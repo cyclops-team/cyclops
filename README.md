@@ -1,86 +1,69 @@
 # commPact
 
-commPact is a small Bash and tmux toolkit for coordinating several terminal panes, including AI agents, inside one tmux session. It labels panes by role, routes structured messages between them, applies a repeatable layout, and enforces a same-session permission boundary so messages cannot cross into unrelated sessions.
+**Structured, safe communication for teams working across tmux panes.**
 
-It works with any program that runs in a pane: a plain shell, Claude Code, Codex, a REPL, or a long-running process.
+Use it with AI agents, shells, REPLs, or long-running processes. commPact gives each pane an identity, delivers structured messages, and keeps communication inside an explicit same-session permission boundary.
 
-## Why it exists
-
-Raw tmux can send keystrokes to any pane, but it has no notion of who a pane is, who may talk to it, or how a message should be framed. commPact adds three things on top of tmux without replacing it:
-
-- **Roles.** Every pane carries a label (`operator`, `lead`, `reviewer`, or whatever you choose). Messages target the label, not a volatile pane id.
-- **A permission boundary.** A pane may only message declared roles in its own session. The allow list comes from configuration, not from hard-coded names, and an unconfigured session cannot send at all.
-- **Structured, verified delivery.** `send` pastes a framed message, verifies it landed, and submits it, returning a machine-readable result instead of raw scrollback.
-
-## Prerequisites
-
-- macOS or Linux
-- Bash
-- tmux 3.2 or newer recommended
-
-The installer checks these and stops with an actionable message if tmux is missing. It never runs a package manager, downloads from the network, edits your shell startup files, or edits your `tmux.conf`. Installing tmux and adding to `PATH` stay under your control.
+[![Test](https://github.com/notyahir/commPact/actions/workflows/ci.yml/badge.svg)](https://github.com/notyahir/commPact/actions/workflows/ci.yml)
 
 ## Quick start
 
-The panes open in whatever directory you run the bootstrap from, so clone commPact somewhere separate and invoke it by path from your project directory:
+Clone commPact somewhere separate, then bootstrap it from the project directory where the panes should open:
 
-```sh
-git clone <repo-url> ~/commPact
+~~~sh
+git clone https://github.com/notyahir/commPact.git ~/commPact
 cd /path/to/your/project
 ~/commPact/install.sh
+tmux attach -t commpact
+~~~
+
+That one bootstrap command installs commPact into <code>~/.commPact</code>, generates a validated local configuration, and starts a shell-based team with generic defaults: <code>operator</code>, <code>lead</code>, <code>worker</code>, and <code>reviewer</code>.
+
+> **Path guide:** <code>~/commPact</code> is the cloned source repository. <code>~/.commPact</code> is the managed local installation and contains your generated team config.
+
+Requirements: macOS or Linux, Bash, and tmux 3.2 or newer recommended. The installer checks them, but never installs packages, downloads from the network, edits shell startup files, or changes <code>tmux.conf</code>.
+
+## How it works
+
+```mermaid
+flowchart LR
+    O["Operator"] -->|"setup"| S["One tmux session"]
+    S --> P1["Pane: driver"]
+    S --> P2["Pane: reviewer"]
+    S --> P3["Pane: any label"]
+    P1 -->|"send reviewer"| A{"Same session and<br/>allowed role?"}
+    A -->|"yes"| V["Paste, verify, submit"]
+    V --> P2
+    A -->|"no"| F["Fail closed<br/>no keystrokes sent"]
+    X["Other tmux session"] -. blocked .-> A
 ```
 
-That single command installs commPact into `~/.commPact`, generates a validated configuration, and starts a `commpact` tmux session with generic shell panes labeled `operator`, `lead`, `worker`, and `reviewer`. The panes open in the current directory; pass `--workdir PATH` to choose another. No configuration file has to be written by hand.
+| What it adds | Why it matters |
+| --- | --- |
+| Pane labels | Target stable names instead of volatile pane IDs. |
+| Structured delivery | <code>send</code> frames, pastes, verifies, and submits one message. |
+| Config-driven ACL | The allowed roles come from your configuration, never a fixed roster. |
 
-The labels above are defaults only. To choose your own from the start, pass flags; they are forwarded to the generator:
+The labels are yours. <code>driver</code>, <code>implementer</code>, <code>reviewer</code>, <code>operator</code>, or any valid lowercase label works. The names above are examples, not a required team shape.
 
-```sh
+## Start with your own team shape
+
+Pass only the values you want to change. This example starts every pane with the same command, which is useful when each pane runs the same CLI agent.
+
+~~~sh
 ~/commPact/install.sh \
   --session project \
   --roles driver,implementer,reviewer \
   --command codex
-```
 
-Attach to the session when it is ready:
-
-```sh
 tmux attach -t project
-```
+~~~
 
-To install the tooling without starting a session, use `~/commPact/install.sh --install-only`.
+Use <code>--workdir PATH</code> if panes should open somewhere other than the current directory. Run <code>~/commPact/install.sh --install-only</code> when you want the tools without starting a session yet.
 
-## Install only, then generate later
+<code>commPact-setup</code> can also be run directly after installation:
 
-If you prefer the two steps separately, install from the release tree:
-
-```sh
-~/commPact/bin/commPact-install install
-```
-
-The default home is `~/.commPact`. Use `--destination PATH` for a staged or test install. An existing home requires `update` or explicit `--replace`; a replacement keeps a timestamped backup. `update` preserves an existing generated `config/team.conf` after re-validating it.
-
-Then create a working session with no file editing:
-
-```sh
-~/.commPact/bin/commPact-setup
-```
-
-### Add to PATH (optional, recommended)
-
-Every command works with its full path. To use the short names day to day, add the bin directory once:
-
-```sh
-echo 'export PATH="$HOME/.commPact/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-```
-
-The rest of this document uses full paths so the examples work with or without this step.
-
-## Customize without hand-writing team.conf
-
-`commPact-setup` generates and validates the configuration for you, then starts the session. Run it with no flags for generic defaults (current directory, current shell, tiled layout), or set only the values you care about:
-
-```sh
+~~~sh
 ~/.commPact/bin/commPact-setup \
   --session project \
   --workdir "$PWD" \
@@ -88,136 +71,115 @@ The rest of this document uses full paths so the examples work with or without t
   --roles builder,checker,writer \
   --default-target builder \
   --command sh
-```
+~~~
 
-| Flag | Meaning | Default |
-| :---- | :---- | :---- |
-| `--session NAME` | tmux session name | `commpact` |
-| `--workdir PATH` | working directory for every pane | current directory |
-| `--roles CSV` | agent labels, excluding the operator | `lead,worker,reviewer` |
-| `--operator LABEL` | operator label | `operator` |
-| `--default-target LABEL` | default message target | first `--roles` label |
-| `--command COMMAND` | command launched in every pane | `$SHELL` or `sh` |
-| `--layout tiled\|columns` | pane layout | `tiled` |
-| `--columns N` | width for columns layout | `2` when columns |
-| `--config PATH` | where to write the config | `~/.commPact/config/team.conf` |
+| Useful setup mode | Result |
+| --- | --- |
+| <code>--dry-run</code> | Print the generated config without writing or starting tmux. |
+| <code>--config-only</code> | Write a validated config for adopting an existing session. |
+| <code>--replace-config</code> | Back up and replace an existing generated config. |
+| <code>--attach</code> | Attach to the new tmux session after setup. |
 
-Useful modes:
+## Send messages between panes
 
-- `--dry-run` prints the configuration it would generate and exits, writing nothing and starting nothing.
-- `--config-only` writes and validates the configuration but does not start tmux. Use it when preparing to adopt an existing session.
-- `--replace-config` backs up and replaces an existing generated config instead of refusing.
-- `--attach` attaches to the new session after setup.
+<code>send</code> is the normal agent-to-agent primitive. It generates the visible <code>SUBJECT:</code> and <code>FROM:</code> envelope, verifies the paste reached the target, submits it, and returns compact JSON.
 
-The generator refuses to overwrite an existing config unless asked, writes with a restrictive umask, and validates the result with the same parser the rest of the toolkit uses before anything starts. The operator label is always kept out of the agent roles, so the operator is never an ordinary message target.
+~~~sh
+printf 'Please review the auth change.' \
+  | ~/.commPact/bin/commPact send reviewer \
+      --json --subject 'Review request' --body-file -
+~~~
 
-## Adopt an existing session safely
+Pass only the message body through <code>--body-file -</code>. The receiver replies to the pane ID in the generated <code>FROM:</code> header. Use pane IDs for replies during a live role rename because labels may be changing.
 
-If your panes are already running, label the live session instead of creating a new one. Nothing is restarted.
+~~~sh
+# Discover and inspect panes.
+~/.commPact/bin/commPact list
+~/.commPact/bin/commPact resolve reviewer
+~/.commPact/bin/commPact read reviewer 100
 
-**1. Generate a config for the session (no session is started):**
+# Send a short request or query the configured default target.
+~/.commPact/bin/commPact-msg @reviewer "Please take a look"
+~/.commPact/bin/commPact-msg @status
+~~~
 
-```sh
+## Adopt an existing session
+
+Adoption labels panes that already exist. It never restarts panes or changes their commands. The explicit role-to-pane map is intentional because existing panes cannot be identified safely by inference.
+
+~~~sh
+# 1. Generate a config. This writes no tmux state.
 ~/.commPact/bin/commPact-setup --config-only \
   --session your-session \
   --roles lead,worker,reviewer \
   --command sh
-```
 
-The per-role command is required by the file format but is ignored by adoption; it is used only when `commPact-init` starts fresh panes.
-
-**2. Read the current pane ids immediately before adopting**, because they change if a pane restarts:
-
-```sh
+# 2. Read pane IDs immediately before adoption. IDs can change on restart.
 ~/.commPact/bin/commPact list
-```
 
-**3. Adopt, mapping each role to a live pane id:**
+# 3. Stamp labels and session metadata.
+~/.commPact/bin/commPact-adopt \
+  --config ~/.commPact/config/team.conf \
+  --session your-session \
+  --map operator=%1 \
+  --map lead=%2 \
+  --map worker=%3 \
+  --map reviewer=%4
+~~~
 
-```sh
-~/.commPact/bin/commPact-adopt --config ~/.commPact/config/team.conf --session your-session \
-  --map operator=%1 --map lead=%2 --map worker=%3 --map reviewer=%4
-```
+The per-role command is required by the config format but is ignored by adoption. It is used only when <code>commPact-init</code> starts fresh panes.
 
-Adoption stamps each pane's label and the session permission metadata together. It refuses a mapping that points outside the session or reuses a pane, and it will not silently leave a role unmapped.
+When renaming a live team, notify every pane first. Pause sends during the brief re-adoption window, then reply by pane ID until the new labels are confirmed.
 
-**4. Smoke test:**
+## Safety model
 
-```sh
-~/.commPact/bin/commPact-msg --session your-session @lead "smoke test"
-```
+| Boundary | Behavior |
+| --- | --- |
+| Session | A sender can target only panes in its own tmux session. |
+| Role | Allowed targets come from <code>agent_roles</code> in session metadata. |
+| Missing metadata | <code>send</code> returns <code>ACL_UNCONFIGURED</code>; it never guesses a roster. |
+| Operator | The operator is excluded from ordinary agent message targets. |
+| Setup | Inside an existing commPact session, only its operator pane may bootstrap another team. |
+| Manual input | <code>type</code> and <code>keys</code> require a prior <code>read</code> of the target pane. |
 
-If you rename roles on a live session, tell every pane the new labels first, quiesce sending during the brief re-adoption, and reply by pane id rather than label until the new labels are confirmed.
+<code>commPact name</code> can relabel a pane directly. Treat it as an operator recovery tool, not as a routine way to assign identities.
 
-## Messaging basics
+## Command reference
 
-The `commPact` command is the pane interface:
+| Command | Purpose |
+| --- | --- |
+| <code>commPact list</code> | Show panes, processes, sizes, and labels. |
+| <code>commPact send TARGET --json --subject TEXT --body-file -</code> | Send one structured message. |
+| <code>commPact read TARGET [LINES]</code> | Inspect pane output for status or debugging. |
+| <code>commPact type</code> and <code>commPact keys</code> | Manually drive a pane after reading it. |
+| <code>commPact-setup</code> | Generate config and start a new session. |
+| <code>commPact-init --config PATH</code> | Start a new session from existing config. |
+| <code>commPact-adopt --config PATH --session NAME --map ROLE=%PANE</code> | Label an existing session. |
+| <code>commPact-layout --config PATH</code> | Apply the configured layout and theme. |
+| <code>commPact-install update</code> | Update a local installation while preserving valid config. |
 
-```sh
-~/.commPact/bin/commPact list                       # panes: target, pid, command, size, label
-~/.commPact/bin/commPact resolve reviewer            # print the pane id for a label
-~/.commPact/bin/commPact read lead 100               # read the last 100 lines of a pane
-~/.commPact/bin/commPact id                          # print this pane's id
-```
+Every command is available under <code>~/.commPact/bin/</code> after installation. Add it to your <code>PATH</code> only if you want shorter commands:
 
-Send a structured message. `send` frames it with a subject and sender header, verifies it pasted, submits it, and returns a JSON result:
-
-```sh
-printf 'Please review the auth change.' \
-  | ~/.commPact/bin/commPact send reviewer --json --subject 'Review request' --body-file -
-```
-
-Pass only the message body on `--body-file -`; the `SUBJECT:` and `FROM:` header lines are generated for you. The recipient sees who sent it and the exact pane id to reply to, and replies to that pane id.
-
-For a short one-off line to the default target or a named role, `commPact-msg` is a convenience wrapper:
-
-```sh
-~/.commPact/bin/commPact-msg @reviewer "Please take a look"
-~/.commPact/bin/commPact-msg @status
-```
-
-To surface a formatted notice to the operator pane, use `commPact-notice` (levels: `info`, `success`, `action`, `urgent`; `--popup` also shows a tmux popup):
-
-```sh
-~/.commPact/bin/commPact-notice --level action "Staging deploy needs approval"
-```
-
-Lower-level `type` and `keys` are also available for driving a non-agent pane (a prompt, a REPL). They require reading the target first, so you always see the current state before you type into it:
-
-```sh
-~/.commPact/bin/commPact read worker 10
-~/.commPact/bin/commPact type worker "y"
-~/.commPact/bin/commPact read worker 10
-~/.commPact/bin/commPact keys worker Enter
-```
-
-## Safety boundaries
-
-- **Same-session only.** `send` reads the allow list from the sender session's metadata and permits only targets in the same session. A target in another session is denied.
-- **Config-driven allow list, fail closed.** The permitted roles come from the session's `agent_roles`, never from hard-coded names. A session with no commPact metadata cannot send at all; it reports an unconfigured error rather than guessing. Use `send --allow-label LABEL` for a deliberate one-off override and `--expect-label LABEL` to assert the target is who you think it is.
-- **Operator is not a message target.** The operator role is excluded from `agent_roles` by the config parser, so ordinary agent messaging cannot address it.
-- **Operator-gated setup.** `commPact-init` and `commPact-setup` refuse to run from inside an existing commPact session unless invoked from that session's operator pane. From a normal shell they run freely.
-- **Read before you type.** `type` and `keys` require a prior `read` of the target pane, so manual keystrokes are never sent blind. `send` performs its own guarded preflight internally.
-- **`name` is unguarded.** `commPact name` sets a pane label with no permission check. It is for operator recovery of a pane that lost its label, not routine use; re-labeling a working pane can desync it from the enforced roster.
-- **No surprise system changes.** The installer never touches your shell startup files, package manager, or `tmux.conf`.
+~~~sh
+echo 'export PATH="$HOME/.commPact/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+~~~
 
 ## Update and uninstall
 
-```sh
-~/.commPact/bin/commPact-install update                 # re-install, preserving a validated config
-~/.commPact/bin/commPact-install uninstall              # remove the install home
-~/.commPact/bin/commPact-install uninstall --restore PATH   # restore a specific backup
-```
+~~~sh
+~/.commPact/bin/commPact-install update
+~/.commPact/bin/commPact-install uninstall
+~/.commPact/bin/commPact-install uninstall --restore PATH
+~~~
 
-`update` requires an existing install and keeps your generated `config/team.conf`. A replace-install (`install --replace`) and every `update` create a timestamped backup under `~/.commPact.backup.*`. `uninstall` does not create a backup: it removes the install home and reports any existing backups, which are never auto-deleted. `--restore PATH` restores one of those backups.
-
-`commPact-state-watchdog --state-dir PATH` is a manual local state check you can run on demand.
+<code>update</code> preserves a valid generated config and creates a timestamped backup. A replace-install also creates a backup. <code>uninstall</code> does not create a backup; it removes the install home and reports any existing backups, which are never auto-deleted.
 
 ## Advanced configuration
 
-Most users never edit the config; `commPact-setup` writes it. When you need advanced options, the format is a flat, data-only file (the parser never executes it):
+Most teams should use <code>commPact-setup</code>. For advanced layouts or per-role commands, <code>team.conf</code> remains small and data only:
 
-```conf
+~~~conf
 version=1
 session=project
 workdir=/absolute/path
@@ -229,29 +191,20 @@ role=operator|sh
 role=lead|sh
 role=worker|sh
 role=reviewer|sh
-```
+~~~
 
-Rules the parser enforces:
+The parser rejects malformed labels, duplicate roles, missing references, an operator in <code>agent_roles</code>, and invalid layout settings before touching tmux. See [Configuration and runtime metadata](docs/CONFIG.md) for the full schema, including columns and weighted splits.
 
-- `version` must be `1`; `session`, `workdir`, `layout`, `operator`, `default_target`, and `agent_roles` are required.
-- `layout` is `tiled` or `columns`; a `columns` layout also needs `columns=N`.
-- Each `role=LABEL|COMMAND` declares a pane. Labels match `^[a-z][a-z0-9_-]*$`. The command is what `commPact-init` launches; adoption ignores it.
-- `operator` and `default_target` must be declared roles, `default_target` must be in `agent_roles`, and `operator` must not be in `agent_roles`.
-- An optional `split=LABEL:WEIGHT,LABEL:WEIGHT` gives a weighted rightmost column with the `columns` layout.
+## Develop and release
 
-Apply or refresh a layout on a running session without changing labels or metadata:
+Run the complete local check from the repository root:
 
-```sh
-~/.commPact/bin/commPact-layout --config ~/.commPact/config/team.conf
-~/.commPact/bin/commPact-layout --config ~/.commPact/config/team.conf --theme-only
-```
+~~~sh
+bash tests/regression.sh
+~~~
 
-The generated `config/team.conf` is local user state. It is not part of the release source; only `config/team.conf.example` ships. `update` preserves your local copy across upgrades.
+GitHub Actions runs the same suite on Ubuntu and macOS. Generated local config, Finder files, editor state, and Git metadata are excluded from packaged installs.
 
-## Reference
+> **Release status:** version, project copyright, and project license remain owner decisions. See [Releasing commPact](docs/RELEASING.md) for the final publication checklist.
 
-- [Configuration and runtime metadata](docs/CONFIG.md)
-- [Operator cutover and rollback](docs/CUTOVER.md)
-- [Vendor and attribution boundary](docs/VENDOR.md)
-
-The final commPact project license and distribution status are pending.
+commPact retains the required [smux attribution](docs/VENDOR.md) and upstream MIT text in [LICENSE](LICENSE).
