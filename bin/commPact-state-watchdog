@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="3.0.0-candidate"
+STATE_DIR=""
+
+die() { echo "commPact-state-watchdog: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'USAGE'
+Usage: commPact-state-watchdog --state-dir PATH
+
+Read local state and report stale or failed work. This is a manual check.
+It does not create a watcher, schedule a job, or choose a service default.
+USAGE
+}
+
+file_mtime() {
+  local path="$1"
+  case "$(uname -s 2>/dev/null || printf unknown)" in
+    Darwin) stat -f %m "$path" ;;
+    *) stat -c %Y "$path" ;;
+  esac
+}
+
+main() {
+  local max_age=3600 now mtime age status="PASS"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --state-dir) [[ $# -ge 2 ]] || die "--state-dir requires PATH"; STATE_DIR="$2"; shift 2 ;;
+      --max-age) [[ $# -ge 2 ]] || die "--max-age requires seconds"; max_age="$2"; shift 2 ;;
+      --help|-h) usage; return 0 ;;
+      --version) echo "commPact-state-watchdog $VERSION"; return 0 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [[ -n "$STATE_DIR" ]] || { usage >&2; exit 2; }
+  [[ -d "$STATE_DIR" ]] || die "state directory does not exist: $STATE_DIR"
+  [[ "$max_age" =~ ^[0-9]+$ ]] || die "max age must be a nonnegative integer"
+  now="$(date +%s)"
+  if [[ -f "$STATE_DIR/last_update" ]]; then
+    mtime="$(file_mtime "$STATE_DIR/last_update")"
+    age=$((now - mtime))
+    if ((age > max_age)); then
+      status="STALE"
+      echo "status: STALE (last_update age ${age}s, limit ${max_age}s)"
+    else
+      echo "status: PASS (last_update age ${age}s)"
+    fi
+  else
+    status="NO_STATE"
+    echo "status: NO_STATE (missing $STATE_DIR/last_update)"
+  fi
+  if [[ -f "$STATE_DIR/error" ]]; then
+    status="ERROR"
+    echo "error: $(head -n 1 "$STATE_DIR/error")"
+  fi
+  printf 'state_dir: %s\nfinal: %s\n' "$STATE_DIR" "$status"
+}
+
+main "$@"

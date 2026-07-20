@@ -1,0 +1,15 @@
+# Data only. The parser never executes this file.
+# Every role label below is an example. Replace every label with your own team names.
+version=1
+session=team-example
+workdir=/tmp
+layout=columns
+columns=3
+operator=operator
+default_target=lead
+agent_roles=lead,worker,reviewer,observer
+role=operator|sh
+role=lead|sh
+role=worker|sh
+role=reviewer|sh
+role=observer|sh

@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=commPact-config.sh
+source "$SCRIPT_DIR/../lib/commPact-config.sh"
+
+die() { echo "commPact-init: $*" >&2; exit 1; }
+
+tmux_cmd() {
+  if [[ -n "${COMMPACT_SOCKET:-}" ]]; then
+    tmux -S "$COMMPACT_SOCKET" "$@"
+  else
+    tmux "$@"
+  fi
+}
+
+session_exists() {
+  tmux_cmd has-session -t "$1" 2>/dev/null
+}
+
+csv_roles() {
+  local result="" i
+  for ((i = 0; i < COMMPACT_CFG_ROLE_COUNT; i++)); do
+    [[ -z "$result" ]] || result+=","
+    result+="${COMMPACT_CFG_ROLE_LABELS[i]}"
+  done
+  printf '%s' "$result"
+}
+
+stamp_metadata() {
+  local config_path="$1"
+  local roles
+  roles="$(csv_roles)"
+  tmux_cmd set-option -t "$COMMPACT_CFG_SESSION" @commPact_config_path "$config_path"
+  tmux_cmd set-option -t "$COMMPACT_CFG_SESSION" @commPact_roles "$roles"
+  tmux_cmd set-option -t "$COMMPACT_CFG_SESSION" @commPact_agent_roles "$COMMPACT_CFG_AGENT_ROLES"
+  tmux_cmd set-option -t "$COMMPACT_CFG_SESSION" @commPact_operator_role "$COMMPACT_CFG_OPERATOR"
+  tmux_cmd set-option -t "$COMMPACT_CFG_SESSION" @commPact_default_target "$COMMPACT_CFG_DEFAULT_TARGET"
+}
+
+check_operator_invocation() {
+  [[ -n "${TMUX_PANE:-}" ]] || return 0
+  local current_session current_agents current_operator current_label
+  current_session="$(tmux_cmd display-message -p '#{session_name}' 2>/dev/null || true)"
+  [[ -n "$current_session" ]] || return 0
+  current_agents="$(tmux_cmd show-options -t "$current_session" -v @commPact_agent_roles 2>/dev/null || true)"
+  [[ -n "$current_agents" ]] || return 0
+  current_operator="$(tmux_cmd show-options -t "$current_session" -v @commPact_operator_role 2>/dev/null || true)"
+  [[ -n "$current_operator" ]] || die "current commPact session metadata is incomplete; run init from a normal shell or repair the session first"
+  current_label="$(tmux_cmd display-message -p '#{@name}' 2>/dev/null || true)"
+  [[ "$current_label" == "$current_operator" ]] || die "init is operator-only from an existing commPact session; current pane is not '$current_operator'"
+}
+
+main() {
+  local config_path="" attach=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --config) [[ $# -ge 2 ]] || die "--config requires a path"; config_path="$2"; shift 2 ;;
+      --attach) attach=true; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [[ -n "$config_path" ]] || die "usage: commPact-init --config PATH [--attach]"
+  commPactConfigLoad "$config_path" || exit 1
+  [[ -d "$COMMPACT_CFG_WORKDIR" ]] || die "workdir does not exist: $COMMPACT_CFG_WORKDIR"
+  check_operator_invocation
+  session_exists "$COMMPACT_CFG_SESSION" && die "session already exists: $COMMPACT_CFG_SESSION"
+
+  local i command pane
+  local -a created_panes=()
+  command="${COMMPACT_CFG_ROLE_COMMANDS[0]}"
+  pane="$(tmux_cmd new-session -P -F '#{pane_id}' -d -s "$COMMPACT_CFG_SESSION" -n main -c "$COMMPACT_CFG_WORKDIR" "$command")"
+  created_panes[0]="$pane"
+  for ((i = 1; i < COMMPACT_CFG_ROLE_COUNT; i++)); do
+    command="${COMMPACT_CFG_ROLE_COMMANDS[i]}"
+    pane="$(tmux_cmd split-window -P -F '#{pane_id}' -t "$COMMPACT_CFG_SESSION:main" -c "$COMMPACT_CFG_WORKDIR" "$command")"
+    created_panes[i]="$pane"
+    tmux_cmd select-layout -t "$COMMPACT_CFG_SESSION:main" tiled
+  done
+  stamp_metadata "$config_path"
+
+  local label
+  for ((i = 0; i < COMMPACT_CFG_ROLE_COUNT; i++)); do
+    label="${COMMPACT_CFG_ROLE_LABELS[i]}"
+    pane="${created_panes[i]}"
+    [[ -n "$pane" ]] || die "created pane missing for role '$label'"
+    tmux_cmd set-option -p -t "$pane" @name "$label"
+    tmux_cmd set-option -p -t "$pane" @role "$label"
+  done
+
+  COMMPACT_SOCKET="${COMMPACT_SOCKET:-}" "$SCRIPT_DIR/commPact-layout" --config "$config_path"
+  echo "initialized $COMMPACT_CFG_SESSION with $COMMPACT_CFG_ROLE_COUNT roles"
+  if [[ "$attach" == true ]]; then
+    tmux_cmd attach-session -t "$COMMPACT_CFG_SESSION"
+  fi
+}
+
+main "$@"

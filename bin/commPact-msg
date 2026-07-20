@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BRIDGE="$SCRIPT_DIR/commPact"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  commPact-msg [--session NAME] [@ROLE|ROLE] "message"
+  commPact-msg [--session NAME] @quiet
+  commPact-msg [--session NAME] @status
+
+ROLE comes from the session's commPact metadata. The default target is the
+configured default_target value.
+USAGE
+}
+
+die() { echo "commPact-msg: $*" >&2; exit 1; }
+
+[[ -x "$BRIDGE" ]] || die "package bridge missing: $BRIDGE"
+
+tmux_cmd() {
+  if [[ -n "${COMMPACT_SOCKET:-}" ]]; then
+    tmux -S "$COMMPACT_SOCKET" "$@"
+  else
+    tmux "$@"
+  fi
+}
+
+csv_contains() {
+  local wanted="$1" csv="$2" item old_ifs="$IFS"
+  IFS=','
+  for item in $csv; do
+    [[ "$item" == "$wanted" ]] && { IFS="$old_ifs"; return 0; }
+  done
+  IFS="$old_ifs"
+  return 1
+}
+
+pane_for_route() {
+  local session="$1" route="$2"
+  tmux_cmd list-panes -s -t "$session" -F '#{pane_id}|#{@name}' \
+    | awk -F'|' -v wanted="$route" '$2 == wanted { print $1; exit }'
+}
+
+main() {
+  local session="" first route request
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --session) [[ $# -ge 2 ]] || die "--session requires a name"; session="$2"; shift 2 ;;
+      --help|-h) usage; return 0 ;;
+      *) break ;;
+    esac
+  done
+  [[ $# -ge 1 ]] || { usage >&2; exit 2; }
+
+  if [[ -z "$session" && -n "${TMUX_PANE:-}" ]]; then
+    session="$(tmux_cmd display-message -p '#{session_name}' 2>/dev/null || true)"
+  fi
+  [[ -n "$session" ]] || die "outside tmux, --session NAME is required"
+  tmux_cmd has-session -t "$session" 2>/dev/null || die "session does not exist: $session"
+
+  local configured_roles default_target operator
+  configured_roles="$(tmux_cmd show-options -t "$session" -v @commPact_roles 2>/dev/null || true)"
+  default_target="$(tmux_cmd show-options -t "$session" -v @commPact_default_target 2>/dev/null || true)"
+  operator="$(tmux_cmd show-options -t "$session" -v @commPact_operator_role 2>/dev/null || true)"
+  [[ -n "$configured_roles" && -n "$default_target" && -n "$operator" ]] \
+    || die "session lacks commPact metadata; run commPact-init or commPact-adopt first"
+
+  first="$1"
+  shift
+  route="$default_target"
+  if [[ "$first" == @* ]]; then
+    route="${first#@}"
+    route="${route%:}"
+  elif [[ "$first" == *:* && "$first" != /* ]]; then
+    local possible_route="${first%%:*}"
+    local possible_message="${first#*:}"
+    if csv_contains "$possible_route" "$configured_roles" || [[ "$possible_route" == quiet || "$possible_route" == status ]]; then
+      route="$possible_route"
+      shift 0
+      if [[ -n "$possible_message" ]]; then
+        set -- "$possible_message" "$@"
+      fi
+    else
+      set -- "$first" "$@"
+    fi
+  elif csv_contains "$first" "$configured_roles" || [[ "$first" == quiet || "$first" == status ]]; then
+    route="$first"
+  else
+    set -- "$first" "$@"
+  fi
+
+  local special=false
+  case "$route" in
+    quiet) request="/quiet"; route="$default_target"; special=true ;;
+    status) request="/status"; route="$default_target"; special=true ;;
+    *) [[ $# -gt 0 ]] || { usage >&2; exit 2; }; request="$*" ;;
+  esac
+
+  if [[ "$route" == "$operator" ]]; then
+    printf 'OPERATOR_MESSAGE\nFROM: %s\nTO: %s\nBODY:\n%s\n' "$operator" "$route" "$request"
+    return 0
+  fi
+  csv_contains "$route" "$configured_roles" || die "unknown configured role '$route'"
+  local target
+  target="$(pane_for_route "$session" "$route")"
+  [[ -n "$target" ]] || die "no pane labeled '$route' in session '$session'"
+
+  local send_json send_exit=0
+  send_json=$(printf '%s' "$request" | "$BRIDGE" send "$target" --json --subject "Operator message" --body-file -) || send_exit=$?
+  if [[ "$send_exit" -ne 0 ]]; then
+    local send_status send_error
+    send_status=$(printf '%s' "$send_json" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+    send_error=$(printf '%s' "$send_json" | grep -o '"error":"[^"]*"' | head -1 | cut -d'"' -f4)
+    die "delivery to '${route}' failed [${send_status:-UNKNOWN}]: ${send_error:-no detail}. Check with: $BRIDGE read $target"
+  fi
+  [[ "$special" == true ]] && echo "sent ${request} to ${route}" || echo "sent to ${route}"
+}
+
+main "$@"

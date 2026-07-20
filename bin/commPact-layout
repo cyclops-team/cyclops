@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=commPact-config.sh
+source "$SCRIPT_DIR/../lib/commPact-config.sh"
+
+die() { echo "commPact-layout: $*" >&2; exit 1; }
+
+tmux_cmd() {
+  if [[ -n "${COMMPACT_SOCKET:-}" ]]; then
+    tmux -S "$COMMPACT_SOCKET" "$@"
+  else
+    tmux "$@"
+  fi
+}
+
+session_exists() {
+  tmux_cmd has-session -t "$1" 2>/dev/null
+}
+
+window_id_for_session() {
+  tmux_cmd list-windows -t "$1" -F '#{window_id}' | head -n 1
+}
+
+pane_for_label() {
+  local session="$1"
+  local label="$2"
+  tmux_cmd list-panes -s -t "$session" -F '#{pane_id}|#{@name}' \
+    | awk -F'|' -v wanted="$label" '$2 == wanted { print $1; exit }'
+}
+
+read_theme_value() {
+  local path="$1"
+  local wanted="$2"
+  local line key value
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    [[ "$line" == *=* ]] || die "${path}: expected key=value"
+    key="${line%%=*}"
+    value="${line#*=}"
+    [[ "$key" == "$wanted" ]] && { printf '%s' "$value"; return 0; }
+  done < "$path"
+  return 1
+}
+
+apply_theme() {
+  local config_path="$1"
+  local config_dir theme_file palette
+  local selected_theme=""
+  config_dir="$(cd "$(dirname "$config_path")" && pwd)"
+  theme_file="$config_dir/theme.conf"
+  [[ -f "$theme_file" ]] || theme_file="$SCRIPT_DIR/../config/theme.conf"
+  [[ -f "$theme_file" ]] || die "theme file not found beside config: $theme_file"
+  selected_theme="$(read_theme_value "$theme_file" selected_theme || true)"
+  [[ "$selected_theme" =~ ^[a-z][a-z0-9_-]*$ ]] || die "invalid selected_theme '$selected_theme'"
+  palette="$config_dir/themes/${selected_theme}.conf"
+  [[ -f "$palette" ]] || palette="$SCRIPT_DIR/../themes/${selected_theme}.conf"
+  [[ -f "$palette" ]] || die "theme preset not found: $selected_theme"
+
+  local status_bg status_fg border border_active
+  status_bg="$(read_theme_value "$palette" status_bg || true)"
+  status_fg="$(read_theme_value "$palette" status_fg || true)"
+  border="$(read_theme_value "$palette" pane_border || true)"
+  border_active="$(read_theme_value "$palette" pane_active_border || true)"
+  [[ -n "$status_bg" && -n "$status_fg" && -n "$border" && -n "$border_active" ]] \
+    || die "theme preset must define status_bg, status_fg, pane_border, pane_active_border"
+  tmux_cmd set-option -t "$COMMPACT_CFG_SESSION" status-style "bg=${status_bg},fg=${status_fg}"
+  tmux_cmd set-option -t "$COMMPACT_CFG_SESSION" pane-border-style "fg=${border}"
+  tmux_cmd set-option -t "$COMMPACT_CFG_SESSION" pane-active-border-style "fg=${border_active}"
+  tmux_cmd set-option -t "$COMMPACT_CFG_SESSION" @commPact_selected_theme "$selected_theme"
+}
+
+stamp_roles() {
+  local session="$1"
+  local i pane label
+  for ((i = 0; i < COMMPACT_CFG_ROLE_COUNT; i++)); do
+    label="${COMMPACT_CFG_ROLE_LABELS[i]}"
+    pane="$(pane_for_label "$session" "$label")"
+    [[ -n "$pane" ]] || die "configured role '$label' has no pane"
+    tmux_cmd set-option -p -t "$pane" @role "$label"
+  done
+}
+
+layout_checksum() {
+  local body="$1"
+  local checksum=0 char byte
+  while IFS= read -r -n 1 char; do
+    [[ -n "$char" ]] || continue
+    printf -v byte '%d' "'$char"
+    checksum=$(( (checksum >> 1) + ((checksum & 1) << 15) + byte ))
+    checksum=$((checksum & 65535))
+  done < <(printf '%s' "$body")
+  printf '%04x' "$checksum"
+}
+
+columns_layout() {
+  local window="$1"
+  local count="$COMMPACT_CFG_ROLE_COUNT"
+  local columns="$COMMPACT_CFG_COLUMNS"
+  ((columns <= count)) || die "columns cannot exceed role count"
+  local width height gap=1
+  width="$(tmux_cmd display-message -t "$window" -p '#{window_width}')"
+  height="$(tmux_cmd display-message -t "$window" -p '#{window_height}')"
+  ((width > columns && height > 0)) || die "window is too small for configured columns"
+
+  local base_width=$(( (width - (columns - 1) * gap) / columns ))
+  local width_remainder=$(( (width - (columns - 1) * gap) % columns ))
+  local x=0 c r index col_width row_count row_height height_remainder y pane pane_num
+  local column_body leaf
+  local -a regular_labels=()
+  local regular_count regular_columns label body
+  if ((COMMPACT_CFG_SPLIT_ENABLED == 1)); then
+    regular_columns=$((columns - 1))
+    for ((index = 0; index < count; index++)); do
+      label="${COMMPACT_CFG_ROLE_LABELS[index]}"
+      if [[ "$label" != "${COMMPACT_CFG_SPLIT_LABELS[0]}" && "$label" != "${COMMPACT_CFG_SPLIT_LABELS[1]}" ]]; then
+        regular_labels[${#regular_labels[@]}]="$label"
+      fi
+    done
+    regular_count="${#regular_labels[@]}"
+  else
+    regular_columns="$columns"
+    regular_count="$count"
+    for ((index = 0; index < count; index++)); do
+      regular_labels[index]="${COMMPACT_CFG_ROLE_LABELS[index]}"
+    done
+  fi
+
+  if ((COMMPACT_CFG_SPLIT_ENABLED == 1)); then
+    local -a desired_labels=()
+    local desired_column desired_row desired_slot
+    for ((desired_column = 0; desired_column < regular_columns; desired_column++)); do
+      row_count=$(( (regular_count - desired_column + regular_columns - 1) / regular_columns ))
+      for ((desired_row = 0; desired_row < row_count; desired_row++)); do
+        desired_slot=$((desired_column + desired_row * regular_columns))
+        desired_labels[${#desired_labels[@]}]="${regular_labels[desired_slot]}"
+      done
+    done
+    desired_labels[${#desired_labels[@]}]="${COMMPACT_CFG_SPLIT_LABELS[0]}"
+    desired_labels[${#desired_labels[@]}]="${COMMPACT_CFG_SPLIT_LABELS[1]}"
+    local desired_index pane_slot pane_base current_label target_pane source_pane
+    pane_base="$(tmux_cmd show-options -gv pane-base-index 2>/dev/null || echo 0)"
+    [[ "$pane_base" =~ ^[0-9]+$ ]] || pane_base=0
+    for ((desired_index = 0; desired_index < count; desired_index++)); do
+      pane_slot=$((pane_base + desired_index))
+      current_label="$(tmux_cmd list-panes -s -t "$COMMPACT_CFG_SESSION" -F '#{pane_index}|#{@name}' | awk -F'|' -v wanted="$pane_slot" '$1 == wanted {print $2; exit}')"
+      [[ "$current_label" == "${desired_labels[desired_index]}" ]] && continue
+      target_pane="$(tmux_cmd list-panes -s -t "$COMMPACT_CFG_SESSION" -F '#{pane_index}|#{pane_id}' | awk -F'|' -v wanted="$pane_slot" '$1 == wanted {print $2; exit}')"
+      source_pane="$(pane_for_label "$COMMPACT_CFG_SESSION" "${desired_labels[desired_index]}")"
+      [[ -n "$target_pane" && -n "$source_pane" ]] || die "cannot reorder split panes"
+      tmux_cmd swap-pane -s "$source_pane" -t "$target_pane"
+    done
+  fi
+
+  body="${width}x${height},0,0{"
+
+  for ((c = 0; c < regular_columns; c++)); do
+    col_width="$base_width"
+    ((c < width_remainder)) && col_width=$((col_width + 1))
+    row_count=$(( (regular_count - c + regular_columns - 1) / regular_columns ))
+    ((row_count > 0)) || continue
+    column_body=""
+    y=0
+    for ((r = 0; r < row_count; r++)); do
+      index=$((c + r * regular_columns))
+      pane="$(pane_for_label "$COMMPACT_CFG_SESSION" "${regular_labels[index]}")"
+      [[ -n "$pane" ]] || die "configured role '${regular_labels[index]}' has no pane"
+      pane_num="${pane#%}"
+      row_height=$(( (height - (row_count - 1) * gap) / row_count ))
+      height_remainder=$(( (height - (row_count - 1) * gap) % row_count ))
+      ((r < height_remainder)) && row_height=$((row_height + 1))
+      leaf="${col_width}x${row_height},${x},${y},${pane_num}"
+      [[ -z "$column_body" ]] || column_body+=","
+      column_body+="$leaf"
+      y=$((y + row_height + gap))
+    done
+    if ((row_count > 1)); then
+      column_body="${col_width}x${height},${x},0[${column_body}]"
+    fi
+    ((c == 0)) || body+=","
+    body+="$column_body"
+    x=$((x + col_width + gap))
+  done
+  if ((COMMPACT_CFG_SPLIT_ENABLED == 1)); then
+    col_width="$base_width"
+    ((regular_columns < width_remainder)) && col_width=$((col_width + 1))
+    local split_available split_total split_top split_bottom split_top_pane split_bottom_pane
+    split_available=$((height - gap))
+    split_total=$((COMMPACT_CFG_SPLIT_WEIGHTS[0] + COMMPACT_CFG_SPLIT_WEIGHTS[1]))
+    split_top=$((split_available * COMMPACT_CFG_SPLIT_WEIGHTS[0] / split_total))
+    split_bottom=$((split_available - split_top))
+    ((split_top > 0 && split_bottom > 0)) || die "split weights produce an empty pane"
+    split_top_pane="$(pane_for_label "$COMMPACT_CFG_SESSION" "${COMMPACT_CFG_SPLIT_LABELS[0]}")"
+    split_bottom_pane="$(pane_for_label "$COMMPACT_CFG_SESSION" "${COMMPACT_CFG_SPLIT_LABELS[1]}")"
+    [[ -n "$split_top_pane" && -n "$split_bottom_pane" ]] || die "split role has no pane"
+    split_top_pane="${split_top_pane#%}"
+    split_bottom_pane="${split_bottom_pane#%}"
+    leaf="${col_width}x${split_top},${x},0,${split_top_pane},${col_width}x${split_bottom},${x},$((split_top + gap)),${split_bottom_pane}"
+    ((regular_columns == 0)) || body+=","
+    body+="${col_width}x${height},${x},0[${leaf}]"
+  fi
+  body+="}"
+  body="${body//$'\n'/}"
+  local checksum
+  checksum="$(layout_checksum "$body")"
+  tmux_cmd select-layout -t "$window" "${checksum},${body}"
+}
+
+main() {
+  local config_path="" theme_only=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --config) [[ $# -ge 2 ]] || die "--config requires a path"; config_path="$2"; shift 2 ;;
+      --theme-only) theme_only=true; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [[ -n "$config_path" ]] || die "usage: commPact-layout --config PATH [--theme-only]"
+  commPactConfigLoad "$config_path" || exit 1
+  session_exists "$COMMPACT_CFG_SESSION" || die "session does not exist: $COMMPACT_CFG_SESSION"
+  if [[ "$theme_only" == true ]]; then
+    apply_theme "$config_path"
+    echo "theme reapplied for $COMMPACT_CFG_SESSION"
+    return 0
+  fi
+
+  local window
+  window="$(window_id_for_session "$COMMPACT_CFG_SESSION")"
+  [[ -n "$window" ]] || die "session has no window: $COMMPACT_CFG_SESSION"
+  local i pane label
+  for ((i = 0; i < COMMPACT_CFG_ROLE_COUNT; i++)); do
+    label="${COMMPACT_CFG_ROLE_LABELS[i]}"
+    pane="$(pane_for_label "$COMMPACT_CFG_SESSION" "$label")"
+    [[ -n "$pane" ]] || die "configured role '$label' has no pane"
+  done
+  if [[ "$COMMPACT_CFG_LAYOUT" == tiled ]]; then
+    tmux_cmd select-layout -t "$window" tiled
+  else
+    columns_layout "$window"
+  fi
+  stamp_roles "$COMMPACT_CFG_SESSION"
+  apply_theme "$config_path"
+  echo "layout applied for $COMMPACT_CFG_SESSION"
+}
+
+main "$@"

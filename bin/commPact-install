@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="3.0.0-candidate"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PACKAGE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+DESTINATION="${HOME:-}/.commPact"
+REPLACE=false
+
+die() { echo "commPact-install: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'USAGE'
+Usage: commPact-install <install|update|uninstall|version|help> [options]
+
+Options:
+  --destination PATH  Use PATH instead of ~/.commPact (tests and staging)
+  --replace            Replace an existing install after a backup
+  --restore PATH       Restore this explicit backup during uninstall
+  --help               Show this help
+USAGE
+}
+
+platform_check() {
+  local platform
+  platform="$(uname -s 2>/dev/null || printf unknown)"
+  case "$platform" in
+    Darwin|Linux) echo "platform: $platform" ;;
+    *) echo "warning: unsupported platform '$platform'; macOS and Linux are tested" >&2 ;;
+  esac
+  [[ -n "${BASH_VERSION:-}" ]] || die "Bash is required"
+}
+
+tmux_check() {
+  local version major minor
+  if ! command -v tmux >/dev/null 2>&1; then
+    case "$(uname -s 2>/dev/null || printf unknown)" in
+      Darwin) echo "tmux is missing. Install it with: brew install tmux" >&2 ;;
+      Linux) echo "tmux is missing. Install it with your distribution package manager (for example: sudo apt-get install tmux)." >&2 ;;
+      *) echo "tmux is missing. Install tmux with your operating system package manager." >&2 ;;
+    esac
+    return 1
+  fi
+  version="$(tmux -V 2>/dev/null || true)"
+  if [[ "$version" =~ ([0-9]+)\.([0-9]+) ]]; then
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
+    if ((major < 3 || (major == 3 && minor < 2))); then
+      echo "warning: $version found; commPact works best with tmux 3.2 or newer" >&2
+    fi
+  else
+    echo "warning: unable to parse tmux version: ${version:-unknown}" >&2
+  fi
+}
+
+validate_destination() {
+  [[ -n "$DESTINATION" && "$DESTINATION" != "/" ]] || die "refusing unsafe destination '$DESTINATION'"
+}
+
+required_files=(
+  bin/commPact
+  bin/commPact-adopt
+  bin/commPact-init
+  bin/commPact-layout
+  bin/commPact-msg
+  bin/commPact-notice
+  bin/commPact-install
+  bin/commPact-setup
+  bin/commPact-state-watchdog
+  lib/commPact-config.sh
+  config/team.conf.example
+  config/theme.conf
+  themes/default.conf
+  themes/custom.conf
+  docs/README.md
+  README.md
+  docs/CONFIG.md
+  docs/CUTOVER.md
+  docs/RELEASING.md
+  docs/VENDOR.md
+  CHANGELOG.md
+  .gitignore
+  .gitattributes
+  tests/regression.sh
+  install.sh
+  NOTICE
+  LICENSE
+)
+
+validate_tree() {
+  local tree="$1" path
+  for path in "${required_files[@]}"; do
+    [[ -f "$tree/$path" ]] || die "release is missing $path"
+  done
+  for path in "$tree"/bin/*; do
+    [[ -x "$path" ]] || die "release command is not executable: ${path#*/}"
+  done
+  [[ -x "$tree/install.sh" ]] || die "release bootstrap is not executable: install.sh"
+  bash -n "$tree"/bin/* "$tree"/lib/*.sh "$tree"/tests/*.sh
+  bash "$tree/lib/commPact-config.sh" "$tree/config/team.conf.example" >/dev/null
+}
+
+stage_tree() {
+  local stage="$1" path parent
+  [[ ! -e "$stage" ]] || die "staging path already exists: $stage"
+  mkdir -p "$stage"
+  # Build from the release manifest, not a recursive source copy. This keeps
+  # VCS metadata, Finder files, and other local artifacts out of user installs.
+  for path in "${required_files[@]}"; do
+    parent="$(dirname "$path")"
+    mkdir -p "$stage/$parent"
+    cp "$PACKAGE_ROOT/$path" "$stage/$path"
+  done
+  chmod +x "$stage"/bin/* "$stage"/tests/*.sh "$stage/install.sh"
+  validate_tree "$stage"
+}
+
+backup_path() {
+  local base="${DESTINATION}.backup.$(date '+%Y%m%d-%H%M%S')"
+  [[ ! -e "$base" ]] && { printf '%s' "$base"; return; }
+  printf '%s.%s' "$base" "$$"
+}
+
+install_tree() {
+  local mode="$1" stage backup="" had_existing=false
+  validate_destination
+  if [[ -e "$DESTINATION" ]]; then
+    had_existing=true
+    if [[ "$mode" == install && "$REPLACE" != true ]]; then
+      die "destination exists: $DESTINATION (use update or --replace)"
+    fi
+  elif [[ "$mode" == update ]]; then
+    die "cannot update a missing install: $DESTINATION"
+  fi
+
+  stage="${DESTINATION}.next.$$"
+  cleanup_stage() { [[ -n "${stage:-}" && -e "$stage" ]] && rm -rf -- "$stage"; }
+  trap cleanup_stage EXIT
+  stage_tree "$stage"
+  if [[ "$mode" == update && -f "$DESTINATION/config/team.conf" ]]; then
+    cp "$DESTINATION/config/team.conf" "$stage/config/team.conf"
+    bash "$stage/lib/commPact-config.sh" "$stage/config/team.conf" >/dev/null \
+      || die "existing team configuration is invalid; update did not activate"
+  fi
+  if [[ "$had_existing" == true ]]; then
+    backup="$(backup_path)"
+    mv "$DESTINATION" "$backup"
+  fi
+  if ! mv "$stage" "$DESTINATION"; then
+    if [[ -n "$backup" && -e "$backup" ]]; then mv "$backup" "$DESTINATION"; fi
+    die "could not activate $DESTINATION"
+  fi
+  trap - EXIT
+  echo "commPact ${mode} complete"
+  echo "install home: $DESTINATION"
+  [[ -n "$backup" ]] && echo "backup retained: $backup"
+  echo "next commands:"
+  echo "  $DESTINATION/bin/commPact-setup"
+  echo "  $DESTINATION/bin/commPact-setup --session my-team --roles driver,implementer,reviewer"
+}
+
+uninstall_tree() {
+  validate_destination
+  [[ -e "$DESTINATION" ]] || die "install home does not exist: $DESTINATION"
+  rm -rf -- "$DESTINATION"
+  echo "uninstalled: $DESTINATION"
+  local backup
+  for backup in "${DESTINATION}.backup."*; do
+    [[ -e "$backup" ]] && echo "backup retained: $backup"
+  done
+  if [[ -n "${RESTORE:-}" ]]; then
+    [[ -d "$RESTORE" ]] || die "restore backup is not a directory: $RESTORE"
+    [[ ! -e "$DESTINATION" ]] || die "restore destination unexpectedly exists: $DESTINATION"
+    mkdir -p "$DESTINATION"
+    cp -R "$RESTORE/." "$DESTINATION/"
+    echo "restored explicit backup: $RESTORE"
+  fi
+}
+
+main() {
+  local action="" restore=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      install|update|uninstall|version|help) [[ -z "$action" ]] || die "only one action is allowed"; action="$1"; shift ;;
+      --destination) [[ $# -ge 2 ]] || die "--destination requires PATH"; DESTINATION="$2"; shift 2 ;;
+      --replace) REPLACE=true; shift ;;
+      --restore) [[ $# -ge 2 ]] || die "--restore requires BACKUP"; restore="$2"; shift 2 ;;
+      --help|-h) action=help; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [[ -n "$action" ]] || { usage >&2; exit 2; }
+  case "$action" in
+    help) usage ;;
+    version) echo "commPact-install $VERSION" ;;
+    uninstall)
+      [[ "$REPLACE" != true ]] || die "--replace is not valid for uninstall"
+      [[ -z "$restore" || "$restore" != "$DESTINATION" ]] || die "restore backup must differ from destination"
+      RESTORE="$restore"; uninstall_tree ;;
+    install|update)
+      [[ -z "$restore" ]] || die "--restore is valid only for uninstall"
+      platform_check
+      tmux_check || exit 1
+      install_tree "$action" ;;
+  esac
+}
+
+main "$@"

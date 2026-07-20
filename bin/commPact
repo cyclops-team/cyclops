@@ -1,0 +1,890 @@
+#!/usr/bin/env bash
+# commPact - Agent-agnostic CLI for cross-pane communication in tmux.
+# Any tool that can run bash can use this to talk to other panes.
+set -euo pipefail
+
+VERSION="3.0.0-candidate"
+
+# --- Helpers ---
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# --- Read Guard ---
+# Enforces read-before-act: agents must read a pane before typing/keys.
+
+read_guard_path() {
+  local pane_id="$1"
+  # Sanitize: %66 → _66
+  echo "/tmp/commPact-read-${pane_id//%/_}"
+}
+
+mark_read() {
+  touch "$(read_guard_path "$1")"
+}
+
+require_read() {
+  local guard
+  guard=$(read_guard_path "$1")
+  if [[ ! -f "$guard" ]]; then
+    die "must read the pane before interacting. Run: commPact read $1"
+  fi
+}
+
+clear_read() {
+  rm -f "$(read_guard_path "$1")"
+}
+
+json_escape() {
+  local s="${1:-}"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  printf '%s' "$s"
+}
+
+sha256_12() {
+  local backend="${COMMPACT_SHA256_BACKEND:-auto}"
+  local digest
+  case "$backend" in
+    auto)
+      if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | awk '{ print substr($1, 1, 12) }'
+        return 0
+      fi
+      if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | awk '{ print substr($1, 1, 12) }'
+        return 0
+      fi
+      if command -v openssl >/dev/null 2>&1; then
+        digest="$(openssl dgst -sha256 | awk '{print $NF}')"
+        printf '%s\n' "${digest:0:12}"
+        return 0
+      fi
+      die "no SHA-256 command available"
+      ;;
+    shasum)
+      command -v shasum >/dev/null 2>&1 || die "COMMPACT_SHA256_BACKEND=shasum requested but shasum is unavailable"
+      shasum -a 256 | awk '{ print substr($1, 1, 12) }'
+      ;;
+    sha256sum)
+      command -v sha256sum >/dev/null 2>&1 || die "COMMPACT_SHA256_BACKEND=sha256sum requested but sha256sum is unavailable"
+      sha256sum | awk '{ print substr($1, 1, 12) }'
+      ;;
+    openssl)
+      command -v openssl >/dev/null 2>&1 || die "COMMPACT_SHA256_BACKEND=openssl requested but openssl is unavailable"
+      digest="$(openssl dgst -sha256 | awk '{print $NF}')"
+      printf '%s\n' "${digest:0:12}"
+      ;;
+    *) die "unknown COMMPACT_SHA256_BACKEND: $backend" ;;
+  esac
+}
+
+byte_count() {
+  LC_ALL=C wc -c | tr -d ' '
+}
+
+# Detect the correct tmux server socket.
+# Priority: COMMPACT_SOCKET env > $TMUX (if socket alive) > scan for pane owner.
+detect_socket() {
+  # Explicit override
+  if [[ -n "${COMMPACT_SOCKET:-}" ]]; then
+    if [[ -S "$COMMPACT_SOCKET" ]]; then
+      echo "$COMMPACT_SOCKET"
+      return
+    fi
+    die "COMMPACT_SOCKET=$COMMPACT_SOCKET is not a valid socket"
+  fi
+
+  # Extract from $TMUX (format: "socket_path,pid,session_index")
+  if [[ -n "${TMUX:-}" ]]; then
+    local socket="${TMUX%%,*}"
+    if [[ -S "$socket" ]]; then
+      # Verify the socket is actually reachable
+      if tmux -S "$socket" list-sessions &>/dev/null; then
+        echo "$socket"
+        return
+      fi
+    fi
+  fi
+
+  # Fallback: scan tmux server sockets for one that owns $TMUX_PANE
+  local pane="${TMUX_PANE:-}"
+  if [[ -n "$pane" ]]; then
+    local uid
+    uid=$(id -u)
+    # Check both /tmp and /private/tmp (macOS symlinks /tmp → /private/tmp,
+    # but some sandboxed environments only see one or the other)
+    local sock_dirs=("/tmp/tmux-${uid}" "/private/tmp/tmux-${uid}")
+    for sock_dir in "${sock_dirs[@]}"; do
+      [[ -d "$sock_dir" ]] || continue
+      for sock in "$sock_dir"/*; do
+        [[ -S "$sock" ]] || continue
+        if tmux -S "$sock" display-message -t "$pane" -p '#{pane_id}' &>/dev/null; then
+          echo "$sock"
+          return
+        fi
+      done
+    done
+    # Also try the default socket (no -S flag)
+    if tmux display-message -t "$pane" -p '#{pane_id}' &>/dev/null; then
+      echo "__default__"
+      return
+    fi
+  fi
+
+  # Last resort: try default tmux server
+  if tmux list-sessions &>/dev/null; then
+    echo "__default__"
+    return
+  fi
+
+  die "cannot find a reachable tmux server (TMUX=${TMUX:-<unset>}, TMUX_PANE=${TMUX_PANE:-<unset>})"
+}
+
+# Resolved once at startup, used by tmx() for all tmux calls.
+TMUX_SOCKET=""
+
+init_socket() {
+  TMUX_SOCKET=$(detect_socket)
+}
+
+# Wrapper: run tmux with the detected socket.
+tmx() {
+  if [[ "$TMUX_SOCKET" == "__default__" || -z "$TMUX_SOCKET" ]]; then
+    tmux "$@"
+  else
+    tmux -S "$TMUX_SOCKET" "$@"
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+commPact - cross-pane communication for AI agents
+
+Usage: commPact <command> [args...]
+
+Commands:
+  list                      Show all panes (target, pid, command, size, label)
+  type <target> <text>      Type text without pressing Enter
+  message <target> <text>   Type text with auto-prepended sender info and reply target
+  send <target> --json --subject <text> --body-file -
+                            Paste, verify, and submit a structured message
+  read <target> [lines]     Read last N lines from pane (default: 50)
+  keys <target> <key>...    Send special keys (Enter, Escape, C-c, etc.)
+  name <target> <label>     Label a pane (visible in tmux border)
+  resolve <label>           Print pane target for a label
+  id                        Print this pane's ID ($TMUX_PANE)
+  doctor                    Diagnose tmux connectivity issues
+  version                   Print version
+  hash <text>               Print the first 12 SHA-256 hex characters
+
+Target resolution:
+  Targets can be tmux native (session:window.pane, %N) or a label set via 'name'.
+  Labels are resolved automatically - e.g. 'commPact type codex "hello"' works.
+
+Environment:
+  COMMPACT_SOCKET   Override the tmux server socket path (skips auto-detection)
+
+ACL:
+  send reads @commPact_agent_roles from the sender's session and permits only
+  same-session targets. Use --allow-label for an explicit target override.
+EOF
+  exit 0
+}
+
+require_tmux() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is not installed or not in PATH"
+}
+
+# Resolve a target: if it looks like a tmux target (%N, session:win.pane, pure digits),
+# use it directly; otherwise treat it as a @name label and resolve.
+resolve_target() {
+  local target="$1"
+  local session="${2:-}"
+
+  # Strip one label sigil before checking native tmux targets.
+  [[ "$target" == @* ]] && target="${target#@}"
+
+  # tmux pane ID like %0, %12
+  if [[ "$target" =~ ^%[0-9]+$ ]]; then
+    echo "$target"; return
+  fi
+
+  # Looks like a tmux target with colon or dot (session:win.pane)
+  if [[ "$target" == *:* ]] || [[ "$target" == *.* ]]; then
+    echo "$target"; return
+  fi
+
+  # Pure numeric - treat as window index
+  if [[ "$target" =~ ^[0-9]+$ ]]; then
+    echo "$target"; return
+  fi
+
+  # Otherwise resolve as a @name label
+  resolve_label "$target" "$session"
+}
+
+resolve_label() {
+  local label="$1"
+  local session="${2:-}"
+  local result
+  if [[ -n "$session" ]]; then
+    result=$(tmx list-panes -s -t "$session" -F '#{pane_id} #{@name}' 2>/dev/null \
+      | awk -v lbl="$label" '$2 == lbl { print $1; exit }')
+  else
+    result=$(tmx list-panes -a -F '#{pane_id} #{@name}' 2>/dev/null \
+      | awk -v lbl="$label" '$2 == lbl { print $1; exit }')
+  fi
+  if [[ -z "$result" ]]; then
+    die "no pane found with label '$label'"
+  fi
+  echo "$result"
+}
+
+validate_target() {
+  local target="$1"
+  tmx display-message -t "$target" -p '#{pane_id}' >/dev/null 2>&1 \
+    || die "invalid target: $target"
+}
+
+require_args() {
+  local need="$1" have="$2" cmd="$3"
+  if (( have < need )); then
+    die "'$cmd' requires at least $need argument(s). Run 'commPact' for usage."
+  fi
+}
+
+# --- Commands ---
+
+cmd_list() {
+  require_tmux
+  printf "%-8s %-16s %-10s %-25s %-10s %s\n" "TARGET" "SESSION:WIN" "SIZE" "PROCESS" "LABEL" "CWD"
+  tmx list-panes -a \
+    -F '#{pane_id}|#{session_name}|#{window_index}|#{window_name}|#{pane_pid}|#{pane_width}x#{pane_height}|#{@name}|#{pane_current_path}' \
+    2>/dev/null | while IFS='|' read -r id sess widx wname pid size label cwd; do
+      # Get the actual running process (deepest child of pane pid)
+      local proc child_pid
+      proc=$(ps -o comm= -p "$pid" 2>/dev/null || echo "?")
+      # Find child process (e.g. claude/node running inside zsh) - works on macOS + Linux
+      child_pid=$(pgrep -P "$pid" 2>/dev/null | head -1 || true)
+      if [[ -n "$child_pid" ]]; then
+        local child_proc
+        child_proc=$(ps -o comm= -p "$child_pid" 2>/dev/null || true)
+        if [[ -n "$child_proc" ]]; then
+          proc="$child_proc"
+        fi
+      fi
+      # Shorten home dir in cwd
+      cwd="${cwd/#$HOME/~}"
+      printf "%-8s %-16s %-10s %-25s %-10s %s\n" \
+        "$id" "${sess}:${widx}" "$size" "$proc" "${label:--}" "$cwd"
+    done
+}
+
+cmd_type() {
+  require_args 2 $# "type"
+  require_tmux
+  local target
+  target=$(resolve_target "$1")
+  validate_target "$target"
+  require_read "$target"
+
+  tmx send-keys -t "$target" -l -- "$2"
+  clear_read "$target"
+}
+
+cmd_message() {
+  require_args 2 $# "message"
+  require_tmux
+  local target
+  target=$(resolve_target "$1")
+  validate_target "$target"
+  require_read "$target"
+
+  # Detect sender identity and location
+  local sender_pane="${TMUX_PANE:-}"
+  if [[ -z "$sender_pane" ]]; then
+    die "not running inside a tmux pane (\$TMUX_PANE is unset)"
+  fi
+  local sender_label
+  sender_label=$(tmx display-message -t "$sender_pane" -p '#{@name}' 2>/dev/null || true)
+  local from="${sender_label:-$sender_pane}"
+  local session_win
+  session_win=$(tmx display-message -t "$sender_pane" -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || true)
+
+  local header body
+  header="[commPact from:${from} pane:${sender_pane} at:${session_win}]"
+  body=$(strip_leading_bridge_headers "$2")
+  tmx send-keys -t "$target" -l -- "${header} ${body}"
+  clear_read "$target"
+}
+
+cmd_read() {
+  require_tmux
+  require_args 1 $# "read"
+  local target
+  target=$(resolve_target "$1")
+  validate_target "$target"
+  local lines="${2:-50}"
+
+  tmx capture-pane -t "$target" -p -J -S "-${lines}"
+  mark_read "$target"
+}
+
+cmd_keys() {
+  require_args 2 $# "keys"
+  require_tmux
+  local target
+  target=$(resolve_target "$1")
+  validate_target "$target"
+  require_read "$target"
+  shift
+
+  for key in "$@"; do
+    tmx send-keys -t "$target" "$key"
+  done
+  clear_read "$target"
+}
+
+cmd_send() {
+  require_args 1 $# "send"
+  require_tmux
+
+  local target_arg="$1"
+  shift
+
+  local json=false
+  local subject=""
+  local body_file=""
+  local allow_labels=""
+  local allow_override=false
+  local expect_label=""
+  local max_bytes=8192
+  local lock_timeout_ms=1500
+  local verify_mode="marker-hash"
+  local no_submit=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json)
+        json=true
+        shift
+        ;;
+      --subject)
+        [[ $# -ge 2 ]] || die "'send --subject' requires a value"
+        subject="$2"
+        shift 2
+        ;;
+      --body-file)
+        [[ $# -ge 2 ]] || die "'send --body-file' requires a value"
+        body_file="$2"
+        shift 2
+        ;;
+      --allow-label)
+        [[ $# -ge 2 ]] || die "'send --allow-label' requires a value"
+        allow_labels="$2"
+        allow_override=true
+        shift 2
+        ;;
+      --expect-label)
+        [[ $# -ge 2 ]] || die "'send --expect-label' requires a value"
+        expect_label="$2"
+        shift 2
+        ;;
+      --max-bytes)
+        [[ $# -ge 2 ]] || die "'send --max-bytes' requires a value"
+        max_bytes="$2"
+        shift 2
+        ;;
+      --lock-timeout-ms)
+        [[ $# -ge 2 ]] || die "'send --lock-timeout-ms' requires a value"
+        lock_timeout_ms="$2"
+        shift 2
+        ;;
+      --verify)
+        [[ $# -ge 2 ]] || die "'send --verify' requires a value"
+        verify_mode="$2"
+        shift 2
+        ;;
+      --no-submit)
+        no_submit=true
+        shift
+        ;;
+      *)
+        send_result "INVALID_ARGS" "" "" "" "" "" false false "unknown option: $1"
+        return 2
+        ;;
+    esac
+  done
+
+  if [[ "$json" != true ]]; then
+    send_result "INVALID_ARGS" "" "" "" "" "" false false "send requires --json in this version"
+    return 2
+  fi
+  if [[ -z "$subject" || "$subject" == *$'\n'* || "$subject" == *$'\r'* ]]; then
+    send_result "INVALID_ARGS" "" "" "" "" "" false false "subject must be one non-empty line"
+    return 2
+  fi
+  if [[ "$body_file" != "-" ]]; then
+    send_result "INVALID_ARGS" "" "" "" "" "" false false "send currently supports only --body-file -"
+    return 2
+  fi
+  if [[ ! "$max_bytes" =~ ^[0-9]+$ || "$max_bytes" -le 0 ]]; then
+    send_result "INVALID_ARGS" "" "" "" "" "" false false "max-bytes must be a positive integer"
+    return 2
+  fi
+  if [[ ! "$lock_timeout_ms" =~ ^[0-9]+$ || "$lock_timeout_ms" -le 0 ]]; then
+    send_result "INVALID_ARGS" "" "" "" "" "" false false "lock-timeout-ms must be a positive integer"
+    return 2
+  fi
+  if [[ "$verify_mode" != "marker-hash" ]]; then
+    send_result "INVALID_ARGS" "" "" "" "" "" false false "only --verify marker-hash is supported"
+    return 2
+  fi
+
+  local body
+  body=$(cat)
+  if [[ -z "$body" ]]; then
+    send_result "INVALID_ARGS" "" "" "" "" "" false false "body must not be empty"
+    return 2
+  fi
+  body=$(strip_leading_structured_headers "$body")
+  if [[ -z "$body" ]]; then
+    send_result "INVALID_ARGS" "" "" "" "" "" false false "body must not be empty after stripping generated headers"
+    return 2
+  fi
+
+  local body_bytes
+  body_bytes=$(printf '%s' "$body" | byte_count)
+  if (( body_bytes > max_bytes )); then
+    send_result "INVALID_ARGS" "" "" "" "" "" false false "body exceeds max-bytes"
+    return 2
+  fi
+
+  local sender_pane="${TMUX_PANE:-}"
+  local sender_session=""
+  local configured_agent_roles=""
+  if [[ -n "$sender_pane" ]] && tmx display-message -t "$sender_pane" -p '#{pane_id}' >/dev/null 2>&1; then
+    sender_session=$(tmx display-message -t "$sender_pane" -p '#{session_name}' 2>/dev/null || true)
+    configured_agent_roles=$(tmx show-options -t "$sender_session" -v @commPact_agent_roles 2>/dev/null || true)
+  fi
+  if [[ -z "$sender_session" ]]; then
+    send_result "ACL_UNCONFIGURED" "" "" "" "" "" false false "sender session is unavailable; initialize or adopt the session before using send"
+    return 3
+  fi
+  if [[ -z "$configured_agent_roles" ]]; then
+    send_result "ACL_UNCONFIGURED" "$sender_pane" "" "" "" "" false false "sender session has no @commPact_agent_roles; initialize or adopt the session before using send"
+    return 3
+  fi
+  [[ "$allow_override" == true ]] || allow_labels="$configured_agent_roles"
+
+  local target pane_id label target_session
+  target=$(resolve_target "$target_arg" "$sender_session") || return $?
+  validate_target "$target"
+  pane_id=$(tmx display-message -t "$target" -p '#{pane_id}' 2>/dev/null || true)
+  label=$(tmx display-message -t "$pane_id" -p '#{@name}' 2>/dev/null || true)
+  target_session=$(tmx display-message -t "$pane_id" -p '#{session_name}' 2>/dev/null || true)
+
+  if [[ "$target_session" != "$sender_session" ]]; then
+    send_result "ACL_DENIED" "$pane_id" "$label" "" "" "" false false "target pane is outside the sender session"
+    return 3
+  fi
+
+  if [[ -z "$label" ]]; then
+    send_result "TARGET_UNLABELED" "$pane_id" "" "" "" "" false false "target pane has no label"
+    return 3
+  fi
+  if [[ -n "$expect_label" && "$label" != "$expect_label" ]]; then
+    send_result "ACL_DENIED" "$pane_id" "$label" "" "" "" false false "target label does not match --expect-label"
+    return 3
+  fi
+  if ! label_allowed "$label" "$allow_labels"; then
+    send_result "ACL_DENIED" "$pane_id" "$label" "" "" "" false false "target label is not allowed"
+    return 3
+  fi
+
+  local socket_hash safe_pane lock_dir acquired=false attempts max_attempts
+  socket_hash=$(printf '%s' "$TMUX_SOCKET" | cksum | awk '{ print $1 }')
+  safe_pane="${pane_id//%/_}"
+  local uid; uid=$(id -u)
+  lock_dir="/tmp/commPact-${uid}/locks/${socket_hash}/${safe_pane}.lock"
+  mkdir -p "$(dirname "$lock_dir")"
+
+  max_attempts=$(( (lock_timeout_ms + 99) / 100 ))
+  (( max_attempts < 1 )) && max_attempts=1
+  for ((attempts = 0; attempts < max_attempts; attempts++)); do
+    if mkdir "$lock_dir" 2>/dev/null; then
+      acquired=true
+      break
+    fi
+    sleep 0.1
+  done
+  if [[ "$acquired" != true ]]; then
+    if [[ -f "${lock_dir}/meta" ]]; then
+      local holder_pid
+      holder_pid=$(awk -F= '$1=="holder_pid"{print $2}' "${lock_dir}/meta" 2>/dev/null || true)
+      if [[ -n "$holder_pid" ]] && ! kill -0 "$holder_pid" 2>/dev/null; then
+        rm -rf "$lock_dir"
+        mkdir "$lock_dir" 2>/dev/null && acquired=true
+      fi
+    fi
+  fi
+  if [[ "$acquired" != true ]]; then
+    send_result "LOCK_TIMEOUT" "$pane_id" "$label" "" "" "" false false "target pane is locked"
+    return 4
+  fi
+
+  local tmp_payload=""
+  cleanup_send() {
+    [[ -z "${tmp_payload:-}" ]] || rm -f "$tmp_payload" || true
+    [[ "${acquired:-}" != true ]] || rm -rf "$lock_dir" || true
+  }
+  trap cleanup_send RETURN
+  trap 'cleanup_send; exit 130' INT
+  trap 'cleanup_send; exit 143' TERM
+
+  local after_target after_pane after_label after_session
+  after_target=$(resolve_target "$target_arg" "$sender_session") || {
+    send_result "TARGET_CHANGED" "$pane_id" "$label" "" "" "" false false "target no longer resolves"
+    return 5
+  }
+  after_pane=$(tmx display-message -t "$after_target" -p '#{pane_id}' 2>/dev/null || true)
+  after_label=$(tmx display-message -t "$after_pane" -p '#{@name}' 2>/dev/null || true)
+  after_session=$(tmx display-message -t "$after_pane" -p '#{session_name}' 2>/dev/null || true)
+  if [[ "$after_pane" != "$pane_id" || "$after_label" != "$label" || "$after_session" != "$sender_session" ]]; then
+    send_result "TARGET_CHANGED" "$pane_id" "$label" "" "" "" false false "target changed while waiting for lock"
+    return 5
+  fi
+
+  local pane_dead pane_in_mode pane_current_command
+  pane_dead=$(tmx display-message -t "$pane_id" -p '#{pane_dead}' 2>/dev/null || echo 1)
+  pane_in_mode=$(tmx display-message -t "$pane_id" -p '#{pane_in_mode}' 2>/dev/null || echo 1)
+  pane_current_command=$(tmx display-message -t "$pane_id" -p '#{pane_current_command}' 2>/dev/null || true)
+  if [[ "$pane_dead" == "1" ]]; then
+    send_result "PANE_DEAD" "$pane_id" "$label" "" "" "" false false "target pane is dead"
+    return 6
+  fi
+  if [[ "$pane_in_mode" == "1" ]]; then
+    send_result "PANE_COPY_MODE" "$pane_id" "$label" "" "" "" false false "target pane is in copy mode"
+    return 6
+  fi
+
+  local readiness_tail ready_line queueable_agent=false
+  readiness_tail=$(tmx capture-pane -t "$pane_id" -p -J -S -8 2>/dev/null || true)
+  if queueable_agent_command "$pane_current_command"; then
+    queueable_agent=true
+  fi
+  ready_line=$(printf '%s\n' "$readiness_tail" | awk '/READY>|^[[:space:]]*[›❯>]/ { line=$0 } END { print line }')
+  if [[ -z "$ready_line" && "$queueable_agent" != true ]]; then
+    send_result "PANE_UNKNOWN" "$pane_id" "$label" "" "" "" false false "target pane does not show a ready prompt and is not a queueable agent"
+    return 6
+  fi
+  if [[ "$queueable_agent" != true && -n "$ready_line" && ! "$ready_line" =~ (READY\>|[›❯\>])[[:space:] ]*$ ]] && ! known_ghost_prompt "$ready_line"; then
+    send_result "PANE_HAS_INPUT" "$pane_id" "$label" "" "" "" false false "target pane appears to have staged input"
+    return 6
+  fi
+
+  local message_id payload_sha marker payload buffer_name sender_pane sender_label from_line
+  sender_pane="${TMUX_PANE:-unknown}"
+  sender_label="${COMMPACT_SENDER_LABEL:-external}"
+  if [[ -n "${TMUX_PANE:-}" ]] && tmx display-message -t "$TMUX_PANE" -p '#{pane_id}' >/dev/null 2>&1; then
+    sender_pane=$(tmx display-message -t "$TMUX_PANE" -p '#{pane_id}' 2>/dev/null || printf '%s' "$sender_pane")
+    sender_label=$(tmx display-message -t "$sender_pane" -p '#{@name}' 2>/dev/null || true)
+    [[ -n "$sender_label" ]] || sender_label="$sender_pane"
+  fi
+  from_line="FROM: ${sender_label} pane:${sender_pane}"
+  message_id="$(date +%s)-$$-${RANDOM:-0}"
+  payload_sha=$(printf '%s\n%s\n%s' "$subject" "$from_line" "$body" | sha256_12)
+  marker="[send:${message_id} sha256:${payload_sha}]"
+  payload="SUBJECT: ${subject}"$'\n'"${from_line}"$'\n\n'"${body}"$'\n\n'"${marker}"
+
+  tmp_payload=$(mktemp "/tmp/commPact-send.XXXXXX")
+  printf '%s' "$payload" > "$tmp_payload"
+  buffer_name="commPact-send-${safe_pane}-${message_id}"
+
+  {
+    printf 'holder_pid=%s\n' "$$"
+    printf 'sender_pane=%s\n' "${TMUX_PANE:-}"
+    printf 'target_pane=%s\n' "$pane_id"
+    printf 'target_label=%s\n' "$label"
+    printf 'message_id=%s\n' "$message_id"
+    printf 'payload_sha256_12=%s\n' "$payload_sha"
+    date '+acquired_at=%Y-%m-%dT%H:%M:%S%z'
+  } > "${lock_dir}/meta"
+
+  local pre_verify_tail
+  pre_verify_tail=$(tmx capture-pane -t "$pane_id" -p -J -S -500 2>/dev/null || true)
+
+  tmx load-buffer -b "$buffer_name" "$tmp_payload"
+  tmx paste-buffer -d -b "$buffer_name" -t "$pane_id"
+
+  local verify_tail normalized_tail normalized_marker normalized_message_id normalized_payload_sha verification verify_attempt
+  verify_tail=""
+  normalized_marker=$(printf '%s' "$marker" | tr -d '[:space:]')
+  normalized_message_id=$(printf '%s' "$message_id" | tr -d '[:space:]')
+  normalized_payload_sha=$(printf '%s' "$payload_sha" | tr -d '[:space:]')
+  verification=""
+  for verify_attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    verify_tail=$(tmx capture-pane -t "$pane_id" -p -J -S -500 2>/dev/null || true)
+    normalized_tail=$(printf '%s' "$verify_tail" | tr -d '[:space:]')
+    if [[ "$verify_tail" == *"$marker"* || "$normalized_tail" == *"$normalized_marker"* || ( "$normalized_tail" == *"$normalized_message_id"* && "$normalized_tail" == *"$normalized_payload_sha"* ) ]]; then
+      verification="marker"
+      break
+    fi
+    if [[ "$verify_tail" == *"[Pasted text #"* && "$verify_tail" != "$pre_verify_tail" ]]; then
+      verification="paste-placeholder"
+      break
+    fi
+    sleep 0.1
+  done
+  if [[ -z "$verification" ]]; then
+    if [[ "$queueable_agent" == true ]]; then
+      verification="paste-command"
+    else
+    send_result "VERIFY_FAILED" "$pane_id" "$label" "$message_id" "$payload_sha" "$marker" false true "marker not visible after paste"
+    return 7
+    fi
+  fi
+
+  if [[ "$no_submit" == true ]]; then
+    send_result "PASTED" "$pane_id" "$label" "$message_id" "$payload_sha" "$marker" false true "" "$verification"
+    return 0
+  fi
+
+  tmx send-keys -t "$pane_id" Enter
+  send_result "SUBMITTED" "$pane_id" "$label" "$message_id" "$payload_sha" "$marker" true false "" "$verification"
+}
+
+label_allowed() {
+  local label="$1"
+  local allow_csv="$2"
+  local item
+  local old_ifs="$IFS"
+  IFS=','
+  for item in $allow_csv; do
+    item="${item#"${item%%[![:space:]]*}"}"
+    item="${item%"${item##*[![:space:]]}"}"
+    if [[ "$item" == "$label" ]]; then
+      IFS="$old_ifs"
+      return 0
+    fi
+  done
+  IFS="$old_ifs"
+  return 1
+}
+
+known_ghost_prompt() {
+  local line="$1"
+  [[ "$line" == *"Find and fix a bug in @filename"* ]] && return 0
+  [[ "$line" == *"Improve documentation in @filename"* ]] && return 0
+  return 1
+}
+
+queueable_agent_command() {
+  local cmd="${1##*/}"
+  case "$cmd" in
+    codex|claude|agy|gemini|antigravity|antigravity-cli)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+strip_leading_bridge_headers() {
+  local text="$1"
+  while [[ "$text" == "[commPact from:"* ]]; do
+    local first_line="${text%%$'\n'*}"
+    [[ "$first_line" == *"]"* ]] || break
+    text="${text#*]}"
+    text="${text#"${text%%[![:space:]]*}"}"
+  done
+  printf '%s' "$text"
+}
+
+strip_leading_structured_headers() {
+  local text="$1"
+  local line
+  while :; do
+    line="${text%%$'\n'*}"
+    case "$line" in
+      SUBJECT:*|FROM:*|PANE:*)
+        if [[ "$text" == *$'\n'* ]]; then
+          text="${text#*$'\n'}"
+          text="${text#"${text%%[![:space:]]*}"}"
+        else
+          text=""
+        fi
+        ;;
+      "")
+        if [[ "$text" == *$'\n'* ]]; then
+          text="${text#*$'\n'}"
+        else
+          break
+        fi
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  printf '%s' "$text"
+}
+
+send_result() {
+  local status="$1"
+  local pane_id="${2:-}"
+  local label="${3:-}"
+  local message_id="${4:-}"
+  local payload_sha="${5:-}"
+  local marker="${6:-}"
+  local submitted="${7:-false}"
+  local manual="${8:-false}"
+  local error="${9:-}"
+  local verification="${10:-}"
+
+  printf '{'
+  printf '"status":"%s"' "$(json_escape "$status")"
+  printf ',"target_pane":"%s"' "$(json_escape "$pane_id")"
+  printf ',"target_label":"%s"' "$(json_escape "$label")"
+  printf ',"message_id":"%s"' "$(json_escape "$message_id")"
+  printf ',"payload_sha256_12":"%s"' "$(json_escape "$payload_sha")"
+  printf ',"marker":"%s"' "$(json_escape "$marker")"
+  printf ',"submitted":%s' "$submitted"
+  printf ',"manual_intervention_required":%s' "$manual"
+  printf ',"error":"%s"' "$(json_escape "$error")"
+  printf ',"verification":"%s"' "$(json_escape "$verification")"
+  printf '}\n'
+}
+
+cmd_name() {
+  require_args 2 $# "name"
+  require_tmux
+  local target
+  target=$(resolve_target "$1")
+  validate_target "$target"
+
+  tmx set-option -p -t "$target" @name "$2"
+}
+
+cmd_resolve() {
+  require_args 1 $# "resolve"
+  require_tmux
+  resolve_target "$1"
+}
+
+cmd_id() {
+  if [[ -z "${TMUX_PANE:-}" ]]; then
+    die "not running inside a tmux pane (\$TMUX_PANE is unset)"
+  fi
+  echo "$TMUX_PANE"
+}
+
+cmd_hash() {
+  require_args 1 $# "hash"
+  printf '%s' "$1" | sha256_12
+}
+
+cmd_doctor() {
+  require_tmux
+  local ok=true
+
+  echo "commPact doctor v${VERSION}"
+  echo "---"
+
+  # Environment
+  echo "TMUX_PANE:          ${TMUX_PANE:-<unset>}"
+  echo "TMUX:               ${TMUX:-<unset>}"
+  echo "COMMPACT_SOCKET: ${COMMPACT_SOCKET:-<unset>}"
+
+  # Socket from $TMUX
+  if [[ -n "${TMUX:-}" ]]; then
+    local env_socket="${TMUX%%,*}"
+    if [[ -S "$env_socket" ]]; then
+      if tmux -S "$env_socket" list-sessions &>/dev/null; then
+        echo "\$TMUX socket:       $env_socket (reachable)"
+      else
+        echo "\$TMUX socket:       $env_socket (exists but not responding)"
+        ok=false
+      fi
+    else
+      echo "\$TMUX socket:       $env_socket (MISSING - stale env)"
+      ok=false
+    fi
+  fi
+
+  # Detected socket
+  echo "---"
+  local detected
+  detected=$(detect_socket 2>/dev/null || echo "__failed__")
+  if [[ "$detected" == "__failed__" ]]; then
+    echo "Detected socket:    FAILED - no reachable tmux server found"
+    ok=false
+  elif [[ "$detected" == "__default__" ]]; then
+    echo "Detected socket:    (default tmux server)"
+  else
+    echo "Detected socket:    $detected"
+  fi
+
+  # Pane visibility
+  echo "---"
+  if [[ -n "${TMUX_PANE:-}" && "$detected" != "__failed__" ]]; then
+    if tmx display-message -t "$TMUX_PANE" -p '#{pane_id}' &>/dev/null; then
+      echo "This pane ($TMUX_PANE): visible to server"
+    else
+      echo "This pane ($TMUX_PANE): NOT visible to server"
+      ok=false
+    fi
+  fi
+
+  # Pane count
+  if [[ "$detected" != "__failed__" ]]; then
+    local count
+    count=$(tmx list-panes -a -F '#{pane_id}' 2>/dev/null | wc -l | tr -d ' ')
+    echo "Total panes:        $count"
+    local labeled
+    labeled=$(tmx list-panes -a -F '#{@name}' 2>/dev/null | grep -cv '^$' || echo 0)
+    echo "Labeled panes:      $labeled"
+  fi
+
+  echo "---"
+  if $ok; then
+    echo "Status: OK"
+  else
+    echo "Status: ISSUES DETECTED"
+    echo ""
+    echo "Likely cause: \$TMUX env var is stale (terminal was restarted)."
+    echo "Fix: re-source tmux env or set COMMPACT_SOCKET explicitly."
+    return 1
+  fi
+}
+
+# --- Main ---
+
+[[ $# -eq 0 ]] && usage
+
+# cmd_id and cmd_doctor(detect) don't need socket pre-init for the id case
+case "$1" in
+  id)      shift; cmd_id "$@"; exit ;;
+  hash)    shift; cmd_hash "$@"; exit ;;
+  -h|--help|help) usage ;;
+  version) echo "commPact $VERSION"; exit ;;
+esac
+
+# All other commands need the socket
+require_tmux
+init_socket
+
+case "$1" in
+  list)    shift; cmd_list "$@" ;;
+  type)    shift; cmd_type "$@" ;;
+  message|msg) shift; cmd_message "$@" ;;
+  send)    shift; cmd_send "$@" ;;
+  read)    shift; cmd_read "$@" ;;
+  keys)    shift; cmd_keys "$@" ;;
+  name)    shift; cmd_name "$@" ;;
+  resolve) shift; cmd_resolve "$@" ;;
+  doctor)  shift; cmd_doctor "$@" ;;
+  *)       die "unknown command: $1. Run 'commPact' for usage." ;;
+esac

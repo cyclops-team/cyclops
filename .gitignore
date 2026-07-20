@@ -1,0 +1,11 @@
+# macOS Finder metadata
+.DS_Store
+
+# Editor state
+*.swp
+*.swo
+*~
+
+# Generated local team configuration. The release ships only the example.
+config/team.conf
+config/team.conf.backup.*

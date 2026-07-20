@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BRIDGE="$SCRIPT_DIR/commPact"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  commPact-notice [--session NAME] [options] "message"
+  commPact-notice [--session NAME] [options] --stdin < message.txt
+
+Options:
+  --title TEXT        Notice title. Default: OPERATOR NOTICE
+  --level LEVEL       info | success | action | urgent. Default: info
+  --target LABEL      Target label or pane. Default: session operator role
+  --clear             Clear target pane before printing
+  --force             Clear current input before printing
+  --popup             Also show a tmux popup
+  --stdin             Read message body from stdin
+USAGE
+}
+
+die() { echo "commPact-notice: $*" >&2; exit 1; }
+[[ -x "$BRIDGE" ]] || die "package bridge missing: $BRIDGE"
+
+tmux_cmd() {
+  if [[ -n "${COMMPACT_SOCKET:-}" ]]; then
+    tmux -S "$COMMPACT_SOCKET" "$@"
+  else
+    tmux "$@"
+  fi
+}
+
+pane_for_label() {
+  local session="$1" label="$2"
+  tmux_cmd list-panes -s -t "$session" -F '#{pane_id}|#{@name}' \
+    | awk -F'|' -v wanted="$label" '$2 == wanted { print $1; exit }'
+}
+
+title="OPERATOR NOTICE"
+level="info"
+target=""
+session=""
+clear_pane=0
+force=0
+popup=0
+read_stdin=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --title) [[ $# -ge 2 ]] || die "--title requires a value"; title="$2"; shift 2 ;;
+    --level) [[ $# -ge 2 ]] || die "--level requires a value"; level="$2"; shift 2 ;;
+    --target) [[ $# -ge 2 ]] || die "--target requires a value"; target="$2"; shift 2 ;;
+    --session) [[ $# -ge 2 ]] || die "--session requires a name"; session="$2"; shift 2 ;;
+    --clear) clear_pane=1; shift ;;
+    --force) force=1; shift ;;
+    --popup) popup=1; shift ;;
+    --stdin) read_stdin=1; shift ;;
+    --help|-h) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) die "unknown option: $1" ;;
+    *) break ;;
+  esac
+done
+
+if [[ -z "$session" && -n "${TMUX_PANE:-}" ]]; then
+  session="$(tmux_cmd display-message -p '#{session_name}' 2>/dev/null || true)"
+fi
+[[ -n "$session" ]] || die "outside tmux, --session NAME is required"
+tmux_cmd has-session -t "$session" 2>/dev/null || die "session does not exist: $session"
+
+operator="$(tmux_cmd show-options -t "$session" -v @commPact_operator_role 2>/dev/null || true)"
+[[ -n "$operator" ]] || die "session lacks @commPact_operator_role metadata"
+[[ -n "$target" ]] || target="$operator"
+if [[ "$target" == %* || "$target" == *:* || "$target" == *.* ]]; then
+  pane="$target"
+else
+  pane="$(pane_for_label "$session" "$target")"
+fi
+[[ -n "$pane" ]] || die "no pane labeled '$target' in session '$session'"
+pane_session="$(tmux_cmd display-message -t "$pane" -p '#{session_name}' 2>/dev/null || true)"
+[[ "$pane_session" == "$session" ]] || die "target pane is outside session '$session'"
+
+body=""
+if [[ "$read_stdin" -eq 1 ]]; then
+  body="$(cat)"
+elif [[ $# -gt 0 ]]; then
+  body="$*"
+else
+  usage >&2
+  exit 2
+fi
+
+case "$level" in
+  info) color=$'\033[1;36m'; label="INFO" ;;
+  success|ready) color=$'\033[1;32m'; label="READY" ;;
+  action) color=$'\033[1;33m'; label="ACTION" ;;
+  urgent|error) color=$'\033[1;31m'; label="URGENT" ;;
+  *) color=$'\033[1;37m'; label="$(printf '%s' "$level" | tr '[:lower:]' '[:upper:]')" ;;
+esac
+
+sender_label="external"
+if [[ -n "${TMUX_PANE:-}" ]] && tmux_cmd display-message -t "$TMUX_PANE" -p '#{pane_id}' >/dev/null 2>&1; then
+  sender_label="$(tmux_cmd display-message -t "$TMUX_PANE" -p '#{@name}' 2>/dev/null || true)"
+  [[ -n "$sender_label" ]] || sender_label="${TMUX_PANE}"
+fi
+
+reset=$'\033[0m'
+bold=$'\033[1m'
+dim=$'\033[2m'
+pane_width="$(tmux_cmd display-message -p -t "$pane" '#{pane_width}' 2>/dev/null || echo 80)"
+[[ "$pane_width" =~ ^[0-9]+$ ]] || pane_width=80
+box_width=$((pane_width - 4)); ((box_width < 40)) && box_width=40; ((box_width > 88)) && box_width=88
+text_width=$((box_width - 4))
+border="$(printf '%*s' "$box_width" '' | tr ' ' '-')"
+timestamp="$(date '+%Y-%m-%d %H:%M')"
+format_line() {
+  local line="$1"
+  printf '%s\n' "$line" | fold -s -w "$text_width" | while IFS= read -r part; do
+    printf '| %-*s |\n' "$text_width" "$part"
+  done
+}
+
+message_file="$(mktemp "${TMPDIR:-/tmp}/commPact-notice.XXXXXX")"
+{
+  printf '%s+%s+%s\n' "$color" "$border" "$reset"
+  printf '%s| %-*s |%s\n' "$color" "$text_width" "$label - $title" "$reset"
+  printf '%s+%s+%s\n' "$color" "$border" "$reset"
+  printf '%s' "$bold"
+  while IFS= read -r line; do
+    if [[ -z "$line" ]]; then printf '| %-*s |\n' "$text_width" ''; else format_line "$line"; fi
+  done <<< "$body"
+  printf '%s' "$reset"
+  printf '%s+%s+%s\n' "$color" "$border" "$reset"
+  printf '%s%s%s\n' "$dim" "from ${sender_label} | $timestamp" "$reset"
+} > "$message_file"
+
+popup_file=""
+if [[ "$popup" -eq 1 ]]; then
+  popup_file="$(mktemp "${TMPDIR:-/tmp}/commPact-notice-popup.XXXXXX")"
+  cp "$message_file" "$popup_file"
+fi
+script_file="$(mktemp "${TMPDIR:-/tmp}/commPact-notice-script.XXXXXX")"
+cat > "$script_file" <<EOF
+#!/usr/bin/env bash
+cat "$message_file"
+rm -f "$message_file" "$script_file"
+EOF
+chmod +x "$script_file"
+
+last_line="$(tmux_cmd capture-pane -t "$pane" -p | tail -1)"
+if [[ "$force" -eq 0 && "$last_line" =~ "% ".+ ]]; then
+  rm -f "$message_file" "$script_file" "$popup_file"
+  die "target input line is not empty; rerun with --force"
+fi
+[[ "$force" -eq 1 ]] && tmux_cmd send-keys -t "$pane" C-u
+[[ "$clear_pane" -eq 1 ]] && tmux_cmd send-keys -t "$pane" C-l
+tmux_cmd send-keys -t "$pane" -l "bash '$script_file'"
+tmux_cmd send-keys -t "$pane" Enter
+if [[ "$popup" -eq 1 ]]; then
+  tmux_cmd display-popup -t "$pane" -w 80 -h 14 -E "cat '$popup_file'; rm -f '$popup_file'; printf '\\nPress Enter to close... '; read _"
+fi

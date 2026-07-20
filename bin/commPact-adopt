@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=commPact-config.sh
+source "$SCRIPT_DIR/../lib/commPact-config.sh"
+
+die() { echo "commPact-adopt: $*" >&2; exit 1; }
+
+tmux_cmd() {
+  if [[ -n "${COMMPACT_SOCKET:-}" ]]; then
+    tmux -S "$COMMPACT_SOCKET" "$@"
+  else
+    tmux "$@"
+  fi
+}
+
+session_exists() {
+  tmux_cmd has-session -t "$1" 2>/dev/null
+}
+
+pane_for_label() {
+  local session="$1" label="$2"
+  tmux_cmd list-panes -s -t "$session" -F '#{pane_id}|#{@name}' \
+    | awk -F'|' -v wanted="$label" '$2 == wanted { print $1; exit }'
+}
+
+csv_roles() {
+  local result="" i
+  for ((i = 0; i < COMMPACT_CFG_ROLE_COUNT; i++)); do
+    [[ -z "$result" ]] || result+=","
+    result+="${COMMPACT_CFG_ROLE_LABELS[i]}"
+  done
+  printf '%s' "$result"
+}
+
+stamp_metadata() {
+  local config_path="$1"
+  local roles
+  roles="$(csv_roles)"
+  tmux_cmd set-option -t "$COMMPACT_CFG_SESSION" @commPact_config_path "$config_path"
+  tmux_cmd set-option -t "$COMMPACT_CFG_SESSION" @commPact_roles "$roles"
+  tmux_cmd set-option -t "$COMMPACT_CFG_SESSION" @commPact_agent_roles "$COMMPACT_CFG_AGENT_ROLES"
+  tmux_cmd set-option -t "$COMMPACT_CFG_SESSION" @commPact_operator_role "$COMMPACT_CFG_OPERATOR"
+  tmux_cmd set-option -t "$COMMPACT_CFG_SESSION" @commPact_default_target "$COMMPACT_CFG_DEFAULT_TARGET"
+}
+
+main() {
+  local config_path="" session=""
+  local -a map_roles=() map_panes=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --config) [[ $# -ge 2 ]] || die "--config requires a path"; config_path="$2"; shift 2 ;;
+      --session) [[ $# -ge 2 ]] || die "--session requires a name"; session="$2"; shift 2 ;;
+      --map)
+        [[ $# -ge 2 ]] || die "--map requires ROLE=PANE"
+        [[ "$2" == *=* ]] || die "--map requires ROLE=PANE"
+        map_roles+=("${2%%=*}")
+        map_panes+=("${2#*=}")
+        shift 2
+        ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [[ -n "$config_path" && -n "$session" ]] || die "usage: commPact-adopt --config PATH --session NAME [--map ROLE=PANE ...]"
+  commPactConfigLoad "$config_path" || exit 1
+  [[ "$session" == "$COMMPACT_CFG_SESSION" ]] || die "session '$session' does not match config session '$COMMPACT_CFG_SESSION'"
+  session_exists "$session" || die "session does not exist: $session"
+
+  local existing_config
+  existing_config="$(tmux_cmd show-options -t "$session" -v @commPact_config_path 2>/dev/null || true)"
+  local -a resolved_panes=()
+  local i j role pane map_found
+  for ((i = 0; i < COMMPACT_CFG_ROLE_COUNT; i++)); do
+    role="${COMMPACT_CFG_ROLE_LABELS[i]}"
+    pane=""
+    map_found=false
+    for ((j = 0; j < ${#map_roles[@]}; j++)); do
+      if [[ "${map_roles[j]}" == "$role" ]]; then
+        [[ "$map_found" == false ]] || die "duplicate map for role '$role'"
+        pane="${map_panes[j]}"
+        map_found=true
+      fi
+    done
+    if [[ -z "$pane" ]]; then
+      pane="$(pane_for_label "$session" "$role")"
+    fi
+    if [[ -z "$pane" ]]; then
+      if [[ -n "$existing_config" ]]; then
+        die "adopted session metadata is incomplete; re-adopt with --config $existing_config --session $session and explicit --map values"
+      fi
+      die "session has no commPact metadata for '$role'; run adopt with explicit --map ROLE=PANE values"
+    fi
+    local pane_session
+    pane_session="$(tmux_cmd display-message -t "$pane" -p '#{session_name}' 2>/dev/null || true)"
+    [[ "$pane_session" == "$session" ]] || die "map for '$role' is not a pane in session '$session'"
+    for ((j = 0; j < i; j++)); do
+      [[ "${resolved_panes[j]}" != "$pane" ]] || die "pane '$pane' is mapped more than once"
+    done
+    resolved_panes[i]="$pane"
+  done
+
+  for ((j = 0; j < ${#map_roles[@]}; j++)); do
+    commPactConfigHasRole "${map_roles[j]}" || die "map references undeclared role '${map_roles[j]}'"
+  done
+
+  for ((i = 0; i < COMMPACT_CFG_ROLE_COUNT; i++)); do
+    tmux_cmd set-option -p -t "${resolved_panes[i]}" @name "${COMMPACT_CFG_ROLE_LABELS[i]}"
+    tmux_cmd set-option -p -t "${resolved_panes[i]}" @role "${COMMPACT_CFG_ROLE_LABELS[i]}"
+  done
+  stamp_metadata "$config_path"
+  echo "adopted $session with $COMMPACT_CFG_ROLE_COUNT roles"
+}
+
+main "$@"

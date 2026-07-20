@@ -1,0 +1,40 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    name: Regression (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install tmux when missing
+        shell: bash
+        run: |
+          if command -v tmux >/dev/null 2>&1; then
+            exit 0
+          fi
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get update
+            sudo apt-get install -y tmux
+          else
+            brew install tmux
+          fi
+
+      - name: Run regression suite
+        shell: bash
+        run: bash tests/regression.sh
