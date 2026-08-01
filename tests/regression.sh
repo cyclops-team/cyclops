@@ -111,9 +111,6 @@ cyclops_resolve="$(COMMPACT_SOCKET="$SOCKET" "$DEST/bin/cyclops" resolve lead)"
 assert_eq "$cyclops_resolve" "$raw_label"
 cyclops_list="$(COMMPACT_SOCKET="$SOCKET" "$DEST/bin/cyclops" list)"
 [[ -n "$cyclops_list" ]] || fail "cyclops list produced no output"
-cyclops_dry_run="$(cd "$TMP_ROOT" && "$DEST/bin/cyclops" start --dry-run --roles driver --command sh)"
-[[ "$cyclops_dry_run" == *'agent_roles=driver'* ]] || fail "cyclops start did not forward setup options"
-[[ "$cyclops_dry_run" == *'session=commpact'* ]] || fail "cyclops start did not default the session name"
 
 printf 'commPact regression: cyclops start_strategy resume/attach/setup decision\n'
 NO_CONFIG="$TMP_ROOT/no-such-config.conf"
@@ -158,7 +155,143 @@ ln -s "$CUSTOM_HOME/bin/cyclops" "$CUSTOM_BIN/cyclops"
 HOME="$HOME_TEST" "$CUSTOM_BIN/cyclops" uninstall >/dev/null
 [[ ! -e "$CUSTOM_HOME" ]] || fail "cyclops uninstall did not remove its own install home"
 [[ -e "$DEST" ]] || fail "cyclops uninstall removed the default install home instead of its own"
-[[ ! -e "$CUSTOM_BIN/cyclops" ]] || fail "cyclops uninstall left a dangling PATH symlink"
+[[ ! -e "$CUSTOM_BIN/cyclops" && ! -L "$CUSTOM_BIN/cyclops" ]] || fail "cyclops uninstall left a dangling PATH symlink"
+
+printf 'commPact regression: cyclops refuses to update/uninstall an unmanaged directory\n'
+assert_file "$DEST/.commPact-installed"
+UNMANAGED_CHECKOUT="$TMP_ROOT/unmanaged-checkout"
+mkdir -p "$UNMANAGED_CHECKOUT/bin"
+cp "$RELEASE/bin/cyclops" "$UNMANAGED_CHECKOUT/bin/cyclops"
+chmod +x "$UNMANAGED_CHECKOUT/bin/cyclops"
+[[ ! -e "$UNMANAGED_CHECKOUT/.commPact-installed" ]] || fail "unmanaged fixture unexpectedly carries the managed-install marker"
+if HOME="$HOME_TEST" "$UNMANAGED_CHECKOUT/bin/cyclops" update >/dev/null 2>&1; then
+  fail "cyclops update ran against a directory without a managed-install marker"
+fi
+[[ -d "$UNMANAGED_CHECKOUT" ]] || fail "cyclops update guard did not stop before touching the unmanaged directory"
+if HOME="$HOME_TEST" "$UNMANAGED_CHECKOUT/bin/cyclops" uninstall >/dev/null 2>&1; then
+  fail "cyclops uninstall deleted a directory without a managed-install marker"
+fi
+[[ -d "$UNMANAGED_CHECKOUT" ]] || fail "cyclops uninstall guard did not stop before deleting the unmanaged directory"
+
+printf 'commPact regression: cyclops start --help and setup-only arg rejection\n'
+cyclops_start_help="$("$DEST/bin/cyclops" start --help)"
+[[ "$cyclops_start_help" == *'Usage: commPact-setup'* ]] || fail "cyclops start --help did not show setup usage"
+REJECT_CONFIG="$TMP_ROOT/cyclops-reject-args.conf"
+cat > "$REJECT_CONFIG" <<'EOF'
+version=1
+session=cyclops-reject-args-session
+workdir=/tmp
+layout=tiled
+operator=operator
+default_target=lead
+agent_roles=lead
+role=operator|sh
+role=lead|sh
+EOF
+if COMMPACT_SOCKET="$SOCKET" "$DEST/bin/cyclops" start --config "$REJECT_CONFIG" --roles solo >/dev/null 2>&1; then
+  fail "cyclops start silently accepted a setup-only flag once a config already exists"
+fi
+
+printf 'commPact regression: cyclops start rejects commPact-setup-only config modes\n'
+for setup_only_flag in --dry-run --config-only --replace-config; do
+  if "$DEST/bin/cyclops" start "$setup_only_flag" >/dev/null 2>&1; then
+    fail "cyclops start accepted $setup_only_flag, which is commPact-setup only"
+  fi
+done
+# The rejection is unconditional -- it must fire even when a workspace
+# already exists (the resume path), not just on first-time setup.
+if COMMPACT_SOCKET="$SOCKET" "$DEST/bin/cyclops" start --config "$REJECT_CONFIG" --config-only >/dev/null 2>&1; then
+  fail "cyclops start accepted --config-only against an existing config"
+fi
+
+printf 'commPact regression: public installer script (offline via CYCLOPS_SOURCE_DIR)\n'
+INSTALLER_HOME="$TMP_ROOT/installer-home"
+INSTALLER_BIN="$TMP_ROOT/installer-bin"
+env -u TMUX -u TMUX_PANE HOME="$HOME_TEST" CYCLOPS_SOURCE_DIR="$DEST" \
+  CYCLOPS_HOME="$INSTALLER_HOME" CYCLOPS_BIN_DIR="$INSTALLER_BIN" \
+  sh "$RELEASE/frontend/static/install.sh" >/dev/null
+assert_file "$INSTALLER_HOME/.commPact-installed"
+[[ -L "$INSTALLER_BIN/cyclops" ]] || fail "public installer did not link cyclops onto PATH"
+[[ "$(readlink "$INSTALLER_BIN/cyclops")" == "$INSTALLER_HOME/bin/cyclops" ]] \
+  || fail "public installer linked cyclops to the wrong target"
+
+printf 'commPact regression: public installer refuses to hijack an unmanaged symlink\n'
+HIJACK_BIN="$TMP_ROOT/installer-hijack-bin"
+mkdir -p "$HIJACK_BIN" "$TMP_ROOT/unrelated-tool"
+printf '#!/bin/sh\necho unrelated\n' > "$TMP_ROOT/unrelated-tool/cyclops"
+chmod +x "$TMP_ROOT/unrelated-tool/cyclops"
+ln -s "$TMP_ROOT/unrelated-tool/cyclops" "$HIJACK_BIN/cyclops"
+if env -u TMUX -u TMUX_PANE HOME="$HOME_TEST" CYCLOPS_SOURCE_DIR="$DEST" \
+  CYCLOPS_HOME="$INSTALLER_HOME" CYCLOPS_BIN_DIR="$HIJACK_BIN" \
+  sh "$RELEASE/frontend/static/install.sh" >/dev/null 2>&1; then
+  fail "public installer silently replaced a symlink it doesn't manage"
+fi
+[[ "$(readlink "$HIJACK_BIN/cyclops")" == "$TMP_ROOT/unrelated-tool/cyclops" ]] \
+  || fail "public installer removed an unmanaged symlink before refusing to proceed"
+
+printf 'commPact regression: cyclops update/uninstall take no options besides --help\n'
+GUARD_HOME="$TMP_ROOT/destination-guard-home"
+HOME="$HOME_TEST" "$RELEASE/bin/commPact-install" install --destination "$GUARD_HOME" >/dev/null
+DESTINATION_VICTIM="$TMP_ROOT/destination-victim"
+mkdir -p "$DESTINATION_VICTIM"
+printf 'do not touch me\n' > "$DESTINATION_VICTIM/marker.txt"
+
+cyclops_update_help="$(HOME="$HOME_TEST" "$GUARD_HOME/bin/cyclops" update --help)"
+[[ "$cyclops_update_help" == *'Usage: commPact-install'* ]] || fail "cyclops update --help did not show commPact-install usage"
+cyclops_uninstall_help="$(HOME="$HOME_TEST" "$GUARD_HOME/bin/cyclops" uninstall --help)"
+[[ "$cyclops_uninstall_help" == *'Usage: commPact-install'* ]] || fail "cyclops uninstall --help did not show commPact-install usage"
+
+if HOME="$HOME_TEST" "$GUARD_HOME/bin/cyclops" update --destination "$DESTINATION_VICTIM" >/dev/null 2>&1; then
+  fail "cyclops update accepted a caller-supplied --destination"
+fi
+assert_file "$DESTINATION_VICTIM/marker.txt"
+[[ -d "$GUARD_HOME" ]] || fail "cyclops update guard removed its own install home"
+if HOME="$HOME_TEST" "$GUARD_HOME/bin/cyclops" uninstall --restore "$DESTINATION_VICTIM" >/dev/null 2>&1; then
+  fail "cyclops uninstall accepted a --restore option (advanced restore is commPact-install only now)"
+fi
+assert_file "$DESTINATION_VICTIM/marker.txt"
+[[ -d "$GUARD_HOME" ]] || fail "cyclops uninstall guard removed its own install home"
+
+printf 'commPact regression: cyclops start validates --session/--config values\n'
+if COMMPACT_SOCKET="$SOCKET" "$DEST/bin/cyclops" start --session >/dev/null 2>&1; then
+  fail "cyclops start accepted --session without a value"
+fi
+if COMMPACT_SOCKET="$SOCKET" "$DEST/bin/cyclops" start --config >/dev/null 2>&1; then
+  fail "cyclops start accepted --config without a value"
+fi
+CONFLICT_CONFIG="$TMP_ROOT/cyclops-conflict.conf"
+cat > "$CONFLICT_CONFIG" <<'EOF'
+version=1
+session=cyclops-conflict-saved-session
+workdir=/tmp
+layout=tiled
+operator=operator
+default_target=lead
+agent_roles=lead
+role=operator|sh
+role=lead|sh
+EOF
+if COMMPACT_SOCKET="$SOCKET" "$DEST/bin/cyclops" start --config "$CONFLICT_CONFIG" --session some-other-session >/dev/null 2>&1; then
+  fail "cyclops start silently ignored a --session that conflicts with the saved config"
+fi
+
+printf 'commPact regression: public installer canonicalizes a relative CYCLOPS_HOME\n'
+RELATIVE_INSTALL_BASE="$TMP_ROOT/relative-install-base"
+RELATIVE_INSTALL_BIN="$TMP_ROOT/relative-install-bin"
+mkdir -p "$RELATIVE_INSTALL_BASE" "$RELATIVE_INSTALL_BIN"
+(
+  cd "$RELATIVE_INSTALL_BASE"
+  env -u TMUX -u TMUX_PANE HOME="$HOME_TEST" CYCLOPS_SOURCE_DIR="$DEST" \
+    CYCLOPS_HOME="relative-home" CYCLOPS_BIN_DIR="$RELATIVE_INSTALL_BIN" \
+    sh "$RELEASE/frontend/static/install.sh" >/dev/null
+)
+RELATIVE_LINK_TARGET="$(readlink "$RELATIVE_INSTALL_BIN/cyclops")"
+case "$RELATIVE_LINK_TARGET" in
+  /*) : ;;
+  *) fail "public installer linked cyclops to a relative target: $RELATIVE_LINK_TARGET" ;;
+esac
+[[ -x "$RELATIVE_INSTALL_BIN/cyclops" ]] || fail "public installer's relative-CYCLOPS_HOME symlink is dangling"
+"$RELATIVE_INSTALL_BIN/cyclops" version >/dev/null || fail "public installer's relative-CYCLOPS_HOME symlink is broken"
 
 printf 'commPact regression: one-command generic bootstrap\n'
 QUICK_HOME="$TMP_ROOT/quick-home"
@@ -256,6 +389,61 @@ STATE="$TMP_ROOT/state"
 mkdir -p "$STATE"
 touch "$STATE/last_update"
 "$DEST/bin/commPact-state-watchdog" --state-dir "$STATE" >/dev/null
+
+printf 'commPact regression: commPact-install validates --restore before deleting the install\n'
+RESTORE_GUARD_HOME="$TMP_ROOT/restore-guard-home"
+HOME="$HOME_TEST" "$RELEASE/bin/commPact-install" install --destination "$RESTORE_GUARD_HOME" >/dev/null
+RESTORE_GUARD_CHANGELOG_BEFORE="$(cat "$RESTORE_GUARD_HOME/CHANGELOG.md")"
+
+if HOME="$HOME_TEST" "$RELEASE/bin/commPact-install" uninstall --destination "$RESTORE_GUARD_HOME" \
+  --restore "$TMP_ROOT/no-such-backup" >/dev/null 2>&1; then
+  fail "commPact-install uninstall accepted a --restore path that doesn't exist"
+fi
+[[ -d "$RESTORE_GUARD_HOME" ]] || fail "an invalid --restore path deleted the install before validation"
+[[ "$(cat "$RESTORE_GUARD_HOME/CHANGELOG.md")" == "$RESTORE_GUARD_CHANGELOG_BEFORE" ]] \
+  || fail "an invalid --restore path left the install modified"
+HOME="$HOME_TEST" "$RESTORE_GUARD_HOME/bin/cyclops" version >/dev/null \
+  || fail "an invalid --restore path broke the launcher"
+
+RESTORE_GUARD_NOT_A_DIR="$TMP_ROOT/restore-guard-not-a-dir"
+printf 'not a directory\n' > "$RESTORE_GUARD_NOT_A_DIR"
+if HOME="$HOME_TEST" "$RELEASE/bin/commPact-install" uninstall --destination "$RESTORE_GUARD_HOME" \
+  --restore "$RESTORE_GUARD_NOT_A_DIR" >/dev/null 2>&1; then
+  fail "commPact-install uninstall accepted a --restore path that is a file, not a directory"
+fi
+[[ -d "$RESTORE_GUARD_HOME" ]] || fail "a file --restore path deleted the install before validation"
+[[ "$(cat "$RESTORE_GUARD_HOME/CHANGELOG.md")" == "$RESTORE_GUARD_CHANGELOG_BEFORE" ]] \
+  || fail "a file --restore path left the install modified"
+HOME="$HOME_TEST" "$RESTORE_GUARD_HOME/bin/cyclops" version >/dev/null \
+  || fail "a file --restore path broke the launcher"
+
+printf 'commPact regression: commPact-install rejects overlapping restore paths\n'
+RESTORE_GUARD_NESTED="$RESTORE_GUARD_HOME/nested-backup"
+mkdir -p "$RESTORE_GUARD_NESTED"
+printf 'nested backup marker\n' > "$RESTORE_GUARD_NESTED/marker.txt"
+if HOME="$HOME_TEST" "$RELEASE/bin/commPact-install" uninstall --destination "$RESTORE_GUARD_HOME" \
+  --restore "$RESTORE_GUARD_NESTED" >/dev/null 2>&1; then
+  fail "commPact-install accepted a restore path inside the install home"
+fi
+assert_file "$RESTORE_GUARD_NESTED/marker.txt"
+[[ -x "$RESTORE_GUARD_HOME/bin/cyclops" ]] \
+  || fail "a nested restore path deleted the install"
+
+if HOME="$HOME_TEST" "$RELEASE/bin/commPact-install" uninstall --destination "$RESTORE_GUARD_HOME" \
+  --restore "$TMP_ROOT" >/dev/null 2>&1; then
+  fail "commPact-install accepted a restore path containing the install home"
+fi
+assert_file "$RESTORE_GUARD_NESTED/marker.txt"
+[[ -x "$RESTORE_GUARD_HOME/bin/cyclops" ]] \
+  || fail "an ancestor restore path deleted the install"
+
+if HOME="$HOME_TEST" "$RELEASE/bin/commPact-install" uninstall --destination "$RESTORE_GUARD_HOME" \
+  --restore "$RESTORE_GUARD_HOME/." >/dev/null 2>&1; then
+  fail "commPact-install accepted a restore path resolving to the install home"
+fi
+assert_file "$RESTORE_GUARD_NESTED/marker.txt"
+[[ -x "$RESTORE_GUARD_HOME/bin/cyclops" ]] \
+  || fail "an equivalent restore path deleted the install"
 
 printf 'commPact regression: explicit uninstall and restore\n'
 HOME="$HOME_TEST" "$RELEASE/bin/commPact-install" uninstall --destination "$DEST" --restore "$BACKUP" >/dev/null

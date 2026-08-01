@@ -10,7 +10,7 @@
 # doing the one network fetch itself and nothing else privileged.
 #
 # Environment overrides:
-#   CYCLOPS_REF          branch, tag, or (git only) commit SHA to install (default: main)
+#   CYCLOPS_REF          branch, tag, or full commit SHA to install (default: main)
 #   CYCLOPS_HOME          install destination (default: $HOME/.commPact)
 #   CYCLOPS_BIN_DIR        where the `cyclops` command is linked (default: $HOME/.local/bin)
 #   CYCLOPS_SOURCE_DIR    use this local directory instead of downloading (offline/dev use)
@@ -21,6 +21,19 @@ REPO_NAME="cyclops"
 REF="${CYCLOPS_REF:-main}"
 CYCLOPS_HOME="${CYCLOPS_HOME:-$HOME/.commPact}"
 BIN_DIR="${CYCLOPS_BIN_DIR:-$HOME/.local/bin}"
+# A relative CYCLOPS_HOME works fine for install_release() (every op below
+# runs from the same CWD), but ln -s writes it into the symlink verbatim --
+# and a relative symlink target is resolved against the symlink's own
+# directory ($BIN_DIR) at dereference time, not this script's CWD. Absolute
+# it here so the linked `cyclops` command doesn't dangle.
+case "$CYCLOPS_HOME" in
+  /*) : ;;
+  *) CYCLOPS_HOME="$PWD/$CYCLOPS_HOME" ;;
+esac
+# Written into every tree bin/commPact-install produces. Used below to tell
+# a symlink cyclops itself manages apart from an unrelated one that happens
+# to already occupy $BIN_DIR/cyclops.
+MANAGED_MARKER=".commPact-installed"
 
 say() { printf 'cyclops: %s\n' "$1"; }
 err() { printf 'cyclops: %s\n' "$1" >&2; exit 1; }
@@ -43,9 +56,16 @@ fetch_source() {
 
   if need_cmd git; then
     say "fetching $REPO_OWNER/$REPO_NAME@$REF (git)"
-    git clone --depth 1 --branch "$REF" \
-      "https://github.com/$REPO_OWNER/$REPO_NAME.git" "$src_dir" >/dev/null 2>&1 \
-      || err "git clone failed; check your network connection and that ref '$REF' exists"
+    # Not `git clone --branch`: that flag only resolves branch and tag
+    # names, so a full commit SHA (documented as a valid CYCLOPS_REF) would
+    # fail with "Remote branch ... not found". init+fetch+checkout resolves
+    # branches, tags, and (for public GitHub repos) full commit SHAs alike.
+    mkdir -p "$src_dir"
+    git -C "$src_dir" init --quiet \
+      && git -C "$src_dir" fetch --quiet --depth 1 \
+        "https://github.com/$REPO_OWNER/$REPO_NAME.git" "$REF" \
+      && git -C "$src_dir" checkout --quiet FETCH_HEAD \
+      || err "git fetch failed; check your network connection and that ref '$REF' exists"
     return
   fi
 
@@ -83,8 +103,22 @@ link_command() {
   mkdir -p "$BIN_DIR"
 
   target="$BIN_DIR/cyclops"
-  if [ -e "$target" ] && [ ! -L "$target" ]; then
-    err "$target already exists and isn't a symlink cyclops manages; move it aside (or set CYCLOPS_BIN_DIR to a different directory) and re-run"
+  # -e alone misses a dangling symlink (it follows the link and reports
+  # false), so also check -L before concluding nothing is there.
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    if [ ! -L "$target" ]; then
+      err "$target already exists and isn't a symlink cyclops manages; move it aside (or set CYCLOPS_BIN_DIR to a different directory) and re-run"
+    fi
+    need_cmd readlink || err "cyclops needs readlink to safely check the existing $target symlink"
+    link_dest="$(readlink "$target")"
+    case "$link_dest" in
+      /*) : ;;
+      *) link_dest="$BIN_DIR/$link_dest" ;;
+    esac
+    link_home="$(dirname "$(dirname "$link_dest")")"
+    if [ ! -f "$link_home/$MANAGED_MARKER" ]; then
+      err "$target is a symlink cyclops doesn't manage (-> $link_dest); move it aside (or set CYCLOPS_BIN_DIR to a different directory) and re-run"
+    fi
   fi
   rm -f "$target"
 

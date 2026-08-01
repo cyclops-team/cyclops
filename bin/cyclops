@@ -23,8 +23,20 @@ SCRIPT_DIR="$(cd -P "$(dirname "$(resolve_script_path "${BASH_SOURCE[0]}")")" &&
 # cyclops always knows where it actually lives.
 INSTALL_HOME="$(cd -P "$SCRIPT_DIR/.." && pwd)"
 CYCLOPS_REPO_URL="https://github.com/notyahir/cyclops.git"
+# Written into every tree commPact-install produces (install and update).
+# Absent from a plain source checkout, so it distinguishes a managed
+# install home from the repository cyclops happens to be running out of.
+MANAGED_MARKER=".commPact-installed"
 
 die() { echo "cyclops: $*" >&2; exit 1; }
+
+# update/uninstall are destructive against $INSTALL_HOME. Without this
+# check, running `bin/cyclops update|uninstall` straight out of a source
+# checkout would treat the checkout itself as the install home and fetch
+# over it or rm -rf it.
+require_managed_install() {
+  [[ -f "$INSTALL_HOME/$MANAGED_MARKER" ]] || die "$INSTALL_HOME does not look like a managed install (missing $MANAGED_MARKER) -- refusing to $1 it. If this is a source checkout, install with 'curl -fsSL https://usecyclops.dev/install.sh | sh' instead, or use commPact-install directly."
+}
 
 usage() {
   cat <<'USAGE'
@@ -37,7 +49,10 @@ directory. This is equivalent to `cyclops start`.
 
 Commands:
   start [options]        Bootstrap, resume, or attach a tmux workspace
-                          (options: see commPact-setup --help)
+                          (team-shape options: see commPact-setup --help;
+                          config-generation modes such as --dry-run,
+                          --config-only, and --replace-config are
+                          commPact-setup only, not accepted here)
   send TARGET ...        Send a structured message to a labeled pane
   list                   Show panes, processes, sizes, and labels
   read TARGET [LINES]    Inspect pane output
@@ -46,8 +61,10 @@ Commands:
                           Pane-level primitives (see commPact --help)
   adopt ...               Label an existing tmux session
   layout ...               Apply the configured layout and theme
-  update                  Fetch and install the latest release
-  uninstall                Remove this installation
+  update                  Fetch and install the latest release (no
+                          options; see commPact-install for advanced use)
+  uninstall                Remove this installation (no options; see
+                          commPact-install for advanced use)
   version                 Print installed versions
   help                    Show this help
 
@@ -68,10 +85,13 @@ has_flag() {
   return 1
 }
 
+# Empty means --session was never passed -- distinct from an explicit
+# value -- so callers can tell "not specified" from "specified as X".
 session_arg() {
-  local session="commpact"
+  local session=""
   while [[ $# -gt 0 ]]; do
-    if [[ "$1" == "--session" && $# -ge 2 ]]; then
+    if [[ "$1" == "--session" ]]; then
+      [[ $# -ge 2 ]] || die "--session requires a value"
       session="$2"
     fi
     shift
@@ -82,7 +102,8 @@ session_arg() {
 config_arg() {
   local config_path="$INSTALL_HOME/config/team.conf"
   while [[ $# -gt 0 ]]; do
-    if [[ "$1" == "--config" && $# -ge 2 ]]; then
+    if [[ "$1" == "--config" ]]; then
+      [[ $# -ge 2 ]] || die "--config requires a value"
       config_path="$2"
     fi
     shift
@@ -130,26 +151,69 @@ start_strategy() {
   fi
 }
 
+# Flags that only mean something when generating a new config via
+# commPact-setup. If a workspace already exists (attach/init), forwarding
+# these silently -- as if cyclops had applied them -- would misrepresent
+# what actually happened.
+reject_unusable_start_args() {
+  local arg skip_next=false
+  for arg in "$@"; do
+    if [[ "$skip_next" == true ]]; then
+      skip_next=false
+      continue
+    fi
+    case "$arg" in
+      --session | --config) skip_next=true ;;
+      *) die "a workspace already exists; '$arg' only applies to first-time setup (run commPact-setup --replace-config to regenerate it, or stop the tmux session first)" ;;
+    esac
+  done
+}
+
+# --dry-run, --config-only, and --replace-config are commPact-setup's
+# config-generation modes (print and exit, write config only, force-
+# regenerate an existing config). cyclops start only ever bootstraps,
+# resumes, or attaches -- keep those modes under commPact-setup directly
+# instead of giving cyclops start a second, overlapping set of meanings.
+reject_setup_only_flags() {
+  local flag
+  for flag in --dry-run --config-only --replace-config; do
+    if has_flag "$flag" "$@"; then
+      die "cyclops start does not support $flag; run commPact-setup directly for advanced config modes ($SCRIPT_DIR/commPact-setup --help)"
+    fi
+  done
+}
+
 cmd_start() {
-  # These modes have their own explicit semantics (print and exit, write
-  # config only, force-regenerate config) that the resume/attach shortcuts
-  # below must not intercept.
-  if has_flag --dry-run "$@" || has_flag --config-only "$@" || has_flag --replace-config "$@"; then
-    "$SCRIPT_DIR/commPact-setup" --workdir "$PWD" --attach "$@"
+  if has_flag --help "$@" || has_flag -h "$@"; then
+    "$SCRIPT_DIR/commPact-setup" --help
     return
   fi
+  reject_setup_only_flags "$@"
 
-  local config_path session strategy
+  local config_path
   config_path="$(config_arg "$@")"
-  session=""
-  [[ -e "$config_path" ]] && session="$(config_session "$config_path")"
-  [[ -n "$session" ]] || session="$(session_arg "$@")"
+
+  local config_derived_session="" explicit_session session strategy
+  [[ -e "$config_path" ]] && config_derived_session="$(config_session "$config_path")"
+  explicit_session="$(session_arg "$@")"
+  if [[ -n "$config_derived_session" && -n "$explicit_session" && "$config_derived_session" != "$explicit_session" ]]; then
+    die "the config at $config_path targets session '$config_derived_session', which conflicts with --session $explicit_session (run commPact-setup --replace-config to regenerate it, use --config to point elsewhere, or drop --session to resume '$config_derived_session')"
+  fi
+  session="${config_derived_session:-${explicit_session:-commpact}}"
 
   strategy="$(start_strategy "$session" "$config_path")"
   case "$strategy" in
-    attach) attach_session "$session" ;;
-    init) exec "$SCRIPT_DIR/commPact-init" --config "$config_path" --attach ;;
-    setup) "$SCRIPT_DIR/commPact-setup" --workdir "$PWD" --attach "$@" ;;
+    attach)
+      reject_unusable_start_args "$@"
+      attach_session "$session"
+      ;;
+    init)
+      reject_unusable_start_args "$@"
+      exec "$SCRIPT_DIR/commPact-init" --config "$config_path" --attach
+      ;;
+    setup)
+      "$SCRIPT_DIR/commPact-setup" --workdir "$PWD" --attach --config "$config_path" "$@"
+      ;;
   esac
 }
 
@@ -162,6 +226,12 @@ cleanup_update_tmp() { [[ -z "$UPDATE_TMP_DIR" ]] || rm -rf "$UPDATE_TMP_DIR"; }
 trap cleanup_update_tmp EXIT
 
 cmd_update() {
+  if has_flag --help "$@" || has_flag -h "$@"; then
+    "$SCRIPT_DIR/commPact-install" --help
+    return
+  fi
+  require_managed_install update
+  [[ $# -eq 0 ]] || die "cyclops update takes no options; run '$SCRIPT_DIR/commPact-install update' directly for advanced options (e.g. --replace)"
   local ref="${CYCLOPS_REF:-main}" release_dir
   UPDATE_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cyclops-update.XXXXXX")"
 
@@ -170,28 +240,34 @@ cmd_update() {
   else
     command -v git >/dev/null 2>&1 \
       || die "update requires git; re-run the installer instead: curl -fsSL https://usecyclops.dev/install.sh | sh"
-    git clone --depth 1 --branch "$ref" "$CYCLOPS_REPO_URL" "$UPDATE_TMP_DIR/src" >/dev/null 2>&1 \
+    # Not `git clone --branch`: that flag only resolves branch and tag
+    # names, so a full commit SHA (a documented CYCLOPS_REF value) would
+    # fail with "Remote branch ... not found". init+fetch+checkout resolves
+    # branches, tags, and (for public GitHub repos) full commit SHAs alike
+    # -- same fix as frontend/static/install.sh's fetch_source.
+    mkdir -p "$UPDATE_TMP_DIR/src"
+    git -C "$UPDATE_TMP_DIR/src" init --quiet \
+      && git -C "$UPDATE_TMP_DIR/src" fetch --quiet --depth 1 "$CYCLOPS_REPO_URL" "$ref" \
+      && git -C "$UPDATE_TMP_DIR/src" checkout --quiet FETCH_HEAD \
       || die "could not fetch the latest release (ref '$ref')"
     release_dir="$UPDATE_TMP_DIR/src"
   fi
 
   [[ -x "$release_dir/bin/commPact-install" ]] || die "fetched release is missing bin/commPact-install"
-  "$release_dir/bin/commPact-install" update --destination "$INSTALL_HOME" "$@"
+  "$release_dir/bin/commPact-install" update --destination "$INSTALL_HOME"
 }
 
 cmd_uninstall() {
-  local invoked="${BASH_SOURCE[0]}" path_link="" arg
+  if has_flag --help "$@" || has_flag -h "$@"; then
+    "$SCRIPT_DIR/commPact-install" --help
+    return
+  fi
+  require_managed_install uninstall
+  [[ $# -eq 0 ]] || die "cyclops uninstall takes no options; run '$SCRIPT_DIR/commPact-install uninstall' directly for advanced options (e.g. --restore)"
+  local invoked="${BASH_SOURCE[0]}" path_link=""
   [[ -L "$invoked" ]] && path_link="$invoked"
-  for arg in "$@"; do
-    if [[ "$arg" == "--restore" ]]; then
-      # A restore uninstall puts the install tree right back, so the PATH
-      # symlink into it is still valid afterward -- leave it alone.
-      path_link=""
-      break
-    fi
-  done
 
-  "$SCRIPT_DIR/commPact-install" uninstall --destination "$INSTALL_HOME" "$@"
+  "$SCRIPT_DIR/commPact-install" uninstall --destination "$INSTALL_HOME"
   [[ -z "$path_link" ]] || rm -f "$path_link"
 }
 

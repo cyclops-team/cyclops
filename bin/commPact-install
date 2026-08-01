@@ -57,6 +57,15 @@ validate_destination() {
   [[ -n "$DESTINATION" && "$DESTINATION" != "/" ]] || die "refusing unsafe destination '$DESTINATION'"
 }
 
+canonical_existing_dir() {
+  (cd -P -- "$1" && pwd -P)
+}
+
+path_is_same_or_within() {
+  local candidate="$1" parent="$2"
+  [[ "$candidate" == "$parent" || "$parent" == "/" || "$candidate" == "$parent/"* ]]
+}
+
 required_files=(
   bin/commPact
   bin/commPact-adopt
@@ -113,6 +122,10 @@ stage_tree() {
     cp "$PACKAGE_ROOT/$path" "$stage/$path"
   done
   chmod +x "$stage"/bin/* "$stage"/tests/*.sh "$stage/install.sh"
+  # Marks this tree as a managed install (as opposed to a source checkout
+  # that happens to satisfy the file manifest above). cyclops update/
+  # uninstall refuse to run destructively without this marker present.
+  printf 'version=%s\ndestination=%s\n' "$VERSION" "$DESTINATION" > "$stage/.commPact-installed"
   validate_tree "$stage"
 }
 
@@ -163,6 +176,21 @@ install_tree() {
 uninstall_tree() {
   validate_destination
   [[ -e "$DESTINATION" ]] || die "install home does not exist: $DESTINATION"
+  # Validate before the rm -rf below, not after: catching a bad --restore
+  # path once the existing install is already gone would strand the caller
+  # with neither the old install nor a usable restore.
+  if [[ -n "${RESTORE:-}" ]]; then
+    local destination_real restore_real
+    [[ -d "$RESTORE" ]] || die "restore backup is not a directory: $RESTORE"
+    destination_real="$(canonical_existing_dir "$DESTINATION")" \
+      || die "install home is not a directory: $DESTINATION"
+    restore_real="$(canonical_existing_dir "$RESTORE")" \
+      || die "could not resolve restore backup: $RESTORE"
+    path_is_same_or_within "$restore_real" "$destination_real" \
+      && die "restore backup must be outside the install home: $RESTORE"
+    path_is_same_or_within "$destination_real" "$restore_real" \
+      && die "restore backup must not contain the install home: $RESTORE"
+  fi
   rm -rf -- "$DESTINATION"
   echo "uninstalled: $DESTINATION"
   local backup
@@ -170,8 +198,6 @@ uninstall_tree() {
     [[ -e "$backup" ]] && echo "backup retained: $backup"
   done
   if [[ -n "${RESTORE:-}" ]]; then
-    [[ -d "$RESTORE" ]] || die "restore backup is not a directory: $RESTORE"
-    [[ ! -e "$DESTINATION" ]] || die "restore destination unexpectedly exists: $DESTINATION"
     mkdir -p "$DESTINATION"
     cp -R "$RESTORE/." "$DESTINATION/"
     echo "restored explicit backup: $RESTORE"

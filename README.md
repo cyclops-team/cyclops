@@ -98,6 +98,8 @@ Use <code>--workdir PATH</code> if panes should open somewhere other than the cu
 | <code>--replace-config</code> | Back up and replace an existing generated config. |
 | <code>--attach</code> | Attach to the new tmux session after setup. |
 
+These config-generation modes are <code>commPact-setup</code> only. <code>cyclops start</code> always bootstraps, resumes, or attaches — it rejects <code>--dry-run</code>, <code>--config-only</code>, and <code>--replace-config</code> and points you at <code>commPact-setup</code> instead.
+
 ## Send messages between panes
 
 <code>send</code> is the normal agent-to-agent primitive. It generates the visible <code>SUBJECT:</code> and <code>FROM:</code> envelope, verifies the paste reached the target, submits it, and returns compact JSON.
@@ -191,15 +193,19 @@ source ~/.zshrc
 ~~~sh
 cyclops update
 cyclops uninstall
-~/.commPact/bin/commPact-install uninstall --restore PATH
 ~~~
 
-These forward to <code>commPact-install</code>, which can also be called directly:
+<code>cyclops update</code> and <code>cyclops uninstall</code> take no options other than <code>--help</code> — they always act on this install's own home. For anything beyond that, call <code>commPact-install</code> directly:
 
 ~~~sh
 ~/.commPact/bin/commPact-install update
 ~/.commPact/bin/commPact-install uninstall
+~/.commPact/bin/commPact-install uninstall --restore PATH
 ~~~
+
+<code>cyclops update</code> fetches the latest release from GitHub (or a pinned <code>CYCLOPS_REF</code>) and hands it to that release's own <code>commPact-install update</code>. It is not the same as calling <code>commPact-install update</code> directly on your existing install, which re-copies the already-installed tree onto itself and fetches nothing — useful only for repairing a damaged install, not for getting a newer release.
+
+<code>cyclops uninstall</code> forwards straight to <code>commPact-install uninstall</code> and also removes the <code>cyclops</code> symlink it created on <code>PATH</code>; calling <code>commPact-install uninstall</code> directly does not touch that symlink, and is also the only way to pass advanced options such as <code>--restore</code> (restore an explicit backup) or <code>--destination</code> (target an install elsewhere).
 
 <code>update</code> preserves a valid generated config and creates a timestamped backup. A replace-install also creates a backup. <code>uninstall</code> does not create a backup; it removes the install home and reports any existing backups, which are never auto-deleted.
 
