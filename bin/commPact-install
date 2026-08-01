@@ -67,6 +67,7 @@ required_files=(
   bin/commPact-install
   bin/commPact-setup
   bin/commPact-state-watchdog
+  bin/cyclops
   lib/commPact-config.sh
   config/team.conf.example
   config/theme.conf

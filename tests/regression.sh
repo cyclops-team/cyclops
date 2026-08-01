@@ -15,7 +15,7 @@ assert_file() { [[ -f "$1" ]] || fail "missing file: $1"; }
 assert_eq() { [[ "$1" == "$2" ]] || fail "expected '$2', got '$1'"; }
 
 printf 'commPact regression: release tree\n'
-for command_name in commPact commPact-adopt commPact-init commPact-layout commPact-msg commPact-notice commPact-install commPact-setup commPact-state-watchdog; do
+for command_name in commPact commPact-adopt commPact-init commPact-layout commPact-msg commPact-notice commPact-install commPact-setup commPact-state-watchdog cyclops; do
   assert_file "$RELEASE/bin/$command_name"
   [[ -x "$RELEASE/bin/$command_name" ]] || fail "not executable: $command_name"
 done
@@ -65,7 +65,7 @@ if HOME="$HOME_TEST" "$RELEASE/bin/commPact-install" install --destination "$DES
   fail "install replaced an existing home without --replace"
 fi
 HOME="$HOME_TEST" "$RELEASE/bin/commPact-install" install --replace --destination "$DEST" >/dev/null
-PATH="$DEST/bin:$PATH" HOME="$HOME_TEST" bash -c 'for name in commPact commPact-adopt commPact-init commPact-layout commPact-msg commPact-notice commPact-install commPact-setup commPact-state-watchdog; do command -v "$name" >/dev/null || exit 1; done; commPact-msg --help >/dev/null; commPact-setup --help >/dev/null; commPact-install version >/dev/null'
+PATH="$DEST/bin:$PATH" HOME="$HOME_TEST" bash -c 'for name in commPact commPact-adopt commPact-init commPact-layout commPact-msg commPact-notice commPact-install commPact-setup commPact-state-watchdog cyclops; do command -v "$name" >/dev/null || exit 1; done; commPact-msg --help >/dev/null; commPact-setup --help >/dev/null; commPact-install version >/dev/null; cyclops help >/dev/null; cyclops version >/dev/null'
 [[ ! -e "$DEST.next.$$" ]] || fail "staging path leaked"
 
 printf 'commPact regression: update and retained backup\n'
@@ -101,6 +101,64 @@ env -u TMUX -u TMUX_PANE COMMPACT_SOCKET="$SOCKET" "$DEST/bin/commPact-msg" --se
 raw_label="$(COMMPACT_SOCKET="$SOCKET" "$DEST/bin/commPact" resolve lead)"
 at_label="$(COMMPACT_SOCKET="$SOCKET" "$DEST/bin/commPact" resolve @lead)"
 assert_eq "$at_label" "$raw_label"
+
+printf 'commPact regression: cyclops entry point\n'
+cyclops_help="$("$DEST/bin/cyclops" help)"
+[[ "$cyclops_help" == *'one team, any agent'* ]] || fail "cyclops help output missing banner"
+cyclops_hash="$("$DEST/bin/cyclops" hash abc)"
+assert_eq "$cyclops_hash" "ba7816bf8f01"
+cyclops_resolve="$(COMMPACT_SOCKET="$SOCKET" "$DEST/bin/cyclops" resolve lead)"
+assert_eq "$cyclops_resolve" "$raw_label"
+cyclops_list="$(COMMPACT_SOCKET="$SOCKET" "$DEST/bin/cyclops" list)"
+[[ -n "$cyclops_list" ]] || fail "cyclops list produced no output"
+cyclops_dry_run="$(cd "$TMP_ROOT" && "$DEST/bin/cyclops" start --dry-run --roles driver --command sh)"
+[[ "$cyclops_dry_run" == *'agent_roles=driver'* ]] || fail "cyclops start did not forward setup options"
+[[ "$cyclops_dry_run" == *'session=commpact'* ]] || fail "cyclops start did not default the session name"
+
+printf 'commPact regression: cyclops start_strategy resume/attach/setup decision\n'
+NO_CONFIG="$TMP_ROOT/no-such-config.conf"
+STUB_CONFIG="$TMP_ROOT/strategy-stub.conf"
+: >"$STUB_CONFIG"
+strategy_setup="$(
+  CYCLOPS_TEST_SESSION="no-such-session" CYCLOPS_TEST_CONFIG="$NO_CONFIG" COMMPACT_SOCKET="$SOCKET" \
+    bash -c 'source "$1"; start_strategy "$CYCLOPS_TEST_SESSION" "$CYCLOPS_TEST_CONFIG"' _ "$DEST/bin/cyclops"
+)"
+assert_eq "$strategy_setup" "setup"
+strategy_init="$(
+  CYCLOPS_TEST_SESSION="no-such-session" CYCLOPS_TEST_CONFIG="$STUB_CONFIG" COMMPACT_SOCKET="$SOCKET" \
+    bash -c 'source "$1"; start_strategy "$CYCLOPS_TEST_SESSION" "$CYCLOPS_TEST_CONFIG"' _ "$DEST/bin/cyclops"
+)"
+assert_eq "$strategy_init" "init"
+strategy_attach="$(
+  CYCLOPS_TEST_SESSION="team-example" CYCLOPS_TEST_CONFIG="$STUB_CONFIG" COMMPACT_SOCKET="$SOCKET" \
+    bash -c 'source "$1"; start_strategy "$CYCLOPS_TEST_SESSION" "$CYCLOPS_TEST_CONFIG"' _ "$DEST/bin/cyclops"
+)"
+assert_eq "$strategy_attach" "attach"
+
+printf 'commPact regression: cyclops update/uninstall target their own install home\n'
+CUSTOM_HOME="$TMP_ROOT/custom-cyclops-home"
+DEST_CHANGELOG_BEFORE="$(cat "$DEST/CHANGELOG.md")"
+HOME="$HOME_TEST" "$RELEASE/bin/commPact-install" install --destination "$CUSTOM_HOME" >/dev/null
+assert_file "$CUSTOM_HOME/bin/cyclops"
+[[ "$(cat "$DEST/CHANGELOG.md")" == "$DEST_CHANGELOG_BEFORE" ]] \
+  || fail "custom-destination install modified the default install home"
+
+UPDATE_FIXTURE="$TMP_ROOT/update-fixture"
+cp -R "$RELEASE" "$UPDATE_FIXTURE"
+printf '\n### cyclops regression marker %s\n' "$$" >>"$UPDATE_FIXTURE/CHANGELOG.md"
+CYCLOPS_SOURCE_DIR="$UPDATE_FIXTURE" HOME="$HOME_TEST" "$CUSTOM_HOME/bin/cyclops" update >/dev/null
+grep -q "cyclops regression marker $$" "$CUSTOM_HOME/CHANGELOG.md" \
+  || fail "cyclops update did not install the fetched release into its own install home"
+grep -q "cyclops regression marker $$" "$DEST/CHANGELOG.md" \
+  && fail "cyclops update touched the default install home instead of its own"
+
+CUSTOM_BIN="$TMP_ROOT/custom-bin"
+mkdir -p "$CUSTOM_BIN"
+ln -s "$CUSTOM_HOME/bin/cyclops" "$CUSTOM_BIN/cyclops"
+HOME="$HOME_TEST" "$CUSTOM_BIN/cyclops" uninstall >/dev/null
+[[ ! -e "$CUSTOM_HOME" ]] || fail "cyclops uninstall did not remove its own install home"
+[[ -e "$DEST" ]] || fail "cyclops uninstall removed the default install home instead of its own"
+[[ ! -e "$CUSTOM_BIN/cyclops" ]] || fail "cyclops uninstall left a dangling PATH symlink"
 
 printf 'commPact regression: one-command generic bootstrap\n'
 QUICK_HOME="$TMP_ROOT/quick-home"

@@ -19,10 +19,12 @@ export interface InstallMethod {
 	note?: string;
 }
 
-// NOTE: as of 2026-08-01 this URL did not resolve and the installer's own
-// test suite intentionally blocked curl/wget — set here at explicit request.
-// Confirm https://usecyclops.dev/install.sh is actually deployed before this
-// ships; otherwise "Copy" hands users a dead command.
+// The script itself now lives at frontend/static/install.sh (served at
+// /install.sh by this SvelteKit app). It fetches the release from GitHub
+// and delegates the actual install to bin/commPact-install, which stays
+// network-free — see tests/regression.sh for that guarantee.
+// Still TODO: confirm usecyclops.dev is actually deployed and pointed at
+// this app before shipping; otherwise "Copy" hands users a dead command.
 export const INSTALL_METHODS: InstallMethod[] = [
 	{
 		id: 'script',

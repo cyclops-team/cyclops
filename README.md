@@ -1,27 +1,36 @@
-# commPact
+# cyclops
 
-**Structured, safe communication for teams working across tmux panes.**
+**One team, any agent.** Structured, safe communication for coding agents (and shells, REPLs, or any long-running process) working across tmux panes.
 
-Use it with AI agents, shells, REPLs, or long-running processes. commPact gives each pane an identity, delivers structured messages, and keeps communication inside an explicit same-session permission boundary.
+`cyclops` gives each pane an identity, delivers structured messages, and keeps communication inside an explicit same-session permission boundary. It's built on the commPact toolkit, whose individual commands remain available for advanced use.
 
-[![Test](https://github.com/notyahir/commPact/actions/workflows/ci.yml/badge.svg)](https://github.com/notyahir/commPact/actions/workflows/ci.yml)
+[![Test](https://github.com/notyahir/cyclops/actions/workflows/ci.yml/badge.svg)](https://github.com/notyahir/cyclops/actions/workflows/ci.yml)
 
 ## Quick start
 
-Clone commPact somewhere separate, then bootstrap it from the project directory where the panes should open:
+~~~sh
+curl -fsSL https://usecyclops.dev/install.sh | sh
+cyclops
+~~~
+
+The install script fetches the release from GitHub, installs it into <code>~/.commPact</code>, and links the <code>cyclops</code> command onto your <code>PATH</code> (it prints the one line to add if your shell doesn't already pick it up). Running <code>cyclops</code> with no arguments then bootstraps — or, if a workspace is already running, attaches to — a tmux session in the current directory with generic defaults: <code>operator</code>, <code>lead</code>, <code>worker</code>, and <code>reviewer</code>.
+
+> **Path guide:** <code>~/.commPact</code> is the managed local installation and contains your generated team config.
+
+Requirements: macOS or Linux, Bash, and tmux 3.2 or newer recommended. Everything past the initial GitHub fetch stays local: the installer never installs packages, edits shell startup files, or changes <code>tmux.conf</code>.
+
+### Install from a local clone
+
+Prefer to review the source first, need <code>--install-only</code>, or want to build from a branch? Clone the repository and bootstrap from the project directory where the panes should open:
 
 ~~~sh
-git clone https://github.com/notyahir/commPact.git ~/commPact
+git clone https://github.com/notyahir/cyclops.git ~/cyclops
 cd /path/to/your/project
-~/commPact/install.sh
+~/cyclops/install.sh
 tmux attach -t commpact
 ~~~
 
-That one bootstrap command installs commPact into <code>~/.commPact</code>, generates a validated local configuration, and starts a shell-based team with generic defaults: <code>operator</code>, <code>lead</code>, <code>worker</code>, and <code>reviewer</code>.
-
-> **Path guide:** <code>~/commPact</code> is the cloned source repository. <code>~/.commPact</code> is the managed local installation and contains your generated team config.
-
-Requirements: macOS or Linux, Bash, and tmux 3.2 or newer recommended. The installer checks them, but never installs packages, downloads from the network, edits shell startup files, or changes <code>tmux.conf</code>.
+This runs the same underlying installer as the curl script. It installs <code>cyclops</code> and every commPact command under <code>~/.commPact/bin/</code>, but — unlike the curl script — does not link <code>cyclops</code> onto your <code>PATH</code>. Add the directory yourself (see [Command reference](#command-reference)), or call <code>~/.commPact/bin/cyclops</code> directly.
 
 ## How it works
 
@@ -51,7 +60,16 @@ The labels are yours. <code>driver</code>, <code>implementer</code>, <code>revie
 Pass only the values you want to change. This example starts every pane with the same command, which is useful when each pane runs the same CLI agent.
 
 ~~~sh
-~/commPact/install.sh \
+cyclops start \
+  --session project \
+  --roles driver,implementer,reviewer \
+  --command codex
+~~~
+
+<code>cyclops start</code> already attaches once the session is ready. From a local clone, the equivalent is:
+
+~~~sh
+~/cyclops/install.sh \
   --session project \
   --roles driver,implementer,reviewer \
   --command codex
@@ -59,7 +77,7 @@ Pass only the values you want to change. This example starts every pane with the
 tmux attach -t project
 ~~~
 
-Use <code>--workdir PATH</code> if panes should open somewhere other than the current directory. Run <code>~/commPact/install.sh --install-only</code> when you want the tools without starting a session yet.
+Use <code>--workdir PATH</code> if panes should open somewhere other than the current directory. Run <code>~/cyclops/install.sh --install-only</code> when you want the tools without starting a session yet.
 
 <code>commPact-setup</code> can also be run directly after installation:
 
@@ -146,8 +164,11 @@ When renaming a live team, notify every pane first. Pause sends during the brief
 
 ## Command reference
 
+<code>cyclops</code> is a thin front end over the commPact toolkit below — <code>cyclops send ...</code> is <code>commPact send ...</code>, <code>cyclops start</code> is <code>commPact-setup --attach</code>, and so on. Reach for the commPact commands directly for options <code>cyclops</code> doesn't expose (adoption maps, config-only generation, etc.).
+
 | Command | Purpose |
 | --- | --- |
+| <code>cyclops</code> | Start (or attach to) a workspace in the current directory. |
 | <code>commPact list</code> | Show panes, processes, sizes, and labels. |
 | <code>commPact send TARGET --json --subject TEXT --body-file -</code> | Send one structured message. |
 | <code>commPact read TARGET [LINES]</code> | Inspect pane output for status or debugging. |
@@ -158,7 +179,7 @@ When renaming a live team, notify every pane first. Pause sends during the brief
 | <code>commPact-layout --config PATH</code> | Apply the configured layout and theme. |
 | <code>commPact-install update</code> | Update a local installation while preserving valid config. |
 
-Every command is available under <code>~/.commPact/bin/</code> after installation. Add it to your <code>PATH</code> only if you want shorter commands:
+Every command is available under <code>~/.commPact/bin/</code> after installation. The curl installer already links <code>cyclops</code> onto your <code>PATH</code>; add the whole directory if you want the rest of the commands too, or installed from a local clone:
 
 ~~~sh
 echo 'export PATH="$HOME/.commPact/bin:$PATH"' >> ~/.zshrc
@@ -168,9 +189,16 @@ source ~/.zshrc
 ## Update and uninstall
 
 ~~~sh
+cyclops update
+cyclops uninstall
+~/.commPact/bin/commPact-install uninstall --restore PATH
+~~~
+
+These forward to <code>commPact-install</code>, which can also be called directly:
+
+~~~sh
 ~/.commPact/bin/commPact-install update
 ~/.commPact/bin/commPact-install uninstall
-~/.commPact/bin/commPact-install uninstall --restore PATH
 ~~~
 
 <code>update</code> preserves a valid generated config and creates a timestamped backup. A replace-install also creates a backup. <code>uninstall</code> does not create a backup; it removes the install home and reports any existing backups, which are never auto-deleted.

@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# cyclops - unified entry point for the commPact toolkit.
+set -euo pipefail
+
+resolve_script_path() {
+  local source="$1" dir target
+  while [[ -L "$source" ]]; do
+    dir="$(cd -P "$(dirname "$source")" && pwd)"
+    target="$(readlink "$source")"
+    case "$target" in
+      /*) source="$target" ;;
+      *) source="$dir/$target" ;;
+    esac
+  done
+  printf '%s' "$source"
+}
+
+# cyclops is typically symlinked onto PATH from the real install home
+# (e.g. ~/.local/bin/cyclops -> ~/.commPact/bin/cyclops), so resolve through
+# the symlink to find the sibling commPact-* commands next to it.
+SCRIPT_DIR="$(cd -P "$(dirname "$(resolve_script_path "${BASH_SOURCE[0]}")")" && pwd)"
+# The install root, regardless of what CYCLOPS_HOME the installer used —
+# cyclops always knows where it actually lives.
+INSTALL_HOME="$(cd -P "$SCRIPT_DIR/.." && pwd)"
+CYCLOPS_REPO_URL="https://github.com/notyahir/cyclops.git"
+
+die() { echo "cyclops: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'USAGE'
+cyclops - one team, any agent
+
+Usage: cyclops [command] [args...]
+
+With no command, cyclops starts (or attaches to) a workspace in the current
+directory. This is equivalent to `cyclops start`.
+
+Commands:
+  start [options]        Bootstrap, resume, or attach a tmux workspace
+                          (options: see commPact-setup --help)
+  send TARGET ...        Send a structured message to a labeled pane
+  list                   Show panes, processes, sizes, and labels
+  read TARGET [LINES]    Inspect pane output
+  resolve TARGET         Print the pane target for a label
+  type / keys / name / message / id / doctor / hash
+                          Pane-level primitives (see commPact --help)
+  adopt ...               Label an existing tmux session
+  layout ...               Apply the configured layout and theme
+  update                  Fetch and install the latest release
+  uninstall                Remove this installation
+  version                 Print installed versions
+  help                    Show this help
+
+Examples:
+  cyclops
+  cyclops start --roles driver,implementer,reviewer --command codex
+  cyclops send reviewer --json --subject "Review request" --body-file -
+USAGE
+}
+
+has_flag() {
+  local want="$1"
+  shift
+  local arg
+  for arg in "$@"; do
+    [[ "$arg" == "$want" ]] && return 0
+  done
+  return 1
+}
+
+session_arg() {
+  local session="commpact"
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--session" && $# -ge 2 ]]; then
+      session="$2"
+    fi
+    shift
+  done
+  printf '%s' "$session"
+}
+
+config_arg() {
+  local config_path="$INSTALL_HOME/config/team.conf"
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--config" && $# -ge 2 ]]; then
+      config_path="$2"
+    fi
+    shift
+  done
+  printf '%s' "$config_path"
+}
+
+# The session name a saved config actually targets, which may differ from
+# session_arg's CLI-derived guess (e.g. it was generated with --session once
+# and this invocation didn't repeat it).
+config_session() {
+  local config_path="$1" line
+  line="$(grep -m1 '^session=' "$config_path" 2>/dev/null || true)"
+  [[ -n "$line" ]] && printf '%s' "${line#session=}"
+}
+
+tmux_cmd() {
+  if [[ -n "${COMMPACT_SOCKET:-}" ]]; then
+    tmux -S "$COMMPACT_SOCKET" "$@"
+  else
+    tmux "$@"
+  fi
+}
+
+attach_session() {
+  if [[ -n "${COMMPACT_SOCKET:-}" ]]; then
+    exec tmux -S "$COMMPACT_SOCKET" attach -t "$1"
+  else
+    exec tmux attach -t "$1"
+  fi
+}
+
+# Decide how to bring the workspace up, given what's actually there:
+# a live session wins (just attach); otherwise a saved config means the
+# session was stopped (reboot, `tmux kill-session`) and should be resumed
+# from it; otherwise this is a genuine first run.
+start_strategy() {
+  local session="$1" config_path="$2"
+  if tmux_cmd has-session -t "$session" 2>/dev/null; then
+    printf 'attach'
+  elif [[ -e "$config_path" ]]; then
+    printf 'init'
+  else
+    printf 'setup'
+  fi
+}
+
+cmd_start() {
+  # These modes have their own explicit semantics (print and exit, write
+  # config only, force-regenerate config) that the resume/attach shortcuts
+  # below must not intercept.
+  if has_flag --dry-run "$@" || has_flag --config-only "$@" || has_flag --replace-config "$@"; then
+    "$SCRIPT_DIR/commPact-setup" --workdir "$PWD" --attach "$@"
+    return
+  fi
+
+  local config_path session strategy
+  config_path="$(config_arg "$@")"
+  session=""
+  [[ -e "$config_path" ]] && session="$(config_session "$config_path")"
+  [[ -n "$session" ]] || session="$(session_arg "$@")"
+
+  strategy="$(start_strategy "$session" "$config_path")"
+  case "$strategy" in
+    attach) attach_session "$session" ;;
+    init) exec "$SCRIPT_DIR/commPact-init" --config "$config_path" --attach ;;
+    setup) "$SCRIPT_DIR/commPact-setup" --workdir "$PWD" --attach "$@" ;;
+  esac
+}
+
+# A function-scoped `trap ... RETURN` isn't actually scoped to the function
+# that set it -- it fires on every later function return in this process,
+# by which point a `local` fetch_dir is out of scope. Use one script-level
+# EXIT trap instead, same as tests/regression.sh does for its temp dirs.
+UPDATE_TMP_DIR=""
+cleanup_update_tmp() { [[ -z "$UPDATE_TMP_DIR" ]] || rm -rf "$UPDATE_TMP_DIR"; }
+trap cleanup_update_tmp EXIT
+
+cmd_update() {
+  local ref="${CYCLOPS_REF:-main}" release_dir
+  UPDATE_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cyclops-update.XXXXXX")"
+
+  if [[ -n "${CYCLOPS_SOURCE_DIR:-}" ]]; then
+    release_dir="$CYCLOPS_SOURCE_DIR"
+  else
+    command -v git >/dev/null 2>&1 \
+      || die "update requires git; re-run the installer instead: curl -fsSL https://usecyclops.dev/install.sh | sh"
+    git clone --depth 1 --branch "$ref" "$CYCLOPS_REPO_URL" "$UPDATE_TMP_DIR/src" >/dev/null 2>&1 \
+      || die "could not fetch the latest release (ref '$ref')"
+    release_dir="$UPDATE_TMP_DIR/src"
+  fi
+
+  [[ -x "$release_dir/bin/commPact-install" ]] || die "fetched release is missing bin/commPact-install"
+  "$release_dir/bin/commPact-install" update --destination "$INSTALL_HOME" "$@"
+}
+
+cmd_uninstall() {
+  local invoked="${BASH_SOURCE[0]}" path_link="" arg
+  [[ -L "$invoked" ]] && path_link="$invoked"
+  for arg in "$@"; do
+    if [[ "$arg" == "--restore" ]]; then
+      # A restore uninstall puts the install tree right back, so the PATH
+      # symlink into it is still valid afterward -- leave it alone.
+      path_link=""
+      break
+    fi
+  done
+
+  "$SCRIPT_DIR/commPact-install" uninstall --destination "$INSTALL_HOME" "$@"
+  [[ -z "$path_link" ]] || rm -f "$path_link"
+}
+
+main() {
+  [[ $# -gt 0 ]] || set -- start
+
+  case "$1" in
+    start)
+      shift
+      cmd_start "$@"
+      ;;
+    send | list | read | resolve | type | keys | name | message | id | doctor | hash)
+      local cmd="$1"
+      shift
+      exec "$SCRIPT_DIR/commPact" "$cmd" "$@"
+      ;;
+    adopt)
+      shift
+      exec "$SCRIPT_DIR/commPact-adopt" "$@"
+      ;;
+    layout)
+      shift
+      exec "$SCRIPT_DIR/commPact-layout" "$@"
+      ;;
+    update)
+      shift
+      cmd_update "$@"
+      ;;
+    uninstall)
+      shift
+      cmd_uninstall "$@"
+      ;;
+    version)
+      "$SCRIPT_DIR/commPact-install" version
+      "$SCRIPT_DIR/commPact" version
+      ;;
+    help | --help | -h)
+      usage
+      ;;
+    *)
+      die "unknown command '$1' (run 'cyclops help')"
+      ;;
+  esac
+}
+
+# Allow tests to `source` this file (e.g. to exercise start_strategy
+# directly) without triggering the CLI dispatch below.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
