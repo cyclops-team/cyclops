@@ -9,7 +9,10 @@
 	<h3 class="pixel heading">If it runs in your terminal,<br />it can run in Cyclops.</h3>
 	<div class="strip">
 		{#each strip as name, i (name)}
-			<span class="term-name">{name}</span>{#if i < strip.length - 1}<span class="dot">·</span>{/if}
+			<span class="item">
+				<span class="term-name">{name}</span>
+				{#if i < strip.length - 1}<span class="dot" aria-hidden="true">·</span>{/if}
+			</span>
 		{/each}
 	</div>
 </section>
@@ -24,8 +27,19 @@
 	}
 
 	.strip {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 8px 10px;
 		font-size: 14px;
 		color: var(--gray);
+	}
+
+	.item {
+		display: inline-flex;
+		align-items: center;
+		gap: 10px;
+		white-space: nowrap;
 	}
 
 	.term-name {
@@ -34,6 +48,5 @@
 
 	.dot {
 		color: var(--faint);
-		margin: 0 10px;
 	}
 </style>

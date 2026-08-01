@@ -14,7 +14,7 @@
 		</div>
 		<a class="github-link" href={REPO_URL} target="_blank" rel="noopener noreferrer">
 			<GithubMark size={14} />
-			github.com/notyahir/cyclops
+			<span>github.com/notyahir/cyclops</span>
 		</a>
 	</div>
 </section>
@@ -57,9 +57,15 @@
 	.github-link {
 		display: inline-flex;
 		align-items: center;
+		max-width: 100%;
 		gap: 8px;
 		font-size: 13px;
 		color: var(--gray);
+	}
+
+	.github-link span {
+		min-width: 0;
+		overflow-wrap: anywhere;
 	}
 
 	.github-link:hover {

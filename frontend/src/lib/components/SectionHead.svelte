@@ -30,4 +30,13 @@
 		color: var(--faint);
 		text-transform: uppercase;
 	}
+
+	@media (max-width: 420px) {
+		.head {
+			align-items: flex-start;
+			flex-direction: column;
+			gap: 10px;
+			margin-bottom: 32px;
+		}
+	}
 </style>

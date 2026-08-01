@@ -94,6 +94,8 @@ html,
 body {
 	margin: 0;
 	padding: 0;
+	max-width: 100%;
+	overflow-x: clip;
 }
 
 body {
@@ -158,6 +160,8 @@ a:hover {
 }
 
 .section {
+	width: 100%;
+	min-width: 0;
 	max-width: 1200px;
 	margin: 0 auto;
 	padding: 56px 48px;

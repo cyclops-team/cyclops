@@ -83,10 +83,21 @@
 
 	@media (max-width: 560px) {
 		header {
+			gap: 12px;
 			padding: 14px 20px;
 		}
 
+		.actions {
+			gap: 8px;
+		}
+
 		.wordmark {
+			display: none;
+		}
+	}
+
+	@media (max-width: 420px) {
+		.actions :global(.badge) {
 			display: none;
 		}
 	}

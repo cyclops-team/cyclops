@@ -62,6 +62,12 @@
 		max-width: 440px;
 	}
 
+	.copy,
+	.meta,
+	.row {
+		min-width: 0;
+	}
+
 	.actions {
 		display: flex;
 		gap: 14px;
@@ -99,6 +105,7 @@
 	.row a {
 		font-size: 13.5px;
 		color: var(--text);
+		overflow-wrap: anywhere;
 	}
 
 	.row a:hover {

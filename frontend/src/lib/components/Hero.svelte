@@ -27,11 +27,15 @@
 <style>
 	.hero {
 		display: grid;
-		grid-template-columns: 1.05fr 1fr;
+		grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
 		gap: 40px;
 		align-items: start;
 		padding-top: 40px;
 		padding-bottom: 56px;
+	}
+
+	.copy {
+		min-width: 0;
 	}
 
 	.eyebrow {
@@ -72,6 +76,8 @@
 	}
 
 	.install {
+		width: 100%;
+		min-width: 0;
 		max-width: 560px;
 	}
 
@@ -82,8 +88,19 @@
 
 	@media (max-width: 960px) {
 		.hero {
-			grid-template-columns: 1fr;
+			grid-template-columns: minmax(0, 1fr);
 			padding-top: 48px;
+		}
+	}
+
+	@media (max-width: 420px) {
+		.actions {
+			align-items: stretch;
+			flex-direction: column;
+		}
+
+		.actions a {
+			justify-content: center;
 		}
 	}
 </style>
