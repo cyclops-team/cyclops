@@ -35,7 +35,7 @@ die() { echo "cyclops: $*" >&2; exit 1; }
 # checkout would treat the checkout itself as the install home and fetch
 # over it or rm -rf it.
 require_managed_install() {
-  [[ -f "$INSTALL_HOME/$MANAGED_MARKER" ]] || die "$INSTALL_HOME does not look like a managed install (missing $MANAGED_MARKER) -- refusing to $1 it. If this is a source checkout, install with 'curl -fsSL https://usecyclops.dev/install.sh | sh' instead, or use commPact-install directly."
+  [[ -f "$INSTALL_HOME/$MANAGED_MARKER" ]] || die "$INSTALL_HOME does not look like a managed install (missing $MANAGED_MARKER) -- refusing to $1 it. If this is a source checkout, install with 'curl -fsSL https://www.usecyclops.dev/install.sh | sh' instead, or use commPact-install directly."
 }
 
 usage() {
@@ -239,7 +239,7 @@ cmd_update() {
     release_dir="$CYCLOPS_SOURCE_DIR"
   else
     command -v git >/dev/null 2>&1 \
-      || die "update requires git; re-run the installer instead: curl -fsSL https://usecyclops.dev/install.sh | sh"
+      || die "update requires git; re-run the installer instead: curl -fsSL https://www.usecyclops.dev/install.sh | sh"
     # Not `git clone --branch`: that flag only resolves branch and tag
     # names, so a full commit SHA (a documented CYCLOPS_REF value) would
     # fail with "Remote branch ... not found". init+fetch+checkout resolves

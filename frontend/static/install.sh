@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cyclops bootstrap installer.
 #
-#   curl -fsSL https://usecyclops.dev/install.sh | sh
+#   curl -fsSL https://www.usecyclops.dev/install.sh | sh
 #
 # This script only fetches the release source and hands it to the release's
 # own bin/commPact-install, which is what actually populates the install

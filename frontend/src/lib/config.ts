@@ -30,7 +30,7 @@ export const INSTALL_METHODS: InstallMethod[] = [
 		id: 'script',
 		label: 'Script',
 		status: 'live',
-		lines: ['curl -fsSL https://usecyclops.dev/install.sh | sh']
+		lines: ['curl -fsSL https://www.usecyclops.dev/install.sh | sh']
 	},
 	{
 		id: 'homebrew',

@@ -9,7 +9,7 @@
 ## Quick start
 
 ~~~sh
-curl -fsSL https://usecyclops.dev/install.sh | sh
+curl -fsSL https://www.usecyclops.dev/install.sh | sh
 cyclops
 ~~~
 
