@@ -22,7 +22,7 @@ SCRIPT_DIR="$(cd -P "$(dirname "$(resolve_script_path "${BASH_SOURCE[0]}")")" &&
 # The install root, regardless of what CYCLOPS_HOME the installer used —
 # cyclops always knows where it actually lives.
 INSTALL_HOME="$(cd -P "$SCRIPT_DIR/.." && pwd)"
-CYCLOPS_REPO_URL="https://github.com/notyahir/cyclops.git"
+CYCLOPS_REPO_URL="https://github.com/cyclops-team/cyclops.git"
 # Written into every tree commPact-install produces (install and update).
 # Absent from a plain source checkout, so it distinguishes a managed
 # install home from the repository cyclops happens to be running out of.

@@ -26,7 +26,7 @@
 		<div class="meta">
 			<div class="row">
 				<span class="label">Repository</span>
-				<a href={REPO_URL} target="_blank" rel="noopener noreferrer">github.com/notyahir/cyclops</a>
+				<a href={REPO_URL} target="_blank" rel="noopener noreferrer">github.com/cyclops-team/cyclops</a>
 			</div>
 			<div class="row">
 				<span class="label">License</span>

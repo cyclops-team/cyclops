@@ -4,7 +4,7 @@
 
 `cyclops` gives each pane an identity, delivers structured messages, and keeps communication inside an explicit same-session permission boundary. It's built on the commPact toolkit, whose individual commands remain available for advanced use.
 
-[![Test](https://github.com/notyahir/cyclops/actions/workflows/ci.yml/badge.svg)](https://github.com/notyahir/cyclops/actions/workflows/ci.yml)
+[![Test](https://github.com/cyclops-team/cyclops/actions/workflows/ci.yml/badge.svg)](https://github.com/cyclops-team/cyclops/actions/workflows/ci.yml)
 
 ## Quick start
 
@@ -24,7 +24,7 @@ Requirements: macOS or Linux, Bash, and tmux 3.2 or newer recommended. Everythin
 Prefer to review the source first, need <code>--install-only</code>, or want to build from a branch? Clone the repository and bootstrap from the project directory where the panes should open:
 
 ~~~sh
-git clone https://github.com/notyahir/cyclops.git ~/cyclops
+git clone https://github.com/cyclops-team/cyclops.git ~/cyclops
 cd /path/to/your/project
 ~/cyclops/install.sh
 tmux attach -t commpact

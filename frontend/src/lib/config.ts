@@ -1,4 +1,4 @@
-export const REPO_OWNER = 'notyahir';
+export const REPO_OWNER = 'cyclops-team';
 export const REPO_NAME = 'cyclops';
 export const REPO_URL = `https://github.com/${REPO_OWNER}/${REPO_NAME}`;
 export const DOCS_URL = `${REPO_URL}/tree/main/docs`;

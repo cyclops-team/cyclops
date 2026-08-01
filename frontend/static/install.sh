@@ -16,7 +16,7 @@
 #   CYCLOPS_SOURCE_DIR    use this local directory instead of downloading (offline/dev use)
 set -eu
 
-REPO_OWNER="notyahir"
+REPO_OWNER="cyclops-team"
 REPO_NAME="cyclops"
 REF="${CYCLOPS_REF:-main}"
 CYCLOPS_HOME="${CYCLOPS_HOME:-$HOME/.commPact}"

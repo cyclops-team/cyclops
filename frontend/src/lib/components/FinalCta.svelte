@@ -14,7 +14,7 @@
 		</div>
 		<a class="github-link" href={REPO_URL} target="_blank" rel="noopener noreferrer">
 			<GithubMark size={14} />
-			<span>github.com/notyahir/cyclops</span>
+			<span>github.com/cyclops-team/cyclops</span>
 		</a>
 	</div>
 </section>
