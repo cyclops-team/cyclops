@@ -59,7 +59,10 @@ async fn bracketed_paste_round_trip_is_byte_exact() {
     srv.new_session("pa");
     let (client, _notif) = ControlClient::spawn(srv.config("pa")).await.expect("spawn");
 
-    let out_path = format!("/private/tmp/cyclops-paste-test-{}.bin", std::process::id());
+    let out_path = cyclops_proto::scratch::scratch_root()
+        .join(format!("cyclops-paste-test-{}.bin", std::process::id()))
+        .to_string_lossy()
+        .into_owned();
     let _ = std::fs::remove_file(&out_path);
 
     // Enable bracketed paste in the pane (paste-buffer -p only inserts the

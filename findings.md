@@ -143,3 +143,38 @@ by `wait --until done` on screen/title-only agents (hook-tier agents
 report their edges out of band), and fixture tests must hold each driven
 state across a tick. Proven by crates/cyclopsd/tests/m2_wait.rs, which
 holds working titles for 2s.
+
+## F24. /private/tmp is macOS-only, and cargo test hides every failure after the first binary (MEASURED)
+
+Both v2 pushes failed CI while the same tree was green on the developer
+machine. Root cause: test scratch paths were hardcoded to `/private/tmp`,
+which exists on macOS (it is the real `/tmp`) and does not exist on Linux,
+where `/private` is not writable by the runner. Every Linux job died on
+`control::tests::spool_file_is_owner_only_and_dir_created_0700` with
+`Io(Os { code: 13, kind: PermissionDenied })` at control.rs:827
+(runs 30754262517 and 30758203413, jobs 91523975003 and 91523975029).
+
+The path itself was a deliberate choice, not an accident: a unix socket
+path caps near 104 bytes on macOS and `std::env::temp_dir()` there is a
+long `/var/folders/...` path, so a daemon socket created under it fails to
+bind. The rule that was missing is that the constraint is macOS-specific.
+`cyclops_proto::scratch::scratch_root` now states it once: `/private/tmp`
+on macOS, the system temp dir elsewhere, `CYCLOPS_TEST_TMP` overriding
+both. Proven by running the full suite with the root relocated to
+`/private/var/tmp`, which is the same code path Linux takes.
+
+Two masking effects made one bug look like a green build for two
+milestones, and both were worth more than the fix:
+
+- `cargo test` stops at the first failing test binary. 25 of 26 tests in
+  `cyclops-tmux --lib` passed, that binary failed, and the remaining 31
+  test binaries never ran. The visible failure count (1) had no relation
+  to the real one, which stayed unknown until the fix landed. CI now runs
+  `--no-fail-fast`.
+- The job matrix defaulted to `fail-fast: true`, so the ubuntu failure
+  cancelled macOS mid-run and threw away the only signal that would have
+  distinguished a portability bug from a real regression. CI now sets
+  `fail-fast: false`.
+
+Local green plus red CI is not a flaky-CI story until the logs say so.
+Read the failing job before assuming the environment is at fault.

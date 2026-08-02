@@ -817,10 +817,7 @@ mod tests {
     #[tokio::test]
     async fn spool_file_is_owner_only_and_dir_created_0700() {
         use std::os::unix::fs::PermissionsExt;
-        let base = std::path::PathBuf::from(format!(
-            "/private/tmp/cyclops-spool-test-{}",
-            std::process::id()
-        ));
+        let base = cyclops_proto::scratch::scratch_dir("cyclops-spool-test");
         let _ = std::fs::remove_dir_all(&base);
         let path = write_spool_file(Some(&base), 7, b"secret payload")
             .await

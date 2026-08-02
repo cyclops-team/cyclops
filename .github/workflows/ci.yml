@@ -17,6 +17,10 @@ env:
 jobs:
   test:
     strategy:
+      # One platform failing must not cancel the other. Cyclops has real
+      # per-OS behavior (peer credentials, scratch paths), so a Linux
+      # failure that hides the macOS result costs a whole round trip.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -30,10 +34,14 @@ jobs:
           if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y tmux; else brew install tmux; fi
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # --no-fail-fast: cargo stops at the first failing test binary, which
+      # hides every binary after it. One run should report every failure.
+      - run: cargo test --workspace --no-fail-fast
       # The commPact shim is bash + python, invisible to cargo test; its
       # suite reuses the cyclops debug binary the tests above just built.
+      # Runs even when tests failed, for the same reason.
       - name: commPact shim tests
+        if: ${{ !cancelled() }}
         run: python3 scripts/commpact-shim/test_shim.py
 
   # ADR-001 owns the tmux-churn risk by testing the adapter against tmux HEAD.
@@ -52,4 +60,4 @@ jobs:
           cd /tmp/tmux-head && sh autogen.sh && ./configure && make -j
           sudo make install
           tmux -V
-      - run: cargo test --workspace
+      - run: cargo test --workspace --no-fail-fast

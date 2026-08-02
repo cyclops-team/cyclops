@@ -38,6 +38,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -48,7 +49,12 @@ CYCLOPSD = os.path.join(REPO, "target/release/cyclopsd")
 MANIFESTS = os.path.join(REPO, "manifests")
 RAW = os.environ.get("CYC_SOAK_RAW", os.path.join(REPO, "tests/raw/m1-soak"))
 PID = os.getpid()
-SCRATCH = f"/private/tmp/cyc-m1-soak-{PID}"
+# /private/tmp is macOS only; elsewhere the system temp dir is already
+# short enough for a daemon socket. CYCLOPS_TEST_TMP overrides both.
+TMPROOT = os.environ.get("CYCLOPS_TEST_TMP") or (
+    "/private/tmp" if os.path.isdir("/private/tmp") else tempfile.gettempdir()
+)
+SCRATCH = os.path.join(TMPROOT, f"cyc-m1-soak-{PID}")
 HOME = os.path.join(SCRATCH, "home")
 SOCK = f"cyc-soak-{PID}"
 SESSION = "soak"

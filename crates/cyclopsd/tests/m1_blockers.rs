@@ -6,7 +6,6 @@
 
 mod common;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -402,7 +401,7 @@ async fn send_and_wait_reports_paneless_recipients() {
 #[tokio::test(flavor = "multi_thread")]
 async fn restart_closes_pre_hosted_field_ledger_chains() {
     let pid = std::process::id();
-    let home = PathBuf::from(format!("/private/tmp/cyc-m1-oldhost-{pid}"));
+    let home = cyclops_proto::scratch::scratch_dir("cyc-m1-oldhost");
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(home.join("ledger")).expect("scratch home");
     let _guard = HomeGuard(home.clone());

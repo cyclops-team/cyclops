@@ -3040,7 +3040,7 @@ contains = ["OTHER-DIALOG"]
         }
         let pid = std::process::id();
         let socket = format!("cyc-dubuf-{pid}");
-        let spool = std::path::PathBuf::from(format!("/private/tmp/cyc-dubuf-spool-{pid}"));
+        let spool = cyclops_proto::scratch::scratch_dir("cyc-dubuf-spool");
         let cfg = cyclops_tmux::ControlConfig::new_session("dubuf")
             .on_socket(&socket)
             .with_config_file("/dev/null")

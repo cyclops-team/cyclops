@@ -5,7 +5,6 @@
 
 mod common;
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use common::*;
@@ -363,7 +362,7 @@ async fn binding_falls_back_to_argv_basename() {
     }
     // A renamed binary: the pane runs .../claude (a symlink to cat), so
     // the kernel comm never matches the manifest's process_names.
-    let bin_dir = PathBuf::from(format!("/private/tmp/cyc-argv-{}", std::process::id()));
+    let bin_dir = cyclops_proto::scratch::scratch_dir("cyc-argv");
     let _ = std::fs::remove_dir_all(&bin_dir);
     std::fs::create_dir_all(&bin_dir).expect("bin dir");
     let link = bin_dir.join("claude");
@@ -577,8 +576,7 @@ async fn long_gate_hold_notifies_the_admin_once() {
 #[tokio::test(flavor = "multi_thread")]
 async fn briefly_stalled_subscriber_survives_event_burst() {
     // No tmux needed: a daemon with zero sessions still serves events.
-    let pid = std::process::id();
-    let home = PathBuf::from(format!("/private/tmp/cyc-m1-subbuf-{pid}"));
+    let home = cyclops_proto::scratch::scratch_dir("cyc-m1-subbuf");
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).expect("scratch home");
     let _guard = HomeGuard(home.clone());

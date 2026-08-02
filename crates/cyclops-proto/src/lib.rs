@@ -9,6 +9,7 @@
 //! All deserialization tolerates unknown fields.
 
 pub mod ledger;
+pub mod scratch;
 pub mod state;
 pub mod wire;
 

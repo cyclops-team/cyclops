@@ -194,7 +194,7 @@ async fn m0_shadow_daemon_end_to_end() {
     }
     let pid = std::process::id();
     let tmux_socket = format!("cyc-m0-{pid}");
-    let home = PathBuf::from(format!("/private/tmp/cyc-m0-home-{pid}"));
+    let home = cyclops_proto::scratch::scratch_dir("cyc-m0-home");
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(home.join("manifests")).expect("create scratch home");
     let _home_guard = HomeGuard(home.clone());

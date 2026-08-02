@@ -366,7 +366,7 @@ impl Rig {
         }
         let pid = std::process::id();
         let socket = format!("cyc-m1-{tag}-{pid}");
-        let home = PathBuf::from(format!("/private/tmp/cyc-m1-{tag}-{pid}"));
+        let home = cyclops_proto::scratch::scratch_dir(&format!("cyc-m1-{tag}"));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(home.join("manifests")).expect("create scratch home");
         let home_guard = HomeGuard(home.clone());

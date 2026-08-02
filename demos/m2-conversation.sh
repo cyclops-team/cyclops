@@ -22,7 +22,10 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SOCK="cyc-m2-demo-$$"
 SESSION="demo"
-CYCLOPS_HOME="$(mktemp -d /private/tmp/cyclops-m2-demo.XXXXXX)"
+# /private/tmp is macOS only and keeps socket paths short; elsewhere the
+# system temp dir is already short. CYCLOPS_TEST_TMP overrides both.
+TMPROOT="${CYCLOPS_TEST_TMP:-$([ -d /private/tmp ] && echo /private/tmp || echo "${TMPDIR:-/tmp}")}"
+CYCLOPS_HOME="$(mktemp -d "$TMPROOT/cyclops-m2-demo.XXXXXX")"
 export CYCLOPS_HOME
 CYC="$REPO/target/debug/cyclops"
 DAEMON_PID=""

@@ -790,7 +790,7 @@ mod tests {
 
     fn bare_inner() -> Arc<Inner> {
         Arc::new(Inner {
-            cfg: Config::defaults(Path::new("/private/tmp/cyc-unit")),
+            cfg: Config::defaults(&cyclops_proto::scratch::scratch_dir("cyc-unit")),
             boot_id: "b-test".into(),
             started: Instant::now(),
             tmux_version: "3.6a".into(),
