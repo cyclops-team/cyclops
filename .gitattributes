@@ -1,0 +1,3 @@
+# Keep source files portable across contributor platforms.
+* text=auto eol=lf
+*.sh text eol=lf
