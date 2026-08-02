@@ -1,0 +1,14 @@
+/Users/yahirh/projects/clops/crates/cyclops-ledger/target/debug/deps/thiserror-dcd4cb438ccc35af.d: /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/lib.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/aserror.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/display.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/var.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/private.rs /Users/yahirh/projects/clops/crates/cyclops-ledger/target/debug/build/thiserror-2e87b36eebfae270/out/private.rs
+
+/Users/yahirh/projects/clops/crates/cyclops-ledger/target/debug/deps/libthiserror-dcd4cb438ccc35af.rlib: /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/lib.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/aserror.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/display.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/var.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/private.rs /Users/yahirh/projects/clops/crates/cyclops-ledger/target/debug/build/thiserror-2e87b36eebfae270/out/private.rs
+
+/Users/yahirh/projects/clops/crates/cyclops-ledger/target/debug/deps/libthiserror-dcd4cb438ccc35af.rmeta: /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/lib.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/aserror.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/display.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/var.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/private.rs /Users/yahirh/projects/clops/crates/cyclops-ledger/target/debug/build/thiserror-2e87b36eebfae270/out/private.rs
+
+/Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/lib.rs:
+/Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/aserror.rs:
+/Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/display.rs:
+/Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/var.rs:
+/Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/private.rs:
+/Users/yahirh/projects/clops/crates/cyclops-ledger/target/debug/build/thiserror-2e87b36eebfae270/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/yahirh/projects/clops/crates/cyclops-ledger/target/debug/build/thiserror-2e87b36eebfae270/out

@@ -1,0 +1,18 @@
+[package]
+name = "cyclops-ledger"
+version = "0.1.0"
+edition = "2021"
+description = "Append-only NDJSON ledger: crash-safe writer, cursor-replayable reader."
+
+# Standalone until M1 integration; the workspace adds this crate as a member
+# when the delivery pipeline lands. Remove this table at that point.
+[workspace]
+
+[dependencies]
+cyclops-proto = { path = "../cyclops-proto" }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

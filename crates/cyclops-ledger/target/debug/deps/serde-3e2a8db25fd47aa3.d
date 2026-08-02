@@ -1,0 +1,14 @@
+/Users/yahirh/projects/clops/crates/cyclops-ledger/target/debug/deps/serde-3e2a8db25fd47aa3.d: /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/yahirh/projects/clops/crates/cyclops-ledger/target/debug/build/serde-47d4d1738f453ee4/out/private.rs
+
+/Users/yahirh/projects/clops/crates/cyclops-ledger/target/debug/deps/libserde-3e2a8db25fd47aa3.rlib: /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/yahirh/projects/clops/crates/cyclops-ledger/target/debug/build/serde-47d4d1738f453ee4/out/private.rs
+
+/Users/yahirh/projects/clops/crates/cyclops-ledger/target/debug/deps/libserde-3e2a8db25fd47aa3.rmeta: /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/yahirh/projects/clops/crates/cyclops-ledger/target/debug/build/serde-47d4d1738f453ee4/out/private.rs
+
+/Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs:
+/Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs:
+/Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs:
+/Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs:
+/Users/yahirh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs:
+/Users/yahirh/projects/clops/crates/cyclops-ledger/target/debug/build/serde-47d4d1738f453ee4/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/yahirh/projects/clops/crates/cyclops-ledger/target/debug/build/serde-47d4d1738f453ee4/out
