@@ -1,11 +1,12 @@
 //! cyclops: the thin CLI client for cyclopsd.
 //!
 //! Speaks NDJSON over the daemon's Unix socket (cyclops-proto) and renders
-//! for humans. M0 surface: status, ping, read, watch. Messaging verbs land
-//! in M1 and are deliberately absent here.
+//! for humans. M0 surface: status, ping, read, watch. M1 adds send and the
+//! hook receiver vendor hook configs invoke.
 
 mod client;
 mod copy;
+mod hook;
 mod render;
 mod style;
 
@@ -17,10 +18,14 @@ use serde_json::{json, Value};
 
 use client::Client;
 use cyclops_proto::{
-    Event, PaneReadParams, PaneReadResult, PaneReadSource, StatusResult, SubscribeParams,
-    PROTOCOL_VERSION,
+    DeliveryReceipt, DeliveryState, Event, MsgSendParams, MsgSendResult, PaneReadParams,
+    PaneReadResult, PaneReadSource, StatusResult, SubscribeParams, PROTOCOL_VERSION,
 };
 use style::Style;
+
+/// Usage mistakes exit 2 (clap's convention), keeping 1 to mean the
+/// message ended parked or needing attention, which scripts branch on.
+const EXIT_USAGE: i32 = 2;
 
 #[derive(Parser)]
 #[command(name = "cyclops", version, about = "One eye on every agent")]
@@ -59,6 +64,45 @@ enum Cmd {
         #[arg(long, value_delimiter = ',')]
         kinds: Vec<String>,
     },
+    /// Send a message. The receipt names each delivery's state; exit 0 on
+    /// delivered/queued, 1 on parked or needs attention.
+    Send(SendArgs),
+    /// Relay a vendor hook event to cyclops. Silent, always exits 0.
+    Hook {
+        /// Event name, e.g. Stop. An argument because agy payloads carry
+        /// no event-name field (F7); the payload arrives on stdin.
+        event: String,
+        /// Reporting agent label; defaults to $CYCLOPS_AGENT.
+        #[arg(long)]
+        agent: Option<String>,
+    },
+}
+
+#[derive(clap::Args)]
+struct SendArgs {
+    /// Recipient label or pane id, e.g. reviewer. Merges with --to.
+    target: Option<String>,
+    /// One line the recipient sees first.
+    #[arg(long)]
+    subject: String,
+    /// Message body text.
+    #[arg(long, conflicts_with = "body_file")]
+    body: Option<String>,
+    /// Read the body from a file; - reads stdin.
+    #[arg(long)]
+    body_file: Option<String>,
+    /// More recipients, comma separated.
+    #[arg(long, value_delimiter = ',')]
+    to: Vec<String>,
+    /// Every adopted agent.
+    #[arg(long, conflicts_with_all = ["target", "to"])]
+    all: bool,
+    /// Announcement expecting no reply; the reply hint is dropped.
+    #[arg(long)]
+    fyi: bool,
+    /// Message id this replies to, e.g. m-3f9c2a.
+    #[arg(long)]
+    reply_to: Option<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -93,19 +137,30 @@ fn run(cli: &Cli) -> i32 {
     } else {
         Style::detect(cli.plain)
     };
-    let mut c = match connect() {
-        Ok(c) => c,
-        Err(code) => return code,
-    };
     match &cli.cmd {
-        Cmd::Status => cmd_status(&mut c, cli, &style),
-        Cmd::Ping => cmd_ping(&mut c, cli, &style),
-        Cmd::Read {
-            target,
-            lines,
-            source,
-        } => cmd_read(&mut c, cli, &style, target, *lines, (*source).into()),
-        Cmd::Watch { kinds } => cmd_watch(&mut c, cli, &style, kinds),
+        // Hook never prints and owns its transport handling: a hook that
+        // fails loudly breaks the vendor CLI that invoked it.
+        Cmd::Hook { event, agent } => hook::run(event, agent.as_deref()),
+        // Send validates usage and reads the body before touching the
+        // daemon, so usage errors don't hide behind a down daemon.
+        Cmd::Send(args) => cmd_send(cli, &style, args),
+        Cmd::Status | Cmd::Ping | Cmd::Read { .. } | Cmd::Watch { .. } => {
+            let mut c = match connect() {
+                Ok(c) => c,
+                Err(code) => return code,
+            };
+            match &cli.cmd {
+                Cmd::Status => cmd_status(&mut c, cli, &style),
+                Cmd::Ping => cmd_ping(&mut c, cli, &style),
+                Cmd::Read {
+                    target,
+                    lines,
+                    source,
+                } => cmd_read(&mut c, cli, &style, target, *lines, (*source).into()),
+                Cmd::Watch { kinds } => cmd_watch(&mut c, cli, &style, kinds),
+                Cmd::Send(_) | Cmd::Hook { .. } => unreachable!("handled above"),
+            }
+        }
     }
 }
 
@@ -220,6 +275,122 @@ fn cmd_read(
         }
     }
     0
+}
+
+fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
+    // Positional target merges into the to-list; --all is the whole list.
+    let mut to: Vec<String> = Vec::new();
+    if args.all {
+        to.push("*".into());
+    }
+    for t in args.target.iter().chain(args.to.iter()) {
+        if !to.contains(t) {
+            to.push(t.clone());
+        }
+    }
+    if to.is_empty() {
+        eprintln!("{}", copy::NO_RECIPIENT);
+        return EXIT_USAGE;
+    }
+    let body = match (&args.body, &args.body_file) {
+        (Some(b), _) => b.clone(),
+        (None, Some(path)) => match read_body_file(path) {
+            Ok(b) => b,
+            Err(cause) => {
+                eprintln!("{}", copy::body_file_unreadable(path, &cause));
+                return EXIT_USAGE;
+            }
+        },
+        (None, None) => String::new(),
+    };
+    let mut c = match connect() {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let params = serde_json::to_value(MsgSendParams {
+        to: to.clone(),
+        subject: args.subject.clone(),
+        body,
+        fyi: args.fyi,
+        reply_to: args.reply_to.clone(),
+        wait: None,
+    })
+    .expect("msg.send params serialize");
+    // With one recipient the unknown-target copy can name it; a broadcast
+    // failure passes the daemon's copy through.
+    let asked = if to.len() == 1 {
+        Some(to[0].as_str())
+    } else {
+        None
+    };
+    let result = match c.request("msg.send", params) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}", copy::client_error(&e, asked));
+            return 1;
+        }
+    };
+    if cli.json {
+        println!("{result}");
+        return receipts_exit_json(&result);
+    }
+    let receipt: MsgSendResult = match serde_json::from_value(result) {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("{}", copy::UNREADABLE_ANSWER);
+            return 1;
+        }
+    };
+    println!("{}", render::render_receipts(&receipt.deliveries, style));
+    // Parked recipients get the reset hint and next step spelled out.
+    for d in &receipt.deliveries {
+        if d.state == DeliveryState::ParkedBlockedQuota {
+            eprintln!("{}", copy::parked(&d.to, d.note.as_deref()));
+        }
+    }
+    receipts_exit(&receipt.deliveries)
+}
+
+/// Body from a file path, or stdin when the path is "-" (the v1 habit:
+/// printf body | cyclops send ... --body-file -). Verbatim, no trimming:
+/// the ledger records what was sent, not a cleaned-up version.
+fn read_body_file(path: &str) -> Result<String, String> {
+    if path == "-" {
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut s).map_err(|e| e.to_string())?;
+        Ok(s)
+    } else {
+        std::fs::read_to_string(path).map_err(|e| e.to_string())
+    }
+}
+
+/// Scripts branch on this: delivered, queued, and in-flight states exit 0;
+/// parked and needs-attention exit 1.
+fn receipts_exit(ds: &[DeliveryReceipt]) -> i32 {
+    let bad = ds.iter().any(|d| {
+        matches!(
+            d.state,
+            DeliveryState::ParkedBlockedQuota | DeliveryState::AttentionRequired
+        )
+    });
+    i32::from(bad)
+}
+
+/// Same rule read tolerantly off the raw result for --json passthrough:
+/// unknown states from a newer daemon don't break the exit code.
+fn receipts_exit_json(v: &Value) -> i32 {
+    let bad = v
+        .get("deliveries")
+        .and_then(Value::as_array)
+        .is_some_and(|a| {
+            a.iter().any(|d| {
+                matches!(
+                    d.get("state").and_then(Value::as_str),
+                    Some("parked_blocked_quota" | "attention_required")
+                )
+            })
+        });
+    i32::from(bad)
 }
 
 fn cmd_watch(c: &mut Client, cli: &Cli, style: &Style, kinds: &[String]) -> i32 {

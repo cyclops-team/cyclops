@@ -22,6 +22,14 @@ pub struct Config {
     pub tmux_config: Option<PathBuf>,
     /// Explicit manifest directory. None falls back, see [`Config::manifest_dir`].
     pub manifest_dir: Option<PathBuf>,
+    /// Tier-1 ACK window: how long a delivery waits for the manifest hook
+    /// ACK before falling back to screen evidence.
+    pub ack_timeout_ms: u64,
+    /// Redelivery attempts after the first failure. The soak needed zero;
+    /// one bounded retry is the ceiling, never a loop.
+    pub delivery_retry_max: u32,
+    /// Cap on how long msg.send blocks for a receipt on the idle path.
+    pub receipt_block_ms: u64,
 }
 
 impl Config {
@@ -33,6 +41,9 @@ impl Config {
             tmux_socket: None,
             tmux_config: None,
             manifest_dir: None,
+            ack_timeout_ms: 1500,
+            delivery_retry_max: 1,
+            receipt_block_ms: 2500,
         }
     }
 
@@ -96,6 +107,30 @@ impl Config {
                         other.type_str()
                     )),
                 },
+                "ack_timeout_ms" => match ms_value(&value) {
+                    Some(v) => cfg.ack_timeout_ms = v,
+                    None => warnings.push(format!(
+                        "`ack_timeout_ms` must be a non-negative integer, not a {}; using {}",
+                        value.type_str(),
+                        cfg.ack_timeout_ms
+                    )),
+                },
+                "delivery_retry_max" => match ms_value(&value) {
+                    Some(v) => cfg.delivery_retry_max = v.min(u32::MAX as u64) as u32,
+                    None => warnings.push(format!(
+                        "`delivery_retry_max` must be a non-negative integer, not a {}; using {}",
+                        value.type_str(),
+                        cfg.delivery_retry_max
+                    )),
+                },
+                "receipt_block_ms" => match ms_value(&value) {
+                    Some(v) => cfg.receipt_block_ms = v,
+                    None => warnings.push(format!(
+                        "`receipt_block_ms` must be a non-negative integer, not a {}; using {}",
+                        value.type_str(),
+                        cfg.receipt_block_ms
+                    )),
+                },
                 unknown => warnings.push(format!("unknown config key `{unknown}` ignored")),
             }
         }
@@ -118,6 +153,14 @@ impl Config {
             return Some(cwd);
         }
         None
+    }
+}
+
+/// Non-negative integer TOML value for the timing/count knobs.
+fn ms_value(value: &toml::Value) -> Option<u64> {
+    match value {
+        toml::Value::Integer(n) if *n >= 0 => Some(*n as u64),
+        _ => None,
     }
 }
 
@@ -167,5 +210,30 @@ manifest_dir = "/private/tmp/manifests"
     #[test]
     fn syntax_error_is_an_error() {
         assert!(Config::parse("sessions = [", Path::new("/h")).is_err());
+    }
+
+    #[test]
+    fn delivery_knobs_default_and_override() {
+        let (cfg, warnings) = Config::parse("", Path::new("/h")).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(cfg.ack_timeout_ms, 1500);
+        assert_eq!(cfg.delivery_retry_max, 1);
+        assert_eq!(cfg.receipt_block_ms, 2500);
+
+        let text = "ack_timeout_ms = 200\ndelivery_retry_max = 0\nreceipt_block_ms = 900\n";
+        let (cfg, warnings) = Config::parse(text, Path::new("/h")).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(cfg.ack_timeout_ms, 200);
+        assert_eq!(cfg.delivery_retry_max, 0);
+        assert_eq!(cfg.receipt_block_ms, 900);
+    }
+
+    #[test]
+    fn delivery_knobs_wrong_types_warn_and_keep_defaults() {
+        let text = "ack_timeout_ms = \"soon\"\ndelivery_retry_max = -2\n";
+        let (cfg, warnings) = Config::parse(text, Path::new("/h")).unwrap();
+        assert_eq!(cfg.ack_timeout_ms, 1500);
+        assert_eq!(cfg.delivery_retry_max, 1);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
     }
 }

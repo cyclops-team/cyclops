@@ -1,0 +1,1123 @@
+//! M1 end-to-end: the delivery pipeline against a real tmux server on an
+//! isolated `-L` socket, the daemon booted in-process, NDJSON clients on
+//! the Unix socket.
+//!
+//! Never touches the user's tmux: every tmux call carries a per-test
+//! `-L cyc-m1-<tag>-<pid> -f /dev/null` socket (tmux -u per finding F14)
+//! and the server dies in teardown. Skips cleanly when tmux is absent.
+//! Bounded poll loops here are test-side waits, explicitly outside the
+//! daemon's zero-polling contract.
+
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use cyclops_proto::{DeliveryState, Kind, LedgerLine};
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::UnixStream;
+
+// ---------------------------------------------------------------------------
+// Fixture manifests
+// ---------------------------------------------------------------------------
+
+/// Screen-tier fixture bound to plain cat/sh panes: title tier always says
+/// idle, staging is verified by the message id, no hook ACK (tier 2).
+const CAT_MANIFEST: &str = r#"
+[agent]
+id = "fix"
+display_name = "Cat fixture"
+process_names = ["cat", "sh", "bash", "dash"]
+
+[[rule]]
+id = "always_idle"
+state = "idle"
+priority = 100
+region = "pane_title"
+regex = ['^']
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+"#;
+
+/// Tier-1 fixture: same pane behavior plus a payload-matchable hook ACK.
+const HOOK_MANIFEST: &str = r#"
+[agent]
+id = "fix"
+display_name = "Hook fixture"
+process_names = ["cat", "sh", "bash", "dash"]
+
+[hooks]
+turn_start = "UserPromptSubmit"
+turn_end = "Stop"
+ack = "UserPromptSubmit"
+ack_payload_field = "prompt"
+
+[[rule]]
+id = "always_idle"
+state = "idle"
+priority = 100
+region = "pane_title"
+regex = ['^']
+
+[injection]
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+"#;
+
+/// Modal fixture: one auto-dismissable rule with explicit decline keys and
+/// one rule (trust-style) that must never be dismissed by the daemon.
+const MODAL_MANIFEST: &str = r#"
+[agent]
+id = "fix"
+display_name = "Modal fixture"
+process_names = ["cat", "sh", "bash", "dash"]
+
+[[rule]]
+id = "fake_update_modal"
+state = "blocked_modal"
+priority = 1300
+region = "bottom_non_empty_lines(8)"
+contains = ["FAKE-UPDATE-AVAILABLE"]
+decline_keys = ["3", "Enter"]
+auto_dismiss = true
+
+[[rule]]
+id = "fake_trust_modal"
+state = "blocked_modal"
+priority = 1300
+region = "bottom_non_empty_lines(8)"
+contains = ["FAKE-TRUST-PROMPT"]
+auto_dismiss = false
+
+[[rule]]
+id = "always_idle"
+state = "idle"
+priority = 100
+region = "pane_title"
+regex = ['^']
+
+[injection]
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+"#;
+
+/// Quota fixture: the agy quota phrase parks the recipient.
+const QUOTA_MANIFEST: &str = r#"
+[agent]
+id = "fix"
+display_name = "Quota fixture"
+process_names = ["cat", "sh", "bash", "dash"]
+
+[[rule]]
+id = "quota_exhausted"
+state = "blocked_quota"
+priority = 1400
+region = "bottom_non_empty_lines(12)"
+contains = ["Individual quota reached"]
+
+[[rule]]
+id = "always_idle"
+state = "idle"
+priority = 100
+region = "pane_title"
+regex = ['^']
+
+[injection]
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+"#;
+
+/// Busy fixture: a screen marker keeps the pane working until released.
+const BUSY_MANIFEST: &str = r#"
+[agent]
+id = "fix"
+display_name = "Busy fixture"
+process_names = ["cat", "sh", "bash", "dash"]
+
+[[rule]]
+id = "busy_marker"
+state = "working"
+priority = 1200
+region = "bottom_non_empty_lines(8)"
+contains = ["BUSY-MARKER"]
+
+[[rule]]
+id = "always_idle"
+state = "idle"
+priority = 100
+region = "pane_title"
+regex = ['^']
+
+[injection]
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+"#;
+
+/// Verification-failure fixture: the pattern can never appear on screen,
+/// so every attempt fails composer verification.
+const BAD_VERIFY_MANIFEST: &str = r#"
+[agent]
+id = "fix"
+display_name = "Bad verify fixture"
+process_names = ["cat", "sh", "bash", "dash"]
+
+[[rule]]
+id = "always_idle"
+state = "idle"
+priority = 100
+region = "pane_title"
+regex = ['^']
+
+[injection]
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["CYC-NOPE-<message_id>-NOPE"]
+"#;
+
+// ---------------------------------------------------------------------------
+// Rig
+// ---------------------------------------------------------------------------
+
+fn tmux_available() -> bool {
+    Command::new("tmux")
+        .arg("-V")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Isolated tmux server, killed on drop. -u everywhere (finding F14).
+struct TmuxGuard {
+    socket: String,
+}
+
+impl TmuxGuard {
+    fn run(&self, args: &[&str]) {
+        let status = Command::new("tmux")
+            .args(["-u", "-L", &self.socket, "-f", "/dev/null"])
+            .args(args)
+            .status()
+            .expect("run tmux");
+        assert!(status.success(), "tmux {args:?} failed");
+    }
+
+    fn capture(&self, target: &str) -> String {
+        let out = Command::new("tmux")
+            .args(["-u", "-L", &self.socket, "-f", "/dev/null"])
+            .args(["capture-pane", "-p", "-t", target])
+            .output()
+            .expect("tmux capture-pane");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    fn wait_screen(&self, target: &str, needle: &str) {
+        let t = Instant::now();
+        while !self.capture(target).contains(needle) {
+            assert!(
+                t.elapsed() < Duration::from_secs(5),
+                "{needle:?} never rendered in {target}: {}",
+                self.capture(target)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for TmuxGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("tmux")
+            .args(["-L", &self.socket, "kill-server"])
+            .output();
+    }
+}
+
+/// Scratch CYCLOPS_HOME under /private/tmp, removed on drop.
+struct HomeGuard(PathBuf);
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        // Debug aid: CYC_TEST_KEEP=1 preserves the scratch home.
+        if std::env::var("CYC_TEST_KEEP").is_err() {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+/// Minimal NDJSON test client (the m0 pattern): responses by id, events
+/// buffered for next_event.
+struct TestClient {
+    lines: tokio::io::Lines<BufReader<OwnedReadHalf>>,
+    writer: OwnedWriteHalf,
+    pending_events: VecDeque<Value>,
+    next_id: u64,
+}
+
+impl TestClient {
+    async fn connect(path: &Path) -> TestClient {
+        let stream = UnixStream::connect(path).await.expect("connect daemon");
+        let (r, writer) = stream.into_split();
+        let mut lines = BufReader::new(r).lines();
+        // Consume the hello line.
+        tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("hello within 5s")
+            .expect("read hello")
+            .expect("hello line");
+        TestClient {
+            lines,
+            writer,
+            pending_events: VecDeque::new(),
+            next_id: 1,
+        }
+    }
+
+    async fn next_line(&mut self) -> Value {
+        let line = tokio::time::timeout(Duration::from_secs(10), self.lines.next_line())
+            .await
+            .expect("line within 10s")
+            .expect("read line")
+            .expect("connection open");
+        serde_json::from_str(&line).expect("line parses")
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        let line = json!({"id": id, "method": method, "params": params}).to_string();
+        self.writer
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .expect("write to daemon");
+        loop {
+            let v = self.next_line().await;
+            if v.get("event").is_some() {
+                self.pending_events.push_back(v);
+                continue;
+            }
+            if v["id"] == json!(id) {
+                return v;
+            }
+        }
+    }
+
+    /// Next event matching `pred`, scanning buffered then incoming lines.
+    async fn wait_event<F: Fn(&Value) -> bool>(&mut self, within: Duration, pred: F) -> Value {
+        if let Some(i) = self.pending_events.iter().position(&pred) {
+            return self.pending_events.remove(i).unwrap();
+        }
+        let deadline = Instant::now() + within;
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "no matching event within {within:?}"
+            );
+            let v = self.next_line().await;
+            if v.get("event").is_some() {
+                if pred(&v) {
+                    return v;
+                }
+                self.pending_events.push_back(v);
+            }
+        }
+    }
+}
+
+/// One booted rig: isolated tmux server, scratch home, in-process daemon,
+/// a request client, and an events-subscribed client.
+struct Rig {
+    tmux: TmuxGuard,
+    home: PathBuf,
+    _home_guard: HomeGuard,
+    daemon: cyclopsd::Daemon,
+    ctl: TestClient,
+    ev: TestClient,
+}
+
+impl Rig {
+    /// Boot with one pane running `pane_cmd`. `cfg_extra` appends config
+    /// lines (timing knobs per scenario).
+    async fn new(tag: &str, manifest: &str, pane_cmd: &str, cfg_extra: &str) -> Rig {
+        // Debug aid: CYC_TEST_LOG=debug turns daemon tracing on.
+        if let Ok(filter) = std::env::var("CYC_TEST_LOG") {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .try_init();
+        }
+        let pid = std::process::id();
+        let socket = format!("cyc-m1-{tag}-{pid}");
+        let home = PathBuf::from(format!("/private/tmp/cyc-m1-{tag}-{pid}"));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("manifests")).expect("create scratch home");
+        let home_guard = HomeGuard(home.clone());
+        std::fs::write(home.join("manifests/fix.toml"), manifest).expect("write manifest");
+        std::fs::write(
+            home.join("config.toml"),
+            format!(
+                "sessions = [\"main\"]\n\
+                 tmux_socket = \"{socket}\"\n\
+                 tmux_config = \"/dev/null\"\n\
+                 manifest_dir = \"{}\"\n\
+                 {cfg_extra}",
+                home.join("manifests").display()
+            ),
+        )
+        .expect("write config");
+
+        let tmux = TmuxGuard { socket };
+        tmux.run(&[
+            "new-session",
+            "-d",
+            "-s",
+            "main",
+            "-x",
+            "160",
+            "-y",
+            "40",
+            pane_cmd,
+        ]);
+
+        let (cfg, _) = cyclopsd::Config::load(&home).expect("config loads");
+        let daemon = cyclopsd::boot(cfg).await.expect("daemon boots");
+        let sock = daemon.socket_path();
+        let ctl = TestClient::connect(&sock).await;
+        let mut ev = TestClient::connect(&sock).await;
+        let ack = ev.request("events.subscribe", json!({})).await;
+        assert_eq!(ack["result"]["subscribed"], true);
+        let mut rig = Rig {
+            tmux,
+            home,
+            _home_guard: home_guard,
+            daemon,
+            ctl,
+            ev,
+        };
+        rig.wait_attached(1).await;
+        rig
+    }
+
+    /// Wait until the daemon is attached and sees `panes` panes.
+    async fn wait_attached(&mut self, panes: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let resp = self.ctl.request("status", json!({})).await;
+            let session = &resp["result"]["sessions"][0];
+            if session["attached"] == json!(true)
+                && session["panes"].as_array().map(Vec::len) == Some(panes)
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "daemon never attached with {panes} panes: {resp}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn pane_ids(&mut self) -> Vec<String> {
+        let resp = self.ctl.request("status", json!({})).await;
+        resp["result"]["sessions"][0]["panes"]
+            .as_array()
+            .expect("panes array")
+            .iter()
+            .map(|p| p["pane_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    async fn label(&mut self, target: &str, label: &str) {
+        let resp = self
+            .ctl
+            .request("pane.label", json!({"target": target, "label": label}))
+            .await;
+        assert_eq!(resp["result"]["label"], label, "{resp}");
+    }
+
+    /// msg.send over the socket (sender resolves to admin: the test
+    /// process is same-uid and outside every watched pane).
+    async fn send(&mut self, params: Value) -> (Value, Duration) {
+        let t = Instant::now();
+        let resp = self.ctl.request("msg.send", params).await;
+        let elapsed = t.elapsed();
+        assert!(resp["error"].is_null(), "msg.send failed: {resp}");
+        (resp["result"].clone(), elapsed)
+    }
+
+    fn ledger_path(&self) -> PathBuf {
+        self.home.join("ledger/main.ndjson")
+    }
+
+    fn ledger_lines(&self) -> Vec<Value> {
+        let text = std::fs::read_to_string(self.ledger_path()).expect("ledger readable");
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("ledger line is valid JSON"))
+            .collect()
+    }
+
+    /// The whole-run ledger contract: every line is jq-parseable and
+    /// schema-legal, every delivery transition is legal and chains
+    /// continuously from queued, and screen-only text never leaked in.
+    fn assert_ledger_legal(&self, forbidden_screen_text: &[&str]) {
+        let text = std::fs::read_to_string(self.ledger_path()).expect("ledger readable");
+        let mut chains: HashMap<(String, String), Vec<(DeliveryState, DeliveryState)>> =
+            HashMap::new();
+        let mut saw_boot = false;
+        let mut last_seq = 0u64;
+        for raw in text.lines().filter(|l| !l.trim().is_empty()) {
+            let _: Value = serde_json::from_str(raw).expect("jq-parseable line");
+            let line: LedgerLine = serde_json::from_str(raw).expect("schema-legal line");
+            assert!(line.seq > last_seq, "seq not monotonic at {raw}");
+            last_seq = line.seq;
+            for f in forbidden_screen_text {
+                assert!(
+                    !raw.contains(f),
+                    "screen text leaked into the ledger: {f:?} in {raw}"
+                );
+            }
+            if let Some(data) = &line.data {
+                if data["event"] == "boot" {
+                    saw_boot = true;
+                }
+                // Delivery-state lines carry to/from/to_state; fusion
+                // state lines carry pane_id/state instead.
+                if matches!(line.kind, Kind::State) && data.get("to_state").is_some() {
+                    let from: DeliveryState =
+                        serde_json::from_value(data["from"].clone()).expect("from state");
+                    let to_state: DeliveryState =
+                        serde_json::from_value(data["to_state"].clone()).expect("to state");
+                    assert!(
+                        from.can_transition_to(to_state),
+                        "illegal transition {from:?} -> {to_state:?} in ledger: {raw}"
+                    );
+                    let to = data["to"].as_str().unwrap_or_default().to_string();
+                    chains
+                        .entry((line.id.clone(), to))
+                        .or_default()
+                        .push((from, to_state));
+                }
+            }
+        }
+        assert!(saw_boot, "no boot system line in ledger");
+        for ((id, to), steps) in chains {
+            assert_eq!(
+                steps[0].0,
+                DeliveryState::Queued,
+                "delivery {id}->{to} does not start from queued"
+            );
+            for pair in steps.windows(2) {
+                assert_eq!(
+                    pair[0].1, pair[1].0,
+                    "delivery {id}->{to} chain breaks between {:?} and {:?}",
+                    pair[0], pair[1]
+                );
+            }
+        }
+    }
+
+    /// Final delivery state for (msg id, recipient), from the ledger.
+    fn final_state(&self, msg_id: &str, to: &str) -> Option<String> {
+        self.ledger_lines()
+            .iter()
+            .rev()
+            .find(|l| l["kind"] == "state" && l["id"] == msg_id && l["data"]["to"] == to)
+            .map(|l| l["data"]["to_state"].as_str().unwrap().to_string())
+    }
+
+    async fn shutdown(self) {
+        self.daemon.shutdown().await;
+    }
+}
+
+/// Pane command: print a marker, hold until any input line, clear the
+/// screen, become cat.
+fn hold_script(marker: &str) -> String {
+    format!("sh -c 'echo {marker}; read x; printf \"\\033[2J\\033[H\"; exec cat'")
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn screen_tier_delivery_end_to_end() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new("cat", CAT_MANIFEST, "cat", "").await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+
+    let (result, elapsed) = rig
+        .send(json!({
+            "to": ["worker"],
+            "subject": "Review the rate limiter",
+            "body": "line one\nline two\nline three",
+        }))
+        .await;
+    let msg_id = result["msg_id"].as_str().expect("msg id").to_string();
+    assert!(msg_id.starts_with("m-"), "{msg_id}");
+
+    // Idle path: the receipt blocks until resolution, under the 2.5s cap,
+    // and reports the screen tier honestly.
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "receipt took {elapsed:?}"
+    );
+    let d = &result["deliveries"][0];
+    assert_eq!(d["to"], "worker");
+    assert_eq!(d["state"], "delivered_unverified", "{result}");
+
+    // The payload is in the pane: daemon-built envelope, body, reply hint.
+    let screen = rig.tmux.capture(&pane);
+    assert!(
+        screen.contains(&format!(
+            "[cyclops {msg_id}] FROM: admin  SUBJECT: Review the rate limiter"
+        )),
+        "payload not on screen:\n{screen}"
+    );
+    assert!(screen.contains("line two"), "{screen}");
+    assert!(
+        screen.contains("Reply with: cyclops send admin"),
+        "{screen}"
+    );
+
+    // Events arrived as they happened: msg, then the delivery-state walk.
+    rig.ev
+        .wait_event(Duration::from_secs(5), |e| {
+            e["event"] == "msg" && e["data"]["id"] == msg_id.as_str()
+        })
+        .await;
+    for expect in [
+        "gating",
+        "pasting",
+        "staged",
+        "submitted",
+        "delivered_unverified",
+    ] {
+        rig.ev
+            .wait_event(Duration::from_secs(5), |e| {
+                e["event"] == "delivery-state"
+                    && e["data"]["id"] == msg_id.as_str()
+                    && e["data"]["to_state"] == expect
+            })
+            .await;
+    }
+    let gate = rig
+        .ev
+        .wait_event(Duration::from_secs(5), |e| {
+            e["event"] == "gate" && e["data"]["id"] == msg_id.as_str()
+        })
+        .await;
+    assert_eq!(gate["data"]["action"], "proceed");
+
+    // Ledger: one msg line carrying subject and body, legal transitions,
+    // verified_by=screen on the final record.
+    let lines = rig.ledger_lines();
+    let msg_lines: Vec<&Value> = lines
+        .iter()
+        .filter(|l| l["kind"] == "msg" && l["id"] == msg_id.as_str())
+        .collect();
+    assert_eq!(msg_lines.len(), 1);
+    assert_eq!(msg_lines[0]["from"], "admin");
+    assert_eq!(msg_lines[0]["subject"], "Review the rate limiter");
+    assert_eq!(msg_lines[0]["body"], "line one\nline two\nline three");
+    let final_line = lines
+        .iter()
+        .rev()
+        .find(|l| l["kind"] == "state" && l["id"] == msg_id.as_str())
+        .expect("final state line");
+    assert_eq!(final_line["deliveries"][0]["verified_by"], "screen");
+    assert_eq!(
+        rig.final_state(&msg_id, "worker").as_deref(),
+        Some("delivered_unverified")
+    );
+    rig.assert_ledger_legal(&[]);
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tier1_hook_ack_and_late_upgrade() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    // Short receipt block so the test can post hook reports while the
+    // delivery waits in its ACK window.
+    let mut rig = Rig::new(
+        "hook",
+        HOOK_MANIFEST,
+        "cat",
+        "receipt_block_ms = 300\nack_timeout_ms = 800\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "hooky").await;
+
+    // Message 1: hook ACK inside the window -> delivered_verified.
+    let (result, _) = rig
+        .send(json!({"to": ["hooky"], "subject": "one", "body": "a\nb\nc"}))
+        .await;
+    let m1 = result["msg_id"].as_str().unwrap().to_string();
+    rig.ev
+        .wait_event(Duration::from_secs(5), |e| {
+            e["event"] == "delivery-state"
+                && e["data"]["id"] == m1.as_str()
+                && e["data"]["to_state"] == "submitted"
+        })
+        .await;
+    let resp = rig
+        .ctl
+        .request(
+            "agent.state.report",
+            json!({
+                "agent": "hooky",
+                "event": "UserPromptSubmit",
+                "seq": 1,
+                "payload": {"prompt": format!("staged text {m1} etc"), "session_id": "s1", "turn_id": "t1"},
+            }),
+        )
+        .await;
+    assert_eq!(resp["result"]["applied"], true, "{resp}");
+    let done = rig
+        .ev
+        .wait_event(Duration::from_secs(8), |e| {
+            e["event"] == "delivery-state"
+                && e["data"]["id"] == m1.as_str()
+                && e["data"]["to_state"] == "delivered_verified"
+        })
+        .await;
+    assert_eq!(done["data"]["verified_by"], "hook");
+
+    // Exact duplicate (same session, turn, event): deduped (amendment d).
+    let dup = rig
+        .ctl
+        .request(
+            "agent.state.report",
+            json!({
+                "agent": "hooky",
+                "event": "UserPromptSubmit",
+                "seq": 2,
+                "payload": {"prompt": format!("staged text {m1} etc"), "session_id": "s1", "turn_id": "t1"},
+            }),
+        )
+        .await;
+    assert_eq!(dup["result"]["duplicate"], true, "{dup}");
+
+    // Message 2: no hook inside the window -> screen tier resolves it,
+    // then a late matching ACK upgrades it (receipts stay honest).
+    let (result, _) = rig
+        .send(json!({"to": ["hooky"], "subject": "two", "body": "a\nb\nc"}))
+        .await;
+    let m2 = result["msg_id"].as_str().unwrap().to_string();
+    rig.ev
+        .wait_event(Duration::from_secs(8), |e| {
+            e["event"] == "delivery-state"
+                && e["data"]["id"] == m2.as_str()
+                && e["data"]["to_state"] == "delivered_unverified"
+        })
+        .await;
+    let resp = rig
+        .ctl
+        .request(
+            "agent.state.report",
+            json!({
+                "agent": "hooky",
+                "event": "user_prompt_submit",
+                "seq": 3,
+                "payload": {"prompt": format!("late but matching {m2}"), "session_id": "s1", "turn_id": "t2"},
+            }),
+        )
+        .await;
+    assert_eq!(resp["result"]["matched"], true, "{resp}");
+    let upgraded = rig
+        .ev
+        .wait_event(Duration::from_secs(5), |e| {
+            e["event"] == "delivery-state"
+                && e["data"]["id"] == m2.as_str()
+                && e["data"]["to_state"] == "delivered_verified"
+        })
+        .await;
+    assert_eq!(upgraded["data"]["from"], "delivered_unverified");
+    assert_eq!(upgraded["data"]["verified_by"], "hook");
+
+    rig.assert_ledger_legal(&[]);
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn modal_declined_with_manifest_keys() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "modal",
+        MODAL_MANIFEST,
+        &hold_script("FAKE-UPDATE-AVAILABLE"),
+        "",
+    )
+    .await;
+    rig.tmux.wait_screen("main", "FAKE-UPDATE-AVAILABLE");
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "moody").await;
+
+    let (result, _) = rig
+        .send(json!({"to": ["moody"], "subject": "hello", "body": "x\ny\nz"}))
+        .await;
+    let msg_id = result["msg_id"].as_str().unwrap().to_string();
+
+    // The gate declined via the manifest rule's keys, then delivered.
+    let decline = rig
+        .ev
+        .wait_event(Duration::from_secs(8), |e| {
+            e["event"] == "gate"
+                && e["data"]["id"] == msg_id.as_str()
+                && e["data"]["action"] == "decline"
+        })
+        .await;
+    assert_eq!(decline["data"]["rule"], "fake_update_modal");
+    rig.ev
+        .wait_event(Duration::from_secs(10), |e| {
+            e["event"] == "delivery-state"
+                && e["data"]["id"] == msg_id.as_str()
+                && e["data"]["to_state"] == "delivered_unverified"
+        })
+        .await;
+
+    // The decline keys landed in the pane (the script consumed them), and
+    // the raw modal text never entered the ledger.
+    rig.assert_ledger_legal(&["FAKE-UPDATE-AVAILABLE"]);
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn modal_without_auto_dismiss_holds_and_notifies() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "trust",
+        MODAL_MANIFEST,
+        &hold_script("FAKE-TRUST-PROMPT"),
+        "receipt_block_ms = 600\n",
+    )
+    .await;
+    rig.tmux.wait_screen("main", "FAKE-TRUST-PROMPT");
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "trusty").await;
+
+    let (result, _) = rig
+        .send(json!({"to": ["trusty"], "subject": "held", "body": "x\ny\nz"}))
+        .await;
+    let msg_id = result["msg_id"].as_str().unwrap().to_string();
+    // Unresolved inside the receipt window: reported queued, never a lie.
+    assert_eq!(result["deliveries"][0]["state"], "queued", "{result}");
+
+    // The hold is announced to the admin, naming the rule, and the
+    // delivery stays in gating (no decline keys are ever sent).
+    let notify = rig
+        .ev
+        .wait_event(Duration::from_secs(5), |e| {
+            e["event"] == "admin-notify" && e["data"]["level"] == "action_required"
+        })
+        .await;
+    assert!(
+        notify["data"]["subject"]
+            .as_str()
+            .unwrap()
+            .contains("fake_trust_modal"),
+        "{notify}"
+    );
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let lines = rig.ledger_lines();
+    let last = lines
+        .iter()
+        .rev()
+        .find(|l| l["kind"] == "state" && l["id"] == msg_id.as_str())
+        .expect("state line");
+    assert_eq!(last["data"]["to_state"], "gating", "held, not dismissed");
+    // The pane still shows the modal: nothing was typed into it.
+    assert!(rig.tmux.capture(&pane).contains("FAKE-TRUST-PROMPT"));
+
+    // The human clears the modal; the held delivery proceeds on the state
+    // change, no timer involved.
+    rig.tmux.run(&["send-keys", "-t", &pane, "x", "Enter"]);
+    rig.ev
+        .wait_event(Duration::from_secs(10), |e| {
+            e["event"] == "delivery-state"
+                && e["data"]["id"] == msg_id.as_str()
+                && e["data"]["to_state"] == "delivered_unverified"
+        })
+        .await;
+    rig.assert_ledger_legal(&["FAKE-TRUST-PROMPT"]);
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quota_parks_everything_and_never_retries() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let script = "sh -c 'echo \"Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 135h57m42s.\"; read x; printf \"\\033[2J\\033[H\"; exec cat'";
+    let mut rig = Rig::new("quota", QUOTA_MANIFEST, script, "receipt_block_ms = 2000\n").await;
+    rig.tmux.wait_screen("main", "Individual quota reached");
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "agy").await;
+
+    // First send: the gate discovers the quota wall and parks, with the
+    // parsed reset hint in the receipt note.
+    let (r1, _) = rig
+        .send(json!({"to": ["agy"], "subject": "first", "body": "b"}))
+        .await;
+    let m1 = r1["msg_id"].as_str().unwrap().to_string();
+    assert_eq!(r1["deliveries"][0]["state"], "parked_blocked_quota", "{r1}");
+    assert_eq!(r1["deliveries"][0]["note"], "resets in 135h57m42s", "{r1}");
+    let notify = rig
+        .ev
+        .wait_event(Duration::from_secs(5), |e| e["event"] == "admin-notify")
+        .await;
+    assert_eq!(notify["data"]["level"], "urgent", "{notify}");
+    assert!(notify["data"]["body"]
+        .as_str()
+        .unwrap()
+        .contains("resets in 135h57m42s"));
+
+    // Second send: the parked recipient answers immediately, still parked.
+    let (r2, elapsed) = rig
+        .send(json!({"to": ["agy"], "subject": "second", "body": "b"}))
+        .await;
+    let m2 = r2["msg_id"].as_str().unwrap().to_string();
+    assert_eq!(r2["deliveries"][0]["state"], "parked_blocked_quota", "{r2}");
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "parked receipt blocked {elapsed:?}"
+    );
+
+    // Even when the pane recovers, NOTHING auto-retries: re-queue is an
+    // explicit operator action (amendment f).
+    rig.tmux.run(&["send-keys", "-t", &pane, "x", "Enter"]);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        rig.final_state(&m1, "agy").as_deref(),
+        Some("parked_blocked_quota")
+    );
+    assert_eq!(
+        rig.final_state(&m2, "agy").as_deref(),
+        Some("parked_blocked_quota")
+    );
+    let screen = rig.tmux.capture(&pane);
+    assert!(
+        !screen.contains("[cyclops"),
+        "a parked delivery was pasted:\n{screen}"
+    );
+
+    // The raw quota banner text stays out of the ledger; only the parsed
+    // hint travels.
+    rig.assert_ledger_legal(&["upgrade your subscription"]);
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fifo_ordering_after_busy_target_goes_idle() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "fifo",
+        BUSY_MANIFEST,
+        &hold_script("BUSY-MARKER"),
+        "receipt_block_ms = 400\n",
+    )
+    .await;
+    rig.tmux.wait_screen("main", "BUSY-MARKER");
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "busy").await;
+
+    let mut ids = Vec::new();
+    let mut positions = Vec::new();
+    for n in 0..3 {
+        let (r, elapsed) = rig
+            .send(json!({"to": ["busy"], "subject": format!("msg {n}"), "body": "a\nb\nc"}))
+            .await;
+        ids.push(r["msg_id"].as_str().unwrap().to_string());
+        assert_eq!(r["deliveries"][0]["state"], "queued", "{r}");
+        positions.push(r["deliveries"][0]["position"].as_u64());
+        if n > 0 {
+            // Busy path: immediate queued receipt with the queue depth.
+            assert!(
+                elapsed < Duration::from_millis(300),
+                "busy receipt blocked {elapsed:?}"
+            );
+        }
+    }
+    assert_eq!(positions, vec![Some(0), Some(1), Some(2)]);
+
+    // Release the pane; queued deliveries land FIFO on the state change.
+    let released_at = Instant::now();
+    rig.tmux.run(&["send-keys", "-t", &pane, "x", "Enter"]);
+    let mut delivered_order = Vec::new();
+    for _ in 0..3 {
+        let e = rig
+            .ev
+            .wait_event(Duration::from_secs(15), |e| {
+                e["event"] == "delivery-state" && e["data"]["to_state"] == "delivered_unverified"
+            })
+            .await;
+        delivered_order.push(e["data"]["id"].as_str().unwrap().to_string());
+    }
+    assert_eq!(delivered_order, ids, "deliveries arrived out of order");
+    assert!(
+        released_at.elapsed() < Duration::from_secs(10),
+        "queued deliveries took {:?} after release",
+        released_at.elapsed()
+    );
+    rig.assert_ledger_legal(&["BUSY-MARKER"]);
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn broadcast_fans_out_and_missing_recipient_needs_attention() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    // Generous receipt cap: this test asserts fan-out semantics, not the
+    // 2.5s budget. Under full-workspace parallel load the second screen-tier
+    // delivery can outlast the default cap, and a queued receipt is legal.
+    let mut rig = Rig::new("cast", CAT_MANIFEST, "cat", "receipt_block_ms = 10000\n").await;
+    rig.tmux.run(&["split-window", "-d", "-t", "main:0", "cat"]);
+    rig.wait_attached(2).await;
+    let panes = rig.pane_ids().await;
+    rig.label(&panes[0], "impl").await;
+    rig.label(&panes[1], "rev").await;
+
+    // Broadcast: one msg ledger fact, N delivery records advancing
+    // independently.
+    let (result, _) = rig
+        .send(json!({"to": ["impl", "rev"], "subject": "cast", "body": "a\nb\nc"}))
+        .await;
+    let msg_id = result["msg_id"].as_str().unwrap().to_string();
+    let deliveries = result["deliveries"].as_array().unwrap();
+    assert_eq!(deliveries.len(), 2);
+    for d in deliveries {
+        assert_eq!(d["state"], "delivered_unverified", "{result}");
+    }
+    let lines = rig.ledger_lines();
+    let msg_lines: Vec<&Value> = lines
+        .iter()
+        .filter(|l| l["kind"] == "msg" && l["id"] == msg_id.as_str())
+        .collect();
+    assert_eq!(msg_lines.len(), 1, "broadcast is ONE msg line");
+    assert_eq!(msg_lines[0]["deliveries"].as_array().unwrap().len(), 2);
+    assert!(rig.tmux.capture(&panes[0]).contains(&msg_id));
+    assert!(rig.tmux.capture(&panes[1]).contains(&msg_id));
+
+    // Unresolvable recipient: attention_required with a cause, plus an
+    // admin notification. Limbo is a bug; this is a named state.
+    let (result, _) = rig
+        .send(json!({"to": ["ghost"], "subject": "lost", "body": "b"}))
+        .await;
+    assert_eq!(
+        result["deliveries"][0]["state"], "attention_required",
+        "{result}"
+    );
+    rig.ev
+        .wait_event(Duration::from_secs(5), |e| {
+            e["event"] == "admin-notify" && e["data"]["subject"].as_str().unwrap().contains("ghost")
+        })
+        .await;
+
+    rig.assert_ledger_legal(&[]);
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verification_failure_retries_once_then_needs_attention() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new("retry", BAD_VERIFY_MANIFEST, "cat", "").await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "flaky").await;
+
+    let (result, _) = rig
+        .send(json!({"to": ["flaky"], "subject": "will fail", "body": "b"}))
+        .await;
+    let msg_id = result["msg_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        result["deliveries"][0]["state"], "attention_required",
+        "{result}"
+    );
+
+    // Exactly one bounded retry: two pasting attempts, then attention and
+    // an admin notification. Never a loop.
+    let lines = rig.ledger_lines();
+    let pastes = lines
+        .iter()
+        .filter(|l| {
+            l["kind"] == "state" && l["id"] == msg_id.as_str() && l["data"]["to_state"] == "pasting"
+        })
+        .count();
+    assert_eq!(pastes, 2, "expected exactly 2 attempts");
+    assert_eq!(
+        rig.final_state(&msg_id, "flaky").as_deref(),
+        Some("attention_required")
+    );
+    rig.ev
+        .wait_event(Duration::from_secs(5), |e| {
+            e["event"] == "admin-notify" && e["data"]["level"] == "action_required"
+        })
+        .await;
+    rig.assert_ledger_legal(&[]);
+    rig.shutdown().await;
+}
+
+/// The in-process embedding path: a caller with an already-resolved sender
+/// (the socket path resolves identity first, tested above via "admin").
+#[tokio::test(flavor = "multi_thread")]
+async fn in_process_send_with_custom_sender() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new("embed", CAT_MANIFEST, "cat", "").await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "peer").await;
+
+    let params: cyclops_proto::MsgSendParams = serde_json::from_value(json!({
+        "to": ["peer"],
+        "subject": "from a labeled agent",
+        "body": "a\nb\nc",
+    }))
+    .unwrap();
+    let result = rig.daemon.msg_send("codex", params).await.expect("send ok");
+    assert_eq!(
+        result["deliveries"][0]["state"], "delivered_unverified",
+        "{result}"
+    );
+    let screen = rig.tmux.capture(&pane);
+    assert!(screen.contains("FROM: codex"), "{screen}");
+    assert!(
+        screen.contains("Reply with: cyclops send codex"),
+        "{screen}"
+    );
+    rig.assert_ledger_legal(&[]);
+    rig.shutdown().await;
+}

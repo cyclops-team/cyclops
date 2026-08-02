@@ -6,7 +6,9 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use cyclops_proto::{AgentState, Detection, Event, PaneStatus, Sensor, StatusResult};
+use cyclops_proto::{
+    AgentState, DeliveryReceipt, DeliveryState, Detection, Event, PaneStatus, Sensor, StatusResult,
+};
 
 use crate::style::Style;
 
@@ -207,6 +209,55 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
         }
     }
     out.join("\n")
+}
+
+/// One receipt badge, the landing-page voice: glyph plus word, qualifier
+/// after a dim separator. In-flight pipeline states should not reach a
+/// receipt, but every DeliveryState renders rather than panicking on a
+/// daemon that answers mid-pipeline.
+pub fn receipt_badge(r: &DeliveryReceipt, style: &Style) -> String {
+    let sep = style.dim("·");
+    let with = |head: &str, tail: &str| format!("{head} {sep} {}", style.dim(tail));
+    match r.state {
+        DeliveryState::Queued => match r.position {
+            Some(n) => with("● queued", &format!("{n} ahead")),
+            None => "● queued".into(),
+        },
+        DeliveryState::Gating => "● gating".into(),
+        DeliveryState::Pasting => "● pasting".into(),
+        DeliveryState::Staged => "● staged".into(),
+        DeliveryState::Submitted => "● submitted".into(),
+        DeliveryState::RetryQueued => "● retrying".into(),
+        DeliveryState::DeliveredVerified => with("✓ delivered", "verified"),
+        DeliveryState::DeliveredUnverified => with("✓ delivered", "unverified (screen)"),
+        DeliveryState::AttentionRequired => match &r.note {
+            Some(note) => with("⚠ needs attention", note),
+            None => "⚠ needs attention".into(),
+        },
+        DeliveryState::ParkedBlockedQuota => match &r.note {
+            Some(note) => with("⛔ parked", &format!("quota, {note}")),
+            None => with("⛔ parked", "quota"),
+        },
+    }
+}
+
+/// Receipts as send shows them: one delivery is a bare badge line, a
+/// broadcast is a grid of role-colored recipients and badges.
+pub fn render_receipts(rs: &[DeliveryReceipt], style: &Style) -> String {
+    if rs.len() == 1 {
+        return receipt_badge(&rs[0], style);
+    }
+    let to_w = rs.iter().map(|r| display_width(&r.to)).max().unwrap_or(0);
+    rs.iter()
+        .map(|r| {
+            format!(
+                "  {}  {}",
+                style.role(&r.to, &pad(&r.to, to_w)),
+                receipt_badge(r, style)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn render_ping(rtt_ms: f64, style: &Style) -> String {
@@ -444,6 +495,75 @@ mod tests {
                         \n\
                         \x20 No sessions yet. Name one in /x/config.toml and cyclops will pick it up.";
         assert_eq!(got, expected);
+    }
+
+    fn receipt(state: DeliveryState, position: Option<u32>, note: Option<&str>) -> DeliveryReceipt {
+        DeliveryReceipt {
+            to: "reviewer".into(),
+            state,
+            position,
+            note: note.map(String::from),
+        }
+    }
+
+    #[test]
+    fn receipt_badges_are_exact_in_plain_mode() {
+        use DeliveryState::*;
+        let s = Style::none();
+        let cases = [
+            (
+                receipt(DeliveredVerified, None, None),
+                "✓ delivered · verified",
+            ),
+            (
+                receipt(DeliveredUnverified, None, None),
+                "✓ delivered · unverified (screen)",
+            ),
+            (receipt(Queued, Some(2), None), "● queued · 2 ahead"),
+            (receipt(Queued, None, None), "● queued"),
+            (
+                receipt(ParkedBlockedQuota, None, Some("resets in 135h")),
+                "⛔ parked · quota, resets in 135h",
+            ),
+            (receipt(ParkedBlockedQuota, None, None), "⛔ parked · quota"),
+            (
+                receipt(AttentionRequired, None, Some("target pane is gone")),
+                "⚠ needs attention · target pane is gone",
+            ),
+            (receipt(AttentionRequired, None, None), "⚠ needs attention"),
+            (receipt(Gating, None, None), "● gating"),
+            (receipt(Pasting, None, None), "● pasting"),
+            (receipt(Staged, None, None), "● staged"),
+            (receipt(Submitted, None, None), "● submitted"),
+            (receipt(RetryQueued, None, None), "● retrying"),
+        ];
+        for (r, want) in &cases {
+            assert_eq!(receipt_badge(r, &s), *want);
+        }
+    }
+
+    #[test]
+    fn single_receipt_is_a_bare_badge_line() {
+        let rs = [receipt(DeliveryState::DeliveredVerified, None, None)];
+        assert_eq!(
+            render_receipts(&rs, &Style::none()),
+            "✓ delivered · verified"
+        );
+    }
+
+    #[test]
+    fn broadcast_grid_is_exact_and_aligned() {
+        let mut a = receipt(DeliveryState::DeliveredVerified, None, None);
+        a.to = "reviewer".into();
+        let mut b = receipt(DeliveryState::Queued, Some(2), None);
+        b.to = "implementer".into();
+        let got = render_receipts(&[a, b], &Style::none());
+        let expected = "\x20 reviewer     ✓ delivered · verified\n\
+                        \x20 implementer  ● queued · 2 ahead";
+        assert_eq!(got, expected);
+        for line in got.lines() {
+            assert_eq!(line, line.trim_end(), "trailing space in: {line:?}");
+        }
     }
 
     #[test]

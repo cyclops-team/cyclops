@@ -1,9 +1,15 @@
 name: ci
 
+# frontend/ is the production landing page, a read-only branding reference;
+# Rust CI has no business running for changes to it.
 on:
   push:
-    branches: [main]
+    branches: [v2, main]
+    paths-ignore:
+      - "frontend/**"
   pull_request:
+    paths-ignore:
+      - "frontend/**"
 
 env:
   CARGO_TERM_COLOR: always

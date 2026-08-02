@@ -8,6 +8,7 @@ description = "The Cyclops daemon: control-mode watcher, sensor fusion, ledger, 
 cyclops-proto.workspace = true
 cyclops-manifest.workspace = true
 cyclops-tmux.workspace = true
+cyclops-ledger.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

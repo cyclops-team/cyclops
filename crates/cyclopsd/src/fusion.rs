@@ -1,6 +1,6 @@
-//! Sensor fusion, M0 scope: title tier plus screen tier over manifest
-//! rules, with output activity as a recompute trigger (never a verdict).
-//! The hook sensor joins in M2 via agent.state.report.
+//! Sensor fusion: title tier plus screen tier over manifest rules, with
+//! output activity as a recompute trigger (never a verdict), and the hook
+//! sensor fed by agent.state.report (M1).
 //!
 //! Tier semantics mirror `Manifest::evaluate`: rules are already sorted by
 //! priority, the first match in a region class wins that tier, and the
@@ -161,7 +161,7 @@ pub(crate) async fn recompute_pane(
         return Some(det);
     }
 
-    let detection = if row.dead {
+    let mut detection = if row.dead {
         Detection {
             state: AgentState::Dead,
             readings: Vec::new(),
@@ -213,6 +213,31 @@ pub(crate) async fn recompute_pane(
         }
     };
 
+    // Hook sensor (agent.state.report): high-precision edges, incomplete
+    // coverage. Rules keep the verdict when they produced one; the hook
+    // decides only where rules see nothing, and a live disagreement stays
+    // observable either way. Blocked states always come from rules, since
+    // no tested CLI hooks its modals or quota (amendment h).
+    if !row.dead {
+        let hook = inner
+            .hook_readings
+            .lock()
+            .expect("hook readings lock")
+            .get(pane_id)
+            .cloned();
+        if let Some(reading) = hook {
+            let hook_state = reading.state;
+            let hook_rule = reading.rule.clone();
+            detection.readings.push(reading);
+            if detection.state == AgentState::Unknown {
+                detection.state = hook_state;
+                detection.decided_by = format!("hook:{hook_rule}");
+            } else if hook_state != detection.state {
+                detection.disagreement = true;
+            }
+        }
+    }
+
     let prior = {
         let mut map = inner.detections.lock().expect("detections lock");
         let prior = map.get(pane_id).map(|e| e.detection.state);
@@ -236,7 +261,7 @@ pub(crate) async fn recompute_pane(
             cause,
             "fused state changed"
         );
-        inner.emit_state(pane_id, detection.state, prior, detection.disagreement);
+        inner.emit_state(watcher.session(), pane_id, &detection, prior, cause);
     }
     Some(detection)
 }

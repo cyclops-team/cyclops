@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use cyclops_proto::{
-    Event, Hello, PaneReadParams, PaneReadResult, PaneReadSource, PingResult, Request, Response,
-    SessionStatus, StatusResult, SubscribeParams, PROTOCOL_VERSION,
+    AdminNotifyParams, AgentWaitParams, Event, Hello, MsgSendParams, PaneReadParams,
+    PaneReadResult, PaneReadSource, PingResult, Request, Response, SessionStatus,
+    StateReportParams, StatusResult, SubscribeParams, PROTOCOL_VERSION,
 };
 use cyclops_tmux::SessionWatcher;
 use serde_json::{json, Value};
@@ -22,7 +23,12 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, watch};
 use tracing::{debug, info, warn};
 
-use crate::{fusion, peercred, unix_ms, Inner};
+use crate::{ack, delivery, fusion, identity, unix_ms, Inner};
+
+/// Peer credentials captured once per connection, before the stream is
+/// split. None means the kernel could not report them; identity-gated
+/// methods fail closed on it.
+type Peer = Option<(u32, i32)>;
 
 /// A write that does not finish inside this window means the client is
 /// wedged; the connection is dropped rather than buffered without bound.
@@ -32,15 +38,11 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_RECENT_LINES: u32 = 200;
 
 /// Protocol v1 methods that exist but land in a later milestone. One list,
-/// so M1/M2 replace entries here instead of hunting through dispatch.
+/// so M2 replaces entries here instead of hunting through dispatch.
 const UNIMPLEMENTED: &[(&str, &str)] = &[
-    ("msg.send", "M1"),
-    ("msg.history", "M1"),
-    ("msg.thread", "M1"),
-    ("agent.wait", "M1"),
-    ("admin.notify", "M1"),
-    // Hook/state ingestion arrives with the hook sensor.
-    ("agent.state.report", "M2"),
+    // The ledger already records everything these will read.
+    ("msg.history", "M2"),
+    ("msg.thread", "M2"),
 ];
 
 /// Bind the daemon socket under `home`, creating the directory 0700.
@@ -119,12 +121,18 @@ enum Pumped {
 }
 
 pub(crate) async fn handle_conn(inner: Arc<Inner>, stream: UnixStream) {
-    // Identity enforcement is M1/M2; for now the peer is logged so the
-    // plumbing is proven on both platforms.
-    match peercred::peer_creds(&stream) {
-        Some(c) => debug!(uid = c.uid, pid = ?c.pid, "client connected"),
-        None => debug!("client connected; peer credentials unavailable"),
-    }
+    // Peer credentials are read once, before the split consumes the
+    // stream. Identity-gated methods (msg.send) fail closed without them.
+    let peer: Peer = match identity::peer_of(&stream) {
+        Ok((uid, pid)) => {
+            debug!(uid, pid, "client connected");
+            Some((uid, pid))
+        }
+        Err(e) => {
+            debug!(error = %e, "client connected; peer credentials unavailable");
+            None
+        }
+    };
     let (read_half, mut w) = stream.into_split();
     let hello = Hello {
         cyclops: env!("CARGO_PKG_VERSION").to_string(),
@@ -165,7 +173,7 @@ pub(crate) async fn handle_conn(inner: Arc<Inner>, stream: UnixStream) {
                 return;
             }
             Pumped::Ev(Err(broadcast::error::RecvError::Closed)) => return,
-            Pumped::Line(Ok(Some(line))) => match handle_line(&inner, &line, &mut w).await {
+            Pumped::Line(Ok(Some(line))) => match handle_line(&inner, &line, peer, &mut w).await {
                 LineOutcome::Continue => {}
                 LineOutcome::Drop => return,
                 LineOutcome::Subscribed(kinds, rx) => sub = Some((rx, kinds)),
@@ -177,7 +185,12 @@ pub(crate) async fn handle_conn(inner: Arc<Inner>, stream: UnixStream) {
 }
 
 /// Process one request line: parse, dispatch, write the response.
-async fn handle_line(inner: &Arc<Inner>, line: &str, w: &mut OwnedWriteHalf) -> LineOutcome {
+async fn handle_line(
+    inner: &Arc<Inner>,
+    line: &str,
+    peer: Peer,
+    w: &mut OwnedWriteHalf,
+) -> LineOutcome {
     if line.trim().is_empty() {
         return LineOutcome::Continue;
     }
@@ -194,7 +207,7 @@ async fn handle_line(inner: &Arc<Inner>, line: &str, w: &mut OwnedWriteHalf) -> 
             };
         }
     };
-    let (resp, subscribe) = dispatch(inner, req).await;
+    let (resp, subscribe) = dispatch(inner, req, peer).await;
     let text = serde_json::to_string(&resp).expect("response serializes");
     if let Some(params) = subscribe {
         // Subscribe before writing the ack so no event can fall between.
@@ -231,6 +244,7 @@ pub(crate) fn kind_matches(kinds: &[String], event: &str) -> bool {
 pub(crate) async fn dispatch(
     inner: &Arc<Inner>,
     req: Request,
+    peer: Peer,
 ) -> (Response, Option<SubscribeParams>) {
     let id = req.id.clone();
     match req.method.as_str() {
@@ -252,6 +266,77 @@ pub(crate) async fn dispatch(
             )
         }
         "pane.read" => (pane_read(inner, id, req.params).await, None),
+        "msg.send" => (msg_send(inner, id, req.params, peer).await, None),
+        "agent.state.report" => {
+            let params: StateReportParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => {
+                    return (
+                        Response::err(id, "bad_request", format!("bad state report: {e}")),
+                        None,
+                    )
+                }
+            };
+            (
+                from_result(id, ack::handle_report(inner, params).await),
+                None,
+            )
+        }
+        "admin.notify" => {
+            let params: AdminNotifyParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => {
+                    return (
+                        Response::err(id, "bad_request", format!("bad admin.notify params: {e}")),
+                        None,
+                    )
+                }
+            };
+            let seq = delivery::admin_notify(
+                inner,
+                params.level,
+                &params.subject,
+                &params.body,
+                None,
+                None,
+            );
+            (
+                Response::ok(id, json!({"notified": true, "seq": seq})),
+                None,
+            )
+        }
+        "agent.wait" => {
+            let params: AgentWaitParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => {
+                    return (
+                        Response::err(id, "bad_request", format!("bad agent.wait params: {e}")),
+                        None,
+                    )
+                }
+            };
+            (
+                from_result(id, delivery::agent_wait(inner, params).await),
+                None,
+            )
+        }
+        "pane.label" => {
+            let target = req.params["target"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if target.is_empty() {
+                return (
+                    Response::err(id, "bad_request", "pane.label needs a target"),
+                    None,
+                );
+            }
+            let label = req.params["label"].as_str().map(str::to_string);
+            (
+                from_result(id, crate::label_pane(inner, &target, label)),
+                None,
+            )
+        }
         "events.subscribe" => {
             let params: SubscribeParams = if req.params.is_null() {
                 SubscribeParams {
@@ -270,7 +355,7 @@ pub(crate) async fn dispatch(
                 }
             };
             if params.cursor.is_some() {
-                debug!("subscribe cursor ignored: ledger replay lands in M1");
+                debug!("subscribe cursor ignored: ledger replay lands with the stream client (M3)");
             }
             (Response::ok(id, json!({"subscribed": true})), Some(params))
         }
@@ -290,9 +375,68 @@ pub(crate) async fn dispatch(
     }
 }
 
+/// Wrap a handler's Result into a Response.
+fn from_result(id: Value, result: Result<Value, cyclops_proto::WireError>) -> Response {
+    match result {
+        Ok(v) => Response::ok(id, v),
+        Err(e) => Response {
+            id,
+            result: None,
+            error: Some(e),
+        },
+    }
+}
+
+/// msg.send over the socket: resolve the sender from peer credentials
+/// (fail-closed: no credentials or a foreign uid is denied, and nothing
+/// in the request body can override the resolved sender), then hand off
+/// to the delivery pipeline.
+async fn msg_send(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
+    let params: MsgSendParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => return Response::err(id, "bad_request", format!("bad msg.send params: {e}")),
+    };
+    let Some((uid, pid)) = peer else {
+        return Response::err(id, "denied", "peer credentials unavailable");
+    };
+    let daemon_uid = unsafe { libc::getuid() };
+    if uid != daemon_uid {
+        return Response::err(id, "denied", format!("uid {uid} is not the daemon's user"));
+    }
+    let panes = sender_panes(inner);
+    let from = match identity::resolve_sender(uid, pid, &panes) {
+        identity::Sender::Agent(label) => label,
+        identity::Sender::Pane(pane_id) => pane_id,
+        identity::Sender::Admin => "admin".to_string(),
+    };
+    from_result(id, delivery::msg_send(inner, &from, params).await)
+}
+
+/// (pane_id, label, pane_pid) rows for sender resolution, across every
+/// attached session.
+fn sender_panes(inner: &Inner) -> Vec<(String, Option<String>, i32)> {
+    let labels = inner.labels.lock().expect("labels lock");
+    inner
+        .sessions
+        .iter()
+        .flat_map(|slot| {
+            let link = slot.link.lock().expect("session link lock");
+            link.watcher
+                .as_ref()
+                .map(|w| w.snapshot())
+                .unwrap_or_default()
+        })
+        .map(|row| {
+            let label = labels.get(&row.pane_id).cloned();
+            (row.pane_id, label, row.pane_pid)
+        })
+        .collect()
+}
+
 /// Assemble StatusResult from the session slots and the detection cache.
 pub(crate) fn status_result(inner: &Inner) -> StatusResult {
     let detections = inner.detections.lock().expect("detections lock");
+    let labels = inner.labels.lock().expect("labels lock");
     let sessions = inner
         .sessions
         .iter()
@@ -311,8 +455,7 @@ pub(crate) fn status_result(inner: &Inner) -> StatusResult {
                     .map(|r| {
                         let entry = detections.get(&r.pane_id);
                         r.to_status(
-                            // Labels arrive with the adoption registry (M1).
-                            None,
+                            labels.get(&r.pane_id).cloned(),
                             entry.and_then(|e| e.manifest.clone()),
                             entry
                                 .map(|e| e.detection.state)
@@ -476,6 +619,10 @@ mod tests {
             sessions: Vec::new(),
             events: broadcast::channel(16).0,
             detections: StdMutex::new(HashMap::<String, DetEntry>::new()),
+            labels: StdMutex::new(HashMap::new()),
+            hook_readings: StdMutex::new(HashMap::new()),
+            engine: crate::delivery::Engine::new(),
+            ack_state: crate::ack::AckState::new(),
         })
     }
 
@@ -485,6 +632,10 @@ mod tests {
             method: method.into(),
             params: json!({}),
         }
+    }
+
+    fn own_peer() -> Peer {
+        Some((unsafe { libc::getuid() }, std::process::id() as i32))
     }
 
     /// Every protocol v1 method answers with something that is not
@@ -501,16 +652,17 @@ mod tests {
             "agent.wait",
             "agent.state.report",
             "pane.read",
+            "pane.label",
             "events.subscribe",
             "admin.notify",
         ];
         for method in v1 {
-            let (resp, _) = dispatch(&inner, req(method)).await;
+            let (resp, _) = dispatch(&inner, req(method), own_peer()).await;
             if let Some(err) = &resp.error {
                 assert_ne!(err.code, "unknown_method", "{method} fell through dispatch");
             }
         }
-        let (resp, _) = dispatch(&inner, req("bogus.method")).await;
+        let (resp, _) = dispatch(&inner, req("bogus.method"), own_peer()).await;
         assert_eq!(resp.error.unwrap().code, "unknown_method");
     }
 
@@ -518,7 +670,7 @@ mod tests {
     async fn unimplemented_methods_name_their_milestone() {
         let inner = bare_inner();
         for (method, milestone) in UNIMPLEMENTED {
-            let (resp, _) = dispatch(&inner, req(method)).await;
+            let (resp, _) = dispatch(&inner, req(method), own_peer()).await;
             let err = resp.error.expect("unimplemented answers with an error");
             assert_eq!(err.code, "unimplemented", "{method}");
             assert_eq!(err.message, format!("coming in {milestone}"), "{method}");
@@ -526,11 +678,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn msg_send_fails_closed_without_peer_credentials() {
+        let inner = bare_inner();
+        let (resp, _) = dispatch(
+            &inner,
+            Request {
+                id: json!(9),
+                method: "msg.send".into(),
+                params: json!({"to": ["reviewer"], "subject": "hi"}),
+            },
+            None,
+        )
+        .await;
+        assert_eq!(resp.error.unwrap().code, "denied");
+    }
+
+    #[tokio::test]
+    async fn msg_send_denies_foreign_uid() {
+        let inner = bare_inner();
+        let foreign = unsafe { libc::getuid() }.wrapping_add(1);
+        let (resp, _) = dispatch(
+            &inner,
+            Request {
+                id: json!(9),
+                method: "msg.send".into(),
+                params: json!({"to": ["reviewer"], "subject": "hi"}),
+            },
+            Some((foreign, 1)),
+        )
+        .await;
+        assert_eq!(resp.error.unwrap().code, "denied");
+    }
+
+    #[tokio::test]
     async fn ping_and_status_answer_without_tmux() {
         let inner = bare_inner();
-        let (resp, _) = dispatch(&inner, req("ping")).await;
+        let (resp, _) = dispatch(&inner, req("ping"), own_peer()).await;
         assert_eq!(resp.result.unwrap()["pong"], true);
-        let (resp, _) = dispatch(&inner, req("status")).await;
+        let (resp, _) = dispatch(&inner, req("status"), own_peer()).await;
         let result = resp.result.unwrap();
         assert_eq!(result["boot_id"], "b-test");
         assert_eq!(result["sessions"], json!([]));
@@ -546,6 +731,7 @@ mod tests {
                 method: "events.subscribe".into(),
                 params: json!({"kinds": ["state"]}),
             },
+            own_peer(),
         )
         .await;
         assert_eq!(resp.result.unwrap()["subscribed"], true);

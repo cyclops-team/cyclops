@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::copy;
 use cyclops_proto::Hello;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -22,8 +23,8 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 pub enum ClientError {
     /// Nothing listening at the socket path.
     NotRunning,
-    /// Connect did not finish inside CONNECT_TIMEOUT.
-    ConnectTimeout,
+    /// Connect did not finish inside the carried budget.
+    ConnectTimeout(Duration),
     /// The daemon answered a request with a wire error.
     Server {
         code: String,
@@ -41,12 +42,19 @@ pub struct Client {
     reader: BufReader<UnixStream>,
     hello: Hello,
     next_id: u64,
+    /// Active read deadline, kept so timeout errors can name it honestly.
+    read_timeout: Option<Duration>,
     /// Event lines that arrived while a response was pending. Buffered so
     /// a subscribe race drops nothing; next_line drains these first.
     pending: VecDeque<String>,
 }
 
 impl Client {
+    /// Connect with the interactive defaults: 2s connect, 5s reads.
+    pub fn connect() -> Result<Self, ClientError> {
+        Self::connect_with_timeouts(CONNECT_TIMEOUT, READ_TIMEOUT)
+    }
+
     /// Connect to cyclops_proto::socket_path() and read the Hello line.
     ///
     /// UnixStream::connect has no timeout parameter, so the connect runs on
@@ -54,13 +62,16 @@ impl Client {
     /// connect instantly; the timeout catches a daemon with a full accept
     /// backlog. An abandoned helper thread costs nothing here because the
     /// process exits right after the error path.
-    pub fn connect() -> Result<Self, ClientError> {
+    ///
+    /// The explicit-budget form exists for the hook receiver, which runs
+    /// inside vendor hook time limits and cannot afford the defaults.
+    pub fn connect_with_timeouts(connect: Duration, read: Duration) -> Result<Self, ClientError> {
         let path = cyclops_proto::socket_path();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let _ = tx.send(UnixStream::connect(path));
         });
-        let stream = match rx.recv_timeout(CONNECT_TIMEOUT) {
+        let stream = match rx.recv_timeout(connect) {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 return Err(match e.kind() {
@@ -68,10 +79,10 @@ impl Client {
                     _ => ClientError::Broken(e.to_string()),
                 })
             }
-            Err(_) => return Err(ClientError::ConnectTimeout),
+            Err(_) => return Err(ClientError::ConnectTimeout(connect)),
         };
         stream
-            .set_read_timeout(Some(READ_TIMEOUT))
+            .set_read_timeout(Some(read))
             .map_err(|e| ClientError::Broken(e.to_string()))?;
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
@@ -82,7 +93,7 @@ impl Client {
                 ))
             }
             Ok(_) => {}
-            Err(e) => return Err(ClientError::Broken(read_cause(&e))),
+            Err(e) => return Err(ClientError::Broken(read_cause(&e, Some(read)))),
         }
         let hello: Hello = serde_json::from_str(line.trim())
             .map_err(|_| ClientError::Broken("the hello line didn't parse".into()))?;
@@ -90,6 +101,7 @@ impl Client {
             reader,
             hello,
             next_id: 1,
+            read_timeout: Some(read),
             pending: VecDeque::new(),
         })
     }
@@ -161,6 +173,16 @@ impl Client {
     /// here would hide data and misname the error.
     pub fn clear_read_timeout(&mut self) {
         let _ = self.reader.get_ref().set_read_timeout(None);
+        self.read_timeout = None;
+    }
+
+    /// Shrink or extend the read deadline mid-connection. The hook receiver
+    /// sets this to its remaining budget before the one request it makes.
+    /// Setter failure is swallowed for the same F18 reason as
+    /// clear_read_timeout.
+    pub fn set_read_timeout(&mut self, d: Duration) {
+        let _ = self.reader.get_ref().set_read_timeout(Some(d));
+        self.read_timeout = Some(d);
     }
 
     fn raw_line(&mut self) -> Result<String, ClientError> {
@@ -174,18 +196,21 @@ impl Client {
                         return Ok(t.to_string());
                     }
                 }
-                Err(e) => return Err(ClientError::Broken(read_cause(&e))),
+                Err(e) => return Err(ClientError::Broken(read_cause(&e, self.read_timeout))),
             }
         }
     }
 }
 
-/// Read errors carry a timeout cause worth naming for humans.
-fn read_cause(e: &std::io::Error) -> String {
-    if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) {
-        "no answer within 5 seconds".into()
-    } else {
-        e.to_string()
+/// Read errors carry a timeout cause worth naming for humans. The deadline
+/// varies by caller (5s interactive, sub-second in hooks), so it is named
+/// from the active value, never a constant.
+fn read_cause(e: &std::io::Error, timeout: Option<Duration>) -> String {
+    match (e.kind(), timeout) {
+        (ErrorKind::WouldBlock | ErrorKind::TimedOut, Some(d)) => {
+            format!("no answer within {}", copy::timeout_words(d))
+        }
+        _ => e.to_string(),
     }
 }
 

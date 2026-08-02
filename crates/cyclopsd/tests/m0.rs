@@ -268,11 +268,14 @@ async fn m0_shadow_daemon_end_to_end() {
     let resp = c.request("ping", json!({})).await;
     assert_eq!(resp["result"]["pong"], true);
 
-    // Unimplemented methods name their milestone.
+    // msg.send and agent.state.report are implemented since M1; empty
+    // params are a parse error. The M2 query methods name their milestone.
     let resp = c.request("msg.send", json!({})).await;
-    assert_eq!(resp["error"]["code"], "unimplemented");
-    assert_eq!(resp["error"]["message"], "coming in M1");
+    assert_eq!(resp["error"]["code"], "bad_request");
     let resp = c.request("agent.state.report", json!({})).await;
+    assert_eq!(resp["error"]["code"], "bad_request");
+    let resp = c.request("msg.history", json!({})).await;
+    assert_eq!(resp["error"]["code"], "unimplemented");
     assert_eq!(resp["error"]["message"], "coming in M2");
 
     // Status: attached, one bash pane bound to the fixture manifest, state

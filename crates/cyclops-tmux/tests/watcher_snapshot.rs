@@ -37,6 +37,12 @@ async fn snapshot_sees_created_panes_with_ids_titles_sizes() {
     assert_eq!(rows[0].height + rows[1].height, 29);
     assert_eq!(rows.iter().filter(|r| r.active).count(), 1);
 
+    // pane_pid is the pane's root process: live, and unique per pane.
+    for r in &rows {
+        assert!(r.pane_pid > 0, "pane_pid must be a real pid: {r:?}");
+    }
+    assert_ne!(rows[0].pane_pid, rows[1].pane_pid);
+
     // pane() agrees with snapshot().
     assert_eq!(w.pane("%1").unwrap().title, "beta");
     assert!(w.pane("%9").is_none());

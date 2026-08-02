@@ -1,0 +1,281 @@
+/* Cyclops design tokens — from "Cyclops Light" design system v1.0 */
+:root {
+	color-scheme: light;
+
+	/* Surfaces */
+	--paper: #fefefe;
+	--surface: #fbfbf9;
+	--surface-mid: #f4f3f1;
+	--surface-deep: #f7f6f3;
+	--navbar-bg: rgba(254, 254, 254, 0.85);
+
+	/* Ink & grays */
+	--ink: #0a0a0a;
+	--text: #2a2a2a;
+	--muted: #6e6e6e;
+	--gray: #8a8a8a;
+	--faint: #a6a6a6;
+
+	/* Lines */
+	--line: #e4e3df;
+	--line-soft: #efeeeb;
+	--hairline: #d8d7d3;
+	--hairline-btn: #cfcec9;
+
+	/* Sorbet accents */
+	--sage: #b7c396;
+	--sage-hover: #a6b382;
+	--sage-ink: #7e8a5c;
+	--mist: #e0e7d7;
+	--mauve: #ba9a91;
+	--mauve-hover: #a8877e;
+	--mauve-ink: #9c7e75;
+	--link: #6e7a4e;
+	--accent-ink: #0a0a0a;
+
+	/* Terminal */
+	--term-bg: #0d0d0d;
+	--term-line: #1f1f1f;
+	--term-text: #edecec;
+	--term-dim: #777;
+	--term-faint: #666;
+	--term-control: #161616;
+	--term-control-hover: #3a3a3a;
+	--term-neutral: #cccccc;
+	--term-active-bg: rgba(183, 195, 150, 0.07);
+
+	--font-mono: 'JetBrains Mono', ui-monospace, monospace;
+	--font-pixel: 'Silkscreen', ui-monospace, monospace;
+}
+
+:root[data-theme='dark'] {
+	color-scheme: dark;
+
+	/* Surfaces */
+	--paper: #10110f;
+	--surface: #151613;
+	--surface-mid: #1b1c18;
+	--surface-deep: #181916;
+	--navbar-bg: rgba(16, 17, 15, 0.88);
+
+	/* Ink & grays */
+	--ink: #f2f1ec;
+	--text: #d9d8d2;
+	--muted: #aaa9a2;
+	--gray: #989790;
+	--faint: #7e7d77;
+
+	/* Lines */
+	--line: #2d2e29;
+	--line-soft: #242520;
+	--hairline: #3b3c36;
+	--hairline-btn: #484942;
+
+	/* Accents */
+	--sage-hover: #c5cfaa;
+	--sage-ink: #bdc99c;
+	--mist: #293021;
+	--mauve-hover: #c5a69d;
+	--mauve-ink: #c7a59b;
+	--link: #bdc99c;
+
+	/* Terminal tokens intentionally stay unchanged in both themes. */
+}
+
+* {
+	box-sizing: border-box;
+}
+
+html {
+	scroll-behavior: smooth;
+}
+
+html,
+body {
+	margin: 0;
+	padding: 0;
+	max-width: 100%;
+	overflow-x: clip;
+}
+
+body {
+	background: var(--paper);
+	color: var(--text);
+	font-family: var(--font-mono);
+	-webkit-font-smoothing: antialiased;
+}
+
+#install,
+#how-it-works {
+	scroll-margin-top: 96px;
+}
+
+:focus-visible {
+	outline: 2px solid var(--sage-ink);
+	outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	html {
+		scroll-behavior: auto;
+	}
+
+	* {
+		animation-duration: 0.001ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.001ms !important;
+		scroll-behavior: auto !important;
+	}
+}
+
+::selection {
+	background: var(--sage);
+	color: var(--accent-ink);
+}
+
+a {
+	color: var(--link);
+	text-decoration: none;
+}
+
+a:hover {
+	color: var(--sage);
+}
+
+@keyframes blink {
+	0%,
+	49% {
+		opacity: 1;
+	}
+	50%,
+	100% {
+		opacity: 0;
+	}
+}
+
+/* ---- Shared primitives ---- */
+
+.pixel {
+	font-family: var(--font-pixel);
+}
+
+.section {
+	width: 100%;
+	min-width: 0;
+	max-width: 1200px;
+	margin: 0 auto;
+	padding: 56px 48px;
+}
+
+.eyebrow {
+	font-size: 12px;
+	letter-spacing: 2px;
+	color: var(--sage-ink);
+	text-transform: uppercase;
+}
+
+.btn {
+	font-family: var(--font-mono);
+	font-size: 13px;
+	letter-spacing: 0.5px;
+	cursor: pointer;
+}
+
+.btn-primary {
+	font-weight: 700;
+	background: var(--sage);
+	color: var(--accent-ink);
+	border: none;
+	padding: 14px 26px;
+}
+
+.btn-primary:hover,
+a.btn-primary:hover {
+	background: var(--sage-hover);
+	color: var(--accent-ink);
+}
+
+.btn-secondary {
+	font-weight: 600;
+	background: transparent;
+	color: var(--text);
+	border: 1px solid var(--hairline-btn);
+	padding: 13px 26px;
+}
+
+.btn-secondary:hover,
+a.btn-secondary:hover {
+	border-color: var(--sage);
+	color: var(--sage-ink);
+}
+
+.btn-ghost {
+	font-weight: 600;
+	background: transparent;
+	color: var(--gray);
+	border: none;
+	padding: 14px 12px;
+}
+
+.btn-ghost:hover {
+	color: var(--text);
+}
+
+/* ---- Terminal chrome ---- */
+
+.term {
+	border: 1px solid var(--term-line);
+	background: var(--term-bg);
+}
+
+.term-bar {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 12px 16px;
+	border-bottom: 1px solid var(--term-line);
+}
+
+.term-dot {
+	width: 11px;
+	height: 11px;
+	border-radius: 50%;
+}
+
+.term-title {
+	font-size: 11px;
+	color: var(--term-faint);
+	margin-left: 8px;
+}
+
+.term-body {
+	padding: 20px;
+	font-size: 13px;
+	line-height: 2;
+}
+
+.term-body .dim {
+	color: var(--term-dim);
+}
+
+.term-body .out {
+	color: var(--term-text);
+}
+
+.term-body .ok {
+	color: var(--sage);
+}
+
+.term-body .prompt {
+	color: var(--sage);
+}
+
+.cursor {
+	animation: blink 1s step-end infinite;
+}
+
+@media (max-width: 720px) {
+	.section {
+		padding: 40px 24px;
+	}
+}

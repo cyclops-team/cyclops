@@ -17,6 +17,8 @@ async fn title_changes_update_row_and_emit_pane_changed() {
     let w = SessionWatcher::connect(srv.config("ti"))
         .await
         .expect("connect");
+    let pid_at_bootstrap = w.pane("%0").expect("pane %0").pane_pid;
+    assert!(pid_at_bootstrap > 0);
     let mut rx = w.subscribe();
 
     // From outside the pane.
@@ -45,7 +47,11 @@ async fn title_changes_update_row_and_emit_pane_changed() {
             if changed.contains(&PaneField::Title) && row.title == "TITLE_OSC")
     })
     .await;
-    assert_eq!(w.pane("%0").unwrap().title, "TITLE_OSC");
+    let row = w.pane("%0").unwrap();
+    assert_eq!(row.title, "TITLE_OSC");
+    // The subscription push carries pane_pid as its last field; a garbled
+    // parse would have shifted or zeroed it.
+    assert_eq!(row.pane_pid, pid_at_bootstrap);
 
     w.shutdown().await;
 }

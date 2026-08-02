@@ -24,7 +24,10 @@ use cyclops_proto::LedgerLine;
 #[derive(Debug, thiserror::Error)]
 pub enum LedgerError {
     #[error("ledger io at {path}: {source}")]
-    Io { path: PathBuf, source: std::io::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("ledger serialize: {0}")]
     Serialize(#[from] serde_json::Error),
 }
@@ -45,7 +48,10 @@ impl LedgerWriter {
     /// Open (creating parents) and recover: seal a torn tail, find the last
     /// valid seq, continue numbering after it.
     pub fn open(path: &Path, boot_id: &str) -> Result<LedgerWriter, LedgerError> {
-        let io = |source| LedgerError::Io { path: path.into(), source };
+        let io = |source| LedgerError::Io {
+            path: path.into(),
+            source,
+        };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(io)?;
         }
@@ -85,7 +91,10 @@ impl LedgerWriter {
     /// Assign seq, boot_id, and ts, then append and fsync. The returned line
     /// is what hit the disk.
     pub fn append(&self, mut line: LedgerLine) -> Result<LedgerLine, LedgerError> {
-        let io = |source| LedgerError::Io { path: self.path.clone(), source };
+        let io = |source| LedgerError::Io {
+            path: self.path.clone(),
+            source,
+        };
         let mut inner = self.inner.lock().expect("ledger writer poisoned");
         line.seq = inner.next_seq;
         line.boot_id = self.boot_id.clone();
@@ -109,7 +118,10 @@ impl LedgerWriter {
 /// Replay every valid line with seq > cursor (cursor 0 replays everything).
 /// Invalid lines are skipped with a warning; they never abort the replay.
 pub fn read_after(path: &Path, cursor: u64) -> Result<Vec<LedgerLine>, LedgerError> {
-    let io = |source| LedgerError::Io { path: path.into(), source };
+    let io = |source| LedgerError::Io {
+        path: path.into(),
+        source,
+    };
     let file = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -225,7 +237,9 @@ mod tests {
     #[test]
     fn missing_file_reads_empty() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(read_after(&dir.path().join("nope.ndjson"), 0).unwrap().is_empty());
+        assert!(read_after(&dir.path().join("nope.ndjson"), 0)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

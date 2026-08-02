@@ -39,13 +39,14 @@ const SUB_PREFIX: &str = "cyp";
 
 /// Per-pane subscription format. Title first because it is the only
 /// free-text field; the fixed fields are parsed from the right.
-const SUB_FORMAT: &str = "#{pane_title}\t#{pane_dead}\t#{pane_in_mode}\t#{pane_current_command}";
+const SUB_FORMAT: &str =
+    "#{pane_title}\t#{pane_dead}\t#{pane_in_mode}\t#{pane_current_command}\t#{pane_pid}";
 
 /// Snapshot format for list-panes. pane_id and window_id lead (no tabs
-/// possible in ids), the six fixed fields trail; window_name and title sit
-/// in the middle and are split on the first tab between them. A tab inside
-/// a window name would shift the title; documented limitation.
-const PANE_FORMAT: &str = "#{pane_id}\t#{window_id}\t#{window_name}\t#{pane_title}\t#{pane_dead}\t#{pane_in_mode}\t#{pane_current_command}\t#{pane_width}\t#{pane_height}\t#{pane_active}";
+/// possible in ids), the seven fixed fields trail; window_name and title
+/// sit in the middle and are split on the first tab between them. A tab
+/// inside a window name would shift the title; documented limitation.
+const PANE_FORMAT: &str = "#{pane_id}\t#{window_id}\t#{window_name}\t#{pane_title}\t#{pane_dead}\t#{pane_in_mode}\t#{pane_current_command}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_pid}";
 
 /// One pane as the watcher knows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +71,13 @@ pub struct PaneRow {
     pub height: u32,
     /// Active pane of its window.
     pub active: bool,
+    /// Pid of the pane's root process (what tmux spawned into the pane).
+    /// Daemon-internal: sender identity walks socket-peer ancestry to this
+    /// pid; it never enters PaneStatus. Dead panes keep reporting the stale
+    /// pid (MEASURED on 3.6a). A change (respawn-pane) updates the row but
+    /// emits no PaneChanged: no consumer reacts to pid edges, resolution
+    /// reads the table at message time.
+    pub pane_pid: i32,
 }
 
 impl PaneRow {
@@ -415,19 +423,25 @@ fn output_activity(ctx: &mut LoopCtx, pane: String) -> Action {
 /// format expansion, so it is authoritative for the fields it carries; an
 /// unknown pane means the table is stale and needs a reconcile.
 fn apply_sub_value(ctx: &mut LoopCtx, pane: &str, value: &str) -> Action {
-    // Fields in reverse: current_command, in_mode, dead, then title (which
-    // may itself contain tabs and so is taken as the remainder).
-    let mut it = value.rsplitn(4, '\t');
-    let (Some(cmd), Some(in_mode), Some(dead), Some(title)) =
-        (it.next(), it.next(), it.next(), it.next())
+    // Fields in reverse: pane_pid, current_command, in_mode, dead, then
+    // title (which may itself contain tabs and so is taken as the
+    // remainder).
+    let mut it = value.rsplitn(5, '\t');
+    let (Some(pid), Some(cmd), Some(in_mode), Some(dead), Some(title)) =
+        (it.next(), it.next(), it.next(), it.next(), it.next())
     else {
         warn!(%pane, %value, "malformed subscription value");
+        return Action::Hint;
+    };
+    let Ok(pid) = pid.parse::<i32>() else {
+        warn!(%pane, %value, "malformed pane_pid in subscription value");
         return Action::Hint;
     };
     let mut table = ctx.table.lock().expect("table lock");
     let Some(row) = table.get_mut(pane) else {
         return Action::Hint;
     };
+    row.pane_pid = pid;
     let mut changed = Vec::new();
     if row.title != title {
         row.title = title.to_string();
@@ -572,7 +586,8 @@ fn parse_pane_row(line: &str) -> Option<PaneRow> {
     let pane_id = left.next()?;
     let window_id = left.next()?;
     let rest = left.next()?;
-    let mut right = rest.rsplitn(7, '\t');
+    let mut right = rest.rsplitn(8, '\t');
+    let pane_pid = right.next()?;
     let active = right.next()?;
     let height = right.next()?;
     let width = right.next()?;
@@ -592,6 +607,7 @@ fn parse_pane_row(line: &str) -> Option<PaneRow> {
         width: width.parse().ok()?,
         height: height.parse().ok()?,
         active: active == "1",
+        pane_pid: pane_pid.parse().ok()?,
     })
 }
 
@@ -629,7 +645,7 @@ mod tests {
 
     #[test]
     fn pane_row_parses_and_survives_tabbed_title() {
-        let line = "%3\t@1\tmain\tsome title\t0\t1\tzsh\t120\t30\t1";
+        let line = "%3\t@1\tmain\tsome title\t0\t1\tzsh\t120\t30\t1\t4242";
         let r = parse_pane_row(line).unwrap();
         assert_eq!(r.pane_id, "%3");
         assert_eq!(r.window_id, "@1");
@@ -640,15 +656,18 @@ mod tests {
         assert_eq!(r.current_command, "zsh");
         assert_eq!((r.width, r.height), (120, 30));
         assert!(r.active);
+        assert_eq!(r.pane_pid, 4242);
 
         // A tab inside the title stays inside the title.
-        let line = "%0\t@0\tw\ttab\there\t1\t0\tcat\t80\t24\t0";
+        let line = "%0\t@0\tw\ttab\there\t1\t0\tcat\t80\t24\t0\t99";
         let r = parse_pane_row(line).unwrap();
         assert_eq!(r.title, "tab\there");
         assert!(r.dead);
+        assert_eq!(r.pane_pid, 99);
 
         assert!(parse_pane_row("garbage").is_none());
-        assert!(parse_pane_row("%0\t@0\tw\tt\t1\t0\tcat\t80\tNaN\t0").is_none());
+        assert!(parse_pane_row("%0\t@0\tw\tt\t1\t0\tcat\t80\tNaN\t0\t99").is_none());
+        assert!(parse_pane_row("%0\t@0\tw\tt\t1\t0\tcat\t80\t24\t0\tNaN").is_none());
     }
 
     #[test]
@@ -659,7 +678,7 @@ mod tests {
 
     #[test]
     fn diff_reports_each_field_once() {
-        let a = parse_pane_row("%1\t@0\tw\tt\t0\t0\tzsh\t80\t24\t1").unwrap();
+        let a = parse_pane_row("%1\t@0\tw\tt\t0\t0\tzsh\t80\t24\t1\t7").unwrap();
         let mut b = a.clone();
         assert!(diff_fields(&a, &b).is_empty());
         b.title = "other".into();
@@ -670,5 +689,11 @@ mod tests {
             d,
             vec![PaneField::Title, PaneField::InMode, PaneField::Size]
         );
+
+        // pane_pid changes update the table silently: no PaneField, no
+        // event (see the field comment on PaneRow).
+        let mut c = a.clone();
+        c.pane_pid = 8;
+        assert!(diff_fields(&a, &c).is_empty());
     }
 }
