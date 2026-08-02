@@ -7,9 +7,9 @@ gives each tmux pane an identity, delivers structured messages between agents
 with verified receipts, and keeps everything on an append-only record you can
 audit months later. If it runs in your terminal, it can run in Cyclops.
 
-Pre-release. Today the daemon watches sessions and reads agent state
-(milestone M0); message delivery is next. [STATUS.md](STATUS.md) has the
-live picture.
+Pre-release. Today the daemon watches sessions, reads agent state, and
+delivers messages with verified receipts (milestones M0 and M1; M2 in
+progress). [STATUS.md](STATUS.md) has the live picture.
 
 ## Try it now
 
@@ -20,11 +20,15 @@ git clone <this repo> && cd clops && cargo build --release
 ```
 
 See the whole stack run against an isolated tmux server (nothing touches
-your own sessions):
+your own sessions): two panes exchange a reviewed message and a reply,
+history reconstructs the thread, and the hook self-test proves the ack
+round trip.
 
 ```bash
-./demos/m0-status.sh
+./demos/m2-conversation.sh
 ```
+
+`demos/` also keeps the smaller m0 (status) and m1 (send) walkthroughs.
 
 Or run it against a real session:
 
@@ -40,15 +44,22 @@ What works today:
 | Command | What it does |
 |---|---|
 | `cyclops status` | Every watched pane with its fused state (idle, working, blocked) |
+| `cyclops send <agent> --subject ...` | Deliver a message with a verified receipt (`--wait done` blocks until the turn it starts ends) |
+| `cyclops wait <agent> --until idle\|done\|blocked` | Block until an agent is ready, finishes a turn, or needs a human |
+| `cyclops history --with <agent>` | The message record, newest last, with each delivery's current badge |
+| `cyclops thread <id>` | One message plus its replies and delivery record |
+| `cyclops hooks install <cli> --agent ...` | Render a vendor hook config plus wiring instructions |
+| `cyclops hooks verify <agent>` | Hook liveness: tier and last-seen edge ages |
+| `cyclops hooks selftest <agent>` | Prove the ack hook fires, via one no-op delivery |
 | `cyclops ping` | Daemon round trip |
-| `cyclops read <pane> --source detection` | Per-sensor readings behind a state verdict |
+| `cyclops read <agent> --source detection` | Per-sensor readings behind a state verdict |
 | `cyclops watch` | Live event stream |
 
 All commands take `--json` (scripts can do anything the UI does) and
 `--plain`, and honor `NO_COLOR`.
 
-The messaging surface (`send`, `history`, `wait`, `ui`, `start`) ships
-milestone by milestone; [STATUS.md](STATUS.md) tracks what is real.
+The rest of the surface (`ui`, `start`) ships milestone by milestone;
+[STATUS.md](STATUS.md) tracks what is real.
 
 ## How it works
 
@@ -70,6 +81,8 @@ ledger you can `jq`.
 | `crates/cyclops-ledger` | Crash-safe append-only ledger writer and reader. |
 
 More: [docs/install.md](docs/install.md), [docs/send.md](docs/send.md),
+[docs/history.md](docs/history.md),
+[docs/wait.md](docs/wait.md), [docs/hooks.md](docs/hooks.md),
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/GOALS.md](docs/GOALS.md).
 
 ## Principles

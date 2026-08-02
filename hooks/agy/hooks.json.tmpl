@@ -1,0 +1,35 @@
+# Cyclops hook config template: Antigravity CLI .agents/hooks.json
+# (named-hooks schema: { "<name>": { "<Event>": [...] } }).
+# Rendered by `cyclops hooks install agy --agent <label>`; '#' lines are
+# stripped, {label} and {cyclops_bin} are substituted.
+#
+# Wiring: place the rendered file at <workspace>/.agents/hooks.json in the
+# directory the agent runs in. Cyclops never writes into .agents for you.
+#
+# EVERY event is registered with a distinct self-tagging command because agy
+# hook payloads carry NO event-name field (finding F7): a shared command
+# cannot tell which event invoked it. PreInvocation is the closest thing to
+# a submit edge (fired 48 ms after Enter, MEASURED) but its payload does not
+# carry the prompt text, so agy stays on the screen-verified delivery tier;
+# these hooks feed liveness and turn-state fusion, not message-id ACKs.
+# Tool events use the matcher form; lifecycle events take entries directly
+# (both shapes MEASURED against agy 1.1.6).
+{
+  "{label}": {
+    "PreInvocation": [
+      { "type": "command", "command": "{cyclops_bin} hook PreInvocation --agent {label}" }
+    ],
+    "PostInvocation": [
+      { "type": "command", "command": "{cyclops_bin} hook PostInvocation --agent {label}" }
+    ],
+    "Stop": [
+      { "type": "command", "command": "{cyclops_bin} hook Stop --agent {label}" }
+    ],
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "{cyclops_bin} hook PreToolUse --agent {label}" } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "{cyclops_bin} hook PostToolUse --agent {label}" } ] }
+    ]
+  }
+}

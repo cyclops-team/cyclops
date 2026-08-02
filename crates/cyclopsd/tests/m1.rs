@@ -141,19 +141,23 @@ async fn tier1_hook_ack_and_late_upgrade() {
                 && e["data"]["to_state"] == "submitted"
         })
         .await;
+    // Hook reports post through the trusted in-process path: the socket
+    // path is pinned to the pane's process ancestry, and this test process
+    // lives outside the pane (see m2_hooks for the denial test).
     let resp = rig
-        .ctl
-        .request(
-            "agent.state.report",
-            json!({
+        .daemon
+        .report_state(
+            serde_json::from_value(json!({
                 "agent": "hooky",
                 "event": "UserPromptSubmit",
                 "seq": 1,
                 "payload": {"prompt": format!("staged text {m1} etc"), "session_id": "s1", "turn_id": "t1"},
-            }),
+            }))
+            .unwrap(),
         )
-        .await;
-    assert_eq!(resp["result"]["applied"], true, "{resp}");
+        .await
+        .expect("report ok");
+    assert_eq!(resp["applied"], true, "{resp}");
     let done = rig
         .ev
         .wait_event(Duration::from_secs(8), |e| {
@@ -166,18 +170,19 @@ async fn tier1_hook_ack_and_late_upgrade() {
 
     // Exact duplicate (same session, turn, event): deduped (amendment d).
     let dup = rig
-        .ctl
-        .request(
-            "agent.state.report",
-            json!({
+        .daemon
+        .report_state(
+            serde_json::from_value(json!({
                 "agent": "hooky",
                 "event": "UserPromptSubmit",
                 "seq": 2,
                 "payload": {"prompt": format!("staged text {m1} etc"), "session_id": "s1", "turn_id": "t1"},
-            }),
+            }))
+            .unwrap(),
         )
-        .await;
-    assert_eq!(dup["result"]["duplicate"], true, "{dup}");
+        .await
+        .expect("report ok");
+    assert_eq!(dup["duplicate"], true, "{dup}");
 
     // Message 2: no hook inside the window -> screen tier resolves it,
     // then a late matching ACK upgrades it (receipts stay honest).
@@ -193,18 +198,19 @@ async fn tier1_hook_ack_and_late_upgrade() {
         })
         .await;
     let resp = rig
-        .ctl
-        .request(
-            "agent.state.report",
-            json!({
+        .daemon
+        .report_state(
+            serde_json::from_value(json!({
                 "agent": "hooky",
                 "event": "user_prompt_submit",
                 "seq": 3,
                 "payload": {"prompt": format!("late but matching {m2}"), "session_id": "s1", "turn_id": "t2"},
-            }),
+            }))
+            .unwrap(),
         )
-        .await;
-    assert_eq!(resp["result"]["matched"], true, "{resp}");
+        .await
+        .expect("report ok");
+    assert_eq!(resp["matched"], true, "{resp}");
     let upgraded = rig
         .ev
         .wait_event(Duration::from_secs(5), |e| {

@@ -10,7 +10,7 @@
 //! checkpoints, and the decline-key spacing. Nothing runs on an interval.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ use cyclops_proto::{
     AgentState, Delivery, DeliveryReceipt, DeliveryState, Event, Kind, LedgerLine, MsgSendParams,
     MsgSendResult, NotifyLevel, VerifiedBy, WaitUntil, WireError,
 };
-use cyclops_tmux::{quote_arg, ControlClient, PaneEvent, SessionWatcher, TmuxError};
+use cyclops_tmux::{quote_arg, ControlClient, PaneEvent, PaneRow, SessionWatcher, TmuxError};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, watch, Notify};
 use tokio::task::JoinHandle;
@@ -153,6 +153,12 @@ pub(crate) struct DeliveryHandle {
     /// ACK waiter; anchors send-and-wait `done` so a working phase that
     /// predates the delivery never counts.
     working_seen: AtomicBool,
+    /// pane_pid of the occupant this delivery was submitted to, recorded
+    /// right before the submit key. Send-and-wait pins its wait on THIS
+    /// occupant, not whoever lives in the pane when the wait starts; an
+    /// impostor that swaps in between must read occupant_changed, never a
+    /// report about itself. 0 until a submit happened.
+    submitted_pid: AtomicI32,
 }
 
 struct HandleState {
@@ -202,6 +208,7 @@ impl DeliveryHandle {
             ack: Notify::new(),
             early_ack: AtomicBool::new(false),
             working_seen: AtomicBool::new(false),
+            submitted_pid: AtomicI32::new(0),
         })
     }
 
@@ -643,14 +650,27 @@ pub(crate) async fn msg_send(
     if inner.sessions.is_empty() {
         return Err(wire_err("no_such_target", "no sessions are watched"));
     }
-    let names = expand_recipients(inner, &params.to)?;
+    let typed = expand_recipients(inner, &params.to)?;
 
-    // Resolve each recipient before writing the msg line so the ledger's
-    // delivery records carry the addressed names.
-    let resolved: Vec<(String, Option<(usize, String)>)> = names
-        .iter()
-        .map(|n| (n.clone(), inner.resolve_recipient(n)))
-        .collect();
+    // Resolve each recipient before writing the msg line, and canonicalize
+    // the resolved ones to their ledger name: the pane's label, or the
+    // pane id when unlabeled. "%1" and its label are the same recipient;
+    // the record carries one name, so history filters match however the
+    // sender addressed it. Unresolvable names stay as typed (the
+    // attention_required record should show what was asked for).
+    let mut resolved: Vec<(String, Option<(usize, String)>)> = Vec::new();
+    let mut canonical_seen: HashSet<String> = HashSet::new();
+    for n in &typed {
+        let target = inner.resolve_recipient(n);
+        let name = match &target {
+            Some((_, pane_id)) => inner.label_of(pane_id).unwrap_or_else(|| pane_id.clone()),
+            None => n.clone(),
+        };
+        if canonical_seen.insert(name.clone()) {
+            resolved.push((name, target));
+        }
+    }
+    let names: Vec<String> = resolved.iter().map(|(n, _)| n.clone()).collect();
 
     let msg_id = inner.engine.mint_msg_id();
     let payload = render_payload(&msg_id, from, &params.subject, &params.body, params.fyi);
@@ -827,8 +847,12 @@ pub(crate) async fn msg_send(
     // (DELIVERY.md), so `done` can never be satisfied by a turn that
     // predates the delivery. A delivery that ends anywhere but delivered
     // has no turn to watch; its entry reports the delivery state instead
-    // of a fabricated wait result.
+    // of a fabricated wait result. Every entry carries the same
+    // {outcome, state, waited_ms} shape agent.wait resolves with.
     if let Some(spec) = &params.wait {
+        // Test seam between delivery resolution and the wait, so a test can
+        // swap the pane occupant deterministically. No-op in production.
+        inject_pause(inner, "pre_wait").await;
         let timeout = spec.timeout_ms.unwrap_or(WAIT_DEFAULT_MS).min(WAIT_MAX_MS);
         let wait_deadline = Instant::now() + Duration::from_millis(timeout);
         let mut waits = Vec::new();
@@ -840,12 +864,14 @@ pub(crate) async fn msg_send(
                 // delivery field carries the resolution.
                 waits.push(json!({
                     "to": handle.to,
+                    "outcome": WaitOutcome::NotDelivered,
                     "state": Value::Null,
-                    "timed_out": false,
+                    "waited_ms": 0,
                     "delivery": handle.state(),
                 }));
                 continue;
             }
+            let started = Instant::now();
             let mut rx = handle.state_tx.subscribe();
             let resolved =
                 tokio::time::timeout_at(wait_deadline, rx.wait_for(|s| receipt_resolved(*s)))
@@ -857,10 +883,18 @@ pub(crate) async fn msg_send(
                 DeliveryState::DeliveredVerified | DeliveryState::DeliveredUnverified
             );
             if !delivered {
+                // Resolved but not delivered: no turn to watch. Unresolved
+                // by the deadline: the wait timed out waiting for the
+                // delivery itself.
                 waits.push(json!({
                     "to": handle.to,
+                    "outcome": if resolved {
+                        WaitOutcome::NotDelivered
+                    } else {
+                        WaitOutcome::Timeout
+                    },
                     "state": inner.cached_state(&handle.pane_id),
-                    "timed_out": !resolved,
+                    "waited_ms": started.elapsed().as_millis() as u64,
                     "delivery": delivery_state,
                 }));
                 continue;
@@ -870,12 +904,26 @@ pub(crate) async fn msg_send(
             // held the pane idle until our submit, so a working state read
             // now is the turn this delivery started.
             let working_pre = handle.working_seen.load(Ordering::SeqCst);
-            let (state, timed_out) =
-                wait_until_with(inner, &handle.pane_id, spec.until, remaining, working_pre).await;
+            // Pin the wait on the occupant the delivery was SUBMITTED to,
+            // not whoever lives in the pane now: an occupant swap between
+            // submit and wait start must read occupant_changed instead of
+            // answering for the impostor.
+            let submitted = handle.submitted_pid.load(Ordering::SeqCst);
+            let end = wait_pinned(
+                inner,
+                handle.session_idx,
+                &handle.pane_id,
+                spec.until,
+                remaining,
+                working_pre,
+                (submitted != 0).then_some(submitted),
+            )
+            .await;
             waits.push(json!({
                 "to": handle.to,
-                "state": state,
-                "timed_out": timed_out,
+                "outcome": end.outcome,
+                "state": end.state,
+                "waited_ms": end.waited_ms,
                 "delivery": delivery_state,
             }));
         }
@@ -888,6 +936,7 @@ fn wire_err(code: &str, msg: impl Into<String>) -> WireError {
     WireError {
         code: code.to_string(),
         message: msg.into(),
+        data: None,
     }
 }
 
@@ -1162,6 +1211,9 @@ async fn attempt_delivery(
         );
         return AttemptOutcome::Failed("pane_rebound".to_string());
     }
+    // The occupant re-check just passed: admitted_pid IS the process the
+    // submit key goes to. Send-and-wait pins its wait on this pid.
+    handle.submitted_pid.store(admitted_pid, Ordering::SeqCst);
     if let Err(cause) = injector.submit(&handle.pane_id, submit_key).await {
         unregister_ack(inner, handle);
         // Move to retry_queued here; fail_attempt sees the state and only
@@ -2036,6 +2088,20 @@ async fn await_ack(
             {
                 let now = Instant::now();
                 if target.is_some_and(|(_, hook_end)| hook_end) {
+                    // Tier-1 window over: the delivery downgrades to screen
+                    // evidence. On a pane that has NEVER produced a hook
+                    // edge this is the F1 signature (configuration does not
+                    // equal subscription); the admin hears about it once.
+                    if tier1 {
+                        crate::selftest::notify_f1_once(
+                            inner,
+                            &handle.msg_id,
+                            &handle.to,
+                            &handle.pane_id,
+                            handle.session_idx,
+                            &manifest.agent.id,
+                        );
+                    }
                     clock.end_hook_phase(now);
                     continue;
                 }
@@ -2316,76 +2382,206 @@ pub(crate) fn resolve_hook_ack(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>)
 // agent.wait
 // ---------------------------------------------------------------------------
 
-/// Wait for a pane's fused state to satisfy `until`. Event-driven off the
-/// state stream; returns (state, timed_out).
-pub(crate) async fn wait_until(
-    inner: &Arc<Inner>,
-    pane_id: &str,
-    until: WaitUntil,
-    timeout: Duration,
-) -> (AgentState, bool) {
-    wait_until_with(inner, pane_id, until, timeout, false).await
+/// How a wait ended. Serialized into send-and-wait entries and agent.wait
+/// error data; NotDelivered only occurs in send-and-wait composition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WaitOutcome {
+    /// The target reached `until`.
+    Reached,
+    /// The timeout expired first.
+    Timeout,
+    /// The pinned pane died or its occupant changed mid-wait; resolving
+    /// anything else would be a false answer about a different process.
+    OccupantChanged,
+    /// Send-and-wait only: the delivery resolved somewhere other than
+    /// delivered, so there is no turn to watch.
+    NotDelivered,
 }
 
-/// [`wait_until`] with prior turn evidence. `working_pre` is true when a
-/// working phase attributable to the caller's delivery was already
-/// observed (the ACK waiter records it on the handle), so a fast turn that
-/// ended before the wait began still satisfies `done`.
-async fn wait_until_with(
+/// A finished wait: how it ended, the fused state it ended on, and how
+/// long it actually waited.
+pub(crate) struct WaitEnd {
+    pub(crate) outcome: WaitOutcome,
+    pub(crate) state: AgentState,
+    pub(crate) waited_ms: u64,
+}
+
+/// The pane row behind a wait target: the live table while attached, the
+/// frozen last-known table during a detach (frozen rows cannot false-alarm
+/// the pin; the reattach re-check settles it).
+fn occupant_of(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) -> Option<PaneRow> {
+    if let Some(w) = inner.watcher_of(session_idx) {
+        return w.pane(pane_id);
+    }
+    inner
+        .sessions
+        .get(session_idx)?
+        .last_panes
+        .lock()
+        .expect("last panes lock")
+        .get(pane_id)
+        .cloned()
+}
+
+/// True when the pinned occupant is gone: pane missing, dead, or running
+/// under a different root pid than the one pinned at wait start.
+fn occupant_gone(inner: &Arc<Inner>, session_idx: usize, pane_id: &str, pinned_pid: i32) -> bool {
+    match occupant_of(inner, session_idx, pane_id) {
+        Some(row) => row.dead || row.pane_pid != pinned_pid,
+        None => true,
+    }
+}
+
+/// Wait for a pane's fused state to satisfy `until`, pinned to the pane
+/// occupant present at wait start. Event-driven off the fusion broadcast
+/// and the session watcher stream; the deadline is the only timer.
+///
+/// Semantics (protocol spec): idle is fused Idle; blocked is any blocked_*
+/// state; done is the working -> idle edge, so the CURRENT turn (already
+/// working, or `working_pre` from a delivery handle) or the NEXT turn
+/// counts, and a blocked state mid-turn keeps waiting rather than passing
+/// as done.
+///
+/// Pinning: (pane_id, pane_pid) recorded at start, or supplied by the
+/// caller as `pinned` when the wait answers for an earlier moment (the
+/// send-and-wait path pins the occupant its delivery was SUBMITTED to).
+/// The pane vanishing, dying, or changing root pid resolves
+/// OccupantChanged, never a false success. pane_pid changes are silent in
+/// the watcher (no PaneField), so the pin is re-read on every wake for
+/// this pane, including output activity: a swapped occupant that neither
+/// prints nor changes any pane field stays undetected until it does, the
+/// same residual window the delivery pipeline accepts.
+pub(crate) async fn wait_pinned(
     inner: &Arc<Inner>,
+    session_idx: usize,
     pane_id: &str,
     until: WaitUntil,
     timeout: Duration,
     working_pre: bool,
-) -> (AgentState, bool) {
-    let mut rx = inner.events.subscribe();
-    let deadline = Instant::now() + timeout;
+    pinned: Option<i32>,
+) -> WaitEnd {
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let end = |outcome: WaitOutcome, state: AgentState| WaitEnd {
+        outcome,
+        state,
+        waited_ms: started.elapsed().as_millis() as u64,
+    };
+    let session_name = inner
+        .sessions
+        .get(session_idx)
+        .map(|s| s.name.clone())
+        .unwrap_or_default();
+    // Subscribe before the first read so no edge can fall between.
+    let mut ev_rx = inner.events.subscribe();
+    let mut pane_rx = inner.watcher_of(session_idx).map(|w| w.subscribe());
     let mut state = inner.cached_state(pane_id);
-    // Done means "the turn started by our delivery ended": a working phase
-    // must be observed (or already running) before a non-working state
-    // satisfies the wait.
+    // Pin the occupant. A pane already dead or gone can never honestly
+    // reach `until`, and a caller-pinned occupant that is already replaced
+    // is already an occupant change.
+    let pinned_pid = match occupant_of(inner, session_idx, pane_id) {
+        Some(row) if !row.dead && pinned.is_none_or(|p| p == row.pane_pid) => {
+            pinned.unwrap_or(row.pane_pid)
+        }
+        _ => return end(WaitOutcome::OccupantChanged, state),
+    };
     let mut working_seen = working_pre || state == AgentState::Working;
     loop {
+        if state == AgentState::Dead {
+            return end(WaitOutcome::OccupantChanged, state);
+        }
         let satisfied = match until {
             WaitUntil::Idle => state == AgentState::Idle,
             WaitUntil::Blocked => state.is_blocked(),
-            WaitUntil::Done => working_seen && state != AgentState::Working,
+            WaitUntil::Done => {
+                working_seen && matches!(state, AgentState::Idle | AgentState::IdleWithInput)
+            }
         };
         if satisfied {
-            return (state, false);
+            return end(WaitOutcome::Reached, state);
         }
-        let ev = tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => return (state, true),
-            ev = rx.recv() => ev,
-        };
-        match ev {
-            Ok(e) if e.event == "state" && e.data["pane_id"] == pane_id => {
-                if let Ok(s) = serde_json::from_value::<AgentState>(e.data["state"].clone()) {
-                    state = s;
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => return end(WaitOutcome::Timeout, state),
+            ev = ev_rx.recv() => match ev {
+                Ok(e) if e.event == "state" && e.data["pane_id"] == pane_id => {
+                    if let Ok(s) = serde_json::from_value::<AgentState>(e.data["state"].clone()) {
+                        state = s;
+                        if state == AgentState::Working {
+                            working_seen = true;
+                        }
+                    }
+                }
+                Ok(e) if e.event == "session" && e.data["name"] == session_name => {
+                    match e.data["attached"].as_bool() {
+                        Some(true) => {
+                            // Reattach: fresh stream, then re-verify the pin
+                            // against the live table (the pane may have died
+                            // or been replaced during the outage).
+                            pane_rx = inner.watcher_of(session_idx).map(|w| w.subscribe());
+                            if occupant_gone(inner, session_idx, pane_id, pinned_pid) {
+                                return end(WaitOutcome::OccupantChanged, state);
+                            }
+                        }
+                        // Detached: fused state stops moving; keep waiting on
+                        // the deadline and the reattach edge.
+                        _ => pane_rx = None,
+                    }
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // Reconcile on doubt: re-read the cache and the pin.
+                    state = inner.cached_state(pane_id);
                     if state == AgentState::Working {
                         working_seen = true;
                     }
+                    if occupant_gone(inner, session_idx, pane_id, pinned_pid) {
+                        return end(WaitOutcome::OccupantChanged, state);
+                    }
                 }
-            }
-            Ok(_) => {}
-            Err(broadcast::error::RecvError::Lagged(_)) => {
-                // Reconcile on doubt: re-read the cache.
-                state = inner.cached_state(pane_id);
-                if state == AgentState::Working {
-                    working_seen = true;
+                Err(broadcast::error::RecvError::Closed) => {
+                    return end(WaitOutcome::Timeout, state)
                 }
-            }
-            Err(broadcast::error::RecvError::Closed) => return (state, true),
+            },
+            pe = recv_pane(&mut pane_rx) => match pe {
+                Ok(PaneEvent::PaneRemoved(id)) if id == pane_id => {
+                    return end(WaitOutcome::OccupantChanged, state);
+                }
+                Ok(PaneEvent::PaneChanged { id, row, .. }) if id == pane_id => {
+                    if row.dead || row.pane_pid != pinned_pid {
+                        return end(WaitOutcome::OccupantChanged, state);
+                    }
+                }
+                Ok(PaneEvent::OutputActivity { pane_id: p, .. }) if p == pane_id => {
+                    // Output is the one signal a silent pid swap gives off
+                    // (respawn-pane updates the row without a PaneChanged).
+                    if occupant_gone(inner, session_idx, pane_id, pinned_pid) {
+                        return end(WaitOutcome::OccupantChanged, state);
+                    }
+                }
+                Ok(PaneEvent::Disconnected) | Err(broadcast::error::RecvError::Closed) => {
+                    pane_rx = None;
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    if occupant_gone(inner, session_idx, pane_id, pinned_pid) {
+                        return end(WaitOutcome::OccupantChanged, state);
+                    }
+                }
+                Ok(_) => {}
+            },
         }
     }
 }
 
-/// agent.wait entry for the socket server.
+/// agent.wait entry for the socket server. Reached answers with the state
+/// and waited_ms; timeout and occupant_changed answer as wire errors whose
+/// data carries the same fields, so a caller always learns the state the
+/// target was in.
 pub(crate) async fn agent_wait(
     inner: &Arc<Inner>,
     params: cyclops_proto::AgentWaitParams,
 ) -> Result<Value, WireError> {
-    let Some((_, pane_id)) = inner.resolve_recipient(&params.target) else {
+    let Some((session_idx, pane_id)) = inner.resolve_recipient(&params.target) else {
         return Err(wire_err(
             "no_such_target",
             format!("no such target {:?}", params.target),
@@ -2395,21 +2591,55 @@ pub(crate) async fn agent_wait(
         .timeout_ms
         .unwrap_or(WAIT_DEFAULT_MS)
         .min(WAIT_MAX_MS);
-    let started = Instant::now();
-    let (state, timed_out) = wait_until(
+    let until_word = until_word(params.until);
+    let end = wait_pinned(
         inner,
+        session_idx,
         &pane_id,
         params.until,
         Duration::from_millis(timeout),
+        false,
+        None,
     )
     .await;
-    Ok(json!({
+    // `outcome` mirrors the send-and-wait entry shape: "reached" on
+    // success, and the same word the error code carries otherwise.
+    let data = json!({
         "target": params.target,
         "pane_id": pane_id,
-        "state": state,
-        "timed_out": timed_out,
-        "waited_ms": started.elapsed().as_millis() as u64,
-    }))
+        "until": params.until,
+        "outcome": end.outcome,
+        "state": end.state,
+        "waited_ms": end.waited_ms,
+    });
+    match end.outcome {
+        WaitOutcome::Reached => Ok(data),
+        WaitOutcome::Timeout => Err(WireError {
+            code: "timeout".to_string(),
+            message: format!(
+                "{} did not reach {until_word} within {timeout}ms; state was {}",
+                params.target, end.state
+            ),
+            data: Some(data),
+        }),
+        WaitOutcome::OccupantChanged | WaitOutcome::NotDelivered => Err(WireError {
+            code: "occupant_changed".to_string(),
+            message: format!(
+                "the pane behind {} died or changed occupant while waiting",
+                params.target
+            ),
+            data: Some(data),
+        }),
+    }
+}
+
+/// The wire word for an until mode, for human-facing error copy.
+fn until_word(until: WaitUntil) -> &'static str {
+    match until {
+        WaitUntil::Idle => "idle",
+        WaitUntil::Done => "done",
+        WaitUntil::Blocked => "blocked",
+    }
 }
 
 #[cfg(test)]

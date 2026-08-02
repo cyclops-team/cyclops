@@ -3,7 +3,7 @@
 Cyclops v2 is a tmux-backed coordination daemon for terminal coding agents.
 The architecture is frozen by ADR-001 (`cyclops-arch/deliverables/`) plus the
 validation campaign's amendments (`cyclops-arch/validation-report.md`,
-section 8). This document maps those decisions to code. Parts marked M2 or
+section 8). This document maps those decisions to code. Parts marked M3 or
 later do not exist yet; everything else is in the tree today.
 
 ## Crate map
@@ -13,17 +13,20 @@ later do not exist yet; everything else is in the tree today.
 | `crates/cyclops-proto` | Wire protocol v1, ledger schema, delivery state machine, agent state model. Data types only, no IO. Daemon and every client compile against it. | Done |
 | `crates/cyclops-manifest` | Per-CLI detection manifests: TOML schema, compiled rules, region parsing, priority evaluation, modal decline actions. Loads `manifests/*.toml`. | Done |
 | `crates/cyclops-tmux` | The tmux adapter. Every tmux-specific behavior lives here: version probe with feature gates, control-mode client (FIFO reply correlation, pause-after flow control), zero-polling reconciling pane table on `refresh-client -B` subscriptions. Pane rows carry `pane_pid` for sender identity. | Done (M1 scope) |
-| `crates/cyclopsd` | The daemon: control-mode watcher, sensor fusion (title + screen + hook reports), socket server, per-session ledger writer, delivery pipeline with per-recipient FIFO workers, fail-closed sender identity, pane adoption registry. | Done (M1 scope) |
-| `crates/cyclops` | The CLI: thin NDJSON client over the daemon socket. `ping`, `status`, `read`, `watch`, `send`, and the `hook` receiver exist; `history` and a wait verb land in M2. | Done (M1 scope) |
+| `crates/cyclopsd` | The daemon: control-mode watcher, sensor fusion (title + screen + hook reports), socket server, per-session ledger writer, delivery pipeline with per-recipient FIFO workers, fail-closed sender identity, pane adoption registry. M2 adds the ledger read side (`msg.history`, `msg.thread`), server-owned `agent.wait` with occupant pinning, and hook liveness plus the startup self-test (`hooks.verify`, `hooks.selftest`). | Done (M2 scope) |
+| `crates/cyclops` | The CLI: thin NDJSON client over the daemon socket. `ping`, `status`, `read`, `watch`, `send`, the `hook` receiver, and the M2 verbs: `history`, `thread`, `wait`, `send --wait`, and `hooks install\|verify\|selftest`. | Done (M2 scope) |
 | `crates/cyclops-ledger` | Crash-safe append-only NDJSON ledger writer and cursor reader. Workspace member; `cyclopsd` writes one ledger per watched session through it. | Done |
 
 Non-crate directories: `manifests/` (shipped detection data for claude,
-codex, agy, seeded from the campaign), `tests/harness/` (Python probe
-harness, the regression seed), `demos/` (runnable end-to-end scripts),
-`themes/` (semantic color tokens, consumed from M3), `frontend/` (the
-production landing page for usecyclops.dev; read-only branding reference,
-outside the Cargo workspace, ignored by Rust CI, never modified without an
-explicit admin request).
+codex, agy, seeded from the campaign), `hooks/` (vendor hook config
+templates `cyclops hooks install` renders; measured schemas, data not
+code), `scripts/commpact-shim/` (the prepared commPact v1 shim and its
+guarded installer; nothing installs it, see `docs/CUTOVER.md`),
+`tests/harness/` (Python probe harness, the regression seed), `demos/`
+(runnable end-to-end scripts), `themes/` (semantic color tokens, consumed
+from M3), `frontend/` (the production landing page for usecyclops.dev;
+read-only branding reference, outside the Cargo workspace, ignored by Rust
+CI, never modified without an explicit admin request).
 
 ## Data flow
 
@@ -66,6 +69,16 @@ they never drop and never loop. Receipts on the idle path block up to
 `receipt_block_ms` (default 2500); busy targets answer queued with a
 position immediately, parked targets answer parked with the reset hint.
 
+The M2 read side rides the ledger, not new state: `msg.history` and
+`msg.thread` scan the session files at query time and fold each message's
+delivery chain into its `deliveries` array (one broadcast fact, N current
+badges); reading never writes. `agent.wait` subscribes server-side to the
+fusion broadcast and the watcher stream, pinned to the pane occupant
+recorded at wait start; the deadline is its only timer. Hook liveness
+(per-pane last-seen edges from `agent.state.report`) backs `hooks.verify`,
+the `hooks_verified` status bit, and `hooks.selftest`'s one-marker round
+trip through the normal delivery pipeline.
+
 ## Where each frozen decision lives
 
 | ADR-001 decision | Lives at | Status |
@@ -78,11 +91,11 @@ position immediately, parked targets answer parked with the reset hint.
 | Append-only NDJSON ledger, monotonic seq plus boot_id, replayable by cursor (C6) | Schema: `cyclops-proto/src/ledger.rs`. Writer: `crates/cyclops-ledger`; `cyclopsd` writes `$CYCLOPS_HOME/ledger/<session>.ndjson` per watched session | Done (cursor replay over the socket lands with the M3 stream client) |
 | Delivery pipeline: queue, gate, paste, verify, submit, ACK; failures are queued states | State machine: `cyclops-proto/src/ledger.rs` (`DeliveryState::can_transition_to`). Pipeline: `cyclopsd/src/delivery.rs` | Done |
 | Turn detection from hooks via a `cyclops hook` receiver | `wire.rs` (`agent.state.report` params); receiver in `crates/cyclops/src/hook.rs`, matcher and fusion input in `cyclopsd/src/ack.rs` | Done |
-| Agent surface: thin CLI speaking NDJSON to the socket | `crates/cyclops` | ping/status/read/watch/send/hook done; history and a wait verb M2 |
-| MCP front-door on the same daemon (option D absorbed) | Planned addition, not a dependency | M2+ |
+| Agent surface: thin CLI speaking NDJSON to the socket | `crates/cyclops` | Done (M2: history, thread, wait, hooks verbs landed) |
+| MCP front-door on the same daemon (option D absorbed) | Planned addition, not a dependency | M3+ |
 | v1 keepers: fail-closed ACL, data-only config, explicit pane adoption, identity from socket peer | `cyclopsd/src/identity.rs` (peer creds + pid ancestry walk to a watched pane), `pane.label` adoption registry | Done |
 | tmux specifics confined to one adapter, version-gated, CI against tmux HEAD | `crates/cyclops-tmux`; advisory tmux-HEAD CI job | Done (probe), ongoing |
-| Rollout: shadow mode first, cutover gated on soak | M0 was the shadow daemon; M1 adds the write path (delivery), cutover is admin's call | In progress |
+| Rollout: shadow mode first, cutover gated on soak | M0 was the shadow daemon; M1 added the write path (delivery); M2 prepared the v1 shim and runbook (`scripts/commpact-shim/`, `docs/CUTOVER.md`), install is admin's call | In progress |
 
 ## Validation amendments (a)-(i)
 
@@ -98,10 +111,10 @@ pipeline honors it from M1.
 |---|---|---|---|
 | a | `pause-after` set on the control connection at attach (2) | `cyclops-tmux/src/control.rs` attach handshake; findings F15 covers the %extended-output consequence | Done |
 | b | `bracket_paste_flag` unavailable through tmux 3.6a; post-paste composer verification is the gate (3) | `cyclops-tmux/src/version.rs` `has_bracket_paste_flag`; verification with `<message_id>` substitution in `cyclopsd/src/delivery.rs` | Done |
-| c | Daemon startup self-test proving hooks actually fire, F1: Codex loads zero hooks in untrusted dirs, silently (4) | `cyclopsd` hook liveness tracking, result logged as a `system` ledger line | M2 |
+| c | Daemon startup self-test proving hooks actually fire, F1: Codex loads zero hooks in untrusted dirs, silently (4) | `cyclopsd/src/selftest.rs`: per-pane hook edge liveness, `hooks.verify` / `hooks.selftest` verbs, the `hooks_verified` status bit, one F1 admin ping per zero-edge pane; the self-test result is a `system` ledger line | Done |
 | d | Dedupe hook events on (session_id, turn_id, event), F2: Codex double-fires across config layers (5) | `cyclopsd/src/ack.rs` (plus reporter seq) | Done |
 | e | Unique tmux buffer name per delivery, F4: named buffers are global, concurrent senders race (6) | `cyclopsd/src/delivery.rs`: `cyc-<pid>-<seq>` buffers loaded from a 0700 spool file, `paste-buffer -p -d` | Done |
-| f | Terminal `blocked_quota` state: park and alert, never auto-retry, F11: quota exhaustion passes every liveness check (9) | `state.rs` `AgentState::BlockedQuota`, `ledger.rs` `ParkedBlockedQuota` (only exit: operator requeue, M2), parking + urgent notify with reset hint in `cyclopsd/src/delivery.rs` | Done |
+| f | Terminal `blocked_quota` state: park and alert, never auto-retry, F11: quota exhaustion passes every liveness check (9) | `state.rs` `AgentState::BlockedQuota`, `ledger.rs` `ParkedBlockedQuota` (terminal in the record; a dedicated operator re-queue verb has not shipped, the operator resends after the reset), parking + urgent notify with reset hint in `cyclopsd/src/delivery.rs` | Done |
 | g | Modal vocabulary is per-CLI manifest data with explicit decline options, never generic Enter/Escape, F3, F12 (8) | `cyclops-manifest` `decline_keys` + `auto_dismiss`; `manifests/*.toml` (codex update dialog declines "3" Enter, agy survey "0", trust prompts never auto-dismiss) | Done |
 | h | Fusion documented as rare-blocked-state coverage, not steady-state accuracy (7) | `cyclops-proto/src/state.rs` module doc; fusion engine ordering in `cyclopsd` | Done |
 | i | Delivery behind a trait so per-agent backends can swap to headless protocol drive without touching layers above | `cyclopsd/src/delivery.rs`: the `Injector` trait (paste / submit / capture) with `TmuxInjector` (load-buffer + paste-buffer + send-keys) as the M1 backend; gate, verify, and ACK layers call through the seam only | Done |
@@ -125,4 +138,5 @@ Idle CPU near zero is a hard goal (GOALS.md). Concretely:
 
 Two sanctioned exceptions, neither in the product: the Python probe harness
 (`tests/harness/`) polls because it is a measuring instrument, and demo
-scripts may wait in a bounded loop for process startup.
+scripts may wait in a bounded loop for process startup or for the record
+to settle between narration steps.

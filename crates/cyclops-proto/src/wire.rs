@@ -57,6 +57,7 @@ impl Response {
             error: Some(WireError {
                 code: code.into(),
                 message: message.into(),
+                data: None,
             }),
         }
     }
@@ -65,9 +66,13 @@ impl Response {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireError {
     /// Stable machine-readable code, e.g. "unknown_method", "denied",
-    /// "no_such_target", "parked_blocked_quota".
+    /// "no_such_target", "timeout", "occupant_changed".
     pub code: String,
     pub message: String,
+    /// Structured extras for codes that carry evidence, e.g. agent.wait's
+    /// timeout reports the state the target was in. Absent on most errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 /// Unsolicited push on subscribed connections.
@@ -84,7 +89,8 @@ pub struct Event {
 // ---------------------------------------------------------------------------
 // Method params and results. Methods use dot notation: "ping", "status",
 // "msg.send", "msg.history", "msg.thread", "agent.wait", "agent.state.report",
-// "pane.read", "events.subscribe", "admin.notify".
+// "pane.read", "events.subscribe", "admin.notify", "hooks.verify",
+// "hooks.selftest".
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +136,15 @@ pub struct PaneStatus {
     pub width: u32,
     pub height: u32,
     pub state: AgentState,
+    /// Hook liveness for adopted panes whose manifest declares hooks:
+    /// Some(true) once any hook edge has been seen from the pane's CURRENT
+    /// occupant this daemon run, Some(false) while none has (amendment c:
+    /// configuration does not equal subscription, finding F1; an occupant
+    /// restart invalidates its predecessor's edges). None when the pane is
+    /// unadopted or its manifest declares no hooks. Additive optional
+    /// field: old daemons omit it, old clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks_verified: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,9 +267,38 @@ fn default_history_limit() -> u32 {
     50
 }
 
+/// msg.history result: matching msg/fyi lines, oldest first (newest last).
+/// Each line's `deliveries` are folded to the latest recorded state per
+/// recipient, so a broadcast reads as one msg fact with N current badges.
+/// The ledger files themselves are never rewritten; folding is a read model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryResult {
+    pub lines: Vec<crate::ledger::LedgerLine>,
+    /// Seq of the newest returned line; pass as `cursor` to resume after it.
+    /// Only present with a single watched session, where per-file seqs are
+    /// unambiguous. Absent when nothing matched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<u64>,
+    /// Opaque composite cursor covering every watched session; pass back as
+    /// the request's `cursor2` param to resume after the returned lines.
+    /// The daemon issues it whenever more than one session is watched (the
+    /// plain `cursor` seq would be ambiguous there) and on any `cursor2`
+    /// paged request. Additive optional field: old clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor2: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadParams {
     pub id: String,
+}
+
+/// msg.thread result: the message's folded msg line, every state/gate line
+/// sharing its id, and every msg whose reply_to chains to it (also folded),
+/// ordered oldest first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadResult {
+    pub lines: Vec<crate::ledger::LedgerLine>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,6 +323,64 @@ pub struct StateReportParams {
     /// Raw vendor payload, passed through for matching and audit.
     #[serde(default)]
     pub payload: Value,
+}
+
+// --- Hook liveness (M2: hooks install + startup self-test, amendment c) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HooksVerifyParams {
+    /// Cyclops label or tmux pane id.
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HooksVerifyResult {
+    pub target: String,
+    pub pane_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<String>,
+    /// ACK capability tier: 1 = payload-matchable hook ACK, 2 = screen
+    /// evidence only.
+    pub tier: u8,
+    /// Same semantics as PaneStatus::hooks_verified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hooks_verified: Option<bool>,
+    pub events: Vec<HookEdgeAge>,
+}
+
+/// One hook event's last observed edge. `last_seen_ms_ago` is None when
+/// the event has never been seen this daemon run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookEdgeAge {
+    pub event: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_ms_ago: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HooksSelftestParams {
+    pub target: String,
+    /// Cap on how long the daemon waits for the self-test delivery to
+    /// resolve. Defaults server-side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HooksSelftestResult {
+    pub target: String,
+    pub msg_id: String,
+    /// Bound manifest id ("claude", "codex", "agy"): the CLI kind that
+    /// `cyclops hooks install` takes, so failure copy can name a runnable
+    /// command. Absent when no manifest binds the pane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<String>,
+    pub tier: u8,
+    /// Delivery state at resolution (or the in-flight state at timeout).
+    pub state: crate::ledger::DeliveryState,
+    /// True when the recipient's ACK hook fired carrying the marker.
+    pub hook_ack: bool,
+    pub waited_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

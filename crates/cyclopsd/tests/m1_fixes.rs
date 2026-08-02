@@ -65,7 +65,7 @@ async fn send_and_wait_starts_after_delivery_resolution() {
     assert_eq!(wait["to"], "waity", "{result}");
     assert_eq!(wait["delivery"], "delivered_unverified", "{result}");
     assert_eq!(
-        wait["timed_out"], true,
+        wait["outcome"], "timeout",
         "done was satisfied by a working phase that predates the delivery: {result}"
     );
 
@@ -221,21 +221,25 @@ async fn hook_ack_during_detach_resolves_the_delivery() {
 
     // The recipient's hook fires DURING the outage. The report needs no
     // tmux connection; rejecting it was the soak's duplicate-delivery bug.
+    // Posted through the trusted in-process path: the socket path is
+    // pinned to the pane's process ancestry and this test process lives
+    // outside the pane.
     let resp = rig
-        .ctl
-        .request(
-            "agent.state.report",
-            json!({
+        .daemon
+        .report_state(
+            serde_json::from_value(json!({
                 "agent": "hooky",
                 "event": "UserPromptSubmit",
                 "seq": 1,
                 "payload": {"prompt": format!("staged {msg_id} text"), "session_id": "s", "turn_id": "t"},
-            }),
+            }))
+            .unwrap(),
         )
-        .await;
-    assert_eq!(resp["result"]["applied"], true, "{resp}");
-    assert_eq!(resp["result"]["matched"], true, "{resp}");
-    assert_eq!(resp["result"]["live"], false, "{resp}");
+        .await
+        .expect("report ok");
+    assert_eq!(resp["applied"], true, "{resp}");
+    assert_eq!(resp["matched"], true, "{resp}");
+    assert_eq!(resp["live"], false, "{resp}");
 
     let done = rig
         .ev

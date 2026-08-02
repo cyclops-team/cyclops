@@ -32,6 +32,9 @@ pub enum ClientError {
         /// Known targets, read tolerantly from the error object when the
         /// daemon includes them. Feeds the unknown-target copy.
         targets: Vec<String>,
+        /// Structured extras some codes carry (agent.wait's timeout and
+        /// occupant_changed report the state). Null when absent.
+        data: Value,
     },
     /// The connection died or carried something that is not NDJSON.
     /// The payload is a short human cause, not a next step.
@@ -148,6 +151,7 @@ impl Client {
                                 .collect()
                         })
                         .unwrap_or_default(),
+                    data: err.get("data").cloned().unwrap_or(Value::Null),
                 });
             }
             return Ok(v.get("result").cloned().unwrap_or(Value::Null));

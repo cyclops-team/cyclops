@@ -128,3 +128,18 @@ sustained variant (braille + OSC title churn + split sequences + command
 traffic). Field-proven in the rerun soak (tests/raw/m1-soak-2): zero
 control drops and zero shutdown wedges in daemon.log across 252 s of the
 same claude braille load that produced 8 drops in 80 s pre-fix.
+
+## F23. tmux evaluates format subscriptions on a 1Hz tick; sub-second states are invisible (MEASURED)
+
+refresh-client -B pushes %subscription-changed only when the server's
+once-per-second tick re-evaluates the format, not on the change itself.
+Observed while driving fixture turns for agent.wait: three title flips
+landed on an exact 1s grid in the daemon log, and a working-state title
+that was set and replaced within the same second produced no notification
+at all: tmux pushed one net change whose value was already the final idle
+title, so fusion never saw the turn. Consequences: the title sensor's
+resolution is one second, a turn shorter than that can be missed entirely
+by `wait --until done` on screen/title-only agents (hook-tier agents
+report their edges out of band), and fixture tests must hold each driven
+state across a tick. Proven by crates/cyclopsd/tests/m2_wait.rs, which
+holds working titles for 2s.

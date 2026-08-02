@@ -389,7 +389,8 @@ async fn send_and_wait_reports_paneless_recipients() {
     assert_eq!(waits[0]["to"], "ghost", "{result}");
     assert_eq!(waits[0]["delivery"], "attention_required", "{result}");
     assert!(waits[0]["state"].is_null(), "{result}");
-    assert_eq!(waits[0]["timed_out"], false, "{result}");
+    assert_eq!(waits[0]["outcome"], "not_delivered", "{result}");
+    assert_eq!(waits[0]["waited_ms"], 0, "{result}");
     rig.assert_ledger_legal(&[]);
     rig.shutdown().await;
 }

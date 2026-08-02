@@ -1,0 +1,19 @@
+{
+  "reviewer": {
+    "PreInvocation": [
+      { "type": "command", "command": "/opt/cyclops/bin/cyclops hook PreInvocation --agent reviewer" }
+    ],
+    "PostInvocation": [
+      { "type": "command", "command": "/opt/cyclops/bin/cyclops hook PostInvocation --agent reviewer" }
+    ],
+    "Stop": [
+      { "type": "command", "command": "/opt/cyclops/bin/cyclops hook Stop --agent reviewer" }
+    ],
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook PreToolUse --agent reviewer" } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook PostToolUse --agent reviewer" } ] }
+    ]
+  }
+}

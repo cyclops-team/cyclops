@@ -53,6 +53,20 @@ Logs go to stderr; set `CYCLOPS_LOG=debug` for more. Stop with Ctrl-C or
 SIGTERM; the daemon removes its socket and exits cleanly. Your tmux session
 is never modified by watching it.
 
+## Wire the hooks
+
+Hooks turn receipts from screen-verified into hook-verified and give the
+daemon instant turn edges:
+
+```bash
+cyclops hooks install claude --agent reviewer   # renders config + prints wiring
+cyclops hooks selftest reviewer                 # proves the hooks actually fire
+```
+
+Install never touches vendor config directories; it prepares files under
+`~/.cyclops/hooks/` and tells you the one command to wire each CLI.
+Details and the codex trust caveat: [hooks.md](hooks.md).
+
 ## Verify
 
 ```bash

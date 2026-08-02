@@ -334,7 +334,7 @@ fn send_happy_path_stdin_body_delivers_verified() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "✓ delivered · verified\n"
+        "✔ delivered · verified\n"
     );
     assert!(
         out.stderr.is_empty(),
@@ -387,7 +387,7 @@ fn send_broadcast_renders_the_aligned_grid() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let expected = "\x20 reviewer     ✓ delivered · verified\n\
+    let expected = "\x20 reviewer     ✔ delivered · verified\n\
                     \x20 implementer  ● queued · 2 ahead\n";
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
     let _ = fs::remove_dir_all(&home);
@@ -629,5 +629,580 @@ fn read_prints_pane_text_verbatim() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "line one\nline two\n");
+    let _ = fs::remove_dir_all(&home);
+}
+
+// ---------------------------------------------------------------------------
+// M2 read side: history and thread
+// ---------------------------------------------------------------------------
+
+/// Canned folded msg line as msg.history/msg.thread return them. Callers
+/// that need a body set it on the returned value.
+fn canned_msg(
+    id: &str,
+    ts: u64,
+    kind: &str,
+    from: &str,
+    to: Value,
+    subject: &str,
+    deliveries: Value,
+) -> Value {
+    json!({
+        "seq": 3, "boot_id": "b-e2e", "id": id, "ts": ts, "kind": kind,
+        "from": from, "to": to, "subject": subject, "deliveries": deliveries
+    })
+}
+
+#[test]
+fn history_plain_renders_the_grid_with_broadcast_badges() {
+    let home = scratch_home("hp");
+    let lines = json!([
+        canned_msg(
+            "m-aaa",
+            1_753_000_000_000u64,
+            "msg",
+            "codex",
+            json!(["reviewer"]),
+            "Review the rate limiter",
+            json!([{"to": "reviewer", "state": "delivered_verified", "verified_by": "hook", "attempts": 1, "ts": 1_753_000_001_000u64}])
+        ),
+        canned_msg(
+            "m-bbb",
+            1_753_172_800_000u64,
+            "fyi",
+            "admin",
+            json!(["reviewer", "implementer"]),
+            "Standup",
+            json!([
+                {"to": "reviewer", "state": "delivered_verified", "verified_by": "hook", "attempts": 1, "ts": 1_753_172_801_000u64},
+                {"to": "implementer", "state": "parked_blocked_quota", "attempts": 0, "ts": 1_753_172_801_000u64, "cause": "blocked_quota"}
+            ])
+        ),
+    ]);
+    serve_once(&home, hello(1), move |req| {
+        assert_eq!(req["method"], "msg.history");
+        assert_eq!(req["params"]["with"], "reviewer");
+        assert_eq!(req["params"]["limit"], 50);
+        (
+            vec![
+                json!({"id": req["id"], "result": {"lines": lines, "next_cursor": 9}}).to_string(),
+            ],
+            false,
+        )
+    });
+    let out = run_cyclops(&home, &["history", "--with", "reviewer"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Fixed 2025 timestamps render date gutters (relative gutters would
+    // depend on the wall clock); the broadcast is one fact, two badges.
+    let expected = "\x20 Jul 20 2025  codex → reviewer       Review the rate limiter  ✔ delivered · verified\n\
+                    \x20 Jul 22 2025  admin → 2 agents  fyi  Standup\n\
+                    \x20              reviewer     ✔ delivered · verified\n\
+                    \x20              implementer  ⛔ parked · quota\n";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn history_json_passthrough_and_cursor_params() {
+    let home = scratch_home("hj");
+    let result = json!({"lines": [], "next_cursor": 42});
+    let expected = result.to_string();
+    serve_once(&home, hello(1), move |req| {
+        assert_eq!(req["params"]["from"], "codex");
+        assert_eq!(req["params"]["to"], "me");
+        assert_eq!(req["params"]["limit"], 5);
+        assert_eq!(req["params"]["cursor"], 7);
+        assert!(req["params"].get("with").is_none());
+        (
+            vec![json!({"id": req["id"], "result": result}).to_string()],
+            false,
+        )
+    });
+    let out = run_cyclops(
+        &home,
+        &[
+            "history", "--from", "codex", "--to", "me", "--limit", "5", "--cursor", "7", "--json",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), expected);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn history_empty_states_invite_a_send() {
+    let home = scratch_home("he");
+    serve_conns(&home, hello(1), 2, move |req| {
+        (
+            vec![json!({"id": req["id"], "result": {"lines": []}}).to_string()],
+            true,
+        )
+    });
+    let out = run_cyclops(&home, &["history"]);
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "No messages yet. Send one: cyclops send <target> --subject ..."
+    );
+    let out = run_cyclops(&home, &["history", "--with", "reviewer"]);
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "No messages with reviewer yet. Send one: cyclops send reviewer --subject ..."
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn history_with_conflicts_with_from_to() {
+    let home = scratch_home("hc");
+    // Usage error straight from clap; the daemon is never contacted.
+    let out = run_cyclops(&home, &["history", "--with", "a", "--from", "b"]);
+    assert_eq!(out.status.code(), Some(2));
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn thread_plain_renders_messages_with_bodies() {
+    let home = scratch_home("tp");
+    // State lines ride along in the result; the human view keeps messages
+    // and badges only.
+    let state_line = json!({
+        "seq": 5, "boot_id": "b-e2e", "id": "m-aaa", "ts": 1_753_000_001_000u64,
+        "kind": "state", "from": "cyclopsd", "to": ["reviewer"],
+        "deliveries": [{"to": "reviewer", "state": "gating", "attempts": 0, "ts": 1_753_000_001_000u64}],
+        "data": {"to": "reviewer", "from": "queued", "to_state": "gating"}
+    });
+    let mut ask = canned_msg(
+        "m-aaa",
+        1_753_000_000_000u64,
+        "msg",
+        "codex",
+        json!(["reviewer"]),
+        "Review the rate limiter",
+        json!([{"to": "reviewer", "state": "delivered_verified", "verified_by": "hook", "attempts": 1, "ts": 1_753_000_002_000u64}]),
+    );
+    ask["body"] = json!("gateway.rs:120");
+    let mut reply = canned_msg(
+        "m-ccc",
+        1_753_172_800_000u64,
+        "msg",
+        "reviewer",
+        json!(["codex"]),
+        "Re: Review the rate limiter",
+        json!([{"to": "codex", "state": "delivered_verified", "verified_by": "hook", "attempts": 1, "ts": 1_753_172_801_000u64}]),
+    );
+    reply["body"] = json!("Done.");
+    let lines = json!([ask, state_line, reply]);
+    serve_once(&home, hello(1), move |req| {
+        assert_eq!(req["method"], "msg.thread");
+        assert_eq!(req["params"]["id"], "m-aaa");
+        (
+            vec![json!({"id": req["id"], "result": {"lines": lines}}).to_string()],
+            false,
+        )
+    });
+    let out = run_cyclops(&home, &["thread", "m-aaa"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let expected = "\x20 Jul 20 2025  codex → reviewer  Review the rate limiter      ✔ delivered · verified\n\
+                    \x20              gateway.rs:120\n\
+                    \n\
+                    \x20 Jul 22 2025  reviewer → codex  Re: Review the rate limiter  ✔ delivered · verified\n\
+                    \x20              Done.\n";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn thread_unknown_id_passes_the_daemon_copy_through() {
+    let home = scratch_home("tu");
+    serve_once(&home, hello(1), move |req| {
+        (
+            vec![json!({
+                "id": req["id"],
+                "error": {
+                    "code": "no_such_message",
+                    "message": "no message \"m-nope\" in the record. Run cyclops history to see what's there."
+                }
+            })
+            .to_string()],
+            false,
+        )
+    });
+    let out = run_cyclops(&home, &["thread", "m-nope"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "no message \"m-nope\" in the record. Run cyclops history to see what's there."
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn wait_reached_renders_the_badge_and_exits_zero() {
+    let home = scratch_home("wr");
+    serve_once(&home, hello(1), move |req| {
+        assert_eq!(req["method"], "agent.wait");
+        assert_eq!(req["params"]["target"], "reviewer");
+        assert_eq!(req["params"]["until"], "idle");
+        assert_eq!(req["params"]["timeout_ms"], 90_000);
+        (
+            vec![json!({"id": req["id"], "result": {
+                "target": "reviewer", "pane_id": "%1", "until": "idle",
+                "state": "idle", "waited_ms": 3000
+            }})
+            .to_string()],
+            false,
+        )
+    });
+    let out = run_cyclops(
+        &home,
+        &["wait", "reviewer", "--until", "idle", "--timeout", "90s"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "○ idle · waited 3s\n");
+    assert!(
+        out.stderr.is_empty(),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn wait_timeout_exits_two_with_copy() {
+    let home = scratch_home("wt");
+    serve_once(&home, hello(1), move |req| {
+        assert_eq!(req["params"]["until"], "done");
+        // Default --timeout is 60s.
+        assert_eq!(req["params"]["timeout_ms"], 60_000);
+        (
+            vec![json!({"id": req["id"], "error": {
+                "code": "timeout",
+                "message": "reviewer did not reach done within 60000ms; state was working",
+                "data": {"target": "reviewer", "until": "done", "state": "working", "waited_ms": 60_001}
+            }})
+            .to_string()],
+            false,
+        )
+    });
+    let out = run_cyclops(&home, &["wait", "reviewer", "--until", "done"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "reviewer didn't reach done within 60 seconds. Last state: working. Give it more time with --timeout, or look in with cyclops status."
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn wait_occupant_changed_exits_three_with_copy() {
+    let home = scratch_home("wo");
+    serve_once(&home, hello(1), move |req| {
+        (
+            vec![json!({"id": req["id"], "error": {
+                "code": "occupant_changed",
+                "message": "the pane behind reviewer died or changed occupant while waiting",
+                "data": {"target": "reviewer", "until": "done", "state": "dead", "waited_ms": 1200}
+            }})
+            .to_string()],
+            false,
+        )
+    });
+    let out = run_cyclops(&home, &["wait", "reviewer", "--until", "done"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "reviewer's pane died or changed occupant while waiting, so the wait can't answer for the agent you asked about. Check cyclops status and relabel the pane if a new agent owns it."
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn wait_json_prints_the_error_object_and_keeps_the_exit_code() {
+    let home = scratch_home("wjs");
+    serve_once(&home, hello(1), move |req| {
+        (
+            vec![json!({"id": req["id"], "error": {
+                "code": "timeout",
+                "message": "words",
+                "data": {"state": "working", "waited_ms": 500}
+            }})
+            .to_string()],
+            false,
+        )
+    });
+    let out = run_cyclops(
+        &home,
+        &[
+            "wait",
+            "reviewer",
+            "--until",
+            "idle",
+            "--timeout",
+            "500ms",
+            "--json",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let v: Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("json error object");
+    assert_eq!(v["code"], "timeout");
+    assert_eq!(v["data"]["state"], "working");
+    assert!(
+        out.stderr.is_empty(),
+        "json mode stays machine-clean: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn wait_bad_duration_is_a_usage_error() {
+    let home = scratch_home("wb");
+    // No daemon on purpose: usage errors must not hide behind a down one.
+    let out = run_cyclops(
+        &home,
+        &["wait", "reviewer", "--until", "idle", "--timeout", "soon"],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "can't read \"soon\" as a duration. Use forms like 90s, 2m, 1m30s, or 500ms."
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn send_wait_passes_the_spec_and_renders_the_outcome() {
+    let home = scratch_home("sw");
+    serve_once(&home, hello(1), move |req| {
+        assert_eq!(req["method"], "msg.send");
+        assert_eq!(req["params"]["wait"]["until"], "done");
+        assert_eq!(req["params"]["wait"]["timeout_ms"], 120_000);
+        (
+            vec![json!({"id": req["id"], "result": {
+                "msg_id": "m-dd", "seq": 12,
+                "deliveries": [{"to": "reviewer", "state": "delivered_verified"}],
+                "wait": [{
+                    "to": "reviewer", "outcome": "reached", "state": "idle",
+                    "waited_ms": 42_000, "delivery": "delivered_verified"
+                }]
+            }})
+            .to_string()],
+            false,
+        )
+    });
+    let out = run_cyclops(
+        &home,
+        &[
+            "send",
+            "reviewer",
+            "--subject",
+            "go",
+            "--body",
+            "b",
+            "--wait",
+            "done",
+            "--timeout",
+            "2m",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "✔ delivered · verified\nwait: ○ idle · waited 42s\n"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+// ---------------------------------------------------------------------------
+// M2 hooks verify/selftest rendering: canned daemon, exact copy
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hooks_selftest_ack_renders_the_badge_voice() {
+    let home = scratch_home("sta");
+    serve_once(&home, hello(1), move |req| {
+        assert_eq!(req["method"], "hooks.selftest");
+        assert_eq!(req["params"]["target"], "reviewer");
+        (
+            vec![json!({"id": req["id"], "result": {
+                "target": "reviewer", "msg_id": "m-77aa88", "manifest": "claude",
+                "tier": 1, "state": "delivered_verified", "hook_ack": true,
+                "waited_ms": 12
+            }})
+            .to_string()],
+            false,
+        )
+    });
+    let out = run_cyclops(&home, &["hooks", "selftest", "reviewer"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "reviewer · ✔ ack hook fired with the marker · ✔ delivered · verified · m-77aa88\n"
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn hooks_selftest_failure_names_a_runnable_install_command() {
+    let home = scratch_home("stf");
+    serve_once(&home, hello(1), move |req| {
+        (
+            vec![json!({"id": req["id"], "result": {
+                "target": "reviewer", "msg_id": "m-9b1c2d", "manifest": "codex",
+                "tier": 1, "state": "delivered_unverified", "hook_ack": false,
+                "waited_ms": 1800
+            }})
+            .to_string()],
+            false,
+        )
+    });
+    let out = run_cyclops(&home, &["hooks", "selftest", "reviewer"]);
+    assert_eq!(out.status.code(), Some(1));
+    // The wire state renders as the send badge, never raw snake_case.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "reviewer · ⚠ no hook ack · ✓ delivered · unverified (screen) · m-9b1c2d\n"
+    );
+    // install takes the CLI kind (the bound manifest), --agent the label:
+    // this command runs as printed.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "The ack hook never reported the marker. Its config is probably not loaded; \
+         cyclops hooks install codex --agent reviewer prints the wiring and the trust caveats."
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn hooks_selftest_screen_tier_keeps_the_delivery_state_answer() {
+    let home = scratch_home("sts");
+    serve_once(&home, hello(1), move |req| {
+        (
+            vec![json!({"id": req["id"], "result": {
+                "target": "agy", "msg_id": "m-40e5f6", "manifest": "agy",
+                "tier": 2, "state": "delivered_unverified", "hook_ack": false,
+                "waited_ms": 900
+            }})
+            .to_string()],
+            false,
+        )
+    });
+    let out = run_cyclops(&home, &["hooks", "selftest", "agy"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "agy · ⚠ no hook ack · ✓ delivered · unverified (screen) · m-40e5f6\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "agy has no payload-matchable ack hook (screen tier); a hook ack can \
+         never confirm it. The delivery state above is the whole answer."
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn hooks_verify_unlabeled_pane_names_the_label_step() {
+    let home = scratch_home("vul");
+    serve_once(&home, hello(1), move |req| {
+        assert_eq!(req["method"], "hooks.verify");
+        assert_eq!(req["params"]["target"], "%4");
+        // Manifest bound, hooks declared, but no hooks_verified bit: the
+        // pane is unadopted, so edge tracking has not started.
+        (
+            vec![json!({"id": req["id"], "result": {
+                "target": "%4", "pane_id": "%4", "manifest": "claude", "tier": 1,
+                "events": [
+                    {"event": "UserPromptSubmit"},
+                    {"event": "Stop"}
+                ]
+            }})
+            .to_string()],
+            false,
+        )
+    });
+    let out = run_cyclops(&home, &["hooks", "verify", "%4"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let expected = "%4 · tier 1 · hook tracking starts when the pane has a label\n\
+                    \n\
+                    \x20 UserPromptSubmit  never\n\
+                    \x20 Stop              never\n";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "%4 declares hooks but has no label, and hook edges only count for a \
+         labeled pane. Name the pane (cyclops status shows every pane and its \
+         label), then rerun cyclops hooks verify."
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn hooks_verify_without_manifest_reads_no_hooks_declared() {
+    let home = scratch_home("vnm");
+    serve_once(&home, hello(1), move |req| {
+        (
+            vec![json!({"id": req["id"], "result": {
+                "target": "%4", "pane_id": "%4", "tier": 2, "events": []
+            }})
+            .to_string()],
+            false,
+        )
+    });
+    let out = run_cyclops(&home, &["hooks", "verify", "%4"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "%4 · tier 2 · no hooks declared\n"
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let _ = fs::remove_dir_all(&home);
 }

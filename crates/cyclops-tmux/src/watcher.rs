@@ -102,6 +102,8 @@ impl PaneRow {
             width: self.width,
             height: self.height,
             state,
+            // Hook liveness is daemon knowledge; the daemon fills it in.
+            hooks_verified: None,
         }
     }
 }

@@ -172,6 +172,14 @@ pub(crate) async fn handle_report(
     };
     let pane_id = row.pane_id.clone();
 
+    // Hook liveness (amendment c): any report that resolves to a pane
+    // proves its hook config is loaded and firing. Recorded before dedupe
+    // on purpose: a duplicate is still a live edge. Keyed by the occupant
+    // pid so a restarted occupant never inherits its predecessor's edges.
+    inner
+        .hook_liveness
+        .record(&pane_id, &params.event, unix_ms(), row.pane_pid);
+
     // Dedupe: exact repost (same reporter seq), then cross-config
     // duplicates on (session_id, turn_id, event) (amendment d).
     if let Some(seq) = params.seq {

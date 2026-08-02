@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook UserPromptSubmit --agent reviewer" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook Stop --agent reviewer" } ] }
+    ],
+    "PermissionRequest": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook PermissionRequest --agent reviewer" } ] }
+    ]
+  }
+}

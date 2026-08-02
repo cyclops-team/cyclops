@@ -1,0 +1,30 @@
+# Cyclops hook config template: Claude Code settings fragment.
+# Rendered by `cyclops hooks install claude --agent <label>`; '#' lines are
+# stripped, {label} and {cyclops_bin} are substituted.
+#
+# Wiring: launch claude with `--settings <rendered file>`. Claude only reads
+# hooks from settings it was launched with; dropping this file somewhere is
+# not enough, and cyclops never edits ~/.claude for you. If you already pass
+# your own --settings file, merge the "hooks" object into it instead.
+#
+# Events: UserPromptSubmit is the delivery ACK (payload carries the injected
+# prompt, so the message id is matchable, MEASURED 130/130), Stop is turn
+# end, Notification and PermissionRequest are attention edges. Every entry
+# names its own event on the command line: the receiver must not trust
+# payloads to self-identify (finding F7 on agy set the fleet-wide rule).
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook UserPromptSubmit --agent {label}" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook Stop --agent {label}" } ] }
+    ],
+    "Notification": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook Notification --agent {label}" } ] }
+    ],
+    "PermissionRequest": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook PermissionRequest --agent {label}" } ] }
+    ]
+  }
+}

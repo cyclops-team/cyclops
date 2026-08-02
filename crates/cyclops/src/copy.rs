@@ -46,6 +46,15 @@ pub fn parked(to: &str, note: Option<&str>) -> String {
     }
 }
 
+/// Empty history invites the next action. A filtered query names the agent
+/// it was scoped to so the suggested send goes somewhere real.
+pub fn no_messages(target: Option<&str>) -> String {
+    match target {
+        Some(t) => format!("No messages with {t} yet. Send one: cyclops send {t} --subject ..."),
+        None => "No messages yet. Send one: cyclops send <target> --subject ...".to_string(),
+    }
+}
+
 pub fn body_file_unreadable(path: &str, cause: &str) -> String {
     let src = if path == "-" {
         "stdin".to_string()
@@ -77,6 +86,30 @@ pub fn proto_mismatch(server: u32, client: u32) -> String {
     format!("note: cyclopsd speaks protocol {server}, this cyclops speaks {client}. Continuing; update the older side.")
 }
 
+pub fn bad_duration(input: &str) -> String {
+    format!("can't read \"{input}\" as a duration. Use forms like 90s, 2m, 1m30s, or 500ms.")
+}
+
+/// Wait timed out (exit 2). Names what was waited for, how long, the state
+/// the target was last seen in, and the next step.
+pub fn wait_timeout(target: &str, until: &str, d: Duration, state: Option<&str>) -> String {
+    let last = match state {
+        Some(s) => format!(" Last state: {s}."),
+        None => String::new(),
+    };
+    format!(
+        "{target} didn't reach {until} within {}.{last} Give it more time with --timeout, or look in with cyclops status.",
+        timeout_words(d)
+    )
+}
+
+/// The pinned pane died or changed occupant mid-wait (exit 3).
+pub fn wait_occupant_changed(target: &str) -> String {
+    format!(
+        "{target}'s pane died or changed occupant while waiting, so the wait can't answer for the agent you asked about. Check cyclops status and relabel the pane if a new agent owns it."
+    )
+}
+
 /// One place turns transport errors into copy. `asked` names the target the
 /// user typed, when the command had one.
 pub fn client_error(e: &ClientError, asked: Option<&str>) -> String {
@@ -87,6 +120,7 @@ pub fn client_error(e: &ClientError, asked: Option<&str>) -> String {
             code,
             message,
             targets,
+            ..
         } => {
             if code == "no_such_target" {
                 if let Some(asked) = asked {
@@ -142,12 +176,14 @@ mod tests {
             code: "denied".into(),
             message: "reviewer declined the message".into(),
             targets: vec![],
+            data: serde_json::Value::Null,
         };
         assert_eq!(client_error(&e, None), "reviewer declined the message");
         let bare = ClientError::Server {
             code: "denied".into(),
             message: String::new(),
             targets: vec![],
+            data: serde_json::Value::Null,
         };
         assert_eq!(client_error(&bare, None), "cyclops refused: denied");
     }
@@ -176,6 +212,18 @@ mod tests {
     }
 
     #[test]
+    fn empty_history_copy_invites_a_send() {
+        assert_eq!(
+            no_messages(None),
+            "No messages yet. Send one: cyclops send <target> --subject ..."
+        );
+        assert_eq!(
+            no_messages(Some("reviewer")),
+            "No messages with reviewer yet. Send one: cyclops send reviewer --subject ..."
+        );
+    }
+
+    #[test]
     fn body_file_copy_names_the_source() {
         assert_eq!(
             body_file_unreadable("notes.md", "No such file or directory (os error 2)"),
@@ -192,6 +240,7 @@ mod tests {
             code: "no_such_target".into(),
             message: "server words".into(),
             targets: vec!["reviewer".into()],
+            data: serde_json::Value::Null,
         };
         assert_eq!(
             client_error(&e, Some("ghost")),
@@ -199,5 +248,33 @@ mod tests {
         );
         // Without an asked name there is nothing to blame; daemon copy wins.
         assert_eq!(client_error(&e, None), "server words");
+    }
+
+    #[test]
+    fn bad_duration_names_the_input_and_the_forms() {
+        assert_eq!(
+            bad_duration("soon"),
+            "can't read \"soon\" as a duration. Use forms like 90s, 2m, 1m30s, or 500ms."
+        );
+    }
+
+    #[test]
+    fn wait_timeout_copy_names_state_and_next_step() {
+        assert_eq!(
+            wait_timeout("reviewer", "done", Duration::from_secs(60), Some("working")),
+            "reviewer didn't reach done within 60 seconds. Last state: working. Give it more time with --timeout, or look in with cyclops status."
+        );
+        assert_eq!(
+            wait_timeout("reviewer", "idle", Duration::from_secs(5), None),
+            "reviewer didn't reach idle within 5 seconds. Give it more time with --timeout, or look in with cyclops status."
+        );
+    }
+
+    #[test]
+    fn occupant_changed_copy_is_exact() {
+        assert_eq!(
+            wait_occupant_changed("reviewer"),
+            "reviewer's pane died or changed occupant while waiting, so the wait can't answer for the agent you asked about. Check cyclops status and relabel the pane if a new agent owns it."
+        );
     }
 }

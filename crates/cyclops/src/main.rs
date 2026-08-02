@@ -7,25 +7,40 @@
 mod client;
 mod copy;
 mod hook;
+mod hookset;
 mod render;
 mod style;
 
 use std::io::Write;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 
-use client::Client;
+use client::{Client, ClientError};
 use cyclops_proto::{
-    DeliveryReceipt, DeliveryState, Event, MsgSendParams, MsgSendResult, PaneReadParams,
-    PaneReadResult, PaneReadSource, StatusResult, SubscribeParams, PROTOCOL_VERSION,
+    DeliveryReceipt, DeliveryState, Event, HistoryParams, HistoryResult, MsgSendParams,
+    MsgSendResult, PaneReadParams, PaneReadResult, PaneReadSource, StatusResult, SubscribeParams,
+    ThreadResult, WaitSpec, WaitUntil, PROTOCOL_VERSION,
 };
 use style::Style;
 
 /// Usage mistakes exit 2 (clap's convention), keeping 1 to mean the
 /// message ended parked or needing attention, which scripts branch on.
 const EXIT_USAGE: i32 = 2;
+
+/// `cyclops wait` exit codes scripts branch on: 2 the timeout expired, 3
+/// the pinned pane died or changed occupant mid-wait. Reached exits 0;
+/// transport and unknown-target errors keep the usual 1.
+const EXIT_WAIT_TIMEOUT: i32 = 2;
+const EXIT_OCCUPANT_CHANGED: i32 = 3;
+
+/// Default wait budget when --timeout is not given, mirroring the daemon.
+const WAIT_TIMEOUT_DEFAULT: &str = "60s";
+
+/// Slack added to the socket read deadline over the daemon-side wait
+/// budget, so the transport never times out before the daemon answers.
+const WAIT_READ_SLACK: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
 #[command(name = "cyclops", version, about = "One eye on every agent")]
@@ -67,6 +82,26 @@ enum Cmd {
     /// Send a message. The receipt names each delivery's state; exit 0 on
     /// delivered/queued, 1 on parked or needs attention.
     Send(SendArgs),
+    /// Messages from the record, newest last. Filter by agent or direction.
+    History(HistoryArgs),
+    /// One message with its replies and delivery record, oldest first.
+    Thread {
+        /// Message id, e.g. m-3f9c2a.
+        id: String,
+    },
+    /// Wait for an agent to reach a state. Exit 0 when reached, 2 on
+    /// timeout, 3 when the pane died or changed occupant mid-wait.
+    Wait {
+        /// Agent label or pane id, e.g. reviewer or %4.
+        target: String,
+        /// idle: composer ready. done: the current or next turn ends.
+        /// blocked: any blocked state (modal, permission, quota).
+        #[arg(long, value_enum)]
+        until: UntilArg,
+        /// Give up after this long, e.g. 90s, 2m, 1m30s. Max 10m.
+        #[arg(long, default_value = WAIT_TIMEOUT_DEFAULT)]
+        timeout: String,
+    },
     /// Relay a vendor hook event to cyclops. Silent, always exits 0.
     Hook {
         /// Event name, e.g. Stop. An argument because agy payloads carry
@@ -75,6 +110,41 @@ enum Cmd {
         /// Reporting agent label; defaults to $CYCLOPS_AGENT.
         #[arg(long)]
         agent: Option<String>,
+    },
+    /// Prepare vendor hook configs and prove they fire.
+    Hooks {
+        #[command(subcommand)]
+        cmd: HooksCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum HooksCmd {
+    /// Render a hook config for one CLI and print the wiring instructions.
+    /// Never writes into vendor config directories.
+    Install {
+        /// Which agent CLI to render for.
+        cli: hookset::CliKind,
+        /// Cyclops label the hooks report as.
+        #[arg(long)]
+        agent: String,
+        /// Print what would be written without writing it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Output directory; defaults to $CYCLOPS_HOME/hooks/<label>/.
+        #[arg(long)]
+        dest: Option<std::path::PathBuf>,
+    },
+    /// Hook liveness for a pane: tier and last-seen edge ages.
+    Verify {
+        /// Agent label or pane id.
+        target: String,
+    },
+    /// One no-op round trip through the delivery pipeline, reporting
+    /// whether the ack hook fired with the marker. Costs one trivial turn.
+    Selftest {
+        /// Agent label or pane id.
+        target: String,
     },
 }
 
@@ -103,6 +173,104 @@ struct SendArgs {
     /// Message id this replies to, e.g. m-3f9c2a.
     #[arg(long)]
     reply_to: Option<String>,
+    /// After delivery, also wait for the recipient: idle, done, or blocked.
+    /// The receipt gains a wait outcome per recipient.
+    #[arg(long, value_enum)]
+    wait: Option<UntilArg>,
+    /// Wait budget for --wait, e.g. 90s, 2m. Default 60s, max 10m.
+    #[arg(long, requires = "wait", default_value = WAIT_TIMEOUT_DEFAULT)]
+    timeout: String,
+}
+
+#[derive(clap::Args)]
+struct HistoryArgs {
+    /// Messages from or to this agent. "me" is you.
+    #[arg(long, conflicts_with_all = ["from", "to"])]
+    with: Option<String>,
+    /// Only messages from this sender. "me" is you.
+    #[arg(long)]
+    from: Option<String>,
+    /// Only messages to this recipient. "me" is you.
+    #[arg(long)]
+    to: Option<String>,
+    /// Most recent N messages (default 50).
+    #[arg(long)]
+    limit: Option<u32>,
+    /// Resume after this record seq (next_cursor from a --json call).
+    #[arg(long)]
+    cursor: Option<u64>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum UntilArg {
+    Idle,
+    Done,
+    Blocked,
+}
+
+impl UntilArg {
+    fn word(self) -> &'static str {
+        match self {
+            UntilArg::Idle => "idle",
+            UntilArg::Done => "done",
+            UntilArg::Blocked => "blocked",
+        }
+    }
+}
+
+impl From<UntilArg> for WaitUntil {
+    fn from(u: UntilArg) -> Self {
+        match u {
+            UntilArg::Idle => WaitUntil::Idle,
+            UntilArg::Done => WaitUntil::Done,
+            UntilArg::Blocked => WaitUntil::Blocked,
+        }
+    }
+}
+
+/// Human duration: segments of <number><unit> with units ms, s, m, h
+/// ("90s", "2m", "1m30s", "500ms"); a bare number means seconds. Zero and
+/// anything unparseable are rejected.
+fn parse_duration(input: &str) -> Result<Duration, ()> {
+    let s = input.trim();
+    if s.is_empty() {
+        return Err(());
+    }
+    if let Ok(secs) = s.parse::<u64>() {
+        return if secs == 0 {
+            Err(())
+        } else {
+            Ok(Duration::from_secs(secs))
+        };
+    }
+    let mut total = Duration::ZERO;
+    let mut rest = s;
+    while !rest.is_empty() {
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits == 0 {
+            return Err(());
+        }
+        let (num, tail) = rest.split_at(digits);
+        let n: u64 = num.parse().map_err(|_| ())?;
+        let unit = tail.len()
+            - tail
+                .trim_start_matches(|c: char| c.is_ascii_alphabetic())
+                .len();
+        let (unit, tail) = tail.split_at(unit);
+        total += match unit {
+            "ms" => Duration::from_millis(n),
+            "s" => Duration::from_secs(n),
+            "m" => Duration::from_secs(n * 60),
+            "h" => Duration::from_secs(n * 3600),
+            _ => return Err(()),
+        };
+        rest = tail;
+    }
+    if total.is_zero() {
+        Err(())
+    } else {
+        Ok(total)
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -141,10 +309,32 @@ fn run(cli: &Cli) -> i32 {
         // Hook never prints and owns its transport handling: a hook that
         // fails loudly breaks the vendor CLI that invoked it.
         Cmd::Hook { event, agent } => hook::run(event, agent.as_deref()),
-        // Send validates usage and reads the body before touching the
-        // daemon, so usage errors don't hide behind a down daemon.
+        // Send and wait validate usage before touching the daemon, so
+        // usage errors don't hide behind a down daemon.
         Cmd::Send(args) => cmd_send(cli, &style, args),
-        Cmd::Status | Cmd::Ping | Cmd::Read { .. } | Cmd::Watch { .. } => {
+        Cmd::Wait {
+            target,
+            until,
+            timeout,
+        } => cmd_wait(cli, &style, target, *until, timeout),
+        // Install renders and instructs without a daemon; verify and
+        // selftest ask the daemon for hook liveness.
+        Cmd::Hooks {
+            cmd:
+                HooksCmd::Install {
+                    cli: kind,
+                    agent,
+                    dry_run,
+                    dest,
+                },
+        } => hookset::run_install(*kind, agent, *dry_run, dest.as_deref(), cli.json),
+        Cmd::Status
+        | Cmd::Ping
+        | Cmd::Read { .. }
+        | Cmd::Watch { .. }
+        | Cmd::History(_)
+        | Cmd::Thread { .. }
+        | Cmd::Hooks { .. } => {
             let mut c = match connect() {
                 Ok(c) => c,
                 Err(code) => return code,
@@ -158,7 +348,17 @@ fn run(cli: &Cli) -> i32 {
                     source,
                 } => cmd_read(&mut c, cli, &style, target, *lines, (*source).into()),
                 Cmd::Watch { kinds } => cmd_watch(&mut c, cli, &style, kinds),
-                Cmd::Send(_) | Cmd::Hook { .. } => unreachable!("handled above"),
+                Cmd::History(args) => cmd_history(&mut c, cli, &style, args),
+                Cmd::Thread { id } => cmd_thread(&mut c, cli, &style, id),
+                Cmd::Hooks {
+                    cmd: HooksCmd::Verify { target },
+                } => hookset::run_verify(&mut c, cli.json, &style, target),
+                Cmd::Hooks {
+                    cmd: HooksCmd::Selftest { target },
+                } => hookset::run_selftest(&mut c, cli.json, &style, target),
+                Cmd::Send(_) | Cmd::Hook { .. } | Cmd::Wait { .. } | Cmd::Hooks { .. } => {
+                    unreachable!("handled above")
+                }
             }
         }
     }
@@ -303,17 +503,37 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
         },
         (None, None) => String::new(),
     };
+    // --wait composes send-and-wait; the timeout parses before connecting.
+    let wait = match &args.wait {
+        None => None,
+        Some(until) => {
+            let Ok(budget) = parse_duration(&args.timeout) else {
+                eprintln!("{}", copy::bad_duration(&args.timeout));
+                return EXIT_USAGE;
+            };
+            Some(WaitSpec {
+                until: (*until).into(),
+                timeout_ms: Some(budget.as_millis() as u64),
+            })
+        }
+    };
     let mut c = match connect() {
         Ok(c) => c,
         Err(code) => return code,
     };
+    if let Some(spec) = &wait {
+        // The daemon holds the response until delivery plus wait resolve.
+        c.set_read_timeout(
+            Duration::from_millis(spec.timeout_ms.unwrap_or_default()) + WAIT_READ_SLACK,
+        );
+    }
     let params = serde_json::to_value(MsgSendParams {
         to: to.clone(),
         subject: args.subject.clone(),
         body,
         fyi: args.fyi,
         reply_to: args.reply_to.clone(),
-        wait: None,
+        wait,
     })
     .expect("msg.send params serialize");
     // With one recipient the unknown-target copy can name it; a broadcast
@@ -334,6 +554,11 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
         println!("{result}");
         return receipts_exit_json(&result);
     }
+    let waits: Vec<Value> = result
+        .get("wait")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let receipt: MsgSendResult = match serde_json::from_value(result) {
         Ok(r) => r,
         Err(_) => {
@@ -342,6 +567,9 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
         }
     };
     println!("{}", render::render_receipts(&receipt.deliveries, style));
+    if !waits.is_empty() {
+        println!("{}", render::render_wait_entries(&waits, style));
+    }
     // Parked recipients get the reset hint and next step spelled out.
     for d in &receipt.deliveries {
         if d.state == DeliveryState::ParkedBlockedQuota {
@@ -349,6 +577,145 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
         }
     }
     receipts_exit(&receipt.deliveries)
+}
+
+/// cyclops wait <target> --until idle|done|blocked [--timeout 60s].
+/// Blocks on the daemon's agent.wait: the daemon watches the fused state
+/// stream and pins the pane occupant; nothing here polls.
+fn cmd_wait(cli: &Cli, style: &Style, target: &str, until: UntilArg, timeout: &str) -> i32 {
+    let Ok(budget) = parse_duration(timeout) else {
+        eprintln!("{}", copy::bad_duration(timeout));
+        return EXIT_USAGE;
+    };
+    let mut c = match connect() {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    // The daemon holds the response for the whole wait.
+    c.set_read_timeout(budget + WAIT_READ_SLACK);
+    let params = json!({
+        "target": target,
+        "until": until.word(),
+        "timeout_ms": budget.as_millis() as u64,
+    });
+    match c.request("agent.wait", params) {
+        Ok(v) => {
+            if cli.json {
+                println!("{v}");
+            } else {
+                println!(
+                    "{}",
+                    render::wait_badge(
+                        "reached",
+                        serde_json::from_value(v["state"].clone()).ok(),
+                        v["waited_ms"].as_u64(),
+                        None,
+                        style,
+                    )
+                );
+            }
+            0
+        }
+        Err(ClientError::Server {
+            code,
+            message,
+            data,
+            ..
+        }) if code == "timeout" || code == "occupant_changed" => {
+            if cli.json {
+                println!(
+                    "{}",
+                    json!({"code": code, "message": message, "data": data})
+                );
+            } else if code == "timeout" {
+                eprintln!(
+                    "{}",
+                    copy::wait_timeout(target, until.word(), budget, data["state"].as_str())
+                );
+            } else {
+                eprintln!("{}", copy::wait_occupant_changed(target));
+            }
+            if code == "timeout" {
+                EXIT_WAIT_TIMEOUT
+            } else {
+                EXIT_OCCUPANT_CHANGED
+            }
+        }
+        Err(e) => {
+            eprintln!("{}", copy::client_error(&e, Some(target)));
+            1
+        }
+    }
+}
+
+/// The record, newest last: folded msg lines rendered on the history grid.
+fn cmd_history(c: &mut Client, cli: &Cli, style: &Style, args: &HistoryArgs) -> i32 {
+    let params = serde_json::to_value(HistoryParams {
+        with: args.with.clone(),
+        from: args.from.clone(),
+        to: args.to.clone(),
+        limit: args.limit.unwrap_or(50),
+        cursor: args.cursor,
+    })
+    .expect("msg.history params serialize");
+    let result = match c.request("msg.history", params) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}", copy::client_error(&e, None));
+            return 1;
+        }
+    };
+    if cli.json {
+        println!("{result}");
+        return 0;
+    }
+    let history: HistoryResult = match serde_json::from_value(result) {
+        Ok(h) => h,
+        Err(_) => {
+            eprintln!("{}", copy::UNREADABLE_ANSWER);
+            return 1;
+        }
+    };
+    if history.lines.is_empty() {
+        // Empty states invite the next action. Name the filtered agent when
+        // there is one worth addressing.
+        let target = args.with.as_deref().or(args.to.as_deref());
+        let target = target.filter(|t| *t != "me");
+        println!("{}", copy::no_messages(target));
+        return 0;
+    }
+    println!(
+        "{}",
+        render::render_history(&history.lines, style, render::now_ms())
+    );
+    0
+}
+
+/// One thread: the message, its replies, and each delivery's current badge.
+fn cmd_thread(c: &mut Client, cli: &Cli, style: &Style, id: &str) -> i32 {
+    let result = match c.request("msg.thread", json!({"id": id})) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}", copy::client_error(&e, None));
+            return 1;
+        }
+    };
+    if cli.json {
+        println!("{result}");
+        return 0;
+    }
+    let thread: ThreadResult = match serde_json::from_value(result) {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!("{}", copy::UNREADABLE_ANSWER);
+            return 1;
+        }
+    };
+    println!(
+        "{}",
+        render::render_thread(&thread.lines, style, render::now_ms())
+    );
+    0
 }
 
 /// Body from a file path, or stdin when the path is "-" (the v1 habit:
@@ -433,5 +800,28 @@ fn cmd_watch(c: &mut Client, cli: &Cli, style: &Style, kinds: &[String]) -> i32 
             );
         }
         let _ = stdout.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durations_parse_human_forms() {
+        assert_eq!(parse_duration("90"), Ok(Duration::from_secs(90)));
+        assert_eq!(parse_duration("90s"), Ok(Duration::from_secs(90)));
+        assert_eq!(parse_duration("2m"), Ok(Duration::from_secs(120)));
+        assert_eq!(parse_duration("1m30s"), Ok(Duration::from_secs(90)));
+        assert_eq!(parse_duration("500ms"), Ok(Duration::from_millis(500)));
+        assert_eq!(parse_duration("1h"), Ok(Duration::from_secs(3600)));
+        assert_eq!(parse_duration(" 2m "), Ok(Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn bad_durations_are_rejected() {
+        for bad in ["", "0", "0s", "nope", "10x", "s", "-5s", "1.5s", "5s junk"] {
+            assert_eq!(parse_duration(bad), Err(()), "{bad:?} should not parse");
+        }
     }
 }

@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+# commPact deprecation shim: the v1 calling surface, served by cyclops.
+#
+# PREPARED by Cyclops M2. Nothing installs this automatically: the admin
+# runs install.sh (guarded by CYCLOPS_CUTOVER_ACK=yes) per the runbook in
+# clops/docs/CUTOVER.md. After install, the real v1 implementation stays
+# next to this file as commPact.v1.bak.
+#
+# Verb map:
+#   send, read, list, resolve, doctor  forwarded to cyclops (daemon-backed)
+#   id, hash, version, help            local, same behavior as v1
+#   type, keys, message, name          not shimmed; refused with a pointer
+set -euo pipefail
+
+SHIM_VERSION="3.1.0-shim"
+
+# cyclops binary; override with CYCLOPS_BIN=/path/to/cyclops.
+CYCLOPS_BIN="${CYCLOPS_BIN:-cyclops}"
+
+# Environment problems exit 1.
+die() { echo "error: $*" >&2; exit 1; }
+
+# Usage mistakes exit 2, matching v1 send's INVALID_ARGS and the cyclops
+# CLI convention (1 means a delivery or daemon problem).
+usage_die() { echo "error: $*" >&2; exit 2; }
+
+# One-line deprecation note on stderr, once per day per user. The stamp
+# lives in cyclops's own home, so tests sandbox it via CYCLOPS_HOME and it
+# never touches ~/.commPact or vendor config dirs.
+note_deprecation() {
+  local dir="${CYCLOPS_HOME:-$HOME/.cyclops}"
+  local stamp="$dir/commpact-shim.stamp"
+  local today
+  today=$(date +%Y-%m-%d)
+  if [[ -r "$stamp" && "$(cat "$stamp" 2>/dev/null)" == "$today" ]]; then
+    return 0
+  fi
+  mkdir -p "$dir" 2>/dev/null || true
+  printf '%s' "$today" > "$stamp" 2>/dev/null || true
+  echo "note: commPact v1 is deprecated; this call went through the cyclops shim (unshimmed verbs: type, keys, message, name; runbook: clops/docs/CUTOVER.md)" >&2
+}
+
+require_cyclops() {
+  command -v "$CYCLOPS_BIN" >/dev/null 2>&1 \
+    || die "cyclops not found (looked for '$CYCLOPS_BIN'). Put cyclops on PATH or set CYCLOPS_BIN."
+}
+
+# Honest refusal for v1 verbs with no v2 equivalent yet.
+unshimmed() {
+  local verb="$1" hint="$2"
+  echo "error: commPact '$verb' is not shimmed: $hint" >&2
+  exit 2
+}
+
+usage() {
+  cat <<'EOF'
+commPact (cyclops shim) - v1 verbs forwarded to cyclops
+
+Usage: commPact <command> [args...]
+
+Forwarded to cyclops:
+  send <target> [--json] --subject <text> --body-file -
+                            cyclops send: gated, verified, receipted
+  read <target> [lines]     cyclops read --source recent (default 50 lines)
+  list                      cyclops status
+  resolve <label>           pane id, via cyclops read --json
+  doctor                    cyclops ping + cyclops status
+
+Local (same behavior as v1):
+  id                        print this pane's ID ($TMUX_PANE)
+  hash <text>               first 12 SHA-256 hex characters
+  version                   print shim version
+
+Not shimmed (no cyclops equivalent yet; refused with a clear error):
+  type, keys, message, name
+
+Environment:
+  CYCLOPS_BIN               cyclops binary to use (default: cyclops on PATH)
+
+Cutover runbook: clops/docs/CUTOVER.md
+EOF
+  exit 0
+}
+
+# --- Local verbs, kept byte-compatible with v1 ---
+
+cmd_id() {
+  if [[ -z "${TMUX_PANE:-}" ]]; then
+    die "not running inside a tmux pane (\$TMUX_PANE is unset)"
+  fi
+  echo "$TMUX_PANE"
+}
+
+# Copied from v1 unchanged, backend selection included: scripts that set
+# COMMPACT_SHA256_BACKEND keep working.
+sha256_12() {
+  local backend="${COMMPACT_SHA256_BACKEND:-auto}"
+  local digest
+  case "$backend" in
+    auto)
+      if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | awk '{ print substr($1, 1, 12) }'
+        return 0
+      fi
+      if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | awk '{ print substr($1, 1, 12) }'
+        return 0
+      fi
+      if command -v openssl >/dev/null 2>&1; then
+        digest="$(openssl dgst -sha256 | awk '{print $NF}')"
+        printf '%s\n' "${digest:0:12}"
+        return 0
+      fi
+      die "no SHA-256 command available"
+      ;;
+    shasum)
+      command -v shasum >/dev/null 2>&1 || die "COMMPACT_SHA256_BACKEND=shasum requested but shasum is unavailable"
+      shasum -a 256 | awk '{ print substr($1, 1, 12) }'
+      ;;
+    sha256sum)
+      command -v sha256sum >/dev/null 2>&1 || die "COMMPACT_SHA256_BACKEND=sha256sum requested but sha256sum is unavailable"
+      sha256sum | awk '{ print substr($1, 1, 12) }'
+      ;;
+    openssl)
+      command -v openssl >/dev/null 2>&1 || die "COMMPACT_SHA256_BACKEND=openssl requested but openssl is unavailable"
+      digest="$(openssl dgst -sha256 | awk '{print $NF}')"
+      printf '%s\n' "${digest:0:12}"
+      ;;
+    *) die "unknown COMMPACT_SHA256_BACKEND: $backend" ;;
+  esac
+}
+
+cmd_hash() {
+  if [[ $# -lt 1 ]]; then
+    usage_die "'hash' requires at least 1 argument(s). Run 'commPact' for usage."
+  fi
+  printf '%s' "$1" | sha256_12
+}
+
+# --- Forwarded verbs ---
+
+cmd_send() {
+  if [[ $# -lt 1 ]]; then
+    usage_die "'send' requires a target. Usage: printf 'body' | commPact send <target> --json --subject <text> --body-file -"
+  fi
+  local target="$1"
+  shift
+
+  local json=false subject="" body_file="" have_subject=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json)
+        json=true
+        shift
+        ;;
+      --subject)
+        [[ $# -ge 2 ]] || usage_die "'send --subject' requires a value"
+        subject="$2"
+        have_subject=true
+        shift 2
+        ;;
+      --body-file)
+        [[ $# -ge 2 ]] || usage_die "'send --body-file' requires a value"
+        body_file="$2"
+        shift 2
+        ;;
+      --max-bytes|--lock-timeout-ms)
+        # v1 tuning knobs with no meaning in v2: the daemon owns pacing.
+        [[ $# -ge 2 ]] || usage_die "'send $1' requires a value"
+        echo "note: send $1 is ignored; the cyclops daemon owns delivery pacing" >&2
+        shift 2
+        ;;
+      --verify)
+        [[ $# -ge 2 ]] || usage_die "'send --verify' requires a value"
+        if [[ "$2" != "marker-hash" ]]; then
+          usage_die "send --verify $2 has no cyclops equivalent; composer verification is daemon-side and always on"
+        fi
+        echo "note: send --verify marker-hash is ignored; cyclops verifies every delivery daemon-side" >&2
+        shift 2
+        ;;
+      --no-submit)
+        usage_die "send --no-submit has no cyclops equivalent; cyclops always gates, verifies, and submits, or reports why not"
+        ;;
+      --allow-label|--expect-label)
+        usage_die "send $1 has no cyclops equivalent; the ACL lives in the daemon now"
+        ;;
+      *)
+        usage_die "unknown send option: $1"
+        ;;
+    esac
+  done
+
+  if [[ "$have_subject" != true || -z "$subject" || "$subject" == *$'\n'* || "$subject" == *$'\r'* ]]; then
+    usage_die "subject must be one non-empty line"
+  fi
+  if [[ -z "$body_file" ]]; then
+    usage_die "send requires --body-file (v1 always passed --body-file -)"
+  fi
+
+  local -a args=(send "$target" --subject "$subject" --body-file "$body_file")
+  if [[ "$json" == true ]]; then
+    args+=(--json)
+  fi
+  if [[ "$body_file" == "-" ]]; then
+    # v1 buffered stdin through $(cat): trailing newlines were stripped
+    # and an empty body was refused. Keep both behaviors.
+    local body
+    body=$(cat)
+    if [[ -z "$body" ]]; then
+      usage_die "body must not be empty"
+    fi
+    printf '%s' "$body" | "$CYCLOPS_BIN" "${args[@]}"
+  else
+    "$CYCLOPS_BIN" "${args[@]}"
+  fi
+}
+
+cmd_read() {
+  if [[ $# -lt 1 ]]; then
+    usage_die "'read' requires at least 1 argument(s). Run 'commPact' for usage."
+  fi
+  local target="$1" lines="${2:-50}"
+  if [[ ! "$lines" =~ ^[0-9]+$ ]]; then
+    usage_die "lines must be a number"
+  fi
+  # v1 captured the last N lines including scrollback (-J -S -N); the
+  # recent source is the cyclops equivalent.
+  exec "$CYCLOPS_BIN" read "$target" --source recent --lines "$lines"
+}
+
+cmd_list() {
+  exec "$CYCLOPS_BIN" status
+}
+
+cmd_resolve() {
+  if [[ $# -lt 1 ]]; then
+    usage_die "'resolve' requires at least 1 argument(s). Run 'commPact' for usage."
+  fi
+  local out pane
+  out=$("$CYCLOPS_BIN" read "$1" --lines 1 --json)
+  pane=$(printf '%s' "$out" | sed -n 's/.*"pane_id":"\([^"]*\)".*/\1/p' | head -1)
+  if [[ -z "$pane" ]]; then
+    die "could not resolve '$1' (no pane_id in the daemon answer)"
+  fi
+  printf '%s\n' "$pane"
+}
+
+cmd_doctor() {
+  echo "commPact shim doctor (v1 surface, cyclops transport)"
+  echo "shim:    ${BASH_SOURCE[0]}"
+  echo "cyclops: $CYCLOPS_BIN"
+  echo "---"
+  "$CYCLOPS_BIN" ping
+  "$CYCLOPS_BIN" status
+}
+
+# --- Main ---
+
+main() {
+  if [[ $# -eq 0 ]]; then
+    usage
+  fi
+  case "$1" in
+    -h|--help|help) usage ;;
+    version)
+      note_deprecation
+      echo "commPact $SHIM_VERSION (cyclops shim)"
+      exit 0
+      ;;
+    id)
+      note_deprecation
+      shift
+      cmd_id "$@"
+      exit 0
+      ;;
+    hash)
+      note_deprecation
+      shift
+      cmd_hash "$@"
+      exit 0
+      ;;
+  esac
+
+  note_deprecation
+  case "$1" in
+    type)
+      unshimmed type "cyclops never raw-types into a pane. Send a structured message instead: cyclops send <target> --subject '...' --body '...'"
+      ;;
+    keys)
+      unshimmed keys "raw key injection has no cyclops equivalent. If a pane truly needs manual keys, ask the admin to type them."
+      ;;
+    message|msg)
+      unshimmed message "use 'commPact send' (or cyclops send); the daemon builds the sender header itself"
+      ;;
+    name)
+      unshimmed name "pane adoption has no cyclops CLI verb yet (the daemon method pane.label exists). Ask the admin to label panes."
+      ;;
+  esac
+
+  require_cyclops
+  case "$1" in
+    send)    shift; cmd_send "$@" ;;
+    read)    shift; cmd_read "$@" ;;
+    list)    shift; cmd_list "$@" ;;
+    resolve) shift; cmd_resolve "$@" ;;
+    doctor)  shift; cmd_doctor "$@" ;;
+    *)       usage_die "unknown command: $1. Run 'commPact' for usage." ;;
+  esac
+}
+
+main "$@"

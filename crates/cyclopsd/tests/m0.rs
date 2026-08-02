@@ -269,14 +269,15 @@ async fn m0_shadow_daemon_end_to_end() {
     assert_eq!(resp["result"]["pong"], true);
 
     // msg.send and agent.state.report are implemented since M1; empty
-    // params are a parse error. The M2 query methods name their milestone.
+    // params are a parse error. msg.history is implemented since M2 and
+    // answers an unfiltered query with the (empty so far) record.
     let resp = c.request("msg.send", json!({})).await;
     assert_eq!(resp["error"]["code"], "bad_request");
     let resp = c.request("agent.state.report", json!({})).await;
     assert_eq!(resp["error"]["code"], "bad_request");
     let resp = c.request("msg.history", json!({})).await;
-    assert_eq!(resp["error"]["code"], "unimplemented");
-    assert_eq!(resp["error"]["message"], "coming in M2");
+    assert!(resp["error"].is_null(), "{resp}");
+    assert_eq!(resp["result"]["lines"], json!([]));
 
     // Status: attached, one bash pane bound to the fixture manifest, state
     // working (default title matches nothing; only the screen tier fires).
@@ -360,6 +361,25 @@ async fn m0_shadow_daemon_end_to_end() {
     assert_eq!(readings[0]["rule"], "title_idle");
     assert_eq!(readings[1]["sensor"], "screen");
     assert_eq!(readings[1]["rule"], "screen_busy");
+
+    // pane.read resolves adoption labels too, like every verb that
+    // promises "label or pane id" (the v1 shim maps `read <label>` here).
+    let resp = c
+        .request("pane.label", json!({"target": pane_id, "label": "fixture"}))
+        .await;
+    assert!(resp["error"].is_null(), "{resp}");
+    let resp = c
+        .request(
+            "pane.read",
+            json!({"target": "fixture", "source": "visible"}),
+        )
+        .await;
+    assert!(resp["error"].is_null(), "{resp}");
+    let text = resp["result"]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.lines().any(|l| l.trim() == "cyclops-M0-marker"),
+        "label-resolved read missed the pane text: {resp}"
+    );
 
     // Unknown target answers no_such_target and names known panes.
     let resp = c.request("pane.read", json!({"target": "ghost"})).await;

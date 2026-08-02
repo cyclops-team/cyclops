@@ -13,7 +13,7 @@ use anyhow::Context as _;
 use cyclops_proto::{
     AdminNotifyParams, AgentWaitParams, Event, Hello, MsgSendParams, PaneReadParams,
     PaneReadResult, PaneReadSource, PingResult, Request, Response, SessionStatus,
-    StateReportParams, StatusResult, SubscribeParams, PROTOCOL_VERSION,
+    StateReportParams, StatusResult, SubscribeParams, WireError, PROTOCOL_VERSION,
 };
 use cyclops_tmux::SessionWatcher;
 use serde_json::{json, Value};
@@ -38,12 +38,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_RECENT_LINES: u32 = 200;
 
 /// Protocol v1 methods that exist but land in a later milestone. One list,
-/// so M2 replaces entries here instead of hunting through dispatch.
-const UNIMPLEMENTED: &[(&str, &str)] = &[
-    // The ledger already records everything these will read.
-    ("msg.history", "M2"),
-    ("msg.thread", "M2"),
-];
+/// so a new milestone replaces entries here instead of hunting through
+/// dispatch. Empty as of M2 (msg.history/msg.thread landed).
+const UNIMPLEMENTED: &[(&str, &str)] = &[];
 
 /// Bind the daemon socket under `home`, creating the directory 0700.
 ///
@@ -224,6 +221,9 @@ async fn handle_line(
     }
 }
 
+// The Err arm is a cold path (malformed client line) and the Response is
+// written out immediately; boxing it would only add ceremony.
+#[allow(clippy::result_large_err)]
 fn parse_request(line: &str) -> Result<Request, Response> {
     serde_json::from_str::<Request>(line).map_err(|e| {
         Response::err(
@@ -267,6 +267,51 @@ pub(crate) async fn dispatch(
         }
         "pane.read" => (pane_read(inner, id, req.params).await, None),
         "msg.send" => (msg_send(inner, id, req.params, peer).await, None),
+        "msg.history" => {
+            // cursor2 travels outside the HistoryParams struct (wire-additive;
+            // the struct is shared with clients that predate the field).
+            let cursor2 = match req.params.get("cursor2") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => {
+                    return (
+                        Response::err(id, "bad_request", "cursor2 must be a string"),
+                        None,
+                    )
+                }
+            };
+            let params: cyclops_proto::HistoryParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => {
+                    return (
+                        Response::err(id, "bad_request", format!("bad msg.history params: {e}")),
+                        None,
+                    )
+                }
+            };
+            (
+                from_result(
+                    id,
+                    crate::history::msg_history(inner, params, cursor2, peer),
+                ),
+                None,
+            )
+        }
+        "msg.thread" => {
+            let params: cyclops_proto::ThreadParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => {
+                    return (
+                        Response::err(id, "bad_request", format!("bad msg.thread params: {e}")),
+                        None,
+                    )
+                }
+            };
+            (
+                from_result(id, crate::history::msg_thread(inner, &params.id)),
+                None,
+            )
+        }
         "agent.state.report" => {
             let params: StateReportParams = match serde_json::from_value(req.params) {
                 Ok(p) => p,
@@ -277,6 +322,20 @@ pub(crate) async fn dispatch(
                     )
                 }
             };
+            // Hook reports feed liveness and tier-1 ACK evidence, so a
+            // forged one lets the record lie. The socket path is pinned to
+            // the reporting pane exactly like msg.send pins senders; only
+            // the in-process Daemon::report_state path is pre-trusted.
+            if let Err(e) = verify_report_origin(inner, peer, &params.agent) {
+                return (
+                    Response {
+                        id,
+                        result: None,
+                        error: Some(e),
+                    },
+                    None,
+                );
+            }
             (
                 from_result(id, ack::handle_report(inner, params).await),
                 None,
@@ -334,6 +393,42 @@ pub(crate) async fn dispatch(
             let label = req.params["label"].as_str().map(str::to_string);
             (
                 from_result(id, crate::label_pane(inner, &target, label)),
+                None,
+            )
+        }
+        "hooks.verify" => {
+            let params: cyclops_proto::HooksVerifyParams = match serde_json::from_value(req.params)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    return (
+                        Response::err(id, "bad_request", format!("bad hooks.verify params: {e}")),
+                        None,
+                    )
+                }
+            };
+            (
+                from_result(id, crate::selftest::verify(inner, params).await),
+                None,
+            )
+        }
+        "hooks.selftest" => {
+            let params: cyclops_proto::HooksSelftestParams =
+                match serde_json::from_value(req.params) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return (
+                            Response::err(
+                                id,
+                                "bad_request",
+                                format!("bad hooks.selftest params: {e}"),
+                            ),
+                            None,
+                        )
+                    }
+                };
+            (
+                from_result(id, crate::selftest::selftest(inner, params).await),
                 None,
             )
         }
@@ -413,8 +508,8 @@ async fn msg_send(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> R
 }
 
 /// (pane_id, label, pane_pid) rows for sender resolution, across every
-/// attached session.
-fn sender_panes(inner: &Inner) -> Vec<(String, Option<String>, i32)> {
+/// attached session. Shared with msg.history's "me" resolution.
+pub(crate) fn sender_panes(inner: &Inner) -> Vec<(String, Option<String>, i32)> {
     let labels = inner.labels.lock().expect("labels lock");
     inner
         .sessions
@@ -431,6 +526,75 @@ fn sender_panes(inner: &Inner) -> Vec<(String, Option<String>, i32)> {
             (row.pane_id, label, row.pane_pid)
         })
         .collect()
+}
+
+/// (pane_id, label, pane_pid) rows for hook-report origin resolution:
+/// every live pane plus, for DETACHED sessions, the last-known pane table.
+/// A hook report does not need the tmux connection (the pane and its
+/// process tree outlive a control-mode outage), so the reporter's ancestry
+/// must still be resolvable while the daemon is detached.
+fn report_panes(inner: &Inner) -> Vec<(String, Option<String>, i32)> {
+    let mut rows = sender_panes(inner);
+    let labels = inner.labels.lock().expect("labels lock");
+    for slot in &inner.sessions {
+        if slot.link.lock().expect("session link lock").attached {
+            continue;
+        }
+        let last = slot.last_panes.lock().expect("last panes lock");
+        for row in last.values() {
+            if rows.iter().any(|(id, _, _)| id == &row.pane_id) {
+                continue;
+            }
+            rows.push((
+                row.pane_id.clone(),
+                labels.get(&row.pane_id).cloned(),
+                row.pane_pid,
+            ));
+        }
+    }
+    rows
+}
+
+/// Fail-closed origin check for agent.state.report over the socket: the
+/// peer's process ancestry must land in the very pane `agent` names (its
+/// label or its pane id). Honest reports pass by construction, because
+/// `cyclops hook` runs as a child of the vendor CLI inside the pane.
+/// Everything else is denied and NOT ingested: a same-uid process outside
+/// the pane (the admin shell included) could otherwise forge hook liveness
+/// and tier-1 ACK evidence, and the record must never lie.
+fn verify_report_origin(inner: &Inner, peer: Peer, agent: &str) -> Result<(), WireError> {
+    let deny = |message: String| WireError {
+        code: "denied".to_string(),
+        message,
+        data: None,
+    };
+    let Some((uid, pid)) = peer else {
+        return Err(deny("peer credentials unavailable".to_string()));
+    };
+    let daemon_uid = unsafe { libc::getuid() };
+    if uid != daemon_uid {
+        return Err(deny(format!("uid {uid} is not the daemon's user")));
+    }
+    let panes = report_panes(inner);
+    let allowed = match identity::resolve_sender(uid, pid, &panes) {
+        identity::Sender::Agent(label) => {
+            // The report may name the pane by label or by pane id.
+            agent == label
+                || panes
+                    .iter()
+                    .any(|(pane_id, l, _)| l.as_deref() == Some(label.as_str()) && pane_id == agent)
+        }
+        identity::Sender::Pane(pane_id) => agent == pane_id,
+        identity::Sender::Admin => false,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(deny(format!(
+            "hook reports for {agent:?} are only accepted from a process inside that pane; \
+             this peer is not (admin cannot post hook reports)"
+        )))
+    }
 }
 
 /// Assemble StatusResult from the session slots and the detection cache.
@@ -454,13 +618,25 @@ pub(crate) fn status_result(inner: &Inner) -> StatusResult {
                     .iter()
                     .map(|r| {
                         let entry = detections.get(&r.pane_id);
-                        r.to_status(
+                        let mut ps = r.to_status(
                             labels.get(&r.pane_id).cloned(),
                             entry.and_then(|e| e.manifest.clone()),
                             entry
                                 .map(|e| e.detection.state)
                                 .unwrap_or(cyclops_proto::AgentState::Unknown),
-                        )
+                        );
+                        // Hook liveness (amendment c): adopted panes whose
+                        // manifest declares hooks carry the verified bit,
+                        // scoped to the current occupant (edges from a
+                        // replaced occupant count for nothing).
+                        ps.hooks_verified = crate::selftest::hooks_verified_for(
+                            inner,
+                            &r.pane_id,
+                            labels.contains_key(&r.pane_id),
+                            entry.and_then(|e| e.manifest.as_deref()),
+                            r.pane_pid,
+                        );
+                        ps
                     })
                     .collect(),
             }
@@ -556,14 +732,17 @@ fn cap_lines(text: String, cap: Option<u32>) -> String {
     }
 }
 
-/// Find the watcher owning a pane id. The session link lock is dropped
-/// before any await; only the Arc leaves the closure.
+/// Find the watcher owning a target: adoption label first, then pane id,
+/// same resolution order as every other verb (the CLI promises "label or
+/// pane id" everywhere). The session link lock is dropped before any
+/// await; only the Arc leaves the closure.
 fn resolve_target(inner: &Inner, target: &str) -> Option<(Arc<SessionWatcher>, String)> {
+    let wanted = inner.label_target(target);
     inner.sessions.iter().find_map(|slot| {
         let link = slot.link.lock().expect("session link lock");
         link.watcher
             .as_ref()
-            .and_then(|w| w.pane(target).map(|row| (Arc::clone(w), row.pane_id)))
+            .and_then(|w| w.pane(&wanted).map(|row| (Arc::clone(w), row.pane_id)))
     })
 }
 
@@ -624,6 +803,7 @@ mod tests {
             argv_cache: StdMutex::new(HashMap::new()),
             engine: crate::delivery::Engine::new(),
             ack_state: crate::ack::AckState::new(),
+            hook_liveness: crate::selftest::HookLiveness::new(),
             inject_pause: StdMutex::new(None),
         })
     }
@@ -657,6 +837,8 @@ mod tests {
             "pane.label",
             "events.subscribe",
             "admin.notify",
+            "hooks.verify",
+            "hooks.selftest",
         ];
         for method in v1 {
             let (resp, _) = dispatch(&inner, req(method), own_peer()).await;
@@ -679,6 +861,45 @@ mod tests {
         }
     }
 
+    /// msg.history is implemented from M2: an empty daemon answers with an
+    /// empty page, and "me" filters stay fail-closed without credentials.
+    #[tokio::test]
+    async fn msg_history_answers_and_me_fails_closed() {
+        let inner = bare_inner();
+        let (resp, _) = dispatch(&inner, req("msg.history"), own_peer()).await;
+        let result = resp.result.expect("history answers");
+        assert_eq!(result["lines"], json!([]));
+        assert!(result.get("next_cursor").is_none());
+
+        let (resp, _) = dispatch(
+            &inner,
+            Request {
+                id: json!(2),
+                method: "msg.history".into(),
+                params: json!({"to": "me"}),
+            },
+            None,
+        )
+        .await;
+        assert_eq!(resp.error.unwrap().code, "denied");
+    }
+
+    #[tokio::test]
+    async fn msg_thread_unknown_id_is_a_named_error() {
+        let inner = bare_inner();
+        let (resp, _) = dispatch(
+            &inner,
+            Request {
+                id: json!(3),
+                method: "msg.thread".into(),
+                params: json!({"id": "m-nope00"}),
+            },
+            own_peer(),
+        )
+        .await;
+        assert_eq!(resp.error.unwrap().code, "no_such_message");
+    }
+
     #[tokio::test]
     async fn msg_send_fails_closed_without_peer_credentials() {
         let inner = bare_inner();
@@ -688,6 +909,39 @@ mod tests {
                 id: json!(9),
                 method: "msg.send".into(),
                 params: json!({"to": ["reviewer"], "subject": "hi"}),
+            },
+            None,
+        )
+        .await;
+        assert_eq!(resp.error.unwrap().code, "denied");
+    }
+
+    /// agent.state.report over the socket is pinned to the reporting pane:
+    /// a same-uid peer outside every watched pane (this test process) is
+    /// the admin, and admin cannot post hook reports. No credentials at
+    /// all fails the same way.
+    #[tokio::test]
+    async fn state_report_over_socket_is_denied_outside_the_pane() {
+        let inner = bare_inner();
+        let params = json!({"agent": "reviewer", "event": "Stop"});
+        let (resp, _) = dispatch(
+            &inner,
+            Request {
+                id: json!(4),
+                method: "agent.state.report".into(),
+                params: params.clone(),
+            },
+            own_peer(),
+        )
+        .await;
+        assert_eq!(resp.error.unwrap().code, "denied");
+
+        let (resp, _) = dispatch(
+            &inner,
+            Request {
+                id: json!(5),
+                method: "agent.state.report".into(),
+                params,
             },
             None,
         )

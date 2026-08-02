@@ -5,6 +5,141 @@ versions are unreleased until admin cuts a tag.
 
 ## [Unreleased]
 
+### Added (M2: messaging read side, history + thread)
+
+- Daemon msg.history: filter the message record (with = from-or-to,
+  from/to one direction each, limit, cursor), newest last, returning
+  {lines, next_cursor}. Lines are the ledger's msg/fyi facts with their
+  delivery chains folded in at read time: one msg fact, N current badges;
+  the files are never rewritten. Cross-session broadcasts dedupe to one
+  fact with each hosting file's chain. Reading is free (any same-uid
+  caller may query the whole record) and reading never writes; the name
+  "me" in any filter resolves through the caller's identity envelope with
+  the same fail-closed peer-credential walk msg.send uses. Reader is
+  cyclops-ledger's existing read_after full scan; no indexed reader was
+  added (a 10k-line ledger parses in single-digit ms, no measured need).
+- Daemon msg.thread: id -> the folded msg line, every state/gate line
+  sharing the id (cross-file duplicates collapse), and every msg whose
+  reply_to chains to it, transitively, ordered oldest first. Unknown ids
+  answer no_such_message, not an empty page.
+- cyclops history [--with X | --from X --to Y | --to me] [--limit N]
+  [--cursor S] and cyclops thread <id>: strict-grid rendering with a
+  timestamp gutter (relative under 24h, UTC date beyond), role-colored
+  from -> to, a distinct fyi column, and per-delivery badges in the M1
+  receipt voice (broadcasts hang N badges under one fact line; thread
+  adds bodies). --json passes the raw folded lines through; empty states
+  invite the next send.
+- Tests: 12 daemon unit tests over a checked-in fixture ledger covering
+  every line kind (tests/fixtures/history.ndjson), 6 CLI e2e tests
+  against the canned daemon, and an integration test (m2_history.rs)
+  where two fixture panes exchange real messages through the daemon and
+  history --with reconstructs the conversation, including the
+  one-fact-N-badges broadcast read, me-resolution over the socket,
+  gapless cursor walk, thread chain order, and a reboot replay.
+- Docs: docs/history.md; README history/thread rows.
+
+### Added (M2: agent.wait, server-owned, plus send-and-wait)
+
+- agent.wait rebuilt as a server-owned wait with occupant pinning:
+  (pane_id, pane_pid) recorded at wait start; the pane vanishing, dying,
+  or changing root pid resolves a wire error occupant_changed instead of a
+  false success. Timeout is now a wire error too (code timeout), and both
+  errors carry {state, waited_ms, target, until} in the new optional
+  WireError.data field (additive; old clients ignore it). done tightened
+  to the working -> idle edge: the current or next turn ending satisfies
+  it; a blocked state mid-turn keeps waiting instead of passing as done.
+  Waits are event-driven off the fusion broadcast plus the watcher stream;
+  the deadline is the only timer.
+- msg.send send-and-wait entries now carry {outcome, state, waited_ms,
+  delivery} per recipient (outcome: reached | timeout | occupant_changed |
+  not_delivered), replacing the boolean timed_out shape.
+- cyclops wait <target> --until idle|done|blocked [--timeout 60s]: human
+  durations (90s, 2m, 1m30s, 500ms; max 10m), badge output on reached,
+  exit 0 reached / 2 timeout / 3 occupant changed. cyclops send gained
+  --wait idle|done|blocked with --timeout passthrough and a wait line
+  under the receipt.
+- F23 (findings.md): tmux evaluates format subscriptions on a 1Hz tick;
+  a title state that appears and disappears within the same second never
+  produces %subscription-changed, so the title sensor's resolution is one
+  second. m2_wait fixtures hold driven states across the tick.
+- Tests: 6 fixture-pane integration tests (m2_wait.rs) covering each until
+  mode including both done edges, timeout data, kill-pane occupant
+  pinning, and a send --wait done round trip; 6 CLI e2e tests for badges,
+  copy, exit codes, --json error objects, and the --wait passthrough.
+- Docs: docs/wait.md; send.md --wait section; README wait row.
+
+### Added (M2: hooks install + startup self-test, amendment c)
+
+- Hook config templates under hooks/<cli>/ with the measured vendor
+  schemas: claude settings fragment (UserPromptSubmit, Stop, Notification,
+  PermissionRequest), codex hooks.json (PascalCase; no Notification event
+  exists on codex), agy .agents/hooks.json (named-hooks schema, every
+  event registered with a distinct self-tagging command, F7). Templates
+  carry {label}/{cyclops_bin} placeholders and comment headers naming the
+  trust caveats; comments are stripped at render.
+- cyclops hooks install <cli> --agent <label> [--dry-run] [--dest <dir>]:
+  renders to $CYCLOPS_HOME/hooks/<label>/ and prints copy-pasteable wiring
+  instructions (claude --settings path; codex CODEX_HOME copy or the
+  config.toml trust seed line, printed not applied, F1; agy .agents
+  placement). Refuses vendor dot-dirs (.claude/.codex/.gemini/.agents)
+  even via --dest.
+- Daemon hook liveness (per adopted pane whose manifest declares hooks):
+  every agent.state.report records a per-event last-seen edge. PaneStatus
+  gained additive optional hooks_verified (skip-serialized None; old
+  daemons omit it, old clients ignore it); cyclops status renders
+  "hooks unverified". New socket verbs hooks.verify (tier plus last-seen
+  edge ages) and hooks.selftest (one fyi marker through the normal
+  delivery pipeline, subject "[cyclops] hook self-test", reporting whether
+  the ack hook fired with the marker; costs one trivial turn; result is a
+  ledger system line).
+- F1 downgrade visibility: the first delivery that times out its tier-1
+  ack window on a pane with zero hook edges ever seen emits one
+  admin.notify action_required naming the likely cause (codex directory
+  trust); the delivery itself resolves on screen evidence as before.
+- Tests: template golden files, install e2e (dry-run, default dest, vendor
+  dot-dir refusal, json mode), selftest integration with a simulated hook
+  edge, and the F1 regression shape (zero-edge tier-1 pane downgrades
+  cleanly, notifies once, loses nothing).
+
+### Added (M2: commPact v1 cutover prep; prepared, never installed)
+
+- scripts/commpact-shim/commPact: the v1 calling surface served by
+  cyclops. send/read/list/resolve/doctor forward to the cyclops CLI,
+  id/hash/version stay local with v1 behavior, verbs with no v2
+  equivalent (type, keys, message, name) refuse honestly with exit 2,
+  and a one-line deprecation note prints to stderr once per day per user
+  via a stamp under $CYCLOPS_HOME.
+- scripts/commpact-shim/install.sh: the guarded installer only the admin
+  runs: refuses without CYCLOPS_CUTOVER_ACK=yes, moves the v1 binary to
+  commPact.v1.bak (the backup IS the original), symlinks the shim, prints
+  rollback, refuses on existing backups or foreign symlinks. Nothing in
+  the repo executes it.
+- docs/CUTOVER.md: the runbook: verb map, honest differences,
+  preconditions, admin-only install steps, parallel window, verification
+  checklist over the COORDINATION.md messaging patterns, and rollback;
+  ends in ADMIN_ACTION_REQUIRED.
+- scripts/commpact-shim/test_shim.py: 42 checks running the shim against
+  a canned daemon on a sandbox socket, asserting verb mapping, refusals
+  never reaching the daemon, stamp behavior, installer guards, and that
+  the real ~/.commPact stays untouched. Python, outside cargo test; run
+  python3 scripts/commpact-shim/test_shim.py.
+
+### Added (M2: integration)
+
+- demos/m2-conversation.sh: the whole M2 surface in one isolated rig: two
+  fixture panes acting like hook-wired CLIs (acks travel through the real
+  cyclops hook receiver), a send whose identity resolves from the sending
+  pane, a --reply-to reply, a broadcast fyi, history --with and thread
+  reconstructing the conversation, wait --until idle, hooks verify, hooks
+  selftest, and jq over the session ledger.
+
+### Fixed (M2)
+
+- pane.read resolved strict pane ids only: cyclops read <label> answered
+  no_such_target while the CLI promised "label or pane id", and the v1
+  shim maps commPact read <label> onto exactly that call. The resolver
+  now goes through the adoption registry first, like every other verb.
+
 ### Added (M1: delivery pipeline)
 
 - cyclopsd delivery core per docs/DELIVERY.md: per-recipient FIFO workers,

@@ -20,7 +20,9 @@ mod ack;
 pub mod config;
 mod delivery;
 mod fusion;
+mod history;
 pub mod identity;
+mod selftest;
 mod server;
 
 pub use config::Config;
@@ -95,6 +97,9 @@ pub(crate) struct Inner {
     pub(crate) engine: delivery::Engine,
     /// Hook report dedupe state.
     pub(crate) ack_state: ack::AckState,
+    /// Per-pane hook edge record behind hooks_verified, hooks.verify, and
+    /// the F1 downgrade notification (amendment c).
+    pub(crate) hook_liveness: selftest::HookLiveness,
     /// Test-only injection pause, see [`InjectPause`].
     pub(crate) inject_pause: StdMutex<Option<InjectPause>>,
 }
@@ -337,9 +342,30 @@ impl Daemon {
         delivery::msg_send(&self.inner, from, params).await
     }
 
-    /// In-process agent.state.report (the hook receiver posts this).
+    /// In-process agent.state.report with a pre-trusted origin, mirroring
+    /// [`Daemon::msg_send`]'s design: embedders and tests call this
+    /// directly. The SOCKET path instead pins every report to the
+    /// reporting pane via peer credentials and denies everything else,
+    /// because hook reports are liveness and ACK evidence.
     pub async fn report_state(&self, params: StateReportParams) -> Result<Value, WireError> {
         ack::handle_report(&self.inner, params).await
+    }
+
+    /// In-process hooks.verify: hook liveness for one target pane.
+    pub async fn hooks_verify(
+        &self,
+        params: cyclops_proto::HooksVerifyParams,
+    ) -> Result<Value, WireError> {
+        selftest::verify(&self.inner, params).await
+    }
+
+    /// In-process hooks.selftest: one fyi marker through the delivery
+    /// pipeline, reporting whether the ACK hook fired with it.
+    pub async fn hooks_selftest(
+        &self,
+        params: cyclops_proto::HooksSelftestParams,
+    ) -> Result<Value, WireError> {
+        selftest::selftest(&self.inner, params).await
     }
 
     /// In-process admin.notify.
@@ -392,6 +418,7 @@ pub(crate) fn label_pane(
         return Err(WireError {
             code: "no_such_target".to_string(),
             message: format!("no such target {target:?}"),
+            data: None,
         });
     };
     let label = label.filter(|l| !l.is_empty());
@@ -400,6 +427,7 @@ pub(crate) fn label_pane(
             return Err(WireError {
                 code: "bad_request".to_string(),
                 message: format!("label {l:?} is reserved"),
+                data: None,
             });
         }
         let labels = inner.labels.lock().expect("labels lock");
@@ -410,6 +438,7 @@ pub(crate) fn label_pane(
             return Err(WireError {
                 code: "bad_request".to_string(),
                 message: format!("label {l:?} is already taken"),
+                data: None,
             });
         }
     }
@@ -519,6 +548,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         argv_cache: StdMutex::new(HashMap::new()),
         engine,
         ack_state: ack::AckState::new(),
+        hook_liveness: selftest::HookLiveness::new(),
         inject_pause: StdMutex::new(None),
     });
 
@@ -806,6 +836,7 @@ async fn handle_pane_event(
                 .lock()
                 .expect("argv cache lock")
                 .retain(|(pane, _), _| pane != &id);
+            inner.hook_liveness.forget(&id);
             false
         }
         PaneEvent::PaneChanged { id, changed, .. } => {
