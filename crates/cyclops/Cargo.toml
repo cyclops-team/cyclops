@@ -1,0 +1,11 @@
+[package]
+name = "cyclops"
+version.workspace = true
+edition.workspace = true
+description = "The Cyclops CLI: thin NDJSON client over the daemon socket."
+
+[dependencies]
+cyclops-proto.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true

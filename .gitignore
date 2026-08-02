@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+.DS_Store
+/tests/harness/__pycache__/
+/tests/raw/
+*.ndjson.tmp

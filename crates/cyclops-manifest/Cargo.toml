@@ -1,0 +1,13 @@
+[package]
+name = "cyclops-manifest"
+version.workspace = true
+edition.workspace = true
+description = "Per-CLI detection manifests: schema, loading, and rule evaluation. Data, not code, drives detection."
+
+[dependencies]
+cyclops-proto.workspace = true
+serde.workspace = true
+toml.workspace = true
+regex.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

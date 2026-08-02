@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install tmux
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y tmux; else brew install tmux; fi
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  # ADR-001 owns the tmux-churn risk by testing the adapter against tmux HEAD.
+  # Failures here are early warning, not merge blockers.
+  tmux-head:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build tmux from master
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libevent-dev ncurses-dev build-essential bison pkg-config autoconf automake
+          git clone --depth 1 https://github.com/tmux/tmux.git /tmp/tmux-head
+          cd /tmp/tmux-head && sh autogen.sh && ./configure && make -j
+          sudo make install
+          tmux -V
+      - run: cargo test --workspace

@@ -1,0 +1,124 @@
+# Cyclops detection manifest: OpenAI Codex CLI
+# Derived from MEASURED evidence in validation/raw/p0 and validation/raw/soak.
+# Verified against codex-cli 0.145.0 inside tmux 3.6a, 120x40 pane.
+#
+# Sensor summary for this CLI:
+#   title  USELESS. #{pane_title} is the static project directory name in
+#          220/220 samples taken during active turns. There is no title tier
+#          for Codex, unlike Claude. This asymmetry is why the fusion layer
+#          must be per-agent data, not one fleet-wide ladder.
+#   hooks  AUTHORITATIVE for turn edges and ACK, but see [hooks].gating below:
+#          project-local hooks silently do not load in an untrusted directory.
+#   screen REQUIRED for busy/idle, since the title carries nothing.
+
+[agent]
+id = "codex"
+display_name = "Codex CLI"
+version_tested = "0.145.0"
+process_names = ["codex"]
+
+[hooks]
+# Event names are PascalCase in hooks.json, snake_case internally.
+config_mechanism = "hooks.json in CODEX_HOME or <repo>/.codex/"
+turn_start = "UserPromptSubmit"
+turn_end = "Stop"
+ack = "UserPromptSubmit"
+available = [
+  "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "PreToolUse",
+  "PostToolUse", "PermissionRequest", "PreCompact", "PostCompact",
+  "SubagentStart", "SubagentStop",
+]
+ack_payload_field = "prompt"
+ack_latency_ms_p50 = 30.4
+ack_latency_ms_p95 = 34.8
+legacy_notify = "agent-turn-complete"   # notify program; payload has last-assistant-message, no cwd
+
+gating = """CRITICAL DEPLOYMENT FACT, MEASURED. Project-local .codex/hooks.json does
+NOT load until the working directory is trusted. The trust decision is an
+interactive dialog ('Do you trust the contents of this directory?'). In
+non-interactive `codex exec` the dialog cannot be answered, so hooks silently
+never fire and every turn looks unacknowledged. --dangerously-bypass-hook-trust
+does NOT solve this: it bypasses hook-definition trust, not directory trust.
+Working configuration: put hooks in a CODEX_HOME-scoped user-level hooks.json,
+or pre-seed projects."<path>".trust_level = "trusted" in config.toml.
+Evidence: 4 consecutive exec runs fired zero hooks until CODEX_HOME was used."""
+
+duplicate_warning = """User-level and project-level hooks BOTH load and BOTH fire
+when the directory is trusted, producing duplicate events for the same edge.
+The daemon must dedupe on (session_id, turn_id)."""
+
+# ---------------------------------------------------------------------------
+# Screen rules. No title tier exists for this CLI.
+# ---------------------------------------------------------------------------
+
+[[rule]]
+id = "composer_empty_or_ghost"
+state = "idle"
+priority = 1000
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^\s*›']
+note = """The composer line renders ghost-text suggestions such as
+'› Write tests for @filename' when empty. Ghost text is NOT staged user input.
+This is the same trap cyclops v1 hardcoded an allowlist for (bin/commPact:678-683);
+matching the glyph rather than emptiness avoids needing that allowlist."""
+evidence = "MEASURED: observed live during soak startup"
+
+[[rule]]
+id = "screen_working"
+state = "working"
+priority = 800
+region = "bottom_non_empty_lines(8)"
+any = [
+  { contains = ["Esc to interrupt"] },
+  { contains = ["Working"] },
+  { contains = ["Thinking"] },
+]
+evidence = "MEASURED during soak turns"
+
+[[rule]]
+id = "trust_dialog"
+state = "blocked_modal"
+priority = 1300
+region = "bottom_non_empty_lines(14)"
+contains = ["Do you trust the contents of this directory"]
+note = "Blocks all hook loading until answered. Options: 1 = Yes, 2 = No/quit."
+evidence = "MEASURED p0_ack_codex first launch"
+# Trust is a security decision the daemon never makes on its own.
+auto_dismiss = false
+
+[[rule]]
+id = "update_dialog"
+state = "blocked_modal"
+priority = 1300
+region = "bottom_non_empty_lines(14)"
+contains = ["Update available"]
+note = """HIGHEST-SEVERITY INJECTION HAZARD FOUND IN THIS CAMPAIGN. The dialog reads
+'Press enter to continue' with option 1 preselected as
+'Update now (runs `brew upgrade --cask codex`)'. A blind Enter from a delivery
+pipeline triggers a package upgrade of the agent binary mid-session. Decline
+explicitly with '3' (Skip until next version), never Escape-then-Enter and never
+a bare Enter."""
+evidence = "MEASURED live during soak startup, validation/raw/soak/codex_modals.log"
+decline_keys = ["3", "Enter"]
+auto_dismiss = true
+
+[[rule]]
+id = "approval_prompt"
+state = "blocked_permission"
+priority = 1200
+region = "bottom_non_empty_lines(12)"
+any = [
+  { contains = ["Allow command"] },
+  { line_regex = ['^\s*›?\s*1\.\s+Yes'] },
+]
+evidence = "INFERRED from approval_policy=untrusted config surface; not reproduced in the measured window"
+# An approval decision belongs to the human. Park the delivery and alert.
+auto_dismiss = false
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>", "Pasted"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

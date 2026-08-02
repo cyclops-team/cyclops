@@ -1,0 +1,10 @@
+[package]
+name = "cyclops-proto"
+version.workspace = true
+edition.workspace = true
+description = "Wire protocol and ledger schema for Cyclops. Data types only, no IO."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

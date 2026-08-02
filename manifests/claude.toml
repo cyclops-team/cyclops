@@ -1,0 +1,133 @@
+# Cyclops detection manifest: Claude Code
+# Derived from MEASURED evidence in validation/raw/p0 and validation/raw/soak.
+# Verified against Claude Code 2.1.220 running inside tmux 3.6a, 120x40 pane.
+#
+# Sensor summary for this CLI:
+#   title  AUTHORITATIVE for busy/idle. Tracks hooks within 30-80 ms, below the
+#          100 ms sample interval used to measure it (claude_busy_titles.json).
+#   hooks  AUTHORITATIVE for turn edges and the delivery ACK. UserPromptSubmit
+#          fires 21-28 ms after Enter for paste-injected input, payload carries
+#          the full prompt text so a message id is matchable.
+#   screen LAST RESORT. Needed only for modal and permission states, which
+#          neither the title nor any hook reports.
+
+[agent]
+id = "claude"
+display_name = "Claude Code"
+version_tested = "2.1.220"
+process_names = ["claude"]
+
+[hooks]
+# Configured via --settings <file>; the file may be generated per pane so the
+# user's own ~/.claude/settings.json is never modified. MEASURED: hooks fire in
+# both interactive TUI and -p print mode.
+config_mechanism = "--settings <file>"
+turn_start = "UserPromptSubmit"
+turn_end = "Stop"
+ack = "UserPromptSubmit"          # delivery receipt, payload contains `prompt`
+attention = "Notification"
+available = [
+  "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "StopFailure",
+  "PreToolUse", "PostToolUse", "PermissionRequest", "PermissionDenied", "Notification",
+]
+ack_payload_field = "prompt"      # MEASURED: full injected text present, 130/130 matches
+ack_latency_ms_p50 = 21.0
+ack_latency_ms_p95 = 26.1
+
+# ---------------------------------------------------------------------------
+# Title rules. tmux tracks the OSC title, so #{pane_title} is readable from the
+# control connection with no screen scraping at all.
+# ---------------------------------------------------------------------------
+
+[[rule]]
+id = "title_working_spinner"
+state = "working"
+priority = 1100
+region = "pane_title"
+# Braille spinner frames observed: U+2802, U+2810. Range covers the full cycle.
+regex = ['^[\x{2800}-\x{28FF}]']
+evidence = "MEASURED claude_busy_titles.json; spinner appears 10 ms after UserPromptSubmit"
+
+[[rule]]
+id = "title_idle_sparkle"
+state = "idle"
+priority = 1000
+region = "pane_title"
+# U+2733 replaces the spinner when the turn ends.
+regex = ['^\x{2733}']
+evidence = "MEASURED: appears 30-80 ms after the Stop hook, 6 of 6 turns"
+
+# ---------------------------------------------------------------------------
+# Screen rules. Only for what the title cannot express.
+# ---------------------------------------------------------------------------
+
+[[rule]]
+id = "composer_empty"
+state = "idle"
+priority = 900
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^\s*❯\s*$']
+evidence = "MEASURED claude_idle_composer.txt"
+
+[[rule]]
+id = "composer_has_staged_input"
+state = "idle_with_input"
+priority = 950
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^\s*❯\s+\S']
+note = "Do not inject: would concatenate with existing text. Includes the collapsed paste form '❯ [Pasted text #1 +80 lines]'."
+evidence = "MEASURED m4_capture.txt and soak composer verification"
+
+[[rule]]
+id = "screen_working"
+state = "working"
+priority = 800
+region = "bottom_non_empty_lines(8)"
+contains = ["esc to interrupt"]
+evidence = "MEASURED claude_busy2_after_enter.txt"
+
+[[rule]]
+id = "startup_modal"
+state = "blocked_modal"
+priority = 1200
+region = "bottom_non_empty_lines(16)"
+any = [
+  { contains = ["Enter to confirm"] },
+  { contains = ["Esc to keep"] },
+]
+note = """UNSAFE TO INJECT. Observed live: a 'Claude in Chrome extension detected'
+dialog on first launch swallowed a 4 KB paste entirely (measurements.md M4).
+Dismiss with Escape, never a bare Enter."""
+evidence = "MEASURED m4_paste.py first run"
+decline_keys = ["Escape"]
+auto_dismiss = true
+
+[[rule]]
+id = "permission_prompt"
+state = "blocked_permission"
+priority = 1200
+region = "bottom_non_empty_lines(12)"
+any = [
+  { contains = ["Do you want to"] },
+  { line_regex = ['^\s*❯?\s*1\.\s+(Yes|Allow)'] },
+]
+note = """No hook fires for the interactive permission prompt: the Notification
+and PermissionRequest hooks did NOT fire in the measured run, so this state is
+screen-only. This is the concrete gap that keeps the screen sensor mandatory."""
+evidence = "MEASURED p0_states.py claude: notification_hook_fired=false, permissionrequest_hook_fired=false"
+# A permission decision belongs to the human. Park the delivery and alert.
+auto_dismiss = false
+
+[injection]
+# MEASURED: 4 KB / 80 lines arrives as one collapsed block, zero premature submits.
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>", "Pasted text"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]
+busy_behavior = "queues"
+busy_note = """MEASURED: text pasted while a turn is running stages in the composer
+and is submitted as its own separate turn once the current turn ends. It is not
+merged into the running turn and is not lost. Gating on idle is therefore a
+correctness nicety for ordering, not a loss-prevention necessity, on this CLI."""
