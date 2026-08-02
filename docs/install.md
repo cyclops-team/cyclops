@@ -29,11 +29,15 @@ sessions = ["main"]
 manifest_dir = "/path/to/clops/manifests"
 ```
 
-Optional keys:
+Optional keys (defaults shown):
 
 ```toml
 tmux_socket = "name"    # tmux -L socket, for non-default servers
 tmux_config = "/dev/null"  # tmux -f, mostly for tests
+ack_timeout_ms = 1500        # tier-1 hook ACK window per delivery
+delivery_retry_max = 1       # redelivery attempts after the first failure
+receipt_block_ms = 2500      # receipt cap on the idle send path
+gate_hold_notify_ms = 120000 # one admin ping when a delivery is held this long
 ```
 
 Unknown keys warn and are ignored. The file is data; nothing in it executes.

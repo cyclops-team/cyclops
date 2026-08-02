@@ -30,6 +30,10 @@ pub struct Config {
     pub delivery_retry_max: u32,
     /// Cap on how long msg.send blocks for a receipt on the idle path.
     pub receipt_block_ms: u64,
+    /// One admin notification when a delivery has been held in gating this
+    /// long (working pane, human typing, detached session). Visibility for
+    /// wedged holds; the delivery itself keeps waiting for events.
+    pub gate_hold_notify_ms: u64,
 }
 
 impl Config {
@@ -44,6 +48,7 @@ impl Config {
             ack_timeout_ms: 1500,
             delivery_retry_max: 1,
             receipt_block_ms: 2500,
+            gate_hold_notify_ms: 120_000,
         }
     }
 
@@ -129,6 +134,14 @@ impl Config {
                         "`receipt_block_ms` must be a non-negative integer, not a {}; using {}",
                         value.type_str(),
                         cfg.receipt_block_ms
+                    )),
+                },
+                "gate_hold_notify_ms" => match ms_value(&value) {
+                    Some(v) => cfg.gate_hold_notify_ms = v,
+                    None => warnings.push(format!(
+                        "`gate_hold_notify_ms` must be a non-negative integer, not a {}; using {}",
+                        value.type_str(),
+                        cfg.gate_hold_notify_ms
                     )),
                 },
                 unknown => warnings.push(format!("unknown config key `{unknown}` ignored")),
@@ -219,13 +232,15 @@ manifest_dir = "/private/tmp/manifests"
         assert_eq!(cfg.ack_timeout_ms, 1500);
         assert_eq!(cfg.delivery_retry_max, 1);
         assert_eq!(cfg.receipt_block_ms, 2500);
+        assert_eq!(cfg.gate_hold_notify_ms, 120_000);
 
-        let text = "ack_timeout_ms = 200\ndelivery_retry_max = 0\nreceipt_block_ms = 900\n";
+        let text = "ack_timeout_ms = 200\ndelivery_retry_max = 0\nreceipt_block_ms = 900\ngate_hold_notify_ms = 300\n";
         let (cfg, warnings) = Config::parse(text, Path::new("/h")).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(cfg.ack_timeout_ms, 200);
         assert_eq!(cfg.delivery_retry_max, 0);
         assert_eq!(cfg.receipt_block_ms, 900);
+        assert_eq!(cfg.gate_hold_notify_ms, 300);
     }
 
     #[test]

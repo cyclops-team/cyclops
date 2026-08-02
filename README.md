@@ -69,8 +69,8 @@ ledger you can `jq`.
 | `crates/cyclops` | The CLI: thin NDJSON client over the daemon socket. |
 | `crates/cyclops-ledger` | Crash-safe append-only ledger writer and reader. |
 
-More: [docs/install.md](docs/install.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
-[docs/GOALS.md](docs/GOALS.md).
+More: [docs/install.md](docs/install.md), [docs/send.md](docs/send.md),
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/GOALS.md](docs/GOALS.md).
 
 ## Principles
 

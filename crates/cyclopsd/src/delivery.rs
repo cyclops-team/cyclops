@@ -14,11 +14,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use cyclops_manifest::Manifest;
 use cyclops_proto::{
     AgentState, Delivery, DeliveryReceipt, DeliveryState, Event, Kind, LedgerLine, MsgSendParams,
     MsgSendResult, NotifyLevel, VerifiedBy, WaitUntil, WireError,
 };
-use cyclops_tmux::{quote_arg, PaneEvent, SessionWatcher};
+use cyclops_tmux::{quote_arg, ControlClient, PaneEvent, SessionWatcher, TmuxError};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, watch, Notify};
 use tokio::task::JoinHandle;
@@ -135,6 +136,11 @@ pub(crate) struct DeliveryHandle {
     pub(crate) to: String,
     pub(crate) pane_id: String,
     pub(crate) session_idx: usize,
+    /// Session files this delivery's state lines append to. Normally just
+    /// the hosting session; an unresolvable recipient records into every
+    /// session file that carries the msg line, so each file stays a
+    /// complete stream.
+    ledger_sessions: Vec<usize>,
     payload: String,
     state: StdMutex<HandleState>,
     state_tx: watch::Sender<DeliveryState>,
@@ -143,6 +149,10 @@ pub(crate) struct DeliveryHandle {
     /// Hook ACK that raced ahead of the Submitted transition; consumed by
     /// the worker right after submitting.
     early_ack: AtomicBool,
+    /// Turn evidence at or after this delivery's submit. Recorded by the
+    /// ACK waiter; anchors send-and-wait `done` so a working phase that
+    /// predates the delivery never counts.
+    working_seen: AtomicBool,
 }
 
 struct HandleState {
@@ -162,12 +172,24 @@ impl DeliveryHandle {
         session_idx: usize,
         payload: String,
     ) -> Arc<Self> {
+        Self::with_ledger_sessions(msg_id, to, pane_id, session_idx, vec![session_idx], payload)
+    }
+
+    fn with_ledger_sessions(
+        msg_id: &str,
+        to: &str,
+        pane_id: &str,
+        session_idx: usize,
+        ledger_sessions: Vec<usize>,
+        payload: String,
+    ) -> Arc<Self> {
         let (state_tx, _) = watch::channel(DeliveryState::Queued);
         Arc::new(DeliveryHandle {
             msg_id: msg_id.to_string(),
             to: to.to_string(),
             pane_id: pane_id.to_string(),
             session_idx,
+            ledger_sessions,
             payload,
             state: StdMutex::new(HandleState {
                 state: DeliveryState::Queued,
@@ -179,6 +201,7 @@ impl DeliveryHandle {
             state_tx,
             ack: Notify::new(),
             early_ack: AtomicBool::new(false),
+            working_seen: AtomicBool::new(false),
         })
     }
 
@@ -336,7 +359,15 @@ fn advance(
             "cause": step.cause,
         })),
     };
-    let seq = inner.append_line(handle.session_idx, line);
+    // Every session file carrying this delivery's msg line gets the state
+    // line too; a per-session ledger is a complete stream on its own.
+    let mut seq = None;
+    for idx in &handle.ledger_sessions {
+        let s = inner.append_line(*idx, line.clone());
+        if seq.is_none() {
+            seq = s;
+        }
+    }
     inner.emit(
         "delivery-state",
         json!({
@@ -453,6 +484,128 @@ pub(crate) fn admin_notify(
 }
 
 // ---------------------------------------------------------------------------
+// Restart-limbo closure
+// ---------------------------------------------------------------------------
+
+/// Close deliveries a previous daemon run left unresolved (GOALS: limbo is
+/// a bug). Runs once at boot over the replayed session ledgers: any
+/// delivery whose latest state is still in-flight gets a state line to
+/// attention_required (cause: daemon_restart), and ONE aggregated
+/// admin.notify lists everything closed.
+///
+/// A msg line's `hosted` list names the recipients whose chains live in
+/// that file, so a chain recorded in another session's file is never
+/// falsely closed here; a delivery that died before its first state line
+/// still closes through its hosted msg record.
+pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine>)]) {
+    let mut closed: Vec<String> = Vec::new();
+    for (idx, lines) in replayed {
+        // (msg id, recipient) -> (latest state, attempts).
+        let mut chains: HashMap<(String, String), (DeliveryState, u32)> = HashMap::new();
+        for line in lines {
+            match line.kind {
+                Kind::Msg | Kind::Fyi => {
+                    // `hosted` names the recipients whose chains live in
+                    // this file. Ledgers from before the field existed were
+                    // single-file: a msg line with no hosted list hosts
+                    // every recipient it names, so those chains still get
+                    // closed instead of dangling forever.
+                    let hosted: Option<HashSet<&str>> = line
+                        .data
+                        .as_ref()
+                        .and_then(|d| d.get("hosted"))
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().filter_map(Value::as_str).collect());
+                    for d in &line.deliveries {
+                        let is_hosted = hosted.as_ref().is_none_or(|h| h.contains(d.to.as_str()));
+                        if is_hosted {
+                            chains
+                                .entry((line.id.clone(), d.to.clone()))
+                                .or_insert((d.state, d.attempts));
+                        }
+                    }
+                }
+                Kind::State => {
+                    let Some(data) = &line.data else { continue };
+                    let (Some(to), Ok(state)) = (
+                        data["to"].as_str(),
+                        serde_json::from_value::<DeliveryState>(data["to_state"].clone()),
+                    ) else {
+                        continue; // fused-state line, not a delivery line
+                    };
+                    let attempts = line.deliveries.first().map(|d| d.attempts).unwrap_or(0);
+                    chains.insert((line.id.clone(), to.to_string()), (state, attempts));
+                }
+                _ => {}
+            }
+        }
+        let mut dangling: Vec<((String, String), (DeliveryState, u32))> = chains
+            .into_iter()
+            .filter(|(_, (state, _))| !receipt_resolved(*state))
+            .collect();
+        dangling.sort_by(|a, b| a.0.cmp(&b.0));
+        for ((id, to), (state, attempts)) in dangling {
+            let record = Delivery {
+                to: to.clone(),
+                state: DeliveryState::AttentionRequired,
+                verified_by: None,
+                attempts,
+                ts: unix_ms(),
+                cause: Some("daemon_restart".to_string()),
+            };
+            let line = LedgerLine {
+                seq: 0,
+                boot_id: String::new(),
+                id: id.clone(),
+                ts: 0,
+                kind: Kind::State,
+                from: "cyclopsd".to_string(),
+                to: vec![to.clone()],
+                subject: None,
+                body: None,
+                reply_to: None,
+                deliveries: vec![record],
+                data: Some(json!({
+                    "to": to,
+                    "from": state,
+                    "to_state": DeliveryState::AttentionRequired,
+                    "cause": "daemon_restart",
+                })),
+            };
+            let seq = inner.append_line(*idx, line);
+            inner.emit(
+                "delivery-state",
+                json!({
+                    "id": id,
+                    "to": to,
+                    "from": state,
+                    "to_state": DeliveryState::AttentionRequired,
+                    "cause": "daemon_restart",
+                }),
+                seq,
+            );
+            closed.push(format!("{id} -> {to}"));
+        }
+    }
+    if closed.is_empty() {
+        return;
+    }
+    closed.sort();
+    closed.dedup();
+    admin_notify(
+        inner,
+        NotifyLevel::ActionRequired,
+        "deliveries interrupted by daemon restart",
+        &format!(
+            "closed as attention_required (cause: daemon_restart): {}",
+            closed.join(", ")
+        ),
+        None,
+        None,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // msg.send
 // ---------------------------------------------------------------------------
 
@@ -533,6 +686,9 @@ pub(crate) async fn msg_send(
     };
     // One msg fact. With recipients across sessions the same line lands in
     // each involved per-session file; each file stays a complete stream.
+    // Each copy names the recipients whose delivery chains that file hosts,
+    // so a restart can tell a chain that belongs elsewhere from one that
+    // died before its first state line.
     let mut involved: Vec<usize> = resolved
         .iter()
         .filter_map(|(_, r)| r.as_ref().map(|(idx, _)| *idx))
@@ -544,7 +700,22 @@ pub(crate) async fn msg_send(
     }
     let mut first_seq = None;
     for idx in &involved {
-        let seq = inner.append_line(*idx, line.clone());
+        let mut copy = line.clone();
+        let mut hosted: Vec<&str> = resolved
+            .iter()
+            .filter(|(_, r)| r.as_ref().is_some_and(|(i, _)| i == idx))
+            .map(|(n, _)| n.as_str())
+            .collect();
+        // Unresolvable recipients record their chain in every involved
+        // file; every file hosts them.
+        hosted.extend(
+            resolved
+                .iter()
+                .filter(|(_, r)| r.is_none())
+                .map(|(n, _)| n.as_str()),
+        );
+        copy.data = Some(json!({ "hosted": hosted }));
+        let seq = inner.append_line(*idx, copy);
         if first_seq.is_none() {
             first_seq = seq;
         }
@@ -570,8 +741,17 @@ pub(crate) async fn msg_send(
     for (name, target) in &resolved {
         match target {
             None => {
-                // Gate step 1: unresolvable recipient needs a human.
-                let handle = DeliveryHandle::new(&msg_id, name, "", 0, String::new());
+                // Gate step 1: unresolvable recipient needs a human. The
+                // resolution line lands in every file that carries the msg
+                // line, never a session the message does not involve.
+                let handle = DeliveryHandle::with_ledger_sessions(
+                    &msg_id,
+                    name,
+                    "",
+                    involved[0],
+                    involved.clone(),
+                    String::new(),
+                );
                 advance(
                     inner,
                     &handle,
@@ -642,17 +822,62 @@ pub(crate) async fn msg_send(
     };
     let mut value = serde_json::to_value(result).expect("msg.send result serializes");
 
-    // Send-and-wait composes agent.wait onto the same call: after the
-    // delivery resolves, block until the recipient reaches `until`.
+    // Send-and-wait composes agent.wait onto the same call: the wait
+    // starts only AFTER the delivery reaches a resolved state
+    // (DELIVERY.md), so `done` can never be satisfied by a turn that
+    // predates the delivery. A delivery that ends anywhere but delivered
+    // has no turn to watch; its entry reports the delivery state instead
+    // of a fabricated wait result.
     if let Some(spec) = &params.wait {
         let timeout = spec.timeout_ms.unwrap_or(WAIT_DEFAULT_MS).min(WAIT_MAX_MS);
         let wait_deadline = Instant::now() + Duration::from_millis(timeout);
         let mut waits = Vec::new();
-        for handle in handles.iter().filter(|h| !h.pane_id.is_empty()) {
+        for handle in handles.iter() {
+            if handle.pane_id.is_empty() {
+                // Every recipient reports (DELIVERY.md). A pane-less
+                // recipient resolved at send time (attention_required);
+                // there is no pane to watch, so the state is null and the
+                // delivery field carries the resolution.
+                waits.push(json!({
+                    "to": handle.to,
+                    "state": Value::Null,
+                    "timed_out": false,
+                    "delivery": handle.state(),
+                }));
+                continue;
+            }
+            let mut rx = handle.state_tx.subscribe();
+            let resolved =
+                tokio::time::timeout_at(wait_deadline, rx.wait_for(|s| receipt_resolved(*s)))
+                    .await
+                    .is_ok();
+            let delivery_state = handle.state();
+            let delivered = matches!(
+                delivery_state,
+                DeliveryState::DeliveredVerified | DeliveryState::DeliveredUnverified
+            );
+            if !delivered {
+                waits.push(json!({
+                    "to": handle.to,
+                    "state": inner.cached_state(&handle.pane_id),
+                    "timed_out": !resolved,
+                    "delivery": delivery_state,
+                }));
+                continue;
+            }
             let remaining = wait_deadline.saturating_duration_since(Instant::now());
+            // Turn evidence at or after this delivery's submit: the gate
+            // held the pane idle until our submit, so a working state read
+            // now is the turn this delivery started.
+            let working_pre = handle.working_seen.load(Ordering::SeqCst);
             let (state, timed_out) =
-                wait_until(inner, &handle.pane_id, spec.until, remaining).await;
-            waits.push(json!({"to": handle.to, "state": state, "timed_out": timed_out}));
+                wait_until_with(inner, &handle.pane_id, spec.until, remaining, working_pre).await;
+            waits.push(json!({
+                "to": handle.to,
+                "state": state,
+                "timed_out": timed_out,
+                "delivery": delivery_state,
+            }));
         }
         value["wait"] = Value::Array(waits);
     }
@@ -819,7 +1044,10 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
                 notify_attention(inner, handle, &cause);
                 return;
             }
-            GateOutcome::Proceed { manifest_id } => {
+            GateOutcome::Proceed {
+                manifest_id,
+                pane_pid,
+            } => {
                 {
                     let mut st = handle.state.lock().expect("handle state lock");
                     st.attempts += 1;
@@ -832,7 +1060,7 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
                 ) {
                     return;
                 }
-                match attempt_delivery(inner, worker, handle, &manifest_id).await {
+                match attempt_delivery(inner, worker, handle, &manifest_id, pane_pid).await {
                     AttemptOutcome::Done => return,
                     AttemptOutcome::Failed(cause) => {
                         if !fail_attempt(inner, handle, &cause) {
@@ -862,11 +1090,18 @@ enum AttemptOutcome {
 }
 
 /// One injection attempt: paste, verify, submit, wait for an ACK tier.
+///
+/// The gate's admitting snapshot is re-checked against the live pane table
+/// immediately before the paste and again immediately before the submit
+/// key (`admitted_pid`): a pane whose occupant changed after admit (agent
+/// exited to a shell, another CLI took over) must never receive the
+/// payload or the Enter, because a shell occupant would EXECUTE it.
 async fn attempt_delivery(
     inner: &Arc<Inner>,
     worker: &Arc<Worker>,
     handle: &Arc<DeliveryHandle>,
     manifest_id: &str,
+    admitted_pid: i32,
 ) -> AttemptOutcome {
     let Some(watcher) = inner.watcher_of(worker.session_idx) else {
         return AttemptOutcome::Failed("session_detached".to_string());
@@ -874,8 +1109,27 @@ async fn attempt_delivery(
     let Some(manifest) = inner.manifests.get(manifest_id) else {
         return AttemptOutcome::Failed("no_manifest".to_string());
     };
-    let staged_window = match inject(inner, &watcher, handle, manifest).await {
-        Ok(w) => w,
+    let injector = TmuxInjector {
+        client: watcher.client(),
+        buffer: format!(
+            "cyc-{}-{}",
+            std::process::id(),
+            inner.engine.buffer_seq.fetch_add(1, Ordering::Relaxed)
+        ),
+    };
+    inject_pause(inner, "pre_paste").await;
+    if let Err(detail) = occupant_unchanged(inner, &watcher, handle, manifest_id, admitted_pid) {
+        gate_line(inner, handle, "rebound", None, Some(&detail));
+        let _ = advance(
+            inner,
+            handle,
+            &[DeliveryState::Pasting],
+            Step::to(DeliveryState::RetryQueued).cause("pane_rebound"),
+        );
+        return AttemptOutcome::Failed("pane_rebound".to_string());
+    }
+    let (staged_window, id_staged) = match inject(&injector, handle, manifest).await {
+        Ok(v) => v,
         Err(cause) => return AttemptOutcome::Failed(cause),
     };
     if !advance(
@@ -894,12 +1148,21 @@ async fn attempt_delivery(
     } else {
         manifest.injection.submit.as_str()
     };
-    if let Err(e) = watcher
-        .client()
-        .send_keys(&handle.pane_id, &[submit_key])
-        .await
-    {
-        warn!(id = %handle.msg_id, error = %e, "submit key failed");
+    inject_pause(inner, "pre_submit").await;
+    if let Err(detail) = occupant_unchanged(inner, &watcher, handle, manifest_id, admitted_pid) {
+        // The staged payload belongs to the occupant that verified it; the
+        // submit key must never reach whoever replaced it.
+        unregister_ack(inner, handle);
+        gate_line(inner, handle, "rebound", None, Some(&detail));
+        let _ = advance(
+            inner,
+            handle,
+            &[DeliveryState::Staged],
+            Step::to(DeliveryState::RetryQueued).cause("pane_rebound"),
+        );
+        return AttemptOutcome::Failed("pane_rebound".to_string());
+    }
+    if let Err(cause) = injector.submit(&handle.pane_id, submit_key).await {
         unregister_ack(inner, handle);
         // Move to retry_queued here; fail_attempt sees the state and only
         // does the bookkeeping.
@@ -907,9 +1170,9 @@ async fn attempt_delivery(
             inner,
             handle,
             &[DeliveryState::Staged],
-            Step::to(DeliveryState::RetryQueued).cause("submit_failed"),
+            Step::to(DeliveryState::RetryQueued).cause(&cause),
         );
-        return AttemptOutcome::Failed("submit_failed".to_string());
+        return AttemptOutcome::Failed(cause);
     }
     if !advance(
         inner,
@@ -932,7 +1195,7 @@ async fn attempt_delivery(
     {
         return AttemptOutcome::Done;
     }
-    match await_ack(inner, &watcher, handle, manifest, &staged_window).await {
+    match await_ack(inner, handle, manifest, &staged_window, id_staged).await {
         AckOutcome::Resolved => AttemptOutcome::Done,
         AckOutcome::Screen => {
             // Stays registered: a late matching hook ACK upgrades it to
@@ -951,6 +1214,47 @@ async fn attempt_delivery(
             unregister_ack(inner, handle);
             AttemptOutcome::Failed("ack_timeout".to_string())
         }
+    }
+}
+
+/// Pane-rebind re-check between the gate's admitting recompute and the
+/// irreversible injection steps. The pane must still exist, be alive, keep
+/// the pid it was admitted with, and bind to the manifest the gate
+/// admitted. Err carries the mismatch detail for the gate ledger line; the
+/// delivery then retries through the gate, which re-evaluates from scratch.
+fn occupant_unchanged(
+    inner: &Arc<Inner>,
+    watcher: &Arc<SessionWatcher>,
+    handle: &Arc<DeliveryHandle>,
+    manifest_id: &str,
+    admitted_pid: i32,
+) -> Result<(), String> {
+    let Some(row) = watcher.pane(&handle.pane_id) else {
+        return Err("pane_gone".to_string());
+    };
+    if row.dead {
+        return Err("pane_dead".to_string());
+    }
+    if row.pane_pid != admitted_pid {
+        return Err("pane_pid_changed".to_string());
+    }
+    match fusion::bind_manifest_for(inner, &row) {
+        Some(m) if m.agent.id == manifest_id => Ok(()),
+        Some(_) => Err("manifest_changed".to_string()),
+        None => Err("manifest_unbound".to_string()),
+    }
+}
+
+/// Await the test-only injection pause, when one is installed. Production
+/// never installs one; this is a no-op there.
+async fn inject_pause(inner: &Arc<Inner>, phase: &'static str) {
+    let hook = inner
+        .inject_pause
+        .lock()
+        .expect("inject pause lock")
+        .clone();
+    if let Some(h) = hook {
+        h(phase).await;
     }
 }
 
@@ -1056,9 +1360,19 @@ async fn park_recipient(
 // ---------------------------------------------------------------------------
 
 enum GateOutcome {
-    Proceed { manifest_id: String },
-    Park { hint: Option<String> },
-    Attention { cause: String },
+    Proceed {
+        manifest_id: String,
+        /// pane_pid of the admitted occupant, re-checked before paste and
+        /// submit: a pane whose occupant changed after admit must never be
+        /// injected into.
+        pane_pid: i32,
+    },
+    Park {
+        hint: Option<String>,
+    },
+    Attention {
+        cause: String,
+    },
 }
 
 /// The delivery gate, in spec order: pane resolution and liveness, mode,
@@ -1071,6 +1385,10 @@ async fn gate(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> GateOutcome {
     let mut declines: HashMap<String, u32> = HashMap::new();
     let mut notified_rules: HashSet<String> = HashSet::new();
     let mut last_hold: Option<String> = None;
+    // One-shot visibility for wedged holds: a delivery held in gating past
+    // the configured threshold pings the admin exactly once.
+    let mut hold_since: Option<Instant> = None;
+    let mut hold_notified = false;
     loop {
         // Subscribe before evaluating so nothing published mid-evaluation
         // is lost; evaluation itself is authoritative.
@@ -1096,9 +1414,7 @@ async fn gate(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> GateOutcome {
                     // re-triggers via the pane event stream.
                     Some("pane_in_mode".to_string())
                 } else {
-                    let Some(manifest) =
-                        fusion::bind_manifest(&inner.manifests, &row.current_command)
-                    else {
+                    let Some(manifest) = fusion::bind_manifest_for(inner, &row) else {
                         return GateOutcome::Attention {
                             cause: "no_manifest".to_string(),
                         };
@@ -1114,7 +1430,10 @@ async fn gate(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> GateOutcome {
                     match det.state {
                         AgentState::Idle => {
                             gate_line(inner, handle, "proceed", Some(&det.decided_by), None);
-                            return GateOutcome::Proceed { manifest_id };
+                            return GateOutcome::Proceed {
+                                manifest_id,
+                                pane_pid: row.pane_pid,
+                            };
                         }
                         AgentState::Dead => {
                             return GateOutcome::Attention {
@@ -1147,7 +1466,28 @@ async fn gate(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> GateOutcome {
                                     *declines.entry(r.id.clone()).or_insert(0) += 1;
                                     gate_line(inner, handle, "decline", Some(&r.id), None);
                                     let keys = r.decline_keys.clone();
-                                    send_decline_keys(w, &handle.pane_id, &keys).await;
+                                    let rule_id = r.id.clone();
+                                    if !send_decline_keys(
+                                        w,
+                                        &handle.pane_id,
+                                        manifest,
+                                        &rule_id,
+                                        &keys,
+                                    )
+                                    .await
+                                    {
+                                        // The screen changed under the
+                                        // decline (TOCTOU): the confirming
+                                        // key was withheld. Back to the
+                                        // gate loop to re-read reality.
+                                        gate_line(
+                                            inner,
+                                            handle,
+                                            "decline_aborted",
+                                            Some(&rule_id),
+                                            Some("modal_changed"),
+                                        );
+                                    }
                                     // One-shot settle so the dismissal
                                     // renders before the re-check; the
                                     // decline count bounds this loop.
@@ -1188,25 +1528,78 @@ async fn gate(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> GateOutcome {
         if let Some(cause) = hold {
             if last_hold.as_deref() != Some(cause.as_str()) {
                 gate_line(inner, handle, "hold", None, Some(&cause));
-                last_hold = Some(cause);
+                last_hold = Some(cause.clone());
             }
-            wait_pane_change(&mut ev_rx, pane_rx.as_mut(), &handle.pane_id).await;
+            let since = *hold_since.get_or_insert_with(Instant::now);
+            let notify_at = since + Duration::from_millis(inner.cfg.gate_hold_notify_ms);
+            tokio::select! {
+                _ = wait_pane_change(&mut ev_rx, pane_rx.as_mut(), &handle.pane_id) => {}
+                _ = tokio::time::sleep_until(notify_at), if !hold_notified => {
+                    // A wedged hold must at least be visible. One ping per
+                    // delivery; the hold itself keeps waiting on events.
+                    hold_notified = true;
+                    admin_notify(
+                        inner,
+                        NotifyLevel::ActionRequired,
+                        &format!("delivery to {} held in gating", handle.to),
+                        &format!(
+                            "message {} has been held for over {}ms ({cause})",
+                            handle.msg_id, inner.cfg.gate_hold_notify_ms
+                        ),
+                        Some(&handle.msg_id),
+                        Some(handle.session_idx),
+                    );
+                }
+            }
         }
     }
 }
 
 /// Manifest decline keys, in order, with spacing (amendment g: the keys
 /// come from the manifest rule, never a generic Enter/Escape).
-async fn send_decline_keys(watcher: &Arc<SessionWatcher>, pane_id: &str, keys: &[String]) {
+///
+/// TOCTOU guard: before the FINAL confirming key of a multi-key sequence
+/// the screen is re-captured, and the same modal rule must still be the
+/// winning match. A dialog that vanished or changed between keys (the
+/// human answered it, the app redrew) must not receive the confirm.
+/// Returns false when the sequence was aborted.
+async fn send_decline_keys(
+    watcher: &Arc<SessionWatcher>,
+    pane_id: &str,
+    manifest: &Manifest,
+    rule_id: &str,
+    keys: &[String],
+) -> bool {
     for (i, key) in keys.iter().enumerate() {
         if i > 0 {
             tokio::time::sleep(DECLINE_SPACING).await;
         }
+        if i > 0 && i == keys.len() - 1 {
+            let title = watcher.pane(pane_id).map(|r| r.title).unwrap_or_default();
+            let screen = match watcher.client().capture_pane(pane_id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(pane = pane_id, error = %e, "decline recheck capture failed");
+                    return false;
+                }
+            };
+            if !modal_still_matches(manifest, &title, &screen, rule_id) {
+                return false;
+            }
+        }
         if let Err(e) = watcher.client().send_keys(pane_id, &[key.as_str()]).await {
             warn!(pane = pane_id, error = %e, "decline key failed");
-            return;
+            return true; // sent what we could; not a TOCTOU abort
         }
     }
+    true
+}
+
+/// True while `rule_id` is still the winning match for this screen.
+fn modal_still_matches(manifest: &Manifest, title: &str, screen: &str, rule_id: &str) -> bool {
+    manifest
+        .evaluate(title, screen)
+        .is_some_and(|r| r.id == rule_id && r.state.is_blocked())
 }
 
 /// Parse the quota reset hint from the screen. Only the parsed phrase ever
@@ -1282,77 +1675,105 @@ fn pane_event_wakes(pe: &Result<PaneEvent, broadcast::error::RecvError>, pane_id
 // Inject and verify
 // ---------------------------------------------------------------------------
 
-/// Paste the payload and verify the composer staged it. Returns the
-/// composer-window snapshot used later by the screen ACK tier.
-///
-/// The payload travels through a file under the 0700 cyclops home (never
-/// the shared system temp dir) into a per-delivery unique buffer
-/// (amendment e), pasted with -p (bracketed when the app opted in, F17)
-/// and -d so the buffer does not linger server-global.
-async fn inject(
-    inner: &Arc<Inner>,
-    watcher: &Arc<SessionWatcher>,
-    handle: &Arc<DeliveryHandle>,
-    manifest: &cyclops_manifest::Manifest,
-) -> Result<String, String> {
-    let client = watcher.client();
-    let buffer = format!(
-        "cyc-{}-{}",
-        std::process::id(),
-        inner.engine.buffer_seq.fetch_add(1, Ordering::Relaxed)
-    );
-    let spool = inner.cfg.home.join("spool");
-    if !spool.exists() {
-        use std::os::unix::fs::DirBuilderExt;
-        if let Err(e) = std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&spool)
+/// How payload bytes reach an agent and how the backend reads them back
+/// (amendment i; GOALS: delivery behind an adapter). The gate, verify, and
+/// ACK layers above call through this seam only, so a headless protocol
+/// backend slots in per agent without touching them. [`TmuxInjector`] is
+/// the M1 implementation. Errors are the short cause codes retry
+/// accounting records.
+pub(crate) trait Injector {
+    /// Deliver the payload into the pane's composer without submitting.
+    async fn paste(&self, pane_id: &str, payload: &str) -> Result<(), String>;
+    /// Press the submit key.
+    async fn submit(&self, pane_id: &str, key: &str) -> Result<(), String>;
+    /// Read back the visible grid (this backend's verification sensor).
+    async fn capture(&self, pane_id: &str) -> Result<String, String>;
+}
+
+/// The tmux paste path: load-buffer through the adapter's private spool
+/// (0600 file under the 0700 cyclops home, never the shared temp dir) into
+/// a per-delivery unique buffer (amendment e), paste-buffer -p (bracketed
+/// when the app opted in, F17) -d so the buffer does not linger
+/// server-global, send-keys for submit.
+struct TmuxInjector {
+    client: Arc<ControlClient>,
+    /// Per-delivery unique buffer name.
+    buffer: String,
+}
+
+impl Injector for TmuxInjector {
+    async fn paste(&self, pane_id: &str, payload: &str) -> Result<(), String> {
+        if let Err(e) = self
+            .client
+            .load_buffer(&self.buffer, payload.as_bytes())
+            .await
         {
-            warn!(error = %e, "cannot create spool dir");
-            return Err("spool_failed".to_string());
+            warn!(buffer = %self.buffer, error = %e, "load-buffer failed");
+            return Err(match e {
+                TmuxError::Io(_) => "spool_failed",
+                _ => "paste_failed",
+            }
+            .to_string());
         }
-    }
-    let path = spool.join(&buffer);
-    if let Err(e) = tokio::fs::write(&path, handle.payload.as_bytes()).await {
-        warn!(error = %e, "cannot write spool file");
-        return Err("spool_failed".to_string());
-    }
-    let load = client
-        .command(&format!(
-            "load-buffer -b {} {}",
-            quote_arg(&buffer),
-            quote_arg(&path.to_string_lossy())
-        ))
-        .await;
-    // Message content must not linger on disk.
-    let _ = tokio::fs::remove_file(&path).await;
-    if let Err(e) = load {
-        warn!(id = %handle.msg_id, error = %e, "load-buffer failed");
-        return Err("paste_failed".to_string());
-    }
-    if let Err(e) = client
-        .paste_buffer(&buffer, &handle.pane_id, true, true)
-        .await
-    {
-        warn!(id = %handle.msg_id, error = %e, "paste-buffer failed");
-        return Err("paste_failed".to_string());
+        if let Err(e) = self
+            .client
+            .paste_buffer(&self.buffer, pane_id, true, true)
+            .await
+        {
+            warn!(buffer = %self.buffer, error = %e, "paste-buffer failed");
+            // paste-buffer -d never ran, so the loaded buffer would linger
+            // server-global with the payload in it. Best effort: the buffer
+            // dies with the server either way.
+            let _ = self
+                .client
+                .command(&format!("delete-buffer -b {}", quote_arg(&self.buffer)))
+                .await;
+            return Err("paste_failed".to_string());
+        }
+        Ok(())
     }
 
-    // Composer verification is the gate (amendment b): bracketed-paste
-    // degradation is not observable up front through tmux 3.6a.
-    let patterns = verify_patterns(manifest, &handle.msg_id);
+    async fn submit(&self, pane_id: &str, key: &str) -> Result<(), String> {
+        self.client.send_keys(pane_id, &[key]).await.map_err(|e| {
+            warn!(error = %e, "submit key failed");
+            "submit_failed".to_string()
+        })
+    }
+
+    async fn capture(&self, pane_id: &str) -> Result<String, String> {
+        self.client
+            .capture_pane(pane_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Paste the payload and verify the composer staged it. Returns the
+/// composer-window snapshot the screen ACK tier compares against, plus
+/// whether an id-carrying pattern proved the staging (feeds the tier-2
+/// evidence rules).
+///
+/// Composer verification is the gate (amendment b): bracketed-paste
+/// degradation is not observable up front through tmux 3.6a.
+async fn inject<I: Injector>(
+    injector: &I,
+    handle: &Arc<DeliveryHandle>,
+    manifest: &Manifest,
+) -> Result<(String, bool), String> {
+    injector.paste(&handle.pane_id, &handle.payload).await?;
+    let (id_patterns, other_patterns) = verify_patterns(manifest, &handle.msg_id);
     let mut last_delay = 0;
     for delay in VERIFY_DELAYS_MS {
         if delay > last_delay {
             tokio::time::sleep(Duration::from_millis(delay - last_delay)).await;
         }
         last_delay = delay;
-        match client.capture_pane(&handle.pane_id).await {
+        match injector.capture(&handle.pane_id).await {
             Ok(screen) => {
-                let region = bottom_window(&screen, VERIFY_REGION);
-                if patterns_hit(&region, &patterns) {
-                    return Ok(bottom_window(&screen, COMPOSER_WINDOW));
+                if let Some(id_staged) =
+                    staged_verified(manifest, &screen, &id_patterns, &other_patterns)
+                {
+                    return Ok((bottom_window(&screen, COMPOSER_WINDOW), id_staged));
                 }
             }
             Err(e) => debug!(error = %e, "verify capture failed"),
@@ -1361,18 +1782,44 @@ async fn inject(
     Err("verify_failed".to_string())
 }
 
-/// Substituted staging patterns; the message id is always one of them.
-fn verify_patterns(manifest: &cyclops_manifest::Manifest, msg_id: &str) -> Vec<String> {
-    let mut out: Vec<String> = manifest
-        .injection
-        .verify_pattern
-        .iter()
-        .map(|p| p.replace("<message_id>", msg_id))
-        .collect();
-    if out.is_empty() {
-        out.push(msg_id.to_string());
+/// Did this capture prove the paste staged? Id-carrying patterns are
+/// unique to the delivery and count anywhere in the verify region; generic
+/// patterns ("Pasted text") count only on a manifest composer line, so
+/// residue from an EARLIER message in the transcript can never verify a
+/// paste that did not stage. Some(id_matched) when staged.
+fn staged_verified(
+    manifest: &Manifest,
+    screen: &str,
+    id_patterns: &[String],
+    other_patterns: &[String],
+) -> Option<bool> {
+    let region = bottom_window(screen, VERIFY_REGION);
+    if patterns_hit(&region, id_patterns) {
+        return Some(true);
     }
-    out
+    if marker_in_composer(manifest, screen, other_patterns) {
+        return Some(false);
+    }
+    None
+}
+
+/// Substituted staging patterns, split into id-carrying (contain the
+/// message id after substitution) and generic. The id is always an
+/// id-carrying pattern.
+fn verify_patterns(manifest: &Manifest, msg_id: &str) -> (Vec<String>, Vec<String>) {
+    let mut id = Vec::new();
+    let mut other = Vec::new();
+    for p in &manifest.injection.verify_pattern {
+        if p.contains("<message_id>") {
+            id.push(p.replace("<message_id>", msg_id));
+        } else {
+            other.push(p.clone());
+        }
+    }
+    if id.is_empty() {
+        id.push(msg_id.to_string());
+    }
+    (id, other)
 }
 
 /// Last `n` non-empty lines of a capture, top-down, joined.
@@ -1404,122 +1851,349 @@ enum AckOutcome {
     Timeout,
 }
 
-/// Tier 1: the manifest hook ACK inside ack_timeout_ms. Tier 2: screen
-/// evidence until the 5s deadline, checked on pane events and bounded
-/// one-shot checkpoints. A hook ACK is accepted at any point.
-async fn await_ack(
-    inner: &Arc<Inner>,
-    watcher: &Arc<SessionWatcher>,
-    handle: &Arc<DeliveryHandle>,
-    manifest: &cyclops_manifest::Manifest,
-    staged_window: &str,
-) -> AckOutcome {
-    let submit_at = Instant::now();
-    let deadline = submit_at + SCREEN_ACK_DEADLINE;
-    let tier1 = manifest.hooks.ack.is_some() && manifest.hooks.ack_payload_field.is_some();
-    let patterns = verify_patterns(manifest, &handle.msg_id);
-    let mut ev_rx = inner.events.subscribe();
-    let mut pane_rx = watcher.subscribe();
-    let mut working_seen = false;
-    let mut output_seen = false;
+/// Outcome of one tier-2 evidence pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evidence {
+    /// The conjunctive rule held: marker gone plus turn evidence.
+    Confirmed,
+    /// The pane was observed and the evidence is not there (yet).
+    Absent,
+    /// Nobody looked: the watcher is gone (a detach can clear it before
+    /// the lifecycle event is broadcast) or the capture failed. Doubt,
+    /// never expiry, mirroring fusion's capture-failure handling.
+    Unobservable,
+}
 
-    if tier1 {
-        let hook_deadline = submit_at + Duration::from_millis(inner.cfg.ack_timeout_ms);
-        loop {
-            tokio::select! {
-                _ = handle.ack.notified() => {
-                    if handle.state() == DeliveryState::DeliveredVerified {
-                        return AckOutcome::Resolved;
-                    }
-                }
-                _ = tokio::time::sleep_until(hook_deadline) => break,
-                ev = ev_rx.recv() => track_state_event(&ev, &handle.pane_id, &mut working_seen),
-                pe = pane_rx.recv() => track_pane_event(&pe, &handle.pane_id, &mut output_seen),
-            }
+/// What one checkpoint pass means for the ACK loop. Expiry may stand only
+/// on a pass that actually looked and saw nothing; doubt freezes the clock
+/// until observability returns (detach-aware ACKs, v1.1 amendment 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointStep {
+    Deliver,
+    Freeze,
+    Expire,
+    Wait,
+}
+
+fn checkpoint_step(evidence: Evidence, expired: bool) -> CheckpointStep {
+    match evidence {
+        Evidence::Confirmed => CheckpointStep::Deliver,
+        Evidence::Unobservable => CheckpointStep::Freeze,
+        Evidence::Absent if expired => CheckpointStep::Expire,
+        Evidence::Absent => CheckpointStep::Wait,
+    }
+}
+
+/// The per-delivery ACK timeline: the tier-1 hook window, the tier-2
+/// screen-evidence checkpoints, and the give-up deadline.
+///
+/// Detach-aware (DELIVERY.md v1.1 amendment 2): while the session's
+/// control connection is down the daemon cannot observe the pane, so the
+/// clock freezes; on reattach every remaining instant shifts by the outage
+/// duration. Time lost to a detach never counts against an ACK window.
+struct AckClock {
+    /// End of the tier-1 hook phase; None once the phase ended (or for
+    /// screen-tier agents that never had one).
+    hook_deadline: Option<Instant>,
+    checkpoints: Vec<Instant>,
+    next: usize,
+    deadline: Instant,
+    frozen_at: Option<Instant>,
+}
+
+impl AckClock {
+    fn new(submit_at: Instant, hook_window: Option<Duration>) -> AckClock {
+        AckClock {
+            hook_deadline: hook_window.map(|w| submit_at + w),
+            checkpoints: ACK_CHECKPOINTS_MS
+                .iter()
+                .map(|ms| submit_at + Duration::from_millis(*ms))
+                .collect(),
+            next: 0,
+            deadline: submit_at + SCREEN_ACK_DEADLINE,
+            frozen_at: None,
         }
     }
 
-    let checkpoints: Vec<Instant> = ACK_CHECKPOINTS_MS
-        .iter()
-        .map(|ms| submit_at + Duration::from_millis(*ms))
-        .filter(|t| *t > Instant::now())
-        .collect();
-    let mut next = 0;
+    fn frozen(&self) -> bool {
+        self.frozen_at.is_some()
+    }
+
+    fn freeze(&mut self, now: Instant) {
+        if self.frozen_at.is_none() {
+            self.frozen_at = Some(now);
+        }
+    }
+
+    /// Reattach: shift every remaining instant by the detach duration.
+    fn unfreeze(&mut self, now: Instant) {
+        let Some(at) = self.frozen_at.take() else {
+            return;
+        };
+        let lost = now.saturating_duration_since(at);
+        if let Some(h) = &mut self.hook_deadline {
+            *h += lost;
+        }
+        for c in &mut self.checkpoints[self.next..] {
+            *c += lost;
+        }
+        self.deadline += lost;
+    }
+
+    /// Next timer to arm: (instant, is_hook_phase_end). None while frozen;
+    /// a frozen clock never fires.
+    fn next_target(&self) -> Option<(Instant, bool)> {
+        if self.frozen() {
+            return None;
+        }
+        if let Some(h) = self.hook_deadline {
+            return Some((h, true));
+        }
+        Some((
+            self.checkpoints
+                .get(self.next)
+                .copied()
+                .unwrap_or(self.deadline),
+            false,
+        ))
+    }
+
+    /// The tier-1 phase ended; skip the checkpoints it already covered.
+    fn end_hook_phase(&mut self, now: Instant) {
+        self.hook_deadline = None;
+        while self.next < self.checkpoints.len() && self.checkpoints[self.next] <= now {
+            self.next += 1;
+        }
+    }
+
+    fn advance_checkpoint(&mut self) {
+        self.next += 1;
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        !self.frozen() && now >= self.deadline
+    }
+}
+
+/// Receive from an optional pane-event stream; pends forever when the
+/// session is detached (no watcher, no stream).
+async fn recv_pane(
+    rx: &mut Option<broadcast::Receiver<PaneEvent>>,
+) -> Result<PaneEvent, broadcast::error::RecvError> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Tier 1: the manifest hook ACK inside ack_timeout_ms. Tier 2: screen
+/// evidence until the deadline, checked on pane events and bounded
+/// one-shot checkpoints. A hook ACK is accepted at any point.
+///
+/// The clock freezes across a session detach and a reattach runs an
+/// immediate evidence pass BEFORE any deadline can expire, so a delivery
+/// that landed during the outage resolves as delivered instead of being
+/// resubmitted (the m1 soak's duplicate). Hook ACKs arriving during the
+/// outage are accepted by the matcher independently of this loop.
+async fn await_ack(
+    inner: &Arc<Inner>,
+    handle: &Arc<DeliveryHandle>,
+    manifest: &Manifest,
+    staged_window: &str,
+    id_staged: bool,
+) -> AckOutcome {
+    let submit_at = Instant::now();
+    let tier1 = manifest.hooks.ack.is_some() && manifest.hooks.ack_payload_field.is_some();
+    let (id_patterns, other_patterns) = verify_patterns(manifest, &handle.msg_id);
+    let patterns: Vec<String> = id_patterns.into_iter().chain(other_patterns).collect();
+    let session_name = inner
+        .sessions
+        .get(handle.session_idx)
+        .map(|s| s.name.clone())
+        .unwrap_or_default();
+    let mut ev_rx = inner.events.subscribe();
+    let mut pane_rx = inner.watcher_of(handle.session_idx).map(|w| w.subscribe());
+    let mut working_seen = false;
+    let mut output_seen = false;
+    let mut clock = AckClock::new(
+        submit_at,
+        tier1.then(|| Duration::from_millis(inner.cfg.ack_timeout_ms)),
+    );
+    if pane_rx.is_none() {
+        clock.freeze(Instant::now());
+    }
+
     loop {
-        let target = checkpoints.get(next).copied().unwrap_or(deadline);
+        let target = clock.next_target();
         tokio::select! {
             _ = handle.ack.notified() => {
                 if handle.state() == DeliveryState::DeliveredVerified {
                     return AckOutcome::Resolved;
                 }
             }
-            _ = tokio::time::sleep_until(target) => {
-                next += 1;
-                if screen_ack(watcher, handle, manifest, &patterns, staged_window, working_seen, output_seen).await {
-                    return AckOutcome::Screen;
+            _ = tokio::time::sleep_until(target.map(|(t, _)| t).unwrap_or_else(Instant::now)),
+                if target.is_some() =>
+            {
+                let now = Instant::now();
+                if target.is_some_and(|(_, hook_end)| hook_end) {
+                    clock.end_hook_phase(now);
+                    continue;
                 }
-                if Instant::now() >= deadline {
-                    return AckOutcome::Timeout;
+                clock.advance_checkpoint();
+                let evidence = screen_evidence(
+                    inner, handle, manifest, &patterns, staged_window,
+                    id_staged, working_seen, output_seen,
+                ).await;
+                match checkpoint_step(evidence, clock.expired(Instant::now())) {
+                    CheckpointStep::Deliver => return AckOutcome::Screen,
+                    CheckpointStep::Expire => return AckOutcome::Timeout,
+                    CheckpointStep::Freeze => {
+                        // The pass could not look (watcher cleared before
+                        // its detach event, or the capture failed): a
+                        // Timeout here would stand on nothing. Freeze; a
+                        // session edge, pane activity, or a lag reconcile
+                        // unfreezes.
+                        clock.freeze(Instant::now());
+                    }
+                    CheckpointStep::Wait => {}
                 }
             }
-            ev = ev_rx.recv() => track_state_event(&ev, &handle.pane_id, &mut working_seen),
-            pe = pane_rx.recv() => track_pane_event(&pe, &handle.pane_id, &mut output_seen),
+            ev = ev_rx.recv() => {
+                if track_state_event(&ev, &handle.pane_id) {
+                    working_seen = true;
+                    handle.working_seen.store(true, Ordering::SeqCst);
+                }
+                match session_edge(&ev, &session_name) {
+                    Some(true) => {
+                        if let Some(w) = inner.watcher_of(handle.session_idx) {
+                            pane_rx = Some(w.subscribe());
+                            clock.unfreeze(Instant::now());
+                            // Reattach evidence pass, before any deadline
+                            // can fire: did the payload arrive during the
+                            // outage?
+                            match screen_evidence(
+                                inner, handle, manifest, &patterns, staged_window,
+                                id_staged, working_seen, output_seen,
+                            ).await {
+                                Evidence::Confirmed => return AckOutcome::Screen,
+                                // Still blind right after the edge: stay
+                                // frozen rather than letting the shifted
+                                // deadlines run on an unobserved pane.
+                                Evidence::Unobservable => clock.freeze(Instant::now()),
+                                Evidence::Absent => {}
+                            }
+                        }
+                    }
+                    Some(false) => {
+                        pane_rx = None;
+                        clock.freeze(Instant::now());
+                    }
+                    None => {
+                        // A lagged event stream can swallow the reattach
+                        // notice; reconcile against the link instead of
+                        // staying frozen forever.
+                        if matches!(ev, Err(broadcast::error::RecvError::Lagged(_)))
+                            && clock.frozen()
+                        {
+                            if let Some(w) = inner.watcher_of(handle.session_idx) {
+                                pane_rx = Some(w.subscribe());
+                                clock.unfreeze(Instant::now());
+                            }
+                        }
+                    }
+                }
+            }
+            pe = recv_pane(&mut pane_rx) => {
+                match pe {
+                    Ok(PaneEvent::OutputActivity { pane_id: p, .. }) if p == handle.pane_id => {
+                        output_seen = true;
+                        // A frozen clock with a live pane stream is doubt
+                        // from a failed capture; the pane speaking again
+                        // is the cue to look and, if observable, resume.
+                        if clock.frozen() {
+                            match screen_evidence(
+                                inner, handle, manifest, &patterns, staged_window,
+                                id_staged, working_seen, output_seen,
+                            ).await {
+                                Evidence::Confirmed => return AckOutcome::Screen,
+                                Evidence::Absent => clock.unfreeze(Instant::now()),
+                                Evidence::Unobservable => {}
+                            }
+                        }
+                    }
+                    Ok(PaneEvent::Disconnected)
+                    | Err(broadcast::error::RecvError::Closed) => {
+                        pane_rx = None;
+                        clock.freeze(Instant::now());
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 }
 
-fn track_state_event(
-    ev: &Result<Event, broadcast::error::RecvError>,
-    pane_id: &str,
-    working_seen: &mut bool,
-) {
-    if let Ok(e) = ev {
-        if e.event == "state" && e.data["pane_id"] == pane_id && e.data["state"] == "working" {
-            *working_seen = true;
-        }
+/// True when the event is a working fused-state change for this pane.
+fn track_state_event(ev: &Result<Event, broadcast::error::RecvError>, pane_id: &str) -> bool {
+    matches!(ev, Ok(e)
+        if e.event == "state" && e.data["pane_id"] == pane_id && e.data["state"] == "working")
+}
+
+/// Some(attached) when the event is a lifecycle edge for this session.
+fn session_edge(ev: &Result<Event, broadcast::error::RecvError>, session: &str) -> Option<bool> {
+    match ev {
+        Ok(e) if e.event == "session" && e.data["name"] == session => e.data["attached"].as_bool(),
+        _ => None,
     }
 }
 
-fn track_pane_event(
-    pe: &Result<PaneEvent, broadcast::error::RecvError>,
-    pane_id: &str,
-    output_seen: &mut bool,
-) {
-    if let Ok(PaneEvent::OutputActivity { pane_id: p, .. }) = pe {
-        if p == pane_id {
-            *output_seen = true;
-        }
-    }
-}
-
-/// Screen evidence for tier 2: the marker left the composer and the pane
-/// showed turn-start evidence.
+/// Screen evidence for tier 2, spec conjunctive form (v1.1 amendment 1):
+/// the marker left the composer AND turn evidence appeared.
 ///
 /// "Left the composer" is manifest-driven: the marker still sits in the
 /// composer only when an idle_with_input rule identifies a composer line
 /// that carries it (staged-but-unsubmitted text, e.g. Claude's collapsed
 /// paste on the `❯` line). Manifests without an idle_with_input rule
-/// cannot pin staged text, so the changed-window signal decides alone.
+/// cannot pin staged text.
 ///
-/// A changed composer window is itself output evidence read through the
-/// screen sensor; %output events can be swallowed by the watcher's
-/// per-pane rate limit for single short bursts (MEASURED: a cat pane's
-/// echoed submit stays under the 100ms floor).
-async fn screen_ack(
-    watcher: &Arc<SessionWatcher>,
+/// Turn evidence is a working state, output activity, or a changed
+/// composer window. The changed window counts only when verification
+/// demonstrably staged the id pattern: a redraw can change the window of a
+/// pane that never took the paste, but it cannot have staged OUR id first.
+/// (%output events can be swallowed by the watcher's per-pane rate limit
+/// for single short bursts, MEASURED: a cat pane's echoed submit stays
+/// under the 100ms floor, which is why the changed window matters.)
+#[allow(clippy::too_many_arguments)]
+async fn screen_evidence(
+    inner: &Arc<Inner>,
     handle: &Arc<DeliveryHandle>,
-    manifest: &cyclops_manifest::Manifest,
+    manifest: &Manifest,
     patterns: &[String],
     staged_window: &str,
+    id_staged: bool,
     working_seen: bool,
     output_seen: bool,
-) -> bool {
-    let Ok(screen) = watcher.client().capture_pane(&handle.pane_id).await else {
-        return false;
+) -> Evidence {
+    let Some(watcher) = inner.watcher_of(handle.session_idx) else {
+        return Evidence::Unobservable;
     };
-    let window = bottom_window(&screen, COMPOSER_WINDOW);
-    let changed = window != staged_window;
-    !marker_in_composer(manifest, &screen, patterns) && (changed || working_seen || output_seen)
+    let Ok(screen) = watcher.client().capture_pane(&handle.pane_id).await else {
+        return Evidence::Unobservable;
+    };
+    let changed = bottom_window(&screen, COMPOSER_WINDOW) != staged_window;
+    if !marker_in_composer(manifest, &screen, patterns)
+        && tier2_evidence(changed, id_staged, working_seen, output_seen)
+    {
+        Evidence::Confirmed
+    } else {
+        Evidence::Absent
+    }
+}
+
+/// The tier-2 turn-evidence rule, factored for the unit test: a changed
+/// window alone is only evidence when the id demonstrably staged.
+fn tier2_evidence(changed: bool, id_staged: bool, working_seen: bool, output_seen: bool) -> bool {
+    working_seen || output_seen || (changed && id_staged)
 }
 
 /// True when a manifest idle_with_input rule matches a line in its own
@@ -1650,13 +2324,27 @@ pub(crate) async fn wait_until(
     until: WaitUntil,
     timeout: Duration,
 ) -> (AgentState, bool) {
+    wait_until_with(inner, pane_id, until, timeout, false).await
+}
+
+/// [`wait_until`] with prior turn evidence. `working_pre` is true when a
+/// working phase attributable to the caller's delivery was already
+/// observed (the ACK waiter records it on the handle), so a fast turn that
+/// ended before the wait began still satisfies `done`.
+async fn wait_until_with(
+    inner: &Arc<Inner>,
+    pane_id: &str,
+    until: WaitUntil,
+    timeout: Duration,
+    working_pre: bool,
+) -> (AgentState, bool) {
     let mut rx = inner.events.subscribe();
     let deadline = Instant::now() + timeout;
     let mut state = inner.cached_state(pane_id);
     // Done means "the turn started by our delivery ended": a working phase
     // must be observed (or already running) before a non-working state
     // satisfies the wait.
-    let mut working_seen = state == AgentState::Working;
+    let mut working_seen = working_pre || state == AgentState::Working;
     loop {
         let satisfied = match until {
             WaitUntil::Idle => state == AgentState::Idle,
@@ -1779,8 +2467,8 @@ mod tests {
     }
 
     #[test]
-    fn verify_patterns_substitute_and_default() {
-        let m = cyclops_manifest::Manifest::parse(
+    fn verify_patterns_substitute_split_and_default() {
+        let m = Manifest::parse(
             r#"
 [agent]
 id = "x"
@@ -1791,15 +2479,18 @@ verify_pattern = ["<message_id>", "Pasted text"]
             std::path::Path::new("x.toml"),
         )
         .unwrap();
-        let pats = verify_patterns(&m, "m-ab12");
-        assert_eq!(pats, vec!["m-ab12".to_string(), "Pasted text".to_string()]);
+        let (id, other) = verify_patterns(&m, "m-ab12");
+        assert_eq!(id, vec!["m-ab12".to_string()]);
+        assert_eq!(other, vec!["Pasted text".to_string()]);
 
-        let empty = cyclops_manifest::Manifest::parse(
+        let empty = Manifest::parse(
             "[agent]\nid = \"y\"\ndisplay_name = \"y\"\n",
             std::path::Path::new("y.toml"),
         )
         .unwrap();
-        assert_eq!(verify_patterns(&empty, "m-1"), vec!["m-1".to_string()]);
+        let (id, other) = verify_patterns(&empty, "m-1");
+        assert_eq!(id, vec!["m-1".to_string()]);
+        assert!(other.is_empty());
     }
 
     #[test]
@@ -1861,5 +2552,287 @@ line_regex = ['^\s*❯\s+\S']
         let b = e.mint_msg_id();
         assert_ne!(a, b);
         assert!(a.starts_with("m-") && a.len() == 8, "{a}");
+    }
+
+    // -----------------------------------------------------------------
+    // Post-paste verification (fix B: stale screen text must not verify)
+    // -----------------------------------------------------------------
+
+    const COMPOSER_MANIFEST: &str = r#"
+[agent]
+id = "c"
+display_name = "c"
+
+[[rule]]
+id = "composer_has_staged_input"
+state = "idle_with_input"
+priority = 1050
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^\s*❯\s+\S']
+
+[injection]
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>", "Pasted text"]
+"#;
+
+    fn composer_manifest() -> Manifest {
+        Manifest::parse(COMPOSER_MANIFEST, std::path::Path::new("c.toml")).unwrap()
+    }
+
+    #[test]
+    fn stale_generic_pattern_does_not_verify() {
+        let m = composer_manifest();
+        let (id, other) = verify_patterns(&m, "m-new01");
+        // "Pasted text" from a PREVIOUS message sits in the transcript;
+        // the composer is empty. Nothing staged.
+        let screen = "you: [Pasted text #1 +9 lines]\nassistant: done\n❯ \n? for shortcuts";
+        assert_eq!(staged_verified(&m, screen, &id, &other), None);
+        // The same chip ON the composer line is a real staging.
+        let staged = "transcript\n❯ [Pasted text #2 +9 lines]\n? for shortcuts";
+        assert_eq!(staged_verified(&m, staged, &id, &other), Some(false));
+        // The substituted id counts anywhere in the region: it is unique
+        // to this delivery.
+        let id_anywhere = "transcript\n❯ [cyclops m-new01] hello\n? for shortcuts";
+        assert_eq!(staged_verified(&m, id_anywhere, &id, &other), Some(true));
+    }
+
+    /// The whole inject() path with a mock backend: the stale screen fails
+    /// all verify re-reads (this failed before fix B: any "Pasted text" in
+    /// the bottom 15 lines verified), and a composer-line staging passes.
+    struct MockInjector {
+        screens: StdMutex<Vec<String>>,
+        cursor: std::sync::atomic::AtomicUsize,
+        pasted: StdMutex<Vec<String>>,
+    }
+
+    impl MockInjector {
+        fn new(screens: Vec<&str>) -> MockInjector {
+            MockInjector {
+                screens: StdMutex::new(screens.into_iter().map(String::from).collect()),
+                cursor: std::sync::atomic::AtomicUsize::new(0),
+                pasted: StdMutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Injector for MockInjector {
+        async fn paste(&self, _pane_id: &str, payload: &str) -> Result<(), String> {
+            self.pasted.lock().unwrap().push(payload.to_string());
+            Ok(())
+        }
+        async fn submit(&self, _pane_id: &str, _key: &str) -> Result<(), String> {
+            Ok(())
+        }
+        async fn capture(&self, _pane_id: &str) -> Result<String, String> {
+            let screens = self.screens.lock().unwrap();
+            let i = self.cursor.fetch_add(1, Ordering::Relaxed);
+            Ok(screens[i.min(screens.len() - 1)].clone())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inject_rejects_stale_screen_and_accepts_staged() {
+        let m = composer_manifest();
+        let handle = DeliveryHandle::new("m-new01", "worker", "%1", 0, "payload".into());
+
+        let stale = "you: [Pasted text #1 +9 lines]\nold turn\n❯ \n? for shortcuts";
+        let mock = MockInjector::new(vec![stale]);
+        assert_eq!(
+            inject(&mock, &handle, &m).await,
+            Err("verify_failed".to_string())
+        );
+        assert_eq!(mock.pasted.lock().unwrap().len(), 1, "payload was pasted");
+
+        let staged = "transcript\n❯ [Pasted text #2 +9 lines]\n? for shortcuts";
+        let mock = MockInjector::new(vec![stale, staged]);
+        let (window, id_staged) = inject(&mock, &handle, &m).await.expect("staged verifies");
+        assert!(!id_staged, "generic pattern staged it, not the id");
+        assert!(window.contains("Pasted text #2"));
+    }
+
+    // -----------------------------------------------------------------
+    // Tier-2 evidence (fix D) and the detach-aware clock (fix E)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn tier2_changed_window_alone_needs_the_id_staged() {
+        // A changed window with no staged id is a redraw, not delivery
+        // evidence (this returned true before fix D).
+        assert!(!tier2_evidence(true, false, false, false));
+        assert!(tier2_evidence(true, true, false, false));
+        assert!(tier2_evidence(false, false, true, false));
+        assert!(tier2_evidence(false, false, false, true));
+        // Marker gone but nothing else moved: not evidence.
+        assert!(!tier2_evidence(false, true, false, false));
+    }
+
+    #[test]
+    fn unobservable_evidence_freezes_instead_of_expiring() {
+        // The detach race: the watcher is cleared before its lifecycle
+        // event is broadcast, so a checkpoint's evidence pass cannot look.
+        // Before the fix an expired clock returned Timeout here and the
+        // retry double-pasted a delivery that may have landed.
+        assert_eq!(
+            checkpoint_step(Evidence::Unobservable, true),
+            CheckpointStep::Freeze
+        );
+        assert_eq!(
+            checkpoint_step(Evidence::Unobservable, false),
+            CheckpointStep::Freeze
+        );
+        // Expiry stands only on a pass that looked and saw nothing.
+        assert_eq!(
+            checkpoint_step(Evidence::Absent, true),
+            CheckpointStep::Expire
+        );
+        assert_eq!(
+            checkpoint_step(Evidence::Absent, false),
+            CheckpointStep::Wait
+        );
+        assert_eq!(
+            checkpoint_step(Evidence::Confirmed, true),
+            CheckpointStep::Deliver
+        );
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ack_clock_freezes_across_detach_and_extends_deadlines() {
+        let t0 = Instant::now();
+        let mut c = AckClock::new(t0, Some(ms(1500)));
+        assert_eq!(c.next_target(), Some((t0 + ms(1500), true)));
+
+        // Detach at +200ms: the clock stops firing entirely.
+        c.freeze(t0 + ms(200));
+        assert!(c.frozen());
+        assert_eq!(c.next_target(), None);
+        assert!(!c.expired(t0 + ms(60_000)), "a frozen clock never expires");
+        // A second freeze keeps the first freeze instant.
+        c.freeze(t0 + ms(300));
+
+        // Reattach at +6200ms: 6s of outage extend every deadline.
+        c.unfreeze(t0 + ms(6200));
+        assert_eq!(c.next_target(), Some((t0 + ms(7500), true)));
+        c.end_hook_phase(t0 + ms(7500));
+        // Checkpoints shifted by 6s; the ones the hook phase covered are
+        // skipped (250/750/1500 -> 6250/6750/7500 are all <= now).
+        assert_eq!(c.next_target(), Some((t0 + ms(9000), false)));
+        c.advance_checkpoint();
+        assert_eq!(c.next_target(), Some((t0 + ms(11_000), false)));
+        c.advance_checkpoint();
+        // Past the checkpoints the final deadline is also shifted.
+        assert_eq!(c.next_target(), Some((t0 + ms(11_000), false)));
+        assert!(!c.expired(t0 + ms(10_999)));
+        assert!(c.expired(t0 + ms(11_000)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ack_clock_without_hook_window_goes_straight_to_checkpoints() {
+        let t0 = Instant::now();
+        let c = AckClock::new(t0, None);
+        assert_eq!(c.next_target(), Some((t0 + ms(250), false)));
+    }
+
+    // -----------------------------------------------------------------
+    // Decline TOCTOU (fix G: modal must still match before the confirm)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn modal_match_is_rechecked_by_rule_id() {
+        let m = Manifest::parse(
+            r#"
+[agent]
+id = "x"
+display_name = "x"
+
+[[rule]]
+id = "update_modal"
+state = "blocked_modal"
+priority = 1300
+region = "bottom_non_empty_lines(8)"
+contains = ["FAKE-UPDATE-AVAILABLE"]
+decline_keys = ["3", "Enter"]
+auto_dismiss = true
+
+[[rule]]
+id = "other_modal"
+state = "blocked_modal"
+priority = 1200
+region = "bottom_non_empty_lines(8)"
+contains = ["OTHER-DIALOG"]
+"#,
+            std::path::Path::new("x.toml"),
+        )
+        .unwrap();
+        assert!(modal_still_matches(
+            &m,
+            "t",
+            "text\nFAKE-UPDATE-AVAILABLE\nmore",
+            "update_modal"
+        ));
+        // Dialog vanished: never send the confirming key.
+        assert!(!modal_still_matches(
+            &m,
+            "t",
+            "plain shell output",
+            "update_modal"
+        ));
+        // A DIFFERENT dialog appeared: the confirm belongs to nobody.
+        assert!(!modal_still_matches(
+            &m,
+            "t",
+            "OTHER-DIALOG",
+            "update_modal"
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // Buffer hygiene (fix G: delete-buffer after a failed paste)
+    // -----------------------------------------------------------------
+
+    /// Real tmux on an isolated -L socket: when paste-buffer fails after
+    /// load-buffer succeeded, the loaded buffer must not linger
+    /// server-global with the payload in it.
+    #[tokio::test]
+    async fn paste_failure_deletes_the_loaded_buffer() {
+        if std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let pid = std::process::id();
+        let socket = format!("cyc-dubuf-{pid}");
+        let spool = std::path::PathBuf::from(format!("/private/tmp/cyc-dubuf-spool-{pid}"));
+        let cfg = cyclops_tmux::ControlConfig::new_session("dubuf")
+            .on_socket(&socket)
+            .with_config_file("/dev/null")
+            .with_buffer_spool_dir(&spool);
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("tmux spawns");
+        let client = Arc::new(client);
+        let injector = TmuxInjector {
+            client: Arc::clone(&client),
+            buffer: format!("cyc-{pid}-t"),
+        };
+        // %9999 does not exist: load-buffer succeeds, paste-buffer fails.
+        let err = injector.paste("%9999", "secret payload").await.unwrap_err();
+        assert_eq!(err, "paste_failed");
+        let buffers = client.command("list-buffers").await.unwrap_or_default();
+        assert!(
+            buffers.iter().all(|l| !l.contains(&injector.buffer)),
+            "buffer lingered after failed paste: {buffers:?}"
+        );
+        client.shutdown().await;
+        let _ = std::process::Command::new("tmux")
+            .args(["-L", &socket, "kill-server"])
+            .output();
+        let _ = std::fs::remove_dir_all(&spool);
     }
 }

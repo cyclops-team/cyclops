@@ -15,6 +15,10 @@ Files:
 - `hooklog.py`: the hook command wired into vendor hook configs. Appends one
   NDJSON line per hook event, with `--event <name>` self-tagging because agy
   payloads carry no event-name field (finding F7).
+- `test_vocab.py`: modal-vocabulary regression test, no tmux needed. Locks
+  the trust-dialog handling (explicit affirmative, never Escape on a dialog
+  whose text says Esc cancels/exits) against the real Claude 2.1.220
+  capture. Run directly: `python3 tests/harness/test_vocab.py`.
 
 ## The rule: never touch the live session
 

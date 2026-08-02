@@ -3,7 +3,10 @@
 //! Every `%`-prefixed line outside a reply block is parsed here. Unknown
 //! lines become [`Notification::Other`], never an error: tmux control mode
 //! is unversioned and grows notifications between releases, and the adapter
-//! must keep working against tmux HEAD (ADR-001 T7).
+//! must keep working against tmux HEAD (ADR-001 T7). Lines enter as raw
+//! bytes ([`parse_notification_bytes`]): %output data is not guaranteed to
+//! be valid UTF-8 on the wire (F22), and decoding must never turn a
+//! notification into an error.
 
 /// One parsed control-mode notification.
 ///
@@ -86,6 +89,66 @@ pub enum Notification {
     /// Anything we do not recognize, kept verbatim for debug logging.
     /// Forward compatibility with tmux HEAD: never an error.
     Other(String),
+}
+
+/// Parse one control-mode line given as raw bytes. Total, like
+/// [`parse_notification`].
+///
+/// Invalid UTF-8 is a real wire condition, not corruption (MEASURED on
+/// 3.6a, F22): pane bytes >= 0x80 ride %output/%extended-output verbatim,
+/// and a multi-byte character split across two pty reads makes each of the
+/// two lines invalid on its own. Those lines are parsed byte-faithfully so
+/// the pane's exact bytes reach the consumer. Any other notification kind
+/// keeps its structure through a lossy conversion.
+pub fn parse_notification_bytes(line: &[u8]) -> Notification {
+    match std::str::from_utf8(line) {
+        Ok(s) => parse_notification(s),
+        Err(_) => match parse_output_bytes(line) {
+            Some(n) => n,
+            None => parse_notification(&String::from_utf8_lossy(line)),
+        },
+    }
+}
+
+/// Byte-faithful %output / %extended-output parse for lines that are not
+/// valid UTF-8. None for any other shape (caller falls back to lossy).
+fn parse_output_bytes(line: &[u8]) -> Option<Notification> {
+    if let Some(rest) = line.strip_prefix(b"%output ".as_slice()) {
+        let sp = rest.iter().position(|&b| b == b' ')?;
+        let pane = std::str::from_utf8(&rest[..sp]).ok()?;
+        return Some(Notification::Output {
+            pane: pane.to_string(),
+            data: unescape_octal_bytes(&rest[sp + 1..]),
+        });
+    }
+    if let Some(rest) = line.strip_prefix(b"%extended-output ".as_slice()) {
+        let sp = rest.iter().position(|&b| b == b' ')?;
+        let pane = std::str::from_utf8(&rest[..sp]).ok()?;
+        let tail = &rest[sp + 1..];
+        // Same shape as the str parser: age (plus reserved words), then
+        // " : ", then data; empty data leaves the line ending in " :".
+        let (head, data) = match find_subslice(tail, b" : ") {
+            Some(i) => (&tail[..i], &tail[i + 3..]),
+            None => (tail.strip_suffix(b" :".as_slice())?, &[][..]),
+        };
+        let age_ms = head
+            .split(|&b| b == b' ')
+            .next()
+            .and_then(|a| std::str::from_utf8(a).ok())
+            .and_then(|a| a.parse().ok())
+            .unwrap_or(0);
+        return Some(Notification::ExtendedOutput {
+            pane: pane.to_string(),
+            age_ms,
+            data: unescape_octal_bytes(data),
+        });
+    }
+    None
+}
+
+/// First occurrence of `needle` in `hay`.
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Parse one control-mode line into a [`Notification`]. Total: unknown or
@@ -264,7 +327,12 @@ fn parse_subscription_changed(line: &str, rest: &str) -> Notification {
 /// and backslash this way and leaves valid UTF-8 alone, so the result is the
 /// pane's raw byte stream.
 pub fn unescape_octal(s: &str) -> Vec<u8> {
-    let b = s.as_bytes();
+    unescape_octal_bytes(s.as_bytes())
+}
+
+/// [`unescape_octal`] over raw bytes: needed because %output data is not
+/// guaranteed to be valid UTF-8 on the wire (F22).
+pub fn unescape_octal_bytes(b: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
@@ -413,6 +481,64 @@ mod tests {
                 reason: Some("detached".into())
             }
         );
+    }
+
+    #[test]
+    fn bytes_valid_utf8_delegates_to_str_parser() {
+        assert_eq!(
+            parse_notification_bytes(b"%output %0 hello"),
+            parse_notification("%output %0 hello")
+        );
+        assert_eq!(
+            parse_notification_bytes(b"%pause %5"),
+            Notification::Pause { pane: "%5".into() }
+        );
+    }
+
+    #[test]
+    fn bytes_raw_invalid_output_is_byte_faithful() {
+        // MEASURED wire shape (F22): bytes >= 0x80 arrive verbatim.
+        let n = parse_notification_bytes(b"%output %0 X\xffY\\015");
+        match n {
+            Notification::Output { pane, data } => {
+                assert_eq!(pane, "%0");
+                assert_eq!(data, b"X\xffY\r");
+            }
+            other => panic!("wrong parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bytes_split_multibyte_fragment_survives() {
+        // MEASURED (F22): a split braille char yields two lines, each an
+        // invalid fragment on its own.
+        let n = parse_notification_bytes(b"%output %0 \xe2\xa0");
+        match n {
+            Notification::Output { data, .. } => assert_eq!(data, b"\xe2\xa0"),
+            other => panic!("wrong parse: {other:?}"),
+        }
+        let n = parse_notification_bytes(b"%extended-output %1 42 : \x9b\\012");
+        match n {
+            Notification::ExtendedOutput { pane, age_ms, data } => {
+                assert_eq!(pane, "%1");
+                assert_eq!(age_ms, 42);
+                assert_eq!(data, b"\x9b\n");
+            }
+            other => panic!("wrong parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bytes_invalid_non_output_lines_keep_structure_lossily() {
+        // Free-text tails of other notifications should not break parsing;
+        // structure survives with U+FFFD in the text.
+        let n = parse_notification_bytes(b"%session-renamed na\xffme");
+        match n {
+            Notification::SessionRenamed { name } => {
+                assert_eq!(name, "na\u{FFFD}me");
+            }
+            other => panic!("wrong parse: {other:?}"),
+        }
     }
 
     #[test]

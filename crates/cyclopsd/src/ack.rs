@@ -19,6 +19,13 @@ use crate::{delivery, fusion, unix_ms, Inner};
 
 /// Dedupe memory per agent; old keys roll off.
 const SEEN_CAP: usize = 256;
+/// A replayed seq at or below this reads as a counter reset: the hook's
+/// file counter restarts at 1 after garbage or deletion, so genuine resets
+/// replay from the bottom of the range.
+const RESET_SEQ_CEILING: u64 = 8;
+/// Consecutive replayed below-max seqs before a reset is assumed anyway
+/// (a counter that restarted from a partially-preserved file).
+const RESET_REPLAY_STREAK: u32 = 3;
 
 /// Per-agent dedupe state.
 pub(crate) struct AckState {
@@ -29,6 +36,12 @@ pub(crate) struct AckState {
 struct AgentSeen {
     seqs: HashSet<u64>,
     seq_order: VecDeque<u64>,
+    /// Highest seq ever ingested. A replayed LOWER seq is only a counter
+    /// reset when it is small or keeps repeating; a lone repost of an old
+    /// seq is a duplicate.
+    max_seq: u64,
+    /// Consecutive replayed below-max seqs; a streak marks a reset.
+    low_replays: u32,
     keys: HashSet<String>,
     key_order: VecDeque<String>,
 }
@@ -41,13 +54,36 @@ impl AckState {
     }
 
     /// True when this (agent, seq) was already ingested.
+    ///
+    /// The hook's file counter restarts at 1 after garbage or deletion
+    /// (cyclops/src/hook.rs), so a replayed below-max seq CAN mean a reset.
+    /// But only a small seq (<= RESET_SEQ_CEILING) or a consecutive streak
+    /// of below-max replays reads as one: an exact repost of a lone older
+    /// out-of-order seq is a duplicate and must not wipe the dedupe window.
+    /// Out-of-order arrival of a fresh seq stays legal, and an exact repost
+    /// of the newest seq stays a duplicate. The (session_id, turn_id,
+    /// event) key dedupe remains the backstop either way.
     fn seen_seq(&self, agent: &str, seq: u64) -> bool {
         let mut agents = self.agents.lock().expect("ack agents lock");
         let entry = agents.entry(agent.to_string()).or_default();
-        if !entry.seqs.insert(seq) {
-            return true;
+        if entry.seqs.contains(&seq) {
+            let reset = seq < entry.max_seq && {
+                entry.low_replays += 1;
+                seq <= RESET_SEQ_CEILING || entry.low_replays >= RESET_REPLAY_STREAK
+            };
+            if !reset {
+                return true;
+            }
+            entry.seqs.clear();
+            entry.seq_order.clear();
+            entry.max_seq = 0;
+            entry.low_replays = 0;
+        } else {
+            entry.low_replays = 0;
         }
+        entry.seqs.insert(seq);
         entry.seq_order.push_back(seq);
+        entry.max_seq = entry.max_seq.max(seq);
         if entry.seq_order.len() > SEEN_CAP {
             if let Some(old) = entry.seq_order.pop_front() {
                 entry.seqs.remove(&old);
@@ -102,16 +138,39 @@ fn dedupe_ids(payload: &Value) -> Option<(String, String)> {
 /// Handle one agent.state.report. Never errors for unknown agents: hooks
 /// must not break the agent CLI they run inside, so unresolvable reports
 /// are acknowledged and dropped with a debug log.
+///
+/// A report does not need the tmux connection: while a session is detached
+/// the pane is resolved against its last-known table, so hook ACKs stay
+/// visible through a control-connection outage (the m1 soak lost a
+/// delivery to exactly this blindness). Fusion recompute is skipped on
+/// that path; the reading is stored and reconciles at reattach.
 pub(crate) async fn handle_report(
     inner: &Arc<Inner>,
     params: StateReportParams,
 ) -> Result<Value, WireError> {
     let event = normalize_event(&params.event);
 
-    let Some((session_idx, pane_id)) = inner.resolve_recipient(&params.agent) else {
-        debug!(agent = %params.agent, "state report for unknown agent dropped");
-        return Ok(json!({"applied": false, "reason": "unknown_agent"}));
+    let (row, watcher) = match inner.resolve_recipient(&params.agent) {
+        Some((idx, pane_id)) => {
+            let Some(watcher) = inner.watcher_of(idx) else {
+                // resolve_recipient only answers from live watchers; a
+                // detach between the two calls lands on the fallback.
+                return Ok(json!({"applied": false, "reason": "session_detached"}));
+            };
+            let Some(row) = watcher.pane(&pane_id) else {
+                return Ok(json!({"applied": false, "reason": "no_such_pane"}));
+            };
+            (row, Some(watcher))
+        }
+        None => match inner.resolve_recipient_last_known(&params.agent) {
+            Some((_, row)) => (row, None),
+            None => {
+                debug!(agent = %params.agent, "state report for unknown agent dropped");
+                return Ok(json!({"applied": false, "reason": "unknown_agent"}));
+            }
+        },
     };
+    let pane_id = row.pane_id.clone();
 
     // Dedupe: exact repost (same reporter seq), then cross-config
     // duplicates on (session_id, turn_id, event) (amendment d).
@@ -127,13 +186,7 @@ pub(crate) async fn handle_report(
         }
     }
 
-    let Some(watcher) = inner.watcher_of(session_idx) else {
-        return Ok(json!({"applied": false, "reason": "session_detached"}));
-    };
-    let Some(row) = watcher.pane(&pane_id) else {
-        return Ok(json!({"applied": false, "reason": "no_such_pane"}));
-    };
-    let manifest = fusion::bind_manifest(&inner.manifests, &row.current_command);
+    let manifest = fusion::bind_manifest_for(inner, &row);
 
     // ACK matching: the manifest hooks.ack event whose ack_payload_field
     // contains a waiting delivery's message id.
@@ -177,19 +230,23 @@ pub(crate) async fn handle_report(
             .expect("hook readings lock")
             .insert(
                 pane_id.clone(),
-                SensorReading {
+                fusion::HookEntry::new(SensorReading {
                     sensor: Sensor::Hook,
                     state,
                     rule: params.event.clone(),
                     ts: unix_ms(),
-                },
+                }),
             );
     }
     // Reconcile on the edge; the recompute emits the state event and the
-    // ledger line if the fused verdict moved.
-    fusion::recompute_pane(inner, &watcher, &pane_id, false, "hook_report").await;
+    // ledger line if the fused verdict moved. Detached sessions have no
+    // sensors to reconcile; the stored reading waits for reattach.
+    let live = watcher.is_some();
+    if let Some(w) = watcher {
+        fusion::recompute_pane(inner, &w, &pane_id, false, "hook_report").await;
+    }
 
-    Ok(json!({"applied": true, "matched": matched, "state": mapped}))
+    Ok(json!({"applied": true, "matched": matched, "state": mapped, "live": live}))
 }
 
 #[cfg(test)]
@@ -234,5 +291,61 @@ mod tests {
         assert!(!st.seen_seq("a", 5));
         assert!(!st.seen_seq("a", 3)); // out of order is fine
         assert!(st.seen_seq("a", 5)); // exact repost is not
+    }
+
+    #[test]
+    fn seq_counter_reset_clears_the_window() {
+        let st = AckState::new();
+        for i in 1..=5 {
+            assert!(!st.seen_seq("a", i));
+        }
+        // hookseq file lost: the hook restarts at 1. The replayed low seq
+        // is a reset, not a duplicate, and the window starts over.
+        assert!(
+            !st.seen_seq("a", 1),
+            "reset seq 1 must not read as duplicate"
+        );
+        assert!(
+            !st.seen_seq("a", 2),
+            "post-reset seq 2 must not read as duplicate"
+        );
+        // Exact repost after the reset still dedupes.
+        assert!(st.seen_seq("a", 2));
+    }
+
+    #[test]
+    fn lone_out_of_order_repost_is_duplicate_not_reset() {
+        let st = AckState::new();
+        for i in 1..=100 {
+            assert!(!st.seen_seq("a", i));
+        }
+        // An exact repost of an old-but-not-small seq is a duplicate.
+        // Before the fix this read as a counter reset and wiped the
+        // window, so the next reposts sailed through as fresh.
+        assert!(st.seen_seq("a", 50), "repost of 50 must be a duplicate");
+        assert!(st.seen_seq("a", 99), "window must survive the repost");
+        assert!(st.seen_seq("a", 100), "newest repost stays a duplicate");
+        // A fresh seq still ingests normally.
+        assert!(!st.seen_seq("a", 101));
+        // A genuinely small replayed seq is still a reset.
+        assert!(!st.seen_seq("a", 1), "small replay is a real reset");
+    }
+
+    #[test]
+    fn consecutive_low_replays_read_as_reset() {
+        let st = AckState::new();
+        for i in 1..=100 {
+            assert!(!st.seen_seq("a", i));
+        }
+        // A hook that restarted from a partially-preserved counter replays
+        // from the middle of the range: the streak marks the reset.
+        assert!(st.seen_seq("a", 40), "first low replay is a duplicate");
+        assert!(st.seen_seq("a", 41), "second low replay is a duplicate");
+        assert!(
+            !st.seen_seq("a", 42),
+            "third consecutive low replay is a reset"
+        );
+        // The window restarted: the old high seqs are fresh again.
+        assert!(!st.seen_seq("a", 43));
     }
 }

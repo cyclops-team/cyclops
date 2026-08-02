@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 description = "The Cyclops daemon: control-mode watcher, sensor fusion, ledger, delivery pipeline, NDJSON socket API."
 
+[dev-dependencies]
+# start_paused tests: virtual time for the verify re-read delays.
+tokio = { workspace = true, features = ["test-util"] }
+
 [dependencies]
 cyclops-proto.workspace = true
 cyclops-manifest.workspace = true

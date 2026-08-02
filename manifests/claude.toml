@@ -16,6 +16,12 @@ id = "claude"
 display_name = "Claude Code"
 version_tested = "2.1.220"
 process_names = ["claude"]
+# MEASURED (m1 soak): on native installs ~/.local/bin/claude is a symlink to
+# ~/.local/share/claude/versions/2.1.220 and macOS derives the process comm
+# from the resolved file, so #{pane_current_command} reports the bare version
+# string "2.1.220". process_names alone never binds those panes; the daemon
+# falls back to matching argv[0] basenames via pane_pid.
+argv_basenames = ["claude"]
 
 [hooks]
 # Configured via --settings <file>; the file may be generated per pane so the
@@ -72,10 +78,14 @@ evidence = "MEASURED claude_idle_composer.txt"
 [[rule]]
 id = "composer_has_staged_input"
 state = "idle_with_input"
-priority = 950
+priority = 1050
 region = "bottom_non_empty_lines(6)"
 line_regex = ['^\s*❯\s+\S']
-note = "Do not inject: would concatenate with existing text. Includes the collapsed paste form '❯ [Pasted text #1 +80 lines]'."
+note = """Do not inject: would concatenate with existing text. Includes the
+collapsed paste form '❯ [Pasted text #1 +80 lines]'. Priority MUST stay above
+title_idle_sparkle: the ✳ title reads idle while a human draft sits in the
+composer, and an idle verdict would let the gate paste over the draft and
+auto-submit it (M1 review, HIGH). Human live typing always wins (GOALS)."""
 evidence = "MEASURED m4_capture.txt and soak composer verification"
 
 [[rule]]
@@ -85,6 +95,24 @@ priority = 800
 region = "bottom_non_empty_lines(8)"
 contains = ["esc to interrupt"]
 evidence = "MEASURED claude_busy2_after_enter.txt"
+
+[[rule]]
+id = "trust_dialog"
+state = "blocked_modal"
+priority = 1300
+region = "bottom_non_empty_lines(16)"
+any = [
+  { contains = ["safety check"] },
+  { contains = ["trust this folder"] },
+]
+note = """Folder-trust dialog, observed on 2.1.220: 'Quick safety check: Is this
+a project you created or one you trust?' with '1. Yes, I trust this folder /
+2. No, exit' and 'Enter to confirm . Esc to cancel'. Escape EXITS the CLI, so
+startup_modal's auto-dismiss decline (Escape) would kill the session; this rule
+sits above startup_modal so that can never match here. Trust is a human
+decision (same policy as codex trust_dialog): park the delivery and alert."""
+evidence = "MEASURED m1 soak, tests/raw/m1-soak/claude_launch_modals.log"
+auto_dismiss = false
 
 [[rule]]
 id = "startup_modal"
@@ -97,7 +125,9 @@ any = [
 ]
 note = """UNSAFE TO INJECT. Observed live: a 'Claude in Chrome extension detected'
 dialog on first launch swallowed a 4 KB paste entirely (measurements.md M4).
-Dismiss with Escape, never a bare Enter."""
+Dismiss with Escape, never a bare Enter. The folder-trust dialog also contains
+'Enter to confirm' but there Escape exits the CLI; trust_dialog (priority 1300)
+must always outrank this rule."""
 evidence = "MEASURED m4_paste.py first run"
 decline_keys = ["Escape"]
 auto_dismiss = true

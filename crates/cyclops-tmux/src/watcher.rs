@@ -254,6 +254,10 @@ impl SessionWatcher {
     /// Reconcile against authoritative state right now (explicit doubt).
     /// Runs on the event loop so it serializes with hint-driven reconciles;
     /// returns once the table reflects the query result.
+    ///
+    /// `Err(Timeout)` means the query reply was late, nothing more: the
+    /// table kept its prior state and the connection is still up. Only
+    /// `Err(Disconnected)` means the watcher is dead and needs rebuilding.
     pub async fn reconcile_now(&self) -> Result<(), TmuxError> {
         let (tx, rx) = oneshot::channel();
         self.reconcile_tx

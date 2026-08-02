@@ -1,70 +1,65 @@
 # Status
 
-Updated 2026-08-02. M0 complete and audited; M1 launched.
+Updated 2026-08-02. M1 complete: gate passed, reviews cleared. M2 next.
 
 ## Done
 
-- **M0 shadow daemon, end to end.** `demos/m0-status.sh` runs the whole
-  stack: isolated tmux server, cyclopsd attached in control mode, `cyclops
-  ping` (0.1ms round trip) and `cyclops status` rendering the branded grid.
-- `cyclops-proto`: protocol v1, ledger schema, delivery state machine. 7 tests.
-- `cyclops-manifest`: rule engine + shipped claude/codex/agy manifests with
-  modal decline actions (amendment g). 7 tests, hazard screens locked.
-- `cyclops-tmux`: control client (FIFO reply correlation via %begin flags,
-  pause-after at attach per amendment a, %pause auto-resume, octal-safe
-  %output), zero-polling SessionWatcher on refresh-client -B subscriptions
-  (probed working on 3.6a, F13) with hint-debounced list-panes reconcile,
-  typed helpers incl. byte-exact bracketed paste. 29 tests.
-- `cyclopsd` M0 scope: config, boot, fusion (title+screen, disagreement
-  observable), socket server (hello, ping/status/pane.read/events.subscribe,
-  peer credentials), signal shutdown. Integration-tested against a live
-  isolated tmux server.
-- `cyclops` CLI: status/ping/read/watch, strict-grid rendering, semantic
-  style module (truecolor + 256, NO_COLOR, --plain), GOALS-grade error copy.
-  26 tests.
-- `cyclops-ledger` (early M1): crash-safe appender (fsync per line, torn-tail
-  sealing, monotonic seq across restarts), cursor replay. 5 tests. Standalone
-  until M1 wires it in.
-- Harness ported (`tests/harness/`), CI authored, `docs/ARCHITECTURE.md`,
-  `docs/DELIVERY.md` (M1 spec), `docs/GOALS.md` (admin quality bar).
-- Milestone queue authored as named workflows in `.claude/workflows/`
-  (m1-delivery ... m6-flow), each preflight-gated on a green committed base.
-- New findings F13-F18 in `findings.md`. Standouts: F13 (subscriptions work
-  on 3.6a, zero-polling is real), F14 (tmux sanitizes control-mode replies
-  without `-u` in non-UTF-8 environments, which would have silently
-  destroyed the Claude title sensor under launchd; Python probes could never
-  have seen it).
+- M0 shadow daemon (ffa4b5b): control-mode attach, zero-polling pane table,
+  fusion, socket API, branded CLI. Audited; startup 107ms.
+- M1 delivery pipeline (416056d + this commit): msg.send end to end with
+  per-recipient FIFO workers, the full gate order, unique-buffer injection
+  from 0600 spool files, composer verification (id-anchored, stale-text
+  proof), ACK tiers with detach-frozen deadlines and a post-reattach
+  evidence pass before any retry, late-ACK upgrade, codex hook dedupe with
+  reset-safe seq handling, single bounded retry, quota parking, manifest
+  modal declines with TOCTOU re-checks, occupant re-check before paste AND
+  submit (pane_rebound), restart limbo closure at boot, broadcast, spec
+  receipts, fail-closed peer-cred identity, argv-fallback manifest binding
+  for native installs, escaped-capture ghost/typed discrimination for
+  codex, `cyclops send` + `cyclops hook`. 196 tests green workspace-wide.
+
+## M1 gate evidence
+
+- Soak (tests/raw/m1-soak-2): 221 deliveries, zero unrecovered loss, zero
+  retries, zero duplicates, zero control drops in 252s. claude 100/100
+  delivered_verified (ack p50 12ms) through the real argv binding; codex
+  100/100 (66 hook-verified, 34 screen-tier); agy 20 delivered then a
+  genuine vendor quota park, the F11 chain end to end.
+- Reviews: correctness PASS (all seven blockers verified fixed); invariants
+  BLOCK twice, both HIGHs closed in the finishing pass and re-verified PASS
+  (196 tests, clippy clean, regression hunt empty).
+- Root causes worth remembering: F22 (tmux 3.6a emits invalid UTF-8 on
+  control-mode notification lines when multi-byte glyphs split across pty
+  reads; UTF-8 line decoding read a live connection as dead; Claude-only
+  because only Claude streams braille), F19-F21 in findings.md.
 
 ## Next
 
-- M1 via the `m1-delivery` workflow: ledger wiring, msg.send end to end,
-  ACK tiers, quota parking, modal declines, 100-message mini-soak per
-  available CLI as the regression gate.
+- Push this commit to origin/v2, launch m2-messaging: history/thread,
+  agent.wait, hooks install + startup self-test (amendment c), v1 shim
+  PREPARED with the cutover held for admin.
 
-## Audit note
+## Backlog (from final verification, non-blocking)
 
-The M0 cyclopsd implementation agent died mid-run (API error) after its code
-was complete but before self-reporting. An independent audit substituted:
-verdict complete-to-spec, zero-polling verified across every timer in the
-workspace, startup measured at 107ms against the 300ms bar. Its three minor
-gaps are fixed: tests now pass tmux -u (F14 discipline), an unexpected
-socket state at boot fails loudly instead of reclaiming a possibly-live
-daemon's socket, and a capture failure with no prior verdict reports
-decided_by "sensor_error" instead of masquerading as a consulted rule set.
+- codex marker_in_composer consults only plain rules, so tier-2's
+  "marker left the composer" conjunct is vacuous for codex: a narrow race
+  can label delivered_unverified while text sits in the composer (record
+  truthfulness, not injection safety). Teach the ACK evidence path the
+  escaped capture, or add a plain composer marker regex for codex.
+- occupant_unchanged reads the subscription-fed table, so a swap the
+  watcher has not seen yet passes the re-check. Accepted residual window,
+  consistent with the zero-polling design; documented in DELIVERY.md.
+- agy full uninterrupted 100-leg deferred on vendor quota flakiness
+  (parked legs count complete per the frozen gate rules).
 
 ## Risks
 
-- CI authored but unexercised (no remote; pushes are admin-only).
-- The M1 mini-soak spends real vendor tokens (cheapest models, trivial
-  prompts, quota parking honored as a valid outcome).
+- CI runs remotely for the first time on this push (v2 branch trigger).
 
 ## Open questions
 
 - License file before anything publishes (admin decision).
-- Local-time vs UTC gutter in `cyclops watch` (needs a tz dependency; UTC
-  for now, one-line decision later).
 
 ## Deviations from the brief
 
-- None in behavior. One bookkeeping fix: docs/ARCHITECTURE.md initially
-  carried a derived amendment lettering; corrected to the brief's (a)-(i).
+- None. M1 closure was held twice on its own gate evidence before passing.

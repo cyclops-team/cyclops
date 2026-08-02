@@ -9,7 +9,8 @@
 //!   data, never errors.
 //! - [`ControlClient`]: one `tmux -C` child, FIFO reply correlation, flow
 //!   control via pause-after, typed helpers (capture, display, send-keys,
-//!   load-buffer, paste-buffer).
+//!   load-buffer, paste-buffer). The stream is read as raw byte lines:
+//!   %output data is not guaranteed to be valid UTF-8 on the wire (F22).
 //! - [`SessionWatcher`]: zero-polling reconciling pane table for one
 //!   session. `refresh-client -B` subscriptions (MEASURED working on tmux
 //!   3.6a) push per-pane field changes; structural notifications are hints

@@ -104,7 +104,7 @@ pipeline honors it from M1.
 | f | Terminal `blocked_quota` state: park and alert, never auto-retry, F11: quota exhaustion passes every liveness check (9) | `state.rs` `AgentState::BlockedQuota`, `ledger.rs` `ParkedBlockedQuota` (only exit: operator requeue, M2), parking + urgent notify with reset hint in `cyclopsd/src/delivery.rs` | Done |
 | g | Modal vocabulary is per-CLI manifest data with explicit decline options, never generic Enter/Escape, F3, F12 (8) | `cyclops-manifest` `decline_keys` + `auto_dismiss`; `manifests/*.toml` (codex update dialog declines "3" Enter, agy survey "0", trust prompts never auto-dismiss) | Done |
 | h | Fusion documented as rare-blocked-state coverage, not steady-state accuracy (7) | `cyclops-proto/src/state.rs` module doc; fusion engine ordering in `cyclopsd` | Done |
-| i | Delivery behind a trait so per-agent backends can swap to headless protocol drive without touching layers above | Not landed: M1 injection is a single tmux paste path (`cyclopsd/src/delivery.rs` `inject`), no trait seam yet | Open (target M2) |
+| i | Delivery behind a trait so per-agent backends can swap to headless protocol drive without touching layers above | `cyclopsd/src/delivery.rs`: the `Injector` trait (paste / submit / capture) with `TmuxInjector` (load-buffer + paste-buffer + send-keys) as the M1 backend; gate, verify, and ACK layers call through the seam only | Done |
 
 ## The zero-polling contract
 

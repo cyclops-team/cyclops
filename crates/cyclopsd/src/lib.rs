@@ -34,9 +34,9 @@ use cyclops_ledger::LedgerWriter;
 use cyclops_manifest::Manifest;
 use cyclops_proto::{
     AdminNotifyParams, AgentState, Detection, Event, Kind, LedgerLine, MsgSendParams,
-    SensorReading, StateReportParams, WireError,
+    StateReportParams, WireError,
 };
-use cyclops_tmux::{ControlConfig, PaneEvent, PaneField, SessionWatcher, TmuxVersion};
+use cyclops_tmux::{ControlConfig, PaneEvent, PaneField, PaneRow, SessionWatcher, TmuxVersion};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -49,6 +49,20 @@ const RECONNECT_MIN: Duration = Duration::from_millis(200);
 const RECONNECT_MAX: Duration = Duration::from_secs(5);
 /// How long shutdown waits for tasks before aborting them.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+/// Event broadcast capacity. Doubles as every subscriber's buffer: a
+/// briefly-stalled client must survive soak-rate events (the m1 soak
+/// measured drops at ~2.5s of stall on the old 1024), while a truly wedged
+/// client still lags out and is dropped by the server.
+const EVENT_BUFFER: usize = 8192;
+
+/// Test seam: an async pause awaited inside the delivery injection path at
+/// a named phase ("pre_paste", "pre_submit"), installed via
+/// [`Daemon::set_inject_pause`]. Always None in production.
+pub(crate) type InjectPause = Arc<
+    dyn Fn(&'static str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Shared daemon state. Everything the socket server and the fusion engine
 /// need lives here behind one Arc.
@@ -70,12 +84,19 @@ pub(crate) struct Inner {
     /// Adoption registry: pane id -> cyclops label. Explicit labeling via
     /// pane.label (v1 keeper: explicit pane adoption).
     pub(crate) labels: StdMutex<HashMap<String, String>>,
-    /// Latest hook sensor reading per pane id (agent.state.report).
-    pub(crate) hook_readings: StdMutex<HashMap<String, SensorReading>>,
+    /// Latest hook sensor reading per pane id (agent.state.report), plus
+    /// the aging state that keeps a stale edge from pinning fused state.
+    pub(crate) hook_readings: StdMutex<HashMap<String, fusion::HookEntry>>,
+    /// argv-basename cache for manifest binding, per (pane id, pane pid).
+    /// Filled lazily when comm-name binding misses (F21); entries die with
+    /// the pane.
+    pub(crate) argv_cache: StdMutex<HashMap<(String, i32), Option<String>>>,
     /// Delivery pipeline state.
     pub(crate) engine: delivery::Engine,
     /// Hook report dedupe state.
     pub(crate) ack_state: ack::AckState,
+    /// Test-only injection pause, see [`InjectPause`].
+    pub(crate) inject_pause: StdMutex<Option<InjectPause>>,
 }
 
 pub(crate) struct SessionSlot {
@@ -83,6 +104,10 @@ pub(crate) struct SessionSlot {
     pub(crate) link: StdMutex<SessionLink>,
     /// Append-only session ledger at $CYCLOPS_HOME/ledger/<session>.ndjson.
     pub(crate) ledger: Arc<LedgerWriter>,
+    /// Pane table as of the last detach. Hook reports arriving while the
+    /// control connection is down resolve against this (a report does not
+    /// need the tmux connection); the live table wins whenever attached.
+    pub(crate) last_panes: StdMutex<HashMap<String, PaneRow>>,
 }
 
 #[derive(Default)]
@@ -211,26 +236,47 @@ impl Inner {
     /// Resolve a recipient/target name: label first, then pane id. Only
     /// panes that currently exist resolve.
     pub(crate) fn resolve_recipient(&self, name: &str) -> Option<(usize, String)> {
-        let by_label: Option<String> = {
-            let labels = self.labels.lock().expect("labels lock");
-            labels
-                .iter()
-                .find(|(_, l)| l.as_str() == name)
-                .map(|(pane, _)| pane.clone())
-        };
-        let wanted = by_label.as_deref().unwrap_or(name);
+        let wanted = self.label_target(name);
         for (idx, slot) in self.sessions.iter().enumerate() {
             let watcher = {
                 let link = slot.link.lock().expect("session link lock");
                 link.watcher.as_ref().map(Arc::clone)
             };
             if let Some(w) = watcher {
-                if let Some(row) = w.pane(wanted) {
+                if let Some(row) = w.pane(&wanted) {
                     return Some((idx, row.pane_id));
                 }
             }
         }
         None
+    }
+
+    /// Resolve a name against the last-known pane tables of DETACHED
+    /// sessions. Hook reports do not need the tmux connection: a report for
+    /// a pane that existed at detach must still match ACKs, or every detach
+    /// blinds tier 1 (the m1 soak's duplicate-delivery failure).
+    pub(crate) fn resolve_recipient_last_known(&self, name: &str) -> Option<(usize, PaneRow)> {
+        let wanted = self.label_target(name);
+        for (idx, slot) in self.sessions.iter().enumerate() {
+            if slot.link.lock().expect("session link lock").attached {
+                continue; // live table is authoritative while attached
+            }
+            let last = slot.last_panes.lock().expect("last panes lock");
+            if let Some(row) = last.get(&wanted) {
+                return Some((idx, row.clone()));
+            }
+        }
+        None
+    }
+
+    /// Pane id a label points at, or the name itself when unlabeled.
+    fn label_target(&self, name: &str) -> String {
+        let labels = self.labels.lock().expect("labels lock");
+        labels
+            .iter()
+            .find(|(_, l)| l.as_str() == name)
+            .map(|(pane, _)| pane.clone())
+            .unwrap_or_else(|| name.to_string())
     }
 }
 
@@ -307,6 +353,21 @@ impl Daemon {
             None,
         );
         Ok(json!({"notified": true, "seq": seq}))
+    }
+
+    /// Test-only seam: pause the delivery injection path at a named phase
+    /// ("pre_paste", "pre_submit"), between the gate's admit and the
+    /// occupant re-check, so integration tests can change the pane
+    /// occupant deterministically. Not part of the public API surface.
+    #[doc(hidden)]
+    pub fn set_inject_pause<F>(&self, f: F)
+    where
+        F: Fn(&'static str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        *self.inner.inject_pause.lock().expect("inject pause lock") = Some(Arc::new(f));
     }
 
     /// Label (adopt) or unlabel a pane. `target` is a pane id or an
@@ -421,23 +482,29 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     // record must not deliver, so open failures fail the boot.
     let ledger_dir = cfg.home.join("ledger");
     let mut sessions = Vec::with_capacity(cfg.sessions.len());
+    let mut replayed: Vec<(usize, Vec<LedgerLine>)> = Vec::new();
     let engine = delivery::Engine::new();
-    for name in &cfg.sessions {
+    for (idx, name) in cfg.sessions.iter().enumerate() {
         let path = ledger_dir.join(format!("{name}.ndjson"));
         let ledger = LedgerWriter::open(&path, &boot_id)
             .map_err(|e| anyhow::anyhow!("open ledger {}: {e}", path.display()))?;
-        // Message ids stay unique per ledger across restarts.
+        // Message ids stay unique per ledger across restarts; the replayed
+        // lines also feed the restart-limbo scan below.
         match cyclops_ledger::read_after(&path, 0) {
-            Ok(lines) => engine.preload_ids(&lines),
+            Ok(lines) => {
+                engine.preload_ids(&lines);
+                replayed.push((idx, lines));
+            }
             Err(e) => warn!(session = %name, error = %e, "ledger replay for id preload failed"),
         }
         sessions.push(SessionSlot {
             name: name.clone(),
             link: StdMutex::new(SessionLink::default()),
             ledger: Arc::new(ledger),
+            last_panes: StdMutex::new(HashMap::new()),
         });
     }
-    let (events, _) = broadcast::channel(1024);
+    let (events, _) = broadcast::channel(EVENT_BUFFER);
     let inner = Arc::new(Inner {
         cfg,
         boot_id,
@@ -449,8 +516,10 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         detections: StdMutex::new(HashMap::new()),
         labels: StdMutex::new(HashMap::new()),
         hook_readings: StdMutex::new(HashMap::new()),
+        argv_cache: StdMutex::new(HashMap::new()),
         engine,
         ack_state: ack::AckState::new(),
+        inject_pause: StdMutex::new(None),
     });
 
     // Boot fact on every session ledger: which daemon run, which tmux,
@@ -480,6 +549,11 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
             },
         );
     }
+
+    // Restart-limbo closure: any delivery the previous run left in a
+    // non-resolved state gets a named ending now (GOALS: limbo is a bug).
+    delivery::close_limbo(&inner, &replayed);
+    drop(replayed);
 
     let listener = server::bind_socket(&inner.cfg.home).await?;
     let (stop, stop_rx) = watch::channel(false);
@@ -559,7 +633,10 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
         if *stop.borrow() {
             return;
         }
-        let mut ccfg = ControlConfig::attach(&name);
+        // Payload spool files stay under the 0700 cyclops home, never the
+        // shared system temp dir.
+        let mut ccfg =
+            ControlConfig::attach(&name).with_buffer_spool_dir(inner.cfg.home.join("spool"));
         if let Some(sock) = &inner.cfg.tmux_socket {
             ccfg = ccfg.on_socket(sock.clone());
         }
@@ -579,6 +656,19 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                 info!(session = %name, "attached to tmux session");
                 session_lifecycle(&inner, idx, true);
                 run_session(&inner, &watcher, stop.clone()).await;
+                // Freeze the pane table as of this detach: hook reports
+                // arriving during the outage resolve against it.
+                {
+                    let mut last = inner.sessions[idx]
+                        .last_panes
+                        .lock()
+                        .expect("last panes lock");
+                    *last = watcher
+                        .snapshot()
+                        .into_iter()
+                        .map(|r| (r.pane_id.clone(), r))
+                        .collect();
+                }
                 {
                     let mut link = inner.sessions[idx].link.lock().expect("session link lock");
                     link.attached = false;
@@ -703,13 +793,19 @@ async fn handle_pane_event(
                 .lock()
                 .expect("detections lock")
                 .remove(&id);
-            // Adoption ends with the pane; hook history dies with it too.
+            // Adoption ends with the pane; hook history and the argv
+            // binding cache die with it too.
             inner.labels.lock().expect("labels lock").remove(&id);
             inner
                 .hook_readings
                 .lock()
                 .expect("hook readings lock")
                 .remove(&id);
+            inner
+                .argv_cache
+                .lock()
+                .expect("argv cache lock")
+                .retain(|(pane, _), _| pane != &id);
             false
         }
         PaneEvent::PaneChanged { id, changed, .. } => {

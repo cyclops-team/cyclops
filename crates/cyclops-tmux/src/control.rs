@@ -14,6 +14,12 @@
 //! pauses individual panes instead of stalling the connection until the
 //! server-side 300 s disconnect. `%pause` is answered with an immediate
 //! resume; the consumer still sees the pause as an event.
+//!
+//! The stream is read as byte lines, never UTF-8 lines (F22): pane bytes
+//! at 0x80 and above ride %output/%extended-output verbatim, and a
+//! multi-byte character split across two pty reads makes each of the two
+//! lines invalid UTF-8 on its own. Decoding must never decide whether the
+//! connection lives.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -29,7 +35,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::error::TmuxError;
-use crate::notify::{parse_notification, Notification};
+use crate::notify::{parse_notification_bytes, Notification};
 use crate::quote::quote_arg;
 
 /// How the control client reaches its session.
@@ -55,8 +61,15 @@ pub struct ControlConfig {
     pub session: String,
     /// Attach to an existing session or create one.
     pub mode: ControlMode,
-    /// Per-command reply timeout.
+    /// Per-command reply timeout. A timeout is a command-level failure
+    /// only: the connection stays up and the late reply is consumed in
+    /// FIFO order, so correlation survives.
     pub command_timeout: Duration,
+    /// Directory for [`ControlClient::load_buffer`] payload spool files,
+    /// created 0o700 on first use. None falls back to the system temp dir.
+    /// Payload files are always created 0o600 either way; point this at a
+    /// private directory so payloads never touch a shared temp dir at all.
+    pub buffer_spool_dir: Option<PathBuf>,
 }
 
 impl ControlConfig {
@@ -68,6 +81,7 @@ impl ControlConfig {
             session: session.into(),
             mode: ControlMode::Attach,
             command_timeout: Duration::from_secs(10),
+            buffer_spool_dir: None,
         }
     }
 
@@ -94,6 +108,13 @@ impl ControlConfig {
     /// Override the reply timeout.
     pub fn with_command_timeout(mut self, t: Duration) -> Self {
         self.command_timeout = t;
+        self
+    }
+
+    /// Spool `load_buffer` payload files under `dir` instead of the system
+    /// temp dir. The directory is created 0o700 on first use.
+    pub fn with_buffer_spool_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.buffer_spool_dir = Some(dir.into());
         self
     }
 }
@@ -172,11 +193,14 @@ enum Routed {
 
 /// Line-level state machine for the control stream.
 ///
-/// Blocks are collected verbatim: MEASURED on 3.6a, notifications do not
-/// interleave inside a %begin/%end pair, they are written after the block
-/// closes. A content line is only treated as the terminator when its command
-/// number matches the opening %begin, so captured pane text containing
-/// "%end ..." cannot truncate a block.
+/// Operates on raw byte lines: %output/%extended-output data is not
+/// guaranteed to be valid UTF-8 on the wire (MEASURED on 3.6a, F22), so
+/// decoding must never gate routing. Blocks are collected verbatim:
+/// MEASURED on 3.6a, notifications do not interleave inside a %begin/%end
+/// pair, they are written after the block closes. A content line is only
+/// treated as the terminator when its command number matches the opening
+/// %begin, so captured pane text containing "%end ..." cannot truncate a
+/// block.
 struct LineRouter {
     /// (client flag, command number, collected lines) of the open block.
     block: Option<(bool, Option<u64>, Vec<String>)>,
@@ -187,11 +211,11 @@ impl LineRouter {
         LineRouter { block: None }
     }
 
-    fn feed(&mut self, line: &str) -> Option<Routed> {
+    fn feed(&mut self, line: &[u8]) -> Option<Routed> {
         if let Some((_, num, lines)) = &mut self.block {
-            if let Some(rest) =
-                line.strip_prefix("%end ")
-                    .or(if line == "%end" { Some("") } else { None })
+            if let Some(rest) = line
+                .strip_prefix(b"%end ".as_slice())
+                .or(if line == b"%end" { Some(&[][..]) } else { None })
             {
                 if block_num(rest) == *num {
                     let (client, _, lines) = self.block.take().expect("open block");
@@ -200,7 +224,7 @@ impl LineRouter {
                         result: Ok(lines),
                     });
                 }
-            } else if let Some(rest) = line.strip_prefix("%error ") {
+            } else if let Some(rest) = line.strip_prefix(b"%error ".as_slice()) {
                 if block_num(rest) == *num {
                     let (client, _, lines) = self.block.take().expect("open block");
                     return Some(Routed::Reply {
@@ -209,22 +233,33 @@ impl LineRouter {
                     });
                 }
             }
-            lines.push(line.to_string());
+            // Reply content is textual (formats, grids); pane bytes travel
+            // on notification lines. Lossy conversion keeps a stray invalid
+            // byte from poisoning the whole block.
+            lines.push(String::from_utf8_lossy(line).into_owned());
             return None;
         }
-        if let Some(rest) = line.strip_prefix("%begin ") {
+        if let Some(rest) = line.strip_prefix(b"%begin ".as_slice()) {
             let num = block_num(rest);
-            let client = rest.split_whitespace().nth(2) == Some("1");
+            let client = block_field(rest, 2) == Some(b"1".as_slice());
             self.block = Some((client, num, Vec::new()));
             return None;
         }
-        Some(Routed::Notify(parse_notification(line)))
+        Some(Routed::Notify(parse_notification_bytes(line)))
     }
 }
 
-/// Command number: second whitespace field of a %begin/%end/%error tail.
-fn block_num(rest: &str) -> Option<u64> {
-    rest.split_whitespace().nth(1).and_then(|n| n.parse().ok())
+/// nth space-separated field of a %begin/%end/%error tail. These tails are
+/// ASCII (timestamp, command number, flags).
+fn block_field(rest: &[u8], n: usize) -> Option<&[u8]> {
+    rest.split(|&b| b == b' ').filter(|f| !f.is_empty()).nth(n)
+}
+
+/// Command number: second field of a %begin/%end/%error tail.
+fn block_num(rest: &[u8]) -> Option<u64> {
+    std::str::from_utf8(block_field(rest, 1)?)
+        .ok()
+        .and_then(|n| n.parse().ok())
 }
 
 /// A live control-mode connection to one tmux session.
@@ -237,6 +272,7 @@ pub struct ControlClient {
     session: String,
     timeout: Duration,
     buffer_file_seq: AtomicU64,
+    spool_dir: Option<PathBuf>,
 }
 
 impl ControlClient {
@@ -326,6 +362,7 @@ impl ControlClient {
             session: cfg.session,
             timeout: cfg.command_timeout,
             buffer_file_seq: AtomicU64::new(0),
+            spool_dir: cfg.buffer_spool_dir,
         };
 
         // Handshake plus flow control in one command. A %error reply still
@@ -372,6 +409,19 @@ impl ControlClient {
     pub async fn capture_pane(&self, pane_id: &str) -> Result<String, TmuxError> {
         let out = self
             .command(&format!("capture-pane -p -t {}", quote_arg(pane_id)))
+            .await?;
+        Ok(out.join("\n"))
+    }
+
+    /// Visible grid of a pane with SGR escape sequences preserved
+    /// (capture-pane -e). This is the sensor for manifest `line_regex_esc`
+    /// rules: rendering style the plain capture cannot express (codex ghost
+    /// suggestions are dim, typed text is bare, F19). Safe through the
+    /// byte-line reader (F22): the escaped content is plain text plus ASCII
+    /// ESC bytes, which survive the reply block's lossy conversion intact.
+    pub async fn capture_pane_escaped(&self, pane_id: &str) -> Result<String, TmuxError> {
+        let out = self
+            .command(&format!("capture-pane -e -p -t {}", quote_arg(pane_id)))
             .await?;
         Ok(out.join("\n"))
     }
@@ -437,15 +487,17 @@ impl ControlClient {
     /// Load bytes into a named tmux buffer.
     ///
     /// Control-mode stdin is the command channel, so the content travels via
-    /// a temp file that `load-buffer` reads; the file is deleted afterwards
-    /// whether or not the command succeeded. Buffer names are caller-owned;
-    /// the daemon guarantees per-delivery uniqueness (amendment e, F4:
-    /// named buffers are server-global and concurrent reuse corrupts).
+    /// a spool file that `load-buffer` reads; the file is created 0o600
+    /// (payloads are never world-readable, even transiently) under the
+    /// configured spool dir ([`ControlConfig::with_buffer_spool_dir`]) or
+    /// the system temp dir, and is deleted afterwards whether or not the
+    /// command succeeded. Buffer names are caller-owned; the daemon
+    /// guarantees per-delivery uniqueness (amendment e, F4: named buffers
+    /// are server-global and concurrent reuse corrupts).
     pub async fn load_buffer(&self, name: &str, bytes: &[u8]) -> Result<(), TmuxError> {
         debug_assert!(!name.is_empty(), "buffer name must be nonempty");
         let seq = self.buffer_file_seq.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("cyclops-buf-{}-{seq}", std::process::id()));
-        tokio::fs::write(&path, bytes).await?;
+        let path = write_spool_file(self.spool_dir.as_deref(), seq, bytes).await?;
         let cmd = format!(
             "load-buffer -b {} {}",
             quote_arg(name),
@@ -487,17 +539,34 @@ impl ControlClient {
     /// stop the reader. Safe to call more than once. Best effort by design;
     /// `kill_on_drop` backstops every path.
     pub async fn shutdown(&self) {
-        // Fire and forget: the reply may never come if tmux exits first.
-        if let Ok(rx) = self.pipe.submit("detach-client").await {
-            drop(rx);
-        }
+        // Ask for a clean detach. Bounded: a wedged stdin pipe must never
+        // hang shutdown. Fire and forget beyond that; the reply may never
+        // come if tmux exits first.
+        let detach_sent = matches!(
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                self.pipe.submit("detach-client")
+            )
+            .await,
+            Ok(Ok(_))
+        );
         self.pipe.close().await;
         let child = self.child.lock().expect("child lock").take();
         if let Some(mut child) = child {
-            match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+            // When the detach could not be written the pipe was already
+            // closed: the child has had stdin EOF since then and is not
+            // leaving on its own (a dead reader also stops draining its
+            // stdout, so it may be wedged flushing). Skip straight to kill
+            // instead of blinding the owner for the full grace period.
+            let grace = if detach_sent {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_millis(100)
+            };
+            match tokio::time::timeout(grace, child.wait()).await {
                 Ok(_) => {}
                 Err(_) => {
-                    warn!("tmux control child did not exit after detach, killing");
+                    warn!(detach_sent, "tmux control child did not exit, killing");
                     let _ = child.kill().await;
                 }
             }
@@ -507,6 +576,39 @@ impl ControlClient {
             h.abort();
         }
     }
+}
+
+/// Write one load-buffer payload spool file: exclusive create, mode 0o600,
+/// under `dir` (created 0o700 when missing) or the system temp dir. A stale
+/// same-named file (a dead process that reused our pid) is removed first so
+/// the exclusive create cannot write through it.
+async fn write_spool_file(
+    dir: Option<&std::path::Path>,
+    seq: u64,
+    bytes: &[u8],
+) -> Result<PathBuf, TmuxError> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = match dir {
+        Some(d) => {
+            if !d.exists() {
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(d)
+                    .map_err(TmuxError::Io)?;
+            }
+            d.to_path_buf()
+        }
+        None => std::env::temp_dir(),
+    };
+    let path = dir.join(format!("cyclops-buf-{}-{seq}", std::process::id()));
+    let _ = tokio::fs::remove_file(&path).await;
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create_new(true).mode(0o600);
+    let mut f = opts.open(&path).await?;
+    f.write_all(bytes).await?;
+    f.flush().await?;
+    Ok(path)
 }
 
 /// Reads the control stream: resolves reply blocks against the pending FIFO
@@ -519,9 +621,28 @@ async fn reader_task(
     pipe: CommandPipe,
     notif_tx: mpsc::UnboundedSender<Notification>,
 ) {
-    let mut lines = BufReader::new(stdout).lines();
+    // Byte lines, never UTF-8 lines. tmux escapes control bytes octally but
+    // passes bytes >= 0x80 through verbatim, and a multi-byte character
+    // split across two pty reads produces two lines that are each invalid
+    // UTF-8 on their own (MEASURED on 3.6a, F22). A UTF-8-decoding reader
+    // dies on the first such line and takes the connection with it; that
+    // was the M1 soak's 8-drops-in-80s bug under a Claude TUI pane.
+    let mut reader = BufReader::new(stdout);
+    let mut line: Vec<u8> = Vec::new();
     let mut router = LineRouter::new();
-    while let Ok(Some(line)) = lines.next_line().await {
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line).await {
+            Ok(0) => break, // EOF: the transport is really gone
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, "control stream read failed");
+                break;
+            }
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
         match router.feed(&line) {
             None => {}
             Some(Routed::Notify(n)) => {
@@ -600,26 +721,26 @@ mod tests {
         // Transcript shape verbatim from 3.6a: the attach-time block carries
         // flags 0, replies to our commands carry flags 1.
         let mut r = LineRouter::new();
-        assert_eq!(r.feed("%begin 1785658188 276 0"), None);
+        assert_eq!(r.feed(b"%begin 1785658188 276 0"), None);
         assert_eq!(
-            r.feed("%end 1785658188 276 0"),
+            r.feed(b"%end 1785658188 276 0"),
             Some(Routed::Reply {
                 client: false,
                 result: Ok(vec![])
             })
         );
         assert_eq!(
-            r.feed("%session-changed $0 probe"),
+            r.feed(b"%session-changed $0 probe"),
             Some(Routed::Notify(Notification::SessionChanged {
                 session: "$0".into(),
                 name: "probe".into()
             }))
         );
-        assert_eq!(r.feed("%begin 1785658188 283 1"), None);
-        assert_eq!(r.feed("line one"), None);
-        assert_eq!(r.feed("line two"), None);
+        assert_eq!(r.feed(b"%begin 1785658188 283 1"), None);
+        assert_eq!(r.feed(b"line one"), None);
+        assert_eq!(r.feed(b"line two"), None);
         assert_eq!(
-            r.feed("%end 1785658188 283 1"),
+            r.feed(b"%end 1785658188 283 1"),
             Some(Routed::Reply {
                 client: true,
                 result: Ok(vec!["line one".into(), "line two".into()])
@@ -630,13 +751,13 @@ mod tests {
     #[test]
     fn router_error_block_carries_text() {
         let mut r = LineRouter::new();
-        assert_eq!(r.feed("%begin 1785658267 288 1"), None);
+        assert_eq!(r.feed(b"%begin 1785658267 288 1"), None);
         assert_eq!(
-            r.feed("parse error: unknown command: bogus-command-xyz"),
+            r.feed(b"parse error: unknown command: bogus-command-xyz"),
             None
         );
         assert_eq!(
-            r.feed("%error 1785658267 288 1"),
+            r.feed(b"%error 1785658267 288 1"),
             Some(Routed::Reply {
                 client: true,
                 result: Err("parse error: unknown command: bogus-command-xyz".into())
@@ -649,16 +770,75 @@ mod tests {
         // Captured pane content can contain control-mode text. Only a
         // terminator repeating the opening command number closes the block.
         let mut r = LineRouter::new();
-        assert_eq!(r.feed("%begin 100 7 1"), None);
-        assert_eq!(r.feed("%end 100 99 1"), None); // content, wrong number
-        assert_eq!(r.feed("%error 100 98 1"), None); // content, wrong number
+        assert_eq!(r.feed(b"%begin 100 7 1"), None);
+        assert_eq!(r.feed(b"%end 100 99 1"), None); // content, wrong number
+        assert_eq!(r.feed(b"%error 100 98 1"), None); // content, wrong number
         assert_eq!(
-            r.feed("%end 101 7 1"),
+            r.feed(b"%end 101 7 1"),
             Some(Routed::Reply {
                 client: true,
                 result: Ok(vec!["%end 100 99 1".into(), "%error 100 98 1".into()])
             })
         );
+    }
+
+    #[test]
+    fn router_survives_invalid_utf8_lines() {
+        // Wire truth on 3.6a (F22): raw bytes >= 0x80 and split multi-byte
+        // fragments appear on notification lines. Routing must stay
+        // byte-faithful for output data and lossy-tolerant inside blocks.
+        let mut r = LineRouter::new();
+        match r.feed(b"%output %0 X\xffY") {
+            Some(Routed::Notify(Notification::Output { pane, data })) => {
+                assert_eq!(pane, "%0");
+                assert_eq!(data, b"X\xffY");
+            }
+            other => panic!("wrong route: {other:?}"),
+        }
+        match r.feed(b"%extended-output %0 3 : \xe2\xa0") {
+            Some(Routed::Notify(Notification::ExtendedOutput { data, .. })) => {
+                assert_eq!(data, b"\xe2\xa0");
+            }
+            other => panic!("wrong route: {other:?}"),
+        }
+        // Inside a reply block an invalid byte must not derail terminator
+        // matching; content degrades lossily instead.
+        assert_eq!(r.feed(b"%begin 200 9 1"), None);
+        assert_eq!(r.feed(b"grid \xff line"), None);
+        assert_eq!(
+            r.feed(b"%end 200 9 1"),
+            Some(Routed::Reply {
+                client: true,
+                result: Ok(vec!["grid \u{FFFD} line".into()])
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn spool_file_is_owner_only_and_dir_created_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::path::PathBuf::from(format!(
+            "/private/tmp/cyclops-spool-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let path = write_spool_file(Some(&base), 7, b"secret payload")
+            .await
+            .expect("spool write");
+        let dir_mode = std::fs::metadata(&base)
+            .expect("spool dir exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "spool dir is owner-only");
+        let file_mode = std::fs::metadata(&path)
+            .expect("spool file exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600, "spool file is owner-only");
+        assert_eq!(std::fs::read(&path).expect("read back"), b"secret payload");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

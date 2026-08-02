@@ -21,7 +21,15 @@ CYCLOPS_HOME under /private/tmp, everything killed in teardown. Never
 touches the user's tmux server. Driver-side wait loops are test-side waits,
 outside the daemon's zero-polling contract.
 
+Rerun additions (m1-soak-2): claude launches through its native versioned
+symlink so manifest binding must come from the argv fallback (F21 real fix,
+no hardlink shim); the final pane scrollback is scanned for duplicated
+[cyclops <msg_id>] markers (double-paste is the failure mode amendment 2
+forbids) and any duplicate fails the gate; daemon.log detach/reattach
+events are counted so the F22 control-drop fix is proven by a zero.
+
 Usage: python3 tests/m1_soak.py [count-per-cli]   (default 100)
+CYC_SOAK_RAW overrides the artifact directory (default tests/raw/m1-soak).
 """
 import json
 import os
@@ -38,7 +46,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CYCLOPS = os.path.join(REPO, "target/release/cyclops")
 CYCLOPSD = os.path.join(REPO, "target/release/cyclopsd")
 MANIFESTS = os.path.join(REPO, "manifests")
-RAW = os.path.join(REPO, "tests/raw/m1-soak")
+RAW = os.environ.get("CYC_SOAK_RAW", os.path.join(REPO, "tests/raw/m1-soak"))
 PID = os.getpid()
 SCRATCH = f"/private/tmp/cyc-m1-soak-{PID}"
 HOME = os.path.join(SCRATCH, "home")
@@ -103,9 +111,15 @@ def send_key(target, key):
 
 MODAL_SIGNS = (
     "Enter to confirm", "Esc to keep", "Press enter to continue",
-    "Do you trust", "Update available", "1. Yes", "2. Skip",
+    "Do you trust", "trust this folder", "safety check",
+    "Update available", "1. Yes", "2. Skip",
     "Do you want to", "❯ 1.", "› 1.",
 )
+
+# Dialog text meaning Escape aborts or exits the program (Claude 2.1.220's
+# trust dialog says 'Esc to cancel' and Escape exits the CLI). Same
+# vocabulary as tests/harness/tuikit.py.
+ESC_EXITS_SIGNS = ("esc to cancel", "esc to exit", "esc cancels", "esc exits")
 
 
 def modal_visible(cap):
@@ -138,6 +152,11 @@ def dismiss_modal(cli, target, cap, modlog):
         send_key(target, "Enter")
     elif "how's the cli experience" in low:
         send_key(target, "0")  # agy survey: explicit skip (F12)
+    elif any(s in low for s in ESC_EXITS_SIGNS):
+        # Unknown dialog where Escape aborts the program: never press it.
+        # Log and stand off; wait_composer times out with evidence instead.
+        modlog.write("UNKNOWN MODAL: Esc exits, not pressing it\n")
+        modlog.flush()
     else:
         send_key(target, "Escape")
 
@@ -159,13 +178,17 @@ def wait_composer(cli, target, modlog, timeout=180):
     while time.monotonic() < end:
         time.sleep(1)
         cap = capture(target)
-        if "Individual quota reached" in cap:
-            return "quota", cap
         if modal_visible(cap):
             dismiss_modal(cli, target, cap, modlog)
             continue
+        # Ready wins over a visible quota banner: with a live composer the
+        # first send must flow through the daemon so its own blocked_quota
+        # gate parks the leg (park-on-first proof, F11 gate rules). The
+        # quota branch only covers a pane whose composer never comes up.
         if READY[cli](cap):
             return "ready", cap
+        if "Individual quota reached" in cap:
+            return "quota", cap
     return "timeout", cap
 
 
@@ -267,22 +290,13 @@ def write_vendor_configs(legs):
                      for e in ("UserPromptSubmit", "Stop", "Notification")}
             with open(settings, "w") as f:
                 json.dump({"hooks": hooks}, f)
-            # MEASURED here: the native installer names the binary by
-            # version ("~/.local/share/claude/versions/2.1.220") and macOS
-            # derives the process name from the resolved file, so
-            # pane_current_command is "2.1.220" and the manifest's
-            # process_names = ["claude"] never binds. A hardlink named
-            # "claude" restores the manifest's tested assumption for the
-            # soak; the product-side gap is reported as a finding.
-            bindir = os.path.join(SCRATCH, "bin")
-            os.makedirs(bindir, exist_ok=True)
-            launch_bin = os.path.join(bindir, "claude")
-            real = os.path.realpath(leg["bin"])
-            try:
-                os.link(real, launch_bin)
-            except OSError:
-                shutil.copy2(real, launch_bin)
-            leg["cmd"] = (f"{launch_bin} --model haiku --dangerously-skip-permissions "
+            # F21 real fix in play: launch the native versioned symlink
+            # directly, so pane_current_command reads "2.1.220" and the
+            # manifest can only bind through the argv_basenames fallback
+            # (ps argv[0] basename is still "claude"). The first soak used
+            # a hardlink shim here; keeping the shim would mask the fix.
+            # The binding check before spending tokens catches a miss.
+            leg["cmd"] = (f"{leg['bin']} --model haiku --dangerously-skip-permissions "
                           f"--settings {settings}")
         elif cli == "codex":
             # CODEX_HOME under scratch is the F1 fix: user-level hooks load
@@ -315,16 +329,20 @@ def write_vendor_configs(legs):
 
 def launch_tuis(active):
     """One window per CLI, created in leg order. Panes are mapped back by
-    window index, not name: automatic-rename would race a name lookup."""
-    first = True
+    window index, not name: automatic-rename would race a name lookup.
+
+    A placeholder window boots the session first so history-limit is raised
+    before any CLI pane exists; the end-of-run duplicate scan needs the
+    whole transcript in scrollback, and the /dev/null config default (2000
+    lines) can truncate a 100-message leg. The placeholder dies once the
+    leg windows are up."""
+    tmux("new-session", "-d", "-s", SESSION, "-x", "120", "-y", "40",
+         "-n", "rig-placeholder", "sleep 600", check=True)
+    tmux("set-option", "-g", "history-limit", "20000", check=True)
     for leg in active:
-        if first:
-            tmux("new-session", "-d", "-s", SESSION, "-x", "120", "-y", "40",
-                 "-n", leg["cli"], "-c", leg["proj"], leg["shell_cmd"], check=True)
-            first = False
-        else:
-            tmux("new-window", "-d", "-t", f"{SESSION}:", "-n", leg["cli"],
-                 "-c", leg["proj"], leg["shell_cmd"], check=True)
+        tmux("new-window", "-d", "-t", f"{SESSION}:", "-n", leg["cli"],
+             "-c", leg["proj"], leg["shell_cmd"], check=True)
+    tmux("kill-window", "-t", f"{SESSION}:0", check=True)
     rows = tmux("list-panes", "-s", "-t", SESSION, "-F",
                 "#{window_index}\t#{pane_id}\t#{pane_current_command}",
                 check=True).stdout
@@ -502,6 +520,32 @@ def run_leg(leg, sock_path):
     ev.close()
 
 
+def scan_duplicates(leg):
+    """Scan the leg's full pane scrollback for double-pasted deliveries.
+
+    Every injected payload opens with the unique "[cyclops <msg_id>]"
+    marker; after submit it stays in the transcript exactly once. A marker
+    seen twice means the payload was pasted twice (the first soak's claude
+    failure mode: retry after a blind delivery). -J unwraps soft-wrapped
+    lines so a marker split at the pane edge still counts. Coverage is
+    recorded because a truncated scrollback bounds what the scan can see."""
+    cap = tmux("capture-pane", "-p", "-J", "-S", "-", "-t", leg["pane"]).stdout
+    with open(os.path.join(RAW, f"{leg['cli']}_pane_final.txt"), "w") as f:
+        f.write(cap)
+    dups, seen = {}, 0
+    for rec in leg["records"]:
+        mid = rec.get("msg_id")
+        if not mid:
+            continue
+        n = cap.count(f"[cyclops {mid}]")
+        if n >= 1:
+            seen += 1
+        if n > 1:
+            dups[rec["seq"]] = n
+    leg["dup_seqs"] = dups
+    leg["pane_markers_seen"] = seen
+
+
 # ---------------------------------------------------------------------------
 # Ledger analysis (ground truth)
 # ---------------------------------------------------------------------------
@@ -575,6 +619,9 @@ def analyze(legs, ledger_lines):
             "parked_blocked_quota": counts["parked_blocked_quota"],
             "lost": counts["lost"],
             "retries": retries_total,
+            "duplicates": len(leg.get("dup_seqs") or {}),
+            "duplicate_seqs": leg.get("dup_seqs") or {},
+            "pane_marker_coverage": f"{leg.get('pane_markers_seen', 0)}/{leg['sent']}",
             # Ledger ground truth, not thread state: a leg whose driver
             # thread died after the park still counts as parked.
             "parked": leg["parked"] or counts["parked_blocked_quota"] > 0,
@@ -670,6 +717,9 @@ def main():
         for t in threads:
             t.join()
         time.sleep(3)  # let late hook upgrades land in the ledger
+        # Duplicate scan must run while the panes still exist.
+        for leg in runnable:
+            scan_duplicates(leg)
     finally:
         if daemon:
             daemon.terminate()
@@ -694,16 +744,35 @@ def main():
                 if line.strip():
                     ledger_lines.append(json.loads(line))
 
+    # Detach evidence from the daemon's own log: "connection lost" is a
+    # mid-run control drop (the F22 failure mode), "did not exit" is the
+    # shutdown shadow of the same bug. Both must be zero on the fixed tree.
+    detach_events, shutdown_wedges = 0, 0
+    dlog_path = os.path.join(RAW, "daemon.log")
+    if os.path.exists(dlog_path):
+        with open(dlog_path) as f:
+            for line in f:
+                if "connection lost" in line:
+                    detach_events += 1
+                if "did not exit" in line:
+                    shutdown_wedges += 1
+
     per_cli = analyze(legs, ledger_lines)
     losses = sum(c["lost"] for c in per_cli.values())
+    duplicates = sum(c.get("duplicates", 0) for c in per_cli.values())
     incomplete = [cli for cli, c in per_cli.items()
                   if not c.get("skipped") and not c.get("parked")
                   and c["sent"] < TARGET]
-    verdict = "PASS" if losses == 0 and not incomplete else "FAIL"
+    # Amendment 2 forbids double-paste, so a detected duplicate fails the
+    # gate alongside loss and an incomplete leg.
+    verdict = ("PASS" if losses == 0 and duplicates == 0 and not incomplete
+               else "FAIL")
     summary = {
         "verdict": verdict,
         "target_per_cli": TARGET,
         "wall_s": round(time.time() - t_run0, 1),
+        "detach_events": detach_events,
+        "shutdown_wedges": shutdown_wedges,
         "environment": {
             "tmux_socket": SOCK,
             "legs": {l["cli"]: {k: l.get(k) for k in

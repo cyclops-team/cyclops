@@ -26,7 +26,11 @@ def raw_dir():
     return RAW
 
 def tmux(*args, check=False):
-    r = subprocess.run(["tmux", "-L", SOCK, *args], capture_output=True, text=True)
+    # -u per finding F14 (control replies sanitized for non-UTF-8 clients),
+    # -f /dev/null so a first call can never start a server on the user's
+    # tmux config. Same argv shape as tests/m1_soak.py.
+    r = subprocess.run(["tmux", "-u", "-L", SOCK, "-f", "/dev/null", *args],
+                       capture_output=True, text=True)
     if check and r.returncode != 0:
         raise RuntimeError(f"tmux {args}: {r.stderr.strip()}")
     return r
@@ -42,7 +46,7 @@ def clean_env():
 
 def launch(session, cmd, cwd, w=120, h=40):
     """Create session running cmd. First call creates the isolated server with -f /dev/null."""
-    r = subprocess.run(["tmux", "-f", "/dev/null", "-L", SOCK, "new-session", "-d",
+    r = subprocess.run(["tmux", "-u", "-L", SOCK, "-f", "/dev/null", "new-session", "-d",
                         "-s", session, "-x", str(w), "-y", str(h), "-c", cwd, cmd],
                        capture_output=True, text=True, env=clean_env())
     if r.returncode != 0:
@@ -130,9 +134,15 @@ class HookTail:
 
 MODAL_SIGNS = (
     "Enter to confirm", "Esc to keep", "Press enter to continue",
-    "Do you trust", "Update available", "1. Yes", "2. Skip",
+    "Do you trust", "trust this folder", "safety check",
+    "Update available", "1. Yes", "2. Skip",
     "Do you want to", "❯ 1.", "› 1.",
 )
+
+# Dialog text meaning Escape aborts or exits the program. Claude 2.1.220's
+# folder-trust dialog says 'Esc to cancel' and Escape EXITS the CLI
+# (MEASURED, cost a soak leg). Never Escape out of these.
+ESC_EXITS_SIGNS = ("esc to cancel", "esc to exit", "esc cancels", "esc exits")
 
 def modal_visible(cap):
     """Any numbered-choice or confirm dialog. Deliberately broad: a false
@@ -142,25 +152,39 @@ def modal_visible(cap):
     alone must never be treated as a composer."""
     return any(s in cap for s in MODAL_SIGNS)
 
-def dismiss_modal(target, cap, log):
+def dismiss_modal(target, cap, log, cli=None):
     """Dismiss safely. NEVER a bare Enter: the default choice can be destructive.
-    Choose the explicit decline option by number when the dialog offers one."""
+    Choose the explicit decline option by number when the dialog offers one.
+    NEVER Escape when the dialog says Esc cancels/exits: on Claude 2.1.220's
+    folder-trust dialog Escape exits the CLI (MEASURED in the m1 soak).
+    `cli` selects the per-CLI decline vocabulary (same as tests/m1_soak.py)."""
     log.write("MODAL SEEN:\n" + "\n".join(cap.rstrip().splitlines()[-16:]) + "\n---\n")
     log.flush()
     low = cap.lower()
     if "update available" in low or "update now" in low:
-        send_key(target, "2")          # Skip, never "Update now"
+        # Codex option 3 is the explicit skip (F3); other CLIs use 2=Skip.
+        send_key(target, "3" if cli == "codex" else "2")
         time.sleep(0.4); send_enter(target)
-    elif "do you trust" in low:
-        send_key(target, "1")          # our own scratch dir
+    elif ("do you trust" in low or "trust this folder" in low
+          or ("safety check" in low and "trust" in low)):
+        # Trust prompts for harness-owned scratch dirs: explicit affirmative.
+        # Claude 2.1.220 words it "Is this a project you created or one you
+        # trust?", so matching "Do you trust" alone misses it.
+        send_key(target, "1")
         time.sleep(0.4); send_enter(target)
     elif "hook" in low and "trust" in low:
         send_key(target, "1")
         time.sleep(0.4); send_enter(target)
+    elif any(s in low for s in ESC_EXITS_SIGNS):
+        # Unknown dialog where Escape aborts the program: pressing it would
+        # kill the session. Log and stand off; the wait loop times out with
+        # the capture as evidence instead of losing the pane.
+        log.write("UNKNOWN MODAL: Esc exits, not pressing it\n")
+        log.flush()
     else:
         send_key(target, "Escape")
 
-def wait_composer(target, ready_pred, log, timeout=90):
+def wait_composer(target, ready_pred, log, timeout=90, cli=None):
     """Wait until ready_pred(capture) is true, dismissing modals along the way."""
     end = time.monotonic() + timeout
     cap = ""
@@ -168,7 +192,7 @@ def wait_composer(target, ready_pred, log, timeout=90):
         time.sleep(1)
         cap = capture(target)
         if modal_visible(cap):
-            dismiss_modal(target, cap, log)
+            dismiss_modal(target, cap, log, cli=cli)
             continue
         if ready_pred(cap):
             return cap

@@ -8,6 +8,12 @@
 //! Hot reload is the daemon's job; this crate parses, validates, and
 //! evaluates. Unknown TOML keys are tolerated so manifests can carry
 //! evidence notes the code does not model.
+//!
+//! Two schema fields exist for vendor quirks that plain text cannot express:
+//! `agent.argv_basenames` (bind by pane argv when the kernel comm name is
+//! useless, e.g. native Claude installs reporting "2.1.220") and rule
+//! `line_regex_esc` (match against a capture-pane -e capture, e.g. codex
+//! ghost suggestions are only distinguishable from typed text by SGR dim).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -67,6 +73,14 @@ pub struct AgentMeta {
     pub version_tested: String,
     #[serde(default)]
     pub process_names: Vec<String>,
+    /// Fallback binding when `process_names` misses: argv[0] basenames to
+    /// match against the pane's process argv, resolved via `pane_pid`.
+    /// Needed because #{pane_current_command} is the kernel comm name of the
+    /// resolved executable, not the invoked name. MEASURED (m1 soak): native
+    /// Claude installs symlink ~/.local/bin/claude to versions/2.1.220, so
+    /// comm reports the bare version string and "claude" never binds.
+    #[serde(default)]
+    pub argv_basenames: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -119,6 +133,15 @@ pub struct RawMatcher {
     pub regex: Vec<String>,
     #[serde(default)]
     pub line_regex: Vec<String>,
+    /// Like `line_regex`, but run against an SGR-escaped capture
+    /// (capture-pane -e), so a rule can discriminate on rendering style the
+    /// plain text cannot express. MEASURED (codex-cli 0.146.0): ghost
+    /// suggestions render dim (ESC[2m...ESC[0m) after the composer glyph
+    /// while typed text is bare, which is the only signal separating
+    /// idle from idle_with_input on that CLI. A matcher carrying these
+    /// clauses fails closed when no escaped capture was provided.
+    #[serde(default)]
+    pub line_regex_esc: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -151,20 +174,39 @@ pub struct CompiledMatcher {
     pub contains: Vec<String>,
     pub regex: Vec<regex::Regex>,
     pub line_regex: Vec<regex::Regex>,
+    pub line_regex_esc: Vec<regex::Regex>,
 }
 
 impl CompiledMatcher {
     fn is_empty(&self) -> bool {
-        self.contains.is_empty() && self.regex.is_empty() && self.line_regex.is_empty()
+        self.contains.is_empty()
+            && self.regex.is_empty()
+            && self.line_regex.is_empty()
+            && self.line_regex_esc.is_empty()
     }
 
     /// All clauses must hold. `lines` are the region lines; `joined` is the
-    /// region text joined with newlines.
-    fn matches(&self, joined: &str, lines: &[&str]) -> bool {
+    /// region text joined with newlines. `esc_lines` are the same region's lines from
+    /// an SGR-escaped capture (capture-pane -e); None means no escaped
+    /// capture was taken, so `line_regex_esc` clauses cannot hold and the
+    /// matcher fails closed rather than guessing.
+    fn matches_esc(&self, joined: &str, lines: &[&str], esc_lines: Option<&[&str]>) -> bool {
         if self.is_empty() {
             return false;
         }
-        self.contains.iter().all(|s| joined.contains(s.as_str()))
+        let esc_ok = if self.line_regex_esc.is_empty() {
+            true
+        } else {
+            match esc_lines {
+                Some(el) => self
+                    .line_regex_esc
+                    .iter()
+                    .all(|r| el.iter().any(|l| r.is_match(l))),
+                None => false,
+            }
+        };
+        esc_ok
+            && self.contains.iter().all(|s| joined.contains(s.as_str()))
             && self.regex.iter().all(|r| r.is_match(joined))
             && self
                 .line_regex
@@ -187,10 +229,18 @@ pub struct CompiledRule {
 
 impl CompiledRule {
     pub fn matches(&self, joined: &str, lines: &[&str]) -> bool {
-        if self.matcher.matches(joined, lines) {
+        self.matches_esc(joined, lines, None)
+    }
+
+    /// `matches` with the region's escaped-capture lines available, for
+    /// rules carrying `line_regex_esc` clauses.
+    pub fn matches_esc(&self, joined: &str, lines: &[&str], esc_lines: Option<&[&str]>) -> bool {
+        if self.matcher.matches_esc(joined, lines, esc_lines) {
             return true;
         }
-        self.any.iter().any(|m| m.matches(joined, lines))
+        self.any
+            .iter()
+            .any(|m| m.matches_esc(joined, lines, esc_lines))
     }
 }
 
@@ -265,7 +315,34 @@ fn compile_matcher(
         contains: raw.contains.clone(),
         regex: mk(&raw.regex)?,
         line_regex: mk(&raw.line_regex)?,
+        line_regex_esc: mk(&raw.line_regex_esc)?,
     })
+}
+
+/// Remove CSI escape sequences (ESC [ ... final byte), i.e. the SGR styling
+/// a capture-pane -e capture carries. Used to judge line emptiness in the
+/// escaped capture the same way the plain capture does, so both region
+/// slices select the same screen rows.
+pub fn strip_csi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                // Parameter and intermediate bytes end at the final byte @..~.
+                for n in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            // Bare ESC (or a non-CSI escape introducer) is dropped.
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 impl Manifest {
@@ -325,23 +402,49 @@ impl Manifest {
 
     /// Evaluate title + screen against the rules. Returns the winning rule.
     /// `screen` is a full visible-grid capture; region slicing happens here.
+    /// Rules needing an escaped capture (`line_regex_esc`) cannot fire on
+    /// this path; use `evaluate_esc` to supply one.
     pub fn evaluate(&self, title: &str, screen: &str) -> Option<&CompiledRule> {
+        self.evaluate_esc(title, screen, None)
+    }
+
+    /// `evaluate` with an optional SGR-escaped capture (capture-pane -e) of
+    /// the same grid. Escaped-region lines are judged non-empty on their
+    /// CSI-stripped text so both captures slice the same screen rows.
+    pub fn evaluate_esc(
+        &self,
+        title: &str,
+        screen: &str,
+        screen_esc: Option<&str>,
+    ) -> Option<&CompiledRule> {
         let non_empty: Vec<&str> = screen
             .lines()
             .rev()
             .filter(|l| !l.trim().is_empty())
             .collect();
+        let non_empty_esc: Option<Vec<&str>> = screen_esc.map(|s| {
+            s.lines()
+                .rev()
+                .filter(|l| !strip_csi(l).trim().is_empty())
+                .collect()
+        });
         for rule in &self.rules {
-            let (joined, lines): (String, Vec<&str>) = match rule.region {
-                Region::PaneTitle => (title.to_string(), vec![title]),
-                Region::BottomNonEmptyLines(n) => {
-                    // non_empty is bottom-up; restore top-down order.
-                    let mut sel: Vec<&str> = non_empty.iter().take(n).copied().collect();
-                    sel.reverse();
-                    (sel.join("\n"), sel)
-                }
-            };
-            if rule.matches(&joined, &lines) {
+            let (joined, lines, esc_lines): (String, Vec<&str>, Option<Vec<&str>>) =
+                match rule.region {
+                    Region::PaneTitle => (title.to_string(), vec![title], None),
+                    Region::BottomNonEmptyLines(n) => {
+                        // non_empty is bottom-up; restore top-down order.
+                        let mut sel: Vec<&str> = non_empty.iter().take(n).copied().collect();
+                        sel.reverse();
+                        let esc = non_empty_esc.as_ref().map(|ne| {
+                            let mut sel: Vec<&str> = ne.iter().take(n).copied().collect();
+                            sel.reverse();
+                            sel
+                        });
+                        (sel.join("\n"), sel, esc)
+                    }
+                };
+            if rule.matches_esc(&joined, &lines, esc_lines.as_deref()) {
                 return Some(rule);
             }
         }
@@ -353,6 +456,16 @@ impl Manifest {
     pub fn matching_modal(&self, title: &str, screen: &str) -> Option<&CompiledRule> {
         self.evaluate(title, screen)
             .filter(|r| r.state.is_blocked())
+    }
+
+    /// True when any rule carries a `line_regex_esc` clause, i.e. the full
+    /// rule set needs an SGR-escaped capture (capture-pane -e) to fire.
+    /// The daemon uses this to decide whether to take the second capture.
+    pub fn has_escaped_rules(&self) -> bool {
+        self.rules.iter().any(|r| {
+            !r.matcher.line_regex_esc.is_empty()
+                || r.any.iter().any(|m| !m.line_regex_esc.is_empty())
+        })
     }
 }
 
@@ -476,6 +589,103 @@ unsafe_states = ["blocked_modal"]
     fn bad_region_rejected() {
         let bad = MINI.replace("bottom_non_empty_lines(6)", "middle_of_screen");
         assert!(Manifest::parse(&bad, Path::new("bad.toml")).is_err());
+    }
+
+    #[test]
+    fn strip_csi_removes_sgr_only() {
+        assert_eq!(
+            strip_csi("\u{1b}[1m›\u{1b}[0m \u{1b}[2mghost\u{1b}[0m"),
+            "› ghost"
+        );
+        assert_eq!(strip_csi("plain"), "plain");
+        assert_eq!(
+            strip_csi("\u{1b}[38;2;246;226;183mcolor\u{1b}[39m"),
+            "color"
+        );
+    }
+
+    // Mini manifest exercising the escaped-capture discriminator: dim text
+    // after the glyph is a ghost suggestion (idle), bare text is typed
+    // input (idle_with_input), and the plain rule is the fallback.
+    const ESC_MINI: &str = r#"
+[agent]
+id = "codex"
+display_name = "Codex CLI"
+
+[[rule]]
+id = "composer_typed_input"
+state = "idle_with_input"
+priority = 1050
+region = "bottom_non_empty_lines(6)"
+line_regex_esc = ['^\s*(?:\x1b\[[0-9;]*m)*›(?:\x1b\[[0-9;]*m)*\s+[^\x1b\s]']
+
+[[rule]]
+id = "composer_ghost_suggestion"
+state = "idle"
+priority = 1040
+region = "bottom_non_empty_lines(6)"
+line_regex_esc = ['^\s*(?:\x1b\[[0-9;]*m)*›(?:\x1b\[[0-9;]*m)*\s+\x1b\[2m']
+
+[[rule]]
+id = "composer_empty_or_ghost"
+state = "idle"
+priority = 1000
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^\s*›']
+
+[injection]
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+"#;
+
+    #[test]
+    fn esc_rules_fail_closed_without_escaped_capture() {
+        let m = Manifest::parse(ESC_MINI, Path::new("esc.toml")).unwrap();
+        // No escaped capture: both esc rules cannot fire, plain fallback wins.
+        let r = m.evaluate("proj", "› typed text here").unwrap();
+        assert_eq!(r.id, "composer_empty_or_ghost");
+        assert_eq!(r.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn esc_rules_discriminate_ghost_from_typed() {
+        let m = Manifest::parse(ESC_MINI, Path::new("esc.toml")).unwrap();
+        let typed_plain = "› fix the rate limiter";
+        let typed_esc = "\u{1b}[1m›\u{1b}[0m fix the rate limiter";
+        let r = m
+            .evaluate_esc("proj", typed_plain, Some(typed_esc))
+            .unwrap();
+        assert_eq!(r.id, "composer_typed_input");
+        assert_eq!(r.state, AgentState::IdleWithInput);
+
+        let ghost_plain = "› Find and fix a bug in @filename";
+        let ghost_esc = "\u{1b}[1m›\u{1b}[0m \u{1b}[2mFind and fix a bug in @filename\u{1b}[0m";
+        let r = m
+            .evaluate_esc("proj", ghost_plain, Some(ghost_esc))
+            .unwrap();
+        assert_eq!(r.id, "composer_ghost_suggestion");
+        assert_eq!(r.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn has_escaped_rules_reflects_esc_clauses() {
+        let with = Manifest::parse(ESC_MINI, Path::new("esc.toml")).unwrap();
+        assert!(with.has_escaped_rules());
+        let without = manifest();
+        assert!(!without.has_escaped_rules());
+    }
+
+    #[test]
+    fn argv_basenames_parse_and_default_empty() {
+        let with = format!("{MINI}\n");
+        let m = Manifest::parse(&with, Path::new("mini.toml")).unwrap();
+        assert!(m.agent.argv_basenames.is_empty());
+        let extended = MINI.replace(
+            "display_name = \"Claude Code\"",
+            "display_name = \"Claude Code\"\nargv_basenames = [\"claude\"]",
+        );
+        let m = Manifest::parse(&extended, Path::new("mini.toml")).unwrap();
+        assert_eq!(m.agent.argv_basenames, vec!["claude"]);
     }
 
     /// The shipped manifests must always parse. They are the product's seed

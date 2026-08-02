@@ -28,9 +28,11 @@ pub enum TmuxError {
     #[error("tmux control connection closed")]
     Disconnected,
 
-    /// No reply within the command timeout. The command may still run inside
-    /// tmux; correlation stays intact because the reply slot is consumed
-    /// when the late reply arrives.
+    /// No reply within the command timeout. A command-level failure only:
+    /// the connection is not torn down, and correlation stays intact
+    /// because the reply slot is consumed in FIFO order when the late
+    /// reply arrives. Only [`TmuxError::Disconnected`] means the transport
+    /// is gone.
     #[error("tmux reply timeout for: {0}")]
     Timeout(String),
 }

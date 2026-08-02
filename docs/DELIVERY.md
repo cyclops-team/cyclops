@@ -57,9 +57,12 @@ timer. In order:
      operator action.
    - `blocked_modal`: if the matched manifest rule has `auto_dismiss` and
      `decline_keys`, send the decline keys in order with ~250ms spacing,
-     ledger a gate line naming the rule, re-evaluate. Rules without
-     auto_dismiss (trust, permission prompts) hold in gating and
-     admin.notify action_required.
+     ledger a gate line naming the rule, re-evaluate. Multi-key declines
+     re-capture the screen before the FINAL confirming key and require the
+     same rule to still match; a dialog that changed under the sequence
+     aborts back to the gate loop (gate line: decline_aborted, cause
+     modal_changed). Rules without auto_dismiss (trust, permission
+     prompts) hold in gating and admin.notify action_required.
    - `working`: hold in gating; the turn-end state change re-triggers
      (GOALS: queued lands within 1s of turn end).
    - `idle_with_input` (human typing, human always wins): hold in gating,
@@ -67,6 +70,10 @@ timer. In order:
    - `idle`: proceed.
 4. Just before pasting, re-read title and capture once more (the gate
    snapshot must be fresher than any human keystroke round-trip).
+
+A delivery held in gating longer than `gate_hold_notify_ms` (config,
+default 120000) pings the admin once (action_required) so a wedged hold is
+visible; the hold itself keeps waiting on events, never on a timer.
 
 ### Inject (amendments b, e)
 
@@ -113,7 +120,22 @@ The receipt returns the target's disposition, never auto-attached history:
 
 `wait` (send-and-wait) composes agent.wait onto the same call: after the
 delivery resolves, block until the recipient reaches `until` (idle | done |
-blocked) or `timeout_ms`.
+blocked) or `timeout_ms`. The wait starts only once the delivery reaches a
+resolved state, and `done` counts only working phases observed at or after
+this delivery's submit; a turn that predates the delivery never satisfies
+it. A delivery that resolves anywhere but delivered has no turn to watch:
+its wait entry reports the delivery state (`delivery` field) instead of a
+fabricated wait result.
+
+## Daemon restart
+
+At boot the daemon replays each session ledger and closes every delivery
+whose latest state is still in flight: a state line to attention_required
+(cause: daemon_restart) per dangling chain, plus ONE aggregated
+admin.notify listing them. Limbo is a bug (GOALS); a restart never leaves
+a chain open. msg lines carry a `hosted` list naming the recipients whose
+delivery chains live in that file, so a cross-session broadcast closes
+only where it is hosted.
 
 ## Ledger and privacy
 
@@ -138,3 +160,44 @@ blocked) or `timeout_ms`.
 - msg.history / msg.thread query methods: M2 (the ledger already records
   everything they will read).
 - Operator re-queue verb for parked/attention deliveries: M2 surface.
+
+## v1.1 amendments (M1 gate)
+
+Clarifications from the M1 gate review. They bind the implementation; the
+sections above are unchanged.
+
+1. Tier-2 evidence is conjunctive, as already worded: delivered_unverified
+   requires BOTH the marker leaving the composer AND turn-start evidence
+   (working state or output activity). Marker absence alone is not delivery
+   evidence: a dialog or a redraw can clear the composer without the
+   message ever becoming a turn. A changed composer window counts as turn
+   evidence only when the post-paste verification demonstrably staged the
+   message id; without a staged id, working or output evidence is
+   required. Similarly, verification itself only accepts a generic
+   pattern ("Pasted text") on a manifest composer line; residue from an
+   earlier message elsewhere on screen verifies nothing. The substituted
+   id pattern counts anywhere in the verify region: it is unique to the
+   delivery.
+2. ACK deadlines are detach-aware. While the tmux control connection is
+   down the daemon cannot observe the pane, so ACK and retry deadlines
+   freeze for the duration of the outage; time lost to a detach never
+   counts against the ACK window. After reattach the pipeline re-verifies
+   the composer and turn evidence before deciding anything, and in
+   particular before any retry, so a delivery that landed during the
+   outage is never pasted twice. Implemented as a per-delivery ACK clock
+   (every remaining deadline shifts by the outage duration on reattach), a
+   reattach evidence pass that runs before any deadline can expire, and
+   hook reports resolved against the session's last-known pane table while
+   detached: a report does not need the tmux connection, so tier-1 ACKs
+   stay visible through the outage.
+3. The inject contract includes a pane-rebind re-check. The gate's
+   admitting snapshot is re-validated against the live pane table
+   immediately before the paste and again immediately before the submit
+   key: the pane must still exist, be alive, keep the pane_pid it was
+   admitted with, and bind to the manifest the gate admitted. Any mismatch
+   moves the delivery to retry_queued (cause: pane_rebound) with a gate
+   ledger line, and the submit key is never sent; the retry re-enters
+   gating and re-evaluates from scratch. Without this, a pane whose
+   occupant changed between admit and injection (agent exited to a shell,
+   another CLI took over) would receive the payload and an Enter, and a
+   shell occupant would execute the message text.

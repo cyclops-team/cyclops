@@ -621,8 +621,10 @@ mod tests {
             detections: StdMutex::new(HashMap::<String, DetEntry>::new()),
             labels: StdMutex::new(HashMap::new()),
             hook_readings: StdMutex::new(HashMap::new()),
+            argv_cache: StdMutex::new(HashMap::new()),
             engine: crate::delivery::Engine::new(),
             ack_state: crate::ack::AckState::new(),
+            inject_pause: StdMutex::new(None),
         })
     }
 

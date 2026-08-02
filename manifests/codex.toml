@@ -51,6 +51,37 @@ The daemon must dedupe on (session_id, turn_id)."""
 # Screen rules. No title tier exists for this CLI.
 # ---------------------------------------------------------------------------
 
+# The plain capture cannot separate ghost suggestions from typed text: both
+# render as '› <text>'. MEASURED (ghost probe, codex-cli 0.146.0, fixtures in
+# crates/cyclops-manifest/tests/fixtures/codex_*): the escaped capture can.
+# The composer glyph renders bold (ESC[1m › ESC[0m); ghost text after it is
+# wrapped in dim (ESC[2m ... ESC[0m) while typed text is bare. The two rules
+# below carry that discriminator as line_regex_esc clauses, which only fire
+# on a capture-pane -e capture; the daemon supplies one wherever a bound
+# manifest carries esc rules. Without one they fail closed and
+# composer_empty_or_ghost remains the (idle-biased) fallback.
+
+[[rule]]
+id = "composer_typed_input"
+state = "idle_with_input"
+priority = 1050
+region = "bottom_non_empty_lines(6)"
+line_regex_esc = ['^\s*(?:\x1b\[[0-9;]*m)*›(?:\x1b\[[0-9;]*m)*\s+[^\x1b\s]']
+note = """Typed (or staged) text after the composer glyph is NOT dim: the first
+significant character after '› ' is a plain byte, not an SGR introducer. Do not
+inject: would concatenate with the human's draft. Human live typing wins."""
+evidence = "MEASURED ghost probe: 'ESC[1m›ESC[0m fix the rate limiter in gateway.rs'"
+
+[[rule]]
+id = "composer_ghost_suggestion"
+state = "idle"
+priority = 1040
+region = "bottom_non_empty_lines(6)"
+line_regex_esc = ['^\s*(?:\x1b\[[0-9;]*m)*›(?:\x1b\[[0-9;]*m)*\s+\x1b\[2m']
+note = """Ghost suggestion text is wrapped in SGR dim (ESC[2m) directly after
+the glyph. Ghost text is NOT staged user input; the pane is idle and safe."""
+evidence = "MEASURED ghost probe: 'ESC[1m›ESC[0m ESC[2mFind and fix a bug in @filenameESC[0m'"
+
 [[rule]]
 id = "composer_empty_or_ghost"
 state = "idle"
@@ -60,7 +91,11 @@ line_regex = ['^\s*›']
 note = """The composer line renders ghost-text suggestions such as
 '› Write tests for @filename' when empty. Ghost text is NOT staged user input.
 This is the same trap cyclops v1 hardcoded an allowlist for (bin/commPact:678-683);
-matching the glyph rather than emptiness avoids needing that allowlist."""
+matching the glyph rather than emptiness avoids needing that allowlist.
+FALLBACK ONLY: on a plain capture this rule also matches typed text and reads
+it as idle. The esc rules above outrank it whenever an escaped capture is
+available, and the daemon feeds one wherever the bound manifest carries esc
+rules, so this fallback only decides when the escaped sensor is absent."""
 evidence = "MEASURED: observed live during soak startup"
 
 [[rule]]
