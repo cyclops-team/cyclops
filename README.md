@@ -7,17 +7,24 @@ gives each tmux pane an identity, delivers structured messages between agents
 with verified receipts, and keeps everything on an append-only record you can
 audit months later. If it runs in your terminal, it can run in Cyclops.
 
-Pre-release. Today the daemon watches sessions, reads agent state, and
-delivers messages with verified receipts (milestones M0 and M1; M2 in
-progress). [STATUS.md](STATUS.md) has the live picture.
+Pre-release. Today the daemon watches sessions, reads agent state,
+delivers messages with verified receipts, reconstructs the record on
+demand, and streams it live (milestones M0 through M3).
+[STATUS.md](STATUS.md) has the live picture.
 
 ## Try it now
 
 Requires tmux 3.2+ and Rust.
 
 ```bash
-git clone <this repo> && cd clops && cargo build --release
+git clone https://github.com/cyclops-team/cyclops.git && cd cyclops
+cargo build --release
 ```
+
+Building from source is how you run this implementation. The one-line
+installer advertised on usecyclops.dev installs the previous shell
+implementation, which is a separate program that shares the name; see
+[Versions](#versions).
 
 See the whole stack run against an isolated tmux server (nothing touches
 your own sessions): two panes exchange a reviewed message and a reply,
@@ -28,7 +35,9 @@ round trip.
 ./demos/m2-conversation.sh
 ```
 
-`demos/` also keeps the smaller m0 (status) and m1 (send) walkthroughs.
+`demos/` also keeps the m0 (status) and m1 (send) walkthroughs, and
+`demos/m3-stream.sh` shows the stream UI following the same rig in
+plain mode (the full-screen `cyclops ui` is worth a real terminal).
 
 Or run it against a real session:
 
@@ -51,14 +60,16 @@ What works today:
 | `cyclops hooks install <cli> --agent ...` | Render a vendor hook config plus wiring instructions |
 | `cyclops hooks verify <agent>` | Hook liveness: tier and last-seen edge ages |
 | `cyclops hooks selftest <agent>` | Prove the ack hook fires, via one no-op delivery |
+| `cyclops ui` | The live stream: calm admin view, firehose one keypress away, the eye, jump-to-pane |
 | `cyclops ping` | Daemon round trip |
 | `cyclops read <agent> --source detection` | Per-sensor readings behind a state verdict |
 | `cyclops watch` | Live event stream |
 
 All commands take `--json` (scripts can do anything the UI does) and
-`--plain`, and honor `NO_COLOR`.
+`--plain`, and honor `NO_COLOR`. (`ui` has no `--json`; the machine
+stream is `cyclops watch --json`.)
 
-The rest of the surface (`ui`, `start`) ships milestone by milestone;
+The rest of the surface (`start`) ships milestone by milestone;
 [STATUS.md](STATUS.md) tracks what is real.
 
 ## How it works
@@ -78,12 +89,17 @@ ledger you can `jq`.
 | `crates/cyclops-tmux` | The tmux adapter. Every tmux-specific behavior lives here. |
 | `crates/cyclopsd` | The daemon: watcher, fusion, socket API, ledger, delivery. |
 | `crates/cyclops` | The CLI: thin NDJSON client over the daemon socket. |
+| `crates/cyclops-ui` | The stream UI behind `cyclops ui`: admin view, firehose, the eye. |
+| `crates/cyclops-theme` | Semantic color tokens and the shipped themes. Data, not code. |
 | `crates/cyclops-ledger` | Crash-safe append-only ledger writer and reader. |
 
 More: [docs/install.md](docs/install.md), [docs/send.md](docs/send.md),
 [docs/history.md](docs/history.md),
 [docs/wait.md](docs/wait.md), [docs/hooks.md](docs/hooks.md),
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/GOALS.md](docs/GOALS.md).
+[docs/ui.md](docs/ui.md), [docs/themes.md](docs/themes.md),
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/GOALS.md](docs/GOALS.md),
+[docs/STYLE.md](docs/STYLE.md) (how this codebase is written, binding on
+every change).
 
 ## Principles
 
@@ -93,3 +109,21 @@ More: [docs/install.md](docs/install.md), [docs/send.md](docs/send.md),
   delivery was verified.
 - Progressive, never prescriptive: valuable with one pane; roles are
   optional labels, never requirements.
+
+## Versions
+
+Cyclops has been rewritten. This tree is the Rust implementation: a
+daemon on tmux control mode, an append-only ledger, verified receipts.
+
+The previous implementation was a shell and Python toolkit built around
+`bin/commPact`. It still exists and still works: branch
+[`v1`](https://github.com/cyclops-team/cyclops/tree/v1), tag `v1-final`.
+It is a read-only reference now, and it is what the usecyclops.dev
+one-line installer currently fetches. Nothing here migrates your v1 state
+automatically; [docs/CUTOVER.md](docs/CUTOVER.md) is the runbook when you
+choose to move.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Upstream attribution for the v1 lineage is
+in [NOTICE](NOTICE).

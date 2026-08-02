@@ -10,7 +10,7 @@
 # doing the one network fetch itself and nothing else privileged.
 #
 # Environment overrides:
-#   CYCLOPS_REF          branch, tag, or full commit SHA to install (default: main)
+#   CYCLOPS_REF          branch, tag, or full commit SHA to install (default: v1-final)
 #   CYCLOPS_HOME          install destination (default: $HOME/.commPact)
 #   CYCLOPS_BIN_DIR        where the `cyclops` command is linked (default: $HOME/.local/bin)
 #   CYCLOPS_SOURCE_DIR    use this local directory instead of downloading (offline/dev use)
@@ -18,7 +18,10 @@ set -eu
 
 REPO_OWNER="cyclops-team"
 REPO_NAME="cyclops"
-REF="${CYCLOPS_REF:-main}"
+# Pinned to the v1 release tag, not to a branch. main becomes the Rust
+# rewrite, which has no bin/commPact-install, so a main-tracking default
+# would break this installer for every visitor the moment that lands.
+REF="${CYCLOPS_REF:-v1-final}"
 CYCLOPS_HOME="${CYCLOPS_HOME:-$HOME/.commPact}"
 BIN_DIR="${CYCLOPS_BIN_DIR:-$HOME/.local/bin}"
 # A relative CYCLOPS_HOME works fine for install_release() (every op below
