@@ -12,7 +12,9 @@ export const meta = {
 
 const REPO = '/Users/yahirh/projects/clops'
 
-const COMMON = `You are implementing Cyclops v2 milestone M3 in ${REPO}. Read first, binding: ${REPO}/docs/GOALS.md (the frontend section is the spec for this milestone: the eye, strict grid, two encodings, semantic tokens, motion restraint, copy rules), ${REPO}/docs/ARCHITECTURE.md, findings.md, and the CURRENT code (daemon events, proto, the CLI style/render modules whose grid and badge voice you must match exactly). Hard rules as ever: isolated tmux only for tests (-u -L unique -f /dev/null), no git, no network, zero polling (the UI is event-driven on the subscription; ledger tail via fs watch or on-event refresh, no interval refresh), no em-dashes, fmt/clippy -D warnings/tests green. Return JSON: summary, api, tests_passed, test_output_tail, findings, concerns.`
+const COMMON = `You are implementing Cyclops v2 milestone M3 in ${REPO}. Read first, binding: ${REPO}/docs/GOALS.md (the frontend section is the spec for this milestone: the eye, strict grid, two encodings, semantic tokens, motion restraint, copy rules), ${REPO}/docs/ARCHITECTURE.md, findings.md, and the CURRENT code (daemon events, proto, the CLI style/render modules whose grid and badge voice you must match exactly). Hard rules as ever: isolated tmux only for tests (-u -L unique -f /dev/null), no git, no network, zero polling (the UI is event-driven on the subscription; ledger tail via fs watch or on-event refresh, no interval refresh), no em-dashes, fmt/clippy -D warnings/tests green. Docs are part of done (GOALS documentation rule): update every doc page your change makes stale in the same change set (docs/ui.md is yours to create when the ui verb lands), and never document behavior that does not exist yet.
+
+Return JSON: summary, api, tests_passed, test_output_tail, findings, concerns.`
 
 const IMPL_SCHEMA = {
   type: 'object',

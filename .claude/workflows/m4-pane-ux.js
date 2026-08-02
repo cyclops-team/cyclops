@@ -16,6 +16,8 @@ const COMMON = `You are implementing Cyclops v2 milestone M4 in ${REPO}. Read fi
 
 CRITICAL SAFETY RULE for this milestone: M4 code writes INTO tmux sessions (titles, border formats, layouts). Production writes target ONLY panes/sessions the daemon watches and the admin asked to modify, and every tmux option write must be scoped (per-pane or per-session @options and format options, never server-global), reversible (cyclops name --clear restores), and recorded as a gate/system ledger line. Tests never touch the default server. The demo creates its own isolated session.
 
+Docs are part of done (GOALS documentation rule): update every doc page your change makes stale in the same change set, and never document behavior that does not exist yet.
+
 Return JSON: summary, api, tests_passed, test_output_tail, findings, concerns.`
 
 const IMPL_SCHEMA = {

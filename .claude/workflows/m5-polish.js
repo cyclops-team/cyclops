@@ -12,7 +12,9 @@ export const meta = {
 
 const REPO = '/Users/yahirh/projects/clops'
 
-const COMMON = `You are implementing Cyclops v2 milestone M5 in ${REPO}. Read first, binding: ${REPO}/docs/GOALS.md (themes as semantic tokens, copy rules, ladder law, 'default output should look like a product screenshot'), README.md (the landing-page command shapes recorded there: cyclops start '✓ workspace ready — 3 agents', cyclops send receipt '✓ delivered · verified', cyclops list three-column shape), findings.md, and the CURRENT code including crates/cyclops-theme and themes/. Hard rules as ever: isolated tmux for tests, no git, no network, zero polling, no em-dashes, fmt/clippy -D warnings/tests green. Return JSON: summary, api, tests_passed, test_output_tail, findings, concerns.`
+const COMMON = `You are implementing Cyclops v2 milestone M5 in ${REPO}. Read first, binding: ${REPO}/docs/GOALS.md (themes as semantic tokens, copy rules, ladder law, 'default output should look like a product screenshot'), README.md (the landing-page command shapes recorded there: cyclops start '✓ workspace ready — 3 agents', cyclops send receipt '✓ delivered · verified', cyclops list three-column shape), findings.md, and the CURRENT code including crates/cyclops-theme and themes/. Hard rules as ever: isolated tmux for tests, no git, no network, zero polling, no em-dashes, fmt/clippy -D warnings/tests green. Docs are part of done (GOALS documentation rule, binding for this milestone especially): one page per question (install, send, history, ui, themes, manifests, troubleshooting), 60-second skimmable, truth rule absolute.
+
+Return JSON: summary, api, tests_passed, test_output_tail, findings, concerns.`
 
 const IMPL_SCHEMA = {
   type: 'object',

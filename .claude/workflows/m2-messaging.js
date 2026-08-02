@@ -16,6 +16,8 @@ const COMMON = `You are implementing part of Cyclops v2 milestone M2 in ${REPO}.
 
 Hard rules (same as M0/M1): isolated tmux only (tmux -u -L unique -f /dev/null, killed in teardown; -u per finding F14), no git commands, no network, temp under /private/tmp, zero polling, no em-dashes, fmt/clippy -D warnings/tests green for touched crates, secrets never in the ledger. NEVER modify anything under ~/.commPact or the user's live tmux session or real CLI config dirs (~/.claude, ~/.codex, ~/.gemini, ~/.agents): M2 PREPARES artifacts in-repo; installation is a separate admin-approved step.
 
+Docs are part of done (GOALS documentation rule): update every doc page your change makes stale in the same change set, keep pages skimmable in 60 seconds, and never document behavior that does not exist yet.
+
 Return machine-consumed JSON: summary, api, tests_passed, test_output_tail, findings (MEASURED/READ), concerns.`
 
 const IMPL_SCHEMA = {

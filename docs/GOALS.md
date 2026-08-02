@@ -86,6 +86,23 @@ invisible, on a record that never lies.
 - No PTY hosting, no GUI app, no cloud, no telemetry, no forced hierarchy, no
   idle CPU or token spend without intent.
 
+## Documentation and repo
+
+Docs are part of "done." Every milestone updates them in the same commit as
+the code.
+
+- Style: direct, succinct, comprehensible. Short sentences, active voice,
+  task-first headings, examples over explanation. No filler, no marketing
+  voice, no walls of text. Any page that cannot be skimmed in 60 seconds
+  gets split or cut.
+- Structure: README is a 60-second quickstart that follows the progressive
+  ladder. docs/ is one page per question (install, send, history, ui,
+  themes, manifests, troubleshooting). CHANGELOG.md and STATUS.md always
+  current.
+- Truth rule: a doc describing behavior that no longer exists is a bug.
+  Fix or delete it in the same commit that changes the behavior. Never
+  document aspirationally; only what is built and tested.
+
 ## Done-well test
 
 A stranger runs `cyclops start`, wires two agents, passes reviewed work

@@ -12,7 +12,9 @@ export const meta = {
 
 const REPO = '/Users/yahirh/projects/clops'
 
-const COMMON = `You are implementing Cyclops v2 milestone M6 in ${REPO}. Read first, binding: ${REPO}/docs/GOALS.md (human layer: ping on blocked/done/parked, silent otherwise; background worker + attention routing flow), docs/DELIVERY.md, findings.md, CURRENT code. Hard rules as ever: isolated tmux for tests, no git, no network, zero polling, no em-dashes, fmt/clippy -D warnings/tests green. Return JSON: summary, api, tests_passed, test_output_tail, findings, concerns.`
+const COMMON = `You are implementing Cyclops v2 milestone M6 in ${REPO}. Read first, binding: ${REPO}/docs/GOALS.md (human layer: ping on blocked/done/parked, silent otherwise; background worker + attention routing flow), docs/DELIVERY.md, findings.md, CURRENT code. Hard rules as ever: isolated tmux for tests, no git, no network, zero polling, no em-dashes, fmt/clippy -D warnings/tests green. Docs are part of done (GOALS documentation rule): update every doc page your change makes stale in the same change set (docs/send.md gains pipe and --wait sections), and never document behavior that does not exist yet.
+
+Return JSON: summary, api, tests_passed, test_output_tail, findings, concerns.`
 
 const IMPL_SCHEMA = {
   type: 'object',
