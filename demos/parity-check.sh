@@ -52,6 +52,9 @@ FAILS=0
 # built. Off by default it costs nothing; on, it is a cold release compile.
 # CI runs it as its own job so it does not sit in front of the test results.
 WITH_INSTALLER=0
+# The real home, kept because the installer section runs with HOME pointed
+# at a throwaway and still needs to find the toolchain.
+CALLER_HOME="$HOME"
 case "${1:-}" in
   --with-installer) WITH_INSTALLER=1 ;;
   "") ;;
@@ -918,9 +921,43 @@ mkdir -p "$INST"
 printf '# an existing profile\nexport EXAMPLE=1\n' > "$INST/.zshrc"
 cp "$INST/.zshrc" "$ROOT/zshrc.before"
 
+# Run it with almost nothing in the environment, so an install that only
+# works because of something this shell happens to export fails here.
+#
+# HOME is the throwaway, which is what keeps the operator's profile out of
+# reach. The toolchain paths have to survive that: rustup resolves its
+# default toolchain under $RUSTUP_HOME, which follows HOME when it is
+# unset, so redirecting HOME alone leaves cargo unable to pick a version.
+# The two below are the toolchain, not the operator's cyclops state.
+#
+# SHELL only picks which profile file name to look for; nothing here runs
+# it, so /bin/zsh gives the same `.zshrc` assertions on both platforms.
+run_installer() {
+  local path="$1"; shift
+  # The toolchain env, which is the part that has to survive `env -i`.
+  # RUSTUP_HOME follows HOME when unset, so redirecting HOME alone hides
+  # the toolchain; and CI pins a toolchain with RUSTUP_TOOLCHAIN rather
+  # than setting a rustup default, so dropping it leaves cargo with no
+  # version to choose. Both are the toolchain, not the operator's state.
+  local keep=(
+    "RUSTUP_HOME=${RUSTUP_HOME:-$CALLER_HOME/.rustup}"
+    "CARGO_HOME=${CARGO_HOME:-$CALLER_HOME/.cargo}"
+  )
+  if [ -n "${RUSTUP_TOOLCHAIN:-}" ]; then
+    keep+=("RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN")
+  fi
+  env -i \
+    PATH="$path" \
+    HOME="$INST" \
+    SHELL=/bin/zsh \
+    TERM=dumb \
+    NO_COLOR=1 \
+    "${keep[@]}" \
+    sh "$REPO/scripts/install.sh" "$@" > "$OUT" 2>&1 || true
+}
+
 printf '\n$ ./scripts/install.sh\n'
-env -i PATH="$PATH" HOME="$INST" SHELL=/bin/zsh TERM=dumb NO_COLOR=1 \
-  sh "$REPO/scripts/install.sh" > "$OUT" 2>&1 || true
+run_installer "$PATH"
 # The build log is noise here; the checks are all on what it says it did.
 grep -v '^ *\(Compiling\|Finished\|Downloaded\|Blocking\|Updating\|Adding\)' "$OUT" | tail -22
 
@@ -942,15 +979,13 @@ check_file "and the shipped manifests"    "$INST/.cyclops/manifests/claude.toml"
 # The profile has exactly one block, not one per run, and the second run
 # says so instead of appending another.
 printf '\n$ ./scripts/install.sh    # again\n'
-env -i PATH="$PATH" HOME="$INST" SHELL=/bin/zsh TERM=dumb NO_COLOR=1 \
-  sh "$REPO/scripts/install.sh" > "$OUT" 2>&1 || true
+run_installer "$PATH"
 grep -c '>>> cyclops >>>' "$INST/.zshrc" > "$ROOT/blocks"
 cat "$OUT" | grep 'already has the cyclops block' || true
 check_file "a second run adds no second block" "$ROOT/blocks" '^1$'
 
 printf '\n$ ./scripts/install.sh --uninstall\n'
-env -i PATH="$INST/.local/bin:$PATH" HOME="$INST" SHELL=/bin/zsh TERM=dumb NO_COLOR=1 \
-  sh "$REPO/scripts/install.sh" --uninstall > "$OUT" 2>&1 || true
+run_installer "$INST/.local/bin:$PATH" --uninstall
 cat "$OUT"
 check "uninstall keeps the record"        "your record and config are untouched at $INST/.cyclops"
 
