@@ -1,12 +1,10 @@
 <script lang="ts">
-	import lightLogo from '$lib/assets/cyclops-logo-light-mode.png';
-	import darkLogo from '$lib/assets/cyclops-logo-dark-mode-removebg.png';
+	import logo from '$lib/assets/cyclops-new-logo.png';
 
 	let { height, alt = 'Cyclops' }: { height: number; alt?: string } = $props();
 </script>
 
-<img class="light" src={lightLogo} {alt} style:height={`${height}px`} />
-<img class="dark" src={darkLogo} {alt} style:height={`${height}px`} />
+<img src={logo} {alt} style:height={`${height}px`} />
 
 <style>
 	img {
@@ -14,17 +12,8 @@
 		display: block;
 	}
 
-	.dark {
-		display: none;
-		/* Its artwork has more transparent padding than the light asset. */
-		transform: scale(1.25);
-	}
-
-	:global(html[data-theme='dark']) .light {
-		display: none;
-	}
-
-	:global(html[data-theme='dark']) .dark {
-		display: block;
+	:global(html[data-theme='dark']) img {
+		/* The artwork is near-black; flatten it and invert to match --ink (#f2f1ec). */
+		filter: brightness(0) invert(0.95);
 	}
 </style>

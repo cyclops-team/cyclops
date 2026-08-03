@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import '../app.css';
-	import logo from '$lib/assets/cyclops-logo-light-mode.png';
+	import favicon from '$lib/assets/favicon.png';
 
 	let { children } = $props();
 
@@ -17,7 +17,7 @@
 </script>
 
 <svelte:head>
-	<link rel="icon" type="image/png" href={logo} />
+	<link rel="icon" type="image/png" href={favicon} />
 </svelte:head>
 
 {@render children()}
