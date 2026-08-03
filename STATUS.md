@@ -8,8 +8,10 @@ opens the workspace, starts the daemon, waits for it, and names the panes:
 one command, measured at 1.1s on a bare home, heavy check.
 
 598 tests across 65 targets, parity 115/115 (131/131 with the installer
-section), CI green, v2 is main. M8 shipped the dashboard; next is M9,
-flow features.
+section), CI green, v2 is main. M8 shipped the dashboard, and with it the
+planned build is COMPLETE: M0 through M8, install to dashboard. Flow
+features (pipe, attention routing) stay in the backlog by admin decision,
+picked up if and when wanted.
 One thing still waits on admin: the v1 cutover.
 
 ## Done
@@ -458,8 +460,8 @@ it lying in minutes.
 - M7 flow features: `cyclops pipe`, attention routing, `--wait`
   composition ergonomics. Moved behind the handoff milestone so its docs
   are written as it ships rather than retrofitted.
-- M9 flow features: `cyclops pipe`, attention routing, `--wait`
-  composition ergonomics.
+- Flow features, parked by admin decision (2026-08-03): `cyclops pipe`,
+  attention routing, `--wait` composition ergonomics.
 - `cyclops list` could carry the roster's new detail (elapsed in state,
   which CLI) the way the dashboard panel does; the data is in `status`
   already. Parity pins the current three-column shape, so this is a
