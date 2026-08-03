@@ -107,6 +107,7 @@ fn started(dir: &std::path::Path, backfill: usize, seed: StatusSeed) -> App {
 fn daemon_answer() -> StatusSeed {
     StatusSeed {
         watched: vec!["main".into()],
+        roster: Vec::new(),
         panes: vec![
             PaneSnapshot {
                 name: "reviewer".into(),
@@ -207,7 +208,7 @@ fn a_replayed_alarm_the_answer_no_longer_counts_gets_its_clearance() {
     ledger_with_a_buried_park(&dir);
 
     let mut app = started(&dir, 400, daemon_answer());
-    let rows: Vec<String> = build(&mut app, 40);
+    let rows: Vec<String> = build(&mut app, 80, 40);
     let ghost = |what: &str| {
         rows.iter()
             .position(|r| r.contains("ghost") && r.contains(what))
@@ -225,7 +226,7 @@ fn a_replayed_alarm_the_answer_no_longer_counts_gets_its_clearance() {
     // With no tail there is no alarm on screen, so there is nothing to
     // answer and nothing is written.
     let mut app = started(&dir, 0, daemon_answer());
-    let rows = build(&mut app, 40);
+    let rows = build(&mut app, 80, 40);
     assert!(
         !rows.iter().any(|r| r.contains("✔ pane closed")),
         "a clearance with no alarm above it: {rows:#?}"
@@ -277,7 +278,7 @@ fn a_pane_removed_mid_stream_drops_its_item_without_a_second_snapshot() {
 
     // The header may not point at a line for a pane that is gone either:
     // the delivery is the only thing left to name.
-    let rows = build(&mut app, 12);
+    let rows = build(&mut app, 80, 12);
     assert!(rows[0].contains("1 needs attention"), "{:?}", rows[0]);
     assert!(!rows[0].contains("2 need"), "{:?}", rows[0]);
 
@@ -314,7 +315,7 @@ fn every_count_has_a_line_the_reader_can_reach() {
 
     // Nothing hidden: both lines are in the view, so the frame says
     // nothing extra and the stream carries them.
-    let rows = build(&mut app, 12);
+    let rows = build(&mut app, 80, 12);
     assert!(rows[0].contains("2 need attention"), "{:?}", rows[0]);
     assert!(!rows[2].contains("Hidden by the"), "{rows:?}");
     assert!(
@@ -326,7 +327,7 @@ fn every_count_has_a_line_the_reader_can_reach() {
     // the other. The header keeps both, so the frame has to name the one
     // it cannot show.
     app.filter.with = Some("reviewer".into());
-    let rows = build(&mut app, 12);
+    let rows = build(&mut app, 80, 12);
     assert!(rows[0].contains("2 need attention"), "{:?}", rows[0]);
     assert!(!app.visible().is_empty(), "the window is not empty here");
     assert_eq!(
@@ -338,7 +339,7 @@ fn every_count_has_a_line_the_reader_can_reach() {
 
     // A filter that hides both names them both, one line, plural counted.
     app.filter.with = Some("nobody".into());
-    let rows = build(&mut app, 12);
+    let rows = build(&mut app, 80, 12);
     assert!(app.visible().is_empty());
     assert_eq!(
         rows[2],
@@ -349,17 +350,17 @@ fn every_count_has_a_line_the_reader_can_reach() {
 
     // The firehose is a different view and answers the same way.
     app.view = View::Firehose;
-    let rows = build(&mut app, 12);
+    let rows = build(&mut app, 80, 12);
     assert!(rows[2].contains("Hidden by the with filter"), "{rows:?}");
 
     // Filter cleared: the lines are reachable and the band goes away.
     app.filter.with = None;
-    let rows = build(&mut app, 12);
+    let rows = build(&mut app, 80, 12);
     assert!(!rows.iter().any(|r| r.contains("Hidden by the")));
 
     // Nothing outstanding: calm is calm again.
     let mut calm = App::new(Theme::none(), View::Admin, Filter::default());
-    let rows = build(&mut calm, 10);
+    let rows = build(&mut calm, 80, 10);
     assert_eq!(rows[2], "  All calm. tab shows the firehose.");
 }
 
@@ -401,7 +402,7 @@ fn a_ping_the_register_cannot_back_stays_out_of_the_calm_view() {
     while app.tick_eye() {}
     assert_eq!(app.attention_count(), 0, "a ping moved the count");
 
-    let rows = build(&mut app, 12);
+    let rows = build(&mut app, 80, 12);
     assert!(rows[0].starts_with("‿ cyclops"), "{:?}", rows[0]);
     assert!(
         !rows.iter().any(|r| r.contains("action required")),
@@ -409,7 +410,7 @@ fn a_ping_the_register_cannot_back_stays_out_of_the_calm_view() {
     );
     // Nothing is dropped: the firehose keeps every ping the daemon sent.
     app.view = View::Firehose;
-    let rows = build(&mut app, 12);
+    let rows = build(&mut app, 80, 12);
     assert!(
         rows.iter().any(|r| r.contains("action required")),
         "{rows:#?}"
@@ -453,7 +454,7 @@ fn a_ping_about_a_live_item_reaches_the_calm_view() {
         serde_json::json!({"id": "m-old", "to": "nobody"}),
     ));
 
-    let rows = build(&mut app, 20);
+    let rows = build(&mut app, 80, 20);
     assert!(rows[0].contains("2 need attention"), "{:?}", rows[0]);
     for said in [
         "implementer parked: quota exhausted",
@@ -480,7 +481,7 @@ fn a_ping_about_a_live_item_reaches_the_calm_view() {
         },
         BASE + 7000,
     ));
-    let rows = build(&mut app, 20);
+    let rows = build(&mut app, 80, 20);
     assert!(rows[0].contains("1 needs attention"), "{:?}", rows[0]);
     assert!(
         !rows.iter().any(|r| r.contains("quota exhausted")),
@@ -517,7 +518,7 @@ fn a_batch_ping_stands_while_any_item_it_names_does() {
     ])));
     // Nothing in the register yet: the ping names two items and holds
     // neither, so the calm view may not show it.
-    let rows = build(&mut app, 12);
+    let rows = build(&mut app, 80, 12);
     assert!(rows[0].starts_with("‿ cyclops"), "{:?}", rows[0]);
     assert!(
         !rows.iter().any(|r| r.contains("action required")),
@@ -536,7 +537,7 @@ fn a_batch_ping_stands_while_any_item_it_names_does() {
         },
         BASE + 8000,
     ));
-    let rows = build(&mut app, 12);
+    let rows = build(&mut app, 80, 12);
     assert!(rows[0].contains("1 needs attention"), "{:?}", rows[0]);
     assert!(
         rows.iter().any(|r| r.contains("action required")),
@@ -555,7 +556,7 @@ fn a_batch_ping_stands_while_any_item_it_names_does() {
         BASE + 9000,
     ));
     while app.tick_eye() {}
-    let rows = build(&mut app, 12);
+    let rows = build(&mut app, 80, 12);
     assert!(rows[0].starts_with("‿ cyclops"), "{:?}", rows[0]);
     assert!(
         !rows.iter().any(|r| r.contains("action required")),
@@ -571,7 +572,7 @@ fn a_batch_ping_stands_while_any_item_it_names_does() {
         "deliveries interrupted by daemon restart",
         serde_json::json!({"id": "e-restart"}),
     ));
-    let rows = build(&mut old, 12);
+    let rows = build(&mut old, 80, 12);
     assert!(
         rows.iter().any(|r| r.contains("action required")),
         "{rows:#?}"

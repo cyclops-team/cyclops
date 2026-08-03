@@ -1,0 +1,35 @@
+# Catppuccin Mocha, mapped onto the cyclops vocabulary. Palette: the
+# Catppuccin project (MIT). Mocha is the dark flagship; text and overlay0
+# carry the surface, mauve is the brand accent, and the aurora of pastels
+# fills the role slots without any of them shouting.
+#
+# [state] and [badge] stay redundant by construction: glyph + word carry
+# the meaning, these only underline it. Same four groups as dark.toml.
+name = "catppuccin"
+[surface]
+fg = { hex = "#cdd6f4", c256 = 189 }
+dim = { hex = "#6c7086", c256 = 243 }
+accent = { hex = "#cba6f7", c256 = 183 }
+[role]
+1 = { hex = "#cba6f7", c256 = 183 } # mauve
+2 = { hex = "#a6e3a1", c256 = 151 } # green
+3 = { hex = "#89b4fa", c256 = 111 } # blue
+4 = { hex = "#94e2d5", c256 = 116 } # teal
+5 = { hex = "#fab387", c256 = 216 } # peach
+6 = { hex = "#f5c2e7", c256 = 218 } # pink
+7 = { hex = "#f9e2af", c256 = 223 } # yellow
+8 = { hex = "#74c7ec", c256 = 74 }  # sapphire
+[eye]
+calm = { hex = "#6c7086", c256 = 243 }
+alert = { hex = "#cba6f7", c256 = 183 }
+[state]
+healthy = { hex = "#a6e3a1", c256 = 151 }
+needs_you = { hex = "#f9e2af", c256 = 223 }
+terminal = { hex = "#f38ba8", c256 = 211 }
+quiet = { hex = "#6c7086", c256 = 243 }
+dead = { hex = "#45475a", c256 = 238 }
+[badge]
+healthy = { hex = "#a6e3a1", c256 = 151 }
+needs_you = { hex = "#f9e2af", c256 = 223 }
+terminal = { hex = "#f38ba8", c256 = 211 }
+quiet = { hex = "#6c7086", c256 = 243 }

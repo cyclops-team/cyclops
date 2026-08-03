@@ -110,6 +110,7 @@ what the installer calls and what a cargo install needs afterwards:
 $ cyclops start --setup-only
 ✔ cyclops is set up
   wrote /Users/you/.cyclops/config.toml
+  wrote 7 themes to /Users/you/.cyclops/themes
   wrote 3 detection manifests to /Users/you/.cyclops/manifests
 ```
 
@@ -170,13 +171,11 @@ chrome = "off"             # stop writing names onto tmux borders, see panes.md
 of this file alone, and `cyclops theme` on its own shows what each one
 looks like. Editing the key by hand does the same thing.
 
-Theme files are read from `~/.cyclops/themes`, or from `./themes` in the
-working directory (the repo layout). Copy the shipped ones in if you run
-cyclops from anywhere else, otherwise it renders with built-in colors:
-
-```bash
-mkdir -p ~/.cyclops/themes && cp themes/*.toml ~/.cyclops/themes/
-```
+Theme files are read from `~/.cyclops/themes`, which `cyclops start`
+fills with the shipped set (dark, light, high-contrast, catppuccin,
+tokyo-night, nord, gruvbox). A theme you edited is never rewritten, the
+same rule the manifests follow. With no theme files at all, cyclops
+renders in built-in colors.
 
 The tuning knobs, defaults shown:
 

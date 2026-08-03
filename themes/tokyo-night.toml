@@ -1,0 +1,31 @@
+# Tokyo Night, mapped onto the cyclops vocabulary. Palette: the
+# tokyo-night project (MIT). The storm-blue text and comment gray carry
+# the surface, blue is the accent, and the neon set fills the roles.
+name = "tokyo-night"
+[surface]
+fg = { hex = "#c0caf5", c256 = 189 }
+dim = { hex = "#565f89", c256 = 60 }
+accent = { hex = "#7aa2f7", c256 = 111 }
+[role]
+1 = { hex = "#7aa2f7", c256 = 111 } # blue
+2 = { hex = "#9ece6a", c256 = 149 } # green
+3 = { hex = "#bb9af7", c256 = 141 } # magenta
+4 = { hex = "#7dcfff", c256 = 117 } # cyan
+5 = { hex = "#ff9e64", c256 = 215 } # orange
+6 = { hex = "#73daca", c256 = 116 } # teal
+7 = { hex = "#e0af68", c256 = 179 } # yellow
+8 = { hex = "#9d7cd8", c256 = 140 } # purple
+[eye]
+calm = { hex = "#565f89", c256 = 60 }
+alert = { hex = "#7aa2f7", c256 = 111 }
+[state]
+healthy = { hex = "#9ece6a", c256 = 149 }
+needs_you = { hex = "#e0af68", c256 = 179 }
+terminal = { hex = "#f7768e", c256 = 210 }
+quiet = { hex = "#565f89", c256 = 60 }
+dead = { hex = "#3b4261", c256 = 238 }
+[badge]
+healthy = { hex = "#9ece6a", c256 = 149 }
+needs_you = { hex = "#e0af68", c256 = 179 }
+terminal = { hex = "#f7768e", c256 = 210 }
+quiet = { hex = "#565f89", c256 = 60 }

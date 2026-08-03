@@ -335,6 +335,7 @@ echo "#### Rung 1: one pane, persistence, history"
 # the rig takes the same two steps a person installing does.
 run "$CYC" start --setup-only --plain
 check "setup writes the config"           'wrote .*/config\.toml$'
+check "setup installs the themes"         '^  wrote 7 themes to .*/themes$'
 check "setup installs the manifests"      '^  wrote 3 detection manifests to .*/manifests$'
 
 # Two budgets raised above their defaults, for the rig and not for cyclops.
@@ -479,6 +480,14 @@ run "$CYC" read reviewer --source detection --plain
 check "detection names the deciding rule" '^reviewer · ○ idle · decided by title_idle$'
 check "and shows the sensor that read it" '^ +title +○ idle +title_idle'
 
+run "$CYC" read reviewer --source detection --raw --plain
+check "--raw keeps the verdict"           '^reviewer · ○ idle · decided by title_idle$'
+check "and adds the capture it read"      '^what the sensors read \(%[0-9]+\):$'
+
+run "$CYC" read reviewer --raw --plain
+check "--raw without detection is a usage error" 'pairs with --source detection'
+check_exit "and exits 2" 2
+
 run "$CYC" name "$P2" reviewer --manifest cluade --plain
 check "an unknown manifest lists the known ones" '^no manifest "cluade"; loaded: agy, claude, codex, demo$'
 
@@ -593,7 +602,9 @@ check "ui points machine readers at watch" 'cyclops watch --json'
 check_exit "and exits on usage" 2
 
 run "$CYC" theme --plain
-check "theme lists the shipped three"     '^▸ dark +● working'
+check "theme lists the shipped default"   '^▸ dark +● working'
+check "and the seeded palettes"           '^  catppuccin +● working'
+check "all seven of them"                 '^  tokyo-night +● working'
 check "with the ones not on beside it"    '^  high-contrast +● working'
 check "and says how to switch"            '^  cyclops theme <name> to switch$'
 

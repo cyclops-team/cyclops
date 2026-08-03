@@ -37,8 +37,12 @@ impl Term {
         if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        // Alternate screen, hidden cursor, autowrap off.
-        print!("\x1b[?1049h\x1b[?25l\x1b[?7l");
+        // Alternate screen, hidden cursor, autowrap off; then mouse
+        // press+wheel reporting in the SGR encoding (1006, the one whose
+        // coordinates are not capped at 223, and the one every terminal
+        // this decade speaks). A terminal that knows neither ignores both
+        // and the UI is keyboard-only, exactly as before.
+        print!("\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1000;1006h");
         let _ = std::io::stdout().flush();
         Ok(Term { orig })
     }
@@ -79,9 +83,11 @@ impl Term {
 
 impl Drop for Term {
     fn drop(&mut self) {
-        // Leave the alternate screen, restore wrap and cursor, then the
-        // saved termios. Errors are moot: the process is on its way out.
-        print!("\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l");
+        // Mouse reporting off first: a shell fed mouse escapes is the one
+        // way this UI could outlive itself. Then leave the alternate
+        // screen, restore wrap and cursor, then the saved termios. Errors
+        // are moot: the process is on its way out.
+        print!("\x1b[?1000;1006l\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l");
         let _ = std::io::stdout().flush();
         unsafe {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.orig);

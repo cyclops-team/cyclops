@@ -173,6 +173,11 @@ pub(crate) struct DetEntry {
     pub(crate) detection: Detection,
     /// Manifest id bound at the last recompute.
     pub(crate) manifest: Option<String>,
+    /// When the fused STATE last changed, not when it was last computed.
+    /// A recompute that lands on the same state keeps this, which is what
+    /// lets `status` say "working for 13m" instead of "working since the
+    /// last event". The roster's elapsed column reads it.
+    pub(crate) since: std::time::Instant,
 }
 
 impl Inner {

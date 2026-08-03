@@ -373,7 +373,7 @@ fn the_calm_view_shows_the_alarm_and_the_line_that_ends_it() {
     app.live(event_for(Step::Working, BASE + 1000, true).expect("a working event"));
     while app.tick_eye() {}
 
-    let rows = build(&mut app, 8);
+    let rows = build(&mut app, 80, 8);
     assert_eq!(
         rows,
         vec![
@@ -384,7 +384,8 @@ fn the_calm_view_shows_the_alarm_and_the_line_that_ends_it() {
             "  12:04:32  reviewer  ✔ cleared · was ⚠ blocked_permission".to_string(),
             String::new(),
             String::new(),
-            "? keys · tab view · c density · w/f/t filter · enter jump · q quit".to_string(),
+            "? keys · tab view · a agents · c density · w/f/t filter · enter jump · q quit"
+                .to_string(),
         ]
     );
 }
@@ -405,7 +406,7 @@ fn a_clearance_names_what_it_resolved_on_both_halves() {
             }
             blocked = leaves_pane_blocked(*step, blocked);
         }
-        let rows = build(&mut app, 20);
+        let rows = build(&mut app, 80, 20);
         rows.into_iter()
             .filter_map(|r| split_row(&r).map(|(n, c)| format!("{n}|{c}")))
             .collect::<Vec<String>>()
@@ -522,7 +523,7 @@ fn no_calm_frame_leaves_an_alarm_unanswered() {
                             app.view = how.view;
                             app.density = how.density;
                             app.filter = how.filter.clone();
-                            let rows = build(&mut app, how.height);
+                            let rows = build(&mut app, 80, how.height);
                             frames += 1;
                             check(&vocab, &app, &rows, &seq, &how);
                         }
@@ -634,7 +635,7 @@ fn the_row_reader_recognises_what_the_stream_renders() {
             app.live(e);
         }
     }
-    for row in build(&mut app, 30) {
+    for row in build(&mut app, 80, 30) {
         found.insert(match vocab.reads(&row) {
             Says::Alarm(..) => "alarm",
             Says::Answers(..) => "answers",

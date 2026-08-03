@@ -43,7 +43,7 @@ mod plain;
 mod term;
 mod theme;
 
-pub use app::{App, Command, Density, StatusSeed, View};
+pub use app::{App, Command, Density, RosterRow, RosterSeed, RowTarget, StatusSeed, View};
 pub use cyclops_proto::{Attention, AttentionItem, Eye, PaneSnapshot};
 pub use data::{read_backfill, Backfilled, Intake, UiMsg};
 pub use entry::{Entry, EntryKind, Filter, PingDelivery};
@@ -303,8 +303,8 @@ fn seed_status(app: &mut App, seed: app::StatusSeed) {
 }
 
 fn draw(term: &mut term::Term, app: &mut App) {
-    let (_w, h) = term::Term::size();
-    let rows = frame::build(app, h);
+    let (w, h) = term::Term::size();
+    let rows = frame::build(app, w, h);
     term.draw(&rows);
 }
 
@@ -359,7 +359,7 @@ mod tests {
             },
         });
         while app.tick_eye() {}
-        let rows = build(&mut app, 12);
+        let rows = build(&mut app, 80, 12);
         assert!(
             rows.iter().all(|r| !r.contains('\x1b')),
             "an uncolored frame emitted escape sequences"

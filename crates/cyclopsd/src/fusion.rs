@@ -334,6 +334,7 @@ pub(crate) async fn recompute_pane(
                     DetEntry {
                         detection: det.clone(),
                         manifest: manifest_id,
+                        since: std::time::Instant::now(),
                     },
                 );
                 det
@@ -433,11 +434,19 @@ pub(crate) async fn recompute_pane(
     let prior = {
         let mut map = inner.detections.lock().expect("detections lock");
         let prior = map.get(pane_id).map(|e| e.detection.state);
+        // `since` marks the state CHANGING, so a recompute that confirms
+        // the same state carries the old mark forward. Without this the
+        // elapsed column would reset on every unrelated event.
+        let since = match map.get(pane_id) {
+            Some(e) if e.detection.state == detection.state => e.since,
+            _ => std::time::Instant::now(),
+        };
         map.insert(
             pane_id.to_string(),
             DetEntry {
                 detection: detection.clone(),
                 manifest: manifest_id,
+                since,
             },
         );
         prior

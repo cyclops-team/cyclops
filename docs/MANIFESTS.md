@@ -24,6 +24,21 @@ reviewer · ○ idle · decided by title_idle
 `decided by` names the rule that produced the verdict. A wrong reading is
 one rule to fix.
 
+Add `--raw` and the same answer carries the pane capture the sensors
+read, under the readings. One answer means one moment: a separate
+`--source visible` read can straddle a state change, and then the screen
+you are staring at contradicts the verdict it is supposed to explain.
+
+```
+$ cyclops read reviewer --source detection --raw
+reviewer · ○ idle · decided by title_idle
+
+  title  ○ idle  title_idle  just now
+
+what the sensors read (%1):
+...the pane, verbatim...
+```
+
 Cyclops looks for manifests in `manifest_dir` from your config, then
 `~/.cyclops/manifests`, then `./manifests` relative to where you started the
 daemon. First directory that exists wins; it is not a search path. With no

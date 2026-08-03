@@ -5,6 +5,26 @@ versions are unreleased until admin cuts a tag.
 
 ## [Unreleased]
 
+### Added
+
+- The dashboard. `cyclops ui` on a terminal 96 columns or wider shares
+  the screen with an agents panel: every watched pane, which CLI the
+  daemon detects in it, its state, and how long it has stood there.
+  `a` hides it; `--plain` is untouched.
+- The mouse, in `cyclops ui`: click an agent to jump tmux focus to its
+  pane, click a stream entry to select it, wheel scrolls. Everything the
+  mouse does has a key.
+- `state_ms` on every `status` pane row: how long the pane has been in
+  its state, by the daemon's clock. Additive field.
+- Four themes: catppuccin (Mocha), tokyo-night, nord, gruvbox, each
+  mapped onto the semantic vocabulary from its upstream (MIT) palette.
+  All seven shipped themes are now seeded into `~/.cyclops/themes` by
+  `cyclops start`, never overwriting an edited file; installed machines
+  used to list no themes at all.
+- `cyclops read <t> --source detection --raw`: the pane capture the
+  sensors read, in the same answer as the readings, so the evidence and
+  the verdict are one moment.
+
 ### Fixed
 
 - F25: cyclops could not see a pane die. `pane_dead` is set when the

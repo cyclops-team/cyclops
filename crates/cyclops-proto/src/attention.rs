@@ -604,6 +604,7 @@ mod tests {
             width: 120,
             height: 40,
             state,
+            state_ms: None,
             hooks_verified: None,
         }
     }

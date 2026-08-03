@@ -305,8 +305,10 @@ scratch root: `CYCLOPS_TEST_TMP=/some/writable/dir`. [install.md](install.md).
 ## Still stuck
 
 `cyclops read <agent> --source detection` shows every sensor reading behind
-a state verdict and names the rule that decided it. `cyclops watch` streams
-what the daemon is seeing, live. `CYCLOPS_LOG=debug cyclopsd` says the rest.
+a state verdict and names the rule that decided it; add `--raw` and the
+same answer carries the pane capture those sensors read, so the evidence
+and the verdict are one moment. `cyclops watch` streams what the daemon is
+seeing, live. `CYCLOPS_LOG=debug cyclopsd` says the rest.
 
 The record never lies and never needs the daemon:
 

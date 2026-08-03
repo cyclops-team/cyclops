@@ -45,6 +45,7 @@ mod manifests;
 mod render;
 mod style;
 mod theme;
+mod themeseed;
 mod workspace;
 
 use std::io::Write;
@@ -120,6 +121,11 @@ enum Cmd {
         lines: Option<u32>,
         #[arg(long, value_enum, default_value = "visible")]
         source: SourceArg,
+        /// With --source detection: also print the raw pane capture the
+        /// sensors read, under the readings. Debugging a manifest needs
+        /// both halves of that moment in one look.
+        #[arg(long)]
+        raw: bool,
     },
     /// Stream daemon events, one line each. Ctrl-C exits.
     Watch {
@@ -599,7 +605,8 @@ fn run(cli: &Cli) -> i32 {
                     target,
                     lines,
                     source,
-                } => cmd_read(&mut c, cli, &style, target, *lines, (*source).into()),
+                    raw,
+                } => cmd_read(&mut c, cli, &style, target, *lines, (*source).into(), *raw),
                 Cmd::Watch { kinds } => cmd_watch(&mut c, cli, &style, kinds),
                 Cmd::History(args) => cmd_history(&mut c, cli, &style, args),
                 Cmd::Thread { id } => cmd_thread(&mut c, cli, &style, id),
@@ -933,11 +940,23 @@ fn cmd_read(
     target: &str,
     lines: Option<u32>,
     source: PaneReadSource,
+    raw: bool,
 ) -> i32 {
+    // The other two sources ARE the raw capture, so --raw beside them is
+    // a misunderstanding worth a sentence rather than a silent no-op.
+    if raw && source != PaneReadSource::Detection {
+        eprintln!(
+            "--raw pairs with --source detection: it adds the capture the \
+             sensors read to the detection view. This source is already the \
+             raw capture."
+        );
+        return EXIT_USAGE;
+    }
     let params = serde_json::to_value(PaneReadParams {
         target: target.to_string(),
         source,
         lines,
+        include_raw: raw,
     })
     .expect("pane.read params serialize");
     let result = match c.request("pane.read", params) {
@@ -963,6 +982,19 @@ fn cmd_read(
             "{}",
             render::render_detection(&read.target, det, style, render::now_ms())
         );
+        // --raw: the capture the sensors read, under the readings. Same
+        // answer, same moment; a second read could straddle a change.
+        if let Some(text) = &read.text {
+            println!();
+            println!(
+                "{}",
+                style.dim(&format!("what the sensors read ({}):", read.pane_id))
+            );
+            print!("{text}");
+            if !text.ends_with('\n') {
+                println!();
+            }
+        }
     } else if let Some(text) = &read.text {
         // Pane text verbatim, terminated by exactly one newline.
         print!("{text}");

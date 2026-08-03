@@ -837,7 +837,17 @@ fn prepare_home(
         notes.push(config_hint(&config_path(home), session));
     }
 
-    // 2. Manifests, every run and not only the first. A home that predates
+    // 2. Themes, every run for the same reasons as the manifests below.
+    //    Quieter stakes: a home without themes renders in built-in colors
+    //    rather than delivering nothing, so problems are notes, never an
+    //    error.
+    let themes = crate::themeseed::seed(home);
+    if !themes.written.is_empty() {
+        notes.push(crate::themeseed::installed(&themes));
+    }
+    notes.extend(themes.problems);
+
+    // 3. Manifests, every run and not only the first. A home that predates
     //    the seed gets them without a reinstall, and a shipped set that
     //    gains a file reaches an existing home on the next run. Files
     //    already there are never touched (crate::manifests).

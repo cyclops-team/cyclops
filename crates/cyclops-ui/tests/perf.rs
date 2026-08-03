@@ -73,6 +73,7 @@ fn synthetic(i: u64) -> Entry {
 fn backlog(open: usize) -> StatusSeed {
     StatusSeed {
         watched: vec!["main".into()],
+        roster: Vec::new(),
         panes: if open == 0 {
             Vec::new()
         } else {
@@ -113,11 +114,11 @@ fn rig(view: View, open: usize) -> App {
 /// Median of five builds at a 220x60 terminal, pinned to the tail like a
 /// live stream. One warm build first.
 fn median_us(app: &mut App) -> u128 {
-    let _ = build(app, 60);
+    let _ = build(app, 80, 60);
     let mut samples: Vec<u128> = (0..5)
         .map(|_| {
             let t = Instant::now();
-            let rows = build(app, 60);
+            let rows = build(app, 80, 60);
             let d = t.elapsed().as_micros();
             assert_eq!(rows.len(), 60);
             d

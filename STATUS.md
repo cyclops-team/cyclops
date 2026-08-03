@@ -7,8 +7,9 @@ looks, sets the home up, and proves the result runs. Then `cyclops start`
 opens the workspace, starts the daemon, waits for it, and names the panes:
 one command, measured at 1.1s on a bare home, heavy check.
 
-589 tests across 64 targets, parity 108/108 (124/124 with the installer
-section), CI green, v2 is main. Next is M8, the dashboard.
+598 tests across 65 targets, parity 115/115 (131/131 with the installer
+section), CI green, v2 is main. M8 shipped the dashboard; next is M9,
+flow features.
 One thing still waits on admin: the v1 cutover.
 
 ## Done
@@ -345,6 +346,38 @@ One thing still waits on admin: the v1 cutover.
     (fix A) and outlive tmux's 1Hz tick (F23). Parity is 107/107, 123/123
     with the installer.
 
+- M8 the dashboard (this commit):
+  - `cyclops ui` on a terminal 96 columns or wider shares the screen with
+    an agents panel: every watched pane, which CLI the daemon detects in
+    it, its state (glyph plus word, like every surface), and how long it
+    has stood there. `a` hides it; below 96 columns it never draws, so
+    the stream's own words are never clipped to make room; `--plain` is
+    untouched.
+  - Elapsed-in-state is the daemon's own clock: fusion keeps a change
+    mark per pane that survives recomputes onto the same state, `status`
+    serves it as the additive `state_ms` field, and the panel extends it
+    from the seed anchor or from an observed transition. It refreshes
+    when anything redraws; nothing runs a timer for it, because zero
+    polling outranks a live clock.
+  - The mouse. SGR press+wheel reporting, on at entry and off before the
+    alternate screen closes. Click an agent to jump tmux focus to its
+    pane, click a stream entry to select it, wheel scrolls three rows a
+    notch and unpins like ↑. The frame writes what each cell means as it
+    lays rows out (row_targets), so the click asks the screen that is
+    actually there. Everything the mouse does has a key.
+  - Seven themes ship and are seeded into `~/.cyclops/themes` by every
+    `cyclops start`, the manifests' own never-overwrite rule: dark,
+    light, high-contrast, and four loved palettes mapped onto the same
+    vocabulary (catppuccin, tokyo-night, nord, gruvbox; all MIT). Until
+    this, an installed machine listed no themes at all and the docs said
+    to copy files by hand. A test loads all seven through the real
+    engine and fails on any warning, so a misspelled token cannot ship
+    as a theme that half-works.
+  - `cyclops read <t> --source detection --raw` adds the pane capture
+    the sensors read to the detection view, in the same answer, so the
+    evidence and the verdict are one moment. `--raw` beside another
+    source is a usage error naming why.
+
 ## ADMIN_ACTION_REQUIRED (not blocking the build)
 
 ### The v2-becomes-main flip: approved, unblocked, runs when M3 lands
@@ -425,9 +458,12 @@ it lying in minutes.
 - M7 flow features: `cyclops pipe`, attention routing, `--wait`
   composition ergonomics. Moved behind the handoff milestone so its docs
   are written as it ships rather than retrofitted.
-- M8 the dashboard: a roster beside the stream rather than a feed alone,
-  per-agent detail (elapsed in state, which CLI and its version), more
-  themes, and mouse support for clicking a row to jump to its pane.
+- M9 flow features: `cyclops pipe`, attention routing, `--wait`
+  composition ergonomics.
+- `cyclops list` could carry the roster's new detail (elapsed in state,
+  which CLI) the way the dashboard panel does; the data is in `status`
+  already. Parity pins the current three-column shape, so this is a
+  deliberate change, not a drive-by.
 
 Dropped by admin decision on 2026-08-03:
 

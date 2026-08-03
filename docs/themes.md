@@ -8,9 +8,13 @@ cyclops theme light      # switch
 ```
 
 ```
+  catppuccin     ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
 ▸ dark           ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  gruvbox        ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   high-contrast  ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   light          ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  nord           ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  tokyo-night    ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
 
   cyclops theme <name> to switch
 ```
@@ -56,8 +60,12 @@ config key and is fixed for the life of that process, and a bare name
 resolves against `./themes` relative to the daemon's own working directory
 when `~/.cyclops/themes` does not exist.
 
-Three themes ship, all on the usecyclops.dev identity: `dark` (the
-default), `light`, `high-contrast`.
+Seven themes ship. Three are the usecyclops.dev identity: `dark` (the
+default), `light`, `high-contrast`. Four are loved terminal palettes
+mapped onto the same vocabulary: `catppuccin` (Mocha), `tokyo-night`,
+`nord`, `gruvbox`; each names its upstream project (all MIT) at the top
+of its file. `cyclops start` seeds all seven into `~/.cyclops/themes`
+and never rewrites one you edited.
 
 Two other ways to choose, for a config you maintain by hand and for one
 run:

@@ -144,6 +144,25 @@ pub struct StatusResult {
     pub pid: Option<u32>,
 }
 
+/// A duration in the roster's words: seconds under a minute, then
+/// minutes, then hours with the leftover minutes. Never more precise
+/// than a reader can act on.
+pub fn duration_words(ms: u64) -> String {
+    let s = ms / 1000;
+    if s < 60 {
+        return format!("{s}s");
+    }
+    let m = s / 60;
+    if m < 60 {
+        return format!("{m}m");
+    }
+    let h = m / 60;
+    match m % 60 {
+        0 => format!("{h}h"),
+        rest => format!("{h}h {rest}m"),
+    }
+}
+
 /// What the daemon loaded for pane detection, and where from.
 ///
 /// A pane no manifest binds reads `? unknown`, and a delivery to an unknown
@@ -212,6 +231,12 @@ pub struct PaneStatus {
     pub width: u32,
     pub height: u32,
     pub state: AgentState,
+    /// How long the pane has been in `state`, in milliseconds, from the
+    /// daemon's own clock: it is the one process that saw the transition.
+    /// None from a daemon that predates the field, and for a pane whose
+    /// state has not been computed yet. Additive optional field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_ms: Option<u64>,
     /// Hook liveness for adopted panes whose manifest declares hooks:
     /// Some(true) once any hook edge has been seen from the pane's CURRENT
     /// occupant this daemon run, Some(false) while none has (amendment c:
@@ -229,9 +254,16 @@ pub struct PaneReadParams {
     pub target: String,
     #[serde(default)]
     pub source: PaneReadSource,
-    /// Cap on returned lines (visible/recent sources).
+    /// Cap on returned lines (visible/recent sources, and the raw half
+    /// of a detection read).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lines: Option<u32>,
+    /// Detection reads only: also capture the visible pane, so the answer
+    /// carries the screen beside what the sensors made of it. What
+    /// `cyclops read --raw` asks for; debugging a manifest needs both
+    /// halves in one look. Additive: old daemons ignore it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_raw: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

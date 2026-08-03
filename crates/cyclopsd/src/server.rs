@@ -677,6 +677,10 @@ pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResul
                                 .map(|e| e.detection.state)
                                 .unwrap_or(cyclops_proto::AgentState::Unknown),
                         );
+                        // How long the pane has been in that state, from
+                        // the change mark fusion keeps. The roster's
+                        // elapsed column is this number and nothing else.
+                        ps.state_ms = entry.map(|e| e.since.elapsed().as_millis() as u64);
                         // Hook liveness (amendment c): adopted panes whose
                         // manifest declares hooks carry the verified bit,
                         // scoped to the current occupant (edges from a
@@ -755,10 +759,25 @@ async fn pane_read(inner: &Arc<Inner>, id: Value, params: Value) -> Response {
         PaneReadSource::Detection => {
             // Reconcile on doubt: an explicit detection read refreshes with
             // the full sensor set instead of trusting the cache.
-            match fusion::recompute_pane(inner, &watcher, &pane_id, true, "pane.read").await {
-                Some(det) => ok_read(id, &params.target, &pane_id, None, Some(det)),
-                None => Response::err(id, "no_such_target", "pane vanished during read"),
-            }
+            let det = match fusion::recompute_pane(inner, &watcher, &pane_id, true, "pane.read")
+                .await
+            {
+                Some(det) => det,
+                None => return Response::err(id, "no_such_target", "pane vanished during read"),
+            };
+            // --raw: the screen beside what the sensors made of it, in the
+            // same answer, so the two halves are one moment. Two separate
+            // reads can straddle a state change and then the capture
+            // contradicts the verdict it is supposed to explain.
+            let raw = if params.include_raw {
+                match watcher.client().capture_pane(&pane_id).await {
+                    Ok(text) => Some(cap_lines(text, params.lines)),
+                    Err(e) => return Response::err(id, "tmux_error", e.to_string()),
+                }
+            } else {
+                None
+            };
+            ok_read(id, &params.target, &pane_id, raw, Some(det))
         }
     }
 }

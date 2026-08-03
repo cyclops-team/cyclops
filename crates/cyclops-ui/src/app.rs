@@ -8,7 +8,7 @@
 //! count. Which is why every entry arrives through a method that names its
 //! source: [`App::replay`] for history, [`App::live`] for the push.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use cyclops_proto::{
     Attention, AttentionItem, Clearance, Eye, Half, NotifyLevel, OpenDelivery, PaneSnapshot,
@@ -63,6 +63,78 @@ pub struct StatusSeed {
     /// transposition of label and pane id cannot compile.
     pub panes: Vec<PaneSnapshot>,
     pub open: Vec<OpenDelivery>,
+    /// The same panes again, in the roster's richer shape. Separate from
+    /// `panes` because the register's PaneSnapshot is the attention
+    /// rule's input and grows for nobody else's convenience.
+    pub roster: Vec<RosterSeed>,
+}
+
+/// One pane as the roster wants it seeded: everything the sidebar shows.
+#[derive(Debug, Clone)]
+pub struct RosterSeed {
+    pub pane_id: String,
+    pub name: String,
+    pub state: cyclops_proto::AgentState,
+    /// Which CLI the daemon detects in the pane, e.g. "claude".
+    pub manifest: Option<String>,
+    /// How long the pane had been in `state` when the answer was taken,
+    /// by the daemon's clock. None from a daemon that predates the field.
+    pub state_ms: Option<u64>,
+}
+
+/// One agent row in the sidebar: who, where they stand, since when.
+#[derive(Debug)]
+pub struct RosterRow {
+    pub name: String,
+    pub pane_id: String,
+    pub state: cyclops_proto::AgentState,
+    pub manifest: Option<String>,
+    since: Since,
+}
+
+/// Where a row's elapsed-in-state comes from. Two honest sources and one
+/// honest absence; the sidebar never counts from a guess.
+#[derive(Debug)]
+enum Since {
+    /// The daemon said how long at seed time; the anchor extends it.
+    Seeded {
+        state_ms: u64,
+        at: std::time::Instant,
+    },
+    /// This process saw the transition itself.
+    Observed(std::time::Instant),
+    /// Nobody has said. The elapsed cell stays empty.
+    Unknown,
+}
+
+impl RosterRow {
+    /// Milliseconds in the current state, as of now.
+    ///
+    /// Computed at render, not stored: the value is only ever as fresh as
+    /// the frame that shows it, and frames are event-driven (no redraw
+    /// timer ticks this along; the zero-polling contract outranks a live
+    /// clock, and any event refreshes it).
+    pub fn elapsed_ms(&self) -> Option<u64> {
+        match self.since {
+            Since::Seeded { state_ms, at } => Some(state_ms + at.elapsed().as_millis() as u64),
+            Since::Observed(at) => Some(at.elapsed().as_millis() as u64),
+            Since::Unknown => None,
+        }
+    }
+}
+
+/// What one screen row means to a click. frame::build writes one per
+/// terminal row as it lays the frame out, so the mouse asks the frame
+/// that is actually on screen rather than recomputing a layout that
+/// might not match it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RowTarget {
+    #[default]
+    Nothing,
+    /// A sidebar agent row: click jumps focus to the pane.
+    Agent(String),
+    /// A stream entry row: click selects it.
+    Entry(u64),
 }
 
 impl StatusSeed {
@@ -83,6 +155,18 @@ impl StatusSeed {
                 })
                 .collect(),
             open: res.open_deliveries.clone(),
+            roster: res
+                .sessions
+                .iter()
+                .flat_map(|s| &s.panes)
+                .map(|p| RosterSeed {
+                    pane_id: p.pane_id.clone(),
+                    name: p.display_name().to_string(),
+                    state: p.state,
+                    manifest: p.manifest.clone(),
+                    state_ms: p.state_ms,
+                })
+                .collect(),
         }
     }
 }
@@ -163,6 +247,17 @@ pub struct App {
     pub notice: Option<String>,
     /// Set when the daemon connection dies; the header says so.
     pub conn_lost: bool,
+    /// The roster panel is on when the terminal is wide enough; `a` hides
+    /// it for a session that wants the full width back.
+    pub show_roster: bool,
+    /// What each terminal row of the last frame means to a click, halved
+    /// where the frame is: left of `sidebar_w` is the panel's target,
+    /// right of it the stream's. frame::build rewrites both per frame;
+    /// handle_key reads them.
+    pub row_targets: Vec<(RowTarget, RowTarget)>,
+    /// Display columns the sidebar occupied in the last frame; 0 when it
+    /// was not drawn.
+    pub sidebar_w: usize,
     entries: VecDeque<Entry>,
     next_uid: u64,
     attention: Attention,
@@ -170,6 +265,10 @@ pub struct App {
     /// Agent label -> pane id, harvested from status and events only
     /// (zero polling). Backs the focus jump.
     panes: HashMap<String, String>,
+    /// Every watched pane, keyed by pane id: the sidebar's rows. Seeded
+    /// from the one status answer, then moved by live events alone, the
+    /// same contract the attention register keeps.
+    roster: BTreeMap<String, RosterRow>,
 }
 
 impl App {
@@ -187,11 +286,25 @@ impl App {
             notice: None,
             conn_lost: false,
             entries: VecDeque::new(),
+            show_roster: true,
+            row_targets: Vec::new(),
+            sidebar_w: 0,
             next_uid: 1,
             attention: Attention::default(),
             eye: Eye::Closed,
             panes: HashMap::new(),
+            roster: BTreeMap::new(),
         }
+    }
+
+    /// The sidebar's rows, in pane-id order: stable across frames, so a
+    /// row does not wander while the reader is aiming a click at it.
+    pub fn roster(&self) -> impl Iterator<Item = &RosterRow> {
+        self.roster.values()
+    }
+
+    pub fn roster_len(&self) -> usize {
+        self.roster.len()
     }
 
     pub fn entries(&self) -> impl Iterator<Item = &Entry> {
@@ -262,17 +375,26 @@ impl App {
                 target,
                 pane_id,
                 state,
-            } => self
-                .attention
-                .observe_agent(target, pane_id.as_deref(), *state),
+            } => {
+                // The sidebar moves on the same live edge the register
+                // does, and only live: a replayed line is old news and
+                // must not restart anyone's clock.
+                if let Some(p) = pane_id {
+                    self.roster_observe(p, target, *state);
+                }
+                self.attention
+                    .observe_agent(target, pane_id.as_deref(), *state)
+            }
             EntryKind::Delivery { to, state, .. } => {
                 self.attention.observe_delivery(to, e.id.as_deref(), *state)
             }
             // A pane leaving the table is its last transition. The jump
-            // map goes with it: "no pane known for reviewer" is honest,
-            // and a jump to a pane id tmux has retired is not.
+            // map and the sidebar row go with it: "no pane known for
+            // reviewer" is honest, and a jump to a pane id tmux has
+            // retired is not.
             EntryKind::PaneGone { pane_id } => {
                 self.panes.retain(|_, p| p != pane_id);
+                self.roster.remove(pane_id);
                 self.attention.forget_agent(pane_id)
             }
             _ => None,
@@ -286,6 +408,37 @@ impl App {
         // Copied back off the ring so the caller's entry carries the uid
         // the ring gave it, not a placeholder.
         self.entries.back().cloned()
+    }
+
+    /// One live state event moving a sidebar row.
+    ///
+    /// The elapsed clock restarts only when the STATE changed; the same
+    /// state re-observed (the daemon re-emits on unrelated recomputes) is
+    /// confirmation, not a transition, and a clock that reset on it would
+    /// show every long-running agent as seconds old.
+    fn roster_observe(&mut self, pane_id: &str, name: &str, state: cyclops_proto::AgentState) {
+        match self.roster.get_mut(pane_id) {
+            Some(row) => {
+                row.name = name.to_string();
+                if row.state != state {
+                    row.state = state;
+                    row.since = Since::Observed(std::time::Instant::now());
+                }
+            }
+            None => {
+                // A pane the seed never saw: it appeared after startup.
+                self.roster.insert(
+                    pane_id.to_string(),
+                    RosterRow {
+                        name: name.to_string(),
+                        pane_id: pane_id.to_string(),
+                        state,
+                        manifest: None,
+                        since: Since::Observed(std::time::Instant::now()),
+                    },
+                );
+            }
+        }
     }
 
     /// Assign a uid, harvest the label -> pane map, ring the buffer.
@@ -335,6 +488,33 @@ impl App {
     /// After that the register moves on live events alone, and a pane
     /// leaving the table is one of them ([`App::live`]).
     pub fn seed_status(&mut self, seed: StatusSeed) -> Vec<Entry> {
+        // 0. The sidebar's roster is the answer's pane list, replaced
+        //    whole for the same reason the register is: anything the
+        //    answer does not list is gone. The daemon's own elapsed
+        //    anchors each clock; from here live events move it.
+        let seeded_at = std::time::Instant::now();
+        self.roster = seed
+            .roster
+            .iter()
+            .map(|r| {
+                (
+                    r.pane_id.clone(),
+                    RosterRow {
+                        name: r.name.clone(),
+                        pane_id: r.pane_id.clone(),
+                        state: r.state,
+                        manifest: r.manifest.clone(),
+                        since: match r.state_ms {
+                            Some(ms) => Since::Seeded {
+                                state_ms: ms,
+                                at: seeded_at,
+                            },
+                            None => Since::Unknown,
+                        },
+                    },
+                )
+            })
+            .collect();
         // 1. Replace both halves of the register with the answer.
         self.attention.snapshot_agents(seed.panes.iter().cloned());
         self.attention.snapshot_deliveries(&seed.open);
@@ -630,6 +810,44 @@ impl App {
                     Density::Comfortable => Density::Compact,
                     Density::Compact => Density::Comfortable,
                 };
+            }
+            Key::Char('a') => self.show_roster = !self.show_roster,
+            // A click means what the clicked cell means: a sidebar agent
+            // jumps focus (the act the sidebar exists for), a stream entry
+            // becomes the selection, dead space does nothing. The frame
+            // wrote row_targets as it laid the screen out, so the mouse
+            // and the eye agree about what is where; x picks the half.
+            Key::Click { x, y } => {
+                self.notice = None;
+                let target = self.row_targets.get(y as usize).map(|(side, stream)| {
+                    if (x as usize) < self.sidebar_w {
+                        side.clone()
+                    } else {
+                        stream.clone()
+                    }
+                });
+                match target {
+                    Some(RowTarget::Agent(pane_id)) => {
+                        return Some(Command::Focus(pane_id));
+                    }
+                    Some(RowTarget::Entry(uid)) => {
+                        self.selected = Some(uid);
+                        self.pinned = false;
+                    }
+                    _ => {}
+                }
+            }
+            // A wheel notch is three rows, matching every terminal list
+            // there is; the first notch unpins like ↑ does.
+            Key::WheelUp => {
+                for _ in 0..3 {
+                    self.select_prev();
+                }
+            }
+            Key::WheelDown => {
+                for _ in 0..3 {
+                    self.select_next();
+                }
             }
             Key::Char('w') => self.open_input(Which::With),
             Key::Char('f') => self.open_input(Which::From),
@@ -978,6 +1196,16 @@ mod tests {
                 })
                 .collect(),
             open,
+            roster: panes
+                .iter()
+                .map(|(name, pane_id, state)| RosterSeed {
+                    pane_id: (*pane_id).into(),
+                    name: (*name).into(),
+                    state: *state,
+                    manifest: None,
+                    state_ms: Some(5_000),
+                })
+                .collect(),
         }
     }
 

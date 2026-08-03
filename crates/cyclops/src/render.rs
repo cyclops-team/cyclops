@@ -977,6 +977,7 @@ mod tests {
             width: 120,
             height: 40,
             state,
+            state_ms: None,
             hooks_verified: None,
         }
     }
@@ -1372,7 +1373,7 @@ mod tests {
                 app.replay(e);
             }
             while app.tick_eye() {}
-            let stream_head = cyclops_ui::build(&mut app, 12).remove(0);
+            let stream_head = cyclops_ui::build(&mut app, 80, 12).remove(0);
 
             let lead = format!("{} cyclops", eye.cell);
             assert!(

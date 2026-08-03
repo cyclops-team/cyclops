@@ -1,0 +1,31 @@
+# Gruvbox dark, mapped onto the cyclops vocabulary. Palette: the gruvbox
+# project (MIT). The retro warm fg and gray carry the surface, the
+# signature yellow is the accent, and the bright set fills the roles.
+name = "gruvbox"
+[surface]
+fg = { hex = "#ebdbb2", c256 = 223 }
+dim = { hex = "#928374", c256 = 245 }
+accent = { hex = "#fabd2f", c256 = 214 }
+[role]
+1 = { hex = "#fabd2f", c256 = 214 } # yellow, the accent
+2 = { hex = "#b8bb26", c256 = 142 } # green
+3 = { hex = "#83a598", c256 = 109 } # blue
+4 = { hex = "#8ec07c", c256 = 108 } # aqua
+5 = { hex = "#fe8019", c256 = 208 } # orange
+6 = { hex = "#d3869b", c256 = 175 } # purple
+7 = { hex = "#d79921", c256 = 172 } # dark yellow
+8 = { hex = "#458588", c256 = 66 }  # dark blue
+[eye]
+calm = { hex = "#928374", c256 = 245 }
+alert = { hex = "#fabd2f", c256 = 214 }
+[state]
+healthy = { hex = "#b8bb26", c256 = 142 }
+needs_you = { hex = "#fabd2f", c256 = 214 }
+terminal = { hex = "#fb4934", c256 = 167 }
+quiet = { hex = "#928374", c256 = 245 }
+dead = { hex = "#665c54", c256 = 241 }
+[badge]
+healthy = { hex = "#b8bb26", c256 = 142 }
+needs_you = { hex = "#fabd2f", c256 = 214 }
+terminal = { hex = "#fb4934", c256 = 167 }
+quiet = { hex = "#928374", c256 = 245 }

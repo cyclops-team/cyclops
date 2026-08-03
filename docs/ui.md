@@ -57,10 +57,45 @@ a second line under it. The rule lives with the count
 (`crates/cyclops-proto/src/attention.rs`), so both halves and every
 surface get it the same way.
 
+## The agents panel
+
+On a terminal 96 columns or wider, the stream shares the screen with a
+panel listing every watched pane: who, which CLI the daemon detects
+there, where they stand, and for how long.
+
+```
+agents               │
+                     │   12:04:31  implementer → reviewer  Burst path fix
+implementer · claude │               gateway.rs:120. Tests pass.
+  ● working · 13m    │
+                     │   12:04:35  reviewer  ⚠ blocked_permission
+reviewer · claude    │
+  ⚠ blocked_permission · 4s
+```
+
+The elapsed cell is the daemon's own clock for the pane's current state,
+and it stays empty when nobody has said (a daemon older than the field).
+It refreshes whenever anything redraws the frame; the stream never runs
+a timer just to tick it, because the zero-polling contract outranks a
+live clock.
+
+`a` hides the panel and gives the stream the full width. Below 96
+columns it is never drawn, so nothing the stream says gets clipped to
+make room. `--plain` has no panel: that mode is a line-by-line follow.
+
+## Mouse
+
+Click an agent in the panel and tmux focus jumps to its pane, the same
+jump `enter` makes from a stream entry. Click a stream entry to select
+it; the wheel scrolls three rows a notch, and scrolling up unpins from
+the tail exactly like `↑`. Everything the mouse does has a key, so a
+terminal with no mouse reporting loses convenience and nothing else.
+
 ## Keys
 
 ```
 tab      admin stream / firehose
+a        agents panel on / off (wide terminals)
 w f t    filter with / from / to (enter applies, esc cancels, empty clears)
 enter    jump tmux focus to the pane behind the selected entry
 up down  scroll; scrolling up unpins from the tail

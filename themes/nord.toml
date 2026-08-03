@@ -1,0 +1,31 @@
+# Nord, mapped onto the cyclops vocabulary. Palette: the Nord project
+# (MIT). Snow Storm carries the surface, Frost the accent and the cool
+# roles, Aurora the states and the warm roles.
+name = "nord"
+[surface]
+fg = { hex = "#d8dee9", c256 = 253 }
+dim = { hex = "#4c566a", c256 = 240 }
+accent = { hex = "#88c0d0", c256 = 110 }
+[role]
+1 = { hex = "#88c0d0", c256 = 110 } # frost, the accent
+2 = { hex = "#a3be8c", c256 = 144 } # aurora green
+3 = { hex = "#81a1c1", c256 = 109 } # frost blue
+4 = { hex = "#8fbcbb", c256 = 109 } # frost teal
+5 = { hex = "#d08770", c256 = 173 } # aurora orange
+6 = { hex = "#b48ead", c256 = 139 } # aurora purple
+7 = { hex = "#ebcb8b", c256 = 222 } # aurora yellow
+8 = { hex = "#5e81ac", c256 = 67 }  # frost deep blue
+[eye]
+calm = { hex = "#4c566a", c256 = 240 }
+alert = { hex = "#88c0d0", c256 = 110 }
+[state]
+healthy = { hex = "#a3be8c", c256 = 144 }
+needs_you = { hex = "#ebcb8b", c256 = 222 }
+terminal = { hex = "#bf616a", c256 = 131 }
+quiet = { hex = "#4c566a", c256 = 240 }
+dead = { hex = "#3b4252", c256 = 238 }
+[badge]
+healthy = { hex = "#a3be8c", c256 = 144 }
+needs_you = { hex = "#ebcb8b", c256 = 222 }
+terminal = { hex = "#bf616a", c256 = 131 }
+quiet = { hex = "#4c566a", c256 = 240 }

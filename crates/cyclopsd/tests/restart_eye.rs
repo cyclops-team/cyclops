@@ -158,7 +158,7 @@ async fn the_restart_ping_never_outlives_the_deliveries_it_names() {
     let mut app = ui_after_startup(&home, &answer);
     assert_eq!(app.attention_count(), 2);
     assert_eq!(app.eye(), Eye::Open);
-    let rows = build(&mut app, 20);
+    let rows = build(&mut app, 80, 20);
     assert!(rows[0].contains("2 need attention"), "{:?}", rows[0]);
     assert!(
         rows.iter().any(|r| r.contains("action required")),
@@ -171,7 +171,7 @@ async fn the_restart_ping_never_outlives_the_deliveries_it_names() {
     half_done.open_deliveries.retain(|d| d.to == "reviewer");
     let mut app = ui_after_startup(&home, &half_done);
     assert_eq!(app.attention_count(), 1);
-    let rows = build(&mut app, 20);
+    let rows = build(&mut app, 80, 20);
     assert!(rows[0].contains("1 needs attention"), "{:?}", rows[0]);
     assert!(
         rows.iter().any(|r| r.contains("action required")),
@@ -198,7 +198,7 @@ async fn the_restart_ping_never_outlives_the_deliveries_it_names() {
         !app.admits_in_view(&ping),
         "--plain would print this ping and can never take it back"
     );
-    let rows = build(&mut app, 20);
+    let rows = build(&mut app, 80, 20);
     assert!(rows[0].starts_with("‿ cyclops"), "{:?}", rows[0]);
     assert!(
         !rows.iter().any(|r| r.contains("action required")),
@@ -237,7 +237,7 @@ async fn the_restart_ping_never_outlives_the_deliveries_it_names() {
     //    either surface: the ping is history, and history is complete.
     app.view = View::Firehose;
     assert!(app.admits_in_view(&ping), "the firehose lost a daemon ping");
-    let rows = build(&mut app, 20);
+    let rows = build(&mut app, 80, 20);
     assert!(
         rows.iter().any(|r| r.contains("action required")),
         "{rows:#?}"

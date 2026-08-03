@@ -265,6 +265,7 @@ mod tests {
             crate::app::StatusSeed {
                 watched: vec!["main".into()],
                 panes: Vec::new(),
+                roster: Vec::new(),
                 open: vec![cyclops_proto::OpenDelivery {
                     id: "m-park".into(),
                     to: "implementer".into(),

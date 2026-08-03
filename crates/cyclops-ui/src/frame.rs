@@ -16,18 +16,38 @@
 //! (`cyclops_proto::attention`) for its own words, and the band asks the
 //! app which of those the current view cannot reach.
 
-use crate::app::{App, Density, View, Which};
+use crate::app::{App, Density, RowTarget, View, Which};
 use crate::entry::{Entry, Filter};
+use crate::grid::display_width;
+
+/// The narrowest terminal that gets the sidebar. The stream's widest
+/// routine line is 59 columns (docs/workspaces.md walks the arithmetic),
+/// the sidebar caps at [`SIDEBAR_MAX_W`], and the separator is 3, so at
+/// 96 both halves keep the words they exist to carry.
+const SIDEBAR_MIN_TERM_W: usize = 96;
+/// Sidebar content width bounds. The floor keeps the panel readable when
+/// every name is short; the cap keeps a long pane title from eating the
+/// stream.
+const SIDEBAR_MIN_W: usize = 18;
+const SIDEBAR_MAX_W: usize = 30;
 
 /// Rows for one frame, exactly `height` of them.
-pub fn build(app: &mut App, height: usize) -> Vec<String> {
+///
+/// Also rewrites `app.row_targets`, one entry per row: the frame is the
+/// only thing that knows what ended up where, so it is the only thing
+/// that can tell a click what it landed on.
+pub fn build(app: &mut App, width: usize, height: usize) -> Vec<String> {
     let mut rows = Vec::with_capacity(height);
+    let mut targets = vec![(RowTarget::Nothing, RowTarget::Nothing); height];
+    let mut sidebar_w = 0usize;
     if height < 5 {
         // A sliver of a terminal: header plus whatever fits.
         rows.push(header(app));
         while rows.len() < height {
             rows.push(String::new());
         }
+        app.row_targets = targets;
+        app.sidebar_w = 0;
         return rows;
     }
     // One walk of the view per frame: the header, the band, and the
@@ -38,20 +58,145 @@ pub fn build(app: &mut App, height: usize) -> Vec<String> {
         rows.push(header(app));
         rows.push(String::new());
         let band = attention_band(app, &list);
-        let stream_h = height - 3 - usize::from(band.is_some());
-        rows.extend(band);
+        let region_h = height - 3;
+        let stream_h = region_h - usize::from(band.is_some());
+        let band_rows = usize::from(band.is_some());
+        let mut region: Vec<String> = Vec::with_capacity(region_h);
+        region.extend(band);
+        let mut uids: Vec<Option<u64>> = vec![None; band_rows];
         if app.overlay {
-            rows.extend(cheatsheet(stream_h));
+            region.extend(cheatsheet(stream_h));
+            uids.resize(region_h, None);
             top = None;
         } else {
-            let (stream, new_top) = stream_rows(app, &list, stream_h);
-            rows.extend(stream);
+            let (stream, new_top, stream_uids) = stream_rows(app, &list, stream_h);
+            region.extend(stream);
+            uids.extend(stream_uids);
             top = new_top;
+        }
+        uids.resize(region_h, None);
+        // The sidebar, beside the whole region. Terminal rows are single
+        // strings the terminal clips at its own edge, so the sidebar is
+        // the padded head of each row and the stream is the tail; only
+        // the head needs measuring.
+        match sidebar(app, width, region_h) {
+            Some((cells, side_w)) => {
+                sidebar_w = side_w;
+                for (i, row) in region.into_iter().enumerate() {
+                    let (cell, side_target) = cells
+                        .get(i)
+                        .cloned()
+                        .unwrap_or((String::new(), RowTarget::Nothing));
+                    let stream_target = uids[i].map_or(RowTarget::Nothing, RowTarget::Entry);
+                    targets[2 + i] = (side_target, stream_target);
+                    rows.push(format!(
+                        "{}{} {}",
+                        pad_display(&cell, side_w),
+                        app.theme.dim("│"),
+                        row
+                    ));
+                }
+            }
+            None => {
+                for (i, row) in region.into_iter().enumerate() {
+                    let stream_target = uids[i].map_or(RowTarget::Nothing, RowTarget::Entry);
+                    targets[2 + i] = (RowTarget::Nothing, stream_target);
+                    rows.push(row);
+                }
+            }
         }
     }
     app.top = top;
     rows.push(footer(app));
+    app.row_targets = targets;
+    app.sidebar_w = sidebar_w;
     rows
+}
+
+/// The agent panel: every watched pane, its state, and how long it has
+/// stood there. `None` when it should not be drawn: hidden by `a`, no
+/// roster to show, or a terminal too narrow to split.
+///
+/// Each agent is two lines and a blank: who (with the CLI the daemon
+/// detects), then where they stand and since when. Both content lines
+/// answer a click with the pane, because the panel's whole job is being
+/// the fastest route to the pane that needs you.
+#[allow(clippy::type_complexity)]
+fn sidebar(app: &App, width: usize, region_h: usize) -> Option<(Vec<(String, RowTarget)>, usize)> {
+    if !app.show_roster || app.roster_len() == 0 || width < SIDEBAR_MIN_TERM_W {
+        return None;
+    }
+    let theme = &app.theme;
+    let mut cells: Vec<(String, RowTarget)> = Vec::new();
+    cells.push((theme.dim("agents"), RowTarget::Nothing));
+    cells.push((String::new(), RowTarget::Nothing));
+    let total = app.roster_len();
+    for (shown, row) in app.roster().enumerate() {
+        // Three lines to close this agent plus one for "+N more" if the
+        // rest will not fit: stop while the message is still honest.
+        let remaining = region_h.saturating_sub(cells.len());
+        if remaining < 3 && shown < total {
+            let more = total - shown;
+            cells.pop_if_empty();
+            cells.push((theme.dim(&format!("+{more} more")), RowTarget::Nothing));
+            break;
+        }
+        let target = RowTarget::Agent(row.pane_id.clone());
+        let who = match &row.manifest {
+            Some(m) => format!(
+                "{} {} {}",
+                theme.role(&row.name, &row.name),
+                theme.dim("·"),
+                theme.dim(m)
+            ),
+            None => theme.role(&row.name, &row.name).to_string(),
+        };
+        cells.push((who, target.clone()));
+        let mut standing = format!("  {}", crate::grid::state_cell(row.state, theme));
+        if let Some(ms) = row.elapsed_ms() {
+            standing.push_str(&format!(
+                " {} {}",
+                theme.dim("·"),
+                theme.dim(&cyclops_proto::duration_words(ms))
+            ));
+        }
+        cells.push((standing, target));
+        cells.push((String::new(), RowTarget::Nothing));
+    }
+    cells.pop_if_empty();
+    cells.truncate(region_h);
+    let side_w = cells
+        .iter()
+        .map(|(s, _)| display_width(s))
+        .max()
+        .unwrap_or(0)
+        .clamp(SIDEBAR_MIN_W, SIDEBAR_MAX_W);
+    Some((cells, side_w))
+}
+
+/// Pad to `w` display columns. A cell already wider is left whole:
+/// cutting it means cutting inside an escape sequence, which corrupts
+/// the row, so a rare over-wide cell pushes its own row's separator
+/// right instead.
+fn pad_display(s: &str, w: usize) -> String {
+    let have = display_width(s);
+    let mut out = s.to_string();
+    for _ in have..w {
+        out.push(' ');
+    }
+    out
+}
+
+/// Drop a trailing spacer so a panel never ends on a blank.
+trait PopIfEmpty {
+    fn pop_if_empty(&mut self);
+}
+impl PopIfEmpty for Vec<(String, RowTarget)> {
+    fn pop_if_empty(&mut self) {
+        if self.last().is_some_and(|(s, _)| s.is_empty()) {
+            self.pop();
+        }
+    }
 }
 
 /// The eye leads: glyph, count beside it when open, then the view and its
@@ -158,7 +303,7 @@ fn footer(app: &App) -> String {
     if let Some(notice) = &app.notice {
         return format!("  {notice}");
     }
-    theme.dim("? keys · tab view · c density · w/f/t filter · enter jump · q quit")
+    theme.dim("? keys · tab view · a agents · c density · w/f/t filter · enter jump · q quit")
 }
 
 fn cheatsheet(height: usize) -> Vec<String> {
@@ -166,6 +311,7 @@ fn cheatsheet(height: usize) -> Vec<String> {
         "  keys",
         "",
         "  tab    admin stream / firehose",
+        "  a      agents panel · on wide terminals",
         "  w f t  filter with / from / to · enter applies · esc cancels",
         "  enter  jump to the entry's pane",
         "  ↑ ↓    scroll · unpins from the tail",
@@ -173,6 +319,9 @@ fn cheatsheet(height: usize) -> Vec<String> {
         "  c      density · comfortable / compact",
         "  ?      close this help",
         "  q      quit",
+        "",
+        "  mouse  click an agent to jump to its pane · click an entry to",
+        "         select it · wheel scrolls",
     ];
     let mut rows: Vec<String> = lines.iter().take(height).map(|l| l.to_string()).collect();
     while rows.len() < height {
@@ -213,14 +362,19 @@ fn has_body(e: &Entry) -> bool {
 /// Pinned: the tail fills bottom-up, no anchor. Unpinned: the stored top
 /// anchor holds still, so arrivals append below the viewport instead of
 /// shifting it; the selection is kept visible.
-fn stream_rows(app: &App, list: &[&Entry], sh: usize) -> (Vec<String>, Option<u64>) {
+fn stream_rows(
+    app: &App,
+    list: &[&Entry],
+    sh: usize,
+) -> (Vec<String>, Option<u64>, Vec<Option<u64>>) {
     let comfortable = app.density == Density::Comfortable;
     if list.is_empty() {
         let mut rows = vec![empty_state(app)];
         while rows.len() < sh {
             rows.push(String::new());
         }
-        return (rows, None);
+        let uids = vec![None; rows.len()];
+        return (rows, None, uids);
     }
 
     // Choose the window: (start index, lines to cut from the top block).
@@ -257,6 +411,10 @@ fn stream_rows(app: &App, list: &[&Entry], sh: usize) -> (Vec<String>, Option<u6
 
     let theme = &app.theme;
     let mut rows: Vec<String> = Vec::with_capacity(sh + 2);
+    // Which entry each visual row belongs to, so a click can name it.
+    // Spacer rows belong to nobody; a click on breathing room does
+    // nothing, which is what breathing room is for.
+    let mut uids: Vec<Option<u64>> = Vec::with_capacity(sh + 2);
     for (i, e) in list.iter().enumerate().skip(start) {
         let marker = if app.selected == Some(e.uid) {
             format!("{} ", theme.accent("▸"))
@@ -269,19 +427,23 @@ fn stream_rows(app: &App, list: &[&Entry], sh: usize) -> (Vec<String>, Option<u6
             } else {
                 rows.push(format!("  {line}"));
             }
+            uids.push(Some(e.uid));
         }
         if comfortable && i + 1 < list.len() {
             rows.push(String::new());
+            uids.push(None);
         }
         if rows.len() >= cut_top + sh {
             break;
         }
     }
     let mut rows: Vec<String> = rows.into_iter().skip(cut_top).take(sh).collect();
+    let mut uids: Vec<Option<u64>> = uids.into_iter().skip(cut_top).take(sh).collect();
     while rows.len() < sh {
         rows.push(String::new());
+        uids.push(None);
     }
-    (rows, new_top)
+    (rows, new_top, uids)
 }
 
 /// Walk backward from `end` until `sh` lines are covered. Returns the
@@ -377,7 +539,7 @@ mod tests {
         // Settle the eye: one blocked agent, target opening.
         while a.tick_eye() {}
         a.tick_eye();
-        let got = build(&mut a, 12);
+        let got = build(&mut a, 80, 12);
         let expected = vec![
             "◑ 1 cyclops · firehose · 1 needs attention".to_string(),
             String::new(),
@@ -390,7 +552,8 @@ mod tests {
             String::new(),
             String::new(),
             String::new(),
-            "? keys · tab view · c density · w/f/t filter · enter jump · q quit".to_string(),
+            "? keys · tab view · a agents · c density · w/f/t filter · enter jump · q quit"
+                .to_string(),
         ];
         assert_eq!(got, expected);
         for line in &got {
@@ -423,7 +586,7 @@ mod tests {
         });
         while a.tick_eye() {}
         a.tick_eye();
-        let got = build(&mut a, 9);
+        let got = build(&mut a, 80, 9);
         let expected = vec![
             "‿ cyclops · firehose".to_string(),
             String::new(),
@@ -433,7 +596,8 @@ mod tests {
             "  12:04:41  reviewer  ○ idle".to_string(),
             "  12:04:41  reviewer  ✔ cleared · was ⚠ blocked_permission".to_string(),
             String::new(),
-            "? keys · tab view · c density · w/f/t filter · enter jump · q quit".to_string(),
+            "? keys · tab view · a agents · c density · w/f/t filter · enter jump · q quit"
+                .to_string(),
         ];
         assert_eq!(got, expected);
     }
@@ -451,7 +615,7 @@ mod tests {
                 None,
             ));
         }
-        let got = build(&mut a, 8);
+        let got = build(&mut a, 80, 8);
         // Stream area is 5 rows: the last five messages, tail at bottom.
         assert!(got[2].ends_with("m45"), "{:?}", got[2]);
         assert!(got[6].ends_with("m49"), "{:?}", got[6]);
@@ -472,7 +636,7 @@ mod tests {
         }
         // Scroll up once: selection m18, anchor stored on first build.
         a.handle_key(Key::Up);
-        let before = build(&mut a, 8);
+        let before = build(&mut a, 80, 8);
         // New arrivals must not move the viewport.
         for i in 20..30 {
             a.live(msg(
@@ -483,13 +647,13 @@ mod tests {
                 None,
             ));
         }
-        let after = build(&mut a, 8);
+        let after = build(&mut a, 80, 8);
         assert_eq!(before[2..7], after[2..7], "viewport moved on arrival");
         // The selected line carries the marker.
         assert!(after.iter().any(|l| l.starts_with("▸ ")), "{after:?}");
         // End repins to the tail.
         a.handle_key(Key::End);
-        let tail = build(&mut a, 8);
+        let tail = build(&mut a, 80, 8);
         assert!(tail[6].ends_with("m29"), "{:?}", tail[6]);
     }
 
@@ -497,7 +661,7 @@ mod tests {
     fn overlay_and_input_lines_render() {
         let mut a = fixture();
         a.handle_key(Key::Char('?'));
-        let got = build(&mut a, 12);
+        let got = build(&mut a, 80, 12);
         assert_eq!(got[2], "  keys");
         assert!(got[4].starts_with("  tab"));
         a.handle_key(Key::Char('?'));
@@ -505,7 +669,7 @@ mod tests {
         for c in "rev".chars() {
             a.handle_key(Key::Char(c));
         }
-        let got = build(&mut a, 12);
+        let got = build(&mut a, 80, 12);
         assert_eq!(
             got.last().unwrap(),
             "with: rev  · enter applies · esc cancels"
@@ -515,10 +679,10 @@ mod tests {
     #[test]
     fn empty_states_invite_the_next_action() {
         let mut a = App::new(Theme::none(), View::Admin, Filter::default());
-        let got = build(&mut a, 8);
+        let got = build(&mut a, 80, 8);
         assert_eq!(got[2], "  All calm. tab shows the firehose.");
         a.view = View::Firehose;
-        let got = build(&mut a, 8);
+        let got = build(&mut a, 80, 8);
         assert_eq!(got[2], "  Nothing yet. Events land here as they arrive.");
     }
 
@@ -533,7 +697,7 @@ mod tests {
         let one = |set: fn(&mut Filter)| {
             let mut a = fixture();
             set(&mut a.filter);
-            build(&mut a, 12)[2].clone()
+            build(&mut a, 80, 12)[2].clone()
         };
         assert_eq!(
             one(|f| f.with = Some("nobody".into())),
@@ -562,7 +726,7 @@ mod tests {
         // No filter at all is the other reason a line can be missing.
         let mut a = fixture();
         a.filter.with = Some("nobody".into());
-        assert!(build(&mut a, 12)[2].contains("Hidden by the"));
+        assert!(build(&mut a, 80, 12)[2].contains("Hidden by the"));
     }
 
     /// The band's keys and the keys that open the inputs are one table.
@@ -589,7 +753,7 @@ mod tests {
         a.conn_lost = true;
         while a.tick_eye() {}
         a.tick_eye();
-        let got = build(&mut a, 12);
+        let got = build(&mut a, 80, 12);
         assert_eq!(
             got[0],
             "◑ 1 cyclops · firehose · with reviewer · 1 needs attention · connection lost"

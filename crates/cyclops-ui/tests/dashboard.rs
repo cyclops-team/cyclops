@@ -1,0 +1,215 @@
+//! The dashboard half of the stream: the agents panel beside the window,
+//! and the mouse. Everything here goes through the public surface the
+//! runtime uses: seed, live, build, handle_key.
+
+use cyclops_ui::{build, App, Command, Entry, EntryKind, Filter, Key, RowTarget, View};
+
+use cyclops_proto::AgentState;
+use cyclops_ui::{RosterSeed, StatusSeed, Theme};
+
+const WIDE: usize = 120;
+const NARROW: usize = 80;
+const H: usize = 24;
+
+fn seeded_app() -> App {
+    let mut app = App::new(Theme::none(), View::Admin, Filter::default());
+    app.seed_status(StatusSeed {
+        watched: vec!["main".into()],
+        panes: Vec::new(),
+        open: Vec::new(),
+        roster: vec![
+            RosterSeed {
+                pane_id: "%0".into(),
+                name: "implementer".into(),
+                state: AgentState::Working,
+                manifest: Some("claude".into()),
+                state_ms: Some(5_000),
+            },
+            RosterSeed {
+                pane_id: "%1".into(),
+                name: "reviewer".into(),
+                state: AgentState::Idle,
+                manifest: None,
+                state_ms: None,
+            },
+        ],
+    });
+    app
+}
+
+fn state_event(uid_ts: u64, name: &str, pane: &str, state: AgentState) -> Entry {
+    Entry {
+        uid: 0,
+        ts: uid_ts,
+        seq: None,
+        id: Some("e-t".into()),
+        kind: EntryKind::State {
+            target: name.into(),
+            pane_id: Some(pane.into()),
+            state,
+        },
+    }
+}
+
+/// The panel: who, which CLI, where they stand, for how long. Glyph plus
+/// word for every state, elapsed only where somebody has said, and the
+/// whole thing absent below the width that can afford it.
+#[test]
+fn the_panel_shows_each_agent_and_only_on_a_wide_terminal() {
+    let mut app = seeded_app();
+    let wide = build(&mut app, WIDE, H);
+    let joined = wide.join("\n");
+    assert!(joined.contains("agents"), "{joined}");
+    assert!(joined.contains("implementer · claude"), "{joined}");
+    assert!(joined.contains("● working · 5s"), "{joined}");
+    assert!(joined.contains("reviewer"), "{joined}");
+    // Nobody said how long reviewer has been idle, so nothing counts.
+    assert!(joined.contains("○ idle"), "{joined}");
+    assert!(!joined.contains("○ idle ·"), "{joined}");
+    assert!(joined.contains("│"), "no separator: {joined}");
+    assert!(app.sidebar_w > 0);
+
+    let narrow = build(&mut app, NARROW, H);
+    let joined = narrow.join("\n");
+    assert!(!joined.contains("agents\n"), "{joined}");
+    assert!(!joined.contains("│"), "{joined}");
+    assert_eq!(app.sidebar_w, 0);
+
+    // `a` gives the width back on demand.
+    let mut app = seeded_app();
+    app.handle_key(Key::Char('a'));
+    let rows = build(&mut app, WIDE, H);
+    assert!(!rows.join("\n").contains("│"));
+}
+
+/// A click is the panel's whole point: the fastest route to the pane that
+/// needs you. The frame wrote what each cell means; x picks the half.
+#[test]
+fn clicks_land_on_what_the_frame_drew() {
+    let mut app = seeded_app();
+    // One entry the ADMIN view can reach: routine working/idle traffic is
+    // firehose-only, and a click needs a row to land on.
+    app.live(state_event(
+        43_480_000,
+        "implementer",
+        "%0",
+        AgentState::BlockedPermission,
+    ));
+    let _ = build(&mut app, WIDE, H);
+
+    // Find the implementer row in the panel and click its left half.
+    let agent_row = app
+        .row_targets
+        .iter()
+        .position(|(side, _)| *side == RowTarget::Agent("%0".into()))
+        .expect("an agent row in the panel");
+    let cmd = app.handle_key(Key::Click {
+        x: 2,
+        y: agent_row as u16,
+    });
+    assert_eq!(cmd, Some(Command::Focus("%0".into())));
+
+    // A stream entry row, clicked right of the divider: selection, no jump.
+    let entry_row = app
+        .row_targets
+        .iter()
+        .find_map(|(_, stream)| match stream {
+            RowTarget::Entry(uid) => Some(*uid),
+            RowTarget::Nothing => None,
+            RowTarget::Agent(_) => None,
+        })
+        .expect("a stream entry row");
+    let y = app
+        .row_targets
+        .iter()
+        .position(|(_, s)| *s == RowTarget::Entry(entry_row))
+        .unwrap();
+    let cmd = app.handle_key(Key::Click {
+        x: (app.sidebar_w + 5) as u16,
+        y: y as u16,
+    });
+    assert_eq!(cmd, None);
+    assert_eq!(app.selected, Some(entry_row));
+    assert!(!app.pinned);
+
+    // Dead space does nothing at all.
+    let cmd = app.handle_key(Key::Click { x: 0, y: 1 });
+    assert_eq!(cmd, None);
+}
+
+/// The elapsed clock restarts on a TRANSITION and survives confirmation.
+/// The daemon re-emits state on unrelated recomputes; a clock that reset
+/// on those would show every long-running agent as seconds old.
+#[test]
+fn elapsed_survives_confirmation_and_restarts_on_transition() {
+    let mut app = seeded_app();
+    // Confirmed: same state again. The 5s the daemon reported stands.
+    app.live(state_event(1, "implementer", "%0", AgentState::Working));
+    let row = app.roster().find(|r| r.pane_id == "%0").unwrap();
+    assert!(row.elapsed_ms().unwrap() >= 5_000, "the clock reset");
+
+    // A real transition: the clock starts over from what we saw.
+    app.live(state_event(2, "implementer", "%0", AgentState::Idle));
+    let row = app.roster().find(|r| r.pane_id == "%0").unwrap();
+    assert!(row.elapsed_ms().unwrap() < 5_000, "the clock carried over");
+}
+
+/// A pane leaving the table leaves the panel: tmux retired the id, and a
+/// row nothing can click is a row that lies.
+#[test]
+fn a_gone_pane_leaves_the_panel() {
+    let mut app = seeded_app();
+    assert_eq!(app.roster_len(), 2);
+    app.live(Entry {
+        uid: 0,
+        ts: 3,
+        seq: None,
+        id: None,
+        kind: EntryKind::PaneGone {
+            pane_id: "%0".into(),
+        },
+    });
+    assert_eq!(app.roster_len(), 1);
+    let rows = build(&mut app, WIDE, H);
+    assert!(!rows.join("\n").contains("implementer"));
+}
+
+/// The uncolored dashboard carries everything the colored one does: the
+/// panel is glyph-plus-word like every other surface, so NO_COLOR costs
+/// paint and nothing else.
+#[test]
+fn an_uncolored_dashboard_emits_no_escapes() {
+    let mut app = seeded_app();
+    let rows = build(&mut app, WIDE, H);
+    assert!(
+        rows.iter().all(|r| !r.contains('\x1b')),
+        "escape bytes in an uncolored frame"
+    );
+}
+
+/// The wheel scrolls like the arrows, three rows a notch.
+#[test]
+fn the_wheel_scrolls_and_unpins() {
+    let mut app = seeded_app();
+    // The firehose: routine state traffic is visible there, and the wheel
+    // needs a list longer than the window to scroll in.
+    app.handle_key(Key::Tab);
+    for n in 0..12 {
+        app.live(state_event(
+            43_480_000 + n,
+            "implementer",
+            "%0",
+            if n % 2 == 0 {
+                AgentState::Working
+            } else {
+                AgentState::Idle
+            },
+        ));
+    }
+    let _ = build(&mut app, WIDE, 10);
+    assert!(app.pinned);
+    app.handle_key(Key::WheelUp);
+    assert!(!app.pinned, "a wheel notch should unpin like ↑ does");
+    app.handle_key(Key::End);
+    assert!(app.pinned);
+}
