@@ -254,14 +254,18 @@ impl Inner {
     /// The theme for the next chrome write.
     ///
     /// The stat rides the edge that is about to repaint, which is
-    /// cyclops-theme's reload contract: an edit to the active theme moves
-    /// the borders on the next state change, and no timer exists.
+    /// cyclops-theme's reload contract: an edit to the active theme, or a
+    /// `cyclops theme <name>` that moved the config key, reaches the
+    /// borders on the next state change, and no timer exists.
+    ///
+    /// Warnings are taken, not read: a refusal to reload a half-written
+    /// file has to be logged once per edit, and reading them without
+    /// draining logged the same line on every repaint after it.
     pub(crate) fn theme_now(&self) -> cyclops_theme::Theme {
         let mut watch = self.theme.lock().expect("theme lock");
-        if watch.refresh() {
-            for w in watch.warnings() {
-                warn!("theme: {w}");
-            }
+        watch.refresh();
+        for w in watch.take_warnings() {
+            warn!("theme: {w}");
         }
         watch.theme().clone()
     }
@@ -857,12 +861,52 @@ fn bad_request(message: String) -> WireError {
     }
 }
 
+/// Paint these adopted panes' borders, through this session's watcher, in
+/// the theme that is active right now.
+///
+/// The one place a border is painted. Four of the eight write edges land
+/// here (adoption, a session attach, a window move, a theme switch), and
+/// before this existed each carried its own copy of the same four steps:
+/// read the theme, read the pane's cached state, apply, warn. Three copies
+/// meant three answers to "which panes get repainted, with what", and
+/// three wordings of the same failure in the log.
+///
+/// Silent on an empty set, which is what a session with nothing adopted
+/// gives. `chrome = "off"` is chrome.rs's answer, not this function's.
+async fn paint_adoptions(
+    inner: &Arc<Inner>,
+    watcher: &SessionWatcher,
+    adoptions: &[registry::Adoption],
+) {
+    if adoptions.is_empty() {
+        return;
+    }
+    // One theme for the whole set: a file edited between two panes would
+    // otherwise leave one window wearing two palettes.
+    let theme = inner.theme_now();
+    for a in adoptions {
+        let state = inner.cached_state(&a.pane_id);
+        if let Err(e) = chrome::apply(
+            &watcher.client(),
+            inner.cfg.chrome,
+            &a.pane_id,
+            &a.window_id,
+            &a.label,
+            state,
+            &theme,
+        )
+        .await
+        {
+            warn!(pane = %a.pane_id, error = %e, "cannot write pane chrome");
+        }
+    }
+}
+
 /// Paint one adopted pane's border with its current label and state.
 ///
-/// Silent when the pane is not adopted, and when the session is detached:
-/// there is no client to write through, and the re-attach repaints
-/// everything anyway. `chrome = "off"` is chrome.rs's answer, not this
-/// function's.
+/// [`paint_adoptions`] with a set of one. Silent when the pane is not
+/// adopted, and when the session is detached: there is no client to write
+/// through, and the re-attach repaints everything anyway.
 pub(crate) async fn paint_chrome(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) {
     let Some(watcher) = inner.watcher_of(session_idx) else {
         return;
@@ -876,21 +920,7 @@ pub(crate) async fn paint_chrome(inner: &Arc<Inner>, session_idx: usize, pane_id
     else {
         return;
     };
-    let theme = inner.theme_now();
-    let state = inner.cached_state(pane_id);
-    if let Err(e) = chrome::apply(
-        &watcher.client(),
-        inner.cfg.chrome,
-        pane_id,
-        &adoption.window_id,
-        &adoption.label,
-        state,
-        &theme,
-    )
-    .await
-    {
-        warn!(pane = %pane_id, error = %e, "cannot write pane chrome");
-    }
+    paint_adoptions(inner, &watcher, std::slice::from_ref(&adoption)).await;
 }
 
 /// Repaint the state half of an adopted pane's border. Called from the one
@@ -920,6 +950,38 @@ pub(crate) async fn repaint_chrome(inner: &Arc<Inner>, watcher: &SessionWatcher,
     {
         warn!(pane = %pane_id, error = %e, "cannot repaint pane chrome");
     }
+}
+
+/// Re-read the theme selection and put it on every border that is up.
+///
+/// `cyclops theme <name>` writes the config key and calls this. Without
+/// the call the switch still lands, on the next fused state change, which
+/// on a calm rig is not a time anyone can name; borders in last week's
+/// theme next to a stream in this week's is the visible half of that.
+///
+/// Returns the name now active, for the CLI to print, and emits `theme`
+/// so a running `cyclops ui` wakes and re-reads the selection itself.
+/// The event carries no colors: every surface resolves its own, and one
+/// that took a palette off the wire could show a theme no file holds.
+pub(crate) async fn reload_theme(inner: &Arc<Inner>) -> String {
+    // This call IS the reload: it re-stats the selection and drains
+    // whatever the engine refused, so the warning is logged once rather
+    // than once per pane. The paints below read the same watch, which by
+    // then has nothing new to find.
+    let name = inner.theme_now().name().to_string();
+    for idx in 0..inner.sessions.len() {
+        let Some(watcher) = inner.watcher_of(idx) else {
+            continue;
+        };
+        let adopted = inner
+            .registry
+            .lock()
+            .expect("registry lock")
+            .in_session(watcher.session());
+        paint_adoptions(inner, &watcher, &adopted).await;
+    }
+    inner.emit("theme", json!({"name": name}), None);
+    name
 }
 
 /// Boot the daemon: probe tmux, load manifests, bind the socket, spawn one
@@ -984,8 +1046,8 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     for w in warnings {
         warn!("registry: {w}");
     }
-    let theme = cyclops_theme::ThemeWatch::new(&cfg.home);
-    for w in theme.warnings() {
+    let mut theme = cyclops_theme::ThemeWatch::new(&cfg.home);
+    for w in theme.take_warnings() {
         warn!("theme: {w}");
     }
 
@@ -1288,26 +1350,7 @@ async fn reconcile_adoptions(inner: &Arc<Inner>, watcher: &Arc<SessionWatcher>) 
             }
         }
     };
-    if kept.is_empty() {
-        return;
-    }
-    let theme = inner.theme_now();
-    for a in kept {
-        let state = inner.cached_state(&a.pane_id);
-        if let Err(e) = chrome::apply(
-            &watcher.client(),
-            inner.cfg.chrome,
-            &a.pane_id,
-            &a.window_id,
-            &a.label,
-            state,
-            &theme,
-        )
-        .await
-        {
-            warn!(pane = %a.pane_id, error = %e, "cannot write pane chrome on attach");
-        }
-    }
+    paint_adoptions(inner, watcher, &kept).await;
 }
 
 /// An adopted pane moved to another window (tmux `join-pane`,

@@ -36,6 +36,26 @@
 # There is no [stream] table, for the reason written out in dark.toml: the
 # stream's gutter resolves surface.dim like every other detail column.
 #
+# CONTRAST. Checked pair: every token in the vocabulary against #fefefe,
+# the site's --paper. That is the ground this palette was drawn on, and
+# this file sets no background of its own. Measured as WCAG 2.1 relative
+# luminance in sRGB, ratio (lighter + 0.05) / (darker + 0.05); the
+# arithmetic is in crates/cyclops-theme/tests/shipped.rs and the numbers
+# below are pinned there by shipped_themes_meet_their_stated_contrast.
+#
+# Floor 3.6:1 for every token except state.dead, which is WCAG's 3:1 bar
+# for large text and interface elements, cleared with room. The floor is
+# surface.accent, eye.alert and role.1 at 3.67:1, all three the site's own
+# --sage-ink; role.2 follows at 3.68:1. The rest: role slots to 5.4:1,
+# surface.dim and state.quiet 5.1:1, state.healthy 5.3:1, state.needs_you
+# 5.3:1, state.terminal 6.9:1.
+#
+# state.dead is the deliberate exception, floor 2.8:1, measuring 2.82:1,
+# for dark.toml's reason: a pane whose process is gone should be the
+# hardest row to read. On paper that means lighter, not darker, which is
+# why it sits ABOVE dim here. #9a9a9a, one step lighter, measures 2.79:1
+# and is under the floor, so the floor is what picks this value.
+#
 # Every 256-color fallback here is explicit and exactly what the
 # cyclops-theme derivation picks; the role hues above were chosen so the
 # derivation lands the eight slots on pairwise distinct entries.
@@ -66,7 +86,7 @@ healthy = { hex = "#2a7a3f", c256 = 29 }   # forest green
 needs_you = { hex = "#8a6520", c256 = 94 } # ochre amber
 terminal = { hex = "#9c3838", c256 = 131 } # brick red
 quiet = { hex = "#6e6e6e", c256 = 242 }    # --muted, same as surface.dim
-dead = { hex = "#9a9a9a", c256 = 247 }     # above dim: lighter is quieter here
+dead = { hex = "#999999", c256 = 246 }     # above dim: lighter is quieter here
 
 [badge]
 healthy = { hex = "#2a7a3f", c256 = 29 }

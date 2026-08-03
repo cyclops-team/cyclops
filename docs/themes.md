@@ -1,33 +1,81 @@
 # Themes
 
-Every color Cyclops prints is a semantic token, resolved through a theme.
-Code never names a raw color; a theme file maps tokens to values. The
-engine lives in `crates/cyclops-theme`, and every surface resolves color
-through it: the one-shot CLI commands, `cyclops ui`, and the `role • state`
-the daemon writes onto a named pane's tmux border (docs/panes.md).
-
 ## Pick a theme
 
-In `~/.cyclops/config.toml`:
-
-```toml
-theme = "dark"
+```bash
+cyclops theme            # what is there, and what each one looks like
+cyclops theme light      # switch
 ```
 
-Or per invocation, which wins over the config:
+```
+▸ dark           ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  high-contrast  ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  light          ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+
+  cyclops theme <name> to switch
+```
+
+Each row is painted in its own theme, and `▸` marks the one that is on.
+
+Only files that would change a color are listed. A file that will not
+parse, and a file that parses and sets no token at all, are both left out:
+a row here is an offer to switch, and either one would switch you to the
+built-in colors under somebody else's name. Typing such a name is refused
+for the same reason. See [what counts as setting nothing](#file-format).
+
+Switching writes `theme = "light"` into `~/.cyclops/config.toml` and
+leaves the rest of that file alone, comments included.
+
+```
+✔ theme light
+  light  ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+```
+
+The first line says how far the switch got, and it is the only line that
+claims anything about the screen.
+
+`✔` is cyclopsd answering that it is painting `light` now: the pane
+borders and any running `cyclops ui` are already on it.
+
+`✓` means no daemon was running to ask. The config is written either way,
+and the line says `the next command picks it up`.
+
+`⚠` means a daemon answered and is painting something else. The config is
+written and the next one-shot command is on the new theme, but the pane
+borders are not, and no later command moves them:
+
+```
+⚠ theme light · saved, not live
+  light  ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  cyclopsd is still painting dark, so pane borders did not change. Check CYCLOPS_THEME and the themes directory where cyclopsd runs, then restart it.
+```
+
+Two things put it there, and restarting cyclopsd clears either one once
+the cause is gone. `CYCLOPS_THEME` in the daemon's environment beats the
+config key and is fixed for the life of that process, and a bare name
+resolves against `./themes` relative to the daemon's own working directory
+when `~/.cyclops/themes` does not exist.
+
+Three themes ship, all on the usecyclops.dev identity: `dark` (the
+default), `light`, `high-contrast`.
+
+Two other ways to choose, for a config you maintain by hand and for one
+run:
+
+```toml
+theme = "dark"           # ~/.cyclops/config.toml
+```
 
 ```bash
 CYCLOPS_THEME=light cyclops status
 ```
 
+`CYCLOPS_THEME` wins over the config key, which wins over the default.
 Both accept a name (resolved to `<themes dir>/<name>.toml`) or a path to a
 `.toml` file. The themes directory is `~/.cyclops/themes` when it exists,
-else `./themes` relative to the working directory (the repo layout).
-
-Shipped themes, all on the usecyclops.dev identity: `dark` (the default),
-`light`, `high-contrast`. With no theme file anywhere, a compiled default
-table renders; a theme that names only some tokens falls back to that
-table for the rest.
+else `./themes` relative to the working directory (the repo layout). With
+no theme file anywhere, a compiled default table renders; a theme that
+names only some tokens falls back to that table for the rest.
 
 `NO_COLOR` and `--plain` win over everything: no theme is even read.
 
@@ -39,7 +87,7 @@ table for the rest.
 |---|---|---|
 | `role` | `1`..`8` | Stable per-agent colors; a label hashes to a slot |
 | `surface` | `dim` | Detail columns, gutters, separators, every dimmed qualifier |
-| `surface` | `accent` | The marker on the selected entry in `ui` |
+| `surface` | `accent` | The marker on the row a surface is pointing at: the selected entry in `ui`, the active theme in `cyclops theme` |
 | `eye` | `calm` `alert` | The eye, in both the `status` and `ui` headers: calm closed, alert open |
 | `state` | `healthy` `needs_you` `terminal` `quiet` `dead` | Agent state cells, by group, including on pane borders |
 | `badge` | `healthy` `needs_you` `terminal` `quiet` | Delivery badges, the same groups read on a delivery |
@@ -47,7 +95,9 @@ table for the rest.
 One more token exists and is worth knowing about. `surface.fg` is the
 engine's fallback for a token name outside this list, which only a bug
 produces. No renderer paints it, so editing it changes nothing on screen.
-The shipped themes set it anyway, because it names their text color.
+The shipped themes set it anyway, because it names their text color. It
+does not count as a theme setting a color, so a file that sets it and
+nothing else is treated as [a file that sets nothing](#file-format).
 
 ## What the colors mean
 
@@ -55,9 +105,9 @@ Two things carry meaning: the color of an agent's name, and the state
 glyph. Nothing else.
 
 An agent's name is colored by role, so the same agent is the same color
-everywhere, including on its pane border. State color is a second reading of what the glyph and the
-word already said, never a replacement for it. Turn color off and you
-lose nothing: `● working` is still `● working`.
+everywhere, including on its pane border. State color is a second reading
+of what the glyph and the word already said, never a replacement for it.
+Turn color off and you lose nothing: `● working` is still `● working`.
 
 States are grouped, not one color each. Four groups answer the only two
 questions a color is any good at answering across a room, plus one step
@@ -80,6 +130,33 @@ delivery badge reads the same on a receipt, in `cyclops history` and in
 the stream. Both surfaces compose the cell in one place
 (`crates/cyclops-ui/src/grid.rs`) and supply only the paint, so a theme
 edit moves them together.
+
+## Contrast
+
+A contrast ratio is how far a color stands out from the background behind
+it, from 1:1 for invisible up to 21:1 for black on white. The numbers here
+are the ones the accessibility guidelines for the web use (WCAG 2.1,
+measured on relative luminance in sRGB), because they are the only
+published bar for "can a person read this".
+
+Each shipped theme's file header states the ground it assumes and the
+ratio every token clears against it. The bars below are the bars, not a
+summary of them: `shipped_themes_meet_their_stated_contrast` in
+`crates/cyclops-theme/tests/shipped.rs` measures every color against them,
+and `the_published_bars_are_the_bars_that_get_measured` fails the build if
+this table and that test stop agreeing. A retuned color that drops below
+what is published here fails too.
+
+| Theme | Ground | Every token clears | Except |
+|---|---|---|---|
+| `dark` | `#0d0d0d`, the site's terminal panel | 4.3:1 | `state.dead`, 2.8:1 |
+| `light` | `#fefefe`, the site's paper | 3.6:1 | `state.dead`, 2.8:1 |
+| `high-contrast` | `#000000`, the terminal's own black | 7:1, WCAG AAA for body text | nothing |
+
+Every number is a floor. `state.dead` gets its own because it is
+deliberately the hardest cell to read: it marks a pane whose process is
+gone, and there is nothing to do about one. Both exceptions measure
+2.82:1 against their ground.
 
 ## What is not themeable
 
@@ -109,13 +186,29 @@ Data-only TOML. A value is either `"#rrggbb"` or a table with an explicit
 name = "dark"
 
 [surface]
-dim = "#777777"                        # fallback derived
+dim = "#777777"                          # fallback derived
 accent = { hex = "#b7c396", c256 = 144 } # fallback explicit
 ```
 
 Unknown tokens warn and are ignored; missing tokens fall back to the
-compiled defaults; only broken TOML rejects the file. Nothing in a theme
-executes.
+compiled defaults; only broken TOML stops the file loading at all. Nothing
+in a theme executes.
+
+That tolerance has one edge, and `cyclops theme` handles it rather than
+letting you fall into it. A file that loads and sets none of the 21 tokens
+that change what you see is not listed and not accepted by name. Empty, a
+`name` and nothing else, every token name stale, and `surface.fg` alone
+all parse cleanly, and every color would still come off the compiled
+table, so choosing one would repaint nothing anywhere:
+
+```
+$ cyclops theme stale
+theme: unknown token `state.idle` ignored
+can't use theme "stale": ~/.cyclops/themes/stale.toml sets no colors, so switching to it would change nothing on screen. Nothing was changed. Pick another with cyclops theme.
+```
+
+Setting one token is enough. The rule is about a file that sets none, not
+about a sparse one.
 
 When `c256` is omitted it is derived: nearest xterm-256 entry by squared
 RGB distance, comparing the 6x6x6 color cube (16..231) against the
@@ -127,23 +220,51 @@ hues onto one entry, since two roles must never share a color.
 
 ## Editing a live theme
 
-A change to the active theme file applies on the next render: the engine
-re-checks the file (a stat of mtime plus length) when something is about
-to repaint, with no watcher thread and no timer, keeping the zero-polling
-contract. One-shot commands read the theme at startup, so they always
-print the current file.
+Save the file. The change applies on the next thing that repaints.
 
-A file broken mid-edit behaves differently on the two surfaces, because
-they hold the theme differently. A running `cyclops ui` keeps the colors
-it already has and prints nothing. A one-shot command has no previous
-colors to keep, so it falls back to the built-in table and says why on
-stderr:
+Long-lived surfaces (`cyclops ui`, the pane borders cyclopsd writes) hold
+the selection and re-check it when an event has already woken them: a
+stat of the config key and of the theme file, no watcher thread and no
+timer, so the zero-polling contract holds. One-shot commands read the
+theme at startup, so they always print the current file.
+
+A reload applies whole or not at all. The file has to load, and it has to
+still set every token it set before. Otherwise the colors already on
+screen stay and one line says why:
 
 ```
-theme: theme ~/.cyclops/themes/dark.toml isn't valid TOML: ... Using built-in colors.
+theme: ~/.cyclops/themes/dark.toml stopped setting `surface.dim` and 4 more. Keeping the colors on screen. Fix the file and save again.
 ```
 
-Deleting the file falls back to the built-in table on both surfaces.
-That is silent for the default theme. A theme you chose explicitly, with
-`CYCLOPS_THEME` or the `theme` config key, warns that it resolved to
-nothing.
+That rule is there for the way editors save. Truncate, then rewrite: a
+stat landing in the middle reads a shorter file that is still valid TOML,
+and loading it would paint every missing token out of the compiled table,
+whose lightness has nothing to do with the theme you are on. A misspelled
+token name does the same thing and stays until you notice. Neither one
+reaches the screen.
+
+`cyclops ui` shows that line on its notice row. One-shot commands print it
+on stderr; they have no previous colors to keep, so a file they cannot
+read falls back to the built-in table and says so:
+
+```
+theme: ~/.cyclops/themes/dark.toml isn't valid TOML (line 1, column 9: invalid table header; expected `.`, `]`), so cyclops is using built-in colors until you fix it.
+```
+
+Choosing a *different* theme is the one case that is exempt: you asked for
+that palette, so a theme that sets only a few tokens takes the compiled
+defaults for the rest, exactly as it would on a fresh start. The exemption
+is about the file changing, not about the config changing, so
+`cyclops theme light` while you are already on light is still an edit and
+still held to the rule.
+
+That case is also the one the switch's `✔` cannot speak for. The check
+reports which theme cyclopsd says it is painting, and a refused edit
+leaves it painting the same theme under the same name, so re-choosing the
+theme you are already on prints `✔` whether or not the edit applied.
+cyclopsd logs the refusal. Choosing a different theme always applies
+whole, so there the check answers for the whole of what it claims.
+
+`demos/m5-theme.sh` runs all of it against a throwaway tmux server: a
+switch reaching a live pane border, an edit reaching the same border, and
+a theme file caught mid-save leaving it exactly where it was.

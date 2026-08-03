@@ -179,270 +179,247 @@ milestones, and both were worth more than the fix:
 Local green plus red CI is not a flaky-CI story until the logs say so.
 Read the failing job before assuming the environment is at fault.
 
-## F25. Cyclops has no reliable dead-pane edge on any tmux version; 3.6a wins the race by 23ms (MEASURED)
+## F25. A per-pane subscription can never report a pane's death; the all-panes form can (FIXED)
 
 The advisory tmux-HEAD job went red on one test,
-`short_lived_command_flips_pane_dead_with_remain_on_exit`. The first
-reading, that next-3.8 had stopped emitting a dead-pane notification, was
-wrong. Measured against a local tmux built from master, next-3.8 and 3.6a
-emit byte-identical control-mode notification sequences for this scenario,
-and both flip `pane_dead` at the same moment (595ms on 3.6a, 611ms on
-next-3.8, for a child exiting at 500ms).
+`short_lived_command_flips_pane_dead_with_remain_on_exit`. Two readings
+were wrong before the right one. It is not that next-3.8 changed
+anything: both versions emit identical notification sequences and flip
+`pane_dead` within 16ms of each other. And it is not merely a race,
+though it presents as one.
 
-What actually happens is a race that nothing in the design arbitrates.
-There is no notification for a pane's death. The watcher only learns of it
-because some OTHER event forces a pane-table resync, and here that event is
-tmux's automatic window rename firing when the command exits:
+The cause is in tmux's source. `pane_dead` is set when the pane's pty fd
+closes (format.c `format_cb_pane_dead`: `wp->fd == -1 && PANE_STATUSREADY`).
+That same closed fd is the gate that makes tmux skip the pane's own
+subscription (monitor.c `monitor_check_pane`: `if (wp == NULL || wp->fd
+== -1) return;`). So a per-pane subscription carrying `#{pane_dead}` can
+report a live pane and can never report the flip, on any version. Measured
+on both: the per-pane subscription pushes once at arm time with dead=0 and
+nothing afterwards, while list-panes shows dead=1.
 
-    3.6a       pane_dead flips 595ms   resync 618ms   sees dead=1   PASS
-    next-3.8   pane_dead flips 611ms   resync 598ms   sees dead=0   FAIL
+Cyclops only ever saw a death because some unrelated event forced a
+pane-table resync in the same moment, in practice tmux's automatic window
+rename firing when the command exits. 3.6a won that by 23ms (flip 595ms,
+resync 618ms) and next-3.8 lost it by 13ms (flip 611ms, resync 598ms).
+3.6a was passing on luck, and the cost was real: pane-dead is a delivery
+gate condition, so a corpse could read as a live agent indefinitely.
 
-Both margins are around 20ms and neither is guaranteed. 3.6a passes by
-luck. Proven by dumping every PaneEvent the watcher emits under each
-binary: on 3.6a the resync yields `PaneChanged %1 changed=[WindowName,
-Dead] dead=true`; on next-3.8 the same resync yields `changed=[WindowName]
-dead=false`, and because no further event ever arrives, the watcher's
-table holds `dead=false` permanently. Final state read back from the
-watcher confirms it: `%1 dead=Some(false)` with the pane long dead.
+The fix is one more subscription, armed once per connection:
+`cypdead:%*:#{pane_dead}`. The all-panes form has no fd gate, so it keeps
+expanding for a dead pane. Its handler arms the existing 30ms debounced
+reconcile only when the pushed flag disagrees with the table, so an
+all-live session arms nothing and the zero-polling contract holds. Latency
+is now bounded rather than unbounded: 1033ms for a pane dying at 500ms,
+which is tmux's own 1Hz tick plus the debounce, not a timer cyclops added.
+Measured over 12s on an idle session, the subscription produced three
+pushes total: one per pane at arm time plus the one real flip.
 
-The reason the subscription does not save us is the substantive finding.
-SUB_FORMAT already carries `#{pane_dead}`, and subscriptions re-evaluate on
-tmux's 1Hz tick (F23), so a 0-to-1 flip should push. It does not. Measured
-on BOTH versions: subscribe to a pane while alive, let it die, watch eight
-seconds and four-plus ticks, and the count of pushes for that pane after
-death is zero. tmux stops re-evaluating a per-pane format subscription once
-the pane's process exits. Subscribing to an already-dead pane likewise
-pushes nothing, so there is no recovery path through the subscription
-either.
+A second defect had to be fixed or the first would have made things worse.
+tmux master gates `#{pane_pid}` on the same fd (format.c:2465), so
+next-3.8 reports an empty pid for a dead pane while 3.6a reports the stale
+one. The row parser treated the empty field as a parse failure and dropped
+the whole row, so on next-3.8 the reconcile the new edge triggers read the
+death as a REMOVAL: `PaneRemoved("%1")` at 1033ms with the pane gone from
+the table. An empty pid now parses as -1, in one place used by both parse
+sites.
 
-Consequence, and it applies to the shipping version, not just to HEAD: a
-pane that dies without a coincident second event stays `dead=false` in the
-pane table forever. `cyclops status` will show a corpse as a live agent,
-and the delivery gate's dead check, which is one of the guards standing
-between a delivery and the wrong destination, silently stops guarding. The
-occupant_unchanged re-check before paste and submit still catches the worse
-case where a NEW process rebinds the pane id, so this degrades a layer
-rather than opening the door.
+Verified on both binaries: exactly one `PaneChanged { changed: [Dead],
+dead: true }` at ~1033ms, no PaneRemoved, 543 tests green under each.
+Disarming the new subscription makes the test time out on BOTH versions,
+so 3.6a's 23ms of luck is no longer what carries it.
 
-Scope, measured rather than assumed: this is specific to
-`remain-on-exit on`, which is not tmux's default. With the default off, an
-exiting command takes its pane with it, and that emits a real
-`%layout-change` (measured at 5.65s for a child exiting at 5.5s), which
-resyncs the table and produces PaneRemoved normally. So the exposure is
-users who turn remain-on-exit on, plus the test rig that must turn it on
-to make pane_dead observable at all. That is why this is recorded and
-carried rather than fixed hot.
+Open, and worth knowing: a dead pane's `pane_pid` now differs by version,
+stale on 3.6a and -1 on next-3.8. Not normalized, because inventing a
+value tmux stopped reporting would be a lie. On 3.6a a stale pid can in
+principle be recycled by an unrelated process, and sender identity walks
+socket-peer ancestry to a pid; next-3.8 closes that, 3.6a leaves it as
+open as it already was. Also untested: the `%*` subscription form is
+measured on 3.6a and next-3.8 only. If an older tmux rejects it,
+subscribing only warns and the death edge silently reverts to the old
+race.
 
-Not fixed here. The fix has to give death its own edge rather than relying
-on a coincident rename: a bounded re-read of the pane row triggered by the
-pane's process exiting, or a window-level subscription that keeps ticking
-after the pane's process is gone. Recorded as a risk in STATUS.md and
-carried into the pane work, where the pane table is already being touched.
-The tmux-HEAD job stays continue-on-error: it did its job, which was to
-surface this at all.
+## F26. Every shipped manifest reads the pane title as a sensor, so cyclops never writes it (MEASURED)
 
-## F26. Every shipped manifest reads the pane title, so cyclops cannot write it (MEASURED)
+The M4 brief asked the daemon to put `role • state` on the pane title as
+well as the border. Only the border is written, and the title is the
+reason.
 
-M4's brief asked the daemon to put `role • state` on both the pane title
-and the pane border. The title is not available, for three reasons that
-compound.
+Measured by reading what the shipped manifests bind. Two of the three
+(`manifests/claude.toml`, `manifests/agy.toml`) carry rules over
+`region = "pane_title"`, and claude's spinner rules are the title tier at
+priority 1100. The third says so in its own header: codex sets no OSC
+title, so `#{pane_title}` there is the static project directory name and
+the manifest marks it useless. A matching title rule means the screen
+sensor never runs at all (amendment h), so on claude the title IS the
+detection input for the common case.
 
-It is a sensor. claude.toml carries `title_working_spinner` at priority
-1100 and `title_idle_sparkle` at 1000, both `region = "pane_title"`, and
-they are the title tier of fusion: on a pane where a title rule matches,
-screen capture never runs at all (amendment h). agy.toml and codex.toml
-carry pane_title rules too. Overwriting the title with decoration would
-replace the highest-priority evidence cyclops has about that pane with a
-string cyclops wrote itself.
+Writing it would have cost twice over, both already measured elsewhere. A
+title write from outside the pane pushes a `%subscription-changed` like any
+other (F13), so cyclops would be feeding its own decoration back into its
+own sensor. And an agent that publishes its own title overwrites cyclops
+inside tmux's one-second tick (F23), so the decoration would not even hold.
 
-It is a fusion trigger. F13 measured that `select-pane -T` from outside
-the pane pushes `%subscription-changed` exactly like an in-pane OSC 2
-write, so every chrome write would wake a recompute of the pane it just
-overwrote.
+What it constrains: `crates/cyclopsd/src/chrome.rs` writes
+`@cyclops_role`, `@cyclops_state`, `pane-border-format` and
+`pane-border-status`, and no pane title; `cyclops_tmux::layout` writes none
+either. The border already displays `#{pane_title}` by default, so
+replacing the border FORMAT replaces the view without touching the value
+underneath. Proven by `crates/cyclopsd/tests/m4_name.rs`, which drives the
+title sensor from outside the pane to move a border: that test can only
+exist because chrome does not write the title.
 
-It does not stick. Claude rewrites its title continuously through a turn
-and tmux re-evaluates subscriptions on a 1Hz tick (F23), so a title
-cyclops writes is gone before a reader sees it.
+## F27. `pane-border-format` is a pane option, `pane-border-status` is not, and border text costs every pane a line (MEASURED)
 
-The border is the surface that was actually wanted. tmux's default
-`pane-border-format` is `#{?pane_active,#[reverse],}#{pane_index}#[default]
-"#{pane_title}"`, so the border already DISPLAYS the title: replacing the
-format replaces the view of the pane's identity without touching the value
-underneath, and the title sensor keeps reading what the agent publishes.
-Proven by crates/cyclopsd/tests/m4_name.rs, where the border follows the
-fused state while the test drives that state by writing the pane title
-from outside; both would be impossible if cyclops owned the title.
+Three measurements about the two options the pane chrome writes, taken on
+tmux 3.6a and re-taken on 2026-08-03 (macOS 26.5.2, arm64) with a probe on
+an isolated `cyclops-testrig` server holding two panes in one 80x24 window.
 
-Recorded as a deviation from the brief in STATUS.md.
+1. `pane-border-format` is a real pane option. `set -p -t %0
+   pane-border-format AAA` then `show -p -v` reads back `AAA` on `%0`,
+   empty on `%1`, and empty at window scope. So cyclops can rewrite one
+   named pane's border without touching the pane beside it.
+2. `pane-border-status` has no pane scope. `set -p -t %0
+   pane-border-status top` succeeds, exit 0, no stderr, and afterwards the
+   WINDOW option reads `top`. tmux accepted the command and wrote the
+   window. There is no way to give one pane border text and not its
+   neighbour.
+3. Border text costs each pane one line. The same two panes measured
+   `40x24` and `39x24` with `pane-border-status` unset, and `40x23` and
+   `39x23` with it set to `top`.
+4. A format expands ONCE. With `@cyclops_role` set to the literal
+   `#{pane_id}` and the border format set to ` #{@cyclops_role} `,
+   `#{E:pane-border-format}` expands to ` #{pane_id} `: the option's VALUE
+   is substituted and never re-expanded.
 
-## F27. pane-border-format is a pane option; pane-border-status is not (MEASURED)
+What each constrains. (2) is why `pane-border-status` is snapshotted per
+window, turned on by the first adoption in a window and put back by the
+last un-adoption, and why the registry carries a `WindowChrome` at all
+(`crates/cyclopsd/src/registry.rs`); it is also why a pane moving windows
+needs `move_chrome` to hand the setting back to the window it left. (3) is
+why every ratio in `cyclops_tmux::layout` is a share of the cells the PANES
+hold and never of the window: a grid checked against the window stopped
+adding up the moment the daemon named a pane, and `cyclops workspace save`
+refused a session `cyclops start` had built seconds earlier
+(`crates/cyclops-tmux/tests/layout_round_trip.rs::a_window_wearing_border_chrome_still_reads_as_a_grid`).
+(4) is why the label rides `@cyclops_role` instead of being written into
+the format string: labels are human input, and a label containing `#{...}`
+would otherwise become a tmux directive evaluated on every border redraw.
 
-Probed on tmux 3.6a in an isolated server. The two options behind border
-chrome scope differently, and the difference decides how much of a user's
-tmux a daemon has to touch to name a pane.
+## F28. tmux spreads a window resize evenly, not in proportion (MEASURED)
 
-`set-option -p -t %0 pane-border-format ...` is accepted and stored AT PANE
-SCOPE: `show-options -p -t %0 -v pane-border-format` reads it back, a
-sibling pane in the same window still resolves the inherited default, and
-`set-option -p -t %0 -u` removes it. So per-pane chrome affects exactly one
-pane and reverses exactly.
+A workspace is saved as ratios, so the question is what tmux does with them
+when the window changes size. It does not scale them. A two-pane window
+split 70/29 at 100 columns becomes 120/79 at 200 columns, not 140/59: the
+100 new columns were handed out evenly, 50 each, rather than in proportion.
 
-`set-option -p -t %0 pane-border-status top` is also accepted, and it is
-NOT a pane option: `show-options -w -t @0 -v pane-border-status` reads
-"top" straight afterwards, i.e. the `-p` write went to the window. There is
-no pane scope for it. Cyclops therefore sets it with an explicit `-w`,
-snapshots the window's prior value once (the first adoption in that window
-takes the snapshot, the last un-adoption puts it back), and never touches
-the server-global scope.
+The consequence has a number. tmux gives a detached session 80x24 by
+default, so a workspace built by a script and attached from a 200x50
+terminal arrives with its shares moved: the `ops` preset's stream dock,
+designed at 30% of the height, arrives at 41%.
 
-Two more measurements that shaped the design:
+What it constrains: `cyclops start` and `cyclops workspace restore` build
+at the size of the terminal they were run from
+(`crates/cyclops/src/workspace.rs::build_size`), which is the only size
+that keeps a preset looking like its design. One built with no terminal to
+ask still drifts, and docs/workspaces.md says so rather than hiding it.
+And `first_difference` deliberately does not compare ratios when matching a
+live session to a saved workspace: resizing a pane moves no agent, and two
+sessions built at different terminal sizes never have the same cell counts
+anyway.
 
-- `show-options -p -t %0 -v <opt>` prints an empty line both for "unset at
-  this scope" and for "set here to the empty string". The value-less form
-  (`show-options -p -t %0 <opt>`) prints nothing for the first and
-  `<opt> ''` for the second, so the snapshot asks twice: once whether the
-  option is set here, once what it is.
-- A format string is expanded ONCE, so an option's value is substituted
-  literally and never re-expanded: `@cyclops_state` holding
-  `a#{pane_id},b"c` renders as those characters. That is why the chrome
-  text lives in per-pane `@cyclops_role` / `@cyclops_state` options while
-  the `#[fg=...]` runs live in the format cyclops owns. A label can then
-  never become a tmux directive.
-- `#[fg=#d19a66]` in a border format renders as SGR `38;5;173` on a
-  256-color client, so tmux does the truecolor-to-256 mapping per client.
-  The daemon writes one border for every client that may attach, and only
-  tmux knows what each one supports, so chrome writes hex and lets tmux
-  map it rather than picking the theme's own c256 fallback.
-- `pane-border-status top` costs the pane one row (a 20-row pane becomes
-  19), including in a single-pane window where tmux then draws a border
-  that was not there. That is the visible price of border chrome and the
-  reason `chrome = "off"` exists.
+## F29. The daemon's JSON object keys come out alphabetical, not in the order the code writes them (MEASURED)
 
-## F28. tmux spreads a resize evenly, not proportionally, so cell layouts drift (MEASURED)
+Every reply and every event the daemon sends is built through
+`serde_json::Value`, whose object is a `BTreeMap`, so the keys are sorted
+before they reach the wire. Nothing in the daemon's source order survives.
 
-A layout expressed as ratios has to be turned into cells at some window
-size, and tmux does not keep those cells in proportion when the window
-changes size. It hands the delta out EVENLY, one pane at a time.
+Measured twice. First in `demos/m4-workspace.sh`, which waited for
+`"name":"demo","attached":true` to appear in a `--json status` answer. That
+substring cannot occur: `attached` sorts before `name`. The loop fell
+through all 40 of its iterations, the demo carried on regardless, and it
+passed on the `sleep` inside the wait rather than on the condition.
+Re-measured on 2026-08-03 by capturing raw event lines off a rig socket:
+the daemon writes `{"name": name, "pane_labeled": pane_id, "label": label}`
+and the wire carries
+`{"event":"session","data":{"label":"reviewer","name":"main","pane_labeled":"%0"},"seq":4}`;
+it writes `{"name": name, "attached": attached}` and the wire carries
+`{"event":"session","data":{"attached":false,"name":"main"},"seq":7}`.
 
-Measured on tmux 3.6a, isolated server, two panes side by side at 100
-columns split 70 | 29:
+What it constrains: any script matching daemon output textually must match
+ONE field, or use `jq`. A pattern spanning two keys is a pattern about the
+alphabet. Written down where a script writer meets it, in docs/PROTOCOL.md
+under "Requests and responses", and the demo now waits on a single field
+plus a specific pane id after a restore.
 
-    resize-window -x 200   ->  120 | 79      (each +50; proportional is 140 | 59)
-    resize-window -x 60    ->   50 |  9      (each -70)
+## F30 and F31 were never allocated
 
-Vertically the same, and this is the case that matters. `cyclops start`
-built the `ops` preset into a detached session, which tmux sizes with
-`default-size`, 80x24. The dock landed at 7 of 23 usable rows, 30.4%, as
-designed. Attaching from a 200x50 terminal grew both rows by 13, so the
-dock became 20 of 49 rows: 40.8% of the screen for a dock designed at 30%,
-and the three agents lost a third of their height between them.
+Nothing in the tree cites them, and no measurement in the M4 or M5 work is
+missing a number. They are recorded here so a reader who finds F29 followed
+by F32 knows the file is not truncated, and so nobody reuses the numbers
+for something new: a finding number that once meant two things is worse
+than a gap.
 
-Consequence: a preset only looks like its design if it is built at the
-size it will be looked at. `cyclops start` and `cyclops workspace restore`
-therefore size the new session to the terminal they were run from
-(`cyclops_ui::terminal_size`, the ioctl the stream already uses), and fall
-back to letting tmux choose only when stdout is not a terminal.
+## F32. Reading a theme file while an editor saves it: about one read in five sees valid TOML defining ZERO tokens, and none sees a syntax error (MEASURED)
 
-Not fixed, and it cannot be fixed from here: nothing re-applies the ratios
-when a client attaches later at a different size, because there is no
-event to hang that on without polling. Building at the operator's own size
-covers the case that happens, which is a person running `cyclops start` in
-the terminal they are about to work in. Building one inside a small pane,
-or in a script, and attaching elsewhere still drifts. Recorded in
-docs/workspaces.md under "Sizes and resizing" rather than hidden.
+This is the measurement the apply-whole-or-not-at-all reload rule rests on.
+The question it answers: when a hot reload stats a theme file that is being
+saved right then, what does it actually read?
 
-## F29. The daemon's JSON keys come out alphabetically, so scripts must not match on key order (MEASURED)
+How. Editors save by truncating and rewriting, which is what
+`open(path, "w")` does: the file goes to zero bytes and the content comes
+back afterwards. The probe ran that save in a loop against a copy of a
+shipped theme (`themes/light.toml`, 4410 bytes, all 22 tokens) while a
+second thread read the file continuously. Both the saves and the reads were
+timed with `perf_counter_ns` and the overlap was computed afterwards rather
+than from a flag, so a read counts as concurrent only when its own interval
+overlaps a save's open-to-close interval. Every overlapping read was
+classified by parsing it: all 22 tokens, some, zero, or not valid TOML.
 
-`cyclops --json status` prints one compact line whose object keys are in
-ALPHABETICAL order, not the order the structs declare:
+The numbers, 5000 saves per run on macOS 26.5.2 (arm64), 2026-08-03:
 
-    {"boot_id":"...","daemon_version":"0.1.0","proto":1,
-     "sessions":[{"attached":true,"name":"demo","panes":[...]}],
-     "tmux_version":"3.6a","uptime_ms":2017}
+| Run | reads overlapping a save | zero of 22 tokens | syntax error | partial |
+|---|---|---|---|---|
+| 1 | 14697 | 3045 (20.7%) | 0 | 0 |
+| 2 | 14572 | 3408 (23.4%) | 0 | 0 |
+| 3 | 14618 | 3415 (23.4%) | 0 | 0 |
 
-`SessionStatus` declares `name` then `attached`; the wire says `attached`
-then `name`. The daemon answers through `serde_json::Value`, whose object
-is a `BTreeMap` unless the `preserve_order` feature is on, and it is not.
+Three things in that table matter, in this order.
 
-This is not cosmetic. `demos/m4-workspace.sh` waited for the daemon to
-attach with
+**Zero syntax errors, every run.** A TOML parse error was the only failure
+the loader used to treat as a failure, so the thing it guarded against is
+the thing that never happens. That is the whole finding: the guard was
+pointed at the wrong failure.
 
-    grep -q "\"name\":\"$SESSION\",\"attached\":true"
+**There is no partial state.** A 4.4 KB write lands in one flush, so the
+file is either whole or empty. "Valid TOML defining zero tokens" is not an
+edge case of the save, it IS the save's visible state, and loading it
+paints all 22 tokens out of the compiled default table, whose lightness has
+nothing to do with the theme on screen.
 
-which matches nothing the daemon can ever send. The loop ran out its 40
-iterations every time and the script continued anyway, so the demo passed
-on a ten-second sleep and would have failed on a slower machine for a
-reason nobody would have looked for. A wait that cannot succeed is worse
-than no wait: it looks like a wait in the diff.
+**About one read in five.** Roughly a fifth of the reads that land inside a
+save see it. In absolute terms it is rarer than that sounds, 3045 of the
+359376 reads the first run made, because a save is 226 microseconds and the
+gaps between saves are much longer. But cyclops's reads are not random:
+the stat rides an event, and an event is exactly what a person editing
+their theme file generates.
 
-Two consequences, both applied:
+The milestone recorded this as 27.3% (CHANGELOG.md, STATUS.md). This
+reproduction gets 20.7% to 23.4% for the same class of file, and the
+difference is in what counts as "during a save": the window used here runs
+from open to close, and the bytes are back before close returns. The
+load-bearing half, no syntax errors at all, reproduces exactly.
 
-- A shell consumer matches ONE field (`"attached":true`) or uses jq. A
-  pattern spanning two keys is a pattern about the alphabet.
-- A wait keyed on `attached` alone is still not enough right after a
-  session is rebuilt, because the daemon can still be reporting the
-  session that just died. `demos/m4-workspace.sh` waits on the new pane
-  id instead.
+What it constrains: `ThemeWatch::adopt` in `crates/cyclops-theme/src/select.rs`
+refuses a reload that no longer sets a token the theme on screen sets,
+rather than refusing only what fails to parse. A misspelled token name
+fails the same way and stays failed until it is fixed, which is the same
+rule doing the same job. A theme SWITCH is exempt: that palette was asked
+for, so it applies with a fresh start's tolerance. `theme.reload` on the
+daemon is on the near side of that rule, which is why a half-written file
+can reach a real pane border and why
+`crates/cyclopsd/tests/m5_theme.rs::a_half_written_theme_leaves_the_borders_alone`
+reads the border back off tmux rather than off the daemon's own belief.
 
-## F30. Killing a session kills a one-session tmux server, and the next one re-issues %0 (MEASURED)
-
-Probed on tmux 3.6a, isolated server, one session `demo` with two panes:
-
-    kill-session -t =demo   ->  has-session: "no server running on <path>"
-    new-session -d -s demo  ->  panes %0 %1 again, server pid 60557 -> 60571
-
-With a second session on the same server keeping it alive, the same
-kill-and-rebuild hands out `%2` instead: the id counter is the server's
-and dies with it.
-
-So pane id reuse is not an exotic case reachable only by a crash. It is
-what happens when a person kills the session they were working in and
-builds it again, which is the ordinary `cyclops workspace restore` path.
-Nothing may carry a name across on a pane id alone. The adoption registry
-already refuses to (an entry is restored only when the pane exists AND its
-root pid matches the one recorded at adoption); this is the measurement
-showing the case it defends against is the common one, not the rare one.
-`demos/m4-workspace.sh` runs exactly this: the rebuilt session comes back
-as `%0` and `%1`, and the names go back on from the workspace file rather
-than from the ids.
-
-## F31. Three of the four shipped preset labels get the same role color (MEASURED)
-
-Role color is one of the two encodings GOALS says carry meaning, and
-`cyclops_theme::role_slot` picks it by FNV-hashing the label into eight
-slots. Run over the labels Cyclops itself ships in `layouts/`:
-
-    implementer -> slot 1
-    reviewer    -> slot 2
-    tests       -> slot 2
-    docs        -> slot 2
-    admin       -> slot 4
-
-So the `quad` preset, the arrangement with the most agents in it, paints
-three of its four agents in one color. Seen live in `demos/m4-name.sh`,
-where `reviewer` and `tests` both render `#[fg=#96aac3]` on their borders
-and in `cyclops list`.
-
-Nothing is lost, because color is never alone: the name is spelled out in
-the same cell on every surface, so a `--plain` or NO_COLOR reader and a
-color reader get the same information. What is lost is the encoding's
-value. Role color exists so a person can tell panes apart at a glance, and
-across the shipped ladder it mostly cannot.
-
-Not fixed here, because every fix is a design decision rather than a
-correction:
-
-- Hashing differently just moves the collision to a different set of
-  labels; eight slots and a hash will always collide somewhere.
-- Assigning slots in adoption order would make them distinct, but the
-  color then depends on the order panes were named, and it has to be
-  recorded (the registry is durable now, so it could be) or it changes on
-  every daemon restart.
-- Assigning over the whole registry at render time keeps them distinct
-  without new state, but an agent's color would then change when a
-  different agent is named.
-
-M4 raises the stakes rather than causing this: it ships the four labels
-that collide, and it puts role color onto tmux borders, so the same
-collision is now visible on the border, in `list`, in `status` and in the
-stream at once.
+Not a suite test, and deliberately: it measures a race and reports a
+distribution, so asserting on it would flake. The procedure above is the
+whole probe; it is 60 lines of Python and reproduces in under a minute.

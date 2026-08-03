@@ -67,8 +67,10 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
                 }
             }
             UiMsg::ConnLost(text) => lost = Some(text),
-            // TUI-only traffic.
-            UiMsg::Key(_) | UiMsg::Notice(_) | UiMsg::EyeTick => {}
+            // TUI-only traffic. Plain mode holds no theme at all
+            // (`Theme::none`, this is the screen-reader mode), so a theme
+            // switch has nothing here to move.
+            UiMsg::Key(_) | UiMsg::Notice(_) | UiMsg::EyeTick | UiMsg::ThemeChanged => {}
         }
         eye_line(&app, &mut eye_printed, &mut stdout);
         let _ = stdout.flush();

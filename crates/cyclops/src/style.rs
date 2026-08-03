@@ -82,6 +82,20 @@ impl Style {
         }
     }
 
+    /// This terminal's answer, wearing a different token table.
+    ///
+    /// `cyclops theme` paints each theme's swatch in that theme while the
+    /// run still honors NO_COLOR, `--plain` and what the terminal can
+    /// actually emit. Those are the terminal's facts, not the theme's, so
+    /// they survive the swap.
+    pub fn wearing(&self, theme: &Theme) -> Style {
+        Style {
+            color: self.color,
+            truecolor: self.truecolor,
+            theme: theme.clone(),
+        }
+    }
+
     fn paint(&self, c: Color, text: &str) -> String {
         if !self.color {
             return text.to_string();
@@ -143,6 +157,14 @@ impl Style {
     /// Dim: detail columns, gutters, separators.
     pub fn dim(&self, text: &str) -> String {
         self.paint(self.theme.resolve(tokens::SURFACE_DIM), text)
+    }
+
+    /// The accent: the marker on the row a surface is pointing at. The
+    /// stream paints its selected entry with it (cyclops-ui frame.rs) and
+    /// `cyclops theme` marks the active theme with the same glyph in the
+    /// same token, so the mark means one thing on both surfaces.
+    pub fn accent(&self, text: &str) -> String {
+        self.paint(self.theme.resolve(tokens::SURFACE_ACCENT), text)
     }
 
     pub fn bold(&self, text: &str) -> String {

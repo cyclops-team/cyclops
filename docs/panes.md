@@ -110,9 +110,23 @@ same two colors the same agent and state wear in `cyclops list`, in the
 stream, and in `cyclops status`. Both cells carry a word, so the border
 reads the same with color off.
 
-The border is written on seven edges and no others: adoption, a fused state
-change, clear, session attach, a window move, pane close, and daemon
-shutdown. Nothing runs on a clock.
+The border is written on eight edges and no others. Nothing runs on a
+clock: every write rides something that already happened, and each edge is
+fired by one named function in the daemon.
+
+| Edge | What happened | Fired by |
+|---|---|---|
+| adoption | you named the pane | `adopt_pane` |
+| a fused state change | the agent went idle, working, or blocked | `fusion::recompute_pane` |
+| a clear | you took the name back | `unadopt_pane` |
+| a session attach | the daemon connected to the session | `reconcile_adoptions` |
+| a window move | the pane was joined or broken into another window | `move_chrome` |
+| a pane close | the pane went away | `handle_pane_event` |
+| daemon shutdown | cyclopsd stopped | `restore_all_chrome` |
+| a theme switch | `cyclops theme <name>` or `theme.reload` | `reload_theme` |
+
+The last one is why a switch shows up on the border at once instead of
+waiting for the agent to do something.
 
 Turn it off in `$CYCLOPS_HOME/config.toml`:
 

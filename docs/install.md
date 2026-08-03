@@ -55,6 +55,10 @@ theme = "dark"             # colors, see docs/themes.md; unset picks dark too
 chrome = "off"             # stop writing names onto tmux borders, see panes.md
 ```
 
+`cyclops theme <name>` writes the `theme` key for you and leaves the rest
+of this file alone, and `cyclops theme` on its own shows what each one
+looks like. Editing the key by hand does the same thing.
+
 Theme files are read from `~/.cyclops/themes`, or from `./themes` in the
 working directory (the repo layout). Copy the shipped ones in if you run
 cyclops from anywhere else, otherwise it renders with built-in colors:
@@ -71,6 +75,11 @@ delivery_retry_max = 1       # redelivery attempts after the first failure
 receipt_block_ms = 2500      # receipt cap on the idle send path
 gate_hold_notify_ms = 120000 # one admin ping when a delivery is held this long
 ```
+
+Keep `receipt_block_ms` under 5000. The CLI gives a socket read five seconds
+before it calls the connection lost, so a longer receipt budget means
+`cyclops send` reports a lost connection over a delivery that is going fine.
+The delivery itself still completes and the record still shows it.
 
 Unknown keys warn and are ignored. The file is data; nothing in it executes.
 
@@ -118,13 +127,20 @@ cyclops watch         # live events; Ctrl-C to stop
 
 A pane shows `? unknown` when no manifest matches what is running in it.
 The shipped manifests cover Claude Code, Codex CLI, and Antigravity CLI.
+Teaching it another one is a single TOML file:
+[MANIFESTS.md](MANIFESTS.md). More symptoms and their next steps:
+[troubleshooting.md](troubleshooting.md).
 
 ## Run the tests
 
 ```bash
 cargo test --workspace --no-fail-fast
 python3 scripts/commpact-shim/test_shim.py
+./demos/parity-check.sh
 ```
+
+`parity-check.sh` walks the README ladder against a throwaway tmux server
+and fails if a line the docs quote is no longer what the binaries print.
 
 `--no-fail-fast` is not optional: cargo stops at the first failing test
 binary and hides every binary after it, which is how one portability bug

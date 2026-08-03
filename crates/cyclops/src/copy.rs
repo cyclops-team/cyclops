@@ -143,6 +143,81 @@ pub fn client_error(e: &ClientError, asked: Option<&str>) -> String {
     }
 }
 
+/// Said after a switch no daemon confirmed. The config is written either
+/// way, so this is a "when", not a "but".
+pub const THEME_NEXT_COMMAND: &str = "the next command picks it up";
+
+/// Said after a switch a running daemon did NOT take. Not a "when": the
+/// config is written and every one-shot command is already on the new
+/// theme, but the pane borders and any open `cyclops ui` are cyclopsd's to
+/// repaint and it is painting something else. Nothing that happens on this
+/// side moves them.
+///
+/// Two ways the daemon lands somewhere else, and the next step covers
+/// both. `CYCLOPS_THEME` in its environment beats the config key and is
+/// fixed for the life of the process, and a bare theme name resolves
+/// against `./themes` relative to the daemon's working directory when
+/// `$CYCLOPS_HOME/themes` does not exist, which need not be the directory
+/// this command just read.
+pub fn theme_not_live(painting: Option<&str>) -> String {
+    match painting {
+        Some(now) => format!(
+            "cyclopsd is still painting {now}, so pane borders did not change. Check CYCLOPS_THEME and the themes directory where cyclopsd runs, then restart it."
+        ),
+        None => "cyclopsd didn't take the switch, so pane borders did not change. Restart cyclopsd to pick it up.".to_string(),
+    }
+}
+
+/// A theme file that parses but sets no token in the vocabulary.
+///
+/// Refused for the same reason a file that will not parse is refused, and
+/// it is the reason the listing leaves both out: every token would resolve
+/// off the compiled default table, so the switch would report a change
+/// that no surface can show.
+pub fn theme_sets_no_colors(name: &str, path: &std::path::Path) -> String {
+    format!(
+        "can't use theme \"{name}\": {} sets no colors, so switching to it would change nothing on screen. Nothing was changed. Pick another with cyclops theme.",
+        path.display()
+    )
+}
+
+/// No themes directory anywhere. Names both places one is looked for, and
+/// the colors that render until one exists.
+pub fn no_themes(home: &std::path::Path) -> String {
+    format!(
+        "No themes found. Cyclops looks in {} and ./themes, and renders in built-in colors until one of them has a .toml in it.",
+        home.join("themes").display()
+    )
+}
+
+/// The active theme is not in the listing, which happens when it was
+/// chosen by path or by CYCLOPS_THEME. The listing marks nothing, so this
+/// says what is actually on.
+pub fn active_elsewhere(sel: &cyclops_theme::Selection) -> String {
+    match &sel.path {
+        Some(p) => format!("on now: {} ({})", sel.theme.name(), p.display()),
+        None => format!("on now: {} (built-in colors)", sel.theme.name()),
+    }
+}
+
+/// A named theme that will not load. The key is not written: a config
+/// pointing at this file would render built-in colors and say why only at
+/// the next command.
+///
+/// `cause` is a `cyclops_theme::ThemeError`, which names the file itself,
+/// so nothing here repeats the path.
+pub fn theme_unusable(name: &str, cause: &str) -> String {
+    format!("can't use theme \"{name}\": {cause}. Nothing was changed. Pick another with cyclops theme.")
+}
+
+/// The config could not be written, so nothing switched.
+pub fn theme_not_saved(path: &std::path::Path, cause: &str) -> String {
+    format!(
+        "can't save the theme: {cause}. Nothing was changed. Check that you can write {}.",
+        path.display()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

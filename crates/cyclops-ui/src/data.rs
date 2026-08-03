@@ -38,6 +38,15 @@ pub enum UiMsg {
     Notice(String),
     /// One-shot eye animation step, armed only while the eye is mid-tick.
     EyeTick,
+    /// `cyclops theme <name>` moved the selection. Carries nothing: the
+    /// event loop's own `ThemeWatch` re-reads the config key and the file
+    /// (cyclops-theme's reload rule), and a palette taken off the wire
+    /// could show a theme no file on this machine holds.
+    ///
+    /// Its whole job is to WAKE the loop. The reload already happens
+    /// before every frame; on a calm rig there is just no frame until
+    /// something arrives.
+    ThemeChanged,
 }
 
 pub fn now_ms() -> u64 {
@@ -133,8 +142,14 @@ async fn subscribe_loop(tx: &UnboundedSender<UiMsg>, sock: &Path) -> Result<(), 
         let Ok(ev) = serde_json::from_value::<Event>(v) else {
             continue;
         };
-        let entry = Entry::from_event(&ev, now_ms());
-        if tx.send(UiMsg::Entry(Box::new(entry))).is_err() {
+        // A theme switch is not a fact about the record, so it does not
+        // become a stream entry. It wakes the loop and nothing else.
+        let msg = if ev.event == "theme" {
+            UiMsg::ThemeChanged
+        } else {
+            UiMsg::Entry(Box::new(Entry::from_event(&ev, now_ms())))
+        };
+        if tx.send(msg).is_err() {
             return Ok(());
         }
     }

@@ -43,6 +43,13 @@ jobs:
       - name: commPact shim tests
         if: ${{ !cancelled() }}
         run: python3 scripts/commpact-shim/test_shim.py
+      # Docs are part of done, so a doc quoting output the binaries no
+      # longer print fails the build. This walks the README ladder against
+      # a throwaway tmux server and asserts every shape the pages promise.
+      # Reuses the debug binaries the tests above built.
+      - name: docs and binaries agree
+        if: ${{ !cancelled() }}
+        run: ./demos/parity-check.sh
       # F24: every scratch path comes from cyclops_proto::scratch, so the
       # whole suite has to run with that root relocated or the rule can rot
       # unnoticed. The binaries are already built; this is a second test

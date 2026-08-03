@@ -10,6 +10,7 @@ mod hook;
 mod hookset;
 mod render;
 mod style;
+mod theme;
 mod workspace;
 
 use std::io::Write;
@@ -131,6 +132,11 @@ enum Cmd {
     Hooks {
         #[command(subcommand)]
         cmd: HooksCmd,
+    },
+    /// Switch themes, or list them with a preview of each.
+    Theme {
+        /// Theme to switch to, e.g. light. Omit to list what is there.
+        name: Option<String>,
     },
 }
 
@@ -450,6 +456,10 @@ fn run(cli: &Cli) -> i32 {
             session.as_deref(),
             *launch,
         ),
+        // Theme reads and writes files. It nudges a running daemon so a
+        // switch is live at once, but a down daemon costs it only that,
+        // so it must not go through connect() either.
+        Cmd::Theme { name } => theme::run(cli.json, &style_for(cli), name.as_deref()),
         // Send and wait validate usage before touching the daemon, so
         // usage errors don't hide behind a down daemon.
         Cmd::Send(args) => cmd_send(cli, &style_for(cli), args),
@@ -508,6 +518,7 @@ fn run(cli: &Cli) -> i32 {
                 | Cmd::Hooks { .. }
                 | Cmd::Ui(_)
                 | Cmd::Start(_)
+                | Cmd::Theme { .. }
                 | Cmd::Workspace { .. } => {
                     unreachable!("handled above")
                 }

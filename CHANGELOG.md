@@ -5,6 +5,148 @@ versions are unreleased until admin cuts a tag.
 
 ## [Unreleased]
 
+### Fixed
+
+- F25: cyclops could not see a pane die. `pane_dead` is set when the
+  pane's pty fd closes, and that same closed fd is the gate that makes
+  tmux skip the pane's own format subscription, so a per-pane
+  subscription carrying `#{pane_dead}` can report a live pane and can
+  never report the flip, on any tmux version. Cyclops only caught a death
+  when an unrelated event forced a resync in the same moment, in practice
+  tmux's automatic window rename: 3.6a won that race by 23ms and next-3.8
+  lost it by 13ms, which is the whole of the red tmux-HEAD job. Since
+  pane-dead is a delivery gate condition, a corpse could read as a live
+  agent indefinitely. Fixed with one all-panes subscription, which has no
+  fd gate, whose handler arms the existing debounced reconcile only when
+  the pushed flag disagrees with the table; an all-live session arms
+  nothing and no timer was added. Bounded at about 1s, tmux's own tick.
+  Also fixed underneath it: tmux master gates `#{pane_pid}` on the same
+  fd, so an empty pid made the row parser drop the whole row and read the
+  death as a REMOVAL on next-3.8. An empty pid now parses as -1.
+  Verified 543 tests green under both 3.6a and next-3.8.
+
+
+### Added (M5: docs on the ladder, and a parity gate that keeps them true)
+
+- `demos/parity-check.sh`: every command shape the README and docs show,
+  run for real against a throwaway tmux server and checked against what
+  the binaries print. 63 assertions across the six ladder rungs, the
+  two-agent handoff, the open eye, and the error copy. It prints the transcript the
+  README's output blocks are copied from, so a line that stops matching
+  fails the script instead of quietly rotting on the page. Runs in CI
+  after the test suites.
+  - Isolation is a private `TMUX_TMPDIR` rather than `tmux -L`, because
+    rung 1 is the first run with no config file and the config file is the
+    only place a tmux socket name can be set. The default server gets its
+    own directory, which nothing outside the rig can reach.
+  - The stand-in agent is a shell loop with a four-rule manifest, which is
+    the point of rung 3: a CLI cyclops has never heard of becomes
+    addressable by adding one TOML file. It reports both turn edges
+    through the real `cyclops hook` receiver, so deliveries earn
+    `✔ delivered · verified` the same way a wired vendor CLI does.
+  - Two negative assertions carry their own weight: `cyclops pipe` must
+    NOT exist while the README says it is coming in M6, and
+    `cyclops --json ui` must keep pointing machine readers at
+    `cyclops watch --json`.
+- README rewritten as the progressive ladder, one rung at a time: one
+  pane, name panes, any terminal agent, layouts, structured messages,
+  pipe. Every output block is real, captured from one parity run, with the
+  home directory shortened to `~/.cyclops` and color off. The crate table
+  moved out to ARCHITECTURE.md rather than being kept in two places.
+- docs/QUICKSTART.md: the two-agent review gate end to end. Open a `duo`
+  workspace, name the panes, wire the hooks, hand work from the
+  implementer to the reviewer with the sender resolved from the pane
+  rather than from the request, chain the reply, read the thread back, and
+  audit the pair out of the ledger file months later.
+- docs/MANIFESTS.md: how a new agent CLI becomes one TOML file. Every key
+  of `[agent]`, `[[rule]]`, `[hooks]` and `[injection]` with what it does,
+  a complete working file, and the two fields that exist for measured
+  vendor quirks (`argv_basenames` for installs whose binary reports a
+  version string, `line_regex_esc` for state that only the color codes
+  distinguish).
+- docs/PROTOCOL.md: the socket, with request and response lines captured
+  from a running daemon. Every method, the error codes, the ledger shape
+  underneath, and the two rules a script writer trips over first: keys
+  come out alphabetically, and `agent.state.report` is refused from
+  anywhere but inside the pane it speaks for.
+- docs/troubleshooting.md: symptom to next step, each one quoting the real
+  message. Daemon down, `? unknown` panes, an open eye, deliveries that
+  never verify, wait timeouts and occupant changes, a `start` that renamed
+  nothing and said why, and the tests that need `--no-fail-fast`.
+
+### Added (M5: the theme set, `cyclops theme`, and a reload that cannot half-apply)
+
+- `cyclops theme` lists every theme it can find with a one-line swatch
+  each, painted in that theme: a cell from every state group and the eye,
+  with `▸` on the one that is on. `cyclops theme <name>` switches. A theme
+  that will not load is refused before anything is written, and left out
+  of the listing, because offering a theme that would come up as built-in
+  colors is a lie the reader only finds out about later.
+- The switch edits one line of `~/.cyclops/config.toml` and leaves the
+  rest of the file, comments and key order included, exactly as written.
+  `cyclops start` refuses to touch a config you wrote for that reason, and
+  a rewrite through a TOML serializer would cost the file its comments.
+- The check glyph on the answer says how far the switch got, following the
+  repo's one rule for it: `✔` means cyclopsd repainted the pane borders
+  and told a running `cyclops ui`, `✓` means no daemon was there to tell
+  and the next command picks it up. The config is written either way.
+- `theme.reload` on the daemon: no params, because it reads the config
+  itself and a client-supplied name would let the two disagree about what
+  is on. It repaints every adopted pane's border and emits `theme` so
+  subscribers wake. The event carries the name and no colors: every
+  surface resolves its own.
+- themes/light.toml and themes/high-contrast.toml join dark.toml with
+  every one of the 22 tokens set and every 256-color fallback explicit,
+  and each file header now states its contrast as numbers: the ground it
+  assumes, the floor every token clears against it, and how it was
+  measured. high-contrast was retuned to clear 7:1 (WCAG AAA for body
+  text) on every token, `state.dead` moving from #949494 (6.9:1) to
+  #9e9e9e (7.8:1). A new test fails the build if a color drops below what
+  its own header claims.
+
+### Fixed (M5: themes)
+
+- A theme file edited into a broken state could repaint a running surface
+  out of the compiled default table. Only a TOML syntax error was treated
+  as a failure; a file that was merely SHORTER still loaded, and every
+  token it had lost fell back to a table whose lightness has nothing to do
+  with the theme on screen. That is what an editor leaves behind mid-save
+  (truncate, then rewrite), and what a misspelled token name leaves behind
+  permanently. A reload now applies whole or not at all: it has to load
+  and it has to still set every token it set before, or the colors on
+  screen stay and one line says why. Choosing a different theme is exempt,
+  because that palette was asked for; rewriting the key with the value it
+  already had is not, which is what `cyclops theme <name>` does every
+  time. Measured in findings.md as F32: rewriting a theme file the way an
+  editor does, 27.3% of concurrent reads saw valid TOML defining zero of
+  the 22 tokens, and none saw a syntax error, which was the only thing the
+  loader used to treat as a failure.
+- `cyclops theme <name>` moved the config key, and nothing running noticed.
+  `ThemeWatch` stat'ed one file path, resolved once at startup, so a
+  running `cyclops ui` and the daemon's pane borders stayed on the old
+  palette for the life of the process. It now watches the selection: the
+  config key first, because that decides which file the file check should
+  even look at.
+- The daemon logged the same theme warning on every repaint after a bad
+  edit. Warnings are drained now (`take_warnings`), which is what makes
+  "one warning line" true rather than aspirational.
+- `demos/m5-theme.sh`: a switch reaching a live pane border, an edit
+  reaching the same border, and a theme file caught mid-save leaving it
+  exactly where it was, all read back off an isolated tmux server rather
+  than off the daemon's own belief. It found the config-versus-file defect
+  above while it was being written.
+
+### Fixed (M5: docs)
+
+- install.md documented `receipt_block_ms` as a free knob. Values above
+  5000 break `cyclops send`: the CLI allows a socket read five seconds
+  before it reports the connection lost, so a longer receipt budget makes
+  a delivery that is going fine look like a transport failure. The ceiling
+  is now written down where the knob is.
+- README showed `✔ workspace ready · 1 agent` for a `cyclops start` run
+  before the daemon is up. That line is the light `✓`: with no daemon to
+  ask, `start` is reporting the workspace file and not a roster.
+
 ### Added (M4: naming panes, the roster, and pane border chrome)
 
 - `cyclops name <target> <label> [--manifest <id>] [--clear]`: explicit

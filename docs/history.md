@@ -64,8 +64,9 @@ Without a cursor you get the newest `--limit` messages; with one you get
 the oldest messages recorded after it, so a loop that feeds `next_cursor`
 back walks the whole record exactly once.
 
-`next_cursor` is only issued while ONE session is watched: it is a
-per-session ledger seq, and with several watched sessions it would skip
+`next_cursor` is only issued while ONE session is watched: it is a line
+number within that session's ledger, and with several watched sessions it
+would skip
 whichever file's lines hide behind the other's numbering. There the
 daemon refuses `cursor` with an error and pages on `cursor2` instead: an
 opaque composite cursor issued as `next_cursor2` in every msg.history
@@ -74,8 +75,9 @@ starts from the beginning); the walk covers every session's messages
 exactly once, in order, cross-session broadcasts included. `cursor2` is
 a socket-API param; the raw files below are always available too.
 
-The ledger itself is plain NDJSON at `~/.cyclops/ledger/<session>.ndjson`,
-one line per fact, always `jq`-able. `history` folds each message's
+The ledger itself is a plain text file at
+`~/.cyclops/ledger/<session>.ndjson`, one JSON object per line and one line
+per fact, so `jq` reads it directly. `history` folds each message's
 delivery chain into its `deliveries` array at read time; the file is never
 rewritten.
 

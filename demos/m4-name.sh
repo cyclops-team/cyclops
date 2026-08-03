@@ -15,7 +15,8 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SOCK="cyc-demo-$$"
 SESSION="demo"
-# The scratch root and the tmux teardown rule are shared, not copied.
+# The scratch root, the tmux teardown rule and the daemon stop are
+# shared, not copied.
 # shellcheck source=demos/lib.sh
 . "$(cd "$(dirname "$0")" && pwd)/lib.sh"
 CYCLOPS_HOME="$(mktemp -d "$(cyc_scratch_root)/cyclops-demo.XXXXXX")"
@@ -26,16 +27,8 @@ cd "$REPO"
 
 tmx() { command tmux -u -L "$SOCK" -f /dev/null "$@"; }
 
-stop_daemon() {
-  if [ -n "$DAEMON_PID" ]; then
-    kill "$DAEMON_PID" 2>/dev/null || true
-    wait "$DAEMON_PID" 2>/dev/null || true
-    DAEMON_PID=""
-  fi
-}
-
 cleanup() {
-  stop_daemon
+  cyc_stop_daemon
   cyc_tmux_teardown "$SOCK"
   rm -rf "$CYCLOPS_HOME"
 }
@@ -133,7 +126,7 @@ printf '   %s\n' "$(tmx display-message -p -t "$P2" '#{E:pane-border-format}')"
 echo
 echo "== the roster is a file, so it survives a restart"
 cat "$CYCLOPS_HOME/registry.json"
-stop_daemon
+cyc_stop_daemon
 sleep 0.5
 "$CYCD" >>"$CYCLOPS_HOME/daemon.log" 2>&1 &
 DAEMON_PID=$!

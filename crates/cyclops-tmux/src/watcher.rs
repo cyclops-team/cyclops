@@ -11,6 +11,9 @@
 //! pane_current_command changes, including title changes made via OSC from
 //! inside the pane. Structural changes (splits, kills, window renames)
 //! arrive as notification hints and trigger a debounced full reconcile.
+//!
+//! Death is the one field that signal cannot carry, so it gets its own
+//! subscription: see [`DEAD_SUB`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -41,6 +44,30 @@ const SUB_PREFIX: &str = "cyp";
 /// free-text field; the fixed fields are parsed from the right.
 const SUB_FORMAT: &str =
     "#{pane_title}\t#{pane_dead}\t#{pane_in_mode}\t#{pane_current_command}\t#{pane_pid}";
+
+/// Session-wide dead-pane subscription: the edge a pane's death produces.
+/// Shares the prefix and cannot collide with a per-pane name, which is
+/// always digits after "cyp".
+///
+/// A death has no notification of its own, and it cannot arrive on the
+/// per-pane subscription either, by construction: tmux sets pane_dead when
+/// the pane's pty fd closes, and the closed fd is also what makes tmux skip
+/// that pane's per-pane subscription. MEASURED on 3.6a and next-3.8: zero
+/// pushes over four-plus ticks after the death, while list-panes reports
+/// dead=1. So `#{pane_dead}` in [`SUB_FORMAT`] can report a live pane and
+/// never the flip. Before this subscription the watcher learned of a death
+/// only when an unrelated event happened to force a reconcile at the same
+/// moment, which 3.6a won and next-3.8 lost, leaving a corpse reading as a
+/// live agent for the rest of the session (F25).
+///
+/// The all-panes form (`%*`) has no fd gate: tmux keeps expanding it for a
+/// dead pane, MEASURED pushing the 0-to-1 flip on the tick after the death
+/// on both versions.
+const DEAD_SUB: &str = "cypdead";
+
+/// Format for [`DEAD_SUB`]. One field, so tmux pushes on the flip and on
+/// nothing else; the pane id travels in the notification header.
+const DEAD_FORMAT: &str = "#{pane_dead}";
 
 /// Snapshot format for list-panes. pane_id and window_id lead (no tabs
 /// possible in ids), the seven fixed fields trail; window_name and title
@@ -73,10 +100,12 @@ pub struct PaneRow {
     pub active: bool,
     /// Pid of the pane's root process (what tmux spawned into the pane).
     /// Daemon-internal: sender identity walks socket-peer ancestry to this
-    /// pid; it never enters PaneStatus. Dead panes keep reporting the stale
-    /// pid (MEASURED on 3.6a). A change (respawn-pane) updates the row but
-    /// emits no PaneChanged: no consumer reacts to pid edges, resolution
-    /// reads the table at message time.
+    /// pid; it never enters PaneStatus. -1 when tmux reports no process:
+    /// next-3.8 stops reporting `#{pane_pid}` for a dead pane while 3.6a
+    /// keeps returning the stale pid, so a dead pane's pid is one of the
+    /// two depending on the tmux underneath (MEASURED, both). A change
+    /// (respawn-pane) updates the row but emits no PaneChanged: no consumer
+    /// reacts to pid edges, resolution reads the table at message time.
     pub pane_pid: i32,
 }
 
@@ -203,6 +232,16 @@ impl SessionWatcher {
         if let Err(e) = reconcile(&mut ctx).await {
             client.shutdown().await;
             return Err(e);
+        }
+
+        // Arm the death edge once. It covers panes that do not exist yet:
+        // tmux expands an all-panes format for whatever the session holds
+        // at each evaluation, so nothing resubscribes on a split. Not
+        // fatal when it fails: the rest of the watcher is unaffected and
+        // deaths go back to being noticed by the next reconcile, whenever
+        // that is (F25).
+        if let Err(e) = subscribe_dead(&client).await {
+            warn!(error = %e, "dead-pane subscription failed; pane_dead flips will be late or missed");
         }
 
         let (reconcile_tx, reconcile_rx) = mpsc::channel(16);
@@ -360,6 +399,13 @@ fn handle_notification(ctx: &mut LoopCtx, n: Notification) -> Action {
         Notification::Output { pane, .. } | Notification::ExtendedOutput { pane, .. } => {
             output_activity(ctx, pane)
         }
+        // Ordered before the per-pane arm: DEAD_SUB shares the prefix.
+        Notification::SubscriptionChanged {
+            name, pane, value, ..
+        } if name == DEAD_SUB => match pane {
+            Some(pane) => dead_edge(ctx, &pane, &value),
+            None => Action::Hint,
+        },
         Notification::SubscriptionChanged {
             name, pane, value, ..
         } if name.starts_with(SUB_PREFIX) => match pane {
@@ -425,6 +471,32 @@ fn output_activity(ctx: &mut LoopCtx, pane: String) -> Action {
     }
 }
 
+/// Handle a push from [`DEAD_SUB`]: hint when it disagrees with the table,
+/// stay silent when it does not.
+///
+/// A hint rather than a direct write: a death moves more of the row than
+/// this one field (next-3.8 drops pane_pid along with it), and reconcile is
+/// the single place that builds a whole row out of tmux's answer. The
+/// disagreement check is what keeps the subscription free: every pane's
+/// first push repeats the flag the bootstrap snapshot already recorded, so
+/// a session of live panes arms no reconcile at all.
+fn dead_edge(ctx: &LoopCtx, pane: &str, value: &str) -> Action {
+    let dead = match value {
+        "0" => false,
+        "1" => true,
+        _ => {
+            warn!(%pane, %value, "malformed dead subscription value");
+            return Action::Hint;
+        }
+    };
+    match ctx.table.lock().expect("table lock").get(pane) {
+        Some(row) if row.dead == dead => Action::None,
+        // Stale flag, or a pane the table has never seen. Either way the
+        // table is behind tmux.
+        _ => Action::Hint,
+    }
+}
+
 /// Apply a pushed subscription value to the table. The value is tmux's own
 /// format expansion, so it is authoritative for the fields it carries; an
 /// unknown pane means the table is stale and needs a reconcile.
@@ -439,7 +511,7 @@ fn apply_sub_value(ctx: &mut LoopCtx, pane: &str, value: &str) -> Action {
         warn!(%pane, %value, "malformed subscription value");
         return Action::Hint;
     };
-    let Ok(pid) = pid.parse::<i32>() else {
+    let Some(pid) = parse_pane_pid(pid) else {
         warn!(%pane, %value, "malformed pane_pid in subscription value");
         return Action::Hint;
     };
@@ -613,8 +685,23 @@ fn parse_pane_row(line: &str) -> Option<PaneRow> {
         width: width.parse().ok()?,
         height: height.parse().ok()?,
         active: active == "1",
-        pane_pid: pane_pid.parse().ok()?,
+        pane_pid: parse_pane_pid(pane_pid)?,
     })
+}
+
+/// Parse a `#{pane_pid}` field. Empty means the pane has no process, which
+/// is -1, not a parse failure.
+///
+/// next-3.8 reports nothing there for a dead pane; 3.6a reports the stale
+/// pid (MEASURED, both). Rejecting the empty field would drop the whole row
+/// from the snapshot on next-3.8, and the row is the record that the pane
+/// is dead: reconcile would read the death as a removal and delete the pane
+/// the death edge just asked it to look at.
+fn parse_pane_pid(field: &str) -> Option<i32> {
+    if field.is_empty() {
+        return Some(-1);
+    }
+    field.parse().ok()
 }
 
 fn sub_name(pane_id: &str) -> String {
@@ -623,6 +710,15 @@ fn sub_name(pane_id: &str) -> String {
 
 async fn subscribe_pane(client: &ControlClient, pane_id: &str) -> Result<(), TmuxError> {
     let arg = format!("{}:{}:{}", sub_name(pane_id), pane_id, SUB_FORMAT);
+    client
+        .command(&format!("refresh-client -B {}", quote_arg(&arg)))
+        .await
+        .map(|_| ())
+}
+
+/// Subscribe to pane_dead for every pane in the session at once (`%*`).
+async fn subscribe_dead(client: &ControlClient) -> Result<(), TmuxError> {
+    let arg = format!("{DEAD_SUB}:%*:{DEAD_FORMAT}");
     client
         .command(&format!("refresh-client -B {}", quote_arg(&arg)))
         .await
@@ -674,6 +770,16 @@ mod tests {
         assert!(parse_pane_row("garbage").is_none());
         assert!(parse_pane_row("%0\t@0\tw\tt\t1\t0\tcat\t80\tNaN\t0\t99").is_none());
         assert!(parse_pane_row("%0\t@0\tw\tt\t1\t0\tcat\t80\t24\t0\tNaN").is_none());
+    }
+
+    #[test]
+    fn dead_pane_row_survives_an_empty_pid() {
+        // What next-3.8 sends for a pane whose process has exited. The row
+        // has to parse or the death reads as a removal (F25).
+        let line = "%1\t@0\tw\tt\t1\t0\tsleep\t120\t14\t0\t";
+        let r = parse_pane_row(line).unwrap();
+        assert!(r.dead);
+        assert_eq!(r.pane_pid, -1);
     }
 
     #[test]

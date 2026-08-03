@@ -56,6 +56,29 @@
 # terminal's own foreground, so separate stream tokens would only let the
 # two surfaces drift.
 #
+# CONTRAST. Checked pair: every token in the vocabulary against #0d0d0d,
+# the site's --term-bg. That is the ground this palette was drawn on, and
+# this file sets no background of its own, so a terminal darker than it
+# reads higher and a lighter one reads lower. Measured as WCAG 2.1
+# relative luminance in sRGB, ratio (lighter + 0.05) / (darker + 0.05);
+# the arithmetic is in crates/cyclops-theme/tests/shipped.rs and the
+# numbers below are pinned there by
+# shipped_themes_meet_their_stated_contrast.
+#
+# Floor 4.3:1 for every token except state.dead. The floor itself is
+# surface.dim, and eye.calm, state.quiet and badge.quiet sit on it because
+# they take the same value: 4.34:1, just under WCAG AA's 4.5:1, and it
+# stays because #777 is the site's own --term-dim and detail columns are
+# meant to recede. Body text is not painted from this file at all (see
+# surface.fg above), so nothing that carries a sentence rides that number.
+# The rest: role slots 7.3:1 to 10.4:1, state.terminal 5.5:1,
+# state.needs_you 9.0:1, state.healthy 9.8:1.
+#
+# state.dead is the deliberate exception, floor 2.8:1, measuring 2.82:1.
+# It marks a pane whose process is gone, one step below the dim it sits
+# under, and a row nobody can act on should be the hardest thing on the
+# screen to read.
+#
 # 256-color fallbacks are explicit and derived with the algorithm in
 # cyclops-theme (nearest cube-or-ramp entry), except the eight role slots:
 # several of the muted pastels derive to the same cube entry, and role

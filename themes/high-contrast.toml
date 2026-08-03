@@ -9,9 +9,19 @@
 # role.2 is mauve pushed the same way, and the other six slots keep the
 # dark theme's wheel order (blue, cyan, green, yellow, purple, pink) at
 # high saturation. The alert eye is pure yellow, the strongest signal on
-# black. Every value here clears WCAG AA (4.5:1) against a black ground;
-# the dimmest, state.dead, measures 6.9:1, and the state and badge groups
-# run 6.9:1 to 11.4:1. Pinned by shipped_high_contrast_clears_wcag_aa.
+# black.
+#
+# CONTRAST. Checked pair: every token in the vocabulary against #000000.
+# That ground is the terminal's own black, because this file sets no
+# background (see below), and a high-contrast terminal is on black.
+# Measured as WCAG 2.1 relative luminance in sRGB, ratio
+# (lighter + 0.05) / (darker + 0.05); the arithmetic is in
+# crates/cyclops-theme/tests/shipped.rs and every number below is pinned
+# there by shipped_themes_meet_their_stated_contrast.
+#
+# Target 7:1, WCAG AAA for body text, and every one of the 22 tokens
+# clears it. The floor is state.terminal and badge.terminal at 7.05:1,
+# then role.2 at 7.5:1 and state.dead at 7.8:1; surface.fg is 21:1.
 #
 # surface.fg is the one value here that no renderer paints. Cyclops prints
 # body text in the terminal's own foreground; the engine reads surface.fg
@@ -20,10 +30,11 @@
 #
 # [state] and [badge] are dark.toml's four groups pushed onto the same
 # grid: pure green, amber, salmon red, and the two grays. Which state
-# lands in which group is dark.toml's table. The reds are the loosest
-# constraint here, because a saturated red on black is the one signal
-# color that struggles to clear AA at all: #ff5f5f (7.1:1) is the grid
-# entry that stays unmistakably red and still clears it comfortably.
+# lands in which group is dark.toml's table. The reds are what sets the
+# floor, because a saturated red on black is the one signal color that
+# struggles to clear a high bar at all: #ff5f5f is the grid entry that
+# stays unmistakably red, and it clears 7:1 with 0.05 to spare. The next
+# grid red up, #ff8787 (9.1:1), has gone pink.
 #
 # There is no [stream] table, for the reason written out in dark.toml:
 # the stream's gutter resolves surface.dim like every other detail column.
@@ -54,9 +65,9 @@ alert = { hex = "#ffff00", c256 = 226 }
 [state]
 healthy = { hex = "#00d700", c256 = 40 }    # 10.7:1
 needs_you = { hex = "#ffaf00", c256 = 214 } # 11.4:1
-terminal = { hex = "#ff5f5f", c256 = 203 }  # 7.1:1
+terminal = { hex = "#ff5f5f", c256 = 203 }  # 7.05:1, the floor
 quiet = { hex = "#bcbcbc", c256 = 250 }     # 11.1:1, same as surface.dim
-dead = { hex = "#949494", c256 = 246 }      # 6.9:1, below quiet
+dead = { hex = "#9e9e9e", c256 = 247 }      # 7.8:1, below quiet
 
 [badge]
 healthy = { hex = "#00d700", c256 = 40 }

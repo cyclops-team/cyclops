@@ -25,7 +25,7 @@
 
 mod select;
 
-pub use select::{active, active_with, themes_dir, Selection, ThemeWatch, THEME_ENV};
+pub use select::{active, active_with, path_for, themes_dir, Selection, ThemeWatch, THEME_ENV};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -304,18 +304,58 @@ impl Default for Theme {
 
 /// Theme file failures a caller must decide about. Everything softer
 /// (unknown tokens, bad values) degrades to a warning instead.
+///
+/// Both variants are one line and neither says the word "theme": every
+/// surface that prints one already prefixes `theme: `, and the path names
+/// the file. Saying it again printed `theme: theme /path/...`.
 #[derive(Debug, thiserror::Error)]
 pub enum ThemeError {
-    #[error("can't read theme {}: {source}", path.display())]
+    #[error("can't read {}: {source}", path.display())]
     Read {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("theme {} isn't valid TOML: {source}", path.display())]
-    Parse {
-        path: PathBuf,
-        source: Box<toml::de::Error>,
-    },
+    /// `detail` is [`parse_detail`]'s one-line summary, not toml's own
+    /// Display: the caller quotes this inside a sentence.
+    #[error("{} isn't valid TOML ({detail})", path.display())]
+    Parse { path: PathBuf, detail: String },
+}
+
+/// A TOML parse failure on one line: where it is, and what the parser
+/// wanted there.
+///
+/// `toml::de::Error`'s Display is a five-line diagnostic block with a
+/// caret diagram under the offending line. Every caller here quotes the
+/// error inside a sentence, so that block split the sentence around
+/// itself and left the tail alone on a line of its own. The position and
+/// the message are the whole of what a reader can act on.
+fn parse_detail(text: &str, e: &toml::de::Error) -> String {
+    // toml states one failure per line ("invalid table header", then
+    // "expected `.`, `]`"); joined, they stay one line and lose nothing.
+    let message = e.message().lines().collect::<Vec<_>>().join("; ");
+    match e.span() {
+        Some(span) => {
+            let (line, column) = line_col(text, span.start);
+            format!("line {line}, column {column}: {message}")
+        }
+        // No span: a whole-document failure with nowhere to point.
+        None => message,
+    }
+}
+
+/// 1-based line and column of a byte offset in `text`. Columns count
+/// characters, not bytes, so a file with multi-byte content does not
+/// report a column no editor agrees with. An offset landing inside a
+/// character walks back to its start rather than panicking on the slice.
+fn line_col(text: &str, offset: usize) -> (usize, usize) {
+    let mut end = offset.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let upto = &text[..end];
+    let line = upto.bytes().filter(|b| *b == b'\n').count() + 1;
+    let column = upto.rsplit('\n').next().unwrap_or_default().chars().count() + 1;
+    (line, column)
 }
 
 impl Theme {
@@ -330,9 +370,9 @@ impl Theme {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "theme".into());
-        Theme::parse(&text, &stem).map_err(|source| ThemeError::Parse {
+        Theme::parse(&text, &stem).map_err(|e| ThemeError::Parse {
             path: path.to_path_buf(),
-            source: Box::new(source),
+            detail: parse_detail(&text, &e),
         })
     }
 
@@ -390,6 +430,24 @@ impl Theme {
     /// True when the theme file itself sets this token (no fallback needed).
     pub fn defines(&self, token: &str) -> bool {
         self.overrides.contains_key(token)
+    }
+
+    /// True when the file sets at least one token some renderer paints.
+    ///
+    /// False is the degenerate theme: it parsed, so the tolerant loader
+    /// took it, and every color it resolves still comes off the compiled
+    /// default table. Switching to one repaints nothing anywhere, so
+    /// `cyclops theme` keeps it out of the listing and refuses it by name;
+    /// a row there is an offer to change the colors.
+    ///
+    /// [`tokens::SURFACE_FG`] does not count. It is the engine's fallback
+    /// for a token name outside the vocabulary and no renderer asks for
+    /// it (pinned by `surface_fg_stays_the_engines_own_fallback`), so a
+    /// file setting only that one is the same nothing with one line in it.
+    pub fn paints_anything(&self) -> bool {
+        self.overrides
+            .keys()
+            .any(|t| t.as_str() != tokens::SURFACE_FG)
     }
 
     /// Resolve a token to its color. Total: file override first, then the

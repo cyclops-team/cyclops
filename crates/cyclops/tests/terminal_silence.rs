@@ -9,6 +9,8 @@
 //!   in that CLI's output.
 //! - `cyclops ui` must say what is wrong with the theme once. It loads the
 //!   theme itself; a second load in the CLI's dispatch said it twice.
+//! - A one-shot command must say it in one line. The warning quotes a TOML
+//!   parse error, and toml's own Display is a diagnostic block.
 
 use std::ffi::CStr;
 use std::fs::{File, OpenOptions};
@@ -116,6 +118,57 @@ fn hook_writes_nothing_to_a_terminal_even_with_a_broken_theme() {
         log.contains("hook Stop"),
         "the failure belongs in hook-errors.log, got {log:?}"
     );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The broken-theme warning as a one-shot command prints it: one line,
+/// one sentence, and the file named once.
+///
+/// It used to print a seven-line block. `theme: ` prefixed a message that
+/// opened with the word "theme" again, then toml's five-line diagnostic
+/// with its caret diagram, and the tail of the sentence the diagnostic was
+/// quoted inside ("Using built-in colors.") landed alone on the last line.
+///
+/// `cyclops theme` is the command under test because it needs no daemon,
+/// so what reaches the terminal is the theme warning and the listing.
+#[test]
+fn a_one_shot_command_says_a_broken_theme_in_one_line() {
+    let home = home_with_a_broken_theme("oneshottheme");
+    std::fs::write(
+        home.join("themes/light.toml"),
+        "[surface]\ndim = \"#6e6e6e\"\n",
+    )
+    .expect("write a theme that loads");
+    let (master, slave) = pty();
+    let mut child = spawn_on_a_terminal(&home, &["theme"], &slave);
+    let status = child.wait().expect("theme exits");
+    let wrote = drain(master);
+    unsafe { libc::close(master) };
+    assert!(status.success(), "{status}");
+
+    let said: Vec<&str> = wrote
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| l.contains("theme:"))
+        .collect();
+    assert_eq!(said.len(), 1, "the warning is not one line: {wrote:?}");
+    let line = said[0];
+    // What is wrong, where, and what is being painted instead. The path is
+    // in there once: the prefix and the message both naming it read
+    // "theme: theme /path/...".
+    assert!(line.contains("isn't valid TOML"), "{line:?}");
+    assert!(line.contains("line 1, column 9"), "{line:?}");
+    assert!(line.contains("built-in colors"), "{line:?}");
+    assert!(!line.contains("theme: theme "), "stutters: {line:?}");
+    assert_eq!(
+        line.matches("dark.toml").count(),
+        1,
+        "the file is named more than once: {line:?}"
+    );
+    // The diagnostic block is gone, caret diagram and all.
+    for noise in ["TOML parse error", "  |", "^"] {
+        assert!(!wrote.contains(noise), "{noise:?} survived: {wrote:?}");
+    }
     let _ = std::fs::remove_dir_all(&home);
 }
 

@@ -34,8 +34,11 @@ pub struct Config {
     /// long (working pane, human typing, detached session). Visibility for
     /// wedged holds; the delivery itself keeps waiting for events.
     pub gate_hold_notify_ms: u64,
-    /// Theme name for rendering clients (cyclops, cyclops-ui) and for the
-    /// pane border chrome the daemon writes, resolved by cyclops-theme.
+    /// Theme name. The daemon never reads this field: `cyclops-theme`
+    /// re-reads the same key out of the same file (`select::config_theme`)
+    /// and that is what paints every surface, borders included. It is
+    /// recognized here so a config carrying it does not warn as an unknown
+    /// key, and for nothing else, exactly like `default_workspace`.
     pub theme: Option<String>,
     /// Write `role • state` onto an adopted pane's tmux border. On by
     /// default: a named pane that does not say its name is the whole
@@ -159,13 +162,18 @@ impl Config {
                         cfg.gate_hold_notify_ms
                     )),
                 },
-                "theme" => match value {
-                    toml::Value::String(s) => cfg.theme = Some(s),
-                    other => warnings.push(format!(
-                        "`theme` must be a string, not a {}; using the default",
-                        other.type_str()
-                    )),
-                },
+                // Recognized, never used, and deliberately silent about a
+                // wrong type: cyclops-theme reads this same key out of
+                // this same file and warns about it there. Two crates
+                // parsing one key printed two warnings in two wordings for
+                // one mistake, and the daemon's was the one describing a
+                // fallback it does not have (nothing here reads the
+                // value).
+                "theme" => {
+                    if let toml::Value::String(s) = value {
+                        cfg.theme = Some(s);
+                    }
+                }
                 "default_workspace" => match value {
                     toml::Value::String(s) => cfg.default_workspace = Some(s),
                     other => warnings.push(format!(
@@ -263,8 +271,42 @@ default_workspace = "main"
         .unwrap();
         assert!(cfg.sessions.is_empty());
         assert!(cfg.tmux_socket.is_none());
+        // Two, not three: `theme` is silent here on purpose, see below.
         assert!(cfg.theme.is_none());
-        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+    }
+
+    /// One mistake, one warning.
+    ///
+    /// The `theme` key is parsed twice on this machine: here, so a config
+    /// carrying it is not an unknown key, and in cyclops-theme, which is
+    /// the crate that resolves it and paints from it. Both used to
+    /// complain about a wrong type in different words, and the daemon's
+    /// version named a fallback it does not have, because nothing in the
+    /// daemon reads the value at all.
+    #[test]
+    fn a_wrong_typed_theme_key_is_the_theme_engine_s_to_complain_about() {
+        let home = cyclops_proto::scratch::scratch_dir("cfg-theme-key");
+        std::fs::create_dir_all(&home).expect("create scratch home");
+        std::fs::write(home.join("config.toml"), "theme = 3\n").expect("write config");
+
+        let (cfg, warnings) = Config::load(&home).expect("load config");
+        assert!(cfg.theme.is_none());
+        assert!(
+            !warnings.iter().any(|w| w.contains("theme")),
+            "the daemon complained about a key it never reads: {warnings:?}"
+        );
+
+        // The crate that does read it says it, exactly once.
+        let sel = cyclops_theme::active_with(None, &home);
+        let said: Vec<&String> = sel
+            .warnings
+            .iter()
+            .filter(|w| w.contains("`theme`"))
+            .collect();
+        assert_eq!(said.len(), 1, "{:?}", sel.warnings);
+
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

@@ -188,10 +188,17 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
         if quit {
             break;
         }
-        // An edited theme file applies on this render.
+        // A theme edit, or a `cyclops theme <name>`, applies on this
+        // render. A reload the engine refused (a file half-written, a
+        // token misspelled) leaves the colors alone and hands back one
+        // line, which goes on the notice row: stderr would land in the
+        // middle of the frame.
         if let Some(watch) = theme_watch.as_mut() {
             if watch.refresh() {
                 app.theme.set_engine(watch.theme().clone());
+            }
+            if let Some(first) = watch.take_warnings().into_iter().next() {
+                app.notice = Some(format!("theme: {first}"));
             }
         }
         // The eye advances one step per frame toward its target; a pending
@@ -262,6 +269,9 @@ fn handle(
         UiMsg::ConnLost(_) => app.conn_lost = true,
         UiMsg::Notice(n) => app.notice = Some(n),
         UiMsg::EyeTick => *tick_armed = false,
+        // Nothing to apply: waking the loop is the whole message, and the
+        // reload runs before the frame it woke.
+        UiMsg::ThemeChanged => {}
     }
     false
 }

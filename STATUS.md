@@ -1,10 +1,12 @@
 # Status
 
-Updated 2026-08-03. M4 is complete and committed: cyclops name and list,
-pane border chrome, layout presets, workspace save and restore, and
-cyclops start. 524 tests green, CI green on Linux and macOS, and v2 is
-main. Next up is M5, polish parity. One thing still waits on admin: the
-v1 cutover.
+Updated 2026-08-03. M5 is complete and committed: three themes with stated
+contrast, `cyclops theme`, hardened hot reload, docs polish, and a README
+quickstart on the progressive ladder. F25 is fixed in the same commit, so
+the tmux-HEAD CI job is green again after being red all through M3 and M4.
+555 tests across 61 targets, CI green on Linux and macOS, and v2 is main.
+Next is M6, the handoff milestone, which is now the one that matters most.
+One thing still waits on admin: the v1 cutover.
 
 ## Done
 
@@ -193,6 +195,64 @@ v1 cutover.
     and in none of chrome.rs, with two of the eight already disagreeing.
     It now lives in chrome.rs alone.
 
+- M5 themes (this change). The three-theme set, the verb that switches
+  between them, and the reload rule that keeps a half-written file off the
+  screen. The rest of M5 (landing-page command parity, the README
+  quickstart pass) is not in this change.
+  - themes/dark, light and high-contrast each set the whole 22-token
+    vocabulary with explicit 256-color fallbacks, and each header now
+    states its contrast as numbers: the ground it assumes, the floor every
+    token clears, and how it was measured. high-contrast was retuned to
+    clear 7:1 (WCAG AAA for body text) on every token; `state.dead` moved
+    from #949494 (6.9:1) to #9e9e9e (7.8:1) to get there. The floor is the
+    red at 7.05:1, and the file says why a red on black is the color that
+    sets it. `shipped_themes_meet_their_stated_contrast` fails the build
+    if a retune drops below what a header claims.
+  - `cyclops theme` lists what is there with a one-line swatch per theme,
+    painted in that theme, `▸` on the active one. `cyclops theme <name>`
+    edits the one config line and leaves the rest of the file, comments
+    included, exactly as written. It refuses a name that will not load
+    rather than writing a key that renders built-in colors and says so
+    only at the next command.
+  - Hot reload got two changes, and the second is the one that matters.
+    `ThemeWatch` now watches the SELECTION, config key plus theme file, so
+    a switch moves a running `cyclops ui` and the daemon's pane borders,
+    not just an edit to the file they were already on. And a reload now
+    applies whole or not at all: the file has to load AND still set every
+    token it set before, or the colors on screen stay and one line says
+    why. That rule exists for how editors save. Truncate, then rewrite: a
+    stat landing mid-save reads a SHORTER file that is still valid TOML,
+    and loading it paints every lost token out of the compiled default
+    table, whose lightness has nothing to do with the theme on screen. A
+    misspelled token name does the same thing and stays. Switching is
+    deliberately exempt: a palette the user just asked for applies with a
+    fresh start's tolerance.
+  - `theme.reload` on the daemon (no params, it reads the config itself)
+    repaints every adopted pane's border and emits `theme` so subscribers
+    wake. The event carries the name and no colors: every surface resolves
+    its own, and one that took a palette off the wire could show a theme
+    no file on the machine holds. Proven against tmux, not against the
+    daemon's own belief: crates/cyclopsd/tests/m5_theme.rs reads the
+    border format back off the server.
+  - Warnings are drained rather than read (`take_warnings`), which is what
+    makes "one warning line" true: the daemon used to log the same theme
+    warning on every repaint after a bad edit.
+  - One defect came out of writing demos/m5-theme.sh and not out of
+    reading the code, which is the M3 lesson holding again. The reload
+    exempted a config change from the token rule, and `cyclops theme
+    <name>` rewrites the config key every time, so running it while a file
+    was mid-save turned the exemption on and put the compiled default
+    table onto a real pane border. The question the check asks is now
+    whether the selected FILE changed, not whether the config did.
+    Regression test in select.rs, and the demo is the thing that would
+    catch it again.
+  - F32 in findings.md is the measurement behind all of it: rewriting a
+    theme file the way every editor does, 27.3% of concurrent reads saw
+    valid TOML defining ZERO of the 22 tokens, and 0% saw a syntax error.
+    A syntax error was the only thing the loader used to treat as a
+    failure, so the failure it guarded against was the one that never
+    happens.
+
 ## ADMIN_ACTION_REQUIRED (not blocking the build)
 
 ### The v2-becomes-main flip: approved, unblocked, runs when M3 lands
@@ -270,11 +330,28 @@ it lying in minutes.
 
 ## Next
 
-- M4 pane UX is in flight. Naming, the roster, and the border chrome are
-  done (see Done). Live pane TITLES are not being built and will not be:
-  the title is a sensor on every shipped manifest, and the reason is
-  written up as F26 and under Deviations. The dead-pane edge below belongs
-  to this milestone too, and is still open.
+- M5 polish parity. Running. The theme set, `cyclops theme` and hardened
+  hot reload are in (see Done). Still open: landing-page command parity,
+  docs examples elsewhere in docs/, README quickstart on the progressive
+  ladder.
+- M6 handoff, and this is now the milestone that matters most. The bar is
+  a person, not a checklist: a competent engineer who has never seen this
+  repo should be able to build and run it, explain how a message becomes a
+  verified receipt, add a new agent CLI, debug a stuck delivery, and know
+  which invariants they must not break and why, without asking anyone.
+  docs/STYLE.md is the standard, so this means fewer and better placed
+  words, not more, with diagrams where prose is worse.
+- M7 flow features: `cyclops pipe`, attention routing, `--wait`
+  composition ergonomics. Moved behind the handoff milestone so its docs
+  are written as it ships rather than retrofitted.
+
+Dropped by admin decision on 2026-08-03:
+
+- The narrator (a cheap agent posting periodic digests into the admin
+  stream). Beyond being unwanted, it fought the calm-stream rule: a digest
+  on a timer needs nobody, so opening the eye for it is the exact failure
+  that cost M3 six rounds.
+- The dogfood experiment (running a Cyclops workspace to build Cyclops).
 
 ## Backlog (non-blocking)
 
@@ -286,15 +363,11 @@ it lying in minutes.
 - `cyclops workspace save` prints an agent count taken from the file
   rather than the live roster; only the second line discloses that.
 
-- F25, and it is the sharpest one: cyclops has no reliable dead-pane edge
-  on any tmux version. Death has no notification, per-pane subscriptions
-  stop being re-evaluated once the pane's process exits (measured on both
-  3.6a and next-3.8), and the watcher only catches a death when an
-  unrelated event happens to force a resync afterwards. 3.6a wins that
-  race by 23ms and tmux next-3.8 loses it by 13ms, which is the whole of
-  the red tmux-HEAD job. Scope is `remain-on-exit on` only; the default
-  closes the pane and emits a real %layout-change. Fix belongs with the
-  pane work: give death its own edge.
+- F25 is FIXED (see findings.md). A per-pane subscription can never
+  report a pane's death, because the closed pty fd that sets pane_dead is
+  the same gate that makes tmux skip that pane's subscription. Cyclops now
+  arms an all-panes subscription, which has no such gate. The tmux-HEAD CI
+  job is green again on both 3.6a and next-3.8.
 - codex tier-2 marker evidence still plain-capture-blind (record
   truthfulness nuance, M1 note).
 - Accepted hook reports are covered by unit-level ancestry tests plus
@@ -313,8 +386,13 @@ it lying in minutes.
 
 ## Risks
 
-- The tmux-HEAD CI job is red on the F25 dead-pane test. It stays
-  continue-on-error: it is early warning and it did its job.
+- The tmux-HEAD CI job is green again now that F25 is fixed. It stays
+  continue-on-error so a break in tmux master cannot block this repo, but
+  that also means it can rot unnoticed: check it when it goes red rather
+  than assuming it is the usual failure. It earned its keep once already.
+- A dead pane's pane_pid differs by tmux version (stale on 3.6a, -1 on
+  next-3.8) and is deliberately not normalized. On 3.6a a stale pid can be
+  recycled, and sender identity walks socket-peer ancestry to a pid.
 - NOTICE still describes the v1 staged build, down to SHA-256 sums of
   bin/commPact files absent from this tree. It needs rewriting for the
   Rust implementation before this tree becomes the public tip.

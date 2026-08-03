@@ -10,14 +10,14 @@ in the tree today; anything still to come is marked M5 or later.
 
 | Crate | Role | Status |
 |---|---|---|
-| `crates/cyclops-proto` | Wire protocol v1, ledger schema, delivery state machine, agent state model. Data types only, no IO. Daemon and every client compile against it. | Done |
-| `crates/cyclops-manifest` | Per-CLI detection manifests: TOML schema, compiled rules, region parsing, priority evaluation, modal decline actions. Loads `manifests/*.toml`. | Done |
+| `crates/cyclops-proto` | Wire protocol v1, ledger schema, delivery state machine, agent state model. Data types only, no IO. Daemon and every client compile against it. The methods and their request/response lines are docs/PROTOCOL.md. | Done |
+| `crates/cyclops-manifest` | Per-CLI detection manifests: TOML schema, compiled rules, region parsing, priority evaluation, modal decline actions. Loads `manifests/*.toml`. The schema as a page someone writing a manifest can read is docs/MANIFESTS.md. | Done |
 | `crates/cyclops-tmux` | The tmux adapter. Every tmux-specific behavior lives here: version probe with feature gates, control-mode client (FIFO reply correlation, pause-after flow control), zero-polling reconciling pane table on `refresh-client -B` subscriptions. Pane rows carry `pane_pid` for sender identity. M3 adds `focus_pane`, a one-shot `select-window` plus `select-pane` outside control mode, so the stream UI's jump-to-pane makes no tmux call outside this crate. M4 adds `layout`: the declarative workspace tree (windows, rows of panes, ratios) with `capture` off a live session and `apply` onto a new one, on the same one-shot invocation path. It writes no tmux option and no pane title, and refuses a session that already exists. | Done (M4 scope) |
 | `crates/cyclopsd` | The daemon: control-mode watcher, sensor fusion (title + screen + hook reports), socket server, per-session ledger writer, delivery pipeline with per-recipient FIFO workers, fail-closed sender identity, pane adoption registry. M2 adds the ledger read side (`msg.history`, `msg.thread`), server-owned `agent.wait` with occupant pinning, and hook liveness plus the startup self-test (`hooks.verify`, `hooks.selftest`). M4 makes the adoption registry durable (`registry.rs`: `$CYCLOPS_HOME/registry.json`, restored per session against the live pane table and the pane's root pid) and adds the border chrome writer (`chrome.rs`: per-pane `pane-border-format` and `@cyclops_*` options, window-scoped `pane-border-status`, snapshotted at adoption and restored on clear, on pane close, on a window move, and at shutdown; it also owns the `chrome = "off"` switch, so no caller tests it). The chrome is the only thing the daemon renders, and it paints from cyclops-theme like every other surface. | Done (M4 scope) |
 | `crates/cyclops` | The CLI: thin NDJSON client over the daemon socket. `ping`, `status`, `read`, `watch`, `send`, the `hook` receiver, the M2 verbs (`history`, `thread`, `wait`, `send --wait`, `hooks install\|verify\|selftest`), and M3's `ui` (dispatch only; the stream lives in `cyclops-ui`). M4 adds `name` and `list` (pane adoption and the roster, rendered on the same grid as `status`) plus the workspace verbs: `start` (restore or build the default workspace, idempotent) and `workspace save|restore`, in `src/workspace.rs`, which owns the files, the `default_workspace` config key, the label round trips through `pane.label`, and the copy. | Done (M4 scope) |
 | `crates/cyclops-ui` | The stream UI behind `cyclops ui`: admin view and firehose over `events.subscribe` plus a ledger-tail backfill, the eye, filters, jump-to-pane through the tmux adapter, `--plain` follow mode. Windowed rendering over a 10k ring; the terminal layer is a hand-rolled termios/ANSI backend behind a pure frame builder. | Done (M3 scope) |
 | `crates/cyclops-ledger` | Crash-safe append-only NDJSON ledger writer and cursor reader. Workspace member; `cyclopsd` writes one ledger per watched session through it; `cyclops-ui` replays session tails through it for backfill. | Done |
-| `crates/cyclops-theme` | The theme engine: semantic token vocabulary (role.1-8, surface.dim/accent, eye.calm/alert, state.\* and badge.\* in four groups, plus surface.fg as the engine's own out-of-vocabulary fallback), the state-to-group mapping both renderers resolve through, data-only theme TOML with 256-color fallback derivation, selection (`theme` config key, `CYCLOPS_THEME` override), event-driven hot reload. The CLI's style module and cyclops-ui resolve every color through it. The vocabulary is exactly what the renderers paint: stream and background tokens stay out because nothing resolves them (docs/themes.md). | Done (M3 scope) |
+| `crates/cyclops-theme` | The theme engine: semantic token vocabulary (role.1-8, surface.dim/accent, eye.calm/alert, state.\* and badge.\* in four groups, plus surface.fg as the engine's own out-of-vocabulary fallback), the state-to-group mapping both renderers resolve through, data-only theme TOML with 256-color fallback derivation, selection (`theme` config key, `CYCLOPS_THEME` override), event-driven hot reload. The CLI's style module and cyclops-ui resolve every color through it. The vocabulary is exactly what the renderers paint: stream and background tokens stay out because nothing resolves them (docs/themes.md). M5 makes the reload watch the SELECTION rather than one file path, so `cyclops theme <name>` moves a running UI and the daemon's borders, and makes a reload apply whole or not at all: a file that no longer sets a token it used to is refused with one warning, because a half-written save would otherwise paint the missing tokens out of the compiled default table (F32). | Done (M5 scope) |
 | `crates/cyclops-testrig` | Test-only, `publish = false`, no dependencies. The isolated tmux server every test runs against, and the one statement of its teardown rule: kill the server, unlink the socket file it leaves behind, from `Drop` so a panicking test tears down too. A dev-dependency of `cyclops-tmux` and `cyclopsd`, which is what a `#[cfg(test)]` module could not be: the sites needing it span two crates plus a unit test inside the `cyclopsd` library. Its `one_place` test fails if any other Rust file kills a tmux server, or any demo script does it outside `demos/lib.sh`. | Done (M3 scope) |
 
 Non-crate directories: `manifests/` (shipped detection data for claude,
@@ -267,12 +267,32 @@ flowchart TD
     N["cyclops name %4 reviewer"] --> D["cyclopsd: pane.label"]
     D -->|"the roster, so a restart keeps it"| R["registry.json<br/>whole-file temp+rename, 0600"]
     D -->|"how it got here"| L["ledger: system line, pane_labeled"]
-    D -->|"written on seven edges and no others: adoption,<br/>a fused state change, clear, session attach,<br/>a window move, pane close, and daemon shutdown"| C["chrome.rs, over the control-mode client:<br/>@cyclops_role, @cyclops_state,<br/>pane-border-format (this pane),<br/>pane-border-status (this window)"]
+    D -->|"written on eight edges and no others: adoption,<br/>a fused state change, a clear, a session attach,<br/>a window move, a pane close, daemon shutdown,<br/>and a theme switch"| C["chrome.rs, over the control-mode client:<br/>@cyclops_role, @cyclops_state,<br/>pane-border-format (this pane),<br/>pane-border-status (this window)"]
     W["cyclops start · workspace save and restore"] -->|"labels, and only when a daemon answers"| D
     W -->|"structure"| T["cyclops-tmux layout, one-shot invocations:<br/>new-session, split-window, resize-pane"]
     C --> X(["tmux"])
     T --> X
 ```
+
+Each of those eight edges is fired by one function, and no function fires
+two:
+
+| Edge | Fired by |
+|---|---|
+| adoption | `adopt_pane` |
+| a fused state change | `fusion::recompute_pane` |
+| a clear | `unadopt_pane` |
+| a session attach | `reconcile_adoptions` |
+| a window move | `move_chrome` |
+| a pane close | `handle_pane_event` |
+| daemon shutdown | `restore_all_chrome` |
+| a theme switch | `reload_theme` |
+
+The theme switch is M5's, and the four that paint a set of panes (adoption,
+session attach, window move, theme switch) all paint through one function,
+`paint_adoptions`. `crates/cyclopsd/src/chrome.rs` holds the same table and
+a test reads this page against it, so a ninth caller cannot leave these
+three pages describing the old set.
 
 The two paths reach tmux from different processes and never write the same
 thing. Chrome sets options and takes them back: the pane's prior

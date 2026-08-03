@@ -44,6 +44,13 @@ async fn short_lived_command_flips_pane_dead_with_remain_on_exit() {
     srv.new_session("dp");
     // Keep exited panes around so pane_dead is observable.
     srv.tmux_ok(&["set-option", "-g", "remain-on-exit", "on"]);
+    // Take away the coincidence this test used to pass on. tmux's automatic
+    // rename fires when the command exits, and that %window-renamed forced
+    // the reconcile that noticed the death: a race the watcher never
+    // arbitrated, which 3.6a won by 23ms and next-3.8 lost by 13ms (F25).
+    // With automatic-rename off, nothing else moves when the pane dies, so
+    // what is under test is cyclops's own dead edge and not tmux's timing.
+    srv.tmux_ok(&["set-option", "-g", "automatic-rename", "off"]);
 
     let w = SessionWatcher::connect(srv.config("dp"))
         .await
@@ -51,8 +58,7 @@ async fn short_lived_command_flips_pane_dead_with_remain_on_exit() {
     let mut rx = w.subscribe();
 
     // Long enough to be seen alive first, short enough to die during the
-    // test. Death has no dedicated notification; the pane_dead flip arrives
-    // through the per-pane subscription.
+    // test.
     srv.tmux_ok(&["split-window", "-t", "dp", "sleep 0.5"]);
     await_event(
         &mut rx,
@@ -61,11 +67,13 @@ async fn short_lived_command_flips_pane_dead_with_remain_on_exit() {
     )
     .await;
 
-    await_event(&mut rx, "PaneChanged(dead=true) or PaneAdded dead", |e| {
+    await_event(&mut rx, "PaneChanged(dead=true)", |e| {
         matches!(e, PaneEvent::PaneChanged { id, changed, row }
             if id == "%1" && changed.contains(&PaneField::Dead) && row.dead)
     })
     .await;
+    // The corpse stays in the table. next-3.8 stops reporting #{pane_pid}
+    // for a dead pane, and a row dropped for that reads as a removal.
     assert!(w.pane("%1").unwrap().dead);
 
     w.shutdown().await;

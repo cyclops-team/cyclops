@@ -90,7 +90,7 @@ pub struct Event {
 // Method params and results. Methods use dot notation: "ping", "status",
 // "msg.send", "msg.history", "msg.thread", "agent.wait", "agent.state.report",
 // "pane.read", "events.subscribe", "admin.notify", "hooks.verify",
-// "hooks.selftest".
+// "hooks.selftest", "theme.reload".
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

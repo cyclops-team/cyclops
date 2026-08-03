@@ -6,6 +6,7 @@
 #
 #   cyc_scratch_root      where throwaway state goes
 #   cyc_tmux_teardown     stop an isolated tmux server, completely
+#   cyc_stop_daemon       stop the demo's cyclopsd, idempotently
 #
 # The Rust side of both rules lives in cyclops_proto::scratch and in
 # crates/cyclops-testrig. Restated here because bash cannot call them;
@@ -72,4 +73,22 @@ cyc_tmux_teardown() {
 # itself. Empty when no server is up.
 cyc_tmux_socket_path() {
   command tmux -u -L "$1" -f /dev/null display-message -p '#{socket_path}' 2>/dev/null || true
+}
+
+# Stop the demo's cyclopsd and wait for it to go.
+#
+# Reads and clears the caller's DAEMON_PID, so it is safe to call twice:
+# a demo that restarts its daemon mid-run calls it once for the restart
+# and again from the EXIT trap, and the second call has nothing to do.
+#
+# Waiting is the point, not the kill. The daemon puts every pane border
+# back on the way down (docs/panes.md), and a trap that killed and moved
+# straight on to cyc_tmux_teardown raced that restore against the tmux
+# server going away.
+cyc_stop_daemon() {
+  if [ -n "${DAEMON_PID:-}" ]; then
+    kill "$DAEMON_PID" 2>/dev/null || true
+    wait "$DAEMON_PID" 2>/dev/null || true
+    DAEMON_PID=""
+  fi
 }

@@ -396,6 +396,14 @@ pub(crate) async fn dispatch(
                 None,
             )
         }
+        // No params: the daemon reads the selection itself. A method that
+        // took a theme name would let a client and the config disagree
+        // about what is on, and the config is what every other surface
+        // reads.
+        "theme.reload" => {
+            let name = crate::reload_theme(inner).await;
+            (Response::ok(id, json!({"theme": name})), None)
+        }
         "agent.wait" => {
             let params: AgentWaitParams = match serde_json::from_value(req.params) {
                 Ok(p) => p,
@@ -1033,25 +1041,29 @@ mod tests {
 
     /// Every protocol v1 method answers with something that is not
     /// unknown_method: implemented, unimplemented, or a param error.
+    /// Every method protocol v1 answers. One list, read by the dispatch
+    /// check below and by the page that documents the wire.
+    const PROTOCOL_V1: [&str; 14] = [
+        "ping",
+        "status",
+        "msg.send",
+        "msg.history",
+        "msg.thread",
+        "agent.wait",
+        "agent.state.report",
+        "pane.read",
+        "pane.label",
+        "events.subscribe",
+        "admin.notify",
+        "hooks.verify",
+        "hooks.selftest",
+        "theme.reload",
+    ];
+
     #[tokio::test]
     async fn dispatch_covers_protocol_v1() {
         let inner = bare_inner();
-        let v1 = [
-            "ping",
-            "status",
-            "msg.send",
-            "msg.history",
-            "msg.thread",
-            "agent.wait",
-            "agent.state.report",
-            "pane.read",
-            "pane.label",
-            "events.subscribe",
-            "admin.notify",
-            "hooks.verify",
-            "hooks.selftest",
-        ];
-        for method in v1 {
+        for method in PROTOCOL_V1 {
             let (resp, _) = dispatch(&inner, req(method), own_peer()).await;
             if let Some(err) = &resp.error {
                 assert_ne!(err.code, "unknown_method", "{method} fell through dispatch");
@@ -1059,6 +1071,69 @@ mod tests {
         }
         let (resp, _) = dispatch(&inner, req("bogus.method"), own_peer()).await;
         assert_eq!(resp.error.unwrap().code, "unknown_method");
+    }
+
+    /// docs/PROTOCOL.md is the page a script writer works from, and it is
+    /// the only page that documents the wire. It shipped M5 without
+    /// `theme.reload`, the method M5 added, and with no event catalogue at
+    /// all: `events.subscribe` takes a `kinds` filter and the page named
+    /// nothing to filter on.
+    ///
+    /// Both halves are read out of the daemon rather than listed here, so
+    /// a new method or a new event fails until the page carries it.
+    #[test]
+    fn the_protocol_page_names_every_method_and_every_event() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let page = std::fs::read_to_string(root.join("../../docs/PROTOCOL.md"))
+            .expect("read docs/PROTOCOL.md");
+        let mut missing: Vec<String> = Vec::new();
+        for method in PROTOCOL_V1 {
+            if !page.contains(&format!("`{method}`")) {
+                missing.push(format!("method {method}"));
+            }
+        }
+        for event in emitted_events(&root.join("src")) {
+            if !page.contains(&format!("`{event}`")) {
+                missing.push(format!("event {event}"));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "docs/PROTOCOL.md documents the wire and does not mention these: {missing:#?}"
+        );
+    }
+
+    /// Every event name the daemon emits, read off the `emit` call sites.
+    ///
+    /// The names are string literals scattered across the crate and there
+    /// is no list of them anywhere else; scanning is what makes a ninth
+    /// event fail the check above instead of shipping undocumented.
+    fn emitted_events(src: &std::path::Path) -> Vec<String> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(src).expect("read src").flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source");
+            for (idx, _) in text.match_indices(".emit(") {
+                let rest = &text[idx..];
+                let Some(open) = rest.find('"') else { continue };
+                let Some(close) = rest[open + 1..].find('"') else {
+                    continue;
+                };
+                let name = &rest[open + 1..open + 1 + close];
+                // The event name is the first argument; anything else at
+                // this position is not one and is not ours to document.
+                if !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '-') {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        assert!(!names.is_empty(), "found no emit call sites in {src:?}");
+        names
     }
 
     #[tokio::test]

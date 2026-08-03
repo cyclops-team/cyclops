@@ -3,9 +3,11 @@
 //! explicit 256-color fallbacks match the documented derivation wherever
 //! the file headers do not declare hand-tuning (the role slots). The
 //! high-contrast theme is additionally held to WCAG AA, which is the only
-//! promise it makes that a reader cannot check by looking. The last test
-//! here pins docs/themes.md to the vocabulary, because a token table that
-//! outlives its tokens is the bug this milestone went looking for.
+//! promise it makes that a reader cannot check by looking. Two tests here
+//! pin docs/themes.md instead of the files: the token table, because a
+//! table that outlives its tokens is the bug this milestone went looking
+//! for, and the contrast table, because a bar nobody publishes is a
+//! threshold and not a check.
 
 use std::path::PathBuf;
 
@@ -13,13 +15,21 @@ use cyclops_theme::{derive_c256, tokens, Theme};
 
 const SHIPPED: [&str; 3] = ["dark", "light", "high-contrast"];
 
-fn shipped(name: &str) -> Theme {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+fn theme_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../themes")
-        .join(format!("{name}.toml"));
-    let (theme, warnings) = Theme::load(&path).expect("shipped theme loads");
+        .join(format!("{name}.toml"))
+}
+
+fn shipped(name: &str) -> Theme {
+    let (theme, warnings) = Theme::load(&theme_path(name)).expect("shipped theme loads");
     assert!(warnings.is_empty(), "{name}: {warnings:?}");
     theme
+}
+
+fn themes_doc() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/themes.md");
+    std::fs::read_to_string(&path).expect("docs/themes.md")
 }
 
 #[test]
@@ -97,26 +107,153 @@ fn luminance(rgb: (u8, u8, u8)) -> f64 {
     0.2126 * lin(rgb.0) + 0.7152 * lin(rgb.1) + 0.0722 * lin(rgb.2)
 }
 
-/// The high-contrast theme's whole promise is legibility, and its header
-/// states that promise as a number. Every token is measured against black
-/// because that is the ground the file assumes: it sets no `surface.bg`,
-/// so a high-contrast terminal's own black is what these colors land on.
-///
-/// The state and badge groups are the reason this test exists. Role hues
-/// were picked once, by hand, against this bar; a group added or retuned
-/// later has no such moment unless something checks.
+/// WCAG contrast ratio between two colors, the number each theme header
+/// states: (lighter + 0.05) / (darker + 0.05) on relative luminance.
+fn contrast(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// What one theme's header claims about contrast, as numbers.
+struct Claim {
+    theme: &'static str,
+    /// The background the file was drawn on and says so: the site's
+    /// `--term-bg` for dark, its `--paper` for light, the terminal's own
+    /// black for high-contrast. No theme sets `surface.bg`, so this is an
+    /// assumption stated in the file, not something Cyclops paints.
+    ground: (u8, u8, u8),
+    /// The floor every token clears.
+    floor: f64,
+    /// `state.dead`'s own floor. Lower in two of the three: a pane whose
+    /// process is gone should be the hardest row on the screen to read,
+    /// and every header says so in those words.
+    dead: f64,
+}
+
+const CONTRAST: [Claim; 3] = [
+    Claim {
+        theme: "dark",
+        ground: (0x0d, 0x0d, 0x0d),
+        floor: 4.3,
+        dead: 2.8,
+    },
+    Claim {
+        theme: "light",
+        ground: (0xfe, 0xfe, 0xfe),
+        floor: 3.6,
+        dead: 2.8,
+    },
+    Claim {
+        theme: "high-contrast",
+        ground: (0x00, 0x00, 0x00),
+        floor: 7.0,
+        dead: 7.0,
+    },
+];
+
+/// Contrast is the one promise in a theme header that a reader cannot
+/// check by looking, so it is the one that has to be measured. Role hues
+/// were picked once, by hand, against these bars; a group added or
+/// retuned later has no such moment unless something checks.
 #[test]
-fn shipped_high_contrast_clears_wcag_aa() {
-    const AA: f64 = 4.5;
-    let theme = shipped("high-contrast");
-    let black = luminance((0, 0, 0));
-    for token in tokens::ALL {
-        let c = theme.resolve(token);
-        let ratio = (luminance(c.rgb) + 0.05) / (black + 0.05);
+fn shipped_themes_meet_their_stated_contrast() {
+    for claim in CONTRAST {
+        let name = claim.theme;
+        let theme = shipped(name);
+        for token in tokens::ALL {
+            let bar = if token == tokens::STATE_DEAD {
+                claim.dead
+            } else {
+                claim.floor
+            };
+            let ratio = contrast(theme.resolve(token).rgb, claim.ground);
+            assert!(
+                ratio >= bar,
+                "{name}: {token} {:?} measures {ratio:.2}:1 on {:?}, under the \
+                 {bar}:1 its header states",
+                theme.resolve(token).rgb,
+                claim.ground
+            );
+        }
+        // A gone pane and a quiet one are different rows, so their cells
+        // are different colors. Every header describes dead as one step
+        // past quiet; collapsing them would make that sentence false and
+        // cost a reader the difference at a glance.
+        assert_ne!(
+            theme.resolve(tokens::STATE_DEAD),
+            theme.resolve(tokens::STATE_QUIET),
+            "{name}: dead and quiet are the same color"
+        );
+    }
+}
+
+/// A contrast bar as the theme headers and docs/themes.md write it: whole
+/// numbers bare ("7:1"), everything else to one decimal ("2.8:1").
+fn bar_words(bar: f64) -> String {
+    if bar.fract() == 0.0 {
+        format!("{bar:.0}:1")
+    } else {
+        format!("{bar:.1}:1")
+    }
+}
+
+fn hex_words(rgb: (u8, u8, u8)) -> String {
+    format!("`#{:02x}{:02x}{:02x}`", rgb.0, rgb.1, rgb.2)
+}
+
+/// The bars measured above are the bars the shipped files and
+/// docs/themes.md publish, and nothing else is allowed to be.
+///
+/// A threshold is only a check while it is somebody else's number. Tuned
+/// down until the colors pass, it still passes its own assertion and stops
+/// meaning anything: `light`'s `state.dead` measured 2.79:1 under a 2.7
+/// threshold while its header and the page both said 2.8:1, so the one
+/// test named as catching exactly that could not.
+#[test]
+fn the_published_bars_are_the_bars_that_get_measured() {
+    let doc = themes_doc();
+    for claim in CONTRAST {
+        let name = claim.theme;
+
+        // The page's contrast table: ground, floor, and the exception.
+        let head = format!("| `{name}` |");
+        let row = doc
+            .lines()
+            .find(|l| l.starts_with(&head))
+            .unwrap_or_else(|| panic!("docs/themes.md has no contrast row for {name}"));
         assert!(
-            ratio >= AA,
-            "{token} {:?} measures {ratio:.2}:1 on black, under AA's {AA}:1",
-            c.rgb
+            row.contains(&hex_words(claim.ground)),
+            "{name}: the page names a different ground than the one measured: {row}"
+        );
+        assert!(
+            row.contains(&bar_words(claim.floor)),
+            "{name}: the page does not publish the {} floor measured here: {row}",
+            bar_words(claim.floor)
+        );
+        if claim.dead == claim.floor {
+            assert!(
+                row.trim_end().ends_with("| nothing |"),
+                "{name}: the page claims an exception this test does not measure: {row}"
+            );
+        } else {
+            assert!(
+                row.contains(&format!("`state.dead`, {}", bar_words(claim.dead))),
+                "{name}: the page does not publish the {} state.dead bar measured here: {row}",
+                bar_words(claim.dead)
+            );
+        }
+
+        // And the file header, which is where a theme's own numbers live.
+        let header = std::fs::read_to_string(theme_path(name)).expect("shipped theme file");
+        assert!(
+            header.contains(&bar_words(claim.floor)),
+            "{name}.toml does not state the {} floor measured here",
+            bar_words(claim.floor)
+        );
+        assert!(
+            header.contains(&bar_words(claim.dead)),
+            "{name}.toml does not state the {} state.dead bar measured here",
+            bar_words(claim.dead)
         );
     }
 }

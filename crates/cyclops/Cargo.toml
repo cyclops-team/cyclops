@@ -11,6 +11,8 @@ libc.workspace = true
 # The workspace verbs build real tmux sessions, so their tests need the
 # isolated server and its teardown rule.
 cyclops-testrig.workspace = true
+# `cyclops theme` edits a config in place, so its tests need a scratch one.
+tempfile = "3"
 
 [dependencies]
 cyclops-proto.workspace = true
