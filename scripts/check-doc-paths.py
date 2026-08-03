@@ -139,6 +139,37 @@ def line_of(text, index):
     return text.count("\n", 0, index) + 1
 
 
+# The two front doors. README.md indexes every page in a table; HANDOFF.md
+# is the one a newcomer is pointed at first. A page reachable from neither
+# is a page nobody finds.
+FRONT_DOORS = ["README.md", "docs/HANDOFF.md"]
+
+
+def check_orphans():
+    """Every page has to be reachable from a front door.
+
+    This is the rule that keeps the doc set from growing sideways. Adding
+    a page is cheap and linking it is one line, so a page that is worth
+    writing is worth putting in the index; one that is not worth indexing
+    should not exist. Without this, a doc set gets larger and less useful
+    at the same time.
+    """
+    linked = set()
+    for door in FRONT_DOORS:
+        text = (REPO / door).read_text()
+        for m in LINK.finditer(text):
+            target = m.group(1).split("#")[0]
+            if target.endswith(".md"):
+                linked.add(Path(target).name)
+
+    orphans = sorted(
+        p.name for p in docs() if p.name not in linked and p.name not in {"README.md"}
+    )
+    if not orphans:
+        return []
+    return orphans
+
+
 # One page holding both halves: paths that must be reported, and paths
 # that must not be. A gate that reports nothing looks identical to a gate
 # that is switched off, and this one was switched off once already: an
@@ -199,19 +230,32 @@ def main():
         check_links(page, text, bad)
         check_code_spans(page, text, bad)
 
-    if not bad:
-        print(f"== {len(pages)} pages checked, every path resolves")
+    orphans = check_orphans()
+
+    if not bad and not orphans:
+        print(f"== {len(pages)} pages checked, every path resolves and every page is indexed")
         return 0
 
-    print(f"== {len(bad)} path(s) the docs quote and this repo does not have\n")
-    for page, line, s, kind in bad:
-        rel = page.relative_to(REPO)
-        print(f"  {rel}:{line}  {kind}  {s}")
-    print(
-        "\nEither the path is wrong, or the file moved and the doc did not.\n"
-        "A path that is deliberately not in this repo goes in LITERAL_SKIPS\n"
-        "with the reason it is there."
-    )
+    if bad:
+        print(f"== {len(bad)} path(s) the docs quote and this repo does not have\n")
+        for page, line, s, kind in bad:
+            rel = page.relative_to(REPO)
+            print(f"  {rel}:{line}  {kind}  {s}")
+        print(
+            "\nEither the path is wrong, or the file moved and the doc did not.\n"
+            "A path that is deliberately not in this repo goes in LITERAL_SKIPS\n"
+            "with the reason it is there."
+        )
+
+    if orphans:
+        print(f"\n== {len(orphans)} page(s) no front door links to\n")
+        for name in orphans:
+            print(f"  {name}")
+        print(
+            "\nAdd a row to the table in README.md, or a link from\n"
+            "docs/HANDOFF.md. A page nobody can navigate to is a page that\n"
+            "goes stale unread; if it is not worth indexing, delete it."
+        )
     return 1
 
 

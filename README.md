@@ -418,6 +418,7 @@ Otherwise, one page per question.
 | [CONTRIBUTING.md](docs/CONTRIBUTING.md) | The development loop, the demos, and the gates a change must pass |
 | [INVARIANTS.md](docs/INVARIANTS.md) | Eleven rules a change must never break, and what breaks otherwise |
 | [findings.md](findings.md) | The measurements the design rests on, F13 onward, each with the probe that proved it |
+| [CHANGELOG.md](CHANGELOG.md) | What each milestone changed, in the order it shipped |
 | [GOALS.md](docs/GOALS.md) | The quality bar every milestone is reviewed against |
 | [STYLE.md](docs/STYLE.md) | How this codebase is written, binding on every change |
 
