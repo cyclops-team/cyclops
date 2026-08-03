@@ -15,10 +15,10 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SOCK="cyc-m1-demo-$$"
 SESSION="demo"
-# /private/tmp is macOS only and keeps socket paths short; elsewhere the
-# system temp dir is already short. CYCLOPS_TEST_TMP overrides both.
-TMPROOT="${CYCLOPS_TEST_TMP:-$([ -d /private/tmp ] && echo /private/tmp || echo "${TMPDIR:-/tmp}")}"
-CYCLOPS_HOME="$(mktemp -d "$TMPROOT/cyclops-m1-demo.XXXXXX")"
+# The scratch root and the tmux teardown rule are shared, not copied.
+# shellcheck source=demos/lib.sh
+. "$(cd "$(dirname "$0")" && pwd)/lib.sh"
+CYCLOPS_HOME="$(mktemp -d "$(cyc_scratch_root)/cyclops-m1-demo.XXXXXX")"
 export CYCLOPS_HOME
 DAEMON_PID=""
 
@@ -38,13 +38,13 @@ cleanup() {
     kill "$DAEMON_PID" 2>/dev/null || true
     wait "$DAEMON_PID" 2>/dev/null || true
   fi
-  tmx kill-server 2>/dev/null || true
+  cyc_tmux_teardown "$SOCK"
   rm -rf "$CYCLOPS_HOME"
 }
 trap cleanup EXIT
 
 echo "== demo home:   $CYCLOPS_HOME (removed on exit)"
-echo "== tmux server: -L $SOCK (isolated, killed on exit)"
+echo "== tmux server: -L $SOCK (isolated, removed on exit)"
 
 # Isolated server, session "demo", two cat panes. cat echoes whatever the
 # pipeline pastes, so the delivery is visible in a capture.

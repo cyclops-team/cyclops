@@ -311,6 +311,10 @@ async fn modal_without_auto_dismiss_holds_and_notifies() {
             .contains("fake_trust_modal"),
         "{notify}"
     );
+    // A ping points at something; this one points at the pane, because
+    // the prompt on the pane is what a human clears (the delivery is only
+    // gating). A reader's calm view holds the ping to that item.
+    assert_eq!(notify["data"]["pane_id"], pane.as_str(), "{notify}");
     tokio::time::sleep(Duration::from_millis(800)).await;
     let lines = rig.ledger_lines();
     let last = lines
@@ -324,7 +328,7 @@ async fn modal_without_auto_dismiss_holds_and_notifies() {
 
     // The human clears the modal; the held delivery proceeds on the state
     // change, no timer involved.
-    rig.tmux.run(&["send-keys", "-t", &pane, "x", "Enter"]);
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
     rig.ev
         .wait_event(Duration::from_secs(10), |e| {
             e["event"] == "delivery-state"
@@ -379,7 +383,7 @@ async fn quota_parks_everything_and_never_retries() {
 
     // Even when the pane recovers, NOTHING auto-retries: re-queue is an
     // explicit operator action (amendment f).
-    rig.tmux.run(&["send-keys", "-t", &pane, "x", "Enter"]);
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(
         rig.final_state(&m1, "agy").as_deref(),
@@ -439,7 +443,7 @@ async fn fifo_ordering_after_busy_target_goes_idle() {
 
     // Release the pane; queued deliveries land FIFO on the state change.
     let released_at = Instant::now();
-    rig.tmux.run(&["send-keys", "-t", &pane, "x", "Enter"]);
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
     let mut delivered_order = Vec::new();
     for _ in 0..3 {
         let e = rig
@@ -470,7 +474,8 @@ async fn broadcast_fans_out_and_missing_recipient_needs_attention() {
     // 2.5s budget. Under full-workspace parallel load the second screen-tier
     // delivery can outlast the default cap, and a queued receipt is legal.
     let mut rig = Rig::new("cast", CAT_MANIFEST, "cat", "receipt_block_ms = 10000\n").await;
-    rig.tmux.run(&["split-window", "-d", "-t", "main:0", "cat"]);
+    rig.tmux
+        .run_ok(&["split-window", "-d", "-t", "main:0", "cat"]);
     rig.wait_attached(2).await;
     let panes = rig.pane_ids().await;
     rig.label(&panes[0], "impl").await;

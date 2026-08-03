@@ -158,7 +158,8 @@ async fn history_reconstructs_a_two_pane_conversation() {
     // semantics, not the 2.5s budget, and parallel-workspace load can push
     // the second screen-tier delivery past the default cap.
     let mut rig = Rig::new("m2hist", CAT_MANIFEST, "cat", "receipt_block_ms = 10000\n").await;
-    rig.tmux.run(&["split-window", "-d", "-t", "main:0", "cat"]);
+    rig.tmux
+        .run_ok(&["split-window", "-d", "-t", "main:0", "cat"]);
     rig.wait_attached(2).await;
     let panes = rig.pane_ids().await;
     rig.label(&panes[0], "codex").await;

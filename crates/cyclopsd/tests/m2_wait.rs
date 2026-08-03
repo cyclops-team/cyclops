@@ -133,7 +133,7 @@ async fn agent_wait_done_resolves_on_the_working_to_idle_edge() {
         })
         .await;
     let driver = drive_later(
-        rig.tmux.socket.clone(),
+        rig.tmux.socket().to_string(),
         vec![title_step(500, &pane, "READY again")],
     );
     let resp = rig
@@ -151,7 +151,7 @@ async fn agent_wait_done_resolves_on_the_working_to_idle_edge() {
     // working phase has been observed AND ended. The working phase must
     // outlive tmux's 1Hz subscription tick or it is invisible (F23).
     let driver = drive_later(
-        rig.tmux.socket.clone(),
+        rig.tmux.socket().to_string(),
         vec![
             title_step(400, &pane, "WORKING again"),
             title_step(2000, &pane, "READY once more"),
@@ -186,7 +186,7 @@ async fn agent_wait_blocked_resolves_on_a_blocked_state() {
     rig.label(&pane, "worker").await;
 
     let driver = drive_later(
-        rig.tmux.socket.clone(),
+        rig.tmux.socket().to_string(),
         vec![title_step(400, &pane, "BLOCKED on a permission prompt")],
     );
     let resp = rig
@@ -247,13 +247,14 @@ async fn agent_wait_pins_the_occupant_and_reports_a_killed_pane() {
     }
     let mut rig = Rig::new("waitocc", WAIT_MANIFEST, "cat", "").await;
     // Keep a second pane so the session survives the kill.
-    rig.tmux.run(&["split-window", "-d", "-t", "main:0", "cat"]);
+    rig.tmux
+        .run_ok(&["split-window", "-d", "-t", "main:0", "cat"]);
     rig.wait_attached(2).await;
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "mortal").await;
 
     let driver = drive_later(
-        rig.tmux.socket.clone(),
+        rig.tmux.socket().to_string(),
         vec![(
             400,
             ["kill-pane", "-t", &pane]
@@ -336,7 +337,7 @@ async fn send_wait_pins_the_submitted_occupant_not_the_impostor() {
             .expect("send reached the pre_wait seam");
         // Swap the occupant (cat -> sh) and wait until the watcher table
         // saw it: command and pid travel in the same subscription push.
-        tmux.run(&["respawn-pane", "-k", "-t", &pane, "sh"]);
+        tmux.run_ok(&["respawn-pane", "-k", "-t", &pane, "sh"]);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             let status = ctl.request("status", json!({})).await;
@@ -379,7 +380,7 @@ async fn send_wait_done_round_trip() {
 
     // Fixture turn: once the payload lands in the pane, run one
     // working-then-idle title cycle, as an agent CLI would.
-    let socket = rig.tmux.socket.clone();
+    let socket = rig.tmux.socket().to_string();
     let pane_for_driver = pane.clone();
     let driver = std::thread::spawn(move || {
         let tmux = |args: &[&str]| {

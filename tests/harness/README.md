@@ -28,8 +28,11 @@ Probes must never interact with the user's tmux server. Non-negotiable:
   /dev/null`. `tuikit.py` enforces this by routing everything through `SOCK`.
 - One unique socket per test, including the process id, e.g.
   `cyc-probe-f13-$$`. Set it via `CYC_HARNESS_SOCK` before importing tuikit.
-- Teardown kills that server (`tmux -L <socket> kill-server`), even on
-  failure. A leaked server is a bug in the probe.
+- Teardown goes through `tuikit.teardown()`, even on failure. Stopping a
+  tmux server unlinks nothing, so a probe that stops it and no more leaves
+  a dead socket file behind on every run. `teardown()` calls the one shell
+  statement of that rule (`cyc_tmux_teardown` in `demos/lib.sh`). A leaked
+  server or socket is a bug in the probe.
 - Never call bare `tmux`. Bare `tmux` is the user's server.
 
 ## Writing a probe test
@@ -49,7 +52,7 @@ try:
     tk.paste("probe", "reply ok [m-test1]")
     # ... measure, assert, record ...
 finally:
-    tk.tmux("kill-server")
+    tk.teardown()
 ```
 
 Conventions, inherited from the campaign:

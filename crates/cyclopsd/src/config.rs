@@ -34,6 +34,10 @@ pub struct Config {
     /// long (working pane, human typing, detached session). Visibility for
     /// wedged holds; the delivery itself keeps waiting for events.
     pub gate_hold_notify_ms: u64,
+    /// Theme name for rendering clients (cyclops, cyclops-ui), resolved by
+    /// cyclops-theme. The daemon renders nothing; the key is recognized
+    /// here so a themed config file does not warn as unknown.
+    pub theme: Option<String>,
 }
 
 impl Config {
@@ -49,6 +53,7 @@ impl Config {
             delivery_retry_max: 1,
             receipt_block_ms: 2500,
             gate_hold_notify_ms: 120_000,
+            theme: None,
         }
     }
 
@@ -144,6 +149,13 @@ impl Config {
                         cfg.gate_hold_notify_ms
                     )),
                 },
+                "theme" => match value {
+                    toml::Value::String(s) => cfg.theme = Some(s),
+                    other => warnings.push(format!(
+                        "`theme` must be a string, not a {}; using the default",
+                        other.type_str()
+                    )),
+                },
                 unknown => warnings.push(format!("unknown config key `{unknown}` ignored")),
             }
         }
@@ -188,12 +200,14 @@ sessions = ["main", "aux"]
 tmux_socket = "cyc-test"
 tmux_config = "/dev/null"
 manifest_dir = "/private/tmp/manifests"
+theme = "dark"
 "#;
         let (cfg, warnings) = Config::parse(text, Path::new("/private/tmp/home")).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(cfg.sessions, vec!["main", "aux"]);
         assert_eq!(cfg.tmux_socket.as_deref(), Some("cyc-test"));
         assert_eq!(cfg.tmux_config.as_deref(), Some(Path::new("/dev/null")));
+        assert_eq!(cfg.theme.as_deref(), Some("dark"));
         assert_eq!(
             cfg.manifest_dir(),
             Some(PathBuf::from("/private/tmp/manifests"))
@@ -213,11 +227,15 @@ manifest_dir = "/private/tmp/manifests"
 
     #[test]
     fn wrong_types_warn_and_fall_back() {
-        let (cfg, warnings) =
-            Config::parse("sessions = \"main\"\ntmux_socket = 7\n", Path::new("/h")).unwrap();
+        let (cfg, warnings) = Config::parse(
+            "sessions = \"main\"\ntmux_socket = 7\ntheme = 3\n",
+            Path::new("/h"),
+        )
+        .unwrap();
         assert!(cfg.sessions.is_empty());
         assert!(cfg.tmux_socket.is_none());
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(cfg.theme.is_none());
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
     }
 
     #[test]

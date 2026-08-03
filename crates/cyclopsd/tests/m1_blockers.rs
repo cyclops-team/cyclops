@@ -121,7 +121,7 @@ async fn escaped_capture_flips_typed_text_to_idle_with_input_and_gates() {
     // The human "types": the composer line becomes bare text. Only the
     // escaped capture can tell this apart from the ghost (the plain
     // captures are identical), so before the fix this stayed idle.
-    rig.tmux.run(&["send-keys", "-t", &pane, "x", "Enter"]);
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
     wait_pane_state(&mut rig, "idle_with_input").await;
 
     // A delivery against typed text must hold in gating: human wins.
@@ -147,7 +147,7 @@ async fn escaped_capture_flips_typed_text_to_idle_with_input_and_gates() {
 
     // The typed text goes away, only ghost text remains: idle again, and
     // the held delivery proceeds on the state change.
-    rig.tmux.run(&["send-keys", "-t", &pane, "x", "Enter"]);
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
     rig.ev
         .wait_event(Duration::from_secs(10), |e| {
             e["event"] == "delivery-state"
@@ -243,7 +243,7 @@ async fn pane_rebound_before_paste_never_pastes_into_the_new_occupant() {
     // the occupant with a plain shell and wait until the watcher table
     // saw the swap (command and pid travel in the same push).
     entered.recv().await.expect("paste path reached the seam");
-    rig.tmux.run(&["respawn-pane", "-k", "-t", &pane, "sh"]);
+    rig.tmux.run_ok(&["respawn-pane", "-k", "-t", &pane, "sh"]);
     wait_pane_command_away_from(&mut rig, "cat").await;
     release.add_permits(1);
 
@@ -318,7 +318,7 @@ async fn pane_rebound_before_submit_withholds_the_submit_key() {
 
     // Paste and verification ran; the path is parked just before Enter.
     entered.recv().await.expect("submit path reached the seam");
-    rig.tmux.run(&["respawn-pane", "-k", "-t", &pane, "sh"]);
+    rig.tmux.run_ok(&["respawn-pane", "-k", "-t", &pane, "sh"]);
     wait_pane_command_away_from(&mut rig, "cat").await;
     release.add_permits(1);
 
@@ -400,17 +400,17 @@ async fn send_and_wait_reports_paneless_recipients() {
 /// dangling forever.
 #[tokio::test(flavor = "multi_thread")]
 async fn restart_closes_pre_hosted_field_ledger_chains() {
-    let pid = std::process::id();
     let home = cyclops_proto::scratch::scratch_dir("cyc-m1-oldhost");
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(home.join("ledger")).expect("scratch home");
     let _guard = HomeGuard(home.clone());
     // A watched session that never attaches: limbo closure runs at boot
-    // from the replayed ledger alone, no tmux needed.
-    // The socket name is unique and the config file is /dev/null so the
-    // attach retries can never touch the user's tmux; the server (if the
-    // client ever autostarts one) is killed in teardown below.
-    let socket = format!("cyc-oldhost-none-{pid}");
+    // from the replayed ledger alone, no tmux needed. The attach retries
+    // still autostart a server on this socket, so it goes through the rig
+    // like every other server: unique name, and teardown on drop rather
+    // than at the end of the body, where a failed assertion skips it.
+    let tmux = TmuxGuard::new("oldhost-none");
+    let socket = tmux.socket();
     std::fs::write(
         home.join("config.toml"),
         format!("sessions = [\"main\"]\ntmux_socket = \"{socket}\"\ntmux_config = \"/dev/null\"\n"),
@@ -453,7 +453,4 @@ async fn restart_closes_pre_hosted_field_ledger_chains() {
         "no aggregated restart notification"
     );
     daemon.shutdown().await;
-    let _ = std::process::Command::new("tmux")
-        .args(["-L", &socket, "kill-server"])
-        .output();
 }

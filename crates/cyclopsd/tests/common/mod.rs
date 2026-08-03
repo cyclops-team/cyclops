@@ -1,14 +1,17 @@
 //! Shared rig for the cyclopsd integration tests: isolated tmux server,
-//! scratch home, in-process daemon, NDJSON test clients. Every tmux call
-//! carries a per-test `-L <tag>-<pid> -f /dev/null` socket (tmux -u per
-//! finding F14) and the server dies in teardown. Bounded poll loops here
-//! are test-side waits, explicitly outside the daemon's zero-polling
-//! contract.
-#![allow(dead_code)]
+//! scratch home, in-process daemon, NDJSON test clients.
+//!
+//! The tmux server and its teardown come from `cyclops-testrig`, which is
+//! where the isolation flags and the kill-then-unlink rule are stated. Do
+//! not re-implement either here; that is how the socket leak survived
+//! three rounds of fixes. Bounded poll loops in this file are test-side
+//! waits, explicitly outside the daemon's zero-polling contract.
+// One rig serving every test binary in this crate: no single binary uses
+// every helper or every re-export, and each compiles this file on its own.
+#![allow(dead_code, unused_imports)]
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use cyclops_proto::{DeliveryState, Kind, LedgerLine};
@@ -187,60 +190,13 @@ verify_pattern = ["CYC-NOPE-<message_id>-NOPE"]
 // Rig
 // ---------------------------------------------------------------------------
 
-pub fn tmux_available() -> bool {
-    Command::new("tmux")
-        .arg("-V")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
+/// The isolated tmux server these tests drive, plus the skip check.
+/// Naming, isolation flags, and teardown are `cyclops-testrig`'s: this
+/// crate's tests add helpers on top, never a second way to kill a server.
+pub use cyclops_testrig::{tmux_available, TmuxServer as TmuxGuard};
 
-/// Isolated tmux server, killed on drop. -u everywhere (finding F14).
-pub struct TmuxGuard {
-    pub socket: String,
-}
-
-impl TmuxGuard {
-    pub fn run(&self, args: &[&str]) {
-        let status = Command::new("tmux")
-            .args(["-u", "-L", &self.socket, "-f", "/dev/null"])
-            .args(args)
-            .status()
-            .expect("run tmux");
-        assert!(status.success(), "tmux {args:?} failed");
-    }
-
-    pub fn capture(&self, target: &str) -> String {
-        let out = Command::new("tmux")
-            .args(["-u", "-L", &self.socket, "-f", "/dev/null"])
-            .args(["capture-pane", "-p", "-t", target])
-            .output()
-            .expect("tmux capture-pane");
-        String::from_utf8_lossy(&out.stdout).to_string()
-    }
-
-    pub fn wait_screen(&self, target: &str, needle: &str) {
-        let t = Instant::now();
-        while !self.capture(target).contains(needle) {
-            assert!(
-                t.elapsed() < Duration::from_secs(5),
-                "{needle:?} never rendered in {target}: {}",
-                self.capture(target)
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-}
-
-impl Drop for TmuxGuard {
-    fn drop(&mut self) {
-        let _ = Command::new("tmux")
-            .args(["-L", &self.socket, "kill-server"])
-            .output();
-    }
-}
-
-/// Scratch CYCLOPS_HOME under /private/tmp, removed on drop.
+/// Scratch CYCLOPS_HOME under the scratch root, removed on drop. The root
+/// is `cyclops_proto::scratch`'s, never a hardcoded /private/tmp (F24).
 pub struct HomeGuard(pub PathBuf);
 
 impl Drop for HomeGuard {
@@ -364,8 +320,10 @@ impl Rig {
                 .with_writer(std::io::stderr)
                 .try_init();
         }
-        let pid = std::process::id();
-        let socket = format!("cyc-m1-{tag}-{pid}");
+        // The server exists from here on, so its teardown is already armed
+        // when the config below names it.
+        let tmux = TmuxGuard::new(&format!("m1-{tag}"));
+        let socket = tmux.socket();
         let home = cyclops_proto::scratch::scratch_dir(&format!("cyc-m1-{tag}"));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(home.join("manifests")).expect("create scratch home");
@@ -386,9 +344,8 @@ impl Rig {
         )
         .expect("write config");
 
-        let tmux = TmuxGuard { socket };
         for (name, pane_cmd) in sessions {
-            tmux.run(&[
+            tmux.run_ok(&[
                 "new-session",
                 "-d",
                 "-s",

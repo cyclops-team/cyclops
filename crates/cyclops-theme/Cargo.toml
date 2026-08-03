@@ -1,0 +1,16 @@
+[package]
+name = "cyclops-theme"
+version.workspace = true
+edition.workspace = true
+description = "Semantic color tokens: theme files, 256-color fallback derivation, hot reload."
+
+[dependencies]
+# The four groups state and delivery color speak in are part of the token
+# vocabulary, so the mapping lives with the tokens rather than once per
+# renderer. That needs the state enums; cyclops-proto is data types only.
+cyclops-proto.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

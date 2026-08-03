@@ -7,12 +7,18 @@
 //! Compatibility rule (ADR-001, shpool pattern S2): the server writes a hello
 //! line first on every connection. Version mismatch warns, never rejects.
 //! All deserialization tolerates unknown fields.
+//!
+//! Two rules over those types live here because every surface has to agree
+//! on them: the delivery state machine ([`ledger::DeliveryState`]) and
+//! what needs a human ([`attention`], which owns the eye).
 
+pub mod attention;
 pub mod ledger;
 pub mod scratch;
 pub mod state;
 pub mod wire;
 
+pub use attention::*;
 pub use ledger::*;
 pub use state::*;
 pub use wire::*;

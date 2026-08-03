@@ -9,7 +9,7 @@
 ## Build
 
 ```bash
-git clone <this repo> && cd clops
+git clone https://github.com/cyclops-team/cyclops.git && cd cyclops
 cargo build --release
 ```
 
@@ -26,14 +26,30 @@ Create `~/.cyclops/config.toml`:
 sessions = ["main"]
 
 # where the per-CLI detection manifests live
-manifest_dir = "/path/to/clops/manifests"
+manifest_dir = "/path/to/cyclops/manifests"
 ```
 
-Optional keys (defaults shown):
+Three optional keys are unset by default. The first two change how the
+daemon talks to tmux, so add them only when you mean to; the third only
+changes what the CLI prints:
 
 ```toml
-tmux_socket = "name"    # tmux -L socket, for non-default servers
-tmux_config = "/dev/null"  # tmux -f, mostly for tests
+tmux_socket = "cyc"        # tmux -L socket; unset uses the default server
+tmux_config = "/dev/null"  # tmux -f file; unset uses your own tmux config
+theme = "dark"             # colors, see docs/themes.md; unset picks dark too
+```
+
+Theme files are read from `~/.cyclops/themes`, or from `./themes` in the
+working directory (the repo layout). Copy the shipped ones in if you run
+cyclops from anywhere else, otherwise it renders with built-in colors:
+
+```bash
+mkdir -p ~/.cyclops/themes && cp themes/*.toml ~/.cyclops/themes/
+```
+
+The tuning knobs, defaults shown:
+
+```toml
 ack_timeout_ms = 1500        # tier-1 hook ACK window per delivery
 delivery_retry_max = 1       # redelivery attempts after the first failure
 receipt_block_ms = 2500      # receipt cap on the idle send path
@@ -77,6 +93,35 @@ cyclops watch         # live events; Ctrl-C to stop
 
 A pane shows `? unknown` when no manifest matches what is running in it.
 The shipped manifests cover Claude Code, Codex CLI, and Antigravity CLI.
+
+## Run the tests
+
+```bash
+cargo test --workspace --no-fail-fast
+python3 scripts/commpact-shim/test_shim.py
+```
+
+`--no-fail-fast` is not optional: cargo stops at the first failing test
+binary and hides every binary after it, which is how one portability bug
+looked like a green build for two milestones.
+
+Tests need tmux on PATH; the ones that need it skip cleanly without it.
+Every test runs against its own tmux server (`-L cyc-<tag>-<pid>`), never
+yours.
+
+Throwaway test state goes under a short scratch root, because a Unix
+socket path caps out near 104 bytes on macOS and the system temp dir there
+is long. The root is `/private/tmp` on macOS and the system temp dir
+elsewhere. Move it with `CYCLOPS_TEST_TMP`:
+
+```bash
+mkdir -p /private/var/tmp/cyc-relocated
+CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated cargo test --workspace --no-fail-fast
+```
+
+Use it when `/private/tmp` is not writable, and when you want to check
+that nothing has hardcoded a path: a relocated run on macOS takes the same
+code path Linux does. CI runs both.
 
 ## Uninstall
 

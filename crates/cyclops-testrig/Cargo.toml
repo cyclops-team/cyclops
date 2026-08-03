@@ -1,0 +1,8 @@
+[package]
+name = "cyclops-testrig"
+version.workspace = true
+edition.workspace = true
+description = "Test-only rig: the isolated tmux server every Cyclops test runs against, and the teardown rule that unlinks its socket."
+publish = false
+
+[dependencies]

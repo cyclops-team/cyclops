@@ -1,57 +1,55 @@
 //! Shared harness for integration tests.
 //!
-//! Every test runs against its own isolated tmux server: unique `-L` socket
-//! (test tag plus pid), `-f /dev/null`, killed on drop. Nothing here can
-//! reach the user's default tmux server. Tests skip with an eprintln when
-//! no tmux binary is on PATH.
+//! The isolated tmux server and its teardown are `cyclops-testrig`'s, not
+//! this file's: one place holds the naming, the isolation flags, and the
+//! kill-then-unlink rule. What lives here is only what this crate's tests
+//! want on top of it, the fixed-size session and the control config that
+//! points at it. Tests skip with an eprintln when no tmux is on PATH.
 
 #![allow(dead_code)]
 
-use std::process::{Command, Output};
+use std::path::PathBuf;
+use std::process::Output;
 use std::time::Duration;
 
+use cyclops_testrig::{tmux_available, TmuxServer};
 use cyclops_tmux::{ControlConfig, PaneEvent};
 use tokio::sync::broadcast;
 
 pub struct TestServer {
-    pub sock: String,
+    server: TmuxServer,
 }
 
 impl TestServer {
     /// None (caller returns early, skipping the test) when tmux is absent.
     pub fn new(tag: &str) -> Option<TestServer> {
-        if Command::new("tmux").arg("-V").output().is_err() {
+        if !tmux_available() {
             eprintln!("skipping: no tmux binary on PATH");
             return None;
         }
         Some(TestServer {
-            sock: format!("cyclops-test-{tag}-{}", std::process::id()),
+            server: TmuxServer::new(tag),
         })
+    }
+
+    /// The `-L` name, for tests that call tmux code paths themselves.
+    pub fn sock(&self) -> &str {
+        self.server.socket()
     }
 
     /// Run a tmux command against the isolated server.
     pub fn tmux(&self, args: &[&str]) -> Output {
-        Command::new("tmux")
-            .args(["-L", &self.sock, "-f", "/dev/null"])
-            .args(args)
-            .env_remove("TMUX")
-            .output()
-            .expect("run tmux")
+        self.server.run(args)
     }
 
     /// Same, but the command must succeed.
     pub fn tmux_ok(&self, args: &[&str]) {
-        let out = self.tmux(args);
-        assert!(
-            out.status.success(),
-            "tmux {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        self.server.run_ok(args);
     }
 
     /// Detached session running /bin/sh, fixed 120x30 grid.
     pub fn new_session(&self, name: &str) {
-        self.tmux_ok(&[
+        self.server.run_ok(&[
             "new-session",
             "-d",
             "-s",
@@ -67,17 +65,13 @@ impl TestServer {
     /// Control config attaching to a session on this server.
     pub fn config(&self, session: &str) -> ControlConfig {
         ControlConfig::attach(session)
-            .on_socket(self.sock.clone())
+            .on_socket(self.sock().to_string())
             .with_config_file("/dev/null")
     }
-}
 
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        let _ = Command::new("tmux")
-            .args(["-L", &self.sock, "kill-server"])
-            .env_remove("TMUX")
-            .output();
+    /// Where this server's socket file lives. None when no server is up.
+    pub fn socket_path(&self) -> Option<PathBuf> {
+        self.server.socket_path()
     }
 }
 

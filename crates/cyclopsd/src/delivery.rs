@@ -438,6 +438,67 @@ fn gate_line(
     );
 }
 
+/// What a ping is ABOUT: the attention item a reader can go and clear.
+///
+/// A ping says a human is needed but is not itself a state, so nothing
+/// ever transitions it and no register can hold it. Naming its item is
+/// what lets a reader's stream tell a ping that still stands from one
+/// whose subject already resolved (cyclops-ui `App::admits`). Additive on
+/// the wire: a ping that names nothing omits both fields, and a reader
+/// that predates them ignores them.
+#[derive(Default)]
+pub(crate) struct About {
+    /// The pane whose blocked state raised the ping.
+    pane_id: Option<String>,
+    /// The recipient of the delivery the ping is about. That delivery's
+    /// id is the ping's own `msg_id`, so this pairs with `Some(msg_id)`.
+    to: Option<String>,
+    /// Every delivery a ping about SEVERAL of them names, when one ping
+    /// covers a batch. The ping's own `msg_id` can only name one, and the
+    /// restart closure ends a whole run's worth at once.
+    deliveries: Vec<DeliveryRef>,
+}
+
+/// One delivery a batch ping points at, keyed the way the register keys
+/// it: recipient plus message.
+///
+/// Named fields, not a pair: both are strings, they sit next to each
+/// other, and a transposition would compile and then quietly point every
+/// ping at nothing.
+pub(crate) struct DeliveryRef {
+    pub(crate) to: String,
+    pub(crate) msg_id: String,
+}
+
+impl About {
+    /// A ping about a pane a human must unblock.
+    pub(crate) fn pane(pane_id: &str) -> About {
+        About {
+            pane_id: Some(pane_id.to_string()),
+            ..About::default()
+        }
+    }
+
+    /// A ping about one delivery to `to`. Pass the message id as `msg_id`
+    /// or the ping names a recipient without saying which delivery.
+    pub(crate) fn delivery(to: &str) -> About {
+        About {
+            to: Some(to.to_string()),
+            ..About::default()
+        }
+    }
+
+    /// A ping about many deliveries at once. A reader holds it against
+    /// the register per item and shows it while ANY of them still stands,
+    /// so one summary line cannot outlive the whole batch it summarizes.
+    pub(crate) fn deliveries(deliveries: Vec<DeliveryRef>) -> About {
+        About {
+            deliveries,
+            ..About::default()
+        }
+    }
+}
+
 /// Write a kind=system admin notification line and broadcast the event.
 /// `session_idx` scopes internal (delivery-driven) notifications to the
 /// recipient's ledger; None (external admin.notify) writes to every
@@ -449,10 +510,41 @@ pub(crate) fn admin_notify(
     body: &str,
     msg_id: Option<&str>,
     session_idx: Option<usize>,
+    about: About,
 ) -> Option<u64> {
     let id = msg_id
         .map(str::to_string)
         .unwrap_or_else(|| inner.mint_event_id());
+    // The item the ping points at, written once and worn by both the
+    // ledger line's data and the live event, so a reader replaying the
+    // record and one on the push read the same ping.
+    let mut about_fields = serde_json::Map::new();
+    if let Some(pane_id) = &about.pane_id {
+        about_fields.insert("pane_id".into(), json!(pane_id));
+    }
+    if let Some(to) = &about.to {
+        about_fields.insert("to".into(), json!(to));
+    }
+    if !about.deliveries.is_empty() {
+        // The batch form of the `to` field above, spelled the same way:
+        // recipient plus message id, which is the register's key for the
+        // delivery half. Additive and absent when the ping names one item
+        // or none.
+        about_fields.insert(
+            "deliveries".into(),
+            json!(about
+                .deliveries
+                .iter()
+                .map(|d| json!({"to": d.to, "id": d.msg_id}))
+                .collect::<Vec<_>>()),
+        );
+    }
+    let with_about = |mut v: Value| {
+        if let Value::Object(map) = &mut v {
+            map.extend(about_fields.clone());
+        }
+        v
+    };
     let line = LedgerLine {
         seq: 0,
         boot_id: String::new(),
@@ -469,7 +561,7 @@ pub(crate) fn admin_notify(
         },
         reply_to: None,
         deliveries: Vec::new(),
-        data: Some(json!({"event": "admin_notify", "level": level})),
+        data: Some(with_about(json!({"event": "admin_notify", "level": level}))),
     };
     let sessions: Vec<usize> = match session_idx {
         Some(i) => vec![i],
@@ -484,7 +576,7 @@ pub(crate) fn admin_notify(
     }
     inner.emit(
         "admin-notify",
-        json!({"id": id, "level": level, "subject": subject, "body": body}),
+        with_about(json!({"id": id, "level": level, "subject": subject, "body": body})),
         first_seq,
     );
     first_seq
@@ -506,6 +598,9 @@ pub(crate) fn admin_notify(
 /// still closes through its hosted msg record.
 pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine>)]) {
     let mut closed: Vec<String> = Vec::new();
+    // The same closures as identities, so the one ping can name them and
+    // a reader can hold it to the register (cyclops-ui `App::admits`).
+    let mut named: Vec<DeliveryRef> = Vec::new();
     for (idx, lines) in replayed {
         // (msg id, recipient) -> (latest state, attempts).
         let mut chains: HashMap<(String, String), (DeliveryState, u32)> = HashMap::new();
@@ -592,6 +687,10 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
                 seq,
             );
             closed.push(format!("{id} -> {to}"));
+            named.push(DeliveryRef {
+                to: to.clone(),
+                msg_id: id.clone(),
+            });
         }
     }
     if closed.is_empty() {
@@ -609,6 +708,12 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
         ),
         None,
         None,
+        // Every delivery this closed, by name. One ping over many is
+        // still a ping about each of them: it claims a human is needed,
+        // so a calm stream has to be able to ask the register whether any
+        // of them still does. Naming nothing is what put a closed eye
+        // over "action required" once the batch had been dealt with.
+        About::deliveries(named),
     );
 }
 
@@ -787,6 +892,7 @@ pub(crate) async fn msg_send(
                     &format!("message {msg_id}: no such pane for {name:?}"),
                     Some(&msg_id),
                     None,
+                    About::delivery(name),
                 );
                 handles.push(handle);
             }
@@ -1356,6 +1462,7 @@ fn notify_attention(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>, cause: &st
         &format!("message {}: {cause}", handle.msg_id),
         Some(&handle.msg_id),
         Some(handle.session_idx),
+        About::delivery(&handle.to),
     );
 }
 
@@ -1404,6 +1511,7 @@ async fn park_recipient(
         ),
         Some(&handle.msg_id),
         Some(handle.session_idx),
+        About::delivery(&handle.to),
     );
 }
 
@@ -1563,6 +1671,11 @@ async fn gate(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> GateOutcome {
                                             ),
                                             Some(&handle.msg_id),
                                             Some(handle.session_idx),
+                                            // The pane, not the delivery:
+                                            // the delivery is only gating,
+                                            // and the thing a human clears
+                                            // is the prompt on the pane.
+                                            About::pane(&handle.pane_id),
                                         );
                                     }
                                     Some(format!("blocked:{rule_id}"))
@@ -1600,6 +1713,7 @@ async fn gate(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> GateOutcome {
                         ),
                         Some(&handle.msg_id),
                         Some(handle.session_idx),
+                        About::delivery(&handle.to),
                     );
                 }
             }
@@ -3029,20 +3143,17 @@ contains = ["OTHER-DIALOG"]
     /// server-global with the payload in it.
     #[tokio::test]
     async fn paste_failure_deletes_the_loaded_buffer() {
-        if std::process::Command::new("tmux")
-            .arg("-V")
-            .output()
-            .map(|o| !o.status.success())
-            .unwrap_or(true)
-        {
+        if !cyclops_testrig::tmux_available() {
             eprintln!("skipping: tmux not on PATH");
             return;
         }
         let pid = std::process::id();
-        let socket = format!("cyc-dubuf-{pid}");
+        // The rig owns the server: teardown kills it AND unlinks its socket,
+        // and runs on unwind, which a kill at the end of the body does not.
+        let tmux = cyclops_testrig::TmuxServer::new("dubuf");
         let spool = cyclops_proto::scratch::scratch_dir("cyc-dubuf-spool");
         let cfg = cyclops_tmux::ControlConfig::new_session("dubuf")
-            .on_socket(&socket)
+            .on_socket(tmux.socket())
             .with_config_file("/dev/null")
             .with_buffer_spool_dir(&spool);
         let (client, _rx) = ControlClient::spawn(cfg).await.expect("tmux spawns");
@@ -3060,9 +3171,6 @@ contains = ["OTHER-DIALOG"]
             "buffer lingered after failed paste: {buffers:?}"
         );
         client.shutdown().await;
-        let _ = std::process::Command::new("tmux")
-            .args(["-L", &socket, "kill-server"])
-            .output();
         let _ = std::fs::remove_dir_all(&spool);
     }
 }

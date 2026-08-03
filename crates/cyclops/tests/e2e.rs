@@ -11,10 +11,13 @@ use std::thread;
 
 use serde_json::{json, Value};
 
-/// Scratch home unique per test and process, under the OS temp dir. Kept
-/// short: Unix socket paths cap out around 104 bytes on macOS.
+/// Scratch home unique per test and process, under the relocatable
+/// scratch root. Kept short: Unix socket paths cap out around 104 bytes
+/// on macOS, which is why the root is not the OS temp dir (F24). That the
+/// root really relocates is proven once, in cyclopsd's scratch_override
+/// test; restating it here as a starts_with could not fail.
 fn scratch_home(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("cyc-{}-{}", tag, std::process::id()));
+    let dir = cyclops_proto::scratch::scratch_dir(&format!("cyc-{tag}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create scratch home");
     dir
@@ -186,11 +189,42 @@ fn status_plain_renders_the_grid() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let expected = "◉ cyclops · watching main · tmux 3.6a · up 2m\n\
+    // Nothing blocked in the canned answer, so the eye stays closed.
+    let expected = "‿ cyclops · watching main · tmux 3.6a · up 2m\n\
                     \n\
                     \x20 reviewer     ● working  Run the tests\n\
                     \x20 implementer  ○ idle\n\
                     \x20 %4           ? unknown  vim\n";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn status_plain_opens_the_eye_on_a_blocked_agent() {
+    // The shipped surface, not just the renderer: a blocked agent is the
+    // only thing that opens the mark, and it names the count in words.
+    // Tags name the scratch home, so every one in this file is distinct:
+    // two tests sharing a tag share a socket and race.
+    let home = scratch_home("seye");
+    let mut canned = canned_status();
+    canned["sessions"][0]["panes"][1]["state"] = json!("blocked_permission");
+    serve_once(&home, hello(1), move |req| {
+        (
+            vec![json!({"id": req["id"], "result": canned}).to_string()],
+            false,
+        )
+    });
+    let out = run_cyclops(&home, &["status", "--plain"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let expected = "◑ 1 cyclops · watching main · tmux 3.6a · up 2m · 1 needs attention\n\
+                    \n\
+                    \x20 reviewer     ● working             Run the tests\n\
+                    \x20 implementer  ⚠ blocked_permission\n\
+                    \x20 %4           ? unknown             vim\n";
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
     let _ = fs::remove_dir_all(&home);
 }
@@ -443,7 +477,7 @@ fn send_parked_exits_one_with_reset_hint() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "⛔ parked · quota, resets in 135h\n"
+        "⊘ parked · quota, resets in 135h\n"
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stderr).trim(),
@@ -701,7 +735,7 @@ fn history_plain_renders_the_grid_with_broadcast_badges() {
     let expected = "\x20 Jul 20 2025  codex → reviewer       Review the rate limiter  ✔ delivered · verified\n\
                     \x20 Jul 22 2025  admin → 2 agents  fyi  Standup\n\
                     \x20              reviewer     ✔ delivered · verified\n\
-                    \x20              implementer  ⛔ parked · quota\n";
+                    \x20              implementer  ⊘ parked · quota\n";
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
     let _ = fs::remove_dir_all(&home);
 }

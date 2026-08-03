@@ -12,3 +12,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 uuid.workspace = true
+cyclops-testrig.workspace = true

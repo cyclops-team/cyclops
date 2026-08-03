@@ -236,6 +236,10 @@ pub(crate) fn notify_f1_once(
         ),
         Some(msg_id),
         Some(session_idx),
+        // The delivery this is about. It downgraded to the screen tier
+        // rather than stalling, so the rule counts it as nobody's to
+        // clear, and a reader's calm stream holds the ping to that.
+        delivery::About::delivery(to),
     );
 }
 

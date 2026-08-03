@@ -13,7 +13,7 @@ use anyhow::Context as _;
 use cyclops_proto::{
     AdminNotifyParams, AgentWaitParams, Event, Hello, MsgSendParams, PaneReadParams,
     PaneReadResult, PaneReadSource, PingResult, Request, Response, SessionStatus,
-    StateReportParams, StatusResult, SubscribeParams, WireError, PROTOCOL_VERSION,
+    StateReportParams, StatusParams, StatusResult, SubscribeParams, WireError, PROTOCOL_VERSION,
 };
 use cyclops_tmux::SessionWatcher;
 use serde_json::{json, Value};
@@ -259,7 +259,36 @@ pub(crate) async fn dispatch(
             )
         }
         "status" => {
-            let result = status_result(inner);
+            // Absent params mean the shipped answer: every member defaults,
+            // and callers that predate the struct send none. A params
+            // object that is present with a member of the WRONG TYPE is an
+            // error rather than a default, because `status` is how a client
+            // reconciles the deliveries still waiting on a human, and
+            // answering that with an empty list is the one direction this
+            // path should not fail in.
+            //
+            // An unknown FIELD NAME is accepted, and that is deliberate:
+            // ADR-001 S2 makes every decode tolerate unknown fields, so a
+            // field a newer client adds still works against this daemon,
+            // and a typo is byte-identical to one. What the typo costs is
+            // bounded and stated where the count is composed
+            // (cyclops_proto::attention): an answer that did not carry the
+            // backlog counts blocked panes alone, which UNDERSTATES, and
+            // the client knows what it asked for. Any client that shows the
+            // eye must set open_deliveries.
+            let params: StatusParams = match req.params {
+                Value::Null => StatusParams::default(),
+                given => match serde_json::from_value(given) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return (
+                            Response::err(id, "bad_request", format!("bad status params: {e}")),
+                            None,
+                        )
+                    }
+                },
+            };
+            let result = status_result(inner, params.open_deliveries);
             (
                 Response::ok(id, serde_json::to_value(result).expect("status serializes")),
                 None,
@@ -358,6 +387,9 @@ pub(crate) async fn dispatch(
                 &params.body,
                 None,
                 None,
+                // An operator's own ping. It names no delivery and no
+                // pane, so nothing downstream may decide it is stale.
+                delivery::About::default(),
             );
             (
                 Response::ok(id, json!({"notified": true, "seq": seq})),
@@ -598,7 +630,18 @@ fn verify_report_origin(inner: &Inner, peer: Peer, agent: &str) -> Result<(), Wi
 }
 
 /// Assemble StatusResult from the session slots and the detection cache.
-pub(crate) fn status_result(inner: &Inner) -> StatusResult {
+///
+/// `open_deliveries` adds the ledger-folded backlog of deliveries still
+/// waiting on a human. It is opt-in because it reads the session files,
+/// and only a client reconciling attention at startup needs it.
+pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResult {
+    // The ledger fold happens before the state locks are taken: it reads
+    // files, and the fusion engine wants those locks back promptly.
+    let open_deliveries = if open_deliveries {
+        crate::history::open_deliveries(inner)
+    } else {
+        Vec::new()
+    };
     let detections = inner.detections.lock().expect("detections lock");
     let labels = inner.labels.lock().expect("labels lock");
     let sessions = inner
@@ -649,6 +692,7 @@ pub(crate) fn status_result(inner: &Inner) -> StatusResult {
         uptime_ms: inner.started.elapsed().as_millis() as u64,
         tmux_version: inner.tmux_version.clone(),
         sessions,
+        open_deliveries,
     }
 }
 
@@ -806,6 +850,168 @@ mod tests {
             hook_liveness: crate::selftest::HookLiveness::new(),
             inject_pause: StdMutex::new(None),
         })
+    }
+
+    /// A daemon with one session ledger seeded from the history fixture,
+    /// which carries both states a human must clear. Scratch paths go
+    /// through cyclops_proto::scratch so the suite runs off macOS (F24).
+    fn inner_with_ledger(tag: &str) -> (Arc<Inner>, std::path::PathBuf) {
+        let dir = cyclops_proto::scratch::scratch_dir(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("ledger/main.ndjson");
+        std::fs::create_dir_all(path.parent().expect("ledger dir")).expect("scratch dir");
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/history.ndjson"),
+            &path,
+        )
+        .expect("fixture copies");
+        let mut inner = bare_inner();
+        Arc::get_mut(&mut inner)
+            .expect("sole owner")
+            .sessions
+            .push(crate::SessionSlot {
+                name: "main".into(),
+                link: StdMutex::new(crate::SessionLink::default()),
+                ledger: Arc::new(
+                    cyclops_ledger::LedgerWriter::open(&path, "b-test").expect("ledger opens"),
+                ),
+                last_panes: StdMutex::new(HashMap::new()),
+            });
+        (inner, dir)
+    }
+
+    /// The stream UI's attention seed. It rides the existing status answer
+    /// and only when asked: the fold reads the session files, and a caller
+    /// that does not need the backlog must not pay for it.
+    #[tokio::test]
+    async fn status_serves_open_deliveries_only_when_asked() {
+        let (inner, dir) = inner_with_ledger("cyc-status-open");
+        assert!(
+            status_result(&inner, false).open_deliveries.is_empty(),
+            "the backlog is opt-in"
+        );
+        let open = status_result(&inner, true).open_deliveries;
+        let got: Vec<(&str, &str)> = open
+            .iter()
+            .map(|d| (d.to.as_str(), d.id.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("implementer", "m-bbbbbb"), ("admin", "m-dddddd")]
+        );
+
+        // The param travels on the wire, and a request without it (every
+        // caller that predates the field) still gets the shipped answer.
+        let ask = Request {
+            id: json!(1),
+            method: "status".into(),
+            params: json!({"open_deliveries": true}),
+        };
+        let (resp, _) = dispatch(&inner, ask, own_peer()).await;
+        let result: StatusResult =
+            serde_json::from_value(resp.result.expect("status answers")).expect("decodes");
+        assert_eq!(result.open_deliveries.len(), 2);
+        let (resp, _) = dispatch(&inner, req("status"), own_peer()).await;
+        let result: StatusResult =
+            serde_json::from_value(resp.result.expect("status answers")).expect("decodes");
+        assert!(result.open_deliveries.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Absent params mean the shipped default; a member of the wrong TYPE
+    /// is an error; an unknown FIELD NAME is accepted and defaults.
+    ///
+    /// The last one is the tolerant-protocol rule (ADR-001 S2) and it is
+    /// the interesting case, because a typo and a field a newer client
+    /// added are the same bytes. This pins that the answer is then the
+    /// pane half alone, which is the understating direction, and never a
+    /// refusal that would break a newer client against this daemon.
+    #[tokio::test]
+    async fn status_defaults_on_absent_params_and_rejects_malformed_ones() {
+        let (inner, dir) = inner_with_ledger("cyc-status-params");
+
+        // No params at all: the answer every pre-struct caller gets.
+        for absent in [Value::Null, json!({})] {
+            let (resp, _) = dispatch(
+                &inner,
+                Request {
+                    id: json!(1),
+                    method: "status".into(),
+                    params: absent.clone(),
+                },
+                own_peer(),
+            )
+            .await;
+            let result: StatusResult =
+                serde_json::from_value(resp.result.expect("status answers")).expect("decodes");
+            assert!(
+                result.open_deliveries.is_empty(),
+                "{absent} must mean the shipped default"
+            );
+        }
+
+        // Wrong type, wrong shape: named errors, no answer.
+        for bad in [
+            json!({"open_deliveries": "yes"}),
+            json!({"open_deliveries": 1}),
+            json!(["open_deliveries"]),
+            json!("open_deliveries"),
+        ] {
+            let (resp, _) = dispatch(
+                &inner,
+                Request {
+                    id: json!(1),
+                    method: "status".into(),
+                    params: bad.clone(),
+                },
+                own_peer(),
+            )
+            .await;
+            assert!(
+                resp.result.is_none(),
+                "{bad} was answered instead of refused"
+            );
+            let err = resp.error.expect("malformed params must be an error");
+            assert_eq!(err.code, "bad_request", "{bad}");
+            assert!(
+                err.message.contains("status params"),
+                "the error must name what was wrong: {}",
+                err.message
+            );
+        }
+
+        // An unknown field name: accepted, defaulted, answered. A newer
+        // client's added param must not break against this daemon, and a
+        // typo is the same bytes.
+        for tolerated in [
+            json!({"open_delivery": true}),
+            json!({"open_deliveries": true, "a_field_from_next_year": 7}),
+        ] {
+            let (resp, _) = dispatch(
+                &inner,
+                Request {
+                    id: json!(1),
+                    method: "status".into(),
+                    params: tolerated.clone(),
+                },
+                own_peer(),
+            )
+            .await;
+            assert!(
+                resp.error.is_none(),
+                "{tolerated} was refused: {:?}",
+                resp.error
+            );
+            let result: StatusResult =
+                serde_json::from_value(resp.result.expect("status answers")).expect("decodes");
+            // The typo asked for nothing, so it got the pane half alone.
+            assert_eq!(
+                result.open_deliveries.is_empty(),
+                tolerated.get("open_deliveries").is_none(),
+                "{tolerated} served the wrong half"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn req(method: &str) -> Request {

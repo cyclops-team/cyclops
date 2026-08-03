@@ -2,7 +2,8 @@
 //! daemon booted in-process, an NDJSON client on the Unix socket.
 //!
 //! Never touches the user's tmux: every tmux call carries
-//! `-L cyc-m0-<pid> -f /dev/null`, and the server is killed in teardown.
+//! `-L cyc-m0-<pid> -f /dev/null` through cyclops-testrig, which kills
+//! the server and unlinks its socket on drop.
 //! Skips cleanly when tmux is not on PATH.
 //!
 //! One test function on purpose: the scenario is sequential (boot, ping,
@@ -13,9 +14,9 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
+use cyclops_testrig::{tmux_available, TmuxServer};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -46,51 +47,8 @@ region = "bottom_non_empty_lines(3)"
 line_regex = ['^FIXPROMPT']
 "#;
 
-fn tmux_available() -> bool {
-    Command::new("tmux")
-        .arg("-V")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Isolated tmux server, killed on drop.
-struct TmuxGuard {
-    socket: String,
-}
-
-impl TmuxGuard {
-    // -u everywhere: without it tmux sanitizes tabs/non-ASCII to '_' in
-    // non-UTF-8 environments (findings F14), which would silently break
-    // capture parsing under launchd/cron/CI locales.
-    fn run(&self, args: &[&str]) {
-        let status = Command::new("tmux")
-            .args(["-u", "-L", &self.socket, "-f", "/dev/null"])
-            .args(args)
-            .status()
-            .expect("run tmux");
-        assert!(status.success(), "tmux {args:?} failed");
-    }
-
-    fn capture(&self) -> String {
-        let out = Command::new("tmux")
-            .args(["-u", "-L", &self.socket, "-f", "/dev/null"])
-            .args(["capture-pane", "-p", "-t", "main"])
-            .output()
-            .expect("tmux capture-pane");
-        String::from_utf8_lossy(&out.stdout).to_string()
-    }
-}
-
-impl Drop for TmuxGuard {
-    fn drop(&mut self) {
-        let _ = Command::new("tmux")
-            .args(["-L", &self.socket, "kill-server"])
-            .output();
-    }
-}
-
-/// Scratch CYCLOPS_HOME under /private/tmp, removed on drop.
+/// Scratch CYCLOPS_HOME under the relocatable scratch root (F24), removed
+/// on drop.
 struct HomeGuard(PathBuf);
 
 impl Drop for HomeGuard {
@@ -192,8 +150,10 @@ async fn m0_shadow_daemon_end_to_end() {
         eprintln!("skipping m0 integration test: tmux not on PATH");
         return;
     }
-    let pid = std::process::id();
-    let tmux_socket = format!("cyc-m0-{pid}");
+    // Isolated tmux server with one bash pane. Created before the config
+    // that names it, so its teardown is armed for the whole test.
+    let tmux = TmuxServer::new("m0");
+    let tmux_socket = tmux.socket();
     let home = cyclops_proto::scratch::scratch_dir("cyc-m0-home");
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(home.join("manifests")).expect("create scratch home");
@@ -212,12 +172,8 @@ async fn m0_shadow_daemon_end_to_end() {
     )
     .expect("write config");
 
-    // Isolated tmux server with one bash pane. --norc --noprofile keeps the
-    // user's shell config out of the fixture.
-    let tmux = TmuxGuard {
-        socket: tmux_socket.clone(),
-    };
-    tmux.run(&[
+    // --norc --noprofile keeps the user's shell config out of the fixture.
+    tmux.run_ok(&[
         "new-session",
         "-d",
         "-s",
@@ -228,14 +184,18 @@ async fn m0_shadow_daemon_end_to_end() {
         "30",
         "bash --norc --noprofile",
     ]);
-    tmux.run(&["send-keys", "-t", "main", "PS1='FIXPROMPT '", "Enter"]);
+    tmux.run_ok(&["send-keys", "-t", "main", "PS1='FIXPROMPT '", "Enter"]);
     // Wait until the fixture prompt renders (screen tier signal).
     let t_prompt = Instant::now();
-    while !tmux.capture().lines().any(|l| l.starts_with("FIXPROMPT")) {
+    while !tmux
+        .capture("main")
+        .lines()
+        .any(|l| l.starts_with("FIXPROMPT"))
+    {
         assert!(
             t_prompt.elapsed() < Duration::from_secs(5),
             "fixture prompt never rendered: {}",
-            tmux.capture()
+            tmux.capture("main")
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -317,7 +277,7 @@ async fn m0_shadow_daemon_end_to_end() {
         .request("events.subscribe", json!({"kinds": ["state"]}))
         .await;
     assert_eq!(ack["result"]["subscribed"], true);
-    tmux.run(&["select-pane", "-t", "main", "-T", "IDLE ready"]);
+    tmux.run_ok(&["select-pane", "-t", "main", "-T", "IDLE ready"]);
     let ev = watcher_client.next_event(Duration::from_secs(5)).await;
     assert_eq!(ev["event"], "state");
     assert_eq!(ev["data"]["pane_id"].as_str(), Some(pane_id.as_str()));
@@ -325,7 +285,7 @@ async fn m0_shadow_daemon_end_to_end() {
     assert_eq!(ev["data"]["prior"], "working");
 
     // pane.read visible sees a marker printed in the pane.
-    tmux.run(&["send-keys", "-t", "main", "echo cyclops-M0-marker", "Enter"]);
+    tmux.run_ok(&["send-keys", "-t", "main", "echo cyclops-M0-marker", "Enter"]);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let resp = c

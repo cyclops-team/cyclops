@@ -178,3 +178,65 @@ milestones, and both were worth more than the fix:
 
 Local green plus red CI is not a flaky-CI story until the logs say so.
 Read the failing job before assuming the environment is at fault.
+
+## F25. Cyclops has no reliable dead-pane edge on any tmux version; 3.6a wins the race by 23ms (MEASURED)
+
+The advisory tmux-HEAD job went red on one test,
+`short_lived_command_flips_pane_dead_with_remain_on_exit`. The first
+reading, that next-3.8 had stopped emitting a dead-pane notification, was
+wrong. Measured against a local tmux built from master, next-3.8 and 3.6a
+emit byte-identical control-mode notification sequences for this scenario,
+and both flip `pane_dead` at the same moment (595ms on 3.6a, 611ms on
+next-3.8, for a child exiting at 500ms).
+
+What actually happens is a race that nothing in the design arbitrates.
+There is no notification for a pane's death. The watcher only learns of it
+because some OTHER event forces a pane-table resync, and here that event is
+tmux's automatic window rename firing when the command exits:
+
+    3.6a       pane_dead flips 595ms   resync 618ms   sees dead=1   PASS
+    next-3.8   pane_dead flips 611ms   resync 598ms   sees dead=0   FAIL
+
+Both margins are around 20ms and neither is guaranteed. 3.6a passes by
+luck. Proven by dumping every PaneEvent the watcher emits under each
+binary: on 3.6a the resync yields `PaneChanged %1 changed=[WindowName,
+Dead] dead=true`; on next-3.8 the same resync yields `changed=[WindowName]
+dead=false`, and because no further event ever arrives, the watcher's
+table holds `dead=false` permanently. Final state read back from the
+watcher confirms it: `%1 dead=Some(false)` with the pane long dead.
+
+The reason the subscription does not save us is the substantive finding.
+SUB_FORMAT already carries `#{pane_dead}`, and subscriptions re-evaluate on
+tmux's 1Hz tick (F23), so a 0-to-1 flip should push. It does not. Measured
+on BOTH versions: subscribe to a pane while alive, let it die, watch eight
+seconds and four-plus ticks, and the count of pushes for that pane after
+death is zero. tmux stops re-evaluating a per-pane format subscription once
+the pane's process exits. Subscribing to an already-dead pane likewise
+pushes nothing, so there is no recovery path through the subscription
+either.
+
+Consequence, and it applies to the shipping version, not just to HEAD: a
+pane that dies without a coincident second event stays `dead=false` in the
+pane table forever. `cyclops status` will show a corpse as a live agent,
+and the delivery gate's dead check, which is one of the guards standing
+between a delivery and the wrong destination, silently stops guarding. The
+occupant_unchanged re-check before paste and submit still catches the worse
+case where a NEW process rebinds the pane id, so this degrades a layer
+rather than opening the door.
+
+Scope, measured rather than assumed: this is specific to
+`remain-on-exit on`, which is not tmux's default. With the default off, an
+exiting command takes its pane with it, and that emits a real
+`%layout-change` (measured at 5.65s for a child exiting at 5.5s), which
+resyncs the table and produces PaneRemoved normally. So the exposure is
+users who turn remain-on-exit on, plus the test rig that must turn it on
+to make pane_dead observable at all. That is why this is recorded and
+carried rather than fixed hot.
+
+Not fixed here. The fix has to give death its own edge rather than relying
+on a coincident rename: a bounded re-read of the pane row triggered by the
+pane's process exiting, or a window-level subscription that keeps ticking
+after the pane's process is gone. Recorded as a risk in STATUS.md and
+carried into the pane work, where the pane table is already being touched.
+The tmux-HEAD job stays continue-on-error: it did its job, which was to
+surface this at all.

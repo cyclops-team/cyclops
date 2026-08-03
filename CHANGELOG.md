@@ -5,6 +5,152 @@ versions are unreleased until admin cuts a tag.
 
 ## [Unreleased]
 
+### Added (M3: the stream UI, cyclops ui)
+
+- crates/cyclops-ui plus the `cyclops ui` verb (dispatch-only wiring in
+  the CLI): the live stream. Admin view by default and deliberately calm:
+  only messages addressed to admin, deliveries whose latest state is
+  attention_required or parked, agents entering a blocked_* state, gate
+  holds whose cause names a blocked pane, and every admin ping
+  (hook-unverified notices arrive as pings). A delivery held merely
+  because the recipient is mid-turn is routine and stays in the firehose.
+  The firehose (tab) shows every message, delivery transition, state
+  change, gate decision, and session event; a message to admin appears in
+  both views.
+- THE EYE in the header: `‿` closed when calm, `◑` opening at one
+  attention item, `◉` open with the count beside it (glyph set documented
+  with the theme tokens in cyclops-ui/src/theme.rs; colors ride eye.calm
+  and eye.alert). Attention items are currently-blocked agents plus
+  deliveries sitting in attention_required or parked_blocked_quota, keyed
+  per (recipient, message) so a later message to the same agent can never
+  clear an earlier one's item: only that delivery's own next transition
+  does, and both those states are terminal until an operator requeues. The
+  eye ticks through at most one intermediate frame per change on a single
+  one-shot timer; nothing animates continuously, nothing blinks. --plain
+  prints it as a word line ("eye opening · 1 needs attention").
+- Rendering on the GOALS grid: an aligned HH:MM:SS gutter with hanging
+  indents at the content column, role color and state glyph as the only
+  meaning-carrying encodings, delivery badges byte-identical to M1
+  receipts (pinned by tests against the CLI's exact strings), density
+  modes (c: comfortable with body lines and breathing room, compact one
+  line per entry). No reflow on arrival: autowrap is off (long lines clip,
+  never wrap), pinned-to-tail scrolls, and an unpinned viewport anchors to
+  an entry uid so arrivals append below it. Keys: tab view, w/f/t filter
+  input mirroring the history flags, up/down/end scroll and repin, enter
+  jump, c density, ? cheatsheet, q quit.
+- Data: events.subscribe live push plus a one-time ledger-tail backfill
+  (default 200 lines, --backfill N), merged behind a buffering intake
+  that dedupes by ledger seq when one session file exists. One status
+  request at startup seeds the label-to-pane map and current states.
+  All IO on separate tasks feeding one channel; the event loop never
+  blocks on the daemon, keypresses are handled between IO batches.
+- Fluidity, measured: 10,000-entry ring with windowed rendering; frame
+  build at 220x60 over the full ring is 0.33 to 0.35ms median in a debug
+  build across three runs, and 0.12ms for the admin view, which filters
+  the whole ring every frame; ingesting all 10,000 entries takes 3.2ms.
+  Budget is 16ms, one 60Hz frame; tests/perf.rs asserts and prints both.
+- Jump-to-pane: enter resolves the entry's agent through the harvested
+  pane map and calls the new cyclops-tmux `focus_pane` helper (one-shot
+  `tmux -u select-window` + `select-pane`, adapter-only rule intact,
+  proven against an isolated tmux server).
+- --plain, or a non-terminal stdin or stdout, degrades to a line-oriented
+  follow mode: backfill first, then each admitted event, eye word lines,
+  standard connection-loss copy and exit 1 when the daemon goes away.
+  Plain mode carries the same content as the sighted comfortable view,
+  message body lines included: it is the screen-reader path, so it is an
+  accessibility peer rather than a reduced view.
+  NO_COLOR is a color preference, not a mode: it keeps the full stream UI
+  and turns the color off. Every state pairs a glyph with a word, so the
+  UI is legible with no color at all, and conflating the two would have
+  cost a NO_COLOR user the eye, the filters, scrolling and the jump.
+  `cyclops ui --json` refuses and points at `cyclops watch --json`.
+- The TUI terminal layer is hand-rolled (termios raw mode, alternate
+  screen, single-write frames with per-line clears) behind a pure frame
+  builder: the offline build environment carries no TUI crates, so
+  ratatui/crossterm were not used; the backend is a thin seam if that
+  changes.
+- Tests: 42 cyclops-ui unit tests (classification, filters, eye, ring,
+  selection, exact frame strings at fixed sizes, badge-voice parity with
+  the CLI), the 10k fluidity measurement, 2 focus helper integration tests
+  on an isolated tmux server, and 5 headless end-to-end tests driving
+  `cyclops ui --plain` against a canned daemon over a scratch socket with
+  a fixture ledger (calm admin stream, firehose, filter, dedupe, honest
+  endings).
+- Docs: docs/ui.md; README ui row and crate row; ARCHITECTURE crate map
+  and zero-polling notes updated to the shipped M3 client.
+
+### Added (M3: theme engine)
+
+- crates/cyclops-theme: every color is a semantic token (role.1-8,
+  surface.dim, surface.accent, eye.calm, eye.alert, five state.* and four
+  badge.*, plus surface.fg as the engine's fallback for an
+  out-of-vocabulary name). Themes are data-only
+  TOML: values are "#rrggbb" or { hex, c256 }; an omitted 256-color
+  fallback is derived (nearest cube-or-ramp xterm entry, documented and
+  tested), unknown tokens warn, missing tokens fall back to a compiled
+  default table (the pre-M3 CLI palette), only broken TOML rejects a file.
+- The vocabulary is exactly what the renderers paint, and that now
+  includes state and badge color. GOALS says color must never be the only
+  encoding, which requires it to be REDUNDANT with the glyph and the word,
+  not absent. M3 first read that as "states are never colored" and dropped
+  the tokens; that reading was wrong and is reversed here. States and
+  badges resolve five state.* and four badge.* tokens grouped by what a
+  reader needs to tell apart, not one hue per state: healthy (working,
+  delivered), needs-you (blocked_modal, blocked_permission, attention),
+  terminal (blocked_quota, parked, the states that never retry
+  themselves), quiet (idle, queued, unknown) and a dimmer dead. Role hues
+  stay on the agent name alone, so the two encodings never share a cell.
+  Color stays redundant and is measured that way: under NO_COLOR, --plain
+  or Theme::none every state still carries its glyph and its word and
+  renders byte-identically. The CLI and the stream paint from the same
+  tokens through the same code, so the two surfaces cannot drift.
+  stream.* (3) and surface.bg stayed dropped: nothing paints a ground, and
+  the stream's gutter resolves surface.dim like every other detail column.
+  Naming a dropped token warns and is skipped.
+- themes/: dark (the shipped default; maps the usecyclops.dev terminal
+  identity, sage and mauve leading a muted eight-slot role wheel), light
+  (the site's light page palette at ink strength), high-contrast (white
+  and saturated grid-exact hues on the terminal's black; every value
+  clears WCAG AA against it, the dimmest at 7.5:1). Each file header
+  documents every mapping choice and why the absent groups are absent.
+- Selection: `theme = "name"` in config.toml, `CYCLOPS_THEME` env wins
+  over it; both accept a name in the themes dir (`~/.cyclops/themes`,
+  falling back to `./themes`) or a direct .toml path. Hot reload for
+  long-lived renderers is ThemeWatch: a (mtime, length) stat when an
+  event already woke the renderer, no watcher thread, no timer; edits to
+  the active theme apply on the next render.
+- cyclops/src/style.rs resolves through the theme engine; its public
+  surface (detect, none, role, accent, dim, bold, role_color) is
+  unchanged and every CLI render test passes untouched. Role labels now
+  hash into 8 palette slots instead of 6, so agents may land on different
+  colors than before (slot count is part of visual stability going
+  forward). cyclopsd recognizes the `theme` config key so a themed
+  config file does not warn.
+- Tests: 21 cyclops-theme unit tests (vocabulary and default table agree
+  and every token resolves to its own default, every documented token is
+  one a renderer paints, dropped tokens warn when named, 256-color
+  derivation, parse
+  tolerance, selection precedence, hot reload) plus 5 shipped-file tests
+  (the three themes load with zero warnings and cover every token, role
+  fallbacks stay pairwise distinct, non-role fallbacks match the
+  documented derivation, high-contrast is grid-exact throughout, and
+  docs/themes.md's token table is pinned to the vocabulary).
+- Docs: docs/themes.md; install.md theme key; ARCHITECTURE.md crate map.
+
+### Added (M3: integration)
+
+- demos/m3-stream.sh: the M3 surface live in one isolated rig: three
+  fixture panes (implementer, reviewer, builder), two `cyclops ui
+  --plain` followers capturing the admin stream and the firehose while
+  the panes generate an agent-to-agent review request, a title-driven
+  blocked_permission and its clear (the eye opening and closing as word
+  lines), and a message to admin that lands in both views with its
+  honest attention_required delivery and admin ping. A late viewer then
+  backfills from the ledger tail with --with filtering, and stopping the
+  daemon proves the connection-loss copy and exit 1. Twelve checks pin
+  the contract in the captured logs; the full-screen TUI is the manual
+  half, printed as a command to try in a real terminal.
+
 ### Added (M2: messaging read side, history + thread)
 
 - Daemon msg.history: filter the message record (with = from-or-to,

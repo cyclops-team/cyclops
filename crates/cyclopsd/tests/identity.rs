@@ -6,13 +6,15 @@
 //! pane's pane_pid.
 //!
 //! Never touches the user's tmux: every tmux call carries
-//! `-L cyc-id-<pid> -f /dev/null`, and the server is killed in teardown.
+//! `-L cyc-id-<pid> -f /dev/null` through cyclops-testrig, which kills
+//! the server and unlinks its socket on drop.
 //! Skips cleanly when tmux is not on PATH. The retry loops are test-side
 //! waits for process spawns, outside the daemon's zero-polling contract.
 
 use std::process::Command;
 use std::time::Duration;
 
+use cyclops_testrig::{tmux_available, TmuxServer};
 use cyclops_tmux::{ControlConfig, SessionWatcher};
 use cyclopsd::identity::{peer_of, resolve_sender, Sender};
 use tokio::net::UnixStream;
@@ -27,40 +29,6 @@ async fn peer_of_reports_own_uid_and_pid_over_socketpair() {
         let (peer_uid, peer_pid) = peer_of(end).expect("peer_of");
         assert_eq!(peer_uid, uid);
         assert_eq!(peer_pid, me);
-    }
-}
-
-fn tmux_available() -> bool {
-    Command::new("tmux")
-        .arg("-V")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Isolated tmux server, killed on drop.
-struct TmuxGuard {
-    socket: String,
-}
-
-impl TmuxGuard {
-    // -u everywhere: without it tmux sanitizes tabs/non-ASCII to '_' in
-    // non-UTF-8 environments (findings F14).
-    fn run(&self, args: &[&str]) {
-        let status = Command::new("tmux")
-            .args(["-u", "-L", &self.socket, "-f", "/dev/null"])
-            .args(args)
-            .status()
-            .expect("run tmux");
-        assert!(status.success(), "tmux {args:?} failed");
-    }
-}
-
-impl Drop for TmuxGuard {
-    fn drop(&mut self) {
-        let _ = Command::new("tmux")
-            .args(["-L", &self.socket, "kill-server"])
-            .output();
     }
 }
 
@@ -112,10 +80,8 @@ async fn ancestry_walk_resolves_real_child_in_pane() {
         eprintln!("skipping identity integration test: tmux not on PATH");
         return;
     }
-    let tmux = TmuxGuard {
-        socket: format!("cyc-id-{}", std::process::id()),
-    };
-    tmux.run(&[
+    let tmux = TmuxServer::new("id");
+    tmux.run_ok(&[
         "new-session",
         "-d",
         "-s",
@@ -130,15 +96,15 @@ async fn ancestry_walk_resolves_real_child_in_pane() {
     // The watcher supplies pane_id and pane_pid exactly the way the daemon
     // will feed them to resolve_sender.
     let cfg = ControlConfig::attach("idsess")
-        .on_socket(tmux.socket.clone())
+        .on_socket(tmux.socket().to_string())
         .with_config_file("/dev/null");
     let w = SessionWatcher::connect(cfg).await.expect("connect watcher");
     let row = w.snapshot().into_iter().next().expect("one pane");
     assert!(row.pane_pid > 0, "pane_pid must be real: {row:?}");
 
-    // Long enough to survive a loaded CI box; the kill-server teardown
-    // reaps it early on every normal run.
-    tmux.run(&["send-keys", "-t", "idsess", "sleep 30", "Enter"]);
+    // Long enough to survive a loaded CI box; teardown reaps it early on
+    // every normal run.
+    tmux.run_ok(&["send-keys", "-t", "idsess", "sleep 30", "Enter"]);
 
     // Bounded wait for the shell to spawn sleep (test-side only).
     let mut sleep_pid = None;

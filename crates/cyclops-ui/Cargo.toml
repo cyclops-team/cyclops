@@ -1,0 +1,17 @@
+[package]
+name = "cyclops-ui"
+version.workspace = true
+edition.workspace = true
+description = "The Cyclops stream UI: admin view, firehose, the eye. Reads the socket and the ledger only."
+
+[dependencies]
+cyclops-proto.workspace = true
+cyclops-ledger.workspace = true
+cyclops-theme.workspace = true
+cyclops-tmux.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

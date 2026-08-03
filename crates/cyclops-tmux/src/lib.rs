@@ -16,11 +16,14 @@
 //!   3.6a) push per-pane field changes; structural notifications are hints
 //!   that trigger debounced reconciliation against `list-panes`.
 //! - [`TmuxVersion`]: version probe and feature gates.
+//! - [`focus_pane`]: one-shot focus jump for the stream UI, outside
+//!   control mode on purpose (a user gesture, not daemon state).
 //!
 //! Everything can fail with [`TmuxError`].
 
 pub mod control;
 pub mod error;
+pub mod focus;
 pub mod notify;
 pub mod quote;
 pub mod version;
@@ -28,6 +31,7 @@ pub mod watcher;
 
 pub use control::{ControlClient, ControlConfig, ControlMode};
 pub use error::TmuxError;
+pub use focus::focus_pane;
 pub use notify::Notification;
 pub use quote::quote_arg;
 pub use version::TmuxVersion;

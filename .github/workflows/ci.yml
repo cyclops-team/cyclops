@@ -43,6 +43,19 @@ jobs:
       - name: commPact shim tests
         if: ${{ !cancelled() }}
         run: python3 scripts/commpact-shim/test_shim.py
+      # F24: every scratch path comes from cyclops_proto::scratch, so the
+      # whole suite has to run with that root relocated or the rule can rot
+      # unnoticed. The binaries are already built; this is a second test
+      # execution, not a second build. On macOS the relocated root is the
+      # code path Linux takes, which is the case that broke CI twice.
+      - name: tests with the scratch root relocated
+        if: ${{ !cancelled() }}
+        env:
+          CYCLOPS_TEST_TMP: ${{ runner.os == 'macOS' && '/private/var/tmp/cyc-relocated' || '/tmp/cyc-relocated' }}
+        run: |
+          mkdir -p "$CYCLOPS_TEST_TMP"
+          cargo test --workspace --no-fail-fast
+          python3 scripts/commpact-shim/test_shim.py
 
   # ADR-001 owns the tmux-churn risk by testing the adapter against tmux HEAD.
   # Failures here are early warning, not merge blockers.

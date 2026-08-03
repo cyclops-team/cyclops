@@ -17,7 +17,8 @@ or delivered_unverified; a leg parked by vendor quota counts as complete at
 the parking point. attention_required or a stuck delivery is a FAILURE.
 
 Isolation: tmux -u -L cyc-soak-<pid> -f /dev/null (F14), scratch
-CYCLOPS_HOME under /private/tmp, everything killed in teardown. Never
+CYCLOPS_HOME under the shared scratch root, and teardown through
+demos/lib.sh so the server's socket file goes with the server. Never
 touches the user's tmux server. Driver-side wait loops are test-side waits,
 outside the daemon's zero-polling contract.
 
@@ -38,7 +39,6 @@ import shlex
 import shutil
 import socket
 import subprocess
-import tempfile
 import sys
 import threading
 import time
@@ -49,12 +49,27 @@ CYCLOPSD = os.path.join(REPO, "target/release/cyclopsd")
 MANIFESTS = os.path.join(REPO, "manifests")
 RAW = os.environ.get("CYC_SOAK_RAW", os.path.join(REPO, "tests/raw/m1-soak"))
 PID = os.getpid()
-# /private/tmp is macOS only; elsewhere the system temp dir is already
-# short enough for a daemon socket. CYCLOPS_TEST_TMP overrides both.
-TMPROOT = os.environ.get("CYCLOPS_TEST_TMP") or (
-    "/private/tmp" if os.path.isdir("/private/tmp") else tempfile.gettempdir()
-)
-SCRATCH = os.path.join(TMPROOT, f"cyc-m1-soak-{PID}")
+# The shell home of the two rules that keep leaking when they are copied:
+# where throwaway scratch goes, and how an isolated tmux server is torn
+# down. Rust has crates/cyclops-testrig, bash has this file, and python
+# gets neither by holding a third copy.
+LIB_SH = os.path.join(REPO, "demos", "lib.sh")
+
+
+def shared_rule(func, *args, env=None):
+    """Run one function from demos/lib.sh; return its stdout, trimmed.
+
+    Sourcing the file and calling the function is the whole bridge: the
+    rule itself stays in one place, so an edit there reaches this driver
+    without anyone remembering that it exists.
+    """
+    r = subprocess.run(["bash", "-c", '. "$1"; shift; "$@"', "bash",
+                        LIB_SH, func, *args],
+                       capture_output=True, text=True, env=env)
+    return r.stdout.strip()
+
+
+SCRATCH = os.path.join(shared_rule("cyc_scratch_root"), f"cyc-m1-soak-{PID}")
 HOME = os.path.join(SCRATCH, "home")
 SOCK = f"cyc-soak-{PID}"
 SESSION = "soak"
@@ -101,6 +116,17 @@ def tmux(*args, check=False):
     if check and r.returncode != 0:
         raise RuntimeError(f"tmux {args}: {r.stderr.strip()}")
     return r
+
+
+def tmux_teardown():
+    """Stop the soak's tmux server and remove its socket file.
+
+    Stopping a server unlinks nothing, so killing it and stopping there
+    left one dead cyc-soak-<pid> socket in the tmux tmpdir per run. The
+    rule that handles it, including the case where the server is already
+    gone, lives in demos/lib.sh.
+    """
+    shared_rule("cyc_tmux_teardown", SOCK, env=clean_env())
 
 
 def capture(target):
@@ -733,7 +759,7 @@ def main():
                 daemon.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 daemon.kill()
-        tmux("kill-server")
+        tmux_teardown()
         for name in ("daemon.log",):
             src = os.path.join(SCRATCH, name)
             if os.path.exists(src):

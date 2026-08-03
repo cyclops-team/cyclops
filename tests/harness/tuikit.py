@@ -15,10 +15,8 @@ the default tmux server.
 import subprocess, os, time, json, tempfile
 
 SOCK = os.environ.get("CYC_HARNESS_SOCK", "cyc-harness")
-RAW = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "tests", "raw",
-)
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+RAW = os.path.join(REPO, "tests", "raw")
 
 def raw_dir():
     """Probe artifact directory, created on demand. Gitignored."""
@@ -54,6 +52,21 @@ def launch(session, cmd, cwd, w=120, h=40):
 
 def kill(session):
     tmux("kill-session", "-t", session)
+
+def teardown():
+    """Stop the isolated server and remove the socket file it leaves behind.
+
+    Stopping a tmux server unlinks nothing, and a server that exits on its
+    own leaves the file too (both MEASURED), so a probe that only stopped
+    the server left one dead socket in the tmux tmpdir per run. The rule,
+    including the case where the server is already gone by then, lives in
+    demos/lib.sh; python calls it instead of keeping a copy, which
+    crates/cyclops-testrig/tests/teardown_has_one_home.rs enforces.
+    """
+    subprocess.run(["bash", "-c", '. "$1"; shift; "$@"', "bash",
+                    os.path.join(REPO, "demos", "lib.sh"),
+                    "cyc_tmux_teardown", SOCK],
+                   capture_output=True, text=True, env=clean_env())
 
 def capture(target, tail=None):
     r = tmux("capture-pane", "-p", "-t", target)

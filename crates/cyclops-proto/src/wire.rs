@@ -99,6 +99,21 @@ pub struct PingResult {
     pub ts: u64,
 }
 
+/// `status` params. Absent on every caller that predates the field, which
+/// is why every member defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StatusParams {
+    /// Ask for [`StatusResult::open_deliveries`]. Off by default because
+    /// answering it folds the session ledgers.
+    ///
+    /// Any caller that SHOWS the eye must ask: half the rule
+    /// ([`crate::attention`]) lives in this field, and an answer without
+    /// it counts blocked panes alone. A caller that only reads pane state
+    /// pays nothing by leaving it off.
+    #[serde(default)]
+    pub open_deliveries: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResult {
     pub daemon_version: String,
@@ -107,6 +122,33 @@ pub struct StatusResult {
     pub uptime_ms: u64,
     pub tmux_version: String,
     pub sessions: Vec<SessionStatus>,
+    /// Deliveries whose latest recorded state still needs a human, folded
+    /// from the whole record rather than a recent window, so age never
+    /// hides one. Served only when [`StatusParams::open_deliveries`] asked
+    /// for it. Additive optional field: old daemons omit it, old clients
+    /// ignore it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_deliveries: Vec<OpenDelivery>,
+}
+
+/// One delivery still waiting on a human: redelivery exhausted, or a quota
+/// park (which never auto-retries, so nothing but an operator moves it).
+///
+/// Identity is (to, id), the same pair the delivery chain carries in the
+/// ledger, so a client can match a seeded item against the transitions it
+/// later sees on the wire and clear it on the right one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenDelivery {
+    /// Message id this delivery belongs to, e.g. "m-3f9c2a".
+    pub id: String,
+    /// Recipient as addressed.
+    pub to: String,
+    pub state: crate::ledger::DeliveryState,
+    /// Unix ms of the transition that left it here.
+    pub ts: u64,
+    /// Machine-readable cause, the same one the ledger record carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -422,5 +464,37 @@ mod tests {
     fn missing_params_defaults_to_null() {
         let req: Request = serde_json::from_str(r#"{"id":"a","method":"status"}"#).unwrap();
         assert!(req.params.is_null());
+    }
+
+    /// The open-delivery seed is additive in both directions: a daemon that
+    /// predates it omits the field, and a client that predates it omits the
+    /// param. Neither side may fail on the other's absence.
+    #[test]
+    fn open_deliveries_is_additive_and_absence_tolerant() {
+        let old = r#"{"daemon_version":"0.1.0","proto":1,"boot_id":"b","uptime_ms":1,
+            "tmux_version":"3.6a","sessions":[]}"#;
+        let s: StatusResult = serde_json::from_str(old).expect("old status still decodes");
+        assert!(s.open_deliveries.is_empty());
+        // Nothing open serializes to nothing on the wire.
+        assert!(!serde_json::to_string(&s)
+            .unwrap()
+            .contains("open_deliveries"));
+
+        let p: StatusParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!p.open_deliveries, "the seed is opt-in");
+        let p: StatusParams =
+            serde_json::from_value(serde_json::json!({"open_deliveries": true})).unwrap();
+        assert!(p.open_deliveries);
+
+        let d = OpenDelivery {
+            id: "m-aaaaaa".into(),
+            to: "implementer".into(),
+            state: crate::ledger::DeliveryState::ParkedBlockedQuota,
+            ts: 1_754_000_002_600,
+            cause: Some("blocked_quota".into()),
+        };
+        let back: OpenDelivery = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
+        assert_eq!(back.state, crate::ledger::DeliveryState::ParkedBlockedQuota);
+        assert_eq!(back.to, "implementer");
     }
 }

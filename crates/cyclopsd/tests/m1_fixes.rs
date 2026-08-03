@@ -32,7 +32,7 @@ async fn send_and_wait_starts_after_delivery_resolution() {
     rig.label(&pane, "waity").await;
 
     // Release the pane 400ms in, while msg.send is blocked on the wait.
-    let socket = rig.tmux.socket.clone();
+    let socket = rig.tmux.socket().to_string();
     let pane_for_release = pane.clone();
     let releaser = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(400));
@@ -171,12 +171,12 @@ async fn restart_closes_limbo_deliveries() {
 /// Rename the session away and detach the daemon's control client: a
 /// scripted, held-open detach. Rename back to let it reattach.
 fn scripted_detach(rig: &Rig, session: &str, hidden: &str) {
-    rig.tmux.run(&["rename-session", "-t", session, hidden]);
-    rig.tmux.run(&["detach-client", "-s", hidden]);
+    rig.tmux.run_ok(&["rename-session", "-t", session, hidden]);
+    rig.tmux.run_ok(&["detach-client", "-s", hidden]);
 }
 
 fn scripted_reattach(rig: &Rig, hidden: &str, session: &str) {
-    rig.tmux.run(&["rename-session", "-t", hidden, session]);
+    rig.tmux.run_ok(&["rename-session", "-t", hidden, session]);
 }
 
 /// Fix E part 3: a hook report arriving while the session is detached must
@@ -556,9 +556,14 @@ async fn long_gate_hold_notifies_the_admin_once() {
         .await;
     assert_eq!(notify["data"]["level"], "action_required", "{notify}");
     assert!(notify["data"]["body"].as_str().unwrap().contains(&msg_id));
+    // It names the delivery it is about, which is still gating and so is
+    // nobody's to clear: a reader's calm view keeps this out until the
+    // delivery itself lands in a state the rule counts.
+    assert_eq!(notify["data"]["to"], "held", "{notify}");
+    assert_eq!(notify["data"]["id"], msg_id.as_str(), "{notify}");
 
     // Release: the held delivery proceeds on the state change.
-    rig.tmux.run(&["send-keys", "-t", &pane, "x", "Enter"]);
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
     rig.ev
         .wait_event(Duration::from_secs(10), |e| {
             e["event"] == "delivery-state"

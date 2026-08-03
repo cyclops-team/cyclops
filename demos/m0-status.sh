@@ -3,7 +3,8 @@
 # and `cyclops ping` against it.
 #
 # Never touches the default tmux server. Everything runs on a private server
-# (tmux -L cyc-demo-$$ -f /dev/null) with a throwaway CYCLOPS_HOME, both
+# (tmux -u -L cyc-demo-$$ -f /dev/null, -u per finding F14) with a throwaway
+# CYCLOPS_HOME, both
 # removed by the EXIT trap. Safe to run repeatedly.
 #
 # cyclopsd and cyclops are implemented in parallel with this script; it is
@@ -15,17 +16,17 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SOCK="cyc-demo-$$"
 SESSION="demo"
-# /private/tmp is macOS only and keeps socket paths short; elsewhere the
-# system temp dir is already short. CYCLOPS_TEST_TMP overrides both.
-TMPROOT="${CYCLOPS_TEST_TMP:-$([ -d /private/tmp ] && echo /private/tmp || echo "${TMPDIR:-/tmp}")}"
-CYCLOPS_HOME="$(mktemp -d "$TMPROOT/cyclops-demo.XXXXXX")"
+# The scratch root and the tmux teardown rule are shared, not copied.
+# shellcheck source=demos/lib.sh
+. "$(cd "$(dirname "$0")" && pwd)/lib.sh"
+CYCLOPS_HOME="$(mktemp -d "$(cyc_scratch_root)/cyclops-demo.XXXXXX")"
 export CYCLOPS_HOME
 DAEMON_PID=""
 
 cd "$REPO"
 
 # Every tmux call in this script goes through the isolated socket.
-tmx() { command tmux -L "$SOCK" "$@"; }
+tmx() { command tmux -u -L "$SOCK" "$@"; }
 
 cleanup() {
   if [ -n "$DAEMON_PID" ]; then
@@ -34,16 +35,16 @@ cleanup() {
     kill "$DAEMON_PID" 2>/dev/null || true
     wait "$DAEMON_PID" 2>/dev/null || true
   fi
-  tmx kill-server 2>/dev/null || true
+  cyc_tmux_teardown "$SOCK"
   rm -rf "$CYCLOPS_HOME"
 }
 trap cleanup EXIT
 
 echo "== demo home:   $CYCLOPS_HOME (removed on exit)"
-echo "== tmux server: -L $SOCK (isolated, killed on exit)"
+echo "== tmux server: -L $SOCK (isolated, removed on exit)"
 
 # Isolated server, session "demo", two shell panes with titles.
-command tmux -f /dev/null -L "$SOCK" new-session -d -s "$SESSION" -x 180 -y 45
+command tmux -u -f /dev/null -L "$SOCK" new-session -d -s "$SESSION" -x 180 -y 45
 tmx split-window -h -t "$SESSION"
 tmx select-pane -t "$SESSION.0" -T "implementer"
 tmx select-pane -t "$SESSION.1" -T "reviewer"

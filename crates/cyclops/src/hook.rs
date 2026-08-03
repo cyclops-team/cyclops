@@ -204,7 +204,11 @@ mod tests {
 
     #[test]
     fn seq_counter_starts_at_one_and_advances() {
-        let home = std::env::temp_dir().join(format!("cyc-hookseq-{}", std::process::id()));
+        // Scratch state goes through the shared root (F24), not the OS
+        // temp dir, so CYCLOPS_TEST_TMP relocates this test with the rest.
+        // That the root really relocates is proven once, in cyclopsd's
+        // scratch_override test.
+        let home = cyclops_proto::scratch::scratch_dir("cyc-hookseq");
         let _ = fs::remove_dir_all(&home);
         assert_eq!(next_seq(&home, "reviewer").unwrap(), 1);
         assert_eq!(next_seq(&home, "reviewer").unwrap(), 2);

@@ -7,8 +7,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+/// Scratch home unique per test and process, under the relocatable
+/// scratch root rather than the OS temp dir (F24), so CYCLOPS_TEST_TMP
+/// moves this suite's state with the rest of the workspace. That the root
+/// really relocates is proven once, in cyclopsd's scratch_override test;
+/// restating it here as a starts_with could not fail.
 fn scratch_home(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("cyc-{}-{}", tag, std::process::id()));
+    let dir = cyclops_proto::scratch::scratch_dir(&format!("cyc-{tag}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create scratch home");
     dir

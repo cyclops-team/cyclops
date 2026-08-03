@@ -5,8 +5,13 @@ members = [
     "crates/cyclops-manifest",
     "crates/cyclops-tmux",
     "crates/cyclops-ledger",
+    "crates/cyclops-theme",
+    "crates/cyclops-ui",
     "crates/cyclopsd",
     "crates/cyclops",
+    # Test-only: the isolated tmux server and its teardown rule, in one
+    # place because the sites that need it span crates and test kinds.
+    "crates/cyclops-testrig",
 ]
 
 # The production landing page for usecyclops.dev lives at frontend/ as a
@@ -35,6 +40,9 @@ cyclops-proto = { path = "crates/cyclops-proto" }
 cyclops-manifest = { path = "crates/cyclops-manifest" }
 cyclops-tmux = { path = "crates/cyclops-tmux" }
 cyclops-ledger = { path = "crates/cyclops-ledger" }
+cyclops-theme = { path = "crates/cyclops-theme" }
+cyclops-ui = { path = "crates/cyclops-ui" }
+cyclops-testrig = { path = "crates/cyclops-testrig" }
 
 [profile.release]
 lto = "thin"

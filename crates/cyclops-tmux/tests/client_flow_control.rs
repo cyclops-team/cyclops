@@ -13,7 +13,7 @@ async fn pause_after_flag_is_accepted() {
     };
     // NewSession mode: the control client creates the session itself.
     let cfg = ControlConfig::new_session("fc")
-        .on_socket(srv.sock.clone())
+        .on_socket(srv.sock().to_string())
         .with_config_file("/dev/null");
     let (client, _notif) = ControlClient::spawn(cfg).await.expect("spawn");
 

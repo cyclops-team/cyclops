@@ -335,6 +335,17 @@ impl Daemon {
         self.inner.events.subscribe()
     }
 
+    /// In-process `status`, byte for byte the answer the socket serves.
+    ///
+    /// The eye's whole register comes from this one answer, so a test that
+    /// drives the daemon and then hand-builds a snapshot proves nothing
+    /// about what a reader sees. `open_deliveries` is the delivery half of
+    /// the count (`cyclops_proto::attention`); any caller drawing the eye
+    /// asks for it.
+    pub fn status(&self, open_deliveries: bool) -> cyclops_proto::StatusResult {
+        server::status_result(&self.inner, open_deliveries)
+    }
+
     /// In-process msg.send with an already-resolved sender. The socket
     /// path resolves the sender from peer credentials first; embedders and
     /// tests supply it directly.
@@ -377,6 +388,7 @@ impl Daemon {
             &params.body,
             None,
             None,
+            delivery::About::default(),
         );
         Ok(json!({"notified": true, "seq": seq}))
     }
@@ -837,6 +849,23 @@ async fn handle_pane_event(
                 .expect("argv cache lock")
                 .retain(|(pane, _), _| pane != &id);
             inner.hook_liveness.forget(&id);
+            // The pane's last transition, and the only one a subscriber
+            // can hear: every other event names a pane that still exists.
+            // A client counting what needs a human takes its roster from
+            // one `status` answer at startup and moves it on events after
+            // that (cyclops_proto::attention), so without this edge a pane
+            // that blocked and then closed stays counted for the life of
+            // the client. Additive: an older client renders it and moves
+            // on, and a client watching an older daemon never hears it.
+            inner.emit(
+                "pane-removed",
+                json!({
+                    "ts": unix_ms(),
+                    "session": watcher.session(),
+                    "pane_id": id,
+                }),
+                None,
+            );
             false
         }
         PaneEvent::PaneChanged { id, changed, .. } => {

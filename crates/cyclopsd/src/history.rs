@@ -20,7 +20,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use cyclops_proto::{HistoryParams, HistoryResult, Kind, LedgerLine, ThreadResult, WireError};
+use cyclops_proto::{
+    HistoryParams, HistoryResult, Kind, LedgerLine, OpenDelivery, ThreadResult, WireError,
+};
 use serde_json::Value;
 use tracing::warn;
 
@@ -211,7 +213,7 @@ fn caller_name(inner: &Arc<Inner>, peer: Peer) -> Result<String, WireError> {
 /// Every session ledger replayed, in session order. A file that fails to
 /// read degrades to empty with a warning: one corrupt file must not blind
 /// the query to the others.
-fn read_all_sessions(inner: &Arc<Inner>) -> Vec<Vec<LedgerLine>> {
+fn read_all_sessions(inner: &Inner) -> Vec<Vec<LedgerLine>> {
     inner
         .sessions
         .iter()
@@ -308,6 +310,36 @@ pub(crate) fn merge_files(files: &[Vec<LedgerLine>]) -> Vec<LedgerLine> {
     }
     sort_lines(&mut merged);
     merged
+}
+
+/// Every delivery whose latest folded state still needs a human, oldest
+/// first. Same read model `msg.history` uses, so the answer does not
+/// depend on how much of the record a caller happens to be holding: a
+/// quota park from hours ago reads exactly like one from a second ago.
+pub(crate) fn open_deliveries(inner: &Inner) -> Vec<OpenDelivery> {
+    open_from(&read_all_sessions(inner))
+}
+
+/// The fold half of [`open_deliveries`], split out so it tests on files.
+pub(crate) fn open_from(files: &[Vec<LedgerLine>]) -> Vec<OpenDelivery> {
+    let mut out = Vec::new();
+    for msg in merge_files(files) {
+        for d in &msg.deliveries {
+            // The rule lives in cyclops_proto::attention and is read, not
+            // restated: the daemon's answer and the eye that draws it must
+            // never disagree about what an open delivery is.
+            if cyclops_proto::delivery_needs_human(d.state) {
+                out.push(OpenDelivery {
+                    id: msg.id.clone(),
+                    to: d.to.clone(),
+                    state: d.state,
+                    ts: d.ts,
+                    cause: d.cause.clone(),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Order lines oldest first. ts is the cross-file comparator; seq breaks
@@ -601,6 +633,32 @@ mod tests {
 
         // In-flight chains fold too; history may honestly show mid-pipeline.
         assert_eq!(msgs[4].deliveries[0].state, DeliveryState::Gating);
+    }
+
+    /// The attention seed the stream UI starts from. It must find both
+    /// unresolved deliveries in the fixture wherever they sit in the file,
+    /// and nothing that resolved itself.
+    #[test]
+    fn open_deliveries_are_the_two_states_a_human_must_clear() {
+        let open = open_from(&[fixture()]);
+        let got: Vec<(&str, &str, DeliveryState)> = open
+            .iter()
+            .map(|d| (d.id.as_str(), d.to.as_str(), d.state))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("m-bbbbbb", "implementer", DeliveryState::ParkedBlockedQuota),
+                ("m-dddddd", "admin", DeliveryState::AttentionRequired),
+            ]
+        );
+        // The transition timestamp travels with it: the item is as old as
+        // the record says, not as old as the query.
+        assert_eq!(open[0].ts, 1_754_000_002_600);
+        // Delivered and in-flight chains are nobody's to clear.
+        assert!(open
+            .iter()
+            .all(|d| d.id != "m-aaaaaa" && d.id != "m-eeeeee"));
     }
 
     #[test]

@@ -144,6 +144,9 @@ dependencies = [
  "anyhow",
  "clap",
  "cyclops-proto",
+ "cyclops-theme",
+ "cyclops-ui",
+ "libc",
  "serde_json",
 ]
 
@@ -180,14 +183,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "cyclops-testrig"
+version = "0.1.0"
+
+[[package]]
+name = "cyclops-theme"
+version = "0.1.0"
+dependencies = [
+ "cyclops-proto",
+ "tempfile",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "cyclops-tmux"
 version = "0.1.0"
 dependencies = [
  "cyclops-proto",
+ "cyclops-testrig",
  "thiserror",
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "cyclops-ui"
+version = "0.1.0"
+dependencies = [
+ "cyclops-ledger",
+ "cyclops-proto",
+ "cyclops-theme",
+ "cyclops-tmux",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -199,7 +231,9 @@ dependencies = [
  "cyclops-ledger",
  "cyclops-manifest",
  "cyclops-proto",
+ "cyclops-testrig",
  "cyclops-tmux",
+ "cyclops-ui",
  "libc",
  "serde",
  "serde_json",

@@ -19,9 +19,9 @@ use serde_json::{json, Value};
 
 use client::{Client, ClientError};
 use cyclops_proto::{
-    DeliveryReceipt, DeliveryState, Event, HistoryParams, HistoryResult, MsgSendParams,
-    MsgSendResult, PaneReadParams, PaneReadResult, PaneReadSource, StatusResult, SubscribeParams,
-    ThreadResult, WaitSpec, WaitUntil, PROTOCOL_VERSION,
+    delivery_needs_human, DeliveryReceipt, DeliveryState, Event, HistoryParams, HistoryResult,
+    MsgSendParams, MsgSendResult, PaneReadParams, PaneReadResult, PaneReadSource, StatusResult,
+    SubscribeParams, ThreadResult, WaitSpec, WaitUntil, PROTOCOL_VERSION,
 };
 use style::Style;
 
@@ -102,6 +102,9 @@ enum Cmd {
         #[arg(long, default_value = WAIT_TIMEOUT_DEFAULT)]
         timeout: String,
     },
+    /// Live stream of the record: admin view by default, firehose one
+    /// keypress away, the eye in the header. --plain follows line by line.
+    Ui(UiArgs),
     /// Relay a vendor hook event to cyclops. Silent, always exits 0.
     Hook {
         /// Event name, e.g. Stop. An argument because agy payloads carry
@@ -146,6 +149,25 @@ enum HooksCmd {
         /// Agent label or pane id.
         target: String,
     },
+}
+
+#[derive(clap::Args)]
+struct UiArgs {
+    /// Start in the firehose: every message and state event live.
+    #[arg(long)]
+    firehose: bool,
+    /// Only entries involving this agent (either direction).
+    #[arg(long, conflicts_with_all = ["from", "to"])]
+    with: Option<String>,
+    /// Only messages from this sender.
+    #[arg(long)]
+    from: Option<String>,
+    /// Only messages to this recipient.
+    #[arg(long)]
+    to: Option<String>,
+    /// Ledger lines replayed for backfill before going live.
+    #[arg(long, default_value_t = 200)]
+    backfill: usize,
 }
 
 #[derive(clap::Args)]
@@ -298,25 +320,39 @@ fn main() {
     std::process::exit(code);
 }
 
-fn run(cli: &Cli) -> i32 {
+/// Human output style, built only where something is about to be
+/// rendered. [`Style::detect`] reads the theme file and prints its
+/// warnings, so a command that renders nothing must never call it: see the
+/// hook and ui arms in [`run`].
+fn style_for(cli: &Cli) -> Style {
     // Machine output never decorates, whatever the terminal supports.
-    let style = if cli.json {
+    if cli.json {
         Style::none()
     } else {
         Style::detect(cli.plain)
-    };
+    }
+}
+
+fn run(cli: &Cli) -> i32 {
     match &cli.cmd {
         // Hook never prints and owns its transport handling: a hook that
-        // fails loudly breaks the vendor CLI that invoked it.
+        // fails loudly breaks the vendor CLI that invoked it. No Style is
+        // built on this path, so a broken theme file cannot put a warning
+        // on the vendor CLI's stderr.
         Cmd::Hook { event, agent } => hook::run(event, agent.as_deref()),
+        // The stream UI owns its own daemon connections, terminal, and
+        // theme (cyclops-ui's Theme::detect); dispatch only hands the
+        // flags over. Building a Style here warned about the same file
+        // twice.
+        Cmd::Ui(args) => cmd_ui(cli, args),
         // Send and wait validate usage before touching the daemon, so
         // usage errors don't hide behind a down daemon.
-        Cmd::Send(args) => cmd_send(cli, &style, args),
+        Cmd::Send(args) => cmd_send(cli, &style_for(cli), args),
         Cmd::Wait {
             target,
             until,
             timeout,
-        } => cmd_wait(cli, &style, target, *until, timeout),
+        } => cmd_wait(cli, &style_for(cli), target, *until, timeout),
         // Install renders and instructs without a daemon; verify and
         // selftest ask the daemon for hook liveness.
         Cmd::Hooks {
@@ -339,6 +375,7 @@ fn run(cli: &Cli) -> i32 {
                 Ok(c) => c,
                 Err(code) => return code,
             };
+            let style = style_for(cli);
             match &cli.cmd {
                 Cmd::Status => cmd_status(&mut c, cli, &style),
                 Cmd::Ping => cmd_ping(&mut c, cli, &style),
@@ -356,12 +393,36 @@ fn run(cli: &Cli) -> i32 {
                 Cmd::Hooks {
                     cmd: HooksCmd::Selftest { target },
                 } => hookset::run_selftest(&mut c, cli.json, &style, target),
-                Cmd::Send(_) | Cmd::Hook { .. } | Cmd::Wait { .. } | Cmd::Hooks { .. } => {
+                Cmd::Send(_)
+                | Cmd::Hook { .. }
+                | Cmd::Wait { .. }
+                | Cmd::Hooks { .. }
+                | Cmd::Ui(_) => {
                     unreachable!("handled above")
                 }
             }
         }
     }
+}
+
+/// cyclops ui: hand over to cyclops-ui. --plain follows line by line, and
+/// so does a run with no terminal to take over. NO_COLOR does not: it
+/// turns the paint off and leaves the full-screen view standing, because
+/// every state there pairs a glyph with a word. --json has no meaning
+/// here; the machine stream is cyclops watch --json.
+fn cmd_ui(cli: &Cli, args: &UiArgs) -> i32 {
+    if cli.json {
+        eprintln!("cyclops ui has no --json form. The machine stream is: cyclops watch --json");
+        return EXIT_USAGE;
+    }
+    cyclops_ui::run(cyclops_ui::UiOptions {
+        plain: cli.plain,
+        firehose: args.firehose,
+        with: args.with.clone(),
+        from: args.from.clone(),
+        to: args.to.clone(),
+        backfill: args.backfill,
+    })
 }
 
 /// Connect and check the hello. A protocol mismatch warns once on stderr
@@ -382,8 +443,22 @@ fn connect() -> Result<Client, i32> {
     }
 }
 
+/// `status` params for a surface that SHOWS the eye.
+///
+/// Half the rule is the open-delivery backlog, and the daemon folds it
+/// only for a caller that asks (`cyclops_proto::StatusParams`). Asking
+/// with an empty object served the pane half alone, so this grid counted
+/// blocked panes while `cyclops ui` counted both against the same daemon
+/// at the same instant, and the two eyes contradicted each other.
+fn eye_status_params() -> Value {
+    serde_json::to_value(cyclops_proto::StatusParams {
+        open_deliveries: true,
+    })
+    .expect("status params serialize")
+}
+
 fn cmd_status(c: &mut Client, cli: &Cli, style: &Style) -> i32 {
-    let result = match c.request("status", json!({})) {
+    let result = match c.request("status", eye_status_params()) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{}", copy::client_error(&e, None));
@@ -732,29 +807,27 @@ fn read_body_file(path: &str) -> Result<String, String> {
 }
 
 /// Scripts branch on this: delivered, queued, and in-flight states exit 0;
-/// parked and needs-attention exit 1.
+/// anything the pipeline cannot leave on its own exits 1.
+///
+/// Which states those are is the rule's delivery half and is not decided
+/// here: `cyclops_proto::delivery_needs_human` is the same predicate the
+/// eye counts by and the daemon folds `status` by, so an exit code and an
+/// eye can never disagree about one delivery.
 fn receipts_exit(ds: &[DeliveryReceipt]) -> i32 {
-    let bad = ds.iter().any(|d| {
-        matches!(
-            d.state,
-            DeliveryState::ParkedBlockedQuota | DeliveryState::AttentionRequired
-        )
-    });
-    i32::from(bad)
+    i32::from(ds.iter().any(|d| delivery_needs_human(d.state)))
 }
 
-/// Same rule read tolerantly off the raw result for --json passthrough:
-/// unknown states from a newer daemon don't break the exit code.
+/// The same rule read tolerantly off the raw result for --json
+/// passthrough: a state name from a newer daemon does not decode, and an
+/// exit code is not the place to fail on that.
 fn receipts_exit_json(v: &Value) -> i32 {
     let bad = v
         .get("deliveries")
         .and_then(Value::as_array)
         .is_some_and(|a| {
             a.iter().any(|d| {
-                matches!(
-                    d.get("state").and_then(Value::as_str),
-                    Some("parked_blocked_quota" | "attention_required")
-                )
+                serde_json::from_value::<DeliveryState>(d["state"].clone())
+                    .is_ok_and(delivery_needs_human)
             })
         });
     i32::from(bad)
@@ -823,5 +896,57 @@ mod tests {
         for bad in ["", "0", "0s", "nope", "10x", "s", "-5s", "1.5s", "5s junk"] {
             assert_eq!(parse_duration(bad), Err(()), "{bad:?} should not parse");
         }
+    }
+
+    fn receipt(state: DeliveryState) -> DeliveryReceipt {
+        DeliveryReceipt {
+            to: "reviewer".into(),
+            state,
+            position: None,
+            note: None,
+        }
+    }
+
+    /// The exit code and the eye answer the same question, so they read the
+    /// same predicate. Both paths are checked against every state, and the
+    /// --json path against the same states as the daemon spells them, so a
+    /// state moving between halves of the rule moves both together.
+    #[test]
+    fn the_exit_code_branches_exactly_where_the_rule_does() {
+        use DeliveryState::*;
+        for state in [
+            Queued,
+            Gating,
+            Pasting,
+            Staged,
+            Submitted,
+            DeliveredVerified,
+            DeliveredUnverified,
+            RetryQueued,
+            AttentionRequired,
+            ParkedBlockedQuota,
+        ] {
+            let want = i32::from(delivery_needs_human(state));
+            assert_eq!(receipts_exit(&[receipt(state)]), want, "{state:?}");
+            let wire = serde_json::to_value(state).expect("a state serializes");
+            assert_eq!(
+                receipts_exit_json(&json!({"deliveries": [{"to": "reviewer", "state": wire}]})),
+                want,
+                "{state:?} through --json"
+            );
+        }
+        // One bad recipient in a broadcast is enough.
+        assert_eq!(
+            receipts_exit(&[receipt(DeliveredVerified), receipt(ParkedBlockedQuota)]),
+            1
+        );
+        // A state this build does not know is not an error to report on:
+        // the protocol is tolerant, and an exit code is a bad place to
+        // fail. Neither is a missing deliveries array.
+        assert_eq!(
+            receipts_exit_json(&json!({"deliveries": [{"state": "from_next_year"}]})),
+            0
+        );
+        assert_eq!(receipts_exit_json(&json!({})), 0);
     }
 }

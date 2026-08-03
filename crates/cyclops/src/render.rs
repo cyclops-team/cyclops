@@ -1,47 +1,37 @@
 //! Renderers: strict grid, computed column widths, two-space gutters, no
 //! trailing spaces. Pads by display width, not bytes. States always render
-//! glyph plus word; color never carries meaning alone.
+//! glyph plus word, and the group color on top of them is redundant: turn
+//! color off and the same words are still there.
+//!
+//! Padding happens before painting everywhere below, so escape bytes never
+//! reach the width table.
+//!
+//! The voice itself is not here. The width table, the clock gutter, the
+//! state cells, the cause vocabulary and the badges live in
+//! `cyclops_ui::grid`, which this crate already links to run `cyclops ui`.
+//! They were copied here once, justified by this crate being a binary, and
+//! the parity tests written to police the copy imported the very module
+//! the copy was supposed to be impossible to import. What stays here is
+//! this surface's own layout: padding, column widths, and the grids.
 
 use std::path::Path;
 
 use serde_json::Value;
 
 use cyclops_proto::{
-    AgentState, Delivery, DeliveryReceipt, DeliveryState, Detection, Event, Kind, LedgerLine,
-    PaneStatus, Sensor, StatusResult,
+    AgentState, Attention, AttentionItem, Delivery, DeliveryReceipt, DeliveryState, Detection,
+    Event, Kind, LedgerLine, PaneStatus, Sensor, StatusResult,
 };
+use cyclops_ui::grid;
 
 use crate::style::Style;
 
-/// Display width of one char, covering the glyph set cyclops prints plus
-/// the broad wide ranges pane titles can carry (CJK, emoji). Deliberately
-/// not a full UAX-11 table: the daemon controls most strings here and the
-/// crate stays dependency-free.
-pub fn char_width(c: char) -> usize {
-    match c {
-        // Combining marks occupy no column.
-        '\u{0300}'..='\u{036f}' => 0,
-        // The one wide glyph in our own set: ⛔ (blocked_quota).
-        '\u{26d4}' => 2,
-        // Common wide blocks: Hangul jamo, CJK, Hangul syllables,
-        // compatibility ideographs, vertical forms, fullwidth forms, emoji.
-        '\u{1100}'..='\u{115f}'
-        | '\u{2e80}'..='\u{a4cf}'
-        | '\u{ac00}'..='\u{d7a3}'
-        | '\u{f900}'..='\u{faff}'
-        | '\u{fe30}'..='\u{fe4f}'
-        | '\u{ff00}'..='\u{ff60}'
-        | '\u{ffe0}'..='\u{ffe6}'
-        | '\u{1f300}'..='\u{1faff}' => 2,
-        _ => 1,
-    }
-}
-
-pub fn display_width(s: &str) -> usize {
-    s.chars().map(char_width).sum()
-}
+pub use cyclops_ui::grid::{display_width, state_words};
 
 /// Pad with spaces to `width` display columns. Never truncates.
+///
+/// Padding is this crate's alone: the stream never pads, because autowrap
+/// is off there and the terminal clips its own edge.
 pub fn pad(s: &str, width: usize) -> String {
     let w = display_width(s);
     if w >= width {
@@ -49,11 +39,6 @@ pub fn pad(s: &str, width: usize) -> String {
     } else {
         format!("{s}{}", " ".repeat(width - w))
     }
-}
-
-/// Glyph plus word, the only state encoding. "● working", "○ idle".
-pub fn state_cell(s: AgentState) -> String {
-    format!("{} {s}", s.glyph())
 }
 
 /// Compact humane duration: "42s", "2m", "3h 12m", "5d 2h".
@@ -141,20 +126,43 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
     } else {
         names.join(", ")
     };
-    let header = format!(
+    // The eye is the one attention device (GOALS: stream header, pane
+    // badges, and status), and this surface reads it rather than deciding
+    // it: the register composes the cell and the words, the stream header
+    // asks the same register, and neither can be edited alone.
+    //
+    // Scope: the register is built from THIS answer. `open_deliveries`
+    // rides `status` only for a caller that asks for it, so an answer
+    // without the backlog counts panes alone and understates, which is the
+    // safe direction for an alarm. Everything it does count gets a row
+    // below, so the number is never bare.
+    let attention = Attention::from_status(res);
+    let eye = attention.header();
+    let mut header = format!(
         "{} {} {sep} watching {watching} {sep} tmux {} {sep} up {}",
-        style.accent("◉"),
+        style.eye(eye.calm, &eye.cell),
         style.bold("cyclops"),
         res.tmux_version,
         human_duration(res.uptime_ms),
     );
+    if let Some(tail) = &eye.tail {
+        header.push_str(&format!(" {sep} {tail}"));
+    }
 
     if res.sessions.is_empty() {
-        // Empty state invites the next action instead of erroring.
-        return format!(
-            "{header}\n\n  No sessions yet. Name one in {} and cyclops will pick it up.",
-            config_path.display()
-        );
+        // Empty state invites the next action instead of erroring. The
+        // backlog rows still ride along: no branch of this function may
+        // print a count with nothing behind it.
+        let mut out = vec![
+            header,
+            String::new(),
+            format!(
+                "  No sessions yet. Name one in {} and cyclops will pick it up.",
+                config_path.display()
+            ),
+        ];
+        out.extend(waiting_rows(&attention, style));
+        return out.join("\n");
     }
 
     let mut rows: Vec<Row> = Vec::new();
@@ -190,7 +198,7 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
         .unwrap_or(0);
     let state_w = rows
         .iter()
-        .map(|r| display_width(&state_cell(r.state)))
+        .map(|r| display_width(&state_words(r.state)))
         .max()
         .unwrap_or(0);
 
@@ -209,50 +217,72 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
             } else {
                 style.dim(&pad(&r.label, label_w))
             };
-            let cell = state_cell(r.state);
+            // Padded before painting: the column is measured on the
+            // words, and padding after the paint would count escape
+            // bytes as columns.
             let line = match &r.detail {
-                Some(d) => format!("  {label}  {}  {}", pad(&cell, state_w), style.dim(d)),
-                None => format!("  {label}  {cell}"),
+                Some(d) => format!(
+                    "  {label}  {}  {}",
+                    style.state(r.state, &pad(&state_words(r.state), state_w)),
+                    style.dim(d)
+                ),
+                None => format!("  {label}  {}", grid::state_cell(r.state, style)),
             };
             out.push(line);
         }
     }
+    out.extend(waiting_rows(&attention, style));
     out.join("\n")
 }
 
-/// One receipt badge, the landing-page voice: glyph plus word, qualifier
-/// after a dim separator. In-flight pipeline states should not reach a
-/// receipt, but every DeliveryState renders rather than panicking on a
-/// daemon that answers mid-pipeline.
+/// The deliveries the header counted, one row each.
+///
+/// A count with nothing behind it is the same defect on any surface: the
+/// pane grid answers for the blocked panes, so the backlog needs rows of
+/// its own or the number stands alone. Empty when the answer carried no
+/// backlog, which is also when the header counted none.
+fn waiting_rows(attention: &Attention, style: &Style) -> Vec<String> {
+    let open: Vec<(String, DeliveryState)> = attention
+        .items()
+        .into_iter()
+        .filter_map(|i| match i {
+            AttentionItem::Delivery { to, state, .. } => Some((to, state)),
+            AttentionItem::Agent { .. } => None,
+        })
+        .collect();
+    if open.is_empty() {
+        return Vec::new();
+    }
+    let to_w = open
+        .iter()
+        .map(|(to, _)| display_width(to))
+        .max()
+        .unwrap_or(0);
+    let mut out = vec![String::new(), format!("  {}", style.dim("waiting on you"))];
+    out.extend(open.iter().map(|(to, state)| {
+        let badge = receipt_badge(
+            &DeliveryReceipt {
+                to: to.clone(),
+                state: *state,
+                position: None,
+                note: None,
+            },
+            style,
+        );
+        format!("  {}  {badge}", style.role(to, &pad(to, to_w)))
+    }));
+    out
+}
+
+/// One receipt badge in this surface's paint. Words, glyph and color all
+/// come from `cyclops_ui::grid`; the CLI supplies only the painter.
 ///
 /// The check carries the evidence tier as weight: heavy ✔ for
 /// hook-verified, light ✓ for screen-tier. GOALS asks for a hollow check
 /// on unverified; no portable hollow check glyph exists in terminal
 /// fonts, so weight is the pair (STATUS.md deviations).
 pub fn receipt_badge(r: &DeliveryReceipt, style: &Style) -> String {
-    let sep = style.dim("·");
-    let with = |head: &str, tail: &str| format!("{head} {sep} {}", style.dim(tail));
-    match r.state {
-        DeliveryState::Queued => match r.position {
-            Some(n) => with("● queued", &format!("{n} ahead")),
-            None => "● queued".into(),
-        },
-        DeliveryState::Gating => "● gating".into(),
-        DeliveryState::Pasting => "● pasting".into(),
-        DeliveryState::Staged => "● staged".into(),
-        DeliveryState::Submitted => "● submitted".into(),
-        DeliveryState::RetryQueued => "● retrying".into(),
-        DeliveryState::DeliveredVerified => with("✔ delivered", "verified"),
-        DeliveryState::DeliveredUnverified => with("✓ delivered", "unverified (screen)"),
-        DeliveryState::AttentionRequired => match &r.note {
-            Some(note) => with("⚠ needs attention", note),
-            None => "⚠ needs attention".into(),
-        },
-        DeliveryState::ParkedBlockedQuota => match &r.note {
-            Some(note) => with("⛔ parked", &format!("quota, {note}")),
-            None => with("⛔ parked", "quota"),
-        },
-    }
+    grid::receipt_badge(r, style)
 }
 
 /// Receipts as send shows them: one delivery is a bare badge line, a
@@ -288,8 +318,11 @@ pub fn wait_badge(
     let with = |head: &str, tail: &str| format!("{head} {sep} {}", style.dim(tail));
     match outcome {
         "reached" => {
+            // Reached-with-a-state IS a state cell, so it wears the state
+            // cell's group color. The outcomes below are wait vocabulary
+            // rather than agent or delivery states and take no group.
             let head = match state {
-                Some(s) => state_cell(s),
+                Some(s) => grid::state_cell(s, style),
                 None => "✓ reached".to_string(),
             };
             match waited_ms {
@@ -396,31 +429,10 @@ pub fn history_gutter(ts: u64, now: u64) -> String {
     }
 }
 
-/// Machine causes in user-side words for badges. The generic fallback
-/// swaps underscores for spaces, which reads fine for the rest.
-fn cause_words(cause: &str) -> String {
-    match cause {
-        "no_such_pane" => "no pane with that name".into(),
-        "daemon_restart" => "daemon restarted mid-delivery".into(),
-        _ => cause.replace('_', " "),
-    }
-}
-
-/// One folded ledger delivery in the M1 badge voice.
+/// One folded ledger delivery in the M1 badge voice, painted like a
+/// receipt badge (same words, same painter).
 pub fn delivery_badge(d: &Delivery, style: &Style) -> String {
-    let note = match d.state {
-        DeliveryState::AttentionRequired => d.cause.as_deref().map(cause_words),
-        _ => None,
-    };
-    receipt_badge(
-        &DeliveryReceipt {
-            to: d.to.clone(),
-            state: d.state,
-            position: None,
-            note,
-        },
-        style,
-    )
+    grid::delivery_badge(&d.to, d.state, d.cause.as_deref(), style)
 }
 
 /// One message resolved for the grid before layout.
@@ -591,7 +603,7 @@ pub fn render_detection(target: &str, det: &Detection, style: &Style, now_ms: u6
     let mut header = format!(
         "{} {sep} {}",
         style.role(target, target),
-        state_cell(det.state)
+        grid::state_cell(det.state, style)
     );
     if det.disagreement {
         header.push_str(&format!(" {sep} ⚠ sensors disagree"));
@@ -613,7 +625,7 @@ pub fn render_detection(target: &str, det: &Detection, style: &Style, now_ms: u6
     let state_w = det
         .readings
         .iter()
-        .map(|r| display_width(&state_cell(r.state)))
+        .map(|r| display_width(&state_words(r.state)))
         .max()
         .unwrap_or(0);
     let rule_w = det
@@ -628,7 +640,7 @@ pub fn render_detection(target: &str, det: &Detection, style: &Style, now_ms: u6
         out.push(format!(
             "  {}  {}  {}  {}",
             pad(sensor_name(r.sensor), name_w),
-            pad(&state_cell(r.state), state_w),
+            style.state(r.state, &pad(&state_words(r.state), state_w)),
             pad(&r.rule, rule_w),
             style.dim(&age(now_ms.saturating_sub(r.ts))),
         ));
@@ -636,18 +648,11 @@ pub fn render_detection(target: &str, det: &Detection, style: &Style, now_ms: u6
     out.join("\n")
 }
 
-/// HH:MM:SS in UTC. std ships no timezone database; a local-time gutter
-/// needs a tz crate and M0 does not buy one for this.
-fn clock_hms(ts_ms: u64) -> String {
-    let s = (ts_ms / 1000) % 86_400;
-    format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
-}
-
 /// One event, one line: timestamp gutter, event name, then whatever the
 /// payload can say in user-side words.
 pub fn render_event_line(ev: &Event, style: &Style, now_ms: u64) -> String {
     let ts = ev.data.get("ts").and_then(Value::as_u64).unwrap_or(now_ms);
-    let mut line = format!("{}  {}", style.dim(&clock_hms(ts)), ev.event);
+    let mut line = format!("{}  {}", style.dim(&grid::clock_hms(ts)), ev.event);
     let summary = event_summary(&ev.data, style);
     if !summary.is_empty() {
         line.push_str("  ");
@@ -685,7 +690,7 @@ fn event_summary(data: &Value, style: &Style) -> String {
     }
     if let Some(v) = data.get("state") {
         if let Ok(st) = serde_json::from_value::<AgentState>(v.clone()) {
-            parts.push(state_cell(st));
+            parts.push(grid::state_cell(st, style));
         } else if let Some(s) = v.as_str() {
             parts.push(s.to_string());
         }
@@ -739,6 +744,16 @@ mod tests {
         }
     }
 
+    fn open_delivery(id: &str, to: &str, state: DeliveryState) -> cyclops_proto::OpenDelivery {
+        cyclops_proto::OpenDelivery {
+            id: id.into(),
+            to: to.into(),
+            state,
+            ts: 1_754_000_000_000,
+            cause: None,
+        }
+    }
+
     fn fixture() -> StatusResult {
         StatusResult {
             daemon_version: "0.1.0".into(),
@@ -772,18 +787,184 @@ mod tests {
                     pane("%4", None, None, "", "vim", AgentState::Unknown),
                 ],
             }],
+            // The daemon serves this half only when the caller asks for
+            // it. An answer without it counts panes alone, which is what
+            // the calm-rig cases below pin.
+            open_deliveries: Vec::new(),
         }
     }
 
     #[test]
-    fn status_grid_plain_is_exact() {
+    fn status_grid_plain_is_exact_on_a_calm_rig() {
+        // Nothing blocked, so the header must not wear the alarm eye. The
+        // shipped themes give surface.accent and eye.alert the same hex
+        // and the same 256 fallback, so an accent-painted ◉ here was
+        // byte- and color-identical to the stream's "two or more
+        // attention items" mark on a system with nothing wrong.
         let got = render_status(&fixture(), &Style::none(), Path::new("/x/config.toml"));
-        let expected = "◉ cyclops · watching main · tmux 3.6a · up 2m\n\
+        let expected = "‿ cyclops · watching main · tmux 3.6a · up 2m\n\
                         \n\
                         \x20 reviewer     ● working  Run the tests\n\
                         \x20 implementer  ○ idle\n\
                         \x20 %4           ? unknown  vim";
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn status_header_eye_opens_with_the_blocked_agent_count() {
+        let mut res = fixture();
+        res.sessions[0].panes[1].state = AgentState::BlockedPermission;
+        let got = render_status(&res, &Style::none(), Path::new("/x/config.toml"));
+        let expected = "◑ 1 cyclops · watching main · tmux 3.6a · up 2m · 1 needs attention\n\
+                        \n\
+                        \x20 reviewer     ● working             Run the tests\n\
+                        \x20 implementer  ⚠ blocked_permission\n\
+                        \x20 %4           ? unknown             vim";
+        assert_eq!(got, expected);
+        // Two blocked agents open the eye fully and take the plural.
+        res.sessions[0].panes[0].state = AgentState::BlockedQuota;
+        let got = render_status(&res, &Style::none(), Path::new("/x/config.toml"));
+        assert_eq!(
+            got.lines().next().unwrap_or_default(),
+            "◉ 2 cyclops · watching main · tmux 3.6a · up 2m · 2 need attention"
+        );
+        for line in got.lines() {
+            assert_eq!(line, line.trim_end(), "trailing space in: {line:?}");
+        }
+    }
+
+    #[test]
+    fn status_eye_glyphs_come_from_the_stream_vocabulary() {
+        // One glyph table, not two: the header must read the same device
+        // the stream header and docs/ui.md describe.
+        let mut res = fixture();
+        assert!(render_status(&res, &Style::none(), Path::new("/x"))
+            .starts_with(cyclops_proto::Eye::Closed.glyph()));
+        res.sessions[0].panes[0].state = AgentState::BlockedModal;
+        assert!(render_status(&res, &Style::none(), Path::new("/x"))
+            .starts_with(cyclops_proto::Eye::Opening.glyph()));
+        res.sessions[0].panes[1].state = AgentState::BlockedModal;
+        assert!(render_status(&res, &Style::none(), Path::new("/x"))
+            .starts_with(cyclops_proto::Eye::Open.glyph()));
+    }
+
+    /// The eye header is composed once, in cyclops_proto::attention, and
+    /// worn by two crates. This is the assertion that was missing while
+    /// they mirrored it: it drives both surfaces off ONE status answer and
+    /// fails the moment either stops asking the register, or phrases the
+    /// cell or the count words itself.
+    #[test]
+    fn the_eye_header_is_composed_once_for_both_surfaces() {
+        let cases = [
+            (AgentState::Working, Vec::new()),
+            (AgentState::BlockedPermission, Vec::new()),
+            (
+                AgentState::Working,
+                vec![open_delivery(
+                    "m-1",
+                    "implementer",
+                    DeliveryState::ParkedBlockedQuota,
+                )],
+            ),
+            (
+                AgentState::BlockedPermission,
+                vec![
+                    open_delivery("m-1", "implementer", DeliveryState::ParkedBlockedQuota),
+                    open_delivery("m-2", "reviewer", DeliveryState::AttentionRequired),
+                ],
+            ),
+        ];
+        for (state, open) in cases {
+            let mut res = fixture();
+            res.sessions[0].panes[1].state = state;
+            res.open_deliveries = open;
+
+            // What the register says the header must carry.
+            let attention = cyclops_proto::Attention::from_status(&res);
+            let eye = attention.header();
+
+            // Surface one: the CLI grid.
+            let status = render_status(&res, &Style::none(), Path::new("/x"));
+            let status_head = status.lines().next().expect("a header line");
+
+            // Surface two: the stream header, from the same answer.
+            let mut app = cyclops_ui::App::new(
+                cyclops_ui::Theme::none(),
+                cyclops_ui::View::Admin,
+                cyclops_ui::Filter::default(),
+            );
+            for e in app.seed_status(cyclops_ui::StatusSeed::from_status(&res)) {
+                app.replay(e);
+            }
+            while app.tick_eye() {}
+            let stream_head = cyclops_ui::build(&mut app, 12).remove(0);
+
+            let lead = format!("{} cyclops", eye.cell);
+            assert!(
+                status_head.starts_with(&lead),
+                "status header lost the composed eye cell: {status_head:?}"
+            );
+            assert!(
+                stream_head.starts_with(&lead),
+                "stream header lost the composed eye cell: {stream_head:?}"
+            );
+            match &eye.tail {
+                Some(tail) => {
+                    assert!(status_head.ends_with(tail), "{status_head:?}");
+                    assert!(stream_head.ends_with(tail), "{stream_head:?}");
+                }
+                None => {
+                    assert!(!status_head.contains("attention"), "{status_head:?}");
+                    assert!(!stream_head.contains("attention"), "{stream_head:?}");
+                }
+            }
+        }
+    }
+
+    /// Both halves, or the header lies. `cyclops status` counted blocked
+    /// panes only while the stream counted deliveries too, so one surface
+    /// showed the calm closed eye over a delivery the other was shouting
+    /// about.
+    #[test]
+    fn status_counts_open_deliveries_and_gives_each_a_row() {
+        let mut res = fixture();
+        res.open_deliveries = vec![
+            open_delivery("m-1", "implementer", DeliveryState::ParkedBlockedQuota),
+            open_delivery("m-2", "reviewer", DeliveryState::AttentionRequired),
+        ];
+        let got = render_status(&res, &Style::none(), Path::new("/x/config.toml"));
+        let expected = "◉ 2 cyclops · watching main · tmux 3.6a · up 2m · 2 need attention\n\
+                        \n\
+                        \x20 reviewer     ● working  Run the tests\n\
+                        \x20 implementer  ○ idle\n\
+                        \x20 %4           ? unknown  vim\n\
+                        \n\
+                        \x20 waiting on you\n\
+                        \x20 implementer  ⊘ parked · quota\n\
+                        \x20 reviewer     ⚠ needs attention";
+        assert_eq!(got, expected);
+        for line in got.lines() {
+            assert_eq!(line, line.trim_end(), "trailing space in: {line:?}");
+        }
+
+        // A blocked pane and an open delivery add up.
+        res.sessions[0].panes[1].state = AgentState::BlockedQuota;
+        let got = render_status(&res, &Style::none(), Path::new("/x/config.toml"));
+        assert!(
+            got.lines()
+                .next()
+                .unwrap_or_default()
+                .contains("3 need attention"),
+            "{got}"
+        );
+
+        // An answer with no backlog says nothing about one, and the eye
+        // closes on a calm rig exactly as before.
+        res.sessions[0].panes[1].state = AgentState::Idle;
+        res.open_deliveries.clear();
+        let got = render_status(&res, &Style::none(), Path::new("/x/config.toml"));
+        assert!(!got.contains("waiting on you"), "{got}");
+        assert!(got.starts_with("‿ cyclops"), "{got}");
     }
 
     #[test]
@@ -794,7 +975,7 @@ mod tests {
         // implementer has no detail: the marker stands alone.
         res.sessions[0].panes[1].hooks_verified = Some(false);
         let got = render_status(&res, &Style::none(), Path::new("/x/config.toml"));
-        let expected = "◉ cyclops · watching main · tmux 3.6a · up 2m\n\
+        let expected = "‿ cyclops · watching main · tmux 3.6a · up 2m\n\
                         \n\
                         \x20 reviewer     ● working  Run the tests · hooks unverified\n\
                         \x20 implementer  ○ idle     hooks unverified\n\
@@ -820,7 +1001,8 @@ mod tests {
         let mut res = fixture();
         res.sessions.clear();
         let got = render_status(&res, &Style::none(), Path::new("/x/config.toml"));
-        let expected = "◉ cyclops · watching nothing · tmux 3.6a · up 2m\n\
+        // No panes means nothing blocked: the empty rig is calm too.
+        let expected = "‿ cyclops · watching nothing · tmux 3.6a · up 2m\n\
                         \n\
                         \x20 No sessions yet. Name one in /x/config.toml and cyclops will pick it up.";
         assert_eq!(got, expected);
@@ -835,40 +1017,184 @@ mod tests {
         }
     }
 
+    /// Every agent state and every delivery state, so a variant added
+    /// later cannot skip the color-off check below.
+    const EVERY_AGENT_STATE: [AgentState; 8] = [
+        AgentState::Unknown,
+        AgentState::Idle,
+        AgentState::IdleWithInput,
+        AgentState::Working,
+        AgentState::BlockedModal,
+        AgentState::BlockedPermission,
+        AgentState::BlockedQuota,
+        AgentState::Dead,
+    ];
+
+    const EVERY_DELIVERY_STATE: [DeliveryState; 10] = [
+        DeliveryState::Queued,
+        DeliveryState::Gating,
+        DeliveryState::Pasting,
+        DeliveryState::Staged,
+        DeliveryState::Submitted,
+        DeliveryState::DeliveredVerified,
+        DeliveryState::DeliveredUnverified,
+        DeliveryState::RetryQueued,
+        DeliveryState::AttentionRequired,
+        DeliveryState::ParkedBlockedQuota,
+    ];
+
+    /// The reason state color is allowed to exist: it is redundant. With
+    /// color off, every badge is byte-identical to the words grid
+    /// composed, and every status row still carries its state's glyph and
+    /// word. `NO_COLOR` and `--plain` lose nothing.
     #[test]
-    fn receipt_badges_are_exact_in_plain_mode() {
-        use DeliveryState::*;
+    fn color_off_is_byte_identical_to_the_grid_words() {
         let s = Style::none();
-        let cases = [
-            (
-                receipt(DeliveredVerified, None, None),
-                "✔ delivered · verified",
-            ),
-            (
-                receipt(DeliveredUnverified, None, None),
-                "✓ delivered · unverified (screen)",
-            ),
-            (receipt(Queued, Some(2), None), "● queued · 2 ahead"),
-            (receipt(Queued, None, None), "● queued"),
-            (
-                receipt(ParkedBlockedQuota, None, Some("resets in 135h")),
-                "⛔ parked · quota, resets in 135h",
-            ),
-            (receipt(ParkedBlockedQuota, None, None), "⛔ parked · quota"),
-            (
-                receipt(AttentionRequired, None, Some("target pane is gone")),
-                "⚠ needs attention · target pane is gone",
-            ),
-            (receipt(AttentionRequired, None, None), "⚠ needs attention"),
-            (receipt(Gating, None, None), "● gating"),
-            (receipt(Pasting, None, None), "● pasting"),
-            (receipt(Staged, None, None), "● staged"),
-            (receipt(Submitted, None, None), "● submitted"),
-            (receipt(RetryQueued, None, None), "● retrying"),
-        ];
-        for (r, want) in &cases {
-            assert_eq!(receipt_badge(r, &s), *want);
+        for state in EVERY_DELIVERY_STATE {
+            assert_eq!(
+                receipt_badge(&receipt(state, None, None), &s),
+                grid::receipt_badge(&receipt(state, None, None), &grid::Plain),
+                "{state:?}"
+            );
         }
+        for state in EVERY_AGENT_STATE {
+            let mut res = fixture();
+            res.sessions[0].panes[0].state = state;
+            let got = render_status(&res, &s, Path::new("/x/config.toml"));
+            assert!(
+                got.contains(&state_words(state)),
+                "{state} lost its glyph and word:\n{got}"
+            );
+        }
+    }
+
+    /// SGR runs removed, so a colored render can be compared to the plain
+    /// one it has to lay out identically.
+    fn strip_sgr(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// The status grid paints its state cells through the group tokens,
+    /// and pads before painting. Both halves matter: an unpainted cell
+    /// drops the second encoding's color half, and a cell measured for
+    /// width AFTER painting counts escape bytes as columns and tears the
+    /// grid apart.
+    #[test]
+    fn status_grid_paints_state_cells_through_their_group() {
+        let (theme, warnings) = cyclops_theme::Theme::parse(
+            concat!(
+                "[state]\n",
+                "healthy = { hex = \"#010203\", c256 = 31 }\n",
+                "quiet = { hex = \"#040506\", c256 = 32 }\n",
+                "needs_you = { hex = \"#070809\", c256 = 33 }\n",
+            ),
+            "test",
+        )
+        .expect("parse");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let s = Style::with_theme(theme, false);
+        let mut res = fixture();
+        res.sessions[0].panes[1].state = AgentState::BlockedPermission;
+        let got = render_status(&res, &s, Path::new("/x/config.toml"));
+
+        // The widest cell sets the column, so the other two are padded
+        // inside their own paint.
+        let w = display_width(&state_words(AgentState::BlockedPermission));
+        for (state, code) in [
+            (AgentState::Working, 31),
+            (AgentState::Unknown, 32),
+            (AgentState::BlockedPermission, 33),
+        ] {
+            let cell = state_words(state);
+            let cell = if state == AgentState::BlockedPermission {
+                cell
+            } else {
+                pad(&cell, w)
+            };
+            assert!(
+                got.contains(&format!("\x1b[38;5;{code}m{cell}\x1b[0m")),
+                "{state} did not paint through its group:\n{got}"
+            );
+        }
+
+        // Padding before painting, stated as a layout invariant: strip the
+        // color and the grid is the plain grid, byte for byte.
+        let plain = render_status(&res, &Style::none(), Path::new("/x/config.toml"));
+        assert_eq!(strip_sgr(&got), plain);
+    }
+
+    /// The badge's glyph and word wear the delivery's group color; the
+    /// qualifier after the separator stays dim. Two painters compose one
+    /// string (grid dims the qualifier, this crate wraps the whole badge),
+    /// so the byte layout that produces is pinned here. A grid badge that
+    /// ever put an unpainted word AFTER a dim run would lose its color
+    /// silently, and this is what catches it.
+    #[test]
+    fn badge_paint_colors_the_head_and_dims_the_qualifier() {
+        let (theme, warnings) = cyclops_theme::Theme::parse(
+            concat!(
+                "[badge]\n",
+                "terminal = { hex = \"#010203\", c256 = 21 }\n",
+                "quiet = { hex = \"#040506\", c256 = 23 }\n",
+                "[surface]\n",
+                "dim = { hex = \"#070809\", c256 = 22 }\n",
+            ),
+            "test",
+        )
+        .expect("parse");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let s = Style::with_theme(theme, false);
+
+        // Head in the group color, separator and qualifier dim.
+        let got = receipt_badge(&receipt(DeliveryState::ParkedBlockedQuota, None, None), &s);
+        let head = grid::receipt_badge(
+            &receipt(DeliveryState::ParkedBlockedQuota, None, None),
+            &grid::Plain,
+        );
+        let head = head
+            .split(" · ")
+            .next()
+            .expect("a head before the separator");
+        assert_eq!(
+            got,
+            format!("\x1b[38;5;21m{head} \x1b[38;5;22m·\x1b[0m \x1b[38;5;22mquota\x1b[0m\x1b[0m")
+        );
+
+        // No qualifier: the whole badge is one run of the group color.
+        let got = receipt_badge(&receipt(DeliveryState::Gating, None, None), &s);
+        assert_eq!(got, "\x1b[38;5;23m● gating\x1b[0m");
+    }
+
+    /// The badge words live in cyclops_ui::grid and are pinned there.
+    /// What this crate owns is the paint, so this pins the paint: a badge
+    /// with color off is the words and not one escape byte.
+    #[test]
+    fn badges_paint_through_this_surfaces_dim() {
+        let plain = receipt_badge(
+            &receipt(DeliveryState::ParkedBlockedQuota, None, None),
+            &Style::none(),
+        );
+        assert_eq!(plain, "⊘ parked · quota");
+        let painted = receipt_badge(
+            &receipt(DeliveryState::ParkedBlockedQuota, None, None),
+            &Style::detect(false),
+        );
+        // Style::detect off a pipe is colorless, which is the machine
+        // path; the colored form is pinned in style.rs.
+        assert_eq!(painted, plain);
     }
 
     #[test]
@@ -1052,20 +1378,6 @@ mod tests {
     }
 
     #[test]
-    fn width_accounts_for_wide_and_combining_chars() {
-        assert_eq!(display_width("● working"), 9);
-        assert_eq!(display_width("⛔ blocked_quota"), 16);
-        assert_eq!(display_width("⚠"), 1);
-        // The delivered pair shares one column width, so grids stay aligned.
-        assert_eq!(display_width("✔"), 1);
-        assert_eq!(display_width("✓"), 1);
-        assert_eq!(display_width("日本"), 4);
-        // e + combining acute renders in one column.
-        assert_eq!(display_width("e\u{0301}"), 1);
-        assert_eq!(display_width("🚀"), 2);
-    }
-
-    #[test]
     fn pad_pads_by_display_width_not_bytes() {
         // "日" is 3 bytes but 2 columns; pad to 4 adds 2 spaces.
         assert_eq!(pad("日", 4), "日  ");
@@ -1239,32 +1551,6 @@ mod tests {
                         \x20 2m  reviewer → codex  Re: Review the rate limiter  ✔ delivered · verified\n\
                         \x20     Done. One nit.";
         assert_eq!(got, expected);
-    }
-
-    #[test]
-    fn attention_badge_carries_cause_words() {
-        let s = Style::none();
-        let d = Delivery {
-            to: "reviewer".into(),
-            state: DeliveryState::AttentionRequired,
-            verified_by: None,
-            attempts: 2,
-            ts: 0,
-            cause: Some("no_such_pane".into()),
-        };
-        assert_eq!(
-            delivery_badge(&d, &s),
-            "⚠ needs attention · no pane with that name"
-        );
-        let parked = Delivery {
-            to: "reviewer".into(),
-            state: DeliveryState::ParkedBlockedQuota,
-            verified_by: None,
-            attempts: 0,
-            ts: 0,
-            cause: Some("blocked_quota".into()),
-        };
-        assert_eq!(delivery_badge(&parked, &s), "⛔ parked · quota");
     }
 
     #[test]

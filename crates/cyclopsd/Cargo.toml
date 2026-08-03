@@ -7,6 +7,12 @@ description = "The Cyclops daemon: control-mode watcher, sensor fusion, ledger, 
 [dev-dependencies]
 # start_paused tests: virtual time for the verify re-read delays.
 tokio = { workspace = true, features = ["test-util"] }
+# The isolated tmux server, including the unit test inside src/delivery.rs.
+cyclops-testrig.workspace = true
+# The stream reader, so the restart path can be driven end to end: what
+# the daemon writes at boot has to be read by the surface that draws the
+# eye, or the two only agree in a hand-written fixture.
+cyclops-ui.workspace = true
 
 [dependencies]
 cyclops-proto.workspace = true

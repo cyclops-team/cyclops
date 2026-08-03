@@ -46,6 +46,17 @@ impl AgentState {
         )
     }
 
+    /// The state glyph, one of the two encodings that carry meaning
+    /// (GOALS). Every one of these measures ONE column and renders as
+    /// text, never as a color emoji: the grid is strict, and a glyph the
+    /// terminal draws double-wide or in its own emoji font breaks the
+    /// column rhythm and cannot take the theme's color.
+    ///
+    /// blocked_quota was U+26D4 (no entry), which is East Asian Wide and
+    /// defaults to emoji presentation. U+2298 (circled division slash) is
+    /// one column, plain text, and the same geometric family as the
+    /// circles above it. The warning sign stays: it is one column and does
+    /// not default to emoji presentation.
     pub fn glyph(self) -> &'static str {
         match self {
             AgentState::Unknown => "?",
@@ -53,7 +64,7 @@ impl AgentState {
             AgentState::IdleWithInput => "◐",
             AgentState::Working => "●",
             AgentState::BlockedModal | AgentState::BlockedPermission => "⚠",
-            AgentState::BlockedQuota => "⛔",
+            AgentState::BlockedQuota => "⊘",
             AgentState::Dead => "✗",
         }
     }

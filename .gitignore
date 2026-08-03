@@ -1,7 +1,16 @@
-/target
+# Cargo output, anywhere. Anchored at the root this read `/target` and
+# missed crates/cyclops-ledger/target/, which is how 751 build files (113M)
+# came to be tracked: the crate was built standalone before it joined the
+# workspace, and a workspace member's output lands in the root target/ now.
+target/
 **/*.rs.bk
 .DS_Store
-/tests/harness/__pycache__/
+# Python bytecode, anywhere. Naming one directory left
+# tests/__pycache__/m1_soak.cpython-313.pyc tracked, and a compiled
+# artifact in the record shows up as a change in every milestone that
+# happens to run the soak driver.
+__pycache__/
+*.py[cod]
 /tests/raw/
 *.ndjson.tmp
 /.claude/

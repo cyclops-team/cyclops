@@ -179,6 +179,11 @@ async fn f1_zero_edge_tier1_downgrades_notifies_once_and_loses_nothing() {
     let body = notify["data"]["body"].as_str().unwrap();
     assert!(body.contains(&m1), "names the delivery: {body}");
     assert!(body.contains("screen"), "names the downgrade: {body}");
+    // And names it structurally too. That delivery resolved as
+    // delivered_unverified, which the rule says nobody must clear, so
+    // this is exactly the ping that used to sit under a calm eye.
+    assert_eq!(notify["data"]["to"], "hooky", "{notify}");
+    assert_eq!(notify["data"]["id"], m1.as_str(), "{notify}");
 
     // Still unverified in status; the payload really reached the pane.
     let status = rig.ctl.request("status", json!({})).await;
@@ -352,7 +357,7 @@ async fn occupant_swap_invalidates_liveness_and_renews_the_f1_ping() {
     // Occupant swap: same command, new process. The watcher's pane_pid
     // updates on the subscription tick; hooks_verified must revert as soon
     // as it does, because the edges belong to the dead occupant.
-    rig.tmux.run(&["respawn-pane", "-k", "-t", &pane, "cat"]);
+    rig.tmux.run_ok(&["respawn-pane", "-k", "-t", &pane, "cat"]);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let status = rig.ctl.request("status", json!({})).await;

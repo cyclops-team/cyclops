@@ -1,0 +1,75 @@
+# Cyclops light: the site's light page palette, for light terminals.
+#
+# Source of truth is frontend/src/app.css (:root, light). Where dark.toml
+# maps the site's terminal panel, this maps the page itself:
+#
+#   surface.fg      --text         #2a2a2a   fallback only, see below
+#   surface.dim     --muted        #6e6e6e
+#   surface.accent  --sage-ink     #7e8a5c   the site uses the ink strength
+#                                            of sage for accents on paper,
+#                                            because #b7c396 washes out
+#
+#   role.1          --sage-ink     #7e8a5c
+#   role.2          --mauve-ink    #9c7e75
+#
+# The remaining six role slots are the dark theme's sorbet wheel at ink
+# strength: the same hues, darkened until they read on paper. Sand and
+# lavender lean slightly warmer and deeper than a mechanical darkening so
+# their 256-color fallbacks stay distinct (see below).
+#
+# The eye follows dark.toml's logic at ink strength: calm takes --muted so
+# a quiet rig recedes, alert takes sage-ink, the accent of the page.
+#
+# surface.fg is the one value here that no renderer paints. Cyclops prints
+# body text in the terminal's own foreground; the engine reads surface.fg
+# only as its fallback when a renderer asks for a token outside the
+# vocabulary. It stays because it names the page's text color and gives
+# that fallback a themed value. Editing it changes nothing on screen.
+#
+# [state] and [badge] are dark.toml's four groups at ink strength, and
+# they are redundant with the glyph and the word there too: healthy is a
+# forest green, needs-you an ochre amber, terminal a brick red, quiet is
+# --muted itself, and dead sits ABOVE it, because on paper a lighter gray
+# is the quieter one. Which state lands in which group is dark.toml's
+# table; nothing about the grouping changes per theme.
+#
+# There is no [stream] table, for the reason written out in dark.toml: the
+# stream's gutter resolves surface.dim like every other detail column.
+#
+# Every 256-color fallback here is explicit and exactly what the
+# cyclops-theme derivation picks; the role hues above were chosen so the
+# derivation lands the eight slots on pairwise distinct entries.
+
+name = "light"
+
+[surface]
+fg = { hex = "#2a2a2a", c256 = 235 }
+dim = { hex = "#6e6e6e", c256 = 242 }
+accent = { hex = "#7e8a5c", c256 = 101 }
+
+[role]
+1 = { hex = "#7e8a5c", c256 = 101 } # sage ink, the site accent
+2 = { hex = "#9c7e75", c256 = 138 } # mauve ink, the site message color
+3 = { hex = "#5c6e8a", c256 = 60 }  # mist blue ink
+4 = { hex = "#5c8287", c256 = 66 }  # aqua ink
+5 = { hex = "#5c8a6e", c256 = 65 }  # moss ink
+6 = { hex = "#a07a50", c256 = 137 } # sand ink
+7 = { hex = "#7a5c9e", c256 = 97 }  # lavender ink
+8 = { hex = "#8a5c7e", c256 = 96 }  # plum ink
+
+[eye]
+calm = { hex = "#6e6e6e", c256 = 242 }
+alert = { hex = "#7e8a5c", c256 = 101 }
+
+[state]
+healthy = { hex = "#2a7a3f", c256 = 29 }   # forest green
+needs_you = { hex = "#8a6520", c256 = 94 } # ochre amber
+terminal = { hex = "#9c3838", c256 = 131 } # brick red
+quiet = { hex = "#6e6e6e", c256 = 242 }    # --muted, same as surface.dim
+dead = { hex = "#9a9a9a", c256 = 247 }     # above dim: lighter is quieter here
+
+[badge]
+healthy = { hex = "#2a7a3f", c256 = 29 }
+needs_you = { hex = "#8a6520", c256 = 94 }
+terminal = { hex = "#9c3838", c256 = 131 }
+quiet = { hex = "#6e6e6e", c256 = 242 }

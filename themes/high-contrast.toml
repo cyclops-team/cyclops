@@ -1,0 +1,65 @@
+# Cyclops high-contrast: maximum legibility, identity kept as hue.
+#
+# Pure white figure and saturated colors picked directly on the xterm-256
+# grid so truecolor and the 256 fallback are the same color on every
+# terminal (each explicit c256 below is the exact grid entry for its hex;
+# the derivation confirms it, nothing is approximated).
+#
+# The identity survives as hue: role.1 is sage pushed to full brightness,
+# role.2 is mauve pushed the same way, and the other six slots keep the
+# dark theme's wheel order (blue, cyan, green, yellow, purple, pink) at
+# high saturation. The alert eye is pure yellow, the strongest signal on
+# black. Every value here clears WCAG AA (4.5:1) against a black ground;
+# the dimmest, state.dead, measures 6.9:1, and the state and badge groups
+# run 6.9:1 to 11.4:1. Pinned by shipped_high_contrast_clears_wcag_aa.
+#
+# surface.fg is the one value here that no renderer paints. Cyclops prints
+# body text in the terminal's own foreground; the engine reads surface.fg
+# only as its fallback when a renderer asks for a token outside the
+# vocabulary. Editing it changes nothing on screen.
+#
+# [state] and [badge] are dark.toml's four groups pushed onto the same
+# grid: pure green, amber, salmon red, and the two grays. Which state
+# lands in which group is dark.toml's table. The reds are the loosest
+# constraint here, because a saturated red on black is the one signal
+# color that struggles to clear AA at all: #ff5f5f (7.1:1) is the grid
+# entry that stays unmistakably red and still clears it comfortably.
+#
+# There is no [stream] table, for the reason written out in dark.toml:
+# the stream's gutter resolves surface.dim like every other detail column.
+# There is no surface.bg either: nothing paints a ground, so this theme
+# assumes the terminal's own black rather than setting one.
+
+name = "high-contrast"
+
+[surface]
+fg = { hex = "#ffffff", c256 = 231 }
+dim = { hex = "#bcbcbc", c256 = 250 }
+accent = { hex = "#ffff00", c256 = 226 }
+
+[role]
+1 = { hex = "#87d75f", c256 = 113 } # sage at full brightness
+2 = { hex = "#d7875f", c256 = 173 } # mauve at full brightness
+3 = { hex = "#5fafff", c256 = 75 }  # blue
+4 = { hex = "#5fd7d7", c256 = 80 }  # cyan
+5 = { hex = "#5fd787", c256 = 78 }  # green
+6 = { hex = "#d7d75f", c256 = 185 } # yellow
+7 = { hex = "#af87ff", c256 = 141 } # purple
+8 = { hex = "#ff87d7", c256 = 212 } # pink
+
+[eye]
+calm = { hex = "#c6c6c6", c256 = 251 }
+alert = { hex = "#ffff00", c256 = 226 }
+
+[state]
+healthy = { hex = "#00d700", c256 = 40 }    # 10.7:1
+needs_you = { hex = "#ffaf00", c256 = 214 } # 11.4:1
+terminal = { hex = "#ff5f5f", c256 = 203 }  # 7.1:1
+quiet = { hex = "#bcbcbc", c256 = 250 }     # 11.1:1, same as surface.dim
+dead = { hex = "#949494", c256 = 246 }      # 6.9:1, below quiet
+
+[badge]
+healthy = { hex = "#00d700", c256 = 40 }
+needs_you = { hex = "#ffaf00", c256 = 214 }
+terminal = { hex = "#ff5f5f", c256 = 203 }
+quiet = { hex = "#bcbcbc", c256 = 250 }

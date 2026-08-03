@@ -34,7 +34,7 @@ capped at 2.5 s. A busy target answers immediately with its queue position.
 | `✔ delivered · verified` | The recipient's own hook confirmed this exact message arrived. |
 | `✓ delivered · unverified (screen)` | Screen evidence only: the marker left the composer and a turn started. A late hook report upgrades it to verified. |
 | `● queued · 2 ahead` | Recipient cannot take input yet: mid-turn, a human typing, or a dialog waiting on a human decision (you get alerted). Delivers in order once the pane is ready. |
-| `⛔ parked · quota, resets in 135h` | Recipient is out of vendor quota. See below. |
+| `⊘ parked · quota, resets in 135h` | Recipient is out of vendor quota. See below. |
 | `⚠ needs attention · no pane for "reviewer"` | A human must look. The qualifier names why: missing pane, dead pane, no matching manifest, or two failed delivery attempts. |
 
 Verified means proven end to end: the recipient CLI's hook reported the

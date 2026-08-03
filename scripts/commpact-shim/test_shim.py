@@ -13,8 +13,9 @@ commPact, and asserts:
   - nothing outside the sandbox is touched: the real ~/.commPact is
     snapshotted by mtime before and after (the M2 brief's assertion)
 
-No tmux, no network, no real home. Everything lives in a sandbox temp dir
-(/private/tmp on macOS, the system temp dir elsewhere).
+No tmux, no network, no real home. Everything lives in a sandbox under the
+scratch root: CYCLOPS_TEST_TMP if set, else /private/tmp on macOS, else the
+system temp dir (see scratch_root below and F24).
 Run: python3 scripts/commpact-shim/test_shim.py
 """
 
@@ -34,6 +35,9 @@ REPO = HERE.parents[1]
 SHIM = HERE / "commPact"
 INSTALL = HERE / "install.sh"
 CYCLOPS = REPO / "target" / "debug" / "cyclops"
+
+# cyclops_proto::scratch::SCRATCH_ENV. One name, both languages.
+SCRATCH_ENV = "CYCLOPS_TEST_TMP"
 
 # Same canned status shape crates/cyclops/tests/e2e.rs uses, so the human
 # status rendering (list, doctor) parses it.
@@ -157,6 +161,24 @@ def snapshot(root):
     return snap
 
 
+def scratch_root():
+    """Where throwaway test state goes. None means the system temp dir.
+
+    The same rule as cyclops_proto::scratch::scratch_root, restated here
+    because Python cannot call it: CYCLOPS_TEST_TMP wins, then /private/tmp
+    on macOS (short, so a unix socket path fits the ~104 byte cap), then
+    the system temp dir. Hardcoding /private/tmp broke every Linux run
+    (F24), and ignoring the override made this suite the one place the
+    relocated-root CI leg could not reach. Change it with scratch.rs.
+    """
+    override = os.environ.get(SCRATCH_ENV)
+    if override:
+        return override
+    if sys.platform == "darwin":
+        return "/private/tmp"
+    return None
+
+
 def main():
     if not CYCLOPS.exists():
         subprocess.run(["cargo", "build", "-p", "cyclops"], cwd=REPO, check=True)
@@ -175,10 +197,12 @@ def main():
     real_commpact = pathlib.Path.home() / ".commPact"
     before = snapshot(real_commpact)
 
-    # /private/tmp keeps socket paths short on macOS; Linux CI has no such
-    # directory, so fall back to the system temp dir there.
-    tmp_root = "/private/tmp" if os.path.isdir("/private/tmp") else None
-    sb = pathlib.Path(tempfile.mkdtemp(prefix="cyc-shim-", dir=tmp_root))
+    root = scratch_root()
+    sb = pathlib.Path(tempfile.mkdtemp(prefix="cyc-shim-", dir=root))
+    # The sandbox has to land where the rule says, or CI running with the
+    # root relocated proves nothing about this suite.
+    expect(root is None or str(sb).startswith(str(root)),
+           f"sandbox lands under the scratch root {root}", str(sb))
     home = sb / "home"
     ch = sb / "ch"
     home.mkdir()
