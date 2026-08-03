@@ -411,11 +411,20 @@ async fn fifo_ordering_after_busy_target_goes_idle() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
+    // The receipt window is deliberately far larger than the thing being
+    // measured. This test's timing assertion separates two outcomes: a
+    // busy target answering AT ONCE with a queue position, and a
+    // regression that holds the receipt open for the whole window. At
+    // `receipt_block_ms = 400` against a 300ms threshold those two are
+    // 100ms apart, which a loaded runner crosses without anything being
+    // wrong: tmux-head measured 330ms on a genuinely immediate answer and
+    // failed, while the same commit passed on a quieter runner minutes
+    // earlier. A window ten times the threshold cannot be crossed by load.
     let mut rig = Rig::new(
         "fifo",
         BUSY_MANIFEST,
         &hold_script("BUSY-MARKER"),
-        "receipt_block_ms = 400\n",
+        "receipt_block_ms = 4000\n",
     )
     .await;
     rig.tmux.wait_screen("main", "BUSY-MARKER");
@@ -433,9 +442,12 @@ async fn fifo_ordering_after_busy_target_goes_idle() {
         positions.push(r["deliveries"][0]["position"].as_u64());
         if n > 0 {
             // Busy path: immediate queued receipt with the queue depth.
+            // Well under the 4000ms window above, so a pass means the
+            // receipt did not wait for it and a failure means it did.
             assert!(
-                elapsed < Duration::from_millis(300),
-                "busy receipt blocked {elapsed:?}"
+                elapsed < Duration::from_millis(1500),
+                "busy receipt blocked {elapsed:?}, so it waited for the receipt window \
+                 instead of answering at once with a queue position"
             );
         }
     }
