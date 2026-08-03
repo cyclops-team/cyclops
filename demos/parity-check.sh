@@ -594,6 +594,88 @@ cat "$OUT"
 check "the record links the reply to it"  "\"reply_to\":\"$HANDOFF\""
 
 echo
+echo "#### The blocking gate docs/QUICKSTART.md section 6 hands to scripts"
+
+# That section tells scripts to gate on `.wait[0].outcome`, and explains
+# why the exit code is not enough. Both halves are checked here, because
+# the explanation is the load-bearing part: a reader who trusts `set -e`
+# alone ships a gate that passes when no review happened.
+
+# The turn has to be driven, and the order is the whole difficulty.
+#
+# Two rules constrain it, and between them the stand-in's own answer is
+# unusable. `done` deliberately refuses a working phase that predates the
+# delivery (crates/cyclopsd/tests/m1_fixes.rs, fix A), so the turn cannot
+# be started before the send. And a working phase shorter than tmux's 1Hz
+# subscription tick is invisible (F23), so the stand-in's instant
+# hook-fired turn leaves no edge to return on.
+#
+# So: wait for the delivery to resolve, then run a turn long enough to
+# see, then end it. That is a real agent's shape, slowed down.
+( wait_for "the gate delivery to resolve" 100 settled "Review the burst path fix"
+  tmx select-pane -t "$N2" -T 'Reviewing the burst path'
+  sleep 2.5
+  tmx select-pane -t "$N2" -T '' ) &
+EDGE_DRIVER=$!
+
+printf '\n$ cyclops send reviewer --subject "Review the burst path fix" --wait done --timeout 30s --json\n'
+"$CYC" send reviewer --subject "Review the burst path fix" \
+  --wait done --timeout 30s --json > "$ROOT/receipt.json" 2>&1
+GATE_EXIT=$?
+wait "$EDGE_DRIVER" 2>/dev/null || true
+jq -c '.wait[0]' "$ROOT/receipt.json" > "$OUT"
+cat "$OUT"
+check "there is one wait entry per recipient" '"to":"reviewer"'
+# The five fields the section names. A gate that branches on `outcome`
+# breaks the moment one of them is renamed, and renaming one is easy.
+for field in to outcome state waited_ms delivery; do
+  check "the wait entry carries $field"      "\"$field\":"
+done
+
+# The exact predicate the documented script runs. Not a paraphrase of it:
+# this is the line a reader copies.
+if jq -e '.wait[0].outcome == "reached"' "$ROOT/receipt.json" >/dev/null; then
+  printf '   ok    the documented jq gate passes on a finished turn\n'
+else
+  printf '   FAIL  the documented jq gate passes on a finished turn\n'
+  FAILS=$((FAILS + 1))
+fi
+CHECKS=$((CHECKS + 1))
+[ "$GATE_EXIT" -eq 0 ] || { printf '   FAIL  a reached wait exits 0 (got %s)\n' "$GATE_EXIT"; FAILS=$((FAILS + 1)); }
+CHECKS=$((CHECKS + 1))
+
+# The other half, and the reason that jq line exists. A recipient that
+# takes the message and never finishes a turn: `cat` is in the stand-in
+# manifest's process_names, so the pane stays detected and the delivery
+# still lands, but nothing fires a hook and no turn ever ends.
+printf '\n$ cyclops send reviewer --subject "Never answered" --wait done --timeout 3s --json    # reviewer is not answering\n'
+tmx respawn-pane -k -t "$N2" "cat"
+tmx select-pane -t "$N2" -T ''
+sleep 2.5
+"$CYC" send reviewer --subject "Never answered" \
+  --wait done --timeout 3s --json > "$ROOT/timeout.json" 2>&1
+STALL_EXIT=$?
+jq -c '{exit: '"$STALL_EXIT"', outcome: .wait[0].outcome, delivered: .deliveries[0].state}' \
+  "$ROOT/timeout.json" > "$OUT"
+cat "$OUT"
+check "a wait that runs out says timeout"  '"outcome":"timeout"'
+# The claim the whole section is built on. If this ever exits non-zero the
+# warning in the docs is wrong, and if it ever stops being 0 silently, a
+# documented gate starts passing on an unreviewed change.
+[ "$STALL_EXIT" -eq 0 ] \
+  && printf '   ok    but the delivery landed, so it still exits 0\n' \
+  || { printf '   FAIL  but the delivery landed, so it still exits 0 (got %s)\n' "$STALL_EXIT"; FAILS=$((FAILS + 1)); }
+CHECKS=$((CHECKS + 1))
+
+if jq -e '.wait[0].outcome == "reached"' "$ROOT/timeout.json" >/dev/null 2>&1; then
+  printf '   FAIL  and the documented jq gate stops it\n'
+  FAILS=$((FAILS + 1))
+else
+  printf '   ok    and the documented jq gate stops it\n'
+fi
+CHECKS=$((CHECKS + 1))
+
+echo
 echo "#### The open eye (docs/troubleshooting.md quotes both of these)"
 
 # Last, because it leaves an item on the record that nothing clears. A send

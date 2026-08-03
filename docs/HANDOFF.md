@@ -95,10 +95,10 @@ The most valuable thing to understand, and the thing every other question
 leads back to. Read in this order:
 
 1. [DELIVERY.md](DELIVERY.md). The spec, and short.
-2. `cyclops-proto/src/ledger.rs`, `DeliveryState::can_transition_to`. The
+2. `crates/cyclops-proto/src/ledger.rs`, `DeliveryState::can_transition_to`. The
    legal moves are a table you can read in a minute; everything below is a
    drive through it.
-3. `cyclopsd/src/delivery.rs`, in call order: `msg_send` -> `worker_for` ->
+3. `crates/cyclopsd/src/delivery.rs`, in call order: `msg_send` -> `worker_for` ->
    `worker_loop` -> `process` -> `gate` -> `attempt_delivery` -> `inject`
    -> `await_ack` -> `receipt_of`.
 4. The two diagrams in [ARCHITECTURE.md](ARCHITECTURE.md): the gate's eight

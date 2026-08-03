@@ -43,6 +43,15 @@ jobs:
       - name: commPact shim tests
         if: ${{ !cancelled() }}
         run: python3 scripts/commpact-shim/test_shim.py
+      # A path in a doc is checkable. Before this, ARCHITECTURE.md pointed
+      # newcomers at files that were not in the repo, and thirty-one source
+      # paths were missing their `crates/` prefix. --selftest first, so a
+      # green result cannot mean the checker stopped checking.
+      - name: docs point at files that exist
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/check-doc-paths.py --selftest
+          python3 scripts/check-doc-paths.py
       # Docs are part of done, so a doc quoting output the binaries no
       # longer print fails the build. This walks the README ladder against
       # a throwaway tmux server and asserts every shape the pages promise.

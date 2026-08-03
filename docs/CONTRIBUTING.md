@@ -28,10 +28,12 @@ run here is a green run there.
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --no-fail-fast
+python3 scripts/check-doc-paths.py
 ./demos/parity-check.sh
 ```
 
-The last two take a few minutes. Run the first two while you work.
+The two cargo lines at the end take a few minutes; the rest are seconds.
+Run the first two while you work.
 
 Touching `scripts/install.sh` or what it prints adds one more, and it does
 a release build:
@@ -189,6 +191,7 @@ throw away the signal that tells a portability bug from a real regression.
 | `cargo clippy --workspace --all-targets -- -D warnings` | Any lint fires, including in tests |
 | `cargo test --workspace --no-fail-fast` | Any test fails, on either OS |
 | `python3 scripts/commpact-shim/test_shim.py` | The commPact v1 shim broke (bash and python, invisible to cargo) |
+| `python3 scripts/check-doc-paths.py` | A doc points at a file this repo does not have. `--selftest` proves the checker still catches, so a green run cannot mean it stopped looking |
 | `./demos/parity-check.sh` | A doc quotes output the binaries no longer print |
 | The whole suite again with `CYCLOPS_TEST_TMP` relocated | Something hardcoded a scratch path (F24) |
 | `./demos/parity-check.sh --with-installer` | `scripts/install.sh` stopped doing what install.md says, or left a shell profile changed after `--uninstall`. Its own job: it does a release build |

@@ -67,7 +67,7 @@ core). `crates/cyclops-tmux/src/watcher.rs` owns this loop.
 
 ### Fusion: which sensor decides
 
-`cyclopsd/src/fusion.rs`, `recompute_pane`. Manifest rules are sorted by
+`crates/cyclopsd/src/fusion.rs`, `recompute_pane`. Manifest rules are sorted by
 priority once at load; every tier below picks the first rule that matches,
 and the fused verdict is whichever tier's winner sits earlier in that one
 order.
@@ -107,7 +107,7 @@ tested CLI hooks its modals or its quota.
 
 Two halves, joined by one queue. `msg.send` writes the fact and fans out;
 one FIFO worker per recipient pane then carries each chain on its own.
-Both are `cyclopsd/src/delivery.rs`; the semantics are docs/DELIVERY.md.
+Both are `crates/cyclopsd/src/delivery.rs`; the semantics are docs/DELIVERY.md.
 
 ### The call: what the sender gets back
 
@@ -240,7 +240,7 @@ renders before the screen is re-read, and a one-shot admin ping after
 ### The record of it
 
 Every transition above is a ledger line. The table of legal moves is
-`cyclops-proto/src/ledger.rs`, `DeliveryState::can_transition_to`:
+`crates/cyclops-proto/src/ledger.rs`, `DeliveryState::can_transition_to`:
 
 ```mermaid
 stateDiagram-v2
@@ -292,7 +292,7 @@ with cause `daemon_restart`, whatever state it was in (`delivery.rs`,
 The eye is the signature device, and it appears on three surfaces: the
 stream header, the `--plain` eye line, and `cyclops status`. All three read
 one register and none of them recomputes it. That register is
-`cyclops-proto/src/attention.rs`, and it is the only file allowed to answer
+`crates/cyclops-proto/src/attention.rs`, and it is the only file allowed to answer
 this question.
 
 ```mermaid
@@ -462,16 +462,16 @@ modified without an explicit admin request).
 
 | ADR-001 decision | Lives at |
 |---|---|
-| Single daemon, one `tmux -C` client per session (T3) | `cyclops-tmux/src/control.rs`, owned by `cyclopsd` |
-| Level-triggered reconciling core, not an event mirror (revision 1, C2) | `cyclops-tmux/src/watcher.rs` |
-| Sensor fusion with per-sensor readings and observable disagreement (revision 2) | Types in `cyclops-proto/src/state.rs`; engine in `cyclopsd/src/fusion.rs`; hook sensor fed from `cyclopsd/src/ack.rs` |
+| Single daemon, one `tmux -C` client per session (T3) | `crates/cyclops-tmux/src/control.rs`, owned by `cyclopsd` |
+| Level-triggered reconciling core, not an event mirror (revision 1, C2) | `crates/cyclops-tmux/src/watcher.rs` |
+| Sensor fusion with per-sensor readings and observable disagreement (revision 2) | Types in `crates/cyclops-proto/src/state.rs`; engine in `crates/cyclopsd/src/fusion.rs`; hook sensor fed from `crates/cyclopsd/src/ack.rs` |
 | Detection rules are per-CLI data, not code (H2) | `cyclops-manifest`, `manifests/{claude,codex,agy}.toml` |
-| NDJSON Unix socket, hello line first, version mismatch warns never rejects (S2) | `cyclops-proto/src/wire.rs`; server in `cyclopsd/src/server.rs` |
-| Append-only NDJSON ledger, monotonic seq plus boot_id, replayable by cursor (C6) | Schema in `cyclops-proto/src/ledger.rs`; writer in `cyclops-ledger`. The stream client backfills by reading session files directly; server-side cursor replay on `events.subscribe` is accepted and ignored, with no client that needs it |
-| Delivery pipeline: queue, gate, paste, verify, submit, ACK; failures are queued states | `cyclops-proto/src/ledger.rs` for the machine, `cyclopsd/src/delivery.rs` for the pipeline |
-| Turn detection from hooks via a `cyclops hook` receiver | `wire.rs` (`agent.state.report`), `cyclops/src/hook.rs`, `cyclopsd/src/ack.rs` |
+| NDJSON Unix socket, hello line first, version mismatch warns never rejects (S2) | `crates/cyclops-proto/src/wire.rs`; server in `crates/cyclopsd/src/server.rs` |
+| Append-only NDJSON ledger, monotonic seq plus boot_id, replayable by cursor (C6) | Schema in `crates/cyclops-proto/src/ledger.rs`; writer in `cyclops-ledger`. The stream client backfills by reading session files directly; server-side cursor replay on `events.subscribe` is accepted and ignored, with no client that needs it |
+| Delivery pipeline: queue, gate, paste, verify, submit, ACK; failures are queued states | `crates/cyclops-proto/src/ledger.rs` for the machine, `crates/cyclopsd/src/delivery.rs` for the pipeline |
+| Turn detection from hooks via a `cyclops hook` receiver | `wire.rs` (`agent.state.report`), `crates/cyclops/src/hook.rs`, `crates/cyclopsd/src/ack.rs` |
 | Agent surface: thin CLI speaking NDJSON to the socket | `crates/cyclops` |
-| v1 keepers: fail-closed ACL, data-only config, explicit pane adoption, identity from socket peer | `cyclopsd/src/identity.rs` (peer creds plus a pid-ancestry walk to a watched pane), `cyclopsd/src/registry.rs` |
+| v1 keepers: fail-closed ACL, data-only config, explicit pane adoption, identity from socket peer | `crates/cyclopsd/src/identity.rs` (peer creds plus a pid-ancestry walk to a watched pane), `crates/cyclopsd/src/registry.rs` |
 | tmux specifics confined to one adapter, CI against tmux HEAD | `crates/cyclops-tmux`; advisory tmux-HEAD CI job. One invocation is outside it: `cyclopsd::probe_tmux` runs `tmux -V` and parses through the adapter, which the adapter's own header names as the exception |
 
 Two frozen decisions are not done, and this is where that is written down.
@@ -493,15 +493,15 @@ than a lettered amendment; it lives in `cyclops-manifest` `Hooks.ack`
 
 | | Amendment | Lives at |
 |---|---|---|
-| a | `pause-after` set on the control connection at attach (2) | `cyclops-tmux/src/control.rs` attach handshake; F15 covers the `%extended-output` consequence |
-| b | `bracket_paste_flag` unavailable through tmux 3.6a, so post-paste composer verification is the gate (3) | `cyclops-tmux/src/version.rs`; verification with `<message_id>` substitution in `cyclopsd/src/delivery.rs` |
-| c | Daemon self-test proving hooks actually fire, F1: Codex loads zero hooks in untrusted dirs, silently (4) | `cyclopsd/src/selftest.rs`: per-pane edge liveness, `hooks.verify` / `hooks.selftest`, the `hooks_verified` bit, one F1 ping per zero-edge pane |
-| d | Dedupe hook events on (session_id, turn_id, event), F2: Codex double-fires across config layers (5) | `cyclopsd/src/ack.rs`, plus the reporter's own seq |
-| e | Unique tmux buffer name per delivery, F4: named buffers are global and concurrent senders race (6) | `cyclopsd/src/delivery.rs`: `cyc-<pid>-<seq>` loaded from a 0600 spool file in a 0700 directory |
+| a | `pause-after` set on the control connection at attach (2) | `crates/cyclops-tmux/src/control.rs` attach handshake; F15 covers the `%extended-output` consequence |
+| b | `bracket_paste_flag` unavailable through tmux 3.6a, so post-paste composer verification is the gate (3) | `crates/cyclops-tmux/src/version.rs`; verification with `<message_id>` substitution in `crates/cyclopsd/src/delivery.rs` |
+| c | Daemon self-test proving hooks actually fire, F1: Codex loads zero hooks in untrusted dirs, silently (4) | `crates/cyclopsd/src/selftest.rs`: per-pane edge liveness, `hooks.verify` / `hooks.selftest`, the `hooks_verified` bit, one F1 ping per zero-edge pane |
+| d | Dedupe hook events on (session_id, turn_id, event), F2: Codex double-fires across config layers (5) | `crates/cyclopsd/src/ack.rs`, plus the reporter's own seq |
+| e | Unique tmux buffer name per delivery, F4: named buffers are global and concurrent senders race (6) | `crates/cyclopsd/src/delivery.rs`: `cyc-<pid>-<seq>` loaded from a 0600 spool file in a 0700 directory |
 | f | Terminal `blocked_quota`: park and alert, never auto-retry, F11 (9) | `state.rs` `BlockedQuota`, `ledger.rs` `ParkedBlockedQuota` (terminal in the record; the operator resends after the reset), parking and the urgent notify in `delivery.rs` |
 | g | Modal vocabulary is per-CLI data with explicit decline options, never a generic Enter or Escape, F3, F12, F20 (8) | `cyclops-manifest` `decline_keys` plus `auto_dismiss`; `manifests/*.toml` |
-| h | Fusion is rare-blocked-state coverage, not steady-state accuracy (7) | `cyclops-proto/src/state.rs` module header; the tier order in `cyclopsd/src/fusion.rs` |
-| i | Delivery behind a trait so per-agent backends can swap without touching the layers above | `cyclopsd/src/delivery.rs`: the `Injector` trait (paste, submit, capture) with `TmuxInjector` as the M1 backend; gate, verify and ACK call through the seam only |
+| h | Fusion is rare-blocked-state coverage, not steady-state accuracy (7) | `crates/cyclops-proto/src/state.rs` module header; the tier order in `crates/cyclopsd/src/fusion.rs` |
+| i | Delivery behind a trait so per-agent backends can swap without touching the layers above | `crates/cyclopsd/src/delivery.rs`: the `Injector` trait (paste, submit, capture) with `TmuxInjector` as the M1 backend; gate, verify and ACK call through the seam only |
 
 ## The zero-polling contract
 

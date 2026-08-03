@@ -327,7 +327,7 @@ versions are unreleased until admin cuts a tag.
   both views.
 - THE EYE in the header: `‿` closed when calm, `◑` opening at one
   attention item, `◉` open with the count beside it (glyph set documented
-  with the theme tokens in cyclops-ui/src/theme.rs; colors ride eye.calm
+  with the theme tokens in crates/cyclops-ui/src/theme.rs; colors ride eye.calm
   and eye.alert). Attention items are currently-blocked agents plus
   deliveries sitting in attention_required or parked_blocked_quota, keyed
   per (recipient, message) so a later message to the same agent can never
@@ -427,7 +427,7 @@ versions are unreleased until admin cuts a tag.
   long-lived renderers is ThemeWatch: a (mtime, length) stat when an
   event already woke the renderer, no watcher thread, no timer; edits to
   the active theme apply on the next render.
-- cyclops/src/style.rs resolves through the theme engine; its public
+- crates/cyclops/src/style.rs resolves through the theme engine; its public
   surface (detect, none, role, accent, dim, bold, role_color) is
   unchanged and every CLI render test passes untouched. Role labels now
   hash into 8 palette slots instead of 6, so agents may land on different

@@ -5,7 +5,7 @@ Updated 2026-08-03. The installer ships and the first run works end to end.
 looks, sets the home up, and proves the result runs; `--uninstall` puts the
 machine back. Getting there turned up F33, three defects on the first-run
 path that made `cyclops start` print a step which answered with an error.
-582 tests across 63 targets, parity 96/96 (112/112 with the installer
+582 tests across 63 targets, parity 107/107 (123/123 with the installer
 section), CI green, v2 is main. Next is M7 flow features.
 One thing still waits on admin: the v1 cutover.
 
@@ -314,8 +314,34 @@ One thing still waits on admin: the v1 cutover.
     `WARN cannot attach` for a session that does not exist yet, which is
     the line that stopped the operator, is now an INFO naming the fix.
   - Parity covers the installer behind `--with-installer`, in its own CI
-    job because it does a release build: 112/112 with it, 96/96 without,
-    and the skip says so rather than passing silently.
+    job because it does a release build, and the skip says so rather than
+    passing silently.
+- The paths docs quote are gated (this commit):
+  - `scripts/check-doc-paths.py` checks two things a reader uses: markdown
+    link targets, and code spans shaped like repo paths. It found 31 source
+    paths written without their `crates/` prefix, in ARCHITECTURE, HANDOFF
+    and CHANGELOG, so copying one into an editor found nothing. Fixed in
+    the docs rather than taught to the checker, because a reader has to be
+    able to paste the path.
+  - Exclusions are seven categories with a stated reason (home paths, env
+    vars, absolute system paths, placeholders and globs, KEY=value,
+    all-numeric ratios, cargo `target/` output), plus exactly two literals:
+    `bin/commPact` and `versions/2.1.220`, both real paths in the v1 tree.
+  - `--selftest` plants three findings and asserts the checker reports
+    those three and nothing else, and CI runs it before the real pass. The
+    first version of this gate skipped the missing-prefix form, the exact
+    defect it was written for, because it required the first segment to be
+    a repo root; measured against these docs that test excluded 49
+    candidates, 43 already covered by a rule and 6 real repo paths. The
+    selftest is where that form is still written down, because writing it
+    anywhere else fails this gate, which is the gate working.
+  - QUICKSTART section 6, the blocking script gate, is now walked for real:
+    the `.wait[0]` shape, the documented `jq -e` predicate on a finished
+    turn, and the claim the section is built on, that a delivered message
+    whose wait times out still exits 0. Driving a real `done` edge needs
+    both rules at once: the turn must start after the delivery resolves
+    (fix A) and outlive tmux's 1Hz tick (F23). Parity is 107/107, 123/123
+    with the installer.
 
 ## ADMIN_ACTION_REQUIRED (not blocking the build)
 
@@ -403,10 +429,6 @@ it lying in minutes.
   then retry", which can never help. Two fixes: `start` refuses a home too
   long to bind, and the connect-error copy names CYCLOPS_HOME and the cap.
   Documented in install.md today, which is not the same as caught.
-- Gate the paths docs quote, and cover the QUICKSTART script example. A
-  path in a doc is checkable and is not checked; the allowlist has to
-  carry `bin/commPact`, `versions/2.1.220`, the workspaces.md ratios, and
-  cargo's `target/` outputs.
 
 Dropped by admin decision on 2026-08-03:
 
