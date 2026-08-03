@@ -188,6 +188,10 @@ struct StartArgs {
     /// Run each pane's recorded command instead of leaving a shell.
     #[arg(long)]
     launch: bool,
+    /// Write the config and the detection manifests, and stop before
+    /// opening anything. What `scripts/install.sh` runs last.
+    #[arg(long)]
+    setup_only: bool,
 }
 
 #[derive(Subcommand)]
@@ -459,6 +463,7 @@ fn run(cli: &Cli) -> i32 {
         // The workspace verbs talk to tmux, and reach the daemon only for
         // the labels. A down daemon costs them the names, not the verb, so
         // they must not go through connect().
+        Cmd::Start(args) if args.setup_only => workspace::run_setup(cli.json, &style_for(cli)),
         Cmd::Start(args) => workspace::run_start(
             cli.json,
             &style_for(cli),

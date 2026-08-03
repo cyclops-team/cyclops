@@ -1265,6 +1265,28 @@ pub(crate) fn no_manifests_warning(dir: Option<&Path>) -> String {
     )
 }
 
+/// Does this session not exist on the server the daemon is configured for?
+///
+/// Answers false on any tmux trouble, because the point is to soften one
+/// specific log line and a probe that cannot tell should not be the reason
+/// a real failure goes unreported. Runs off the reactor: it shells out to
+/// tmux, which blocks.
+async fn session_missing(inner: &Arc<Inner>, session: &str) -> bool {
+    let server = cyclops_tmux::layout::Server {
+        socket: inner.cfg.tmux_socket.clone(),
+        config_file: inner.cfg.tmux_config.clone(),
+    };
+    let session = session.to_string();
+    tokio::task::spawn_blocking(move || {
+        matches!(
+            cyclops_tmux::layout::session_exists(&server, &session),
+            Ok(false)
+        )
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// Own one configured session for the daemon's lifetime: attach, pump
 /// events, reattach with backoff when the connection dies or the session
 /// does not exist yet.
@@ -1334,7 +1356,19 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
             }
             Err(e) => {
                 if !announced_missing {
-                    warn!(session = %name, error = %e, "cannot attach; retrying with backoff");
+                    // Two different situations reach this arm, and only
+                    // one of them is trouble. A session that does not
+                    // exist yet is the ordinary case for a daemon started
+                    // before `cyclops start`, and it clears itself the
+                    // moment the session appears. Logging that at WARN as
+                    // "cannot attach" reads like a dead end, and an
+                    // operator who stops there never finds out that the
+                    // retry two seconds later succeeded.
+                    if session_missing(&inner, &name).await {
+                        info!(session = %name, "waiting for session; cyclops start creates it");
+                    } else {
+                        warn!(session = %name, error = %e, "cannot attach; retrying with backoff");
+                    }
                     announced_missing = true;
                 } else {
                     debug!(session = %name, error = %e, "attach retry failed");

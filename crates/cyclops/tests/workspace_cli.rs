@@ -42,6 +42,10 @@ fn cyclops(home: &Path, args: &[&str]) -> Output {
         .env("CYCLOPS_HOME", home)
         .env("NO_COLOR", "1")
         .env_remove("CYCLOPS_THEME")
+        // `start` offers `tmux attach` only outside tmux, so an inherited
+        // TMUX would give a developer running the suite from inside tmux
+        // different output than CI. The rule gets its own test below.
+        .env_remove("TMUX")
         .args(args)
         .output()
         .expect("run cyclops")
@@ -208,15 +212,17 @@ fn start_builds_the_workspace_and_says_what_is_left_to_do() {
         text.starts_with("✓ workspace ready · 2 agents\n"),
         "got {text:?}"
     );
-    // The daemon is down and the session is new, so all three rungs of the
-    // guided moment are still to do.
+    // The daemon is down and the session is new, so the guided moment is
+    // still to do: start the daemon, put the names on, open the workspace.
     assert!(text.contains("Next:"), "{text}");
     assert!(text.contains("cyclopsd &"), "{text}");
+    assert!(text.contains("cyclops start"), "{text}");
     assert!(text.contains("tmux attach -t duo"), "{text}");
-    assert!(
-        text.contains("cyclops send implementer --subject \"hello\""),
-        "{text}"
-    );
+    // And no send step. Only cyclopsd holds a name, so with it down
+    // nothing is named and `cyclops send implementer` would answer "no
+    // pane for implementer": a printed step that cannot work.
+    assert!(!text.contains("cyclops send"), "{text}");
+    assert!(text.contains("nothing was named yet"), "{text}");
     assert_eq!(panes(&t, "duo").len(), 2);
 
     let _ = fs::remove_dir_all(&home);
@@ -247,7 +253,73 @@ fn start_runs_twice_without_building_anything_twice() {
     assert!(text.starts_with("✓ workspace ready · 3 agents\n"), "{text}");
     // Same panes, same ids: nothing was rebuilt, nothing was added.
     assert_eq!(panes(&t, "ops"), first);
-    // And the step that opens a new workspace is gone, because it is open.
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// `--setup-only` is the installer's last step: make the home usable, and
+/// touch tmux for nothing. Needs no tmux server, which is the point.
+#[test]
+fn setup_only_writes_the_home_and_opens_nothing() {
+    let home = scratch_home("ws-setup");
+
+    let out = cyclops(&home, &["start", "--setup-only"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = stdout(&out);
+    assert!(text.starts_with("✔ cyclops is set up\n"), "got {text:?}");
+    assert!(text.contains("config.toml"), "{text}");
+    assert!(text.contains("3 detection manifests"), "{text}");
+    // No workspace, so no next steps: whoever called this owns what comes
+    // after it.
+    assert!(!text.contains("Next:"), "{text}");
+
+    assert!(home.join("config.toml").is_file());
+    assert!(home.join("manifests/claude.toml").is_file());
+
+    // Twice is a no-op. The installer runs it on every install, including
+    // the ones over a home that is already set up.
+    let again = stdout(&cyclops(&home, &["start", "--setup-only"]));
+    assert!(again.starts_with("✔ cyclops is set up\n"), "got {again:?}");
+    assert!(!again.contains("wrote"), "{again}");
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// The `tmux attach` step follows where you are, not what this run built.
+///
+/// It used to appear only when `start` created the session, which dropped
+/// it from the second run of a first setup: the run where the session
+/// exists, the panes still hold no agent, and opening it is the whole
+/// point. Inside tmux there is nothing to attach to, so it goes away.
+#[test]
+fn the_attach_step_follows_whether_you_are_inside_tmux() {
+    if !tmux_available() {
+        return;
+    }
+    let t = TmuxServer::new("ws-inside");
+    let home = scratch_home("ws-inside");
+    write_config(
+        &home,
+        &t,
+        "sessions = [\"duo\"]\ndefault_workspace = \"duo\"\n",
+    );
+
+    // First run builds it, second finds it there. Outside tmux both offer
+    // the step.
+    assert!(cyclops(&home, &["start", "--preset", "duo"])
+        .status
+        .success());
+    let again = stdout(&cyclops(&home, &["start"]));
+    assert!(again.contains("tmux attach -t duo"), "{again}");
+
+    let inside = Command::new(env!("CARGO_BIN_EXE_cyclops"))
+        .env("CYCLOPS_HOME", &home)
+        .env("NO_COLOR", "1")
+        .env("TMUX", "/tmp/tmux-501/default,12345,0")
+        .args(["start"])
+        .output()
+        .expect("run cyclops");
+    let text = stdout(&inside);
     assert!(!text.contains("tmux attach"), "{text}");
 
     let _ = fs::remove_dir_all(&home);

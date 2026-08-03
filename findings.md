@@ -456,3 +456,95 @@ reads the border back off tmux rather than off the daemon's own belief.
 Not a suite test, and deliberately: it measures a race and reports a
 distribution, so asserting on it would flake. The procedure above is the
 whole probe; it is 60 lines of Python and reproduces in under a minute.
+
+## F33. `cyclops start` printed a first step that could not work, because it read the count instead of the daemon (FIXED)
+
+The symptom an operator reported: `cyclops start` says `✓ workspace ready ·
+1 agent`, and its own third step answers with an error.
+
+```
+$ cyclops start
+✓ workspace ready · 1 agent
+
+Next:
+  1  cyclopsd &                                  start the daemon
+  2  tmux attach -t main                         open the workspace and start your agents
+  3  cyclops send implementer --subject "hello"  send the first message
+
+$ cyclopsd &
+$ cyclops send implementer --subject "hello"
+⚠ needs attention · no pane for "implementer"
+```
+
+Only cyclopsd holds a name. `start` ran before it, so the name went into
+the workspace file and onto no pane, and step 3 addressed an agent that
+did not exist. `cyclops list` right after says `No agents yet`.
+
+Three separate holes, all on the same path.
+
+**The count was the wrong witness.** The note that exists to say this
+(`names_wait`) was gated on `agents == 0`, and `agents` falls back to the
+workspace file's count when no daemon can be asked. That is exactly the
+case the note is for, so the note never printed. The gate now tests
+whether the daemon confirmed, which is the fact it was always about.
+
+**The step list was built from the file too.** `first_name` came from the
+layout whenever naming was allowed, whether or not anything had been
+named. It now comes from the layout only when the daemon is watching;
+otherwise the step is `cyclops start` again, which is the command that
+puts the names on.
+
+**The attach step was gated on the wrong thing.** `if !existed` dropped
+`tmux attach` from the second run of a first setup, which is the run where
+the panes still hold no agent and opening the session is the point. It
+now follows `$TMUX`: offered outside tmux, not offered inside.
+
+Measured after: daemon down, the three steps are `cyclopsd &`, `cyclops
+start`, `tmux attach -t main`, and each works when run.
+
+### The waiting half
+
+Starting the daemon first did not help either, for a different reason: the
+daemon retries its attach on a backoff (RECONNECT_MIN 200ms doubling to
+RECONNECT_MAX 5s), so a session created seconds ago is one it has not
+reached, and `start` saw `Watch::NotYet` and named nothing. Two runs
+either way round.
+
+`start` now waits, bounded at 6 seconds, when it just built the session
+and a daemon is there to wait for. Measured: 1.3s on this machine, and the
+first run reports the heavy check.
+
+Attaching turned out not to be enough to wait for. The first version
+returned as soon as `attached == true` and produced a partial adopt:
+
+```
+✔ workspace ready · 1 agent
+  no such target "%1"
+```
+
+The daemon reads the pane table after it attaches, and a pane it has not
+read cannot be labelled. The wait now ends when every pane the run built
+is one the daemon can see, which is why `session_view` returns the pane
+set alongside the names.
+
+### The log line that stopped the operator
+
+```
+WARN cyclopsd: cannot attach; retrying with backoff session=main error=tmux spawn failed: attach handshake failed
+```
+
+That is a daemon started before `cyclops start`, waiting for a session
+that does not exist yet. It clears itself: the retry three seconds later
+succeeded, in the same log. Logged at WARN with "cannot attach" in front,
+it reads as a dead end, and the operator stopped there rather than finding
+out. It now checks whether the session actually exists and says
+`INFO waiting for session; cyclops start creates it`, keeping the WARN for
+an attach that failed against a session that is there.
+
+### The shape of the mistake
+
+The same one as the perf fixture with zero attention items, and the settle
+predicate that passed on an empty record: a check pointed at a value that
+is only meaningful in the case it was not testing for. Here the count is
+a fallback, so reading it asks "is the file empty" while meaning to ask
+"did anything actually get named".

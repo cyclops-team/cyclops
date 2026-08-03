@@ -23,60 +23,65 @@ else should match line for line.
 
 ```bash
 git clone https://github.com/cyclops-team/cyclops.git && cd cyclops
-cargo install --path crates/cyclops
-cargo install --path crates/cyclopsd
+./scripts/install.sh
 ```
 
-Then check your shell can see both:
+It builds both binaries, puts them where your shell looks, and writes the
+config and detection manifests. It ends by telling you whether this shell
+can already find them:
 
 ```
-$ command -v cyclops cyclopsd
-/Users/you/.cargo/bin/cyclops
-/Users/you/.cargo/bin/cyclopsd
+✔ cyclops 0.1.0 is installed
+  cyclops    /Users/you/.local/bin/cyclops
+  cyclopsd   /Users/you/.local/bin/cyclopsd
+  home       /Users/you/.cyclops
+
+Next:
+  1  exec /bin/zsh -l  so your shell can find cyclops
+  2  cyclopsd &        start the daemon
+  3  cyclops start     open your workspace; it prints what to do next
 ```
 
-Nothing back means `~/.cargo/bin` is not on your PATH, which is common.
-[install.md](install.md) has the line to add for zsh and bash, and how to
-install somewhere else instead.
+Step 1 is there only when the installer had to add a line to your shell
+profile. It prints that line, backs the file up first, and
+`./scripts/install.sh --uninstall` takes it back out.
+[install.md](install.md) covers `--prefix`, `--no-path`, and installing
+with cargo instead.
+
+The home it set up holds two things, both needed. `config.toml` says which
+tmux session to watch. The manifests are how cyclops tells what is running
+in a pane, and nothing can be delivered to a pane it cannot read. Your
+edits to them survive later runs; [install.md](install.md) covers what
+happens when the shipped set gains one.
 
 Nothing below needs the repo. Run it from wherever you work.
 
 ## 2. Open the workspace
 
+The daemon first. Started the other way round it has no session to attach
+to, `cyclops start` has nothing to register a name with, and naming takes
+a second run.
+
+```bash
+cyclopsd &
+```
+
 `duo` is two panes side by side, one implementer and one reviewer.
 
 ```
 $ cyclops start --preset duo
-✓ workspace ready · 2 agents
-  wrote ~/.cyclops/config.toml
-  wrote 3 detection manifests to ~/.cyclops/manifests
+✔ workspace ready · 2 agents
 
 Next:
-  1  cyclopsd &                                  start the daemon
-  2  tmux attach -t main                         open the workspace and start your agents
-  3  cyclops send implementer --subject "hello"  send the first message
+  1  tmux attach -t main                         open the workspace and start your agents
+  2  cyclops send implementer --subject "hello"  send the first message
 ```
 
-Two files, both needed. The config says which tmux session to watch. The
-manifests are how cyclops tells what is running in a pane, and nothing can
-be delivered to a pane it cannot read. Your edits to them survive later
-runs; [install.md](install.md) covers what happens when the shipped set
-gains one.
+The heavy check means the daemon confirmed the roster: two panes it will
+deliver to, not two names in a file. A light `✓` means it could not be
+asked, and the line under it says so.
 
-Do the steps in order. `cyclopsd &` from anywhere; it reads
-`~/.cyclops/config.toml`, which `start` just wrote. Then attach, and start
-one agent CLI in each pane the way you normally would.
-
-Run `cyclops start` again once the agents are up. The second run is where
-the names go on the panes, because only a running daemon can adopt one:
-
-```
-$ cyclops start
-✔ workspace ready · 2 agents
-```
-
-The heavy check means the daemon confirmed the roster. A light `✓` means it
-could not be asked and the count came from the workspace file.
+Attach, and start one agent CLI in each pane the way you normally would.
 
 ## 3. Check the roster
 

@@ -64,6 +64,31 @@ jobs:
           cargo test --workspace --no-fail-fast
           python3 scripts/commpact-shim/test_shim.py
 
+  # The installer is what a stranger runs first, so it gets its own gate:
+  # build, place the binaries, edit a shell profile, set the home up, then
+  # uninstall and prove the profile came back byte for byte. Its own job
+  # because it does a cold release build, and behind `test` that would sit
+  # in front of every test result.
+  #
+  # Both platforms: the profile it picks and the tools it edits with differ
+  # (.bash_profile vs .bashrc, BSD vs GNU userland).
+  installer:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install tmux
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y tmux; else brew install tmux; fi
+      # The debug binaries the parity walk before it needs, then the
+      # installer section on top.
+      - run: cargo build --workspace
+      - run: ./demos/parity-check.sh --with-installer
+
   # ADR-001 owns the tmux-churn risk by testing the adapter against tmux HEAD.
   # Failures here are early warning, not merge blockers.
   tmux-head:

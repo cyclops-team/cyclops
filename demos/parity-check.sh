@@ -47,6 +47,17 @@ DAEMON_PID=""
 CHECKS=0
 FAILS=0
 
+# The installer section is opt-in because it runs `cargo build --release`,
+# and everything else here reuses the debug binaries that are already
+# built. Off by default it costs nothing; on, it is a cold release compile.
+# CI runs it as its own job so it does not sit in front of the test results.
+WITH_INSTALLER=0
+case "${1:-}" in
+  --with-installer) WITH_INSTALLER=1 ;;
+  "") ;;
+  *) echo "!! unknown option: $1 (only --with-installer)" >&2; exit 2 ;;
+esac
+
 cd "$REPO"
 
 for dep in tmux jq; do
@@ -312,9 +323,14 @@ run "$CYC" start --plain
 check "start builds the solo workspace"   '^✓ workspace ready · 1 agent$'
 check "start writes the config"           'wrote .*/config\.toml$'
 check "start installs the manifests"      '^  wrote 3 detection manifests to .*/manifests$'
-check "step 1 starts the daemon"          '^  1  cyclopsd &  +start the daemon$'
-check "step 2 attaches"                   '^  2  tmux attach -t main  +open the workspace and start your agents$'
-check "step 3 sends the first message"    '^  3  cyclops send implementer --subject "hello"  +send the first message$'
+check "and says nothing is named yet"     '^  cyclopsd isn.t running, so nothing was named yet\.'
+check "step 1 starts the daemon"          '^  1  cyclopsd & +start the daemon$'
+check "step 2 puts the names on"          '^  2  cyclops start +put the workspace.s names on the panes$'
+check "step 3 attaches"                   '^  3  tmux attach -t main +open the workspace and start your agents$'
+# No send step here. Nothing is named until the daemon is up, so a
+# `cyclops send implementer` printed at this point answers "no pane for
+# implementer": the one shape a first run must never be handed.
+check_absent "and offers no send yet"     'cyclops send implementer'
 
 printf '\n$ ls ~/.cyclops/manifests\n'
 ls "$CYCLOPS_HOME/manifests" > "$OUT"
@@ -396,7 +412,9 @@ wait_for "cyclopsd to see the new pane" 50 pane_known "$P2"
 run "$CYC" status --plain
 check "the header carries the eye"        '^‿ cyclops · watching main · tmux .* · up [0-9]'
 check "status lists a pane with no name"  "^ +$P2 +○ idle"
-check "and marks a pane no hook reported" '^ +implementer +○ idle +bash · hooks unverified$'
+# The shell name is whatever tmux reports for the rig's own `sh`, which is
+# bash on macOS and dash on Linux. This check is about the trailing marker.
+check "and marks a pane no hook reported" '^ +implementer +○ idle +[a-z]+ · hooks unverified$'
 
 run "$CYC" name "$P2" reviewer --plain
 check "naming confirms name and pane"     "^✔ named reviewer · $P2\$"
@@ -437,16 +455,14 @@ printf '\n$ tmux kill-session -t main\n'
 tmx kill-session -t '=main'
 wait_for "the roster to empty" 50 roster_empty
 
-# Same two runs as rung 1, for the same reason: the first rebuilds the
-# session, and only a daemon that has re-attached to it can put the names
-# back on. The light check is `start` declining to claim a roster it could
-# not read.
+# One run, not the two rung 1 needs. The daemon is already up here, so
+# `start` waits for it to re-attach to the session it just rebuilt and the
+# names go back on in the same run. The heavy check is what proves the
+# wait paid off: a roster cyclopsd confirmed, not one read off a file.
 run "$CYC" start --plain
-check "start rebuilds the session"        '^✓ workspace ready · 2 agents$'
+check "start rebuilds the session and names it" '^✔ workspace ready · 2 agents$'
 
 wait_for "cyclopsd to re-attach" 60 daemon_attached
-run "$CYC" start --plain
-check "and the second run names the panes" '^✔ workspace ready · 2 agents$'
 
 wait_for "the roster to come back" 60 roster_has reviewer
 # tmux titles a fresh pane with the hostname. Clear both so the roster
@@ -627,20 +643,33 @@ stop_duo_daemon() {
   DUO_PID=""
 }
 
-printf '\n$ cd ~/scratch && cyclops start --preset duo\n'
-duo "$CYC" start --preset duo --plain > "$OUT" 2>&1
+# The order scripts/install.sh and the README hand out: set the home up,
+# start the daemon, then open the workspace. Started the other way round
+# the first `start` has no daemon to register a name with, and naming
+# takes a second run (rung 1 covers that path).
+printf '\n$ cd ~/scratch && cyclops start --setup-only\n'
+duo "$CYC" start --setup-only --plain > "$OUT" 2>&1
 cat "$OUT"
-check "duo opens two panes"               '^✓ workspace ready · 2 agents$'
-check "and writes the config"             'wrote .*/config\.toml$'
+check "setup writes the config"           'wrote .*/config\.toml$'
 check "and installs the manifests"        '^  wrote 3 detection manifests to .*/manifests$'
-check "step 3 names the first agent"      '^  3  cyclops send implementer --subject "hello"  +send the first message$'
+check_absent "and opens nothing"          'workspace ready'
 
 # The daemon runs from the same empty directory. Nothing in the config
-# names a manifest directory, so it has to find the one `start` just wrote.
+# names a manifest directory, so it has to find the one setup just wrote.
 start_duo_daemon
+
+printf '\n$ cyclopsd &\n$ cyclops start --preset duo\n'
+duo "$CYC" start --preset duo --plain > "$OUT" 2>&1
+cat "$OUT"
+# The heavy check: one run, with the daemon confirming every name. This is
+# the whole point of the order, and the glyph is what proves it happened.
+check "duo opens two panes"               '^✔ workspace ready · 2 agents$'
+check "step 1 attaches"                   '^  1  tmux attach -t main +open the workspace and start your agents$'
+check "step 2 names the first agent"      '^  2  cyclops send implementer --subject "hello" +send the first message$'
+
 wait_for "the second daemon to attach" 60 duo_attached
 
-printf '\n$ cyclopsd &\n$ cyclops --json status | jq -r .manifests.ids[]\n'
+printf '\n$ cyclops --json status | jq -r .manifests.ids[]\n'
 duo "$CYC" --json status | jq -r '.manifests.ids[]' > "$OUT"
 cat "$OUT"
 check "the daemon found the shipped set"  '^claude$'
@@ -867,6 +896,75 @@ check "the delivered one is on the record" '^ +[0-9]+s +admin → implementer +h
 check "and the refused one too"            '^ +[0-9]+s +admin → ghostpane +hello +⚠ needs attention · nothing detects its pane$'
 
 stop_stock_daemon
+
+if [ "$WITH_INSTALLER" -eq 0 ]; then
+  echo
+  echo "== skipped: the installer section (./demos/parity-check.sh --with-installer)"
+fi
+
+# Run against a home of its own, so nothing here can reach the operator's
+# profile, binaries, or cyclops home.
+#
+# What this covers is the shapes install.md and QUICKSTART.md quote. The
+# defect it exists for is an installer that edits a shell profile in a way
+# the docs describe wrongly, which is the one thing here that touches a
+# file the operator wrote.
+if [ "$WITH_INSTALLER" -eq 1 ]; then
+echo
+echo "#### The installer docs/install.md documents"
+
+INST="$ROOT/inst"
+mkdir -p "$INST"
+printf '# an existing profile\nexport EXAMPLE=1\n' > "$INST/.zshrc"
+cp "$INST/.zshrc" "$ROOT/zshrc.before"
+
+printf '\n$ ./scripts/install.sh\n'
+env -i PATH="$PATH" HOME="$INST" SHELL=/bin/zsh TERM=dumb NO_COLOR=1 \
+  sh "$REPO/scripts/install.sh" > "$OUT" 2>&1 || true
+# The build log is noise here; the checks are all on what it says it did.
+grep -v '^ *\(Compiling\|Finished\|Downloaded\|Blocking\|Updating\|Adding\)' "$OUT" | tail -22
+
+check "it says where each binary went"    "^  cyclops    $INST/.local/bin/cyclops$"
+check "and the daemon too"                "^  cyclopsd   $INST/.local/bin/cyclopsd$"
+check "and where the home is"             "^  home       $INST/.cyclops$"
+check "it reports the version it built"   '^✔ cyclops [0-9]+\.[0-9]+\.[0-9]+ is installed$'
+check "step 2 starts the daemon"          '^  2  cyclopsd & +start the daemon$'
+check "step 3 opens the workspace"        '^  3  cyclops start +open your workspace; it prints what to do next$'
+check "it names the profile it edited"    "^  three lines added to $INST/.zshrc:$"
+check "and shows the block it added"      '^    # >>> cyclops >>>$'
+check "and the PATH line inside it"       "^    export PATH=\"$INST/.local/bin:\\\$PATH\"$"
+check "and where the backup went"         "^  the file as it was: $INST/.zshrc.cyclops-backup.[0-9]+$"
+
+check_file "the binaries are executable"  "$INST/.local/bin/cyclops" '.'
+check_file "and the home has a config"    "$INST/.cyclops/config.toml" '^sessions = '
+check_file "and the shipped manifests"    "$INST/.cyclops/manifests/claude.toml" '^id = "claude"$'
+
+# The profile has exactly one block, not one per run, and the second run
+# says so instead of appending another.
+printf '\n$ ./scripts/install.sh    # again\n'
+env -i PATH="$PATH" HOME="$INST" SHELL=/bin/zsh TERM=dumb NO_COLOR=1 \
+  sh "$REPO/scripts/install.sh" > "$OUT" 2>&1 || true
+grep -c '>>> cyclops >>>' "$INST/.zshrc" > "$ROOT/blocks"
+cat "$OUT" | grep 'already has the cyclops block' || true
+check_file "a second run adds no second block" "$ROOT/blocks" '^1$'
+
+printf '\n$ ./scripts/install.sh --uninstall\n'
+env -i PATH="$INST/.local/bin:$PATH" HOME="$INST" SHELL=/bin/zsh TERM=dumb NO_COLOR=1 \
+  sh "$REPO/scripts/install.sh" --uninstall > "$OUT" 2>&1 || true
+cat "$OUT"
+check "uninstall keeps the record"        "your record and config are untouched at $INST/.cyclops"
+
+# The load-bearing one. A profile this touched has to come back byte for
+# byte, or the installer is something an operator cannot safely undo.
+if diff -q "$ROOT/zshrc.before" "$INST/.zshrc" >/dev/null 2>&1; then
+  printf '   ok    the profile is byte-for-byte what it was\n'
+else
+  printf '   FAIL  the profile is byte-for-byte what it was\n'
+  diff "$ROOT/zshrc.before" "$INST/.zshrc" || true
+  FAILS=$((FAILS + 1))
+fi
+CHECKS=$((CHECKS + 1))
+fi
 
 echo
 echo "== $((CHECKS - FAILS))/$CHECKS checks passed"

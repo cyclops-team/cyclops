@@ -33,6 +33,13 @@ cargo test --workspace --no-fail-fast
 
 The last two take a few minutes. Run the first two while you work.
 
+Touching `scripts/install.sh` or what it prints adds one more, and it does
+a release build:
+
+```bash
+./demos/parity-check.sh --with-installer
+```
+
 ### `--no-fail-fast` is not optional
 
 `cargo test` stops at the first failing test **binary** and never runs the
@@ -184,8 +191,9 @@ throw away the signal that tells a portability bug from a real regression.
 | `python3 scripts/commpact-shim/test_shim.py` | The commPact v1 shim broke (bash and python, invisible to cargo) |
 | `./demos/parity-check.sh` | A doc quotes output the binaries no longer print |
 | The whole suite again with `CYCLOPS_TEST_TMP` relocated | Something hardcoded a scratch path (F24) |
+| `./demos/parity-check.sh --with-installer` | `scripts/install.sh` stopped doing what install.md says, or left a shell profile changed after `--uninstall`. Its own job: it does a release build |
 
-A seventh job builds tmux from master and runs the suite against it. It is
+An eighth job builds tmux from master and runs the suite against it. It is
 `continue-on-error`, so it warns rather than blocks: tmux is not this
 repo's to fix. It has earned its keep once already (F25), so when it goes
 red, read it rather than assuming it is the usual noise.

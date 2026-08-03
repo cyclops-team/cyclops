@@ -16,11 +16,24 @@ Needs tmux 3.2+ (developed on 3.6a) and a Rust toolchain.
 
 ```bash
 git clone https://github.com/cyclops-team/cyclops.git && cd cyclops
-cargo build --release
+./scripts/install.sh
 ```
 
-Binaries land in `target/release/`: `cyclopsd` (the daemon) and `cyclops`
-(the CLI). Put them on your PATH. More: [docs/install.md](docs/install.md).
+That builds both binaries, puts them where your shell looks, and writes
+the config and detection manifests. It prints every file it touches, backs
+up any shell profile it edits, and never uses sudo. `--prefix DIR` picks
+where the binaries go, `--no-path` leaves your profile alone, and
+`--uninstall` takes it all back off. More: [docs/install.md](docs/install.md).
+
+Then, in order:
+
+```bash
+cyclopsd &        # start the daemon
+cyclops start     # open your workspace
+```
+
+The daemon first. Started the other way round it has no session to attach
+to, and the first `cyclops start` can name nothing.
 
 Building from source is how you run this implementation. The one-line
 installer on usecyclops.dev installs the previous shell implementation,
@@ -46,21 +59,24 @@ reports. Everything else should match line for line.
 
 ### 1. One pane
 
-`cyclops start` opens a workspace and tells you what is left to do.
+With the daemon running, `cyclops start` opens a workspace, names its
+panes, and tells you what is left to do.
 
 ```
-$ cyclops start
-✓ workspace ready · 1 agent
-  wrote ~/.cyclops/config.toml
+$ cyclops start --preset duo
+✔ workspace ready · 2 agents
 
 Next:
-  1  cyclopsd &                                  start the daemon
-  2  tmux attach -t main                         open the workspace and start your agents
-  3  cyclops send implementer --subject "hello"  send the first message
+  1  tmux attach -t main                         open the workspace and start your agents
+  2  cyclops send implementer --subject "hello"  send the first message
 ```
 
-Do them in order. Start the daemon, attach, run your agent CLI in the pane
-the way you normally would. Then send it something.
+The heavy check means cyclopsd confirmed each name. Run `cyclops start`
+before the daemon and you get the light one, plus a line saying nothing
+was named yet and the step that fixes it.
+
+Do them in order. Attach, run your agent CLI in the pane the way you
+normally would. Then send it something.
 
 ```
 $ cyclops send implementer --subject "Review the rate limiter" --body "gateway.rs:120 drops the burst path"

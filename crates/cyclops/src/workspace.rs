@@ -25,6 +25,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use cyclops_tmux::layout::{self, ApplyOptions, Capture, Layout, Server};
 use serde_json::{json, Value};
@@ -280,25 +281,73 @@ impl Watch {
 /// Ask the daemon about a session. Never fatal: every verb here works
 /// without a daemon, minus the names.
 fn watch_of(client: &mut Client, session: &str) -> Watch {
+    session_view(client, session).0
+}
+
+/// One status request, answering both questions callers ask of it: what
+/// the daemon is doing with this session, and which panes it can see.
+///
+/// The pane set is separate from the names because they are different
+/// facts. A pane the daemon has not read yet carries no name and cannot be
+/// given one, so a caller about to label panes has to check the set and
+/// not the names.
+fn session_view(client: &mut Client, session: &str) -> (Watch, HashSet<String>) {
+    let none = HashSet::new();
     let Ok(v) = client.request("status", json!({})) else {
-        return Watch::Down;
+        return (Watch::Down, none);
     };
     let Some(sessions) = v.get("sessions").and_then(Value::as_array) else {
-        return Watch::Down;
+        return (Watch::Down, none);
     };
     let Some(s) = sessions.iter().find(|s| s["name"] == json!(session)) else {
-        return Watch::Elsewhere;
+        return (Watch::Elsewhere, none);
     };
     if s["attached"] != json!(true) {
-        return Watch::NotYet;
+        return (Watch::NotYet, none);
     }
     let mut labels = BTreeMap::new();
+    let mut panes = HashSet::new();
     for p in s["panes"].as_array().into_iter().flatten() {
-        if let (Some(id), Some(agent)) = (p["pane_id"].as_str(), p["agent"].as_str()) {
+        let Some(id) = p["pane_id"].as_str() else {
+            continue;
+        };
+        panes.insert(id.to_string());
+        if let Some(agent) = p["agent"].as_str() {
             labels.insert(id.to_string(), agent.to_string());
         }
     }
-    Watch::Watching(labels)
+    (Watch::Watching(labels), panes)
+}
+
+/// How long `start` waits for cyclopsd to connect to a session it just
+/// built. The daemon's reattach backoff caps at five seconds (cyclopsd's
+/// RECONNECT_MAX), so this is that plus a margin.
+const ATTACH_WAIT: Duration = Duration::from_secs(6);
+
+/// Wait for cyclopsd to reach a session and read its panes, or give up.
+///
+/// Attaching is not enough to wait for. The daemon reads the pane table
+/// after it attaches, and a pane it has not read yet cannot be labelled:
+/// naming one answers `no such target "%1"`. So the wait ends when every
+/// pane this run built is one the daemon can see.
+///
+/// Giving up is not a failure. The caller reports what it could confirm
+/// and prints the step that names the panes once the daemon catches up,
+/// which is better than a terminal that never comes back.
+fn wait_for_attach(client: &mut Client, session: &str, built: &[String]) -> Watch {
+    let deadline = Instant::now() + ATTACH_WAIT;
+    loop {
+        let (watch, panes) = session_view(client, session);
+        let ready =
+            matches!(watch, Watch::Watching(_)) && built.iter().all(|id| panes.contains(id));
+        if ready || !matches!(watch, Watch::NotYet | Watch::Watching(_)) {
+            return watch;
+        }
+        if Instant::now() >= deadline {
+            return watch;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Connect without printing. A down daemon is a normal state for these
@@ -536,43 +585,38 @@ pub fn run_start(
     }
 
     // 3.
-    if !settings.exists {
-        let path = config_path(&home);
-        if let Err(e) = write_first_run_config(&home, &session) {
+    let seeded = match prepare_home(&home, &settings, &session) {
+        Ok((home_notes, seeded)) => {
+            notes.extend(home_notes);
+            seeded
+        }
+        Err(e) => {
             eprintln!("{e}");
             return 1;
         }
-        notes.push(format!("wrote {}", path.display()));
-    } else if !settings.watches(&session) {
-        notes.push(config_hint(&config_path(&home), &session));
-    }
-    // Every run, not only the first. A home that predates the seed gets the
-    // manifests without a reinstall, and a shipped set that gains a file
-    // reaches an existing home on the next start. Files already there are
-    // never touched (crate::manifests).
-    let seeded = crate::manifests::seed(&home);
-    if seeded.none_installed() {
-        // The one thing on this page that says the ready line above is
-        // empty: with no manifests cyclopsd reads every pane as unknown and
-        // no message reaches an agent.
-        notes.push(crate::manifests::nothing_installed(&seeded));
-    } else {
-        if !seeded.written.is_empty() {
-            notes.push(crate::manifests::installed(&seeded));
-        }
-        if !seeded.problems.is_empty() {
-            notes.push(crate::manifests::partly_installed(&seeded));
-        }
-    }
+    };
 
     // 4. The registry is the only record of which pane already answers to
     //    which name, and gate 3 below is that record against the
     //    workspace, so the daemon is asked before anything is decided.
     let mut client = daemon();
-    let watch = match client.as_mut() {
+    let mut watch = match client.as_mut() {
         None => Watch::Down,
         Some(c) => watch_of(c, &session),
     };
+    // A session built seconds ago is one cyclopsd has not connected to
+    // yet, and until it does, no pane can be named. Waiting for it here is
+    // what makes one `cyclops start` enough: without this the first run
+    // builds the session, names nothing, and a second run is what puts the
+    // names on.
+    //
+    // Only when this run built the session, and only with a daemon there
+    // to wait for. Every other state is already its own answer.
+    if !existed && matches!(watch, Watch::NotYet | Watch::Watching(_)) {
+        if let Some(c) = client.as_mut() {
+            watch = wait_for_attach(c, &session, &pane_ids);
+        }
+    }
     let watching = matches!(watch, Watch::Watching(_));
     let live_labels = match &watch {
         Watch::Watching(labels) => labels.clone(),
@@ -638,33 +682,50 @@ pub fn run_start(
     };
     // A workspace with names in it, and none of them on a pane, looks like
     // the verb did nothing, so it gets a line saying why. Not when a gate
-    // already explained itself, and not when the daemon answered: both
-    // have said it once already.
-    if agents == 0 && layout.agents() > 0 && allowed {
+    // already explained itself: that has said it once already.
+    //
+    // The test is whether the daemon confirmed, NOT what the count says.
+    // The count above falls back to the workspace file when nobody could
+    // be asked, which is exactly the case this note exists for, so testing
+    // the count meant the note never printed and the run looked done.
+    if !watching && layout.agents() > 0 && allowed {
         if let Some(why) = unaskable(&watch, &session) {
-            notes.push(names_wait(&name, &session, &why));
+            notes.push(names_wait_step(&why));
         }
     }
-    // 7.
+    // 7. Every step here has to be a command that works when it is run.
+    //    A step that answers with an error is worse than one step fewer.
     if matches!(watch, Watch::Down) {
         steps.push(("cyclopsd &".into(), "start the daemon".into()));
     }
-    if !existed {
+    // A name is addressable only once cyclopsd holds it, so with no daemon
+    // watching, `cyclops send <name>` answers "no pane for ...". What
+    // belongs here instead is the command that puts the names on: this
+    // verb again, once the daemon is up.
+    let addressable = if !watching {
+        None
+    } else if allowed {
+        layout.panes().find_map(|p| p.label.clone())
+    } else {
+        live_labels.values().next().cloned()
+    };
+    if addressable.is_none() && layout.agents() > 0 && allowed {
+        steps.push((
+            start_again(&name, &session),
+            "put the workspace's names on the panes".into(),
+        ));
+    }
+    // Offered whenever this shell is outside tmux, not only when this run
+    // built the session. Gating it on "just created" dropped the step on
+    // the second run of a first setup, which is the run where the operator
+    // still has no agent in the pane and most needs to open it.
+    if std::env::var_os("TMUX").is_none() {
         steps.push((
             format!("tmux attach -t {session}"),
             "open the workspace and start your agents".into(),
         ));
     }
-    // The last step has to name an agent that will exist: the workspace's
-    // first when its names may go on these panes, otherwise one the daemon
-    // already holds. A step naming an agent nobody can address is worse
-    // than one step fewer.
-    let first_name = if allowed {
-        layout.panes().find_map(|p| p.label.clone())
-    } else {
-        live_labels.values().next().cloned()
-    };
-    if let Some(first) = first_name {
+    if let Some(first) = addressable {
         steps.push((
             format!("cyclops send {first} --subject \"hello\""),
             "send the first message".into(),
@@ -702,6 +763,116 @@ pub fn run_start(
     if !steps.is_empty() {
         println!();
         println!("{}", next_steps(&steps, style));
+    }
+    0
+}
+
+/// Everything a run puts in the home directory, and nothing that touches
+/// tmux: the config on a first run, and the shipped manifests on every
+/// run. Returns the lines to print under the ready line, and what the
+/// seed did.
+///
+/// One home for this because two verbs need it. `cyclops start` runs it on
+/// the way to opening a workspace, and `cyclops start --setup-only` runs
+/// it alone, which is what the installer calls. A second copy would let
+/// the installed home drift from the one a first `start` writes, and that
+/// gap is invisible until a message fails to reach a pane.
+fn prepare_home(
+    home: &Path,
+    settings: &Settings,
+    session: &str,
+) -> Result<(Vec<String>, crate::manifests::Seeded), String> {
+    let mut notes: Vec<String> = Vec::new();
+
+    // 1. The config names the session, which is the only reason cyclopsd
+    //    watches it. An existing config is never rewritten; it gets a line
+    //    saying what to add when it does not name this session.
+    if !settings.exists {
+        let path = config_path(home);
+        write_first_run_config(home, session)?;
+        notes.push(format!("wrote {}", path.display()));
+    } else if !settings.watches(session) {
+        notes.push(config_hint(&config_path(home), session));
+    }
+
+    // 2. Manifests, every run and not only the first. A home that predates
+    //    the seed gets them without a reinstall, and a shipped set that
+    //    gains a file reaches an existing home on the next run. Files
+    //    already there are never touched (crate::manifests).
+    let seeded = crate::manifests::seed(home);
+    if seeded.none_installed() {
+        // The one note that contradicts the ready line above it: with no
+        // manifests cyclopsd reads every pane as unknown and no message
+        // reaches an agent.
+        notes.push(crate::manifests::nothing_installed(&seeded));
+    } else {
+        if !seeded.written.is_empty() {
+            notes.push(crate::manifests::installed(&seeded));
+        }
+        if !seeded.problems.is_empty() {
+            notes.push(crate::manifests::partly_installed(&seeded));
+        }
+    }
+    Ok((notes, seeded))
+}
+
+/// `cyclops start --setup-only`: make the home usable and stop.
+///
+/// The installer's last step. It writes the same config and manifests a
+/// first `cyclops start` would and never opens a session, because an
+/// installer that creates tmux sessions behind the operator is a surprise,
+/// and because a machine without tmux should still finish installing.
+pub fn run_setup(json_out: bool, style: &Style) -> i32 {
+    let home = cyclops_proto::cyclops_home();
+    let settings = Settings::read(&home);
+    // The session the config will name. `start` with no arguments opens
+    // this same one, so the config this writes is the config that run wants.
+    let session = settings.workspace_name(None);
+
+    let (notes, seeded) = match prepare_home(&home, &settings, &session) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+
+    // A home with no manifests cannot deliver to anything, so this verb
+    // does not get to call itself done. The installer reads the exit code.
+    let usable = !seeded.none_installed();
+
+    if json_out {
+        println!(
+            "{}",
+            json!({
+                "home": home.display().to_string(),
+                "session": session,
+                "usable": usable,
+                "manifests": {
+                    "dir": seeded.dir.display().to_string(),
+                    "written": seeded.written,
+                    "kept": seeded.kept,
+                },
+                "notes": notes,
+            })
+        );
+        return if usable { 0 } else { 1 };
+    }
+    if !usable {
+        for note in &notes {
+            eprintln!("{note}");
+        }
+        return 1;
+    }
+    // No next steps here, unlike every other verb. Whoever called this
+    // owns what comes after it: the installer prints its own list, and a
+    // person running it by hand is already past the part that needs one.
+    println!(
+        "{}",
+        style.bold(&format!("{} cyclops is set up", crate::render::check(true)))
+    );
+    for note in &notes {
+        println!("  {}", style.dim(note));
     }
     0
 }
@@ -1253,6 +1424,13 @@ fn unaskable(watch: &Watch, session: &str) -> Option<String> {
         Watch::NotYet => Some(format!("cyclopsd hasn't connected to \"{session}\" yet")),
         Watch::Watching(_) => None,
     }
+}
+
+/// The same fact as [`names_wait`], for a caller whose step list already
+/// carries the command. Printing it in both places reads like two things
+/// to do when there is one.
+fn names_wait_step(why: &str) -> String {
+    format!("{why}, so nothing was named yet. The names are in the workspace; the step below puts them on.")
 }
 
 fn names_wait(workspace: &str, session: &str, why: &str) -> String {

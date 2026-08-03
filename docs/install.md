@@ -10,59 +10,105 @@
 
 ```bash
 git clone https://github.com/cyclops-team/cyclops.git && cd cyclops
+./scripts/install.sh
+```
+
+That is the whole install. It builds both binaries, puts them where your
+shell looks, writes the config and the detection manifests, and proves the
+result runs.
+
+Two binaries: `cyclops` (the CLI) and `cyclopsd` (the daemon).
+
+### Where the binaries go
+
+The installer prefers a directory your shell already searches, checking
+`~/.local/bin`, `~/bin`, then `~/.cargo/bin`. Finding one means no profile
+edit at all. Finding none, it uses `~/.local/bin` and adds one line to your
+shell profile.
+
+`--prefix DIR` overrides the choice:
+
+```bash
+./scripts/install.sh --prefix ~/bin
+```
+
+It never uses sudo. A prefix you cannot write to is an error with the fix
+in it, not a password prompt.
+
+### What it does to your shell profile
+
+Only when the prefix is not already on your PATH, and never without saying
+so. It copies the file to `<profile>.cyclops-backup.<timestamp>`, appends
+three lines, and prints both:
+
+```
+== adding /Users/you/.local/bin to your PATH
+  three lines added to /Users/you/.zshrc:
+
+    # >>> cyclops >>>
+    export PATH="/Users/you/.local/bin:$PATH"
+    # <<< cyclops <<<
+
+  the file as it was: /Users/you/.zshrc.cyclops-backup.20260803082117
+  undo: cp "/Users/you/.zshrc.cyclops-backup.20260803082117" "/Users/you/.zshrc"    (or ./scripts/install.sh --uninstall)
+```
+
+The markers are what make a second run a no-op instead of a second copy.
+The file it picks follows `$SHELL`: `.zshrc` for zsh, `.bash_profile` or
+`.bashrc` for bash, `config.fish` for fish. A shell it does not know gets
+the line printed and no edit.
+
+`--no-path` skips all of it and prints the line for you to add yourself.
+
+### Uninstall
+
+```bash
+./scripts/install.sh --uninstall
+```
+
+Removes both binaries and takes the block back out of your profile,
+backing it up again first. It leaves `~/.cyclops` alone and says how to
+remove that too; the ledger under it is your message history.
+
+### With cargo instead
+
+```bash
 cargo install --path crates/cyclops
 cargo install --path crates/cyclopsd
 ```
 
-Two binaries: `cyclops` (the CLI) and `cyclopsd` (the daemon). Both go to
-`~/.cargo/bin`. Cargo says so on the last line of each install, and warns
-when that directory is not on your PATH.
+Both go to `~/.cargo/bin`, and cargo warns when that is not on your PATH.
+`cargo install --root ~/.local --path crates/cyclops` writes
+`~/.local/bin/cyclops` instead; the root is the prefix, not the directory,
+and cargo appends `bin`.
 
-To build without installing, `cargo build --release` puts the same two in
+Installing this way does no setup, so run `cyclops start --setup-only`
+after it to write the config and the manifests.
+
+To build without installing, `cargo build --release` puts both in
 `target/release/`.
 
-## Put them on your PATH
-
-Check:
+### Check your shell can find them
 
 ```bash
 $ command -v cyclops cyclopsd
-/Users/you/.cargo/bin/cyclops
-/Users/you/.cargo/bin/cyclopsd
+/Users/you/.local/bin/cyclops
+/Users/you/.local/bin/cyclopsd
 ```
 
-Two paths back means you are done. Nothing back means the shell cannot see
-them, and `~/.cargo/bin` is on plenty of machines without being on the
-PATH of any of them. Add it, then open a new shell:
-
-```bash
-# zsh
-echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.zshrc
-
-# bash
-echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc
-```
-
-If you already keep binaries somewhere on your PATH, `cargo install
---root` puts them there instead of in `~/.cargo/bin`:
-
-```bash
-cargo install --root ~/.local --path crates/cyclops
-cargo install --root ~/.local --path crates/cyclopsd
-```
-
-`--root ~/.local` writes `~/.local/bin/cyclops`. The root is the prefix,
-not the directory; cargo appends `bin`.
+Two paths back means you are done. Nothing back means the shell has not
+read the profile line yet: open a new shell, or `exec $SHELL -l`.
 
 ## Configure
 
 Cyclops keeps everything under `~/.cyclops` (override with `$CYCLOPS_HOME`,
 which has a length limit: see [below](#keep-cyclops_home-short)).
-`cyclops start` sets it up, so the short way is:
+`./scripts/install.sh` already did this. The same step on its own, which is
+what the installer calls and what a cargo install needs afterwards:
 
 ```
-$ cyclops start
-✓ workspace ready · 1 agent
+$ cyclops start --setup-only
+✔ cyclops is set up
   wrote /Users/you/.cyclops/config.toml
   wrote 3 detection manifests to /Users/you/.cyclops/manifests
 ```
@@ -70,6 +116,10 @@ $ cyclops start
 Two things, and both matter. The config says which tmux sessions to watch.
 The manifests are how cyclops tells what is running in a pane; without
 them every pane reads `? unknown` and no message can be delivered to one.
+
+`--setup-only` writes them and opens nothing. A plain `cyclops start`
+writes the same files on its way to opening a workspace, so a machine that
+has run either one is set up.
 
 The long way, by hand. Create `~/.cyclops/config.toml`:
 
@@ -174,14 +224,18 @@ and prints its usual next steps, because nothing it does needs a socket.
 ## Run
 
 ```bash
-cyclops start   # ✓ workspace ready · 1 agent
 cyclopsd &
+cyclops start   # ✔ workspace ready · 1 agent
 cyclops status
 ```
 
-The check is light because the daemon is not up yet, so that one agent is
-a name in a file and nothing can be addressed. Run `cyclops start` again
-after `cyclopsd &` and it goes heavy: the count is the roster then.
+The daemon first, and the order is the difference between one command and
+two. Only cyclopsd holds a name, so a `cyclops start` that runs before it
+builds the session and names nothing: it says so, and the step it prints
+is `cyclops start` again. With the daemon already up, `start` waits for it
+to reach the session it just built and the names go on in the same run.
+That is what the heavy check reports: a roster the daemon confirmed, not a
+count read off a file.
 
 `start` opens the default workspace, building it from the `solo` preset
 the first time. `--preset duo|quad|ops` picks a bigger one;
@@ -247,6 +301,10 @@ python3 scripts/commpact-shim/test_shim.py
 
 `parity-check.sh` walks the README ladder against a throwaway tmux server
 and fails if a line the docs quote is no longer what the binaries print.
+`--with-installer` adds `scripts/install.sh` to the walk: it installs into
+a throwaway home, checks the shapes this page quotes, then uninstalls and
+proves the shell profile came back byte for byte. It is opt-in because it
+does a release build, and CI runs it as its own job.
 
 `--no-fail-fast` is not optional: cargo stops at the first failing test
 binary and hides every binary after it, which is how one portability bug

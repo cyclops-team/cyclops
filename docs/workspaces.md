@@ -11,22 +11,27 @@ cyclops start
 
 ```
 ✓ workspace ready · 3 agents
+  cyclopsd isn't running, so nothing was named yet. The names are in the workspace; the step below puts them on.
 
 Next:
-  1  cyclopsd &                                  start the daemon
-  2  tmux attach -t main                         open the workspace and start your agents
-  3  cyclops send implementer --subject "hello"  send the first message
+  1  cyclopsd &           start the daemon
+  2  cyclops start        put the workspace's names on the panes
+  3  tmux attach -t main  open the workspace and start your agents
 ```
 
 `start` is safe to run as often as you like. A session that is already
 there is left exactly as it is, and the list only shows what is still
-undone, so the second run is one line and a shorter list.
+undone.
 
 The check is light there because no daemon is running yet, so the three
 agents are three names in a file and nothing can be addressed. It goes
 heavy once cyclopsd answers for them. That is the same rule as
 `✔ delivered · verified` against `✓ delivered · unverified (screen)`:
 the weight says who confirmed the thing beside it.
+
+Start the daemon first and there is no second run: `start` waits for
+cyclopsd to reach the session it just built, the names go on, and the
+check is heavy the first time.
 
 What it decides:
 

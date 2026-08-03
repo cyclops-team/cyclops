@@ -1,12 +1,12 @@
 # Status
 
-Updated 2026-08-03. M6 is complete and committed: the first run works now,
-and the system is documented for someone who is not its author. A reviewer
-working only from the docs could build it, explain how a message becomes a
-verified receipt, write a manifest for a CLI that does not exist and watch a
-pane bind to it, debug a stuck delivery, and list the invariants. 580 tests
-across 63 targets, parity 93/93, CI green, v2 is main. Next is the installer,
-then M7 flow features.
+Updated 2026-08-03. The installer ships and the first run works end to end.
+`./scripts/install.sh` builds both binaries, puts them where the shell
+looks, sets the home up, and proves the result runs; `--uninstall` puts the
+machine back. Getting there turned up F33, three defects on the first-run
+path that made `cyclops start` print a step which answered with an error.
+582 tests across 63 targets, parity 96/96 (112/112 with the installer
+section), CI green, v2 is main. Next is M7 flow features.
 One thing still waits on admin: the v1 cutover.
 
 ## Done
@@ -288,6 +288,34 @@ One thing still waits on admin: the v1 cutover.
     tuning, plus a guard asserting that leg's config stays untuned. Every
     defect above lived behind a gate that only ever tested the
     configured-perfectly path. 93/93.
+- The installer, and F33 with it (this commit):
+  - `scripts/install.sh`, POSIX sh: checks tmux and cargo with the fix in
+    each error, builds from the clone it sits in (or clones when piped
+    from the network), installs both binaries, puts the prefix on PATH,
+    sets the home up, and proves the shell finds what it installed. No
+    sudo, no tmux.conf, nothing outside the operator's home. `--prefix`,
+    `--no-path`, `--uninstall`.
+  - It prefers a directory already on PATH (`~/.local/bin`, `~/bin`,
+    `~/.cargo/bin`), so the quietest install edits no profile at all. When
+    it must edit one it backs the file up, appends one marker-delimited
+    block, and prints the block, the backup and the undo. A second run
+    adds nothing; `--uninstall` restores the file byte for byte, which the
+    parity gate asserts by diff.
+  - `cyclops start --setup-only` writes the config and the manifests and
+    opens nothing. The installer calls it rather than reimplementing what
+    a usable home is, so the two cannot drift.
+  - F33, three defects on the first-run path: `start` printed
+    `cyclops send <name>` as a step while nothing was named, the note that
+    exists to say so was gated on a count that falls back to the workspace
+    file, and the `tmux attach` step vanished on the run that most needed
+    it. Plus the waiting half: `start` now waits for cyclopsd to reach a
+    session it just built AND to have read its panes, so one run names
+    everything (1.3s measured, heavy check). And the daemon's
+    `WARN cannot attach` for a session that does not exist yet, which is
+    the line that stopped the operator, is now an INFO naming the fix.
+  - Parity covers the installer behind `--with-installer`, in its own CI
+    job because it does a release build: 112/112 with it, 96/96 without,
+    and the skip says so rather than passing silently.
 
 ## ADMIN_ACTION_REQUIRED (not blocking the build)
 
@@ -366,20 +394,19 @@ it lying in minutes.
 
 ## Next
 
-- M5 polish parity. Running. The theme set, `cyclops theme` and hardened
-  hot reload are in (see Done). Still open: landing-page command parity,
-  docs examples elsewhere in docs/, README quickstart on the progressive
-  ladder.
-- M6 handoff, and this is now the milestone that matters most. The bar is
-  a person, not a checklist: a competent engineer who has never seen this
-  repo should be able to build and run it, explain how a message becomes a
-  verified receipt, add a new agent CLI, debug a stuck delivery, and know
-  which invariants they must not break and why, without asking anyone.
-  docs/STYLE.md is the standard, so this means fewer and better placed
-  words, not more, with diagrams where prose is worse.
 - M7 flow features: `cyclops pipe`, attention routing, `--wait`
   composition ergonomics. Moved behind the handoff milestone so its docs
   are written as it ships rather than retrofitted.
+- The SUN_LEN dead end. A `$CYCLOPS_HOME` past 98 bytes can never bind a
+  socket, `cyclops start` succeeds anyway because nothing it does needs
+  one, and every later command says "Check that cyclopsd is still running,
+  then retry", which can never help. Two fixes: `start` refuses a home too
+  long to bind, and the connect-error copy names CYCLOPS_HOME and the cap.
+  Documented in install.md today, which is not the same as caught.
+- Gate the paths docs quote, and cover the QUICKSTART script example. A
+  path in a doc is checkable and is not checked; the allowlist has to
+  carry `bin/commPact`, `versions/2.1.220`, the workspaces.md ratios, and
+  cargo's `target/` outputs.
 
 Dropped by admin decision on 2026-08-03:
 
