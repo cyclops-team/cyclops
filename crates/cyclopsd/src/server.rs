@@ -709,6 +709,8 @@ pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResul
             ids: inner.manifests.keys().cloned().collect(),
             dir: inner.manifest_dir.as_ref().map(|d| d.display().to_string()),
         }),
+        // The one process that can say this without guessing.
+        pid: Some(std::process::id()),
     }
 }
 

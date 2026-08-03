@@ -255,9 +255,12 @@ fn ui_daemon_down_reports_and_exits_one() {
     let home = scratch_home("down");
     let out = run_ui(&home, &["ui", "--plain"]);
     assert_eq!(out.status.code(), Some(1));
+    // The same sentence the CLI prints, from the same place. It used to
+    // be a literal here and a literal there, so the stream would have
+    // kept saying `cyclopsd &` after `cyclops start` took the job over.
     assert_eq!(
         String::from_utf8_lossy(&out.stderr).trim(),
-        "cyclops isn't running. Start it with: cyclopsd &"
+        cyclops_proto::NOT_RUNNING
     );
     let _ = fs::remove_dir_all(&home);
 }

@@ -67,3 +67,12 @@ pub fn cyclops_home() -> std::path::PathBuf {
 pub fn socket_path() -> std::path::PathBuf {
     cyclops_home().join(SOCK_NAME)
 }
+
+/// Nothing is answering the socket, and the command that fixes it.
+///
+/// Here, beside the socket path, because every surface that can fail to
+/// reach the daemon has to say the same thing. The CLI and the stream
+/// each carried their own copy of this sentence, and when `cyclops start`
+/// took over starting the daemon, one of them would have kept telling
+/// people to run `cyclopsd &`.
+pub const NOT_RUNNING: &str = "cyclops isn't running. Start it with: cyclops start";

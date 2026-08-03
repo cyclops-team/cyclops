@@ -329,10 +329,14 @@ pub struct Backfilled {
 }
 
 /// Connection errors in the CLI's words: what happened, next step.
+///
+/// The sentence is cyclops_proto's, not a copy of it. A copy lived here
+/// and would have gone on naming `cyclopsd &` after `cyclops start` took
+/// over starting the daemon.
 fn connect_words(e: std::io::Error) -> String {
     match e.kind() {
         std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
-            "cyclops isn't running. Start it with: cyclopsd &".to_string()
+            cyclops_proto::NOT_RUNNING.to_string()
         }
         _ => e.to_string(),
     }

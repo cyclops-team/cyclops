@@ -1,6 +1,8 @@
 # Status
 
-Updated 2026-08-03. The installer ships and the first run works end to end.
+Updated 2026-08-03. One command is the whole first run: `cyclops start`
+opens the workspace, starts the daemon, and names the panes. The installer
+ships too.
 `./scripts/install.sh` builds both binaries, puts them where the shell
 looks, sets the home up, and proves the result runs; `--uninstall` puts the
 machine back. Getting there turned up F33, three defects on the first-run
@@ -423,12 +425,9 @@ it lying in minutes.
 - M7 flow features: `cyclops pipe`, attention routing, `--wait`
   composition ergonomics. Moved behind the handoff milestone so its docs
   are written as it ships rather than retrofitted.
-- The SUN_LEN dead end. A `$CYCLOPS_HOME` past 98 bytes can never bind a
-  socket, `cyclops start` succeeds anyway because nothing it does needs
-  one, and every later command says "Check that cyclopsd is still running,
-  then retry", which can never help. Two fixes: `start` refuses a home too
-  long to bind, and the connect-error copy names CYCLOPS_HOME and the cap.
-  Documented in install.md today, which is not the same as caught.
+- M8 the dashboard: a roster beside the stream rather than a feed alone,
+  per-agent detail (elapsed in state, which CLI and its version), more
+  themes, and mouse support for clicking a row to jump to its pane.
 
 Dropped by admin decision on 2026-08-03:
 

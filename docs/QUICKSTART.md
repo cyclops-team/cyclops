@@ -38,8 +38,7 @@ can already find them:
 
 Next:
   1  exec /bin/zsh -l  so your shell can find cyclops
-  2  cyclopsd &        start the daemon
-  3  cyclops start     open your workspace; it prints what to do next
+  2  cyclops start     open your workspace; it prints what to do next
 ```
 
 Step 1 is there only when the installer had to add a line to your shell
@@ -58,13 +57,8 @@ Nothing below needs the repo. Run it from wherever you work.
 
 ## 2. Open the workspace
 
-The daemon first. Started the other way round it has no session to attach
-to, `cyclops start` has nothing to register a name with, and naming takes
-a second run.
-
-```bash
-cyclopsd &
-```
+One command. It builds the session, starts the daemon if none is running,
+waits for it to reach the session, and names the panes.
 
 `duo` is two panes side by side, one implementer and one reviewer.
 
@@ -80,6 +74,10 @@ Next:
 The heavy check means the daemon confirmed the roster: two panes it will
 deliver to, not two names in a file. A light `✓` means it could not be
 asked, and the line under it says so.
+
+The daemon outlives the shell you typed in. `cyclops daemon status` says
+whether one is running, `cyclops daemon stop` takes it down, and
+`cyclops daemon log` is where a detached one writes.
 
 Attach, and start one agent CLI in each pane the way you normally would.
 

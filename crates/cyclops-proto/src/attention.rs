@@ -622,6 +622,7 @@ mod tests {
             }],
             open_deliveries: open,
             manifests: None,
+            pid: None,
         }
     }
 

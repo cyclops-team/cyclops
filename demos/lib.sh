@@ -88,7 +88,18 @@ cyc_tmux_socket_path() {
 cyc_stop_daemon() {
   if [ -n "${DAEMON_PID:-}" ]; then
     kill "$DAEMON_PID" 2>/dev/null || true
+    # `wait` only knows this shell's own children, and since `cyclops
+    # start` began spawning the daemon a demo's daemon is often not one:
+    # it was started by a cyclops process that has already exited. So
+    # `wait` returns at once with nothing waited for, and the watch below
+    # is what actually waits. Cheap and correct for a real child too,
+    # where the pid is gone by the first check.
     wait "$DAEMON_PID" 2>/dev/null || true
+    local i=0
+    while kill -0 "$DAEMON_PID" 2>/dev/null && [ "$i" -lt 100 ]; do
+      sleep 0.05
+      i=$((i + 1))
+    done
     DAEMON_PID=""
   fi
 }

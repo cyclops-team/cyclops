@@ -133,6 +133,15 @@ pub struct StatusResult {
     /// field: old daemons omit it, old clients ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifests: Option<Manifests>,
+    /// The daemon's own process id, so `cyclops daemon stop` signals the
+    /// process that is actually holding the socket.
+    ///
+    /// It comes from the daemon rather than from a pid file because a file
+    /// outlives the process that wrote it, and a stop reading a stale one
+    /// would signal whatever inherited the number. Additive optional
+    /// field: old daemons omit it, old clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 /// What the daemon loaded for pane detection, and where from.

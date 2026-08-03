@@ -5,7 +5,14 @@ use std::time::Duration;
 
 use crate::client::ClientError;
 
-pub const NOT_RUNNING: &str = "cyclops isn't running. Start it with: cyclopsd &";
+/// A down daemon, and the one command that fixes it.
+///
+/// Re-exported rather than written here: the stream carries the same
+/// sentence, and cyclops_proto is the one place both can read it from.
+pub use cyclops_proto::NOT_RUNNING;
+
+/// `cyclops daemon status` with nothing to report on.
+pub const DAEMON_DOWN: &str = "○ cyclopsd is not running · start it with: cyclops start";
 
 pub const NO_RECIPIENT: &str =
     "no recipient. Name one (cyclops send reviewer --subject \"...\"), or pass --to or --all.";
@@ -389,11 +396,19 @@ mod tests {
         );
     }
 
+    /// The sentence is cyclops_proto's, and the stream prints the same
+    /// one. What this pins is the property that survives a rewording: it
+    /// names a command, and that command is one that exists and starts a
+    /// daemon. It said `cyclopsd &` until `cyclops start` took the job
+    /// over, and a frozen literal here would have had to be edited in
+    /// two crates on the same day to stay true in one.
     #[test]
-    fn not_running_copy_is_exact() {
-        assert_eq!(
-            NOT_RUNNING,
-            "cyclops isn't running. Start it with: cyclopsd &"
+    fn not_running_names_the_command_that_fixes_it() {
+        assert_eq!(NOT_RUNNING, cyclops_proto::NOT_RUNNING);
+        assert!(NOT_RUNNING.contains("cyclops start"), "{NOT_RUNNING}");
+        assert!(
+            !NOT_RUNNING.contains("cyclopsd &"),
+            "the daemon is not started by hand any more: {NOT_RUNNING}"
         );
     }
 

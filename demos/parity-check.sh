@@ -76,6 +76,14 @@ start_daemon() {
   wait_for "cyclopsd to attach" 50 daemon_attached
 }
 
+# Take over the daemon `cyclops start` spawned, so the restart and the
+# teardown below work on it. Its pid comes from the daemon itself, which
+# is the only thing that can say it without guessing.
+adopt_daemon() {
+  DAEMON_PID="$("$CYC" --json daemon status | jq -r '.pid // empty')"
+  [ -n "$DAEMON_PID" ] || { echo "!! cyclops start did not leave a daemon running" >&2; exit 1; }
+}
+
 cleanup() {
   cyc_stop_daemon
   # The nested rigs run their own daemon and their own tmux server in their
@@ -322,42 +330,19 @@ EOF
 echo
 echo "#### Rung 1: one pane, persistence, history"
 
-run "$CYC" start --plain
-check "start builds the solo workspace"   '^✓ workspace ready · 1 agent$'
-check "start writes the config"           'wrote .*/config\.toml$'
-check "start installs the manifests"      '^  wrote 3 detection manifests to .*/manifests$'
-check "and says nothing is named yet"     '^  cyclopsd isn.t running, so nothing was named yet\.'
-check "step 1 starts the daemon"          '^  1  cyclopsd & +start the daemon$'
-check "step 2 puts the names on"          '^  2  cyclops start +put the workspace.s names on the panes$'
-check "step 3 attaches"                   '^  3  tmux attach -t main +open the workspace and start your agents$'
-# No send step here. Nothing is named until the daemon is up, so a
-# `cyclops send implementer` printed at this point answers "no pane for
-# implementer": the one shape a first run must never be handed.
-check_absent "and offers no send yet"     'cyclops send implementer'
-
-printf '\n$ ls ~/.cyclops/manifests\n'
-ls "$CYCLOPS_HOME/manifests" > "$OUT"
-cat "$OUT"
-check "the shipped set is on disk"        '^claude\.toml$'
-
-# The stand-in's own manifest, written the way docs/MANIFESTS.md says to
-# write one: a file in the home directory the daemon already reads.
-printf '%s\n' "$DEMO_MANIFEST" > "$CYCLOPS_HOME/manifests/demo.toml"
-
-P1="$(tmx list-panes -t main -F '#{pane_id}')"
-# A person attaches here and starts an agent. The rig starts its stand-in,
-# and clears the pane title tmux seeded with the hostname so the roster
-# below shows what an agent publishes rather than what tmux did.
-tmx respawn-pane -k -t "$P1" "sh '$ROOT/agent.sh' implementer '$CYC'"
-tmx select-pane -t "$P1" -T ''
+# Setup first, so the tuning below is in the config before the daemon
+# that `cyclops start` spawns reads it. This is what install.sh runs, so
+# the rig takes the same two steps a person installing does.
+run "$CYC" start --setup-only --plain
+check "setup writes the config"           'wrote .*/config\.toml$'
+check "setup installs the manifests"      '^  wrote 3 detection manifests to .*/manifests$'
 
 # Two budgets raised above their defaults, for the rig and not for cyclops.
 # The stand-in answers a delivery by spawning jq and `cyclops hook`, which
 # costs far more than a vendor hook already loaded in the agent's process,
 # so at the shipped defaults the receipt returns "queued" and the ack lands
 # after the window. Raising both makes the transcript reproducible instead
-# of racing this machine. Appending is safe: `cyclops start` wrote this
-# file on its first run and never edits one that exists.
+# of racing this machine.
 #
 # receipt_block_ms stays under the CLI's own 5-second socket read deadline
 # (crates/cyclops/src/client.rs, READ_TIMEOUT). Past it the daemon is still
@@ -368,13 +353,62 @@ receipt_block_ms = 4000
 ack_timeout_ms = 3000
 EOF
 
-# Only the daemon can put a name on a pane, and there was none when the
-# first `start` built the session. The second run is where the name lands.
-start_daemon
+# The stand-in's own manifest, written the way docs/MANIFESTS.md says to
+# write one: a file in the home directory the daemon reads at boot. It
+# goes in before the daemon starts, which is the order a person teaching
+# cyclops a new CLI takes too.
+printf '%s\n' "$DEMO_MANIFEST" > "$CYCLOPS_HOME/manifests/demo.toml"
+
+# The first run a person makes, with nothing running. One command: it
+# builds the session, starts a daemon, waits for it to reach the session,
+# and puts the workspace's names on the panes.
+run "$CYC" start --plain
+check "start builds the solo workspace"   '^✔ workspace ready · 1 agent$'
+check "and starts a daemon"               '^  started cyclopsd, logging to .*/cyclopsd\.log$'
+check "step 1 attaches"                   '^  1  tmux attach -t main +open the workspace and start your agents$'
+check "step 2 sends the first message"    '^  2  cyclops send implementer --subject "hello" +send the first message$'
+# The heavy check is the load-bearing one. It means cyclopsd confirmed the
+# roster in this run, which is what starting the daemon here buys: before
+# it, the first run named nothing and a second was needed (F33).
+check_absent "and needs no second run"    'nothing was named yet'
+check_absent "and no daemon step"         'cyclopsd &'
+
+# Everything below restarts and stops this daemon, so the rig adopts the
+# one `cyclops start` made rather than starting a second.
+adopt_daemon
+
+printf '\n$ ls ~/.cyclops/manifests\n'
+ls "$CYCLOPS_HOME/manifests" > "$OUT"
+cat "$OUT"
+check "the shipped set is on disk"        '^claude\.toml$'
+
+P1="$(tmx list-panes -t main -F '#{pane_id}')"
+# A person attaches here and starts an agent. The rig starts its stand-in,
+# and clears the pane title tmux seeded with the hostname so the roster
+# below shows what an agent publishes rather than what tmux did.
+tmx respawn-pane -k -t "$P1" "sh '$ROOT/agent.sh' implementer '$CYC'"
+tmx select-pane -t "$P1" -T ''
+# The daemon was already running when the occupant changed, so wait for it
+# to have read the new one. A person does this without noticing: they
+# start their agent and then type, and the typing is slower than a tmux
+# subscription tick.
+# Let the daemon see the new occupant before anything is delivered to it.
+#
+# It was already running when the pane changed hands, so it learns the new
+# occupant from a tmux subscription, and those tick at 1Hz (F23). Deliver
+# inside that window and the hook ack cannot arrive in time, so the receipt
+# falls to screen evidence: `✓ delivered · unverified (screen)` instead of
+# the heavy check. A person does this without noticing, because starting
+# an agent and typing at it are seconds apart.
+#
+# MEASURED: at 0s the receipt is screen-tier every run; at 4s it is
+# hook-verified every run.
+sleep 4
 
 run "$CYC" start --plain
 check "a second start is one line"        '^✔ workspace ready · 1 agent$'
 check_absent "and installs nothing twice" '^  wrote [0-9]+ detection manifest'
+check_absent "and starts no second daemon" 'started cyclopsd'
 # The rule the seed turns on: a manifest written by hand survives every
 # later start, and nothing already on disk is rewritten.
 check_file "the stand-in's manifest survived" \
@@ -462,7 +496,7 @@ wait_for "the roster to empty" 50 roster_empty
 # `start` waits for it to re-attach to the session it just rebuilt and the
 # names go back on in the same run. The heavy check is what proves the
 # wait paid off: a roster cyclopsd confirmed, not one read off a file.
-run "$CYC" start --plain
+run "$CYC" start --no-daemon --plain
 check "start rebuilds the session and names it" '^✔ workspace ready · 2 agents$'
 
 wait_for "cyclopsd to re-attach" 60 daemon_attached
@@ -479,7 +513,7 @@ run "$CYC" list --plain
 check "with both names on the new panes"  '^ +implementer +○ idle$'
 check "and the second one too"            '^ +reviewer +○ idle$'
 
-run "$CYC" start --workspace ops --session ops --preset ops --plain
+run "$CYC" start --workspace ops --session ops --preset ops --no-daemon --plain
 check "a preset builds three agents"      '^✓ workspace ready · 3 agents$'
 check "and says what the daemon needs"    'cyclopsd won.t watch "ops" until it.s listed in'
 
@@ -744,7 +778,7 @@ check_absent "and opens nothing"          'workspace ready'
 start_duo_daemon
 
 printf '\n$ cyclopsd &\n$ cyclops start --preset duo\n'
-duo "$CYC" start --preset duo --plain > "$OUT" 2>&1
+duo "$CYC" start --preset duo --no-daemon --plain > "$OUT" 2>&1
 cat "$OUT"
 # The heavy check: one run, with the daemon confirming every name. This is
 # the whole point of the order, and the glyph is what proves it happened.
@@ -794,7 +828,7 @@ cat "$OUT"
 check "the restarted daemon read the new one" '^demo$'
 
 printf '\n$ cyclops start\n'
-duo "$CYC" start --plain > "$OUT" 2>&1
+duo "$CYC" start --no-daemon --plain > "$OUT" 2>&1
 cat "$OUT"
 check "the second start names the panes"  '^✔ workspace ready · 2 agents$'
 check_absent "and installs nothing twice" '^  wrote [0-9]+ detection manifest'
@@ -903,7 +937,7 @@ stop_stock_daemon() {
   STOCK_PID=""
 }
 
-stock_run "$CYC" start --preset duo --plain
+stock_run "$CYC" start --preset duo --no-daemon --plain
 check "duo opens two panes"               '^✓ workspace ready · 2 agents$'
 
 # One manifest, shaped like a shipped one: it binds the panes AND declares

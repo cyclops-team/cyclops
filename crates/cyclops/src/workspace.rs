@@ -496,14 +496,16 @@ fn misplaced_names(
 /// 3. Make the home usable: the config has to name the session so the
 ///    daemon watches it, and the detection manifests have to be there or
 ///    cyclopsd binds no pane and delivers nothing.
-/// 4. Ask the daemon what it is watching and which panes already answer to
-///    a name. Step 5 needs both, so it happens first.
-/// 5. Decide whether this workspace may name this session's panes at all.
+/// 4. Make sure a daemon is running, starting one when it is not. After
+///    the session exists, so it attaches on its first try.
+/// 5. Ask the daemon what it is watching and which panes already answer to
+///    a name. Step 6 needs both, so it happens first.
+/// 6. Decide whether this workspace may name this session's panes at all.
 ///    Everything after depends on the answer, because a workspace that
 ///    may not name the session can neither rename its panes nor say how
 ///    many agents are in it.
-/// 6. Put the names back, when the daemon is watching.
-/// 7. Say what is ready, and what is left to do.
+/// 7. Put the names back, when the daemon is watching.
+/// 8. Say what is ready, and what is left to do.
 pub fn run_start(
     json_out: bool,
     style: &Style,
@@ -511,6 +513,7 @@ pub fn run_start(
     asked_session: Option<&str>,
     preset_name: Option<&str>,
     launch: bool,
+    start_daemon: bool,
 ) -> i32 {
     let home = cyclops_proto::cyclops_home();
     let settings = Settings::read(&home);
@@ -596,7 +599,35 @@ pub fn run_start(
         }
     };
 
-    // 4. The registry is the only record of which pane already answers to
+    // 4. Make sure there is a daemon, starting one if there is not.
+    //
+    //    Here, and not earlier, because the session now exists: a daemon
+    //    that boots with its session already there attaches at once
+    //    instead of retrying on a backoff, so the names below land in
+    //    this run. Starting it before building the session would work
+    //    too, and would spend up to five seconds waiting for the retry.
+    //
+    //    A failure to start is a note, not an exit. The workspace is
+    //    open and usable at this point; what is lost is naming, and the
+    //    lines below already say so when nothing is watching.
+    let mut daemon_failed = false;
+    if start_daemon {
+        match crate::daemon::ensure_running(&home) {
+            Ok(crate::daemon::Started::Spawned) => {
+                notes.push(format!(
+                    "started cyclopsd, logging to {}",
+                    crate::daemon::log_path(&home).display()
+                ));
+            }
+            Ok(crate::daemon::Started::AlreadyRunning) => {}
+            Err(why) => {
+                notes.push(why);
+                daemon_failed = true;
+            }
+        }
+    }
+
+    // 5. The registry is the only record of which pane already answers to
     //    which name, and gate 3 below is that record against the
     //    workspace, so the daemon is asked before anything is decided.
     let mut client = daemon();
@@ -623,7 +654,7 @@ pub fn run_start(
         _ => BTreeMap::new(),
     };
 
-    // 5. May this workspace put its names on this session's panes? Three
+    // 6. May this workspace put its names on this session's panes? Three
     //    gates, each preventing the same failure from a different
     //    direction, and a no from any of them renames nothing:
     //
@@ -661,7 +692,7 @@ pub fn run_start(
         notes.push(why);
     }
 
-    // 6. Names, and the count the ready line reports.
+    // 7. Names, and the count the ready line reports.
     //
     //    The daemon's registry is the truth about who is named, so it wins
     //    whenever it can be asked: the number matches `cyclops list`.
@@ -693,11 +724,13 @@ pub fn run_start(
             notes.push(names_wait_step(&why));
         }
     }
-    // 7. Every step here has to be a command that works when it is run.
+    // 8. Every step here has to be a command that works when it is run.
     //    A step that answers with an error is worse than one step fewer.
-    if matches!(watch, Watch::Down) {
-        steps.push(("cyclopsd &".into(), "start the daemon".into()));
-    }
+    //
+    //    No "start the daemon" step: step 4 did that. A daemon still down
+    //    here is one that failed to start, and running the same thing by
+    //    hand fails the same way; the note step 4 pushed carries the
+    //    reason and the log to read.
     // A name is addressable only once cyclopsd holds it, so with no daemon
     // watching, `cyclops send <name>` answers "no pane for ...". What
     // belongs here instead is the command that puts the names on: this
@@ -754,7 +787,9 @@ pub fn run_start(
                 "notes": notes,
             })
         );
-        return 0;
+        // Same rule as the rendered path: a script reading JSON branches
+        // on the exit code, so it must not read 0 over a dead daemon.
+        return if daemon_failed { 1 } else { 0 };
     }
     println!("{}", ready_line(agents, watching, style));
     for note in &notes {
@@ -763,6 +798,13 @@ pub fn run_start(
     if !steps.is_empty() {
         println!();
         println!("{}", next_steps(&steps, style));
+    }
+    // The workspace opened, so this is not a failure of the verb. It is
+    // still not a run anybody should treat as fine: with no daemon
+    // nothing can be named, addressed or recorded, and reporting success
+    // is the exact shape that let a broken first run look finished.
+    if daemon_failed {
+        return 1;
     }
     0
 }

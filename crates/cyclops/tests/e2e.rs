@@ -385,7 +385,7 @@ fn daemon_not_running_copy_and_exit_code() {
     assert!(out.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&out.stderr).trim(),
-        "cyclops isn't running. Start it with: cyclopsd &"
+        cyclops_proto::NOT_RUNNING
     );
     let _ = fs::remove_dir_all(&home);
 }

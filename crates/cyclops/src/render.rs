@@ -370,6 +370,54 @@ pub fn check(confirmed: bool) -> &'static str {
     }
 }
 
+/// `cyclops daemon status` when one is answering.
+///
+/// The same facts as the `cyclops status` header minus the roster, in the
+/// same order, because a reader who knows one should not have to learn
+/// the other. No eye: this line is about the process, and the eye is
+/// about the agents.
+pub fn daemon_running(res: &StatusResult, style: &Style) -> String {
+    let sep = style.dim("·");
+    let pid = match res.pid {
+        Some(p) => format!(" {sep} pid {p}"),
+        None => String::new(),
+    };
+    format!(
+        "{} {sep} up {}{pid} {sep} watching {}",
+        style.bold("● cyclopsd is running"),
+        human_duration(res.uptime_ms),
+        watching_words(res),
+    )
+}
+
+/// What the daemon has been told to watch, for a one-line summary.
+fn watching_words(res: &StatusResult) -> String {
+    if res.sessions.is_empty() {
+        return "nothing".to_string();
+    }
+    res.sessions
+        .iter()
+        .map(|s| s.name.clone())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `cyclops daemon stop`, in the badge voice.
+///
+/// It names what was NOT touched, because stopping the thing that watches
+/// your agents reads like it might take the agents with it. It does not:
+/// tmux keeps running and the record is on disk.
+pub fn daemon_stopped(pid: u32, style: &Style) -> String {
+    let sep = style.dim("·");
+    format!(
+        "{} {sep} {}",
+        style.bold(&format!("{} stopped cyclopsd", check(true))),
+        style.dim(&format!(
+            "pid {pid}, your tmux panes and the record are untouched"
+        ))
+    )
+}
+
 /// The answer to `cyclops name`, in the badge voice: what happened, then
 /// the detail after a dim separator.
 ///
@@ -990,6 +1038,7 @@ mod tests {
                 ids: vec!["agy".into(), "claude".into(), "codex".into()],
                 dir: Some("/x/manifests".into()),
             }),
+            pid: Some(4242),
         }
     }
 

@@ -38,6 +38,26 @@ fn write_config(home: &Path, t: &TmuxServer, body: &str) {
 }
 
 fn cyclops(home: &Path, args: &[&str]) -> Output {
+    cyclops_raw(home, args, true)
+}
+
+/// `cyclops` with `start` allowed to launch a daemon, for the one test
+/// that is about that.
+fn cyclops_with_daemon(home: &Path, args: &[&str]) -> Output {
+    cyclops_raw(home, args, false)
+}
+
+/// `no_daemon` adds `--no-daemon` to a `start`, because these tests are
+/// about what `start` does to tmux and to the workspace file, and a real
+/// daemon per test would be a process to reap, a socket to collide on,
+/// and a source of timing in assertions that have none today. The spawn
+/// path is covered where it belongs: on a real rig, in
+/// demos/parity-check.sh.
+fn cyclops_raw(home: &Path, args: &[&str], no_daemon: bool) -> Output {
+    let mut argv: Vec<&str> = args.to_vec();
+    if no_daemon && args.first() == Some(&"start") && !args.contains(&"--setup-only") {
+        argv.push("--no-daemon");
+    }
     Command::new(env!("CARGO_BIN_EXE_cyclops"))
         .env("CYCLOPS_HOME", home)
         .env("NO_COLOR", "1")
@@ -46,7 +66,7 @@ fn cyclops(home: &Path, args: &[&str]) -> Output {
         // TMUX would give a developer running the suite from inside tmux
         // different output than CI. The rule gets its own test below.
         .env_remove("TMUX")
-        .args(args)
+        .args(&argv)
         .output()
         .expect("run cyclops")
 }
@@ -212,12 +232,17 @@ fn start_builds_the_workspace_and_says_what_is_left_to_do() {
         text.starts_with("✓ workspace ready · 2 agents\n"),
         "got {text:?}"
     );
-    // The daemon is down and the session is new, so the guided moment is
-    // still to do: start the daemon, put the names on, open the workspace.
+    // --no-daemon, so nothing is watching and nothing got named. The
+    // steps say so: `cyclops start` puts the names on (and starts a
+    // daemon, which is why there is no separate step for that), then
+    // open the workspace.
     assert!(text.contains("Next:"), "{text}");
-    assert!(text.contains("cyclopsd &"), "{text}");
     assert!(text.contains("cyclops start"), "{text}");
     assert!(text.contains("tmux attach -t duo"), "{text}");
+    assert!(
+        !text.contains("cyclopsd &"),
+        "the daemon is not started by hand any more: {text}"
+    );
     // And no send step. Only cyclopsd holds a name, so with it down
     // nothing is named and `cyclops send implementer` would answer "no
     // pane for implementer": a printed step that cannot work.
@@ -999,5 +1024,65 @@ fn an_unknown_preset_lists_the_ones_that_exist() {
     assert_eq!(out.status.code(), Some(2), "usage mistakes exit 2");
     let err = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(err.contains("solo, duo, quad, ops"), "{err}");
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// The whole point of M7: one command, from nothing to a workspace with
+/// named panes and a daemon that outlives the shell that started it.
+///
+/// This is the only test that lets `start` spawn a daemon, so it stops
+/// the one it started. Everything else passes --no-daemon (see
+/// `cyclops_raw`).
+#[test]
+fn start_starts_a_daemon_when_none_is_running() {
+    if !tmux_available() {
+        return;
+    }
+    let t = TmuxServer::new("ws-daemon");
+    let home = scratch_home("ws-daemon");
+    write_config(
+        &home,
+        &t,
+        "sessions = [\"solo\"]\ndefault_workspace = \"solo\"\n",
+    );
+
+    let out = cyclops_with_daemon(&home, &["start"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("started cyclopsd"), "{text}");
+    assert!(home.join("cyclopsd.log").is_file(), "no log was written");
+
+    // Heavy check: with a daemon up, the roster is one it confirmed
+    // rather than a count read off the workspace file. That is the
+    // difference the whole change exists to make.
+    assert!(
+        text.starts_with("✔ workspace ready"),
+        "names did not land in one run: {text}"
+    );
+    // And no "start the daemon" step, because it is running.
+    assert!(!text.contains("cyclopsd &"), "{text}");
+
+    // A second run finds it and says nothing about starting one.
+    let again = stdout(&cyclops_with_daemon(&home, &["start"]));
+    assert!(
+        !again.contains("started cyclopsd"),
+        "started a second: {again}"
+    );
+
+    // `cyclops daemon status` sees it, and stop takes it down.
+    let status = stdout(&cyclops(&home, &["daemon", "status"]));
+    assert!(status.contains("cyclopsd is running"), "{status}");
+
+    let stopped = stdout(&cyclops(&home, &["daemon", "stop"]));
+    assert!(stopped.contains("stopped cyclopsd"), "{stopped}");
+    for _ in 0..50 {
+        if !home.join("sock").exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let after = stdout(&cyclops(&home, &["daemon", "status"]));
+    assert!(after.contains("not running"), "still up: {after}");
+
     let _ = fs::remove_dir_all(&home);
 }

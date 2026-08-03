@@ -38,6 +38,7 @@
 
 mod client;
 mod copy;
+mod daemon;
 mod hook;
 mod hookset;
 mod manifests;
@@ -171,6 +172,26 @@ enum Cmd {
         /// Theme to switch to, e.g. light. Omit to list what is there.
         name: Option<String>,
     },
+    /// The daemon: stop it, ask after it, read its log. `cyclops start`
+    /// starts one for you, so there is no `daemon start`.
+    Daemon {
+        #[command(subcommand)]
+        cmd: DaemonCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonCmd {
+    /// Whether one is running, since when, and where its log is.
+    Status,
+    /// Stop it. Your tmux sessions and the record are untouched.
+    Stop,
+    /// Print the daemon's log, which is where a detached one writes.
+    Log {
+        /// How many lines from the end.
+        #[arg(long, default_value = "40")]
+        lines: usize,
+    },
 }
 
 #[derive(clap::Args)]
@@ -192,6 +213,11 @@ struct StartArgs {
     /// opening anything. What `scripts/install.sh` runs last.
     #[arg(long)]
     setup_only: bool,
+    /// Do not start cyclopsd. For running the daemon under your own
+    /// supervisor, and for a workspace you want open with nothing
+    /// watching it. Without this, `start` starts one when none answers.
+    #[arg(long)]
+    no_daemon: bool,
 }
 
 #[derive(Subcommand)]
@@ -481,6 +507,7 @@ fn run(cli: &Cli) -> i32 {
             args.session.as_deref(),
             args.preset.as_deref(),
             args.launch,
+            !args.no_daemon,
         ),
         Cmd::Workspace {
             cmd: WorkspaceCmd::Save { name, session },
@@ -508,6 +535,9 @@ fn run(cli: &Cli) -> i32 {
         // switch is live at once, but a down daemon costs it only that,
         // so it must not go through connect() either.
         Cmd::Theme { name } => theme::run(cli.json, &style_for(cli), name.as_deref()),
+        // All three answer about a daemon rather than through one, so a
+        // daemon that is down is an answer here, not a failure.
+        Cmd::Daemon { cmd } => cmd_daemon(cli, &style_for(cli), cmd),
         // Send and wait validate usage before touching the daemon, so
         // usage errors don't hide behind a down daemon.
         Cmd::Send(args) => cmd_send(cli, &style_for(cli), args),
@@ -582,6 +612,7 @@ fn run(cli: &Cli) -> i32 {
                 Cmd::Send(_)
                 | Cmd::Hook { .. }
                 | Cmd::Name(_)
+                | Cmd::Daemon { .. }
                 | Cmd::Wait { .. }
                 | Cmd::Hooks { .. }
                 | Cmd::Ui(_)
@@ -681,6 +712,91 @@ fn cmd_status(c: &mut Client, cli: &Cli, style: &Style) -> i32 {
 /// format back is the daemon's half, it happens only while the daemon can
 /// still reach the pane, and this line must never be read as having
 /// confirmed it: see `--clear`'s help.
+/// `cyclops daemon`: the three questions about the process itself.
+///
+/// There is no `daemon start` on purpose. `cyclops start` starts one when
+/// none is running, so a verb for it would be a second way to do the same
+/// thing and a second thing to know about.
+fn cmd_daemon(cli: &Cli, style: &Style, cmd: &DaemonCmd) -> i32 {
+    let home = cyclops_proto::cyclops_home();
+    let log = daemon::log_path(&home);
+    match cmd {
+        DaemonCmd::Status => {
+            let mut client = match client::Client::connect() {
+                Ok(c) => c,
+                Err(_) => {
+                    if cli.json {
+                        println!(
+                            "{}",
+                            json!({"running": false, "log": log.display().to_string()})
+                        );
+                    } else {
+                        println!("{}", copy::DAEMON_DOWN);
+                        println!("  {}", style.dim(&format!("log: {}", log.display())));
+                    }
+                    // Down is the answer to the question, not a failure to
+                    // answer it.
+                    return 0;
+                }
+            };
+            let result = match client.request("status", json!({})) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", copy::client_error(&e, None));
+                    return 1;
+                }
+            };
+            if cli.json {
+                println!("{result}");
+                return 0;
+            }
+            let status: StatusResult = match serde_json::from_value(result) {
+                Ok(s) => s,
+                Err(_) => {
+                    eprintln!("{}", copy::UNREADABLE_ANSWER);
+                    return 1;
+                }
+            };
+            println!("{}", render::daemon_running(&status, style));
+            println!("  {}", style.dim(&format!("log: {}", log.display())));
+            0
+        }
+        DaemonCmd::Stop => match daemon::stop() {
+            Ok(pid) => {
+                if cli.json {
+                    println!("{}", json!({"stopped": true, "pid": pid}));
+                } else {
+                    println!("{}", render::daemon_stopped(pid, style));
+                }
+                0
+            }
+            Err(why) => {
+                eprintln!("{why}");
+                1
+            }
+        },
+        DaemonCmd::Log { lines } => match std::fs::read_to_string(&log) {
+            Ok(text) => {
+                let all: Vec<&str> = text.lines().collect();
+                for l in all.iter().skip(all.len().saturating_sub(*lines)) {
+                    println!("{l}");
+                }
+                0
+            }
+            Err(_) => {
+                // No log is not an error: it means no detached daemon has
+                // ever run from this home.
+                eprintln!(
+                    "no daemon log at {}. One appears the first time `cyclops \
+                     start` starts a daemon for you.",
+                    log.display()
+                );
+                1
+            }
+        },
+    }
+}
+
 /// Which pane `cyclops name` is about, and what it will be called.
 ///
 /// Runs before the daemon is asked anything, because both answers are

@@ -208,34 +208,47 @@ Past the cap `cyclopsd` exits at boot:
 boot failed: bind /a/very/long/path/.cyclops/sock: path must be shorter than SUN_LEN
 ```
 
-`cyclopsd &` puts that on a stderr nobody is reading, so what you actually
-see is the next command:
+`cyclops start` starts the daemon and waits for it, so it sees the exit
+and reports it where you are:
 
 ```
-$ cyclops status
-lost the connection to cyclops: path must be shorter than SUN_LEN. Check that cyclopsd is still running, then retry.
+$ cyclops start
+✓ workspace ready · 1 agent
+  cyclopsd could not start: bind /a/very/long/path/.cyclops/sock: path must be shorter than SUN_LEN
+Its whole log is /a/very/long/path/.cyclops/cyclopsd.log.
 ```
 
-Checking cyclopsd does not help, because it never started. Move
-`$CYCLOPS_HOME` somewhere shorter and start the daemon again. `cyclops
-start` will not catch this for you: it writes the config and the manifests
-and prints its usual next steps, because nothing it does needs a socket.
+and exits 1, because a workspace with no daemon can name nothing. Move
+`$CYCLOPS_HOME` somewhere shorter and run it again.
+
+This used to be a dead end: the daemon wrote that line to a stderr nobody
+was reading, and every later command said `Check that cyclopsd is still
+running, then retry`, which could never help because it never started.
 
 ## Run
 
 ```bash
-cyclopsd &
 cyclops start   # ✔ workspace ready · 1 agent
 cyclops status
 ```
 
-The daemon first, and the order is the difference between one command and
-two. Only cyclopsd holds a name, so a `cyclops start` that runs before it
-builds the session and names nothing: it says so, and the step it prints
-is `cyclops start` again. With the daemon already up, `start` waits for it
-to reach the session it just built and the names go on in the same run.
-That is what the heavy check reports: a roster the daemon confirmed, not a
-count read off a file.
+One command. `start` builds the session, starts cyclopsd when none is
+running, waits for it to reach the session, and puts the workspace's names
+on the panes. That is what the heavy check reports: a roster the daemon
+confirmed, not a count read off a file.
+
+The daemon it starts is detached, so it outlives the shell you typed in
+and there is no tab to keep open. It logs to `$CYCLOPS_HOME/cyclopsd.log`.
+
+```bash
+cyclops daemon status   # ● cyclopsd is running · up 4m · pid 51230 · watching main
+cyclops daemon log      # what it has written
+cyclops daemon stop     # your tmux panes and the record are untouched
+```
+
+There is no `daemon start`: `cyclops start` is that. To run the daemon
+under your own supervisor instead, `cyclops start --no-daemon` leaves it
+alone.
 
 `start` opens the default workspace, building it from the `solo` preset
 the first time. `--preset duo|quad|ops` picks a bigger one;

@@ -2,20 +2,22 @@
 
 Every message below is real output. Find yours, do the next step.
 
-## "cyclops isn't running. Start it with: cyclopsd &"
+## "cyclops isn't running. Start it with: cyclops start"
 
 ```
 $ cyclops status
-cyclops isn't running. Start it with: cyclopsd &
+cyclops isn't running. Start it with: cyclops start
 ```
 
-Nothing is listening on `$CYCLOPS_HOME/sock`. Start the daemon. If you
-started it and it died, its reason is on its stderr; run it in the
-foreground once and read it. `CYCLOPS_LOG=debug` says more.
+Nothing is listening on `$CYCLOPS_HOME/sock`. `cyclops start` starts one,
+and if starting it fails it says why rather than leaving you here.
 
-The workspace commands (`start`, `workspace save|restore`) work without a
-daemon, they just cannot name panes or count agents. That is what a light
-`✓` on their output line means.
+If one was running and died, `cyclops daemon log` is where it wrote its
+reason. `CYCLOPS_LOG=debug` says more on the next run.
+
+The workspace commands (`start --no-daemon`, `workspace save|restore`)
+work without a daemon, they just cannot name panes or count agents. That
+is what a light `✓` on their output line means.
 
 ## "lost the connection to cyclops: path must be shorter than SUN_LEN"
 

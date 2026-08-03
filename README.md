@@ -25,15 +25,14 @@ up any shell profile it edits, and never uses sudo. `--prefix DIR` picks
 where the binaries go, `--no-path` leaves your profile alone, and
 `--uninstall` takes it all back off. More: [docs/install.md](docs/install.md).
 
-Then, in order:
+Then one command, from anywhere:
 
 ```bash
-cyclopsd &        # start the daemon
-cyclops start     # open your workspace
+cyclops start
 ```
 
-The daemon first. Started the other way round it has no session to attach
-to, and the first `cyclops start` can name nothing.
+It starts the daemon too, so there is no second command and no tab to
+keep open.
 
 Building from source is how you run this implementation. The one-line
 installer on usecyclops.dev installs the previous shell implementation,
@@ -59,24 +58,29 @@ reports. Everything else should match line for line.
 
 ### 1. One pane
 
-With the daemon running, `cyclops start` opens a workspace, names its
-panes, and tells you what is left to do.
+One command. It opens the workspace, starts the daemon if none is
+running, names the panes, and tells you what is left to do.
 
 ```
-$ cyclops start --preset duo
-✔ workspace ready · 2 agents
+$ cyclops start
+✔ workspace ready · 1 agent
+  started cyclopsd, logging to ~/.cyclops/cyclopsd.log
 
 Next:
   1  tmux attach -t main                         open the workspace and start your agents
   2  cyclops send implementer --subject "hello"  send the first message
 ```
 
-The heavy check means cyclopsd confirmed each name. Run `cyclops start`
-before the daemon and you get the light one, plus a line saying nothing
-was named yet and the step that fixes it.
+The heavy check means cyclopsd confirmed the roster: one pane it will
+deliver to, not one name in a file.
 
-Do them in order. Attach, run your agent CLI in the pane the way you
-normally would. Then send it something.
+The daemon it started outlives the shell you typed in, so there is no tab
+to keep open. `cyclops daemon status` says whether one is running,
+`cyclops daemon stop` takes it down, and `cyclops daemon log` is where it
+writes. `cyclops start --no-daemon` leaves that to you.
+
+Attach, and run your agent CLI in the pane the way you normally would.
+Then send it something.
 
 ```
 $ cyclops send implementer --subject "Review the rate limiter" --body "gateway.rs:120 drops the burst path"
