@@ -2,13 +2,12 @@
 //!
 //! Not control mode. A focus jump is a user gesture from the stream UI,
 //! not daemon state, and it may target a server no control client is
-//! attached to. A short-lived `tmux -u` invocation is the whole cost;
-//! routing it through this crate keeps the adapter-only rule intact
-//! (no tmux calls outside cyclops-tmux). `-u` always: F14.
+//! attached to. The invocation itself is [`crate::cmd::run`], which is
+//! where the isolation and `-u` rules live.
 
 use std::path::Path;
-use std::process::Command;
 
+use crate::cmd::run;
 use crate::error::TmuxError;
 
 /// Select the window holding `pane_id`, then the pane itself. The window
@@ -34,29 +33,8 @@ pub fn focus_pane(
         )));
     }
     run(socket, config_file, &["select-window", "-t", pane_id])?;
-    run(socket, config_file, &["select-pane", "-t", pane_id])
-}
-
-fn run(socket: Option<&str>, config_file: Option<&Path>, args: &[&str]) -> Result<(), TmuxError> {
-    let mut cmd = Command::new("tmux");
-    cmd.arg("-u");
-    if let Some(sock) = socket {
-        // An explicit socket targets exactly that server; the inherited
-        // $TMUX must not redirect it.
-        cmd.args(["-L", sock]).env_remove("TMUX");
-    }
-    if let Some(cfg) = config_file {
-        cmd.arg("-f").arg(cfg);
-    }
-    cmd.args(args);
-    let out = cmd.output().map_err(|e| TmuxError::Spawn(e.to_string()))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(TmuxError::Command(
-            String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        ))
-    }
+    run(socket, config_file, &["select-pane", "-t", pane_id])?;
+    Ok(())
 }
 
 #[cfg(test)]

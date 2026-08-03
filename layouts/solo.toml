@@ -1,0 +1,21 @@
+# Cyclops layout preset: solo
+#
+# The first rung of the ladder: one pane, one name. Everything else in
+# Cyclops works at n=1, so this is what `cyclops start` builds when there
+# is nothing saved to restore.
+#
+# Presets are compiled into the cyclops binary from this directory, so a
+# fresh install has them before it has a config file.
+
+name = "solo"
+about = "One agent. The first rung: one pane, one name."
+
+[[windows]]
+name = "solo"
+
+[[windows.rows]]
+ratio = 1.0
+
+[[windows.rows.panes]]
+label = "implementer"
+ratio = 1.0

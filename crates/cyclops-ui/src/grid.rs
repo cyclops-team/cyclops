@@ -116,10 +116,10 @@ pub fn state_cell(s: AgentState, paint: &dyn Paint) -> String {
 /// cell, and padding after the paint would count escape bytes as columns.
 ///
 /// Only that caller: everything else takes the painted cell, or the same
-/// words through [`Plain`].
-pub fn state_words(s: AgentState) -> String {
-    format!("{} {s}", s.glyph())
-}
+/// words through [`Plain`]. The words themselves are
+/// [`cyclops_proto::state_words`], because the daemon writes the same cell
+/// onto tmux pane borders and does not link this crate.
+pub use cyclops_proto::state_words;
 
 /// Machine causes in user-side words. GOALS: no `pane_id`, no `NDJSON`,
 /// nothing a newcomer has to look up, on any surface that shows a cause.

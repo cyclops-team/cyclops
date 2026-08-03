@@ -2,8 +2,9 @@
 
 Every color Cyclops prints is a semantic token, resolved through a theme.
 Code never names a raw color; a theme file maps tokens to values. The
-engine lives in `crates/cyclops-theme`, and both surfaces resolve every
-color through it: the one-shot CLI commands and `cyclops ui`.
+engine lives in `crates/cyclops-theme`, and every surface resolves color
+through it: the one-shot CLI commands, `cyclops ui`, and the `role • state`
+the daemon writes onto a named pane's tmux border (docs/panes.md).
 
 ## Pick a theme
 
@@ -40,7 +41,7 @@ table for the rest.
 | `surface` | `dim` | Detail columns, gutters, separators, every dimmed qualifier |
 | `surface` | `accent` | The marker on the selected entry in `ui` |
 | `eye` | `calm` `alert` | The eye, in both the `status` and `ui` headers: calm closed, alert open |
-| `state` | `healthy` `needs_you` `terminal` `quiet` `dead` | Agent state cells, by group |
+| `state` | `healthy` `needs_you` `terminal` `quiet` `dead` | Agent state cells, by group, including on pane borders |
 | `badge` | `healthy` `needs_you` `terminal` `quiet` | Delivery badges, the same groups read on a delivery |
 
 One more token exists and is worth knowing about. `surface.fg` is the
@@ -54,7 +55,7 @@ Two things carry meaning: the color of an agent's name, and the state
 glyph. Nothing else.
 
 An agent's name is colored by role, so the same agent is the same color
-everywhere. State color is a second reading of what the glyph and the
+everywhere, including on its pane border. State color is a second reading of what the glyph and the
 word already said, never a replacement for it. Turn color off and you
 lose nothing: `● working` is still `● working`.
 

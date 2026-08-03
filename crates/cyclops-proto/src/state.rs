@@ -70,6 +70,18 @@ impl AgentState {
     }
 }
 
+/// The state cell's words: glyph, space, state name. "● working", "○ idle".
+///
+/// Every surface that shows a state shows these exact words: the CLI grids,
+/// the stream, and the pane border chrome the daemon writes into tmux. It
+/// lives here rather than in a rendering crate because the daemon has no
+/// business linking a terminal UI to name a state, and a second spelling on
+/// the borders would put a different word on the pane than on the grid
+/// naming the same pane.
+pub fn state_words(s: AgentState) -> String {
+    format!("{} {s}", s.glyph())
+}
+
 impl std::fmt::Display for AgentState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {

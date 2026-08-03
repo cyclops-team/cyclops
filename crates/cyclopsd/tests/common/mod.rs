@@ -329,20 +329,8 @@ impl Rig {
         std::fs::create_dir_all(home.join("manifests")).expect("create scratch home");
         let home_guard = HomeGuard(home.clone());
         std::fs::write(home.join("manifests/fix.toml"), manifest).expect("write manifest");
-        let names: Vec<String> = sessions.iter().map(|(n, _)| format!("\"{n}\"")).collect();
-        std::fs::write(
-            home.join("config.toml"),
-            format!(
-                "sessions = [{}]\n\
-                 tmux_socket = \"{socket}\"\n\
-                 tmux_config = \"/dev/null\"\n\
-                 manifest_dir = \"{}\"\n\
-                 {cfg_extra}",
-                names.join(", "),
-                home.join("manifests").display()
-            ),
-        )
-        .expect("write config");
+        let names: Vec<String> = sessions.iter().map(|(n, _)| n.to_string()).collect();
+        write_config(&home, socket, &names, cfg_extra);
 
         for (name, pane_cmd) in sessions {
             tmux.run_ok(&[
@@ -378,6 +366,12 @@ impl Rig {
             rig.wait_attached_session(idx, 1).await;
         }
         rig
+    }
+
+    /// Change the config this rig boots on. Takes effect at the next
+    /// [`Rig::reboot`], which is the only time the daemon reads the file.
+    pub fn rewrite_config(&self, cfg_extra: &str) {
+        write_config(&self.home, self.tmux.socket(), &self.sessions, cfg_extra);
     }
 
     /// Shut the daemon down and boot a fresh one on the same home and tmux
@@ -565,6 +559,25 @@ impl Rig {
     pub async fn shutdown(self) {
         self.daemon.shutdown().await;
     }
+}
+
+/// Write the daemon config file. One place, so a test that changes a knob
+/// mid-run writes the same file the boot wrote.
+fn write_config(home: &Path, socket: &str, sessions: &[String], cfg_extra: &str) {
+    let names: Vec<String> = sessions.iter().map(|n| format!("\"{n}\"")).collect();
+    std::fs::write(
+        home.join("config.toml"),
+        format!(
+            "sessions = [{}]\n\
+             tmux_socket = \"{socket}\"\n\
+             tmux_config = \"/dev/null\"\n\
+             manifest_dir = \"{}\"\n\
+             {cfg_extra}",
+            names.join(", "),
+            home.join("manifests").display()
+        ),
+    )
+    .expect("write config");
 }
 
 /// Pane command: print a marker, hold until any input line, clear the

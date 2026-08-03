@@ -24,6 +24,7 @@ use cyclops_proto::{
 };
 use cyclops_ui::grid;
 
+use crate::copy;
 use crate::style::Style;
 
 pub use cyclops_ui::grid::{display_width, state_words};
@@ -91,15 +92,30 @@ struct Row {
     session: usize,
 }
 
-/// Detail column: the pane title when it says something the row doesn't
-/// already say, else the running command, else nothing. Hostname-style
-/// title noise (F5: agy publishes the hostname) is the daemon's problem to
-/// filter; the client only drops exact repeats. The agent binary as a
-/// command repeats the manifest, so it is suppressed too.
-fn detail_for(p: &PaneStatus, label: &str) -> Option<String> {
+/// The pane title when it says something the row does not already say.
+///
+/// This is the "what is it on" column: agent CLIs publish the current task
+/// there ("Implementing rate limiter"), and tmux publishes noise there
+/// (the hostname, F5; the window name; the command). Exact repeats of
+/// anything already on the row are dropped, and what is left is either a
+/// task hint or nothing.
+fn title_hint(p: &PaneStatus, label: &str) -> Option<String> {
     let title = p.title.trim();
     if !title.is_empty() && title != label && title != p.current_command && title != p.window_name {
         return Some(title.to_string());
+    }
+    None
+}
+
+/// Detail column for `status`: the informative title, else the running
+/// command, else nothing. `status` answers "what is in this pane" for
+/// every pane including unnamed ones, so a bare command is worth showing
+/// there; `cyclops list` asks a narrower question and takes the title
+/// alone. The agent binary as a command repeats the manifest, so it is
+/// suppressed too.
+fn detail_for(p: &PaneStatus, label: &str) -> Option<String> {
+    if let Some(t) = title_hint(p, label) {
+        return Some(t);
     }
     let cmd = p.current_command.trim();
     if cmd.is_empty() || cmd == label || Some(cmd) == p.manifest.as_deref() {
@@ -235,6 +251,118 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
     out.join("\n")
 }
 
+/// The roster: one row per named agent, on the same grid as `status`.
+///
+///     implementer  ● working  Implementing rate limiter
+///     reviewer     ○ idle
+///
+/// Three columns and no header. The name wears its role color, the state
+/// cell wears its group color on top of the glyph and the word, and the
+/// task hint is dim. Turn color off and every one of those still reads.
+///
+/// Sessions are not a column: a label is unique across every watched
+/// session (the daemon refuses a duplicate), so naming the session would
+/// add a column that never disambiguates anything.
+pub fn render_list(res: &StatusResult, style: &Style) -> String {
+    let rows: Vec<(String, AgentState, Option<String>)> = res
+        .sessions
+        .iter()
+        .flat_map(|s| s.panes.iter())
+        .filter_map(|p| {
+            let label = p.agent.clone()?;
+            let hint = title_hint(p, &label);
+            Some((label, p.state, hint))
+        })
+        .collect();
+    if rows.is_empty() {
+        return copy::NO_AGENTS.to_string();
+    }
+    let label_w = rows
+        .iter()
+        .map(|(l, _, _)| display_width(l))
+        .max()
+        .unwrap_or(0);
+    let state_w = rows
+        .iter()
+        .map(|(_, s, _)| display_width(&state_words(*s)))
+        .max()
+        .unwrap_or(0);
+    rows.iter()
+        .map(|(label, state, hint)| {
+            let name = style.role(label, &pad(label, label_w));
+            // The state cell is padded only when a hint follows it. The
+            // padding lives INSIDE the color run, so a trailing-space trim
+            // could not reach it afterwards: a row with nothing to say
+            // must take the unpadded cell, exactly as `status` does.
+            match hint {
+                Some(h) => format!(
+                    "  {name}  {}  {}",
+                    style.state(*state, &pad(&state_words(*state), state_w)),
+                    style.dim(h)
+                ),
+                None => format!("  {name}  {}", grid::state_cell(*state, style)),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The check glyph, and the one rule for it. Every surface that prints a
+/// check goes through here.
+///
+/// The weight says WHO answered for the fact beside it. Heavy ✔ means the
+/// component that owns the fact confirmed it: a vendor hook for a
+/// delivery, cyclopsd for a name, a roster, or its own liveness. Light ✓
+/// means nobody could be asked, and the line carries the best statement
+/// there is: a read off the screen, or an agent count taken off a
+/// workspace file.
+///
+/// So the same words take either glyph, and the glyph is the difference:
+/// `✔ workspace ready · 3 agents` is three panes cyclopsd will deliver to,
+/// `✓ workspace ready · 3 agents` is three names in a file with no daemon
+/// running to put them on anything.
+///
+/// GOALS asks for a hollow check on unverified; no portable hollow check
+/// glyph exists in terminal fonts, so weight is the pair (STATUS.md
+/// deviations).
+pub fn check(confirmed: bool) -> &'static str {
+    if confirmed {
+        "✔"
+    } else {
+        "✓"
+    }
+}
+
+/// The answer to `cyclops name`, in the badge voice: what happened, then
+/// the detail after a dim separator.
+///
+/// Heavy check: this is the daemon's answer to its own write. It put the
+/// pane in the registry and the line on the ledger before replying, so
+/// there is nothing left to confirm.
+pub fn render_named(result: &Value, style: &Style) -> String {
+    let sep = style.dim("·");
+    let ok = check(true);
+    let pane = result["pane_id"].as_str().unwrap_or_default();
+    let manifest = result["manifest"].as_str();
+    match result["label"].as_str() {
+        Some(label) => {
+            let tail = match manifest {
+                Some(m) => format!("{pane}, detects as {m}"),
+                None => pane.to_string(),
+            };
+            format!(
+                "{ok} named {} {sep} {}",
+                style.role(label, label),
+                style.dim(&tail)
+            )
+        }
+        None => format!(
+            "{ok} cleared {sep} {}",
+            style.dim(&format!("{pane} is unnamed"))
+        ),
+    }
+}
+
 /// The deliveries the header counted, one row each.
 ///
 /// A count with nothing behind it is the same defect on any surface: the
@@ -277,10 +405,9 @@ fn waiting_rows(attention: &Attention, style: &Style) -> Vec<String> {
 /// One receipt badge in this surface's paint. Words, glyph and color all
 /// come from `cyclops_ui::grid`; the CLI supplies only the painter.
 ///
-/// The check carries the evidence tier as weight: heavy ✔ for
-/// hook-verified, light ✓ for screen-tier. GOALS asks for a hollow check
-/// on unverified; no portable hollow check glyph exists in terminal
-/// fonts, so weight is the pair (STATUS.md deviations).
+/// Its checks follow [`check`]: hook-verified is confirmed and takes the
+/// heavy one, screen-tier is not and takes the light one. The parity test
+/// below reads both from [`check`] so the two cannot drift.
 pub fn receipt_badge(r: &DeliveryReceipt, style: &Style) -> String {
     grid::receipt_badge(r, style)
 }
@@ -323,7 +450,10 @@ pub fn wait_badge(
             // rather than agent or delivery states and take no group.
             let head = match state {
                 Some(s) => grid::state_cell(s, style),
-                None => "✓ reached".to_string(),
+                // Light check by [`check`]'s rule: the daemon said the
+                // wait reached its target and named no state to show for
+                // it, so there is nothing here that anybody confirmed.
+                None => format!("{} reached", check(false)),
             };
             match waited_ms {
                 Some(ms) => with(&head, &format!("waited {}", human_duration(ms))),
@@ -579,9 +709,12 @@ pub fn render_thread(lines: &[LedgerLine], style: &Style, now: u64) -> String {
     render_messages(lines, style, now, true)
 }
 
+/// Heavy check by [`check`]'s rule: the daemon answered this round trip
+/// itself, which is the whole of what the line claims.
 pub fn render_ping(rtt_ms: f64, style: &Style) -> String {
     format!(
-        "✓ cyclops is up {} {}",
+        "{} cyclops is up {} {}",
+        check(true),
         style.dim("·"),
         style.dim(&format!("{rtt_ms:.1}ms"))
     )
@@ -808,6 +941,118 @@ mod tests {
                         \x20 implementer  ○ idle\n\
                         \x20 %4           ? unknown  vim";
         assert_eq!(got, expected);
+    }
+
+    /// The roster grid, pinned exactly. This is the shape the landing page
+    /// promises: name, how it is doing, what it is on, aligned, no header.
+    #[test]
+    fn list_grid_plain_is_exact() {
+        let got = render_list(&fixture(), &Style::none());
+        let expected = "\x20 reviewer     ● working  Run the tests\n\
+                        \x20 implementer  ○ idle";
+        assert_eq!(got, expected);
+        for line in got.lines() {
+            assert_eq!(line, line.trim_end(), "trailing space in: {line:?}");
+        }
+    }
+
+    /// Painted, the grid still ends where the words end.
+    ///
+    /// A plain golden cannot see this one. The state cell is padded to its
+    /// column and then colored, so the padding sits INSIDE the escape run
+    /// and a `trim_end` over the finished line walks straight past it. A
+    /// row with no hint has to take the unpadded cell instead, which is
+    /// what `status` does and what this pins.
+    #[test]
+    fn list_rows_carry_no_padding_a_reader_cannot_see() {
+        let mut res = fixture();
+        res.sessions[0].panes[1].state = AgentState::BlockedPermission;
+        let painted = render_list(
+            &res,
+            &Style::with_theme(cyclops_theme::Theme::default(), true),
+        );
+        for line in painted.lines() {
+            let stripped: String = {
+                // Drop every CSI run, leaving the words the row prints.
+                let mut out = String::new();
+                let mut chars = line.chars();
+                while let Some(c) = chars.next() {
+                    if c == '\x1b' {
+                        for c in chars.by_ref() {
+                            if c == 'm' {
+                                break;
+                            }
+                        }
+                    } else {
+                        out.push(c);
+                    }
+                }
+                out
+            };
+            assert_eq!(
+                stripped,
+                stripped.trim_end(),
+                "painted row ends in space: {line:?}"
+            );
+        }
+    }
+
+    /// Unnamed panes are `status`'s business. `list` answers "who is on
+    /// this team", and a pane nobody named is not on it.
+    #[test]
+    fn list_shows_named_panes_only_and_invites_the_first_one() {
+        let got = render_list(&fixture(), &Style::none());
+        assert!(!got.contains("%4"), "{got}");
+
+        let mut res = fixture();
+        for p in &mut res.sessions[0].panes {
+            p.agent = None;
+        }
+        assert_eq!(render_list(&res, &Style::none()), copy::NO_AGENTS);
+    }
+
+    /// The state cell carries glyph and word on this grid too, and every
+    /// state is spelled the way the stream and `status` spell it.
+    #[test]
+    fn list_states_read_as_glyph_and_word() {
+        let mut res = fixture();
+        res.sessions[0].panes[1].state = AgentState::BlockedQuota;
+        res.sessions[0].panes[1].title = String::new();
+        let got = render_list(&res, &Style::none());
+        assert_eq!(
+            got,
+            "\x20 reviewer     ● working        Run the tests\n\
+             \x20 implementer  ⊘ blocked_quota"
+        );
+    }
+
+    /// `cyclops name` answers in the badge voice: what happened, then the
+    /// detail after a dim separator. A pin is named out loud, because the
+    /// whole point of passing it was to stop guessing.
+    #[test]
+    fn the_name_verb_says_what_it_did() {
+        let s = Style::none();
+        assert_eq!(
+            render_named(
+                &json!({"pane_id": "%3", "label": "reviewer", "manifest": null}),
+                &s
+            ),
+            "✔ named reviewer · %3"
+        );
+        assert_eq!(
+            render_named(
+                &json!({"pane_id": "%3", "label": "reviewer", "manifest": "claude"}),
+                &s
+            ),
+            "✔ named reviewer · %3, detects as claude"
+        );
+        // The clear badge answers for the name and nothing else. Whether
+        // the pane's own border format came back is cyclopsd's to report,
+        // and this line must never stand in for it.
+        assert_eq!(
+            render_named(&json!({"pane_id": "%3", "label": null}), &s),
+            "✔ cleared · %3 is unnamed"
+        );
     }
 
     #[test]
@@ -1206,16 +1451,36 @@ mod tests {
         );
     }
 
+    /// [`check`] is the one place the rule lives, so every surface that
+    /// prints a check reads its glyph from there. This test is what makes
+    /// that true of the surfaces whose glyph comes from somewhere else:
+    /// the delivery badges are `cyclops_ui::grid`'s, and a hook-verified
+    /// one has to be the confirmed glyph while a screen-tier one has to
+    /// be the other.
     #[test]
-    fn delivered_check_weight_pairs_heavy_verified_light_unverified() {
-        // GOALS "hollow check = unverified", implemented as weight: the
-        // two delivered badges must never share a glyph.
+    fn every_check_on_every_surface_reads_the_same_rule() {
         let s = Style::none();
+        assert_ne!(check(true), check(false), "the weights have to differ");
+
         let verified = receipt_badge(&receipt(DeliveryState::DeliveredVerified, None, None), &s);
         let unverified =
             receipt_badge(&receipt(DeliveryState::DeliveredUnverified, None, None), &s);
-        assert!(verified.starts_with('✔'), "{verified}");
-        assert!(unverified.starts_with('✓'), "{unverified}");
+        assert!(verified.starts_with(check(true)), "{verified}");
+        assert!(unverified.starts_with(check(false)), "{unverified}");
+
+        // The daemon wrote the registry and the ledger before answering.
+        let named = render_named(&json!({"pane_id": "%3", "label": "reviewer"}), &s);
+        assert!(named.starts_with(check(true)), "{named}");
+        let cleared = render_named(&json!({"pane_id": "%3", "label": null}), &s);
+        assert!(cleared.starts_with(check(true)), "{cleared}");
+
+        // The daemon answered this round trip itself.
+        assert!(render_ping(0.4, &s).starts_with(check(true)));
+
+        // A wait that reached with no state to show for it: nothing there
+        // was confirmed by anyone.
+        let reached = wait_badge("reached", None, None, None, &s);
+        assert!(reached.starts_with(check(false)), "{reached}");
     }
 
     #[test]
@@ -1298,10 +1563,10 @@ mod tests {
 
     #[test]
     fn ping_line_is_exact() {
-        assert_eq!(render_ping(0.42, &Style::none()), "✓ cyclops is up · 0.4ms");
+        assert_eq!(render_ping(0.42, &Style::none()), "✔ cyclops is up · 0.4ms");
         assert_eq!(
             render_ping(12.0, &Style::none()),
-            "✓ cyclops is up · 12.0ms"
+            "✔ cyclops is up · 12.0ms"
         );
     }
 

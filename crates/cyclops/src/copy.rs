@@ -10,6 +10,11 @@ pub const NOT_RUNNING: &str = "cyclops isn't running. Start it with: cyclopsd &"
 pub const NO_RECIPIENT: &str =
     "no recipient. Name one (cyclops send reviewer --subject \"...\"), or pass --to or --all.";
 
+/// Empty roster invites the next action, and names the command that fills
+/// it. `cyclops status` is the way to find the pane id to hand it.
+pub const NO_AGENTS: &str =
+    "No agents yet. Name a pane: cyclops name %1 reviewer  (cyclops status lists the panes)";
+
 /// Humane duration for timeout copy: whole seconds as words, else ms.
 pub fn timeout_words(d: Duration) -> String {
     let ms = d.as_millis();

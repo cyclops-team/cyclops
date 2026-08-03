@@ -59,13 +59,34 @@ pub(crate) fn bind_manifest<'a>(
         .find(|m| m.agent.process_names.iter().any(|p| p == current_command))
 }
 
-/// Bind a manifest to a pane row: comm name first, then the argv-basename
-/// fallback. pane_current_command is the kernel comm of the RESOLVED
-/// executable, so native installs can report a bare version string
-/// ("2.1.220", F21) and never bind by comm; the invoked argv[0] basename
-/// still says "claude". The fallback resolves argv once per (pane, pid),
-/// cached, and matches it against process_names plus argv_basenames.
+/// Bind a manifest to a pane row: the explicit pin first, then the comm
+/// name, then the argv-basename fallback.
+///
+/// The pin is `cyclops name --manifest <id>` and it wins outright. It
+/// exists because both automatic routes read what the pane is RUNNING, and
+/// a wrapper script, a `sh -c`, or a versioned symlink (F21) can leave a
+/// real agent looking like nothing in particular. A person who says which
+/// CLI is in the pane is better evidence than a process name.
+///
+/// pane_current_command is the kernel comm of the RESOLVED executable, so
+/// native installs can report a bare version string ("2.1.220", F21) and
+/// never bind by comm; the invoked argv[0] basename still says "claude".
+/// The fallback resolves argv once per (pane, pid), cached, and matches it
+/// against process_names plus argv_basenames.
 pub(crate) fn bind_manifest_for<'a>(inner: &'a Inner, row: &PaneRow) -> Option<&'a Manifest> {
+    if let Some(pinned) = inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .manifest_of(&row.pane_id)
+    {
+        // A pin that names nothing loaded falls through to detection
+        // rather than blinding the pane: the manifest set can shrink
+        // between the adoption and this recompute.
+        if let Some(m) = inner.manifests.get(&pinned) {
+            return Some(m);
+        }
+    }
     if let Some(m) = bind_manifest(&inner.manifests, &row.current_command) {
         return Some(m);
     }
@@ -433,6 +454,10 @@ pub(crate) async fn recompute_pane(
             "fused state changed"
         );
         inner.emit_state(watcher.session(), pane_id, &detection, prior, cause);
+        // The border says what this row says, from the same edge. No
+        // timer, no second rule: an adopted pane's chrome moves exactly
+        // when the fused state it names moves.
+        crate::repaint_chrome(inner, watcher, pane_id).await;
     }
     Some(detection)
 }

@@ -28,6 +28,13 @@ pub enum TmuxError {
     #[error("tmux control connection closed")]
     Disconnected,
 
+    /// A layout could not be read off a session or built onto one: a
+    /// window that is not a grid of rows, a zoomed pane, a session that
+    /// already exists. Carries the whole sentence to show the human,
+    /// because only this layer knows which window and which pane.
+    #[error("{0}")]
+    Layout(String),
+
     /// No reply within the command timeout. A command-level failure only:
     /// the connection is not torn down, and correlation stays intact
     /// because the reply slot is consumed in FIFO order when the late

@@ -18,16 +18,23 @@
 //! - [`TmuxVersion`]: version probe and feature gates.
 //! - [`focus_pane`]: one-shot focus jump for the stream UI, outside
 //!   control mode on purpose (a user gesture, not daemon state).
+//! - [`layout`]: workspace layouts, read off a session and applied to a
+//!   new one. Not re-exported flat: its `Server` is one of several types
+//!   in this workspace that name a tmux server, and the module path is
+//!   what tells them apart.
 //!
 //! Everything can fail with [`TmuxError`].
 
 pub mod control;
 pub mod error;
 pub mod focus;
+pub mod layout;
 pub mod notify;
 pub mod quote;
 pub mod version;
 pub mod watcher;
+
+mod cmd;
 
 pub use control::{ControlClient, ControlConfig, ControlMode};
 pub use error::TmuxError;

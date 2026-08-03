@@ -423,8 +423,9 @@ pub(crate) async fn dispatch(
                 );
             }
             let label = req.params["label"].as_str().map(str::to_string);
+            let manifest = req.params["manifest"].as_str().map(str::to_string);
             (
-                from_result(id, crate::label_pane(inner, &target, label)),
+                from_result(id, crate::label_pane(inner, &target, label, manifest).await),
                 None,
             )
         }
@@ -542,7 +543,7 @@ async fn msg_send(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> R
 /// (pane_id, label, pane_pid) rows for sender resolution, across every
 /// attached session. Shared with msg.history's "me" resolution.
 pub(crate) fn sender_panes(inner: &Inner) -> Vec<(String, Option<String>, i32)> {
-    let labels = inner.labels.lock().expect("labels lock");
+    let labels = inner.labels();
     inner
         .sessions
         .iter()
@@ -567,7 +568,7 @@ pub(crate) fn sender_panes(inner: &Inner) -> Vec<(String, Option<String>, i32)> 
 /// must still be resolvable while the daemon is detached.
 fn report_panes(inner: &Inner) -> Vec<(String, Option<String>, i32)> {
     let mut rows = sender_panes(inner);
-    let labels = inner.labels.lock().expect("labels lock");
+    let labels = inner.labels();
     for slot in &inner.sessions {
         if slot.link.lock().expect("session link lock").attached {
             continue;
@@ -643,7 +644,7 @@ pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResul
         Vec::new()
     };
     let detections = inner.detections.lock().expect("detections lock");
-    let labels = inner.labels.lock().expect("labels lock");
+    let labels = inner.labels();
     let sessions = inner
         .sessions
         .iter()
@@ -833,8 +834,10 @@ mod tests {
     use std::time::Instant;
 
     fn bare_inner() -> Arc<Inner> {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-unit");
+        let (registry, _) = crate::registry::Registry::load(&home);
         Arc::new(Inner {
-            cfg: Config::defaults(&cyclops_proto::scratch::scratch_dir("cyc-unit")),
+            cfg: Config::defaults(&home),
             boot_id: "b-test".into(),
             started: Instant::now(),
             tmux_version: "3.6a".into(),
@@ -842,13 +845,15 @@ mod tests {
             sessions: Vec::new(),
             events: broadcast::channel(16).0,
             detections: StdMutex::new(HashMap::<String, DetEntry>::new()),
-            labels: StdMutex::new(HashMap::new()),
+            registry: StdMutex::new(registry),
+            theme: StdMutex::new(cyclops_theme::ThemeWatch::new(&home)),
             hook_readings: StdMutex::new(HashMap::new()),
             argv_cache: StdMutex::new(HashMap::new()),
             engine: crate::delivery::Engine::new(),
             ack_state: crate::ack::AckState::new(),
             hook_liveness: crate::selftest::HookLiveness::new(),
             inject_pause: StdMutex::new(None),
+            fail_chrome_restore: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

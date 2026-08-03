@@ -144,10 +144,13 @@ dependencies = [
  "anyhow",
  "clap",
  "cyclops-proto",
+ "cyclops-testrig",
  "cyclops-theme",
+ "cyclops-tmux",
  "cyclops-ui",
  "libc",
  "serde_json",
+ "toml",
 ]
 
 [[package]]
@@ -202,8 +205,10 @@ version = "0.1.0"
 dependencies = [
  "cyclops-proto",
  "cyclops-testrig",
+ "serde",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
  "uuid",
 ]
@@ -232,6 +237,7 @@ dependencies = [
  "cyclops-manifest",
  "cyclops-proto",
  "cyclops-testrig",
+ "cyclops-theme",
  "cyclops-tmux",
  "cyclops-ui",
  "libc",

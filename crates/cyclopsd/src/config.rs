@@ -34,10 +34,18 @@ pub struct Config {
     /// long (working pane, human typing, detached session). Visibility for
     /// wedged holds; the delivery itself keeps waiting for events.
     pub gate_hold_notify_ms: u64,
-    /// Theme name for rendering clients (cyclops, cyclops-ui), resolved by
-    /// cyclops-theme. The daemon renders nothing; the key is recognized
-    /// here so a themed config file does not warn as unknown.
+    /// Theme name for rendering clients (cyclops, cyclops-ui) and for the
+    /// pane border chrome the daemon writes, resolved by cyclops-theme.
     pub theme: Option<String>,
+    /// Write `role • state` onto an adopted pane's tmux border. On by
+    /// default: a named pane that does not say its name is the whole
+    /// feature missing. Off leaves every tmux option untouched.
+    pub chrome: bool,
+    /// Workspace `cyclops start` opens when it is given no name. The
+    /// daemon builds no workspaces and never reads this; like `theme`, it
+    /// is recognized here so a config carrying it does not warn as an
+    /// unknown key.
+    pub default_workspace: Option<String>,
 }
 
 impl Config {
@@ -54,6 +62,8 @@ impl Config {
             receipt_block_ms: 2500,
             gate_hold_notify_ms: 120_000,
             theme: None,
+            chrome: true,
+            default_workspace: None,
         }
     }
 
@@ -156,6 +166,23 @@ impl Config {
                         other.type_str()
                     )),
                 },
+                "default_workspace" => match value {
+                    toml::Value::String(s) => cfg.default_workspace = Some(s),
+                    other => warnings.push(format!(
+                        "`default_workspace` must be a string, not a {}; `cyclops start` will use the first watched session",
+                        other.type_str()
+                    )),
+                },
+                // Words, not a bool: the switch turns a visible thing on
+                // and off, and `chrome = "off"` is what a person writes.
+                "chrome" => match value.as_str() {
+                    Some("on") => cfg.chrome = true,
+                    Some("off") => cfg.chrome = false,
+                    _ => warnings.push(format!(
+                        "`chrome` must be \"on\" or \"off\", not {value}; leaving it {}",
+                        if cfg.chrome { "on" } else { "off" }
+                    )),
+                },
                 unknown => warnings.push(format!("unknown config key `{unknown}` ignored")),
             }
         }
@@ -201,12 +228,14 @@ tmux_socket = "cyc-test"
 tmux_config = "/dev/null"
 manifest_dir = "/private/tmp/manifests"
 theme = "dark"
+default_workspace = "main"
 "#;
         let (cfg, warnings) = Config::parse(text, Path::new("/private/tmp/home")).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(cfg.sessions, vec!["main", "aux"]);
         assert_eq!(cfg.tmux_socket.as_deref(), Some("cyc-test"));
         assert_eq!(cfg.tmux_config.as_deref(), Some(Path::new("/dev/null")));
+        assert_eq!(cfg.default_workspace.as_deref(), Some("main"));
         assert_eq!(cfg.theme.as_deref(), Some("dark"));
         assert_eq!(
             cfg.manifest_dir(),
@@ -259,6 +288,24 @@ theme = "dark"
         assert_eq!(cfg.delivery_retry_max, 0);
         assert_eq!(cfg.receipt_block_ms, 900);
         assert_eq!(cfg.gate_hold_notify_ms, 300);
+    }
+
+    #[test]
+    fn chrome_is_on_unless_the_file_says_off() {
+        let (cfg, warnings) = Config::parse("", Path::new("/h")).unwrap();
+        assert!(cfg.chrome, "{warnings:?}");
+        let (cfg, warnings) = Config::parse("chrome = \"off\"\n", Path::new("/h")).unwrap();
+        assert!(!cfg.chrome);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (cfg, warnings) = Config::parse("chrome = \"on\"\n", Path::new("/h")).unwrap();
+        assert!(cfg.chrome);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // Anything else warns and changes nothing, including a bool: this
+        // key takes words, and silently accepting `true` would leave two
+        // spellings of the same switch in circulation.
+        let (cfg, warnings) = Config::parse("chrome = true\n", Path::new("/h")).unwrap();
+        assert!(cfg.chrome);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
 
     #[test]

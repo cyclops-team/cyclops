@@ -38,6 +38,16 @@ use std::path::Path;
 
 use tokio::sync::mpsc::unbounded_channel;
 
+/// The terminal's size in cells, or the classic 80x24 when there is none
+/// to ask.
+///
+/// Public because two callers ask the same question: the stream sizes its
+/// frame with it, and `cyclops start` sizes a new tmux session with it.
+/// The ioctl is written once.
+pub fn terminal_size() -> (usize, usize) {
+    term::Term::size()
+}
+
 /// How `cyclops ui` was asked to run.
 #[derive(Debug, Clone, Default)]
 pub struct UiOptions {

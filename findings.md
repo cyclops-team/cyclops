@@ -240,3 +240,209 @@ after the pane's process is gone. Recorded as a risk in STATUS.md and
 carried into the pane work, where the pane table is already being touched.
 The tmux-HEAD job stays continue-on-error: it did its job, which was to
 surface this at all.
+
+## F26. Every shipped manifest reads the pane title, so cyclops cannot write it (MEASURED)
+
+M4's brief asked the daemon to put `role • state` on both the pane title
+and the pane border. The title is not available, for three reasons that
+compound.
+
+It is a sensor. claude.toml carries `title_working_spinner` at priority
+1100 and `title_idle_sparkle` at 1000, both `region = "pane_title"`, and
+they are the title tier of fusion: on a pane where a title rule matches,
+screen capture never runs at all (amendment h). agy.toml and codex.toml
+carry pane_title rules too. Overwriting the title with decoration would
+replace the highest-priority evidence cyclops has about that pane with a
+string cyclops wrote itself.
+
+It is a fusion trigger. F13 measured that `select-pane -T` from outside
+the pane pushes `%subscription-changed` exactly like an in-pane OSC 2
+write, so every chrome write would wake a recompute of the pane it just
+overwrote.
+
+It does not stick. Claude rewrites its title continuously through a turn
+and tmux re-evaluates subscriptions on a 1Hz tick (F23), so a title
+cyclops writes is gone before a reader sees it.
+
+The border is the surface that was actually wanted. tmux's default
+`pane-border-format` is `#{?pane_active,#[reverse],}#{pane_index}#[default]
+"#{pane_title}"`, so the border already DISPLAYS the title: replacing the
+format replaces the view of the pane's identity without touching the value
+underneath, and the title sensor keeps reading what the agent publishes.
+Proven by crates/cyclopsd/tests/m4_name.rs, where the border follows the
+fused state while the test drives that state by writing the pane title
+from outside; both would be impossible if cyclops owned the title.
+
+Recorded as a deviation from the brief in STATUS.md.
+
+## F27. pane-border-format is a pane option; pane-border-status is not (MEASURED)
+
+Probed on tmux 3.6a in an isolated server. The two options behind border
+chrome scope differently, and the difference decides how much of a user's
+tmux a daemon has to touch to name a pane.
+
+`set-option -p -t %0 pane-border-format ...` is accepted and stored AT PANE
+SCOPE: `show-options -p -t %0 -v pane-border-format` reads it back, a
+sibling pane in the same window still resolves the inherited default, and
+`set-option -p -t %0 -u` removes it. So per-pane chrome affects exactly one
+pane and reverses exactly.
+
+`set-option -p -t %0 pane-border-status top` is also accepted, and it is
+NOT a pane option: `show-options -w -t @0 -v pane-border-status` reads
+"top" straight afterwards, i.e. the `-p` write went to the window. There is
+no pane scope for it. Cyclops therefore sets it with an explicit `-w`,
+snapshots the window's prior value once (the first adoption in that window
+takes the snapshot, the last un-adoption puts it back), and never touches
+the server-global scope.
+
+Two more measurements that shaped the design:
+
+- `show-options -p -t %0 -v <opt>` prints an empty line both for "unset at
+  this scope" and for "set here to the empty string". The value-less form
+  (`show-options -p -t %0 <opt>`) prints nothing for the first and
+  `<opt> ''` for the second, so the snapshot asks twice: once whether the
+  option is set here, once what it is.
+- A format string is expanded ONCE, so an option's value is substituted
+  literally and never re-expanded: `@cyclops_state` holding
+  `a#{pane_id},b"c` renders as those characters. That is why the chrome
+  text lives in per-pane `@cyclops_role` / `@cyclops_state` options while
+  the `#[fg=...]` runs live in the format cyclops owns. A label can then
+  never become a tmux directive.
+- `#[fg=#d19a66]` in a border format renders as SGR `38;5;173` on a
+  256-color client, so tmux does the truecolor-to-256 mapping per client.
+  The daemon writes one border for every client that may attach, and only
+  tmux knows what each one supports, so chrome writes hex and lets tmux
+  map it rather than picking the theme's own c256 fallback.
+- `pane-border-status top` costs the pane one row (a 20-row pane becomes
+  19), including in a single-pane window where tmux then draws a border
+  that was not there. That is the visible price of border chrome and the
+  reason `chrome = "off"` exists.
+
+## F28. tmux spreads a resize evenly, not proportionally, so cell layouts drift (MEASURED)
+
+A layout expressed as ratios has to be turned into cells at some window
+size, and tmux does not keep those cells in proportion when the window
+changes size. It hands the delta out EVENLY, one pane at a time.
+
+Measured on tmux 3.6a, isolated server, two panes side by side at 100
+columns split 70 | 29:
+
+    resize-window -x 200   ->  120 | 79      (each +50; proportional is 140 | 59)
+    resize-window -x 60    ->   50 |  9      (each -70)
+
+Vertically the same, and this is the case that matters. `cyclops start`
+built the `ops` preset into a detached session, which tmux sizes with
+`default-size`, 80x24. The dock landed at 7 of 23 usable rows, 30.4%, as
+designed. Attaching from a 200x50 terminal grew both rows by 13, so the
+dock became 20 of 49 rows: 40.8% of the screen for a dock designed at 30%,
+and the three agents lost a third of their height between them.
+
+Consequence: a preset only looks like its design if it is built at the
+size it will be looked at. `cyclops start` and `cyclops workspace restore`
+therefore size the new session to the terminal they were run from
+(`cyclops_ui::terminal_size`, the ioctl the stream already uses), and fall
+back to letting tmux choose only when stdout is not a terminal.
+
+Not fixed, and it cannot be fixed from here: nothing re-applies the ratios
+when a client attaches later at a different size, because there is no
+event to hang that on without polling. Building at the operator's own size
+covers the case that happens, which is a person running `cyclops start` in
+the terminal they are about to work in. Building one inside a small pane,
+or in a script, and attaching elsewhere still drifts. Recorded in
+docs/workspaces.md under "Sizes and resizing" rather than hidden.
+
+## F29. The daemon's JSON keys come out alphabetically, so scripts must not match on key order (MEASURED)
+
+`cyclops --json status` prints one compact line whose object keys are in
+ALPHABETICAL order, not the order the structs declare:
+
+    {"boot_id":"...","daemon_version":"0.1.0","proto":1,
+     "sessions":[{"attached":true,"name":"demo","panes":[...]}],
+     "tmux_version":"3.6a","uptime_ms":2017}
+
+`SessionStatus` declares `name` then `attached`; the wire says `attached`
+then `name`. The daemon answers through `serde_json::Value`, whose object
+is a `BTreeMap` unless the `preserve_order` feature is on, and it is not.
+
+This is not cosmetic. `demos/m4-workspace.sh` waited for the daemon to
+attach with
+
+    grep -q "\"name\":\"$SESSION\",\"attached\":true"
+
+which matches nothing the daemon can ever send. The loop ran out its 40
+iterations every time and the script continued anyway, so the demo passed
+on a ten-second sleep and would have failed on a slower machine for a
+reason nobody would have looked for. A wait that cannot succeed is worse
+than no wait: it looks like a wait in the diff.
+
+Two consequences, both applied:
+
+- A shell consumer matches ONE field (`"attached":true`) or uses jq. A
+  pattern spanning two keys is a pattern about the alphabet.
+- A wait keyed on `attached` alone is still not enough right after a
+  session is rebuilt, because the daemon can still be reporting the
+  session that just died. `demos/m4-workspace.sh` waits on the new pane
+  id instead.
+
+## F30. Killing a session kills a one-session tmux server, and the next one re-issues %0 (MEASURED)
+
+Probed on tmux 3.6a, isolated server, one session `demo` with two panes:
+
+    kill-session -t =demo   ->  has-session: "no server running on <path>"
+    new-session -d -s demo  ->  panes %0 %1 again, server pid 60557 -> 60571
+
+With a second session on the same server keeping it alive, the same
+kill-and-rebuild hands out `%2` instead: the id counter is the server's
+and dies with it.
+
+So pane id reuse is not an exotic case reachable only by a crash. It is
+what happens when a person kills the session they were working in and
+builds it again, which is the ordinary `cyclops workspace restore` path.
+Nothing may carry a name across on a pane id alone. The adoption registry
+already refuses to (an entry is restored only when the pane exists AND its
+root pid matches the one recorded at adoption); this is the measurement
+showing the case it defends against is the common one, not the rare one.
+`demos/m4-workspace.sh` runs exactly this: the rebuilt session comes back
+as `%0` and `%1`, and the names go back on from the workspace file rather
+than from the ids.
+
+## F31. Three of the four shipped preset labels get the same role color (MEASURED)
+
+Role color is one of the two encodings GOALS says carry meaning, and
+`cyclops_theme::role_slot` picks it by FNV-hashing the label into eight
+slots. Run over the labels Cyclops itself ships in `layouts/`:
+
+    implementer -> slot 1
+    reviewer    -> slot 2
+    tests       -> slot 2
+    docs        -> slot 2
+    admin       -> slot 4
+
+So the `quad` preset, the arrangement with the most agents in it, paints
+three of its four agents in one color. Seen live in `demos/m4-name.sh`,
+where `reviewer` and `tests` both render `#[fg=#96aac3]` on their borders
+and in `cyclops list`.
+
+Nothing is lost, because color is never alone: the name is spelled out in
+the same cell on every surface, so a `--plain` or NO_COLOR reader and a
+color reader get the same information. What is lost is the encoding's
+value. Role color exists so a person can tell panes apart at a glance, and
+across the shipped ladder it mostly cannot.
+
+Not fixed here, because every fix is a design decision rather than a
+correction:
+
+- Hashing differently just moves the collision to a different set of
+  labels; eight slots and a hash will always collide somewhere.
+- Assigning slots in adoption order would make them distinct, but the
+  color then depends on the order panes were named, and it has to be
+  recorded (the registry is durable now, so it could be) or it changes on
+  every daemon restart.
+- Assigning over the whole registry at render time keeps them distinct
+  without new state, but an agent's color would then change when a
+  different agent is named.
+
+M4 raises the stakes rather than causing this: it ships the four labels
+that collide, and it puts role color onto tmux borders, so the same
+collision is now visible on the border, in `list`, in `status` and in the
+stream at once.

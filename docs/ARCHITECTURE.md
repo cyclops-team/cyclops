@@ -3,8 +3,8 @@
 Cyclops v2 is a tmux-backed coordination daemon for terminal coding agents.
 The architecture is frozen by ADR-001 (`cyclops-arch/deliverables/`) plus the
 validation campaign's amendments (`cyclops-arch/validation-report.md`,
-section 8). This document maps those decisions to code. Parts marked M4 or
-later do not exist yet; everything else is in the tree today.
+section 8). This document maps those decisions to code. Everything here is
+in the tree today; anything still to come is marked M5 or later.
 
 ## Crate map
 
@@ -12,9 +12,9 @@ later do not exist yet; everything else is in the tree today.
 |---|---|---|
 | `crates/cyclops-proto` | Wire protocol v1, ledger schema, delivery state machine, agent state model. Data types only, no IO. Daemon and every client compile against it. | Done |
 | `crates/cyclops-manifest` | Per-CLI detection manifests: TOML schema, compiled rules, region parsing, priority evaluation, modal decline actions. Loads `manifests/*.toml`. | Done |
-| `crates/cyclops-tmux` | The tmux adapter. Every tmux-specific behavior lives here: version probe with feature gates, control-mode client (FIFO reply correlation, pause-after flow control), zero-polling reconciling pane table on `refresh-client -B` subscriptions. Pane rows carry `pane_pid` for sender identity. M3 adds `focus_pane`, a one-shot `select-window` plus `select-pane` outside control mode, so the stream UI's jump-to-pane makes no tmux call outside this crate. | Done (M3 scope) |
-| `crates/cyclopsd` | The daemon: control-mode watcher, sensor fusion (title + screen + hook reports), socket server, per-session ledger writer, delivery pipeline with per-recipient FIFO workers, fail-closed sender identity, pane adoption registry. M2 adds the ledger read side (`msg.history`, `msg.thread`), server-owned `agent.wait` with occupant pinning, and hook liveness plus the startup self-test (`hooks.verify`, `hooks.selftest`). | Done (M2 scope) |
-| `crates/cyclops` | The CLI: thin NDJSON client over the daemon socket. `ping`, `status`, `read`, `watch`, `send`, the `hook` receiver, the M2 verbs (`history`, `thread`, `wait`, `send --wait`, `hooks install\|verify\|selftest`), and M3's `ui` (dispatch only; the stream lives in `cyclops-ui`). | Done (M3 scope) |
+| `crates/cyclops-tmux` | The tmux adapter. Every tmux-specific behavior lives here: version probe with feature gates, control-mode client (FIFO reply correlation, pause-after flow control), zero-polling reconciling pane table on `refresh-client -B` subscriptions. Pane rows carry `pane_pid` for sender identity. M3 adds `focus_pane`, a one-shot `select-window` plus `select-pane` outside control mode, so the stream UI's jump-to-pane makes no tmux call outside this crate. M4 adds `layout`: the declarative workspace tree (windows, rows of panes, ratios) with `capture` off a live session and `apply` onto a new one, on the same one-shot invocation path. It writes no tmux option and no pane title, and refuses a session that already exists. | Done (M4 scope) |
+| `crates/cyclopsd` | The daemon: control-mode watcher, sensor fusion (title + screen + hook reports), socket server, per-session ledger writer, delivery pipeline with per-recipient FIFO workers, fail-closed sender identity, pane adoption registry. M2 adds the ledger read side (`msg.history`, `msg.thread`), server-owned `agent.wait` with occupant pinning, and hook liveness plus the startup self-test (`hooks.verify`, `hooks.selftest`). M4 makes the adoption registry durable (`registry.rs`: `$CYCLOPS_HOME/registry.json`, restored per session against the live pane table and the pane's root pid) and adds the border chrome writer (`chrome.rs`: per-pane `pane-border-format` and `@cyclops_*` options, window-scoped `pane-border-status`, snapshotted at adoption and restored on clear, on pane close, on a window move, and at shutdown; it also owns the `chrome = "off"` switch, so no caller tests it). The chrome is the only thing the daemon renders, and it paints from cyclops-theme like every other surface. | Done (M4 scope) |
+| `crates/cyclops` | The CLI: thin NDJSON client over the daemon socket. `ping`, `status`, `read`, `watch`, `send`, the `hook` receiver, the M2 verbs (`history`, `thread`, `wait`, `send --wait`, `hooks install\|verify\|selftest`), and M3's `ui` (dispatch only; the stream lives in `cyclops-ui`). M4 adds `name` and `list` (pane adoption and the roster, rendered on the same grid as `status`) plus the workspace verbs: `start` (restore or build the default workspace, idempotent) and `workspace save|restore`, in `src/workspace.rs`, which owns the files, the `default_workspace` config key, the label round trips through `pane.label`, and the copy. | Done (M4 scope) |
 | `crates/cyclops-ui` | The stream UI behind `cyclops ui`: admin view and firehose over `events.subscribe` plus a ledger-tail backfill, the eye, filters, jump-to-pane through the tmux adapter, `--plain` follow mode. Windowed rendering over a 10k ring; the terminal layer is a hand-rolled termios/ANSI backend behind a pure frame builder. | Done (M3 scope) |
 | `crates/cyclops-ledger` | Crash-safe append-only NDJSON ledger writer and cursor reader. Workspace member; `cyclopsd` writes one ledger per watched session through it; `cyclops-ui` replays session tails through it for backfill. | Done |
 | `crates/cyclops-theme` | The theme engine: semantic token vocabulary (role.1-8, surface.dim/accent, eye.calm/alert, state.\* and badge.\* in four groups, plus surface.fg as the engine's own out-of-vocabulary fallback), the state-to-group mapping both renderers resolve through, data-only theme TOML with 256-color fallback derivation, selection (`theme` config key, `CYCLOPS_THEME` override), event-driven hot reload. The CLI's style module and cyclops-ui resolve every color through it. The vocabulary is exactly what the renderers paint: stream and background tokens stay out because nothing resolves them (docs/themes.md). | Done (M3 scope) |
@@ -30,7 +30,10 @@ guarded installer; nothing installs it, see `docs/CUTOVER.md`),
 scripts must not copy, the scratch root and the tmux teardown), `themes/`
 (the shipped semantic token
 files dark, light, high-contrast, loaded by `cyclops-theme`; dark is the
-default and maps the landing page palette), `frontend/` (the production
+default and maps the landing page palette), `layouts/` (the four shipped
+workspace presets solo, duo, quad, ops; data, compiled into the `cyclops`
+binary with `include_str!` so a fresh install has them before it has a
+config file), `frontend/` (the production
 landing page for usecyclops.dev;
 read-only branding reference, outside the Cargo workspace, ignored by Rust
 CI, never modified without an explicit admin request).
@@ -253,6 +256,45 @@ adapter's one-shot `focus_pane` helper. Colors resolve through
 `cyclops-theme`; the eye, classification, and windowed rendering live in
 `cyclops-ui` (docs/ui.md).
 
+M4 is the first milestone that writes INTO tmux, and it writes on two
+paths that never touch each other. Keeping them apart is the whole design:
+one is the daemon's, on a control-mode connection it already owns, and one
+is a client's, on one-shot invocations against a server no daemon need be
+watching.
+
+```mermaid
+flowchart TD
+    N["cyclops name %4 reviewer"] --> D["cyclopsd: pane.label"]
+    D -->|"the roster, so a restart keeps it"| R["registry.json<br/>whole-file temp+rename, 0600"]
+    D -->|"how it got here"| L["ledger: system line, pane_labeled"]
+    D -->|"written on seven edges and no others: adoption,<br/>a fused state change, clear, session attach,<br/>a window move, pane close, and daemon shutdown"| C["chrome.rs, over the control-mode client:<br/>@cyclops_role, @cyclops_state,<br/>pane-border-format (this pane),<br/>pane-border-status (this window)"]
+    W["cyclops start · workspace save and restore"] -->|"labels, and only when a daemon answers"| D
+    W -->|"structure"| T["cyclops-tmux layout, one-shot invocations:<br/>new-session, split-window, resize-pane"]
+    C --> X(["tmux"])
+    T --> X
+```
+
+The two paths reach tmux from different processes and never write the same
+thing. Chrome sets options and takes them back: the pane's prior
+`pane-border-format` and the window's prior `pane-border-status` are
+snapshotted at adoption and restored on `--clear`, on pane close, on a
+window move (the window the pane left), and at shutdown (F27 for why the
+window scope is unavoidable, F26 for why the pane title is not written at
+all). The `chrome = "off"` switch that turns every one of those writes off
+lives in `chrome.rs` and nowhere else; the snapshot is taken either way, so
+a restore never unsets an option cyclops did not read. The layout path sets
+no option at all, writes no pane title, and sends no keys, so nothing it
+does needs undoing and it cannot collide with the chrome the daemon owns.
+
+They meet at exactly one call, `pane.label`. A workspace file holds the
+names when the panes are gone; the registry holds them while the panes are
+alive. `cyclops start` and `workspace restore` carry names from the file to
+the registry, and `workspace save` reads them back out of `status`. Neither
+verb can name a pane in a session the daemon has not attached to, and both
+say which of the four daemon states they found rather than half-doing it
+(docs/workspaces.md). `demos/m4-workspace.sh` runs that loop end to end and
+diffs what came back against what was there.
+
 ## Where each frozen decision lives
 
 | ADR-001 decision | Lives at | Status |
@@ -266,7 +308,7 @@ adapter's one-shot `focus_pane` helper. Colors resolve through
 | Delivery pipeline: queue, gate, paste, verify, submit, ACK; failures are queued states | State machine: `cyclops-proto/src/ledger.rs` (`DeliveryState::can_transition_to`). Pipeline: `cyclopsd/src/delivery.rs` | Done |
 | Turn detection from hooks via a `cyclops hook` receiver | `wire.rs` (`agent.state.report` params); receiver in `crates/cyclops/src/hook.rs`, matcher and fusion input in `cyclopsd/src/ack.rs` | Done |
 | Agent surface: thin CLI speaking NDJSON to the socket | `crates/cyclops` | Done (M2: history, thread, wait, hooks verbs; M3: ui) |
-| MCP front-door on the same daemon (option D absorbed) | Planned addition, not a dependency | M4+ |
+| MCP front-door on the same daemon (option D absorbed) | Planned addition, not a dependency | M5+ |
 | v1 keepers: fail-closed ACL, data-only config, explicit pane adoption, identity from socket peer | `cyclopsd/src/identity.rs` (peer creds + pid ancestry walk to a watched pane), `pane.label` adoption registry | Done |
 | tmux specifics confined to one adapter, version-gated, CI against tmux HEAD | `crates/cyclops-tmux`; advisory tmux-HEAD CI job | Done (probe), ongoing |
 | Rollout: shadow mode first, cutover gated on soak | M0 was the shadow daemon; M1 added the write path (delivery); M2 prepared the v1 shim and runbook (`scripts/commpact-shim/`, `docs/CUTOVER.md`), install is admin's call | In progress |

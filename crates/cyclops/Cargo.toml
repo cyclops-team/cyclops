@@ -8,11 +8,18 @@ description = "The Cyclops CLI: thin NDJSON client over the daemon socket."
 # The silence tests need a real terminal on the child's stdout: the theme
 # is only read when stdout is a tty, so a piped run cannot see the warning.
 libc.workspace = true
+# The workspace verbs build real tmux sessions, so their tests need the
+# isolated server and its teardown rule.
+cyclops-testrig.workspace = true
 
 [dependencies]
 cyclops-proto.workspace = true
 cyclops-theme.workspace = true
+# The workspace verbs build tmux sessions, and every tmux specific in
+# Cyclops lives in the adapter crate.
+cyclops-tmux.workspace = true
 cyclops-ui.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 anyhow.workspace = true
 clap.workspace = true

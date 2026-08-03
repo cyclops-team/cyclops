@@ -200,6 +200,142 @@ fn status_plain_renders_the_grid() {
 }
 
 #[test]
+fn list_renders_the_roster_and_asks_status_for_it() {
+    let home = scratch_home("lr");
+    let canned = canned_status();
+    serve_once(&home, hello(1), move |req| {
+        // One question, not a second one: the roster is already in the
+        // status answer, so a `pane.list` method would be a second place
+        // for it to come from.
+        assert_eq!(req["method"], "status");
+        (
+            vec![json!({"id": req["id"], "result": canned}).to_string()],
+            false,
+        )
+    });
+    let out = run_cyclops(&home, &["list", "--plain"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let expected = "\x20 reviewer     ● working  Run the tests\n\
+                    \x20 implementer  ○ idle\n";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn list_json_carries_the_same_rows() {
+    let home = scratch_home("lj");
+    let canned = canned_status();
+    serve_once(&home, hello(1), move |req| {
+        (
+            vec![json!({"id": req["id"], "result": canned}).to_string()],
+            false,
+        )
+    });
+    let out = run_cyclops(&home, &["list", "--json"]);
+    assert!(out.status.success());
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    let agents = v["agents"].as_array().expect("agents array");
+    assert_eq!(agents.len(), 2, "{v}");
+    assert_eq!(agents[0]["agent"], json!("reviewer"));
+    assert_eq!(agents[0]["state"], json!("working"));
+    assert_eq!(agents[1]["agent"], json!("implementer"));
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// The verb the ladder starts with. What matters here is the wire: a name
+/// and an optional pin go out, and `--clear` sends a null label rather
+/// than the string "null" or nothing at all.
+#[test]
+fn name_sends_the_label_and_the_pin() {
+    let home = scratch_home("nm");
+    serve_conns(&home, hello(1), 2, move |req| {
+        assert_eq!(req["method"], "pane.label");
+        let p = req["params"].clone();
+        let result = if p["label"].is_null() {
+            assert_eq!(p["target"], json!("reviewer"));
+            json!({"target": "reviewer", "pane_id": "%3", "label": null})
+        } else {
+            assert_eq!(p["target"], json!("%3"));
+            assert_eq!(p["label"], json!("reviewer"));
+            assert_eq!(p["manifest"], json!("claude"));
+            json!({"target": "%3", "pane_id": "%3", "label": "reviewer", "manifest": "claude"})
+        };
+        (
+            vec![json!({"id": req["id"], "result": result}).to_string()],
+            false,
+        )
+    });
+    let out = run_cyclops(
+        &home,
+        &["name", "%3", "reviewer", "--manifest", "claude", "--plain"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "✔ named reviewer · %3, detects as claude\n"
+    );
+
+    let out = run_cyclops(&home, &["name", "reviewer", "--clear", "--plain"]);
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "✔ cleared · %3 is unnamed\n"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// A name is required unless it is being taken back, and the two cannot
+/// be asked for at once. Usage mistakes never reach the daemon.
+#[test]
+fn name_usage_mistakes_stop_before_the_socket() {
+    let home = scratch_home("nmu");
+    for args in [
+        vec!["name", "%3"],
+        vec!["name", "%3", "reviewer", "--clear"],
+        vec!["name", "%3", "--clear", "--manifest", "claude"],
+    ] {
+        let out = run_cyclops(&home, &args);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?} should be a usage error"
+        );
+    }
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// `--clear` used to promise the pane's tmux border back flat out. It is
+/// the daemon that puts it back, only while it can still reach the pane,
+/// and the operator's own border format is the thing at stake, so the
+/// help says under what condition rather than asserting the outcome.
+#[test]
+fn clear_does_not_promise_a_border_it_cannot_confirm() {
+    let home = scratch_home("nhelp");
+    let out = run_cyclops(&home, &["name", "--help"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        text.contains("when cyclopsd can still reach the pane"),
+        "{text}"
+    );
+    // And it says what happens when it cannot: the clear fails and the
+    // name stays, because that record is the only copy of the operator's
+    // own border settings left once tmux is wearing cyclops's.
+    assert!(text.contains("the clear fails"), "{text}");
+    assert!(text.contains("the name is kept"), "{text}");
+    assert!(text.contains("Run it again"), "{text}");
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
 fn status_plain_opens_the_eye_on_a_blocked_agent() {
     // The shipped surface, not just the renderer: a blocked agent is the
     // only thing that opens the mark, and it names the count in words.

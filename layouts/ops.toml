@@ -1,0 +1,57 @@
+# Cyclops layout preset: ops
+#
+# Three agents across the top, the stream docked under them. The operator
+# watches one surface instead of scanning three.
+#
+# The dock is FULL WIDTH and 30% of the height. Both numbers are the
+# stream's, not taste:
+#
+#   Full width, because the stream does not wrap: it draws on a strict
+#   grid and lets the terminal clip its own edge. Its widest routine line
+#   is a clearance for an eleven-column label,
+#
+#       12:04:31  implementer  ✔ cleared · was ⚠ blocked_permission
+#
+#   which is 59 columns. A side dock at 30% of a 160-column terminal is 48
+#   columns and cuts the state word off, which is the one word that line
+#   exists to carry.
+#
+#   30% of the height, because that is where both halves stay usable. On a
+#   48-line terminal the dock gets 14 lines, the header plus a dozen
+#   entries, and each agent keeps 33, still more than a classic 24-line
+#   screen.
+#
+# The dock has no label on purpose. Labels are how you address an agent,
+# and nothing addresses the stream. It is also why `cyclops start` reports
+# three agents here and not four.
+#
+# The dock's command runs only under --launch, like every other recorded
+# command. Without it you get an empty pane and the one line to type.
+
+name = "ops"
+about = "Three agents with the stream docked underneath."
+
+[[windows]]
+name = "ops"
+
+[[windows.rows]]
+ratio = 0.70
+
+[[windows.rows.panes]]
+label = "implementer"
+ratio = 0.34
+
+[[windows.rows.panes]]
+label = "reviewer"
+ratio = 0.33
+
+[[windows.rows.panes]]
+label = "tests"
+ratio = 0.33
+
+[[windows.rows]]
+ratio = 0.30
+
+[[windows.rows.panes]]
+ratio = 1.0
+command = "cyclops ui"

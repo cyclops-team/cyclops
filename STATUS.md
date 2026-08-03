@@ -1,9 +1,10 @@
 # Status
 
-Updated 2026-08-02. M3 is complete and committed: the stream UI, the eye,
-the theme engine with state color, 442 tests green. CI is green on Linux
-and macOS. v2 has been promoted to main. Next up is M4, pane UX. One thing
-still waits on admin: the v1 cutover.
+Updated 2026-08-03. M4 is complete and committed: cyclops name and list,
+pane border chrome, layout presets, workspace save and restore, and
+cyclops start. 524 tests green, CI green on Linux and macOS, and v2 is
+main. Next up is M5, polish parity. One thing still waits on admin: the
+v1 cutover.
 
 ## Done
 
@@ -75,6 +76,122 @@ still waits on admin: the v1 cutover.
     8 slots (was 6), so existing labels may change color once.
   - Docs in the same commit: docs/ui.md and docs/themes.md created,
     ARCHITECTURE and CHANGELOG updated, README given a public face.
+- M4 naming, the roster, and pane border chrome (this change). What
+  shipped:
+  - `cyclops name <target> <label> [--manifest <id>] [--clear]` and
+    `cyclops list`. Naming records a `pane_labeled` system line, paints
+    the pane's tmux border, and recomputes the pane so an explicit
+    `--manifest` binds at that moment rather than at the next unrelated
+    event. `list` is the roster on the strict grid and it asks `status`
+    for it, so there is one source of the roster and not two.
+  - The adoption registry became a file, `$CYCLOPS_HOME/registry.json`.
+    M1 kept it in memory, so every daemon restart silently unnamed every
+    agent. It is restored per session against the live pane table, and an
+    entry survives only when the pane exists AND its root pid matches the
+    one recorded at adoption: a tmux server restart re-issues pane ids
+    from %0, and without that check an old name lands on whatever
+    inherited the id.
+  - Border chrome, painted from cyclops-theme's tokens on the fused-state
+    edge and no other. Scoped writes only: three per-pane options plus
+    one per-window one, snapshotted at adoption and restored on `--clear`,
+    on pane close, and at shutdown. Never the server-global scope, proven
+    by asking tmux rather than the daemon (tests/m4_name.rs). `chrome =
+    "off"` writes nothing at all.
+  - MEASURED and recorded as F26 and F27: `pane-border-format` is a real
+    pane option on 3.6a and `pane-border-status` is not; a format expands
+    once, so an option's value can never become a directive, which is why
+    the label rides `@cyclops_role` and the styling stays in the format;
+    and the pane TITLE cannot be written by cyclops at all, because every
+    shipped manifest reads it as a sensor.
+  - Docs in the same change: docs/panes.md written from a real run,
+    README, install, themes, ARCHITECTURE, CHANGELOG updated.
+- M4 workspaces, layout presets and `cyclops start` (this change):
+  - `cyclops start` opens the default workspace and is safe to run twice:
+    it restores the saved workspace under that name, builds one from a
+    preset when there is nothing saved, and leaves an existing session
+    exactly as it is. Under the ready line it prints only the steps still
+    undone, so a first run is the guided three-step moment GOALS asks for
+    and a second run is one line. It writes `config.toml` when there is
+    none and never edits one the user wrote; when the config does not
+    name the session it prints the line to add.
+  - The number in the ready line has one rule and it was worth finding by
+    running the thing: a `--preset` build used to leave no workspace file,
+    so the NEXT bare `start` fell back to `solo` and reported one agent
+    over a two-agent session. Building from a preset now writes the
+    workspace file, and the count comes from cyclopsd when it is watching
+    (the roster `cyclops list` shows), from the workspace when there is no
+    daemon and it still describes the session pane for pane, and otherwise
+    is not claimed: a session split since gets no names touched and a line
+    saying so. Regression tests cover both halves.
+  - `cyclops workspace save|restore`: a session's shape as one TOML file
+    under `$CYCLOPS_HOME/workspaces/`. Structure, ratios, working
+    directories, the names from the registry, and a launch hint per pane.
+    Restore always builds a NEW session, so it can never rearrange one
+    somebody is working in, and it restores structure and not processes:
+    panes are empty unless `--launch` is given, and even then tmux runs
+    the command as the pane's own. Nothing on this path sends keys to a
+    pane or sets a tmux option.
+  - Four presets in `layouts/`, compiled into the binary so a fresh
+    install has them before it has a config file. They are a ladder: each
+    is the one before it plus a pane, and the names carry over. The `ops`
+    dock's full width and 30% height are argued from the stream's own
+    grid, in the preset file and in docs/workspaces.md.
+  - `cyclops_tmux::layout` holds the tree, `capture` and `apply`. The
+    one-shot tmux runner `focus_pane` had is now shared in `cmd.rs`. The
+    model refuses what it cannot describe honestly, a nested split or a
+    zoomed pane, rather than saving an approximation that would restore
+    into a different arrangement.
+  - F28 came out of this: tmux spreads a window resize EVENLY, not in
+    proportion, so a workspace built at tmux's detached 80x24 default and
+    then attached from a 200x50 terminal turns a 30% dock into 41%.
+    `start` and `restore` build at the size of the terminal they were run
+    from. One built in a script and attached elsewhere still drifts, and
+    docs/workspaces.md says so rather than hiding it.
+  - Three defects came out of writing demos/m4-workspace.sh rather than
+    out of reading the code, which is the M3 lesson holding: a preset
+    build left no workspace file (so the next run reported the wrong agent
+    count); the grid was measured against the WINDOW, so the pane chrome's
+    `pane-border-status top` (F27, one line per pane) made
+    `cyclops workspace save` refuse a session `cyclops start` had just
+    built; and naming a session the daemon had not attached to yet failed
+    per pane with a confusing error and then a second, wrong sentence over
+    the top of it. All three are fixed with regression tests: the file is
+    written at build, the arithmetic measures panes, and the four daemon
+    states each get their own line plus the exact `cyclops start` that
+    finishes the job.
+  - demos/m4-workspace.sh is the whole loop end to end: build, name, save,
+    kill the session, restore, name again. Isolated tmux server and a
+    throwaway home like every other demo.
+  - Docs in the same change: docs/workspaces.md written from a real run,
+    README, install, ARCHITECTURE, CHANGELOG updated, F28 in findings.md.
+
+- M4 pane UX (this commit): `cyclops name` / `cyclops list` with a durable
+  adoption registry, pane border chrome carrying role and state, four
+  declarative layout presets, `cyclops workspace save|restore`, and
+  `cyclops start`. Its review found three defects that all shipped as
+  working code and all of which would have hurt, so they are recorded
+  rather than smoothed over:
+  - `cyclops start` matched a saved workspace to a live session by pane
+    COUNT, so a rearranged session got its agents renamed onto the wrong
+    panes. Proven: a tiled ops layout renamed the tests pane to reviewer
+    and the stream dock to tests, under a line reading "workspace ready ·
+    3 agents". A name is what every later send resolves through, so that
+    is the GOALS cardinal rule broken silently. Now matched on grid
+    topology position for position PLUS the names the daemon already
+    holds; any mismatch renames nothing at all and names the difference.
+    Deliberately not compared: pane sizes (resizing moves no agent) and
+    window names (tmux automatic-rename would refuse constantly).
+  - `cyclops name --clear` deleted the registry entry holding the user's
+    own pane-border-format before restoring it, so a failed restore lost
+    it permanently while printing success, and a later rename re-recorded
+    cyclops's own border as if it were the user's. Now: peek, restore,
+    and only commit the removal once the restore succeeded.
+  - `cyclops workspace save` overwrote every label in an existing file
+    when it could not read the roster, printing the opposite. Both causes
+    are fixed: no daemon, and a daemon with an empty roster.
+  - The chrome on/off switch was tested in eight places in five spellings
+    and in none of chrome.rs, with two of the eight already disagreeing.
+    It now lives in chrome.rs alone.
 
 ## ADMIN_ACTION_REQUIRED (not blocking the build)
 
@@ -153,11 +270,21 @@ it lying in minutes.
 
 ## Next
 
-- M4 pane UX: live titles and borders, layout presets, workspace
-  save/restore, `cyclops start`. The dead-pane edge below belongs here,
-  as does the status eye once StatusResult can carry open deliveries.
+- M4 pane UX is in flight. Naming, the roster, and the border chrome are
+  done (see Done). Live pane TITLES are not being built and will not be:
+  the title is a sensor on every shipped manifest, and the reason is
+  written up as F26 and under Deviations. The dead-pane edge below belongs
+  to this milestone too, and is still open.
 
 ## Backlog (non-blocking)
+
+- M4 floor, documented rather than fixed: if cyclopsd is watching a
+  session but holds NO names for it, a reorder is undetectable and
+  `cyclops start` maps the workspace's names onto panes by position. Grid
+  topology alone cannot tell two same-shaped arrangements apart. This is
+  the model's floor, not a regression; naming one pane closes it.
+- `cyclops workspace save` prints an agent count taken from the file
+  rather than the live roster; only the second line discloses that.
 
 - F25, and it is the sharpest one: cyclops has no reliable dead-pane edge
   on any tmux version. Death has no notification, per-pane subscriptions
@@ -227,6 +354,37 @@ it lying in minutes.
 
 ## Deviations from the brief
 
+- **`cyclops start` prints `✔ workspace ready · 3 agents`, and the brief
+  and the landing page both write it `✓ workspace ready — 3 agents`.** Two
+  characters, and both are the product's existing vocabulary rather than
+  taste. The light check already means one specific thing here, "delivered
+  but unverified", and the site's other check line
+  (`✓ delivered · verified`, HowItWorks.svelte:32) is already translated
+  to the heavy check in the shipped CLI: this line gets the same
+  translation. The separator is the middle dot every badge, header and
+  receipt in the tree uses, and the tree carries no em dash anywhere. The
+  site is the branding reference and stays untouched; if admin wants the
+  site's characters exactly, it is one line in
+  `crates/cyclops/src/workspace.rs` (`ready_line`) and its test.
+- The brief's `cyclops start` "ensure the daemon watches it" is done
+  through the config file, not by making the daemon watch a session at
+  runtime. `Inner.sessions` is fixed at boot and indexed everywhere by
+  position, with one ledger per slot; adding sessions live is a daemon
+  change that touches M1 and M2 invariants and is not part of a workspace
+  verb. `start` writes the config on a first run, prints the exact line to
+  add when the file is the user's own, and reports whether cyclopsd is
+  down, running elsewhere, or watching.
+- The workspace tree is a grid of rows, not tmux's binary split tree. It
+  says every preset and everything `select-layout` produces, it reads as
+  data a human can edit, and what it cannot say it refuses by name. A
+  window nested deeper than a grid can be saved only after
+  `select-layout`; the error says exactly that.
+- Saved launch commands carry no arguments. `#{pane_current_command}` is a
+  process name, so a pane running `claude --resume` records `claude`. The
+  field is documented as a hint for that reason. Recording full argv means
+  reading `/proc` or `ps` for the pane's foreground child, which is a
+  second identity mechanism and belongs with the argv work F21 already
+  started, not here.
 - GOALS says "hollow check = unverified"; no portable hollow check glyph
   exists in terminal fonts, so it ships as heavy check (verified) vs light
   check (unverified), words unchanged. Flagged for admin; GOALS.md itself
@@ -246,6 +404,24 @@ it lying in minutes.
   dropped because nothing paints a ground and the stream's gutter resolves
   surface.dim like every other detail column. GOALS.md is admin text and
   stays untouched; only those two names need an admin edit.
+- The M4 brief asks the daemon to set the pane TITLE as well as the
+  border format. Only the border is written. The title is the title tier
+  of fusion on every shipped manifest (claude's spinner rules sit at
+  priority 1100, and a matching title rule means the screen sensor never
+  runs), a write from outside pushes a subscription change like any other
+  (F13), and an agent that publishes its own title overwrites cyclops
+  inside tmux's 1Hz tick (F23). The border already displays the title, so
+  replacing the border format gives the same reading surface without
+  replacing the evidence underneath. Measured and written up as F26.
+- `pane-border-status` is written at WINDOW scope, which is wider than
+  the per-pane rule the brief states. tmux offers no pane scope for it:
+  `set -p` on that option writes the window option anyway (F27,
+  MEASURED). It is snapshotted per window, turned on by the first
+  adoption in a window and put back by the last un-adoption, and the
+  server-global scope is never touched.
+- GOALS puts the eye on pane badges. The border carries `role • state`
+  and not the eye; the eye stays on the stream header and `status`. The
+  M3 deviation entry above is still accurate.
 - ratatui and crossterm were unavailable offline, so the terminal layer is
   a hand-rolled termios and ANSI backend behind a pure frame builder.
   Swapping in a TUI crate later touches only that backend.

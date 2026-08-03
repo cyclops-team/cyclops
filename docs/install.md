@@ -19,24 +19,40 @@ Binaries land in `target/release/`: `cyclopsd` (the daemon) and `cyclops`
 ## Configure
 
 Cyclops keeps everything under `~/.cyclops` (override with `$CYCLOPS_HOME`).
-Create `~/.cyclops/config.toml`:
+`cyclops start` writes the config on a first run, so the short way is:
+
+```bash
+cyclops start
+```
+
+The long way, by hand. Create `~/.cyclops/config.toml`:
 
 ```toml
 # tmux sessions to watch
 sessions = ["main"]
 
+# what a bare `cyclops start` opens, see workspaces.md
+default_workspace = "main"
+
 # where the per-CLI detection manifests live
 manifest_dir = "/path/to/cyclops/manifests"
 ```
 
-Three optional keys are unset by default. The first two change how the
-daemon talks to tmux, so add them only when you mean to; the third only
-changes what the CLI prints:
+`cyclops start` writes the first two keys and not the third: it does not
+know where you cloned the repo. Without `manifest_dir`, the daemon looks
+in `~/.cyclops/manifests` and then in `./manifests`, so starting cyclopsd
+from the repo root works.
+
+Four optional keys. The first two change how the daemon talks to tmux, so
+add them only when you mean to. `theme` changes what every surface prints,
+and `chrome` is the one switch that stops the daemon writing to your tmux
+at all:
 
 ```toml
 tmux_socket = "cyc"        # tmux -L socket; unset uses the default server
 tmux_config = "/dev/null"  # tmux -f file; unset uses your own tmux config
 theme = "dark"             # colors, see docs/themes.md; unset picks dark too
+chrome = "off"             # stop writing names onto tmux borders, see panes.md
 ```
 
 Theme files are read from `~/.cyclops/themes`, or from `./themes` in the
@@ -61,9 +77,18 @@ Unknown keys warn and are ignored. The file is data; nothing in it executes.
 ## Run
 
 ```bash
+cyclops start   # ✓ workspace ready · 1 agent
 cyclopsd &
 cyclops status
 ```
+
+The check is light because the daemon is not up yet, so that one agent is
+a name in a file and nothing can be addressed. Run `cyclops start` again
+after `cyclopsd &` and it goes heavy: the count is the roster then.
+
+`start` opens the default workspace, building it from the `solo` preset
+the first time. `--preset duo|quad|ops` picks a bigger one;
+[workspaces.md](workspaces.md) covers saving and restoring your own.
 
 Logs go to stderr; set `CYCLOPS_LOG=debug` for more. Stop with Ctrl-C or
 SIGTERM; the daemon removes its socket and exits cleanly. Your tmux session

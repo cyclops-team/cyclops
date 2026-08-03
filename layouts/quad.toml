@@ -1,0 +1,33 @@
+# Cyclops layout preset: quad
+#
+# Four agents on one change, in even quarters. Nothing here is a reading
+# surface, so nothing gets a bigger share: four working agents, four equal
+# panes.
+
+name = "quad"
+about = "Four agents in even quarters: implement, review, test, document."
+
+[[windows]]
+name = "quad"
+
+[[windows.rows]]
+ratio = 0.5
+
+[[windows.rows.panes]]
+label = "implementer"
+ratio = 0.5
+
+[[windows.rows.panes]]
+label = "reviewer"
+ratio = 0.5
+
+[[windows.rows]]
+ratio = 0.5
+
+[[windows.rows.panes]]
+label = "tests"
+ratio = 0.5
+
+[[windows.rows.panes]]
+label = "docs"
+ratio = 0.5

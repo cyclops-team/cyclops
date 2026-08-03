@@ -1091,13 +1091,7 @@ fn expand_recipients(inner: &Arc<Inner>, to: &[String]) -> Result<Vec<String>, W
     let mut seen = HashSet::new();
     for t in to {
         if t == "*" {
-            let mut labels: Vec<String> = inner
-                .labels
-                .lock()
-                .expect("labels lock")
-                .values()
-                .cloned()
-                .collect();
+            let mut labels: Vec<String> = inner.labels().into_values().collect();
             labels.sort();
             for l in labels {
                 if seen.insert(l.clone()) {

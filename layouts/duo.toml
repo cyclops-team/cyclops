@@ -1,0 +1,26 @@
+# Cyclops layout preset: duo
+#
+# Two agents side by side, even halves. The pairing Cyclops was built for:
+# one writes, one reviews, and the handoff between them is a message with
+# a receipt.
+#
+# Even halves rather than a wide-and-narrow split because neither pane is
+# a reading surface. Both hold a working agent, and a reviewer reading a
+# diff needs the same width as the agent that wrote it.
+
+name = "duo"
+about = "Two agents side by side: one writes, one reviews."
+
+[[windows]]
+name = "duo"
+
+[[windows.rows]]
+ratio = 1.0
+
+[[windows.rows.panes]]
+label = "implementer"
+ratio = 0.5
+
+[[windows.rows.panes]]
+label = "reviewer"
+ratio = 0.5

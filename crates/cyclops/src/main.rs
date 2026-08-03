@@ -10,6 +10,7 @@ mod hook;
 mod hookset;
 mod render;
 mod style;
+mod workspace;
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -20,8 +21,8 @@ use serde_json::{json, Value};
 use client::{Client, ClientError};
 use cyclops_proto::{
     delivery_needs_human, DeliveryReceipt, DeliveryState, Event, HistoryParams, HistoryResult,
-    MsgSendParams, MsgSendResult, PaneReadParams, PaneReadResult, PaneReadSource, StatusResult,
-    SubscribeParams, ThreadResult, WaitSpec, WaitUntil, PROTOCOL_VERSION,
+    MsgSendParams, MsgSendResult, PaneReadParams, PaneReadResult, PaneReadSource, PaneStatus,
+    StatusResult, SubscribeParams, ThreadResult, WaitSpec, WaitUntil, PROTOCOL_VERSION,
 };
 use style::Style;
 
@@ -59,8 +60,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Open the default workspace: restore it, or build it from a preset.
+    /// Safe to run twice; a session that is already there is left alone.
+    Start(StartArgs),
+    /// Save and restore the shape of a session: panes, sizes, names.
+    Workspace {
+        #[command(subcommand)]
+        cmd: WorkspaceCmd,
+    },
     /// What cyclops is watching and the state of every agent.
     Status,
+    /// Name a pane so cyclops can address it. `--clear` gives it back.
+    Name(NameArgs),
+    /// Every named agent: what it is called, how it is doing, what it is on.
+    List,
     /// Round-trip check against the daemon.
     Ping,
     /// Read a pane: visible screen, recent output, or the detection view.
@@ -121,6 +134,46 @@ enum Cmd {
     },
 }
 
+#[derive(clap::Args)]
+struct StartArgs {
+    /// Workspace to open. Defaults to the config's default_workspace.
+    #[arg(long)]
+    workspace: Option<String>,
+    /// Session to open it in. Defaults to the workspace name.
+    #[arg(long)]
+    session: Option<String>,
+    /// Which shipped arrangement to build when nothing is saved:
+    /// solo, duo, quad, or ops. Ignored once the session exists.
+    #[arg(long)]
+    preset: Option<String>,
+    /// Run each pane's recorded command instead of leaving a shell.
+    #[arg(long)]
+    launch: bool,
+}
+
+#[derive(Subcommand)]
+enum WorkspaceCmd {
+    /// Write the session's shape, names and directories to a file.
+    Save {
+        /// Workspace name. Defaults to the session's.
+        name: Option<String>,
+        /// Session to read. Defaults to the default workspace's.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Build a saved workspace again, in a new session.
+    Restore {
+        /// Workspace to restore. Defaults to the config's default_workspace.
+        name: Option<String>,
+        /// Session to build. Defaults to the workspace name.
+        #[arg(long)]
+        session: Option<String>,
+        /// Run each pane's recorded command instead of leaving a shell.
+        #[arg(long)]
+        launch: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum HooksCmd {
     /// Render a hook config for one CLI and print the wiring instructions.
@@ -168,6 +221,25 @@ struct UiArgs {
     /// Ledger lines replayed for backfill before going live.
     #[arg(long, default_value_t = 200)]
     backfill: usize,
+}
+
+#[derive(clap::Args)]
+struct NameArgs {
+    /// The pane to name: a tmux pane id like %4, or the name it has now.
+    target: String,
+    /// What to call it, e.g. reviewer. Omit with --clear.
+    #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+    label: Option<String>,
+    /// Which agent CLI is in this pane (claude, codex, agy). Skip it and
+    /// cyclops works it out from the running process.
+    #[arg(long, conflicts_with = "clear")]
+    manifest: Option<String>,
+    /// Take the name back. The pane's tmux border goes back to yours when
+    /// cyclopsd can still reach the pane. When it cannot, the clear fails
+    /// and the name is kept: that record holds the only copy of your own
+    /// border settings. Run it again once tmux is answering.
+    #[arg(long)]
+    clear: bool,
 }
 
 #[derive(clap::Args)]
@@ -345,6 +417,39 @@ fn run(cli: &Cli) -> i32 {
         // flags over. Building a Style here warned about the same file
         // twice.
         Cmd::Ui(args) => cmd_ui(cli, args),
+        // The workspace verbs talk to tmux, and reach the daemon only for
+        // the labels. A down daemon costs them the names, not the verb, so
+        // they must not go through connect().
+        Cmd::Start(args) => workspace::run_start(
+            cli.json,
+            &style_for(cli),
+            args.workspace.as_deref(),
+            args.session.as_deref(),
+            args.preset.as_deref(),
+            args.launch,
+        ),
+        Cmd::Workspace {
+            cmd: WorkspaceCmd::Save { name, session },
+        } => workspace::run_save(
+            cli.json,
+            &style_for(cli),
+            name.as_deref(),
+            session.as_deref(),
+        ),
+        Cmd::Workspace {
+            cmd:
+                WorkspaceCmd::Restore {
+                    name,
+                    session,
+                    launch,
+                },
+        } => workspace::run_restore(
+            cli.json,
+            &style_for(cli),
+            name.as_deref(),
+            session.as_deref(),
+            *launch,
+        ),
         // Send and wait validate usage before touching the daemon, so
         // usage errors don't hide behind a down daemon.
         Cmd::Send(args) => cmd_send(cli, &style_for(cli), args),
@@ -365,6 +470,8 @@ fn run(cli: &Cli) -> i32 {
                 },
         } => hookset::run_install(*kind, agent, *dry_run, dest.as_deref(), cli.json),
         Cmd::Status
+        | Cmd::Name(_)
+        | Cmd::List
         | Cmd::Ping
         | Cmd::Read { .. }
         | Cmd::Watch { .. }
@@ -378,6 +485,8 @@ fn run(cli: &Cli) -> i32 {
             let style = style_for(cli);
             match &cli.cmd {
                 Cmd::Status => cmd_status(&mut c, cli, &style),
+                Cmd::Name(args) => cmd_name(&mut c, cli, &style, args),
+                Cmd::List => cmd_list(&mut c, cli, &style),
                 Cmd::Ping => cmd_ping(&mut c, cli, &style),
                 Cmd::Read {
                     target,
@@ -397,7 +506,9 @@ fn run(cli: &Cli) -> i32 {
                 | Cmd::Hook { .. }
                 | Cmd::Wait { .. }
                 | Cmd::Hooks { .. }
-                | Cmd::Ui(_) => {
+                | Cmd::Ui(_)
+                | Cmd::Start(_)
+                | Cmd::Workspace { .. } => {
                     unreachable!("handled above")
                 }
             }
@@ -478,6 +589,77 @@ fn cmd_status(c: &mut Client, cli: &Cli, style: &Style) -> i32 {
     };
     let config = cyclops_proto::cyclops_home().join("config.toml");
     println!("{}", render::render_status(&status, style, &config));
+    0
+}
+
+/// cyclops name <target> <label> [--manifest <id>] [--clear].
+///
+/// Adoption is explicit and this is the verb that does it: the daemon
+/// writes the pane into its registry, records a line on the ledger, and
+/// paints the pane's tmux border. `--clear` asks for all three back.
+///
+/// The badge answers for the name only. Putting a pane's own border
+/// format back is the daemon's half, it happens only while the daemon can
+/// still reach the pane, and this line must never be read as having
+/// confirmed it: see `--clear`'s help.
+fn cmd_name(c: &mut Client, cli: &Cli, style: &Style, args: &NameArgs) -> i32 {
+    let params = json!({
+        "target": args.target,
+        "label": if args.clear { Value::Null } else { json!(args.label) },
+        "manifest": args.manifest,
+    });
+    let result = match c.request("pane.label", params) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}", copy::client_error(&e, Some(&args.target)));
+            return 1;
+        }
+    };
+    if cli.json {
+        println!("{result}");
+        return 0;
+    }
+    println!("{}", render::render_named(&result, style));
+    0
+}
+
+/// cyclops list: the roster, one named agent per row.
+///
+/// Everything it shows is already in one `status` answer, so there is no
+/// second question to ask the daemon and no second place the roster can
+/// come from. `status` shows every watched pane; this shows the ones with
+/// names.
+fn cmd_list(c: &mut Client, cli: &Cli, style: &Style) -> i32 {
+    let result = match c.request("status", json!({})) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}", copy::client_error(&e, None));
+            return 1;
+        }
+    };
+    let status: StatusResult = match serde_json::from_value(result) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("{}", copy::UNREADABLE_ANSWER);
+            return 1;
+        }
+    };
+    if cli.json {
+        // Parity, not a second shape: the same rows the grid prints, as
+        // the pane records they came from.
+        let named: Vec<&PaneStatus> = status
+            .sessions
+            .iter()
+            .flat_map(|s| s.panes.iter())
+            .filter(|p| p.agent.is_some())
+            .collect();
+        println!(
+            "{}",
+            json!({"agents": serde_json::to_value(&named).expect("panes serialize")})
+        );
+        return 0;
+    }
+    println!("{}", render::render_list(&status, style));
     0
 }
 

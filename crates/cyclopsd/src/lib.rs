@@ -17,11 +17,13 @@
 //! main.rs is a thin wrapper adding signals and logging.
 
 mod ack;
+mod chrome;
 pub mod config;
 mod delivery;
 mod fusion;
 mod history;
 pub mod identity;
+mod registry;
 mod selftest;
 mod server;
 
@@ -29,6 +31,7 @@ pub use config::Config;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -38,7 +41,9 @@ use cyclops_proto::{
     AdminNotifyParams, AgentState, Detection, Event, Kind, LedgerLine, MsgSendParams,
     StateReportParams, WireError,
 };
-use cyclops_tmux::{ControlConfig, PaneEvent, PaneField, PaneRow, SessionWatcher, TmuxVersion};
+use cyclops_tmux::{
+    ControlConfig, PaneEvent, PaneField, PaneRow, SessionWatcher, TmuxError, TmuxVersion,
+};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -83,9 +88,15 @@ pub(crate) struct Inner {
     pub(crate) events: broadcast::Sender<Event>,
     /// Cached fusion verdict per pane id.
     pub(crate) detections: StdMutex<HashMap<String, DetEntry>>,
-    /// Adoption registry: pane id -> cyclops label. Explicit labeling via
-    /// pane.label (v1 keeper: explicit pane adoption).
-    pub(crate) labels: StdMutex<HashMap<String, String>>,
+    /// Adoption registry: which pane wears which label, what manifest is
+    /// pinned to it, and the tmux chrome it wore before cyclops arrived.
+    /// Explicit adoption via pane.label (v1 keeper), durable across
+    /// restarts (crates/cyclopsd/src/registry.rs).
+    pub(crate) registry: StdMutex<registry::Registry>,
+    /// Active theme for the pane border chrome, re-stat'ed on the state
+    /// change that is about to repaint (cyclops-theme's hot reload rule:
+    /// the stat rides an event, no timer exists).
+    pub(crate) theme: StdMutex<cyclops_theme::ThemeWatch>,
     /// Latest hook sensor reading per pane id (agent.state.report), plus
     /// the aging state that keeps a stale edge from pinning fused state.
     pub(crate) hook_readings: StdMutex<HashMap<String, fusion::HookEntry>>,
@@ -102,6 +113,9 @@ pub(crate) struct Inner {
     pub(crate) hook_liveness: selftest::HookLiveness,
     /// Test-only injection pause, see [`InjectPause`].
     pub(crate) inject_pause: StdMutex<Option<InjectPause>>,
+    /// Test-only: make the `--clear` chrome restore fail the way tmux
+    /// refusing a command would. See [`Daemon::fail_chrome_restore`].
+    pub(crate) fail_chrome_restore: AtomicBool,
 }
 
 pub(crate) struct SessionSlot {
@@ -224,11 +238,32 @@ impl Inner {
 
     /// Label of a pane, if adopted.
     pub(crate) fn label_of(&self, pane_id: &str) -> Option<String> {
-        self.labels
+        self.registry
             .lock()
-            .expect("labels lock")
-            .get(pane_id)
-            .cloned()
+            .expect("registry lock")
+            .label_of(pane_id)
+    }
+
+    /// pane id -> label for every adopted pane. The surfaces that render
+    /// or resolve the whole roster take this snapshot rather than holding
+    /// the registry lock across their own work.
+    pub(crate) fn labels(&self) -> HashMap<String, String> {
+        self.registry.lock().expect("registry lock").labels()
+    }
+
+    /// The theme for the next chrome write.
+    ///
+    /// The stat rides the edge that is about to repaint, which is
+    /// cyclops-theme's reload contract: an edit to the active theme moves
+    /// the borders on the next state change, and no timer exists.
+    pub(crate) fn theme_now(&self) -> cyclops_theme::Theme {
+        let mut watch = self.theme.lock().expect("theme lock");
+        if watch.refresh() {
+            for w in watch.warnings() {
+                warn!("theme: {w}");
+            }
+        }
+        watch.theme().clone()
     }
 
     /// Live watcher for a session slot, if attached.
@@ -276,11 +311,10 @@ impl Inner {
 
     /// Pane id a label points at, or the name itself when unlabeled.
     fn label_target(&self, name: &str) -> String {
-        let labels = self.labels.lock().expect("labels lock");
-        labels
-            .iter()
-            .find(|(_, l)| l.as_str() == name)
-            .map(|(pane, _)| pane.clone())
+        self.registry
+            .lock()
+            .expect("registry lock")
+            .pane_for_label(name)
             .unwrap_or_else(|| name.to_string())
     }
 }
@@ -299,10 +333,16 @@ impl Daemon {
         self.inner.cfg.home.join(cyclops_proto::SOCK_NAME)
     }
 
-    /// Clean shutdown: signal every task, let session tasks detach their
-    /// control clients, then remove the socket file. Delivery workers are
-    /// aborted; queued deliveries stay recorded in the ledger.
+    /// Clean shutdown: put every adopted pane's border back, signal every
+    /// task, let session tasks detach their control clients, then remove
+    /// the socket file. Delivery workers are aborted; queued deliveries
+    /// stay recorded in the ledger.
+    ///
+    /// The chrome restore comes first because it needs the control
+    /// connections the stop signal is about to close. The adoptions
+    /// themselves stay in the registry: a restart re-adopts and repaints.
     pub async fn shutdown(&self) {
+        restore_all_chrome(&self.inner).await;
         let _ = self.stop.send(true);
         let tasks: Vec<JoinHandle<()>> =
             std::mem::take(&mut *self.tasks.lock().expect("tasks lock"));
@@ -408,24 +448,56 @@ impl Daemon {
         *self.inner.inject_pause.lock().expect("inject pause lock") = Some(Arc::new(f));
     }
 
-    /// Label (adopt) or unlabel a pane. `target` is a pane id or an
-    /// existing label; `label: None` clears.
+    /// Test-only seam: from here on, the chrome restore behind `--clear`
+    /// fails as tmux refusing the command would. Not part of the public API
+    /// surface.
+    ///
+    /// It exists because the branch it reaches cannot be reached any other
+    /// way on demand. The real failure is tmux refusing a `set-option`, and
+    /// the only ways to cause that (kill the pane, kill the server) also
+    /// destroy the tmux state every assertion in such a test has to read
+    /// afterwards to prove the settings survived.
+    #[doc(hidden)]
+    pub fn fail_chrome_restore(&self, on: bool) {
+        self.inner.fail_chrome_restore.store(on, Ordering::SeqCst);
+    }
+
+    /// Adopt a pane under a label, or un-adopt it. `target` is a pane id or
+    /// an existing label; `label: None` clears.
     pub async fn label_pane(
         &self,
         target: &str,
         label: Option<String>,
+        manifest: Option<String>,
     ) -> Result<Value, WireError> {
-        label_pane(&self.inner, target, label)
+        label_pane(&self.inner, target, label, manifest).await
     }
 }
 
-/// Set or clear a pane label. Labels are the adoption registry: they name
-/// senders, resolve recipients, and define the "*" broadcast domain.
-pub(crate) fn label_pane(
+/// Adopt a pane under a label, or un-adopt it. Labels are the adoption
+/// registry: they name senders, resolve recipients, and define the "*"
+/// broadcast domain.
+///
+/// This is the half both verbs share: what has to be true before anything
+/// changes, and what has to be recorded once it has. The steps are ordered
+/// because each one can only be undone before the next has happened:
+///
+/// 1. Resolve the target to a live pane. Nothing is written for a name
+///    that points at no pane.
+/// 2. Validate the label. Reserved names and duplicates are refused here,
+///    while nothing has changed yet.
+/// 3. Validate an explicit `--manifest` against the loaded set, so a typo
+///    is an error instead of a pane that silently detects nothing.
+/// 4. Hand the pane to [`adopt_pane`] or [`unadopt_pane`], which own the
+///    registry write and the chrome between them.
+/// 5. Append the system ledger line and emit the event.
+pub(crate) async fn label_pane(
     inner: &Arc<Inner>,
     target: &str,
     label: Option<String>,
+    manifest: Option<String>,
 ) -> Result<Value, WireError> {
+    // 1. Resolve.
     let Some((session_idx, pane_id)) = inner.resolve_recipient(target) else {
         return Err(WireError {
             code: "no_such_target".to_string(),
@@ -433,38 +505,63 @@ pub(crate) fn label_pane(
             data: None,
         });
     };
+    let session = inner.sessions[session_idx].name.clone();
     let label = label.filter(|l| !l.is_empty());
+
+    // 2. Validate the label.
     if let Some(l) = &label {
         if l == "*" || l == "admin" || l.starts_with('%') {
-            return Err(WireError {
-                code: "bad_request".to_string(),
-                message: format!("label {l:?} is reserved"),
-                data: None,
-            });
+            return Err(bad_request(format!("label {l:?} is reserved")));
         }
-        let labels = inner.labels.lock().expect("labels lock");
-        if labels
-            .iter()
-            .any(|(p, existing)| existing == l && *p != pane_id)
+        // A control character cannot survive onto a tmux command line
+        // (quote_arg strips newlines), so the border would wear a
+        // different name than the ledger. One name per pane, everywhere.
+        if l.chars().any(char::is_control) {
+            return Err(bad_request(format!(
+                "label {l:?} has a control character in it"
+            )));
+        }
+        if inner
+            .registry
+            .lock()
+            .expect("registry lock")
+            .label_taken_by_other(l, &pane_id)
         {
-            return Err(WireError {
-                code: "bad_request".to_string(),
-                message: format!("label {l:?} is already taken"),
-                data: None,
-            });
+            return Err(bad_request(format!("label {l:?} is already taken")));
         }
     }
-    {
-        let mut labels = inner.labels.lock().expect("labels lock");
-        match &label {
-            Some(l) => {
-                labels.insert(pane_id.clone(), l.clone());
-            }
-            None => {
-                labels.remove(&pane_id);
-            }
+
+    // 3. Validate the manifest pin.
+    if let Some(m) = &manifest {
+        if !inner.manifests.contains_key(m) {
+            let known: Vec<&str> = inner.manifests.keys().map(String::as_str).collect();
+            return Err(bad_request(if known.is_empty() {
+                format!("no manifest {m:?}; this daemon loaded none at all")
+            } else {
+                format!("no manifest {m:?}; loaded: {}", known.join(", "))
+            }));
         }
     }
+
+    // 4. Adopt or un-adopt.
+    let watcher = inner.watcher_of(session_idx);
+    match &label {
+        Some(l) => {
+            adopt_pane(
+                inner,
+                watcher.as_ref(),
+                session_idx,
+                target,
+                &pane_id,
+                l,
+                manifest.as_deref(),
+            )
+            .await?
+        }
+        None => unadopt_pane(inner, watcher.as_ref(), &pane_id).await?,
+    }
+
+    // 5. Record.
     let seq = inner.append_line(
         session_idx,
         LedgerLine {
@@ -479,15 +576,350 @@ pub(crate) fn label_pane(
             body: None,
             reply_to: None,
             deliveries: Vec::new(),
-            data: Some(json!({"event": "pane_labeled", "pane_id": pane_id, "label": label})),
+            data: Some(json!({
+                "event": "pane_labeled",
+                "pane_id": pane_id,
+                "label": label,
+                "manifest": manifest,
+            })),
         },
     );
     inner.emit(
         "session",
-        json!({"name": inner.sessions[session_idx].name, "pane_labeled": pane_id, "label": label}),
+        json!({"name": session, "pane_labeled": pane_id, "label": label}),
         seq,
     );
-    Ok(json!({"target": target, "pane_id": pane_id, "label": label}))
+    Ok(json!({
+        "target": target,
+        "pane_id": pane_id,
+        "label": label,
+        "manifest": manifest,
+    }))
+}
+
+/// Put one pane on the roster under `label` and paint the border that says
+/// so.
+///
+/// The order is the crash story: the registry is the durable fact and the
+/// border is decoration, so a crash between them leaves a named pane
+/// wearing stale decoration rather than decoration nobody can take off.
+///
+/// 1. Read what tmux looked like before cyclops, and only the half that is
+///    not already on file: re-reading a pane cyclops already painted would
+///    record cyclops's own border as the thing to restore.
+/// 2. Write the registry.
+/// 3. Paint, from the state already on file so the border is never blank.
+///    A tmux failure is logged and does not fail the verb: the pane is
+///    adopted either way, and decoration is not the record.
+/// 4. Re-read the pane, which is what makes an explicit `--manifest` take
+///    effect now instead of at the next unrelated event; it repaints again
+///    if the pin changed the verdict.
+async fn adopt_pane(
+    inner: &Arc<Inner>,
+    watcher: Option<&Arc<SessionWatcher>>,
+    session_idx: usize,
+    target: &str,
+    pane_id: &str,
+    label: &str,
+    manifest: Option<&str>,
+) -> Result<(), WireError> {
+    let Some(row) = watcher.and_then(|w| w.pane(pane_id)) else {
+        return Err(WireError {
+            code: "no_such_target".to_string(),
+            message: format!("no such target {target:?}"),
+            data: None,
+        });
+    };
+    // 1. Read, ONCE.
+    //
+    // The two halves are decided separately because they belong to
+    // different things. The pane's format is already recorded if this pane
+    // was adopted before, and the window's status is already recorded if
+    // any adopted pane is already in this window. Either can be known
+    // while the other is not: renaming a pane that has since moved windows
+    // is exactly that case.
+    let (known_format, known_status) = {
+        let reg = inner.registry.lock().expect("registry lock");
+        (
+            reg.get(pane_id).map(|a| a.border_format.clone()),
+            reg.window(&row.window_id).map(|w| w.border_status.clone()),
+        )
+    };
+    let read = match watcher {
+        Some(w) if known_format.is_none() || known_status.is_none() => {
+            match chrome::snapshot(&w.client(), pane_id, &row.window_id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(pane = %pane_id, error = %e, "cannot read pane chrome; adopting without it");
+                    chrome::Snapshot::none()
+                }
+            }
+        }
+        _ => chrome::Snapshot::none(),
+    };
+    // 2. Write the registry.
+    let session = inner.sessions[session_idx].name.clone();
+    let adoption = registry::Adoption {
+        session: session.clone(),
+        pane_id: pane_id.to_string(),
+        label: label.to_string(),
+        manifest: manifest.map(str::to_string),
+        pane_pid: row.pane_pid,
+        window_id: row.window_id.clone(),
+        border_format: known_format.unwrap_or(read.border_format),
+    };
+    let window = registry::WindowChrome {
+        session,
+        window_id: row.window_id.clone(),
+        border_status: known_status.unwrap_or(read.border_status),
+    };
+    if let Err(e) = inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .adopt(adoption, window)
+    {
+        return Err(WireError {
+            code: "internal".to_string(),
+            message: format!("cannot record the adoption: {e}"),
+            data: None,
+        });
+    }
+    // 3. Paint.
+    paint_chrome(inner, session_idx, pane_id).await;
+    // 4. Re-read.
+    if let Some(w) = watcher {
+        fusion::recompute_pane(inner, w, pane_id, false, "pane_labeled").await;
+    }
+    Ok(())
+}
+
+/// Take a pane off the roster and give tmux its border back.
+///
+/// The order IS the correctness here. The registry entry is the only copy
+/// on the machine of the pane's own `pane-border-format` and its window's
+/// own `pane-border-status`: tmux has been overwritten and the user wrote
+/// those values down nowhere else. Forgetting the entry first and
+/// restoring afterwards means one tmux failure destroys both at once, with
+/// the pane still wearing cyclops's decoration and nothing left that knows
+/// what was under it. Worse, the next `name` re-snapshots the pane and
+/// records CYCLOPS's format as the thing to restore, so the user gets
+/// cyclops's border back believing it is theirs.
+///
+/// So the snapshot is the last thing to go:
+///
+/// 1. Read what the clear would hand back, WITHOUT committing it.
+/// 2. Restore the border from that, while the entry still exists. The
+///    window's own border status comes back only when this was the last
+///    adopted pane in that window.
+/// 3. A failed restore stops here. The entry stays exactly as it is, so a
+///    later `--clear` restores the same values, and the pane stays named,
+///    so no re-adoption ever re-snapshots cyclops's own decoration.
+/// 4. Forget the entry, now that what it carried is back on tmux.
+/// 5. Re-read the pane. The pin went with the name, so detection goes back
+///    to working the manifest out from the process, and that is an event
+///    rather than something to notice later.
+async fn unadopt_pane(
+    inner: &Arc<Inner>,
+    watcher: Option<&Arc<SessionWatcher>>,
+    pane_id: &str,
+) -> Result<(), WireError> {
+    // 1. Look, do not commit.
+    let pending = inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .pending_clear(pane_id);
+    // 2. Restore, with the snapshot still on file.
+    if let (Some((adoption, freed)), Some(w)) = (&pending, watcher) {
+        if let Err(e) = restore_for_clear(inner, w, adoption, freed.as_ref()).await {
+            // 3. Keep the name rather than the decoration: see above.
+            warn!(pane = %pane_id, error = %e, "cannot restore pane chrome; the name is kept so the snapshot survives");
+            return Err(WireError {
+                code: "chrome_not_restored".to_string(),
+                message: chrome_not_restored(adoption, freed.as_ref(), &e),
+                data: None,
+            });
+        }
+    }
+    // 4. Forget it. A write that fails here has already put the border
+    //    back, and the entry it could not drop still holds the ORIGINAL
+    //    values, so the retry restores the same thing twice and nothing is
+    //    poisoned.
+    inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .clear(pane_id)
+        .map_err(|e| WireError {
+            code: "internal".to_string(),
+            message: format!("cannot record the change: {e}"),
+            data: None,
+        })?;
+    // 5. Re-read.
+    if let Some(w) = watcher {
+        fusion::recompute_pane(inner, w, pane_id, false, "pane_unlabeled").await;
+    }
+    Ok(())
+}
+
+/// The chrome restore `--clear` runs, with the test seam in front of it.
+/// Production installs no seam and this is exactly [`chrome::restore`].
+async fn restore_for_clear(
+    inner: &Arc<Inner>,
+    watcher: &Arc<SessionWatcher>,
+    adoption: &registry::Adoption,
+    freed: Option<&registry::WindowChrome>,
+) -> Result<(), TmuxError> {
+    if inner.fail_chrome_restore.load(Ordering::SeqCst) {
+        return Err(TmuxError::Command("forced by the test seam".to_string()));
+    }
+    chrome::restore(&watcher.client(), inner.cfg.chrome, adoption, freed).await
+}
+
+/// What a failed `--clear` leaves behind, and how to finish it.
+///
+/// Three things the user has to be told, because the pane looks unchanged
+/// from the outside: the clear did not happen, the decoration on screen is
+/// still cyclops's, and the name was kept on purpose rather than by
+/// accident. Naming the tmux options makes the state checkable by hand;
+/// naming the command makes it fixable without one.
+fn chrome_not_restored(
+    adoption: &registry::Adoption,
+    freed: Option<&registry::WindowChrome>,
+    cause: &TmuxError,
+) -> String {
+    let window = match freed {
+        Some(w) => format!(
+            ", and window {} still wears cyclops's pane-border-status",
+            w.window_id
+        ),
+        None => String::new(),
+    };
+    format!(
+        "couldn't put {pane}'s tmux border back: {cause}. {pane} is still named \"{label}\" and still wears cyclops's pane-border-format{window}. Your own settings live only in that name's record, so the name is kept until they are back on tmux. Retry with: cyclops name {pane} --clear",
+        pane = adoption.pane_id,
+        label = adoption.label,
+    )
+}
+
+/// Put every adopted pane's border back the way cyclops found it, without
+/// touching the registry: the panes stay adopted, they just stop wearing
+/// cyclops's decoration while no daemon is running to keep it true.
+///
+/// A window's border status is put back once, on the first of its adopted
+/// panes this loop reaches; the rest only need their own pane options
+/// removed. (`--clear` gets there the other way round, on the last pane
+/// out, because there the window keeps its text while a named pane is
+/// still in it.)
+async fn restore_all_chrome(inner: &Arc<Inner>) {
+    for (idx, slot) in inner.sessions.iter().enumerate() {
+        let Some(watcher) = inner.watcher_of(idx) else {
+            continue;
+        };
+        let adoptions = inner
+            .registry
+            .lock()
+            .expect("registry lock")
+            .in_session(&slot.name);
+        let mut restored_windows: Vec<String> = Vec::new();
+        for adoption in adoptions {
+            let window_snapshot = if restored_windows.contains(&adoption.window_id) {
+                None
+            } else {
+                restored_windows.push(adoption.window_id.clone());
+                inner
+                    .registry
+                    .lock()
+                    .expect("registry lock")
+                    .window(&adoption.window_id)
+                    .cloned()
+            };
+            if let Err(e) = chrome::restore(
+                &watcher.client(),
+                inner.cfg.chrome,
+                &adoption,
+                window_snapshot.as_ref(),
+            )
+            .await
+            {
+                warn!(pane = %adoption.pane_id, error = %e, "cannot restore pane chrome at shutdown");
+            }
+        }
+    }
+}
+
+fn bad_request(message: String) -> WireError {
+    WireError {
+        code: "bad_request".to_string(),
+        message,
+        data: None,
+    }
+}
+
+/// Paint one adopted pane's border with its current label and state.
+///
+/// Silent when the pane is not adopted, and when the session is detached:
+/// there is no client to write through, and the re-attach repaints
+/// everything anyway. `chrome = "off"` is chrome.rs's answer, not this
+/// function's.
+pub(crate) async fn paint_chrome(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) {
+    let Some(watcher) = inner.watcher_of(session_idx) else {
+        return;
+    };
+    let Some(adoption) = inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .get(pane_id)
+        .cloned()
+    else {
+        return;
+    };
+    let theme = inner.theme_now();
+    let state = inner.cached_state(pane_id);
+    if let Err(e) = chrome::apply(
+        &watcher.client(),
+        inner.cfg.chrome,
+        pane_id,
+        &adoption.window_id,
+        &adoption.label,
+        state,
+        &theme,
+    )
+    .await
+    {
+        warn!(pane = %pane_id, error = %e, "cannot write pane chrome");
+    }
+}
+
+/// Repaint the state half of an adopted pane's border. Called from the one
+/// place a fused state change is recorded (fusion::recompute_pane), so a
+/// border can never disagree with the row `cyclops list` prints.
+pub(crate) async fn repaint_chrome(inner: &Arc<Inner>, watcher: &SessionWatcher, pane_id: &str) {
+    let Some(adoption) = inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .get(pane_id)
+        .cloned()
+    else {
+        return;
+    };
+    let theme = inner.theme_now();
+    let state = inner.cached_state(pane_id);
+    if let Err(e) = chrome::repaint(
+        &watcher.client(),
+        inner.cfg.chrome,
+        pane_id,
+        &adoption.label,
+        state,
+        &theme,
+    )
+    .await
+    {
+        warn!(pane = %pane_id, error = %e, "cannot repaint pane chrome");
+    }
 }
 
 /// Boot the daemon: probe tmux, load manifests, bind the socket, spawn one
@@ -545,6 +977,18 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
             last_panes: StdMutex::new(HashMap::new()),
         });
     }
+    // Adoptions from the previous run. Nothing is trusted onto a pane
+    // yet; each session prunes its own entries against the live pane
+    // table when it attaches (registry::restore_session).
+    let (adoptions, warnings) = registry::Registry::load(&cfg.home);
+    for w in warnings {
+        warn!("registry: {w}");
+    }
+    let theme = cyclops_theme::ThemeWatch::new(&cfg.home);
+    for w in theme.warnings() {
+        warn!("theme: {w}");
+    }
+
     let (events, _) = broadcast::channel(EVENT_BUFFER);
     let inner = Arc::new(Inner {
         cfg,
@@ -555,13 +999,15 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         sessions,
         events,
         detections: StdMutex::new(HashMap::new()),
-        labels: StdMutex::new(HashMap::new()),
+        registry: StdMutex::new(adoptions),
+        theme: StdMutex::new(theme),
         hook_readings: StdMutex::new(HashMap::new()),
         argv_cache: StdMutex::new(HashMap::new()),
         engine,
         ack_state: ack::AckState::new(),
         hook_liveness: selftest::HookLiveness::new(),
         inject_pause: StdMutex::new(None),
+        fail_chrome_restore: AtomicBool::new(false),
     });
 
     // Boot fact on every session ledger: which daemon run, which tmux,
@@ -783,7 +1229,10 @@ async fn run_session(
 ) {
     let mut rx = watcher.subscribe();
     // Bootstrap: the watcher's table is already authoritative; evaluate
-    // every pane once so status answers immediately.
+    // every pane once so status answers immediately. Adoptions are
+    // reconciled against that table first, so the very first recompute
+    // already knows which panes are named and which manifest is pinned.
+    reconcile_adoptions(inner, watcher).await;
     for row in watcher.snapshot() {
         fusion::recompute_pane(inner, watcher, &row.pane_id, false, "bootstrap").await;
     }
@@ -816,6 +1265,123 @@ async fn run_session(
     }
 }
 
+/// Bring the registry back in step with a session that just attached, and
+/// repaint what survives.
+///
+/// This runs on every attach, not only at boot: a reattach after tmux went
+/// away can find a completely different set of panes, and a label pointing
+/// at a pane id that now belongs to somebody else is how a message reaches
+/// the wrong terminal.
+async fn reconcile_adoptions(inner: &Arc<Inner>, watcher: &Arc<SessionWatcher>) {
+    let live: Vec<(String, i32)> = watcher
+        .snapshot()
+        .into_iter()
+        .map(|r| (r.pane_id, r.pane_pid))
+        .collect();
+    let kept = {
+        let mut reg = inner.registry.lock().expect("registry lock");
+        match reg.restore_session(watcher.session(), &live) {
+            Ok(kept) => kept,
+            Err(e) => {
+                error!(session = %watcher.session(), error = %e, "cannot rewrite the registry; keeping it in memory only");
+                reg.in_session(watcher.session())
+            }
+        }
+    };
+    if kept.is_empty() {
+        return;
+    }
+    let theme = inner.theme_now();
+    for a in kept {
+        let state = inner.cached_state(&a.pane_id);
+        if let Err(e) = chrome::apply(
+            &watcher.client(),
+            inner.cfg.chrome,
+            &a.pane_id,
+            &a.window_id,
+            &a.label,
+            state,
+            &theme,
+        )
+        .await
+        {
+            warn!(pane = %a.pane_id, error = %e, "cannot write pane chrome on attach");
+        }
+    }
+}
+
+/// An adopted pane moved to another window (tmux `join-pane`,
+/// `break-pane`). Take the border text off the window it left and put it
+/// on the window it joined.
+///
+/// Border text is a window setting with no pane scope (F27), so it does
+/// not travel with the pane. Without this, the source window keeps showing
+/// border text with nothing named left in it, and the destination shows
+/// none at all. The pane's own options need no work: they moved with it.
+///
+/// The name and everything under it are untouched. This is chrome only.
+async fn move_chrome(inner: &Arc<Inner>, watcher: &Arc<SessionWatcher>, pane_id: &str) {
+    let Some(row) = watcher.pane(pane_id) else {
+        return;
+    };
+    // Nothing to do for a pane nobody named, or one already recorded in
+    // the window it is now in.
+    match inner.registry.lock().expect("registry lock").get(pane_id) {
+        Some(a) if a.window_id != row.window_id => {}
+        _ => return,
+    }
+    // Read the destination's border setting before anything writes to it,
+    // and only when this is a window the registry has not already
+    // snapshotted; a window already holding an adopted pane has one.
+    let destination_known = inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .window(&row.window_id)
+        .is_some();
+    let destination_status = if destination_known {
+        None
+    } else {
+        match chrome::snapshot(&watcher.client(), pane_id, &row.window_id).await {
+            Ok(s) => s.border_status,
+            Err(e) => {
+                warn!(pane = %pane_id, error = %e, "cannot read the destination window's border setting");
+                None
+            }
+        }
+    };
+    let freed = match inner.registry.lock().expect("registry lock").move_window(
+        pane_id,
+        &row.window_id,
+        destination_status,
+    ) {
+        Ok(freed) => freed,
+        Err(e) => {
+            error!(pane = %pane_id, error = %e, "cannot record the pane move");
+            return;
+        }
+    };
+    if let Some(source) = freed {
+        if let Err(e) = chrome::restore_window(
+            &watcher.client(),
+            inner.cfg.chrome,
+            &source.window_id,
+            source.border_status.as_deref(),
+        )
+        .await
+        {
+            warn!(window = %source.window_id, error = %e, "cannot restore the window an adopted pane left");
+        }
+    }
+    let session_idx = inner
+        .sessions
+        .iter()
+        .position(|s| s.name == watcher.session());
+    if let Some(idx) = session_idx {
+        paint_chrome(inner, idx, pane_id).await;
+    }
+}
+
 /// Apply one watcher event. Returns true when the connection is over.
 async fn handle_pane_event(
     inner: &Arc<Inner>,
@@ -836,8 +1402,27 @@ async fn handle_pane_event(
                 .expect("detections lock")
                 .remove(&id);
             // Adoption ends with the pane; hook history and the argv
-            // binding cache die with it too.
-            inner.labels.lock().expect("labels lock").remove(&id);
+            // binding cache die with it too. There is no chrome to put
+            // back: the pane that wore it is gone, and its window only
+            // keeps the border on while some other adopted pane is left.
+            let freed = inner
+                .registry
+                .lock()
+                .expect("registry lock")
+                .forget(&id)
+                .and_then(|(a, freed)| freed.map(|f| (a, f)));
+            if let Some((adoption, window)) = freed {
+                if let Err(e) = chrome::restore_window(
+                    &watcher.client(),
+                    inner.cfg.chrome,
+                    &adoption.window_id,
+                    window.border_status.as_deref(),
+                )
+                .await
+                {
+                    warn!(window = %adoption.window_id, error = %e, "cannot restore window border after the last adopted pane closed");
+                }
+            }
             inner
                 .hook_readings
                 .lock()
@@ -882,6 +1467,12 @@ async fn handle_pane_event(
             });
             if relevant {
                 fusion::recompute_pane(inner, watcher, &id, false, "pane_changed").await;
+            }
+            // A move does not touch agent state, but it does move half the
+            // chrome: the pane carries its own options and the window's
+            // border text does not follow it.
+            if changed.iter().any(|f| matches!(f, PaneField::WindowId)) {
+                move_chrome(inner, watcher, &id).await;
             }
             false
         }
