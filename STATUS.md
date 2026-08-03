@@ -1,14 +1,14 @@
 # Status
 
-Updated 2026-08-03. One command is the whole first run: `cyclops start`
-opens the workspace, starts the daemon, and names the panes. The installer
-ships too.
+Updated 2026-08-03. Two commands take a stranger from a clone to a
+working system, and neither has a wrong order to get wrong.
 `./scripts/install.sh` builds both binaries, puts them where the shell
-looks, sets the home up, and proves the result runs; `--uninstall` puts the
-machine back. Getting there turned up F33, three defects on the first-run
-path that made `cyclops start` print a step which answered with an error.
-582 tests across 63 targets, parity 107/107 (123/123 with the installer
-section), CI green, v2 is main. Next is M7 flow features.
+looks, sets the home up, and proves the result runs. Then `cyclops start`
+opens the workspace, starts the daemon, waits for it, and names the panes:
+one command, measured at 1.1s on a bare home, heavy check.
+
+589 tests across 64 targets, parity 108/108 (124/124 with the installer
+section), CI green, v2 is main. Next is M8, the dashboard.
 One thing still waits on admin: the v1 cutover.
 
 ## Done
