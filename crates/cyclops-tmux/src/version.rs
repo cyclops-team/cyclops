@@ -1,7 +1,24 @@
-//! tmux version probe and feature gates.
+//! tmux version parsing, and the named predicates for version-specific
+//! behavior.
 //!
-//! Rule (engineering rule 5): every version-specific behavior is gated here
-//! with an explicit probe, not assumed at call sites.
+//! Rule (engineering rule 5): a version-specific behavior is a named
+//! predicate here, never a version comparison written at a call site.
+//!
+//! What is actually gated on a version today is ONE thing, and it is a log
+//! line: [`TmuxVersion::has_bracket_paste_flag`] tells `cyclopsd::boot`
+//! whether to say that deliveries will fall back to post-paste composer
+//! verification (amendment b). Nothing branches on it, because through
+//! 3.6a the answer is always no and verification is the gate either way.
+//! [`TmuxVersion::has_pause_after`] has no caller at all: the control
+//! client sends `refresh-client -f pause-after=300` unconditionally and
+//! treats a `%error` reply as an older tmux, which is a better test than
+//! a version number because it asks the server that answered.
+//!
+//! This module does not run `tmux -V`. `cyclopsd::probe_tmux` spawns it
+//! once at boot and hands the text to [`TmuxVersion::parse`], which is the
+//! one tmux invocation outside this crate (see the crate header). The
+//! parse is total: an unrecognized string leaves `numeric` None, and both
+//! predicates then read false.
 
 /// Parsed `tmux -V` output plus the feature gates Cyclops cares about.
 #[derive(Debug, Clone, PartialEq, Eq)]

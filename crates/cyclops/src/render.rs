@@ -247,8 +247,45 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
             out.push(line);
         }
     }
+    out.extend(unknown_rows(res, style));
     out.extend(waiting_rows(&attention, style));
     out.join("\n")
+}
+
+/// The sentence under the grid explaining every `? unknown` row on it.
+///
+/// A state cell says WHAT cyclops read. Unknown is the one cell where that
+/// is not enough: it is not a state the agent is in, it is cyclops unable
+/// to read one, and the pane it names can receive nothing until that is
+/// fixed. The grid keeps its one-line rows and the reason goes underneath,
+/// once, however many rows there are.
+fn unknown_rows(res: &StatusResult, style: &Style) -> Vec<String> {
+    let unknown: Vec<&PaneStatus> = res
+        .sessions
+        .iter()
+        .flat_map(|s| s.panes.iter())
+        .filter(|p| p.state == AgentState::Unknown)
+        .collect();
+    let Some(first) = unknown.first() else {
+        return Vec::new();
+    };
+    // The pin command names the pane by its tmux id and keeps the name it
+    // already answers to, so it can be pasted whole: `cyclops name` takes
+    // a target and a label, and passing the label as the target would
+    // rename an adopted pane to a placeholder.
+    let loaded = res.manifests.as_ref().map(|m| m.ids.as_slice());
+    vec![
+        String::new(),
+        format!(
+            "  {}",
+            style.dim(&copy::unknown_panes(
+                unknown.len(),
+                &first.pane_id,
+                first.agent.as_deref(),
+                loaded
+            ))
+        ),
+    ]
 }
 
 /// The roster: one row per named agent, on the same grid as `status`.
@@ -339,6 +376,11 @@ pub fn check(confirmed: bool) -> &'static str {
 /// Heavy check: this is the daemon's answer to its own write. It put the
 /// pane in the registry and the line on the ledger before replying, so
 /// there is nothing left to confirm.
+///
+/// A name is an address, and an address nothing can be delivered to is
+/// half a name. So a pane no manifest binds gets a second line saying so
+/// here, where the reader is, rather than at the receipt of the first
+/// message half a minute later.
 pub fn render_named(result: &Value, style: &Style) -> String {
     let sep = style.dim("·");
     let ok = check(true);
@@ -350,11 +392,22 @@ pub fn render_named(result: &Value, style: &Style) -> String {
                 Some(m) => format!("{pane}, detects as {m}"),
                 None => pane.to_string(),
             };
-            format!(
+            let mut out = format!(
                 "{ok} named {} {sep} {}",
                 style.role(label, label),
                 style.dim(&tail)
-            )
+            );
+            // `manifest` is the pin the caller asked for; `detects_as` is
+            // what binds the pane now. A daemon that predates the field
+            // says nothing, and nothing is what gets printed.
+            if result["detects_as"].is_null() && result.get("detects_as").is_some() {
+                out.push('\n');
+                out.push_str(&format!(
+                    "  {}",
+                    style.dim(&copy::named_but_undetected(pane, label))
+                ));
+            }
+            out
         }
         None => format!(
             "{ok} cleared {sep} {}",
@@ -877,6 +930,12 @@ mod tests {
         }
     }
 
+    /// The block [`fixture`]'s one unknown pane earns, appended to every
+    /// golden below. Written once because it is one sentence with one
+    /// wording, and a golden that spelled it again would be a second copy
+    /// of the copy.
+    const UNKNOWN_NOTE: &str = "\n\n  1 pane reads unknown: none of agy, claude, codex matches what is running there. Nothing can be delivered to an unknown pane. Pin one: cyclops name %4 <label> --manifest <id>. Teaching cyclops a new CLI is one file: docs/MANIFESTS.md.";
+
     fn open_delivery(id: &str, to: &str, state: DeliveryState) -> cyclops_proto::OpenDelivery {
         cyclops_proto::OpenDelivery {
             id: id.into(),
@@ -924,6 +983,10 @@ mod tests {
             // it. An answer without it counts panes alone, which is what
             // the calm-rig cases below pin.
             open_deliveries: Vec::new(),
+            manifests: Some(cyclops_proto::Manifests {
+                ids: vec!["agy".into(), "claude".into(), "codex".into()],
+                dir: Some("/x/manifests".into()),
+            }),
         }
     }
 
@@ -935,12 +998,91 @@ mod tests {
         // byte- and color-identical to the stream's "two or more
         // attention items" mark on a system with nothing wrong.
         let got = render_status(&fixture(), &Style::none(), Path::new("/x/config.toml"));
-        let expected = "‿ cyclops · watching main · tmux 3.6a · up 2m\n\
-                        \n\
-                        \x20 reviewer     ● working  Run the tests\n\
-                        \x20 implementer  ○ idle\n\
-                        \x20 %4           ? unknown  vim";
+        let expected = format!(
+            "‿ cyclops · watching main · tmux 3.6a · up 2m\n\
+             \n\
+             \x20 reviewer     ● working  Run the tests\n\
+             \x20 implementer  ○ idle\n\
+             \x20 %4           ? unknown  vim{UNKNOWN_NOTE}"
+        );
         assert_eq!(got, expected);
+    }
+
+    /// An unknown pane is the one cell on the grid that is not a state the
+    /// agent is in: it is cyclops unable to read one, and the pane can
+    /// receive nothing until it is fixed. Two causes wear that same label
+    /// and their fixes are nothing alike, so the daemon's manifest set
+    /// decides which sentence a reader gets. A daemon too old to say is a
+    /// third answer, not the empty set.
+    #[test]
+    fn an_unknown_pane_gets_the_reason_its_cause_earns() {
+        let mut res = fixture();
+
+        // Nothing loaded: the install is broken for every pane at once, and
+        // no per-pane pin would help.
+        res.manifests = Some(cyclops_proto::Manifests {
+            ids: Vec::new(),
+            dir: Some("/x/manifests".into()),
+        });
+        let got = render_status(&res, &Style::none(), Path::new("/x"));
+        assert!(
+            got.contains("1 pane reads unknown: cyclopsd loaded no detection manifests."),
+            "{got}"
+        );
+        assert!(
+            got.contains("Nothing can be delivered to an unknown pane"),
+            "{got}"
+        );
+        assert!(
+            got.contains("cyclops start, then restart cyclopsd"),
+            "{got}"
+        );
+        assert!(!got.contains("--manifest"), "nothing to pin: {got}");
+
+        // A daemon that predates the field says neither, so neither is
+        // claimed: the pin is still the next step and no id list is quoted.
+        res.manifests = None;
+        let got = render_status(&res, &Style::none(), Path::new("/x"));
+        assert!(
+            got.contains("no manifest matches what is running there"),
+            "{got}"
+        );
+        assert!(
+            got.contains("cyclops name %4 <label> --manifest <id>"),
+            "{got}"
+        );
+        assert!(!got.contains("loaded no detection manifests"), "{got}");
+
+        // Two unknown panes take one sentence, counted and pluralized, and
+        // the command names the first of them.
+        res.manifests = Some(cyclops_proto::Manifests {
+            ids: vec!["claude".into()],
+            dir: None,
+        });
+        res.sessions[0].panes[0].state = AgentState::Unknown;
+        let got = render_status(&res, &Style::none(), Path::new("/x"));
+        assert!(got.contains("2 panes read unknown"), "{got}");
+        // The first unknown row is reviewer, which already answers to a
+        // name: the command keeps it rather than renaming the pane.
+        assert!(
+            got.contains("cyclops name %1 reviewer --manifest <id>"),
+            "{got}"
+        );
+        assert_eq!(
+            got.matches("panes read unknown").count(),
+            1,
+            "one sentence however many rows: {got}"
+        );
+    }
+
+    /// And a grid with nothing unknown on it says nothing at all. The
+    /// explanation is not a footer.
+    #[test]
+    fn a_grid_with_no_unknown_pane_stays_quiet() {
+        let mut res = fixture();
+        res.sessions[0].panes.pop();
+        let got = render_status(&res, &Style::none(), Path::new("/x"));
+        assert!(!got.contains("unknown"), "{got}");
     }
 
     /// The roster grid, pinned exactly. This is the shape the landing page
@@ -1055,16 +1197,52 @@ mod tests {
         );
     }
 
+    /// A name is an address. `cyclops name` used to report success for a
+    /// pane nothing binds, and the first message to it died in the gate
+    /// half a minute later with the reason nowhere near the command that
+    /// caused it.
+    #[test]
+    fn naming_a_pane_nothing_detects_says_so_on_the_spot() {
+        let s = Style::none();
+        let got = render_named(
+            &json!({"pane_id": "%0", "label": "implementer",
+                    "manifest": null, "detects_as": null}),
+            &s,
+        );
+        assert_eq!(
+            got,
+            "✔ named implementer · %0\n  nothing detects %0 yet, so implementer can't receive a message. cyclops status names the manifests that are loaded; pin one with: cyclops name %0 implementer --manifest <id>"
+        );
+        // Bound, so the badge stands alone exactly as it always has.
+        let got = render_named(
+            &json!({"pane_id": "%0", "label": "implementer",
+                    "manifest": null, "detects_as": "claude"}),
+            &s,
+        );
+        assert_eq!(got, "✔ named implementer · %0");
+        // A daemon too old to answer the question says nothing, and a
+        // clear was never about detection at all.
+        let got = render_named(&json!({"pane_id": "%0", "label": "implementer"}), &s);
+        assert_eq!(got, "✔ named implementer · %0");
+        let got = render_named(
+            &json!({"pane_id": "%0", "label": null, "detects_as": null}),
+            &s,
+        );
+        assert_eq!(got, "✔ cleared · %0 is unnamed");
+    }
+
     #[test]
     fn status_header_eye_opens_with_the_blocked_agent_count() {
         let mut res = fixture();
         res.sessions[0].panes[1].state = AgentState::BlockedPermission;
         let got = render_status(&res, &Style::none(), Path::new("/x/config.toml"));
-        let expected = "◑ 1 cyclops · watching main · tmux 3.6a · up 2m · 1 needs attention\n\
-                        \n\
-                        \x20 reviewer     ● working             Run the tests\n\
-                        \x20 implementer  ⚠ blocked_permission\n\
-                        \x20 %4           ? unknown             vim";
+        let expected = format!(
+            "◑ 1 cyclops · watching main · tmux 3.6a · up 2m · 1 needs attention\n\
+             \n\
+             \x20 reviewer     ● working             Run the tests\n\
+             \x20 implementer  ⚠ blocked_permission\n\
+             \x20 %4           ? unknown             vim{UNKNOWN_NOTE}"
+        );
         assert_eq!(got, expected);
         // Two blocked agents open the eye fully and take the plural.
         res.sessions[0].panes[0].state = AgentState::BlockedQuota;
@@ -1178,15 +1356,17 @@ mod tests {
             open_delivery("m-2", "reviewer", DeliveryState::AttentionRequired),
         ];
         let got = render_status(&res, &Style::none(), Path::new("/x/config.toml"));
-        let expected = "◉ 2 cyclops · watching main · tmux 3.6a · up 2m · 2 need attention\n\
-                        \n\
-                        \x20 reviewer     ● working  Run the tests\n\
-                        \x20 implementer  ○ idle\n\
-                        \x20 %4           ? unknown  vim\n\
-                        \n\
-                        \x20 waiting on you\n\
-                        \x20 implementer  ⊘ parked · quota\n\
-                        \x20 reviewer     ⚠ needs attention";
+        let expected = format!(
+            "◉ 2 cyclops · watching main · tmux 3.6a · up 2m · 2 need attention\n\
+             \n\
+             \x20 reviewer     ● working  Run the tests\n\
+             \x20 implementer  ○ idle\n\
+             \x20 %4           ? unknown  vim{UNKNOWN_NOTE}\n\
+             \n\
+             \x20 waiting on you\n\
+             \x20 implementer  ⊘ parked · quota\n\
+             \x20 reviewer     ⚠ needs attention"
+        );
         assert_eq!(got, expected);
         for line in got.lines() {
             assert_eq!(line, line.trim_end(), "trailing space in: {line:?}");
@@ -1220,11 +1400,13 @@ mod tests {
         // implementer has no detail: the marker stands alone.
         res.sessions[0].panes[1].hooks_verified = Some(false);
         let got = render_status(&res, &Style::none(), Path::new("/x/config.toml"));
-        let expected = "‿ cyclops · watching main · tmux 3.6a · up 2m\n\
-                        \n\
-                        \x20 reviewer     ● working  Run the tests · hooks unverified\n\
-                        \x20 implementer  ○ idle     hooks unverified\n\
-                        \x20 %4           ? unknown  vim";
+        let expected = format!(
+            "‿ cyclops · watching main · tmux 3.6a · up 2m\n\
+             \n\
+             \x20 reviewer     ● working  Run the tests · hooks unverified\n\
+             \x20 implementer  ○ idle     hooks unverified\n\
+             \x20 %4           ? unknown  vim{UNKNOWN_NOTE}"
+        );
         assert_eq!(got, expected);
         // Verified and undeclared panes carry no marker.
         res.sessions[0].panes[0].hooks_verified = Some(true);

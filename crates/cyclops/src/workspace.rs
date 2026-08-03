@@ -444,7 +444,9 @@ fn misplaced_names(
 /// 2. Build the session if it is not there, and write the workspace file
 ///    when the layout came from a preset. An existing session is left
 ///    exactly as it is; this verb is safe to run twice.
-/// 3. Make sure the config names the session, so the daemon watches it.
+/// 3. Make the home usable: the config has to name the session so the
+///    daemon watches it, and the detection manifests have to be there or
+///    cyclopsd binds no pane and delivers nothing.
 /// 4. Ask the daemon what it is watching and which panes already answer to
 ///    a name. Step 5 needs both, so it happens first.
 /// 5. Decide whether this workspace may name this session's panes at all.
@@ -543,6 +545,24 @@ pub fn run_start(
         notes.push(format!("wrote {}", path.display()));
     } else if !settings.watches(&session) {
         notes.push(config_hint(&config_path(&home), &session));
+    }
+    // Every run, not only the first. A home that predates the seed gets the
+    // manifests without a reinstall, and a shipped set that gains a file
+    // reaches an existing home on the next start. Files already there are
+    // never touched (crate::manifests).
+    let seeded = crate::manifests::seed(&home);
+    if seeded.none_installed() {
+        // The one thing on this page that says the ready line above is
+        // empty: with no manifests cyclopsd reads every pane as unknown and
+        // no message reaches an agent.
+        notes.push(crate::manifests::nothing_installed(&seeded));
+    } else {
+        if !seeded.written.is_empty() {
+            notes.push(crate::manifests::installed(&seeded));
+        }
+        if !seeded.problems.is_empty() {
+            notes.push(crate::manifests::partly_installed(&seeded));
+        }
     }
 
     // 4. The registry is the only record of which pane already answers to
@@ -663,6 +683,13 @@ pub fn run_start(
                 "describes_session": allowed,
                 "confirmed": watching,
                 "daemon": watch.word(),
+                // What the home holds for pane detection, so a script can
+                // branch on a usable install rather than on the copy.
+                "manifests": {
+                    "dir": seeded.dir.display().to_string(),
+                    "written": seeded.written,
+                    "kept": seeded.kept,
+                },
                 "notes": notes,
             })
         );

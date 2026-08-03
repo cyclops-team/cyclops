@@ -13,6 +13,14 @@
 //!   appending a newline; readers skip unparseable lines with a warning and
 //!   never abort a replay over one.
 //! - Lines are never rewritten. Corrections are new lines.
+//!
+//! What it does not own: the shape of a line ([`cyclops_proto::LedgerLine`]),
+//! which facts get written (cyclopsd), and any query over them. Reading is
+//! [`read_after`], a full scan from a cursor, and that is on purpose: a
+//! 10k-line session ledger parses in single-digit milliseconds on this
+//! machine, so filtering, folding and paging live in
+//! `cyclopsd/src/history.rs` where the read model does. An index here
+//! stays a measured need rather than a speculative one.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};

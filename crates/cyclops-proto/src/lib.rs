@@ -10,7 +10,25 @@
 //!
 //! Two rules over those types live here because every surface has to agree
 //! on them: the delivery state machine ([`ledger::DeliveryState`]) and
-//! what needs a human ([`attention`], which owns the eye).
+//! what needs a human ([`attention`], which owns the eye). A rule earns a
+//! place here by being one more than one crate would otherwise implement,
+//! and both of these were implemented twice before they were moved.
+//!
+//! ## What does not live here
+//!
+//! - Any behavior. Nothing here opens a file, a socket, or a process. A
+//!   type that needed to would belong to whoever does the opening.
+//! - The pipeline that drives the state machine (`cyclopsd/src/delivery.rs`)
+//!   or the register that answers `status` (`cyclopsd/src/history.rs`).
+//!   This crate says which moves are legal and which states need a human;
+//!   it never makes a move.
+//! - Anything about how a state LOOKS. Glyphs, words and color are
+//!   `cyclops-theme` and `cyclops_ui::grid`.
+//! - Detection rules. Those are `cyclops-manifest` data.
+//!
+//! One deliberate oddity: [`scratch`] is here and is used by nothing at
+//! runtime. It holds the one statement of where throwaway test state goes,
+//! and it sits in the crate every other crate already depends on.
 
 pub mod attention;
 pub mod ledger;

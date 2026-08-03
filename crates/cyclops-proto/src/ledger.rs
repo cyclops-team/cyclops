@@ -3,8 +3,18 @@
 //! One file per watched session at `~/.cyclops/ledger/<session>.ndjson`.
 //! Every message, delivery attempt, ACK, state transition, and gate decision
 //! is a line here. Lines are never rewritten; corrections are new lines.
-//! `seq` is monotonic within a `boot_id`; a reader resuming across daemon
-//! restarts orders by (file position), not seq alone.
+//!
+//! `seq` is strictly increasing over the whole FILE, not just within a
+//! `boot_id`: the writer scans the tail at open and continues numbering
+//! (`cyclops-ledger`), so ordering by seq is correct across a daemon
+//! restart. MEASURED on 2026-08-03: a restart carried on from 7 to 8 under
+//! a new boot_id. What `boot_id` tells a reader is which daemon run wrote
+//! a line, which is how a restart boundary is visible at all. Numbering
+//! restarts only if the file itself is gone.
+//!
+//! This is the schema and nothing else. Appending is `cyclops-ledger`,
+//! deciding what to append is cyclopsd, and folding a delivery chain back
+//! into its msg line at read time is `cyclopsd/src/history.rs`.
 //!
 //! The ledger is plain text a human can `jq`. Secrets never enter it.
 

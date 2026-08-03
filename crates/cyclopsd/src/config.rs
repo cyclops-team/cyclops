@@ -309,6 +309,38 @@ default_workspace = "main"
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// The order matters and only one of the three is a supported install.
+    ///
+    /// `cyclops start` seeds `$CYCLOPS_HOME/manifests`, and that is the
+    /// only manifest directory an installed pair of binaries has: nothing
+    /// writes the config key, and `./manifests` exists only in a clone.
+    /// So the home has to win over the working directory, and it has to be
+    /// found with no key pointing at it, or a first run detects nothing.
+    #[test]
+    fn the_home_wins_over_the_working_directory_and_the_key_wins_over_both() {
+        let home = cyclops_proto::scratch::scratch_dir("cfg-manifest-dir");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create scratch home");
+
+        // Nothing seeded yet, and no ./manifests under the test's working
+        // directory (the crate root), so there is nothing to find.
+        let (cfg, _) = Config::parse("", &home).unwrap();
+        assert_eq!(cfg.manifest_dir(), None);
+
+        std::fs::create_dir_all(home.join("manifests")).expect("seed");
+        let (cfg, _) = Config::parse("", &home).unwrap();
+        assert_eq!(cfg.manifest_dir(), Some(home.join("manifests")));
+
+        // An explicit key still wins: a clone running out of the repo, and
+        // every demo script, points at its own directory.
+        let text = format!("manifest_dir = \"{}\"\n", home.join("elsewhere").display());
+        let (cfg, warnings) = Config::parse(&text, &home).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(cfg.manifest_dir(), Some(home.join("elsewhere")));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn syntax_error_is_an_error() {
         assert!(Config::parse("sessions = [", Path::new("/h")).is_err());

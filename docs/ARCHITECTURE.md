@@ -1,198 +1,115 @@
-# Architecture
+# How a message gets from one pane to another
 
 Cyclops v2 is a tmux-backed coordination daemon for terminal coding agents.
-The architecture is frozen by ADR-001 (`cyclops-arch/deliverables/`) plus the
-validation campaign's amendments (`cyclops-arch/validation-report.md`,
-section 8). This document maps those decisions to code. Everything here is
-in the tree today; anything still to come is marked M5 or later.
+This page follows one message end to end and names, at every fork, the file
+that decides. Read it once and you can put your finger on where any
+behavior comes from.
 
-## Crate map
+The shape is frozen by ADR-001 and by the validation campaign's amendments.
+Neither document is in this repository. Both live in the separate
+`cyclops-arch` design repo, which this clone does not carry, and you do not
+need either to read this page: every frozen decision and every lettered
+amendment is tabled at the end of it against the file that implements it,
+and the measurements they rest on are [findings.md](../findings.md).
+Everything described here is in the tree and under test.
 
-| Crate | Role | Status |
-|---|---|---|
-| `crates/cyclops-proto` | Wire protocol v1, ledger schema, delivery state machine, agent state model. Data types only, no IO. Daemon and every client compile against it. The methods and their request/response lines are docs/PROTOCOL.md. | Done |
-| `crates/cyclops-manifest` | Per-CLI detection manifests: TOML schema, compiled rules, region parsing, priority evaluation, modal decline actions. Loads `manifests/*.toml`. The schema as a page someone writing a manifest can read is docs/MANIFESTS.md. | Done |
-| `crates/cyclops-tmux` | The tmux adapter. Every tmux-specific behavior lives here: version probe with feature gates, control-mode client (FIFO reply correlation, pause-after flow control), zero-polling reconciling pane table on `refresh-client -B` subscriptions. Pane rows carry `pane_pid` for sender identity. M3 adds `focus_pane`, a one-shot `select-window` plus `select-pane` outside control mode, so the stream UI's jump-to-pane makes no tmux call outside this crate. M4 adds `layout`: the declarative workspace tree (windows, rows of panes, ratios) with `capture` off a live session and `apply` onto a new one, on the same one-shot invocation path. It writes no tmux option and no pane title, and refuses a session that already exists. | Done (M4 scope) |
-| `crates/cyclopsd` | The daemon: control-mode watcher, sensor fusion (title + screen + hook reports), socket server, per-session ledger writer, delivery pipeline with per-recipient FIFO workers, fail-closed sender identity, pane adoption registry. M2 adds the ledger read side (`msg.history`, `msg.thread`), server-owned `agent.wait` with occupant pinning, and hook liveness plus the startup self-test (`hooks.verify`, `hooks.selftest`). M4 makes the adoption registry durable (`registry.rs`: `$CYCLOPS_HOME/registry.json`, restored per session against the live pane table and the pane's root pid) and adds the border chrome writer (`chrome.rs`: per-pane `pane-border-format` and `@cyclops_*` options, window-scoped `pane-border-status`, snapshotted at adoption and restored on clear, on pane close, on a window move, and at shutdown; it also owns the `chrome = "off"` switch, so no caller tests it). The chrome is the only thing the daemon renders, and it paints from cyclops-theme like every other surface. | Done (M4 scope) |
-| `crates/cyclops` | The CLI: thin NDJSON client over the daemon socket. `ping`, `status`, `read`, `watch`, `send`, the `hook` receiver, the M2 verbs (`history`, `thread`, `wait`, `send --wait`, `hooks install\|verify\|selftest`), and M3's `ui` (dispatch only; the stream lives in `cyclops-ui`). M4 adds `name` and `list` (pane adoption and the roster, rendered on the same grid as `status`) plus the workspace verbs: `start` (restore or build the default workspace, idempotent) and `workspace save|restore`, in `src/workspace.rs`, which owns the files, the `default_workspace` config key, the label round trips through `pane.label`, and the copy. | Done (M4 scope) |
-| `crates/cyclops-ui` | The stream UI behind `cyclops ui`: admin view and firehose over `events.subscribe` plus a ledger-tail backfill, the eye, filters, jump-to-pane through the tmux adapter, `--plain` follow mode. Windowed rendering over a 10k ring; the terminal layer is a hand-rolled termios/ANSI backend behind a pure frame builder. | Done (M3 scope) |
-| `crates/cyclops-ledger` | Crash-safe append-only NDJSON ledger writer and cursor reader. Workspace member; `cyclopsd` writes one ledger per watched session through it; `cyclops-ui` replays session tails through it for backfill. | Done |
-| `crates/cyclops-theme` | The theme engine: semantic token vocabulary (role.1-8, surface.dim/accent, eye.calm/alert, state.\* and badge.\* in four groups, plus surface.fg as the engine's own out-of-vocabulary fallback), the state-to-group mapping both renderers resolve through, data-only theme TOML with 256-color fallback derivation, selection (`theme` config key, `CYCLOPS_THEME` override), event-driven hot reload. The CLI's style module and cyclops-ui resolve every color through it. The vocabulary is exactly what the renderers paint: stream and background tokens stay out because nothing resolves them (docs/themes.md). M5 makes the reload watch the SELECTION rather than one file path, so `cyclops theme <name>` moves a running UI and the daemon's borders, and makes a reload apply whole or not at all: a file that no longer sets a token it used to is refused with one warning, because a half-written save would otherwise paint the missing tokens out of the compiled default table (F32). | Done (M5 scope) |
-| `crates/cyclops-testrig` | Test-only, `publish = false`, no dependencies. The isolated tmux server every test runs against, and the one statement of its teardown rule: kill the server, unlink the socket file it leaves behind, from `Drop` so a panicking test tears down too. A dev-dependency of `cyclops-tmux` and `cyclopsd`, which is what a `#[cfg(test)]` module could not be: the sites needing it span two crates plus a unit test inside the `cyclopsd` library. Its `one_place` test fails if any other Rust file kills a tmux server, or any demo script does it outside `demos/lib.sh`. | Done (M3 scope) |
+## The shape of it
 
-Non-crate directories: `manifests/` (shipped detection data for claude,
-codex, agy, seeded from the campaign), `hooks/` (vendor hook config
-templates `cyclops hooks install` renders; measured schemas, data not
-code), `scripts/commpact-shim/` (the prepared commPact v1 shim and its
-guarded installer; nothing installs it, see `docs/CUTOVER.md`),
-`tests/harness/` (Python probe harness, the regression seed), `demos/`
-(runnable end-to-end scripts; `demos/lib.sh` holds the two rules the
-scripts must not copy, the scratch root and the tmux teardown), `themes/`
-(the shipped semantic token
-files dark, light, high-contrast, loaded by `cyclops-theme`; dark is the
-default and maps the landing page palette), `layouts/` (the four shipped
-workspace presets solo, duo, quad, ops; data, compiled into the `cyclops`
-binary with `include_str!` so a fresh install has them before it has a
-config file), `frontend/` (the production
-landing page for usecyclops.dev;
-read-only branding reference, outside the Cargo workspace, ignored by Rust
-CI, never modified without an explicit admin request).
-
-## Data flow
-
-M0 core (the reconciling read side):
-
-```
-tmux control mode (one tmux -C client per watched session)
-      |  %output, %pane-title-changed, refresh-client -B subscriptions
-      v
-change hints ---> reconcile on doubt (list-panes, display-message,
-      |           capture-pane; authoritative queries, event-triggered)
-      v
-pane state table (pane_id keyed; dead, in_mode, title, command, size, pid)
-      |
-      v
-fusion (manifest rules over title + screen; unmatched hook reports join
-      |            as the hook sensor via agent.state.report)
-      |            per-sensor readings kept, disagreement observable
-      v
-AgentState per pane ---> socket: status, pane.read, events.subscribe
+```mermaid
+flowchart LR
+    A["agent CLI<br/>in a tmux pane"] -->|"cyclops send, over the socket"| C["cyclops<br/>(thin NDJSON client)"]
+    C -->|"one JSON object per line"| D["cyclopsd"]
+    D -->|"who connected, walked up<br/>to a watched pane"| I["sender identity"]
+    D -->|"every fact, before it is acted on"| L[("ledger<br/>one NDJSON file<br/>per session")]
+    D -->|"load-buffer, paste-buffer, send-keys<br/>on the control connection"| T(["tmux server"])
+    T -->|"the payload, as if pasted"| B["recipient's pane"]
+    B -->|"the vendor hook runs cyclops hook,<br/>which posts back through the same socket"| D
+    D -->|"one receipt per recipient"| C
+    D -->|"and an event line to every subscriber"| S(["cyclops ui · cyclops watch"])
 ```
 
-Notifications are hints, not truth. The daemon reconciles derived state
-against authoritative queries whenever a hint arrives or a doubt exists.
-Missed events degrade freshness, never correctness (ADR revision 1,
-level-triggered core).
+Four rules hold the whole design up.
 
-The fusion tiers, in the order one recompute consults them
-(`cyclopsd/src/fusion.rs`, `recompute_pane`):
+- **tmux owns the terminal.** Cyclops never hosts a pty. It asks tmux and
+  tmux answers, over the interface tmux calls control mode.
+- **The ledger is the record.** Append-only NDJSON, one file per watched
+  session, written before anything downstream believes it.
+- **Nothing polls.** Every recompute rides an event that already happened.
+- **Every tmux specific lives in `crates/cyclops-tmux`.** Control mode is
+  unversioned and moves between releases, so one crate absorbs that.
+
+The sender is never in the request. The daemon resolves it from the peer
+credentials on the socket and walks that pid up to a watched pane, so
+nothing in a body can forge the header a recipient reads.
+
+## Watching: how the daemon knows what a pane is doing
 
 ```mermaid
 flowchart TD
-    rc(["recompute"]) --> mode{"pane in copy-mode?"}
-    mode -->|yes| prior["verdict: the prior one, kept"]
-    mode -->|no| dead{"pane dead?"}
+    X(["tmux server"]) -->|"%subscription-changed on cyp&lt;n&gt;:<br/>title, dead, in_mode, command, pid"| W["control client<br/>one tmux -C per watched session"]
+    X -->|"%subscription-changed on cypdead:%*,<br/>the only edge a death can arrive on (F25)"| W
+    X -->|"%output / %extended-output"| W
+    X -->|"window add, close, rename, layout change,<br/>pane moved, pane mode changed"| W
+    W -->|"a subscribed field moved"| RW["write the row"]
+    W -->|"structural hint, or output from<br/>a pane the table does not know"| RC["reconcile, debounced 30ms"]
+    W -->|"activity on a known pane"| EV(["OutputActivity event"])
+    RC -->|"list-panes: the authoritative answer"| P["pane table, keyed by pane_id"]
+    RW --> P
+    P -->|"a row moved, a hook edge arrived,<br/>or a caller asked"| F["fusion"]
+    F -->|"the verdict moved"| O(["state event · ledger line · border repaint"])
+    F -->|"a caller asked"| Q(["status · pane.read · agent.wait · the gate"])
+```
+
+Notifications are hints, not truth. Truth comes from `list-panes`, and the
+daemon re-asks whenever a hint arrives or a doubt exists, so a missed event
+costs freshness and never correctness (ADR revision 1, level-triggered
+core). `crates/cyclops-tmux/src/watcher.rs` owns this loop.
+
+### Fusion: which sensor decides
+
+`cyclopsd/src/fusion.rs`, `recompute_pane`. Manifest rules are sorted by
+priority once at load; every tier below picks the first rule that matches,
+and the fused verdict is whichever tier's winner sits earlier in that one
+order.
+
+```mermaid
+flowchart TD
+    rc(["recompute"]) --> dead{"pane dead?"}
     dead -->|yes| isdead["verdict: dead"]
-    dead -->|no| bound{"manifest bound by comm or argv?"}
-    bound -->|no| unknown["verdict: unknown"]
+    dead -->|no| mode{"pane in copy-mode?"}
+    mode -->|"yes: not an agent state,<br/>status exposes in_mode per row"| prior["verdict: the prior one, kept"]
+    mode -->|no| bound{"manifest bound?<br/>1. the explicit pin from cyclops name --manifest<br/>2. the pane's kernel comm name<br/>3. the launched argv basename (F21)"}
+    bound -->|"none of the three"| unknown["verdict: unknown"]
     bound -->|yes| title["title tier:<br/>first pane_title rule that matches"]
-    title -->|a rule matched and nothing forced a capture| fuse
-    title -->|no rule matched, or pane.read forced the full set| screen["screen tier: capture-pane,<br/>plus the -e capture when the<br/>manifest carries esc rules"]
-    screen --> fuse["fuse: whichever tier's winning rule sits<br/>earlier in priority order decides"]
-    fuse -->|one tier fired, or both agree| verdict(["verdict, decided_by names what won"])
-    fuse -->|both tiers fired and disagree| flag["disagreement exposed;<br/>the higher-priority rule still wins"]
-    fuse -->|the rules tier came back unknown<br/>and a live hook reading exists| hook["the hook reading decides"]
-    fuse -->|a rule decided and the hook reading differs| flag
+    title -->|"a rule matched and nobody forced a capture"| fuse
+    title -->|"no rule matched, or the caller forced<br/>the full set (the gate, pane.read detection)"| screen["screen tier: capture-pane,<br/>plus the -e capture when the<br/>manifest carries esc rules (F19)"]
+    screen -->|"the capture failed"| doubt["keep the prior verdict;<br/>with no prior, decided_by is sensor_error"]
+    screen -->|"captured"| fuse["fuse: whichever tier's winning rule sits<br/>earlier in priority order decides"]
+    fuse -->|"one tier fired, or both agree"| verdict(["verdict, decided_by names what won"])
+    fuse -->|"both tiers fired and disagree"| flag["disagreement exposed;<br/>the higher-priority rule still wins"]
+    fuse -->|"the rules tier came back unknown<br/>and a live hook reading exists"| hook["the hook reading decides,<br/>decided_by is hook:&lt;event&gt;"]
+    fuse -->|"a rule decided and the hook reading differs"| flag
     flag --> verdict
     hook --> verdict
 ```
 
 Screen capture is evidence of last resort (amendment h): a pane_title rule
-that decides alone skips `capture-pane` entirely. A hook reading counts as
-live for 300s and is dropped after three consecutive recomputes where the
-rules tier decided against it, so a stale edge cannot pin fused state.
-Blocked states always come from rules; no tested CLI hooks its modals or
-its quota.
+that decides alone skips `capture-pane` entirely. A sensor that fails is
+doubt, not evidence, which is why a failed capture keeps the prior verdict
+instead of flipping the pane.
 
-The M1 delivery pipeline rides the same state, one FIFO worker per
-recipient pane:
+A hook reading counts as live for 300s, and is dropped after three
+consecutive recomputes where the rules tier decided against it, so a stale
+edge cannot pin fused state. Blocked states always come from rules: no
+tested CLI hooks its modals or its quota.
 
-```
-msg.send -> ledger (queued) -> gate (fused idle, pane_dead, pane_in_mode,
-no modal) -> load-buffer + paste-buffer -p -d (unique buffer name) -> verify
-composer staged it -> Enter -> ACK (per-agent tier: hook payload match, or
-screen evidence) -> delivered_verified | delivered_unverified
-```
+## Sending: how a message becomes a verified receipt
 
-Every transition is a ledger line. Failures retry once, then queue or park;
-they never drop and never loop. Receipts on the idle path block up to
-`receipt_block_ms` (default 2500); busy targets answer queued with a
-position immediately, parked targets answer parked with the reset hint.
+Two halves, joined by one queue. `msg.send` writes the fact and fans out;
+one FIFO worker per recipient pane then carries each chain on its own.
+Both are `cyclopsd/src/delivery.rs`; the semantics are docs/DELIVERY.md.
 
-The state machine those lines record (`cyclops-proto/src/ledger.rs`,
-`DeliveryState::can_transition_to`; the pipeline that drives it is
-`cyclopsd/src/delivery.rs`):
-
-```mermaid
-stateDiagram-v2
-    [*] --> queued: msg.send recorded
-    queued --> gating: the recipient's worker takes it
-    gating --> pasting: gate admits, fused idle
-    pasting --> staged: composer holds the message id
-    staged --> submitted: Enter sent
-    submitted --> delivered_verified: hook ACK matches
-    submitted --> delivered_unverified: screen evidence, no ack tier
-    delivered_unverified --> delivered_verified: a late hook ACK matches
-    delivered_verified --> [*]
-
-    gating --> retry_queued: pane rebound after admit
-    pasting --> retry_queued: step failed, attempts left
-    staged --> retry_queued: step failed, attempts left
-    submitted --> retry_queued: step failed, attempts left
-    retry_queued --> gating: retry, back through the gate
-
-    queued --> attention_required: no pane for that name
-    gating --> attention_required: pane dead, gone, or no manifest
-    pasting --> attention_required: attempts spent
-    staged --> attention_required: attempts spent
-    submitted --> attention_required: attempts spent
-    retry_queued --> attention_required: attempts spent
-
-    gating --> parked_blocked_quota: fused blocked_quota
-    queued --> parked_blocked_quota: recipient parked, queue drained
-
-    attention_required --> queued: re-queue, no verb ships yet
-    parked_blocked_quota --> queued: re-queue, no verb ships yet
-```
-
-Two edges are allowed by the machine and driven by nothing today: an
-operator resends the message instead, which starts a new chain. One
-transition is missing from the diagram because it has no single source: a
-daemon restart closes every chain still in flight to `attention_required`
-with cause `daemon_restart`, whatever state it was in
-(`delivery.rs`, `close_limbo`).
-
-The gate is the pipeline's first step and the guard that stands between a
-delivery and the wrong pane. It decides in this order, and only in this
-order (`delivery.rs`, `gate`):
-
-```mermaid
-flowchart TD
-    s1{"1. session attached?"} -->|"no: session_detached"| hold
-    s1 -->|yes| s2{"2. pane still in the table?"}
-    s2 -->|no| gone["attention_required: no_such_pane"]
-    s2 -->|yes| s3{"3. pane dead?"}
-    s3 -->|yes| deadout["attention_required: pane_dead"]
-    s3 -->|no| s4{"4. pane in copy-mode?"}
-    s4 -->|"yes: pane_in_mode"| hold
-    s4 -->|no| s5{"5. manifest bound?"}
-    s5 -->|no| nomanifest["attention_required: no_manifest"]
-    s5 -->|yes| s6["6. recompute fused state,<br/>screen sensor forced"]
-    s6 --> s7{"7. fused state"}
-    s7 -->|idle| ok["proceed: paste"]
-    s7 -->|dead| deadout
-    s7 -->|blocked_quota| park["park: quota never auto-retries"]
-    s7 -->|"modal or permission, the rule auto-dismisses<br/>and declines remain"| decline["send that rule's decline keys,<br/>then re-read the screen"]
-    s7 -->|"modal or permission, otherwise:<br/>hold on the rule id, admin pinged once"| hold
-    s7 -->|working| hold
-    s7 -->|"idle_with_input: human typing wins"| hold
-    s7 -->|unknown| hold
-    decline --> s1
-    hold["8. hold: wait for a pane or state event,<br/>never a timer"] --> s1
-```
-
-Steps 1 to 5 read the pane table and the manifest binding; step 6 is the
-only one that touches the screen, and it runs immediately before pasting
-so the snapshot is fresher than any human keystroke round trip.
-
-Holds wake on events, never on a clock. Two timers live in this loop and
-neither of them polls: a one-shot settle after a decline, so the dismissal
-renders before the screen is re-read, and a one-shot admin ping after
-`gate_hold_notify_ms`, which reports a wedged hold without ending it.
-
-How a message becomes a receipt, which is what the sender actually gets
-back from the call (`cyclopsd/src/delivery.rs`, `msg_send` and
-`receipt_of`; the semantics are docs/DELIVERY.md):
+### The call: what the sender gets back
 
 ```mermaid
 flowchart TD
@@ -229,37 +146,242 @@ call returns and every transition still lands in the ledger; the sender is
 told where it stood when the daemon answered, which is the only thing the
 daemon knew.
 
-The four states step 9 waits for are not the attention rule's two. A
-receipt is settled once the pipeline will not move the chain on its own,
-and that includes both delivered states. Which of them still need a human
-is a separate question with its own owner
-(`cyclops-proto/src/attention.rs`).
-
 `send --wait` composes `agent.wait` onto the same call after step 10: it
 appends a `wait` array and never changes the receipts.
 
-The M2 read side rides the ledger, not new state: `msg.history` and
-`msg.thread` scan the session files at query time and fold each message's
-delivery chain into its `deliveries` array (one broadcast fact, N current
-badges); reading never writes. `agent.wait` subscribes server-side to the
-fusion broadcast and the watcher stream, pinned to the pane occupant
-recorded at wait start; the deadline is its only timer. Hook liveness
-(per-pane last-seen edges from `agent.state.report`) backs `hooks.verify`,
-the `hooks_verified` status bit, and `hooks.selftest`'s one-marker round
-trip through the normal delivery pipeline.
+### The chain: gate, paste, submit, prove
 
-The M3 stream UI (`cyclops ui`) adds no daemon surface: it rides the
-existing `events.subscribe` push for live entries, reads the session
-ledger tails once at startup for backfill, asks `status` once for the
-label-to-pane map and current states, and jumps focus through the tmux
-adapter's one-shot `focus_pane` helper. Colors resolve through
-`cyclops-theme`; the eye, classification, and windowed rendering live in
-`cyclops-ui` (docs/ui.md).
+```mermaid
+flowchart TD
+    q(["the worker takes the chain"]) --> g["gate<br/>(next section)"]
+    g -->|"admits, and hands back the pane_pid it admitted"| r1{"occupant check: still that pid,<br/>alive, same manifest?"}
+    r1 -->|"no: a shell occupant would EXECUTE the text"| rb["retry_queued, cause pane_rebound"]
+    r1 -->|yes| paste["load-buffer into cyc-&lt;daemon pid&gt;-&lt;seq&gt;,<br/>then paste-buffer -p -d (amendment e)"]
+    paste --> ver{"did the paste stage?<br/>re-read the screen on a ladder of delays"}
+    ver -->|"no capture proved it"| vf["retry_queued, cause verify_failed"]
+    ver -->|"the message id is in the verify region,<br/>or a generic marker sits on<br/>a manifest composer line"| staged["staged, and registered<br/>for hook ACK matching"]
+    staged --> r2{"occupant check, second time"}
+    r2 -->|no| rb
+    r2 -->|yes| sub["send the manifest's submit key"]
+    sub --> t1{"does this CLI declare an ack hook<br/>with a payload field?"}
+    t1 -->|"yes: tier 1, for ack_timeout_ms"| hookw["wait for an agent.state.report<br/>whose payload carries this message id"]
+    hookw -->|"it arrived"| dv(["delivered_verified · verified_by hook"])
+    hookw -->|"the window closed. On a pane no hook edge<br/>has EVER reached, that is the F1 signature<br/>and the admin hears it once"| t2
+    t1 -->|"no: screen evidence is the best available"| t2{"tier 2, at fixed checkpoints:<br/>marker gone from the composer<br/>AND turn evidence?"}
+    t2 -->|"working state, output activity,<br/>or a changed composer with the id staged"| du(["delivered_unverified · verified_by screen"])
+    t2 -->|"nobody could look: session detached,<br/>or the capture failed"| fz["freeze the clock; a reattach or<br/>pane activity looks again and resumes it"]
+    fz --> t2
+    t2 -->|"looked, saw nothing, deadline spent"| ao["retry_queued, cause ack_timeout"]
+    du -->|"a late hook ACK matches"| dv
+    rb --> retry{"attempts left?"}
+    vf --> retry
+    ao --> retry
+    retry -->|yes| g
+    retry -->|no| att(["attention_required, admin pinged"])
+```
 
-M4 is the first milestone that writes INTO tmux, and it writes on two
-paths that never touch each other. Keeping them apart is the whole design:
-one is the daemon's, on a control-mode connection it already owns, and one
-is a client's, on one-shot invocations against a server no daemon need be
+Three things in that diagram are the whole reason it is longer than "paste
+and press Enter".
+
+The occupant check runs twice, before the paste and again before the submit
+key, against the `pane_pid` the gate admitted. A pane whose occupant changed
+in between (the agent exited to a shell, another CLI took over) must never
+receive the payload or the Enter, because a shell would run it.
+
+Freezing beats expiring. While the control connection is down the daemon
+cannot see the pane, so a deadline that ran anyway would fail a delivery
+that in fact landed. Every remaining instant shifts by the outage, and the
+reattach re-reads the screen before any deadline may fire.
+
+Tier 1 never stops being possible. The registration made at `staged` stays
+live until the chain resolves, so a hook ACK that arrives after the window
+closed still verifies, whether the chain is still waiting or already
+settled on screen evidence.
+
+### The gate
+
+The gate is the guard between a delivery and the wrong pane. It decides in
+this order and only in this order (`delivery.rs`, `gate`):
+
+```mermaid
+flowchart TD
+    s1{"1. session attached?"} -->|"no: session_detached"| hold
+    s1 -->|yes| s2{"2. pane still in the table?"}
+    s2 -->|no| gone["attention_required: no_such_pane"]
+    s2 -->|yes| s3{"3. pane dead?"}
+    s3 -->|yes| deadout["attention_required: pane_dead"]
+    s3 -->|no| s4{"4. pane in copy-mode?"}
+    s4 -->|"yes: pane_in_mode"| hold
+    s4 -->|no| s5{"5. manifest bound?"}
+    s5 -->|no| nomanifest["attention_required: no_manifest"]
+    s5 -->|yes| s6["6. recompute fused state,<br/>screen sensor forced"]
+    s6 --> s7{"7. fused state"}
+    s7 -->|idle| ok["proceed: paste"]
+    s7 -->|dead| deadout
+    s7 -->|blocked_quota| park["park: quota never auto-retries"]
+    s7 -->|"modal or permission, the rule auto-dismisses<br/>and declines remain"| decline["send that rule's decline keys,<br/>then re-read the screen"]
+    s7 -->|"modal or permission, otherwise:<br/>hold on the rule id, admin pinged once"| hold
+    s7 -->|working| hold
+    s7 -->|"idle_with_input: human typing wins"| hold
+    s7 -->|unknown| hold
+    decline --> s1
+    hold["8. hold: wait for a pane or state event,<br/>never a timer"] --> s1
+```
+
+Steps 1 to 5 read the pane table and the manifest binding; step 6 is the
+only one that touches the screen, and it runs immediately before pasting so
+the snapshot is fresher than any human keystroke round trip.
+
+Holds wake on events, never on a clock. Two timers live in this loop and
+neither of them polls: a one-shot settle after a decline, so the dismissal
+renders before the screen is re-read, and a one-shot admin ping after
+`gate_hold_notify_ms`, which reports a wedged hold without ending it.
+
+### The record of it
+
+Every transition above is a ledger line. The table of legal moves is
+`cyclops-proto/src/ledger.rs`, `DeliveryState::can_transition_to`:
+
+```mermaid
+stateDiagram-v2
+    [*] --> queued: msg.send recorded
+    queued --> gating: the recipient's worker takes it
+    gating --> pasting: gate admits, fused idle
+    pasting --> staged: composer holds the message id
+    staged --> submitted: Enter sent
+    submitted --> delivered_verified: hook ACK matches
+    submitted --> delivered_unverified: screen evidence, no ack tier
+    delivered_unverified --> delivered_verified: a late hook ACK matches
+    delivered_verified --> [*]
+
+    gating --> retry_queued: pane rebound after admit
+    pasting --> retry_queued: step failed, attempts left
+    staged --> retry_queued: step failed, attempts left
+    submitted --> retry_queued: step failed, attempts left
+    retry_queued --> gating: retry, back through the gate
+
+    queued --> attention_required: no pane for that name
+    gating --> attention_required: pane dead, gone, or no manifest
+    pasting --> attention_required: attempts spent
+    staged --> attention_required: attempts spent
+    submitted --> attention_required: attempts spent
+    retry_queued --> attention_required: attempts spent
+
+    gating --> parked_blocked_quota: fused blocked_quota
+    queued --> parked_blocked_quota: recipient parked, queue drained
+    retry_queued --> parked_blocked_quota: legal, unreachable today
+
+    attention_required --> queued: re-queue, no verb ships yet
+    parked_blocked_quota --> queued: re-queue, no verb ships yet
+```
+
+Three edges are legal and driven by nothing today. The two re-queues have
+no verb: an operator resends the message instead, which starts a new chain.
+The third cannot happen at all, and the reason is worth knowing, because
+its absence is what keeps a park from creating limbo: a chain in
+`retry_queued` is being carried inside the worker's own retry loop and is
+therefore not in the queue that a park drains.
+
+One transition is missing from the diagram because it has no single source.
+A daemon restart closes every chain still in flight to `attention_required`
+with cause `daemon_restart`, whatever state it was in (`delivery.rs`,
+`close_limbo`). Limbo is a bug, so a restart never leaves a chain open.
+
+## What needs a human, and who owns it
+
+The eye is the signature device, and it appears on three surfaces: the
+stream header, the `--plain` eye line, and `cyclops status`. All three read
+one register and none of them recomputes it. That register is
+`cyclops-proto/src/attention.rs`, and it is the only file allowed to answer
+this question.
+
+```mermaid
+flowchart TD
+    S["the daemon's status answer:<br/>the pane roster as it is now, plus<br/>open_deliveries folded from the whole record"] -->|"REPLACES both halves wholesale,<br/>once, at startup"| R
+    E["live events: state, delivery-state, pane-removed"] -->|"one item at a time; each one IS<br/>that item's next transition"| R
+    H["a replayed ledger tail"] -->|"nothing. A window over the record cannot<br/>answer 'right now', and letting it try means<br/>--backfill decides the count"| R
+    R(["the register"]) --> A{"AGENT half: the pane's fused state"}
+    R --> D{"DELIVERY half: the chain's latest state"}
+    A -->|"blocked_modal, blocked_permission or<br/>blocked_quota: nothing downstream clears them"| CT["counted"]
+    A -->|"anything else"| NC["not counted"]
+    D -->|"attention_required or parked_blocked_quota:<br/>the pipeline cannot move it on its own"| CT
+    D -->|"in flight, or delivered"| NC
+    CT -->|"the count is what the eye answers to"| EYE(["the eye opens, and every number<br/>it shows has a line the reader can reach"])
+    NC --> EYE
+    CT -->|"the item's next transition leaves that set"| RES(["a clearance: the surface that showed<br/>the alarm is the one that shows it end"])
+    CT -->|"the pane leaves the tmux table"| RES
+```
+
+Two failures shaped that picture. Deriving the count from the displayed
+stream made `--backfill 200` and `--backfill 400` disagree about whether
+anything was wrong. And a blocked pane that later closed stayed counted
+forever, because the snapshot is taken once and re-taking it on a timer
+would be polling: `pane-removed` is that pane's last transition and the
+only thing that can drop it.
+
+The four states a receipt waits for are not this rule's two. A receipt is
+settled once the pipeline will not move the chain on its own, which
+includes both delivered states. Whether one still needs a human is this
+separate question with this separate owner.
+
+`crates/cyclops-proto/tests/one_place.rs` is a tripwire against a second
+implementation. Read its header before trusting a green run: it catches
+the copies people write without meaning to, and it says plainly that it
+cannot catch a determined one.
+
+## Workspaces: how a session comes back
+
+A name lives in exactly two places. The daemon's registry holds it while
+the pane is alive; a workspace file holds it when the panes are gone.
+`cyclops start` and `cyclops workspace restore` carry names from the file
+to the registry, `cyclops workspace save` reads them back out of `status`,
+and `pane.label` is the one call where the two paths meet.
+
+```mermaid
+flowchart TD
+    st(["cyclops start"]) --> l{"1. a saved workspace file for this name?"}
+    l -->|yes| lay["the layout is that file"]
+    l -->|"no: take a preset, and write the file<br/>once a session has been built from it"| lay
+    lay --> ex{"2. does the session exist?"}
+    ex -->|no| build["build it through cyclops-tmux layout:<br/>new-session, split-window, resize-pane,<br/>at the size of this terminal (F28)"]
+    ex -->|"yes: left exactly as it is,<br/>so start is safe to run twice"| cfg
+    build --> cfg["3. make sure config.toml names the session,<br/>so the daemon will watch it"]
+    cfg --> ask["4. ask the daemon: watching it, connecting,<br/>watching something else, or down?"]
+    ask --> gate{"5. may this workspace name these panes?"}
+    gate -->|"the session was just built from this layout"| yes["allowed"]
+    gate -->|"a preset meeting a session it never built"| no
+    gate -->|"the live grid no longer has this shape,<br/>window for window and row for row"| no
+    gate -->|"a name the daemon holds sits on a pane<br/>the file does not put it on"| no
+    gate -->|"the shape matches and no name is misplaced"| yes
+    no["refused. Nothing is renamed, and the<br/>copy says what would fix it"] --> say
+    yes --> adopt
+    rs(["cyclops workspace restore"]) -->|"apply refuses a session that already exists, so<br/>this always builds a fresh one and the gates<br/>above have nothing left to protect"| build2["build it, the same way"]
+    build2 --> ask2["ask the daemon the same question"]
+    ask2 --> adopt{"6. is the daemon watching this session?"}
+    adopt -->|"yes: pane.label per named pane,<br/>in the layout's position order"| say
+    adopt -->|"no: a session built a second ago is normally<br/>still connecting, so say which of the four<br/>daemon states this was"| say
+    say(["7. what is ready, and what is left to do"])
+```
+
+The gates exist because a workspace file holds no pane ids and cannot: the
+panes it describes are usually gone by the time it is read, and tmux hands
+a freed id to the next pane it makes. All the file has to point at a pane
+with is WHERE the pane sits, and that points at something only while the
+grid still matches and every name already on a pane is where the file puts
+it. Pane count is not that check: `ops` and `quad` both hold four panes,
+and mapping either onto the other renames every agent onto a pane it does
+not own. Never type into the wrong pane (GOALS).
+
+Restore rebuilds panes, sizes, directories and labels. It starts no
+process unless you pass `--launch`, and even then tmux runs the command as
+the pane's own; no keys are sent anywhere. Details: docs/workspaces.md.
+
+## Writing into tmux
+
+M4 is the first milestone that writes INTO tmux, and it writes on two paths
+that never touch each other. Keeping them apart is the whole design: one is
+the daemon's, on a control-mode connection it already owns, and one is a
+client's, on one-shot invocations against a server no daemon need be
 watching.
 
 ```mermaid
@@ -288,94 +410,125 @@ two:
 | daemon shutdown | `restore_all_chrome` |
 | a theme switch | `reload_theme` |
 
-The theme switch is M5's, and the four that paint a set of panes (adoption,
-session attach, window move, theme switch) all paint through one function,
-`paint_adoptions`. `crates/cyclopsd/src/chrome.rs` holds the same table and
-a test reads this page against it, so a ninth caller cannot leave these
-three pages describing the old set.
+The four that paint a set of panes (adoption, session attach, window move,
+theme switch) all paint through one function, `paint_adoptions`.
+`crates/cyclopsd/src/chrome.rs` holds the same table and a test reads this
+page against it, so a ninth caller cannot leave these three pages
+describing the old set.
 
-The two paths reach tmux from different processes and never write the same
-thing. Chrome sets options and takes them back: the pane's prior
+Chrome sets options and takes them back. The pane's prior
 `pane-border-format` and the window's prior `pane-border-status` are
-snapshotted at adoption and restored on `--clear`, on pane close, on a
-window move (the window the pane left), and at shutdown (F27 for why the
-window scope is unavoidable, F26 for why the pane title is not written at
-all). The `chrome = "off"` switch that turns every one of those writes off
-lives in `chrome.rs` and nowhere else; the snapshot is taken either way, so
-a restore never unsets an option cyclops did not read. The layout path sets
-no option at all, writes no pane title, and sends no keys, so nothing it
-does needs undoing and it cannot collide with the chrome the daemon owns.
+snapshotted at adoption and put back on `--clear`, on pane close, on a
+window move (the window the pane left), and at shutdown. F27 says why the
+window scope is unavoidable, F26 why the pane title is never written. The
+`chrome = "off"` switch lives in `chrome.rs` and nowhere else, and the
+snapshot is taken even when it is off, so a restore never unsets an option
+cyclops did not read.
 
-They meet at exactly one call, `pane.label`. A workspace file holds the
-names when the panes are gone; the registry holds them while the panes are
-alive. `cyclops start` and `workspace restore` carry names from the file to
-the registry, and `workspace save` reads them back out of `status`. Neither
-verb can name a pane in a session the daemon has not attached to, and both
-say which of the four daemon states they found rather than half-doing it
-(docs/workspaces.md). `demos/m4-workspace.sh` runs that loop end to end and
-diffs what came back against what was there.
+The layout path sets no option, writes no pane title, and sends no keys.
+Nothing it does needs undoing, and it cannot collide with the chrome the
+daemon owns.
 
-## Where each frozen decision lives
+## Where each decision lives
 
-| ADR-001 decision | Lives at | Status |
+One line per crate. Each crate's own `//!` header states what it owns and
+what it deliberately does not; read that before changing one.
+
+| Crate | Owns |
+|---|---|
+| `cyclops-proto` | Wire types, ledger schema, the delivery state machine, the attention rule. Data only, no IO. Everything compiles against it (docs/PROTOCOL.md). |
+| `cyclops-manifest` | Per-CLI detection rules as TOML data: regions, priorities, modal decline keys, injection contract (docs/MANIFESTS.md). |
+| `cyclops-tmux` | The tmux adapter and the blast wall: nothing outside it speaks to tmux. Control mode, the reconciling pane table, version parsing, one-shot focus and layout. |
+| `cyclopsd` | The daemon: watcher, fusion, delivery pipeline, ledger writer, socket server, adoption registry, pane chrome. |
+| `cyclops` | The CLI: a thin NDJSON client plus the human-facing renderers, `cyclops hook`, and the workspace verbs. |
+| `cyclops-ui` | The stream behind `cyclops ui`: admin view, firehose, the eye, jump-to-pane, windowed rendering over a 10k ring (docs/ui.md). |
+| `cyclops-ledger` | Crash-safe append-only NDJSON writer and cursor reader. Fsync before acknowledging; torn final lines are sealed, never rewritten. |
+| `cyclops-theme` | The semantic token vocabulary, theme files, 256-color fallback, selection and hot reload (docs/themes.md). |
+| `cyclops-testrig` | Test-only. The isolated tmux server and the one statement of its teardown rule. |
+
+Non-crate directories: `manifests/` (shipped detection data for claude,
+codex, agy), `hooks/` (vendor hook config templates `cyclops hooks install`
+renders), `layouts/` (the four workspace presets, compiled in with
+`include_str!` so a fresh install has them before it has a config file),
+`themes/` (the three shipped token files), `demos/` (runnable end-to-end
+scripts; `demos/lib.sh` holds the two rules the scripts must not copy, the
+scratch root and the tmux teardown), `tests/harness/` (the Python probe
+harness), `scripts/commpact-shim/` (the prepared v1 shim and its guarded
+installer; nothing installs it, see docs/CUTOVER.md), `frontend/` (the
+landing page for usecyclops.dev, outside the Cargo workspace and never
+modified without an explicit admin request).
+
+### The frozen decisions
+
+| ADR-001 decision | Lives at |
+|---|---|
+| Single daemon, one `tmux -C` client per session (T3) | `cyclops-tmux/src/control.rs`, owned by `cyclopsd` |
+| Level-triggered reconciling core, not an event mirror (revision 1, C2) | `cyclops-tmux/src/watcher.rs` |
+| Sensor fusion with per-sensor readings and observable disagreement (revision 2) | Types in `cyclops-proto/src/state.rs`; engine in `cyclopsd/src/fusion.rs`; hook sensor fed from `cyclopsd/src/ack.rs` |
+| Detection rules are per-CLI data, not code (H2) | `cyclops-manifest`, `manifests/{claude,codex,agy}.toml` |
+| NDJSON Unix socket, hello line first, version mismatch warns never rejects (S2) | `cyclops-proto/src/wire.rs`; server in `cyclopsd/src/server.rs` |
+| Append-only NDJSON ledger, monotonic seq plus boot_id, replayable by cursor (C6) | Schema in `cyclops-proto/src/ledger.rs`; writer in `cyclops-ledger`. The stream client backfills by reading session files directly; server-side cursor replay on `events.subscribe` is accepted and ignored, with no client that needs it |
+| Delivery pipeline: queue, gate, paste, verify, submit, ACK; failures are queued states | `cyclops-proto/src/ledger.rs` for the machine, `cyclopsd/src/delivery.rs` for the pipeline |
+| Turn detection from hooks via a `cyclops hook` receiver | `wire.rs` (`agent.state.report`), `cyclops/src/hook.rs`, `cyclopsd/src/ack.rs` |
+| Agent surface: thin CLI speaking NDJSON to the socket | `crates/cyclops` |
+| v1 keepers: fail-closed ACL, data-only config, explicit pane adoption, identity from socket peer | `cyclopsd/src/identity.rs` (peer creds plus a pid-ancestry walk to a watched pane), `cyclopsd/src/registry.rs` |
+| tmux specifics confined to one adapter, CI against tmux HEAD | `crates/cyclops-tmux`; advisory tmux-HEAD CI job. One invocation is outside it: `cyclopsd::probe_tmux` runs `tmux -V` and parses through the adapter, which the adapter's own header names as the exception |
+
+Two frozen decisions are not done, and this is where that is written down.
+The MCP front-door on the same daemon (option D absorbed) is a planned
+addition, not a dependency of anything shipped. The rollout is mid-flight:
+M0 was the shadow daemon, M1 added the write path, M2 prepared the v1 shim
+and its runbook, and installing it is admin's call (docs/CUTOVER.md).
+
+### The validation amendments
+
+Letters follow the admin's build brief. The related change number from the
+validation report's section 8 is in parentheses; that report is in
+`cyclops-arch` and not in this tree, so the table below is the whole of it
+you need. The report's change 1
+(per-agent ACK capability tiers) is a frozen decision in the brief rather
+than a lettered amendment; it lives in `cyclops-manifest` `Hooks.ack`
+(None means the screen tier), `ledger.rs` `DeliveredUnverified` plus
+`VerifiedBy`, and the manifests (`agy.toml` declares no ack).
+
+| | Amendment | Lives at |
 |---|---|---|
-| Single daemon, one `tmux -C` client per session (T3 scoping) | `crates/cyclops-tmux/src/control.rs`, owned by `cyclopsd` | Done |
-| Level-triggered reconciling core, not an event mirror (revision 1, C2) | `crates/cyclops-tmux/src/watcher.rs` | Done |
-| Sensor fusion with per-sensor readings and observable disagreement (revision 2) | Types: `cyclops-proto/src/state.rs` (`Sensor`, `SensorReading`, `Detection`). Engine: `cyclopsd/src/fusion.rs`; hook sensor fed from `cyclopsd/src/ack.rs` | Done |
-| Detection rules are per-CLI data, not code (herdr manifest style, H2) | `crates/cyclops-manifest`, `manifests/{claude,codex,agy}.toml` | Done |
-| NDJSON Unix socket, hello line first, version mismatch warns never rejects (S2) | `cyclops-proto/src/wire.rs` (`Hello`, `PROTOCOL_VERSION`); server in `cyclopsd/src/server.rs` | Done |
-| Append-only NDJSON ledger, monotonic seq plus boot_id, replayable by cursor (C6) | Schema: `cyclops-proto/src/ledger.rs`. Writer: `crates/cyclops-ledger`; `cyclopsd` writes `$CYCLOPS_HOME/ledger/<session>.ndjson` per watched session | Done (the M3 stream client backfills by reading the session files directly; server-side cursor replay on `events.subscribe` stays unimplemented) |
-| Delivery pipeline: queue, gate, paste, verify, submit, ACK; failures are queued states | State machine: `cyclops-proto/src/ledger.rs` (`DeliveryState::can_transition_to`). Pipeline: `cyclopsd/src/delivery.rs` | Done |
-| Turn detection from hooks via a `cyclops hook` receiver | `wire.rs` (`agent.state.report` params); receiver in `crates/cyclops/src/hook.rs`, matcher and fusion input in `cyclopsd/src/ack.rs` | Done |
-| Agent surface: thin CLI speaking NDJSON to the socket | `crates/cyclops` | Done (M2: history, thread, wait, hooks verbs; M3: ui) |
-| MCP front-door on the same daemon (option D absorbed) | Planned addition, not a dependency | M5+ |
-| v1 keepers: fail-closed ACL, data-only config, explicit pane adoption, identity from socket peer | `cyclopsd/src/identity.rs` (peer creds + pid ancestry walk to a watched pane), `pane.label` adoption registry | Done |
-| tmux specifics confined to one adapter, version-gated, CI against tmux HEAD | `crates/cyclops-tmux`; advisory tmux-HEAD CI job | Done (probe), ongoing |
-| Rollout: shadow mode first, cutover gated on soak | M0 was the shadow daemon; M1 added the write path (delivery); M2 prepared the v1 shim and runbook (`scripts/commpact-shim/`, `docs/CUTOVER.md`), install is admin's call | In progress |
-
-## Validation amendments (a)-(i)
-
-Letters follow the admin's build brief, the authoritative list. The related
-change number from `validation-report.md` section 8 is in parentheses. The
-report's change 1 (per-agent ACK capability tiers) is frozen decision 6 in
-the brief rather than a lettered amendment; it lives in `cyclops-manifest`
-`Hooks.ack: Option` (None = screen tier), `ledger.rs` `DeliveredUnverified`
-plus `VerifiedBy`, and the manifests (`agy.toml` declares no ack); the
-pipeline honors it from M1.
-
-| | Amendment | Lives at | Status |
-|---|---|---|---|
-| a | `pause-after` set on the control connection at attach (2) | `cyclops-tmux/src/control.rs` attach handshake; findings F15 covers the %extended-output consequence | Done |
-| b | `bracket_paste_flag` unavailable through tmux 3.6a; post-paste composer verification is the gate (3) | `cyclops-tmux/src/version.rs` `has_bracket_paste_flag`; verification with `<message_id>` substitution in `cyclopsd/src/delivery.rs` | Done |
-| c | Daemon startup self-test proving hooks actually fire, F1: Codex loads zero hooks in untrusted dirs, silently (4) | `cyclopsd/src/selftest.rs`: per-pane hook edge liveness, `hooks.verify` / `hooks.selftest` verbs, the `hooks_verified` status bit, one F1 admin ping per zero-edge pane; the self-test result is a `system` ledger line | Done |
-| d | Dedupe hook events on (session_id, turn_id, event), F2: Codex double-fires across config layers (5) | `cyclopsd/src/ack.rs` (plus reporter seq) | Done |
-| e | Unique tmux buffer name per delivery, F4: named buffers are global, concurrent senders race (6) | `cyclopsd/src/delivery.rs`: `cyc-<pid>-<seq>` buffers loaded from a 0600 spool file in a 0700 spool directory, `paste-buffer -p -d` | Done |
-| f | Terminal `blocked_quota` state: park and alert, never auto-retry, F11: quota exhaustion passes every liveness check (9) | `state.rs` `AgentState::BlockedQuota`, `ledger.rs` `ParkedBlockedQuota` (terminal in the record; a dedicated operator re-queue verb has not shipped, the operator resends after the reset), parking + urgent notify with reset hint in `cyclopsd/src/delivery.rs` | Done |
-| g | Modal vocabulary is per-CLI manifest data with explicit decline options, never generic Enter/Escape, F3, F12 (8) | `cyclops-manifest` `decline_keys` + `auto_dismiss`; `manifests/*.toml` (codex update dialog declines "3" Enter, agy survey "0", trust prompts never auto-dismiss) | Done |
-| h | Fusion documented as rare-blocked-state coverage, not steady-state accuracy (7) | `cyclops-proto/src/state.rs` module doc; fusion engine ordering in `cyclopsd` | Done |
-| i | Delivery behind a trait so per-agent backends can swap to headless protocol drive without touching layers above | `cyclopsd/src/delivery.rs`: the `Injector` trait (paste / submit / capture) with `TmuxInjector` (load-buffer + paste-buffer + send-keys) as the M1 backend; gate, verify, and ACK layers call through the seam only | Done |
+| a | `pause-after` set on the control connection at attach (2) | `cyclops-tmux/src/control.rs` attach handshake; F15 covers the `%extended-output` consequence |
+| b | `bracket_paste_flag` unavailable through tmux 3.6a, so post-paste composer verification is the gate (3) | `cyclops-tmux/src/version.rs`; verification with `<message_id>` substitution in `cyclopsd/src/delivery.rs` |
+| c | Daemon self-test proving hooks actually fire, F1: Codex loads zero hooks in untrusted dirs, silently (4) | `cyclopsd/src/selftest.rs`: per-pane edge liveness, `hooks.verify` / `hooks.selftest`, the `hooks_verified` bit, one F1 ping per zero-edge pane |
+| d | Dedupe hook events on (session_id, turn_id, event), F2: Codex double-fires across config layers (5) | `cyclopsd/src/ack.rs`, plus the reporter's own seq |
+| e | Unique tmux buffer name per delivery, F4: named buffers are global and concurrent senders race (6) | `cyclopsd/src/delivery.rs`: `cyc-<pid>-<seq>` loaded from a 0600 spool file in a 0700 directory |
+| f | Terminal `blocked_quota`: park and alert, never auto-retry, F11 (9) | `state.rs` `BlockedQuota`, `ledger.rs` `ParkedBlockedQuota` (terminal in the record; the operator resends after the reset), parking and the urgent notify in `delivery.rs` |
+| g | Modal vocabulary is per-CLI data with explicit decline options, never a generic Enter or Escape, F3, F12, F20 (8) | `cyclops-manifest` `decline_keys` plus `auto_dismiss`; `manifests/*.toml` |
+| h | Fusion is rare-blocked-state coverage, not steady-state accuracy (7) | `cyclops-proto/src/state.rs` module header; the tier order in `cyclopsd/src/fusion.rs` |
+| i | Delivery behind a trait so per-agent backends can swap without touching the layers above | `cyclopsd/src/delivery.rs`: the `Injector` trait (paste, submit, capture) with `TmuxInjector` as the M1 backend; gate, verify and ACK call through the seam only |
 
 ## The zero-polling contract
 
 Idle CPU near zero is a hard goal (GOALS.md). Concretely:
 
-- No interval timers re-querying tmux, panes, or files. State changes arrive
-  as control-mode notifications and `refresh-client -B` subscription
+- No interval timers re-querying tmux, panes, or files. State changes
+  arrive as control-mode notifications and `refresh-client -B` subscription
   reports; hook reports arrive as socket requests.
 - Reconciliation is event-triggered: a notification, a socket request, or a
   delivery gate check may trigger authoritative queries. A clock may not.
-- Screen capture (the heuristic sensor) runs only at gate time or when a
-  hint puts fused state in doubt, never on a schedule.
+- Screen capture runs only at gate time or when a hint puts fused state in
+  doubt, never on a schedule.
 - Daemon stalls are in-band, not watchdog-polled: `pause-after` converts
-  falling behind into `%pause` / `%continue` notifications (amendment a).
-- Clients never poll the daemon: `events.subscribe` pushes. The stream
-  UI backfills by reading the session ledger tails once at startup and
-  rides the push from there; the subscribe cursor for server-side replay
-  is still accepted but ignored, with no client that needs it.
+  falling behind into `%pause` and `%continue` notifications (amendment a).
+- Clients never poll the daemon: `events.subscribe` pushes. The stream UI
+  backfills by reading the session ledger tails once at startup and rides
+  the push from there.
+
+Timers do exist; none of them is an interval. Each is a one-shot tied to
+one thing that already happened: the paste verification re-reads, the
+tier-1 ACK window, the tier-2 checkpoints, the decline spacing, the gate's
+single wedged-hold ping, the per-pane output settle debounce, the watcher's
+reconnect backoff, and the deadlines a caller asked for.
 
 Sanctioned exceptions, none in the product: the Python probe harness
 (`tests/harness/`) polls because it is a measuring instrument, the test
-rigs wait in bounded loops for things a test has no edge to await (a shell
-finishing its draw, `cyclops-testrig`'s `wait_screen`), and demo scripts
-may wait in a bounded loop for process startup or for the record to settle
-between narration steps.
+rigs wait in bounded loops for things a test has no edge to await
+(`cyclops-testrig`'s `wait_screen`), and demo scripts may wait in a bounded
+loop for process startup or for the record to settle between narration
+steps.

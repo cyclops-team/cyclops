@@ -17,6 +17,12 @@
 # default tmux server its own directory: nothing here can reach the server
 # your own sessions live on. CYCLOPS_HOME is throwaway too. Both go on the
 # EXIT trap.
+#
+# The rungs run from the repo root, where the daemon's last-resort
+# `./manifests` fallback would find the manifests whether or not anything
+# installed them. That is the hole the first run fell through for five
+# milestones, so the last section runs the whole ladder from a directory
+# with nothing in it, on its own home and its own daemon.
 
 set -euo pipefail
 
@@ -58,11 +64,21 @@ start_daemon() {
 
 cleanup() {
   cyc_stop_daemon
+  # The nested rigs run their own daemon and their own tmux server in their
+  # own directories. All of them die here even when a check above exited
+  # early.
+  for pid in "${DUO_PID:-}" "${STOCK_PID:-}"; do
+    if [ -n "$pid" ]; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
   cyc_tmux_teardown default
-  # The nested duo rig runs its own tmux server in its own directory.
-  if [ -d "$ROOT/duo/tmux" ]; then
-    TMUX_TMPDIR="$ROOT/duo/tmux" cyc_tmux_teardown default
-  fi
+  for nested in duo stock; do
+    if [ -d "$ROOT/$nested/tmux" ]; then
+      TMUX_TMPDIR="$ROOT/$nested/tmux" cyc_tmux_teardown default
+    fi
+  done
   rm -rf "$ROOT"
 }
 trap cleanup EXIT
@@ -152,6 +168,48 @@ check() {
   fi
 }
 
+# Assert the last `run` printed NOTHING matching an extended regex. For the
+# lines a command must say once and then stop saying: a note repeated on
+# every run is noise, and the reader is looking for what changed.
+check_absent() {
+  local what="$1" pattern="$2"
+  CHECKS=$((CHECKS + 1))
+  if grep -qE -- "$pattern" "$OUT"; then
+    printf '   FAIL  %s\n         did not want /%s/\n' "$what" "$pattern"
+    FAILS=$((FAILS + 1))
+  else
+    printf '   ok    %s\n' "$what"
+  fi
+}
+
+# Assert a file on disk matches. The seed's rule is about files, not
+# output: a run that says nothing and rewrote your manifest anyway would
+# pass every check above.
+check_file() {
+  local what="$1" path="$2" pattern="$3"
+  CHECKS=$((CHECKS + 1))
+  if grep -qE -- "$pattern" "$path" 2>/dev/null; then
+    printf '   ok    %s\n' "$what"
+  else
+    printf '   FAIL  %s\n         wanted /%s/ in %s\n' "$what" "$pattern" "$path"
+    FAILS=$((FAILS + 1))
+  fi
+}
+
+# The file half of check_absent: assert a file does NOT match. For the
+# lines whose absence is the property under test, where a later edit that
+# adds one would otherwise pass silently.
+check_file_absent() {
+  local what="$1" path="$2" pattern="$3"
+  CHECKS=$((CHECKS + 1))
+  if grep -qE -- "$pattern" "$path" 2>/dev/null; then
+    printf '   FAIL  %s\n         did not want /%s/ in %s\n' "$what" "$pattern" "$path"
+    FAILS=$((FAILS + 1))
+  else
+    printf '   ok    %s\n' "$what"
+  fi
+}
+
 # Assert the last `run` exited with this code. Exit codes are documented
 # per command and scripts branch on them.
 check_exit() {
@@ -208,9 +266,11 @@ while IFS= read -r line; do
 done
 EOF
 
-mkdir -p "$CYCLOPS_HOME/manifests"
-cp "$REPO"/manifests/*.toml "$CYCLOPS_HOME/manifests/"
-cat > "$CYCLOPS_HOME/manifests/demo.toml" <<'EOF'
+# The stand-in's manifest. Written AFTER the first `cyclops start`, not
+# before: seeding the home with the shipped manifests is that command's job
+# now, and a rig that copied them in first is exactly how the first run
+# stayed broken through five milestones while this gate passed.
+DEMO_MANIFEST=$(cat <<'EOF'
 [agent]
 id = "demo"
 display_name = "Parity rig stand-in"
@@ -243,6 +303,7 @@ verify_before_submit = true
 verify_pattern = ["<message_id>"]
 safe_states = ["idle"]
 EOF
+)
 
 echo
 echo "#### Rung 1: one pane, persistence, history"
@@ -250,9 +311,19 @@ echo "#### Rung 1: one pane, persistence, history"
 run "$CYC" start --plain
 check "start builds the solo workspace"   '^✓ workspace ready · 1 agent$'
 check "start writes the config"           'wrote .*/config\.toml$'
+check "start installs the manifests"      '^  wrote 3 detection manifests to .*/manifests$'
 check "step 1 starts the daemon"          '^  1  cyclopsd &  +start the daemon$'
 check "step 2 attaches"                   '^  2  tmux attach -t main  +open the workspace and start your agents$'
 check "step 3 sends the first message"    '^  3  cyclops send implementer --subject "hello"  +send the first message$'
+
+printf '\n$ ls ~/.cyclops/manifests\n'
+ls "$CYCLOPS_HOME/manifests" > "$OUT"
+cat "$OUT"
+check "the shipped set is on disk"        '^claude\.toml$'
+
+# The stand-in's own manifest, written the way docs/MANIFESTS.md says to
+# write one: a file in the home directory the daemon already reads.
+printf '%s\n' "$DEMO_MANIFEST" > "$CYCLOPS_HOME/manifests/demo.toml"
 
 P1="$(tmx list-panes -t main -F '#{pane_id}')"
 # A person attaches here and starts an agent. The rig starts its stand-in,
@@ -284,6 +355,11 @@ start_daemon
 
 run "$CYC" start --plain
 check "a second start is one line"        '^✔ workspace ready · 1 agent$'
+check_absent "and installs nothing twice" '^  wrote [0-9]+ detection manifest'
+# The rule the seed turns on: a manifest written by hand survives every
+# later start, and nothing already on disk is rewritten.
+check_file "the stand-in's manifest survived" \
+  "$CYCLOPS_HOME/manifests/demo.toml" '^id = "demo"$'
 
 wait_for "the roster to hold implementer" 50 roster_has implementer
 
@@ -320,6 +396,7 @@ wait_for "cyclopsd to see the new pane" 50 pane_known "$P2"
 run "$CYC" status --plain
 check "the header carries the eye"        '^‿ cyclops · watching main · tmux .* · up [0-9]'
 check "status lists a pane with no name"  "^ +$P2 +○ idle"
+check "and marks a pane no hook reported" '^ +implementer +○ idle +bash · hooks unverified$'
 
 run "$CYC" name "$P2" reviewer --plain
 check "naming confirms name and pane"     "^✔ named reviewer · $P2\$"
@@ -514,21 +591,274 @@ check "and the block names what it is"   '^  waiting on you$'
 check "one row per open item"            '^  ghost +⚠ needs attention$'
 
 echo
-echo "#### The first run docs/QUICKSTART.md opens with"
+echo "#### The first run docs/QUICKSTART.md walks, from outside the repo"
 
-# A nested rig, because the page starts from a machine with no config and
-# no session called main, and this one has had both since rung 1. Its own
-# home and its own tmux directory keep the two apart.
-mkdir -p "$ROOT/duo/home" "$ROOT/duo/tmux"
-printf '\n$ cyclops start --preset duo\n'
-(
-  export CYCLOPS_HOME="$ROOT/duo/home" TMUX_TMPDIR="$ROOT/duo/tmux"
-  "$CYC" start --preset duo --plain
-) > "$OUT" 2>&1
+# A nested rig, and the one that regresses the whole first-run break.
+#
+# Everything above runs from the repo root, where the daemon's last-resort
+# `./manifests` fallback finds the manifests whether or not anything
+# installed them. An installed pair of binaries has no repo to stand in, so
+# this rig runs from a directory with nothing in it, with its own home and
+# its own tmux directory. It is the walk a stranger takes: start, daemon,
+# status, teach a manifest, name, send, read the receipt.
+mkdir -p "$ROOT/duo/home" "$ROOT/duo/tmux" "$ROOT/duo/elsewhere"
+DUO_HOME="$ROOT/duo/home"
+duo() { ( cd "$ROOT/duo/elsewhere" && CYCLOPS_HOME="$DUO_HOME" TMUX_TMPDIR="$ROOT/duo/tmux" "$@" ); }
+duo_tmx() { duo tmux -u "$@"; }
+duo_daemon_up() { duo "$CYC" --json status >/dev/null 2>&1; }
+duo_attached() { duo "$CYC" --json status | jq -e '.sessions[0].attached == true' >/dev/null; }
+duo_roster_has() { duo "$CYC" --json list | jq -e --arg a "$1" '[.agents[].agent] | index($a)' >/dev/null; }
+
+# `exec env` so $! is cyclopsd's own pid. Without it the subshell is what
+# gets killed on restart, the daemon under it lives on holding the socket,
+# and the replacement exits on "another cyclopsd is already running" while
+# the rig happily waits for a socket that was never the new one's.
+start_duo_daemon() {
+  ( cd "$ROOT/duo/elsewhere" && exec env CYCLOPS_HOME="$DUO_HOME" \
+      TMUX_TMPDIR="$ROOT/duo/tmux" "$CYCD" ) >>"$ROOT/duo/daemon.log" 2>&1 &
+  DUO_PID=$!
+  wait_for "the second daemon's socket" 50 test -S "$DUO_HOME/sock"
+  wait_for "the second daemon to answer" 50 duo_daemon_up
+}
+stop_duo_daemon() {
+  [ -n "${DUO_PID:-}" ] || return 0
+  kill "$DUO_PID" 2>/dev/null || true
+  wait "$DUO_PID" 2>/dev/null || true
+  DUO_PID=""
+}
+
+printf '\n$ cd ~/scratch && cyclops start --preset duo\n'
+duo "$CYC" start --preset duo --plain > "$OUT" 2>&1
 cat "$OUT"
 check "duo opens two panes"               '^✓ workspace ready · 2 agents$'
 check "and writes the config"             'wrote .*/config\.toml$'
+check "and installs the manifests"        '^  wrote 3 detection manifests to .*/manifests$'
 check "step 3 names the first agent"      '^  3  cyclops send implementer --subject "hello"  +send the first message$'
+
+# The daemon runs from the same empty directory. Nothing in the config
+# names a manifest directory, so it has to find the one `start` just wrote.
+start_duo_daemon
+wait_for "the second daemon to attach" 60 duo_attached
+
+printf '\n$ cyclopsd &\n$ cyclops --json status | jq -r .manifests.ids[]\n'
+duo "$CYC" --json status | jq -r '.manifests.ids[]' > "$OUT"
+cat "$OUT"
+check "the daemon found the shipped set"  '^claude$'
+
+# Two shells, and no shipped manifest binds a shell, so both panes read
+# unknown. This is the state the admin hit, and the surface has to say why
+# rather than only labelling it.
+read -r D1 D2 <<<"$(duo_tmx list-panes -t main -F '#{pane_id}' | tr '\n' ' ')"
+duo_tmx respawn-pane -k -t "$D1" "sh '$ROOT/agent.sh' implementer '$CYC'"
+duo_tmx respawn-pane -k -t "$D2" "sh '$ROOT/agent.sh' reviewer '$CYC'"
+duo_tmx select-pane -t "$D1" -T ''
+duo_tmx select-pane -t "$D2" -T ''
+sleep 2.5
+
+printf '\n$ cyclops status\n'
+duo "$CYC" status --plain > "$OUT" 2>&1
+cat "$OUT"
+check "an unknown pane is on the grid"    '\? unknown'
+check "and the grid says why"             'panes read unknown: none of agy, claude, codex matches what is running there'
+check "and what to do about it"           'Pin one: cyclops name .* --manifest <id>'
+
+# Teaching cyclops the CLI in those panes is one file in the home
+# directory the daemon already reads (docs/MANIFESTS.md).
+printf '\n$ $EDITOR ~/.cyclops/manifests/demo.toml\n$ (restart cyclopsd)\n'
+printf '%s\n' "$DEMO_MANIFEST" > "$DUO_HOME/manifests/demo.toml"
+stop_duo_daemon
+cat >> "$DUO_HOME/config.toml" <<'EOF'
+receipt_block_ms = 4000
+ack_timeout_ms = 3000
+EOF
+start_duo_daemon
+wait_for "the second daemon to re-attach" 60 duo_attached
+
+printf '\n$ cyclops --json status | jq -r .manifests.ids[]\n'
+duo "$CYC" --json status | jq -r '.manifests.ids[]' > "$OUT"
+cat "$OUT"
+check "the restarted daemon read the new one" '^demo$'
+
+printf '\n$ cyclops start\n'
+duo "$CYC" start --plain > "$OUT" 2>&1
+cat "$OUT"
+check "the second start names the panes"  '^✔ workspace ready · 2 agents$'
+check_absent "and installs nothing twice" '^  wrote [0-9]+ detection manifest'
+check_file "the hand-written manifest stayed" \
+  "$DUO_HOME/manifests/demo.toml" '^id = "demo"$'
+
+wait_for "the roster to hold implementer" 60 duo_roster_has implementer
+sleep 2.5
+
+printf '\n$ cyclops list\n'
+duo "$CYC" list --plain > "$OUT" 2>&1
+cat "$OUT"
+check "both panes are named and idle"     '^ +implementer +○ idle$'
+check "one row each"                      '^ +reviewer +○ idle$'
+
+printf '\n$ cyclops send implementer --subject "hello"\n'
+duo "$CYC" send implementer --subject "hello" --plain > "$OUT" 2>&1
+cat "$OUT"
+check "the first message is delivered"    '^✔ delivered · verified$'
+
+printf '\n$ cyclops history\n'
+duo "$CYC" history --plain > "$OUT" 2>&1
+cat "$OUT"
+check "and the record holds the receipt"  '^ +[0-9]+s +admin → implementer +hello +✔ delivered · verified$'
+
+stop_duo_daemon
+
+echo
+echo "#### The shipped defaults, with no hooks wired"
+
+# The leg this gate did not have, and the reason two receipt defects
+# shipped under 81 passing checks.
+#
+# Every rung above raises two timing budgets and wires a hook reporter into
+# its stand-in agent. Both are legitimate rig pacing, and together they
+# mean the gate has only ever walked the configured-perfectly path: a
+# delivery that earns "delivered · verified" inside a 4-second receipt
+# window. A new user has none of that. Their config is whatever `cyclops
+# start` wrote, their agent's hooks are not installed until they run
+# `cyclops hooks install`, and their panes are whatever was already
+# running in them.
+#
+# So this rig touches no config knob and reports no hook, and asserts the
+# two shapes a first-timer actually gets. They are different failures with
+# the same old symptom, which is why both are pinned here:
+#
+#   bound, unhooked   the manifest binds the pane and declares an ACK hook
+#                     that nothing ever fires. The delivery is real and
+#                     lands on screen evidence, so the receipt owes the
+#                     screen-tier badge INSIDE the default receipt window.
+#                     MEASURED before the fix: "● queued" at 2.507s, with
+#                     the record reaching delivered_unverified at 3.03s,
+#                     because the tier-1 window suppressed every screen
+#                     checkpoint under it and the ladder resumed past the
+#                     window. No unhooked agent could land a badge at all.
+#
+#   nothing binds it  the pane has a name and no manifest matches what runs
+#                     there, so nothing can be typed into it. This one is
+#                     not slow, it is impossible, and the receipt has to
+#                     say so while the sender is still there: it reported
+#                     "● queued · 0 ahead" and exited 0.
+mkdir -p "$ROOT/stock/home" "$ROOT/stock/tmux" "$ROOT/stock/elsewhere"
+STOCK_HOME="$ROOT/stock/home"
+stock() { ( cd "$ROOT/stock/elsewhere" && CYCLOPS_HOME="$STOCK_HOME" \
+    TMUX_TMPDIR="$ROOT/stock/tmux" "$@" ); }
+stock_tmx() { stock tmux -u "$@"; }
+stock_up() { stock "$CYC" --json status >/dev/null 2>&1; }
+stock_attached() { stock "$CYC" --json status | jq -e '.sessions[0].attached == true' >/dev/null; }
+stock_roster_has() { stock "$CYC" --json list | jq -e --arg a "$1" '[.agents[].agent] | index($a)' >/dev/null; }
+stock_idle() { stock "$CYC" --json list | jq -e --arg a "$1" \
+  '[.agents[] | select(.agent == $a and .state == "idle")] | length == 1' >/dev/null; }
+
+# `run` prints and records the exit code but cannot carry this rig's env.
+# Same contract, same $OUT and $ROOT/exit, so check and check_exit work
+# here exactly as they do above.
+stock_run() {
+  local built="$REPO/target/debug/" shown="" a
+  for a in "$@"; do
+    a="${a//$built/}"
+    [ "$a" = "--plain" ] && continue
+    case "$a" in
+      *" "*) shown="$shown \"$a\"" ;;
+      *) shown="$shown $a" ;;
+    esac
+  done
+  printf '\n$ %s\n' "${shown# }"
+  set +e
+  stock "$@" >"$OUT" 2>&1
+  local code=$?
+  set -e
+  cat "$OUT"
+  printf '%s' "$code" > "$ROOT/exit"
+}
+
+start_stock_daemon() {
+  ( cd "$ROOT/stock/elsewhere" && exec env CYCLOPS_HOME="$STOCK_HOME" \
+      TMUX_TMPDIR="$ROOT/stock/tmux" "$CYCD" ) >>"$ROOT/stock/daemon.log" 2>&1 &
+  STOCK_PID=$!
+  wait_for "the defaults daemon's socket" 50 test -S "$STOCK_HOME/sock"
+  wait_for "the defaults daemon to answer" 50 stock_up
+}
+stop_stock_daemon() {
+  [ -n "${STOCK_PID:-}" ] || return 0
+  kill "$STOCK_PID" 2>/dev/null || true
+  wait "$STOCK_PID" 2>/dev/null || true
+  STOCK_PID=""
+}
+
+stock_run "$CYC" start --preset duo --plain
+check "duo opens two panes"               '^✓ workspace ready · 2 agents$'
+
+# One manifest, shaped like a shipped one: it binds the panes AND declares
+# an ACK hook. claude.toml and codex.toml both do, which is what makes an
+# unwired agent the default case rather than an edge case.
+printf '\n$ $EDITOR ~/.cyclops/manifests/demo.toml\n'
+printf '%s\n' "$DEMO_MANIFEST" > "$STOCK_HOME/manifests/demo.toml"
+
+# NOTHING is appended to the config. That is the whole point of this leg,
+# and it is asserted rather than assumed: an override added here later
+# would quietly turn this back into another configured-perfectly rung.
+check_file_absent "this leg runs on untouched defaults" \
+  "$STOCK_HOME/config.toml" 'receipt_block_ms|ack_timeout_ms'
+
+start_stock_daemon
+wait_for "the defaults daemon to attach" 60 stock_attached
+
+read -r S1 S2 <<<"$(stock_tmx list-panes -t main -F '#{pane_id}' | tr '\n' ' ')"
+# Pane 1 is the agent: bound by the manifest, and it never reports a hook,
+# because a first run has not installed any. Plain `cat` is the honest
+# stand-in for that: it takes the paste and echoes it, which is exactly the
+# screen evidence tier 2 reads, and it reports nothing.
+stock_tmx respawn-pane -k -t "$S1" "cat"
+# Pane 2 is the pane nothing detects. `sleep` is in no manifest's
+# process_names, which is the state every pane is in before its agent CLI
+# starts.
+stock_tmx respawn-pane -k -t "$S2" "sleep 600"
+stock_tmx select-pane -t "$S1" -T ''
+stock_tmx select-pane -t "$S2" -T ''
+sleep 2.5
+
+# Naming both panes, and the pair is the point: the same command says
+# nothing extra about a pane a manifest binds, and warns about the one
+# nothing binds. A warning on both would be noise nobody reads.
+stock_run "$CYC" name "$S1" implementer --plain
+check "the bound pane is named"           "^✔ named implementer · $S1\$"
+check_absent "with no warning about it"   "can.t receive a message"
+
+stock_run "$CYC" name "$S2" ghostpane --plain
+check "and the pane nothing detects says so" 'nothing detects .* can.t receive a message'
+
+wait_for "the roster to hold implementer" 60 stock_roster_has implementer
+wait_for "implementer to read idle" 60 stock_idle implementer
+sleep 2.5
+
+# Shape 1. An agent with no hooks wired is delivered to on screen evidence,
+# and the badge has to be on the receipt the sender reads, not only in the
+# record half a second later.
+stock_run "$CYC" send implementer --subject "hello" --plain
+check "an unhooked agent gets the screen-tier badge" '^✓ delivered · unverified \(screen\)$'
+check_exit "and a delivered send exits 0" 0
+
+# Shape 2. The pane nothing binds. Not slow: impossible. The receipt names
+# the pane and the exit code keeps a script from reading it as delivered.
+stock_run "$CYC" send ghostpane --subject "hello" --plain
+check "a pane nothing detects refuses the message" "^⚠ needs attention · nothing detects $S2\$"
+# The badge names the pane and the reason; the line under it has to leave
+# the reader somewhere to go. Which surface that is belongs to the CLI's
+# copy, so this asserts that a next step is named, not how it reads.
+check "and names a next step"             'cyclops status'
+check_exit "and it does NOT exit 0" 1
+
+# The record agrees with both receipts. A receipt that says one thing while
+# the ledger says another is the defect these two checks exist to catch.
+stock_run "$CYC" history --plain
+check "the delivered one is on the record" '^ +[0-9]+s +admin → implementer +hello +✓ delivered · unverified \(screen\)$'
+check "and the refused one too"            '^ +[0-9]+s +admin → ghostpane +hello +⚠ needs attention · no manifest$'
+
+stop_stock_daemon
 
 echo
 echo "== $((CHECKS - FAILS))/$CHECKS checks passed"

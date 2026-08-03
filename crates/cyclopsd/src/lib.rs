@@ -1,17 +1,45 @@
-//! cyclopsd: the Cyclops daemon.
+//! cyclopsd: the Cyclops daemon. One process, one socket, one record.
 //!
-//! M0 landed the read-only shadow scope: watch configured tmux sessions
-//! over control mode, fuse manifest rules over pane titles and screens
-//! into an AgentState per pane, and serve the NDJSON socket API. M1 adds
-//! the ledger (one crash-safe NDJSON file per watched session), the
-//! delivery pipeline (msg.send end to end, docs/DELIVERY.md), the hook
-//! sensor via agent.state.report, admin.notify, and pane labeling.
+//! ## What it owns
 //!
-//! Zero-polling contract: nothing here re-queries state on a clock. The
-//! only timers are the per-pane output settle debounce, the watcher
-//! reconnect backoff, and the per-delivery one-shots inside the delivery
-//! pipeline (verify re-reads, ACK windows, decline spacing). No interval
-//! ever re-queries state.
+//! - The watched sessions: one control-mode connection each, through
+//!   `cyclops-tmux`, and the pane table it reconciles (`watcher.rs` is
+//!   that crate's; the session slots and the reconnect loop are here).
+//! - The verdict about what each pane is doing (`fusion.rs`), fusing
+//!   manifest rules over title and screen with hook edges (`ack.rs`).
+//! - The record: one crash-safe NDJSON ledger per watched session, and
+//!   the read side over it (`history.rs`: `msg.history`, `msg.thread`).
+//! - Delivery (`delivery.rs`, docs/DELIVERY.md): the gate, the paste,
+//!   the ACK tiers, quota parking, `agent.wait`, restart-limbo closure.
+//! - Who is who: sender identity from socket peer credentials
+//!   (`identity.rs`) and the durable adoption roster
+//!   (`registry.rs`).
+//! - The one thing cyclops draws itself, the pane border
+//!   (`chrome.rs`), and hook liveness plus the self-test
+//!   (`selftest.rs`).
+//! - The socket (`server.rs`): every method in docs/PROTOCOL.md.
+//!
+//! ## What it does not own
+//!
+//! - Talking to tmux. Every invocation goes through `cyclops-tmux`; see
+//!   that crate's header for the rule and its one live exception, which
+//!   is `probe_tmux` in this file.
+//! - What a rule means. Detection rules are `cyclops-manifest` data, and
+//!   a new agent CLI is a TOML file, never a change here.
+//! - What needs a human. That rule has one home,
+//!   `cyclops_proto::attention`; this crate answers `status` with the same
+//!   predicate and decides nothing extra.
+//! - Rendering. Nothing here formats for a human except the border, and
+//!   the border's colors are `cyclops-theme` tokens.
+//!
+//! ## Zero polling
+//!
+//! Nothing here re-queries state on a clock. Every timer is a one-shot
+//! attached to one thing that already happened: the per-pane output settle
+//! debounce, the watcher reconnect backoff, the delivery pipeline's verify
+//! re-reads, ACK windows and decline spacing, the gate's single
+//! wedged-hold ping, and the deadlines a caller asked for
+//! (`receipt_block_ms`, `agent.wait`'s `timeout_ms`). No interval exists.
 //!
 //! The crate is a library so integration tests boot the daemon in-process;
 //! main.rs is a thin wrapper adding signals and logging.
@@ -30,7 +58,7 @@ mod server;
 pub use config::Config;
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -82,6 +110,12 @@ pub(crate) struct Inner {
     /// Keyed and iterated by agent id, so process-name binding is
     /// deterministic.
     pub(crate) manifests: BTreeMap<String, Manifest>,
+    /// The directory the manifests above were read from, resolved once at
+    /// boot. None when no directory was found at all. Kept because the
+    /// resolution consults the working directory (see
+    /// [`Config::manifest_dir`]) and a later reader has no way to redo it:
+    /// `status` reports this path to whoever has to fix an unknown pane.
+    pub(crate) manifest_dir: Option<PathBuf>,
     /// One slot per configured session, fixed at boot.
     pub(crate) sessions: Vec<SessionSlot>,
     /// Push stream for events.subscribe connections.
@@ -598,6 +632,18 @@ pub(crate) async fn label_pane(
         "pane_id": pane_id,
         "label": label,
         "manifest": manifest,
+        // What actually binds the pane now, which is not the same as the
+        // pin above: the pin is what the caller asked for and is usually
+        // absent, and adoption re-reads the pane (adopt_pane step 4) so
+        // this is the verdict a delivery would gate on. Null means nothing
+        // binds it, and a named pane nothing binds can receive no message.
+        // Additive: an older client ignores the field.
+        "detects_as": label.as_ref().and_then(|_| inner
+            .detections
+            .lock()
+            .expect("detections lock")
+            .get(&pane_id)
+            .and_then(|e| e.manifest.clone())),
     }))
 }
 
@@ -1011,7 +1057,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         }
     };
 
-    let manifests = load_manifests(&cfg);
+    let (manifests, manifest_dir) = load_manifests(&cfg);
 
     // One crash-safe ledger per watched session. A daemon that cannot
     // record must not deliver, so open failures fail the boot.
@@ -1058,6 +1104,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         started,
         tmux_version,
         manifests,
+        manifest_dir,
         sessions,
         events,
         detections: StdMutex::new(HashMap::new()),
@@ -1097,6 +1144,34 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
                     "session": inner.sessions[idx].name,
                 })),
             },
+        );
+    }
+
+    // A daemon with no manifests boots clean, watches panes, and can
+    // deliver nothing. The warn! below reaches whoever is tailing stderr,
+    // which after `cyclopsd &` is nobody, so the same sentence also goes on
+    // the record: it lands in `cyclops ui` and replays out of the ledger.
+    // `cyclops status` reads the same fact off the status answer and
+    // explains the unknown panes it produces.
+    //
+    // Fyi, not ActionRequired, and the level is load-bearing. A ping is a
+    // POINTER at something in the attention register, and this names
+    // nothing there: no pane is blocked and no delivery is open, because
+    // nothing has been tried yet. An action-required ping naming no item is
+    // admitted to the calm view forever (`cyclops_ui::App::admits`), which
+    // would put "⚠ action required" under a closed eye on every frame until
+    // the daemon is restarted. That contradiction is the thing M3 banned.
+    if manifest_ids.is_empty() {
+        let words = no_manifests_warning(inner.manifest_dir.as_deref());
+        warn!("{words}");
+        delivery::admin_notify(
+            &inner,
+            cyclops_proto::NotifyLevel::Fyi,
+            "no detection manifests",
+            &words,
+            None,
+            None,
+            delivery::About::default(),
         );
     }
 
@@ -1152,24 +1227,42 @@ async fn probe_tmux() -> Option<TmuxVersion> {
     }
 }
 
-/// Load detection manifests. Failure is loud but not fatal: a shadow
-/// daemon with zero manifests still watches panes and answers status,
-/// every pane just reads unknown.
-fn load_manifests(cfg: &Config) -> BTreeMap<String, Manifest> {
+/// Load detection manifests, and report the directory they came from.
+///
+/// Failure is loud but not fatal: a daemon with zero manifests still
+/// watches panes and answers status. It just cannot tell what is running in
+/// any of them, so every pane reads unknown and every delivery to one ends
+/// in attention_required. That is a broken install, not a quiet mode, and
+/// [`boot`] says so on the record as well as in the log.
+fn load_manifests(cfg: &Config) -> (BTreeMap<String, Manifest>, Option<PathBuf>) {
     let Some(dir) = cfg.manifest_dir() else {
-        warn!("no manifest directory found; every pane will read unknown");
-        return BTreeMap::new();
+        return (BTreeMap::new(), None);
     };
     match cyclops_manifest::load_dir(&dir) {
         Ok(map) => {
             info!(dir = %dir.display(), count = map.len(), "manifests loaded");
-            map.into_iter().collect()
+            (map.into_iter().collect(), Some(dir))
         }
         Err(e) => {
             warn!(dir = %dir.display(), error = %e, "manifest load failed; continuing with none");
-            BTreeMap::new()
+            (BTreeMap::new(), Some(dir))
         }
     }
+}
+
+/// What to tell a person when the daemon booted with no manifests.
+///
+/// Same words in the log and in the notification, because they are the same
+/// fact reaching two readers. The directory is named when there is one: an
+/// empty directory and no directory at all are fixed differently.
+pub(crate) fn no_manifests_warning(dir: Option<&Path>) -> String {
+    let where_ = match dir {
+        Some(d) => format!("{} holds no readable manifests", d.display()),
+        None => "there is no manifest directory".to_string(),
+    };
+    format!(
+        "{where_}, so every pane reads unknown and no message can be delivered. Install the shipped set with: cyclops start, then restart cyclopsd."
+    )
 }
 
 /// Own one configured session for the daemon's lifetime: attach, pump

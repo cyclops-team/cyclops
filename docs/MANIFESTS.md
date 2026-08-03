@@ -4,8 +4,9 @@ Everything cyclops knows about an agent CLI is one TOML file: which
 processes it runs as, how to tell working from idle by looking at the pane,
 and how to type into it. No code, no plugin, no wrapper around the CLI.
 
-Three ship in [`manifests/`](../manifests/): `claude.toml`, `codex.toml`,
-`agy.toml`. A fourth is three steps away.
+Three ship inside the `cyclops` binary and land in `~/.cyclops/manifests`
+on your first `cyclops start`: `claude.toml`, `codex.toml`, `agy.toml`.
+Their source is [`manifests/`](../manifests/). A fourth is three steps away.
 
 ## Add one
 
@@ -25,7 +26,10 @@ one rule to fix.
 
 Cyclops looks for manifests in `manifest_dir` from your config, then
 `~/.cyclops/manifests`, then `./manifests` relative to where you started the
-daemon. First directory that exists wins; it is not a search path.
+daemon. First directory that exists wins; it is not a search path. With no
+`manifest_dir` set, that means the directory `cyclops start` filled, which
+is where your own file goes too. A later `cyclops start` writes only the
+shipped files it does not find, so nothing you put there is touched.
 
 A file that fails to parse takes the whole directory with it: the daemon
 logs the reason and runs with no manifests at all, so every pane reads

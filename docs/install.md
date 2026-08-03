@@ -6,24 +6,70 @@
 - tmux 3.2 or newer (`tmux -V`); developed and tested on 3.6a
 - Rust toolchain (`cargo`)
 
-## Build
+## Install
 
 ```bash
 git clone https://github.com/cyclops-team/cyclops.git && cd cyclops
-cargo build --release
+cargo install --path crates/cyclops
+cargo install --path crates/cyclopsd
 ```
 
-Binaries land in `target/release/`: `cyclopsd` (the daemon) and `cyclops`
-(the CLI). Put them on your PATH or call them by path.
+Two binaries: `cyclops` (the CLI) and `cyclopsd` (the daemon). Both go to
+`~/.cargo/bin`. Cargo says so on the last line of each install, and warns
+when that directory is not on your PATH.
+
+To build without installing, `cargo build --release` puts the same two in
+`target/release/`.
+
+## Put them on your PATH
+
+Check:
+
+```bash
+$ command -v cyclops cyclopsd
+/Users/you/.cargo/bin/cyclops
+/Users/you/.cargo/bin/cyclopsd
+```
+
+Two paths back means you are done. Nothing back means the shell cannot see
+them, and `~/.cargo/bin` is on plenty of machines without being on the
+PATH of any of them. Add it, then open a new shell:
+
+```bash
+# zsh
+echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.zshrc
+
+# bash
+echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc
+```
+
+If you already keep binaries somewhere on your PATH, `cargo install
+--root` puts them there instead of in `~/.cargo/bin`:
+
+```bash
+cargo install --root ~/.local --path crates/cyclops
+cargo install --root ~/.local --path crates/cyclopsd
+```
+
+`--root ~/.local` writes `~/.local/bin/cyclops`. The root is the prefix,
+not the directory; cargo appends `bin`.
 
 ## Configure
 
-Cyclops keeps everything under `~/.cyclops` (override with `$CYCLOPS_HOME`).
-`cyclops start` writes the config on a first run, so the short way is:
+Cyclops keeps everything under `~/.cyclops` (override with `$CYCLOPS_HOME`,
+which has a length limit: see [below](#keep-cyclops_home-short)).
+`cyclops start` sets it up, so the short way is:
 
-```bash
-cyclops start
 ```
+$ cyclops start
+✓ workspace ready · 1 agent
+  wrote /Users/you/.cyclops/config.toml
+  wrote 3 detection manifests to /Users/you/.cyclops/manifests
+```
+
+Two things, and both matter. The config says which tmux sessions to watch.
+The manifests are how cyclops tells what is running in a pane; without
+them every pane reads `? unknown` and no message can be delivered to one.
 
 The long way, by hand. Create `~/.cyclops/config.toml`:
 
@@ -34,14 +80,29 @@ sessions = ["main"]
 # what a bare `cyclops start` opens, see workspaces.md
 default_workspace = "main"
 
-# where the per-CLI detection manifests live
+# where the per-CLI detection manifests live; the default is
+# ~/.cyclops/manifests and you rarely want anything else
 manifest_dir = "/path/to/cyclops/manifests"
 ```
 
-`cyclops start` writes the first two keys and not the third: it does not
-know where you cloned the repo. Without `manifest_dir`, the daemon looks
-in `~/.cyclops/manifests` and then in `./manifests`, so starting cyclopsd
-from the repo root works.
+`cyclops start` writes the first two keys and not the third: with nothing
+there the daemon reads `~/.cyclops/manifests`, which is the directory it
+just filled. Set `manifest_dir` only to point somewhere else, e.g. a
+clone you are editing manifests in.
+
+### When the shipped set gains a manifest
+
+Every `cyclops start` writes the manifests it ships and does not already
+find, so a new one lands on your next start and says so:
+
+```
+  wrote 1 detection manifest to /Users/you/.cyclops/manifests
+```
+
+A file already there is never read, compared, or rewritten, so your edits
+survive every run. The other side of that: a shipped manifest that changes
+does not reach a copy you already have. Delete yours and run `cyclops
+start` again to take the new one.
 
 Four optional keys. The first two change how the daemon talks to tmux, so
 add them only when you mean to. `theme` changes what every surface prints,
@@ -82,6 +143,33 @@ before it calls the connection lost, so a longer receipt budget means
 The delivery itself still completes and the record still shows it.
 
 Unknown keys warn and are ignored. The file is data; nothing in it executes.
+
+### Keep `$CYCLOPS_HOME` short
+
+The daemon binds its socket at `$CYCLOPS_HOME/sock`, and a Unix socket path
+caps out near 104 bytes on macOS. Measured there: a `$CYCLOPS_HOME` of 98
+bytes binds, 99 does not. The default `~/.cyclops` is nowhere near it; a
+home under a deep project directory or a macOS `/var/folders` temp path
+can be.
+
+Past the cap `cyclopsd` exits at boot:
+
+```
+boot failed: bind /a/very/long/path/.cyclops/sock: path must be shorter than SUN_LEN
+```
+
+`cyclopsd &` puts that on a stderr nobody is reading, so what you actually
+see is the next command:
+
+```
+$ cyclops status
+lost the connection to cyclops: path must be shorter than SUN_LEN. Check that cyclopsd is still running, then retry.
+```
+
+Checking cyclopsd does not help, because it never started. Move
+`$CYCLOPS_HOME` somewhere shorter and start the daemon again. `cyclops
+start` will not catch this for you: it writes the config and the manifests
+and prints its usual next steps, because nothing it does needs a socket.
 
 ## Run
 
@@ -125,7 +213,25 @@ cyclops status        # watched panes and their states
 cyclops watch         # live events; Ctrl-C to stop
 ```
 
-A pane shows `? unknown` when no manifest matches what is running in it.
+A pane shows `? unknown` when no manifest matches what is running in it,
+and `cyclops status` says which of the two reasons it is:
+
+```
+$ cyclops status
+‿ cyclops · watching main · tmux 3.6a · up 1s
+
+  %0  ? unknown  zsh
+
+  1 pane reads unknown: none of agy, claude, codex matches what is running there. Nothing can be delivered to an unknown pane. Pin one: cyclops name %0 <label> --manifest <id>. Teaching cyclops a new CLI is one file: docs/MANIFESTS.md.
+```
+
+With no manifests at all it says that instead, because the fix is the
+whole install and not one pane:
+
+```
+  1 pane reads unknown: cyclopsd loaded no detection manifests. Nothing can be delivered to an unknown pane. Install them and restart: cyclops start, then restart cyclopsd.
+```
+
 The shipped manifests cover Claude Code, Codex CLI, and Antigravity CLI.
 Teaching it another one is a single TOML file:
 [MANIFESTS.md](MANIFESTS.md). More symptoms and their next steps:

@@ -142,9 +142,17 @@ fn canned_status() -> Value {
                     "state": "unknown"
                 }
             ]
-        }]
+        }],
+        // What a real daemon answers with. %4 above is the reason it
+        // matters: the grid labels that pane unknown, and only this field
+        // says whether the machine has no manifests at all or three that
+        // do not bind vim.
+        "manifests": {"ids": ["agy", "claude", "codex"], "dir": "/h/manifests"}
     })
 }
+
+/// The block the canned answer's one unknown pane earns, under the grid.
+const UNKNOWN_NOTE: &str = "\n  1 pane reads unknown: none of agy, claude, codex matches what is running there. Nothing can be delivered to an unknown pane. Pin one: cyclops name %4 <label> --manifest <id>. Teaching cyclops a new CLI is one file: docs/MANIFESTS.md.\n";
 
 #[test]
 fn status_json_prints_the_raw_result() {
@@ -190,11 +198,13 @@ fn status_plain_renders_the_grid() {
         String::from_utf8_lossy(&out.stderr)
     );
     // Nothing blocked in the canned answer, so the eye stays closed.
-    let expected = "‿ cyclops · watching main · tmux 3.6a · up 2m\n\
-                    \n\
-                    \x20 reviewer     ● working  Run the tests\n\
-                    \x20 implementer  ○ idle\n\
-                    \x20 %4           ? unknown  vim\n";
+    let expected = format!(
+        "‿ cyclops · watching main · tmux 3.6a · up 2m\n\
+         \n\
+         \x20 reviewer     ● working  Run the tests\n\
+         \x20 implementer  ○ idle\n\
+         \x20 %4           ? unknown  vim\n{UNKNOWN_NOTE}"
+    );
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
     let _ = fs::remove_dir_all(&home);
 }
@@ -356,11 +366,13 @@ fn status_plain_opens_the_eye_on_a_blocked_agent() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let expected = "◑ 1 cyclops · watching main · tmux 3.6a · up 2m · 1 needs attention\n\
-                    \n\
-                    \x20 reviewer     ● working             Run the tests\n\
-                    \x20 implementer  ⚠ blocked_permission\n\
-                    \x20 %4           ? unknown             vim\n";
+    let expected = format!(
+        "◑ 1 cyclops · watching main · tmux 3.6a · up 2m · 1 needs attention\n\
+         \n\
+         \x20 reviewer     ● working             Run the tests\n\
+         \x20 implementer  ⚠ blocked_permission\n\
+         \x20 %4           ? unknown             vim\n{UNKNOWN_NOTE}"
+    );
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
     let _ = fs::remove_dir_all(&home);
 }
@@ -618,6 +630,64 @@ fn send_parked_exits_one_with_reset_hint() {
     assert_eq!(
         String::from_utf8_lossy(&out.stderr).trim(),
         "reviewer is out of quota, resets in 135h. The message is kept as parked; requeue it once the quota resets."
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// A send to a pane nothing detects. The badge names the pane and why,
+/// the follow-up says the message did not arrive, and the exit code keeps
+/// a script from branching on it as a delivery.
+#[test]
+fn send_to_an_undetected_pane_says_it_did_not_arrive_and_exits_one() {
+    let home = scratch_home("sund");
+    serve_once(&home, hello(1), move |req| {
+        (
+            vec![json!({"id": req["id"], "result": {
+                "msg_id": "m-ee", "seq": 14,
+                "deliveries": [{
+                    "to": "worker", "state": "attention_required",
+                    "note": "nothing detects %0"
+                }]
+            }})
+            .to_string()],
+            false,
+        )
+    });
+    let out = run_cyclops(&home, &["send", "worker", "--subject", "hello"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "⚠ needs attention · nothing detects %0\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "worker did not get this message. It is on the record and needs attention; cyclops status lists what is waiting on you and what to do about each one."
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// A receipt taken while the payload is already in the pane. It is not
+/// queued, it does not claim to be delivered, and the follow-up says where
+/// the badge turns up.
+#[test]
+fn send_in_flight_reports_the_state_it_is_in_not_queued() {
+    let home = scratch_home("si");
+    serve_once(&home, hello(1), move |req| {
+        (
+            vec![json!({"id": req["id"], "result": {
+                "msg_id": "m-ff", "seq": 15,
+                "deliveries": [{"to": "worker", "state": "submitted"}]
+            }})
+            .to_string()],
+            false,
+        )
+    });
+    let out = run_cyclops(&home, &["send", "worker", "--subject", "hello"]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "● submitted\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "the message is in worker's pane; cyclops is still waiting for the confirmation. It lands on the record either way: cyclops history shows the badge."
     );
     let _ = fs::remove_dir_all(&home);
 }

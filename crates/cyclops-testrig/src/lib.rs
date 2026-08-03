@@ -32,6 +32,13 @@
 //! kinds: integration tests in `cyclops-tmux` and `cyclopsd`, plus a unit
 //! test inside the `cyclopsd` library. A dev-dependency reaches all three;
 //! a `#[cfg(test)]` module in any one crate reaches none of the others.
+//!
+//! What it does not own: anything that ships. `publish = false`, no
+//! dependencies, and nothing in the product links it. It also does not own
+//! the shell half of the same rule, which bash cannot call: that is
+//! `demos/lib.sh`, held to this contract by `tests/shell_teardown.rs`. And
+//! it owns no fixture, session shape or wait helper beyond the server
+//! itself; each test crate builds its own on top.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};

@@ -26,8 +26,11 @@ Everything sent is queryable later: see [history.md](history.md).
 
 ## Receipts
 
-One badge per recipient. An idle target blocks until the delivery resolves,
-capped at 2.5 s. A busy target answers immediately with its queue position.
+One badge per recipient. The send blocks while an answer is coming and
+stops blocking when it is not: an idle target holds until the delivery
+resolves, capped at 2.5 s, and a target nothing detects holds only as long
+as the refusal takes (milliseconds). A busy target answers immediately with
+its queue position, because that answer will not change until its turn ends.
 
 | Badge | Meaning |
 |---|---|
@@ -35,7 +38,8 @@ capped at 2.5 s. A busy target answers immediately with its queue position.
 | `✓ delivered · unverified (screen)` | Screen evidence only: the marker left the composer and a turn started. A late hook report upgrades it to verified. |
 | `● queued · 2 ahead` | Recipient cannot take input yet: mid-turn, a human typing, or a dialog waiting on a human decision (you get alerted). Delivers in order once the pane is ready. |
 | `⊘ parked · quota, resets in 135h` | Recipient is out of vendor quota. See below. |
-| `⚠ needs attention · no pane for "reviewer"` | A human must look. The qualifier names why: missing pane, dead pane, no matching manifest, or two failed delivery attempts. |
+| `⚠ needs attention · no pane for "reviewer"` | A human must look. The qualifier names why: missing pane, dead pane, nothing detecting the pane, or two failed delivery attempts. |
+| `⚠ needs attention · nothing detects %4` | The recipient has a name and no manifest matches what runs in its pane, so nothing can be typed into it. See below. |
 
 Verified means proven end to end: the recipient CLI's hook reported the
 injected text and it contained this message's id. Unverified means the
@@ -47,7 +51,34 @@ A recipient that always lands unverified probably has hooks that never
 load: `cyclops hooks verify <target>` shows the evidence, [hooks.md](hooks.md)
 the fix.
 
+Until you wire hooks, every delivery is screen-tier, so `✓ delivered ·
+unverified (screen)` is the normal receipt on a fresh install. It is a
+delivered message, not a degraded one.
+
 Add `--json` for the raw receipt. Anything the badge shows, scripts can read.
+
+## A recipient nothing detects
+
+```
+$ cyclops send ghostpane --subject "hello"
+⚠ needs attention · nothing detects %4
+ghostpane did not get this message. It is on the record and needs attention;
+cyclops status lists what is waiting on you and what to do about each one.
+```
+
+Naming a pane makes it addressable, not readable. Cyclops types into a pane
+only when a manifest tells it what is running there and how to tell a busy
+composer from an idle one, so a pane no manifest binds can receive nothing.
+
+The send stops there rather than queueing: nothing is pasted, the message is
+kept on the record as needs attention, and the exit code is `1`. That code is
+the contract a script depends on. Exit `0` means cyclops has the message and
+will deliver it; a recipient nothing detects is not going to be delivered to
+by waiting, so it must never share an exit code with one that is.
+
+`cyclops status` names the pane, the manifests cyclopsd loaded, and the pin
+command. Teaching cyclops a new CLI is one file:
+[MANIFESTS.md](MANIFESTS.md).
 
 ## Broadcast
 

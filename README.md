@@ -36,9 +36,13 @@ Every block below is real output, captured by
 Three things are edited and nothing else: the home directory is shortened to
 `~/.cyclops`, color is off, and a `Next:` block already shown once is left
 out the second time. That script re-runs the whole walk and fails if a line
-here stops matching what the binaries print. Message ids and clock values
-belong to the run it was captured from; yours will differ there and nowhere
-else.
+here stops matching what the binaries print.
+
+Some of it follows your machine rather than the run it was captured from:
+message ids and clock values, the pane ids tmux hands out (`%1`), the shell
+a status row names for a pane running one (`bash` below, `zsh` on plenty of
+machines), and the tmux version and loaded-manifest list the daemon
+reports. Everything else should match line for line.
 
 ### 1. One pane
 
@@ -365,10 +369,16 @@ The crate-by-crate map, the delivery state machine, and the gate order are in
 
 ## Docs
 
-One page per question.
+**Going to work on the code? Start at
+[HANDOFF.md](docs/HANDOFF.md).** It is the front door for a newcomer: where
+everything lives, what to read for the job you have been handed, and which
+decisions were deliberate so you do not spend a day undoing one.
+
+Otherwise, one page per question.
 
 | | |
 |---|---|
+| [HANDOFF.md](docs/HANDOFF.md) | Start here to work on the codebase: the map, and the decisions behind it |
 | [install.md](docs/install.md) | Build it, configure it, run the tests |
 | [QUICKSTART.md](docs/QUICKSTART.md) | Two agents and a review gate, start to finish |
 | [send.md](docs/send.md) | Sending, receipts, broadcast, quota parking |
@@ -383,6 +393,10 @@ One page per question.
 | [PROTOCOL.md](docs/PROTOCOL.md) | The socket: methods, requests, responses |
 | [troubleshooting.md](docs/troubleshooting.md) | When something is wrong |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the pieces fit |
+| [DELIVERY.md](docs/DELIVERY.md) | The delivery spec: states, evidence tiers, ordering |
+| [CONTRIBUTING.md](docs/CONTRIBUTING.md) | The development loop, the demos, and the gates a change must pass |
+| [INVARIANTS.md](docs/INVARIANTS.md) | Eleven rules a change must never break, and what breaks otherwise |
+| [findings.md](findings.md) | The measurements the design rests on, F13 onward, each with the probe that proved it |
 | [GOALS.md](docs/GOALS.md) | The quality bar every milestone is reviewed against |
 | [STYLE.md](docs/STYLE.md) | How this codebase is written, binding on every change |
 

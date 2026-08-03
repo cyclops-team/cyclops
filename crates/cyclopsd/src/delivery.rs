@@ -1,13 +1,28 @@
-//! The M1 delivery pipeline (docs/DELIVERY.md is the spec).
+//! The delivery pipeline (docs/DELIVERY.md is the spec, and the flow with
+//! its decision points drawn is docs/ARCHITECTURE.md).
 //!
 //! One worker per target pane; deliveries to one recipient are strictly
 //! FIFO. Every state transition appends a ledger line and emits an event.
 //! Failures queue or park; they never drop (limbo is a bug).
 //!
+//! Four things live here that read like they belong elsewhere, and each
+//! one is here because it needs the same handle the pipeline holds:
+//! `admin_notify` (a ping usually points at a delivery), `close_limbo`
+//! (the restart sweep over chains this file left open), `agent_wait` and
+//! `wait_pinned` (send-and-wait pins on the pid the submit went to), and
+//! `About`, the item a ping names so a reader can stop showing it.
+//!
+//! What is NOT decided here: whether a pane is idle (`fusion.rs`), which
+//! keys dismiss a modal (`cyclops-manifest` data), whether a finished
+//! delivery still needs a human (`cyclops_proto::attention`), and how any
+//! of it is worded for a person (the CLI).
+//!
 //! Zero-polling shape: workers sleep on queue notifies and wake on watcher
-//! or fusion events. The only timers are per-delivery one-shots: the paste
-//! verification re-reads, the tier-1 ACK window, the screen-evidence
-//! checkpoints, and the decline-key spacing. Nothing runs on an interval.
+//! or fusion events. Every timer is a one-shot tied to one delivery: the
+//! paste verification re-reads, the tier-1 ACK window, the screen-evidence
+//! checkpoints, the decline-key spacing, the gate's single wedged-hold
+//! ping, and the two deadlines a caller asked for (`receipt_block_ms`,
+//! and `timeout_ms` on a wait). Nothing runs on an interval.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
@@ -913,18 +928,18 @@ pub(crate) async fn msg_send(
                             .note(hint),
                     );
                 } else {
-                    // Idle path blocks for its receipt; busy path answers
-                    // queued immediately.
-                    let idle_now = !worker.busy.load(Ordering::SeqCst)
-                        && worker.queue.lock().expect("worker queue lock").is_empty()
-                        && inner.cached_state(pane_id) == AgentState::Idle;
+                    // Block for this receipt only when the worker starts on
+                    // it now AND the gate answers without waiting on anyone.
+                    let first_in_line = !worker.busy.load(Ordering::SeqCst)
+                        && worker.queue.lock().expect("worker queue lock").is_empty();
+                    let answers_now = gate_answers_now(inner, *session_idx, pane_id);
                     worker
                         .queue
                         .lock()
                         .expect("worker queue lock")
                         .push_back(Arc::clone(&handle));
                     worker.notify.notify_one();
-                    if idle_now {
+                    if first_in_line && answers_now {
                         blocking.push(Arc::clone(&handle));
                     }
                 }
@@ -933,7 +948,8 @@ pub(crate) async fn msg_send(
         }
     }
 
-    // Receipts: block only on the idle path, capped by receipt_block_ms.
+    // Receipts: block only where the verdict is coming, capped by
+    // receipt_block_ms.
     let deadline = Instant::now() + Duration::from_millis(inner.cfg.receipt_block_ms);
     for handle in &blocking {
         let mut rx = handle.state_tx.subscribe();
@@ -1038,6 +1054,42 @@ pub(crate) async fn msg_send(
     Ok(value)
 }
 
+/// Will the gate reach a verdict on this pane without waiting on the agent
+/// or the human? That is the question the receipt blocks on, and it is not
+/// the same question as "is the pane idle".
+///
+/// Two shapes answer immediately and they end opposite ways. An idle pane
+/// proceeds and the delivery resolves inside the block. A pane no manifest
+/// binds is refused: the gate returns no_manifest before it ever looks at a
+/// state (MEASURED at 7ms), because nothing can be typed into a pane cyclops
+/// cannot read. Reporting that one "queued · 0 ahead" and exiting 0 told the
+/// sender their message was on its way to a pane it could never reach.
+///
+/// Everything else holds: a working pane, a human mid-keystroke, a modal
+/// waiting on a person. Those senders get their queue position now rather
+/// than a 2.5s wait for a badge that is not coming, which is the property
+/// docs/send.md promises for a busy target.
+///
+/// The verdict itself stays the gate's: this only decides whether the
+/// receipt is worth waiting for. A pane that binds a manifest between this
+/// call and the gate simply takes the idle path, and the block is capped
+/// either way.
+fn gate_answers_now(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) -> bool {
+    if inner.cached_state(pane_id) == AgentState::Idle {
+        return true;
+    }
+    let Some(watcher) = inner.watcher_of(session_idx) else {
+        // Detached: the gate holds until the session comes back.
+        return false;
+    };
+    // A pane that left the table between resolution and here is answered
+    // by the gate's no_such_pane, which is just as immediate.
+    match watcher.pane(pane_id) {
+        Some(row) => fusion::bind_manifest_for(inner, &row).is_none(),
+        None => true,
+    }
+}
+
 fn wire_err(code: &str, msg: impl Into<String>) -> WireError {
     WireError {
         code: code.to_string(),
@@ -1046,8 +1098,8 @@ fn wire_err(code: &str, msg: impl Into<String>) -> WireError {
     }
 }
 
-/// A receipt never conflates in-flight machinery with public states: a
-/// delivery still moving reports queued with its position.
+/// The four states a delivery stops moving in. A receipt taken on any of
+/// them is final; anything else is still in the pipeline.
 fn receipt_resolved(s: DeliveryState) -> bool {
     matches!(
         s,
@@ -1058,29 +1110,55 @@ fn receipt_resolved(s: DeliveryState) -> bool {
     )
 }
 
+/// Queued means nothing has been typed into the pane yet.
+///
+/// That covers the three states where the delivery is waiting on the
+/// recipient rather than on cyclops: behind another message, held at the
+/// gate for a turn to end or a human to stop typing, or waiting out a
+/// bounded retry. From the sender's side those are one thing, and the
+/// queue position is the honest detail.
+///
+/// Past the paste it is a different fact and it may not wear the same
+/// word: the payload is in the pane, the composer verified it, the submit
+/// key may already be sent. Reporting "queued" there tells the sender the
+/// opposite of what happened.
+fn receipt_is_queued(s: DeliveryState) -> bool {
+    matches!(
+        s,
+        DeliveryState::Queued | DeliveryState::Gating | DeliveryState::RetryQueued
+    )
+}
+
 fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryReceipt {
     let (state, _, _, cause, note) = handle.snapshot();
     if receipt_resolved(state) {
-        DeliveryReceipt {
+        return DeliveryReceipt {
             to: handle.to.clone(),
             state,
             position: None,
             note: note.or(cause),
-        }
-    } else {
-        let position = inner
-            .engine
-            .workers
-            .lock()
-            .expect("workers lock")
-            .get(&handle.pane_id)
-            .map(|w| w.position_of(handle));
-        DeliveryReceipt {
+        };
+    }
+    if !receipt_is_queued(state) {
+        return DeliveryReceipt {
             to: handle.to.clone(),
-            state: DeliveryState::Queued,
-            position,
+            state,
+            position: None,
             note: None,
-        }
+        };
+    }
+    let position = inner
+        .engine
+        .workers
+        .lock()
+        .expect("workers lock")
+        .get(&handle.pane_id)
+        .map(|w| w.position_of(handle));
+    DeliveryReceipt {
+        to: handle.to.clone(),
+        state: DeliveryState::Queued,
+        position,
+        note: None,
     }
 }
 
@@ -1184,12 +1262,11 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
                 return;
             }
             GateOutcome::Attention { cause } => {
-                advance(
-                    inner,
-                    handle,
-                    &[DeliveryState::Gating],
-                    Step::to(DeliveryState::AttentionRequired).cause(&cause),
-                );
+                let mut step = Step::to(DeliveryState::AttentionRequired).cause(&cause);
+                if let Some(note) = attention_note(&cause, &handle.pane_id) {
+                    step = step.note(note);
+                }
+                advance(inner, handle, &[DeliveryState::Gating], step);
                 notify_attention(inner, handle, &cause);
                 return;
             }
@@ -1228,6 +1305,24 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
                 }
             }
         }
+    }
+}
+
+/// The badge qualifier a gate refusal wears, for the causes where the raw
+/// cause is not a sentence a person can act on.
+///
+/// A receipt shows this after "⚠ needs attention", the same slot the
+/// unresolvable-recipient path fills with `no pane for "ghost"`. Only the
+/// cause a receipt can now reach at send time has one; the rest keep
+/// printing the cause, which is what history has always shown.
+///
+/// The pane id is in it because that is the thing the fix names: pinning a
+/// manifest is per pane, and the label alone cannot be pasted into
+/// `cyclops name`.
+fn attention_note(cause: &str, pane_id: &str) -> Option<String> {
+    match cause {
+        "no_manifest" => Some(format!("nothing detects {pane_id}")),
+        _ => None,
     }
 }
 
@@ -2118,12 +2213,27 @@ impl AckClock {
         ))
     }
 
-    /// The tier-1 phase ended; skip the checkpoints it already covered.
+    /// The tier-1 phase ended, so tier 2 opens here: one pass now, then the
+    /// checkpoints the hook window did not cover.
+    ///
+    /// The passes inside the window are dropped rather than replayed. None
+    /// of them ran (the hook deadline is the only armed timer while the
+    /// phase lasts), and three captures of one screen in the same instant
+    /// answer the same question three times.
+    ///
+    /// The pass AT `now` is the one that matters, and leaving it out is
+    /// what shipped. MEASURED at the defaults: submit at +20ms, hook window
+    /// closes at +1520ms, and the next unexpired checkpoint is submit+3000,
+    /// so nothing looked at a pane that had held the evidence since +20ms
+    /// for a second and a half. receipt_block_ms (2500) expires inside that
+    /// hole, which is why every send to an agent whose hooks are not wired
+    /// printed "queued" and no delivery badge ever reached the sender.
     fn end_hook_phase(&mut self, now: Instant) {
         self.hook_deadline = None;
         while self.next < self.checkpoints.len() && self.checkpoints[self.next] <= now {
             self.next += 1;
         }
+        self.checkpoints.insert(self.next, now);
     }
 
     fn advance_checkpoint(&mut self) {
@@ -3056,8 +3166,11 @@ verify_pattern = ["<message_id>", "Pasted text"]
         c.unfreeze(t0 + ms(6200));
         assert_eq!(c.next_target(), Some((t0 + ms(7500), true)));
         c.end_hook_phase(t0 + ms(7500));
-        // Checkpoints shifted by 6s; the ones the hook phase covered are
-        // skipped (250/750/1500 -> 6250/6750/7500 are all <= now).
+        // Checkpoints shifted by 6s. The ones the hook phase covered
+        // (250/750/1500 -> 6250/6750/7500) are dropped and replaced by one
+        // pass now, so tier 2 opens with a look instead of a wait.
+        assert_eq!(c.next_target(), Some((t0 + ms(7500), false)));
+        c.advance_checkpoint();
         assert_eq!(c.next_target(), Some((t0 + ms(9000), false)));
         c.advance_checkpoint();
         assert_eq!(c.next_target(), Some((t0 + ms(11_000), false)));
@@ -3073,6 +3186,70 @@ verify_pattern = ["<message_id>", "Pasted text"]
         let t0 = Instant::now();
         let c = AckClock::new(t0, None);
         assert_eq!(c.next_target(), Some((t0 + ms(250), false)));
+    }
+
+    /// The shipped numbers, and the hole the receipt fell through.
+    ///
+    /// ack_timeout_ms is 1500 and every manifest for a real CLI declares a
+    /// hook, so a pane whose hooks are not wired spends the whole window
+    /// waiting for an ACK that never comes. When it closes, the screen has
+    /// held the evidence since the submit. Before this, the next armed
+    /// timer was the 3000 checkpoint: a second and a half of nothing
+    /// looking, with receipt_block_ms (2500) expiring inside it.
+    #[tokio::test(start_paused = true)]
+    async fn tier2_opens_the_moment_the_hook_window_closes() {
+        let t0 = Instant::now();
+        let mut c = AckClock::new(t0, Some(ms(1500)));
+        assert_eq!(c.next_target(), Some((t0 + ms(1500), true)));
+
+        c.end_hook_phase(t0 + ms(1500));
+        assert_eq!(
+            c.next_target(),
+            Some((t0 + ms(1500), false)),
+            "tier 2 opened with a wait instead of a look"
+        );
+        // And the checkpoints the window did not cover still run.
+        c.advance_checkpoint();
+        assert_eq!(c.next_target(), Some((t0 + ms(3000), false)));
+        c.advance_checkpoint();
+        assert_eq!(c.next_target(), Some((t0 + ms(5000), false)));
+    }
+
+    /// Queued is a claim about the pane: nothing has been typed into it.
+    #[test]
+    fn a_receipt_calls_a_delivery_queued_only_before_the_paste() {
+        use DeliveryState::*;
+        for s in [Queued, Gating, RetryQueued] {
+            assert!(receipt_is_queued(s), "{s:?} is waiting on the recipient");
+        }
+        for s in [Pasting, Staged, Submitted] {
+            assert!(
+                !receipt_is_queued(s),
+                "{s:?} has the payload in the pane and may not report queued"
+            );
+        }
+        // Resolved states never reach the question.
+        for s in [
+            DeliveredVerified,
+            DeliveredUnverified,
+            AttentionRequired,
+            ParkedBlockedQuota,
+        ] {
+            assert!(receipt_resolved(s), "{s:?}");
+        }
+    }
+
+    /// The one gate cause a receipt can reach at send time says what it
+    /// means in words, and names the pane the fix is applied to.
+    #[test]
+    fn the_no_manifest_refusal_names_the_pane() {
+        assert_eq!(
+            attention_note("no_manifest", "%3").as_deref(),
+            Some("nothing detects %3")
+        );
+        // Everything else keeps printing the cause history already shows.
+        assert_eq!(attention_note("pane_dead", "%3"), None);
+        assert_eq!(attention_note("ack_timeout", "%3"), None);
     }
 
     // -----------------------------------------------------------------

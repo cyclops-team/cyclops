@@ -129,6 +129,31 @@ pub struct StatusResult {
     /// ignore it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_deliveries: Vec<OpenDelivery>,
+    /// The detection manifests this daemon is running on. Additive optional
+    /// field: old daemons omit it, old clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifests: Option<Manifests>,
+}
+
+/// What the daemon loaded for pane detection, and where from.
+///
+/// A pane no manifest binds reads `? unknown`, and a delivery to an unknown
+/// pane ends in attention_required. Two different problems wear that same
+/// label: the daemon holding no manifests at all, in which case nothing on
+/// the machine can be addressed, and a full set that binds nothing in one
+/// pane. The fixes are nothing alike, so a surface explaining an unknown
+/// pane has to be able to tell them apart.
+///
+/// Absence of the whole field is a daemon that predates it, which is not
+/// the same statement as `ids` being empty.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Manifests {
+    /// Loaded manifest ids, sorted, e.g. ["agy", "claude", "codex"].
+    /// Empty means every pane reads unknown.
+    pub ids: Vec<String>,
+    /// Directory they were read from. None when no directory was found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
 }
 
 /// One delivery still waiting on a human: redelivery exhausted, or a quota
@@ -496,5 +521,31 @@ mod tests {
         let back: OpenDelivery = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
         assert_eq!(back.state, crate::ledger::DeliveryState::ParkedBlockedQuota);
         assert_eq!(back.to, "implementer");
+    }
+
+    /// A daemon saying "I loaded none" and a daemon too old to say are two
+    /// different facts, and the surface that explains an unknown pane picks
+    /// a different next step for each. The wire has to keep them apart.
+    #[test]
+    fn a_silent_daemon_is_not_a_daemon_with_no_manifests() {
+        let old = r#"{"daemon_version":"0.1.0","proto":1,"boot_id":"b","uptime_ms":1,
+            "tmux_version":"3.6a","sessions":[]}"#;
+        let s: StatusResult = serde_json::from_str(old).expect("old status still decodes");
+        assert!(s.manifests.is_none(), "silence is not an empty set");
+
+        let none_loaded = r#"{"daemon_version":"0.1.0","proto":1,"boot_id":"b","uptime_ms":1,
+            "tmux_version":"3.6a","sessions":[],"manifests":{"ids":[]}}"#;
+        let s: StatusResult = serde_json::from_str(none_loaded).expect("decodes");
+        let m = s.manifests.expect("the daemon said so");
+        assert!(m.ids.is_empty());
+        assert!(m.dir.is_none());
+
+        let loaded = r#"{"daemon_version":"0.1.0","proto":1,"boot_id":"b","uptime_ms":1,
+            "tmux_version":"3.6a","sessions":[],
+            "manifests":{"ids":["agy","claude"],"dir":"/h/manifests"}}"#;
+        let s: StatusResult = serde_json::from_str(loaded).expect("decodes");
+        let m = s.manifests.expect("the daemon said so");
+        assert_eq!(m.ids, vec!["agy", "claude"]);
+        assert_eq!(m.dir.as_deref(), Some("/h/manifests"));
     }
 }

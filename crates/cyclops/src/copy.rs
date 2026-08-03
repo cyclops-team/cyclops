@@ -15,6 +15,67 @@ pub const NO_RECIPIENT: &str =
 pub const NO_AGENTS: &str =
     "No agents yet. Name a pane: cyclops name %1 reviewer  (cyclops status lists the panes)";
 
+/// Why a pane reads `? unknown`, and the next step.
+///
+/// The label alone has never been enough, because two different problems
+/// wear it and their fixes are nothing alike. cyclopsd holding no manifests
+/// at all is a broken install: nothing on the machine can be detected or
+/// delivered to, and it is fixed once for every pane. A full manifest set
+/// that binds nothing in one pane is one CLI cyclops has not been taught,
+/// and it is fixed for that pane. A delivery to an unknown pane ends in
+/// attention_required either way, which is why this is said before a
+/// message is sent rather than half a minute after.
+///
+/// `loaded` is the daemon's manifest ids: None from a daemon too old to
+/// say, which is not the same as an empty set and must not be reported as
+/// one.
+pub fn unknown_panes(
+    n: usize,
+    pane_id: &str,
+    label: Option<&str>,
+    loaded: Option<&[String]>,
+) -> String {
+    let head = if n == 1 {
+        "1 pane reads unknown".to_string()
+    } else {
+        format!("{n} panes read unknown")
+    };
+    let (why, next) = match loaded {
+        Some([]) => (
+            "cyclopsd loaded no detection manifests.".to_string(),
+            "Install them and restart: cyclops start, then restart cyclopsd.".to_string(),
+        ),
+        Some(ids) => (
+            format!("none of {} matches what is running there.", ids.join(", ")),
+            pin_a_manifest(pane_id, label),
+        ),
+        None => (
+            "no manifest matches what is running there.".to_string(),
+            pin_a_manifest(pane_id, label),
+        ),
+    };
+    format!("{head}: {why} Nothing can be delivered to an unknown pane. {next}")
+}
+
+/// The next step for a pane no manifest binds: pin one, or write one.
+/// `label` is the name the pane already answers to, so the command can be
+/// pasted whole instead of renaming the pane to a placeholder.
+fn pin_a_manifest(pane: &str, label: Option<&str>) -> String {
+    let name = label.unwrap_or("<label>");
+    format!(
+        "Pin one: cyclops name {pane} {name} --manifest <id>. Teaching cyclops a new CLI is one file: docs/MANIFESTS.md."
+    )
+}
+
+/// Said right after `cyclops name` when nothing binds the pane it just
+/// named. The name went on the roster and the border, and no message can
+/// reach it, which the receipt would otherwise report half a minute later.
+pub fn named_but_undetected(pane: &str, label: &str) -> String {
+    format!(
+        "nothing detects {pane} yet, so {label} can't receive a message. cyclops status names the manifests that are loaded; pin one with: cyclops name {pane} {label} --manifest <id>"
+    )
+}
+
 /// Humane duration for timeout copy: whole seconds as words, else ms.
 pub fn timeout_words(d: Duration) -> String {
     let ms = d.as_millis();
@@ -49,6 +110,33 @@ pub fn parked(to: &str, note: Option<&str>) -> String {
             "{to} is out of quota. The message is kept as parked; requeue it once the quota resets."
         ),
     }
+}
+
+/// Follow-up for a receipt that needs a human, said after the badge.
+///
+/// The badge names the state and the reason; a reader still has to be told
+/// what became of the message, because "⚠ needs attention" on its own does
+/// not say whether it was delivered. It was not. It is on the record, and
+/// `cyclops status` is where every waiting item is listed with what to do
+/// about it: a pane nothing detects gets the pin command there, with the
+/// manifest ids the daemon actually loaded in it.
+pub fn needs_attention(to: &str) -> String {
+    format!(
+        "{to} did not get this message. It is on the record and needs attention; cyclops status lists what is waiting on you and what to do about each one."
+    )
+}
+
+/// Follow-up for a receipt taken while the delivery is still in flight.
+///
+/// The payload is in the pane and cyclops is waiting on the evidence that
+/// the recipient took it. That is a real state and it gets its own word,
+/// so the sender is not told the message is queued when the pane already
+/// has it. What is missing is the confirmation, and it lands on the record
+/// with or without a reader, which is what this points at.
+pub fn in_flight(to: &str) -> String {
+    format!(
+        "the message is in {to}'s pane; cyclops is still waiting for the confirmation. It lands on the record either way: cyclops history shows the badge."
+    )
 }
 
 /// Empty history invites the next action. A filtered query names the agent
@@ -222,6 +310,37 @@ pub fn theme_not_saved(path: &std::path::Path, cause: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Three causes, three sentences, and the difference between them is
+    /// the whole point: an empty manifest set is fixed once for the
+    /// machine, a set that binds nothing in one pane is fixed for that
+    /// pane, and a daemon too old to say must be reported as neither.
+    #[test]
+    fn unknown_pane_copy_names_the_cause_and_the_fix() {
+        let ids = vec!["agy".to_string(), "claude".to_string()];
+        assert_eq!(
+            unknown_panes(1, "%4", None, Some(&[])),
+            "1 pane reads unknown: cyclopsd loaded no detection manifests. Nothing can be delivered to an unknown pane. Install them and restart: cyclops start, then restart cyclopsd."
+        );
+        assert_eq!(
+            unknown_panes(1, "%4", None, Some(&ids)),
+            "1 pane reads unknown: none of agy, claude matches what is running there. Nothing can be delivered to an unknown pane. Pin one: cyclops name %4 <label> --manifest <id>. Teaching cyclops a new CLI is one file: docs/MANIFESTS.md."
+        );
+        // A pane that already answers to a name keeps it, so the command
+        // is one a reader can paste instead of edit.
+        assert_eq!(
+            unknown_panes(2, "%4", Some("reviewer"), None),
+            "2 panes read unknown: no manifest matches what is running there. Nothing can be delivered to an unknown pane. Pin one: cyclops name %4 reviewer --manifest <id>. Teaching cyclops a new CLI is one file: docs/MANIFESTS.md."
+        );
+    }
+
+    #[test]
+    fn a_named_pane_nothing_detects_says_it_cannot_receive_yet() {
+        assert_eq!(
+            named_but_undetected("%0", "implementer"),
+            "nothing detects %0 yet, so implementer can't receive a message. cyclops status names the manifests that are loaded; pin one with: cyclops name %0 implementer --manifest <id>"
+        );
+    }
+
     #[test]
     fn not_running_copy_is_exact() {
         assert_eq!(
@@ -288,6 +407,24 @@ mod tests {
         assert_eq!(
             parked("reviewer", None),
             "reviewer is out of quota. The message is kept as parked; requeue it once the quota resets."
+        );
+    }
+
+    /// A badge that says a human is needed still has to say the message
+    /// did not arrive. Nothing else on the surface says it.
+    #[test]
+    fn attention_copy_says_the_message_did_not_arrive() {
+        assert_eq!(
+            needs_attention("worker"),
+            "worker did not get this message. It is on the record and needs attention; cyclops status lists what is waiting on you and what to do about each one."
+        );
+    }
+
+    #[test]
+    fn in_flight_copy_names_what_is_missing_and_where_to_look() {
+        assert_eq!(
+            in_flight("worker"),
+            "the message is in worker's pane; cyclops is still waiting for the confirmation. It lands on the record either way: cyclops history shows the badge."
         );
     }
 

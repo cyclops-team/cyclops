@@ -7,6 +7,39 @@ inspection), with the probe that proved it. The validation campaign's
 F1-F12 live in `~/projects/cyclops-arch/findings.md`; numbering here
 continues from F13.
 
+## Index
+
+What each finding constrains, in one line. Search for `## F<n>` to reach
+the measurement itself; the numbers are stable and never reused.
+
+**Nothing here has expired.** Every measurement below still constrains code
+in this tree today, which is why the file is long: it is not an archive.
+The two exceptions are marked: F13 is still true but a later finding
+changed what follows from it, and F30/F31 record a deliberate gap rather
+than a measurement.
+
+| | Constrains | Status |
+|---|---|---|
+| F13 | Subscriptions are the watcher's per-pane change signal, and bootstrap comes from `list-panes`, never from the subscription's first event | binds, amended by F25 |
+| F14 | Every tmux invocation passes `-u`, or replies come back with tabs and non-ASCII replaced by `_` | binds |
+| F15 | Anything reading pane output accepts `%extended-output` as well as `%output` | binds |
+| F16 | Reply correlation accepts a terminator only when the `%begin` command number matches, so pane text cannot truncate a reply | binds |
+| F17 | Bracketed paste cannot be the gate; post-paste composer verification is | binds |
+| F18 | Code adjusting socket timeouts mid-connection on macOS tolerates EINVAL once the peer has closed | binds |
+| F19 | Typed text versus ghost text is an SGR distinction, so the delivery gate reads escaped captures | binds |
+| F20 | A dialog whose own text says Escape cancels never receives Escape; trust prompts hold for a human | binds |
+| F21 | Manifest binding falls back to argv basenames when the kernel comm name is a version string | binds |
+| F22 | The control-mode reader reads bytes, not UTF-8 lines | binds |
+| F23 | One second is the title sensor's resolution floor, and fixtures hold a driven state across a tick | binds |
+| F24 | Scratch paths come from `cyclops_proto::scratch`, and CI runs `--no-fail-fast` with `fail-fast: false` | binds |
+| F25 | Pane death is reported only by the all-panes subscription, and an empty `pane_pid` parses as -1 | binds |
+| F26 | Cyclops writes the pane border and never the pane title | binds |
+| F27 | Border chrome is a per-pane format plus a window-scoped status, and costs each pane a row, so layout ratios measure panes and not the window | binds |
+| F28 | Workspaces build at the terminal's size, because tmux spreads a resize evenly rather than in proportion | binds |
+| F29 | A script matching daemon output textually matches one field, or uses `jq` | binds |
+| F30, F31 | Never allocated. The gap is deliberate and the numbers stay unused | bookkeeping |
+| F32 | A theme reload applies whole or not at all: a file that stops setting a token it set before is refused | binds |
+
 ## F13. refresh-client -B subscriptions work in control mode on tmux 3.6a (MEASURED)
 
 Subscribing `name:%pane:#{pane_title}\t#{pane_dead}\t#{pane_in_mode}\t#{pane_current_command}`

@@ -702,6 +702,13 @@ pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResul
         tmux_version: inner.tmux_version.clone(),
         sessions,
         open_deliveries,
+        // Always answered, empty set included: "I loaded none" is the fact
+        // a client needs to explain an unknown pane, and it is exactly the
+        // fact an omitted field would hide.
+        manifests: Some(cyclops_proto::Manifests {
+            ids: inner.manifests.keys().cloned().collect(),
+            dir: inner.manifest_dir.as_ref().map(|d| d.display().to_string()),
+        }),
     }
 }
 
@@ -850,6 +857,7 @@ mod tests {
             started: Instant::now(),
             tmux_version: "3.6a".into(),
             manifests: BTreeMap::new(),
+            manifest_dir: None,
             sessions: Vec::new(),
             events: broadcast::channel(16).0,
             detections: StdMutex::new(HashMap::<String, DetEntry>::new()),

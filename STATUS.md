@@ -1,11 +1,12 @@
 # Status
 
-Updated 2026-08-03. M5 is complete and committed: three themes with stated
-contrast, `cyclops theme`, hardened hot reload, docs polish, and a README
-quickstart on the progressive ladder. F25 is fixed in the same commit, so
-the tmux-HEAD CI job is green again after being red all through M3 and M4.
-555 tests across 61 targets, CI green on Linux and macOS, and v2 is main.
-Next is M6, the handoff milestone, which is now the one that matters most.
+Updated 2026-08-03. M6 is complete and committed: the first run works now,
+and the system is documented for someone who is not its author. A reviewer
+working only from the docs could build it, explain how a message becomes a
+verified receipt, write a manifest for a CLI that does not exist and watch a
+pane bind to it, debug a stuck delivery, and list the invariants. 577 tests
+across 63 targets, parity 93/93, CI green, v2 is main. Next is the installer,
+then M7 flow features.
 One thing still waits on admin: the v1 cutover.
 
 ## Done
@@ -252,6 +253,41 @@ One thing still waits on admin: the v1 cutover.
     A syntax error was the only thing the loader used to treat as a
     failure, so the failure it guarded against was the one that never
     happens.
+
+- M6 handoff (this commit). Two halves, one goal: a person who is not the
+  author can install this, use it, and then maintain it.
+  - The first run was broken and the admin hit it. `cyclops start` reported
+    success, cyclopsd logged "no manifest directory found" where nobody
+    sees it, `status` said "? unknown" without saying why, and the message
+    died 24s later as "needs attention · no manifest". The manifests only
+    existed in a clone, so an installed binary had none. They are now
+    compiled into the CLI and seeded into the cyclops home on every start,
+    never clobbering a file already there, and the daemon falls back to
+    that directory. Nothing reports success while the thing it set up
+    cannot work: start, status and name each say so, and the daemon's
+    warning reaches the record instead of only a log.
+  - A real defect underneath it, found by measurement: at shipped defaults
+    no unhooked agent could ever land a badge on a receipt. ack_timeout_ms
+    (1500ms) was the only armed timer during the tier-1 window, so nothing
+    looked at the pane at all, and the ladder resumed at submit+3000ms
+    while receipt_block_ms closed the window at 2500ms. Tier 2 now opens
+    with an immediate evidence pass. Note for the record: the orchestrator
+    measured this case with a fixture manifest declaring no ack hook, got
+    a healthy 0.43s delivery, and wrongly told an agent the finding was a
+    misdiagnosis. Both shipped CLI manifests declare an ack, so the
+    defective path was the default one.
+  - A send to a recipient nothing detects no longer reports a success
+    shape. It says what happened, names the pin command, and exits 1, so a
+    script branching on exit 0 cannot read it as delivered.
+  - docs/HANDOFF.md, docs/INVARIANTS.md and docs/CONTRIBUTING.md are new
+    and reachable from README; findings.md gained an index. ARCHITECTURE
+    opened by pointing newcomers at two files that do not exist in this
+    repo, which is fixed, and the checker that caught it is adopted as a
+    task rather than left in a scratch directory.
+  - The parity gate gained a shipped-defaults leg with no hooks and no
+    tuning, plus a guard asserting that leg's config stays untuned. Every
+    defect above lived behind a gate that only ever tested the
+    configured-perfectly path. 93/93.
 
 ## ADMIN_ACTION_REQUIRED (not blocking the build)
 

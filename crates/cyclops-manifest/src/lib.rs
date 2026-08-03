@@ -5,9 +5,23 @@
 //! the modal vocabulary with explicit decline actions, and how to inject.
 //! Seeded from the 2026-08-01 validation campaign's measured drafts.
 //!
-//! Hot reload is the daemon's job; this crate parses, validates, and
-//! evaluates. Unknown TOML keys are tolerated so manifests can carry
-//! evidence notes the code does not model.
+//! This crate parses, validates, compiles and EVALUATES a manifest: given
+//! a title or a screen region, which rule matches, and at what priority.
+//! Unknown TOML keys are tolerated so manifests can carry evidence notes
+//! the code does not model.
+//!
+//! What it does not own, and each of these has bitten somebody:
+//!
+//! - Which sensor gets consulted, and what a tier disagreement means.
+//!   That is fusion (`cyclopsd/src/fusion.rs`). This crate answers "does
+//!   this text match", never "should you have looked".
+//! - Reading the screen. Nothing here captures a pane or touches tmux.
+//! - Loading the files. The daemon reads the directory once at boot into
+//!   an immutable map, so editing a manifest takes a daemon restart. There
+//!   is no hot reload; a previous version of this header said there was.
+//! - Acting on a rule. A `decline_keys` list is data; sending those keys
+//!   is the delivery gate's, and it is the gate that decides whether a
+//!   modal may be dismissed at all.
 //!
 //! Two schema fields exist for vendor quirks that plain text cannot express:
 //! `agent.argv_basenames` (bind by pane argv when the kernel comm name is

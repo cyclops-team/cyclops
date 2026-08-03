@@ -621,6 +621,7 @@ mod tests {
                 panes,
             }],
             open_deliveries: open,
+            manifests: None,
         }
     }
 

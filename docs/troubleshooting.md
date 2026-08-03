@@ -17,6 +17,25 @@ The workspace commands (`start`, `workspace save|restore`) work without a
 daemon, they just cannot name panes or count agents. That is what a light
 `✓` on their output line means.
 
+## "lost the connection to cyclops: path must be shorter than SUN_LEN"
+
+```
+$ cyclops status
+lost the connection to cyclops: path must be shorter than SUN_LEN. Check that cyclopsd is still running, then retry.
+```
+
+Ignore the next step on that line; no restart can help. `$CYCLOPS_HOME` is
+deep enough that `$CYCLOPS_HOME/sock` does not fit in a Unix socket
+address, so `cyclopsd` never bound and never will. Run it in the foreground
+once and it says the same thing about itself:
+
+```
+boot failed: bind /some/very/deep/path/.cyclops/sock: path must be shorter than SUN_LEN
+```
+
+Put the home somewhere shorter and start the daemon again. The cap and the
+byte counts are in [install.md](install.md).
+
 ## A pane reads `? unknown`
 
 ```
@@ -38,6 +57,39 @@ reading it and will not deliver to it. Three causes, in order of likelihood:
    daemon's log for `manifests loaded dir=... count=N`. Count 0, or no line
    at all, means the directory was empty, missing, or one file failed to
    parse and took the rest with it. See [MANIFESTS.md](MANIFESTS.md).
+
+## A send says "● queued · 0 ahead"
+
+```
+$ cyclops send implementer --subject "hello"
+● queued · 0 ahead
+```
+
+Read the number first. It is a queue position, so `0 ahead` means nothing
+is in front of this message. Queued is not a backlog here. It is the daemon
+saying the recipient could not take input at the instant you asked, and
+answering with where the message stood rather than guessing.
+
+On a first message the cause is almost always the one above: no manifest
+binds that pane. Cyclops will not type into a pane it cannot read, so the
+delivery holds in the gate and ends up needing a human:
+
+```
+$ cyclops history
+  40s  admin → implementer  hello  ⚠ needs attention · no manifest
+```
+
+Fix the binding, not the receipt. `cyclops status` names what is loaded and
+what to pin; the `? unknown` entry above is the whole of it. Hooks are a
+different axis and do not help: they upgrade a delivered receipt from
+screen evidence to hook-verified, and a pane nothing detects never gets
+that far.
+
+Every other reason clears itself. A recipient mid-turn, a human typing in
+that pane, or a dialog waiting on a human decision all take the message in
+order once the pane is ready. A receipt is the state at the instant you
+asked; `cyclops history` is where each delivery actually ended up.
+[send.md](send.md).
 
 ## "no manifest \"cluade\"; loaded: agy, claude, codex"
 

@@ -22,6 +22,14 @@
 //! The vocabulary is exactly what the renderers paint. A token no renderer
 //! resolves would load in silence and change nothing, which is the same
 //! lie as a stale doc, so it does not get to live here (see [`tokens`]).
+//!
+//! What it does not own: any layout, any glyph, and any word. A state's
+//! check mark, its name, and the column it sits in are `cyclops_ui::grid`
+//! and the CLI's renderers; this crate says only what color that cell
+//! takes. It also writes nothing: `cyclops theme <name>` writes the config
+//! key and the daemon repaints borders, both outside here. Reload is a
+//! stat that rides an event a caller was already handling
+//! ([`ThemeWatch`]), never a watcher thread and never a timer.
 
 mod select;
 

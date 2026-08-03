@@ -1,13 +1,46 @@
 //! cyclops: the thin CLI client for cyclopsd.
 //!
-//! Speaks NDJSON over the daemon's Unix socket (cyclops-proto) and renders
-//! for humans. M0 surface: status, ping, read, watch. M1 adds send and the
-//! hook receiver vendor hook configs invoke.
+//! ## What it owns
+//!
+//! Two jobs, and nothing between them. It speaks NDJSON over the daemon's
+//! Unix socket (`client.rs`, types from `cyclops-proto`), and it renders
+//! what comes back for a human (`render.rs` layout, `style.rs` color,
+//! `copy.rs` words). Every verb takes `--json` and then prints exactly the
+//! socket answer, which is the promise the rendering exists to be optional
+//! against. `cyclops ui` is the one verb with no `--json`; the machine
+//! stream is `cyclops watch --json`.
+//!
+//! Three things here are not that shape and say why:
+//!
+//! - `hook.rs`, the receiver vendor hook configs invoke. It runs inside a
+//!   vendor's hook budget, so it is fast, silent, and exits 0 regardless.
+//! - `hookset.rs`, which renders vendor hook configs and never writes into
+//!   a vendor dot-dir.
+//! - `workspace.rs`, the only place this binary reaches tmux, and it does
+//!   that through `cyclops_tmux::layout`. What is left here is files, the
+//!   config keys, the daemon round trips, and the copy.
+//!
+//! ## What it does not own
+//!
+//! - Any decision. A verb asks the daemon and prints the answer; it does
+//!   not compute state, and it does not judge what needs a human (that is
+//!   `cyclops_proto::attention`, which `render.rs` reads).
+//! - The stream. `cyclops ui` dispatches into `cyclops-ui`.
+//! - The voice of a state cell, a badge, or the clock gutter. Those are
+//!   `cyclops_ui::grid`, which this crate calls rather than copies. A copy
+//!   lived here once and drifted.
+//! - Any color value. Every paint is a `cyclops-theme` token.
+//!
+//! Verbs, by the milestone that added them: `ping`, `status`, `read`,
+//! `watch` (M0); `send`, `hook` (M1); `history`, `thread`, `wait`,
+//! `send --wait`, `hooks install|verify|selftest` (M2); `ui` (M3); `name`,
+//! `list`, `start`, `workspace save|restore` (M4); `theme` (M5).
 
 mod client;
 mod copy;
 mod hook;
 mod hookset;
+mod manifests;
 mod render;
 mod style;
 mod theme;
@@ -838,10 +871,21 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
     if !waits.is_empty() {
         println!("{}", render::render_wait_entries(&waits, style));
     }
-    // Parked recipients get the reset hint and next step spelled out.
+    // A badge is a state, not an outcome. Every receipt that is not a
+    // delivery gets one line saying what became of the message, because
+    // that is the sentence a sender is actually looking for.
     for d in &receipt.deliveries {
-        if d.state == DeliveryState::ParkedBlockedQuota {
-            eprintln!("{}", copy::parked(&d.to, d.note.as_deref()));
+        match d.state {
+            DeliveryState::ParkedBlockedQuota => {
+                eprintln!("{}", copy::parked(&d.to, d.note.as_deref()));
+            }
+            DeliveryState::AttentionRequired => eprintln!("{}", copy::needs_attention(&d.to)),
+            // Past the paste and still unresolved: the pane has the
+            // payload and the confirmation is outstanding.
+            DeliveryState::Pasting | DeliveryState::Staged | DeliveryState::Submitted => {
+                eprintln!("{}", copy::in_flight(&d.to));
+            }
+            _ => {}
         }
     }
     receipts_exit(&receipt.deliveries)

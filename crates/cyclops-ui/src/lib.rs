@@ -14,6 +14,24 @@
 //!
 //! Zero polling: the subscription pushes, backfill reads once, the eye
 //! arms a single one-shot timer per transition. No intervals anywhere.
+//!
+//! ## What it owns beyond the stream
+//!
+//! [`grid`] is the product's one voice for a timestamp gutter, a state
+//! cell, a delivery badge and a cause word. The CLI calls it rather than
+//! holding a copy, because it held a copy once and the two drifted while
+//! both were green.
+//!
+//! ## What it does not own
+//!
+//! - What needs a human. The register and the rule are
+//!   `cyclops_proto::attention`; this crate feeds it the two things it
+//!   accepts and asks it for the count.
+//! - Any color value. Every paint names a `cyclops-theme` token, and the
+//!   state-to-group mapping is that crate's too.
+//! - The daemon. It reads `events.subscribe` and one `status`, asks
+//!   nothing else, and jumps focus through `cyclops_tmux::focus_pane`,
+//!   which is the only tmux call anywhere near it.
 
 mod app;
 mod data;

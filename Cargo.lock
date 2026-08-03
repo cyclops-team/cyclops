@@ -143,6 +143,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "cyclops-manifest",
  "cyclops-proto",
  "cyclops-testrig",
  "cyclops-theme",

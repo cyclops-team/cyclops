@@ -1,19 +1,47 @@
 # Two agents and a review gate
 
-Wire two agents, pass reviewed work between them, and read it back months
-later. About ten minutes, most of it waiting for agents.
+Install cyclops, wire two agents, pass reviewed work between them, and read
+it back months later. About ten minutes, most of it waiting for agents.
 
-The README ladder is the short version. This is the same walk with the
-handoff in the middle, which is the thing Cyclops is for.
+The README ladder is the short version. This is the same walk from a bare
+machine, with the handoff in the middle, which is the thing Cyclops is for.
 
 Output here is real, captured by
 [`demos/parity-check.sh`](../demos/parity-check.sh) on a throwaway tmux
 server. Three things are edited and nothing else: the home directory is
 shortened to `~/.cyclops`, color is off, and a `Next:` block already shown
-once is left out the second time. Message ids and clock values belong to
-that run; yours will differ there and nowhere else.
+once is left out the second time.
 
-## 1. Open the workspace
+Some of it follows your machine rather than that run: message ids and clock
+values, the pane ids tmux hands out (`%0`, `%1`), the home directory in
+`command -v` output, the shell a status row names for a pane running one
+(`bash` below, `zsh` on plenty of machines), and the tmux version and
+loaded-manifest list the daemon reports in `cyclops status`. Everything
+else should match line for line.
+
+## 1. Install
+
+```bash
+git clone https://github.com/cyclops-team/cyclops.git && cd cyclops
+cargo install --path crates/cyclops
+cargo install --path crates/cyclopsd
+```
+
+Then check your shell can see both:
+
+```
+$ command -v cyclops cyclopsd
+/Users/you/.cargo/bin/cyclops
+/Users/you/.cargo/bin/cyclopsd
+```
+
+Nothing back means `~/.cargo/bin` is not on your PATH, which is common.
+[install.md](install.md) has the line to add for zsh and bash, and how to
+install somewhere else instead.
+
+Nothing below needs the repo. Run it from wherever you work.
+
+## 2. Open the workspace
 
 `duo` is two panes side by side, one implementer and one reviewer.
 
@@ -21,6 +49,7 @@ that run; yours will differ there and nowhere else.
 $ cyclops start --preset duo
 ✓ workspace ready · 2 agents
   wrote ~/.cyclops/config.toml
+  wrote 3 detection manifests to ~/.cyclops/manifests
 
 Next:
   1  cyclopsd &                                  start the daemon
@@ -28,7 +57,13 @@ Next:
   3  cyclops send implementer --subject "hello"  send the first message
 ```
 
-Do those in order. `cyclopsd &` from anywhere; it reads
+Two files, both needed. The config says which tmux session to watch. The
+manifests are how cyclops tells what is running in a pane, and nothing can
+be delivered to a pane it cannot read. Your edits to them survive later
+runs; [install.md](install.md) covers what happens when the shipped set
+gains one.
+
+Do the steps in order. `cyclopsd &` from anywhere; it reads
 `~/.cyclops/config.toml`, which `start` just wrote. Then attach, and start
 one agent CLI in each pane the way you normally would.
 
@@ -43,7 +78,7 @@ $ cyclops start
 The heavy check means the daemon confirmed the roster. A light `✓` means it
 could not be asked and the count came from the workspace file.
 
-## 2. Check the roster
+## 3. Check the roster
 
 ```
 $ cyclops list
@@ -55,9 +90,26 @@ Three columns: the name, how the agent is doing, and what it is on. Both
 names came from the preset. `duo` carries them, and `cyclops start` put them
 on the panes it built.
 
-If a pane reads `? unknown`, no manifest matched the process in it. Pin one
-by hand with `--manifest claude` when you name it, or write one:
-[MANIFESTS.md](MANIFESTS.md).
+### When a pane reads unknown
+
+`? unknown` is not a state an agent is in. It is cyclops unable to read one,
+and a message to that pane will end up needing a human. `cyclops status`
+says which of the two causes it is:
+
+```
+$ cyclops status
+‿ cyclops · watching main · tmux 3.6a · up 2s
+
+  %0  ? unknown  bash
+  %1  ? unknown  bash
+
+  2 panes read unknown: none of agy, claude, codex matches what is running there. Nothing can be delivered to an unknown pane. Pin one: cyclops name %0 <label> --manifest <id>. Teaching cyclops a new CLI is one file: docs/MANIFESTS.md.
+```
+
+Manifests loaded and none of them matching, as here, is one CLI cyclops has
+not been taught: pin one, or write one ([MANIFESTS.md](MANIFESTS.md)). The
+other sentence, `cyclopsd loaded no detection manifests`, is the whole
+install and is fixed once, with `cyclops start` and a daemon restart.
 
 ### Naming a pane yourself
 
@@ -86,7 +138,7 @@ Names are addresses, so they are unique across every watched session.
 Naming is always explicit: cyclops never adopts a pane because it looks like
 an agent. [panes.md](panes.md).
 
-## 3. Wire the hooks
+## 4. Wire the hooks
 
 Skip this and everything still works; deliveries land verified by screen
 evidence instead of by the agent's own hook. Wiring takes a minute and
@@ -101,7 +153,7 @@ Install never writes into a vendor config directory. It prepares files under
 `~/.cyclops/hooks/` and tells you the one command to wire each CLI. The codex
 directory-trust trap and the agy caveat are in [hooks.md](hooks.md).
 
-## 4. The handoff
+## 5. The handoff
 
 The implementer finishes something and hands it to the reviewer. This is run
 in the implementer's own pane, by you or by the agent itself, and its receipt
@@ -141,7 +193,7 @@ That is the gate: work does not move until a message with a verdict moves
 with it, and both halves are on the record with the delivery evidence
 attached.
 
-## 5. Make the gate blocking
+## 6. Make the gate blocking
 
 The handoff above is fire and forget. To hold until the reviewer has
 actually finished the turn your message started, wait for it:
@@ -155,19 +207,30 @@ started, never a turn that predates it, and it is pinned to the pane
 occupant the message was submitted to. Exit codes and the pinning rule:
 [wait.md](wait.md).
 
-A script gate around it:
+A script gate around it has to read two answers, because the exit code is
+only the first one:
 
 ```bash
-cyclops send reviewer --subject "Review $BRANCH" --body-file diff.txt --wait done --timeout 10m
-cyclops --json history --with reviewer --limit 1 | jq -r '.lines[0].subject'
+set -e
+cyclops send reviewer --subject "Review $BRANCH" --body-file diff.txt \
+  --wait done --timeout 10m --json > receipt.json
+jq -e '.wait[0].outcome == "reached"' receipt.json > /dev/null
 ```
 
 The exit code follows the delivery, not the wait: 0 delivered or queued, 1
-parked or needing a human, 2 a usage error. Scripts that branch on the wait
-outcome read `--json`, where every wait entry carries `{outcome, state,
-waited_ms, delivery}`.
+parked or needing a human, 2 a usage error. So a message that landed and
+then ran out of wait budget still exits 0, and `set -e` alone lets the
+script march on as if the review had happened. The `jq -e` line is the half
+that gates: it stops on anything but a finished turn.
 
-## 6. Audit it later
+There is one wait entry per recipient, each `{to, outcome, state,
+waited_ms, delivery}`. `outcome` is `reached`, `timeout`,
+`occupant_changed` when the pane's occupant changed mid-wait, or
+`not_delivered` when the delivery never got far enough to start a turn. A
+gate that wants to tell those apart branches on that field instead of
+testing it against one value.
+
+## 7. Audit it later
 
 The record is a file per watched session, one JSON object per line, never
 rewritten. It does not need a daemon to read:
@@ -187,6 +250,7 @@ writes: any agent may query the whole record.
 
 ## What to read next
 
+- [install.md](install.md) for PATH, config keys, and the manifests
 - [send.md](send.md) for receipts, broadcast, and quota parking
 - [history.md](history.md) for filters, threads, and paging a long record
 - [ui.md](ui.md) for the live stream
