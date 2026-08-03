@@ -269,10 +269,20 @@ struct UiArgs {
 #[derive(clap::Args)]
 struct NameArgs {
     /// The pane to name: a tmux pane id like %4, or the name it has now.
-    target: String,
+    /// With --self this is the name instead, because the pane is this one.
+    #[arg(required_unless_present = "self_")]
+    target: Option<String>,
     /// What to call it, e.g. reviewer. Omit with --clear.
-    #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+    #[arg(
+        required_unless_present_any = ["clear", "self_"],
+        conflicts_with_all = ["clear", "self_"],
+    )]
     label: Option<String>,
+    /// Name the pane this command is running in: `cyclops name reviewer
+    /// --self`. For an agent that registers itself on startup, and for
+    /// naming the pane you are sitting in without looking up its id.
+    #[arg(long = "self", id = "self_", conflicts_with = "clear")]
+    self_: bool,
     /// Which agent CLI is in this pane (claude, codex, agy). Skip it and
     /// cyclops works it out from the running process.
     #[arg(long, conflicts_with = "clear")]
@@ -517,8 +527,28 @@ fn run(cli: &Cli) -> i32 {
                     dest,
                 },
         } => hookset::run_install(*kind, agent, *dry_run, dest.as_deref(), cli.json),
+        // Which pane, and what to call it, are settled before anything
+        // connects: a name nobody can use is a usage error, and the rule
+        // above says those must not hide behind a down daemon.
+        Cmd::Name(args) => {
+            let (target, label) = match resolve_name(args) {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            let mut c = match connect() {
+                Ok(c) => c,
+                Err(code) => return code,
+            };
+            cmd_name(
+                &mut c,
+                cli,
+                &style_for(cli),
+                args,
+                &target,
+                label.as_deref(),
+            )
+        }
         Cmd::Status
-        | Cmd::Name(_)
         | Cmd::List
         | Cmd::Ping
         | Cmd::Read { .. }
@@ -533,7 +563,6 @@ fn run(cli: &Cli) -> i32 {
             let style = style_for(cli);
             match &cli.cmd {
                 Cmd::Status => cmd_status(&mut c, cli, &style),
-                Cmd::Name(args) => cmd_name(&mut c, cli, &style, args),
                 Cmd::List => cmd_list(&mut c, cli, &style),
                 Cmd::Ping => cmd_ping(&mut c, cli, &style),
                 Cmd::Read {
@@ -552,6 +581,7 @@ fn run(cli: &Cli) -> i32 {
                 } => hookset::run_selftest(&mut c, cli.json, &style, target),
                 Cmd::Send(_)
                 | Cmd::Hook { .. }
+                | Cmd::Name(_)
                 | Cmd::Wait { .. }
                 | Cmd::Hooks { .. }
                 | Cmd::Ui(_)
@@ -651,16 +681,60 @@ fn cmd_status(c: &mut Client, cli: &Cli, style: &Style) -> i32 {
 /// format back is the daemon's half, it happens only while the daemon can
 /// still reach the pane, and this line must never be read as having
 /// confirmed it: see `--clear`'s help.
-fn cmd_name(c: &mut Client, cli: &Cli, style: &Style, args: &NameArgs) -> i32 {
+/// Which pane `cyclops name` is about, and what it will be called.
+///
+/// Runs before the daemon is asked anything, because both answers are
+/// knowable here and a bad one is a usage error.
+///
+/// `--self` moves the positional along: the pane is this one, so the
+/// single argument is the name. tmux puts the pane id in the environment
+/// of every process it starts, which is how a pane knows which one it is
+/// without asking anybody.
+fn resolve_name(args: &NameArgs) -> Result<(String, Option<String>), i32> {
+    let (target, label) = if args.self_ {
+        match std::env::var("TMUX_PANE") {
+            Ok(p) if !p.is_empty() => (p, args.target.clone()),
+            _ => {
+                eprintln!(
+                    "--self names the pane this command is running in, and this \
+                     shell is not in one. Run it inside tmux, or name the pane by \
+                     id: cyclops name %0 {}.",
+                    args.target.as_deref().unwrap_or("<name>")
+                );
+                return Err(EXIT_USAGE);
+            }
+        }
+    } else {
+        (args.target.clone().unwrap_or_default(), args.label.clone())
+    };
+
+    // Same rule and same sentence as the daemon: cyclops_proto::label.
+    if !args.clear {
+        if let Some(why) = label.as_deref().and_then(cyclops_proto::label::refusal) {
+            eprintln!("{why}");
+            return Err(EXIT_USAGE);
+        }
+    }
+    Ok((target, label))
+}
+
+fn cmd_name(
+    c: &mut Client,
+    cli: &Cli,
+    style: &Style,
+    args: &NameArgs,
+    target: &str,
+    label: Option<&str>,
+) -> i32 {
     let params = json!({
-        "target": args.target,
-        "label": if args.clear { Value::Null } else { json!(args.label) },
+        "target": target,
+        "label": if args.clear { Value::Null } else { json!(label) },
         "manifest": args.manifest,
     });
     let result = match c.request("pane.label", params) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("{}", copy::client_error(&e, Some(&args.target)));
+            eprintln!("{}", copy::client_error(&e, Some(target)));
             return 1;
         }
     };

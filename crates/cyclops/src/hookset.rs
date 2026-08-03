@@ -150,15 +150,14 @@ pub fn run_install(
     dest: Option<&Path>,
     json: bool,
 ) -> i32 {
-    if label.is_empty() || label == "*" || label == "admin" || label.starts_with('%') {
+    // The same rule the daemon enforces, from the same place, so the two
+    // never disagree about which names exist (cyclops_proto::label).
+    if let Some(why) = cyclops_proto::label::refusal(label) {
         // Dead ends invite the next action: name the pane, then come back.
-        let config = cyclops_proto::cyclops_home().join("config.toml");
         eprintln!(
-            "--agent needs a real label; {label:?} is reserved. Name the pane \
-             first: cyclops status shows every pane and its label, and {} \
-             names the watched sessions. Then rerun cyclops hooks install \
-             with that label.",
-            config.display()
+            "--agent needs a name a pane can answer to. {why} \
+             cyclops status shows every pane and its label; name one, then \
+             rerun cyclops hooks install with that name."
         );
         return EXIT_USAGE;
     }

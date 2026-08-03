@@ -146,14 +146,16 @@ fn install_reserved_label_names_the_naming_step() {
     for reserved in ["%4", "*", "admin"] {
         let out = run(&home, &["hooks", "install", "claude", "--agent", reserved]);
         assert_eq!(out.status.code(), Some(2), "{reserved} must be refused");
-        let expected = format!(
-            "--agent needs a real label; {reserved:?} is reserved. Name the pane \
-             first: cyclops status shows every pane and its label, and {} \
-             names the watched sessions. Then rerun cyclops hooks install \
-             with that label.",
-            home.join("config.toml").display()
+        let err = String::from_utf8_lossy(&out.stderr);
+        // The wording belongs to cyclops_proto::label, which has its own
+        // tests for saying why and offering a way out. What this asserts
+        // is that the refusal reaches the operator through this verb, and
+        // carries the step that gets them out of it.
+        assert!(
+            err.contains(&cyclops_proto::label::refusal(reserved).expect("refused")),
+            "{reserved} refusal did not carry the shared reason: {err}"
         );
-        assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), expected);
+        assert!(err.contains("cyclops status"), "{reserved}: {err}");
         assert!(out.stdout.is_empty(), "refusal must not print wiring");
         assert!(!home.join("hooks").exists(), "refusal must not write");
     }

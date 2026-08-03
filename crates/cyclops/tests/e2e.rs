@@ -1483,3 +1483,74 @@ fn hooks_verify_without_manifest_reads_no_hooks_declared() {
     );
     let _ = fs::remove_dir_all(&home);
 }
+
+/// A name nobody could address is a usage error, so it must arrive
+/// without a daemon in the way. This is the rule the dispatch comment in
+/// main.rs states, and `cyclops name` broke it when the check moved.
+///
+/// The wording lives in cyclops_proto::label and is tested there; what
+/// this pins is that the CLI reaches it, exits 2, and never opens a
+/// socket to find out.
+#[test]
+fn a_reserved_name_is_refused_without_a_daemon() {
+    let home = scratch_home("name-reserved");
+    for reserved in ["admin", "*", "%9"] {
+        let out = run_cyclops(&home, &["name", "%0", reserved, "--plain"]);
+        assert_eq!(out.status.code(), Some(2), "{reserved} must be refused");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains(&cyclops_proto::label::refusal(reserved).expect("refused")),
+            "{reserved}: {err}"
+        );
+        // The connect error would name the daemon. Seeing it here means
+        // the refusal happened too late to be useful.
+        assert!(
+            !err.contains("cyclopsd"),
+            "{reserved} asked the daemon: {err}"
+        );
+    }
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// `--self` names the pane the command runs in, which is how an agent
+/// registers itself on startup without being told its own pane id.
+#[test]
+fn self_names_the_calling_pane_and_says_so_when_there_is_none() {
+    let home = scratch_home("name-self");
+
+    // Outside tmux there is no pane to name. The refusal carries the way
+    // to do it anyway, with the name the operator already typed.
+    let out = run_cyclops_io(&home, &[], &["name", "picked", "--self", "--plain"], None);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not in one"), "{err}");
+    assert!(err.contains("cyclops name %0 picked"), "{err}");
+
+    // Inside one, the pane id comes from the environment tmux sets, and
+    // the positional is the name. With no daemon this gets as far as the
+    // connection and no further, which is enough to prove the argument
+    // was read as a name rather than as a target.
+    let out = run_cyclops_io(
+        &home,
+        &[("TMUX_PANE", "%7")],
+        &["name", "picked", "--self", "--plain"],
+        None,
+    );
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "--self inside tmux is not a usage error"
+    );
+
+    // And a reserved name is still refused through --self.
+    let out = run_cyclops_io(
+        &home,
+        &[("TMUX_PANE", "%7")],
+        &["name", "admin", "--self", "--plain"],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("is you"));
+
+    let _ = fs::remove_dir_all(&home);
+}

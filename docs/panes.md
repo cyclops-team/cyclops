@@ -7,6 +7,7 @@ its name; `cyclops list` shows the roster.
 
 ```
 cyclops name %4 reviewer          # this pane is now "reviewer"
+cyclops name reviewer --self      # name the pane you are sitting in
 cyclops name %4 reviewer --manifest claude
 cyclops name reviewer --clear     # take the name back
 cyclops list
@@ -14,6 +15,25 @@ cyclops list
 
 `cyclops status` lists every pane cyclops watches, with its pane id.
 That is where the `%4` comes from.
+
+`--self` skips that lookup: it names the pane the command is running in,
+taking the id from `$TMUX_PANE`, which tmux sets in every process it
+starts. It is the form an agent uses to register itself on startup, and
+the one to use when you are already sitting in the pane you mean. Outside
+tmux there is no pane to name, and it says so.
+
+## Three names a pane cannot have
+
+```
+$ cyclops name %4 admin
+"admin" is you. Every message you send from a terminal is from "admin", so a pane called that could not be told apart from you on the record. Pick another name, e.g. lead.
+```
+
+`admin` is your own identity on the record. `*` addresses every agent at
+once. Anything starting with `%` is a tmux pane id, which cyclops accepts
+anywhere it accepts a name, so a pane called `%9` could mean two panes.
+Each refusal says which of the three it is and what to use instead; none
+of them is a rule you have to remember in advance.
 
 To watch the whole thing run against an isolated tmux server, without
 touching your own sessions: `./demos/m4-name.sh`.

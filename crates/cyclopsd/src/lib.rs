@@ -546,18 +546,12 @@ pub(crate) async fn label_pane(
     let session = inner.sessions[session_idx].name.clone();
     let label = label.filter(|l| !l.is_empty());
 
-    // 2. Validate the label.
+    // 2. Validate the label. The rule and its wording are
+    //    cyclops_proto::label, so every surface refuses the same names
+    //    with the same sentence.
     if let Some(l) = &label {
-        if l == "*" || l == "admin" || l.starts_with('%') {
-            return Err(bad_request(format!("label {l:?} is reserved")));
-        }
-        // A control character cannot survive onto a tmux command line
-        // (quote_arg strips newlines), so the border would wear a
-        // different name than the ledger. One name per pane, everywhere.
-        if l.chars().any(char::is_control) {
-            return Err(bad_request(format!(
-                "label {l:?} has a control character in it"
-            )));
+        if let Some(why) = cyclops_proto::label::refusal(l) {
+            return Err(bad_request(why));
         }
         if inner
             .registry
