@@ -85,21 +85,27 @@ roster_has() { "$CYC" --json list | jq -e --arg a "$1" '[.agents[].agent] | inde
 roster_empty() { "$CYC" --json list | jq -e '.agents | length == 0' >/dev/null; }
 all_idle() { "$CYC" --json list | jq -e '[.agents[].state] | all(. == "idle")' >/dev/null; }
 
-# Every delivery the record knows about has stopped moving, AND the record
-# holds the number of messages we are waiting for. Badges are read from the
-# record, so a read taken mid-flight shows a legal in-flight state and the
-# transcript stops being reproducible.
+# One named message has reached the record AND every delivery it carries
+# has stopped moving. Badges are read from the record, so a read taken
+# mid-flight shows a legal in-flight state and the transcript stops being
+# reproducible.
 #
-# The count is the load-bearing half. A send typed into a pane has not
-# reached the daemon yet when this first runs, so "nothing is in flight" is
-# true of an empty record and would settle before the work began: absence
-# of evidence read as evidence of completion. Callers pass how many
-# messages must exist by then.
+# Naming the message is the load-bearing part, and two weaker versions of
+# this check have already shipped and failed. "Nothing is in flight" is
+# true of an empty record, so it settled before a send typed into a pane
+# had reached the daemon at all. Counting lines then settled on messages
+# an earlier rung had already delivered. Both are the same mistake: absence
+# of evidence read as evidence of completion.
+#
+# Requiring at least one delivery matters too: a message exists in the
+# record before any delivery attempt is written against it.
 settled() {
-  local want="$1"
-  "$CYC" --json history | jq -e --argjson want "$want" '
-    (.lines | length) >= $want
-    and ([.lines[].deliveries[]?.state
+  local subject="$1"
+  "$CYC" --json history | jq -e --arg s "$subject" '
+    [.lines[] | select(.subject == $s)] as $m
+    | ($m | length) > 0
+    and ([$m[].deliveries[]?] | length) > 0
+    and ([$m[].deliveries[].state
       | select(. == "queued" or . == "gating" or . == "pasting"
                or . == "staged" or . == "submitted" or . == "retry_queued")]
       | length == 0)' >/dev/null
@@ -414,7 +420,7 @@ check "a thread carries the body"         '^ +gateway\.rs:120 drops the burst pa
 # delivery AND fusion has to have caught up with the panes, or the
 # broadcast receipt reads "queued" for whichever recipient is still
 # finishing the last one. Legal, self-healing, and not reproducible.
-wait_for "the last delivery to settle" 50 settled 1
+wait_for "the last delivery to settle" 50 settled "Review the rate limiter"
 wait_for "both stand-ins to read idle" 50 all_idle
 sleep 2.5
 
@@ -422,7 +428,7 @@ run "$CYC" send --all --subject "Standup in 5" --fyi --plain
 check "a broadcast receipts per recipient" '^ +implementer +(✔|✓|●) '
 check "one row each"                       '^ +reviewer +(✔|✓|●) '
 
-wait_for "the broadcast to settle" 50 settled 2
+wait_for "the broadcast to settle" 50 settled "Standup in 5"
 run "$CYC" history --plain
 check "a broadcast is one line with N badges" '^ +[0-9]+s +admin → 2 agents +fyi +Standup in 5$'
 check "and one badge row per recipient"       '^ +implementer +✔ delivered · verified$'
@@ -470,7 +476,7 @@ echo "#### The handoff (docs/QUICKSTART.md walks this)"
 printf '\n$ (typed in the implementer pane) cyclops send reviewer --subject "Burst path fix, ready for review" --body "gateway.rs:120. Tests pass."\n'
 tmx send-keys -t "$N1" -l '@send reviewer --subject "Burst path fix, ready for review" --body "gateway.rs:120. Tests pass."'
 tmx send-keys -t "$N1" Enter
-wait_for "the handoff to settle" 50 settled 3
+wait_for "the handoff to settle" 50 settled "Burst path fix, ready for review"
 
 run "$CYC" history --with reviewer --limit 1 --plain
 check "the sender is the pane, not the caller" '^ +[0-9]+s +implementer → reviewer +Burst path fix, ready for review +✔ delivered · verified$'
@@ -479,7 +485,7 @@ HANDOFF="$("$CYC" --json history --with reviewer | jq -r '.lines[-1].id')"
 printf '\n$ (typed in the reviewer pane) cyclops send implementer --reply-to %s --subject "Re: Burst path fix" --body "Approved. One nit in the retry path."\n' "$HANDOFF"
 tmx send-keys -t "$N2" -l "@send implementer --reply-to $HANDOFF --subject \"Re: Burst path fix\" --body \"Approved. One nit in the retry path.\""
 tmx send-keys -t "$N2" Enter
-wait_for "the reply to settle" 50 settled 4
+wait_for "the reply to settle" 50 settled "Re: Burst path fix"
 
 run "$CYC" thread "$HANDOFF" --plain
 check "the thread holds the request"      '^ +[0-9]+s +implementer → reviewer +Burst path fix, ready for review'
