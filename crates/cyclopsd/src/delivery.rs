@@ -1131,12 +1131,20 @@ fn receipt_is_queued(s: DeliveryState) -> bool {
 
 fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryReceipt {
     let (state, _, _, cause, note) = handle.snapshot();
+    // The pane the delivery resolved to, so the caller can name it and
+    // build the per-pane fix. Empty for a recipient that answered to no
+    // pane, which is the one case there is nothing to name.
+    let pane = (!handle.pane_id.is_empty()).then(|| handle.pane_id.clone());
     if receipt_resolved(state) {
         return DeliveryReceipt {
             to: handle.to.clone(),
             state,
             position: None,
+            // The gate's machine cause travels as-is when the daemon had
+            // no detail to add; wording it belongs to the surface showing
+            // it (cyclops_ui::grid::cause_words), not here.
             note: note.or(cause),
+            pane,
         };
     }
     if !receipt_is_queued(state) {
@@ -1145,6 +1153,7 @@ fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryRecei
             state,
             position: None,
             note: None,
+            pane,
         };
     }
     let position = inner
@@ -1159,6 +1168,7 @@ fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryRecei
         state: DeliveryState::Queued,
         position,
         note: None,
+        pane,
     }
 }
 
@@ -1262,11 +1272,12 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
                 return;
             }
             GateOutcome::Attention { cause } => {
-                let mut step = Step::to(DeliveryState::AttentionRequired).cause(&cause);
-                if let Some(note) = attention_note(&cause, &handle.pane_id) {
-                    step = step.note(note);
-                }
-                advance(inner, handle, &[DeliveryState::Gating], step);
+                advance(
+                    inner,
+                    handle,
+                    &[DeliveryState::Gating],
+                    Step::to(DeliveryState::AttentionRequired).cause(&cause),
+                );
                 notify_attention(inner, handle, &cause);
                 return;
             }
@@ -1305,24 +1316,6 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
                 }
             }
         }
-    }
-}
-
-/// The badge qualifier a gate refusal wears, for the causes where the raw
-/// cause is not a sentence a person can act on.
-///
-/// A receipt shows this after "⚠ needs attention", the same slot the
-/// unresolvable-recipient path fills with `no pane for "ghost"`. Only the
-/// cause a receipt can now reach at send time has one; the rest keep
-/// printing the cause, which is what history has always shown.
-///
-/// The pane id is in it because that is the thing the fix names: pinning a
-/// manifest is per pane, and the label alone cannot be pasted into
-/// `cyclops name`.
-fn attention_note(cause: &str, pane_id: &str) -> Option<String> {
-    match cause {
-        "no_manifest" => Some(format!("nothing detects {pane_id}")),
-        _ => None,
     }
 }
 
@@ -3148,11 +3141,69 @@ verify_pattern = ["<message_id>", "Pasted text"]
         Duration::from_millis(n)
     }
 
+    /// Every target a clock hands out, in milliseconds from the submit it
+    /// was built on, paired with whether it is the hook-phase end.
+    ///
+    /// The ACK ladder is a sequence, and asserting it one `next_target` at
+    /// a time hides the shape and makes a moved rung read as an unrelated
+    /// number. Reading it as offsets also makes the arithmetic checkable
+    /// by eye: 1500 is the hook window, 250/750/1500/3000/5000 are the
+    /// checkpoints, 5000 is the give-up deadline.
+    fn timeline(mut c: AckClock, submit_at: Instant) -> Vec<(u64, bool)> {
+        let mut out = Vec::new();
+        // Bounded so a clock that stops advancing fails as a wrong
+        // timeline instead of hanging the suite.
+        for _ in 0..12 {
+            let Some((at, hook_end)) = c.next_target() else {
+                break;
+            };
+            out.push(((at - submit_at).as_millis() as u64, hook_end));
+            if hook_end {
+                c.end_hook_phase(at);
+            } else if c.expired(at) {
+                break;
+            } else {
+                c.advance_checkpoint();
+            }
+        }
+        out
+    }
+
+    /// The clock reads no wall time after it is built.
+    ///
+    /// Everything it hands out is derived from the submit instant it was
+    /// given, so two clocks built ten minutes apart must produce the same
+    /// timeline. This is the property that keeps the assertions above from
+    /// being load-sensitive, and it is worth stating once rather than
+    /// leaving every reader to re-derive it from `next_target`.
+    #[tokio::test(start_paused = true)]
+    async fn the_ack_timeline_does_not_depend_on_when_the_clock_was_built() {
+        let early = Instant::now();
+        let late = early + ms(600_000);
+        assert_eq!(
+            timeline(AckClock::new(early, Some(ms(1500))), early),
+            timeline(AckClock::new(late, Some(ms(1500))), late)
+        );
+        assert_eq!(
+            timeline(AckClock::new(early, None), early),
+            timeline(AckClock::new(late, None), late)
+        );
+    }
+
+    /// Instants are asserted as offsets from the submit the clock was
+    /// built on, never as wall-clock values: nothing in `AckClock` reads
+    /// the clock after construction (proved by
+    /// `the_ack_timeline_does_not_depend_on_when_the_clock_was_built`), so
+    /// every number below is arithmetic and none of it is a race.
     #[tokio::test(start_paused = true)]
     async fn ack_clock_freezes_across_detach_and_extends_deadlines() {
         let t0 = Instant::now();
+        let at = |c: &AckClock| {
+            c.next_target()
+                .map(|(t, hook)| ((t - t0).as_millis() as u64, hook))
+        };
         let mut c = AckClock::new(t0, Some(ms(1500)));
-        assert_eq!(c.next_target(), Some((t0 + ms(1500), true)));
+        assert_eq!(at(&c), Some((1500, true)));
 
         // Detach at +200ms: the clock stops firing entirely.
         c.freeze(t0 + ms(200));
@@ -3164,28 +3215,38 @@ verify_pattern = ["<message_id>", "Pasted text"]
 
         // Reattach at +6200ms: 6s of outage extend every deadline.
         c.unfreeze(t0 + ms(6200));
-        assert_eq!(c.next_target(), Some((t0 + ms(7500), true)));
+        assert_eq!(at(&c), Some((7500, true)));
         c.end_hook_phase(t0 + ms(7500));
         // Checkpoints shifted by 6s. The ones the hook phase covered
         // (250/750/1500 -> 6250/6750/7500) are dropped and replaced by one
         // pass now, so tier 2 opens with a look instead of a wait.
-        assert_eq!(c.next_target(), Some((t0 + ms(7500), false)));
+        assert_eq!(at(&c), Some((7500, false)));
         c.advance_checkpoint();
-        assert_eq!(c.next_target(), Some((t0 + ms(9000), false)));
+        assert_eq!(at(&c), Some((9000, false)));
         c.advance_checkpoint();
-        assert_eq!(c.next_target(), Some((t0 + ms(11_000), false)));
+        assert_eq!(at(&c), Some((11_000, false)));
         c.advance_checkpoint();
         // Past the checkpoints the final deadline is also shifted.
-        assert_eq!(c.next_target(), Some((t0 + ms(11_000), false)));
+        assert_eq!(at(&c), Some((11_000, false)));
         assert!(!c.expired(t0 + ms(10_999)));
         assert!(c.expired(t0 + ms(11_000)));
     }
 
+    /// A screen-tier agent has no hook window, so the ladder is the
+    /// checkpoints and nothing else.
     #[tokio::test(start_paused = true)]
     async fn ack_clock_without_hook_window_goes_straight_to_checkpoints() {
         let t0 = Instant::now();
-        let c = AckClock::new(t0, None);
-        assert_eq!(c.next_target(), Some((t0 + ms(250), false)));
+        assert_eq!(
+            timeline(AckClock::new(t0, None), t0),
+            vec![
+                (250, false),
+                (750, false),
+                (1500, false),
+                (3000, false),
+                (5000, false),
+            ]
+        );
     }
 
     /// The shipped numbers, and the hole the receipt fell through.
@@ -3193,26 +3254,21 @@ verify_pattern = ["<message_id>", "Pasted text"]
     /// ack_timeout_ms is 1500 and every manifest for a real CLI declares a
     /// hook, so a pane whose hooks are not wired spends the whole window
     /// waiting for an ACK that never comes. When it closes, the screen has
-    /// held the evidence since the submit. Before this, the next armed
-    /// timer was the 3000 checkpoint: a second and a half of nothing
-    /// looking, with receipt_block_ms (2500) expiring inside it.
+    /// held the evidence since the submit, and the second entry here is
+    /// the look that reads it.
+    ///
+    /// That entry is the fix. Without it the timeline ran
+    /// [(1500, hook), (3000, ...)]: a second and a half in which tier 2
+    /// had opened and nothing looked, with receipt_block_ms (2500)
+    /// expiring inside it. A 1.5s gap between the first two entries is
+    /// exactly that defect coming back.
     #[tokio::test(start_paused = true)]
     async fn tier2_opens_the_moment_the_hook_window_closes() {
         let t0 = Instant::now();
-        let mut c = AckClock::new(t0, Some(ms(1500)));
-        assert_eq!(c.next_target(), Some((t0 + ms(1500), true)));
-
-        c.end_hook_phase(t0 + ms(1500));
         assert_eq!(
-            c.next_target(),
-            Some((t0 + ms(1500), false)),
-            "tier 2 opened with a wait instead of a look"
+            timeline(AckClock::new(t0, Some(ms(1500))), t0),
+            vec![(1500, true), (1500, false), (3000, false), (5000, false),]
         );
-        // And the checkpoints the window did not cover still run.
-        c.advance_checkpoint();
-        assert_eq!(c.next_target(), Some((t0 + ms(3000), false)));
-        c.advance_checkpoint();
-        assert_eq!(c.next_target(), Some((t0 + ms(5000), false)));
     }
 
     /// Queued is a claim about the pane: nothing has been typed into it.
@@ -3237,19 +3293,6 @@ verify_pattern = ["<message_id>", "Pasted text"]
         ] {
             assert!(receipt_resolved(s), "{s:?}");
         }
-    }
-
-    /// The one gate cause a receipt can reach at send time says what it
-    /// means in words, and names the pane the fix is applied to.
-    #[test]
-    fn the_no_manifest_refusal_names_the_pane() {
-        assert_eq!(
-            attention_note("no_manifest", "%3").as_deref(),
-            Some("nothing detects %3")
-        );
-        // Everything else keeps printing the cause history already shows.
-        assert_eq!(attention_note("pane_dead", "%3"), None);
-        assert_eq!(attention_note("ack_timeout", "%3"), None);
     }
 
     // -----------------------------------------------------------------

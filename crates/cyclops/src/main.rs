@@ -879,7 +879,16 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
             DeliveryState::ParkedBlockedQuota => {
                 eprintln!("{}", copy::parked(&d.to, d.note.as_deref()));
             }
-            DeliveryState::AttentionRequired => eprintln!("{}", copy::needs_attention(&d.to)),
+            DeliveryState::AttentionRequired => {
+                // The pin command is offered for the one cause it fixes.
+                // A dead pane or a name nobody answers to is not taught
+                // away with a manifest, and offering it there would send
+                // the reader after the wrong thing.
+                let pane = (d.note.as_deref() == Some(copy::CAUSE_NO_MANIFEST))
+                    .then_some(d.pane.as_deref())
+                    .flatten();
+                eprintln!("{}", copy::needs_attention(&d.to, pane));
+            }
             // Past the paste and still unresolved: the pane has the
             // payload and the confirmation is outstanding.
             DeliveryState::Pasting | DeliveryState::Staged | DeliveryState::Submitted => {
@@ -1141,6 +1150,7 @@ mod tests {
             state,
             position: None,
             note: None,
+            pane: None,
         }
     }
 

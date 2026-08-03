@@ -847,16 +847,24 @@ check_exit "and a delivered send exits 0" 0
 stock_run "$CYC" send ghostpane --subject "hello" --plain
 check "a pane nothing detects refuses the message" "^⚠ needs attention · nothing detects $S2\$"
 # The badge names the pane and the reason; the line under it has to leave
-# the reader somewhere to go. Which surface that is belongs to the CLI's
-# copy, so this asserts that a next step is named, not how it reads.
-check "and names a next step"             'cyclops status'
+# the reader somewhere to go, and for this one cause the way out is a
+# command. It carries the pane as the target and the name the pane already
+# answers to as the label, so it can be pasted whole: passing the label as
+# the target would rename an adopted pane to a placeholder.
+check "and names the command that fixes it" \
+  "cyclops name $S2 ghostpane --manifest <id>"
 check_exit "and it does NOT exit 0" 1
 
 # The record agrees with both receipts. A receipt that says one thing while
 # the ledger says another is the defect these two checks exist to catch.
 stock_run "$CYC" history --plain
 check "the delivered one is on the record" '^ +[0-9]+s +admin → implementer +hello +✓ delivered · unverified \(screen\)$'
-check "and the refused one too"            '^ +[0-9]+s +admin → ghostpane +hello +⚠ needs attention · no manifest$'
+# One cause, one wording. The receipt above named the pane because it had
+# one; a folded record line carries the recipient and not the pane, so it
+# says the same sentence without the id. Both come out of
+# cyclops_ui::grid::cause_words, which is the only place this cause becomes
+# English.
+check "and the refused one too"            '^ +[0-9]+s +admin → ghostpane +hello +⚠ needs attention · nothing detects its pane$'
 
 stop_stock_daemon
 

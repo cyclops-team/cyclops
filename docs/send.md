@@ -36,7 +36,8 @@ its queue position, because that answer will not change until its turn ends.
 |---|---|
 | `✔ delivered · verified` | The recipient's own hook confirmed this exact message arrived. |
 | `✓ delivered · unverified (screen)` | Screen evidence only: the marker left the composer and a turn started. A late hook report upgrades it to verified. |
-| `● queued · 2 ahead` | Recipient cannot take input yet: mid-turn, a human typing, or a dialog waiting on a human decision (you get alerted). Delivers in order once the pane is ready. |
+| `● queued · 2 ahead` | Nothing has been typed into the pane yet: it is mid-turn, a human is typing, or a dialog is waiting on a human decision (you get alerted). Delivers in order once the pane is ready. |
+| `● submitted` | Rare. The payload is in the pane and the confirmation had not landed when the receipt was printed. The badge lands on `cyclops history` when it does. |
 | `⊘ parked · quota, resets in 135h` | Recipient is out of vendor quota. See below. |
 | `⚠ needs attention · no pane for "reviewer"` | A human must look. The qualifier names why: missing pane, dead pane, nothing detecting the pane, or two failed delivery attempts. |
 | `⚠ needs attention · nothing detects %4` | The recipient has a name and no manifest matches what runs in its pane, so nothing can be typed into it. See below. |
@@ -62,8 +63,10 @@ Add `--json` for the raw receipt. Anything the badge shows, scripts can read.
 ```
 $ cyclops send ghostpane --subject "hello"
 ⚠ needs attention · nothing detects %4
-ghostpane did not get this message. It is on the record and needs attention;
-cyclops status lists what is waiting on you and what to do about each one.
+ghostpane did not get this message; it is on the record and needs attention.
+Teach cyclops what runs in %4: cyclops name %4 ghostpane --manifest <id>.
+cyclops status names the manifests that are loaded, and docs/MANIFESTS.md is
+how to write one.
 ```
 
 Naming a pane makes it addressable, not readable. Cyclops types into a pane
@@ -76,9 +79,14 @@ the contract a script depends on. Exit `0` means cyclops has the message and
 will deliver it; a recipient nothing detects is not going to be delivered to
 by waiting, so it must never share an exit code with one that is.
 
-`cyclops status` names the pane, the manifests cyclopsd loaded, and the pin
-command. Teaching cyclops a new CLI is one file:
-[MANIFESTS.md](MANIFESTS.md).
+The pin command comes pasteable: the pane as the target, the name the pane
+already answers to as the label. `cyclops status` lists the manifest ids to
+choose from, and [MANIFESTS.md](MANIFESTS.md) is how to write one for a CLI
+cyclops has not met.
+
+`cyclops history` shows the same delivery as `⚠ needs attention · nothing
+detects its pane`. Same words, minus the pane id: a folded record line
+carries the recipient, not the pane the delivery went to.
 
 ## Broadcast
 
@@ -106,9 +114,12 @@ Details, outcomes, and exit semantics: [wait.md](wait.md).
 
 ## Exit codes
 
-- `0` delivered or queued
+- `0` cyclops has the message: delivered, queued, or in flight
 - `1` parked or needs attention (also: daemon unreachable)
 - `2` usage error (no recipient, unreadable body file)
+
+The line between `0` and `1` is whether waiting helps. Exit `0` means the
+message is cyclops's problem now. Exit `1` means it is yours.
 
 ## Quota parking
 

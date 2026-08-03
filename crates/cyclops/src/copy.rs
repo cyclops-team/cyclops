@@ -57,13 +57,28 @@ pub fn unknown_panes(
     format!("{head}: {why} Nothing can be delivered to an unknown pane. {next}")
 }
 
+/// The command that teaches cyclops what runs in a pane.
+///
+/// One home, because three surfaces print it: the status grid explaining
+/// an unknown pane, `cyclops name` warning about the pane it just named,
+/// and a send refused for that pane. The sentences around it differ
+/// because they answer different questions; the command may not, or a
+/// reader who has now seen it twice has to compare them word by word.
+///
+/// The pane is the target and the label is the name it already answers to.
+/// Passing the label as the target would rename an adopted pane to a
+/// placeholder, which is the one way to get this command wrong.
+fn pin_command(pane: &str, label: &str) -> String {
+    format!("cyclops name {pane} {label} --manifest <id>")
+}
+
 /// The next step for a pane no manifest binds: pin one, or write one.
 /// `label` is the name the pane already answers to, so the command can be
 /// pasted whole instead of renaming the pane to a placeholder.
 fn pin_a_manifest(pane: &str, label: Option<&str>) -> String {
-    let name = label.unwrap_or("<label>");
     format!(
-        "Pin one: cyclops name {pane} {name} --manifest <id>. Teaching cyclops a new CLI is one file: docs/MANIFESTS.md."
+        "Pin one: {}. Teaching cyclops a new CLI is one file: docs/MANIFESTS.md.",
+        pin_command(pane, label.unwrap_or("<label>"))
     )
 }
 
@@ -72,7 +87,8 @@ fn pin_a_manifest(pane: &str, label: Option<&str>) -> String {
 /// reach it, which the receipt would otherwise report half a minute later.
 pub fn named_but_undetected(pane: &str, label: &str) -> String {
     format!(
-        "nothing detects {pane} yet, so {label} can't receive a message. cyclops status names the manifests that are loaded; pin one with: cyclops name {pane} {label} --manifest <id>"
+        "nothing detects {pane} yet, so {label} can't receive a message. cyclops status names the manifests that are loaded; pin one with: {}",
+        pin_command(pane, label)
     )
 }
 
@@ -112,18 +128,35 @@ pub fn parked(to: &str, note: Option<&str>) -> String {
     }
 }
 
+/// The gate cause a receipt carries when nothing detects the pane. It is a
+/// protocol token, not prose: the words a reader sees are
+/// `cyclops_ui::grid::cause_words`'s, and this is only how the CLI knows
+/// which follow-up to print under the badge.
+pub const CAUSE_NO_MANIFEST: &str = "no_manifest";
+
 /// Follow-up for a receipt that needs a human, said after the badge.
 ///
 /// The badge names the state and the reason; a reader still has to be told
 /// what became of the message, because "⚠ needs attention" on its own does
 /// not say whether it was delivered. It was not. It is on the record, and
 /// `cyclops status` is where every waiting item is listed with what to do
-/// about it: a pane nothing detects gets the pin command there, with the
-/// manifest ids the daemon actually loaded in it.
-pub fn needs_attention(to: &str) -> String {
-    format!(
-        "{to} did not get this message. It is on the record and needs attention; cyclops status lists what is waiting on you and what to do about each one."
-    )
+/// about it.
+///
+/// `pane` is set on the one cause whose fix is a command: a pane no
+/// manifest binds. It carries the pin, with the name the pane already
+/// answers to in it, so the line can be pasted whole. Passing the label as
+/// the target would rename an adopted pane to a placeholder, which is why
+/// `cyclops name` takes both and why both are here.
+pub fn needs_attention(to: &str, pane: Option<&str>) -> String {
+    match pane {
+        Some(pane) => format!(
+            "{to} did not get this message; it is on the record and needs attention. Teach cyclops what runs in {pane}: {}. cyclops status names the manifests that are loaded, and docs/MANIFESTS.md is how to write one.",
+            pin_command(pane, to)
+        ),
+        None => format!(
+            "{to} did not get this message. It is on the record and needs attention; cyclops status lists what is waiting on you and what to do about each one."
+        ),
+    }
 }
 
 /// Follow-up for a receipt taken while the delivery is still in flight.
@@ -333,6 +366,21 @@ mod tests {
         );
     }
 
+    /// Three surfaces, one command, byte for byte. A reader who has seen
+    /// it on the status grid must not have to compare it with the one a
+    /// refused send prints.
+    #[test]
+    fn every_surface_prints_the_same_pin_command() {
+        let want = "cyclops name %4 reviewer --manifest <id>";
+        for said in [
+            unknown_panes(1, "%4", Some("reviewer"), None),
+            named_but_undetected("%4", "reviewer"),
+            needs_attention("reviewer", Some("%4")),
+        ] {
+            assert!(said.contains(want), "{said}");
+        }
+    }
+
     #[test]
     fn a_named_pane_nothing_detects_says_it_cannot_receive_yet() {
         assert_eq!(
@@ -411,12 +459,20 @@ mod tests {
     }
 
     /// A badge that says a human is needed still has to say the message
-    /// did not arrive. Nothing else on the surface says it.
+    /// did not arrive, and the one cause a command fixes has to carry the
+    /// command. Pasteable means both ids in it: the pane, and the name the
+    /// pane already answers to.
     #[test]
-    fn attention_copy_says_the_message_did_not_arrive() {
+    fn attention_copy_says_the_message_did_not_arrive_and_carries_the_fix() {
         assert_eq!(
-            needs_attention("worker"),
-            "worker did not get this message. It is on the record and needs attention; cyclops status lists what is waiting on you and what to do about each one."
+            needs_attention("worker", Some("%1")),
+            "worker did not get this message; it is on the record and needs attention. Teach cyclops what runs in %1: cyclops name %1 worker --manifest <id>. cyclops status names the manifests that are loaded, and docs/MANIFESTS.md is how to write one."
+        );
+        // Every other cause: no pin command, because a manifest does not
+        // fix a dead pane or a name nobody answers to.
+        assert_eq!(
+            needs_attention("ghost", None),
+            "ghost did not get this message. It is on the record and needs attention; cyclops status lists what is waiting on you and what to do about each one."
         );
     }
 

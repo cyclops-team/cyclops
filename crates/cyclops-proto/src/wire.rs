@@ -310,9 +310,20 @@ pub struct DeliveryReceipt {
     /// Queue depth ahead of this message when state is queued.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<u32>,
-    /// Human hint, e.g. "resets in 135h57m".
+    /// Human hint, e.g. "resets in 135h57m", or the gate cause the caller
+    /// words for itself, e.g. "no_manifest".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// tmux pane this delivery resolved to, e.g. "%3". Absent when the
+    /// recipient answered to no pane at all, and on the record surfaces,
+    /// which fold from ledger lines that carry no pane.
+    ///
+    /// It is here because the fixes for a stopped delivery are per pane:
+    /// pinning a manifest names the pane, and a receipt that cannot say
+    /// which pane leaves the reader to go and find it. Additive optional
+    /// field: old daemons omit it, old clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

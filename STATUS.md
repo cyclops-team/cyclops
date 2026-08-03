@@ -4,7 +4,7 @@ Updated 2026-08-03. M6 is complete and committed: the first run works now,
 and the system is documented for someone who is not its author. A reviewer
 working only from the docs could build it, explain how a message becomes a
 verified receipt, write a manifest for a CLI that does not exist and watch a
-pane bind to it, debug a stuck delivery, and list the invariants. 577 tests
+pane bind to it, debug a stuck delivery, and list the invariants. 580 tests
 across 63 targets, parity 93/93, CI green, v2 is main. Next is the installer,
 then M7 flow features.
 One thing still waits on admin: the v1 cutover.

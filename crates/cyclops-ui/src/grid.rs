@@ -123,11 +123,33 @@ pub use cyclops_proto::state_words;
 
 /// Machine causes in user-side words. GOALS: no `pane_id`, no `NDJSON`,
 /// nothing a newcomer has to look up, on any surface that shows a cause.
+///
+/// This is the only place a delivery cause becomes English. Receipts,
+/// history and the stream all reach it, which is the point: the same cause
+/// said two ways on two surfaces is a rule with two homes, and one of them
+/// drifts. "no manifest" was that drift, and it also failed the GOALS test
+/// on its own, because a reader hitting it for the first time has no idea
+/// what a manifest is.
 pub fn cause_words(cause: &str) -> String {
     match cause {
         "no_such_pane" => "no pane with that name".into(),
+        "no_manifest" => "nothing detects its pane".into(),
         "daemon_restart" => "daemon restarted mid-delivery".into(),
         _ => cause.replace('_', " "),
+    }
+}
+
+/// [`cause_words`] for the one surface that knows which pane: a receipt.
+///
+/// The record does not carry a pane on a delivery, so history and the
+/// stream name what they have and stop. A receipt is answering a send that
+/// resolved to a pane, and naming it is what makes the fix pasteable.
+/// Both spellings live here, next to each other, so neither can move
+/// without the other.
+pub fn cause_words_for(cause: &str, pane: Option<&str>) -> String {
+    match (cause, pane) {
+        ("no_manifest", Some(pane)) => format!("nothing detects {pane}"),
+        _ => cause_words(cause),
     }
 }
 
@@ -154,8 +176,15 @@ pub fn receipt_badge(r: &DeliveryReceipt, paint: &dyn Paint) -> String {
         DeliveryState::RetryQueued => "● retrying".into(),
         DeliveryState::DeliveredVerified => with("✔ delivered", "verified"),
         DeliveryState::DeliveredUnverified => with("✓ delivered", "unverified (screen)"),
+        // The qualifier is the gate's cause worded here, never at the
+        // daemon: a receipt that arrived carrying a sentence keeps it
+        // (cause_words leaves anything it does not know alone), and one
+        // that arrived carrying a cause gets the same words history does.
         DeliveryState::AttentionRequired => match &r.note {
-            Some(note) => with("⚠ needs attention", note),
+            Some(note) => with(
+                "⚠ needs attention",
+                &cause_words_for(note, r.pane.as_deref()),
+            ),
             None => "⚠ needs attention".into(),
         },
         DeliveryState::ParkedBlockedQuota => match &r.note {
@@ -176,7 +205,7 @@ pub fn delivery_badge(
     paint: &dyn Paint,
 ) -> String {
     let note = match state {
-        DeliveryState::AttentionRequired => cause.map(cause_words),
+        DeliveryState::AttentionRequired => cause.map(String::from),
         _ => None,
     };
     receipt_badge(
@@ -185,6 +214,8 @@ pub fn delivery_badge(
             state,
             position: None,
             note,
+            // A record line names the recipient, not the pane it lived in.
+            pane: None,
         },
         paint,
     )
@@ -232,6 +263,7 @@ mod tests {
             state,
             position,
             note: note.map(String::from),
+            pane: None,
         }
     }
 

@@ -58,32 +58,41 @@ reading it and will not deliver to it. Three causes, in order of likelihood:
    at all, means the directory was empty, missing, or one file failed to
    parse and took the rest with it. See [MANIFESTS.md](MANIFESTS.md).
 
-## A send says "● queued · 0 ahead"
+## A send to a pane nothing detects
+
+```
+$ cyclops send ghost --subject "hello"
+⚠ needs attention · nothing detects %1
+ghost did not get this message; it is on the record and needs attention.
+Teach cyclops what runs in %1: cyclops name %1 ghost --manifest <id>.
+cyclops status names the manifests that are loaded, and docs/MANIFESTS.md
+is how to write one.
+```
+
+Exit code 1, and the message is on the record rather than lost. Cyclops
+will not type into a pane it cannot read, so the delivery never starts.
+Fix the binding, not the receipt: `cyclops status` names what is loaded and
+what to pin.
+
+Hooks are a different axis and do not help here. They upgrade a delivered
+receipt from screen evidence to hook-verified, and a pane nothing detects
+never gets that far.
+
+## A send says "● queued"
 
 ```
 $ cyclops send implementer --subject "hello"
-● queued · 0 ahead
+● queued · 1 ahead
 ```
 
-Read the number first. It is a queue position, so `0 ahead` means nothing
-is in front of this message. Queued is not a backlog here. It is the daemon
-saying the recipient could not take input at the instant you asked, and
-answering with where the message stood rather than guessing.
+Queued means one thing: nothing has been typed into the pane yet. The
+number is a queue position, so `1 ahead` means one message is in front of
+this one. You see this when the recipient already has a delivery moving,
+or when it could not take input at the instant you asked.
 
-On a first message the cause is almost always the one above: no manifest
-binds that pane. Cyclops will not type into a pane it cannot read, so the
-delivery holds in the gate and ends up needing a human:
-
-```
-$ cyclops history
-  40s  admin → implementer  hello  ⚠ needs attention · no manifest
-```
-
-Fix the binding, not the receipt. `cyclops status` names what is loaded and
-what to pin; the `? unknown` entry above is the whole of it. Hooks are a
-different axis and do not help: they upgrade a delivered receipt from
-screen evidence to hook-verified, and a pane nothing detects never gets
-that far.
+This one clears itself. Past the paste, a receipt reports the state it is
+actually in rather than calling it queued, so a receipt that still says
+queued is telling you the truth about where the message stands.
 
 Every other reason clears itself. A recipient mid-turn, a human typing in
 that pane, or a dialog waiting on a human decision all take the message in

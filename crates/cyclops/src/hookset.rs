@@ -313,6 +313,7 @@ pub fn run_selftest(c: &mut Client, json: bool, style: &Style, target: &str) -> 
                 state: s,
                 position: None,
                 note: None,
+                pane: None,
             },
             style,
         ),

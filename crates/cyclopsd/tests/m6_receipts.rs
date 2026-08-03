@@ -45,10 +45,14 @@ async fn a_send_to_a_pane_nothing_detects_says_so_on_the_receipt() {
         d["state"], "attention_required",
         "the receipt reported a state the delivery never reached: {result}"
     );
+    // The cause travels as the machine token the ledger records, and the
+    // pane as data. Wording either one is the reader's surface's job
+    // (cyclops_ui::grid::cause_words), so the daemon ships neither.
+    assert_eq!(d["note"], json!("no_manifest"), "{result}");
     assert_eq!(
-        d["note"],
-        json!(format!("nothing detects {pane}")),
-        "the receipt does not name the pane or say why: {result}"
+        d["pane"],
+        json!(pane),
+        "the receipt cannot name the pane the fix applies to: {result}"
     );
     assert!(
         elapsed < Duration::from_millis(2500),

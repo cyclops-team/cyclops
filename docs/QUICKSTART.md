@@ -140,9 +140,19 @@ an agent. [panes.md](panes.md).
 
 ## 4. Wire the hooks
 
-Skip this and everything still works; deliveries land verified by screen
-evidence instead of by the agent's own hook. Wiring takes a minute and
-upgrades every receipt:
+Skip this and everything still works. Without hooks a delivery is confirmed
+by what cyclops can see on the screen, and the receipt says so in those
+words:
+
+```
+✓ delivered · unverified (screen)
+```
+
+The light check is not a lesser delivery. It means the message landed and
+the evidence is screen-tier, which is the honest thing to say when the
+agent itself has not confirmed. Wiring hooks takes a minute and upgrades
+every receipt to the heavy check, `✔ delivered · verified`, where the
+recipient's own hook confirmed this exact message:
 
 ```
 cyclops hooks install claude --agent reviewer   # renders config, prints wiring

@@ -634,9 +634,11 @@ fn send_parked_exits_one_with_reset_hint() {
     let _ = fs::remove_dir_all(&home);
 }
 
-/// A send to a pane nothing detects. The badge names the pane and why,
-/// the follow-up says the message did not arrive, and the exit code keeps
-/// a script from branching on it as a delivery.
+/// A send to a pane nothing detects, in the shape the daemon answers
+/// with: the gate's machine cause plus the pane as data. The badge words
+/// the cause and names the pane, the follow-up says the message did not
+/// arrive and carries the command that fixes it, and the exit code keeps a
+/// script from branching on it as a delivery.
 #[test]
 fn send_to_an_undetected_pane_says_it_did_not_arrive_and_exits_one() {
     let home = scratch_home("sund");
@@ -646,7 +648,7 @@ fn send_to_an_undetected_pane_says_it_did_not_arrive_and_exits_one() {
                 "msg_id": "m-ee", "seq": 14,
                 "deliveries": [{
                     "to": "worker", "state": "attention_required",
-                    "note": "nothing detects %0"
+                    "note": "no_manifest", "pane": "%1"
                 }]
             }})
             .to_string()],
@@ -657,11 +659,46 @@ fn send_to_an_undetected_pane_says_it_did_not_arrive_and_exits_one() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "⚠ needs attention · nothing detects %0\n"
+        "⚠ needs attention · nothing detects %1\n"
     );
+    // Pasteable: the pane as the target, the name it already answers to as
+    // the label. Passing the label as the target would rename the pane.
     assert_eq!(
         String::from_utf8_lossy(&out.stderr).trim(),
-        "worker did not get this message. It is on the record and needs attention; cyclops status lists what is waiting on you and what to do about each one."
+        "worker did not get this message; it is on the record and needs attention. Teach cyclops what runs in %1: cyclops name %1 worker --manifest <id>. cyclops status names the manifests that are loaded, and docs/MANIFESTS.md is how to write one."
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// The same refusal reaching a client through a daemon that predates the
+/// pane field. The badge still words the cause, and the follow-up drops
+/// the command rather than printing one with a hole in it.
+#[test]
+fn an_older_daemon_without_the_pane_field_still_gets_worded_copy() {
+    let home = scratch_home("sold");
+    serve_once(&home, hello(1), move |req| {
+        (
+            vec![json!({"id": req["id"], "result": {
+                "msg_id": "m-e2", "seq": 16,
+                "deliveries": [{
+                    "to": "worker", "state": "attention_required",
+                    "note": "no_manifest"
+                }]
+            }})
+            .to_string()],
+            false,
+        )
+    });
+    let out = run_cyclops(&home, &["send", "worker", "--subject", "hello"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "⚠ needs attention · nothing detects its pane\n"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("--manifest"),
+        "offered a command it could not fill in: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
     let _ = fs::remove_dir_all(&home);
 }

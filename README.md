@@ -64,16 +64,21 @@ the way you normally would. Then send it something.
 
 ```
 $ cyclops send implementer --subject "Review the rate limiter" --body "gateway.rs:120 drops the burst path"
-✔ delivered · verified
+✓ delivered · unverified (screen)
 ```
 
-`✔ delivered · verified` means the recipient's own hook confirmed this exact
-message arrived, not that cyclops typed hopefully. Every message lands on
-the record:
+The receipt names its evidence. The light check means the message landed
+and cyclops confirmed it on the screen, which is what you get before the
+agent's own hooks are wired. Wire them once
+([hooks.md](docs/hooks.md)) and the same send earns the heavy check,
+`✔ delivered · verified`, meaning the recipient's own hook confirmed this
+exact message rather than cyclops typing hopefully.
+
+Either way it lands on the record:
 
 ```
 $ cyclops history
-  0s  admin → implementer  Review the rate limiter  ✔ delivered · verified
+  0s  admin → implementer  Review the rate limiter  ✓ delivered · unverified (screen)
 ```
 
 The record is a file, so it outlives the daemon. Kill `cyclopsd`, start it

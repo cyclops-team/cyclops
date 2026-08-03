@@ -447,6 +447,9 @@ fn waiting_rows(attention: &Attention, style: &Style) -> Vec<String> {
                 state: *state,
                 position: None,
                 note: None,
+                // The eye counts items from the record, which names the
+                // recipient and not the pane the delivery went to.
+                pane: None,
             },
             style,
         );
@@ -1441,6 +1444,7 @@ mod tests {
             state,
             position,
             note: note.map(String::from),
+            pane: None,
         }
     }
 
@@ -1663,6 +1667,42 @@ mod tests {
         // was confirmed by anyone.
         let reached = wait_badge("reached", None, None, None, &s);
         assert!(reached.starts_with(check(false)), "{reached}");
+    }
+
+    /// One cause, one wording, on both surfaces that show it.
+    ///
+    /// The receipt used to be worded by the daemon and history by
+    /// `cause_words`, so the same refused delivery read "nothing detects
+    /// %1" while the record line under it read "no manifest". Two homes,
+    /// and the drift was visible in one screenful. Both now come out of
+    /// `cyclops_ui::grid`, and the only difference left is the identifier
+    /// a receipt has and a folded record line does not.
+    #[test]
+    fn a_refused_delivery_reads_the_same_on_the_receipt_and_the_record() {
+        let s = Style::none();
+        let mut r = receipt(DeliveryState::AttentionRequired, None, Some("no_manifest"));
+        r.pane = Some("%1".into());
+        assert_eq!(
+            receipt_badge(&r, &s),
+            "⚠ needs attention · nothing detects %1"
+        );
+
+        let recorded = Delivery {
+            to: "reviewer".into(),
+            state: DeliveryState::AttentionRequired,
+            verified_by: None,
+            attempts: 1,
+            ts: 0,
+            cause: Some("no_manifest".into()),
+        };
+        assert_eq!(
+            delivery_badge(&recorded, &s),
+            "⚠ needs attention · nothing detects its pane"
+        );
+
+        // The machine cause never faces a reader on either surface.
+        assert!(!receipt_badge(&r, &s).contains("no_manifest"));
+        assert!(!delivery_badge(&recorded, &s).contains("no_manifest"));
     }
 
     #[test]
