@@ -77,11 +77,12 @@ pub fn sidebar_row(paint: &Paint) -> Style {
 }
 
 pub fn sidebar_label(paint: &Paint) -> Style {
-    paint.style_token(tokens::SURFACE_FG)
+    paint.style_token(tokens::SURFACE_DIM)
 }
 
-pub fn pane_cell(paint: &Paint) -> Style {
-    paint.style_token(tokens::SURFACE_FG)
+/// Pane body uses the terminal's own foreground; see docs/themes.md.
+pub fn pane_cell(_paint: &Paint) -> Style {
+    Style::new()
 }
 
 pub fn attention_eye(paint: &Paint) -> Style {

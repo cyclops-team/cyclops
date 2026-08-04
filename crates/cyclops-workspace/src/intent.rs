@@ -311,9 +311,10 @@ mod tests {
             .display(new_pane, "#{pane_current_path}")
             .await
             .expect("path");
+        let expected = std::fs::canonicalize(src).expect("canonical src");
+        let actual = std::fs::canonicalize(path.trim()).expect("canonical pane path");
         assert_eq!(
-            path.trim(),
-            src,
+            actual, expected,
             "new split pane should inherit source pane_current_path"
         );
         client.shutdown().await;
