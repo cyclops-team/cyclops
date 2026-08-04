@@ -52,13 +52,16 @@ fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Build output, git internals, python bytecode, the vendored landing
-/// page, the local agent workflow scripts, and the soak's raw artifacts.
-/// The last one matters: those are captured vendor screens and can hold
-/// any text at all, including a command a probe typed into a pane.
+/// page, local agent workflow scripts, the generated agent knowledge
+/// base, and the soak's raw artifacts. The last one matters: those are
+/// captured vendor screens and can hold any text at all, including a
+/// command a probe typed into a pane. `.agents/` is skipped for the same
+/// reason as `.claude/`: it paraphrases teardown rules for assistants and
+/// is not a second home for the rule itself.
 fn holds_no_source(dir: &Path) -> bool {
     matches!(
         dir.file_name().and_then(|n| n.to_str()),
-        Some("target" | ".git" | "__pycache__" | "frontend" | ".claude")
+        Some("target" | ".git" | "__pycache__" | "frontend" | ".claude" | ".agents")
     ) || dir.ends_with("tests/raw")
 }
 
