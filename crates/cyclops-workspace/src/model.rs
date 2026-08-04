@@ -43,7 +43,7 @@ impl RuntimeRegistry {
     }
 }
 
-/// Session-level model for step 5 (single session; sidebar arrives step 7).
+/// Session-level model for the active workspace.
 #[derive(Debug)]
 pub struct SessionModel {
     pub session: String,
@@ -54,6 +54,34 @@ pub struct SessionModel {
 impl SessionModel {
     pub fn active_tab(&self) -> &TabModel {
         &self.tabs[self.active_tab]
+    }
+}
+
+/// One workspace row in the sidebar (a tmux session).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceRow {
+    pub name: String,
+    pub tab_count: usize,
+    pub active: bool,
+}
+
+/// Full workspace model: sidebar sessions plus the active session's tabs.
+#[derive(Debug)]
+pub struct WorkspaceModel {
+    pub workspaces: Vec<WorkspaceRow>,
+    pub active_workspace: usize,
+    pub session: SessionModel,
+    /// Sidebar expanded (render state; persisted in step 13).
+    pub sidebar_visible: bool,
+}
+
+impl WorkspaceModel {
+    pub fn active_workspace_name(&self) -> &str {
+        &self.workspaces[self.active_workspace].name
+    }
+
+    pub fn active_tab(&self) -> &TabModel {
+        self.session.active_tab()
     }
 }
 

@@ -23,6 +23,11 @@ pub enum BindingAction {
     ZoomPane,
     RenameTab,
     CloseTab,
+    NextWorkspace,
+    PrevWorkspace,
+    NewWorkspace,
+    RenameWorkspace,
+    CloseWorkspace,
 }
 
 /// One binding: either after prefix or a direct chord.
@@ -124,6 +129,26 @@ pub fn default_bindings() -> HashMap<BindingAction, BindingChord> {
             BindingAction::CloseTab,
             BindingChord::Prefix(KeyCode::Char('&')),
         ),
+        (
+            BindingAction::NextWorkspace,
+            BindingChord::Prefix(KeyCode::Char(']')),
+        ),
+        (
+            BindingAction::PrevWorkspace,
+            BindingChord::Prefix(KeyCode::Char('[')),
+        ),
+        (
+            BindingAction::NewWorkspace,
+            BindingChord::Prefix(KeyCode::Char('w')),
+        ),
+        (
+            BindingAction::RenameWorkspace,
+            BindingChord::Prefix(KeyCode::Char('W')),
+        ),
+        (
+            BindingAction::CloseWorkspace,
+            BindingChord::Prefix(KeyCode::Char('K')),
+        ),
     ])
 }
 
@@ -173,6 +198,11 @@ fn action_from_key(key: &str) -> Option<BindingAction> {
         "zoom_pane" => Some(BindingAction::ZoomPane),
         "rename_tab" => Some(BindingAction::RenameTab),
         "close_tab" => Some(BindingAction::CloseTab),
+        "next_workspace" => Some(BindingAction::NextWorkspace),
+        "prev_workspace" => Some(BindingAction::PrevWorkspace),
+        "new_workspace" => Some(BindingAction::NewWorkspace),
+        "rename_workspace" => Some(BindingAction::RenameWorkspace),
+        "close_workspace" => Some(BindingAction::CloseWorkspace),
         s if s.starts_with("tab_") => s
             .strip_prefix("tab_")
             .and_then(|n| n.parse::<usize>().ok())

@@ -1,10 +1,12 @@
 //! UI intents mapped to tmux operations. The model updates only from
 //! reconciliation after tmux replies and notifications — never here.
 
+use std::path::Path;
+
 use cyclops_tmux::{quote_arg, ControlClient, TmuxError};
 
 /// Structural workspace actions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Intent {
     NextTab,
     PrevTab,
@@ -20,6 +22,10 @@ pub enum Intent {
     ZoomPane,
     RenameTab,
     CloseTab,
+    SwitchWorkspace(String),
+    NewWorkspace,
+    RenameWorkspace,
+    CloseWorkspace,
 }
 
 /// Issue one intent against tmux. Does not mutate the workspace model.
@@ -75,8 +81,75 @@ pub async fn execute(
         Intent::CloseTab => {
             client.command("kill-window").await?;
         }
+        Intent::SwitchWorkspace(name) => {
+            client
+                .command(&format!("switch-client -t {}", quote_arg(&name)))
+                .await?;
+        }
+        Intent::NewWorkspace | Intent::RenameWorkspace | Intent::CloseWorkspace => {}
     }
     Ok(())
+}
+
+/// Create a workspace (tmux session) from a project folder.
+pub async fn execute_new_workspace(
+    client: &ControlClient,
+    folder: &Path,
+) -> Result<String, TmuxError> {
+    let name = session_name_from_folder(folder);
+    let path = folder.to_string_lossy();
+    client
+        .command(&format!(
+            "new-session -d -s {} -c {}",
+            quote_arg(&name),
+            quote_arg(path.as_ref())
+        ))
+        .await?;
+    client
+        .command(&format!("switch-client -t {}", quote_arg(&name)))
+        .await?;
+    Ok(name)
+}
+
+/// Rename the attached session.
+pub async fn execute_rename_workspace(
+    client: &ControlClient,
+    name: &str,
+) -> Result<(), TmuxError> {
+    client
+        .command(&format!("rename-session {}", quote_arg(name)))
+        .await?;
+    Ok(())
+}
+
+/// Close the attached session.
+pub async fn execute_close_workspace(client: &ControlClient) -> Result<(), TmuxError> {
+    client.command("kill-session").await?;
+    Ok(())
+}
+
+fn session_name_from_folder(folder: &Path) -> String {
+    folder
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("project")
+        .to_string()
+}
+
+/// Switch to adjacent workspace by index delta.
+pub async fn execute_switch_workspace_by_delta(
+    client: &ControlClient,
+    workspaces: &[crate::model::WorkspaceRow],
+    active: usize,
+    delta: isize,
+) -> Result<(), TmuxError> {
+    if workspaces.is_empty() {
+        return Ok(());
+    }
+    let len = workspaces.len() as isize;
+    let next = (active as isize + delta).rem_euclid(len) as usize;
+    let name = workspaces[next].name.clone();
+    execute(client, Intent::SwitchWorkspace(name), "").await
 }
 
 /// Rename the active window after the user supplies a name.
@@ -122,6 +195,9 @@ impl From<crate::bindings::BindingAction> for Intent {
             ZoomPane => Intent::ZoomPane,
             RenameTab => Intent::RenameTab,
             CloseTab => Intent::CloseTab,
+            NextWorkspace | PrevWorkspace | NewWorkspace | RenameWorkspace | CloseWorkspace => {
+                unreachable!("workspace actions use dedicated handlers")
+            }
             Detach => unreachable!("detach is not an intent"),
         }
     }
@@ -139,6 +215,35 @@ mod tests {
             .on_socket(server.socket().to_string())
             .with_config_file("/dev/null");
         ControlClient::spawn(cfg).await.expect("attach").0
+    }
+
+    #[tokio::test]
+    async fn new_workspace_sets_name_and_directory() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("ws-create");
+        let folder = "/tmp/cyclops-ws-create";
+        std::fs::create_dir_all(folder).expect("folder");
+        server.run_ok(&["new-session", "-d", "-s", "host", "/bin/sh"]);
+        let client = rig_client(&server, "host").await;
+        let name = execute_new_workspace(&client, std::path::Path::new(folder))
+            .await
+            .expect("create");
+        assert_eq!(name, "cyclops-ws-create");
+        let out = server.run(&[
+            "display-message",
+            "-p",
+            "-t",
+            &name,
+            "#{session_path}",
+        ]);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            folder,
+            "session default directory should match folder"
+        );
+        client.shutdown().await;
     }
 
     fn pane_ids(server: &TmuxServer, target: &str) -> Vec<String> {

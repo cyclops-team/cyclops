@@ -8,6 +8,8 @@ use crate::error::TmuxError;
 pub struct SessionRow {
     pub name: String,
     pub attached: bool,
+    /// Number of windows (tabs) in the session.
+    pub tab_count: usize,
 }
 
 /// One window in a session.
@@ -42,7 +44,7 @@ pub fn list_sessions(socket: Option<&str>) -> Result<Vec<SessionRow>, TmuxError>
         &[
             "list-sessions",
             "-F",
-            "#{session_name}\t#{session_attached}",
+            "#{session_name}\t#{session_attached}\t#{session_windows}",
         ],
     )?;
     let mut rows = Vec::new();
@@ -50,12 +52,21 @@ pub fn list_sessions(socket: Option<&str>) -> Result<Vec<SessionRow>, TmuxError>
         if line.is_empty() {
             continue;
         }
-        let (name, attached) = line
-            .split_once('\t')
-            .ok_or_else(|| TmuxError::Protocol(format!("list-sessions line: {line:?}")))?;
+        let (name, attached, tabs) = match line.split_once('\t') {
+            Some((name, rest)) => {
+                let (attached, tabs) = rest
+                    .split_once('\t')
+                    .ok_or_else(|| TmuxError::Protocol(format!("list-sessions line: {line:?}")))?;
+                (name, attached, tabs)
+            }
+            None => return Err(TmuxError::Protocol(format!("list-sessions line: {line:?}"))),
+        };
         rows.push(SessionRow {
             name: name.to_string(),
             attached: attached == "1",
+            tab_count: tabs
+                .parse()
+                .map_err(|e| TmuxError::Protocol(format!("session_windows: {e}")))?,
         });
     }
     Ok(rows)

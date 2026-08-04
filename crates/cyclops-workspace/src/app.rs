@@ -18,14 +18,15 @@ use crate::bindings::{load_bindings, BindingAction};
 use crate::copy;
 use crate::input::encode_send_keys;
 use crate::input::router::{Router, RouterResult};
-use crate::model::{RuntimeRegistry, SessionModel};
-use crate::render::{paint_dialog, paint_tab_bar, paint_window};
-use crate::sync::{fetch_session_model, hydrate_visible_tab};
+use crate::model::{RuntimeRegistry, WorkspaceModel};
+use crate::render::{paint_dialog, paint_sidebar, paint_tab_bar, paint_window};
+use crate::sync::{fetch_workspace_model, hydrate_visible_tab};
 use crate::term_guard::TermGuard;
 use crate::theme::Paint;
 
 const RECONCILE_DEBOUNCE: Duration = Duration::from_millis(30);
 const TAB_BAR_HEIGHT: u16 = 1;
+const SIDEBAR_WIDTH: u16 = 20;
 
 enum AppMsg {
     Input(KeyEvent),
@@ -35,7 +36,7 @@ enum AppMsg {
 }
 
 struct App {
-    model: SessionModel,
+    model: WorkspaceModel,
     runtimes: RuntimeRegistry,
     router: Router,
     paint: Paint,
@@ -84,7 +85,7 @@ pub async fn run_async() -> i32 {
         eprintln!("{e}");
     }
 
-    let model = match fetch_session_model(&session, socket) {
+    let model = match fetch_workspace_model(&session, socket) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{e}");
@@ -130,7 +131,9 @@ pub async fn run_async() -> i32 {
                 | Notification::WindowAdd { .. }
                 | Notification::WindowClose { .. }
                 | Notification::WindowRenamed { .. }
-                | Notification::WindowPaneChanged { .. } => {
+                | Notification::WindowPaneChanged { .. }
+                | Notification::SessionsChanged
+                | Notification::SessionRenamed { .. } => {
                     let _ = out_tx.send(AppMsg::Reconcile);
                 }
                 Notification::Exit { .. } => break,
@@ -264,14 +267,16 @@ async fn handle_app_msg(
 
 async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_tmux::TmuxError> {
     let active_window = app.model.active_tab().window_id.clone();
-    let model = fetch_session_model(&app.model.session, app.socket.as_deref())?;
+    let session = app.model.session.session.clone();
+    let model = fetch_workspace_model(&session, app.socket.as_deref())?;
     let active_tab = model
+        .session
         .tabs
         .iter()
         .position(|t| t.window_id == active_window)
-        .unwrap_or(model.active_tab);
+        .unwrap_or(model.session.active_tab);
     app.model = model;
-    app.model.active_tab = active_tab;
+    app.model.session.active_tab = active_tab;
     hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await
 }
 
@@ -309,18 +314,52 @@ async fn dispatch_action(
     action: BindingAction,
 ) -> Result<(), cyclops_tmux::TmuxError> {
     let pane = app.model.active_tab().active_pane.clone();
-    if action == BindingAction::ClosePane {
-        let home = cyclops_proto::cyclops_home();
-        if pane_has_agent(&home, &pane) {
-            app.dialog = Some(Dialog::confirm_close(&pane));
+    match action {
+        BindingAction::ClosePane => {
+            let home = cyclops_proto::cyclops_home();
+            if pane_has_agent(&home, &pane) {
+                app.dialog = Some(Dialog::confirm_close(&pane));
+                return Ok(());
+            }
+            intent::execute(client, Intent::ClosePane, &pane).await?;
+        }
+        BindingAction::RenameTab => {
+            app.dialog = Some(Dialog::RenameTab {
+                buffer: String::new(),
+            });
             return Ok(());
         }
+        BindingAction::NewWorkspace => {
+            app.dialog = Some(Dialog::NewWorkspace {
+                buffer: String::new(),
+            });
+            return Ok(());
+        }
+        BindingAction::RenameWorkspace => {
+            app.dialog = Some(Dialog::RenameWorkspace {
+                buffer: String::new(),
+            });
+            return Ok(());
+        }
+        BindingAction::CloseWorkspace => {
+            app.dialog = Some(Dialog::ConfirmCloseWorkspace);
+            return Ok(());
+        }
+        BindingAction::NextWorkspace => {
+            let active = app.model.active_workspace;
+            let workspaces = app.model.workspaces.clone();
+            intent::execute_switch_workspace_by_delta(client, &workspaces, active, 1).await?;
+        }
+        BindingAction::PrevWorkspace => {
+            let active = app.model.active_workspace;
+            let workspaces = app.model.workspaces.clone();
+            intent::execute_switch_workspace_by_delta(client, &workspaces, active, -1).await?;
+        }
+        other => {
+            intent::execute(client, Intent::from(other), &pane).await?;
+        }
     }
-    if action == BindingAction::RenameTab {
-        app.dialog = Some(Dialog::RenameTab { buffer: String::new() });
-        return Ok(());
-    }
-    intent::execute(client, Intent::from(action), &pane).await
+    Ok(())
 }
 
 async fn handle_dialog_key(
@@ -361,6 +400,56 @@ async fn handle_dialog_key(
             }
             _ => {}
         },
+        Dialog::NewWorkspace { mut buffer } => match key.code {
+            KeyCode::Esc => app.dialog = None,
+            KeyCode::Enter => {
+                app.dialog = None;
+                if !buffer.is_empty() {
+                    let path = std::path::PathBuf::from(&buffer);
+                    intent::execute_new_workspace(client, &path).await?;
+                    reconcile(app, client).await?;
+                }
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+                app.dialog = Some(Dialog::NewWorkspace { buffer });
+            }
+            KeyCode::Char(c) => {
+                buffer.push(c);
+                app.dialog = Some(Dialog::NewWorkspace { buffer });
+            }
+            _ => {}
+        },
+        Dialog::RenameWorkspace { mut buffer } => match key.code {
+            KeyCode::Esc => app.dialog = None,
+            KeyCode::Enter => {
+                app.dialog = None;
+                if !buffer.is_empty() {
+                    intent::execute_rename_workspace(client, &buffer).await?;
+                    reconcile(app, client).await?;
+                }
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+                app.dialog = Some(Dialog::RenameWorkspace { buffer });
+            }
+            KeyCode::Char(c) => {
+                buffer.push(c);
+                app.dialog = Some(Dialog::RenameWorkspace { buffer });
+            }
+            _ => {}
+        },
+        Dialog::ConfirmCloseWorkspace => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                app.dialog = None;
+                intent::execute_close_workspace(client).await?;
+                reconcile(app, client).await?;
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                app.dialog = None;
+            }
+            _ => {}
+        },
     }
     Ok(DetachOutcome::Continue)
 }
@@ -369,23 +458,42 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App) -> io:
     terminal
         .draw(|f| {
             let area = f.area();
-            let tab_area = Rect::new(area.x, area.y, area.width, TAB_BAR_HEIGHT);
+            let (sidebar_area, main_area) = if app.model.sidebar_visible {
+                let chunks = ratatui::layout::Layout::default()
+                    .direction(ratatui::layout::Direction::Horizontal)
+                    .constraints([
+                        ratatui::layout::Constraint::Length(SIDEBAR_WIDTH),
+                        ratatui::layout::Constraint::Min(0),
+                    ])
+                    .split(area);
+                (Some(chunks[0]), chunks[1])
+            } else {
+                (None, area)
+            };
+            if let Some(sidebar) = sidebar_area {
+                paint_sidebar(
+                    &app.model.workspaces,
+                    app.model.active_workspace,
+                    sidebar,
+                    f.buffer_mut(),
+                    &app.paint,
+                );
+            }
+            let tab_area = Rect::new(main_area.x, main_area.y, main_area.width, TAB_BAR_HEIGHT);
             let canvas = Rect::new(
-                area.x,
-                area.y + TAB_BAR_HEIGHT,
-                area.width,
-                area.height.saturating_sub(TAB_BAR_HEIGHT),
+                main_area.x,
+                main_area.y + TAB_BAR_HEIGHT,
+                main_area.width,
+                main_area.height.saturating_sub(TAB_BAR_HEIGHT),
             );
             paint_tab_bar(
-                &app.model.tabs,
-                app.model.active_tab,
+                &app.model.session.tabs,
+                app.model.session.active_tab,
                 tab_area,
                 f.buffer_mut(),
                 &app.paint,
             );
             let tab = app.model.active_tab();
-            let _ = tab.index;
-            let _ = tab.zoomed;
             paint_window(tab, &app.runtimes, canvas, f.buffer_mut(), &app.paint);
             if let Some(dialog) = &app.dialog {
                 paint_dialog(dialog, f.area(), f.buffer_mut(), &app.paint);

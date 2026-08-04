@@ -68,6 +68,18 @@ pub fn tab_inactive(paint: &Paint) -> Style {
     paint.style_token(tokens::SURFACE_DIM)
 }
 
+pub fn sidebar_row_active(paint: &Paint) -> Style {
+    paint.style_token(tokens::SURFACE_ACCENT)
+}
+
+pub fn sidebar_row(paint: &Paint) -> Style {
+    paint.style_token(tokens::SURFACE_DIM)
+}
+
+pub fn sidebar_label(paint: &Paint) -> Style {
+    paint.style_token(tokens::SURFACE_FG)
+}
+
 pub fn pane_cell(paint: &Paint) -> Style {
     paint.style_token(tokens::SURFACE_FG)
 }

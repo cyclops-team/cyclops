@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use crate::layout::layout_pane_slots;
 use crate::copy;
 use crate::dialog::Dialog;
-use crate::model::{PaneSlot, RuntimeRegistry, TabModel};
+use crate::model::{PaneSlot, RuntimeRegistry, TabModel, WorkspaceRow};
 use crate::runtime::{CellGrid, Color, GridCell};
 use crate::theme::{self, Paint};
 
@@ -29,6 +29,11 @@ pub fn paint_dialog(dialog: &Dialog, area: Rect, buf: &mut Buffer, paint: &Paint
     let text = match dialog {
         Dialog::ConfirmClosePane { .. } => copy::CONFIRM_CLOSE_PANE.to_string(),
         Dialog::RenameTab { buffer } => format!("{}{}", copy::RENAME_TAB_PROMPT, buffer),
+        Dialog::NewWorkspace { buffer } => format!("{}{}", copy::NEW_WORKSPACE_PROMPT, buffer),
+        Dialog::RenameWorkspace { buffer } => {
+            format!("{}{}", copy::RENAME_WORKSPACE_PROMPT, buffer)
+        }
+        Dialog::ConfirmCloseWorkspace => copy::CONFIRM_CLOSE_WORKSPACE.to_string(),
     };
     Paragraph::new(text).render(inner, buf);
 }
@@ -53,6 +58,38 @@ pub fn paint_pane(grid: &CellGrid, area: Rect, buf: &mut Buffer, paint: &Paint) 
             }
         }
     }
+}
+
+/// Render the workspace sidebar.
+pub fn paint_sidebar(
+    workspaces: &[WorkspaceRow],
+    active: usize,
+    area: Rect,
+    buf: &mut Buffer,
+    paint: &Paint,
+) {
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        " Workspaces",
+        theme::sidebar_label(paint),
+    )));
+    for (i, ws) in workspaces.iter().enumerate() {
+        let marker = if i == active { "▸" } else { " " };
+        let style = if i == active {
+            theme::sidebar_row_active(paint)
+        } else {
+            theme::sidebar_row(paint)
+        };
+        let label = format!("{marker} {} ({})", ws.name, ws.tab_count);
+        lines.push(Line::from(Span::styled(label, style)));
+    }
+    let block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(theme::pane_border(paint));
+    let inner = block.inner(area);
+    block.render(area, buf);
+    let para = Paragraph::new(lines);
+    para.render(inner, buf);
 }
 
 /// Render the tab bar for the active session.
@@ -156,7 +193,7 @@ mod tests {
     use super::*;
     use crate::dialog::Dialog;
     use crate::layout::{parse_layout, resolve_layout};
-    use crate::model::{RuntimeRegistry, TabModel};
+    use crate::model::{RuntimeRegistry, TabModel, WorkspaceRow};
     use crate::runtime::{CellAttrs, GridCell};
     use crate::theme::Paint;
     use ratatui::backend::TestBackend;
@@ -235,6 +272,52 @@ mod tests {
             }
         }
         assert!(saw_border, "pane borders should render");
+    }
+
+    #[test]
+    fn sidebar_rows_render_with_selection() {
+        let workspaces = vec![
+            WorkspaceRow {
+                name: "cyclops".into(),
+                tab_count: 2,
+                active: true,
+            },
+            WorkspaceRow {
+                name: "website".into(),
+                tab_count: 1,
+                active: false,
+            },
+        ];
+        let backend = TestBackend::new(20, 6);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+        term.draw(|f| {
+            paint_sidebar(&workspaces, 0, f.area(), f.buffer_mut(), &theme);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let flat: String = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| buf[(x, y)].symbol().to_string()))
+            .collect();
+        assert!(flat.contains("cyclops"), "sidebar should list workspace: {flat}");
+        assert!(flat.contains('▸'), "active row should be marked");
+    }
+
+    #[test]
+    fn new_workspace_dialog_renders() {
+        let backend = TestBackend::new(50, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+        let dialog = Dialog::NewWorkspace {
+            buffer: "/tmp/proj".into(),
+        };
+        term.draw(|f| paint_dialog(&dialog, f.area(), f.buffer_mut(), &theme))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let flat: String = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| buf[(x, y)].symbol().to_string()))
+            .collect();
+        assert!(flat.contains("New workspace folder"));
     }
 
     #[test]

@@ -2,11 +2,38 @@
 
 use std::collections::HashMap;
 
-use cyclops_tmux::{list_panes, list_windows, ControlClient, TmuxError, WindowPaneRow, WindowRow};
+use cyclops_tmux::{list_panes, list_sessions, list_windows, ControlClient, TmuxError, WindowPaneRow, WindowRow};
 
 use crate::layout::{pane_ids_in_layout, parse_layout, resolve_layout};
-use crate::model::{RuntimeRegistry, SessionModel, TabModel};
+use crate::model::{RuntimeRegistry, SessionModel, TabModel, WorkspaceModel, WorkspaceRow};
 use crate::runtime::{snapshot_from_bundle, PaneRuntime};
+
+/// Build the full workspace model from tmux.
+pub fn fetch_workspace_model(
+    active_session: &str,
+    socket: Option<&str>,
+) -> Result<WorkspaceModel, TmuxError> {
+    let sessions = list_sessions(socket)?;
+    let workspaces: Vec<WorkspaceRow> = sessions
+        .iter()
+        .map(|s| WorkspaceRow {
+            name: s.name.clone(),
+            tab_count: s.tab_count,
+            active: s.name == active_session,
+        })
+        .collect();
+    let active_workspace = workspaces
+        .iter()
+        .position(|w| w.name == active_session)
+        .unwrap_or(0);
+    let session = fetch_session_model(active_session, socket)?;
+    Ok(WorkspaceModel {
+        workspaces,
+        active_workspace,
+        session,
+        sidebar_visible: true,
+    })
+}
 
 /// Build the session model from tmux list commands.
 pub fn fetch_session_model(session: &str, socket: Option<&str>) -> Result<SessionModel, TmuxError> {
@@ -90,6 +117,19 @@ mod tests {
 
     use super::*;
     use crate::model::RuntimeRegistry;
+
+    #[tokio::test]
+    async fn foreign_session_appears_in_workspace_list() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("ws-list");
+        server.run_ok(&["new-session", "-d", "-s", "alpha", "/bin/sh"]);
+        server.run_ok(&["new-session", "-d", "-s", "beta", "/bin/sh"]);
+        let model = fetch_workspace_model("alpha", Some(server.socket())).expect("model");
+        assert_eq!(model.workspaces.len(), 2);
+        assert!(model.workspaces.iter().any(|w| w.name == "beta"));
+    }
 
     #[tokio::test]
     async fn tab_switch_rehydrates_panes_to_match_capture() {

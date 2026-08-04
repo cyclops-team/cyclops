@@ -9,3 +9,9 @@ pub const HELP_HINT: &str = "Run cyclops --help for commands.";
 pub const CONFIRM_CLOSE_PANE: &str = "Close this pane? An agent may be running. [y/N]";
 
 pub const RENAME_TAB_PROMPT: &str = "Rename tab: ";
+
+pub const NEW_WORKSPACE_PROMPT: &str = "New workspace folder: ";
+
+pub const RENAME_WORKSPACE_PROMPT: &str = "Rename workspace: ";
+
+pub const CONFIRM_CLOSE_WORKSPACE: &str = "Close this workspace? [y/N]";
