@@ -2,6 +2,7 @@
 
 pub mod app;
 mod bindings;
+mod config;
 mod copy;
 mod input;
 mod layout;

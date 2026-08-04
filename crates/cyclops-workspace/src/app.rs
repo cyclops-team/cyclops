@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Duration, Instant};
 
 use crate::bindings::{load_bindings, BindingAction};
+use crate::config::load_tmux_config;
 use crate::copy;
 use crate::input::encode_send_keys;
 use crate::input::router::{Router, RouterResult};
@@ -40,7 +41,10 @@ struct App {
 
 /// Run the workspace on a tty. Returns the process exit code.
 pub async fn run_async() -> i32 {
-    let sessions = match list_sessions(None) {
+    let tmux_cfg = load_tmux_config(&cyclops_proto::cyclops_home());
+    let socket_name = tmux_cfg.socket.clone();
+    let socket = socket_name.as_deref();
+    let sessions = match list_sessions(socket) {
         Ok(s) => s,
         Err(_) => {
             eprintln!("{}", copy::NO_TMUX_SERVER);
@@ -57,7 +61,13 @@ pub async fn run_async() -> i32 {
         return 0;
     };
 
-    let cfg = ControlConfig::attach(&session);
+    let mut cfg = ControlConfig::attach(&session);
+    if let Some(ref sock) = socket_name {
+        cfg = cfg.on_socket(sock.clone());
+    }
+    if let Some(path) = tmux_cfg.config_file {
+        cfg = cfg.with_config_file(path);
+    }
     let (client, mut notif_rx) = match ControlClient::spawn(cfg).await {
         Ok(pair) => pair,
         Err(e) => {
@@ -70,7 +80,7 @@ pub async fn run_async() -> i32 {
         eprintln!("{e}");
     }
 
-    let model = match fetch_session_model(&session, None) {
+    let model = match fetch_session_model(&session, socket) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{e}");
@@ -135,8 +145,10 @@ pub async fn run_async() -> i32 {
     };
 
     let size = crossterm::terminal::size().unwrap_or((80, 24));
-    if let Err(e) = client.set_client_size(size.0, size.1).await {
-        eprintln!("{e}");
+    if size.0 >= 20 && size.1 >= 8 {
+        if let Err(e) = client.set_client_size(size.0, size.1).await {
+            eprintln!("{e}");
+        }
     }
 
     let mut terminal = match Terminal::new(CrosstermBackend::new(io::stdout())) {
@@ -154,48 +166,30 @@ pub async fn run_async() -> i32 {
         runtimes,
         router: Router::new(bindings),
         paint: Paint::detect(),
-        socket: None,
+        socket: socket_name,
     };
 
     let mut debounce: Option<Instant> = None;
     let mut detached = false;
     let _ = draw(&mut terminal, &app);
     while !detached {
-        let deadline = debounce;
-        tokio::select! {
-            biased;
-            msg = rx.recv() => {
-                let Some(msg) = msg else { break };
-                match msg {
-                    AppMsg::Redraw => debounce = Some(Instant::now() + RECONCILE_DEBOUNCE),
-                    AppMsg::Reconcile => {
-                        if let Err(e) = reconcile(&mut app, &client).await {
-                            eprintln!("{e}");
-                        }
-                        debounce = Some(Instant::now() + RECONCILE_DEBOUNCE);
-                    }
-                    AppMsg::Output { pane, bytes } => {
-                        if app.is_visible_pane(&pane) {
-                            if let Some(rt) = app.runtimes.get_mut(&pane) {
-                                rt.feed(&bytes);
-                            }
-                        }
-                        debounce = Some(Instant::now() + RECONCILE_DEBOUNCE);
-                    }
-                    AppMsg::Input(key) => {
-                        match handle_key(&mut app, &client, key).await {
-                            Ok(DetachOutcome::Detached) => detached = true,
-                            Ok(DetachOutcome::Continue) => {
-                                debounce = Some(Instant::now() + RECONCILE_DEBOUNCE);
-                            }
-                            Err(e) => eprintln!("{e}"),
-                        }
+        if let Some(deadline) = debounce {
+            tokio::select! {
+                biased;
+                msg = rx.recv() => {
+                    if !handle_app_msg(msg, &mut app, &client, &mut debounce, &mut detached).await {
+                        break;
                     }
                 }
+                _ = sleep_until(deadline) => {
+                    debounce = None;
+                    let _ = draw(&mut terminal, &app);
+                }
             }
-            _ = sleep_until(deadline.unwrap()), if deadline.is_some() => {
-                debounce = None;
-                let _ = draw(&mut terminal, &app);
+        } else {
+            let Some(msg) = rx.recv().await else { break };
+            if !handle_app_msg(Some(msg), &mut app, &client, &mut debounce, &mut detached).await {
+                break;
             }
         }
     }
@@ -221,6 +215,46 @@ impl App {
 enum DetachOutcome {
     Detached,
     Continue,
+}
+
+/// Handle one app message. Returns false when the channel closed.
+async fn handle_app_msg(
+    msg: Option<AppMsg>,
+    app: &mut App,
+    client: &ControlClient,
+    debounce: &mut Option<Instant>,
+    detached: &mut bool,
+) -> bool {
+    let Some(msg) = msg else {
+        return false;
+    };
+    match msg {
+        AppMsg::Redraw => *debounce = Some(Instant::now() + RECONCILE_DEBOUNCE),
+        AppMsg::Reconcile => {
+            if let Err(e) = reconcile(app, client).await {
+                eprintln!("{e}");
+            }
+            *debounce = Some(Instant::now() + RECONCILE_DEBOUNCE);
+        }
+        AppMsg::Output { pane, bytes } => {
+            if app.is_visible_pane(&pane) {
+                if let Some(rt) = app.runtimes.get_mut(&pane) {
+                    rt.feed(&bytes);
+                }
+            }
+            *debounce = Some(Instant::now() + RECONCILE_DEBOUNCE);
+        }
+        AppMsg::Input(key) => {
+            match handle_key(app, client, key).await {
+                Ok(DetachOutcome::Detached) => *detached = true,
+                Ok(DetachOutcome::Continue) => {
+                    *debounce = Some(Instant::now() + RECONCILE_DEBOUNCE);
+                }
+                Err(e) => eprintln!("{e}"),
+            }
+        }
+    }
+    true
 }
 
 async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_tmux::TmuxError> {
