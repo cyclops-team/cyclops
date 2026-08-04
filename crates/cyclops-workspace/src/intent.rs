@@ -1,6 +1,8 @@
 //! UI intents mapped to tmux operations. The model updates only from
 //! reconciliation after tmux replies and notifications — never here.
 
+#![allow(dead_code)]
+
 use std::path::Path;
 
 use cyclops_tmux::{quote_arg, ControlClient, TmuxError};
@@ -112,10 +114,7 @@ pub async fn execute_new_workspace(
 }
 
 /// Rename the attached session.
-pub async fn execute_rename_workspace(
-    client: &ControlClient,
-    name: &str,
-) -> Result<(), TmuxError> {
+pub async fn execute_rename_workspace(client: &ControlClient, name: &str) -> Result<(), TmuxError> {
     client
         .command(&format!("rename-session {}", quote_arg(name)))
         .await?;
@@ -160,6 +159,44 @@ pub async fn execute_rename(client: &ControlClient, name: &str) -> Result<(), Tm
     Ok(())
 }
 
+/// Resize a split divider by coalesced steps.
+pub async fn resize_divider(
+    client: &ControlClient,
+    pane: &str,
+    dir: crate::layout::SplitDir,
+    steps: i32,
+) -> Result<(), TmuxError> {
+    if steps == 0 {
+        return Ok(());
+    }
+    let flag = match dir {
+        crate::layout::SplitDir::Horizontal => {
+            if steps > 0 {
+                "-R"
+            } else {
+                "-L"
+            }
+        }
+        crate::layout::SplitDir::Vertical => {
+            if steps > 0 {
+                "-D"
+            } else {
+                "-U"
+            }
+        }
+    };
+    let n = steps.unsigned_abs();
+    client
+        .command(&format!(
+            "resize-pane -t {} {} {}",
+            quote_arg(pane),
+            flag,
+            n
+        ))
+        .await?;
+    Ok(())
+}
+
 async fn split(client: &ControlClient, pane: &str, horizontal: bool) -> Result<(), TmuxError> {
     let path = client
         .display(pane, "#{pane_current_path}")
@@ -198,7 +235,7 @@ impl From<crate::bindings::BindingAction> for Intent {
             NextWorkspace | PrevWorkspace | NewWorkspace | RenameWorkspace | CloseWorkspace => {
                 unreachable!("workspace actions use dedicated handlers")
             }
-            Detach => unreachable!("detach is not an intent"),
+            ToggleEventPanel | Detach => unreachable!("handled in app"),
         }
     }
 }
@@ -231,13 +268,7 @@ mod tests {
             .await
             .expect("create");
         assert_eq!(name, "cyclops-ws-create");
-        let out = server.run(&[
-            "display-message",
-            "-p",
-            "-t",
-            &name,
-            "#{session_path}",
-        ]);
+        let out = server.run(&["display-message", "-p", "-t", &name, "#{session_path}"]);
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
             folder,
@@ -263,15 +294,7 @@ mod tests {
         let server = TmuxServer::new("intent-split");
         let src = "/tmp/cyclops-split-src";
         std::fs::create_dir_all(src).expect("split src dir");
-        server.run_ok(&[
-            "new-session",
-            "-d",
-            "-s",
-            "s",
-            "-c",
-            src,
-            "/bin/sh",
-        ]);
+        server.run_ok(&["new-session", "-d", "-s", "s", "-c", src, "/bin/sh"]);
         let client = rig_client(&server, "s").await;
         let before = pane_ids(&server, "s");
         let pane = before[0].clone();
@@ -339,10 +362,7 @@ mod tests {
         let client = rig_client(&server, "s").await;
         execute_rename(&client, "review").await.expect("rename");
         let out = server.run(&["list-windows", "-t", "s", "-F", "#{window_name}"]);
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim(),
-            "review"
-        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "review");
         client.shutdown().await;
     }
 
@@ -353,11 +373,21 @@ mod tests {
         }
         let server = TmuxServer::new("intent-close-tab");
         server.run_ok(&["new-session", "-d", "-s", "closetab", "/bin/sh"]);
-        server.run_ok(&["new-window", "-d", "-t", "closetab", "-n", "extra", "/bin/sh"]);
+        server.run_ok(&[
+            "new-window",
+            "-d",
+            "-t",
+            "closetab",
+            "-n",
+            "extra",
+            "/bin/sh",
+        ]);
         let client = rig_client(&server, "closetab").await;
         client.command("select-window -t :1").await.expect("focus");
         let pane = pane_ids(&server, "closetab:1")[0].clone();
-        execute(&client, Intent::CloseTab, &pane).await.expect("close tab");
+        execute(&client, Intent::CloseTab, &pane)
+            .await
+            .expect("close tab");
         let out = server.run(&["list-windows", "-t", "closetab", "-F", "#{window_name}"]);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let names: Vec<_> = stdout.lines().filter(|l| !l.is_empty()).collect();
@@ -375,7 +405,9 @@ mod tests {
         server.run_ok(&["split-window", "-h", "-t", "z"]);
         let client = rig_client(&server, "z").await;
         let pane = pane_ids(&server, "z")[0].clone();
-        execute(&client, Intent::ZoomPane, &pane).await.expect("zoom");
+        execute(&client, Intent::ZoomPane, &pane)
+            .await
+            .expect("zoom");
         let out = server.run(&["list-windows", "-t", "z", "-F", "#{window_zoomed_flag}"]);
         let zoomed = String::from_utf8_lossy(&out.stdout);
         assert_eq!(zoomed.trim(), "1", "window should be zoomed with 2+ panes");

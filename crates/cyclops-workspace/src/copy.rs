@@ -22,3 +22,5 @@ pub const PAUSED_NOTE: &str = "paused";
 
 pub const SERVER_GONE_OFFER: &str =
     "tmux server is gone. Start a new session with: tmux new -s main";
+
+pub const EVENT_PANEL_EMPTY: &str = "No events yet.";

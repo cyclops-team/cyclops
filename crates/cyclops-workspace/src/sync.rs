@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 
-use cyclops_tmux::{list_panes, list_sessions, list_windows, ControlClient, TmuxError, WindowPaneRow, WindowRow};
+use cyclops_tmux::{
+    list_panes, list_sessions, list_windows, ControlClient, TmuxError, WindowPaneRow, WindowRow,
+};
 
 use crate::layout::{pane_ids_in_layout, parse_layout, resolve_layout};
 use crate::model::{RuntimeRegistry, SessionModel, TabModel, WorkspaceModel, WorkspaceRow};

@@ -1,18 +1,23 @@
 //! Paint pane grids into a Ratatui buffer.
 
+#![allow(clippy::too_many_arguments, dead_code)]
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color as RtColor, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
-use crate::layout::layout_pane_slots;
 use crate::copy;
-use crate::input::mouse::{HitMap, HitTarget};
+use crate::decoration::DecorationSnapshot;
 use crate::dialog::Dialog;
+use crate::drag::{DragState, DragTarget};
+use crate::input::mouse::{HitMap, HitTarget, PaneGeometry};
+use crate::layout::{layout_pane_slots, SplitDir};
 use crate::model::{PaneSlot, RuntimeRegistry, TabModel, WorkspaceRow};
 use crate::resilience::LinkState;
 use crate::runtime::{CellGrid, Color, GridCell};
+use crate::selection::Selection;
 use crate::theme::{self, Paint};
 
 /// Paint a modal dialog centered in `area`.
@@ -70,12 +75,24 @@ pub fn paint_sidebar(
     buf: &mut Buffer,
     paint: &Paint,
     hits: &mut HitMap,
+    decoration: &DecorationSnapshot,
 ) {
     let mut lines = Vec::new();
-    lines.push(Line::from(Span::styled(
-        " Workspaces",
-        theme::sidebar_label(paint),
-    )));
+    let eye = if decoration.workspace_needs_attention() {
+        " ◉"
+    } else {
+        ""
+    };
+    lines.push(Line::from(vec![
+        Span::styled(" Workspaces", theme::sidebar_label(paint)),
+        Span::styled(eye, theme::attention_eye(paint)),
+    ]));
+    if !decoration.online {
+        lines.push(Line::from(Span::styled(
+            " cyclopsd offline",
+            theme::sidebar_row(paint),
+        )));
+    }
     for (i, ws) in workspaces.iter().enumerate() {
         let marker = if i == active { "▸" } else { " " };
         let style = if i == active {
@@ -104,7 +121,12 @@ pub fn paint_sidebar(
         }
     }
     hits.push(
-        Rect::new(area.x, area.y + area.height.saturating_sub(1), area.width, 1),
+        Rect::new(
+            area.x,
+            area.y + area.height.saturating_sub(1),
+            area.width,
+            1,
+        ),
         HitTarget::AppMenu,
     );
 }
@@ -117,6 +139,7 @@ pub fn paint_tab_bar(
     buf: &mut Buffer,
     paint: &Paint,
     hits: &mut HitMap,
+    decoration: &DecorationSnapshot,
 ) {
     let mut spans = Vec::new();
     for (i, tab) in tabs.iter().enumerate() {
@@ -128,7 +151,12 @@ pub fn paint_tab_bar(
         } else {
             theme::tab_inactive(paint)
         };
-        spans.push(Span::styled(format!(" {} ", tab.name), style));
+        let attn = if decoration.tab_needs_attention(&tab.window_id) {
+            " ◉"
+        } else {
+            ""
+        };
+        spans.push(Span::styled(format!(" {} {attn}", tab.name), style));
     }
     spans.push(Span::raw(" +"));
     let line = Line::from(spans);
@@ -142,6 +170,16 @@ pub fn paint_tab_bar(
     }
 }
 
+/// Chrome state passed through the window paint pass.
+pub struct WindowPaintCtx<'a> {
+    pub link: LinkState,
+    pub paused: &'a std::collections::HashSet<String>,
+    pub hits: &'a mut HitMap,
+    pub decoration: &'a DecorationSnapshot,
+    pub selection: Option<&'a Selection>,
+    pub drag: Option<&'a DragState>,
+}
+
 /// Render every pane of the active window with borders.
 pub fn paint_window(
     tab: &TabModel,
@@ -149,13 +187,15 @@ pub fn paint_window(
     canvas: Rect,
     buf: &mut Buffer,
     paint: &Paint,
-    link: LinkState,
-    paused: &std::collections::HashSet<String>,
-    hits: &mut HitMap,
+    ctx: &mut WindowPaintCtx<'_>,
 ) {
     let slots = layout_pane_slots(&tab.layout, canvas, &tab.active_pane);
-    for slot in slots {
-        paint_pane_slot(&slot, runtimes, buf, paint, link, paused, hits);
+    record_divider_hits(&slots, ctx.hits);
+    for slot in &slots {
+        paint_pane_slot(slot, runtimes, buf, paint, ctx);
+    }
+    if let Some(drag) = ctx.drag.filter(|d| d.is_active()) {
+        paint_drag_preview(drag, buf, paint);
     }
 }
 
@@ -164,9 +204,7 @@ fn paint_pane_slot(
     runtimes: &RuntimeRegistry,
     buf: &mut Buffer,
     paint: &Paint,
-    link: LinkState,
-    paused: &std::collections::HashSet<String>,
-    hits: &mut HitMap,
+    ctx: &mut WindowPaintCtx<'_>,
 ) {
     if slot.rect.width == 0 || slot.rect.height == 0 {
         return;
@@ -176,13 +214,21 @@ fn paint_pane_slot(
     } else {
         theme::pane_border(paint)
     };
-    if matches!(link, LinkState::Reconnecting { .. }) {
+    if matches!(ctx.link, LinkState::Reconnecting { .. }) {
         border_style = border_style.add_modifier(Modifier::DIM);
     }
-    let mut title = format!(" {} ", slot.pane_id);
-    if matches!(link, LinkState::Reconnecting { .. }) {
+    let dec = ctx.decoration.pane(&slot.pane_id);
+    let badge = dec
+        .map(|d| DecorationSnapshot::state_badge(d.state))
+        .unwrap_or_default();
+    let attn = dec
+        .filter(|d| d.needs_attention)
+        .map(|_| " ◉")
+        .unwrap_or_default();
+    let mut title = format!(" {} · {badge}{attn} ", slot.pane_id);
+    if matches!(ctx.link, LinkState::Reconnecting { .. }) {
         title = format!(" {} · {} ", slot.pane_id, copy::RECONNECTING_NOTE);
-    } else if paused.contains(&slot.pane_id) {
+    } else if ctx.paused.contains(&slot.pane_id) {
         title = format!(" {} · {} ", slot.pane_id, copy::PAUSED_NOTE);
     }
     let block = Block::default()
@@ -191,20 +237,41 @@ fn paint_pane_slot(
         .title(title);
     let inner = block.inner(slot.rect);
     block.render(slot.rect, buf);
-    hits.push(inner, HitTarget::PaneBody {
+    ctx.hits.push(
+        Rect::new(slot.rect.x, slot.rect.y, slot.rect.width, 1),
+        HitTarget::PaneBorder {
+            pane_id: slot.pane_id.clone(),
+        },
+    );
+    if dec.is_some_and(|d| d.needs_attention) {
+        ctx.hits.push(
+            Rect::new(slot.rect.x + 1, slot.rect.y, 3, 1),
+            HitTarget::AttentionIndicator {
+                pane_id: slot.pane_id.clone(),
+            },
+        );
+    }
+    ctx.hits.push(
+        inner,
+        HitTarget::PaneBody {
+            pane_id: slot.pane_id.clone(),
+        },
+    );
+    ctx.hits.push_geometry(PaneGeometry {
         pane_id: slot.pane_id.clone(),
+        inner,
+        cols: inner.width,
+        rows: inner.height,
     });
     if inner.width >= 4 && inner.height >= 1 {
-        let ctrl = Rect::new(
-            inner.x + inner.width.saturating_sub(3),
-            inner.y,
-            3,
-            1,
+        let ctrl = Rect::new(inner.x + inner.width.saturating_sub(3), inner.y, 3, 1);
+        ctx.hits.push(
+            ctrl,
+            HitTarget::PaneSplitRight {
+                pane_id: slot.pane_id.clone(),
+            },
         );
-        hits.push(ctrl, HitTarget::PaneSplitRight {
-            pane_id: slot.pane_id.clone(),
-        });
-        hits.push(
+        ctx.hits.push(
             Rect::new(ctrl.x.saturating_sub(2), inner.y, 2, 1),
             HitTarget::PaneSplitDown {
                 pane_id: slot.pane_id.clone(),
@@ -214,11 +281,135 @@ fn paint_pane_slot(
     if let Some(runtime) = runtimes.get(&slot.pane_id) {
         let grid = runtime.grid();
         let mut base = theme::pane_cell(paint);
-        if matches!(link, LinkState::Reconnecting { .. }) {
+        if matches!(ctx.link, LinkState::Reconnecting { .. }) {
             base = base.add_modifier(Modifier::DIM);
         }
         paint_pane_dim(grid.grid, inner, buf, base);
+        if let Some(sel) = ctx
+            .selection
+            .filter(|s| s.pane_id == slot.pane_id)
+        {
+            paint_selection_overlay(grid.grid, inner, buf, sel, paint);
+        }
     }
+}
+
+fn record_divider_hits(slots: &[PaneSlot], hits: &mut HitMap) {
+    for i in 0..slots.len() {
+        for j in (i + 1)..slots.len() {
+            let a = &slots[i];
+            let b = &slots[j];
+            if a.rect.y == b.rect.y && a.rect.height == b.rect.height {
+                let x = a.rect.x + a.rect.width;
+                if x == b.rect.x {
+                    hits.push(
+                        Rect::new(x.saturating_sub(1), a.rect.y, 2, a.rect.height),
+                        HitTarget::Divider {
+                            pane_id: a.pane_id.clone(),
+                            dir: SplitDir::Horizontal,
+                        },
+                    );
+                }
+            }
+            if a.rect.x == b.rect.x && a.rect.width == b.rect.width {
+                let y = a.rect.y + a.rect.height;
+                if y == b.rect.y {
+                    hits.push(
+                        Rect::new(a.rect.x, y.saturating_sub(1), a.rect.width, 2),
+                        HitTarget::Divider {
+                            pane_id: a.pane_id.clone(),
+                            dir: SplitDir::Vertical,
+                        },
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn paint_selection_overlay(
+    grid: &CellGrid,
+    area: Rect,
+    buf: &mut Buffer,
+    sel: &Selection,
+    paint: &Paint,
+) {
+    let (from, to) = if sel.from.row < sel.to.row
+        || (sel.from.row == sel.to.row && sel.from.col <= sel.to.col)
+    {
+        (sel.from, sel.to)
+    } else {
+        (sel.to, sel.from)
+    };
+    let hi = theme::selection_highlight(paint);
+    for row in from.row..=to.row {
+        let col_start = if row == from.row { from.col } else { 0 };
+        let col_end = if row == to.row {
+            to.col
+        } else {
+            area.width.saturating_sub(1)
+        };
+        for col in col_start..=col_end.min(area.width.saturating_sub(1)) {
+            if let Some(cell) = grid.cell(col, row) {
+                let ch = if cell.wide_spacer || cell.ch == '\0' {
+                    ' '
+                } else {
+                    cell.ch
+                };
+                let x = area.x + col;
+                let y = area.y + row;
+                if let Some(dst) = buf.cell_mut((x, y)) {
+                    dst.set_symbol(&ch.to_string());
+                    dst.set_style(hi);
+                }
+            }
+        }
+    }
+}
+
+fn paint_drag_preview(drag: &DragState, buf: &mut Buffer, paint: &Paint) {
+    let style = theme::pane_border_focused(paint);
+    let (x, y) = drag.current;
+    let hint = match &drag.target {
+        DragTarget::Divider { .. } => "↔",
+        DragTarget::Tab { .. } => "⇄",
+        DragTarget::TabToWorkspace { .. } => "⇢",
+        DragTarget::Pane { .. } => "⤢",
+    };
+    if let Some(cell) = buf.cell_mut((x, y)) {
+        cell.set_symbol(hint);
+        cell.set_style(style);
+    }
+}
+
+/// Slide-out event panel from daemon attention items.
+pub fn paint_event_panel(lines: &[String], area: Rect, buf: &mut Buffer, paint: &Paint) {
+    let w = area.width.min(40);
+    let panel = Rect::new(
+        area.x + area.width.saturating_sub(w),
+        area.y,
+        w,
+        area.height,
+    );
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .title(" Events ")
+        .border_style(theme::pane_border_focused(paint));
+    let inner = block.inner(panel);
+    block.render(panel, buf);
+    let text: Vec<Line> = if lines.is_empty() {
+        vec![Line::from(Span::styled(
+            copy::EVENT_PANEL_EMPTY,
+            theme::sidebar_row(paint),
+        ))]
+    } else {
+        lines
+            .iter()
+            .take(inner.height as usize)
+            .map(|l| Line::from(Span::raw(l.as_str())))
+            .collect()
+    };
+    Paragraph::new(text).render(inner, buf);
 }
 
 fn paint_pane_dim(grid: &CellGrid, area: Rect, buf: &mut Buffer, base: Style) {
@@ -280,6 +471,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::decoration::DecorationSnapshot;
     use crate::dialog::Dialog;
     use crate::layout::{parse_layout, resolve_layout};
     use crate::model::{RuntimeRegistry, TabModel, WorkspaceRow};
@@ -346,17 +538,17 @@ mod tests {
                 f.buffer_mut(),
                 &theme,
                 &mut hits,
+                &DecorationSnapshot::default(),
             );
-            paint_window(
-                &tab,
-                &runtimes,
-                canvas,
-                f.buffer_mut(),
-                &theme,
-                LinkState::Live,
-                &std::collections::HashSet::new(),
-                &mut hits,
-            );
+            let mut ctx = WindowPaintCtx {
+                link: LinkState::Live,
+                paused: &std::collections::HashSet::new(),
+                hits: &mut hits,
+                decoration: &DecorationSnapshot::default(),
+                selection: None,
+                drag: None,
+            };
+            paint_window(&tab, &runtimes, canvas, f.buffer_mut(), &theme, &mut ctx);
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -400,14 +592,25 @@ mod tests {
         let theme = Paint::for_test();
         term.draw(|f| {
             let mut hits = HitMap::default();
-            paint_sidebar(&workspaces, 0, f.area(), f.buffer_mut(), &theme, &mut hits);
+            paint_sidebar(
+                &workspaces,
+                0,
+                f.area(),
+                f.buffer_mut(),
+                &theme,
+                &mut hits,
+                &DecorationSnapshot::default(),
+            );
         })
         .unwrap();
         let buf = term.backend().buffer();
         let flat: String = (0..buf.area.height)
             .flat_map(|y| (0..buf.area.width).map(move |x| buf[(x, y)].symbol().to_string()))
             .collect();
-        assert!(flat.contains("cyclops"), "sidebar should list workspace: {flat}");
+        assert!(
+            flat.contains("cyclops"),
+            "sidebar should list workspace: {flat}"
+        );
         assert!(flat.contains('▸'), "active row should be marked");
     }
 
@@ -437,23 +640,27 @@ mod tests {
         let theme = Paint::for_test();
         term.draw(|f| {
             let mut hits = HitMap::default();
-            paint_window(
-                &tab,
-                &runtimes,
-                f.area(),
-                f.buffer_mut(),
-                &theme,
-                LinkState::Reconnecting { attempt: 1 },
-                &std::collections::HashSet::new(),
-                &mut hits,
-            );
+            let paused = std::collections::HashSet::new();
+            let dec = DecorationSnapshot::default();
+            let mut ctx = WindowPaintCtx {
+                link: LinkState::Reconnecting { attempt: 1 },
+                paused: &paused,
+                hits: &mut hits,
+                decoration: &dec,
+                selection: None,
+                drag: None,
+            };
+            paint_window(&tab, &runtimes, f.area(), f.buffer_mut(), &theme, &mut ctx);
         })
         .unwrap();
         let buf = term.backend().buffer();
         let flat: String = (0..buf.area.height)
             .flat_map(|y| (0..buf.area.width).map(move |x| buf[(x, y)].symbol().to_string()))
             .collect();
-        assert!(flat.contains("reconnecting"), "border should note reconnect: {flat}");
+        assert!(
+            flat.contains("reconnecting"),
+            "border should note reconnect: {flat}"
+        );
     }
 
     #[test]
@@ -475,6 +682,97 @@ mod tests {
             })
             .collect();
         assert!(flat.contains("Close this pane"));
+    }
+
+    #[test]
+    fn selection_highlight_renders_on_test_backend() {
+        use crate::runtime::CellPos;
+        use crate::selection::Selection;
+
+        let tab = two_pane_tab();
+        let mut runtimes = RuntimeRegistry::default();
+        let mut rt = crate::runtime::PaneRuntime::new(5, 2);
+        rt.feed(b"hello\r\n");
+        runtimes.insert("%0".into(), rt);
+        let sel = Selection {
+            pane_id: "%0".into(),
+            from: CellPos { col: 0, row: 0 },
+            to: CellPos { col: 2, row: 0 },
+        };
+        let backend = TestBackend::new(40, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+        term.draw(|f| {
+            let mut hits = HitMap::default();
+            let paused = std::collections::HashSet::new();
+            let dec = DecorationSnapshot::default();
+            let mut ctx = WindowPaintCtx {
+                link: LinkState::Live,
+                paused: &paused,
+                hits: &mut hits,
+                decoration: &dec,
+                selection: Some(&sel),
+                drag: None,
+            };
+            paint_window(&tab, &runtimes, f.area(), f.buffer_mut(), &theme, &mut ctx);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let mut saw_highlight = false;
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if buf[(x, y)].bg != RtColor::Reset {
+                    saw_highlight = true;
+                }
+            }
+        }
+        assert!(saw_highlight, "selection should paint a highlight");
+    }
+
+    #[test]
+    fn agent_badge_renders_on_pane_border() {
+        use crate::decoration::{DecorationSnapshot, PaneDecoration};
+        use cyclops_proto::AgentState;
+
+        let tab = two_pane_tab();
+        let runtimes = RuntimeRegistry::default();
+        let mut decoration = DecorationSnapshot {
+            online: true,
+            ..Default::default()
+        };
+        decoration.panes.insert(
+            "%0".into(),
+            PaneDecoration {
+                pane_id: "%0".into(),
+                window_id: "@0".into(),
+                label: Some("reviewer".into()),
+                manifest: Some("claude".into()),
+                state: AgentState::Working,
+                needs_attention: false,
+            },
+        );
+        let backend = TestBackend::new(40, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+        term.draw(|f| {
+            let mut hits = HitMap::default();
+            let paused = std::collections::HashSet::new();
+            let mut ctx = WindowPaintCtx {
+                link: LinkState::Live,
+                paused: &paused,
+                hits: &mut hits,
+                decoration: &decoration,
+                selection: None,
+                drag: None,
+            };
+            paint_window(&tab, &runtimes, f.area(), f.buffer_mut(), &theme, &mut ctx);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let flat: String = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| buf[(x, y)].symbol().to_string()))
+            .collect();
+        assert!(flat.contains("working"), "badge word should render: {flat}");
     }
 
     #[test]

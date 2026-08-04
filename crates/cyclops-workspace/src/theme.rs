@@ -83,3 +83,13 @@ pub fn sidebar_label(paint: &Paint) -> Style {
 pub fn pane_cell(paint: &Paint) -> Style {
     paint.style_token(tokens::SURFACE_FG)
 }
+
+pub fn attention_eye(paint: &Paint) -> Style {
+    paint.style_token(tokens::EYE_ALERT)
+}
+
+pub fn selection_highlight(paint: &Paint) -> Style {
+    paint
+        .style_token(tokens::SURFACE_ACCENT)
+        .bg(RtColor::Indexed(236))
+}

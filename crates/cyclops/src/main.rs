@@ -128,11 +128,15 @@ enum Cmd {
         #[arg(long)]
         raw: bool,
     },
-    /// Stream daemon events, one line each. Ctrl-C exits.
+    /// Live stream of daemon events and the admin TUI. `--json` prints one
+    /// event per line; without it, opens the stream TUI (formerly `ui`).
     Watch {
-        /// Only these event kinds (prefix match), comma separated.
+        /// Only these event kinds (prefix match), comma separated. JSON mode
+        /// only; ignored when opening the TUI.
         #[arg(long, value_delimiter = ',')]
         kinds: Vec<String>,
+        #[command(flatten)]
+        ui: UiArgs,
     },
     /// Send a message. The receipt names each delivery's state; exit 0 on
     /// delivered/queued, 1 on parked or needs attention.
@@ -157,8 +161,7 @@ enum Cmd {
         #[arg(long, default_value = WAIT_TIMEOUT_DEFAULT)]
         timeout: String,
     },
-    /// Live stream of the record: admin view by default, firehose one
-    /// keypress away, the eye in the header. --plain follows line by line.
+    /// Deprecated alias for `cyclops watch`. Use `cyclops watch` instead.
     Ui(UiArgs),
     /// Relay a vendor hook event to cyclops. Silent, always exits 0.
     Hook {
@@ -516,6 +519,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
         // flags over. Building a Style here warned about the same file
         // twice.
         Cmd::Ui(args) => cmd_ui(cli, args),
+        Cmd::Watch { kinds, ui } => cmd_watch(cli, &style_for(cli), kinds, ui),
         // The workspace verbs talk to tmux, and reach the daemon only for
         // the labels. A down daemon costs them the names, not the verb, so
         // they must not go through connect().
@@ -602,7 +606,6 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
         | Cmd::List
         | Cmd::Ping
         | Cmd::Read { .. }
-        | Cmd::Watch { .. }
         | Cmd::History(_)
         | Cmd::Thread { .. }
         | Cmd::Hooks { .. } => {
@@ -621,7 +624,6 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                     source,
                     raw,
                 } => cmd_read(&mut c, cli, &style, target, *lines, (*source).into(), *raw),
-                Cmd::Watch { kinds } => cmd_watch(&mut c, cli, &style, kinds),
                 Cmd::History(args) => cmd_history(&mut c, cli, &style, args),
                 Cmd::Thread { id } => cmd_thread(&mut c, cli, &style, id),
                 Cmd::Hooks {
@@ -637,6 +639,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 | Cmd::Wait { .. }
                 | Cmd::Hooks { .. }
                 | Cmd::Ui(_)
+                | Cmd::Watch { .. }
                 | Cmd::Start(_)
                 | Cmd::Theme { .. }
                 | Cmd::Workspace { .. } => {
@@ -647,16 +650,29 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
     }
 }
 
-/// cyclops ui: hand over to cyclops-ui. --plain follows line by line, and
-/// so does a run with no terminal to take over. NO_COLOR does not: it
-/// turns the paint off and leaves the full-screen view standing, because
-/// every state there pairs a glyph with a word. --json has no meaning
-/// here; the machine stream is cyclops watch --json.
+/// cyclops watch: stream TUI by default; `--json` is the machine stream.
+fn cmd_watch(cli: &Cli, style: &Style, kinds: &[String], ui: &UiArgs) -> i32 {
+    if cli.json {
+        let mut c = match connect() {
+            Ok(c) => c,
+            Err(code) => return code,
+        };
+        return cmd_watch_json(&mut c, cli, style, kinds);
+    }
+    run_stream_ui(cli, ui)
+}
+
+/// cyclops ui: deprecated alias for `cyclops watch`.
 fn cmd_ui(cli: &Cli, args: &UiArgs) -> i32 {
     if cli.json {
         eprintln!("cyclops ui has no --json form. The machine stream is: cyclops watch --json");
         return EXIT_USAGE;
     }
+    eprintln!("cyclops ui is deprecated; use cyclops watch");
+    run_stream_ui(cli, args)
+}
+
+fn run_stream_ui(cli: &Cli, args: &UiArgs) -> i32 {
     cyclops_ui::run(cyclops_ui::UiOptions {
         plain: cli.plain,
         firehose: args.firehose,
@@ -1320,7 +1336,7 @@ fn receipts_exit_json(v: &Value) -> i32 {
     i32::from(bad)
 }
 
-fn cmd_watch(c: &mut Client, cli: &Cli, style: &Style, kinds: &[String]) -> i32 {
+fn cmd_watch_json(c: &mut Client, cli: &Cli, style: &Style, kinds: &[String]) -> i32 {
     let params = serde_json::to_value(SubscribeParams {
         kinds: kinds.to_vec(),
         cursor: None,

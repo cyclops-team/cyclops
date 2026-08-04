@@ -1,35 +1,40 @@
 //! Workspace application state and event loop.
 
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::HashSet;
 use std::io;
 
 use crossterm::event::{self, Event, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use cyclops_tmux::{list_sessions, ControlClient, ControlConfig, Notification};
+use cyclops_tmux::{ControlClient, ControlConfig, Notification};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Duration, Instant};
 
-use crate::config::load_tmux_config;
-use crate::daemon::pane_has_agent;
-use crate::dialog::Dialog;
-use crate::intent::{self, Intent};
 use crate::bindings::{load_bindings, BindingAction};
+use crate::config::load_tmux_config;
 use crate::copy;
-use crate::input::mouse::{HitMap, HitTarget, MenuState};
+use crate::daemon::pane_has_agent;
+use crate::decoration::{self, DecorationSnapshot};
+use crate::dialog::Dialog;
+use crate::drag::{DragState, DragTarget};
 use crate::input::encode_send_keys;
+use crate::input::mouse::{HitMap, HitTarget, MenuState};
 use crate::input::router::{Router, RouterResult};
+use crate::intent::{self, Intent};
 use crate::model::{RuntimeRegistry, WorkspaceModel};
-use crate::render::{paint_dialog, paint_sidebar, paint_tab_bar, paint_window};
+use crate::persist::{self, load_prefs, set_last_active, WorkspacePrefs};
+use crate::render::{paint_dialog, paint_event_panel, paint_sidebar, paint_tab_bar, paint_window};
 use crate::resilience::{self, LinkState};
+use crate::selection::{self, SelectionState};
 use crate::sync::{fetch_workspace_model, hydrate_visible_tab};
 use crate::term_guard::TermGuard;
 use crate::theme::Paint;
 
 const RECONCILE_DEBOUNCE: Duration = Duration::from_millis(30);
 const TAB_BAR_HEIGHT: u16 = 1;
-const SIDEBAR_WIDTH: u16 = 20;
 
 enum AppMsg {
     Input(KeyEvent),
@@ -54,28 +59,45 @@ struct App {
     reconnect_attempt: usize,
     hit_map: HitMap,
     menu: MenuState,
+    selection: SelectionState,
+    drag: Option<DragState>,
+    decoration: DecorationSnapshot,
+    prefs: WorkspacePrefs,
+    event_panel_open: bool,
+    event_lines: Vec<String>,
+    home: std::path::PathBuf,
 }
 
 /// Run the workspace on a tty. Returns the process exit code.
 pub async fn run_async() -> i32 {
-    let tmux_cfg = load_tmux_config(&cyclops_proto::cyclops_home());
+    let home = cyclops_proto::cyclops_home();
+    let prefs = load_prefs(&home);
+    let tmux_cfg = load_tmux_config(&home);
     let socket_name = tmux_cfg.socket.clone();
     let socket = socket_name.as_deref();
-    let sessions = match list_sessions(socket) {
+    let sessions = match cyclops_tmux::list_sessions(socket) {
         Ok(s) => s,
         Err(_) => {
             eprintln!("{}", copy::NO_TMUX_SERVER);
             return 0;
         }
     };
-    let Some(session) = sessions
-        .iter()
-        .find(|s| s.attached)
-        .or(sessions.first())
-        .map(|s| s.name.clone())
-    else {
-        eprintln!("{}", copy::NO_TMUX_SERVER);
-        return 0;
+    let session_names: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
+    let last_active = persist::get_last_active(&home);
+    let reopen = persist::reopen_fallback(
+        &session_names,
+        last_active.as_ref(),
+        None,
+        &prefs.workspace_order,
+    );
+    let session = match &reopen {
+        persist::ReopenTarget::LastActive { session, .. }
+        | persist::ReopenTarget::DefaultWorkspace(session)
+        | persist::ReopenTarget::First(session) => session.clone(),
+        persist::ReopenTarget::OfferCreate => {
+            eprintln!("{}", copy::NO_TMUX_SERVER);
+            return 0;
+        }
     };
 
     let mut cfg = ControlConfig::attach(&session);
@@ -113,7 +135,7 @@ pub async fn run_async() -> i32 {
         return 1;
     }
 
-    let bindings = load_bindings(&cyclops_proto::cyclops_home());
+    let bindings = load_bindings(&home);
     let (tx, mut rx) = mpsc::unbounded_channel::<AppMsg>();
 
     let input_tx = tx.clone();
@@ -177,7 +199,27 @@ pub async fn run_async() -> i32 {
         reconnect_attempt: 0,
         hit_map: HitMap::default(),
         menu: MenuState::None,
+        selection: SelectionState::default(),
+        drag: None,
+        decoration: decoration::fetch_decoration(&home),
+        prefs: prefs.clone(),
+        event_panel_open: false,
+        event_lines: Vec::new(),
+        home,
     };
+    app.model.sidebar_visible = prefs.sidebar_visible;
+    if let persist::ReopenTarget::LastActive { window_id, .. } = &reopen {
+        if let Some(idx) = app
+            .model
+            .session
+            .tabs
+            .iter()
+            .position(|t| t.window_id == *window_id)
+        {
+            app.model.session.active_tab = idx;
+        }
+    }
+    app.refresh_event_lines();
 
     let mut debounce: Option<Instant> = None;
     let mut reconnect_deadline: Option<Instant> = None;
@@ -287,10 +329,7 @@ fn spawn_notif_forwarder(
     });
 }
 
-fn schedule_reconnect(
-    app: &mut App,
-    reconnect_deadline: &mut Option<Instant>,
-) {
+fn schedule_reconnect(app: &mut App, reconnect_deadline: &mut Option<Instant>) {
     if !resilience::may_retry(app.reconnect_attempt) {
         app.link_state = LinkState::ServerGone;
         return;
@@ -339,6 +378,25 @@ impl App {
             .iter()
             .any(|id| id == pane)
     }
+
+    fn sidebar_width(&self) -> u16 {
+        self.prefs.sidebar_width.max(8)
+    }
+
+    fn refresh_event_lines(&mut self) {
+        self.event_lines = self
+            .decoration
+            .attention
+            .items()
+            .into_iter()
+            .map(|item| format!("{item:?}"))
+            .collect();
+    }
+
+    fn persist_active(&self) {
+        let tab = self.model.active_tab();
+        set_last_active(&self.home, &self.model.session.session, &tab.window_id);
+    }
 }
 
 enum DetachOutcome {
@@ -351,7 +409,7 @@ async fn handle_app_msg(
     msg: Option<AppMsg>,
     app: &mut App,
     client: &mut ControlClient,
-    control_cfg: &ControlConfig,
+    _control_cfg: &ControlConfig,
     _tx: &mpsc::UnboundedSender<AppMsg>,
     debounce: &mut Option<Instant>,
     reconnect_deadline: &mut Option<Instant>,
@@ -388,7 +446,9 @@ async fn handle_app_msg(
         AppMsg::PaneContinued { pane } => {
             app.paused_panes.remove(&pane);
             if app.is_visible_pane(&pane) {
-                if let Err(e) = hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await {
+                if let Err(e) =
+                    hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await
+                {
                     eprintln!("{e}");
                 }
             }
@@ -403,6 +463,10 @@ async fn handle_app_msg(
         AppMsg::Input(key) => {
             if app.link_state == LinkState::ServerGone {
                 return true;
+            }
+            if key.code == crossterm::event::KeyCode::Esc {
+                app.selection.cancel_drag();
+                app.drag = None;
             }
             app.menu.close();
             match handle_key(app, client, key).await {
@@ -426,6 +490,9 @@ async fn handle_mouse(
     let row = mouse.row;
     match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            if app.selection.is_dragging() {
+                return Ok(());
+            }
             if let Some(HitTarget::PaneBody { pane_id }) = app.hit_map.hit(col, row).cloned() {
                 let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
                     -3
@@ -443,58 +510,184 @@ async fn handle_mouse(
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(drag) = app.drag.as_mut() {
+                drag.on_move(col, row);
+                return Ok(());
+            }
             let Some(target) = app.hit_map.hit(col, row).cloned() else {
                 app.menu.close();
+                app.selection.clear();
                 return Ok(());
             };
-            match target {
+            match &target {
                 HitTarget::PaneBody { pane_id } => {
                     app.menu.close();
+                    let clicks = app.selection.register_click(&target, col, row);
+                    if let Some(geom) = app.hit_map.pane_geometry(pane_id) {
+                        if let Some(cell) = crate::input::mouse::HitMap::cell_at(geom, col, row) {
+                            match clicks {
+                                2 => {
+                                    if let Some(rt) = app.runtimes.get(pane_id) {
+                                        app.selection.set_word(pane_id.clone(), cell, &rt.grid());
+                                    }
+                                }
+                                3 => {
+                                    app.selection.set_line(pane_id.clone(), cell.row, geom.cols);
+                                }
+                                _ => {
+                                    app.selection.start_drag(pane_id.clone(), cell);
+                                }
+                            }
+                        }
+                    }
                     client
                         .command(&format!(
                             "select-pane -t {}",
-                            cyclops_tmux::quote_arg(&pane_id)
+                            cyclops_tmux::quote_arg(pane_id)
                         ))
                         .await?;
                     reconcile(app, client).await?;
                 }
-                HitTarget::PaneSplitRight { pane_id } => {
-                    app.menu.close();
-                    intent::execute(client, Intent::SplitRight, &pane_id).await?;
-                    reconcile(app, client).await?;
+                HitTarget::PaneBorder { .. }
+                | HitTarget::PaneSplitRight { .. }
+                | HitTarget::PaneSplitDown { .. } => {
+                    app.selection.clear();
+                    handle_click_target(app, client, target).await?;
                 }
-                HitTarget::PaneSplitDown { pane_id } => {
-                    app.menu.close();
-                    intent::execute(client, Intent::SplitDown, &pane_id).await?;
-                    reconcile(app, client).await?;
+                HitTarget::Divider { pane_id, dir } => {
+                    app.selection.clear();
+                    app.drag = Some(DragState::on_down(
+                        DragTarget::Divider {
+                            pane_id: pane_id.clone(),
+                            dir: *dir,
+                        },
+                        col,
+                        row,
+                    ));
                 }
                 HitTarget::Tab { index } => {
+                    app.selection.clear();
+                    app.drag = Some(DragState::on_down(
+                        DragTarget::Tab { index: *index },
+                        col,
+                        row,
+                    ));
+                }
+                HitTarget::AttentionIndicator { pane_id } => {
                     app.menu.close();
-                    intent::execute(client, Intent::SelectTab(index + 1), "").await?;
+                    client
+                        .command(&format!(
+                            "select-pane -t {}",
+                            cyclops_tmux::quote_arg(pane_id)
+                        ))
+                        .await?;
                     reconcile(app, client).await?;
                 }
-                HitTarget::SidebarRow { index } => {
-                    app.menu.close();
-                    if let Some(ws) = app.model.workspaces.get(index) {
-                        intent::execute(
-                            client,
-                            Intent::SwitchWorkspace(ws.name.clone()),
-                            "",
-                        )
-                        .await?;
-                        reconcile(app, client).await?;
+                _ => {
+                    app.selection.clear();
+                    handle_click_target(app, client, target).await?;
+                }
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if app.selection.is_dragging() {
+                if let Some(sel) = &app.selection.active {
+                    if let Some(geom) = app.hit_map.pane_geometry(&sel.pane_id) {
+                        if let Some(cell) = crate::input::mouse::HitMap::cell_at(geom, col, row) {
+                            app.selection.update_drag(cell);
+                        }
                     }
                 }
-                HitTarget::AppMenu => {
-                    app.menu = if app.menu == MenuState::AppMenu {
-                        MenuState::None
-                    } else {
-                        MenuState::AppMenu
-                    };
+            } else if let Some(drag) = app.drag.as_mut() {
+                drag.on_move(col, row);
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if app.selection.is_dragging() {
+                if let Some(sel) = app.selection.finish_drag() {
+                    if let Some(rt) = app.runtimes.get_mut(&sel.pane_id) {
+                        if let Some(text) = selection::SelectionState::extract(rt, &sel) {
+                            selection::copy_to_clipboard(&text);
+                        }
+                    }
+                }
+            } else if let Some(mut drag) = app.drag.take() {
+                if let Some(target) = drag.on_up() {
+                    commit_drag(app, client, target, &drag).await?;
+                    reconcile(app, client).await?;
                 }
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+async fn handle_click_target(
+    app: &mut App,
+    client: &ControlClient,
+    target: HitTarget,
+) -> Result<(), cyclops_tmux::TmuxError> {
+    match target {
+        HitTarget::PaneSplitRight { pane_id } => {
+            app.menu.close();
+            intent::execute(client, Intent::SplitRight, &pane_id).await?;
+            reconcile(app, client).await?;
+        }
+        HitTarget::PaneSplitDown { pane_id } => {
+            app.menu.close();
+            intent::execute(client, Intent::SplitDown, &pane_id).await?;
+            reconcile(app, client).await?;
+        }
+        HitTarget::Tab { index } => {
+            app.menu.close();
+            intent::execute(client, Intent::SelectTab(index + 1), "").await?;
+            reconcile(app, client).await?;
+        }
+        HitTarget::SidebarRow { index } => {
+            app.menu.close();
+            if let Some(ws) = app.model.workspaces.get(index) {
+                intent::execute(client, Intent::SwitchWorkspace(ws.name.clone()), "").await?;
+                reconcile(app, client).await?;
+            }
+        }
+        HitTarget::AppMenu => {
+            app.menu = if app.menu == MenuState::AppMenu {
+                MenuState::None
+            } else {
+                MenuState::AppMenu
+            };
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn commit_drag(
+    _app: &mut App,
+    client: &ControlClient,
+    target: DragTarget,
+    drag: &DragState,
+) -> Result<(), cyclops_tmux::TmuxError> {
+    match target {
+        DragTarget::Divider { pane_id, dir } => {
+            let steps = drag.divider_resize_steps(dir);
+            intent::resize_divider(client, &pane_id, dir, steps).await?;
+        }
+        DragTarget::Tab { index } => {
+            let _ = index;
+            // Reorder is reconciled from tmux notifications after swap-window.
+            client.command("swap-window -t :+").await?;
+        }
+        DragTarget::TabToWorkspace {
+            tab_index,
+            workspace_index,
+        } => {
+            let _ = (tab_index, workspace_index);
+        }
+        DragTarget::Pane { pane_id } => {
+            let _ = pane_id;
+        }
     }
     Ok(())
 }
@@ -511,6 +704,10 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
         .unwrap_or(model.session.active_tab);
     app.model = model;
     app.model.session.active_tab = active_tab;
+    app.model.sidebar_visible = app.prefs.sidebar_visible;
+    app.decoration = decoration::fetch_decoration(&app.home);
+    app.refresh_event_lines();
+    app.persist_active();
     hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await
 }
 
@@ -579,6 +776,10 @@ async fn dispatch_action(
             app.dialog = Some(Dialog::ConfirmCloseWorkspace);
             return Ok(());
         }
+        BindingAction::ToggleEventPanel => {
+            app.event_panel_open = !app.event_panel_open;
+            return Ok(());
+        }
         BindingAction::NextWorkspace => {
             let active = app.model.active_workspace;
             let workspaces = app.model.workspaces.clone();
@@ -603,6 +804,12 @@ async fn handle_dialog_key(
     dialog: Dialog,
 ) -> Result<DetachOutcome, cyclops_tmux::TmuxError> {
     use crossterm::event::KeyCode;
+    if key.code == KeyCode::Esc {
+        app.dialog = None;
+        app.selection.cancel_drag();
+        app.drag = None;
+        return Ok(DetachOutcome::Continue);
+    }
     match dialog {
         Dialog::ConfirmClosePane { pane_id } => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -693,11 +900,16 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
     terminal
         .draw(|f| {
             let area = f.area();
-            let (sidebar_area, main_area) = if app.model.sidebar_visible {
+            let sidebar_w = if app.model.sidebar_visible {
+                app.sidebar_width()
+            } else {
+                0
+            };
+            let (sidebar_area, mut main_area) = if sidebar_w > 0 {
                 let chunks = ratatui::layout::Layout::default()
                     .direction(ratatui::layout::Direction::Horizontal)
                     .constraints([
-                        ratatui::layout::Constraint::Length(SIDEBAR_WIDTH),
+                        ratatui::layout::Constraint::Length(sidebar_w),
                         ratatui::layout::Constraint::Min(0),
                     ])
                     .split(area);
@@ -705,6 +917,17 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
             } else {
                 (None, area)
             };
+            if app.event_panel_open {
+                let chunks = ratatui::layout::Layout::default()
+                    .direction(ratatui::layout::Direction::Horizontal)
+                    .constraints([
+                        ratatui::layout::Constraint::Min(0),
+                        ratatui::layout::Constraint::Length(40),
+                    ])
+                    .split(main_area);
+                main_area = chunks[0];
+                paint_event_panel(&app.event_lines, chunks[1], f.buffer_mut(), &app.paint);
+            }
             if let Some(sidebar) = sidebar_area {
                 paint_sidebar(
                     &app.model.workspaces,
@@ -713,6 +936,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
                     f.buffer_mut(),
                     &app.paint,
                     &mut app.hit_map,
+                    &app.decoration,
                 );
             }
             let tab_area = Rect::new(main_area.x, main_area.y, main_area.width, TAB_BAR_HEIGHT);
@@ -729,18 +953,18 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
                 f.buffer_mut(),
                 &app.paint,
                 &mut app.hit_map,
+                &app.decoration,
             );
             let tab = app.model.active_tab();
-            paint_window(
-                tab,
-                &app.runtimes,
-                canvas,
-                f.buffer_mut(),
-                &app.paint,
-                app.link_state,
-                &app.paused_panes,
-                &mut app.hit_map,
-            );
+            let mut ctx = crate::render::WindowPaintCtx {
+                link: app.link_state,
+                paused: &app.paused_panes,
+                hits: &mut app.hit_map,
+                decoration: &app.decoration,
+                selection: app.selection.active.as_ref(),
+                drag: app.drag.as_ref(),
+            };
+            paint_window(tab, &app.runtimes, canvas, f.buffer_mut(), &app.paint, &mut ctx);
             if let Some(dialog) = &app.dialog {
                 paint_dialog(dialog, f.area(), f.buffer_mut(), &app.paint);
             }

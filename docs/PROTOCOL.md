@@ -99,6 +99,8 @@ alphabet.
 | `events.subscribe` | Switch this connection to push mode |
 | `admin.notify` | Raise something for the human |
 | `theme.reload` | Re-read the theme selection and repaint every named pane's border |
+| `workspace_ui.get` | Last-active workspace and tab for the terminal workspace UI |
+| `workspace_ui.set` | Persist last-active workspace and tab (not a ledger fact) |
 
 ### status
 
@@ -369,6 +371,27 @@ Use a second connection for the stream if you also want to make requests.
 No params. The daemon reads the `theme` key out of `$CYCLOPS_HOME/config.toml`
 itself, so a client and the config can never disagree about what is on.
 Write the key, then call this; `cyclops theme <name>` is those two steps.
+
+### workspace_ui.get
+
+```
+-> {"id":2,"method":"workspace_ui.get","params":{}}
+<- {"id":2,"result":{"last_active_session":"main","last_active_window":"@2"}}
+```
+
+Returns the last workspace and tab the terminal UI focused. Absent fields
+mean nothing was saved yet. Not a ledger fact — losing it costs one click
+after a daemon restart.
+
+### workspace_ui.set
+
+```
+-> {"id":2,"method":"workspace_ui.set","params":{"session":"main","window_id":"@2"}}
+<- {"id":2,"result":{"saved":true}}
+```
+
+Persist last-active workspace/tab for the terminal UI. Additive: older
+daemons answer `unknown_method` and the UI falls through its reopen chain.
 
 It repaints every adopted pane's tmux border and returns the name now
 active. That name is what is ON SCREEN, which is not always what you just

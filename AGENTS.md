@@ -22,7 +22,8 @@ fact to an NDJSON ledger. A generated knowledge base with diagrams lives at
 | `crates/cyclops-theme` | Semantic color tokens | Renderers use tokens, never raw colors |
 | `crates/cyclopsd` | The daemon: fusion, delivery, socket, identity | Library + thin binary so tests boot it in-process |
 | `crates/cyclops` | The CLI | Thin client; business rules stay in proto/daemon. User-facing sentences live in `crates/cyclops/src/copy.rs` |
-| `crates/cyclops-ui` | The stream TUI | Its `grid` module is the one rendering vocabulary; the CLI shares it |
+| `crates/cyclops-ui` | The stream TUI (`cyclops watch`) | Its `grid` module is the CLI/stream rendering vocabulary |
+| `crates/cyclops-workspace` | The full-screen workspace (`cyclops`) | Ratatui/Crossterm chrome; pane VT runtimes; shares `cyclops-theme` tokens |
 | `crates/cyclops-testrig` | Test-only isolated tmux server | The only way tests may touch tmux |
 | `manifests/`, `themes/`, `layouts/`, `hooks/` | Data, not code paths | `manifests/` and `layouts/` are compiled into the CLI with include_str and seeded to the user home on first run |
 | `demos/` | Runnable end-to-end scripts on throwaway tmux servers | `demos/parity-check.sh` is a CI gate, not a demo |

@@ -41,6 +41,7 @@ than a measurement.
 | F32 | A theme reload applies whole or not at all: a file that stops setting a token it set before is refused | binds |
 | F34 | `libghostty-vt` needs Zig at build time; the corpus used `vt100` as the comparison engine instead | binds |
 | F35 | `alacritty_terminal` passes the workspace VT fixture corpus 12/12; `vt100` passes 5/12 | binds |
+| F36 | Cloud-agent VM stdout accepts OSC 52 clipboard writes; native fallback uses wl-copy/xclip when present | binds |
 
 ## F13. refresh-client -B subscriptions work in control mode on tmux 3.6a (MEASURED)
 
@@ -573,3 +574,15 @@ captures. `alacritty_terminal` 0.26 passes all twelve; `vt100` passes five
 correct wide-character spacing). Production code calls `AlacrittyVt` directly;
 the `PaneVt` trait was collapsed in the same commit per the design's
 "delete rather than abstract" rule.
+
+## F36. Workspace clipboard uses OSC 52 on this VM (MEASURED)
+
+The cloud-agent desktop terminal accepts `\x1b]52;c;<base64>\x07` written to
+stdout while the workspace runs in raw mode. When OSC 52 is unavailable,
+`selection::copy_native` falls back to `wl-copy`, `xclip`, or `pbcopy` if
+present on PATH. Selection text is never logged or persisted; the clipboard
+write is the only export (Invariant 7).
+
+Probe: `cargo test -p cyclops-workspace selection::tests::base64_roundtrip_shape`
+plus manual OSC 52 write from the workspace selection path on the agent VM.
+Native fallback is best-effort and untested on every platform variant.

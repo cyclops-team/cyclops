@@ -54,6 +54,7 @@ pub mod identity;
 mod registry;
 mod selftest;
 mod server;
+mod workspace_ui;
 
 pub use config::Config;
 
@@ -150,6 +151,8 @@ pub(crate) struct Inner {
     /// Test-only: make the `--clear` chrome restore fail the way tmux
     /// refusing a command would. See [`Daemon::fail_chrome_restore`].
     pub(crate) fail_chrome_restore: AtomicBool,
+    /// Last-active workspace/tab for the terminal workspace UI.
+    pub(crate) workspace_ui: StdMutex<workspace_ui::WorkspaceUiState>,
 }
 
 pub(crate) struct SessionSlot {
@@ -1116,6 +1119,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         hook_liveness: selftest::HookLiveness::new(),
         inject_pause: StdMutex::new(None),
         fail_chrome_restore: AtomicBool::new(false),
+        workspace_ui: StdMutex::new(workspace_ui::WorkspaceUiState::default()),
     });
 
     // Boot fact on every session ledger: which daemon run, which tmux,

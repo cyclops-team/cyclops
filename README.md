@@ -412,7 +412,8 @@ Otherwise, one page per question.
 | [wait.md](docs/wait.md) | Waiting on an agent, exit codes |
 | [panes.md](docs/panes.md) | Naming, the roster, the tmux border |
 | [workspaces.md](docs/workspaces.md) | Presets, save and restore, `cyclops start` |
-| [ui.md](docs/ui.md) | The stream: keys, filters, the eye |
+| [workspace-ui.md](docs/workspace-ui.md) | The full-screen workspace (`cyclops`) |
+| [ui.md](docs/ui.md) | The stream TUI (`cyclops watch`) |
 | [themes.md](docs/themes.md) | Semantic color tokens, shipped themes |
 | [hooks.md](docs/hooks.md) | Wiring vendor hooks, verifying they fire |
 | [MANIFESTS.md](docs/MANIFESTS.md) | Teaching cyclops a new agent CLI |

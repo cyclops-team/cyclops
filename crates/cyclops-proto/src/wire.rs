@@ -298,6 +298,31 @@ pub struct SubscribeParams {
     pub cursor: Option<u64>,
 }
 
+/// `workspace_ui.get` params. Additive; older daemons omit the method.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkspaceUiGetParams {
+    #[serde(default)]
+    pub protocol_version: u32,
+}
+
+/// Last-active workspace/tab the workspace UI persisted through the daemon.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkspaceUiGetResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_active_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_active_window: Option<String>,
+}
+
+/// `workspace_ui.set` params.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceUiSetParams {
+    pub session: String,
+    pub window_id: String,
+    #[serde(default)]
+    pub protocol_version: u32,
+}
+
 // --- Messaging (implemented from M1; types are part of protocol v1) ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

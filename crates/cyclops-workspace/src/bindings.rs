@@ -28,6 +28,7 @@ pub enum BindingAction {
     NewWorkspace,
     RenameWorkspace,
     CloseWorkspace,
+    ToggleEventPanel,
 }
 
 /// One binding: either after prefix or a direct chord.
@@ -149,6 +150,10 @@ pub fn default_bindings() -> HashMap<BindingAction, BindingChord> {
             BindingAction::CloseWorkspace,
             BindingChord::Prefix(KeyCode::Char('K')),
         ),
+        (
+            BindingAction::ToggleEventPanel,
+            BindingChord::Prefix(KeyCode::Char('e')),
+        ),
     ])
 }
 
@@ -203,6 +208,7 @@ fn action_from_key(key: &str) -> Option<BindingAction> {
         "new_workspace" => Some(BindingAction::NewWorkspace),
         "rename_workspace" => Some(BindingAction::RenameWorkspace),
         "close_workspace" => Some(BindingAction::CloseWorkspace),
+        "toggle_event_panel" => Some(BindingAction::ToggleEventPanel),
         s if s.starts_with("tab_") => s
             .strip_prefix("tab_")
             .and_then(|n| n.parse::<usize>().ok())
