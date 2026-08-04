@@ -39,6 +39,8 @@ than a measurement.
 | F29 | A script matching daemon output textually matches one field, or uses `jq` | binds |
 | F30, F31 | Never allocated. The gap is deliberate and the numbers stay unused | bookkeeping |
 | F32 | A theme reload applies whole or not at all: a file that stops setting a token it set before is refused | binds |
+| F34 | `libghostty-vt` needs Zig at build time; the corpus used `vt100` as the comparison engine instead | binds |
+| F35 | `alacritty_terminal` passes the workspace VT fixture corpus 12/12; `vt100` passes 5/12 | binds |
 
 ## F13. refresh-client -B subscriptions work in control mode on tmux 3.6a (MEASURED)
 
@@ -548,3 +550,26 @@ predicate that passed on an empty record: a check pointed at a value that
 is only meaningful in the case it was not testing for. Here the count is
 a fallback, so reading it asks "is the file empty" while meaning to ask
 "did anything actually get named".
+
+## F34. libghostty-vt requires Zig at build time; corpus used vt100 instead (MEASURED)
+
+The design's second VT candidate is `libghostty-vt`, which fetches Ghostty
+sources and runs `zig build` in its build script (`libghostty-vt-sys` 0.2.1).
+On this machine and in the default CI image, `zig` is not on PATH, so
+`cargo build -p libghostty-vt` fails with "failed to execute zig build: No
+such file or directory". The fixture corpus therefore compared
+`alacritty_terminal` against `vt100` 0.16 as the only Rust-pure alternative
+that builds without Zig. `libghostty-vt` remains the documented fallback if
+a future gap appears that alacritty cannot cover and Zig is added to the
+build environment.
+
+## F35. alacritty_terminal wins the workspace VT fixture corpus 12/12 (MEASURED)
+
+`crates/cyclops-workspace/tests/corpus.rs` runs twelve fixtures covering
+plain output, SGR/256/truecolor, attributes, cursor motion, wrapping, wide
+characters, alternate screen, bracketed paste, and synthetic Codex/Claude
+captures. `alacritty_terminal` 0.26 passes all twelve; `vt100` passes five
+(missing truecolor, 256-color fg assertions, bold/dim attribute checks, and
+correct wide-character spacing). Production code calls `AlacrittyVt` directly;
+the `PaneVt` trait was collapsed in the same commit per the design's
+"delete rather than abstract" rule.

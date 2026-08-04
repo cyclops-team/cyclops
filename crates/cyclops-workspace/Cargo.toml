@@ -1,0 +1,12 @@
+[package]
+name = "cyclops-workspace"
+version.workspace = true
+edition.workspace = true
+description = "Cyclops terminal workspace: pane VT runtimes and the full-screen TUI."
+
+[dependencies]
+alacritty_terminal = "0.26"
+thiserror.workspace = true
+
+[dev-dependencies]
+vt100 = "0.16"
