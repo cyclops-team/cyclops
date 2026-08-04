@@ -404,6 +404,7 @@ Otherwise, one page per question.
 | | |
 |---|---|
 | [HANDOFF.md](docs/HANDOFF.md) | Start here to work on the codebase: the map, and the decisions behind it |
+| [AGENTS.md](AGENTS.md) | The same front door for AI coding agents: the map condensed, and the gates a change must pass |
 | [install.md](docs/install.md) | Build it, configure it, run the tests |
 | [QUICKSTART.md](docs/QUICKSTART.md) | Two agents and a review gate, start to finish |
 | [send.md](docs/send.md) | Sending, receipts, broadcast, quota parking |
