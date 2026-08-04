@@ -11,6 +11,7 @@ mod intent;
 mod layout;
 mod model;
 mod render;
+pub mod resilience;
 pub mod runtime;
 mod sync;
 mod term_guard;

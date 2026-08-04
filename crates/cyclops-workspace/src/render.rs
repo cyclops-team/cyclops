@@ -10,6 +10,7 @@ use crate::layout::layout_pane_slots;
 use crate::copy;
 use crate::dialog::Dialog;
 use crate::model::{PaneSlot, RuntimeRegistry, TabModel, WorkspaceRow};
+use crate::resilience::LinkState;
 use crate::runtime::{CellGrid, Color, GridCell};
 use crate::theme::{self, Paint};
 
@@ -124,31 +125,73 @@ pub fn paint_window(
     canvas: Rect,
     buf: &mut Buffer,
     paint: &Paint,
+    link: LinkState,
+    paused: &std::collections::HashSet<String>,
 ) {
     let slots = layout_pane_slots(&tab.layout, canvas, &tab.active_pane);
     for slot in slots {
-        paint_pane_slot(&slot, runtimes, buf, paint);
+        paint_pane_slot(&slot, runtimes, buf, paint, link, paused);
     }
 }
 
-fn paint_pane_slot(slot: &PaneSlot, runtimes: &RuntimeRegistry, buf: &mut Buffer, paint: &Paint) {
+fn paint_pane_slot(
+    slot: &PaneSlot,
+    runtimes: &RuntimeRegistry,
+    buf: &mut Buffer,
+    paint: &Paint,
+    link: LinkState,
+    paused: &std::collections::HashSet<String>,
+) {
     if slot.rect.width == 0 || slot.rect.height == 0 {
         return;
     }
-    let border_style = if slot.focused {
+    let mut border_style = if slot.focused {
         theme::pane_border_focused(paint)
     } else {
         theme::pane_border(paint)
     };
+    if matches!(link, LinkState::Reconnecting { .. }) {
+        border_style = border_style.add_modifier(Modifier::DIM);
+    }
+    let mut title = format!(" {} ", slot.pane_id);
+    if matches!(link, LinkState::Reconnecting { .. }) {
+        title = format!(" {} · {} ", slot.pane_id, copy::RECONNECTING_NOTE);
+    } else if paused.contains(&slot.pane_id) {
+        title = format!(" {} · {} ", slot.pane_id, copy::PAUSED_NOTE);
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
-        .title(format!(" {} ", slot.pane_id));
+        .title(title);
     let inner = block.inner(slot.rect);
     block.render(slot.rect, buf);
     if let Some(runtime) = runtimes.get(&slot.pane_id) {
         let grid = runtime.grid();
-        paint_pane(grid.grid, inner, buf, paint);
+        let mut base = theme::pane_cell(paint);
+        if matches!(link, LinkState::Reconnecting { .. }) {
+            base = base.add_modifier(Modifier::DIM);
+        }
+        paint_pane_dim(grid.grid, inner, buf, base);
+    }
+}
+
+fn paint_pane_dim(grid: &CellGrid, area: Rect, buf: &mut Buffer, base: Style) {
+    for row in 0..area.height {
+        for col in 0..area.width {
+            let cell = grid.cell(col, row).cloned().unwrap_or_default();
+            let style = cell_style(&cell, base);
+            let ch = if cell.wide_spacer || cell.ch == '\0' {
+                ' '
+            } else {
+                cell.ch
+            };
+            let x = area.x + col;
+            let y = area.y + row;
+            if let Some(dst) = buf.cell_mut((x, y)) {
+                dst.set_symbol(&ch.to_string());
+                dst.set_style(style);
+            }
+        }
     }
 }
 
@@ -194,6 +237,7 @@ mod tests {
     use crate::dialog::Dialog;
     use crate::layout::{parse_layout, resolve_layout};
     use crate::model::{RuntimeRegistry, TabModel, WorkspaceRow};
+    use crate::resilience::LinkState;
     use crate::runtime::{CellAttrs, GridCell};
     use crate::theme::Paint;
     use ratatui::backend::TestBackend;
@@ -249,7 +293,15 @@ mod tests {
             let tab_area = Rect::new(area.x, area.y, area.width, 1);
             let canvas = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
             paint_tab_bar(std::slice::from_ref(&tab), 0, tab_area, f.buffer_mut(), &theme);
-            paint_window(&tab, &runtimes, canvas, f.buffer_mut(), &theme);
+            paint_window(
+                &tab,
+                &runtimes,
+                canvas,
+                f.buffer_mut(),
+                &theme,
+                LinkState::Live,
+                &std::collections::HashSet::new(),
+            );
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -318,6 +370,32 @@ mod tests {
             .flat_map(|y| (0..buf.area.width).map(move |x| buf[(x, y)].symbol().to_string()))
             .collect();
         assert!(flat.contains("New workspace folder"));
+    }
+
+    #[test]
+    fn reconnecting_pane_renders_dimmed_note() {
+        let tab = two_pane_tab();
+        let runtimes = RuntimeRegistry::default();
+        let backend = TestBackend::new(40, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+        term.draw(|f| {
+            paint_window(
+                &tab,
+                &runtimes,
+                f.area(),
+                f.buffer_mut(),
+                &theme,
+                LinkState::Reconnecting { attempt: 1 },
+                &std::collections::HashSet::new(),
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let flat: String = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| buf[(x, y)].symbol().to_string()))
+            .collect();
+        assert!(flat.contains("reconnecting"), "border should note reconnect: {flat}");
     }
 
     #[test]

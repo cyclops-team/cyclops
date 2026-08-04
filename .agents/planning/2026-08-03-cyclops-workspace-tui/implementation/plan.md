@@ -24,7 +24,7 @@ re-renderable after later changes.
 - [x] Step 4: Minimal workspace — one live pane, keyboard pass-through, bare `cyclops`
 - [x] Step 5: Tabs and layout — split-tree rendering and the prefix keyboard router
 - [x] Step 6: Structural intents and reconciliation
-- [ ] Step 7: Sidebar and workspaces
+- [x] Step 7: Sidebar and workspaces
 - [ ] Step 8: Resilience — reconnect, flow-control recovery, server-gone
 - [ ] Step 9: Mouse foundation — click, wheel, menus, split controls
 - [ ] Step 10: Selection and clipboard

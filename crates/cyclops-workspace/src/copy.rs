@@ -15,3 +15,10 @@ pub const NEW_WORKSPACE_PROMPT: &str = "New workspace folder: ";
 pub const RENAME_WORKSPACE_PROMPT: &str = "Rename workspace: ";
 
 pub const CONFIRM_CLOSE_WORKSPACE: &str = "Close this workspace? [y/N]";
+
+pub const RECONNECTING_NOTE: &str = "reconnecting…";
+
+pub const PAUSED_NOTE: &str = "paused";
+
+pub const SERVER_GONE_OFFER: &str =
+    "tmux server is gone. Start a new session with: tmux new -s main";

@@ -1,5 +1,6 @@
 //! Workspace application state and event loop.
 
+use std::collections::HashSet;
 use std::io;
 
 use crossterm::event::{self, Event, KeyEvent};
@@ -20,6 +21,7 @@ use crate::input::encode_send_keys;
 use crate::input::router::{Router, RouterResult};
 use crate::model::{RuntimeRegistry, WorkspaceModel};
 use crate::render::{paint_dialog, paint_sidebar, paint_tab_bar, paint_window};
+use crate::resilience::{self, LinkState};
 use crate::sync::{fetch_workspace_model, hydrate_visible_tab};
 use crate::term_guard::TermGuard;
 use crate::theme::Paint;
@@ -33,6 +35,9 @@ enum AppMsg {
     Output { pane: String, bytes: Vec<u8> },
     Redraw,
     Reconcile,
+    LinkLost,
+    PanePaused { pane: String },
+    PaneContinued { pane: String },
 }
 
 struct App {
@@ -42,6 +47,9 @@ struct App {
     paint: Paint,
     socket: Option<String>,
     dialog: Option<Dialog>,
+    link_state: LinkState,
+    paused_panes: HashSet<String>,
+    reconnect_attempt: usize,
 }
 
 /// Run the workspace on a tty. Returns the process exit code.
@@ -73,7 +81,8 @@ pub async fn run_async() -> i32 {
     if let Some(path) = tmux_cfg.config_file {
         cfg = cfg.with_config_file(path);
     }
-    let (client, mut notif_rx) = match ControlClient::spawn(cfg).await {
+    let control_cfg = cfg.clone();
+    let (mut client, notif_rx) = match ControlClient::spawn(cfg).await {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("{e}");
@@ -119,28 +128,7 @@ pub async fn run_async() -> i32 {
         }
     });
 
-    let out_tx = tx.clone();
-    tokio::spawn(async move {
-        while let Some(n) = notif_rx.recv().await {
-            match n {
-                Notification::Output { pane, data }
-                | Notification::ExtendedOutput { pane, data, .. } => {
-                    let _ = out_tx.send(AppMsg::Output { pane, bytes: data });
-                }
-                Notification::LayoutChange { .. }
-                | Notification::WindowAdd { .. }
-                | Notification::WindowClose { .. }
-                | Notification::WindowRenamed { .. }
-                | Notification::WindowPaneChanged { .. }
-                | Notification::SessionsChanged
-                | Notification::SessionRenamed { .. } => {
-                    let _ = out_tx.send(AppMsg::Reconcile);
-                }
-                Notification::Exit { .. } => break,
-                _ => {}
-            }
-        }
-    });
+    spawn_notif_forwarder(notif_rx, tx.clone());
 
     let guard = match TermGuard::enter() {
         Ok(g) => g,
@@ -175,28 +163,67 @@ pub async fn run_async() -> i32 {
         paint: Paint::detect(),
         socket: socket_name,
         dialog: None,
+        link_state: LinkState::Live,
+        paused_panes: HashSet::new(),
+        reconnect_attempt: 0,
     };
 
     let mut debounce: Option<Instant> = None;
+    let mut reconnect_deadline: Option<Instant> = None;
     let mut detached = false;
     let _ = draw(&mut terminal, &app);
     while !detached {
-        if let Some(deadline) = debounce {
+        if let Some(deadline) = debounce.or(reconnect_deadline) {
             tokio::select! {
                 biased;
                 msg = rx.recv() => {
-                    if !handle_app_msg(msg, &mut app, &client, &mut debounce, &mut detached).await {
+                    if !handle_app_msg(
+                        msg,
+                        &mut app,
+                        &mut client,
+                        &control_cfg,
+                        &tx,
+                        &mut debounce,
+                        &mut reconnect_deadline,
+                        &mut detached,
+                    )
+                    .await
+                    {
                         break;
                     }
                 }
                 _ = sleep_until(deadline) => {
-                    debounce = None;
-                    let _ = draw(&mut terminal, &app);
+                    if debounce == Some(deadline) {
+                        debounce = None;
+                        let _ = draw(&mut terminal, &app);
+                    } else if reconnect_deadline == Some(deadline) {
+                        reconnect_deadline = None;
+                        let _ = handle_reconnect(
+                            &mut app,
+                            &mut client,
+                            &control_cfg,
+                            &tx,
+                            &mut reconnect_deadline,
+                        )
+                        .await;
+                        let _ = draw(&mut terminal, &app);
+                    }
                 }
             }
         } else {
             let Some(msg) = rx.recv().await else { break };
-            if !handle_app_msg(Some(msg), &mut app, &client, &mut debounce, &mut detached).await {
+            if !handle_app_msg(
+                Some(msg),
+                &mut app,
+                &mut client,
+                &control_cfg,
+                &tx,
+                &mut debounce,
+                &mut reconnect_deadline,
+                &mut detached,
+            )
+            .await
+            {
                 break;
             }
         }
@@ -207,8 +234,91 @@ pub async fn run_async() -> i32 {
     client.shutdown().await;
     if detached {
         eprintln!("{}", copy::DETACHED);
+    } else if app.link_state == LinkState::ServerGone {
+        eprintln!("{}", copy::SERVER_GONE_OFFER);
     }
     0
+}
+
+fn spawn_notif_forwarder(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Notification>,
+    tx: mpsc::UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        while let Some(n) = rx.recv().await {
+            match n {
+                Notification::Output { pane, data }
+                | Notification::ExtendedOutput { pane, data, .. } => {
+                    let _ = tx.send(AppMsg::Output { pane, bytes: data });
+                }
+                Notification::LayoutChange { .. }
+                | Notification::WindowAdd { .. }
+                | Notification::WindowClose { .. }
+                | Notification::WindowRenamed { .. }
+                | Notification::WindowPaneChanged { .. }
+                | Notification::SessionsChanged
+                | Notification::SessionRenamed { .. } => {
+                    let _ = tx.send(AppMsg::Reconcile);
+                }
+                Notification::Pause { pane } => {
+                    let _ = tx.send(AppMsg::PanePaused { pane });
+                }
+                Notification::Continue { pane } => {
+                    let _ = tx.send(AppMsg::PaneContinued { pane });
+                }
+                Notification::Exit { .. } => {
+                    let _ = tx.send(AppMsg::LinkLost);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+fn schedule_reconnect(
+    app: &mut App,
+    reconnect_deadline: &mut Option<Instant>,
+) {
+    if !resilience::may_retry(app.reconnect_attempt) {
+        app.link_state = LinkState::ServerGone;
+        return;
+    }
+    app.link_state = LinkState::Reconnecting {
+        attempt: app.reconnect_attempt,
+    };
+    let delay = resilience::reconnect_delay(app.reconnect_attempt);
+    *reconnect_deadline = Some(Instant::now() + delay);
+}
+
+async fn handle_reconnect(
+    app: &mut App,
+    client: &mut ControlClient,
+    cfg: &ControlConfig,
+    tx: &mpsc::UnboundedSender<AppMsg>,
+    reconnect_deadline: &mut Option<Instant>,
+) -> Result<(), cyclops_tmux::TmuxError> {
+    client.shutdown().await;
+    match ControlClient::spawn(cfg.clone()).await {
+        Ok((new_client, rx)) => {
+            *client = new_client;
+            spawn_notif_forwarder(rx, tx.clone());
+            let _ = client.set_window_size_latest().await;
+            reconcile(app, client).await?;
+            app.link_state = LinkState::Live;
+            app.reconnect_attempt = 0;
+        }
+        Err(_) => {
+            app.reconnect_attempt += 1;
+            if resilience::may_retry(app.reconnect_attempt) {
+                schedule_reconnect(app, reconnect_deadline);
+            } else {
+                app.link_state = LinkState::ServerGone;
+                let _ = tx.send(AppMsg::Redraw);
+            }
+        }
+    }
+    Ok(())
 }
 
 impl App {
@@ -229,8 +339,11 @@ enum DetachOutcome {
 async fn handle_app_msg(
     msg: Option<AppMsg>,
     app: &mut App,
-    client: &ControlClient,
+    client: &mut ControlClient,
+    control_cfg: &ControlConfig,
+    _tx: &mpsc::UnboundedSender<AppMsg>,
     debounce: &mut Option<Instant>,
+    reconnect_deadline: &mut Option<Instant>,
     detached: &mut bool,
 ) -> bool {
     let Some(msg) = msg else {
@@ -252,7 +365,28 @@ async fn handle_app_msg(
             }
             *debounce = Some(Instant::now() + RECONCILE_DEBOUNCE);
         }
+        AppMsg::LinkLost => {
+            app.reconnect_attempt = 0;
+            schedule_reconnect(app, reconnect_deadline);
+            *debounce = Some(Instant::now() + RECONCILE_DEBOUNCE);
+        }
+        AppMsg::PanePaused { pane } => {
+            app.paused_panes.insert(pane);
+            *debounce = Some(Instant::now() + RECONCILE_DEBOUNCE);
+        }
+        AppMsg::PaneContinued { pane } => {
+            app.paused_panes.remove(&pane);
+            if app.is_visible_pane(&pane) {
+                if let Err(e) = hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await {
+                    eprintln!("{e}");
+                }
+            }
+            *debounce = Some(Instant::now() + RECONCILE_DEBOUNCE);
+        }
         AppMsg::Input(key) => {
+            if app.link_state == LinkState::ServerGone {
+                return true;
+            }
             match handle_key(app, client, key).await {
                 Ok(DetachOutcome::Detached) => *detached = true,
                 Ok(DetachOutcome::Continue) => {
@@ -494,7 +628,15 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App) -> io:
                 &app.paint,
             );
             let tab = app.model.active_tab();
-            paint_window(tab, &app.runtimes, canvas, f.buffer_mut(), &app.paint);
+            paint_window(
+                tab,
+                &app.runtimes,
+                canvas,
+                f.buffer_mut(),
+                &app.paint,
+                app.link_state,
+                &app.paused_panes,
+            );
             if let Some(dialog) = &app.dialog {
                 paint_dialog(dialog, f.area(), f.buffer_mut(), &app.paint);
             }
