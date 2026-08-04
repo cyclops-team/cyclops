@@ -964,7 +964,14 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
                 selection: app.selection.active.as_ref(),
                 drag: app.drag.as_ref(),
             };
-            paint_window(tab, &app.runtimes, canvas, f.buffer_mut(), &app.paint, &mut ctx);
+            paint_window(
+                tab,
+                &app.runtimes,
+                canvas,
+                f.buffer_mut(),
+                &app.paint,
+                &mut ctx,
+            );
             if let Some(dialog) = &app.dialog {
                 paint_dialog(dialog, f.area(), f.buffer_mut(), &app.paint);
             }

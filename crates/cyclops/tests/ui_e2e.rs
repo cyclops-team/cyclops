@@ -260,7 +260,10 @@ fn ui_daemon_down_reports_and_exits_one() {
     // kept saying `cyclopsd &` after `cyclops start` took the job over.
     assert_eq!(
         String::from_utf8_lossy(&out.stderr).trim(),
-        format!("cyclops ui is deprecated; use cyclops watch\n{}", cyclops_proto::NOT_RUNNING)
+        format!(
+            "cyclops ui is deprecated; use cyclops watch\n{}",
+            cyclops_proto::NOT_RUNNING
+        )
     );
     let _ = fs::remove_dir_all(&home);
 }

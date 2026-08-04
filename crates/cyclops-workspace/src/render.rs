@@ -285,10 +285,7 @@ fn paint_pane_slot(
             base = base.add_modifier(Modifier::DIM);
         }
         paint_pane_dim(grid.grid, inner, buf, base);
-        if let Some(sel) = ctx
-            .selection
-            .filter(|s| s.pane_id == slot.pane_id)
-        {
+        if let Some(sel) = ctx.selection.filter(|s| s.pane_id == slot.pane_id) {
             paint_selection_overlay(grid.grid, inner, buf, sel, paint);
         }
     }
