@@ -17,6 +17,12 @@ pub enum BindingAction {
     FocusRight,
     FocusUp,
     FocusDown,
+    SplitRight,
+    SplitDown,
+    ClosePane,
+    ZoomPane,
+    RenameTab,
+    CloseTab,
 }
 
 /// One binding: either after prefix or a direct chord.
@@ -94,6 +100,30 @@ pub fn default_bindings() -> HashMap<BindingAction, BindingChord> {
             BindingAction::SelectTab(9),
             BindingChord::Prefix(KeyCode::Char('9')),
         ),
+        (
+            BindingAction::SplitRight,
+            BindingChord::Prefix(KeyCode::Char('%')),
+        ),
+        (
+            BindingAction::SplitDown,
+            BindingChord::Prefix(KeyCode::Char('\"')),
+        ),
+        (
+            BindingAction::ClosePane,
+            BindingChord::Prefix(KeyCode::Char('x')),
+        ),
+        (
+            BindingAction::ZoomPane,
+            BindingChord::Prefix(KeyCode::Char('z')),
+        ),
+        (
+            BindingAction::RenameTab,
+            BindingChord::Prefix(KeyCode::Char(',')),
+        ),
+        (
+            BindingAction::CloseTab,
+            BindingChord::Prefix(KeyCode::Char('&')),
+        ),
     ])
 }
 
@@ -137,6 +167,12 @@ fn action_from_key(key: &str) -> Option<BindingAction> {
         "focus_right" => Some(BindingAction::FocusRight),
         "focus_up" => Some(BindingAction::FocusUp),
         "focus_down" => Some(BindingAction::FocusDown),
+        "split_right" => Some(BindingAction::SplitRight),
+        "split_down" => Some(BindingAction::SplitDown),
+        "close_pane" => Some(BindingAction::ClosePane),
+        "zoom_pane" => Some(BindingAction::ZoomPane),
+        "rename_tab" => Some(BindingAction::RenameTab),
+        "close_tab" => Some(BindingAction::CloseTab),
         s if s.starts_with("tab_") => s
             .strip_prefix("tab_")
             .and_then(|n| n.parse::<usize>().ok())

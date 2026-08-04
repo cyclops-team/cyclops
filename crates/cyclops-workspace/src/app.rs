@@ -10,13 +10,16 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Duration, Instant};
 
-use crate::bindings::{load_bindings, BindingAction};
 use crate::config::load_tmux_config;
+use crate::daemon::pane_has_agent;
+use crate::dialog::Dialog;
+use crate::intent::{self, Intent};
+use crate::bindings::{load_bindings, BindingAction};
 use crate::copy;
 use crate::input::encode_send_keys;
 use crate::input::router::{Router, RouterResult};
 use crate::model::{RuntimeRegistry, SessionModel};
-use crate::render::{paint_tab_bar, paint_window};
+use crate::render::{paint_dialog, paint_tab_bar, paint_window};
 use crate::sync::{fetch_session_model, hydrate_visible_tab};
 use crate::term_guard::TermGuard;
 use crate::theme::Paint;
@@ -37,6 +40,7 @@ struct App {
     router: Router,
     paint: Paint,
     socket: Option<String>,
+    dialog: Option<Dialog>,
 }
 
 /// Run the workspace on a tty. Returns the process exit code.
@@ -167,6 +171,7 @@ pub async fn run_async() -> i32 {
         router: Router::new(bindings),
         paint: Paint::detect(),
         socket: socket_name,
+        dialog: None,
     };
 
     let mut debounce: Option<Instant> = None;
@@ -275,12 +280,15 @@ async fn handle_key(
     client: &ControlClient,
     key: KeyEvent,
 ) -> Result<DetachOutcome, cyclops_tmux::TmuxError> {
+    if let Some(dialog) = app.dialog.clone() {
+        return handle_dialog_key(app, client, key, dialog).await;
+    }
     match app.router.route(key) {
         RouterResult::PrefixArmed => Ok(DetachOutcome::Continue),
         RouterResult::Consumed => Ok(DetachOutcome::Continue),
         RouterResult::Action(BindingAction::Detach) => Ok(DetachOutcome::Detached),
         RouterResult::Action(action) => {
-            execute_action(app, client, action).await?;
+            dispatch_action(app, client, action).await?;
             reconcile(app, client).await?;
             Ok(DetachOutcome::Continue)
         }
@@ -295,41 +303,66 @@ async fn handle_key(
     }
 }
 
-async fn execute_action(
-    _app: &mut App,
+async fn dispatch_action(
+    app: &mut App,
     client: &ControlClient,
     action: BindingAction,
 ) -> Result<(), cyclops_tmux::TmuxError> {
-    match action {
-        BindingAction::Detach => {}
-        BindingAction::NextTab => {
-            client.command("next-window").await?;
-        }
-        BindingAction::PrevTab => {
-            client.command("previous-window").await?;
-        }
-        BindingAction::SelectTab(n) => {
-            let idx = n.saturating_sub(1);
-            client.command(&format!("select-window -t :{idx}")).await?;
-        }
-        BindingAction::NewTab => {
-            client.command("new-window -d").await?;
-            client.command("select-window -t :+").await?;
-        }
-        BindingAction::FocusLeft => {
-            client.command("select-pane -L").await?;
-        }
-        BindingAction::FocusRight => {
-            client.command("select-pane -R").await?;
-        }
-        BindingAction::FocusUp => {
-            client.command("select-pane -U").await?;
-        }
-        BindingAction::FocusDown => {
-            client.command("select-pane -D").await?;
+    let pane = app.model.active_tab().active_pane.clone();
+    if action == BindingAction::ClosePane {
+        let home = cyclops_proto::cyclops_home();
+        if pane_has_agent(&home, &pane) {
+            app.dialog = Some(Dialog::confirm_close(&pane));
+            return Ok(());
         }
     }
-    Ok(())
+    if action == BindingAction::RenameTab {
+        app.dialog = Some(Dialog::RenameTab { buffer: String::new() });
+        return Ok(());
+    }
+    intent::execute(client, Intent::from(action), &pane).await
+}
+
+async fn handle_dialog_key(
+    app: &mut App,
+    client: &ControlClient,
+    key: KeyEvent,
+    dialog: Dialog,
+) -> Result<DetachOutcome, cyclops_tmux::TmuxError> {
+    use crossterm::event::KeyCode;
+    match dialog {
+        Dialog::ConfirmClosePane { pane_id } => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                app.dialog = None;
+                intent::execute(client, Intent::ClosePane, &pane_id).await?;
+                reconcile(app, client).await?;
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                app.dialog = None;
+            }
+            _ => {}
+        },
+        Dialog::RenameTab { mut buffer } => match key.code {
+            KeyCode::Esc => app.dialog = None,
+            KeyCode::Enter => {
+                app.dialog = None;
+                if !buffer.is_empty() {
+                    intent::execute_rename(client, &buffer).await?;
+                    reconcile(app, client).await?;
+                }
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+                app.dialog = Some(Dialog::RenameTab { buffer });
+            }
+            KeyCode::Char(c) => {
+                buffer.push(c);
+                app.dialog = Some(Dialog::RenameTab { buffer });
+            }
+            _ => {}
+        },
+    }
+    Ok(DetachOutcome::Continue)
 }
 
 fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App) -> io::Result<()> {
@@ -354,6 +387,9 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App) -> io:
             let _ = tab.index;
             let _ = tab.zoomed;
             paint_window(tab, &app.runtimes, canvas, f.buffer_mut(), &app.paint);
+            if let Some(dialog) = &app.dialog {
+                paint_dialog(dialog, f.area(), f.buffer_mut(), &app.paint);
+            }
         })
         .map(|_| ())
 }

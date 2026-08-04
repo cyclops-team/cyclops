@@ -113,7 +113,7 @@ mod tests {
         let mut router = Router::new(default_bindings());
         router.route(ctrl_b());
         assert_eq!(
-            router.route(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::empty())),
+            router.route(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty())),
             RouterResult::Consumed
         );
     }

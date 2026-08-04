@@ -11,6 +11,7 @@ cyclops-theme.workspace = true
 cyclops-tmux.workspace = true
 crossterm = "0.28"
 ratatui = "0.30"
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 toml.workspace = true

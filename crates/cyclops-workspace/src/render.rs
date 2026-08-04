@@ -7,9 +7,31 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use crate::layout::layout_pane_slots;
+use crate::copy;
+use crate::dialog::Dialog;
 use crate::model::{PaneSlot, RuntimeRegistry, TabModel};
 use crate::runtime::{CellGrid, Color, GridCell};
 use crate::theme::{self, Paint};
+
+/// Paint a modal dialog centered in `area`.
+pub fn paint_dialog(dialog: &Dialog, area: Rect, buf: &mut Buffer, paint: &Paint) {
+    let w = area.width.min(60);
+    let h = 3u16;
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let dialog_area = Rect::new(x, y, w, h);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::pane_border_focused(paint))
+        .style(theme::pane_cell(paint));
+    let inner = block.inner(dialog_area);
+    block.render(dialog_area, buf);
+    let text = match dialog {
+        Dialog::ConfirmClosePane { .. } => copy::CONFIRM_CLOSE_PANE.to_string(),
+        Dialog::RenameTab { buffer } => format!("{}{}", copy::RENAME_TAB_PROMPT, buffer),
+    };
+    Paragraph::new(text).render(inner, buf);
+}
 
 /// Blit a runtime grid into `area` of `buf`.
 pub fn paint_pane(grid: &CellGrid, area: Rect, buf: &mut Buffer, paint: &Paint) {
@@ -132,6 +154,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::dialog::Dialog;
     use crate::layout::{parse_layout, resolve_layout};
     use crate::model::{RuntimeRegistry, TabModel};
     use crate::runtime::{CellAttrs, GridCell};
@@ -212,6 +235,27 @@ mod tests {
             }
         }
         assert!(saw_border, "pane borders should render");
+    }
+
+    #[test]
+    fn confirm_close_dialog_renders() {
+        let backend = TestBackend::new(40, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+        let dialog = Dialog::confirm_close("%0");
+        term.draw(|f| {
+            paint_dialog(&dialog, f.area(), f.buffer_mut(), &theme);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let flat: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(flat.contains("Close this pane"));
     }
 
     #[test]

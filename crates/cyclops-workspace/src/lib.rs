@@ -3,8 +3,11 @@
 pub mod app;
 mod bindings;
 mod config;
+mod daemon;
+mod dialog;
 mod copy;
 mod input;
+mod intent;
 mod layout;
 mod model;
 mod render;
