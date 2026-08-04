@@ -48,6 +48,7 @@ mod theme;
 mod themeseed;
 mod workspace;
 
+use std::io::IsTerminal;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -91,7 +92,7 @@ struct Cli {
     plain: bool,
 
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -492,6 +493,19 @@ fn style_for(cli: &Cli) -> Style {
 
 fn run(cli: &Cli) -> i32 {
     match &cli.cmd {
+        None => {
+            if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+                cyclops_workspace::run()
+            } else {
+                cyclops_workspace::print_help_and_exit()
+            }
+        }
+        Some(cmd) => run_cmd(cli, cmd),
+    }
+}
+
+fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
+    match cmd {
         // Hook never prints and owns its transport handling: a hook that
         // fails loudly breaks the vendor CLI that invoked it. No Style is
         // built on this path, so a broken theme file cannot put a warning
@@ -597,7 +611,7 @@ fn run(cli: &Cli) -> i32 {
                 Err(code) => return code,
             };
             let style = style_for(cli);
-            match &cli.cmd {
+            match cmd {
                 Cmd::Status => cmd_status(&mut c, cli, &style),
                 Cmd::List => cmd_list(&mut c, cli, &style),
                 Cmd::Ping => cmd_ping(&mut c, cli, &style),

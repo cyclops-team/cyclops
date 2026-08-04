@@ -66,6 +66,7 @@ pub mod hydration;
 pub mod layout;
 pub mod notify;
 pub mod quote;
+pub mod session;
 pub mod version;
 pub mod watcher;
 
@@ -77,5 +78,6 @@ pub use focus::focus_pane;
 pub use hydration::HydrationBundle;
 pub use notify::Notification;
 pub use quote::quote_arg;
+pub use session::{active_pane, list_sessions, SessionRow};
 pub use version::TmuxVersion;
 pub use watcher::{PaneEvent, PaneField, PaneRow, SessionWatcher};

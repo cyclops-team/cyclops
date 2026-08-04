@@ -20,8 +20,8 @@ re-renderable after later changes.
 
 - [x] Step 1: VT engine evaluation — `PaneVt` trait + fidelity fixture corpus
 - [x] Step 2: Streaming control client in `cyclops-tmux`
-- [ ] Step 3: Hydration bundles, client sizing, and flow control
-- [ ] Step 4: Minimal workspace — one live pane, keyboard pass-through, bare `cyclops`
+- [x] Step 3: Hydration bundles, client sizing, and flow control
+- [x] Step 4: Minimal workspace — one live pane, keyboard pass-through, bare `cyclops`
 - [ ] Step 5: Tabs and layout — split-tree rendering and the prefix keyboard router
 - [ ] Step 6: Structural intents and reconciliation
 - [ ] Step 7: Sidebar and workspaces

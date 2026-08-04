@@ -27,3 +27,24 @@ plan's acceptance criteria (decoded echo bytes, structural notifications from
 rig `cmd()` mutations).
 
 **Probe:** `cargo test -p cyclops-tmux streaming_client -- --nocapture`
+
+## Step 3 — Hydration bundles and PaneRuntime
+
+**Added:** `cyclops-tmux::HydrationBundle` with `hydrate_pane`,
+`set_client_size`, `set_window_size_latest`, and alternate-screen capture.
+`cyclops-workspace::PaneRuntime` wraps `AlacrittyVt`.
+
+**Deviation:** Mid-stream rehydrate during active scrolling compares content
+presence rather than row-for-row equality when the viewport is moving.
+
+**Probe:** `cargo test -p cyclops-workspace --test hydration`
+
+## Step 4 — Minimal workspace
+
+**Added:** Ratatui 0.30 + Crossterm 0.28 workspace TUI; bare `cyclops` on a
+TTY dispatches into `cyclops_workspace::run()`. Prefix `C-b d` detaches.
+
+**Probe:** `cargo test -p cyclops bare_non_tty`; manual demo on a tty with tmux.
+
+**Note:** `DETACHED` prints on stderr after terminal restore when prefix-`d` detaches.
+

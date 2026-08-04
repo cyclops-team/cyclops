@@ -25,6 +25,7 @@ cyclops-theme.workspace = true
 # Cyclops lives in the adapter crate.
 cyclops-tmux.workspace = true
 cyclops-ui.workspace = true
+cyclops-workspace.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 anyhow.workspace = true
