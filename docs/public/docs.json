@@ -1,0 +1,12 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Cyclops",
+  "description": "Coordinate terminal coding agents already running in tmux.",
+  "colors": {
+    "primary": "#7e8a5c"
+  },
+  "navigation": {
+    "pages": ["index"]
+  }
+}
