@@ -158,7 +158,7 @@ The CLI binary ("One eye on every agent").
 Test-only, zero dependencies. `TmuxServer::new(tag)` reserves a private
 `-L cyc-<tag>-<pid>` socket; every command applies `-u -L <sock> -f
 /dev/null` and unsets `TMUX`; `Drop` kills the server *and unlinks the
-socket file* (kill-server does not unlink — measured). `tmux_available()`
+socket file* (stopping the server alone does not unlink — measured). `tmux_available()`
 lets suites skip cleanly. Two guard tests keep the rule from being copied
 back out: `teardown_has_one_home.rs` (no other Rust file may start or kill a
 tmux server) and `shell_teardown.rs` (holds `demos/lib.sh` to the same
