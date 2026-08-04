@@ -1,0 +1,13 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    {
+      "source": "/docs",
+      "destination": "https://cyclops-681ba6f7.mintlify.site/docs"
+    },
+    {
+      "source": "/docs/:match*",
+      "destination": "https://cyclops-681ba6f7.mintlify.site/docs/:match*"
+    }
+  ]
+}
