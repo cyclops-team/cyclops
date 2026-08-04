@@ -16,5 +16,14 @@ engine is `vt100` 0.16 (dev-dependency, tests only).
 play. After the corpus (`alacritty` 12/12, `vt100` 5/12), the trait was
 collapsed per the design's own rule (F35).
 
-**Probe:** `cargo test -p cyclops-workspace -- --nocapture` prints the
-comparison summary; `crates/cyclops-workspace/tests/corpus.rs`.
+## Step 2 — Streaming control client
+
+**Decision:** No adapter changes required. `ControlClient::spawn` already
+exposes a blocking byte-line reader, typed `Notification` fan-out, octal
+unescaping (`notify.rs` unit tests), and clean `shutdown()`.
+
+**Added:** `crates/cyclops-tmux/tests/streaming_client.rs` pins the workspace
+plan's acceptance criteria (decoded echo bytes, structural notifications from
+rig `cmd()` mutations).
+
+**Probe:** `cargo test -p cyclops-tmux streaming_client -- --nocapture`
