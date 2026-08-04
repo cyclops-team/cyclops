@@ -6,6 +6,6 @@
 pub mod runtime;
 
 pub use runtime::{
-    feed_alacritty, AlacrittyVt, CellAttrs, CellGrid, CellGridView, CellPos, Color, CursorShape,
-    CursorState, GridCell, HydrationSnapshot,
+    feed_alacritty, snapshot_from_bundle, AlacrittyVt, CellAttrs, CellGrid, CellGridView, CellPos,
+    Color, CursorShape, CursorState, GridCell, HydrationSnapshot, PaneRuntime,
 };

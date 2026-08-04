@@ -301,7 +301,10 @@ name = "cyclops-workspace"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
+ "cyclops-testrig",
+ "cyclops-tmux",
  "thiserror",
+ "tokio",
  "vt100",
 ]
 

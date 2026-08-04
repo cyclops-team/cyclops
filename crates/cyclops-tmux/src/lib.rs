@@ -62,6 +62,7 @@
 pub mod control;
 pub mod error;
 pub mod focus;
+pub mod hydration;
 pub mod layout;
 pub mod notify;
 pub mod quote;
@@ -73,6 +74,7 @@ mod cmd;
 pub use control::{ControlClient, ControlConfig, ControlMode};
 pub use error::TmuxError;
 pub use focus::focus_pane;
+pub use hydration::HydrationBundle;
 pub use notify::Notification;
 pub use quote::quote_arg;
 pub use version::TmuxVersion;

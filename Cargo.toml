@@ -44,6 +44,7 @@ cyclops-ledger = { path = "crates/cyclops-ledger" }
 cyclops-theme = { path = "crates/cyclops-theme" }
 cyclops-ui = { path = "crates/cyclops-ui" }
 cyclops-testrig = { path = "crates/cyclops-testrig" }
+cyclops-workspace = { path = "crates/cyclops-workspace" }
 
 [profile.release]
 lto = "thin"
