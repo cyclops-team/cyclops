@@ -8,6 +8,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use crate::layout::layout_pane_slots;
 use crate::copy;
+use crate::input::mouse::{HitMap, HitTarget};
 use crate::dialog::Dialog;
 use crate::model::{PaneSlot, RuntimeRegistry, TabModel, WorkspaceRow};
 use crate::resilience::LinkState;
@@ -68,6 +69,7 @@ pub fn paint_sidebar(
     area: Rect,
     buf: &mut Buffer,
     paint: &Paint,
+    hits: &mut HitMap,
 ) {
     let mut lines = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -91,6 +93,20 @@ pub fn paint_sidebar(
     block.render(area, buf);
     let para = Paragraph::new(lines);
     para.render(inner, buf);
+    let row_h = inner.height.saturating_sub(1) / workspaces.len().max(1) as u16;
+    for (i, _) in workspaces.iter().enumerate() {
+        let y = inner.y + 1 + (i as u16) * row_h;
+        if y < inner.y + inner.height {
+            hits.push(
+                Rect::new(inner.x, y, inner.width, row_h.max(1)),
+                HitTarget::SidebarRow { index: i },
+            );
+        }
+    }
+    hits.push(
+        Rect::new(area.x, area.y + area.height.saturating_sub(1), area.width, 1),
+        HitTarget::AppMenu,
+    );
 }
 
 /// Render the tab bar for the active session.
@@ -100,6 +116,7 @@ pub fn paint_tab_bar(
     area: Rect,
     buf: &mut Buffer,
     paint: &Paint,
+    hits: &mut HitMap,
 ) {
     let mut spans = Vec::new();
     for (i, tab) in tabs.iter().enumerate() {
@@ -116,6 +133,13 @@ pub fn paint_tab_bar(
     spans.push(Span::raw(" +"));
     let line = Line::from(spans);
     Paragraph::new(line).render(area, buf);
+    let tab_w = (area.width / tabs.len().max(1) as u16).max(4);
+    for (i, _) in tabs.iter().enumerate() {
+        hits.push(
+            Rect::new(area.x + (i as u16) * tab_w, area.y, tab_w, area.height),
+            HitTarget::Tab { index: i },
+        );
+    }
 }
 
 /// Render every pane of the active window with borders.
@@ -127,10 +151,11 @@ pub fn paint_window(
     paint: &Paint,
     link: LinkState,
     paused: &std::collections::HashSet<String>,
+    hits: &mut HitMap,
 ) {
     let slots = layout_pane_slots(&tab.layout, canvas, &tab.active_pane);
     for slot in slots {
-        paint_pane_slot(&slot, runtimes, buf, paint, link, paused);
+        paint_pane_slot(&slot, runtimes, buf, paint, link, paused, hits);
     }
 }
 
@@ -141,6 +166,7 @@ fn paint_pane_slot(
     paint: &Paint,
     link: LinkState,
     paused: &std::collections::HashSet<String>,
+    hits: &mut HitMap,
 ) {
     if slot.rect.width == 0 || slot.rect.height == 0 {
         return;
@@ -165,6 +191,26 @@ fn paint_pane_slot(
         .title(title);
     let inner = block.inner(slot.rect);
     block.render(slot.rect, buf);
+    hits.push(inner, HitTarget::PaneBody {
+        pane_id: slot.pane_id.clone(),
+    });
+    if inner.width >= 4 && inner.height >= 1 {
+        let ctrl = Rect::new(
+            inner.x + inner.width.saturating_sub(3),
+            inner.y,
+            3,
+            1,
+        );
+        hits.push(ctrl, HitTarget::PaneSplitRight {
+            pane_id: slot.pane_id.clone(),
+        });
+        hits.push(
+            Rect::new(ctrl.x.saturating_sub(2), inner.y, 2, 1),
+            HitTarget::PaneSplitDown {
+                pane_id: slot.pane_id.clone(),
+            },
+        );
+    }
     if let Some(runtime) = runtimes.get(&slot.pane_id) {
         let grid = runtime.grid();
         let mut base = theme::pane_cell(paint);
@@ -292,7 +338,15 @@ mod tests {
             let area = f.area();
             let tab_area = Rect::new(area.x, area.y, area.width, 1);
             let canvas = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
-            paint_tab_bar(std::slice::from_ref(&tab), 0, tab_area, f.buffer_mut(), &theme);
+            let mut hits = HitMap::default();
+            paint_tab_bar(
+                std::slice::from_ref(&tab),
+                0,
+                tab_area,
+                f.buffer_mut(),
+                &theme,
+                &mut hits,
+            );
             paint_window(
                 &tab,
                 &runtimes,
@@ -301,6 +355,7 @@ mod tests {
                 &theme,
                 LinkState::Live,
                 &std::collections::HashSet::new(),
+                &mut hits,
             );
         })
         .unwrap();
@@ -344,7 +399,8 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         let theme = Paint::for_test();
         term.draw(|f| {
-            paint_sidebar(&workspaces, 0, f.area(), f.buffer_mut(), &theme);
+            let mut hits = HitMap::default();
+            paint_sidebar(&workspaces, 0, f.area(), f.buffer_mut(), &theme, &mut hits);
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -380,6 +436,7 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         let theme = Paint::for_test();
         term.draw(|f| {
+            let mut hits = HitMap::default();
             paint_window(
                 &tab,
                 &runtimes,
@@ -388,6 +445,7 @@ mod tests {
                 &theme,
                 LinkState::Reconnecting { attempt: 1 },
                 &std::collections::HashSet::new(),
+                &mut hits,
             );
         })
         .unwrap();

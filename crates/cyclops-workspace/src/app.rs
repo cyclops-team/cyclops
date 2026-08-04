@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::io;
 
-use crossterm::event::{self, Event, KeyEvent};
+use crossterm::event::{self, Event, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use cyclops_tmux::{list_sessions, ControlClient, ControlConfig, Notification};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -17,6 +17,7 @@ use crate::dialog::Dialog;
 use crate::intent::{self, Intent};
 use crate::bindings::{load_bindings, BindingAction};
 use crate::copy;
+use crate::input::mouse::{HitMap, HitTarget, MenuState};
 use crate::input::encode_send_keys;
 use crate::input::router::{Router, RouterResult};
 use crate::model::{RuntimeRegistry, WorkspaceModel};
@@ -32,6 +33,7 @@ const SIDEBAR_WIDTH: u16 = 20;
 
 enum AppMsg {
     Input(KeyEvent),
+    Mouse(MouseEvent),
     Output { pane: String, bytes: Vec<u8> },
     Redraw,
     Reconcile,
@@ -50,6 +52,8 @@ struct App {
     link_state: LinkState,
     paused_panes: HashSet<String>,
     reconnect_attempt: usize,
+    hit_map: HitMap,
+    menu: MenuState,
 }
 
 /// Run the workspace on a tty. Returns the process exit code.
@@ -120,6 +124,11 @@ pub async fn run_async() -> i32 {
                     break;
                 }
             }
+            Ok(Event::Mouse(m)) => {
+                if input_tx.send(AppMsg::Mouse(m)).is_err() {
+                    break;
+                }
+            }
             Ok(Event::Resize(_, _)) => {
                 let _ = input_tx.send(AppMsg::Redraw);
             }
@@ -166,12 +175,14 @@ pub async fn run_async() -> i32 {
         link_state: LinkState::Live,
         paused_panes: HashSet::new(),
         reconnect_attempt: 0,
+        hit_map: HitMap::default(),
+        menu: MenuState::None,
     };
 
     let mut debounce: Option<Instant> = None;
     let mut reconnect_deadline: Option<Instant> = None;
     let mut detached = false;
-    let _ = draw(&mut terminal, &app);
+    let _ = draw(&mut terminal, &mut app);
     while !detached {
         if let Some(deadline) = debounce.or(reconnect_deadline) {
             tokio::select! {
@@ -195,7 +206,7 @@ pub async fn run_async() -> i32 {
                 _ = sleep_until(deadline) => {
                     if debounce == Some(deadline) {
                         debounce = None;
-                        let _ = draw(&mut terminal, &app);
+                        let _ = draw(&mut terminal, &mut app);
                     } else if reconnect_deadline == Some(deadline) {
                         reconnect_deadline = None;
                         let _ = handle_reconnect(
@@ -206,7 +217,7 @@ pub async fn run_async() -> i32 {
                             &mut reconnect_deadline,
                         )
                         .await;
-                        let _ = draw(&mut terminal, &app);
+                        let _ = draw(&mut terminal, &mut app);
                     }
                 }
             }
@@ -383,10 +394,17 @@ async fn handle_app_msg(
             }
             *debounce = Some(Instant::now() + RECONCILE_DEBOUNCE);
         }
+        AppMsg::Mouse(mouse) => {
+            if let Err(e) = handle_mouse(app, client, mouse).await {
+                eprintln!("{e}");
+            }
+            *debounce = Some(Instant::now() + RECONCILE_DEBOUNCE);
+        }
         AppMsg::Input(key) => {
             if app.link_state == LinkState::ServerGone {
                 return true;
             }
+            app.menu.close();
             match handle_key(app, client, key).await {
                 Ok(DetachOutcome::Detached) => *detached = true,
                 Ok(DetachOutcome::Continue) => {
@@ -397,6 +415,88 @@ async fn handle_app_msg(
         }
     }
     true
+}
+
+async fn handle_mouse(
+    app: &mut App,
+    client: &ControlClient,
+    mouse: MouseEvent,
+) -> Result<(), cyclops_tmux::TmuxError> {
+    let col = mouse.column;
+    let row = mouse.row;
+    match mouse.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            if let Some(HitTarget::PaneBody { pane_id }) = app.hit_map.hit(col, row).cloned() {
+                let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    -3
+                } else {
+                    3
+                };
+                if let Some(rt) = app.runtimes.get_mut(&pane_id) {
+                    rt.scroll(delta);
+                }
+            }
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            if let Some(HitTarget::PaneBody { pane_id }) = app.hit_map.hit(col, row).cloned() {
+                app.menu = MenuState::ContextMenu { pane_id };
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(target) = app.hit_map.hit(col, row).cloned() else {
+                app.menu.close();
+                return Ok(());
+            };
+            match target {
+                HitTarget::PaneBody { pane_id } => {
+                    app.menu.close();
+                    client
+                        .command(&format!(
+                            "select-pane -t {}",
+                            cyclops_tmux::quote_arg(&pane_id)
+                        ))
+                        .await?;
+                    reconcile(app, client).await?;
+                }
+                HitTarget::PaneSplitRight { pane_id } => {
+                    app.menu.close();
+                    intent::execute(client, Intent::SplitRight, &pane_id).await?;
+                    reconcile(app, client).await?;
+                }
+                HitTarget::PaneSplitDown { pane_id } => {
+                    app.menu.close();
+                    intent::execute(client, Intent::SplitDown, &pane_id).await?;
+                    reconcile(app, client).await?;
+                }
+                HitTarget::Tab { index } => {
+                    app.menu.close();
+                    intent::execute(client, Intent::SelectTab(index + 1), "").await?;
+                    reconcile(app, client).await?;
+                }
+                HitTarget::SidebarRow { index } => {
+                    app.menu.close();
+                    if let Some(ws) = app.model.workspaces.get(index) {
+                        intent::execute(
+                            client,
+                            Intent::SwitchWorkspace(ws.name.clone()),
+                            "",
+                        )
+                        .await?;
+                        reconcile(app, client).await?;
+                    }
+                }
+                HitTarget::AppMenu => {
+                    app.menu = if app.menu == MenuState::AppMenu {
+                        MenuState::None
+                    } else {
+                        MenuState::AppMenu
+                    };
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_tmux::TmuxError> {
@@ -588,7 +688,8 @@ async fn handle_dialog_key(
     Ok(DetachOutcome::Continue)
 }
 
-fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App) -> io::Result<()> {
+fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
+    app.hit_map.clear();
     terminal
         .draw(|f| {
             let area = f.area();
@@ -611,6 +712,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App) -> io:
                     sidebar,
                     f.buffer_mut(),
                     &app.paint,
+                    &mut app.hit_map,
                 );
             }
             let tab_area = Rect::new(main_area.x, main_area.y, main_area.width, TAB_BAR_HEIGHT);
@@ -626,6 +728,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App) -> io:
                 tab_area,
                 f.buffer_mut(),
                 &app.paint,
+                &mut app.hit_map,
             );
             let tab = app.model.active_tab();
             paint_window(
@@ -636,6 +739,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App) -> io:
                 &app.paint,
                 app.link_state,
                 &app.paused_panes,
+                &mut app.hit_map,
             );
             if let Some(dialog) = &app.dialog {
                 paint_dialog(dialog, f.area(), f.buffer_mut(), &app.paint);

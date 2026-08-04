@@ -4,6 +4,7 @@ use std::io::{self, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crossterm::event::EnableMouseCapture;
 use crossterm::event::DisableMouseCapture;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -24,8 +25,7 @@ impl TermGuard {
         enable_raw_mode()?;
         let mut out = io::stdout();
         out.execute(EnterAlternateScreen)?;
-        // Mouse off for step 4; EnableMouseCapture lands in step 9.
-        let _ = out.execute(DisableMouseCapture);
+        let _ = out.execute(EnableMouseCapture);
         let _ = out.flush();
         install_panic_hook();
         Ok(TermGuard { active: true })

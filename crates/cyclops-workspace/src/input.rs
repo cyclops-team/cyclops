@@ -1,5 +1,6 @@
 //! Map crossterm keys to tmux `send-keys` arguments.
 
+pub mod mouse;
 pub mod router;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
