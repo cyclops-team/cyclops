@@ -13,6 +13,7 @@ crossterm = "0.28"
 ratatui = "0.30"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+toml.workspace = true
 
 [dev-dependencies]
 vt100 = "0.16"

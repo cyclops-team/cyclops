@@ -2,35 +2,40 @@
 
 use std::io;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use cyclops_tmux::{active_pane, list_sessions, ControlClient, ControlConfig, Notification};
+use crossterm::event::{self, Event, KeyEvent};
+use cyclops_tmux::{list_sessions, ControlClient, ControlConfig, Notification};
 use ratatui::backend::CrosstermBackend;
-use ratatui::widgets::{Block, Borders};
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Duration, Instant};
 
+use crate::bindings::{load_bindings, BindingAction};
 use crate::copy;
 use crate::input::encode_send_keys;
-use crate::render::paint_pane;
-use crate::runtime::{snapshot_from_bundle, PaneRuntime};
+use crate::input::router::{Router, RouterResult};
+use crate::model::{RuntimeRegistry, SessionModel};
+use crate::render::{paint_tab_bar, paint_window};
+use crate::sync::{fetch_session_model, hydrate_visible_tab};
 use crate::term_guard::TermGuard;
 use crate::theme::Paint;
 
 const RECONCILE_DEBOUNCE: Duration = Duration::from_millis(30);
+const TAB_BAR_HEIGHT: u16 = 1;
 
 enum AppMsg {
     Input(KeyEvent),
     Output { pane: String, bytes: Vec<u8> },
     Redraw,
+    Reconcile,
 }
 
 struct App {
-    session: String,
-    pane_id: String,
-    runtime: PaneRuntime,
+    model: SessionModel,
+    runtimes: RuntimeRegistry,
+    router: Router,
     paint: Paint,
-    prefix_armed: bool,
+    socket: Option<String>,
 }
 
 /// Run the workspace on a tty. Returns the process exit code.
@@ -52,14 +57,6 @@ pub async fn run_async() -> i32 {
         return 0;
     };
 
-    let pane_id = match active_pane(&session, None) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("{e}");
-            return 1;
-        }
-    };
-
     let cfg = ControlConfig::attach(&session);
     let (client, mut notif_rx) = match ControlClient::spawn(cfg).await {
         Ok(pair) => pair,
@@ -73,17 +70,22 @@ pub async fn run_async() -> i32 {
         eprintln!("{e}");
     }
 
-    let bundle = match client.hydrate_pane(&pane_id).await {
-        Ok(b) => b,
+    let model = match fetch_session_model(&session, None) {
+        Ok(m) => m,
         Err(e) => {
             eprintln!("{e}");
             client.shutdown().await;
             return 1;
         }
     };
-    let mut runtime = PaneRuntime::new(bundle.cols, bundle.rows);
-    runtime.hydrate(&snapshot_from_bundle(&bundle));
+    let mut runtimes = RuntimeRegistry::default();
+    if let Err(e) = hydrate_visible_tab(&client, model.active_tab(), &mut runtimes).await {
+        eprintln!("{e}");
+        client.shutdown().await;
+        return 1;
+    }
 
+    let bindings = load_bindings(&cyclops_proto::cyclops_home());
     let (tx, mut rx) = mpsc::unbounded_channel::<AppMsg>();
 
     let input_tx = tx.clone();
@@ -109,6 +111,13 @@ pub async fn run_async() -> i32 {
                 Notification::Output { pane, data }
                 | Notification::ExtendedOutput { pane, data, .. } => {
                     let _ = out_tx.send(AppMsg::Output { pane, bytes: data });
+                }
+                Notification::LayoutChange { .. }
+                | Notification::WindowAdd { .. }
+                | Notification::WindowClose { .. }
+                | Notification::WindowRenamed { .. }
+                | Notification::WindowPaneChanged { .. } => {
+                    let _ = out_tx.send(AppMsg::Reconcile);
                 }
                 Notification::Exit { .. } => break,
                 _ => {}
@@ -141,11 +150,11 @@ pub async fn run_async() -> i32 {
     };
 
     let mut app = App {
-        session,
-        pane_id,
-        runtime,
+        model,
+        runtimes,
+        router: Router::new(bindings),
         paint: Paint::detect(),
-        prefix_armed: false,
+        socket: None,
     };
 
     let mut debounce: Option<Instant> = None;
@@ -159,16 +168,27 @@ pub async fn run_async() -> i32 {
                 let Some(msg) = msg else { break };
                 match msg {
                     AppMsg::Redraw => debounce = Some(Instant::now() + RECONCILE_DEBOUNCE),
-                    AppMsg::Output { pane, bytes } if pane == app.pane_id => {
-                        app.runtime.feed(&bytes);
+                    AppMsg::Reconcile => {
+                        if let Err(e) = reconcile(&mut app, &client).await {
+                            eprintln!("{e}");
+                        }
                         debounce = Some(Instant::now() + RECONCILE_DEBOUNCE);
                     }
-                    AppMsg::Output { .. } => {}
+                    AppMsg::Output { pane, bytes } => {
+                        if app.is_visible_pane(&pane) {
+                            if let Some(rt) = app.runtimes.get_mut(&pane) {
+                                rt.feed(&bytes);
+                            }
+                        }
+                        debounce = Some(Instant::now() + RECONCILE_DEBOUNCE);
+                    }
                     AppMsg::Input(key) => {
-                        if handle_key(&mut app, &client, key).await {
-                            detached = true;
-                        } else {
-                            debounce = Some(Instant::now() + RECONCILE_DEBOUNCE);
+                        match handle_key(&mut app, &client, key).await {
+                            Ok(DetachOutcome::Detached) => detached = true,
+                            Ok(DetachOutcome::Continue) => {
+                                debounce = Some(Instant::now() + RECONCILE_DEBOUNCE);
+                            }
+                            Err(e) => eprintln!("{e}"),
                         }
                     }
                 }
@@ -189,36 +209,117 @@ pub async fn run_async() -> i32 {
     0
 }
 
-async fn handle_key(app: &mut App, client: &ControlClient, key: KeyEvent) -> bool {
-    if app.prefix_armed {
-        app.prefix_armed = false;
-        if matches!(key.code, KeyCode::Char('d')) {
-            return true;
+impl App {
+    fn is_visible_pane(&self, pane: &str) -> bool {
+        let tab = self.model.active_tab();
+        crate::layout::pane_ids_in_layout(&tab.layout)
+            .iter()
+            .any(|id| id == pane)
+    }
+}
+
+enum DetachOutcome {
+    Detached,
+    Continue,
+}
+
+async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_tmux::TmuxError> {
+    let active_window = app.model.active_tab().window_id.clone();
+    let model = fetch_session_model(&app.model.session, app.socket.as_deref())?;
+    let active_tab = model
+        .tabs
+        .iter()
+        .position(|t| t.window_id == active_window)
+        .unwrap_or(model.active_tab);
+    app.model = model;
+    app.model.active_tab = active_tab;
+    hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await
+}
+
+async fn handle_key(
+    app: &mut App,
+    client: &ControlClient,
+    key: KeyEvent,
+) -> Result<DetachOutcome, cyclops_tmux::TmuxError> {
+    match app.router.route(key) {
+        RouterResult::PrefixArmed => Ok(DetachOutcome::Continue),
+        RouterResult::Consumed => Ok(DetachOutcome::Continue),
+        RouterResult::Action(BindingAction::Detach) => Ok(DetachOutcome::Detached),
+        RouterResult::Action(action) => {
+            execute_action(app, client, action).await?;
+            reconcile(app, client).await?;
+            Ok(DetachOutcome::Continue)
+        }
+        RouterResult::PassThrough(key) => {
+            let pane = app.model.active_tab().active_pane.clone();
+            let encoded = encode_send_keys(&key);
+            for key_arg in &encoded {
+                client.send_keys(&pane, &[key_arg.as_str()]).await?;
+            }
+            Ok(DetachOutcome::Continue)
         }
     }
-    if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        app.prefix_armed = true;
-        return false;
+}
+
+async fn execute_action(
+    _app: &mut App,
+    client: &ControlClient,
+    action: BindingAction,
+) -> Result<(), cyclops_tmux::TmuxError> {
+    match action {
+        BindingAction::Detach => {}
+        BindingAction::NextTab => {
+            client.command("next-window").await?;
+        }
+        BindingAction::PrevTab => {
+            client.command("previous-window").await?;
+        }
+        BindingAction::SelectTab(n) => {
+            let idx = n.saturating_sub(1);
+            client.command(&format!("select-window -t :{idx}")).await?;
+        }
+        BindingAction::NewTab => {
+            client.command("new-window -d").await?;
+            client.command("select-window -t :+").await?;
+        }
+        BindingAction::FocusLeft => {
+            client.command("select-pane -L").await?;
+        }
+        BindingAction::FocusRight => {
+            client.command("select-pane -R").await?;
+        }
+        BindingAction::FocusUp => {
+            client.command("select-pane -U").await?;
+        }
+        BindingAction::FocusDown => {
+            client.command("select-pane -D").await?;
+        }
     }
-    let encoded = encode_send_keys(&key);
-    for key_arg in &encoded {
-        let _ = client.send_keys(&app.pane_id, &[key_arg.as_str()]).await;
-    }
-    false
+    Ok(())
 }
 
 fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App) -> io::Result<()> {
     terminal
         .draw(|f| {
             let area = f.area();
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(crate::theme::pane_border_focused(&app.paint))
-                .title(format!(" {} · {} ", app.session, app.pane_id));
-            let inner = block.inner(area);
-            f.render_widget(block, area);
-            let grid = app.runtime.grid();
-            paint_pane(grid.grid, inner, f.buffer_mut(), &app.paint);
+            let tab_area = Rect::new(area.x, area.y, area.width, TAB_BAR_HEIGHT);
+            let canvas = Rect::new(
+                area.x,
+                area.y + TAB_BAR_HEIGHT,
+                area.width,
+                area.height.saturating_sub(TAB_BAR_HEIGHT),
+            );
+            paint_tab_bar(
+                &app.model.tabs,
+                app.model.active_tab,
+                tab_area,
+                f.buffer_mut(),
+                &app.paint,
+            );
+            let tab = app.model.active_tab();
+            let _ = tab.index;
+            let _ = tab.zoomed;
+            paint_window(tab, &app.runtimes, canvas, f.buffer_mut(), &app.paint);
         })
         .map(|_| ())
 }

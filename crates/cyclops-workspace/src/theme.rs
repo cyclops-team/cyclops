@@ -56,8 +56,15 @@ pub fn pane_border_focused(paint: &Paint) -> Style {
     paint.style_token(tokens::SURFACE_ACCENT)
 }
 
-#[allow(dead_code)]
 pub fn pane_border(paint: &Paint) -> Style {
+    paint.style_token(tokens::SURFACE_DIM)
+}
+
+pub fn tab_active(paint: &Paint) -> Style {
+    paint.style_token(tokens::SURFACE_ACCENT)
+}
+
+pub fn tab_inactive(paint: &Paint) -> Style {
     paint.style_token(tokens::SURFACE_DIM)
 }
 

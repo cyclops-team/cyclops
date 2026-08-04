@@ -1,10 +1,14 @@
 //! Cyclops terminal workspace: pane VT runtimes and the full-screen TUI.
 
 pub mod app;
+mod bindings;
 mod copy;
 mod input;
+mod layout;
+mod model;
 mod render;
 pub mod runtime;
+mod sync;
 mod term_guard;
 mod theme;
 

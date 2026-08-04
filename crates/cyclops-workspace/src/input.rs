@@ -1,5 +1,7 @@
 //! Map crossterm keys to tmux `send-keys` arguments.
 
+pub mod router;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Encode one key event for passthrough to the focused pane.

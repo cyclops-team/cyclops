@@ -48,3 +48,16 @@ TTY dispatches into `cyclops_workspace::run()`. Prefix `C-b d` detaches.
 
 **Note:** `DETACHED` prints on stderr after terminal restore when prefix-`d` detaches.
 
+## Step 5 — Tabs, layout, and prefix keyboard router
+
+**Added:** `layout` module parses tmux `window_layout` strings into a split tree;
+`model`/`sync` reconcile windows and panes; tab bar and multi-pane borders in
+`render`; prefix keyboard router with `config.toml` `[workspace.bindings]`
+rebinds.
+
+**Deviation:** When a layout leaf index disagrees with `#{pane_index}` on some
+tmux builds, `build_tab` falls back to a single-leaf layout from `list-panes`
+rather than failing attach.
+
+**Probe:** `cargo test -p cyclops-workspace layout router sync`
+

@@ -498,6 +498,7 @@ dependencies = [
  "ratatui",
  "thiserror 2.0.19",
  "tokio",
+ "toml",
  "vt100",
 ]
 
