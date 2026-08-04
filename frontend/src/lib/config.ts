@@ -1,7 +1,7 @@
 export const REPO_OWNER = 'cyclops-team';
 export const REPO_NAME = 'cyclops';
 export const REPO_URL = `https://github.com/${REPO_OWNER}/${REPO_NAME}`;
-export const DOCS_URL = `${REPO_URL}/tree/main/docs`;
+export const DOCS_URL = 'https://usecyclops.dev/docs';
 export const LICENSE_URL = `${REPO_URL}/blob/main/LICENSE`;
 export const GITHUB_API_URL = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}`;
 
