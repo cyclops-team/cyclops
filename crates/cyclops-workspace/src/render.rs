@@ -750,13 +750,14 @@ pub fn paint_window(
     for slot in &slots {
         paint_pane_slot(slot, runtimes, buf, paint, ctx);
     }
+    let frames = outer_frames(&slots);
     // Every pane owns a quiet boundary. Paint the focused pane last so its
     // accent wins where nested borders intersect.
-    for slot in slots.iter().filter(|slot| !slot.focused) {
-        paint_pane_frame(slot, canvas, buf, paint, ctx);
+    for (slot, frame) in slots.iter().zip(&frames).filter(|(slot, _)| !slot.focused) {
+        paint_pane_frame(slot, *frame, canvas, buf, paint, ctx);
     }
-    for slot in slots.iter().filter(|slot| slot.focused) {
-        paint_pane_frame(slot, canvas, buf, paint, ctx);
+    for (slot, frame) in slots.iter().zip(&frames).filter(|(slot, _)| slot.focused) {
+        paint_pane_frame(slot, *frame, canvas, buf, paint, ctx);
     }
     // Shared pane borders are resize handles. Put divider regions above the
     // generic frame regions, then restore the visibly overlaid controls as
@@ -768,6 +769,65 @@ pub fn paint_window(
     if let Some(drag) = ctx.drag.filter(|d| d.is_active()) {
         paint_drag_preview(drag, buf, paint);
     }
+}
+
+/// The border box for each slot: its own rect, grown to the shared outer
+/// edge on any axis where no sibling lies beyond it.
+///
+/// The pane area has to read as one rectangle, and without this it does
+/// not. tmux gives every column the same height, but a column expands one
+/// screen cell per split into two (`PANE_GAPS`), so a column carrying three
+/// panes needs more chrome rows than a column carrying one.
+/// [`layout_gap_overhead`] reserves that difference from the deepest branch,
+/// which leaves every shallower branch finishing that many cells short and
+/// the deepest one looking like it overhangs the rest.
+///
+/// Only the border moves. Leaf content rects stay exactly the size tmux
+/// reported, because a live child terminal maps one runtime cell to one
+/// screen cell and cropping or stretching it would corrupt what it drew —
+/// the surplus simply becomes gutter inside the box, which is already how
+/// this renderer treats every cell tmux does not own.
+fn outer_frames(slots: &[PaneSlot]) -> Vec<Rect> {
+    let edge_right = slots
+        .iter()
+        .map(|slot| slot.rect.x + slot.rect.width)
+        .max()
+        .unwrap_or(0);
+    let edge_bottom = slots
+        .iter()
+        .map(|slot| slot.rect.y + slot.rect.height)
+        .max()
+        .unwrap_or(0);
+    slots
+        .iter()
+        .map(|slot| {
+            let own = slot.rect;
+            let shares_rows =
+                |other: &Rect| other.y < own.y + own.height && own.y < other.y + other.height;
+            let shares_cols =
+                |other: &Rect| other.x < own.x + own.width && own.x < other.x + other.width;
+            let has_pane_below = slots
+                .iter()
+                .any(|o| o.rect.y >= own.y + own.height && shares_cols(&o.rect));
+            let has_pane_beyond = slots
+                .iter()
+                .any(|o| o.rect.x >= own.x + own.width && shares_rows(&o.rect));
+            Rect::new(
+                own.x,
+                own.y,
+                if has_pane_beyond {
+                    own.width
+                } else {
+                    edge_right.saturating_sub(own.x)
+                },
+                if has_pane_below {
+                    own.height
+                } else {
+                    edge_bottom.saturating_sub(own.y)
+                },
+            )
+        })
+        .collect()
 }
 
 /// Divider gap cells stay grabbable for resize even though they paint as
@@ -894,12 +954,15 @@ fn paint_pane_slot(
 /// layout legible.
 fn paint_pane_frame(
     slot: &PaneSlot,
+    frame: Rect,
     bounds: Rect,
     buf: &mut Buffer,
     paint: &Paint,
     ctx: &mut WindowPaintCtx<'_>,
 ) {
-    let vis = slot.rect;
+    // The frame, not the content rect: a box grown out to the shared edge
+    // must stay grabbable over the whole boundary it actually draws.
+    let vis = frame;
     let border_style = if slot.focused {
         theme::pane_border_focused(paint)
     } else {
@@ -1475,6 +1538,72 @@ mod tests {
         assert!(matches!(hits.hit(20, 7), Some(HitTarget::Divider { .. })));
         // The bottom margin carries the second pane's muted border.
         assert_eq!(buf[(20, 11)].symbol(), "─", "every pane has a border");
+    }
+
+    fn frame_slot(pane_id: &str, rect: Rect) -> PaneSlot {
+        PaneSlot {
+            pane_id: pane_id.into(),
+            rect,
+            focused: false,
+        }
+    }
+
+    /// A column split three ways spends more rows on separator bands than
+    /// its single-pane sibling, so tmux's equal columns paint unequal boxes
+    /// and the deep one reads as overhanging the rest.
+    #[test]
+    fn outermost_boxes_close_on_one_shared_bottom_edge() {
+        let slots = vec![
+            frame_slot("%0", Rect::new(0, 0, 40, 18)),
+            frame_slot("%1", Rect::new(42, 0, 40, 5)),
+            frame_slot("%2", Rect::new(42, 7, 40, 5)),
+            frame_slot("%3", Rect::new(42, 14, 40, 6)),
+        ];
+        let frames = outer_frames(&slots);
+
+        let shallow = frames[0].y + frames[0].height;
+        let deep = frames[3].y + frames[3].height;
+        assert_eq!(
+            shallow, deep,
+            "the single-pane column must close on the same row as the three-pane column"
+        );
+        assert_eq!(
+            frames[0].width, 40,
+            "a pane with a sibling beyond it keeps its own right edge"
+        );
+        assert_eq!(
+            frames[1].height, 5,
+            "a pane with a sibling below it keeps its own bottom edge"
+        );
+        for (slot, frame) in slots.iter().zip(&frames) {
+            assert!(
+                frame.width >= slot.rect.width && frame.height >= slot.rect.height,
+                "a frame only ever grows past its content, never crops it"
+            );
+        }
+    }
+
+    /// The identical bug on the other axis: a row split three ways beside a
+    /// single pane must still close on one right edge.
+    #[test]
+    fn outermost_boxes_close_on_one_shared_right_edge() {
+        let slots = vec![
+            frame_slot("%0", Rect::new(0, 0, 18, 40)),
+            frame_slot("%1", Rect::new(0, 42, 5, 40)),
+            frame_slot("%2", Rect::new(7, 42, 5, 40)),
+            frame_slot("%3", Rect::new(14, 42, 6, 40)),
+        ];
+        let frames = outer_frames(&slots);
+
+        assert_eq!(
+            frames[0].x + frames[0].width,
+            frames[3].x + frames[3].width,
+            "both rows must end on the same column"
+        );
+        assert_eq!(
+            frames[1].width, 5,
+            "a pane with a sibling beyond it keeps its own right edge"
+        );
     }
 
     #[test]
