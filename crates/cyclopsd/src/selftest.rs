@@ -192,6 +192,11 @@ pub(crate) fn f1_cause(manifest_id: &str) -> String {
             probably missing where this agent runs. \
             Run: cyclops hooks install agy --agent <label>"
             .to_string(),
+        "cursor" => "cursor reads hooks from ~/.cursor/hooks.json or \
+            <workspace>/.cursor/hooks.json; CURSOR_CONFIG_DIR does NOT apply to \
+            hooks, so a hooks.json placed there never loads. \
+            Run: cyclops hooks install cursor --agent <label>"
+            .to_string(),
         other => format!("the {other} hook config is probably not loaded by the running CLI"),
     }
 }
@@ -257,7 +262,7 @@ pub(crate) async fn verify(
         });
     };
     let row = inner
-        .sessions
+        .session_slots()
         .iter()
         .find_map(|slot| {
             let link = slot.link.lock().expect("session link lock");
@@ -341,7 +346,7 @@ pub(crate) async fn selftest(
         });
     };
     let (manifest_id, tier) = inner
-        .sessions
+        .session_slots()
         .iter()
         .find_map(|slot| {
             let link = slot.link.lock().expect("session link lock");
@@ -454,7 +459,7 @@ fn ledger_state(
     msg_id: &str,
     to: &str,
 ) -> Option<DeliveryState> {
-    let slot = inner.sessions.get(session_idx)?;
+    let slot = inner.session(session_idx)?;
     let lines = cyclops_ledger::read_after(slot.ledger.path(), 0).ok()?;
     lines
         .iter()
@@ -568,6 +573,7 @@ mod tests {
         assert!(c.contains("does NOT fix"));
         assert!(f1_cause("claude").contains("--settings"));
         assert!(f1_cause("agy").contains(".agents/hooks.json"));
+        assert!(f1_cause("cursor").contains("CURSOR_CONFIG_DIR"));
         assert!(f1_cause("mystery").contains("mystery"));
     }
 }

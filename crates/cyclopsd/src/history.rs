@@ -74,7 +74,11 @@ pub(crate) fn msg_history(
     let limit = params.limit as usize;
 
     let files = read_all_sessions(inner);
-    let names: Vec<String> = inner.sessions.iter().map(|s| s.name.clone()).collect();
+    let names: Vec<String> = inner
+        .session_slots()
+        .iter()
+        .map(|s| s.name.clone())
+        .collect();
 
     if let Some(c2) = cursor2 {
         if params.cursor.is_some() {
@@ -215,7 +219,7 @@ fn caller_name(inner: &Arc<Inner>, peer: Peer) -> Result<String, WireError> {
 /// the query to the others.
 fn read_all_sessions(inner: &Inner) -> Vec<Vec<LedgerLine>> {
     inner
-        .sessions
+        .session_slots()
         .iter()
         .map(|slot| match cyclops_ledger::read_after(slot.ledger.path(), 0) {
             Ok(lines) => lines,

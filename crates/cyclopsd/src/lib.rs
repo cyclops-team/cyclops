@@ -117,8 +117,19 @@ pub(crate) struct Inner {
     /// [`Config::manifest_dir`]) and a later reader has no way to redo it:
     /// `status` reports this path to whoever has to fix an unknown pane.
     pub(crate) manifest_dir: Option<PathBuf>,
-    /// One slot per configured session, fixed at boot.
-    pub(crate) sessions: Vec<SessionSlot>,
+    /// One slot per watched session: every session named in `sessions` at
+    /// boot, plus any [`watch_session`] has added since.
+    ///
+    /// Append-only, and that append-only-ness is the whole reason this is
+    /// safe: a `session_idx` handed to a spawned task, an in-flight
+    /// request, or a delivery handle stays valid for the daemon's life,
+    /// because no element is ever removed or reordered. Go through
+    /// [`Inner::session`], [`Inner::session_count`], [`Inner::session_index`],
+    /// or [`Inner::session_slots`] rather than touching the `Vec` directly,
+    /// and never hold this lock across an `.await` or while taking another
+    /// lock: every read here is a snapshot (clone of the `Arc`s, or of the
+    /// whole `Vec`) taken and released before any work happens.
+    pub(crate) sessions: StdMutex<Vec<Arc<SessionSlot>>>,
     /// Push stream for events.subscribe connections.
     pub(crate) events: broadcast::Sender<Event>,
     /// Cached fusion verdict per pane id.
@@ -153,6 +164,15 @@ pub(crate) struct Inner {
     pub(crate) fail_chrome_restore: AtomicBool,
     /// Last-active workspace/tab for the terminal workspace UI.
     pub(crate) workspace_ui: StdMutex<workspace_ui::WorkspaceUiState>,
+    /// The shutdown signal, readable so a session watched after boot
+    /// ([`watch_session`]) can hand its `session_task` the same receiver
+    /// every configured session got.
+    pub(crate) stop: watch::Receiver<bool>,
+    /// Handles for tasks spawned after boot (currently: `session_task` for
+    /// a dynamically watched session). [`Daemon::shutdown`] joins these
+    /// alongside `Daemon.tasks` so a session added at runtime shuts down
+    /// exactly as cleanly as one that was configured.
+    pub(crate) extra_tasks: StdMutex<Vec<JoinHandle<()>>>,
 }
 
 pub(crate) struct SessionSlot {
@@ -184,6 +204,38 @@ pub(crate) struct DetEntry {
 }
 
 impl Inner {
+    /// The slot at `idx`, if one exists. Locks, clones the `Arc`, releases:
+    /// safe to call right before an `.await`.
+    pub(crate) fn session(&self, idx: usize) -> Option<Arc<SessionSlot>> {
+        self.sessions
+            .lock()
+            .expect("sessions lock")
+            .get(idx)
+            .cloned()
+    }
+
+    /// How many sessions are watched right now (configured plus any added
+    /// since boot).
+    pub(crate) fn session_count(&self) -> usize {
+        self.sessions.lock().expect("sessions lock").len()
+    }
+
+    /// The index of a watched session by name, if it is already watched.
+    pub(crate) fn session_index(&self, name: &str) -> Option<usize> {
+        self.sessions
+            .lock()
+            .expect("sessions lock")
+            .iter()
+            .position(|s| s.name == name)
+    }
+
+    /// A cloned snapshot of every session slot, for iteration. Lock the
+    /// sessions vector, clone every `Arc`, release: the lock never has to
+    /// span the loop body that follows.
+    pub(crate) fn session_slots(&self) -> Vec<Arc<SessionSlot>> {
+        self.sessions.lock().expect("sessions lock").clone()
+    }
+
     /// Emit a fused-state change: one kind=state ledger line on the
     /// session's ledger plus a "state" event. Gate/state lines carry rule
     /// ids and causes, never raw screen captures (secrets rule).
@@ -198,7 +250,7 @@ impl Inner {
         let target = self
             .label_of(pane_id)
             .unwrap_or_else(|| pane_id.to_string());
-        let session_idx = self.sessions.iter().position(|s| s.name == session);
+        let session_idx = self.session_index(session);
         let seq = session_idx.and_then(|idx| {
             self.append_line(
                 idx,
@@ -252,7 +304,7 @@ impl Inner {
     /// Append one line to a session ledger. Append failures are loud but
     /// never take the daemon down mid-delivery.
     pub(crate) fn append_line(&self, session_idx: usize, line: LedgerLine) -> Option<u64> {
-        let slot = self.sessions.get(session_idx)?;
+        let slot = self.session(session_idx)?;
         match slot.ledger.append(line) {
             Ok(l) => Some(l.seq),
             Err(e) => {
@@ -314,7 +366,7 @@ impl Inner {
 
     /// Live watcher for a session slot, if attached.
     pub(crate) fn watcher_of(&self, session_idx: usize) -> Option<Arc<SessionWatcher>> {
-        let slot = self.sessions.get(session_idx)?;
+        let slot = self.session(session_idx)?;
         let link = slot.link.lock().expect("session link lock");
         link.watcher.as_ref().map(Arc::clone)
     }
@@ -323,7 +375,7 @@ impl Inner {
     /// panes that currently exist resolve.
     pub(crate) fn resolve_recipient(&self, name: &str) -> Option<(usize, String)> {
         let wanted = self.label_target(name);
-        for (idx, slot) in self.sessions.iter().enumerate() {
+        for (idx, slot) in self.session_slots().into_iter().enumerate() {
             let watcher = {
                 let link = slot.link.lock().expect("session link lock");
                 link.watcher.as_ref().map(Arc::clone)
@@ -343,7 +395,7 @@ impl Inner {
     /// blinds tier 1 (the m1 soak's duplicate-delivery failure).
     pub(crate) fn resolve_recipient_last_known(&self, name: &str) -> Option<(usize, PaneRow)> {
         let wanted = self.label_target(name);
-        for (idx, slot) in self.sessions.iter().enumerate() {
+        for (idx, slot) in self.session_slots().into_iter().enumerate() {
             if slot.link.lock().expect("session link lock").attached {
                 continue; // live table is authoritative while attached
             }
@@ -390,8 +442,14 @@ impl Daemon {
     pub async fn shutdown(&self) {
         restore_all_chrome(&self.inner).await;
         let _ = self.stop.send(true);
-        let tasks: Vec<JoinHandle<()>> =
+        let mut tasks: Vec<JoinHandle<()>> =
             std::mem::take(&mut *self.tasks.lock().expect("tasks lock"));
+        // Tasks spawned after boot (watch_session's session_task) shut down
+        // exactly like the ones boot spawned: same stop signal, same
+        // grace-then-abort below.
+        tasks.extend(std::mem::take(
+            &mut *self.inner.extra_tasks.lock().expect("extra tasks lock"),
+        ));
         for mut task in tasks {
             if tokio::time::timeout(SHUTDOWN_GRACE, &mut task)
                 .await
@@ -551,7 +609,11 @@ pub(crate) async fn label_pane(
             data: None,
         });
     };
-    let session = inner.sessions[session_idx].name.clone();
+    let session = inner
+        .session(session_idx)
+        .expect("session_idx valid: resolve_recipient just returned it")
+        .name
+        .clone();
     let label = label.filter(|l| !l.is_empty());
 
     // 2. Validate the label. The rule and its wording are
@@ -710,7 +772,11 @@ async fn adopt_pane(
         _ => chrome::Snapshot::none(),
     };
     // 2. Write the registry.
-    let session = inner.sessions[session_idx].name.clone();
+    let session = inner
+        .session(session_idx)
+        .expect("session_idx valid: caller resolved it")
+        .name
+        .clone();
     let adoption = registry::Adoption {
         session: session.clone(),
         pane_id: pane_id.to_string(),
@@ -865,7 +931,7 @@ fn chrome_not_restored(
 /// out, because there the window keeps its text while a named pane is
 /// still in it.)
 async fn restore_all_chrome(inner: &Arc<Inner>) {
-    for (idx, slot) in inner.sessions.iter().enumerate() {
+    for (idx, slot) in inner.session_slots().into_iter().enumerate() {
         let Some(watcher) = inner.watcher_of(idx) else {
             continue;
         };
@@ -1017,7 +1083,7 @@ pub(crate) async fn reload_theme(inner: &Arc<Inner>) -> String {
     // than once per pane. The paints below read the same watch, which by
     // then has nothing new to find.
     let name = inner.theme_now().name().to_string();
-    for idx in 0..inner.sessions.len() {
+    for idx in 0..inner.session_count() {
         let Some(watcher) = inner.watcher_of(idx) else {
             continue;
         };
@@ -1030,6 +1096,32 @@ pub(crate) async fn reload_theme(inner: &Arc<Inner>) -> String {
     }
     inner.emit("theme", json!({"name": name}), None);
     name
+}
+
+/// The `event: "boot"` system line every watched session's ledger gets:
+/// which daemon run, which tmux, which manifest set. `boot` appends one of
+/// these to every configured session; [`watch_session`] appends the same
+/// line to a session that joins afterwards.
+fn boot_fact_line(inner: &Inner, manifest_ids: &[String], session: &str) -> LedgerLine {
+    LedgerLine {
+        seq: 0,
+        boot_id: String::new(),
+        id: inner.mint_event_id(),
+        ts: 0,
+        kind: Kind::System,
+        from: "cyclopsd".to_string(),
+        to: Vec::new(),
+        subject: None,
+        body: None,
+        reply_to: None,
+        deliveries: Vec::new(),
+        data: Some(json!({
+            "event": "boot",
+            "tmux_version": inner.tmux_version,
+            "manifests": manifest_ids,
+            "session": session,
+        })),
+    }
 }
 
 /// Boot the daemon: probe tmux, load manifests, bind the socket, spawn one
@@ -1080,12 +1172,12 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
             }
             Err(e) => warn!(session = %name, error = %e, "ledger replay for id preload failed"),
         }
-        sessions.push(SessionSlot {
+        sessions.push(Arc::new(SessionSlot {
             name: name.clone(),
             link: StdMutex::new(SessionLink::default()),
             ledger: Arc::new(ledger),
             last_panes: StdMutex::new(HashMap::new()),
-        });
+        }));
     }
     // Adoptions from the previous run. Nothing is trusted onto a pane
     // yet; each session prunes its own entries against the live pane
@@ -1099,6 +1191,10 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         warn!("theme: {w}");
     }
 
+    // Created before Inner so the receiver can live on it: a session
+    // watched after boot (watch_session) hands its session_task the same
+    // receiver every configured session got. boot keeps the sender.
+    let (stop, stop_rx) = watch::channel(false);
     let (events, _) = broadcast::channel(EVENT_BUFFER);
     let inner = Arc::new(Inner {
         cfg,
@@ -1107,7 +1203,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         tmux_version,
         manifests,
         manifest_dir,
-        sessions,
+        sessions: StdMutex::new(sessions),
         events,
         detections: StdMutex::new(HashMap::new()),
         registry: StdMutex::new(adoptions),
@@ -1120,34 +1216,17 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         inject_pause: StdMutex::new(None),
         fail_chrome_restore: AtomicBool::new(false),
         workspace_ui: StdMutex::new(workspace_ui::WorkspaceUiState::default()),
+        stop: stop_rx,
+        extra_tasks: StdMutex::new(Vec::new()),
     });
 
     // Boot fact on every session ledger: which daemon run, which tmux,
-    // which manifest set.
+    // which manifest set. watch_session appends the same line to a
+    // session that joins afterwards (boot_fact_line).
     let manifest_ids: Vec<String> = inner.manifests.keys().cloned().collect();
-    for idx in 0..inner.sessions.len() {
-        inner.append_line(
-            idx,
-            LedgerLine {
-                seq: 0,
-                boot_id: String::new(),
-                id: inner.mint_event_id(),
-                ts: 0,
-                kind: Kind::System,
-                from: "cyclopsd".to_string(),
-                to: Vec::new(),
-                subject: None,
-                body: None,
-                reply_to: None,
-                deliveries: Vec::new(),
-                data: Some(json!({
-                    "event": "boot",
-                    "tmux_version": inner.tmux_version,
-                    "manifests": manifest_ids,
-                    "session": inner.sessions[idx].name,
-                })),
-            },
-        );
+    for idx in 0..inner.session_count() {
+        let name = inner.session(idx).expect("just counted it").name.clone();
+        inner.append_line(idx, boot_fact_line(&inner, &manifest_ids, &name));
     }
 
     // A daemon with no manifests boots clean, watches panes, and can
@@ -1184,23 +1263,22 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     drop(replayed);
 
     let listener = server::bind_socket(&inner.cfg.home).await?;
-    let (stop, stop_rx) = watch::channel(false);
     let mut tasks = Vec::new();
-    for idx in 0..inner.sessions.len() {
+    for idx in 0..inner.session_count() {
         tasks.push(tokio::spawn(session_task(
             Arc::clone(&inner),
             idx,
-            stop_rx.clone(),
+            inner.stop.clone(),
         )));
     }
     tasks.push(tokio::spawn(server::accept_loop(
         Arc::clone(&inner),
         listener,
-        stop_rx,
+        inner.stop.clone(),
     )));
     info!(
         boot_id = %inner.boot_id,
-        sessions = inner.sessions.len(),
+        sessions = inner.session_count(),
         manifests = inner.manifests.len(),
         "cyclopsd booted"
     );
@@ -1209,6 +1287,67 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         stop,
         tasks: StdMutex::new(tasks),
     })
+}
+
+/// Start watching a tmux session the daemon was not booted with.
+///
+/// `sessions` in `config.toml` is what the daemon watches AT BOOT; this is
+/// how a session created afterwards (the terminal workspace UI creates
+/// tmux sessions at runtime) joins that set. It does not rewrite
+/// `config.toml`: a restart watches the configured list again, not
+/// whatever a client added here in between.
+///
+/// Idempotent: watching an already-watched session neither opens a second
+/// ledger nor spawns a second task, it just hands back the existing index
+/// with `added: false`. Otherwise the ledger is opened exactly the way
+/// `boot` opens one (same [`LedgerWriter::open`] with the boot id, same
+/// id-preload so message ids stay unique across the whole daemon, not just
+/// within one session), and a failure to open it is a [`WireError`] rather
+/// than a silent no-watch: a daemon that cannot record must not watch,
+/// same rule `boot` follows when it fails the whole boot.
+pub(crate) async fn watch_session(
+    inner: &Arc<Inner>,
+    name: &str,
+) -> Result<(usize, bool), WireError> {
+    if let Some(idx) = inner.session_index(name) {
+        return Ok((idx, false));
+    }
+    let path = inner.cfg.home.join("ledger").join(format!("{name}.ndjson"));
+    let ledger = LedgerWriter::open(&path, &inner.boot_id).map_err(|e| WireError {
+        code: "internal".to_string(),
+        message: format!("open ledger {}: {e}", path.display()),
+        data: None,
+    })?;
+    // Same id-preload boot does: message ids stay unique across restarts
+    // and across every session this daemon has ever watched.
+    match cyclops_ledger::read_after(&path, 0) {
+        Ok(lines) => inner.engine.preload_ids(&lines),
+        Err(e) => warn!(session = %name, error = %e, "ledger replay for id preload failed"),
+    }
+    let slot = Arc::new(SessionSlot {
+        name: name.to_string(),
+        link: StdMutex::new(SessionLink::default()),
+        ledger: Arc::new(ledger),
+        last_panes: StdMutex::new(HashMap::new()),
+    });
+    // Push, then drop the lock before doing anything else: the locking
+    // rule this field's doc comment states is never taking another lock,
+    // or awaiting, while holding the sessions lock.
+    let idx = {
+        let mut sessions = inner.sessions.lock().expect("sessions lock");
+        sessions.push(slot);
+        sessions.len() - 1
+    };
+    // The same boot-fact line `boot` appends to every configured session.
+    let manifest_ids: Vec<String> = inner.manifests.keys().cloned().collect();
+    inner.append_line(idx, boot_fact_line(inner, &manifest_ids, name));
+    let handle = tokio::spawn(session_task(Arc::clone(inner), idx, inner.stop.clone()));
+    inner
+        .extra_tasks
+        .lock()
+        .expect("extra tasks lock")
+        .push(handle);
+    Ok((idx, true))
 }
 
 /// One `tmux -V`, run once at boot. None when tmux is absent or broken.
@@ -1294,7 +1433,12 @@ async fn session_missing(inner: &Arc<Inner>, session: &str) -> bool {
 /// events, reattach with backoff when the connection dies or the session
 /// does not exist yet.
 async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<bool>) {
-    let name = inner.sessions[idx].name.clone();
+    // One snapshot of the Arc for the task's whole life: idx is append-only
+    // stable, so this never needs to re-consult the sessions lock.
+    let slot = inner
+        .session(idx)
+        .expect("session_idx valid: append-only, never removed");
+    let name = slot.name.clone();
     let mut backoff = RECONNECT_MIN;
     let mut announced_missing = false;
     loop {
@@ -1317,7 +1461,7 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                 backoff = RECONNECT_MIN;
                 let watcher = Arc::new(watcher);
                 {
-                    let mut link = inner.sessions[idx].link.lock().expect("session link lock");
+                    let mut link = slot.link.lock().expect("session link lock");
                     link.attached = true;
                     link.watcher = Some(Arc::clone(&watcher));
                 }
@@ -1327,10 +1471,7 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                 // Freeze the pane table as of this detach: hook reports
                 // arriving during the outage resolve against it.
                 {
-                    let mut last = inner.sessions[idx]
-                        .last_panes
-                        .lock()
-                        .expect("last panes lock");
+                    let mut last = slot.last_panes.lock().expect("last panes lock");
                     *last = watcher
                         .snapshot()
                         .into_iter()
@@ -1338,7 +1479,7 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                         .collect();
                 }
                 {
-                    let mut link = inner.sessions[idx].link.lock().expect("session link lock");
+                    let mut link = slot.link.lock().expect("session link lock");
                     link.attached = false;
                     link.watcher = None;
                 }
@@ -1389,7 +1530,11 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
 /// Record and broadcast a session attach/detach: a system ledger line
 /// plus a "session" event (gate holds wake on it after a reattach).
 fn session_lifecycle(inner: &Arc<Inner>, idx: usize, attached: bool) {
-    let name = inner.sessions[idx].name.clone();
+    let name = inner
+        .session(idx)
+        .expect("session_idx valid: append-only, never removed")
+        .name
+        .clone();
     let seq = inner.append_line(
         idx,
         LedgerLine {
@@ -1546,10 +1691,7 @@ async fn move_chrome(inner: &Arc<Inner>, watcher: &Arc<SessionWatcher>, pane_id:
             warn!(window = %source.window_id, error = %e, "cannot restore the window an adopted pane left");
         }
     }
-    let session_idx = inner
-        .sessions
-        .iter()
-        .position(|s| s.name == watcher.session());
+    let session_idx = inner.session_index(watcher.session());
     if let Some(idx) = session_idx {
         paint_chrome(inner, idx, pane_id).await;
     }

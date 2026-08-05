@@ -89,6 +89,7 @@ alphabet.
 | `status` | Every watched session and pane, with fused state |
 | `pane.read` | A pane's screen, its recent output, or the detection view |
 | `pane.label` | Give a pane a name, or take it back |
+| `session.watch` | Start watching a tmux session the daemon was not booted with |
 | `msg.send` | Deliver a message; returns a receipt per recipient |
 | `msg.history` | Messages from the record, filtered and paged |
 | `msg.thread` | One message, its replies, and its full delivery chain |
@@ -279,6 +280,33 @@ starting with `%` (a tmux pane id), and a name another pane already
 answers to. A control character is refused too, because it cannot survive
 onto a tmux command line and the border would then wear a different name
 than the record.
+
+### session.watch
+
+```
+-> {"id":16,"method":"session.watch","params":{"session":"extra"}}
+<- {"id":16,"result":{"added":true,"session":"extra","watching":true}}
+```
+
+`sessions` in `config.toml` is what the daemon watches from boot. This is
+how a session created afterwards joins that set -- the terminal workspace
+UI creates tmux sessions on the fly and needs the daemon to see one without
+a restart. It does not touch `config.toml`: a restart goes back to
+watching only the configured list, not whatever a client added here in the
+meantime.
+
+Watching a session that is already watched is a no-op, not an error:
+`added` is false and nothing is opened twice.
+
+```
+-> {"id":17,"method":"session.watch","params":{"session":"extra"}}
+<- {"id":17,"result":{"added":false,"session":"extra","watching":true}}
+```
+
+An absent, non-string, or empty/whitespace-only `session` is `bad_request`.
+A session name that does not exist yet on the tmux server is not an error
+either: the daemon watches for it exactly the way it waits for any
+configured session that has not been created yet.
 
 ### agent.state.report
 

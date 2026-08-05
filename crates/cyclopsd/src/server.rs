@@ -437,6 +437,38 @@ pub(crate) async fn dispatch(
                 None,
             )
         }
+        // Start watching a tmux session the daemon was not booted with
+        // (crate::watch_session's doc comment has the full story: this
+        // does not touch config.toml, so a restart forgets it).
+        "session.watch" => {
+            let session = req.params["session"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if session.trim().is_empty() {
+                return (
+                    Response::err(id, "bad_request", "session.watch needs a session"),
+                    None,
+                );
+            }
+            match crate::watch_session(inner, &session).await {
+                Ok((_, added)) => (
+                    Response::ok(
+                        id,
+                        json!({"session": session, "watching": true, "added": added}),
+                    ),
+                    None,
+                ),
+                Err(e) => (
+                    Response {
+                        id,
+                        result: None,
+                        error: Some(e),
+                    },
+                    None,
+                ),
+            }
+        }
         "hooks.verify" => {
             let params: cyclops_proto::HooksVerifyParams = match serde_json::from_value(req.params)
             {
@@ -581,7 +613,7 @@ async fn msg_send(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> R
 pub(crate) fn sender_panes(inner: &Inner) -> Vec<(String, Option<String>, i32)> {
     let labels = inner.labels();
     inner
-        .sessions
+        .session_slots()
         .iter()
         .flat_map(|slot| {
             let link = slot.link.lock().expect("session link lock");
@@ -605,7 +637,7 @@ pub(crate) fn sender_panes(inner: &Inner) -> Vec<(String, Option<String>, i32)> 
 fn report_panes(inner: &Inner) -> Vec<(String, Option<String>, i32)> {
     let mut rows = sender_panes(inner);
     let labels = inner.labels();
-    for slot in &inner.sessions {
+    for slot in inner.session_slots() {
         if slot.link.lock().expect("session link lock").attached {
             continue;
         }
@@ -682,7 +714,7 @@ pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResul
     let detections = inner.detections.lock().expect("detections lock");
     let labels = inner.labels();
     let sessions = inner
-        .sessions
+        .session_slots()
         .iter()
         .map(|slot| {
             let link = slot.link.lock().expect("session link lock");
@@ -847,7 +879,7 @@ fn cap_lines(text: String, cap: Option<u32>) -> String {
 /// await; only the Arc leaves the closure.
 fn resolve_target(inner: &Inner, target: &str) -> Option<(Arc<SessionWatcher>, String)> {
     let wanted = inner.label_target(target);
-    inner.sessions.iter().find_map(|slot| {
+    inner.session_slots().iter().find_map(|slot| {
         let link = slot.link.lock().expect("session link lock");
         link.watcher
             .as_ref()
@@ -857,7 +889,7 @@ fn resolve_target(inner: &Inner, target: &str) -> Option<(Arc<SessionWatcher>, S
 
 fn known_panes(inner: &Inner) -> Vec<String> {
     inner
-        .sessions
+        .session_slots()
         .iter()
         .flat_map(|slot| {
             let link = slot.link.lock().expect("session link lock");
@@ -907,7 +939,7 @@ mod tests {
             tmux_version: "3.6a".into(),
             manifests: BTreeMap::new(),
             manifest_dir: None,
-            sessions: Vec::new(),
+            sessions: StdMutex::new(Vec::new()),
             events: broadcast::channel(16).0,
             detections: StdMutex::new(HashMap::<String, DetEntry>::new()),
             registry: StdMutex::new(registry),
@@ -920,6 +952,10 @@ mod tests {
             inject_pause: StdMutex::new(None),
             fail_chrome_restore: std::sync::atomic::AtomicBool::new(false),
             workspace_ui: StdMutex::new(crate::workspace_ui::WorkspaceUiState::default()),
+            // No production sender behind this in tests: nothing here
+            // spawns a session_task or calls Daemon::shutdown.
+            stop: watch::channel(false).1,
+            extra_tasks: StdMutex::new(Vec::new()),
         })
     }
 
@@ -940,14 +976,16 @@ mod tests {
         Arc::get_mut(&mut inner)
             .expect("sole owner")
             .sessions
-            .push(crate::SessionSlot {
+            .get_mut()
+            .expect("sessions lock")
+            .push(Arc::new(crate::SessionSlot {
                 name: "main".into(),
                 link: StdMutex::new(crate::SessionLink::default()),
                 ledger: Arc::new(
                     cyclops_ledger::LedgerWriter::open(&path, "b-test").expect("ledger opens"),
                 ),
                 last_panes: StdMutex::new(HashMap::new()),
-            });
+            }));
         (inner, dir)
     }
 
@@ -1101,7 +1139,7 @@ mod tests {
     /// unknown_method: implemented, unimplemented, or a param error.
     /// Every method protocol v1 answers. One list, read by the dispatch
     /// check below and by the page that documents the wire.
-    const PROTOCOL_V1: [&str; 16] = [
+    const PROTOCOL_V1: [&str; 17] = [
         "ping",
         "status",
         "msg.send",
@@ -1111,6 +1149,7 @@ mod tests {
         "agent.state.report",
         "pane.read",
         "pane.label",
+        "session.watch",
         "events.subscribe",
         "admin.notify",
         "hooks.verify",
