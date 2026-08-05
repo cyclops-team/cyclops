@@ -1,0 +1,39 @@
+briosolivares@Brioss-MacBook-Pro-3 curdemo % CURSOR_CONFIG_DIR=/tmp/curcfg agent
+
+
+  Cursor Agent
+  v2026.07.23-e383d2b
+  Tip: Use /run-everything to skip all approvals.
+
+
+  run the shell command: ls -la /tmp/curdemo
+
+
+  $ ls -la /tmp/curdemo Waiting for approval...
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ $  ls -la /tmp/curdemo in .
+
+ Run this command?
+ Shell allowlist is empty
+  → Run (once) (y)
+    Add Shell(ls) to allowlist? (tab)
+    Run Everything (shift+tab)
+    Skip & tell the agent what to do instead (esc or n)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -149,11 +149,11 @@ gives the border back. Details: [docs/panes.md](docs/panes.md).
 
 Cyclops has no SDK and no wrapper. Everything it knows about an agent CLI is
 one TOML file: which processes it runs as, how to read working from idle off
-the pane, how to type into it. Three ship in [`manifests/`](manifests/):
-Claude Code, Codex CLI, Antigravity CLI.
+the pane, how to type into it. Four ship in [`manifests/`](manifests/):
+Claude Code, Codex CLI, Antigravity CLI, Cursor Agent.
 
 The panes in this walk are none of those. They run a shell script, and
-cyclops addresses them because `demos/parity-check.sh` adds a fourth
+cyclops addresses them because `demos/parity-check.sh` adds a fifth
 manifest. That is the promise demonstrated rather than claimed:
 
 ```
@@ -168,7 +168,7 @@ verdict, so a wrong reading is one file to fix and no code to change.
 
 ```
 $ cyclops name %1 reviewer --manifest cluade
-no manifest "cluade"; loaded: agy, claude, codex, demo
+no manifest "cluade"; loaded: agy, claude, codex, cursor, demo
 ```
 
 Writing one: [docs/MANIFESTS.md](docs/MANIFESTS.md).

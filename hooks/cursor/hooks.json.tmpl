@@ -1,0 +1,30 @@
+# Cyclops hook config template: Cursor Agent CLI hooks.json (flat schema:
+# "<eventName>": [ { "command": ... } ], camelCase events, no nested "hooks"
+# array and no "type": "command" field — this is NOT Claude's or Codex's
+# shape). Rendered by `cyclops hooks install cursor --agent <label>`; '#'
+# lines are stripped, {label} and {cyclops_bin} are substituted.
+#
+# CONFIG_DIR TRAP (MEASURED): CURSOR_CONFIG_DIR relocates cli-config.json but
+# NOT hooks.json. A hooks.json placed in a CURSOR_CONFIG_DIR fired ZERO
+# events across a full session; the same file at
+# <workspace>/.cursor/hooks.json fired every event. Do not instruct anyone to
+# install hooks via CURSOR_CONFIG_DIR. Working locations are
+# ~/.cursor/hooks.json (user level) and <workspace>/.cursor/hooks.json
+# (project level); both load.
+#
+# Events: beforeSubmitPrompt is the delivery ACK (payload carries the full
+# prompt text in `prompt`) and turn start; stop is turn end. Only these two
+# are wired: the daemon matches incoming hook events against the manifest's
+# own ack/turn_start/turn_end names, so wiring any other event would be
+# ignored.
+{
+  "hooks": {
+    "beforeSubmitPrompt": [
+      { "command": "{cyclops_bin} hook beforeSubmitPrompt --agent {label}" }
+    ],
+    "stop": [
+      { "command": "{cyclops_bin} hook stop --agent {label}" }
+    ]
+  },
+  "version": 1
+}

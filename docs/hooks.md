@@ -30,6 +30,12 @@ Wiring per CLI:
 - **agy**: copy the rendered `hooks.json` to `<workspace>/.agents/hooks.json`.
   agy has no payload-matchable ack, so its deliveries stay screen-verified;
   these hooks feed liveness and turn detection.
+- **cursor**: copy the rendered `hooks.json` to `<workspace>/.cursor/hooks.json`
+  or `~/.cursor/hooks.json` (both load). `CURSOR_CONFIG_DIR` relocates
+  `cli-config.json` but not `hooks.json`: a file placed there fires zero
+  events, so never wire it that way. Unlike agy, cursor's `beforeSubmitPrompt`
+  carries the full prompt text, a payload-matchable ack, so its deliveries
+  reach the verified tier.
 
 ## Verify (did edges ever arrive?)
 

@@ -111,7 +111,7 @@ $ cyclops start --setup-only
 ✔ cyclops is set up
   wrote /Users/you/.cyclops/config.toml
   wrote 7 themes to /Users/you/.cyclops/themes
-  wrote 3 detection manifests to /Users/you/.cyclops/manifests
+  wrote 4 detection manifests to /Users/you/.cyclops/manifests
 ```
 
 Two things, and both matter. The config says which tmux sessions to watch.
@@ -140,6 +140,11 @@ manifest_dir = "/path/to/cyclops/manifests"
 there the daemon reads `~/.cyclops/manifests`, which is the directory it
 just filled. Set `manifest_dir` only to point somewhere else, e.g. a
 clone you are editing manifests in.
+
+`sessions` is only the boot set. A running daemon can be asked to watch
+another one -- `session.watch` on the socket, which the terminal workspace
+UI calls whenever it creates a tmux session -- without touching this file
+or restarting; a restart goes back to watching only what is written here.
 
 ### When the shipped set gains a manifest
 
@@ -245,9 +250,10 @@ cyclops daemon log      # what it has written
 cyclops daemon stop     # your tmux panes and the record are untouched
 ```
 
-There is no `daemon start`: `cyclops start` is that. To run the daemon
-under your own supervisor instead, `cyclops start --no-daemon` leaves it
-alone.
+There is no `daemon start`: `cyclops start` is that, and so is bare
+`cyclops` — both start one when none answers, so whichever way you open a
+workspace there is a daemon watching it. To run the daemon under your own
+supervisor instead, `cyclops start --no-daemon` leaves it alone.
 
 `start` opens the default workspace, building it from the `solo` preset
 the first time. `--preset duo|quad|ops` picks a bigger one;
@@ -288,7 +294,7 @@ $ cyclops status
 
   %0  ? unknown  zsh
 
-  1 pane reads unknown: none of agy, claude, codex matches what is running there. Nothing can be delivered to an unknown pane. Pin one: cyclops name %0 <label> --manifest <id>. Teaching cyclops a new CLI is one file: docs/MANIFESTS.md.
+  1 pane reads unknown: none of agy, claude, codex, cursor matches what is running there. Nothing can be delivered to an unknown pane. Pin one: cyclops name %0 <label> --manifest <id>. Teaching cyclops a new CLI is one file: docs/MANIFESTS.md.
 ```
 
 With no manifests at all it says that instead, because the fix is the
@@ -298,7 +304,8 @@ whole install and not one pane:
   1 pane reads unknown: cyclopsd loaded no detection manifests. Nothing can be delivered to an unknown pane. Install them and restart: cyclops start, then restart cyclopsd.
 ```
 
-The shipped manifests cover Claude Code, Codex CLI, and Antigravity CLI.
+The shipped manifests cover Claude Code, Codex CLI, Antigravity CLI, and
+Cursor Agent CLI.
 Teaching it another one is a single TOML file:
 [MANIFESTS.md](MANIFESTS.md). More symptoms and their next steps:
 [troubleshooting.md](troubleshooting.md).

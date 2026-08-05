@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "beforeSubmitPrompt": [
+      { "command": "/opt/cyclops/bin/cyclops hook beforeSubmitPrompt --agent reviewer" }
+    ],
+    "stop": [
+      { "command": "/opt/cyclops/bin/cyclops hook stop --agent reviewer" }
+    ]
+  },
+  "version": 1
+}

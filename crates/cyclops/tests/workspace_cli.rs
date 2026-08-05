@@ -293,7 +293,7 @@ fn setup_only_writes_the_home_and_opens_nothing() {
     let text = stdout(&out);
     assert!(text.starts_with("✔ cyclops is set up\n"), "got {text:?}");
     assert!(text.contains("config.toml"), "{text}");
-    assert!(text.contains("3 detection manifests"), "{text}");
+    assert!(text.contains("4 detection manifests"), "{text}");
     // No workspace, so no next steps: whoever called this owns what comes
     // after it.
     assert!(!text.contains("Next:"), "{text}");

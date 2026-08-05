@@ -108,6 +108,24 @@ fn install_writes_the_default_dest_and_prints_the_wiring() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains(".agents/hooks.json"), "{stdout}");
+
+    // cursor: .cursor/hooks.json placement instructions and the
+    // CURSOR_CONFIG_DIR trap called out, not applied.
+    let out = run(
+        &home,
+        &["hooks", "install", "cursor", "--agent", "reviewer"],
+    );
+    assert!(out.status.success());
+    let path = home.join("hooks/reviewer/hooks.json");
+    let text = fs::read_to_string(&path).expect("rendered hooks.json");
+    let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+    assert!(v["hooks"]["beforeSubmitPrompt"].is_array(), "{text}");
+    assert!(v["hooks"]["stop"].is_array(), "{text}");
+    assert!(text.contains("--agent reviewer"), "{text}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(".cursor/hooks.json"), "{stdout}");
+    assert!(stdout.contains("CURSOR_CONFIG_DIR"), "{stdout}");
+    assert!(stdout.contains("hooks selftest reviewer"), "{stdout}");
     let _ = fs::remove_dir_all(&home);
 }
 
@@ -165,7 +183,7 @@ fn install_reserved_label_names_the_naming_step() {
 #[test]
 fn install_refuses_vendor_dot_dirs() {
     let home = scratch_home("hiv");
-    for vendor in [".claude", ".codex", ".gemini", ".agents"] {
+    for vendor in [".claude", ".codex", ".gemini", ".agents", ".cursor"] {
         let dest = home.join(vendor).join("sub");
         let out = run(
             &home,
