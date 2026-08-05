@@ -1,0 +1,101 @@
+---
+title: "CLI reference"
+description: "Every Cyclops command and flag."
+---
+
+All commands are invoked as `cyclops <command>`.
+
+## `attach`
+
+Attach Cyclops to a tmux target.
+
+```bash
+cyclops attach <target> [--name <name>]
+```
+
+| Flag | Description |
+| --- | --- |
+| `<target>` | tmux target: `session`, `session:window`, or `session:window.pane`. |
+| `--name` | Friendly name to assign to a single-pane attach. |
+
+## `detach`
+
+Stop tracking agents without killing tmux.
+
+```bash
+cyclops detach [target]
+```
+
+Omit `target` to detach from everything.
+
+## `ls`
+
+List tracked agents.
+
+```bash
+cyclops ls [--session <name>]
+```
+
+## `send`
+
+Send a prompt to an agent.
+
+```bash
+cyclops send <agent> "<prompt>"
+cyclops send --all "<prompt>"
+cyclops send <agent> --from <other-agent>
+```
+
+| Flag | Description |
+| --- | --- |
+| `<agent>` | Agent ID or name. |
+| `--all` | Broadcast to every tracked agent. |
+| `--from` | Use another agent's last output as the prompt. |
+
+## `tail`
+
+Stream agent output.
+
+```bash
+cyclops tail [agent] [--follow]
+```
+
+## `sessions`
+
+List Cyclops sessions and their agent counts.
+
+```bash
+cyclops sessions
+```
+
+## `rename`
+
+Rename a tracked agent.
+
+```bash
+cyclops rename <agent> <new-name>
+```
+
+## `rm`
+
+Stop tracking an agent. The tmux pane keeps running.
+
+```bash
+cyclops rm <agent>
+```
+
+## `kill`
+
+Kill a tmux session and every agent in it.
+
+```bash
+cyclops kill <session>
+```
+
+## Global flags
+
+| Flag | Description |
+| --- | --- |
+| `--config <path>` | Use a specific config file. |
+| `--verbose` | Print debug logs. |
+| `--version` | Print the Cyclops version. |

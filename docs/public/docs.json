@@ -18,6 +18,34 @@
     }
   },
   "navigation": {
-    "pages": ["index"]
+    "pages": [
+      "index",
+      {
+        "group": "Get started",
+        "icon": "rocket",
+        "pages": [
+          "introduction",
+          "installation",
+          "quickstart"
+        ]
+      },
+      {
+        "group": "Guides",
+        "icon": "book",
+        "pages": [
+          "guides/attach-tmux",
+          "guides/coordinate-agents",
+          "guides/sessions"
+        ]
+      },
+      {
+        "group": "Reference",
+        "icon": "code",
+        "pages": [
+          "reference/cli",
+          "reference/configuration"
+        ]
+      }
+    ]
   }
 }

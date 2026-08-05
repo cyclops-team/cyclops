@@ -1,0 +1,62 @@
+---
+title: "Coordinate agents"
+description: "Run several coding agents in parallel."
+---
+
+Cyclops is at its best when you have more than one agent running. This guide covers common patterns for coordinating multiple agents.
+
+## Broadcast a prompt
+
+Send the same prompt to every attached agent:
+
+```bash
+cyclops send --all "Pull the latest changes and run the test suite."
+```
+
+Useful for warming up several agents on the same task before you compare their output.
+
+## Target by name or ID
+
+```bash
+cyclops send reviewer "Review the last commit."
+cyclops send 2 "Draft release notes for v0.4.0."
+```
+
+## Watch output
+
+Stream output from every agent in one view:
+
+```bash
+cyclops tail
+```
+
+Filter to one agent:
+
+```bash
+cyclops tail reviewer
+```
+
+## Handoffs between agents
+
+Pipe an agent's last response into another agent as a prompt:
+
+```bash
+cyclops send reviewer --from planner
+```
+
+This reads the most recent output from `planner` and forwards it to `reviewer`.
+
+## Roles
+
+A common setup is one agent per role:
+
+- `planner`: breaks a task down into steps
+- `builder`: writes the code
+- `reviewer`: reviews diffs and runs tests
+
+Attach each pane with `--name` and coordinate them from Cyclops.
+
+## Next steps
+
+- [CLI reference](/reference/cli) for every flag
+- [Configuration](/reference/configuration) to set default agent names and roles

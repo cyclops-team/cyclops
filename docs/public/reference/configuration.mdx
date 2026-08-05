@@ -1,0 +1,58 @@
+---
+title: "Configuration"
+description: "Configure Cyclops."
+---
+
+Cyclops reads configuration from `~/.config/cyclops/config.toml` by default. Override the path with `--config` or the `CYCLOPS_CONFIG` environment variable.
+
+## Example config
+
+```toml
+[defaults]
+session = "work"
+
+[[agents]]
+name = "planner"
+target = "work:agents.0"
+
+[[agents]]
+name = "builder"
+target = "work:agents.1"
+
+[[agents]]
+name = "reviewer"
+target = "work:agents.2"
+```
+
+On startup, Cyclops attaches to any agents listed in `[[agents]]` if their tmux targets exist.
+
+## Sections
+
+### `[defaults]`
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `session` | string | Session used when a command omits a target. |
+| `editor` | string | Editor invoked by `cyclops edit`. Falls back to `$EDITOR`. |
+
+### `[[agents]]`
+
+One block per pre-registered agent.
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `name` | string | Friendly name. |
+| `target` | string | tmux target in `session:window.pane` form. |
+| `role` | string | Optional role tag used by `cyclops send --role`. |
+
+## Environment variables
+
+| Variable | Description |
+| --- | --- |
+| `CYCLOPS_CONFIG` | Path to the config file. |
+| `CYCLOPS_HOME` | Directory for local state and logs. Defaults to `~/.local/share/cyclops`. |
+| `CYCLOPS_LOG_LEVEL` | `debug`, `info`, `warn`, or `error`. |
+
+## State and logs
+
+Cyclops writes agent state and logs under `$CYCLOPS_HOME`. Delete this directory to reset local state; tmux sessions are not affected.

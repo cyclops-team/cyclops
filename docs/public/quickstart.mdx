@@ -1,0 +1,61 @@
+---
+title: "Quickstart"
+description: "Attach Cyclops to your first tmux session."
+---
+
+This guide walks through starting an agent in tmux, attaching Cyclops to it, and sending your first prompt.
+
+## 1. Start a tmux session with an agent
+
+Open a tmux session and launch a coding agent inside it. For example:
+
+```bash
+tmux new -s work
+claude
+```
+
+Leave the agent running in that pane.
+
+## 2. Attach Cyclops
+
+In a separate terminal, run:
+
+```bash
+cyclops attach work
+```
+
+Cyclops discovers panes in the `work` session and registers each one as an agent.
+
+## 3. List attached agents
+
+```bash
+cyclops ls
+```
+
+You should see the agent from step 1 listed with an ID, its tmux target, and its current status.
+
+## 4. Send a prompt
+
+Send a message to the first agent:
+
+```bash
+cyclops send 1 "Summarize the README in this repo."
+```
+
+Cyclops forwards the prompt to the pane and streams the agent's response back.
+
+## 5. Detach
+
+When you are done, detach without stopping the agents:
+
+```bash
+cyclops detach
+```
+
+The tmux session and its agents keep running.
+
+## Next steps
+
+- [Attach to tmux](/guides/attach-tmux) for more attach patterns
+- [Coordinate agents](/guides/coordinate-agents) to run several agents in parallel
+- [CLI reference](/reference/cli) for every command

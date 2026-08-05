@@ -1,0 +1,52 @@
+---
+title: "Installation"
+description: "Install the Cyclops CLI."
+---
+
+Cyclops ships as a single CLI binary. Pick the install method that matches your setup.
+
+## Requirements
+
+- macOS 12\+ or a recent Linux distribution
+- [tmux](https://github.com/tmux/tmux) 3.2 or newer
+- A terminal that supports 256 colors
+
+## Install with Homebrew
+
+```bash
+brew install cyclops-team/tap/cyclops
+```
+
+## Install with the shell script
+
+```bash
+curl -fsSL https://usecyclops.dev/install.sh | sh
+```
+
+The script downloads the latest release for your platform and installs it to `/usr/local/bin/cyclops`.
+
+## Verify the install
+
+```bash
+cyclops --version
+```
+
+You should see the installed version printed to stdout.
+
+## Update
+
+<CodeGroup>
+
+```bash Homebrew
+brew upgrade cyclops
+```
+
+```bash Script
+curl -fsSL https://usecyclops.dev/install.sh | sh
+```
+
+</CodeGroup>
+
+## Next steps
+
+Head to the [quickstart](/quickstart) to attach Cyclops to your first tmux session.

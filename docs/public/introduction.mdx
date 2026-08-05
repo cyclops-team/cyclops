@@ -1,0 +1,28 @@
+---
+title: "Introduction"
+description: "What Cyclops is and why it exists."
+---
+
+Cyclops is a coordination layer for terminal coding agents. It attaches to agents that are already running inside tmux, so you can drive them from a single control surface without leaving your terminal.
+
+## Why Cyclops
+
+Most coding agents run as long-lived REPLs inside a shell. Once you have more than one running, keeping track of which pane is doing what, forwarding context, and reviewing output becomes the bottleneck.
+
+Cyclops treats each tmux pane as a first-class agent and gives you:
+
+- A single place to send prompts, files, and follow-ups to any attached agent.
+- Visibility into agent output across every session.
+- Session state that persists across restarts, since the agents live in tmux, not in Cyclops.
+
+## How it fits together
+
+1. You run your coding agents (Claude Code, Codex, Aider, custom scripts, etc.) inside tmux windows or panes as usual.
+2. Cyclops attaches to those panes and tracks them as agents.
+3. You interact with Cyclops to send input, read output, and coordinate work across agents.
+
+## Next steps
+
+- [Install Cyclops](/installation)
+- [Run the quickstart](/quickstart)
+- [Attach to a tmux session](/guides/attach-tmux)

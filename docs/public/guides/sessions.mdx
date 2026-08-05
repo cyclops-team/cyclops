@@ -1,0 +1,52 @@
+---
+title: "Sessions"
+description: "Persist and restore Cyclops sessions."
+---
+
+Cyclops sessions map to tmux sessions. Because agents live in tmux, they survive Cyclops restarts, terminal reboots, and SSH disconnects.
+
+## List sessions
+
+```bash
+cyclops sessions
+```
+
+Shows every tmux session Cyclops has attached to, with the number of tracked agents in each.
+
+## Reattach after a restart
+
+If you close Cyclops and come back later:
+
+```bash
+cyclops attach work
+```
+
+Cyclops rediscovers the panes in `work` and restores their agent IDs and names from local state.
+
+## Rename an agent
+
+```bash
+cyclops rename 2 builder
+```
+
+Names persist across sessions.
+
+## Remove an agent
+
+Stop tracking a pane without killing it:
+
+```bash
+cyclops rm reviewer
+```
+
+The tmux pane keeps running.
+
+## Kill a session
+
+Stop every agent in a session and remove the tmux session:
+
+```bash
+cyclops kill work
+```
+
+Use with care: this terminates the underlying tmux session.
