@@ -5,8 +5,15 @@ use crate::layout::SplitDir;
 /// What a drag operation targets once it crosses the movement threshold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DragTarget {
-    Divider { pane_id: String, dir: SplitDir },
-    Tab { window_id: String },
+    Divider {
+        pane_id: String,
+        dir: SplitDir,
+    },
+    Tab {
+        window_id: String,
+    },
+    /// Resize the application sidebar, not a tmux pane.
+    Sidebar,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +108,7 @@ mod tests {
                 window_id: "@0".into(),
             },
             divider(),
+            DragTarget::Sidebar,
         ] {
             let mut drag = DragState::on_down(target.clone(), 0, 0);
             drag.on_move(10, 10);

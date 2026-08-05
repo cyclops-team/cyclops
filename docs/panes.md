@@ -3,6 +3,13 @@
 Cyclops addresses agents by name, not by pane. `cyclops name` gives a pane
 its name; `cyclops list` shows the roster.
 
+In the full-screen workspace opened by bare `cyclops`, focus a pane and press
+`Ctrl+B` `m`, or right-click it and choose **Name pane**. The dialog uses the
+same daemon-backed identity as `cyclops name`, so the label immediately
+becomes its message address and appears with state in the pane border and the
+workspace sidebar. If `cyclopsd` is offline, the dialog stays open and shows
+the error instead of pretending the pane was named.
+
 ## Basics
 
 ```
@@ -124,6 +131,11 @@ $ tmux display-message -p -t %0 '#{E:pane-border-format}'
 
 On screen that is `implementer • ● working`, drawn into the pane's top
 border.
+
+The full-screen workspace renders the same identity as
+`implementer · ● working` in its own pane chrome. Its focused border is
+bright, inactive borders are muted, and the underlying tmux border remains
+the durable decoration seen by ordinary tmux clients.
 
 The name wears the agent's color and the state wears its group color, the
 same two colors the same agent and state wear in `cyclops list`, in the

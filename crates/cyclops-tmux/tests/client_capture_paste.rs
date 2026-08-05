@@ -52,6 +52,28 @@ async fn capture_pane_returns_visible_content() {
 }
 
 #[tokio::test]
+async fn unconfirmed_key_send_keeps_later_reply_correlation() {
+    let Some(srv) = TestServer::new("send-unconfirmed") else {
+        return;
+    };
+    srv.new_session("fast");
+    let (client, _notif) = ControlClient::spawn(srv.config("fast"))
+        .await
+        .expect("spawn");
+
+    client
+        .send_keys_unconfirmed("%0", &["true", "Enter"])
+        .await
+        .expect("queue keys");
+    let reply = client
+        .command("display-message -p correlation-ok")
+        .await
+        .expect("later command reply");
+    assert_eq!(reply, vec!["correlation-ok"]);
+    client.shutdown().await;
+}
+
+#[tokio::test]
 async fn bracketed_paste_round_trip_is_byte_exact() {
     let Some(srv) = TestServer::new("paste") else {
         return;

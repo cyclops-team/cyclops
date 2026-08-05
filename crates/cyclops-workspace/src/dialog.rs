@@ -9,8 +9,14 @@
 pub enum Dialog {
     /// Confirm closing a pane that may host a live agent.
     ConfirmClosePane { pane_id: String },
-    /// Name a new tab before it is created; blank keeps tmux's default.
+    /// Name a new tab before it is created; blank uses the next number.
     NewTab { buffer: String },
+    /// Assign the pane's Cyclops identity and message address.
+    NamePane {
+        pane_id: String,
+        buffer: String,
+        error: Option<String>,
+    },
     /// Rename one tab; buffer holds the edited name.
     RenameTab { window_id: String, buffer: String },
     /// Confirm closing a whole tab (kills every pane in it).
@@ -19,6 +25,11 @@ pub enum Dialog {
     RenameWorkspace { session: String, buffer: String },
     /// Confirm closing a workspace that may host agents.
     ConfirmCloseWorkspace { session: String },
+    /// Read-only, scrollable reference generated from the active bindings.
+    Keybinds {
+        scroll: u16,
+        rows: Vec<crate::bindings::BindingHelp>,
+    },
 }
 
 impl Dialog {
@@ -32,7 +43,10 @@ impl Dialog {
     pub fn has_input(&self) -> bool {
         matches!(
             self,
-            Dialog::NewTab { .. } | Dialog::RenameTab { .. } | Dialog::RenameWorkspace { .. }
+            Dialog::NewTab { .. }
+                | Dialog::NamePane { .. }
+                | Dialog::RenameTab { .. }
+                | Dialog::RenameWorkspace { .. }
         )
     }
 }

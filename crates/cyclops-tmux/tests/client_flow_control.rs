@@ -33,3 +33,22 @@ async fn pause_after_flag_is_accepted() {
 
     client.shutdown().await;
 }
+
+#[tokio::test]
+async fn new_session_honors_the_initial_window_name() {
+    let Some(srv) = TestServer::new("initial-window-name") else {
+        return;
+    };
+    let cfg = ControlConfig::new_session("numeric")
+        .with_initial_window_name("1")
+        .on_socket(srv.sock().to_string())
+        .with_config_file("/dev/null");
+    let (client, _notif) = ControlClient::spawn(cfg).await.expect("spawn");
+
+    let name = client
+        .command("display-message -p '#{window_name}'")
+        .await
+        .expect("window name");
+    assert_eq!(name, vec!["1"]);
+    client.shutdown().await;
+}

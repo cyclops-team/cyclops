@@ -9,12 +9,15 @@ use crate::layout::SplitDir;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HitTarget {
     PaneBody { pane_id: String },
+    PaneFrame { pane_id: String },
     PaneSplitRight { pane_id: String },
     PaneSplitDown { pane_id: String },
     Divider { pane_id: String, dir: SplitDir },
     Tab { window_id: String },
     NewTabButton,
     SidebarRow { session: String },
+    SidebarAgent { pane_id: String },
+    SidebarDivider,
     AttentionIndicator { pane_id: String },
     AppMenu,
     MenuItem { action: BindingAction },

@@ -1,10 +1,9 @@
 //! Parse tmux `window_layout` strings into a split tree.
 //!
 //! Layout leaves carry the pane's numeric id (the `N` of `%N`) and its
-//! cell-exact geometry inside the window. The workspace renders panes at
-//! those exact coordinates — tmux's own one-cell gaps between panes are
-//! where dividers are drawn — so the grid a pane runtime holds maps 1:1
-//! onto screen cells.
+//! cell-exact geometry inside the window. The workspace keeps every leaf at
+//! that exact size while expanding separator bands into UI-owned chrome, so
+//! the grid a pane runtime holds still maps 1:1 onto screen cells.
 
 use ratatui::layout::Rect;
 use thiserror::Error;
@@ -413,12 +412,162 @@ fn extract_group(
 /// Pane render rectangles: window coordinates offset into `canvas` and
 /// clipped to it. Cells map 1:1 — no scaling, so a runtime grid lands on
 /// exactly the cells tmux gave the pane.
+#[cfg(test)]
 pub fn layout_pane_slots(node: &ResolvedLayout, canvas: Rect, focused_pane: &str) -> Vec<PaneSlot> {
     let mut out = Vec::new();
     collect_slots(node, canvas, focused_pane, &mut out);
     out
 }
 
+/// Screen geometry with an explicit chrome band between sibling panes.
+/// Leaf rectangles keep their exact tmux dimensions; only separator bands
+/// expand, so a child TUI still maps one runtime cell to one screen cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutGeometry {
+    pub slots: Vec<PaneSlot>,
+    pub dividers: Vec<DividerSeg>,
+}
+
+/// Expand tmux's separator cells to `gap` screen cells without scaling pane
+/// content. Nested splits may leave quiet chrome beside a less-deep sibling;
+/// that is preferable to stretching or cropping the sibling's terminal.
+pub fn layout_geometry(
+    node: &ResolvedLayout,
+    canvas: Rect,
+    focused_pane: &str,
+    gap: u16,
+) -> LayoutGeometry {
+    let mut geometry = LayoutGeometry {
+        slots: Vec::new(),
+        dividers: Vec::new(),
+    };
+    collect_geometry(
+        node,
+        (canvas.x, canvas.y),
+        canvas,
+        focused_pane,
+        gap,
+        &mut geometry,
+    );
+    geometry
+}
+
+/// Extra client cells reserved for expanded separator bands. Subtract this
+/// from tmux's declared window size; [`layout_geometry`] puts the cells back
+/// as chrome when painting.
+pub fn layout_gap_overhead(node: &ResolvedLayout, gap: u16) -> (u16, u16) {
+    let (painted_width, painted_height) = transformed_size(node, gap);
+    let root = node.rect();
+    (
+        painted_width.saturating_sub(root.width),
+        painted_height.saturating_sub(root.height),
+    )
+}
+
+fn transformed_size(node: &ResolvedLayout, gap: u16) -> (u16, u16) {
+    match node {
+        ResolvedLayout::Leaf { width, height, .. } => (*width, *height),
+        ResolvedLayout::Split { dir, children, .. } => {
+            let sizes: Vec<_> = children
+                .iter()
+                .map(|child| transformed_size(child, gap))
+                .collect();
+            let divider_count = u16::try_from(children.len().saturating_sub(1)).unwrap_or(u16::MAX);
+            let bands = gap.saturating_mul(divider_count);
+            match dir {
+                SplitDir::Horizontal => (
+                    sizes
+                        .iter()
+                        .fold(bands, |width, child| width.saturating_add(child.0)),
+                    sizes.iter().map(|child| child.1).max().unwrap_or(0),
+                ),
+                SplitDir::Vertical => (
+                    sizes.iter().map(|child| child.0).max().unwrap_or(0),
+                    sizes
+                        .iter()
+                        .fold(bands, |height, child| height.saturating_add(child.1)),
+                ),
+            }
+        }
+    }
+}
+
+fn collect_geometry(
+    node: &ResolvedLayout,
+    origin: (u16, u16),
+    bounds: Rect,
+    focused: &str,
+    gap: u16,
+    geometry: &mut LayoutGeometry,
+) {
+    match node {
+        ResolvedLayout::Leaf {
+            pane_id,
+            width,
+            height,
+            ..
+        } => {
+            if let Some(rect) = clip_rect(Rect::new(origin.0, origin.1, *width, *height), bounds) {
+                geometry.slots.push(PaneSlot {
+                    pane_id: pane_id.clone(),
+                    rect,
+                    focused: pane_id == focused,
+                });
+            }
+        }
+        ResolvedLayout::Split { dir, children, .. } => {
+            let (width, height) = transformed_size(node, gap);
+            let mut cursor = origin;
+            for (index, child) in children.iter().enumerate() {
+                let child_size = transformed_size(child, gap);
+                collect_geometry(child, cursor, bounds, focused, gap, geometry);
+                if index + 1 < children.len() {
+                    let divider = match dir {
+                        SplitDir::Horizontal => {
+                            Rect::new(cursor.0.saturating_add(child_size.0), origin.1, gap, height)
+                        }
+                        SplitDir::Vertical => {
+                            Rect::new(origin.0, cursor.1.saturating_add(child_size.1), width, gap)
+                        }
+                    };
+                    if let (Some(rect), Some(pane_id)) =
+                        (clip_rect(divider, bounds), trailing_leaf(child, *dir))
+                    {
+                        geometry.dividers.push(DividerSeg {
+                            rect,
+                            dir: *dir,
+                            pane_id,
+                        });
+                    }
+                }
+                match dir {
+                    SplitDir::Horizontal => {
+                        cursor.0 = cursor.0.saturating_add(child_size.0).saturating_add(gap)
+                    }
+                    SplitDir::Vertical => {
+                        cursor.1 = cursor.1.saturating_add(child_size.1).saturating_add(gap)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn clip_rect(rect: Rect, bounds: Rect) -> Option<Rect> {
+    let left = rect.x.max(bounds.x);
+    let top = rect.y.max(bounds.y);
+    let right = rect
+        .x
+        .saturating_add(rect.width)
+        .min(bounds.x.saturating_add(bounds.width));
+    let bottom = rect
+        .y
+        .saturating_add(rect.height)
+        .min(bounds.y.saturating_add(bounds.height));
+    (right > left && bottom > top).then(|| Rect::new(left, top, right - left, bottom - top))
+}
+
+#[cfg(test)]
 fn collect_slots(node: &ResolvedLayout, canvas: Rect, focused: &str, out: &mut Vec<PaneSlot>) {
     match node {
         ResolvedLayout::Leaf {
@@ -458,12 +607,14 @@ pub struct DividerSeg {
 }
 
 /// Dividers for every split in the tree, window coordinates.
+#[cfg(test)]
 pub fn layout_dividers(node: &ResolvedLayout) -> Vec<DividerSeg> {
     let mut out = Vec::new();
     collect_dividers(node, &mut out);
     out
 }
 
+#[cfg(test)]
 fn collect_dividers(node: &ResolvedLayout, out: &mut Vec<DividerSeg>) {
     if let ResolvedLayout::Split { dir, children, .. } = node {
         for pair in children.windows(2) {
@@ -517,6 +668,7 @@ fn trailing_leaf(node: &ResolvedLayout, dir: SplitDir) -> Option<String> {
 }
 
 /// Offset a window-coordinate rectangle into `canvas`, clipping to it.
+#[cfg(test)]
 pub fn offset_clip(x: u16, y: u16, width: u16, height: u16, canvas: Rect) -> Option<Rect> {
     let ax = canvas.x.saturating_add(x);
     let ay = canvas.y.saturating_add(y);
@@ -649,6 +801,29 @@ mod tests {
         assert_eq!(slots[1].rect, Rect::new(111, 1, 89, 45));
         assert!(!slots[0].focused);
         assert!(slots[1].focused);
+    }
+
+    #[test]
+    fn expanded_gap_keeps_pane_cells_and_separates_their_borders() {
+        let node = parse_layout("da0d,80x24,0,0{40x24,0,0,0,39x24,41,0,1}").unwrap();
+        let resolved = resolve_layout(&node, &[]).unwrap();
+        assert_eq!(layout_gap_overhead(&resolved, 3), (2, 0));
+
+        let geometry = layout_geometry(&resolved, Rect::new(10, 5, 82, 24), "%1", 3);
+        assert_eq!(geometry.slots[0].rect, Rect::new(10, 5, 40, 24));
+        assert_eq!(geometry.dividers[0].rect, Rect::new(50, 5, 3, 24));
+        assert_eq!(geometry.slots[1].rect, Rect::new(53, 5, 39, 24));
+    }
+
+    #[test]
+    fn nested_gap_overhead_uses_the_deepest_parallel_branch() {
+        let node = parse_layout("abcd,80x49,0,0[80x24,0,0{40x24,0,0,0,39x24,41,0,1},80x24,0,25,2]")
+            .unwrap();
+        let resolved = resolve_layout(&node, &[]).unwrap();
+        assert_eq!(layout_gap_overhead(&resolved, 3), (2, 2));
+        let geometry = layout_geometry(&resolved, Rect::new(0, 0, 82, 51), "%0", 3);
+        assert_eq!(geometry.slots.len(), 3);
+        assert_eq!(geometry.slots[2].rect, Rect::new(0, 27, 80, 24));
     }
 
     #[test]

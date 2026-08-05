@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::bindings::{BindingAction, BindingChord};
+use crate::bindings::{binding_help, BindingAction, BindingChord, BindingHelp};
 
 /// What the router does with one key event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +58,10 @@ impl Router {
         }
 
         RouterResult::PassThrough(key)
+    }
+
+    pub fn help(&self) -> Vec<BindingHelp> {
+        binding_help(&self.bindings)
     }
 
     fn match_prefix(&self, code: KeyCode) -> Option<BindingAction> {

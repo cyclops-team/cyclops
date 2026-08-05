@@ -73,6 +73,25 @@ pub async fn execute(
     Ok(())
 }
 
+/// Select a pane and, when it lives on another tab, select that window
+/// first. The two commands stay explicit so each control-mode reply remains
+/// correctly correlated.
+pub async fn execute_focus_pane(
+    client: &ControlClient,
+    window_id: Option<&str>,
+    pane_id: &str,
+) -> Result<(), TmuxError> {
+    if let Some(window_id) = window_id {
+        client
+            .command(&format!("select-window -t {}", quote_arg(window_id)))
+            .await?;
+    }
+    client
+        .command(&format!("select-pane -t {}", quote_arg(pane_id)))
+        .await?;
+    Ok(())
+}
+
 /// Create a tab, optionally named and rooted in `cwd`, and return its window
 /// id. One command owns creation plus naming, so the UI never exposes an
 /// intermediate default name.
@@ -107,8 +126,9 @@ pub async fn execute_new_workspace(
     let path = folder.to_string_lossy();
     client
         .command(&format!(
-            "new-session -d -s {} -c {}",
+            "new-session -d -s {} -n {} -c {}",
             quote_arg(&name),
+            quote_arg("1"),
             quote_arg(path.as_ref())
         ))
         .await?;
@@ -336,6 +356,12 @@ mod tests {
             std::fs::canonicalize(&folder).unwrap(),
             "session default directory should match folder"
         );
+        let out = server.run(&["list-windows", "-t", &name, "-F", "#{window_name}"]);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "1",
+            "a workspace's first tab uses the numeric sequence"
+        );
         client.shutdown().await;
         let _ = std::fs::remove_dir_all(&folder);
     }
@@ -447,6 +473,49 @@ mod tests {
         let names = String::from_utf8_lossy(&out.stdout);
         let names: Vec<_> = names.lines().collect();
         assert_eq!(names, vec!["review", "active"]);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn focusing_a_pane_switches_to_its_window_first() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("intent-focus-window");
+        server.run_ok(&["new-session", "-d", "-s", "s", "-n", "one", "/bin/sh"]);
+        server.run_ok(&["new-window", "-d", "-t", "s", "-n", "two", "/bin/sh"]);
+        let client = rig_client(&server, "s").await;
+        let out = server.run(&[
+            "list-panes",
+            "-a",
+            "-F",
+            "#{window_name}\t#{window_id}\t#{pane_id}",
+        ]);
+        let rows = String::from_utf8_lossy(&out.stdout);
+        let target = rows
+            .lines()
+            .find(|line| line.starts_with("two\t"))
+            .expect("second window pane");
+        let mut fields = target.split('\t');
+        let _name = fields.next();
+        let window = fields.next().expect("window id");
+        let pane = fields.next().expect("pane id");
+
+        execute_focus_pane(&client, Some(window), pane)
+            .await
+            .expect("focus pane");
+
+        let active = server.run(&[
+            "display-message",
+            "-p",
+            "-t",
+            "s",
+            "#{window_name}\t#{pane_id}",
+        ]);
+        assert_eq!(
+            String::from_utf8_lossy(&active.stdout).trim(),
+            format!("two\t{pane}")
+        );
         client.shutdown().await;
     }
 

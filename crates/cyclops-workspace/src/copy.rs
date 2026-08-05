@@ -17,6 +17,14 @@ pub const NEW_TAB_TITLE: &str = "New tab";
 
 pub const NEW_TAB_HINT: &str = "Opens in the current pane's directory.";
 
+pub const NAME_PANE_TITLE: &str = "Name pane";
+
+pub const NAME_PANE_HINT: &str = "This becomes the agent's Cyclops address.";
+
+pub const KEYBINDS_TITLE: &str = "Keybinds";
+
+pub const KEYBINDS_HINT: &str = "Scroll with ↑/↓, PgUp/PgDn, or the mouse wheel.";
+
 pub const RENAME_WORKSPACE_PROMPT: &str = "Rename workspace";
 
 pub const CONFIRM_CLOSE_WORKSPACE: &str = "Close this workspace? [y/N]";
@@ -30,6 +38,8 @@ pub const BUTTON_CANCEL: &str = "Cancel";
 pub const BUTTON_YES: &str = "Yes";
 
 pub const BUTTON_NO: &str = "No";
+
+pub const BUTTON_CLOSE: &str = "Close";
 
 pub const RECONNECTING_NOTE: &str = "reconnecting…";
 
@@ -47,6 +57,8 @@ pub const MENU_SPLIT_DOWN: &str = "Split down";
 
 pub const MENU_ZOOM_PANE: &str = "Zoom pane";
 
+pub const MENU_NAME_PANE: &str = "Name pane";
+
 pub const MENU_CLOSE_PANE: &str = "Close pane";
 
 pub const MENU_NEW_TAB: &str = "New tab";
@@ -54,6 +66,8 @@ pub const MENU_NEW_TAB: &str = "New tab";
 pub const MENU_NEW_WORKSPACE: &str = "New workspace";
 
 pub const MENU_TOGGLE_EVENTS: &str = "Events panel";
+
+pub const MENU_KEYBINDS: &str = "Keybinds";
 
 pub const MENU_DETACH: &str = "Detach";
 

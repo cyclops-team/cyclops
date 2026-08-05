@@ -80,6 +80,30 @@ impl AlacrittyVt {
         self.grid_dirty = true;
     }
 
+    /// Replace every parser and terminal-state bit with a clean grid.
+    ///
+    /// Hydration is an authoritative visual checkpoint after continuity was
+    /// lost. Replaying it over the old terminal would retain private modes,
+    /// saved cursors, and stale primary/alternate buffers that the capture
+    /// cannot describe.
+    fn reset(&mut self, cols: u16, rows: u16) {
+        let size = Size {
+            cols: cols as usize,
+            rows: rows as usize,
+        };
+        self.term = Term::new(Config::default(), &size, NullListener);
+        self.parser = Processor::new();
+        self.cols = cols;
+        self.rows = rows;
+        self.scroll_offset = 0;
+        self.cached_grid = CellGrid {
+            cols,
+            rows,
+            cells: vec![GridCell::default(); cols as usize * rows as usize],
+        };
+        self.grid_dirty = false;
+    }
+
     fn refresh_grid(&mut self) {
         if !self.grid_dirty {
             return;
@@ -169,12 +193,20 @@ impl AlacrittyVt {
 
     /// Initialize from a tmux hydration bundle.
     pub fn hydrate(&mut self, snapshot: &HydrationSnapshot) {
-        self.resize(snapshot.cols, snapshot.rows);
+        self.reset(snapshot.cols, snapshot.rows);
         let bytes = if snapshot.alternate_on {
             snapshot.alternate.as_deref().unwrap_or(&snapshot.visible)
         } else {
             &snapshot.visible
         };
+        // A capture restores pixels, not VT modes. Full-screen TUIs such as
+        // Claude and Codex are already in the alternate buffer; record that
+        // fact before replaying their pixels. Otherwise their next exit or
+        // redraw sequence switches buffers relative to the wrong baseline
+        // and can make the restored UI disappear.
+        if snapshot.alternate_on {
+            self.feed_internal(b"\x1b[?1049h");
+        }
         // Capture rows arrive joined with bare LF; a VT treats LF as
         // index-down without carriage return, so feed each row with CRLF or
         // columns staircase.
@@ -258,6 +290,7 @@ pub fn feed_alacritty(bytes: &[u8], cols: u16, rows: u16) -> CellGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alacritty_terminal::term::TermMode;
 
     #[test]
     fn plain_hello() {
@@ -279,5 +312,43 @@ mod tests {
 
         assert_eq!(vt.grid().row_texts()[0], "hello");
         assert!(!vt.grid_dirty, "one cell read refreshes all pending output");
+    }
+
+    #[test]
+    fn alternate_hydration_restores_the_buffer_mode_as_well_as_pixels() {
+        let mut vt = AlacrittyVt::new(10, 2);
+        vt.hydrate(&HydrationSnapshot {
+            cols: 10,
+            rows: 2,
+            visible: b"primary".to_vec(),
+            alternate: Some(b"CLAUDE".to_vec()),
+            cursor_x: 6,
+            cursor_y: 0,
+            alternate_on: true,
+        });
+
+        assert!(
+            vt.term.mode().contains(TermMode::ALT_SCREEN),
+            "a visual alternate-screen capture must not be replayed into the primary buffer"
+        );
+        assert_eq!(vt.grid().row_texts()[0], "CLAUDE");
+    }
+
+    #[test]
+    fn hydration_discards_stale_terminal_state() {
+        let mut vt = AlacrittyVt::new(10, 2);
+        vt.feed(b"stale");
+        vt.hydrate(&HydrationSnapshot {
+            cols: 10,
+            rows: 2,
+            visible: b"new".to_vec(),
+            alternate: None,
+            cursor_x: 3,
+            cursor_y: 0,
+            alternate_on: false,
+        });
+
+        assert_eq!(vt.grid().row_texts()[0], "new");
+        assert!(!vt.term.mode().contains(TermMode::ALT_SCREEN));
     }
 }

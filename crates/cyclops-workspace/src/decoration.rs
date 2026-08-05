@@ -7,8 +7,10 @@ use std::path::Path;
 
 use cyclops_proto::{
     attention::{Attention, AttentionItem},
-    state_words, AgentState, PaneStatus, StatusResult, PROTOCOL_VERSION,
+    state_words, AgentState, PaneStatus, StatusParams, StatusResult,
 };
+
+use crate::model::TabModel;
 
 /// Per-pane decoration fetched from cyclopsd.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,45 +66,40 @@ impl DecorationSnapshot {
             .filter(|p| p.label.is_some() || p.manifest.is_some())
             .collect()
     }
+
+    /// Named or detected agents owned by these tabs, ordered so the sidebar
+    /// does not jump around when daemon hash-map insertion order changes.
+    /// Window ids, unlike session names, stay stable across a workspace
+    /// rename and are global within the target tmux server.
+    pub fn agent_rows_for_tabs(&self, tabs: &[TabModel]) -> Vec<&PaneDecoration> {
+        let mut rows: Vec<_> = self
+            .panes
+            .values()
+            .filter(|pane| {
+                tabs.iter().any(|tab| tab.window_id == pane.window_id)
+                    && (pane.label.is_some() || pane.manifest.is_some())
+            })
+            .collect();
+        rows.sort_by(|left, right| {
+            Self::sidebar_name(left)
+                .cmp(&Self::sidebar_name(right))
+                .then_with(|| left.pane_id.cmp(&right.pane_id))
+        });
+        rows
+    }
 }
 
 /// Fetch decoration from cyclopsd on reconcile. Attention is consumed, never
 /// recomputed here.
-pub fn fetch_decoration(_home: &Path) -> DecorationSnapshot {
-    let sock = cyclops_proto::socket_path();
-    if !sock.exists() {
-        return DecorationSnapshot::default();
-    }
-    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) else {
-        return DecorationSnapshot::default();
-    };
-    // This runs inline in the UI event loop: a wedged daemon must degrade
-    // to the offline state, never stall input handling.
-    let deadline = Some(std::time::Duration::from_millis(250));
-    let _ = stream.set_read_timeout(deadline);
-    let _ = stream.set_write_timeout(deadline);
-    use std::io::{BufRead, Write};
-    let req = format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"status\",\"params\":{{\"protocol_version\":{PROTOCOL_VERSION},\"open_deliveries\":true}}}}\n"
-    );
-    if stream.write_all(req.as_bytes()).is_err() {
-        return DecorationSnapshot::default();
-    }
-    let mut line = String::new();
-    let mut reader = std::io::BufReader::new(stream);
-    if reader.read_line(&mut line).is_err() {
-        return DecorationSnapshot::default();
-    }
-    let Ok(resp) = serde_json::from_str::<serde_json::Value>(&line) else {
-        return DecorationSnapshot::default();
-    };
-    let Some(result) = resp.get("result") else {
-        return DecorationSnapshot::default();
-    };
-    let Ok(status) = serde_json::from_value::<StatusResult>(result.clone()) else {
-        return DecorationSnapshot::default();
-    };
-    snapshot_from_status(&status)
+pub fn fetch_decoration(home: &Path) -> DecorationSnapshot {
+    crate::daemon::status(
+        home,
+        StatusParams {
+            open_deliveries: true,
+        },
+    )
+    .map(|status| snapshot_from_status(&status))
+    .unwrap_or_default()
 }
 
 fn snapshot_from_status(status: &StatusResult) -> DecorationSnapshot {
@@ -189,6 +186,26 @@ mod tests {
             false,
         );
         assert_eq!(DecorationSnapshot::sidebar_name(&dec), "reviewer");
+    }
+
+    #[test]
+    fn sidebar_membership_follows_stable_window_ids() {
+        let snap = snapshot_from_status(&status_with(vec![
+            pane("%0", "@7", Some("reviewer"), AgentState::Idle),
+            pane("%1", "@8", Some("other"), AgentState::Working),
+        ]));
+        let node = crate::layout::parse_layout("0000,80x24,0,0,0").unwrap();
+        let tab = TabModel {
+            window_id: "@7".into(),
+            name: "1".into(),
+            layout: crate::layout::resolve_layout(&node, &[]).unwrap(),
+            active_pane: "%0".into(),
+            zoomed: false,
+        };
+
+        let rows = snap.agent_rows_for_tabs(&[tab]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label.as_deref(), Some("reviewer"));
     }
 
     #[test]

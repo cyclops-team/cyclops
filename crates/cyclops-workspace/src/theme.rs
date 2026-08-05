@@ -64,6 +64,17 @@ impl Paint {
         }
         Style::new().bg(rt_color(self.theme.resolve(token), self.truecolor))
     }
+
+    pub fn role(&self, label: &str) -> Style {
+        if !self.colors_enabled {
+            return Style::new();
+        }
+        Style::new().fg(rt_color(self.theme.role(label), self.truecolor))
+    }
+
+    pub fn state(&self, state: cyclops_proto::AgentState) -> Style {
+        self.style_token(cyclops_theme::state_token(state))
+    }
 }
 
 fn rt_color(c: ThemeColor, truecolor: bool) -> RtColor {
@@ -112,26 +123,51 @@ pub fn sidebar_row_active(paint: &Paint) -> Style {
 }
 
 pub fn sidebar_row(paint: &Paint) -> Style {
-    paint.style_token(tokens::SURFACE_DIM)
+    paint
+        .style_token(tokens::SURFACE_DIM)
+        .patch(paint.bg_token(tokens::CHROME_PANEL))
 }
 
 pub fn sidebar_label(paint: &Paint) -> Style {
-    paint.style_token(tokens::SURFACE_DIM)
+    paint
+        .style_token(tokens::SURFACE_DIM)
+        .patch(paint.bg_token(tokens::CHROME_PANEL))
 }
 
-/// A menu or dialog row at rest.
+/// A menu or dialog surface at rest. Overlays sit one level above the
+/// workspace panel so they read as theme furniture rather than black holes.
 pub fn menu_row(paint: &Paint) -> Style {
-    chrome_panel(paint)
+    chrome_raised(paint)
 }
 
 /// The menu or dialog row under the mouse.
 pub fn menu_row_hover(paint: &Paint) -> Style {
-    let style = chrome_raised(paint);
     if paint.colors_enabled {
-        style
+        paint
+            .style_token(tokens::SURFACE_ACCENT)
+            .patch(paint.bg_token(tokens::CHROME_PANEL))
+            .add_modifier(Modifier::BOLD)
     } else {
-        style.add_modifier(Modifier::REVERSED)
+        Style::new().add_modifier(Modifier::REVERSED)
     }
+}
+
+/// Secondary copy on a raised menu or dialog surface.
+pub fn menu_hint(paint: &Paint) -> Style {
+    paint
+        .style_token(tokens::SURFACE_DIM)
+        .patch(paint.bg_token(tokens::CHROME_RAISED))
+}
+
+/// Inset text field within a raised dialog.
+pub fn dialog_input(paint: &Paint) -> Style {
+    chrome_panel(paint)
+}
+
+pub fn dialog_error(paint: &Paint) -> Style {
+    paint
+        .style_token(tokens::STATE_TERMINAL)
+        .patch(paint.bg_token(tokens::CHROME_RAISED))
 }
 
 /// Pane body uses the terminal's own foreground; see docs/themes.md.

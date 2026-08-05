@@ -16,7 +16,7 @@ impl Default for WorkspacePrefs {
     fn default() -> Self {
         WorkspacePrefs {
             sidebar_visible: true,
-            sidebar_width: 20,
+            sidebar_width: 22,
             workspace_order: Vec::new(),
         }
     }
@@ -74,10 +74,9 @@ pub fn load_prefs(home: &Path) -> WorkspacePrefs {
 pub fn save_prefs(home: &Path, prefs: &WorkspacePrefs) -> std::io::Result<()> {
     let path = home.join("config.toml");
     let mut table: toml::Table = if path.exists() {
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|t| t.parse().ok())
-            .unwrap_or_default()
+        std::fs::read_to_string(&path)?
+            .parse()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
     } else {
         toml::Table::new()
     };
@@ -88,7 +87,10 @@ pub fn save_prefs(home: &Path, prefs: &WorkspacePrefs) -> std::io::Result<()> {
             .map(|s| toml::Value::String(s.clone()))
             .collect(),
     );
-    let mut workspace = toml::Table::new();
+    let mut workspace = match table.remove("workspace") {
+        Some(toml::Value::Table(workspace)) => workspace,
+        _ => toml::Table::new(),
+    };
     workspace.insert(
         "sidebar_visible".into(),
         toml::Value::Boolean(prefs.sidebar_visible),
@@ -99,63 +101,62 @@ pub fn save_prefs(home: &Path, prefs: &WorkspacePrefs) -> std::io::Result<()> {
     );
     workspace.insert("workspace_order".into(), order);
     table.insert("workspace".into(), toml::Value::Table(workspace));
-    std::fs::write(path, toml::to_string_pretty(&table).unwrap_or_default())
+    let mut body = toml::to_string_pretty(&table)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+
+    // A sidebar drag must never leave a torn shared config behind. The pid
+    // keeps simultaneous workspace processes from sharing a temp file; the
+    // final rename is atomic on the Unix platforms this crate supports. An
+    // existing symlink is resolved so a dotfiles-managed link stays a link.
+    std::fs::create_dir_all(home)?;
+    let destination = if path.exists() {
+        std::fs::canonicalize(&path)?
+    } else {
+        path.clone()
+    };
+    let tmp = destination.with_extension(format!("toml.workspace-{}.tmp", std::process::id()));
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&tmp)?;
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            file.set_permissions(metadata.permissions())?;
+        }
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(tmp, destination)
 }
 
 /// Query last-active state from cyclopsd. Returns None when the daemon is
 /// offline or the method is absent (version skew).
-pub fn get_last_active(_home: &Path) -> Option<LastActive> {
-    let sock = cyclops_proto::socket_path();
-    if !sock.exists() {
-        return None;
-    }
-    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) else {
-        return None;
-    };
-    use std::io::{BufRead, Write};
-    let req = format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"workspace_ui.get\",\"params\":{{\"protocol_version\":{}}}}}\n",
-        cyclops_proto::PROTOCOL_VERSION
-    );
-    if stream.write_all(req.as_bytes()).is_err() {
-        return None;
-    }
-    let mut line = String::new();
-    let mut reader = std::io::BufReader::new(stream);
-    if reader.read_line(&mut line).is_err() {
-        return None;
-    }
-    let Ok(resp) = serde_json::from_str::<serde_json::Value>(&line) else {
-        return None;
-    };
-    if resp.get("error").is_some() {
-        return None;
-    }
-    let result = resp.get("result")?;
+pub fn get_last_active(home: &Path) -> Option<LastActive> {
+    let result = crate::daemon::request(
+        home,
+        "workspace_ui.get",
+        serde_json::json!({"protocol_version": cyclops_proto::PROTOCOL_VERSION}),
+    )
+    .ok()?;
     let session = result.get("last_active_session")?.as_str()?.to_string();
     let window_id = result.get("last_active_window")?.as_str()?.to_string();
     Some(LastActive { session, window_id })
 }
 
 /// Persist last-active workspace/tab through cyclopsd.
-pub fn set_last_active(_home: &Path, session: &str, window_id: &str) {
-    let sock = cyclops_proto::socket_path();
-    if !sock.exists() {
-        return;
-    }
-    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) else {
-        return;
-    };
-    use std::io::Write;
-    let body = serde_json::json!({
-        "session": session,
-        "window_id": window_id,
-        "protocol_version": cyclops_proto::PROTOCOL_VERSION,
-    });
-    let req = format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"workspace_ui.set\",\"params\":{body}}}\n"
+pub fn set_last_active(home: &Path, session: &str, window_id: &str) {
+    // Wait for the acknowledgement so two rapid switches cannot be
+    // processed out of order on separate daemon connection tasks.
+    let _ = crate::daemon::request(
+        home,
+        "workspace_ui.set",
+        serde_json::json!({
+            "session": session,
+            "window_id": window_id,
+            "protocol_version": cyclops_proto::PROTOCOL_VERSION,
+        }),
     );
-    let _ = stream.write_all(req.as_bytes());
 }
 
 /// Reopen fallback: last-active → default_workspace → first → offer.
@@ -238,6 +239,63 @@ mod tests {
         .expect("write");
         let loaded = load_prefs(&home);
         assert!(loaded.sidebar_visible);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn saving_prefs_preserves_bindings_and_future_workspace_keys() {
+        let home = scratch_dir("ws-prefs-preserve");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("scratch");
+        std::fs::write(
+            home.join("config.toml"),
+            "[workspace]\nfuture_key = 42\n[workspace.bindings]\nnext_tab = 'Alt+n'\n[theme]\nname = 'sage'\n",
+        )
+        .expect("write");
+
+        save_prefs(
+            &home,
+            &WorkspacePrefs {
+                sidebar_visible: true,
+                sidebar_width: 31,
+                workspace_order: vec!["cyclops".into()],
+            },
+        )
+        .expect("save");
+
+        let saved = std::fs::read_to_string(home.join("config.toml")).expect("saved config");
+        let table = saved.parse::<toml::Table>().expect("valid TOML");
+        let workspace = table["workspace"].as_table().expect("workspace table");
+        assert_eq!(workspace["future_key"].as_integer(), Some(42));
+        assert_eq!(
+            workspace["bindings"]
+                .as_table()
+                .and_then(|bindings| bindings["next_tab"].as_str()),
+            Some("Alt+n")
+        );
+        assert_eq!(
+            table["theme"]
+                .as_table()
+                .and_then(|theme| theme["name"].as_str()),
+            Some("sage")
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn saving_prefs_never_overwrites_an_invalid_shared_config() {
+        let home = scratch_dir("ws-prefs-invalid");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("scratch");
+        let original = "theme = [this is not valid TOML\n";
+        std::fs::write(home.join("config.toml"), original).expect("write invalid config");
+
+        let error = save_prefs(&home, &WorkspacePrefs::default()).expect_err("must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            std::fs::read_to_string(home.join("config.toml")).expect("original remains"),
+            original
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

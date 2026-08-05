@@ -61,6 +61,9 @@ pub struct ControlConfig {
     pub session: String,
     /// Attach to an existing session or create one.
     pub mode: ControlMode,
+    /// Name for the first window when [`ControlMode::NewSession`] creates
+    /// the session. Ignored by attach mode.
+    pub initial_window_name: Option<String>,
     /// Per-command reply timeout. A timeout is a command-level failure
     /// only: the connection stays up and the late reply is consumed in
     /// FIFO order, so correlation survives.
@@ -80,6 +83,7 @@ impl ControlConfig {
             config_file: None,
             session: session.into(),
             mode: ControlMode::Attach,
+            initial_window_name: None,
             command_timeout: Duration::from_secs(10),
             buffer_spool_dir: None,
         }
@@ -102,6 +106,12 @@ impl ControlConfig {
     /// Use an explicit `-f` config file.
     pub fn with_config_file(mut self, path: impl Into<PathBuf>) -> Self {
         self.config_file = Some(path.into());
+        self
+    }
+
+    /// Give a newly-created session's first window an explicit name.
+    pub fn with_initial_window_name(mut self, name: impl Into<String>) -> Self {
+        self.initial_window_name = Some(name.into());
         self
     }
 
@@ -311,6 +321,9 @@ impl ControlClient {
             }
             ControlMode::NewSession => {
                 cmd.args(["new-session", "-A", "-s"]).arg(&cfg.session);
+                if let Some(name) = &cfg.initial_window_name {
+                    cmd.arg("-n").arg(name);
+                }
             }
         }
         cmd.env_remove("TMUX"); // nested-session guard
@@ -406,6 +419,17 @@ impl ControlClient {
         }
     }
 
+    /// Queue a trusted command without waiting for its reply block.
+    ///
+    /// The reader still consumes the command's FIFO reply slot, so later
+    /// request/response correlation remains intact. This is reserved for
+    /// latency-sensitive commands whose output cannot affect the caller,
+    /// such as forwarding a keypress.
+    async fn command_unconfirmed(&self, cmd: &str) -> Result<(), TmuxError> {
+        let _reply = self.pipe.submit(cmd).await?;
+        Ok(())
+    }
+
     /// Visible grid of a pane as plain text, lines joined with newlines.
     pub async fn capture_pane(&self, pane_id: &str) -> Result<String, TmuxError> {
         let out = self
@@ -461,26 +485,25 @@ impl ControlClient {
     /// Literals must not contain newlines (control mode is line based); use
     /// an explicit "Enter" element, or the buffer/paste path for payloads.
     pub async fn send_keys(&self, pane_id: &str, keys: &[&str]) -> Result<(), TmuxError> {
-        let target = quote_arg(pane_id);
-        let mut i = 0;
-        while i < keys.len() {
-            let first_is_key = is_key_name(keys[i]);
-            let mut j = i + 1;
-            while j < keys.len() && is_key_name(keys[j]) == first_is_key {
-                j += 1;
-            }
-            let mut cmd = format!("send-keys -t {target}");
-            let literal = !first_is_key;
-            if literal {
-                cmd.push_str(" -l");
-            }
-            cmd.push_str(" --");
-            for k in &keys[i..j] {
-                cmd.push(' ');
-                cmd.push_str(&quote_arg(k));
-            }
+        for cmd in send_keys_commands(pane_id, keys) {
             self.command(&cmd).await?;
-            i = j;
+        }
+        Ok(())
+    }
+
+    /// Forward keys without waiting for tmux's empty success reply.
+    ///
+    /// Generated `send-keys` commands have no useful response body. The
+    /// write itself is still awaited and ordered; only the reply wait is
+    /// removed so an interactive client does not add a tmux round trip to
+    /// every keystroke.
+    pub async fn send_keys_unconfirmed(
+        &self,
+        pane_id: &str,
+        keys: &[&str],
+    ) -> Result<(), TmuxError> {
+        for cmd in send_keys_commands(pane_id, keys) {
+            self.command_unconfirmed(&cmd).await?;
         }
         Ok(())
     }
@@ -585,6 +608,31 @@ impl ControlClient {
             h.abort();
         }
     }
+}
+
+fn send_keys_commands(pane_id: &str, keys: &[&str]) -> Vec<String> {
+    let target = quote_arg(pane_id);
+    let mut commands = Vec::new();
+    let mut i = 0;
+    while i < keys.len() {
+        let first_is_key = is_key_name(keys[i]);
+        let mut j = i + 1;
+        while j < keys.len() && is_key_name(keys[j]) == first_is_key {
+            j += 1;
+        }
+        let mut cmd = format!("send-keys -t {target}");
+        if !first_is_key {
+            cmd.push_str(" -l");
+        }
+        cmd.push_str(" --");
+        for key in &keys[i..j] {
+            cmd.push(' ');
+            cmd.push_str(&quote_arg(key));
+        }
+        commands.push(cmd);
+        i = j;
+    }
+    commands
 }
 
 /// Write one load-buffer payload spool file: exclusive create, mode 0o600,

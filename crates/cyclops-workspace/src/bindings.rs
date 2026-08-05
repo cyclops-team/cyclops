@@ -21,6 +21,7 @@ pub enum BindingAction {
     SplitDown,
     ClosePane,
     ZoomPane,
+    NamePane,
     RenameTab,
     CloseTab,
     NextWorkspace,
@@ -29,6 +30,14 @@ pub enum BindingAction {
     RenameWorkspace,
     CloseWorkspace,
     ToggleEventPanel,
+    ShowKeybinds,
+}
+
+/// One human-readable row in the in-app keybinding reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingHelp {
+    pub keys: String,
+    pub action: String,
 }
 
 /// One binding: either after prefix or a direct chord.
@@ -123,6 +132,10 @@ pub fn default_bindings() -> HashMap<BindingAction, BindingChord> {
             BindingChord::Prefix(KeyCode::Char('z')),
         ),
         (
+            BindingAction::NamePane,
+            BindingChord::Prefix(KeyCode::Char('m')),
+        ),
+        (
             BindingAction::RenameTab,
             BindingChord::Prefix(KeyCode::Char(',')),
         ),
@@ -153,6 +166,10 @@ pub fn default_bindings() -> HashMap<BindingAction, BindingChord> {
         (
             BindingAction::ToggleEventPanel,
             BindingChord::Prefix(KeyCode::Char('e')),
+        ),
+        (
+            BindingAction::ShowKeybinds,
+            BindingChord::Prefix(KeyCode::Char('?')),
         ),
     ])
 }
@@ -201,6 +218,7 @@ fn action_from_key(key: &str) -> Option<BindingAction> {
         "split_down" => Some(BindingAction::SplitDown),
         "close_pane" => Some(BindingAction::ClosePane),
         "zoom_pane" => Some(BindingAction::ZoomPane),
+        "name_pane" => Some(BindingAction::NamePane),
         "rename_tab" => Some(BindingAction::RenameTab),
         "close_tab" => Some(BindingAction::CloseTab),
         "next_workspace" => Some(BindingAction::NextWorkspace),
@@ -209,12 +227,123 @@ fn action_from_key(key: &str) -> Option<BindingAction> {
         "rename_workspace" => Some(BindingAction::RenameWorkspace),
         "close_workspace" => Some(BindingAction::CloseWorkspace),
         "toggle_event_panel" => Some(BindingAction::ToggleEventPanel),
+        "show_keybinds" => Some(BindingAction::ShowKeybinds),
         s if s.starts_with("tab_") => s
             .strip_prefix("tab_")
             .and_then(|n| n.parse::<usize>().ok())
             .filter(|&n| (1..=9).contains(&n))
             .map(BindingAction::SelectTab),
         _ => None,
+    }
+}
+
+/// Stable, complete help rows for the active binding map. The reference is
+/// generated from the same map the router uses, so a config rebind cannot
+/// leave the modal teaching the old key.
+pub fn binding_help(bindings: &HashMap<BindingAction, BindingChord>) -> Vec<BindingHelp> {
+    let mut rows: Vec<_> = bindings
+        .iter()
+        .map(|(action, chord)| {
+            (
+                *action,
+                BindingHelp {
+                    keys: chord_words(chord),
+                    action: action_words(*action),
+                },
+            )
+        })
+        .collect();
+    rows.sort_by_key(|(action, _)| help_rank(*action));
+    rows.into_iter().map(|(_, row)| row).collect()
+}
+
+fn action_words(action: BindingAction) -> String {
+    match action {
+        BindingAction::Detach => "Detach".into(),
+        BindingAction::NextTab => "Next tab".into(),
+        BindingAction::PrevTab => "Previous tab".into(),
+        BindingAction::SelectTab(index) => format!("Select tab {index}"),
+        BindingAction::NewTab => "New tab".into(),
+        BindingAction::FocusLeft => "Focus pane left".into(),
+        BindingAction::FocusRight => "Focus pane right".into(),
+        BindingAction::FocusUp => "Focus pane above".into(),
+        BindingAction::FocusDown => "Focus pane below".into(),
+        BindingAction::SplitRight => "Split pane right".into(),
+        BindingAction::SplitDown => "Split pane down".into(),
+        BindingAction::ClosePane => "Close pane".into(),
+        BindingAction::ZoomPane => "Zoom pane".into(),
+        BindingAction::NamePane => "Name pane / agent".into(),
+        BindingAction::RenameTab => "Rename tab".into(),
+        BindingAction::CloseTab => "Close tab".into(),
+        BindingAction::NextWorkspace => "Next workspace".into(),
+        BindingAction::PrevWorkspace => "Previous workspace".into(),
+        BindingAction::NewWorkspace => "New workspace here".into(),
+        BindingAction::RenameWorkspace => "Rename workspace".into(),
+        BindingAction::CloseWorkspace => "Close workspace".into(),
+        BindingAction::ToggleEventPanel => "Toggle events".into(),
+        BindingAction::ShowKeybinds => "Keybinds".into(),
+    }
+}
+
+fn help_rank(action: BindingAction) -> (u8, usize) {
+    match action {
+        BindingAction::FocusLeft => (10, 0),
+        BindingAction::FocusRight => (11, 0),
+        BindingAction::FocusUp => (12, 0),
+        BindingAction::FocusDown => (13, 0),
+        BindingAction::SplitRight => (14, 0),
+        BindingAction::SplitDown => (15, 0),
+        BindingAction::ZoomPane => (16, 0),
+        BindingAction::NamePane => (17, 0),
+        BindingAction::ClosePane => (18, 0),
+        BindingAction::NewTab => (30, 0),
+        BindingAction::NextTab => (31, 0),
+        BindingAction::PrevTab => (32, 0),
+        BindingAction::SelectTab(index) => (33, index),
+        BindingAction::RenameTab => (34, 0),
+        BindingAction::CloseTab => (35, 0),
+        BindingAction::NewWorkspace => (40, 0),
+        BindingAction::NextWorkspace => (41, 0),
+        BindingAction::PrevWorkspace => (42, 0),
+        BindingAction::RenameWorkspace => (43, 0),
+        BindingAction::CloseWorkspace => (44, 0),
+        BindingAction::ToggleEventPanel => (50, 0),
+        BindingAction::ShowKeybinds => (51, 0),
+        BindingAction::Detach => (52, 0),
+    }
+}
+
+fn chord_words(chord: &BindingChord) -> String {
+    match chord {
+        BindingChord::Prefix(code) => format!("Ctrl+B {}", key_words(*code)),
+        BindingChord::Direct(event) => {
+            let mut parts = Vec::new();
+            if event.modifiers.contains(KeyModifiers::CONTROL) {
+                parts.push("Ctrl".to_string());
+            }
+            if event.modifiers.contains(KeyModifiers::ALT) {
+                parts.push("Alt".to_string());
+            }
+            if event.modifiers.contains(KeyModifiers::SHIFT) {
+                parts.push("Shift".to_string());
+            }
+            parts.push(key_words(event.code));
+            parts.join("+")
+        }
+    }
+}
+
+fn key_words(code: KeyCode) -> String {
+    match code {
+        KeyCode::Left => "Left".into(),
+        KeyCode::Right => "Right".into(),
+        KeyCode::Up => "Up".into(),
+        KeyCode::Down => "Down".into(),
+        KeyCode::Enter => "Enter".into(),
+        KeyCode::Esc => "Esc".into(),
+        KeyCode::Char(' ') => "Space".into(),
+        KeyCode::Char(character) => character.to_string(),
+        other => format!("{other:?}"),
     }
 }
 
@@ -279,5 +408,26 @@ mod tests {
     fn prefix_key_parses() {
         let chord = parse_binding_spec("prefix n").expect("parse");
         assert_eq!(chord, BindingChord::Prefix(KeyCode::Char('n')));
+    }
+
+    #[test]
+    fn help_rows_come_from_the_active_bindings() {
+        let mut bindings = default_bindings();
+        bindings.insert(
+            BindingAction::NamePane,
+            BindingChord::Direct(KeyEvent::new(
+                KeyCode::Char('m'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            )),
+        );
+
+        let rows = binding_help(&bindings);
+        let naming = rows
+            .iter()
+            .find(|row| row.action == "Name pane / agent")
+            .expect("naming row");
+        assert_eq!(naming.keys, "Ctrl+Alt+m");
+        assert!(rows.iter().any(|row| row.action == "Keybinds"));
+        assert!(rows.iter().any(|row| row.action == "Detach"));
     }
 }
