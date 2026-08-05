@@ -114,6 +114,19 @@ pub async fn execute_new_tab(
         .unwrap_or_default())
 }
 
+/// A workspace this call just created: its name plus the tmux session id
+/// that identifies it once the name is gone. A folder-following workspace
+/// gets renamed later, and the id is the only handle that survives that.
+#[derive(Debug, Clone)]
+pub struct NewWorkspace {
+    /// The production caller only needs `session_id` to start following the
+    /// folder; `name` is exercised by the test below, which asserts creation
+    /// still names the session after the folder.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub name: String,
+    pub session_id: String,
+}
+
 /// Create a workspace (tmux session) from a project folder and switch to
 /// it. The name is the folder's basename, sanitized for tmux and made
 /// unique against `taken`, so "create a workspace here" never collides.
@@ -121,24 +134,29 @@ pub async fn execute_new_workspace(
     client: &ControlClient,
     folder: &Path,
     taken: &[String],
-) -> Result<String, TmuxError> {
+) -> Result<NewWorkspace, TmuxError> {
     let name = unique_session_name(&session_name_from_folder(folder), taken);
     let path = folder.to_string_lossy();
-    client
+    let out = client
         .command(&format!(
-            "new-session -d -s {} -n {} -c {}",
+            "new-session -d -P -F {} -s {} -n {} -c {}",
+            quote_arg("#{session_id}"),
             quote_arg(&name),
             quote_arg("1"),
             quote_arg(path.as_ref())
         ))
         .await?;
+    let session_id = out
+        .first()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
     client
         .command(&format!(
             "switch-client -t {}",
             quote_arg(&session_target(&name))
         ))
         .await?;
-    Ok(name)
+    Ok(NewWorkspace { name, session_id })
 }
 
 /// Rename one session.
@@ -220,6 +238,26 @@ pub fn unique_session_name(base: &str, taken: &[String]) -> String {
         }
     }
     unreachable!("some suffix is always free")
+}
+
+/// The name a folder-following workspace should wear, or `None` when it
+/// already wears it. `taken` is every OTHER workspace's name, so the suffix
+/// rule that keeps `execute_new_workspace` collision-free keeps this rename
+/// collision-free too.
+///
+/// This is a pure function — no tmux, no session lookup — because it *is*
+/// the whole follow-the-folder rule: every case is decided from `current`,
+/// `cwd`, and `taken` alone. That's what lets a caller run it on every
+/// render tick without a round trip, and what lets it be tested exhaustively
+/// without a tmux server.
+pub fn folder_rename(current: &str, cwd: &str, taken: &[String]) -> Option<String> {
+    let cwd = cwd.trim();
+    if cwd.is_empty() {
+        return None;
+    }
+    let base = session_name_from_folder(Path::new(cwd));
+    let next = unique_session_name(&base, taken);
+    (next != current).then_some(next)
 }
 
 /// Switch to adjacent workspace by index delta.
@@ -342,13 +380,20 @@ mod tests {
         std::fs::create_dir_all(&folder).expect("folder");
         server.run_ok(&["new-session", "-d", "-s", "host", "/bin/sh"]);
         let client = rig_client(&server, "host").await;
-        let name = execute_new_workspace(&client, &folder, &[])
+        let created = execute_new_workspace(&client, &folder, &[])
             .await
             .expect("create");
+        let name = created.name;
         assert_eq!(
             name,
             folder.file_name().unwrap().to_string_lossy(),
             "the session name comes from the scratch folder"
+        );
+        let out = server.run(&["display-message", "-p", "-t", &name, "#{session_id}"]);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            created.session_id,
+            "the returned session id should identify the created session"
         );
         let out = server.run(&["display-message", "-p", "-t", &name, "#{session_path}"]);
         assert_eq!(
@@ -579,6 +624,44 @@ mod tests {
         let taken = vec!["cyclops".to_string(), "cyclops-2".to_string()];
         assert_eq!(unique_session_name("cyclops", &taken), "cyclops-3");
         assert_eq!(unique_session_name("fresh", &taken), "fresh");
+    }
+
+    #[test]
+    fn folder_rename_targets_the_new_folders_basename() {
+        assert_eq!(
+            folder_rename("old", "/a/cyclops", &[]),
+            Some("cyclops".to_string())
+        );
+    }
+
+    #[test]
+    fn folder_rename_is_none_once_the_name_already_matches() {
+        assert_eq!(folder_rename("cyclops", "/a/cyclops", &[]), None);
+    }
+
+    #[test]
+    fn folder_rename_ignores_an_empty_or_blank_cwd() {
+        assert_eq!(folder_rename("cyclops", "", &[]), None);
+        assert_eq!(folder_rename("cyclops", "   ", &[]), None);
+    }
+
+    #[test]
+    fn folder_rename_lands_on_a_suffix_and_then_holds_still() {
+        let taken = vec!["cyclops".to_string()];
+        let next = folder_rename("old", "/a/cyclops", &taken).expect("collision suffix");
+        assert_eq!(next, "cyclops-2");
+        // Probing again with the suffixed name as `current` must return
+        // None — otherwise a folder-following workspace that collided once
+        // would rename itself on every subsequent probe.
+        assert_eq!(folder_rename(&next, "/a/cyclops", &taken), None);
+    }
+
+    #[test]
+    fn folder_rename_sanitizes_like_session_name_from_folder() {
+        assert_eq!(
+            folder_rename("old", "/a/my.project", &[]),
+            Some("my-project".to_string())
+        );
     }
 
     #[tokio::test]

@@ -30,7 +30,9 @@ use crate::theme::{self, Paint};
 /// dialog.
 fn dialog_parts(dialog: &Dialog) -> (&str, Option<&str>, Option<&str>, &'static str) {
     match dialog {
-        Dialog::ConfirmClosePane { .. } => (copy::CONFIRM_CLOSE_PANE, None, None, copy::BUTTON_YES),
+        Dialog::ConfirmClosePane { .. } => {
+            (copy::CONFIRM_CLOSE_PANE, None, None, copy::BUTTON_CONFIRM)
+        }
         Dialog::NewTab { buffer } => (
             copy::NEW_TAB_TITLE,
             Some(buffer),
@@ -49,16 +51,21 @@ fn dialog_parts(dialog: &Dialog) -> (&str, Option<&str>, Option<&str>, &'static 
             None,
             copy::BUTTON_SAVE,
         ),
-        Dialog::ConfirmCloseTab { .. } => (copy::CONFIRM_CLOSE_TAB, None, None, copy::BUTTON_YES),
+        Dialog::ConfirmCloseTab { .. } => {
+            (copy::CONFIRM_CLOSE_TAB, None, None, copy::BUTTON_CONFIRM)
+        }
         Dialog::RenameWorkspace { buffer, .. } => (
             copy::RENAME_WORKSPACE_PROMPT,
             Some(buffer),
             None,
             copy::BUTTON_SAVE,
         ),
-        Dialog::ConfirmCloseWorkspace { .. } => {
-            (copy::CONFIRM_CLOSE_WORKSPACE, None, None, copy::BUTTON_YES)
-        }
+        Dialog::ConfirmCloseWorkspace { .. } => (
+            copy::CONFIRM_CLOSE_WORKSPACE,
+            None,
+            None,
+            copy::BUTTON_CONFIRM,
+        ),
         Dialog::Keybinds { .. } => unreachable!("keybinds uses its own dialog renderer"),
     }
 }
@@ -162,32 +169,18 @@ pub fn paint_dialog(
             .render(error_area, buf);
     }
     // Keyboard-first actions on the last inner row, recorded for the mouse.
-    // Destructive dialogs make the safe Enter/Escape path primary.
+    // Enter confirms every modal and Escape cancels it, so one shape covers
+    // input dialogs and destructive confirms alike.
     let button_y = inner.y + inner.height.saturating_sub(1);
     let mut bx = inner.x + 1;
-    let buttons = if dialog.has_input() {
-        [
-            (format!("↵ {confirm_label}"), HitTarget::DialogConfirm, true),
-            (
-                format!("Esc {}", copy::BUTTON_CANCEL),
-                HitTarget::DialogCancel,
-                false,
-            ),
-        ]
-    } else {
-        [
-            (
-                format!("Y {confirm_label}"),
-                HitTarget::DialogConfirm,
-                false,
-            ),
-            (
-                format!("↵ / Esc {}", copy::BUTTON_CANCEL),
-                HitTarget::DialogCancel,
-                true,
-            ),
-        ]
-    };
+    let buttons = [
+        (format!("↵ {confirm_label}"), HitTarget::DialogConfirm, true),
+        (
+            format!("Esc {}", copy::BUTTON_CANCEL),
+            HitTarget::DialogCancel,
+            false,
+        ),
+    ];
     for (text, target, primary) in buttons {
         let bw = Span::raw(text.as_str()).width() as u16;
         let available = inner.x.saturating_add(inner.width).saturating_sub(bx);
@@ -1979,10 +1972,10 @@ mod tests {
         .unwrap();
         let flat = flatten(term.backend().buffer());
         assert!(flat.contains("Close this pane"));
-        assert!(flat.contains("Y Yes"), "confirm key is visible: {flat}");
+        assert!(flat.contains("↵ Confirm"), "confirm key is visible: {flat}");
         assert!(
-            flat.contains("↵ / Esc Cancel"),
-            "safe default is visibly primary: {flat}"
+            flat.contains("Esc Cancel"),
+            "cancel action is visible: {flat}"
         );
     }
 

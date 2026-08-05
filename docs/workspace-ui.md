@@ -8,6 +8,12 @@ ran it from. Its first tab is `1`; automatic tab names continue with `2`,
 `3`, and so on. No preset or manual `tmux new` required; `cyclops start`
 remains the front door for preset-built workspaces.
 
+It starts cyclopsd too, when none is answering. Everything the workspace
+shows about an agent — the detected name, the status glyph, the pane
+chrome — comes from the daemon, so a workspace without one is a workspace
+where nothing is ever detected and no state ever changes. The sidebar says
+`cyclopsd offline` for as long as that is true.
+
 ```bash
 cyclops                   # workspace (TTY required)
 cyclops watch             # stream TUI (formerly `cyclops ui`)
@@ -47,6 +53,14 @@ Creating a workspace is immediate. Cyclops uses the focused pane's current
 folder as both the new session's directory and its name, makes the name safe
 for tmux, adds `-2`, `-3`, and so on when needed, then switches to it. There
 is no folder prompt.
+
+A workspace created this way keeps following its folder afterward: `cd` in
+its pane and the workspace's name updates to match the new directory, sanitized
+and de-duplicated the same way creation is. Renaming a workspace by hand —
+`Ctrl+B` `W` or the right-click menu — hands the name back to you permanently;
+Cyclops never renames it out from under you again. Pre-existing sessions the
+TUI didn't create, such as the default `main` session, never start following
+a folder in the first place.
 
 ## What the chrome means
 
@@ -101,9 +115,9 @@ The filled `+` in the tab strip opens the new-tab dialog. Type a name and use
 `↵ Create`, or click that action; the tab opens in the focused pane's current
 directory with that name. An empty name uses the next numeric tab name.
 `Esc Cancel` creates nothing. Rename and pane-name dialogs use the same
-keyboard-first, mouse-clickable action model. Destructive confirmations keep
-Enter and Escape on the safe cancel action; use `y` or click `Y Yes` to
-proceed.
+keyboard-first, mouse-clickable action model. Destructive confirmations use
+the same rule: Enter or click `↵ Confirm` to proceed, Escape or click
+`Esc Cancel` to back out.
 
 Right-click chooses the object under the pointer, even when it is not
 active:
