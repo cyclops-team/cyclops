@@ -10,7 +10,7 @@ accent = { hex = "#88c0d0", c256 = 110 }
 1 = { hex = "#88c0d0", c256 = 110 } # frost, the accent
 2 = { hex = "#a3be8c", c256 = 144 } # aurora green
 3 = { hex = "#81a1c1", c256 = 109 } # frost blue
-4 = { hex = "#8fbcbb", c256 = 109 } # frost teal
+4 = { hex = "#8fbcbb", c256 = 116 } # frost teal; hand-tuned away from role.3
 5 = { hex = "#d08770", c256 = 173 } # aurora orange
 6 = { hex = "#b48ead", c256 = 139 } # aurora purple
 7 = { hex = "#ebcb8b", c256 = 222 } # aurora yellow
@@ -29,3 +29,9 @@ healthy = { hex = "#a3be8c", c256 = 144 }
 needs_you = { hex = "#ebcb8b", c256 = 222 }
 terminal = { hex = "#bf616a", c256 = 131 }
 quiet = { hex = "#4c566a", c256 = 240 }
+
+# The workspace chrome's grounds: Nord's polar-night steps nord1/nord2.
+[chrome]
+text = { hex = "#d8dee9", c256 = 253 }
+panel = { hex = "#3b4252", c256 = 238 }
+raised = { hex = "#434c5e", c256 = 239 }

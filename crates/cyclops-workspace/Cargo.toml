@@ -1,0 +1,21 @@
+[package]
+name = "cyclops-workspace"
+version.workspace = true
+edition.workspace = true
+description = "Cyclops terminal workspace: pane VT runtimes and the full-screen TUI."
+
+[dependencies]
+alacritty_terminal = "0.26"
+cyclops-proto.workspace = true
+cyclops-theme.workspace = true
+cyclops-tmux.workspace = true
+crossterm = "0.28"
+ratatui = "0.30"
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+toml.workspace = true
+
+[dev-dependencies]
+vt100 = "0.16"
+cyclops-testrig.workspace = true

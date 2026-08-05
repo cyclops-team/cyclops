@@ -179,7 +179,7 @@ fn ui_plain_admin_stream_is_calm_and_ends_honestly() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
     assert_eq!(
         String::from_utf8_lossy(&out.stderr).trim(),
-        "lost the connection to cyclops: the connection closed. Check that cyclopsd is still running, then retry."
+        "cyclops ui is deprecated; use cyclops watch\nlost the connection to cyclops: the connection closed. Check that cyclopsd is still running, then retry."
     );
     let _ = fs::remove_dir_all(&home);
 }
@@ -260,7 +260,10 @@ fn ui_daemon_down_reports_and_exits_one() {
     // kept saying `cyclopsd &` after `cyclops start` took the job over.
     assert_eq!(
         String::from_utf8_lossy(&out.stderr).trim(),
-        cyclops_proto::NOT_RUNNING
+        format!(
+            "cyclops ui is deprecated; use cyclops watch\n{}",
+            cyclops_proto::NOT_RUNNING
+        )
     );
     let _ = fs::remove_dir_all(&home);
 }

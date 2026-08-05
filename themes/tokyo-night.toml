@@ -29,3 +29,9 @@ healthy = { hex = "#9ece6a", c256 = 149 }
 needs_you = { hex = "#e0af68", c256 = 179 }
 terminal = { hex = "#f7768e", c256 = 210 }
 quiet = { hex = "#565f89", c256 = 60 }
+
+# The workspace chrome's grounds: Tokyo Night storm panel and highlight.
+[chrome]
+text = { hex = "#c0caf5", c256 = 189 }
+panel = { hex = "#24283b", c256 = 236 }
+raised = { hex = "#3b4261", c256 = 239 }

@@ -16,7 +16,8 @@ can read months later.
 flowchart LR
     subgraph clients["what a person runs"]
       cli["cyclops<br/>send, status, list, wait"]
-      ui["cyclops ui<br/>the stream"]
+      ui["cyclops watch<br/>the stream"]
+      ws["cyclops<br/>the workspace"]
       hk["cyclops hook<br/>(a vendor hook runs this)"]
     end
     subgraph daemon["cyclopsd"]
@@ -29,6 +30,7 @@ flowchart LR
     tmux(["your tmux server"])
     data["manifests/ themes/<br/>layouts/ hooks/"]
     cli -->|"one request per command,<br/>held open until the daemon answers"| sock
+    ws -->|"control mode: panes,<br/>layout, send-keys"| tmux
     ui -->|"events.subscribe once;<br/>after that it only listens"| sock
     hk -->|"the vendor CLI fired a turn edge:<br/>agent.state.report"| sock
     sock -->|"one JSON object per line,<br/>hello line first"| daemon
@@ -56,7 +58,8 @@ are a rule implemented in a crate that should not have known about it.
 | `cyclops-theme` | The semantic token vocabulary, the state-to-group mapping, theme files, selection, the reload rule | Painting. It resolves a token to a color; renderers turn colors into escape sequences |
 | `cyclopsd` | The daemon: fusion, the delivery pipeline, the socket server, sender identity, the adoption registry, pane border chrome, the hooks self-test, the ledger read side | tmux specifics (adapter), the wire schema (proto), the attention rule (proto). It renders exactly one string: the border format |
 | `cyclops` | The CLI: a thin NDJSON client plus rendering on the shared grid | Business logic. `cyclops list` asks `status` for the roster rather than holding a second one |
-| `cyclops-ui` | The stream: two views, filters, backfill, the terminal backend | The attention rule (reads proto), tmux (one focus helper in the adapter) |
+| `cyclops-ui` | The stream: two views, filters, backfill, the terminal backend (`cyclops watch`) |
+| `cyclops-workspace` | The full-screen workspace (`cyclops`): sidebar, tabs, pane canvas, mouse | The attention rule (reads proto), tmux (one focus helper in the adapter) |
 | `cyclops-testrig` | The isolated tmux server and its teardown rule, in one place | Anything shipped. `publish = false`, test-only |
 
 One honest exception to "every tmux invocation": `cyclopsd::probe_tmux`

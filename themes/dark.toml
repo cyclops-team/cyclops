@@ -65,7 +65,11 @@
 # numbers below are pinned there by
 # shipped_themes_meet_their_stated_contrast.
 #
-# Floor 4.3:1 for every token except state.dead. The floor itself is
+# Floor 4.3:1 for every figure token except state.dead; the two [chrome]
+# grounds are backgrounds the workspace chrome paints, not figures, so
+# their bar (pinned in the same test) is that chrome.text stays readable
+# on both grounds at this floor, not that they clear it themselves.
+# The floor itself is
 # surface.dim, and eye.calm, state.quiet and badge.quiet sit on it because
 # they take the same value: 4.34:1, just under WCAG AA's 4.5:1, and it
 # stays because #777 is the site's own --term-dim and detail columns are
@@ -119,3 +123,11 @@ healthy = { hex = "#96c396", c256 = 108 }
 needs_you = { hex = "#d7a86e", c256 = 179 }
 terminal = { hex = "#cf6a6a", c256 = 167 }
 quiet = { hex = "#777777", c256 = 243 }
+
+# The workspace chrome's grounds: one and two visible steps up from the
+# site's --term-bg, so the chrome reads as furniture, not content.
+# chrome.text on raised measures 11.5:1.
+[chrome]
+text = { hex = "#edecec", c256 = 255 }
+panel = { hex = "#1a1a1a", c256 = 234 }
+raised = { hex = "#2e2e2e", c256 = 236 }

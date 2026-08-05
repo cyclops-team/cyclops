@@ -39,6 +39,10 @@ than a measurement.
 | F29 | A script matching daemon output textually matches one field, or uses `jq` | binds |
 | F30, F31 | Never allocated. The gap is deliberate and the numbers stay unused | bookkeeping |
 | F32 | A theme reload applies whole or not at all: a file that stops setting a token it set before is refused | binds |
+| F34 | `libghostty-vt` needs Zig at build time; the corpus used `vt100` as the comparison engine instead | binds |
+| F35 | `alacritty_terminal` passes the workspace VT fixture corpus 12/12; `vt100` passes 5/12 | binds |
+| F36 | Cloud-agent VM stdout accepts OSC 52 clipboard writes; native fallback uses wl-copy/xclip when present | binds |
+| F37 | Session rename notifications carry a stable id and can describe a background session | binds |
 
 ## F13. refresh-client -B subscriptions work in control mode on tmux 3.6a (MEASURED)
 
@@ -548,3 +552,62 @@ predicate that passed on an empty record: a check pointed at a value that
 is only meaningful in the case it was not testing for. Here the count is
 a fallback, so reading it asks "is the file empty" while meaning to ask
 "did anything actually get named".
+
+## F34. libghostty-vt requires Zig at build time; corpus used vt100 instead (MEASURED)
+
+The design's second VT candidate is `libghostty-vt`, which fetches Ghostty
+sources and runs `zig build` in its build script (`libghostty-vt-sys` 0.2.1).
+On this machine and in the default CI image, `zig` is not on PATH, so
+`cargo build -p libghostty-vt` fails with "failed to execute zig build: No
+such file or directory". The fixture corpus therefore compared
+`alacritty_terminal` against `vt100` 0.16 as the only Rust-pure alternative
+that builds without Zig. `libghostty-vt` remains the documented fallback if
+a future gap appears that alacritty cannot cover and Zig is added to the
+build environment.
+
+## F35. alacritty_terminal wins the workspace VT fixture corpus 12/12 (MEASURED)
+
+`crates/cyclops-workspace/tests/corpus.rs` runs twelve fixtures covering
+plain output, SGR/256/truecolor, attributes, cursor motion, wrapping, wide
+characters, alternate screen, bracketed paste, and synthetic Codex/Claude
+captures. `alacritty_terminal` 0.26 passes all twelve; `vt100` passes five
+(missing truecolor, 256-color fg assertions, bold/dim attribute checks, and
+correct wide-character spacing). Production code calls `AlacrittyVt` directly;
+the `PaneVt` trait was collapsed in the same commit per the design's
+"delete rather than abstract" rule.
+
+## F36. Workspace clipboard uses OSC 52 on this VM (MEASURED)
+
+The cloud-agent desktop terminal accepts `\x1b]52;c;<base64>\x07` written to
+stdout while the workspace runs in raw mode. When OSC 52 is unavailable,
+`selection::copy_native` falls back to `wl-copy`, `xclip`, or `pbcopy` if
+present on PATH. Selection text is never logged or persisted; the clipboard
+write is the only export (Invariant 7).
+
+Probe: `cargo test -p cyclops-workspace selection::tests::base64_roundtrip_shape`
+plus manual OSC 52 write from the workspace selection path on the agent VM.
+Native fallback is best-effort and untested on every platform variant.
+
+## F37. Session-renamed identifies background sessions on tmux 3.7b (MEASURED)
+
+A control client attached to one session receives `%session-renamed` when a
+different session is renamed. tmux 3.7b puts the renamed session's stable id
+before its new name:
+
+```text
+%session-changed $2 alpha
+%session-renamed $0 gamma-probe
+```
+
+Treating the whole tail as the attached session name makes the client try to
+reconcile a session literally named `$0 gamma-probe`. The notification parser
+therefore accepts the current `id name` shape and retains the older one-field
+shape. Workspace reconciliation switches its active name only when the id is
+the attached session; a background rename refreshes the sidebar without
+changing sessions.
+
+Probe: start isolated sessions `alpha` and `gamma` on one server, run
+`tmux -L <socket> -C attach-session -t '=alpha'`, then run
+`tmux -L <socket> rename-session -t '=gamma' gamma-probe` from another
+client. The two notification lines above arrived verbatim on the control-mode
+client.

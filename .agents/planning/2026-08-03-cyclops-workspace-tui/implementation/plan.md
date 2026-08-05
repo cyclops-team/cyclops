@@ -18,20 +18,20 @@ re-renderable after later changes.
 
 ## Checklist
 
-- [ ] Step 1: VT engine evaluation — `PaneVt` trait + fidelity fixture corpus
-- [ ] Step 2: Streaming control client in `cyclops-tmux`
-- [ ] Step 3: Hydration bundles, client sizing, and flow control
-- [ ] Step 4: Minimal workspace — one live pane, keyboard pass-through, bare `cyclops`
-- [ ] Step 5: Tabs and layout — split-tree rendering and the prefix keyboard router
-- [ ] Step 6: Structural intents and reconciliation
-- [ ] Step 7: Sidebar and workspaces
-- [ ] Step 8: Resilience — reconnect, flow-control recovery, server-gone
-- [ ] Step 9: Mouse foundation — click, wheel, menus, split controls
-- [ ] Step 10: Selection and clipboard
-- [ ] Step 11: Drag — dividers, tabs, panes
-- [ ] Step 12: Agent decoration — states, attention, labels, event panel
-- [ ] Step 13: Persistence — preferences and last-active state
-- [ ] Step 14: Command surface and docs — `watch` rename, parity, front doors
+- [x] Step 1: VT engine evaluation — `PaneVt` trait + fidelity fixture corpus
+- [x] Step 2: Streaming control client in `cyclops-tmux`
+- [x] Step 3: Hydration bundles, client sizing, and flow control
+- [x] Step 4: Minimal workspace — one live pane, keyboard pass-through, bare `cyclops`
+- [x] Step 5: Tabs and layout — split-tree rendering and the prefix keyboard router
+- [x] Step 6: Structural intents and reconciliation
+- [x] Step 7: Sidebar and workspaces
+- [x] Step 8: Resilience — reconnect, flow-control recovery, server-gone
+- [x] Step 9: Mouse foundation — click, wheel, menus, split controls
+- [x] Step 10: Selection and clipboard
+- [x] Step 11: Drag — dividers, tabs, panes
+- [x] Step 12: Agent decoration — states, attention, labels, event panel
+- [x] Step 13: Persistence — preferences and last-active state
+- [x] Step 14: Command surface and docs — `watch` rename, parity, front doors
 
 ---
 

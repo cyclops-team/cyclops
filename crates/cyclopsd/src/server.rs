@@ -495,6 +495,34 @@ pub(crate) async fn dispatch(
             }
             (Response::ok(id, json!({"subscribed": true})), Some(params))
         }
+        "workspace_ui.get" => {
+            let result = crate::workspace_ui::workspace_ui_get(&inner.workspace_ui);
+            (
+                Response::ok(
+                    id,
+                    serde_json::to_value(result).expect("workspace_ui.get serializes"),
+                ),
+                None,
+            )
+        }
+        "workspace_ui.set" => {
+            let params: cyclops_proto::WorkspaceUiSetParams =
+                match serde_json::from_value(req.params) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return (
+                            Response::err(
+                                id,
+                                "bad_request",
+                                format!("bad workspace_ui.set params: {e}"),
+                            ),
+                            None,
+                        )
+                    }
+                };
+            crate::workspace_ui::workspace_ui_set(&inner.workspace_ui, &params);
+            (Response::ok(id, json!({"saved": true})), None)
+        }
         method => {
             if let Some((_, milestone)) = UNIMPLEMENTED.iter().find(|(m, _)| *m == method) {
                 (
@@ -891,6 +919,7 @@ mod tests {
             hook_liveness: crate::selftest::HookLiveness::new(),
             inject_pause: StdMutex::new(None),
             fail_chrome_restore: std::sync::atomic::AtomicBool::new(false),
+            workspace_ui: StdMutex::new(crate::workspace_ui::WorkspaceUiState::default()),
         })
     }
 
@@ -1072,7 +1101,7 @@ mod tests {
     /// unknown_method: implemented, unimplemented, or a param error.
     /// Every method protocol v1 answers. One list, read by the dispatch
     /// check below and by the page that documents the wire.
-    const PROTOCOL_V1: [&str; 14] = [
+    const PROTOCOL_V1: [&str; 16] = [
         "ping",
         "status",
         "msg.send",
@@ -1087,6 +1116,8 @@ mod tests {
         "hooks.verify",
         "hooks.selftest",
         "theme.reload",
+        "workspace_ui.get",
+        "workspace_ui.set",
     ];
 
     #[tokio::test]

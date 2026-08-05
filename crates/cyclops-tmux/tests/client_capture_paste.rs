@@ -13,6 +13,13 @@ use std::time::Duration;
 use common::{eventually, TestServer};
 use cyclops_tmux::ControlClient;
 
+fn contains_csi_z_hex(text: &str) -> bool {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(3)
+        .any(|bytes| bytes == ["1b", "5b", "5a"])
+}
+
 #[tokio::test]
 async fn capture_pane_returns_visible_content() {
     let Some(srv) = TestServer::new("capture") else {
@@ -48,6 +55,77 @@ async fn capture_pane_returns_visible_content() {
         .expect("capture history");
     assert!(hist.contains("CYCAP_MARKER_42"));
 
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn unconfirmed_key_send_keeps_later_reply_correlation() {
+    let Some(srv) = TestServer::new("send-unconfirmed") else {
+        return;
+    };
+    srv.new_session("fast");
+    let (client, _notif) = ControlClient::spawn(srv.config("fast"))
+        .await
+        .expect("spawn");
+
+    client
+        .send_keys_unconfirmed("%0", &["true", "Enter"])
+        .await
+        .expect("queue keys");
+    let reply = client
+        .command("display-message -p correlation-ok")
+        .await
+        .expect("later command reply");
+    assert_eq!(reply, vec!["correlation-ok"]);
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn backtab_key_name_delivers_shift_tab_bytes() {
+    let Some(srv) = TestServer::new("backtab") else {
+        return;
+    };
+    srv.new_session("keys");
+    let (client, _notif) = ControlClient::spawn(srv.config("keys"))
+        .await
+        .expect("spawn");
+
+    client
+        .send_keys(
+            "%0",
+            &["stty -echo -icanon min 1 time 0; od -An -tx1 -N3", "Enter"],
+        )
+        .await
+        .expect("start byte reader");
+    for _ in 0..100 {
+        if matches!(
+            client
+                .display("%0", "#{pane_current_command}")
+                .await
+                .as_deref(),
+            Ok("od")
+        ) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    client
+        .send_keys_unconfirmed("%0", &["BTab"])
+        .await
+        .expect("send BackTab");
+
+    let mut capture = String::new();
+    for _ in 0..100 {
+        capture = client.capture_pane("%0").await.expect("capture");
+        if contains_csi_z_hex(&capture) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        contains_csi_z_hex(&capture),
+        "BTab should arrive as CSI Z: {capture:?}"
+    );
     client.shutdown().await;
 }
 

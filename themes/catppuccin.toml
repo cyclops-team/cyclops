@@ -33,3 +33,9 @@ healthy = { hex = "#a6e3a1", c256 = 151 }
 needs_you = { hex = "#f9e2af", c256 = 223 }
 terminal = { hex = "#f38ba8", c256 = 211 }
 quiet = { hex = "#6c7086", c256 = 243 }
+
+# The workspace chrome's grounds: Catppuccin mocha base and surface0.
+[chrome]
+text = { hex = "#cdd6f4", c256 = 189 }
+panel = { hex = "#1e1e2e", c256 = 235 }
+raised = { hex = "#313244", c256 = 237 }

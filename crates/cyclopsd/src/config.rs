@@ -191,6 +191,10 @@ impl Config {
                         if cfg.chrome { "on" } else { "off" }
                     )),
                 },
+                // Owned by cyclops-workspace. Recognize the table so one
+                // shared config file does not make the daemon warn about
+                // another shipped binary's settings.
+                "workspace" => {}
                 unknown => warnings.push(format!("unknown config key `{unknown}` ignored")),
             }
         }
@@ -237,6 +241,10 @@ tmux_config = "/dev/null"
 manifest_dir = "/private/tmp/manifests"
 theme = "dark"
 default_workspace = "main"
+[workspace]
+sidebar_width = 28
+[workspace.bindings]
+next_tab = "Alt+n"
 "#;
         let (cfg, warnings) = Config::parse(text, Path::new("/private/tmp/home")).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");

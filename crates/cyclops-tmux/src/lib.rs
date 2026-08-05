@@ -62,18 +62,26 @@
 pub mod control;
 pub mod error;
 pub mod focus;
+pub mod hydration;
 pub mod layout;
 pub mod notify;
 pub mod quote;
+pub mod session;
 pub mod version;
 pub mod watcher;
 
 mod cmd;
 
+pub use cmd::session_target;
 pub use control::{ControlClient, ControlConfig, ControlMode};
 pub use error::TmuxError;
 pub use focus::focus_pane;
+pub use hydration::HydrationBundle;
 pub use notify::Notification;
 pub use quote::quote_arg;
+pub use session::{
+    active_pane, list_panes, list_sessions, list_window_memberships, list_windows, SessionRow,
+    WindowMembership, WindowPaneRow, WindowRow,
+};
 pub use version::TmuxVersion;
 pub use watcher::{PaneEvent, PaneField, PaneRow, SessionWatcher};

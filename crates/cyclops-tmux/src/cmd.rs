@@ -57,6 +57,6 @@ pub(crate) fn run(
 /// Without the `=`, tmux accepts a prefix match, so a command aimed at
 /// session "main" lands on "mainly" when "main" is gone. Every command
 /// here that names a session names it this way.
-pub(crate) fn session_target(session: &str) -> String {
+pub fn session_target(session: &str) -> String {
     format!("={session}")
 }
