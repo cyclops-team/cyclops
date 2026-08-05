@@ -181,7 +181,15 @@ impl DecorationSnapshot {
 
 /// Fetch decoration from cyclopsd on reconcile. Attention is consumed, never
 /// recomputed here.
-pub fn fetch_decoration(home: &Path) -> DecorationSnapshot {
+///
+/// `None` is a failed ASK, not an answer of "no agents", and the difference
+/// matters: every sidebar row and pane label is filtered on a pane carrying
+/// a label or a manifest, so rendering an empty snapshot un-names every
+/// agent on screen. One fetch runs per pushed daemon event, and a pane
+/// split or a border drag pushes a burst of them, so a single refused
+/// connection under that load used to blank the roster and let it pop back
+/// a frame later. A caller with a previous snapshot should keep it.
+pub fn fetch_decoration(home: &Path) -> Option<DecorationSnapshot> {
     crate::daemon::status(
         home,
         StatusParams {
@@ -192,7 +200,7 @@ pub fn fetch_decoration(home: &Path) -> DecorationSnapshot {
         let display_names = manifest_display_names(home);
         snapshot_from_status(&status, &display_names)
     })
-    .unwrap_or_default()
+    .ok()
 }
 
 fn snapshot_from_status(
@@ -442,6 +450,22 @@ mod tests {
     fn offline_snapshot_is_empty() {
         let snap = DecorationSnapshot::default();
         assert!(!snap.online);
+    }
+
+    /// A fetch that cannot reach the daemon must be distinguishable from a
+    /// daemon reporting no agents, or a caller holding a good roster has no
+    /// way to keep it.
+    #[test]
+    fn a_failed_fetch_is_no_answer_not_an_empty_roster() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-decoration-unreachable");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("home");
+        // Nothing is bound at <home>/sock, so the status call cannot answer.
+        assert!(
+            fetch_decoration(&home).is_none(),
+            "an unreachable daemon must not read as an empty roster"
+        );
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

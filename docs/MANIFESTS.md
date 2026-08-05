@@ -4,9 +4,10 @@ Everything cyclops knows about an agent CLI is one TOML file: which
 processes it runs as, how to tell working from idle by looking at the pane,
 and how to type into it. No code, no plugin, no wrapper around the CLI.
 
-Three ship inside the `cyclops` binary and land in `~/.cyclops/manifests`
-on your first `cyclops start`: `claude.toml`, `codex.toml`, `agy.toml`.
-Their source is [`manifests/`](../manifests/). A fourth is three steps away.
+Four ship inside the `cyclops` binary and land in `~/.cyclops/manifests`
+on your first `cyclops start`: `claude.toml`, `codex.toml`, `agy.toml`,
+`cursor.toml`. Their source is [`manifests/`](../manifests/). A fifth is
+three steps away.
 
 ## Add one
 

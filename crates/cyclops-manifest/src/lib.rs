@@ -708,7 +708,7 @@ verify_pattern = ["<message_id>"]
     fn shipped_manifests_load() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../manifests");
         let all = load_dir(&dir).unwrap();
-        for id in ["claude", "codex", "agy"] {
+        for id in ["claude", "codex", "agy", "cursor"] {
             let m = all
                 .get(id)
                 .unwrap_or_else(|| panic!("missing manifest {id}"));

@@ -10,7 +10,8 @@ cyclops isn't running. Start it with: cyclops start
 ```
 
 Nothing is listening on `$CYCLOPS_HOME/sock`. `cyclops start` starts one,
-and if starting it fails it says why rather than leaving you here.
+and so does bare `cyclops`; if starting it fails either says why rather
+than leaving you here.
 
 If one was running and died, `cyclops daemon log` is where it wrote its
 reason. `CYCLOPS_LOG=debug` says more on the next run.
@@ -102,7 +103,7 @@ order once the pane is ready. A receipt is the state at the instant you
 asked; `cyclops history` is where each delivery actually ended up.
 [send.md](send.md).
 
-## "no manifest \"cluade\"; loaded: agy, claude, codex"
+## "no manifest \"cluade\"; loaded: agy, claude, codex, cursor"
 
 A typo, or a manifest the daemon has not read. The list is what it has.
 Adding a file needs a `cyclopsd` restart: manifests are read once at boot.

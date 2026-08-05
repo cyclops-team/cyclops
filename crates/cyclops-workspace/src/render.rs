@@ -30,7 +30,9 @@ use crate::theme::{self, Paint};
 /// dialog.
 fn dialog_parts(dialog: &Dialog) -> (&str, Option<&str>, Option<&str>, &'static str) {
     match dialog {
-        Dialog::ConfirmClosePane { .. } => (copy::CONFIRM_CLOSE_PANE, None, None, copy::BUTTON_YES),
+        Dialog::ConfirmClosePane { .. } => {
+            (copy::CONFIRM_CLOSE_PANE, None, None, copy::BUTTON_CONFIRM)
+        }
         Dialog::NewTab { buffer } => (
             copy::NEW_TAB_TITLE,
             Some(buffer),
@@ -49,16 +51,21 @@ fn dialog_parts(dialog: &Dialog) -> (&str, Option<&str>, Option<&str>, &'static 
             None,
             copy::BUTTON_SAVE,
         ),
-        Dialog::ConfirmCloseTab { .. } => (copy::CONFIRM_CLOSE_TAB, None, None, copy::BUTTON_YES),
+        Dialog::ConfirmCloseTab { .. } => {
+            (copy::CONFIRM_CLOSE_TAB, None, None, copy::BUTTON_CONFIRM)
+        }
         Dialog::RenameWorkspace { buffer, .. } => (
             copy::RENAME_WORKSPACE_PROMPT,
             Some(buffer),
             None,
             copy::BUTTON_SAVE,
         ),
-        Dialog::ConfirmCloseWorkspace { .. } => {
-            (copy::CONFIRM_CLOSE_WORKSPACE, None, None, copy::BUTTON_YES)
-        }
+        Dialog::ConfirmCloseWorkspace { .. } => (
+            copy::CONFIRM_CLOSE_WORKSPACE,
+            None,
+            None,
+            copy::BUTTON_CONFIRM,
+        ),
         Dialog::Keybinds { .. } => unreachable!("keybinds uses its own dialog renderer"),
     }
 }
@@ -162,32 +169,18 @@ pub fn paint_dialog(
             .render(error_area, buf);
     }
     // Keyboard-first actions on the last inner row, recorded for the mouse.
-    // Destructive dialogs make the safe Enter/Escape path primary.
+    // Enter confirms every modal and Escape cancels it, so one shape covers
+    // input dialogs and destructive confirms alike.
     let button_y = inner.y + inner.height.saturating_sub(1);
     let mut bx = inner.x + 1;
-    let buttons = if dialog.has_input() {
-        [
-            (format!("↵ {confirm_label}"), HitTarget::DialogConfirm, true),
-            (
-                format!("Esc {}", copy::BUTTON_CANCEL),
-                HitTarget::DialogCancel,
-                false,
-            ),
-        ]
-    } else {
-        [
-            (
-                format!("Y {confirm_label}"),
-                HitTarget::DialogConfirm,
-                false,
-            ),
-            (
-                format!("↵ / Esc {}", copy::BUTTON_CANCEL),
-                HitTarget::DialogCancel,
-                true,
-            ),
-        ]
-    };
+    let buttons = [
+        (format!("↵ {confirm_label}"), HitTarget::DialogConfirm, true),
+        (
+            format!("Esc {}", copy::BUTTON_CANCEL),
+            HitTarget::DialogCancel,
+            false,
+        ),
+    ];
     for (text, target, primary) in buttons {
         let bw = Span::raw(text.as_str()).width() as u16;
         let available = inner.x.saturating_add(inner.width).saturating_sub(bx);
@@ -418,6 +411,7 @@ pub fn paint_sidebar(
     paint: &Paint,
     hits: &mut HitMap,
     decoration: &DecorationSnapshot,
+    hover: Option<(u16, u16)>,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -591,13 +585,43 @@ pub fn paint_sidebar(
         let plus_x = content
             .x
             .saturating_add(content.width.saturating_sub(plus_width));
+        // The button keeps one width whether or not it is pointed at, so
+        // the target never moves out from under the mouse that found it.
+        let hovered = hover.is_some_and(|(hover_col, hover_row)| {
+            hover_row == menu_row.y
+                && hover_col >= plus_x
+                && hover_col < plus_x.saturating_add(plus_width)
+        });
+        if hovered {
+            // Say what it makes, in the gutter the footer already leaves
+            // between the menu label and the button. Skipped rather than
+            // truncated when the sidebar is too narrow: half a word next to
+            // a lit button teaches nothing.
+            let hint_width =
+                u16::try_from(Span::raw(copy::NEW_WORKSPACE_HINT).width()).unwrap_or(u16::MAX);
+            let gutter = plus_x.saturating_sub(content.x.saturating_add(menu_width));
+            if hint_width < gutter {
+                overlay_text(
+                    buf,
+                    content,
+                    plus_x.saturating_sub(hint_width),
+                    menu_row.y,
+                    copy::NEW_WORKSPACE_HINT,
+                    theme::sidebar_label(paint),
+                );
+            }
+        }
         overlay_text(
             buf,
             content,
             plus_x,
             menu_row.y,
             plus,
-            theme::add_button(paint),
+            if hovered {
+                theme::add_button_hover(paint)
+            } else {
+                theme::add_button(paint)
+            },
         );
         hits.push(
             Rect::new(plus_x, menu_row.y, plus_width, 1),
@@ -757,13 +781,14 @@ pub fn paint_window(
     for slot in &slots {
         paint_pane_slot(slot, runtimes, buf, paint, ctx);
     }
+    let frames = outer_frames(&slots);
     // Every pane owns a quiet boundary. Paint the focused pane last so its
     // accent wins where nested borders intersect.
-    for slot in slots.iter().filter(|slot| !slot.focused) {
-        paint_pane_frame(slot, canvas, buf, paint, ctx);
+    for (slot, frame) in slots.iter().zip(&frames).filter(|(slot, _)| !slot.focused) {
+        paint_pane_frame(slot, *frame, canvas, buf, paint, ctx);
     }
-    for slot in slots.iter().filter(|slot| slot.focused) {
-        paint_pane_frame(slot, canvas, buf, paint, ctx);
+    for (slot, frame) in slots.iter().zip(&frames).filter(|(slot, _)| slot.focused) {
+        paint_pane_frame(slot, *frame, canvas, buf, paint, ctx);
     }
     // Shared pane borders are resize handles. Put divider regions above the
     // generic frame regions, then restore the visibly overlaid controls as
@@ -775,6 +800,65 @@ pub fn paint_window(
     if let Some(drag) = ctx.drag.filter(|d| d.is_active()) {
         paint_drag_preview(drag, buf, paint);
     }
+}
+
+/// The border box for each slot: its own rect, grown to the shared outer
+/// edge on any axis where no sibling lies beyond it.
+///
+/// The pane area has to read as one rectangle, and without this it does
+/// not. tmux gives every column the same height, but a column expands one
+/// screen cell per split into two (`PANE_GAPS`), so a column carrying three
+/// panes needs more chrome rows than a column carrying one.
+/// [`layout_gap_overhead`] reserves that difference from the deepest branch,
+/// which leaves every shallower branch finishing that many cells short and
+/// the deepest one looking like it overhangs the rest.
+///
+/// Only the border moves. Leaf content rects stay exactly the size tmux
+/// reported, because a live child terminal maps one runtime cell to one
+/// screen cell and cropping or stretching it would corrupt what it drew —
+/// the surplus simply becomes gutter inside the box, which is already how
+/// this renderer treats every cell tmux does not own.
+fn outer_frames(slots: &[PaneSlot]) -> Vec<Rect> {
+    let edge_right = slots
+        .iter()
+        .map(|slot| slot.rect.x + slot.rect.width)
+        .max()
+        .unwrap_or(0);
+    let edge_bottom = slots
+        .iter()
+        .map(|slot| slot.rect.y + slot.rect.height)
+        .max()
+        .unwrap_or(0);
+    slots
+        .iter()
+        .map(|slot| {
+            let own = slot.rect;
+            let shares_rows =
+                |other: &Rect| other.y < own.y + own.height && own.y < other.y + other.height;
+            let shares_cols =
+                |other: &Rect| other.x < own.x + own.width && own.x < other.x + other.width;
+            let has_pane_below = slots
+                .iter()
+                .any(|o| o.rect.y >= own.y + own.height && shares_cols(&o.rect));
+            let has_pane_beyond = slots
+                .iter()
+                .any(|o| o.rect.x >= own.x + own.width && shares_rows(&o.rect));
+            Rect::new(
+                own.x,
+                own.y,
+                if has_pane_beyond {
+                    own.width
+                } else {
+                    edge_right.saturating_sub(own.x)
+                },
+                if has_pane_below {
+                    own.height
+                } else {
+                    edge_bottom.saturating_sub(own.y)
+                },
+            )
+        })
+        .collect()
 }
 
 /// Divider gap cells stay grabbable for resize even though they paint as
@@ -901,12 +985,15 @@ fn paint_pane_slot(
 /// layout legible.
 fn paint_pane_frame(
     slot: &PaneSlot,
+    frame: Rect,
     bounds: Rect,
     buf: &mut Buffer,
     paint: &Paint,
     ctx: &mut WindowPaintCtx<'_>,
 ) {
-    let vis = slot.rect;
+    // The frame, not the content rect: a box grown out to the shared edge
+    // must stay grabbable over the whole boundary it actually draws.
+    let vis = frame;
     let border_style = if slot.focused {
         theme::pane_border_focused(paint)
     } else {
@@ -1484,6 +1571,72 @@ mod tests {
         assert_eq!(buf[(20, 11)].symbol(), "─", "every pane has a border");
     }
 
+    fn frame_slot(pane_id: &str, rect: Rect) -> PaneSlot {
+        PaneSlot {
+            pane_id: pane_id.into(),
+            rect,
+            focused: false,
+        }
+    }
+
+    /// A column split three ways spends more rows on separator bands than
+    /// its single-pane sibling, so tmux's equal columns paint unequal boxes
+    /// and the deep one reads as overhanging the rest.
+    #[test]
+    fn outermost_boxes_close_on_one_shared_bottom_edge() {
+        let slots = vec![
+            frame_slot("%0", Rect::new(0, 0, 40, 18)),
+            frame_slot("%1", Rect::new(42, 0, 40, 5)),
+            frame_slot("%2", Rect::new(42, 7, 40, 5)),
+            frame_slot("%3", Rect::new(42, 14, 40, 6)),
+        ];
+        let frames = outer_frames(&slots);
+
+        let shallow = frames[0].y + frames[0].height;
+        let deep = frames[3].y + frames[3].height;
+        assert_eq!(
+            shallow, deep,
+            "the single-pane column must close on the same row as the three-pane column"
+        );
+        assert_eq!(
+            frames[0].width, 40,
+            "a pane with a sibling beyond it keeps its own right edge"
+        );
+        assert_eq!(
+            frames[1].height, 5,
+            "a pane with a sibling below it keeps its own bottom edge"
+        );
+        for (slot, frame) in slots.iter().zip(&frames) {
+            assert!(
+                frame.width >= slot.rect.width && frame.height >= slot.rect.height,
+                "a frame only ever grows past its content, never crops it"
+            );
+        }
+    }
+
+    /// The identical bug on the other axis: a row split three ways beside a
+    /// single pane must still close on one right edge.
+    #[test]
+    fn outermost_boxes_close_on_one_shared_right_edge() {
+        let slots = vec![
+            frame_slot("%0", Rect::new(0, 0, 18, 40)),
+            frame_slot("%1", Rect::new(0, 42, 5, 40)),
+            frame_slot("%2", Rect::new(7, 42, 5, 40)),
+            frame_slot("%3", Rect::new(14, 42, 6, 40)),
+        ];
+        let frames = outer_frames(&slots);
+
+        assert_eq!(
+            frames[0].x + frames[0].width,
+            frames[3].x + frames[3].width,
+            "both rows must end on the same column"
+        );
+        assert_eq!(
+            frames[1].width, 5,
+            "a pane with a sibling beyond it keeps its own right edge"
+        );
+    }
+
     #[test]
     fn pane_canvas_insets_by_the_margin() {
         assert_eq!(pane_canvas(Rect::new(0, 1, 40, 11)), Rect::new(1, 2, 38, 9));
@@ -1542,6 +1695,72 @@ mod tests {
         );
     }
 
+    /// The create button is a bare glyph at rest, so the mouse has to be
+    /// what explains it: pointing at it fills the button and names what it
+    /// makes, and the target must not move while being pointed at.
+    #[test]
+    fn sidebar_create_button_answers_the_mouse() {
+        let workspaces = vec![WorkspaceRow {
+            session_id: "$0".into(),
+            name: "cyclops".into(),
+            tab_count: 1,
+            active: true,
+            window_ids: vec!["@0".into()],
+        }];
+        let theme = Paint::for_test();
+        let expanded = std::collections::HashSet::from(["$0".to_string()]);
+
+        let draw = |hover: Option<(u16, u16)>| {
+            let mut term = Terminal::new(TestBackend::new(20, 8)).unwrap();
+            let mut hits = HitMap::default();
+            term.draw(|f| {
+                paint_sidebar(
+                    &workspaces,
+                    0,
+                    "%0",
+                    &expanded,
+                    &[],
+                    f.area(),
+                    f.buffer_mut(),
+                    &theme,
+                    &mut hits,
+                    &DecorationSnapshot::default(),
+                    hover,
+                );
+            })
+            .unwrap();
+            let buf = term.backend().buffer().clone();
+            (buf, hits)
+        };
+
+        let (rest_buf, rest_hits) = draw(None);
+        let plus = (0..rest_buf.area.width)
+            .flat_map(|x| (0..rest_buf.area.height).map(move |y| (x, y)))
+            .find(|&(x, y)| matches!(rest_hits.hit(x, y), Some(HitTarget::NewWorkspaceButton)))
+            .expect("the sidebar paints a create button");
+
+        let (hot_buf, hot_hits) = draw(Some(plus));
+        assert_eq!(
+            hot_hits.hit(plus.0, plus.1).cloned(),
+            rest_hits.hit(plus.0, plus.1).cloned(),
+            "the button must not move out from under the mouse that found it"
+        );
+        assert_ne!(
+            hot_buf[plus].style(),
+            rest_buf[plus].style(),
+            "pointing at the create button must change how it paints"
+        );
+        assert!(
+            flatten(&hot_buf).contains(copy::NEW_WORKSPACE_HINT),
+            "hovering should name what the button makes: {}",
+            flatten(&hot_buf)
+        );
+        assert!(
+            !flatten(&rest_buf).contains(copy::NEW_WORKSPACE_HINT),
+            "the hint belongs to hover, not to the resting sidebar"
+        );
+    }
+
     #[test]
     fn sidebar_rows_render_and_hit_test_aligned() {
         let workspaces = vec![
@@ -1577,6 +1796,7 @@ mod tests {
                 &theme,
                 &mut hits,
                 &DecorationSnapshot::default(),
+                None,
             );
         })
         .unwrap();
@@ -1670,6 +1890,7 @@ mod tests {
                 &theme,
                 &mut hits,
                 &decoration,
+                None,
             );
         })
         .unwrap();
@@ -1979,10 +2200,10 @@ mod tests {
         .unwrap();
         let flat = flatten(term.backend().buffer());
         assert!(flat.contains("Close this pane"));
-        assert!(flat.contains("Y Yes"), "confirm key is visible: {flat}");
+        assert!(flat.contains("↵ Confirm"), "confirm key is visible: {flat}");
         assert!(
-            flat.contains("↵ / Esc Cancel"),
-            "safe default is visibly primary: {flat}"
+            flat.contains("Esc Cancel"),
+            "cancel action is visible: {flat}"
         );
     }
 

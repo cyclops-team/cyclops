@@ -318,7 +318,7 @@ poll around it (F23).
 **Rejected:** writing `role • state` into the pane title, which the brief
 originally asked for.
 
-**Why:** two of the three shipped manifests read `#{pane_title}` as a
+**Why:** two of the four shipped manifests read `#{pane_title}` as a
 sensor, and Claude's spinner rules ARE the title tier. Writing the title
 would blind detection to paint decoration, feed Cyclops's own decoration
 back into its own sensor (F13), and lose the race to any agent that

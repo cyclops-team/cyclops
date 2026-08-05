@@ -1,0 +1,39 @@
+briosolivares@Brioss-MacBook-Pro-3 curdemo % agent
+
+  [33m╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮[39m
+  [33m│[39m                                                                                                                  [33m│[39m
+  [33m│[39m  [1m[33m⚠ [39mWorkspace Trust Required[0m                                                                                      [33m│[39m
+  [33m│[39m                                                                                                                  [33m│[39m
+  [33m│[39m  Cursor Agent can execute code and access files in this directory.                                               [33m│[39m
+  [33m│[39m                                                                                                                  [33m│[39m
+  [33m│[39m  Do you trust the contents of this directory?                                                                    [33m│[39m
+  [33m│[39m                                                                                                                  [33m│[39m
+  [33m│[39m    [1m[36m/private/tmp/curdemo[0m                                                                                          [33m│[39m
+  [33m│[39m                                                                                                                  [33m│[39m
+  [33m│[39m                                                                                                                  [33m│[39m
+  [33m│[39m  [2m  [a] Trust this workspace[0m                                                                                      [33m│[39m
+  [33m│[39m  [2m  [q] Quit[0m                                                                                                      [33m│[39m
+  [33m│[39m                                                                                                                  [33m│[39m
+  [33m│[39m  [34m⏳ Trusting workspace...[39m                                                                                        [33m│[39m
+  [33m│[39m                                                                                                                  [33m│[39m
+  [33m╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯[39m
+
+
+  Cursor Agent
+  [2mv2026.07.23-e383d2b[0m
+  [2mTip: Type ? in the prompt bar to show in-app hints.[0m
+
+
+
+ [48;2;21;21;21m                                                                                                                      [49m
+ [48;2;21;21;21m [2m→ [0;7m[48;2;21;21;21mP[0;2m[48;2;21;21;21mlan, search, build anything[0m[48;2;21;21;21m                                                                                       [49m
+ [48;2;21;21;21m                                                                                                                      [49m
+
+  [2mCursor Grok 4.5 High[0m                                                                                  [35mRun Everything[39m
+  [2m/private/tmp/curdemo · main[0m
+
+
+
+
+
+

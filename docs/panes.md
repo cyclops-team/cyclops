@@ -123,7 +123,7 @@ An unknown name is refused and the loaded ones are listed:
 
 ```
 $ cyclops name %4 reviewer --manifest cluade
-no manifest "cluade"; loaded: agy, claude, codex
+no manifest "cluade"; loaded: agy, claude, codex, cursor
 ```
 
 ## The border

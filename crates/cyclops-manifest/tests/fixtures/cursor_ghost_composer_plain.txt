@@ -1,0 +1,39 @@
+briosolivares@Brioss-MacBook-Pro-3 curdemo % agent
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │                                                                                                                  │
+  │  ⚠ Workspace Trust Required                                                                                      │
+  │                                                                                                                  │
+  │  Cursor Agent can execute code and access files in this directory.                                               │
+  │                                                                                                                  │
+  │  Do you trust the contents of this directory?                                                                    │
+  │                                                                                                                  │
+  │    /private/tmp/curdemo                                                                                          │
+  │                                                                                                                  │
+  │                                                                                                                  │
+  │    [a] Trust this workspace                                                                                      │
+  │    [q] Quit                                                                                                      │
+  │                                                                                                                  │
+  │  ⏳ Trusting workspace...                                                                                        │
+  │                                                                                                                  │
+  ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+  Cursor Agent
+  v2026.07.23-e383d2b
+  Tip: Type ? in the prompt bar to show in-app hints.
+
+
+
+
+  → Plan, search, build anything
+
+
+  Cursor Grok 4.5 High                                                                                  Run Everything
+  /private/tmp/curdemo · main
+
+
+
+
+
+

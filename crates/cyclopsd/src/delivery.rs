@@ -580,7 +580,7 @@ pub(crate) fn admin_notify(
     };
     let sessions: Vec<usize> = match session_idx {
         Some(i) => vec![i],
-        None => (0..inner.sessions.len()).collect(),
+        None => (0..inner.session_count()).collect(),
     };
     let mut first_seq = None;
     for idx in sessions {
@@ -767,7 +767,7 @@ pub(crate) async fn msg_send(
     from: &str,
     params: MsgSendParams,
 ) -> Result<Value, WireError> {
-    if inner.sessions.is_empty() {
+    if inner.session_count() == 0 {
         return Err(wire_err("no_such_target", "no sessions are watched"));
     }
     let typed = expand_recipients(inner, &params.to)?;
@@ -2267,8 +2267,7 @@ async fn await_ack(
     let (id_patterns, other_patterns) = verify_patterns(manifest, &handle.msg_id);
     let patterns: Vec<String> = id_patterns.into_iter().chain(other_patterns).collect();
     let session_name = inner
-        .sessions
-        .get(handle.session_idx)
+        .session(handle.session_idx)
         .map(|s| s.name.clone())
         .unwrap_or_default();
     let mut ev_rx = inner.events.subscribe();
@@ -2623,8 +2622,7 @@ fn occupant_of(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) -> Option<
         return w.pane(pane_id);
     }
     inner
-        .sessions
-        .get(session_idx)?
+        .session(session_idx)?
         .last_panes
         .lock()
         .expect("last panes lock")
@@ -2677,8 +2675,7 @@ pub(crate) async fn wait_pinned(
         waited_ms: started.elapsed().as_millis() as u64,
     };
     let session_name = inner
-        .sessions
-        .get(session_idx)
+        .session(session_idx)
         .map(|s| s.name.clone())
         .unwrap_or_default();
     // Subscribe before the first read so no edge can fall between.

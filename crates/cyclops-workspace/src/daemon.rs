@@ -106,6 +106,23 @@ pub fn pane_has_agent(home: &Path, pane_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Ask cyclopsd to watch a session it was not booted with.
+///
+/// `sessions` in config.toml is the daemon's BOOT set, and a workspace this
+/// UI creates is never in it. An unwatched session has no pane table at all,
+/// so nothing in it can be detected, named, or given a state: its sidebar
+/// row would stay empty for as long as the daemon runs.
+///
+/// Callers ask once per session id and never again. A tmux control
+/// connection survives a session rename — the daemon holds the session
+/// object, not its name — so re-asking under the new name would build a
+/// second slot naming something nothing answers to, and leave its watcher
+/// retrying an attach for the daemon's whole life.
+pub fn watch_session(home: &Path, session: &str) -> Result<(), String> {
+    request(home, "session.watch", json!({"session": session}))?;
+    Ok(())
+}
+
 /// Assign the pane's Cyclops identity. Detection remains the daemon's job;
 /// omitting `manifest` preserves the CLI's normal auto-detection behavior.
 pub fn label_pane(home: &Path, pane_id: &str, label: &str) -> Result<(), String> {

@@ -498,12 +498,37 @@ fn run(cli: &Cli) -> i32 {
     match &cli.cmd {
         None => {
             if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+                ensure_daemon_for_workspace();
                 cyclops_workspace::run()
             } else {
                 cyclops_workspace::print_help_and_exit()
             }
         }
         Some(cmd) => run_cmd(cli, cmd),
+    }
+}
+
+/// Bare `cyclops` opens the workspace, and the workspace is only decorated
+/// by what the daemon reports: without one, every agent reads unknown, no
+/// pane is detected, and no state ever changes. That is indistinguishable
+/// from a broken build, so the front door starts a daemon the same way
+/// `cyclops start` does rather than leaving it to a second command.
+///
+/// Unlike `start`, this runs before the session exists, because the
+/// workspace creates or attaches its own session after this returns. The
+/// cost is the daemon's attach retry rather than an immediate attach; it
+/// converges within seconds, and the workspace asks it to watch whatever
+/// session it lands on (`session.watch`) regardless of what was configured.
+///
+/// A failure is a note, not an exit. The workspace is still usable without
+/// a daemon, and its sidebar says `cyclopsd offline` for as long as none
+/// answers, so the state is never silently wrong. Boot failures write their
+/// own reason to the daemon log; this only has to carry the ones that never
+/// got as far as a running daemon.
+fn ensure_daemon_for_workspace() {
+    let home = cyclops_proto::cyclops_home();
+    if let Err(why) = daemon::ensure_running(&home) {
+        eprintln!("{why}");
     }
 }
 

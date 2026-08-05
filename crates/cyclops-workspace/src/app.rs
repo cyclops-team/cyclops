@@ -50,6 +50,19 @@ use crate::theme::Paint;
 /// At most one frame per 8 ms (~120 Hz). The timer exists only after an
 /// event; idle workspaces still have no wakeups.
 const RENDER_DEBOUNCE: Duration = Duration::from_millis(8);
+/// How long after pane output a folder-following workspace re-reads its
+/// pane's directory.
+///
+/// It has to be a DELAY, not a render-time check. There is no tmux
+/// notification for a `cd`, so the only signal is the pane output the
+/// command produces — and the first of that output is the shell echoing the
+/// line the user typed, which arrives before the shell has run `chdir`.
+/// MEASURED: probing on that edge reads the old path every time, and a pane
+/// that then sits idle produces no further output, so the name never catches
+/// up. Waiting lets the shell land first. One armed probe at a time, never
+/// pushed back, so a noisy pane costs one tmux round trip per interval and
+/// an idle workspace costs no wakeups at all.
+const FOLDER_PROBE_DELAY: Duration = Duration::from_millis(600);
 const TAB_BAR_HEIGHT: u16 = 1;
 const EVENT_STREAM_WIDTH: u16 = 40;
 const SIDEBAR_MIN_WIDTH: u16 = 22;
@@ -111,6 +124,13 @@ struct App {
     prefs: WorkspacePrefs,
     /// Stable session ids whose agent children are visible in the sidebar.
     expanded_workspaces: HashSet<String>,
+    /// The session id the sidebar last auto-expanded for. Only a CHANGE
+    /// opens a row; see [`expand_active_workspace`].
+    expanded_for: Option<String>,
+    /// Session ids cyclopsd has already been asked to watch. Keyed by id,
+    /// not name, so a folder-following rename never asks twice; see
+    /// [`crate::daemon::watch_session`].
+    watched_sessions: HashSet<String>,
     event_stream_open: bool,
     event_lines: Vec<String>,
     term_size: (u16, u16),
@@ -125,6 +145,9 @@ struct App {
     needs_hydrate: bool,
     paste_seq: u64,
     home: std::path::PathBuf,
+    /// When the next folder probe is due. `None` means none is armed; see
+    /// [`arm_folder_probe`].
+    folder_probe_at: Option<Instant>,
 }
 
 /// Chrome rectangles for one frame.
@@ -442,9 +465,13 @@ pub async fn run_async() -> i32 {
         hover: None,
         selection: SelectionState::default(),
         drag: None,
-        decoration: decoration::fetch_decoration(&home),
+        // Nothing to fall back to on the first frame: no answer here is
+        // genuinely "nothing known yet", which is what the default says.
+        decoration: decoration::fetch_decoration(&home).unwrap_or_default(),
         prefs: prefs.clone(),
         expanded_workspaces,
+        expanded_for: None,
+        watched_sessions: HashSet::new(),
         event_stream_open: false,
         event_lines: Vec::new(),
         term_size,
@@ -453,8 +480,14 @@ pub async fn run_async() -> i32 {
         needs_hydrate: false,
         paste_seq: 0,
         home,
+        folder_probe_at: None,
     };
     app.model.sidebar_visible = prefs.sidebar_visible;
+    // Bare `cyclops` can boot a session config.toml never mentions, so the
+    // very first frame is already a frame the daemon may not be watching
+    // for. Ask before drawing it.
+    ensure_sessions_watched(&mut app);
+    app.decoration = decoration::fetch_decoration(&app.home).unwrap_or_default();
     app.refresh_event_lines();
 
     let mut debounce: Option<Instant> = None;
@@ -462,10 +495,10 @@ pub async fn run_async() -> i32 {
     let mut detached = false;
     let _ = draw(&mut terminal, &mut app);
     while !detached {
-        let next_deadline = match (debounce, reconnect_deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        let next_deadline = [debounce, reconnect_deadline, app.folder_probe_at]
+            .into_iter()
+            .flatten()
+            .min();
         match next_wake(&mut rx, next_deadline).await {
             Wake::Message(msg) => {
                 if !handle_app_msg(
@@ -508,6 +541,12 @@ pub async fn run_async() -> i32 {
                         }
                     }
                     let _ = draw(&mut terminal, &mut app);
+                }
+                if app.folder_probe_at.is_some_and(|due| due <= now) {
+                    app.folder_probe_at = None;
+                    if let Err(e) = follow_workspace_folder(&mut app, &client).await {
+                        log_err(&app.home, &e);
+                    }
                 }
                 if reconnect_deadline.is_some_and(|deadline| deadline <= now) {
                     reconnect_deadline = None;
@@ -655,7 +694,15 @@ fn spawn_decoration_forwarder(home: std::path::PathBuf, tx: mpsc::UnboundedSende
             if value.get("event").is_none() {
                 continue;
             }
-            let snapshot = decoration::fetch_decoration(&home);
+            // A refused or timed-out status call is doubt about this
+            // instant, not news about the roster; the subscription is still
+            // up, so the next event asks again. Dropping it keeps the last
+            // known decoration on screen instead of un-naming every agent
+            // for a frame. A daemon that is really gone ends the read loop
+            // below, which is the one place "offline" is reported.
+            let Some(snapshot) = decoration::fetch_decoration(&home) else {
+                continue;
+            };
             if tx.send(AppMsg::DecorationChanged(snapshot)).is_err() {
                 return;
             }
@@ -758,6 +805,20 @@ impl App {
     fn persist_active(&self) {
         let tab = self.model.active_tab();
         set_last_active(&self.home, &self.model.session.session, &tab.window_id);
+    }
+
+    /// Whether this motion arrives on, or departs from, the sidebar's
+    /// create button. Both edges have to reach the renderer: one lights the
+    /// button, the other puts it out, and a filter that only let the
+    /// arrival through would leave it lit wherever the mouse went next.
+    fn motion_touches_new_workspace_button(&self, col: u16, row: u16) -> bool {
+        let on_button = |col: u16, row: u16| {
+            matches!(
+                self.hit_map.hit(col, row),
+                Some(HitTarget::NewWorkspaceButton)
+            )
+        };
+        on_button(col, row) || self.hover.is_some_and(|(col, row)| on_button(col, row))
     }
 
     fn open_menu(&mut self, menu: MenuState) {
@@ -975,6 +1036,7 @@ async fn handle_app_msg(
             }
             if changed {
                 arm(debounce);
+                arm_folder_probe(app);
             }
         }
         AppMsg::LinkLost => {
@@ -996,6 +1058,12 @@ async fn handle_app_msg(
             arm(debounce);
         }
         AppMsg::DecorationChanged(snapshot) => {
+            // A daemon that went away forgot every session it was asked to
+            // watch: those live in memory, not in config.toml. Dropping the
+            // record here is what makes the next reconcile ask again.
+            if !snapshot.online {
+                app.watched_sessions.clear();
+            }
             if migrate_agent_order_entries(&mut app.prefs.agent_order, &app.decoration, &snapshot) {
                 if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
                     log_err(&app.home, &error);
@@ -1007,10 +1075,13 @@ async fn handle_app_msg(
         }
         AppMsg::Mouse(mouse) => {
             // Bare motion only matters while a menu or dialog shows hover
-            // highlights; everywhere else it must not wake the renderer.
+            // highlights — or over the sidebar's create button, the one
+            // piece of resting chrome that answers the mouse. Everywhere
+            // else it must not wake the renderer.
             if matches!(mouse.kind, MouseEventKind::Moved)
                 && !app.menu.is_open()
                 && app.dialog.is_none()
+                && !app.motion_touches_new_workspace_button(mouse.column, mouse.row)
             {
                 return true;
             }
@@ -1816,7 +1887,94 @@ async fn new_workspace_here(
         .iter()
         .map(|w| w.name.clone())
         .collect();
-    intent::execute_new_workspace(client, &folder, &taken).await?;
+    let created = intent::execute_new_workspace(client, &folder, &taken).await?;
+    if !app.prefs.folder_tracked.contains(&created.session_id) {
+        app.prefs.folder_tracked.push(created.session_id);
+        if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
+            log_err(&app.home, &error);
+        }
+    }
+    app.needs_reconcile = true;
+    Ok(())
+}
+
+/// Arm one delayed folder probe, if the active workspace follows its folder
+/// and none is armed already.
+///
+/// Never pushes an armed probe back — the same rule [`arm`] follows for the
+/// render deadline, and for the same reason: a pane producing a steady
+/// stream of output would otherwise postpone the probe forever. Workspaces
+/// that do not follow a folder arm nothing, so they add no wakeups.
+fn arm_folder_probe(app: &mut App) {
+    if app.folder_probe_at.is_some() {
+        return;
+    }
+    let follows = app
+        .model
+        .workspaces
+        .get(app.model.active_workspace)
+        .is_some_and(|workspace| app.prefs.folder_tracked.contains(&workspace.session_id));
+    if follows {
+        app.folder_probe_at = Some(Instant::now() + FOLDER_PROBE_DELAY);
+    }
+}
+
+/// Keep a folder-following workspace's name on its pane's directory.
+///
+/// A `cd` produces no tmux notification, so there is nothing to subscribe
+/// to; what a `cd` DOES produce is pane output, and pane output is what
+/// arms the render deadline. Riding that deadline means the check happens
+/// exactly when the screen changed and never on a clock, rate-limited so a
+/// noisy pane cannot turn every frame into a tmux round trip.
+async fn follow_workspace_folder(
+    app: &mut App,
+    client: &ControlClient,
+) -> Result<(), cyclops_tmux::TmuxError> {
+    let Some(workspace) = app.model.workspaces.get(app.model.active_workspace) else {
+        return Ok(());
+    };
+    if !app.prefs.folder_tracked.contains(&workspace.session_id) {
+        return Ok(());
+    }
+    let session_id = workspace.session_id.clone();
+    let current_name = workspace.name.clone();
+
+    let pane = app.model.active_tab().active_pane.clone();
+    let Ok(cwd) = client.display(&pane, "#{pane_current_path}").await else {
+        // A transient tmux failure here must never be fatal — the next
+        // probe tries again.
+        return Ok(());
+    };
+
+    let taken: Vec<String> = app
+        .model
+        .workspaces
+        .iter()
+        .filter(|w| w.session_id != session_id)
+        .map(|w| w.name.clone())
+        .collect();
+    let Some(next) = intent::folder_rename(&current_name, cwd.trim(), &taken) else {
+        return Ok(());
+    };
+
+    intent::execute_rename_workspace(client, &current_name, &next).await?;
+
+    // The model addresses the active session BY NAME; skip this and the
+    // next reconcile queries a session that no longer exists. The sidebar
+    // row carries that same name, and the reconcile that refreshes it is a
+    // deadline away — leaving the stale name there would let the next probe
+    // rename a target tmux no longer knows.
+    if app.model.session.session == current_name {
+        app.model.session.session = next.clone();
+    }
+    if let Some(row) = app.model.workspaces.get_mut(app.model.active_workspace) {
+        row.name = next.clone();
+    }
+    if migrate_order_entry(&mut app.prefs.workspace_order, &current_name, &next) {
+        if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
+            log_err(&app.home, &error);
+        }
+    }
     app.needs_reconcile = true;
     Ok(())
 }
@@ -1974,7 +2132,7 @@ async fn menu_action(
     Ok(())
 }
 
-/// Apply the open dialog's action (Enter, `y`, or its confirm button).
+/// Apply the open dialog's action (Enter or its confirm button).
 async fn dialog_confirm(
     app: &mut App,
     client: &ControlClient,
@@ -2011,7 +2169,9 @@ async fn dialog_confirm(
         }
         app.dialog = None;
         app.hover = None;
-        app.decoration = decoration::fetch_decoration(&app.home);
+        if let Some(snapshot) = decoration::fetch_decoration(&app.home) {
+            app.decoration = snapshot;
+        }
         app.refresh_event_lines();
         return Ok(());
     }
@@ -2040,10 +2200,31 @@ async fn dialog_confirm(
             if !buffer.trim().is_empty() {
                 let name = buffer.trim();
                 intent::execute_rename_workspace(client, &session, name).await?;
-                if migrate_order_entry(&mut app.prefs.workspace_order, &session, name) {
+                let mut prefs_changed =
+                    migrate_order_entry(&mut app.prefs.workspace_order, &session, name);
+                // An explicit rename means the user owns the name now — a
+                // folder-following workspace must never be renamed out from
+                // under them again.
+                if let Some(session_id) = app
+                    .model
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.name == session)
+                    .map(|workspace| workspace.session_id.clone())
+                {
+                    let before = app.prefs.folder_tracked.len();
+                    app.prefs.folder_tracked.retain(|id| id != &session_id);
+                    prefs_changed |= app.prefs.folder_tracked.len() != before;
+                }
+                if prefs_changed {
                     if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
                         log_err(&app.home, &error);
                     }
+                }
+                // The model addresses the active session BY NAME; skip this
+                // and the reconcile that follows queries the old name.
+                if app.model.session.session == session {
+                    app.model.session.session = name.to_string();
                 }
                 app.needs_reconcile = true;
             }
@@ -2058,10 +2239,22 @@ async fn dialog_confirm(
             } else {
                 None
             };
+            let closed_session_id = app
+                .model
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.name == session)
+                .map(|workspace| workspace.session_id.clone());
             intent::execute_close_workspace(client, &session, fallback.as_deref()).await?;
-            let previous_len = app.prefs.workspace_order.len();
+            let previous_order_len = app.prefs.workspace_order.len();
             app.prefs.workspace_order.retain(|name| name != &session);
-            if app.prefs.workspace_order.len() != previous_len {
+            let previous_tracked_len = app.prefs.folder_tracked.len();
+            if let Some(session_id) = closed_session_id {
+                app.prefs.folder_tracked.retain(|id| id != &session_id);
+            }
+            if app.prefs.workspace_order.len() != previous_order_len
+                || app.prefs.folder_tracked.len() != previous_tracked_len
+            {
                 if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
                     log_err(&app.home, &error);
                 }
@@ -2142,9 +2335,10 @@ enum DialogKeyAction {
     Ignore,
 }
 
-/// Resolve dialog keys without mutating application state. Input dialogs
-/// submit on Enter; destructive `[y/N]` confirms keep No as the Enter
-/// default, so an accidental return key can never delete anything.
+/// Resolve dialog keys without mutating application state. Every modal
+/// confirms on Enter and cancels on Escape, so one key means the same thing
+/// in every dialog. The read-only keybinds sheet has nothing to confirm, so
+/// Enter dismisses it.
 fn dialog_key_action(dialog: &Dialog, key: &KeyEvent) -> DialogKeyAction {
     use crossterm::event::KeyCode;
 
@@ -2163,12 +2357,9 @@ fn dialog_key_action(dialog: &Dialog, key: &KeyEvent) -> DialogKeyAction {
     let text_key = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
     match key.code {
         KeyCode::Esc => DialogKeyAction::Cancel,
-        KeyCode::Enter if dialog.has_input() => DialogKeyAction::Confirm,
-        KeyCode::Enter => DialogKeyAction::Cancel,
+        KeyCode::Enter => DialogKeyAction::Confirm,
         KeyCode::Backspace if dialog.has_input() => DialogKeyAction::Backspace,
         KeyCode::Char(c) if dialog.has_input() && text_key => DialogKeyAction::Append(c),
-        KeyCode::Char('y' | 'Y') if text_key => DialogKeyAction::Confirm,
-        KeyCode::Char('n' | 'N') if text_key => DialogKeyAction::Cancel,
         _ => DialogKeyAction::Ignore,
     }
 }
@@ -2194,13 +2385,75 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
     let mut model = fetch_workspace_model(&session, app.socket.as_deref())?;
     apply_workspace_order(&mut model, &app.prefs.workspace_order);
     install_reconciled_model(&mut app.model, model, app.prefs.sidebar_visible);
-    app.decoration = decoration::fetch_decoration(&app.home);
+    expand_active_workspace(
+        &app.model.workspaces,
+        app.model.active_workspace,
+        &mut app.expanded_for,
+        &mut app.expanded_workspaces,
+    );
+    // Before the snapshot, not after: a session the daemon starts watching
+    // now is one this same reconcile can already show agents for.
+    ensure_sessions_watched(app);
+    // Keep what the last answer said when this one does not arrive: a
+    // reconcile that cannot reach the daemon knows nothing new about the
+    // roster, and blanking it would un-name every agent on screen.
+    if let Some(snapshot) = decoration::fetch_decoration(&app.home) {
+        app.decoration = snapshot;
+    }
     app.refresh_event_lines();
     app.persist_active();
     resize_client(app, client).await;
     hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await?;
     app.needs_hydrate = false;
     Ok(())
+}
+
+/// Make sure cyclopsd is watching every workspace on screen.
+///
+/// The sidebar's whole agent hierarchy comes from the daemon's pane table,
+/// and the daemon only builds one for sessions it watches. Workspaces this
+/// UI creates are not in config.toml, so without this their rows would show
+/// nothing no matter what was running in them.
+///
+/// One ask per session id, ever. See [`crate::daemon::watch_session`] for
+/// why a rename must not produce a second ask.
+fn ensure_sessions_watched(app: &mut App) {
+    for workspace in &app.model.workspaces {
+        if app.watched_sessions.contains(&workspace.session_id) {
+            continue;
+        }
+        match crate::daemon::watch_session(&app.home, &workspace.name) {
+            Ok(()) => {
+                app.watched_sessions.insert(workspace.session_id.clone());
+            }
+            // A daemon that is down is a normal state for this UI: the rest
+            // of the workspace works without it. Leaving the id unrecorded
+            // is what makes the next reconcile try again.
+            Err(error) => log_err(&app.home, &error),
+        }
+    }
+}
+
+/// Open the active workspace in the sidebar when it becomes the active one.
+///
+/// Agent rows are children of an expanded workspace, so a workspace you just
+/// created or switched to would otherwise hide the agents it was opened for.
+/// Only the CHANGE opens it: re-expanding on every reconcile would leave the
+/// disclosure triangle unable to close the row you are actually looking at.
+fn expand_active_workspace(
+    workspaces: &[crate::model::WorkspaceRow],
+    active: usize,
+    expanded_for: &mut Option<String>,
+    expanded: &mut HashSet<String>,
+) {
+    let Some(row) = workspaces.get(active) else {
+        return;
+    };
+    if expanded_for.as_deref() == Some(row.session_id.as_str()) {
+        return;
+    }
+    *expanded_for = Some(row.session_id.clone());
+    expanded.insert(row.session_id.clone());
 }
 
 /// Apply the persisted visual order without changing tmux session identity.
@@ -2465,6 +2718,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
                     &app.paint,
                     &mut app.hit_map,
                     &app.decoration,
+                    app.hover,
                 );
             }
             paint_tab_bar(
@@ -2741,12 +2995,12 @@ mod tests {
     }
 
     #[test]
-    fn enter_never_confirms_a_destructive_dialog() {
+    fn enter_confirms_a_destructive_dialog() {
         let dialog = Dialog::ConfirmCloseTab {
             window_id: "@1".into(),
         };
         let enter = KeyEvent::new(crossterm::event::KeyCode::Enter, KeyModifiers::empty());
-        assert_eq!(dialog_key_action(&dialog, &enter), DialogKeyAction::Cancel);
+        assert_eq!(dialog_key_action(&dialog, &enter), DialogKeyAction::Confirm);
     }
 
     #[test]
@@ -2863,6 +3117,34 @@ mod tests {
         assert_eq!(model.workspaces[0].name, "beta");
         assert_eq!(model.active_workspace, 0);
         assert_eq!(model.workspaces[model.active_workspace].session_id, "$1");
+    }
+
+    #[test]
+    fn switching_workspaces_opens_the_new_one_but_respects_a_manual_collapse() {
+        let row = |id: &str| crate::model::WorkspaceRow {
+            session_id: id.into(),
+            name: id.into(),
+            tab_count: 1,
+            active: false,
+            window_ids: vec!["@1".into()],
+        };
+        let rows = vec![row("$0"), row("$1")];
+        let mut expanded_for = None;
+        let mut expanded = HashSet::new();
+
+        expand_active_workspace(&rows, 0, &mut expanded_for, &mut expanded);
+        assert!(expanded.contains("$0"), "the active workspace opens");
+
+        // Collapsing the row you are looking at has to stick, so a reconcile
+        // that does not change the active workspace must not reopen it.
+        toggle_workspace_expanded(&mut expanded, "$0".into());
+        expand_active_workspace(&rows, 0, &mut expanded_for, &mut expanded);
+        assert!(!expanded.contains("$0"), "a manual collapse survives");
+
+        // Switching is a change, and the workspace you switch to has to show
+        // its agents without a second click.
+        expand_active_workspace(&rows, 1, &mut expanded_for, &mut expanded);
+        assert!(expanded.contains("$1"), "the workspace switched to opens");
     }
 
     #[test]

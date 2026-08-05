@@ -3,7 +3,8 @@
 //! pipeline).
 //!
 //! Install PREPARES artifacts and prints wiring instructions; it never
-//! writes into vendor dot-dirs (~/.claude, ~/.codex, ~/.gemini, .agents).
+//! writes into vendor dot-dirs (~/.claude, ~/.codex, ~/.gemini, .agents,
+//! .cursor).
 //! Configuration does not equal subscription (amendment c, finding F1):
 //! a rendered config proves nothing until `hooks verify` or
 //! `hooks selftest` shows edges actually arriving.
@@ -25,6 +26,7 @@ use crate::{copy, EXIT_USAGE};
 const CLAUDE_TMPL: &str = include_str!("../../../hooks/claude/settings.json.tmpl");
 const CODEX_TMPL: &str = include_str!("../../../hooks/codex/hooks.json.tmpl");
 const AGY_TMPL: &str = include_str!("../../../hooks/agy/hooks.json.tmpl");
+const CURSOR_TMPL: &str = include_str!("../../../hooks/cursor/hooks.json.tmpl");
 
 /// Read timeout for hooks.selftest: the daemon waits up to 10s for the
 /// delivery to resolve, so the client waits a little longer.
@@ -32,13 +34,14 @@ const SELFTEST_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Path components that mark a vendor CLI's own config tree. Install
 /// refuses to write anywhere inside one, whatever the --dest says.
-const VENDOR_DIRS: &[&str] = &[".claude", ".codex", ".gemini", ".agents"];
+const VENDOR_DIRS: &[&str] = &[".claude", ".codex", ".gemini", ".agents", ".cursor"];
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CliKind {
     Claude,
     Codex,
     Agy,
+    Cursor,
 }
 
 impl CliKind {
@@ -47,6 +50,7 @@ impl CliKind {
             CliKind::Claude => CLAUDE_TMPL,
             CliKind::Codex => CODEX_TMPL,
             CliKind::Agy => AGY_TMPL,
+            CliKind::Cursor => CURSOR_TMPL,
         }
     }
 
@@ -54,7 +58,7 @@ impl CliKind {
     fn file_name(self) -> &'static str {
         match self {
             CliKind::Claude => "settings.json",
-            CliKind::Codex | CliKind::Agy => "hooks.json",
+            CliKind::Codex | CliKind::Agy | CliKind::Cursor => "hooks.json",
         }
     }
 
@@ -63,6 +67,7 @@ impl CliKind {
             CliKind::Claude => "claude",
             CliKind::Codex => "codex",
             CliKind::Agy => "agy",
+            CliKind::Cursor => "cursor",
         }
     }
 }
@@ -121,6 +126,18 @@ fn instructions(kind: CliKind, rendered: &Path, label: &str) -> String {
              agy has no payload-matchable ACK (finding F7): deliveries stay on the\n\
              screen-verified tier; these hooks feed liveness and turn detection.\n\
              Then check edges arrive: cyclops hooks verify {label}"
+        ),
+        CliKind::Cursor => format!(
+            "Wire it (cursor reads hooks.json from the workspace it runs in, or\n\
+             from your home directory):\n\
+             \n\
+             \x20 mkdir -p <workspace>/.cursor && cp {p} <workspace>/.cursor/hooks.json\n\
+             \x20 # or, user level:\n\
+             \x20 mkdir -p ~/.cursor && cp {p} ~/.cursor/hooks.json\n\
+             \n\
+             CURSOR_CONFIG_DIR does NOT work for hooks: it relocates\n\
+             cli-config.json but hooks.json placed there fires zero events.\n\
+             Then prove it fires: cyclops hooks selftest {label}"
         ),
     }
 }
@@ -371,6 +388,7 @@ mod tests {
             (CliKind::Claude, "claude.settings.json"),
             (CliKind::Codex, "codex.hooks.json"),
             (CliKind::Agy, "agy.hooks.json"),
+            (CliKind::Cursor, "cursor.hooks.json"),
         ] {
             assert_eq!(
                 render(kind, GOLDEN_LABEL, GOLDEN_BIN),
@@ -382,7 +400,12 @@ mod tests {
 
     #[test]
     fn rendered_templates_are_valid_vendor_json() {
-        for kind in [CliKind::Claude, CliKind::Codex, CliKind::Agy] {
+        for kind in [
+            CliKind::Claude,
+            CliKind::Codex,
+            CliKind::Agy,
+            CliKind::Cursor,
+        ] {
             let out = render(kind, GOLDEN_LABEL, GOLDEN_BIN);
             let v: serde_json::Value = serde_json::from_str(&out)
                 .unwrap_or_else(|e| panic!("{} render is not JSON: {e}", kind.name()));
@@ -469,10 +492,33 @@ mod tests {
             "/Users/x/.codex",
             "/home/x/.gemini/sub",
             "/work/project/.agents",
+            "/work/project/.cursor",
         ] {
             assert!(inside_vendor_dir(Path::new(p)), "{p}");
         }
         assert!(!inside_vendor_dir(Path::new("/Users/x/.cyclops/hooks/rev")));
         assert!(!inside_vendor_dir(Path::new("/work/agents/hooks")));
+    }
+
+    #[test]
+    fn cursor_registers_only_the_two_measured_events() {
+        // The daemon matches incoming events against the manifest's own
+        // ack/turn_start/turn_end names (both beforeSubmitPrompt here), so
+        // wiring any other Cursor event would just be ignored; this proves
+        // the template does not do so, and that the flat schema (no nested
+        // "hooks" array, no "type": "command") round-trips correctly.
+        let v: serde_json::Value =
+            serde_json::from_str(&render(CliKind::Cursor, "r", "cyclops")).unwrap();
+        assert_eq!(v["version"], 1);
+        let hooks = v["hooks"].as_object().expect("hooks object");
+        let mut events: Vec<&String> = hooks.keys().collect();
+        events.sort();
+        assert_eq!(events, ["beforeSubmitPrompt", "stop"]);
+        for (event, entries) in hooks {
+            let cmd = entries[0]["command"]
+                .as_str()
+                .unwrap_or_else(|| panic!("cursor: {event} entry shape"));
+            assert_eq!(cmd, format!("cyclops hook {event} --agent r"));
+        }
     }
 }

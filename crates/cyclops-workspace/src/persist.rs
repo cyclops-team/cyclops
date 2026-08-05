@@ -12,6 +12,11 @@ pub struct WorkspacePrefs {
     pub workspace_order: Vec<String>,
     /// Stable labels, with pane-id fallbacks for unnamed detected agents.
     pub agent_order: Vec<String>,
+    /// tmux session ids (`$n`) of workspaces that follow their pane's
+    /// folder. The id, not the name, is what's tracked here: following is
+    /// what renames the name, so the name can't be the thing that survives
+    /// the rename.
+    pub folder_tracked: Vec<String>,
 }
 
 impl Default for WorkspacePrefs {
@@ -21,6 +26,7 @@ impl Default for WorkspacePrefs {
             sidebar_width: 22,
             workspace_order: Vec::new(),
             agent_order: Vec::new(),
+            folder_tracked: Vec::new(),
         }
     }
 }
@@ -76,6 +82,12 @@ pub fn load_prefs(home: &Path) -> WorkspacePrefs {
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
     }
+    if let Some(arr) = workspace.get("folder_tracked").and_then(|v| v.as_array()) {
+        prefs.folder_tracked = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+    }
     prefs
 }
 
@@ -103,6 +115,13 @@ pub fn save_prefs(home: &Path, prefs: &WorkspacePrefs) -> std::io::Result<()> {
             .map(|s| toml::Value::String(s.clone()))
             .collect(),
     );
+    let folder_tracked = toml::Value::Array(
+        prefs
+            .folder_tracked
+            .iter()
+            .map(|s| toml::Value::String(s.clone()))
+            .collect(),
+    );
     let mut workspace = match table.remove("workspace") {
         Some(toml::Value::Table(workspace)) => workspace,
         _ => toml::Table::new(),
@@ -117,6 +136,7 @@ pub fn save_prefs(home: &Path, prefs: &WorkspacePrefs) -> std::io::Result<()> {
     );
     workspace.insert("workspace_order".into(), order);
     workspace.insert("agent_order".into(), agent_order);
+    workspace.insert("folder_tracked".into(), folder_tracked);
     table.insert("workspace".into(), toml::Value::Table(workspace));
     let mut body = toml::to_string_pretty(&table)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
@@ -238,9 +258,28 @@ mod tests {
             sidebar_width: 28,
             workspace_order: vec!["beta".into(), "alpha".into()],
             agent_order: vec!["name:reviewer".into(), "pane:%7".into()],
+            folder_tracked: vec!["$3".into(), "$7".into()],
         };
         save_prefs(&home, &prefs).expect("save");
         let loaded = load_prefs(&home);
+        assert_eq!(loaded, prefs);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn folder_tracked_round_trips_by_session_id() {
+        let home = scratch_dir("ws-prefs-folder-tracked");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("scratch");
+        let prefs = WorkspacePrefs {
+            folder_tracked: vec!["$3".into()],
+            ..WorkspacePrefs::default()
+        };
+        save_prefs(&home, &prefs).expect("save");
+        let loaded = load_prefs(&home);
+        // Tracked entries are session ids, not names — the id is what
+        // survives a folder-follow rename, so it's the id that must persist.
+        assert_eq!(loaded.folder_tracked, vec!["$3".to_string()]);
         assert_eq!(loaded, prefs);
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -278,6 +317,7 @@ mod tests {
                 sidebar_width: 31,
                 workspace_order: vec!["cyclops".into()],
                 agent_order: vec!["name:implementer".into()],
+                folder_tracked: vec![],
             },
         )
         .expect("save");

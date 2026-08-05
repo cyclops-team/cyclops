@@ -32,6 +32,10 @@ const SHIPPED: &[(&str, &str)] = &[
         include_str!("../../../manifests/claude.toml"),
     ),
     ("codex.toml", include_str!("../../../manifests/codex.toml")),
+    (
+        "cursor.toml",
+        include_str!("../../../manifests/cursor.toml"),
+    ),
 ];
 
 /// Where manifests go, and where cyclopsd looks with no `manifest_dir` set.

@@ -149,6 +149,13 @@ pub fn add_button(paint: &Paint) -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// The create button under the mouse. It fills rather than merely
+/// brightening, so the glyph reads as a button the moment it is pointed
+/// at instead of only once it has been clicked.
+pub fn add_button_hover(paint: &Paint) -> Style {
+    accent_fill(paint)
+}
+
 /// Primary keyboard action in a modal and the selected tab chip.
 pub fn accent_fill(paint: &Paint) -> Style {
     if paint.colors_enabled {

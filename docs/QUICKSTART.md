@@ -106,7 +106,7 @@ $ cyclops status
   %0  ? unknown  bash
   %1  ? unknown  bash
 
-  2 panes read unknown: none of agy, claude, codex matches what is running there. Nothing can be delivered to an unknown pane. Pin one: cyclops name %0 <label> --manifest <id>. Teaching cyclops a new CLI is one file: docs/MANIFESTS.md.
+  2 panes read unknown: none of agy, claude, codex, cursor matches what is running there. Nothing can be delivered to an unknown pane. Pin one: cyclops name %0 <label> --manifest <id>. Teaching cyclops a new CLI is one file: docs/MANIFESTS.md.
 ```
 
 Manifests loaded and none of them matching, as here, is one CLI cyclops has

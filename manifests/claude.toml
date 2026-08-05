@@ -20,7 +20,10 @@ process_names = ["claude"]
 # ~/.local/share/claude/versions/2.1.220 and macOS derives the process comm
 # from the resolved file, so #{pane_current_command} reports the bare version
 # string "2.1.220". process_names alone never binds those panes; the daemon
-# falls back to matching argv[0] basenames via pane_pid.
+# falls back to matching argv[0] basenames. It reads that argv from the pane's
+# FOREGROUND process group, not #{pane_pid}: a claude started by typing its
+# name at a shell prompt is a child of the pane's first process, so pane_pid
+# resolves to the shell ("-zsh") and binds nothing.
 argv_basenames = ["claude"]
 
 [hooks]
