@@ -554,6 +554,80 @@ async fn select_window_makes_it_current() {
 }
 
 #[tokio::test]
+async fn switch_to_session_moves_this_client() {
+    let Some(srv) = TestServer::new("ops-switch") else {
+        return;
+    };
+    srv.new_session("alpha");
+    srv.new_session("beta");
+    let (client, _n) = ControlClient::spawn(srv.config("alpha"))
+        .await
+        .expect("spawn");
+
+    client.switch_to_session("beta").await.expect("switch");
+
+    let attached = lines(&srv, &["list-clients", "-F", "#{client_session}"]);
+    assert_eq!(attached, vec!["beta"], "the control client must move");
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn new_session_returns_its_id_detached_in_the_requested_directory() {
+    let Some(srv) = TestServer::new("ops-new-session") else {
+        return;
+    };
+    srv.new_session("host");
+    let dir = scratch("cyclops-ops-new-session");
+    let (client, _n) = ControlClient::spawn(srv.config("host"))
+        .await
+        .expect("spawn");
+
+    let id = client
+        .new_session("proj", dir.as_path())
+        .await
+        .expect("new session");
+
+    assert!(id.starts_with('$'), "expected a session id, got {id:?}");
+    let sessions = lines(&srv, &["list-sessions", "-F", "#{session_name}"]);
+    assert!(sessions.iter().any(|s| s == "proj"), "{sessions:?}");
+    // Detached creation: this client must still be looking at `host`.
+    let attached = lines(&srv, &["list-clients", "-F", "#{client_session}"]);
+    assert_eq!(attached, vec!["host"], "-d must not steal the client");
+    let path = field(&srv, &format!("{id}:"), "#{pane_current_path}");
+    assert!(
+        same_dir(&path, &dir),
+        "the session should start in the requested directory, got {path}"
+    );
+    assert_eq!(window_names(&srv, "proj"), vec!["1"]);
+
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn kill_session_closes_exactly_that_session() {
+    let Some(srv) = TestServer::new("ops-kill-session") else {
+        return;
+    };
+    srv.new_session("host");
+    srv.new_session("proj");
+    srv.new_session("project");
+    let (client, _n) = ControlClient::spawn(srv.config("host"))
+        .await
+        .expect("spawn");
+
+    client.kill_session("proj").await.expect("kill");
+
+    let sessions = lines(&srv, &["list-sessions", "-F", "#{session_name}"]);
+    assert!(!sessions.iter().any(|s| s == "proj"), "{sessions:?}");
+    assert!(
+        sessions.iter().any(|s| s == "project"),
+        "the prefix neighbour must survive an exact-match kill: {sessions:?}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
 async fn kill_window_closes_the_named_window() {
     let Some(srv) = TestServer::new("ops-kill-window") else {
         return;

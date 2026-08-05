@@ -244,6 +244,50 @@ impl ControlClient {
             .await
             .map(|_| ())
     }
+
+    /// Switch this control client to another session. The `=` exact-match
+    /// rule is the same as [`ControlClient::rename_session`].
+    pub async fn switch_to_session(&self, session: &str) -> Result<(), TmuxError> {
+        self.command(&format!(
+            "switch-client -t {}",
+            quote_arg(&session_target(session))
+        ))
+        .await
+        .map(|_| ())
+    }
+
+    /// Create a detached session rooted in `cwd` and return its session id.
+    ///
+    /// The id comes back from `-P -F '#{session_id}'` because the name is
+    /// not a stable handle: a folder-following workspace gets renamed later
+    /// and the `$n` id is what survives that. The caller owns name policy
+    /// (sanitization, uniqueness); this owns the command. The first window
+    /// is named "1" so tab naming starts numeric, matching the workspace's
+    /// automatic tab names.
+    pub async fn new_session(&self, name: &str, cwd: &Path) -> Result<String, TmuxError> {
+        let out = self
+            .command(&format!(
+                "new-session -d -P -F {} -s {} -n {} -c {}",
+                quote_arg("#{session_id}"),
+                quote_arg(name),
+                quote_arg("1"),
+                quote_arg(&cwd.to_string_lossy())
+            ))
+            .await?;
+        first_field(&out, "new-session")
+    }
+
+    /// Close one session and every window in it. Exact-match `=` target, so
+    /// a kill aimed at a vanished session fails instead of landing on a
+    /// prefix neighbour.
+    pub async fn kill_session(&self, session: &str) -> Result<(), TmuxError> {
+        self.command(&format!(
+            "kill-session -t {}",
+            quote_arg(&session_target(session))
+        ))
+        .await
+        .map(|_| ())
+    }
 }
 
 /// The single value a `-P -F` reply carries.
