@@ -64,6 +64,25 @@ tests.
 - Personally handle small integration fixes when delegation would be slower
   or riskier.
 
+## Protect the disk budget
+
+- Do not create additional Git worktrees for subagents. Keep subagents in the
+  shared worktree and enforce the ownership boundaries above.
+- Subagents run targeted crate tests only. Run the complete workspace gates
+  only at Q1 and Q2.
+- Use `CARGO_INCREMENTAL=0` for routine agent builds to limit incremental
+  artifacts.
+- Check available disk space before starting Cargo commands. Below 10 GiB
+  free, stop starting new builds and reclaim only generated artifacts from
+  inactive worktrees.
+- Never run `cargo clean` while `cargo`, `rustc`, Clippy, or Rustdoc is active.
+  Resolve the exact inactive worktree and use its manifest or target path;
+  never use a broad directory, recursive search, or unresolved glob as the
+  cleanup target.
+- Remove inactive worktree build artifacts promptly after their work is
+  integrated. Preserve source files, untracked handoffs, measurements, and
+  other human-authored material.
+
 ## Preserve the product decisions
 
 - Compact workspace surfaces use the stable status glyphs without redundant
