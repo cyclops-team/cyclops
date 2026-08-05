@@ -465,7 +465,9 @@ pub async fn run_async() -> i32 {
         hover: None,
         selection: SelectionState::default(),
         drag: None,
-        decoration: decoration::fetch_decoration(&home),
+        // Nothing to fall back to on the first frame: no answer here is
+        // genuinely "nothing known yet", which is what the default says.
+        decoration: decoration::fetch_decoration(&home).unwrap_or_default(),
         prefs: prefs.clone(),
         expanded_workspaces,
         expanded_for: None,
@@ -485,7 +487,7 @@ pub async fn run_async() -> i32 {
     // very first frame is already a frame the daemon may not be watching
     // for. Ask before drawing it.
     ensure_sessions_watched(&mut app);
-    app.decoration = decoration::fetch_decoration(&app.home);
+    app.decoration = decoration::fetch_decoration(&app.home).unwrap_or_default();
     app.refresh_event_lines();
 
     let mut debounce: Option<Instant> = None;
@@ -692,7 +694,15 @@ fn spawn_decoration_forwarder(home: std::path::PathBuf, tx: mpsc::UnboundedSende
             if value.get("event").is_none() {
                 continue;
             }
-            let snapshot = decoration::fetch_decoration(&home);
+            // A refused or timed-out status call is doubt about this
+            // instant, not news about the roster; the subscription is still
+            // up, so the next event asks again. Dropping it keeps the last
+            // known decoration on screen instead of un-naming every agent
+            // for a frame. A daemon that is really gone ends the read loop
+            // below, which is the one place "offline" is reported.
+            let Some(snapshot) = decoration::fetch_decoration(&home) else {
+                continue;
+            };
             if tx.send(AppMsg::DecorationChanged(snapshot)).is_err() {
                 return;
             }
@@ -2142,7 +2152,9 @@ async fn dialog_confirm(
         }
         app.dialog = None;
         app.hover = None;
-        app.decoration = decoration::fetch_decoration(&app.home);
+        if let Some(snapshot) = decoration::fetch_decoration(&app.home) {
+            app.decoration = snapshot;
+        }
         app.refresh_event_lines();
         return Ok(());
     }
@@ -2365,7 +2377,12 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
     // Before the snapshot, not after: a session the daemon starts watching
     // now is one this same reconcile can already show agents for.
     ensure_sessions_watched(app);
-    app.decoration = decoration::fetch_decoration(&app.home);
+    // Keep what the last answer said when this one does not arrive: a
+    // reconcile that cannot reach the daemon knows nothing new about the
+    // roster, and blanking it would un-name every agent on screen.
+    if let Some(snapshot) = decoration::fetch_decoration(&app.home) {
+        app.decoration = snapshot;
+    }
     app.refresh_event_lines();
     app.persist_active();
     resize_client(app, client).await;
