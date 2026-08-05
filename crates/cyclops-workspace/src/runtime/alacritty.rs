@@ -4,7 +4,7 @@ use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::term::cell::{Cell as AlacCell, Flags};
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{self, Processor};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 
@@ -194,28 +194,25 @@ impl AlacrittyVt {
     /// Initialize from a tmux hydration bundle.
     pub fn hydrate(&mut self, snapshot: &HydrationSnapshot) {
         self.reset(snapshot.cols, snapshot.rows);
-        let bytes = if snapshot.alternate_on {
-            snapshot.alternate.as_deref().unwrap_or(&snapshot.visible)
-        } else {
-            &snapshot.visible
-        };
+
         // A capture restores pixels, not VT modes. Full-screen TUIs such as
         // Claude and Codex are already in the alternate buffer; record that
         // fact before replaying their pixels. Otherwise their next exit or
         // redraw sequence switches buffers relative to the wrong baseline
         // and can make the restored UI disappear.
+        //
+        // Order matters: tmux's saved grid is the *primary* screen from
+        // before the TUI started, so it has to be laid down first and then
+        // covered by entering the alternate screen. Replaying it after the
+        // switch paints the stale shell over the live TUI (F38).
         if snapshot.alternate_on {
+            if let Some(saved) = snapshot.saved_primary.as_deref() {
+                self.replay_rows(saved);
+            }
             self.feed_internal(b"\x1b[?1049h");
         }
-        // Capture rows arrive joined with bare LF; a VT treats LF as
-        // index-down without carriage return, so feed each row with CRLF or
-        // columns staircase.
-        for (i, row) in bytes.split(|&b| b == b'\n').enumerate() {
-            if i > 0 {
-                self.feed_internal(b"\r\n");
-            }
-            self.feed_internal(row);
-        }
+        self.replay_rows(&snapshot.visible);
+
         // The replay leaves the cursor after the last capture cell; move it
         // to where the pane really has it.
         let seq = format!(
@@ -226,12 +223,36 @@ impl AlacrittyVt {
         self.feed_internal(seq.as_bytes());
     }
 
+    /// Replay captured rows into the active buffer.
+    ///
+    /// Capture rows arrive joined with bare LF; a VT treats LF as index-down
+    /// without carriage return, so each row needs an explicit CRLF or the
+    /// columns staircase.
+    fn replay_rows(&mut self, bytes: &[u8]) {
+        self.feed_internal(b"\x1b[H\x1b[2J");
+        for (i, row) in bytes.split(|&b| b == b'\n').enumerate() {
+            if i > 0 {
+                self.feed_internal(b"\r\n");
+            }
+            self.feed_internal(row);
+        }
+    }
+
     /// Visible cells and attributes.
     pub fn grid(&mut self) -> CellGridView<'_> {
         self.refresh_grid();
         CellGridView {
             grid: &self.cached_grid,
         }
+    }
+
+    /// An owned copy of the visible grid.
+    ///
+    /// Golden tests need values that outlive the borrow of the runtime;
+    /// production rendering should read cells through [`Self::grid`] instead
+    /// of paying for this copy.
+    pub fn snapshot(&mut self) -> CellGrid {
+        self.build_grid()
     }
 
     /// Grid dimensions as `(cols, rows)`.
@@ -257,7 +278,11 @@ impl AlacrittyVt {
         CursorState {
             col: point.column.0 as u16,
             row: point.line.0 as u16,
-            visible: style.shape != ansi::CursorShape::Hidden,
+            // DECTCEM (`\x1b[?25l`) hides the cursor through a terminal mode,
+            // not through the cursor style. A TUI that hides its cursor while
+            // repainting must not get a block painted over its output.
+            visible: self.term.mode().contains(TermMode::SHOW_CURSOR)
+                && style.shape != ansi::CursorShape::Hidden,
             shape,
         }
     }
@@ -290,7 +315,6 @@ pub fn feed_alacritty(bytes: &[u8], cols: u16, rows: u16) -> CellGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alacritty_terminal::term::TermMode;
 
     #[test]
     fn plain_hello() {
@@ -320,8 +344,10 @@ mod tests {
         vt.hydrate(&HydrationSnapshot {
             cols: 10,
             rows: 2,
-            visible: b"primary".to_vec(),
-            alternate: Some(b"CLAUDE".to_vec()),
+            // What the user is looking at: the agent TUI.
+            visible: b"CLAUDE".to_vec(),
+            // What tmux saved when that TUI took the alternate screen.
+            saved_primary: Some(b"shell".to_vec()),
             cursor_x: 6,
             cursor_y: 0,
             alternate_on: true,
@@ -335,6 +361,27 @@ mod tests {
     }
 
     #[test]
+    fn leaving_a_hydrated_alternate_screen_reveals_the_saved_shell() {
+        let mut vt = AlacrittyVt::new(10, 2);
+        vt.hydrate(&HydrationSnapshot {
+            cols: 10,
+            rows: 2,
+            visible: b"CLAUDE".to_vec(),
+            saved_primary: Some(b"shell".to_vec()),
+            cursor_x: 6,
+            cursor_y: 0,
+            alternate_on: true,
+        });
+
+        vt.feed(b"\x1b[?1049l");
+        assert_eq!(
+            vt.grid().row_texts()[0],
+            "shell",
+            "the saved primary must be underneath, so the TUI's own exit works"
+        );
+    }
+
+    #[test]
     fn hydration_discards_stale_terminal_state() {
         let mut vt = AlacrittyVt::new(10, 2);
         vt.feed(b"stale");
@@ -342,7 +389,7 @@ mod tests {
             cols: 10,
             rows: 2,
             visible: b"new".to_vec(),
-            alternate: None,
+            saved_primary: None,
             cursor_x: 3,
             cursor_y: 0,
             alternate_on: false,

@@ -125,6 +125,65 @@ async fn resize_then_rehydrate_still_matches_capture() {
     client.shutdown().await;
 }
 
+/// A full-screen agent TUI lives in the alternate screen. Hydration must
+/// restore what the user is looking at, not the shell content tmux saved
+/// when the TUI started.
+#[tokio::test]
+async fn hydrating_a_pane_in_the_alternate_screen_restores_what_the_user_sees() {
+    let Some(rig) = Rig::new("hydr-alt") else {
+        return;
+    };
+    rig.session("halt");
+
+    let (client, _notif) = ControlClient::spawn(rig.config("halt"))
+        .await
+        .expect("attach");
+    client.set_window_size_latest().await.expect("window-size");
+    client.set_client_size(80, 24).await.expect("client size");
+
+    // Mark the primary screen, then enter the alternate screen and paint a
+    // different marker there — the shape every shipped agent TUI has.
+    rig.server.run_ok(&[
+        "send-keys",
+        "-t",
+        "%0",
+        r"printf '\033[H\033[2JPRIMARY_SHELL\n'",
+        "Enter",
+    ]);
+    rig.server.wait_screen("%0", "PRIMARY_SHELL");
+    rig.server.run_ok(&[
+        "send-keys",
+        "-t",
+        "%0",
+        r"printf '\033[?1049h\033[H\033[2JALT_TUI_SCREEN\n'",
+        "Enter",
+    ]);
+    rig.server.wait_screen("%0", "ALT_TUI_SCREEN");
+
+    let bundle = client.hydrate_pane("%0").await.expect("hydrate bundle");
+    assert!(
+        bundle.alternate_on,
+        "tmux must report the pane as being on the alternate screen"
+    );
+
+    let mut runtime = PaneRuntime::new(bundle.cols, bundle.rows);
+    runtime.hydrate(&snapshot_from_bundle(&bundle));
+    let rows = runtime.snapshot().row_texts();
+
+    assert!(
+        rows.iter().any(|l| l.contains("ALT_TUI_SCREEN")),
+        "hydration must show the alternate screen the user is looking at, \
+         got {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|l| l.contains("PRIMARY_SHELL")),
+        "the saved primary screen must not be painted over the live TUI, \
+         got {rows:?}"
+    );
+
+    client.shutdown().await;
+}
+
 #[tokio::test]
 async fn mid_stream_rehydrate_matches_capture() {
     let Some(rig) = Rig::new("hydr-mid") else {

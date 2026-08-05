@@ -611,3 +611,25 @@ Probe: start isolated sessions `alpha` and `gamma` on one server, run
 `tmux -L <socket> rename-session -t '=gamma' gamma-probe` from another
 client. The two notification lines above arrived verbatim on the control-mode
 client.
+
+## F38. `capture-pane -a` reads the saved primary screen, never the alternate screen (MEASURED)
+
+For a pane inside the alternate screen (every full-screen agent TUI), plain
+`capture-pane` reads what is in front of the user — the TUI. `capture-pane
+-a` reads tmux's *saved* grid: the primary screen as it was when the TUI took
+over, which is what reappears after the TUI exits. Hydration originally
+replayed the `-a` capture as though it were the alternate screen, so every
+attach, tab switch, and reconnect of a Claude/Codex/Cursor pane painted the
+stale shell over the live TUI. The correct replay order is: lay down the
+saved primary, enter the alternate screen (`\x1b[?1049h`), then replay the
+visible capture — the TUI's own later exit then restores against the right
+baseline. The workspace names the field `saved_primary` so the bytes cannot
+be re-misread.
+
+Probe: `crates/cyclops-workspace/tests/hydration.rs::hydrating_a_pane_in_the_alternate_screen_restores_what_the_user_sees`
+on an isolated server — mark the primary screen `PRIMARY_SHELL`, enter the
+alternate screen and paint `ALT_TUI_SCREEN`, hydrate through the control
+client. The bundle reports `alternate_on`; the plain capture holds
+`ALT_TUI_SCREEN` and the `-a` capture holds `PRIMARY_SHELL`. Under the old
+replay order the test shows `PRIMARY_SHELL`; under the fixed order it shows
+the TUI.

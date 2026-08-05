@@ -1,7 +1,7 @@
 //! One live pane's VT runtime and scroll/selection state.
 
 use super::alacritty::AlacrittyVt;
-use super::grid::{CellGridView, CellPos, CursorState, HydrationSnapshot};
+use super::grid::{CellGrid, CellGridView, CellPos, CursorState, HydrationSnapshot};
 
 /// Wraps the pane VT engine with hydration and viewport state.
 pub struct PaneRuntime {
@@ -42,6 +42,11 @@ impl PaneRuntime {
         self.vt.grid()
     }
 
+    /// An owned copy of the visible grid, for tests that need owned values.
+    pub fn snapshot(&mut self) -> CellGrid {
+        self.vt.snapshot()
+    }
+
     pub fn cursor(&self) -> CursorState {
         self.vt.cursor()
     }
@@ -61,12 +66,17 @@ impl PaneRuntime {
 }
 
 /// Map a tmux adapter bundle into workspace hydration state.
+///
+/// `capture-pane -a` reads tmux's *saved* grid, which is the primary screen
+/// from before a TUI entered the alternate buffer — not the alternate buffer
+/// itself. The adapter still spells that field `alternate_escaped`; the
+/// workspace names it for what it holds (F38).
 pub fn snapshot_from_bundle(bundle: &cyclops_tmux::HydrationBundle) -> HydrationSnapshot {
     HydrationSnapshot {
         cols: bundle.cols,
         rows: bundle.rows,
         visible: bundle.visible_escaped.clone(),
-        alternate: bundle.alternate_escaped.clone(),
+        saved_primary: bundle.alternate_escaped.clone(),
         cursor_x: bundle.cursor_x,
         cursor_y: bundle.cursor_y,
         alternate_on: bundle.alternate_on,

@@ -73,10 +73,14 @@ pub enum CursorShape {
 pub struct HydrationSnapshot {
     pub cols: u16,
     pub rows: u16,
-    /// Escaped visible-screen bytes (`capture-pane -e`).
+    /// Escaped bytes for the screen the user is currently looking at
+    /// (`capture-pane -e`). When `alternate_on`, this is the alternate
+    /// screen — the running TUI, not the shell behind it.
     pub visible: Vec<u8>,
-    /// Escaped alternate-screen bytes (`capture-pane -e -a`), when present.
-    pub alternate: Option<Vec<u8>>,
+    /// Escaped bytes of tmux's saved grid (`capture-pane -e -a`): the
+    /// *primary* screen as it was when the TUI took over. It is what the
+    /// user sees again after the TUI exits, never the TUI itself (F38).
+    pub saved_primary: Option<Vec<u8>>,
     pub cursor_x: u16,
     pub cursor_y: u16,
     pub alternate_on: bool,
