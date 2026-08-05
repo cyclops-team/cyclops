@@ -10,7 +10,8 @@ cyclops isn't running. Start it with: cyclops start
 ```
 
 Nothing is listening on `$CYCLOPS_HOME/sock`. `cyclops start` starts one,
-and if starting it fails it says why rather than leaving you here.
+and so does bare `cyclops`; if starting it fails either says why rather
+than leaving you here.
 
 If one was running and died, `cyclops daemon log` is where it wrote its
 reason. `CYCLOPS_LOG=debug` says more on the next run.
