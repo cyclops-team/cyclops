@@ -9,7 +9,7 @@ alacritty_terminal = "0.26"
 cyclops-proto.workspace = true
 cyclops-theme.workspace = true
 cyclops-tmux.workspace = true
-crossterm = "0.28"
+crossterm = "0.29"
 ratatui = "0.30"
 serde_json.workspace = true
 thiserror.workspace = true
@@ -17,5 +17,4 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 toml.workspace = true
 
 [dev-dependencies]
-vt100 = "0.16"
 cyclops-testrig.workspace = true
