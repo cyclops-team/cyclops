@@ -54,8 +54,12 @@ use cyclops_proto::{AgentState, DeliveryState};
 /// `surface.dim` like every other detail column and its subjects and
 /// bodies print in the terminal's own foreground, so a second set of
 /// tokens would only let the two surfaces drift; `surface.bg`, because
-/// nothing paints a ground (one-shot commands print onto the terminal's
-/// own background and the alternate screen inherits it).
+/// pane bodies and one-shot commands print onto the terminal's own
+/// background and the alternate screen inherits it. The workspace's
+/// chrome is the one surface that does paint grounds — its tab strip,
+/// pane gutters and highlighted rows — and its text plus two grounds are
+/// the `chrome.*` group below, scoped so no theme mistakes them for a page
+/// palette.
 pub mod tokens {
     /// Stable role palette slots. [`crate::role_slot`] hashes an agent
     /// label into this array, so its length and order are part of visual
@@ -104,8 +108,16 @@ pub mod tokens {
     pub const BADGE_TERMINAL: &str = "badge.terminal";
     pub const BADGE_QUIET: &str = "badge.quiet";
 
+    /// Workspace chrome text plus its two grounds. Chrome cannot inherit
+    /// the terminal's foreground after painting a background: an unrelated
+    /// terminal palette could make active tabs unreadable. `panel` is the
+    /// flat ground; `raised` is one step up for active and hovered rows.
+    pub const CHROME_TEXT: &str = "chrome.text";
+    pub const CHROME_PANEL: &str = "chrome.panel";
+    pub const CHROME_RAISED: &str = "chrome.raised";
+
     /// Every token, the whole vocabulary. Loaders validate against this.
-    pub const ALL: [&str; 22] = [
+    pub const ALL: [&str; 25] = [
         "role.1",
         "role.2",
         "role.3",
@@ -128,6 +140,9 @@ pub mod tokens {
         BADGE_NEEDS_YOU,
         BADGE_TERMINAL,
         BADGE_QUIET,
+        CHROME_TEXT,
+        CHROME_PANEL,
+        CHROME_RAISED,
     ];
 }
 
@@ -264,7 +279,7 @@ pub fn role_slot(label: &str) -> usize {
 /// file anywhere. Seeded from the pre-theme CLI palette (style.rs before
 /// M3) and extended to cover the full vocabulary. The shipped themes
 /// override all of it; this is the safety net, not the identity.
-const DEFAULT: [(&str, (u8, u8, u8), u8); 22] = [
+const DEFAULT: [(&str, (u8, u8, u8), u8); 25] = [
     ("role.1", (97, 175, 239), 75),   // blue
     ("role.2", (152, 195, 121), 114), // green
     ("role.3", (198, 120, 221), 176), // violet
@@ -290,6 +305,11 @@ const DEFAULT: [(&str, (u8, u8, u8), u8); 22] = [
     ("badge.needs_you", (229, 192, 123), 180),
     ("badge.terminal", (224, 108, 117), 168),
     ("badge.quiet", (128, 128, 128), 245),
+    // The workspace chrome: explicit text prevents an unrelated terminal
+    // foreground from disappearing into the two painted grounds.
+    ("chrome.text", (238, 238, 238), 255),
+    ("chrome.panel", (26, 26, 26), 234),
+    ("chrome.raised", (46, 46, 46), 236),
 ];
 
 /// A loaded theme: named token overrides on top of the compiled defaults.

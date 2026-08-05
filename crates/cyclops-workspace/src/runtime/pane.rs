@@ -38,7 +38,7 @@ impl PaneRuntime {
         self.vt.at_tail()
     }
 
-    pub fn grid(&self) -> CellGridView<'_> {
+    pub fn grid(&mut self) -> CellGridView<'_> {
         self.vt.grid()
     }
 

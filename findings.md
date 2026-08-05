@@ -42,6 +42,7 @@ than a measurement.
 | F34 | `libghostty-vt` needs Zig at build time; the corpus used `vt100` as the comparison engine instead | binds |
 | F35 | `alacritty_terminal` passes the workspace VT fixture corpus 12/12; `vt100` passes 5/12 | binds |
 | F36 | Cloud-agent VM stdout accepts OSC 52 clipboard writes; native fallback uses wl-copy/xclip when present | binds |
+| F37 | Session rename notifications carry a stable id and can describe a background session | binds |
 
 ## F13. refresh-client -B subscriptions work in control mode on tmux 3.6a (MEASURED)
 
@@ -586,3 +587,27 @@ write is the only export (Invariant 7).
 Probe: `cargo test -p cyclops-workspace selection::tests::base64_roundtrip_shape`
 plus manual OSC 52 write from the workspace selection path on the agent VM.
 Native fallback is best-effort and untested on every platform variant.
+
+## F37. Session-renamed identifies background sessions on tmux 3.7b (MEASURED)
+
+A control client attached to one session receives `%session-renamed` when a
+different session is renamed. tmux 3.7b puts the renamed session's stable id
+before its new name:
+
+```text
+%session-changed $2 alpha
+%session-renamed $0 gamma-probe
+```
+
+Treating the whole tail as the attached session name makes the client try to
+reconcile a session literally named `$0 gamma-probe`. The notification parser
+therefore accepts the current `id name` shape and retains the older one-field
+shape. Workspace reconciliation switches its active name only when the id is
+the attached session; a background rename refreshes the sidebar without
+changing sessions.
+
+Probe: start isolated sessions `alpha` and `gamma` on one server, run
+`tmux -L <socket> -C attach-session -t '=alpha'`, then run
+`tmux -L <socket> rename-session -t '=gamma' gamma-probe` from another
+client. The two notification lines above arrived verbatim on the control-mode
+client.

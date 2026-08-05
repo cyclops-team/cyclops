@@ -19,9 +19,12 @@
 # crates/cyclops-theme/tests/shipped.rs and every number below is pinned
 # there by shipped_themes_meet_their_stated_contrast.
 #
-# Target 7:1, WCAG AAA for body text, and every one of the 22 tokens
-# clears it. The floor is state.terminal and badge.terminal at 7.05:1,
-# then role.2 at 7.5:1 and state.dead at 7.8:1; surface.fg is 21:1.
+# Target 7:1, WCAG AAA for body text, and every figure token clears it.
+# The floor is state.terminal and badge.terminal at 7.05:1, then role.2
+# at 7.5:1 and state.dead at 7.8:1; surface.fg is 21:1. The two [chrome]
+# grounds are backgrounds the workspace chrome paints, not figures, so
+# their bar (pinned in the same test) is that chrome.text stays readable
+# on both grounds at the same 7:1, measuring 13.2:1 on raised.
 #
 # surface.fg is the one value here that no renderer paints. Cyclops prints
 # body text in the terminal's own foreground; the engine reads surface.fg
@@ -38,8 +41,9 @@
 #
 # There is no [stream] table, for the reason written out in dark.toml:
 # the stream's gutter resolves surface.dim like every other detail column.
-# There is no surface.bg either: nothing paints a ground, so this theme
-# assumes the terminal's own black rather than setting one.
+# There is no surface.bg either: pane bodies never paint a ground, so
+# this theme assumes the terminal's own black. The [chrome] pair is the
+# workspace chrome's own two grounds, both exact grid grays.
 
 name = "high-contrast"
 
@@ -74,3 +78,8 @@ healthy = { hex = "#00d700", c256 = 40 }
 needs_you = { hex = "#ffaf00", c256 = 214 }
 terminal = { hex = "#ff5f5f", c256 = 203 }
 quiet = { hex = "#bcbcbc", c256 = 250 }
+
+[chrome]
+text = { hex = "#ffffff", c256 = 231 }
+panel = { hex = "#121212", c256 = 233 }
+raised = { hex = "#303030", c256 = 236 }

@@ -306,7 +306,8 @@ impl ControlClient {
         cmd.arg("-C");
         match cfg.mode {
             ControlMode::Attach => {
-                cmd.args(["attach-session", "-t"]).arg(&cfg.session);
+                cmd.args(["attach-session", "-t"])
+                    .arg(crate::cmd::session_target(&cfg.session));
             }
             ControlMode::NewSession => {
                 cmd.args(["new-session", "-A", "-s"]).arg(&cfg.session);
@@ -533,6 +534,14 @@ impl ControlClient {
             quote_arg(pane_id)
         ));
         self.command(&cmd).await.map(|_| ())
+    }
+
+    /// Delete one named server-global buffer. Used as cleanup when a
+    /// load succeeded but the matching paste did not consume it with `-d`.
+    pub async fn delete_buffer(&self, name: &str) -> Result<(), TmuxError> {
+        self.command(&format!("delete-buffer -b {}", quote_arg(name)))
+            .await
+            .map(|_| ())
     }
 
     /// Clean shutdown: ask tmux to detach, close stdin, reap the child,

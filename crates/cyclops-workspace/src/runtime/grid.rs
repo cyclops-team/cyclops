@@ -121,7 +121,7 @@ impl CellGrid {
     }
 }
 
-/// Borrowed grid view returned by [`super::vt::PaneVt::grid`].
+/// Borrowed view of a pane runtime's current visible grid.
 pub struct CellGridView<'a> {
     pub grid: &'a CellGrid,
 }

@@ -34,7 +34,7 @@ use cyclops_proto::{
     AgentState, Delivery, DeliveryReceipt, DeliveryState, Event, Kind, LedgerLine, MsgSendParams,
     MsgSendResult, NotifyLevel, VerifiedBy, WaitUntil, WireError,
 };
-use cyclops_tmux::{quote_arg, ControlClient, PaneEvent, PaneRow, SessionWatcher, TmuxError};
+use cyclops_tmux::{ControlClient, PaneEvent, PaneRow, SessionWatcher, TmuxError};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, watch, Notify};
 use tokio::task::JoinHandle;
@@ -1972,10 +1972,7 @@ impl Injector for TmuxInjector {
             // paste-buffer -d never ran, so the loaded buffer would linger
             // server-global with the payload in it. Best effort: the buffer
             // dies with the server either way.
-            let _ = self
-                .client
-                .command(&format!("delete-buffer -b {}", quote_arg(&self.buffer)))
-                .await;
+            let _ = self.client.delete_buffer(&self.buffer).await;
             return Err("paste_failed".to_string());
         }
         Ok(())

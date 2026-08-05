@@ -1,7 +1,5 @@
 //! Pure workspace model reconciled from tmux.
 
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 use ratatui::layout::Rect;
@@ -13,7 +11,6 @@ use crate::runtime::PaneRuntime;
 #[derive(Debug, Clone)]
 pub struct TabModel {
     pub window_id: String,
-    pub index: usize,
     pub name: String,
     pub layout: ResolvedLayout,
     pub active_pane: String,
@@ -62,6 +59,8 @@ impl SessionModel {
 /// One workspace row in the sidebar (a tmux session).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceRow {
+    /// Stable tmux identity, retained across session renames.
+    pub session_id: String,
     pub name: String,
     pub tab_count: usize,
     pub active: bool,
@@ -78,10 +77,6 @@ pub struct WorkspaceModel {
 }
 
 impl WorkspaceModel {
-    pub fn active_workspace_name(&self) -> &str {
-        &self.workspaces[self.active_workspace].name
-    }
-
     pub fn active_tab(&self) -> &TabModel {
         self.session.active_tab()
     }
@@ -105,10 +100,11 @@ pub fn visible_pane_dims(tab: &TabModel) -> Vec<(String, u16, u16)> {
     crate::layout::pane_dims_in_layout(&tab.layout)
 }
 
-/// Pane ids the tab shows (zoom-aware).
-pub fn visible_pane_ids(tab: &TabModel) -> Vec<String> {
-    visible_pane_dims(tab)
-        .into_iter()
-        .map(|(id, _, _)| id)
-        .collect()
+/// Whether `pane_id` is visible on this tab, including zoom semantics.
+pub fn pane_is_visible(tab: &TabModel, pane_id: &str) -> bool {
+    if tab.zoomed {
+        tab.active_pane == pane_id
+    } else {
+        crate::layout::layout_contains_pane(&tab.layout, pane_id)
+    }
 }

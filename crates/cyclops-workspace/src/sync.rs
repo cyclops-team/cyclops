@@ -19,6 +19,7 @@ pub fn fetch_workspace_model(
     let workspaces: Vec<WorkspaceRow> = sessions
         .iter()
         .map(|s| WorkspaceRow {
+            session_id: s.id.clone(),
             name: s.name.clone(),
             tab_count: s.tab_count,
             active: s.name == active_session,
@@ -87,7 +88,6 @@ fn build_tab(window: &WindowRow, panes: &[WindowPaneRow]) -> Result<TabModel, Tm
     };
     Ok(TabModel {
         window_id: window.id.clone(),
-        index: window.index,
         name: window.name.clone(),
         layout,
         active_pane,

@@ -6,6 +6,8 @@ use crate::error::TmuxError;
 /// One session on a tmux server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRow {
+    /// Stable tmux session id, e.g. `$0`.
+    pub id: String,
     pub name: String,
     pub attached: bool,
     /// Number of windows (tabs) in the session.
@@ -44,7 +46,7 @@ pub fn list_sessions(socket: Option<&str>) -> Result<Vec<SessionRow>, TmuxError>
         &[
             "list-sessions",
             "-F",
-            "#{session_name}\t#{session_attached}\t#{session_windows}",
+            "#{session_id}\t#{session_name}\t#{session_attached}\t#{session_windows}",
         ],
     )?;
     let mut rows = Vec::new();
@@ -52,19 +54,15 @@ pub fn list_sessions(socket: Option<&str>) -> Result<Vec<SessionRow>, TmuxError>
         if line.is_empty() {
             continue;
         }
-        let (name, attached, tabs) = match line.split_once('\t') {
-            Some((name, rest)) => {
-                let (attached, tabs) = rest
-                    .split_once('\t')
-                    .ok_or_else(|| TmuxError::Protocol(format!("list-sessions line: {line:?}")))?;
-                (name, attached, tabs)
-            }
-            None => return Err(TmuxError::Protocol(format!("list-sessions line: {line:?}"))),
-        };
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() != 4 {
+            return Err(TmuxError::Protocol(format!("list-sessions line: {line:?}")));
+        }
         rows.push(SessionRow {
-            name: name.to_string(),
-            attached: attached == "1",
-            tab_count: tabs
+            id: parts[0].to_string(),
+            name: parts[1].to_string(),
+            attached: parts[2] == "1",
+            tab_count: parts[3]
                 .parse()
                 .map_err(|e| TmuxError::Protocol(format!("session_windows: {e}")))?,
         });

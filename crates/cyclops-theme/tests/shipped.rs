@@ -1,11 +1,12 @@
 //! The shipped theme files against the crate contract: they load clean,
 //! cover the whole vocabulary, keep role fallbacks distinct, and their
-//! explicit 256-color fallbacks match the documented derivation wherever
-//! the file headers do not declare hand-tuning (the role slots). The
-//! high-contrast theme is additionally held to WCAG AA, which is the only
-//! promise it makes that a reader cannot check by looking. Two tests here
-//! pin docs/themes.md instead of the files: the token table, because a
-//! table that outlives its tokens is the bug this milestone went looking
+//! explicit 256-color fallbacks in the three base themes match the
+//! documented derivation wherever the files do not declare hand-tuning
+//! (the role slots). Branded themes keep their curated xterm mappings.
+//! The high-contrast theme is additionally held to WCAG AA, which is the
+//! only promise it makes that a reader cannot check by looking. Two tests
+//! here pin docs/themes.md instead of the files: the token table, because
+//! a table that outlives its tokens is the bug this milestone went looking
 //! for, and the contrast table, because a bar nobody publishes is a
 //! threshold and not a check.
 
@@ -13,7 +14,16 @@ use std::path::PathBuf;
 
 use cyclops_theme::{derive_c256, tokens, Theme};
 
-const SHIPPED: [&str; 3] = ["dark", "light", "high-contrast"];
+const SHIPPED: [&str; 7] = [
+    "catppuccin",
+    "dark",
+    "gruvbox",
+    "high-contrast",
+    "light",
+    "nord",
+    "tokyo-night",
+];
+const DERIVED_FALLBACKS: [&str; 3] = ["dark", "light", "high-contrast"];
 
 fn theme_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -65,7 +75,7 @@ fn shipped_role_fallbacks_are_pairwise_distinct() {
 /// distinctness. A deliberate hand-tune elsewhere updates this test.
 #[test]
 fn shipped_non_role_fallbacks_match_the_derivation() {
-    for name in SHIPPED {
+    for name in DERIVED_FALLBACKS {
         let theme = shipped(name);
         for token in tokens::ALL {
             if tokens::ROLE.contains(&token) {
@@ -161,6 +171,11 @@ fn shipped_themes_meet_their_stated_contrast() {
         let name = claim.theme;
         let theme = shipped(name);
         for token in tokens::ALL {
+            // Chrome is measured as text on its painted grounds below;
+            // measuring either ground as a figure would force it light.
+            if token.starts_with("chrome.") {
+                continue;
+            }
             let bar = if token == tokens::STATE_DEAD {
                 claim.dead
             } else {
@@ -175,6 +190,32 @@ fn shipped_themes_meet_their_stated_contrast() {
                 claim.ground
             );
         }
+        // The grounds' own contract: body text painted on the raised
+        // ground (the active tab, a hovered menu row) clears the same
+        // floor, and the two grounds are not the same color — raised
+        // that equals panel highlights nothing.
+        let fg = theme.resolve(tokens::CHROME_TEXT).rgb;
+        let panel = theme.resolve(tokens::CHROME_PANEL).rgb;
+        let raised = theme.resolve(tokens::CHROME_RAISED).rgb;
+        for (ground_name, ground) in [("panel", panel), ("raised", raised)] {
+            let ratio = contrast(fg, ground);
+            assert!(
+                ratio >= claim.floor,
+                "{name}: chrome.text on chrome.{ground_name} measures {ratio:.2}:1, \
+                 under the {}:1 floor",
+                claim.floor
+            );
+        }
+        assert_ne!(
+            theme.resolve(tokens::CHROME_PANEL),
+            theme.resolve(tokens::CHROME_RAISED),
+            "{name}: chrome.panel and chrome.raised are the same color"
+        );
+        assert_ne!(
+            theme.resolve(tokens::CHROME_PANEL).c256,
+            theme.resolve(tokens::CHROME_RAISED).c256,
+            "{name}: chrome grounds collapse on a 256-color terminal"
+        );
         // A gone pane and a quiet one are different rows, so their cells
         // are different colors. Every header describes dead as one step
         // past quiet; collapsing them would make that sentence false and
@@ -288,7 +329,7 @@ fn the_docs_token_table_matches_the_vocabulary() {
         .collect();
     assert!(!table.is_empty(), "docs/themes.md has no token table");
     let table = table.join("\n");
-    for group in ["role", "surface", "eye", "state", "badge"] {
+    for group in ["role", "surface", "eye", "state", "badge", "chrome"] {
         assert!(table.contains(group), "docs/themes.md drops `{group}`");
     }
     for gone in ["stream", "surface.bg"] {

@@ -46,6 +46,10 @@ pub struct AlacrittyVt {
     rows: u16,
     scroll_offset: usize,
     cached_grid: CellGrid,
+    /// Parsing can arrive in many small control-mode chunks. Rebuilding the
+    /// whole visible grid for each chunk wastes the frame debounce: defer it
+    /// until a renderer or selection operation actually asks for cells.
+    grid_dirty: bool,
 }
 
 impl AlacrittyVt {
@@ -67,28 +71,35 @@ impl AlacrittyVt {
             rows,
             scroll_offset: 0,
             cached_grid,
+            grid_dirty: false,
         }
     }
 
     fn feed_internal(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
-        self.refresh_grid();
+        self.grid_dirty = true;
     }
 
     fn refresh_grid(&mut self) {
-        let cols = self.cols;
-        let rows = self.rows;
-        let mut cells = Vec::with_capacity(cols as usize * rows as usize);
+        if !self.grid_dirty {
+            return;
+        }
+        let cell_count = self.cols as usize * self.rows as usize;
+        self.cached_grid.cells.clear();
+        self.cached_grid.cells.reserve(cell_count);
         for cell in self.term.grid().display_iter() {
-            cells.push(cell_from_alac(&cell));
+            self.cached_grid.cells.push(cell_from_alac(&cell));
         }
-        while cells.len() < cols as usize * rows as usize {
-            cells.push(GridCell::default());
-        }
-        self.cached_grid = CellGrid { cols, rows, cells };
+        self.cached_grid
+            .cells
+            .resize(cell_count, GridCell::default());
+        self.cached_grid.cols = self.cols;
+        self.cached_grid.rows = self.rows;
+        self.grid_dirty = false;
     }
 
-    fn build_grid(&self) -> CellGrid {
+    fn build_grid(&mut self) -> CellGrid {
+        self.refresh_grid();
         self.cached_grid.clone()
     }
 }
@@ -153,7 +164,7 @@ impl AlacrittyVt {
         };
         self.term.resize(size);
         self.scroll_offset = 0;
-        self.refresh_grid();
+        self.grid_dirty = true;
     }
 
     /// Initialize from a tmux hydration bundle.
@@ -184,7 +195,8 @@ impl AlacrittyVt {
     }
 
     /// Visible cells and attributes.
-    pub fn grid(&self) -> CellGridView<'_> {
+    pub fn grid(&mut self) -> CellGridView<'_> {
+        self.refresh_grid();
         CellGridView {
             grid: &self.cached_grid,
         }
@@ -222,7 +234,7 @@ impl AlacrittyVt {
     pub fn scroll(&mut self, delta: i32) {
         self.term.scroll_display(Scroll::Delta(-delta));
         self.scroll_offset = self.term.grid().display_offset();
-        self.refresh_grid();
+        self.grid_dirty = true;
     }
 
     /// Extract selected text between two cell positions.
@@ -251,5 +263,21 @@ mod tests {
     fn plain_hello() {
         let grid = feed_alacritty(b"hello\r\n", 10, 3);
         assert_eq!(grid.row_texts()[0], "hello");
+    }
+
+    #[test]
+    fn output_chunks_coalesce_before_grid_conversion() {
+        let mut vt = AlacrittyVt::new(10, 2);
+        vt.feed(b"hel");
+        vt.feed(b"lo");
+        assert!(vt.grid_dirty, "output should only dirty the cached grid");
+        assert_eq!(
+            vt.cached_grid.row_texts()[0],
+            "",
+            "no full-grid conversion should happen between output chunks"
+        );
+
+        assert_eq!(vt.grid().row_texts()[0], "hello");
+        assert!(!vt.grid_dirty, "one cell read refreshes all pending output");
     }
 }

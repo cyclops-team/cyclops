@@ -4,8 +4,9 @@ use std::io::{self, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crossterm::event::DisableMouseCapture;
-use crossterm::event::EnableMouseCapture;
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -19,13 +20,14 @@ pub struct TermGuard {
 }
 
 impl TermGuard {
-    /// Enter raw mode and the alternate screen. Mouse capture stays off in
-    /// step 4; step 9 enables it through the same guard.
+    /// Enter raw mode and the alternate screen, with mouse and bracketed
+    /// paste reporting owned by the same restoration guard.
     pub fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut out = io::stdout();
         out.execute(EnterAlternateScreen)?;
         let _ = out.execute(EnableMouseCapture);
+        let _ = out.execute(EnableBracketedPaste);
         let _ = out.flush();
         install_panic_hook();
         Ok(TermGuard { active: true })
@@ -36,6 +38,7 @@ impl TermGuard {
             return;
         }
         let mut out = io::stdout();
+        let _ = out.execute(DisableBracketedPaste);
         let _ = out.execute(DisableMouseCapture);
         let _ = out.execute(LeaveAlternateScreen);
         let _ = disable_raw_mode();

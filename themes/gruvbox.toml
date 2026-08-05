@@ -29,3 +29,9 @@ healthy = { hex = "#b8bb26", c256 = 142 }
 needs_you = { hex = "#fabd2f", c256 = 214 }
 terminal = { hex = "#fb4934", c256 = 167 }
 quiet = { hex = "#928374", c256 = 245 }
+
+# The workspace chrome's grounds: gruvbox bg0_s and bg2.
+[chrome]
+text = { hex = "#ebdbb2", c256 = 223 }
+panel = { hex = "#32302f", c256 = 236 }
+raised = { hex = "#504945", c256 = 239 }

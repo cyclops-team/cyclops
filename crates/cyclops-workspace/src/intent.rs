@@ -1,21 +1,15 @@
 //! UI intents mapped to tmux operations. The model updates only from
 //! reconciliation after tmux replies and notifications — never here.
 
-#![allow(dead_code)]
-
 use std::path::Path;
 
-use cyclops_tmux::{quote_arg, ControlClient, TmuxError};
+use cyclops_tmux::{quote_arg, session_target, ControlClient, TmuxError};
 
 /// Structural workspace actions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Intent {
-    NextTab,
-    PrevTab,
-    SelectTab(usize),
     /// Select a tab by tmux window id (`@n`) — robust to index gaps.
     SelectTabId(String),
-    NewTab,
     FocusLeft,
     FocusRight,
     FocusUp,
@@ -24,12 +18,7 @@ pub enum Intent {
     SplitDown,
     ClosePane,
     ZoomPane,
-    RenameTab,
-    CloseTab,
     SwitchWorkspace(String),
-    NewWorkspace,
-    RenameWorkspace,
-    CloseWorkspace,
 }
 
 /// Issue one intent against tmux. Does not mutate the workspace model.
@@ -39,23 +28,10 @@ pub async fn execute(
     active_pane: &str,
 ) -> Result<(), TmuxError> {
     match intent {
-        Intent::NextTab => {
-            client.command("next-window").await?;
-        }
-        Intent::PrevTab => {
-            client.command("previous-window").await?;
-        }
-        Intent::SelectTab(n) => {
-            let idx = n.saturating_sub(1);
-            client.command(&format!("select-window -t :{idx}")).await?;
-        }
         Intent::SelectTabId(id) => {
             client
                 .command(&format!("select-window -t {}", quote_arg(&id)))
                 .await?;
-        }
-        Intent::NewTab => {
-            execute_new_tab(client, None).await?;
         }
         Intent::FocusLeft => {
             client.command("select-pane -L").await?;
@@ -85,27 +61,30 @@ pub async fn execute(
                 .command(&format!("resize-pane -Z -t {}", quote_arg(active_pane)))
                 .await?;
         }
-        Intent::RenameTab => {}
-        Intent::CloseTab => {
-            client.command("kill-window").await?;
-        }
         Intent::SwitchWorkspace(name) => {
             client
-                .command(&format!("switch-client -t {}", quote_arg(&name)))
+                .command(&format!(
+                    "switch-client -t {}",
+                    quote_arg(&session_target(&name))
+                ))
                 .await?;
         }
-        Intent::NewWorkspace | Intent::RenameWorkspace | Intent::CloseWorkspace => {}
     }
     Ok(())
 }
 
-/// Create a tab, optionally in `cwd`, and return its window id. The new
-/// window is selected by tmux; the model converges from notifications.
+/// Create a tab, optionally named and rooted in `cwd`, and return its window
+/// id. One command owns creation plus naming, so the UI never exposes an
+/// intermediate default name.
 pub async fn execute_new_tab(
     client: &ControlClient,
     cwd: Option<&str>,
+    name: Option<&str>,
 ) -> Result<String, TmuxError> {
     let mut cmd = format!("new-window -P -F {}", quote_arg("#{window_id}"));
+    if let Some(name) = name.filter(|name| !name.is_empty()) {
+        cmd.push_str(&format!(" -n {}", quote_arg(name)));
+    }
     if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
         cmd.push_str(&format!(" -c {}", quote_arg(dir)));
     }
@@ -116,12 +95,15 @@ pub async fn execute_new_tab(
         .unwrap_or_default())
 }
 
-/// Create a workspace (tmux session) from a project folder.
+/// Create a workspace (tmux session) from a project folder and switch to
+/// it. The name is the folder's basename, sanitized for tmux and made
+/// unique against `taken`, so "create a workspace here" never collides.
 pub async fn execute_new_workspace(
     client: &ControlClient,
     folder: &Path,
+    taken: &[String],
 ) -> Result<String, TmuxError> {
-    let name = session_name_from_folder(folder);
+    let name = unique_session_name(&session_name_from_folder(folder), taken);
     let path = folder.to_string_lossy();
     client
         .command(&format!(
@@ -131,31 +113,93 @@ pub async fn execute_new_workspace(
         ))
         .await?;
     client
-        .command(&format!("switch-client -t {}", quote_arg(&name)))
+        .command(&format!(
+            "switch-client -t {}",
+            quote_arg(&session_target(&name))
+        ))
         .await?;
     Ok(name)
 }
 
-/// Rename the attached session.
-pub async fn execute_rename_workspace(client: &ControlClient, name: &str) -> Result<(), TmuxError> {
+/// Rename one session.
+pub async fn execute_rename_workspace(
+    client: &ControlClient,
+    session: &str,
+    name: &str,
+) -> Result<(), TmuxError> {
     client
-        .command(&format!("rename-session {}", quote_arg(name)))
+        .command(&format!(
+            "rename-session -t {} {}",
+            quote_arg(&session_target(session)),
+            quote_arg(name)
+        ))
         .await?;
     Ok(())
 }
 
-/// Close the attached session.
-pub async fn execute_close_workspace(client: &ControlClient) -> Result<(), TmuxError> {
-    client.command("kill-session").await?;
+/// Close one session. When it owns this control client, switch the client
+/// to `fallback` first so closing one workspace does not strand the UI while
+/// other sessions still exist.
+pub async fn execute_close_workspace(
+    client: &ControlClient,
+    session: &str,
+    fallback: Option<&str>,
+) -> Result<(), TmuxError> {
+    if let Some(fallback) = fallback {
+        client
+            .command(&format!(
+                "switch-client -t {}",
+                quote_arg(&session_target(fallback))
+            ))
+            .await?;
+    }
+    client
+        .command(&format!(
+            "kill-session -t {}",
+            quote_arg(&session_target(session))
+        ))
+        .await?;
     Ok(())
 }
 
-fn session_name_from_folder(folder: &Path) -> String {
-    folder
+/// A folder basename as a tmux session name. tmux reserves `.` and `:` in
+/// targets, so they become `-`; an unusable basename falls back to
+/// "workspace".
+pub fn session_name_from_folder(folder: &Path) -> String {
+    let name: String = folder
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("project")
-        .to_string()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .map(|c| {
+            if c == '.' || c == ':' || c.is_control() {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = name.trim_matches('-');
+    if trimmed.is_empty() {
+        "workspace".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// `base`, or the first `base-N` (N from 2) not in `taken`.
+pub fn unique_session_name(base: &str, taken: &[String]) -> String {
+    if !taken.iter().any(|t| t == base) {
+        return base.to_string();
+    }
+    for n in 2.. {
+        let candidate = format!("{base}-{n}");
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("some suffix is always free")
 }
 
 /// Switch to adjacent workspace by index delta.
@@ -174,10 +218,26 @@ pub async fn execute_switch_workspace_by_delta(
     execute(client, Intent::SwitchWorkspace(name), "").await
 }
 
-/// Rename the active window after the user supplies a name.
-pub async fn execute_rename(client: &ControlClient, name: &str) -> Result<(), TmuxError> {
+/// Rename one window after the user supplies a name.
+pub async fn execute_rename_tab(
+    client: &ControlClient,
+    window_id: &str,
+    name: &str,
+) -> Result<(), TmuxError> {
     client
-        .command(&format!("rename-window {}", quote_arg(name)))
+        .command(&format!(
+            "rename-window -t {} {}",
+            quote_arg(window_id),
+            quote_arg(name)
+        ))
+        .await?;
+    Ok(())
+}
+
+/// Close one window.
+pub async fn execute_close_tab(client: &ControlClient, window_id: &str) -> Result<(), TmuxError> {
+    client
+        .command(&format!("kill-window -t {}", quote_arg(window_id)))
         .await?;
     Ok(())
 }
@@ -237,32 +297,6 @@ async fn split(client: &ControlClient, pane: &str, horizontal: bool) -> Result<(
     Ok(())
 }
 
-impl From<crate::bindings::BindingAction> for Intent {
-    fn from(action: crate::bindings::BindingAction) -> Self {
-        use crate::bindings::BindingAction::*;
-        match action {
-            NextTab => Intent::NextTab,
-            PrevTab => Intent::PrevTab,
-            SelectTab(n) => Intent::SelectTab(n),
-            NewTab => Intent::NewTab,
-            FocusLeft => Intent::FocusLeft,
-            FocusRight => Intent::FocusRight,
-            FocusUp => Intent::FocusUp,
-            FocusDown => Intent::FocusDown,
-            SplitRight => Intent::SplitRight,
-            SplitDown => Intent::SplitDown,
-            ClosePane => Intent::ClosePane,
-            ZoomPane => Intent::ZoomPane,
-            RenameTab => Intent::RenameTab,
-            CloseTab => Intent::CloseTab,
-            NextWorkspace | PrevWorkspace | NewWorkspace | RenameWorkspace | CloseWorkspace => {
-                unreachable!("workspace actions use dedicated handlers")
-            }
-            ToggleEventPanel | Detach => unreachable!("handled in app"),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use cyclops_testrig::{tmux_available, TmuxServer};
@@ -283,21 +317,27 @@ mod tests {
             return;
         }
         let server = TmuxServer::new("ws-create");
-        let folder = "/tmp/cyclops-ws-create";
-        std::fs::create_dir_all(folder).expect("folder");
+        let folder = cyclops_proto::scratch::scratch_dir("cyclops-ws-create");
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).expect("folder");
         server.run_ok(&["new-session", "-d", "-s", "host", "/bin/sh"]);
         let client = rig_client(&server, "host").await;
-        let name = execute_new_workspace(&client, std::path::Path::new(folder))
+        let name = execute_new_workspace(&client, &folder, &[])
             .await
             .expect("create");
-        assert_eq!(name, "cyclops-ws-create");
+        assert_eq!(
+            name,
+            folder.file_name().unwrap().to_string_lossy(),
+            "the session name comes from the scratch folder"
+        );
         let out = server.run(&["display-message", "-p", "-t", &name, "#{session_path}"]);
         assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim(),
-            folder,
+            std::fs::canonicalize(String::from_utf8_lossy(&out.stdout).trim()).unwrap(),
+            std::fs::canonicalize(&folder).unwrap(),
             "session default directory should match folder"
         );
         client.shutdown().await;
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     fn pane_ids(server: &TmuxServer, target: &str) -> Vec<String> {
@@ -315,9 +355,18 @@ mod tests {
             return;
         }
         let server = TmuxServer::new("intent-split");
-        let src = "/tmp/cyclops-split-src";
-        std::fs::create_dir_all(src).expect("split src dir");
-        server.run_ok(&["new-session", "-d", "-s", "s", "-c", src, "/bin/sh"]);
+        let src = cyclops_proto::scratch::scratch_dir("cyclops-split-src");
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).expect("split src dir");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-c",
+            src.to_str().expect("UTF-8 scratch path"),
+            "/bin/sh",
+        ]);
         let client = rig_client(&server, "s").await;
         let before = pane_ids(&server, "s");
         let pane = before[0].clone();
@@ -334,13 +383,14 @@ mod tests {
             .display(new_pane, "#{pane_current_path}")
             .await
             .expect("path");
-        let expected = std::fs::canonicalize(src).expect("canonical src");
+        let expected = std::fs::canonicalize(&src).expect("canonical src");
         let actual = std::fs::canonicalize(path.trim()).expect("canonical pane path");
         assert_eq!(
             actual, expected,
             "new split pane should inherit source pane_current_path"
         );
         client.shutdown().await;
+        let _ = std::fs::remove_dir_all(&src);
     }
 
     #[tokio::test]
@@ -377,17 +427,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_tab_updates_window_name() {
+    async fn rename_tab_targets_the_named_window() {
         if !tmux_available() {
             return;
         }
         let server = TmuxServer::new("intent-rename");
         server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        // A second window is active, so an untargeted rename would hit it
+        // instead of the first — the id must carry the target.
+        server.run_ok(&["new-window", "-t", "s", "-n", "active", "/bin/sh"]);
+        let out = server.run(&["list-windows", "-t", "s", "-F", "#{window_id}"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let first = stdout.lines().next().expect("first window id").to_string();
         let client = rig_client(&server, "s").await;
-        execute_rename(&client, "review").await.expect("rename");
+        execute_rename_tab(&client, &first, "review")
+            .await
+            .expect("rename");
         let out = server.run(&["list-windows", "-t", "s", "-F", "#{window_name}"]);
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "review");
+        let names = String::from_utf8_lossy(&out.stdout);
+        let names: Vec<_> = names.lines().collect();
+        assert_eq!(names, vec!["review", "active"]);
         client.shutdown().await;
+    }
+
+    #[test]
+    fn folder_names_sanitize_for_tmux() {
+        use std::path::Path;
+        assert_eq!(session_name_from_folder(Path::new("/a/cyclops")), "cyclops");
+        // `.` and `:` are tmux target syntax; a dotfile folder must not
+        // produce a name tmux reads as "window of the empty session".
+        assert_eq!(
+            session_name_from_folder(Path::new("/a/my.project")),
+            "my-project"
+        );
+        assert_eq!(session_name_from_folder(Path::new("/a/.config")), "config");
+        assert_eq!(
+            session_name_from_folder(Path::new("/a/line\nbreak")),
+            "line-break"
+        );
+        assert_eq!(session_name_from_folder(Path::new("/")), "workspace");
+    }
+
+    #[test]
+    fn duplicate_workspace_names_get_a_suffix() {
+        let taken = vec!["cyclops".to_string(), "cyclops-2".to_string()];
+        assert_eq!(unique_session_name("cyclops", &taken), "cyclops-3");
+        assert_eq!(unique_session_name("fresh", &taken), "fresh");
     }
 
     #[tokio::test]
@@ -408,14 +493,66 @@ mod tests {
         ]);
         let client = rig_client(&server, "closetab").await;
         client.command("select-window -t :1").await.expect("focus");
-        let pane = pane_ids(&server, "closetab:1")[0].clone();
-        execute(&client, Intent::CloseTab, &pane)
-            .await
-            .expect("close tab");
+        execute_close_tab(&client, "@1").await.expect("close tab");
         let out = server.run(&["list-windows", "-t", "closetab", "-F", "#{window_name}"]);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let names: Vec<_> = stdout.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(names.len(), 1);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stale_session_target_never_falls_through_to_a_prefix_match() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("intent-exact-session");
+        server.run_ok(&["new-session", "-d", "-s", "host", "/bin/sh"]);
+        server.run_ok(&["new-session", "-d", "-s", "proj", "/bin/sh"]);
+        server.run_ok(&["new-session", "-d", "-s", "project", "/bin/sh"]);
+        let client = rig_client(&server, "host").await;
+        server.run_ok(&["kill-session", "-t", "=proj"]);
+
+        assert!(
+            execute_close_workspace(&client, "proj", None)
+                .await
+                .is_err(),
+            "a vanished exact target must fail instead of matching `project`"
+        );
+        let sessions = server.run(&["list-sessions", "-F", "#{session_name}"]);
+        let sessions = String::from_utf8_lossy(&sessions.stdout);
+        assert!(
+            sessions.lines().any(|name| name == "project"),
+            "the prefix-neighbor session must survive: {sessions}"
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn closing_the_attached_workspace_moves_to_a_survivor_first() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("intent-close-active-session");
+        server.run_ok(&["new-session", "-d", "-s", "alpha", "/bin/sh"]);
+        server.run_ok(&["new-session", "-d", "-s", "beta", "/bin/sh"]);
+        let client = rig_client(&server, "alpha").await;
+
+        execute_close_workspace(&client, "alpha", Some("beta"))
+            .await
+            .expect("switch then close");
+
+        assert_eq!(
+            client
+                .command("display-message -p '#{session_name}'")
+                .await
+                .expect("client remains live"),
+            vec!["beta"]
+        );
+        let sessions = server.run(&["list-sessions", "-F", "#{session_name}"]);
+        let sessions = String::from_utf8_lossy(&sessions.stdout);
+        assert!(!sessions.lines().any(|name| name == "alpha"));
+        assert!(sessions.lines().any(|name| name == "beta"));
         client.shutdown().await;
     }
 

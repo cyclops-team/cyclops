@@ -33,8 +33,12 @@ pub enum Notification {
     },
     /// This client's attached session changed.
     SessionChanged { session: String, name: String },
-    /// The attached session was renamed.
-    SessionRenamed { name: String },
+    /// A session was renamed. tmux 3.7 includes its stable id; older
+    /// versions may send only the new name.
+    SessionRenamed {
+        session: Option<String>,
+        name: String,
+    },
     /// Sessions were created or destroyed somewhere on the server.
     SessionsChanged,
     /// Window linked into the attached session.
@@ -179,8 +183,15 @@ pub fn parse_notification(line: &str) -> Notification {
             },
             None => Notification::Other(line.to_string()),
         },
-        "%session-renamed" => Notification::SessionRenamed {
-            name: rest.to_string(),
+        "%session-renamed" => match rest.split_once(' ') {
+            Some((session, name)) if session.starts_with('$') => Notification::SessionRenamed {
+                session: Some(session.to_string()),
+                name: name.to_string(),
+            },
+            _ => Notification::SessionRenamed {
+                session: None,
+                name: rest.to_string(),
+            },
         },
         "%sessions-changed" => Notification::SessionsChanged,
         "%window-add" => Notification::WindowAdd {
@@ -438,6 +449,20 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_notification("%session-renamed $1 renamed project"),
+            Notification::SessionRenamed {
+                session: Some("$1".into()),
+                name: "renamed project".into()
+            }
+        );
+        assert_eq!(
+            parse_notification("%session-renamed legacy-name"),
+            Notification::SessionRenamed {
+                session: None,
+                name: "legacy-name".into()
+            }
+        );
+        assert_eq!(
             parse_notification("%window-renamed @0 my window name"),
             Notification::WindowRenamed {
                 window: "@0".into(),
@@ -534,7 +559,8 @@ mod tests {
         // structure survives with U+FFFD in the text.
         let n = parse_notification_bytes(b"%session-renamed na\xffme");
         match n {
-            Notification::SessionRenamed { name } => {
+            Notification::SessionRenamed { session, name } => {
+                assert_eq!(session, None);
                 assert_eq!(name, "na\u{FFFD}me");
             }
             other => panic!("wrong parse: {other:?}"),

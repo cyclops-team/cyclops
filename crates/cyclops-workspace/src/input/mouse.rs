@@ -1,7 +1,5 @@
 //! Mouse hit regions and routing.
 
-#![allow(dead_code)]
-
 use ratatui::layout::Rect;
 
 use crate::bindings::BindingAction;
@@ -11,16 +9,17 @@ use crate::layout::SplitDir;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HitTarget {
     PaneBody { pane_id: String },
-    PaneBorder { pane_id: String },
     PaneSplitRight { pane_id: String },
     PaneSplitDown { pane_id: String },
     Divider { pane_id: String, dir: SplitDir },
-    Tab { index: usize },
+    Tab { window_id: String },
     NewTabButton,
-    SidebarRow { index: usize },
+    SidebarRow { session: String },
     AttentionIndicator { pane_id: String },
     AppMenu,
     MenuItem { action: BindingAction },
+    DialogConfirm,
+    DialogCancel,
 }
 
 /// Geometry recorded during render for cell hit-testing.
@@ -28,8 +27,6 @@ pub enum HitTarget {
 pub struct PaneGeometry {
     pub pane_id: String,
     pub inner: Rect,
-    pub cols: u16,
-    pub rows: u16,
 }
 
 /// One recorded hit region from the last render pass.
@@ -52,16 +49,20 @@ impl HitMap {
         self.pane_geometries.clear();
     }
 
+    /// Remove menu rows as soon as a menu closes. The next frame restores
+    /// the complete map; until then a fast second click must not replay a
+    /// command through stale overlay geometry.
+    pub fn clear_menu_items(&mut self) {
+        self.regions
+            .retain(|region| !matches!(region.target, HitTarget::MenuItem { .. }));
+    }
+
     pub fn push_geometry(&mut self, geometry: PaneGeometry) {
         self.pane_geometries.push(geometry);
     }
 
     pub fn pane_geometry(&self, pane_id: &str) -> Option<&PaneGeometry> {
         self.pane_geometries.iter().find(|g| g.pane_id == pane_id)
-    }
-
-    pub fn pane_geometries(&self) -> &[PaneGeometry] {
-        &self.pane_geometries
     }
 
     pub fn push(&mut self, rect: Rect, target: HitTarget) {
@@ -83,6 +84,7 @@ impl HitMap {
             .map(|r| &r.target)
     }
 
+    #[cfg(test)]
     pub fn regions(&self) -> &[HitRegion] {
         &self.regions
     }
@@ -103,12 +105,14 @@ impl HitMap {
     }
 }
 
-/// Open menu state — app menu and context menu are mutually exclusive.
+/// Open menu state — at most one menu is open at a time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuState {
     None,
     AppMenu,
     ContextMenu { pane_id: String, at: (u16, u16) },
+    TabMenu { window_id: String, at: (u16, u16) },
+    WorkspaceMenu { session: String, at: (u16, u16) },
 }
 
 impl MenuState {
@@ -128,7 +132,12 @@ mod tests {
     #[test]
     fn hit_test_returns_topmost_region() {
         let mut map = HitMap::default();
-        map.push(Rect::new(0, 0, 10, 10), HitTarget::Tab { index: 0 });
+        map.push(
+            Rect::new(0, 0, 10, 10),
+            HitTarget::Tab {
+                window_id: "@0".into(),
+            },
+        );
         map.push(
             Rect::new(2, 2, 4, 4),
             HitTarget::PaneBody {
@@ -136,25 +145,30 @@ mod tests {
             },
         );
         assert!(matches!(map.hit(3, 3), Some(HitTarget::PaneBody { .. })));
-        assert!(matches!(map.hit(9, 9), Some(HitTarget::Tab { index: 0 })));
+        assert!(matches!(
+            map.hit(9, 9),
+            Some(HitTarget::Tab { window_id }) if window_id == "@0"
+        ));
     }
 
     #[test]
-    fn pane_body_hit_distinguishes_from_border() {
+    fn closing_a_menu_removes_only_its_stale_rows() {
         let mut map = HitMap::default();
         map.push(
             Rect::new(0, 0, 10, 5),
-            HitTarget::PaneBorder {
-                pane_id: "%0".into(),
-            },
-        );
-        map.push(
-            Rect::new(1, 1, 8, 3),
             HitTarget::PaneBody {
                 pane_id: "%0".into(),
             },
         );
-        assert!(matches!(map.hit(5, 2), Some(HitTarget::PaneBody { .. })));
-        assert!(matches!(map.hit(0, 0), Some(HitTarget::PaneBorder { .. })));
+        map.push(
+            Rect::new(1, 1, 8, 1),
+            HitTarget::MenuItem {
+                action: BindingAction::ClosePane,
+            },
+        );
+
+        map.clear_menu_items();
+
+        assert!(matches!(map.hit(2, 1), Some(HitTarget::PaneBody { .. })));
     }
 }

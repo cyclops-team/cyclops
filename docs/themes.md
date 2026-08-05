@@ -89,16 +89,17 @@ names only some tokens falls back to that table for the rest.
 
 ## Tokens
 
-21 tokens change what you see:
+24 tokens change what you see:
 
 | Group | Tokens | Used for |
 |---|---|---|
 | `role` | `1`..`8` | Stable per-agent colors; a label hashes to a slot |
 | `surface` | `dim` | Detail columns, gutters, separators, every dimmed qualifier |
-| `surface` | `accent` | The marker on the row a surface is pointing at: the selected entry in `ui`, the active theme in `cyclops theme` |
+| `surface` | `accent` | The marker on the row a surface is pointing at: the selected entry in `ui`, the active theme in `cyclops theme`, the workspace's focused-pane ring |
 | `eye` | `calm` `alert` | The eye, in both the `status` and `ui` headers: calm closed, alert open |
 | `state` | `healthy` `needs_you` `terminal` `quiet` `dead` | Agent state cells, by group, including on pane borders |
 | `badge` | `healthy` `needs_you` `terminal` `quiet` | Delivery badges, the same groups read on a delivery |
+| `chrome` | `text` `panel` `raised` | The workspace chrome palette: explicit `text` on `panel` under the tab strip, pane gutters and menus; `raised` under the active tab, active workspace row, hovered menu items and selected text |
 
 One more token exists and is worth knowing about. `surface.fg` is the
 engine's fallback for a token name outside this list, which only a bug
@@ -166,6 +167,11 @@ deliberately the hardest cell to read: it marks a pane whose process is
 gone, and there is nothing to do about one. Both exceptions measure
 2.82:1 against their ground.
 
+The two `chrome` grounds are backgrounds, not figures, so they are not
+held to the figure floor. Their bar, measured by the same test, is that
+`chrome.text` stays readable on both grounds at the theme's floor, and
+that the grounds stay different in truecolor and 256-color terminals.
+
 ## What is not themeable
 
 There are no `stream.*` tokens. The stream's gutter resolves
@@ -173,9 +179,11 @@ There are no `stream.*` tokens. The stream's gutter resolves
 print in the terminal's own foreground, so tuning `surface.dim` moves the
 CLI and the stream together instead of letting them drift.
 
-There is no `surface.bg`. Nothing paints a ground: one-shot commands
-print onto the terminal's own background and the full-screen stream
-inherits it.
+There is no `surface.bg`. Pane bodies and one-shot commands print onto
+the terminal's own background and the full-screen stream inherits it.
+The workspace chrome is the one surface that paints grounds, and its
+palette is the `chrome` group above — scoped so no theme mistakes it for
+a page background.
 
 Naming either of them in a theme file warns on stderr and is skipped, and
 so does a per-state token name from before the groups (`state.idle`,
@@ -203,7 +211,7 @@ compiled defaults; only broken TOML stops the file loading at all. Nothing
 in a theme executes.
 
 That tolerance has one edge, and `cyclops theme` handles it rather than
-letting you fall into it. A file that loads and sets none of the 21 tokens
+letting you fall into it. A file that loads and sets none of the 24 tokens
 that change what you see is not listed and not accepted by name. Empty, a
 `name` and nothing else, every token name stale, and `surface.fg` alone
 all parse cleanly, and every color would still come off the compiled

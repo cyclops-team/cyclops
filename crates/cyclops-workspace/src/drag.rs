@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Drag state machine for dividers, tabs, and pane drops.
 
 use crate::layout::SplitDir;
@@ -7,26 +5,13 @@ use crate::layout::SplitDir;
 /// What a drag operation targets once it crosses the movement threshold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DragTarget {
-    Divider {
-        pane_id: String,
-        dir: SplitDir,
-    },
-    Tab {
-        index: usize,
-    },
-    TabToWorkspace {
-        tab_index: usize,
-        workspace_index: usize,
-    },
-    Pane {
-        pane_id: String,
-    },
+    Divider { pane_id: String, dir: SplitDir },
+    Tab { window_id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DragPhase {
     Down,
-    Threshold,
     Moving,
 }
 
@@ -58,9 +43,6 @@ impl DragState {
     pub fn on_move(&mut self, x: u16, y: u16) {
         self.current = (x, y);
         if self.phase == DragPhase::Down && self.past_threshold() {
-            self.phase = DragPhase::Threshold;
-        }
-        if self.phase == DragPhase::Threshold || self.phase == DragPhase::Moving {
             self.phase = DragPhase::Moving;
         }
     }
@@ -72,33 +54,15 @@ impl DragState {
     }
 
     /// Commit on mouse up. None when the drag never crossed the threshold.
-    pub fn on_up(&mut self) -> Option<DragTarget> {
+    pub fn on_up(&self) -> Option<DragTarget> {
         if !self.past_threshold() {
-            *self = Self::on_down(self.target.clone(), self.start.0, self.start.1);
             return None;
         }
         Some(self.target.clone())
     }
 
-    pub fn cancel(&mut self) {
-        self.phase = DragPhase::Down;
-        self.current = self.start;
-    }
-
     pub fn is_active(&self) -> bool {
-        matches!(self.phase, DragPhase::Threshold | DragPhase::Moving)
-    }
-
-    /// Resize steps coalesced from a divider drag delta.
-    pub fn divider_resize_steps(&self, dir: SplitDir) -> i32 {
-        if !self.is_active() {
-            return 0;
-        }
-        let delta = match dir {
-            SplitDir::Horizontal => self.current.0 as i32 - self.start.0 as i32,
-            SplitDir::Vertical => self.current.1 as i32 - self.start.1 as i32,
-        };
-        delta.signum()
+        self.phase == DragPhase::Moving
     }
 }
 
@@ -131,23 +95,10 @@ mod tests {
     }
 
     #[test]
-    fn escape_cancels() {
-        let mut drag = DragState::on_down(DragTarget::Tab { index: 1 }, 0, 0);
-        drag.on_move(10, 0);
-        drag.cancel();
-        assert!(!drag.is_active());
-    }
-
-    #[test]
     fn each_target_variant_lifecycle() {
         for target in [
-            DragTarget::Tab { index: 0 },
-            DragTarget::Pane {
-                pane_id: "%1".into(),
-            },
-            DragTarget::TabToWorkspace {
-                tab_index: 0,
-                workspace_index: 1,
+            DragTarget::Tab {
+                window_id: "@0".into(),
             },
             divider(),
         ] {
@@ -156,23 +107,6 @@ mod tests {
             assert!(drag.is_active());
             assert_eq!(drag.on_up(), Some(target));
         }
-    }
-
-    #[test]
-    fn divider_resize_sign_follows_motion() {
-        let mut drag = DragState::on_down(
-            DragTarget::Divider {
-                pane_id: "%0".into(),
-                dir: SplitDir::Horizontal,
-            },
-            10,
-            5,
-        );
-        drag.on_move(20, 5);
-        assert_eq!(drag.divider_resize_steps(SplitDir::Horizontal), 1);
-        drag.start = (20, 5);
-        drag.on_move(5, 5);
-        assert_eq!(drag.divider_resize_steps(SplitDir::Horizontal), -1);
     }
 
     #[tokio::test]

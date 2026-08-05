@@ -9,13 +9,27 @@ pub const HELP_HINT: &str = "Run cyclops --help for commands.";
 
 pub const CONFIRM_CLOSE_PANE: &str = "Close this pane? An agent may be running. [y/N]";
 
-pub const RENAME_TAB_PROMPT: &str = "Rename tab: ";
+pub const CONFIRM_CLOSE_TAB: &str = "Close this tab? Its panes may host agents. [y/N]";
 
-pub const NEW_WORKSPACE_PROMPT: &str = "New workspace folder: ";
+pub const RENAME_TAB_PROMPT: &str = "Rename tab";
 
-pub const RENAME_WORKSPACE_PROMPT: &str = "Rename workspace: ";
+pub const NEW_TAB_TITLE: &str = "New tab";
+
+pub const NEW_TAB_HINT: &str = "Opens in the current pane's directory.";
+
+pub const RENAME_WORKSPACE_PROMPT: &str = "Rename workspace";
 
 pub const CONFIRM_CLOSE_WORKSPACE: &str = "Close this workspace? [y/N]";
+
+pub const BUTTON_CREATE: &str = "Create";
+
+pub const BUTTON_SAVE: &str = "Save";
+
+pub const BUTTON_CANCEL: &str = "Cancel";
+
+pub const BUTTON_YES: &str = "Yes";
+
+pub const BUTTON_NO: &str = "No";
 
 pub const RECONNECTING_NOTE: &str = "reconnecting…";
 
@@ -37,8 +51,16 @@ pub const MENU_CLOSE_PANE: &str = "Close pane";
 
 pub const MENU_NEW_TAB: &str = "New tab";
 
-pub const MENU_NEW_WORKSPACE: &str = "New workspace…";
+pub const MENU_NEW_WORKSPACE: &str = "New workspace";
 
 pub const MENU_TOGGLE_EVENTS: &str = "Events panel";
 
 pub const MENU_DETACH: &str = "Detach";
+
+pub const MENU_RENAME_TAB: &str = "Rename tab";
+
+pub const MENU_CLOSE_TAB: &str = "Close tab";
+
+pub const MENU_RENAME_WORKSPACE: &str = "Rename workspace";
+
+pub const MENU_CLOSE_WORKSPACE: &str = "Close workspace";

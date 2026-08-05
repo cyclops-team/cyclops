@@ -193,6 +193,17 @@ pub fn pane_ids_in_layout(node: &ResolvedLayout) -> Vec<String> {
         .collect()
 }
 
+/// Whether one pane id is a leaf of this layout, without allocating the
+/// complete id list. Output routing calls this for every control-mode chunk.
+pub fn layout_contains_pane(node: &ResolvedLayout, pane_id: &str) -> bool {
+    match node {
+        ResolvedLayout::Leaf { pane_id: id, .. } => id == pane_id,
+        ResolvedLayout::Split { children, .. } => children
+            .iter()
+            .any(|child| layout_contains_pane(child, pane_id)),
+    }
+}
+
 /// Collect `(pane_id, cols, rows)` for every leaf in layout order.
 pub fn pane_dims_in_layout(node: &ResolvedLayout) -> Vec<(String, u16, u16)> {
     let mut out = Vec::new();
@@ -541,6 +552,15 @@ mod tests {
                 height: 24,
             }
         );
+    }
+
+    #[test]
+    fn pane_membership_does_not_build_a_side_list() {
+        let node = parse_layout("4c3e,40x11,0,0[40x5,0,0,0,40x5,0,6,1]").unwrap();
+        let layout = resolve_layout(&node, &[]).unwrap();
+        assert!(layout_contains_pane(&layout, "%0"));
+        assert!(layout_contains_pane(&layout, "%1"));
+        assert!(!layout_contains_pane(&layout, "%2"));
     }
 
     #[test]

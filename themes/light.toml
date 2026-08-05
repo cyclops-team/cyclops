@@ -43,7 +43,11 @@
 # arithmetic is in crates/cyclops-theme/tests/shipped.rs and the numbers
 # below are pinned there by shipped_themes_meet_their_stated_contrast.
 #
-# Floor 3.6:1 for every token except state.dead, which is WCAG's 3:1 bar
+# Floor 3.6:1 for every figure token except state.dead; the two [chrome]
+# grounds are backgrounds the workspace chrome paints, not figures, so
+# their bar (pinned in the same test) is that chrome.text stays readable
+# on both grounds at this floor, not that they clear it themselves.
+# state.dead's own bar is WCAG's 3:1 bar
 # for large text and interface elements, cleared with room. The floor is
 # surface.accent, eye.alert and role.1 at 3.67:1, all three the site's own
 # --sage-ink; role.2 follows at 3.68:1. The rest: role slots to 5.4:1,
@@ -93,3 +97,11 @@ healthy = { hex = "#2a7a3f", c256 = 29 }
 needs_you = { hex = "#8a6520", c256 = 94 }
 terminal = { hex = "#9c3838", c256 = 131 }
 quiet = { hex = "#6e6e6e", c256 = 242 }
+
+# The workspace chrome's grounds, a step and two steps down from --paper:
+# on a light page the chrome recedes by darkening. chrome.text on raised
+# measures 10.9:1.
+[chrome]
+text = { hex = "#2a2a2a", c256 = 235 }
+panel = { hex = "#f1f1f1", c256 = 255 }
+raised = { hex = "#e0e0e0", c256 = 254 }
