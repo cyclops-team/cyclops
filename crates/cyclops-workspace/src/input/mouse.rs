@@ -4,6 +4,7 @@
 
 use ratatui::layout::Rect;
 
+use crate::bindings::BindingAction;
 use crate::layout::SplitDir;
 
 /// What a click or wheel event targets.
@@ -15,9 +16,11 @@ pub enum HitTarget {
     PaneSplitDown { pane_id: String },
     Divider { pane_id: String, dir: SplitDir },
     Tab { index: usize },
+    NewTabButton,
     SidebarRow { index: usize },
     AttentionIndicator { pane_id: String },
     AppMenu,
+    MenuItem { action: BindingAction },
 }
 
 /// Geometry recorded during render for cell hit-testing.
@@ -105,12 +108,16 @@ impl HitMap {
 pub enum MenuState {
     None,
     AppMenu,
-    ContextMenu { pane_id: String },
+    ContextMenu { pane_id: String, at: (u16, u16) },
 }
 
 impl MenuState {
     pub fn close(&mut self) {
         *self = MenuState::None;
+    }
+
+    pub fn is_open(&self) -> bool {
+        *self != MenuState::None
     }
 }
 

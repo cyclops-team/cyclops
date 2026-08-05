@@ -32,9 +32,14 @@ Unbound keys pass through to the focused pane.
 
 ## Mouse
 
-Click panes, tabs, and sidebar rows to focus. Wheel scrolls pane history.
-Right-click a pane for the context menu. Split controls sit in the
-upper-right corner of each pane.
+Click panes, tabs, and sidebar rows to focus; `+` in the tab bar opens a
+tab in the current pane's directory. Wheel scrolls pane history — new
+output never yanks a scrolled viewport. Right-click a pane for the context
+menu; the `☰ menu` button at the sidebar's bottom opens the application
+menu. Split controls sit in the upper-right corner of the focused pane.
+Drag a divider to resize, drag a tab onto another tab to reorder, or onto
+a sidebar row to move it there. Click-drag inside a pane selects text and
+copies it on release; double-click selects a word, triple-click a line.
 
 Rebindings live under `[workspace.bindings]` in `config.toml`.
 

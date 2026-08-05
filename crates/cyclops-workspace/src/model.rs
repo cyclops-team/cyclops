@@ -94,3 +94,21 @@ pub struct PaneSlot {
     pub rect: Rect,
     pub focused: bool,
 }
+
+/// `(pane_id, cols, rows)` of every pane the tab shows. A zoomed tab shows
+/// only its active pane, at the full window size.
+pub fn visible_pane_dims(tab: &TabModel) -> Vec<(String, u16, u16)> {
+    if tab.zoomed {
+        let root = tab.layout.rect();
+        return vec![(tab.active_pane.clone(), root.width, root.height)];
+    }
+    crate::layout::pane_dims_in_layout(&tab.layout)
+}
+
+/// Pane ids the tab shows (zoom-aware).
+pub fn visible_pane_ids(tab: &TabModel) -> Vec<String> {
+    visible_pane_dims(tab)
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect()
+}

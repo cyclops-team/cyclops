@@ -1,13 +1,13 @@
 //! Reconcile workspace model from tmux.
 
-use std::collections::HashMap;
-
 use cyclops_tmux::{
     list_panes, list_sessions, list_windows, ControlClient, TmuxError, WindowPaneRow, WindowRow,
 };
 
-use crate::layout::{pane_ids_in_layout, parse_layout, resolve_layout};
-use crate::model::{RuntimeRegistry, SessionModel, TabModel, WorkspaceModel, WorkspaceRow};
+use crate::layout::{parse_layout, resolve_layout};
+use crate::model::{
+    visible_pane_dims, RuntimeRegistry, SessionModel, TabModel, WorkspaceModel, WorkspaceRow,
+};
 use crate::runtime::{snapshot_from_bundle, PaneRuntime};
 
 /// Build the full workspace model from tmux.
@@ -57,8 +57,7 @@ pub fn fetch_session_model(session: &str, socket: Option<&str>) -> Result<Sessio
 }
 
 fn build_tab(window: &WindowRow, panes: &[WindowPaneRow]) -> Result<TabModel, TmuxError> {
-    let index_to_id: HashMap<usize, String> =
-        panes.iter().map(|p| (p.index, p.id.clone())).collect();
+    let known: Vec<String> = panes.iter().map(|p| p.id.clone()).collect();
     let layout_node = parse_layout(&window.layout)
         .map_err(|e| TmuxError::Protocol(format!("layout parse: {e}")))?;
     let active_pane = panes
@@ -67,18 +66,22 @@ fn build_tab(window: &WindowRow, panes: &[WindowPaneRow]) -> Result<TabModel, Tm
         .map(|p| p.id.clone())
         .or_else(|| panes.first().map(|p| p.id.clone()))
         .unwrap_or_else(|| "%0".to_string());
-    let layout = match resolve_layout(&layout_node, &index_to_id) {
+    let layout = match resolve_layout(&layout_node, &known) {
         Some(layout) => layout,
         None => {
-            // tmux layout leaf numbers can disagree with #{pane_index} on
-            // some builds; fall back to one leaf per listed pane.
+            // Layout leaves name a pane the listing does not know — a race
+            // between the two reads. Render the first pane alone; the next
+            // %layout-change reconciles.
+            let root = layout_node.rect();
             let pane = panes
                 .first()
                 .ok_or_else(|| TmuxError::Protocol(format!("no panes in window {}", window.id)))?;
             crate::layout::ResolvedLayout::Leaf {
                 pane_id: pane.id.clone(),
-                width: 80,
-                height: 24,
+                x: 0,
+                y: 0,
+                width: root.width,
+                height: root.height,
             }
         }
     };
@@ -92,16 +95,23 @@ fn build_tab(window: &WindowRow, panes: &[WindowPaneRow]) -> Result<TabModel, Tm
     })
 }
 
-/// Hydrate runtimes for every pane on the visible tab.
+/// Hydrate runtimes for every pane on the visible tab. A runtime whose grid
+/// no longer matches the pane's layout size is rehydrated fresh — feeding
+/// bytes into a stale-sized grid scrambles rows (the recovery rule from the
+/// hydration design: never trust continuity across a resize).
 pub async fn hydrate_visible_tab(
     client: &ControlClient,
     tab: &TabModel,
     registry: &mut RuntimeRegistry,
 ) -> Result<(), TmuxError> {
-    let pane_ids = pane_ids_in_layout(&tab.layout);
+    let dims = visible_pane_dims(tab);
+    let pane_ids: Vec<String> = dims.iter().map(|(id, _, _)| id.clone()).collect();
     registry.retain_visible(&pane_ids);
-    for pane_id in pane_ids {
-        if registry.get(&pane_id).is_some() {
+    for (pane_id, cols, rows) in dims {
+        let fresh = registry
+            .get(&pane_id)
+            .is_some_and(|rt| rt.size() == (cols, rows));
+        if fresh {
             continue;
         }
         let bundle = client.hydrate_pane(&pane_id).await?;

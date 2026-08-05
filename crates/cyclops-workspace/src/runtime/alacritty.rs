@@ -164,7 +164,23 @@ impl AlacrittyVt {
         } else {
             &snapshot.visible
         };
-        self.feed_internal(bytes);
+        // Capture rows arrive joined with bare LF; a VT treats LF as
+        // index-down without carriage return, so feed each row with CRLF or
+        // columns staircase.
+        for (i, row) in bytes.split(|&b| b == b'\n').enumerate() {
+            if i > 0 {
+                self.feed_internal(b"\r\n");
+            }
+            self.feed_internal(row);
+        }
+        // The replay leaves the cursor after the last capture cell; move it
+        // to where the pane really has it.
+        let seq = format!(
+            "\x1b[{};{}H",
+            snapshot.cursor_y.saturating_add(1),
+            snapshot.cursor_x.saturating_add(1)
+        );
+        self.feed_internal(seq.as_bytes());
     }
 
     /// Visible cells and attributes.
@@ -172,6 +188,16 @@ impl AlacrittyVt {
         CellGridView {
             grid: &self.cached_grid,
         }
+    }
+
+    /// Grid dimensions as `(cols, rows)`.
+    pub fn size(&self) -> (u16, u16) {
+        (self.cols, self.rows)
+    }
+
+    /// Whether the viewport is at the live tail (not scrolled into history).
+    pub fn at_tail(&self) -> bool {
+        self.scroll_offset == 0
     }
 
     /// Cursor in visible coordinates.

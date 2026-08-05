@@ -18,6 +18,9 @@ pub struct Selection {
 pub struct SelectionState {
     pub active: Option<Selection>,
     dragging: Option<(String, CellPos)>,
+    /// Button-down cell waiting for movement. A press alone never selects;
+    /// the selection starts on the first drag into a different cell.
+    pending: Option<(String, CellPos)>,
     click: ClickTracker,
 }
 
@@ -34,11 +37,45 @@ impl SelectionState {
     pub fn clear(&mut self) {
         self.active = None;
         self.dragging = None;
+        self.pending = None;
     }
 
     pub fn cancel_drag(&mut self) {
         self.dragging = None;
         self.active = None;
+        self.pending = None;
+    }
+
+    /// Button down inside a pane body: remember the cell, clear any old
+    /// highlight, select nothing yet.
+    pub fn press(&mut self, pane_id: String, pos: CellPos) {
+        self.active = None;
+        self.dragging = None;
+        self.pending = Some((pane_id, pos));
+    }
+
+    /// Drag motion inside a pane body. Starts the selection once the drag
+    /// leaves the press cell; extends it afterwards.
+    pub fn drag_to(&mut self, pane_id: &str, pos: CellPos) {
+        if self.dragging.is_some() {
+            self.update_drag(pos);
+            return;
+        }
+        if let Some((pending_pane, start)) = self.pending.clone() {
+            if pending_pane == pane_id && start != pos {
+                self.pending = None;
+                self.start_drag(pending_pane, start);
+                self.update_drag(pos);
+            }
+        }
+    }
+
+    /// Pane the press or drag is anchored in, if any.
+    pub fn anchor_pane(&self) -> Option<&str> {
+        self.dragging
+            .as_ref()
+            .map(|(p, _)| p.as_str())
+            .or(self.pending.as_ref().map(|(p, _)| p.as_str()))
     }
 
     /// Record a click for double/triple detection. Returns 1, 2, or 3.
@@ -82,9 +119,11 @@ impl SelectionState {
         self.dragging.is_some()
     }
 
-    /// End a drag and return the finished selection.
+    /// End a drag and return the finished selection. A press that never
+    /// moved returns None.
     pub fn finish_drag(&mut self) -> Option<Selection> {
-        self.dragging = None;
+        self.pending = None;
+        self.dragging.take()?;
         self.active.clone()
     }
 

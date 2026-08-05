@@ -76,6 +76,11 @@ pub fn fetch_decoration(_home: &Path) -> DecorationSnapshot {
     let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) else {
         return DecorationSnapshot::default();
     };
+    // This runs inline in the UI event loop: a wedged daemon must degrade
+    // to the offline state, never stall input handling.
+    let deadline = Some(std::time::Duration::from_millis(250));
+    let _ = stream.set_read_timeout(deadline);
+    let _ = stream.set_write_timeout(deadline);
     use std::io::{BufRead, Write};
     let req = format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"status\",\"params\":{{\"protocol_version\":{PROTOCOL_VERSION},\"open_deliveries\":true}}}}\n"

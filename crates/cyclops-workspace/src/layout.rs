@@ -1,6 +1,10 @@
 //! Parse tmux `window_layout` strings into a split tree.
-
-use std::collections::HashMap;
+//!
+//! Layout leaves carry the pane's numeric id (the `N` of `%N`) and its
+//! cell-exact geometry inside the window. The workspace renders panes at
+//! those exact coordinates — tmux's own one-cell gaps between panes are
+//! where dividers are drawn — so the grid a pane runtime holds maps 1:1
+//! onto screen cells.
 
 use ratatui::layout::Rect;
 use thiserror::Error;
@@ -16,18 +20,47 @@ pub enum SplitDir {
     Vertical,
 }
 
-/// Parsed tmux layout tree. Leaves carry pane indices; map to `%n` ids separately.
+/// Parsed tmux layout tree. Leaf numbers are pane ids (`%N` without the
+/// sigil); every node carries its cell rectangle in window coordinates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LayoutNode {
     Leaf {
-        pane_index: usize,
+        pane_num: usize,
+        x: u16,
+        y: u16,
         width: u16,
         height: u16,
     },
     Split {
         dir: SplitDir,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
         children: Vec<LayoutNode>,
     },
+}
+
+impl LayoutNode {
+    /// Node extent in window coordinates.
+    pub fn rect(&self) -> Rect {
+        match self {
+            LayoutNode::Leaf {
+                x,
+                y,
+                width,
+                height,
+                ..
+            }
+            | LayoutNode::Split {
+                x,
+                y,
+                width,
+                height,
+                ..
+            } => Rect::new(*x, *y, *width, *height),
+        }
+    }
 }
 
 /// Resolved layout with tmux pane ids.
@@ -35,13 +68,41 @@ pub enum LayoutNode {
 pub enum ResolvedLayout {
     Leaf {
         pane_id: String,
+        x: u16,
+        y: u16,
         width: u16,
         height: u16,
     },
     Split {
         dir: SplitDir,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
         children: Vec<ResolvedLayout>,
     },
+}
+
+impl ResolvedLayout {
+    /// Node extent in window coordinates.
+    pub fn rect(&self) -> Rect {
+        match self {
+            ResolvedLayout::Leaf {
+                x,
+                y,
+                width,
+                height,
+                ..
+            }
+            | ResolvedLayout::Split {
+                x,
+                y,
+                width,
+                height,
+                ..
+            } => Rect::new(*x, *y, *width, *height),
+        }
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -75,30 +136,49 @@ pub fn parse_layout(s: &str) -> Result<LayoutNode, LayoutError> {
     Ok(node)
 }
 
-/// Map pane indices from the layout tree to tmux pane ids.
-pub fn resolve_layout(
-    node: &LayoutNode,
-    index_to_id: &HashMap<usize, String>,
-) -> Option<ResolvedLayout> {
+/// Turn leaf pane numbers into `%N` ids. `known` guards against a layout
+/// naming a pane the window listing did not: MEASURED, leaf numbers are the
+/// pane's `%N` id, not `#{pane_index}`. Pass an empty slice to skip the
+/// guard (control-mode notifications carry the layout but no pane list).
+pub fn resolve_layout(node: &LayoutNode, known: &[String]) -> Option<ResolvedLayout> {
     match node {
         LayoutNode::Leaf {
-            pane_index,
+            pane_num,
+            x,
+            y,
             width,
             height,
-        } => index_to_id
-            .get(pane_index)
-            .map(|pane_id| ResolvedLayout::Leaf {
-                pane_id: pane_id.clone(),
+        } => {
+            let pane_id = format!("%{pane_num}");
+            if !known.is_empty() && !known.iter().any(|k| k == &pane_id) {
+                return None;
+            }
+            Some(ResolvedLayout::Leaf {
+                pane_id,
+                x: *x,
+                y: *y,
                 width: *width,
                 height: *height,
-            }),
-        LayoutNode::Split { dir, children } => {
+            })
+        }
+        LayoutNode::Split {
+            dir,
+            x,
+            y,
+            width,
+            height,
+            children,
+        } => {
             let mut resolved = Vec::with_capacity(children.len());
             for child in children {
-                resolved.push(resolve_layout(child, index_to_id)?);
+                resolved.push(resolve_layout(child, known)?);
             }
             Some(ResolvedLayout::Split {
                 dir: *dir,
+                x: *x,
+                y: *y,
+                width: *width,
+                height: *height,
                 children: resolved,
             })
         }
@@ -107,17 +187,30 @@ pub fn resolve_layout(
 
 /// Collect pane ids in layout order.
 pub fn pane_ids_in_layout(node: &ResolvedLayout) -> Vec<String> {
+    pane_dims_in_layout(node)
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect()
+}
+
+/// Collect `(pane_id, cols, rows)` for every leaf in layout order.
+pub fn pane_dims_in_layout(node: &ResolvedLayout) -> Vec<(String, u16, u16)> {
     let mut out = Vec::new();
-    collect_pane_ids(node, &mut out);
+    collect_pane_dims(node, &mut out);
     out
 }
 
-fn collect_pane_ids(node: &ResolvedLayout, out: &mut Vec<String>) {
+fn collect_pane_dims(node: &ResolvedLayout, out: &mut Vec<(String, u16, u16)>) {
     match node {
-        ResolvedLayout::Leaf { pane_id, .. } => out.push(pane_id.clone()),
+        ResolvedLayout::Leaf {
+            pane_id,
+            width,
+            height,
+            ..
+        } => out.push((pane_id.clone(), *width, *height)),
         ResolvedLayout::Split { children, .. } => {
             for child in children {
-                collect_pane_ids(child, out);
+                collect_pane_dims(child, out);
             }
         }
     }
@@ -127,9 +220,7 @@ fn parse_node(s: &str, base: usize) -> Result<(LayoutNode, usize), LayoutError> 
     let mut pos = 0;
     let (width, height) = parse_dims(s, &mut pos, base)?;
     let x = parse_u16(s, &mut pos, base)?;
-    let _ = x;
     let y = parse_u16(s, &mut pos, base)?;
-    let _ = y;
     if pos < s.len() && s.as_bytes()[pos] == b',' {
         expect_char(s, &mut pos, ',', base)?;
     }
@@ -146,6 +237,10 @@ fn parse_node(s: &str, base: usize) -> Result<(LayoutNode, usize), LayoutError> 
             Ok((
                 LayoutNode::Split {
                     dir: SplitDir::Vertical,
+                    x,
+                    y,
+                    width,
+                    height,
                     children,
                 },
                 end,
@@ -157,16 +252,22 @@ fn parse_node(s: &str, base: usize) -> Result<(LayoutNode, usize), LayoutError> 
             Ok((
                 LayoutNode::Split {
                     dir: SplitDir::Horizontal,
+                    x,
+                    y,
+                    width,
+                    height,
                     children,
                 },
                 end,
             ))
         }
         _ => {
-            let pane_index = parse_usize(s, &mut pos, base)?;
+            let pane_num = parse_usize(s, &mut pos, base)?;
             Ok((
                 LayoutNode::Leaf {
-                    pane_index,
+                    pane_num,
+                    x,
+                    y,
                     width,
                     height,
                 },
@@ -246,12 +347,12 @@ fn parse_usize(s: &str, pos: &mut usize, base: usize) -> Result<usize, LayoutErr
     if start == *pos {
         return Err(LayoutError::Parse {
             pos: base + *pos,
-            detail: "expected pane index".into(),
+            detail: "expected pane id".into(),
         });
     }
     s[start..*pos].parse().map_err(|e| LayoutError::Parse {
         pos: base + start,
-        detail: format!("pane index: {e}"),
+        detail: format!("pane id: {e}"),
     })
 }
 
@@ -298,81 +399,134 @@ fn extract_group(
     })
 }
 
-/// Assign render rectangles to each pane in a resolved layout tree.
-pub fn layout_pane_slots(node: &ResolvedLayout, area: Rect, focused_pane: &str) -> Vec<PaneSlot> {
+/// Pane render rectangles: window coordinates offset into `canvas` and
+/// clipped to it. Cells map 1:1 — no scaling, so a runtime grid lands on
+/// exactly the cells tmux gave the pane.
+pub fn layout_pane_slots(node: &ResolvedLayout, canvas: Rect, focused_pane: &str) -> Vec<PaneSlot> {
     let mut out = Vec::new();
-    layout_slots_recursive(node, area, focused_pane, &mut out);
+    collect_slots(node, canvas, focused_pane, &mut out);
     out
 }
 
-fn layout_slots_recursive(
-    node: &ResolvedLayout,
-    area: Rect,
-    focused: &str,
-    out: &mut Vec<PaneSlot>,
-) {
+fn collect_slots(node: &ResolvedLayout, canvas: Rect, focused: &str, out: &mut Vec<PaneSlot>) {
     match node {
-        ResolvedLayout::Leaf { pane_id, .. } => {
-            out.push(PaneSlot {
-                pane_id: pane_id.clone(),
-                rect: area,
-                focused: pane_id == focused,
-            });
+        ResolvedLayout::Leaf {
+            pane_id,
+            x,
+            y,
+            width,
+            height,
+        } => {
+            if let Some(rect) = offset_clip(*x, *y, *width, *height, canvas) {
+                out.push(PaneSlot {
+                    pane_id: pane_id.clone(),
+                    rect,
+                    focused: pane_id == focused,
+                });
+            }
         }
-        ResolvedLayout::Split { dir, children } => {
-            let weights: Vec<u32> = children
-                .iter()
-                .map(|c| primary_size(c, *dir) as u32)
-                .collect();
-            let total: u32 = weights.iter().sum::<u32>().max(1);
-            let mut offset_x = area.x;
-            let mut offset_y = area.y;
-            for (i, child) in children.iter().enumerate() {
-                let share = weights[i];
-                let is_last = i + 1 == children.len();
-                let child_area = match dir {
-                    SplitDir::Horizontal => {
-                        let w = if is_last {
-                            area.width.saturating_sub(offset_x - area.x)
-                        } else {
-                            (area.width as u32 * share / total) as u16
-                        };
-                        let rect = Rect::new(offset_x, area.y, w.max(1), area.height);
-                        offset_x = offset_x.saturating_add(w);
-                        rect
-                    }
-                    SplitDir::Vertical => {
-                        let h = if is_last {
-                            area.height.saturating_sub(offset_y - area.y)
-                        } else {
-                            (area.height as u32 * share / total) as u16
-                        };
-                        let rect = Rect::new(area.x, offset_y, area.width, h.max(1));
-                        offset_y = offset_y.saturating_add(h);
-                        rect
-                    }
-                };
-                layout_slots_recursive(child, child_area, focused, out);
+        ResolvedLayout::Split { children, .. } => {
+            for child in children {
+                collect_slots(child, canvas, focused, out);
             }
         }
     }
 }
 
-fn primary_size(node: &ResolvedLayout, dir: SplitDir) -> u16 {
-    match node {
-        ResolvedLayout::Leaf { width, height, .. } => match dir {
-            SplitDir::Horizontal => *width,
-            SplitDir::Vertical => *height,
-        },
-        ResolvedLayout::Split { children, .. } => {
-            children.iter().map(|c| primary_size(c, dir)).sum()
+/// One divider band between adjacent split children, in window coordinates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DividerSeg {
+    /// The gap cells tmux leaves between the two children.
+    pub rect: Rect,
+    /// Direction of the split that owns the gap: `Horizontal` gaps are
+    /// vertical lines, `Vertical` gaps horizontal lines.
+    pub dir: SplitDir,
+    /// The pane whose trailing edge the divider is — the `resize-pane`
+    /// target for drags.
+    pub pane_id: String,
+}
+
+/// Dividers for every split in the tree, window coordinates.
+pub fn layout_dividers(node: &ResolvedLayout) -> Vec<DividerSeg> {
+    let mut out = Vec::new();
+    collect_dividers(node, &mut out);
+    out
+}
+
+fn collect_dividers(node: &ResolvedLayout, out: &mut Vec<DividerSeg>) {
+    if let ResolvedLayout::Split { dir, children, .. } = node {
+        for pair in children.windows(2) {
+            let a = pair[0].rect();
+            let b = pair[1].rect();
+            let rect = match dir {
+                SplitDir::Horizontal => {
+                    let gap_x = a.x + a.width;
+                    Rect::new(gap_x, a.y, b.x.saturating_sub(gap_x), a.height)
+                }
+                SplitDir::Vertical => {
+                    let gap_y = a.y + a.height;
+                    Rect::new(a.x, gap_y, a.width, b.y.saturating_sub(gap_y))
+                }
+            };
+            if rect.width > 0 && rect.height > 0 {
+                if let Some(pane_id) = trailing_leaf(&pair[0], *dir) {
+                    out.push(DividerSeg {
+                        rect,
+                        dir: *dir,
+                        pane_id,
+                    });
+                }
+            }
+        }
+        for child in children {
+            collect_dividers(child, out);
         }
     }
+}
+
+/// Leaf whose trailing edge (right for horizontal, bottom for vertical)
+/// touches the subtree's own trailing edge.
+fn trailing_leaf(node: &ResolvedLayout, dir: SplitDir) -> Option<String> {
+    match node {
+        ResolvedLayout::Leaf { pane_id, .. } => Some(pane_id.clone()),
+        ResolvedLayout::Split { children, .. } => {
+            let extent = node.rect();
+            children
+                .iter()
+                .find(|c| {
+                    let r = c.rect();
+                    match dir {
+                        SplitDir::Horizontal => r.x + r.width == extent.x + extent.width,
+                        SplitDir::Vertical => r.y + r.height == extent.y + extent.height,
+                    }
+                })
+                .and_then(|c| trailing_leaf(c, dir))
+        }
+    }
+}
+
+/// Offset a window-coordinate rectangle into `canvas`, clipping to it.
+pub fn offset_clip(x: u16, y: u16, width: u16, height: u16, canvas: Rect) -> Option<Rect> {
+    let ax = canvas.x.saturating_add(x);
+    let ay = canvas.y.saturating_add(y);
+    if ax >= canvas.x + canvas.width || ay >= canvas.y + canvas.height {
+        return None;
+    }
+    let w = width.min(canvas.x + canvas.width - ax);
+    let h = height.min(canvas.y + canvas.height - ay);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some(Rect::new(ax, ay, w, h))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
 
     #[test]
     fn single_pane_leaf() {
@@ -380,7 +534,9 @@ mod tests {
         assert_eq!(
             node,
             LayoutNode::Leaf {
-                pane_index: 0,
+                pane_num: 0,
+                x: 0,
+                y: 0,
                 width: 80,
                 height: 24,
             }
@@ -388,20 +544,28 @@ mod tests {
     }
 
     #[test]
-    fn vertical_split_two_panes() {
+    fn vertical_split_keeps_offsets() {
         let node = parse_layout("4c3e,319x89,0,0[319x44,0,0,0,319x44,0,45,1]").expect("parse");
         assert_eq!(
             node,
             LayoutNode::Split {
                 dir: SplitDir::Vertical,
+                x: 0,
+                y: 0,
+                width: 319,
+                height: 89,
                 children: vec![
                     LayoutNode::Leaf {
-                        pane_index: 0,
+                        pane_num: 0,
+                        x: 0,
+                        y: 0,
                         width: 319,
                         height: 44,
                     },
                     LayoutNode::Leaf {
-                        pane_index: 1,
+                        pane_num: 1,
+                        x: 0,
+                        y: 45,
                         width: 319,
                         height: 44,
                     },
@@ -412,63 +576,107 @@ mod tests {
 
     #[test]
     fn horizontal_split_two_panes() {
-        let node = parse_layout("da0d,200x50,0,0{100x50,0,0,0,100x50,100,0,1}").expect("parse");
-        assert_eq!(
-            node,
-            LayoutNode::Split {
-                dir: SplitDir::Horizontal,
-                children: vec![
-                    LayoutNode::Leaf {
-                        pane_index: 0,
-                        width: 100,
-                        height: 50,
-                    },
-                    LayoutNode::Leaf {
-                        pane_index: 1,
-                        width: 100,
-                        height: 50,
-                    },
-                ],
-            }
-        );
+        let node = parse_layout("da0d,200x50,0,0{100x50,0,0,0,99x50,101,0,1}").expect("parse");
+        let LayoutNode::Split { dir, children, .. } = node else {
+            panic!("expected split");
+        };
+        assert_eq!(dir, SplitDir::Horizontal);
+        assert_eq!(children[1].rect(), Rect::new(101, 0, 99, 50));
     }
 
     #[test]
     fn nested_split() {
-        let layout = "abcd,200x50,0,0[200x25,0,0{100x25,0,0,0,100x25,100,0,0},200x24,0,26,2]";
+        let layout = "abcd,200x50,0,0[200x25,0,0{100x25,0,0,0,99x25,101,0,3},200x24,0,26,2]";
         let node = parse_layout(layout).expect("parse");
+        let LayoutNode::Split { dir, children, .. } = &node else {
+            panic!("expected split");
+        };
+        assert_eq!(*dir, SplitDir::Vertical);
+        assert_eq!(children.len(), 2);
         assert!(matches!(
-            node,
+            children[0],
             LayoutNode::Split {
-                dir: SplitDir::Vertical,
+                dir: SplitDir::Horizontal,
                 ..
             }
         ));
-        if let LayoutNode::Split { children, .. } = node {
-            assert_eq!(children.len(), 2);
-            assert!(matches!(
-                children[0],
-                LayoutNode::Split {
-                    dir: SplitDir::Horizontal,
-                    ..
-                }
-            ));
-            assert!(matches!(
-                children[1],
-                LayoutNode::Leaf { pane_index: 2, .. }
-            ));
-        }
+        assert!(matches!(children[1], LayoutNode::Leaf { pane_num: 2, .. }));
     }
 
     #[test]
-    fn resolve_maps_indices_to_ids() {
-        let node = parse_layout("4c3e,319x89,0,0[319x44,0,0,0,319x44,0,45,1]").unwrap();
-        let map = HashMap::from([(0, "%0".to_string()), (1, "%1".to_string())]);
-        let resolved = resolve_layout(&node, &map).expect("resolve");
+    fn leaf_numbers_resolve_as_pane_ids() {
+        // Leaf numbers are pane ids, not pane indexes: this window's panes
+        // are %3 and %7 at indexes 0 and 1.
+        let node = parse_layout("4c3e,319x89,0,0[319x44,0,0,3,319x44,0,45,7]").unwrap();
+        let resolved = resolve_layout(&node, &ids(&["%3", "%7"])).expect("resolve");
+        assert_eq!(pane_ids_in_layout(&resolved), ids(&["%3", "%7"]));
+    }
+
+    #[test]
+    fn unknown_leaf_id_fails_resolution() {
+        let node = parse_layout("4c3e,319x89,0,0[319x44,0,0,3,319x44,0,45,7]").unwrap();
+        assert_eq!(resolve_layout(&node, &ids(&["%0", "%1"])), None);
+    }
+
+    #[test]
+    fn slots_map_cells_one_to_one() {
+        let node = parse_layout("dd63,180x45,0,0{90x45,0,0,0,89x45,91,0,1}").unwrap();
+        let resolved = resolve_layout(&node, &[]).unwrap();
+        let canvas = Rect::new(20, 1, 180, 45);
+        let slots = layout_pane_slots(&resolved, canvas, "%1");
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[0].rect, Rect::new(20, 1, 90, 45));
+        assert_eq!(slots[1].rect, Rect::new(111, 1, 89, 45));
+        assert!(!slots[0].focused);
+        assert!(slots[1].focused);
+    }
+
+    #[test]
+    fn slots_clip_to_canvas() {
+        let node = parse_layout("dd63,180x45,0,0{90x45,0,0,0,89x45,91,0,1}").unwrap();
+        let resolved = resolve_layout(&node, &[]).unwrap();
+        // Canvas narrower than the window: the right pane is clipped.
+        let canvas = Rect::new(0, 0, 150, 45);
+        let slots = layout_pane_slots(&resolved, canvas, "%0");
+        assert_eq!(slots[1].rect, Rect::new(91, 0, 59, 45));
+    }
+
+    #[test]
+    fn divider_fills_the_gap_between_panes() {
+        let node = parse_layout("dd63,180x45,0,0{90x45,0,0,0,89x45,91,0,1}").unwrap();
+        let resolved = resolve_layout(&node, &[]).unwrap();
+        let dividers = layout_dividers(&resolved);
         assert_eq!(
-            pane_ids_in_layout(&resolved),
-            vec!["%0".to_string(), "%1".to_string()]
+            dividers,
+            vec![DividerSeg {
+                rect: Rect::new(90, 0, 1, 45),
+                dir: SplitDir::Horizontal,
+                pane_id: "%0".into(),
+            }]
         );
+    }
+
+    #[test]
+    fn nested_divider_targets_trailing_leaf() {
+        // Top row split into %0 | %3, bottom row %2. The horizontal gap
+        // between the rows belongs to the top subtree; its bottom edge is
+        // shared by both leaves, so either is a valid resize target — the
+        // trailing rule picks the child touching the subtree's bottom.
+        let layout = "abcd,200x50,0,0[200x25,0,0{100x25,0,0,0,99x25,101,0,3},200x24,0,26,2]";
+        let resolved = resolve_layout(&parse_layout(layout).unwrap(), &[]).unwrap();
+        let dividers = layout_dividers(&resolved);
+        assert_eq!(dividers.len(), 2);
+        let row_gap = dividers
+            .iter()
+            .find(|d| d.dir == SplitDir::Vertical)
+            .expect("row divider");
+        assert_eq!(row_gap.rect, Rect::new(0, 25, 200, 1));
+        let col_gap = dividers
+            .iter()
+            .find(|d| d.dir == SplitDir::Horizontal)
+            .expect("column divider");
+        assert_eq!(col_gap.rect, Rect::new(100, 0, 1, 25));
+        assert_eq!(col_gap.pane_id, "%0");
     }
 
     #[test]
@@ -500,6 +708,15 @@ mod tests {
         let hsplit = String::from_utf8_lossy(&out.stdout);
         let node = parse_layout(hsplit.trim()).expect("horizontal split layout should parse");
         assert!(matches!(node, LayoutNode::Split { .. }));
+
+        // Leaf numbers must match the server's pane ids exactly.
+        let out = server.run(&["list-panes", "-t", "lay", "-F", "#{pane_id}"]);
+        let pane_ids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let resolved = resolve_layout(&node, &pane_ids).expect("layout leaves are pane ids");
+        assert_eq!(pane_ids_in_layout(&resolved), pane_ids);
 
         server.run_ok(&["select-pane", "-t", "lay:0.1"]);
         server.run_ok(&["split-window", "-v", "-t", "lay:0.1"]);

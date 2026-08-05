@@ -37,6 +37,9 @@ pub struct DragState {
     pub phase: DragPhase,
     pub start: (u16, u16),
     pub current: (u16, u16),
+    /// Position already translated into tmux operations — divider drags
+    /// apply live, coalescing motion since the last applied step.
+    pub last_applied: (u16, u16),
 }
 
 pub const DRAG_THRESHOLD_PX: u16 = 3;
@@ -48,6 +51,7 @@ impl DragState {
             phase: DragPhase::Down,
             start: (x, y),
             current: (x, y),
+            last_applied: (x, y),
         }
     }
 

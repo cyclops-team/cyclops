@@ -13,6 +13,8 @@ pub enum Intent {
     NextTab,
     PrevTab,
     SelectTab(usize),
+    /// Select a tab by tmux window id (`@n`) — robust to index gaps.
+    SelectTabId(String),
     NewTab,
     FocusLeft,
     FocusRight,
@@ -47,9 +49,13 @@ pub async fn execute(
             let idx = n.saturating_sub(1);
             client.command(&format!("select-window -t :{idx}")).await?;
         }
+        Intent::SelectTabId(id) => {
+            client
+                .command(&format!("select-window -t {}", quote_arg(&id)))
+                .await?;
+        }
         Intent::NewTab => {
-            client.command("new-window -d").await?;
-            client.command("select-window -t :+").await?;
+            execute_new_tab(client, None).await?;
         }
         Intent::FocusLeft => {
             client.command("select-pane -L").await?;
@@ -91,6 +97,23 @@ pub async fn execute(
         Intent::NewWorkspace | Intent::RenameWorkspace | Intent::CloseWorkspace => {}
     }
     Ok(())
+}
+
+/// Create a tab, optionally in `cwd`, and return its window id. The new
+/// window is selected by tmux; the model converges from notifications.
+pub async fn execute_new_tab(
+    client: &ControlClient,
+    cwd: Option<&str>,
+) -> Result<String, TmuxError> {
+    let mut cmd = format!("new-window -P -F {}", quote_arg("#{window_id}"));
+    if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
+        cmd.push_str(&format!(" -c {}", quote_arg(dir)));
+    }
+    let out = client.command(&cmd).await?;
+    Ok(out
+        .first()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default())
 }
 
 /// Create a workspace (tmux session) from a project folder.

@@ -6,21 +6,18 @@ use super::grid::{CellGridView, CellPos, CursorState, HydrationSnapshot};
 /// Wraps the pane VT engine with hydration and viewport state.
 pub struct PaneRuntime {
     vt: AlacrittyVt,
-    scroll_offset: usize,
 }
 
 impl PaneRuntime {
     pub fn new(cols: u16, rows: u16) -> Self {
         Self {
             vt: AlacrittyVt::new(cols, rows),
-            scroll_offset: 0,
         }
     }
 
     /// Hydrate from a tmux bundle. Visual snapshot only — not parser-exact.
     pub fn hydrate(&mut self, snapshot: &HydrationSnapshot) {
         self.vt.hydrate(snapshot);
-        self.scroll_offset = 0;
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
@@ -29,6 +26,16 @@ impl PaneRuntime {
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.vt.resize(cols, rows);
+    }
+
+    /// Grid dimensions as `(cols, rows)`.
+    pub fn size(&self) -> (u16, u16) {
+        self.vt.size()
+    }
+
+    /// Whether the viewport is at the live tail (not scrolled into history).
+    pub fn at_tail(&self) -> bool {
+        self.vt.at_tail()
     }
 
     pub fn grid(&self) -> CellGridView<'_> {
@@ -41,9 +48,6 @@ impl PaneRuntime {
 
     pub fn scroll(&mut self, delta: i32) {
         self.vt.scroll(delta);
-        self.scroll_offset = self
-            .scroll_offset
-            .saturating_add(delta.unsigned_abs() as usize);
     }
 
     pub fn select(&mut self, from: CellPos, to: CellPos) -> Option<String> {

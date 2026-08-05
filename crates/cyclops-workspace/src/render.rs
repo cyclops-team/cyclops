@@ -1,4 +1,9 @@
-//! Paint pane grids into a Ratatui buffer.
+//! Paint pane grids and chrome into a Ratatui buffer.
+//!
+//! Panes render at their tmux cell coordinates 1:1 — the client size the
+//! workspace declares is the pane canvas, so tmux's own one-cell gaps
+//! between panes are where dividers draw. Nothing scales; a runtime grid
+//! lands on exactly the cells tmux gave the pane.
 
 #![allow(clippy::too_many_arguments, dead_code)]
 
@@ -8,12 +13,13 @@ use ratatui::style::{Color as RtColor, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
+use crate::bindings::BindingAction;
 use crate::copy;
 use crate::decoration::DecorationSnapshot;
 use crate::dialog::Dialog;
 use crate::drag::{DragState, DragTarget};
-use crate::input::mouse::{HitMap, HitTarget, PaneGeometry};
-use crate::layout::{layout_pane_slots, SplitDir};
+use crate::input::mouse::{HitMap, HitTarget, MenuState, PaneGeometry};
+use crate::layout::{layout_dividers, layout_pane_slots, offset_clip, SplitDir};
 use crate::model::{PaneSlot, RuntimeRegistry, TabModel, WorkspaceRow};
 use crate::resilience::LinkState;
 use crate::runtime::{CellGrid, Color, GridCell};
@@ -47,24 +53,7 @@ pub fn paint_dialog(dialog: &Dialog, area: Rect, buf: &mut Buffer, paint: &Paint
 
 /// Blit a runtime grid into `area` of `buf`.
 pub fn paint_pane(grid: &CellGrid, area: Rect, buf: &mut Buffer, paint: &Paint) {
-    let base = theme::pane_cell(paint);
-    for row in 0..area.height {
-        for col in 0..area.width {
-            let cell = grid.cell(col, row).cloned().unwrap_or_default();
-            let style = cell_style(&cell, base);
-            let ch = if cell.wide_spacer || cell.ch == '\0' {
-                ' '
-            } else {
-                cell.ch
-            };
-            let x = area.x + col;
-            let y = area.y + row;
-            if let Some(dst) = buf.cell_mut((x, y)) {
-                dst.set_symbol(&ch.to_string());
-                dst.set_style(style);
-            }
-        }
-    }
+    paint_pane_styled(grid, area, buf, theme::pane_cell(paint));
 }
 
 /// Render the workspace sidebar.
@@ -77,6 +66,12 @@ pub fn paint_sidebar(
     hits: &mut HitMap,
     decoration: &DecorationSnapshot,
 ) {
+    let block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(theme::pane_border(paint));
+    let inner = block.inner(area);
+    block.render(area, buf);
+
     let mut lines = Vec::new();
     let eye = if decoration.workspace_needs_attention() {
         " ◉"
@@ -94,44 +89,43 @@ pub fn paint_sidebar(
         )));
     }
     for (i, ws) in workspaces.iter().enumerate() {
-        let marker = if i == active { "▸" } else { " " };
+        let marker = if i == active { "●" } else { " " };
         let style = if i == active {
             theme::sidebar_row_active(paint)
         } else {
             theme::sidebar_row(paint)
         };
-        let label = format!("{marker} {} ({})", ws.name, ws.tab_count);
-        lines.push(Line::from(Span::styled(label, style)));
-    }
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(theme::pane_border(paint));
-    let inner = block.inner(area);
-    block.render(area, buf);
-    let para = Paragraph::new(lines);
-    para.render(inner, buf);
-    let row_h = inner.height.saturating_sub(1) / workspaces.len().max(1) as u16;
-    for (i, _) in workspaces.iter().enumerate() {
-        let y = inner.y + 1 + (i as u16) * row_h;
+        // The row's paragraph line index is lines.len() right now, so its
+        // screen row is knowable before pushing — hit rows always match
+        // painted rows.
+        let y = inner.y + lines.len() as u16;
+        lines.push(Line::from(Span::styled(
+            format!("{marker} {} ({})", ws.name, ws.tab_count),
+            style,
+        )));
         if y < inner.y + inner.height {
             hits.push(
-                Rect::new(inner.x, y, inner.width, row_h.max(1)),
+                Rect::new(inner.x, y, inner.width, 1),
                 HitTarget::SidebarRow { index: i },
             );
         }
     }
-    hits.push(
-        Rect::new(
-            area.x,
-            area.y + area.height.saturating_sub(1),
-            area.width,
-            1,
-        ),
-        HitTarget::AppMenu,
-    );
+    Paragraph::new(lines).render(inner, buf);
+
+    // Application-menu button on the bottom row.
+    if inner.height >= 2 {
+        let menu_row = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {}", copy::APP_MENU_BUTTON),
+            theme::sidebar_label(paint),
+        )))
+        .render(menu_row, buf);
+        hits.push(menu_row, HitTarget::AppMenu);
+    }
 }
 
-/// Render the tab bar for the active session.
+/// Render the tab bar. Hit regions come from the measured span widths, so
+/// clicks land on the tab actually painted there.
 pub fn paint_tab_bar(
     tabs: &[TabModel],
     active: usize,
@@ -142,32 +136,45 @@ pub fn paint_tab_bar(
     decoration: &DecorationSnapshot,
 ) {
     let mut spans = Vec::new();
+    let mut x = area.x;
+    let right = area.x + area.width;
     for (i, tab) in tabs.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw(" "));
-        }
-        let style = if i == active {
-            theme::tab_active(paint)
-        } else {
-            theme::tab_inactive(paint)
-        };
         let attn = if decoration.tab_needs_attention(&tab.window_id) {
             " ◉"
         } else {
             ""
         };
-        spans.push(Span::styled(format!(" {} {attn}", tab.name), style));
+        let style = if i == active {
+            theme::tab_active(paint).add_modifier(Modifier::BOLD)
+        } else {
+            theme::tab_inactive(paint)
+        };
+        let label = format!(" {}{} ", tab.name, attn);
+        let w = Span::raw(label.as_str()).width() as u16;
+        if x < right {
+            hits.push(
+                Rect::new(x, area.y, w.min(right - x), area.height.max(1)),
+                HitTarget::Tab { index: i },
+            );
+        }
+        spans.push(Span::styled(label, style));
+        spans.push(Span::styled("│", theme::pane_border(paint)));
+        x = x.saturating_add(w + 1);
     }
-    spans.push(Span::raw(" +"));
-    let line = Line::from(spans);
-    Paragraph::new(line).render(area, buf);
-    let tab_w = (area.width / tabs.len().max(1) as u16).max(4);
-    for (i, _) in tabs.iter().enumerate() {
+    let plus = " + ";
+    if x < right {
         hits.push(
-            Rect::new(area.x + (i as u16) * tab_w, area.y, tab_w, area.height),
-            HitTarget::Tab { index: i },
+            Rect::new(
+                x,
+                area.y,
+                (plus.len() as u16).min(right - x),
+                area.height.max(1),
+            ),
+            HitTarget::NewTabButton,
         );
     }
+    spans.push(Span::styled(plus, theme::tab_inactive(paint)));
+    Paragraph::new(Line::from(spans)).render(area, buf);
 }
 
 /// Chrome state passed through the window paint pass.
@@ -178,9 +185,11 @@ pub struct WindowPaintCtx<'a> {
     pub decoration: &'a DecorationSnapshot,
     pub selection: Option<&'a Selection>,
     pub drag: Option<&'a DragState>,
+    /// Screen cell for the hardware cursor when the focused pane shows one.
+    pub cursor: Option<(u16, u16)>,
 }
 
-/// Render every pane of the active window with borders.
+/// Render every pane of the active window plus the dividers between them.
 pub fn paint_window(
     tab: &TabModel,
     runtimes: &RuntimeRegistry,
@@ -189,14 +198,85 @@ pub fn paint_window(
     paint: &Paint,
     ctx: &mut WindowPaintCtx<'_>,
 ) {
-    let slots = layout_pane_slots(&tab.layout, canvas, &tab.active_pane);
-    record_divider_hits(&slots, ctx.hits);
+    if canvas.width == 0 || canvas.height == 0 {
+        return;
+    }
+    let slots = if tab.zoomed {
+        vec![PaneSlot {
+            pane_id: tab.active_pane.clone(),
+            rect: canvas,
+            focused: true,
+        }]
+    } else {
+        layout_pane_slots(&tab.layout, canvas, &tab.active_pane)
+    };
+    if !tab.zoomed {
+        paint_dividers(tab, &slots, canvas, buf, paint, ctx.hits);
+    }
     for slot in &slots {
         paint_pane_slot(slot, runtimes, buf, paint, ctx);
     }
     if let Some(drag) = ctx.drag.filter(|d| d.is_active()) {
         paint_drag_preview(drag, buf, paint);
     }
+}
+
+fn paint_dividers(
+    tab: &TabModel,
+    slots: &[PaneSlot],
+    canvas: Rect,
+    buf: &mut Buffer,
+    paint: &Paint,
+    hits: &mut HitMap,
+) {
+    let focused_rect = slots.iter().find(|s| s.focused).map(|s| s.rect);
+    for seg in layout_dividers(&tab.layout) {
+        let Some(rect) = offset_clip(
+            seg.rect.x,
+            seg.rect.y,
+            seg.rect.width,
+            seg.rect.height,
+            canvas,
+        ) else {
+            continue;
+        };
+        let touches_focus = focused_rect.is_some_and(|f| rects_touch(f, rect));
+        let style = if touches_focus {
+            theme::pane_border_focused(paint)
+        } else {
+            theme::pane_border(paint)
+        };
+        let glyph = match seg.dir {
+            SplitDir::Horizontal => "│",
+            SplitDir::Vertical => "─",
+        };
+        for y in rect.y..rect.y + rect.height {
+            for x in rect.x..rect.x + rect.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_symbol(glyph);
+                    cell.set_style(style);
+                }
+            }
+        }
+        hits.push(
+            rect,
+            HitTarget::Divider {
+                pane_id: seg.pane_id.clone(),
+                dir: seg.dir,
+            },
+        );
+    }
+}
+
+/// Whether two non-overlapping rectangles share an edge.
+fn rects_touch(a: Rect, b: Rect) -> bool {
+    let h_adjacent = (a.x + a.width == b.x || b.x + b.width == a.x)
+        && a.y < b.y + b.height
+        && b.y < a.y + a.height;
+    let v_adjacent = (a.y + a.height == b.y || b.y + b.height == a.y)
+        && a.x < b.x + b.width
+        && b.x < a.x + a.width;
+    h_adjacent || v_adjacent
 }
 
 fn paint_pane_slot(
@@ -206,122 +286,212 @@ fn paint_pane_slot(
     paint: &Paint,
     ctx: &mut WindowPaintCtx<'_>,
 ) {
-    if slot.rect.width == 0 || slot.rect.height == 0 {
+    let vis = slot.rect;
+    if vis.width == 0 || vis.height == 0 {
         return;
     }
-    let mut border_style = if slot.focused {
-        theme::pane_border_focused(paint)
+    let mut base = theme::pane_cell(paint);
+    if matches!(ctx.link, LinkState::Reconnecting { .. }) {
+        base = base.add_modifier(Modifier::DIM);
+    }
+    if let Some(runtime) = runtimes.get(&slot.pane_id) {
+        paint_pane_styled(runtime.grid().grid, vis, buf, base);
+        if let Some(sel) = ctx.selection.filter(|s| s.pane_id == slot.pane_id) {
+            paint_selection_overlay(runtime.grid().grid, vis, buf, sel, paint);
+        }
+        if slot.focused {
+            let cur = runtime.cursor();
+            if cur.visible && runtime.at_tail() && cur.col < vis.width && cur.row < vis.height {
+                ctx.cursor = Some((vis.x + cur.col, vis.y + cur.row));
+            }
+        }
     } else {
-        theme::pane_border(paint)
-    };
-    if matches!(ctx.link, LinkState::Reconnecting { .. }) {
-        border_style = border_style.add_modifier(Modifier::DIM);
+        let empty = CellGrid {
+            cols: 0,
+            rows: 0,
+            cells: Vec::new(),
+        };
+        paint_pane_styled(&empty, vis, buf, base);
     }
-    let dec = ctx.decoration.pane(&slot.pane_id);
-    let badge = dec
-        .map(|d| DecorationSnapshot::state_badge(d.state))
-        .unwrap_or_default();
-    let attn = dec
-        .filter(|d| d.needs_attention)
-        .map(|_| " ◉")
-        .unwrap_or_default();
-    let mut title = format!(" {} · {badge}{attn} ", slot.pane_id);
-    if matches!(ctx.link, LinkState::Reconnecting { .. }) {
-        title = format!(" {} · {} ", slot.pane_id, copy::RECONNECTING_NOTE);
-    } else if ctx.paused.contains(&slot.pane_id) {
-        title = format!(" {} · {} ", slot.pane_id, copy::PAUSED_NOTE);
-    }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .title(title);
-    let inner = block.inner(slot.rect);
-    block.render(slot.rect, buf);
+
     ctx.hits.push(
-        Rect::new(slot.rect.x, slot.rect.y, slot.rect.width, 1),
-        HitTarget::PaneBorder {
-            pane_id: slot.pane_id.clone(),
-        },
-    );
-    if dec.is_some_and(|d| d.needs_attention) {
-        ctx.hits.push(
-            Rect::new(slot.rect.x + 1, slot.rect.y, 3, 1),
-            HitTarget::AttentionIndicator {
-                pane_id: slot.pane_id.clone(),
-            },
-        );
-    }
-    ctx.hits.push(
-        inner,
+        vis,
         HitTarget::PaneBody {
             pane_id: slot.pane_id.clone(),
         },
     );
     ctx.hits.push_geometry(PaneGeometry {
         pane_id: slot.pane_id.clone(),
-        inner,
-        cols: inner.width,
-        rows: inner.height,
+        inner: vis,
+        cols: vis.width,
+        rows: vis.height,
     });
-    if inner.width >= 4 && inner.height >= 1 {
-        let ctrl = Rect::new(inner.x + inner.width.saturating_sub(3), inner.y, 3, 1);
-        ctx.hits.push(
-            ctrl,
-            HitTarget::PaneSplitRight {
-                pane_id: slot.pane_id.clone(),
-            },
-        );
-        ctx.hits.push(
-            Rect::new(ctrl.x.saturating_sub(2), inner.y, 2, 1),
-            HitTarget::PaneSplitDown {
-                pane_id: slot.pane_id.clone(),
-            },
+
+    // Transient link state, top-left overlay.
+    let note = if matches!(ctx.link, LinkState::Reconnecting { .. }) {
+        Some(copy::RECONNECTING_NOTE)
+    } else if ctx.paused.contains(&slot.pane_id) {
+        Some(copy::PAUSED_NOTE)
+    } else {
+        None
+    };
+    if let Some(note) = note {
+        overlay_text(
+            buf,
+            vis,
+            vis.x,
+            vis.y,
+            &format!(" {note} "),
+            theme::pane_border_focused(paint).add_modifier(Modifier::DIM),
         );
     }
-    if let Some(runtime) = runtimes.get(&slot.pane_id) {
-        let grid = runtime.grid();
-        let mut base = theme::pane_cell(paint);
-        if matches!(ctx.link, LinkState::Reconnecting { .. }) {
-            base = base.add_modifier(Modifier::DIM);
+
+    // Agent decoration and split controls, top-right overlay. Split
+    // controls render on the focused pane only; decoration sits to their
+    // left. Plain undetected panes get no chrome text at all.
+    let mut right_edge = vis.x + vis.width;
+    if slot.focused && vis.width >= 10 {
+        // Rightmost first: split-down button, then split-right to its left.
+        for split_down in [true, false] {
+            let glyph = if split_down { "[-]" } else { "[|]" };
+            let w = glyph.len() as u16;
+            right_edge = right_edge.saturating_sub(w);
+            let rect = Rect::new(right_edge, vis.y, w, 1);
+            overlay_text(
+                buf,
+                vis,
+                rect.x,
+                rect.y,
+                glyph,
+                theme::pane_border_focused(paint),
+            );
+            let target = if split_down {
+                HitTarget::PaneSplitDown {
+                    pane_id: slot.pane_id.clone(),
+                }
+            } else {
+                HitTarget::PaneSplitRight {
+                    pane_id: slot.pane_id.clone(),
+                }
+            };
+            ctx.hits.push(rect, target);
         }
-        paint_pane_dim(grid.grid, inner, buf, base);
-        if let Some(sel) = ctx.selection.filter(|s| s.pane_id == slot.pane_id) {
-            paint_selection_overlay(grid.grid, inner, buf, sel, paint);
+    }
+    if let Some(dec) = ctx.decoration.pane(&slot.pane_id) {
+        let attn = if dec.needs_attention { " ◉" } else { "" };
+        let label = format!(" {}{} ", DecorationSnapshot::state_badge(dec.state), attn);
+        let w = Span::raw(label.as_str()).width() as u16;
+        let x = right_edge.saturating_sub(w).max(vis.x);
+        overlay_text(
+            buf,
+            vis,
+            x,
+            vis.y,
+            &label,
+            theme::pane_border_focused(paint),
+        );
+        if dec.needs_attention {
+            ctx.hits.push(
+                Rect::new(x, vis.y, w, 1),
+                HitTarget::AttentionIndicator {
+                    pane_id: slot.pane_id.clone(),
+                },
+            );
         }
     }
 }
 
-fn record_divider_hits(slots: &[PaneSlot], hits: &mut HitMap) {
-    for i in 0..slots.len() {
-        for j in (i + 1)..slots.len() {
-            let a = &slots[i];
-            let b = &slots[j];
-            if a.rect.y == b.rect.y && a.rect.height == b.rect.height {
-                let x = a.rect.x + a.rect.width;
-                if x == b.rect.x {
-                    hits.push(
-                        Rect::new(x.saturating_sub(1), a.rect.y, 2, a.rect.height),
-                        HitTarget::Divider {
-                            pane_id: a.pane_id.clone(),
-                            dir: SplitDir::Horizontal,
-                        },
-                    );
-                }
-            }
-            if a.rect.x == b.rect.x && a.rect.width == b.rect.width {
-                let y = a.rect.y + a.rect.height;
-                if y == b.rect.y {
-                    hits.push(
-                        Rect::new(a.rect.x, y.saturating_sub(1), a.rect.width, 2),
-                        HitTarget::Divider {
-                            pane_id: a.pane_id.clone(),
-                            dir: SplitDir::Vertical,
-                        },
-                    );
-                }
+/// Write `text` onto one row, clipped to `bounds`.
+fn overlay_text(buf: &mut Buffer, bounds: Rect, x: u16, y: u16, text: &str, style: Style) {
+    if y < bounds.y || y >= bounds.y + bounds.height {
+        return;
+    }
+    for (cx, ch) in (x..).zip(text.chars()) {
+        if cx < bounds.x || cx >= bounds.x + bounds.width {
+            break;
+        }
+        if let Some(cell) = buf.cell_mut((cx, y)) {
+            cell.set_symbol(&ch.to_string());
+            cell.set_style(style);
+        }
+    }
+}
+
+/// Menu items for one open menu.
+pub fn menu_items(menu: &MenuState) -> Vec<(&'static str, BindingAction)> {
+    match menu {
+        MenuState::None => Vec::new(),
+        MenuState::AppMenu => vec![
+            (copy::MENU_NEW_TAB, BindingAction::NewTab),
+            (copy::MENU_NEW_WORKSPACE, BindingAction::NewWorkspace),
+            (copy::MENU_TOGGLE_EVENTS, BindingAction::ToggleEventPanel),
+            (copy::MENU_DETACH, BindingAction::Detach),
+        ],
+        MenuState::ContextMenu { .. } => vec![
+            (copy::MENU_SPLIT_RIGHT, BindingAction::SplitRight),
+            (copy::MENU_SPLIT_DOWN, BindingAction::SplitDown),
+            (copy::MENU_ZOOM_PANE, BindingAction::ZoomPane),
+            (copy::MENU_CLOSE_PANE, BindingAction::ClosePane),
+        ],
+    }
+}
+
+/// Paint the open menu (if any) and record its item hit regions. Painted
+/// last, so its regions shadow everything under it.
+pub fn paint_menu(
+    menu: &MenuState,
+    area: Rect,
+    buf: &mut Buffer,
+    paint: &Paint,
+    hits: &mut HitMap,
+) {
+    let items = menu_items(menu);
+    if items.is_empty() {
+        return;
+    }
+    let w = (items
+        .iter()
+        .map(|(label, _)| Span::raw(*label).width())
+        .max()
+        .unwrap_or(0) as u16)
+        .saturating_add(4);
+    let h = items.len() as u16 + 2;
+    let (ax, ay) = match menu {
+        MenuState::ContextMenu { at, .. } => *at,
+        // App menu opens above its bottom-left button.
+        _ => (area.x, (area.y + area.height).saturating_sub(h + 1)),
+    };
+    let x = ax.min((area.x + area.width).saturating_sub(w).max(area.x));
+    let y = ay.min((area.y + area.height).saturating_sub(h).max(area.y));
+    let menu_area = Rect::new(x, y, w.min(area.width), h.min(area.height));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::pane_border_focused(paint));
+    let inner = block.inner(menu_area);
+    // Clear what's underneath so pane content doesn't bleed through.
+    for row in menu_area.y..menu_area.y + menu_area.height {
+        for col in menu_area.x..menu_area.x + menu_area.width {
+            if let Some(cell) = buf.cell_mut((col, row)) {
+                cell.reset();
             }
         }
     }
+    block.render(menu_area, buf);
+    let mut lines = Vec::new();
+    for (i, (label, action)) in items.iter().enumerate() {
+        lines.push(Line::from(Span::styled(
+            format!(" {label}"),
+            theme::sidebar_row(paint),
+        )));
+        let y = inner.y + i as u16;
+        if y < inner.y + inner.height {
+            hits.push(
+                Rect::new(inner.x, y, inner.width, 1),
+                HitTarget::MenuItem { action: *action },
+            );
+        }
+    }
+    Paragraph::new(lines).render(inner, buf);
 }
 
 fn paint_selection_overlay(
@@ -409,7 +579,7 @@ pub fn paint_event_panel(lines: &[String], area: Rect, buf: &mut Buffer, paint: 
     Paragraph::new(text).render(inner, buf);
 }
 
-fn paint_pane_dim(grid: &CellGrid, area: Rect, buf: &mut Buffer, base: Style) {
+fn paint_pane_styled(grid: &CellGrid, area: Rect, buf: &mut Buffer, base: Style) {
     for row in 0..area.height {
         for col in 0..area.width {
             let cell = grid.cell(col, row).cloned().unwrap_or_default();
@@ -465,8 +635,6 @@ fn rt_color(c: Color) -> Option<RtColor> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
     use crate::decoration::DecorationSnapshot;
     use crate::dialog::Dialog;
@@ -478,10 +646,10 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    /// Two stacked panes filling a 40x11 window, one divider row at y=5.
     fn two_pane_tab() -> TabModel {
-        let node = parse_layout("4c3e,319x89,0,0[319x44,0,0,0,319x44,0,45,1]").unwrap();
-        let map = HashMap::from([(0, "%0".to_string()), (1, "%1".to_string())]);
-        let layout = resolve_layout(&node, &map).unwrap();
+        let node = parse_layout("4c3e,40x11,0,0[40x5,0,0,0,40x5,0,6,1]").unwrap();
+        let layout = resolve_layout(&node, &[]).unwrap();
         TabModel {
             window_id: "@0".to_string(),
             index: 0,
@@ -490,6 +658,28 @@ mod tests {
             active_pane: "%0".to_string(),
             zoomed: false,
         }
+    }
+
+    fn ctx_defaults<'a>(
+        hits: &'a mut HitMap,
+        paused: &'a std::collections::HashSet<String>,
+        decoration: &'a DecorationSnapshot,
+    ) -> WindowPaintCtx<'a> {
+        WindowPaintCtx {
+            link: LinkState::Live,
+            paused,
+            hits,
+            decoration,
+            selection: None,
+            drag: None,
+            cursor: None,
+        }
+    }
+
+    fn flatten(buf: &Buffer) -> String {
+        (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| buf[(x, y)].symbol().to_string()))
+            .collect()
     }
 
     #[test]
@@ -516,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_pane_borders_and_tab_bar_render() {
+    fn divider_and_tab_bar_render() {
         let tab = two_pane_tab();
         let runtimes = RuntimeRegistry::default();
 
@@ -537,14 +727,9 @@ mod tests {
                 &mut hits,
                 &DecorationSnapshot::default(),
             );
-            let mut ctx = WindowPaintCtx {
-                link: LinkState::Live,
-                paused: &std::collections::HashSet::new(),
-                hits: &mut hits,
-                decoration: &DecorationSnapshot::default(),
-                selection: None,
-                drag: None,
-            };
+            let paused = std::collections::HashSet::new();
+            let dec = DecorationSnapshot::default();
+            let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
             paint_window(&tab, &runtimes, canvas, f.buffer_mut(), &theme, &mut ctx);
         })
         .unwrap();
@@ -556,22 +741,46 @@ mod tests {
             row0.contains("main"),
             "active tab label should render: {row0}"
         );
-        let mut saw_border = false;
-        for y in 1..buf.area.height {
-            for x in 0..buf.area.width {
-                if matches!(
-                    buf[(x, y)].symbol(),
-                    "│" | "─" | "┌" | "┐" | "└" | "┘" | "├" | "┤" | "┬" | "┴" | "┼"
-                ) {
-                    saw_border = true;
-                }
-            }
-        }
-        assert!(saw_border, "pane borders should render");
+        // The divider row is window y=5, canvas offset 1 → screen row 6.
+        let divider_row: String = (0..buf.area.width)
+            .map(|x| buf[(x, 6)].symbol().to_string())
+            .collect();
+        assert!(
+            divider_row.chars().all(|c| c == '─'),
+            "gap row should be a divider line: {divider_row:?}"
+        );
     }
 
     #[test]
-    fn sidebar_rows_render_with_selection() {
+    fn tab_hit_regions_match_label_widths() {
+        let mut tabs = vec![two_pane_tab(), two_pane_tab()];
+        tabs[1].window_id = "@1".into();
+        tabs[1].name = "logs".into();
+        let backend = TestBackend::new(40, 2);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+        let mut hits = HitMap::default();
+        term.draw(|f| {
+            paint_tab_bar(
+                &tabs,
+                0,
+                Rect::new(0, 0, 40, 1),
+                f.buffer_mut(),
+                &theme,
+                &mut hits,
+                &DecorationSnapshot::default(),
+            );
+        })
+        .unwrap();
+        // " main " is 6 wide, then a 1-cell separator, then " logs ".
+        assert!(matches!(hits.hit(1, 0), Some(HitTarget::Tab { index: 0 })));
+        assert!(matches!(hits.hit(8, 0), Some(HitTarget::Tab { index: 1 })));
+        // After both labels comes the + button.
+        assert!(matches!(hits.hit(15, 0), Some(HitTarget::NewTabButton)));
+    }
+
+    #[test]
+    fn sidebar_rows_render_and_hit_test_aligned() {
         let workspaces = vec![
             WorkspaceRow {
                 name: "cyclops".into(),
@@ -584,11 +793,11 @@ mod tests {
                 active: false,
             },
         ];
-        let backend = TestBackend::new(20, 6);
+        let backend = TestBackend::new(20, 8);
         let mut term = Terminal::new(backend).unwrap();
         let theme = Paint::for_test();
+        let mut hits = HitMap::default();
         term.draw(|f| {
-            let mut hits = HitMap::default();
             paint_sidebar(
                 &workspaces,
                 0,
@@ -601,14 +810,48 @@ mod tests {
         })
         .unwrap();
         let buf = term.backend().buffer();
-        let flat: String = (0..buf.area.height)
-            .flat_map(|y| (0..buf.area.width).map(move |x| buf[(x, y)].symbol().to_string()))
-            .collect();
+        let flat = flatten(buf);
         assert!(
             flat.contains("cyclops"),
             "sidebar should list workspace: {flat}"
         );
-        assert!(flat.contains('▸'), "active row should be marked");
+        assert!(flat.contains('●'), "active row should be marked");
+        // Offline note occupies row 1, so workspaces paint on rows 2 and 3.
+        assert!(matches!(
+            hits.hit(2, 2),
+            Some(HitTarget::SidebarRow { index: 0 })
+        ));
+        assert!(matches!(
+            hits.hit(2, 3),
+            Some(HitTarget::SidebarRow { index: 1 })
+        ));
+        // Bottom row is the app-menu button.
+        assert!(matches!(hits.hit(2, 7), Some(HitTarget::AppMenu)));
+        assert!(flat.contains("menu"), "menu button should render: {flat}");
+    }
+
+    #[test]
+    fn context_menu_paints_items_with_hits() {
+        let backend = TestBackend::new(40, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+        let mut hits = HitMap::default();
+        let menu = MenuState::ContextMenu {
+            pane_id: "%0".into(),
+            at: (5, 2),
+        };
+        term.draw(|f| {
+            paint_menu(&menu, f.area(), f.buffer_mut(), &theme, &mut hits);
+        })
+        .unwrap();
+        let flat = flatten(term.backend().buffer());
+        assert!(flat.contains("Split right"), "menu items render: {flat}");
+        assert!(matches!(
+            hits.hit(7, 3),
+            Some(HitTarget::MenuItem {
+                action: BindingAction::SplitRight
+            })
+        ));
     }
 
     #[test]
@@ -621,10 +864,7 @@ mod tests {
         };
         term.draw(|f| paint_dialog(&dialog, f.area(), f.buffer_mut(), &theme))
             .unwrap();
-        let buf = term.backend().buffer();
-        let flat: String = (0..buf.area.height)
-            .flat_map(|y| (0..buf.area.width).map(move |x| buf[(x, y)].symbol().to_string()))
-            .collect();
+        let flat = flatten(term.backend().buffer());
         assert!(flat.contains("New workspace folder"));
     }
 
@@ -632,31 +872,22 @@ mod tests {
     fn reconnecting_pane_renders_dimmed_note() {
         let tab = two_pane_tab();
         let runtimes = RuntimeRegistry::default();
-        let backend = TestBackend::new(40, 10);
+        let backend = TestBackend::new(40, 12);
         let mut term = Terminal::new(backend).unwrap();
         let theme = Paint::for_test();
         term.draw(|f| {
             let mut hits = HitMap::default();
             let paused = std::collections::HashSet::new();
             let dec = DecorationSnapshot::default();
-            let mut ctx = WindowPaintCtx {
-                link: LinkState::Reconnecting { attempt: 1 },
-                paused: &paused,
-                hits: &mut hits,
-                decoration: &dec,
-                selection: None,
-                drag: None,
-            };
+            let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
+            ctx.link = LinkState::Reconnecting { attempt: 1 };
             paint_window(&tab, &runtimes, f.area(), f.buffer_mut(), &theme, &mut ctx);
         })
         .unwrap();
-        let buf = term.backend().buffer();
-        let flat: String = (0..buf.area.height)
-            .flat_map(|y| (0..buf.area.width).map(move |x| buf[(x, y)].symbol().to_string()))
-            .collect();
+        let flat = flatten(term.backend().buffer());
         assert!(
             flat.contains("reconnecting"),
-            "border should note reconnect: {flat}"
+            "pane should note reconnect: {flat}"
         );
     }
 
@@ -670,14 +901,7 @@ mod tests {
             paint_dialog(&dialog, f.area(), f.buffer_mut(), &theme);
         })
         .unwrap();
-        let buf = term.backend().buffer();
-        let flat: String = (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol().to_string())
-                    .collect::<String>()
-            })
-            .collect();
+        let flat = flatten(term.backend().buffer());
         assert!(flat.contains("Close this pane"));
     }
 
@@ -696,21 +920,15 @@ mod tests {
             from: CellPos { col: 0, row: 0 },
             to: CellPos { col: 2, row: 0 },
         };
-        let backend = TestBackend::new(40, 10);
+        let backend = TestBackend::new(40, 12);
         let mut term = Terminal::new(backend).unwrap();
         let theme = Paint::for_test();
         term.draw(|f| {
             let mut hits = HitMap::default();
             let paused = std::collections::HashSet::new();
             let dec = DecorationSnapshot::default();
-            let mut ctx = WindowPaintCtx {
-                link: LinkState::Live,
-                paused: &paused,
-                hits: &mut hits,
-                decoration: &dec,
-                selection: Some(&sel),
-                drag: None,
-            };
+            let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
+            ctx.selection = Some(&sel);
             paint_window(&tab, &runtimes, f.area(), f.buffer_mut(), &theme, &mut ctx);
         })
         .unwrap();
@@ -727,7 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_badge_renders_on_pane_border() {
+    fn agent_badge_renders_on_pane_overlay() {
         use crate::decoration::{DecorationSnapshot, PaneDecoration};
         use cyclops_proto::AgentState;
 
@@ -748,33 +966,46 @@ mod tests {
                 needs_attention: false,
             },
         );
-        let backend = TestBackend::new(40, 10);
+        let backend = TestBackend::new(40, 12);
         let mut term = Terminal::new(backend).unwrap();
         let theme = Paint::for_test();
         term.draw(|f| {
             let mut hits = HitMap::default();
             let paused = std::collections::HashSet::new();
-            let mut ctx = WindowPaintCtx {
-                link: LinkState::Live,
-                paused: &paused,
-                hits: &mut hits,
-                decoration: &decoration,
-                selection: None,
-                drag: None,
-            };
+            let mut ctx = ctx_defaults(&mut hits, &paused, &decoration);
             paint_window(&tab, &runtimes, f.area(), f.buffer_mut(), &theme, &mut ctx);
         })
         .unwrap();
-        let buf = term.backend().buffer();
-        let flat: String = (0..buf.area.height)
-            .flat_map(|y| (0..buf.area.width).map(move |x| buf[(x, y)].symbol().to_string()))
-            .collect();
+        let flat = flatten(term.backend().buffer());
         assert!(flat.contains("working"), "badge word should render: {flat}");
     }
 
     #[test]
-    fn focused_pane_uses_accent_border() {
-        let slots = layout_pane_slots(&two_pane_tab().layout, Rect::new(0, 0, 40, 10), "%0");
+    fn focused_pane_reports_cursor_position() {
+        let tab = two_pane_tab();
+        let mut runtimes = RuntimeRegistry::default();
+        let mut rt = crate::runtime::PaneRuntime::new(40, 5);
+        rt.feed(b"$ ");
+        runtimes.insert("%0".into(), rt);
+        let backend = TestBackend::new(40, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+        let mut cursor = None;
+        term.draw(|f| {
+            let mut hits = HitMap::default();
+            let paused = std::collections::HashSet::new();
+            let dec = DecorationSnapshot::default();
+            let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
+            paint_window(&tab, &runtimes, f.area(), f.buffer_mut(), &theme, &mut ctx);
+            cursor = ctx.cursor;
+        })
+        .unwrap();
+        assert_eq!(cursor, Some((2, 0)), "cursor should track the focused pane");
+    }
+
+    #[test]
+    fn focused_pane_slots_flag() {
+        let slots = layout_pane_slots(&two_pane_tab().layout, Rect::new(0, 0, 40, 11), "%0");
         assert_eq!(slots.len(), 2);
         assert!(slots[0].focused);
         assert!(!slots[1].focused);
