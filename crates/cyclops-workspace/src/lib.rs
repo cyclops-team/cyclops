@@ -1,5 +1,6 @@
 //! Cyclops terminal workspace: pane VT runtimes and the full-screen TUI.
 
+mod action;
 pub mod app;
 mod bindings;
 mod config;
