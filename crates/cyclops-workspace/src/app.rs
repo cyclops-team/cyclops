@@ -39,7 +39,7 @@ use crate::layout::SplitDir;
 use crate::model::{pane_is_visible, RuntimeRegistry, WorkspaceModel};
 use crate::persist::{self, load_prefs, set_last_active, WorkspacePrefs};
 use crate::render::{
-    paint_dialog, paint_event_panel, paint_menu, paint_sidebar, paint_tab_bar, paint_window,
+    paint_dialog, paint_event_stream, paint_menu, paint_sidebar, paint_tab_bar, paint_window,
 };
 use crate::resilience::{self, LinkState};
 use crate::selection::{self, SelectionState};
@@ -51,7 +51,7 @@ use crate::theme::Paint;
 /// event; idle workspaces still have no wakeups.
 const RENDER_DEBOUNCE: Duration = Duration::from_millis(8);
 const TAB_BAR_HEIGHT: u16 = 1;
-const EVENT_PANEL_WIDTH: u16 = 40;
+const EVENT_STREAM_WIDTH: u16 = 40;
 const SIDEBAR_MIN_WIDTH: u16 = 22;
 const SIDEBAR_MAX_WIDTH: u16 = 42;
 
@@ -109,7 +109,9 @@ struct App {
     drag: Option<DragState>,
     decoration: DecorationSnapshot,
     prefs: WorkspacePrefs,
-    event_panel_open: bool,
+    /// Stable session ids whose agent children are visible in the sidebar.
+    expanded_workspaces: HashSet<String>,
+    event_stream_open: bool,
     event_lines: Vec<String>,
     term_size: (u16, u16),
     /// Last size successfully declared by this control client. Avoids a
@@ -148,14 +150,14 @@ fn chrome_areas_for(
     } else {
         None
     };
-    let panel = if panel_open && main.width > EVENT_PANEL_WIDTH + 4 {
+    let panel = if panel_open && main.width > EVENT_STREAM_WIDTH + 4 {
         let p = Rect::new(
-            main.x + main.width - EVENT_PANEL_WIDTH,
+            main.x + main.width - EVENT_STREAM_WIDTH,
             main.y,
-            EVENT_PANEL_WIDTH,
+            EVENT_STREAM_WIDTH,
             main.height,
         );
-        main = Rect::new(main.x, main.y, main.width - EVENT_PANEL_WIDTH, main.height);
+        main = Rect::new(main.x, main.y, main.width - EVENT_STREAM_WIDTH, main.height);
         Some(p)
     } else {
         None
@@ -189,6 +191,15 @@ fn sidebar_width_for_column(column: u16, terminal_width: u16) -> u16 {
 fn sidebar_width_on_cancel(drag: &DragState, terminal_width: u16) -> Option<u16> {
     matches!(&drag.target, DragTarget::Sidebar)
         .then(|| sidebar_width_for_column(drag.start.0, terminal_width))
+}
+
+fn toggle_workspace_expanded(expanded: &mut HashSet<String>, session_id: String) -> bool {
+    if expanded.remove(&session_id) {
+        false
+    } else {
+        expanded.insert(session_id);
+        true
+    }
 }
 
 fn escape_cancels_visual_state(
@@ -345,6 +356,7 @@ pub async fn run_async() -> i32 {
             return 1;
         }
     };
+    apply_workspace_order(&mut model, &prefs.workspace_order);
     // Last-active is a tmux selection, not just local paint state. Select it
     // before sizing and hydration so bytes and geometry come from the same
     // window the user sees.
@@ -368,7 +380,7 @@ pub async fn run_async() -> i32 {
     }
 
     // Declare terminal cells only after the split topology is known. tmux
-    // gets pane content cells; expanded separator bands remain UI chrome.
+    // gets pane content cells; two-cell separator bands remain UI chrome.
     let chrome_canvas = chrome_areas_for(
         Rect::new(0, 0, term_size.0, term_size.1),
         prefs.sidebar_visible,
@@ -386,6 +398,7 @@ pub async fn run_async() -> i32 {
                 // hydration rather than replaying captures into stale slots.
                 if let Ok(resized) = fetch_workspace_model(&session, socket) {
                     model = resized;
+                    apply_workspace_order(&mut model, &prefs.workspace_order);
                 }
             }
             Err(error) => log_err(&home, &error),
@@ -409,6 +422,11 @@ pub async fn run_async() -> i32 {
         }
     };
 
+    let expanded_workspaces = model
+        .workspaces
+        .get(model.active_workspace)
+        .map(|workspace| HashSet::from([workspace.session_id.clone()]))
+        .unwrap_or_default();
     let mut app = App {
         model,
         runtimes,
@@ -426,7 +444,8 @@ pub async fn run_async() -> i32 {
         drag: None,
         decoration: decoration::fetch_decoration(&home),
         prefs: prefs.clone(),
-        event_panel_open: false,
+        expanded_workspaces,
+        event_stream_open: false,
         event_lines: Vec::new(),
         term_size,
         declared_client_size,
@@ -722,7 +741,7 @@ impl App {
             area,
             self.model.sidebar_visible,
             self.sidebar_width(),
-            self.event_panel_open,
+            self.event_stream_open,
         )
     }
 
@@ -879,6 +898,25 @@ async fn handle_app_msg(
             arm(debounce);
         }
         AppMsg::SessionRenamed { session, name } => {
+            let renamed_index = session
+                .as_deref()
+                .and_then(|session_id| {
+                    app.model
+                        .workspaces
+                        .iter()
+                        .position(|workspace| workspace.session_id == session_id)
+                })
+                .or_else(|| session.is_none().then_some(app.model.active_workspace));
+            if let Some(index) = renamed_index {
+                if let Some(workspace) = app.model.workspaces.get_mut(index) {
+                    let old_name = std::mem::replace(&mut workspace.name, name.clone());
+                    if migrate_order_entry(&mut app.prefs.workspace_order, &old_name, &name) {
+                        if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
+                            log_err(&app.home, &error);
+                        }
+                    }
+                }
+            }
             let active_session = app
                 .model
                 .workspaces
@@ -958,6 +996,11 @@ async fn handle_app_msg(
             arm(debounce);
         }
         AppMsg::DecorationChanged(snapshot) => {
+            if migrate_agent_order_entries(&mut app.prefs.agent_order, &app.decoration, &snapshot) {
+                if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
+                    log_err(&app.home, &error);
+                }
+            }
             app.decoration = snapshot;
             app.refresh_event_lines();
             arm(debounce);
@@ -1084,6 +1127,52 @@ async fn focus_pane(
     Ok(())
 }
 
+/// Focus a sidebar agent even when its expanded parent is a background
+/// workspace. The switch and pane selection are sent in order; reconciliation
+/// then replaces the active session model with authoritative tmux state.
+async fn focus_sidebar_agent(
+    app: &mut App,
+    client: &ControlClient,
+    workspace_id: &str,
+    pane_id: &str,
+) -> Result<(), cyclops_tmux::TmuxError> {
+    let active_id = app
+        .model
+        .workspaces
+        .get(app.model.active_workspace)
+        .map(|workspace| workspace.session_id.as_str());
+    if active_id == Some(workspace_id) {
+        if app.model.active_tab().active_pane == pane_id {
+            return Ok(());
+        }
+        return focus_pane(app, client, pane_id).await;
+    }
+    let Some(session) = app
+        .model
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.session_id == workspace_id)
+        .map(|workspace| workspace.name.clone())
+    else {
+        app.needs_reconcile = true;
+        return Ok(());
+    };
+    let Some(window_id) = app
+        .decoration
+        .pane(pane_id)
+        .map(|decoration| decoration.window_id.clone())
+    else {
+        // A decoration event can invalidate a rendered hit region before the
+        // next frame. Do not select a same-shaped pane in the wrong window.
+        app.needs_reconcile = true;
+        return Ok(());
+    };
+    intent::execute(client, Intent::SwitchWorkspace(session), "").await?;
+    intent::execute_focus_pane(client, Some(&window_id), pane_id).await?;
+    app.needs_reconcile = true;
+    Ok(())
+}
+
 /// Select a tab by model index: tell tmux, mirror locally, hydrate.
 async fn select_tab(
     app: &mut App,
@@ -1178,14 +1267,18 @@ async fn handle_mouse(
                     at: (col, row),
                 });
             }
-            Some(HitTarget::SidebarRow { session }) => {
+            Some(HitTarget::SidebarRow { session, .. }) => {
                 app.open_menu(MenuState::WorkspaceMenu {
                     session,
                     at: (col, row),
                 });
             }
-            Some(HitTarget::SidebarAgent { pane_id }) => {
-                focus_pane(app, client, &pane_id).await?;
+            Some(HitTarget::SidebarAgent {
+                workspace_id,
+                pane_id,
+                ..
+            }) => {
+                focus_sidebar_agent(app, client, &workspace_id, &pane_id).await?;
                 app.open_menu(MenuState::ContextMenu {
                     pane_id,
                     at: (col, row),
@@ -1241,7 +1334,7 @@ async fn handle_mouse(
                         focus_pane(app, client, &pane_id).await?;
                     }
                 }
-                HitTarget::PaneFrame { pane_id } | HitTarget::SidebarAgent { pane_id } => {
+                HitTarget::PaneFrame { pane_id } => {
                     app.close_menu();
                     app.selection.clear();
                     if app.model.active_tab().active_pane != pane_id {
@@ -1279,10 +1372,40 @@ async fn handle_mouse(
                         buffer: String::new(),
                     });
                 }
-                HitTarget::SidebarRow { session } => {
+                HitTarget::SidebarRow {
+                    session_id,
+                    session,
+                } => {
                     app.close_menu();
-                    intent::execute(client, Intent::SwitchWorkspace(session), "").await?;
-                    app.needs_reconcile = true;
+                    app.selection.clear();
+                    app.drag = Some(DragState::on_down(
+                        DragTarget::Workspace {
+                            session_id,
+                            session,
+                        },
+                        col,
+                        row,
+                    ));
+                }
+                HitTarget::SidebarDisclosure { session_id } => {
+                    toggle_workspace_expanded(&mut app.expanded_workspaces, session_id);
+                }
+                HitTarget::SidebarAgent {
+                    workspace_id,
+                    pane_id,
+                    order_key,
+                } => {
+                    app.close_menu();
+                    app.selection.clear();
+                    app.drag = Some(DragState::on_down(
+                        DragTarget::Agent {
+                            workspace_id,
+                            pane_id,
+                            order_key,
+                        },
+                        col,
+                        row,
+                    ));
                 }
                 HitTarget::SidebarDivider => {
                     app.close_menu();
@@ -1299,6 +1422,10 @@ async fn handle_mouse(
                     } else {
                         app.open_menu(MenuState::AppMenu);
                     }
+                }
+                HitTarget::NewWorkspaceButton => {
+                    app.close_menu();
+                    new_workspace_here(app, client).await?;
                 }
                 HitTarget::DialogConfirm | HitTarget::DialogCancel => {}
             }
@@ -1341,11 +1468,20 @@ async fn handle_mouse(
                     Some(DragTarget::Tab { window_id }) => {
                         commit_tab_drop(app, client, &window_id, col, row).await?;
                     }
+                    Some(DragTarget::Workspace {
+                        session_id,
+                        session: _,
+                    }) => commit_workspace_drop(app, &session_id, col, row),
+                    Some(DragTarget::Agent {
+                        workspace_id,
+                        pane_id: _,
+                        order_key,
+                    }) => commit_agent_drop(app, &workspace_id, &order_key, col, row),
                     Some(DragTarget::Sidebar) => {}
                     // Divider drags applied live during motion.
                     Some(_) => {}
-                    None => {
-                        if let DragTarget::Tab { window_id } = drag.target {
+                    None => match drag.target {
+                        DragTarget::Tab { window_id } => {
                             if let Some(index) = app
                                 .model
                                 .session
@@ -1356,7 +1492,19 @@ async fn handle_mouse(
                                 select_tab(app, client, index).await?;
                             }
                         }
-                    }
+                        DragTarget::Workspace { session, .. } => {
+                            intent::execute(client, Intent::SwitchWorkspace(session), "").await?;
+                            app.needs_reconcile = true;
+                        }
+                        DragTarget::Agent {
+                            workspace_id,
+                            pane_id,
+                            ..
+                        } => {
+                            focus_sidebar_agent(app, client, &workspace_id, &pane_id).await?;
+                        }
+                        DragTarget::Divider { .. } | DragTarget::Sidebar => {}
+                    },
                 }
             } else if app.selection.is_dragging() {
                 if let Some(sel) = app.selection.finish_drag() {
@@ -1383,6 +1531,154 @@ fn copy_active_selection(app: &mut App) {
         if let Some(text) = selection::SelectionState::extract(rt, &sel) {
             selection::copy_to_clipboard(&text);
         }
+    }
+}
+
+/// Move one item to the index occupied by another. Downward drags land after
+/// the target and upward drags before it, matching the direction of motion.
+fn move_to_index(items: &mut Vec<String>, source: &str, target: &str) -> bool {
+    let Some(source_index) = items.iter().position(|item| item == source) else {
+        return false;
+    };
+    let Some(target_index) = items.iter().position(|item| item == target) else {
+        return false;
+    };
+    if source_index == target_index {
+        return false;
+    }
+    let item = items.remove(source_index);
+    items.insert(target_index.min(items.len()), item);
+    true
+}
+
+/// Keep a persisted row in place when its identity-bearing label changes.
+/// If a stale copy of the new key already exists, remove the old entry rather
+/// than creating a duplicate.
+fn migrate_order_entry(order: &mut Vec<String>, old: &str, new: &str) -> bool {
+    if old == new {
+        return false;
+    }
+    let Some(old_index) = order.iter().position(|entry| entry == old) else {
+        return false;
+    };
+    if order.iter().any(|entry| entry == new) {
+        order.remove(old_index);
+    } else {
+        order[old_index] = new.to_string();
+    }
+    true
+}
+
+/// Preserve a pane's position when a daemon event reports an external rename
+/// or clear. Pane ids bind the before/after snapshots without guessing from
+/// display text.
+fn migrate_agent_order_entries(
+    order: &mut Vec<String>,
+    previous: &DecorationSnapshot,
+    next: &DecorationSnapshot,
+) -> bool {
+    let mut changed = false;
+    for pane in next.panes.values() {
+        let Some(old_pane) = previous.pane(&pane.pane_id) else {
+            continue;
+        };
+        let old_key = DecorationSnapshot::agent_order_key(old_pane);
+        let new_key = DecorationSnapshot::agent_order_key(pane);
+        changed |= migrate_order_entry(order, &old_key, &new_key);
+    }
+    changed
+}
+
+fn commit_workspace_drop(app: &mut App, source_id: &str, col: u16, row: u16) {
+    let Some(HitTarget::SidebarRow {
+        session_id: target_id,
+        ..
+    }) = app.hit_map.hit(col, row).cloned()
+    else {
+        return;
+    };
+    let active_id = app
+        .model
+        .workspaces
+        .get(app.model.active_workspace)
+        .map(|workspace| workspace.session_id.clone());
+    let Some(source_index) = app
+        .model
+        .workspaces
+        .iter()
+        .position(|workspace| workspace.session_id == source_id)
+    else {
+        return;
+    };
+    let Some(target_index) = app
+        .model
+        .workspaces
+        .iter()
+        .position(|workspace| workspace.session_id == target_id)
+    else {
+        return;
+    };
+    if source_index == target_index {
+        return;
+    }
+    let workspace = app.model.workspaces.remove(source_index);
+    app.model
+        .workspaces
+        .insert(target_index.min(app.model.workspaces.len()), workspace);
+    app.model.active_workspace = active_id
+        .and_then(|id| {
+            app.model
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.session_id == id)
+        })
+        .unwrap_or(0);
+    app.prefs.workspace_order = app
+        .model
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.name.clone())
+        .collect();
+    if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
+        log_err(&app.home, &error);
+    }
+}
+
+fn commit_agent_drop(app: &mut App, workspace_id: &str, source_key: &str, col: u16, row: u16) {
+    let Some(HitTarget::SidebarAgent {
+        workspace_id: target_workspace,
+        order_key: target_key,
+        ..
+    }) = app.hit_map.hit(col, row).cloned()
+    else {
+        return;
+    };
+    if target_workspace != workspace_id {
+        return;
+    }
+    let Some(workspace) = app
+        .model
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.session_id == workspace_id)
+    else {
+        return;
+    };
+    let mut local: Vec<String> = app
+        .decoration
+        .agent_rows_for_window_ids(&workspace.window_ids, &app.prefs.agent_order)
+        .into_iter()
+        .map(DecorationSnapshot::agent_order_key)
+        .collect();
+    if !move_to_index(&mut local, source_key, &target_key) {
+        return;
+    }
+    app.prefs
+        .agent_order
+        .retain(|key| !local.iter().any(|local_key| local_key == key));
+    app.prefs.agent_order.extend(local);
+    if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
+        log_err(&app.home, &error);
     }
 }
 
@@ -1444,7 +1740,7 @@ async fn commit_tab_drop(
                 .await?;
             app.needs_reconcile = true;
         }
-        Some(HitTarget::SidebarRow { session }) => {
+        Some(HitTarget::SidebarRow { session, .. }) => {
             client
                 .command(&format!(
                     "move-window -s {} -t {}",
@@ -1691,6 +1987,10 @@ async fn dialog_confirm(
     } = &dialog
     {
         let label = buffer.trim();
+        let previous_order_key = app
+            .decoration
+            .pane(pane_id)
+            .map(DecorationSnapshot::agent_order_key);
         let result = crate::daemon::label_pane(&app.home, pane_id, label);
         if let Err(error) = result {
             if let Some(Dialog::NamePane {
@@ -1700,6 +2000,14 @@ async fn dialog_confirm(
                 *shown_error = Some(error);
             }
             return Ok(());
+        }
+        let next_order_key = format!("name:{label}");
+        if previous_order_key.is_some_and(|previous| {
+            migrate_order_entry(&mut app.prefs.agent_order, &previous, &next_order_key)
+        }) {
+            if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
+                log_err(&app.home, &error);
+            }
         }
         app.dialog = None;
         app.hover = None;
@@ -1730,7 +2038,13 @@ async fn dialog_confirm(
         }
         Dialog::RenameWorkspace { session, buffer } => {
             if !buffer.trim().is_empty() {
-                intent::execute_rename_workspace(client, &session, buffer.trim()).await?;
+                let name = buffer.trim();
+                intent::execute_rename_workspace(client, &session, name).await?;
+                if migrate_order_entry(&mut app.prefs.workspace_order, &session, name) {
+                    if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
+                        log_err(&app.home, &error);
+                    }
+                }
                 app.needs_reconcile = true;
             }
         }
@@ -1745,6 +2059,13 @@ async fn dialog_confirm(
                 None
             };
             intent::execute_close_workspace(client, &session, fallback.as_deref()).await?;
+            let previous_len = app.prefs.workspace_order.len();
+            app.prefs.workspace_order.retain(|name| name != &session);
+            if app.prefs.workspace_order.len() != previous_len {
+                if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
+                    log_err(&app.home, &error);
+                }
+            }
             app.needs_reconcile = true;
         }
         Dialog::Keybinds { .. } => {}
@@ -1870,7 +2191,8 @@ fn move_keybind_scroll(current: u16, delta: i16, max: u16) -> u16 {
 
 async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_tmux::TmuxError> {
     let session = app.model.session.session.clone();
-    let model = fetch_workspace_model(&session, app.socket.as_deref())?;
+    let mut model = fetch_workspace_model(&session, app.socket.as_deref())?;
+    apply_workspace_order(&mut model, &app.prefs.workspace_order);
     install_reconciled_model(&mut app.model, model, app.prefs.sidebar_visible);
     app.decoration = decoration::fetch_decoration(&app.home);
     app.refresh_event_lines();
@@ -1879,6 +2201,41 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
     hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await?;
     app.needs_hydrate = false;
     Ok(())
+}
+
+/// Apply the persisted visual order without changing tmux session identity.
+/// Rows absent from the preference append in tmux's deterministic order.
+fn apply_workspace_order(model: &mut WorkspaceModel, order: &[String]) {
+    let active_id = model
+        .workspaces
+        .get(model.active_workspace)
+        .map(|workspace| workspace.session_id.clone());
+    let mut remaining = std::mem::take(&mut model.workspaces);
+    let mut ordered = Vec::with_capacity(remaining.len());
+    for name in order {
+        if let Some(index) = remaining
+            .iter()
+            .position(|workspace| &workspace.name == name)
+        {
+            ordered.push(remaining.remove(index));
+        }
+    }
+    ordered.extend(remaining);
+    model.workspaces = ordered;
+    model.active_workspace = active_id
+        .and_then(|id| {
+            model
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.session_id == id)
+        })
+        .or_else(|| {
+            model
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.name == model.session.session)
+        })
+        .unwrap_or(0);
 }
 
 /// Replace local structure with one authoritative tmux snapshot while
@@ -1985,7 +2342,7 @@ async fn dispatch_action(
             return Ok(());
         }
         BindingAction::ToggleEventPanel => {
-            app.event_panel_open = !app.event_panel_open;
+            app.event_stream_open = !app.event_stream_open;
             resize_client(app, client).await;
             return Ok(());
         }
@@ -2094,14 +2451,15 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
         .draw(|f| {
             let areas = app.chrome(f.area());
             if let Some(panel) = areas.panel {
-                paint_event_panel(&app.event_lines, panel, f.buffer_mut(), &app.paint);
+                paint_event_stream(&app.event_lines, panel, f.buffer_mut(), &app.paint);
             }
             if let Some(sidebar) = areas.sidebar {
                 paint_sidebar(
                     &app.model.workspaces,
                     app.model.active_workspace,
-                    &app.model.session.tabs,
                     &app.model.active_tab().active_pane,
+                    &app.expanded_workspaces,
+                    &app.prefs.agent_order,
                     sidebar,
                     f.buffer_mut(),
                     &app.paint,
@@ -2289,6 +2647,67 @@ mod tests {
     }
 
     #[test]
+    fn workspace_disclosure_click_toggles_both_directions() {
+        let mut expanded = HashSet::new();
+        assert!(toggle_workspace_expanded(&mut expanded, "$0".into()));
+        assert!(expanded.contains("$0"));
+        assert!(!toggle_workspace_expanded(&mut expanded, "$0".into()));
+        assert!(!expanded.contains("$0"));
+    }
+
+    #[test]
+    fn sidebar_drag_order_moves_in_the_direction_of_the_drop() {
+        let mut down = vec!["a".into(), "b".into(), "c".into()];
+        assert!(move_to_index(&mut down, "a", "c"));
+        assert_eq!(down, vec!["b", "c", "a"]);
+
+        let mut up = vec!["a".into(), "b".into(), "c".into()];
+        assert!(move_to_index(&mut up, "c", "a"));
+        assert_eq!(up, vec!["c", "a", "b"]);
+    }
+
+    #[test]
+    fn renamed_sidebar_entries_keep_their_persisted_position() {
+        let mut order = vec!["alpha".into(), "beta".into(), "gamma".into()];
+        assert!(migrate_order_entry(&mut order, "beta", "renamed"));
+        assert_eq!(order, vec!["alpha", "renamed", "gamma"]);
+
+        let mut stale = vec!["old".into(), "new".into()];
+        assert!(migrate_order_entry(&mut stale, "old", "new"));
+        assert_eq!(stale, vec!["new"]);
+    }
+
+    #[test]
+    fn external_agent_rename_keeps_its_persisted_position() {
+        use crate::decoration::PaneDecoration;
+        use cyclops_proto::AgentState;
+
+        let snapshot = |label: &str| {
+            let mut snapshot = DecorationSnapshot::default();
+            snapshot.panes.insert(
+                "%7".into(),
+                PaneDecoration {
+                    pane_id: "%7".into(),
+                    window_id: "@2".into(),
+                    label: Some(label.into()),
+                    manifest: Some("claude".into()),
+                    manifest_display_name: Some("Claude Code".into()),
+                    state: AgentState::Idle,
+                    needs_attention: false,
+                },
+            );
+            snapshot
+        };
+        let mut order = vec!["name:reviewer".into(), "name:implementer".into()];
+        assert!(migrate_agent_order_entries(
+            &mut order,
+            &snapshot("reviewer"),
+            &snapshot("auditor")
+        ));
+        assert_eq!(order, vec!["name:auditor", "name:implementer"]);
+    }
+
+    #[test]
     fn cancelling_a_sidebar_drag_restores_its_starting_width() {
         let mut drag = DragState::on_down(DragTarget::Sidebar, 27, 5);
         drag.on_move(38, 5);
@@ -2408,6 +2827,45 @@ mod tests {
     }
 
     #[test]
+    fn persisted_workspace_order_keeps_the_active_identity() {
+        let tab = crate::model::TabModel {
+            window_id: "@1".into(),
+            name: "1".into(),
+            layout: crate::layout::ResolvedLayout::Leaf {
+                pane_id: "%1".into(),
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            active_pane: "%1".into(),
+            zoomed: false,
+        };
+        let row = |id: &str, name: &str, active: bool| crate::model::WorkspaceRow {
+            session_id: id.into(),
+            name: name.into(),
+            tab_count: 1,
+            active,
+            window_ids: vec!["@1".into()],
+        };
+        let mut model = WorkspaceModel {
+            workspaces: vec![row("$0", "alpha", false), row("$1", "beta", true)],
+            active_workspace: 1,
+            session: crate::model::SessionModel {
+                session: "beta".into(),
+                tabs: vec![tab],
+                active_tab: 0,
+            },
+            sidebar_visible: true,
+        };
+
+        apply_workspace_order(&mut model, &["beta".into(), "alpha".into()]);
+        assert_eq!(model.workspaces[0].name, "beta");
+        assert_eq!(model.active_workspace, 0);
+        assert_eq!(model.workspaces[model.active_workspace].session_id, "$1");
+    }
+
+    #[test]
     fn chrome_canvas_excludes_sidebar_and_tab_bar() {
         let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, false);
         assert_eq!(areas.sidebar, Some(Rect::new(0, 0, 22, 50)));
@@ -2417,7 +2875,7 @@ mod tests {
     }
 
     #[test]
-    fn chrome_canvas_shrinks_for_event_panel() {
+    fn chrome_canvas_shrinks_for_event_stream() {
         let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, true);
         assert_eq!(areas.panel, Some(Rect::new(160, 0, 40, 50)));
         assert_eq!(areas.canvas, Rect::new(22, 1, 138, 49));

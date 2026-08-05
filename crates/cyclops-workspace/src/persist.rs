@@ -10,6 +10,8 @@ pub struct WorkspacePrefs {
     pub sidebar_visible: bool,
     pub sidebar_width: u16,
     pub workspace_order: Vec<String>,
+    /// Stable labels, with pane-id fallbacks for unnamed detected agents.
+    pub agent_order: Vec<String>,
 }
 
 impl Default for WorkspacePrefs {
@@ -18,6 +20,7 @@ impl Default for WorkspacePrefs {
             sidebar_visible: true,
             sidebar_width: 22,
             workspace_order: Vec::new(),
+            agent_order: Vec::new(),
         }
     }
 }
@@ -67,6 +70,12 @@ pub fn load_prefs(home: &Path) -> WorkspacePrefs {
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
     }
+    if let Some(arr) = workspace.get("agent_order").and_then(|v| v.as_array()) {
+        prefs.agent_order = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+    }
     prefs
 }
 
@@ -87,6 +96,13 @@ pub fn save_prefs(home: &Path, prefs: &WorkspacePrefs) -> std::io::Result<()> {
             .map(|s| toml::Value::String(s.clone()))
             .collect(),
     );
+    let agent_order = toml::Value::Array(
+        prefs
+            .agent_order
+            .iter()
+            .map(|s| toml::Value::String(s.clone()))
+            .collect(),
+    );
     let mut workspace = match table.remove("workspace") {
         Some(toml::Value::Table(workspace)) => workspace,
         _ => toml::Table::new(),
@@ -100,6 +116,7 @@ pub fn save_prefs(home: &Path, prefs: &WorkspacePrefs) -> std::io::Result<()> {
         toml::Value::Integer(prefs.sidebar_width as i64),
     );
     workspace.insert("workspace_order".into(), order);
+    workspace.insert("agent_order".into(), agent_order);
     table.insert("workspace".into(), toml::Value::Table(workspace));
     let mut body = toml::to_string_pretty(&table)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
@@ -220,6 +237,7 @@ mod tests {
             sidebar_visible: false,
             sidebar_width: 28,
             workspace_order: vec!["beta".into(), "alpha".into()],
+            agent_order: vec!["name:reviewer".into(), "pane:%7".into()],
         };
         save_prefs(&home, &prefs).expect("save");
         let loaded = load_prefs(&home);
@@ -259,6 +277,7 @@ mod tests {
                 sidebar_visible: true,
                 sidebar_width: 31,
                 workspace_order: vec!["cyclops".into()],
+                agent_order: vec!["name:implementer".into()],
             },
         )
         .expect("save");

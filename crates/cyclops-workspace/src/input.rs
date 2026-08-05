@@ -23,13 +23,15 @@ pub fn encode_send_keys(ev: &KeyEvent) -> Vec<String> {
 
 fn tmux_key_name(ev: &KeyEvent) -> Option<String> {
     use KeyCode::*;
-    let prefix = if ev.modifiers.contains(KeyModifiers::CONTROL) {
-        "C-"
-    } else if ev.modifiers.contains(KeyModifiers::ALT) {
-        "M-"
-    } else {
-        ""
-    };
+    // Crossterm normally reports Shift+Tab as BackTab, but accepting the
+    // shifted Tab shape too keeps the passthrough correct across terminals.
+    if ev.code == BackTab || (ev.code == Tab && ev.modifiers.contains(KeyModifiers::SHIFT)) {
+        // BTab already implies Shift. Preserve any additional modifiers
+        // without redundantly producing `S-BTab`.
+        let prefix = modifier_prefix(ev.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT));
+        return Some(format!("{prefix}BTab"));
+    }
+    let prefix = modifier_prefix(ev.modifiers);
     let name = match ev.code {
         Enter => "Enter",
         Backspace => "BSpace",
@@ -46,15 +48,30 @@ fn tmux_key_name(ev: &KeyEvent) -> Option<String> {
         Delete => "DC",
         Insert => "IC",
         F(n) => return Some(format!("{prefix}F{n}")),
-        Char(c) if ev.modifiers.contains(KeyModifiers::CONTROL) => {
-            return Some(format!("C-{}", c.to_ascii_lowercase()));
-        }
-        Char(c) if ev.modifiers.contains(KeyModifiers::ALT) => {
-            return Some(format!("M-{c}"));
+        Char(c)
+            if ev
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            return Some(format!("{prefix}{}", c.to_ascii_lowercase()));
         }
         _ => return None,
     };
     Some(format!("{prefix}{name}"))
+}
+
+fn modifier_prefix(modifiers: KeyModifiers) -> String {
+    let mut prefix = String::new();
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        prefix.push_str("C-");
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        prefix.push_str("M-");
+    }
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        prefix.push_str("S-");
+    }
+    prefix
 }
 
 #[cfg(test)]
@@ -77,5 +94,33 @@ mod tests {
     fn plain_char_literal() {
         let ev = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty());
         assert_eq!(encode_send_keys(&ev), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn shift_tab_reaches_agent_tuis_as_backtab() {
+        for ev in [
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
+        ] {
+            assert_eq!(encode_send_keys(&ev), vec!["BTab".to_string()]);
+        }
+    }
+
+    #[test]
+    fn backtab_preserves_additional_modifiers() {
+        let ev = KeyEvent::new(
+            KeyCode::BackTab,
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
+        );
+        assert_eq!(encode_send_keys(&ev), vec!["C-M-BTab".to_string()]);
+    }
+
+    #[test]
+    fn combined_modifiers_are_not_silently_discarded() {
+        let ev = KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
+        );
+        assert_eq!(encode_send_keys(&ev), vec!["C-M-S-Left".to_string()]);
     }
 }

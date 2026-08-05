@@ -38,6 +38,15 @@ pub struct WindowPaneRow {
     pub active: bool,
 }
 
+/// Membership of one globally identified window in a session. A single
+/// `list-windows -a` supplies the sidebar hierarchy without one process per
+/// workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowMembership {
+    pub session_id: String,
+    pub window_id: String,
+}
+
 /// List sessions on the server `socket` names (None = default server).
 pub fn list_sessions(socket: Option<&str>) -> Result<Vec<SessionRow>, TmuxError> {
     let out = run(
@@ -102,6 +111,31 @@ pub fn list_windows(session: &str, socket: Option<&str>) -> Result<Vec<WindowRow
             layout: parts[3].to_string(),
             active: parts[4] == "1",
             zoomed: parts[5] == "1",
+        });
+    }
+    Ok(rows)
+}
+
+/// List every session-to-window edge on the server in one tmux invocation.
+pub fn list_window_memberships(socket: Option<&str>) -> Result<Vec<WindowMembership>, TmuxError> {
+    let out = run(
+        socket,
+        None,
+        &["list-windows", "-a", "-F", "#{session_id}\t#{window_id}"],
+    )?;
+    let mut rows = Vec::new();
+    for line in out.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((session_id, window_id)) = line.split_once('\t') else {
+            return Err(TmuxError::Protocol(format!(
+                "list-windows membership line: {line:?}"
+            )));
+        };
+        rows.push(WindowMembership {
+            session_id: session_id.to_string(),
+            window_id: window_id.to_string(),
         });
     }
     Ok(rows)

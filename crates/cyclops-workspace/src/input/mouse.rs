@@ -8,19 +8,47 @@ use crate::layout::SplitDir;
 /// What a click or wheel event targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HitTarget {
-    PaneBody { pane_id: String },
-    PaneFrame { pane_id: String },
-    PaneSplitRight { pane_id: String },
-    PaneSplitDown { pane_id: String },
-    Divider { pane_id: String, dir: SplitDir },
-    Tab { window_id: String },
+    PaneBody {
+        pane_id: String,
+    },
+    PaneFrame {
+        pane_id: String,
+    },
+    PaneSplitRight {
+        pane_id: String,
+    },
+    PaneSplitDown {
+        pane_id: String,
+    },
+    Divider {
+        pane_id: String,
+        dir: SplitDir,
+    },
+    Tab {
+        window_id: String,
+    },
     NewTabButton,
-    SidebarRow { session: String },
-    SidebarAgent { pane_id: String },
+    SidebarRow {
+        session_id: String,
+        session: String,
+    },
+    SidebarDisclosure {
+        session_id: String,
+    },
+    SidebarAgent {
+        workspace_id: String,
+        pane_id: String,
+        order_key: String,
+    },
     SidebarDivider,
-    AttentionIndicator { pane_id: String },
+    AttentionIndicator {
+        pane_id: String,
+    },
     AppMenu,
-    MenuItem { action: BindingAction },
+    NewWorkspaceButton,
+    MenuItem {
+        action: BindingAction,
+    },
     DialogConfirm,
     DialogCancel,
 }

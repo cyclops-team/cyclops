@@ -1,4 +1,4 @@
-//! Drag state machine for dividers, tabs, and pane drops.
+//! Drag state machine for dividers, tabs, and sidebar row ordering.
 
 use crate::layout::SplitDir;
 
@@ -11,6 +11,15 @@ pub enum DragTarget {
     },
     Tab {
         window_id: String,
+    },
+    Workspace {
+        session_id: String,
+        session: String,
+    },
+    Agent {
+        workspace_id: String,
+        pane_id: String,
+        order_key: String,
     },
     /// Resize the application sidebar, not a tmux pane.
     Sidebar,
@@ -57,7 +66,14 @@ impl DragState {
     pub fn past_threshold(&self) -> bool {
         let (sx, sy) = self.start;
         let (cx, cy) = self.current;
-        sx.abs_diff(cx) >= DRAG_THRESHOLD_PX || sy.abs_diff(cy) >= DRAG_THRESHOLD_PX
+        let threshold = match &self.target {
+            // Sidebar rows are one cell apart; requiring the general
+            // three-cell threshold would make adjacent rows impossible to
+            // reorder with a natural vertical drag.
+            DragTarget::Workspace { .. } | DragTarget::Agent { .. } => 1,
+            _ => DRAG_THRESHOLD_PX,
+        };
+        sx.abs_diff(cx) >= threshold || sy.abs_diff(cy) >= threshold
     }
 
     /// Commit on mouse up. None when the drag never crossed the threshold.
@@ -102,10 +118,33 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_sidebar_rows_cross_the_reorder_threshold() {
+        let mut drag = DragState::on_down(
+            DragTarget::Workspace {
+                session_id: "$0".into(),
+                session: "main".into(),
+            },
+            4,
+            4,
+        );
+        drag.on_move(4, 5);
+        assert!(drag.is_active());
+    }
+
+    #[test]
     fn each_target_variant_lifecycle() {
         for target in [
             DragTarget::Tab {
                 window_id: "@0".into(),
+            },
+            DragTarget::Workspace {
+                session_id: "$0".into(),
+                session: "main".into(),
+            },
+            DragTarget::Agent {
+                workspace_id: "$0".into(),
+                pane_id: "%0".into(),
+                order_key: "name:reviewer".into(),
             },
             divider(),
             DragTarget::Sidebar,

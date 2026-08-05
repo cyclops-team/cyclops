@@ -1,7 +1,7 @@
 //! Paint pane grids and chrome into a Ratatui buffer.
 //!
 //! Panes render at their tmux cell coordinates 1:1. The workspace subtracts
-//! the extra cells used by its three-cell separator bands before declaring
+//! the extra cells used by its separator bands before declaring
 //! the client size, then restores those cells only as chrome. Nothing scales;
 //! a runtime grid lands on exactly the cells tmux gave the pane.
 
@@ -19,7 +19,7 @@ use crate::decoration::DecorationSnapshot;
 use crate::dialog::Dialog;
 use crate::drag::{DragState, DragTarget};
 use crate::input::mouse::{HitMap, HitTarget, MenuState, PaneGeometry};
-use crate::layout::{layout_gap_overhead, layout_geometry, DividerSeg};
+use crate::layout::{layout_gap_overhead, layout_geometry, DividerSeg, PaneGaps};
 use crate::model::{PaneSlot, RuntimeRegistry, TabModel, WorkspaceRow};
 use crate::resilience::LinkState;
 use crate::runtime::{CellGrid, Color, GridCell};
@@ -78,11 +78,6 @@ pub fn paint_dialog(
         return;
     }
     let (title, input, hint, confirm_label) = dialog_parts(dialog);
-    let cancel_label = if dialog.has_input() {
-        copy::BUTTON_CANCEL
-    } else {
-        copy::BUTTON_NO
-    };
     let error = match dialog {
         Dialog::NamePane { error, .. } => error.as_deref(),
         _ => None,
@@ -166,24 +161,46 @@ pub fn paint_dialog(
             .wrap(Wrap { trim: true })
             .render(error_area, buf);
     }
-    // Buttons on the last inner row, recorded for the mouse.
+    // Keyboard-first actions on the last inner row, recorded for the mouse.
+    // Destructive dialogs make the safe Enter/Escape path primary.
     let button_y = inner.y + inner.height.saturating_sub(1);
     let mut bx = inner.x + 1;
-    for (label, target) in [
-        (confirm_label, HitTarget::DialogConfirm),
-        (cancel_label, HitTarget::DialogCancel),
-    ] {
-        let text = format!("[ {label} ]");
+    let buttons = if dialog.has_input() {
+        [
+            (format!("↵ {confirm_label}"), HitTarget::DialogConfirm, true),
+            (
+                format!("Esc {}", copy::BUTTON_CANCEL),
+                HitTarget::DialogCancel,
+                false,
+            ),
+        ]
+    } else {
+        [
+            (
+                format!("Y {confirm_label}"),
+                HitTarget::DialogConfirm,
+                false,
+            ),
+            (
+                format!("↵ / Esc {}", copy::BUTTON_CANCEL),
+                HitTarget::DialogCancel,
+                true,
+            ),
+        ]
+    };
+    for (text, target, primary) in buttons {
         let bw = Span::raw(text.as_str()).width() as u16;
-        let rect = Rect::new(bx, button_y, bw.min(inner.width), 1);
+        let available = inner.x.saturating_add(inner.width).saturating_sub(bx);
+        let rect = Rect::new(bx, button_y, bw.min(available), 1);
+        if rect.width == 0 {
+            break;
+        }
         let hovered =
             hover.is_some_and(|(hc, hr)| hr == rect.y && hc >= rect.x && hc < rect.x + rect.width);
-        let style = if hovered {
-            theme::pane_border_focused(paint)
-                .patch(theme::chrome_raised(paint))
-                .add_modifier(Modifier::BOLD)
+        let style = if hovered || primary {
+            theme::dialog_primary(paint)
         } else {
-            theme::menu_row_hover(paint)
+            theme::dialog_secondary(paint)
         };
         overlay_text(buf, inner, bx, button_y, &text, style);
         hits.push(rect, target);
@@ -310,7 +327,7 @@ fn paint_keybinds_dialog(
     }
 
     let footer_y = inner.y + inner.height.saturating_sub(1);
-    let close = format!("[ {} ]", copy::BUTTON_CLOSE);
+    let close = format!("↵ / Esc {}", copy::BUTTON_CLOSE);
     let close_w = Span::raw(close.as_str()).width() as u16;
     let close_rect = Rect::new(left, footer_y, close_w.min(usable_w), 1);
     let hovered = hover.is_some_and(|(x, y)| {
@@ -323,9 +340,9 @@ fn paint_keybinds_dialog(
         close_rect.y,
         &close,
         if hovered {
-            theme::menu_row_hover(paint)
+            theme::dialog_primary(paint).add_modifier(Modifier::UNDERLINED)
         } else {
-            theme::menu_row(paint)
+            theme::dialog_primary(paint)
         },
     );
     hits.push(close_rect, HitTarget::DialogCancel);
@@ -393,8 +410,9 @@ pub fn paint_pane(grid: &CellGrid, area: Rect, buf: &mut Buffer, paint: &Paint) 
 pub fn paint_sidebar(
     workspaces: &[WorkspaceRow],
     active: usize,
-    active_tabs: &[TabModel],
     active_pane: &str,
+    expanded_workspaces: &std::collections::HashSet<String>,
+    agent_order: &[String],
     area: Rect,
     buf: &mut Buffer,
     paint: &Paint,
@@ -463,15 +481,17 @@ pub fn paint_sidebar(
         );
         y += 1;
     }
+    let footer_y = inner.y + inner.height.saturating_sub(1);
     for (i, ws) in workspaces.iter().enumerate() {
-        if y >= inner.y + inner.height.saturating_sub(1) {
+        if y >= footer_y {
             break;
         }
-        let marker = if i == active { "▾" } else { "▸" };
+        let expanded = expanded_workspaces.contains(&ws.session_id);
+        let marker = if expanded { "▾" } else { "▸" };
         let style = if i == active {
-            theme::sidebar_row_active(paint).add_modifier(Modifier::BOLD)
+            theme::sidebar_workspace_active(paint)
         } else {
-            theme::sidebar_row(paint)
+            theme::sidebar_workspace(paint)
         };
         let row = Rect::new(inner.x, y, inner.width, 1);
         buf.set_style(row, style);
@@ -486,19 +506,26 @@ pub fn paint_sidebar(
         hits.push(
             row,
             HitTarget::SidebarRow {
+                session_id: ws.session_id.clone(),
                 session: ws.name.clone(),
+            },
+        );
+        hits.push(
+            Rect::new(content.x, y, 1.min(content.width), 1),
+            HitTarget::SidebarDisclosure {
+                session_id: ws.session_id.clone(),
             },
         );
         y += 1;
 
-        if i != active {
+        if !expanded {
             continue;
         }
-        for agent in decoration.agent_rows_for_tabs(active_tabs) {
-            if y >= inner.y + inner.height.saturating_sub(1) {
+        for agent in decoration.agent_rows_for_window_ids(&ws.window_ids, agent_order) {
+            if y >= footer_y {
                 break;
             }
-            let selected = agent.pane_id == active_pane;
+            let selected = i == active && agent.pane_id == active_pane;
             let row_style = if selected {
                 theme::sidebar_row_active(paint)
             } else {
@@ -508,34 +535,43 @@ pub fn paint_sidebar(
             buf.set_style(row, row_style);
             let name = DecorationSnapshot::sidebar_name(agent);
             let name_style = if agent.label.is_some() {
-                row_style.patch(paint.role(&name))
+                row_style.patch(paint.role(name))
             } else {
                 row_style
             };
-            let x = content.x.saturating_add(2);
-            overlay_text(buf, content, x, y, &name, name_style);
-            let state = DecorationSnapshot::state_badge(agent.state);
-            overlay_text(
-                buf,
-                content,
-                x.saturating_add(Span::raw(name.as_str()).width() as u16 + 2),
-                y,
-                &state,
-                row_style.patch(paint.state(agent.state)),
-            );
+            // Status leads the row, matching the compact roster shape
+            // (`● Claude Code`). Unknown deliberately contributes no text.
+            let mut x = content.x.saturating_add(3);
+            if let Some(status) = DecorationSnapshot::primary_status(agent) {
+                let status_style = if status.glyph == "⚠" {
+                    theme::attention_eye(paint)
+                } else {
+                    paint.state(status.color_state)
+                };
+                overlay_text(buf, content, x, y, status.glyph, status_style);
+                x = x.saturating_add(2);
+            }
+            overlay_text(buf, content, x, y, name, name_style);
+            let order_key = DecorationSnapshot::agent_order_key(agent);
             hits.push(
                 row,
                 HitTarget::SidebarAgent {
+                    workspace_id: ws.session_id.clone(),
                     pane_id: agent.pane_id.clone(),
+                    order_key,
                 },
             );
             y += 1;
         }
     }
 
-    // Application-menu button on the bottom row.
+    // Application menu at left; a matching compact create button anchors the
+    // hierarchy at bottom-right without stealing the rest of the footer row.
     if inner.height >= 2 {
         let menu_row = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+        let menu_width = u16::try_from(Span::raw(copy::APP_MENU_BUTTON).width())
+            .unwrap_or(u16::MAX)
+            .min(content.width);
         overlay_text(
             buf,
             content,
@@ -544,7 +580,29 @@ pub fn paint_sidebar(
             copy::APP_MENU_BUTTON,
             theme::sidebar_label(paint),
         );
-        hits.push(menu_row, HitTarget::AppMenu);
+        hits.push(
+            Rect::new(content.x, menu_row.y, menu_width, 1),
+            HitTarget::AppMenu,
+        );
+        let plus = " + ";
+        let plus_width = u16::try_from(Span::raw(plus).width())
+            .unwrap_or(u16::MAX)
+            .min(content.width);
+        let plus_x = content
+            .x
+            .saturating_add(content.width.saturating_sub(plus_width));
+        overlay_text(
+            buf,
+            content,
+            plus_x,
+            menu_row.y,
+            plus,
+            theme::add_button(paint),
+        );
+        hits.push(
+            Rect::new(plus_x, menu_row.y, plus_width, 1),
+            HitTarget::NewWorkspaceButton,
+        );
     }
 }
 
@@ -576,7 +634,7 @@ pub fn paint_tab_bar(
             ""
         };
         let style = if i == active {
-            theme::tab_active(paint).add_modifier(Modifier::BOLD)
+            theme::tab_active(paint)
         } else {
             theme::tab_inactive(paint)
         };
@@ -606,7 +664,7 @@ pub fn paint_tab_bar(
             HitTarget::NewTabButton,
         );
     }
-    spans.push(Span::styled(plus, theme::tab_inactive(paint)));
+    spans.push(Span::styled(plus, theme::add_button(paint)));
     Paragraph::new(Line::from(spans)).render(area, buf);
 }
 
@@ -622,13 +680,17 @@ pub struct WindowPaintCtx<'a> {
     pub cursor: Option<(u16, u16)>,
 }
 
-/// One cell of breathing room around the pane canvas. Expanded separator
-/// bands provide the equivalent breathing room between sibling panes.
+/// One cell of breathing room around the pane canvas. Compact separator
+/// bands preserve one border for each sibling pane.
 pub const PANE_MARGIN: u16 = 1;
 
-/// Border, one blank chrome cell, border. tmux contributes one separator
-/// cell; client sizing reserves the other two.
-pub const PANE_GAP: u16 = 3;
+/// Compact pane separation: each sibling keeps its own border, with no extra
+/// blank cell between them. Both split directions therefore use two cells,
+/// one less than the previous border/blank/border band.
+pub const PANE_GAPS: PaneGaps = PaneGaps {
+    columns: 2,
+    rows: 2,
+};
 
 /// The rectangle occupied by pane content plus internal separators: the
 /// canvas inset by [`PANE_MARGIN`] when there is room.
@@ -652,7 +714,7 @@ pub fn tmux_client_size(canvas: Rect, tab: &TabModel) -> (u16, u16) {
     let (gap_width, gap_height) = if tab.zoomed {
         (0, 0)
     } else {
-        layout_gap_overhead(&tab.layout, PANE_GAP)
+        layout_gap_overhead(&tab.layout, PANE_GAPS)
     };
     (
         inner.width.saturating_sub(gap_width),
@@ -689,7 +751,7 @@ pub fn paint_window(
             Vec::new(),
         )
     } else {
-        let geometry = layout_geometry(&tab.layout, inner, &tab.active_pane, PANE_GAP);
+        let geometry = layout_geometry(&tab.layout, inner, &tab.active_pane, PANE_GAPS);
         (geometry.slots, geometry.dividers)
     };
     for slot in &slots {
@@ -730,7 +792,7 @@ fn push_divider_hits(dividers: &[DividerSeg], hits: &mut HitMap) {
 }
 
 /// A pane border in the gutter cells around `rect`, clipped to `bounds`.
-/// The margin and expanded separators guarantee those cells are chrome,
+/// The margin and explicit separators guarantee those cells are chrome,
 /// never another pane's content.
 fn paint_pane_border(rect: Rect, bounds: Rect, buf: &mut Buffer, style: Style) {
     if rect.width == 0 || rect.height == 0 {
@@ -912,53 +974,49 @@ fn paint_pane_frame(
     let Some(decoration) = ctx
         .decoration
         .pane(&slot.pane_id)
-        .filter(|decoration| decoration.label.is_some())
+        .filter(|decoration| decoration.label.is_some() || decoration.manifest.is_some())
     else {
         return;
     };
-    let label = decoration.label.as_deref().unwrap_or_default();
+    let label = DecorationSnapshot::sidebar_name(decoration);
     let Some(title_bounds) = pane_title_rect(slot, bounds, control_left) else {
         return;
     };
-    let state = DecorationSnapshot::state_badge(decoration.state);
+    let status = DecorationSnapshot::primary_status(decoration);
+    let shown_state = status.map(|status| {
+        let full = format!("{} {}", status.glyph, status.word);
+        let full_suffix = 3usize.saturating_add(Span::raw(full.as_str()).width());
+        if slot.focused
+            && Span::raw(label).width().saturating_add(full_suffix)
+                <= usize::from(title_bounds.width)
+        {
+            full
+        } else {
+            status.glyph.to_string()
+        }
+    });
+    let suffix_width = shown_state
+        .as_ref()
+        .map(|state| {
+            3u16.saturating_add(u16::try_from(Span::raw(state).width()).unwrap_or(u16::MAX))
+        })
+        .unwrap_or(0);
     let label_width = u16::try_from(Span::raw(label).width()).unwrap_or(u16::MAX);
-    let state_width = u16::try_from(Span::raw(state.as_str()).width()).unwrap_or(u16::MAX);
-    let attention_width = if decoration.needs_attention { 2 } else { 0 };
-    let full_width = label_width
-        .saturating_add(3)
-        .saturating_add(state_width)
-        .saturating_add(attention_width);
-    let compact_state = state.split_whitespace().next().unwrap_or(state.as_str());
-    let compact_state_width = u16::try_from(Span::raw(compact_state).width()).unwrap_or(u16::MAX);
-    let compact_suffix_width = 3u16
-        .saturating_add(compact_state_width)
-        .saturating_add(attention_width);
-    let (label_budget, shown_state) = if full_width <= title_bounds.width {
-        (label_width, state.as_str())
-    } else if title_bounds.width > compact_suffix_width {
-        (title_bounds.width - compact_suffix_width, compact_state)
+    let label_budget = if suffix_width > 0 && title_bounds.width > suffix_width {
+        label_width.min(title_bounds.width - suffix_width)
     } else {
-        // There is physically no room for both identity and state. Keep the
-        // name—the pane remains addressable—and let the sidebar carry state.
-        overlay_text(
-            buf,
-            title_bounds,
-            title_bounds.x,
-            top,
-            label,
-            paint.role(label).add_modifier(Modifier::BOLD),
-        );
-        return;
+        label_width.min(title_bounds.width)
+    };
+    let label_style = if decoration.label.is_some() {
+        paint.role(label).add_modifier(Modifier::BOLD)
+    } else {
+        border_style.add_modifier(Modifier::BOLD)
     };
     let label_bounds = Rect::new(title_bounds.x, top, label_budget, 1);
-    overlay_text(
-        buf,
-        label_bounds,
-        label_bounds.x,
-        top,
-        label,
-        paint.role(label).add_modifier(Modifier::BOLD),
-    );
+    overlay_text(buf, label_bounds, label_bounds.x, top, label, label_style);
+    let Some(shown_state) = shown_state.filter(|_| title_bounds.width > suffix_width) else {
+        return;
+    };
     let mut x = title_bounds.x.saturating_add(label_budget);
     overlay_text(buf, title_bounds, x, top, " · ", border_style);
     x = x.saturating_add(3);
@@ -967,21 +1025,17 @@ fn paint_pane_frame(
         title_bounds,
         x,
         top,
-        shown_state,
-        paint.state(decoration.state),
+        &shown_state,
+        if shown_state.starts_with('⚠') {
+            theme::attention_eye(paint)
+        } else {
+            paint.state(
+                status
+                    .map(|status| status.color_state)
+                    .unwrap_or(decoration.state),
+            )
+        },
     );
-    if decoration.needs_attention {
-        let shown_state_width = u16::try_from(Span::raw(shown_state).width()).unwrap_or(u16::MAX);
-        let eye_x = x.saturating_add(shown_state_width.saturating_add(1));
-        overlay_text(
-            buf,
-            title_bounds,
-            eye_x,
-            top,
-            "◉",
-            theme::attention_eye(paint),
-        );
-    }
 }
 
 fn pane_title_rect(slot: &PaneSlot, bounds: Rect, control_left: u16) -> Option<Rect> {
@@ -1197,6 +1251,7 @@ fn paint_drag_preview(drag: &DragState, buf: &mut Buffer, paint: &Paint) {
     let hint = match &drag.target {
         DragTarget::Divider { .. } => "↔",
         DragTarget::Tab { .. } => "⇄",
+        DragTarget::Workspace { .. } | DragTarget::Agent { .. } => "⇅",
         DragTarget::Sidebar => "↔",
     };
     if let Some(cell) = buf.cell_mut((x, y)) {
@@ -1205,8 +1260,8 @@ fn paint_drag_preview(drag: &DragState, buf: &mut Buffer, paint: &Paint) {
     }
 }
 
-/// Slide-out event panel from daemon attention items.
-pub fn paint_event_panel(lines: &[String], area: Rect, buf: &mut Buffer, paint: &Paint) {
+/// Slide-out event stream from daemon attention items.
+pub fn paint_event_stream(lines: &[String], area: Rect, buf: &mut Buffer, paint: &Paint) {
     let w = area.width.min(40);
     let panel = Rect::new(
         area.x + area.width.saturating_sub(w),
@@ -1216,14 +1271,14 @@ pub fn paint_event_panel(lines: &[String], area: Rect, buf: &mut Buffer, paint: 
     );
     let block = Block::default()
         .borders(Borders::LEFT)
-        .title(" Events ")
+        .title(" Event stream ")
         .border_style(theme::pane_border_focused(paint))
         .style(theme::menu_row(paint));
     let inner = block.inner(panel);
     block.render(panel, buf);
     let text: Vec<Line> = if lines.is_empty() {
         vec![Line::from(Span::styled(
-            copy::EVENT_PANEL_EMPTY,
+            copy::EVENT_STREAM_EMPTY,
             theme::sidebar_row(paint),
         ))]
     } else {
@@ -1306,10 +1361,10 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    /// Two stacked panes whose tmux grid plus expanded gutter fills the
+    /// Two stacked panes whose tmux grid plus compact divider fills the
     /// 38x9 pane canvas used by the frame tests.
     fn two_pane_tab() -> TabModel {
-        let node = parse_layout("4c3e,38x7,0,0[38x3,0,0,0,38x3,0,4,1]").unwrap();
+        let node = parse_layout("4c3e,38x8,0,0[38x4,0,0,0,38x3,0,5,1]").unwrap();
         let layout = resolve_layout(&node, &[]).unwrap();
         TabModel {
             window_id: "@0".to_string(),
@@ -1412,19 +1467,19 @@ mod tests {
         // the focused pane's ring corners land on the canvas edge rows.
         assert_eq!(buf[(0, 1)].symbol(), "╭", "ring top-left corner");
         assert_eq!(buf[(39, 1)].symbol(), "╮", "ring top-right corner");
-        // Each pane owns its own border, with a blank themed cell between
-        // them instead of both borders fighting for one tmux separator row.
-        assert_eq!(buf[(0, 5)].symbol(), "╰", "first pane bottom corner");
-        assert_eq!(buf[(5, 5)].symbol(), "─", "first pane bottom border");
-        assert_eq!(buf[(20, 6)].symbol(), " ", "blank gutter cell");
+        // Each stacked pane keeps its border, but the old blank row between
+        // those borders is gone.
+        assert_eq!(buf[(0, 6)].symbol(), "╰", "first pane bottom corner");
+        assert_eq!(buf[(5, 6)].symbol(), "─", "first pane bottom border");
         assert_eq!(buf[(5, 7)].symbol(), "─", "second pane top border");
         assert_ne!(
-            buf[(5, 5)].fg,
+            buf[(5, 6)].fg,
             buf[(5, 7)].fg,
             "focused and inactive borders use distinct theme tokens"
         );
-        // The complete three-cell band stays grabbable for resize.
+        // The compact two-cell band stays grabbable for resize.
         assert!(matches!(hits.hit(20, 6), Some(HitTarget::Divider { .. })));
+        assert!(matches!(hits.hit(20, 7), Some(HitTarget::Divider { .. })));
         // The bottom margin carries the second pane's muted border.
         assert_eq!(buf[(20, 11)].symbol(), "─", "every pane has a border");
     }
@@ -1437,9 +1492,9 @@ mod tests {
     }
 
     #[test]
-    fn client_size_reserves_the_expanded_internal_gutter() {
+    fn client_size_reserves_the_compact_internal_gutter() {
         let tab = two_pane_tab();
-        assert_eq!(tmux_client_size(Rect::new(0, 1, 40, 11), &tab), (38, 7));
+        assert_eq!(tmux_client_size(Rect::new(0, 1, 40, 11), &tab), (38, 8));
     }
 
     #[test]
@@ -1472,8 +1527,19 @@ mod tests {
             hits.hit(8, 0),
             Some(HitTarget::Tab { window_id }) if window_id == "@1"
         ));
+        let buf = term.backend().buffer();
+        assert_ne!(
+            buf[(1, 0)].bg,
+            buf[(8, 0)].bg,
+            "the selected tab needs a materially stronger fill"
+        );
         // After both labels comes the + button.
         assert!(matches!(hits.hit(15, 0), Some(HitTarget::NewTabButton)));
+        assert_ne!(
+            buf[(15, 0)].bg,
+            buf[(8, 0)].bg,
+            "the add button should read as part of the tab strip"
+        );
     }
 
     #[test]
@@ -1484,24 +1550,28 @@ mod tests {
                 name: "cyclops".into(),
                 tab_count: 2,
                 active: true,
+                window_ids: vec!["@0".into()],
             },
             WorkspaceRow {
                 session_id: "$1".into(),
                 name: "website".into(),
                 tab_count: 1,
                 active: false,
+                window_ids: vec!["@1".into()],
             },
         ];
         let backend = TestBackend::new(20, 8);
         let mut term = Terminal::new(backend).unwrap();
         let theme = Paint::for_test();
         let mut hits = HitMap::default();
+        let expanded = std::collections::HashSet::from(["$0".to_string()]);
         term.draw(|f| {
             paint_sidebar(
                 &workspaces,
                 0,
-                &[two_pane_tab()],
                 "%0",
+                &expanded,
+                &[],
                 f.area(),
                 f.buffer_mut(),
                 &theme,
@@ -1522,16 +1592,103 @@ mod tests {
         // The title row is followed by a spacer, then the offline note,
         // so workspaces paint on rows 3 and 4.
         assert!(matches!(
-            hits.hit(2, 3),
-            Some(HitTarget::SidebarRow { session }) if session == "cyclops"
+            hits.hit(3, 3),
+            Some(HitTarget::SidebarRow { session, .. }) if session == "cyclops"
         ));
         assert!(matches!(
-            hits.hit(2, 4),
-            Some(HitTarget::SidebarRow { session }) if session == "website"
+            hits.hit(3, 4),
+            Some(HitTarget::SidebarRow { session, .. }) if session == "website"
         ));
-        // Bottom row is the app-menu button.
+        assert!(matches!(
+            hits.hit(2, 3),
+            Some(HitTarget::SidebarDisclosure { session_id }) if session_id == "$0"
+        ));
+        // Bottom row carries distinct menu and create buttons.
         assert!(matches!(hits.hit(2, 7), Some(HitTarget::AppMenu)));
+        assert!(matches!(
+            hits.hit(15, 7),
+            Some(HitTarget::NewWorkspaceButton)
+        ));
         assert!(flat.contains("menu"), "menu button should render: {flat}");
+        assert!(flat.contains('+'), "create button should render: {flat}");
+    }
+
+    #[test]
+    fn sidebar_agents_use_hierarchy_display_names_and_compact_status() {
+        use crate::decoration::PaneDecoration;
+        use cyclops_proto::AgentState;
+
+        let workspaces = vec![WorkspaceRow {
+            session_id: "$0".into(),
+            name: "cyclops".into(),
+            tab_count: 1,
+            active: true,
+            window_ids: vec!["@0".into()],
+        }];
+        let mut decoration = DecorationSnapshot {
+            online: true,
+            ..Default::default()
+        };
+        decoration.panes.insert(
+            "%0".into(),
+            PaneDecoration {
+                pane_id: "%0".into(),
+                window_id: "@0".into(),
+                label: Some("reviewer".into()),
+                manifest: Some("claude".into()),
+                manifest_display_name: Some("Claude Code".into()),
+                state: AgentState::Unknown,
+                needs_attention: false,
+            },
+        );
+        decoration.panes.insert(
+            "%1".into(),
+            PaneDecoration {
+                pane_id: "%1".into(),
+                window_id: "@0".into(),
+                label: None,
+                manifest: Some("claude".into()),
+                manifest_display_name: Some("Claude Code".into()),
+                state: AgentState::Working,
+                needs_attention: false,
+            },
+        );
+        let backend = TestBackend::new(28, 8);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+        let mut hits = HitMap::default();
+        let expanded = std::collections::HashSet::from(["$0".to_string()]);
+        term.draw(|frame| {
+            paint_sidebar(
+                &workspaces,
+                0,
+                "%0",
+                &expanded,
+                &["pane:%1".into(), "name:reviewer".into()],
+                frame.area(),
+                frame.buffer_mut(),
+                &theme,
+                &mut hits,
+                &decoration,
+            );
+        })
+        .unwrap();
+
+        let flat = flatten(term.backend().buffer());
+        assert!(flat.contains("● Claude Code"), "detected agent: {flat}");
+        assert!(flat.contains("reviewer"), "named pane: {flat}");
+        assert!(
+            !flat.contains("unknown"),
+            "unknown stays diagnostic: {flat}"
+        );
+        assert!(!flat.contains("? reviewer"), "unknown has no glyph: {flat}");
+        assert!(
+            matches!(
+                hits.hit(6, 3),
+                Some(HitTarget::SidebarAgent { pane_id, .. }) if pane_id == "%1"
+            ),
+            "persisted agent order should put Claude first"
+        );
     }
 
     #[test]
@@ -1634,8 +1791,8 @@ mod tests {
         let flat = flatten(term.backend().buffer());
         assert!(flat.contains("New tab"), "title renders: {flat}");
         assert!(flat.contains("revw"), "typed name renders: {flat}");
-        assert!(flat.contains("[ Create ]"), "confirm button: {flat}");
-        assert!(flat.contains("[ Cancel ]"), "cancel button: {flat}");
+        assert!(flat.contains("↵ Create"), "confirm affordance: {flat}");
+        assert!(flat.contains("Esc Cancel"), "cancel affordance: {flat}");
         let confirm = hits
             .regions()
             .iter()
@@ -1822,7 +1979,11 @@ mod tests {
         .unwrap();
         let flat = flatten(term.backend().buffer());
         assert!(flat.contains("Close this pane"));
-        assert!(flat.contains("[ Yes ]"), "confirm gets buttons too: {flat}");
+        assert!(flat.contains("Y Yes"), "confirm key is visible: {flat}");
+        assert!(
+            flat.contains("↵ / Esc Cancel"),
+            "safe default is visibly primary: {flat}"
+        );
     }
 
     #[test]
@@ -1889,6 +2050,7 @@ mod tests {
                 window_id: "@0".into(),
                 label: Some("reviewer".into()),
                 manifest: Some("claude".into()),
+                manifest_display_name: Some("Claude Code".into()),
                 state: AgentState::Working,
                 needs_attention: false,
             },
@@ -1919,6 +2081,106 @@ mod tests {
     }
 
     #[test]
+    fn unknown_is_not_painted_in_primary_pane_chrome() {
+        use crate::decoration::{DecorationSnapshot, PaneDecoration};
+        use cyclops_proto::AgentState;
+
+        let node = parse_layout("0000,30x5,0,0,0").unwrap();
+        let tab = TabModel {
+            window_id: "@0".into(),
+            name: "1".into(),
+            layout: resolve_layout(&node, &[]).unwrap(),
+            active_pane: "%0".into(),
+            zoomed: false,
+        };
+        let mut decoration = DecorationSnapshot {
+            online: true,
+            ..Default::default()
+        };
+        decoration.panes.insert(
+            "%0".into(),
+            PaneDecoration {
+                pane_id: "%0".into(),
+                window_id: "@0".into(),
+                label: Some("planner".into()),
+                manifest: Some("claude".into()),
+                manifest_display_name: Some("Claude Code".into()),
+                state: AgentState::Unknown,
+                needs_attention: false,
+            },
+        );
+        let backend = TestBackend::new(32, 7);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+        term.draw(|frame| {
+            let mut runtimes = RuntimeRegistry::default();
+            let mut hits = HitMap::default();
+            let paused = std::collections::HashSet::new();
+            let mut ctx = ctx_defaults(&mut hits, &paused, &decoration);
+            paint_window(
+                &tab,
+                &mut runtimes,
+                frame.area(),
+                frame.buffer_mut(),
+                &theme,
+                &mut ctx,
+            );
+        })
+        .unwrap();
+
+        let flat = flatten(term.backend().buffer());
+        assert!(flat.contains("planner"));
+        assert!(!flat.contains("unknown"));
+        assert!(!flat.contains("? "));
+    }
+
+    #[test]
+    fn inactive_pane_chrome_keeps_status_compact() {
+        use crate::decoration::{DecorationSnapshot, PaneDecoration};
+        use cyclops_proto::AgentState;
+
+        let tab = two_pane_tab();
+        let mut decoration = DecorationSnapshot {
+            online: true,
+            ..Default::default()
+        };
+        decoration.panes.insert(
+            "%1".into(),
+            PaneDecoration {
+                pane_id: "%1".into(),
+                window_id: "@0".into(),
+                label: Some("reviewer".into()),
+                manifest: Some("claude".into()),
+                manifest_display_name: Some("Claude Code".into()),
+                state: AgentState::Idle,
+                needs_attention: false,
+            },
+        );
+        let backend = TestBackend::new(40, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+        term.draw(|frame| {
+            let mut runtimes = RuntimeRegistry::default();
+            let mut hits = HitMap::default();
+            let paused = std::collections::HashSet::new();
+            let mut ctx = ctx_defaults(&mut hits, &paused, &decoration);
+            paint_window(
+                &tab,
+                &mut runtimes,
+                frame.area(),
+                frame.buffer_mut(),
+                &theme,
+                &mut ctx,
+            );
+        })
+        .unwrap();
+
+        let flat = flatten(term.backend().buffer());
+        assert!(flat.contains("reviewer · ○"), "compact chrome: {flat}");
+        assert!(!flat.contains("reviewer · ○ idle"), "inactive word: {flat}");
+    }
+
+    #[test]
     fn narrow_pane_badge_never_overwrites_split_controls() {
         use crate::decoration::{DecorationSnapshot, PaneDecoration};
         use cyclops_proto::AgentState;
@@ -1942,6 +2204,7 @@ mod tests {
                 window_id: "@0".into(),
                 label: Some("reviewer".into()),
                 manifest: Some("claude".into()),
+                manifest_display_name: Some("Claude Code".into()),
                 state: AgentState::BlockedPermission,
                 needs_attention: true,
             },
@@ -2003,6 +2266,7 @@ mod tests {
                 window_id: "@0".into(),
                 label: Some("reviewer".into()),
                 manifest: Some("claude".into()),
+                manifest_display_name: Some("Claude Code".into()),
                 state: AgentState::BlockedPermission,
                 needs_attention: true,
             },
@@ -2073,7 +2337,7 @@ mod tests {
             &two_pane_tab().layout,
             Rect::new(0, 0, 40, 11),
             "%0",
-            PANE_GAP,
+            PANE_GAPS,
         )
         .slots;
         assert_eq!(slots.len(), 2);

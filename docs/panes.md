@@ -10,6 +10,13 @@ becomes its message address and appears with state in the pane border and the
 workspace sidebar. If `cyclopsd` is offline, the dialog stays open and shows
 the error instead of pretending the pane was named.
 
+The workspace sidebar also shows an unnamed pane when a coding-agent manifest
+detects it, using the manifest's display name such as `Claude Code` or
+`Codex CLI`. That is visual discovery, not adoption: the pane does not become
+an address until you name it. Primary sidebar and pane chrome omit `unknown`;
+`cyclops read <name> --source detection` remains the diagnostic source for the
+exact fused state.
+
 ## Basics
 
 ```

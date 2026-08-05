@@ -19,7 +19,7 @@ pub const NEW_TAB_HINT: &str = "Opens in the current pane's directory.";
 
 pub const NAME_PANE_TITLE: &str = "Name pane";
 
-pub const NAME_PANE_HINT: &str = "This becomes the agent's Cyclops address.";
+pub const NAME_PANE_HINT: &str = "Used to identify and message this agent, e.g. reviewer.";
 
 pub const KEYBINDS_TITLE: &str = "Keybinds";
 
@@ -37,8 +37,6 @@ pub const BUTTON_CANCEL: &str = "Cancel";
 
 pub const BUTTON_YES: &str = "Yes";
 
-pub const BUTTON_NO: &str = "No";
-
 pub const BUTTON_CLOSE: &str = "Close";
 
 pub const RECONNECTING_NOTE: &str = "reconnecting…";
@@ -47,7 +45,7 @@ pub const PAUSED_NOTE: &str = "paused";
 
 pub const SERVER_GONE_OFFER: &str = "tmux server is gone. Run cyclops again to start a fresh one.";
 
-pub const EVENT_PANEL_EMPTY: &str = "No events yet.";
+pub const EVENT_STREAM_EMPTY: &str = "No events yet.";
 
 pub const APP_MENU_BUTTON: &str = "☰ menu";
 
@@ -65,7 +63,7 @@ pub const MENU_NEW_TAB: &str = "New tab";
 
 pub const MENU_NEW_WORKSPACE: &str = "New workspace";
 
-pub const MENU_TOGGLE_EVENTS: &str = "Events panel";
+pub const MENU_TOGGLE_EVENTS: &str = "Event stream";
 
 pub const MENU_KEYBINDS: &str = "Keybinds";
 

@@ -519,6 +519,43 @@ mod tests {
         client.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn focusing_a_background_workspace_agent_selects_its_window() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("intent-focus-background-workspace");
+        server.run_ok(&["new-session", "-d", "-s", "alpha", "/bin/sh"]);
+        server.run_ok(&["new-session", "-d", "-s", "beta", "-n", "one", "/bin/sh"]);
+        server.run_ok(&["new-window", "-d", "-t", "beta", "-n", "two", "/bin/sh"]);
+        let client = rig_client(&server, "alpha").await;
+        let out = server.run(&[
+            "list-panes",
+            "-t",
+            "beta:two",
+            "-F",
+            "#{window_id}\t#{pane_id}",
+        ]);
+        let target = String::from_utf8_lossy(&out.stdout);
+        let (window, pane) = target.trim().split_once('\t').expect("window and pane ids");
+
+        execute(&client, Intent::SwitchWorkspace("beta".into()), "")
+            .await
+            .expect("switch workspace");
+        execute_focus_pane(&client, Some(window), pane)
+            .await
+            .expect("focus background agent");
+
+        assert_eq!(
+            client
+                .command("display-message -p '#{session_name}\t#{window_name}\t#{pane_id}'")
+                .await
+                .expect("active target"),
+            vec![format!("beta\ttwo\t{pane}")]
+        );
+        client.shutdown().await;
+    }
+
     #[test]
     fn folder_names_sanitize_for_tmux() {
         use std::path::Path;

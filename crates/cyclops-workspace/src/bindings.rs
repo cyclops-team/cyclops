@@ -280,7 +280,7 @@ fn action_words(action: BindingAction) -> String {
         BindingAction::NewWorkspace => "New workspace here".into(),
         BindingAction::RenameWorkspace => "Rename workspace".into(),
         BindingAction::CloseWorkspace => "Close workspace".into(),
-        BindingAction::ToggleEventPanel => "Toggle events".into(),
+        BindingAction::ToggleEventPanel => "Toggle event stream".into(),
         BindingAction::ShowKeybinds => "Keybinds".into(),
     }
 }

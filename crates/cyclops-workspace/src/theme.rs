@@ -109,7 +109,7 @@ pub fn chrome_raised(paint: &Paint) -> Style {
 }
 
 pub fn tab_active(paint: &Paint) -> Style {
-    chrome_raised(paint)
+    accent_fill(paint)
 }
 
 pub fn tab_inactive(paint: &Paint) -> Style {
@@ -122,6 +122,14 @@ pub fn sidebar_row_active(paint: &Paint) -> Style {
     chrome_raised(paint)
 }
 
+pub fn sidebar_workspace(paint: &Paint) -> Style {
+    chrome_panel(paint).add_modifier(Modifier::BOLD)
+}
+
+pub fn sidebar_workspace_active(paint: &Paint) -> Style {
+    chrome_raised(paint).add_modifier(Modifier::BOLD)
+}
+
 pub fn sidebar_row(paint: &Paint) -> Style {
     paint
         .style_token(tokens::SURFACE_DIM)
@@ -132,6 +140,35 @@ pub fn sidebar_label(paint: &Paint) -> Style {
     paint
         .style_token(tokens::SURFACE_DIM)
         .patch(paint.bg_token(tokens::CHROME_PANEL))
+}
+
+/// Compact create buttons shared by the tab strip and sidebar footer.
+pub fn add_button(paint: &Paint) -> Style {
+    chrome_raised(paint)
+        .patch(paint.style_token(tokens::SURFACE_ACCENT))
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Primary keyboard action in a modal and the selected tab chip.
+pub fn accent_fill(paint: &Paint) -> Style {
+    if paint.colors_enabled {
+        paint
+            .style_token(tokens::CHROME_PANEL)
+            .patch(paint.bg_token(tokens::SURFACE_ACCENT))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::new()
+            .add_modifier(Modifier::REVERSED)
+            .add_modifier(Modifier::BOLD)
+    }
+}
+
+pub fn dialog_primary(paint: &Paint) -> Style {
+    accent_fill(paint)
+}
+
+pub fn dialog_secondary(paint: &Paint) -> Style {
+    chrome_panel(paint).add_modifier(Modifier::BOLD)
 }
 
 /// A menu or dialog surface at rest. Overlays sit one level above the

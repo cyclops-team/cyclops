@@ -1,7 +1,8 @@
 //! Reconcile workspace model from tmux.
 
 use cyclops_tmux::{
-    list_panes, list_sessions, list_windows, ControlClient, TmuxError, WindowPaneRow, WindowRow,
+    list_panes, list_sessions, list_window_memberships, list_windows, ControlClient, TmuxError,
+    WindowPaneRow, WindowRow,
 };
 
 use crate::layout::{parse_layout, resolve_layout};
@@ -16,6 +17,7 @@ pub fn fetch_workspace_model(
     socket: Option<&str>,
 ) -> Result<WorkspaceModel, TmuxError> {
     let sessions = list_sessions(socket)?;
+    let memberships = list_window_memberships(socket)?;
     let workspaces: Vec<WorkspaceRow> = sessions
         .iter()
         .map(|s| WorkspaceRow {
@@ -23,6 +25,11 @@ pub fn fetch_workspace_model(
             name: s.name.clone(),
             tab_count: s.tab_count,
             active: s.name == active_session,
+            window_ids: memberships
+                .iter()
+                .filter(|membership| membership.session_id == s.id)
+                .map(|membership| membership.window_id.clone())
+                .collect(),
         })
         .collect();
     let active_workspace = workspaces
@@ -141,6 +148,13 @@ mod tests {
         let model = fetch_workspace_model("alpha", Some(server.socket())).expect("model");
         assert_eq!(model.workspaces.len(), 2);
         assert!(model.workspaces.iter().any(|w| w.name == "beta"));
+        assert!(
+            model
+                .workspaces
+                .iter()
+                .all(|workspace| workspace.window_ids.len() == 1),
+            "one all-windows query should populate every sidebar workspace"
+        );
     }
 
     #[tokio::test]

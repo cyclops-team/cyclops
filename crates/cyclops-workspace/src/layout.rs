@@ -19,6 +19,23 @@ pub enum SplitDir {
     Vertical,
 }
 
+/// Screen cells reserved between sibling panes. Keeping the axes explicit
+/// prevents a future visual adjustment from leaking into layout arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneGaps {
+    pub columns: u16,
+    pub rows: u16,
+}
+
+impl PaneGaps {
+    fn for_split(self, dir: SplitDir) -> u16 {
+        match dir {
+            SplitDir::Horizontal => self.columns,
+            SplitDir::Vertical => self.rows,
+        }
+    }
+}
+
 /// Parsed tmux layout tree. Leaf numbers are pane ids (`%N` without the
 /// sigil); every node carries its cell rectangle in window coordinates.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -435,7 +452,7 @@ pub fn layout_geometry(
     node: &ResolvedLayout,
     canvas: Rect,
     focused_pane: &str,
-    gap: u16,
+    gaps: PaneGaps,
 ) -> LayoutGeometry {
     let mut geometry = LayoutGeometry {
         slots: Vec::new(),
@@ -446,7 +463,7 @@ pub fn layout_geometry(
         (canvas.x, canvas.y),
         canvas,
         focused_pane,
-        gap,
+        gaps,
         &mut geometry,
     );
     geometry
@@ -455,8 +472,8 @@ pub fn layout_geometry(
 /// Extra client cells reserved for expanded separator bands. Subtract this
 /// from tmux's declared window size; [`layout_geometry`] puts the cells back
 /// as chrome when painting.
-pub fn layout_gap_overhead(node: &ResolvedLayout, gap: u16) -> (u16, u16) {
-    let (painted_width, painted_height) = transformed_size(node, gap);
+pub fn layout_gap_overhead(node: &ResolvedLayout, gaps: PaneGaps) -> (u16, u16) {
+    let (painted_width, painted_height) = transformed_size(node, gaps);
     let root = node.rect();
     (
         painted_width.saturating_sub(root.width),
@@ -464,16 +481,16 @@ pub fn layout_gap_overhead(node: &ResolvedLayout, gap: u16) -> (u16, u16) {
     )
 }
 
-fn transformed_size(node: &ResolvedLayout, gap: u16) -> (u16, u16) {
+fn transformed_size(node: &ResolvedLayout, gaps: PaneGaps) -> (u16, u16) {
     match node {
         ResolvedLayout::Leaf { width, height, .. } => (*width, *height),
         ResolvedLayout::Split { dir, children, .. } => {
             let sizes: Vec<_> = children
                 .iter()
-                .map(|child| transformed_size(child, gap))
+                .map(|child| transformed_size(child, gaps))
                 .collect();
             let divider_count = u16::try_from(children.len().saturating_sub(1)).unwrap_or(u16::MAX);
-            let bands = gap.saturating_mul(divider_count);
+            let bands = gaps.for_split(*dir).saturating_mul(divider_count);
             match dir {
                 SplitDir::Horizontal => (
                     sizes
@@ -497,7 +514,7 @@ fn collect_geometry(
     origin: (u16, u16),
     bounds: Rect,
     focused: &str,
-    gap: u16,
+    gaps: PaneGaps,
     geometry: &mut LayoutGeometry,
 ) {
     match node {
@@ -516,11 +533,12 @@ fn collect_geometry(
             }
         }
         ResolvedLayout::Split { dir, children, .. } => {
-            let (width, height) = transformed_size(node, gap);
+            let (width, height) = transformed_size(node, gaps);
+            let gap = gaps.for_split(*dir);
             let mut cursor = origin;
             for (index, child) in children.iter().enumerate() {
-                let child_size = transformed_size(child, gap);
-                collect_geometry(child, cursor, bounds, focused, gap, geometry);
+                let child_size = transformed_size(child, gaps);
+                collect_geometry(child, cursor, bounds, focused, gaps, geometry);
                 if index + 1 < children.len() {
                     let divider = match dir {
                         SplitDir::Horizontal => {
@@ -804,15 +822,19 @@ mod tests {
     }
 
     #[test]
-    fn expanded_gap_keeps_pane_cells_and_separates_their_borders() {
+    fn compact_gap_keeps_pane_cells_and_separates_their_borders() {
         let node = parse_layout("da0d,80x24,0,0{40x24,0,0,0,39x24,41,0,1}").unwrap();
         let resolved = resolve_layout(&node, &[]).unwrap();
-        assert_eq!(layout_gap_overhead(&resolved, 3), (2, 0));
+        let gaps = PaneGaps {
+            columns: 2,
+            rows: 2,
+        };
+        assert_eq!(layout_gap_overhead(&resolved, gaps), (1, 0));
 
-        let geometry = layout_geometry(&resolved, Rect::new(10, 5, 82, 24), "%1", 3);
+        let geometry = layout_geometry(&resolved, Rect::new(10, 5, 81, 24), "%1", gaps);
         assert_eq!(geometry.slots[0].rect, Rect::new(10, 5, 40, 24));
-        assert_eq!(geometry.dividers[0].rect, Rect::new(50, 5, 3, 24));
-        assert_eq!(geometry.slots[1].rect, Rect::new(53, 5, 39, 24));
+        assert_eq!(geometry.dividers[0].rect, Rect::new(50, 5, 2, 24));
+        assert_eq!(geometry.slots[1].rect, Rect::new(52, 5, 39, 24));
     }
 
     #[test]
@@ -820,10 +842,14 @@ mod tests {
         let node = parse_layout("abcd,80x49,0,0[80x24,0,0{40x24,0,0,0,39x24,41,0,1},80x24,0,25,2]")
             .unwrap();
         let resolved = resolve_layout(&node, &[]).unwrap();
-        assert_eq!(layout_gap_overhead(&resolved, 3), (2, 2));
-        let geometry = layout_geometry(&resolved, Rect::new(0, 0, 82, 51), "%0", 3);
+        let gaps = PaneGaps {
+            columns: 2,
+            rows: 2,
+        };
+        assert_eq!(layout_gap_overhead(&resolved, gaps), (1, 1));
+        let geometry = layout_geometry(&resolved, Rect::new(0, 0, 81, 50), "%0", gaps);
         assert_eq!(geometry.slots.len(), 3);
-        assert_eq!(geometry.slots[2].rect, Rect::new(0, 27, 80, 24));
+        assert_eq!(geometry.slots[2].rect, Rect::new(0, 26, 80, 24));
     }
 
     #[test]
