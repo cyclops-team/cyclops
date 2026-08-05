@@ -162,6 +162,17 @@ fn arm(debounce: &mut Option<Instant>) {
     }
 }
 
+/// What the boot path does with the reopen decision: attach to `.0`, or
+/// create it first (`new-session -A`) because the server has nothing.
+fn boot_target(reopen: &persist::ReopenTarget) -> (String, bool) {
+    match reopen {
+        persist::ReopenTarget::LastActive { session, .. }
+        | persist::ReopenTarget::DefaultWorkspace(session)
+        | persist::ReopenTarget::First(session) => (session.clone(), false),
+        persist::ReopenTarget::OfferCreate => (copy::DEFAULT_SESSION_NAME.to_string(), true),
+    }
+}
+
 /// Run the workspace on a tty. Returns the process exit code.
 pub async fn run_async() -> i32 {
     let home = cyclops_proto::cyclops_home();
@@ -169,13 +180,8 @@ pub async fn run_async() -> i32 {
     let tmux_cfg = load_tmux_config(&home);
     let socket_name = tmux_cfg.socket.clone();
     let socket = socket_name.as_deref();
-    let sessions = match cyclops_tmux::list_sessions(socket) {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("{}", copy::NO_TMUX_SERVER);
-            return 0;
-        }
-    };
+    // No server yet is the same as a server with no sessions: boot one.
+    let sessions = cyclops_tmux::list_sessions(socket).unwrap_or_default();
     let session_names: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
     let last_active = persist::get_last_active(&home);
     let reopen = persist::reopen_fallback(
@@ -184,17 +190,14 @@ pub async fn run_async() -> i32 {
         None,
         &prefs.workspace_order,
     );
-    let session = match &reopen {
-        persist::ReopenTarget::LastActive { session, .. }
-        | persist::ReopenTarget::DefaultWorkspace(session)
-        | persist::ReopenTarget::First(session) => session.clone(),
-        persist::ReopenTarget::OfferCreate => {
-            eprintln!("{}", copy::NO_TMUX_SERVER);
-            return 0;
-        }
+    // Creating inherits this process's cwd: `cyclops` in a project folder
+    // opens a shell pane there, no preset or manual tmux required.
+    let (session, create) = boot_target(&reopen);
+    let mut cfg = if create {
+        ControlConfig::new_session(&session)
+    } else {
+        ControlConfig::attach(&session)
     };
-
-    let mut cfg = ControlConfig::attach(&session);
     if let Some(ref sock) = socket_name {
         cfg = cfg.on_socket(sock.clone());
     }
@@ -1375,6 +1378,19 @@ mod tests {
     #[test]
     fn help_exits_zero_message() {
         assert_eq!(print_help_and_exit(), 0);
+    }
+
+    #[test]
+    fn empty_server_boots_a_fresh_default_session() {
+        let (session, create) = boot_target(&persist::ReopenTarget::OfferCreate);
+        assert_eq!(session, copy::DEFAULT_SESSION_NAME);
+        assert!(create, "nothing to attach to must create, not exit");
+    }
+
+    #[test]
+    fn existing_session_attaches_without_creating() {
+        let reopen = persist::ReopenTarget::First("proj".into());
+        assert_eq!(boot_target(&reopen), ("proj".into(), false));
     }
 
     #[test]

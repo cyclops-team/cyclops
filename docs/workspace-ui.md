@@ -2,6 +2,10 @@
 
 Bare `cyclops` on a TTY opens the full-screen terminal workspace: a
 project sidebar, tab bar, and live pane canvas fed by tmux control mode.
+With no tmux server running (or no sessions on it), it starts one — a
+fresh session named `main` with a single shell pane in the directory you
+ran it from. No preset or manual `tmux new` required; `cyclops start`
+remains the front door for preset-built workspaces.
 
 ```bash
 cyclops                   # workspace (TTY required)

@@ -1,6 +1,7 @@
 //! User-facing sentences for the workspace UI.
 
-pub const NO_TMUX_SERVER: &str = "No tmux server is running. Start one with: tmux new -s main";
+/// Session bare `cyclops` creates when the server has nothing to attach to.
+pub const DEFAULT_SESSION_NAME: &str = "main";
 
 pub const DETACHED: &str = "Detached from workspace.";
 
@@ -20,8 +21,7 @@ pub const RECONNECTING_NOTE: &str = "reconnecting…";
 
 pub const PAUSED_NOTE: &str = "paused";
 
-pub const SERVER_GONE_OFFER: &str =
-    "tmux server is gone. Start a new session with: tmux new -s main";
+pub const SERVER_GONE_OFFER: &str = "tmux server is gone. Run cyclops again to start a fresh one.";
 
 pub const EVENT_PANEL_EMPTY: &str = "No events yet.";
 
