@@ -112,7 +112,9 @@ pub struct HydrationSnapshot {
     pub alternate_on: bool,
 }
 
-/// Borrowed view of a pane's visible cell grid.
+/// An owned copy of a pane's visible cell grid — the test-facing
+/// representation. Production rendering visits engine cells directly
+/// through `PaneRuntime::for_each_visible_cell` and never builds one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CellGrid {
     pub cols: u16,
@@ -148,20 +150,5 @@ impl CellGrid {
             out.push(line.trim_end().to_string());
         }
         out
-    }
-}
-
-/// Borrowed view of a pane runtime's current visible grid.
-pub struct CellGridView<'a> {
-    pub grid: &'a CellGrid,
-}
-
-impl<'a> CellGridView<'a> {
-    pub fn cell(&self, col: u16, row: u16) -> Option<&'a GridCell> {
-        self.grid.cell(col, row)
-    }
-
-    pub fn row_texts(&self) -> Vec<String> {
-        self.grid.row_texts()
     }
 }

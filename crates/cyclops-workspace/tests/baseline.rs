@@ -267,6 +267,7 @@ fn baseline_pane_runtime_feed_and_grid_throughput() {
         let mut runtime = PaneRuntime::new(cols, rows);
         let mut feed_total = Duration::ZERO;
         let mut grid_total = Duration::ZERO;
+        let mut walk_total = Duration::ZERO;
         let mut frames = 0usize;
         for chunk in bytes.chunks(CHUNK) {
             let t = Instant::now();
@@ -276,6 +277,16 @@ fn baseline_pane_runtime_feed_and_grid_throughput() {
             let t = Instant::now();
             let grid = runtime.snapshot();
             grid_total += t.elapsed();
+
+            // The production render path after R1: visit engine cells
+            // directly, no owned grid. The consumer folds each cell so the
+            // optimizer cannot delete the walk.
+            let t = Instant::now();
+            let mut acc = 0usize;
+            runtime.for_each_visible_cell(|_, _, cell| acc = acc.wrapping_add(cell.ch as usize));
+            walk_total += t.elapsed();
+            assert!(acc > 0, "the walk visited cells");
+
             frames += 1;
             assert!(
                 grid.cols == cols && grid.rows == rows,
@@ -284,14 +295,13 @@ fn baseline_pane_runtime_feed_and_grid_throughput() {
         }
         let bytes_per_sec = bytes.len() as f64 / feed_total.as_secs_f64();
         let avg_grid_us = grid_total.as_micros() as f64 / frames as f64;
+        let avg_walk_us = walk_total.as_micros() as f64 / frames as f64;
         println!(
             "{cols}x{rows}: fed {} bytes over {frames} frames in {:.2}ms feed time ({:.1} MB/s), \
-             avg grid build {:.2}us/frame, total grid-build time {:.2}ms",
+             avg grid build {avg_grid_us:.2}us/frame, avg direct cell walk {avg_walk_us:.2}us/frame",
             bytes.len(),
             feed_total.as_secs_f64() * 1000.0,
             bytes_per_sec / 1_000_000.0,
-            avg_grid_us,
-            grid_total.as_secs_f64() * 1000.0
         );
     }
 }

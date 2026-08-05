@@ -1384,8 +1384,9 @@ async fn handle_mouse(
                         if let Some(cell) = crate::input::mouse::HitMap::cell_at(geom, col, row) {
                             match clicks {
                                 2 => {
-                                    if let Some(rt) = app.runtimes.get_mut(&pane_id) {
-                                        app.selection.set_word(pane_id.clone(), cell, &rt.grid());
+                                    if let Some(rt) = app.runtimes.get(&pane_id) {
+                                        let row_text = rt.row_text(cell.row);
+                                        app.selection.set_word(pane_id.clone(), cell, &row_text);
                                     }
                                     copy_active_selection(app);
                                 }
@@ -2742,7 +2743,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
             };
             paint_window(
                 tab,
-                &mut app.runtimes,
+                &app.runtimes,
                 areas.canvas,
                 f.buffer_mut(),
                 &app.paint,

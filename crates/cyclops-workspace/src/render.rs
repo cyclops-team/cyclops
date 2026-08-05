@@ -22,7 +22,7 @@ use crate::input::mouse::{HitMap, HitTarget, MenuState, PaneGeometry};
 use crate::layout::{layout_gap_overhead, layout_geometry, DividerSeg, PaneGaps};
 use crate::model::{PaneSlot, RuntimeRegistry, TabModel, WorkspaceRow};
 use crate::resilience::LinkState;
-use crate::runtime::{CellGrid, Color, GridCell};
+use crate::runtime::{CellPos, Color, GridCell, PaneRuntime};
 use crate::selection::Selection;
 use crate::theme::{self, Paint};
 
@@ -394,11 +394,6 @@ fn input_tail(input: &str, width: usize) -> String {
     format!("{}{CURSOR}", &input[start..])
 }
 
-/// Blit a runtime grid into `area` of `buf`.
-pub fn paint_pane(grid: &CellGrid, area: Rect, buf: &mut Buffer, paint: &Paint) {
-    paint_pane_styled(grid, area, buf, theme::pane_cell(paint));
-}
-
 /// Render the workspace sidebar.
 pub fn paint_sidebar(
     workspaces: &[WorkspaceRow],
@@ -753,7 +748,7 @@ pub fn tmux_client_size(canvas: Rect, tab: &TabModel) -> (u16, u16) {
 /// cells.
 pub fn paint_window(
     tab: &TabModel,
-    runtimes: &mut RuntimeRegistry,
+    runtimes: &RuntimeRegistry,
     canvas: Rect,
     buf: &mut Buffer,
     paint: &Paint,
@@ -915,7 +910,7 @@ fn paint_pane_border(rect: Rect, bounds: Rect, buf: &mut Buffer, style: Style) {
 
 fn paint_pane_slot(
     slot: &PaneSlot,
-    runtimes: &mut RuntimeRegistry,
+    runtimes: &RuntimeRegistry,
     buf: &mut Buffer,
     paint: &Paint,
     ctx: &mut WindowPaintCtx<'_>,
@@ -928,12 +923,16 @@ fn paint_pane_slot(
     if matches!(ctx.link, LinkState::Reconnecting { .. }) {
         base = base.add_modifier(Modifier::DIM);
     }
-    if let Some(runtime) = runtimes.get_mut(&slot.pane_id) {
-        let grid = runtime.grid();
-        paint_pane_styled(grid.grid, vis, buf, base);
-        if let Some(sel) = ctx.selection.filter(|s| s.pane_id == slot.pane_id) {
-            paint_selection_overlay(grid.grid, vis, buf, sel, paint);
-        }
+    if let Some(runtime) = runtimes.get(&slot.pane_id) {
+        let selection = ctx.selection.filter(|s| s.pane_id == slot.pane_id);
+        paint_pane_cells(
+            runtime,
+            selection,
+            vis,
+            buf,
+            base,
+            theme::selection_highlight(paint),
+        );
         if slot.focused {
             let cur = runtime.cursor();
             if cur.visible && runtime.at_tail() && cur.col < vis.width && cur.row < vis.height {
@@ -941,12 +940,7 @@ fn paint_pane_slot(
             }
         }
     } else {
-        let empty = CellGrid {
-            cols: 0,
-            rows: 0,
-            cells: Vec::new(),
-        };
-        paint_pane_styled(&empty, vis, buf, base);
+        fill_blank(vis, buf, base);
     }
 
     ctx.hits.push(
@@ -1292,41 +1286,70 @@ pub fn paint_menu(
     }
 }
 
-fn paint_selection_overlay(
-    grid: &CellGrid,
+/// One pass from engine cells to buffer cells: the R1 design. There is no
+/// intermediate full-grid copy, and the selection highlight is decided per
+/// cell in the same visit instead of a second walk over a mirrored grid.
+fn paint_pane_cells(
+    runtime: &PaneRuntime,
+    selection: Option<&Selection>,
     area: Rect,
     buf: &mut Buffer,
-    sel: &Selection,
-    paint: &Paint,
+    base: Style,
+    highlight: Style,
 ) {
-    let (from, to) = if sel.from.row < sel.to.row
-        || (sel.from.row == sel.to.row && sel.from.col <= sel.to.col)
-    {
-        (sel.from, sel.to)
-    } else {
-        (sel.to, sel.from)
-    };
-    let hi = theme::selection_highlight(paint);
-    for row in from.row..=to.row {
-        let col_start = if row == from.row { from.col } else { 0 };
-        let col_end = if row == to.row {
-            to.col
+    let range = selection.map(|sel| {
+        if sel.from.row < sel.to.row || (sel.from.row == sel.to.row && sel.from.col <= sel.to.col) {
+            (sel.from, sel.to)
         } else {
-            area.width.saturating_sub(1)
+            (sel.to, sel.from)
+        }
+    });
+    runtime.for_each_visible_cell(|col, row, cell| {
+        if col >= area.width || row >= area.height {
+            return;
+        }
+        let ch = if cell.wide_spacer || cell.ch == '\0' {
+            ' '
+        } else {
+            cell.ch
         };
-        for col in col_start..=col_end.min(area.width.saturating_sub(1)) {
-            if let Some(cell) = grid.cell(col, row) {
-                let ch = if cell.wide_spacer || cell.ch == '\0' {
-                    ' '
-                } else {
-                    cell.ch
-                };
-                let x = area.x + col;
-                let y = area.y + row;
-                if let Some(dst) = buf.cell_mut((x, y)) {
-                    dst.set_char(ch);
-                    dst.set_style(hi);
+        let style = match range {
+            Some((from, to)) if in_selection(col, row, from, to) => highlight,
+            _ => cell_style(&cell, base),
+        };
+        if let Some(dst) = buf.cell_mut((area.x + col, area.y + row)) {
+            dst.set_char(ch);
+            dst.set_style(style);
+        }
+    });
+    // The grid can be smaller than the slot during a resize transient, and
+    // every slot cell must repaint over the previous frame.
+    let (gcols, grows) = runtime.size();
+    for row in 0..area.height {
+        for col in 0..area.width {
+            if col >= gcols || row >= grows {
+                if let Some(dst) = buf.cell_mut((area.x + col, area.y + row)) {
+                    dst.set_char(' ');
+                    dst.set_style(base);
                 }
+            }
+        }
+    }
+}
+
+/// Whether one cell sits inside a normalized selection range. Middle rows
+/// select edge to edge; the end rows clip at the anchor columns.
+fn in_selection(col: u16, row: u16, from: CellPos, to: CellPos) -> bool {
+    (row > from.row || (row == from.row && col >= from.col))
+        && (row < to.row || (row == to.row && col <= to.col))
+}
+
+fn fill_blank(area: Rect, buf: &mut Buffer, base: Style) {
+    for row in 0..area.height {
+        for col in 0..area.width {
+            if let Some(dst) = buf.cell_mut((area.x + col, area.y + row)) {
+                dst.set_char(' ');
+                dst.set_style(base);
             }
         }
     }
@@ -1378,29 +1401,6 @@ pub fn paint_event_stream(lines: &[String], area: Rect, buf: &mut Buffer, paint:
     Paragraph::new(text).render(inner, buf);
 }
 
-fn paint_pane_styled(grid: &CellGrid, area: Rect, buf: &mut Buffer, base: Style) {
-    for row in 0..area.height {
-        for col in 0..area.width {
-            let (ch, style) = if let Some(cell) = grid.cell(col, row) {
-                let ch = if cell.wide_spacer || cell.ch == '\0' {
-                    ' '
-                } else {
-                    cell.ch
-                };
-                (ch, cell_style(cell, base))
-            } else {
-                (' ', base)
-            };
-            let x = area.x + col;
-            let y = area.y + row;
-            if let Some(dst) = buf.cell_mut((x, y)) {
-                dst.set_char(ch);
-                dst.set_style(style);
-            }
-        }
-    }
-}
-
 fn cell_style(cell: &GridCell, base: Style) -> Style {
     let mut style = base;
     if let Some(fg) = rt_color(cell.attrs.fg) {
@@ -1449,7 +1449,6 @@ mod tests {
     use crate::layout::{parse_layout, resolve_layout};
     use crate::model::{RuntimeRegistry, TabModel, WorkspaceRow};
     use crate::resilience::LinkState;
-    use crate::runtime::{CellAttrs, GridCell};
     use crate::theme::Paint;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -1492,31 +1491,31 @@ mod tests {
 
     #[test]
     fn pane_cells_paint_on_test_backend() {
-        let mut grid = CellGrid {
-            cols: 5,
-            rows: 2,
-            cells: vec![GridCell::default(); 10],
-        };
-        grid.cells[0] = GridCell {
-            ch: 'X',
-            wide_spacer: false,
-            attrs: CellAttrs::default(),
-        };
+        let mut rt = crate::runtime::PaneRuntime::new(5, 2);
+        rt.feed(b"X");
         let backend = TestBackend::new(5, 2);
         let mut term = Terminal::new(backend).unwrap();
         let theme = Paint::for_test();
         term.draw(|f| {
-            paint_pane(&grid, f.area(), f.buffer_mut(), &theme);
+            paint_pane_cells(
+                &rt,
+                None,
+                f.area(),
+                f.buffer_mut(),
+                theme::pane_cell(&theme),
+                theme::selection_highlight(&theme),
+            );
         })
         .unwrap();
         let buf = term.backend().buffer();
         assert_eq!(buf[(0, 0)].symbol(), "X");
+        assert_eq!(buf[(1, 0)].symbol(), " ", "blank cells repaint as spaces");
     }
 
     #[test]
     fn gutter_ring_and_tab_bar_render() {
         let tab = two_pane_tab();
-        let mut runtimes = RuntimeRegistry::default();
+        let runtimes = RuntimeRegistry::default();
 
         let backend = TestBackend::new(40, 12);
         let mut term = Terminal::new(backend).unwrap();
@@ -1538,14 +1537,7 @@ mod tests {
             let paused = std::collections::HashSet::new();
             let dec = DecorationSnapshot::default();
             let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
-            paint_window(
-                &tab,
-                &mut runtimes,
-                canvas,
-                f.buffer_mut(),
-                &theme,
-                &mut ctx,
-            );
+            paint_window(&tab, &runtimes, canvas, f.buffer_mut(), &theme, &mut ctx);
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -2166,7 +2158,7 @@ mod tests {
     #[test]
     fn reconnecting_pane_renders_dimmed_note() {
         let tab = two_pane_tab();
-        let mut runtimes = RuntimeRegistry::default();
+        let runtimes = RuntimeRegistry::default();
         let backend = TestBackend::new(40, 12);
         let mut term = Terminal::new(backend).unwrap();
         let theme = Paint::for_test();
@@ -2176,14 +2168,7 @@ mod tests {
             let dec = DecorationSnapshot::default();
             let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
             ctx.link = LinkState::Reconnecting { attempt: 1 };
-            paint_window(
-                &tab,
-                &mut runtimes,
-                f.area(),
-                f.buffer_mut(),
-                &theme,
-                &mut ctx,
-            );
+            paint_window(&tab, &runtimes, f.area(), f.buffer_mut(), &theme, &mut ctx);
         })
         .unwrap();
         let flat = flatten(term.backend().buffer());
@@ -2237,14 +2222,7 @@ mod tests {
             let dec = DecorationSnapshot::default();
             let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
             ctx.selection = Some(&sel);
-            paint_window(
-                &tab,
-                &mut runtimes,
-                f.area(),
-                f.buffer_mut(),
-                &theme,
-                &mut ctx,
-            );
+            paint_window(&tab, &runtimes, f.area(), f.buffer_mut(), &theme, &mut ctx);
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -2265,7 +2243,7 @@ mod tests {
         use cyclops_proto::AgentState;
 
         let tab = two_pane_tab();
-        let mut runtimes = RuntimeRegistry::default();
+        let runtimes = RuntimeRegistry::default();
         let mut decoration = DecorationSnapshot {
             online: true,
             ..Default::default()
@@ -2289,14 +2267,7 @@ mod tests {
         term.draw(|f| {
             let paused = std::collections::HashSet::new();
             let mut ctx = ctx_defaults(&mut hits, &paused, &decoration);
-            paint_window(
-                &tab,
-                &mut runtimes,
-                f.area(),
-                f.buffer_mut(),
-                &theme,
-                &mut ctx,
-            );
+            paint_window(&tab, &runtimes, f.area(), f.buffer_mut(), &theme, &mut ctx);
         })
         .unwrap();
         let flat = flatten(term.backend().buffer());
@@ -2340,13 +2311,13 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         let theme = Paint::for_test();
         term.draw(|frame| {
-            let mut runtimes = RuntimeRegistry::default();
+            let runtimes = RuntimeRegistry::default();
             let mut hits = HitMap::default();
             let paused = std::collections::HashSet::new();
             let mut ctx = ctx_defaults(&mut hits, &paused, &decoration);
             paint_window(
                 &tab,
-                &mut runtimes,
+                &runtimes,
                 frame.area(),
                 frame.buffer_mut(),
                 &theme,
@@ -2387,13 +2358,13 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         let theme = Paint::for_test();
         term.draw(|frame| {
-            let mut runtimes = RuntimeRegistry::default();
+            let runtimes = RuntimeRegistry::default();
             let mut hits = HitMap::default();
             let paused = std::collections::HashSet::new();
             let mut ctx = ctx_defaults(&mut hits, &paused, &decoration);
             paint_window(
                 &tab,
-                &mut runtimes,
+                &runtimes,
                 frame.area(),
                 frame.buffer_mut(),
                 &theme,
@@ -2436,7 +2407,7 @@ mod tests {
                 needs_attention: true,
             },
         );
-        let mut runtimes = RuntimeRegistry::default();
+        let runtimes = RuntimeRegistry::default();
         let backend = TestBackend::new(12, 5);
         let mut term = Terminal::new(backend).unwrap();
         let theme = Paint::for_test();
@@ -2444,14 +2415,7 @@ mod tests {
         term.draw(|f| {
             let paused = std::collections::HashSet::new();
             let mut ctx = ctx_defaults(&mut hits, &paused, &decoration);
-            paint_window(
-                &tab,
-                &mut runtimes,
-                f.area(),
-                f.buffer_mut(),
-                &theme,
-                &mut ctx,
-            );
+            paint_window(&tab, &runtimes, f.area(), f.buffer_mut(), &theme, &mut ctx);
         })
         .unwrap();
 
@@ -2502,13 +2466,13 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         let theme = Paint::for_test();
         term.draw(|frame| {
-            let mut runtimes = RuntimeRegistry::default();
+            let runtimes = RuntimeRegistry::default();
             let mut hits = HitMap::default();
             let paused = std::collections::HashSet::new();
             let mut ctx = ctx_defaults(&mut hits, &paused, &decoration);
             paint_window(
                 &tab,
-                &mut runtimes,
+                &runtimes,
                 frame.area(),
                 frame.buffer_mut(),
                 &theme,
@@ -2543,14 +2507,7 @@ mod tests {
             let paused = std::collections::HashSet::new();
             let dec = DecorationSnapshot::default();
             let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
-            paint_window(
-                &tab,
-                &mut runtimes,
-                f.area(),
-                f.buffer_mut(),
-                &theme,
-                &mut ctx,
-            );
+            paint_window(&tab, &runtimes, f.area(), f.buffer_mut(), &theme, &mut ctx);
             cursor = ctx.cursor;
         })
         .unwrap();

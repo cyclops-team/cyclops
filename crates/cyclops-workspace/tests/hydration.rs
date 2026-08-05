@@ -86,7 +86,7 @@ async fn hydrated_grid_matches_plain_capture() {
     runtime.hydrate(&snapshot_from_bundle(&bundle));
 
     let cap = rig.server.capture("%0");
-    rows_match_grid_and_capture(&runtime.grid().row_texts(), &cap);
+    rows_match_grid_and_capture(&runtime.snapshot().row_texts(), &cap);
 
     client.shutdown().await;
 }
@@ -120,7 +120,7 @@ async fn resize_then_rehydrate_still_matches_capture() {
     let mut runtime = PaneRuntime::new(bundle.cols, bundle.rows);
     runtime.hydrate(&snapshot_from_bundle(&bundle));
 
-    rows_match_grid_and_capture(&runtime.grid().row_texts(), &rig.server.capture("%0"));
+    rows_match_grid_and_capture(&runtime.snapshot().row_texts(), &rig.server.capture("%0"));
 
     client.shutdown().await;
 }
@@ -212,7 +212,7 @@ async fn mid_stream_rehydrate_matches_capture() {
     assert!(cap.contains("MID_STREAM"));
     assert!(
         runtime
-            .grid()
+            .snapshot()
             .row_texts()
             .iter()
             .any(|l| l.contains("MID_STREAM")),

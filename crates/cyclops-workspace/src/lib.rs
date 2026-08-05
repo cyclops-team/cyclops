@@ -24,6 +24,6 @@ mod theme;
 
 pub use app::{print_help_and_exit, run, run_async};
 pub use runtime::{
-    feed_alacritty, snapshot_from_bundle, AlacrittyVt, CellAttrs, CellGrid, CellGridView, CellPos,
-    Color, CursorShape, CursorState, GridCell, HydrationSnapshot, PaneRuntime, Underline,
+    snapshot_from_bundle, CellAttrs, CellGrid, CellPos, Color, CursorShape, CursorState, GridCell,
+    HydrationSnapshot, PaneRuntime, Underline,
 };

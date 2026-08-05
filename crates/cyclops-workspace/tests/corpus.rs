@@ -4,7 +4,15 @@
 //! recorded fixture. F35 settled the engine choice — alacritty 12/12 against
 //! `vt100` 5/12 — so that score lives in `findings.md`, not in every run.
 
-use cyclops_workspace::{feed_alacritty, AlacrittyVt, CellGrid, Color};
+use cyclops_workspace::{CellGrid, Color, PaneRuntime};
+
+/// Feed one recorded byte stream into a fresh runtime and take an owned
+/// snapshot of the visible grid.
+fn feed(bytes: &[u8], cols: u16, rows: u16) -> CellGrid {
+    let mut rt = PaneRuntime::new(cols, rows);
+    rt.feed(bytes);
+    rt.snapshot()
+}
 
 /// One recorded byte stream and its expected visible grid.
 struct Fixture {
@@ -184,7 +192,7 @@ fn corpus() -> Vec<Fixture> {
 #[test]
 fn alacritty_corpus_passes() {
     for fx in corpus() {
-        let grid = feed_alacritty(fx.bytes, fx.cols, fx.rows);
+        let grid = feed(fx.bytes, fx.cols, fx.rows);
         assert_grid_matches(&fx, &grid, "alacritty");
     }
 }
@@ -192,7 +200,7 @@ fn alacritty_corpus_passes() {
 #[test]
 fn hydrate_feeds_visible_bytes() {
     use cyclops_workspace::HydrationSnapshot;
-    let mut vt = AlacrittyVt::new(10, 2);
+    let mut rt = PaneRuntime::new(10, 2);
     let snap = HydrationSnapshot {
         cols: 10,
         rows: 2,
@@ -202,6 +210,6 @@ fn hydrate_feeds_visible_bytes() {
         cursor_y: 0,
         alternate_on: false,
     };
-    vt.hydrate(&snap);
-    assert_eq!(vt.grid().row_texts()[0], "hydrated");
+    rt.hydrate(&snap);
+    assert_eq!(rt.snapshot().row_texts()[0], "hydrated");
 }

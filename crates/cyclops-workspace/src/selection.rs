@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use crate::input::mouse::HitTarget;
-use crate::runtime::{CellGridView, CellPos, PaneRuntime};
+use crate::runtime::{CellPos, PaneRuntime};
 
 /// Active selection in one pane body.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,8 +127,10 @@ impl SelectionState {
         self.active.clone()
     }
 
-    pub fn set_word(&mut self, pane_id: String, pos: CellPos, grid: &CellGridView<'_>) {
-        let (from, to) = word_range(grid, pos);
+    /// Select the word around a double-click. `row_text` is the clicked
+    /// row with one char per column (`PaneRuntime::row_text`).
+    pub fn set_word(&mut self, pane_id: String, pos: CellPos, row_text: &str) {
+        let (from, to) = word_range(row_text, pos);
         self.dragging = None;
         self.active = Some(Selection { pane_id, from, to });
     }
@@ -160,36 +162,23 @@ fn normalize(from: CellPos, to: CellPos) -> (CellPos, CellPos) {
     }
 }
 
-fn word_range(grid: &CellGridView<'_>, pos: CellPos) -> (CellPos, CellPos) {
+/// Word bounds around a click, over a row given as one `char` per column
+/// (`PaneRuntime::row_text`). Indexing chars, not bytes, keeps the columns
+/// honest on rows holding wide or multi-byte characters — the old
+/// grid-view version indexed bytes and drifted right of every CJK glyph.
+fn word_range(row_text: &str, pos: CellPos) -> (CellPos, CellPos) {
     let row = pos.row;
-    let cols = grid.grid.cols;
-    if cols == 0 {
+    let chars: Vec<char> = row_text.chars().collect();
+    if chars.is_empty() {
         return (pos, pos);
     }
-    let text: String = (0..cols)
-        .map(|c| {
-            grid.cell(c, row)
-                .map(|cell| {
-                    if cell.wide_spacer || cell.ch == '\0' {
-                        ' '
-                    } else {
-                        cell.ch
-                    }
-                })
-                .unwrap_or(' ')
-        })
-        .collect();
-    let col = pos.col.min(cols.saturating_sub(1)) as usize;
-    let bytes = text.as_bytes();
-    if bytes.is_empty() {
-        return (pos, pos);
-    }
-    let mut start = col.min(bytes.len().saturating_sub(1));
-    let mut end = start;
-    while start > 0 && is_word_char(bytes[start - 1]) {
+    let col = (pos.col as usize).min(chars.len() - 1);
+    let mut start = col;
+    let mut end = col;
+    while start > 0 && is_word_char(chars[start - 1]) {
         start -= 1;
     }
-    while end + 1 < bytes.len() && is_word_char(bytes[end + 1]) {
+    while end + 1 < chars.len() && is_word_char(chars[end + 1]) {
         end += 1;
     }
     (
@@ -204,8 +193,8 @@ fn word_range(grid: &CellGridView<'_>, pos: CellPos) -> (CellPos, CellPos) {
     )
 }
 
-fn is_word_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
 }
 
 /// Copy text to the system clipboard via OSC 52, with a native fallback.
@@ -278,31 +267,30 @@ fn base64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::AlacrittyVt;
 
     #[test]
     fn word_range_finds_token() {
-        let mut grid = crate::runtime::CellGrid {
-            cols: 12,
-            rows: 1,
-            cells: vec![crate::runtime::GridCell::default(); 12],
-        };
-        for (i, ch) in "hello world".chars().enumerate() {
-            grid.cells[i].ch = ch;
-        }
-        let view = crate::runtime::CellGridView { grid: &grid };
-        let (from, to) = word_range(&view, CellPos { col: 8, row: 0 });
+        let (from, to) = word_range("hello world ", CellPos { col: 8, row: 0 });
         assert_eq!(from.col, 6);
         assert_eq!(to.col, 10);
     }
 
     #[test]
+    fn word_range_stays_column_accurate_after_a_wide_character() {
+        // Column-indexed row text: 你 at col 0, its spacer at col 1. A
+        // byte-indexed range would land two cells right of the word.
+        let (from, to) = word_range("你 abc   ", CellPos { col: 3, row: 0 });
+        assert_eq!(from.col, 2);
+        assert_eq!(to.col, 4);
+    }
+
+    #[test]
     fn selection_extracts_across_cells() {
-        let mut vt = AlacrittyVt::new(10, 2);
-        vt.feed(b"abcdef\r\n");
+        let mut rt = PaneRuntime::new(10, 2);
+        rt.feed(b"abcdef\r\n");
         let from = CellPos { col: 1, row: 0 };
         let to = CellPos { col: 4, row: 0 };
-        let text = vt.select(from, to).expect("text");
+        let text = rt.select(from, to).expect("text");
         assert_eq!(text.trim(), "bcde");
     }
 

@@ -145,6 +145,37 @@ harness deliberately never repeats that mistake. Every number above is
 assertion in `baseline.rs` is structural (pane counts, window counts,
 command counts) rather than a timing threshold.
 
+## Post-R1 measurements (2026-08-05, same machine)
+
+R1 deleted the full-grid `CellGrid` mirror (`cached_grid`/`grid_dirty`/
+`CellGridView`) and made production rendering visit the engine's cells
+directly (`PaneRuntime::for_each_visible_cell`), so the harness gained a
+third metric: the direct cell walk, which *is* the post-R1 production
+render path. Copied from a quiet run (`--test-threads=1`; an earlier run
+during macOS storage-daemon churn was ~20% worse across the board,
+including on unchanged code — trust only quiet-machine runs):
+
+```
+80x24: fed 1048577 bytes over 257 frames in 75.85ms feed time (13.8 MB/s), avg grid build 173.04us/frame, avg direct cell walk 150.75us/frame
+200x50: fed 1048577 bytes over 257 frames in 92.63ms feed time (11.3 MB/s), avg grid build 888.31us/frame, avg direct cell walk 775.10us/frame
+```
+
+Against the pre-R1 baseline:
+
+| Metric | Pre-R1 | Post-R1 | Reading |
+|---|---|---|---|
+| Feed, 80x24 | 13.8 MB/s | 13.8 MB/s | parity |
+| Feed, 200x50 | 10.8 MB/s | 11.3 MB/s | parity/slightly better |
+| Owned snapshot, 80x24 | 165.79us | 173.04us | parity (test-only path now) |
+| Owned snapshot, 200x50 | 884.46us | 888.31us | parity |
+| Production frame walk, 80x24 | 165.79us build + a second paint walk over the mirror | 150.75us, one pass | improved |
+| Production frame walk, 200x50 | 884.46us build + a second paint walk | 775.10us, one pass | improved |
+
+The pre-R1 production frame paid the mirror build *and then* a second
+walk over the mirrored grid to paint (plus a third partial walk when a
+selection was active). Post-R1 there is one walk, cheaper than the old
+build alone, with the selection decision folded into the same visit.
+
 ## Which task each baseline exists to check
 
 | Baseline | Checked by | What "improved" means |
