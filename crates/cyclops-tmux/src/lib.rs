@@ -35,6 +35,10 @@
 //!   control via pause-after, typed helpers (capture, display, send-keys,
 //!   load-buffer, paste-buffer). The stream is read as raw byte lines:
 //!   %output data is not guaranteed to be valid UTF-8 on the wire (F22).
+//! - [`ops`]: the structural vocabulary a workspace UI issues on a gesture
+//!   — split, close, zoom, resize, create, rename, swap, move, select.
+//!   Typed operations on [`ControlClient`]; the command spelling, quoting
+//!   and exact targets stay here so a UI never composes a tmux line.
 //! - [`SessionWatcher`]: zero-polling reconciling pane table for one
 //!   session. `refresh-client -B` subscriptions (MEASURED working on tmux
 //!   3.6a) push per-pane field changes; structural notifications are hints
@@ -65,6 +69,7 @@ pub mod focus;
 pub mod hydration;
 pub mod layout;
 pub mod notify;
+pub mod ops;
 pub mod quote;
 pub mod session;
 pub mod version;
@@ -78,6 +83,7 @@ pub use error::TmuxError;
 pub use focus::focus_pane;
 pub use hydration::HydrationBundle;
 pub use notify::Notification;
+pub use ops::{PaneDirection, SplitDirection};
 pub use quote::quote_arg;
 pub use session::{
     active_pane, list_panes, list_sessions, list_window_memberships, list_windows, SessionRow,
