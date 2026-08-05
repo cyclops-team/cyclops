@@ -338,6 +338,9 @@ pub async fn resize_divider(
     Ok(())
 }
 
+/// No `-d`: a split exists to be typed into, so the new pane should become
+/// current in tmux immediately. The workspace model still only learns this
+/// through reconcile, same as every other structural change.
 async fn split(client: &ControlClient, pane: &str, horizontal: bool) -> Result<(), TmuxError> {
     let path = client
         .display(pane, "#{pane_current_path}")
@@ -347,7 +350,7 @@ async fn split(client: &ControlClient, pane: &str, horizontal: bool) -> Result<(
     let flag = if horizontal { "-h" } else { "-v" };
     client
         .command(&format!(
-            "split-window {flag} -d -c {} -t {}",
+            "split-window {flag} -c {} -t {}",
             quote_arg(&path),
             quote_arg(pane)
         ))
@@ -477,6 +480,60 @@ mod tests {
             .await
             .expect("split");
         assert_eq!(pane_ids(&server, "s").len(), 2);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn split_right_focuses_the_new_pane() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("intent-split-focus-r");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        let client = rig_client(&server, "s").await;
+        let before = pane_ids(&server, "s");
+        let pane = before[0].clone();
+        execute(&client, Intent::SplitRight, &pane)
+            .await
+            .expect("split");
+        let after = pane_ids(&server, "s");
+        let new_pane = after
+            .iter()
+            .find(|p| !before.contains(p))
+            .expect("new pane");
+        let out = server.run(&["display-message", "-p", "-t", "s", "#{pane_id}"]);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            new_pane,
+            "split should hand tmux focus to the pane it just created, not leave it on the source pane"
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn split_down_focuses_the_new_pane() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("intent-split-focus-d");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        let client = rig_client(&server, "s").await;
+        let before = pane_ids(&server, "s");
+        let pane = before[0].clone();
+        execute(&client, Intent::SplitDown, &pane)
+            .await
+            .expect("split");
+        let after = pane_ids(&server, "s");
+        let new_pane = after
+            .iter()
+            .find(|p| !before.contains(p))
+            .expect("new pane");
+        let out = server.run(&["display-message", "-p", "-t", "s", "#{pane_id}"]);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            new_pane,
+            "split should hand tmux focus to the pane it just created, not leave it on the source pane"
+        );
         client.shutdown().await;
     }
 
