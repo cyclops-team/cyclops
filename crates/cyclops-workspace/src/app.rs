@@ -807,6 +807,20 @@ impl App {
         set_last_active(&self.home, &self.model.session.session, &tab.window_id);
     }
 
+    /// Whether this motion arrives on, or departs from, the sidebar's
+    /// create button. Both edges have to reach the renderer: one lights the
+    /// button, the other puts it out, and a filter that only let the
+    /// arrival through would leave it lit wherever the mouse went next.
+    fn motion_touches_new_workspace_button(&self, col: u16, row: u16) -> bool {
+        let on_button = |col: u16, row: u16| {
+            matches!(
+                self.hit_map.hit(col, row),
+                Some(HitTarget::NewWorkspaceButton)
+            )
+        };
+        on_button(col, row) || self.hover.is_some_and(|(col, row)| on_button(col, row))
+    }
+
     fn open_menu(&mut self, menu: MenuState) {
         self.menu = menu;
         self.hover = None;
@@ -1061,10 +1075,13 @@ async fn handle_app_msg(
         }
         AppMsg::Mouse(mouse) => {
             // Bare motion only matters while a menu or dialog shows hover
-            // highlights; everywhere else it must not wake the renderer.
+            // highlights — or over the sidebar's create button, the one
+            // piece of resting chrome that answers the mouse. Everywhere
+            // else it must not wake the renderer.
             if matches!(mouse.kind, MouseEventKind::Moved)
                 && !app.menu.is_open()
                 && app.dialog.is_none()
+                && !app.motion_touches_new_workspace_button(mouse.column, mouse.row)
             {
                 return true;
             }
@@ -2701,6 +2718,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
                     &app.paint,
                     &mut app.hit_map,
                     &app.decoration,
+                    app.hover,
                 );
             }
             paint_tab_bar(

@@ -411,6 +411,7 @@ pub fn paint_sidebar(
     paint: &Paint,
     hits: &mut HitMap,
     decoration: &DecorationSnapshot,
+    hover: Option<(u16, u16)>,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -584,13 +585,43 @@ pub fn paint_sidebar(
         let plus_x = content
             .x
             .saturating_add(content.width.saturating_sub(plus_width));
+        // The button keeps one width whether or not it is pointed at, so
+        // the target never moves out from under the mouse that found it.
+        let hovered = hover.is_some_and(|(hover_col, hover_row)| {
+            hover_row == menu_row.y
+                && hover_col >= plus_x
+                && hover_col < plus_x.saturating_add(plus_width)
+        });
+        if hovered {
+            // Say what it makes, in the gutter the footer already leaves
+            // between the menu label and the button. Skipped rather than
+            // truncated when the sidebar is too narrow: half a word next to
+            // a lit button teaches nothing.
+            let hint_width =
+                u16::try_from(Span::raw(copy::NEW_WORKSPACE_HINT).width()).unwrap_or(u16::MAX);
+            let gutter = plus_x.saturating_sub(content.x.saturating_add(menu_width));
+            if hint_width < gutter {
+                overlay_text(
+                    buf,
+                    content,
+                    plus_x.saturating_sub(hint_width),
+                    menu_row.y,
+                    copy::NEW_WORKSPACE_HINT,
+                    theme::sidebar_label(paint),
+                );
+            }
+        }
         overlay_text(
             buf,
             content,
             plus_x,
             menu_row.y,
             plus,
-            theme::add_button(paint),
+            if hovered {
+                theme::add_button_hover(paint)
+            } else {
+                theme::add_button(paint)
+            },
         );
         hits.push(
             Rect::new(plus_x, menu_row.y, plus_width, 1),
@@ -1664,6 +1695,72 @@ mod tests {
         );
     }
 
+    /// The create button is a bare glyph at rest, so the mouse has to be
+    /// what explains it: pointing at it fills the button and names what it
+    /// makes, and the target must not move while being pointed at.
+    #[test]
+    fn sidebar_create_button_answers_the_mouse() {
+        let workspaces = vec![WorkspaceRow {
+            session_id: "$0".into(),
+            name: "cyclops".into(),
+            tab_count: 1,
+            active: true,
+            window_ids: vec!["@0".into()],
+        }];
+        let theme = Paint::for_test();
+        let expanded = std::collections::HashSet::from(["$0".to_string()]);
+
+        let draw = |hover: Option<(u16, u16)>| {
+            let mut term = Terminal::new(TestBackend::new(20, 8)).unwrap();
+            let mut hits = HitMap::default();
+            term.draw(|f| {
+                paint_sidebar(
+                    &workspaces,
+                    0,
+                    "%0",
+                    &expanded,
+                    &[],
+                    f.area(),
+                    f.buffer_mut(),
+                    &theme,
+                    &mut hits,
+                    &DecorationSnapshot::default(),
+                    hover,
+                );
+            })
+            .unwrap();
+            let buf = term.backend().buffer().clone();
+            (buf, hits)
+        };
+
+        let (rest_buf, rest_hits) = draw(None);
+        let plus = (0..rest_buf.area.width)
+            .flat_map(|x| (0..rest_buf.area.height).map(move |y| (x, y)))
+            .find(|&(x, y)| matches!(rest_hits.hit(x, y), Some(HitTarget::NewWorkspaceButton)))
+            .expect("the sidebar paints a create button");
+
+        let (hot_buf, hot_hits) = draw(Some(plus));
+        assert_eq!(
+            hot_hits.hit(plus.0, plus.1).cloned(),
+            rest_hits.hit(plus.0, plus.1).cloned(),
+            "the button must not move out from under the mouse that found it"
+        );
+        assert_ne!(
+            hot_buf[plus].style(),
+            rest_buf[plus].style(),
+            "pointing at the create button must change how it paints"
+        );
+        assert!(
+            flatten(&hot_buf).contains(copy::NEW_WORKSPACE_HINT),
+            "hovering should name what the button makes: {}",
+            flatten(&hot_buf)
+        );
+        assert!(
+            !flatten(&rest_buf).contains(copy::NEW_WORKSPACE_HINT),
+            "the hint belongs to hover, not to the resting sidebar"
+        );
+    }
+
     #[test]
     fn sidebar_rows_render_and_hit_test_aligned() {
         let workspaces = vec![
@@ -1699,6 +1796,7 @@ mod tests {
                 &theme,
                 &mut hits,
                 &DecorationSnapshot::default(),
+                None,
             );
         })
         .unwrap();
@@ -1792,6 +1890,7 @@ mod tests {
                 &theme,
                 &mut hits,
                 &decoration,
+                None,
             );
         })
         .unwrap();

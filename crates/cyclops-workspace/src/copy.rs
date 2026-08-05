@@ -49,6 +49,11 @@ pub const EVENT_STREAM_EMPTY: &str = "No events yet.";
 
 pub const APP_MENU_BUTTON: &str = "☰ menu";
 
+/// Named beside the sidebar's create button while the mouse rests on it. A
+/// bare glyph does not say what it makes, and the sidebar is too narrow to
+/// carry the whole phrase at rest.
+pub const NEW_WORKSPACE_HINT: &str = "new";
+
 pub const MENU_SPLIT_RIGHT: &str = "Split right";
 
 pub const MENU_SPLIT_DOWN: &str = "Split down";
