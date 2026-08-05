@@ -16,6 +16,30 @@ pub enum Color {
     Rgb(u8, u8, u8),
 }
 
+/// Which underline a cell carries, if any.
+///
+/// The engine distinguishes five underline styles. A Ratatui cell can only
+/// say "underlined", so every non-`None` variant paints the same way today;
+/// the distinction is preserved here so a future renderer can use it and so
+/// the corpus can prove the bridge does not flatten it on the way in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Underline {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curl,
+    Dotted,
+    Dashed,
+}
+
+impl Underline {
+    /// Whether the cell should paint an underline at all.
+    pub fn is_underlined(self) -> bool {
+        !matches!(self, Underline::None)
+    }
+}
+
 /// Visual attributes on one terminal cell.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CellAttrs {
@@ -23,9 +47,11 @@ pub struct CellAttrs {
     pub bg: Color,
     pub bold: bool,
     pub italic: bool,
-    pub underline: bool,
+    pub underline: Underline,
     pub reverse: bool,
     pub dim: bool,
+    pub hidden: bool,
+    pub strikeout: bool,
 }
 
 /// One cell in the visible grid.

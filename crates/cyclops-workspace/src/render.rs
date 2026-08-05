@@ -1418,11 +1418,17 @@ fn cell_style(cell: &GridCell, base: Style) -> Style {
     if cell.attrs.italic {
         style = style.add_modifier(Modifier::ITALIC);
     }
-    if cell.attrs.underline {
+    if cell.attrs.underline.is_underlined() {
         style = style.add_modifier(Modifier::UNDERLINED);
     }
     if cell.attrs.reverse {
         style = style.add_modifier(Modifier::REVERSED);
+    }
+    if cell.attrs.strikeout {
+        style = style.add_modifier(Modifier::CROSSED_OUT);
+    }
+    if cell.attrs.hidden {
+        style = style.add_modifier(Modifier::HIDDEN);
     }
     style
 }

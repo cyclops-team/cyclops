@@ -633,3 +633,19 @@ client. The bundle reports `alternate_on`; the plain capture holds
 `ALT_TUI_SCREEN` and the `-a` capture holds `PRIMARY_SHELL`. Under the old
 replay order the test shows `PRIMARY_SHELL`; under the fixed order it shows
 the TUI.
+
+## F39. alacritty 0.26: VS16 does not widen a narrow glyph, and bare SGR 21 is bold-off (MEASURED)
+
+Two width/attribute behaviors pinned by the bridge-fidelity fixtures so an
+engine bump surfaces the change as a test failure rather than a silent
+one-column shift in every warning glyph:
+
+1. `⚠\u{fe0f}` (U+FE0F VS16, emoji presentation) still occupies one column —
+   the engine sizes by the character's own width class and ignores the
+   variation selector's widening request.
+2. Bare SGR 21 is treated as bold-off, not double underline. Double
+   underline is the colon subparameter form `4:2`.
+
+Probe: `crates/cyclops-workspace/tests/fidelity.rs`,
+`a_variation_selector_does_not_widen_a_narrow_glyph` and
+`every_underline_style_keeps_its_own_identity`.

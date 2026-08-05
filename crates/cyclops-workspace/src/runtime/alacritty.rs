@@ -10,7 +10,7 @@ use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 
 use super::grid::{
     CellAttrs, CellGrid, CellGridView, CellPos, Color, CursorShape, CursorState, GridCell,
-    HydrationSnapshot,
+    HydrationSnapshot, Underline,
 };
 
 struct Size {
@@ -44,7 +44,6 @@ pub struct AlacrittyVt {
     parser: Processor,
     cols: u16,
     rows: u16,
-    scroll_offset: usize,
     cached_grid: CellGrid,
     /// Parsing can arrive in many small control-mode chunks. Rebuilding the
     /// whole visible grid for each chunk wastes the frame debounce: defer it
@@ -69,7 +68,6 @@ impl AlacrittyVt {
             parser: Processor::new(),
             cols,
             rows,
-            scroll_offset: 0,
             cached_grid,
             grid_dirty: false,
         }
@@ -95,7 +93,6 @@ impl AlacrittyVt {
         self.parser = Processor::new();
         self.cols = cols;
         self.rows = rows;
-        self.scroll_offset = 0;
         self.cached_grid = CellGrid {
             cols,
             rows,
@@ -138,10 +135,30 @@ fn cell_from_alac(cell: &AlacCell) -> GridCell {
             bg: map_color(cell.bg),
             bold: flags.contains(Flags::BOLD),
             italic: flags.contains(Flags::ITALIC),
-            underline: flags.contains(Flags::UNDERLINE),
+            underline: map_underline(flags),
             reverse: flags.contains(Flags::INVERSE),
             dim: flags.contains(Flags::DIM),
+            hidden: flags.contains(Flags::HIDDEN),
+            strikeout: flags.contains(Flags::STRIKEOUT),
         },
+    }
+}
+
+/// The engine sets one flag per underline style; the widest wins when a
+/// stream sets more than one without resetting in between.
+fn map_underline(flags: Flags) -> Underline {
+    if flags.contains(Flags::DOUBLE_UNDERLINE) {
+        Underline::Double
+    } else if flags.contains(Flags::UNDERCURL) {
+        Underline::Curl
+    } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+        Underline::Dotted
+    } else if flags.contains(Flags::DASHED_UNDERLINE) {
+        Underline::Dashed
+    } else if flags.contains(Flags::UNDERLINE) {
+        Underline::Single
+    } else {
+        Underline::None
     }
 }
 
@@ -187,7 +204,6 @@ impl AlacrittyVt {
             rows: rows as usize,
         };
         self.term.resize(size);
-        self.scroll_offset = 0;
         self.grid_dirty = true;
     }
 
@@ -261,8 +277,12 @@ impl AlacrittyVt {
     }
 
     /// Whether the viewport is at the live tail (not scrolled into history).
+    ///
+    /// Derived from the engine's display offset rather than a second stored
+    /// copy: new output arriving while the user reads history moves that
+    /// offset to keep the view pinned, and a cached value would go stale.
     pub fn at_tail(&self) -> bool {
-        self.scroll_offset == 0
+        self.term.grid().display_offset() == 0
     }
 
     /// Cursor in visible coordinates.
@@ -290,7 +310,6 @@ impl AlacrittyVt {
     /// Scroll the viewport through history.
     pub fn scroll(&mut self, delta: i32) {
         self.term.scroll_display(Scroll::Delta(-delta));
-        self.scroll_offset = self.term.grid().display_offset();
         self.grid_dirty = true;
     }
 
