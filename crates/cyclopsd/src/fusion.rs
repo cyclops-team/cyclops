@@ -73,6 +73,11 @@ pub(crate) fn bind_manifest<'a>(
 /// never bind by comm; the invoked argv[0] basename still says "claude".
 /// The fallback resolves argv once per (pane, pid), cached, and matches it
 /// against process_names plus argv_basenames.
+///
+/// The pid it reads is the pane's FOREGROUND process, not `pane_pid`. See
+/// [`foreground_pid`]: an agent started by typing its name at a shell
+/// prompt is a child of the pane's first process, and reading `pane_pid`
+/// binds every such pane to the shell instead of the agent.
 pub(crate) fn bind_manifest_for<'a>(inner: &'a Inner, row: &PaneRow) -> Option<&'a Manifest> {
     if let Some(pinned) = inner
         .registry
@@ -90,31 +95,110 @@ pub(crate) fn bind_manifest_for<'a>(inner: &'a Inner, row: &PaneRow) -> Option<&
     if let Some(m) = bind_manifest(&inner.manifests, &row.current_command) {
         return Some(m);
     }
-    let base = argv_basename_cached(inner, &row.pane_id, row.pane_pid)?;
-    inner
-        .manifests
-        .values()
-        .find(|m| m.agent.argv_basenames.contains(&base) || m.agent.process_names.contains(&base))
+    if row.pane_pid <= 0 {
+        return None;
+    }
+    argv_bound_manifest(inner, &row.pane_id, foreground_pid(row.pane_pid))
 }
 
-/// Cached argv[0] basename for a pane's root process. The ps spawn runs at
-/// most once per (pane, pid) and only when comm binding already missed;
-/// never on a clock.
-fn argv_basename_cached(inner: &Inner, pane_id: &str, pid: i32) -> Option<String> {
+/// The manifest that claims this argv[0] basename, by either declared name.
+pub(crate) fn manifest_for_basename<'a>(
+    manifests: &'a BTreeMap<String, Manifest>,
+    base: &str,
+) -> Option<&'a Manifest> {
+    manifests.values().find(|m| {
+        m.agent.argv_basenames.iter().any(|name| name == base)
+            || m.agent.process_names.iter().any(|name| name == base)
+    })
+}
+
+/// The pid whose argv says what a pane is RUNNING.
+///
+/// tmux's `pane_pid` is the pane's FIRST process, which for an interactive
+/// pane is the shell and stays the shell for the pane's whole life. An
+/// agent the user starts by typing its name at that prompt is a child of
+/// it, so `pane_pid` names the shell no matter what is on screen.
+/// MEASURED (tmux 3.7b, Claude Code 2.1.222): a pane running Claude Code
+/// reports `pane_current_command` "2.1.222", `pane_pid` the zsh, and
+/// `ps -o args=` on that pid "-zsh" — nothing in either sensor says
+/// "claude", so the pane bound no manifest and carried no state at all.
+///
+/// The tty's foreground process group is the job the terminal is actually
+/// talking to, and a process group's id is its leader's pid, so `tpgid`
+/// resolves straight to the running agent. A shell idle at its prompt is
+/// its own foreground group and resolves back to `pane_pid` unchanged,
+/// which is what makes the agent's exit unbind the manifest again.
+fn foreground_pid(pane_pid: i32) -> i32 {
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-o", "tpgid=", "-p", &pane_pid.to_string()])
+        .output()
+    else {
+        return pane_pid;
+    };
+    if !out.status.success() {
+        return pane_pid;
+    }
+    parse_tpgid(&String::from_utf8_lossy(&out.stdout)).unwrap_or(pane_pid)
+}
+
+/// A `ps -o tpgid=` line as a pid. A pane with no controlling terminal
+/// reports -1, which names no process and must not be looked up.
+pub(crate) fn parse_tpgid(line: &str) -> Option<i32> {
+    let value: i32 = line.trim().parse().ok()?;
+    (value > 0).then_some(value)
+}
+
+/// Bind a manifest by the argv[0] basename of a pane's foreground process,
+/// memoising the reading only once it has actually bound something. The ps
+/// spawn runs when comm binding already missed; never on a clock.
+///
+/// The asymmetry — remember a hit, re-probe a miss — is load-bearing, not
+/// an optimisation. Vendor CLIs ship a shell wrapper that re-execs itself
+/// in place, so the pid is stable across the exec while argv[0] flips from
+/// the wrapper's interpreter to the agent's own name. cursor-agent's
+/// wrapper ends in `exec -a "$0" "$NODE_BIN" ... index.js "$@"`, and
+/// MEASURED (cursor-agent 2026.07.23-e383d2b) pid 37750 read:
+///
+/// ```text
+/// t+0.00s  ps args = bash /Users/x/.local/bin/agent    -> "bash",  binds nothing
+/// t+0.25s  ps args = /Users/x/.local/bin/agent ...     -> "agent", binds cursor
+/// ```
+///
+/// Recomputes are output-driven and typing `agent` at a prompt echoes that
+/// line immediately, so the probe lands in the first window often. Keyed on
+/// (pane, pid), a cache that remembered "bash" could never correct itself —
+/// the pid never changes — and the pane would read unknown, carry no state
+/// and refuse delivery for the rest of that process's life. So a basename
+/// that binds nothing means "not settled yet", never "no agent here".
+///
+/// One entry per pane: the foreground pid changes with every job the shell
+/// runs, and keeping the losers would grow the map for the pane's whole
+/// life without any of them ever being read again.
+pub(crate) fn argv_bound_manifest<'a>(
+    inner: &'a Inner,
+    pane_id: &str,
+    pid: i32,
+) -> Option<&'a Manifest> {
     if pid <= 0 {
         return None;
     }
     let key = (pane_id.to_string(), pid);
-    if let Some(cached) = inner.argv_cache.lock().expect("argv cache lock").get(&key) {
-        return cached.clone();
-    }
-    let base = argv_basename(pid);
-    inner
+    let cached = inner
         .argv_cache
         .lock()
         .expect("argv cache lock")
-        .insert(key, base.clone());
-    base
+        .get(&key)
+        .cloned();
+    if let Some(base) = cached {
+        return manifest_for_basename(&inner.manifests, &base);
+    }
+    // Spawn outside the lock: ps is slower than every other holder of it.
+    let base = argv_basename(pid)?;
+    let bound = manifest_for_basename(&inner.manifests, &base)?;
+    let mut cache = inner.argv_cache.lock().expect("argv cache lock");
+    cache.retain(|(cached_pane, _), _| cached_pane != pane_id);
+    cache.insert(key, base);
+    Some(bound)
 }
 
 /// argv[0] basename of a live pid via `ps -o args=`.
@@ -474,6 +558,8 @@ pub(crate) async fn recompute_pane(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::StdMutex;
+    use std::collections::HashMap;
     use std::path::Path;
 
     const FIXTURE: &str = r#"
@@ -698,5 +784,119 @@ line_regex = ['^\s*›']
         assert_eq!(parse_argv_basename("  cat  \n"), Some("cat".into()));
         assert_eq!(parse_argv_basename("\n"), None);
         assert_eq!(parse_argv_basename(""), None);
+    }
+
+    const SLEEP_FIXTURE: &str = r#"
+[agent]
+id = "sleeper"
+display_name = "Sleep fixture"
+process_names = []
+argv_basenames = ["sleep"]
+
+[[rule]]
+id = "title_idle"
+state = "idle"
+priority = 1000
+region = "pane_title"
+regex = ['^IDLE']
+"#;
+
+    fn inner_with(manifests: BTreeMap<String, Manifest>) -> Arc<Inner> {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-argv-cache");
+        let (registry, _) = crate::registry::Registry::load(&home);
+        Arc::new(Inner {
+            cfg: crate::Config::defaults(&home),
+            boot_id: "b-test".into(),
+            started: std::time::Instant::now(),
+            tmux_version: "3.6a".into(),
+            manifests,
+            manifest_dir: None,
+            sessions: StdMutex::new(Vec::new()),
+            events: tokio::sync::broadcast::channel(16).0,
+            detections: StdMutex::new(HashMap::new()),
+            registry: StdMutex::new(registry),
+            theme: StdMutex::new(cyclops_theme::ThemeWatch::new(&home)),
+            hook_readings: StdMutex::new(HashMap::new()),
+            argv_cache: StdMutex::new(HashMap::new()),
+            engine: crate::delivery::Engine::new(),
+            ack_state: crate::ack::AckState::new(),
+            hook_liveness: crate::selftest::HookLiveness::new(),
+            inject_pause: StdMutex::new(None),
+            fail_chrome_restore: std::sync::atomic::AtomicBool::new(false),
+            workspace_ui: StdMutex::new(crate::workspace_ui::WorkspaceUiState::default()),
+            stop: tokio::sync::watch::channel(false).1,
+            extra_tasks: StdMutex::new(Vec::new()),
+        })
+    }
+
+    /// A wrapper caught before its `exec` reads as the interpreter and binds
+    /// nothing. Remembering that would pin the pane unknown for the life of
+    /// the process, because the exec keeps the pid the cache is keyed on.
+    #[test]
+    fn a_basename_that_binds_nothing_is_re_probed_not_memoised() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id() as i32;
+
+        // No manifest claims "sleep": the reading is a miss, and a miss must
+        // leave the cache empty so the next recompute probes again.
+        let blind = inner_with(BTreeMap::new());
+        assert!(argv_bound_manifest(&blind, "%0", pid).is_none());
+        assert!(
+            blind.argv_cache.lock().unwrap().is_empty(),
+            "a non-binding basename must not be memoised"
+        );
+
+        // The same pid, once a manifest claims it, binds and is remembered.
+        let mut map = BTreeMap::new();
+        map.insert(
+            "sleeper".to_string(),
+            Manifest::parse(SLEEP_FIXTURE, Path::new("sleeper.toml")).unwrap(),
+        );
+        let bound = inner_with(map);
+        assert_eq!(
+            argv_bound_manifest(&bound, "%0", pid).map(|m| m.agent.id.as_str()),
+            Some("sleeper")
+        );
+        assert_eq!(
+            bound
+                .argv_cache
+                .lock()
+                .unwrap()
+                .get(&("%0".to_string(), pid)),
+            Some(&"sleep".to_string()),
+            "a binding basename is memoised for the pane"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn basename_binding_matches_either_declared_name() {
+        let mut map = BTreeMap::new();
+        map.insert("bash".to_string(), manifest());
+        // process_names
+        assert_eq!(
+            manifest_for_basename(&map, "bash").map(|m| m.agent.id.as_str()),
+            Some("bash")
+        );
+        // the wrapper's pre-exec interpreter is not a claim on the pane
+        assert!(manifest_for_basename(&map, "node").is_none());
+        assert!(manifest_for_basename(&BTreeMap::new(), "bash").is_none());
+    }
+
+    #[test]
+    fn tpgid_parses_ps_output_and_rejects_no_terminal() {
+        assert_eq!(parse_tpgid("  6254\n"), Some(6254));
+        // A pane with no controlling terminal: -1 names no process, and 0
+        // is not a pid either. Both must fall back to pane_pid rather than
+        // send `ps -p` after something that cannot exist.
+        assert_eq!(parse_tpgid("   -1\n"), None);
+        assert_eq!(parse_tpgid("0\n"), None);
+        assert_eq!(parse_tpgid("\n"), None);
+        assert_eq!(parse_tpgid("not a pid\n"), None);
     }
 }

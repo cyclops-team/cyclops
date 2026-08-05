@@ -148,8 +148,11 @@ pub(crate) struct Inner {
     pub(crate) hook_readings: StdMutex<HashMap<String, fusion::HookEntry>>,
     /// argv-basename cache for manifest binding, per (pane id, pane pid).
     /// Filled lazily when comm-name binding misses (F21); entries die with
-    /// the pane.
-    pub(crate) argv_cache: StdMutex<HashMap<(String, i32), Option<String>>>,
+    /// the pane. Only a basename that actually bound a manifest is ever
+    /// stored, so a miss means "not settled yet" rather than "no agent" —
+    /// see [`fusion::argv_bound_manifest`] for the exec race that rule
+    /// exists to survive.
+    pub(crate) argv_cache: StdMutex<HashMap<(String, i32), String>>,
     /// Delivery pipeline state.
     pub(crate) engine: delivery::Engine,
     /// Hook report dedupe state.
