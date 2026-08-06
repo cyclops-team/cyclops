@@ -3,11 +3,14 @@
 //! The loop is event-armed: every visible change arms one render debounce
 //! (`RENDER_DEBOUNCE`) if none is pending — arming never pushes an
 //! already-armed deadline back, so a stream of events cannot starve
-//! rendering. Full model reconciliation (subprocess tmux listing) is
-//! deferred onto that same deadline and coalesced through
-//! `needs_reconcile`; cheap structural notifications (`%layout-change`,
-//! `%window-pane-changed`, `%session-changed`) apply to the model directly
-//! without a full fetch.
+//! rendering. Full model reconciliation (one control-mode workspace
+//! snapshot; see `crate::sync::fetch_workspace_model`) is deferred onto that
+//! same deadline and coalesced through `needs_reconcile`; cheap structural
+//! notifications (`%layout-change`, `%window-pane-changed`,
+//! `%session-changed`) apply to the model directly without a full fetch.
+//! Daemon decoration events get the identical treatment on their own
+//! dedicated thread: `spawn_decoration_forwarder` arms one debounce per
+//! burst instead of fetching status once per pushed event.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -65,6 +68,15 @@ const RENDER_DEBOUNCE: Duration = Duration::from_millis(8);
 /// pushed back, so a noisy pane costs one tmux round trip per interval and
 /// an idle workspace costs no wakeups at all.
 const FOLDER_PROBE_DELAY: Duration = Duration::from_millis(600);
+/// How long a burst of daemon decoration events (state, label, delivery
+/// changes) is allowed to coalesce before `spawn_decoration_forwarder`
+/// issues one status fetch. Same rule as `RENDER_DEBOUNCE`/`arm()`: armed
+/// once by the first event in a burst, fired once, never pushed back by a
+/// later event in the same burst. A split or a border drag can push several
+/// events through cyclopsd at once; without this, each one used to cost its
+/// own blocking status round trip even though only the last result before
+/// the next paint was ever shown.
+const DECORATION_DEBOUNCE: Duration = Duration::from_millis(30);
 const TAB_BAR_HEIGHT: u16 = 1;
 const EVENT_STREAM_WIDTH: u16 = 40;
 const SIDEBAR_MIN_WIDTH: u16 = 22;
@@ -110,7 +122,6 @@ struct App {
     runtimes: RuntimeRegistry,
     router: Router,
     paint: Paint,
-    socket: Option<String>,
     dialog: Option<Dialog>,
     link_state: LinkState,
     paused_panes: HashSet<String>,
@@ -372,7 +383,7 @@ pub async fn run_async() -> i32 {
     };
 
     let term_size = crossterm::terminal::size().unwrap_or((80, 24));
-    let mut model = match fetch_workspace_model(&session, socket) {
+    let mut model = match fetch_workspace_model(&client, &session).await {
         Ok(m) => m,
         Err(e) => {
             drop(guard);
@@ -419,7 +430,7 @@ pub async fn run_async() -> i32 {
                 declared_client_size = Some(boot_size);
                 // The resize can rebalance leaf dimensions. Re-list before
                 // hydration rather than replaying captures into stale slots.
-                if let Ok(resized) = fetch_workspace_model(&session, socket) {
+                if let Ok(resized) = fetch_workspace_model(&client, &session).await {
                     model = resized;
                     apply_workspace_order(&mut model, &prefs.workspace_order);
                 }
@@ -428,12 +439,7 @@ pub async fn run_async() -> i32 {
         }
     }
     let mut runtimes = RuntimeRegistry::default();
-    if let Err(e) = hydrate_visible_tab(&client, model.active_tab(), &mut runtimes).await {
-        drop(guard);
-        eprintln!("{e}");
-        client.shutdown().await;
-        return 1;
-    }
+    hydrate_visible_tab(&client, model.active_tab(), &mut runtimes).await;
 
     let mut terminal = match Terminal::new(CrosstermBackend::new(io::stdout())) {
         Ok(t) => t,
@@ -455,7 +461,6 @@ pub async fn run_async() -> i32 {
         runtimes,
         router: Router::new(bindings),
         paint,
-        socket: socket_name,
         dialog: None,
         link_state: LinkState::Live,
         paused_panes: HashSet::new(),
@@ -533,12 +538,8 @@ pub async fn run_async() -> i32 {
                         }
                     } else if app.needs_hydrate && !resize_applied {
                         app.needs_hydrate = false;
-                        if let Err(e) =
-                            hydrate_visible_tab(&client, app.model.active_tab(), &mut app.runtimes)
-                                .await
-                        {
-                            log_err(&app.home, &e);
-                        }
+                        hydrate_visible_tab(&client, app.model.active_tab(), &mut app.runtimes)
+                            .await;
                     }
                     let _ = draw(&mut terminal, &mut app);
                 }
@@ -655,9 +656,24 @@ fn spawn_notif_forwarder(
     });
 }
 
+/// What the blocking reader thread below hands to the coalescing loop: one
+/// signal per subscription line that carried an `"event"` field, or one
+/// signal when the connection ends.
+enum DecorationSignal {
+    Event,
+    Closed,
+}
+
 /// Event-driven daemon decoration updates. The subscription itself never
-/// polls; each pushed state/label/delivery event triggers one bounded status
-/// snapshot on this dedicated thread, away from the input loop.
+/// polls. A split or a border drag pushes several state/label/delivery
+/// events through cyclopsd at once; a dedicated reader thread turns each
+/// subscription line into one [`DecorationSignal`] on a plain channel, and
+/// the loop below coalesces a burst of them into ONE status fetch instead of
+/// one per event — the same arm-once, never-push-back rule `arm()` and
+/// `RENDER_DEBOUNCE` use for rendering (`DECORATION_DEBOUNCE`), just built on
+/// `std::sync::mpsc::Receiver::recv_timeout` instead of `tokio::select!`
+/// because this connection is deliberately blocking IO on its own thread,
+/// away from the input loop.
 fn spawn_decoration_forwarder(home: std::path::PathBuf, tx: mpsc::UnboundedSender<AppMsg>) {
     std::thread::spawn(move || {
         use std::io::{BufRead, Write};
@@ -682,10 +698,15 @@ fn spawn_decoration_forwarder(home: std::path::PathBuf, tx: mpsc::UnboundedSende
         {
             return;
         }
-        loop {
+
+        let (sig_tx, sig_rx) = std::sync::mpsc::channel::<DecorationSignal>();
+        std::thread::spawn(move || loop {
             let mut line = String::new();
             match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
+                Ok(0) | Err(_) => {
+                    let _ = sig_tx.send(DecorationSignal::Closed);
+                    return;
+                }
                 Ok(_) => {}
             }
             let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
@@ -694,17 +715,51 @@ fn spawn_decoration_forwarder(home: std::path::PathBuf, tx: mpsc::UnboundedSende
             if value.get("event").is_none() {
                 continue;
             }
-            // A refused or timed-out status call is doubt about this
-            // instant, not news about the roster; the subscription is still
-            // up, so the next event asks again. Dropping it keeps the last
-            // known decoration on screen instead of un-naming every agent
-            // for a frame. A daemon that is really gone ends the read loop
-            // below, which is the one place "offline" is reported.
-            let Some(snapshot) = decoration::fetch_decoration(&home) else {
-                continue;
-            };
-            if tx.send(AppMsg::DecorationChanged(snapshot)).is_err() {
+            if sig_tx.send(DecorationSignal::Event).is_err() {
                 return;
+            }
+        });
+
+        // One-shot deadline armed by the first signal in a burst; `None`
+        // means idle, exactly like `debounce` in the main loop.
+        let mut deadline: Option<std::time::Instant> = None;
+        loop {
+            let signal = match deadline {
+                None => sig_rx.recv().ok(),
+                Some(at) => {
+                    let wait = at.saturating_duration_since(std::time::Instant::now());
+                    match sig_rx.recv_timeout(wait) {
+                        Ok(signal) => Some(signal),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            deadline = None;
+                            // A refused or timed-out status call is doubt
+                            // about this instant, not news about the
+                            // roster: the subscription is still up, so the
+                            // next burst asks again. Dropping it keeps the
+                            // last known decoration on screen instead of
+                            // un-naming every agent for a frame. A daemon
+                            // that is really gone ends the read loop below,
+                            // which is the one place "offline" is reported.
+                            if let Some(snapshot) = decoration::fetch_decoration(&home) {
+                                if tx.send(AppMsg::DecorationChanged(snapshot)).is_err() {
+                                    return;
+                                }
+                            }
+                            continue;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+                    }
+                }
+            };
+            match signal {
+                Some(DecorationSignal::Event) => {
+                    // Arm once per burst; a signal that arrives while
+                    // already armed must never push the deadline back.
+                    if deadline.is_none() {
+                        deadline = Some(std::time::Instant::now() + DECORATION_DEBOUNCE);
+                    }
+                }
+                Some(DecorationSignal::Closed) | None => break,
             }
         }
         let _ = tx.send(AppMsg::DecorationChanged(DecorationSnapshot::default()));
@@ -1915,7 +1970,7 @@ fn move_keybind_scroll(current: u16, delta: i16, max: u16) -> u16 {
 
 async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_tmux::TmuxError> {
     let session = app.model.session.session.clone();
-    let mut model = fetch_workspace_model(&session, app.socket.as_deref())?;
+    let mut model = fetch_workspace_model(client, &session).await?;
     apply_workspace_order(&mut model, &app.prefs.workspace_order);
     install_reconciled_model(&mut app.model, model, app.prefs.sidebar_visible);
     expand_active_workspace(
@@ -1936,7 +1991,7 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
     app.refresh_event_lines();
     app.persist_active();
     resize_client(app, client).await;
-    hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await?;
+    hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await;
     app.needs_hydrate = false;
     Ok(())
 }
@@ -2247,7 +2302,6 @@ mod tests {
             runtimes: RuntimeRegistry::default(),
             router: Router::new(crate::bindings::default_bindings()),
             paint: Paint::for_test(),
-            socket: None,
             dialog: None,
             link_state: LinkState::Live,
             paused_panes: HashSet::new(),
@@ -2313,6 +2367,103 @@ mod tests {
             next_wake(&mut rx, Some(due)).await,
             Wake::Deadline
         ));
+    }
+
+    /// L1: a burst of daemon events must collapse to exactly one status
+    /// fetch, the same coalescing guarantee `arm()`/`RENDER_DEBOUNCE` give
+    /// rendering. A fake cyclopsd accepts the forwarder's persistent
+    /// `events.subscribe` connection, pushes five event lines back to back
+    /// with no delay (a split or a border drag's burst), then counts every
+    /// LATER connection — each one is exactly one coalesced status fetch.
+    #[test]
+    fn a_burst_of_decoration_events_produces_one_refresh() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let home = cyclops_proto::scratch::scratch_dir("workspace-decoration-burst");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("scratch home");
+        let listener =
+            UnixListener::bind(home.join(cyclops_proto::SOCK_NAME)).expect("bind fake daemon");
+
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let fetches_for_server = fetches.clone();
+        std::thread::spawn(move || {
+            // 1. The persistent subscribe connection: hello, read the
+            //    subscribe request, then a burst of five event lines with
+            //    no delay between them.
+            let (stream, _) = listener.accept().expect("subscribe connection");
+            let mut reader = std::io::BufReader::new(stream);
+            reader
+                .get_mut()
+                .write_all(b"{\"cyclops\":\"0.1.0\",\"proto\":1,\"boot_id\":\"b\"}\n")
+                .expect("hello");
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("subscribe request");
+            for _ in 0..5 {
+                let _ = reader
+                    .get_mut()
+                    .write_all(b"{\"event\":{\"kind\":\"state\"}}\n");
+            }
+
+            // 2. Every later connection is one coalesced status fetch:
+            //    answer it and count it.
+            for stream in listener.incoming().flatten() {
+                fetches_for_server.fetch_add(1, Ordering::SeqCst);
+                let mut reader = std::io::BufReader::new(stream);
+                let _ = reader
+                    .get_mut()
+                    .write_all(b"{\"cyclops\":\"0.1.0\",\"proto\":1,\"boot_id\":\"b\"}\n");
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                let body = serde_json::json!({
+                    "id": 1,
+                    "result": {
+                        "daemon_version": "0.1.0",
+                        "proto": 1,
+                        "boot_id": "b",
+                        "uptime_ms": 0,
+                        "tmux_version": "3.4",
+                        "sessions": [],
+                    },
+                });
+                let mut out = serde_json::to_vec(&body).expect("encode status");
+                out.push(b'\n');
+                let _ = reader.get_mut().write_all(&out);
+            }
+        });
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        spawn_decoration_forwarder(home.clone(), tx);
+
+        // 3. Wait for the coalesced refresh to land, then confirm it stays
+        //    at exactly one — bounded polling in test code only (rule 9's
+        //    documented exception), never in the forwarder itself.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while fetches.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(DECORATION_DEBOUNCE * 5);
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            1,
+            "a burst of five daemon events must collapse to exactly one status fetch"
+        );
+
+        let mut changed = 0;
+        while let Ok(msg) = rx.try_recv() {
+            if matches!(msg, AppMsg::DecorationChanged(_)) {
+                changed += 1;
+            }
+        }
+        assert_eq!(
+            changed, 1,
+            "exactly one DecorationChanged should reach the app per coalesced burst"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

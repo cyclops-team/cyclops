@@ -176,14 +176,120 @@ walk over the mirrored grid to paint (plus a third partial walk when a
 selection was active). Post-R1 there is one walk, cheaper than the old
 build alone, with the selection decision folded into the same visit.
 
+## Post-L1 measurements (2026-08-05, same machine)
+
+L1 replaced `crates/cyclops-workspace/src/sync.rs`'s `fetch_workspace_model`
+fan-out with one `ControlClient::workspace_snapshot` call, made
+`hydrate_visible_tab` hydrate every stale pane concurrently through
+`ControlClient::hydrate_panes`, and coalesced the daemon decoration
+subscription's per-event status fetch into one event-armed refresh per
+burst (`app::spawn_decoration_forwarder`, `DECORATION_DEBOUNCE`). The harness
+(`crates/cyclops-workspace/tests/baseline.rs`) gained two NEW tests that
+measure the actual production path through the same fixtures the OLD-shape
+tests already used, so both are recorded side by side rather than replacing
+the before number:
+
+```
+$ CARGO_INCREMENTAL=0 cargo test -p cyclops-workspace --test baseline -- --nocapture --test-threads=1
+test baseline_hydration_latency_concurrent ... === baseline: concurrent hydrate_panes latency (L1's hydrate_visible_tab shape) ===
+1 panes: total=0.38ms (concurrent; tracks the slowest pane, not the sum)
+4 panes: total=0.48ms (concurrent; tracks the slowest pane, not the sum)
+8 panes: total=0.76ms (concurrent; tracks the slowest pane, not the sum)
+ok
+test baseline_hydration_latency_serial ... === baseline: serial hydrate_pane latency (today's hydrate_visible_tab shape) ===
+1 panes: total=0.35ms avg_per_pane=0.349ms per_pane=["0.35ms"]
+4 panes: total=1.24ms avg_per_pane=0.309ms per_pane=["0.36ms", "0.31ms", "0.29ms", "0.28ms"]
+8 panes: total=2.44ms avg_per_pane=0.304ms per_pane=["0.38ms", "0.33ms", "0.31ms", "0.29ms", "0.29ms", "0.28ms", "0.28ms", "0.28ms"]
+ok
+test baseline_reconciliation_fan_out ... === baseline: reconciliation fan-out (list-sessions + membership + list-windows + list-panes/window) ===
+1 windows: total=22.03ms commands_issued=4 (W+3 formula)
+4 windows: total=38.23ms commands_issued=7 (W+3 formula)
+8 windows: total=60.35ms commands_issued=11 (W+3 formula)
+ok
+test baseline_reconciliation_workspace_snapshot ... === baseline: workspace_snapshot (L1's fetch_workspace_model shape) ===
+1 windows: total=0.32ms commands_issued=2 (fixed, not W+3)
+4 windows: total=0.55ms commands_issued=2 (fixed, not W+3)
+8 windows: total=0.87ms commands_issued=2 (fixed, not W+3)
+ok
+```
+
+### Reconciliation: OLD fan-out vs. NEW workspace_snapshot
+
+| Windows (W) | OLD (list-sessions + membership + list-windows + list-panes x W) | NEW (`workspace_snapshot`) | Commands: OLD | Commands: NEW |
+|---|---|---|---|---|
+| 1 | 22.03ms | 0.32ms | 4 (W+3) | 2 (fixed) |
+| 4 | 38.23ms | 0.55ms | 7 (W+3) | 2 (fixed) |
+| 8 | 60.35ms | 0.87ms | 11 (W+3) | 2 (fixed) |
+
+At 8 windows this is a ~69x wall-clock improvement (60.35ms -> 0.87ms) and
+the command count stops scaling with window count entirely — flat at 2
+regardless of W, versus the old formula's `W + 3`. This is the same shape
+D2 already proved at the adapter layer
+(`crates/cyclops-tmux/tests/workspace_snapshot.rs`); the numbers above prove
+the workspace crate's `fetch_workspace_model` is actually wired to it end to
+end (see also the new rig test
+`sync::tests::fetch_workspace_model_issues_a_bounded_command_count`, which
+asserts the `commands_issued` delta by structure, not just prints it).
+
+### Hydration: OLD serial vs. NEW concurrent
+
+| Panes | OLD (serial `hydrate_pane` loop) | NEW (`hydrate_panes`, concurrent) |
+|---|---|---|
+| 1 | 0.35ms | 0.38ms |
+| 4 | 1.24ms | 0.48ms |
+| 8 | 2.44ms | 0.76ms |
+
+At 8 panes the old serial loop (2.44ms) is roughly the sum of eight
+~0.3ms round trips; the new concurrent path (0.76ms) tracks much closer to
+one pane's round trip than to the sum of eight, exactly the shape the
+recommendation asks for ("total time should track the slowest pane"). At 1
+pane the two are within noise of each other (0.35ms vs. 0.38ms) — there is
+nothing to overlap with a single pane, so this is the expected floor, not a
+regression. On this idle isolated rig the absolute gap is small in wall
+time; a real session hydrating panes that hold agent TUIs (bigger captures,
+more scrollback) should widen the gap, the same caveat A1a's baseline
+recorded for D2/L1's hydration numbers before any code changed.
+
+### Decoration refresh coalescing
+
+Not wall-clock-comparable to a "before" number the way the two tables above
+are, because the old per-event-fetch code had no equivalent
+"coalesce a burst" behavior to measure — every event cost its own fetch, so
+there was no batching shape to time against. Proven instead by a new
+deterministic rig test,
+`app::tests::a_burst_of_decoration_events_produces_one_refresh`: a fake
+daemon pushes five `events.subscribe` lines back to back with no delay
+(the shape a split or a border drag produces), and the test asserts the
+forwarder issued exactly one status fetch and delivered exactly one
+`AppMsg::DecorationChanged` — not five. Passed in 5/5 repeated runs.
+
+### Contention caveat
+
+This machine was doing background work during every run above (Time
+Machine's `backupd-helper` and Spotlight's `mds_stores`/`mdworker` were both
+active per `ps aux`, matching the exact contention this file's "Variance
+under load" section already documented for a different metric). Three
+back-to-back runs of the full harness produced near-identical numbers for
+every test above (hydration and reconciliation figures varied by <15%
+across runs), but `baseline_pane_runtime_feed_and_grid_throughput` and
+`baseline_resize_cost_with_scrollback` — unrelated to L1, unchanged since
+the Post-R1 measurements above — read ~1.6-1.8x worse here (e.g. 80x24 grid
+build 276.72us vs. the Post-R1 165.79-173.04us) than they did on this same
+machine for A1a/R1. That gap is consistent with this file's existing
+"macOS storage-daemon churn" note, not a regression from any L1 change:
+L1 touched no code either of those two tests exercises. Trust the
+before/after *shapes* (flat vs. growing command count; slowest-pane vs.
+summed latency) over the absolute millisecond values, exactly as this
+file's introduction already asks.
+
 ## Which task each baseline exists to check
 
 | Baseline | Checked by | What "improved" means |
 |---|---|---|
 | Serial hydration latency (1/4/8 panes) | D2, L1 | Total hydration time for N visible panes tracks the slowest pane, not the sum of N serial round trips. |
-| Reconciliation fan-out (list-sessions + membership + list-windows + list-panes x W) | D2 | A full reconcile issues a small, bounded number of commands instead of W+3. |
+| Reconciliation fan-out (list-sessions + membership + list-windows + list-panes x W) | D2, L1 | A full reconcile issues a small, bounded number of commands instead of W+3. |
 | `PaneRuntime` feed/grid-build throughput | R1 | Deleting the full-grid `CellGrid` mirror does not reduce feed throughput or increase per-frame grid-build cost. |
-| Resize cost with scrollback | L1 | Resize coalescing means a drag pays this cost once per render deadline, not once per intermediate mouse-move geometry. |
+| Resize cost with scrollback | C2 | Resize coalescing means a drag pays this cost once per render deadline, not once per intermediate mouse-move geometry. Corrected attribution: `app::apply_live_divider` (gated on the render debounce, one coalesced resize per deadline) landed in C2's executor-integration commit, before L1 started — L1's three integrations (batched reconciliation, concurrent hydration, decoration coalescing) did not touch resize handling. |
 
 ## Probe commands used
 

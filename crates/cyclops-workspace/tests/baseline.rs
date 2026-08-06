@@ -24,8 +24,18 @@
 //! - Resize cost on a runtime holding scrollback is the cost L1's resize
 //!   coalescing is meant to stop paying repeatedly.
 //!
-//! The two tmux-backed tests use `cyclops_testrig::TmuxServer` and skip
-//! cleanly when no tmux binary is on PATH, the same shape as
+//! L1 wired `cyclops-workspace/src/sync.rs` to the new adapter primitives, so
+//! two more tests measure the NEW shape on the identical fixtures used
+//! above, clearly labeled as such: `baseline_hydration_latency_concurrent`
+//! (through `ControlClient::hydrate_panes`, what `hydrate_visible_tab` calls
+//! today) and `baseline_reconciliation_workspace_snapshot` (through
+//! `ControlClient::workspace_snapshot`, what `fetch_workspace_model` calls
+//! today). The OLD-shape tests stay exactly as they were — they no longer
+//! describe production code, but they are the only before/after comparison
+//! point, so they are kept and relabeled rather than deleted.
+//!
+//! The tmux-backed tests use `cyclops_testrig::TmuxServer` and skip cleanly
+//! when no tmux binary is on PATH, the same shape as
 //! `crates/cyclops-workspace/tests/hydration.rs`. The two pure tests touch
 //! no tmux at all.
 
@@ -112,11 +122,13 @@ impl Rig {
     }
 }
 
-/// Baseline: `ControlClient::hydrate_pane` called serially for every visible
-/// pane, the shape `hydrate_visible_tab` loops through today
-/// (`crates/cyclops-workspace/src/sync.rs`). D2/L1's concurrent hydration is
-/// meant to make total latency track the slowest pane, not the sum of all
-/// of them.
+/// OLD shape, kept for comparison: `ControlClient::hydrate_pane` called
+/// serially for every visible pane, the shape `hydrate_visible_tab` looped
+/// through before L1
+/// (`crates/cyclops-workspace/src/sync.rs`). L1 replaced this with
+/// `baseline_hydration_latency_concurrent` below, through
+/// `ControlClient::hydrate_panes`; total latency should now track the
+/// slowest pane instead of the sum of all of them.
 #[tokio::test]
 async fn baseline_hydration_latency_serial() {
     let Some(rig) = Rig::new("base-hyd") else {
@@ -181,14 +193,78 @@ async fn baseline_hydration_latency_serial() {
     }
 }
 
-/// Baseline: the exact multi-process snapshot shape `fetch_workspace_model`
-/// and `fetch_session_model` perform today (`crates/cyclops-workspace/src/
-/// sync.rs`): one `list-sessions`, one all-window membership query, one
-/// `list-windows`, plus one `list-panes` per window. `sync` is a private
-/// module, so this calls the same public `cyclops-tmux` functions sync.rs
-/// calls, in the same order, to measure the identical fan-out. D2's
-/// adapter-owned snapshot is meant to replace the per-window loop with a
-/// small bounded number of commands.
+/// NEW shape (L1): every stale pane's hydrate runs concurrently through one
+/// `ControlClient::hydrate_panes` call instead of the serial loop above —
+/// exactly what `crates/cyclops-workspace/src/sync.rs`'s
+/// `hydrate_visible_tab` calls today. Same fixtures and settle step as
+/// `baseline_hydration_latency_serial`, so the two totals are directly
+/// comparable.
+#[tokio::test]
+async fn baseline_hydration_latency_concurrent() {
+    let Some(rig) = Rig::new("base-hyd-conc") else {
+        return;
+    };
+    println!("=== baseline: concurrent hydrate_panes latency (L1's hydrate_visible_tab shape) ===");
+    for &n in &[1usize, 4, 8] {
+        let session = format!("hydc{n}");
+        rig.session_with_panes(&session, n);
+        let pane_ids = rig.pane_ids(&session);
+        assert_eq!(
+            pane_ids.len(),
+            n,
+            "expected {n} panes, tmux made {}",
+            pane_ids.len()
+        );
+
+        // 1. Settle every pane's shell before the timed section starts, so
+        //    shell-startup jitter never lands inside a measured hydrate.
+        for (i, pane_id) in pane_ids.iter().enumerate() {
+            rig.server.run_ok(&[
+                "send-keys",
+                "-t",
+                pane_id,
+                &format!("printf 'PANE_{i}_READY\\n'"),
+                "Enter",
+            ]);
+        }
+        rig.server.wait_screen(
+            pane_ids.last().expect("at least one pane"),
+            &format!("PANE_{}_READY", n - 1),
+        );
+
+        let (client, _notif) = ControlClient::spawn(rig.config(&session))
+            .await
+            .expect("attach");
+
+        // 2. Hydrate every pane concurrently through one call — exactly
+        //    what hydrate_visible_tab does today.
+        let refs: Vec<&str> = pane_ids.iter().map(String::as_str).collect();
+        let total_start = Instant::now();
+        let results = client.hydrate_panes(&refs).await;
+        let total = total_start.elapsed();
+        for (i, r) in results.iter().enumerate() {
+            r.as_ref()
+                .unwrap_or_else(|e| panic!("pane {i} failed to hydrate: {e}"));
+        }
+
+        println!(
+            "{n} panes: total={:.2}ms (concurrent; tracks the slowest pane, not the sum)",
+            total.as_secs_f64() * 1000.0
+        );
+
+        client.shutdown().await;
+    }
+}
+
+/// OLD shape, kept for comparison: the exact multi-process fan-out
+/// `fetch_workspace_model` and `fetch_session_model` performed before L1
+/// (`crates/cyclops-workspace/src/sync.rs`): one `list-sessions`, one
+/// all-window membership query, one `list-windows`, plus one `list-panes`
+/// per window. `sync` is a private module, so this calls the same public
+/// `cyclops-tmux` functions sync.rs used to call, in the same order, to
+/// measure the identical fan-out. L1 replaced this with
+/// `baseline_reconciliation_workspace_snapshot` below, through
+/// `ControlClient::workspace_snapshot`.
 #[test]
 fn baseline_reconciliation_fan_out() {
     let Some(rig) = Rig::new("base-recon") else {
@@ -231,6 +307,62 @@ fn baseline_reconciliation_fan_out() {
             elapsed.as_secs_f64() * 1000.0
         );
     }
+}
+
+/// NEW shape (L1): one `ControlClient::workspace_snapshot` round trip — two
+/// control-mode commands over a connection that already exists, regardless
+/// of window count — replaces the `W + 3` one-shot-process fan-out above.
+/// This is exactly what `crates/cyclops-workspace/src/sync.rs`'s
+/// `fetch_workspace_model` calls today. Same fixtures as
+/// `baseline_reconciliation_fan_out`, so the two totals are directly
+/// comparable.
+#[tokio::test]
+async fn baseline_reconciliation_workspace_snapshot() {
+    let Some(rig) = Rig::new("base-recon-snap") else {
+        return;
+    };
+    println!("=== baseline: workspace_snapshot (L1's fetch_workspace_model shape) ===");
+    // workspace_snapshot reads the whole server in two fixed commands, so
+    // one client attached anywhere on the server measures every fixture
+    // below — the same way one reconcile measures the whole workspace today.
+    rig.session_with_windows("snap1", 1);
+    let (client, _notif) = ControlClient::spawn(rig.config("snap1"))
+        .await
+        .expect("attach");
+    for &w in &[1usize, 4, 8] {
+        let session = format!("snap{w}");
+        if w != 1 {
+            rig.session_with_windows(&session, w);
+        }
+
+        let before = client.commands_issued();
+        let t = Instant::now();
+        let snapshot = client
+            .workspace_snapshot()
+            .await
+            .expect("workspace_snapshot");
+        let elapsed = t.elapsed();
+        let after = client.commands_issued();
+
+        let found = snapshot
+            .sessions
+            .iter()
+            .find(|s| s.name == session)
+            .unwrap_or_else(|| panic!("snapshot missing session {session}"));
+        assert_eq!(found.windows.len(), w, "expected {w} windows");
+        assert_eq!(
+            after - before,
+            2,
+            "workspace_snapshot must cost exactly two commands regardless of window count"
+        );
+
+        println!(
+            "{w} windows: total={:.2}ms commands_issued={} (fixed, not W+3)",
+            elapsed.as_secs_f64() * 1000.0,
+            after - before
+        );
+    }
+    client.shutdown().await;
 }
 
 /// A synthetic byte stream at least `min_len` bytes, mixing plain ASCII,

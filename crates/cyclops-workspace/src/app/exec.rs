@@ -231,8 +231,11 @@ async fn focus_pane(
 
 /// `pane_id` is on tab `index` of the active session. Select it, switching
 /// tabs first if needed, and hydrate synchronously on the input path the
-/// same way this has always worked — deferring it to the render deadline is
-/// a latency change, not an execution-path change, and belongs to L1.
+/// same way this has always worked. L1 made `hydrate_visible_tab` itself
+/// faster (every stale pane hydrates concurrently instead of serially)
+/// rather than moving it off this path: deferring it to the render deadline
+/// would be the background-effect system the recommendation says to add
+/// only after measurement shows this path is still slow, not speculatively.
 async fn focus_pane_in_session(
     app: &mut App,
     client: &ControlClient,
@@ -256,7 +259,7 @@ async fn focus_pane_in_session(
     app.model.session.tabs[index].active_pane = pane_id.to_string();
     if index != prior_tab || (zoomed && prior_pane != pane_id) {
         super::resize_client(app, client).await;
-        crate::sync::hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await?;
+        crate::sync::hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await;
         app.needs_hydrate = false;
         app.persist_active();
     }
@@ -447,7 +450,7 @@ async fn select_tab(
     client.select_window(&window_id).await?;
     app.model.session.active_tab = index;
     super::resize_client(app, client).await;
-    crate::sync::hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await?;
+    crate::sync::hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await;
     app.needs_hydrate = false;
     app.persist_active();
     Ok(Outcome::default())
@@ -737,7 +740,6 @@ mod tests {
             runtimes: RuntimeRegistry::default(),
             router: Router::new(default_bindings()),
             paint: Paint::for_test(),
-            socket: None,
             dialog: None,
             link_state: LinkState::Live,
             paused_panes: HashSet::new(),

@@ -185,10 +185,10 @@ impl DecorationSnapshot {
 /// `None` is a failed ASK, not an answer of "no agents", and the difference
 /// matters: every sidebar row and pane label is filtered on a pane carrying
 /// a label or a manifest, so rendering an empty snapshot un-names every
-/// agent on screen. One fetch runs per pushed daemon event, and a pane
-/// split or a border drag pushes a burst of them, so a single refused
-/// connection under that load used to blank the roster and let it pop back
-/// a frame later. A caller with a previous snapshot should keep it.
+/// agent on screen. `app::spawn_decoration_forwarder` coalesces a burst of
+/// daemon events (a split or a border drag pushes several) into one fetch,
+/// but that one fetch can still be refused; a caller with a previous
+/// snapshot should keep it rather than blank the roster for a frame.
 pub fn fetch_decoration(home: &Path) -> Option<DecorationSnapshot> {
     crate::daemon::status(
         home,
