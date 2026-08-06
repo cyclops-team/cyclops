@@ -5,6 +5,10 @@
 //! `%output` bytes continue from there, and rehydration is the recovery path
 //! on pause or reconnect.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::task::Poll;
+
 use crate::control::ControlClient;
 use crate::error::TmuxError;
 use crate::quote::quote_arg;
@@ -45,6 +49,30 @@ impl ControlClient {
         })
     }
 
+    /// Hydrate every pane in `pane_ids` concurrently, one result per input
+    /// id in the same order.
+    ///
+    /// Each pane's own capture -> capture -> metadata sequence still runs
+    /// exactly as [`ControlClient::hydrate_pane`] runs it alone; only
+    /// *independent* panes now overlap, pipelined through the same
+    /// correlated connection (`control.rs`'s FIFO reply matching keeps every
+    /// command's reply correctly paired no matter how commands from
+    /// different panes interleave on the wire). One pane's `Err` — a dead or
+    /// nonexistent id — never fails the batch; it only fails that pane's
+    /// slot.
+    ///
+    /// This is the concurrency the recommendation asks for
+    /// ("Hydrate panes concurrently without weakening ordering"): callers
+    /// that today loop `hydrate_pane` per visible pane pay the sum of every
+    /// pane's round trips; this pays roughly the slowest one.
+    pub async fn hydrate_panes(
+        &self,
+        pane_ids: &[&str],
+    ) -> Vec<Result<HydrationBundle, TmuxError>> {
+        let futures = pane_ids.iter().map(|id| self.hydrate_pane(id)).collect();
+        join_all_ordered(futures).await
+    }
+
     /// Declare this control client's size to tmux (`refresh-client -C`).
     pub async fn set_client_size(&self, cols: u16, rows: u16) -> Result<(), TmuxError> {
         self.command(&format!("refresh-client -C {cols}x{rows}"))
@@ -65,6 +93,44 @@ impl ControlClient {
             .await?;
         Ok(out.join("\n"))
     }
+}
+
+/// Drive a batch of same-typed futures to completion concurrently,
+/// preserving input order in the output.
+///
+/// This crate's only async dependency is tokio, which has no `join_all` for
+/// a *dynamic* number of futures: `tokio::join!` is fixed-arity, and
+/// `tokio::task::JoinSet` needs `'static` tasks — adopting it would force
+/// [`ControlClient::hydrate_panes`] to take `Arc<Self>` instead of `&self`,
+/// unlike every other method on this type. `futures::future::join_all` is
+/// the obvious tool, but nothing else in this crate needs that dependency.
+/// `poll_fn` polls every not-yet-ready future on each wake, which is exactly
+/// what `join_all` does; hand-rolling the loop below costs fewer lines than
+/// the dependency would for this one call site.
+async fn join_all_ordered<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut slots: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
+    let mut pending: Vec<Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
+    std::future::poll_fn(move |cx| {
+        let mut all_ready = true;
+        for (slot, fut) in slots.iter_mut().zip(pending.iter_mut()) {
+            if slot.is_none() {
+                match fut.as_mut().poll(cx) {
+                    Poll::Ready(v) => *slot = Some(v),
+                    Poll::Pending => all_ready = false,
+                }
+            }
+        }
+        if all_ready {
+            let done = std::mem::take(&mut slots)
+                .into_iter()
+                .map(|s| s.expect("every slot filled when all_ready"))
+                .collect();
+            Poll::Ready(done)
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 fn parse_meta(line: &str) -> Result<(u16, u16, bool, u16, u16), TmuxError> {
@@ -100,11 +166,47 @@ fn parse_meta(line: &str) -> Result<(u16, u16, bool, u16, u16), TmuxError> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_meta;
+    use super::{join_all_ordered, parse_meta};
 
     #[test]
     fn meta_format_parses() {
         let (x, y, alt, w, h) = parse_meta("3\t5\t0\t120\t30").unwrap();
         assert_eq!((x, y, alt, w, h), (3, 5, false, 120, 30));
+    }
+
+    #[tokio::test]
+    async fn join_all_ordered_preserves_input_order_regardless_of_completion_order() {
+        // Each future yields after a different number of scheduler
+        // round-trips, so the LAST one to be issued (index 4) is the FIRST
+        // to become ready. The output must still land at index 4.
+        let futures: Vec<_> = (0..5)
+            .map(|i| async move {
+                for _ in 0..(4 - i) {
+                    tokio::task::yield_now().await;
+                }
+                i
+            })
+            .collect();
+        let out = join_all_ordered(futures).await;
+        assert_eq!(out, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn join_all_ordered_keeps_each_result_independent() {
+        // One "failing" and one "succeeding" future from the same call
+        // site, the same shape `hydrate_panes` builds its batch in — every
+        // element of the `Vec` passed to `join_all_ordered` is necessarily
+        // the same concrete (if anonymous) future type.
+        let futures: Vec<_> = (0..2)
+            .map(|i| async move {
+                if i == 1 {
+                    Err("boom")
+                } else {
+                    Ok::<u32, &str>(1)
+                }
+            })
+            .collect();
+        let out = join_all_ordered(futures).await;
+        assert_eq!(out, vec![Ok(1), Err("boom")]);
     }
 }

@@ -139,6 +139,12 @@ type ReplySlot = oneshot::Sender<Result<Vec<String>, TmuxError>>;
 struct CommandPipe {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     pending: Arc<StdMutex<VecDeque<ReplySlot>>>,
+    /// Commands successfully written, across every clone of this pipe.
+    /// Exists so a caller (a test, or a future cost budget) can prove a
+    /// batched adapter call issues a small, fixed number of tmux commands
+    /// rather than one per item it iterates over — see
+    /// [`ControlClient::commands_issued`].
+    issued: Arc<AtomicU64>,
 }
 
 impl CommandPipe {
@@ -174,6 +180,7 @@ impl CommandPipe {
             self.pending.lock().expect("pending lock").pop_back();
             return Err(TmuxError::Io(e));
         }
+        self.issued.fetch_add(1, Ordering::Relaxed);
         Ok(rx)
     }
 
@@ -365,6 +372,7 @@ impl ControlClient {
         let pipe = CommandPipe {
             stdin: Arc::new(Mutex::new(Some(stdin))),
             pending: Arc::new(StdMutex::new(VecDeque::new())),
+            issued: Arc::new(AtomicU64::new(0)),
         };
         let (notif_tx, notif_rx) = mpsc::unbounded_channel();
         let reader = tokio::spawn(reader_task(stdout, pipe.clone(), notif_tx));
@@ -403,6 +411,17 @@ impl ControlClient {
     /// Session this client is attached to.
     pub fn session(&self) -> &str {
         &self.session
+    }
+
+    /// Total control-mode commands written on this connection, confirmed
+    /// or fire-and-forget alike (every path through [`CommandPipe::submit`],
+    /// which is both [`ControlClient::command`] and the `_unconfirmed`
+    /// variants). Counts lines written, not replies received. Includes the
+    /// attach handshake's own command, so callers proving "a small fixed
+    /// number of commands" should compare a before/after delta rather than
+    /// the absolute value.
+    pub fn commands_issued(&self) -> u64 {
+        self.pipe.issued.load(Ordering::Relaxed)
     }
 
     /// Run one tmux command and return its reply block lines.

@@ -43,6 +43,10 @@ than a measurement.
 | F35 | `alacritty_terminal` passes the workspace VT fixture corpus 12/12; `vt100` passes 5/12 | binds |
 | F36 | Cloud-agent VM stdout accepts OSC 52 clipboard writes; native fallback uses wl-copy/xclip when present | binds |
 | F37 | Session rename notifications carry a stable id and can describe a background session | binds |
+| F38 | Hydration replays the saved primary first, then enters the alternate screen, then the visible capture | binds |
+| F39 | Width fixtures pin VS16 non-widening and SGR 21 as bold-off, so an engine bump fails loudly | binds |
+| F40 | One `list-panes -a` discovers every session, window, and pane; empty sessions cannot exist | binds |
+| F41 | Session fields are reachable from pane lines; the second snapshot command exists for tab-safety, not reachability | binds |
 
 ## F13. refresh-client -B subscriptions work in control mode on tmux 3.6a (MEASURED)
 
@@ -649,3 +653,49 @@ one-column shift in every warning glyph:
 Probe: `crates/cyclops-workspace/tests/fidelity.rs`,
 `a_variation_selector_does_not_widen_a_narrow_glyph` and
 `every_underline_style_keeps_its_own_identity`.
+
+## F40. Killing a session's last pane leaves no server, never an empty session (MEASURED)
+
+A tmux session cannot exist with zero windows, and a window cannot exist
+with zero panes: killing the only pane in the only window of the only
+session on a server does not leave a session with no windows, it leaves no
+server at all. This makes one `list-panes -a` (every pane, on every
+session) structurally sufficient to discover every session and window that
+exists — nothing needs a per-window follow-up query just to find out what
+exists, only to name it (see `ControlClient::workspace_snapshot`,
+`crates/cyclops-tmux/src/snapshot.rs`, task D2).
+
+Probe, on an isolated `-L` socket:
+
+```text
+$ tmux -u -L cyc-probe -f /dev/null new-session -d -s probe -x 80 -y 24 /bin/sh
+$ tmux -u -L cyc-probe -f /dev/null kill-pane -t probe:0.0
+$ tmux -u -L cyc-probe -f /dev/null list-sessions
+no server running on /private/tmp/tmux-501/cyc-probe
+```
+
+## F41. `list-panes -a` exposes session-level fields (`session_attached`), not only pane fields (MEASURED)
+
+Session-, window-, and pane-scoped format variables are all reachable from
+a `list-panes -a` line, not only the pane's own fields — tmux resolves a
+format against the whole session/window/pane chain a pane sits in,
+regardless of which `list-*` command asked for it. `#{session_attached}`
+came back correctly on every pane line for a session with no attached
+client (`0`) in the probe below.
+
+The reason `ControlClient::workspace_snapshot` still issues a second
+`list-sessions` command is not that `#{session_name}` is unreachable this
+way — it is reachable — but that it cannot safely share a `list-panes -a`
+line with `#{window_name}`. Both are arbitrary human text, and this crate's
+escaping precedent (`crate::watcher`'s `PANE_FORMAT`) only makes the *last*
+field on a line safe against an embedded tab; two independent free-text
+fields cannot both hold that position on the same line. See the module doc
+in `crates/cyclops-tmux/src/snapshot.rs`.
+
+Probe:
+
+```text
+$ tmux -u -L cyc-probe -f /dev/null new-session -d -s alpha -x 80 -y 24 /bin/sh
+$ tmux -u -L cyc-probe -f /dev/null list-panes -a -F '#{session_id} #{session_attached} #{pane_id}'
+$0 0 %0
+```

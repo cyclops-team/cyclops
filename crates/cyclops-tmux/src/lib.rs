@@ -43,6 +43,11 @@
 //!   session. `refresh-client -B` subscriptions (MEASURED working on tmux
 //!   3.6a) push per-pane field changes; structural notifications are hints
 //!   that trigger debounced reconciliation against `list-panes`.
+//! - [`snapshot`]: [`ControlClient::workspace_snapshot`], one adapter-owned
+//!   read of every session/window/pane on the server with a small fixed
+//!   number of control-mode commands, replacing one one-shot tmux process
+//!   per window. [`ControlClient::hydrate_panes`] (in [`hydration`]) hydrates
+//!   a batch of panes concurrently instead of one after another.
 //! - [`TmuxVersion`]: version parsing and feature gates.
 //! - [`focus_pane`]: one-shot focus jump for the stream UI, outside
 //!   control mode on purpose (a user gesture, not daemon state).
@@ -72,6 +77,7 @@ pub mod notify;
 pub mod ops;
 pub mod quote;
 pub mod session;
+pub mod snapshot;
 pub mod version;
 pub mod watcher;
 
@@ -89,5 +95,6 @@ pub use session::{
     active_pane, list_panes, list_sessions, list_window_memberships, list_windows, SessionRow,
     WindowMembership, WindowPaneRow, WindowRow,
 };
+pub use snapshot::{SnapshotPane, SnapshotSession, SnapshotWindow, WorkspaceSnapshot};
 pub use version::TmuxVersion;
 pub use watcher::{PaneEvent, PaneField, PaneRow, SessionWatcher};
