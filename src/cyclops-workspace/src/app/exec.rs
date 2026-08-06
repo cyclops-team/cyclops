@@ -756,6 +756,7 @@ mod tests {
             event_stream_open: false,
             record: cyclops_ui::Record::new(),
             intake: cyclops_ui::Intake::new(),
+            cursor_style: None,
             term_size: (80, 24),
             declared_client_size: None,
             needs_reconcile: false,

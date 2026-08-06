@@ -90,6 +90,11 @@ pub struct CursorState {
     pub row: u16,
     pub visible: bool,
     pub shape: CursorShape,
+    /// Whether the pane asked for a blinking cursor (DECSCUSR's odd
+    /// numbers). Forwarded with `shape` so the host terminal's real
+    /// cursor — the only cursor the workspace shows — renders what the
+    /// pane requested rather than whatever the previous pane left.
+    pub blink: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

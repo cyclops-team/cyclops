@@ -31,7 +31,7 @@ use ratatui::style::{Color as RtColor, Modifier, Style};
 use crate::drag::{DragState, DragTarget};
 use crate::runtime::{Color, GridCell};
 
-pub use canvas::{paint_window, tmux_client_size, WindowPaintCtx};
+pub use canvas::{paint_window, tmux_client_size, HostCursor, WindowPaintCtx};
 pub use event_panel::{event_stream_rows, paint_event_stream, EventRow};
 pub use overlay::{keybind_max_scroll, paint_dialog, paint_menu};
 pub use sidebar::paint_sidebar;

@@ -246,13 +246,21 @@ fn the_cursor_reports_its_position_visibility_and_shape() {
     rt.feed(b"\x1b[?25h");
     assert!(rt.cursor().visible);
 
-    // DECSCUSR: 4 = steady underline, 6 = steady bar, 2 = steady block.
-    rt.feed(b"\x1b[4 q");
-    assert_eq!(rt.cursor().shape, CursorShape::Underline);
-    rt.feed(b"\x1b[6 q");
-    assert_eq!(rt.cursor().shape, CursorShape::Bar);
-    rt.feed(b"\x1b[2 q");
-    assert_eq!(rt.cursor().shape, CursorShape::Block);
+    // DECSCUSR: even numbers are steady, odd are blinking; both halves
+    // must survive to the host cursor or a pane's insert-mode bar renders
+    // as whatever the previous pane left behind.
+    for (bytes, shape, blink) in [
+        (b"\x1b[1 q".as_slice(), CursorShape::Block, true),
+        (b"\x1b[2 q".as_slice(), CursorShape::Block, false),
+        (b"\x1b[3 q".as_slice(), CursorShape::Underline, true),
+        (b"\x1b[4 q".as_slice(), CursorShape::Underline, false),
+        (b"\x1b[5 q".as_slice(), CursorShape::Bar, true),
+        (b"\x1b[6 q".as_slice(), CursorShape::Bar, false),
+    ] {
+        rt.feed(bytes);
+        let c = rt.cursor();
+        assert_eq!((c.shape, c.blink), (shape, blink), "for {bytes:?}");
+    }
 }
 
 // ----------------------------------------------------------- alternate screen

@@ -241,6 +241,7 @@ impl PaneRuntime {
             visible: self.term.mode().contains(TermMode::SHOW_CURSOR)
                 && style.shape != ansi::CursorShape::Hidden,
             shape,
+            blink: style.blinking,
         }
     }
 

@@ -4,6 +4,7 @@ use std::io::{self, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
 };
@@ -12,7 +13,27 @@ use crossterm::terminal::{
 };
 use crossterm::ExecutableCommand;
 
+use crate::runtime::CursorShape;
+
 static RESTORING: AtomicBool = AtomicBool::new(false);
+
+/// Emit the focused pane's requested cursor shape (DECSCUSR) to the host
+/// terminal. Lives beside the guard because it changes terminal state the
+/// guard must undo: `restore` puts the user's configured shape back on
+/// every exit path, panic included, so a pane that asked for a bar cannot
+/// leave the user's shell with one.
+pub fn apply_cursor_style(shape: CursorShape, blink: bool) {
+    let style = match (shape, blink) {
+        (CursorShape::Block, true) => SetCursorStyle::BlinkingBlock,
+        (CursorShape::Block, false) => SetCursorStyle::SteadyBlock,
+        (CursorShape::Underline, true) => SetCursorStyle::BlinkingUnderScore,
+        (CursorShape::Underline, false) => SetCursorStyle::SteadyUnderScore,
+        (CursorShape::Bar, true) => SetCursorStyle::BlinkingBar,
+        (CursorShape::Bar, false) => SetCursorStyle::SteadyBar,
+    };
+    let mut out = io::stdout();
+    let _ = out.execute(style);
+}
 
 /// Owns the terminal mode until dropped.
 pub struct TermGuard {
@@ -40,6 +61,10 @@ impl TermGuard {
         let mut out = io::stdout();
         let _ = out.execute(DisableBracketedPaste);
         let _ = out.execute(DisableMouseCapture);
+        // Undo any DECSCUSR a focused pane asked for (`apply_cursor_style`)
+        // before leaving the alternate screen, so the user's shell gets its
+        // own configured cursor back rather than the last pane's.
+        let _ = out.execute(SetCursorStyle::DefaultUserShape);
         let _ = out.execute(LeaveAlternateScreen);
         let _ = disable_raw_mode();
         let _ = out.flush();

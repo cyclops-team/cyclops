@@ -31,8 +31,22 @@ pub struct WindowPaintCtx<'a> {
     pub decoration: &'a DecorationSnapshot,
     pub selection: Option<&'a Selection>,
     pub drag: Option<&'a DragState>,
-    /// Screen cell for the hardware cursor when the focused pane shows one.
-    pub cursor: Option<(u16, u16)>,
+    /// The hardware cursor when the focused pane shows one.
+    pub cursor: Option<HostCursor>,
+}
+
+/// What the focused pane asks the host terminal's real cursor to do this
+/// frame: where to sit, and which DECSCUSR shape to take. The workspace
+/// never paints a cursor cell of its own — the one real cursor is the
+/// only way a bar or underline can render at all in a cell grid — so the
+/// pane's requested shape and blink pass through to the host instead of
+/// being approximated with cell styling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostCursor {
+    pub x: u16,
+    pub y: u16,
+    pub shape: crate::runtime::CursorShape,
+    pub blink: bool,
 }
 
 /// One cell of breathing room around the pane canvas. Compact separator
@@ -272,7 +286,12 @@ fn paint_pane_slot(
         if slot.focused {
             let cur = runtime.cursor();
             if cur.visible && runtime.at_tail() && cur.col < vis.width && cur.row < vis.height {
-                ctx.cursor = Some((vis.x + cur.col, vis.y + cur.row));
+                ctx.cursor = Some(HostCursor {
+                    x: vis.x + cur.col,
+                    y: vis.y + cur.row,
+                    shape: cur.shape,
+                    blink: cur.blink,
+                });
             }
         }
     } else {
@@ -1308,11 +1327,13 @@ mod tests {
     }
 
     #[test]
-    fn focused_pane_reports_cursor_position() {
+    fn focused_pane_reports_cursor_position_and_requested_shape() {
         let tab = two_pane_tab();
         let mut runtimes = RuntimeRegistry::default();
         let mut rt = crate::runtime::PaneRuntime::new(40, 5);
-        rt.feed(b"$ ");
+        // DECSCUSR 6: a steady bar, the shape a modern editor's insert
+        // mode asks for — exactly what must reach the host cursor.
+        rt.feed(b"$ \x1b[6 q");
         runtimes.insert("%0".into(), rt);
         let backend = TestBackend::new(40, 12);
         let mut term = Terminal::new(backend).unwrap();
@@ -1327,8 +1348,18 @@ mod tests {
             cursor = ctx.cursor;
         })
         .unwrap();
-        // The pane sits one margin cell in from the canvas origin.
-        assert_eq!(cursor, Some((3, 1)), "cursor should track the focused pane");
+        // The pane sits one margin cell in from the canvas origin, and the
+        // pane's requested shape rides along with the position.
+        assert_eq!(
+            cursor,
+            Some(HostCursor {
+                x: 3,
+                y: 1,
+                shape: crate::runtime::CursorShape::Bar,
+                blink: false,
+            }),
+            "cursor should track the focused pane and carry its DECSCUSR"
+        );
     }
 
     #[test]

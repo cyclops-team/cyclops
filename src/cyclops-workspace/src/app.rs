@@ -175,6 +175,11 @@ struct App {
     /// ledger-backed duplicates arriving live during startup are dropped
     /// by seq instead of shown twice.
     intake: cyclops_ui::Intake,
+    /// The (shape, blink) last emitted to the host terminal
+    /// ([`crate::term_guard::apply_cursor_style`]), so a frame whose
+    /// focused-pane cursor did not change costs no terminal write. `None`
+    /// until the first visible cursor is drawn.
+    cursor_style: Option<(crate::runtime::CursorShape, bool)>,
     term_size: (u16, u16),
     /// Last size successfully declared by this control client. Avoids a
     /// resize notification loop when expanded pane gutters are already at
@@ -435,6 +440,7 @@ pub async fn run_async() -> i32 {
         event_stream_open: false,
         record: cyclops_ui::Record::new(),
         intake: cyclops_ui::Intake::new(),
+        cursor_style: None,
         term_size,
         declared_client_size,
         needs_reconcile: false,
@@ -2078,6 +2084,7 @@ async fn handle_dialog_key(
 
 fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
     app.hit_map.clear();
+    let mut shown_cursor: Option<crate::render::HostCursor> = None;
     terminal
         .draw(|f| {
             let areas = app.chrome(f.area());
@@ -2147,12 +2154,26 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
                     app.hover,
                 );
             } else if !app.menu.is_open() {
-                if let Some(pos) = cursor {
-                    f.set_cursor_position(pos);
+                if let Some(hc) = cursor {
+                    f.set_cursor_position((hc.x, hc.y));
+                    shown_cursor = Some(hc);
                 }
             }
         })
-        .map(|_| ())
+        .map(|_| ())?;
+    // DECSCUSR is terminal state, not frame content: Ratatui diffs cells
+    // and knows nothing of cursor shape, so the pane's requested shape is
+    // emitted here, once per change rather than once per frame. While the
+    // cursor is hidden its shape cannot show, so nothing is emitted and
+    // the last emission stands until a visible cursor differs.
+    if let Some(hc) = shown_cursor {
+        let style = (hc.shape, hc.blink);
+        if app.cursor_style != Some(style) {
+            crate::term_guard::apply_cursor_style(hc.shape, hc.blink);
+            app.cursor_style = Some(style);
+        }
+    }
+    Ok(())
 }
 
 /// Sync entry: run the async workspace loop.
@@ -2206,6 +2227,7 @@ mod tests {
             event_stream_open: false,
             record: cyclops_ui::Record::new(),
             intake: cyclops_ui::Intake::new(),
+            cursor_style: None,
             term_size: (40, 12),
             declared_client_size: None,
             needs_reconcile: false,
