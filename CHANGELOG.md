@@ -31,6 +31,16 @@ versions are unreleased until admin cuts a tag.
   does, so a fresh machine's first workspace has real themes; a theme
   file that is missing (rather than broken) now says so and names the
   remedy instead of asking the user to fix a file that does not exist.
+- `cyclops list` says whose roster it is: a header names the watched
+  session(s) and the home that answered, and `--json` gains additive
+  `home` and `sessions` fields, so a second daemon on a second home can
+  never be invisible again.
+- A Themes entry in the workspace menu: pick a theme with arrows and
+  Enter, the active one marked; applying does exactly what
+  `cyclops theme <name>` does and the open workspace repaints live.
+- Swap entries in the pane right-click menu, acting on the clicked pane;
+  the same swaps are optionally bindable (`swap_left` and friends) for
+  anyone who wants dedicated chords.
 - Claude Code manifest re-verified against 2.1.221 on a live rig, with
   fidelity tests pinned from the captured evidence: mid-turn streaming,
   idle, the new trust-dialog wording, the title table, and the exact
@@ -53,6 +63,13 @@ versions are unreleased until admin cuts a tag.
 - `cyclops read <t> --source detection --raw`: the pane capture the
   sensors read, in the same answer as the readings, so the evidence and
   the verdict are one moment.
+
+### Changed
+
+- The reply footer on delivered messages trimmed from a full flag
+  synopsis to `Reply: cyclops send <from> --subject "..."`. The routing
+  survives compaction and works for agents without the cyclops skill;
+  the flag lesson lives in the skill and `--help`, not in every message.
 
 ### Fixed
 
