@@ -178,7 +178,7 @@ const CONTRAST: [Claim; 3] = [
     Claim {
         theme: "light",
         ground: (0xfe, 0xfe, 0xfe),
-        floor: 3.6,
+        floor: 4.5,
         dead: 2.8,
     },
     Claim {

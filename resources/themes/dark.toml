@@ -22,11 +22,10 @@
 # rig stays quiet; alert takes sage, the site's "ok" color, so the mark
 # brightens into the brand when something needs the human.
 #
-# surface.fg is the one value here that no renderer paints. Cyclops prints
-# body text in the terminal's own foreground; the engine reads surface.fg
-# only as its fallback when a renderer asks for a token outside the
-# vocabulary. It stays because it names the identity's text color and
-# gives that fallback a themed value. Editing it changes nothing on screen.
+# surface.fg is the pane text: the workspace paints it as the figure on
+# surface.bg under every pane cell. One-shot commands still print in the
+# terminal's own foreground, and the engine also reads surface.fg as its
+# fallback when a renderer asks for a token outside the vocabulary.
 #
 # [state] and [badge] are the second meaning-carrying encoding's color
 # half, and they are REDUNDANT by construction: every state still prints

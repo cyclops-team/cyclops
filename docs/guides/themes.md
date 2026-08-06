@@ -159,7 +159,7 @@ what is published here fails too.
 | Theme | Ground | Every token clears | Except |
 |---|---|---|---|
 | `dark` | `#0d0d0d`, its `surface.bg` | 4.3:1 | `state.dead`, 2.8:1 |
-| `light` | `#fefefe`, its `surface.bg` | 3.6:1 | `state.dead`, 2.8:1 |
+| `light` | `#fefefe`, its `surface.bg` | 4.5:1, WCAG AA for body text | `state.dead`, 2.8:1 |
 | `high-contrast` | `#000000`, its `surface.bg` | 7:1, WCAG AAA for body text | nothing |
 
 Every number is a floor. `state.dead` gets its own because it is

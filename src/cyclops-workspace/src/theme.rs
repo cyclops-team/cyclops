@@ -270,9 +270,11 @@ pub fn attention_eye(paint: &Paint) -> Style {
 
 pub fn selection_highlight(paint: &Paint) -> Style {
     if paint.colors_enabled {
+        // Panel ink on the accent ground: accent-on-raised read fine on
+        // dark but measured 3.23:1 on light, under its own body-text bar.
         paint
-            .style_token(tokens::SURFACE_ACCENT)
-            .patch(paint.bg_token(tokens::CHROME_RAISED))
+            .style_token(tokens::CHROME_PANEL)
+            .patch(paint.bg_token(tokens::SURFACE_ACCENT))
     } else {
         Style::new().add_modifier(Modifier::REVERSED)
     }

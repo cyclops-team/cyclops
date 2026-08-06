@@ -1,31 +1,37 @@
-# Cyclops light: the site's light page palette, for light terminals.
+# Cyclops light: the site's light page palette, drawn on paper for light
+# terminals.
 #
 # Source of truth is website/src/app.css (:root, light). Where dark.toml
 # maps the site's terminal panel, this maps the page itself:
 #
-#   surface.fg      --text         #2a2a2a   fallback only, see below
+#   surface.fg      --text         #2a2a2a   pane body text, see below
 #   surface.bg      --paper        #fefefe   the pane ground the workspace paints
 #   surface.dim     --muted        #6e6e6e
-#   surface.accent  --sage-ink     #7e8a5c   the site uses the ink strength
-#                                            of sage for accents on paper,
-#                                            because #b7c396 washes out
+#   surface.accent  --link         #6e7a4e   the ink the site itself trusts
+#                                            to carry meaning alone on
+#                                            paper; --sage-ink #7e8a5c
+#                                            measures 3.67:1 and washes
+#                                            out at cell size
 #
-#   role.1          --sage-ink     #7e8a5c
-#   role.2          --mauve-ink    #9c7e75
+#   role.1          --link         #6e7a4e
+#   role.2          mauve ink      #886e66   --mauve-ink #9c7e75 deepened
+#                                            to the same bar
 #
 # The remaining six role slots are the dark theme's sorbet wheel at ink
-# strength: the same hues, darkened until they read on paper. Sand and
-# lavender lean slightly warmer and deeper than a mechanical darkening so
-# their 256-color fallbacks stay distinct (see below).
+# strength ON this ground: the same hues, each darkened until it clears
+# the floor stated below. A light theme is not an inverted dark one;
+# every ink here was measured against paper, not translated from the
+# panel.
 #
-# The eye follows dark.toml's logic at ink strength: calm takes --muted so
-# a quiet rig recedes, alert takes sage-ink, the accent of the page.
+# The eye follows dark.toml's logic at ink strength: calm takes --muted
+# so a quiet rig recedes, alert takes the accent, the link ink of the
+# page.
 #
-# surface.fg is the one value here that no renderer paints. Cyclops prints
-# body text in the terminal's own foreground; the engine reads surface.fg
-# only as its fallback when a renderer asks for a token outside the
-# vocabulary. It stays because it names the page's text color and gives
-# that fallback a themed value. Editing it changes nothing on screen.
+# surface.fg is pane body text now. Pane bodies own their ground, so the
+# workspace paints surface.fg on surface.bg under every pane cell;
+# one-shot commands still print in the terminal's own colors. It also
+# stays the engine's fallback when a renderer asks for a token outside
+# the vocabulary.
 #
 # [state] and [badge] are dark.toml's four groups at ink strength, and
 # they are redundant with the glyph and the word there too: healthy is a
@@ -42,22 +48,18 @@
 # it is surface.bg here, so the workspace paints the measured pair under
 # pane bodies; one-shot commands still print on the terminal's own
 # background. Measured as WCAG 2.1 relative luminance in sRGB, ratio
-# (lighter + 0.05) / (darker + 0.05); the
-# arithmetic is in src/cyclops-theme/tests/shipped.rs and the numbers
-# below are pinned there by shipped_themes_meet_their_stated_contrast.
+# (lighter + 0.05) / (darker + 0.05); the arithmetic is in
+# src/cyclops-theme/tests/shipped.rs and the numbers below are pinned
+# there by shipped_themes_meet_their_stated_contrast.
 #
-# Floor 3.6:1 for every figure token except state.dead; surface.bg and
-# the two [chrome] grounds are backgrounds, not figures, so their bar
-# (pinned in the same test) is that chrome.text stays readable on both
-# chrome grounds at this floor, not that they clear it themselves. The
-# [palette] entries carry no bar either: they are content colors the
-# running program picks, and the theme only supplies the mapping.
-# state.dead's own bar is WCAG's 3:1 bar
-# for large text and interface elements, cleared with room. The floor is
-# surface.accent, eye.alert and role.1 at 3.67:1, all three the site's own
-# --sage-ink; role.2 follows at 3.68:1. The rest: role slots to 5.4:1,
-# surface.dim and state.quiet 5.1:1, state.healthy 5.3:1, state.needs_you
-# 5.3:1, state.terminal 6.9:1.
+# Floor 4.5:1, WCAG AA for body text, for every figure token except
+# state.dead; surface.bg and the two [chrome] grounds are backgrounds,
+# not figures, so their bar (pinned in the same test) is that chrome.text
+# stays readable on both chrome grounds at this floor, not that they
+# clear it themselves. The floor sits on surface.accent, eye.alert and
+# role.1 at 4.57:1, all three the site's own --link. The rest: role
+# slots 4.62:1 to 5.41:1, surface.dim and state.quiet 5.06:1,
+# state.healthy 5.27:1, state.needs_you 5.25:1, state.terminal 6.86:1.
 #
 # state.dead is the deliberate exception, floor 2.8:1, measuring 2.82:1,
 # for dark.toml's reason: a pane whose process is gone should be the
@@ -65,11 +67,29 @@
 # why it sits ABOVE dim here. #9a9a9a, one step lighter, measures 2.79:1
 # and is under the floor, so the floor is what picks this value.
 #
-# Every 256-color fallback here is explicit and exactly what the
-# cyclops-theme derivation picks; the role hues above were chosen so the
-# derivation lands the eight slots on pairwise distinct entries. The one
-# exception is [palette], whose fallbacks are the literal ANSI index:
-# the program asked for color N, and terminals remap 0..15 freely.
+# [palette] carries no pinned bar (the entries are content colors the
+# running program picks; the theme only supplies the mapping), but every
+# slot still has to read, because pane programs print body text with
+# these on the dark-terminal assumption. White and bright white land as
+# readable grays: the gray ladder keeps its order, 0 darkest, then 8,
+# then 7, then 15, so shading still ranks, and the lightest rung
+# measures 3.17:1 instead of white on white. Brights are the normals'
+# hues more saturated; the weakest chromatic slot measures 3.72:1.
+#
+# The workspace chrome's grounds: panel is one step down from --paper,
+# the same size step dark.toml takes up from its ground, and raised is
+# deepened past the mechanical second step until the raise reads as
+# clearly as dark's (#e0e0e0 left the selected row nearly flat against
+# the panel). chrome.text on raised measures 10.07:1.
+#
+# Every 256-color fallback here is explicit. Outside [role] and
+# [palette] each is exactly what the cyclops-theme derivation picks. The
+# role fallbacks are hand-tuned pairwise distinct where the derivation
+# would collapse two inks onto one entry: sage and moss both derive to
+# 65, so moss, the nearer, keeps it and sage steps to 101; mauve and
+# sand both derive to 95, so mauve keeps it and sand steps to 137. The
+# [palette] fallbacks are the literal ANSI index: the program asked for
+# color N, and terminals remap 0..15 freely.
 
 name = "light"
 
@@ -77,21 +97,21 @@ name = "light"
 fg = { hex = "#2a2a2a", c256 = 235 }
 bg = { hex = "#fefefe", c256 = 231 }
 dim = { hex = "#6e6e6e", c256 = 242 }
-accent = { hex = "#7e8a5c", c256 = 101 }
+accent = { hex = "#6e7a4e", c256 = 65 }
 
 [role]
-1 = { hex = "#7e8a5c", c256 = 101 } # sage ink, the site accent
-2 = { hex = "#9c7e75", c256 = 138 } # mauve ink, the site message color
+1 = { hex = "#6e7a4e", c256 = 101 } # sage ink, the site link color
+2 = { hex = "#886e66", c256 = 95 }  # mauve ink
 3 = { hex = "#5c6e8a", c256 = 60 }  # mist blue ink
-4 = { hex = "#5c8287", c256 = 66 }  # aqua ink
-5 = { hex = "#5c8a6e", c256 = 65 }  # moss ink
-6 = { hex = "#a07a50", c256 = 137 } # sand ink
+4 = { hex = "#567a7f", c256 = 66 }  # aqua ink
+5 = { hex = "#537c63", c256 = 65 }  # moss ink
+6 = { hex = "#906e48", c256 = 137 } # sand ink
 7 = { hex = "#7a5c9e", c256 = 97 }  # lavender ink
 8 = { hex = "#8a5c7e", c256 = 96 }  # plum ink
 
 [eye]
 calm = { hex = "#6e6e6e", c256 = 242 }
-alert = { hex = "#7e8a5c", c256 = 101 }
+alert = { hex = "#6e7a4e", c256 = 65 }
 
 [state]
 healthy = { hex = "#2a7a3f", c256 = 29 }   # forest green
@@ -107,8 +127,8 @@ terminal = { hex = "#9c3838", c256 = 131 }
 quiet = { hex = "#6e6e6e", c256 = 242 }
 
 # The ANSI-16 mapping for pane content, at ink strength so every entry
-# reads on paper; brights are the same hues more saturated, and 15 stays
-# white because a program asking for bright white means white.
+# reads on paper. 0 is the page's own ink; 7, 8 and 15 are the gray
+# ladder from the header, in the standard order.
 [palette]
 0 = { hex = "#2a2a2a", c256 = 0 }
 1 = { hex = "#9c3838", c256 = 1 }
@@ -117,20 +137,20 @@ quiet = { hex = "#6e6e6e", c256 = 242 }
 4 = { hex = "#5c6e8a", c256 = 4 }
 5 = { hex = "#8a5c7e", c256 = 5 }
 6 = { hex = "#5c8287", c256 = 6 }
-7 = { hex = "#b8b8b8", c256 = 7 }
+7 = { hex = "#808080", c256 = 7 }
 8 = { hex = "#6e6e6e", c256 = 8 }
 9 = { hex = "#c14343", c256 = 9 }
-10 = { hex = "#3f9e55", c256 = 10 }
-11 = { hex = "#b08428", c256 = 11 }
+10 = { hex = "#3b9550", c256 = 10 }
+11 = { hex = "#a77d26", c256 = 11 }
 12 = { hex = "#4a6fb5", c256 = 12 }
 13 = { hex = "#a86a9a", c256 = 13 }
 14 = { hex = "#3f8f98", c256 = 14 }
-15 = { hex = "#ffffff", c256 = 15 }
+15 = { hex = "#909090", c256 = 15 }
 
-# The workspace chrome's grounds, a step and two steps down from --paper:
-# on a light page the chrome recedes by darkening. chrome.text on raised
-# measures 10.9:1.
+# The workspace chrome's grounds, both darker than --paper: on a light
+# page the chrome recedes by darkening. See the header for why raised is
+# deeper than a mirror of dark.toml's step.
 [chrome]
 text = { hex = "#2a2a2a", c256 = 235 }
 panel = { hex = "#f1f1f1", c256 = 255 }
-raised = { hex = "#e0e0e0", c256 = 254 }
+raised = { hex = "#d8d8d8", c256 = 188 }
