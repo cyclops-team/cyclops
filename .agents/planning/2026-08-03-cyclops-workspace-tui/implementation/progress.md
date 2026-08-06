@@ -1,72 +1,65 @@
 # Recommendation implementation — progress
 
-Recovery run resumed 2026-08-05 (took over from the run that paused on a
-full disk). Working from
+Recovery run resumed 2026-08-05. Working from
 `.agents/planning/2026-08-03-cyclops-workspace-tui/implementation-prompt.md`.
-
-## G0 baseline
-
-Merge commit **`e2d059d`** on `main`. Baseline gates at G0: fmt clean,
-clippy clean, `cargo test --workspace --no-fail-fast` 768 passed / 1
-failed — the one failure is the contention-sensitive `cyclops-ui` perf
-test, which passes in isolation (see Gotchas).
-
-## Disk blocker — resolved
-
-The previous run stopped at ~117 MiB free. Verified no cargo/rustc
-process and no open files under the inactive, already-merged worktree's
-target, then `cargo clean --manifest-path
-~/Desktop/Code/cyclops-workspace/Cargo.toml` (dry-run first) reclaimed
-13.2 GiB → 10 GiB free. `handoff-visual-polish.md` preserved (historical;
-that work is in G0 via the merge).
+G0 baseline: merge `e2d059d`. Disk blocker resolved same day (13.2 GiB
+reclaimed from the merged worktree's target via its manifest, dry-run
+first; `handoff-visual-polish.md` preserved).
 
 ## Completed and committed
 
-| Task | Commit | What | Tests |
-|---|---|---|---|
-| B1 | `5d39e49` | One crossterm (0.29); vt100 + comparison tests deleted | workspace crate, fmt, clippy |
-| fixes | `9584252` | Alternate-screen hydration order (F38); DECTCEM hidden cursor. `alternate` → `saved_primary` | 154 incl. new rig test |
-| A1b | `c541d10` | 20 bridge-fidelity fixtures; `hidden`/`strikeout`/`Underline` bridged; `at_tail` derived; F39 | 174 |
-| D1 | `dfb089f` | `cyclops-tmux::ops`: typed select/split/close/zoom/resize/create/rename/swap/move | tmux crate rig tests |
-| A1a | `dc20c4c` | Recorded baselines: hydration, W+3 reconcile fan-out, feed/grid throughput, resize cost (`tests/baseline.rs` + `baselines.md`) | 4 recording tests |
-| D1+ | `870efea` | switch_to_session / new_session / kill_session — the last adapter gaps blocking intent.rs deletion | ops tests (21) |
-| F1 | `54f9a38` | `skills/cyclops/SKILL.md` from real captured runs; 3 blocks deferred to F2 | doc links verified |
-| C1 | `036d60b` | 26-variant stable-target `Action` vocabulary + pure device routing, 39 tests. Temporary module dead_code allowance until C2 | 217 |
-| R1 | `71d2e35` | PaneRuntime/AlacrittyVt collapsed; grid mirror deleted; direct engine-cell rendering with selection folded into the one pass; word-select CJK column fix. Measured: frame walk 150.75us vs 165.79us mirror build + paint walk (baselines.md post-R1 section) | 218 |
-| D2 | `ad07de7` | Adapter workspace_snapshot (2 commands flat vs W+3; 0.36ms vs 39.61ms at 8 windows); hydrate_panes concurrent (0.5-0.7ms vs 1.4-1.6ms at 8 panes); commands_issued counter; F40/F41 | tmux crate (101) |
-| E1 | `7239beb` | Backend-neutral stream model (`cyclops-ui::stream::Record`/`Intake`/`Entry`); watch is renderer #1; transcript seam test for E2 parity | ui 81 + cli 189 |
+| Task | Commit | What |
+|---|---|---|
+| B1 | `5d39e49` | One crossterm (0.29); vt100 + comparison tests deleted |
+| fixes | `9584252` | Alternate-screen hydration order (F38); DECTCEM cursor |
+| A1b | `c541d10` | 20 bridge-fidelity fixtures; attrs bridged; F39 |
+| D1 | `dfb089f` | Typed structural ops on ControlClient |
+| A1a | `dc20c4c` | Recorded perf baselines + harness |
+| D1+ | `870efea` | switch/new/kill session ops |
+| F1 | `54f9a38` | skills/cyclops/SKILL.md from real captures |
+| C1 | `036d60b` | 26-variant Action vocabulary + pure routing |
+| R1 | `71d2e35` | Runtime collapsed; grid mirror deleted; measured |
+| D2 | `ad07de7` | Adapter snapshot (2 cmds flat) + concurrent hydration; F40/F41 |
+| E1 | `7239beb` | Backend-neutral stream model in cyclops-ui |
+| C2 | `ab739b0` | One executor owns every action; intent.rs deleted; app.rs 3166→2532 |
+| W1 | `f58e0cc` | Live insertion rule; preview == drop by construction |
+| L1 | `ceb98da` | Reconcile 2 cmds (~69x at 8 windows); concurrent tab hydration; coalesced decoration |
+| E2 | `7cec8e1` | Event panel renders the shared watch stream; parity test |
+| U1 | `250c28e` | Attention has one owner; glyph contract + invariant 11 amended; dead-code allowances gone |
+| — | `c21acd1` | doc-paths gate exempts the maintainer's notebook.md |
+| — | `5ec068d` | Status carries manifest_display_name; workspace manifest scan deleted |
+| — | `a9b91a6` | Attention tripwire green again (U1 fallout caught by cross-crate test run) |
+| S1 | `61158d2` | render/ split by surface; app.rs sheds non-owned code; moves only, 203 tests before and after |
 
-Findings written this run: F38, F39, F40, F41 (indexed).
+Also: `cba276b` (tmux snapshot comments as history), `17c632f`/`0f6aa92`
+(progress records). Findings this run: F38-F41, all indexed.
 
-## Active delegation
+## In progress
 
-C2 (action-executor integration; sole owner of `crates/cyclops-workspace`,
-deletes intent.rs and the duplicate device execution branches, moves
-naming policy to a workspace module, removes C1's temporary allowance).
+Q1 (lead-owned). Docs drift fix delegated first: ~29 `cyclops ui`
+mentions across 9 pages updated to `cyclops watch` with real re-captured
+output, parity-check and doc-paths as its gates. Full workspace gates
+(fmt, clippy, full test suite, doc-paths, parity) run after it lands.
+No concurrent behavior edits during Q1, per the plan.
 
 ## Remaining
 
-W1 (after C2) → L1 (integrates D2's snapshot + concurrent hydration into
-sync.rs; coalesced decoration refreshes) → E2 (event panel on the shared
-stream model) → U1 (glyph-only compact statuses; delete the
-`state.is_blocked()` attention fallback) → S1 → Q1 → M1 → F2 → Q2.
-Serialized: they converge on app.rs/render.rs.
-
-Also queued for pre-Q1: docs still name `cyclops ui` as current in
-README/HANDOFF/troubleshooting/STATUS though the binary ships it only as
-a deprecated alias for `cyclops watch` (found by F1; parity transcripts
-must be regenerated with the fix).
+M1 (repository migration, one owner, behavior frozen) → F2 (skill
+validation against the final tree; three deferred capture blocks need a
+live hook-wired vendor CLI) → Q2 (final gates incl. relocated-temp,
+shim, installer variants; docs/findings from real output).
 
 ## Gotchas worth keeping
 
-- `cyclops-ui/tests/perf.rs::frame_build_stays_under_16ms_at_10k_entries`
-  flakes under parallel CPU load; passes alone.
-- Two tmux-rig test binaries running concurrently can interfere; rerun a
-  failed rig test alone before believing it.
-- Do not pipe `cargo test` through `tail`; redirect to a file.
-- Perf numbers taken during macOS storage-daemon churn (after mass file
-  deletion) read ~20% worse across the board, including on unchanged
-  code. Trust only quiet-machine runs (see baselines.md).
-- Disk floor: below 10 GiB free, no new builds. Currently ~10 GiB; the
-  only remaining reclaimable artifact set is the active repo's own
-  target/, which stays.
+- `cyclops-ui/tests/perf.rs` 16ms assertion flakes under load; rerun alone.
+- Two tmux-rig test binaries running concurrently can interfere.
+- Never pipe `cargo test` through `tail`; redirect to a file.
+- Perf numbers during macOS storage-daemon churn read ~20% worse on
+  unchanged code; trust quiet-machine runs only (baselines.md).
+- Disk floor 10 GiB: target/debug/incremental was 1.5 GiB of dead weight
+  (all builds run CARGO_INCREMENTAL=0) and was reclaimed before Q1.
+- The attention tripwire (cyclops-proto/tests/one_place.rs) scans file
+  text repo-wide: enumerating the blocked states or string-matching state
+  words anywhere — tests included — trips it. Ask the owner
+  (is_blocked, Display) instead. Targeted crate gates don't run it;
+  cross-crate work does.
