@@ -755,3 +755,22 @@ terminal. The rule the fix encodes: run the native tool whenever one is on
 PATH, emit OSC 52 additionally when stdout is a terminal (it is what makes
 copy work on the near side of SSH), and never let either path's result gate
 the other. `src/cyclops-workspace/src/selection.rs`.
+
+## F45. A starved runner can invalidate a timing test's premise three ways, each observable (MEASURED)
+
+Measured on GitHub's shared runners during the v3 CI runs of 2026-08-06,
+where the macOS box ran the perf-contract binary at 3x its local time and
+one leg's tmux server died mid-parity. Three distinct premise failures,
+each with a signature the tests now check instead of a wall-clock guess:
+a burst meant to land inside one debounce window stretches past it (send
+duration says so); a coalescer starved past the flush window gets its
+armed refresh truncated by `Closed`, which drops pending work by design,
+so a tight burst draws zero rather than two; and a tmux server that never
+gets CPU during a client stall never observes the blocked reader, so no
+`%pause` exists to deliver while output keeps streaming afterward. The
+inverse signatures are the real regressions and still fail hard: two
+refreshes from a tight burst is arm-twice, and a confirmed-flowing flood
+that goes silent with no `%pause` seen is a notification lost on our
+side. `src/cyclops-workspace/tests/perf_contract.rs` carries the guards;
+%pause emission itself is tmux's behavior, a rig prerequisite like tmux
+being installed at all.
