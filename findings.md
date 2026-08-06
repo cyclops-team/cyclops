@@ -774,3 +774,16 @@ that goes silent with no `%pause` seen is a notification lost on our
 side. `src/cyclops-workspace/tests/perf_contract.rs` carries the guards;
 %pause emission itself is tmux's behavior, a rig prerequisite like tmux
 being installed at all.
+
+## F46. tmux master queues control-mode notifications; a stalled client never sees %pause (MEASURED)
+
+tmux commit 6db5175e (2026-08-03, upstream issue 5458) queues control-mode
+notifications rather than emitting them inside %begin/%end. Measured on
+the v3 tmux-head CI job the same week: a control client whose reader
+stalls against a flooding pane sees the flood confirmed flowing, then
+total silence after the stall, 0 bytes in a 500ms drain and no %pause in
+5s, because the queued notification waits for a flush the stalled,
+command-less client never provokes. Every released tmux (3.4, 3.6a, 3.7b)
+delivers %pause to the same rig. The flow-control test skips the silent
+case on "next-" builds citing this finding; the reader's 3.8 adaptation
+is tracked as its own task and flips that skip back to a hard fail.
