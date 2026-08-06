@@ -498,6 +498,7 @@ fn run(cli: &Cli) -> i32 {
     match &cli.cmd {
         None => {
             if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+                seed_themes_for_workspace();
                 ensure_daemon_for_workspace();
                 cyclops_workspace::run()
             } else {
@@ -505,6 +506,22 @@ fn run(cli: &Cli) -> i32 {
             }
         }
         Some(cmd) => run_cmd(cli, cmd),
+    }
+}
+
+/// Bare `cyclops` is a front door the same as `cyclops start`, so it seeds
+/// the shipped themes the same way (`themeseed::seed`) before the workspace
+/// opens. Without this, a home `start` never prepared plus a config or
+/// `$CYCLOPS_THEME` naming a shipped theme was a missing file, and the
+/// warning told the user to fix a file that was never there. Existing
+/// files are never overwritten, so running on every open costs nothing.
+///
+/// A problem is a note, not an exit, for the same reason as the daemon
+/// below: a home without themes still renders, in built-in colors.
+fn seed_themes_for_workspace() {
+    let home = cyclops_proto::cyclops_home();
+    for why in themeseed::seed(&home).problems {
+        eprintln!("{why}");
     }
 }
 
