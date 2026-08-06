@@ -1375,4 +1375,140 @@ mod tests {
         assert!(slots[0].focused);
         assert!(!slots[1].focused);
     }
+
+    // ------------------------------------------------- full-frame paint duration
+    //
+    // Review finding 5: `tests/baseline.rs` only ever timed the per-cell
+    // walk (`baseline_pane_runtime_feed_and_grid_throughput`'s
+    // `for_each_visible_cell` pass), never one whole frame through
+    // `paint_window` — borders, the focused pane's accent ring, divider
+    // hit-testing, and `paint_tab_bar` all run every frame too, around that
+    // walk. `paint_window` and `TabModel`/`RuntimeRegistry` are
+    // crate-private, so this lives here rather than in a `tests/` binary.
+
+    /// Mirrors `tests/baseline.rs`'s generator of the same name: a
+    /// synthetic byte stream mixing plain ASCII, SGR escapes, and wide
+    /// (CJK) characters, standing in for real agent-TUI output.
+    fn perf_synthetic_stream(min_len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(min_len + 256);
+        let mut i = 0u32;
+        while out.len() < min_len {
+            let line = match i % 4 {
+                0 => format!("plain line {i} of steady output text\r\n"),
+                1 => format!("\x1b[1;32mbold green line {i}\x1b[0m\r\n"),
+                2 => format!("\x1b[38;2;200;90;10m宽字符行 {i} 中文测试内容\x1b[0m\r\n"),
+                _ => format!("\x1b[4munderline {i}\x1b[24m plain tail\r\n"),
+            };
+            out.extend_from_slice(line.as_bytes());
+            i += 1;
+        }
+        out
+    }
+
+    /// `n` equal-size panes in one row, each `leaf_w x leaf_h`.
+    /// `parse_layout` ignores the checksum field and `resolve_layout`'s
+    /// empty `known` slice skips the known-pane guard (its own doc), so a
+    /// layout string built by hand here is as valid an input as one tmux
+    /// would have sent. The split node's own declared width is cosmetic:
+    /// `layout_geometry` recomputes every position from the leaves' sizes,
+    /// never from a parent's or a leaf's `x`/`y`.
+    fn perf_row_layout(n: usize, leaf_w: u16, leaf_h: u16) -> crate::layout::ResolvedLayout {
+        let node = if n == 1 {
+            parse_layout(&format!("0000,{leaf_w}x{leaf_h},0,0,0")).expect("one-leaf layout")
+        } else {
+            let leaves: Vec<String> = (0..n)
+                .map(|i| format!("{leaf_w}x{leaf_h},0,0,{i}"))
+                .collect();
+            let total_w = leaf_w * n as u16 + (n as u16 - 1) * PANE_GAPS.columns;
+            parse_layout(&format!(
+                "0000,{total_w}x{leaf_h},0,0{{{}}}",
+                leaves.join(",")
+            ))
+            .expect("row layout")
+        };
+        resolve_layout(&node, &[]).expect("resolve row layout")
+    }
+
+    fn perf_n_pane_tab(n: usize, leaf_w: u16, leaf_h: u16) -> TabModel {
+        TabModel {
+            window_id: "@0".to_string(),
+            name: "perf".to_string(),
+            layout: perf_row_layout(n, leaf_w, leaf_h),
+            active_pane: "%0".to_string(),
+            zoomed: false,
+        }
+    }
+
+    /// One runtime per pane, each fed enough mixed content to fill and
+    /// scroll past its visible grid at least once.
+    fn perf_runtimes_for(n: usize, cols: u16, rows: u16) -> RuntimeRegistry {
+        let mut registry = RuntimeRegistry::default();
+        let bytes = perf_synthetic_stream(8 * 1024);
+        for i in 0..n {
+            let mut rt = crate::runtime::PaneRuntime::new(cols, rows);
+            rt.feed(&bytes);
+            registry.insert(format!("%{i}"), rt);
+        }
+        registry
+    }
+
+    /// Paints full 1/4/8-pane frames (tab bar plus `paint_window`) into a
+    /// real Ratatui `Buffer` and records the per-frame median over enough
+    /// iterations to be stable, for a task that wants to prove frame
+    /// composition itself did not regress, not just the cell walk inside
+    /// it.
+    #[test]
+    fn full_frame_paint_duration_scales_with_pane_count() {
+        const COLS_PER_PANE: u16 = 30;
+        const PANE_ROWS: u16 = 48;
+        const ITERS: usize = 200;
+
+        for &n in &[1usize, 4, 8] {
+            let inner_w =
+                n as u16 * COLS_PER_PANE + (n.saturating_sub(1)) as u16 * PANE_GAPS.columns;
+            let canvas_w = inner_w + 2 * PANE_MARGIN;
+            let canvas_h = PANE_ROWS + 2 * PANE_MARGIN + 1; // +1: the tab bar row above the canvas
+            let tab = perf_n_pane_tab(n, COLS_PER_PANE, PANE_ROWS);
+            let runtimes = perf_runtimes_for(n, COLS_PER_PANE, PANE_ROWS);
+
+            let backend = TestBackend::new(canvas_w, canvas_h);
+            let mut term = Terminal::new(backend).unwrap();
+            let theme = Paint::for_test();
+            let paused = std::collections::HashSet::new();
+            let dec = DecorationSnapshot::default();
+
+            let mut durations = Vec::with_capacity(ITERS);
+            for _ in 0..ITERS {
+                let mut hits = HitMap::default();
+                let t = std::time::Instant::now();
+                term.draw(|f| {
+                    let area = f.area();
+                    let tab_area = Rect::new(area.x, area.y, area.width, 1);
+                    let canvas = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
+                    paint_tab_bar(
+                        std::slice::from_ref(&tab),
+                        0,
+                        tab_area,
+                        f.buffer_mut(),
+                        &theme,
+                        &mut hits,
+                        &dec,
+                    );
+                    let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
+                    paint_window(&tab, &runtimes, canvas, f.buffer_mut(), &theme, &mut ctx);
+                })
+                .unwrap();
+                durations.push(t.elapsed());
+            }
+            durations.sort();
+            let us = |d: std::time::Duration| d.as_secs_f64() * 1_000_000.0;
+            let p10_us = us(durations[durations.len() / 10]);
+            let median_us = us(durations[durations.len() / 2]);
+            let p90_us = us(durations[(durations.len() * 9) / 10]);
+            let max_us = us(durations[durations.len() - 1]);
+            println!(
+                "full_frame_paint {n}-pane: canvas={canvas_w}x{canvas_h} iters={ITERS} p10={p10_us:.1}us median={median_us:.1}us p90={p90_us:.1}us max={max_us:.1}us"
+            );
+        }
+    }
 }
