@@ -91,6 +91,11 @@ versions are unreleased until admin cuts a tag.
 - Event panel body rows printed in the terminal's own foreground on the
   panel's themed ground, unreadable on a light host; they wear chrome
   text now.
+- Typed text ran past the visible pane edge into columns nobody could
+  see: `window-size latest` let any attaching client out-size the
+  workspace's declared canvas (F48); `window-size smallest` is the
+  fixed point no client can steal, so panes never lay out wider than
+  what is painted.
 - Copying from scrollback grabbed the wrong rows: selection mapped
   screen coordinates straight to grid lines, which only agree when the
   pane sits at the live tail. Highlighted history now copies exactly
