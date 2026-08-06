@@ -206,6 +206,12 @@ impl PaneRuntime {
     /// sits at its own column and its spacer column reads as a space, so a
     /// caller's char index is always a column index. This is what word
     /// selection reads.
+    ///
+    /// Zero-width marks (`GridCell::zerowidth`) are deliberately excluded:
+    /// they carry no column of their own, and splicing them in would break
+    /// the one-char-per-column contract word selection's column math
+    /// depends on. `CellGrid::row_texts` is the grapheme-accurate view for
+    /// tests that need to see what a user sees.
     pub fn row_text(&self, row: u16) -> String {
         let mut out = vec![' '; self.cols as usize];
         self.for_each_visible_cell(|col, r, cell| {
@@ -258,6 +264,10 @@ fn cell_from_alac(cell: &AlacCell) -> GridCell {
     let flags = cell.flags;
     GridCell {
         ch: cell.c,
+        // Combining marks and variation selectors: the engine stores these
+        // in the cell's extra storage rather than a column of their own
+        // (`Cell::zerowidth`), so copying only `c` drops them.
+        zerowidth: cell.zerowidth().map(<[char]>::to_vec).unwrap_or_default(),
         wide_spacer: flags.contains(Flags::WIDE_CHAR_SPACER),
         attrs: CellAttrs {
             fg: map_color(cell.fg),

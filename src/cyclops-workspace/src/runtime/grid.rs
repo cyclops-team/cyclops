@@ -59,6 +59,13 @@ pub struct CellAttrs {
 pub struct GridCell {
     /// Primary grapheme. Empty means a blank cell.
     pub ch: char,
+    /// Combining marks and variation selectors (U+0301 COMBINING ACUTE
+    /// ACCENT, U+FE0F VARIATION SELECTOR-16) the engine attaches to `ch`
+    /// instead of giving them their own column. Almost every cell has none,
+    /// and an empty `Vec` never allocates, so the common case pays only the
+    /// 24 bytes of an empty `Vec` header; a renderer that paints `ch` alone
+    /// drops these silently.
+    pub zerowidth: Vec<char>,
     /// When `ch` is blank but the cell is wide, the spacer column holds
     /// the wide character's trailing half.
     pub wide_spacer: bool,
@@ -69,6 +76,7 @@ impl Default for GridCell {
     fn default() -> Self {
         Self {
             ch: ' ',
+            zerowidth: Vec::new(),
             wide_spacer: false,
             attrs: CellAttrs::default(),
         }
@@ -131,7 +139,11 @@ impl CellGrid {
         self.cells.get(idx)
     }
 
-    /// Row-major text, trailing spaces trimmed per row.
+    /// Row-major text, trailing spaces trimmed per row. Zero-width marks
+    /// follow their base character, so golden assertions read the same
+    /// grapheme a user sees on screen — unlike `PaneRuntime::row_text`,
+    /// this is not one `char` per column and must not be used for column
+    /// arithmetic.
     pub fn row_texts(&self) -> Vec<String> {
         let mut out = Vec::with_capacity(self.rows as usize);
         for row in 0..self.rows {
@@ -144,6 +156,7 @@ impl CellGrid {
                         } else {
                             cell.ch
                         });
+                        line.extend(cell.zerowidth.iter());
                     }
                 }
             }

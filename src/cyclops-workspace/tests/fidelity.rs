@@ -81,10 +81,23 @@ fn a_combining_mark_stays_with_its_base_character() {
     // e + U+0301 COMBINING ACUTE ACCENT occupies one cell.
     let grid = render("e\u{301}x".as_bytes(), 6, 1);
 
+    let base = grid.cell(0, 0).unwrap();
+    assert_eq!(base.ch, 'e', "the base character must still own the column");
+    assert_eq!(
+        base.zerowidth,
+        vec!['\u{301}'],
+        "the accent must be kept, not dropped, or an accented letter \
+         renders as the bare base letter"
+    );
     assert_eq!(
         grid.cell(1, 0).unwrap().ch,
         'x',
         "a combining mark must not consume a column of its own"
+    );
+    assert_eq!(
+        grid.row_texts()[0],
+        "e\u{301}x",
+        "the row text a golden test reads must carry the accent too"
     );
 }
 
@@ -108,9 +121,17 @@ fn an_emoji_occupies_two_columns() {
 fn a_variation_selector_does_not_widen_a_narrow_glyph() {
     let grid = render("⚠\u{fe0f}x".as_bytes(), 6, 1);
 
-    assert_eq!(grid.cell(0, 0).unwrap().ch, '⚠');
+    let base = grid.cell(0, 0).unwrap();
+    assert_eq!(base.ch, '⚠');
+    assert_eq!(
+        base.zerowidth,
+        vec!['\u{fe0f}'],
+        "the selector must be kept, not dropped, or the glyph loses its \
+         emoji-presentation request"
+    );
     assert!(!grid.cell(1, 0).unwrap().wide_spacer);
     assert_eq!(grid.cell(1, 0).unwrap().ch, 'x');
+    assert_eq!(grid.row_texts()[0], "⚠\u{fe0f}x");
 }
 
 // ------------------------------------------------------------------- styling

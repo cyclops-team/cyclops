@@ -547,19 +547,26 @@ fn paint_pane_cells(
         if col >= area.width || row >= area.height {
             return;
         }
-        let ch = if cell.wide_spacer || cell.ch == '\0' {
-            ' '
-        } else {
-            cell.ch
-        };
         let style = match range {
             Some((from, to)) if in_selection(col, row, from, to) => highlight,
             _ => super::cell_style(&cell, base),
         };
-        if let Some(dst) = buf.cell_mut((area.x + col, area.y + row)) {
-            dst.set_char(ch);
-            dst.set_style(style);
+        let Some(dst) = buf.cell_mut((area.x + col, area.y + row)) else {
+            return;
+        };
+        if cell.wide_spacer || cell.ch == '\0' {
+            dst.set_char(' ');
+        } else if cell.zerowidth.is_empty() {
+            dst.set_char(cell.ch);
+        } else {
+            // A combining mark or variation selector shares the base
+            // char's column (`GridCell::zerowidth`); `set_char` only takes
+            // one scalar, so the full grapheme needs `set_symbol`.
+            let mut grapheme = String::from(cell.ch);
+            grapheme.extend(cell.zerowidth.iter());
+            dst.set_symbol(&grapheme);
         }
+        dst.set_style(style);
     });
     // The grid can be smaller than the slot during a resize transient, and
     // every slot cell must repaint over the previous frame.
@@ -666,6 +673,97 @@ mod tests {
         let buf = term.backend().buffer();
         assert_eq!(buf[(0, 0)].symbol(), "X");
         assert_eq!(buf[(1, 0)].symbol(), " ", "blank cells repaint as spaces");
+    }
+
+    // ------------------------------------------------- buffer-boundary fidelity
+    //
+    // `corpus.rs` and `fidelity.rs` prove the engine-to-`GridCell` bridge
+    // keeps what the engine parsed. These feed the same bytes through a
+    // real `PaneRuntime` and `paint_pane_cells` — the actual render path —
+    // and read the Ratatui buffer a frame is drawn from, because a fix in
+    // `GridCell` that never reaches `Buffer::cell.symbol()` fixes nothing a
+    // user sees.
+
+    fn paint_bytes(bytes: &[u8], cols: u16, rows: u16) -> Buffer {
+        let mut rt = crate::runtime::PaneRuntime::new(cols, rows);
+        rt.feed(bytes);
+        let backend = TestBackend::new(cols, rows);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+        term.draw(|f| {
+            paint_pane_cells(
+                &rt,
+                None,
+                f.area(),
+                f.buffer_mut(),
+                theme::pane_cell(&theme),
+                theme::selection_highlight(&theme),
+            );
+        })
+        .unwrap();
+        term.backend().buffer().clone()
+    }
+
+    #[test]
+    fn a_combining_mark_reaches_the_buffer_with_its_base_character() {
+        let buf = paint_bytes("e\u{301}x".as_bytes(), 6, 1);
+        assert_eq!(
+            buf[(0, 0)].symbol(),
+            "e\u{301}",
+            "the accent must paint as part of e's cell instead of vanishing"
+        );
+        assert_eq!(buf[(1, 0)].symbol(), "x");
+    }
+
+    #[test]
+    fn a_variation_selector_stays_in_the_symbol_and_the_glyph_stays_narrow() {
+        let buf = paint_bytes("⚠\u{fe0f}x".as_bytes(), 6, 1);
+        assert_eq!(buf[(0, 0)].symbol(), "⚠\u{fe0f}");
+        assert_eq!(
+            buf[(1, 0)].symbol(),
+            "x",
+            "VS16 must not widen the column the engine sized narrow \
+             (fidelity.rs: a_variation_selector_does_not_widen_a_narrow_glyph)"
+        );
+    }
+
+    #[test]
+    fn a_wide_emoji_paints_a_spacer_cell_after_it() {
+        let buf = paint_bytes("😀x".as_bytes(), 6, 1);
+        assert_eq!(buf[(0, 0)].symbol(), "😀");
+        assert_eq!(buf[(1, 0)].symbol(), " ", "the spacer column stays blank");
+        assert_eq!(buf[(2, 0)].symbol(), "x");
+    }
+
+    #[test]
+    fn every_underline_variant_reaches_the_buffer_as_the_one_modifier_ratatui_has() {
+        // Ratatui's Modifier cannot say double/curl/dotted/dashed, so every
+        // engine style narrows to UNDERLINED at this boundary; the five
+        // styles are still told apart in GridCell (grid.rs's `Underline`
+        // doc) and proven not to flatten early by fidelity.rs's
+        // `every_underline_style_keeps_its_own_identity`.
+        for bytes in [
+            b"\x1b[4mU\x1b[0m".as_slice(),
+            b"\x1b[4:2mU\x1b[0m".as_slice(),
+            b"\x1b[4:3mU\x1b[0m".as_slice(),
+            b"\x1b[4:4mU\x1b[0m".as_slice(),
+            b"\x1b[4:5mU\x1b[0m".as_slice(),
+        ] {
+            let buf = paint_bytes(bytes, 4, 1);
+            assert!(
+                buf[(0, 0)].modifier.contains(Modifier::UNDERLINED),
+                "{bytes:?} must reach the buffer underlined"
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_and_strikeout_reach_the_buffer_as_their_own_modifiers() {
+        let buf = paint_bytes(b"\x1b[8mH\x1b[0m", 4, 1);
+        assert!(buf[(0, 0)].modifier.contains(Modifier::HIDDEN));
+
+        let buf = paint_bytes(b"\x1b[9mS\x1b[0m", 4, 1);
+        assert!(buf[(0, 0)].modifier.contains(Modifier::CROSSED_OUT));
     }
 
     #[test]
