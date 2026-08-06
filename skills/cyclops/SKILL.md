@@ -28,8 +28,9 @@ needs to run `cyclops start` in that tmux session before any of this
 works. That is an operator action, not something you should route around
 (see Safety rules below).
 
-Find your own name (the row whose pane matches `$TMUX_PANE`, if you are
-inside tmux) with `cyclops status` or `cyclops list`. If you are running
+Find your own name with `cyclops list --json`: the entry whose `pane_id`
+matches `$TMUX_PANE`, if you are inside tmux. The plain roster prints
+labels, not pane ids. If you are running
 without a name, `cyclops name <label> --self` registers you using the pane
 you are sitting in — the form to use for yourself, since it needs no pane
 id lookup. Full detail: [../../docs/guides/panes.md](../../docs/guides/panes.md).
@@ -63,6 +64,9 @@ $ cyclops status
 
 A closed eye (`‿`) means nothing needs a human. An open one prints a
 `waiting on you` block naming what does.
+
+`cyclops read <agent>` prints the pane's text: the visible screen by
+default, the scrollback tail with `--source recent`, capped by `--lines N`.
 
 `cyclops read <agent> --source detection` is the diagnostic view: which
 sensor decided the state, and which rule fired.
