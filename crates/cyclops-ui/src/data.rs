@@ -11,6 +11,12 @@
 //! gone (`pane-removed`). Re-asking `status` on an interval would answer
 //! the same question, and it is the answer this file is not allowed to
 //! give: see `cyclops_proto::attention`, "what may feed the register".
+//!
+//! This is `cyclops watch`'s own transport: a Unix socket and an NDJSON
+//! ledger directory. The ordering discipline that reconciles what it
+//! fetches — backfill tail, then the seed, then the live backlog — is
+//! backend-neutral and lives in `stream.rs` ([`crate::stream::Intake`]) so
+//! a caller with a different transport gets the same guarantee.
 
 use std::path::Path;
 
@@ -20,9 +26,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::app::StatusSeed;
-use crate::entry::Entry;
 use crate::input::Key;
+use crate::stream::Entry;
+use crate::stream::StatusSeed;
 
 /// Everything the event loop can receive.
 pub enum UiMsg {
@@ -237,97 +243,6 @@ pub fn read_backfill(
     (tail, max_seq)
 }
 
-/// Startup ordering: live entries buffer until the backfill lands, then
-/// flush behind it, with ledger-backed duplicates dropped by seq. One
-/// watched session dedupes exactly; with several, seq is ambiguous across
-/// files and the rare startup-window duplicate is accepted (the ledger
-/// itself never duplicates).
-///
-/// The status seed waits for the backfill too, and lands between the two
-/// groups. All three carry a different age and the order is the whole
-/// point: the replayed tail is history, the seed is the daemon's answer
-/// about now, and a live entry that queued during startup is newer than
-/// either. Applying the seed last let a fold taken before a transition
-/// re-open an item that transition had just closed.
-pub struct Intake {
-    backfilled: bool,
-    pending: Vec<Entry>,
-    pending_status: Option<Box<StatusSeed>>,
-    max_seq: Option<u64>,
-}
-
-impl Default for Intake {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Intake {
-    pub fn new() -> Intake {
-        Intake {
-            backfilled: false,
-            pending: Vec::new(),
-            pending_status: None,
-            max_seq: None,
-        }
-    }
-
-    /// True once the backfill has landed and live entries flow through.
-    pub fn is_backfilled(&self) -> bool {
-        self.backfilled
-    }
-
-    /// A live entry: ready to show now, or empty while buffering.
-    pub fn entry(&mut self, e: Entry) -> Vec<Entry> {
-        if !self.backfilled {
-            self.pending.push(e);
-            return Vec::new();
-        }
-        if self.dup(&e) {
-            Vec::new()
-        } else {
-            vec![e]
-        }
-    }
-
-    /// The status seed: ready to apply now, or held until the backfill
-    /// lands so it reconciles over the replayed tail rather than under it.
-    pub fn status(&mut self, seed: Box<StatusSeed>) -> Option<Box<StatusSeed>> {
-        if self.backfilled {
-            return Some(seed);
-        }
-        self.pending_status = Some(seed);
-        None
-    }
-
-    /// The backfill arrived: the three groups, in the order they must be
-    /// applied.
-    pub fn backfill(&mut self, entries: Vec<Entry>, max_seq: Option<u64>) -> Backfilled {
-        self.backfilled = true;
-        self.max_seq = max_seq;
-        let pending = std::mem::take(&mut self.pending);
-        Backfilled {
-            replayed: entries,
-            seed: self.pending_status.take(),
-            live: pending.into_iter().filter(|e| !self.dup(e)).collect(),
-        }
-    }
-
-    fn dup(&self, e: &Entry) -> bool {
-        matches!((e.seq, self.max_seq), (Some(s), Some(m)) if s <= m)
-    }
-}
-
-/// What the startup window produced, oldest claim first. Apply in field
-/// order: `replayed` is history and moves nothing but the screen, `seed`
-/// is the daemon's snapshot and replaces the register, `live` are the
-/// transitions that happened while the two were loading.
-pub struct Backfilled {
-    pub replayed: Vec<Entry>,
-    pub seed: Option<Box<StatusSeed>>,
-    pub live: Vec<Entry>,
-}
-
 /// Connection errors in the CLI's words: what happened, next step.
 ///
 /// The sentence is cyclops_proto's, not a copy of it. A copy lived here
@@ -345,70 +260,7 @@ fn connect_words(e: std::io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entry::EntryKind;
-
-    fn entry(ts: u64, seq: Option<u64>) -> Entry {
-        Entry {
-            uid: 0,
-            ts,
-            seq,
-            id: None,
-            kind: EntryKind::Other {
-                event: "x".into(),
-                detail: None,
-            },
-        }
-    }
-
-    #[test]
-    fn intake_buffers_until_backfill_then_dedupes_by_seq() {
-        let mut i = Intake::new();
-        // Live entries before the backfill wait.
-        assert!(i.entry(entry(5, Some(3))).is_empty());
-        assert!(i.entry(entry(6, Some(4))).is_empty());
-        assert!(i.entry(entry(7, None)).is_empty());
-        // Backfill covers seq 1..=3: the seq-3 pending entry is a dupe,
-        // seq 4 and the seq-less one flush behind the backfill.
-        let landed = i.backfill(vec![entry(1, Some(1)), entry(3, Some(3))], Some(3));
-        assert!(landed.seed.is_none(), "no status seed was waiting");
-        let replayed: Vec<Option<u64>> = landed.replayed.iter().map(|e| e.seq).collect();
-        assert_eq!(replayed, vec![Some(1), Some(3)]);
-        let live: Vec<Option<u64>> = landed.live.iter().map(|e| e.seq).collect();
-        assert_eq!(live, vec![Some(4), None]);
-        // After the merge, stale live copies still drop; fresh ones pass.
-        assert!(i.entry(entry(8, Some(2))).is_empty());
-        assert_eq!(i.entry(entry(9, Some(5))).len(), 1);
-    }
-
-    #[test]
-    fn intake_without_a_cursor_keeps_everything() {
-        let mut i = Intake::new();
-        assert!(i.entry(entry(5, Some(3))).is_empty());
-        let landed = i.backfill(vec![entry(1, Some(9))], None);
-        assert_eq!(landed.replayed.len(), 1);
-        assert_eq!(landed.live.len(), 1, "no cursor means no dedupe");
-    }
-
-    /// The seed lands between the replayed tail and the live entries that
-    /// queued behind it. Under the tail, a ledger line older by
-    /// construction would overwrite the daemon's answer about now; over
-    /// the live entries, a fold taken before a transition would re-open
-    /// the item that transition just closed.
-    #[test]
-    fn the_status_seed_lands_between_history_and_the_live_backlog() {
-        let mut i = Intake::new();
-        assert!(i.entry(entry(9, None)).is_empty());
-        let seed = Box::new(crate::app::StatusSeed::default());
-        assert!(i.status(seed).is_none(), "the seed jumped the backfill");
-        let landed = i.backfill(vec![entry(1, None)], None);
-        assert_eq!(landed.replayed.len(), 1, "history first");
-        assert!(landed.seed.is_some(), "the seed never came back");
-        assert_eq!(landed.live.len(), 1, "the live backlog goes last");
-        // Once the backfill has landed, a late seed applies straight away.
-        assert!(i
-            .status(Box::new(crate::app::StatusSeed::default()))
-            .is_some());
-    }
+    use crate::stream::EntryKind;
 
     fn write_session(ledger: &Path, session: &str, subjects: &[&str]) {
         std::fs::create_dir_all(ledger).unwrap();

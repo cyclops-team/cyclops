@@ -22,6 +22,14 @@
 //! holding a copy, because it held a copy once and the two drifted while
 //! both were green.
 //!
+//! [`Record`] is the backend-neutral event-stream model: entry
+//! normalization, backfill/live ordering ([`Intake`]), resolution rows,
+//! the calm/firehose decision, and stable row identity — everything a
+//! renderer needs and nothing about how one paints. `cyclops watch`
+//! (app.rs, frame.rs, entry.rs, plain.rs) is its first renderer; a
+//! workspace event panel reading the same daemon answer through the same
+//! model is meant to be the second.
+//!
 //! ## What it does not own
 //!
 //! - What needs a human. The register and the rule are
@@ -40,15 +48,18 @@ mod frame;
 pub mod grid;
 mod input;
 mod plain;
+mod stream;
 mod term;
 mod theme;
 
-pub use app::{App, Command, Density, RosterRow, RosterSeed, RowTarget, StatusSeed, View};
+pub use app::{App, Command, Density, RosterRow, RowTarget, View};
 pub use cyclops_proto::{Attention, AttentionItem, Eye, PaneSnapshot};
-pub use data::{read_backfill, Backfilled, Intake, UiMsg};
-pub use entry::{Entry, EntryKind, Filter, PingDelivery};
+pub use data::{read_backfill, UiMsg};
 pub use frame::build;
 pub use input::Key;
+pub use stream::{
+    Backfilled, Entry, EntryKind, Filter, Intake, PingDelivery, Record, RosterSeed, StatusSeed,
+};
 pub use theme::Theme;
 
 use std::io::IsTerminal;
@@ -296,7 +307,7 @@ fn handle(
 
 /// Apply the startup reconciliation and ingest the lines it wrote for
 /// items the replayed tail does not already carry.
-fn seed_status(app: &mut App, seed: app::StatusSeed) {
+fn seed_status(app: &mut App, seed: stream::StatusSeed) {
     for e in app.seed_status(seed) {
         app.replay(e);
     }

@@ -16,8 +16,8 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::app::{App, View};
-use crate::data::{self, Intake, UiMsg};
-use crate::entry::Entry;
+use crate::data::{self, UiMsg};
+use crate::stream::{Entry, Intake};
 use crate::theme::Theme;
 use crate::UiOptions;
 
@@ -87,7 +87,7 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
 /// Apply the startup reconciliation, printing the lines it wrote for items
 /// the replayed tail does not already carry. A count with no line under it
 /// is exactly what plain mode cannot afford: it has no header to point at.
-fn seed_status(app: &mut App, seed: crate::app::StatusSeed, out: &mut impl Write) {
+fn seed_status(app: &mut App, seed: crate::stream::StatusSeed, out: &mut impl Write) {
     for e in app.seed_status(seed) {
         replay(app, e, out);
     }
@@ -162,7 +162,7 @@ fn eye_line(app: &App, printed: &mut Option<Vec<String>>, out: &mut impl Write) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entry::{EntryKind, Filter};
+    use crate::stream::{EntryKind, Filter};
     use cyclops_proto::AgentState;
 
     fn state(target: &str, s: AgentState) -> Entry {
@@ -262,7 +262,7 @@ mod tests {
         let mut printed = None;
         seed_status(
             &mut app,
-            crate::app::StatusSeed {
+            crate::stream::StatusSeed {
                 watched: vec!["main".into()],
                 panes: Vec::new(),
                 roster: Vec::new(),

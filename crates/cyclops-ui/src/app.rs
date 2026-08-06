@@ -1,28 +1,22 @@
-//! UI state: the entry ring, views, filters, selection, density, and the
-//! eye. Pure state transitions here; no IO, no terminal, so every behavior
-//! is unit-testable.
+//! UI state: views, filters, selection, density, the sidebar roster, and
+//! the eye animation. Pure state transitions here; no IO, no terminal, so
+//! every behavior is unit-testable.
 //!
-//! What needs a human is NOT decided here. The register and the rule live
-//! in `cyclops_proto::attention`; this file only feeds it the two things
-//! it accepts (the daemon's snapshot, and live events) and asks it for the
-//! count. Which is why every entry arrives through a method that names its
-//! source: [`App::replay`] for history, [`App::live`] for the push.
+//! The record itself — the entry ring, the attention register, and the
+//! calm/firehose decision — is not this file's. [`crate::stream::Record`]
+//! owns it, backend-neutral, so a future workspace panel reads the same
+//! ordering and the same judgement. `App` holds one and is otherwise this
+//! renderer's own state: the sidebar roster and the focus-jump map (both
+//! navigation, not the record), and the key handling that turns keyboard
+//! and mouse input into that state moving.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 
-use cyclops_proto::{
-    Attention, AttentionItem, Clearance, Eye, Half, NotifyLevel, OpenDelivery, PaneSnapshot,
-    Resolved,
-};
+use cyclops_proto::{Attention, AttentionItem, Eye};
 
-use crate::entry::{Entry, EntryKind, Filter, PingDelivery};
-use crate::grid;
 use crate::input::Key;
+use crate::stream::{Entry, EntryKind, Filter, Record, StatusSeed};
 use crate::theme::Theme;
-
-/// Ring capacity. The stream stays fluid past this because rendering is
-/// windowed; older entries stay in the ledger, which is the record anyway.
-pub const RING_CAP: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -43,43 +37,6 @@ impl View {
 pub enum Density {
     Comfortable,
     Compact,
-}
-
-/// The one-shot startup reconciliation: which sessions the daemon watches,
-/// where every pane stands right now, and every delivery it still counts
-/// as needing a human.
-///
-/// This answer is the whole count. `--backfill` replays lines onto the
-/// screen and feeds the register nothing, so no backfill value can change
-/// what the eye says (`cyclops_proto::attention`).
-#[derive(Debug, Clone, Default)]
-pub struct StatusSeed {
-    /// Sessions the daemon watches, in its own words. The backfill reads
-    /// these ledgers and no others, so both halves agree on which sessions
-    /// exist.
-    pub watched: Vec<String>,
-    /// Every pane the answer listed, in the register's own shape: the two
-    /// names travel to `snapshot_agents` under their field names, so a
-    /// transposition of label and pane id cannot compile.
-    pub panes: Vec<PaneSnapshot>,
-    pub open: Vec<OpenDelivery>,
-    /// The same panes again, in the roster's richer shape. Separate from
-    /// `panes` because the register's PaneSnapshot is the attention
-    /// rule's input and grows for nobody else's convenience.
-    pub roster: Vec<RosterSeed>,
-}
-
-/// One pane as the roster wants it seeded: everything the sidebar shows.
-#[derive(Debug, Clone)]
-pub struct RosterSeed {
-    pub pane_id: String,
-    pub name: String,
-    pub state: cyclops_proto::AgentState,
-    /// Which CLI the daemon detects in the pane, e.g. "claude".
-    pub manifest: Option<String>,
-    /// How long the pane had been in `state` when the answer was taken,
-    /// by the daemon's clock. None from a daemon that predates the field.
-    pub state_ms: Option<u64>,
 }
 
 /// One agent row in the sidebar: who, where they stand, since when.
@@ -135,40 +92,6 @@ pub enum RowTarget {
     Agent(String),
     /// A stream entry row: click selects it.
     Entry(u64),
-}
-
-impl StatusSeed {
-    /// Normalize one `status` answer. The pane's display name resolves
-    /// through `PaneStatus::display_name`, the same call `cyclops status`
-    /// makes, so one pane never wears two names across surfaces.
-    pub fn from_status(res: &cyclops_proto::StatusResult) -> StatusSeed {
-        StatusSeed {
-            watched: res.sessions.iter().map(|s| s.name.clone()).collect(),
-            panes: res
-                .sessions
-                .iter()
-                .flat_map(|s| &s.panes)
-                .map(|p| PaneSnapshot {
-                    pane_id: p.pane_id.clone(),
-                    name: p.display_name().to_string(),
-                    state: p.state,
-                })
-                .collect(),
-            open: res.open_deliveries.clone(),
-            roster: res
-                .sessions
-                .iter()
-                .flat_map(|s| &s.panes)
-                .map(|p| RosterSeed {
-                    pane_id: p.pane_id.clone(),
-                    name: p.display_name().to_string(),
-                    state: p.state,
-                    manifest: p.manifest.clone(),
-                    state_ms: p.state_ms,
-                })
-                .collect(),
-        }
-    }
 }
 
 /// An open filter input line: which filter, and the buffer so far.
@@ -258,9 +181,10 @@ pub struct App {
     /// Display columns the sidebar occupied in the last frame; 0 when it
     /// was not drawn.
     pub sidebar_w: usize,
-    entries: VecDeque<Entry>,
-    next_uid: u64,
-    attention: Attention,
+    /// The record: the entry ring, the attention register, stable uids.
+    /// Backend-neutral (`crate::stream`); every other field on this struct
+    /// is this renderer's own.
+    record: Record,
     eye: Eye,
     /// Agent label -> pane id, harvested from status and events only
     /// (zero polling). Backs the focus jump.
@@ -285,12 +209,10 @@ impl App {
             top: None,
             notice: None,
             conn_lost: false,
-            entries: VecDeque::new(),
             show_roster: true,
             row_targets: Vec::new(),
             sidebar_w: 0,
-            next_uid: 1,
-            attention: Attention::default(),
+            record: Record::new(),
             eye: Eye::Closed,
             panes: HashMap::new(),
             roster: BTreeMap::new(),
@@ -308,24 +230,24 @@ impl App {
     }
 
     pub fn entries(&self) -> impl Iterator<Item = &Entry> {
-        self.entries.iter()
+        self.record.entries()
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.record.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.record.is_empty()
     }
 
     /// The register itself, for surfaces that need more than the count.
     pub fn attention(&self) -> &Attention {
-        &self.attention
+        self.record.attention()
     }
 
     pub fn attention_count(&self) -> usize {
-        self.attention.count()
+        self.record.attention_count()
     }
 
     /// The eye as currently drawn (it may still be mid-tick).
@@ -335,7 +257,7 @@ impl App {
 
     /// Where the eye is headed given current attention.
     pub fn eye_target(&self) -> Eye {
-        self.attention.eye()
+        self.record.attention().eye()
     }
 
     /// Advance the eye one step toward its target. True means one more
@@ -350,44 +272,30 @@ impl App {
     }
 
     /// One line replayed from the record: it goes on the screen and
-    /// nowhere else.
-    ///
-    /// History cannot answer "what needs a human right now". Letting it
-    /// try is exactly what made `--backfill` decide the count: the same
-    /// rig read at 200 lines and at 400 gave a closed eye and an open one.
-    /// The daemon's snapshot and the live push own the register.
+    /// nowhere else ([`crate::stream::Record::replay`]).
     pub fn replay(&mut self, e: Entry) {
-        self.ingest(e);
+        self.observe_pane_name(&e);
+        self.record.replay(e);
     }
 
-    /// One live event from the daemon: it goes on the screen AND moves the
-    /// register, because the event is the pane's or the delivery's own
-    /// next transition.
+    /// One live event from the daemon: it goes on the record AND moves the
+    /// register ([`crate::stream::Record::live`]). This renderer's own
+    /// navigation state — the sidebar row and the focus-jump map — moves
+    /// on the same live edge, and only live: a replayed line is old news
+    /// and must not restart anyone's clock.
     ///
     /// Returns the clearance line when the transition ended something that
-    /// needed a human (`cyclops_proto::attention`, rule 3). It is already
-    /// on the stream; the caller gets it because `--plain` prints line by
-    /// line and has no frame to reconcile (plain.rs), so a line it never
-    /// sees is a line it never prints.
+    /// needed a human. It is already on the record; the caller gets it
+    /// because `--plain` prints line by line and has no frame to reconcile
+    /// (plain.rs), so a line it never sees is a line it never prints.
     pub fn live(&mut self, e: Entry) -> Option<Entry> {
-        let resolved = match &e.kind {
+        self.observe_pane_name(&e);
+        match &e.kind {
             EntryKind::State {
                 target,
-                pane_id,
+                pane_id: Some(p),
                 state,
-            } => {
-                // The sidebar moves on the same live edge the register
-                // does, and only live: a replayed line is old news and
-                // must not restart anyone's clock.
-                if let Some(p) = pane_id {
-                    self.roster_observe(p, target, *state);
-                }
-                self.attention
-                    .observe_agent(target, pane_id.as_deref(), *state)
-            }
-            EntryKind::Delivery { to, state, .. } => {
-                self.attention.observe_delivery(to, e.id.as_deref(), *state)
-            }
+            } => self.roster_observe(p, target, *state),
             // A pane leaving the table is its last transition. The jump
             // map and the sidebar row go with it: "no pane known for
             // reviewer" is honest, and a jump to a pane id tmux has
@@ -395,19 +303,25 @@ impl App {
             EntryKind::PaneGone { pane_id } => {
                 self.panes.retain(|_, p| p != pane_id);
                 self.roster.remove(pane_id);
-                self.attention.forget_agent(pane_id)
             }
-            _ => None,
-        };
-        let (ts, id) = (e.ts, e.id.clone());
-        self.ingest(e);
-        // Nothing ended: the transition is on the stream and that is all
-        // there is to say about it.
-        let resolved = resolved?;
-        self.ingest(Entry::cleared(ts, id, resolved));
-        // Copied back off the ring so the caller's entry carries the uid
-        // the ring gave it, not a placeholder.
-        self.entries.back().cloned()
+            _ => {}
+        }
+        self.record.live(e)
+    }
+
+    /// Harvest the label -> pane map from a State entry, replayed or live
+    /// alike: a replayed line may still be the freshest naming the jump
+    /// has. The seed lands after the replayed tail and live events after
+    /// the seed, so the newest naming always wins.
+    fn observe_pane_name(&mut self, e: &Entry) {
+        if let EntryKind::State {
+            target,
+            pane_id: Some(p),
+            ..
+        } = &e.kind
+        {
+            self.panes.insert(target.clone(), p.clone());
+        }
     }
 
     /// One live state event moving a sidebar row.
@@ -441,54 +355,24 @@ impl App {
         }
     }
 
-    /// Assign a uid, harvest the label -> pane map, ring the buffer.
-    /// Selection anchors survive eviction because they hold uids, not
-    /// indices.
+    /// Startup reconciliation from the daemon's one status answer.
     ///
-    /// The pane map is navigation, not counting: a replayed line may name
-    /// a pane the jump can use. The seed lands after the replayed tail and
-    /// live events after the seed, so the newest naming always wins.
-    fn ingest(&mut self, mut e: Entry) {
-        e.uid = self.next_uid;
-        self.next_uid += 1;
-        if let EntryKind::State {
-            target,
-            pane_id: Some(p),
-            ..
-        } = &e.kind
-        {
-            self.panes.insert(target.clone(), p.clone());
-        }
-        if self.entries.len() == RING_CAP {
-            self.entries.pop_front();
-        }
-        self.entries.push_back(e);
-    }
-
-    /// Startup reconciliation from the daemon's one status answer: the
-    /// label -> pane map, where every pane stands now, and every delivery
-    /// still waiting on a human.
+    /// This renderer's own navigation state first: the sidebar roster (1)
+    /// and the focus-jump map (2) are seeded fresh from the same answer,
+    /// for the same reason the register is replaced whole rather than
+    /// merged (anything the answer does not list is gone). Replacing the
+    /// register and writing the lines and clearances every count on
+    /// screen needs behind it (3) is [`crate::stream::Record::seed`]'s job,
+    /// so a workspace panel reading the same daemon answer reconciles
+    /// identically.
     ///
-    /// The answer REPLACES the register. It is a snapshot of now, folded
-    /// from the whole record on the delivery side and read off the live
-    /// pane table on the agent side, so anything it does not list is
-    /// resolved or gone. Merging into it left a blocked pane that later
-    /// disappeared counted for the life of the process, with no event able
-    /// to clear it.
-    ///
-    /// Returns the entries the caller should ingest, in two directions.
-    /// One line for each seeded item the loaded stream does not already
-    /// account for, so no number the header shows is left without a line
-    /// behind it; and one clearance for each alarm the loaded stream DOES
-    /// show that the answer no longer counts, so no line saying a human is
-    /// needed is left without the news that it ended. The caller pushes
-    /// them, because in `--plain` they must also print.
+    /// Returns the entries the caller should ingest (via [`App::replay`]),
+    /// because in `--plain` they must also print.
     ///
     /// Event-driven only: called once at startup and never on a timer.
-    /// After that the register moves on live events alone, and a pane
-    /// leaving the table is one of them ([`App::live`]).
+    /// After that the register moves on live events alone ([`App::live`]).
     pub fn seed_status(&mut self, seed: StatusSeed) -> Vec<Entry> {
-        // 0. The sidebar's roster is the answer's pane list, replaced
+        // 1. The sidebar's roster is the answer's pane list, replaced
         //    whole for the same reason the register is: anything the
         //    answer does not list is gone. The daemon's own elapsed
         //    anchors each clock; from here live events move it.
@@ -515,156 +399,13 @@ impl App {
                 )
             })
             .collect();
-        // 1. Replace both halves of the register with the answer.
-        self.attention.snapshot_agents(seed.panes.iter().cloned());
-        self.attention.snapshot_deliveries(&seed.open);
         // 2. Refresh the jump map, which outlives the roster: a label the
         //    answer still names points at the pane the answer named.
         for p in &seed.panes {
             self.panes.insert(p.name.clone(), p.pane_id.clone());
         }
-        // 3. Write a line for every counted item the replayed tail does
-        //    not already carry. The register says WHICH items those are,
-        //    so the header and the stream cannot disagree about the list;
-        //    the answer supplies when each one happened.
-        //
-        //    Both lookups are indexed once, not searched per item: the
-        //    backlog is the item count and a quota weekend leaves hundreds
-        //    of parked deliveries, so a scan per item costs items squared.
-        let items = self.attention.items();
-        let newest = self.newest_line_per_item(&items);
-        let open: HashMap<(&str, &str), &OpenDelivery> = seed
-            .open
-            .iter()
-            .map(|d| ((d.to.as_str(), d.id.as_str()), d))
-            .collect();
-        let mut out = Vec::new();
-        for item in &items {
-            if newest
-                .get(&item.identity())
-                .is_some_and(|e| says_the_same(e, item))
-            {
-                continue; // the stream already says this
-            }
-            out.push(match item {
-                AttentionItem::Agent {
-                    pane_id,
-                    name,
-                    state,
-                } => Entry {
-                    uid: 0,
-                    // No transition time travels with a status answer, so
-                    // the line is stamped when the reading was taken. It
-                    // says where the pane stands now, which is what status
-                    // is.
-                    ts: crate::data::now_ms(),
-                    seq: None,
-                    id: None,
-                    kind: EntryKind::State {
-                        target: name.clone(),
-                        pane_id: Some(pane_id.clone()),
-                        state: *state,
-                    },
-                },
-                AttentionItem::Delivery { to, id, state } => {
-                    let record = open.get(&(to.as_str(), id.as_str())).copied();
-                    Entry {
-                        uid: 0,
-                        // The record's own transition time: this line can
-                        // be hours older than the replayed tail above it,
-                        // and saying so is the point of showing it at all.
-                        ts: record.map_or_else(crate::data::now_ms, |d| d.ts),
-                        seq: None,
-                        id: Some(id.clone()),
-                        kind: EntryKind::Delivery {
-                            to: to.clone(),
-                            state: *state,
-                            cause: record.and_then(|d| d.cause.clone()),
-                        },
-                    }
-                }
-            });
-        }
-        // 4. And the mirror of step 3. The replayed tail can hold an alarm
-        //    whose item the answer does not count: a park requeued while
-        //    the UI was down, a pane that unblocked or went away. Its line
-        //    is on the screen saying a human is needed, and the transition
-        //    that ended it is either older than the tail or was never a
-        //    line the calm view takes. The register says which alarms
-        //    those are and how each one ended; the clearance is what puts
-        //    that under the row the reader is looking at.
-        for (item, how) in self.alarms_the_answer_cleared() {
-            out.push(Entry::cleared(
-                crate::data::now_ms(),
-                None,
-                Resolved { was: item, how },
-            ));
-        }
-        out
-    }
-
-    /// Every alarm the loaded stream still shows with nothing under it,
-    /// paired with the register's account of how it ended.
-    ///
-    /// One walk of the ring, oldest first, holding the newest alarm per
-    /// item: a later alarm about the same item supersedes an earlier one
-    /// (one pane has one current state), and a clearance already on the
-    /// stream retires it. Sorted by name so a startup over a long tail
-    /// always writes them in the same order.
-    fn alarms_the_answer_cleared(&self) -> Vec<(AttentionItem, Clearance)> {
-        // Owned keys: the map outlives each entry's borrow, and the
-        // identity is two strings either way.
-        let key = |item: &AttentionItem| {
-            let (half, name, id) = item.identity();
-            (half, name.to_string(), id.to_string())
-        };
-        let mut open: HashMap<(Half, String, String), AttentionItem> = HashMap::new();
-        for e in &self.entries {
-            match (alarm_item(e), &e.kind) {
-                (Some(item), _) => {
-                    open.insert(key(&item), item);
-                }
-                (None, EntryKind::Cleared { was, .. }) => {
-                    open.remove(&key(was));
-                }
-                _ => {}
-            }
-        }
-        let mut out: Vec<(AttentionItem, Clearance)> = open
-            .into_values()
-            .filter_map(|item| {
-                let how = self.attention.clearance(item.identity())?;
-                Some((item, how))
-            })
-            .collect();
-        out.sort_by(|(a, _), (b, _)| (a.name(), a.identity()).cmp(&(b.name(), b.identity())));
-        out
-    }
-
-    /// The newest loaded line for each of `items`, from ONE walk of the
-    /// ring rather than one walk per item.
-    ///
-    /// The backlog a human has to clear is the item count, and it is a
-    /// backlog: hundreds of parked deliveries after a quota weekend is an
-    /// ordinary reading, against a ring that holds ten thousand lines.
-    fn newest_line_per_item<'a>(
-        &'a self,
-        items: &'a [AttentionItem],
-    ) -> HashMap<(Half, &'a str, &'a str), &'a Entry> {
-        let wanted: HashSet<(Half, &str, &str)> = items.iter().map(|i| i.identity()).collect();
-        let mut newest = HashMap::with_capacity(items.len());
-        for e in self.entries.iter().rev() {
-            if newest.len() == wanted.len() {
-                break;
-            }
-            let Some(id) = entry_identity(e) else {
-                continue;
-            };
-            if wanted.contains(&id) {
-                newest.entry(id).or_insert(e);
-            }
-        }
-        newest
+        // 3. The register and the backlog's lines are the model's job.
+        self.record.seed(&seed.panes, &seed.open)
     }
 
     /// Every attention item as one phrase, in the stream's own voice
@@ -676,11 +417,7 @@ impl App {
     /// line, which has no header to point at. Uncolored, because the eye
     /// line is the screen-reader path and never carries paint.
     pub fn attention_items(&self) -> Vec<String> {
-        self.attention
-            .items()
-            .iter()
-            .map(|i| grid::attention_phrase(i, &grid::Plain))
-            .collect()
+        self.record.attention_items()
     }
 
     /// Counted items with no line in the current view.
@@ -691,9 +428,9 @@ impl App {
     /// 10k ring. The startup reconciliation writes a line for everything
     /// else, so nothing else can.
     ///
-    /// One walk of the view, not one per item. The band rides EVERY frame
-    /// and `visible` is the whole filtered ring, so a scan per item makes
-    /// the frame cost items x ring.
+    /// One walk of the view, not one per item: [`crate::stream::Record::
+    /// unreachable`] does it in a single pass against `visible`, which the
+    /// caller already built once to draw the frame.
     ///
     /// Measured against the naive scan over a full 10,000-entry firehose:
     /// 7.0ms at 50 items, 13.3ms at 100, 15.8ms at 120, 19.6ms at 150,
@@ -705,81 +442,22 @@ impl App {
     /// for. Numbers from crates/cyclops-ui/tests/perf.rs on the dev
     /// machine; the test asserts the budget rather than these times.
     pub fn unreachable(&self, visible: &[&Entry]) -> Vec<AttentionItem> {
-        let items = self.attention.items();
-        if items.is_empty() {
-            return Vec::new();
-        }
-        let mut reached = vec![false; items.len()];
-        {
-            // The register keys are unique, so identity indexes the
-            // backlog exactly and the window is walked once against it.
-            let by_id: HashMap<(Half, &str, &str), usize> = items
-                .iter()
-                .enumerate()
-                .map(|(i, item)| (item.identity(), i))
-                .collect();
-            for e in visible {
-                let Some(id) = entry_identity(e) else {
-                    continue;
-                };
-                if let Some(&i) = by_id.get(&id) {
-                    reached[i] |= says_the_same(e, &items[i]);
-                }
-            }
-        }
-        items
-            .into_iter()
-            .zip(reached)
-            .filter(|(_, reached)| !reached)
-            .map(|(item, _)| item)
-            .collect()
+        self.record.unreachable(visible)
     }
 
     /// Entries the current view and filter admit, oldest first.
     pub fn visible(&self) -> Vec<&Entry> {
-        self.entries
-            .iter()
+        self.record
+            .entries()
             .filter(|e| self.admits_in_view(e))
             .filter(|e| self.filter.matches(e))
             .collect()
     }
 
     /// Does the CURRENT view admit this line? The firehose admits
-    /// everything; the admin stream asks [`App::admits`].
+    /// everything; the admin stream asks [`crate::stream::Record::admits`].
     pub fn admits_in_view(&self, e: &Entry) -> bool {
-        self.view == View::Firehose || self.admits(e)
-    }
-
-    /// Does the calm view admit this line?
-    ///
-    /// Every kind but one answers for itself, by the rule and nothing else
-    /// ([`Entry::admin_visible`]). The daemon's admin pings are the
-    /// exception, and they need the register rather than the line: a ping
-    /// POINTS AT something that needs a human, it is not itself a state,
-    /// so no transition can ever clear it and it cannot join the register
-    /// either. A ping admitted regardless kept saying "action required"
-    /// after its delivery moved on, and pinged about conditions the rule
-    /// says nobody must clear (a wedged gate hold, a downgraded hook
-    /// verification), which is how "⚠ action required" came to render
-    /// directly under a closed eye.
-    ///
-    /// So a ping that claims a human is needed is admitted only while the
-    /// register still holds an item it names. One ping may name several
-    /// (the restart closure ends a whole run's worth of deliveries at
-    /// once), and it still stands while ANY of them does: the others have
-    /// been dealt with, this one has not. A ping that names no item (an
-    /// operator's own `admin.notify`, a daemon that predates the naming)
-    /// is admitted: nothing here can prove it stale, and dropping a
-    /// human's own ping is the worse failure.
-    fn admits(&self, e: &Entry) -> bool {
-        if !e.admin_visible() {
-            return false;
-        }
-        let mut items = ping_items(e).peekable();
-        if items.peek().is_none() {
-            return true; // names nothing the register could answer for
-        }
-        items.any(|item| self.attention.holds(item))
+        self.view == View::Firehose || self.record.admits(e)
     }
 
     /// Handle one key. Returns a command for the runtime when the key
@@ -982,125 +660,11 @@ impl App {
     }
 }
 
-/// The item a line could be about, by name alone. Lines that name nothing
-/// the register tracks (messages, gates, session churn) answer None.
-///
-/// The identity is the register's own ([`AttentionItem::identity`]): the
-/// pane key across adoption, or (recipient, message id). Keeping it a
-/// value rather than a comparison is what lets a surface index its lines
-/// once instead of rescanning them per item.
-fn entry_identity(e: &Entry) -> Option<(Half, &str, &str)> {
-    match &e.kind {
-        EntryKind::State {
-            target, pane_id, ..
-        } => Some((
-            Half::Agent,
-            cyclops_proto::agent_key(target, pane_id.as_deref()),
-            "",
-        )),
-        EntryKind::Delivery { to, .. } => {
-            Some((Half::Delivery, to, e.id.as_deref().unwrap_or_default()))
-        }
-        // A clearance is about its item, and carries the identity itself
-        // rather than deriving it from a name and a record id.
-        EntryKind::Cleared { was, .. } => Some(was.identity()),
-        _ => None,
-    }
-}
-
-/// The item this line raises, when the line says a human is needed.
-///
-/// The judgement is `Entry::admin_visible`'s, asked of the same rule: what
-/// makes a line an alarm is what puts it in the calm view. Gate holds are
-/// not here on purpose. A hold says a human is needed because a PANE is
-/// blocked, so it has no item of its own and the pane's clearance is the
-/// one that answers it.
-fn alarm_item(e: &Entry) -> Option<AttentionItem> {
-    match &e.kind {
-        EntryKind::State {
-            target,
-            pane_id,
-            state,
-        } if state.is_blocked() => Some(AttentionItem::Agent {
-            pane_id: cyclops_proto::agent_key(target, pane_id.as_deref()).to_string(),
-            name: target.clone(),
-            state: *state,
-        }),
-        EntryKind::Delivery { to, state, .. } if cyclops_proto::delivery_needs_human(*state) => {
-            Some(AttentionItem::Delivery {
-                to: to.clone(),
-                id: e.id.clone().unwrap_or_default(),
-                state: *state,
-            })
-        }
-        _ => None,
-    }
-}
-
-/// Every register item a PING claims a human is needed for, in the
-/// identity the register keys on. Empty means the ping names nothing.
-///
-/// `fyi` pings claim nothing, so nothing about them can contradict a calm
-/// eye and they are never held to the register. The claim lives in how the
-/// level renders ("⚠ action required", "⚠ urgent" against a dim "fyi",
-/// entry.rs `content`), which is why the level is read here and the rule
-/// is not restated.
-///
-/// An iterator rather than a Vec: this runs for every ping on every frame
-/// (`App::admits` through `App::visible`), and a firehose over a full ring
-/// is where the frame budget goes.
-fn ping_items(e: &Entry) -> impl Iterator<Item = (Half, &str, &str)> {
-    // The single-item form every ping about one thing uses, and the batch
-    // list the restart closure adds. A ping carries one or the other.
-    let (one, batch): (Option<(Half, &str, &str)>, &[PingDelivery]) = match &e.kind {
-        EntryKind::Notify {
-            level,
-            pane_id,
-            to,
-            deliveries,
-            ..
-        } if !matches!(level, NotifyLevel::Fyi) => {
-            let one = match (pane_id, to) {
-                (Some(pane_id), _) => Some((Half::Agent, pane_id.as_str(), "")),
-                (None, Some(to)) => Some((
-                    Half::Delivery,
-                    to.as_str(),
-                    e.id.as_deref().unwrap_or_default(),
-                )),
-                (None, None) => None,
-            };
-            (one, deliveries.as_slice())
-        }
-        _ => (None, &[]),
-    };
-    one.into_iter().chain(
-        batch
-            .iter()
-            .map(|d| (Half::Delivery, d.to.as_str(), d.id.as_str())),
-    )
-}
-
-/// Does this line say what the register currently claims about that item?
-///
-/// The second half of "is it evidence"; identity is the caller's to match.
-/// An older line for the same pane is not evidence: it says something the
-/// register no longer claims, and pointing a reader at it would be worse
-/// than saying nothing.
-fn says_the_same(e: &Entry, item: &AttentionItem) -> bool {
-    match (&e.kind, item) {
-        (EntryKind::State { state, .. }, AttentionItem::Agent { state: want, .. }) => state == want,
-        (EntryKind::Delivery { state, .. }, AttentionItem::Delivery { state: want, .. }) => {
-            state == want
-        }
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entry::EntryKind;
-    use cyclops_proto::{AgentState, DeliveryState};
+    use crate::stream::{EntryKind, RosterSeed, RING_CAP};
+    use cyclops_proto::{AgentState, DeliveryState, OpenDelivery, PaneSnapshot};
 
     fn msg(from: &str, to: &[&str]) -> Entry {
         Entry {

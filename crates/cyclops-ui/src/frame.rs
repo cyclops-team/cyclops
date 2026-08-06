@@ -17,8 +17,8 @@
 //! app which of those the current view cannot reach.
 
 use crate::app::{App, Density, RowTarget, View, Which};
-use crate::entry::{Entry, Filter};
 use crate::grid::display_width;
+use crate::stream::{Entry, Filter};
 
 /// The narrowest terminal that gets the sidebar. The stream's widest
 /// routine line is 59 columns (docs/workspaces.md walks the arithmetic),
@@ -355,7 +355,7 @@ fn block_len(e: &Entry, comfortable: bool, spacer_below: bool) -> usize {
 }
 
 fn has_body(e: &Entry) -> bool {
-    matches!(&e.kind, crate::entry::EntryKind::Msg { body: Some(_), .. })
+    matches!(&e.kind, crate::stream::EntryKind::Msg { body: Some(_), .. })
 }
 
 /// The stream window, exactly `sh` rows, plus the top anchor to store.
@@ -478,8 +478,8 @@ fn fits(list: &[&Entry], top: usize, sel: usize, sh: usize, comfortable: bool) -
 mod tests {
     use super::*;
     use crate::app::{App, View};
-    use crate::entry::{Entry, EntryKind, Filter};
     use crate::input::Key;
+    use crate::stream::{Entry, EntryKind, Filter};
     use crate::theme::Theme;
     use cyclops_proto::{AgentState, DeliveryState};
 
