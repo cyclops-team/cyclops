@@ -76,7 +76,7 @@ cyclops/
 MIT (`LICENSE`); upstream attribution for the v1 lineage in `NOTICE`.
 This tree is a Rust rewrite. The previous shell/Python implementation lives on
 branch `v1` (tag `v1-final`) and is what the usecyclops.dev one-line installer
-currently fetches. `docs/CUTOVER.md` is the migration runbook.
+currently fetches. `docs/development/CUTOVER.md` is the migration runbook.
 
 ## Version status
 

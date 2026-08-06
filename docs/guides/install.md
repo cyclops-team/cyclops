@@ -168,7 +168,7 @@ at all:
 ```toml
 tmux_socket = "cyc"        # tmux -L socket; unset uses the default server
 tmux_config = "/dev/null"  # tmux -f file; unset uses your own tmux config
-theme = "dark"             # colors, see docs/themes.md; unset picks dark too
+theme = "dark"             # colors, see docs/guides/themes.md; unset picks dark too
 chrome = "off"             # stop writing names onto tmux borders, see panes.md
 ```
 

@@ -169,10 +169,10 @@ contract).
 | Component | What it is |
 |---|---|
 | `website/` | SvelteKit 2 / Svelte 5 (runes) static marketing site for usecyclops.dev. 19 components, one route, plain CSS design tokens, no backend communication except a GitHub star-count fetch. Excluded from the workspace; read-only branding reference |
-| `resources/manifests/` | Shipped detection manifests: `agy.toml`, `claude.toml`, `codex.toml`. Compiled into the CLI with `include_str!` and seeded to `$CYCLOPS_HOME/manifests` on first `cyclops start`, never overwritten after |
+| `resources/manifests/` | Shipped detection manifests: `agy.toml`, `claude.toml`, `codex.toml`, `cursor.toml`. Compiled into the CLI with `include_str!` and seeded to `$CYCLOPS_HOME/manifests` on first `cyclops start`, never overwritten after |
 | `resources/themes/` | 7 themes: dark, light (derived from the frontend's CSS tokens), catppuccin, gruvbox, nord, tokyo-night, high-contrast |
 | `resources/layouts/` | Presets `solo`, `duo`, `quad`, `ops` — each the previous plus a pane |
 | `resources/hooks/` | Vendor hook config templates per CLI (agy, claude, codex) rendered by `cyclops hooks install` |
-| `demos/` | Eight runnable end-to-end scripts on isolated tmux servers, including `parity-check.sh`, the CI gate that asserts docs and binaries agree |
+| `demos/` | Seven runnable end-to-end scripts on isolated tmux servers; `tests/e2e/parity-check.sh` is the CI gate that asserts docs and binaries agree |
 | `scripts/` | `install.sh` (POSIX source installer: builds, places binaries, edits profile with backup, `--uninstall` restores), `check-doc-paths.py` (doc-path + orphan gate), `commpact-shim/` (v1 compatibility shim + tests) |
-| `tests/` | Python soak gate `m1_soak.py` and probe harness (`tests/harness/`) |
+| `tests/` | Python soak gate `m1_soak.py` and probe harness (`tests/e2e/lib/`) |

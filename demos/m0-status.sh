@@ -58,7 +58,7 @@ tmx list-panes -t "$SESSION" -F '   #{pane_id}  #{pane_title}  (#{pane_current_c
 cat > "$CYCLOPS_HOME/config.toml" <<EOF
 sessions = ["$SESSION"]
 tmux_socket = "$SOCK"
-manifest_dir = "$REPO/manifests"
+manifest_dir = "$REPO/resources/manifests"
 EOF
 
 echo "== building cyclopsd and cyclops"

@@ -65,7 +65,7 @@ $ cyclops send ghostpane --subject "hello"
 ⚠ needs attention · nothing detects %4
 ghostpane did not get this message; it is on the record and needs attention.
 Teach cyclops what runs in %4: cyclops name %4 ghostpane --manifest <id>.
-cyclops status names the manifests that are loaded, and docs/MANIFESTS.md is
+cyclops status names the manifests that are loaded, and docs/reference/MANIFESTS.md is
 how to write one.
 ```
 

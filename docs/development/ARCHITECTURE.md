@@ -107,7 +107,7 @@ tested CLI hooks its modals or its quota.
 
 Two halves, joined by one queue. `msg.send` writes the fact and fans out;
 one FIFO worker per recipient pane then carries each chain on its own.
-Both are `src/cyclopsd/src/delivery.rs`; the semantics are docs/DELIVERY.md.
+Both are `src/cyclopsd/src/delivery.rs`; the semantics are docs/development/DELIVERY.md.
 
 ### The call: what the sender gets back
 
@@ -436,14 +436,14 @@ what it deliberately does not; read that before changing one.
 
 | Crate | Owns |
 |---|---|
-| `cyclops-proto` | Wire types, ledger schema, the delivery state machine, the attention rule. Data only, no IO. Everything compiles against it (docs/PROTOCOL.md). |
+| `cyclops-proto` | Wire types, ledger schema, the delivery state machine, the attention rule. Data only, no IO. Everything compiles against it (docs/reference/PROTOCOL.md). |
 | `cyclops-manifest` | Per-CLI detection rules as TOML data: regions, priorities, modal decline keys, injection contract (docs/reference/MANIFESTS.md). |
 | `cyclops-tmux` | The tmux adapter and the blast wall: nothing outside it speaks to tmux. Control mode, the reconciling pane table, version parsing, one-shot focus and layout. |
 | `cyclopsd` | The daemon: watcher, fusion, delivery pipeline, ledger writer, socket server, adoption registry, pane chrome. |
 | `cyclops` | The CLI: a thin NDJSON client plus the human-facing renderers, `cyclops hook`, and the workspace verbs. |
-| `cyclops-ui` | The stream behind `cyclops watch`: admin view, firehose, the eye, jump-to-pane, windowed rendering over a 10k ring (docs/ui.md). |
+| `cyclops-ui` | The stream behind `cyclops watch`: admin view, firehose, the eye, jump-to-pane, windowed rendering over a 10k ring (docs/guides/ui.md). |
 | `cyclops-ledger` | Crash-safe append-only NDJSON writer and cursor reader. Fsync before acknowledging; torn final lines are sealed, never rewritten. |
-| `cyclops-theme` | The semantic token vocabulary, theme files, 256-color fallback, selection and hot reload (docs/themes.md). |
+| `cyclops-theme` | The semantic token vocabulary, theme files, 256-color fallback, selection and hot reload (docs/guides/themes.md). |
 | `cyclops-testrig` | Test-only. The isolated tmux server and the one statement of its teardown rule. |
 
 Non-crate directories: `resources/manifests/` (shipped detection data for claude,
@@ -454,7 +454,7 @@ renders), `resources/layouts/` (the four workspace presets, compiled in with
 scripts; `tests/e2e/lib/lib.sh` holds the two rules the scripts must not copy, the
 scratch root and the tmux teardown), `tests/e2e/lib/` (the Python probe
 harness), `scripts/commpact-shim/` (the prepared v1 shim and its guarded
-installer; nothing installs it, see docs/CUTOVER.md), `website/` (the
+installer; nothing installs it, see docs/development/CUTOVER.md), `website/` (the
 landing page for usecyclops.dev, outside the Cargo workspace and never
 modified without an explicit admin request).
 
@@ -478,7 +478,7 @@ Two frozen decisions are not done, and this is where that is written down.
 The MCP front-door on the same daemon (option D absorbed) is a planned
 addition, not a dependency of anything shipped. The rollout is mid-flight:
 M0 was the shadow daemon, M1 added the write path, M2 prepared the v1 shim
-and its runbook, and installing it is admin's call (docs/CUTOVER.md).
+and its runbook, and installing it is admin's call (docs/development/CUTOVER.md).
 
 ### The validation amendments
 

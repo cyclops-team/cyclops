@@ -424,7 +424,7 @@ daemons answer `unknown_method` and the UI falls through its reopen chain.
 It repaints every adopted pane's tmux border and returns the name now
 active. That name is what is ON SCREEN, which is not always what you just
 asked for: a theme file that will not load, or one caught mid-save, is
-refused and the borders keep the palette they had (docs/themes.md). With no
+refused and the borders keep the palette they had (docs/guides/themes.md). With no
 theme file anywhere the answer is `built-in`, the compiled default table.
 
 The `theme` event carries the name and no colors. Every surface resolves

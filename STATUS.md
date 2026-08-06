@@ -37,7 +37,7 @@ One thing still waits on admin: the v1 cutover.
   - agent.state.report is peer-pinned: only a process inside the pane it
     speaks for can report; forged reports are denied and ingest nothing
     (fail-before-proven test). The record cannot be made to lie.
-  - commPact v1 shim + guarded installer + docs/CUTOVER.md runbook,
+  - commPact v1 shim + guarded installer + docs/development/CUTOVER.md runbook,
     PREPARED ONLY; ~/.commPact untouched; shim suite wired into CI.
   - Badges: verified is the heavy check, unverified the light check
     (GOALS hollow-check rule; see Deviations).
@@ -82,7 +82,7 @@ One thing still waits on admin: the v1 cutover.
     and the six state.* plus three badge.* tokens restored after the
     misreading described under Corrections. Note: role labels now hash into
     8 slots (was 6), so existing labels may change color once.
-  - Docs in the same commit: docs/ui.md and docs/themes.md created,
+  - Docs in the same commit: docs/guides/ui.md and docs/guides/themes.md created,
     ARCHITECTURE and CHANGELOG updated, README given a public face.
 - M4 naming, the roster, and pane border chrome (this change). What
   shipped:
@@ -284,8 +284,9 @@ One thing still waits on admin: the v1 cutover.
   - A send to a recipient nothing detects no longer reports a success
     shape. It says what happened, names the pin command, and exits 1, so a
     script branching on exit 0 cannot read it as delivered.
-  - docs/HANDOFF.md, docs/INVARIANTS.md and docs/CONTRIBUTING.md are new
-    and reachable from README; findings.md gained an index. ARCHITECTURE
+  - docs/development/HANDOFF.md, docs/development/INVARIANTS.md and
+    CONTRIBUTING.md are new and reachable from README; findings.md gained
+    an index. ARCHITECTURE
     opened by pointing newcomers at two files that do not exist in this
     repo, which is fixed, and the checker that caught it is adopted as a
     task rather than left in a scratch directory.
@@ -415,7 +416,7 @@ absent from this tree.
 
 ### The M2 cutover
 
-Ready and waiting on you: docs/CUTOVER.md is the runbook (preconditions,
+Ready and waiting on you: docs/development/CUTOVER.md is the runbook (preconditions,
 guarded install of scripts/commpact-shim, parallel window, verification
 checklist, rollback). Nothing proceeds there without you; M3-M6 do not
 depend on it.
@@ -598,7 +599,7 @@ Dropped by admin decision on 2026-08-03:
   delivery data; that stopped being true when the round-2 fix added the
   open-delivery fold to StatusResult, and the entry was wrong until this
   correction.
-- docs/GOALS.md:42 lists theme tokens including state.* and badge.*, and
+- docs/development/GOALS.md:42 lists theme tokens including state.* and badge.*, and
   the tree now ships and paints them, so that line is accurate again after
   the correction below. It still names stream.* and surface.bg, which stay
   dropped because nothing paints a ground and the stream's gutter resolves

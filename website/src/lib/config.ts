@@ -19,7 +19,7 @@ export interface InstallMethod {
 	note?: string;
 }
 
-// The script itself now lives at frontend/static/install.sh (served at
+// The script itself now lives at website/static/install.sh (served at
 // /install.sh by this SvelteKit app). It fetches the release from GitHub
 // and delegates the actual install to bin/commPact-install, which stays
 // network-free — see tests/regression.sh for that guarantee.

@@ -39,7 +39,7 @@ of the repo's own docs, plus decisions made during consolidation.
 - **Shell and Python are lightly covered by tooling.** `demos/*.sh`,
   `scripts/install.sh`, and the Python harness have no linter in CI beyond
   `bash -n` (demos) and their own self-tests; documentation for them lives
-  mostly in headers and `tests/harness/README.md`.
+  mostly in headers and `tests/e2e/lib/README.md`.
 - **Volatile documents.** `STATUS.md` (backlog, risks, floors) and
   `findings.md` (measured facts) change with every milestone. The summaries
   point at them rather than quoting them.

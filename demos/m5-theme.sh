@@ -65,7 +65,7 @@ EOF
 # The shipped themes, in this home rather than the repo's, so the demo can
 # edit one without touching the tree.
 mkdir -p "$CYCLOPS_HOME/themes"
-cp "$REPO"/themes/*.toml "$CYCLOPS_HOME/themes/"
+cp "$REPO"/resources/themes/*.toml "$CYCLOPS_HOME/themes/"
 
 cat > "$CYCLOPS_HOME/config.toml" <<EOF
 # A config with comments and keys the switch must leave alone.
