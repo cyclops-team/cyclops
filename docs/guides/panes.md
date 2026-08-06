@@ -59,6 +59,8 @@ $ cyclops name %2 reviewer
 ✓ named reviewer · %2
 
 $ cyclops list
+watching main · home ~/.cyclops
+
   implementer  ● working             Implementing rate limiter
   tests        ⚠ blocked_permission  APPROVE: write to gateway.rs?
   reviewer     ○ idle                mac
@@ -73,7 +75,8 @@ the hostname.
 `cyclops status` shows the same rows plus every pane nobody has named,
 and the eye. `cyclops list` is the roster alone.
 
-`cyclops list --json` prints the same rows as pane records.
+`cyclops list --json` prints the same rows as pane records, plus `home`
+and `sessions`: which daemon answered and what it watches.
 
 ## What a name buys
 

@@ -941,12 +941,18 @@ fn cmd_name(
     0
 }
 
-/// cyclops list: the roster, one named agent per row.
+/// cyclops list: the roster, one named agent per row, under a header
+/// naming the watched session(s) and the home whose socket answered.
 ///
 /// Everything it shows is already in one `status` answer, so there is no
 /// second question to ask the daemon and no second place the roster can
 /// come from. `status` shows every watched pane; this shows the ones with
 /// names.
+///
+/// The home is this client's own resolution, not a daemon field: it is the
+/// directory the socket lives under, so it names the daemon that answered
+/// by construction. Two daemons on two homes give two different rosters,
+/// and the header is how a reader in the wrong terminal tab finds out.
 fn cmd_list(c: &mut Client, cli: &Cli, style: &Style) -> i32 {
     let result = match c.request("status", json!({})) {
         Ok(v) => v,
@@ -962,22 +968,30 @@ fn cmd_list(c: &mut Client, cli: &Cli, style: &Style) -> i32 {
             return 1;
         }
     };
+    let home = cyclops_proto::cyclops_home();
     if cli.json {
         // Parity, not a second shape: the same rows the grid prints, as
-        // the pane records they came from.
+        // the pane records they came from. The header's facts ride along
+        // as additive fields, so a script can also tell which rig
+        // answered.
         let named: Vec<&PaneStatus> = status
             .sessions
             .iter()
             .flat_map(|s| s.panes.iter())
             .filter(|p| p.agent.is_some())
             .collect();
+        let sessions: Vec<&str> = status.sessions.iter().map(|s| s.name.as_str()).collect();
         println!(
             "{}",
-            json!({"agents": serde_json::to_value(&named).expect("panes serialize")})
+            json!({
+                "agents": serde_json::to_value(&named).expect("panes serialize"),
+                "home": home.display().to_string(),
+                "sessions": sessions,
+            })
         );
         return 0;
     }
-    println!("{}", render::render_list(&status, style));
+    println!("{}", render::render_list(&status, style, &home));
     0
 }
 

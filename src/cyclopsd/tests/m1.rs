@@ -52,10 +52,7 @@ async fn screen_tier_delivery_end_to_end() {
         "payload not on screen:\n{screen}"
     );
     assert!(screen.contains("line two"), "{screen}");
-    assert!(
-        screen.contains("Reply with: cyclops send admin"),
-        "{screen}"
-    );
+    assert!(screen.contains("Reply: cyclops send admin"), "{screen}");
 
     // Events arrived as they happened: msg, then the delivery-state walk.
     rig.ev
@@ -600,10 +597,7 @@ async fn in_process_send_with_custom_sender() {
     );
     let screen = rig.tmux.capture(&pane);
     assert!(screen.contains("FROM: codex"), "{screen}");
-    assert!(
-        screen.contains("Reply with: cyclops send codex"),
-        "{screen}"
-    );
+    assert!(screen.contains("Reply: cyclops send codex"), "{screen}");
     rig.assert_ledger_legal(&[]);
     rig.shutdown().await;
 }

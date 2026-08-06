@@ -84,6 +84,8 @@ Attach, and start one agent CLI in each pane the way you normally would.
 
 ```
 $ cyclops list
+watching main · home ~/.cyclops
+
   implementer  ● working  Implementing rate limiter
   reviewer     ○ idle
 ```

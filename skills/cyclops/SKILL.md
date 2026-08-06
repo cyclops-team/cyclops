@@ -148,7 +148,7 @@ A message that lands in your pane looks like this (real capture):
 [cyclops m-d7e4ba] FROM: admin  SUBJECT: Review the rate limiter
 Please look at retry.rs before the next run.
 Both lines paste as one message.
-Reply with: cyclops send admin --subject "..." [--body ... | --body-file -]
+Reply: cyclops send admin --subject "..."
 ```
 
 `m-d7e4ba` is the message id. `FROM` is daemon-resolved from who actually

@@ -290,17 +290,30 @@ fn unknown_rows(res: &StatusResult, style: &Style) -> Vec<String> {
 
 /// The roster: one row per named agent, on the same grid as `status`.
 ///
+///     watching main · home /Users/x/.cyclops
+///
 ///     implementer  ● working  Implementing rate limiter
 ///     reviewer     ○ idle
 ///
-/// Three columns and no header. The name wears its role color, the state
-/// cell wears its group color on top of the glyph and the word, and the
-/// task hint is dim. Turn color off and every one of those still reads.
+/// The dim header says whose roster this is: the watched session(s), and
+/// the home whose socket answered. Two daemons on two homes each answer
+/// `cyclops list` with a plausible roster, and without the header the one
+/// in a fresh terminal tab was anyone's guess.
+///
+/// Three columns and no column header. The name wears its role color, the
+/// state cell wears its group color on top of the glyph and the word, and
+/// the task hint is dim. Turn color off and every one of those still reads.
 ///
 /// Sessions are not a column: a label is unique across every watched
 /// session (the daemon refuses a duplicate), so naming the session would
-/// add a column that never disambiguates anything.
-pub fn render_list(res: &StatusResult, style: &Style) -> String {
+/// add a column that never disambiguates anything. The header names them
+/// once instead.
+pub fn render_list(res: &StatusResult, style: &Style, home: &Path) -> String {
+    let header = style.dim(&format!(
+        "watching {} · home {}",
+        watching_words(res),
+        home.display()
+    ));
     let rows: Vec<(String, AgentState, Option<String>)> = res
         .sessions
         .iter()
@@ -312,7 +325,10 @@ pub fn render_list(res: &StatusResult, style: &Style) -> String {
         })
         .collect();
     if rows.is_empty() {
-        return copy::NO_AGENTS.to_string();
+        // The empty roster keeps inviting the next action, under the same
+        // header and on the grid's indent, exactly as `status` lays out
+        // its own empty state.
+        return format!("{header}\n\n  {}", copy::NO_AGENTS);
     }
     let label_w = rows
         .iter()
@@ -324,7 +340,8 @@ pub fn render_list(res: &StatusResult, style: &Style) -> String {
         .map(|(_, s, _)| display_width(&state_words(*s)))
         .max()
         .unwrap_or(0);
-    rows.iter()
+    let grid = rows
+        .iter()
         .map(|(label, state, hint)| {
             let name = style.role(label, &pad(label, label_w));
             // The state cell is padded only when a hint follows it. The
@@ -341,7 +358,8 @@ pub fn render_list(res: &StatusResult, style: &Style) -> String {
             }
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    format!("{header}\n\n{grid}")
 }
 
 /// The check glyph, and the one rule for it. Every surface that prints a
@@ -1140,16 +1158,46 @@ mod tests {
     }
 
     /// The roster grid, pinned exactly. This is the shape the landing page
-    /// promises: name, how it is doing, what it is on, aligned, no header.
+    /// promises: name, how it is doing, what it is on, aligned, under one
+    /// header line saying whose roster it is.
     #[test]
     fn list_grid_plain_is_exact() {
-        let got = render_list(&fixture(), &Style::none());
-        let expected = "\x20 reviewer     ● working  Run the tests\n\
+        let got = render_list(&fixture(), &Style::none(), Path::new("/x"));
+        let expected = "watching main · home /x\n\
+                        \n\
+                        \x20 reviewer     ● working  Run the tests\n\
                         \x20 implementer  ○ idle";
         assert_eq!(got, expected);
         for line in got.lines() {
             assert_eq!(line, line.trim_end(), "trailing space in: {line:?}");
         }
+    }
+
+    /// The header answers the question the rows cannot: WHICH rig this
+    /// roster came from. Two daemons on two homes both answer `cyclops
+    /// list` with a plausible roster, so the header has to name every
+    /// watched session and the home whose socket answered.
+    #[test]
+    fn list_header_names_the_sessions_and_the_home() {
+        let mut res = fixture();
+        res.sessions.push(SessionStatus {
+            name: "ops".into(),
+            attached: true,
+            panes: Vec::new(),
+        });
+        let got = render_list(&res, &Style::none(), Path::new("/second/.cyclops"));
+        assert!(
+            got.starts_with("watching main, ops · home /second/.cyclops\n"),
+            "{got}"
+        );
+
+        // A daemon watching nothing says so in status's word for it.
+        res.sessions.clear();
+        let got = render_list(&res, &Style::none(), Path::new("/second/.cyclops"));
+        assert!(
+            got.starts_with("watching nothing · home /second/.cyclops\n"),
+            "{got}"
+        );
     }
 
     /// Painted, the grid still ends where the words end.
@@ -1166,6 +1214,7 @@ mod tests {
         let painted = render_list(
             &res,
             &Style::with_theme(cyclops_theme::Theme::default(), true),
+            Path::new("/x"),
         );
         for line in painted.lines() {
             let stripped: String = {
@@ -1194,17 +1243,21 @@ mod tests {
     }
 
     /// Unnamed panes are `status`'s business. `list` answers "who is on
-    /// this team", and a pane nobody named is not on it.
+    /// this team", and a pane nobody named is not on it. The empty roster
+    /// keeps the invitation, under the same header.
     #[test]
     fn list_shows_named_panes_only_and_invites_the_first_one() {
-        let got = render_list(&fixture(), &Style::none());
+        let got = render_list(&fixture(), &Style::none(), Path::new("/x"));
         assert!(!got.contains("%4"), "{got}");
 
         let mut res = fixture();
         for p in &mut res.sessions[0].panes {
             p.agent = None;
         }
-        assert_eq!(render_list(&res, &Style::none()), copy::NO_AGENTS);
+        assert_eq!(
+            render_list(&res, &Style::none(), Path::new("/x")),
+            format!("watching main · home /x\n\n  {}", copy::NO_AGENTS)
+        );
     }
 
     /// The state cell carries glyph and word on this grid too, and every
@@ -1214,10 +1267,12 @@ mod tests {
         let mut res = fixture();
         res.sessions[0].panes[1].state = AgentState::BlockedQuota;
         res.sessions[0].panes[1].title = String::new();
-        let got = render_list(&res, &Style::none());
+        let got = render_list(&res, &Style::none(), Path::new("/x"));
         assert_eq!(
             got,
-            "\x20 reviewer     ● working        Run the tests\n\
+            "watching main · home /x\n\
+             \n\
+             \x20 reviewer     ● working        Run the tests\n\
              \x20 implementer  ⊘ blocked_quota"
         );
     }

@@ -112,6 +112,8 @@ $ cyclops history
   0s  admin → implementer  Review the rate limiter  ✔ delivered · verified
 
 $ cyclops list
+watching main · home ~/.cyclops
+
   implementer  ○ idle
 ```
 
@@ -140,6 +142,8 @@ $ cyclops name %1 reviewer
 ✔ named reviewer · %1
 
 $ cyclops list
+watching main · home ~/.cyclops
+
   implementer  ● working  Implementing rate limiter
   reviewer     ○ idle
 ```
@@ -203,6 +207,8 @@ $ cyclops start
 ✔ workspace ready · 2 agents
 
 $ cyclops list
+watching main · home ~/.cyclops
+
   implementer  ○ idle
   reviewer     ○ idle
 ```
@@ -230,7 +236,7 @@ recipient's model actually reads:
 $ tmux capture-pane -p -t %1
 [cyclops m-2f304e] FROM: admin  SUBJECT: Review the rate limiter
 gateway.rs:120 drops the burst path
-Reply with: cyclops send admin --subject "..." [--body ... | --body-file -]
+Reply: cyclops send admin --subject "..."
 ```
 
 The daemon builds that header from the sender's real identity, resolved from

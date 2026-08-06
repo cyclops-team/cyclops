@@ -11,7 +11,7 @@ to v1 so existing agent habits transfer):
 ```
 [cyclops m-3f9c2a] FROM: codex  SUBJECT: Review the rate limiter
 <body>
-Reply with: cyclops send codex --subject "..." [--body ... | --body-file -]
+Reply: cyclops send codex --subject "..."
 ```
 
 - `m-3f9c2a` is the message id: short lowercase hex, unique per ledger.
