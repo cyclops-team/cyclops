@@ -24,7 +24,7 @@ use std::collections::HashSet;
 use std::io;
 
 use crossterm::event::{
-    self, Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use cyclops_tmux::{ControlClient, ControlConfig, Notification};
 use ratatui::backend::CrosstermBackend;
@@ -1479,9 +1479,21 @@ async fn handle_mouse(
                         }
                     }
                 }
-                HitTarget::PaneFrame { .. } => {
+                HitTarget::PaneFrame { pane_id } => {
                     app.close_menu();
                     app.selection.clear();
+                    // Down on the frame starts a possible swap drag; a
+                    // below-threshold release focuses the pane instead,
+                    // matching what a frame click always did. The body is
+                    // untouched; dragging there is text selection.
+                    app.drag = Some(DragState::on_down(
+                        DragTarget::Pane {
+                            pane_id: pane_id.clone(),
+                        },
+                        col,
+                        row,
+                    ));
+                    return Ok(());
                 }
                 HitTarget::PaneSplitRight { .. } | HitTarget::PaneSplitDown { .. } => {
                     app.close_menu();
@@ -1638,8 +1650,8 @@ async fn handle_mouse(
 
 /// Commit a drag that crossed its move threshold: resolve the drop hit
 /// target under the release point through `action`'s routing, and execute
-/// whatever it resolves to. Only [`DragTarget::Tab`], `Workspace`, and
-/// `Agent` resolve here — a divider applies live during motion
+/// whatever it resolves to. Only [`DragTarget::Pane`], `Tab`, `Workspace`,
+/// and `Agent` resolve here: a divider applies live during motion
 /// ([`apply_live_divider`]) and a sidebar-width drag already applied and
 /// persisted above.
 ///
@@ -1657,6 +1669,9 @@ async fn commit_drag_drop(
 ) -> Result<(), cyclops_tmux::TmuxError> {
     let drop = app.hit_map.hit(col, row).cloned();
     let action = match picked_up {
+        DragTarget::Pane { pane_id } => {
+            drop.and_then(|drop| action::resolve_pane_drop(pane_id, &drop))
+        }
         DragTarget::Tab { window_id } => {
             drop.and_then(|drop| action::resolve_tab_drop(window_id, &drop))
         }
@@ -2071,7 +2086,22 @@ async fn handle_key(
         RouterResult::Action(binding) => {
             let resolved = {
                 let ctx = route_context(app);
-                action::route_binding(binding, &ctx)
+                // Shift on the chord upgrades directional focus to a pane
+                // swap (Ctrl+B Shift+Arrow). Only a prefix chord can carry
+                // the upgrade: the router matches prefix chords by key
+                // code alone, so Shift is unread information there, while
+                // a direct chord matched its modifiers exactly and an
+                // explicit shift+arrow focus binding must stay focus.
+                let prefix_shift = key.modifiers.contains(KeyModifiers::SHIFT)
+                    && matches!(
+                        app.router.chord(binding),
+                        Some(crate::bindings::BindingChord::Prefix(_))
+                    );
+                if prefix_shift {
+                    action::route_binding_shifted(binding, &ctx)
+                } else {
+                    action::route_binding(binding, &ctx)
+                }
             };
             let Some(resolved) = resolved else {
                 return Ok(InputOutcome::NoRedraw);
@@ -2927,6 +2957,117 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&home);
+        client.shutdown().await;
+    }
+
+    // -- A pane-frame drag released on another pane dispatches one swap
+    // through the executor. What the swap itself does to tmux is
+    // `app::exec::tests`' job; this proves the resolution-to-dispatch
+    // wiring against the painted hit rects. --
+
+    #[tokio::test]
+    async fn a_pane_drop_on_another_pane_dispatches_one_swap() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("app-pane-drop");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        server.run_ok(&["split-window", "-h", "-t", "s"]);
+        let out = server.run(&["list-panes", "-t", "s", "-F", "#{pane_id} #{pane_left}"]);
+        let before: Vec<(String, String)> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let mut fields = line.split_whitespace();
+                (
+                    fields.next().unwrap_or_default().to_string(),
+                    fields.next().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let (dragged, target) = (before[0].0.clone(), before[1].0.clone());
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+
+        let model = WorkspaceModel {
+            workspaces: vec![crate::model::WorkspaceRow {
+                session_id: "$0".into(),
+                name: "s".into(),
+                tab_count: 1,
+                window_ids: vec!["@0".into()],
+            }],
+            active_workspace: 0,
+            session: crate::model::SessionModel {
+                session: "s".into(),
+                tabs: vec![crate::model::TabModel {
+                    window_id: "@0".into(),
+                    name: "1".into(),
+                    layout: crate::layout::ResolvedLayout::Leaf {
+                        pane_id: dragged.clone(),
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 24,
+                    },
+                    active_pane: dragged.clone(),
+                    zoomed: false,
+                }],
+                active_tab: 0,
+            },
+            sidebar_visible: true,
+        };
+        let mut app = test_app(
+            model,
+            cyclops_proto::scratch::scratch_dir("app-pane-drop-home"),
+        );
+
+        // Fixture rects standing in for the last painted frame: the dragged
+        // pane on the left, the drop target's body on the right.
+        app.hit_map.push(
+            Rect::new(0, 2, 10, 5),
+            HitTarget::PaneBody {
+                pane_id: dragged.clone(),
+            },
+        );
+        app.hit_map.push(
+            Rect::new(12, 2, 10, 5),
+            HitTarget::PaneBody {
+                pane_id: target.clone(),
+            },
+        );
+
+        commit_drag_drop(
+            &mut app,
+            &client,
+            &DragTarget::Pane {
+                pane_id: dragged.clone(),
+            },
+            13,
+            3,
+        )
+        .await
+        .expect("commit");
+
+        assert!(app.needs_reconcile, "a swap is structural");
+        let out = server.run(&["list-panes", "-t", "s", "-F", "#{pane_id} #{pane_left}"]);
+        let after = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            after
+                .lines()
+                .any(|line| line == format!("{dragged} {}", before[1].1)),
+            "the dragged pane must take the target's slot, got {after}"
+        );
+        assert!(
+            after
+                .lines()
+                .any(|line| line == format!("{target} {}", before[0].1)),
+            "the target pane must take the dragged pane's slot, got {after}"
+        );
         client.shutdown().await;
     }
 }

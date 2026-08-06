@@ -474,6 +474,121 @@ async fn swap_window_exchanges_the_two_positions() {
 }
 
 #[tokio::test]
+async fn swap_pane_exchanges_the_panes_and_focuses_the_target() {
+    let Some(srv) = TestServer::new("ops-swap-pane") else {
+        return;
+    };
+    srv.tmux_ok(&[
+        "new-session",
+        "-d",
+        "-s",
+        "s",
+        "-n",
+        "one",
+        "-x",
+        "120",
+        "-y",
+        "30",
+        "/bin/sh",
+    ]);
+    srv.tmux_ok(&["split-window", "-d", "-h", "-t", "s:one", "/bin/sh"]);
+    let before = lines(
+        &srv,
+        &["list-panes", "-t", "s:one", "-F", "#{pane_id} #{pane_left}"],
+    );
+    let (client, _n) = ControlClient::spawn(srv.config("s")).await.expect("spawn");
+
+    let (a, b) = (
+        before[0].split(' ').next().expect("id").to_string(),
+        before[1].split(' ').next().expect("id").to_string(),
+    );
+    client.swap_pane(&a, &b).await.expect("swap");
+
+    let after = lines(
+        &srv,
+        &[
+            "list-panes",
+            "-t",
+            "s:one",
+            "-F",
+            "#{pane_id} #{pane_left} #{pane_active}",
+        ],
+    );
+    // Positions exchanged, and tmux focused `-t` in its new slot.
+    let a_left_before = before[0].split(' ').nth(1).expect("left");
+    let b_left_before = before[1].split(' ').nth(1).expect("left");
+    assert!(
+        after.contains(&format!("{a} {b_left_before} 0")),
+        "{after:?}"
+    );
+    assert!(
+        after.contains(&format!("{b} {a_left_before} 1")),
+        "{after:?}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn swap_pane_toward_swaps_with_the_tmux_resolved_neighbour() {
+    let Some(srv) = TestServer::new("ops-swap-toward") else {
+        return;
+    };
+    srv.tmux_ok(&[
+        "new-session",
+        "-d",
+        "-s",
+        "s",
+        "-n",
+        "one",
+        "-x",
+        "120",
+        "-y",
+        "30",
+        "/bin/sh",
+    ]);
+    srv.tmux_ok(&["split-window", "-d", "-h", "-t", "s:one", "/bin/sh"]);
+    let before = lines(
+        &srv,
+        &["list-panes", "-t", "s:one", "-F", "#{pane_id} #{pane_left}"],
+    );
+    let (left, right) = (
+        before[0].split(' ').next().expect("id").to_string(),
+        before[1].split(' ').next().expect("id").to_string(),
+    );
+    srv.tmux_ok(&["select-pane", "-t", &left]);
+    let (client, _n) = ControlClient::spawn(srv.config("s")).await.expect("spawn");
+
+    client
+        .swap_pane_toward(PaneDirection::Right)
+        .await
+        .expect("swap toward");
+
+    // The current pane moved right and kept focus (it rides the implied
+    // `-t`); the resolved neighbour took its old slot.
+    let after = lines(
+        &srv,
+        &[
+            "list-panes",
+            "-t",
+            "s:one",
+            "-F",
+            "#{pane_id} #{pane_left} #{pane_active}",
+        ],
+    );
+    let left_pos = before[0].split(' ').nth(1).expect("left");
+    let right_pos = before[1].split(' ').nth(1).expect("left");
+    assert!(
+        after.contains(&format!("{left} {right_pos} 1")),
+        "{after:?}"
+    );
+    assert!(
+        after.contains(&format!("{right} {left_pos} 0")),
+        "{after:?}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
 async fn move_window_to_session_appends_it_to_the_other_session() {
     let Some(srv) = TestServer::new("ops-move") else {
         return;

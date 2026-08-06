@@ -55,6 +55,17 @@ impl PaneDirection {
             PaneDirection::Down => "-D",
         }
     }
+
+    /// The neighbour-of-current target mnemonic, for commands that take a
+    /// pane target rather than a directional flag.
+    fn neighbour_target(self) -> &'static str {
+        match self {
+            PaneDirection::Left => "{left-of}",
+            PaneDirection::Right => "{right-of}",
+            PaneDirection::Up => "{up-of}",
+            PaneDirection::Down => "{down-of}",
+        }
+    }
 }
 
 impl ControlClient {
@@ -206,6 +217,31 @@ impl ControlClient {
             "swap-window -s {} -t {}",
             quote_arg(src_window_id),
             quote_arg(dst_window_id)
+        ))
+        .await
+        .map(|_| ())
+    }
+
+    /// Swap two panes by id. tmux focuses `-t` after a swap, so
+    /// `dst_pane_id` ends up focused in its new slot.
+    pub async fn swap_pane(&self, src_pane_id: &str, dst_pane_id: &str) -> Result<(), TmuxError> {
+        self.command(&format!(
+            "swap-pane -s {} -t {}",
+            quote_arg(src_pane_id),
+            quote_arg(dst_pane_id)
+        ))
+        .await
+        .map(|_| ())
+    }
+
+    /// Swap the current pane with its neighbour in `direction`, which tmux
+    /// resolves from live layout via its `{left-of}` target family. The
+    /// implied `-t` is the current pane, and tmux focuses `-t` after a
+    /// swap, so focus follows the pane being moved.
+    pub async fn swap_pane_toward(&self, direction: PaneDirection) -> Result<(), TmuxError> {
+        self.command(&format!(
+            "swap-pane -s {}",
+            quote_arg(direction.neighbour_target())
         ))
         .await
         .map(|_| ())

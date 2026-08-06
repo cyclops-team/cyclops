@@ -627,7 +627,7 @@ fn paint_drag_preview(drag: &DragState, buf: &mut Buffer, paint: &Paint) {
     let (x, y) = drag.current;
     let hint = match &drag.target {
         DragTarget::Divider { .. } => "↔",
-        DragTarget::Tab { .. } => "⇄",
+        DragTarget::Pane { .. } | DragTarget::Tab { .. } => "⇄",
         DragTarget::Workspace { .. } | DragTarget::Agent { .. } => "⇅",
         DragTarget::Sidebar => "↔",
     };

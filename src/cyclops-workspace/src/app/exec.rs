@@ -75,6 +75,22 @@ pub(super) async fn execute(
             client.select_pane_toward(direction).await?;
             Ok(Outcome::reconcile())
         }
+        Action::SwapPaneDirection(direction) => {
+            // At an edge with no neighbour tmux answers with an error,
+            // which the caller logs like any other failed command.
+            client.swap_pane_toward(direction).await?;
+            Ok(Outcome::reconcile())
+        }
+        Action::SwapPanes {
+            pane_id,
+            other_pane_id,
+        } => {
+            // The dragged pane rides in `-t`: tmux focuses `-t` after a
+            // swap, so the pane the user just dropped ends up focused in
+            // its new slot, the same way a frame click focuses it.
+            client.swap_pane(&other_pane_id, &pane_id).await?;
+            Ok(Outcome::reconcile())
+        }
         Action::ClosePane { pane_id } => close_pane(app, client, pane_id).await,
         Action::ZoomPane { pane_id } => {
             client.toggle_pane_zoom(&pane_id).await?;
@@ -683,7 +699,7 @@ mod tests {
     use std::collections::HashSet;
 
     use cyclops_testrig::{tmux_available, TmuxServer};
-    use cyclops_tmux::{ControlClient, ControlConfig, SplitDirection};
+    use cyclops_tmux::{ControlClient, ControlConfig, PaneDirection, SplitDirection};
 
     use super::*;
     use crate::bindings::default_bindings;
@@ -799,6 +815,31 @@ mod tests {
             .filter(|l| !l.is_empty())
             .map(str::to_string)
             .collect()
+    }
+
+    /// `(pane_id, pane_left)` per pane, enough to prove a swap exchanged
+    /// two side-by-side panes' slots.
+    fn pane_positions(server: &TmuxServer, target: &str) -> Vec<(String, String)> {
+        let out = server.run(&["list-panes", "-t", target, "-F", "#{pane_id} #{pane_left}"]);
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|line| {
+                let mut fields = line.split_whitespace();
+                (
+                    fields.next().unwrap_or_default().to_string(),
+                    fields.next().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn left_of(positions: &[(String, String)], pane: &str) -> String {
+        positions
+            .iter()
+            .find(|(id, _)| id == pane)
+            .map(|(_, left)| left.clone())
+            .unwrap_or_else(|| panic!("pane {pane} missing from {positions:?}"))
     }
 
     fn scratch_home(tag: &str) -> std::path::PathBuf {
@@ -927,6 +968,89 @@ mod tests {
             "a structural change must ask to reconcile"
         );
         assert_eq!(pane_ids(&server, "s").len(), 2, "tmux actually split");
+        client.shutdown().await;
+    }
+
+    // -- Pane swap: ids exchange slots while the layout shape stays put. --
+
+    #[tokio::test]
+    async fn swap_panes_exchanges_the_two_panes_positions() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-swap-panes");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        server.run_ok(&["split-window", "-h", "-t", "s"]);
+        let before = pane_positions(&server, "s");
+        assert_eq!(before.len(), 2);
+        let (a, b) = (before[0].0.clone(), before[1].0.clone());
+        let client = rig_client(&server, "s").await;
+        let mut app = test_app(
+            one_tab_model("s", "@0", &a, "$0"),
+            cyclops_proto::scratch::scratch_dir("exec-swap-panes-home"),
+        );
+
+        let outcome = execute(
+            &mut app,
+            &client,
+            Action::SwapPanes {
+                pane_id: a.clone(),
+                other_pane_id: b.clone(),
+            },
+        )
+        .await
+        .expect("swap executes");
+
+        assert!(outcome.reconcile, "a swap is structural and must reconcile");
+        let after = pane_positions(&server, "s");
+        assert_eq!(left_of(&after, &a), left_of(&before, &b));
+        assert_eq!(left_of(&after, &b), left_of(&before, &a));
+        // The dragged pane (`pane_id`) ends up focused in its new slot.
+        let active = server.run(&["list-panes", "-t", "s", "-F", "#{pane_id} #{pane_active}"]);
+        let active = String::from_utf8_lossy(&active.stdout);
+        assert!(
+            active.lines().any(|line| line == format!("{a} 1")),
+            "the dragged pane must end focused, got {active}"
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn swap_pane_direction_swaps_with_the_tmux_resolved_neighbour() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-swap-direction");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        server.run_ok(&["split-window", "-h", "-t", "s"]);
+        let before = pane_positions(&server, "s");
+        let (left, right) = (before[0].0.clone(), before[1].0.clone());
+        server.run_ok(&["select-pane", "-t", &left]);
+        let client = rig_client(&server, "s").await;
+        let mut app = test_app(
+            one_tab_model("s", "@0", &left, "$0"),
+            cyclops_proto::scratch::scratch_dir("exec-swap-direction-home"),
+        );
+
+        let outcome = execute(
+            &mut app,
+            &client,
+            Action::SwapPaneDirection(PaneDirection::Right),
+        )
+        .await
+        .expect("directional swap executes");
+
+        assert!(outcome.reconcile);
+        let after = pane_positions(&server, "s");
+        assert_eq!(left_of(&after, &left), left_of(&before, &right));
+        assert_eq!(left_of(&after, &right), left_of(&before, &left));
+        // Focus follows the focused pane to its new slot.
+        let active = server.run(&["list-panes", "-t", "s", "-F", "#{pane_id} #{pane_active}"]);
+        let active = String::from_utf8_lossy(&active.stdout);
+        assert!(
+            active.lines().any(|line| line == format!("{left} 1")),
+            "the swapped pane must keep focus, got {active}"
+        );
         client.shutdown().await;
     }
 
