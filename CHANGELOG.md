@@ -96,7 +96,7 @@ versions are unreleased until admin cuts a tag.
   under a current binary on two real machines. The seeder now upgrades
   any file byte-identical to a version this project ever shipped, and
   still never touches a file the user edited.
-- Pane text never falls under a 2.5:1 readability floor: an agent's
+- Pane text never falls under a 3:1 readability floor, DIM included: an agent's
   pale grays drawn for a dark terminal no longer vanish on the light
   ground, and the theme's ink no longer disappears into an agent's own
   dark fills. Readable colors pass through hue-intact; NO_COLOR never
