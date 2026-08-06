@@ -63,7 +63,6 @@ pub struct WorkspaceRow {
     pub session_id: String,
     pub name: String,
     pub tab_count: usize,
-    pub active: bool,
     /// Stable window ids currently linked into this session. Sidebar agent
     /// membership follows these ids, so a session rename cannot orphan rows.
     pub window_ids: Vec<String>,

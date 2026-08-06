@@ -1,4 +1,11 @@
-//! Map crossterm keys to tmux `send-keys` arguments.
+//! Device-event decoding: turning a raw crossterm key or mouse event into
+//! something routing can act on, before any tmux call or app-state mutation.
+//! `mouse` owns hit regions and menu state; `router` owns the prefix-chord
+//! state machine. This top level owns what is left: encoding a key for pane
+//! passthrough, and deciding whether a key preempts routing entirely (an
+//! Escape that cancels a chrome drag or selection). No tmux IO, no App
+//! state — a decision here is a pure function of the event and, at most,
+//! the couple of booleans the caller already has in hand.
 
 pub mod mouse;
 pub mod router;
@@ -74,6 +81,18 @@ fn modifier_prefix(modifiers: KeyModifiers) -> String {
     prefix
 }
 
+/// Whether this key decodes to "cancel the in-progress chrome operation"
+/// before any routing happens — a text selection drag or a chrome drag both
+/// answer to Escape ahead of the router and the focused pane, so the app
+/// loop checks this first and consumes the key rather than forwarding it.
+pub fn escape_cancels_visual_state(
+    code: crossterm::event::KeyCode,
+    selection_active: bool,
+    drag_active: bool,
+) -> bool {
+    code == crossterm::event::KeyCode::Esc && (selection_active || drag_active)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +141,13 @@ mod tests {
             KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
         );
         assert_eq!(encode_send_keys(&ev), vec!["C-M-S-Left".to_string()]);
+    }
+
+    #[test]
+    fn escape_is_consumed_when_it_cancels_a_chrome_operation() {
+        assert!(escape_cancels_visual_state(KeyCode::Esc, true, false));
+        assert!(escape_cancels_visual_state(KeyCode::Esc, false, true));
+        assert!(!escape_cancels_visual_state(KeyCode::Esc, false, false));
+        assert!(!escape_cancels_visual_state(KeyCode::Char('x'), true, true));
     }
 }

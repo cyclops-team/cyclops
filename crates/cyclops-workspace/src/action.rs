@@ -704,7 +704,6 @@ mod tests {
             session_id: session_id.to_string(),
             name: name.to_string(),
             tab_count: 1,
-            active: false,
             window_ids: Vec::new(),
         }
     }

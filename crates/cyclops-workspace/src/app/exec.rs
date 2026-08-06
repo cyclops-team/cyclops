@@ -370,7 +370,7 @@ fn name_pane(app: &mut App, pane_id: String, label: String) -> Result<Outcome, T
     }
     let next_order_key = format!("name:{label}");
     let persist = previous_order_key.is_some_and(|previous| {
-        super::migrate_order_entry(&mut app.prefs.agent_order, &previous, &next_order_key)
+        crate::persist::migrate_order_entry(&mut app.prefs.agent_order, &previous, &next_order_key)
     });
     app.dialog = None;
     app.hover = None;
@@ -500,7 +500,8 @@ async fn rename_workspace(
     name: String,
 ) -> Result<Outcome, TmuxError> {
     client.rename_session(&session, &name).await?;
-    let mut persist = super::migrate_order_entry(&mut app.prefs.workspace_order, &session, &name);
+    let mut persist =
+        crate::persist::migrate_order_entry(&mut app.prefs.workspace_order, &session, &name);
     if let Some(session_id) = app
         .model
         .workspaces
@@ -720,7 +721,6 @@ mod tests {
                 session_id: session_id.to_string(),
                 name: session.to_string(),
                 tab_count: 1,
-                active: true,
                 window_ids: vec![window_id.to_string()],
             }],
             active_workspace: 0,
@@ -986,7 +986,6 @@ mod tests {
             session_id: "$1".into(),
             name: "other".into(),
             tab_count: 1,
-            active: false,
             window_ids: Vec::new(),
         });
         let mut app = test_app(model, home.clone());
@@ -1196,7 +1195,6 @@ mod tests {
             session_id: "$existing".into(),
             name: folder_name.clone(),
             tab_count: 1,
-            active: false,
             window_ids: Vec::new(),
         });
         let mut app = test_app(model, scratch_home("exec-new-workspace-home"));

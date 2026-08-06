@@ -11,6 +11,12 @@
 //! Daemon decoration events get the identical treatment on their own
 //! dedicated thread: `spawn_decoration_forwarder` arms one debounce per
 //! burst instead of fetching status once per pushed event.
+//!
+//! This module owns boot, the event queue, render scheduling, reconnect
+//! orchestration, and top-level `App` state. It does not own tmux command
+//! strings (`cyclops-tmux` and `action::route_*`), device-event decoding
+//! (`input`), dialog text-editing (`dialog`), or frame composition
+//! (`render`) — it calls into those and reacts to their results.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -18,7 +24,7 @@ use std::collections::HashSet;
 use std::io;
 
 use crossterm::event::{
-    self, Event, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
 use cyclops_tmux::{ControlClient, ControlConfig, Notification};
 use ratatui::backend::CrosstermBackend;
@@ -32,7 +38,7 @@ use crate::bindings::load_bindings;
 use crate::config::load_tmux_config;
 use crate::copy;
 use crate::decoration::{self, DecorationSnapshot};
-use crate::dialog::Dialog;
+use crate::dialog::{self, Dialog, DialogKeyAction};
 use crate::drag::{DragState, DragTarget};
 use crate::input::encode_send_keys;
 use crate::input::mouse::{HitMap, HitTarget, MenuState};
@@ -77,10 +83,6 @@ const FOLDER_PROBE_DELAY: Duration = Duration::from_millis(600);
 /// own blocking status round trip even though only the last result before
 /// the next paint was ever shown.
 const DECORATION_DEBOUNCE: Duration = Duration::from_millis(30);
-const TAB_BAR_HEIGHT: u16 = 1;
-const EVENT_STREAM_WIDTH: u16 = 40;
-const SIDEBAR_MIN_WIDTH: u16 = 22;
-const SIDEBAR_MAX_WIDTH: u16 = 42;
 
 enum AppMsg {
     Input(KeyEvent),
@@ -179,72 +181,6 @@ struct App {
     folder_probe_at: Option<Instant>,
 }
 
-/// Chrome rectangles for one frame.
-struct ChromeAreas {
-    sidebar: Option<Rect>,
-    panel: Option<Rect>,
-    tab_bar: Rect,
-    canvas: Rect,
-}
-
-fn chrome_areas_for(
-    area: Rect,
-    sidebar_visible: bool,
-    sidebar_width: u16,
-    panel_open: bool,
-) -> ChromeAreas {
-    let mut main = area;
-    let sidebar = if sidebar_visible && main.width > 4 {
-        let w = clamp_sidebar_width(sidebar_width, main.width);
-        let s = Rect::new(main.x, main.y, w, main.height);
-        main = Rect::new(main.x + w, main.y, main.width - w, main.height);
-        Some(s)
-    } else {
-        None
-    };
-    let panel = if panel_open && main.width > EVENT_STREAM_WIDTH + 4 {
-        let p = Rect::new(
-            main.x + main.width - EVENT_STREAM_WIDTH,
-            main.y,
-            EVENT_STREAM_WIDTH,
-            main.height,
-        );
-        main = Rect::new(main.x, main.y, main.width - EVENT_STREAM_WIDTH, main.height);
-        Some(p)
-    } else {
-        None
-    };
-    let bar_h = TAB_BAR_HEIGHT.min(main.height);
-    let tab_bar = Rect::new(main.x, main.y, main.width, bar_h);
-    let canvas = Rect::new(
-        main.x,
-        main.y + bar_h,
-        main.width,
-        main.height.saturating_sub(bar_h),
-    );
-    ChromeAreas {
-        sidebar,
-        panel,
-        tab_bar,
-        canvas,
-    }
-}
-
-fn clamp_sidebar_width(requested: u16, terminal_width: u16) -> u16 {
-    let max = SIDEBAR_MAX_WIDTH.min(terminal_width / 2).max(1);
-    let min = SIDEBAR_MIN_WIDTH.min(max);
-    requested.clamp(min, max)
-}
-
-fn sidebar_width_for_column(column: u16, terminal_width: u16) -> u16 {
-    clamp_sidebar_width(column.saturating_add(1), terminal_width)
-}
-
-fn sidebar_width_on_cancel(drag: &DragState, terminal_width: u16) -> Option<u16> {
-    matches!(&drag.target, DragTarget::Sidebar)
-        .then(|| sidebar_width_for_column(drag.start.0, terminal_width))
-}
-
 fn toggle_workspace_expanded(expanded: &mut HashSet<String>, session_id: String) -> bool {
     if expanded.remove(&session_id) {
         false
@@ -252,14 +188,6 @@ fn toggle_workspace_expanded(expanded: &mut HashSet<String>, session_id: String)
         expanded.insert(session_id);
         true
     }
-}
-
-fn escape_cancels_visual_state(
-    code: crossterm::event::KeyCode,
-    selection_active: bool,
-    drag_active: bool,
-) -> bool {
-    code == crossterm::event::KeyCode::Esc && (selection_active || drag_active)
 }
 
 /// Arm the render debounce if none is pending. Never pushes an armed
@@ -431,10 +359,10 @@ pub async fn run_async() -> i32 {
 
     // Declare terminal cells only after the split topology is known. tmux
     // gets pane content cells; two-cell separator bands remain UI chrome.
-    let chrome_canvas = chrome_areas_for(
+    let chrome_canvas = crate::render::chrome_areas_for(
         Rect::new(0, 0, term_size.0, term_size.1),
         prefs.sidebar_visible,
-        prefs.sidebar_width.max(SIDEBAR_MIN_WIDTH),
+        prefs.sidebar_width.max(crate::render::SIDEBAR_MIN_WIDTH),
         false,
     )
     .canvas;
@@ -924,11 +852,13 @@ impl App {
     }
 
     fn sidebar_width(&self) -> u16 {
-        self.prefs.sidebar_width.max(SIDEBAR_MIN_WIDTH)
+        self.prefs
+            .sidebar_width
+            .max(crate::render::SIDEBAR_MIN_WIDTH)
     }
 
-    fn chrome(&self, area: Rect) -> ChromeAreas {
-        chrome_areas_for(
+    fn chrome(&self, area: Rect) -> crate::render::ChromeAreas {
+        crate::render::chrome_areas_for(
             area,
             self.model.sidebar_visible,
             self.sidebar_width(),
@@ -939,20 +869,6 @@ impl App {
     fn persist_active(&self) {
         let tab = self.model.active_tab();
         set_last_active(&self.home, &self.model.session.session, &tab.window_id);
-    }
-
-    /// Whether this motion arrives on, or departs from, the sidebar's
-    /// create button. Both edges have to reach the renderer: one lights the
-    /// button, the other puts it out, and a filter that only let the
-    /// arrival through would leave it lit wherever the mouse went next.
-    fn motion_touches_new_workspace_button(&self, col: u16, row: u16) -> bool {
-        let on_button = |col: u16, row: u16| {
-            matches!(
-                self.hit_map.hit(col, row),
-                Some(HitTarget::NewWorkspaceButton)
-            )
-        };
-        on_button(col, row) || self.hover.is_some_and(|(col, row)| on_button(col, row))
     }
 
     fn open_menu(&mut self, menu: MenuState) {
@@ -1104,7 +1020,11 @@ async fn handle_app_msg(
             if let Some(index) = renamed_index {
                 if let Some(workspace) = app.model.workspaces.get_mut(index) {
                     let old_name = std::mem::replace(&mut workspace.name, name.clone());
-                    if migrate_order_entry(&mut app.prefs.workspace_order, &old_name, &name) {
+                    if persist::migrate_order_entry(
+                        &mut app.prefs.workspace_order,
+                        &old_name,
+                        &name,
+                    ) {
                         if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
                             log_err(&app.home, &error);
                         }
@@ -1197,7 +1117,11 @@ async fn handle_app_msg(
             if !snapshot.online {
                 app.watched_sessions.clear();
             }
-            if migrate_agent_order_entries(&mut app.prefs.agent_order, &app.decoration, &snapshot) {
+            if persist::migrate_agent_order_entries(
+                &mut app.prefs.agent_order,
+                &app.decoration,
+                &snapshot,
+            ) {
                 if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
                     log_err(&app.home, &error);
                 }
@@ -1224,7 +1148,12 @@ async fn handle_app_msg(
             if matches!(mouse.kind, MouseEventKind::Moved)
                 && !app.menu.is_open()
                 && app.dialog.is_none()
-                && !app.motion_touches_new_workspace_button(mouse.column, mouse.row)
+                && !crate::input::mouse::motion_touches_new_workspace_button(
+                    &app.hit_map,
+                    app.hover,
+                    mouse.column,
+                    mouse.row,
+                )
             {
                 return true;
             }
@@ -1248,7 +1177,7 @@ async fn handle_app_msg(
                 return true;
             }
             if app.dialog.is_some() {
-                if append_dialog_text(app.dialog.as_mut(), &text) {
+                if dialog::append_dialog_text(app.dialog.as_mut(), &text) {
                     arm(debounce);
                 }
                 return true;
@@ -1267,7 +1196,7 @@ async fn handle_app_msg(
                 arm(debounce);
                 return true;
             }
-            if escape_cancels_visual_state(
+            if crate::input::escape_cancels_visual_state(
                 key.code,
                 app.selection.active.is_some(),
                 app.drag.is_some(),
@@ -1292,7 +1221,7 @@ async fn handle_app_msg(
 
 fn cancel_drag(app: &mut App) {
     if let Some(drag) = app.drag.take() {
-        if let Some(width) = sidebar_width_on_cancel(&drag, app.term_size.0) {
+        if let Some(width) = crate::render::sidebar_width_on_cancel(&drag, app.term_size.0) {
             // Sidebar motion is only visual until mouse-up, so Escape can
             // restore the start without a compensating tmux resize.
             app.prefs.sidebar_width = width;
@@ -1363,7 +1292,7 @@ async fn handle_mouse(
                 } else {
                     3
                 };
-                *scroll = move_keybind_scroll(*scroll, delta, max_scroll);
+                *scroll = dialog::move_keybind_scroll(*scroll, delta, max_scroll);
             }
             return Ok(());
         }
@@ -1594,7 +1523,8 @@ async fn handle_mouse(
                 if app.drag.as_ref().is_some_and(|drag| {
                     drag.is_active() && matches!(&drag.target, DragTarget::Sidebar)
                 }) {
-                    app.prefs.sidebar_width = sidebar_width_for_column(col, app.term_size.0);
+                    app.prefs.sidebar_width =
+                        crate::render::sidebar_width_for_column(col, app.term_size.0);
                 }
             } else if let Some(anchor) = app.selection.anchor_pane().map(str::to_string) {
                 if let Some(geom) = app.hit_map.pane_geometry(&anchor) {
@@ -1612,7 +1542,8 @@ async fn handle_mouse(
                 drag.is_active() && matches!(&drag.target, DragTarget::Sidebar)
             });
             if sidebar_drag {
-                app.prefs.sidebar_width = sidebar_width_for_column(col, app.term_size.0);
+                app.prefs.sidebar_width =
+                    crate::render::sidebar_width_for_column(col, app.term_size.0);
                 if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
                     log_err(&app.home, &error);
                 }
@@ -1759,46 +1690,6 @@ fn copy_active_selection(app: &mut App) {
     }
 }
 
-/// Move one item to the index occupied by another. Downward drags land after
-/// the target and upward drags before it, matching the direction of motion.
-/// Keep a persisted row in place when its identity-bearing label changes.
-/// If a stale copy of the new key already exists, remove the old entry rather
-/// than creating a duplicate.
-fn migrate_order_entry(order: &mut Vec<String>, old: &str, new: &str) -> bool {
-    if old == new {
-        return false;
-    }
-    let Some(old_index) = order.iter().position(|entry| entry == old) else {
-        return false;
-    };
-    if order.iter().any(|entry| entry == new) {
-        order.remove(old_index);
-    } else {
-        order[old_index] = new.to_string();
-    }
-    true
-}
-
-/// Preserve a pane's position when a daemon event reports an external rename
-/// or clear. Pane ids bind the before/after snapshots without guessing from
-/// display text.
-fn migrate_agent_order_entries(
-    order: &mut Vec<String>,
-    previous: &DecorationSnapshot,
-    next: &DecorationSnapshot,
-) -> bool {
-    let mut changed = false;
-    for pane in next.panes.values() {
-        let Some(old_pane) = previous.pane(&pane.pane_id) else {
-            continue;
-        };
-        let old_key = DecorationSnapshot::agent_order_key(old_pane);
-        let new_key = DecorationSnapshot::agent_order_key(pane);
-        changed |= migrate_order_entry(order, &old_key, &new_key);
-    }
-    changed
-}
-
 /// The divider drag's pending motion since the last applied step, if any:
 /// `(pane_id, axis, signed delta)`. A read-only helper so the borrow it
 /// takes on `app.drag` ends before [`apply_live_divider`] needs `&mut App`
@@ -1910,7 +1801,7 @@ async fn follow_workspace_folder(
     if let Some(row) = app.model.workspaces.get_mut(app.model.active_workspace) {
         row.name = next.clone();
     }
-    if migrate_order_entry(&mut app.prefs.workspace_order, &current_name, &next) {
+    if persist::migrate_order_entry(&mut app.prefs.workspace_order, &current_name, &next) {
         if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
             log_err(&app.home, &error);
         }
@@ -1947,34 +1838,6 @@ fn dialog_cancel(app: &mut App) {
     app.hover = None;
 }
 
-/// The editable buffer of an input dialog, if this dialog has one.
-fn dialog_buffer_mut(dialog: &mut Dialog) -> Option<&mut String> {
-    match dialog {
-        Dialog::NewTab { buffer }
-        | Dialog::NamePane { buffer, .. }
-        | Dialog::RenameTab { buffer, .. }
-        | Dialog::RenameWorkspace { buffer, .. } => Some(buffer),
-        _ => None,
-    }
-}
-
-/// Add printable pasted text to an input dialog. Line controls belong to a
-/// pane paste, never to a tmux tab or session name.
-fn append_dialog_text(dialog: Option<&mut Dialog>, text: &str) -> bool {
-    let Some(dialog) = dialog else {
-        return false;
-    };
-    if let Dialog::NamePane { error, .. } = dialog {
-        *error = None;
-    }
-    let Some(buffer) = dialog_buffer_mut(dialog) else {
-        return false;
-    };
-    let before = buffer.len();
-    buffer.extend(text.chars().filter(|ch| !ch.is_control()));
-    buffer.len() != before
-}
-
 /// Paste one outer-terminal bracketed paste into the focused pane in two
 /// tmux commands, regardless of payload length. On failure after load, the
 /// server-global buffer is removed best-effort so pasted text cannot linger.
@@ -1999,61 +1862,12 @@ async fn paste_into_focused_pane(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DialogKeyAction {
-    Confirm,
-    Cancel,
-    Backspace,
-    Append(char),
-    Scroll(i16),
-    ScrollStart,
-    ScrollEnd,
-    Ignore,
-}
-
-/// Resolve dialog keys without mutating application state. Every modal
-/// confirms on Enter and cancels on Escape, so one key means the same thing
-/// in every dialog. The read-only keybinds sheet has nothing to confirm, so
-/// Enter dismisses it.
-fn dialog_key_action(dialog: &Dialog, key: &KeyEvent) -> DialogKeyAction {
-    use crossterm::event::KeyCode;
-
-    if matches!(dialog, Dialog::Keybinds { .. }) {
-        return match key.code {
-            KeyCode::Esc | KeyCode::Enter => DialogKeyAction::Cancel,
-            KeyCode::Up => DialogKeyAction::Scroll(-1),
-            KeyCode::Down => DialogKeyAction::Scroll(1),
-            KeyCode::PageUp => DialogKeyAction::Scroll(-8),
-            KeyCode::PageDown => DialogKeyAction::Scroll(8),
-            KeyCode::Home => DialogKeyAction::ScrollStart,
-            KeyCode::End => DialogKeyAction::ScrollEnd,
-            _ => DialogKeyAction::Ignore,
-        };
-    }
-    let text_key = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
-    match key.code {
-        KeyCode::Esc => DialogKeyAction::Cancel,
-        KeyCode::Enter => DialogKeyAction::Confirm,
-        KeyCode::Backspace if dialog.has_input() => DialogKeyAction::Backspace,
-        KeyCode::Char(c) if dialog.has_input() && text_key => DialogKeyAction::Append(c),
-        _ => DialogKeyAction::Ignore,
-    }
-}
-
 fn keybind_scroll_limit(app: &App) -> u16 {
     let row_count = match app.dialog.as_ref() {
         Some(Dialog::Keybinds { rows, .. }) => rows.len(),
         _ => return 0,
     };
     crate::render::keybind_max_scroll(row_count, Rect::new(0, 0, app.term_size.0, app.term_size.1))
-}
-
-fn move_keybind_scroll(current: u16, delta: i16, max: u16) -> u16 {
-    if delta.is_negative() {
-        current.saturating_sub(delta.unsigned_abs()).min(max)
-    } else {
-        current.saturating_add(delta as u16).min(max)
-    }
 }
 
 async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_tmux::TmuxError> {
@@ -2229,7 +2043,7 @@ async fn handle_dialog_key(
     let Some(dialog) = app.dialog.as_ref() else {
         return Ok(InputOutcome::NoRedraw);
     };
-    let action = dialog_key_action(dialog, &key);
+    let action = dialog::dialog_key_action(dialog, &key);
     let max_scroll = keybind_scroll_limit(app);
     match action {
         DialogKeyAction::Cancel => {
@@ -2241,7 +2055,7 @@ async fn handle_dialog_key(
         }
         DialogKeyAction::Confirm => dialog_confirm(app, client).await?,
         DialogKeyAction::Backspace => {
-            if let Some(buffer) = app.dialog.as_mut().and_then(dialog_buffer_mut) {
+            if let Some(buffer) = app.dialog.as_mut().and_then(dialog::dialog_buffer_mut) {
                 buffer.pop();
             }
             if let Some(Dialog::NamePane { error, .. }) = app.dialog.as_mut() {
@@ -2250,11 +2064,11 @@ async fn handle_dialog_key(
         }
         DialogKeyAction::Append(c) => {
             let mut encoded = [0; 4];
-            append_dialog_text(app.dialog.as_mut(), c.encode_utf8(&mut encoded));
+            dialog::append_dialog_text(app.dialog.as_mut(), c.encode_utf8(&mut encoded));
         }
         DialogKeyAction::Scroll(delta) => {
             if let Some(Dialog::Keybinds { scroll, .. }) = app.dialog.as_mut() {
-                *scroll = move_keybind_scroll(*scroll, delta, max_scroll);
+                *scroll = dialog::move_keybind_scroll(*scroll, delta, max_scroll);
             }
         }
         DialogKeyAction::ScrollStart => {
@@ -2586,77 +2400,12 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_resize_is_bounded_by_readability_and_half_the_terminal() {
-        assert_eq!(clamp_sidebar_width(1, 200), SIDEBAR_MIN_WIDTH);
-        assert_eq!(clamp_sidebar_width(100, 200), SIDEBAR_MAX_WIDTH);
-        assert_eq!(clamp_sidebar_width(100, 50), 25);
-        assert_eq!(sidebar_width_for_column(30, 50), 25);
-    }
-
-    #[test]
     fn workspace_disclosure_click_toggles_both_directions() {
         let mut expanded = HashSet::new();
         assert!(toggle_workspace_expanded(&mut expanded, "$0".into()));
         assert!(expanded.contains("$0"));
         assert!(!toggle_workspace_expanded(&mut expanded, "$0".into()));
         assert!(!expanded.contains("$0"));
-    }
-
-    #[test]
-    fn renamed_sidebar_entries_keep_their_persisted_position() {
-        let mut order = vec!["alpha".into(), "beta".into(), "gamma".into()];
-        assert!(migrate_order_entry(&mut order, "beta", "renamed"));
-        assert_eq!(order, vec!["alpha", "renamed", "gamma"]);
-
-        let mut stale = vec!["old".into(), "new".into()];
-        assert!(migrate_order_entry(&mut stale, "old", "new"));
-        assert_eq!(stale, vec!["new"]);
-    }
-
-    #[test]
-    fn external_agent_rename_keeps_its_persisted_position() {
-        use crate::decoration::PaneDecoration;
-        use cyclops_proto::AgentState;
-
-        let snapshot = |label: &str| {
-            let mut snapshot = DecorationSnapshot::default();
-            snapshot.panes.insert(
-                "%7".into(),
-                PaneDecoration {
-                    pane_id: "%7".into(),
-                    window_id: "@2".into(),
-                    label: Some(label.into()),
-                    manifest: Some("claude".into()),
-                    manifest_display_name: Some("Claude Code".into()),
-                    state: AgentState::Idle,
-                    needs_attention: false,
-                },
-            );
-            snapshot
-        };
-        let mut order = vec!["name:reviewer".into(), "name:implementer".into()];
-        assert!(migrate_agent_order_entries(
-            &mut order,
-            &snapshot("reviewer"),
-            &snapshot("auditor")
-        ));
-        assert_eq!(order, vec!["name:auditor", "name:implementer"]);
-    }
-
-    #[test]
-    fn cancelling_a_sidebar_drag_restores_its_starting_width() {
-        let mut drag = DragState::on_down(DragTarget::Sidebar, 27, 5);
-        drag.on_move(38, 5);
-        assert_eq!(sidebar_width_on_cancel(&drag, 100), Some(28));
-
-        let tab = DragState::on_down(
-            DragTarget::Tab {
-                window_id: "@0".into(),
-            },
-            27,
-            5,
-        );
-        assert_eq!(sidebar_width_on_cancel(&tab, 100), None);
     }
 
     // -- Cancelling a workspace-row drag (Escape, or any other
@@ -2671,7 +2420,6 @@ mod tests {
             session_id: id.into(),
             name: name.into(),
             tab_count: 1,
-            active: false,
             window_ids: Vec::new(),
         };
         let tab = crate::model::TabModel {
@@ -2739,67 +2487,6 @@ mod tests {
     }
 
     #[test]
-    fn escape_is_consumed_when_it_cancels_a_chrome_operation() {
-        use crossterm::event::KeyCode;
-
-        assert!(escape_cancels_visual_state(KeyCode::Esc, true, false));
-        assert!(escape_cancels_visual_state(KeyCode::Esc, false, true));
-        assert!(!escape_cancels_visual_state(KeyCode::Esc, false, false));
-        assert!(!escape_cancels_visual_state(KeyCode::Char('x'), true, true));
-    }
-
-    #[test]
-    fn keybind_scroll_moves_immediately_after_end_and_never_overshoots() {
-        assert_eq!(move_keybind_scroll(4, 20, 10), 10);
-        assert_eq!(move_keybind_scroll(10, -1, 10), 9);
-        assert_eq!(move_keybind_scroll(0, -8, 10), 0);
-    }
-
-    #[test]
-    fn enter_confirms_a_destructive_dialog() {
-        let dialog = Dialog::ConfirmCloseTab {
-            window_id: "@1".into(),
-        };
-        let enter = KeyEvent::new(crossterm::event::KeyCode::Enter, KeyModifiers::empty());
-        assert_eq!(dialog_key_action(&dialog, &enter), DialogKeyAction::Confirm);
-    }
-
-    #[test]
-    fn enter_submits_an_input_dialog() {
-        let dialog = Dialog::NewTab {
-            buffer: "review".into(),
-        };
-        let enter = KeyEvent::new(crossterm::event::KeyCode::Enter, KeyModifiers::empty());
-        assert_eq!(dialog_key_action(&dialog, &enter), DialogKeyAction::Confirm);
-    }
-
-    #[test]
-    fn modified_characters_do_not_leak_into_dialog_text() {
-        let dialog = Dialog::NewTab {
-            buffer: String::new(),
-        };
-        let control_c = KeyEvent::new(crossterm::event::KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(
-            dialog_key_action(&dialog, &control_c),
-            DialogKeyAction::Ignore
-        );
-    }
-
-    #[test]
-    fn dialog_paste_keeps_text_and_drops_line_controls() {
-        let mut dialog = Dialog::NewTab {
-            buffer: "review".into(),
-        };
-        assert!(append_dialog_text(Some(&mut dialog), "-api\n\t"));
-        assert_eq!(
-            dialog,
-            Dialog::NewTab {
-                buffer: "review-api".into()
-            }
-        );
-    }
-
-    #[test]
     fn reconciled_model_follows_tmuxs_new_active_window() {
         let tab = |id: &str, pane: &str| crate::model::TabModel {
             window_id: id.into(),
@@ -2856,15 +2543,14 @@ mod tests {
             active_pane: "%1".into(),
             zoomed: false,
         };
-        let row = |id: &str, name: &str, active: bool| crate::model::WorkspaceRow {
+        let row = |id: &str, name: &str| crate::model::WorkspaceRow {
             session_id: id.into(),
             name: name.into(),
             tab_count: 1,
-            active,
             window_ids: vec!["@1".into()],
         };
         let mut model = WorkspaceModel {
-            workspaces: vec![row("$0", "alpha", false), row("$1", "beta", true)],
+            workspaces: vec![row("$0", "alpha"), row("$1", "beta")],
             active_workspace: 1,
             session: crate::model::SessionModel {
                 session: "beta".into(),
@@ -2886,7 +2572,6 @@ mod tests {
             session_id: id.into(),
             name: id.into(),
             tab_count: 1,
-            active: false,
             window_ids: vec!["@1".into()],
         };
         let rows = vec![row("$0"), row("$1")];
@@ -2906,22 +2591,6 @@ mod tests {
         // its agents without a second click.
         expand_active_workspace(&rows, 1, &mut expanded_for, &mut expanded);
         assert!(expanded.contains("$1"), "the workspace switched to opens");
-    }
-
-    #[test]
-    fn chrome_canvas_excludes_sidebar_and_tab_bar() {
-        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, false);
-        assert_eq!(areas.sidebar, Some(Rect::new(0, 0, 22, 50)));
-        assert_eq!(areas.tab_bar, Rect::new(22, 0, 178, 1));
-        assert_eq!(areas.canvas, Rect::new(22, 1, 178, 49));
-        assert_eq!(areas.panel, None);
-    }
-
-    #[test]
-    fn chrome_canvas_shrinks_for_event_stream() {
-        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, true);
-        assert_eq!(areas.panel, Some(Rect::new(160, 0, 40, 50)));
-        assert_eq!(areas.canvas, Rect::new(22, 1, 138, 49));
     }
 
     // -- `resolve_workspace_slot_drop`: the drop must match exactly what
@@ -3028,7 +2697,6 @@ mod tests {
             session_id: id.into(),
             name: name.into(),
             tab_count: 1,
-            active: false,
             window_ids: Vec::new(),
         };
         let tab = crate::model::TabModel {

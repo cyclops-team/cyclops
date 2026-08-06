@@ -34,7 +34,6 @@ pub async fn fetch_workspace_model(
             session_id: s.id.clone(),
             name: s.name.clone(),
             tab_count: s.windows.len(),
-            active: s.name == active_session,
             window_ids: s.windows.iter().map(|w| w.id.clone()).collect(),
         })
         .collect();

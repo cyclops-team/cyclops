@@ -1,6 +1,10 @@
-//! Durable workspace UI preferences and last-active state.
+//! Durable workspace UI preferences and last-active state, including
+//! keeping a persisted order list correct when the identity it was keyed
+//! on renames or is replaced.
 
 use std::path::Path;
+
+use crate::decoration::DecorationSnapshot;
 
 /// User intent persisted under `[workspace]` in config.toml.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +230,46 @@ pub fn reopen_fallback(
     ReopenTarget::OfferCreate
 }
 
+/// Move one item to the index occupied by another. Downward drags land after
+/// the target and upward drags before it, matching the direction of motion.
+/// Keep a persisted row in place when its identity-bearing label changes.
+/// If a stale copy of the new key already exists, remove the old entry rather
+/// than creating a duplicate.
+pub fn migrate_order_entry(order: &mut Vec<String>, old: &str, new: &str) -> bool {
+    if old == new {
+        return false;
+    }
+    let Some(old_index) = order.iter().position(|entry| entry == old) else {
+        return false;
+    };
+    if order.iter().any(|entry| entry == new) {
+        order.remove(old_index);
+    } else {
+        order[old_index] = new.to_string();
+    }
+    true
+}
+
+/// Preserve a pane's position when a daemon event reports an external rename
+/// or clear. Pane ids bind the before/after snapshots without guessing from
+/// display text.
+pub fn migrate_agent_order_entries(
+    order: &mut Vec<String>,
+    previous: &DecorationSnapshot,
+    next: &DecorationSnapshot,
+) -> bool {
+    let mut changed = false;
+    for pane in next.panes.values() {
+        let Some(old_pane) = previous.pane(&pane.pane_id) else {
+            continue;
+        };
+        let old_key = DecorationSnapshot::agent_order_key(old_pane);
+        let new_key = DecorationSnapshot::agent_order_key(pane);
+        changed |= migrate_order_entry(order, &old_key, &new_key);
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +411,46 @@ mod tests {
             reopen_fallback(&[], None, None, &[]),
             ReopenTarget::OfferCreate
         );
+    }
+
+    #[test]
+    fn renamed_sidebar_entries_keep_their_persisted_position() {
+        let mut order = vec!["alpha".into(), "beta".into(), "gamma".into()];
+        assert!(migrate_order_entry(&mut order, "beta", "renamed"));
+        assert_eq!(order, vec!["alpha", "renamed", "gamma"]);
+
+        let mut stale = vec!["old".into(), "new".into()];
+        assert!(migrate_order_entry(&mut stale, "old", "new"));
+        assert_eq!(stale, vec!["new"]);
+    }
+
+    #[test]
+    fn external_agent_rename_keeps_its_persisted_position() {
+        use crate::decoration::PaneDecoration;
+        use cyclops_proto::AgentState;
+
+        let snapshot = |label: &str| {
+            let mut snapshot = DecorationSnapshot::default();
+            snapshot.panes.insert(
+                "%7".into(),
+                PaneDecoration {
+                    pane_id: "%7".into(),
+                    window_id: "@2".into(),
+                    label: Some(label.into()),
+                    manifest: Some("claude".into()),
+                    manifest_display_name: Some("Claude Code".into()),
+                    state: AgentState::Idle,
+                    needs_attention: false,
+                },
+            );
+            snapshot
+        };
+        let mut order = vec!["name:reviewer".into(), "name:implementer".into()];
+        assert!(migrate_agent_order_entries(
+            &mut order,
+            &snapshot("reviewer"),
+            &snapshot("auditor")
+        ));
+        assert_eq!(order, vec!["name:auditor", "name:implementer"]);
     }
 }

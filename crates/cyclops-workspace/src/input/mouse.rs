@@ -166,6 +166,21 @@ impl HitMap {
     }
 }
 
+/// Whether this motion arrives on, or departs from, the sidebar's create
+/// button. Both edges have to reach the renderer: one lights the button,
+/// the other puts it out, and a filter that only let the arrival through
+/// would leave it lit wherever the mouse went next.
+pub fn motion_touches_new_workspace_button(
+    hit_map: &HitMap,
+    hover: Option<(u16, u16)>,
+    col: u16,
+    row: u16,
+) -> bool {
+    let on_button =
+        |col: u16, row: u16| matches!(hit_map.hit(col, row), Some(HitTarget::NewWorkspaceButton));
+    on_button(col, row) || hover.is_some_and(|(col, row)| on_button(col, row))
+}
+
 /// Open menu state — at most one menu is open at a time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuState {
