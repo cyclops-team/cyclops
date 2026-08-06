@@ -336,7 +336,7 @@ echo "#### Rung 1: one pane, persistence, history"
 run "$CYC" start --setup-only --plain
 check "setup writes the config"           'wrote .*/config\.toml$'
 check "setup installs the themes"         '^  wrote 7 themes to .*/themes$'
-check "setup installs the manifests"      '^  wrote 3 detection manifests to .*/manifests$'
+check "setup installs the manifests"      '^  wrote 4 detection manifests to .*/manifests$'
 
 # Two budgets raised above their defaults, for the rig and not for cyclops.
 # The stand-in answers a delivery by spawning jq and `cyclops hook`, which
@@ -489,7 +489,7 @@ check "--raw without detection is a usage error" 'pairs with --source detection'
 check_exit "and exits 2" 2
 
 run "$CYC" name "$P2" reviewer --manifest cluade --plain
-check "an unknown manifest lists the known ones" '^no manifest "cluade"; loaded: agy, claude, codex, demo$'
+check "an unknown manifest lists the known ones" '^no manifest "cluade"; loaded: agy, claude, codex, cursor, demo$'
 
 echo
 echo "#### Rung 4: layouts"
@@ -781,7 +781,7 @@ printf '\n$ cd ~/scratch && cyclops start --setup-only\n'
 duo "$CYC" start --setup-only --plain > "$OUT" 2>&1
 cat "$OUT"
 check "setup writes the config"           'wrote .*/config\.toml$'
-check "and installs the manifests"        '^  wrote 3 detection manifests to .*/manifests$'
+check "and installs the manifests"        '^  wrote 4 detection manifests to .*/manifests$'
 check_absent "and opens nothing"          'workspace ready'
 
 # The daemon runs from the same empty directory. Nothing in the config
@@ -818,7 +818,7 @@ printf '\n$ cyclops status\n'
 duo "$CYC" status --plain > "$OUT" 2>&1
 cat "$OUT"
 check "an unknown pane is on the grid"    '\? unknown'
-check "and the grid says why"             'panes read unknown: none of agy, claude, codex matches what is running there'
+check "and the grid says why"             'panes read unknown: none of agy, claude, codex, cursor matches what is running there'
 check "and what to do about it"           'Pin one: cyclops name .* --manifest <id>'
 
 # Teaching cyclops the CLI in those panes is one file in the home
