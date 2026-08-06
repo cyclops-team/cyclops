@@ -1507,6 +1507,12 @@ async fn handle_mouse(
 /// `Agent` resolve here — a divider applies live during motion
 /// ([`apply_live_divider`]) and a sidebar-width drag already applied and
 /// persisted above.
+///
+/// `Workspace` is the one variant that does NOT resolve through a dropped-
+/// on hit target: [`resolve_workspace_slot_drop`] recomputes the exact
+/// slot [`crate::drag::slot_for_row`] would preview at the release point,
+/// so the drop always matches the live insertion rule the user watched
+/// track their pointer — never a second, possibly disagreeing, resolution.
 async fn commit_drag_drop(
     app: &mut App,
     client: &ControlClient,
@@ -1520,13 +1526,10 @@ async fn commit_drag_drop(
             drop.and_then(|drop| action::resolve_tab_drop(window_id, &drop))
         }
         DragTarget::Workspace { session_id, .. } => {
-            let order: Vec<String> = app
-                .model
-                .workspaces
-                .iter()
-                .map(|w| w.session_id.clone())
-                .collect();
-            drop.and_then(|drop| action::resolve_workspace_drop(session_id, &drop, &order))
+            let sidebar = app
+                .chrome(Rect::new(0, 0, app.term_size.0, app.term_size.1))
+                .sidebar;
+            resolve_workspace_slot_drop(&app.hit_map, sidebar, session_id, col, row)
         }
         DragTarget::Agent {
             workspace_id,
@@ -1544,6 +1547,43 @@ async fn commit_drag_drop(
     let outcome = exec::execute(app, client, action).await?;
     apply_outcome(app, outcome);
     Ok(())
+}
+
+/// Resolve a workspace-row drag release into the exact [`Action`] its live
+/// preview showed. `None` — leave the order exactly as it was, dispatch
+/// nothing — covers every case that is not a real move:
+///
+/// - the release point is outside the sidebar entirely (no rule was
+///   showing there to honor);
+/// - the sidebar is not visible at all (`sidebar` is `None`);
+/// - the previewed slot is one of the two boundaries touching the dragged
+///   row's own position (dropping it back where it started); or
+/// - the dragged workspace has vanished from the model mid-drag (closed by
+///   another client) — a stale drop, not a move.
+///
+/// This is a pure function of the last painted frame's hit rects and the
+/// release point — no tmux call, nothing async — so both the rule's
+/// destination and this function answer the identical question the
+/// identical way; see [`crate::drag::slot_for_row`] and
+/// [`crate::drag::insertion_for_slot`].
+fn resolve_workspace_slot_drop(
+    hit_map: &crate::input::mouse::HitMap,
+    sidebar: Option<Rect>,
+    session_id: &str,
+    col: u16,
+    row: u16,
+) -> Option<action::Action> {
+    let sidebar = sidebar?;
+    if !sidebar.contains(ratatui::layout::Position::from((col, row))) {
+        return None;
+    }
+    let blocks = hit_map.workspace_blocks();
+    let slot = crate::drag::slot_for_row(&blocks, row);
+    let insertion = crate::drag::insertion_for_slot(&blocks, session_id, slot)?;
+    Some(action::Action::ReorderWorkspace {
+        session_id: session_id.to_string(),
+        insertion,
+    })
 }
 
 /// The sidebar agent order for one workspace, keyed the same way
@@ -2115,6 +2155,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
                     &mut app.hit_map,
                     &app.decoration,
                     app.hover,
+                    app.drag.as_ref(),
                 );
             }
             paint_tab_bar(
@@ -2196,6 +2237,42 @@ pub fn print_help_and_exit() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A minimal `App` for tests that only need model/prefs/drag state, not
+    /// a live pane runtime — mirrors `exec::tests::test_app`, which is
+    /// private to that module and so cannot be reused directly here.
+    fn test_app(model: WorkspaceModel, home: std::path::PathBuf) -> App {
+        App {
+            model,
+            runtimes: RuntimeRegistry::default(),
+            router: Router::new(crate::bindings::default_bindings()),
+            paint: Paint::for_test(),
+            socket: None,
+            dialog: None,
+            link_state: LinkState::Live,
+            paused_panes: HashSet::new(),
+            reconnect_attempt: 0,
+            hit_map: HitMap::default(),
+            menu: MenuState::None,
+            hover: None,
+            selection: SelectionState::default(),
+            drag: None,
+            decoration: DecorationSnapshot::default(),
+            prefs: WorkspacePrefs::default(),
+            expanded_workspaces: HashSet::new(),
+            expanded_for: None,
+            watched_sessions: HashSet::new(),
+            event_stream_open: false,
+            event_lines: Vec::new(),
+            term_size: (40, 12),
+            declared_client_size: None,
+            needs_reconcile: false,
+            needs_hydrate: false,
+            paste_seq: 0,
+            home,
+            folder_probe_at: None,
+        }
+    }
 
     #[test]
     fn help_exits_zero_message() {
@@ -2342,6 +2419,85 @@ mod tests {
             5,
         );
         assert_eq!(sidebar_width_on_cancel(&tab, 100), None);
+    }
+
+    // -- Cancelling a workspace-row drag (Escape, or any other
+    // `cancel_drag` path) must leave the model order and prefs exactly as
+    // they were: `cancel_drag` only ever restores the sidebar WIDTH for a
+    // `DragTarget::Sidebar` drag, and a `Workspace` drag never touched the
+    // model to begin with — nothing here is undone because nothing was
+    // ever applied while the drag was live. --
+    #[test]
+    fn cancelling_a_workspace_reorder_drag_leaves_order_and_prefs_untouched() {
+        let row = |id: &str, name: &str| crate::model::WorkspaceRow {
+            session_id: id.into(),
+            name: name.into(),
+            tab_count: 1,
+            active: false,
+            window_ids: Vec::new(),
+        };
+        let tab = crate::model::TabModel {
+            window_id: "@0".into(),
+            name: "1".into(),
+            layout: crate::layout::ResolvedLayout::Leaf {
+                pane_id: "%0".into(),
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            active_pane: "%0".into(),
+            zoomed: false,
+        };
+        let model = WorkspaceModel {
+            workspaces: vec![row("$a", "a"), row("$b", "b"), row("$c", "c")],
+            active_workspace: 0,
+            session: crate::model::SessionModel {
+                session: "a".into(),
+                tabs: vec![tab],
+                active_tab: 0,
+            },
+            sidebar_visible: true,
+        };
+        let mut app = test_app(
+            model,
+            cyclops_proto::scratch::scratch_dir("cancel-workspace-drag"),
+        );
+        let orders_before = (
+            app.model
+                .workspaces
+                .iter()
+                .map(|w| w.session_id.clone())
+                .collect::<Vec<_>>(),
+            app.prefs.workspace_order.clone(),
+        );
+        let mut drag = DragState::on_down(
+            DragTarget::Workspace {
+                session_id: "$c".into(),
+                session: "c".into(),
+            },
+            5,
+            5,
+        );
+        drag.on_move(5, 3);
+        assert!(drag.is_active(), "past the 1-cell sidebar row threshold");
+        app.drag = Some(drag);
+
+        cancel_drag(&mut app);
+
+        assert!(app.drag.is_none(), "cancel always clears the drag");
+        assert_eq!(
+            (
+                app.model
+                    .workspaces
+                    .iter()
+                    .map(|w| w.session_id.clone())
+                    .collect::<Vec<_>>(),
+                app.prefs.workspace_order.clone(),
+            ),
+            orders_before,
+            "cancelling must not reorder the model or touch prefs"
+        );
     }
 
     #[test]
@@ -2528,5 +2684,206 @@ mod tests {
         let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, true);
         assert_eq!(areas.panel, Some(Rect::new(160, 0, 40, 50)));
         assert_eq!(areas.canvas, Rect::new(22, 1, 138, 49));
+    }
+
+    // -- `resolve_workspace_slot_drop`: the drop must match exactly what
+    // the live rule would have previewed at the same point, computed the
+    // same way (`crate::drag::slot_for_row` + `insertion_for_slot`), never
+    // re-derived from whatever hit target happens to sit under the
+    // release. --
+
+    fn sidebar_rows(rows: &[(&str, &str, u16)]) -> HitMap {
+        let mut hits = HitMap::default();
+        for (session_id, session, y) in rows {
+            hits.push(
+                Rect::new(2, *y, 18, 1),
+                HitTarget::SidebarRow {
+                    session_id: session_id.to_string(),
+                    session: session.to_string(),
+                },
+            );
+        }
+        hits
+    }
+
+    #[test]
+    fn a_valid_drop_resolves_the_previewed_insertion() {
+        let hits = sidebar_rows(&[("$a", "a", 3), ("$b", "b", 4), ("$c", "c", 5)]);
+        let sidebar = Some(Rect::new(0, 0, 22, 10));
+
+        // $c, picked up and released on $a's row, previews "before $a" —
+        // the same slot a pointer at row 3 would have shown all along.
+        assert_eq!(
+            resolve_workspace_slot_drop(&hits, sidebar, "$c", 5, 3),
+            Some(action::Action::ReorderWorkspace {
+                session_id: "$c".into(),
+                insertion: action::Insertion::Before("$a".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn a_release_outside_the_sidebar_resolves_nothing() {
+        let hits = sidebar_rows(&[("$a", "a", 3), ("$b", "b", 4)]);
+        let sidebar = Some(Rect::new(0, 0, 22, 10));
+
+        // Column 30 is past the sidebar's right edge: released over the
+        // pane canvas, not the sidebar, even though the row lines up with
+        // a workspace row.
+        assert_eq!(
+            resolve_workspace_slot_drop(&hits, sidebar, "$a", 30, 3),
+            None
+        );
+        // No sidebar painted at all (hidden).
+        assert_eq!(resolve_workspace_slot_drop(&hits, None, "$a", 5, 3), None);
+    }
+
+    #[test]
+    fn a_drop_that_does_not_move_the_row_resolves_nothing() {
+        let hits = sidebar_rows(&[("$a", "a", 3), ("$b", "b", 4)]);
+        let sidebar = Some(Rect::new(0, 0, 22, 10));
+
+        // Releasing $a back on its own row previews "before $a" — its own
+        // position, not a move.
+        assert_eq!(
+            resolve_workspace_slot_drop(&hits, sidebar, "$a", 5, 3),
+            None
+        );
+    }
+
+    #[test]
+    fn a_stale_drop_against_a_vanished_workspace_resolves_nothing() {
+        let hits = sidebar_rows(&[("$a", "a", 3), ("$b", "b", 4)]);
+        let sidebar = Some(Rect::new(0, 0, 22, 10));
+
+        assert_eq!(
+            resolve_workspace_slot_drop(&hits, sidebar, "$gone", 5, 3),
+            None
+        );
+    }
+
+    // -- End to end through `commit_drag_drop`: a valid drop dispatches
+    // exactly one `ReorderWorkspace` and persists exactly once. Executor
+    // tests (`app::exec::tests`) already cover what the dispatched action
+    // itself does; this proves the resolution-to-dispatch wiring. --
+
+    #[tokio::test]
+    async fn a_valid_workspace_drop_dispatches_one_reorder_and_persists_once() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("app-workspace-drop");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+
+        let home = cyclops_proto::scratch::scratch_dir("app-workspace-drop-home");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("scratch home");
+
+        let row = |id: &str, name: &str| crate::model::WorkspaceRow {
+            session_id: id.into(),
+            name: name.into(),
+            tab_count: 1,
+            active: false,
+            window_ids: Vec::new(),
+        };
+        let tab = crate::model::TabModel {
+            window_id: "@0".into(),
+            name: "1".into(),
+            layout: crate::layout::ResolvedLayout::Leaf {
+                pane_id: "%0".into(),
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            active_pane: "%0".into(),
+            zoomed: false,
+        };
+        let model = WorkspaceModel {
+            workspaces: vec![row("$a", "a"), row("$b", "b"), row("$c", "c")],
+            active_workspace: 0,
+            session: crate::model::SessionModel {
+                session: "a".into(),
+                tabs: vec![tab],
+                active_tab: 0,
+            },
+            sidebar_visible: true,
+        };
+        let mut app = test_app(model, home.clone());
+
+        // Fixture rects standing in for "the last frame actually painted" —
+        // narrower than proving `paint_sidebar` itself (that's render.rs's
+        // job), just enough to exercise `commit_drag_drop`'s wiring.
+        let sidebar = app
+            .chrome(Rect::new(0, 0, app.term_size.0, app.term_size.1))
+            .sidebar
+            .expect("sidebar visible");
+        app.hit_map.push(
+            Rect::new(sidebar.x + 2, 3, 10, 1),
+            HitTarget::SidebarRow {
+                session_id: "$a".into(),
+                session: "a".into(),
+            },
+        );
+        app.hit_map.push(
+            Rect::new(sidebar.x + 2, 4, 10, 1),
+            HitTarget::SidebarRow {
+                session_id: "$b".into(),
+                session: "b".into(),
+            },
+        );
+        app.hit_map.push(
+            Rect::new(sidebar.x + 2, 5, 10, 1),
+            HitTarget::SidebarRow {
+                session_id: "$c".into(),
+                session: "c".into(),
+            },
+        );
+        assert!(
+            sidebar.contains(ratatui::layout::Position::from((sidebar.x + 2, 3))),
+            "fixture rows must sit inside the real sidebar rect"
+        );
+
+        // $c is picked up and released on $a's row.
+        commit_drag_drop(
+            &mut app,
+            &client,
+            &DragTarget::Workspace {
+                session_id: "$c".into(),
+                session: "c".into(),
+            },
+            sidebar.x + 2,
+            3,
+        )
+        .await
+        .expect("commit");
+
+        assert_eq!(
+            app.model
+                .workspaces
+                .iter()
+                .map(|w| w.session_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["$c".to_string(), "$a".to_string(), "$b".to_string()],
+        );
+        assert_eq!(
+            app.prefs.workspace_order,
+            vec!["c".to_string(), "a".to_string(), "b".to_string()]
+        );
+        let reloaded = crate::persist::load_prefs(&home);
+        assert_eq!(
+            reloaded.workspace_order, app.prefs.workspace_order,
+            "the promised persist must have actually round-tripped"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+        client.shutdown().await;
     }
 }

@@ -407,10 +407,20 @@ pub fn paint_sidebar(
     hits: &mut HitMap,
     decoration: &DecorationSnapshot,
     hover: Option<(u16, u16)>,
+    drag: Option<&DragState>,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
+    // A live workspace-row drag: which row is grabbed (dimmed in the loop
+    // below) and, once the pointer is actually over this sidebar, which
+    // slot it currently previews.
+    let dragging_session = drag
+        .filter(|d| d.is_active())
+        .and_then(|d| match &d.target {
+            DragTarget::Workspace { session_id, .. } => Some(session_id.as_str()),
+            _ => None,
+        });
     buf.set_style(area, theme::chrome_panel(paint));
     let block = Block::default()
         .borders(Borders::RIGHT)
@@ -477,19 +487,25 @@ pub fn paint_sidebar(
         }
         let expanded = expanded_workspaces.contains(&ws.session_id);
         let marker = if expanded { "▾" } else { "▸" };
-        let style = if i == active {
+        // The color cue (dim) is redundant with a non-color one (the grip
+        // glyph prefix) — see rule 11 and `theme::sidebar_row_dragging`.
+        let dragging = dragging_session == Some(ws.session_id.as_str());
+        let style = if dragging {
+            theme::sidebar_row_dragging(paint)
+        } else if i == active {
             theme::sidebar_workspace_active(paint)
         } else {
             theme::sidebar_workspace(paint)
         };
         let row = Rect::new(inner.x, y, inner.width, 1);
         buf.set_style(row, style);
+        let grip = if dragging { "⇅ " } else { "" };
         overlay_text(
             buf,
             content,
             content.x,
             y,
-            &format!("{marker} {} ({})", ws.name, ws.tab_count),
+            &format!("{grip}{marker} {} ({})", ws.name, ws.tab_count),
             style,
         );
         hits.push(
@@ -551,6 +567,23 @@ pub fn paint_sidebar(
                 },
             );
             y += 1;
+        }
+    }
+
+    // The live drop preview: a full-width rule at the boundary the drag
+    // currently previews, painted only once the pointer is actually over
+    // this sidebar — a pointer that has strayed elsewhere (a pane, the tab
+    // bar) shows no rule, matching that a release there leaves order
+    // unchanged. Terminal rows have no sub-row resolution, so "between two
+    // rows" is approximated as the row itself, repainted as a rule for as
+    // long as the drag stays live.
+    if let Some(drag) = drag.filter(|d| d.is_active() && dragging_session.is_some()) {
+        if area.contains(ratatui::layout::Position::from(drag.current)) {
+            let blocks = hits.workspace_blocks();
+            let slot = crate::drag::slot_for_row(&blocks, drag.current.1);
+            if let Some(rule_y) = crate::drag::boundary_row(&blocks, slot) {
+                paint_insertion_rule(buf, inner, rule_y, paint);
+            }
         }
     }
 
@@ -1355,6 +1388,19 @@ fn fill_blank(area: Rect, buf: &mut Buffer, base: Style) {
     }
 }
 
+/// The workspace-reorder drop indicator: a full-width accent rule at row
+/// `y`, spanning `area`'s usable width. Called only while a workspace-row
+/// drag is live and the pointer sits over the sidebar — see the call site
+/// in [`paint_sidebar`].
+fn paint_insertion_rule(buf: &mut Buffer, area: Rect, y: u16, paint: &Paint) {
+    if area.width == 0 || y < area.y || y >= area.y + area.height {
+        return;
+    }
+    let style = theme::drag_insertion_rule(paint);
+    let rule: String = "─".repeat(area.width as usize);
+    buf.set_stringn(area.x, y, &rule, area.width as usize, style);
+}
+
 fn paint_drag_preview(drag: &DragState, buf: &mut Buffer, paint: &Paint) {
     let style = theme::pane_border_focused(paint);
     let (x, y) = drag.current;
@@ -1724,6 +1770,7 @@ mod tests {
                     &mut hits,
                     &DecorationSnapshot::default(),
                     hover,
+                    None,
                 );
             })
             .unwrap();
@@ -1795,6 +1842,7 @@ mod tests {
                 &mut hits,
                 &DecorationSnapshot::default(),
                 None,
+                None,
             );
         })
         .unwrap();
@@ -1829,6 +1877,118 @@ mod tests {
         ));
         assert!(flat.contains("menu"), "menu button should render: {flat}");
         assert!(flat.contains('+'), "create button should render: {flat}");
+    }
+
+    /// A live workspace-row drag must (1) mark the grabbed row with a
+    /// non-color cue on top of the color one, and (2) paint a full-width
+    /// rule at the exact boundary the drag currently previews — the same
+    /// slot math `commit_drag_drop` uses to resolve the drop, so what the
+    /// user watches while dragging is what actually lands.
+    #[test]
+    fn dragging_a_workspace_row_dims_it_and_paints_the_previewed_rule() {
+        let workspaces = vec![
+            WorkspaceRow {
+                session_id: "$0".into(),
+                name: "cyclops".into(),
+                tab_count: 2,
+                active: true,
+                window_ids: vec!["@0".into()],
+            },
+            WorkspaceRow {
+                session_id: "$1".into(),
+                name: "website".into(),
+                tab_count: 1,
+                active: false,
+                window_ids: vec!["@1".into()],
+            },
+        ];
+        // Both collapsed: rows 3 ($0) and 4 ($1), matching
+        // `sidebar_rows_render_and_hit_test_aligned`.
+        let expanded = std::collections::HashSet::new();
+        let theme = Paint::for_test();
+
+        let render = |drag: Option<&DragState>| {
+            let backend = TestBackend::new(20, 8);
+            let mut term = Terminal::new(backend).unwrap();
+            let mut hits = HitMap::default();
+            term.draw(|f| {
+                paint_sidebar(
+                    &workspaces,
+                    0,
+                    "%0",
+                    &expanded,
+                    &[],
+                    f.area(),
+                    f.buffer_mut(),
+                    &theme,
+                    &mut hits,
+                    &DecorationSnapshot::default(),
+                    None,
+                    drag,
+                );
+            })
+            .unwrap();
+            term.backend().buffer().clone()
+        };
+
+        let at_rest = render(None);
+
+        // $1 (website, row 4) is picked up and dragged onto $0's row (3) —
+        // the rule should preview inserting before $0.
+        let mut drag = DragState::on_down(
+            DragTarget::Workspace {
+                session_id: "$1".into(),
+                session: "website".into(),
+            },
+            3,
+            4,
+        );
+        drag.on_move(3, 3);
+        assert!(drag.is_active(), "past the 1-cell sidebar row threshold");
+        let dragging = render(Some(&drag));
+
+        // (1) The grabbed row keeps its name but gains a non-color grip
+        // glyph and a materially different style than at rest — color
+        // alone never carries this.
+        let row4 = |buf: &Buffer| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, 4)].symbol().to_string())
+                .collect::<String>()
+        };
+        assert!(
+            row4(&dragging).contains('⇅'),
+            "the grabbed row shows a non-color marker glyph: {}",
+            row4(&dragging)
+        );
+        assert!(
+            row4(&dragging).contains("website"),
+            "the grabbed row's own name stays visible while dragging"
+        );
+        assert_ne!(
+            dragging[(2, 4)].style(),
+            at_rest[(2, 4)].style(),
+            "the grabbed row's style must change while dragging"
+        );
+
+        // (2) The rule paints across the sidebar's usable width at row 3 —
+        // the previewed boundary — and nowhere else.
+        let inner_width = 19; // area width 20 minus the 1-cell right border
+        for x in 0..inner_width {
+            assert_eq!(
+                dragging[(x, 3)].symbol(),
+                "─",
+                "the rule should span the full sidebar width at column {x}"
+            );
+        }
+        assert_ne!(
+            dragging[(inner_width, 3)].symbol(),
+            "─",
+            "the rule must not paint over the sidebar's own border column"
+        );
+        // Rows other than the previewed boundary are unaffected by the
+        // rule (row 4 still reads as the grabbed row's own text, not a
+        // second copy of the line).
+        assert_ne!(dragging[(0, 4)].symbol(), "─");
     }
 
     #[test]
@@ -1888,6 +2048,7 @@ mod tests {
                 &theme,
                 &mut hits,
                 &decoration,
+                None,
                 None,
             );
         })

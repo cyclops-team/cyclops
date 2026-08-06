@@ -102,6 +102,36 @@ impl HitMap {
         }
     }
 
+    /// The sidebar's workspace rows as contiguous vertical blocks, built
+    /// from the rects the last frame actually painted rather than
+    /// recomputed independently — see [`crate::drag::WorkspaceBlock`]. Each
+    /// `SidebarRow` starts a new block; any `SidebarAgent` rows pushed
+    /// right after it (only present while that workspace is expanded) fold
+    /// into the SAME block, so the boundary math built on top of this never
+    /// lands inside one's agent rows. A workspace the sidebar clipped for
+    /// lack of height never got a rect pushed, so it is simply absent here.
+    pub fn workspace_blocks(&self) -> Vec<crate::drag::WorkspaceBlock> {
+        let mut blocks: Vec<crate::drag::WorkspaceBlock> = Vec::new();
+        for region in &self.regions {
+            match &region.target {
+                HitTarget::SidebarRow { session_id, .. } => {
+                    blocks.push(crate::drag::WorkspaceBlock {
+                        session_id: session_id.clone(),
+                        top: region.rect.y,
+                        bottom: region.rect.y + region.rect.height,
+                    });
+                }
+                HitTarget::SidebarAgent { .. } => {
+                    if let Some(last) = blocks.last_mut() {
+                        last.bottom = last.bottom.max(region.rect.y + region.rect.height);
+                    }
+                }
+                _ => {}
+            }
+        }
+        blocks
+    }
+
     pub fn hit(&self, col: u16, row: u16) -> Option<&HitTarget> {
         self.regions
             .iter()
@@ -180,6 +210,82 @@ mod tests {
             map.hit(9, 9),
             Some(HitTarget::Tab { window_id }) if window_id == "@0"
         ));
+    }
+
+    #[test]
+    fn workspace_blocks_folds_agent_rows_into_their_own_workspace() {
+        let mut map = HitMap::default();
+        // $a is collapsed: one row, one block.
+        map.push(
+            Rect::new(0, 3, 20, 1),
+            HitTarget::SidebarRow {
+                session_id: "$a".into(),
+                session: "a".into(),
+            },
+        );
+        // $b is expanded: its header plus two agent rows fold into one
+        // block spanning rows 4..7.
+        map.push(
+            Rect::new(0, 4, 20, 1),
+            HitTarget::SidebarRow {
+                session_id: "$b".into(),
+                session: "b".into(),
+            },
+        );
+        map.push(
+            Rect::new(0, 5, 20, 1),
+            HitTarget::SidebarAgent {
+                workspace_id: "$b".into(),
+                pane_id: "%1".into(),
+                order_key: "pane:%1".into(),
+            },
+        );
+        map.push(
+            Rect::new(0, 6, 20, 1),
+            HitTarget::SidebarAgent {
+                workspace_id: "$b".into(),
+                pane_id: "%2".into(),
+                order_key: "pane:%2".into(),
+            },
+        );
+        // A disclosure hit is pushed alongside every row but must not
+        // create a block of its own.
+        map.push(
+            Rect::new(0, 3, 1, 1),
+            HitTarget::SidebarDisclosure {
+                session_id: "$a".into(),
+            },
+        );
+
+        let blocks = map.workspace_blocks();
+
+        assert_eq!(
+            blocks,
+            vec![
+                crate::drag::WorkspaceBlock {
+                    session_id: "$a".into(),
+                    top: 3,
+                    bottom: 4,
+                },
+                crate::drag::WorkspaceBlock {
+                    session_id: "$b".into(),
+                    top: 4,
+                    bottom: 7,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_blocks_is_empty_without_any_sidebar_rows() {
+        let mut map = HitMap::default();
+        map.push(
+            Rect::new(0, 0, 10, 1),
+            HitTarget::Tab {
+                window_id: "@0".into(),
+            },
+        );
+        assert!(map.workspace_blocks().is_empty());
     }
 
     #[test]

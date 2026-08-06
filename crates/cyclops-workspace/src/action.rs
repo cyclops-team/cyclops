@@ -45,8 +45,19 @@
 //! | Divider drag motion (coalesced per render deadline) | [`resolve_pane_resize`] |
 //! | Drag released without crossing the reorder threshold | [`route_drag_click`] |
 //! | Tab drag released onto another hit target | [`resolve_tab_drop`] |
-//! | Workspace-row drag released onto another row | [`resolve_workspace_drop`] |
 //! | Sidebar-agent drag released onto another row | [`resolve_agent_drop`] |
+//!
+//! Workspace-row drag release is the one exception to "every device routes
+//! through this module": it does not resolve against whichever hit target
+//! happens to sit under the release point. A live insertion rule tracks the
+//! pointer while the drag is active (`render::paint_sidebar`), and the drop
+//! has to land exactly where that rule pointed — including "before the
+//! first row" and "after the last," neither of which is any row's own hit
+//! target. `app::resolve_workspace_slot_drop` answers that by re-running
+//! the same slot math the rule painted with
+//! ([`crate::drag::slot_for_row`], [`crate::drag::insertion_for_slot`])
+//! against the release point, rather than adding a second, possibly
+//! disagreeing, resolution here.
 //!
 //! `HitTarget::MenuItem` is deliberately absent from [`route_mouse_click`]:
 //! it needs the open `MenuState` to mean anything, so a caller must route it
@@ -60,11 +71,15 @@
 //!
 //! `Action` deliberately does not cover the exact pixel/half-row geometry
 //! that decides *where* a sidebar drop lands relative to its target row.
-//! [`resolve_insertion`] mirrors the current index-shift rule (dragging
-//! down inserts after the target, dragging up inserts before it) restated
-//! over stable ids; a later task that renders a live insertion rule may
-//! refine the decision without changing [`Action::ReorderWorkspace`],
-//! [`Action::ReorderAgent`], or [`Insertion`] themselves.
+//! [`resolve_insertion`] mirrors the index-shift rule (dragging down
+//! inserts after the target, dragging up inserts before it) restated over
+//! stable ids, and still answers that question for
+//! [`resolve_agent_drop`]'s target-row drops. Workspace-row dragging was
+//! refined exactly as anticipated: [`crate::drag::insertion_for_slot`]
+//! answers the same question from the live rule's own previewed slot
+//! instead of a dropped-on row, without changing
+//! [`Action::ReorderWorkspace`], [`Action::ReorderAgent`], or [`Insertion`]
+//! themselves.
 
 use crossterm::event::MouseButton;
 use cyclops_tmux::{PaneDirection, SplitDirection};
@@ -463,7 +478,7 @@ fn non_empty(buffer: &str) -> Option<String> {
 /// sidebar rows, sidebar agents, dividers, the sidebar splitter) resolves
 /// no action here; its click-without-drag fallback is
 /// [`route_drag_click`], and its drag-release commit is
-/// [`resolve_tab_drop`], [`resolve_workspace_drop`], or
+/// [`resolve_tab_drop`], `app::resolve_workspace_slot_drop`, or
 /// [`resolve_agent_drop`].
 pub fn route_mouse_click(target: &HitTarget, button: MouseButton) -> Option<Action> {
     match (target, button) {
@@ -568,27 +583,6 @@ pub fn resolve_tab_drop(window_id: &str, drop: &HitTarget) -> Option<Action> {
         }),
         _ => None,
     }
-}
-
-/// Resolve a workspace-row drag released on another row. `order` is the
-/// current sidebar order, top to bottom, by stable session id.
-pub fn resolve_workspace_drop(
-    session_id: &str,
-    drop: &HitTarget,
-    order: &[String],
-) -> Option<Action> {
-    let HitTarget::SidebarRow {
-        session_id: target_id,
-        ..
-    } = drop
-    else {
-        return None;
-    };
-    let insertion = resolve_insertion(order, session_id, target_id)?;
-    Some(Action::ReorderWorkspace {
-        session_id: session_id.to_string(),
-        insertion,
-    })
 }
 
 /// Resolve a sidebar-agent drag released on another agent row in the same
@@ -1218,30 +1212,9 @@ mod tests {
         assert_eq!(resolve_insertion(&order, "$missing", "$a"), None);
     }
 
-    #[test]
-    fn resolve_workspace_drop_wraps_insertion_with_the_session_id() {
-        let order = vec!["$a".to_string(), "$b".to_string(), "$c".to_string()];
-        let drop = HitTarget::SidebarRow {
-            session_id: "$a".into(),
-            session: "alpha".into(),
-        };
-        assert_eq!(
-            resolve_workspace_drop("$c", &drop, &order),
-            Some(Action::ReorderWorkspace {
-                session_id: "$c".into(),
-                insertion: Insertion::Before("$a".into()),
-            })
-        );
-    }
-
-    #[test]
-    fn resolve_workspace_drop_on_a_non_sidebar_row_resolves_nothing() {
-        let order = vec!["$a".to_string(), "$b".to_string()];
-        let drop = HitTarget::Tab {
-            window_id: "@1".into(),
-        };
-        assert_eq!(resolve_workspace_drop("$a", &drop, &order), None);
-    }
+    // Workspace-row drag release no longer resolves through this module —
+    // see `app::resolve_workspace_slot_drop` and its own tests, plus the
+    // slot math in `drag::tests`.
 
     #[test]
     fn resolve_agent_drop_requires_the_same_workspace() {

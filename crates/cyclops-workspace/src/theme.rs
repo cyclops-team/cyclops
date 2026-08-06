@@ -136,6 +136,22 @@ pub fn sidebar_row(paint: &Paint) -> Style {
         .patch(paint.bg_token(tokens::CHROME_PANEL))
 }
 
+/// The grabbed row while a sidebar-row reorder drag is live. Dim is the
+/// color cue; the caller also swaps in a grip glyph (see
+/// `render::paint_sidebar`) so the row still reads as "being moved" with
+/// `NO_COLOR` — rule 11 wants a non-color encoding beside the color one,
+/// not instead of it.
+pub fn sidebar_row_dragging(paint: &Paint) -> Style {
+    sidebar_row(paint).add_modifier(Modifier::DIM)
+}
+
+/// The live insertion rule a sidebar workspace-row drag previews. Reuses
+/// the same accent token as a focused pane border rather than inventing a
+/// new one for this one purpose.
+pub fn drag_insertion_rule(paint: &Paint) -> Style {
+    pane_border_focused(paint)
+}
+
 pub fn sidebar_label(paint: &Paint) -> Style {
     paint
         .style_token(tokens::SURFACE_DIM)
