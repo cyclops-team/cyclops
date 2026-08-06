@@ -9,6 +9,7 @@ alacritty_terminal = "0.26"
 cyclops-proto.workspace = true
 cyclops-theme.workspace = true
 cyclops-tmux.workspace = true
+cyclops-ui.workspace = true
 crossterm = "0.29"
 ratatui = "0.30"
 serde_json.workspace = true

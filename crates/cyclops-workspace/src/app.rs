@@ -115,6 +115,12 @@ enum AppMsg {
         pane: String,
     },
     DecorationChanged(DecorationSnapshot),
+    /// One daemon event, already normalized onto the shared `cyclops
+    /// watch` stream vocabulary (E2) by [`spawn_decoration_forwarder`]'s
+    /// reader thread. Feeds `App::record` and nothing else — decoration's
+    /// own coalesced refresh is a separate message (`DecorationChanged`)
+    /// on the same connection, so this must never gate or delay it.
+    StreamEntry(Box<cyclops_ui::Entry>),
 }
 
 struct App {
@@ -145,7 +151,17 @@ struct App {
     /// [`crate::daemon::watch_session`].
     watched_sessions: HashSet<String>,
     event_stream_open: bool,
-    event_lines: Vec<String>,
+    /// The shared `cyclops watch` stream model (E2): the same ordered,
+    /// identity-stable [`cyclops_ui::Entry`] rows that surface renders,
+    /// fed by [`spawn_decoration_forwarder`]'s `events.subscribe`
+    /// connection so the panel never opens a second one.
+    ///
+    /// Fed whether or not the panel is open. The record is cheap (no IO
+    /// per event, and internally ring-capped) and stopping the feed while
+    /// the panel is closed would show an empty history the moment it
+    /// reopens mid-session; keeping it warm costs nothing a closed panel
+    /// would otherwise save.
+    record: cyclops_ui::Record,
     term_size: (u16, u16),
     /// Last size successfully declared by this control client. Avoids a
     /// resize notification loop when expanded pane gutters are already at
@@ -478,7 +494,7 @@ pub async fn run_async() -> i32 {
         expanded_for: None,
         watched_sessions: HashSet::new(),
         event_stream_open: false,
-        event_lines: Vec::new(),
+        record: cyclops_ui::Record::new(),
         term_size,
         declared_client_size,
         needs_reconcile: false,
@@ -493,7 +509,7 @@ pub async fn run_async() -> i32 {
     // for. Ask before drawing it.
     ensure_sessions_watched(&mut app);
     app.decoration = decoration::fetch_decoration(&app.home).unwrap_or_default();
-    app.refresh_event_lines();
+    seed_event_record(&mut app.record, &app.home);
 
     let mut debounce: Option<Instant> = None;
     let mut reconnect_deadline: Option<Instant> = None;
@@ -656,6 +672,45 @@ fn spawn_notif_forwarder(
     });
 }
 
+/// Seed `record` from the daemon's boot-time status answer, the same
+/// one-time reconciliation `cyclops watch` runs at startup
+/// (`cyclops_ui::StatusSeed::from_status`, `Record::seed`).
+///
+/// This is a second `status` request beyond the one
+/// `decoration::fetch_decoration` already made at boot: the daemon's
+/// answer that call converts keeps only the fields workspace chrome
+/// needs, not the raw `PaneSnapshot`/`OpenDelivery` lists the stream
+/// model seeds from. Paying one more bounded, one-shot request here is
+/// simpler than threading the raw answer through `decoration.rs`'s
+/// conversion, and it never repeats: after boot the record moves on the
+/// live `events.subscribe` push alone, exactly like `cyclops watch`'s own
+/// register.
+///
+/// A ledger-tail backfill (`cyclops watch`'s replayed history) is not
+/// built here: it would need a second reader of the daemon's ledger
+/// files, which is new IO machinery this task does not add. The panel
+/// starts from the seeded attention state plus whatever arrives live
+/// after this call, which is acceptable for a view that can also be
+/// reopened mid-session (see `App::record`'s doc).
+fn seed_event_record(record: &mut cyclops_ui::Record, home: &std::path::Path) {
+    let params = cyclops_proto::StatusParams {
+        open_deliveries: true,
+    };
+    if let Ok(status) = crate::daemon::status(home, params) {
+        let seed = cyclops_ui::StatusSeed::from_status(&status);
+        for e in record.seed(&seed.panes, &seed.open) {
+            record.replay(e);
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// What the blocking reader thread below hands to the coalescing loop: one
 /// signal per subscription line that carried an `"event"` field, or one
 /// signal when the connection ends.
@@ -664,16 +719,26 @@ enum DecorationSignal {
     Closed,
 }
 
-/// Event-driven daemon decoration updates. The subscription itself never
-/// polls. A split or a border drag pushes several state/label/delivery
-/// events through cyclopsd at once; a dedicated reader thread turns each
-/// subscription line into one [`DecorationSignal`] on a plain channel, and
-/// the loop below coalesces a burst of them into ONE status fetch instead of
-/// one per event — the same arm-once, never-push-back rule `arm()` and
+/// Event-driven daemon decoration updates, and (E2) the shared `cyclops
+/// watch` stream feed. The subscription itself never polls. A split or a
+/// border drag pushes several state/label/delivery events through
+/// cyclopsd at once; a dedicated reader thread turns each subscription
+/// line into one [`DecorationSignal`] on a plain channel, and the loop
+/// below coalesces a burst of them into ONE status fetch instead of one
+/// per event — the same arm-once, never-push-back rule `arm()` and
 /// `RENDER_DEBOUNCE` use for rendering (`DECORATION_DEBOUNCE`), just built on
 /// `std::sync::mpsc::Receiver::recv_timeout` instead of `tokio::select!`
 /// because this connection is deliberately blocking IO on its own thread,
 /// away from the input loop.
+///
+/// That same reader thread also normalizes each event line into a
+/// [`cyclops_ui::Entry`] and sends it straight to the app as
+/// [`AppMsg::StreamEntry`], bypassing the coalescing above entirely.
+/// Feeding the record is in-memory normalization with no IO of its own —
+/// unlike a status fetch, there is nothing to debounce — so folding it
+/// into the burst logic would only add latency the decoration path does
+/// not have today. This is the ONE connection both concerns share; see
+/// the module doc and `docs/INVARIANTS.md` rule 9.
 fn spawn_decoration_forwarder(home: std::path::PathBuf, tx: mpsc::UnboundedSender<AppMsg>) {
     std::thread::spawn(move || {
         use std::io::{BufRead, Write};
@@ -700,6 +765,7 @@ fn spawn_decoration_forwarder(home: std::path::PathBuf, tx: mpsc::UnboundedSende
         }
 
         let (sig_tx, sig_rx) = std::sync::mpsc::channel::<DecorationSignal>();
+        let stream_tx = tx.clone();
         std::thread::spawn(move || loop {
             let mut line = String::new();
             match reader.read_line(&mut line) {
@@ -714,6 +780,30 @@ fn spawn_decoration_forwarder(home: std::path::PathBuf, tx: mpsc::UnboundedSende
             };
             if value.get("event").is_none() {
                 continue;
+            }
+            // E2: normalize this same line onto the shared stream model
+            // before the decoration signal below. Cheap (no IO) and
+            // per-event on purpose — it must never wait for or extend the
+            // coalescing deadline that follows. An unreadable event still
+            // reaches the decoration signal; only the record feed skips
+            // it (`Entry::from_event` never rejects a KNOWN event, but a
+            // daemon ahead of this build can still send a shape that
+            // fails to deserialize at all).
+            if let Ok(ev) = serde_json::from_value::<cyclops_proto::Event>(value) {
+                // A theme reload is not a fact about the record; the CLI
+                // stream drops it the same way (`cyclops_ui`'s own
+                // subscribe loop). Every other vocabulary, known or not,
+                // still becomes an entry (unknown kinds render as
+                // `Other` rather than being dropped).
+                if ev.event != "theme" {
+                    let entry = cyclops_ui::Entry::from_event(&ev, now_ms());
+                    if stream_tx
+                        .send(AppMsg::StreamEntry(Box::new(entry)))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
             }
             if sig_tx.send(DecorationSignal::Event).is_err() {
                 return;
@@ -845,16 +935,6 @@ impl App {
             self.sidebar_width(),
             self.event_stream_open,
         )
-    }
-
-    fn refresh_event_lines(&mut self) {
-        self.event_lines = self
-            .decoration
-            .attention
-            .items()
-            .into_iter()
-            .map(|item| format!("{item:?}"))
-            .collect();
     }
 
     fn persist_active(&self) {
@@ -1125,7 +1205,17 @@ async fn handle_app_msg(
                 }
             }
             app.decoration = snapshot;
-            app.refresh_event_lines();
+            arm(debounce);
+        }
+        // E2: per-event, not coalesced with the decoration burst above —
+        // feeding the record is cheap and in-memory, so it runs on every
+        // event rather than waiting for that debounce (see
+        // `spawn_decoration_forwarder`'s doc). `Record::live` also moves
+        // the record's own attention register by the one rule in
+        // `cyclops_proto::attention`, the same rule `app.decoration`'s
+        // register answers to; neither side recomputes it.
+        AppMsg::StreamEntry(entry) => {
+            app.record.live(*entry);
             arm(debounce);
         }
         AppMsg::Mouse(mouse) => {
@@ -1988,7 +2078,6 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
     if let Some(snapshot) = decoration::fetch_decoration(&app.home) {
         app.decoration = snapshot;
     }
-    app.refresh_event_lines();
     app.persist_active();
     resize_client(app, client).await;
     hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await;
@@ -2195,7 +2284,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
         .draw(|f| {
             let areas = app.chrome(f.area());
             if let Some(panel) = areas.panel {
-                paint_event_stream(&app.event_lines, panel, f.buffer_mut(), &app.paint);
+                paint_event_stream(&app.record, panel, f.buffer_mut(), &app.paint);
             }
             if let Some(sidebar) = areas.sidebar {
                 paint_sidebar(
@@ -2317,7 +2406,7 @@ mod tests {
             expanded_for: None,
             watched_sessions: HashSet::new(),
             event_stream_open: false,
-            event_lines: Vec::new(),
+            record: cyclops_ui::Record::new(),
             term_size: (40, 12),
             declared_client_size: None,
             needs_reconcile: false,

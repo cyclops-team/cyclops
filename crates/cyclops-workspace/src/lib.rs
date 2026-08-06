@@ -23,6 +23,7 @@ mod term_guard;
 mod theme;
 
 pub use app::{print_help_and_exit, run, run_async};
+pub use render::{event_stream_rows, EventRow};
 pub use runtime::{
     snapshot_from_bundle, CellAttrs, CellGrid, CellPos, Color, CursorShape, CursorState, GridCell,
     HydrationSnapshot, PaneRuntime, Underline,

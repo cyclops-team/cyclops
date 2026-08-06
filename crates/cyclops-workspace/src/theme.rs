@@ -42,7 +42,7 @@ impl Paint {
     }
 
     #[cfg(test)]
-    fn without_color_for_test() -> Self {
+    pub(crate) fn without_color_for_test() -> Self {
         Paint {
             theme: Theme::default(),
             truecolor: false,
@@ -74,6 +74,14 @@ impl Paint {
 
     pub fn state(&self, state: cyclops_proto::AgentState) -> Style {
         self.style_token(cyclops_theme::state_token(state))
+    }
+
+    /// The delivery-badge half of the same grouping `state` resolves for
+    /// agent states. Added for the event panel (E2), which colors a
+    /// `Delivery`/`Cleared` row by whichever group its own state or
+    /// former state belongs to.
+    pub fn delivery(&self, state: cyclops_proto::DeliveryState) -> Style {
+        self.style_token(cyclops_theme::delivery_token(state))
     }
 }
 

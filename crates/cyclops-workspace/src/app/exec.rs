@@ -377,7 +377,6 @@ fn name_pane(app: &mut App, pane_id: String, label: String) -> Result<Outcome, T
     if let Some(snapshot) = decoration::fetch_decoration(&app.home) {
         app.decoration = snapshot;
     }
-    app.refresh_event_lines();
     Ok(Outcome {
         persist,
         ..Outcome::default()
@@ -755,7 +754,7 @@ mod tests {
             expanded_for: None,
             watched_sessions: HashSet::new(),
             event_stream_open: false,
-            event_lines: Vec::new(),
+            record: cyclops_ui::Record::new(),
             term_size: (80, 24),
             declared_client_size: None,
             needs_reconcile: false,
