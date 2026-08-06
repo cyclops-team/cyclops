@@ -1,0 +1,39 @@
+
+❯ write a 300 word story about a lighthouse keeper, no tools, just prose
+
+⏺ The light failed twice that winter. Both times Aldous Renn climbed the hundred and ninety steps carrying a hand lamp,
+  as though shaming the great lens with a smaller flame might embarrass it back into service.
+
+  He was sixty-one and had kept the Fennwick light for twenty-three years. He knew its moods the way a farrier knows a
+  horse: the shudder in the gearing when the wind came hard off the northwest, the particular whine the clockwork made
+  in cold that meant the weights wanted regreasing. The Board sent inspectors every spring. They wrote in their ledgers
+  that the station was in good order and never once asked him how he knew when the fog was coming, which was by the ache
+  behind his left ear, four hours out, reliable as a barometer.
+
+  His wife had died in the second year. People assumed the isolation was a wound he was nursing. It was not. The truth,
+  which he never told anyone because it sounded unkind, was that he liked the arrangement of his days. Wick trimmed at
+  four. Brass polished Tuesdays. The log filled in his small upright hand: wind, visibility, vessels sighted. There was
+  no argument in it. The sea asked one thing of him and he gave it, and in return nothing else was required.
+
+  In March a trawler went down on the Barrow shoals in weather he had signaled clean. He walked the beach for six days.
+  He found a glove, a crate lid, and a boy's boot, and he wrote all three in the log because the log was for what
+  happened, not for what he wished had happened.
+
+  The Board retired him in the autumn. He took a cottage two miles inland, well out of sight of the water, and every
+  night at dusk he stood at the back door and listened for the horn.
+
+✻ Churned for 17s
+
+❯ write a 250 word essay about tide pools, prose only, no tools
+
+⏺ A tide pool is a lease, not a home. Twice a day the ocean withdraws and leaves behind a basin of water that is, for
+  the next six hours, a small closed world running an experiment on its inhabitants. The temperature climbs. Salinity
+  rises as water evaporates, then crashes when rain falls. Oxygen drops through the afternoon. Nothing living there is
+  comfortable; everything living there is specialized.
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Opus 5 · xhigh · /private/tmp/cyc-claude-repro/work · Ctx: 97% · 5h: 21% · 7d: 80% · 1000K window · 25K used
+  ⏸ manual mode on · ← for agents

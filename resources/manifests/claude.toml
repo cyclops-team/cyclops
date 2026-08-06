@@ -1,6 +1,9 @@
 # Cyclops detection manifest: Claude Code
 # Derived from MEASURED evidence in validation/raw/p0 and validation/raw/soak.
-# Verified against Claude Code 2.1.220 running inside tmux 3.6a, 120x40 pane.
+# Verified against Claude Code 2.1.220 running inside tmux 3.6a, 120x40 pane;
+# re-verified on 2.1.221 (live rig, 2026-08-06). On 2.1.221 the idle title is
+# "✳ <conversation summary>" and the pre-OSC title is the tmux hostname
+# seed; the ^ anchors cover both, do not tighten them to fixed strings.
 #
 # Sensor summary for this CLI:
 #   title  AUTHORITATIVE for busy/idle. Tracks hooks within 30-80 ms, below the
@@ -14,7 +17,7 @@
 [agent]
 id = "claude"
 display_name = "Claude Code"
-version_tested = "2.1.220"
+version_tested = "2.1.221"
 process_names = ["claude"]
 # MEASURED (m1 soak): on native installs ~/.local/bin/claude is a symlink to
 # ~/.local/share/claude/versions/2.1.220 and macOS derives the process comm
@@ -76,7 +79,11 @@ state = "idle"
 priority = 900
 region = "bottom_non_empty_lines(6)"
 line_regex = ['^\s*❯\s*$']
-evidence = "MEASURED claude_idle_composer.txt"
+note = """On 2.1.221 the empty composer stays visible below streaming output,
+so this rule matches mid-turn and its idle verdict is trustworthy only under
+a live title tier: title_working_spinner (1100) outranking it is what keeps
+the fused verdict right while the model works."""
+evidence = "MEASURED claude_idle_composer.txt; matches mid-turn on 2.1.221"
 
 [[rule]]
 id = "composer_has_staged_input"
@@ -97,7 +104,11 @@ state = "working"
 priority = 800
 region = "bottom_non_empty_lines(8)"
 contains = ["esc to interrupt"]
-evidence = "MEASURED claude_busy2_after_enter.txt"
+note = """MEASURED on 2.1.221 in an UNFOCUSED tmux pane: this text was absent
+for a whole 17s streaming turn (sampled at 0.7s plus full mid-turn grids), so
+the title spinner is the only working signal cyclops reads there. Kept for
+human-focused panes, where it may still render."""
+evidence = "MEASURED claude_busy2_after_enter.txt; absent all turn on 2.1.221 unfocused"
 
 [[rule]]
 id = "trust_dialog"

@@ -888,6 +888,38 @@ regex = ['^IDLE']
         assert!(manifest_for_basename(&BTreeMap::new(), "bash").is_none());
     }
 
+    /// MEASURED 2026-08-06 (Claude Code 2.1.221, tmux 3.6a, live rig): a
+    /// pane running a native claude read pane_current_command "2.1.221"
+    /// (version symlink, F21), `ps -o args=` on pane_pid "-zsh", and
+    /// tpgid " 19989\n" whose args were "claude". Pins every hop of the
+    /// binding chain against the shipped manifests on that data alone.
+    #[test]
+    fn measured_claude_binding_triple_2_1_221() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources/manifests");
+        let shipped: BTreeMap<String, Manifest> = cyclops_manifest::load_dir(&dir)
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        // Comm route: nothing claims the bare version string.
+        assert!(bind_manifest(&shipped, "2.1.221").is_none());
+
+        // pane_pid's argv is the login shell and binds nothing.
+        let shell = parse_argv_basename("-zsh\n").unwrap();
+        assert_eq!(shell, "-zsh");
+        assert!(manifest_for_basename(&shipped, &shell).is_none());
+
+        // The measured tpgid line resolves to the foreground group leader.
+        assert_eq!(parse_tpgid(" 19989\n"), Some(19989));
+
+        // That leader's argv is what binds the claude manifest.
+        let agent = parse_argv_basename("claude\n").unwrap();
+        assert_eq!(
+            manifest_for_basename(&shipped, &agent).map(|m| m.agent.id.as_str()),
+            Some("claude")
+        );
+    }
+
     #[test]
     fn tpgid_parses_ps_output_and_rejects_no_terminal() {
         assert_eq!(parse_tpgid("  6254\n"), Some(6254));
