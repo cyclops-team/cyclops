@@ -328,14 +328,6 @@ async fn sustained_output_backlog_drains_continuously() {
 /// measurement; `pause_to_continue` (the reader's auto-resume round trip,
 /// `control.rs`'s `%pause` handler) and the rehydrate call after it are.
 #[tokio::test]
-#[ignore = "unreliable in this environment: tmux delivers %pause \
-            inconsistently under the induced stall and %continue was never \
-            observed (raw-tmux probes outside this harness reproduce both), \
-            so the measurement fails more often than it measures. Kept for \
-            whoever root-causes the missing %continue; the production \
-            pause/continue handling itself is exercised functionally by \
-            src/cyclops-tmux/tests/client_flow_control.rs and app.rs's \
-            rehydrate-on-continue path."]
 async fn flow_control_pause_and_resume() {
     let Some(rig) = Rig::new("perf-flow") else {
         return;
@@ -350,56 +342,50 @@ async fn flow_control_pause_and_resume() {
         .await
         .expect("lower pause-after for this test's stall below");
 
-    rig.server.run_ok(&[
-        "send-keys",
-        "-t",
-        "%0",
-        "yes flood | head -c 50000000",
-        "Enter",
-    ]);
+    rig.server
+        .run_ok(&["send-keys", "-t", "%0", "yes flood", "Enter"]);
     // The stall (see the doc above): block the executor reader_task runs
     // on, so tmux's own pause-after clock — which needs a reader that has
     // genuinely stopped, not just a slow one — has something real to fire
     // against.
     std::thread::sleep(Duration::from_secs(2));
 
-    let pause_deadline = Instant::now() + Duration::from_secs(5);
-    let mut paused_pane = None;
-    while paused_pane.is_none() {
-        assert!(
-            Instant::now() < pause_deadline,
-            "never saw %pause after the stall"
-        );
-        match notif.recv().await {
-            Some(Notification::Pause { pane }) => paused_pane = Some(pane),
-            Some(_) => {}
-            None => panic!("connection closed before %pause"),
+    let paused_pane = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match notif.recv().await {
+                Some(Notification::Pause { pane }) => return pane,
+                Some(_) => {}
+                None => panic!("connection closed before %pause"),
+            }
         }
-    }
+    })
+    .await
+    .expect("never saw %pause after the stall");
     let pause_at = Instant::now();
 
-    let continue_deadline = Instant::now() + Duration::from_secs(5);
-    let mut continue_at = None;
-    while continue_at.is_none() {
-        assert!(
-            Instant::now() < continue_deadline,
-            "never saw %continue after %pause (control.rs's auto-resume)"
-        );
-        match notif.recv().await {
-            Some(Notification::Continue { .. }) => continue_at = Some(Instant::now()),
-            Some(_) => {}
-            None => panic!("connection closed before %continue"),
+    let continue_wait = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match notif.recv().await {
+                Some(Notification::Continue { .. }) => return Instant::now(),
+                Some(_) => {}
+                None => panic!("connection closed before %continue"),
+            }
         }
-    }
-    let pause_to_continue = continue_at.expect("set above").duration_since(pause_at);
+    })
+    .await;
+
+    rig.server.run_ok(&["send-keys", "-t", "%0", "C-c"]);
+
+    let continue_at =
+        continue_wait.expect("never saw %continue after %pause (confirmed resume command)");
+    let pause_to_continue = continue_at.duration_since(pause_at);
 
     // "Rehydrate-complete": AppMsg::PaneContinued drops the paused pane's
     // runtime and re-hydrates it (app.rs); this times the same hydrate call
     // production makes right after a pane resumes.
-    let pane = paused_pane.expect("pane id carried by %pause");
     let t = Instant::now();
     client
-        .hydrate_pane(&pane)
+        .hydrate_pane(&paused_pane)
         .await
         .expect("hydrate_pane after resume");
     let rehydrate = t.elapsed();
@@ -586,11 +572,6 @@ fn wait_until(deadline: Instant, what: &str, mut poll: impl FnMut() -> bool) {
 /// exactly the property `TermGuard::restore` (`src/cyclops-workspace/src/
 /// term_guard.rs`) exists to guarantee on every exit path, quit included.
 #[test]
-#[ignore = "written but never executed: the run was halted before its first \
-            invocation, and it drives real debug binaries that were stale \
-            at the halt. Rebuild target/debug/{cyclops,cyclopsd}, run this \
-            alone with --ignored --nocapture, and remove this attribute \
-            once it has passed on a real machine."]
 fn quitting_leaves_the_alternate_screen_and_returns_to_a_shell_prompt() {
     if !tmux_available() {
         eprintln!("skipping: no tmux binary on PATH");

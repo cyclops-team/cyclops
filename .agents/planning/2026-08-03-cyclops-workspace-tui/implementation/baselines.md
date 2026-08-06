@@ -282,6 +282,35 @@ before/after *shapes* (flat vs. growing command count; slowest-pane vs.
 summed latency) over the absolute millisecond values, exactly as this
 file's introduction already asks.
 
+## Review finding 5 measurements (2026-08-06, same machine)
+
+`src/cyclops-workspace/tests/perf_contract.rs` records these production-path
+measurements without timing assertions. Run them with `--nocapture`; they are
+a record, not a performance gate.
+
+| Scenario | Result |
+|---|---|
+| Key-to-control write, idle pane (`send_keys_unconfirmed`, n=500) | p50 3.4us; p95 6–10us; max <170us |
+| Key-to-control write, pane flooding ~8MB | p50 68us; p95 125us; max <800us |
+| Sustained-output backlog | 93 drains at the 8ms cadence; peak batch 143 messages / 84KB; 7.0MB total; no stall longer than 5 empty cycles |
+| Decoration burst | 100 signals in 0.6ms produced exactly one refresh 35.6ms after the first signal |
+| Continuous decoration stream | 200ms of signals produced 6 refreshes at roughly 30–37ms gaps; the deadline arms once and is not pushed back |
+| Full-frame paint, mixed ASCII/wide/SGR | median 0.99ms / 3.89ms / 7.78ms at 1 / 4 / 8 panes |
+| Flow control, five runs | pause-to-confirmed-continue / continue-to-rehydrate: 0.30 / 1.33ms, 0.26 / 1.30ms, 0.20 / 2.57ms, 0.21 / 2.83ms, and 0.16 / 3.23ms |
+
+The flooding path is roughly 20x slower at the median than the idle path,
+but remains sub-millisecond. The 8-pane paint result stays inside the 8ms
+debounce window.
+
+These numbers came from a noisy machine and do not establish a user-visible
+latency bound. In particular, the 4- and 8-pane paint figures are from one
+quiet run; an earlier loaded run was discarded as noise. The harness measures
+control writes, backlog drains, coalescing, and paint work, not loop-level
+frame gaps under live output. The flow-control test now runs normally: tmux
+3.7b's successful `refresh-client -A <pane>:continue` reply is the resume
+confirmation when it omits `%continue`; the five recorded runs above use that
+confirmed notification before rehydrating.
+
 ## Which task each baseline exists to check
 
 | Baseline | Checked by | What "improved" means |

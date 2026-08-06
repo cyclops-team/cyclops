@@ -1125,13 +1125,14 @@ async fn handle_app_msg(
             arm(debounce);
         }
         AppMsg::PaneContinued { pane } => {
-            app.paused_panes.remove(&pane);
-            if app.is_visible_pane(&pane) {
-                // Rehydrate: paused output was dropped, continuity is gone.
-                app.runtimes.retain_visible(&[]);
-                app.needs_hydrate = true;
+            if app.paused_panes.remove(&pane) {
+                if app.is_visible_pane(&pane) {
+                    // Rehydrate: paused output was dropped, continuity is gone.
+                    app.runtimes.retain_visible(&[]);
+                    app.needs_hydrate = true;
+                }
+                arm(debounce);
             }
-            arm(debounce);
         }
         AppMsg::DecorationChanged(snapshot) => {
             // A daemon that went away forgot every session it was asked to

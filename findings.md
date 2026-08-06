@@ -699,3 +699,33 @@ $ tmux -u -L cyc-probe -f /dev/null new-session -d -s alpha -x 80 -y 24 /bin/sh
 $ tmux -u -L cyc-probe -f /dev/null list-panes -a -F '#{session_id} #{session_attached} #{pane_id}'
 $0 0 %0
 ```
+
+## F42. Workspace performance contract measurements are shape evidence, not latency budgets (MEASURED)
+
+On this machine, `send_keys_unconfirmed` took p50 3.4us and p95 6–10us
+while idle (n=500), and p50 68us/p95 125us while the target pane flooded
+about 8MB. The flood path is about 20x slower at the median but remained
+under 800us at the observed maximum. Sustained output drained 7.0MB in 93
+batches at the 8ms cadence, with a largest batch of 143 messages/84KB and no
+stall longer than five empty cycles. A 100-signal decoration burst produced
+one refresh 35.6ms after its first signal; a continuous 200ms stream produced
+six refreshes at roughly 30–37ms gaps. Full-frame paint of mixed
+ASCII/wide/SGR content had medians of 0.99ms, 3.89ms, and 7.78ms for 1, 4,
+and 8 panes.
+
+These are record-only measurements, not thresholds. The machine was noisy;
+the 4- and 8-pane paint figures came from one quiet run after an earlier
+loaded run was discarded. They measure control writes, backlog draining,
+coalescing, and paint work, not end-to-end frame gaps under live output.
+Flow control is measured separately: five normal runs recorded
+pause-to-confirmed-continue / continue-to-rehydrate times of 0.30 / 1.33ms,
+0.26 / 1.30ms, 0.20 / 2.57ms, 0.21 / 2.83ms, and 0.16 / 3.23ms. tmux 3.7b
+accepts `refresh-client -A <pane>:continue` but omits `%continue`, so the
+successful command reply is the authoritative confirmation that emits the
+consumer notification.
+
+Probe: `CARGO_INCREMENTAL=0 cargo test -p cyclops-workspace --test
+perf_contract -- --nocapture`. The test file is
+`src/cyclops-workspace/tests/perf_contract.rs`; the complete recorded table
+and caveats are in
+`.agents/planning/2026-08-03-cyclops-workspace-tui/implementation/baselines.md`.

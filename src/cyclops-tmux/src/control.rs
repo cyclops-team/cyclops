@@ -725,17 +725,41 @@ async fn reader_task(
                 if let Notification::Pause { pane } = &n {
                     debug!(%pane, "flow control paused pane, resuming");
                     let pipe = pipe.clone();
+                    let notif_tx = notif_tx.clone();
+                    let pane = pane.clone();
                     let cmd = format!(
                         "refresh-client -A {}",
                         quote_arg(&format!("{pane}:continue"))
                     );
+                    // Preserve the state transition order for consumers: a
+                    // successful resume reply can arrive immediately.
+                    let _ = notif_tx.send(n);
                     // Separate task: the reader must keep draining so it can
                     // route this very command's reply.
                     tokio::spawn(async move {
-                        if let Err(e) = pipe.submit(&cmd).await {
-                            warn!(error = %e, "failed to resume paused pane");
+                        let reply = match pipe.submit(&cmd).await {
+                            Ok(reply) => reply,
+                            Err(e) => {
+                                warn!(error = %e, %pane, "failed to submit paused-pane resume");
+                                return;
+                            }
+                        };
+                        match reply.await {
+                            Ok(Ok(_)) => {
+                                // tmux 3.7b accepts the resume command but
+                                // omits `%continue`; its successful reply is
+                                // the authoritative resume confirmation.
+                                let _ = notif_tx.send(Notification::Continue { pane });
+                            }
+                            Ok(Err(e)) => {
+                                warn!(error = %e, %pane, "tmux rejected paused-pane resume");
+                            }
+                            Err(e) => {
+                                warn!(error = %e, %pane, "paused-pane resume reply receiver cancelled");
+                            }
                         }
                     });
+                    continue;
                 }
                 if let Notification::Other(raw) = &n {
                     debug!(line = %raw, "unrecognized control line");
