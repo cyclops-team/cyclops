@@ -1330,6 +1330,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         boot_id = %inner.boot_id,
         sessions = inner.session_count(),
         manifests = inner.manifests.len(),
+        build = env!("CYCLOPS_BUILD_REF"),
         "cyclopsd booted"
     );
     Ok(Daemon {

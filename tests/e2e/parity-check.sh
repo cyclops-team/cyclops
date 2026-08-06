@@ -1112,7 +1112,7 @@ grep -v '^ *\(Compiling\|Finished\|Downloaded\|Blocking\|Updating\|Adding\)' "$O
 check "it says where each binary went"    "^  cyclops    $INST/.local/bin/cyclops$"
 check "and the daemon too"                "^  cyclopsd   $INST/.local/bin/cyclopsd$"
 check "and where the home is"             "^  home       $INST/.cyclops$"
-check "it reports the version it built"   '^✔ cyclops [0-9]+\.[0-9]+\.[0-9]+ is installed$'
+check "it reports the version it built"   '^✔ cyclops [0-9]+\.[0-9]+\.[0-9]+ \(([0-9a-f]+(\.dirty)?|unknown)\) is installed$'
 check_absent "it gives no separate daemon step" 'cyclopsd &'
 check "step 2 opens the workspace"        '^  2  cyclops start +open your workspace; it prints what to do next$'
 check "it names the profile it edited"    "^  three lines added to $INST/.zshrc:$"

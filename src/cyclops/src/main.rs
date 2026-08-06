@@ -80,8 +80,17 @@ const WAIT_TIMEOUT_DEFAULT: &str = "60s";
 /// budget, so the transport never times out before the daemon answers.
 const WAIT_READ_SLACK: Duration = Duration::from_secs(10);
 
+/// Version plus the commit that built it (build.rs), so "which build am
+/// I on" is one command instead of an afternoon.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("CYCLOPS_BUILD_REF"),
+    ")"
+);
+
 #[derive(Parser)]
-#[command(name = "cyclops", version, about = "One eye on every agent")]
+#[command(name = "cyclops", version = VERSION, about = "One eye on every agent")]
 struct Cli {
     /// Print raw results as JSON. Anything the UI shows, scripts can read.
     #[arg(long, global = true)]
