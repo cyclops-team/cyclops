@@ -122,9 +122,11 @@ fn build_tab(window: &SnapshotWindow) -> Result<TabModel, TmuxError> {
 
 /// Hydrate runtimes for every pane on the visible tab, concurrently. A
 /// runtime whose grid no longer matches the pane's layout size is
-/// rehydrated fresh — feeding bytes into a stale-sized grid scrambles rows
-/// (the recovery rule from the hydration design: never trust continuity
-/// across a resize).
+/// rehydrated, because feeding bytes into a stale-sized grid scrambles
+/// rows (the recovery rule from the hydration design: never trust
+/// continuity across a resize). Rehydration happens in place so the
+/// runtime's accumulated scrollback survives; only a pane with no runtime
+/// yet gets a fresh one.
 ///
 /// Every stale pane's hydration round trip runs through one
 /// [`ControlClient::hydrate_panes`] call instead of a serial loop, so total
@@ -164,9 +166,18 @@ pub async fn hydrate_visible_tab(
     let results = client.hydrate_panes(&stale_ids).await;
     for ((pane_id, _, _), result) in stale.into_iter().zip(results) {
         if let Ok(bundle) = result {
-            let mut runtime = PaneRuntime::new(bundle.cols, bundle.rows);
-            runtime.hydrate(&snapshot_from_bundle(&bundle));
-            registry.insert(pane_id, runtime);
+            let snapshot = snapshot_from_bundle(&bundle);
+            // In place when the pane already has a runtime: hydrate resets
+            // modes and the grid itself but carries scrollback across, so a
+            // resize does not eat the history the wheel scrolls through.
+            match registry.get_mut(&pane_id) {
+                Some(runtime) => runtime.hydrate(&snapshot),
+                None => {
+                    let mut runtime = PaneRuntime::new(bundle.cols, bundle.rows);
+                    runtime.hydrate(&snapshot);
+                    registry.insert(pane_id, runtime);
+                }
+            }
         }
         // Err: this pane's slot fails alone (see the doc comment above) —
         // no runtime is inserted, and it paints blank until a later
@@ -393,6 +404,71 @@ mod tests {
             registry.get("%99").is_none(),
             "a dead pane's slot must fail alone: no runtime, but the live \
              pane's own hydration must not be blocked by it"
+        );
+
+        client.shutdown().await;
+    }
+
+    /// The resize path marks a pane's runtime stale and rehydrates it. The
+    /// existing runtime must be hydrated in place, not rebuilt, so the
+    /// scrollback it accumulated from live output still answers the wheel
+    /// immediately after the resize.
+    #[tokio::test]
+    async fn a_resized_panes_rehydration_keeps_its_scrollback() {
+        if !tmux_available() {
+            eprintln!("skipping: no tmux binary on PATH");
+            return;
+        }
+        let server = TmuxServer::new("hyd-keep-scrollback");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "keep",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "/bin/sh",
+        ]);
+        let (client, _notif) = ControlClient::spawn(config(&server, "keep"))
+            .await
+            .expect("attach");
+
+        let leaf = |width, height| TabModel {
+            window_id: "@0".to_string(),
+            name: "1".to_string(),
+            layout: ResolvedLayout::Leaf {
+                pane_id: "%0".to_string(),
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            active_pane: "%0".to_string(),
+            zoomed: false,
+        };
+
+        let mut registry = RuntimeRegistry::default();
+        hydrate_visible_tab(&client, &leaf(80, 24), &mut registry).await;
+        // Live output builds local scrollback, the way the %output feed does.
+        let runtime = registry.get_mut("%0").expect("runtime");
+        for i in 0..40 {
+            runtime.feed(format!("history{i}\r\n").as_bytes());
+        }
+
+        // The pane resized: the layout reports new dims, the runtime is stale.
+        hydrate_visible_tab(&client, &leaf(60, 20), &mut registry).await;
+
+        let runtime = registry.get_mut("%0").expect("runtime");
+        runtime.scroll(-5);
+        assert!(
+            !runtime.at_tail(),
+            "the wheel must still reach scrollback right after a resize"
+        );
+        assert!(
+            runtime.row_text(0).contains("history"),
+            "the lines that scrolled off before the resize are still there"
         );
 
         client.shutdown().await;

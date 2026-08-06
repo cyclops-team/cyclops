@@ -130,10 +130,26 @@ pub fn paint_window(
     // Every pane owns a quiet boundary. Paint the focused pane last so its
     // accent wins where nested borders intersect.
     for (slot, frame) in slots.iter().zip(&frames).filter(|(slot, _)| !slot.focused) {
-        paint_pane_frame(slot, *frame, canvas, buf, paint, ctx);
+        paint_pane_frame(
+            slot,
+            *frame,
+            canvas,
+            buf,
+            paint,
+            ctx,
+            scroll_depth(runtimes, slot),
+        );
     }
     for (slot, frame) in slots.iter().zip(&frames).filter(|(slot, _)| slot.focused) {
-        paint_pane_frame(slot, *frame, canvas, buf, paint, ctx);
+        paint_pane_frame(
+            slot,
+            *frame,
+            canvas,
+            buf,
+            paint,
+            ctx,
+            scroll_depth(runtimes, slot),
+        );
     }
     // Shared pane borders are resize handles. Put divider regions above the
     // generic frame regions, then restore the visibly overlaid controls as
@@ -330,9 +346,18 @@ fn paint_pane_slot(
     }
 }
 
+/// Lines a pane's viewport sits back from its live tail; 0 when the pane
+/// has no runtime yet.
+fn scroll_depth(runtimes: &RuntimeRegistry, slot: &PaneSlot) -> usize {
+    runtimes
+        .get(&slot.pane_id)
+        .map_or(0, PaneRuntime::scrolled_back)
+}
+
 /// Paint one pane's border, optional named-agent chrome, and split controls.
 /// Unnamed panes stay textually quiet; their muted boundary still makes the
-/// layout legible.
+/// layout legible. `scrolled` is the pane's scrollback depth; nonzero paints
+/// a dim hint on the top border.
 fn paint_pane_frame(
     slot: &PaneSlot,
     frame: Rect,
@@ -340,6 +365,7 @@ fn paint_pane_frame(
     buf: &mut Buffer,
     paint: &Paint,
     ctx: &mut WindowPaintCtx<'_>,
+    scrolled: usize,
 ) {
     // The frame, not the content rect: a box grown out to the shared edge
     // must stay grabbable over the whole boundary it actually draws.
@@ -407,6 +433,12 @@ fn paint_pane_frame(
             border_style,
         );
     }
+
+    // A scrolled pane says how deep it sits, dim on the top border flush
+    // against the split controls. The title budget below stops at the
+    // returned boundary, so the hint never collides with the title text,
+    // and the frame's drag hit regions are untouched.
+    let control_left = paint_scroll_hint(slot, bounds, control_left, scrolled, buf, border_style);
 
     let Some(decoration) = ctx
         .decoration
@@ -479,6 +511,39 @@ fn pane_title_rect(slot: &PaneSlot, bounds: Rect, control_left: u16) -> Option<R
     let top = slot.rect.y.saturating_sub(1).max(bounds.y);
     let title_left = slot.rect.x.saturating_add(1);
     (title_left < control_left).then(|| Rect::new(title_left, top, control_left - title_left, 1))
+}
+
+/// Paint the scrollback depth hint ("12 back") right-aligned against
+/// `control_left` on the top border. Returns the new left boundary for the
+/// title strip: the hint's own start while it shows, `control_left`
+/// untouched when the pane is at the tail or the border is too narrow.
+fn paint_scroll_hint(
+    slot: &PaneSlot,
+    bounds: Rect,
+    control_left: u16,
+    scrolled: usize,
+    buf: &mut Buffer,
+    border_style: Style,
+) -> u16 {
+    if scrolled == 0 {
+        return control_left;
+    }
+    let text = format!(" {scrolled} back ");
+    let width = u16::try_from(text.chars().count()).unwrap_or(u16::MAX);
+    let title_left = slot.rect.x.saturating_add(1);
+    let Some(x) = control_left.checked_sub(width).filter(|x| *x > title_left) else {
+        return control_left;
+    };
+    let top = slot.rect.y.saturating_sub(1).max(bounds.y);
+    super::overlay_text(
+        buf,
+        bounds,
+        x,
+        top,
+        &text,
+        border_style.add_modifier(Modifier::DIM),
+    );
+    x
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -941,6 +1006,45 @@ mod tests {
             assert_eq!(buf[(x, y)].fg, ground.fg.unwrap());
             assert_eq!(buf[(x, y)].bg, ground.bg.unwrap());
         }
+    }
+
+    #[test]
+    fn a_scrolled_pane_shows_a_depth_hint_that_leaves_with_the_scroll() {
+        let tab = two_pane_tab();
+        let mut runtimes = RuntimeRegistry::default();
+        let mut rt = crate::runtime::PaneRuntime::new(38, 4);
+        for i in 0..10 {
+            rt.feed(format!("line{i}\r\n").as_bytes());
+        }
+        rt.scroll(-5);
+        runtimes.insert("%0".to_string(), rt);
+        let paint = Paint::for_test();
+
+        let draw = |runtimes: &RuntimeRegistry| -> String {
+            let backend = TestBackend::new(40, 12);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| {
+                let mut hits = HitMap::default();
+                let paused = std::collections::HashSet::new();
+                let dec = DecorationSnapshot::default();
+                let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
+                paint_window(&tab, runtimes, f.area(), f.buffer_mut(), &paint, &mut ctx);
+            })
+            .unwrap();
+            flatten(term.backend().buffer())
+        };
+
+        assert!(
+            draw(&runtimes).contains("5 back"),
+            "a scrolled pane must say how far back it sits"
+        );
+
+        // Back at the tail the hint is gone.
+        runtimes.get_mut("%0").unwrap().scroll(1000);
+        assert!(
+            !draw(&runtimes).contains("back"),
+            "the hint must vanish once the pane is at the live tail"
+        );
     }
 
     #[test]

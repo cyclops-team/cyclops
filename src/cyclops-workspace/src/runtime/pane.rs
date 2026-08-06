@@ -101,8 +101,15 @@ impl PaneRuntime {
     }
 
     /// Hydrate from a tmux bundle. Visual snapshot only — not parser-exact.
+    ///
+    /// The capture describes the screen; scrollback this runtime already
+    /// accumulated is carried across the reset as plain text. Rehydration
+    /// runs on every pane resize, and wiping history there would kill the
+    /// scroll wheel right after the user resizes a pane.
     pub fn hydrate(&mut self, snapshot: &HydrationSnapshot) {
+        let history = self.history_lines();
         self.reset(snapshot.cols, snapshot.rows);
+        self.refill_history(&history);
 
         // A capture restores pixels, not VT modes. Full-screen TUIs such as
         // Claude and Codex are already in the alternate buffer; record that
@@ -142,13 +149,53 @@ impl PaneRuntime {
     /// Capture rows arrive joined with bare LF; a VT treats LF as index-down
     /// without carriage return, so each row needs an explicit CRLF or the
     /// columns staircase.
+    ///
+    /// The clear is ED 0 from home, not ED 2: the engine treats ED 2 on the
+    /// primary screen as "scroll the viewport into history", which pushes a
+    /// phantom blank line even on an empty screen and would bury the
+    /// scrollback [`Self::refill_history`] just laid down.
     fn replay_rows(&mut self, bytes: &[u8]) {
-        self.feed(b"\x1b[H\x1b[2J");
+        self.feed(b"\x1b[H\x1b[J");
         for (i, row) in bytes.split(|&b| b == b'\n').enumerate() {
             if i > 0 {
                 self.feed(b"\r\n");
             }
             self.feed(row);
+        }
+    }
+
+    /// The scrollback lines the engine holds, oldest first, as plain text.
+    /// Soft-wrapped rows come back joined as one logical line, so refeeding
+    /// reflows them at the current width. Attributes are not kept: history
+    /// survives a rehydrate as text, which is what selection copies anyway.
+    fn history_lines(&self) -> Vec<String> {
+        let history = self.term.grid().history_size();
+        if history == 0 {
+            return Vec::new();
+        }
+        let last = Column((self.cols as usize).saturating_sub(1));
+        let text = self.term.bounds_to_string(
+            Point::new(Line(-(history as i32)), Column(0)),
+            Point::new(Line(-1), last),
+        );
+        text.split('\n').map(str::to_string).collect()
+    }
+
+    /// Refeed saved scrollback into the freshly reset primary screen, then
+    /// scroll it fully off so the capture replay finds a blank screen and
+    /// history holds exactly the saved lines. The push-off is rows-1 line
+    /// feeds: after the trailing CRLF the cursor row is blank, so that count
+    /// scrolls every content row into history and not one filler line.
+    fn refill_history(&mut self, lines: &[String]) {
+        if lines.is_empty() {
+            return;
+        }
+        for line in lines {
+            self.feed(line.as_bytes());
+            self.feed(b"\r\n");
+        }
+        for _ in 1..self.rows {
+            self.feed(b"\n");
         }
     }
 
@@ -163,7 +210,12 @@ impl PaneRuntime {
     /// copy: new output arriving while the user reads history moves that
     /// offset to keep the view pinned, and a cached value would go stale.
     pub fn at_tail(&self) -> bool {
-        self.term.grid().display_offset() == 0
+        self.scrolled_back() == 0
+    }
+
+    /// How many lines back into history the viewport sits (0 at the tail).
+    pub fn scrolled_back(&self) -> usize {
+        self.term.grid().display_offset()
     }
 
     /// Visit every visible cell once, in row-major order.
@@ -251,10 +303,16 @@ impl PaneRuntime {
     }
 
     /// Extract selected text between two cell positions.
+    ///
+    /// Positions are viewport cells. Grid lines equal viewport rows only at
+    /// the live tail; a viewport scrolled back starts `display_offset` lines
+    /// up in history, and skipping that shift makes a scrolled selection
+    /// copy rows the user cannot even see.
     pub fn select(&mut self, from: CellPos, to: CellPos) -> Option<String> {
         use alacritty_terminal::selection::{Selection, SelectionType};
-        let start = Point::new(Line(from.row as i32), Column(from.col as usize));
-        let end = Point::new(Line(to.row as i32), Column(to.col as usize));
+        let offset = self.scrolled_back() as i32;
+        let start = Point::new(Line(from.row as i32 - offset), Column(from.col as usize));
+        let end = Point::new(Line(to.row as i32 - offset), Column(to.col as usize));
         self.term.selection = Some(Selection::new(SelectionType::Simple, start, Side::Left));
         self.term.selection.as_mut()?.update(end, Side::Right);
         self.term.selection_to_string()
@@ -404,6 +462,54 @@ mod tests {
             "shell",
             "the saved primary must be underneath, so the TUI's own exit works"
         );
+    }
+
+    #[test]
+    fn hydration_preserves_scrollback_history() {
+        let mut rt = PaneRuntime::new(8, 2);
+        rt.feed(b"one\r\ntwo\r\nthree\r\nfour");
+        // The resize path rehydrates from a screen-only capture; the two
+        // rows already in history must come along.
+        rt.hydrate(&HydrationSnapshot {
+            cols: 10,
+            rows: 3,
+            visible: b"prompt".to_vec(),
+            saved_primary: None,
+            cursor_x: 6,
+            cursor_y: 0,
+            alternate_on: false,
+        });
+
+        assert!(rt.at_tail(), "a rehydrated pane lands at the live tail");
+        assert_eq!(rt.snapshot().row_texts()[0], "prompt");
+        rt.scroll(-2);
+        assert_eq!(
+            rt.row_text(0).trim_end(),
+            "one",
+            "scrollback must survive rehydration, or the wheel goes dead after a resize"
+        );
+    }
+
+    #[test]
+    fn rehydrating_twice_keeps_history_exact() {
+        let snapshot = HydrationSnapshot {
+            cols: 10,
+            rows: 3,
+            visible: b"prompt".to_vec(),
+            saved_primary: None,
+            cursor_x: 6,
+            cursor_y: 0,
+            alternate_on: false,
+        };
+        let mut rt = PaneRuntime::new(8, 2);
+        rt.feed(b"one\r\ntwo\r\nthree\r\nfour");
+        rt.hydrate(&snapshot);
+        rt.hydrate(&snapshot);
+
+        // Scroll past the end of history: the view clamps at the oldest
+        // line. Nothing duplicated, no blank filler rows.
+        rt.scroll(-1000);
+        assert_eq!(rt.snapshot().row_texts(), vec!["one", "two", "prompt"]);
     }
 
     #[test]

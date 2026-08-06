@@ -319,6 +319,31 @@ mod tests {
     }
 
     #[test]
+    fn extract_while_scrolled_copies_the_rows_on_screen() {
+        let mut rt = PaneRuntime::new(8, 2);
+        rt.feed(b"one\r\ntwo\r\nthree\r\nfour");
+        // Two rows scrolled into history; the viewport now shows them.
+        rt.scroll(-2);
+        assert_eq!(
+            rt.row_text(0).trim_end(),
+            "one",
+            "rig premise: the viewport must be showing history"
+        );
+
+        let sel = Selection {
+            pane_id: "%0".into(),
+            from: CellPos { col: 0, row: 0 },
+            to: CellPos { col: 2, row: 0 },
+        };
+        let text = SelectionState::extract(&mut rt, &sel).expect("text");
+        assert_eq!(
+            text.trim_end(),
+            "one",
+            "the copied text must be the row the user sees highlighted"
+        );
+    }
+
+    #[test]
     fn click_tracker_counts_triple() {
         let mut state = SelectionState::default();
         let target = HitTarget::PaneBody {
