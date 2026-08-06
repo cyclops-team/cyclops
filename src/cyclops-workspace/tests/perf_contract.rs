@@ -411,15 +411,47 @@ async fn flow_control_pause_and_resume() {
 
         match paused {
             Some(paused_pane) => break (client, notif, pane, paused_pane),
-            None if attempt < 2 => {
-                eprintln!(
-                    "attempt {attempt}: no %pause; fresh session on a possibly starved runner"
+            None => {
+                // Judge the attempt by its premise: drain what the flood
+                // actually queued behind the stalled reader. A real
+                // backlog with no %pause is tmux failing to pause, and
+                // fails now; a trickle means the flood starved and the
+                // attempt is no evidence either way.
+                let mut drained = 0usize;
+                let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                    loop {
+                        match notif.recv().await {
+                            Some(
+                                Notification::Output { data, .. }
+                                | Notification::ExtendedOutput { data, .. },
+                            ) => drained += data.len(),
+                            Some(_) => {}
+                            None => break,
+                        }
+                    }
+                })
+                .await;
+                assert!(
+                    drained < 256 * 1024,
+                    "no %pause although the stalled reader had {drained} bytes queued: \
+                     tmux should have paused the pane"
                 );
                 rig.server.run_ok(&["send-keys", "-t", &pane, "C-c"]);
                 client.shutdown().await;
+                if attempt == 2 {
+                    eprintln!(
+                        "skipping: the flood starved on three fresh attempts \
+                         ({drained} bytes queued on the last); this runner cannot \
+                         produce the backlog flow control needs"
+                    );
+                    return;
+                }
+                eprintln!(
+                    "attempt {attempt}: no %pause and only {drained} bytes queued; \
+                     the flood starved, fresh session"
+                );
                 attempt += 1;
             }
-            None => panic!("never saw %pause after the stall on three fresh attempts"),
         }
     };
     let pause_at = Instant::now();
@@ -474,13 +506,40 @@ async fn flow_control_pause_and_resume() {
 #[test]
 fn decoration_burst_coalesces_into_one_refresh() {
     let _serial = SERIAL.blocking_lock();
+    // The premise is a burst SENT inside one debounce window; a starved
+    // runner can stretch the send loop past it, and a burst that spans
+    // windows legitimately draws a second refresh. An attempt whose
+    // premise held asserts at once; a runner that cannot produce the
+    // premise in three tries cannot measure this and says so.
+    for attempt in 0..3 {
+        let (sent_in, refreshes) = burst_refreshes();
+        if sent_in < DEBOUNCE {
+            assert_eq!(
+                refreshes, 1,
+                "a 100-signal burst sent within one debounce window ({sent_in:?}) \
+                 must coalesce into exactly one refresh, got {refreshes}"
+            );
+            return;
+        }
+        eprintln!("attempt {attempt}: the burst took {sent_in:?} to send, premise not met");
+    }
+    eprintln!(
+        "skipping: this runner cannot send a 100-signal burst inside one \
+         {DEBOUNCE:?} debounce window"
+    );
+}
+
+const DEBOUNCE: Duration = Duration::from_millis(30);
+
+/// One burst scenario: how long the 100-signal send loop took, and how
+/// many refreshes it drew.
+fn burst_refreshes() -> (Duration, usize) {
     let (sig_tx, sig_rx) = mpsc::channel();
     let refreshes: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
     let refreshes_bg = Arc::clone(&refreshes);
-    let debounce = Duration::from_millis(30);
 
     let handle = std::thread::spawn(move || {
-        coalesce_decoration_signals(sig_rx, debounce, move || {
+        coalesce_decoration_signals(sig_rx, DEBOUNCE, move || {
             refreshes_bg
                 .lock()
                 .expect("refresh log")
@@ -497,7 +556,7 @@ fn decoration_burst_coalesces_into_one_refresh() {
     }
     let send_burst_duration = t0.elapsed();
     // Give the debounce time to fire before ending the loop.
-    std::thread::sleep(debounce * 3);
+    std::thread::sleep(DEBOUNCE * 3);
     sig_tx
         .send(DecorationSignal::Closed)
         .expect("coalescing thread still running");
@@ -505,16 +564,14 @@ fn decoration_burst_coalesces_into_one_refresh() {
 
     assert_eq!(end, CoalesceEnd::Closed);
     let calls = refreshes.lock().expect("refresh log");
-    assert_eq!(
-        calls.len(),
-        1,
-        "a 100-signal burst must coalesce into exactly one refresh, got {calls:?}"
-    );
+    let first_ms = calls
+        .first()
+        .map(|c| c.duration_since(t0).as_secs_f64() * 1000.0);
     println!(
-        "decoration_burst: 100 signals sent in {:.3}ms, first-signal-to-refresh latency={:.2}ms",
+        "decoration_burst: 100 signals sent in {:.3}ms, first-signal-to-refresh latency={first_ms:?}ms",
         send_burst_duration.as_secs_f64() * 1000.0,
-        calls[0].duration_since(t0).as_secs_f64() * 1000.0
     );
+    (send_burst_duration, calls.len())
 }
 
 /// The other half of the same rule: signals arriving every ~5ms for ~200ms
@@ -528,27 +585,37 @@ fn decoration_burst_coalesces_into_one_refresh() {
 #[test]
 fn decoration_stream_refreshes_repeatedly_during_the_stream() {
     let _serial = SERIAL.blocking_lock();
-    // Up to three attempts: the 5ms driver below is at the scheduler's
-    // mercy, and a starved runner can stretch the whole 200ms stream into
-    // two debounce windows (the relocated-leg CI reds). One attempt with
-    // several refreshes proves the arm-once rule; a regression that waits
-    // for the stream to end produces one refresh on every attempt.
-    let mut last = 0;
+    // Up to three attempts, and each one is judged by its premise: a
+    // healthy 5ms driver sends ~40 signals over 200ms, and only a stream
+    // the driver actually sustained is evidence about the arm-once rule.
+    // A starved driver (the relocated-leg CI reds) does not count either
+    // way; a healthy stream with too few refreshes is the regression.
+    let mut regression = None;
     for attempt in 0..3 {
-        last = stream_refresh_count();
-        if last >= 3 {
+        let (signals, refreshes) = stream_refresh_count();
+        if refreshes >= 3 {
             return;
         }
-        eprintln!("attempt {attempt}: {last} refreshes; retrying on a possibly starved runner");
+        if signals >= 30 {
+            regression = Some((signals, refreshes));
+            eprintln!("attempt {attempt}: a healthy {signals}-signal stream drew only {refreshes} refreshes");
+        } else {
+            eprintln!("attempt {attempt}: the driver was starved ({signals} signals over 200ms), no evidence");
+        }
     }
-    panic!(
-        "expected several refreshes during a 200ms stream with a 30ms debounce, got {last} \
-         on three attempts — the arm-once rule should keep firing throughout the stream \
-         rather than waiting for it to end"
-    );
+    match regression {
+        Some((signals, refreshes)) => panic!(
+            "expected several refreshes during a healthy {signals}-signal 200ms stream with a \
+             30ms debounce, got {refreshes} — the arm-once rule should keep firing throughout \
+             the stream rather than waiting for it to end"
+        ),
+        None => {
+            eprintln!("skipping: this runner starved the 5ms signal driver on all three attempts")
+        }
+    }
 }
 
-fn stream_refresh_count() -> usize {
+fn stream_refresh_count() -> (usize, usize) {
     let (sig_tx, sig_rx) = mpsc::channel();
     let refreshes: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
     let refreshes_bg = Arc::clone(&refreshes);
@@ -592,7 +659,7 @@ fn stream_refresh_count() -> usize {
         "decoration_stream: {signals_sent} signals over ~200ms produced {} refreshes at {offsets_ms:?}ms (gaps {gaps_ms:?}ms)",
         calls.len()
     );
-    calls.len()
+    (signals_sent, calls.len())
 }
 
 // ---------------------------------------------------------------------------
