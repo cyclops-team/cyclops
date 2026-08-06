@@ -229,8 +229,16 @@ fn list_renders_the_roster_and_asks_status_for_it() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let expected = "\x20 reviewer     ● working  Run the tests\n\
-                    \x20 implementer  ○ idle\n";
+    // The header names the watched session and the home the client asked
+    // through: the roster of a second daemon on a second home reads
+    // differently on its first line.
+    let expected = format!(
+        "watching main · home {}\n\
+         \n\
+         \x20 reviewer     ● working  Run the tests\n\
+         \x20 implementer  ○ idle\n",
+        home.display()
+    );
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
     let _ = fs::remove_dir_all(&home);
 }
@@ -253,6 +261,10 @@ fn list_json_carries_the_same_rows() {
     assert_eq!(agents[0]["agent"], json!("reviewer"));
     assert_eq!(agents[0]["state"], json!("working"));
     assert_eq!(agents[1]["agent"], json!("implementer"));
+    // The header's facts, as additive fields: which home this client
+    // asked through, and the sessions the daemon watches.
+    assert_eq!(v["home"], json!(home.display().to_string()), "{v}");
+    assert_eq!(v["sessions"], json!(["main"]), "{v}");
     let _ = fs::remove_dir_all(&home);
 }
 

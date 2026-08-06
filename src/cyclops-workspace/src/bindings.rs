@@ -17,6 +17,13 @@ pub enum BindingAction {
     FocusRight,
     FocusUp,
     FocusDown,
+    /// No default chords: the pane context menu reaches these, and the
+    /// keyboard's Shift upgrade of the focus chords covers the common
+    /// case; bindable via config for anyone who wants dedicated keys.
+    SwapPaneLeft,
+    SwapPaneRight,
+    SwapPaneUp,
+    SwapPaneDown,
     SplitRight,
     SplitDown,
     ClosePane,
@@ -31,6 +38,8 @@ pub enum BindingAction {
     CloseWorkspace,
     ToggleEventPanel,
     ShowKeybinds,
+    /// No default chord: reached from the app menu, bindable via config.
+    ShowThemes,
 }
 
 /// One human-readable row in the in-app keybinding reference.
@@ -214,6 +223,10 @@ fn action_from_key(key: &str) -> Option<BindingAction> {
         "focus_right" => Some(BindingAction::FocusRight),
         "focus_up" => Some(BindingAction::FocusUp),
         "focus_down" => Some(BindingAction::FocusDown),
+        "swap_left" => Some(BindingAction::SwapPaneLeft),
+        "swap_right" => Some(BindingAction::SwapPaneRight),
+        "swap_up" => Some(BindingAction::SwapPaneUp),
+        "swap_down" => Some(BindingAction::SwapPaneDown),
         "split_right" => Some(BindingAction::SplitRight),
         "split_down" => Some(BindingAction::SplitDown),
         "close_pane" => Some(BindingAction::ClosePane),
@@ -228,6 +241,7 @@ fn action_from_key(key: &str) -> Option<BindingAction> {
         "close_workspace" => Some(BindingAction::CloseWorkspace),
         "toggle_event_panel" => Some(BindingAction::ToggleEventPanel),
         "show_keybinds" => Some(BindingAction::ShowKeybinds),
+        "show_themes" => Some(BindingAction::ShowThemes),
         s if s.starts_with("tab_") => s
             .strip_prefix("tab_")
             .and_then(|n| n.parse::<usize>().ok())
@@ -254,7 +268,58 @@ pub fn binding_help(bindings: &HashMap<BindingAction, BindingChord>) -> Vec<Bind
         })
         .collect();
     rows.sort_by_key(|(action, _)| help_rank(*action));
-    rows.into_iter().map(|(_, row)| row).collect()
+    // The pane swap chords are Shift upgrades of the focus chords, not
+    // entries in the map ([`crate::action::route_binding_shifted`]), and
+    // only a prefix chord can carry the upgrade: a direct chord's
+    // modifiers are matched exactly, so Shift there is a different
+    // binding. Deriving the rows from the live chords keeps a config
+    // rebind from leaving the sheet teaching the old key.
+    let swaps: Vec<BindingHelp> = [
+        (BindingAction::FocusLeft, "Swap pane left"),
+        (BindingAction::FocusRight, "Swap pane right"),
+        (BindingAction::FocusUp, "Swap pane above"),
+        (BindingAction::FocusDown, "Swap pane below"),
+    ]
+    .into_iter()
+    .filter_map(|(focus, words)| match bindings.get(&focus) {
+        Some(BindingChord::Prefix(code)) => Some(BindingHelp {
+            keys: format!("Ctrl+B Shift+{}", key_words(*code)),
+            action: words.into(),
+        }),
+        _ => None,
+    })
+    .collect();
+    let at = rows
+        .iter()
+        .rposition(|(action, _)| {
+            matches!(
+                action,
+                BindingAction::FocusLeft
+                    | BindingAction::FocusRight
+                    | BindingAction::FocusUp
+                    | BindingAction::FocusDown
+            )
+        })
+        .map_or(rows.len(), |index| index + 1);
+    let mut rows: Vec<BindingHelp> = rows.into_iter().map(|(_, row)| row).collect();
+    for (offset, row) in swaps.into_iter().enumerate() {
+        rows.insert(at + offset, row);
+    }
+    // Copy and paste are fixed gestures, not bindings, but this reference
+    // is the one place a user looks for them.
+    rows.push(BindingHelp {
+        keys: "Drag".into(),
+        action: "Select text, copy on release".into(),
+    });
+    rows.push(BindingHelp {
+        keys: "Double / triple click".into(),
+        action: "Copy word / line".into(),
+    });
+    rows.push(BindingHelp {
+        keys: "Terminal paste".into(),
+        action: "Paste into focused pane".into(),
+    });
+    rows
 }
 
 fn action_words(action: BindingAction) -> String {
@@ -268,6 +333,10 @@ fn action_words(action: BindingAction) -> String {
         BindingAction::FocusRight => "Focus pane right".into(),
         BindingAction::FocusUp => "Focus pane above".into(),
         BindingAction::FocusDown => "Focus pane below".into(),
+        BindingAction::SwapPaneLeft => "Swap pane left".into(),
+        BindingAction::SwapPaneRight => "Swap pane right".into(),
+        BindingAction::SwapPaneUp => "Swap pane above".into(),
+        BindingAction::SwapPaneDown => "Swap pane below".into(),
         BindingAction::SplitRight => "Split pane right".into(),
         BindingAction::SplitDown => "Split pane down".into(),
         BindingAction::ClosePane => "Close pane".into(),
@@ -282,6 +351,7 @@ fn action_words(action: BindingAction) -> String {
         BindingAction::CloseWorkspace => "Close workspace".into(),
         BindingAction::ToggleEventPanel => "Toggle event stream".into(),
         BindingAction::ShowKeybinds => "Keybinds".into(),
+        BindingAction::ShowThemes => "Themes".into(),
     }
 }
 
@@ -291,6 +361,10 @@ fn help_rank(action: BindingAction) -> (u8, usize) {
         BindingAction::FocusRight => (11, 0),
         BindingAction::FocusUp => (12, 0),
         BindingAction::FocusDown => (13, 0),
+        BindingAction::SwapPaneLeft => (13, 1),
+        BindingAction::SwapPaneRight => (13, 2),
+        BindingAction::SwapPaneUp => (13, 3),
+        BindingAction::SwapPaneDown => (13, 4),
         BindingAction::SplitRight => (14, 0),
         BindingAction::SplitDown => (15, 0),
         BindingAction::ZoomPane => (16, 0),
@@ -309,7 +383,8 @@ fn help_rank(action: BindingAction) -> (u8, usize) {
         BindingAction::CloseWorkspace => (44, 0),
         BindingAction::ToggleEventPanel => (50, 0),
         BindingAction::ShowKeybinds => (51, 0),
-        BindingAction::Detach => (52, 0),
+        BindingAction::ShowThemes => (52, 0),
+        BindingAction::Detach => (53, 0),
     }
 }
 
@@ -429,5 +504,61 @@ mod tests {
         assert_eq!(naming.keys, "Ctrl+Alt+m");
         assert!(rows.iter().any(|row| row.action == "Keybinds"));
         assert!(rows.iter().any(|row| row.action == "Detach"));
+    }
+
+    #[test]
+    fn help_documents_copy_and_paste() {
+        let rows = binding_help(&default_bindings());
+        assert!(rows
+            .iter()
+            .any(|row| row.action == "Select text, copy on release"));
+        assert!(rows.iter().any(|row| row.action == "Copy word / line"));
+        assert!(rows
+            .iter()
+            .any(|row| row.action == "Paste into focused pane"));
+    }
+
+    /// The swap rows derive from the live focus chords, right after them,
+    /// so a rebind cannot leave the sheet teaching the old key.
+    #[test]
+    fn help_derives_the_swap_chords_from_the_focus_chords() {
+        let rows = binding_help(&default_bindings());
+        let focus_down = rows
+            .iter()
+            .position(|row| row.action == "Focus pane below")
+            .expect("focus rows present");
+        let swaps: Vec<_> = rows[focus_down + 1..focus_down + 5]
+            .iter()
+            .map(|row| (row.keys.as_str(), row.action.as_str()))
+            .collect();
+        assert_eq!(
+            swaps,
+            vec![
+                ("Ctrl+B Shift+Left", "Swap pane left"),
+                ("Ctrl+B Shift+Right", "Swap pane right"),
+                ("Ctrl+B Shift+Up", "Swap pane above"),
+                ("Ctrl+B Shift+Down", "Swap pane below"),
+            ]
+        );
+
+        // A rebound prefix chord changes the taught key with it.
+        let mut bindings = default_bindings();
+        bindings.insert(
+            BindingAction::FocusLeft,
+            BindingChord::Prefix(KeyCode::Char('h')),
+        );
+        let rows = binding_help(&bindings);
+        assert!(rows
+            .iter()
+            .any(|row| row.action == "Swap pane left" && row.keys == "Ctrl+B Shift+h"));
+
+        // A direct chord matches its modifiers exactly, so no Shift
+        // upgrade exists and no swap row is taught for it.
+        bindings.insert(
+            BindingAction::FocusLeft,
+            BindingChord::Direct(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT)),
+        );
+        let rows = binding_help(&bindings);
+        assert!(!rows.iter().any(|row| row.action == "Swap pane left"));
     }
 }

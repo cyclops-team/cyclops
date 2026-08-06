@@ -1,4 +1,4 @@
-//! Drag state machine for dividers, tabs, and sidebar row ordering.
+//! Drag state machine for dividers, panes, tabs, and sidebar row ordering.
 
 use crate::action::Insertion;
 use crate::layout::SplitDir;
@@ -9,6 +9,11 @@ pub enum DragTarget {
     Divider {
         pane_id: String,
         dir: SplitDir,
+    },
+    /// Swap a pane with the one it is dropped on. Picked up by its frame,
+    /// never its body: a body drag is text selection.
+    Pane {
+        pane_id: String,
     },
     Tab {
         window_id: String,
@@ -212,6 +217,9 @@ mod tests {
     #[test]
     fn each_target_variant_lifecycle() {
         for target in [
+            DragTarget::Pane {
+                pane_id: "%0".into(),
+            },
             DragTarget::Tab {
                 window_id: "@0".into(),
             },

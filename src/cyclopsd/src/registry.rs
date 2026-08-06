@@ -186,6 +186,16 @@ impl Registry {
         self.panes.get(pane_id)
     }
 
+    /// Distinct session names with at least one adoption on file. Boot
+    /// verifies the ones it will not watch against tmux (lib.rs); an entry
+    /// nothing verifies would hold its label forever.
+    pub(crate) fn sessions(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.panes.values().map(|a| a.session.clone()).collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Adoptions in a session, for chrome re-apply after a reattach.
     pub(crate) fn in_session(&self, session: &str) -> Vec<Adoption> {
         let mut out: Vec<Adoption> = self
@@ -632,6 +642,7 @@ mod tests {
         assert!(reg.label_taken_by_other("reviewer", "%2"));
         assert!(!reg.label_taken_by_other("reviewer", "%1"));
         assert!(!reg.label_taken_by_other("implementer", "%2"));
+        assert_eq!(reg.sessions(), vec!["main"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

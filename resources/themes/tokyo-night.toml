@@ -4,6 +4,7 @@
 name = "tokyo-night"
 [surface]
 fg = { hex = "#c0caf5", c256 = 189 }
+bg = { hex = "#1a1b26", c256 = 234 } # night bg, the pane ground
 dim = { hex = "#565f89", c256 = 60 }
 accent = { hex = "#7aa2f7", c256 = 111 }
 [role]
@@ -29,6 +30,27 @@ healthy = { hex = "#9ece6a", c256 = 149 }
 needs_you = { hex = "#e0af68", c256 = 179 }
 terminal = { hex = "#f7768e", c256 = 210 }
 quiet = { hex = "#565f89", c256 = 60 }
+
+# The ANSI-16 mapping: the project's published night terminal colors,
+# brights included. Fallbacks are the literal ANSI index, as in every
+# shipped theme.
+[palette]
+0 = { hex = "#15161e", c256 = 0 }
+1 = { hex = "#f7768e", c256 = 1 }
+2 = { hex = "#9ece6a", c256 = 2 }
+3 = { hex = "#e0af68", c256 = 3 }
+4 = { hex = "#7aa2f7", c256 = 4 }
+5 = { hex = "#bb9af7", c256 = 5 }
+6 = { hex = "#7dcfff", c256 = 6 }
+7 = { hex = "#a9b1d6", c256 = 7 }
+8 = { hex = "#414868", c256 = 8 }
+9 = { hex = "#ff899d", c256 = 9 }
+10 = { hex = "#9fe044", c256 = 10 }
+11 = { hex = "#faba4a", c256 = 11 }
+12 = { hex = "#8db0ff", c256 = 12 }
+13 = { hex = "#c7a9ff", c256 = 13 }
+14 = { hex = "#a4daff", c256 = 14 }
+15 = { hex = "#c0caf5", c256 = 15 }
 
 # The workspace chrome's grounds: Tokyo Night storm panel and highlight.
 [chrome]

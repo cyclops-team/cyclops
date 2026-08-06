@@ -1,7 +1,7 @@
 //! Data-safety tests for the shipped manifests, locked against real
-//! captures from the M1 soak and the codex ghost probe (2026-08-02).
-//! These encode the M1 gate fixes; loosening them reopens measured
-//! injection hazards.
+//! captures from the M1 soak, the codex ghost probe (2026-08-02), and the
+//! live Claude Code 2.1.221 rig (2026-08-06). These encode the M1 gate
+//! fixes; loosening them reopens measured injection hazards.
 
 use std::path::Path;
 
@@ -121,6 +121,120 @@ fn claude_carries_argv_basenames_fallback() {
 /// that a rule would have fired on its own.
 fn non_empty(capture: &str) -> Vec<&str> {
     capture.lines().filter(|l| !l.trim().is_empty()).collect()
+}
+
+/// MEASURED 2026-08-06 (Claude Code 2.1.221, unfocused tmux pane): "esc to
+/// interrupt" never appeared on the daemon's grid across a 17s streaming
+/// turn (0.7s samples plus full mid-turn captures), and the empty composer
+/// stays visible below the stream, so mid-turn the screen tier reads
+/// composer_empty. Only the title spinner says working. The second
+/// assertion pins that screen-tier gap ON PURPOSE: a future real mid-turn
+/// screen rule must flip it consciously.
+#[test]
+fn claude_midturn_streaming_2_1_221() {
+    let all = shipped();
+    let claude = &all["claude"];
+    let grid = include_str!("fixtures/claude_midturn_streaming_2_1_221.txt");
+
+    // The spinner title decides working over the idle-shaped screen.
+    let r = claude
+        .evaluate("\u{2802} Reply with exactly OK", grid)
+        .unwrap();
+    assert_eq!(r.id, "title_working_spinner");
+    assert_eq!(r.state, AgentState::Working);
+
+    // Pre-OSC hostname title: no title rule fires and the screen tier
+    // calls the same mid-turn grid idle. Known gap, deliberately pinned.
+    let r = claude.evaluate("mac", grid).unwrap();
+    assert_eq!(r.id, "composer_empty");
+    assert_eq!(r.state, AgentState::Idle);
+}
+
+/// MEASURED 2026-08-06 (Claude Code 2.1.221): idle after launch. The title
+/// carries the ✳ sparkle; the screen alone reads idle by the empty
+/// composer, whose glyph is followed by U+00A0, not a plain space.
+#[test]
+fn claude_idle_2_1_221() {
+    let all = shipped();
+    let claude = &all["claude"];
+    let grid = include_str!("fixtures/claude_idle_2_1_221.txt");
+
+    let r = claude.evaluate("\u{2733} Claude Code", grid).unwrap();
+    assert_eq!(r.id, "title_idle_sparkle");
+    assert_eq!(r.state, AgentState::Idle);
+
+    // Screen tier alone: the empty composer is the idle signal.
+    let r = claude.evaluate("mac", grid).unwrap();
+    assert_eq!(r.id, "composer_empty");
+    assert_eq!(r.state, AgentState::Idle);
+}
+
+/// MEASURED 2026-08-06 (Claude Code 2.1.221): the trust dialog's wording
+/// still carries 'safety check' and 'trust this folder', and BOTH lower
+/// modal rules shadow this capture: startup_modal on 'Enter to confirm',
+/// permission_prompt on the '❯ 1. Yes, ...' option line. Only the 1300
+/// priority keeps the human-only park in charge; Escape exits the CLI.
+#[test]
+fn claude_trust_dialog_2_1_221() {
+    let all = shipped();
+    let claude = &all["claude"];
+    let dialog = include_str!("fixtures/claude_trust_dialog_2_1_221.txt");
+
+    let r = claude.evaluate("mac", dialog).unwrap();
+    assert_eq!(r.id, "trust_dialog");
+    assert_eq!(r.state, AgentState::BlockedModal);
+    assert!(!r.auto_dismiss, "trust dialog must park, not auto-dismiss");
+    assert!(r.decline_keys.is_empty(), "no keys: Escape exits the CLI");
+
+    let trust = claude
+        .rules
+        .iter()
+        .find(|r| r.id == "trust_dialog")
+        .expect("trust_dialog rule");
+    let lines = non_empty(dialog);
+    for shadow_id in ["startup_modal", "permission_prompt"] {
+        let shadow = claude
+            .rules
+            .iter()
+            .find(|r| r.id == shadow_id)
+            .expect(shadow_id);
+        assert!(
+            shadow.matches(dialog, &lines),
+            "{shadow_id} lost its shadow"
+        );
+        assert!(trust.priority > shadow.priority, "{shadow_id} must lose");
+    }
+}
+
+/// Title table measured on 2.1.221: the ✳ prefix reads idle whatever the
+/// summary text after it, every braille frame reads working, and the
+/// pre-OSC hostname seed matches no title rule (the screen tier decides).
+#[test]
+fn claude_title_table_2_1_221() {
+    let all = shipped();
+    let claude = &all["claude"];
+
+    // Empty screen isolates the title tier.
+    let r = claude
+        .evaluate("\u{2733} Reply with exactly OK", "")
+        .unwrap();
+    assert_eq!(r.id, "title_idle_sparkle");
+    assert_eq!(r.state, AgentState::Idle);
+
+    for title in [
+        "\u{2802} Reply with exactly OK",
+        "\u{2810} Reply with exactly OK",
+        "\u{2802} Claude Code",
+    ] {
+        let r = claude.evaluate(title, "").unwrap();
+        assert_eq!(r.id, "title_working_spinner", "{title}");
+        assert_eq!(r.state, AgentState::Working, "{title}");
+    }
+
+    assert!(
+        claude.evaluate("mac", "").is_none(),
+        "the hostname seed must match no title rule"
+    );
 }
 
 /// MEASURED 2026-08-05, BINDING: the Cursor entry points are symlinks to a

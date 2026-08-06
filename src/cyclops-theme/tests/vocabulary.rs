@@ -58,11 +58,15 @@ fn renderers() -> Vec<String> {
 }
 
 /// The identifier a renderer names a token by: the token string uppercased
-/// with the dot as an underscore. The eight role slots are the exception
-/// they are declared as, one `ROLE` array a renderer indexes into.
+/// with the dot as an underscore. The eight role slots and the sixteen
+/// palette slots are the exception they are declared as, one array a
+/// renderer indexes into.
 fn constant_of(token: &str) -> String {
     if tokens::ROLE.contains(&token) {
         return "ROLE".to_string();
+    }
+    if tokens::PALETTE.contains(&token) {
+        return "PALETTE".to_string();
     }
     token.replace('.', "_").to_uppercase()
 }
@@ -114,10 +118,6 @@ fn every_token_in_the_vocabulary_is_painted_by_a_renderer() {
     assert!(!sources.is_empty(), "found no renderer sources to read");
     let mapped = reached_through_mappings(&sources);
     for token in tokens::ALL {
-        // surface.fg is the one documented exception, checked below.
-        if token == tokens::SURFACE_FG {
-            continue;
-        }
         if mapped.contains(&token) {
             continue;
         }
@@ -130,20 +130,4 @@ fn every_token_in_the_vocabulary_is_painted_by_a_renderer() {
              docs/guides/themes.md)"
         );
     }
-}
-
-/// The other direction, because the exception is a documented claim too:
-/// `surface.fg` is the engine's fallback for a token name outside the
-/// vocabulary, and both the crate doc and docs/guides/themes.md tell readers that
-/// editing it changes nothing. A renderer reaching for it makes all three
-/// pages wrong at once.
-#[test]
-fn surface_fg_stays_the_engines_own_fallback() {
-    let needle = format!("tokens::{}", constant_of(tokens::SURFACE_FG));
-    let offenders = renderers().iter().filter(|s| s.contains(&needle)).count();
-    assert_eq!(
-        offenders, 0,
-        "{needle} is documented as painted by nobody; a renderer that paints \
-         it has to be documented instead"
-    );
 }

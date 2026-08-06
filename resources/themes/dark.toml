@@ -6,6 +6,7 @@
 # the two brand accents onto the semantic vocabulary:
 #
 #   surface.fg      --term-text    #edecec   fallback only, see below
+#   surface.bg      --term-bg      #0d0d0d   the pane ground the workspace paints
 #   surface.dim     --term-dim     #777777   secondary terminal text
 #   surface.accent  --sage         #b7c396   the brand accent, ".ok"/".prompt"
 #
@@ -21,11 +22,10 @@
 # rig stays quiet; alert takes sage, the site's "ok" color, so the mark
 # brightens into the brand when something needs the human.
 #
-# surface.fg is the one value here that no renderer paints. Cyclops prints
-# body text in the terminal's own foreground; the engine reads surface.fg
-# only as its fallback when a renderer asks for a token outside the
-# vocabulary. It stays because it names the identity's text color and
-# gives that fallback a themed value. Editing it changes nothing on screen.
+# surface.fg is the pane text: the workspace paints it as the figure on
+# surface.bg under every pane cell. One-shot commands still print in the
+# terminal's own foreground, and the engine also reads surface.fg as its
+# fallback when a renderer asks for a token outside the vocabulary.
 #
 # [state] and [badge] are the second meaning-carrying encoding's color
 # half, and they are REDUNDANT by construction: every state still prints
@@ -58,17 +58,20 @@
 #
 # CONTRAST. Checked pair: every token in the vocabulary against #0d0d0d,
 # the site's --term-bg. That is the ground this palette was drawn on, and
-# this file sets no background of its own, so a terminal darker than it
-# reads higher and a lighter one reads lower. Measured as WCAG 2.1
-# relative luminance in sRGB, ratio (lighter + 0.05) / (darker + 0.05);
-# the arithmetic is in src/cyclops-theme/tests/shipped.rs and the
-# numbers below are pinned there by
-# shipped_themes_meet_their_stated_contrast.
+# it is surface.bg here, so the workspace paints the measured pair under
+# pane bodies. One-shot commands still print on the terminal's own
+# background, where a darker terminal reads higher and a lighter one
+# lower. Measured as WCAG 2.1 relative luminance in sRGB, ratio
+# (lighter + 0.05) / (darker + 0.05); the arithmetic is in
+# src/cyclops-theme/tests/shipped.rs and the numbers below are pinned
+# there by shipped_themes_meet_their_stated_contrast.
 #
-# Floor 4.3:1 for every figure token except state.dead; the two [chrome]
-# grounds are backgrounds the workspace chrome paints, not figures, so
-# their bar (pinned in the same test) is that chrome.text stays readable
-# on both grounds at this floor, not that they clear it themselves.
+# Floor 4.3:1 for every figure token except state.dead; surface.bg and
+# the two [chrome] grounds are backgrounds, not figures, so their bar
+# (pinned in the same test) is that chrome.text stays readable on both
+# chrome grounds at this floor, not that they clear it themselves. The
+# [palette] entries carry no bar either: they are content colors the
+# running program picks, and the theme only supplies the mapping.
 # The floor itself is
 # surface.dim, and eye.calm, state.quiet and badge.quiet sit on it because
 # they take the same value: 4.34:1, just under WCAG AA's 4.5:1, and it
@@ -88,12 +91,14 @@
 # several of the muted pastels derive to the same cube entry, and role
 # color is one of the two meaning-carrying encodings, so the role
 # fallbacks are hand-tuned to stay pairwise distinct (nearest distinct
-# entries in hue order).
+# entries in hue order). The [palette] fallbacks are the literal ANSI
+# index: the program asked for color N, and terminals remap 0..15 freely.
 
 name = "dark"
 
 [surface]
 fg = { hex = "#edecec", c256 = 255 }
+bg = { hex = "#0d0d0d", c256 = 232 }
 dim = { hex = "#777777", c256 = 243 }
 accent = { hex = "#b7c396", c256 = 144 }
 
@@ -123,6 +128,26 @@ healthy = { hex = "#96c396", c256 = 108 }
 needs_you = { hex = "#d7a86e", c256 = 179 }
 terminal = { hex = "#cf6a6a", c256 = 167 }
 quiet = { hex = "#777777", c256 = 243 }
+
+# The ANSI-16 mapping for pane content: the sorbet family's take on the
+# sixteen terminal colors, brights lifted toward white.
+[palette]
+0 = { hex = "#2e2e2e", c256 = 0 }
+1 = { hex = "#cf6a6a", c256 = 1 }
+2 = { hex = "#96c396", c256 = 2 }
+3 = { hex = "#d7a86e", c256 = 3 }
+4 = { hex = "#96aac3", c256 = 4 }
+5 = { hex = "#c396bb", c256 = 5 }
+6 = { hex = "#96bfc3", c256 = 6 }
+7 = { hex = "#c9c9c9", c256 = 7 }
+8 = { hex = "#5a5a5a", c256 = 8 }
+9 = { hex = "#d98888", c256 = 9 }
+10 = { hex = "#abcfab", c256 = 10 }
+11 = { hex = "#dfb98b", c256 = 11 }
+12 = { hex = "#abbbcf", c256 = 12 }
+13 = { hex = "#cfabc9", c256 = 13 }
+14 = { hex = "#abcccf", c256 = 14 }
+15 = { hex = "#edecec", c256 = 15 }
 
 # The workspace chrome's grounds: one and two visible steps up from the
 # site's --term-bg, so the chrome reads as furniture, not content.

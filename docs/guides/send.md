@@ -16,7 +16,7 @@ The recipient's model reads:
 ```
 [cyclops m-3f9c2a] FROM: admin  SUBJECT: Review the rate limiter
 gateway.rs:120
-Reply with: cyclops send admin --subject "..." [--body ... | --body-file -]
+Reply: cyclops send admin --subject "..."
 ```
 
 The daemon builds the header from the sender's real identity (socket peer,

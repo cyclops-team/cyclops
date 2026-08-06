@@ -203,11 +203,14 @@ async fn split_opens_in_the_source_panes_directory_not_the_sessions() {
     };
     let session_dir = scratch("cyclops-ops-session-dir");
     let pane_dir = scratch("cyclops-ops-pane-dir");
+    // Named window: an unnamed /bin/sh window auto-renames to "sh", which bare `-t s` prefix-matches.
     srv.tmux_ok(&[
         "new-session",
         "-d",
         "-s",
         "s",
+        "-n",
+        "root",
         "-x",
         "120",
         "-y",
@@ -219,10 +222,13 @@ async fn split_opens_in_the_source_panes_directory_not_the_sessions() {
     // A window rooted somewhere else: its pane's path is the only thing
     // that distinguishes `-c #{pane_current_path}` from tmux's default,
     // which is the session's directory.
+    // `s:` is the session-typed target; bare `-t s` would prefix-match an auto-renamed window.
     srv.tmux_ok(&[
         "new-window",
         "-t",
-        "s",
+        "s:",
+        "-n",
+        "work",
         "-c",
         pane_dir.to_str().expect("UTF-8 scratch path"),
         "/bin/sh",
@@ -371,7 +377,8 @@ async fn rename_window_targets_the_id_not_the_current_window() {
     };
     srv.new_session("s");
     // The second window is current, so an untargeted rename would hit it.
-    srv.tmux_ok(&["new-window", "-t", "s", "-n", "active", "/bin/sh"]);
+    // `s:` is the session-typed target; bare `-t s` prefix-matches window 0's auto-renamed "sh" name.
+    srv.tmux_ok(&["new-window", "-t", "s:", "-n", "active", "/bin/sh"]);
     let first = lines(&srv, &["list-windows", "-t", "s", "-F", "#{window_id}"])[0].clone();
     let (client, _n) = ControlClient::spawn(srv.config("s")).await.expect("spawn");
 
@@ -463,6 +470,121 @@ async fn swap_window_exchanges_the_two_positions() {
     client.swap_window(&first, &second).await.expect("swap");
 
     assert_eq!(window_names(&srv, "s"), vec!["two", "one"]);
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn swap_pane_exchanges_the_panes_and_focuses_the_target() {
+    let Some(srv) = TestServer::new("ops-swap-pane") else {
+        return;
+    };
+    srv.tmux_ok(&[
+        "new-session",
+        "-d",
+        "-s",
+        "s",
+        "-n",
+        "one",
+        "-x",
+        "120",
+        "-y",
+        "30",
+        "/bin/sh",
+    ]);
+    srv.tmux_ok(&["split-window", "-d", "-h", "-t", "s:one", "/bin/sh"]);
+    let before = lines(
+        &srv,
+        &["list-panes", "-t", "s:one", "-F", "#{pane_id} #{pane_left}"],
+    );
+    let (client, _n) = ControlClient::spawn(srv.config("s")).await.expect("spawn");
+
+    let (a, b) = (
+        before[0].split(' ').next().expect("id").to_string(),
+        before[1].split(' ').next().expect("id").to_string(),
+    );
+    client.swap_pane(&a, &b).await.expect("swap");
+
+    let after = lines(
+        &srv,
+        &[
+            "list-panes",
+            "-t",
+            "s:one",
+            "-F",
+            "#{pane_id} #{pane_left} #{pane_active}",
+        ],
+    );
+    // Positions exchanged, and tmux focused `-t` in its new slot.
+    let a_left_before = before[0].split(' ').nth(1).expect("left");
+    let b_left_before = before[1].split(' ').nth(1).expect("left");
+    assert!(
+        after.contains(&format!("{a} {b_left_before} 0")),
+        "{after:?}"
+    );
+    assert!(
+        after.contains(&format!("{b} {a_left_before} 1")),
+        "{after:?}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn swap_pane_toward_swaps_with_the_tmux_resolved_neighbour() {
+    let Some(srv) = TestServer::new("ops-swap-toward") else {
+        return;
+    };
+    srv.tmux_ok(&[
+        "new-session",
+        "-d",
+        "-s",
+        "s",
+        "-n",
+        "one",
+        "-x",
+        "120",
+        "-y",
+        "30",
+        "/bin/sh",
+    ]);
+    srv.tmux_ok(&["split-window", "-d", "-h", "-t", "s:one", "/bin/sh"]);
+    let before = lines(
+        &srv,
+        &["list-panes", "-t", "s:one", "-F", "#{pane_id} #{pane_left}"],
+    );
+    let (left, right) = (
+        before[0].split(' ').next().expect("id").to_string(),
+        before[1].split(' ').next().expect("id").to_string(),
+    );
+    srv.tmux_ok(&["select-pane", "-t", &left]);
+    let (client, _n) = ControlClient::spawn(srv.config("s")).await.expect("spawn");
+
+    client
+        .swap_pane_toward(PaneDirection::Right)
+        .await
+        .expect("swap toward");
+
+    // The current pane moved right and kept focus (it rides the implied
+    // `-t`); the resolved neighbour took its old slot.
+    let after = lines(
+        &srv,
+        &[
+            "list-panes",
+            "-t",
+            "s:one",
+            "-F",
+            "#{pane_id} #{pane_left} #{pane_active}",
+        ],
+    );
+    let left_pos = before[0].split(' ').nth(1).expect("left");
+    let right_pos = before[1].split(' ').nth(1).expect("left");
+    assert!(
+        after.contains(&format!("{left} {right_pos} 1")),
+        "{after:?}"
+    );
+    assert!(
+        after.contains(&format!("{right} {left_pos} 0")),
+        "{after:?}"
+    );
     client.shutdown().await;
 }
 

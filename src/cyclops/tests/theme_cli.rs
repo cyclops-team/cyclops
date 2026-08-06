@@ -336,10 +336,8 @@ fn the_daemon_answer_is_matched_against_the_themes_own_name() {
 fn a_theme_that_sets_no_tokens_is_neither_offered_nor_taken() {
     let home = scratch_home("theme-empty");
     write_theme(&home, "dark", "#777777");
-    // Four ways to parse and still paint nothing: empty, name only, every
-    // token name stale (the per-state names from before the groups), and
-    // `surface.fg` alone, which is in the vocabulary but is the engine's
-    // own fallback and reaches no renderer.
+    // Three ways to parse and still paint nothing: empty, name only, and
+    // every token name stale (the per-state names from before the groups).
     fs::write(home.join("themes/blank.toml"), "").expect("write blank");
     fs::write(home.join("themes/titled.toml"), "name = \"titled\"\n").expect("write titled");
     fs::write(
@@ -347,17 +345,12 @@ fn a_theme_that_sets_no_tokens_is_neither_offered_nor_taken() {
         "[state]\nidle = \"#111111\"\nworking = \"#222222\"\n",
     )
     .expect("write stale");
-    fs::write(
-        home.join("themes/fgonly.toml"),
-        "[surface]\nfg = \"#111111\"\n",
-    )
-    .expect("write fgonly");
     let before = "theme = \"dark\"\n";
     fs::write(home.join("config.toml"), before).expect("seed config");
 
     let out = cyclops(&home, &["theme"]);
     let text = stdout(&out);
-    for gone in ["blank", "titled", "stale", "fgonly"] {
+    for gone in ["blank", "titled", "stale"] {
         assert!(!text.contains(gone), "{gone} is offered: {text}");
     }
     assert!(text.contains("dark"), "{text}");
@@ -375,7 +368,7 @@ fn a_theme_that_sets_no_tokens_is_neither_offered_nor_taken() {
 
     // And a name typed by hand is refused rather than silently changing
     // nothing, which is the harm the listing rule exists to prevent.
-    for bad in ["blank", "titled", "stale", "fgonly"] {
+    for bad in ["blank", "titled", "stale"] {
         let out = cyclops(&home, &["theme", bad]);
         assert_eq!(out.status.code(), Some(2), "{bad}: {}", stdout(&out));
         assert!(

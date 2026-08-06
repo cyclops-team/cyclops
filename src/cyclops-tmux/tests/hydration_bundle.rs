@@ -14,7 +14,10 @@ async fn hydrate_pane_returns_metadata_and_captures() {
 
     let (client, _notif) = ControlClient::spawn(srv.config("hb")).await.expect("spawn");
 
-    client.set_window_size_latest().await.expect("latest");
+    client
+        .set_window_size_smallest("@0")
+        .await
+        .expect("smallest");
     client.set_client_size(120, 30).await.expect("client size");
 
     srv.tmux_ok(&["send-keys", "-t", "%0", "echo BUNDLE_OK", "Enter"]);

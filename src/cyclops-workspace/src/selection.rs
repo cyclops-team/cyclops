@@ -197,42 +197,66 @@ fn is_word_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-'
 }
 
-/// Copy text to the system clipboard via OSC 52, with a native fallback.
+/// Native clipboard writers, first on PATH wins. wl-copy / xclip cover
+/// Linux, pbcopy macOS; no extra dependency.
+const NATIVE_TOOLS: &[(&str, &[&str])] = &[
+    ("wl-copy", &[]),
+    ("xclip", &["-selection", "clipboard"]),
+    ("pbcopy", &[]),
+];
+
+/// Copy text to the system clipboard. Both paths can run: the native tool
+/// writes the local clipboard, OSC 52 reaches the terminal on the near
+/// side of SSH. An OSC 52 stdout write "succeeding" proves nothing, since
+/// macOS Terminal.app ignores the sequence and the write still returns
+/// Ok, so it must never be the reason the native path is skipped.
 pub fn copy_to_clipboard(text: &str) {
+    use std::io::IsTerminal;
     if text.is_empty() {
         return;
     }
-    if copy_osc52(text) {
-        return;
+    if let Some((bin, args)) = native_tool() {
+        let _ = copy_native(bin, args, text);
     }
-    let _ = copy_native(text);
+    if std::io::stdout().is_terminal() {
+        copy_osc52(text);
+    }
 }
 
-fn copy_osc52(text: &str) -> bool {
+/// First native clipboard tool on PATH. A PATH lookup, not a spawn.
+fn native_tool() -> Option<(&'static str, &'static [&'static str])> {
+    NATIVE_TOOLS.iter().copied().find(|(bin, _)| on_path(bin))
+}
+
+fn on_path(bin: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| dir.join(bin).is_file())
+}
+
+/// Emit the OSC 52 escape, fire and forget. No return value on purpose:
+/// the write result says nothing about the terminal honoring it.
+fn copy_osc52(text: &str) {
     use std::io::Write;
     let encoded = base64_encode(text.as_bytes());
     let seq = format!("\x1b]52;c;{encoded}\x07");
-    std::io::stdout().write_all(seq.as_bytes()).is_ok()
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(seq.as_bytes());
+    let _ = stdout.flush();
 }
 
-fn copy_native(text: &str) -> bool {
-    // wl-copy / xclip when present — no extra dependency.
-    for (bin, args) in [
-        ("wl-copy", vec![] as Vec<&str>),
-        ("xclip", vec!["-selection", "clipboard"]),
-        ("pbcopy", vec![]),
-    ] {
-        if let Ok(mut child) = std::process::Command::new(bin)
-            .args(&args)
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-        {
-            use std::io::Write;
-            if let Some(stdin) = child.stdin.as_mut() {
-                if stdin.write_all(text.as_bytes()).is_ok() && child.wait().is_ok() {
-                    return true;
-                }
-            }
+/// Pipe text into one native tool. The caller already proved the binary
+/// is on PATH.
+fn copy_native(bin: &str, args: &[&str], text: &str) -> bool {
+    if let Ok(mut child) = std::process::Command::new(bin)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    {
+        use std::io::Write;
+        if let Some(stdin) = child.stdin.as_mut() {
+            return stdin.write_all(text.as_bytes()).is_ok() && child.wait().is_ok();
         }
     }
     false
@@ -295,6 +319,31 @@ mod tests {
     }
 
     #[test]
+    fn extract_while_scrolled_copies_the_rows_on_screen() {
+        let mut rt = PaneRuntime::new(8, 2);
+        rt.feed(b"one\r\ntwo\r\nthree\r\nfour");
+        // Two rows scrolled into history; the viewport now shows them.
+        rt.scroll(-2);
+        assert_eq!(
+            rt.row_text(0).trim_end(),
+            "one",
+            "rig premise: the viewport must be showing history"
+        );
+
+        let sel = Selection {
+            pane_id: "%0".into(),
+            from: CellPos { col: 0, row: 0 },
+            to: CellPos { col: 2, row: 0 },
+        };
+        let text = SelectionState::extract(&mut rt, &sel).expect("text");
+        assert_eq!(
+            text.trim_end(),
+            "one",
+            "the copied text must be the row the user sees highlighted"
+        );
+    }
+
+    #[test]
     fn click_tracker_counts_triple() {
         let mut state = SelectionState::default();
         let target = HitTarget::PaneBody {
@@ -315,6 +364,12 @@ mod tests {
         let sel = state.finish_drag().expect("selection");
         assert_eq!(sel.from, pos);
         assert_eq!(sel.to.col, 3);
+    }
+
+    #[test]
+    fn on_path_probe_finds_real_binaries_only() {
+        assert!(on_path("sh"));
+        assert!(!on_path("cyclops-no-such-clipboard-tool"));
     }
 
     #[test]

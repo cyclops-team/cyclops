@@ -66,6 +66,13 @@ impl Router {
         binding_help(&self.bindings)
     }
 
+    /// The chord bound to `action`, for callers that need to know how a
+    /// match was made: prefix chords are matched by key code alone, so a
+    /// modifier on the event is extra information there and nowhere else.
+    pub fn chord(&self, action: BindingAction) -> Option<&BindingChord> {
+        self.bindings.get(&action)
+    }
+
     fn match_prefix(&self, code: KeyCode) -> Option<BindingAction> {
         for (action, chord) in &self.bindings {
             if matches!(chord, BindingChord::Prefix(c) if *c == code) {

@@ -80,8 +80,17 @@ const WAIT_TIMEOUT_DEFAULT: &str = "60s";
 /// budget, so the transport never times out before the daemon answers.
 const WAIT_READ_SLACK: Duration = Duration::from_secs(10);
 
+/// Version plus the commit that built it (build.rs), so "which build am
+/// I on" is one command instead of an afternoon.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("CYCLOPS_BUILD_REF"),
+    ")"
+);
+
 #[derive(Parser)]
-#[command(name = "cyclops", version, about = "One eye on every agent")]
+#[command(name = "cyclops", version = VERSION, about = "One eye on every agent")]
 struct Cli {
     /// Print raw results as JSON. Anything the UI shows, scripts can read.
     #[arg(long, global = true)]
@@ -498,6 +507,7 @@ fn run(cli: &Cli) -> i32 {
     match &cli.cmd {
         None => {
             if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+                seed_themes_for_workspace();
                 ensure_daemon_for_workspace();
                 cyclops_workspace::run()
             } else {
@@ -505,6 +515,22 @@ fn run(cli: &Cli) -> i32 {
             }
         }
         Some(cmd) => run_cmd(cli, cmd),
+    }
+}
+
+/// Bare `cyclops` is a front door the same as `cyclops start`, so it seeds
+/// the shipped themes the same way (`themeseed::seed`) before the workspace
+/// opens. Without this, a home `start` never prepared plus a config or
+/// `$CYCLOPS_THEME` naming a shipped theme was a missing file, and the
+/// warning told the user to fix a file that was never there. Existing
+/// files are never overwritten, so running on every open costs nothing.
+///
+/// A problem is a note, not an exit, for the same reason as the daemon
+/// below: a home without themes still renders, in built-in colors.
+fn seed_themes_for_workspace() {
+    let home = cyclops_proto::cyclops_home();
+    for why in themeseed::seed(&home).problems {
+        eprintln!("{why}");
     }
 }
 
@@ -924,12 +950,18 @@ fn cmd_name(
     0
 }
 
-/// cyclops list: the roster, one named agent per row.
+/// cyclops list: the roster, one named agent per row, under a header
+/// naming the watched session(s) and the home whose socket answered.
 ///
 /// Everything it shows is already in one `status` answer, so there is no
 /// second question to ask the daemon and no second place the roster can
 /// come from. `status` shows every watched pane; this shows the ones with
 /// names.
+///
+/// The home is this client's own resolution, not a daemon field: it is the
+/// directory the socket lives under, so it names the daemon that answered
+/// by construction. Two daemons on two homes give two different rosters,
+/// and the header is how a reader in the wrong terminal tab finds out.
 fn cmd_list(c: &mut Client, cli: &Cli, style: &Style) -> i32 {
     let result = match c.request("status", json!({})) {
         Ok(v) => v,
@@ -945,22 +977,30 @@ fn cmd_list(c: &mut Client, cli: &Cli, style: &Style) -> i32 {
             return 1;
         }
     };
+    let home = cyclops_proto::cyclops_home();
     if cli.json {
         // Parity, not a second shape: the same rows the grid prints, as
-        // the pane records they came from.
+        // the pane records they came from. The header's facts ride along
+        // as additive fields, so a script can also tell which rig
+        // answered.
         let named: Vec<&PaneStatus> = status
             .sessions
             .iter()
             .flat_map(|s| s.panes.iter())
             .filter(|p| p.agent.is_some())
             .collect();
+        let sessions: Vec<&str> = status.sessions.iter().map(|s| s.name.as_str()).collect();
         println!(
             "{}",
-            json!({"agents": serde_json::to_value(&named).expect("panes serialize")})
+            json!({
+                "agents": serde_json::to_value(&named).expect("panes serialize"),
+                "home": home.display().to_string(),
+                "sessions": sessions,
+            })
         );
         return 0;
     }
-    println!("{}", render::render_list(&status, style));
+    println!("{}", render::render_list(&status, style, &home));
     0
 }
 

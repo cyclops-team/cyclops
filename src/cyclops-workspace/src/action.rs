@@ -38,6 +38,7 @@
 //! | Device source | Routing function |
 //! |---|---|
 //! | Keyboard chord, resolved to a `BindingAction` | [`route_binding`] |
+//! | Keyboard chord with Shift held on a prefix chord | [`route_binding_shifted`] |
 //! | Menu item clicked while a `MenuState` is open | [`route_menu_item`] |
 //! | Enter, or a dialog's Confirm button | [`route_dialog_confirm`] |
 //! | Mouse button pressed on a painted `HitTarget` | [`route_mouse_click`] |
@@ -45,6 +46,7 @@
 //! | Divider drag motion (coalesced per render deadline) | [`resolve_pane_resize`] |
 //! | Drag released without crossing the reorder threshold | [`route_drag_click`] |
 //! | Tab drag released onto another hit target | [`resolve_tab_drop`] |
+//! | Pane-frame drag released onto another pane | [`resolve_pane_drop`] |
 //! | Sidebar-agent drag released onto another row | [`resolve_agent_drop`] |
 //!
 //! Workspace-row drag release is the one exception to "every device routes
@@ -111,6 +113,27 @@ pub enum Action {
     /// no target: tmux resolves the neighbour from live layout at execution
     /// time, the same way `select-pane -L/-R/-U/-D` always has.
     FocusDirection(PaneDirection),
+    /// Swap the focused pane with whichever pane tmux considers its
+    /// neighbour in `direction`. Carries no target for the same reason as
+    /// [`Action::FocusDirection`].
+    SwapPaneDirection(PaneDirection),
+    /// Exchange the positions of two specific panes: the drop half of a
+    /// pane drag. tmux swaps the contents; each pane keeps its id and takes
+    /// the other's slot, and reconciliation reads the new layout back like
+    /// any other structural change.
+    SwapPanes {
+        pane_id: String,
+        other_pane_id: String,
+    },
+    /// Swap a specific pane with its neighbour in `direction`: the pane
+    /// context menu's swap, which acts on the clicked pane rather than the
+    /// focused one. The executor focuses `pane_id` first, because tmux's
+    /// neighbour mnemonics only resolve against the current pane, and a
+    /// swap leaves the acted-on pane focused anyway.
+    SwapPaneToward {
+        pane_id: String,
+        direction: PaneDirection,
+    },
     /// Close one pane. Whether this needs a confirmation first is an
     /// execution-time question (it depends on daemon-held agent state, not
     /// on anything routing can see); routing always resolves the same
@@ -228,6 +251,16 @@ pub enum Action {
     // -- App --
     ToggleEventPanel,
     ShowKeybinds,
+    /// Open the theme picker. Carries no target: the listing is read from
+    /// the themes directory at execution time, so a file added or removed
+    /// between the click and the open cannot show a stale row.
+    ShowThemes,
+    /// Switch to a theme by name, exactly what `cyclops theme <name>`
+    /// does: write the config key and nudge the daemon, whose theme event
+    /// repaints this workspace through the existing hot-reload watch.
+    ApplyTheme {
+        name: String,
+    },
     Detach,
 }
 
@@ -299,6 +332,12 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
         BindingAction::FocusRight => Some(Action::FocusDirection(PaneDirection::Right)),
         BindingAction::FocusUp => Some(Action::FocusDirection(PaneDirection::Up)),
         BindingAction::FocusDown => Some(Action::FocusDirection(PaneDirection::Down)),
+        // A keyboard swap acts on the focused pane, so it carries no
+        // target, exactly like the Shift upgrade of the focus chords.
+        BindingAction::SwapPaneLeft => Some(Action::SwapPaneDirection(PaneDirection::Left)),
+        BindingAction::SwapPaneRight => Some(Action::SwapPaneDirection(PaneDirection::Right)),
+        BindingAction::SwapPaneUp => Some(Action::SwapPaneDirection(PaneDirection::Up)),
+        BindingAction::SwapPaneDown => Some(Action::SwapPaneDirection(PaneDirection::Down)),
         BindingAction::SplitRight => Some(Action::Split {
             pane_id: ctx.active_pane.to_string(),
             direction: SplitDirection::Horizontal,
@@ -344,6 +383,23 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
         }),
         BindingAction::ToggleEventPanel => Some(Action::ToggleEventPanel),
         BindingAction::ShowKeybinds => Some(Action::ShowKeybinds),
+        BindingAction::ShowThemes => Some(Action::ShowThemes),
+    }
+}
+
+/// Route one resolved keyboard action whose key arrived with Shift held.
+/// Shift upgrades the four directional focus chords to pane swaps
+/// (Ctrl+B Shift+Arrow by default); every other binding resolves exactly
+/// as [`route_binding`] would. The prefix router matches chords by key
+/// code alone, so keyboard dispatch re-reads the modifier from the
+/// original key event and picks this entry point.
+pub fn route_binding_shifted(action: BindingAction, ctx: &RouteContext) -> Option<Action> {
+    match action {
+        BindingAction::FocusLeft => Some(Action::SwapPaneDirection(PaneDirection::Left)),
+        BindingAction::FocusRight => Some(Action::SwapPaneDirection(PaneDirection::Right)),
+        BindingAction::FocusUp => Some(Action::SwapPaneDirection(PaneDirection::Up)),
+        BindingAction::FocusDown => Some(Action::SwapPaneDirection(PaneDirection::Down)),
+        other => route_binding(other, ctx),
     }
 }
 
@@ -380,6 +436,32 @@ pub fn route_menu_item(
         (MenuState::ContextMenu { pane_id, .. }, BindingAction::ZoomPane) => {
             Some(Action::ZoomPane {
                 pane_id: pane_id.clone(),
+            })
+        }
+        // The menu's swap acts on the pane the menu was opened on, per the
+        // module rule: the item resolves against THAT target.
+        (MenuState::ContextMenu { pane_id, .. }, BindingAction::SwapPaneLeft) => {
+            Some(Action::SwapPaneToward {
+                pane_id: pane_id.clone(),
+                direction: PaneDirection::Left,
+            })
+        }
+        (MenuState::ContextMenu { pane_id, .. }, BindingAction::SwapPaneRight) => {
+            Some(Action::SwapPaneToward {
+                pane_id: pane_id.clone(),
+                direction: PaneDirection::Right,
+            })
+        }
+        (MenuState::ContextMenu { pane_id, .. }, BindingAction::SwapPaneUp) => {
+            Some(Action::SwapPaneToward {
+                pane_id: pane_id.clone(),
+                direction: PaneDirection::Up,
+            })
+        }
+        (MenuState::ContextMenu { pane_id, .. }, BindingAction::SwapPaneDown) => {
+            Some(Action::SwapPaneToward {
+                pane_id: pane_id.clone(),
+                direction: PaneDirection::Down,
             })
         }
         (MenuState::ContextMenu { pane_id, .. }, BindingAction::ClosePane) => {
@@ -460,6 +542,13 @@ pub fn route_dialog_confirm(dialog: &Dialog) -> Option<Action> {
         }),
         // Read-only: nothing to confirm. Enter just dismisses it.
         Dialog::Keybinds { .. } => None,
+        // Enter applies the row the arrows are on. An empty listing has
+        // nothing to apply, so Enter dismisses like the keybinds sheet.
+        Dialog::Themes {
+            names, selected, ..
+        } => names
+            .get(*selected)
+            .map(|name| Action::ApplyTheme { name: name.clone() }),
     }
 }
 
@@ -474,18 +563,21 @@ fn non_empty(buffer: &str) -> Option<String> {
 
 /// Route an immediate mouse click (no drag involved) on a painted hit
 /// target. `HitTarget::MenuItem` is absent on purpose — see the module
-/// docs. Every other hit target that starts a drag on `Down` (tabs,
-/// sidebar rows, sidebar agents, dividers, the sidebar splitter) resolves
-/// no action here; its click-without-drag fallback is
+/// docs. Every other hit target that starts a drag on `Down` (pane
+/// frames, tabs, sidebar rows, sidebar agents, dividers, the sidebar
+/// splitter) resolves no action here; its click-without-drag fallback is
 /// [`route_drag_click`], and its drag-release commit is
-/// [`resolve_tab_drop`], `app::resolve_workspace_slot_drop`, or
-/// [`resolve_agent_drop`].
+/// [`resolve_tab_drop`], [`resolve_pane_drop`],
+/// `app::resolve_workspace_slot_drop`, or [`resolve_agent_drop`].
 pub fn route_mouse_click(target: &HitTarget, button: MouseButton) -> Option<Action> {
     match (target, button) {
         (
-            HitTarget::PaneBody { pane_id } | HitTarget::PaneFrame { pane_id },
+            HitTarget::PaneBody { pane_id },
             MouseButton::Left | MouseButton::Right,
-        ) => Some(Action::FocusPane {
+        )
+        // Left-down on a frame starts a swap drag instead; only the
+        // right-click (which never drags) focuses immediately.
+        | (HitTarget::PaneFrame { pane_id }, MouseButton::Right) => Some(Action::FocusPane {
             pane_id: pane_id.clone(),
         }),
         (HitTarget::PaneSplitRight { pane_id }, MouseButton::Left) => Some(Action::Split {
@@ -533,6 +625,9 @@ pub fn route_mouse_scroll(target: &HitTarget, direction: ScrollDirection) -> Opt
 /// value the drag already carries (never a re-derived index).
 pub fn route_drag_click(target: &DragTarget) -> Option<Action> {
     match target {
+        DragTarget::Pane { pane_id } => Some(Action::FocusPane {
+            pane_id: pane_id.clone(),
+        }),
         DragTarget::Tab { window_id } => Some(Action::SelectTab {
             window_id: window_id.clone(),
         }),
@@ -581,6 +676,23 @@ pub fn resolve_tab_drop(window_id: &str, drop: &HitTarget) -> Option<Action> {
             window_id: window_id.to_string(),
             destination: TabDestination::ToWorkspace(session.clone()),
         }),
+        _ => None,
+    }
+}
+
+/// Resolve a pane drag released on another pane: dropping on a different
+/// pane's body or frame swaps the two. Dropping a pane on itself, or on
+/// anything that is not a pane, resolves nothing.
+pub fn resolve_pane_drop(pane_id: &str, drop: &HitTarget) -> Option<Action> {
+    match drop {
+        HitTarget::PaneBody { pane_id: dst } | HitTarget::PaneFrame { pane_id: dst }
+            if dst != pane_id =>
+        {
+            Some(Action::SwapPanes {
+                pane_id: pane_id.to_string(),
+                other_pane_id: dst.clone(),
+            })
+        }
         _ => None,
     }
 }
@@ -758,6 +870,38 @@ mod tests {
         assert_eq!(from_keyboard, expected);
         assert_eq!(from_mouse, expected);
         assert_eq!(from_menu, expected);
+    }
+
+    /// The menu's swap carries the clicked pane and the keyboard's stays
+    /// targetless: right-clicking a background pane must swap THAT pane,
+    /// while a chord acts on whatever tmux considers current.
+    #[test]
+    fn context_menu_swap_targets_the_clicked_pane_keyboard_stays_targetless() {
+        let tabs = [tab("@1")];
+        let workspaces = [workspace("$1", "main")];
+        let c = ctx(&tabs, 0, "%3", "main", &workspaces, 0);
+
+        let from_menu = route_menu_item(
+            &MenuState::ContextMenu {
+                pane_id: "%7".into(),
+                at: (0, 0),
+            },
+            BindingAction::SwapPaneLeft,
+            &c,
+        );
+        assert_eq!(
+            from_menu,
+            Some(Action::SwapPaneToward {
+                pane_id: "%7".into(),
+                direction: PaneDirection::Left,
+            })
+        );
+
+        let from_keyboard = route_binding(BindingAction::SwapPaneDown, &c);
+        assert_eq!(
+            from_keyboard,
+            Some(Action::SwapPaneDirection(PaneDirection::Down))
+        );
     }
 
     #[test]
@@ -1150,6 +1294,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn show_themes_agrees_across_keyboard_and_app_menu() {
+        let tabs = [tab("@1")];
+        let workspaces = [workspace("$1", "main")];
+        let c = ctx(&tabs, 0, "%0", "main", &workspaces, 0);
+
+        assert_eq!(
+            route_binding(BindingAction::ShowThemes, &c),
+            Some(Action::ShowThemes)
+        );
+        assert_eq!(
+            route_menu_item(&MenuState::AppMenu, BindingAction::ShowThemes, &c),
+            Some(Action::ShowThemes)
+        );
+    }
+
+    #[test]
+    fn themes_dialog_confirms_the_selected_row_by_name() {
+        assert_eq!(
+            route_dialog_confirm(&Dialog::Themes {
+                names: vec!["dark".into(), "light".into(), "solar".into()],
+                selected: 1,
+                active: Some(0),
+                notice: None,
+            }),
+            Some(Action::ApplyTheme {
+                name: "light".into()
+            })
+        );
+    }
+
+    #[test]
+    fn an_empty_themes_dialog_confirms_to_no_action() {
+        assert_eq!(
+            route_dialog_confirm(&Dialog::Themes {
+                names: Vec::new(),
+                selected: 0,
+                active: None,
+                notice: None,
+            }),
+            None
+        );
+    }
+
     // -- Reorder insertion: first, middle, last slots. --
 
     #[test]
@@ -1243,6 +1431,107 @@ mod tests {
         );
     }
 
+    // -- Pane swap: shifted focus chords and the pane drag's drop. --
+
+    #[test]
+    fn shifted_focus_chords_resolve_to_directional_swaps() {
+        let tabs = [tab("@1")];
+        let workspaces = [workspace("$1", "main")];
+        let c = ctx(&tabs, 0, "%0", "main", &workspaces, 0);
+
+        for (binding, direction) in [
+            (BindingAction::FocusLeft, PaneDirection::Left),
+            (BindingAction::FocusRight, PaneDirection::Right),
+            (BindingAction::FocusUp, PaneDirection::Up),
+            (BindingAction::FocusDown, PaneDirection::Down),
+        ] {
+            assert_eq!(
+                route_binding_shifted(binding, &c),
+                Some(Action::SwapPaneDirection(direction))
+            );
+        }
+    }
+
+    #[test]
+    fn shifted_non_focus_chords_resolve_like_the_unshifted_binding() {
+        let tabs = [tab("@1"), tab("@2")];
+        let workspaces = [workspace("$1", "main")];
+        let c = ctx(&tabs, 0, "%0", "main", &workspaces, 0);
+
+        // Shift only means swap on the focus chords; a stray shift on any
+        // other binding must not change its meaning.
+        assert_eq!(
+            route_binding_shifted(BindingAction::NextTab, &c),
+            route_binding(BindingAction::NextTab, &c)
+        );
+        assert_eq!(
+            route_binding_shifted(BindingAction::ClosePane, &c),
+            route_binding(BindingAction::ClosePane, &c)
+        );
+    }
+
+    #[test]
+    fn resolve_pane_drop_onto_another_panes_body_or_frame_swaps() {
+        let expected = Some(Action::SwapPanes {
+            pane_id: "%1".into(),
+            other_pane_id: "%2".into(),
+        });
+        assert_eq!(
+            resolve_pane_drop(
+                "%1",
+                &HitTarget::PaneBody {
+                    pane_id: "%2".into()
+                }
+            ),
+            expected
+        );
+        assert_eq!(
+            resolve_pane_drop(
+                "%1",
+                &HitTarget::PaneFrame {
+                    pane_id: "%2".into()
+                }
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn resolve_pane_drop_onto_itself_resolves_nothing() {
+        assert_eq!(
+            resolve_pane_drop(
+                "%1",
+                &HitTarget::PaneBody {
+                    pane_id: "%1".into()
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_pane_drop(
+                "%1",
+                &HitTarget::PaneFrame {
+                    pane_id: "%1".into()
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_pane_drop_onto_a_non_pane_target_resolves_nothing() {
+        assert_eq!(
+            resolve_pane_drop(
+                "%1",
+                &HitTarget::Tab {
+                    window_id: "@1".into()
+                }
+            ),
+            None
+        );
+        assert_eq!(resolve_pane_drop("%1", &HitTarget::NewTabButton), None);
+    }
+
     #[test]
     fn resolve_tab_drop_onto_another_tab_swaps() {
         let drop = HitTarget::Tab {
@@ -1284,6 +1573,14 @@ mod tests {
 
     #[test]
     fn drag_click_resolves_per_target_kind() {
+        assert_eq!(
+            route_drag_click(&DragTarget::Pane {
+                pane_id: "%1".into()
+            }),
+            Some(Action::FocusPane {
+                pane_id: "%1".into()
+            })
+        );
         assert_eq!(
             route_drag_click(&DragTarget::Tab {
                 window_id: "@1".into()

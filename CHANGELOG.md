@@ -7,6 +7,53 @@ versions are unreleased until admin cuts a tag.
 
 ### Added
 
+- Themes own the pane ground. The workspace paints `surface.fg` on
+  `surface.bg` under every pane body and maps ANSI colors 0..15 through a
+  per-theme `[palette]`, so panes look like the theme instead of the host
+  terminal; on a light terminal the UI used to wash white with the host's
+  own text colors bleeding through. All seven shipped themes carry a
+  ground and a full palette; `NO_COLOR` still leaves every host color
+  untouched, and one-shot commands still print on the terminal's own
+  background. A theme file that sets only `surface.fg` now counts as a
+  theme, because editing it now changes the screen.
+- Theme hot reload in the workspace: `cyclops theme <name>` repaints the
+  open workspace on the daemon's theme event, and a hand-edited theme
+  file applies on the next event, riding the existing render debounce
+  with no timer.
+- Pane rearranging in the workspace, one verb, swap: Ctrl+B Shift+Arrow
+  swaps the focused pane with its neighbour, and dragging a pane by its
+  frame onto another pane swaps the two. The frame is the drag handle so
+  plain drags in the pane body stay text selection. Focus follows the
+  pane the user acted on (F43). The keybinds sheet derives the swap
+  chords from the live focus chords, so a rebind cannot leave it
+  teaching dead keys.
+- Bare `cyclops` seeds the shipped themes the same way `cyclops start`
+  does, so a fresh machine's first workspace has real themes; a theme
+  file that is missing (rather than broken) now says so and names the
+  remedy instead of asking the user to fix a file that does not exist.
+- `cyclops list` says whose roster it is: a header names the watched
+  session(s) and the home that answered, and `--json` gains additive
+  `home` and `sessions` fields, so a second daemon on a second home can
+  never be invisible again.
+- A Themes entry in the workspace menu: pick a theme with arrows and
+  Enter, the active one marked; applying does exactly what
+  `cyclops theme <name>` does and the open workspace repaints live.
+- Swap entries in the pane right-click menu, acting on the clicked pane;
+  the same swaps are optionally bindable (`swap_left` and friends) for
+  anyone who wants dedicated chords.
+- The theme picker previews live: moving the selection paints the
+  workspace in the highlighted theme, Enter locks it in (config write
+  plus daemon reload, as before), Esc restores exactly what was live
+  when the picker opened. Nothing is written while browsing.
+- Light mode drawn on paper instead of inverted from dark: contrast
+  floor raised to 4.5:1 (WCAG AA) and every figure measured against it.
+  The old file's palette.15 measured 1.01:1, white on white, which is
+  what "wonky" was.
+- Claude Code manifest re-verified against 2.1.221 on a live rig, with
+  fidelity tests pinned from the captured evidence: mid-turn streaming,
+  idle, the new trust-dialog wording, the title table, and the exact
+  process triple that has to bind the manifest.
+
 - The dashboard. `cyclops ui` on a terminal 96 columns or wider shares
   the screen with an agents panel: every watched pane, which CLI the
   daemon detects in it, its state, and how long it has stood there.
@@ -25,8 +72,75 @@ versions are unreleased until admin cuts a tag.
   sensors read, in the same answer as the readings, so the evidence and
   the verdict are one moment.
 
+### Changed
+
+- The reply footer on delivered messages trimmed from a full flag
+  synopsis to `Reply: cyclops send <from> --subject "..."`. The routing
+  survives compaction and works for agents without the cyclops skill;
+  the flag lesson lives in the skill and `--help`, not in every message.
+
 ### Fixed
 
+- Three CI-red tests, all fixture-side. Two tmux fixtures targeted
+  `new-window -t s`, and tmux resolves that against window names first
+  with a prefix match, so an auto-renamed `sh` window pinned the new
+  window to occupied index 0; the fixtures now name their windows and use
+  the session-typed `s:` target. The flow-control test could stall its
+  reader before the flood it measures had started flowing on a loaded
+  runner; it now confirms output before the stall.
+- Event panel body rows printed in the terminal's own foreground on the
+  panel's themed ground, unreadable on a light host; they wear chrome
+  text now.
+- A theme file seeded by an old build could go stale forever: seeding
+  never overwrites, so a pre-ground light.toml kept a dark background
+  under a current binary on two real machines. The seeder now upgrades
+  any file byte-identical to a version this project ever shipped, and
+  still never touches a file the user edited.
+- Pane text never falls under a 3:1 readability floor, DIM included: an agent's
+  pale grays drawn for a dark terminal no longer vanish on the light
+  ground, and the theme's ink no longer disappears into an agent's own
+  dark fills. Readable colors pass through hue-intact; NO_COLOR never
+  clamps.
+- Panels painted for the wrong terminal re-ground to the theme: an
+  agent that believes it is on a dark terminal (tmux reports the ground
+  its real client taught it, F49) paints composer boxes and command
+  bars near-black, which arrived as black boxes on the light theme. A
+  neutral fill at the opposite luminance extreme from the theme ground
+  now becomes the theme's own panel and the floor sets its text.
+  Chromatic fills (diff greens, powerline segments), reverse video, and
+  block/braille image glyphs keep their colors, and image glyphs are
+  exempt from the floor too, so half-block pictures and braille plots
+  render pixel-exact.
+- Typed text ran past the visible pane edge into columns nobody could
+  see: `window-size latest` let any attaching client out-size the
+  workspace's declared canvas (F48); `window-size smallest` is the
+  fixed point no client can steal, so panes never lay out wider than
+  what is painted.
+- Copying from scrollback grabbed the wrong rows: selection mapped
+  screen coordinates straight to grid lines, which only agree when the
+  pane sits at the live tail. Highlighted history now copies exactly
+  what is on screen, a scrolled pane shows a dim "N back" hint on its
+  frame, and a resize no longer wipes local scrollback and deadens the
+  wheel. Every hydration also stops pushing one phantom blank line into
+  history.
+- A label held by a vanished pane blocked its name forever while
+  appearing in no roster: killing a tmux session delivers no per-pane
+  deaths to control mode (F47), so the adoption registry never released
+  it. The daemon now frees a session's labels when tmux positively says
+  the session is gone, re-verifies resurrected bindings at boot, and the
+  already-taken error names the holder and the remedy that works.
+- Selected text painted accent-on-raised, which measured 3.23:1 on the
+  light ground, under the theme's own body-text bar; selection now
+  paints panel ink on the accent ground, clearer on both themes.
+- Selection copy never reached the clipboard on stock macOS: an OSC 52
+  stdout write "succeeding" was treated as a completed copy, so the
+  pbcopy fallback never ran and Terminal.app ignores the sequence (F44).
+  The native tool now always runs when one is on PATH, with OSC 52
+  emitted additionally for terminals on the near side of SSH, and the
+  keybinds sheet documents select, copy, and paste.
+- The cyclops skill told an agent to find its own name in the plain
+  roster, which prints labels without pane ids; it now says
+  `cyclops list --json` and explains what plain `cyclops read` returns.
 - F25: cyclops could not see a pane die. `pane_dead` is set when the
   pane's pty fd closes, and that same closed fd is the gate that makes
   tmux skip the pane's own format subscription, so a per-pane

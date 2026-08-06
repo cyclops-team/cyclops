@@ -451,6 +451,7 @@ check "the record is still there"         'admin → implementer +Review the rat
 
 run "$CYC" list --plain
 check "the name is still there"           '^ +implementer +○ idle$'
+check "and the header says whose roster"  '^watching main · home .*/home$'
 
 run "$CYC" ping --plain
 check "ping reports the round trip"       '^✔ cyclops is up · [0-9.]+ms$'
@@ -566,7 +567,7 @@ tmx capture-pane -p -t "$N2" | grep -v '^$' > "$OUT"
 cat "$OUT"
 check "the recipient reads a stamped header" "^\[cyclops $MID\] FROM: admin  SUBJECT: Review the rate limiter\$"
 check "the body arrives verbatim"            '^gateway\.rs:120 drops the burst path$'
-check "and the reply line names the sender"  '^Reply with: cyclops send admin --subject'
+check "and the reply line names the sender"  '^Reply: cyclops send admin --subject'
 
 run "$CYC" thread "$MID" --plain
 check "a thread carries the body"         '^ +gateway\.rs:120 drops the burst path$'
@@ -870,6 +871,10 @@ duo "$CYC" list --plain > "$OUT" 2>&1
 cat "$OUT"
 check "both panes are named and idle"     '^ +implementer +○ idle$'
 check "one row each"                      '^ +reviewer +○ idle$'
+# The fix for the invisible second daemon: this rig IS the second daemon
+# on a second home, so its roster must open by naming that home and not
+# the main rig's.
+check "the header names the second home"  '^watching main · home .*/duo/home$'
 
 printf '\n$ cyclops send implementer --subject "hello"\n'
 duo "$CYC" send implementer --subject "hello" --plain > "$OUT" 2>&1
@@ -1107,7 +1112,7 @@ grep -v '^ *\(Compiling\|Finished\|Downloaded\|Blocking\|Updating\|Adding\)' "$O
 check "it says where each binary went"    "^  cyclops    $INST/.local/bin/cyclops$"
 check "and the daemon too"                "^  cyclopsd   $INST/.local/bin/cyclopsd$"
 check "and where the home is"             "^  home       $INST/.cyclops$"
-check "it reports the version it built"   '^✔ cyclops [0-9]+\.[0-9]+\.[0-9]+ is installed$'
+check "it reports the version it built"   '^✔ cyclops [0-9]+\.[0-9]+\.[0-9]+ \(([0-9a-f]+(\.dirty)?|unknown)\) is installed$'
 check_absent "it gives no separate daemon step" 'cyclopsd &'
 check "step 2 opens the workspace"        '^  2  cyclops start +open your workspace; it prints what to do next$'
 check "it names the profile it edited"    "^  three lines added to $INST/.zshrc:$"

@@ -626,13 +626,17 @@ pub(crate) async fn label_pane(
         if let Some(why) = cyclops_proto::label::refusal(l) {
             return Err(bad_request(why));
         }
-        if inner
-            .registry
-            .lock()
-            .expect("registry lock")
-            .label_taken_by_other(l, &pane_id)
-        {
-            return Err(bad_request(format!("label {l:?} is already taken")));
+        let holder = {
+            let reg = inner.registry.lock().expect("registry lock");
+            if reg.label_taken_by_other(l, &pane_id) {
+                let pane = reg.pane_for_label(l).expect("taken means a holder exists");
+                reg.get(&pane).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(holder) = holder {
+            return Err(bad_request(label_taken_words(inner, l, &holder)));
         }
     }
 
@@ -712,6 +716,35 @@ pub(crate) async fn label_pane(
             .get(&pane_id)
             .and_then(|e| e.manifest.clone())),
     }))
+}
+
+/// Why a name cannot be claimed: who wears it now, where, and the way
+/// out. "already taken" alone once had an operator staring at an empty
+/// roster and a refused name at the same time, with nothing to act on.
+fn label_taken_words(inner: &Inner, label: &str, holder: &registry::Adoption) -> String {
+    let attached = inner
+        .session_index(&holder.session)
+        .and_then(|idx| inner.session(idx))
+        .map(|slot| slot.link.lock().expect("session link lock").attached)
+        .unwrap_or(false);
+    if attached {
+        format!(
+            "label {label:?} is already taken by {pane} in session {session} ({state}). \
+             Free it with: cyclops name {pane} --clear, or pick another name.",
+            pane = holder.pane_id,
+            session = holder.session,
+            state = cyclops_proto::state_words(inner.cached_state(&holder.pane_id)),
+        )
+    } else {
+        format!(
+            "label {label:?} is already taken by {pane} in session {session}, which cyclops \
+             is not attached to right now. Pick another name, or once cyclops is watching \
+             that session again (opening its workspace re-attaches it), clear it: \
+             cyclops name {pane} --clear.",
+            pane = holder.pane_id,
+            session = holder.session,
+        )
+    }
 }
 
 /// Put one pane on the roster under `label` and paint the border that says
@@ -1185,9 +1218,23 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     // Adoptions from the previous run. Nothing is trusted onto a pane
     // yet; each session prunes its own entries against the live pane
     // table when it attaches (registry::restore_session).
-    let (adoptions, warnings) = registry::Registry::load(&cfg.home);
+    let (mut adoptions, warnings) = registry::Registry::load(&cfg.home);
     for w in warnings {
         warn!("registry: {w}");
+    }
+    // Entries from sessions this run does NOT watch (watched at runtime by
+    // a previous daemon, dropped by the restart) are re-verified here or
+    // never: only an attach prunes, and only watched sessions attach. Ask
+    // tmux once; a session that is gone took every pane in it along, and
+    // an entry kept past this point still frees the moment its pane
+    // proves dead (restore_session on a later session.watch).
+    for session in adoptions.sessions() {
+        if cfg.sessions.contains(&session) {
+            continue;
+        }
+        if tmux_session_missing(&cfg, &session).await {
+            release_gone_session(&mut adoptions, &session);
+        }
     }
     let mut theme = cyclops_theme::ThemeWatch::new(&cfg.home);
     for w in theme.take_warnings() {
@@ -1283,6 +1330,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         boot_id = %inner.boot_id,
         sessions = inner.session_count(),
         manifests = inner.manifests.len(),
+        build = env!("CYCLOPS_BUILD_REF"),
         "cyclopsd booted"
     );
     Ok(Daemon {
@@ -1417,9 +1465,17 @@ pub(crate) fn no_manifests_warning(dir: Option<&Path>) -> String {
 /// a real failure goes unreported. Runs off the reactor: it shells out to
 /// tmux, which blocks.
 async fn session_missing(inner: &Arc<Inner>, session: &str) -> bool {
+    tmux_session_missing(&inner.cfg, session).await
+}
+
+/// The same question asked of the config alone, so `boot` can ask it
+/// before `Inner` exists. True only when tmux positively says the session
+/// is not there; an error keeps the answer at false, because "could not
+/// ask" must never release anybody's label.
+async fn tmux_session_missing(cfg: &Config, session: &str) -> bool {
     let server = cyclops_tmux::layout::Server {
-        socket: inner.cfg.tmux_socket.clone(),
-        config_file: inner.cfg.tmux_config.clone(),
+        socket: cfg.tmux_socket.clone(),
+        config_file: cfg.tmux_config.clone(),
     };
     let session = session.to_string();
     tokio::task::spawn_blocking(move || {
@@ -1430,6 +1486,19 @@ async fn session_missing(inner: &Arc<Inner>, session: &str) -> bool {
     })
     .await
     .unwrap_or(false)
+}
+
+/// Release every adoption recorded for a session tmux says is gone.
+///
+/// The panes died with the session, so each label is free again, and
+/// there is no chrome to put back: the windows died too. `forget`, not
+/// `clear`, so the entry goes even when the registry file cannot be
+/// rewritten; a dead pane must not keep its name claimed.
+fn release_gone_session(reg: &mut registry::Registry, session: &str) {
+    for a in reg.in_session(session) {
+        reg.forget(&a.pane_id);
+        info!(session = %session, pane = %a.pane_id, label = %a.label, "released a label whose session is gone");
+    }
 }
 
 /// Own one configured session for the daemon's lifetime: attach, pump
@@ -1502,23 +1571,42 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                 warn!(session = %name, "tmux connection lost; reattaching");
             }
             Err(e) => {
-                if !announced_missing {
-                    // Two different situations reach this arm, and only
-                    // one of them is trouble. A session that does not
-                    // exist yet is the ordinary case for a daemon started
-                    // before `cyclops start`, and it clears itself the
-                    // moment the session appears. Logging that at WARN as
-                    // "cannot attach" reads like a dead end, and an
-                    // operator who stops there never finds out that the
-                    // retry two seconds later succeeded.
-                    if session_missing(&inner, &name).await {
-                        info!(session = %name, "waiting for session; cyclops start creates it");
-                    } else {
-                        warn!(session = %name, error = %e, "cannot attach; retrying with backoff");
-                    }
-                    announced_missing = true;
-                } else {
+                if announced_missing {
                     debug!(session = %name, error = %e, "attach retry failed");
+                }
+                // Adoptions recorded for a session that does not exist
+                // name panes that died with it. The reattach reconcile
+                // can never release them, because a session that never
+                // comes back never reattaches; without this, its labels
+                // stay claimed forever while no roster shows the holder.
+                let stale = !inner
+                    .registry
+                    .lock()
+                    .expect("registry lock")
+                    .in_session(&name)
+                    .is_empty();
+                if stale || !announced_missing {
+                    let missing = session_missing(&inner, &name).await;
+                    if stale && missing {
+                        let mut reg = inner.registry.lock().expect("registry lock");
+                        release_gone_session(&mut reg, &name);
+                    }
+                    if !announced_missing {
+                        // Two different situations reach this arm, and only
+                        // one of them is trouble. A session that does not
+                        // exist yet is the ordinary case for a daemon started
+                        // before `cyclops start`, and it clears itself the
+                        // moment the session appears. Logging that at WARN as
+                        // "cannot attach" reads like a dead end, and an
+                        // operator who stops there never finds out that the
+                        // retry two seconds later succeeded.
+                        if missing {
+                            info!(session = %name, "waiting for session; cyclops start creates it");
+                        } else {
+                            warn!(session = %name, error = %e, "cannot attach; retrying with backoff");
+                        }
+                        announced_missing = true;
+                    }
                 }
             }
         }

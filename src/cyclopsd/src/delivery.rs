@@ -752,9 +752,7 @@ pub(crate) fn render_payload(
         lines.push(body.to_string());
     }
     if !fyi {
-        lines.push(format!(
-            "Reply with: cyclops send {from} --subject \"...\" [--body ... | --body-file -]"
-        ));
+        lines.push(format!("Reply: cyclops send {from} --subject \"...\""));
     }
     lines.join("\n")
 }
@@ -2879,10 +2877,7 @@ mod tests {
             "[cyclops m-3f9c2a] FROM: codex  SUBJECT: Review the rate limiter"
         );
         assert_eq!(lines[1], "please");
-        assert_eq!(
-            lines[2],
-            "Reply with: cyclops send codex --subject \"...\" [--body ... | --body-file -]"
-        );
+        assert_eq!(lines[2], "Reply: cyclops send codex --subject \"...\"");
         assert!(
             !p.ends_with('\n'),
             "no trailing newline; submit is separate"
@@ -2892,7 +2887,7 @@ mod tests {
     #[test]
     fn fyi_payload_has_no_reply_hint() {
         let p = render_payload("m-1", "admin", "heads up", "body", true);
-        assert!(!p.contains("Reply with:"));
+        assert!(!p.contains("Reply:"));
     }
 
     #[test]

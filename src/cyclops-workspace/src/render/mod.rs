@@ -135,18 +135,42 @@ fn overlay_text(buf: &mut Buffer, bounds: Rect, x: u16, y: u16, text: &str, styl
     buf.set_stringn(x, y, text, width, style);
 }
 
-fn cell_style(cell: &GridCell, base: Style) -> Style {
+fn cell_style(cell: &GridCell, base: Style, palette: Option<&[RtColor; 16]>) -> Style {
     let mut style = base;
-    if let Some(fg) = rt_color(cell.attrs.fg) {
+    if let Some(fg) = rt_color(cell.attrs.fg, palette) {
         style = style.fg(fg);
     }
-    if let Some(bg) = rt_color(cell.attrs.bg) {
+    if let Some(bg) = rt_color(cell.attrs.bg, palette) {
         style = style.bg(bg);
+    }
+    // Colors-on adjustments (a palette exists exactly when colors are
+    // on). Agents pick their colors for the terminal THEY imagine. Two
+    // symptoms, one cause: a neutral fill at the far luminance extreme
+    // (codex's #393939 composer, painted for the dark ground tmux
+    // reported) re-grounds to this theme's own panel, and text that
+    // cannot read on its ground clamps to the floor. DIM folds into the
+    // clamp's math rather than passing to the terminal, which would
+    // halve brightness AFTER the clamp. Block, shade, and braille
+    // glyphs carry image pixels, not text: their colors pass through
+    // untouched, DIM included. Rule 11 holds because none of this runs
+    // with color off.
+    let pixels = paints_pixels(cell.ch);
+    if palette.is_some() && !pixels {
+        if !cell.attrs.reverse {
+            if let (Some(bg), Some(ground)) = (style.bg, base.bg) {
+                if let Some(panel) = matched_ground(bg, ground, base.fg, palette) {
+                    style.bg = Some(panel);
+                }
+            }
+        }
+        if let (Some(fg), Some(bg)) = (style.fg, style.bg) {
+            style.fg = Some(readable_fg(fg, bg, cell.attrs.dim, palette));
+        }
     }
     if cell.attrs.bold {
         style = style.add_modifier(Modifier::BOLD);
     }
-    if cell.attrs.dim {
+    if cell.attrs.dim && (palette.is_none() || pixels) {
         style = style.add_modifier(Modifier::DIM);
     }
     if cell.attrs.italic {
@@ -167,11 +191,383 @@ fn cell_style(cell: &GridCell, base: Style) -> Style {
     style
 }
 
-fn rt_color(c: Color) -> Option<RtColor> {
+fn rt_color(c: Color, palette: Option<&[RtColor; 16]>) -> Option<RtColor> {
     match c {
+        // The themed pane ground wins where the program set nothing.
         Color::Default => None,
-        Color::Indexed(i) => Some(RtColor::Indexed(i)),
+        // ANSI 0..15 map through the theme's palette when one is on;
+        // 16..255 and the paletteless path stay the host's own.
+        Color::Indexed(i) => Some(match palette {
+            Some(p) if usize::from(i) < p.len() => p[usize::from(i)],
+            _ => RtColor::Indexed(i),
+        }),
         Color::Rgb(r, g, b) => Some(RtColor::Rgb(r, g, b)),
+    }
+}
+
+/// The readability floor a pane cell's text never falls under. Body-text
+/// bars belong to the theme's own figures; this only catches pairs an
+/// agent composed for a different ground, so it sits well below them.
+const MIN_CONTRAST: f64 = 3.0;
+
+/// How far a DIM cell's text fades toward its background before the
+/// floor catches it. The fade is applied here, in the same math the
+/// clamp measures, never as the terminal's own DIM.
+const DIM_FADE: f64 = 0.4;
+
+/// Fills at or past these luminance extremes read as "the ground the
+/// program thought it had": near-black painted for a dark terminal,
+/// near-white for a light one. Dark anchor, measured: codex's dark-mode
+/// composer paints #393939 (luminance 0.041); Claude Code's command
+/// bars sit lower still. The bounds are asymmetric because luminance is:
+/// light grounds cluster from #dcdcdc (0.72) up, while #d0d0d0 (0.63)
+/// is already a mid gray no app uses as paper.
+const FOREIGN_DARK_MAX_L: f64 = 0.10;
+const FOREIGN_LIGHT_MIN_L: f64 = 0.70;
+
+/// Only neutral fills re-ground: channel spread at or under this. A
+/// chromatic dark (a diff's green fill, a powerline segment) is
+/// content, not a mistaken ground, and keeps its color.
+const NEUTRAL_SPREAD_MAX: u8 = 24;
+
+/// How far the replacement panel leans from the ground toward the ink:
+/// enough to keep a composer box visible as a box, no more.
+const PANEL_TINT: f64 = 0.10;
+
+/// `fg`, faded when `dim` and then nudged toward black or white until it
+/// clears [`MIN_CONTRAST`] against `bg`. A pair already readable comes
+/// back with its hue (dim included, as a fade toward the ground rather
+/// than the terminal's blind darkening); a hopeless one lands on the
+/// pole. The output is truecolor when the palette resolves truecolor
+/// (the theme's own signal) and a 256-color grid entry otherwise, so a
+/// clamped color never emits a sequence the terminal was told not to
+/// expect.
+fn readable_fg(fg: RtColor, bg: RtColor, dim: bool, palette: Option<&[RtColor; 16]>) -> RtColor {
+    let (Some(mut f), Some(b)) = (srgb(fg), srgb(bg)) else {
+        return fg;
+    };
+    if dim {
+        f = lerp(f, b, DIM_FADE);
+    }
+    if contrast(f, b) >= MIN_CONTRAST {
+        return if dim { emit(f, palette) } else { fg };
+    }
+    let pole = if luminance(b) > 0.5 {
+        (0, 0, 0)
+    } else {
+        (255, 255, 255)
+    };
+    let mut fixed = pole;
+    for step in [0.25, 0.5, 0.75] {
+        let c = lerp(f, pole, step);
+        if contrast(c, b) >= MIN_CONTRAST {
+            fixed = c;
+            break;
+        }
+    }
+    emit(fixed, palette)
+}
+
+/// The theme's own panel color for a fill painted against the wrong
+/// ground, or `None` for every fill that is the program's business. A
+/// neutral background at the luminance extreme opposite this theme's
+/// ground was composed for the terminal the program imagined: tmux
+/// reports the ground of whichever real client taught it, so an agent
+/// under the user's dark terminal paints dark fills into a light
+/// workspace. Detection cannot be fixed at the source, because the same
+/// pane is viewed through that dark terminal AND this theme at once;
+/// the restyle happens here, per theme, at render.
+fn matched_ground(
+    bg: RtColor,
+    ground: RtColor,
+    ink: Option<RtColor>,
+    palette: Option<&[RtColor; 16]>,
+) -> Option<RtColor> {
+    let (Some(b), Some(g)) = (srgb(bg), srgb(ground)) else {
+        return None;
+    };
+    let spread = b.0.max(b.1).max(b.2) - b.0.min(b.1).min(b.2);
+    if spread > NEUTRAL_SPREAD_MAX {
+        return None;
+    }
+    let (bl, gl) = (luminance(b), luminance(g));
+    let foreign = if gl >= 0.5 {
+        bl <= FOREIGN_DARK_MAX_L
+    } else {
+        bl >= FOREIGN_LIGHT_MIN_L
+    };
+    if !foreign {
+        return None;
+    }
+    let pole = if gl >= 0.5 {
+        (0, 0, 0)
+    } else {
+        (255, 255, 255)
+    };
+    let ink = ink.and_then(srgb).unwrap_or(pole);
+    Some(emit(lerp(g, ink, PANEL_TINT), palette))
+}
+
+/// Block elements, shades, braille, and the legacy-computing set: cells
+/// whose colors are image pixels or plot points. "Text readability" has
+/// no meaning there and recoloring corrupts the picture.
+fn paints_pixels(ch: char) -> bool {
+    matches!(u32::from(ch), 0x2580..=0x259F | 0x2800..=0x28FF | 0x1FB00..=0x1FBFF)
+}
+
+/// A computed color, in the terminal vocabulary the theme itself uses:
+/// truecolor when the palette resolved truecolor, a 256-color grid entry
+/// otherwise.
+fn emit(rgb: (u8, u8, u8), palette: Option<&[RtColor; 16]>) -> RtColor {
+    let truecolor = matches!(
+        palette,
+        Some(p) if p.iter().any(|c| matches!(c, RtColor::Rgb(..)))
+    );
+    if truecolor {
+        RtColor::Rgb(rgb.0, rgb.1, rgb.2)
+    } else {
+        RtColor::Indexed(cyclops_theme::derive_c256(rgb))
+    }
+}
+
+/// RGB of a ratatui color, via the standard xterm-256 table for indexed
+/// entries. Host palettes can remap 0..15, but a clamp keyed on the
+/// standard values is right far more often than no clamp at all.
+fn srgb(c: RtColor) -> Option<(u8, u8, u8)> {
+    match c {
+        RtColor::Rgb(r, g, b) => Some((r, g, b)),
+        RtColor::Indexed(i) => Some(xterm_rgb(i)),
+        _ => None,
+    }
+}
+
+fn xterm_rgb(i: u8) -> (u8, u8, u8) {
+    const STD16: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (205, 0, 0),
+        (0, 205, 0),
+        (205, 205, 0),
+        (0, 0, 238),
+        (205, 0, 205),
+        (0, 205, 205),
+        (229, 229, 229),
+        (127, 127, 127),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (92, 92, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    match i {
+        0..=15 => STD16[usize::from(i)],
+        16..=231 => {
+            let i = i - 16;
+            let level = |n: u8| if n == 0 { 0 } else { 55 + 40 * n };
+            (level(i / 36), level((i / 6) % 6), level(i % 6))
+        }
+        232..=255 => {
+            let g = 8 + 10 * (i - 232);
+            (g, g, g)
+        }
+    }
+}
+
+/// WCAG 2.1 relative luminance, the same math the theme contrast tests
+/// measure with (src/cyclops-theme/tests/shipped.rs).
+fn luminance((r, g, b): (u8, u8, u8)) -> f64 {
+    let lin = |c: u8| {
+        let c = f64::from(c) / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+}
+
+fn contrast(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+fn lerp(from: (u8, u8, u8), to: (u8, u8, u8), f: f64) -> (u8, u8, u8) {
+    let mix = |a: u8, b: u8| (f64::from(a) + (f64::from(b) - f64::from(a)) * f).round() as u8;
+    (mix(from.0, to.0), mix(from.1, to.1), mix(from.2, to.2))
+}
+
+#[cfg(test)]
+mod contrast_tests {
+    use super::*;
+    use crate::runtime::CellAttrs;
+
+    fn cell(fg: Color, bg: Color) -> GridCell {
+        GridCell {
+            ch: 'x',
+            zerowidth: Vec::new(),
+            wide_spacer: false,
+            attrs: CellAttrs {
+                fg,
+                bg,
+                ..CellAttrs::default()
+            },
+        }
+    }
+
+    const WHITE: RtColor = RtColor::Rgb(254, 254, 254);
+    const INK: RtColor = RtColor::Rgb(42, 42, 42);
+    const PALETTE: [RtColor; 16] = [RtColor::Rgb(10, 10, 10); 16];
+
+    /// The live symptom: an agent's pale gray, drawn for a dark
+    /// terminal, must not vanish on paper.
+    #[test]
+    fn pale_gray_on_paper_darkens_to_readable() {
+        let base = Style::new().fg(INK).bg(WHITE);
+        let style = cell_style(
+            &cell(Color::Indexed(250), Color::Default),
+            base,
+            Some(&PALETTE),
+        );
+        let fg = srgb(style.fg.unwrap()).unwrap();
+        let bg = srgb(style.bg.unwrap()).unwrap();
+        assert!(contrast(fg, bg) >= MIN_CONTRAST, "{fg:?} on {bg:?}");
+        assert_ne!(
+            style.fg.unwrap(),
+            RtColor::Indexed(250),
+            "it was 1.2:1 before"
+        );
+    }
+
+    /// The other live symptom, with the stronger answer: an agent's
+    /// neutral dark fill on a light theme is a ground painted for the
+    /// wrong terminal. It becomes this theme's own panel (the measured
+    /// codex composer fill, #393939), and the text on it reads.
+    #[test]
+    fn a_dark_fill_on_paper_becomes_the_themes_panel() {
+        let base = Style::new().fg(INK).bg(WHITE);
+        let style = cell_style(
+            &cell(Color::Default, Color::Rgb(57, 57, 57)),
+            base,
+            Some(&PALETTE),
+        );
+        let bg = srgb(style.bg.unwrap()).unwrap();
+        assert_eq!(bg, lerp((254, 254, 254), (42, 42, 42), PANEL_TINT));
+        let fg = srgb(style.fg.unwrap()).unwrap();
+        assert!(contrast(fg, bg) >= MIN_CONTRAST, "{fg:?} on {bg:?}");
+    }
+
+    /// A chromatic dark fill (a diff's green, a powerline segment) is
+    /// content: the fill keeps its color and only its text gets the
+    /// floor.
+    #[test]
+    fn a_chromatic_dark_fill_keeps_its_color() {
+        let base = Style::new().fg(INK).bg(WHITE);
+        let style = cell_style(
+            &cell(Color::Default, Color::Rgb(14, 53, 18)),
+            base,
+            Some(&PALETTE),
+        );
+        assert_eq!(style.bg.unwrap(), RtColor::Rgb(14, 53, 18));
+        let fg = srgb(style.fg.unwrap()).unwrap();
+        assert!(contrast(fg, (14, 53, 18)) >= MIN_CONTRAST, "{fg:?}");
+    }
+
+    /// The mirror: a near-white panel painted for a light terminal
+    /// re-grounds on a dark theme, while a dark fill there is native
+    /// and stays.
+    #[test]
+    fn a_light_fill_on_a_dark_ground_mirrors() {
+        let base = Style::new().fg(WHITE).bg(INK);
+        let style = cell_style(
+            &cell(Color::Default, Color::Rgb(236, 236, 236)),
+            base,
+            Some(&PALETTE),
+        );
+        assert_eq!(
+            srgb(style.bg.unwrap()).unwrap(),
+            lerp((42, 42, 42), (254, 254, 254), PANEL_TINT)
+        );
+        let native = cell_style(
+            &cell(Color::Default, Color::Rgb(57, 57, 57)),
+            base,
+            Some(&PALETTE),
+        );
+        assert_eq!(native.bg.unwrap(), RtColor::Rgb(57, 57, 57));
+    }
+
+    /// Reverse video is emphasis, not a mistaken ground: the pair
+    /// passes through for the terminal to swap.
+    #[test]
+    fn reverse_video_keeps_its_colors() {
+        let base = Style::new().fg(INK).bg(WHITE);
+        let mut c = cell(Color::Default, Color::Rgb(57, 57, 57));
+        c.attrs.reverse = true;
+        let style = cell_style(&c, base, Some(&PALETTE));
+        assert_eq!(style.bg.unwrap(), RtColor::Rgb(57, 57, 57));
+        assert!(style.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    /// Image pixels: a half-block's pair IS the picture. No re-ground,
+    /// no floor, DIM forwarded as the modifier it always was.
+    #[test]
+    fn image_pixels_pass_through_untouched() {
+        let base = Style::new().fg(INK).bg(WHITE);
+        let mut px = cell(Color::Rgb(16, 16, 16), Color::Rgb(15, 15, 15));
+        px.ch = '▄';
+        px.attrs.dim = true;
+        let style = cell_style(&px, base, Some(&PALETTE));
+        assert_eq!(style.fg.unwrap(), RtColor::Rgb(16, 16, 16));
+        assert_eq!(style.bg.unwrap(), RtColor::Rgb(15, 15, 15));
+        assert!(style.add_modifier.contains(Modifier::DIM));
+    }
+
+    /// A pair already readable keeps its hue exactly.
+    #[test]
+    fn a_readable_color_is_untouched() {
+        let base = Style::new().fg(INK).bg(WHITE);
+        let style = cell_style(
+            &cell(Color::Rgb(200, 0, 0), Color::Default),
+            base,
+            Some(&PALETTE),
+        );
+        assert_eq!(style.fg.unwrap(), RtColor::Rgb(200, 0, 0));
+    }
+
+    /// Rule 11: with color off (no palette) nothing is clamped, the
+    /// program's own colors pass through untouched.
+    #[test]
+    fn no_palette_means_no_clamp() {
+        let style = cell_style(
+            &cell(Color::Indexed(250), Color::Indexed(255)),
+            Style::new(),
+            None,
+        );
+        assert_eq!(style.fg.unwrap(), RtColor::Indexed(250));
+        assert_eq!(style.bg.unwrap(), RtColor::Indexed(255));
+    }
+
+    /// DIM folds into the clamp's own math: the fade happens here and
+    /// the floor still holds, because the terminal's DIM would darken
+    /// the color AFTER the clamp and un-read everything it fixed.
+    #[test]
+    fn dim_fades_in_the_math_and_still_clears_the_floor() {
+        let base = Style::new().fg(INK).bg(WHITE);
+        let mut dimmed = cell(Color::Default, Color::Rgb(30, 30, 30));
+        dimmed.attrs.dim = true;
+        let style = cell_style(&dimmed, base, Some(&PALETTE));
+        assert!(
+            !style.add_modifier.contains(Modifier::DIM),
+            "colors on: DIM is consumed, never forwarded"
+        );
+        let fg = srgb(style.fg.unwrap()).unwrap();
+        let bg = srgb(style.bg.unwrap()).unwrap();
+        assert!(contrast(fg, bg) >= MIN_CONTRAST, "{fg:?} on {bg:?}");
+
+        // Colors off: DIM passes through as the modifier it always was.
+        let plain = cell_style(&dimmed, Style::new(), None);
+        assert!(plain.add_modifier.contains(Modifier::DIM));
     }
 }
 

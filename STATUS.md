@@ -16,9 +16,14 @@ implementation remains available as the read-only `v1` branch and
 - Message delivery has per-recipient ordering, gate decisions, occupant
   checks, verified or screen-inferred receipts, retry limits, and ledgered
   causes.
-- Bare `cyclops` opens the full-screen workspace. It provides a workspace
-  sidebar, tabs, embedded pane terminals, split controls, drag-and-drop
-  workspace ordering, mouse support, and the Cyclops theme vocabulary.
+- Bare `cyclops` opens the full-screen workspace, seeding the shipped
+  themes on the way in. It provides a workspace sidebar, tabs, embedded
+  pane terminals, split controls, pane swapping by keyboard or drag,
+  text selection with clipboard copy, drag-and-drop workspace ordering,
+  mouse support, and the Cyclops theme vocabulary.
+  Pane bodies paint the active theme's ground and ANSI-16 palette rather
+  than inheriting the host terminal's, and theme switches or edits
+  repaint the open workspace without a restart.
 - `cyclops watch` opens the stream TUI; `cyclops watch --json` emits NDJSON.
   The old `cyclops ui` spelling remains only as a deprecated compatibility
   alias.
@@ -27,6 +32,9 @@ implementation remains available as the read-only `v1` branch and
   Rust code.
 - Seven themes and four layout presets ship as resources compiled into the
   CLI and seeded into the Cyclops home without overwriting local edits.
+  Every theme carries a pane ground and a full ANSI-16 palette; homes
+  seeded before those tokens existed resolve them from compiled defaults
+  until reseeded.
 - The source installer builds `cyclops` and `cyclopsd`, uses a user-writable
   prefix without sudo, backs up any shell profile it edits, and can uninstall
   its binaries and PATH block. The hosted website asset is required to match

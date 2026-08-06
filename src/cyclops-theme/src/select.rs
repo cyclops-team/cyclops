@@ -34,7 +34,7 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::{tokens, Theme};
+use crate::{tokens, Theme, ThemeError};
 
 /// Environment override for the active theme: a name or a .toml path.
 pub const THEME_ENV: &str = "CYCLOPS_THEME";
@@ -307,6 +307,19 @@ impl ThemeWatch {
         self.file = file;
         match Theme::load(&path) {
             Ok((theme, warnings)) => self.adopt(&path, theme, warnings),
+            // A file that is not there cannot be fixed by saving it, so
+            // the remedy names how a theme file comes back instead.
+            Err(ThemeError::Read { path, source })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                self.warnings = vec![format!(
+                    "{} does not exist. {KEPT} Run cyclops start to seed the \
+                     shipped themes, or cyclops theme <name> to pick an \
+                     existing one.",
+                    path.display()
+                )];
+                false
+            }
             Err(e) => {
                 // Same next step as the lost-token refusal below, because
                 // the reader's move is the same: the file is wrong, the
@@ -382,7 +395,9 @@ mod tests {
     /// values do not matter and one hex keeps the fixtures readable.
     fn whole(hex: &str) -> String {
         let mut out = String::from("name = \"dark\"\n");
-        for group in ["role", "surface", "eye", "state", "badge"] {
+        for group in [
+            "role", "surface", "eye", "state", "badge", "chrome", "palette",
+        ] {
             out.push_str(&format!("[{group}]\n"));
             for token in tokens::ALL {
                 let (g, key) = token.split_once('.').expect("group.key");
@@ -539,8 +554,11 @@ mod tests {
         write_theme(home.path(), "typo", "[surface\n");
         assert!(!watch.refresh());
         said.extend(watch.take_warnings());
+        std::fs::remove_file(home.path().join("themes/typo.toml")).expect("remove theme");
+        assert!(!watch.refresh());
+        said.extend(watch.take_warnings());
 
-        assert!(said.len() >= 4, "{said:?}");
+        assert!(said.len() >= 5, "{said:?}");
         for w in &said {
             assert_eq!(w.lines().count(), 1, "not one line: {w:?}");
             // Every printer prefixes "theme: ", so a message that names the
@@ -684,6 +702,8 @@ mod tests {
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].contains("isn't valid TOML"), "{w:?}");
         assert!(w[0].contains(KEPT), "{w:?}");
+        // A file that exists and does not parse is fixed by saving it.
+        assert!(w[0].contains("Fix the file and save again"), "{w:?}");
 
         // 2. Truncated mid-save: valid TOML, most of the palette gone.
         //    This is the one that used to paint half a theme.
@@ -706,13 +726,17 @@ mod tests {
         assert!(w[0].contains("`surface.dim`"), "{w:?}");
         assert!(!w[0].contains("more"), "{w:?}");
 
-        // 4. Deleted outright.
+        // 4. Deleted outright. Saving a file that is not there fixes
+        //    nothing, so the remedy names the commands that bring one back.
         std::fs::remove_file(&path).expect("remove theme");
         assert!(!watch.refresh());
         assert_eq!(watch.theme().overrides, good.overrides);
         let w = watch.take_warnings();
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].contains(KEPT), "{w:?}");
+        assert!(w[0].contains("does not exist"), "{w:?}");
+        assert!(w[0].contains("cyclops start"), "{w:?}");
+        assert!(!w[0].contains("Fix the file"), "{w:?}");
 
         // A refusal is said once, not once per repaint.
         assert!(!watch.refresh());

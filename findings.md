@@ -729,3 +729,117 @@ perf_contract -- --nocapture`. The test file is
 `src/cyclops-workspace/tests/perf_contract.rs`; the complete recorded table
 and caveats are in
 `.agents/planning/2026-08-03-cyclops-workspace-tui/implementation/baselines.md`.
+
+## F43. `swap-pane` focuses the `-t` pane id at its new slot; `-d` pins the active SLOT (MEASURED)
+
+Probed on tmux 3.6a, isolated server. After `swap-pane -s A -t B` without
+`-d`, tmux leaves pane B focused wherever it now sits, so the pane named in
+`-t` is the one that keeps the user's focus through a swap. With `-d` the
+active SLOT is preserved instead: whatever pane now occupies the previously
+active position becomes the focused pane, and the moved pane loses focus.
+Cyclops therefore never passes `-d` and rides the pane that should end
+focused in `-t`: the current pane for a keyboard swap, the dragged pane for
+a drop. The `{left-of}` family resolves the neighbour of the current pane
+at execution time, which is what makes the directional swap need no target
+resolution of its own. Pinned by the swap tests in
+`src/cyclops-tmux/tests/ops.rs` and the executor rig tests in
+`src/cyclops-workspace/src/app/exec.rs`.
+
+## F44. An OSC 52 write to stdout "succeeds" on terminals that ignore it (MEASURED)
+
+macOS Terminal.app ignores the OSC 52 clipboard sequence entirely, and the
+stdout write still returns Ok, so a write result can never prove a copy
+happened. The workspace's copy path treated that Ok as success and skipped
+the pbcopy fallback, leaving the clipboard empty on the stock macOS
+terminal. The rule the fix encodes: run the native tool whenever one is on
+PATH, emit OSC 52 additionally when stdout is a terminal (it is what makes
+copy work on the near side of SSH), and never let either path's result gate
+the other. `src/cyclops-workspace/src/selection.rs`.
+
+## F45. A starved runner can invalidate a timing test's premise three ways, each observable (MEASURED)
+
+Measured on GitHub's shared runners during the v3 CI runs of 2026-08-06,
+where the macOS box ran the perf-contract binary at 3x its local time and
+one leg's tmux server died mid-parity. Three distinct premise failures,
+each with a signature the tests now check instead of a wall-clock guess:
+a burst meant to land inside one debounce window stretches past it (send
+duration says so); a coalescer starved past the flush window gets its
+armed refresh truncated by `Closed`, which drops pending work by design,
+so a tight burst draws zero rather than two; and a tmux server that never
+gets CPU during a client stall never observes the blocked reader, so no
+`%pause` exists to deliver while output keeps streaming afterward. The
+inverse signatures are the real regressions and still fail hard: two
+refreshes from a tight burst is arm-twice, and a confirmed-flowing flood
+that goes silent with no `%pause` seen is a notification lost on our
+side. `src/cyclops-workspace/tests/perf_contract.rs` carries the guards;
+%pause emission itself is tmux's behavior, a rig prerequisite like tmux
+being installed at all.
+
+## F46. tmux master queues control-mode notifications; a stalled client never sees %pause (MEASURED)
+
+tmux commit 6db5175e (2026-08-03, upstream issue 5458) queues control-mode
+notifications rather than emitting them inside %begin/%end. Measured on
+the v3 tmux-head CI job the same week: a control client whose reader
+stalls against a flooding pane sees the flood confirmed flowing, then
+total silence after the stall, 0 bytes in a 500ms drain and no %pause in
+5s, because the queued notification waits for a flush the stalled,
+command-less client never provokes. Every released tmux (3.4, 3.6a, 3.7b)
+delivers %pause to the same rig. The flow-control test skips the silent
+case on "next-" builds citing this finding; the reader's 3.8 adaptation
+is tracked as its own task and flips that skip back to a hard fail.
+
+## F47. Killing a tmux session delivers no per-pane deaths to control mode, only the disconnect (MEASURED)
+
+Measured on a live rig while fixing the immortal-label bug: kill a
+watched session and its control-mode client gets a disconnect, never a
+death notification per pane, so the F25 all-panes subscription that
+catches an individual pane dying observes nothing at all when the whole
+session goes. Anything keyed on per-pane death (the adoption registry
+was) silently survives session death. The daemon now releases a
+session's adoptions at the two edges that CAN answer: the attach-retry
+arm, where tmux positively reports the session missing, and boot, which
+re-verifies resurrected bindings for sessions outside the watched set
+with one has-session each. A tmux error keeps the label: could-not-ask
+never releases. src/cyclopsd/src/lib.rs, registry.rs; pinned by
+tests/m4_name.rs.
+
+## F48. `window-size latest` lets any regular client out-size a control client's declared canvas (MEASURED)
+
+Measured on tmux 3.6a while fixing the invisible-typing overflow in the
+workspace. A control client only counts for window sizing after it
+declares a size with `refresh-client -C` (the daemon's watcher, which
+never declares, is ignored: a session with the workspace at 176 and the
+daemon attached stays at 176). But under `window-size latest` the
+declaration is not authority: attaching a plain 240x60 client to the
+same session snapped the window from the workspace's declared 176x46 to
+240x58, and a second declaring control client did the same, so panes
+laid out 64 columns wider than the painted canvas and typed text ran
+past the visible pane edge. A control client can never win `latest`
+back, because latest follows tty input and control clients produce
+none. `window-size smallest` is a fixed point instead: the window is
+the minimum over declaring clients (176 with the 240 viewer attached,
+150 when the viewer redeclares 150x40, back to 176 when it detaches),
+so the window never exceeds the workspace canvas and a smaller viewer
+only shrinks it, which the canvas absorbs as gutter. Probe: two `tmux
+-C attach` coprocesses issuing `refresh-client -C` against one rig
+session, plus a real client on a second tmux server. Pinned by
+src/cyclops-workspace/tests/geometry.rs.
+
+## F49. Apps dress for the ground tmux reports, and one pane serves two terminals at once (MEASURED)
+
+Measured with codex 0.146.1 on tmux 3.6a. In a detached rig session
+codex styled fg-only (bold cyan selected row, no fills): with no answer
+to its OSC 11 background query it commits to no ground. Setting a pane
+style (`select-pane -P 'bg=#1e1e1e'`) before launch made tmux answer
+the query, and the same codex painted its full dark theme, an explicit
+`48;2;57;57;57` composer fill. On a user's machine the answer comes
+from whichever real terminal taught tmux its background, so agents
+dress for the user's dark terminal inside a light workspace. The
+tempting fix, teaching tmux a light ground so apps dress light, is
+wrong by construction: the same pane is still viewed through the user's
+own dark terminal, and one escape stream cannot dress for both grounds.
+The restyle belongs at render, per viewer: the workspace re-grounds
+neutral fills at the opposite luminance extreme to the theme's own
+panel (`matched_ground` in src/cyclops-workspace/src/render/mod.rs),
+the readability floor sets their text, and the same pane stays native
+in the dark terminal. Pinned by render::contrast_tests.

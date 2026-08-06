@@ -1,0 +1,39 @@
+
+╭─── Claude Code v2.1.221 ─────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                        │
+│                 Welcome back Yahir!                │ Ask Claude to create a new app or clone a repository            │
+│                                                    │ ─────────────────────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                                      │
+│                      ▝▜█████▛▘                     │ Added owner wildcard entries (`"owner/*"`) to the `strictKnown… │
+│                        ▘▘ ▝▝                       │ Added a warning when workflow agents, forked skills, slash com… │
+│     Opus 5 with xhigh effort · Claude Pro ·        │ Added a `/teleport` hint in cloud sessions showing how to cont… │
+│     user@example.com's Organization                │ /release-notes for more                                         │
+│         /private/tmp/cyc-claude-repro/work         │                                                                 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                   tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf and reattach for focus tracking
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Opus 5 · xhigh · /private/tmp/cyc-claude-repro/work · 5h: 22% · 7d: 80% · 1000K window
+  ⏸ manual mode on · ← for agents

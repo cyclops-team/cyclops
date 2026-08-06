@@ -1,6 +1,13 @@
 //! Bare `cyclops` invocation (workspace Step 4).
 
+use std::ffi::CStr;
+use std::fs::{File, OpenOptions};
+use std::os::unix::net::UnixListener;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use cyclops_testrig::{tmux_available, TmuxServer};
 
 #[test]
 fn bare_non_tty_prints_help_and_exits_zero() {
@@ -19,4 +26,103 @@ fn bare_non_tty_prints_help_and_exits_zero() {
         text.contains("help") || text.contains("cyclops"),
         "stdout={text}"
     );
+}
+
+/// One pty: (master fd, slave file). Same allocation as
+/// tests/terminal_silence.rs, minus its ptsname lock: this binary has one
+/// pty caller, so no two threads can race the static buffer.
+fn pty() -> (i32, File) {
+    let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+    assert!(
+        master >= 0,
+        "posix_openpt: {}",
+        std::io::Error::last_os_error()
+    );
+    assert_eq!(unsafe { libc::grantpt(master) }, 0, "grantpt");
+    assert_eq!(unsafe { libc::unlockpt(master) }, 0, "unlockpt");
+    let name = unsafe {
+        let p = libc::ptsname(master);
+        assert!(!p.is_null(), "ptsname");
+        CStr::from_ptr(p).to_string_lossy().into_owned()
+    };
+    let slave = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&name)
+        .expect("open pty slave");
+    (master, slave)
+}
+
+/// Scratch CYCLOPS_HOME under the relocatable scratch root (F24).
+fn scratch_home(tag: &str) -> PathBuf {
+    let dir = cyclops_proto::scratch::scratch_dir(&format!("cyc-{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create scratch home");
+    dir
+}
+
+/// The tty path seeds the shipped themes before the workspace opens, the
+/// same way `cyclops start` does. The live failure this pins: a config or
+/// `$CYCLOPS_THEME` naming a shipped theme on a home `start` never touched
+/// was a missing themes/light.toml and a warning about fixing a file that
+/// was never there.
+///
+/// The rig goes as far as the tty branch itself: bare `cyclops` on a pty,
+/// killed once the seed is on disk. The daemon socket is held by this test
+/// so `ensure_daemon` cannot leave a live cyclopsd behind (a spawned one
+/// finds the socket held and exits at boot), and the config points tmux at
+/// an isolated testrig server in case the boot gets that far.
+#[test]
+fn bare_tty_seeds_the_shipped_themes() {
+    if !tmux_available() {
+        return;
+    }
+    let t = TmuxServer::new("bare-seed");
+    let home = scratch_home("bareseed");
+    std::fs::write(
+        home.join("config.toml"),
+        format!(
+            "tmux_socket = \"{}\"\ntmux_config = \"/dev/null\"\n",
+            t.socket()
+        ),
+    )
+    .expect("write config");
+    let _sock = UnixListener::bind(home.join(cyclops_proto::SOCK_NAME)).expect("bind sock");
+
+    let (master, slave) = pty();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cyclops"))
+        .env("CYCLOPS_HOME", &home)
+        .env_remove("CYCLOPS_THEME")
+        .env_remove("TMUX")
+        .stdin(slave.try_clone().expect("dup pty for stdin"))
+        .stdout(slave.try_clone().expect("dup pty for stdout"))
+        .stderr(slave.try_clone().expect("dup pty for stderr"))
+        .spawn()
+        .expect("run cyclops");
+
+    // The seed is the first thing the tty branch does, so the files land
+    // well before the daemon step's connect budget runs out. Bounded wait,
+    // then stop the workspace; nothing after the seed is asserted on.
+    let light = home.join("themes/light.toml");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !light.is_file() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    unsafe { libc::close(master) };
+
+    let seeded: Vec<String> = std::fs::read_dir(home.join("themes"))
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        light.is_file(),
+        "bare cyclops did not seed themes; the dir holds {seeded:?}"
+    );
+    assert!(home.join("themes/dark.toml").is_file(), "{seeded:?}");
+    let _ = std::fs::remove_dir_all(&home);
 }

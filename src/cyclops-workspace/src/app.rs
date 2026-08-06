@@ -24,7 +24,7 @@ use std::collections::HashSet;
 use std::io;
 
 use crossterm::event::{
-    self, Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use cyclops_tmux::{ControlClient, ControlConfig, Notification};
 use ratatui::backend::CrosstermBackend;
@@ -44,7 +44,7 @@ use crate::input::encode_send_keys;
 use crate::input::mouse::{HitMap, HitTarget, MenuState};
 use crate::input::router::{Router, RouterResult};
 use crate::layout::SplitDir;
-use crate::model::{pane_is_visible, RuntimeRegistry, WorkspaceModel};
+use crate::model::{pane_is_visible, RuntimeRegistry, TabModel, WorkspaceModel};
 use crate::naming;
 use crate::persist::{self, load_prefs, set_last_active, WorkspacePrefs};
 use crate::render::{
@@ -123,6 +123,11 @@ enum AppMsg {
     /// own coalesced refresh is a separate message (`DecorationChanged`)
     /// on the same connection, so this must never gate or delay it.
     StreamEntry(Box<cyclops_ui::Entry>),
+    /// The daemon switched themes (`cyclops theme <name>`), forwarded by
+    /// [`spawn_decoration_forwarder`]'s reader thread. Wake-only, like
+    /// cyclops-ui's `UiMsg::ThemeChanged`: the handler arms the render
+    /// debounce and the reload itself runs on that deadline, before draw.
+    ThemeChanged,
 }
 
 struct App {
@@ -131,6 +136,14 @@ struct App {
     router: Router,
     paint: Paint,
     dialog: Option<Dialog>,
+    /// The theme that was live when the theme picker opened; `Some` for
+    /// exactly as long as the picker is. Selection moves preview the
+    /// highlighted theme straight into `paint.theme`
+    /// (`exec::preview_selected_theme`); closing without applying puts
+    /// this back, and applying drops it, the previewed paint being the
+    /// theme the daemon confirms. While set, [`refresh_theme_watch`]
+    /// holds the ThemeWatch off so a reload cannot overwrite the preview.
+    theme_restore: Option<cyclops_theme::Theme>,
     link_state: LinkState,
     paused_panes: HashSet<String>,
     reconnect_attempt: usize,
@@ -185,6 +198,11 @@ struct App {
     /// resize notification loop when expanded pane gutters are already at
     /// their target geometry.
     declared_client_size: Option<(u16, u16)>,
+    /// Window ids already pinned to `window-size smallest`
+    /// ([`pin_window_sizes`]), so reconciliation asks tmux once per window
+    /// rather than once per snapshot. Cleared on reconnect: a restarted
+    /// server can reuse ids for windows that were never pinned.
+    pinned_windows: HashSet<String>,
     needs_reconcile: bool,
     /// A structural notification changed visible pane dimensions. Hydration
     /// waits for the render deadline so resize bursts collapse to one set of
@@ -290,10 +308,6 @@ pub async fn run_async() -> i32 {
         }
     };
 
-    if let Err(e) = client.set_window_size_latest().await {
-        eprintln!("{e}");
-    }
-
     let bindings = load_bindings(&home);
     let (tx, mut rx) = mpsc::unbounded_channel::<AppMsg>();
 
@@ -332,6 +346,16 @@ pub async fn run_async() -> i32 {
     // Theme detection prints warnings; do it before the alternate screen
     // swallows them.
     let paint = Paint::detect();
+    // Theme hot reload: a stat re-checked on the render deadline, riding
+    // events that already wake the loop (never a timer; tests/guards.rs).
+    // Only meaningful while color is on. A theme file edited by hand
+    // repaints on the next event; the daemon's "theme" event covers
+    // `cyclops theme <name>` promptly, and that trade is accepted.
+    let mut theme_watch = if paint.colors_enabled() {
+        Some(cyclops_theme::ThemeWatch::new(&home))
+    } else {
+        None
+    };
 
     let guard = match TermGuard::enter() {
         Ok(g) => g,
@@ -372,6 +396,11 @@ pub async fn run_async() -> i32 {
             }
         }
     }
+
+    // Pin the sizing policy before declaring the canvas, so the declaration
+    // below is already the binding vote (see `set_window_size_smallest`).
+    let mut pinned_windows = HashSet::new();
+    pin_window_sizes(&client, &model.session.tabs, &mut pinned_windows, &home).await;
 
     // Declare terminal cells only after the split topology is known. tmux
     // gets pane content cells; two-cell separator bands remain UI chrome.
@@ -422,6 +451,7 @@ pub async fn run_async() -> i32 {
         router: Router::new(bindings),
         paint,
         dialog: None,
+        theme_restore: None,
         link_state: LinkState::Live,
         paused_panes: HashSet::new(),
         reconnect_attempt: 0,
@@ -443,6 +473,7 @@ pub async fn run_async() -> i32 {
         cursor_style: None,
         term_size,
         declared_client_size,
+        pinned_windows,
         needs_reconcile: false,
         needs_hydrate: false,
         paste_seq: 0,
@@ -506,6 +537,13 @@ pub async fn run_async() -> i32 {
                         hydrate_visible_tab(&client, app.model.active_tab(), &mut app.runtimes)
                             .await;
                     }
+                    // A theme edit, or a `cyclops theme <name>`, applies on
+                    // this render. A reload the engine refused leaves the
+                    // colors alone and hands back a line for workspace.log:
+                    // stderr is under the alternate screen here.
+                    if let Some(watch) = theme_watch.as_mut() {
+                        refresh_theme_watch(&mut app, watch);
+                    }
                     let _ = draw(&mut terminal, &mut app);
                 }
                 if app.folder_probe_at.is_some_and(|due| due <= now) {
@@ -539,6 +577,25 @@ pub async fn run_async() -> i32 {
         eprintln!("{}", copy::SERVER_GONE_OFFER);
     }
     0
+}
+
+/// The render-deadline half of theme hot reload: re-stat the selection,
+/// adopt a change into the live paint, log what a refused reload had to
+/// say. Skipped whole while the theme picker is open (`App::theme_restore`
+/// is `Some`): the preview owns the paint until the picker closes, and a
+/// stamp the watch never polled is still a pending change, so the first
+/// refresh after the close adopts whatever happened while browsing. That
+/// is how the watch resumes ownership unconditionally.
+fn refresh_theme_watch(app: &mut App, watch: &mut cyclops_theme::ThemeWatch) {
+    if app.theme_restore.is_some() {
+        return;
+    }
+    if watch.refresh() {
+        app.paint.theme = watch.theme().clone();
+    }
+    for warning in watch.take_warnings() {
+        log_err(&app.home, &format!("theme: {warning}"));
+    }
 }
 
 fn spawn_notif_forwarder(
@@ -769,8 +826,11 @@ fn spawn_decoration_forwarder(home: std::path::PathBuf, tx: mpsc::UnboundedSende
             if let Ok(ev) = serde_json::from_value::<cyclops_proto::Event>(value) {
                 // A theme reload is not a fact about the record; the CLI
                 // stream drops it the same way (`cyclops_ui`'s own
-                // subscribe loop). Every other vocabulary, known or not,
-                // still becomes an entry (unknown kinds render as
+                // subscribe loop). It still becomes a wake-only
+                // `ThemeChanged`: the decoration signal below only
+                // repaints when a status fetch lands, and a theme switch
+                // must repaint either way. Every other vocabulary, known
+                // or not, still becomes an entry (unknown kinds render as
                 // `Other` rather than being dropped).
                 if ev.event != "theme" {
                     let entry = cyclops_ui::Entry::from_event(&ev, now_ms());
@@ -780,6 +840,8 @@ fn spawn_decoration_forwarder(home: std::path::PathBuf, tx: mpsc::UnboundedSende
                     {
                         return;
                     }
+                } else if stream_tx.send(AppMsg::ThemeChanged).is_err() {
+                    return;
                 }
             }
             if sig_tx.send(DecorationSignal::Event).is_err() {
@@ -841,8 +903,8 @@ async fn handle_reconnect(
         Ok((new_client, rx)) => {
             *client = new_client;
             spawn_notif_forwarder(rx, tx.clone());
-            let _ = client.set_window_size_latest().await;
             app.declared_client_size = None;
+            app.pinned_windows.clear();
             resize_client(app, client).await;
             reconcile(app, client).await?;
             app.link_state = LinkState::Live;
@@ -948,6 +1010,35 @@ async fn resize_client(app: &mut App, client: &ControlClient) {
     match client.set_client_size(size.0, size.1).await {
         Ok(()) => app.declared_client_size = Some(size),
         Err(error) => log_err(&app.home, &error),
+    }
+}
+
+/// The tab windows not yet pinned to the sizing policy, in tab order.
+fn unpinned_windows<'a>(tabs: &'a [TabModel], pinned: &HashSet<String>) -> Vec<&'a str> {
+    tabs.iter()
+        .filter(|tab| !pinned.contains(&tab.window_id))
+        .map(|tab| tab.window_id.as_str())
+        .collect()
+}
+
+/// Pin `window-size smallest` on every window of the displayed session,
+/// once per window id. Without the pin, tmux's default `latest` policy lets
+/// any other attached client out-size this one, laying panes out wider than
+/// the painted canvas (F48). A window that fails stays unpinned, so the
+/// next reconcile retries it.
+async fn pin_window_sizes(
+    client: &ControlClient,
+    tabs: &[TabModel],
+    pinned: &mut HashSet<String>,
+    home: &std::path::Path,
+) {
+    for window_id in unpinned_windows(tabs, pinned) {
+        match client.set_window_size_smallest(window_id).await {
+            Ok(()) => {
+                pinned.insert(window_id.to_string());
+            }
+            Err(error) => log_err(home, &error),
+        }
     }
 }
 
@@ -1166,6 +1257,9 @@ async fn handle_app_msg(
             crate::event_record::live(&mut app.record, &mut app.intake, *entry);
             arm(debounce);
         }
+        // Wake-only: the reload itself runs on the render deadline this
+        // arms (the theme_watch refresh in `run_async`).
+        AppMsg::ThemeChanged => arm(debounce),
         AppMsg::Mouse(mouse) => {
             // Bare motion only matters while a menu or dialog shows hover
             // highlights — or over the sidebar's create button, the one
@@ -1311,15 +1405,26 @@ async fn handle_mouse(
             mouse.kind,
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
         ) {
+            let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
             let max_scroll = keybind_scroll_limit(app);
-            if let Some(Dialog::Keybinds { scroll, .. }) = app.dialog.as_mut() {
-                let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
-                    -3
-                } else {
-                    3
-                };
-                *scroll = dialog::move_keybind_scroll(*scroll, delta, max_scroll);
+            match app.dialog.as_mut() {
+                Some(Dialog::Keybinds { scroll, .. }) => {
+                    let delta = if up { -3 } else { 3 };
+                    *scroll = dialog::move_keybind_scroll(*scroll, delta, max_scroll);
+                }
+                // A picker notch moves the selection one row, not a
+                // viewport three: the list is what the wheel is over.
+                Some(Dialog::Themes {
+                    selected, names, ..
+                }) => {
+                    let delta = if up { -1 } else { 1 };
+                    *selected = dialog::move_theme_selection(*selected, delta, names.len());
+                }
+                _ => {}
             }
+            // Same preview the arrow keys make: the row the wheel lands
+            // on goes live for the next render.
+            exec::preview_selected_theme(app);
             return Ok(());
         }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -1444,9 +1549,21 @@ async fn handle_mouse(
                         }
                     }
                 }
-                HitTarget::PaneFrame { .. } => {
+                HitTarget::PaneFrame { pane_id } => {
                     app.close_menu();
                     app.selection.clear();
+                    // Down on the frame starts a possible swap drag; a
+                    // below-threshold release focuses the pane instead,
+                    // matching what a frame click always did. The body is
+                    // untouched; dragging there is text selection.
+                    app.drag = Some(DragState::on_down(
+                        DragTarget::Pane {
+                            pane_id: pane_id.clone(),
+                        },
+                        col,
+                        row,
+                    ));
+                    return Ok(());
                 }
                 HitTarget::PaneSplitRight { .. } | HitTarget::PaneSplitDown { .. } => {
                     app.close_menu();
@@ -1603,8 +1720,8 @@ async fn handle_mouse(
 
 /// Commit a drag that crossed its move threshold: resolve the drop hit
 /// target under the release point through `action`'s routing, and execute
-/// whatever it resolves to. Only [`DragTarget::Tab`], `Workspace`, and
-/// `Agent` resolve here — a divider applies live during motion
+/// whatever it resolves to. Only [`DragTarget::Pane`], `Tab`, `Workspace`,
+/// and `Agent` resolve here: a divider applies live during motion
 /// ([`apply_live_divider`]) and a sidebar-width drag already applied and
 /// persisted above.
 ///
@@ -1622,6 +1739,9 @@ async fn commit_drag_drop(
 ) -> Result<(), cyclops_tmux::TmuxError> {
     let drop = app.hit_map.hit(col, row).cloned();
     let action = match picked_up {
+        DragTarget::Pane { pane_id } => {
+            drop.and_then(|drop| action::resolve_pane_drop(pane_id, &drop))
+        }
         DragTarget::Tab { window_id } => {
             drop.and_then(|drop| action::resolve_tab_drop(window_id, &drop))
         }
@@ -1850,8 +1970,9 @@ async fn dialog_confirm(
         return Ok(());
     };
     let Some(action) = action::route_dialog_confirm(&dialog) else {
-        app.dialog = None;
-        app.hover = None;
+        // Dismissing without an action is a cancel: same close path, so a
+        // theme picker with nothing to apply also restores its paint.
+        dialog_cancel(app);
         return Ok(());
     };
     let outcome = exec::execute(app, client, action).await?;
@@ -1860,6 +1981,12 @@ async fn dialog_confirm(
 }
 
 fn dialog_cancel(app: &mut App) {
+    // Close-without-apply: the theme picker previews over the live paint,
+    // so the theme that was live when it opened goes back. `None` for
+    // every other dialog, and for an applied picker (the apply drops it).
+    if let Some(theme) = app.theme_restore.take() {
+        app.paint.theme = theme;
+    }
     app.dialog = None;
     app.hover = None;
 }
@@ -1917,6 +2044,16 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
         app.decoration = snapshot;
     }
     app.persist_active();
+    // New windows arrive through this snapshot (new tab, session switch,
+    // external new-window); pin them before sizing so no displayed window
+    // ever lays out under another client's authority.
+    pin_window_sizes(
+        client,
+        &app.model.session.tabs,
+        &mut app.pinned_windows,
+        &app.home,
+    )
+    .await;
     resize_client(app, client).await;
     hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await;
     app.needs_hydrate = false;
@@ -2036,7 +2173,22 @@ async fn handle_key(
         RouterResult::Action(binding) => {
             let resolved = {
                 let ctx = route_context(app);
-                action::route_binding(binding, &ctx)
+                // Shift on the chord upgrades directional focus to a pane
+                // swap (Ctrl+B Shift+Arrow). Only a prefix chord can carry
+                // the upgrade: the router matches prefix chords by key
+                // code alone, so Shift is unread information there, while
+                // a direct chord matched its modifiers exactly and an
+                // explicit shift+arrow focus binding must stay focus.
+                let prefix_shift = key.modifiers.contains(KeyModifiers::SHIFT)
+                    && matches!(
+                        app.router.chord(binding),
+                        Some(crate::bindings::BindingChord::Prefix(_))
+                    );
+                if prefix_shift {
+                    action::route_binding_shifted(binding, &ctx)
+                } else {
+                    action::route_binding(binding, &ctx)
+                }
             };
             let Some(resolved) = resolved else {
                 return Ok(InputOutcome::NoRedraw);
@@ -2093,9 +2245,20 @@ async fn handle_dialog_key(
             dialog::append_dialog_text(app.dialog.as_mut(), c.encode_utf8(&mut encoded));
         }
         DialogKeyAction::Scroll(delta) => {
-            if let Some(Dialog::Keybinds { scroll, .. }) = app.dialog.as_mut() {
-                *scroll = dialog::move_keybind_scroll(*scroll, delta, max_scroll);
+            match app.dialog.as_mut() {
+                Some(Dialog::Keybinds { scroll, .. }) => {
+                    *scroll = dialog::move_keybind_scroll(*scroll, delta, max_scroll);
+                }
+                Some(Dialog::Themes {
+                    selected, names, ..
+                }) => {
+                    *selected = dialog::move_theme_selection(*selected, delta, names.len());
+                }
+                _ => {}
             }
+            // The row the arrows land on goes live for the next render
+            // (a no-op for every other dialog).
+            exec::preview_selected_theme(app);
         }
         DialogKeyAction::ScrollStart => {
             if let Some(Dialog::Keybinds { scroll, .. }) = app.dialog.as_mut() {
@@ -2245,6 +2408,7 @@ mod tests {
             router: Router::new(crate::bindings::default_bindings()),
             paint: Paint::for_test(),
             dialog: None,
+            theme_restore: None,
             link_state: LinkState::Live,
             paused_panes: HashSet::new(),
             reconnect_attempt: 0,
@@ -2264,6 +2428,7 @@ mod tests {
             cursor_style: None,
             term_size: (40, 12),
             declared_client_size: None,
+            pinned_windows: HashSet::new(),
             needs_reconcile: false,
             needs_hydrate: false,
             paste_seq: 0,
@@ -2272,9 +2437,68 @@ mod tests {
         }
     }
 
+    /// A one-pane model for tests that need an `App` but never reach
+    /// tmux, so the ids are inert.
+    fn one_pane_model() -> WorkspaceModel {
+        let tab = crate::model::TabModel {
+            window_id: "@0".into(),
+            name: "1".into(),
+            layout: crate::layout::ResolvedLayout::Leaf {
+                pane_id: "%0".into(),
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            active_pane: "%0".into(),
+            zoomed: false,
+        };
+        WorkspaceModel {
+            workspaces: vec![crate::model::WorkspaceRow {
+                session_id: "$0".into(),
+                name: "s".into(),
+                tab_count: 1,
+                window_ids: vec!["@0".into()],
+            }],
+            active_workspace: 0,
+            session: crate::model::SessionModel {
+                session: "s".into(),
+                tabs: vec![tab],
+                active_tab: 0,
+            },
+            sidebar_visible: true,
+        }
+    }
+
     #[test]
     fn help_exits_zero_message() {
         assert_eq!(print_help_and_exit(), 0);
+    }
+
+    #[test]
+    fn windows_pin_once_and_a_failed_pin_stays_eligible() {
+        let tab = |id: &str| crate::model::TabModel {
+            window_id: id.into(),
+            name: "1".into(),
+            layout: crate::layout::ResolvedLayout::Leaf {
+                pane_id: "%0".into(),
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            active_pane: "%0".into(),
+            zoomed: false,
+        };
+        let tabs = vec![tab("@0"), tab("@1")];
+        let mut pinned = HashSet::new();
+        assert_eq!(unpinned_windows(&tabs, &pinned), vec!["@0", "@1"]);
+        // Only a recorded pin drops out; a window whose pin failed is not
+        // recorded and stays eligible for the next reconcile.
+        pinned.insert("@0".to_string());
+        assert_eq!(unpinned_windows(&tabs, &pinned), vec!["@1"]);
+        pinned.insert("@1".to_string());
+        assert!(unpinned_windows(&tabs, &pinned).is_empty());
     }
 
     #[test]
@@ -2407,6 +2631,175 @@ mod tests {
             "exactly one DecorationChanged should reach the app per coalesced burst"
         );
 
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A daemon "theme" event must reach the app as the wake-only
+    /// `ThemeChanged`, never as a stream entry: the record mirrors
+    /// `cyclops watch`, which drops theme switches the same way.
+    #[test]
+    fn a_theme_event_wakes_the_app_without_entering_the_record() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
+
+        let home = cyclops_proto::scratch::scratch_dir("workspace-theme-event");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("scratch home");
+        let listener =
+            UnixListener::bind(home.join(cyclops_proto::SOCK_NAME)).expect("bind fake daemon");
+
+        std::thread::spawn(move || {
+            // The persistent subscribe connection: hello, read the
+            // subscribe request, then one theme event. Later connections
+            // (the coalesced status fetch) are dropped unanswered; the
+            // refresh closure treats that as doubt and sends nothing.
+            let (stream, _) = listener.accept().expect("subscribe connection");
+            let mut reader = std::io::BufReader::new(stream);
+            reader
+                .get_mut()
+                .write_all(b"{\"cyclops\":\"0.1.0\",\"proto\":1,\"boot_id\":\"b\"}\n")
+                .expect("hello");
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("subscribe request");
+            let _ = reader
+                .get_mut()
+                .write_all(b"{\"event\":\"theme\",\"data\":{\"name\":\"aurora\"}}\n");
+            for stream in listener.incoming().flatten() {
+                drop(stream);
+            }
+        });
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        spawn_decoration_forwarder(home.clone(), tx);
+
+        // Bounded polling in test code only (rule 9's documented
+        // exception), never in the forwarder itself.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut woke = 0;
+        let mut entries = 0;
+        while woke == 0 && std::time::Instant::now() < deadline {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    AppMsg::ThemeChanged => woke += 1,
+                    AppMsg::StreamEntry(_) => entries += 1,
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(woke, 1, "a theme event must wake the app exactly once");
+        assert_eq!(entries, 0, "a theme event must never become a stream entry");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Esc (or the Cancel button: both land in `dialog_cancel`) puts back
+    /// the paint that was live when the theme picker opened.
+    #[test]
+    fn closing_the_picker_without_applying_restores_the_original_paint() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-picker-restore");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("themes")).expect("themes dir");
+        std::fs::write(
+            home.join("themes/solar.toml"),
+            "name = \"solar\"\n[surface]\ndim = \"#222222\"\n",
+        )
+        .expect("write theme");
+        let mut app = test_app(one_pane_model(), home.clone());
+        let dim = cyclops_theme::tokens::SURFACE_DIM;
+        let original = app.paint.theme.resolve(dim).rgb;
+        // What ShowThemes does: keep the live paint beside the picker.
+        app.theme_restore = Some(app.paint.theme.clone());
+        app.dialog = Some(Dialog::Themes {
+            names: vec!["solar".into()],
+            selected: 0,
+            active: None,
+            notice: None,
+        });
+        exec::preview_selected_theme(&mut app);
+        assert_ne!(app.paint.theme.resolve(dim).rgb, original, "previewed");
+
+        dialog_cancel(&mut app);
+
+        assert_eq!(
+            app.paint.theme.resolve(dim).rgb,
+            original,
+            "cancel restores the paint the picker opened over"
+        );
+        assert!(app.dialog.is_none());
+        assert!(
+            app.theme_restore.is_none(),
+            "the watch owns the paint again"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The interleaving trap: the ThemeWatch refresh runs on the render
+    /// deadline, BEFORE draw, so a theme change landing while the picker
+    /// previews would repaint over the preview. While the picker is open
+    /// the refresh is skipped whole; the stamps it never polled are still
+    /// pending changes, so the first refresh after close adopts them and
+    /// the watch owns the paint again.
+    #[test]
+    fn a_watch_refresh_never_overwrites_an_open_preview() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-preview-watch");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("themes")).expect("themes dir");
+        std::fs::write(
+            home.join("themes/dark.toml"),
+            "[surface]\ndim = \"#111111\"\n",
+        )
+        .expect("write dark");
+        std::fs::write(
+            home.join("themes/solar.toml"),
+            "[surface]\ndim = \"#222222\"\n",
+        )
+        .expect("write solar");
+        std::fs::write(home.join("config.toml"), "theme = \"dark\"\n").expect("config");
+        let mut watch = cyclops_theme::ThemeWatch::with_env(None, &home);
+        let mut app = test_app(one_pane_model(), home.clone());
+        app.paint.theme = watch.theme().clone();
+        let dim = cyclops_theme::tokens::SURFACE_DIM;
+
+        app.theme_restore = Some(app.paint.theme.clone());
+        app.dialog = Some(Dialog::Themes {
+            names: vec!["dark".into(), "solar".into()],
+            selected: 1,
+            active: Some(0),
+            notice: None,
+        });
+        exec::preview_selected_theme(&mut app);
+        assert_eq!(app.paint.theme.resolve(dim).rgb, (0x22, 0x22, 0x22));
+
+        // The watched file moves mid-browse (longer, so the stamp moves
+        // regardless of mtime granularity). The deadline refresh must not
+        // repaint.
+        std::fs::write(
+            home.join("themes/dark.toml"),
+            "name = \"dark\"\n[surface]\ndim = \"#333333\"\n",
+        )
+        .expect("edit dark");
+        refresh_theme_watch(&mut app, &mut watch);
+        assert_eq!(
+            app.paint.theme.resolve(dim).rgb,
+            (0x22, 0x22, 0x22),
+            "the preview survives the refresh"
+        );
+
+        // Close without applying: the original comes back first, then the
+        // watch resumes ownership and adopts the edit it was held off from.
+        dialog_cancel(&mut app);
+        assert_eq!(
+            app.paint.theme.resolve(dim).rgb,
+            (0x11, 0x11, 0x11),
+            "Esc restores what was live at open"
+        );
+        refresh_theme_watch(&mut app, &mut watch);
+        assert_eq!(
+            app.paint.theme.resolve(dim).rgb,
+            (0x33, 0x33, 0x33),
+            "the first refresh after close adopts what happened while browsing"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2833,6 +3226,117 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&home);
+        client.shutdown().await;
+    }
+
+    // -- A pane-frame drag released on another pane dispatches one swap
+    // through the executor. What the swap itself does to tmux is
+    // `app::exec::tests`' job; this proves the resolution-to-dispatch
+    // wiring against the painted hit rects. --
+
+    #[tokio::test]
+    async fn a_pane_drop_on_another_pane_dispatches_one_swap() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("app-pane-drop");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        server.run_ok(&["split-window", "-h", "-t", "s"]);
+        let out = server.run(&["list-panes", "-t", "s", "-F", "#{pane_id} #{pane_left}"]);
+        let before: Vec<(String, String)> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let mut fields = line.split_whitespace();
+                (
+                    fields.next().unwrap_or_default().to_string(),
+                    fields.next().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let (dragged, target) = (before[0].0.clone(), before[1].0.clone());
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+
+        let model = WorkspaceModel {
+            workspaces: vec![crate::model::WorkspaceRow {
+                session_id: "$0".into(),
+                name: "s".into(),
+                tab_count: 1,
+                window_ids: vec!["@0".into()],
+            }],
+            active_workspace: 0,
+            session: crate::model::SessionModel {
+                session: "s".into(),
+                tabs: vec![crate::model::TabModel {
+                    window_id: "@0".into(),
+                    name: "1".into(),
+                    layout: crate::layout::ResolvedLayout::Leaf {
+                        pane_id: dragged.clone(),
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 24,
+                    },
+                    active_pane: dragged.clone(),
+                    zoomed: false,
+                }],
+                active_tab: 0,
+            },
+            sidebar_visible: true,
+        };
+        let mut app = test_app(
+            model,
+            cyclops_proto::scratch::scratch_dir("app-pane-drop-home"),
+        );
+
+        // Fixture rects standing in for the last painted frame: the dragged
+        // pane on the left, the drop target's body on the right.
+        app.hit_map.push(
+            Rect::new(0, 2, 10, 5),
+            HitTarget::PaneBody {
+                pane_id: dragged.clone(),
+            },
+        );
+        app.hit_map.push(
+            Rect::new(12, 2, 10, 5),
+            HitTarget::PaneBody {
+                pane_id: target.clone(),
+            },
+        );
+
+        commit_drag_drop(
+            &mut app,
+            &client,
+            &DragTarget::Pane {
+                pane_id: dragged.clone(),
+            },
+            13,
+            3,
+        )
+        .await
+        .expect("commit");
+
+        assert!(app.needs_reconcile, "a swap is structural");
+        let out = server.run(&["list-panes", "-t", "s", "-F", "#{pane_id} #{pane_left}"]);
+        let after = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            after
+                .lines()
+                .any(|line| line == format!("{dragged} {}", before[1].1)),
+            "the dragged pane must take the target's slot, got {after}"
+        );
+        assert!(
+            after
+                .lines()
+                .any(|line| line == format!("{target} {}", before[0].1)),
+            "the target pane must take the dragged pane's slot, got {after}"
+        );
         client.shutdown().await;
     }
 }
