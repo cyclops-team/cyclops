@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Durable workspace UI preferences and last-active state.
 
 use std::path::Path;
@@ -228,21 +226,6 @@ pub fn reopen_fallback(
     ReopenTarget::OfferCreate
 }
 
-/// Apply workspace_order to a session list.
-pub fn order_workspaces(mut names: Vec<String>, order: &[String]) -> Vec<String> {
-    if order.is_empty() {
-        return names;
-    }
-    let mut out = Vec::new();
-    for name in order {
-        if let Some(pos) = names.iter().position(|n| n == name) {
-            out.push(names.remove(pos));
-        }
-    }
-    out.extend(names);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,12 +367,5 @@ mod tests {
             reopen_fallback(&[], None, None, &[]),
             ReopenTarget::OfferCreate
         );
-    }
-
-    #[test]
-    fn workspace_order_sorts_known_sessions() {
-        let names = vec!["alpha".into(), "beta".into(), "gamma".into()];
-        let ordered = order_workspaces(names, &["gamma".into(), "alpha".into()]);
-        assert_eq!(ordered, vec!["gamma", "alpha", "beta"]);
     }
 }

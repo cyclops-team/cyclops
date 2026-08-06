@@ -321,8 +321,10 @@ The same principle runs wider than manifests: hook config templates under
 
 ## 11. Color is redundant and never the only encoding
 
-**Two encodings carry meaning: role color and state glyph. A state cell
-always carries a glyph AND a word. Color is the third copy.**
+**Two encodings carry meaning: role color and state glyph. Color is never
+the only one. A compact workspace surface may carry the glyph alone;
+every detailed, plain-text, or diagnostic surface still carries a glyph
+AND a word.**
 
 What breaks: `NO_COLOR`, `--plain`, a screen reader, a piped log, a CI
 transcript, and a reader who cannot distinguish the two hues you picked. In
@@ -337,17 +339,38 @@ to know (healthy, needs-you, terminal, quiet) rather than one hue per
 state. Role hues stay on the agent name alone, so the two encodings never
 share a cell.
 
+The workspace's compact surfaces — sidebar rows, inactive pane borders —
+are the one narrow exception, and it is not a color standing in for a
+word: `○` idle, `●` working, `⚠` needs attention, and `✕` dead are a
+fixed, documented glyph vocabulary that a reader can learn once. The glyph
+is chosen by state, never by theme, so it renders identically under every
+theme and under `NO_COLOR`; only the `Style` painted under it changes. A
+detailed surface (the focused pane border, dialogs, the event panel),
+plain-text output, and every diagnostic show the word whenever there is
+room for it. None of them may drop straight to hiding the state just
+because the word does not fit — the fallback is always the glyph, the same
+one the compact surfaces show on purpose.
+
 The check that matters is mechanical: turn color off and read the same
-line. If anything is missing, the glyph or the word is doing too little.
+line. If anything is missing beyond a compact surface's own documented
+glyph, the glyph or the word is doing too little.
 
 - Enforced at: `crates/cyclops-theme` (`state_token`, `delivery_token`,
   and the token vocabulary); `crates/cyclops/src/style.rs` and
   `crates/cyclops-ui/src/theme.rs` paint through those and nothing else;
-  `crates/cyclops-ui/src/plain.rs` is the same content with no paint.
+  `crates/cyclops-ui/src/plain.rs` is the same content with no paint;
+  `crates/cyclops-workspace/src/decoration.rs`, `DecorationSnapshot::primary_status`,
+  which maps the daemon's own attention flag to the glyph and word and
+  never raises attention on its own.
 - Proven by: `crates/cyclops-ui/src/entry.rs`, which asserts the
   color-off rendering of a blocked row and a parked row is the words;
   `crates/cyclops-theme/tests/vocabulary.rs`,
-  `every_token_in_the_vocabulary_is_painted_by_a_renderer`.
+  `every_token_in_the_vocabulary_is_painted_by_a_renderer`;
+  `crates/cyclops-workspace/src/render.rs`,
+  `sidebar_state_glyph_is_stable_across_theme_and_no_color` and
+  `inactive_pane_border_glyph_is_stable_across_theme_and_no_color`, which
+  feed the same state through two unrelated themes and `NO_COLOR` and
+  assert the glyph never moves while its `Style` does.
 
 ## Where these came from
 

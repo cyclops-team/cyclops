@@ -1,5 +1,3 @@
-#![allow(dead_code)] // exact-state helpers remain available to diagnostic surfaces
-
 //! Agent decoration from the daemon: badges, attention rollup, event stream.
 
 use std::collections::HashMap;
@@ -7,10 +5,8 @@ use std::path::{Path, PathBuf};
 
 use cyclops_proto::{
     attention::{Attention, AttentionItem},
-    state_words, AgentState, PaneStatus, StatusParams, StatusResult,
+    AgentState, PaneStatus, StatusParams, StatusResult,
 };
-
-use crate::model::TabModel;
 
 /// Per-pane decoration fetched from cyclopsd.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,8 +78,19 @@ impl DecorationSnapshot {
     /// to expose it. A staged composer is unavailable for another prompt, so
     /// the compact UI groups it with working rather than falsely calling it
     /// idle.
+    ///
+    /// `needs_attention` is the only attention predicate: it is copied
+    /// straight from the daemon's authoritative `cyclops_proto::attention`
+    /// result (see `snapshot_from_status`) and never recomputed here. A
+    /// second, local guess — this used to also fire on `state.is_blocked()`
+    /// — can only ever paper over a disagreement between that register and
+    /// the UI; it must never manufacture attention the daemon didn't raise.
+    /// A blocked state the register left unflagged is therefore not an
+    /// attention item: it groups with `working` below, the same "occupied,
+    /// not free" bucket `idle_with_input` uses, colored by the pane's exact
+    /// state rather than the generic `Working` the shared glyph implies.
     pub fn primary_status(dec: &PaneDecoration) -> Option<PrimaryStatus> {
-        if dec.needs_attention || dec.state.is_blocked() {
+        if dec.needs_attention {
             return Some(PrimaryStatus {
                 glyph: "⚠",
                 word: "needs attention",
@@ -102,34 +109,19 @@ impl DecorationSnapshot {
                 word: "working",
                 color_state: AgentState::Working,
             }),
+            AgentState::BlockedModal | AgentState::BlockedPermission | AgentState::BlockedQuota => {
+                Some(PrimaryStatus {
+                    glyph: "●",
+                    word: "working",
+                    color_state: dec.state,
+                })
+            }
             AgentState::Dead => Some(PrimaryStatus {
                 glyph: "✕",
                 word: "dead",
                 color_state: AgentState::Dead,
             }),
-            _ => unreachable!("blocked states return above"),
         }
-    }
-
-    pub fn state_badge(state: AgentState) -> String {
-        state_words(state)
-    }
-
-    /// Named agent rows for the expanded sidebar list.
-    pub fn named_agent_rows(&self) -> Vec<&PaneDecoration> {
-        self.panes
-            .values()
-            .filter(|p| p.label.is_some() || p.manifest.is_some())
-            .collect()
-    }
-
-    /// Named or detected agents owned by these tabs, ordered so the sidebar
-    /// does not jump around when daemon hash-map insertion order changes.
-    /// Window ids, unlike session names, stay stable across a workspace
-    /// rename and are global within the target tmux server.
-    pub fn agent_rows_for_tabs(&self, tabs: &[TabModel]) -> Vec<&PaneDecoration> {
-        let window_ids: Vec<String> = tabs.iter().map(|tab| tab.window_id.clone()).collect();
-        self.agent_rows_for_window_ids(&window_ids, &[])
     }
 
     /// Named and detected agents linked into these windows, in the user's
@@ -385,6 +377,36 @@ mod tests {
         );
     }
 
+    /// The daemon's attention register is the only source of an attention
+    /// item (rule: never recompute attention in decoration). A blocked pane
+    /// the register did not flag — the daemon hasn't raised it yet, or the
+    /// two disagree — must not be relabeled into attention by a second,
+    /// local guess; it renders as its own occupied state instead, the same
+    /// bucket `idle_with_input` shares with `working`.
+    #[test]
+    fn blocked_without_an_attention_item_is_not_shown_as_attention() {
+        for state in [
+            AgentState::BlockedModal,
+            AgentState::BlockedPermission,
+            AgentState::BlockedQuota,
+        ] {
+            let dec = pane_decoration(
+                &pane("%0", "@0", Some("reviewer"), state),
+                false,
+                &HashMap::new(),
+            );
+            assert_eq!(
+                DecorationSnapshot::primary_status(&dec),
+                Some(PrimaryStatus {
+                    glyph: "●",
+                    word: "working",
+                    color_state: state,
+                }),
+                "{state} without needs_attention must not read as needs attention"
+            );
+        }
+    }
+
     #[test]
     fn configured_manifest_directory_drives_display_names() {
         let home = cyclops_proto::scratch::scratch_dir("workspace-manifest-display");
@@ -420,16 +442,8 @@ mod tests {
             ]),
             &HashMap::new(),
         );
-        let node = crate::layout::parse_layout("0000,80x24,0,0,0").unwrap();
-        let tab = TabModel {
-            window_id: "@7".into(),
-            name: "1".into(),
-            layout: crate::layout::resolve_layout(&node, &[]).unwrap(),
-            active_pane: "%0".into(),
-            zoomed: false,
-        };
 
-        let rows = snap.agent_rows_for_tabs(&[tab]);
+        let rows = snap.agent_rows_for_window_ids(&["@7".to_string()], &[]);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].label.as_deref(), Some("reviewer"));
     }
@@ -466,12 +480,5 @@ mod tests {
             "an unreachable daemon must not read as an empty roster"
         );
         let _ = std::fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn state_badge_has_glyph_and_word() {
-        let badge = DecorationSnapshot::state_badge(AgentState::Working);
-        assert!(badge.contains('●'));
-        assert!(badge.contains("working"));
     }
 }

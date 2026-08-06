@@ -33,9 +33,11 @@ impl Router {
         }
     }
 
-    /// Whether the prefix chord is armed for the next key.
-    #[allow(dead_code)]
-    pub fn prefix_armed(&self) -> bool {
+    /// Whether the prefix chord is armed for the next key. Only a test
+    /// checks this directly; product code reads the `RouterResult` `route`
+    /// returns instead.
+    #[cfg(test)]
+    fn prefix_armed(&self) -> bool {
         self.prefix_armed
     }
 

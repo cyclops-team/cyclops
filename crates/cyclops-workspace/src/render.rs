@@ -5,7 +5,7 @@
 //! the client size, then restores those cells only as chrome. Nothing scales;
 //! a runtime grid lands on exactly the cells tmux gave the pane.
 
-#![allow(clippy::too_many_arguments, dead_code)]
+#![allow(clippy::too_many_arguments)]
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -288,8 +288,20 @@ fn paint_keybinds_dialog(
         copy::KEYBINDS_HINT,
         theme::menu_hint(paint),
     );
+    // Rule 11's compact surfaces (sidebar rows, inactive pane borders) show
+    // the glyph alone; this dialog is the one place that spells the whole
+    // vocabulary out, once, so a reader never has to guess what a bare ●
+    // or ✕ meant.
+    overlay_text(
+        buf,
+        inner,
+        left,
+        inner.y + 2,
+        copy::STATE_GLYPH_LEGEND,
+        theme::menu_hint(paint),
+    );
 
-    let list_y = inner.y + 3;
+    let list_y = inner.y + 4;
     let start = if list_h == 0 {
         0
     } else {
@@ -358,7 +370,9 @@ fn keybind_dialog_geometry(row_count: usize, area: Rect) -> Option<(Rect, u16)> 
         return None;
     }
     let width = area.width.saturating_sub(4).min(72);
-    let wanted_height = u16::try_from(row_count.saturating_add(7)).unwrap_or(u16::MAX);
+    // Title, hint, glyph legend, one blank line before the list, one blank
+    // line after it, and the footer: 6 fixed rows around the scrollable list.
+    let wanted_height = u16::try_from(row_count.saturating_add(8)).unwrap_or(u16::MAX);
     let height = wanted_height.min(area.height.saturating_sub(2)).max(6);
     let dialog = Rect::new(
         area.x + (area.width - width) / 2,
@@ -366,7 +380,7 @@ fn keybind_dialog_geometry(row_count: usize, area: Rect) -> Option<(Rect, u16)> 
         width,
         height,
     );
-    let list_height = height.saturating_sub(2).saturating_sub(5);
+    let list_height = height.saturating_sub(2).saturating_sub(6);
     Some((dialog, list_height))
 }
 
@@ -2143,6 +2157,239 @@ mod tests {
             ),
             "persisted agent order should put Claude first"
         );
+    }
+
+    /// A theme deliberately unlike the default on every token the compact
+    /// state cell can paint through — both `[state]` (idle/working/dead)
+    /// and `[eye]` (the attention glyph) — so a color match against the
+    /// default theme in a caller's test would mean its glyph check was
+    /// vacuous. Shared by the two glyph-stability tests below.
+    fn alt_test_theme_paint() -> Paint {
+        let (theme, warnings) = cyclops_theme::Theme::parse(
+            "name = \"alt-test\"\n\
+             [state]\n\
+             healthy = \"#123456\"\n\
+             quiet = \"#234567\"\n\
+             dead = \"#345678\"\n\
+             [eye]\n\
+             alert = \"#456789\"\n",
+            "alt-test",
+        )
+        .expect("valid test theme");
+        assert!(
+            warnings.is_empty(),
+            "unexpected theme warnings: {warnings:?}"
+        );
+        let mut paint = Paint::for_test();
+        paint.theme = theme;
+        paint
+    }
+
+    /// Rule 11's compact glyph vocabulary is a fixed mapping from
+    /// `AgentState`/attention to one of four characters (`○`, `●`, `⚠`,
+    /// `✕`) — it is not a color swatch. Feed the sidebar's status cell two
+    /// materially different themes plus `NO_COLOR` and the glyph at the
+    /// same cell must read identically every time; only the `Style`
+    /// painted under it may change (and must, on the two colored runs, or
+    /// this proves nothing).
+    #[test]
+    fn sidebar_state_glyph_is_stable_across_theme_and_no_color() {
+        use crate::decoration::PaneDecoration;
+        use cyclops_proto::AgentState;
+
+        let workspaces = vec![WorkspaceRow {
+            session_id: "$0".into(),
+            name: "cyclops".into(),
+            tab_count: 1,
+            active: true,
+            window_ids: vec!["@0".into()],
+        }];
+        let expanded = std::collections::HashSet::from(["$0".to_string()]);
+
+        let render_with = |paint: &Paint, state: AgentState, needs_attention: bool| -> Buffer {
+            let mut decoration = DecorationSnapshot {
+                online: true,
+                ..Default::default()
+            };
+            decoration.panes.insert(
+                "%0".into(),
+                PaneDecoration {
+                    pane_id: "%0".into(),
+                    window_id: "@0".into(),
+                    label: Some("reviewer".into()),
+                    manifest: None,
+                    manifest_display_name: None,
+                    state,
+                    needs_attention,
+                },
+            );
+            let backend = TestBackend::new(24, 8);
+            let mut term = Terminal::new(backend).unwrap();
+            let mut hits = HitMap::default();
+            term.draw(|f| {
+                paint_sidebar(
+                    &workspaces,
+                    0,
+                    "%9",
+                    &expanded,
+                    &[],
+                    f.area(),
+                    f.buffer_mut(),
+                    paint,
+                    &mut hits,
+                    &decoration,
+                    None,
+                    None,
+                );
+            })
+            .unwrap();
+            term.backend().buffer().clone()
+        };
+
+        let alt_paint = alt_test_theme_paint();
+        let default_paint = Paint::for_test();
+        let plain_paint = Paint::without_color_for_test();
+
+        // Column 5, row 3: one expanded, online workspace puts its first
+        // agent row at y = 3 (title, blank, workspace row), and the status
+        // glyph lands 3 cells past the 2-cell sidebar pad
+        // (`content.x.saturating_add(3)` in `paint_sidebar`).
+        let (gx, gy) = (5, 3);
+        for (state, needs_attention, glyph) in [
+            (AgentState::Idle, false, "○"),
+            (AgentState::Working, false, "●"),
+            (AgentState::BlockedPermission, true, "⚠"),
+            (AgentState::Dead, false, "✕"),
+        ] {
+            let default_buf = render_with(&default_paint, state, needs_attention);
+            let alt_buf = render_with(&alt_paint, state, needs_attention);
+            let plain_buf = render_with(&plain_paint, state, needs_attention);
+
+            assert_eq!(
+                default_buf[(gx, gy)].symbol(),
+                glyph,
+                "default theme glyph for {state}"
+            );
+            assert_eq!(
+                alt_buf[(gx, gy)].symbol(),
+                glyph,
+                "an unrelated theme must not change the glyph for {state}"
+            );
+            assert_eq!(
+                plain_buf[(gx, gy)].symbol(),
+                glyph,
+                "NO_COLOR must not change the glyph for {state}"
+            );
+            assert_ne!(
+                default_buf[(gx, gy)].fg,
+                alt_buf[(gx, gy)].fg,
+                "the theme change must actually repaint the color for {state}, \
+                 or the glyph check above proves nothing"
+            );
+            assert_eq!(
+                plain_buf[(gx, gy)].fg,
+                RtColor::Reset,
+                "NO_COLOR must leave no color behind for {state}, confirming \
+                 this compact cell does not depend on color to read"
+            );
+        }
+    }
+
+    /// The same guarantee as the sidebar test above, for the other compact
+    /// surface rule 11 names explicitly: an inactive pane's border, which
+    /// (per `inactive_pane_chrome_keeps_status_compact`) paints the glyph
+    /// alone with no word to fall back on.
+    #[test]
+    fn inactive_pane_border_glyph_is_stable_across_theme_and_no_color() {
+        use crate::decoration::{DecorationSnapshot, PaneDecoration};
+        use cyclops_proto::AgentState;
+
+        let render_with = |paint: &Paint, state: AgentState, needs_attention: bool| -> Buffer {
+            let tab = two_pane_tab();
+            let mut decoration = DecorationSnapshot {
+                online: true,
+                ..Default::default()
+            };
+            decoration.panes.insert(
+                "%1".into(),
+                PaneDecoration {
+                    pane_id: "%1".into(),
+                    window_id: "@0".into(),
+                    label: Some("reviewer".into()),
+                    manifest: None,
+                    manifest_display_name: None,
+                    state,
+                    needs_attention,
+                },
+            );
+            let backend = TestBackend::new(40, 12);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|frame| {
+                let runtimes = RuntimeRegistry::default();
+                let mut hits = HitMap::default();
+                let paused = std::collections::HashSet::new();
+                let mut ctx = ctx_defaults(&mut hits, &paused, &decoration);
+                paint_window(
+                    &tab,
+                    &runtimes,
+                    frame.area(),
+                    frame.buffer_mut(),
+                    paint,
+                    &mut ctx,
+                );
+            })
+            .unwrap();
+            term.backend().buffer().clone()
+        };
+
+        fn find_glyph(buf: &Buffer, glyph: &str) -> (u16, u16) {
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    if buf[(x, y)].symbol() == glyph {
+                        return (x, y);
+                    }
+                }
+            }
+            panic!("glyph {glyph:?} was not painted anywhere: {}", flatten(buf));
+        }
+
+        let alt_paint = alt_test_theme_paint();
+        let default_paint = Paint::for_test();
+        let plain_paint = Paint::without_color_for_test();
+
+        for (state, needs_attention, glyph) in [
+            (AgentState::Idle, false, "○"),
+            (AgentState::Working, false, "●"),
+            (AgentState::BlockedPermission, true, "⚠"),
+            (AgentState::Dead, false, "✕"),
+        ] {
+            let default_buf = render_with(&default_paint, state, needs_attention);
+            let alt_buf = render_with(&alt_paint, state, needs_attention);
+            let plain_buf = render_with(&plain_paint, state, needs_attention);
+
+            let pos = find_glyph(&default_buf, glyph);
+            assert_eq!(
+                alt_buf[pos].symbol(),
+                glyph,
+                "an unrelated theme must not move or change the glyph for {state}"
+            );
+            assert_eq!(
+                plain_buf[pos].symbol(),
+                glyph,
+                "NO_COLOR must not move or change the glyph for {state}"
+            );
+            assert_ne!(
+                default_buf[pos].fg, alt_buf[pos].fg,
+                "the theme change must actually repaint the color for {state}, \
+                 or the glyph check above proves nothing"
+            );
+            assert_eq!(
+                plain_buf[pos].fg,
+                RtColor::Reset,
+                "NO_COLOR must leave no color behind for {state}, confirming \
+                 this compact cell does not depend on color to read"
+            );
+        }
     }
 
     #[test]

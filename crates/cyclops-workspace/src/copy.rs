@@ -25,6 +25,11 @@ pub const KEYBINDS_TITLE: &str = "Keybinds";
 
 pub const KEYBINDS_HINT: &str = "Scroll with ↑/↓, PgUp/PgDn, or the mouse wheel.";
 
+/// The compact state vocabulary (rule 11), spelled out once for the
+/// keybinds dialog since sidebar rows and inactive pane borders show only
+/// the glyph half of it.
+pub const STATE_GLYPH_LEGEND: &str = "Status:  ○ idle   ● working   ⚠ needs attention   ✕ dead";
+
 pub const RENAME_WORKSPACE_PROMPT: &str = "Rename workspace";
 
 pub const CONFIRM_CLOSE_WORKSPACE: &str = "Close this workspace?";

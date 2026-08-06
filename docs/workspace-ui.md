@@ -84,11 +84,28 @@ unnamed detected coding agents are nested below any expanded workspace.
 Manifest display names appear for unnamed agents, such as `● Claude Code`.
 Clicking one switches to its workspace and tab, then focuses its pane.
 
+### Status glyphs
+
 The primary workspace UI intentionally omits `unknown`: the sidebar and pane
 chrome show the identity alone until Cyclops has a confident state. Unknown
 remains distinct from idle internally and is still available through
-detection diagnostics. Known primary states use `○ idle`, `● working`,
-`⚠ needs attention`, and `✕ dead`. Cyclops never writes the pane title to do
+detection diagnostics. Every other state maps to one of four glyphs:
+
+| Glyph | Meaning |
+|-------|---------|
+| `○`   | idle — safe to send a message |
+| `●`   | working — a turn is running, or the composer holds staged text |
+| `⚠`   | needs attention — the daemon's attention register has an open item for this pane |
+| `✕`   | dead — the pane's process exited |
+
+Sidebar rows and inactive pane borders are compact surfaces: they show the
+bare glyph, with no word alongside it and no word substituted when one
+doesn't fit — the glyph alone is the encoding there. The focused pane's
+border pairs the glyph with its word, for example `⚠ needs attention`, when
+there is room for both; dialogs and the event panel always have that room.
+The glyph itself never changes meaning: it renders identically under every
+theme and under `NO_COLOR`, so only the surrounding color, never the glyph,
+depends on color. Cyclops never writes the pane title to show any of
 this—the title remains a sensor. See [panes.md](panes.md) for naming and
 identity rules.
 
