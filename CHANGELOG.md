@@ -91,6 +91,16 @@ versions are unreleased until admin cuts a tag.
 - Event panel body rows printed in the terminal's own foreground on the
   panel's themed ground, unreadable on a light host; they wear chrome
   text now.
+- A theme file seeded by an old build could go stale forever: seeding
+  never overwrites, so a pre-ground light.toml kept a dark background
+  under a current binary on two real machines. The seeder now upgrades
+  any file byte-identical to a version this project ever shipped, and
+  still never touches a file the user edited.
+- Pane text never falls under a 2.5:1 readability floor: an agent's
+  pale grays drawn for a dark terminal no longer vanish on the light
+  ground, and the theme's ink no longer disappears into an agent's own
+  dark fills. Readable colors pass through hue-intact; NO_COLOR never
+  clamps.
 - Typed text ran past the visible pane edge into columns nobody could
   see: `window-size latest` let any attaching client out-size the
   workspace's declared canvas (F48); `window-size smallest` is the
