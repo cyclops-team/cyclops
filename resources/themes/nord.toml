@@ -4,6 +4,7 @@
 name = "nord"
 [surface]
 fg = { hex = "#d8dee9", c256 = 253 }
+bg = { hex = "#2e3440", c256 = 237 } # nord0, the pane ground
 dim = { hex = "#4c566a", c256 = 240 }
 accent = { hex = "#88c0d0", c256 = 110 }
 [role]
@@ -29,6 +30,27 @@ healthy = { hex = "#a3be8c", c256 = 144 }
 needs_you = { hex = "#ebcb8b", c256 = 222 }
 terminal = { hex = "#bf616a", c256 = 131 }
 quiet = { hex = "#4c566a", c256 = 240 }
+
+# The ANSI-16 mapping: Nord's published terminal scheme. Nord repeats
+# entries 9..13 verbatim; here they are lifted toward white so all
+# sixteen stay pairwise distinct. Fallbacks are the literal ANSI index.
+[palette]
+0 = { hex = "#3b4252", c256 = 0 }  # nord1
+1 = { hex = "#bf616a", c256 = 1 }
+2 = { hex = "#a3be8c", c256 = 2 }
+3 = { hex = "#ebcb8b", c256 = 3 }
+4 = { hex = "#81a1c1", c256 = 4 }
+5 = { hex = "#b48ead", c256 = 5 }
+6 = { hex = "#88c0d0", c256 = 6 }
+7 = { hex = "#e5e9f0", c256 = 7 }  # nord5
+8 = { hex = "#4c566a", c256 = 8 }  # nord3
+9 = { hex = "#c7747c", c256 = 9 }
+10 = { hex = "#aec69a", c256 = 10 }
+11 = { hex = "#edd199", c256 = 11 }
+12 = { hex = "#90acc8", c256 = 12 }
+13 = { hex = "#bd9cb7", c256 = 13 }
+14 = { hex = "#8fbcbb", c256 = 14 } # nord7
+15 = { hex = "#eceff4", c256 = 15 } # nord6
 
 # The workspace chrome's grounds: Nord's polar-night steps nord1/nord2.
 [chrome]

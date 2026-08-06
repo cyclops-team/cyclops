@@ -45,21 +45,23 @@ use cyclops_proto::{AgentState, DeliveryState};
 ///
 /// Every token here reaches a screen, either because a renderer names it
 /// or because one of the group mappings below returns it, so editing it
-/// changes what a user sees. The one exception is [`SURFACE_FG`], which the
-/// engine resolves when a renderer asks for a token outside the vocabulary;
-/// no renderer paints it directly. A token nothing paints does not belong
-/// in this list: it would load in silence and do nothing.
+/// changes what a user sees. [`SURFACE_FG`] also doubles as the engine's
+/// fallback when a renderer asks for a token outside the vocabulary. A
+/// token nothing paints does not belong in this list: it would load in
+/// silence and do nothing.
 ///
 /// Deliberately absent: `stream.*`, because the stream's gutter resolves
 /// `surface.dim` like every other detail column and its subjects and
 /// bodies print in the terminal's own foreground, so a second set of
-/// tokens would only let the two surfaces drift; `surface.bg`, because
-/// pane bodies and one-shot commands print onto the terminal's own
-/// background and the alternate screen inherits it. The workspace's
-/// chrome is the one surface that does paint grounds — its tab strip,
-/// pane gutters and highlighted rows — and its text plus two grounds are
-/// the `chrome.*` group below, scoped so no theme mistakes them for a page
-/// palette.
+/// tokens would only let the two surfaces drift.
+///
+/// Grounds belong to the workspace. It paints [`SURFACE_BG`] under pane
+/// bodies (paired with [`SURFACE_FG`], the text color that ground
+/// assumes) and maps the sixteen ANSI colors a pane's program asks for
+/// through [`PALETTE`]; its chrome text plus two grounds are the
+/// `chrome.*` group below. One-shot commands still print onto the
+/// terminal's own background: the CLI has no background emitter, and
+/// that is a contract, not a gap.
 pub mod tokens {
     /// Stable role palette slots. [`crate::role_slot`] hashes an agent
     /// label into this array, so its length and order are part of visual
@@ -68,9 +70,13 @@ pub mod tokens {
         "role.1", "role.2", "role.3", "role.4", "role.5", "role.6", "role.7", "role.8",
     ];
 
-    /// The engine's fallback for an out-of-vocabulary token. Not painted
-    /// by any renderer; see the module doc.
+    /// The pane text: the workspace paints it as the figure on
+    /// [`SURFACE_BG`]. Doubles as the engine's fallback for an
+    /// out-of-vocabulary token.
     pub const SURFACE_FG: &str = "surface.fg";
+    /// The pane ground. Only the workspace paints it, under pane bodies;
+    /// one-shot commands print on the terminal's own background.
+    pub const SURFACE_BG: &str = "surface.bg";
     /// Detail columns, gutters, separators.
     pub const SURFACE_DIM: &str = "surface.dim";
     /// The accent: the marker on the stream's selected entry, and nothing
@@ -116,8 +122,33 @@ pub mod tokens {
     pub const CHROME_PANEL: &str = "chrome.panel";
     pub const CHROME_RAISED: &str = "chrome.raised";
 
+    /// The ANSI-16 mapping the workspace gives a pane's program: the
+    /// color it gets when it asks for 0..15. Content colors the program
+    /// picks, not theme figures, so no contrast floor applies. Shipped
+    /// themes write each fallback as the literal index: the derivation
+    /// never lands on 0..15 because terminals remap them freely, and
+    /// here the index is the meaning.
+    pub const PALETTE: [&str; 16] = [
+        "palette.0",
+        "palette.1",
+        "palette.2",
+        "palette.3",
+        "palette.4",
+        "palette.5",
+        "palette.6",
+        "palette.7",
+        "palette.8",
+        "palette.9",
+        "palette.10",
+        "palette.11",
+        "palette.12",
+        "palette.13",
+        "palette.14",
+        "palette.15",
+    ];
+
     /// Every token, the whole vocabulary. Loaders validate against this.
-    pub const ALL: [&str; 25] = [
+    pub const ALL: [&str; 42] = [
         "role.1",
         "role.2",
         "role.3",
@@ -127,6 +158,7 @@ pub mod tokens {
         "role.7",
         "role.8",
         SURFACE_FG,
+        SURFACE_BG,
         SURFACE_DIM,
         SURFACE_ACCENT,
         EYE_CALM,
@@ -143,6 +175,22 @@ pub mod tokens {
         CHROME_TEXT,
         CHROME_PANEL,
         CHROME_RAISED,
+        "palette.0",
+        "palette.1",
+        "palette.2",
+        "palette.3",
+        "palette.4",
+        "palette.5",
+        "palette.6",
+        "palette.7",
+        "palette.8",
+        "palette.9",
+        "palette.10",
+        "palette.11",
+        "palette.12",
+        "palette.13",
+        "palette.14",
+        "palette.15",
     ];
 }
 
@@ -279,7 +327,7 @@ pub fn role_slot(label: &str) -> usize {
 /// file anywhere. Seeded from the pre-theme CLI palette (style.rs before
 /// M3) and extended to cover the full vocabulary. The shipped themes
 /// override all of it; this is the safety net, not the identity.
-const DEFAULT: [(&str, (u8, u8, u8), u8); 25] = [
+const DEFAULT: [(&str, (u8, u8, u8), u8); 42] = [
     ("role.1", (97, 175, 239), 75),   // blue
     ("role.2", (152, 195, 121), 114), // green
     ("role.3", (198, 120, 221), 176), // violet
@@ -289,6 +337,8 @@ const DEFAULT: [(&str, (u8, u8, u8), u8); 25] = [
     ("role.7", (73, 199, 156), 79),   // mint
     ("role.8", (231, 138, 90), 173),  // orange
     ("surface.fg", (237, 236, 236), 255),
+    // The dark ground the rest of this table assumes: #0d0d0d.
+    ("surface.bg", (13, 13, 13), 232),
     ("surface.dim", (128, 128, 128), 245),
     ("surface.accent", (209, 154, 102), 173),
     ("eye.calm", (128, 128, 128), 245),
@@ -310,6 +360,25 @@ const DEFAULT: [(&str, (u8, u8, u8), u8); 25] = [
     ("chrome.text", (238, 238, 238), 255),
     ("chrome.panel", (26, 26, 26), 234),
     ("chrome.raised", (46, 46, 46), 236),
+    // The ANSI-16 mapping: the One Dark family the role slots above come
+    // from, brights lifted toward white. Fallbacks are the literal index;
+    // see tokens::PALETTE.
+    ("palette.0", (46, 46, 46), 0),
+    ("palette.1", (224, 108, 117), 1),
+    ("palette.2", (152, 195, 121), 2),
+    ("palette.3", (229, 192, 123), 3),
+    ("palette.4", (97, 175, 239), 4),
+    ("palette.5", (198, 120, 221), 5),
+    ("palette.6", (86, 182, 194), 6),
+    ("palette.7", (171, 178, 191), 7),
+    ("palette.8", (92, 99, 112), 8),
+    ("palette.9", (232, 145, 152), 9),
+    ("palette.10", (178, 210, 155), 10),
+    ("palette.11", (236, 208, 156), 11),
+    ("palette.12", (137, 195, 243), 12),
+    ("palette.13", (212, 154, 230), 13),
+    ("palette.14", (128, 200, 209), 14),
+    ("palette.15", (255, 255, 255), 15),
 ];
 
 /// A loaded theme: named token overrides on top of the compiled defaults.
@@ -468,14 +537,8 @@ impl Theme {
     /// `cyclops theme` keeps it out of the listing and refuses it by name;
     /// a row there is an offer to change the colors.
     ///
-    /// [`tokens::SURFACE_FG`] does not count. It is the engine's fallback
-    /// for a token name outside the vocabulary and no renderer asks for
-    /// it (pinned by `surface_fg_stays_the_engines_own_fallback`), so a
-    /// file setting only that one is the same nothing with one line in it.
     pub fn paints_anything(&self) -> bool {
-        self.overrides
-            .keys()
-            .any(|t| t.as_str() != tokens::SURFACE_FG)
+        !self.overrides.is_empty()
     }
 
     /// Resolve a token to its color. Total: file override first, then the
@@ -668,14 +731,13 @@ mod tests {
 
     /// The groups that stayed out. The vocabulary is still exactly what
     /// reaches a screen, so a theme naming a second set of stream colors
-    /// or a background nothing paints must be told, not ignored.
+    /// or a token name the vocabulary retired must be told, not ignored.
     #[test]
     fn tokens_nothing_paints_still_warn() {
         let dead = [
             "stream.gutter",
             "stream.subject",
             "stream.body",
-            "surface.bg",
             // The per-state names the pre-M3 vocabulary carried. Groups
             // replaced them; a theme file that still names one is stale
             // and gets told so rather than silently doing nothing.

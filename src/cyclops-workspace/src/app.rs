@@ -123,6 +123,11 @@ enum AppMsg {
     /// own coalesced refresh is a separate message (`DecorationChanged`)
     /// on the same connection, so this must never gate or delay it.
     StreamEntry(Box<cyclops_ui::Entry>),
+    /// The daemon switched themes (`cyclops theme <name>`), forwarded by
+    /// [`spawn_decoration_forwarder`]'s reader thread. Wake-only, like
+    /// cyclops-ui's `UiMsg::ThemeChanged`: the handler arms the render
+    /// debounce and the reload itself runs on that deadline, before draw.
+    ThemeChanged,
 }
 
 struct App {
@@ -332,6 +337,16 @@ pub async fn run_async() -> i32 {
     // Theme detection prints warnings; do it before the alternate screen
     // swallows them.
     let paint = Paint::detect();
+    // Theme hot reload: a stat re-checked on the render deadline, riding
+    // events that already wake the loop (never a timer; tests/guards.rs).
+    // Only meaningful while color is on. A theme file edited by hand
+    // repaints on the next event; the daemon's "theme" event covers
+    // `cyclops theme <name>` promptly, and that trade is accepted.
+    let mut theme_watch = if paint.colors_enabled() {
+        Some(cyclops_theme::ThemeWatch::new(&home))
+    } else {
+        None
+    };
 
     let guard = match TermGuard::enter() {
         Ok(g) => g,
@@ -505,6 +520,18 @@ pub async fn run_async() -> i32 {
                         app.needs_hydrate = false;
                         hydrate_visible_tab(&client, app.model.active_tab(), &mut app.runtimes)
                             .await;
+                    }
+                    // A theme edit, or a `cyclops theme <name>`, applies on
+                    // this render. A reload the engine refused leaves the
+                    // colors alone and hands back a line for workspace.log:
+                    // stderr is under the alternate screen here.
+                    if let Some(watch) = theme_watch.as_mut() {
+                        if watch.refresh() {
+                            app.paint.theme = watch.theme().clone();
+                        }
+                        for warning in watch.take_warnings() {
+                            log_err(&app.home, &format!("theme: {warning}"));
+                        }
                     }
                     let _ = draw(&mut terminal, &mut app);
                 }
@@ -769,8 +796,11 @@ fn spawn_decoration_forwarder(home: std::path::PathBuf, tx: mpsc::UnboundedSende
             if let Ok(ev) = serde_json::from_value::<cyclops_proto::Event>(value) {
                 // A theme reload is not a fact about the record; the CLI
                 // stream drops it the same way (`cyclops_ui`'s own
-                // subscribe loop). Every other vocabulary, known or not,
-                // still becomes an entry (unknown kinds render as
+                // subscribe loop). It still becomes a wake-only
+                // `ThemeChanged`: the decoration signal below only
+                // repaints when a status fetch lands, and a theme switch
+                // must repaint either way. Every other vocabulary, known
+                // or not, still becomes an entry (unknown kinds render as
                 // `Other` rather than being dropped).
                 if ev.event != "theme" {
                     let entry = cyclops_ui::Entry::from_event(&ev, now_ms());
@@ -780,6 +810,8 @@ fn spawn_decoration_forwarder(home: std::path::PathBuf, tx: mpsc::UnboundedSende
                     {
                         return;
                     }
+                } else if stream_tx.send(AppMsg::ThemeChanged).is_err() {
+                    return;
                 }
             }
             if sig_tx.send(DecorationSignal::Event).is_err() {
@@ -1166,6 +1198,9 @@ async fn handle_app_msg(
             crate::event_record::live(&mut app.record, &mut app.intake, *entry);
             arm(debounce);
         }
+        // Wake-only: the reload itself runs on the render deadline this
+        // arms (the theme_watch refresh in `run_async`).
+        AppMsg::ThemeChanged => arm(debounce),
         AppMsg::Mouse(mouse) => {
             // Bare motion only matters while a menu or dialog shows hover
             // highlights — or over the sidebar's create button, the one
@@ -2406,6 +2441,65 @@ mod tests {
             changed, 1,
             "exactly one DecorationChanged should reach the app per coalesced burst"
         );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A daemon "theme" event must reach the app as the wake-only
+    /// `ThemeChanged`, never as a stream entry: the record mirrors
+    /// `cyclops watch`, which drops theme switches the same way.
+    #[test]
+    fn a_theme_event_wakes_the_app_without_entering_the_record() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
+
+        let home = cyclops_proto::scratch::scratch_dir("workspace-theme-event");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("scratch home");
+        let listener =
+            UnixListener::bind(home.join(cyclops_proto::SOCK_NAME)).expect("bind fake daemon");
+
+        std::thread::spawn(move || {
+            // The persistent subscribe connection: hello, read the
+            // subscribe request, then one theme event. Later connections
+            // (the coalesced status fetch) are dropped unanswered; the
+            // refresh closure treats that as doubt and sends nothing.
+            let (stream, _) = listener.accept().expect("subscribe connection");
+            let mut reader = std::io::BufReader::new(stream);
+            reader
+                .get_mut()
+                .write_all(b"{\"cyclops\":\"0.1.0\",\"proto\":1,\"boot_id\":\"b\"}\n")
+                .expect("hello");
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("subscribe request");
+            let _ = reader
+                .get_mut()
+                .write_all(b"{\"event\":\"theme\",\"data\":{\"name\":\"aurora\"}}\n");
+            for stream in listener.incoming().flatten() {
+                drop(stream);
+            }
+        });
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        spawn_decoration_forwarder(home.clone(), tx);
+
+        // Bounded polling in test code only (rule 9's documented
+        // exception), never in the forwarder itself.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut woke = 0;
+        let mut entries = 0;
+        while woke == 0 && std::time::Instant::now() < deadline {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    AppMsg::ThemeChanged => woke += 1,
+                    AppMsg::StreamEntry(_) => entries += 1,
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(woke, 1, "a theme event must wake the app exactly once");
+        assert_eq!(entries, 0, "a theme event must never become a stream entry");
 
         let _ = std::fs::remove_dir_all(&home);
     }

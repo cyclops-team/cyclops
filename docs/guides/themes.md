@@ -66,6 +66,9 @@ mapped onto the same vocabulary: `catppuccin` (Mocha), `tokyo-night`,
 `nord`, `gruvbox`; each names its upstream project (all MIT) at the top
 of its file. `cyclops start` seeds all seven into `~/.cyclops/themes`
 and never rewrites one you edited.
+A home seeded before `surface.bg` and `palette` existed keeps working:
+those tokens resolve from the compiled defaults until you delete the
+file and run `cyclops start` to reseed, or add them by hand.
 
 Two other ways to choose, for a config you maintain by hand and for one
 run:
@@ -89,24 +92,20 @@ names only some tokens falls back to that table for the rest.
 
 ## Tokens
 
-24 tokens change what you see:
+42 tokens change what you see:
 
 | Group | Tokens | Used for |
 |---|---|---|
 | `role` | `1`..`8` | Stable per-agent colors; a label hashes to a slot |
+| `surface` | `fg` | The pane text the workspace paints on `surface.bg`; `surface.fg` doubles as the engine's fallback for a token name outside this list |
+| `surface` | `bg` | The pane ground: the workspace paints it under every agent pane; one-shot commands still print on the terminal's own background |
 | `surface` | `dim` | Detail columns, gutters, separators, every dimmed qualifier |
 | `surface` | `accent` | The marker on the row a surface is pointing at: the selected entry in `watch`, the active theme in `cyclops theme`, the workspace's focused-pane ring |
 | `eye` | `calm` `alert` | The eye, in both the `status` and `watch` headers: calm closed, alert open |
 | `state` | `healthy` `needs_you` `terminal` `quiet` `dead` | Agent state cells, by group, including on pane borders |
 | `badge` | `healthy` `needs_you` `terminal` `quiet` | Delivery badges, the same groups read on a delivery |
 | `chrome` | `text` `panel` `raised` | The workspace chrome palette: explicit `text` on `panel` under the tab strip, pane gutters and menus; `raised` under the active tab, active workspace row, hovered menu items and selected text |
-
-One more token exists and is worth knowing about. `surface.fg` is the
-engine's fallback for a token name outside this list, which only a bug
-produces. No renderer paints it, so editing it changes nothing on screen.
-The shipped themes set it anyway, because it names their text color. It
-does not count as a theme setting a color, so a file that sets it and
-nothing else is treated as [a file that sets nothing](#file-format).
+| `palette` | `0`..`15` | The ANSI-16 mapping for pane content: the color a pane's program gets when it asks for terminal colors 0..15 |
 
 ## What the colors mean
 
@@ -148,9 +147,10 @@ are the ones the accessibility guidelines for the web use (WCAG 2.1,
 measured on relative luminance in sRGB), because they are the only
 published bar for "can a person read this".
 
-Each shipped theme's file header states the ground it assumes and the
-ratio every token clears against it. The bars below are the bars, not a
-summary of them: `shipped_themes_meet_their_stated_contrast` in
+Each shipped theme's file header states its ground, the `surface.bg` it
+ships, and the ratio every token clears against it. The bars below are
+the bars, not a summary of them:
+`shipped_themes_meet_their_stated_contrast` in
 `src/cyclops-theme/tests/shipped.rs` measures every color against them,
 and `the_published_bars_are_the_bars_that_get_measured` fails the build if
 this table and that test stop agreeing. A retuned color that drops below
@@ -158,19 +158,24 @@ what is published here fails too.
 
 | Theme | Ground | Every token clears | Except |
 |---|---|---|---|
-| `dark` | `#0d0d0d`, the site's terminal panel | 4.3:1 | `state.dead`, 2.8:1 |
-| `light` | `#fefefe`, the site's paper | 3.6:1 | `state.dead`, 2.8:1 |
-| `high-contrast` | `#000000`, the terminal's own black | 7:1, WCAG AAA for body text | nothing |
+| `dark` | `#0d0d0d`, its `surface.bg` | 4.3:1 | `state.dead`, 2.8:1 |
+| `light` | `#fefefe`, its `surface.bg` | 3.6:1 | `state.dead`, 2.8:1 |
+| `high-contrast` | `#000000`, its `surface.bg` | 7:1, WCAG AAA for body text | nothing |
 
 Every number is a floor. `state.dead` gets its own because it is
 deliberately the hardest cell to read: it marks a pane whose process is
 gone, and there is nothing to do about one. Both exceptions measure
 2.82:1 against their ground.
 
-The two `chrome` grounds are backgrounds, not figures, so they are not
-held to the figure floor. Their bar, measured by the same test, is that
-`chrome.text` stays readable on both grounds at the theme's floor, and
-that the grounds stay different in truecolor and 256-color terminals.
+`surface.bg` and the two `chrome` grounds are backgrounds, not figures,
+so they are not held to the figure floor. The chrome bar, measured by
+the same test, is that `chrome.text` stays readable on both grounds at
+the theme's floor, and that the grounds stay different in truecolor and
+256-color terminals.
+
+`palette.*` has no bar at all: palette entries are content colors the
+running program picks, so the theme only supplies the mapping
+(`palette.0` on a dark ground could never clear a floor).
 
 ## What is not themeable
 
@@ -179,15 +184,16 @@ There are no `stream.*` tokens. The stream's gutter resolves
 print in the terminal's own foreground, so tuning `surface.dim` moves the
 CLI and the stream together instead of letting them drift.
 
-There is no `surface.bg`. Pane bodies and one-shot commands print onto
-the terminal's own background and the full-screen stream inherits it.
-The workspace chrome is the one surface that paints grounds, and its
-palette is the `chrome` group above — scoped so no theme mistakes it for
-a page background.
+`surface.bg` and the `palette` group ground only the workspace: it
+paints `surface.bg` under every agent pane and maps ANSI colors 0..15
+through `palette`. One-shot commands are the surface that stays
+unthemeable here: they print onto the terminal's own background, the
+CLI has no background emitter, and the full-screen stream inherits the
+terminal's ground the same way.
 
-Naming either of them in a theme file warns on stderr and is skipped, and
-so does a per-state token name from before the groups (`state.idle`,
-`badge.attention`):
+Naming a `stream.*` token in a theme file warns on stderr and is
+skipped, and so does a per-state token name from before the groups
+(`state.idle`, `badge.attention`):
 
 ```
 theme: unknown token `stream.gutter` ignored
@@ -211,11 +217,11 @@ compiled defaults; only broken TOML stops the file loading at all. Nothing
 in a theme executes.
 
 That tolerance has one edge, and `cyclops theme` handles it rather than
-letting you fall into it. A file that loads and sets none of the 24 tokens
+letting you fall into it. A file that loads and sets none of the 42 tokens
 that change what you see is not listed and not accepted by name. Empty, a
-`name` and nothing else, every token name stale, and `surface.fg` alone
-all parse cleanly, and every color would still come off the compiled
-table, so choosing one would repaint nothing anywhere:
+`name` and nothing else, and every token name stale all parse cleanly,
+and every color would still come off the compiled table, so choosing one
+would repaint nothing anywhere:
 
 ```
 $ cyclops theme stale
@@ -232,7 +238,9 @@ grayscale ramp (232..255); ties go to the lower level and the cube. The
 base 16 colors are never derived because terminals remap them freely. The
 shipped themes write every fallback out explicitly; the role slots in
 `dark.toml` are hand-tuned where the derivation would collapse two muted
-hues onto one entry, since two roles must never share a color.
+hues onto one entry, since two roles must never share a color. The
+`palette` fallbacks are the literal ANSI index in every theme: a program
+that asked for color N gets entry N on a 256-color terminal.
 
 ## Editing a live theme
 

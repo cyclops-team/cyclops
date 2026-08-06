@@ -4,6 +4,7 @@
 name = "gruvbox"
 [surface]
 fg = { hex = "#ebdbb2", c256 = 223 }
+bg = { hex = "#282828", c256 = 235 } # bg0, the pane ground
 dim = { hex = "#928374", c256 = 245 }
 accent = { hex = "#fabd2f", c256 = 214 }
 [role]
@@ -29,6 +30,27 @@ healthy = { hex = "#b8bb26", c256 = 142 }
 needs_you = { hex = "#fabd2f", c256 = 214 }
 terminal = { hex = "#fb4934", c256 = 167 }
 quiet = { hex = "#928374", c256 = 245 }
+
+# The ANSI-16 mapping: gruvbox dark's published terminal colors, neutral
+# set then bright set. Fallbacks are the literal ANSI index, as in every
+# shipped theme.
+[palette]
+0 = { hex = "#282828", c256 = 0 }  # bg0
+1 = { hex = "#cc241d", c256 = 1 }
+2 = { hex = "#98971a", c256 = 2 }
+3 = { hex = "#d79921", c256 = 3 }
+4 = { hex = "#458588", c256 = 4 }
+5 = { hex = "#b16286", c256 = 5 }
+6 = { hex = "#689d6a", c256 = 6 }
+7 = { hex = "#a89984", c256 = 7 }
+8 = { hex = "#928374", c256 = 8 }
+9 = { hex = "#fb4934", c256 = 9 }
+10 = { hex = "#b8bb26", c256 = 10 }
+11 = { hex = "#fabd2f", c256 = 11 }
+12 = { hex = "#83a598", c256 = 12 }
+13 = { hex = "#d3869b", c256 = 13 }
+14 = { hex = "#8ec07c", c256 = 14 }
+15 = { hex = "#ebdbb2", c256 = 15 } # fg
 
 # The workspace chrome's grounds: gruvbox bg0_s and bg2.
 [chrome]

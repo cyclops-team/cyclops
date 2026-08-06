@@ -9,7 +9,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color as RtColor, Modifier, Style};
 use ratatui::text::Span;
 
 use crate::copy;
@@ -282,6 +282,7 @@ fn paint_pane_slot(
             buf,
             base,
             theme::selection_highlight(paint),
+            paint.pane_palette().as_ref(),
         );
         if slot.focused {
             let cur = runtime.cursor();
@@ -554,6 +555,7 @@ fn paint_pane_cells(
     buf: &mut Buffer,
     base: Style,
     highlight: Style,
+    palette: Option<&[RtColor; 16]>,
 ) {
     let range = selection.map(|sel| {
         if sel.from.row < sel.to.row || (sel.from.row == sel.to.row && sel.from.col <= sel.to.col) {
@@ -568,7 +570,7 @@ fn paint_pane_cells(
         }
         let style = match range {
             Some((from, to)) if in_selection(col, row, from, to) => highlight,
-            _ => super::cell_style(&cell, base),
+            _ => super::cell_style(&cell, base, palette),
         };
         let Some(dst) = buf.cell_mut((area.x + col, area.y + row)) else {
             return;
@@ -686,6 +688,7 @@ mod tests {
                 f.buffer_mut(),
                 theme::pane_cell(&theme),
                 theme::selection_highlight(&theme),
+                theme.pane_palette().as_ref(),
             );
         })
         .unwrap();
@@ -717,6 +720,7 @@ mod tests {
                 f.buffer_mut(),
                 theme::pane_cell(&theme),
                 theme::selection_highlight(&theme),
+                theme.pane_palette().as_ref(),
             );
         })
         .unwrap();
@@ -783,6 +787,160 @@ mod tests {
 
         let buf = paint_bytes(b"\x1b[9mS\x1b[0m", 4, 1);
         assert!(buf[(0, 0)].modifier.contains(Modifier::CROSSED_OUT));
+    }
+
+    // ------------------------------------------------- themed pane ground
+    //
+    // The pane-body color contract (docs/guides/themes.md): with colors on
+    // the body owns its ground (surface.fg on surface.bg) and maps ANSI
+    // 0..15 through the theme's palette; with NO_COLOR nothing themed is
+    // left behind and the program's own colors pass through untouched.
+
+    /// One row exercising every color family the contract covers: unstyled
+    /// text, ANSI-16 fg (SGR 31/91), 256-color fg (38;5;196), reverse
+    /// video, and an ANSI-16 bg (SGR 41). Shared by the colors-on and
+    /// NO_COLOR probes so both read the identical content.
+    fn ground_probe_buffer(paint: &Paint) -> Buffer {
+        let mut rt = crate::runtime::PaneRuntime::new(12, 2);
+        rt.feed(b"ab \x1b[31mR\x1b[0m \x1b[91mB\x1b[0m \x1b[38;5;196mX\x1b[0m \x1b[7mV\x1b[0m \x1b[41mQ\x1b[0m");
+        let backend = TestBackend::new(12, 2);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            paint_pane_cells(
+                &rt,
+                None,
+                f.area(),
+                f.buffer_mut(),
+                theme::pane_cell(paint),
+                theme::selection_highlight(paint),
+                paint.pane_palette().as_ref(),
+            );
+        })
+        .unwrap();
+        term.backend().buffer().clone()
+    }
+
+    #[test]
+    fn pane_content_owns_its_ground_and_maps_ansi16_through_the_theme() {
+        // Truecolor makes the mapping observable: shipped palette
+        // fallbacks are the literal ANSI index by design (tokens::PALETTE),
+        // so in 256-color mode themed Indexed(1) and host Indexed(1)
+        // compare equal and the assertions below would be vacuous.
+        let mut paint = Paint::for_test();
+        paint.truecolor = true;
+        let buf = ground_probe_buffer(&paint);
+        let ground = theme::pane_cell(&paint);
+        let (fg, bg) = (ground.fg.unwrap(), ground.bg.unwrap());
+
+        // The body owns its ground: no cell lets the host show through.
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                assert_ne!(buf[(x, y)].bg, RtColor::Reset, "Reset bg hole at {x},{y}");
+            }
+        }
+        assert_eq!(buf[(0, 0)].fg, fg, "unstyled text wears surface.fg");
+        assert_eq!(buf[(0, 0)].bg, bg, "unstyled text sits on surface.bg");
+
+        let palette = paint.pane_palette().expect("colors on");
+        assert_eq!(buf[(3, 0)].fg, palette[1], "SGR 31 maps through the theme");
+        assert_ne!(buf[(3, 0)].fg, RtColor::Indexed(1), "not the host's red");
+        assert_eq!(buf[(5, 0)].fg, palette[9], "SGR 91 maps the bright half");
+        assert_eq!(buf[(11, 0)].bg, palette[1], "SGR 41 maps the bg half");
+        assert_eq!(
+            buf[(7, 0)].fg,
+            RtColor::Indexed(196),
+            "indices past the ANSI 16 pass through untouched"
+        );
+
+        // Reverse video swaps the pair at emit time: the buffer holds
+        // REVERSED over the themed surface colors, never over Reset.
+        assert!(buf[(9, 0)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(buf[(9, 0)].fg, fg, "reverse swaps the themed fg");
+        assert_eq!(buf[(9, 0)].bg, bg, "reverse swaps the themed bg");
+    }
+
+    #[test]
+    fn no_color_pane_content_keeps_the_hosts_colors_and_none_of_the_themes() {
+        let paint = Paint::without_color_for_test();
+        let buf = ground_probe_buffer(&paint);
+
+        // Every themed cell flips to Reset (rule 11); the one non-Reset bg
+        // is the program's own SGR 41, which passes through as written.
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let expected = if (x, y) == (11, 0) {
+                    RtColor::Indexed(1)
+                } else {
+                    RtColor::Reset
+                };
+                assert_eq!(buf[(x, y)].bg, expected, "bg at {x},{y}");
+            }
+        }
+        assert_eq!(
+            buf[(0, 0)].fg,
+            RtColor::Reset,
+            "unstyled text is the host's"
+        );
+        assert_eq!(buf[(3, 0)].fg, RtColor::Indexed(1), "SGR 31 stays host red");
+        assert_eq!(buf[(5, 0)].fg, RtColor::Indexed(9));
+        assert_eq!(buf[(7, 0)].fg, RtColor::Indexed(196));
+        assert!(buf[(9, 0)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(buf[(9, 0)].fg, RtColor::Reset, "reverse swaps host colors");
+    }
+
+    #[test]
+    fn a_runtimeless_pane_and_the_resize_transient_keep_the_themed_ground() {
+        // No runtime yet (the blank pane before hydration): the fill is
+        // the themed ground, and the whole canvas leaves no Reset holes.
+        let tab = two_pane_tab();
+        let runtimes = RuntimeRegistry::default();
+        let backend = TestBackend::new(40, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let paint = Paint::for_test();
+        term.draw(|f| {
+            let mut hits = HitMap::default();
+            let paused = std::collections::HashSet::new();
+            let dec = DecorationSnapshot::default();
+            let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
+            paint_window(&tab, &runtimes, f.area(), f.buffer_mut(), &paint, &mut ctx);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                assert_ne!(buf[(x, y)].bg, RtColor::Reset, "Reset bg hole at {x},{y}");
+            }
+        }
+        let ground = theme::pane_cell(&paint);
+        assert_eq!(
+            buf[(5, 2)].bg,
+            ground.bg.unwrap(),
+            "a blank pane body sits on surface.bg"
+        );
+
+        // The resize transient: a grid smaller than the slot repaints the
+        // surplus cells with the same ground, not last frame's leftovers.
+        let rt = crate::runtime::PaneRuntime::new(4, 2);
+        let backend = TestBackend::new(8, 4);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            paint_pane_cells(
+                &rt,
+                None,
+                f.area(),
+                f.buffer_mut(),
+                theme::pane_cell(&paint),
+                theme::selection_highlight(&paint),
+                paint.pane_palette().as_ref(),
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        for (x, y) in [(6u16, 1u16), (2, 3), (7, 3)] {
+            assert_eq!(buf[(x, y)].symbol(), " ", "surplus cell at {x},{y}");
+            assert_eq!(buf[(x, y)].fg, ground.fg.unwrap());
+            assert_eq!(buf[(x, y)].bg, ground.bg.unwrap());
+        }
     }
 
     #[test]
@@ -1061,15 +1219,24 @@ mod tests {
         })
         .unwrap();
         let buf = term.backend().buffer();
-        let mut saw_highlight = false;
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                if buf[(x, y)].bg != RtColor::Reset {
-                    saw_highlight = true;
-                }
-            }
+        // The pane sits one margin cell in from the canvas origin, so the
+        // selection's cols 0..=2 of row 0 land at (1..=3, 1). "Any bg is
+        // set" went vacuous once the pane ground itself carries a bg, so
+        // compare against that ground instead.
+        let ground = theme::pane_cell(&theme).bg.expect("themed pane ground");
+        let highlight = buf[(1, 1)].bg;
+        assert_ne!(
+            highlight, ground,
+            "selection must stand off the themed pane ground"
+        );
+        for x in 1..=3 {
+            assert_eq!(buf[(x, 1)].bg, highlight, "selection spans its range");
         }
-        assert!(saw_highlight, "selection should paint a highlight");
+        assert_eq!(
+            buf[(4, 1)].bg,
+            ground,
+            "cells past the selection keep the pane ground"
+        );
     }
 
     #[test]

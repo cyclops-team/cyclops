@@ -3,7 +3,9 @@
 # Pure white figure and saturated colors picked directly on the xterm-256
 # grid so truecolor and the 256 fallback are the same color on every
 # terminal (each explicit c256 below is the exact grid entry for its hex;
-# the derivation confirms it, nothing is approximated).
+# the derivation confirms it, nothing is approximated). [palette] is the
+# one exception: its fallbacks are the literal ANSI index, because the
+# program asked for color N and terminals remap 0..15 freely.
 #
 # The identity survives as hue: role.1 is sage pushed to full brightness,
 # role.2 is mauve pushed the same way, and the other six slots keep the
@@ -12,8 +14,8 @@
 # black.
 #
 # CONTRAST. Checked pair: every token in the vocabulary against #000000.
-# That ground is the terminal's own black, because this file sets no
-# background (see below), and a high-contrast terminal is on black.
+# That ground is surface.bg, pure black: a high-contrast terminal is on
+# black, and the workspace paints it under pane bodies.
 # Measured as WCAG 2.1 relative luminance in sRGB, ratio
 # (lighter + 0.05) / (darker + 0.05); the arithmetic is in
 # src/cyclops-theme/tests/shipped.rs and every number below is pinned
@@ -41,14 +43,19 @@
 #
 # There is no [stream] table, for the reason written out in dark.toml:
 # the stream's gutter resolves surface.dim like every other detail column.
-# There is no surface.bg either: pane bodies never paint a ground, so
-# this theme assumes the terminal's own black. The [chrome] pair is the
-# workspace chrome's own two grounds, both exact grid grays.
+# surface.bg is the ground the workspace paints under pane bodies, black
+# so a pane body reads the same as the terminal around it; one-shot
+# commands still print on the terminal's own background. The [chrome]
+# pair is the workspace chrome's own two grounds, both exact grid grays.
+# The [palette] entries are content colors the running program picks, so
+# no contrast bar applies to them; all sixteen are exact grid entries in
+# truecolor even though their fallbacks are the indices.
 
 name = "high-contrast"
 
 [surface]
 fg = { hex = "#ffffff", c256 = 231 }
+bg = { hex = "#000000", c256 = 16 }
 dim = { hex = "#bcbcbc", c256 = 250 }
 accent = { hex = "#ffff00", c256 = 226 }
 
@@ -78,6 +85,26 @@ healthy = { hex = "#00d700", c256 = 40 }
 needs_you = { hex = "#ffaf00", c256 = 214 }
 terminal = { hex = "#ff5f5f", c256 = 203 }
 quiet = { hex = "#bcbcbc", c256 = 250 }
+
+# The ANSI-16 mapping for pane content: saturated grid entries, black
+# kept black because programs draw with it on their own grounds.
+[palette]
+0 = { hex = "#000000", c256 = 0 }
+1 = { hex = "#d70000", c256 = 1 }
+2 = { hex = "#00d700", c256 = 2 }
+3 = { hex = "#ffaf00", c256 = 3 }
+4 = { hex = "#5fafff", c256 = 4 }
+5 = { hex = "#d700d7", c256 = 5 }
+6 = { hex = "#00d7d7", c256 = 6 }
+7 = { hex = "#d0d0d0", c256 = 7 }
+8 = { hex = "#6c6c6c", c256 = 8 }
+9 = { hex = "#ff5f5f", c256 = 9 }
+10 = { hex = "#5fff5f", c256 = 10 }
+11 = { hex = "#ffff00", c256 = 11 }
+12 = { hex = "#87d7ff", c256 = 12 }
+13 = { hex = "#ff5fff", c256 = 13 }
+14 = { hex = "#5fffff", c256 = 14 }
+15 = { hex = "#ffffff", c256 = 15 }
 
 [chrome]
 text = { hex = "#ffffff", c256 = 231 }

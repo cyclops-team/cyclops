@@ -65,11 +65,14 @@ fn entry_row_style(kind: &EntryKind, paint: &Paint) -> Style {
         // The daemon's own ping at a human: the eye's alert token, not a
         // state or badge group.
         EntryKind::Notify { .. } => theme::attention_eye(paint),
+        // Plain body rows: chrome text on the panel's own raised ground,
+        // never the terminal's foreground, which a themed ground could
+        // render unreadable on a light host.
         EntryKind::Msg { .. }
         | EntryKind::Gate { .. }
         | EntryKind::Session { .. }
         | EntryKind::PaneGone { .. }
-        | EntryKind::Other { .. } => theme::sidebar_row(paint),
+        | EntryKind::Other { .. } => theme::menu_row(paint),
     }
 }
 
@@ -279,18 +282,35 @@ mod tests {
         assert!(text.contains(&word), "{text:?}");
     }
 
-    /// Rule 11, mechanically: turn color off and read the same line. The
+    /// Rule 11, mechanically: turn color off and read the same lines. The
     /// event panel's rows carry their glyph and word regardless of
     /// `paint.colors_enabled`; only the `Style` painted over them changes.
+    /// The plain body row also proves the themed side of the contract:
+    /// chrome text on the panel ground, never the terminal's foreground.
     #[test]
     fn event_panel_rows_read_the_same_with_color_off() {
         let mut record = Record::new();
+        // A short target keeps the state line inside the panel's 39-column
+        // inner width, so each entry is exactly one rendered row.
         record.live(state_entry(
             1_000,
-            "reviewer",
+            "rev",
             "%1",
             cyclops_proto::AgentState::BlockedPermission,
         ));
+        record.live(Entry {
+            uid: 0,
+            ts: 2_000,
+            seq: None,
+            id: None,
+            kind: EntryKind::Msg {
+                from: "reviewer".into(),
+                to: vec!["admin".into()],
+                subject: "ping".into(),
+                body: None,
+                fyi: false,
+            },
+        });
 
         let render_with = |paint: &Paint| -> ratatui::buffer::Buffer {
             let backend = TestBackend::new(40, 6);
@@ -302,24 +322,35 @@ mod tests {
             term.backend().buffer().clone()
         };
 
-        let colored = render_with(&Paint::for_test());
+        let paint = Paint::for_test();
+        let colored = render_with(&paint);
         let plain = render_with(&Paint::without_color_for_test());
         assert_eq!(
             flatten(&colored),
             flatten(&plain),
             "the words and glyphs must not depend on color"
         );
-        // Column 0 is the panel's left border; the row text itself starts
-        // one cell in.
+        // Column 0 is the panel's left border and row 0 its title; the
+        // state entry renders on row 1, the message on row 2.
         assert_ne!(
-            colored[(1, 0)].fg,
+            colored[(1, 1)].fg,
             RtColor::Reset,
-            "color on must actually paint the row"
+            "color on must actually paint the state row"
         );
         assert_eq!(
-            plain[(1, 0)].fg,
+            colored[(1, 2)].fg,
+            theme::menu_row(&paint).fg.expect("chrome text color"),
+            "a plain body row wears chrome text, not the terminal's own"
+        );
+        assert_eq!(
+            plain[(1, 1)].fg,
             RtColor::Reset,
             "NO_COLOR must leave no color behind"
+        );
+        assert_eq!(
+            plain[(1, 2)].fg,
+            RtColor::Reset,
+            "NO_COLOR must leave the plain row uncolored too"
         );
     }
 

@@ -2,7 +2,8 @@
 //! cover the whole vocabulary, keep role fallbacks distinct, and their
 //! explicit 256-color fallbacks in the three base themes match the
 //! documented derivation wherever the files do not declare hand-tuning
-//! (the role slots). Branded themes keep their curated xterm mappings.
+//! (the role slots, and the palette, whose fallbacks are the ANSI
+//! indices themselves). Branded themes keep their curated xterm mappings.
 //! The high-contrast theme is additionally held to WCAG AA, which is the
 //! only promise it makes that a reader cannot check by looking. Two tests
 //! here pin docs/guides/themes.md instead of the files: the token table, because
@@ -72,13 +73,15 @@ fn shipped_role_fallbacks_are_pairwise_distinct() {
 /// Every non-role fallback is exactly what the derivation would pick, so
 /// the explicit values in the files cannot drift from the algorithm
 /// unnoticed. Role slots are exempt: their files declare hand-tuning for
-/// distinctness. A deliberate hand-tune elsewhere updates this test.
+/// distinctness. Palette slots are exempt too: their fallback is the
+/// literal ANSI index, which the derivation refuses to produce. A
+/// deliberate hand-tune elsewhere updates this test.
 #[test]
 fn shipped_non_role_fallbacks_match_the_derivation() {
     for name in DERIVED_FALLBACKS {
         let theme = shipped(name);
         for token in tokens::ALL {
-            if tokens::ROLE.contains(&token) {
+            if tokens::ROLE.contains(&token) || tokens::PALETTE.contains(&token) {
                 continue;
             }
             let c = theme.resolve(token);
@@ -94,13 +97,37 @@ fn shipped_non_role_fallbacks_match_the_derivation() {
 }
 
 /// The high-contrast theme promises grid-exact colors: every value,
-/// role slots included, is its own 256-color entry.
+/// role slots included, is its own 256-color entry. Palette slots are
+/// the one exemption: their fallback is the literal ANSI index.
 #[test]
 fn high_contrast_is_grid_exact() {
     let theme = shipped("high-contrast");
     for token in tokens::ALL {
+        if tokens::PALETTE.contains(&token) {
+            continue;
+        }
         let c = theme.resolve(token);
         assert_eq!(c.c256, derive_c256(c.rgb), "{token} is off the grid");
+    }
+}
+
+/// The sixteen palette entries are one mapping, not sixteen figures, and
+/// a theme that gives two ANSI slots the same color merges every pair of
+/// things a pane's program distinguishes with them.
+#[test]
+fn shipped_palette_entries_are_pairwise_distinct() {
+    for name in SHIPPED {
+        let theme = shipped(name);
+        let entries: Vec<(u8, u8, u8)> = tokens::PALETTE
+            .iter()
+            .map(|t| theme.resolve(t).rgb)
+            .collect();
+        for (i, a) in entries.iter().enumerate() {
+            assert!(
+                !entries[i + 1..].contains(a),
+                "{name}: duplicate palette color {a:?} in {entries:?}"
+            );
+        }
     }
 }
 
@@ -128,9 +155,10 @@ fn contrast(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
 struct Claim {
     theme: &'static str,
     /// The background the file was drawn on and says so: the site's
-    /// `--term-bg` for dark, its `--paper` for light, the terminal's own
-    /// black for high-contrast. No theme sets `surface.bg`, so this is an
-    /// assumption stated in the file, not something Cyclops paints.
+    /// `--term-bg` for dark, its `--paper` for light, pure black for
+    /// high-contrast. Each theme now ships it as `surface.bg`, so the
+    /// measurement below runs against the theme's own resolved ground
+    /// and asserts it still equals this stated one.
     ground: (u8, u8, u8),
     /// The floor every token clears.
     floor: f64,
@@ -170,10 +198,24 @@ fn shipped_themes_meet_their_stated_contrast() {
     for claim in CONTRAST {
         let name = claim.theme;
         let theme = shipped(name);
+        // The measured ground is the theme's own surface.bg, and it has
+        // to be the one the header (and the docs table) state.
+        let ground = theme.resolve(tokens::SURFACE_BG).rgb;
+        assert_eq!(
+            ground, claim.ground,
+            "{name}: surface.bg is not the ground its header states"
+        );
         for token in tokens::ALL {
             // Chrome is measured as text on its painted grounds below;
             // measuring either ground as a figure would force it light.
-            if token.starts_with("chrome.") {
+            // surface.bg is the ground itself, not a figure on it.
+            if token.starts_with("chrome.") || token == tokens::SURFACE_BG {
+                continue;
+            }
+            // Palette entries are content colors the running program
+            // picks; the theme only supplies the mapping, and palette.0
+            // on a dark ground could never clear a floor.
+            if tokens::PALETTE.contains(&token) {
                 continue;
             }
             let bar = if token == tokens::STATE_DEAD {
@@ -181,13 +223,13 @@ fn shipped_themes_meet_their_stated_contrast() {
             } else {
                 claim.floor
             };
-            let ratio = contrast(theme.resolve(token).rgb, claim.ground);
+            let ratio = contrast(theme.resolve(token).rgb, ground);
             assert!(
                 ratio >= bar,
                 "{name}: {token} {:?} measures {ratio:.2}:1 on {:?}, under the \
                  {bar}:1 its header states",
                 theme.resolve(token).rgb,
-                claim.ground
+                ground
             );
         }
         // The grounds' own contract: body text painted on the raised
@@ -308,9 +350,7 @@ fn the_docs_token_table_matches_the_vocabulary() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/guides/themes.md");
     let doc = std::fs::read_to_string(&path).expect("docs/guides/themes.md");
 
-    // surface.fg is in the vocabulary but no renderer paints it, so the
-    // page counts the tokens whose edits are actually visible.
-    let visible = tokens::ALL.len() - 1;
+    let visible = tokens::ALL.len();
     let claim = format!("{visible} tokens change what you see");
     assert!(
         doc.contains(&claim),
@@ -332,18 +372,18 @@ fn the_docs_token_table_matches_the_vocabulary() {
         "docs/guides/themes.md has no token table"
     );
     let table = table.join("\n");
-    for group in ["role", "surface", "eye", "state", "badge", "chrome"] {
+    for group in [
+        "role", "surface", "eye", "state", "badge", "chrome", "palette",
+    ] {
         assert!(
             table.contains(group),
             "docs/guides/themes.md drops `{group}`"
         );
     }
-    for gone in ["stream", "surface.bg"] {
-        assert!(
-            !table.contains(gone),
-            "docs/guides/themes.md still offers `{gone}`:\n{table}"
-        );
-    }
+    assert!(
+        !table.contains("stream"),
+        "docs/guides/themes.md still offers `stream`:\n{table}"
+    );
     // Every group token by name, so a group renamed or added in the
     // vocabulary cannot leave the page describing the old set.
     for token in tokens::ALL {

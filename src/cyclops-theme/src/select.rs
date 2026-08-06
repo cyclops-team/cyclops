@@ -382,7 +382,9 @@ mod tests {
     /// values do not matter and one hex keeps the fixtures readable.
     fn whole(hex: &str) -> String {
         let mut out = String::from("name = \"dark\"\n");
-        for group in ["role", "surface", "eye", "state", "badge"] {
+        for group in [
+            "role", "surface", "eye", "state", "badge", "chrome", "palette",
+        ] {
             out.push_str(&format!("[{group}]\n"));
             for token in tokens::ALL {
                 let (g, key) = token.split_once('.').expect("group.key");

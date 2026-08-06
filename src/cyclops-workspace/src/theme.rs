@@ -50,6 +50,13 @@ impl Paint {
         }
     }
 
+    /// Whether tokens resolve to colors at all. Gates the theme
+    /// hot-reload watch in the app loop: with colors off there is
+    /// nothing a reload could repaint.
+    pub fn colors_enabled(&self) -> bool {
+        self.colors_enabled
+    }
+
     pub fn style_token(&self, token: &str) -> Style {
         if !self.colors_enabled {
             return Style::new();
@@ -82,6 +89,16 @@ impl Paint {
     /// former state belongs to.
     pub fn delivery(&self, state: cyclops_proto::DeliveryState) -> Style {
         self.style_token(cyclops_theme::delivery_token(state))
+    }
+
+    /// The ANSI-16 colors handed to pane content: what a program gets
+    /// when it asks for 0..15. `None` with colors off, so the host's own
+    /// palette shows through untouched.
+    pub fn pane_palette(&self) -> Option<[RtColor; 16]> {
+        if !self.colors_enabled {
+            return None;
+        }
+        Some(tokens::PALETTE.map(|token| rt_color(self.theme.resolve(token), self.truecolor)))
     }
 }
 
@@ -238,9 +255,13 @@ pub fn dialog_error(paint: &Paint) -> Style {
         .patch(paint.bg_token(tokens::CHROME_RAISED))
 }
 
-/// Pane body uses the terminal's own foreground; see docs/guides/themes.md.
-pub fn pane_cell(_paint: &Paint) -> Style {
-    Style::new()
+/// The pane ground: surface.fg on surface.bg. Pane bodies own their
+/// colors now instead of inheriting the terminal's; see
+/// docs/guides/themes.md.
+pub fn pane_cell(paint: &Paint) -> Style {
+    paint
+        .style_token(tokens::SURFACE_FG)
+        .patch(paint.bg_token(tokens::SURFACE_BG))
 }
 
 pub fn attention_eye(paint: &Paint) -> Style {
@@ -266,6 +287,8 @@ mod tests {
         let paint = Paint::without_color_for_test();
         assert_eq!(chrome_panel(&paint), Style::new());
         assert_eq!(pane_border_focused(&paint), Style::new());
+        assert_eq!(pane_cell(&paint), Style::new());
+        assert!(paint.pane_palette().is_none());
         assert_eq!(
             menu_row_hover(&paint),
             Style::new().add_modifier(Modifier::REVERSED)

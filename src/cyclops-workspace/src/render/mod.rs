@@ -135,12 +135,12 @@ fn overlay_text(buf: &mut Buffer, bounds: Rect, x: u16, y: u16, text: &str, styl
     buf.set_stringn(x, y, text, width, style);
 }
 
-fn cell_style(cell: &GridCell, base: Style) -> Style {
+fn cell_style(cell: &GridCell, base: Style, palette: Option<&[RtColor; 16]>) -> Style {
     let mut style = base;
-    if let Some(fg) = rt_color(cell.attrs.fg) {
+    if let Some(fg) = rt_color(cell.attrs.fg, palette) {
         style = style.fg(fg);
     }
-    if let Some(bg) = rt_color(cell.attrs.bg) {
+    if let Some(bg) = rt_color(cell.attrs.bg, palette) {
         style = style.bg(bg);
     }
     if cell.attrs.bold {
@@ -167,10 +167,16 @@ fn cell_style(cell: &GridCell, base: Style) -> Style {
     style
 }
 
-fn rt_color(c: Color) -> Option<RtColor> {
+fn rt_color(c: Color, palette: Option<&[RtColor; 16]>) -> Option<RtColor> {
     match c {
+        // The themed pane ground wins where the program set nothing.
         Color::Default => None,
-        Color::Indexed(i) => Some(RtColor::Indexed(i)),
+        // ANSI 0..15 map through the theme's palette when one is on;
+        // 16..255 and the paletteless path stay the host's own.
+        Color::Indexed(i) => Some(match palette {
+            Some(p) if usize::from(i) < p.len() => p[usize::from(i)],
+            _ => RtColor::Indexed(i),
+        }),
         Color::Rgb(r, g, b) => Some(RtColor::Rgb(r, g, b)),
     }
 }
