@@ -327,6 +327,8 @@ async fn sustained_output_backlog_drains_continuously() {
 /// requires. The stall's own length is therefore test scaffolding, not a
 /// measurement; `pause_to_continue` (the reader's auto-resume round trip,
 /// `control.rs`'s `%pause` handler) and the rehydrate call after it are.
+/// The flood is confirmed flowing before the stall, because tmux only emits
+/// `%pause` when data is queued while the reader has genuinely stopped.
 #[tokio::test]
 async fn flow_control_pause_and_resume() {
     let Some(rig) = Rig::new("perf-flow") else {
@@ -344,11 +346,25 @@ async fn flow_control_pause_and_resume() {
 
     rig.server
         .run_ok(&["send-keys", "-t", "%0", "yes flood", "Enter"]);
+    // Proof the flood is flowing before the stall; on a loaded runner the
+    // pane shell can start late, and stalling before any output exists means
+    // no queued block ever ages past pause-after.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match notif.recv().await {
+                Some(Notification::Output { .. } | Notification::ExtendedOutput { .. }) => break,
+                Some(_) => {}
+                None => panic!("connection closed before the flood produced output"),
+            }
+        }
+    })
+    .await
+    .expect("the flood never produced output before the stall");
     // The stall (see the doc above): block the executor reader_task runs
     // on, so tmux's own pause-after clock — which needs a reader that has
     // genuinely stopped, not just a slow one — has something real to fire
     // against.
-    std::thread::sleep(Duration::from_secs(2));
+    std::thread::sleep(Duration::from_secs(3));
 
     let paused_pane = tokio::time::timeout(Duration::from_secs(5), async {
         loop {

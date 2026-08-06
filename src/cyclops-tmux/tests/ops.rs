@@ -203,11 +203,14 @@ async fn split_opens_in_the_source_panes_directory_not_the_sessions() {
     };
     let session_dir = scratch("cyclops-ops-session-dir");
     let pane_dir = scratch("cyclops-ops-pane-dir");
+    // Named window: an unnamed /bin/sh window auto-renames to "sh", which bare `-t s` prefix-matches.
     srv.tmux_ok(&[
         "new-session",
         "-d",
         "-s",
         "s",
+        "-n",
+        "root",
         "-x",
         "120",
         "-y",
@@ -219,10 +222,13 @@ async fn split_opens_in_the_source_panes_directory_not_the_sessions() {
     // A window rooted somewhere else: its pane's path is the only thing
     // that distinguishes `-c #{pane_current_path}` from tmux's default,
     // which is the session's directory.
+    // `s:` is the session-typed target; bare `-t s` would prefix-match an auto-renamed window.
     srv.tmux_ok(&[
         "new-window",
         "-t",
-        "s",
+        "s:",
+        "-n",
+        "work",
         "-c",
         pane_dir.to_str().expect("UTF-8 scratch path"),
         "/bin/sh",
@@ -371,7 +377,8 @@ async fn rename_window_targets_the_id_not_the_current_window() {
     };
     srv.new_session("s");
     // The second window is current, so an untargeted rename would hit it.
-    srv.tmux_ok(&["new-window", "-t", "s", "-n", "active", "/bin/sh"]);
+    // `s:` is the session-typed target; bare `-t s` prefix-matches window 0's auto-renamed "sh" name.
+    srv.tmux_ok(&["new-window", "-t", "s:", "-n", "active", "/bin/sh"]);
     let first = lines(&srv, &["list-windows", "-t", "s", "-F", "#{window_id}"])[0].clone();
     let (client, _n) = ControlClient::spawn(srv.config("s")).await.expect("spawn");
 
