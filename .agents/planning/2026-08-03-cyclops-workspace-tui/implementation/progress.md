@@ -3,10 +3,10 @@
 Two phases. The first run (2026-08-05) implemented the recommendation's
 full dependency graph (G0 → foundation → core → integration → S1 → Q1 →
 M1 → F2 → Q2) and its record is preserved below. A post-implementation
-review (`review-findings.md`, committed at `bfc00cb`) then found six
-gaps; the follow-up run (2026-08-06) fixed five of them and landed the
-sixth partially before an externally imposed budget stop. This file is
-the accurate record of where things stand.
+review (`review-findings.md`, committed at `bfc00cb`) found six gaps. The
+current follow-up resolves findings 1–5; finding 6 remains explicitly
+externally blocked under its accepted completion condition. This top section
+is the current handoff; the historical record below remains as written.
 
 ## Review follow-up: finding-by-finding
 
@@ -15,9 +15,9 @@ the accurate record of where things stand.
 | 1. Rendering loses visual information | **Fixed.** Zero-width chars (combining marks, VS16) now reach the painted buffer via `set_symbol`; cursor SHAPE+blink forwarded to the host terminal (DECSCUSR) and restored on every exit path; underline variants remain narrowed to `UNDERLINED` — Ratatui's `Modifier` cannot express double/curl/dotted/dashed — with the narrowing documented and pinned by buffer-boundary tests. Grapheme tests failed against the pre-fix code ("e" vs "e\u{301}") and pass now. | `97d01f0`, `57019a8` |
 | 2. Event panel not on the real watch stream | **Fixed.** New seam `cyclops-workspace/src/event_record.rs` applies watch's exact contract (replayed ledger tail of 200 lines, then status seed, then live, with seq dedup) via the already-public `cyclops_ui::{Intake, read_backfill}`; boot and the `StreamEntry` arm go through it. The parity test now drives this production seam against a verbatim replica of `plain.rs`'s arms; startup-race and seq-dup regression tests live in the module. (These tests do not compile at `fc1a810` — the seam did not exist; the defect was the path's absence.) | `87ec2a5` |
 | 3. Newest event could be clipped | **Fixed.** The panel windows the last `height` RENDERED lines (display-width hard wrap, newest-first accumulation, bottom-trim), not the last `height` entries. New tests failed pre-fix with the newest entry absent from the buffer. | `a1aedb6` |
-| 4. Broken/stale migration paths | **Fixed.** Both demos repaired and RUN green on isolated tmux; every cited doc/summary/website path fixed plus sweep hits; history-narrating text left as written; doc-paths gate + selftest green. | `aeb4d34` |
-| 5. Performance contract partially measured | **Mostly fixed; two scenarios ignored, see below.** | `b77b21c`, `b502690` |
-| 6. Skill's three deferred captures | **Externally blocked, now reported as such** (not silently "complete"): each needs a live hook-wired vendor CLI session no isolated fixture can produce. SKILL.md's closing note states it. | `2cdd1ed` |
+| 4. Broken/stale migration paths | **Fixed.** Both demos repaired and RUN green on isolated tmux; every cited doc/summary/website path fixed plus sweep hits; history-narrating text left as written; doc-paths gate + selftest green. | `aeb4d34`, `24481b2` |
+| 5. Performance contract partially measured | **Fixed.** The flow-control fallback awaits tmux's successful `refresh-client -A <pane>:continue` reply and emits the resume notification when tmux 3.7b omits `%continue`; the pause notification is delivered first and workspace continuation is idempotent. Both formerly ignored performance tests now run and pass. | `b77b21c`, `b502690`, `6da553f` |
+| 6. Skill's three deferred captures | **Externally blocked under the accepted completion condition.** Each needs a live hook-wired vendor CLI session that no isolated fixture can produce; SKILL.md's closing note states this limitation. | `2cdd1ed` |
 
 ## Finding 5: what was measured (2026-08-06, this machine, noisy)
 
@@ -40,59 +40,42 @@ numbers via `--nocapture`:
   back).
 - Full-frame paint, mixed ASCII/wide/SGR: median 0.99ms / 3.89ms /
   7.78ms at 1 / 4 / 8 panes — inside the 8ms debounce at 8 panes.
+- Flow control, five normal runs after the confirmed-resume fallback:
+  pause→continue / continue→rehydrate = 0.30 / 1.33ms, 0.26 / 1.30ms,
+  0.20 / 2.57ms, 0.21 / 2.83ms, and 0.16 / 3.23ms.
 
-## Known failures / not done
+## Remaining external block and final verification
 
-- `flow_control_pause_and_resume` is `#[ignore]`d: tmux delivered
-  `%pause` inconsistently under the induced stall and `%continue` was
-  never observed — reproduced with raw-tmux probes outside the harness,
-  root cause unresolved. Production enables `pause-after=300`
-  unconditionally (`cyclops-tmux/src/control.rs`) and auto-resumes in
-  its reader; only the latency measurement is missing, not the
-  functionality.
-- `quitting_leaves_the_alternate_screen_and_returns_to_a_shell_prompt`
-  is `#[ignore]`d: written and compiling but never yet executed (halt
-  landed before its first run; `target/debug` binaries were stale).
-- The baselines.md "review finding 5" section was NOT written (budget
-  stop); the numbers above and in `b502690`'s message are the record
-  until then. No findings.md entry was written for these measurements.
-- The FULL repository gates have not been re-run since the follow-up
-  commits (each commit ran its targeted tests + crate clippy/fmt +
-  the two cross-crate tripwires, all green). Q2-style gates still to
-  re-run: `cargo test --workspace` (plus relocated `CYCLOPS_TEST_TMP`
-  variant), `tests/e2e/parity-check.sh` (+ `--with-installer`),
-  `scripts/commpact-shim/test_shim.py`, `scripts/check-doc-paths.py`
-  (this one IS green post-`aeb4d34`).
-- Loop-level frame gaps under live output remain unmeasured (private
-  event loop); feed/paint costs above are the proxy. DECSCUSR restore
-  emission is verified by code path + guard, not observed end-to-end
-  (the ignored restoration e2e would observe the alternate-screen
-  half).
+- Finding 6's three skill capture blocks remain externally blocked on a live
+  hook-wired vendor CLI session, as accepted and documented in SKILL.md.
+- Both formerly ignored performance tests now run and pass:
+  `flow_control_pause_and_resume` uses the confirmed-resume fallback, and
+  `quitting_leaves_the_alternate_screen_and_returns_to_a_shell_prompt` passed
+  against freshly rebuilt debug binaries.
+- The complete repository gates are green on the final follow-up tree:
 
-## Uncommitted files
+  | Gate | Result |
+  |---|---|
+  | `cargo fmt --all -- --check` | clean |
+  | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+  | `cargo test --workspace --no-fail-fast` | green; 0 ignored in `perf_contract` |
+  | Relocated `CYCLOPS_TEST_TMP` full suite | green |
+  | `scripts/check-doc-paths.py --selftest` and normal run | 3 planted paths caught; 28/28 pages clean |
+  | `tests/e2e/parity-check.sh` | 115/115 |
+  | `tests/e2e/parity-check.sh --with-installer` | 131/131 |
+  | `scripts/commpact-shim/test_shim.py` | 42/42 |
 
-None. The tree is clean at `b502690`.
+  One initial normal-suite run hit an isolated tmux window-creation collision,
+  and one initial relocated run reported the performance-contract target.
+  Each target passed immediately alone, both clean full reruns passed, and the
+  full performance-contract binary then passed five consecutive relocated
+  runs. Neither failure reproduced.
 
-## Exact next steps (cold start)
+## Handoff state
 
-1. Re-run the full gates listed above; fix anything they surface.
-   Expect `cargo test --workspace` to run perf_contract's 5 live tests
-   (~6s) and skip the 2 ignored ones.
-2. Rebuild `target/debug/{cyclops,cyclopsd}`, run the restoration e2e
-   alone (`cargo test -p cyclops-workspace --test perf_contract
-   quitting_leaves -- --ignored --nocapture`), and drop its `#[ignore]`
-   once it passes. Sweep for leaked daemons afterwards.
-3. Either root-cause the missing `%continue` (start from the raw-tmux
-   probe result: 2/5 induced stalls produced `%pause`, 0/5 produced
-   `%continue` even with `refresh-client -A pane:continue`) or delete
-   the ignored test and record the "not reliably measurable" verdict.
-4. Write the baselines.md "review finding 5" section from the numbers
-   above (machine-noise caveat applies; the 4/8-pane paint numbers came
-   from the one quiet run — an earlier loaded run was discarded as
-   noise) and a findings.md entry if the measurements merit one.
-5. `review-findings.md`'s completion criteria then close: criterion 3
-   (full gates) is the only one still open; 1/2/4 are satisfied, 5 is
-   this file.
+The review follow-up is complete. Findings 1–5 are resolved, finding 6 is
+explicitly externally blocked under its accepted completion condition, and
+the final tree has no uncommitted follow-up files.
 
 ## Watch out for
 
@@ -174,6 +157,8 @@ accuracy pass. Findings recorded: F38–F41, indexed.
 | Finding 1b: cursor shape reaches the host terminal | `57019a8` |
 | Coalescer seam for the burst measurement | `b77b21c` |
 | Finding 5: perf contract harness (2 scenarios ignored) | `b502690` |
+| Finish website rename metadata | `24481b2` |
+| Finding 5: confirmed flow-control resume and enabled scenarios | `6da553f` |
 
 ## Product decisions preserved (verified in code and tests)
 
