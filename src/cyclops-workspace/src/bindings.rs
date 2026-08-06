@@ -17,6 +17,13 @@ pub enum BindingAction {
     FocusRight,
     FocusUp,
     FocusDown,
+    /// No default chords: the pane context menu reaches these, and the
+    /// keyboard's Shift upgrade of the focus chords covers the common
+    /// case; bindable via config for anyone who wants dedicated keys.
+    SwapPaneLeft,
+    SwapPaneRight,
+    SwapPaneUp,
+    SwapPaneDown,
     SplitRight,
     SplitDown,
     ClosePane,
@@ -31,6 +38,8 @@ pub enum BindingAction {
     CloseWorkspace,
     ToggleEventPanel,
     ShowKeybinds,
+    /// No default chord: reached from the app menu, bindable via config.
+    ShowThemes,
 }
 
 /// One human-readable row in the in-app keybinding reference.
@@ -214,6 +223,10 @@ fn action_from_key(key: &str) -> Option<BindingAction> {
         "focus_right" => Some(BindingAction::FocusRight),
         "focus_up" => Some(BindingAction::FocusUp),
         "focus_down" => Some(BindingAction::FocusDown),
+        "swap_left" => Some(BindingAction::SwapPaneLeft),
+        "swap_right" => Some(BindingAction::SwapPaneRight),
+        "swap_up" => Some(BindingAction::SwapPaneUp),
+        "swap_down" => Some(BindingAction::SwapPaneDown),
         "split_right" => Some(BindingAction::SplitRight),
         "split_down" => Some(BindingAction::SplitDown),
         "close_pane" => Some(BindingAction::ClosePane),
@@ -228,6 +241,7 @@ fn action_from_key(key: &str) -> Option<BindingAction> {
         "close_workspace" => Some(BindingAction::CloseWorkspace),
         "toggle_event_panel" => Some(BindingAction::ToggleEventPanel),
         "show_keybinds" => Some(BindingAction::ShowKeybinds),
+        "show_themes" => Some(BindingAction::ShowThemes),
         s if s.starts_with("tab_") => s
             .strip_prefix("tab_")
             .and_then(|n| n.parse::<usize>().ok())
@@ -319,6 +333,10 @@ fn action_words(action: BindingAction) -> String {
         BindingAction::FocusRight => "Focus pane right".into(),
         BindingAction::FocusUp => "Focus pane above".into(),
         BindingAction::FocusDown => "Focus pane below".into(),
+        BindingAction::SwapPaneLeft => "Swap pane left".into(),
+        BindingAction::SwapPaneRight => "Swap pane right".into(),
+        BindingAction::SwapPaneUp => "Swap pane above".into(),
+        BindingAction::SwapPaneDown => "Swap pane below".into(),
         BindingAction::SplitRight => "Split pane right".into(),
         BindingAction::SplitDown => "Split pane down".into(),
         BindingAction::ClosePane => "Close pane".into(),
@@ -333,6 +351,7 @@ fn action_words(action: BindingAction) -> String {
         BindingAction::CloseWorkspace => "Close workspace".into(),
         BindingAction::ToggleEventPanel => "Toggle event stream".into(),
         BindingAction::ShowKeybinds => "Keybinds".into(),
+        BindingAction::ShowThemes => "Themes".into(),
     }
 }
 
@@ -342,6 +361,10 @@ fn help_rank(action: BindingAction) -> (u8, usize) {
         BindingAction::FocusRight => (11, 0),
         BindingAction::FocusUp => (12, 0),
         BindingAction::FocusDown => (13, 0),
+        BindingAction::SwapPaneLeft => (13, 1),
+        BindingAction::SwapPaneRight => (13, 2),
+        BindingAction::SwapPaneUp => (13, 3),
+        BindingAction::SwapPaneDown => (13, 4),
         BindingAction::SplitRight => (14, 0),
         BindingAction::SplitDown => (15, 0),
         BindingAction::ZoomPane => (16, 0),
@@ -360,7 +383,8 @@ fn help_rank(action: BindingAction) -> (u8, usize) {
         BindingAction::CloseWorkspace => (44, 0),
         BindingAction::ToggleEventPanel => (50, 0),
         BindingAction::ShowKeybinds => (51, 0),
-        BindingAction::Detach => (52, 0),
+        BindingAction::ShowThemes => (52, 0),
+        BindingAction::Detach => (53, 0),
     }
 }
 

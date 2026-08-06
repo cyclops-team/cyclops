@@ -58,6 +58,7 @@ fn dialog_parts(dialog: &Dialog) -> (&str, Option<&str>, Option<&str>, &'static 
             copy::BUTTON_CONFIRM,
         ),
         Dialog::Keybinds { .. } => unreachable!("keybinds uses its own dialog renderer"),
+        Dialog::Themes { .. } => unreachable!("themes uses its own dialog renderer"),
     }
 }
 
@@ -73,6 +74,26 @@ pub fn paint_dialog(
 ) {
     if let Dialog::Keybinds { scroll, rows } = dialog {
         paint_keybinds_dialog(*scroll, rows, area, buf, paint, hits, hover);
+        return;
+    }
+    if let Dialog::Themes {
+        names,
+        selected,
+        active,
+        notice,
+    } = dialog
+    {
+        paint_themes_dialog(
+            names,
+            *selected,
+            *active,
+            notice.as_deref(),
+            area,
+            buf,
+            paint,
+            hits,
+            hover,
+        );
         return;
     }
     let (title, input, hint, confirm_label) = dialog_parts(dialog);
@@ -159,9 +180,20 @@ pub fn paint_dialog(
             .wrap(Wrap { trim: true })
             .render(error_area, buf);
     }
-    // Keyboard-first actions on the last inner row, recorded for the mouse.
-    // Enter confirms every modal and Escape cancels it, so one shape covers
-    // input dialogs and destructive confirms alike.
+    paint_dialog_buttons(buf, inner, paint, hits, hover, confirm_label);
+}
+
+/// Keyboard-first actions on the last inner row, recorded for the mouse.
+/// Enter confirms every modal and Escape cancels it, so one shape covers
+/// input dialogs, destructive confirms, and the theme picker alike.
+fn paint_dialog_buttons(
+    buf: &mut Buffer,
+    inner: Rect,
+    paint: &Paint,
+    hits: &mut HitMap,
+    hover: Option<(u16, u16)>,
+    confirm_label: &str,
+) {
     let button_y = inner.y + inner.height.saturating_sub(1);
     let mut bx = inner.x + 1;
     let buttons = [
@@ -384,6 +416,142 @@ pub fn keybind_max_scroll(row_count: usize, area: Rect) -> u16 {
     u16::try_from(row_count.saturating_sub(list_height as usize)).unwrap_or(u16::MAX)
 }
 
+/// The theme picker: a titled list with the active row marked and the
+/// selected row raised. Applying repaints the whole workspace, so the
+/// rows need no swatch; the CLI's listing is the visual preview. The
+/// active marker is the stream's own "this one" marker, and it rides
+/// beside the selection highlight so the two stay readable without color.
+fn paint_themes_dialog(
+    names: &[String],
+    selected: usize,
+    active: Option<usize>,
+    notice: Option<&str>,
+    area: Rect,
+    buf: &mut Buffer,
+    paint: &Paint,
+    hits: &mut HitMap,
+    hover: Option<(u16, u16)>,
+) {
+    // An empty listing has no rows to explain the hint against; the
+    // notice slot wraps, so the where-themes-come-from line goes there.
+    let notice = if names.is_empty() {
+        Some(copy::THEMES_EMPTY)
+    } else {
+        notice
+    };
+    let width = area.width.saturating_sub(4).min(48);
+    let notice_lines = notice
+        .map(|text| wrapped_line_count(text, width.saturating_sub(6)))
+        .unwrap_or(0);
+    let Some((dialog_area, list_h)) = themes_dialog_geometry(names.len(), notice_lines, area)
+    else {
+        return;
+    };
+    clear_area(buf, dialog_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::pane_border_focused(paint))
+        .style(theme::menu_row(paint));
+    let inner = block.inner(dialog_area);
+    block.render(dialog_area, buf);
+
+    let left = inner.x + 2;
+    let usable_w = inner.width.saturating_sub(4);
+    super::overlay_text(
+        buf,
+        inner,
+        left,
+        inner.y,
+        copy::THEMES_TITLE,
+        theme::menu_row(paint).add_modifier(Modifier::BOLD),
+    );
+    if !names.is_empty() {
+        super::overlay_text(
+            buf,
+            inner,
+            left,
+            inner.y + 1,
+            copy::THEMES_HINT,
+            theme::menu_hint(paint),
+        );
+    }
+
+    // The selected row stays visible: the window slides down only once
+    // the arrows walk past its last visible row.
+    let list_y = inner.y + 3;
+    let list_h = usize::from(list_h);
+    let start = if list_h == 0 || selected < list_h {
+        0
+    } else {
+        selected + 1 - list_h
+    };
+    for (line, index) in (start..names.len().min(start + list_h)).enumerate() {
+        let y = list_y + line as u16;
+        let style = if index == selected {
+            theme::menu_row_hover(paint)
+        } else {
+            theme::menu_row(paint)
+        };
+        buf.set_style(Rect::new(left, y, usable_w, 1), style);
+        let mark = if Some(index) == active { "▸" } else { " " };
+        super::overlay_text(
+            buf,
+            inner,
+            left,
+            y,
+            &format!("{mark} {}", names[index]),
+            style,
+        );
+    }
+
+    if let Some(text) = notice {
+        let notice_y = list_y + list_h as u16 + 1;
+        let bottom = inner.y + inner.height;
+        if notice_y < bottom {
+            let notice_area = Rect::new(
+                left,
+                notice_y,
+                usable_w,
+                (notice_lines as u16).min(bottom - notice_y),
+            );
+            Paragraph::new(text)
+                .style(theme::menu_hint(paint))
+                .wrap(Wrap { trim: true })
+                .render(notice_area, buf);
+        }
+    }
+
+    paint_dialog_buttons(buf, inner, paint, hits, hover, copy::BUTTON_APPLY);
+}
+
+/// Same shape as [`keybind_dialog_geometry`]: fixed rows (title, hint,
+/// one blank before the list, one after, the footer) around a list that
+/// shrinks before the chrome does.
+fn themes_dialog_geometry(
+    row_count: usize,
+    notice_lines: usize,
+    area: Rect,
+) -> Option<(Rect, u16)> {
+    if area.width < 8 || area.height < 6 {
+        return None;
+    }
+    let width = area.width.saturating_sub(4).min(48);
+    let wanted_height =
+        u16::try_from(row_count.saturating_add(notice_lines).saturating_add(7)).unwrap_or(u16::MAX);
+    let height = wanted_height.min(area.height.saturating_sub(2)).max(6);
+    let dialog = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    let list_height = height
+        .saturating_sub(2)
+        .saturating_sub(5)
+        .saturating_sub(u16::try_from(notice_lines).unwrap_or(u16::MAX));
+    Some((dialog, list_height))
+}
+
 /// Keep the editing cursor visible when a name is wider than its field.
 fn input_tail(input: &str, width: usize) -> String {
     const CURSOR: &str = "▏";
@@ -407,6 +575,7 @@ pub fn menu_items(menu: &MenuState) -> Vec<(&'static str, BindingAction)> {
             (copy::MENU_NEW_TAB, BindingAction::NewTab),
             (copy::MENU_NEW_WORKSPACE, BindingAction::NewWorkspace),
             (copy::MENU_TOGGLE_EVENTS, BindingAction::ToggleEventPanel),
+            (copy::MENU_THEMES, BindingAction::ShowThemes),
             (copy::MENU_KEYBINDS, BindingAction::ShowKeybinds),
             (copy::MENU_DETACH, BindingAction::Detach),
         ],
@@ -414,6 +583,10 @@ pub fn menu_items(menu: &MenuState) -> Vec<(&'static str, BindingAction)> {
             (copy::MENU_NAME_PANE, BindingAction::NamePane),
             (copy::MENU_SPLIT_RIGHT, BindingAction::SplitRight),
             (copy::MENU_SPLIT_DOWN, BindingAction::SplitDown),
+            (copy::MENU_SWAP_LEFT, BindingAction::SwapPaneLeft),
+            (copy::MENU_SWAP_RIGHT, BindingAction::SwapPaneRight),
+            (copy::MENU_SWAP_UP, BindingAction::SwapPaneUp),
+            (copy::MENU_SWAP_DOWN, BindingAction::SwapPaneDown),
             (copy::MENU_ZOOM_PANE, BindingAction::ZoomPane),
             (copy::MENU_CLOSE_PANE, BindingAction::ClosePane),
         ],
@@ -497,7 +670,7 @@ mod tests {
 
     #[test]
     fn context_menu_paints_items_with_hits() {
-        let backend = TestBackend::new(40, 12);
+        let backend = TestBackend::new(40, 16);
         let mut term = Terminal::new(backend).unwrap();
         let theme = Paint::for_test();
         let mut hits = HitMap::default();
@@ -521,7 +694,7 @@ mod tests {
 
     #[test]
     fn hovered_menu_row_paints_raised() {
-        let backend = TestBackend::new(40, 12);
+        let backend = TestBackend::new(40, 16);
         let mut term = Terminal::new(backend).unwrap();
         let theme = Paint::for_test();
         let mut hits = HitMap::default();
@@ -576,6 +749,122 @@ mod tests {
                 BindingAction::RenameWorkspace,
                 BindingAction::CloseWorkspace
             ]
+        );
+    }
+
+    #[test]
+    fn app_menu_offers_themes_between_events_and_keybinds() {
+        let actions: Vec<_> = menu_items(&MenuState::AppMenu)
+            .iter()
+            .map(|(_, action)| *action)
+            .collect();
+        assert_eq!(
+            actions,
+            vec![
+                BindingAction::NewTab,
+                BindingAction::NewWorkspace,
+                BindingAction::ToggleEventPanel,
+                BindingAction::ShowThemes,
+                BindingAction::ShowKeybinds,
+                BindingAction::Detach,
+            ]
+        );
+    }
+
+    #[test]
+    fn themes_dialog_marks_active_raises_selected_and_offers_apply() {
+        let backend = TestBackend::new(60, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+        let mut hits = HitMap::default();
+        let dialog = Dialog::Themes {
+            names: vec!["dark".into(), "light".into(), "solar".into()],
+            selected: 1,
+            active: Some(0),
+            notice: None,
+        };
+        term.draw(|f| {
+            paint_dialog(&dialog, f.area(), f.buffer_mut(), &theme, &mut hits, None);
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        let flat = flatten(buf);
+        assert!(flat.contains("Themes"), "title renders: {flat}");
+        assert!(flat.contains("▸ dark"), "active row is marked: {flat}");
+        assert!(flat.contains("light") && flat.contains("solar"), "{flat}");
+        assert!(flat.contains("↵ Apply"), "confirm affordance: {flat}");
+        assert!(flat.contains("Esc Cancel"), "cancel affordance: {flat}");
+        assert!(hits
+            .regions()
+            .iter()
+            .any(|region| region.target == HitTarget::DialogConfirm));
+        assert!(hits
+            .regions()
+            .iter()
+            .any(|region| region.target == HitTarget::DialogCancel));
+        // The selected row's ground differs from its neighbours'.
+        let row_of = |needle: &str| {
+            (0..16)
+                .find(|row| {
+                    let line: String = (0..60).map(|col| buf[(col, *row)].symbol()).collect();
+                    line.contains(needle)
+                })
+                .unwrap_or_else(|| panic!("{needle} not painted"))
+        };
+        let x = (0..60)
+            .find(|col| buf[(*col, row_of("light"))].symbol() == "l")
+            .expect("row text");
+        assert_ne!(
+            buf[(x, row_of("light"))].bg,
+            buf[(x, row_of("solar"))].bg,
+            "selection should raise the row the arrows are on"
+        );
+    }
+
+    #[test]
+    fn themes_dialog_shows_the_apply_notice() {
+        let backend = TestBackend::new(60, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+        let mut hits = HitMap::default();
+        let dialog = Dialog::Themes {
+            names: vec!["dark".into()],
+            selected: 0,
+            active: Some(0),
+            notice: Some(copy::THEME_SAVED_NO_DAEMON.into()),
+        };
+        term.draw(|f| {
+            paint_dialog(&dialog, f.area(), f.buffer_mut(), &theme, &mut hits, None);
+        })
+        .unwrap();
+        let flat = flatten(term.backend().buffer());
+        assert!(
+            flat.contains("The next command picks it up."),
+            "the saved story stays visible: {flat}"
+        );
+    }
+
+    #[test]
+    fn empty_themes_dialog_says_where_themes_come_from() {
+        let backend = TestBackend::new(60, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+        let mut hits = HitMap::default();
+        let dialog = Dialog::Themes {
+            names: Vec::new(),
+            selected: 0,
+            active: None,
+            notice: None,
+        };
+        term.draw(|f| {
+            paint_dialog(&dialog, f.area(), f.buffer_mut(), &theme, &mut hits, None);
+        })
+        .unwrap();
+        let flat = flatten(term.backend().buffer());
+        assert!(
+            flat.contains("cyclops start"),
+            "the empty state names the seeding command: {flat}"
         );
     }
 

@@ -37,6 +37,19 @@ pub enum Dialog {
         scroll: u16,
         rows: Vec<crate::bindings::BindingHelp>,
     },
+    /// Pick a theme; Enter applies it exactly like `cyclops theme <name>`.
+    Themes {
+        /// Loadable theme names, the same rows `cyclops theme` lists.
+        names: Vec<String>,
+        /// The row the arrow keys are on.
+        selected: usize,
+        /// The row of the active theme, when it is one of the rows at all
+        /// (a path or CYCLOPS_THEME selection is not).
+        active: Option<usize>,
+        /// What an apply that could not go live has to say (daemon down,
+        /// or painting something else). Same slot NamePane's error uses.
+        notice: Option<String>,
+    },
 }
 
 impl Dialog {
@@ -84,6 +97,17 @@ pub fn dialog_key_action(dialog: &Dialog, key: &KeyEvent) -> DialogKeyAction {
             KeyCode::PageDown => DialogKeyAction::Scroll(8),
             KeyCode::Home => DialogKeyAction::ScrollStart,
             KeyCode::End => DialogKeyAction::ScrollEnd,
+            _ => DialogKeyAction::Ignore,
+        };
+    }
+    // The picker scrolls a selection, not a viewport, and unlike the
+    // keybinds sheet its Enter has something to confirm.
+    if matches!(dialog, Dialog::Themes { .. }) {
+        return match key.code {
+            KeyCode::Esc => DialogKeyAction::Cancel,
+            KeyCode::Enter => DialogKeyAction::Confirm,
+            KeyCode::Up => DialogKeyAction::Scroll(-1),
+            KeyCode::Down => DialogKeyAction::Scroll(1),
             _ => DialogKeyAction::Ignore,
         };
     }
@@ -135,6 +159,21 @@ pub fn move_keybind_scroll(current: u16, delta: i16, max: u16) -> u16 {
     }
 }
 
+/// Resolve a [`DialogKeyAction::Scroll`] delta against the theme picker's
+/// rows: clamped to the ends, same rule as [`move_keybind_scroll`].
+pub fn move_theme_selection(current: usize, delta: i16, len: usize) -> usize {
+    let Some(last) = len.checked_sub(1) else {
+        return 0;
+    };
+    if delta.is_negative() {
+        current
+            .saturating_sub(delta.unsigned_abs() as usize)
+            .min(last)
+    } else {
+        current.saturating_add(delta as usize).min(last)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +213,46 @@ mod tests {
             dialog_key_action(&dialog, &control_c),
             DialogKeyAction::Ignore
         );
+    }
+
+    #[test]
+    fn theme_picker_keys_move_confirm_and_cancel() {
+        let dialog = Dialog::Themes {
+            names: vec!["dark".into(), "light".into()],
+            selected: 0,
+            active: Some(0),
+            notice: None,
+        };
+        let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+        assert_eq!(
+            dialog_key_action(&dialog, &key(KeyCode::Down)),
+            DialogKeyAction::Scroll(1)
+        );
+        assert_eq!(
+            dialog_key_action(&dialog, &key(KeyCode::Up)),
+            DialogKeyAction::Scroll(-1)
+        );
+        assert_eq!(
+            dialog_key_action(&dialog, &key(KeyCode::Enter)),
+            DialogKeyAction::Confirm
+        );
+        assert_eq!(
+            dialog_key_action(&dialog, &key(KeyCode::Esc)),
+            DialogKeyAction::Cancel
+        );
+        // No text input: a typed character must not become an append.
+        assert_eq!(
+            dialog_key_action(&dialog, &key(KeyCode::Char('d'))),
+            DialogKeyAction::Ignore
+        );
+    }
+
+    #[test]
+    fn theme_selection_clamps_at_both_ends() {
+        assert_eq!(move_theme_selection(0, -1, 3), 0);
+        assert_eq!(move_theme_selection(0, 1, 3), 1);
+        assert_eq!(move_theme_selection(2, 1, 3), 2);
+        assert_eq!(move_theme_selection(0, 1, 0), 0);
     }
 
     #[test]

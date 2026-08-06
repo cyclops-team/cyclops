@@ -67,6 +67,14 @@ pub const MENU_ZOOM_PANE: &str = "Zoom pane";
 
 pub const MENU_NAME_PANE: &str = "Name pane";
 
+pub const MENU_SWAP_LEFT: &str = "Swap left";
+
+pub const MENU_SWAP_RIGHT: &str = "Swap right";
+
+pub const MENU_SWAP_UP: &str = "Swap up";
+
+pub const MENU_SWAP_DOWN: &str = "Swap down";
+
 pub const MENU_CLOSE_PANE: &str = "Close pane";
 
 pub const MENU_NEW_TAB: &str = "New tab";
@@ -74,6 +82,8 @@ pub const MENU_NEW_TAB: &str = "New tab";
 pub const MENU_NEW_WORKSPACE: &str = "New workspace";
 
 pub const MENU_TOGGLE_EVENTS: &str = "Event stream";
+
+pub const MENU_THEMES: &str = "Themes";
 
 pub const MENU_KEYBINDS: &str = "Keybinds";
 
@@ -86,3 +96,48 @@ pub const MENU_CLOSE_TAB: &str = "Close tab";
 pub const MENU_RENAME_WORKSPACE: &str = "Rename workspace";
 
 pub const MENU_CLOSE_WORKSPACE: &str = "Close workspace";
+
+pub const THEMES_TITLE: &str = "Themes";
+
+pub const THEMES_HINT: &str = "Pick with ↑/↓, Enter applies everywhere.";
+
+pub const THEMES_EMPTY: &str = "No themes found. Run cyclops start to seed the shipped ones.";
+
+pub const BUTTON_APPLY: &str = "Apply";
+
+/// Said in the picker after a switch no daemon confirmed. The config is
+/// written either way, so this is a "when", not a "but"; the CLI says the
+/// same after `cyclops theme <name>` (its `THEME_NEXT_COMMAND`).
+pub const THEME_SAVED_NO_DAEMON: &str = "Saved. The next command picks it up.";
+
+/// Said after a switch a running daemon did not take: the config is
+/// written and this workspace repaints from it, but pane borders are
+/// cyclopsd's to repaint and it is painting something else. Mirrors the
+/// CLI's `theme_not_live` story, sentence for sentence.
+pub fn theme_not_live(painting: Option<&str>) -> String {
+    match painting {
+        Some(now) => format!(
+            "Saved, but cyclopsd is still painting {now}, so pane borders did not change. Check CYCLOPS_THEME and the themes directory where cyclopsd runs, then restart it."
+        ),
+        None => "Saved, but cyclopsd didn't take the switch, so pane borders did not change. Restart cyclopsd to pick it up.".to_string(),
+    }
+}
+
+/// A picked theme whose file stopped loading between the listing and the
+/// apply. Nothing was written; the CLI refuses the same file by name.
+pub fn theme_unusable(name: &str, cause: &str) -> String {
+    format!("can't use theme \"{name}\": {cause}. Nothing was changed.")
+}
+
+/// A picked theme whose file now parses but sets no token, so switching
+/// to it would repaint nothing. Nothing was written.
+pub fn theme_sets_no_colors(name: &str) -> String {
+    format!(
+        "can't use theme \"{name}\": it sets no colors, so switching to it would change nothing on screen. Nothing was changed."
+    )
+}
+
+/// The config could not be written, so nothing switched.
+pub fn theme_not_saved(cause: &str) -> String {
+    format!("can't save the theme: {cause}. Nothing was changed.")
+}

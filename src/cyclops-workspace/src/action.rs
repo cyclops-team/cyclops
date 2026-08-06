@@ -125,6 +125,15 @@ pub enum Action {
         pane_id: String,
         other_pane_id: String,
     },
+    /// Swap a specific pane with its neighbour in `direction`: the pane
+    /// context menu's swap, which acts on the clicked pane rather than the
+    /// focused one. The executor focuses `pane_id` first, because tmux's
+    /// neighbour mnemonics only resolve against the current pane, and a
+    /// swap leaves the acted-on pane focused anyway.
+    SwapPaneToward {
+        pane_id: String,
+        direction: PaneDirection,
+    },
     /// Close one pane. Whether this needs a confirmation first is an
     /// execution-time question (it depends on daemon-held agent state, not
     /// on anything routing can see); routing always resolves the same
@@ -242,6 +251,16 @@ pub enum Action {
     // -- App --
     ToggleEventPanel,
     ShowKeybinds,
+    /// Open the theme picker. Carries no target: the listing is read from
+    /// the themes directory at execution time, so a file added or removed
+    /// between the click and the open cannot show a stale row.
+    ShowThemes,
+    /// Switch to a theme by name, exactly what `cyclops theme <name>`
+    /// does: write the config key and nudge the daemon, whose theme event
+    /// repaints this workspace through the existing hot-reload watch.
+    ApplyTheme {
+        name: String,
+    },
     Detach,
 }
 
@@ -313,6 +332,12 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
         BindingAction::FocusRight => Some(Action::FocusDirection(PaneDirection::Right)),
         BindingAction::FocusUp => Some(Action::FocusDirection(PaneDirection::Up)),
         BindingAction::FocusDown => Some(Action::FocusDirection(PaneDirection::Down)),
+        // A keyboard swap acts on the focused pane, so it carries no
+        // target, exactly like the Shift upgrade of the focus chords.
+        BindingAction::SwapPaneLeft => Some(Action::SwapPaneDirection(PaneDirection::Left)),
+        BindingAction::SwapPaneRight => Some(Action::SwapPaneDirection(PaneDirection::Right)),
+        BindingAction::SwapPaneUp => Some(Action::SwapPaneDirection(PaneDirection::Up)),
+        BindingAction::SwapPaneDown => Some(Action::SwapPaneDirection(PaneDirection::Down)),
         BindingAction::SplitRight => Some(Action::Split {
             pane_id: ctx.active_pane.to_string(),
             direction: SplitDirection::Horizontal,
@@ -358,6 +383,7 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
         }),
         BindingAction::ToggleEventPanel => Some(Action::ToggleEventPanel),
         BindingAction::ShowKeybinds => Some(Action::ShowKeybinds),
+        BindingAction::ShowThemes => Some(Action::ShowThemes),
     }
 }
 
@@ -410,6 +436,32 @@ pub fn route_menu_item(
         (MenuState::ContextMenu { pane_id, .. }, BindingAction::ZoomPane) => {
             Some(Action::ZoomPane {
                 pane_id: pane_id.clone(),
+            })
+        }
+        // The menu's swap acts on the pane the menu was opened on, per the
+        // module rule: the item resolves against THAT target.
+        (MenuState::ContextMenu { pane_id, .. }, BindingAction::SwapPaneLeft) => {
+            Some(Action::SwapPaneToward {
+                pane_id: pane_id.clone(),
+                direction: PaneDirection::Left,
+            })
+        }
+        (MenuState::ContextMenu { pane_id, .. }, BindingAction::SwapPaneRight) => {
+            Some(Action::SwapPaneToward {
+                pane_id: pane_id.clone(),
+                direction: PaneDirection::Right,
+            })
+        }
+        (MenuState::ContextMenu { pane_id, .. }, BindingAction::SwapPaneUp) => {
+            Some(Action::SwapPaneToward {
+                pane_id: pane_id.clone(),
+                direction: PaneDirection::Up,
+            })
+        }
+        (MenuState::ContextMenu { pane_id, .. }, BindingAction::SwapPaneDown) => {
+            Some(Action::SwapPaneToward {
+                pane_id: pane_id.clone(),
+                direction: PaneDirection::Down,
             })
         }
         (MenuState::ContextMenu { pane_id, .. }, BindingAction::ClosePane) => {
@@ -490,6 +542,13 @@ pub fn route_dialog_confirm(dialog: &Dialog) -> Option<Action> {
         }),
         // Read-only: nothing to confirm. Enter just dismisses it.
         Dialog::Keybinds { .. } => None,
+        // Enter applies the row the arrows are on. An empty listing has
+        // nothing to apply, so Enter dismisses like the keybinds sheet.
+        Dialog::Themes {
+            names, selected, ..
+        } => names
+            .get(*selected)
+            .map(|name| Action::ApplyTheme { name: name.clone() }),
     }
 }
 
@@ -811,6 +870,38 @@ mod tests {
         assert_eq!(from_keyboard, expected);
         assert_eq!(from_mouse, expected);
         assert_eq!(from_menu, expected);
+    }
+
+    /// The menu's swap carries the clicked pane and the keyboard's stays
+    /// targetless: right-clicking a background pane must swap THAT pane,
+    /// while a chord acts on whatever tmux considers current.
+    #[test]
+    fn context_menu_swap_targets_the_clicked_pane_keyboard_stays_targetless() {
+        let tabs = [tab("@1")];
+        let workspaces = [workspace("$1", "main")];
+        let c = ctx(&tabs, 0, "%3", "main", &workspaces, 0);
+
+        let from_menu = route_menu_item(
+            &MenuState::ContextMenu {
+                pane_id: "%7".into(),
+                at: (0, 0),
+            },
+            BindingAction::SwapPaneLeft,
+            &c,
+        );
+        assert_eq!(
+            from_menu,
+            Some(Action::SwapPaneToward {
+                pane_id: "%7".into(),
+                direction: PaneDirection::Left,
+            })
+        );
+
+        let from_keyboard = route_binding(BindingAction::SwapPaneDown, &c);
+        assert_eq!(
+            from_keyboard,
+            Some(Action::SwapPaneDirection(PaneDirection::Down))
+        );
     }
 
     #[test]
@@ -1198,6 +1289,50 @@ mod tests {
             route_dialog_confirm(&Dialog::Keybinds {
                 scroll: 0,
                 rows: Vec::new(),
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn show_themes_agrees_across_keyboard_and_app_menu() {
+        let tabs = [tab("@1")];
+        let workspaces = [workspace("$1", "main")];
+        let c = ctx(&tabs, 0, "%0", "main", &workspaces, 0);
+
+        assert_eq!(
+            route_binding(BindingAction::ShowThemes, &c),
+            Some(Action::ShowThemes)
+        );
+        assert_eq!(
+            route_menu_item(&MenuState::AppMenu, BindingAction::ShowThemes, &c),
+            Some(Action::ShowThemes)
+        );
+    }
+
+    #[test]
+    fn themes_dialog_confirms_the_selected_row_by_name() {
+        assert_eq!(
+            route_dialog_confirm(&Dialog::Themes {
+                names: vec!["dark".into(), "light".into(), "solar".into()],
+                selected: 1,
+                active: Some(0),
+                notice: None,
+            }),
+            Some(Action::ApplyTheme {
+                name: "light".into()
+            })
+        );
+    }
+
+    #[test]
+    fn an_empty_themes_dialog_confirms_to_no_action() {
+        assert_eq!(
+            route_dialog_confirm(&Dialog::Themes {
+                names: Vec::new(),
+                selected: 0,
+                active: None,
+                notice: None,
             }),
             None
         );

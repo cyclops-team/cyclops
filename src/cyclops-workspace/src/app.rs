@@ -1346,14 +1346,22 @@ async fn handle_mouse(
             mouse.kind,
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
         ) {
+            let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
             let max_scroll = keybind_scroll_limit(app);
-            if let Some(Dialog::Keybinds { scroll, .. }) = app.dialog.as_mut() {
-                let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
-                    -3
-                } else {
-                    3
-                };
-                *scroll = dialog::move_keybind_scroll(*scroll, delta, max_scroll);
+            match app.dialog.as_mut() {
+                Some(Dialog::Keybinds { scroll, .. }) => {
+                    let delta = if up { -3 } else { 3 };
+                    *scroll = dialog::move_keybind_scroll(*scroll, delta, max_scroll);
+                }
+                // A picker notch moves the selection one row, not a
+                // viewport three: the list is what the wheel is over.
+                Some(Dialog::Themes {
+                    selected, names, ..
+                }) => {
+                    let delta = if up { -1 } else { 1 };
+                    *selected = dialog::move_theme_selection(*selected, delta, names.len());
+                }
+                _ => {}
             }
             return Ok(());
         }
@@ -2157,11 +2165,17 @@ async fn handle_dialog_key(
             let mut encoded = [0; 4];
             dialog::append_dialog_text(app.dialog.as_mut(), c.encode_utf8(&mut encoded));
         }
-        DialogKeyAction::Scroll(delta) => {
-            if let Some(Dialog::Keybinds { scroll, .. }) = app.dialog.as_mut() {
+        DialogKeyAction::Scroll(delta) => match app.dialog.as_mut() {
+            Some(Dialog::Keybinds { scroll, .. }) => {
                 *scroll = dialog::move_keybind_scroll(*scroll, delta, max_scroll);
             }
-        }
+            Some(Dialog::Themes {
+                selected, names, ..
+            }) => {
+                *selected = dialog::move_theme_selection(*selected, delta, names.len());
+            }
+            _ => {}
+        },
         DialogKeyAction::ScrollStart => {
             if let Some(Dialog::Keybinds { scroll, .. }) = app.dialog.as_mut() {
                 *scroll = 0;

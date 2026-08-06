@@ -50,13 +50,23 @@ fn write_request(stream: &mut UnixStream, method: &str, params: Value) -> Result
 /// or event-triggered refreshes, so a short-lived connection is simpler and
 /// safer than sharing the daemon subscription's stream.
 pub(crate) fn request(home: &Path, method: &str, params: Value) -> Result<Value, String> {
-    let mut reader = connect(home)?;
+    exchange(&mut connect(home)?, method, params)
+}
+
+/// The request/response half of [`request`], on an already-open
+/// connection. Split out because [`theme_reload`] has to tell "nothing
+/// answered on the socket" apart from "a daemon answered and refused".
+fn exchange(
+    reader: &mut BufReader<UnixStream>,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
     write_request(reader.get_mut(), method, params)?;
 
     // A fresh, unsubscribed connection has exactly one response after its
     // Hello. Anything else is a protocol error; failing immediately keeps a
     // malformed peer from extending this bounded request indefinitely.
-    let response = read_value(&mut reader, method)?;
+    let response = read_value(reader, method)?;
     let response = serde_json::from_value::<Response>(response)
         .map_err(|error| format!("cyclopsd sent an unreadable {method} response: {error}"))?;
     if response.id != json!(1) {
@@ -123,6 +133,39 @@ pub fn watch_session(home: &Path, session: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// How far a theme nudge got: the two answers a caller has to tell apart
+/// because they are two different stories (the CLI's `Switch`).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ThemeReload {
+    /// A daemon answered; carries the theme it says it is NOW painting,
+    /// which is not always the one just chosen (a `CYCLOPS_THEME` pinned
+    /// in its environment beats the config key). `None` when the answer
+    /// named no theme, or the daemon refused: either way nothing on
+    /// screen is confirmed to have moved.
+    Painting(Option<String>),
+    /// Nothing answered on the socket. There is no screen to be wrong
+    /// about; the next command reads the key.
+    NoDaemon,
+}
+
+/// Tell a running cyclopsd the theme key moved: the same `theme.reload`
+/// nudge `cyclops theme <name>` sends. Takes no theme name on purpose,
+/// the daemon re-resolves the selection itself.
+pub fn theme_reload(home: &Path) -> ThemeReload {
+    let Ok(mut reader) = connect(home) else {
+        return ThemeReload::NoDaemon;
+    };
+    match exchange(&mut reader, "theme.reload", json!({})) {
+        Ok(result) => ThemeReload::Painting(
+            result
+                .get("theme")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        ),
+        Err(_) => ThemeReload::Painting(None),
+    }
+}
+
 /// Assign the pane's Cyclops identity. Detection remains the daemon's job;
 /// omitting `manifest` preserves the CLI's normal auto-detection behavior.
 pub fn label_pane(home: &Path, pane_id: &str, label: &str) -> Result<(), String> {
@@ -171,6 +214,46 @@ mod tests {
         let response = request(&home, "ping", json!({})).expect("request succeeds");
         assert_eq!(response["pong"], true);
         server.join().expect("server");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn theme_reload_reads_what_the_daemon_says_it_is_painting() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-theme-reload");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("scratch home");
+        let listener = UnixListener::bind(home.join(SOCK_NAME)).expect("listen");
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream);
+            reader
+                .get_mut()
+                .write_all(b"{\"cyclops\":\"0.1.0\",\"proto\":1,\"boot_id\":\"b\"}\n")
+                .expect("hello");
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("request");
+            let request: Value = serde_json::from_str(&line).expect("JSON request");
+            assert_eq!(request["method"], "theme.reload");
+            reader
+                .get_mut()
+                .write_all(b"{\"id\":1,\"result\":{\"theme\":\"solar\"}}\n")
+                .expect("response");
+        });
+
+        assert_eq!(
+            theme_reload(&home),
+            ThemeReload::Painting(Some("solar".into()))
+        );
+        server.join().expect("server");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn theme_reload_with_nothing_on_the_socket_is_no_daemon() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-theme-reload-down");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("scratch home");
+        assert_eq!(theme_reload(&home), ThemeReload::NoDaemon);
         let _ = std::fs::remove_dir_all(home);
     }
 

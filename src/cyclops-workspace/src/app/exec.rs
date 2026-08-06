@@ -29,6 +29,7 @@ use cyclops_tmux::{ControlClient, TmuxError};
 
 use super::App;
 use crate::action::{Action, Insertion, TabDestination};
+use crate::copy;
 use crate::daemon;
 use crate::decoration::{self, DecorationSnapshot};
 use crate::dialog::Dialog;
@@ -89,6 +90,15 @@ pub(super) async fn execute(
             // swap, so the pane the user just dropped ends up focused in
             // its new slot, the same way a frame click focuses it.
             client.swap_pane(&other_pane_id, &pane_id).await?;
+            Ok(Outcome::reconcile())
+        }
+        Action::SwapPaneToward { pane_id, direction } => {
+            // Focus first: tmux's neighbour mnemonics resolve against the
+            // current pane only, and a swap leaves the acted-on pane
+            // focused anyway, so the menu's clicked-pane swap ends in the
+            // same place a keyboard swap of that pane would.
+            client.select_pane(&pane_id).await?;
+            client.swap_pane_toward(direction).await?;
             Ok(Outcome::reconcile())
         }
         Action::ClosePane { pane_id } => close_pane(app, client, pane_id).await,
@@ -217,6 +227,17 @@ pub(super) async fn execute(
             });
             Ok(Outcome::default())
         }
+        Action::ShowThemes => {
+            let (names, active) = theme_rows(&app.home);
+            app.dialog = Some(Dialog::Themes {
+                selected: active.unwrap_or(0),
+                names,
+                active,
+                notice: None,
+            });
+            Ok(Outcome::default())
+        }
+        Action::ApplyTheme { name } => Ok(apply_theme(app, &name)),
         Action::Detach => Ok(Outcome {
             detach: true,
             ..Outcome::default()
@@ -663,6 +684,158 @@ fn reorder_agent(
     }
 }
 
+/// The rows the theme picker offers, sorted by name, and which one is
+/// active. The CLI's listing rule is the contract (`entries` in
+/// src/cyclops/src/theme.rs): a row is offered only for a file that loads
+/// clean and paints anything, because a row that would repaint nothing is
+/// a lie the reader only finds out later. The active row is the file
+/// selection resolves (`cyclops_theme::active`), matched by path; a theme
+/// chosen by path or by CYCLOPS_THEME marks no row, same as the CLI.
+fn theme_rows(home: &Path) -> (Vec<String>, Option<usize>) {
+    let active = cyclops_theme::active(home).path;
+    let Some(dir) = cyclops_theme::themes_dir(home) else {
+        return (Vec::new(), None);
+    };
+    let Ok(read) = std::fs::read_dir(&dir) else {
+        return (Vec::new(), None);
+    };
+    let mut rows: Vec<(String, PathBuf)> = read
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "toml"))
+        .filter_map(|e| {
+            let path = e.path();
+            let name = path.file_stem()?.to_string_lossy().into_owned();
+            let (theme, _) = cyclops_theme::Theme::load(&path).ok()?;
+            theme.paints_anything().then_some((name, path))
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let active = rows
+        .iter()
+        .position(|(_, path)| active.as_deref() == Some(path.as_path()));
+    (rows.into_iter().map(|(name, _)| name).collect(), active)
+}
+
+/// Switch to a theme by name: what `cyclops theme <name>` does, told the
+/// way the picker tells it. The config write and daemon nudge are
+/// [`save_theme_choice`] and [`daemon::theme_reload`]; nothing here
+/// touches `app.paint`, because the repaint is the ThemeWatch's job on
+/// the render deadline (the daemon's theme event, or failing that the
+/// redraw this action already arms, wakes it).
+fn apply_theme(app: &mut App, name: &str) -> Outcome {
+    let (saved, notice) = match save_theme_choice(&app.home, name) {
+        Err(refusal) => (false, Some(refusal)),
+        Ok(want) => match daemon::theme_reload(&app.home) {
+            // The daemon compares by the theme's own `name` key, which
+            // the file stem the user picked can differ from.
+            daemon::ThemeReload::Painting(Some(now)) if now == want => (true, None),
+            daemon::ThemeReload::Painting(painting) => {
+                (true, Some(copy::theme_not_live(painting.as_deref())))
+            }
+            daemon::ThemeReload::NoDaemon => (true, Some(copy::THEME_SAVED_NO_DAEMON.to_string())),
+        },
+    };
+    let Some(text) = notice else {
+        // Live everywhere the daemon paints, and here on the next render.
+        app.dialog = None;
+        app.hover = None;
+        return Outcome::default();
+    };
+    // The story stays in the open picker (the NamePane error shape);
+    // Escape closes it. A written config moves the active marker even
+    // when the daemon did not confirm, because the selection did switch.
+    if let Some(Dialog::Themes {
+        names,
+        active,
+        notice,
+        ..
+    }) = app.dialog.as_mut()
+    {
+        *notice = Some(text);
+        if saved {
+            *active = names.iter().position(|n| n == name);
+        }
+    }
+    Outcome::default()
+}
+
+/// Validate a picked theme and write the config key, mirroring steps 1-3
+/// of the CLI's `set` (src/cyclops/src/theme.rs) in the order that keeps
+/// a bad name from costing anything: resolve the name the way selection
+/// will, refuse a file that will not load or sets nothing, then write.
+/// Ok carries the theme's own `name` key, the name a nudged daemon
+/// answers with. Load warnings are not surfaced here: the ThemeWatch
+/// reloading this same file logs them once on the render deadline.
+fn save_theme_choice(home: &Path, name: &str) -> Result<String, String> {
+    let Some(path) = cyclops_theme::path_for(name, home) else {
+        return Err(copy::THEMES_EMPTY.to_string());
+    };
+    let theme = match cyclops_theme::Theme::load(&path) {
+        Ok((theme, _)) => theme,
+        Err(e) => return Err(copy::theme_unusable(name, &e.to_string())),
+    };
+    if !theme.paints_anything() {
+        return Err(copy::theme_sets_no_colors(name));
+    }
+    write_theme_key(&home.join("config.toml"), name).map_err(|e| copy::theme_not_saved(&e))?;
+    Ok(theme.name().to_string())
+}
+
+/// Set `theme = "<name>"` in the config, leaving the rest of the file
+/// exactly as the person who wrote it left it. A mirror of the CLI's
+/// `write_theme_key` (src/cyclops/src/theme.rs), kept line for line so
+/// the two writers cannot drift; change both together.
+///
+/// Steps:
+/// 1. Read what is there. No file means one is created holding this key
+///    and nothing else.
+/// 2. Find a top-level `theme =` line, which means before the first
+///    `[table]` header, and replace its value in place.
+/// 3. With no such line, insert one at the end of the top-level keys.
+/// 4. Write through a temp file and rename, so a crash mid-write cannot
+///    leave a half-written config where a whole one was.
+fn write_theme_key(path: &Path, name: &str) -> Result<(), String> {
+    use std::io::Write;
+
+    let key = format!("theme = \"{name}\"");
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let top = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .unwrap_or(lines.len());
+    match lines[..top].iter().position(|l| is_theme_key(l)) {
+        Some(i) => lines[i] = key,
+        None => lines.insert(top, key),
+    }
+    let mut body = lines.join("\n");
+    body.push('\n');
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    let mut f = std::fs::File::create(&tmp).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    f.write_all(body.as_bytes())
+        .and_then(|()| f.sync_all())
+        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// A line that assigns the top-level `theme` key. Not a substring match:
+/// `default_workspace = "theme"` and a commented-out `# theme = "dark"`
+/// both contain the word and neither one sets anything.
+fn is_theme_key(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix("theme")
+        .is_some_and(|rest| rest.trim_start().starts_with('='))
+}
+
 /// Move `source` to sit immediately before/after `insertion`'s target.
 /// `false` (leaving `order` untouched) when `source` and the target are the
 /// same row or either has vanished from `order` since the drop was resolved
@@ -918,6 +1091,45 @@ mod tests {
             out.push(b'\n');
             let _ = reader.get_mut().write_all(&out);
         });
+    }
+
+    /// A fake cyclopsd that answers exactly one `theme.reload` request,
+    /// naming `painting` as the theme it is now on. Same Hello-then-
+    /// response shape as [`spawn_status_daemon_with_agent`].
+    fn spawn_theme_reload_daemon(home: &std::path::Path, painting: &str) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let socket = home.join(cyclops_proto::SOCK_NAME);
+        let listener = UnixListener::bind(&socket).expect("bind fake daemon socket");
+        let painting = painting.to_string();
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(stream);
+            let _ = reader
+                .get_mut()
+                .write_all(b"{\"cyclops\":\"0.1.0\",\"proto\":1,\"boot_id\":\"b\"}\n");
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let request: serde_json::Value = serde_json::from_str(&line).expect("JSON request");
+            // A wrong method gets no response at all, which the test sees
+            // as a daemon that did not confirm.
+            if request["method"] != "theme.reload" {
+                return;
+            }
+            let body = serde_json::json!({"id": 1, "result": {"theme": painting}});
+            let mut out = serde_json::to_vec(&body).expect("encode fake reload");
+            out.push(b'\n');
+            let _ = reader.get_mut().write_all(&out);
+        });
+    }
+
+    fn write_theme(home: &std::path::Path, name: &str, body: &str) {
+        let dir = home.join("themes");
+        std::fs::create_dir_all(&dir).expect("mkdir themes");
+        std::fs::write(dir.join(format!("{name}.toml")), body).expect("write theme");
     }
 
     // -- Pure: moved from app.rs's own test module with `next_numeric_tab_name`. --
@@ -1345,6 +1557,180 @@ mod tests {
 
         client.shutdown().await;
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    // -- Theme picker: the listing filter, and the two ends of an apply. --
+
+    #[tokio::test]
+    async fn show_themes_offers_only_loadable_themes_and_marks_the_active_one() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-show-themes");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        let pane = pane_ids(&server, "s")[0].clone();
+        let client = rig_client(&server, "s").await;
+        let home = scratch_home("exec-show-themes-home");
+        // One loadable theme, one broken file, one that parses but paints
+        // nothing: the listing must offer only the first, the CLI's rule.
+        write_theme(
+            &home,
+            "dark",
+            "name = \"dark\"\n[surface]\ndim = \"#111111\"\n",
+        );
+        write_theme(&home, "broken", "[surface\n");
+        write_theme(&home, "empty", "name = \"empty\"\n");
+        std::fs::write(home.join("config.toml"), "theme = \"dark\"\n").expect("config");
+        let mut app = test_app(one_tab_model("s", "@0", &pane, "$0"), home.clone());
+
+        let outcome = execute(&mut app, &client, Action::ShowThemes)
+            .await
+            .expect("open the picker");
+
+        assert!(!outcome.reconcile);
+        assert!(!outcome.persist);
+        match &app.dialog {
+            Some(Dialog::Themes {
+                names,
+                selected,
+                active,
+                notice,
+            }) => {
+                assert_eq!(names, &vec!["dark".to_string()]);
+                assert_eq!(*selected, 0, "the arrows start on the active row");
+                assert_eq!(*active, Some(0));
+                assert_eq!(*notice, None);
+            }
+            other => panic!("expected the theme picker, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn apply_theme_writes_the_key_and_closes_when_the_daemon_confirms() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-apply-theme");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        let pane = pane_ids(&server, "s")[0].clone();
+        let client = rig_client(&server, "s").await;
+        let home = scratch_home("exec-apply-theme-home");
+        write_theme(
+            &home,
+            "solar",
+            "name = \"solar\"\n[surface]\ndim = \"#222222\"\n",
+        );
+        // A config someone wrote: the apply must edit one line and keep
+        // the rest, comments and order included.
+        let before = "# my config\nsessions = [\"main\"]\ntheme = \"dark\"\nchrome = \"off\"\n";
+        std::fs::write(home.join("config.toml"), before).expect("config");
+        spawn_theme_reload_daemon(&home, "solar");
+        let mut app = test_app(one_tab_model("s", "@0", &pane, "$0"), home.clone());
+        app.dialog = Some(Dialog::Themes {
+            names: vec!["dark".into(), "solar".into()],
+            selected: 1,
+            active: Some(0),
+            notice: None,
+        });
+
+        let outcome = execute(
+            &mut app,
+            &client,
+            Action::ApplyTheme {
+                name: "solar".into(),
+            },
+        )
+        .await
+        .expect("apply executes");
+
+        assert_eq!(outcome, Outcome::default(), "no reconcile, no persist");
+        assert!(app.dialog.is_none(), "a confirmed switch closes the picker");
+        assert_eq!(
+            std::fs::read_to_string(home.join("config.toml")).expect("read config"),
+            "# my config\nsessions = [\"main\"]\ntheme = \"solar\"\nchrome = \"off\"\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn apply_theme_without_a_daemon_saves_and_tells_the_next_command_story() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-apply-theme-down");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        let pane = pane_ids(&server, "s")[0].clone();
+        let client = rig_client(&server, "s").await;
+        let home = scratch_home("exec-apply-theme-down-home");
+        write_theme(
+            &home,
+            "solar",
+            "name = \"solar\"\n[surface]\ndim = \"#222222\"\n",
+        );
+        let mut app = test_app(one_tab_model("s", "@0", &pane, "$0"), home.clone());
+        app.dialog = Some(Dialog::Themes {
+            names: vec!["dark".into(), "solar".into()],
+            selected: 1,
+            active: Some(0),
+            notice: None,
+        });
+
+        execute(
+            &mut app,
+            &client,
+            Action::ApplyTheme {
+                name: "solar".into(),
+            },
+        )
+        .await
+        .expect("apply executes");
+
+        // The config write happened; only the immediacy is missing, and
+        // the open picker says so with the CLI's own story.
+        assert_eq!(
+            std::fs::read_to_string(home.join("config.toml")).expect("read config"),
+            "theme = \"solar\"\n"
+        );
+        match &app.dialog {
+            Some(Dialog::Themes { notice, active, .. }) => {
+                assert_eq!(notice.as_deref(), Some(crate::copy::THEME_SAVED_NO_DAEMON));
+                assert_eq!(*active, Some(1), "the selection did switch");
+            }
+            other => panic!("expected the picker to stay open, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+        client.shutdown().await;
+    }
+
+    /// The writer mirrors the CLI's: one line edited, everything else kept.
+    #[test]
+    fn the_theme_key_is_edited_not_rewritten() {
+        let home = scratch_home("exec-write-theme-key");
+        let config = home.join("config.toml");
+        std::fs::write(
+            &config,
+            "# note\nsessions = [\"main\"]\n[other]\ntheme = \"x\"\n",
+        )
+        .expect("seed config");
+        write_theme_key(&config, "light").expect("write key");
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("read config"),
+            "# note\nsessions = [\"main\"]\ntheme = \"light\"\n[other]\ntheme = \"x\"\n"
+        );
+        // No file yet: created holding the key alone.
+        std::fs::remove_file(&config).expect("remove config");
+        write_theme_key(&config, "light").expect("write key");
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("read config"),
+            "theme = \"light\"\n"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     // -- Insertion ordering: matches `action::resolve_insertion`'s
