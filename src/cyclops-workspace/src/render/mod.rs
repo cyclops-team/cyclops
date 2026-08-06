@@ -146,18 +146,19 @@ fn cell_style(cell: &GridCell, base: Style, palette: Option<&[RtColor; 16]>) -> 
     // Minimum contrast, colors-on only (a palette exists exactly when
     // colors are on). Agents pick their colors for the terminal THEY
     // imagine: pale grays drawn for a dark ground vanish on paper, and
-    // their own dark fills swallow the theme's ink. Whatever the pair,
-    // the text stays readable; rule 11 holds because the clamp never
-    // runs with color off.
+    // their own dark fills swallow the theme's ink. DIM folds into the
+    // math here rather than passing to the terminal, which would halve
+    // the brightness AFTER the clamp and un-read everything it fixed.
+    // Rule 11 holds because none of this runs with color off.
     if palette.is_some() {
         if let (Some(fg), Some(bg)) = (style.fg, style.bg) {
-            style.fg = Some(readable_fg(fg, bg, palette));
+            style.fg = Some(readable_fg(fg, bg, cell.attrs.dim, palette));
         }
     }
     if cell.attrs.bold {
         style = style.add_modifier(Modifier::BOLD);
     }
-    if cell.attrs.dim {
+    if cell.attrs.dim && palette.is_none() {
         style = style.add_modifier(Modifier::DIM);
     }
     if cell.attrs.italic {
@@ -195,20 +196,30 @@ fn rt_color(c: Color, palette: Option<&[RtColor; 16]>) -> Option<RtColor> {
 /// The readability floor a pane cell's text never falls under. Body-text
 /// bars belong to the theme's own figures; this only catches pairs an
 /// agent composed for a different ground, so it sits well below them.
-const MIN_CONTRAST: f64 = 2.5;
+const MIN_CONTRAST: f64 = 3.0;
 
-/// `fg`, nudged toward black or white until it clears [`MIN_CONTRAST`]
-/// against `bg`. A pair already readable comes back untouched, hue and
-/// all; a hopeless one lands on the pole. The output is truecolor when
-/// the palette resolves truecolor (the theme's own signal) and a
-/// 256-color grid entry otherwise, so a clamped color never emits a
-/// sequence the terminal was told not to expect.
-fn readable_fg(fg: RtColor, bg: RtColor, palette: Option<&[RtColor; 16]>) -> RtColor {
-    let (Some(f), Some(b)) = (srgb(fg), srgb(bg)) else {
+/// How far a DIM cell's text fades toward its background before the
+/// floor catches it. The fade is applied here, in the same math the
+/// clamp measures, never as the terminal's own DIM.
+const DIM_FADE: f64 = 0.4;
+
+/// `fg`, faded when `dim` and then nudged toward black or white until it
+/// clears [`MIN_CONTRAST`] against `bg`. A pair already readable comes
+/// back with its hue (dim included, as a fade toward the ground rather
+/// than the terminal's blind darkening); a hopeless one lands on the
+/// pole. The output is truecolor when the palette resolves truecolor
+/// (the theme's own signal) and a 256-color grid entry otherwise, so a
+/// clamped color never emits a sequence the terminal was told not to
+/// expect.
+fn readable_fg(fg: RtColor, bg: RtColor, dim: bool, palette: Option<&[RtColor; 16]>) -> RtColor {
+    let (Some(mut f), Some(b)) = (srgb(fg), srgb(bg)) else {
         return fg;
     };
+    if dim {
+        f = lerp(f, b, DIM_FADE);
+    }
     if contrast(f, b) >= MIN_CONTRAST {
-        return fg;
+        return if dim { emit(f, palette) } else { fg };
     }
     let pole = if luminance(b) > 0.5 {
         (0, 0, 0)
@@ -223,14 +234,21 @@ fn readable_fg(fg: RtColor, bg: RtColor, palette: Option<&[RtColor; 16]>) -> RtC
             break;
         }
     }
+    emit(fixed, palette)
+}
+
+/// A computed color, in the terminal vocabulary the theme itself uses:
+/// truecolor when the palette resolved truecolor, a 256-color grid entry
+/// otherwise.
+fn emit(rgb: (u8, u8, u8), palette: Option<&[RtColor; 16]>) -> RtColor {
     let truecolor = matches!(
         palette,
         Some(p) if p.iter().any(|c| matches!(c, RtColor::Rgb(..)))
     );
     if truecolor {
-        RtColor::Rgb(fixed.0, fixed.1, fixed.2)
+        RtColor::Rgb(rgb.0, rgb.1, rgb.2)
     } else {
-        RtColor::Indexed(cyclops_theme::derive_c256(fixed))
+        RtColor::Indexed(cyclops_theme::derive_c256(rgb))
     }
 }
 
@@ -381,6 +399,27 @@ mod contrast_tests {
         );
         assert_eq!(style.fg.unwrap(), RtColor::Indexed(250));
         assert_eq!(style.bg.unwrap(), RtColor::Indexed(255));
+    }
+
+    /// DIM folds into the clamp's own math: the fade happens here and
+    /// the floor still holds, because the terminal's DIM would darken
+    /// the color AFTER the clamp and un-read everything it fixed.
+    #[test]
+    fn dim_fades_in_the_math_and_still_clears_the_floor() {
+        let base = Style::new().fg(INK).bg(WHITE);
+        let mut dimmed = cell(Color::Default, Color::Rgb(30, 30, 30));
+        dimmed.attrs.dim = true;
+        let style = cell_style(&dimmed, base, Some(&PALETTE));
+        assert!(
+            !style.add_modifier.contains(Modifier::DIM),
+            "colors on: DIM is consumed, never forwarded"
+        );
+        let fg = srgb(style.fg.unwrap()).unwrap();
+        assert!(contrast(fg, (30, 30, 30)) >= MIN_CONTRAST, "{fg:?}");
+
+        // Colors off: DIM passes through as the modifier it always was.
+        let plain = cell_style(&dimmed, Style::new(), None);
+        assert!(plain.add_modifier.contains(Modifier::DIM));
     }
 }
 
