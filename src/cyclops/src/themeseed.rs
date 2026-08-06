@@ -49,22 +49,83 @@ pub fn dir(home: &Path) -> PathBuf {
     home.join("themes")
 }
 
+/// FNV-1a 64 of every theme file body this project has ever shipped, the
+/// current ones included. A file on disk whose hash is in this list is a
+/// seed the user never edited, so a newer shipped version may replace it;
+/// any other content is the user's and is never touched. Measured cost of
+/// not having this: a light.toml seeded before `surface.bg` existed kept
+/// resolving a dark ground under a current binary, on two real machines,
+/// through every reinstall.
+///
+/// Regenerate when a shipped theme changes: hash every historical blob of
+/// resources/themes/ (and the old themes/ path) across all refs; the test
+/// below fails until the current bodies are listed.
+const EVER_SHIPPED_FNV64: &[&str] = &[
+    "079d603c4110e97a",
+    "16659b363c97515a",
+    "1c6dd03958d24189",
+    "2805d33948df7087",
+    "3043a40966256b08",
+    "31d3f87d51f24bdb",
+    "3d0aad5d9b63f1d3",
+    "438eef9420321e42",
+    "4e04410bb72e4c83",
+    "590416905c96bb96",
+    "5ffdc0c45a777472",
+    "6040fe6db2bbabbc",
+    "608d06f121bee9bf",
+    "65f6c922b4cfa360",
+    "7b1f9cf910687f09",
+    "7cd90c5fd2fabde5",
+    "85bf980022c0549d",
+    "88387fdff1488ef2",
+    "94301aec753053fb",
+    "95223edd9843dcf8",
+    "a96073b373240177",
+    "aaa456eea2091dc9",
+    "af572f0c4cb4ced1",
+    "c2f4f150f84798d0",
+    "c776b954bfa78c16",
+    "c915108a16b358cd",
+    "cc7d478d863ef7dc",
+    "dc469fc78811f02b",
+    "df7a68ea06240a04",
+    "dfa5b169d8b1a128",
+    "e26522f98f021dd7",
+    "ec8713a84becce80",
+];
+
+/// FNV-1a 64, hex. Not cryptographic and does not need to be: the
+/// question is "did the user edit this file", not "is this an attack".
+fn fnv64(data: &[u8]) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in data {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
+}
+
 /// What one [`seed`] run did.
 pub struct Seeded {
     pub dir: PathBuf,
-    /// Shipped files written this run.
+    /// Shipped files written this run, fresh seeds and upgrades alike.
     pub written: Vec<String>,
     /// Why a file could not be written, one sentence each.
     pub problems: Vec<String>,
 }
 
-/// Put the shipped themes in `<home>/themes`, keeping every file that is
-/// already there.
+/// Put the shipped themes in `<home>/themes`, keeping every file the
+/// user edited.
 ///
 /// Runs on every `cyclops start`, not only the first: an upgrade that
 /// adds a theme lands on the next start, and a home that predates this
-/// seed gets the set without a reinstall. Files already present are never
-/// read, compared, or rewritten, so an edited copy survives every run.
+/// seed gets the set without a reinstall. A file already present is
+/// rewritten only when its content is byte-identical to a version this
+/// project shipped ([`EVER_SHIPPED_FNV64`]): that file is a seed nobody
+/// touched, and leaving it stale is how a pre-`surface.bg` light.toml
+/// kept a dark ground under a current binary. Anything else on disk is
+/// the user's and survives every run.
 pub fn seed(home: &Path) -> Seeded {
     let dir = dir(home);
     let mut out = Seeded {
@@ -78,7 +139,12 @@ pub fn seed(home: &Path) -> Seeded {
     }
     for (name, body) in SHIPPED {
         let path = dir.join(name);
-        if path.exists() {
+        if let Ok(existing) = std::fs::read(&path) {
+            let unedited = EVER_SHIPPED_FNV64.contains(&fnv64(&existing).as_str());
+            if existing == body.as_bytes() || !unedited {
+                continue;
+            }
+        } else if path.exists() {
             continue;
         }
         match std::fs::write(&path, body) {
@@ -125,6 +191,56 @@ mod tests {
             "name = \"mine\"\n"
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The stale-seed trap, closed: a file identical to a version this
+    /// project once shipped is a seed nobody edited, and a newer shipped
+    /// body replaces it on the next run. The pre-ground light.toml kept
+    /// a dark ground under a current binary on two real machines.
+    #[test]
+    fn an_unedited_old_seed_upgrades_and_an_edited_one_never_does() {
+        let home = scratch("cyc-themeup");
+        seed(&home);
+        // Stand in for an old shipped version: any body whose hash is in
+        // the ever-shipped list but is not the current one. The v2-era
+        // light.toml is blob-exact in git history; reproduce its effect
+        // with a truncated current body registered nowhere, then prove
+        // the negative first: unknown content stays.
+        let light = home.join("themes/light.toml");
+        std::fs::write(&light, "name = \"light\"\n").unwrap();
+        let kept = seed(&home);
+        assert!(kept.written.is_empty(), "{:?}", kept.written);
+
+        // Now the positive: plant a body that hashes into the shipped
+        // list (the current dark.toml body under light's name is exactly
+        // that: shipped bytes, wrong file, user never typed them).
+        let dark_body = SHIPPED
+            .iter()
+            .find(|(n, _)| *n == "dark.toml")
+            .map(|(_, b)| *b)
+            .unwrap();
+        std::fs::write(&light, dark_body).unwrap();
+        let upgraded = seed(&home);
+        assert_eq!(upgraded.written, vec!["light.toml".to_string()]);
+        let now = std::fs::read_to_string(&light).unwrap();
+        assert!(now.contains("[palette]"), "upgraded to the current body");
+        assert_ne!(now, dark_body, "and it is light.toml's body, not dark's");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Every current shipped body must be in the ever-shipped hash list,
+    /// which is what keeps the list honest: whoever changes a theme sees
+    /// this fail and appends the new hash, so the version they replaced
+    /// stays recognizable as an unedited seed forever after.
+    #[test]
+    fn the_ever_shipped_list_contains_the_current_bodies() {
+        for (name, body) in SHIPPED {
+            assert!(
+                EVER_SHIPPED_FNV64.contains(&fnv64(body.as_bytes()).as_str()),
+                "{name}'s current body is not in EVER_SHIPPED_FNV64; add {}",
+                fnv64(body.as_bytes())
+            );
+        }
     }
 
     /// Every shipped theme loads in the real engine with ZERO warnings.
