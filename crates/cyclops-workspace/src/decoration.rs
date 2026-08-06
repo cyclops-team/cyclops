@@ -104,22 +104,24 @@ impl DecorationSnapshot {
                 word: "idle",
                 color_state: AgentState::Idle,
             }),
-            AgentState::IdleWithInput | AgentState::Working => Some(PrimaryStatus {
-                glyph: "●",
-                word: "working",
-                color_state: AgentState::Working,
-            }),
-            AgentState::BlockedModal | AgentState::BlockedPermission | AgentState::BlockedQuota => {
-                Some(PrimaryStatus {
-                    glyph: "●",
-                    word: "working",
-                    color_state: dec.state,
-                })
-            }
             AgentState::Dead => Some(PrimaryStatus {
                 glyph: "✕",
                 word: "dead",
                 color_state: AgentState::Dead,
+            }),
+            // Occupied, not free: real work, a composer holding input, and
+            // a block the register has not flagged all read ● on a compact
+            // surface. Whether a block needs a human is the register's call
+            // alone (`needs_attention` above); the exact state only picks
+            // the color token, through the one owner of "is this blocked".
+            state => Some(PrimaryStatus {
+                glyph: "●",
+                word: "working",
+                color_state: if state.is_blocked() {
+                    state
+                } else {
+                    AgentState::Working
+                },
             }),
         }
     }
@@ -351,11 +353,20 @@ mod tests {
     /// bucket `idle_with_input` shares with `working`.
     #[test]
     fn blocked_without_an_attention_item_is_not_shown_as_attention() {
-        for state in [
+        // Every state, filtered by the owner's own predicate: the blocked
+        // states are enumerated nowhere here, so a future blocked state
+        // joins this test by itself.
+        let every_state = [
+            AgentState::Unknown,
+            AgentState::Idle,
+            AgentState::IdleWithInput,
+            AgentState::Working,
             AgentState::BlockedModal,
             AgentState::BlockedPermission,
             AgentState::BlockedQuota,
-        ] {
+            AgentState::Dead,
+        ];
+        for state in every_state.into_iter().filter(|s| s.is_blocked()) {
             let dec = pane_decoration(&pane("%0", "@0", Some("reviewer"), state), false);
             assert_eq!(
                 DecorationSnapshot::primary_status(&dec),

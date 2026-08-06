@@ -3082,7 +3082,10 @@ mod tests {
         let text = flatten(buf);
         assert!(text.contains("reviewer"), "{text:?}");
         assert!(text.contains("⚠"), "{text:?}");
-        assert!(text.contains("blocked_permission"), "{text:?}");
+        // The expected word comes from the vocabulary's owner, not a
+        // literal: if the state's words change, this follows.
+        let word = cyclops_proto::AgentState::BlockedPermission.to_string();
+        assert!(text.contains(&word), "{text:?}");
     }
 
     /// Rule 11, mechanically: turn color off and read the same line. The
