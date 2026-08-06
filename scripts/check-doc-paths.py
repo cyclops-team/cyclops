@@ -162,8 +162,14 @@ def check_orphans():
             if target.endswith(".md"):
                 linked.add(Path(target).name)
 
+    # notebook.md is the maintainer's working scratchpad of raw feedback,
+    # not a documentation page: indexing it from a front door would put
+    # unedited notes in the reader's path, and the rule above is about
+    # pages written to be read.
     orphans = sorted(
-        p.name for p in docs() if p.name not in linked and p.name not in {"README.md"}
+        p.name
+        for p in docs()
+        if p.name not in linked and p.name not in {"README.md", "notebook.md"}
     )
     if not orphans:
         return []
