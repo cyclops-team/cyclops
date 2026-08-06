@@ -20,6 +20,17 @@ versions are unreleased until admin cuts a tag.
   open workspace on the daemon's theme event, and a hand-edited theme
   file applies on the next event, riding the existing render debounce
   with no timer.
+- Pane rearranging in the workspace, one verb, swap: Ctrl+B Shift+Arrow
+  swaps the focused pane with its neighbour, and dragging a pane by its
+  frame onto another pane swaps the two. The frame is the drag handle so
+  plain drags in the pane body stay text selection. Focus follows the
+  pane the user acted on (F43). The keybinds sheet derives the swap
+  chords from the live focus chords, so a rebind cannot leave it
+  teaching dead keys.
+- Bare `cyclops` seeds the shipped themes the same way `cyclops start`
+  does, so a fresh machine's first workspace has real themes; a theme
+  file that is missing (rather than broken) now says so and names the
+  remedy instead of asking the user to fix a file that does not exist.
 - Claude Code manifest re-verified against 2.1.221 on a live rig, with
   fidelity tests pinned from the captured evidence: mid-turn streaming,
   idle, the new trust-dialog wording, the title table, and the exact
@@ -55,6 +66,12 @@ versions are unreleased until admin cuts a tag.
 - Event panel body rows printed in the terminal's own foreground on the
   panel's themed ground, unreadable on a light host; they wear chrome
   text now.
+- Selection copy never reached the clipboard on stock macOS: an OSC 52
+  stdout write "succeeding" was treated as a completed copy, so the
+  pbcopy fallback never ran and Terminal.app ignores the sequence (F44).
+  The native tool now always runs when one is on PATH, with OSC 52
+  emitted additionally for terminals on the near side of SSH, and the
+  keybinds sheet documents select, copy, and paste.
 - The cyclops skill told an agent to find its own name in the plain
   roster, which prints labels without pane ids; it now says
   `cyclops list --json` and explains what plain `cyclops read` returns.

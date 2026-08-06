@@ -729,3 +729,29 @@ perf_contract -- --nocapture`. The test file is
 `src/cyclops-workspace/tests/perf_contract.rs`; the complete recorded table
 and caveats are in
 `.agents/planning/2026-08-03-cyclops-workspace-tui/implementation/baselines.md`.
+
+## F43. `swap-pane` focuses the `-t` pane id at its new slot; `-d` pins the active SLOT (MEASURED)
+
+Probed on tmux 3.6a, isolated server. After `swap-pane -s A -t B` without
+`-d`, tmux leaves pane B focused wherever it now sits, so the pane named in
+`-t` is the one that keeps the user's focus through a swap. With `-d` the
+active SLOT is preserved instead: whatever pane now occupies the previously
+active position becomes the focused pane, and the moved pane loses focus.
+Cyclops therefore never passes `-d` and rides the pane that should end
+focused in `-t`: the current pane for a keyboard swap, the dragged pane for
+a drop. The `{left-of}` family resolves the neighbour of the current pane
+at execution time, which is what makes the directional swap need no target
+resolution of its own. Pinned by the swap tests in
+`src/cyclops-tmux/tests/ops.rs` and the executor rig tests in
+`src/cyclops-workspace/src/app/exec.rs`.
+
+## F44. An OSC 52 write to stdout "succeeds" on terminals that ignore it (MEASURED)
+
+macOS Terminal.app ignores the OSC 52 clipboard sequence entirely, and the
+stdout write still returns Ok, so a write result can never prove a copy
+happened. The workspace's copy path treated that Ok as success and skipped
+the pbcopy fallback, leaving the clipboard empty on the stock macOS
+terminal. The rule the fix encodes: run the native tool whenever one is on
+PATH, emit OSC 52 additionally when stdout is a terminal (it is what makes
+copy work on the near side of SSH), and never let either path's result gate
+the other. `src/cyclops-workspace/src/selection.rs`.

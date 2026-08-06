@@ -16,9 +16,11 @@ implementation remains available as the read-only `v1` branch and
 - Message delivery has per-recipient ordering, gate decisions, occupant
   checks, verified or screen-inferred receipts, retry limits, and ledgered
   causes.
-- Bare `cyclops` opens the full-screen workspace. It provides a workspace
-  sidebar, tabs, embedded pane terminals, split controls, drag-and-drop
-  workspace ordering, mouse support, and the Cyclops theme vocabulary.
+- Bare `cyclops` opens the full-screen workspace, seeding the shipped
+  themes on the way in. It provides a workspace sidebar, tabs, embedded
+  pane terminals, split controls, pane swapping by keyboard or drag,
+  text selection with clipboard copy, drag-and-drop workspace ordering,
+  mouse support, and the Cyclops theme vocabulary.
   Pane bodies paint the active theme's ground and ANSI-16 palette rather
   than inheriting the host terminal's, and theme switches or edits
   repaint the open workspace without a restart.
