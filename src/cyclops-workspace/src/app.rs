@@ -136,6 +136,14 @@ struct App {
     router: Router,
     paint: Paint,
     dialog: Option<Dialog>,
+    /// The theme that was live when the theme picker opened; `Some` for
+    /// exactly as long as the picker is. Selection moves preview the
+    /// highlighted theme straight into `paint.theme`
+    /// (`exec::preview_selected_theme`); closing without applying puts
+    /// this back, and applying drops it, the previewed paint being the
+    /// theme the daemon confirms. While set, [`refresh_theme_watch`]
+    /// holds the ThemeWatch off so a reload cannot overwrite the preview.
+    theme_restore: Option<cyclops_theme::Theme>,
     link_state: LinkState,
     paused_panes: HashSet<String>,
     reconnect_attempt: usize,
@@ -437,6 +445,7 @@ pub async fn run_async() -> i32 {
         router: Router::new(bindings),
         paint,
         dialog: None,
+        theme_restore: None,
         link_state: LinkState::Live,
         paused_panes: HashSet::new(),
         reconnect_attempt: 0,
@@ -526,12 +535,7 @@ pub async fn run_async() -> i32 {
                     // colors alone and hands back a line for workspace.log:
                     // stderr is under the alternate screen here.
                     if let Some(watch) = theme_watch.as_mut() {
-                        if watch.refresh() {
-                            app.paint.theme = watch.theme().clone();
-                        }
-                        for warning in watch.take_warnings() {
-                            log_err(&app.home, &format!("theme: {warning}"));
-                        }
+                        refresh_theme_watch(&mut app, watch);
                     }
                     let _ = draw(&mut terminal, &mut app);
                 }
@@ -566,6 +570,25 @@ pub async fn run_async() -> i32 {
         eprintln!("{}", copy::SERVER_GONE_OFFER);
     }
     0
+}
+
+/// The render-deadline half of theme hot reload: re-stat the selection,
+/// adopt a change into the live paint, log what a refused reload had to
+/// say. Skipped whole while the theme picker is open (`App::theme_restore`
+/// is `Some`): the preview owns the paint until the picker closes, and a
+/// stamp the watch never polled is still a pending change, so the first
+/// refresh after the close adopts whatever happened while browsing. That
+/// is how the watch resumes ownership unconditionally.
+fn refresh_theme_watch(app: &mut App, watch: &mut cyclops_theme::ThemeWatch) {
+    if app.theme_restore.is_some() {
+        return;
+    }
+    if watch.refresh() {
+        app.paint.theme = watch.theme().clone();
+    }
+    for warning in watch.take_warnings() {
+        log_err(&app.home, &format!("theme: {warning}"));
+    }
 }
 
 fn spawn_notif_forwarder(
@@ -1363,6 +1386,9 @@ async fn handle_mouse(
                 }
                 _ => {}
             }
+            // Same preview the arrow keys make: the row the wheel lands
+            // on goes live for the next render.
+            exec::preview_selected_theme(app);
             return Ok(());
         }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -1908,8 +1934,9 @@ async fn dialog_confirm(
         return Ok(());
     };
     let Some(action) = action::route_dialog_confirm(&dialog) else {
-        app.dialog = None;
-        app.hover = None;
+        // Dismissing without an action is a cancel: same close path, so a
+        // theme picker with nothing to apply also restores its paint.
+        dialog_cancel(app);
         return Ok(());
     };
     let outcome = exec::execute(app, client, action).await?;
@@ -1918,6 +1945,12 @@ async fn dialog_confirm(
 }
 
 fn dialog_cancel(app: &mut App) {
+    // Close-without-apply: the theme picker previews over the live paint,
+    // so the theme that was live when it opened goes back. `None` for
+    // every other dialog, and for an applied picker (the apply drops it).
+    if let Some(theme) = app.theme_restore.take() {
+        app.paint.theme = theme;
+    }
     app.dialog = None;
     app.hover = None;
 }
@@ -2165,17 +2198,22 @@ async fn handle_dialog_key(
             let mut encoded = [0; 4];
             dialog::append_dialog_text(app.dialog.as_mut(), c.encode_utf8(&mut encoded));
         }
-        DialogKeyAction::Scroll(delta) => match app.dialog.as_mut() {
-            Some(Dialog::Keybinds { scroll, .. }) => {
-                *scroll = dialog::move_keybind_scroll(*scroll, delta, max_scroll);
+        DialogKeyAction::Scroll(delta) => {
+            match app.dialog.as_mut() {
+                Some(Dialog::Keybinds { scroll, .. }) => {
+                    *scroll = dialog::move_keybind_scroll(*scroll, delta, max_scroll);
+                }
+                Some(Dialog::Themes {
+                    selected, names, ..
+                }) => {
+                    *selected = dialog::move_theme_selection(*selected, delta, names.len());
+                }
+                _ => {}
             }
-            Some(Dialog::Themes {
-                selected, names, ..
-            }) => {
-                *selected = dialog::move_theme_selection(*selected, delta, names.len());
-            }
-            _ => {}
-        },
+            // The row the arrows land on goes live for the next render
+            // (a no-op for every other dialog).
+            exec::preview_selected_theme(app);
+        }
         DialogKeyAction::ScrollStart => {
             if let Some(Dialog::Keybinds { scroll, .. }) = app.dialog.as_mut() {
                 *scroll = 0;
@@ -2324,6 +2362,7 @@ mod tests {
             router: Router::new(crate::bindings::default_bindings()),
             paint: Paint::for_test(),
             dialog: None,
+            theme_restore: None,
             link_state: LinkState::Live,
             paused_panes: HashSet::new(),
             reconnect_attempt: 0,
@@ -2348,6 +2387,39 @@ mod tests {
             paste_seq: 0,
             home,
             folder_probe_at: None,
+        }
+    }
+
+    /// A one-pane model for tests that need an `App` but never reach
+    /// tmux, so the ids are inert.
+    fn one_pane_model() -> WorkspaceModel {
+        let tab = crate::model::TabModel {
+            window_id: "@0".into(),
+            name: "1".into(),
+            layout: crate::layout::ResolvedLayout::Leaf {
+                pane_id: "%0".into(),
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            active_pane: "%0".into(),
+            zoomed: false,
+        };
+        WorkspaceModel {
+            workspaces: vec![crate::model::WorkspaceRow {
+                session_id: "$0".into(),
+                name: "s".into(),
+                tab_count: 1,
+                window_ids: vec!["@0".into()],
+            }],
+            active_workspace: 0,
+            session: crate::model::SessionModel {
+                session: "s".into(),
+                tabs: vec![tab],
+                active_tab: 0,
+            },
+            sidebar_visible: true,
         }
     }
 
@@ -2545,6 +2617,116 @@ mod tests {
         assert_eq!(woke, 1, "a theme event must wake the app exactly once");
         assert_eq!(entries, 0, "a theme event must never become a stream entry");
 
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Esc (or the Cancel button: both land in `dialog_cancel`) puts back
+    /// the paint that was live when the theme picker opened.
+    #[test]
+    fn closing_the_picker_without_applying_restores_the_original_paint() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-picker-restore");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("themes")).expect("themes dir");
+        std::fs::write(
+            home.join("themes/solar.toml"),
+            "name = \"solar\"\n[surface]\ndim = \"#222222\"\n",
+        )
+        .expect("write theme");
+        let mut app = test_app(one_pane_model(), home.clone());
+        let dim = cyclops_theme::tokens::SURFACE_DIM;
+        let original = app.paint.theme.resolve(dim).rgb;
+        // What ShowThemes does: keep the live paint beside the picker.
+        app.theme_restore = Some(app.paint.theme.clone());
+        app.dialog = Some(Dialog::Themes {
+            names: vec!["solar".into()],
+            selected: 0,
+            active: None,
+            notice: None,
+        });
+        exec::preview_selected_theme(&mut app);
+        assert_ne!(app.paint.theme.resolve(dim).rgb, original, "previewed");
+
+        dialog_cancel(&mut app);
+
+        assert_eq!(
+            app.paint.theme.resolve(dim).rgb,
+            original,
+            "cancel restores the paint the picker opened over"
+        );
+        assert!(app.dialog.is_none());
+        assert!(
+            app.theme_restore.is_none(),
+            "the watch owns the paint again"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The interleaving trap: the ThemeWatch refresh runs on the render
+    /// deadline, BEFORE draw, so a theme change landing while the picker
+    /// previews would repaint over the preview. While the picker is open
+    /// the refresh is skipped whole; the stamps it never polled are still
+    /// pending changes, so the first refresh after close adopts them and
+    /// the watch owns the paint again.
+    #[test]
+    fn a_watch_refresh_never_overwrites_an_open_preview() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-preview-watch");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("themes")).expect("themes dir");
+        std::fs::write(
+            home.join("themes/dark.toml"),
+            "[surface]\ndim = \"#111111\"\n",
+        )
+        .expect("write dark");
+        std::fs::write(
+            home.join("themes/solar.toml"),
+            "[surface]\ndim = \"#222222\"\n",
+        )
+        .expect("write solar");
+        std::fs::write(home.join("config.toml"), "theme = \"dark\"\n").expect("config");
+        let mut watch = cyclops_theme::ThemeWatch::with_env(None, &home);
+        let mut app = test_app(one_pane_model(), home.clone());
+        app.paint.theme = watch.theme().clone();
+        let dim = cyclops_theme::tokens::SURFACE_DIM;
+
+        app.theme_restore = Some(app.paint.theme.clone());
+        app.dialog = Some(Dialog::Themes {
+            names: vec!["dark".into(), "solar".into()],
+            selected: 1,
+            active: Some(0),
+            notice: None,
+        });
+        exec::preview_selected_theme(&mut app);
+        assert_eq!(app.paint.theme.resolve(dim).rgb, (0x22, 0x22, 0x22));
+
+        // The watched file moves mid-browse (longer, so the stamp moves
+        // regardless of mtime granularity). The deadline refresh must not
+        // repaint.
+        std::fs::write(
+            home.join("themes/dark.toml"),
+            "name = \"dark\"\n[surface]\ndim = \"#333333\"\n",
+        )
+        .expect("edit dark");
+        refresh_theme_watch(&mut app, &mut watch);
+        assert_eq!(
+            app.paint.theme.resolve(dim).rgb,
+            (0x22, 0x22, 0x22),
+            "the preview survives the refresh"
+        );
+
+        // Close without applying: the original comes back first, then the
+        // watch resumes ownership and adopts the edit it was held off from.
+        dialog_cancel(&mut app);
+        assert_eq!(
+            app.paint.theme.resolve(dim).rgb,
+            (0x11, 0x11, 0x11),
+            "Esc restores what was live at open"
+        );
+        refresh_theme_watch(&mut app, &mut watch);
+        assert_eq!(
+            app.paint.theme.resolve(dim).rgb,
+            (0x33, 0x33, 0x33),
+            "the first refresh after close adopts what happened while browsing"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

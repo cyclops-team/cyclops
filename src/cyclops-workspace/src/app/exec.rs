@@ -229,6 +229,10 @@ pub(super) async fn execute(
         }
         Action::ShowThemes => {
             let (names, active) = theme_rows(&app.home);
+            // What close-without-apply puts back: browsing previews into
+            // `paint.theme` directly (see [`preview_selected_theme`]), so
+            // the theme that is live right now rides beside the picker.
+            app.theme_restore = Some(app.paint.theme.clone());
             app.dialog = Some(Dialog::Themes {
                 selected: active.unwrap_or(0),
                 names,
@@ -716,12 +720,48 @@ fn theme_rows(home: &Path) -> (Vec<String>, Option<usize>) {
     (rows.into_iter().map(|(name, _)| name).collect(), active)
 }
 
+/// Preview the theme under the picker's cursor: load its file and swap it
+/// into the live paint for the next render. Nothing is written and no
+/// daemon is nudged; this is transient UI state (module rule 2), and a
+/// deliberate exception to [`apply_theme`]'s "the repaint is the
+/// ThemeWatch's job": a preview is not an applied theme, so the watch
+/// must not adopt it. `App::theme_restore` keeps what to put back, and
+/// `refresh_theme_watch` (app.rs) holds the watch off while it is set.
+///
+/// Tolerant on purpose: a file that stopped loading or paints nothing
+/// previews as nothing (the prior paint stays, the picker keeps working),
+/// and load warnings are dropped for the reason [`save_theme_choice`]
+/// gives: the ThemeWatch logs them once if this file is ever applied.
+pub(super) fn preview_selected_theme(app: &mut App) {
+    let Some(Dialog::Themes {
+        names, selected, ..
+    }) = app.dialog.as_ref()
+    else {
+        return;
+    };
+    let Some(name) = names.get(*selected) else {
+        return;
+    };
+    let Some(path) = cyclops_theme::path_for(name, &app.home) else {
+        return;
+    };
+    let Ok((theme, _)) = cyclops_theme::Theme::load(&path) else {
+        return;
+    };
+    if !theme.paints_anything() {
+        return;
+    }
+    app.paint.theme = theme;
+}
+
 /// Switch to a theme by name: what `cyclops theme <name>` does, told the
 /// way the picker tells it. The config write and daemon nudge are
 /// [`save_theme_choice`] and [`daemon::theme_reload`]; nothing here
 /// touches `app.paint`, because the repaint is the ThemeWatch's job on
 /// the render deadline (the daemon's theme event, or failing that the
-/// redraw this action already arms, wakes it).
+/// redraw this action already arms, wakes it). The preview has usually
+/// painted the picked theme already; the confirming refresh makes it the
+/// watch's own again.
 fn apply_theme(app: &mut App, name: &str) -> Outcome {
     let (saved, notice) = match save_theme_choice(&app.home, name) {
         Err(refusal) => (false, Some(refusal)),
@@ -736,9 +776,12 @@ fn apply_theme(app: &mut App, name: &str) -> Outcome {
         },
     };
     let Some(text) = notice else {
-        // Live everywhere the daemon paints, and here on the next render.
+        // Live everywhere the daemon paints; the preview already painted
+        // it here. Dropping the kept paint hands ownership back to the
+        // watch, whose next refresh confirms this same file.
         app.dialog = None;
         app.hover = None;
+        app.theme_restore = None;
         return Outcome::default();
     };
     // The story stays in the open picker (the NamePane error shape);
@@ -929,6 +972,7 @@ mod tests {
             router: Router::new(default_bindings()),
             paint: Paint::for_test(),
             dialog: None,
+            theme_restore: None,
             link_state: LinkState::Live,
             paused_panes: HashSet::new(),
             reconnect_attempt: 0,
@@ -1603,6 +1647,10 @@ mod tests {
             }
             other => panic!("expected the theme picker, got {other:?}"),
         }
+        assert!(
+            app.theme_restore.is_some(),
+            "the live paint rides beside the open picker for Esc"
+        );
 
         let _ = std::fs::remove_dir_all(&home);
         client.shutdown().await;
@@ -1629,6 +1677,7 @@ mod tests {
         std::fs::write(home.join("config.toml"), before).expect("config");
         spawn_theme_reload_daemon(&home, "solar");
         let mut app = test_app(one_tab_model("s", "@0", &pane, "$0"), home.clone());
+        app.theme_restore = Some(app.paint.theme.clone());
         app.dialog = Some(Dialog::Themes {
             names: vec!["dark".into(), "solar".into()],
             selected: 1,
@@ -1648,6 +1697,10 @@ mod tests {
 
         assert_eq!(outcome, Outcome::default(), "no reconcile, no persist");
         assert!(app.dialog.is_none(), "a confirmed switch closes the picker");
+        assert!(
+            app.theme_restore.is_none(),
+            "an applied theme is the watch's to own again"
+        );
         assert_eq!(
             std::fs::read_to_string(home.join("config.toml")).expect("read config"),
             "# my config\nsessions = [\"main\"]\ntheme = \"solar\"\nchrome = \"off\"\n"
@@ -1673,6 +1726,7 @@ mod tests {
             "name = \"solar\"\n[surface]\ndim = \"#222222\"\n",
         );
         let mut app = test_app(one_tab_model("s", "@0", &pane, "$0"), home.clone());
+        app.theme_restore = Some(app.paint.theme.clone());
         app.dialog = Some(Dialog::Themes {
             names: vec!["dark".into(), "solar".into()],
             selected: 1,
@@ -1703,9 +1757,103 @@ mod tests {
             }
             other => panic!("expected the picker to stay open, got {other:?}"),
         }
+        assert!(
+            app.theme_restore.is_some(),
+            "an open picker still owns the paint"
+        );
 
         let _ = std::fs::remove_dir_all(&home);
         client.shutdown().await;
+    }
+
+    /// Browsing previews: the highlighted row's theme becomes the live
+    /// paint, and nothing touches the config until Enter.
+    #[test]
+    fn selection_preview_paints_without_writing_the_config() {
+        let home = scratch_home("exec-preview-theme-home");
+        write_theme(
+            &home,
+            "solar",
+            "name = \"solar\"\n[surface]\ndim = \"#222222\"\n",
+        );
+        std::fs::write(home.join("config.toml"), "theme = \"dark\"\n").expect("config");
+        let mut app = test_app(one_tab_model("s", "@0", "%0", "$0"), home.clone());
+        app.theme_restore = Some(app.paint.theme.clone());
+        app.dialog = Some(Dialog::Themes {
+            names: vec!["dark".into(), "solar".into()],
+            selected: 1,
+            active: Some(0),
+            notice: None,
+        });
+
+        preview_selected_theme(&mut app);
+
+        assert_eq!(
+            app.paint
+                .theme
+                .resolve(cyclops_theme::tokens::SURFACE_DIM)
+                .rgb,
+            (0x22, 0x22, 0x22),
+            "the highlighted theme is the live paint"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("config.toml")).expect("read config"),
+            "theme = \"dark\"\n",
+            "browsing must not write the config"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A file that broke after the picker listed it previews as nothing:
+    /// the paint on screen stays and the picker keeps working.
+    #[test]
+    fn a_broken_theme_under_the_cursor_keeps_the_prior_paint() {
+        let home = scratch_home("exec-preview-broken-home");
+        write_theme(
+            &home,
+            "solar",
+            "name = \"solar\"\n[surface]\ndim = \"#222222\"\n",
+        );
+        write_theme(
+            &home,
+            "lunar",
+            "name = \"lunar\"\n[surface]\ndim = \"#333333\"\n",
+        );
+        write_theme(&home, "broken", "[surface\n");
+        let mut app = test_app(one_tab_model("s", "@0", "%0", "$0"), home.clone());
+        app.theme_restore = Some(app.paint.theme.clone());
+        // The listing only offers loadable rows, so "broken" being a row
+        // means the file broke while the picker was open.
+        app.dialog = Some(Dialog::Themes {
+            names: vec!["broken".into(), "lunar".into(), "solar".into()],
+            selected: 2,
+            active: None,
+            notice: None,
+        });
+        let select = |app: &mut App, row: usize| {
+            if let Some(Dialog::Themes { selected, .. }) = app.dialog.as_mut() {
+                *selected = row;
+            }
+            preview_selected_theme(app);
+        };
+        let dim = |app: &App| {
+            app.paint
+                .theme
+                .resolve(cyclops_theme::tokens::SURFACE_DIM)
+                .rgb
+        };
+
+        select(&mut app, 2);
+        assert_eq!(dim(&app), (0x22, 0x22, 0x22), "solar previews");
+        select(&mut app, 0);
+        assert_eq!(
+            dim(&app),
+            (0x22, 0x22, 0x22),
+            "a broken file previews as nothing"
+        );
+        select(&mut app, 1);
+        assert_eq!(dim(&app), (0x33, 0x33, 0x33), "the picker is not wedged");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// The writer mirrors the CLI's: one line edited, everything else kept.
