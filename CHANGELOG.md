@@ -41,6 +41,14 @@ versions are unreleased until admin cuts a tag.
 - Swap entries in the pane right-click menu, acting on the clicked pane;
   the same swaps are optionally bindable (`swap_left` and friends) for
   anyone who wants dedicated chords.
+- The theme picker previews live: moving the selection paints the
+  workspace in the highlighted theme, Enter locks it in (config write
+  plus daemon reload, as before), Esc restores exactly what was live
+  when the picker opened. Nothing is written while browsing.
+- Light mode drawn on paper instead of inverted from dark: contrast
+  floor raised to 4.5:1 (WCAG AA) and every figure measured against it.
+  The old file's palette.15 measured 1.01:1, white on white, which is
+  what "wonky" was.
 - Claude Code manifest re-verified against 2.1.221 on a live rig, with
   fidelity tests pinned from the captured evidence: mid-turn streaming,
   idle, the new trust-dialog wording, the title table, and the exact
@@ -83,6 +91,15 @@ versions are unreleased until admin cuts a tag.
 - Event panel body rows printed in the terminal's own foreground on the
   panel's themed ground, unreadable on a light host; they wear chrome
   text now.
+- A label held by a vanished pane blocked its name forever while
+  appearing in no roster: killing a tmux session delivers no per-pane
+  deaths to control mode (F47), so the adoption registry never released
+  it. The daemon now frees a session's labels when tmux positively says
+  the session is gone, re-verifies resurrected bindings at boot, and the
+  already-taken error names the holder and the remedy that works.
+- Selected text painted accent-on-raised, which measured 3.23:1 on the
+  light ground, under the theme's own body-text bar; selection now
+  paints panel ink on the accent ground, clearer on both themes.
 - Selection copy never reached the clipboard on stock macOS: an OSC 52
   stdout write "succeeding" was treated as a completed copy, so the
   pbcopy fallback never ran and Terminal.app ignores the sequence (F44).
