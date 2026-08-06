@@ -32,7 +32,7 @@ Find your own name (the row whose pane matches `$TMUX_PANE`, if you are
 inside tmux) with `cyclops status` or `cyclops list`. If you are running
 without a name, `cyclops name <label> --self` registers you using the pane
 you are sitting in — the form to use for yourself, since it needs no pane
-id lookup. Full detail: [../../docs/panes.md](../../docs/panes.md).
+id lookup. Full detail: [../../docs/guides/panes.md](../../docs/guides/panes.md).
 
 ## 1. Discover peers and inspect state
 
@@ -80,11 +80,11 @@ pane is genuinely in that state."
 
 Every command above, and every command below, takes `--json` for scripts
 and honors `--plain`/`NO_COLOR`. See
-[../../docs/panes.md](../../docs/panes.md) for naming and the roster, and
-[../../docs/troubleshooting.md](../../docs/troubleshooting.md) if a pane
+[../../docs/guides/panes.md](../../docs/guides/panes.md) for naming and the roster, and
+[../../docs/guides/troubleshooting.md](../../docs/guides/troubleshooting.md) if a pane
 reads `? unknown` (no manifest matches what is running there — a shell,
 not an agent, or a CLI cyclops has not been taught; see
-[../../docs/MANIFESTS.md](../../docs/MANIFESTS.md)).
+[../../docs/reference/MANIFESTS.md](../../docs/reference/MANIFESTS.md)).
 
 ## 2. Send a message and verify delivery
 
@@ -119,8 +119,8 @@ A late hook can upgrade `delivered_unverified` to `delivered_verified` —
 the only legal transition backwards into more confidence, never less. On a
 fresh install, before hooks are wired, every delivery is screen-tier —
 that is normal, not degraded. Full spec:
-[../../docs/DELIVERY.md](../../docs/DELIVERY.md);
-[../../docs/send.md](../../docs/send.md) for the rest of the badge
+[../../docs/development/DELIVERY.md](../../docs/development/DELIVERY.md);
+[../../docs/guides/send.md](../../docs/guides/send.md) for the rest of the badge
 vocabulary (`queued`, `parked`, `needs attention`) and quota parking.
 
 <!-- F2: capture from a real run — a delivered_verified receipt needs a
@@ -184,7 +184,7 @@ $ cyclops thread m-d7e4ba
 `--fyi` messages (announcements) drop the reply-hint line — treat their
 absence of a hint as intentional, not as something to invent a reply to.
 `cyclops history --with <agent>` reconstructs a whole conversation, both
-directions: [../../docs/history.md](../../docs/history.md).
+directions: [../../docs/guides/history.md](../../docs/guides/history.md).
 
 ## 4. Wait for work
 
@@ -229,7 +229,7 @@ jq -e '.wait[0].outcome == "reached"' receipt.json > /dev/null   # this is the l
 
 `outcome` is one of `reached`, `timeout`, `occupant_changed`, or
 `not_delivered` (delivery never got far enough to start a turn — nothing
-to wait for). Full detail: [../../docs/wait.md](../../docs/wait.md).
+to wait for). Full detail: [../../docs/guides/wait.md](../../docs/guides/wait.md).
 
 <!-- F2: capture from a real run — a `--wait done` that actually reaches
      `reached` needs a real agent CLI to run a turn (working -> idle
@@ -267,7 +267,7 @@ Read the last state line first, then the gate lines above it. A stuck
 delivery is the same shape with the last line further back — held in
 `gating`, or moved to `retry_queued` — and the cause on that line tells
 you where to look next (cause table from
-[../../docs/HANDOFF.md](../../docs/HANDOFF.md)):
+[../../docs/development/HANDOFF.md](../../docs/development/HANDOFF.md)):
 
 | Cause | It means | Look at |
 |---|---|---|
@@ -294,13 +294,13 @@ delivery itself. A delivery held past `gate_hold_notify_ms` (default
 If the daemon itself is confusing rather than the ledger, `cyclops read
 <agent> --source detection --raw` and `CYCLOPS_LOG=debug cyclopsd`
 (operator-run) are the next layer down:
-[../../docs/troubleshooting.md](../../docs/troubleshooting.md).
+[../../docs/guides/troubleshooting.md](../../docs/guides/troubleshooting.md).
 
 ## 6. Safety rules you must never work around
 
 These are invariants, not preferences — each one exists because breaking
 it already did something specific and bad
-([../../docs/INVARIANTS.md](../../docs/INVARIANTS.md) has the full list
+([../../docs/development/INVARIANTS.md](../../docs/development/INVARIANTS.md) has the full list
 and the proof).
 
 - **Never bypass the delivery gate.** Do not `tmux send-keys` (or paste,
@@ -328,17 +328,19 @@ and the proof).
 
 ## Read more
 
-- [../../docs/DELIVERY.md](../../docs/DELIVERY.md) — the delivery spec:
+- [../../docs/development/DELIVERY.md](../../docs/development/DELIVERY.md) — the delivery spec:
   states, evidence tiers, ordering.
-- [../../docs/MANIFESTS.md](../../docs/MANIFESTS.md) — teaching cyclops a
+- [../../docs/reference/MANIFESTS.md](../../docs/reference/MANIFESTS.md) — teaching cyclops a
   new agent CLI (one TOML file, no code) when a pane reads `? unknown`.
-- [../../docs/troubleshooting.md](../../docs/troubleshooting.md) — real
+- [../../docs/guides/troubleshooting.md](../../docs/guides/troubleshooting.md) — real
   output for every common failure, with the fix.
-- [../../docs/send.md](../../docs/send.md), [../../docs/wait.md](../../docs/wait.md),
-  [../../docs/history.md](../../docs/history.md),
-  [../../docs/panes.md](../../docs/panes.md) — one page per verb.
+- [../../docs/guides/send.md](../../docs/guides/send.md), [../../docs/guides/wait.md](../../docs/guides/wait.md),
+  [../../docs/guides/history.md](../../docs/guides/history.md),
+  [../../docs/guides/panes.md](../../docs/guides/panes.md) — one page per verb.
 
-These doc paths are current as of this repo's present layout; a later
-repository migration (M1 in the workspace recommendation plan) moves
-`docs/` under a reorganized tree, and task F2 updates these links and
-fills in the deferred output blocks above once that lands.
+These doc paths follow the migrated repository layout (docs sorted into
+`guides/`, `reference/`, and `development/`). The three output blocks
+above marked for F2 remain deferred: each needs a live, hook-wired
+vendor CLI (a verified-tier receipt, a wait that reaches `done`, a
+genuinely blocked ledger chain), which no isolated fixture can produce.
+Capture them from a real session when one exists.
