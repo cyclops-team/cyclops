@@ -80,9 +80,26 @@ impl ControlClient {
         Ok(())
     }
 
-    /// Size the attached window by the most recently active client (R5).
-    pub async fn set_window_size_latest(&self) -> Result<(), TmuxError> {
-        self.command("set-option -w window-size latest").await?;
+    /// Size `window_id` by the smallest size-declared client showing it
+    /// (`set-option -w window-size smallest`).
+    ///
+    /// This replaces the earlier `latest` policy (R5), which held only while
+    /// the declaring control client was the lone size authority. A control
+    /// client never produces tty input, so under `latest` any regular client
+    /// that attaches to the session becomes the authority the moment it is
+    /// used, and tmux lays panes out wider than the declared canvas: typed
+    /// text runs past the visible pane edge. `smallest` has no authority to
+    /// steal. tmux takes the minimum over size-declared clients, so the
+    /// window never exceeds this client's declared canvas and still equals
+    /// it exactly whenever this client is the only viewer. Control clients
+    /// that never declared a size (the daemon's watcher) are ignored under
+    /// both policies (F48).
+    pub async fn set_window_size_smallest(&self, window_id: &str) -> Result<(), TmuxError> {
+        self.command(&format!(
+            "set-option -w -t {} window-size smallest",
+            quote_arg(window_id)
+        ))
+        .await?;
         Ok(())
     }
 

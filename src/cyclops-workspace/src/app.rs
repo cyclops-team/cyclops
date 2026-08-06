@@ -44,7 +44,7 @@ use crate::input::encode_send_keys;
 use crate::input::mouse::{HitMap, HitTarget, MenuState};
 use crate::input::router::{Router, RouterResult};
 use crate::layout::SplitDir;
-use crate::model::{pane_is_visible, RuntimeRegistry, WorkspaceModel};
+use crate::model::{pane_is_visible, RuntimeRegistry, TabModel, WorkspaceModel};
 use crate::naming;
 use crate::persist::{self, load_prefs, set_last_active, WorkspacePrefs};
 use crate::render::{
@@ -198,6 +198,11 @@ struct App {
     /// resize notification loop when expanded pane gutters are already at
     /// their target geometry.
     declared_client_size: Option<(u16, u16)>,
+    /// Window ids already pinned to `window-size smallest`
+    /// ([`pin_window_sizes`]), so reconciliation asks tmux once per window
+    /// rather than once per snapshot. Cleared on reconnect: a restarted
+    /// server can reuse ids for windows that were never pinned.
+    pinned_windows: HashSet<String>,
     needs_reconcile: bool,
     /// A structural notification changed visible pane dimensions. Hydration
     /// waits for the render deadline so resize bursts collapse to one set of
@@ -303,10 +308,6 @@ pub async fn run_async() -> i32 {
         }
     };
 
-    if let Err(e) = client.set_window_size_latest().await {
-        eprintln!("{e}");
-    }
-
     let bindings = load_bindings(&home);
     let (tx, mut rx) = mpsc::unbounded_channel::<AppMsg>();
 
@@ -396,6 +397,11 @@ pub async fn run_async() -> i32 {
         }
     }
 
+    // Pin the sizing policy before declaring the canvas, so the declaration
+    // below is already the binding vote (see `set_window_size_smallest`).
+    let mut pinned_windows = HashSet::new();
+    pin_window_sizes(&client, &model.session.tabs, &mut pinned_windows, &home).await;
+
     // Declare terminal cells only after the split topology is known. tmux
     // gets pane content cells; two-cell separator bands remain UI chrome.
     let chrome_canvas = crate::render::chrome_areas_for(
@@ -467,6 +473,7 @@ pub async fn run_async() -> i32 {
         cursor_style: None,
         term_size,
         declared_client_size,
+        pinned_windows,
         needs_reconcile: false,
         needs_hydrate: false,
         paste_seq: 0,
@@ -896,8 +903,8 @@ async fn handle_reconnect(
         Ok((new_client, rx)) => {
             *client = new_client;
             spawn_notif_forwarder(rx, tx.clone());
-            let _ = client.set_window_size_latest().await;
             app.declared_client_size = None;
+            app.pinned_windows.clear();
             resize_client(app, client).await;
             reconcile(app, client).await?;
             app.link_state = LinkState::Live;
@@ -1003,6 +1010,35 @@ async fn resize_client(app: &mut App, client: &ControlClient) {
     match client.set_client_size(size.0, size.1).await {
         Ok(()) => app.declared_client_size = Some(size),
         Err(error) => log_err(&app.home, &error),
+    }
+}
+
+/// The tab windows not yet pinned to the sizing policy, in tab order.
+fn unpinned_windows<'a>(tabs: &'a [TabModel], pinned: &HashSet<String>) -> Vec<&'a str> {
+    tabs.iter()
+        .filter(|tab| !pinned.contains(&tab.window_id))
+        .map(|tab| tab.window_id.as_str())
+        .collect()
+}
+
+/// Pin `window-size smallest` on every window of the displayed session,
+/// once per window id. Without the pin, tmux's default `latest` policy lets
+/// any other attached client out-size this one, laying panes out wider than
+/// the painted canvas (F48). A window that fails stays unpinned, so the
+/// next reconcile retries it.
+async fn pin_window_sizes(
+    client: &ControlClient,
+    tabs: &[TabModel],
+    pinned: &mut HashSet<String>,
+    home: &std::path::Path,
+) {
+    for window_id in unpinned_windows(tabs, pinned) {
+        match client.set_window_size_smallest(window_id).await {
+            Ok(()) => {
+                pinned.insert(window_id.to_string());
+            }
+            Err(error) => log_err(home, &error),
+        }
     }
 }
 
@@ -2008,6 +2044,16 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
         app.decoration = snapshot;
     }
     app.persist_active();
+    // New windows arrive through this snapshot (new tab, session switch,
+    // external new-window); pin them before sizing so no displayed window
+    // ever lays out under another client's authority.
+    pin_window_sizes(
+        client,
+        &app.model.session.tabs,
+        &mut app.pinned_windows,
+        &app.home,
+    )
+    .await;
     resize_client(app, client).await;
     hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await;
     app.needs_hydrate = false;
@@ -2382,6 +2428,7 @@ mod tests {
             cursor_style: None,
             term_size: (40, 12),
             declared_client_size: None,
+            pinned_windows: HashSet::new(),
             needs_reconcile: false,
             needs_hydrate: false,
             paste_seq: 0,
@@ -2426,6 +2473,32 @@ mod tests {
     #[test]
     fn help_exits_zero_message() {
         assert_eq!(print_help_and_exit(), 0);
+    }
+
+    #[test]
+    fn windows_pin_once_and_a_failed_pin_stays_eligible() {
+        let tab = |id: &str| crate::model::TabModel {
+            window_id: id.into(),
+            name: "1".into(),
+            layout: crate::layout::ResolvedLayout::Leaf {
+                pane_id: "%0".into(),
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            active_pane: "%0".into(),
+            zoomed: false,
+        };
+        let tabs = vec![tab("@0"), tab("@1")];
+        let mut pinned = HashSet::new();
+        assert_eq!(unpinned_windows(&tabs, &pinned), vec!["@0", "@1"]);
+        // Only a recorded pin drops out; a window whose pin failed is not
+        // recorded and stays eligible for the next reconcile.
+        pinned.insert("@0".to_string());
+        assert_eq!(unpinned_windows(&tabs, &pinned), vec!["@1"]);
+        pinned.insert("@1".to_string());
+        assert!(unpinned_windows(&tabs, &pinned).is_empty());
     }
 
     #[test]

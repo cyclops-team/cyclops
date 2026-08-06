@@ -802,3 +802,25 @@ re-verifies resurrected bindings for sessions outside the watched set
 with one has-session each. A tmux error keeps the label: could-not-ask
 never releases. src/cyclopsd/src/lib.rs, registry.rs; pinned by
 tests/m4_name.rs.
+
+## F48. `window-size latest` lets any regular client out-size a control client's declared canvas (MEASURED)
+
+Measured on tmux 3.6a while fixing the invisible-typing overflow in the
+workspace. A control client only counts for window sizing after it
+declares a size with `refresh-client -C` (the daemon's watcher, which
+never declares, is ignored: a session with the workspace at 176 and the
+daemon attached stays at 176). But under `window-size latest` the
+declaration is not authority: attaching a plain 240x60 client to the
+same session snapped the window from the workspace's declared 176x46 to
+240x58, and a second declaring control client did the same, so panes
+laid out 64 columns wider than the painted canvas and typed text ran
+past the visible pane edge. A control client can never win `latest`
+back, because latest follows tty input and control clients produce
+none. `window-size smallest` is a fixed point instead: the window is
+the minimum over declaring clients (176 with the 240 viewer attached,
+150 when the viewer redeclares 150x40, back to 176 when it detaches),
+so the window never exceeds the workspace canvas and a smaller viewer
+only shrinks it, which the canvas absorbs as gutter. Probe: two `tmux
+-C attach` coprocesses issuing `refresh-client -C` against one rig
+session, plus a real client on a second tmux server. Pinned by
+src/cyclops-workspace/tests/geometry.rs.

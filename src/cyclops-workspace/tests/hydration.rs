@@ -69,7 +69,10 @@ async fn hydrated_grid_matches_plain_capture() {
     let (client, _notif) = ControlClient::spawn(rig.config("hyd"))
         .await
         .expect("attach");
-    client.set_window_size_latest().await.expect("window-size");
+    client
+        .set_window_size_smallest("@0")
+        .await
+        .expect("window-size");
     client.set_client_size(80, 24).await.expect("client size");
 
     rig.server.run_ok(&[
@@ -101,7 +104,10 @@ async fn resize_then_rehydrate_still_matches_capture() {
     let (client, _notif) = ControlClient::spawn(rig.config("hrsz"))
         .await
         .expect("attach");
-    client.set_window_size_latest().await.expect("window-size");
+    client
+        .set_window_size_smallest("@0")
+        .await
+        .expect("window-size");
 
     rig.server.run_ok(&[
         "send-keys",
@@ -138,7 +144,10 @@ async fn hydrating_a_pane_in_the_alternate_screen_restores_what_the_user_sees() 
     let (client, _notif) = ControlClient::spawn(rig.config("halt"))
         .await
         .expect("attach");
-    client.set_window_size_latest().await.expect("window-size");
+    client
+        .set_window_size_smallest("@0")
+        .await
+        .expect("window-size");
     client.set_client_size(80, 24).await.expect("client size");
 
     // Mark the primary screen, then enter the alternate screen and paint a
