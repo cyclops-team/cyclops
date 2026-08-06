@@ -979,6 +979,7 @@ mod tests {
             state,
             state_ms: None,
             hooks_verified: None,
+            manifest_display_name: None,
         }
     }
 

@@ -495,6 +495,41 @@ async fn a_pinned_manifest_binds_as_soon_as_the_pane_is_named() {
     rig.shutdown().await;
 }
 
+/// The manifest's display name is daemon identity data: the daemon loaded
+/// it off the manifest TOML at boot, same as the id, so a pane bound to a
+/// manifest carries it in status. This is what lets a client render the
+/// name without re-parsing manifest files itself (the ownership cleanup in
+/// `.agents/planning/2026-08-03-cyclops-workspace-tui/recommendation.md`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bound_manifest_s_display_name_rides_along_in_status() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    // CAT_MANIFEST binds by process name alone (id "fix", display name
+    // "Cat fixture"), so no explicit pane.label is needed to bind it.
+    let mut rig = Rig::new("m4dispname", CAT_MANIFEST, "cat", "").await;
+    rig.wait_attached(1).await;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = rig.ctl.request("status", json!({})).await;
+        let row = &status["result"]["sessions"][0]["panes"][0];
+        if row["manifest"] == json!("fix") {
+            assert_eq!(
+                row["manifest_display_name"],
+                json!("Cat fixture"),
+                "{status}"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "manifest never bound: {status}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    rig.shutdown().await;
+}
+
 /// Border text is a window setting with no pane scope, so it does not
 /// travel with a pane the way the pane's own options do. A named pane that
 /// moves has to take the border text with it, or the window it left keeps

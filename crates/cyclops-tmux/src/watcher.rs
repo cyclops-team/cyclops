@@ -131,10 +131,11 @@ impl PaneRow {
             width: self.width,
             height: self.height,
             state,
-            // Elapsed-in-state and hook liveness are daemon knowledge;
-            // the daemon fills both in.
+            // Elapsed-in-state, hook liveness, and the manifest's display
+            // name are daemon knowledge; the daemon fills all three in.
             state_ms: None,
             hooks_verified: None,
+            manifest_display_name: None,
         }
     }
 }

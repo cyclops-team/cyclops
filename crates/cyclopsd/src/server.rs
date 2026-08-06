@@ -752,6 +752,15 @@ pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResul
                             entry.and_then(|e| e.manifest.as_deref()),
                             r.pane_pid,
                         );
+                        // The manifest's own display name, from the same
+                        // load the daemon did at boot: a client renders
+                        // daemon identity data instead of re-parsing
+                        // manifest TOML off disk to recover it.
+                        ps.manifest_display_name = ps
+                            .manifest
+                            .as_ref()
+                            .and_then(|id| inner.manifests.get(id))
+                            .map(|m| m.agent.display_name.clone());
                         ps
                     })
                     .collect(),

@@ -1,7 +1,7 @@
 //! Agent decoration from the daemon: badges, attention rollup, event stream.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use cyclops_proto::{
     attention::{Attention, AttentionItem},
@@ -188,17 +188,11 @@ pub fn fetch_decoration(home: &Path) -> Option<DecorationSnapshot> {
             open_deliveries: true,
         },
     )
-    .map(|status| {
-        let display_names = manifest_display_names(home);
-        snapshot_from_status(&status, &display_names)
-    })
+    .map(|status| snapshot_from_status(&status))
     .ok()
 }
 
-fn snapshot_from_status(
-    status: &StatusResult,
-    display_names: &HashMap<String, String>,
-) -> DecorationSnapshot {
+fn snapshot_from_status(status: &StatusResult) -> DecorationSnapshot {
     let attention = Attention::from_status(status);
     let attention_panes: HashMap<String, AgentState> = attention
         .items()
@@ -212,10 +206,7 @@ fn snapshot_from_status(
     for session in &status.sessions {
         for pane in &session.panes {
             let needs_attention = attention_panes.contains_key(&pane.pane_id);
-            panes.insert(
-                pane.pane_id.clone(),
-                pane_decoration(pane, needs_attention, display_names),
-            );
+            panes.insert(pane.pane_id.clone(), pane_decoration(pane, needs_attention));
         }
     }
     DecorationSnapshot {
@@ -225,71 +216,21 @@ fn snapshot_from_status(
     }
 }
 
-fn pane_decoration(
-    pane: &PaneStatus,
-    needs_attention: bool,
-    display_names: &HashMap<String, String>,
-) -> PaneDecoration {
+fn pane_decoration(pane: &PaneStatus, needs_attention: bool) -> PaneDecoration {
     PaneDecoration {
         pane_id: pane.pane_id.clone(),
         window_id: pane.window_id.clone(),
         label: pane.agent.clone(),
         manifest: pane.manifest.clone(),
-        manifest_display_name: pane
-            .manifest
-            .as_ref()
-            .and_then(|id| display_names.get(id).cloned()),
+        // Daemon identity data straight off the wire: the daemon already
+        // loaded the manifest at boot, so a client renders this instead of
+        // rediscovering it by re-parsing manifest TOML off disk. None from
+        // a daemon that predates the field, or a pane with no bound
+        // manifest; `sidebar_name` falls back to the bare manifest id.
+        manifest_display_name: pane.manifest_display_name.clone(),
         state: pane.state,
         needs_attention,
     }
-}
-
-/// Read only manifest identity metadata. Invalid files are already reported
-/// by the daemon and cannot be allowed to break primary workspace chrome.
-fn manifest_display_names(home: &Path) -> HashMap<String, String> {
-    let Some(dir) = manifest_dir(home) else {
-        return HashMap::new();
-    };
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return HashMap::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
-        .filter_map(|text| text.parse::<toml::Table>().ok())
-        .filter_map(|table| {
-            let agent = table.get("agent")?.as_table()?;
-            Some((
-                agent.get("id")?.as_str()?.to_string(),
-                agent.get("display_name")?.as_str()?.to_string(),
-            ))
-        })
-        .collect()
-}
-
-/// Match the daemon's manifest-directory precedence without importing its
-/// IO-owning crate: explicit config, seeded home, then a development checkout.
-fn manifest_dir(home: &Path) -> Option<PathBuf> {
-    let configured = std::fs::read_to_string(home.join("config.toml"))
-        .ok()
-        .and_then(|text| text.parse::<toml::Table>().ok())
-        .and_then(|table| {
-            table
-                .get("manifest_dir")
-                .and_then(toml::Value::as_str)
-                .map(PathBuf::from)
-        });
-    configured
-        .or_else(|| {
-            home.join("manifests")
-                .is_dir()
-                .then(|| home.join("manifests"))
-        })
-        .or_else(|| {
-            PathBuf::from("manifests")
-                .is_dir()
-                .then(|| PathBuf::from("manifests"))
-        })
 }
 
 #[cfg(test)]
@@ -313,6 +254,7 @@ mod tests {
             state,
             state_ms: None,
             hooks_verified: None,
+            manifest_display_name: None,
         }
     }
 
@@ -339,18 +281,44 @@ mod tests {
         let dec = pane_decoration(
             &pane("%0", "@0", Some("reviewer"), AgentState::Working),
             false,
-            &HashMap::new(),
         );
         assert_eq!(DecorationSnapshot::sidebar_name(&dec), "reviewer");
     }
 
+    /// Sidebar naming precedence, all three levels, exactly as
+    /// `sidebar_name` ranks them. The display name comes straight off the
+    /// status answer set on the raw `PaneStatus` here — never from a
+    /// manifest file on disk, which is the scan this field replaced (see
+    /// the deleted `manifest_display_names`/`manifest_dir` functions).
     #[test]
-    fn unnamed_detection_uses_the_manifest_display_name() {
-        let mut raw = pane("%0", "@0", None, AgentState::Working);
-        raw.manifest = Some("claude".into());
-        let names = HashMap::from([("claude".into(), "Claude Code".into())]);
-        let dec = pane_decoration(&raw, false, &names);
-        assert_eq!(DecorationSnapshot::sidebar_name(&dec), "Claude Code");
+    fn sidebar_name_prefers_label_then_manifest_display_name_then_manifest_id() {
+        // A label wins even when the daemon also sent a display name.
+        let mut labeled = pane("%0", "@0", Some("reviewer"), AgentState::Working);
+        labeled.manifest_display_name = Some("Claude Code".into());
+        assert_eq!(
+            DecorationSnapshot::sidebar_name(&pane_decoration(&labeled, false)),
+            "reviewer"
+        );
+
+        // No label: the manifest's display name from the answer wins over
+        // its bare id.
+        let mut named = pane("%1", "@0", None, AgentState::Working);
+        named.manifest = Some("claude".into());
+        named.manifest_display_name = Some("Claude Code".into());
+        assert_eq!(
+            DecorationSnapshot::sidebar_name(&pane_decoration(&named, false)),
+            "Claude Code"
+        );
+
+        // No label and no display name — an old daemon that predates the
+        // field, or a pane whose bound manifest carried none. Cosmetic
+        // miss, not an error: falls back to the bare manifest id.
+        let mut bare = pane("%2", "@0", None, AgentState::Working);
+        bare.manifest = Some("claude".into());
+        assert_eq!(
+            DecorationSnapshot::sidebar_name(&pane_decoration(&bare, false)),
+            "claude"
+        );
     }
 
     #[test]
@@ -358,14 +326,12 @@ mod tests {
         let unknown = pane_decoration(
             &pane("%0", "@0", Some("planner"), AgentState::Unknown),
             false,
-            &HashMap::new(),
         );
         assert_eq!(DecorationSnapshot::primary_status(&unknown), None);
 
         let blocked = pane_decoration(
             &pane("%1", "@0", Some("reviewer"), AgentState::BlockedPermission),
             true,
-            &HashMap::new(),
         );
         assert_eq!(
             DecorationSnapshot::primary_status(&blocked),
@@ -390,11 +356,7 @@ mod tests {
             AgentState::BlockedPermission,
             AgentState::BlockedQuota,
         ] {
-            let dec = pane_decoration(
-                &pane("%0", "@0", Some("reviewer"), state),
-                false,
-                &HashMap::new(),
-            );
+            let dec = pane_decoration(&pane("%0", "@0", Some("reviewer"), state), false);
             assert_eq!(
                 DecorationSnapshot::primary_status(&dec),
                 Some(PrimaryStatus {
@@ -408,40 +370,11 @@ mod tests {
     }
 
     #[test]
-    fn configured_manifest_directory_drives_display_names() {
-        let home = cyclops_proto::scratch::scratch_dir("workspace-manifest-display");
-        let _ = std::fs::remove_dir_all(&home);
-        let custom = home.join("custom-manifests");
-        std::fs::create_dir_all(&custom).expect("custom manifest dir");
-        std::fs::write(
-            home.join("config.toml"),
-            format!("manifest_dir = {:?}\n", custom.to_string_lossy()),
-        )
-        .expect("config");
-        std::fs::write(
-            custom.join("custom.toml"),
-            "[agent]\nid = \"custom\"\ndisplay_name = \"Custom Agent\"\n",
-        )
-        .expect("manifest");
-
-        assert_eq!(
-            manifest_display_names(&home)
-                .get("custom")
-                .map(String::as_str),
-            Some("Custom Agent")
-        );
-        let _ = std::fs::remove_dir_all(home);
-    }
-
-    #[test]
     fn sidebar_membership_follows_stable_window_ids() {
-        let snap = snapshot_from_status(
-            &status_with(vec![
-                pane("%0", "@7", Some("reviewer"), AgentState::Idle),
-                pane("%1", "@8", Some("other"), AgentState::Working),
-            ]),
-            &HashMap::new(),
-        );
+        let snap = snapshot_from_status(&status_with(vec![
+            pane("%0", "@7", Some("reviewer"), AgentState::Idle),
+            pane("%1", "@8", Some("other"), AgentState::Working),
+        ]));
 
         let rows = snap.agent_rows_for_window_ids(&["@7".to_string()], &[]);
         assert_eq!(rows.len(), 1);
@@ -454,7 +387,7 @@ mod tests {
             pane("%0", "@0", Some("a"), AgentState::BlockedPermission),
             pane("%1", "@0", Some("b"), AgentState::Idle),
         ]);
-        let snap = snapshot_from_status(&status, &HashMap::new());
+        let snap = snapshot_from_status(&status);
         assert!(snap.tab_needs_attention("@0"));
         assert!(snap.pane("%0").unwrap().needs_attention);
         assert!(!snap.pane("%1").unwrap().needs_attention);

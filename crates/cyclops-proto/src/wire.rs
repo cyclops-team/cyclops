@@ -246,6 +246,18 @@ pub struct PaneStatus {
     /// field: old daemons omit it, old clients ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks_verified: Option<bool>,
+    /// The bound manifest's human-readable name, e.g. "Claude Code" for
+    /// manifest id "claude". The daemon already loaded this at boot; a
+    /// client used to re-derive it by re-parsing manifest TOML off disk
+    /// itself (see the ownership-cleanup paragraph in
+    /// `.agents/planning/2026-08-03-cyclops-workspace-tui/recommendation.md`).
+    /// None when the pane has no bound manifest, and always from a daemon
+    /// that predates the field. Purely cosmetic: a caller that gets None
+    /// falls back to the bare `manifest` id, never treats a miss as an
+    /// error. Additive optional field: old daemons omit it, old clients
+    /// ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
