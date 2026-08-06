@@ -41,6 +41,26 @@ cyclops start
 It starts the daemon too, so there is no second command and no tab to
 keep open.
 
+## Uninstall
+
+A buggy install rarely needs this: run the installer again and it
+overwrites in place. To actually remove cyclops:
+
+```bash
+curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
+```
+
+That stops the daemon, removes both binaries, and takes the installer's
+PATH block back out of your shell profile, backing the file up first.
+Quit any open workspace too (`q`); a running one keeps using the deleted
+binary until it exits. Your state (agent names, message record, themes,
+config) stays at `~/.cyclops` so a later reinstall picks up where you
+left off. To leave nothing behind:
+
+```bash
+rm -rf ~/.cyclops
+```
+
 ## Start here
 
 One rung at a time. Each is useful on its own, and you can stop at any of
