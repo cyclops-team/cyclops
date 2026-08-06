@@ -143,6 +143,17 @@ fn cell_style(cell: &GridCell, base: Style, palette: Option<&[RtColor; 16]>) -> 
     if let Some(bg) = rt_color(cell.attrs.bg, palette) {
         style = style.bg(bg);
     }
+    // Minimum contrast, colors-on only (a palette exists exactly when
+    // colors are on). Agents pick their colors for the terminal THEY
+    // imagine: pale grays drawn for a dark ground vanish on paper, and
+    // their own dark fills swallow the theme's ink. Whatever the pair,
+    // the text stays readable; rule 11 holds because the clamp never
+    // runs with color off.
+    if palette.is_some() {
+        if let (Some(fg), Some(bg)) = (style.fg, style.bg) {
+            style.fg = Some(readable_fg(fg, bg, palette));
+        }
+    }
     if cell.attrs.bold {
         style = style.add_modifier(Modifier::BOLD);
     }
@@ -178,6 +189,198 @@ fn rt_color(c: Color, palette: Option<&[RtColor; 16]>) -> Option<RtColor> {
             _ => RtColor::Indexed(i),
         }),
         Color::Rgb(r, g, b) => Some(RtColor::Rgb(r, g, b)),
+    }
+}
+
+/// The readability floor a pane cell's text never falls under. Body-text
+/// bars belong to the theme's own figures; this only catches pairs an
+/// agent composed for a different ground, so it sits well below them.
+const MIN_CONTRAST: f64 = 2.5;
+
+/// `fg`, nudged toward black or white until it clears [`MIN_CONTRAST`]
+/// against `bg`. A pair already readable comes back untouched, hue and
+/// all; a hopeless one lands on the pole. The output is truecolor when
+/// the palette resolves truecolor (the theme's own signal) and a
+/// 256-color grid entry otherwise, so a clamped color never emits a
+/// sequence the terminal was told not to expect.
+fn readable_fg(fg: RtColor, bg: RtColor, palette: Option<&[RtColor; 16]>) -> RtColor {
+    let (Some(f), Some(b)) = (srgb(fg), srgb(bg)) else {
+        return fg;
+    };
+    if contrast(f, b) >= MIN_CONTRAST {
+        return fg;
+    }
+    let pole = if luminance(b) > 0.5 {
+        (0, 0, 0)
+    } else {
+        (255, 255, 255)
+    };
+    let mut fixed = pole;
+    for step in [0.25, 0.5, 0.75] {
+        let c = lerp(f, pole, step);
+        if contrast(c, b) >= MIN_CONTRAST {
+            fixed = c;
+            break;
+        }
+    }
+    let truecolor = matches!(
+        palette,
+        Some(p) if p.iter().any(|c| matches!(c, RtColor::Rgb(..)))
+    );
+    if truecolor {
+        RtColor::Rgb(fixed.0, fixed.1, fixed.2)
+    } else {
+        RtColor::Indexed(cyclops_theme::derive_c256(fixed))
+    }
+}
+
+/// RGB of a ratatui color, via the standard xterm-256 table for indexed
+/// entries. Host palettes can remap 0..15, but a clamp keyed on the
+/// standard values is right far more often than no clamp at all.
+fn srgb(c: RtColor) -> Option<(u8, u8, u8)> {
+    match c {
+        RtColor::Rgb(r, g, b) => Some((r, g, b)),
+        RtColor::Indexed(i) => Some(xterm_rgb(i)),
+        _ => None,
+    }
+}
+
+fn xterm_rgb(i: u8) -> (u8, u8, u8) {
+    const STD16: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (205, 0, 0),
+        (0, 205, 0),
+        (205, 205, 0),
+        (0, 0, 238),
+        (205, 0, 205),
+        (0, 205, 205),
+        (229, 229, 229),
+        (127, 127, 127),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (92, 92, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    match i {
+        0..=15 => STD16[usize::from(i)],
+        16..=231 => {
+            let i = i - 16;
+            let level = |n: u8| if n == 0 { 0 } else { 55 + 40 * n };
+            (level(i / 36), level((i / 6) % 6), level(i % 6))
+        }
+        232..=255 => {
+            let g = 8 + 10 * (i - 232);
+            (g, g, g)
+        }
+    }
+}
+
+/// WCAG 2.1 relative luminance, the same math the theme contrast tests
+/// measure with (src/cyclops-theme/tests/shipped.rs).
+fn luminance((r, g, b): (u8, u8, u8)) -> f64 {
+    let lin = |c: u8| {
+        let c = f64::from(c) / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+}
+
+fn contrast(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+fn lerp(from: (u8, u8, u8), to: (u8, u8, u8), f: f64) -> (u8, u8, u8) {
+    let mix = |a: u8, b: u8| (f64::from(a) + (f64::from(b) - f64::from(a)) * f).round() as u8;
+    (mix(from.0, to.0), mix(from.1, to.1), mix(from.2, to.2))
+}
+
+#[cfg(test)]
+mod contrast_tests {
+    use super::*;
+    use crate::runtime::CellAttrs;
+
+    fn cell(fg: Color, bg: Color) -> GridCell {
+        GridCell {
+            ch: 'x',
+            zerowidth: Vec::new(),
+            wide_spacer: false,
+            attrs: CellAttrs {
+                fg,
+                bg,
+                ..CellAttrs::default()
+            },
+        }
+    }
+
+    const WHITE: RtColor = RtColor::Rgb(254, 254, 254);
+    const INK: RtColor = RtColor::Rgb(42, 42, 42);
+    const PALETTE: [RtColor; 16] = [RtColor::Rgb(10, 10, 10); 16];
+
+    /// The live symptom: an agent's pale gray, drawn for a dark
+    /// terminal, must not vanish on paper.
+    #[test]
+    fn pale_gray_on_paper_darkens_to_readable() {
+        let base = Style::new().fg(INK).bg(WHITE);
+        let style = cell_style(
+            &cell(Color::Indexed(250), Color::Default),
+            base,
+            Some(&PALETTE),
+        );
+        let fg = srgb(style.fg.unwrap()).unwrap();
+        let bg = srgb(style.bg.unwrap()).unwrap();
+        assert!(contrast(fg, bg) >= MIN_CONTRAST, "{fg:?} on {bg:?}");
+        assert_ne!(
+            style.fg.unwrap(),
+            RtColor::Indexed(250),
+            "it was 1.2:1 before"
+        );
+    }
+
+    /// The other live symptom: an agent's own dark fill must not swallow
+    /// the theme's ink.
+    #[test]
+    fn theme_ink_on_an_agents_dark_fill_lightens() {
+        let base = Style::new().fg(INK).bg(WHITE);
+        let style = cell_style(
+            &cell(Color::Default, Color::Rgb(30, 30, 30)),
+            base,
+            Some(&PALETTE),
+        );
+        let fg = srgb(style.fg.unwrap()).unwrap();
+        assert!(contrast(fg, (30, 30, 30)) >= MIN_CONTRAST, "{fg:?}");
+    }
+
+    /// A pair already readable keeps its hue exactly.
+    #[test]
+    fn a_readable_color_is_untouched() {
+        let base = Style::new().fg(INK).bg(WHITE);
+        let style = cell_style(
+            &cell(Color::Rgb(200, 0, 0), Color::Default),
+            base,
+            Some(&PALETTE),
+        );
+        assert_eq!(style.fg.unwrap(), RtColor::Rgb(200, 0, 0));
+    }
+
+    /// Rule 11: with color off (no palette) nothing is clamped, the
+    /// program's own colors pass through untouched.
+    #[test]
+    fn no_palette_means_no_clamp() {
+        let style = cell_style(
+            &cell(Color::Indexed(250), Color::Indexed(255)),
+            Style::new(),
+            None,
+        );
+        assert_eq!(style.fg.unwrap(), RtColor::Indexed(250));
+        assert_eq!(style.bg.unwrap(), RtColor::Indexed(255));
     }
 }
 
