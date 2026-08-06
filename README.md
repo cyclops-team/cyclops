@@ -327,9 +327,9 @@ The socket the CLI speaks is documented and open:
 
 ## Watch it live
 
-`cyclops ui` turns the terminal into the stream: messages and state changes
-as they happen, calm by default, firehose one keypress away, the eye in the
-header. [docs/ui.md](docs/ui.md).
+`cyclops watch` turns the terminal into the stream: messages and state
+changes as they happen, calm by default, firehose one keypress away, the
+eye in the header. [docs/ui.md](docs/ui.md).
 
 Colors are semantic tokens, never raw values in code, so a theme file changes
 every surface at once, including the pane borders:
@@ -369,14 +369,14 @@ above.
 | `cyclops thread <id>` | One message plus its replies and delivery record |
 | `cyclops hooks install <cli> --agent ...` | Render a vendor hook config plus wiring instructions |
 | `cyclops hooks verify\|selftest <agent>` | Hook liveness, and one no-op delivery that proves the ack fires |
-| `cyclops ui` | The live stream: calm admin view, firehose one keypress away, jump-to-pane |
+| `cyclops watch` | The live stream: calm admin view, firehose one keypress away, jump-to-pane |
 | `cyclops theme [name]` | Switch themes, or list them with a preview of each. A switch is live at once |
 | `cyclops read <agent> --source detection` | Per-sensor readings behind a state verdict |
-| `cyclops watch` | Live event stream |
 | `cyclops ping` | Daemon round trip |
 
-All of them take `--json` and `--plain`, and honor `NO_COLOR`. (`ui` has no
-`--json`; the machine stream is `cyclops watch --json`.)
+All of them take `--json` and `--plain`, and honor `NO_COLOR`. (The
+deprecated `cyclops ui` alias has no `--json`; the machine stream is
+`cyclops watch --json`.)
 
 ## How it works
 

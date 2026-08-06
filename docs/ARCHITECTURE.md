@@ -25,7 +25,7 @@ flowchart LR
     T -->|"the payload, as if pasted"| B["recipient's pane"]
     B -->|"the vendor hook runs cyclops hook,<br/>which posts back through the same socket"| D
     D -->|"one receipt per recipient"| C
-    D -->|"and an event line to every subscriber"| S(["cyclops ui · cyclops watch"])
+    D -->|"and an event line to every subscriber"| S(["cyclops watch"])
 ```
 
 Four rules hold the whole design up.
@@ -441,7 +441,7 @@ what it deliberately does not; read that before changing one.
 | `cyclops-tmux` | The tmux adapter and the blast wall: nothing outside it speaks to tmux. Control mode, the reconciling pane table, version parsing, one-shot focus and layout. |
 | `cyclopsd` | The daemon: watcher, fusion, delivery pipeline, ledger writer, socket server, adoption registry, pane chrome. |
 | `cyclops` | The CLI: a thin NDJSON client plus the human-facing renderers, `cyclops hook`, and the workspace verbs. |
-| `cyclops-ui` | The stream behind `cyclops ui`: admin view, firehose, the eye, jump-to-pane, windowed rendering over a 10k ring (docs/ui.md). |
+| `cyclops-ui` | The stream behind `cyclops watch`: admin view, firehose, the eye, jump-to-pane, windowed rendering over a 10k ring (docs/ui.md). |
 | `cyclops-ledger` | Crash-safe append-only NDJSON writer and cursor reader. Fsync before acknowledging; torn final lines are sealed, never rewritten. |
 | `cyclops-theme` | The semantic token vocabulary, theme files, 256-color fallback, selection and hot reload (docs/themes.md). |
 | `cyclops-testrig` | Test-only. The isolated tmux server and the one statement of its teardown rule. |

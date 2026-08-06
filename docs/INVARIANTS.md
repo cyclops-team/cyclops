@@ -366,8 +366,9 @@ glyph, the glyph or the word is doing too little.
   color-off rendering of a blocked row and a parked row is the words;
   `crates/cyclops-theme/tests/vocabulary.rs`,
   `every_token_in_the_vocabulary_is_painted_by_a_renderer`;
-  `crates/cyclops-workspace/src/render.rs`,
-  `sidebar_state_glyph_is_stable_across_theme_and_no_color` and
+  `crates/cyclops-workspace/src/render/sidebar.rs`,
+  `sidebar_state_glyph_is_stable_across_theme_and_no_color`, and
+  `crates/cyclops-workspace/src/render/canvas.rs`,
   `inactive_pane_border_glyph_is_stable_across_theme_and_no_color`, which
   feed the same state through two unrelated themes and `NO_COLOR` and
   assert the glyph never moves while its `Style` does.

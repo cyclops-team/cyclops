@@ -275,7 +275,7 @@ ratio = 0.3043
 [[windows.rows.panes]]
 ratio = 1.0
 cwd = "/Users/you/projects/gateway"
-command = "cyclops ui"
+command = "cyclops watch"
 ```
 
 Ratios are relative: they are normalized by their own row or window, so

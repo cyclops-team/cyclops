@@ -39,7 +39,7 @@ The first line says how far the switch got, and it is the only line that
 claims anything about the screen.
 
 `✔` is cyclopsd answering that it is painting `light` now: the pane
-borders and any running `cyclops ui` are already on it.
+borders and any running `cyclops watch` are already on it.
 
 `✓` means no daemon was running to ask. The config is written either way,
 and the line says `the next command picks it up`.
@@ -95,8 +95,8 @@ names only some tokens falls back to that table for the rest.
 |---|---|---|
 | `role` | `1`..`8` | Stable per-agent colors; a label hashes to a slot |
 | `surface` | `dim` | Detail columns, gutters, separators, every dimmed qualifier |
-| `surface` | `accent` | The marker on the row a surface is pointing at: the selected entry in `ui`, the active theme in `cyclops theme`, the workspace's focused-pane ring |
-| `eye` | `calm` `alert` | The eye, in both the `status` and `ui` headers: calm closed, alert open |
+| `surface` | `accent` | The marker on the row a surface is pointing at: the selected entry in `watch`, the active theme in `cyclops theme`, the workspace's focused-pane ring |
+| `eye` | `calm` `alert` | The eye, in both the `status` and `watch` headers: calm closed, alert open |
 | `state` | `healthy` `needs_you` `terminal` `quiet` `dead` | Agent state cells, by group, including on pane borders |
 | `badge` | `healthy` `needs_you` `terminal` `quiet` | Delivery badges, the same groups read on a delivery |
 | `chrome` | `text` `panel` `raised` | The workspace chrome palette: explicit `text` on `panel` under the tab strip, pane gutters and menus; `raised` under the active tab, active workspace row, hovered menu items and selected text |
@@ -238,7 +238,7 @@ hues onto one entry, since two roles must never share a color.
 
 Save the file. The change applies on the next thing that repaints.
 
-Long-lived surfaces (`cyclops ui`, the pane borders cyclopsd writes) hold
+Long-lived surfaces (`cyclops watch`, the pane borders cyclopsd writes) hold
 the selection and re-check it when an event has already woken them: a
 stat of the config key and of the theme file, no watcher thread and no
 timer, so the zero-polling contract holds. One-shot commands read the
@@ -259,7 +259,7 @@ whose lightness has nothing to do with the theme you are on. A misspelled
 token name does the same thing and stays until you notice. Neither one
 reaches the screen.
 
-`cyclops ui` shows that line on its notice row. One-shot commands print it
+`cyclops watch` shows that line on its notice row. One-shot commands print it
 on stderr; they have no previous colors to keep, so a file they cannot
 read falls back to the built-in table and says so:
 

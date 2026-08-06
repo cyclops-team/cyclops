@@ -52,7 +52,7 @@ One thing still waits on admin: the v1 cutover.
 - M3 stream UI and theme engine (this commit). It took six gate rounds and
   the reason is written up under Lessons, because it is the most useful
   thing this milestone produced. What shipped:
-  - `cyclops ui`: calm admin view by default, firehose on tab, w/f/t
+  - `cyclops watch`: calm admin view by default, firehose on tab, w/f/t
     filters mirroring the history flags, enter jumps tmux focus to the
     entry's pane through a new adapter-only cyclops-tmux focus helper.
     Routine gate holds stay in the firehose; only holds naming a blocked
@@ -222,7 +222,7 @@ One thing still waits on admin: the v1 cutover.
     only at the next command.
   - Hot reload got two changes, and the second is the one that matters.
     `ThemeWatch` now watches the SELECTION, config key plus theme file, so
-    a switch moves a running `cyclops ui` and the daemon's pane borders,
+    a switch moves a running `cyclops watch` and the daemon's pane borders,
     not just an edit to the file they were already on. And a reload now
     applies whole or not at all: the file has to load AND still set every
     token it set before, or the colors on screen stay and one line says
@@ -349,7 +349,7 @@ One thing still waits on admin: the v1 cutover.
     with the installer.
 
 - M8 the dashboard (this commit):
-  - `cyclops ui` on a terminal 96 columns or wider shares the screen with
+  - `cyclops watch` on a terminal 96 columns or wider shares the screen with
     an agents panel: every watched pane, which CLI the daemon detects in
     it, its state (glyph plus word, like every surface), and how long it
     has stood there. `a` hides it; below 96 columns it never draws, so

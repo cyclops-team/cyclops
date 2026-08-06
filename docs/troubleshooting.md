@@ -124,7 +124,7 @@ $ cyclops status
 The eye opens for exactly two things: a pane in a blocked state, and a
 delivery that cannot move without you. The block under the roster names
 them, and the header counts them. Nothing closes it but the thing itself
-clearing, and a clearance line follows the alarm in `cyclops ui` so a closed
+clearing, and a clearance line follows the alarm in `cyclops watch` so a closed
 eye can never sit over a stale warning.
 
 ## A send says "needs attention"
@@ -262,7 +262,7 @@ just does not say so. [panes.md](panes.md).
 even loaded. Both print the same words a colored terminal does.
 
 A theme file broken mid-edit falls back to the built-in colors rather than
-crashing, and a running `cyclops ui` keeps the colors it already has.
+crashing, and a running `cyclops watch` keeps the colors it already has.
 [themes.md](themes.md).
 
 ## I switched theme and the pane borders did not change

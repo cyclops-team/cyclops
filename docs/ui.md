@@ -1,15 +1,16 @@
 # The stream UI
 
-Watch the whole team live. `cyclops ui` turns the terminal into the
+Watch the whole team live. `cyclops watch` turns the terminal into the
 stream: every message and state change as it happens, on the record.
+`cyclops ui` still works too, as a deprecated alias for `cyclops watch`.
 
 ## Basics
 
 ```
-cyclops ui                # the admin stream: calm by default
-cyclops ui --firehose     # start in the firehose instead
-cyclops ui --plain        # line-oriented follow, no screen takeover
-cyclops ui --with reviewer
+cyclops watch                # the admin stream: calm by default
+cyclops watch --firehose     # start in the firehose instead
+cyclops watch --plain        # line-oriented follow, no screen takeover
+cyclops watch --with reviewer
 ```
 
 The admin stream shows only what is aimed at you: messages addressed to
@@ -272,4 +273,4 @@ and `cyclops history` use against the same theme (see
 
 - `0` quit with `q`
 - `1` the daemon was unreachable, or the connection died in plain mode
-- `2` usage error (`--with` combined with `--from`/`--to`, or `--json`)
+- `2` usage error (`--with` combined with `--from`/`--to`)
