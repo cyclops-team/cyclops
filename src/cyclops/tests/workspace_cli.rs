@@ -347,6 +347,9 @@ fn the_attach_step_follows_whether_you_are_inside_tmux() {
     let text = stdout(&inside);
     assert!(!text.contains("tmux attach"), "{text}");
 
+    // The first start booted a real cyclopsd; without this it outlives
+    // the test reparented to launchd, one leaked daemon per suite run.
+    let _ = cyclops(&home, &["daemon", "stop"]);
     let _ = fs::remove_dir_all(&home);
 }
 
