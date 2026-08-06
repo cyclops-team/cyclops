@@ -787,3 +787,18 @@ command-less client never provokes. Every released tmux (3.4, 3.6a, 3.7b)
 delivers %pause to the same rig. The flow-control test skips the silent
 case on "next-" builds citing this finding; the reader's 3.8 adaptation
 is tracked as its own task and flips that skip back to a hard fail.
+
+## F47. Killing a tmux session delivers no per-pane deaths to control mode, only the disconnect (MEASURED)
+
+Measured on a live rig while fixing the immortal-label bug: kill a
+watched session and its control-mode client gets a disconnect, never a
+death notification per pane, so the F25 all-panes subscription that
+catches an individual pane dying observes nothing at all when the whole
+session goes. Anything keyed on per-pane death (the adoption registry
+was) silently survives session death. The daemon now releases a
+session's adoptions at the two edges that CAN answer: the attach-retry
+arm, where tmux positively reports the session missing, and boot, which
+re-verifies resurrected bindings for sessions outside the watched set
+with one has-session each. A tmux error keeps the label: could-not-ask
+never releases. src/cyclopsd/src/lib.rs, registry.rs; pinned by
+tests/m4_name.rs.

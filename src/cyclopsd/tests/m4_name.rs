@@ -381,13 +381,17 @@ async fn a_refused_name_writes_nothing() {
         )
         .await;
     assert_eq!(resp["error"]["code"], json!("bad_request"), "{resp}");
+    // The refusal names the holder and the way out. "already taken"
+    // alone once had an operator distrusting the roster: the words must
+    // say which pane wears the name, where, and how to free it.
+    let msg = resp["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("already taken"), "{resp}");
+    assert!(msg.contains(&panes[0]), "no holder pane in: {msg}");
     assert!(
-        resp["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("already taken"),
-        "{resp}"
+        msg.contains("in session main"),
+        "no holder session in: {msg}"
     );
+    assert!(msg.contains("--clear"), "no remedy in: {msg}");
 
     // A manifest that was never loaded, named out loud with the ones that were.
     let resp = rig
@@ -418,6 +422,145 @@ async fn a_refused_name_writes_nothing() {
     );
     assert_eq!(pane_labeled_lines(&rig).len(), 1);
 
+    rig.shutdown().await;
+}
+
+/// Adoption ends with the pane (M1 rule), so the name is free the moment
+/// the pane dies. The live-use bug this pins against: a label "already
+/// taken" by a holder no roster shows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dead_panes_label_is_free_to_claim() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new("m4panegone", CHROME_MANIFEST, "cat", "").await;
+    rig.wait_attached(1).await;
+    rig.tmux.run_ok(&["split-window", "-t", "main", "cat"]);
+    rig.wait_attached(2).await;
+    let panes = rig.pane_ids().await;
+    rig.label(&panes[1], "human").await;
+
+    let victim = panes[1].clone();
+    rig.tmux.run_ok(&["kill-pane", "-t", &victim]);
+    rig.ev
+        .wait_event(Duration::from_secs(10), |v| {
+            v["event"] == json!("pane-removed") && v["data"]["pane_id"] == json!(victim)
+        })
+        .await;
+
+    rig.label(&panes[0], "human").await;
+    rig.shutdown().await;
+}
+
+/// Killing a whole session sends no PaneRemoved for its panes: the
+/// control connection just drops (F25 covers pane death, not session
+/// death). The labels are released where the daemon learns the session is
+/// gone, the attach loop, or they stay claimed forever while `cyclops
+/// list` says there are no agents at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn killing_a_watched_session_releases_its_labels() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new_multi(
+        "m4sesskill",
+        CHROME_MANIFEST,
+        &[("main", "cat"), ("aux", "cat")],
+        "",
+    )
+    .await;
+    let aux_pane = rig.pane_ids_session(1).await[0].clone();
+    rig.label(&aux_pane, "human").await;
+    rig.tmux.run_ok(&["kill-session", "-t", "aux"]);
+
+    // Test-side bounded wait: the daemon notices on a reconnect attempt,
+    // and reconnects start at 200ms.
+    let main_pane = rig.pane_ids().await[0].clone();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let resp = rig
+            .ctl
+            .request(
+                "pane.label",
+                json!({"target": &main_pane, "label": "human"}),
+            )
+            .await;
+        if resp["result"]["label"] == json!("human") {
+            break;
+        }
+        let msg = resp["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("already taken"), "unexpected refusal: {resp}");
+        assert!(
+            Instant::now() < deadline,
+            "the killed session's label was never released: {resp}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    rig.shutdown().await;
+}
+
+/// A restart re-verifies what it resurrects from the registry file. A
+/// session the new run does not watch never attaches, so the attach
+/// reconcile can never prune its entries: while the session lives its
+/// names are kept (and the refusal says who holds them and where), and
+/// once it is gone the next boot releases them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_reverifies_labels_from_sessions_it_no_longer_watches() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new_multi(
+        "m4unwatched",
+        CHROME_MANIFEST,
+        &[("main", "cat"), ("aux", "cat")],
+        "",
+    )
+    .await;
+    let aux_pane = rig.pane_ids_session(1).await[0].clone();
+    rig.label(&aux_pane, "human").await;
+
+    // The restart drops aux from the watched set: the shape of every
+    // runtime-watched workspace session after a daemon restart, because
+    // session.watch does not rewrite config.toml.
+    rig.sessions = vec!["main".to_string()];
+    rig.rewrite_config("");
+    let mut rig = rig.reboot().await;
+    rig.wait_attached(1).await;
+
+    // aux still exists, so its pane still wears the name.
+    let main_pane = rig.pane_ids().await[0].clone();
+    let resp = rig
+        .ctl
+        .request(
+            "pane.label",
+            json!({"target": &main_pane, "label": "human"}),
+        )
+        .await;
+    let msg = resp["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("already taken"), "{resp}");
+    assert!(msg.contains(&aux_pane), "no holder pane in: {msg}");
+    assert!(msg.contains("aux"), "no holder session in: {msg}");
+
+    // The session dies while nothing watches it: no subscription, no
+    // reconcile. The next boot is the only verifier left.
+    rig.tmux.run_ok(&["kill-session", "-t", "aux"]);
+    let mut rig = rig.reboot().await;
+    rig.wait_attached(1).await;
+    let resp = rig
+        .ctl
+        .request(
+            "pane.label",
+            json!({"target": &main_pane, "label": "human"}),
+        )
+        .await;
+    assert_eq!(
+        resp["result"]["label"],
+        json!("human"),
+        "the dead session's label was not released at boot: {resp}"
+    );
     rig.shutdown().await;
 }
 
