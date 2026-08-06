@@ -631,9 +631,69 @@ fn now_ms() -> u64 {
 /// What the blocking reader thread below hands to the coalescing loop: one
 /// signal per subscription line that carried an `"event"` field, or one
 /// signal when the connection ends.
-enum DecorationSignal {
+pub enum DecorationSignal {
     Event,
     Closed,
+}
+
+/// Why [`coalesce_decoration_signals`] returned: the daemon connection
+/// ended (the caller reports offline), or the refresh sink is gone (the
+/// app itself is shutting down, nothing left to tell).
+#[derive(Debug, PartialEq, Eq)]
+pub enum CoalesceEnd {
+    Closed,
+    SinkGone,
+}
+
+/// The decoration burst rule, runnable on its own: a burst of signals
+/// coalesces into ONE `refresh` call on a deadline armed by the burst's
+/// FIRST signal — later signals never push it back (rule 9's arm-once
+/// shape, `recv_timeout` instead of `tokio::select!` because this loop
+/// deliberately lives on a blocking thread). `refresh` returns false when
+/// its sink is gone, which ends the loop the way a lost app channel ends
+/// the production forwarder.
+///
+/// Public so the performance contract can drive a measured burst through
+/// the real loop (src/cyclops-workspace/tests/perf_contract.rs) instead
+/// of a re-implementation that could drift; production behavior is
+/// unchanged, `spawn_decoration_forwarder` calls exactly this.
+pub fn coalesce_decoration_signals(
+    sig_rx: std::sync::mpsc::Receiver<DecorationSignal>,
+    debounce: Duration,
+    mut refresh: impl FnMut() -> bool,
+) -> CoalesceEnd {
+    // One-shot deadline armed by the first signal in a burst; `None`
+    // means idle, exactly like `debounce` in the main loop.
+    let mut deadline: Option<std::time::Instant> = None;
+    loop {
+        let signal = match deadline {
+            None => sig_rx.recv().ok(),
+            Some(at) => {
+                let wait = at.saturating_duration_since(std::time::Instant::now());
+                match sig_rx.recv_timeout(wait) {
+                    Ok(signal) => Some(signal),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        deadline = None;
+                        if !refresh() {
+                            return CoalesceEnd::SinkGone;
+                        }
+                        continue;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+                }
+            }
+        };
+        match signal {
+            Some(DecorationSignal::Event) => {
+                // Arm once per burst; a signal that arrives while
+                // already armed must never push the deadline back.
+                if deadline.is_none() {
+                    deadline = Some(std::time::Instant::now() + debounce);
+                }
+            }
+            Some(DecorationSignal::Closed) | None => return CoalesceEnd::Closed,
+        }
+    }
 }
 
 /// Event-driven daemon decoration updates, and (E2) the shared `cyclops
@@ -727,49 +787,22 @@ fn spawn_decoration_forwarder(home: std::path::PathBuf, tx: mpsc::UnboundedSende
             }
         });
 
-        // One-shot deadline armed by the first signal in a burst; `None`
-        // means idle, exactly like `debounce` in the main loop.
-        let mut deadline: Option<std::time::Instant> = None;
-        loop {
-            let signal = match deadline {
-                None => sig_rx.recv().ok(),
-                Some(at) => {
-                    let wait = at.saturating_duration_since(std::time::Instant::now());
-                    match sig_rx.recv_timeout(wait) {
-                        Ok(signal) => Some(signal),
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            deadline = None;
-                            // A refused or timed-out status call is doubt
-                            // about this instant, not news about the
-                            // roster: the subscription is still up, so the
-                            // next burst asks again. Dropping it keeps the
-                            // last known decoration on screen instead of
-                            // un-naming every agent for a frame. A daemon
-                            // that is really gone ends the read loop below,
-                            // which is the one place "offline" is reported.
-                            if let Some(snapshot) = decoration::fetch_decoration(&home) {
-                                if tx.send(AppMsg::DecorationChanged(snapshot)).is_err() {
-                                    return;
-                                }
-                            }
-                            continue;
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
-                    }
-                }
-            };
-            match signal {
-                Some(DecorationSignal::Event) => {
-                    // Arm once per burst; a signal that arrives while
-                    // already armed must never push the deadline back.
-                    if deadline.is_none() {
-                        deadline = Some(std::time::Instant::now() + DECORATION_DEBOUNCE);
-                    }
-                }
-                Some(DecorationSignal::Closed) | None => break,
+        let end = coalesce_decoration_signals(sig_rx, DECORATION_DEBOUNCE, || {
+            // A refused or timed-out status call is doubt about this
+            // instant, not news about the roster: the subscription is
+            // still up, so the next burst asks again. Dropping it keeps
+            // the last known decoration on screen instead of un-naming
+            // every agent for a frame. A daemon that is really gone ends
+            // the read loop above, which is the one place "offline" is
+            // reported.
+            match decoration::fetch_decoration(&home) {
+                Some(snapshot) => tx.send(AppMsg::DecorationChanged(snapshot)).is_ok(),
+                None => true,
             }
+        });
+        if end == CoalesceEnd::Closed {
+            let _ = tx.send(AppMsg::DecorationChanged(DecorationSnapshot::default()));
         }
-        let _ = tx.send(AppMsg::DecorationChanged(DecorationSnapshot::default()));
     });
 }
 
