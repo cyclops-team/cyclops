@@ -2,14 +2,14 @@
 //! server, gathered with a small fixed number of control-mode commands
 //! instead of one one-shot tmux process per window.
 //!
-//! `crates/cyclops-workspace/src/sync.rs`'s `fetch_workspace_model` /
-//! `fetch_session_model` build the workspace model today from `list-sessions`,
-//! an all-window membership query, `list-windows`, and one `list-panes` call
-//! *per window* — `W + 3` one-shot tmux processes for a session with `W`
-//! windows (MEASURED in `crates/cyclops-workspace/tests/baseline.rs`: 10-15ms
-//! per extra window). [`ControlClient::workspace_snapshot`] replaces that
-//! fan-out with two formatted commands over the control client that is
-//! already connected, neither of which scales with window or pane count.
+//! `crates/cyclops-workspace/src/sync.rs`'s `fetch_workspace_model` used to
+//! build the workspace model from `list-sessions`, an all-window membership
+//! query, `list-windows`, and one `list-panes` call *per window* — `W + 3`
+//! one-shot tmux processes for a session with `W` windows (MEASURED in
+//! `crates/cyclops-workspace/tests/baseline.rs`: 10-15ms per extra window).
+//! [`ControlClient::workspace_snapshot`] replaced that fan-out with two
+//! formatted commands over the control client that is already connected,
+//! neither of which scales with window or pane count.
 //!
 //! ## Why two commands, not one
 //!

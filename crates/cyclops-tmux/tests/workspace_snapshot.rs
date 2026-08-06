@@ -242,10 +242,10 @@ async fn timing_fan_out_vs_snapshot_on_eight_windows() {
     }
     let socket = Some(srv.sock());
 
-    // 1. Today's shape (crates/cyclops-workspace/src/sync.rs,
-    //    fetch_workspace_model / fetch_session_model): one list-sessions,
-    //    one membership query, one list-windows, then one list-panes PER
-    //    WINDOW — each a fresh one-shot tmux process.
+    // 1. The pre-L1 shape fetch_workspace_model used to walk: one
+    //    list-sessions, one membership query, one list-windows, then one
+    //    list-panes PER WINDOW — each a fresh one-shot tmux process. Kept
+    //    as the timing comparison point.
     let t = Instant::now();
     let _sessions = list_sessions(socket).expect("list_sessions");
     let _memberships = list_window_memberships(socket).expect("list_window_memberships");
