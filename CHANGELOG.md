@@ -7,6 +7,24 @@ versions are unreleased until admin cuts a tag.
 
 ### Added
 
+- Themes own the pane ground. The workspace paints `surface.fg` on
+  `surface.bg` under every pane body and maps ANSI colors 0..15 through a
+  per-theme `[palette]`, so panes look like the theme instead of the host
+  terminal; on a light terminal the UI used to wash white with the host's
+  own text colors bleeding through. All seven shipped themes carry a
+  ground and a full palette; `NO_COLOR` still leaves every host color
+  untouched, and one-shot commands still print on the terminal's own
+  background. A theme file that sets only `surface.fg` now counts as a
+  theme, because editing it now changes the screen.
+- Theme hot reload in the workspace: `cyclops theme <name>` repaints the
+  open workspace on the daemon's theme event, and a hand-edited theme
+  file applies on the next event, riding the existing render debounce
+  with no timer.
+- Claude Code manifest re-verified against 2.1.221 on a live rig, with
+  fidelity tests pinned from the captured evidence: mid-turn streaming,
+  idle, the new trust-dialog wording, the title table, and the exact
+  process triple that has to bind the manifest.
+
 - The dashboard. `cyclops ui` on a terminal 96 columns or wider shares
   the screen with an agents panel: every watched pane, which CLI the
   daemon detects in it, its state, and how long it has stood there.
@@ -27,6 +45,19 @@ versions are unreleased until admin cuts a tag.
 
 ### Fixed
 
+- Three CI-red tests, all fixture-side. Two tmux fixtures targeted
+  `new-window -t s`, and tmux resolves that against window names first
+  with a prefix match, so an auto-renamed `sh` window pinned the new
+  window to occupied index 0; the fixtures now name their windows and use
+  the session-typed `s:` target. The flow-control test could stall its
+  reader before the flood it measures had started flowing on a loaded
+  runner; it now confirms output before the stall.
+- Event panel body rows printed in the terminal's own foreground on the
+  panel's themed ground, unreadable on a light host; they wear chrome
+  text now.
+- The cyclops skill told an agent to find its own name in the plain
+  roster, which prints labels without pane ids; it now says
+  `cyclops list --json` and explains what plain `cyclops read` returns.
 - F25: cyclops could not see a pane die. `pane_dead` is set when the
   pane's pty fd closes, and that same closed fd is the gate that makes
   tmux skip the pane's own format subscription, so a per-pane
