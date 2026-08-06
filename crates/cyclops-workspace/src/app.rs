@@ -17,26 +17,26 @@ use std::io;
 use crossterm::event::{
     self, Event, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use cyclops_tmux::{quote_arg, session_target, ControlClient, ControlConfig, Notification};
+use cyclops_tmux::{ControlClient, ControlConfig, Notification};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Duration, Instant};
 
-use crate::bindings::{load_bindings, BindingAction};
+use crate::action;
+use crate::bindings::load_bindings;
 use crate::config::load_tmux_config;
 use crate::copy;
-use crate::daemon::pane_has_agent;
 use crate::decoration::{self, DecorationSnapshot};
 use crate::dialog::Dialog;
 use crate::drag::{DragState, DragTarget};
 use crate::input::encode_send_keys;
 use crate::input::mouse::{HitMap, HitTarget, MenuState};
 use crate::input::router::{Router, RouterResult};
-use crate::intent::{self, Intent};
 use crate::layout::SplitDir;
 use crate::model::{pane_is_visible, RuntimeRegistry, WorkspaceModel};
+use crate::naming;
 use crate::persist::{self, load_prefs, set_last_active, WorkspacePrefs};
 use crate::render::{
     paint_dialog, paint_event_stream, paint_menu, paint_sidebar, paint_tab_bar, paint_window,
@@ -46,6 +46,8 @@ use crate::selection::{self, SelectionState};
 use crate::sync::{fetch_workspace_model, hydrate_visible_tab};
 use crate::term_guard::TermGuard;
 use crate::theme::Paint;
+
+mod exec;
 
 /// At most one frame per 8 ms (~120 Hz). The timer exists only after an
 /// event; idle workspaces still have no wakeups.
@@ -391,9 +393,7 @@ pub async fn run_async() -> i32 {
             .position(|tab| tab.window_id == *window_id)
         {
             if index != model.session.active_tab {
-                if let Err(error) =
-                    intent::execute(&client, Intent::SelectTabId(window_id.clone()), "").await
-                {
+                if let Err(error) = client.select_window(window_id).await {
                     log_err(&home, &error);
                 } else {
                     model.session.active_tab = index;
@@ -1157,117 +1157,42 @@ fn cancel_drag(app: &mut App) {
     }
 }
 
-/// Focus a pane, switching to the tab that owns it when needed. Sidebar
-/// agent rows span every tab in the active workspace, so selecting only the
-/// pane would otherwise leave the UI on a different window.
-async fn focus_pane(
-    app: &mut App,
-    client: &ControlClient,
-    pane_id: &str,
-) -> Result<(), cyclops_tmux::TmuxError> {
-    let target = app
-        .model
-        .session
-        .tabs
-        .iter()
-        .position(|tab| crate::layout::layout_contains_pane(&tab.layout, pane_id));
-    let prior_tab = app.model.session.active_tab;
-    let prior_pane = app.model.active_tab().active_pane.clone();
-    let target_window = target
-        .filter(|index| *index != prior_tab)
-        .and_then(|index| app.model.session.tabs.get(index))
-        .map(|tab| tab.window_id.as_str());
-
-    intent::execute_focus_pane(client, target_window, pane_id).await?;
-    let Some(index) = target else {
-        // The daemon or hit map can briefly be ahead of a tmux reconcile.
-        // Never attach that stale pane id to the wrong tab in local state.
-        app.needs_reconcile = true;
-        return Ok(());
-    };
-
-    app.model.session.active_tab = index;
-    let zoomed = app.model.session.tabs[index].zoomed;
-    app.model.session.tabs[index].active_pane = pane_id.to_string();
-    if index != prior_tab || (zoomed && prior_pane != pane_id) {
-        resize_client(app, client).await;
-        hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await?;
-        app.needs_hydrate = false;
-        app.persist_active();
+/// The minimal live-model context [`action::route_binding`] and
+/// [`action::route_menu_item`] need, built fresh for each event so nothing
+/// here can go stale.
+fn route_context(app: &App) -> action::RouteContext<'_> {
+    action::RouteContext {
+        tabs: &app.model.session.tabs,
+        active_tab: app.model.session.active_tab,
+        active_pane: &app.model.active_tab().active_pane,
+        session: &app.model.session.session,
+        workspaces: &app.model.workspaces,
+        active_workspace: app.model.active_workspace,
     }
-    Ok(())
 }
 
-/// Focus a sidebar agent even when its expanded parent is a background
-/// workspace. The switch and pane selection are sent in order; reconciliation
-/// then replaces the active session model with authoritative tmux state.
-async fn focus_sidebar_agent(
-    app: &mut App,
-    client: &ControlClient,
-    workspace_id: &str,
-    pane_id: &str,
-) -> Result<(), cyclops_tmux::TmuxError> {
-    let active_id = app
-        .model
-        .workspaces
-        .get(app.model.active_workspace)
-        .map(|workspace| workspace.session_id.as_str());
-    if active_id == Some(workspace_id) {
-        if app.model.active_tab().active_pane == pane_id {
-            return Ok(());
+/// Apply the executor's outcome. `redraw` is not one of its fields: every
+/// call site below already arms the render debounce unconditionally after
+/// dispatching a resolved action (the same thing keyboard, mouse, and dialog
+/// handling did before this task), so a redundant flag would just be a
+/// field nobody reads. `detach` is read at each call site directly, since
+/// the two callers that can reach it (`handle_key`, and the menu-item
+/// branch of `handle_mouse`) each have their own way of ending the loop.
+fn apply_outcome(app: &mut App, outcome: exec::Outcome) {
+    if outcome.persist {
+        if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
+            log_err(&app.home, &error);
         }
-        return focus_pane(app, client, pane_id).await;
     }
-    let Some(session) = app
-        .model
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.session_id == workspace_id)
-        .map(|workspace| workspace.name.clone())
-    else {
+    if outcome.reconcile {
         app.needs_reconcile = true;
-        return Ok(());
-    };
-    let Some(window_id) = app
-        .decoration
-        .pane(pane_id)
-        .map(|decoration| decoration.window_id.clone())
-    else {
-        // A decoration event can invalidate a rendered hit region before the
-        // next frame. Do not select a same-shaped pane in the wrong window.
-        app.needs_reconcile = true;
-        return Ok(());
-    };
-    intent::execute(client, Intent::SwitchWorkspace(session), "").await?;
-    intent::execute_focus_pane(client, Some(&window_id), pane_id).await?;
-    app.needs_reconcile = true;
-    Ok(())
+    }
 }
 
-/// Select a tab by model index: tell tmux, mirror locally, hydrate.
-async fn select_tab(
-    app: &mut App,
-    client: &ControlClient,
-    index: usize,
-) -> Result<(), cyclops_tmux::TmuxError> {
-    let Some(window_id) = app
-        .model
-        .session
-        .tabs
-        .get(index)
-        .map(|t| t.window_id.clone())
-    else {
-        return Ok(());
-    };
-    intent::execute(client, Intent::SelectTabId(window_id), "").await?;
-    app.model.session.active_tab = index;
-    resize_client(app, client).await;
-    hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await?;
-    app.needs_hydrate = false;
-    app.persist_active();
-    Ok(())
-}
-
+/// Handle one resolved mouse event. This owns hit-testing, drag-state
+/// mechanics, selection, and menu/dialog overlay handling only; every
+/// workspace mutation resolves an [`Action`] (via `action`'s routing
+/// functions) and runs through [`exec::execute`] — see the module docs.
 async fn handle_mouse(
     app: &mut App,
     client: &ControlClient,
@@ -1313,73 +1238,91 @@ async fn handle_mouse(
             if app.menu.is_open() || app.selection.is_dragging() {
                 return Ok(());
             }
-            if let Some(HitTarget::PaneBody { pane_id }) = app.hit_map.hit(col, row).cloned() {
-                let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
-                    -3
+            if let Some(target) = app.hit_map.hit(col, row).cloned() {
+                let direction = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    action::ScrollDirection::Up
                 } else {
-                    3
+                    action::ScrollDirection::Down
                 };
-                if let Some(rt) = app.runtimes.get_mut(&pane_id) {
-                    rt.scroll(delta);
+                if let Some(action) = action::route_mouse_scroll(&target, direction) {
+                    let outcome = exec::execute(app, client, action).await?;
+                    apply_outcome(app, outcome);
                 }
             }
         }
-        MouseEventKind::Down(MouseButton::Right) => match app.hit_map.hit(col, row).cloned() {
-            Some(HitTarget::PaneBody { pane_id } | HitTarget::PaneFrame { pane_id }) => {
-                focus_pane(app, client, &pane_id).await?;
-                app.open_menu(MenuState::ContextMenu {
-                    pane_id,
-                    at: (col, row),
-                });
+        MouseEventKind::Down(MouseButton::Right) => {
+            let Some(target) = app.hit_map.hit(col, row).cloned() else {
+                app.close_menu();
+                return Ok(());
+            };
+            match &target {
+                HitTarget::PaneBody { pane_id } | HitTarget::PaneFrame { pane_id } => {
+                    if let Some(action) = action::route_mouse_click(&target, MouseButton::Right) {
+                        let outcome = exec::execute(app, client, action).await?;
+                        apply_outcome(app, outcome);
+                    }
+                    app.open_menu(MenuState::ContextMenu {
+                        pane_id: pane_id.clone(),
+                        at: (col, row),
+                    });
+                }
+                HitTarget::Tab { window_id } => {
+                    app.open_menu(MenuState::TabMenu {
+                        window_id: window_id.clone(),
+                        at: (col, row),
+                    });
+                }
+                HitTarget::SidebarRow { session, .. } => {
+                    app.open_menu(MenuState::WorkspaceMenu {
+                        session: session.clone(),
+                        at: (col, row),
+                    });
+                }
+                HitTarget::SidebarAgent { pane_id, .. } => {
+                    if let Some(action) = action::route_mouse_click(&target, MouseButton::Right) {
+                        let outcome = exec::execute(app, client, action).await?;
+                        apply_outcome(app, outcome);
+                    }
+                    app.open_menu(MenuState::ContextMenu {
+                        pane_id: pane_id.clone(),
+                        at: (col, row),
+                    });
+                }
+                _ => app.close_menu(),
             }
-            Some(HitTarget::Tab { window_id }) => {
-                app.open_menu(MenuState::TabMenu {
-                    window_id,
-                    at: (col, row),
-                });
-            }
-            Some(HitTarget::SidebarRow { session, .. }) => {
-                app.open_menu(MenuState::WorkspaceMenu {
-                    session,
-                    at: (col, row),
-                });
-            }
-            Some(HitTarget::SidebarAgent {
-                workspace_id,
-                pane_id,
-                ..
-            }) => {
-                focus_sidebar_agent(app, client, &workspace_id, &pane_id).await?;
-                app.open_menu(MenuState::ContextMenu {
-                    pane_id,
-                    at: (col, row),
-                });
-            }
-            _ => app.close_menu(),
-        },
+        }
         MouseEventKind::Down(MouseButton::Left) => {
             let Some(target) = app.hit_map.hit(col, row).cloned() else {
                 app.close_menu();
                 app.selection.clear();
                 return Ok(());
             };
-            match target {
+            match &target {
                 HitTarget::MenuItem { action } => {
+                    let action = *action;
                     let menu = std::mem::replace(&mut app.menu, MenuState::None);
                     app.hover = None;
                     app.hit_map.clear_menu_items();
-                    if action == BindingAction::Detach {
-                        *detached = true;
-                        return Ok(());
+                    let resolved = {
+                        let ctx = route_context(app);
+                        crate::action::route_menu_item(&menu, action, &ctx)
+                    };
+                    if let Some(resolved) = resolved {
+                        let outcome = exec::execute(app, client, resolved).await?;
+                        apply_outcome(app, outcome);
+                        if outcome.detach {
+                            *detached = true;
+                        }
                     }
-                    menu_action(app, client, menu, action).await?;
+                    return Ok(());
                 }
                 HitTarget::PaneBody { pane_id } => {
                     app.close_menu();
-                    let target = HitTarget::PaneBody {
+                    let pane_id = pane_id.clone();
+                    let hit = HitTarget::PaneBody {
                         pane_id: pane_id.clone(),
                     };
-                    let clicks = app.selection.register_click(&target, col, row);
+                    let clicks = app.selection.register_click(&hit, col, row);
                     if let Some(geom) = app.hit_map.pane_geometry(&pane_id) {
                         if let Some(cell) = crate::input::mouse::HitMap::cell_at(geom, col, row) {
                             match clicks {
@@ -1402,47 +1345,44 @@ async fn handle_mouse(
                             }
                         }
                     }
-                    if app.model.active_tab().active_pane != pane_id {
-                        focus_pane(app, client, &pane_id).await?;
-                    }
                 }
-                HitTarget::PaneFrame { pane_id } => {
+                HitTarget::PaneFrame { .. } => {
                     app.close_menu();
                     app.selection.clear();
-                    if app.model.active_tab().active_pane != pane_id {
-                        focus_pane(app, client, &pane_id).await?;
-                    }
                 }
-                HitTarget::PaneSplitRight { pane_id } => {
+                HitTarget::PaneSplitRight { .. } | HitTarget::PaneSplitDown { .. } => {
                     app.close_menu();
-                    intent::execute(client, Intent::SplitRight, &pane_id).await?;
-                    app.needs_reconcile = true;
-                }
-                HitTarget::PaneSplitDown { pane_id } => {
-                    app.close_menu();
-                    intent::execute(client, Intent::SplitDown, &pane_id).await?;
-                    app.needs_reconcile = true;
                 }
                 HitTarget::Divider { pane_id, dir } => {
                     app.selection.clear();
                     app.drag = Some(DragState::on_down(
-                        DragTarget::Divider { pane_id, dir },
+                        DragTarget::Divider {
+                            pane_id: pane_id.clone(),
+                            dir: *dir,
+                        },
                         col,
                         row,
                     ));
+                    return Ok(());
                 }
                 HitTarget::Tab { window_id } => {
                     app.close_menu();
                     app.selection.clear();
                     // Down starts a possible reorder drag; a below-threshold
                     // release selects the tab instead.
-                    app.drag = Some(DragState::on_down(DragTarget::Tab { window_id }, col, row));
+                    app.drag = Some(DragState::on_down(
+                        DragTarget::Tab {
+                            window_id: window_id.clone(),
+                        },
+                        col,
+                        row,
+                    ));
+                    return Ok(());
                 }
-                HitTarget::NewTabButton => {
+                HitTarget::NewTabButton
+                | HitTarget::NewWorkspaceButton
+                | HitTarget::AttentionIndicator { .. } => {
                     app.close_menu();
-                    app.dialog = Some(Dialog::NewTab {
-                        buffer: String::new(),
-                    });
                 }
                 HitTarget::SidebarRow {
                     session_id,
@@ -1452,15 +1392,17 @@ async fn handle_mouse(
                     app.selection.clear();
                     app.drag = Some(DragState::on_down(
                         DragTarget::Workspace {
-                            session_id,
-                            session,
+                            session_id: session_id.clone(),
+                            session: session.clone(),
                         },
                         col,
                         row,
                     ));
+                    return Ok(());
                 }
                 HitTarget::SidebarDisclosure { session_id } => {
-                    toggle_workspace_expanded(&mut app.expanded_workspaces, session_id);
+                    toggle_workspace_expanded(&mut app.expanded_workspaces, session_id.clone());
+                    return Ok(());
                 }
                 HitTarget::SidebarAgent {
                     workspace_id,
@@ -1471,22 +1413,20 @@ async fn handle_mouse(
                     app.selection.clear();
                     app.drag = Some(DragState::on_down(
                         DragTarget::Agent {
-                            workspace_id,
-                            pane_id,
-                            order_key,
+                            workspace_id: workspace_id.clone(),
+                            pane_id: pane_id.clone(),
+                            order_key: order_key.clone(),
                         },
                         col,
                         row,
                     ));
+                    return Ok(());
                 }
                 HitTarget::SidebarDivider => {
                     app.close_menu();
                     app.selection.clear();
                     app.drag = Some(DragState::on_down(DragTarget::Sidebar, col, row));
-                }
-                HitTarget::AttentionIndicator { pane_id } => {
-                    app.close_menu();
-                    focus_pane(app, client, &pane_id).await?;
+                    return Ok(());
                 }
                 HitTarget::AppMenu => {
                     if app.menu == MenuState::AppMenu {
@@ -1494,12 +1434,13 @@ async fn handle_mouse(
                     } else {
                         app.open_menu(MenuState::AppMenu);
                     }
+                    return Ok(());
                 }
-                HitTarget::NewWorkspaceButton => {
-                    app.close_menu();
-                    new_workspace_here(app, client).await?;
-                }
-                HitTarget::DialogConfirm | HitTarget::DialogCancel => {}
+                HitTarget::DialogConfirm | HitTarget::DialogCancel => return Ok(()),
+            }
+            if let Some(action) = action::route_mouse_click(&target, MouseButton::Left) {
+                let outcome = exec::execute(app, client, action).await?;
+                apply_outcome(app, outcome);
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -1536,47 +1477,12 @@ async fn handle_mouse(
             }
             apply_live_divider(app, client).await?;
             if let Some(drag) = app.drag.take() {
-                match drag.on_up() {
-                    Some(DragTarget::Tab { window_id }) => {
-                        commit_tab_drop(app, client, &window_id, col, row).await?;
-                    }
-                    Some(DragTarget::Workspace {
-                        session_id,
-                        session: _,
-                    }) => commit_workspace_drop(app, &session_id, col, row),
-                    Some(DragTarget::Agent {
-                        workspace_id,
-                        pane_id: _,
-                        order_key,
-                    }) => commit_agent_drop(app, &workspace_id, &order_key, col, row),
-                    Some(DragTarget::Sidebar) => {}
-                    // Divider drags applied live during motion.
-                    Some(_) => {}
-                    None => match drag.target {
-                        DragTarget::Tab { window_id } => {
-                            if let Some(index) = app
-                                .model
-                                .session
-                                .tabs
-                                .iter()
-                                .position(|tab| tab.window_id == window_id)
-                            {
-                                select_tab(app, client, index).await?;
-                            }
-                        }
-                        DragTarget::Workspace { session, .. } => {
-                            intent::execute(client, Intent::SwitchWorkspace(session), "").await?;
-                            app.needs_reconcile = true;
-                        }
-                        DragTarget::Agent {
-                            workspace_id,
-                            pane_id,
-                            ..
-                        } => {
-                            focus_sidebar_agent(app, client, &workspace_id, &pane_id).await?;
-                        }
-                        DragTarget::Divider { .. } | DragTarget::Sidebar => {}
-                    },
+                let crossed_threshold = drag.on_up().is_some();
+                if crossed_threshold {
+                    commit_drag_drop(app, client, &drag.target, col, row).await?;
+                } else if let Some(action) = action::route_drag_click(&drag.target) {
+                    let outcome = exec::execute(app, client, action).await?;
+                    apply_outcome(app, outcome);
                 }
             } else if app.selection.is_dragging() {
                 if let Some(sel) = app.selection.finish_drag() {
@@ -1595,6 +1501,70 @@ async fn handle_mouse(
     Ok(())
 }
 
+/// Commit a drag that crossed its move threshold: resolve the drop hit
+/// target under the release point through `action`'s routing, and execute
+/// whatever it resolves to. Only [`DragTarget::Tab`], `Workspace`, and
+/// `Agent` resolve here — a divider applies live during motion
+/// ([`apply_live_divider`]) and a sidebar-width drag already applied and
+/// persisted above.
+async fn commit_drag_drop(
+    app: &mut App,
+    client: &ControlClient,
+    picked_up: &DragTarget,
+    col: u16,
+    row: u16,
+) -> Result<(), cyclops_tmux::TmuxError> {
+    let drop = app.hit_map.hit(col, row).cloned();
+    let action = match picked_up {
+        DragTarget::Tab { window_id } => {
+            drop.and_then(|drop| action::resolve_tab_drop(window_id, &drop))
+        }
+        DragTarget::Workspace { session_id, .. } => {
+            let order: Vec<String> = app
+                .model
+                .workspaces
+                .iter()
+                .map(|w| w.session_id.clone())
+                .collect();
+            drop.and_then(|drop| action::resolve_workspace_drop(session_id, &drop, &order))
+        }
+        DragTarget::Agent {
+            workspace_id,
+            order_key,
+            ..
+        } => {
+            let order = agent_order_for_workspace(app, workspace_id);
+            drop.and_then(|drop| action::resolve_agent_drop(workspace_id, order_key, &drop, &order))
+        }
+        DragTarget::Divider { .. } | DragTarget::Sidebar => None,
+    };
+    let Some(action) = action else {
+        return Ok(());
+    };
+    let outcome = exec::execute(app, client, action).await?;
+    apply_outcome(app, outcome);
+    Ok(())
+}
+
+/// The sidebar agent order for one workspace, keyed the same way
+/// [`crate::decoration::DecorationSnapshot::agent_order_key`] does — the
+/// context [`action::resolve_agent_drop`] needs to turn a drop into a
+/// stable-id insertion.
+fn agent_order_for_workspace(app: &App, workspace_id: &str) -> Vec<String> {
+    app.model
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.session_id == workspace_id)
+        .map(|workspace| {
+            app.decoration
+                .agent_rows_for_window_ids(&workspace.window_ids, &app.prefs.agent_order)
+                .into_iter()
+                .map(DecorationSnapshot::agent_order_key)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn copy_active_selection(app: &mut App) {
     let Some(sel) = app.selection.active.clone() else {
         return;
@@ -1608,21 +1578,6 @@ fn copy_active_selection(app: &mut App) {
 
 /// Move one item to the index occupied by another. Downward drags land after
 /// the target and upward drags before it, matching the direction of motion.
-fn move_to_index(items: &mut Vec<String>, source: &str, target: &str) -> bool {
-    let Some(source_index) = items.iter().position(|item| item == source) else {
-        return false;
-    };
-    let Some(target_index) = items.iter().position(|item| item == target) else {
-        return false;
-    };
-    if source_index == target_index {
-        return false;
-    }
-    let item = items.remove(source_index);
-    items.insert(target_index.min(items.len()), item);
-    true
-}
-
 /// Keep a persisted row in place when its identity-bearing label changes.
 /// If a stale copy of the new key already exists, remove the old entry rather
 /// than creating a duplicate.
@@ -1661,242 +1616,43 @@ fn migrate_agent_order_entries(
     changed
 }
 
-fn commit_workspace_drop(app: &mut App, source_id: &str, col: u16, row: u16) {
-    let Some(HitTarget::SidebarRow {
-        session_id: target_id,
-        ..
-    }) = app.hit_map.hit(col, row).cloned()
-    else {
-        return;
-    };
-    let active_id = app
-        .model
-        .workspaces
-        .get(app.model.active_workspace)
-        .map(|workspace| workspace.session_id.clone());
-    let Some(source_index) = app
-        .model
-        .workspaces
-        .iter()
-        .position(|workspace| workspace.session_id == source_id)
-    else {
-        return;
-    };
-    let Some(target_index) = app
-        .model
-        .workspaces
-        .iter()
-        .position(|workspace| workspace.session_id == target_id)
-    else {
-        return;
-    };
-    if source_index == target_index {
-        return;
+/// The divider drag's pending motion since the last applied step, if any:
+/// `(pane_id, axis, signed delta)`. A read-only helper so the borrow it
+/// takes on `app.drag` ends before [`apply_live_divider`] needs `&mut App`
+/// to run the executor.
+fn pending_divider_resize(app: &App) -> Option<(String, SplitDir, i32)> {
+    let drag = app.drag.as_ref()?;
+    if !drag.is_active() {
+        return None;
     }
-    let workspace = app.model.workspaces.remove(source_index);
-    app.model
-        .workspaces
-        .insert(target_index.min(app.model.workspaces.len()), workspace);
-    app.model.active_workspace = active_id
-        .and_then(|id| {
-            app.model
-                .workspaces
-                .iter()
-                .position(|workspace| workspace.session_id == id)
-        })
-        .unwrap_or(0);
-    app.prefs.workspace_order = app
-        .model
-        .workspaces
-        .iter()
-        .map(|workspace| workspace.name.clone())
-        .collect();
-    if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
-        log_err(&app.home, &error);
-    }
+    let DragTarget::Divider { pane_id, dir } = drag.target.clone() else {
+        return None;
+    };
+    let delta = match dir {
+        SplitDir::Horizontal => drag.current.0 as i32 - drag.last_applied.0 as i32,
+        SplitDir::Vertical => drag.current.1 as i32 - drag.last_applied.1 as i32,
+    };
+    Some((pane_id, dir, delta))
 }
 
-fn commit_agent_drop(app: &mut App, workspace_id: &str, source_key: &str, col: u16, row: u16) {
-    let Some(HitTarget::SidebarAgent {
-        workspace_id: target_workspace,
-        order_key: target_key,
-        ..
-    }) = app.hit_map.hit(col, row).cloned()
-    else {
-        return;
-    };
-    if target_workspace != workspace_id {
-        return;
-    }
-    let Some(workspace) = app
-        .model
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.session_id == workspace_id)
-    else {
-        return;
-    };
-    let mut local: Vec<String> = app
-        .decoration
-        .agent_rows_for_window_ids(&workspace.window_ids, &app.prefs.agent_order)
-        .into_iter()
-        .map(DecorationSnapshot::agent_order_key)
-        .collect();
-    if !move_to_index(&mut local, source_key, &target_key) {
-        return;
-    }
-    app.prefs
-        .agent_order
-        .retain(|key| !local.iter().any(|local_key| local_key == key));
-    app.prefs.agent_order.extend(local);
-    if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
-        log_err(&app.home, &error);
-    }
-}
-
-/// Apply divider motion since the last applied step as resize-pane calls.
+/// Apply divider motion since the last applied step as a resize-pane call.
 /// tmux's `%layout-change` answers reconcile the model — the drag itself
 /// never writes geometry.
 async fn apply_live_divider(
     app: &mut App,
     client: &ControlClient,
 ) -> Result<bool, cyclops_tmux::TmuxError> {
-    let Some(drag) = app.drag.as_mut() else {
+    let Some((pane_id, axis, delta)) = pending_divider_resize(app) else {
         return Ok(false);
     };
-    if !drag.is_active() {
+    let Some(action) = action::resolve_pane_resize(&pane_id, axis, delta) else {
         return Ok(false);
+    };
+    exec::execute(app, client, action).await?;
+    if let Some(drag) = app.drag.as_mut() {
+        drag.last_applied = drag.current;
     }
-    let DragTarget::Divider { pane_id, dir } = drag.target.clone() else {
-        return Ok(false);
-    };
-    let delta = match dir {
-        SplitDir::Horizontal => drag.current.0 as i32 - drag.last_applied.0 as i32,
-        SplitDir::Vertical => drag.current.1 as i32 - drag.last_applied.1 as i32,
-    };
-    if delta == 0 {
-        return Ok(false);
-    }
-    intent::resize_divider(client, &pane_id, dir, delta).await?;
-    drag.last_applied = drag.current;
     Ok(true)
-}
-
-/// Commit a tab drag: drop on another tab reorders, drop on a sidebar row
-/// moves the window to that workspace.
-async fn commit_tab_drop(
-    app: &mut App,
-    client: &ControlClient,
-    window_id: &str,
-    col: u16,
-    row: u16,
-) -> Result<(), cyclops_tmux::TmuxError> {
-    let Some(src) = app
-        .model
-        .session
-        .tabs
-        .iter()
-        .find(|tab| tab.window_id == window_id)
-        .map(|tab| tab.window_id.clone())
-    else {
-        return Ok(());
-    };
-    match app.hit_map.hit(col, row).cloned() {
-        Some(HitTarget::Tab { window_id: dst }) if dst != src => {
-            client
-                .command(&format!(
-                    "swap-window -s {} -t {}",
-                    quote_arg(&src),
-                    quote_arg(&dst)
-                ))
-                .await?;
-            app.needs_reconcile = true;
-        }
-        Some(HitTarget::SidebarRow { session, .. }) => {
-            client
-                .command(&format!(
-                    "move-window -s {} -t {}",
-                    quote_arg(&src),
-                    quote_arg(&format!("{}:", session_target(&session)))
-                ))
-                .await?;
-            app.needs_reconcile = true;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// Create a tab in the current pane's directory; a non-empty `name`
-/// renames the fresh window.
-async fn new_tab(
-    app: &mut App,
-    client: &ControlClient,
-    name: Option<&str>,
-) -> Result<(), cyclops_tmux::TmuxError> {
-    let pane = app.model.active_tab().active_pane.clone();
-    let cwd = client
-        .display(&pane, "#{pane_current_path}")
-        .await
-        .map(|p| p.trim().to_string())
-        .ok();
-    let default_name = next_numeric_tab_name(&app.model.session.tabs);
-    let name = name
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .unwrap_or(&default_name);
-    intent::execute_new_tab(client, cwd.as_deref(), Some(name)).await?;
-    app.needs_reconcile = true;
-    Ok(())
-}
-
-/// The next automatic tab label. Explicit numeric labels advance the
-/// sequence; a legacy/custom-only session starts from its visible tab count
-/// so its next tab still reads naturally as 2, 3, and so on.
-fn next_numeric_tab_name(tabs: &[crate::model::TabModel]) -> String {
-    let largest = tabs
-        .iter()
-        .filter_map(|tab| tab.name.parse::<u64>().ok())
-        .max()
-        .unwrap_or(tabs.len() as u64);
-    largest
-        .checked_add(1)
-        .map(|next| next.to_string())
-        .unwrap_or_else(|| (tabs.len().saturating_add(1)).to_string())
-}
-
-/// Create a workspace named after the focused pane's directory and switch
-/// to it — no prompt, the folder is the name.
-async fn new_workspace_here(
-    app: &mut App,
-    client: &ControlClient,
-) -> Result<(), cyclops_tmux::TmuxError> {
-    let pane = app.model.active_tab().active_pane.clone();
-    let cwd = client
-        .display(&pane, "#{pane_current_path}")
-        .await
-        .map(|p| p.trim().to_string())
-        .unwrap_or_default();
-    let folder = if cwd.is_empty() {
-        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
-    } else {
-        std::path::PathBuf::from(cwd)
-    };
-    let taken: Vec<String> = app
-        .model
-        .workspaces
-        .iter()
-        .map(|w| w.name.clone())
-        .collect();
-    let created = intent::execute_new_workspace(client, &folder, &taken).await?;
-    if !app.prefs.folder_tracked.contains(&created.session_id) {
-        app.prefs.folder_tracked.push(created.session_id);
-        if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
-            log_err(&app.home, &error);
-        }
-    }
-    app.needs_reconcile = true;
-    Ok(())
 }
 
 /// Arm one delayed folder probe, if the active workspace follows its folder
@@ -1954,11 +1710,11 @@ async fn follow_workspace_folder(
         .filter(|w| w.session_id != session_id)
         .map(|w| w.name.clone())
         .collect();
-    let Some(next) = intent::folder_rename(&current_name, cwd.trim(), &taken) else {
+    let Some(next) = naming::folder_rename(&current_name, cwd.trim(), &taken) else {
         return Ok(());
     };
 
-    intent::execute_rename_workspace(client, &current_name, &next).await?;
+    client.rename_session(&current_name, &next).await?;
 
     // The model addresses the active session BY NAME; skip this and the
     // next reconcile queries a session that no longer exists. The sidebar
@@ -1980,160 +1736,12 @@ async fn follow_workspace_folder(
     Ok(())
 }
 
-/// Close a pane: straight away when it hosts no agent, else via confirm.
-async fn close_pane_flow(
-    app: &mut App,
-    client: &ControlClient,
-    pane_id: String,
-) -> Result<(), cyclops_tmux::TmuxError> {
-    if pane_has_agent(&app.home, &pane_id) {
-        app.dialog = Some(Dialog::confirm_close(pane_id));
-    } else {
-        intent::execute(client, Intent::ClosePane, &pane_id).await?;
-        app.needs_reconcile = true;
-    }
-    Ok(())
-}
-
-fn open_name_pane(app: &mut App, pane_id: String) {
-    let buffer = app
-        .decoration
-        .pane(&pane_id)
-        .and_then(|decoration| decoration.label.clone())
-        .unwrap_or_default();
-    app.dialog = Some(Dialog::NamePane {
-        pane_id,
-        buffer,
-        error: None,
-    });
-}
-
-/// Close a tab: straight away when it hosts no agent, else via confirm.
-async fn close_tab_flow(
-    app: &mut App,
-    client: &ControlClient,
-    window_id: String,
-) -> Result<(), cyclops_tmux::TmuxError> {
-    if app.model.session.tabs.len() == 1 && app.model.session.tabs[0].window_id == window_id {
-        app.dialog = Some(Dialog::ConfirmCloseWorkspace {
-            session: app.model.session.session.clone(),
-        });
-        return Ok(());
-    }
-    let has_agent = app
-        .model
-        .session
-        .tabs
-        .iter()
-        .find(|t| t.window_id == window_id)
-        .map(|t| crate::layout::pane_ids_in_layout(&t.layout))
-        .into_iter()
-        .flatten()
-        .any(|p| pane_has_agent(&app.home, &p));
-    if has_agent {
-        app.dialog = Some(Dialog::ConfirmCloseTab { window_id });
-    } else {
-        intent::execute_close_tab(client, &window_id).await?;
-        app.needs_reconcile = true;
-    }
-    Ok(())
-}
-
-/// Run one menu item against the pane, tab, or workspace that opened it.
-async fn menu_action(
-    app: &mut App,
-    client: &ControlClient,
-    menu: MenuState,
-    action: BindingAction,
-) -> Result<(), cyclops_tmux::TmuxError> {
-    match (menu, action) {
-        (MenuState::ContextMenu { pane_id, .. }, BindingAction::NamePane) => {
-            open_name_pane(app, pane_id);
-        }
-        (MenuState::ContextMenu { pane_id, .. }, BindingAction::SplitRight) => {
-            intent::execute(client, Intent::SplitRight, &pane_id).await?;
-            app.needs_reconcile = true;
-        }
-        (MenuState::ContextMenu { pane_id, .. }, BindingAction::SplitDown) => {
-            intent::execute(client, Intent::SplitDown, &pane_id).await?;
-            app.needs_reconcile = true;
-        }
-        (MenuState::ContextMenu { pane_id, .. }, BindingAction::ZoomPane) => {
-            intent::execute(client, Intent::ZoomPane, &pane_id).await?;
-            app.needs_reconcile = true;
-        }
-        (MenuState::ContextMenu { pane_id, .. }, BindingAction::ClosePane) => {
-            close_pane_flow(app, client, pane_id).await?;
-        }
-        (MenuState::TabMenu { window_id, .. }, BindingAction::RenameTab) => {
-            if let Some(tab) = app
-                .model
-                .session
-                .tabs
-                .iter()
-                .find(|tab| tab.window_id == window_id)
-            {
-                app.dialog = Some(Dialog::RenameTab {
-                    window_id: tab.window_id.clone(),
-                    buffer: tab.name.clone(),
-                });
-            }
-        }
-        (MenuState::TabMenu { window_id, .. }, BindingAction::CloseTab) => {
-            if app
-                .model
-                .session
-                .tabs
-                .iter()
-                .any(|tab| tab.window_id == window_id)
-            {
-                close_tab_flow(app, client, window_id).await?;
-            }
-        }
-        (MenuState::WorkspaceMenu { session, .. }, BindingAction::RenameWorkspace) => {
-            if let Some(ws) = app
-                .model
-                .workspaces
-                .iter()
-                .find(|workspace| workspace.name == session)
-            {
-                app.dialog = Some(Dialog::RenameWorkspace {
-                    session: ws.name.clone(),
-                    buffer: ws.name.clone(),
-                });
-            }
-        }
-        (MenuState::WorkspaceMenu { session, .. }, BindingAction::CloseWorkspace) => {
-            if let Some(ws) = app
-                .model
-                .workspaces
-                .iter()
-                .find(|workspace| workspace.name == session)
-            {
-                app.dialog = Some(Dialog::ConfirmCloseWorkspace {
-                    session: ws.name.clone(),
-                });
-            }
-        }
-        // The menus' "New tab" is a mouse affordance, so it opens the
-        // naming modal; the keyboard binding stays instant.
-        (_, BindingAction::NewTab) => {
-            app.dialog = Some(Dialog::NewTab {
-                buffer: String::new(),
-            });
-        }
-        (MenuState::AppMenu, action) => dispatch_action(app, client, action).await?,
-        (MenuState::None, _) => {}
-        (menu, action) => {
-            return Err(cyclops_tmux::TmuxError::Protocol(format!(
-                "menu action {action:?} is not valid for {menu:?}"
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// Apply the open dialog's action (Enter or its confirm button).
+/// Route the open dialog's confirmation to a terminal [`Action`] and run it
+/// through the executor. A dialog whose buffer resolves to nothing (a blank
+/// rename, or the read-only Keybinds sheet) still dismisses on Enter — it
+/// just does so here instead of inside an executor arm, since there is no
+/// action to hand it.
 async fn dialog_confirm(
     app: &mut App,
     client: &ControlClient,
@@ -2141,129 +1749,13 @@ async fn dialog_confirm(
     let Some(dialog) = app.dialog.clone() else {
         return Ok(());
     };
-    if let Dialog::NamePane {
-        pane_id, buffer, ..
-    } = &dialog
-    {
-        let label = buffer.trim();
-        let previous_order_key = app
-            .decoration
-            .pane(pane_id)
-            .map(DecorationSnapshot::agent_order_key);
-        let result = crate::daemon::label_pane(&app.home, pane_id, label);
-        if let Err(error) = result {
-            if let Some(Dialog::NamePane {
-                error: shown_error, ..
-            }) = app.dialog.as_mut()
-            {
-                *shown_error = Some(error);
-            }
-            return Ok(());
-        }
-        let next_order_key = format!("name:{label}");
-        if previous_order_key.is_some_and(|previous| {
-            migrate_order_entry(&mut app.prefs.agent_order, &previous, &next_order_key)
-        }) {
-            if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
-                log_err(&app.home, &error);
-            }
-        }
+    let Some(action) = action::route_dialog_confirm(&dialog) else {
         app.dialog = None;
         app.hover = None;
-        if let Some(snapshot) = decoration::fetch_decoration(&app.home) {
-            app.decoration = snapshot;
-        }
-        app.refresh_event_lines();
         return Ok(());
-    }
-    app.dialog = None;
-    app.hover = None;
-    match dialog {
-        Dialog::ConfirmClosePane { pane_id } => {
-            intent::execute(client, Intent::ClosePane, &pane_id).await?;
-            app.needs_reconcile = true;
-        }
-        Dialog::NewTab { buffer } => {
-            new_tab(app, client, Some(buffer.trim())).await?;
-        }
-        Dialog::NamePane { .. } => unreachable!("pane naming returns above"),
-        Dialog::RenameTab { window_id, buffer } => {
-            if !buffer.trim().is_empty() {
-                intent::execute_rename_tab(client, &window_id, buffer.trim()).await?;
-                app.needs_reconcile = true;
-            }
-        }
-        Dialog::ConfirmCloseTab { window_id } => {
-            intent::execute_close_tab(client, &window_id).await?;
-            app.needs_reconcile = true;
-        }
-        Dialog::RenameWorkspace { session, buffer } => {
-            if !buffer.trim().is_empty() {
-                let name = buffer.trim();
-                intent::execute_rename_workspace(client, &session, name).await?;
-                let mut prefs_changed =
-                    migrate_order_entry(&mut app.prefs.workspace_order, &session, name);
-                // An explicit rename means the user owns the name now — a
-                // folder-following workspace must never be renamed out from
-                // under them again.
-                if let Some(session_id) = app
-                    .model
-                    .workspaces
-                    .iter()
-                    .find(|workspace| workspace.name == session)
-                    .map(|workspace| workspace.session_id.clone())
-                {
-                    let before = app.prefs.folder_tracked.len();
-                    app.prefs.folder_tracked.retain(|id| id != &session_id);
-                    prefs_changed |= app.prefs.folder_tracked.len() != before;
-                }
-                if prefs_changed {
-                    if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
-                        log_err(&app.home, &error);
-                    }
-                }
-                // The model addresses the active session BY NAME; skip this
-                // and the reconcile that follows queries the old name.
-                if app.model.session.session == session {
-                    app.model.session.session = name.to_string();
-                }
-                app.needs_reconcile = true;
-            }
-        }
-        Dialog::ConfirmCloseWorkspace { session } => {
-            let fallback = if session == app.model.session.session {
-                app.model
-                    .workspaces
-                    .iter()
-                    .find(|workspace| workspace.name != session)
-                    .map(|workspace| workspace.name.clone())
-            } else {
-                None
-            };
-            let closed_session_id = app
-                .model
-                .workspaces
-                .iter()
-                .find(|workspace| workspace.name == session)
-                .map(|workspace| workspace.session_id.clone());
-            intent::execute_close_workspace(client, &session, fallback.as_deref()).await?;
-            let previous_order_len = app.prefs.workspace_order.len();
-            app.prefs.workspace_order.retain(|name| name != &session);
-            let previous_tracked_len = app.prefs.folder_tracked.len();
-            if let Some(session_id) = closed_session_id {
-                app.prefs.folder_tracked.retain(|id| id != &session_id);
-            }
-            if app.prefs.workspace_order.len() != previous_order_len
-                || app.prefs.folder_tracked.len() != previous_tracked_len
-            {
-                if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
-                    log_err(&app.home, &error);
-                }
-            }
-            app.needs_reconcile = true;
-        }
-        Dialog::Keybinds { .. } => {}
-    }
+    };
+    let outcome = exec::execute(app, client, action).await?;
+    apply_outcome(app, outcome);
     Ok(())
 }
 
@@ -2505,6 +1997,9 @@ fn install_reconciled_model(
     *current = fresh;
 }
 
+/// Route one key to an [`Action`] (via [`action::route_binding`]) and run
+/// it through the executor. Key passthrough to the focused pane is NOT an
+/// action and stays on its own fast path below, unconfirmed and untouched.
 async fn handle_key(
     app: &mut App,
     client: &ControlClient,
@@ -2516,10 +2011,21 @@ async fn handle_key(
     match app.router.route(key) {
         RouterResult::PrefixArmed => Ok(InputOutcome::NoRedraw),
         RouterResult::Consumed => Ok(InputOutcome::NoRedraw),
-        RouterResult::Action(BindingAction::Detach) => Ok(InputOutcome::Detached),
-        RouterResult::Action(action) => {
-            dispatch_action(app, client, action).await?;
-            Ok(InputOutcome::Redraw)
+        RouterResult::Action(binding) => {
+            let resolved = {
+                let ctx = route_context(app);
+                action::route_binding(binding, &ctx)
+            };
+            let Some(resolved) = resolved else {
+                return Ok(InputOutcome::NoRedraw);
+            };
+            let outcome = exec::execute(app, client, resolved).await?;
+            apply_outcome(app, outcome);
+            Ok(if outcome.detach {
+                InputOutcome::Detached
+            } else {
+                InputOutcome::Redraw
+            })
         }
         RouterResult::PassThrough(key) => {
             let pane = app.model.active_tab().active_pane.clone();
@@ -2531,117 +2037,6 @@ async fn handle_key(
             Ok(InputOutcome::NoRedraw)
         }
     }
-}
-
-async fn dispatch_action(
-    app: &mut App,
-    client: &ControlClient,
-    action: BindingAction,
-) -> Result<(), cyclops_tmux::TmuxError> {
-    let pane = app.model.active_tab().active_pane.clone();
-    match action {
-        BindingAction::ClosePane => {
-            close_pane_flow(app, client, pane).await?;
-        }
-        BindingAction::NamePane => {
-            open_name_pane(app, pane);
-            return Ok(());
-        }
-        BindingAction::NewTab => {
-            new_tab(app, client, None).await?;
-        }
-        BindingAction::NextTab | BindingAction::PrevTab => {
-            let len = app.model.session.tabs.len();
-            if len > 0 {
-                let cur = app.model.session.active_tab as isize;
-                let delta = if action == BindingAction::NextTab {
-                    1
-                } else {
-                    -1
-                };
-                let next = (cur + delta).rem_euclid(len as isize) as usize;
-                select_tab(app, client, next).await?;
-            }
-        }
-        BindingAction::SelectTab(n) => {
-            select_tab(app, client, n.saturating_sub(1)).await?;
-        }
-        BindingAction::RenameTab => {
-            let tab = app.model.active_tab();
-            app.dialog = Some(Dialog::RenameTab {
-                window_id: tab.window_id.clone(),
-                buffer: tab.name.clone(),
-            });
-            return Ok(());
-        }
-        BindingAction::CloseTab => {
-            let window_id = app.model.active_tab().window_id.clone();
-            close_tab_flow(app, client, window_id).await?;
-        }
-        BindingAction::NewWorkspace => {
-            new_workspace_here(app, client).await?;
-        }
-        BindingAction::RenameWorkspace => {
-            let session = app.model.session.session.clone();
-            app.dialog = Some(Dialog::RenameWorkspace {
-                buffer: session.clone(),
-                session,
-            });
-            return Ok(());
-        }
-        BindingAction::CloseWorkspace => {
-            app.dialog = Some(Dialog::ConfirmCloseWorkspace {
-                session: app.model.session.session.clone(),
-            });
-            return Ok(());
-        }
-        BindingAction::ToggleEventPanel => {
-            app.event_stream_open = !app.event_stream_open;
-            resize_client(app, client).await;
-            return Ok(());
-        }
-        BindingAction::ShowKeybinds => {
-            app.dialog = Some(Dialog::Keybinds {
-                scroll: 0,
-                rows: app.router.help(),
-            });
-            return Ok(());
-        }
-        BindingAction::NextWorkspace => {
-            let active = app.model.active_workspace;
-            let workspaces = app.model.workspaces.clone();
-            intent::execute_switch_workspace_by_delta(client, &workspaces, active, 1).await?;
-            app.needs_reconcile = true;
-        }
-        BindingAction::PrevWorkspace => {
-            let active = app.model.active_workspace;
-            let workspaces = app.model.workspaces.clone();
-            intent::execute_switch_workspace_by_delta(client, &workspaces, active, -1).await?;
-            app.needs_reconcile = true;
-        }
-        BindingAction::FocusLeft
-        | BindingAction::FocusRight
-        | BindingAction::FocusUp
-        | BindingAction::FocusDown
-        | BindingAction::SplitRight
-        | BindingAction::SplitDown
-        | BindingAction::ZoomPane => {
-            let intent = match action {
-                BindingAction::FocusLeft => Intent::FocusLeft,
-                BindingAction::FocusRight => Intent::FocusRight,
-                BindingAction::FocusUp => Intent::FocusUp,
-                BindingAction::FocusDown => Intent::FocusDown,
-                BindingAction::SplitRight => Intent::SplitRight,
-                BindingAction::SplitDown => Intent::SplitDown,
-                BindingAction::ZoomPane => Intent::ZoomPane,
-                _ => unreachable!("the outer arm names every intent action"),
-            };
-            intent::execute(client, intent, &pane).await?;
-            app.needs_reconcile = true;
-        }
-        BindingAction::Detach => unreachable!("detach is handled before dispatch"),
-    }
-    Ok(())
 }
 
 async fn handle_dialog_key(
@@ -2876,24 +2271,6 @@ mod tests {
     }
 
     #[test]
-    fn automatic_tab_names_advance_numerically() {
-        let node = crate::layout::parse_layout("0000,10x3,0,0,0").unwrap();
-        let layout = crate::layout::resolve_layout(&node, &[]).unwrap();
-        let tab = |name: &str| crate::model::TabModel {
-            window_id: format!("@{name}"),
-            name: name.into(),
-            layout: layout.clone(),
-            active_pane: "%0".into(),
-            zoomed: false,
-        };
-
-        assert_eq!(next_numeric_tab_name(&[tab("1")]), "2");
-        assert_eq!(next_numeric_tab_name(&[tab("1"), tab("notes")]), "2");
-        assert_eq!(next_numeric_tab_name(&[tab("1"), tab("4")]), "5");
-        assert_eq!(next_numeric_tab_name(&[tab("zsh")]), "2");
-    }
-
-    #[test]
     fn sidebar_resize_is_bounded_by_readability_and_half_the_terminal() {
         assert_eq!(clamp_sidebar_width(1, 200), SIDEBAR_MIN_WIDTH);
         assert_eq!(clamp_sidebar_width(100, 200), SIDEBAR_MAX_WIDTH);
@@ -2908,17 +2285,6 @@ mod tests {
         assert!(expanded.contains("$0"));
         assert!(!toggle_workspace_expanded(&mut expanded, "$0".into()));
         assert!(!expanded.contains("$0"));
-    }
-
-    #[test]
-    fn sidebar_drag_order_moves_in_the_direction_of_the_drop() {
-        let mut down = vec!["a".into(), "b".into(), "c".into()];
-        assert!(move_to_index(&mut down, "a", "c"));
-        assert_eq!(down, vec!["b", "c", "a"]);
-
-        let mut up = vec!["a".into(), "b".into(), "c".into()];
-        assert!(move_to_index(&mut up, "c", "a"));
-        assert_eq!(up, vec!["c", "a", "b"]);
     }
 
     #[test]

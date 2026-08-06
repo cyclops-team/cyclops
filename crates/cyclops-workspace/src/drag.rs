@@ -159,7 +159,7 @@ mod tests {
     #[tokio::test]
     async fn divider_drag_resize_converges_on_rig() {
         use cyclops_testrig::{tmux_available, TmuxServer};
-        use cyclops_tmux::ControlClient;
+        use cyclops_tmux::{ControlClient, PaneDirection};
 
         if !tmux_available() {
             return;
@@ -178,7 +178,10 @@ mod tests {
             .unwrap_or("%0")
             .trim()
             .to_string();
-        crate::intent::resize_divider(&client, &pane, SplitDir::Horizontal, 3)
+        // The divider's resolved direction for a positive horizontal delta —
+        // mirrors what `action::resolve_pane_resize` would hand the executor.
+        client
+            .resize_pane(&pane, PaneDirection::Right, 3)
             .await
             .expect("resize");
         let sizes: Vec<String> = String::from_utf8_lossy(

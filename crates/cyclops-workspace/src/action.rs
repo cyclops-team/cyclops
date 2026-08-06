@@ -1,5 +1,3 @@
-#![allow(dead_code)] // C2 wires the executor; this allowance is deleted with it.
-
 //! One target-bearing workspace action vocabulary, and pure routing from
 //! every input device to it.
 //!
