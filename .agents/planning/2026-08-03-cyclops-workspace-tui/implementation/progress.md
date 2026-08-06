@@ -1,65 +1,85 @@
-# Recommendation implementation — progress
+# Recommendation implementation — complete
 
-Recovery run resumed 2026-08-05. Working from
-`.agents/planning/2026-08-03-cyclops-workspace-tui/implementation-prompt.md`.
-G0 baseline: merge `e2d059d`. Disk blocker resolved same day (13.2 GiB
-reclaimed from the merged worktree's target via its manifest, dry-run
-first; `handoff-visual-polish.md` preserved).
+Recovery run, resumed and finished 2026-08-05. Every task in the
+recommendation's dependency graph (G0 → foundation → core → integration →
+S1 → Q1 → M1 → F2 → Q2) is implemented, committed in logical increments,
+and verified. Working from
+`.agents/planning/2026-08-03-cyclops-workspace-tui/implementation-prompt.md`;
+G0 baseline `e2d059d`.
 
-## Completed and committed
+## Final gates (Q2, run on the migrated tree)
 
-| Task | Commit | What |
-|---|---|---|
-| B1 | `5d39e49` | One crossterm (0.29); vt100 + comparison tests deleted |
-| fixes | `9584252` | Alternate-screen hydration order (F38); DECTCEM cursor |
-| A1b | `c541d10` | 20 bridge-fidelity fixtures; attrs bridged; F39 |
-| D1 | `dfb089f` | Typed structural ops on ControlClient |
-| A1a | `dc20c4c` | Recorded perf baselines + harness |
-| D1+ | `870efea` | switch/new/kill session ops |
-| F1 | `54f9a38` | skills/cyclops/SKILL.md from real captures |
-| C1 | `036d60b` | 26-variant Action vocabulary + pure routing |
-| R1 | `71d2e35` | Runtime collapsed; grid mirror deleted; measured |
-| D2 | `ad07de7` | Adapter snapshot (2 cmds flat) + concurrent hydration; F40/F41 |
-| E1 | `7239beb` | Backend-neutral stream model in cyclops-ui |
-| C2 | `ab739b0` | One executor owns every action; intent.rs deleted; app.rs 3166→2532 |
-| W1 | `f58e0cc` | Live insertion rule; preview == drop by construction |
-| L1 | `ceb98da` | Reconcile 2 cmds (~69x at 8 windows); concurrent tab hydration; coalesced decoration |
-| E2 | `7cec8e1` | Event panel renders the shared watch stream; parity test |
-| U1 | `250c28e` | Attention has one owner; glyph contract + invariant 11 amended; dead-code allowances gone |
-| — | `c21acd1` | doc-paths gate exempts the maintainer's notebook.md |
-| — | `5ec068d` | Status carries manifest_display_name; workspace manifest scan deleted |
-| — | `a9b91a6` | Attention tripwire green again (U1 fallout caught by cross-crate test run) |
-| S1 | `61158d2` | render/ split by surface; app.rs sheds non-owned code; moves only, 203 tests before and after |
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --workspace --no-fail-fast` | 894 passed / 0 failed (768/1 at G0) |
+| `scripts/check-doc-paths.py` | 28 pages, every path resolves, every page indexed |
+| `tests/e2e/parity-check.sh` | 115/115 — docs and binaries agree |
+| `tests/e2e/parity-check.sh --with-installer` | 131/131 |
+| Relocated `CYCLOPS_TEST_TMP` full suite | 894 / 0 |
+| `scripts/commpact-shim/test_shim.py` | 42/42 |
 
-Also: `cba276b` (tmux snapshot comments as history), `17c632f`/`0f6aa92`
-(progress records). Findings this run: F38-F41, all indexed.
+## Task commits, in order
 
-## In progress
+| Task | Commit |
+|---|---|
+| B1 dependency cleanup | `5d39e49` |
+| Hydration + DECTCEM fixes (F38) | `9584252` |
+| A1b fidelity floor (F39) | `c541d10` |
+| D1 typed tmux ops | `dfb089f` |
+| A1a perf baselines | `dc20c4c` |
+| D1 session-lifecycle ops | `870efea` |
+| F1 skill draft | `54f9a38` |
+| C1 action vocabulary | `036d60b` |
+| R1 runtime collapse (measured) | `71d2e35` |
+| D2 adapter snapshot + concurrent hydration (F40/F41) | `ad07de7` |
+| E1 shared stream model | `7239beb` |
+| C2 one executor, intent.rs deleted | `ab739b0` |
+| W1 reorder insertion rule | `f58e0cc` |
+| L1 latency integration (measured ~69x reconcile) | `ceb98da` |
+| E2 event panel on the watch stream | `7cec8e1` |
+| U1 attention owner + glyph contract | `250c28e` |
+| display-name ownership cleanup | `5ec068d` |
+| attention tripwire repair | `a9b91a6` |
+| S1 modules own their rules | `61158d2` |
+| Q1 gates green (parity manifest fix) | `b408618` |
+| M1 repository migration | `b2d5bf7` |
+| F2 skill validation | `8d991fe` |
 
-Q1 (lead-owned). Docs drift fix delegated first: ~29 `cyclops ui`
-mentions across 9 pages updated to `cyclops watch` with real re-captured
-output, parity-check and doc-paths as its gates. Full workspace gates
-(fmt, clippy, full test suite, doc-paths, parity) run after it lands.
-No concurrent behavior edits during Q1, per the plan.
+Supporting commits: `cba276b`, `c21acd1`, and the `cyclops watch` docs
+accuracy pass. Findings recorded: F38–F41, indexed.
 
-## Remaining
+## Product decisions preserved (verified in code and tests)
 
-M1 (repository migration, one owner, behavior frozen) → F2 (skill
-validation against the final tree; three deferred capture blocks need a
-live hook-wired vendor CLI) → Q2 (final gates incl. relocated-temp,
-shim, installer variants; docs/findings from real output).
+Glyph-only compact statuses (invariant 11 amended, theme/NO_COLOR
+stability tests); always-visible split controls; the event panel renders
+the same stream model as `cyclops watch` (parity test); the live
+horizontal insertion rule during workspace reordering (preview == drop
+by construction); zero polling throughout (every new deadline is
+one-shot and event-armed); the attention rule has one owner and a green
+tripwire.
 
-## Gotchas worth keeping
+## Deliberately not done, with reasons
 
-- `cyclops-ui/tests/perf.rs` 16ms assertion flakes under load; rerun alone.
+- The skill's three deferred capture blocks (verified-tier receipt,
+  reached wait, genuinely blocked chain) need a live hook-wired vendor
+  CLI no isolated fixture can produce; each is marked in place.
+- `CursorShape` stays computed-but-unrendered: it is the A1b
+  bridge-fidelity contract, an obligation rather than dead code.
+- `./manifests` / `./themes` cwd-relative fallbacks left as behavior
+  (frozen during M1); the doc-paths gate knows they are not repo paths.
+
+## Gotchas for whoever comes next
+
+- `cyclops-ui/tests/perf.rs` 16ms assertion flakes under CPU load;
+  rerun alone before believing it.
 - Two tmux-rig test binaries running concurrently can interfere.
 - Never pipe `cargo test` through `tail`; redirect to a file.
 - Perf numbers during macOS storage-daemon churn read ~20% worse on
-  unchanged code; trust quiet-machine runs only (baselines.md).
-- Disk floor 10 GiB: target/debug/incremental was 1.5 GiB of dead weight
-  (all builds run CARGO_INCREMENTAL=0) and was reclaimed before Q1.
-- The attention tripwire (cyclops-proto/tests/one_place.rs) scans file
-  text repo-wide: enumerating the blocked states or string-matching state
-  words anywhere — tests included — trips it. Ask the owner
-  (is_blocked, Display) instead. Targeted crate gates don't run it;
-  cross-crate work does.
+  unchanged code (baselines.md quantifies it).
+- The attention tripwire scans file text repo-wide, tests included:
+  ask the owner (`is_blocked`, `Display`) instead of enumerating states
+  or string-matching state words. Targeted crate gates don't run it.
+- Build with `CARGO_INCREMENTAL=0`; the incremental cache is dead
+  weight here and has eaten gigabytes before.
