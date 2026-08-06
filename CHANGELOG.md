@@ -101,6 +101,16 @@ versions are unreleased until admin cuts a tag.
   ground, and the theme's ink no longer disappears into an agent's own
   dark fills. Readable colors pass through hue-intact; NO_COLOR never
   clamps.
+- Panels painted for the wrong terminal re-ground to the theme: an
+  agent that believes it is on a dark terminal (tmux reports the ground
+  its real client taught it, F49) paints composer boxes and command
+  bars near-black, which arrived as black boxes on the light theme. A
+  neutral fill at the opposite luminance extreme from the theme ground
+  now becomes the theme's own panel and the floor sets its text.
+  Chromatic fills (diff greens, powerline segments), reverse video, and
+  block/braille image glyphs keep their colors, and image glyphs are
+  exempt from the floor too, so half-block pictures and braille plots
+  render pixel-exact.
 - Typed text ran past the visible pane edge into columns nobody could
   see: `window-size latest` let any attaching client out-size the
   workspace's declared canvas (F48); `window-size smallest` is the

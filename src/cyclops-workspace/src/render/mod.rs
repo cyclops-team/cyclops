@@ -143,14 +143,26 @@ fn cell_style(cell: &GridCell, base: Style, palette: Option<&[RtColor; 16]>) -> 
     if let Some(bg) = rt_color(cell.attrs.bg, palette) {
         style = style.bg(bg);
     }
-    // Minimum contrast, colors-on only (a palette exists exactly when
-    // colors are on). Agents pick their colors for the terminal THEY
-    // imagine: pale grays drawn for a dark ground vanish on paper, and
-    // their own dark fills swallow the theme's ink. DIM folds into the
-    // math here rather than passing to the terminal, which would halve
-    // the brightness AFTER the clamp and un-read everything it fixed.
-    // Rule 11 holds because none of this runs with color off.
-    if palette.is_some() {
+    // Colors-on adjustments (a palette exists exactly when colors are
+    // on). Agents pick their colors for the terminal THEY imagine. Two
+    // symptoms, one cause: a neutral fill at the far luminance extreme
+    // (codex's #393939 composer, painted for the dark ground tmux
+    // reported) re-grounds to this theme's own panel, and text that
+    // cannot read on its ground clamps to the floor. DIM folds into the
+    // clamp's math rather than passing to the terminal, which would
+    // halve brightness AFTER the clamp. Block, shade, and braille
+    // glyphs carry image pixels, not text: their colors pass through
+    // untouched, DIM included. Rule 11 holds because none of this runs
+    // with color off.
+    let pixels = paints_pixels(cell.ch);
+    if palette.is_some() && !pixels {
+        if !cell.attrs.reverse {
+            if let (Some(bg), Some(ground)) = (style.bg, base.bg) {
+                if let Some(panel) = matched_ground(bg, ground, base.fg, palette) {
+                    style.bg = Some(panel);
+                }
+            }
+        }
         if let (Some(fg), Some(bg)) = (style.fg, style.bg) {
             style.fg = Some(readable_fg(fg, bg, cell.attrs.dim, palette));
         }
@@ -158,7 +170,7 @@ fn cell_style(cell: &GridCell, base: Style, palette: Option<&[RtColor; 16]>) -> 
     if cell.attrs.bold {
         style = style.add_modifier(Modifier::BOLD);
     }
-    if cell.attrs.dim && palette.is_none() {
+    if cell.attrs.dim && (palette.is_none() || pixels) {
         style = style.add_modifier(Modifier::DIM);
     }
     if cell.attrs.italic {
@@ -203,6 +215,25 @@ const MIN_CONTRAST: f64 = 3.0;
 /// clamp measures, never as the terminal's own DIM.
 const DIM_FADE: f64 = 0.4;
 
+/// Fills at or past these luminance extremes read as "the ground the
+/// program thought it had": near-black painted for a dark terminal,
+/// near-white for a light one. Dark anchor, measured: codex's dark-mode
+/// composer paints #393939 (luminance 0.041); Claude Code's command
+/// bars sit lower still. The bounds are asymmetric because luminance is:
+/// light grounds cluster from #dcdcdc (0.72) up, while #d0d0d0 (0.63)
+/// is already a mid gray no app uses as paper.
+const FOREIGN_DARK_MAX_L: f64 = 0.10;
+const FOREIGN_LIGHT_MIN_L: f64 = 0.70;
+
+/// Only neutral fills re-ground: channel spread at or under this. A
+/// chromatic dark (a diff's green fill, a powerline segment) is
+/// content, not a mistaken ground, and keeps its color.
+const NEUTRAL_SPREAD_MAX: u8 = 24;
+
+/// How far the replacement panel leans from the ground toward the ink:
+/// enough to keep a composer box visible as a box, no more.
+const PANEL_TINT: f64 = 0.10;
+
 /// `fg`, faded when `dim` and then nudged toward black or white until it
 /// clears [`MIN_CONTRAST`] against `bg`. A pair already readable comes
 /// back with its hue (dim included, as a fade toward the ground rather
@@ -235,6 +266,53 @@ fn readable_fg(fg: RtColor, bg: RtColor, dim: bool, palette: Option<&[RtColor; 1
         }
     }
     emit(fixed, palette)
+}
+
+/// The theme's own panel color for a fill painted against the wrong
+/// ground, or `None` for every fill that is the program's business. A
+/// neutral background at the luminance extreme opposite this theme's
+/// ground was composed for the terminal the program imagined: tmux
+/// reports the ground of whichever real client taught it, so an agent
+/// under the user's dark terminal paints dark fills into a light
+/// workspace. Detection cannot be fixed at the source, because the same
+/// pane is viewed through that dark terminal AND this theme at once;
+/// the restyle happens here, per theme, at render.
+fn matched_ground(
+    bg: RtColor,
+    ground: RtColor,
+    ink: Option<RtColor>,
+    palette: Option<&[RtColor; 16]>,
+) -> Option<RtColor> {
+    let (Some(b), Some(g)) = (srgb(bg), srgb(ground)) else {
+        return None;
+    };
+    let spread = b.0.max(b.1).max(b.2) - b.0.min(b.1).min(b.2);
+    if spread > NEUTRAL_SPREAD_MAX {
+        return None;
+    }
+    let (bl, gl) = (luminance(b), luminance(g));
+    let foreign = if gl >= 0.5 {
+        bl <= FOREIGN_DARK_MAX_L
+    } else {
+        bl >= FOREIGN_LIGHT_MIN_L
+    };
+    if !foreign {
+        return None;
+    }
+    let pole = if gl >= 0.5 {
+        (0, 0, 0)
+    } else {
+        (255, 255, 255)
+    };
+    let ink = ink.and_then(srgb).unwrap_or(pole);
+    Some(emit(lerp(g, ink, PANEL_TINT), palette))
+}
+
+/// Block elements, shades, braille, and the legacy-computing set: cells
+/// whose colors are image pixels or plot points. "Text readability" has
+/// no meaning there and recoloring corrupts the picture.
+fn paints_pixels(ch: char) -> bool {
+    matches!(u32::from(ch), 0x2580..=0x259F | 0x2800..=0x28FF | 0x1FB00..=0x1FBFF)
 }
 
 /// A computed color, in the terminal vocabulary the theme itself uses:
@@ -362,18 +440,87 @@ mod contrast_tests {
         );
     }
 
-    /// The other live symptom: an agent's own dark fill must not swallow
-    /// the theme's ink.
+    /// The other live symptom, with the stronger answer: an agent's
+    /// neutral dark fill on a light theme is a ground painted for the
+    /// wrong terminal. It becomes this theme's own panel (the measured
+    /// codex composer fill, #393939), and the text on it reads.
     #[test]
-    fn theme_ink_on_an_agents_dark_fill_lightens() {
+    fn a_dark_fill_on_paper_becomes_the_themes_panel() {
         let base = Style::new().fg(INK).bg(WHITE);
         let style = cell_style(
-            &cell(Color::Default, Color::Rgb(30, 30, 30)),
+            &cell(Color::Default, Color::Rgb(57, 57, 57)),
             base,
             Some(&PALETTE),
         );
+        let bg = srgb(style.bg.unwrap()).unwrap();
+        assert_eq!(bg, lerp((254, 254, 254), (42, 42, 42), PANEL_TINT));
         let fg = srgb(style.fg.unwrap()).unwrap();
-        assert!(contrast(fg, (30, 30, 30)) >= MIN_CONTRAST, "{fg:?}");
+        assert!(contrast(fg, bg) >= MIN_CONTRAST, "{fg:?} on {bg:?}");
+    }
+
+    /// A chromatic dark fill (a diff's green, a powerline segment) is
+    /// content: the fill keeps its color and only its text gets the
+    /// floor.
+    #[test]
+    fn a_chromatic_dark_fill_keeps_its_color() {
+        let base = Style::new().fg(INK).bg(WHITE);
+        let style = cell_style(
+            &cell(Color::Default, Color::Rgb(14, 53, 18)),
+            base,
+            Some(&PALETTE),
+        );
+        assert_eq!(style.bg.unwrap(), RtColor::Rgb(14, 53, 18));
+        let fg = srgb(style.fg.unwrap()).unwrap();
+        assert!(contrast(fg, (14, 53, 18)) >= MIN_CONTRAST, "{fg:?}");
+    }
+
+    /// The mirror: a near-white panel painted for a light terminal
+    /// re-grounds on a dark theme, while a dark fill there is native
+    /// and stays.
+    #[test]
+    fn a_light_fill_on_a_dark_ground_mirrors() {
+        let base = Style::new().fg(WHITE).bg(INK);
+        let style = cell_style(
+            &cell(Color::Default, Color::Rgb(236, 236, 236)),
+            base,
+            Some(&PALETTE),
+        );
+        assert_eq!(
+            srgb(style.bg.unwrap()).unwrap(),
+            lerp((42, 42, 42), (254, 254, 254), PANEL_TINT)
+        );
+        let native = cell_style(
+            &cell(Color::Default, Color::Rgb(57, 57, 57)),
+            base,
+            Some(&PALETTE),
+        );
+        assert_eq!(native.bg.unwrap(), RtColor::Rgb(57, 57, 57));
+    }
+
+    /// Reverse video is emphasis, not a mistaken ground: the pair
+    /// passes through for the terminal to swap.
+    #[test]
+    fn reverse_video_keeps_its_colors() {
+        let base = Style::new().fg(INK).bg(WHITE);
+        let mut c = cell(Color::Default, Color::Rgb(57, 57, 57));
+        c.attrs.reverse = true;
+        let style = cell_style(&c, base, Some(&PALETTE));
+        assert_eq!(style.bg.unwrap(), RtColor::Rgb(57, 57, 57));
+        assert!(style.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    /// Image pixels: a half-block's pair IS the picture. No re-ground,
+    /// no floor, DIM forwarded as the modifier it always was.
+    #[test]
+    fn image_pixels_pass_through_untouched() {
+        let base = Style::new().fg(INK).bg(WHITE);
+        let mut px = cell(Color::Rgb(16, 16, 16), Color::Rgb(15, 15, 15));
+        px.ch = '▄';
+        px.attrs.dim = true;
+        let style = cell_style(&px, base, Some(&PALETTE));
+        assert_eq!(style.fg.unwrap(), RtColor::Rgb(16, 16, 16));
+        assert_eq!(style.bg.unwrap(), RtColor::Rgb(15, 15, 15));
+        assert!(style.add_modifier.contains(Modifier::DIM));
     }
 
     /// A pair already readable keeps its hue exactly.
@@ -415,7 +562,8 @@ mod contrast_tests {
             "colors on: DIM is consumed, never forwarded"
         );
         let fg = srgb(style.fg.unwrap()).unwrap();
-        assert!(contrast(fg, (30, 30, 30)) >= MIN_CONTRAST, "{fg:?}");
+        let bg = srgb(style.bg.unwrap()).unwrap();
+        assert!(contrast(fg, bg) >= MIN_CONTRAST, "{fg:?} on {bg:?}");
 
         // Colors off: DIM passes through as the modifier it always was.
         let plain = cell_style(&dimmed, Style::new(), None);

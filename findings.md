@@ -824,3 +824,22 @@ only shrinks it, which the canvas absorbs as gutter. Probe: two `tmux
 -C attach` coprocesses issuing `refresh-client -C` against one rig
 session, plus a real client on a second tmux server. Pinned by
 src/cyclops-workspace/tests/geometry.rs.
+
+## F49. Apps dress for the ground tmux reports, and one pane serves two terminals at once (MEASURED)
+
+Measured with codex 0.146.1 on tmux 3.6a. In a detached rig session
+codex styled fg-only (bold cyan selected row, no fills): with no answer
+to its OSC 11 background query it commits to no ground. Setting a pane
+style (`select-pane -P 'bg=#1e1e1e'`) before launch made tmux answer
+the query, and the same codex painted its full dark theme, an explicit
+`48;2;57;57;57` composer fill. On a user's machine the answer comes
+from whichever real terminal taught tmux its background, so agents
+dress for the user's dark terminal inside a light workspace. The
+tempting fix, teaching tmux a light ground so apps dress light, is
+wrong by construction: the same pane is still viewed through the user's
+own dark terminal, and one escape stream cannot dress for both grounds.
+The restyle belongs at render, per viewer: the workspace re-grounds
+neutral fills at the opposite luminance extreme to the theme's own
+panel (`matched_ground` in src/cyclops-workspace/src/render/mod.rs),
+the readability floor sets their text, and the same pane stays native
+in the dark terminal. Pinned by render::contrast_tests.
