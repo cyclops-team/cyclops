@@ -3,11 +3,14 @@
 //! order, and filtering come from `cyclops_ui::Record`; this only turns
 //! its rows into a painted, backend-neutral text panel.
 
+use std::collections::VecDeque;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use unicode_width::UnicodeWidthChar;
 
 use cyclops_ui::{Entry, EntryKind, Record};
 
@@ -100,21 +103,88 @@ pub fn paint_event_stream(record: &Record, area: Rect, buf: &mut Buffer, paint: 
         return;
     }
 
-    // The viewport clip the spec allows: the tail the panel can plausibly
-    // show, oldest-of-that-window first. Ratatui's own `Wrap` handles the
-    // narrower-width wrapping; this only bounds how many entries it gets.
-    let cap = (inner.height as usize).max(1);
-    let visible = &rows[rows.len().saturating_sub(cap)..];
-    let mut lines: Vec<Line> = Vec::new();
-    for row in visible {
+    // An admitted row can be several lines (a message's body) and any one
+    // of those can be wider than the panel, so "row" and "rendered line"
+    // are different units. Capping by row count let one old, wide row's
+    // wrap push the newest row's lines past the bottom of the viewport,
+    // where `Paragraph` silently drops them (it fills from its first line
+    // and stops, so overflow is lost off the end, not the start). The
+    // panel's guarantee is the last `inner.height` RENDERED lines, so this
+    // wraps to `inner.width` itself and windows the result, rather than
+    // asking `Paragraph::wrap` for a word-wrapped line count it does not
+    // expose.
+    let lines = visible_window(&rows, inner.width as usize, inner.height as usize, paint);
+    Paragraph::new(lines).render(inner, buf);
+}
+
+/// Wraps `text` at `width` display columns, matching how a narrower
+/// terminal would actually break the run of glyphs `text` already is (no
+/// re-flow, no trimming — the panel's other rows are pre-formatted text,
+/// not prose).
+///
+/// A char whose width would overflow the open segment starts a new one; a
+/// zero-width char (a combining mark) always joins whatever segment is
+/// open, even an empty one, so it can never anchor a line by itself.
+fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    let mut segment = String::new();
+    let mut segment_width = 0usize;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if w == 0 {
+            segment.push(ch);
+            continue;
+        }
+        if segment_width + w > width && !segment.is_empty() {
+            out.push(std::mem::take(&mut segment));
+            segment_width = 0;
+        }
+        segment.push(ch);
+        segment_width += w;
+    }
+    out.push(segment);
+    out
+}
+
+/// The last `height` rendered lines of `rows`, newest last.
+///
+/// 1. Walk `rows` newest first, wrapping each row's lines at `width` and
+///    prepending them, so a record holding thousands of admitted rows only
+///    ever wraps the screenful this renders rather than the whole ring.
+/// 2. Stop as soon as `height` lines have accumulated, then keep exactly
+///    the last `height` of them. A row taller than the panel is trimmed
+///    from its own front, the same as the window as a whole, so it shows
+///    its tail rather than disappearing under an older row's lines.
+///
+/// Order matters here: walking oldest first and trimming the same way
+/// would keep the OLDEST lines instead, which is the defect this replaces.
+fn visible_window(
+    rows: &[EventRow<'_>],
+    width: usize,
+    height: usize,
+    paint: &Paint,
+) -> Vec<Line<'static>> {
+    let mut visible: VecDeque<Line<'static>> = VecDeque::new();
+    for row in rows.iter().rev() {
         let style = entry_row_style(&row.entry.kind, paint);
+        let mut wrapped = Vec::new();
         for text in &row.lines {
-            lines.push(Line::from(Span::styled(text.clone(), style)));
+            for segment in wrap_to_width(text, width) {
+                wrapped.push(Line::from(Span::styled(segment, style)));
+            }
+        }
+        for line in wrapped.into_iter().rev() {
+            visible.push_front(line);
+        }
+        if visible.len() >= height {
+            break;
         }
     }
-    Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .render(inner, buf);
+    while visible.len() > height {
+        visible.pop_front();
+    }
+    visible.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -176,6 +246,12 @@ mod tests {
     /// The panel renders the model's own glyph and word — the same
     /// content `cyclops watch` shows for the identical entry — through
     /// Ratatui rather than a private debug-formatted projection.
+    ///
+    /// A state whose word plus "reviewer" comes in under this backend's
+    /// content width: the panel caps its own width at 40 regardless of
+    /// the terminal, so the row this fixture renders has to fit inside
+    /// that fixed 39-column budget to test the glyph and word rather than
+    /// this module's own hard wrap (covered separately, below).
     #[test]
     fn event_panel_renders_the_calm_views_glyph_and_word() {
         let mut record = Record::new();
@@ -183,7 +259,7 @@ mod tests {
             1_000,
             "reviewer",
             "%1",
-            cyclops_proto::AgentState::BlockedPermission,
+            cyclops_proto::AgentState::BlockedModal,
         ));
 
         let backend = TestBackend::new(40, 6);
@@ -199,7 +275,7 @@ mod tests {
         assert!(text.contains("⚠"), "{text:?}");
         // The expected word comes from the vocabulary's owner, not a
         // literal: if the state's words change, this follows.
-        let word = cyclops_proto::AgentState::BlockedPermission.to_string();
+        let word = cyclops_proto::AgentState::BlockedModal.to_string();
         assert!(text.contains(&word), "{text:?}");
     }
 
@@ -245,5 +321,74 @@ mod tests {
             RtColor::Reset,
             "NO_COLOR must leave no color behind"
         );
+    }
+
+    /// The defect this module exists to fix: an older row's target is long
+    /// enough that its own wrapped lines alone exceed the panel's height,
+    /// so with only entries (not rendered lines) capped, Ratatui's `Wrap`
+    /// renders from the first line onward and never reaches the newer
+    /// row. The oldest lines survive; the newest entry is cut off.
+    #[test]
+    fn newest_entrys_lines_survive_when_an_older_entry_wraps_past_the_window() {
+        let mut record = Record::new();
+        record.live(state_entry(
+            1_000,
+            &"a".repeat(200),
+            "%1",
+            cyclops_proto::AgentState::BlockedModal,
+        ));
+        record.live(state_entry(
+            2_000,
+            "z",
+            "%2",
+            cyclops_proto::AgentState::BlockedQuota,
+        ));
+
+        let backend = TestBackend::new(31, 3);
+        let mut term = Terminal::new(backend).unwrap();
+        let paint = Paint::for_test();
+        term.draw(|f| {
+            paint_event_stream(&record, f.area(), f.buffer_mut(), &paint);
+        })
+        .unwrap();
+        let text = flatten(term.backend().buffer());
+
+        let newest_word = cyclops_proto::AgentState::BlockedQuota.to_string();
+        assert!(text.contains(&newest_word), "{text:?}");
+    }
+
+    /// A single entry taller than the panel keeps bottom-aligned
+    /// semantics: its own trailing lines are what the reader sees, never
+    /// its opening ones.
+    ///
+    /// The target's length is picked so the row's word lands exactly on a
+    /// wrapped line's start and fits inside one: `flatten` reads the
+    /// panel's left border once per row, so a word straddling two wrapped
+    /// lines would read back with that border cell spliced into the
+    /// middle of it, which is a property of the test's own flattening and
+    /// not of the panel.
+    #[test]
+    fn a_newest_entry_taller_than_the_panel_shows_its_own_tail() {
+        let mut record = Record::new();
+        let target = format!("head{}", "m".repeat(302));
+        record.live(state_entry(
+            1_000,
+            &target,
+            "%1",
+            cyclops_proto::AgentState::BlockedPermission,
+        ));
+
+        let backend = TestBackend::new(21, 6);
+        let mut term = Terminal::new(backend).unwrap();
+        let paint = Paint::for_test();
+        term.draw(|f| {
+            paint_event_stream(&record, f.area(), f.buffer_mut(), &paint);
+        })
+        .unwrap();
+        let text = flatten(term.backend().buffer());
+
+        assert!(!text.contains("head"), "{text:?}");
+        let word = cyclops_proto::AgentState::BlockedPermission.to_string();
+        assert!(text.contains(&word), "{text:?}");
     }
 }

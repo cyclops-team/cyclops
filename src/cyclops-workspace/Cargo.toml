@@ -16,6 +16,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 toml.workspace = true
+unicode-width = "0.2.2"
 
 [dev-dependencies]
 cyclops-testrig.workspace = true
