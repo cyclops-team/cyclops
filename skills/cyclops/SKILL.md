@@ -340,7 +340,11 @@ and the proof).
 
 These doc paths follow the migrated repository layout (docs sorted into
 `guides/`, `reference/`, and `development/`). The three output blocks
-above marked for F2 remain deferred: each needs a live, hook-wired
-vendor CLI (a verified-tier receipt, a wait that reaches `done`, a
-genuinely blocked ledger chain), which no isolated fixture can produce.
-Capture them from a real session when one exists.
+above marked for F2 are externally blocked, not pending polish: each
+needs a live, hook-wired vendor CLI session (a verified-tier receipt, a
+wait that reaches `done`, a genuinely blocked ledger chain), and no
+isolated fixture can produce one — a fixture pane is always idle, never
+verifies, and never blocks. Every other example in this skill is real
+captured output; those three are annotated placeholders until a real
+session is captured, and the skill should be read as complete-except-
+blocked rather than finished.
