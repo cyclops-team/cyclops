@@ -31,17 +31,17 @@ ledger is NDJSON and a 10k-line scan is single-digit milliseconds).
 | tmux ≥ 3.2 | The product itself and most tests (developed on 3.6a; CI also builds tmux master as an advisory canary) |
 | Rust stable toolchain | Building; CI uses `dtolnay/rust-toolchain@stable` with rustfmt + clippy |
 | Python 3 | `scripts/check-doc-paths.py`, `scripts/commpact-shim/test_shim.py`, `tests/m1_soak.py`, three demos |
-| jq | Demos that read the ledger back (`demos/m1-send.sh`, `demos/m2-conversation.sh`, `demos/m3-stream.sh`, `demos/parity-check.sh`) |
+| jq | Demos that read the ledger back (`demos/m1-send.sh`, `demos/m2-conversation.sh`, `demos/m3-stream.sh`, `tests/e2e/parity-check.sh`) |
 | POSIX shell | `demos/`, `scripts/install.sh` (`bash -n` must always pass on demos) |
 
-## Frontend dependencies (`frontend/`, outside the workspace)
+## Frontend dependencies (`website/`, outside the workspace)
 
 Dev-dependencies only — zero runtime dependencies, no UI library, no
 Tailwind:
 
 | Package | For |
 |---|---|
-| `@sveltejs/kit` 2 / `svelte` 5 | The framework; runes mode forced via compiler options in `frontend/vite.config.ts` (there is no svelte.config.js) |
+| `@sveltejs/kit` 2 / `svelte` 5 | The framework; runes mode forced via compiler options in `website/vite.config.ts` (there is no svelte.config.js) |
 | `vite` 8 + `@sveltejs/vite-plugin-svelte` | Build |
 | `@sveltejs/adapter-auto` | Deploy adapter; the host is configured outside the repo |
 | `typescript` + `svelte-check` | The only static check (`npm run check`) |
@@ -52,11 +52,11 @@ graceful fallback) and Google Fonts (JetBrains Mono, Silkscreen).
 ## Version-compatibility posture
 
 - tmux: version-specific behavior is a named predicate in
-  `crates/cyclops-tmux/src/version.rs` (e.g. bracket-paste flag ≥3.8,
+  `src/cyclops-tmux/src/version.rs` (e.g. bracket-paste flag ≥3.8,
   pause-after ≥3.2), never a call-site comparison. Unknown control-mode
   notification lines are data, not errors, for forward compatibility with
   tmux HEAD.
 - Wire protocol: additive-only. New fields optional, unknown fields ignored
   in both directions, version mismatch warns.
-- Vendor CLIs: all knowledge lives in `manifests/` data files, so a vendor
+- Vendor CLIs: all knowledge lives in `resources/manifests/` data files, so a vendor
   change is a manifest edit, not a release.

@@ -4,8 +4,8 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SOCK="cyc-ws-step7-$$"
-# shellcheck source=demos/lib.sh
-. "$(cd "$(dirname "$0")" && pwd)/lib.sh"
+# shellcheck source=../tests/e2e/lib/lib.sh
+. "$(cd "$(dirname "$0")" && pwd)/../tests/e2e/lib/lib.sh"
 CYCLOPS_HOME="$(mktemp -d "$(cyc_scratch_root)/cyclops-ws7.XXXXXX")"
 export CYCLOPS_HOME
 printf 'tmux_socket = "%s"\ntmux_config = "/dev/null"\n' "$SOCK" >"$CYCLOPS_HOME/config.toml"

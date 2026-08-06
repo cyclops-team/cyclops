@@ -39,7 +39,7 @@ CYCLOPS = REPO / "target" / "debug" / "cyclops"
 # cyclops_proto::scratch::SCRATCH_ENV. One name, both languages.
 SCRATCH_ENV = "CYCLOPS_TEST_TMP"
 
-# Same canned status shape crates/cyclops/tests/e2e.rs uses, so the human
+# Same canned status shape src/cyclops/tests/e2e.rs uses, so the human
 # status rendering (list, doctor) parses it.
 CANNED_STATUS = {
     "daemon_version": "0.1.0",

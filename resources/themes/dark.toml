@@ -1,0 +1,133 @@
+# Cyclops dark: the shipped default, on the usecyclops.dev identity.
+#
+# Source of truth is the landing page in website/src/app.css ("Cyclops
+# Light" design system v1.0). The terminal identity there is deliberately
+# the same in both site themes, so this file maps the --term-* tokens and
+# the two brand accents onto the semantic vocabulary:
+#
+#   surface.fg      --term-text    #edecec   fallback only, see below
+#   surface.dim     --term-dim     #777777   secondary terminal text
+#   surface.accent  --sage         #b7c396   the brand accent, ".ok"/".prompt"
+#
+#   role.1          --sage         #b7c396   pane dot color on the hero visual
+#   role.2          --mauve        #ba9a91   the ".msg" message color there
+#
+# The site defines exactly two chromatic accents. The remaining six role
+# slots extend that sorbet family around the hue wheel at sage's own
+# saturation and lightness, so no agent shouts louder than the brand:
+# mist blue, aqua, moss, sand, lavender, plum.
+#
+# The eye is the one signature element. Calm takes --term-dim so a quiet
+# rig stays quiet; alert takes sage, the site's "ok" color, so the mark
+# brightens into the brand when something needs the human.
+#
+# surface.fg is the one value here that no renderer paints. Cyclops prints
+# body text in the terminal's own foreground; the engine reads surface.fg
+# only as its fallback when a renderer asks for a token outside the
+# vocabulary. It stays because it names the identity's text color and
+# gives that fallback a themed value. Editing it changes nothing on screen.
+#
+# [state] and [badge] are the second meaning-carrying encoding's color
+# half, and they are REDUNDANT by construction: every state still prints
+# its glyph and its word, so NO_COLOR and --plain lose nothing. Four
+# groups, not a hue per state, because two questions are what a reader
+# actually needs answered:
+#
+#   state.healthy    working, delivered                    a calm green
+#   state.needs_you  blocked_modal, blocked_permission,     amber
+#                    attention_required
+#   state.terminal   blocked_quota, parked: the states     red
+#                    that never retry themselves
+#   state.quiet      idle, idle_with_input, queued,        --term-dim
+#                    unknown, and every in-flight step
+#   state.dead       a pane whose process is gone          one step below
+#
+# The greens, ambers and reds are the sorbet family at the role slots'
+# saturation and lightness, so a state cell never shouts louder than the
+# agent name beside it. Role hue stays on the name and state color on the
+# cell, so no cell carries both encodings.
+#
+# [badge] is the same four read on a delivery instead of a pane, at the
+# same values. Separate tokens so a theme can set the badge column back
+# from the state column without regrouping anything.
+#
+# There is no [stream] table. The stream's gutter resolves surface.dim
+# like every other detail column, and its subjects and bodies print in the
+# terminal's own foreground, so separate stream tokens would only let the
+# two surfaces drift.
+#
+# CONTRAST. Checked pair: every token in the vocabulary against #0d0d0d,
+# the site's --term-bg. That is the ground this palette was drawn on, and
+# this file sets no background of its own, so a terminal darker than it
+# reads higher and a lighter one reads lower. Measured as WCAG 2.1
+# relative luminance in sRGB, ratio (lighter + 0.05) / (darker + 0.05);
+# the arithmetic is in src/cyclops-theme/tests/shipped.rs and the
+# numbers below are pinned there by
+# shipped_themes_meet_their_stated_contrast.
+#
+# Floor 4.3:1 for every figure token except state.dead; the two [chrome]
+# grounds are backgrounds the workspace chrome paints, not figures, so
+# their bar (pinned in the same test) is that chrome.text stays readable
+# on both grounds at this floor, not that they clear it themselves.
+# The floor itself is
+# surface.dim, and eye.calm, state.quiet and badge.quiet sit on it because
+# they take the same value: 4.34:1, just under WCAG AA's 4.5:1, and it
+# stays because #777 is the site's own --term-dim and detail columns are
+# meant to recede. Body text is not painted from this file at all (see
+# surface.fg above), so nothing that carries a sentence rides that number.
+# The rest: role slots 7.3:1 to 10.4:1, state.terminal 5.5:1,
+# state.needs_you 9.0:1, state.healthy 9.8:1.
+#
+# state.dead is the deliberate exception, floor 2.8:1, measuring 2.82:1.
+# It marks a pane whose process is gone, one step below the dim it sits
+# under, and a row nobody can act on should be the hardest thing on the
+# screen to read.
+#
+# 256-color fallbacks are explicit and derived with the algorithm in
+# cyclops-theme (nearest cube-or-ramp entry), except the eight role slots:
+# several of the muted pastels derive to the same cube entry, and role
+# color is one of the two meaning-carrying encodings, so the role
+# fallbacks are hand-tuned to stay pairwise distinct (nearest distinct
+# entries in hue order).
+
+name = "dark"
+
+[surface]
+fg = { hex = "#edecec", c256 = 255 }
+dim = { hex = "#777777", c256 = 243 }
+accent = { hex = "#b7c396", c256 = 144 }
+
+[role]
+1 = { hex = "#b7c396", c256 = 144 } # sage, the site accent
+2 = { hex = "#ba9a91", c256 = 138 } # mauve, the site message color
+3 = { hex = "#96aac3", c256 = 110 } # mist blue
+4 = { hex = "#96bfc3", c256 = 109 } # aqua
+5 = { hex = "#96c3a9", c256 = 115 } # moss
+6 = { hex = "#c3b096", c256 = 180 } # sand
+7 = { hex = "#a996c3", c256 = 139 } # lavender
+8 = { hex = "#c396bb", c256 = 175 } # plum
+
+[eye]
+calm = { hex = "#777777", c256 = 243 }
+alert = { hex = "#b7c396", c256 = 144 }
+
+[state]
+healthy = { hex = "#96c396", c256 = 108 }   # leaf green, the family's green
+needs_you = { hex = "#d7a86e", c256 = 179 } # amber
+terminal = { hex = "#cf6a6a", c256 = 167 }  # red
+quiet = { hex = "#777777", c256 = 243 }     # --term-dim, same as surface.dim
+dead = { hex = "#5a5a5a", c256 = 240 }      # below dim: the pane is gone
+
+[badge]
+healthy = { hex = "#96c396", c256 = 108 }
+needs_you = { hex = "#d7a86e", c256 = 179 }
+terminal = { hex = "#cf6a6a", c256 = 167 }
+quiet = { hex = "#777777", c256 = 243 }
+
+# The workspace chrome's grounds: one and two visible steps up from the
+# site's --term-bg, so the chrome reads as furniture, not content.
+# chrome.text on raised measures 11.5:1.
+[chrome]
+text = { hex = "#edecec", c256 = 255 }
+panel = { hex = "#1a1a1a", c256 = 234 }
+raised = { hex = "#2e2e2e", c256 = 236 }

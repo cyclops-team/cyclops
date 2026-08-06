@@ -17,8 +17,8 @@ SOCK="cyc-demo-$$"
 SESSION="demo"
 # The scratch root, the tmux teardown rule and the daemon stop are
 # shared, not copied.
-# shellcheck source=demos/lib.sh
-. "$(cd "$(dirname "$0")" && pwd)/lib.sh"
+# shellcheck source=../tests/e2e/lib/lib.sh
+. "$(cd "$(dirname "$0")" && pwd)/../tests/e2e/lib/lib.sh"
 CYCLOPS_HOME="$(mktemp -d "$(cyc_scratch_root)/cyclops-demo.XXXXXX")"
 export CYCLOPS_HOME
 DAEMON_PID=""
@@ -42,8 +42,8 @@ CYC="$REPO/target/debug/cyclops"
 CYCD="$REPO/target/debug/cyclopsd"
 
 # A detection manifest for this demo's panes. Real manifests live in
-# manifests/ and bind real agent CLIs; these panes run `cat`, so the demo
-# ships rules that read the pane title the way claude's do.
+# resources/manifests/ and bind real agent CLIs; these panes run `cat`, so
+# the demo ships rules that read the pane title the way claude's do.
 mkdir -p "$CYCLOPS_HOME/manifests"
 cat > "$CYCLOPS_HOME/manifests/demo.toml" <<'EOF'
 [agent]

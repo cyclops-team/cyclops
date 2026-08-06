@@ -4,7 +4,7 @@ Every major component, what it owns, and where its key types live.
 
 ## Rust crates
 
-### cyclops-proto (`crates/cyclops-proto`)
+### cyclops-proto (`src/cyclops-proto`)
 
 The foundation: data types only, no IO. Modules re-exported flat from
 `lib.rs`.
@@ -31,7 +31,7 @@ The foundation: data types only, no IO. Modules re-exported flat from
 - Also: `PROTOCOL_VERSION = 1`, `cyclops_home()` (`$CYCLOPS_HOME` or
   `~/.cyclops`), `socket_path()`.
 
-### cyclops-manifest (`crates/cyclops-manifest`)
+### cyclops-manifest (`src/cyclops-manifest`)
 
 Single `lib.rs`. Parses, validates, compiles, and evaluates per-CLI detection
 manifests (TOML). Key types: `Manifest` (`AgentMeta`, `Hooks`,
@@ -43,7 +43,7 @@ first match wins. `load_dir()` loads a directory at daemon boot — no hot
 reload. It does *not* decide pane state (fusion does) or capture screens
 (the tmux crate does).
 
-### cyclops-tmux (`crates/cyclops-tmux`)
+### cyclops-tmux (`src/cyclops-tmux`)
 
 The adapter and "blast wall": nothing outside this crate speaks to tmux.
 
@@ -67,15 +67,15 @@ The adapter and "blast wall": nothing outside this crate speaks to tmux.
   are never call-site comparisons.
 - `quote.rs`, `focus.rs`, `error.rs`, private `cmd.rs` (always `-u`, F14).
 
-### cyclops-ledger (`crates/cyclops-ledger`)
+### cyclops-ledger (`src/cyclops-ledger`)
 
 `LedgerWriter`: `open()` seals a torn final line and continues seq numbering
 across restarts (seq monotonic per file; `boot_id` marks which run wrote a
 line); `append()` fsyncs before returning. Readers: `read_after(path,
 cursor)` full scan, invalid lines skipped with a warning. Deliberately no
-index. Filtering/folding lives in `crates/cyclopsd/src/history.rs`.
+index. Filtering/folding lives in `src/cyclopsd/src/history.rs`.
 
-### cyclops-theme (`crates/cyclops-theme`)
+### cyclops-theme (`src/cyclops-theme`)
 
 22 semantic tokens (`role.1..8`, `surface.*`, `eye.*`, `state.*`,
 `badge.*`); `state_token(AgentState)` and `delivery_token(DeliveryState)`
@@ -85,7 +85,7 @@ total); `select.rs` — selection order `CYCLOPS_THEME` env → `theme` key in
 config → `dark`; `ThemeWatch` hot reload as a *stat* (mtime+len stamps
 checked when a repaint is already due), never a watcher thread or timer.
 
-### cyclops-ui (`crates/cyclops-ui`)
+### cyclops-ui (`src/cyclops-ui`)
 
 The stream TUI behind `cyclops ui`. `run(UiOptions)` builds a current-thread
 runtime; non-tty forces the line-oriented `plain` mode. `app.rs` is pure UI
@@ -97,7 +97,7 @@ terminal layer (termios via libc — no TUI crates, offline build);
 `grid.rs` is the product's one voice for state cells, badges, clock gutters,
 and cause words — the CLI renders through it rather than holding a copy.
 
-### cyclopsd (`crates/cyclopsd`)
+### cyclopsd (`src/cyclopsd`)
 
 Library + thin binary (all logic in the library so tests boot the daemon
 in-process).
@@ -112,7 +112,7 @@ in-process).
   F21), title tier decides when possible, screen capture is evidence of last
   resort, capture failure keeps the prior verdict, hook readings age out
   (TTL 300s, contradiction limit 3). Emits state ledger lines + events.
-- `delivery.rs` — the delivery pipeline (spec: `docs/DELIVERY.md`): one FIFO
+- `delivery.rs` — the delivery pipeline (spec: `docs/development/DELIVERY.md`): one FIFO
   worker per target pane; gate → paste → verify → submit → ACK; every
   transition ledger-logged; quota parks are terminal; occupant pid re-checked
   before paste *and* before submit.
@@ -130,16 +130,16 @@ in-process).
 - `server.rs` — Unix socket: stale-socket protocol, hello first, dispatch,
   event pump after `events.subscribe`, 5s write timeout drops wedged clients.
 
-### cyclops (`crates/cyclops`)
+### cyclops (`src/cyclops`)
 
 The CLI binary ("One eye on every agent").
 
 - `client.rs` — synchronous NDJSON client; reads `Hello` first.
 - `main.rs` — clap subcommands (see interfaces.md); global `--json` and
   `--plain`; exit-code conventions.
-- `workspace.rs` — `cyclops start` (seed config/manifests/themes, ensure
+- `workspace.rs` — `cyclops start` (seed config/resources/manifests/themes, ensure
   daemon, restore-or-build preset, name panes, attach), save/restore.
-  Presets are embedded from `layouts/` with `include_str!` so a fresh
+  Presets are embedded from `resources/layouts/` with `include_str!` so a fresh
   install works with no files.
 - `daemon.rs` — `ensure_running` (spawn detached `cyclopsd`, log to
   `$CYCLOPS_HOME/cyclopsd.log`, wait ≤10s for the socket), stop, log.
@@ -153,7 +153,7 @@ The CLI binary ("One eye on every agent").
 - `theme.rs`, `manifests.rs`, `themeseed.rs` — theme switching and seeding
   shipped data into `$CYCLOPS_HOME`.
 
-### cyclops-testrig (`crates/cyclops-testrig`)
+### cyclops-testrig (`tests/testrig`)
 
 Test-only, zero dependencies. `TmuxServer::new(tag)` reserves a private
 `-L cyc-<tag>-<pid>` socket; every command applies `-u -L <sock> -f
@@ -161,18 +161,18 @@ Test-only, zero dependencies. `TmuxServer::new(tag)` reserves a private
 socket file* (stopping the server alone does not unlink — measured). `tmux_available()`
 lets suites skip cleanly. Two guard tests keep the rule from being copied
 back out: `teardown_has_one_home.rs` (no other Rust file may start or kill a
-tmux server) and `shell_teardown.rs` (holds `demos/lib.sh` to the same
+tmux server) and `shell_teardown.rs` (holds `tests/e2e/lib/lib.sh` to the same
 contract).
 
 ## Non-crate components
 
 | Component | What it is |
 |---|---|
-| `frontend/` | SvelteKit 2 / Svelte 5 (runes) static marketing site for usecyclops.dev. 19 components, one route, plain CSS design tokens, no backend communication except a GitHub star-count fetch. Excluded from the workspace; read-only branding reference |
-| `manifests/` | Shipped detection manifests: `agy.toml`, `claude.toml`, `codex.toml`. Compiled into the CLI with `include_str!` and seeded to `$CYCLOPS_HOME/manifests` on first `cyclops start`, never overwritten after |
-| `themes/` | 7 themes: dark, light (derived from the frontend's CSS tokens), catppuccin, gruvbox, nord, tokyo-night, high-contrast |
-| `layouts/` | Presets `solo`, `duo`, `quad`, `ops` — each the previous plus a pane |
-| `hooks/` | Vendor hook config templates per CLI (agy, claude, codex) rendered by `cyclops hooks install` |
+| `website/` | SvelteKit 2 / Svelte 5 (runes) static marketing site for usecyclops.dev. 19 components, one route, plain CSS design tokens, no backend communication except a GitHub star-count fetch. Excluded from the workspace; read-only branding reference |
+| `resources/manifests/` | Shipped detection manifests: `agy.toml`, `claude.toml`, `codex.toml`. Compiled into the CLI with `include_str!` and seeded to `$CYCLOPS_HOME/manifests` on first `cyclops start`, never overwritten after |
+| `resources/themes/` | 7 themes: dark, light (derived from the frontend's CSS tokens), catppuccin, gruvbox, nord, tokyo-night, high-contrast |
+| `resources/layouts/` | Presets `solo`, `duo`, `quad`, `ops` — each the previous plus a pane |
+| `resources/hooks/` | Vendor hook config templates per CLI (agy, claude, codex) rendered by `cyclops hooks install` |
 | `demos/` | Eight runnable end-to-end scripts on isolated tmux servers, including `parity-check.sh`, the CI gate that asserts docs and binaries agree |
 | `scripts/` | `install.sh` (POSIX source installer: builds, places binaries, edits profile with backup, `--uninstall` restores), `check-doc-paths.py` (doc-path + orphan gate), `commpact-shim/` (v1 compatibility shim + tests) |
 | `tests/` | Python soak gate `m1_soak.py` and probe harness (`tests/harness/`) |

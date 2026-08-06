@@ -1,23 +1,23 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/cyclops-proto",
-    "crates/cyclops-manifest",
-    "crates/cyclops-tmux",
-    "crates/cyclops-ledger",
-    "crates/cyclops-theme",
-    "crates/cyclops-ui",
-    "crates/cyclopsd",
-    "crates/cyclops",
+    "src/cyclops-proto",
+    "src/cyclops-manifest",
+    "src/cyclops-tmux",
+    "src/cyclops-ledger",
+    "src/cyclops-theme",
+    "src/cyclops-ui",
+    "src/cyclopsd",
+    "src/cyclops",
     # Test-only: the isolated tmux server and its teardown rule, in one
     # place because the sites that need it span crates and test kinds.
-    "crates/cyclops-testrig",
-    "crates/cyclops-workspace",
+    "tests/testrig",
+    "src/cyclops-workspace",
 ]
 
-# The production landing page for usecyclops.dev lives at frontend/ as a
+# The production landing page for usecyclops.dev lives at website/ as a
 # read-only branding reference. It is not part of the Rust workspace.
-exclude = ["frontend"]
+exclude = ["website"]
 
 [workspace.package]
 version = "0.1.0"
@@ -37,14 +37,14 @@ anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 
-cyclops-proto = { path = "crates/cyclops-proto" }
-cyclops-manifest = { path = "crates/cyclops-manifest" }
-cyclops-tmux = { path = "crates/cyclops-tmux" }
-cyclops-ledger = { path = "crates/cyclops-ledger" }
-cyclops-theme = { path = "crates/cyclops-theme" }
-cyclops-ui = { path = "crates/cyclops-ui" }
-cyclops-testrig = { path = "crates/cyclops-testrig" }
-cyclops-workspace = { path = "crates/cyclops-workspace" }
+cyclops-proto = { path = "src/cyclops-proto" }
+cyclops-manifest = { path = "src/cyclops-manifest" }
+cyclops-tmux = { path = "src/cyclops-tmux" }
+cyclops-ledger = { path = "src/cyclops-ledger" }
+cyclops-theme = { path = "src/cyclops-theme" }
+cyclops-ui = { path = "src/cyclops-ui" }
+cyclops-testrig = { path = "tests/testrig" }
+cyclops-workspace = { path = "src/cyclops-workspace" }
 
 [profile.release]
 lto = "thin"

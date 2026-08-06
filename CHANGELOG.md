@@ -48,7 +48,7 @@ versions are unreleased until admin cuts a tag.
 
 ### Added (M5: docs on the ladder, and a parity gate that keeps them true)
 
-- `demos/parity-check.sh`: every command shape the README and docs show,
+- `tests/e2e/parity-check.sh`: every command shape the README and docs show,
   run for real against a throwaway tmux server and checked against what
   the binaries print. 63 assertions across the six ladder rungs, the
   two-agent handoff, the open eye, and the error copy. It prints the transcript the
@@ -78,7 +78,7 @@ versions are unreleased until admin cuts a tag.
   implementer to the reviewer with the sender resolved from the pane
   rather than from the request, chain the reply, read the thread back, and
   audit the pair out of the ledger file months later.
-- docs/MANIFESTS.md: how a new agent CLI becomes one TOML file. Every key
+- docs/reference/MANIFESTS.md: how a new agent CLI becomes one TOML file. Every key
   of `[agent]`, `[[rule]]`, `[hooks]` and `[injection]` with what it does,
   a complete working file, and the two fields that exist for measured
   vendor quirks (`argv_basenames` for installs whose binary reports a
@@ -115,7 +115,7 @@ versions are unreleased until admin cuts a tag.
   is on. It repaints every adopted pane's border and emits `theme` so
   subscribers wake. The event carries the name and no colors: every
   surface resolves its own.
-- themes/light.toml and themes/high-contrast.toml join dark.toml with
+- resources/themes/light.toml and resources/themes/high-contrast.toml join dark.toml with
   every one of the 22 tokens set and every 256-color fallback explicit,
   and each file header now states its contrast as numbers: the ground it
   assumes, the floor every token clears against it, and how it was
@@ -176,7 +176,7 @@ versions are unreleased until admin cuts a tag.
   name, appends a `pane_labeled` system line to the session ledger, and
   paints the pane's tmux border. `--clear` un-adopts and puts the border
   back the way it was found.
-- The adoption registry is durable. `crates/cyclopsd/src/registry.rs`
+- The adoption registry is durable. `src/cyclopsd/src/registry.rs`
   writes `$CYCLOPS_HOME/registry.json` whole on every change (temp file
   plus rename, 0600) and reads it at boot, so a daemon restart no longer
   silently unnames every agent. Each session reconciles its own entries
@@ -197,7 +197,7 @@ versions are unreleased until admin cuts a tag.
   filters to named panes: the roster has one source, not two. `--json`
   prints the same rows as pane records.
 - Pane border chrome, written by the daemon on fused-state change and on
-  no other edge (`crates/cyclopsd/src/chrome.rs`). A named pane's border
+  no other edge (`src/cyclopsd/src/chrome.rs`). A named pane's border
   reads `role • state` in the theme's colors, which makes the daemon the
   third surface painting from cyclops-theme's tokens and the first that
   is not a terminal renderer. Every write is scoped and reversible:
@@ -265,7 +265,7 @@ versions are unreleased until admin cuts a tag.
   not processes: panes come back empty unless `--launch` is passed, and
   even then tmux runs the recorded command as the pane's own. No keys are
   ever sent to a pane.
-- Four shipped presets in `layouts/`, data compiled into the binary so a
+- Four shipped presets in `resources/layouts/`, data compiled into the binary so a
   fresh install has them before it has a config: `solo` (one agent),
   `duo` (two side by side), `quad` (even quarters), `ops` (three agents
   with the stream docked underneath). Each is the one before it plus a
@@ -330,12 +330,12 @@ versions are unreleased until admin cuts a tag.
   carried on regardless, passing on a sleep. It now waits on a single
   field, and on a specific pane id after a restore, since "attached" on
   its own can still be answering about the session that just died.
-- `build_size` in `crates/cyclops/src/workspace.rs` cited F26 for the
+- `build_size` in `src/cyclops/src/workspace.rs` cited F26 for the
   even-resize measurement. That is F28; F26 is the pane title.
 
 ### Added (M3: the stream UI, cyclops ui)
 
-- crates/cyclops-ui plus the `cyclops ui` verb (dispatch-only wiring in
+- src/cyclops-ui plus the `cyclops ui` verb (dispatch-only wiring in
   the CLI): the live stream. Admin view by default and deliberately calm:
   only messages addressed to admin, deliveries whose latest state is
   attention_required or parked, agents entering a blocked_* state, gate
@@ -347,7 +347,7 @@ versions are unreleased until admin cuts a tag.
   both views.
 - THE EYE in the header: `‿` closed when calm, `◑` opening at one
   attention item, `◉` open with the count beside it (glyph set documented
-  with the theme tokens in crates/cyclops-ui/src/theme.rs; colors ride eye.calm
+  with the theme tokens in src/cyclops-ui/src/theme.rs; colors ride eye.calm
   and eye.alert). Attention items are currently-blocked agents plus
   deliveries sitting in attention_required or parked_blocked_quota, keyed
   per (recipient, message) so a later message to the same agent can never
@@ -409,7 +409,7 @@ versions are unreleased until admin cuts a tag.
 
 ### Added (M3: theme engine)
 
-- crates/cyclops-theme: every color is a semantic token (role.1-8,
+- src/cyclops-theme: every color is a semantic token (role.1-8,
   surface.dim, surface.accent, eye.calm, eye.alert, five state.* and four
   badge.*, plus surface.fg as the engine's fallback for an
   out-of-vocabulary name). Themes are data-only
@@ -435,7 +435,7 @@ versions are unreleased until admin cuts a tag.
   stream.* (3) and surface.bg stayed dropped: nothing paints a ground, and
   the stream's gutter resolves surface.dim like every other detail column.
   Naming a dropped token warns and is skipped.
-- themes/: dark (the shipped default; maps the usecyclops.dev terminal
+- resources/themes/: dark (the shipped default; maps the usecyclops.dev terminal
   identity, sage and mauve leading a muted eight-slot role wheel), light
   (the site's light page palette at ink strength), high-contrast (white
   and saturated grid-exact hues on the terminal's black; every value
@@ -447,7 +447,7 @@ versions are unreleased until admin cuts a tag.
   long-lived renderers is ThemeWatch: a (mtime, length) stat when an
   event already woke the renderer, no watcher thread, no timer; edits to
   the active theme apply on the next render.
-- crates/cyclops/src/style.rs resolves through the theme engine; its public
+- src/cyclops/src/style.rs resolves through the theme engine; its public
   surface (detect, none, role, accent, dim, bold, role_color) is
   unchanged and every CLI render test passes untouched. Role labels now
   hash into 8 palette slots instead of 6, so agents may land on different
@@ -544,7 +544,7 @@ versions are unreleased until admin cuts a tag.
 
 ### Added (M2: hooks install + startup self-test, amendment c)
 
-- Hook config templates under hooks/<cli>/ with the measured vendor
+- Hook config templates under resources/hooks/<cli>/ with the measured vendor
   schemas: claude settings fragment (UserPromptSubmit, Stop, Notification,
   PermissionRequest), codex hooks.json (PascalCase; no Notification event
   exists on codex), agy .agents/hooks.json (named-hooks schema, every
@@ -694,7 +694,7 @@ versions are unreleased until admin cuts a tag.
   field, so ledgers written before that field existed (old single-file
   daemons) never closed a delivery that died before its first state line.
   A msg line with no hosted list now hosts every recipient it names.
-- tests/harness/tuikit.py ran tmux without -u and without -f /dev/null
+- tests/e2e/lib/tuikit.py ran tmux without -u and without -f /dev/null
   (F14 discipline: a harness server could load the user's tmux config and
   sanitize control replies), and its dismiss_modal sent 2 to the codex
   update dialog whose measured decline is 3 (Skip until next version,

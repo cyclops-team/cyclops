@@ -2,8 +2,8 @@
 set -euo pipefail
 export DISPLAY="${DISPLAY:-:1}"
 REPO="/workspace"
-# shellcheck source=demos/lib.sh
-. "$REPO/demos/lib.sh"
+# shellcheck source=../tests/e2e/lib/lib.sh
+. "$REPO/tests/e2e/lib/lib.sh"
 CYCLOPS_HOME="$(cyc_scratch_root)/cyclops-ws12-demo"
 CYC="$REPO/target/debug/cyclops"
 

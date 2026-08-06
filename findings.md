@@ -56,7 +56,7 @@ from inside the pane, and copy-mode entry/exit. This makes subscriptions the
 watcher's primary per-pane change signal (zero polling holds). Caveat: the
 initial value push after subscribing is lazy, so bootstrap must come from
 list-panes, never from the subscription's first event. Proven by
-crates/cyclops-tmux/tests/subscription_probe.rs, which documents the fallback
+src/cyclops-tmux/tests/subscription_probe.rs, which documents the fallback
 if a future tmux breaks it.
 
 ## F14. tmux sanitizes control-mode replies to '_' for non-UTF-8 clients; spawn tmux -u (MEASURED, high severity)
@@ -113,7 +113,7 @@ The plain capture is identical in both states, which is why
 composer_empty_or_ghost could never produce idle_with_input. SGR is a
 reliable discriminator; the manifest carries it as line_regex_esc rules
 (composer_typed_input, composer_ghost_suggestion) with the probe captures
-as fixtures in crates/cyclops-manifest/tests/fixtures/. The esc rules fail
+as fixtures in src/cyclops-manifest/tests/fixtures/. The esc rules fail
 closed without a -e capture; the daemon now supplies escaped captures in
 fusion recompute (and therefore the delivery gate) whenever the bound
 manifest carries esc rules, so typed text reads as idle_with_input
@@ -164,7 +164,7 @@ lossy-converting only free-text fields, and killing an undetachable child
 without the 2 s grace. Related measurement: control mode answers blocking
 commands (wait-for, run-shell) with an immediately closed reply block, so
 reply-timeout tests must freeze the server itself. Regression:
-crates/cyclops-tmux/tests/control_load.rs, zero Disconnected over the 60 s
+src/cyclops-tmux/tests/control_load.rs, zero Disconnected over the 60 s
 sustained variant (braille + OSC title churn + split sequences + command
 traffic). Field-proven in the rerun soak (tests/raw/m1-soak-2): zero
 control drops and zero shutdown wedges in daemon.log across 252 s of the
@@ -182,7 +182,7 @@ title, so fusion never saw the turn. Consequences: the title sensor's
 resolution is one second, a turn shorter than that can be missed entirely
 by `wait --until done` on screen/title-only agents (hook-tier agents
 report their edges out of band), and fixture tests must hold each driven
-state across a tick. Proven by crates/cyclopsd/tests/m2_wait.rs, which
+state across a tick. Proven by src/cyclopsd/tests/m2_wait.rs, which
 holds working titles for 2s.
 
 ## F24. /private/tmp is macOS-only, and cargo test hides every failure after the first binary (MEASURED)
@@ -286,7 +286,7 @@ well as the border. Only the border is written, and the title is the
 reason.
 
 Measured by reading what the shipped manifests bind. Two of the three
-(`manifests/claude.toml`, `manifests/agy.toml`) carry rules over
+(`resources/manifests/claude.toml`, `resources/manifests/agy.toml`) carry rules over
 `region = "pane_title"`, and claude's spinner rules are the title tier at
 priority 1100. The third says so in its own header: codex sets no OSC
 title, so `#{pane_title}` there is the static project directory name and
@@ -300,12 +300,12 @@ other (F13), so cyclops would be feeding its own decoration back into its
 own sensor. And an agent that publishes its own title overwrites cyclops
 inside tmux's one-second tick (F23), so the decoration would not even hold.
 
-What it constrains: `crates/cyclopsd/src/chrome.rs` writes
+What it constrains: `src/cyclopsd/src/chrome.rs` writes
 `@cyclops_role`, `@cyclops_state`, `pane-border-format` and
 `pane-border-status`, and no pane title; `cyclops_tmux::layout` writes none
 either. The border already displays `#{pane_title}` by default, so
 replacing the border FORMAT replaces the view without touching the value
-underneath. Proven by `crates/cyclopsd/tests/m4_name.rs`, which drives the
+underneath. Proven by `src/cyclopsd/tests/m4_name.rs`, which drives the
 title sensor from outside the pane to move a border: that test can only
 exist because chrome does not write the title.
 
@@ -335,13 +335,13 @@ an isolated `cyclops-testrig` server holding two panes in one 80x24 window.
 What each constrains. (2) is why `pane-border-status` is snapshotted per
 window, turned on by the first adoption in a window and put back by the
 last un-adoption, and why the registry carries a `WindowChrome` at all
-(`crates/cyclopsd/src/registry.rs`); it is also why a pane moving windows
+(`src/cyclopsd/src/registry.rs`); it is also why a pane moving windows
 needs `move_chrome` to hand the setting back to the window it left. (3) is
 why every ratio in `cyclops_tmux::layout` is a share of the cells the PANES
 hold and never of the window: a grid checked against the window stopped
 adding up the moment the daemon named a pane, and `cyclops workspace save`
 refused a session `cyclops start` had built seconds earlier
-(`crates/cyclops-tmux/tests/layout_round_trip.rs::a_window_wearing_border_chrome_still_reads_as_a_grid`).
+(`src/cyclops-tmux/tests/layout_round_trip.rs::a_window_wearing_border_chrome_still_reads_as_a_grid`).
 (4) is why the label rides `@cyclops_role` instead of being written into
 the format string: labels are human input, and a label containing `#{...}`
 would otherwise become a tmux directive evaluated on every border redraw.
@@ -360,7 +360,7 @@ designed at 30% of the height, arrives at 41%.
 
 What it constrains: `cyclops start` and `cyclops workspace restore` build
 at the size of the terminal they were run from
-(`crates/cyclops/src/workspace.rs::build_size`), which is the only size
+(`src/cyclops/src/workspace.rs::build_size`), which is the only size
 that keeps a preset looking like its design. One built with no terminal to
 ask still drifts, and docs/workspaces.md says so rather than hiding it.
 And `first_difference` deliberately does not compare ratios when matching a
@@ -409,7 +409,7 @@ saved right then, what does it actually read?
 How. Editors save by truncating and rewriting, which is what
 `open(path, "w")` does: the file goes to zero bytes and the content comes
 back afterwards. The probe ran that save in a loop against a copy of a
-shipped theme (`themes/light.toml`, 4410 bytes, all 22 tokens) while a
+shipped theme (`resources/themes/light.toml`, 4410 bytes, all 22 tokens) while a
 second thread read the file continuously. Both the saves and the reads were
 timed with `perf_counter_ns` and the overlap was computed afterwards rather
 than from a flag, so a read counts as concurrent only when its own interval
@@ -450,7 +450,7 @@ difference is in what counts as "during a save": the window used here runs
 from open to close, and the bytes are back before close returns. The
 load-bearing half, no syntax errors at all, reproduces exactly.
 
-What it constrains: `ThemeWatch::adopt` in `crates/cyclops-theme/src/select.rs`
+What it constrains: `ThemeWatch::adopt` in `src/cyclops-theme/src/select.rs`
 refuses a reload that no longer sets a token the theme on screen sets,
 rather than refusing only what fails to parse. A misspelled token name
 fails the same way and stays failed until it is fixed, which is the same
@@ -458,7 +458,7 @@ rule doing the same job. A theme SWITCH is exempt: that palette was asked
 for, so it applies with a fresh start's tolerance. `theme.reload` on the
 daemon is on the near side of that rule, which is why a half-written file
 can reach a real pane border and why
-`crates/cyclopsd/tests/m5_theme.rs::a_half_written_theme_leaves_the_borders_alone`
+`src/cyclopsd/tests/m5_theme.rs::a_half_written_theme_leaves_the_borders_alone`
 reads the border back off tmux rather than off the daemon's own belief.
 
 Not a suite test, and deliberately: it measures a race and reports a
@@ -571,7 +571,7 @@ build environment.
 
 ## F35. alacritty_terminal wins the workspace VT fixture corpus 12/12 (MEASURED)
 
-`crates/cyclops-workspace/tests/corpus.rs` runs twelve fixtures covering
+`src/cyclops-workspace/tests/corpus.rs` runs twelve fixtures covering
 plain output, SGR/256/truecolor, attributes, cursor motion, wrapping, wide
 characters, alternate screen, bracketed paste, and synthetic Codex/Claude
 captures. `alacritty_terminal` 0.26 passes all twelve; `vt100` passes five
@@ -630,7 +630,7 @@ visible capture — the TUI's own later exit then restores against the right
 baseline. The workspace names the field `saved_primary` so the bytes cannot
 be re-misread.
 
-Probe: `crates/cyclops-workspace/tests/hydration.rs::hydrating_a_pane_in_the_alternate_screen_restores_what_the_user_sees`
+Probe: `src/cyclops-workspace/tests/hydration.rs::hydrating_a_pane_in_the_alternate_screen_restores_what_the_user_sees`
 on an isolated server — mark the primary screen `PRIMARY_SHELL`, enter the
 alternate screen and paint `ALT_TUI_SCREEN`, hydrate through the control
 client. The bundle reports `alternate_on`; the plain capture holds
@@ -650,7 +650,7 @@ one-column shift in every warning glyph:
 2. Bare SGR 21 is treated as bold-off, not double underline. Double
    underline is the colon subparameter form `4:2`.
 
-Probe: `crates/cyclops-workspace/tests/fidelity.rs`,
+Probe: `src/cyclops-workspace/tests/fidelity.rs`,
 `a_variation_selector_does_not_widen_a_narrow_glyph` and
 `every_underline_style_keeps_its_own_identity`.
 
@@ -663,7 +663,7 @@ server at all. This makes one `list-panes -a` (every pane, on every
 session) structurally sufficient to discover every session and window that
 exists — nothing needs a per-window follow-up query just to find out what
 exists, only to name it (see `ControlClient::workspace_snapshot`,
-`crates/cyclops-tmux/src/snapshot.rs`, task D2).
+`src/cyclops-tmux/src/snapshot.rs`, task D2).
 
 Probe, on an isolated `-L` socket:
 
@@ -690,7 +690,7 @@ line with `#{window_name}`. Both are arbitrary human text, and this crate's
 escaping precedent (`crate::watcher`'s `PANE_FORMAT`) only makes the *last*
 field on a line safe against an embedded tab; two independent free-text
 fields cannot both hold that position on the same line. See the module doc
-in `crates/cyclops-tmux/src/snapshot.rs`.
+in `src/cyclops-tmux/src/snapshot.rs`.
 
 Probe:
 

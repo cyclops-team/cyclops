@@ -23,8 +23,8 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SOCK="cyc-m2-demo-$$"
 SESSION="demo"
 # The scratch root and the tmux teardown rule are shared, not copied.
-# shellcheck source=demos/lib.sh
-. "$(cd "$(dirname "$0")" && pwd)/lib.sh"
+# shellcheck source=../tests/e2e/lib/lib.sh
+. "$(cd "$(dirname "$0")" && pwd)/../tests/e2e/lib/lib.sh"
 CYCLOPS_HOME="$(mktemp -d "$(cyc_scratch_root)/cyclops-m2-demo.XXXXXX")"
 export CYCLOPS_HOME
 CYC="$REPO/target/debug/cyclops"

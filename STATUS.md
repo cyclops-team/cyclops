@@ -58,7 +58,7 @@ One thing still waits on admin: the v1 cutover.
     Routine gate holds stay in the firehose; only holds naming a blocked
     pane reach the calm view.
   - THE EYE, on the stream header, the --plain eye line and `cyclops
-    status`. All three read one owner, crates/cyclops-proto/src/attention.rs,
+    status`. All three read one owner, src/cyclops-proto/src/attention.rs,
     and none recomputes the rule. Verified by probe, not by reading: the
     count is independent of --backfill on both halves; an item raised
     before a pane is adopted clears after it; a pane that disappears stops
@@ -74,10 +74,10 @@ One thing still waits on admin: the v1 cutover.
   - --plain carries the same content as the sighted comfortable view,
     message bodies included: it is the screen-reader path, not a reduced
     view.
-  - crates/cyclops-theme: semantic tokens with data-only theme TOML,
+  - src/cyclops-theme: semantic tokens with data-only theme TOML,
     derived-or-explicit 256-color fallbacks, selection by config `theme`
     key plus CYCLOPS_THEME, hot reload as a stat-on-event with no polling.
-    themes/dark|light|high-contrast.toml on the usecyclops.dev palette.
+    resources/themes/dark|light|high-contrast.toml on the usecyclops.dev palette.
     The vocabulary is role.1-8, surface.fg/dim/accent, eye.calm/eye.alert,
     and the six state.* plus three badge.* tokens restored after the
     misreading described under Corrections. Note: role labels now hash into
@@ -139,7 +139,7 @@ One thing still waits on admin: the v1 cutover.
     panes are empty unless `--launch` is given, and even then tmux runs
     the command as the pane's own. Nothing on this path sends keys to a
     pane or sets a tmux option.
-  - Four presets in `layouts/`, compiled into the binary so a fresh
+  - Four presets in `resources/layouts/`, compiled into the binary so a fresh
     install has them before it has a config file. They are a ladder: each
     is the one before it plus a pane, and the names carry over. The `ops`
     dock's full width and 30% height are argued from the stream's own
@@ -205,7 +205,7 @@ One thing still waits on admin: the v1 cutover.
   between them, and the reload rule that keeps a half-written file off the
   screen. The rest of M5 (landing-page command parity, the README
   quickstart pass) is not in this change.
-  - themes/dark, light and high-contrast each set the whole 22-token
+  - resources/themes/dark, light and high-contrast each set the whole 22-token
     vocabulary with explicit 256-color fallbacks, and each header now
     states its contrast as numbers: the ground it assumes, the floor every
     token clears, and how it was measured. high-contrast was retuned to
@@ -238,7 +238,7 @@ One thing still waits on admin: the v1 cutover.
     wake. The event carries the name and no colors: every surface resolves
     its own, and one that took a palette off the wire could show a theme
     no file on the machine holds. Proven against tmux, not against the
-    daemon's own belief: crates/cyclopsd/tests/m5_theme.rs reads the
+    daemon's own belief: src/cyclopsd/tests/m5_theme.rs reads the
     border format back off the server.
   - Warnings are drained rather than read (`take_warnings`), which is what
     makes "one warning line" true: the daemon used to log the same theme
@@ -324,7 +324,7 @@ One thing still waits on admin: the v1 cutover.
 - The paths docs quote are gated (this commit):
   - `scripts/check-doc-paths.py` checks two things a reader uses: markdown
     link targets, and code spans shaped like repo paths. It found 31 source
-    paths written without their `crates/` prefix, in ARCHITECTURE, HANDOFF
+    paths written without their `src/` prefix, in ARCHITECTURE, HANDOFF
     and CHANGELOG, so copying one into an editor found nothing. Fixed in
     the docs rather than taught to the checker, because a reader has to be
     able to paste the path.
@@ -401,13 +401,13 @@ pushed, so nothing here is waiting on a person:
   nothing breaks after. Verified: the v1-final archive returns 200 and
   carries bin/commPact-install, and extraction uses --strip-components=1
   so the tag-derived directory name does not matter.
-- The site itself is safe: frontend/ is byte-identical to main's copy and
+- The site itself is safe: website/ is byte-identical to main's copy and
   builds through SvelteKit adapter-auto with no committed host config, so
   the deploy is configured host-side and keeps working.
 
 Deliberately NOT carried from main, because both would have clobbered v2
 files at the same paths: .github (main's only workflow is ci.yml, the same
-path as the Rust CI) and themes/ (main's are v1 tmux .conf files).
+path as the Rust CI) and resources/themes/ (main's are v1 tmux .conf files).
 
 Still true and worth a decision before this becomes the public tip: NOTICE
 describes v1's staged build, down to SHA-256 sums of bin/commPact files
@@ -565,7 +565,7 @@ Dropped by admin decision on 2026-08-03:
   receipt in the tree uses, and the tree carries no em dash anywhere. The
   site is the branding reference and stays untouched; if admin wants the
   site's characters exactly, it is one line in
-  `crates/cyclops/src/workspace.rs` (`ready_line`) and its test.
+  `src/cyclops/src/workspace.rs` (`ready_line`) and its test.
 - The brief's `cyclops start` "ensure the daemon watches it" is done
   through the config file, not by making the daemon watch a session at
   runtime. `Inner.sessions` is fixed at boot and indexed everywhere by

@@ -23,7 +23,7 @@ That builds both binaries, puts them where your shell looks, and writes
 the config and detection manifests. It prints every file it touches, backs
 up any shell profile it edits, and never uses sudo. `--prefix DIR` picks
 where the binaries go, `--no-path` leaves your profile alone, and
-`--uninstall` takes it all back off. More: [docs/install.md](docs/install.md).
+`--uninstall` takes it all back off. More: [docs/install.md](docs/guides/install.md).
 
 Then one command, from anywhere:
 
@@ -44,7 +44,7 @@ One rung at a time. Each is useful on its own, and you can stop at any of
 them.
 
 Every block below is real output, captured by
-[`demos/parity-check.sh`](demos/parity-check.sh) on a throwaway tmux server.
+[`tests/e2e/parity-check.sh`](tests/e2e/parity-check.sh) on a throwaway tmux server.
 Three things are edited and nothing else: the home directory is shortened to
 `~/.cyclops`, color is off, and a `Next:` block already shown once is left
 out the second time. That script re-runs the whole walk and fails if a line
@@ -90,7 +90,7 @@ $ cyclops send implementer --subject "Review the rate limiter" --body "gateway.r
 The receipt names its evidence. The light check means the message landed
 and cyclops confirmed it on the screen, which is what you get before the
 agent's own hooks are wired. Wire them once
-([hooks.md](docs/hooks.md)) and the same send earns the heavy check,
+([hooks.md](docs/reference/hooks.md)) and the same send earns the heavy check,
 `✔ delivered · verified`, meaning the recipient's own hook confirmed this
 exact message rather than cyclops typing hopefully.
 
@@ -129,7 +129,7 @@ $ cyclops status
 ```
 
 The closed eye means nothing needs you. `hooks unverified` means no hook has
-reported from that pane this run ([docs/hooks.md](docs/hooks.md)). A name is
+reported from that pane this run ([docs/hooks.md](docs/reference/hooks.md)). A name is
 an address, so give it one:
 
 ```
@@ -143,17 +143,17 @@ $ cyclops list
 
 Three columns: the name, how the agent is doing, what it is on. A named pane
 also says so on its own tmux border, and `cyclops name reviewer --clear`
-gives the border back. Details: [docs/panes.md](docs/panes.md).
+gives the border back. Details: [docs/panes.md](docs/guides/panes.md).
 
 ### 3. Any terminal agent
 
 Cyclops has no SDK and no wrapper. Everything it knows about an agent CLI is
 one TOML file: which processes it runs as, how to read working from idle off
-the pane, how to type into it. Four ship in [`manifests/`](manifests/):
+the pane, how to type into it. Four ship in [`resources/manifests/`](resources/manifests/):
 Claude Code, Codex CLI, Antigravity CLI, Cursor Agent.
 
 The panes in this walk are none of those. They run a shell script, and
-cyclops addresses them because `demos/parity-check.sh` adds a fifth
+cyclops addresses them because `tests/e2e/parity-check.sh` adds a fifth
 manifest. That is the promise demonstrated rather than claimed:
 
 ```
@@ -171,7 +171,7 @@ $ cyclops name %1 reviewer --manifest cluade
 no manifest "cluade"; loaded: agy, claude, codex, cursor, demo
 ```
 
-Writing one: [docs/MANIFESTS.md](docs/MANIFESTS.md).
+Writing one: [docs/MANIFESTS.md](docs/reference/MANIFESTS.md).
 
 ### 4. Layouts
 
@@ -216,7 +216,7 @@ $ cyclops start --workspace ops --session ops --preset ops
   cyclopsd won't watch "ops" until it's listed in ~/.cyclops/config.toml. Add it to sessions there, then restart cyclopsd.
 ```
 
-More: [docs/workspaces.md](docs/workspaces.md).
+More: [docs/workspaces.md](docs/guides/workspaces.md).
 
 ### 5. Structured messages
 
@@ -283,9 +283,9 @@ $ cyclops send --subject nobody
 no recipient. Name one (cyclops send reviewer --subject "..."), or pass --to or --all.
 ```
 
-More: [docs/send.md](docs/send.md), [docs/history.md](docs/history.md),
-[docs/wait.md](docs/wait.md). The two-agent review handoff, start to finish:
-[docs/QUICKSTART.md](docs/QUICKSTART.md).
+More: [docs/send.md](docs/guides/send.md), [docs/history.md](docs/guides/history.md),
+[docs/wait.md](docs/guides/wait.md). The two-agent review handoff, start to finish:
+[docs/QUICKSTART.md](docs/guides/QUICKSTART.md).
 
 ### 6. Pipe output, coming in M6
 
@@ -301,7 +301,7 @@ Usage: cyclops [OPTIONS] <COMMAND>
 For more information, try '--help'.
 ```
 
-`demos/parity-check.sh` asserts that, so this paragraph cannot outlive it.
+`tests/e2e/parity-check.sh` asserts that, so this paragraph cannot outlive it.
 
 What scripts can do today is everything the UI does. Every command takes
 `--json`:
@@ -323,13 +323,13 @@ $ jq -c 'select(.kind == "msg") | {ts, from, to, subject}' ~/.cyclops/ledger/mai
 ```
 
 The socket the CLI speaks is documented and open:
-[docs/PROTOCOL.md](docs/PROTOCOL.md).
+[docs/PROTOCOL.md](docs/reference/PROTOCOL.md).
 
 ## Watch it live
 
 `cyclops watch` turns the terminal into the stream: messages and state
 changes as they happen, calm by default, firehose one keypress away, the
-eye in the header. [docs/ui.md](docs/ui.md).
+eye in the header. [docs/ui.md](docs/guides/ui.md).
 
 Colors are semantic tokens, never raw values in code, so a theme file changes
 every surface at once, including the pane borders:
@@ -344,14 +344,14 @@ $ cyclops theme
 ```
 
 Every state pairs a glyph with a word, so `NO_COLOR` and `--plain` lose
-nothing. [docs/themes.md](docs/themes.md).
+nothing. [docs/themes.md](docs/guides/themes.md).
 
 Every demo in [`demos/`](demos/) runs the real binaries against an isolated
 tmux server and touches nothing of yours. `demos/m2-conversation.sh` is two
 agents exchanging a reviewed message and a reply;
 `demos/m4-workspace.sh` builds a session, saves it, destroys it, and brings
 it back; `demos/m5-theme.sh` switches themes under a live pane border and
-then catches a theme file mid-save; `demos/parity-check.sh` is the walk
+then catches a theme file mid-save; `tests/e2e/parity-check.sh` is the walk
 above.
 
 ## Commands
@@ -385,17 +385,17 @@ session, over the interface tmux calls control mode: cyclops asks and tmux
 answers, and tmux keeps owning your panes, layout, and attach. A daemon crash
 loses nothing. Agent state comes from sensor fusion: vendor hook events, pane
 titles, output activity, and screen evidence as a last resort, with per-CLI
-detection rules shipped as data in [`manifests/`](manifests/), not code.
+detection rules shipped as data in [`resources/manifests/`](resources/manifests/), not code.
 Every message and state change lands in a ledger that is only ever appended
 to, one JSON object per line, so you can `jq` it.
 
 The crate-by-crate map, the delivery state machine, and the gate order are in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+[docs/ARCHITECTURE.md](docs/development/ARCHITECTURE.md).
 
 ## Docs
 
 **Going to work on the code? Start at
-[HANDOFF.md](docs/HANDOFF.md).** It is the front door for a newcomer: where
+[HANDOFF.md](docs/development/HANDOFF.md).** It is the front door for a newcomer: where
 everything lives, what to read for the job you have been handed, and which
 decisions were deliberate so you do not spend a day undoing one.
 
@@ -403,30 +403,30 @@ Otherwise, one page per question.
 
 | | |
 |---|---|
-| [HANDOFF.md](docs/HANDOFF.md) | Start here to work on the codebase: the map, and the decisions behind it |
+| [HANDOFF.md](docs/development/HANDOFF.md) | Start here to work on the codebase: the map, and the decisions behind it |
 | [AGENTS.md](AGENTS.md) | The same front door for AI coding agents: the map condensed, and the gates a change must pass |
-| [install.md](docs/install.md) | Build it, configure it, run the tests |
-| [QUICKSTART.md](docs/QUICKSTART.md) | Two agents and a review gate, start to finish |
-| [send.md](docs/send.md) | Sending, receipts, broadcast, quota parking |
-| [history.md](docs/history.md) | Reading the record, threads, paging |
-| [wait.md](docs/wait.md) | Waiting on an agent, exit codes |
-| [panes.md](docs/panes.md) | Naming, the roster, the tmux border |
-| [workspaces.md](docs/workspaces.md) | Presets, save and restore, `cyclops start` |
-| [workspace-ui.md](docs/workspace-ui.md) | The full-screen workspace (`cyclops`) |
-| [ui.md](docs/ui.md) | The stream TUI (`cyclops watch`) |
-| [themes.md](docs/themes.md) | Semantic color tokens, shipped themes |
-| [hooks.md](docs/hooks.md) | Wiring vendor hooks, verifying they fire |
-| [MANIFESTS.md](docs/MANIFESTS.md) | Teaching cyclops a new agent CLI |
-| [PROTOCOL.md](docs/PROTOCOL.md) | The socket: methods, requests, responses |
-| [troubleshooting.md](docs/troubleshooting.md) | When something is wrong |
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the pieces fit |
-| [DELIVERY.md](docs/DELIVERY.md) | The delivery spec: states, evidence tiers, ordering |
-| [CONTRIBUTING.md](docs/CONTRIBUTING.md) | The development loop, the demos, and the gates a change must pass |
-| [INVARIANTS.md](docs/INVARIANTS.md) | Eleven rules a change must never break, and what breaks otherwise |
+| [install.md](docs/guides/install.md) | Build it, configure it, run the tests |
+| [QUICKSTART.md](docs/guides/QUICKSTART.md) | Two agents and a review gate, start to finish |
+| [send.md](docs/guides/send.md) | Sending, receipts, broadcast, quota parking |
+| [history.md](docs/guides/history.md) | Reading the record, threads, paging |
+| [wait.md](docs/guides/wait.md) | Waiting on an agent, exit codes |
+| [panes.md](docs/guides/panes.md) | Naming, the roster, the tmux border |
+| [workspaces.md](docs/guides/workspaces.md) | Presets, save and restore, `cyclops start` |
+| [workspace-ui.md](docs/guides/workspace-ui.md) | The full-screen workspace (`cyclops`) |
+| [ui.md](docs/guides/ui.md) | The stream TUI (`cyclops watch`) |
+| [themes.md](docs/guides/themes.md) | Semantic color tokens, shipped themes |
+| [hooks.md](docs/reference/hooks.md) | Wiring vendor hooks, verifying they fire |
+| [MANIFESTS.md](docs/reference/MANIFESTS.md) | Teaching cyclops a new agent CLI |
+| [PROTOCOL.md](docs/reference/PROTOCOL.md) | The socket: methods, requests, responses |
+| [troubleshooting.md](docs/guides/troubleshooting.md) | When something is wrong |
+| [ARCHITECTURE.md](docs/development/ARCHITECTURE.md) | How the pieces fit |
+| [DELIVERY.md](docs/development/DELIVERY.md) | The delivery spec: states, evidence tiers, ordering |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | The development loop, the demos, and the gates a change must pass |
+| [INVARIANTS.md](docs/development/INVARIANTS.md) | Eleven rules a change must never break, and what breaks otherwise |
 | [findings.md](findings.md) | The measurements the design rests on, F13 onward, each with the probe that proved it |
 | [CHANGELOG.md](CHANGELOG.md) | What each milestone changed, in the order it shipped |
-| [GOALS.md](docs/GOALS.md) | The quality bar every milestone is reviewed against |
-| [STYLE.md](docs/STYLE.md) | How this codebase is written, binding on every change |
+| [GOALS.md](docs/development/GOALS.md) | The quality bar every milestone is reviewed against |
+| [STYLE.md](docs/development/STYLE.md) | How this codebase is written, binding on every change |
 
 ## Principles
 
@@ -447,7 +447,7 @@ The previous implementation was a shell and Python toolkit built around
 [`v1`](https://github.com/cyclops-team/cyclops/tree/v1), tag `v1-final`.
 It is a read-only reference now, and it is what the usecyclops.dev
 one-line installer currently fetches. Nothing here migrates your v1 state
-automatically; [docs/CUTOVER.md](docs/CUTOVER.md) is the runbook when you
+automatically; [docs/CUTOVER.md](docs/development/CUTOVER.md) is the runbook when you
 choose to move.
 
 ## License

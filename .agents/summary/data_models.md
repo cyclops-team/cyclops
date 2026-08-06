@@ -1,11 +1,11 @@
 # Data Models
 
 The types that flow between components. Everything here is defined once, in
-`crates/cyclops-proto`, unless noted otherwise.
+`src/cyclops-proto`, unless noted otherwise.
 
 ## Agent state
 
-`AgentState` (`crates/cyclops-proto/src/state.rs`) is what fusion decides per
+`AgentState` (`src/cyclops-proto/src/state.rs`) is what fusion decides per
 pane:
 
 | State | Glyph | Meaning |
@@ -25,7 +25,7 @@ disagreed — disagreement is exposed, not treated as an error.
 
 ## The delivery state machine
 
-`DeliveryState` (`crates/cyclops-proto/src/ledger.rs`); every legal move is
+`DeliveryState` (`src/cyclops-proto/src/ledger.rs`); every legal move is
 encoded in `can_transition_to()` and illegal moves are loud errors. Nothing
 is ever in limbo: every delivery ends in a named state.
 
@@ -64,12 +64,12 @@ append-only and fsynced. `seq` is monotonic per file across restarts;
 `boot_id` marks which daemon run wrote a line. Delivery transitions are
 `state` lines carrying cause words — raw screen captures never land on the
 record (secrets rule). The read side
-(`crates/cyclopsd/src/history.rs`) folds each message's delivery-chain lines
+(`src/cyclopsd/src/history.rs`) folds each message's delivery-chain lines
 back into the msg line at read time; disk is never rewritten.
 
 ## The wire envelope
 
-`crates/cyclops-proto/src/wire.rs`:
+`src/cyclops-proto/src/wire.rs`:
 
 - `Hello { cyclops, proto, boot_id }` — first line of every connection.
 - `Request { id, method, params }` / `Response { id, result | error }` with
@@ -86,7 +86,7 @@ back into the msg line at read time; disk is never rewritten.
 
 ## The attention register
 
-`crates/cyclops-proto/src/attention.rs` — the single owner of "what needs a
+`src/cyclops-proto/src/attention.rs` — the single owner of "what needs a
 human". `Attention` is seeded whole from one `status` answer
 (`from_status()`) and then moved one observation at a time (`observe_agent`,
 `observe_delivery`, `forget_agent`). Items are agents in a blocked state or
@@ -98,17 +98,17 @@ prints.
 
 ## Configuration models
 
-- `Config` (`crates/cyclopsd/src/config.rs`): `home`, `sessions`,
+- `Config` (`src/cyclopsd/src/config.rs`): `home`, `sessions`,
   `tmux_socket`, `tmux_config`, `manifest_dir`, `ack_timeout_ms` (1500),
   `delivery_retry_max` (1), `receipt_block_ms` (2500),
   `gate_hold_notify_ms` (120000), `theme`, `chrome` (on by default),
   `default_workspace`.
-- `Manifest` (`crates/cyclops-manifest/src/lib.rs`): see interfaces.md.
-- `Layout → Window → Row → Pane` (`crates/cyclops-tmux/src/layout.rs`):
+- `Manifest` (`src/cyclops-manifest/src/lib.rs`): see interfaces.md.
+- `Layout → Window → Row → Pane` (`src/cyclops-tmux/src/layout.rs`):
   grid-of-rows with normalized ratios measured against pane cells.
-- `Theme` (`crates/cyclops-theme/src/lib.rs`): 22 tokens, total resolution
+- `Theme` (`src/cyclops-theme/src/lib.rs`): 22 tokens, total resolution
   (every token always resolves through the compiled default table).
-- `Adoption` / `WindowChrome` (`crates/cyclopsd/src/registry.rs`): the
+- `Adoption` / `WindowChrome` (`src/cyclopsd/src/registry.rs`): the
   durable roster in `registry.json`, pruned on restore when a pane id or
   root pid no longer matches.
 
@@ -119,4 +119,4 @@ prints.
 - Pane ids are tmux's (`%0`, `%1`, …) and restart at `%0` with a new tmux
   server — which is why registry restore validates pid as well as id.
 - Reserved labels: `admin` (the human), `*` (everyone); refusals name why
-  and a way out (`crates/cyclops-proto/src/label.rs`).
+  and a way out (`src/cyclops-proto/src/label.rs`).

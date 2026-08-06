@@ -10,7 +10,7 @@ Two kinds of path get checked, because a reader uses them differently:
 
 1. Markdown link targets, `[text](docs/install.md)`. A link that does not
    resolve is broken navigation.
-2. Inline code spans that look like repo paths, `crates/cyclopsd/src`.
+2. Inline code spans that look like repo paths, `src/cyclopsd/src`.
    A reader copies these into an editor or a command.
 
 Run it: python3 scripts/check-doc-paths.py
@@ -61,12 +61,22 @@ SKIP_RULES = [
     ),
 ]
 
-# The two that no rule can express, because they are real paths in a tree
-# this repo is not. Both are v1, quoted by the cutover and history pages,
-# and both are correct where they appear.
+# Two that no rule can express, because they are real paths in a tree this
+# repo is not. Both are v1, quoted by the cutover and history pages, and
+# both are correct where they appear.
+#
+# Two more that are not paths in ANY tree: the manifest/theme runtime
+# fallback is `./manifests` or `./themes` relative to whatever directory
+# the process was started from, a cwd-relative convention that is
+# unrelated to this repo's own layout even when the two coincide (docs and
+# code comments call this out explicitly, e.g. HANDOFF.md, themes.md). A
+# code span here always strips a leading `./`, so the checkable candidate
+# is the bare word.
 LITERAL_SKIPS = {
-    "bin/commPact": "a path in the v1 tree, quoted by docs/CUTOVER.md",
+    "bin/commPact": "a path in the v1 tree, quoted by docs/development/CUTOVER.md",
     "versions/2.1.220": "a v1 release directory, quoted as history",
+    "manifests": "the daemon's cwd-relative fallback directory name, not a path this repo ships",
+    "themes": "the theme engine's cwd-relative fallback directory name, not a path this repo ships",
 }
 
 # A code span is a candidate when it has a slash and no whitespace. That
@@ -100,8 +110,13 @@ def skip_reason(s):
 
 
 def docs():
-    """Every markdown page in the repo, top level and docs/."""
-    return sorted(list(REPO.glob("*.md")) + list((REPO / "docs").glob("*.md")))
+    """Every markdown page in the repo, top level and docs/ (recursively).
+
+    docs/ is split into guides/, reference/, and development/; docs/public/
+    is Mintlify's published-docs tree and holds only `.mdx`, so the `*.md`
+    glob already excludes it without a special case.
+    """
+    return sorted(list(REPO.glob("*.md")) + list((REPO / "docs").rglob("*.md")))
 
 
 def check_links(page, text, bad):
@@ -142,7 +157,7 @@ def line_of(text, index):
 # The two front doors. README.md indexes every page in a table; HANDOFF.md
 # is the one a newcomer is pointed at first. A page reachable from neither
 # is a page nobody finds.
-FRONT_DOORS = ["README.md", "docs/HANDOFF.md"]
+FRONT_DOORS = ["README.md", "docs/development/HANDOFF.md"]
 
 
 def check_orphans():
@@ -183,15 +198,15 @@ def check_orphans():
 # defect the gate was written for.
 SELFTEST_PAGE = """# selftest
 
-Must be caught: [gone](docs/nope-{tag}.md), `crates/cyclopsd/src/nope-{tag}.rs`,
+Must be caught: [gone](docs/nope-{tag}.md), `src/cyclopsd/src/nope-{tag}.rs`,
 and the missing-prefix form `cyclops-proto/src/ledger.rs`.
 
 Must not be caught: `~/.cyclops/config.toml`, `$CYCLOPS_HOME/sock`,
-`manifests/*.toml`, `<workspace>/.agents/hooks.json`, `34/33/33`,
+`resources/manifests/*.toml`, `<workspace>/.agents/hooks.json`, `34/33/33`,
 `0.34/0.33/0.33`, `target/release/cyclops`, `CYCLOPS_TEST_TMP=/some/dir`,
-`/private/tmp`, `bin/commPact`, `versions/2.1.220`,
-`crates/cyclops-proto/src/attention.rs`, `./demos/parity-check.sh`,
-`.github/workflows/ci.yml`, and [a real link](install.md).
+`/private/tmp`, `bin/commPact`, `versions/2.1.220`, `./manifests`, `./themes`,
+`src/cyclops-proto/src/attention.rs`, `./tests/e2e/parity-check.sh`,
+`.github/workflows/ci.yml`, and [a real link](guides/install.md).
 """
 
 MUST_CATCH = 3

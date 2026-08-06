@@ -4,7 +4,7 @@ The runtime flows that matter, plus the development and CI loops.
 
 ## Daemon boot
 
-`cyclopsd::boot` (`crates/cyclopsd/src/lib.rs`): mint `boot_id` → probe
+`cyclopsd::boot` (`src/cyclopsd/src/lib.rs`): mint `boot_id` → probe
 `tmux -V` → load manifests once (immutable for the run) → open one
 `LedgerWriter` per configured session (open failure fails boot: a daemon that
 cannot record must not deliver) → replay ledgers to preload message ids and
@@ -28,7 +28,7 @@ freshness, never correctness. Disconnects freeze the pane table, log a
 
 ## Sensor fusion
 
-`crates/cyclopsd/src/fusion.rs` — the one path a fused state changes on:
+`src/cyclopsd/src/fusion.rs` — the one path a fused state changes on:
 
 1. Bind a manifest (registry pin → foreground command → argv basename).
 2. Dead / in-copy-mode short-circuit.
@@ -108,17 +108,17 @@ wire.
 
 ## The development loop
 
-From `docs/CONTRIBUTING.md` — four commands, the same four CI runs:
+From `CONTRIBUTING.md` — four commands, the same four CI runs:
 
 ```bash
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --no-fail-fast     # the flag is not optional (F24)
 python3 scripts/check-doc-paths.py
-./demos/parity-check.sh
+./tests/e2e/parity-check.sh
 ```
 
-Touching `scripts/install.sh` adds `./demos/parity-check.sh
+Touching `scripts/install.sh` adds `./tests/e2e/parity-check.sh
 --with-installer` (does a release build). Testing rules that bite: every
 tmux-touching test goes through `cyclops-testrig` (never the default tmux
 server), and every scratch path comes from `cyclops_proto::scratch` (never
@@ -133,7 +133,7 @@ flowchart TB
         b --> c["cargo test --workspace --no-fail-fast"]
         c --> d["commPact shim tests (python)"]
         d --> e["check-doc-paths.py --selftest, then run"]
-        e --> f["demos/parity-check.sh (docs and binaries agree)"]
+        e --> f["tests/e2e/parity-check.sh (docs and binaries agree)"]
         f --> g["whole suite again with CYCLOPS_TEST_TMP relocated (F24)"]
     end
     subgraph installer["installer (ubuntu + macos)"]
@@ -144,7 +144,7 @@ flowchart TB
     end
 ```
 
-Triggers: push to `v2`/`main` and PRs, with `frontend/**` ignored (the
+Triggers: push to `v2`/`main` and PRs, with `website/**` ignored (the
 landing page is a read-only branding reference). Steps after a test failure
 still run (`if: !cancelled()`) so one run reports every failure. The
 tmux-head job is early warning, not a merge blocker — but it has caught a

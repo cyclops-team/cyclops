@@ -5,8 +5,8 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SOCK="cyc-ws-step12-demo"
 SESSION="agents"
-# shellcheck source=demos/lib.sh
-. "$(cd "$(dirname "$0")" && pwd)/lib.sh"
+# shellcheck source=../tests/e2e/lib/lib.sh
+. "$(cd "$(dirname "$0")" && pwd)/../tests/e2e/lib/lib.sh"
 CYCLOPS_HOME="$(cyc_scratch_root)/cyclops-ws12-demo"
 export CYCLOPS_HOME
 DAEMON_PID=""

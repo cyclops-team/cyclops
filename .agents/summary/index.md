@@ -9,9 +9,9 @@ answers which kind of question so you can pull in only what you need.
 1. Start here. Each entry below says what its file contains and when to read
    it.
 2. **The repo's own docs outrank these summaries.** Cyclops maintains
-   authoritative, CI-enforced pages: `docs/HANDOFF.md` (the newcomer map),
-   `docs/ARCHITECTURE.md`, `docs/PROTOCOL.md`, `docs/DELIVERY.md`,
-   `docs/INVARIANTS.md`, `docs/CONTRIBUTING.md`, `docs/STYLE.md`, and one
+   authoritative, CI-enforced pages: `docs/development/HANDOFF.md` (the newcomer map),
+   `docs/development/ARCHITECTURE.md`, `docs/reference/PROTOCOL.md`, `docs/development/DELIVERY.md`,
+   `docs/development/INVARIANTS.md`, `CONTRIBUTING.md`, `docs/development/STYLE.md`, and one
    page per user-facing feature. These summaries condense and index them;
    when in doubt, follow the pointer to the real page.
 3. Before *changing* anything, read `AGENTS.md` at the repo root — it lists
@@ -38,16 +38,16 @@ answers which kind of question so you can pull in only what you need.
   workflows each expand one of its facets.
 - `data_models.md` and `interfaces.md` describe the same types from two
   angles (what they mean vs. how they're spoken); both point into
-  `crates/cyclops-proto`, the single source of truth.
+  `src/cyclops-proto`, the single source of truth.
 - `workflows.md` shows the types from `data_models.md` moving through the
   components from `components.md`.
 
 ## Example queries and where they resolve
 
-- "Where does the delivery state machine live?" → data_models.md → `crates/cyclops-proto/src/ledger.rs`.
+- "Where does the delivery state machine live?" → data_models.md → `src/cyclops-proto/src/ledger.rs`.
 - "Why isn't there a file watcher / interval timer?" → architecture.md (zero-polling decision).
-- "How do I add support for a new agent CLI?" → interfaces.md (manifest schema) → `docs/MANIFESTS.md`; no Rust required.
-- "Why did my test kill the user's tmux?" → workflows.md (dev loop) → `docs/CONTRIBUTING.md` testrig rules.
+- "How do I add support for a new agent CLI?" → interfaces.md (manifest schema) → `docs/reference/MANIFESTS.md`; no Rust required.
+- "Why did my test kill the user's tmux?" → workflows.md (dev loop) → `CONTRIBUTING.md` testrig rules.
 - "What must pass before a PR is green?" → workflows.md (CI section) or `AGENTS.md`.
 - "Can I edit the frontend?" → components.md / review_notes.md: it's a read-only branding reference; don't, without an explicit request.
 

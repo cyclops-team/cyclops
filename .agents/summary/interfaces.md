@@ -1,7 +1,7 @@
 # Interfaces
 
 Every boundary a client, agent, or contributor programs against. The
-authoritative pages are `docs/PROTOCOL.md` (socket) and `docs/MANIFESTS.md`
+authoritative pages are `docs/reference/PROTOCOL.md` (socket) and `docs/reference/MANIFESTS.md`
 (manifest schema); this file is the summary plus the surfaces those pages do
 not cover.
 
@@ -14,7 +14,7 @@ After `events.subscribe`, the connection also carries pushed
 `Event { event, data, seq }` lines. Compatibility: unknown fields are
 tolerated in both directions; new fields are optional; a protocol version
 mismatch warns and never rejects. Types live in
-`crates/cyclops-proto/src/wire.rs`.
+`src/cyclops-proto/src/wire.rs`.
 
 | Method | Purpose |
 |---|---|
@@ -36,7 +36,7 @@ Error codes are stable strings: `unknown_method`, `denied`, `no_such_target`,
 
 Identity is fail-closed: peer credentials (uid, pid) are read from the
 socket; `msg.send` sender identity is resolved by walking process ancestry to
-a watched pane pid (`crates/cyclopsd/src/identity.rs`), so nothing in a
+a watched pane pid (`src/cyclopsd/src/identity.rs`), so nothing in a
 message body can forge the FROM header.
 
 ## The CLI (`cyclops`)
@@ -66,7 +66,7 @@ Usage errors exit 2.
 
 ## The vendor hook contract
 
-A vendor CLI's hook config (templates in `hooks/`, rendered by
+A vendor CLI's hook config (templates in `resources/hooks/`, rendered by
 `cyclops hooks install <cli> --agent <label>`) invokes `cyclops hook <event>`
 with the payload on stdin. The receiver's contract is strict: fast, silent,
 exit 0 always, 3 seconds total budget; agent identity from `--agent` or
@@ -76,7 +76,7 @@ the ACK window is what upgrades a delivery to `delivered_verified`.
 
 ## The manifest schema (TOML)
 
-One file per agent CLI in `manifests/` (page: `docs/MANIFESTS.md`):
+One file per agent CLI in `resources/manifests/` (page: `docs/reference/MANIFESTS.md`):
 
 - `[agent]` — `id`, `display_name`, `process_names` (binds a pane by
   foreground command), `argv_basenames` (needed when the CLI installs as a
@@ -99,8 +99,8 @@ Unknown keys are tolerated so authors keep evidence next to the rule.
 | `$CYCLOPS_HOME/ledger/<session>.ndjson` | Append-only; one `LedgerLine` JSON object per line; readable with no daemon running |
 | `$CYCLOPS_HOME/config.toml` | `sessions`, `theme`, `chrome`, timing knobs, `default_workspace`; unknown keys warn; missing file is a valid empty config |
 | `$CYCLOPS_HOME/registry.json` | Versioned adoption roster, written whole on every change |
-| `$CYCLOPS_HOME/workspaces/*.toml` | Saved session shapes (layout grammar in `crates/cyclops-tmux/src/layout.rs`) |
-| `themes/*.toml` | `[colors]` token → hex; unknown tokens warn and fall back |
+| `$CYCLOPS_HOME/workspaces/*.toml` | Saved session shapes (layout grammar in `src/cyclops-tmux/src/layout.rs`) |
+| `resources/themes/*.toml` | `[colors]` token → hex; unknown tokens warn and fall back |
 
 ## Environment variables
 

@@ -1,8 +1,8 @@
 # Architecture
 
 How the pieces of Cyclops fit together, and which decisions were deliberate.
-The repo's own architecture page is `docs/ARCHITECTURE.md`; the newcomer map
-is `docs/HANDOFF.md`. This file summarizes both plus what static analysis of
+The repo's own architecture page is `docs/development/ARCHITECTURE.md`; the newcomer map
+is `docs/development/HANDOFF.md`. This file summarizes both plus what static analysis of
 the crates shows.
 
 ## System overview
@@ -23,7 +23,7 @@ flowchart LR
     ad["cyclops-tmux adapter<br/>control mode, pane table"]
     tmux(["the user's tmux server"])
     led[("append-only ledgers<br/>$CYCLOPS_HOME/ledger/*.ndjson")]
-    data["manifests/ themes/<br/>layouts/ hooks/ (data, not code)"]
+    data["resources/manifests/ resources/themes/<br/>resources/layouts/ resources/hooks/ (data, not code)"]
 
     cli --> sock
     ui --> sock
@@ -77,7 +77,7 @@ nowhere else. The CLI does not depend on `cyclops-manifest` or
 ## Ownership rule
 
 Most wrong changes on this codebase are a rule implemented in a crate that
-should not have known about it. The boundaries (from `docs/HANDOFF.md`):
+should not have known about it. The boundaries (from `docs/development/HANDOFF.md`):
 
 - `cyclops-proto` owns shared *rules* (delivery transitions, attention) but no
   IO; it has never heard of tmux and renders nothing.
@@ -93,16 +93,16 @@ should not have known about it. The boundaries (from `docs/HANDOFF.md`):
 
 ## Deliberate decisions (and what was rejected)
 
-Recorded in full in `docs/HANDOFF.md`; the formal ADR lives in a separate
+Recorded in full in `docs/development/HANDOFF.md`; the formal ADR lives in a separate
 design repo. Summary:
 
 1. **tmux control mode, not hosting PTYs.** An own-PTY server was scored and
    rejected on implementation cost (comparable systems run 7k–200k lines for
    that alone). Cost accepted: every tmux quirk is Cyclops's to absorb, so all
-   of it is confined to `crates/cyclops-tmux` and an advisory CI job builds
+   of it is confined to `src/cyclops-tmux` and an advisory CI job builds
    tmux from master as an early-warning canary.
 2. **Manifests are data files.** Everything Cyclops knows about a vendor CLI
-   is one TOML file in `manifests/`; adding an agent must not require a
+   is one TOML file in `resources/manifests/`; adding an agent must not require a
    compiler. Vendor behavior in Rust is a review-and-release cycle; in a
    manifest it is a text edit on the machine with the problem.
 3. **The ledger is append-only NDJSON.** One file per session, fsynced,
@@ -152,9 +152,9 @@ design repo. Summary:
 
 ## The frontend is not part of this architecture
 
-`frontend/` is a static SvelteKit 2 / Svelte 5 marketing site for
+`website/` is a static SvelteKit 2 / Svelte 5 marketing site for
 usecyclops.dev. It is excluded from the Cargo workspace, ignored by Rust CI,
 never embedded or served by any crate, and its only network call is a GitHub
-star-count fetch. The relationship to `themes/` is reversed from what you
-might expect: `themes/dark.toml` and `themes/light.toml` are *derived from*
+star-count fetch. The relationship to `resources/themes/` is reversed from what you
+might expect: `resources/themes/dark.toml` and `resources/themes/light.toml` are *derived from*
 the site's CSS design tokens, not the other way around.
