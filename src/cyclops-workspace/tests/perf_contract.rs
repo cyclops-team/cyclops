@@ -30,6 +30,19 @@ use cyclops_testrig::{tmux_available, TmuxServer};
 use cyclops_tmux::{ControlClient, ControlConfig, Notification};
 use cyclops_workspace::app::{coalesce_decoration_signals, CoalesceEnd, DecorationSignal};
 
+/// One measurement at a time. cargo runs this binary's tests on parallel
+/// threads, and these tests measure timing: the flood tests starve the
+/// decoration-cadence tests and the flow-control stall on a loaded runner
+/// (the CI reds on main and v3 were exactly that). Serializing them keeps
+/// every number honest without touching what any test asserts.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 struct Rig {
     server: TmuxServer,
 }
@@ -105,6 +118,7 @@ const KEYS: [&str; 4] = ["a", "b", "c", "d"];
 /// `key_to_control_write_latency_during_output_flood` compares against.
 #[tokio::test]
 async fn key_to_control_write_latency() {
+    let _serial = serial();
     let Some(rig) = Rig::new("perf-key") else {
         return;
     };
@@ -144,6 +158,7 @@ async fn key_to_control_write_latency() {
 /// place, which is the point of comparing these two numbers.
 #[tokio::test]
 async fn key_to_control_write_latency_during_output_flood() {
+    let _serial = serial();
     let Some(rig) = Rig::new("perf-key-flood") else {
         return;
     };
@@ -218,6 +233,7 @@ async fn key_to_control_write_latency_during_output_flood() {
 /// the channel down to whatever arrived since the last tick.
 #[tokio::test]
 async fn sustained_output_backlog_drains_continuously() {
+    let _serial = serial();
     let Some(rig) = Rig::new("perf-backlog") else {
         return;
     };
@@ -331,6 +347,7 @@ async fn sustained_output_backlog_drains_continuously() {
 /// `%pause` when data is queued while the reader has genuinely stopped.
 #[tokio::test]
 async fn flow_control_pause_and_resume() {
+    let _serial = serial();
     let Some(rig) = Rig::new("perf-flow") else {
         return;
     };
@@ -428,6 +445,7 @@ async fn flow_control_pause_and_resume() {
 /// into exactly one `refresh` call, not one per signal and not zero.
 #[test]
 fn decoration_burst_coalesces_into_one_refresh() {
+    let _serial = serial();
     let (sig_tx, sig_rx) = mpsc::channel();
     let refreshes: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
     let refreshes_bg = Arc::clone(&refreshes);
@@ -481,6 +499,7 @@ fn decoration_burst_coalesces_into_one_refresh() {
 /// `std::thread::sleep(5ms)` is not a precise clock.
 #[test]
 fn decoration_stream_refreshes_repeatedly_during_the_stream() {
+    let _serial = serial();
     let (sig_tx, sig_rx) = mpsc::channel();
     let refreshes: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
     let refreshes_bg = Arc::clone(&refreshes);
@@ -589,6 +608,7 @@ fn wait_until(deadline: Instant, what: &str, mut poll: impl FnMut() -> bool) {
 /// term_guard.rs`) exists to guarantee on every exit path, quit included.
 #[test]
 fn quitting_leaves_the_alternate_screen_and_returns_to_a_shell_prompt() {
+    let _serial = serial();
     if !tmux_available() {
         eprintln!("skipping: no tmux binary on PATH");
         return;
