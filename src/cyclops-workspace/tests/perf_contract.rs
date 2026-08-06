@@ -34,14 +34,9 @@ use cyclops_workspace::app::{coalesce_decoration_signals, CoalesceEnd, Decoratio
 /// threads, and these tests measure timing: the flood tests starve the
 /// decoration-cadence tests and the flow-control stall on a loaded runner
 /// (the CI reds on main and v3 were exactly that). Serializing them keeps
-/// every number honest without touching what any test asserts.
-static SERIAL: Mutex<()> = Mutex::new(());
-
-fn serial() -> std::sync::MutexGuard<'static, ()> {
-    SERIAL
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
+/// every number honest without touching what any test asserts. Async
+/// tests take `.lock().await`, sync ones `.blocking_lock()`.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct Rig {
     server: TmuxServer,
@@ -118,7 +113,7 @@ const KEYS: [&str; 4] = ["a", "b", "c", "d"];
 /// `key_to_control_write_latency_during_output_flood` compares against.
 #[tokio::test]
 async fn key_to_control_write_latency() {
-    let _serial = serial();
+    let _serial = SERIAL.lock().await;
     let Some(rig) = Rig::new("perf-key") else {
         return;
     };
@@ -158,7 +153,7 @@ async fn key_to_control_write_latency() {
 /// place, which is the point of comparing these two numbers.
 #[tokio::test]
 async fn key_to_control_write_latency_during_output_flood() {
-    let _serial = serial();
+    let _serial = SERIAL.lock().await;
     let Some(rig) = Rig::new("perf-key-flood") else {
         return;
     };
@@ -233,7 +228,7 @@ async fn key_to_control_write_latency_during_output_flood() {
 /// the channel down to whatever arrived since the last tick.
 #[tokio::test]
 async fn sustained_output_backlog_drains_continuously() {
-    let _serial = serial();
+    let _serial = SERIAL.lock().await;
     let Some(rig) = Rig::new("perf-backlog") else {
         return;
     };
@@ -347,53 +342,86 @@ async fn sustained_output_backlog_drains_continuously() {
 /// `%pause` when data is queued while the reader has genuinely stopped.
 #[tokio::test]
 async fn flow_control_pause_and_resume() {
-    let _serial = serial();
+    let _serial = SERIAL.lock().await;
     let Some(rig) = Rig::new("perf-flow") else {
         return;
     };
-    rig.session("flow", 80, 24);
-    let (client, mut notif) = ControlClient::spawn(rig.config("flow"))
-        .await
-        .expect("attach");
 
-    client
-        .command("refresh-client -f pause-after=1")
-        .await
-        .expect("lower pause-after for this test's stall below");
+    // Up to three attempts, each on a fresh session. The stall only draws
+    // %pause when the flood keeps the queue full while the reader has
+    // stopped, and a starved runner can deny `yes` the CPU for that whole
+    // window (the relocated-leg CI reds). One success proves the plumbing;
+    // a real regression fails all three the same way.
+    let mut attempt = 0;
+    let (client, mut notif, flood_pane, paused_pane) = loop {
+        let session = format!("flow{attempt}");
+        rig.session(&session, 80, 24);
+        let pane = String::from_utf8_lossy(
+            &rig.server
+                .run(&["list-panes", "-t", &session, "-F", "#{pane_id}"])
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        let (client, mut notif) = ControlClient::spawn(rig.config(&session))
+            .await
+            .expect("attach");
+        client
+            .command("refresh-client -f pause-after=1")
+            .await
+            .expect("lower pause-after for this test's stall below");
 
-    rig.server
-        .run_ok(&["send-keys", "-t", "%0", "yes flood", "Enter"]);
-    // Proof the flood is flowing before the stall; on a loaded runner the
-    // pane shell can start late, and stalling before any output exists means
-    // no queued block ever ages past pause-after.
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            match notif.recv().await {
-                Some(Notification::Output { .. } | Notification::ExtendedOutput { .. }) => break,
-                Some(_) => {}
-                None => panic!("connection closed before the flood produced output"),
+        rig.server
+            .run_ok(&["send-keys", "-t", &pane, "yes flood", "Enter"]);
+        // Proof the flood is flowing before the stall; on a loaded runner
+        // the pane shell can start late, and stalling before any output
+        // exists means no queued block ever ages past pause-after.
+        let flowing = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                match notif.recv().await {
+                    Some(Notification::Output { .. } | Notification::ExtendedOutput { .. }) => {
+                        break
+                    }
+                    Some(_) => {}
+                    None => panic!("connection closed before the flood produced output"),
+                }
             }
-        }
-    })
-    .await
-    .expect("the flood never produced output before the stall");
-    // The stall (see the doc above): block the executor reader_task runs
-    // on, so tmux's own pause-after clock — which needs a reader that has
-    // genuinely stopped, not just a slow one — has something real to fire
-    // against.
-    std::thread::sleep(Duration::from_secs(3));
+        })
+        .await;
+        // The stall (see the doc above): block the executor reader_task
+        // runs on, so tmux's own pause-after clock — which needs a reader
+        // that has genuinely stopped, not just a slow one — has something
+        // real to fire against.
+        let paused = if flowing.is_ok() {
+            std::thread::sleep(Duration::from_secs(3));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match notif.recv().await {
+                        Some(Notification::Pause { pane }) => return pane,
+                        Some(_) => {}
+                        None => panic!("connection closed before %pause"),
+                    }
+                }
+            })
+            .await
+            .ok()
+        } else {
+            None
+        };
 
-    let paused_pane = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match notif.recv().await {
-                Some(Notification::Pause { pane }) => return pane,
-                Some(_) => {}
-                None => panic!("connection closed before %pause"),
+        match paused {
+            Some(paused_pane) => break (client, notif, pane, paused_pane),
+            None if attempt < 2 => {
+                eprintln!(
+                    "attempt {attempt}: no %pause; fresh session on a possibly starved runner"
+                );
+                rig.server.run_ok(&["send-keys", "-t", &pane, "C-c"]);
+                client.shutdown().await;
+                attempt += 1;
             }
+            None => panic!("never saw %pause after the stall on three fresh attempts"),
         }
-    })
-    .await
-    .expect("never saw %pause after the stall");
+    };
     let pause_at = Instant::now();
 
     let continue_wait = tokio::time::timeout(Duration::from_secs(10), async {
@@ -407,7 +435,7 @@ async fn flow_control_pause_and_resume() {
     })
     .await;
 
-    rig.server.run_ok(&["send-keys", "-t", "%0", "C-c"]);
+    rig.server.run_ok(&["send-keys", "-t", &flood_pane, "C-c"]);
 
     let continue_at =
         continue_wait.expect("never saw %continue after %pause (confirmed resume command)");
@@ -445,7 +473,7 @@ async fn flow_control_pause_and_resume() {
 /// into exactly one `refresh` call, not one per signal and not zero.
 #[test]
 fn decoration_burst_coalesces_into_one_refresh() {
-    let _serial = serial();
+    let _serial = SERIAL.blocking_lock();
     let (sig_tx, sig_rx) = mpsc::channel();
     let refreshes: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
     let refreshes_bg = Arc::clone(&refreshes);
@@ -499,7 +527,28 @@ fn decoration_burst_coalesces_into_one_refresh() {
 /// `std::thread::sleep(5ms)` is not a precise clock.
 #[test]
 fn decoration_stream_refreshes_repeatedly_during_the_stream() {
-    let _serial = serial();
+    let _serial = SERIAL.blocking_lock();
+    // Up to three attempts: the 5ms driver below is at the scheduler's
+    // mercy, and a starved runner can stretch the whole 200ms stream into
+    // two debounce windows (the relocated-leg CI reds). One attempt with
+    // several refreshes proves the arm-once rule; a regression that waits
+    // for the stream to end produces one refresh on every attempt.
+    let mut last = 0;
+    for attempt in 0..3 {
+        last = stream_refresh_count();
+        if last >= 3 {
+            return;
+        }
+        eprintln!("attempt {attempt}: {last} refreshes; retrying on a possibly starved runner");
+    }
+    panic!(
+        "expected several refreshes during a 200ms stream with a 30ms debounce, got {last} \
+         on three attempts — the arm-once rule should keep firing throughout the stream \
+         rather than waiting for it to end"
+    );
+}
+
+fn stream_refresh_count() -> usize {
     let (sig_tx, sig_rx) = mpsc::channel();
     let refreshes: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
     let refreshes_bg = Arc::clone(&refreshes);
@@ -543,12 +592,7 @@ fn decoration_stream_refreshes_repeatedly_during_the_stream() {
         "decoration_stream: {signals_sent} signals over ~200ms produced {} refreshes at {offsets_ms:?}ms (gaps {gaps_ms:?}ms)",
         calls.len()
     );
-    assert!(
-        calls.len() >= 3,
-        "expected several refreshes during a 200ms stream with a 30ms debounce, got {} — \
-         the arm-once rule should keep firing throughout the stream rather than waiting for it to end",
-        calls.len()
-    );
+    calls.len()
 }
 
 // ---------------------------------------------------------------------------
@@ -608,7 +652,7 @@ fn wait_until(deadline: Instant, what: &str, mut poll: impl FnMut() -> bool) {
 /// term_guard.rs`) exists to guarantee on every exit path, quit included.
 #[test]
 fn quitting_leaves_the_alternate_screen_and_returns_to_a_shell_prompt() {
-    let _serial = serial();
+    let _serial = SERIAL.blocking_lock();
     if !tmux_available() {
         eprintln!("skipping: no tmux binary on PATH");
         return;
