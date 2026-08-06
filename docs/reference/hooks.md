@@ -15,8 +15,9 @@ cyclops hooks install claude --agent reviewer
 Renders the hook config to `~/.cyclops/hooks/<label>/` and prints
 copy-pasteable wiring instructions. `--dry-run` prints without writing,
 `--dest <dir>` picks another directory. Cyclops refuses to write into
-`~/.claude`, `~/.codex`, `~/.gemini`, or any `.agents` directory: you wire
-your real setup once, deliberately. Templates live in `resources/hooks/` in the repo.
+`~/.claude`, `~/.codex`, `~/.gemini`, or any `.agents` or `.cursor`
+directory: you wire your real setup once, deliberately. Templates live in
+`resources/hooks/` in the repo.
 
 Wiring per CLI:
 

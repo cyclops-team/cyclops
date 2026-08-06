@@ -1,42 +1,38 @@
-# sv
+# Cyclops website
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
+The SvelteKit landing page for [usecyclops.dev](https://www.usecyclops.dev).
+It is a sibling of the Rust source tree and is not part of the Cargo
+workspace.
 
-## Creating a project
+## Develop
 
-If you're seeing this, you've probably already done this step. Congrats!
-
-```sh
-# create a new project
-npx sv create my-app
-```
-
-To recreate this project with the same configuration:
-
-```sh
-# recreate this project
-npx sv@0.17.0 create --template minimal --types ts --install npm website
-```
-
-## Developing
-
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
-
-```sh
+```bash
+npm ci
 npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
 ```
 
-## Building
+The development server uses port 5173 by default. Before committing website
+changes, run both checks CI uses:
 
-To create a production version of your app:
-
-```sh
+```bash
+npm run check
 npm run build
 ```
 
-You can preview the production build with `npm run preview`.
+## Installer
 
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+`static/install.sh` is published as `https://www.usecyclops.dev/install.sh`.
+It must remain byte-for-byte identical to the repository installer:
+
+```bash
+cmp ../scripts/install.sh static/install.sh
+```
+
+The shared script builds the current Rust implementation from `main` when it
+is piped from the website, or builds the checked-out tree when run from a
+clone. `tests/e2e/parity-check.sh` and the website CI job reject drift between
+the two copies.
+
+The public documentation source lives in `../docs/public/`; repository and
+developer documentation starts at `../README.md` and
+`../docs/development/HANDOFF.md`.

@@ -1,7 +1,7 @@
-# Delivery pipeline design (M1)
+# Delivery pipeline design
 
-Fixed by ADR-001, the validation amendments, and GOALS.md. This is the spec
-the M1 implementation is reviewed against.
+Fixed by ADR-001, the validation amendments, and GOALS.md. This is the
+current delivery spec.
 
 ## Message rendering
 
@@ -53,8 +53,8 @@ timer. In order:
 3. Fused state:
    - `blocked_quota`: park ALL queued deliveries for this recipient as
      parked_blocked_quota, admin.notify urgent with the reset hint parsed
-     from screen. Never auto-retried (amendment f). Re-queue is an explicit
-     operator action.
+     from screen. Never auto-retried (amendment f). After the reset, the
+     operator sends a fresh message; there is no requeue verb.
    - `blocked_modal`: if the matched manifest rule has `auto_dismiss` and
      `decline_keys`, send the decline keys in order with ~250ms spacing,
      ledger a gate line naming the rule, re-evaluate. Multi-key declines
@@ -90,7 +90,7 @@ visible; the hold itself keeps waiting on events, never on a timer.
 
 ### ACK tiers (amendment: per-agent capability tiers)
 
-- Tier 1 (claude, codex): the manifest `hooks.ack` event arrives via
+- Tier 1 (claude, codex, cursor): the manifest `hooks.ack` event arrives via
   `agent.state.report` within the ACK window (default 1500ms; measured p95
   is under 40ms) and its `ack_payload_field` contains the message id:
   delivered_verified (verified_by: hook). Codex duplicate hook events are
@@ -152,14 +152,12 @@ only where it is hosted.
 - queued delivery starts within 1s of the turn-end state change (the worker
   wakes on the event, nothing polls).
 
-## Not in M1
+## Later surfaces and current limit
 
-- `cyclops hooks install` and the startup hook self-test (amendment c): M2.
-  M1 tests configure hooks the way the validation harness did (--settings /
-  CODEX_HOME) and post agent.state.report through the socket.
-- msg.history / msg.thread query methods: M2 (the ledger already records
-  everything they will read).
-- Operator re-queue verb for parked/attention deliveries: M2 surface.
+- `cyclops hooks install`, hook verification, history, and thread queries
+  shipped after the original delivery milestone.
+- There is still no operator requeue verb for parked or attention-required
+  deliveries. Send a new message after resolving the cause.
 
 ## v1.1 amendments (M1 gate)
 

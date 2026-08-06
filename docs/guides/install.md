@@ -3,19 +3,29 @@
 ## Requirements
 
 - macOS or Linux
-- tmux 3.2 or newer (`tmux -V`); developed and tested on 3.6a
+- tmux 3.2 or newer (`tmux -V`)
 - Rust toolchain (`cargo`)
+- curl and Git (for the one-line source install)
 
 ## Install
 
 ```bash
-git clone https://github.com/cyclops-team/cyclops.git && cd cyclops
-./scripts/install.sh
+curl -fsSL https://www.usecyclops.dev/install.sh | sh
 ```
 
-That is the whole install. It builds both binaries, puts them where your
-shell looks, writes the config and the detection manifests, and proves the
-result runs.
+The hosted script is the same `scripts/install.sh` that this repository
+tests. It clones the current `main` branch into a temporary directory,
+builds both binaries, puts them where your shell looks, writes the config
+and detection manifests, proves the result runs, and removes the clone.
+It never uses sudo.
+
+To inspect the installer before running it, clone the repository instead:
+
+```bash
+git clone https://github.com/cyclops-team/cyclops.git
+cd cyclops
+./scripts/install.sh
+```
 
 Two binaries: `cyclops` (the CLI) and `cyclopsd` (the daemon).
 
@@ -29,8 +39,10 @@ shell profile.
 `--prefix DIR` overrides the choice:
 
 ```bash
-./scripts/install.sh --prefix ~/bin
+curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --prefix "$HOME/bin"
 ```
+
+From a clone, use `./scripts/install.sh --prefix "$HOME/bin"`.
 
 It never uses sudo. A prefix you cannot write to is an error with the fix
 in it, not a password prompt.
@@ -50,7 +62,7 @@ three lines, and prints both:
     # <<< cyclops <<<
 
   the file as it was: /Users/you/.zshrc.cyclops-backup.20260803082117
-  undo: cp "/Users/you/.zshrc.cyclops-backup.20260803082117" "/Users/you/.zshrc"    (or ./scripts/install.sh --uninstall)
+  undo: cp "/Users/you/.zshrc.cyclops-backup.20260803082117" "/Users/you/.zshrc"    (or curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall)
 ```
 
 The markers are what make a second run a no-op instead of a second copy.
@@ -63,12 +75,14 @@ the line printed and no edit.
 ### Uninstall
 
 ```bash
-./scripts/install.sh --uninstall
+curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
 ```
 
 Removes both binaries and takes the block back out of your profile,
 backing it up again first. It leaves `~/.cyclops` alone and says how to
 remove that too; the ledger under it is your message history.
+
+From a clone, use `./scripts/install.sh --uninstall`.
 
 ### With cargo instead
 
@@ -128,12 +142,12 @@ The long way, by hand. Create `~/.cyclops/config.toml`:
 # tmux sessions to watch
 sessions = ["main"]
 
-# what a bare `cyclops start` opens, see workspaces.md
+# what `cyclops start` opens by default, see workspaces.md
 default_workspace = "main"
 
 # where the per-CLI detection manifests live; the default is
 # ~/.cyclops/manifests and you rarely want anything else
-manifest_dir = "/path/to/cyclops/manifests"
+manifest_dir = "/path/to/cyclops/resources/manifests"
 ```
 
 `cyclops start` writes the first two keys and not the third: with nothing
@@ -323,7 +337,9 @@ and fails if a line the docs quote is no longer what the binaries print.
 `--with-installer` adds `scripts/install.sh` to the walk: it installs into
 a throwaway home, checks the shapes this page quotes, then uninstalls and
 proves the shell profile came back byte for byte. It is opt-in because it
-does a release build, and CI runs it as its own job.
+does a release build, and CI runs it as its own job. The parity gate also
+requires `website/static/install.sh` to be byte-for-byte identical to the
+tested repository installer.
 
 `--no-fail-fast` is not optional: cargo stops at the first failing test
 binary and hides every binary after it, which is how one portability bug
@@ -349,11 +365,13 @@ code path Linux does. CI runs both.
 
 ## Uninstall
 
-Stop the daemon, then:
+The installer removes the binaries and its PATH block but preserves your
+data:
 
 ```bash
-rm -rf ~/.cyclops
+curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
 ```
 
-The ledger under `~/.cyclops/ledger/` is your message history; copy it out
-first if you want the record.
+If you also want to delete all Cyclops configuration and records, stop the
+daemon, copy out any history you want to keep from `~/.cyclops/ledger/`,
+then remove `~/.cyclops` yourself.

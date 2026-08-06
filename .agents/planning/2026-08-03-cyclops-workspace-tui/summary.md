@@ -1,5 +1,9 @@
 # Cyclops Terminal Workspace UI — Project Summary
 
+> Archived planning summary. The implementation is complete, and paths in
+> this page reflect the tree as it existed while planning. See
+> [`STATUS.md`](../../../STATUS.md) for the current product status.
+
 PDD run completed 2026-08-03. This project turns the rough idea — a
 polished, Herdr-feeling terminal workspace for Cyclops — into a reviewed
 design and a 14-step implementation plan.

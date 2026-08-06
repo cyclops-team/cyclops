@@ -1,61 +1,74 @@
 ---
 title: "Quickstart"
-description: "Attach Cyclops to your first tmux session."
+description: "Open a Cyclops workspace and send your first message."
 ---
 
-This guide walks through starting an agent in tmux, attaching Cyclops to it, and sending your first prompt.
-
-## 1. Start a tmux session with an agent
-
-Open a tmux session and launch a coding agent inside it. For example:
+## 1. Install Cyclops
 
 ```bash
-tmux new -s work
-claude
+curl -fsSL https://www.usecyclops.dev/install.sh | sh
 ```
 
-Leave the agent running in that pane.
+The installer needs tmux 3.2 or newer, curl, Git, and a Rust toolchain. If it
+adds a PATH block, open a new shell or run the reload command it prints.
 
-## 2. Attach Cyclops
-
-In a separate terminal, run:
+## 2. Open the default workspace
 
 ```bash
-cyclops attach work
+cyclops start
 ```
 
-Cyclops discovers panes in the `work` session and registers each one as an agent.
+The first run creates a `main` tmux session from the one-pane `solo` preset,
+starts `cyclopsd`, and writes the initial config, themes, and detection
+manifests.
 
-## 3. List attached agents
+## 3. Start an agent
+
+Attach to the session and run the coding-agent CLI normally:
 
 ```bash
-cyclops ls
+tmux attach -t main
 ```
 
-You should see the agent from step 1 listed with an ID, its tmux target, and its current status.
+The default pane is named `implementer`. Start Claude Code, Codex CLI, Cursor
+Agent, or another CLI for which you have a detection manifest.
 
-## 4. Send a prompt
+## 4. Check the roster
 
-Send a message to the first agent:
+From another terminal:
 
 ```bash
-cyclops send 1 "Summarize the README in this repo."
+cyclops list
+cyclops status
 ```
 
-Cyclops forwards the prompt to the pane and streams the agent's response back.
-
-## 5. Detach
-
-When you are done, detach without stopping the agents:
+If you created an extra pane yourself, name it by tmux pane id:
 
 ```bash
-cyclops detach
+cyclops name %1 reviewer
 ```
 
-The tmux session and its agents keep running.
+## 5. Send a message
+
+```bash
+cyclops send implementer --subject "Summarize the README" --body "Call out the setup steps and test commands."
+```
+
+The receipt says whether the agent's own hook verified the delivery or
+Cyclops confirmed it from screen evidence. Messages and their final delivery
+states remain available through `cyclops history`.
+
+## 6. Watch the work
+
+```bash
+cyclops watch
+```
+
+`cyclops watch` opens the live event stream. A bare `cyclops` opens the
+full-screen workspace with the sidebar, tabs, and live pane canvases.
 
 ## Next steps
 
-- [Attach to tmux](/guides/attach-tmux) for more attach patterns
-- [Coordinate agents](/guides/coordinate-agents) to run several agents in parallel
-- [CLI reference](/reference/cli) for every command
+- [Coordinate several agents](/guides/coordinate-agents)
+- [Save and restore workspaces](/guides/sessions)
+- [Configure watched sessions](/reference/configuration)

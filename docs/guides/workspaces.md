@@ -331,7 +331,7 @@ Two keys in `~/.cyclops/config.toml` matter here:
 
 ```toml
 sessions = ["main"]           # what cyclopsd watches
-default_workspace = "main"    # what a bare `cyclops start` opens
+default_workspace = "main"    # what `cyclops start` opens by default
 ```
 
 `cyclops start` writes that file on a first run, when there is none. After

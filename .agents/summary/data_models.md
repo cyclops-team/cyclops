@@ -106,7 +106,7 @@ prints.
 - `Manifest` (`src/cyclops-manifest/src/lib.rs`): see interfaces.md.
 - `Layout → Window → Row → Pane` (`src/cyclops-tmux/src/layout.rs`):
   grid-of-rows with normalized ratios measured against pane cells.
-- `Theme` (`src/cyclops-theme/src/lib.rs`): 22 tokens, total resolution
+- `Theme` (`src/cyclops-theme/src/lib.rs`): 25 tokens, total resolution
   (every token always resolves through the compiled default table).
 - `Adoption` / `WindowChrome` (`src/cyclopsd/src/registry.rs`): the
   durable roster in `registry.json`, pruned on restore when a pane id or

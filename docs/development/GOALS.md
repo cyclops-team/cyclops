@@ -36,9 +36,10 @@ invisible, on a record that never lies.
   `status`, and the stream. Whitespace is a feature. Density modes
   comfortable/compact, both readable at firehose speed.
 - Exactly two encodings carry meaning: role color and state glyph. Identical
-  across CLI, borders, stream, docs. Never color alone: states pair glyph +
-  word. Badges keep one voice: "✓ delivered · verified"; hollow check means
-  unverified.
+  across CLI, borders, stream, docs. Never color alone: compact surfaces may
+  use the fixed glyph by itself; roomy and diagnostic surfaces pair it with
+  the word. Badges keep one voice: "✓ delivered · verified"; hollow check
+  means unverified.
 - Themes are semantic token files (role.*, state.*, surface, accent, badge.*),
   never raw colors in code. Ship at least 3 (dark, light, high-contrast) on
   site identity. Truecolor with 256-color fallback. Honor NO_COLOR and a

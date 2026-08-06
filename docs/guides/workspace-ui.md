@@ -175,6 +175,7 @@ sidebar_visible = true
 sidebar_width = 28
 workspace_order = ["main", "website"]
 agent_order = ["name:implementer", "name:reviewer"]
+folder_tracked = []
 
 [workspace.bindings]
 name_pane = "prefix m"

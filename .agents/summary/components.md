@@ -77,7 +77,7 @@ index. Filtering/folding lives in `src/cyclopsd/src/history.rs`.
 
 ### cyclops-theme (`src/cyclops-theme`)
 
-22 semantic tokens (`role.1..8`, `surface.*`, `eye.*`, `state.*`,
+25 semantic tokens (`role.1..8`, `surface.*`, `eye.*`, `state.*`,
 `badge.*`); `state_token(AgentState)` and `delivery_token(DeliveryState)`
 group mappings; `Color` with hex parse and nearest-xterm-256 derivation;
 tolerant `Theme::parse` (unknown tokens warn and fall back — resolution is
@@ -87,7 +87,7 @@ checked when a repaint is already due), never a watcher thread or timer.
 
 ### cyclops-ui (`src/cyclops-ui`)
 
-The stream TUI behind `cyclops ui`. `run(UiOptions)` builds a current-thread
+The stream TUI behind `cyclops watch`. `run(UiOptions)` builds a current-thread
 runtime; non-tty forces the line-oriented `plain` mode. `app.rs` is pure UI
 state (entry ring of 10k, Admin/Firehose views, attention delegated entirely
 to proto); `data.rs` does IO (connect, one `status` call, subscribe, one
@@ -145,13 +145,23 @@ The CLI binary ("One eye on every agent").
   `$CYCLOPS_HOME/cyclopsd.log`, wait ≤10s for the socket), stop, log.
 - `hook.rs` — the receiver vendor hooks invoke: fast, silent, exit 0 always,
   3s budget; failures append to `$CYCLOPS_HOME/hook-errors.log`.
-- `hookset.rs` — renders vendor hook configs (claude/codex/agy); never
+- `hookset.rs` — renders vendor hook configs (claude/codex/agy/cursor); never
   writes into vendor dot-dirs.
 - `render.rs` — layout for status/list/history/thread/receipts, reading
   proto's attention register and the UI's `grid` rather than deciding
   anything. `copy.rs` holds every user-facing sentence in one place.
 - `theme.rs`, `manifests.rs`, `themeseed.rs` — theme switching and seeding
   shipped data into `$CYCLOPS_HOME`.
+
+### cyclops-workspace (`src/cyclops-workspace`)
+
+The full-screen workspace behind bare `cyclops`. `app.rs` owns the event
+loop and model synchronization; `render/` paints the sidebar, tabs, pane
+canvas, dialogs, and event panel with Ratatui; `runtime/` owns the
+Alacritty-backed VT state and normalized cells; `action.rs`, `input/`, and
+`drag.rs` map keyboard and mouse gestures into tmux operations. `persist.rs`
+and `resilience.rs` preserve UI state and reconnect behavior. It uses
+`cyclops-theme` tokens and leaves daemon business rules in proto/daemon.
 
 ### cyclops-testrig (`tests/testrig`)
 
@@ -168,11 +178,11 @@ contract).
 
 | Component | What it is |
 |---|---|
-| `website/` | SvelteKit 2 / Svelte 5 (runes) static marketing site for usecyclops.dev. 19 components, one route, plain CSS design tokens, no backend communication except a GitHub star-count fetch. Excluded from the workspace; read-only branding reference |
+| `website/` | SvelteKit 2 / Svelte 5 static marketing site for usecyclops.dev. Outside Cargo; its own CI job type-checks and builds it, and its hosted installer must match `scripts/install.sh` |
 | `resources/manifests/` | Shipped detection manifests: `agy.toml`, `claude.toml`, `codex.toml`, `cursor.toml`. Compiled into the CLI with `include_str!` and seeded to `$CYCLOPS_HOME/manifests` on first `cyclops start`, never overwritten after |
-| `resources/themes/` | 7 themes: dark, light (derived from the frontend's CSS tokens), catppuccin, gruvbox, nord, tokyo-night, high-contrast |
+| `resources/themes/` | 7 themes: dark, light, catppuccin, gruvbox, nord, tokyo-night, high-contrast |
 | `resources/layouts/` | Presets `solo`, `duo`, `quad`, `ops` — each the previous plus a pane |
-| `resources/hooks/` | Vendor hook config templates per CLI (agy, claude, codex) rendered by `cyclops hooks install` |
+| `resources/hooks/` | Vendor hook config templates per CLI (agy, claude, codex, cursor) rendered by `cyclops hooks install` |
 | `demos/` | Seven runnable end-to-end scripts on isolated tmux servers; `tests/e2e/parity-check.sh` is the CI gate that asserts docs and binaries agree |
 | `scripts/` | `install.sh` (POSIX source installer: builds, places binaries, edits profile with backup, `--uninstall` restores), `check-doc-paths.py` (doc-path + orphan gate), `commpact-shim/` (v1 compatibility shim + tests) |
-| `tests/` | Python soak gate `m1_soak.py` and probe harness (`tests/e2e/lib/`) |
+| `tests/` | Test-only tmux rig in `testrig/`; parity, soak, vocabulary, and probe machinery in `e2e/` |

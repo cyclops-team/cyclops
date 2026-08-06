@@ -41,12 +41,13 @@ message body can forge the FROM header.
 
 ## The CLI (`cyclops`)
 
-All verbs take `--json` (raw socket answer) and `--plain`, and honor
-`NO_COLOR` (`ui` has no `--json`; the machine stream is `cyclops watch
---json`).
+CLI subcommands accept the global `--json` and `--plain` forms where they
+apply, and honor `NO_COLOR`. Bare `cyclops` opens the full-screen workspace;
+the deprecated `ui` alias has no JSON form.
 
 | Verb | Purpose |
 |---|---|
+| *(none)* | Open the full-screen workspace |
 | `start` | Open/restore the default workspace, seed config+manifests+themes, start the daemon. Safe to run twice |
 | `workspace save\|restore` | Session shape to/from `$CYCLOPS_HOME/workspaces` |
 | `name <pane> <label>` | Adopt a pane (`--manifest` to pin, `--clear` to release) |
@@ -55,8 +56,8 @@ All verbs take `--json` (raw socket answer) and `--plain`, and honor
 | `wait <agent> --until idle\|done\|blocked` | Exit 0 reached, 2 timeout, 3 occupant changed/died |
 | `history` / `thread <id>` | The record |
 | `read <agent> --source visible\|recent\|detection` | Pane content / sensor readings |
-| `watch` | Live event stream, one JSON line each |
-| `ui` | The stream TUI (firehose, filters, the eye, jump-to-pane) |
+| `watch` | Stream TUI by default; live NDJSON with `--json` |
+| `ui` | Deprecated compatibility alias for the stream TUI |
 | `hook <event>` | Vendor-hook receiver: silent, exit 0 always, 3s budget |
 | `hooks install\|verify\|selftest` | Render vendor hook config; prove liveness |
 | `theme [name]` | List with previews, or switch (live at once) |

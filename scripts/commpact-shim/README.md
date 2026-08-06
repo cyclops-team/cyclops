@@ -2,7 +2,8 @@
 
 The commPact v1 calling surface, served by cyclops. PREPARED here;
 installed only by the admin via `install.sh`, which refuses to run unless
-`CYCLOPS_CUTOVER_ACK=yes` is set. Runbook: [docs/CUTOVER.md](../../docs/CUTOVER.md).
+`CYCLOPS_CUTOVER_ACK=yes` is set. Runbook:
+[docs/development/CUTOVER.md](../../docs/development/CUTOVER.md).
 
 - `commPact`: the shim. Forwards send/read/list/resolve/doctor to cyclops,
   keeps id/hash/version local with v1 behavior, refuses type/keys/message/

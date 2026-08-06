@@ -15,8 +15,8 @@ members = [
     "src/cyclops-workspace",
 ]
 
-# The production landing page for usecyclops.dev lives at website/ as a
-# read-only branding reference. It is not part of the Rust workspace.
+# The production landing page for usecyclops.dev lives at website/. It is
+# tested separately from Rust and is not part of the Cargo workspace.
 exclude = ["website"]
 
 [workspace.package]

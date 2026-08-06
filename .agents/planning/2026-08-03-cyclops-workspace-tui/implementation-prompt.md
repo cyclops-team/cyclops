@@ -1,5 +1,11 @@
 # Cyclops recommendation implementation instructions
 
+> Archived execution prompt. It records how the completed 2026-08-05 plan
+> was implemented; its task state and pre-migration paths are not current
+> operating instructions. See
+> [`implementation/progress.md`](implementation/progress.md) for the final
+> record and [`STATUS.md`](../../../STATUS.md) for current product status.
+
 You are the lead senior engineer for Cyclops, with deep expertise in Rust,
 Ratatui, Crossterm, terminal emulation, tmux, performance-sensitive event
 loops, and maintainable systems architecture.

@@ -374,7 +374,8 @@ not own. Never type into the wrong pane (GOALS).
 
 Restore rebuilds panes, sizes, directories and labels. It starts no
 process unless you pass `--launch`, and even then tmux runs the command as
-the pane's own; no keys are sent anywhere. Details: docs/workspaces.md.
+the pane's own; no keys are sent anywhere. Details:
+`docs/guides/workspaces.md`.
 
 ## Writing into tmux
 
@@ -442,21 +443,22 @@ what it deliberately does not; read that before changing one.
 | `cyclopsd` | The daemon: watcher, fusion, delivery pipeline, ledger writer, socket server, adoption registry, pane chrome. |
 | `cyclops` | The CLI: a thin NDJSON client plus the human-facing renderers, `cyclops hook`, and the workspace verbs. |
 | `cyclops-ui` | The stream behind `cyclops watch`: admin view, firehose, the eye, jump-to-pane, windowed rendering over a 10k ring (docs/guides/ui.md). |
+| `cyclops-workspace` | The full-screen workspace behind bare `cyclops`: Ratatui/Crossterm chrome, embedded pane VT runtimes, direct manipulation, dialogs, and persistence. |
 | `cyclops-ledger` | Crash-safe append-only NDJSON writer and cursor reader. Fsync before acknowledging; torn final lines are sealed, never rewritten. |
 | `cyclops-theme` | The semantic token vocabulary, theme files, 256-color fallback, selection and hot reload (docs/guides/themes.md). |
 | `cyclops-testrig` | Test-only. The isolated tmux server and the one statement of its teardown rule. |
 
-Non-crate directories: `resources/manifests/` (shipped detection data for claude,
-codex, agy), `resources/hooks/` (vendor hook config templates `cyclops hooks install`
+Non-crate directories: `resources/manifests/` (shipped detection data for Claude,
+Codex, Antigravity, and Cursor), `resources/hooks/` (vendor hook config templates `cyclops hooks install`
 renders), `resources/layouts/` (the four workspace presets, compiled in with
 `include_str!` so a fresh install has them before it has a config file),
-`resources/themes/` (the three shipped token files), `demos/` (runnable end-to-end
+`resources/themes/` (the seven shipped token files), `demos/` (runnable end-to-end
 scripts; `tests/e2e/lib/lib.sh` holds the two rules the scripts must not copy, the
 scratch root and the tmux teardown), `tests/e2e/lib/` (the Python probe
 harness), `scripts/commpact-shim/` (the prepared v1 shim and its guarded
 installer; nothing installs it, see docs/development/CUTOVER.md), `website/` (the
-landing page for usecyclops.dev, outside the Cargo workspace and never
-modified without an explicit admin request).
+landing page for usecyclops.dev, outside the Cargo workspace and checked by
+its own CI job).
 
 ### The frozen decisions
 
@@ -465,7 +467,7 @@ modified without an explicit admin request).
 | Single daemon, one `tmux -C` client per session (T3) | `src/cyclops-tmux/src/control.rs`, owned by `cyclopsd` |
 | Level-triggered reconciling core, not an event mirror (revision 1, C2) | `src/cyclops-tmux/src/watcher.rs` |
 | Sensor fusion with per-sensor readings and observable disagreement (revision 2) | Types in `src/cyclops-proto/src/state.rs`; engine in `src/cyclopsd/src/fusion.rs`; hook sensor fed from `src/cyclopsd/src/ack.rs` |
-| Detection rules are per-CLI data, not code (H2) | `cyclops-manifest`, `resources/manifests/{claude,codex,agy}.toml` |
+| Detection rules are per-CLI data, not code (H2) | `cyclops-manifest`, `resources/manifests/{claude,codex,agy,cursor}.toml` |
 | NDJSON Unix socket, hello line first, version mismatch warns never rejects (S2) | `src/cyclops-proto/src/wire.rs`; server in `src/cyclopsd/src/server.rs` |
 | Append-only NDJSON ledger, monotonic seq plus boot_id, replayable by cursor (C6) | Schema in `src/cyclops-proto/src/ledger.rs`; writer in `cyclops-ledger`. The stream client backfills by reading session files directly; server-side cursor replay on `events.subscribe` is accepted and ignored, with no client that needs it |
 | Delivery pipeline: queue, gate, paste, verify, submit, ACK; failures are queued states | `src/cyclops-proto/src/ledger.rs` for the machine, `src/cyclopsd/src/delivery.rs` for the pipeline |
@@ -474,11 +476,10 @@ modified without an explicit admin request).
 | v1 keepers: fail-closed ACL, data-only config, explicit pane adoption, identity from socket peer | `src/cyclopsd/src/identity.rs` (peer creds plus a pid-ancestry walk to a watched pane), `src/cyclopsd/src/registry.rs` |
 | tmux specifics confined to one adapter, CI against tmux HEAD | `src/cyclops-tmux`; advisory tmux-HEAD CI job. One invocation is outside it: `cyclopsd::probe_tmux` runs `tmux -V` and parses through the adapter, which the adapter's own header names as the exception |
 
-Two frozen decisions are not done, and this is where that is written down.
-The MCP front-door on the same daemon (option D absorbed) is a planned
-addition, not a dependency of anything shipped. The rollout is mid-flight:
-M0 was the shadow daemon, M1 added the write path, M2 prepared the v1 shim
-and its runbook, and installing it is admin's call (docs/development/CUTOVER.md).
+The MCP front-door on the same daemon (option D absorbed) is not built and
+is not a dependency of anything shipped. The v1 shim and its runbook remain
+available for an explicit migration; nothing installs them automatically
+(`docs/development/CUTOVER.md`).
 
 ### The validation amendments
 

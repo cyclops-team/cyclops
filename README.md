@@ -12,18 +12,25 @@ Everything below is built and tested.
 
 ## Install
 
-Needs tmux 3.2+ (developed on 3.6a) and a Rust toolchain.
+Needs tmux 3.2+, curl, Git, and a Rust toolchain. The public installer builds
+the current Rust implementation from source:
 
 ```bash
-git clone https://github.com/cyclops-team/cyclops.git && cd cyclops
-./scripts/install.sh
+curl -fsSL https://www.usecyclops.dev/install.sh | sh
 ```
 
 That builds both binaries, puts them where your shell looks, and writes
 the config and detection manifests. It prints every file it touches, backs
 up any shell profile it edits, and never uses sudo. `--prefix DIR` picks
 where the binaries go, `--no-path` leaves your profile alone, and
-`--uninstall` takes it all back off. More: [docs/install.md](docs/guides/install.md).
+`--uninstall` takes it all back off. To install a clone instead:
+
+```bash
+git clone https://github.com/cyclops-team/cyclops.git && cd cyclops
+./scripts/install.sh
+```
+
+More: [installation guide](docs/guides/install.md).
 
 Then one command, from anywhere:
 
@@ -33,10 +40,6 @@ cyclops start
 
 It starts the daemon too, so there is no second command and no tab to
 keep open.
-
-Building from source is how you run this implementation. The one-line
-installer on usecyclops.dev installs the previous shell implementation,
-which is a separate program sharing the name; see [Versions](#versions).
 
 ## Start here
 
@@ -129,7 +132,7 @@ $ cyclops status
 ```
 
 The closed eye means nothing needs you. `hooks unverified` means no hook has
-reported from that pane this run ([docs/hooks.md](docs/reference/hooks.md)). A name is
+reported from that pane this run ([hooks guide](docs/reference/hooks.md)). A name is
 an address, so give it one:
 
 ```
@@ -143,7 +146,7 @@ $ cyclops list
 
 Three columns: the name, how the agent is doing, what it is on. A named pane
 also says so on its own tmux border, and `cyclops name reviewer --clear`
-gives the border back. Details: [docs/panes.md](docs/guides/panes.md).
+gives the border back. Details: [pane guide](docs/guides/panes.md).
 
 ### 3. Any terminal agent
 
@@ -171,7 +174,7 @@ $ cyclops name %1 reviewer --manifest cluade
 no manifest "cluade"; loaded: agy, claude, codex, cursor, demo
 ```
 
-Writing one: [docs/MANIFESTS.md](docs/reference/MANIFESTS.md).
+Writing one: [manifest reference](docs/reference/MANIFESTS.md).
 
 ### 4. Layouts
 
@@ -216,7 +219,7 @@ $ cyclops start --workspace ops --session ops --preset ops
   cyclopsd won't watch "ops" until it's listed in ~/.cyclops/config.toml. Add it to sessions there, then restart cyclopsd.
 ```
 
-More: [docs/workspaces.md](docs/guides/workspaces.md).
+More: [workspace guide](docs/guides/workspaces.md).
 
 ### 5. Structured messages
 
@@ -283,11 +286,11 @@ $ cyclops send --subject nobody
 no recipient. Name one (cyclops send reviewer --subject "..."), or pass --to or --all.
 ```
 
-More: [docs/send.md](docs/guides/send.md), [docs/history.md](docs/guides/history.md),
-[docs/wait.md](docs/guides/wait.md). The two-agent review handoff, start to finish:
-[docs/QUICKSTART.md](docs/guides/QUICKSTART.md).
+More: [send guide](docs/guides/send.md), [history guide](docs/guides/history.md),
+and [wait guide](docs/guides/wait.md). The two-agent review handoff, start to
+finish: [quickstart](docs/guides/QUICKSTART.md).
 
-### 6. Pipe output, coming in M6
+### 6. Pipe output is not built
 
 `cyclops pipe <from> <to>` will take the tail of one agent's pane and deliver
 it to another as a normal message. It is not built:
@@ -296,7 +299,7 @@ it to another as a normal message. It is not built:
 $ cyclops pipe implementer reviewer
 error: unrecognized subcommand 'pipe'
 
-Usage: cyclops [OPTIONS] <COMMAND>
+Usage: cyclops [OPTIONS] [COMMAND]
 
 For more information, try '--help'.
 ```
@@ -323,28 +326,32 @@ $ jq -c 'select(.kind == "msg") | {ts, from, to, subject}' ~/.cyclops/ledger/mai
 ```
 
 The socket the CLI speaks is documented and open:
-[docs/PROTOCOL.md](docs/reference/PROTOCOL.md).
+[protocol reference](docs/reference/PROTOCOL.md).
 
 ## Watch it live
 
 `cyclops watch` turns the terminal into the stream: messages and state
 changes as they happen, calm by default, firehose one keypress away, the
-eye in the header. [docs/ui.md](docs/guides/ui.md).
+eye in the header. [stream UI guide](docs/guides/ui.md).
 
 Colors are semantic tokens, never raw values in code, so a theme file changes
 every surface at once, including the pane borders:
 
 ```
 $ cyclops theme
+  catppuccin     ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
 ▸ dark           ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  gruvbox        ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   high-contrast  ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   light          ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  nord           ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  tokyo-night    ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
 
   cyclops theme <name> to switch
 ```
 
-Every state pairs a glyph with a word, so `NO_COLOR` and `--plain` lose
-nothing. [docs/themes.md](docs/guides/themes.md).
+Every state glyph has one fixed meaning under every theme and remains visible
+under `NO_COLOR`; roomy surfaces pair it with a word. [theme guide](docs/guides/themes.md).
 
 Every demo in [`demos/`](demos/) runs the real binaries against an isolated
 tmux server and touches nothing of yours. `demos/m2-conversation.sh` is two
@@ -363,7 +370,7 @@ above.
 | `cyclops name <pane> <label>` | Name a pane so cyclops can address it; the pane's tmux border says so |
 | `cyclops list` | The roster: every named agent, how it is doing, what it is on |
 | `cyclops status` | Every watched pane with its fused state, and the eye |
-| `cyclops send <agent> --subject ...` | Deliver a message with a verified receipt (`--wait done` blocks until the turn it starts ends) |
+| `cyclops send <agent> --subject ...` | Deliver a message with an evidence-labeled receipt (`--wait done` blocks until the turn it starts ends) |
 | `cyclops wait <agent> --until idle\|done\|blocked` | Block until an agent is ready, finishes a turn, or needs a human |
 | `cyclops history --with <agent>` | The message record, newest last, with each delivery's current badge |
 | `cyclops thread <id>` | One message plus its replies and delivery record |
@@ -390,7 +397,7 @@ Every message and state change lands in a ledger that is only ever appended
 to, one JSON object per line, so you can `jq` it.
 
 The crate-by-crate map, the delivery state machine, and the gate order are in
-[docs/ARCHITECTURE.md](docs/development/ARCHITECTURE.md).
+[architecture guide](docs/development/ARCHITECTURE.md).
 
 ## Docs
 
@@ -445,10 +452,10 @@ daemon on tmux control mode, an append-only ledger, verified receipts.
 The previous implementation was a shell and Python toolkit built around
 `bin/commPact`. It still exists and still works: branch
 [`v1`](https://github.com/cyclops-team/cyclops/tree/v1), tag `v1-final`.
-It is a read-only reference now, and it is what the usecyclops.dev
-one-line installer currently fetches. Nothing here migrates your v1 state
-automatically; [docs/CUTOVER.md](docs/development/CUTOVER.md) is the runbook when you
-choose to move.
+It is a read-only reference now. The usecyclops.dev installer follows this
+tree's current `main` branch and installs the Rust implementation. Nothing
+automatically migrates v1 state; [the cutover runbook](docs/development/CUTOVER.md)
+is available if you still use the previous implementation.
 
 ## License
 

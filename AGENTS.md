@@ -1,7 +1,7 @@
 # AGENTS.md
 
 Orientation for AI coding agents working on this repo. The human-written map
-is [docs/HANDOFF.md](docs/development/HANDOFF.md) — read it before any non-trivial
+is [docs/development/HANDOFF.md](docs/development/HANDOFF.md) — read it before any non-trivial
 change; this page is the condensed agent view plus the gates that are easy
 to trip.
 
@@ -27,12 +27,12 @@ fact to an NDJSON ledger. A generated knowledge base with diagrams lives at
 | `tests/testrig` | Test-only isolated tmux server | The only way tests may touch tmux |
 | `resources/manifests/`, `resources/themes/`, `resources/layouts/`, `resources/hooks/` | Data, not code paths | `resources/manifests/` and `resources/layouts/` are compiled into the CLI with include_str and seeded to the user home on first run |
 | `demos/` | Runnable end-to-end scripts on throwaway tmux servers | `tests/e2e/parity-check.sh` is a CI gate, not a demo |
-| `website/` | SvelteKit landing page for usecyclops.dev | Outside the Cargo workspace, ignored by CI, **read-only** — never modify without an explicit request |
+| `website/` | SvelteKit landing page for usecyclops.dev | Outside the Cargo workspace; modify only on explicit request. CI checks it and requires its installer to match `scripts/install.sh` |
 | `findings.md` | Measured facts (F13+), each with its probe | Docs and comments cite these F-numbers |
 
 ## The gates a change must pass
 
-Same four CI runs, in order (full detail: [docs/CONTRIBUTING.md](CONTRIBUTING.md)):
+Same five core checks, in order (full detail: [CONTRIBUTING.md](CONTRIBUTING.md)):
 
 ```bash
 cargo fmt --all
@@ -44,7 +44,9 @@ python3 scripts/check-doc-paths.py
 
 - `--no-fail-fast` is not optional: cargo stops at the first failing test
   *binary* and hides everything after it (F24).
-- Touching `scripts/install.sh` adds `./tests/e2e/parity-check.sh --with-installer`.
+- Touching either installer requires keeping `scripts/install.sh` and
+  `website/static/install.sh` byte-for-byte identical, then running
+  `./tests/e2e/parity-check.sh --with-installer`.
 - CI also reruns the whole suite with `CYCLOPS_TEST_TMP` relocated, runs the
   v1 shim tests (`scripts/commpact-shim/test_shim.py`), and has an advisory
   job against tmux built from master.
@@ -75,19 +77,19 @@ python3 scripts/check-doc-paths.py
    on the pane border only.
 7. **A behavior fix needs a test that fails before it**, and docs ship in
    the same commit as the behavior.
-8. **[docs/STYLE.md](docs/development/STYLE.md) is binding** on code, comments, and
+8. **[docs/development/STYLE.md](docs/development/STYLE.md) is binding** on code, comments, and
    docs. Write for a tired engineer who has never seen this repo.
 9. **Record what you measured.** A learned fact about tmux, a vendor CLI, or
    a platform goes in `findings.md` with the probe that proved it.
 10. **Before touching delivery, the ledger, or anything that renders**, read
-    [docs/INVARIANTS.md](docs/development/INVARIANTS.md). The delivery spec is
-    [docs/DELIVERY.md](docs/development/DELIVERY.md); the legal transitions are
+    [docs/development/INVARIANTS.md](docs/development/INVARIANTS.md). The delivery spec is
+    [docs/development/DELIVERY.md](docs/development/DELIVERY.md); the legal transitions are
     `DeliveryState::can_transition_to` in
     `src/cyclops-proto/src/ledger.rs`.
 
 ## Fast navigation
 
-- How a message becomes a verified receipt: [docs/DELIVERY.md](docs/development/DELIVERY.md),
+- How a message becomes a verified receipt: [docs/development/DELIVERY.md](docs/development/DELIVERY.md),
   then `src/cyclopsd/src/delivery.rs` in call order
   (`msg_send` → `worker_loop` → `process` → `gate` → `attempt_delivery`).
 - What state a pane is in and why: `src/cyclopsd/src/fusion.rs`;
@@ -96,9 +98,9 @@ python3 scripts/check-doc-paths.py
   `src/cyclops-proto/src/attention.rs` — never recompute it elsewhere.
 - Debugging a stuck delivery: the ledger is the debugger; every gate
   decision is a line with a cause. See the cause table in
-  [docs/HANDOFF.md](docs/development/HANDOFF.md).
+  [docs/development/HANDOFF.md](docs/development/HANDOFF.md).
 - Adding an agent CLI: one TOML file, no code —
-  [docs/MANIFESTS.md](docs/reference/MANIFESTS.md), fixtures in
+  [docs/reference/MANIFESTS.md](docs/reference/MANIFESTS.md), fixtures in
   `src/cyclops-manifest/tests/fixtures/`.
 - What is built vs. planned: [STATUS.md](STATUS.md). Two non-bugs to know:
   a quota park has no re-queue verb (by design), and `cyclops start` cannot
@@ -118,7 +120,7 @@ Cloud VMs start with Rust 1.83 pinned as `rustup` default; this tree's
 "feature `edition2024` is required", re-run `rustup default stable`.
 
 Standard lint/test/build/run commands are in this file and
-[docs/CONTRIBUTING.md](CONTRIBUTING.md) — follow those. Non-obvious
+[CONTRIBUTING.md](CONTRIBUTING.md) — follow those. Non-obvious
 caveats for this environment:
 
 - **Run `cargo test` from a plain shell, not inside tmux.** The e2e tests
@@ -138,6 +140,5 @@ caveats for this environment:
   detectable pane, run `./demos/m1-send.sh` (isolated tmux server +
   throwaway home). A live `cyclops start` pane reads `? unknown` unless
   a shipped manifest matches the program in it.
-- `website/` is read-only branding (see above). `npm run dev` from
-  `website/` serves it on port 5173 if you need to look; do not modify
-  it without an explicit request.
+- `website/` serves on port 5173 with `npm run dev`. Modify it only on an
+  explicit request; when you do, run `npm run check` and `npm run build`.

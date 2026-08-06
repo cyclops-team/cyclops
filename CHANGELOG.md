@@ -73,7 +73,7 @@ versions are unreleased until admin cuts a tag.
   pipe. Every output block is real, captured from one parity run, with the
   home directory shortened to `~/.cyclops` and color off. The crate table
   moved out to ARCHITECTURE.md rather than being kept in two places.
-- docs/QUICKSTART.md: the two-agent review gate end to end. Open a `duo`
+- docs/guides/QUICKSTART.md: the two-agent review gate end to end. Open a `duo`
   workspace, name the panes, wire the hooks, hand work from the
   implementer to the reviewer with the sender resolved from the pane
   rather than from the request, chain the reply, read the thread back, and
@@ -84,7 +84,7 @@ versions are unreleased until admin cuts a tag.
   vendor quirks (`argv_basenames` for installs whose binary reports a
   version string, `line_regex_esc` for state that only the color codes
   distinguish).
-- docs/PROTOCOL.md: the socket, with request and response lines captured
+- docs/reference/PROTOCOL.md: the socket, with request and response lines captured
   from a running daemon. Every method, the error codes, the ledger shape
   underneath, and the two rules a script writer trips over first: keys
   come out alphabetically, and `agent.state.report` is refused from
@@ -213,7 +213,7 @@ versions are unreleased until admin cuts a tag.
   words, moved down out of `cyclops-ui::grid` (which re-exports it) so the
   daemon can write the same cell onto a border without linking a terminal
   UI. Two spellings of one state was the alternative.
-- docs/panes.md, with real output from a real run. README, install,
+- docs/guides/panes.md, with real output from a real run. README, install,
   themes and ARCHITECTURE updated in the same change.
 
 ### Not built, and why (M4 pane chrome)
@@ -271,7 +271,7 @@ versions are unreleased until admin cuts a tag.
   with the stream docked underneath). Each is the one before it plus a
   pane, and the names carry over. The `ops` dock is full width and 30% of
   the height for reasons written down in the preset and in
-  docs/workspaces.md: the stream does not wrap and its widest routine line
+  docs/guides/workspaces.md: the stream does not wrap and its widest routine line
   is 59 columns, and 30% of a 48-line terminal leaves the dock a header
   plus a dozen entries while each agent keeps 33 lines.
 - `cyclops_tmux::layout`: the declarative tree, `capture` off a live
@@ -293,7 +293,7 @@ versions are unreleased until admin cuts a tag.
   had built seconds earlier. A row is now a row because its panes share a
   height and span the same columns, and shares are handed out over the
   cells the panes hold.
-- docs/workspaces.md, and the workspace verbs in the README table and
+- docs/guides/workspaces.md, and the workspace verbs in the README table and
   install page.
 
 ### Added (M4 integration: the two halves, proven together)
@@ -404,7 +404,7 @@ versions are unreleased until admin cuts a tag.
   `cyclops ui --plain` against a canned daemon over a scratch socket with
   a fixture ledger (calm admin stream, firehose, filter, dedupe, honest
   endings).
-- Docs: docs/ui.md; README ui row and crate row; ARCHITECTURE crate map
+- Docs: docs/guides/ui.md; README ui row and crate row; ARCHITECTURE crate map
   and zero-polling notes updated to the shipped M3 client.
 
 ### Added (M3: theme engine)
@@ -462,8 +462,9 @@ versions are unreleased until admin cuts a tag.
   (the three themes load with zero warnings and cover every token, role
   fallbacks stay pairwise distinct, non-role fallbacks match the
   documented derivation, high-contrast is grid-exact throughout, and
-  docs/themes.md's token table is pinned to the vocabulary).
-- Docs: docs/themes.md; install.md theme key; ARCHITECTURE.md crate map.
+  docs/guides/themes.md's token table is pinned to the vocabulary).
+- Docs: docs/guides/themes.md; docs/guides/install.md theme key;
+  docs/development/ARCHITECTURE.md crate map.
 
 ### Added (M3: integration)
 
@@ -510,7 +511,7 @@ versions are unreleased until admin cuts a tag.
   history --with reconstructs the conversation, including the
   one-fact-N-badges broadcast read, me-resolution over the socket,
   gapless cursor walk, thread chain order, and a reboot replay.
-- Docs: docs/history.md; README history/thread rows.
+- Docs: docs/guides/history.md; README history/thread rows.
 
 ### Added (M2: agent.wait, server-owned, plus send-and-wait)
 
@@ -540,7 +541,7 @@ versions are unreleased until admin cuts a tag.
   mode including both done edges, timeout data, kill-pane occupant
   pinning, and a send --wait done round trip; 6 CLI e2e tests for badges,
   copy, exit codes, --json error objects, and the --wait passthrough.
-- Docs: docs/wait.md; send.md --wait section; README wait row.
+- Docs: docs/guides/wait.md; docs/guides/send.md --wait section; README wait row.
 
 ### Added (M2: hooks install + startup self-test, amendment c)
 
@@ -588,7 +589,7 @@ versions are unreleased until admin cuts a tag.
   commPact.v1.bak (the backup IS the original), symlinks the shim, prints
   rollback, refuses on existing backups or foreign symlinks. Nothing in
   the repo executes it.
-- docs/CUTOVER.md: the runbook: verb map, honest differences,
+- docs/development/CUTOVER.md: the runbook: verb map, honest differences,
   preconditions, admin-only install steps, parallel window, verification
   checklist over the COORDINATION.md messaging patterns, and rollback;
   ends in ADMIN_ACTION_REQUIRED.
@@ -616,7 +617,7 @@ versions are unreleased until admin cuts a tag.
 
 ### Added (M1: delivery pipeline)
 
-- cyclopsd delivery core per docs/DELIVERY.md: per-recipient FIFO workers,
+- cyclopsd delivery core per docs/development/DELIVERY.md: per-recipient FIFO workers,
   spec-order gate (no_such_pane, pane_dead, pane_in_mode, quota park-all,
   manifest modal decline or hold+notify, working/idle_with_input hold, idle
   proceeds with a forced recompute before pasting), unique cyc-<pid>-<seq>
@@ -698,7 +699,7 @@ versions are unreleased until admin cuts a tag.
   (F14 discipline: a harness server could load the user's tmux config and
   sanitize control replies), and its dismiss_modal sent 2 to the codex
   update dialog whose measured decline is 3 (Skip until next version,
-  F3). Both ported from tests/m1_soak.py; test_vocab.py locks the codex
+  F3). Both ported from tests/e2e/m1_soak.py; tests/e2e/test_vocab.py locks the codex
   decline.
 - Detach-blind ACKs (the soak's duplicate delivery): ACK deadlines now
   freeze while a session's control connection is down and extend by the
@@ -795,7 +796,8 @@ versions are unreleased until admin cuts a tag.
 - cyclops-ledger: crash-safe append-only writer (fsync, torn-tail sealing,
   monotonic seq across restarts) and cursor replay reader.
 - Python probe harness ported from the validation campaign; demos/m0-status.sh
-  end-to-end demo; docs/ARCHITECTURE.md, docs/DELIVERY.md, docs/GOALS.md.
+  end-to-end demo; docs/development/ARCHITECTURE.md,
+  docs/development/DELIVERY.md, docs/development/GOALS.md.
 - Milestone workflow queue (.claude/workflows/m1..m6) with preflight gates.
 - findings.md F13-F18 (subscription probe, tmux -u locale sanitization,
   %extended-output switch, %begin flags correlation, bracketed-paste
@@ -809,4 +811,4 @@ versions are unreleased until admin cuts a tag.
 - Shipped detection manifests for Claude Code, Codex CLI, and Antigravity
   CLI, seeded from the 2026-08-01 validation campaign.
 - CI: fmt, clippy, tests on ubuntu/macos, advisory tmux-HEAD job.
-- docs/GOALS.md: the admin-set quality bar.
+- docs/development/GOALS.md: the admin-set quality bar.

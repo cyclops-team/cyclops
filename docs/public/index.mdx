@@ -1,38 +1,48 @@
 ---
 title: "Cyclops documentation"
-description: "Install, learn, and use Cyclops."
+description: "Install Cyclops, open a workspace, and coordinate terminal coding agents."
 ---
 
-Cyclops coordinates terminal coding agents that are already running inside tmux. Attach to existing sessions, orchestrate multiple agents in parallel, and keep your workflow in the terminal.
+Cyclops coordinates coding agents already running in tmux. It gives panes
+stable names, delivers structured messages with receipts, shows live state,
+and keeps an append-only record of every handoff.
 
 ## Get started
 
 <CardGroup cols={2}>
   <Card title="Introduction" icon="book-open" href="/introduction">
-    Learn what Cyclops is and how it fits into your workflow.
+    Learn what Cyclops does and what remains in tmux.
   </Card>
 
   <Card title="Installation" icon="download" href="/installation">
-    Install the Cyclops CLI on macOS and Linux.
+    Build and install the current Rust implementation.
   </Card>
 
   <Card title="Quickstart" icon="rocket" href="/quickstart">
-    Attach Cyclops to your first tmux session in minutes.
+    Open a workspace and send your first message.
   </Card>
 
   <Card title="CLI reference" icon="terminal" href="/reference/cli">
-    Browse every command and flag.
+    Browse the current commands and common flags.
   </Card>
 </CardGroup>
 
 ## Explore
 
 <CardGroup cols={2}>
-  <Card title="Attach to tmux" icon="link" href="/guides/attach-tmux">
-    Connect Cyclops to running tmux windows and panes.
+  <Card title="Tmux sessions" icon="link" href="/guides/attach-tmux">
+    Choose which sessions Cyclops watches and names.
   </Card>
 
   <Card title="Coordinate agents" icon="users" href="/guides/coordinate-agents">
-    Route work across multiple coding agents at once.
+    Send, broadcast, wait, review history, and watch live events.
+  </Card>
+
+  <Card title="Workspaces" icon="layout" href="/guides/sessions">
+    Save and restore pane layouts, names, and working directories.
+  </Card>
+
+  <Card title="Configuration" icon="settings" href="/reference/configuration">
+    Configure sessions, themes, chrome, and runtime paths.
   </Card>
 </CardGroup>

@@ -1,161 +1,434 @@
 #!/bin/sh
-# Cyclops bootstrap installer.
 #
+# Cyclops installer. Builds both binaries, puts them somewhere your shell
+# looks, and sets up the home directory. One command, then `cyclops start`.
+#
+#   ./scripts/install.sh              from a clone
 #   curl -fsSL https://www.usecyclops.dev/install.sh | sh
+#   ./scripts/install.sh --uninstall  take it back off
 #
-# This script only fetches the release source and hands it to the release's
-# own bin/commPact-install, which is what actually populates the install
-# home. That installer never touches the network, never uses sudo, and never
-# edits shell startup files or tmux.conf — this script preserves that by
-# doing the one network fetch itself and nothing else privileged.
+# Flags:
+#   --prefix DIR   install the binaries here instead of picking a directory
+#   --no-path      never edit a shell profile; print the line to add instead
+#   --uninstall    remove the binaries and the profile block, keep ~/.cyclops
+#   --help
 #
-# Environment overrides:
-#   CYCLOPS_REF          branch, tag, or full commit SHA to install (default: v1-final)
-#   CYCLOPS_HOME          install destination (default: $HOME/.commPact)
-#   CYCLOPS_BIN_DIR        where the `cyclops` command is linked (default: $HOME/.local/bin)
-#   CYCLOPS_SOURCE_DIR    use this local directory instead of downloading (offline/dev use)
+# What it will and will not do: it never uses sudo, never touches your
+# tmux config, and never edits a shell profile without printing the exact
+# lines and where the backup went. Everything it writes is under your home.
+#
+# POSIX sh on purpose. It runs before cyclops exists on the machine, so it
+# cannot assume anything more than the system shell.
+
 set -eu
 
-REPO_OWNER="cyclops-team"
-REPO_NAME="cyclops"
-# Pinned to the v1 release tag, not to a branch. main becomes the Rust
-# rewrite, which has no bin/commPact-install, so a main-tracking default
-# would break this installer for every visitor the moment that lands.
-REF="${CYCLOPS_REF:-v1-final}"
-CYCLOPS_HOME="${CYCLOPS_HOME:-$HOME/.commPact}"
-BIN_DIR="${CYCLOPS_BIN_DIR:-$HOME/.local/bin}"
-# A relative CYCLOPS_HOME works fine for install_release() (every op below
-# runs from the same CWD), but ln -s writes it into the symlink verbatim --
-# and a relative symlink target is resolved against the symlink's own
-# directory ($BIN_DIR) at dereference time, not this script's CWD. Absolute
-# it here so the linked `cyclops` command doesn't dangle.
-case "$CYCLOPS_HOME" in
-  /*) : ;;
-  *) CYCLOPS_HOME="$PWD/$CYCLOPS_HOME" ;;
-esac
-# Written into every tree bin/commPact-install produces. Used below to tell
-# a symlink cyclops itself manages apart from an unrelated one that happens
-# to already occupy $BIN_DIR/cyclops.
-MANAGED_MARKER=".commPact-installed"
+REPO_URL="${CYCLOPS_REPO:-https://github.com/cyclops-team/cyclops.git}"
+REF="${CYCLOPS_REF:-main}"
 
-say() { printf 'cyclops: %s\n' "$1"; }
-err() { printf 'cyclops: %s\n' "$1" >&2; exit 1; }
-need_cmd() { command -v "$1" >/dev/null 2>&1; }
+# The block this script owns inside a shell profile. Matched literally on
+# both install and uninstall, which is what makes a second run a no-op
+# instead of a second copy.
+MARK_START="# >>> cyclops >>>"
+MARK_END="# <<< cyclops <<<"
 
-[ -n "${HOME:-}" ] || err "HOME must be set"
+PREFIX=""
+NO_PATH=0
+UNINSTALL=0
 
-work_dir="$(mktemp -d "${TMPDIR:-/tmp}/cyclops-install.XXXXXX")"
-cleanup() { rm -rf "$work_dir"; }
-trap cleanup EXIT INT TERM
+# ---------------------------------------------------------------------------
+# output
+# ---------------------------------------------------------------------------
 
-fetch_source() {
-  src_dir="$work_dir/src"
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    DIM=$(printf '\033[2m') ; BOLD=$(printf '\033[1m') ; OFF=$(printf '\033[0m')
+else
+    DIM="" ; BOLD="" ; OFF=""
+fi
 
-  if [ -n "${CYCLOPS_SOURCE_DIR:-}" ]; then
-    say "using local source: $CYCLOPS_SOURCE_DIR"
-    cp -R "$CYCLOPS_SOURCE_DIR" "$src_dir"
-    return
-  fi
+say()  { printf '%s\n' "$*"; }
+note() { printf '  %s%s%s\n' "$DIM" "$*" "$OFF"; }
+step() { printf '\n%s==%s %s\n' "$DIM" "$OFF" "$*"; }
 
-  if need_cmd git; then
-    say "fetching $REPO_OWNER/$REPO_NAME@$REF (git)"
-    # Not `git clone --branch`: that flag only resolves branch and tag
-    # names, so a full commit SHA (documented as a valid CYCLOPS_REF) would
-    # fail with "Remote branch ... not found". init+fetch+checkout resolves
-    # branches, tags, and (for public GitHub repos) full commit SHAs alike.
-    mkdir -p "$src_dir"
-    git -C "$src_dir" init --quiet \
-      && git -C "$src_dir" fetch --quiet --depth 1 \
-        "https://github.com/$REPO_OWNER/$REPO_NAME.git" "$REF" \
-      && git -C "$src_dir" checkout --quiet FETCH_HEAD \
-      || err "git fetch failed; check your network connection and that ref '$REF' exists"
-    return
-  fi
-
-  # Deliberately not refs/heads/$REF.tar.gz: that 404s for tags, and
-  # CYCLOPS_REF is documented to accept either. GitHub's bare-ref archive
-  # path resolves branches, tags, and full commit SHAs alike.
-  archive_url="https://github.com/$REPO_OWNER/$REPO_NAME/archive/$REF.tar.gz"
-  say "fetching $REPO_OWNER/$REPO_NAME@$REF (tarball)"
-  if need_cmd curl; then
-    curl -fsSL "$archive_url" -o "$work_dir/src.tar.gz" || err "download failed: $archive_url"
-  elif need_cmd wget; then
-    wget -q -O "$work_dir/src.tar.gz" "$archive_url" || err "download failed: $archive_url"
-  else
-    err "installing cyclops requires git, curl, or wget"
-  fi
-  mkdir -p "$src_dir"
-  tar -xzf "$work_dir/src.tar.gz" -C "$src_dir" --strip-components=1 \
-    || err "could not extract downloaded archive"
+# Failures print what went wrong and the one command that fixes it. An
+# installer that says "failed" and stops is where a first run dies.
+die() {
+    printf '\n%sinstall failed:%s %s\n' "$BOLD" "$OFF" "$1" >&2
+    [ $# -gt 1 ] && printf '  %s\n' "$2" >&2
+    exit 1
 }
 
-install_release() {
-  installer="$src_dir/bin/commPact-install"
-  [ -x "$installer" ] || err "downloaded release is missing bin/commPact-install"
-  if [ -e "$CYCLOPS_HOME" ]; then
-    say "updating existing install at $CYCLOPS_HOME"
-    "$installer" update --destination "$CYCLOPS_HOME"
-  else
-    say "installing to $CYCLOPS_HOME"
-    "$installer" install --destination "$CYCLOPS_HOME"
-  fi
+have() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+    say "Cyclops installer. Builds cyclops and cyclopsd from source."
+    say ""
+    say "Usage:"
+    say "  curl -fsSL https://www.usecyclops.dev/install.sh | sh"
+    say "  ./scripts/install.sh [OPTIONS]"
+    say ""
+    say "Options:"
+    say "  --prefix DIR   install the binaries in DIR"
+    say "  --no-path      do not edit a shell profile"
+    say "  --uninstall    remove binaries and the installer-owned PATH block"
+    say "  --help         show this help"
+    exit 0
 }
 
-link_command() {
-  [ -x "$CYCLOPS_HOME/bin/cyclops" ] || err "install completed but bin/cyclops is missing"
-  mkdir -p "$BIN_DIR"
+# ---------------------------------------------------------------------------
+# arguments
+# ---------------------------------------------------------------------------
 
-  target="$BIN_DIR/cyclops"
-  # -e alone misses a dangling symlink (it follows the link and reports
-  # false), so also check -L before concluding nothing is there.
-  if [ -e "$target" ] || [ -L "$target" ]; then
-    if [ ! -L "$target" ]; then
-      err "$target already exists and isn't a symlink cyclops manages; move it aside (or set CYCLOPS_BIN_DIR to a different directory) and re-run"
-    fi
-    need_cmd readlink || err "cyclops needs readlink to safely check the existing $target symlink"
-    link_dest="$(readlink "$target")"
-    case "$link_dest" in
-      /*) : ;;
-      *) link_dest="$BIN_DIR/$link_dest" ;;
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --prefix)    [ $# -ge 2 ] || die "--prefix needs a directory"; PREFIX="$2"; shift 2 ;;
+        --prefix=*)  PREFIX="${1#--prefix=}"; shift ;;
+        --no-path)   NO_PATH=1; shift ;;
+        --uninstall) UNINSTALL=1; shift ;;
+        -h|--help)   usage ;;
+        *)           die "unknown option: $1" "rerun the installer with --help to list its options" ;;
     esac
-    link_home="$(dirname "$(dirname "$link_dest")")"
-    if [ ! -f "$link_home/$MANAGED_MARKER" ]; then
-      err "$target is a symlink cyclops doesn't manage (-> $link_dest); move it aside (or set CYCLOPS_BIN_DIR to a different directory) and re-run"
+done
+
+# ---------------------------------------------------------------------------
+# where things go
+# ---------------------------------------------------------------------------
+
+on_path() {
+    case ":${PATH}:" in
+        *":$1:"*) return 0 ;;
+    esac
+    return 1
+}
+
+# Pick a bin directory, preferring one your shell already searches. A
+# directory already on PATH means no profile edit at all, which is the
+# quietest install there is.
+pick_prefix() {
+    for d in "$HOME/.local/bin" "$HOME/bin" "$HOME/.cargo/bin"; do
+        if on_path "$d"; then
+            printf '%s\n' "$d"
+            return
+        fi
+    done
+    # Nothing on PATH to use. ~/.local/bin is the conventional answer and
+    # gets one profile line below.
+    printf '%s\n' "$HOME/.local/bin"
+}
+
+# The file that sets PATH for new shells of whatever the operator runs.
+# Empty means an unrecognized shell, and then this script prints the line
+# rather than guessing at a file.
+profile_for_shell() {
+    case "$(basename "${SHELL:-}")" in
+        zsh)  printf '%s\n' "${ZDOTDIR:-$HOME}/.zshrc" ;;
+        bash)
+            # macOS Terminal starts login shells, which read .bash_profile
+            # and not .bashrc. Prefer whichever is already there.
+            if [ -f "$HOME/.bash_profile" ]; then
+                printf '%s\n' "$HOME/.bash_profile"
+            else
+                printf '%s\n' "$HOME/.bashrc"
+            fi
+            ;;
+        fish) printf '%s\n' "$HOME/.config/fish/config.fish" ;;
+        *)    printf '\n' ;;
+    esac
+}
+
+# The PATH line, in the syntax of the shell whose profile it lands in.
+path_line() {
+    case "$(basename "${SHELL:-}")" in
+        fish) printf 'fish_add_path %s\n' "$1" ;;
+        *)    printf 'export PATH="%s:$PATH"\n' "$1" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# uninstall
+# ---------------------------------------------------------------------------
+
+# Take the marked block back out of a profile, byte for byte. Backs the
+# file up first and prints where, because this edits a file the operator
+# owns and did not write.
+strip_block() {
+    profile="$1"
+    [ -f "$profile" ] || return 0
+    grep -Fq "$MARK_START" "$profile" || return 0
+
+    backup="$profile.cyclops-backup.$(date +%Y%m%d%H%M%S)"
+    cp -p "$profile" "$backup"
+    # Buffered so the blank line the install wrote above the block goes
+    # with it. Unbuffered, an install/uninstall cycle leaves one behind
+    # every time.
+    tmp="$profile.cyclops-tmp.$$"
+    awk -v s="$MARK_START" -v e="$MARK_END" '
+        $0 == s { if (n > 0 && out[n] == "") n--; skip = 1; next }
+        $0 == e { skip = 0; next }
+        !skip   { out[++n] = $0 }
+        END     { for (i = 1; i <= n; i++) print out[i] }
+    ' "$profile" > "$tmp"
+    mv -f "$tmp" "$profile"
+    note "removed the cyclops block from $profile"
+    note "the file as it was: $backup"
+}
+
+do_uninstall() {
+    step "removing cyclops"
+    removed=0
+    for name in cyclops cyclopsd; do
+        # An explicit --prefix wins; otherwise take whatever the shell
+        # actually resolves, which is the copy that has been running.
+        if [ -n "$PREFIX" ]; then
+            bin="$PREFIX/$name"
+        else
+            bin="$(command -v "$name" 2>/dev/null || true)"
+        fi
+        if [ -n "$bin" ] && [ -f "$bin" ]; then
+            rm -f "$bin"
+            note "removed $bin"
+            removed=$((removed + 1))
+        fi
+    done
+    [ "$removed" -eq 0 ] && note "no cyclops binaries found on PATH"
+
+    strip_block "$(profile_for_shell)"
+
+    say ""
+    say "${BOLD}✔ cyclops is uninstalled${OFF}"
+    note "your record and config are untouched at ${CYCLOPS_HOME:-$HOME/.cyclops}"
+    note "remove those too with: rm -rf ${CYCLOPS_HOME:-$HOME/.cyclops}"
+    exit 0
+}
+
+[ "$UNINSTALL" -eq 1 ] && do_uninstall
+
+# ---------------------------------------------------------------------------
+# 1. requirements
+# ---------------------------------------------------------------------------
+
+step "checking requirements"
+
+# tmux is not optional and not a runtime detail: every pane cyclops watches
+# is a tmux pane. Missing or too old is a dead end later, so it stops here
+# with the command that fixes it.
+if ! have tmux; then
+    if [ "$(uname -s)" = "Darwin" ]; then
+        die "tmux is not installed" "brew install tmux"
     fi
-  fi
-  rm -f "$target"
+    die "tmux is not installed" "sudo apt install tmux   (or your package manager's equivalent)"
+fi
+tmux_version="$(tmux -V 2>/dev/null | awk '{print $2}')"
+tmux_major="$(printf '%s' "$tmux_version" | sed 's/[^0-9.].*//' | cut -d. -f1)"
+tmux_minor="$(printf '%s' "$tmux_version" | sed 's/[^0-9.].*//' | cut -d. -f2)"
+if [ -n "$tmux_major" ] && [ "$tmux_major" -lt 3 ] 2>/dev/null; then
+    die "tmux $tmux_version is too old; cyclops needs 3.2 or newer" "upgrade tmux, then run this again"
+elif [ "$tmux_major" = "3" ] && [ -n "$tmux_minor" ] && [ "$tmux_minor" -lt 2 ] 2>/dev/null; then
+    die "tmux $tmux_version is too old; cyclops needs 3.2 or newer" "upgrade tmux, then run this again"
+fi
+note "tmux $tmux_version"
 
-  # A copy here (rather than a symlink) would break: bin/cyclops finds its
-  # sibling commPact-* commands next to its real location, and a bare copy
-  # in $BIN_DIR wouldn't have them. Fail clearly instead of shipping a
-  # broken CLI on filesystems that don't support symlinks.
-  ln -s "$CYCLOPS_HOME/bin/cyclops" "$target" \
-    || err "could not create $target -> $CYCLOPS_HOME/bin/cyclops (symlinks unsupported here?); add $CYCLOPS_HOME/bin to your PATH instead"
-}
+if ! have cargo; then
+    die "cargo is not installed; cyclops builds from source" \
+        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+fi
+note "cargo $(cargo --version 2>/dev/null | awk '{print $2}')"
 
-path_has() {
-  case ":$PATH:" in
-    *":$1:"*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
+# ---------------------------------------------------------------------------
+# 2. the source
+# ---------------------------------------------------------------------------
 
-main() {
-  fetch_source
-  install_release
-  link_command
+# Run from a clone, build that clone. Piped from the network with no clone
+# around it, fetch one. Both end with SRC pointing at a workspace root.
+SRC=""
+case "$0" in
+    */install.sh)
+        candidate="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+        [ -f "$candidate/Cargo.toml" ] && SRC="$candidate"
+        ;;
+esac
 
-  say "installed: $BIN_DIR/cyclops"
-  if path_has "$BIN_DIR"; then
-    say "run: cyclops"
-  else
+CLONED=""
+if [ -z "$SRC" ]; then
+    have git || die "git is not installed, and there is no clone to build from" \
+        "install git, or clone the repo and run ./scripts/install.sh inside it"
+    step "fetching the source"
+    CLONED="$(mktemp -d "${TMPDIR:-/tmp}/cyclops-install.XXXXXX")"
+    trap 'rm -rf "$CLONED"' EXIT INT TERM
+    git clone --depth 1 --branch "$REF" "$REPO_URL" "$CLONED/cyclops" >/dev/null 2>&1 ||
+        die "could not clone $REPO_URL at $REF" "check the network, or set CYCLOPS_REF to a branch that exists"
+    SRC="$CLONED/cyclops"
+    note "$REPO_URL at $REF"
+else
+    note "building the clone at $SRC"
+fi
+
+if [ -n "$CLONED" ]; then
+    UNINSTALL_HINT='curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall'
+else
+    UNINSTALL_HINT='./scripts/install.sh --uninstall'
+fi
+
+# ---------------------------------------------------------------------------
+# 3. build
+# ---------------------------------------------------------------------------
+
+step "building cyclops and cyclopsd"
+say "${DIM}  a first build takes a few minutes${OFF}"
+( cd "$SRC" && cargo build --release ) || die "the build failed" "the cargo output above says why"
+
+TARGET="${CARGO_TARGET_DIR:-$SRC/target}/release"
+for name in cyclops cyclopsd; do
+    [ -x "$TARGET/$name" ] || die "the build finished but $TARGET/$name is missing"
+done
+
+# ---------------------------------------------------------------------------
+# 4. install the binaries
+# ---------------------------------------------------------------------------
+
+[ -n "$PREFIX" ] || PREFIX="$(pick_prefix)"
+step "installing to $PREFIX"
+
+mkdir -p "$PREFIX" 2>/dev/null ||
+    die "cannot create $PREFIX" "pick a directory you own: ./scripts/install.sh --prefix ~/.local/bin"
+[ -w "$PREFIX" ] ||
+    die "$PREFIX is not writable, and this installer never uses sudo" \
+        "pick a directory you own: ./scripts/install.sh --prefix ~/.local/bin"
+
+for name in cyclops cyclopsd; do
+    # Copy beside the target and rename over it. Overwriting a running
+    # binary in place fails with "text file busy"; a rename never does.
+    cp "$TARGET/$name" "$PREFIX/$name.new"
+    chmod +x "$PREFIX/$name.new"
+    mv -f "$PREFIX/$name.new" "$PREFIX/$name"
+    note "$PREFIX/$name"
+done
+
+# ---------------------------------------------------------------------------
+# 5. PATH
+# ---------------------------------------------------------------------------
+
+# Three outcomes, and the last step of this script differs for each:
+#
+#   ok      this shell already finds $PREFIX; there is nothing to do
+#   reload  the profile has the PATH line, this shell predates it
+#   manual  nothing was edited, and the operator has a line to add
+#
+# "reload" covers a second run as well as a first: the block being there
+# already says nothing about whether the shell running this has read it.
+PATH_STATE=ok
+PROFILE=""
+
+if on_path "$PREFIX"; then
+    note "$PREFIX is already on your PATH"
+elif [ "$NO_PATH" -eq 1 ]; then
+    PATH_STATE=manual
     say ""
-    say "$BIN_DIR is not on your PATH. Add it, then start a new shell:"
+    say "  $PREFIX is not on your PATH, and --no-path means this is yours to add:"
     say ""
-    say "  export PATH=\"$BIN_DIR:\$PATH\""
-    say ""
-    say "then run: cyclops"
-  fi
-}
+    say "    $(path_line "$PREFIX")"
+else
+    PROFILE="$(profile_for_shell)"
+    if [ -z "$PROFILE" ]; then
+        # An unrecognized shell gets the line and no edit. Guessing at a
+        # file for a shell this script does not know is how a profile
+        # ends up with a line that never runs.
+        PATH_STATE=manual
+        say ""
+        say "  cyclops does not know ${SHELL:-your shell}, so add this yourself:"
+        say ""
+        say "    $(path_line "$PREFIX")"
+    elif [ -f "$PROFILE" ] && grep -Fq "$MARK_START" "$PROFILE"; then
+        PATH_STATE=reload
+        note "$PROFILE already has the cyclops block"
+    else
+        step "adding $PREFIX to your PATH"
+        mkdir -p "$(dirname "$PROFILE")"
+        if [ -f "$PROFILE" ]; then
+            backup="$PROFILE.cyclops-backup.$(date +%Y%m%d%H%M%S)"
+            cp -p "$PROFILE" "$backup"
+        else
+            backup=""
+            : > "$PROFILE"
+        fi
+        {
+            printf '\n%s\n' "$MARK_START"
+            path_line "$PREFIX"
+            printf '%s\n' "$MARK_END"
+        } >> "$PROFILE"
+        PATH_STATE=reload
 
-main
+        say "  three lines added to $PROFILE:"
+        say ""
+        printf '    %s\n' "$MARK_START"
+        printf '    %s\n' "$(path_line "$PREFIX")"
+        printf '    %s\n' "$MARK_END"
+        say ""
+        if [ -n "$backup" ]; then
+            note "the file as it was: $backup"
+            note "undo: cp \"$backup\" \"$PROFILE\"    (or $UNINSTALL_HINT)"
+        else
+            note "undo: $UNINSTALL_HINT"
+        fi
+    fi
+    # This shell needs it too, so the setup and the checks below run
+    # against the copy just installed.
+    PATH="$PREFIX:$PATH"
+    export PATH
+fi
+
+# ---------------------------------------------------------------------------
+# 6. set up the home directory
+# ---------------------------------------------------------------------------
+
+# The config that says which tmux session to watch, and the detection
+# manifests that let a pane be recognized at all. The binary owns this,
+# not the installer: `cyclops start` writes exactly the same files, so
+# there is one implementation of what a usable home is.
+step "setting up ${CYCLOPS_HOME:-$HOME/.cyclops}"
+"$PREFIX/cyclops" start --setup-only ||
+    die "could not set up ${CYCLOPS_HOME:-$HOME/.cyclops}" "the output above says which file"
+
+# ---------------------------------------------------------------------------
+# 7. prove it works
+# ---------------------------------------------------------------------------
+
+version="$("$PREFIX/cyclops" --version 2>/dev/null || true)"
+[ -n "$version" ] || die "$PREFIX/cyclops does not run" "try running it directly to see the error"
+
+# What the shell resolves, which is the thing that actually matters. A
+# binary on disk that the shell cannot find is not installed.
+resolved="$(command -v cyclops 2>/dev/null || true)"
+
+say ""
+say "${BOLD}✔ $version is installed${OFF}"
+note "cyclops    $PREFIX/cyclops"
+note "cyclopsd   $PREFIX/cyclopsd"
+note "home       ${CYCLOPS_HOME:-$HOME/.cyclops}"
+
+say ""
+say "Next:"
+# The steps, padded to the widest command so the reasons line up the way
+# `cyclops start` prints its own.
+first=""
+case "$PATH_STATE" in
+    reload) first="exec ${SHELL:-sh} -l" ;;
+    manual) first="add the PATH line above to your shell profile" ;;
+esac
+open="cyclops start"
+width=${#open}
+[ -n "$first" ] && [ ${#first} -gt "$width" ] && width=${#first}
+n=1
+if [ -n "$first" ]; then
+    printf '  %s  %-*s  %s\n' "$n" "$width" "$first" "so your shell can find cyclops"
+    n=$((n + 1))
+fi
+printf '  %s  %-*s  %s\n' "$n" "$width" "$open" "open your workspace; it prints what to do next"
+
+if [ "$PATH_STATE" = ok ] && [ -n "$resolved" ] && [ "$resolved" != "$PREFIX/cyclops" ]; then
+    # Another cyclops is earlier on PATH. Saying "installed" without
+    # saying this would leave the operator running a different binary
+    # than the one this script just built.
+    say ""
+    say "  Heads up: your shell finds $resolved first, not the copy above."
+    say "  Remove that one, or put $PREFIX earlier on your PATH."
+fi

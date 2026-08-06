@@ -1,28 +1,37 @@
 ---
 title: "Introduction"
-description: "What Cyclops is and why it exists."
+description: "What Cyclops is and how it coordinates terminal coding agents."
 ---
 
-Cyclops is a coordination layer for terminal coding agents. It attaches to agents that are already running inside tmux, so you can drive them from a single control surface without leaving your terminal.
+Cyclops is a coordination layer for coding agents running in tmux. tmux
+continues to own the panes, processes, scrollback, and detach behavior;
+Cyclops observes and coordinates them.
 
-## Why Cyclops
+## What it adds
 
-Most coding agents run as long-lived REPLs inside a shell. Once you have more than one running, keeping track of which pane is doing what, forwarding context, and reviewing output becomes the bottleneck.
+- Stable names for agent panes, such as `implementer` and `reviewer`.
+- Agent state derived from vendor hooks, pane titles, output, and screen
+  evidence.
+- Structured messages that wait for a safe moment before entering a pane.
+- Receipts that distinguish hook-verified delivery from screen evidence.
+- A live stream and full-screen workspace for watching and controlling panes.
+- An append-only NDJSON ledger under `~/.cyclops/ledger/`.
 
-Cyclops treats each tmux pane as a first-class agent and gives you:
+Cyclops supports Claude Code, Codex CLI, Cursor Agent, and Antigravity CLI
+through shipped detection manifests. Another terminal CLI needs a manifest,
+not a Cyclops SDK or wrapper.
 
-- A single place to send prompts, files, and follow-ups to any attached agent.
-- Visibility into agent output across every session.
-- Session state that persists across restarts, since the agents live in tmux, not in Cyclops.
+## The two processes
 
-## How it fits together
+`cyclopsd` is the daemon. It holds one tmux control-mode connection per
+watched session, fuses state, delivers messages, and writes the ledger.
 
-1. You run your coding agents (Claude Code, Codex, Aider, custom scripts, etc.) inside tmux windows or panes as usual.
-2. Cyclops attaches to those panes and tracks them as agents.
-3. You interact with Cyclops to send input, read output, and coordinate work across agents.
+`cyclops` is the user-facing command. A bare `cyclops` opens the full-screen
+workspace. Subcommands such as `cyclops status`, `cyclops send`, and
+`cyclops watch` talk to the daemon over a Unix socket.
 
 ## Next steps
 
 - [Install Cyclops](/installation)
 - [Run the quickstart](/quickstart)
-- [Attach to a tmux session](/guides/attach-tmux)
+- [Choose the tmux sessions to watch](/guides/attach-tmux)

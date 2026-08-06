@@ -69,8 +69,8 @@ spawns `tmux -V` once at boot to read the version. The parsing is
 Data directories, none of them code paths: `resources/manifests/` (per-CLI
 detection), `resources/hooks/` (vendor hook templates), `resources/layouts/` (workspace
 presets), `resources/themes/` (palettes), `demos/` (runnable scenarios), `website/`
-(the landing page, read-only branding reference, outside the Cargo
-workspace).
+(the landing page, outside the Cargo workspace and checked by its own CI
+job).
 
 `resources/manifests/` and `resources/layouts/` are also compiled into the `cyclops` binary
 with `include_str!`, so a fresh install works before it has any files.
@@ -146,12 +146,12 @@ It is one TOML file and no code. [MANIFESTS.md](../reference/MANIFESTS.md) is th
 `resources/manifests/codex.toml` is the closest thing to a template.
 
 Know which copy of the file your daemon is actually reading. With no
-`manifest_dir` in the config it takes `$CYCLOPS_HOME/manifests` if that
-directory exists, and only otherwise `./manifests` relative to where
-`cyclopsd` was started. The home copy is seeded from the binary on the
-first `cyclops start` and never overwritten after that, so once you have a
-home, editing the repo's `resources/manifests/` changes what a fresh install gets and
-nothing you are running.
+`manifest_dir` in the config it takes `$CYCLOPS_HOME/manifests` when that
+directory exists, then `./manifests` relative to the daemon's working
+directory. The first directory that exists wins. The home copy is seeded
+from the binary on the first `cyclops start` and never overwritten after
+that, so once you have a home, editing the repo's `resources/manifests/`
+changes what a fresh install gets and nothing you are running.
 
 What you have to fill in, and where each part is used:
 
@@ -413,7 +413,6 @@ is worse than no guard, because people stop looking.
 The related process note, worth one line: the reviewers who caught real
 defects on this codebase were the ones who wrote probes and ran them. The
 one who read code signed off on a lying attention indicator twice.
-STATUS.md has the longer version under "Lessons from M3".
 
 ## What is deliberately not built
 

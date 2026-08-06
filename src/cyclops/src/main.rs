@@ -319,7 +319,7 @@ struct NameArgs {
     /// naming the pane you are sitting in without looking up its id.
     #[arg(long = "self", id = "self_", conflicts_with = "clear")]
     self_: bool,
-    /// Which agent CLI is in this pane (claude, codex, agy). Skip it and
+    /// Which agent CLI is in this pane (claude, codex, agy, cursor). Skip it and
     /// cyclops works it out from the running process.
     #[arg(long, conflicts_with = "clear")]
     manifest: Option<String>,

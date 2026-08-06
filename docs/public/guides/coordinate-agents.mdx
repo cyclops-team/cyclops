@@ -1,62 +1,59 @@
 ---
 title: "Coordinate agents"
-description: "Run several coding agents in parallel."
+description: "Send work, broadcast announcements, wait for turns, and review the record."
 ---
 
-Cyclops is at its best when you have more than one agent running. This guide covers common patterns for coordinating multiple agents.
-
-## Broadcast a prompt
-
-Send the same prompt to every attached agent:
+## Send one agent a request
 
 ```bash
-cyclops send --all "Pull the latest changes and run the test suite."
+cyclops send reviewer --subject "Review the last commit" --body "Check correctness and test coverage."
 ```
 
-Useful for warming up several agents on the same task before you compare their output.
+Cyclops waits until the pane is safe to inject, stages the message, submits
+it, and returns a receipt. A hook-verified receipt is stronger evidence than
+a screen-verified one, and the badge says which you received.
 
-## Target by name or ID
+## Broadcast
 
 ```bash
-cyclops send reviewer "Review the last commit."
-cyclops send 2 "Draft release notes for v0.4.0."
+cyclops send --all --subject "Standup in 5" --fyi
 ```
 
-## Watch output
+A broadcast creates one delivery per recipient. Each one advances
+independently and keeps its own final state.
 
-Stream output from every agent in one view:
+## Wait for the work
 
 ```bash
-cyclops tail
+cyclops wait reviewer --until done --timeout 2m
+cyclops send reviewer --subject "Run the suite" --wait done --timeout 5m
 ```
 
-Filter to one agent:
+`done` means the working-to-idle edge for the same pane occupant. If the
+process in the pane changes while waiting, Cyclops exits separately rather
+than claiming the new process finished the old turn.
+
+## Watch live
 
 ```bash
-cyclops tail reviewer
+cyclops watch
+cyclops watch --with reviewer
 ```
 
-## Handoffs between agents
+The stream is calm by default and can switch to a firehose of every message
+and state event. A bare `cyclops` opens the larger workspace interface with
+the same event record beside live pane canvases.
 
-Pipe an agent's last response into another agent as a prompt:
+## Read the record
 
 ```bash
-cyclops send reviewer --from planner
+cyclops history --with reviewer --limit 20
+cyclops thread m-3f9c2a
 ```
 
-This reads the most recent output from `planner` and forwards it to `reviewer`.
+The ledger is append-only. Delivery updates are new lines, and history folds
+those lines into the current receipt when you read it.
 
-## Roles
-
-A common setup is one agent per role:
-
-- `planner`: breaks a task down into steps
-- `builder`: writes the code
-- `reviewer`: reviews diffs and runs tests
-
-Attach each pane with `--name` and coordinate them from Cyclops.
-
-## Next steps
-
-- [CLI reference](/reference/cli) for every flag
-- [Configuration](/reference/configuration) to set default agent names and roles
+Cyclops does not currently implement a `pipe` command or a `send --from`
+shortcut. Put the relevant context in `--body`, pipe it through
+`--body-file -`, or send a file's contents with `--body-file <path>`.

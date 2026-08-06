@@ -11,7 +11,8 @@ the crates shows.
 flowchart LR
     subgraph clients["what a person runs"]
       cli["cyclops CLI<br/>send, status, list, wait"]
-      ui["cyclops ui<br/>the stream TUI"]
+      ui["cyclops watch<br/>the stream TUI"]
+      ws["cyclops<br/>the full-screen workspace"]
       hk["cyclops hook<br/>(invoked by vendor hooks)"]
     end
     sock(["NDJSON over Unix socket<br/>$CYCLOPS_HOME/sock"])
@@ -27,6 +28,8 @@ flowchart LR
 
     cli --> sock
     ui --> sock
+    ws --> sock
+    ws --> tmux
     hk --> sock
     sock --> srv
     srv --> fus
@@ -66,6 +69,10 @@ graph BT
     cli --> theme
     cli --> tmux
     cli --> ui
+    workspace["cyclops-workspace"] --> proto
+    workspace --> theme
+    workspace --> tmux
+    workspace --> ui
     testrig["cyclops-testrig<br/>(test-only, zero deps)"]
 ```
 
@@ -88,8 +95,10 @@ should not have known about it. The boundaries (from `docs/development/HANDOFF.m
   proto's.
 - `cyclopsd` owns fusion, delivery, identity, adoption, chrome, and the socket
   server — but not the wire schema or the attention rule.
-- `cyclops` (CLI) and `cyclops-ui` render; they never recompute business
-  rules. The shared rendering vocabulary is `cyclops-ui`'s `grid` module.
+- `cyclops` (CLI), `cyclops-ui`, and `cyclops-workspace` render; they never
+  recompute business rules. `cyclops-ui`'s `grid` is the CLI/stream
+  vocabulary; the workspace paints with Ratatui, and all three resolve the
+  same semantic theme tokens.
 
 ## Deliberate decisions (and what was rejected)
 
@@ -115,7 +124,7 @@ design repo. Summary:
    re-reads, ACK windows). A poll would hide a broken event path.
 5. **The pane title is a sensor, so Cyclops never writes it.** Adoption
    decoration goes on the tmux pane *border* (`role • state`), because two of
-   three shipped manifests read the title as a detection sensor.
+   shipped manifests may read the title as a detection sensor.
 6. **One trait with one implementation is deliberate.** Delivery reaches a
    pane through an `Injector` seam; `TmuxInjector` is the only implementation.
    It is the designated escape lane to per-vendor headless protocols if TUI
@@ -150,11 +159,10 @@ design repo. Summary:
 - CLI exit codes are API: 0 success, 1 parked/attention, 2 usage or wait
   timeout, 3 occupant changed or died.
 
-## The frontend is not part of this architecture
+## The website is a separate build
 
 `website/` is a static SvelteKit 2 / Svelte 5 marketing site for
-usecyclops.dev. It is excluded from the Cargo workspace, ignored by Rust CI,
-never embedded or served by any crate, and its only network call is a GitHub
-star-count fetch. The relationship to `resources/themes/` is reversed from what you
-might expect: `resources/themes/dark.toml` and `resources/themes/light.toml` are *derived from*
-the site's CSS design tokens, not the other way around.
+usecyclops.dev. It is excluded from the Cargo workspace, never embedded or
+served by a Rust crate, and its only runtime network call is a GitHub
+star-count fetch. A separate CI job type-checks and builds it, and rejects
+any drift between its hosted installer asset and `scripts/install.sh`.

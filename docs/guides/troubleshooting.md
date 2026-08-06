@@ -148,8 +148,9 @@ reviewer is out of quota, resets in 135h. The message is kept as parked; requeue
 
 Parked deliveries are never retried automatically, and new sends to that
 recipient park immediately behind them. That is deliberate: a retry loop
-against an exhausted quota burns the reset. Wait it out, or send to a
-different agent now. [send.md](send.md).
+against an exhausted quota burns the reset. Despite the receipt's wording,
+this release has no requeue verb: the parked record remains terminal. Send
+new work after the reset or use a different agent now. [send.md](send.md).
 
 ## Deliveries always land unverified
 

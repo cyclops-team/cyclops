@@ -124,7 +124,7 @@ that is normal, not degraded. Full spec:
 vocabulary (`queued`, `parked`, `needs attention`) and quota parking.
 
 <!-- F2: capture from a real run — a delivered_verified receipt needs a
-     hook-wired agent CLI (claude/codex) actually running and firing its
+     hook-wired agent CLI (claude/codex/cursor) actually running and firing its
      ack hook on this message id. Replace with real --json output once
      the fleet has one, e.g.:
      $ cyclops send reviewer --subject "..." --json

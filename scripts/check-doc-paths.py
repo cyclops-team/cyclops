@@ -2,9 +2,9 @@
 """Check that every repo path a doc quotes actually exists.
 
 A path in a doc is checkable, and until this existed it was not checked:
-docs/ARCHITECTURE.md opened by pointing newcomers at two files that were
-not in this repo, and thirty-one source paths were written without their
-`crates/` prefix, so copying one into an editor found nothing.
+docs/development/ARCHITECTURE.md once pointed newcomers at two files that
+were not in this repo, and thirty-one source paths were written without
+their source-directory prefix, so copying one into an editor found nothing.
 
 Two kinds of path get checked, because a reader uses them differently:
 
@@ -85,7 +85,7 @@ LITERAL_SKIPS = {
 # An earlier version also required the first segment to be a directory at
 # the repo root, and that version skipped `cyclops-proto/src/ledger.rs`,
 # which is the exact defect this gate was written for: thirty-one source
-# paths missing their `crates/` prefix. Measured against these docs, the
+# paths missing their source-directory prefix. Measured against these docs, the
 # root test excluded 49 candidates, 43 of which every rule above already
 # covers and 6 of which were real repo paths (`./demos/parity-check.sh`,
 # `.github/workflows/ci.yml`). It lost more than it saved.
@@ -274,7 +274,7 @@ def main():
             print(f"  {name}")
         print(
             "\nAdd a row to the table in README.md, or a link from\n"
-            "docs/HANDOFF.md. A page nobody can navigate to is a page that\n"
+            "docs/development/HANDOFF.md. A page nobody can navigate to is a page that\n"
             "goes stale unread; if it is not worth indexing, delete it."
         )
     return 1

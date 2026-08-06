@@ -32,10 +32,9 @@ of the repo's own docs, plus decisions made during consolidation.
   constants; the authoritative spec is `docs/development/DELIVERY.md` plus
   `DeliveryState::can_transition_to` in
   `src/cyclops-proto/src/ledger.rs`.
-- **Frontend coverage is intentionally shallow.** `website/` is a read-only
-  branding reference outside the workspace, never modified without an
-  explicit admin request; the summary records that boundary and its shape,
-  not component-by-component detail.
+- **Website coverage is intentionally shallow.** `website/` is a separate
+  SvelteKit build outside Cargo. Its CI contract is type-check, build, and
+  exact parity between its installer asset and `scripts/install.sh`.
 - **Shell and Python are lightly covered by tooling.** `demos/*.sh`,
   `scripts/install.sh`, and the Python harness have no linter in CI beyond
   `bash -n` (demos) and their own self-tests; documentation for them lives
@@ -46,15 +45,11 @@ of the repo's own docs, plus decisions made during consolidation.
 
 ## Observations that may warrant maintainer attention
 
-- The one-line installer served from usecyclops.dev
-  (`website/static/install.sh`) deliberately installs the v1 shell
-  implementation (pinned to tag `v1-final`), while this tree is the Rust
-  rewrite installed via `scripts/install.sh`. `README.md` documents this
-  under "Versions"; `website/src/lib/config.ts` carries a TODO about
-  confirming the deployment before shipping the copy button.
-- The frontend has no tests, no ESLint/Prettier; `svelte-check` is the only
-  static check. Consistent with its read-only status, but worth knowing
-  before touching it.
+- The one-line installer served from usecyclops.dev is stored at
+  `website/static/install.sh` and must remain byte-for-byte identical to
+  `scripts/install.sh`; parity and website CI both enforce this.
+- The website has no browser test suite or ESLint/Prettier configuration.
+  CI runs `svelte-check` and the production build.
 - No `rustfmt.toml`/`clippy.toml` exist — default formatting and lints, with
   clippy at `-D warnings` in CI. That appears deliberate (no note suggests
   otherwise).
@@ -72,7 +67,7 @@ of the repo's own docs, plus decisions made during consolidation.
    The skill default places consolidated files at the repo root, but this
    repo's convention, front-door links, and doc gates are built around
    `docs/`. The existing page already covers the full contributor loop
-   (build, the four gates, testrig and scratch rules, demos, CI, house
+   (build, the five core gates, testrig and scratch rules, demos, CI, house
    rules) and is itself CI-enforced. A duplicate root file would add a page
    the front doors must link and content that would drift.
 3. **AGENTS.md was written to be doc-gate-clean**: every inline path

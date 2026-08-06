@@ -27,9 +27,10 @@ The repository baseline at the research date is:
 | `unicode-segmentation` | 1.13.3 | Extended grapheme-cluster segmentation. |
 | `unicode-width` | 0.2.2 | Terminal-cell width calculation. |
 
-The local evidence is the
-[`cyclops-workspace` manifest](../../crates/cyclops-workspace/Cargo.toml) and
-[`Cargo.lock`](../../Cargo.lock). Ratatui's feature mapping is documented in
+The local evidence at the recorded repository revision is the
+[`cyclops-workspace` manifest](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/Cargo.toml)
+and [`Cargo.lock`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/Cargo.lock).
+Ratatui's feature mapping is documented in
 its [0.30.2 crate manifest](https://docs.rs/crate/ratatui/0.30.2/source/Cargo.toml.orig),
 and its backend package recommends using Ratatui's `ratatui::crossterm`
 re-export to avoid feature and version mismatches

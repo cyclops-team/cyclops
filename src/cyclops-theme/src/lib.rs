@@ -2,10 +2,10 @@
 //!
 //! GOALS.md: themes are semantic token files, never raw colors in code, and
 //! exactly two encodings carry meaning, role color and the state glyph.
-//! Redundant is the whole point. A state's color repeats what its glyph and
-//! its word already said, so `NO_COLOR` and `--plain` lose nothing; role hue
-//! stays on the agent name and state color on the state cell, so the two
-//! encodings never share a cell and no single color has to mean two things.
+//! A state's color repeats its fixed glyph (and its word on roomy surfaces),
+//! so `NO_COLOR` and `--plain` lose nothing; role hue stays on the agent name
+//! and state color on the state cell, so the two encodings never share a cell
+//! and no single color has to mean two things.
 //!
 //! This crate owns the token vocabulary, the four groups that state and
 //! delivery color speak in ([`state_token`], [`delivery_token`]), the theme
@@ -83,7 +83,7 @@ pub mod tokens {
     ///
     /// Every surface that wears the eye paints it with these two, so a
     /// theme that moves them moves the mark everywhere it appears. All
-    /// three shipped themes give this token SURFACE_ACCENT's exact value,
+    /// Shipped themes give this token SURFACE_ACCENT's exact value,
     /// which is how a surface painting the mark through the accent looked
     /// correct while wearing the alarm color on a calm rig.
     pub const EYE_ALERT: &str = "eye.alert";

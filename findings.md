@@ -362,7 +362,7 @@ What it constrains: `cyclops start` and `cyclops workspace restore` build
 at the size of the terminal they were run from
 (`src/cyclops/src/workspace.rs::build_size`), which is the only size
 that keeps a preset looking like its design. One built with no terminal to
-ask still drifts, and docs/workspaces.md says so rather than hiding it.
+ask still drifts, and docs/guides/workspaces.md says so rather than hiding it.
 And `first_difference` deliberately does not compare ratios when matching a
 live session to a saved workspace: resizing a pane moves no agent, and two
 sessions built at different terminal sizes never have the same cell counts
@@ -388,7 +388,7 @@ it writes `{"name": name, "attached": attached}` and the wire carries
 
 What it constrains: any script matching daemon output textually must match
 ONE field, or use `jq`. A pattern spanning two keys is a pattern about the
-alphabet. Written down where a script writer meets it, in docs/PROTOCOL.md
+alphabet. Written down where a script writer meets it, in docs/reference/PROTOCOL.md
 under "Requests and responses", and the demo now waits on a single field
 plus a specific pane id after a restore.
 

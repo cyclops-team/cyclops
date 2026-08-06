@@ -9,17 +9,16 @@
 			body: 'Start the coding agents you already use inside one Cyclops workspace.',
 			snippet: [
 				{ cls: 'dim', text: '$ cyclops start' },
-				{ cls: 'ok', text: '✓ workspace ready — 3 agents' }
+				{ cls: 'ok', text: '✔ workspace ready · 3 agents' }
 			]
 		},
 		{
 			n: '02',
-			title: 'Assign roles',
-			body: 'Give each agent a clear identity so every agent knows where work belongs.',
+			title: 'Name each pane',
+			body: 'Give each agent a stable address so every request reaches the intended terminal.',
 			snippet: [
-				{ cls: 'out', text: 'implementer → pane 1' },
-				{ cls: 'out', text: 'reviewer    → pane 2' },
-				{ cls: 'out', text: 'tests       → pane 3' }
+				{ cls: 'dim', text: '$ cyclops name %1 reviewer' },
+				{ cls: 'ok', text: '✔ named reviewer · %1' }
 			]
 		},
 		{
@@ -29,7 +28,7 @@
 			snippet: [
 				{ cls: 'dim', text: '$ cyclops send reviewer \\' },
 				{ cls: 'dim', text: '  --subject "Review the rate limiter"' },
-				{ cls: 'ok', text: '✓ delivered · verified' }
+				{ cls: 'ok', text: '✓ delivered · unverified (screen)' }
 			]
 		}
 	];

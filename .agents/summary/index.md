@@ -23,13 +23,13 @@ answers which kind of question so you can pull in only what you need.
 
 | File | Contains | Read it when |
 |---|---|---|
-| [codebase_info.md](codebase_info.md) | What Cyclops is, languages, repo layout, the nine crates at a glance, runtime footprint, license, version status | You need basic orientation or a directory map |
+| [codebase_info.md](codebase_info.md) | What Cyclops is, languages, repo layout, the workspace crates at a glance, runtime footprint, license, version status | You need basic orientation or a directory map |
 | [architecture.md](architecture.md) | System diagram, crate dependency graph, ownership boundaries, the six deliberate design decisions and their rejected alternatives, concurrency model, error-handling philosophy | You're deciding *where* a change belongs, or why something is built the way it is |
-| [components.md](components.md) | Per-crate detail: modules, key types, responsibilities, and what each crate deliberately does NOT own; plus non-crate components (frontend, manifests, themes, layouts, demos, scripts) | You're working inside a specific crate or asset directory |
+| [components.md](components.md) | Per-crate detail: modules, key types, responsibilities, and what each crate deliberately does NOT own; plus non-crate components (website, manifests, themes, layouts, demos, scripts) | You're working inside a specific crate or asset directory |
 | [interfaces.md](interfaces.md) | The NDJSON socket protocol and its methods, CLI verbs and exit codes, the vendor hook contract, the manifest TOML schema, on-disk file formats, environment variables | You're calling, extending, or debugging a boundary |
 | [data_models.md](data_models.md) | `AgentState`, the 10-state delivery machine (with diagram), the ledger schema, wire envelope types, the attention register, config structs, identifier conventions | You're reasoning about state, the ledger, or what a field means |
 | [workflows.md](workflows.md) | Runtime flows (boot, session watching, fusion, delivery send-to-receipt with sequence diagram, hooks, UI, workspace start, theme switch) and the dev/CI loops | You're tracing behavior end-to-end or setting up to contribute |
-| [dependencies.md](dependencies.md) | External Rust crates and why each exists, system dependencies (tmux/python/jq), frontend packages, version-compatibility posture, what's deliberately absent | You're adding a dependency or checking compatibility constraints |
+| [dependencies.md](dependencies.md) | External Rust crates and why each exists, system dependencies (tmux/python/jq), website packages, version-compatibility posture, what's deliberately absent | You're adding a dependency or checking compatibility constraints |
 | [review_notes.md](review_notes.md) | Known gaps in this documentation, maintainer-relevant observations, and the consolidation decisions made (why README and CONTRIBUTING were preserved) | You're refreshing this knowledge base or auditing its accuracy |
 
 ## Relationships between files
@@ -49,11 +49,11 @@ answers which kind of question so you can pull in only what you need.
 - "How do I add support for a new agent CLI?" → interfaces.md (manifest schema) → `docs/reference/MANIFESTS.md`; no Rust required.
 - "Why did my test kill the user's tmux?" → workflows.md (dev loop) → `CONTRIBUTING.md` testrig rules.
 - "What must pass before a PR is green?" → workflows.md (CI section) or `AGENTS.md`.
-- "Can I edit the frontend?" → components.md / review_notes.md: it's a read-only branding reference; don't, without an explicit request.
+- "Can I edit the website?" → `AGENTS.md`: only when the request explicitly includes it, then run its checks.
 
 ## Maintenance
 
-Generated 2026-08-03 by static analysis. Regenerate after milestones land —
+Generated 2026-08-03 and refreshed 2026-08-06. Regenerate after milestones land —
 `STATUS.md`, `CHANGELOG.md`, and crate surfaces move together. The
 `Custom Instructions` section of `AGENTS.md` is human-maintained and must be
 preserved verbatim on regeneration.

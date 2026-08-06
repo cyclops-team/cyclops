@@ -1,5 +1,11 @@
 # Recommendation implementation — status
 
+> Archived completion record. The statements below describe the completed
+> implementation and verification runs on 2026-08-06, not the current
+> worktree. For current product status and gates, use
+> [`STATUS.md`](../../../../STATUS.md) and
+> [`CONTRIBUTING.md`](../../../../CONTRIBUTING.md).
+
 Two phases. The first run (2026-08-05) implemented the recommendation's
 full dependency graph (G0 → foundation → core → integration → S1 → Q1 →
 M1 → F2 → Q2) and its record is preserved below. A post-implementation

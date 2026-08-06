@@ -16,15 +16,15 @@
 			dot: 'var(--mauve)',
 			lines: [
 				{ cls: 'dim', text: '$ codex' },
-				{ cls: 'msg', text: '» implementer: review the rate limiter' },
-				{ cls: 'ok', text: '✓ delivered · verified' }
+				{ cls: 'msg', text: '[cyclops m-2f304e] FROM: admin  SUBJECT: Review' },
+				{ cls: 'msg', text: 'Check the retry ordering.' }
 			]
 		},
 		{
 			role: 'tests',
 			dot: 'var(--sage)',
 			lines: [
-				{ cls: 'dim', text: '$ gemini' },
+				{ cls: 'dim', text: '$ cursor-agent' },
 				{ cls: 'out', text: 'Investigating auth.spec failure…' },
 				{ cls: 'out', text: '→ root cause: stale token cache' }
 			]
@@ -33,17 +33,16 @@
 			role: 'operator',
 			dot: 'var(--term-neutral)',
 			lines: [
-				{ cls: 'dim', text: '$ cyclops list' },
-				{ cls: 'out', text: 'implementer  active   rate-limiter' },
-				{ cls: 'out', text: 'reviewer     active   reviewing' },
-				{ cls: 'out', text: 'tests        active   investigating' }
+				{ cls: 'dim', text: '$ cyclops send reviewer \\' },
+				{ cls: 'dim', text: '  --subject "Review"' },
+				{ cls: 'ok', text: '✔ delivered · verified' }
 			]
 		}
 	];
 </script>
 
-<div class="term visual" role="img" aria-label="A Cyclops terminal workspace with four labeled agent panes — implementer, reviewer, tests, and operator — coordinating on a single change">
-	<TerminalHeader title="cyclops — one workspace, four agents" />
+<div class="term visual" role="img" aria-label="A Cyclops terminal workspace with three agent panes and an operator terminal coordinating on a single change">
+	<TerminalHeader title="cyclops — one workspace, three agents" />
 	<div class="grid">
 		{#each panes as pane (pane.role)}
 			<div class="pane">

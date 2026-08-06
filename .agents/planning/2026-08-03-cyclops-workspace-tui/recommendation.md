@@ -2,6 +2,12 @@
 
 Recommendation date: 2026-08-05
 
+> Archived plan. The implementation and repository migration are complete;
+> paths and task wording below describe the pre-migration tree. Use
+> [`STATUS.md`](../../../STATUS.md) and
+> [`docs/development/HANDOFF.md`](../../../docs/development/HANDOFF.md) for
+> the current product and repository map.
+
 ## Recommendation
 
 Keep the current architecture and improve it by subtraction.
@@ -821,8 +827,8 @@ flowchart TD
 - [Ratatui and Crossterm](research/ratatui-crossterm.md)
 - [Terminal rendering and mouse compatibility](research/terminal-compatibility.md)
 - [UI actions to tmux operations](research/tmux-action-map.md)
-- [Repository handoff](../../../docs/HANDOFF.md)
-- [Rendering and system invariants](../../../docs/INVARIANTS.md)
-- [Repository style](../../../docs/STYLE.md)
+- [Repository handoff](../../../docs/development/HANDOFF.md)
+- [Rendering and system invariants](../../../docs/development/INVARIANTS.md)
+- [Repository style](../../../docs/development/STYLE.md)
 - [Current workspace UI](../../../docs/workspace-ui.md)
 - [Measured findings](../../../findings.md)

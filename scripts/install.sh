@@ -4,6 +4,7 @@
 # looks, and sets up the home directory. One command, then `cyclops start`.
 #
 #   ./scripts/install.sh              from a clone
+#   curl -fsSL https://www.usecyclops.dev/install.sh | sh
 #   ./scripts/install.sh --uninstall  take it back off
 #
 # Flags:
@@ -59,7 +60,17 @@ die() {
 have() { command -v "$1" >/dev/null 2>&1; }
 
 usage() {
-    sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'
+    say "Cyclops installer. Builds cyclops and cyclopsd from source."
+    say ""
+    say "Usage:"
+    say "  curl -fsSL https://www.usecyclops.dev/install.sh | sh"
+    say "  ./scripts/install.sh [OPTIONS]"
+    say ""
+    say "Options:"
+    say "  --prefix DIR   install the binaries in DIR"
+    say "  --no-path      do not edit a shell profile"
+    say "  --uninstall    remove binaries and the installer-owned PATH block"
+    say "  --help         show this help"
     exit 0
 }
 
@@ -74,7 +85,7 @@ while [ $# -gt 0 ]; do
         --no-path)   NO_PATH=1; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
         -h|--help)   usage ;;
-        *)           die "unknown option: $1" "./scripts/install.sh --help lists them" ;;
+        *)           die "unknown option: $1" "rerun the installer with --help to list its options" ;;
     esac
 done
 
@@ -251,6 +262,12 @@ else
     note "building the clone at $SRC"
 fi
 
+if [ -n "$CLONED" ]; then
+    UNINSTALL_HINT='curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall'
+else
+    UNINSTALL_HINT='./scripts/install.sh --uninstall'
+fi
+
 # ---------------------------------------------------------------------------
 # 3. build
 # ---------------------------------------------------------------------------
@@ -348,9 +365,9 @@ else
         say ""
         if [ -n "$backup" ]; then
             note "the file as it was: $backup"
-            note "undo: cp \"$backup\" \"$PROFILE\"    (or ./scripts/install.sh --uninstall)"
+            note "undo: cp \"$backup\" \"$PROFILE\"    (or $UNINSTALL_HINT)"
         else
-            note "undo: ./scripts/install.sh --uninstall"
+            note "undo: $UNINSTALL_HINT"
         fi
     fi
     # This shell needs it too, so the setup and the checks below run
@@ -397,22 +414,14 @@ case "$PATH_STATE" in
     reload) first="exec ${SHELL:-sh} -l" ;;
     manual) first="add the PATH line above to your shell profile" ;;
 esac
-# The daemon comes before the workspace on purpose. Started second, it
-# has no session to attach to and cyclops start has nothing to register a
-# name with, so the first run names nothing and takes a second run to
-# finish. Started first, one `cyclops start` does the whole thing.
-daemon="cyclopsd &"
 open="cyclops start"
 width=${#open}
-[ ${#daemon} -gt "$width" ] && width=${#daemon}
 [ -n "$first" ] && [ ${#first} -gt "$width" ] && width=${#first}
 n=1
 if [ -n "$first" ]; then
     printf '  %s  %-*s  %s\n' "$n" "$width" "$first" "so your shell can find cyclops"
     n=$((n + 1))
 fi
-printf '  %s  %-*s  %s\n' "$n" "$width" "$daemon" "start the daemon"
-n=$((n + 1))
 printf '  %s  %-*s  %s\n' "$n" "$width" "$open" "open your workspace; it prints what to do next"
 
 if [ "$PATH_STATE" = ok ] && [ -n "$resolved" ] && [ "$resolved" != "$PREFIX/cyclops" ]; then

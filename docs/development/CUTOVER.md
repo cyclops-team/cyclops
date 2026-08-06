@@ -34,15 +34,17 @@ refused. A one-line deprecation note prints to stderr once per day per user
   instead of v1's `SUBJECT:` and `FROM:` lines. Both fields are still
   there; replying to the FROM label works unchanged.
 - v1 stripped leading `SUBJECT:`/`FROM:`/`PANE:` lines from bodies;
-  cyclops does not (the envelope cannot be forged, see DELIVERY.md).
+  cyclops does not (the envelope cannot be forged; see
+  [DELIVERY.md](DELIVERY.md)).
 - `COMMPACT_SOCKET` is not consulted; the daemon owns the tmux connection.
 
 ## Preconditions (all must hold before install)
 
-- [ ] M2 green: `cargo test --workspace` passes, clippy clean.
+- [ ] Current core gates pass, including clippy and
+      `cargo test --workspace --no-fail-fast`.
 - [ ] Shim tests green: `python3 scripts/commpact-shim/test_shim.py`.
 - [ ] `cyclopsd` running against the real session; `cyclops status` shows
-      the claude, codex, and gemini panes with sane states.
+      every pane you intend to preserve with a sane state.
 - [ ] Panes adopted: each label resolves and receives a test send.
 - [ ] Hooks wired per pane by the admin; a test send to each agent comes
       back `delivered · verified` (hook ACK), not just screen-tier.
@@ -50,7 +52,7 @@ refused. A one-line deprecation note prints to stderr once per day per user
 ## Install (ADMIN ONLY)
 
 ```bash
-cd ~/projects/clops
+cd /path/to/cyclops
 CYCLOPS_CUTOVER_ACK=yes scripts/commpact-shim/install.sh
 ```
 

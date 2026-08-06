@@ -1,52 +1,76 @@
 ---
 title: "Installation"
-description: "Install the Cyclops CLI."
+description: "Build and install the current Rust implementation of Cyclops."
 ---
 
-Cyclops ships as a single CLI binary. Pick the install method that matches your setup.
+Cyclops currently installs from source. The installer builds both `cyclops`
+and `cyclopsd`, places them in a user-writable bin directory, and creates the
+initial `~/.cyclops` configuration.
 
 ## Requirements
 
-- macOS 12\+ or a recent Linux distribution
-- [tmux](https://github.com/tmux/tmux) 3.2 or newer
-- A terminal that supports 256 colors
+- macOS or Linux
+- tmux 3.2 or newer
+- A Rust toolchain with `cargo`
+- curl and Git when using the one-line installer
 
-## Install with Homebrew
-
-```bash
-brew install cyclops-team/tap/cyclops
-```
-
-## Install with the shell script
+## Install
 
 ```bash
-curl -fsSL https://usecyclops.dev/install.sh | sh
+curl -fsSL https://www.usecyclops.dev/install.sh | sh
 ```
 
-The script downloads the latest release for your platform and installs it to `/usr/local/bin/cyclops`.
+The script fetches the current `main` branch and builds it locally. It never
+uses `sudo`. It prefers a bin directory already on your `PATH`; otherwise it
+uses `~/.local/bin` and offers to add that directory to your shell profile,
+after making a timestamped backup.
 
-## Verify the install
+To build a clone you already have:
+
+```bash
+git clone https://github.com/cyclops-team/cyclops.git
+cd cyclops
+./scripts/install.sh
+```
+
+Use `--prefix` to choose the bin directory, or `--no-path` to prevent any
+shell-profile edit:
+
+```bash
+curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --prefix "$HOME/bin" --no-path
+```
+
+## Verify and start
 
 ```bash
 cyclops --version
+cyclops start
 ```
 
-You should see the installed version printed to stdout.
+`cyclops start` opens the default workspace and starts the daemon when one is
+not already running. If the installer added a PATH block, first open a new
+shell or run the reload command it printed.
 
 ## Update
 
-<CodeGroup>
+Run the install command again. The binaries are rebuilt and replaced; your
+configuration, manifests, workspaces, and ledger remain under `~/.cyclops`.
 
-```bash Homebrew
-brew upgrade cyclops
+## Uninstall
+
+From a clone:
+
+```bash
+./scripts/install.sh --uninstall
 ```
 
-```bash Script
-curl -fsSL https://usecyclops.dev/install.sh | sh
+Without a clone:
+
+```bash
+curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
 ```
 
-</CodeGroup>
+Uninstall removes the two binaries and the installer-owned profile block. It
+leaves `~/.cyclops` in place because that directory contains your record.
 
-## Next steps
-
-Head to the [quickstart](/quickstart) to attach Cyclops to your first tmux session.
+Homebrew and Nix packages are not published yet.

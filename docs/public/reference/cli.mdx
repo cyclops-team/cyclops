@@ -1,101 +1,64 @@
 ---
 title: "CLI reference"
-description: "Every Cyclops command and flag."
+description: "Current Cyclops commands, common flags, and exit codes."
 ---
 
-All commands are invoked as `cyclops <command>`.
+A bare `cyclops` opens the full-screen workspace. The commands below expose
+the same system to terminals and scripts.
 
-## `attach`
-
-Attach Cyclops to a tmux target.
-
-```bash
-cyclops attach <target> [--name <name>]
-```
-
-| Flag | Description |
+| Command | Purpose |
 | --- | --- |
-| `<target>` | tmux target: `session`, `session:window`, or `session:window.pane`. |
-| `--name` | Friendly name to assign to a single-pane attach. |
+| `cyclops start` | Create or restore the default workspace and start the daemon if needed. |
+| `cyclops workspace save\|restore` | Save or rebuild a tmux session's panes, sizes, names, and directories. |
+| `cyclops status` | Show every watched pane and its fused state. |
+| `cyclops list` | Show every named agent, its state, and current detail. |
+| `cyclops name <pane> <label>` | Give a pane a stable address; `--clear` releases it. |
+| `cyclops read <agent>` | Read visible/recent pane output or the detection evidence. |
+| `cyclops send <agent> --subject ...` | Deliver a structured message and print its receipt. |
+| `cyclops wait <agent> --until idle\|done\|blocked` | Wait for an agent state or turn edge. |
+| `cyclops history` | Read messages from the append-only record. |
+| `cyclops thread <message-id>` | Read one message, its replies, and delivery state. |
+| `cyclops watch` | Open the stream TUI; `--json` emits one event per line. |
+| `cyclops hook <event>` | Vendor-hook receiver; silent and always exits 0. |
+| `cyclops hooks install\|verify\|selftest` | Prepare and verify vendor hooks. |
+| `cyclops theme [name]` | Preview themes or switch the active theme. |
+| `cyclops daemon status\|log\|stop` | Inspect or stop the daemon. |
+| `cyclops ping` | Measure a daemon round trip. |
 
-## `detach`
-
-Stop tracking agents without killing tmux.
-
-```bash
-cyclops detach [target]
-```
-
-Omit `target` to detach from everything.
-
-## `ls`
-
-List tracked agents.
-
-```bash
-cyclops ls [--session <name>]
-```
-
-## `send`
-
-Send a prompt to an agent.
+## Sending
 
 ```bash
-cyclops send <agent> "<prompt>"
-cyclops send --all "<prompt>"
-cyclops send <agent> --from <other-agent>
+cyclops send reviewer --subject "Review the diff" --body "Focus on retry ordering."
+cyclops send --all --subject "Standup in 5" --fyi
+cyclops send reviewer --subject "Run the tests" --wait done --timeout 2m
 ```
 
-| Flag | Description |
-| --- | --- |
-| `<agent>` | Agent ID or name. |
-| `--all` | Broadcast to every tracked agent. |
-| `--from` | Use another agent's last output as the prompt. |
+`--to` adds recipients, `--body-file -` reads the body from stdin,
+`--reply-to` links a reply, and `--all` broadcasts to every adopted agent.
 
-## `tail`
-
-Stream agent output.
+## Reading and filtering
 
 ```bash
-cyclops tail [agent] [--follow]
+cyclops history --with reviewer --limit 20
+cyclops watch --from implementer --to reviewer
+cyclops read reviewer --source detection --raw
 ```
 
-## `sessions`
+## Global output flags
 
-List Cyclops sessions and their agent counts.
+- `--json` prints machine-readable results. With `watch`, it prints an NDJSON
+  event stream instead of opening the TUI.
+- `--plain` disables color and glyph animation while preserving the words.
+- `NO_COLOR` disables color on every surface.
 
-```bash
-cyclops sessions
-```
+The deprecated `cyclops ui` alias still opens `cyclops watch`, but new scripts
+and documentation should use `watch`.
 
-## `rename`
+## Exit codes
 
-Rename a tracked agent.
+- `0`: the command succeeded; sends also use 0 for delivered or queued.
+- `1`: operational failure, parked delivery, or a delivery needing attention.
+- `2`: usage error, or `wait` timed out.
+- `3`: the waited-on pane died or changed occupant.
 
-```bash
-cyclops rename <agent> <new-name>
-```
-
-## `rm`
-
-Stop tracking an agent. The tmux pane keeps running.
-
-```bash
-cyclops rm <agent>
-```
-
-## `kill`
-
-Kill a tmux session and every agent in it.
-
-```bash
-cyclops kill <session>
-```
-
-## Global flags
-
-| Flag | Description |
-| --- | --- |
-| `--config <path>` | Use a specific config file. |
-| `--verbose` | Print debug logs. |
-| `--version` | Print the Cyclops version. |
+Run `cyclops <command> --help` for every flag accepted by that command.

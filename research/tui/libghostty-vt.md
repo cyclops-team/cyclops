@@ -304,8 +304,8 @@ that a hyperlink exists, but the URI comes from `GridRef::hyperlink_uri`
 Cyclops presently normalizes Alacritty into a deliberately small structure:
 one Rust `char`, one wide-spacer boolean, default/indexed/RGB foreground and
 background, and five boolean attributes
-([`GridCell` and `CellAttrs`](../../crates/cyclops-workspace/src/runtime/grid.rs)). The Alacritty adapter performs a full `display_iter()` conversion only when its grid is dirty, then caches and clones that grid
-([adapter](../../crates/cyclops-workspace/src/runtime/alacritty.rs)).
+([`GridCell` and `CellAttrs`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/runtime/grid.rs)). The Alacritty adapter performs a full `display_iter()` conversion only when its grid is dirty, then caches and clones that grid
+([adapter](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/runtime/alacritty.rs)).
 
 With no model changes, a libghostty adapter could retain:
 
@@ -506,7 +506,7 @@ It is not a general checkpoint/import facility:
 Cyclops hydration currently throws away the old Alacritty terminal, creates a
 fresh one, optionally enters alternate screen 1049, replays captured visible
 rows with CRLF, and restores the cursor with CUP
-([hydration implementation](../../crates/cyclops-workspace/src/runtime/alacritty.rs)). This intentionally restores pixels and a small amount of buffer identity, not exact VT state.
+([hydration implementation](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/runtime/alacritty.rs)). This intentionally restores pixels and a small amount of buffer identity, not exact VT state.
 
 The same replay technique can feed libghostty, but the same information limit
 remains. A tmux capture cannot reconstruct private modes, saved cursor stacks,
@@ -549,7 +549,7 @@ revisions. It is not a ranking.
 The current 12-case corpus covers basic text, color, a few attributes, cursor
 motion, wrapping, CJK width, alternate screen, bracketed-paste bytes, and two
 synthetic agent fragments
-([fixtures](../../crates/cyclops-workspace/tests/corpus.rs)). It does not cover most differentiators in this matrix.
+([fixtures](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/tests/corpus.rs)). It does not cover most differentiators in this matrix.
 
 ## Performance and memory evidence
 

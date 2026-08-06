@@ -22,8 +22,7 @@ else should match line for line.
 ## 1. Install
 
 ```bash
-git clone https://github.com/cyclops-team/cyclops.git && cd cyclops
-./scripts/install.sh
+curl -fsSL https://www.usecyclops.dev/install.sh | sh
 ```
 
 It builds both binaries, puts them where your shell looks, and writes the
@@ -42,8 +41,8 @@ Next:
 ```
 
 Step 1 is there only when the installer had to add a line to your shell
-profile. It prints that line, backs the file up first, and
-`./scripts/install.sh --uninstall` takes it back out.
+profile. It prints that line, backs the file up first, and the uninstall
+command in the [installation guide](install.md#uninstall) takes it back out.
 [install.md](install.md) covers `--prefix`, `--no-path`, and installing
 with cargo instead.
 

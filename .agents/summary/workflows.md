@@ -83,7 +83,7 @@ feeds fusion. A late hook ACK upgrades `delivered_unverified` to
 
 ## The UI stream
 
-`cyclops ui` connects once, sends one `status` (which seeds — replaces — the
+`cyclops watch` connects once, sends one `status` (which seeds — replaces — the
 attention register), subscribes to events, and reads one ledger backfill
 (which feeds the register nothing, so the eye count can never depend on
 `--backfill`). The event loop batches up to 256 messages per frame; the
@@ -108,7 +108,7 @@ wire.
 
 ## The development loop
 
-From `CONTRIBUTING.md` — four commands, the same four CI runs:
+From `CONTRIBUTING.md` — five core checks:
 
 ```bash
 cargo fmt --all
@@ -118,8 +118,10 @@ python3 scripts/check-doc-paths.py
 ./tests/e2e/parity-check.sh
 ```
 
-Touching `scripts/install.sh` adds `./tests/e2e/parity-check.sh
---with-installer` (does a release build). Testing rules that bite: every
+Touching either installer requires `scripts/install.sh` and
+`website/static/install.sh` to remain identical, plus
+`./tests/e2e/parity-check.sh --with-installer` (does a release build).
+Testing rules that bite: every
 tmux-touching test goes through `cyclops-testrig` (never the default tmux
 server), and every scratch path comes from `cyclops_proto::scratch` (never
 `/tmp` literals or `std::env::temp_dir()`).
@@ -142,11 +144,14 @@ flowchart TB
     subgraph canary["tmux-head (advisory, continue-on-error)"]
         j["build tmux from master"] --> k["cargo test --workspace"]
     end
+    subgraph website["website"]
+        l["cmp hosted and tested installers"] --> m["npm run check"]
+        m --> n["npm run build"]
+    end
 ```
 
-Triggers: push to `v2`/`main` and PRs, with `website/**` ignored (the
-landing page is a read-only branding reference). Steps after a test failure
-still run (`if: !cancelled()`) so one run reports every failure. The
+Triggers: pushes to `v2` or `main`, and pull requests. Steps after a test
+failure still run (`if: !cancelled()`) so one run reports every failure. The
 tmux-head job is early warning, not a merge blocker — but it has caught a
 real issue before (F25), so read it when it goes red.
 

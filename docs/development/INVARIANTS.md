@@ -315,7 +315,8 @@ The same principle runs wider than manifests: hook config templates under
 `resources/themes/` are all data files, and none of them is a code path.
 
 - Enforced at: `src/cyclops-manifest` (parse, validate, evaluate, and
-  nothing vendor-specific); `resources/manifests/{claude,codex,agy}.toml`.
+  nothing vendor-specific);
+  `resources/manifests/{claude,codex,agy,cursor}.toml`.
 - Proven by: `src/cyclops-manifest/tests/shipped_rules.rs`, which runs
   the shipped rules against captures taken from real sessions.
 

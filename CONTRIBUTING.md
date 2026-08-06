@@ -21,7 +21,7 @@ or newer; the tree is developed against 3.6a and CI also builds tmux master.
 
 ## The loop
 
-Four commands, in this order. They are the same four CI runs, so a green
+Five commands, in this order. They are the same five core CI checks, so a green
 run here is a green run there.
 
 ```bash
@@ -32,13 +32,15 @@ python3 scripts/check-doc-paths.py
 ./tests/e2e/parity-check.sh
 ```
 
-The two cargo lines at the end take a few minutes; the rest are seconds.
-Run the first two while you work.
+Clippy and the test suite take a few minutes; the rest are usually quick.
+Run formatting and clippy while you work.
 
-Touching `scripts/install.sh` or what it prints adds one more, and it does
-a release build:
+Touching `scripts/install.sh`, `website/static/install.sh`, or installer
+output adds one more check, and it does a release build. The two installer
+files must remain byte-for-byte identical:
 
 ```bash
+cmp scripts/install.sh website/static/install.sh
 ./tests/e2e/parity-check.sh --with-installer
 ```
 
@@ -70,7 +72,7 @@ $ cyclops start
 ✓ workspace ready · 1 agent
   wrote /private/tmp/cyclops-parity.tMpeYD/home/config.toml
 ...
-== 63/63 checks passed
+== 115/115 checks passed
 == docs and binaries agree
 ```
 
@@ -165,7 +167,7 @@ builds an isolated rig, drives a real scenario, and prints what happened.
 ```
 
 All of them need `tmux`; the ones that read the ledger back
-(`m1-send.sh`, `m2-conversation.sh`, `m3-stream.sh`, `parity-check.sh`)
+(`m1-send.sh`, `m2-conversation.sh`, and `m3-stream.sh`)
 also need `jq`, and the first three need `python3`. They check for what
 they use and say so. None of them touches your tmux server or your home,
 and all are safe to run repeatedly.
@@ -195,8 +197,9 @@ throw away the signal that tells a portability bug from a real regression.
 | `./tests/e2e/parity-check.sh` | A doc quotes output the binaries no longer print |
 | The whole suite again with `CYCLOPS_TEST_TMP` relocated | Something hardcoded a scratch path (F24) |
 | `./tests/e2e/parity-check.sh --with-installer` | `scripts/install.sh` stopped doing what install.md says, or left a shell profile changed after `--uninstall`. Its own job: it does a release build |
+| `cmp scripts/install.sh website/static/install.sh`, then `npm run check` and `npm run build` in `website/` | The hosted installer drifted from the tested installer, or the website no longer type-checks or builds |
 
-An eighth job builds tmux from master and runs the suite against it. It is
+Another job builds tmux from master and runs the suite against it. It is
 `continue-on-error`, so it warns rather than blocks: tmux is not this
 repo's to fix. It has earned its keep once already (F25), so when it goes
 red, read it rather than assuming it is the usual noise.

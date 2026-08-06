@@ -40,9 +40,8 @@ says it is over reaches it for the same reason, so the two read together:
 ```
 
 The clearance quotes the alarm it answers, so you match the two by sight
-without going to the firehose for the transition behind it. The same
-holds for a delivery you requeued (`✔ cleared · was ⊘ parked · quota`)
-and for the closure of a delivery a daemon restart interrupted.
+without going to the firehose for the transition behind it. The same holds
+for the closure of a delivery a daemon restart interrupted.
 
 A pane that goes away while it was blocked reads differently, because
 nobody answered the prompt:
@@ -167,9 +166,10 @@ daemon at one instant always agree.
 
 Anything the count knows about gets a line in the stream, timestamped
 when it happened, so a park from this morning reads as this morning. It
-runs both ways: a line already on screen that the answer no longer counts
-gets its clearance written under it at startup, so a park you requeued
-while the UI was down does not sit there looking open.
+runs both ways: a line already on screen that the daemon's current answer
+no longer counts gets its clearance written under it at startup. The wire
+model permits a future additive client to requeue a delivery, but this
+release ships no requeue command.
 
 ### Every count has a line
 

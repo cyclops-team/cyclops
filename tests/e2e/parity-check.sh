@@ -66,6 +66,19 @@ esac
 
 cd "$REPO"
 
+if ! cmp -s "$REPO/scripts/install.sh" "$REPO/website/static/install.sh"; then
+  echo "!! website/static/install.sh must match scripts/install.sh" >&2
+  exit 1
+fi
+
+# `$0` is `sh` when the hosted script is piped. Help must therefore be
+# self-contained rather than trying to reread the source through `$0`.
+PIPE_HELP="$(sh -s -- --help < "$REPO/website/static/install.sh")"
+case "$PIPE_HELP" in
+  *"--prefix DIR"*"--uninstall"*) ;;
+  *) echo "!! the hosted installer's piped --help is incomplete" >&2; exit 1 ;;
+esac
+
 for dep in tmux jq; do
   command -v "$dep" >/dev/null || { echo "!! $dep is required" >&2; exit 1; }
 done
@@ -1095,8 +1108,8 @@ check "it says where each binary went"    "^  cyclops    $INST/.local/bin/cyclop
 check "and the daemon too"                "^  cyclopsd   $INST/.local/bin/cyclopsd$"
 check "and where the home is"             "^  home       $INST/.cyclops$"
 check "it reports the version it built"   '^✔ cyclops [0-9]+\.[0-9]+\.[0-9]+ is installed$'
-check "step 2 starts the daemon"          '^  2  cyclopsd & +start the daemon$'
-check "step 3 opens the workspace"        '^  3  cyclops start +open your workspace; it prints what to do next$'
+check_absent "it gives no separate daemon step" 'cyclopsd &'
+check "step 2 opens the workspace"        '^  2  cyclops start +open your workspace; it prints what to do next$'
 check "it names the profile it edited"    "^  three lines added to $INST/.zshrc:$"
 check "and shows the block it added"      '^    # >>> cyclops >>>$'
 check "and the PATH line inside it"       "^    export PATH=\"$INST/.local/bin:\\\$PATH\"$"

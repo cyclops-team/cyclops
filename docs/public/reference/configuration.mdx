@@ -1,58 +1,72 @@
 ---
 title: "Configuration"
-description: "Configure Cyclops."
+description: "Configure Cyclops sessions, themes, chrome, and runtime state."
 ---
 
-Cyclops reads configuration from `~/.config/cyclops/config.toml` by default. Override the path with `--config` or the `CYCLOPS_CONFIG` environment variable.
+Cyclops keeps its config and runtime state under `~/.cyclops`. Set
+`CYCLOPS_HOME` to use another directory; keep it short enough for a Unix
+socket path because the daemon creates `$CYCLOPS_HOME/sock`.
 
-## Example config
+The main file is `$CYCLOPS_HOME/config.toml`. `cyclops start` creates a
+minimal one and never overwrites settings you add.
+
+## Example
 
 ```toml
-[defaults]
-session = "work"
+sessions = ["main"]
+default_workspace = "main"
+theme = "dark"
+chrome = "on"
 
-[[agents]]
-name = "planner"
-target = "work:agents.0"
+ack_timeout_ms = 1500
+delivery_retry_max = 1
+receipt_block_ms = 2500
+gate_hold_notify_ms = 120000
 
-[[agents]]
-name = "builder"
-target = "work:agents.1"
-
-[[agents]]
-name = "reviewer"
-target = "work:agents.2"
+[workspace]
+sidebar_visible = true
+sidebar_width = 22
+workspace_order = ["main"]
+agent_order = ["name:implementer", "name:reviewer"]
+folder_tracked = []
 ```
 
-On startup, Cyclops attaches to any agents listed in `[[agents]]` if their tmux targets exist.
+## Top-level keys
 
-## Sections
+| Key | Purpose |
+| --- | --- |
+| `sessions` | tmux sessions the daemon watches when it starts. |
+| `default_workspace` | Workspace opened by a bare `cyclops start`. |
+| `manifest_dir` | Optional directory containing detection manifests; otherwise Cyclops tries `$CYCLOPS_HOME/manifests`, then `./manifests`. |
+| `tmux_socket` | Optional tmux `-L` socket name. |
+| `tmux_config` | Optional tmux config path passed with `-f`. |
+| `theme` | Active theme name. `cyclops theme <name>` updates it safely. |
+| `chrome` | `"on"` or `"off"`; controls Cyclops-owned tmux border decoration. |
+| Delivery timing keys | ACK, retry, receipt, and held-delivery notification settings shown above. |
 
-### `[defaults]`
+The full-screen workspace maintains `[workspace]` preferences, including
+sidebar visibility/width and the persisted workspace and agent order. It
+also records which workspaces follow their active pane's folder in
+`folder_tracked`, and preserves unknown keys when it writes preferences.
 
-| Key | Type | Description |
-| --- | --- | --- |
-| `session` | string | Session used when a command omits a target. |
-| `editor` | string | Editor invoked by `cyclops edit`. Falls back to `$EDITOR`. |
+## Runtime files
 
-### `[[agents]]`
-
-One block per pre-registered agent.
-
-| Key | Type | Description |
-| --- | --- | --- |
-| `name` | string | Friendly name. |
-| `target` | string | tmux target in `session:window.pane` form. |
-| `role` | string | Optional role tag used by `cyclops send --role`. |
+| Path | Purpose |
+| --- | --- |
+| `$CYCLOPS_HOME/sock` | Unix socket used by the CLI and daemon. |
+| `$CYCLOPS_HOME/ledger/*.ndjson` | Append-only message and event record. |
+| `$CYCLOPS_HOME/registry.json` | Durable pane names and adoption identity. |
+| `$CYCLOPS_HOME/workspaces/*.toml` | Saved workspace layouts. |
+| `$CYCLOPS_HOME/manifests/` | Per-CLI detection rules. |
+| `$CYCLOPS_HOME/themes/` | Semantic color themes. |
+| `$CYCLOPS_HOME/cyclopsd.log` | Log for the detached daemon. |
 
 ## Environment variables
 
-| Variable | Description |
+| Variable | Purpose |
 | --- | --- |
-| `CYCLOPS_CONFIG` | Path to the config file. |
-| `CYCLOPS_HOME` | Directory for local state and logs. Defaults to `~/.local/share/cyclops`. |
-| `CYCLOPS_LOG_LEVEL` | `debug`, `info`, `warn`, or `error`. |
-
-## State and logs
-
-Cyclops writes agent state and logs under `$CYCLOPS_HOME`. Delete this directory to reset local state; tmux sessions are not affected.
+| `CYCLOPS_HOME` | Runtime home; defaults to `~/.cyclops`. |
+| `CYCLOPS_THEME` | Theme name or theme-file override. |
+| `CYCLOPS_LOG` | Daemon tracing filter, such as `debug`. |
+| `CYCLOPS_AGENT` | Agent label supplied to vendor-hook commands. |
+| `NO_COLOR` | Disable color without removing state words or glyphs. |

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import SectionHead from './SectionHead.svelte';
 
-	const strip = ['claude', 'codex', 'gemini', 'opencode', 'your-agent'];
+	const strip = ['claude', 'codex', 'cursor', 'agy', 'your-agent'];
 </script>
 
 <section class="section">

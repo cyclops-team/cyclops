@@ -1,60 +1,60 @@
 ---
-title: "Attach to tmux"
-description: "Connect Cyclops to tmux sessions, windows, and panes."
+title: "Watch tmux sessions"
+description: "Choose which tmux sessions Cyclops watches and opens as workspaces."
 ---
 
-Cyclops attaches to tmux by target. A target can be a session, a window, or a single pane.
+Cyclops does not have an `attach` command. The daemon watches the sessions in
+`$CYCLOPS_HOME/config.toml`, and `cyclops start` creates or restores a
+workspace session and asks the running daemon to watch it.
 
-## Attach to a session
+## Watch sessions at daemon startup
 
-Register every pane in a session as an agent:
-
-```bash
-cyclops attach work
+```toml
+sessions = ["main", "review"]
+default_workspace = "main"
 ```
 
-New panes opened later are picked up automatically as long as Cyclops is running.
-
-## Attach to a specific window
+Restart `cyclopsd` after changing `sessions`:
 
 ```bash
-cyclops attach work:agents
+cyclops daemon stop
+cyclops start
 ```
 
-Only panes inside the `agents` window are tracked.
+`sessions` is the daemon's boot set. A workspace created while the daemon is
+running can be watched immediately without rewriting the file, but only the
+sessions listed in the file return after a daemon restart.
 
-## Attach to a single pane
+## Open a named workspace in a named session
 
 ```bash
-cyclops attach work:agents.1
+cyclops start --workspace review --session review --preset duo
 ```
 
-Use this when you only want Cyclops managing one agent in an otherwise busy session.
+If the session does not exist, Cyclops restores the saved `review` workspace
+or builds the `duo` preset. If it already exists, Cyclops leaves its layout
+untouched.
 
-## Name your agents
+## Name existing panes
 
-Give an agent a friendly name at attach time:
+`cyclops status` lists watched panes, including unnamed ones by tmux pane id:
 
 ```bash
-cyclops attach work:agents.1 --name reviewer
+cyclops status
+cyclops name %3 reviewer
 ```
 
-You can then refer to it by name:
+Naming a pane gives it a stable message address. Cyclops never writes the
+pane title because titles are detection sensors; its decoration appears on
+the pane border instead.
+
+## Stop watching
+
+`cyclops daemon stop` stops observation and delivery without killing tmux or
+rewriting the ledger. The next `cyclops start` starts the daemon again.
+
+Use tmux itself to attach or detach terminals:
 
 ```bash
-cyclops send reviewer "Review the diff on origin/main."
+tmux attach -t main
 ```
-
-## Detach without stopping agents
-
-```bash
-cyclops detach
-```
-
-tmux keeps running, so your agents keep their state.
-
-## Troubleshooting
-
-- Run `tmux ls` to confirm the target session exists.
-- If Cyclops cannot see a pane, make sure it is inside the session you attached to.
-- Cyclops requires tmux 3.2\+. Check with `tmux -V`.

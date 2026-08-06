@@ -1,15 +1,19 @@
-# How the Cyclops workspace TUI currently works
+# Historical snapshot: how the Cyclops workspace TUI worked
 
-Research record only. This page describes the implementation that exists; it
-does not recommend changes or synthesize the Herdr and Ratatui research lanes.
+Research record only. This page describes the implementation at the pinned
+commit below; it does not describe the current repository layout. Historical
+source links point at that commit so later moves do not make the evidence lie.
+For the current implementation, start in `src/cyclops-workspace` and
+`docs/guides/workspace-ui.md`.
 
 ## Scope and evidence
 
 - Repository commit: `3b5c768eb6f2d03337d50fb0bae305f8f19eab35`
 - Commit date: 2026-08-05
-- Primary scope: `crates/cyclops-workspace`
-- Supporting scope: `cyclops-tmux`, `cyclops-theme`, `cyclops-proto`,
-  `docs/workspace-ui.md`, `docs/INVARIANTS.md`, and findings F34-F37
+- Primary scope at that commit: `crates/cyclops-workspace`
+- Supporting scope at that commit: `cyclops-tmux`, `cyclops-theme`,
+  `cyclops-proto`, the former workspace UI and invariants pages, and findings
+  F34-F37
 - Dependency versions: Ratatui 0.30.2, direct Crossterm 0.28.1,
   `ratatui-crossterm`'s Crossterm 0.29.0, `alacritty_terminal` 0.26.0,
   Tokio 1.53.1, and test-only `vt100` 0.16.2
@@ -439,19 +443,19 @@ These are facts about the current code surface, not change recommendations:
 
 | Question | Primary evidence |
 |---|---|
-| Boot, producers, event loop, priority, draw | [`app.rs`](../../crates/cyclops-workspace/src/app.rs) |
-| Model and visible-runtime policy | [`model.rs`](../../crates/cyclops-workspace/src/model.rs) |
-| tmux snapshot and hydration | [`sync.rs`](../../crates/cyclops-workspace/src/sync.rs) |
-| Structural commands | [`intent.rs`](../../crates/cyclops-workspace/src/intent.rs) |
-| VT behavior and cell conversion | [`runtime/alacritty.rs`](../../crates/cyclops-workspace/src/runtime/alacritty.rs), [`runtime/grid.rs`](../../crates/cyclops-workspace/src/runtime/grid.rs) |
-| Geometry | [`layout.rs`](../../crates/cyclops-workspace/src/layout.rs) |
-| Composition and visuals | [`render.rs`](../../crates/cyclops-workspace/src/render.rs), [`theme.rs`](../../crates/cyclops-workspace/src/theme.rs) |
-| Keyboard | [`input/router.rs`](../../crates/cyclops-workspace/src/input/router.rs), [`input.rs`](../../crates/cyclops-workspace/src/input.rs), [`bindings.rs`](../../crates/cyclops-workspace/src/bindings.rs) |
-| Mouse and direct manipulation | [`input/mouse.rs`](../../crates/cyclops-workspace/src/input/mouse.rs), [`selection.rs`](../../crates/cyclops-workspace/src/selection.rs), [`drag.rs`](../../crates/cyclops-workspace/src/drag.rs) |
-| Agent/attention chrome | [`decoration.rs`](../../crates/cyclops-workspace/src/decoration.rs) |
-| Terminal restoration | [`term_guard.rs`](../../crates/cyclops-workspace/src/term_guard.rs) |
-| Persistence and reconnect | [`persist.rs`](../../crates/cyclops-workspace/src/persist.rs), [`resilience.rs`](../../crates/cyclops-workspace/src/resilience.rs) |
-| User-visible contract | [`docs/workspace-ui.md`](../../docs/workspace-ui.md) |
-| Invariants | [`docs/INVARIANTS.md`](../../docs/INVARIANTS.md) |
+| Boot, producers, event loop, priority, draw | [`app.rs`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/app.rs) |
+| Model and visible-runtime policy | [`model.rs`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/model.rs) |
+| tmux snapshot and hydration | [`sync.rs`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/sync.rs) |
+| Structural commands | [`intent.rs`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/intent.rs) |
+| VT behavior and cell conversion | [`runtime/alacritty.rs`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/runtime/alacritty.rs), [`runtime/grid.rs`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/runtime/grid.rs) |
+| Geometry | [`layout.rs`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/layout.rs) |
+| Composition and visuals | [`render.rs`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/render.rs), [`theme.rs`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/theme.rs) |
+| Keyboard | [`input/router.rs`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/input/router.rs), [`input.rs`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/input.rs), [`bindings.rs`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/bindings.rs) |
+| Mouse and direct manipulation | [`input/mouse.rs`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/input/mouse.rs), [`selection.rs`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/selection.rs), [`drag.rs`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/drag.rs) |
+| Agent/attention chrome | [`decoration.rs`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/decoration.rs) |
+| Terminal restoration | [`term_guard.rs`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/term_guard.rs) |
+| Persistence and reconnect | [`persist.rs`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/persist.rs), [`resilience.rs`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/src/resilience.rs) |
+| User-visible contract | [`docs/workspace-ui.md`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/docs/workspace-ui.md) |
+| Invariants | [`docs/INVARIANTS.md`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/docs/INVARIANTS.md) |
 | VT and tmux measurements | [`findings.md`](../../findings.md) (F34-F37) |
-| Locked dependency versions | [`Cargo.lock`](../../Cargo.lock), [`crates/cyclops-workspace/Cargo.toml`](../../crates/cyclops-workspace/Cargo.toml) |
+| Locked dependency versions | [`Cargo.lock`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/Cargo.lock), [`crates/cyclops-workspace/Cargo.toml`](https://github.com/cyclops-team/cyclops/blob/3b5c768eb6f2d03337d50fb0bae305f8f19eab35/crates/cyclops-workspace/Cargo.toml) |

@@ -1,52 +1,60 @@
 ---
-title: "Sessions"
-description: "Persist and restore Cyclops sessions."
+title: "Workspaces and sessions"
+description: "Save and restore tmux layouts, names, and working directories."
 ---
 
-Cyclops sessions map to tmux sessions. Because agents live in tmux, they survive Cyclops restarts, terminal reboots, and SSH disconnects.
+A Cyclops workspace is a saved description of a tmux session: windows,
+pane rows, relative sizes, working directories, and agent names.
 
-## List sessions
-
-```bash
-cyclops sessions
-```
-
-Shows every tmux session Cyclops has attached to, with the number of tracked agents in each.
-
-## Reattach after a restart
-
-If you close Cyclops and come back later:
+## Open a workspace
 
 ```bash
-cyclops attach work
+cyclops start
+cyclops start --workspace review --session review --preset duo
 ```
 
-Cyclops rediscovers the panes in `work` and restores their agent IDs and names from local state.
+`start` is safe to run repeatedly. It builds or restores a missing session,
+but it does not rearrange a session that already exists.
 
-## Rename an agent
+The shipped presets are `solo`, `duo`, `quad`, and `ops`. A preset is used
+only when no saved workspace or session already answers that name.
+
+## Save a session
 
 ```bash
-cyclops rename 2 builder
+cyclops workspace save
+cyclops workspace save review-setup --session main
 ```
 
-Names persist across sessions.
+The file lands in `$CYCLOPS_HOME/workspaces/`. Save records non-shell commands
+as optional launch hints but never runs them while saving.
 
-## Remove an agent
-
-Stop tracking a pane without killing it:
+## Restore a workspace
 
 ```bash
-cyclops rm reviewer
+cyclops workspace restore review-setup --session review-copy
 ```
 
-The tmux pane keeps running.
+Restore always creates a new tmux session. Add `--launch` only when you want
+the recorded commands to run; without it, restored panes start as shells.
 
-## Kill a session
-
-Stop every agent in a session and remove the tmux session:
+## Rename or release an agent name
 
 ```bash
-cyclops kill work
+cyclops name reviewer code-review
+cyclops name code-review --clear
 ```
 
-Use with care: this terminates the underlying tmux session.
+Names live in Cyclops' durable registry and in saved workspace files. Pane ids
+are deliberately not saved because tmux reuses them.
+
+## Remove a session
+
+Cyclops has no `kill` command. Use tmux explicitly when you intend to destroy
+the processes in a session:
+
+```bash
+tmux kill-session -t review-copy
+```
+
+Stopping `cyclopsd` does not kill any tmux session.
