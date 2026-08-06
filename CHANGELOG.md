@@ -91,6 +91,13 @@ versions are unreleased until admin cuts a tag.
 - Event panel body rows printed in the terminal's own foreground on the
   panel's themed ground, unreadable on a light host; they wear chrome
   text now.
+- Copying from scrollback grabbed the wrong rows: selection mapped
+  screen coordinates straight to grid lines, which only agree when the
+  pane sits at the live tail. Highlighted history now copies exactly
+  what is on screen, a scrolled pane shows a dim "N back" hint on its
+  frame, and a resize no longer wipes local scrollback and deadens the
+  wheel. Every hydration also stops pushing one phantom blank line into
+  history.
 - A label held by a vanished pane blocked its name forever while
   appearing in no roster: killing a tmux session delivers no per-pane
   deaths to control mode (F47), so the adoption registry never released
