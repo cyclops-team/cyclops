@@ -755,6 +755,7 @@ mod tests {
             watched_sessions: HashSet::new(),
             event_stream_open: false,
             record: cyclops_ui::Record::new(),
+            intake: cyclops_ui::Intake::new(),
             term_size: (80, 24),
             declared_client_size: None,
             needs_reconcile: false,

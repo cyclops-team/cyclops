@@ -163,7 +163,18 @@ struct App {
     /// the panel is closed would show an empty history the moment it
     /// reopens mid-session; keeping it warm costs nothing a closed panel
     /// would otherwise save.
+    ///
+    /// Built and fed through [`crate::event_record`]: the same replayed
+    /// ledger tail, status seed, and live ordering `cyclops watch` runs,
+    /// so the panel and the CLI show one history rather than two that
+    /// agree only on formatting.
     record: cyclops_ui::Record,
+    /// Startup ordering and seq dedup for `record`
+    /// ([`cyclops_ui::Intake`]): live entries reaching the app before
+    /// [`crate::event_record::boot`] lands its backfill buffer here, and
+    /// ledger-backed duplicates arriving live during startup are dropped
+    /// by seq instead of shown twice.
+    intake: cyclops_ui::Intake,
     term_size: (u16, u16),
     /// Last size successfully declared by this control client. Avoids a
     /// resize notification loop when expanded pane gutters are already at
@@ -423,6 +434,7 @@ pub async fn run_async() -> i32 {
         watched_sessions: HashSet::new(),
         event_stream_open: false,
         record: cyclops_ui::Record::new(),
+        intake: cyclops_ui::Intake::new(),
         term_size,
         declared_client_size,
         needs_reconcile: false,
@@ -437,7 +449,11 @@ pub async fn run_async() -> i32 {
     // for. Ask before drawing it.
     ensure_sessions_watched(&mut app);
     app.decoration = decoration::fetch_decoration(&app.home).unwrap_or_default();
-    seed_event_record(&mut app.record, &app.home);
+    // The subscription at the top of this function is already queuing live
+    // entries on the app channel; boot's backfill-then-seed lands before
+    // the loop below drains them, which is exactly the order the intake
+    // contract wants (crate::event_record's doc).
+    crate::event_record::boot(&mut app.record, &mut app.intake, &app.home);
 
     let mut debounce: Option<Instant> = None;
     let mut reconnect_deadline: Option<Instant> = None;
@@ -597,38 +613,6 @@ fn spawn_notif_forwarder(
             }
         }
     });
-}
-
-/// Seed `record` from the daemon's boot-time status answer, the same
-/// one-time reconciliation `cyclops watch` runs at startup
-/// (`cyclops_ui::StatusSeed::from_status`, `Record::seed`).
-///
-/// This is a second `status` request beyond the one
-/// `decoration::fetch_decoration` already made at boot: the daemon's
-/// answer that call converts keeps only the fields workspace chrome
-/// needs, not the raw `PaneSnapshot`/`OpenDelivery` lists the stream
-/// model seeds from. Paying one more bounded, one-shot request here is
-/// simpler than threading the raw answer through `decoration.rs`'s
-/// conversion, and it never repeats: after boot the record moves on the
-/// live `events.subscribe` push alone, exactly like `cyclops watch`'s own
-/// register.
-///
-/// A ledger-tail backfill (`cyclops watch`'s replayed history) is not
-/// built here: it would need a second reader of the daemon's ledger
-/// files, which is new IO machinery this task does not add. The panel
-/// starts from the seeded attention state plus whatever arrives live
-/// after this call, which is acceptable for a view that can also be
-/// reopened mid-session (see `App::record`'s doc).
-fn seed_event_record(record: &mut cyclops_ui::Record, home: &std::path::Path) {
-    let params = cyclops_proto::StatusParams {
-        open_deliveries: true,
-    };
-    if let Ok(status) = crate::daemon::status(home, params) {
-        let seed = cyclops_ui::StatusSeed::from_status(&status);
-        for e in record.seed(&seed.panes, &seed.open) {
-            record.replay(e);
-        }
-    }
 }
 
 fn now_ms() -> u64 {
@@ -1135,9 +1119,11 @@ async fn handle_app_msg(
         // `spawn_decoration_forwarder`'s doc). `Record::live` also moves
         // the record's own attention register by the one rule in
         // `cyclops_proto::attention`, the same rule `app.decoration`'s
-        // register answers to; neither side recomputes it.
+        // register answers to; neither side recomputes it. The intake
+        // between here and the record drops ledger-backed entries the
+        // boot-time tail already replayed (crate::event_record).
         AppMsg::StreamEntry(entry) => {
-            app.record.live(*entry);
+            crate::event_record::live(&mut app.record, &mut app.intake, *entry);
             arm(debounce);
         }
         AppMsg::Mouse(mouse) => {
@@ -2219,6 +2205,7 @@ mod tests {
             watched_sessions: HashSet::new(),
             event_stream_open: false,
             record: cyclops_ui::Record::new(),
+            intake: cyclops_ui::Intake::new(),
             term_size: (40, 12),
             declared_client_size: None,
             needs_reconcile: false,

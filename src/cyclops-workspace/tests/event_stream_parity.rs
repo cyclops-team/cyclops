@@ -1,26 +1,31 @@
 //! E2 parity: the workspace event panel must show the same ordered,
-//! plain-text rows `cyclops watch` shows for the identical transcript.
+//! plain-text rows `cyclops watch` shows for the identical transcript —
+//! and it must ACQUIRE them the same way, not merely format them the
+//! same way.
 //!
-//! `cyclops_ui::stream::Record`/`Entry` are the shared, backend-neutral
-//! model (src/cyclops-ui/src/stream.rs); `cyclops_workspace::
-//! event_stream_rows` is the workspace panel's actual row-producing path
-//! (`src/cyclops-workspace/src/render.rs`, also called by
-//! `paint_event_stream`). This test feeds one backfill-plus-live
-//! transcript to two separately fed `Record`s and asserts that reading
-//! one the way `cyclops watch`'s follow mode does (`Record::admits` plus
-//! `Entry::lines`, `src/cyclops-ui/src/plain.rs` `print_line`) and
-//! reading the other through `event_stream_rows` produce byte-identical
-//! rows in the same order. Neither path may re-sort, re-filter beyond the
-//! model's own admission decision, or reword a line.
+//! One startup-plus-live transcript is driven, step by step, into two
+//! records: one fed exactly the way `cyclops watch`'s plain follow loop
+//! feeds its own (the three `UiMsg` arms in `src/cyclops-ui/src/plain.rs`,
+//! replicated verbatim here), one fed through the workspace's real
+//! transport-to-model seam (`cyclops_workspace::event_record`, the
+//! functions `App` boot and the `AppMsg::StreamEntry` arm call in
+//! production). The transcript exercises the whole startup contract: a
+//! live entry that races ahead of the backfill, a status seed that must
+//! wait for it, a replayed ledger tail, a seq-duplicate the dedup must
+//! drop, and post-startup live traffic. If the workspace skipped the
+//! tail, reordered the seed, or showed the duplicate twice — each a real
+//! divergence at some point in this panel's history — the two row lists
+//! stop being identical.
 
 use cyclops_proto::{AgentState, NotifyLevel, PaneSnapshot};
-use cyclops_ui::{Entry, EntryKind, Record, StatusSeed, Theme};
+use cyclops_ui::{Entry, EntryKind, Intake, Record, StatusSeed, Theme};
+use cyclops_workspace::event_record;
 
-fn msg(ts: u64, from: &str, to: &[&str], subject: &str) -> Entry {
+fn msg(ts: u64, seq: Option<u64>, from: &str, to: &[&str], subject: &str) -> Entry {
     Entry {
         uid: 0,
         ts,
-        seq: None,
+        seq,
         id: Some("m-1".into()),
         kind: EntryKind::Msg {
             from: from.into(),
@@ -32,11 +37,11 @@ fn msg(ts: u64, from: &str, to: &[&str], subject: &str) -> Entry {
     }
 }
 
-fn state(ts: u64, target: &str, pane_id: &str, state: AgentState) -> Entry {
+fn state(ts: u64, seq: Option<u64>, target: &str, pane_id: &str, state: AgentState) -> Entry {
     Entry {
         uid: 0,
         ts,
-        seq: None,
+        seq,
         id: None,
         kind: EntryKind::State {
             target: target.into(),
@@ -62,63 +67,97 @@ fn ping(ts: u64, pane_id: &str, subject: &str) -> Entry {
     }
 }
 
-/// Feed the canonical backfill-plus-live shape onto one `Record`: a
-/// replayed ledger line, the daemon's startup reconciliation (seed), and
-/// two live transitions — one that resolves the seed's alarm and one
-/// routine transition that must never surface. Mirrors the ordering
-/// `cyclops_ui::stream::Intake` enforces (replayed tail, then seed, then
-/// live backlog) without needing `Intake` itself: both consumers under
-/// test read a `Record` that already holds this history, exactly as the
-/// workspace's own boot-then-live-feed path builds one (no ledger tail,
-/// per E2's scope; see `App::record`'s doc in `src/cyclops-workspace/
-/// src/app.rs`).
-fn build_record() -> Record {
-    let mut record = Record::new();
+/// One startup-plus-live step, transport-neutral: what arrived, not how.
+enum Step {
+    Live(Entry),
+    Status(Box<StatusSeed>),
+    Backfill(Vec<Entry>, Option<u64>),
+}
 
-    // 1. Replayed history: a message to admin, deterministic clock.
-    record.replay(msg(1_000, "codex", &["admin"], "backfilled note"));
-
-    // 2. The daemon's one-time status answer: reviewer is blocked right
-    //    now. `Record::seed` stamps this line with the wall clock (it is
-    //    the daemon's answer about "now", not a replayed transition), so
-    //    its own text is not asserted verbatim below — only that it is
-    //    identical between the two `Record`s under test.
-    let seed = StatusSeed {
-        watched: vec!["main".into()],
-        panes: vec![PaneSnapshot {
-            pane_id: "%1".into(),
-            name: "reviewer".into(),
-            state: AgentState::BlockedPermission,
-        }],
-        open: Vec::new(),
-        roster: Vec::new(),
+/// The canonical transcript. The ledger's tail holds a message and the
+/// block it recorded (seq 5 and 6); the subscription races the tail read
+/// and delivers seq 6 a second time before the backfill lands; the
+/// daemon's status answer agrees the pane is still blocked; then live
+/// traffic resolves the alarm (which also outlives the admin ping aimed
+/// at it) and a routine transition arrives that the calm view must never
+/// admit.
+fn transcript() -> Vec<Step> {
+    let blocked = || {
+        state(
+            1_500,
+            Some(6),
+            "reviewer",
+            "%1",
+            AgentState::BlockedPermission,
+        )
     };
-    for e in record.seed(&seed.panes, &seed.open) {
-        record.replay(e);
+    vec![
+        Step::Live(blocked()),
+        Step::Status(Box::new(StatusSeed {
+            watched: vec!["main".into()],
+            panes: vec![PaneSnapshot {
+                pane_id: "%1".into(),
+                name: "reviewer".into(),
+                state: AgentState::BlockedPermission,
+            }],
+            open: Vec::new(),
+            roster: Vec::new(),
+        })),
+        Step::Backfill(
+            vec![
+                msg(1_000, Some(5), "codex", &["admin"], "backfilled note"),
+                blocked(),
+            ],
+            Some(6),
+        ),
+        Step::Live(ping(3_000, "%1", "reviewer needs you")),
+        Step::Live(state(3_500, None, "reviewer", "%1", AgentState::Idle)),
+        Step::Live(state(4_000, None, "codex", "%2", AgentState::Working)),
+    ]
+}
+
+/// `cyclops watch`'s own feed: the `UiMsg::Entry`, `UiMsg::Status`, and
+/// `UiMsg::Backfill` arms of `src/cyclops-ui/src/plain.rs`, verbatim.
+fn feed_like_watch(record: &mut Record, intake: &mut Intake, step: Step) {
+    match step {
+        Step::Live(e) => {
+            for e in intake.entry(e) {
+                record.live(e);
+            }
+        }
+        Step::Status(seed) => {
+            if let Some(seed) = intake.status(seed) {
+                for e in record.seed(&seed.panes, &seed.open) {
+                    record.replay(e);
+                }
+            }
+        }
+        Step::Backfill(entries, max_seq) => {
+            let landed = intake.backfill(entries, max_seq);
+            for e in landed.replayed {
+                record.replay(e);
+            }
+            if let Some(seed) = landed.seed {
+                for e in record.seed(&seed.panes, &seed.open) {
+                    record.replay(e);
+                }
+            }
+            for e in landed.live {
+                record.live(e);
+            }
+        }
     }
+}
 
-    // 3. A live admin ping about the pane the seed just put in the
-    //    register. Both consumers below filter the FULL ring at the end
-    //    of this function, by which point step 4 has already resolved
-    //    the alarm this ping points at — so it will not be admitted
-    //    either, the same "outlived its own alarm" case
-    //    `src/cyclops-ui/src/stream.rs` documents on `Record::admits`.
-    //    It stays in the transcript because agreeing on that exclusion is
-    //    exactly the kind of divergence a private projection could get
-    //    wrong silently.
-    record.live(ping(2_000, "%1", "reviewer needs you"));
-
-    // 4. The pane clears. Not itself admin-visible (idle needs nobody),
-    //    but it resolves the seed's alarm, so the record appends a
-    //    `Cleared` row right behind it (rule 8: append, never retract) —
-    //    and that row is what admits the ping's absence above.
-    record.live(state(3_000, "reviewer", "%1", AgentState::Idle));
-
-    // 5. A routine transition on an unrelated pane: on the record, never
-    //    in the calm view.
-    record.live(state(4_000, "codex", "%2", AgentState::Working));
-
-    record
+/// The workspace's feed: the production seam itself.
+fn feed_like_workspace(record: &mut Record, intake: &mut Intake, step: Step) {
+    match step {
+        Step::Live(e) => event_record::live(record, intake, e),
+        Step::Status(seed) => event_record::status(record, intake, seed),
+        Step::Backfill(entries, max_seq) => {
+            event_record::backfill(record, intake, entries, max_seq)
+        }
+    }
 }
 
 /// What `cyclops watch`'s follow mode prints for one admitted entry
@@ -135,9 +174,18 @@ fn cyclops_watch_rows(record: &Record) -> Vec<String> {
 }
 
 #[test]
-fn the_workspace_panel_shows_the_same_rows_cyclops_watch_does() {
-    let watch_record = build_record();
-    let panel_record = build_record();
+fn the_workspace_panel_acquires_and_shows_the_rows_cyclops_watch_does() {
+    let mut watch_record = Record::new();
+    let mut watch_intake = Intake::new();
+    let mut panel_record = Record::new();
+    let mut panel_intake = Intake::new();
+
+    // Interleave per step (not per consumer) so the two `Record::seed`
+    // wall-clock stamps land as close together as two calls can.
+    for (watch_step, panel_step) in transcript().into_iter().zip(transcript()) {
+        feed_like_watch(&mut watch_record, &mut watch_intake, watch_step);
+        feed_like_workspace(&mut panel_record, &mut panel_intake, panel_step);
+    }
 
     let watch_rows = cyclops_watch_rows(&watch_record);
     let panel_rows: Vec<String> = cyclops_workspace::event_stream_rows(&panel_record)
@@ -147,23 +195,42 @@ fn the_workspace_panel_shows_the_same_rows_cyclops_watch_does() {
 
     assert_eq!(
         watch_rows, panel_rows,
-        "the panel's row-producing path must not re-sort, re-filter, or reword a line"
+        "one transcript, two consumers, one history — acquisition included"
     );
 
-    // Three rows survive the calm-view filter, in record order: the
-    // backfilled message, the seed's reconciliation line, and the
-    // clearance the live idle transition produced. The ping from step 3
-    // is correctly excluded — its alarm resolved before either consumer
-    // asked, so admission and exclusion agree on both sides too.
-    assert_eq!(panel_rows.len(), 3, "{panel_rows:#?}");
+    // The properties the transcript was built to prove, asserted on the
+    // panel's rows (already known equal to watch's above):
+    //
+    // 1. The replayed ledger tail is present — the panel does not start
+    //    from the seed alone.
     assert_eq!(panel_rows[0], "00:00:01  codex → admin  backfilled note");
+    // 2. The seq-6 block shows exactly once: the live copy that raced
+    //    the backfill was dropped by seq, the replayed one kept. The
+    //    clearance row quotes the same state word ("cleared · was …"),
+    //    so it is excluded from the count rather than mistaken for a
+    //    second block.
+    let blocked_word = AgentState::BlockedPermission.to_string();
+    let blocked_rows = panel_rows
+        .iter()
+        .filter(|r| r.ends_with(&blocked_word) && !r.contains("cleared"))
+        .count();
+    assert_eq!(blocked_rows, 1, "{panel_rows:#?}");
+    // 3. The alarm resolved, so the record appended a clearance (rule 8:
+    //    append, never retract) and the ping aimed at the alarm outlived
+    //    it — admitted nowhere.
     assert!(
-        panel_rows[1].ends_with("reviewer  ⚠ blocked_permission"),
-        "{:?}",
-        panel_rows[1]
+        panel_rows.iter().any(|r| r.contains("cleared")),
+        "{panel_rows:#?}"
     );
-    assert_eq!(
-        panel_rows[2],
-        "00:00:03  reviewer  ✔ cleared · was ⚠ blocked_permission"
+    assert!(
+        !panel_rows.iter().any(|r| r.contains("needs you")),
+        "{panel_rows:#?}"
+    );
+    // 4. The routine transition never surfaces in the calm view.
+    assert!(
+        !panel_rows
+            .iter()
+            .any(|r| r.ends_with(&AgentState::Working.to_string())),
+        "{panel_rows:#?}"
     );
 }
