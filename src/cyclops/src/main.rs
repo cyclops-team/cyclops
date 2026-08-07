@@ -237,6 +237,11 @@ struct StartArgs {
     /// Run each pane's recorded command instead of leaving a shell.
     #[arg(long)]
     launch: bool,
+    /// Agent CLIs to start, by manifest id, one per named pane in layout
+    /// order: --agents claude,codex. They run as cyclops builds the panes;
+    /// a later start or restore still needs --launch to run them again.
+    #[arg(long, value_delimiter = ',')]
+    agents: Vec<String>,
     /// Write the config and the detection manifests, and stop before
     /// opening anything. What `scripts/install.sh` runs last.
     #[arg(long)]
@@ -598,7 +603,10 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
             args.workspace.as_deref(),
             args.session.as_deref(),
             args.preset.as_deref(),
-            args.launch,
+            &workspace::Launch {
+                stored: args.launch,
+                agents: &args.agents,
+            },
             !args.no_daemon,
         ),
         Cmd::Workspace {

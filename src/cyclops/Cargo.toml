@@ -8,10 +8,6 @@ description = "The Cyclops CLI: thin NDJSON client over the daemon socket."
 # The silence tests need a real terminal on the child's stdout: the theme
 # is only read when stdout is a tty, so a piped run cannot see the warning.
 libc.workspace = true
-# The CLI ships the detection manifests as text and never parses one; the
-# loader is here so the test can prove a shipped file still loads, which is
-# the difference between seeding an install and seeding a broken one.
-cyclops-manifest.workspace = true
 # The workspace verbs build real tmux sessions, so their tests need the
 # isolated server and its teardown rule.
 cyclops-testrig.workspace = true
@@ -20,6 +16,10 @@ tempfile = "3"
 
 [dependencies]
 cyclops-proto.workspace = true
+# The CLI ships the detection manifests as text and seeds them. It reads
+# them for one key: `cyclops start --agents <id>` needs the launch command
+# a manifest names, and the schema has exactly one owner (AGENTS.md).
+cyclops-manifest.workspace = true
 cyclops-theme.workspace = true
 # The workspace verbs build tmux sessions, and every tmux specific in
 # Cyclops lives in the adapter crate.

@@ -7,6 +7,27 @@ versions are unreleased until admin cuts a tag.
 
 ### Added (v4)
 
+- Ten more themes, seventeen in all. Six bright originals drawn on paper
+  rather than inverted from a dark theme (`sorbet`, `meadow`,
+  `periwinkle`, `blossom`, `seafoam`, `buttercream`) and four dark
+  originals (`midnight`, `ember`, `forest`, `obsidian`). Each carries all
+  42 tokens with explicit 256-color fallbacks and maps the ANSI-16
+  palette at ink strength, so an agent CLI printing in red, green or
+  yellow stays legible on that theme's pane ground.
+- `cyclops start --agents <id>[,<id>...]` names the CLIs for a preset's
+  labeled panes and starts them as the panes are built. Ids are matched
+  against installed manifests, and an unknown id or a count that does not
+  fit the preset is refused before a single pane exists. The commands
+  persist into the workspace file, and replaying them later still takes
+  an explicit `--launch`: naming CLIs at the keyboard is a decision about
+  this run, not a standing one. Launched CLIs have no hooks wired, so
+  their receipts stay screen-verified until `cyclops hooks install`.
+- Manifests upgrade the same way themes do. A manifest file still
+  byte-identical to a version Cyclops shipped is a seed nobody edited and
+  is replaced by the newer shipped body; anything else is the operator's
+  measurement and is never touched. Without this, `--agents` was dead on
+  every home seeded before the feature existed, because the shipped
+  `launch` key could not reach it.
 - Pane swap moves to a dedicated grip. Every pane paints a one-cell `⠿`
   handle in its bottom-right border corner, and dragging that cell onto
   another pane swaps the two with the drop resolution and focus-follows

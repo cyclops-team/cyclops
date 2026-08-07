@@ -30,8 +30,8 @@ implementation remains available as the read-only `v1` branch and
 - Four detection manifests ship for Claude Code, Codex CLI, Antigravity CLI,
   and Cursor Agent CLI. New terminal agents are added with TOML rather than
   Rust code.
-- Seven themes and four layout presets ship as resources compiled into the
-  CLI and seeded into the Cyclops home without overwriting local edits.
+- Seventeen themes and four layout presets ship as resources compiled into
+  the CLI and seeded into the Cyclops home without overwriting local edits.
   Every theme carries a pane ground and a full ANSI-16 palette; homes
   seeded before those tokens existed resolve them from compiled defaults
   until reseeded.

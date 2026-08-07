@@ -12,6 +12,9 @@ display_name = "Antigravity CLI"
 version_tested = "1.1.6"
 process_names = ["agy"]
 default_model_observed = "Gemini 3.6 Flash (High)"
+# What `cyclops start --agents agy` runs in a pane. The bare CLI; the ACK
+# gap below is a property of this vendor and a pane started here has it too.
+launch = "agy"
 
 [hooks]
 # From the binary's embedded docs (strings extraction) and confirmed live.

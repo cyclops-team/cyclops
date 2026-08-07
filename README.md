@@ -262,6 +262,25 @@ $ cyclops start --workspace ops --session ops --preset ops
   cyclopsd won't watch "ops" until it's listed in ~/.cyclops/config.toml. Add it to sessions there, then restart cyclopsd.
 ```
 
+A preset ships names and shapes, never CLIs: which agent belongs in which
+pane is yours to say. `--agents` says it, by manifest id, one per named
+pane in layout order.
+
+```
+cyclops start --preset duo --agents claude,codex
+```
+
+That starts them in this run. A workspace cyclops builds from a preset is
+written down as it builds it, so the file carries the fleet too; a
+workspace you saved yourself is never rewritten behind you. Either way the
+next run starts nothing on its own: a command in a file is a suggestion,
+and replaying it stays a `--launch` you type each time. An id cyclops has
+no manifest for, or more CLIs than the preset has named panes, is refused
+before a single pane is built.
+
+The CLIs come up bare. Hook wiring is `cyclops hooks install`, so receipts
+from a freshly spun fleet are screen-tier until you wire them.
+
 More: [workspace guide](docs/guides/workspaces.md).
 
 ### 5. Structured messages
@@ -382,12 +401,22 @@ every surface at once, including the pane borders:
 
 ```
 $ cyclops theme
+  blossom        ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  buttercream    ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   catppuccin     ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
 ▸ dark           ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  ember          ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  forest         ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   gruvbox        ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   high-contrast  ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   light          ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  meadow         ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  midnight       ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   nord           ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  obsidian       ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  periwinkle     ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  seafoam        ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  sorbet         ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   tokyo-night    ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
 
   cyclops theme <name> to switch

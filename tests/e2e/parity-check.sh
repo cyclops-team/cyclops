@@ -317,6 +317,7 @@ DEMO_MANIFEST=$(cat <<'EOF'
 id = "demo"
 display_name = "Parity rig stand-in"
 process_names = ["sh", "bash", "dash", "zsh", "cat"]
+launch = "cat"
 
 [hooks]
 turn_start = "UserPromptSubmit"
@@ -355,7 +356,7 @@ echo "#### Rung 1: one pane, persistence, history"
 # the rig takes the same two steps a person installing does.
 run "$CYC" start --setup-only --plain
 check "setup writes the config"           'wrote .*/config\.toml$'
-check "setup installs the themes"         '^  wrote 7 themes to .*/themes$'
+check "setup installs the themes"         '^  wrote 17 themes to .*/themes$'
 check "setup installs the manifests"      '^  wrote 4 detection manifests to .*/manifests$'
 
 # Two budgets raised above their defaults, for the rig and not for cyclops.
@@ -546,6 +547,40 @@ check "and the second one too"            '^ +reviewer +○ idle$'
 run "$CYC" start --workspace ops --session ops --preset ops --no-daemon --plain
 check "a preset builds three agents"      '^✓ workspace ready · 3 agents$'
 check "and says what the daemon needs"    'cyclopsd won.t watch "ops" until it.s listed in'
+
+# The blank a shipped preset leaves on purpose: which CLI runs in which
+# pane. It is named per run, against the manifests this home holds, and the
+# only CLI on this rig is the stand-in (launch = "cat" above). A vendor CLI
+# is never started here: the gate has to pass on a machine with none
+# installed.
+run "$CYC" start --workspace fleet --session fleet --preset duo --agents demo,demo --no-daemon --plain
+check "--agents opens two named panes"    '^✓ workspace ready · 2 agents$'
+check_file "and writes the fleet into the workspace" \
+  "$CYCLOPS_HOME/workspaces/fleet.toml" '^command = "cat"$'
+
+fleet_running() { [ "$(tmx list-panes -t '=fleet' -F '#{pane_current_command}' | sort -u)" = "cat" ]; }
+wait_for "the fleet to be running" 25 fleet_running
+printf '\n$ tmux list-panes -t fleet -F "#{pane_current_command}"\n'
+tmx list-panes -t '=fleet' -F '#{pane_current_command}' > "$OUT"
+cat "$OUT"
+check "both panes run what --agents named" '^cat$'
+check_absent "and neither fell back to a shell" '^[a-z]*sh$'
+
+# The other half of the rule: naming CLIs runs them now, and a command
+# written into a workspace still needs --launch on every later run.
+printf '\n$ tmux kill-session -t fleet\n'
+tmx kill-session -t '=fleet'
+run "$CYC" start --workspace fleet --session fleet --no-daemon --plain
+check "the workspace comes back"          '^✓ workspace ready · 2 agents$'
+printf '\n$ tmux list-panes -t fleet -F "#{pane_current_command}"\n'
+tmx list-panes -t '=fleet' -F '#{pane_current_command}' > "$OUT"
+cat "$OUT"
+check_absent "with empty panes, not the fleet" '^cat$'
+
+run "$CYC" start --workspace fleet2 --session fleet2 --preset duo --agents demo --no-daemon --plain
+check "a fleet that does not fit is refused" 'preset duo has 2 named panes \(implementer, reviewer\)'
+check "and names the arrangement that fits"  '\-\-preset solo, which has 1'
+check_exit "and exits 2" 2
 
 echo
 echo "#### Rung 5: structured messages with receipts"

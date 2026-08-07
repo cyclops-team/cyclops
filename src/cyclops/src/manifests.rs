@@ -14,14 +14,15 @@
 //! files. `cyclops start` writes them into `$CYCLOPS_HOME/manifests`, which
 //! is where cyclopsd looks when `manifest_dir` is unset.
 //!
-//! Writing never overwrites. These files are meant to be edited, a rule
-//! that has already been measured against a real CLI is worth more than the
-//! shipped guess, and a seed that clobbered would throw that away on every
-//! run. The cost is that a shipped file whose contents change does not
-//! reach a home that already has that name; the fix is deleting your copy
-//! and running `cyclops start` again, which is documented where it is felt
-//! (docs/guides/install.md).
+//! Writing never overwrites an edit. These files are meant to be edited, a
+//! rule that has already been measured against a real CLI is worth more than
+//! the shipped guess, and a seed that clobbered would throw that away on
+//! every run. What the seed does replace is its own writing: a file whose
+//! bytes are a version this project shipped is a seed nobody touched, and a
+//! newer shipped body takes its place ([`EVER_SHIPPED_FNV64`]). Same rule
+//! and same reason as [`crate::themeseed`].
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Every manifest the binary carries, by file name.
@@ -49,10 +50,63 @@ pub fn dir(home: &Path) -> PathBuf {
     home.join("manifests")
 }
 
+/// FNV-1a 64 of every manifest body this project has ever shipped, the
+/// current ones included. A file on disk whose hash is in this list is a
+/// seed nobody edited, so a newer shipped body may replace it; any other
+/// content is a measurement somebody took against a real CLI and is never
+/// touched.
+///
+/// Measured cost of not having it: all ten manifest bodies in this repo's
+/// history predate the `launch` key, so every home seeded before that key
+/// existed holds a claude.toml and a codex.toml that say nothing about how
+/// to start the CLI. On those homes `cyclops start --preset duo --agents
+/// claude,codex` exits 2 saying the manifest has no launch command, and
+/// reinstalling does not help, because the old seed skipped every name it
+/// already found. That is the maintainer's own machines, and every install
+/// that predates the key.
+///
+/// Regenerate when a shipped manifest changes: hash every historical blob
+/// of resources/manifests/ (and the old manifests/ path) across all refs.
+/// The test below fails until the current bodies are listed, and prints the
+/// hash to append.
+const EVER_SHIPPED_FNV64: &[&str] = &[
+    "000da241c916d3cb",
+    "12765e334728f40b",
+    "2893de300e4fc944",
+    "3292eae226f54f79",
+    "3ee05959c01113a7",
+    "3f2860fa1275d798",
+    "4af4029b9d2910e3",
+    "5fb9fab4521686ad",
+    "6a4f11941f4c78be",
+    "7a9754b750109c5e",
+    "85f276e9afffc42d",
+    "9a67be48357ff9e0",
+    "bc4bc371b40e71ca",
+    "f6c7c7aaa830babb",
+];
+
+/// FNV-1a 64, hex. Not cryptographic and does not need to be: the question
+/// is "did the operator edit this file", not "is this an attack".
+fn fnv64(data: &[u8]) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in data {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
+}
+
+/// True when these bytes are a manifest this project wrote, so replacing
+/// them loses nothing the operator put there.
+fn unedited_seed(body: &[u8]) -> bool {
+    EVER_SHIPPED_FNV64.contains(&fnv64(body).as_str())
+}
+
 /// What one [`seed`] run did.
 pub struct Seeded {
     pub dir: PathBuf,
-    /// Shipped files written this run.
+    /// Shipped files written this run, fresh seeds and upgrades alike.
     pub written: Vec<String>,
     /// Shipped files already there, left exactly as they were.
     pub kept: Vec<String>,
@@ -74,8 +128,12 @@ impl Seeded {
 ///
 /// Runs on every `cyclops start`, not only the first: an upgrade that adds
 /// a manifest lands on the next start, and a home that predates this seed
-/// gets one without a reinstall. Files already present are never read,
-/// compared, or rewritten, so an edited copy survives every run.
+/// gets one without a reinstall. A file already present is rewritten only
+/// when its bytes are a version this project shipped
+/// ([`EVER_SHIPPED_FNV64`]): that file is a seed nobody touched, and
+/// leaving it stale is how a pre-`launch` claude.toml kept `--agents` dead
+/// on every install that predates the key. Anything else on disk is a
+/// measurement against a real CLI and survives every run.
 pub fn seed(home: &Path) -> Seeded {
     let dir = dir(home);
     let mut out = Seeded {
@@ -90,7 +148,15 @@ pub fn seed(home: &Path) -> Seeded {
     }
     for (name, body) in SHIPPED {
         let path = dir.join(name);
-        if path.exists() {
+        if let Ok(existing) = std::fs::read(&path) {
+            // Already current needs no write, and anything the operator
+            // typed outranks the shipped guess.
+            if existing == body.as_bytes() || !unedited_seed(&existing) {
+                out.kept.push((*name).to_string());
+                continue;
+            }
+        } else if path.exists() {
+            // There but unreadable: not ours to replace.
             out.kept.push((*name).to_string());
             continue;
         }
@@ -100,6 +166,88 @@ pub fn seed(home: &Path) -> Seeded {
         }
     }
     out
+}
+
+/// One agent CLI cyclops knows about, from the manifest that describes it.
+///
+/// The launch command is what `cyclops start --agents <id>` runs. None
+/// means the manifest detects that CLI without saying how to start it,
+/// which is a refusal and not a guess: the wrong binary name in a pane is
+/// a shell error the operator has to read out of a pane to understand.
+pub struct Known {
+    pub launch: Option<String>,
+    /// The file that said so, for a line telling the reader where to add
+    /// the key.
+    pub path: PathBuf,
+}
+
+/// Every agent CLI this home would use, by manifest id.
+///
+/// Two sources, and the order between them is the point. A file in the
+/// home wins, because that is the copy cyclopsd reads and the copy the
+/// operator edits. The shipped set fills in the ids the home does not have
+/// yet, because [`seed`] writes exactly those files later in the same
+/// `cyclops start` and refusing an id that is about to exist would be a
+/// lie about a first run.
+///
+/// One exception, and it is the rule [`seed`] runs on: a home file whose
+/// bytes are a version this project shipped is this project's own writing,
+/// not the operator's, so the shipped copy of that id wins here too. Both
+/// halves are needed. `cyclops start` resolves `--agents` before it seeds,
+/// so on a home carrying a pre-`launch` claude.toml the seed's upgrade
+/// lands one step too late to answer this run, and the run refuses. A home
+/// file whose id the shipped set does not carry is kept either way: that
+/// file is still what cyclopsd reads.
+///
+/// A file that does not parse is left out rather than reported. The daemon
+/// is what reads manifests for real and what says a directory is broken;
+/// this is one key lookup, and it does not get to speak for the install.
+pub fn known(home: &Path) -> BTreeMap<String, Known> {
+    let dir = dir(home);
+    let mut out = BTreeMap::new();
+    for (name, body) in SHIPPED {
+        // Named at the path the seed will write it to, so a line about a
+        // missing key points at the file the reader will have.
+        if let Some((id, k)) = parsed(body, dir.join(name)) {
+            out.insert(id, k);
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some((id, k)) = parsed(&text, path) else {
+            continue;
+        };
+        // The id check matters only once an id leaves SHIPPED: an unedited
+        // seed with no shipped counterpart is still the file cyclopsd
+        // reads, and dropping it would refuse an id that works.
+        if unedited_seed(text.as_bytes()) && out.contains_key(&id) {
+            continue;
+        }
+        out.insert(id, k);
+    }
+    out
+}
+
+/// The id and launch command a manifest body carries, or None when it does
+/// not parse.
+fn parsed(text: &str, path: PathBuf) -> Option<(String, Known)> {
+    let m = cyclops_manifest::Manifest::parse(text, &path).ok()?;
+    Some((
+        m.agent.id,
+        Known {
+            launch: m.agent.launch,
+            path,
+        },
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +299,30 @@ pub fn partly_installed(seeded: &Seeded) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The body the binary carries under `name`.
+    fn shipped(name: &str) -> &'static str {
+        SHIPPED
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, b)| *b)
+            .expect("a shipped manifest by that name")
+    }
+
+    /// A file body out of this repo's history, by blob sha. None when git
+    /// or the object is not reachable, which is a skip and not a failure:
+    /// the object is evidence about what shipped, not something this build
+    /// produces.
+    fn git_blob(sha: &str) -> Option<String> {
+        let out = std::process::Command::new("git")
+            .args(["-C", env!("CARGO_MANIFEST_DIR"), "cat-file", "blob", sha])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8(out.stdout).ok()
+    }
 
     /// The compiled-in copies have to be the files in the repo, and they
     /// have to be manifests cyclops can actually load. A binary shipping a
@@ -219,6 +391,218 @@ mod tests {
             installed(&third),
             format!("wrote 1 detection manifest to {}", dir(&home).display())
         );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Every current shipped body must be in the ever-shipped hash list,
+    /// which is what keeps the list honest: whoever changes a manifest sees
+    /// this fail and appends the new hash, so the version they replaced
+    /// stays recognizable as an unedited seed forever after.
+    #[test]
+    fn the_ever_shipped_list_contains_the_current_bodies() {
+        for (name, body) in SHIPPED {
+            assert!(
+                unedited_seed(body.as_bytes()),
+                "{name}'s current body is not in EVER_SHIPPED_FNV64; add {}",
+                fnv64(body.as_bytes())
+            );
+        }
+    }
+
+    /// The stale-seed trap, closed. Until this rule a manifest already on
+    /// disk was never read, so the `launch` key added to every shipped
+    /// manifest reached no home that had been seeded even once, and
+    /// `--agents` exited 2 on every install that predates the key.
+    ///
+    /// The real pre-`launch` bodies are blob-exact in git history and their
+    /// hashes are in `EVER_SHIPPED_FNV64`, but they run 5-8 KB each and do
+    /// not belong pasted into a test. What stands in for one here is a body
+    /// that hashes into the list and is not what belongs under that name:
+    /// the current codex.toml under claude.toml is exactly that, shipped
+    /// bytes nobody typed. The negative goes first, because a rule that
+    /// replaces too much is worse than the bug it fixes.
+    #[test]
+    fn an_unedited_old_seed_upgrades_and_an_edited_one_never_does() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-seed-upgrade");
+        let _ = std::fs::remove_dir_all(&home);
+        seed(&home);
+        let claude = dir(&home).join("claude.toml");
+
+        // Content this project never wrote is the operator's, and stays.
+        std::fs::write(&claude, "# measured on 2.1.220\n").expect("edit");
+        let kept = seed(&home);
+        assert!(kept.written.is_empty(), "{:?}", kept.written);
+        assert_eq!(kept.kept.len(), SHIPPED.len());
+        assert_eq!(
+            std::fs::read_to_string(&claude).unwrap(),
+            "# measured on 2.1.220\n"
+        );
+
+        // Shipped bytes under the wrong name are a seed, not a decision.
+        std::fs::write(&claude, shipped("codex.toml")).expect("plant");
+        let upgraded = seed(&home);
+        assert_eq!(upgraded.written, vec!["claude.toml".to_string()]);
+        let now = std::fs::read_to_string(&claude).unwrap();
+        assert_eq!(now, shipped("claude.toml"));
+        assert!(
+            now.contains("launch = \"claude\""),
+            "the upgrade is what carries the launch key onto an old home"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The other half, and the one `--agents` actually hits first.
+    /// `cyclops start` resolves the agent list before it seeds, so an
+    /// upgrade written by [`seed`] lands one step too late for the run that
+    /// needed it. A home file that is an unedited seed must therefore lose
+    /// to the shipped copy of its id here as well, or the first `cyclops
+    /// start --agents` on a pre-`launch` home still exits 2.
+    ///
+    /// One file carries the id, so the answer cannot depend on `read_dir`
+    /// order.
+    #[test]
+    fn an_unedited_seed_does_not_outrank_the_shipped_copy_of_its_id() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-known-stale");
+        let _ = std::fs::remove_dir_all(&home);
+        seed(&home);
+
+        // Shipped bytes under a name nobody ships them under: still this
+        // project's writing, so the shipped claude.toml keeps answering.
+        std::fs::remove_file(dir(&home).join("claude.toml")).expect("remove");
+        std::fs::write(dir(&home).join("stale.toml"), shipped("claude.toml")).expect("plant");
+        let after = known(&home);
+        assert!(
+            after["claude"].path.ends_with("manifests/claude.toml"),
+            "an unedited seed answered for claude: {:?}",
+            after["claude"].path
+        );
+        assert_eq!(after["claude"].launch.as_deref(), Some("claude"));
+
+        // An edited file still wins, which is the rule this must not break.
+        std::fs::write(
+            dir(&home).join("stale.toml"),
+            "[agent]\nid = \"claude\"\ndisplay_name = \"C\"\nlaunch = \"claude --resume\"\n",
+        )
+        .expect("edit");
+        assert_eq!(
+            known(&home)["claude"].launch.as_deref(),
+            Some("claude --resume")
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The defect itself, against the bytes that caused it.
+    ///
+    /// These are resources/manifests/claude.toml and codex.toml as they
+    /// stood before the `launch` key existed, read out of git by blob sha
+    /// so nothing here moves when a branch does. That is what every home
+    /// seeded before the key still holds, and on those homes `cyclops start
+    /// --agents claude,codex` exited 2. Both halves are checked in the
+    /// order `cyclops start` runs them: [`known`] answers first, [`seed`]
+    /// writes after.
+    ///
+    /// Skipped when the object is not reachable, a checkout with no git or
+    /// a rewritten history. The rule is covered by the two tests above
+    /// either way; what this adds is that it fires on the real bodies.
+    #[test]
+    fn the_pre_launch_manifests_every_old_home_holds_get_their_launch_key() {
+        // (blob sha, manifest id, the launch command it is missing)
+        const PRE_LAUNCH: &[(&str, &str, &str)] = &[
+            (
+                "ee4f9d1618e194ea0cd8958db0bc009721aaddb1",
+                "claude",
+                "claude",
+            ),
+            ("da17f332838145403b323167a6d79c76aaa95144", "codex", "codex"),
+        ];
+
+        let home = cyclops_proto::scratch::scratch_dir("cyc-prelaunch");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(dir(&home)).expect("create manifests dir");
+
+        // Plant what git can still hand over, and check on the way that
+        // each body really is the pre-launch shape this is arguing about.
+        let mut planted: Vec<(&str, &str)> = Vec::new();
+        for (blob, id, launch) in PRE_LAUNCH {
+            let Some(old) = git_blob(blob) else { continue };
+            let file = dir(&home).join(format!("{id}.toml"));
+            let m = cyclops_manifest::Manifest::parse(&old, &file).expect("the old body parses");
+            assert_eq!(&m.agent.id, id);
+            assert_eq!(m.agent.launch, None, "{id}: this blob is not pre-launch");
+            assert!(
+                unedited_seed(old.as_bytes()),
+                "the pre-launch {id} body is not in EVER_SHIPPED_FNV64; add {}",
+                fnv64(old.as_bytes())
+            );
+            std::fs::write(&file, &old).expect("plant the old body");
+            planted.push((id, launch));
+        }
+        if planted.is_empty() {
+            return;
+        }
+
+        // 1. The lookup --agents runs on, before anything is seeded.
+        let before = known(&home);
+        for (id, launch) in &planted {
+            assert_eq!(
+                before[*id].launch.as_deref(),
+                Some(*launch),
+                "--agents {id} would still exit 2 on a pre-launch home"
+            );
+        }
+
+        // 2. And the seed puts the current body on disk, so the next run
+        //    reads the launch key from the file the operator can see.
+        let seeded = seed(&home);
+        for (id, launch) in &planted {
+            let name = format!("{id}.toml");
+            assert!(seeded.written.contains(&name), "{id} was not upgraded");
+            let now = std::fs::read_to_string(dir(&home).join(&name)).unwrap();
+            assert_eq!(now, shipped(&name));
+            assert!(now.contains(&format!("launch = \"{launch}\"")));
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The lookup `--agents` runs on: the shipped set answers on a home
+    /// that has not been seeded yet, an edited file in the home wins over
+    /// the shipped copy of the same id, a manifest of the reader's own is
+    /// there too, and a file that does not parse is simply not offered.
+    #[test]
+    fn an_edited_home_manifest_wins_over_the_shipped_copy_of_the_same_cli() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-known");
+        let _ = std::fs::remove_dir_all(&home);
+
+        // Nothing on disk: the shipped set is still the answer, because
+        // this same run is about to write it.
+        let fresh = known(&home);
+        assert_eq!(fresh["claude"].launch.as_deref(), Some("claude"));
+        assert_eq!(fresh["cursor"].launch.as_deref(), Some("cursor-agent"));
+        assert!(fresh["claude"].path.ends_with("manifests/claude.toml"));
+
+        seed(&home);
+        let head = "[agent]\nid = \"claude\"\ndisplay_name = \"Claude Code\"\n";
+        std::fs::write(
+            dir(&home).join("claude.toml"),
+            format!("{head}launch = \"claude --resume\"\n"),
+        )
+        .expect("edit claude");
+        std::fs::write(
+            dir(&home).join("mine.toml"),
+            "[agent]\nid = \"mine\"\ndisplay_name = \"Mine\"\n",
+        )
+        .expect("write mine");
+        std::fs::write(dir(&home).join("broken.toml"), "id = ").expect("write broken");
+
+        let after = known(&home);
+        assert_eq!(after["claude"].launch.as_deref(), Some("claude --resume"));
+        assert_eq!(after["mine"].launch, None, "a manifest need not launch");
+        assert!(!after.contains_key("broken"));
+        assert_eq!(after["codex"].launch.as_deref(), Some("codex"));
 
         let _ = std::fs::remove_dir_all(&home);
     }

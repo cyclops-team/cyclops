@@ -1,0 +1,103 @@
+# Cyclops meadow: herb greens on a warm cream page. The ground is an
+# off-white with a faint green cast, the ink a dark leaf green, and the
+# accent a moss saturated enough to mark a row on its own, not the gray
+# green a pastel drifts into when it is lightened for softness.
+#
+# The role wheel is what grows in a meadow rather than eight greens: moss,
+# wheat, sky, harebell, clover, clay, thistle, fern. Green stays the
+# theme's voice through the ground, the accent, the dim and the chrome;
+# the role slots exist to keep eight agents apart, so they take the whole
+# wheel and every one was drawn against this cream, not lightened out of a
+# dark palette. Red is the one hue the wheel leaves alone, because
+# state.terminal owns it.
+#
+# The eye follows the shipped pattern: calm takes surface.dim so a quiet
+# rig recedes, alert takes the moss accent.
+#
+# [state] and [badge] are the four groups at ink strength, redundant with
+# the glyph and the word as everywhere else: healthy a field green,
+# needs-you a marigold amber, terminal a poppy red, quiet the dim itself,
+# and dead ABOVE dim, because on paper the lighter cell is the quieter
+# one.
+#
+# [palette] is the sixteen ANSI colors at ink strength: an agent CLI
+# painting in red, green or yellow prints body text on this pane ground,
+# so every slot had to stay legible on cream instead of assuming a dark
+# terminal. The gray ladder keeps its order, 0 darkest, then 8, then 7,
+# then 15, and it is tinted green so it belongs to this page.
+#
+# The chrome grounds step down from the cream into sage: on a light theme
+# the furniture recedes by darkening, and raised is deepened past a
+# mechanical second step so a selected row does not sit flat on the panel.
+# The panel is also held one 256-color step off the pane ground, so the
+# chrome does not merge into the panes on a 256-color terminal.
+#
+# Every 256-color fallback is explicit. Outside [palette] each is what the
+# cyclops-theme derivation picks, role slots included: the wheel is spread
+# far enough that no two roles collapse onto one entry, and the four state
+# groups land clear of it too, so nothing here is hand-tuned and an agent's
+# name never comes out the same color as a state cell on a 256-color
+# terminal. The [palette] fallbacks are the literal ANSI index: the program
+# asked for color N, and terminals remap 0..15 freely.
+
+name = "meadow"
+
+[surface]
+fg = { hex = "#2c3328", c256 = 236 }
+bg = { hex = "#f8f9ee", c256 = 255 }
+dim = { hex = "#5f6b5c", c256 = 241 }
+accent = { hex = "#3d7a4e", c256 = 65 }
+
+[role]
+1 = { hex = "#3d7a4e", c256 = 65 }  # moss, the accent
+2 = { hex = "#8a6a1c", c256 = 94 }  # wheat
+3 = { hex = "#3a6f96", c256 = 60 }  # sky
+4 = { hex = "#5b62ad", c256 = 61 }  # harebell
+5 = { hex = "#a94f79", c256 = 132 } # clover
+6 = { hex = "#875744", c256 = 95 }  # clay
+7 = { hex = "#7c58a4", c256 = 97 }  # thistle
+8 = { hex = "#4b7d2f", c256 = 64 }  # fern
+
+[eye]
+calm = { hex = "#5f6b5c", c256 = 241 }
+alert = { hex = "#3d7a4e", c256 = 65 }
+
+[state]
+healthy = { hex = "#2d7a44", c256 = 29 }    # field green
+needs_you = { hex = "#9c6414", c256 = 130 } # marigold amber
+terminal = { hex = "#a83c32", c256 = 131 }  # poppy red
+quiet = { hex = "#5f6b5c", c256 = 241 }     # same as surface.dim
+dead = { hex = "#8e9588", c256 = 245 }      # above dim: lighter is quieter here
+
+[badge]
+healthy = { hex = "#2d7a44", c256 = 29 }
+needs_you = { hex = "#9c6414", c256 = 130 }
+terminal = { hex = "#a83c32", c256 = 131 }
+quiet = { hex = "#5f6b5c", c256 = 241 }
+
+# The ANSI-16 mapping for pane content. 0 is the page's own ink; 7, 8 and
+# 15 are the gray ladder from the header, tinted toward the herb ground.
+[palette]
+0 = { hex = "#2c3328", c256 = 0 }
+1 = { hex = "#a83c32", c256 = 1 }
+2 = { hex = "#2d7a44", c256 = 2 }
+3 = { hex = "#8a6a1c", c256 = 3 }
+4 = { hex = "#3a6f96", c256 = 4 }
+5 = { hex = "#a4508a", c256 = 5 }
+6 = { hex = "#2a7a6c", c256 = 6 }
+7 = { hex = "#7e857b", c256 = 7 }
+8 = { hex = "#5c6659", c256 = 8 }
+9 = { hex = "#cc5a45", c256 = 9 }
+10 = { hex = "#3d9455", c256 = 10 }
+11 = { hex = "#a8802a", c256 = 11 }
+12 = { hex = "#6285c4", c256 = 12 }
+13 = { hex = "#bd6aa2", c256 = 13 }
+14 = { hex = "#3a948a", c256 = 14 }
+15 = { hex = "#888f82", c256 = 15 }
+
+# The chrome grounds, both greener and darker than the page: sage for the
+# flat panel, a deeper sage for the raised rows.
+[chrome]
+text = { hex = "#2c3328", c256 = 236 }
+panel = { hex = "#eaeed9", c256 = 254 }
+raised = { hex = "#dfe3cc", c256 = 253 }

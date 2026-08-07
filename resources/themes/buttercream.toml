@@ -1,0 +1,111 @@
+# Cyclops buttercream: a light theme drawn on soft ivory. The ground is
+# warm paper, the chrome steps down through butter yellows, and the
+# accent is a deep amber, the one ink on this page trusted to carry
+# meaning on its own.
+#
+# The eight role slots start at that amber and cross the wheel away from
+# it: amber, brick, plum rose, violet, indigo, harbor blue, teal, olive.
+# The yellow is the theme's voice and it lives in the ground and the
+# chrome, where it covers the most area; crowding the role wheel into
+# warm hues would only cost a reader the difference between two agents.
+# Every ink here was measured against this ground; none of it is a dark
+# theme lightened.
+#
+# The eye follows the shipped light theme's logic: calm takes
+# surface.dim so a quiet rig recedes, alert takes the amber accent.
+#
+# [state] and [badge] are the same four groups, redundant with the glyph
+# and the word: a grass green, a butter gold, a brick red, quiet on
+# surface.dim, and dead ABOVE dim, because on paper a lighter gray is
+# the quieter one. Which state lands in which group is dark.toml's
+# table; nothing about the grouping changes per theme.
+#
+# There is no [stream] table, for the reason written out in dark.toml:
+# the stream's gutter resolves surface.dim like every other detail
+# column.
+#
+# Two hand-tunes, both because yellow is the hardest hue to read on
+# warm paper:
+#
+#   surface.accent is deepened far past butter into bronze. A butter
+#   yellow on ivory is a tint at cell size, and the accent is what
+#   points at the row a surface is talking about.
+#
+#   role.8 olive is deeper than the rest of the wheel, which keeps it
+#   clear of state.healthy's grass green and off that green's
+#   256-color entry. Role color is one of the two meaning-carrying
+#   encodings, so no two roles may share an entry.
+#
+# Every 256-color fallback is explicit, and outside [palette] each is
+# exactly what the cyclops-theme derivation picks, role slots included:
+# the wheel was chosen at lightnesses where no two roles land on the
+# same entry, so nothing here overrides the algorithm. The [palette]
+# fallbacks are the literal ANSI index: the program asked for color N,
+# and terminals remap 0..15 freely.
+
+name = "buttercream"
+
+[surface]
+fg = { hex = "#37301f", c256 = 236 }
+bg = { hex = "#fdfaef", c256 = 231 }
+dim = { hex = "#756a4d", c256 = 95 }
+accent = { hex = "#8d5a0e", c256 = 94 }
+
+[role]
+1 = { hex = "#8d5a0e", c256 = 94 }  # amber, the accent
+2 = { hex = "#ac4939", c256 = 131 } # brick
+3 = { hex = "#a54776", c256 = 132 } # plum rose
+4 = { hex = "#914ca2", c256 = 97 }  # violet
+5 = { hex = "#695ab8", c256 = 61 }  # indigo
+6 = { hex = "#376d93", c256 = 60 }  # harbor blue
+7 = { hex = "#1b7469", c256 = 29 }  # teal
+8 = { hex = "#586928", c256 = 58 }  # olive, see the header
+
+[eye]
+calm = { hex = "#756a4d", c256 = 95 }
+alert = { hex = "#8d5a0e", c256 = 94 }
+
+[state]
+healthy = { hex = "#3d7422", c256 = 64 }   # grass green
+needs_you = { hex = "#78630d", c256 = 94 } # butter gold
+terminal = { hex = "#ae3a3a", c256 = 131 } # brick red
+quiet = { hex = "#756a4d", c256 = 95 }     # same as surface.dim
+dead = { hex = "#9d957d", c256 = 246 }     # above dim: lighter is quieter here
+
+[badge]
+healthy = { hex = "#3d7422", c256 = 64 }
+needs_you = { hex = "#78630d", c256 = 94 }
+terminal = { hex = "#ae3a3a", c256 = 131 }
+quiet = { hex = "#756a4d", c256 = 95 }
+
+# The ANSI-16 mapping for pane content, at ink strength so every entry
+# reads on this ground: an agent printing in red, green or yellow stays
+# legible on the pane it was given, and yellow is the slot that pays for
+# it, sitting at butter gold rather than butter. 0 is the page's own
+# ink, the three grays keep the standard ladder, 0 darkest, then 8, then
+# 7, then 15, and the brights are the normals' hues lifted.
+[palette]
+0 = { hex = "#37301f", c256 = 0 }
+1 = { hex = "#ae3a3a", c256 = 1 }
+2 = { hex = "#3d7422", c256 = 2 }
+3 = { hex = "#78630d", c256 = 3 }
+4 = { hex = "#3a6895", c256 = 4 }
+5 = { hex = "#a04184", c256 = 5 }
+6 = { hex = "#246f71", c256 = 6 }
+7 = { hex = "#857d68", c256 = 7 }
+8 = { hex = "#756f5c", c256 = 8 }
+9 = { hex = "#d35142", c256 = 9 }
+10 = { hex = "#468c23", c256 = 10 }
+11 = { hex = "#9a7715", c256 = 11 }
+12 = { hex = "#3b7fc4", c256 = 12 }
+13 = { hex = "#c74da3", c256 = 13 }
+14 = { hex = "#21898c", c256 = 14 }
+15 = { hex = "#958d78", c256 = 15 }
+
+# The workspace chrome's grounds, both darker than the page: on a light
+# theme the chrome recedes by darkening, and both hold the ground's
+# warmth rather than falling back to neutral gray.
+[chrome]
+text = { hex = "#37301f", c256 = 236 }
+panel = { hex = "#f5eeda", c256 = 230 }
+raised = { hex = "#e5d9b4", c256 = 187 }

@@ -452,7 +452,8 @@ Non-crate directories: `resources/manifests/` (shipped detection data for Claude
 Codex, Antigravity, and Cursor), `resources/hooks/` (vendor hook config templates `cyclops hooks install`
 renders), `resources/layouts/` (the four workspace presets, compiled in with
 `include_str!` so a fresh install has them before it has a config file),
-`resources/themes/` (the seven shipped token files), `demos/` (runnable end-to-end
+`resources/themes/` (the seventeen shipped token files, and the source of truth
+two SHIPPED lists are held to), `demos/` (runnable end-to-end
 scripts; `tests/e2e/lib/lib.sh` holds the two rules the scripts must not copy, the
 scratch root and the tmux teardown), `tests/e2e/lib/` (the Python probe
 harness), `scripts/commpact-shim/` (the prepared v1 shim and its guarded

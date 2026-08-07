@@ -55,6 +55,15 @@ pub fn preset_names() -> Vec<&'static str> {
     PRESETS.iter().map(|(n, _)| *n).collect()
 }
 
+/// The shipped preset that names exactly `n` agents, if there is one. For
+/// the refusal that has to say what would fit.
+fn preset_with_agents(n: usize) -> Option<&'static str> {
+    PRESETS
+        .iter()
+        .find(|(_, text)| parse(text).map(|l| l.agents()) == Ok(n))
+        .map(|(name, _)| *name)
+}
+
 /// One shipped preset by name.
 pub fn preset(name: &str) -> Option<Result<Layout, String>> {
     let (_, text) = PRESETS.iter().find(|(n, _)| *n == name)?;
@@ -483,13 +492,114 @@ fn misplaced_names(
 // start
 // ---------------------------------------------------------------------------
 
+/// What a `cyclops start` runs in the panes it builds.
+///
+/// The two halves are deliberately different decisions, and they are two
+/// flags because they are answered at different scopes. `stored` replays
+/// commands a file already holds, all of them, and that stays an explicit
+/// per-run choice (`cyclops_tmux::layout`, `push_pane_args`): a file naming
+/// a command is a suggestion. `agents` is the operator typing CLI names at
+/// the keyboard right now, which IS that decision for the panes it names,
+/// so those panes carry it themselves (`layout::Pane::launch_now`) and need
+/// no second flag.
+///
+/// Neither weakens the other, and both hold in one run: `--agents` starts
+/// what it just wrote and leaves every other command in the file waiting
+/// for `--launch`, including the commands `--agents` itself wrote on an
+/// earlier run.
+pub struct Launch<'a> {
+    /// `--launch`.
+    pub stored: bool,
+    /// `--agents`: manifest ids, one per pane the workspace names, in
+    /// layout order.
+    pub agents: &'a [String],
+}
+
+impl Launch<'_> {
+    /// Whether this build replays the commands the layout came in with.
+    /// Only `--launch` does. `--agents` is not a quieter way to ask for it:
+    /// the panes it filled are marked one by one, so an unnamed pane's
+    /// stored command is untouched by it.
+    fn replays_stored(&self) -> bool {
+        self.stored
+    }
+}
+
+/// Resolve `--agents claude,codex` into one launch command per named pane.
+///
+/// Every refusal is here, before anything is built, because a session half
+/// opened around a typo is worse than no session: it is one the operator
+/// has to take down before trying again.
+///
+/// Three refusals, and each is a different mistake. An id no manifest
+/// knows is usually a typo. An id whose manifest carries no `launch` is a
+/// CLI cyclops can watch but was never told how to start. A count that
+/// does not fit the workspace's named panes has no correct answer at all:
+/// filling some panes and not others would put a fleet up that is quietly
+/// smaller than the one that was asked for.
+fn resolve_agents(
+    home: &Path,
+    ids: &[String],
+    layout: &Layout,
+    source: &str,
+) -> Result<Vec<String>, String> {
+    let known = crate::manifests::known(home);
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        // A list typed with spaces after its commas is the same list.
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(empty_agent_id());
+        }
+        match known.get(id) {
+            None => return Err(unknown_agent(id, &known)),
+            Some(m) => match &m.launch {
+                None => return Err(agent_wont_launch(id, &m.path)),
+                Some(cmd) => out.push(cmd.clone()),
+            },
+        }
+    }
+    let labels: Vec<String> = layout.panes().filter_map(|p| p.label.clone()).collect();
+    if out.len() != labels.len() {
+        return Err(agent_count_mismatch(out.len(), source, &labels));
+    }
+    Ok(out)
+}
+
+/// Put one launch command on each pane the workspace names, in layout
+/// order, and mark those panes to run it.
+///
+/// Layout order is the order `adopt` puts the names on, so the CLI that
+/// starts under a name is the one that was listed against it. A pane with
+/// no label keeps whatever command it had and stays unmarked: nothing
+/// addresses the `ops` dock, its `cyclops ui` is part of the arrangement
+/// rather than part of the fleet, and starting it was never asked for. The
+/// mark is what keeps the two apart in the same build, so it goes on here,
+/// beside the write it belongs to.
+fn fill_agents(layout: &mut Layout, commands: &[String]) {
+    let mut next = commands.iter();
+    for w in &mut layout.windows {
+        for r in &mut w.rows {
+            for p in &mut r.panes {
+                if p.label.is_some() {
+                    if let Some(cmd) = next.next() {
+                        p.command = Some(cmd.clone());
+                        p.launch_now = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// `cyclops start`: have the default workspace open, whatever state the
 /// machine was in.
 ///
 /// Steps, in the order they have to happen:
 ///
 /// 1. Resolve which workspace this is, and the layout behind it: the
-///    saved file if there is one, else a preset.
+///    saved file if there is one, else a preset. Then name the CLIs
+///    `--agents` asked for, or refuse before anything is built.
 /// 2. Build the session if it is not there, and write the workspace file
 ///    when the layout came from a preset. An existing session is left
 ///    exactly as it is; this verb is safe to run twice.
@@ -512,7 +622,7 @@ pub fn run_start(
     asked: Option<&str>,
     asked_session: Option<&str>,
     preset_name: Option<&str>,
-    launch: bool,
+    launch: &Launch,
     start_daemon: bool,
 ) -> i32 {
     let home = cyclops_proto::cyclops_home();
@@ -552,6 +662,20 @@ pub fn run_start(
     };
     layout.name = name.clone();
 
+    // The CLIs named on the command line go onto the layout before it is
+    // built, so the panes come up running them and the file this run
+    // stores carries them. Refusing here costs nothing: no session, no
+    // file, no daemon.
+    if !launch.agents.is_empty() {
+        match resolve_agents(&home, launch.agents, &layout, &source) {
+            Ok(commands) => fill_agents(&mut layout, &commands),
+            Err(why) => {
+                eprintln!("{why}");
+                return 2;
+            }
+        }
+    }
+
     // 2.
     let mut steps: Vec<(String, String)> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
@@ -565,7 +689,9 @@ pub fn run_start(
     let mut pane_ids: Vec<String> = Vec::new();
     if !existed {
         let opts = ApplyOptions {
-            launch,
+            // The layout-wide flag is `--launch` alone. What `--agents`
+            // starts rides on the panes `fill_agents` marked.
+            launch: launch.replays_stored(),
             size: build_size(),
         };
         match layout::apply(&settings.server, &session, &layout, &opts) {
@@ -585,6 +711,12 @@ pub fn run_start(
                 notes.push(e);
             }
         }
+    } else if !launch.agents.is_empty() {
+        // Nothing was built, so nothing was started. `start` is safe to
+        // run twice by never touching a session that exists, and that rule
+        // outranks a flag: killing panes to honor `--agents` would take
+        // down whatever is working in them.
+        notes.push(agents_not_started(&session));
     }
 
     // 3.
@@ -1416,6 +1548,75 @@ pub fn unknown_preset(name: &str) -> String {
     )
 }
 
+/// `--agents` named a CLI no manifest describes. The list is every id that
+/// can be started, which is the answer to the question that was asked, not
+/// every manifest on the machine.
+pub fn unknown_agent(id: &str, known: &BTreeMap<String, crate::manifests::Known>) -> String {
+    let startable: Vec<&str> = known
+        .iter()
+        .filter(|(_, m)| m.launch.is_some())
+        .map(|(id, _)| id.as_str())
+        .collect();
+    format!(
+        "no agent CLI called \"{id}\". Cyclops can start: {}. Teaching it another one is one file: docs/reference/MANIFESTS.md.",
+        startable.join(", ")
+    )
+}
+
+/// The manifest exists and does not say how to start the CLI. Cyclops does
+/// not guess a binary name: the guess fails inside a pane, where the error
+/// is a dead shell nobody reads.
+pub fn agent_wont_launch(id: &str, path: &Path) -> String {
+    format!(
+        "the manifest for \"{id}\" doesn't say how to start it. Add launch = \"<command>\" to the [agent] table in {}, then run this again.",
+        path.display()
+    )
+}
+
+/// A comma with nothing on one side of it.
+pub fn empty_agent_id() -> String {
+    "--agents has an empty id in it. Name one CLI per pane, comma separated: --agents claude,codex."
+        .to_string()
+}
+
+/// As many CLIs as there are panes to run them in, or nothing runs.
+///
+/// The line has to carry both numbers and the names behind the second one:
+/// "3 doesn't fit 2" is arithmetic, and what the reader needs is which two
+/// panes those are and which arrangement takes three.
+pub fn agent_count_mismatch(named: usize, source: &str, labels: &[String]) -> String {
+    if labels.is_empty() {
+        return format!(
+            "--agents named {}, and {source} names no panes, so there is nowhere to run them. Label its panes, or start from a preset: {}.",
+            count(named, "agent CLI"),
+            preset_names().join(", ")
+        );
+    }
+    let fits = match preset_with_agents(named) {
+        Some(p) => format!(", or --preset {p}, which has {named}"),
+        None => String::new(),
+    };
+    format!(
+        "--agents named {}, and {source} has {} ({}). Name {}{fits}.",
+        count(named, "agent CLI"),
+        count(labels.len(), "named pane"),
+        labels.join(", "),
+        labels.len(),
+    )
+}
+
+/// `--agents` on a session that was already open.
+///
+/// Not a refusal: the flag is one part of a command that did the rest of
+/// its job, and a second `cyclops start` is a thing scripts and people run
+/// on purpose. It still cannot pass in silence, because the CLIs the
+/// operator asked for are not running.
+pub fn agents_not_started(session: &str) -> String {
+    format!(
+        "{session} was already open, so --agents started nothing: the CLIs it names run in panes cyclops builds. Start them in their panes yourself, or close the session and run this again."
+    )
+}
+
 /// The session no longer has the workspace's shape, so no pane can be
 /// matched to a name with any confidence.
 pub fn shape_changed(workspace: &str, session: &str, difference: &str) -> String {
@@ -1602,6 +1803,160 @@ mod tests {
         assert_eq!(labels("duo"), ["implementer", "reviewer"]);
         assert_eq!(labels("quad"), ["implementer", "reviewer", "tests", "docs"]);
         assert_eq!(labels("ops"), ["implementer", "reviewer", "tests"]);
+    }
+
+    /// `--agents` fills the panes the workspace names, in the order the
+    /// names are in, and leaves everything else alone. The `ops` dock is
+    /// the case that matters: it carries a command of its own and no
+    /// label, so a fleet must neither run in it nor push it out of line.
+    #[test]
+    fn agents_fill_the_named_panes_in_order_and_leave_the_dock_alone() {
+        let mut ops = preset("ops").unwrap().unwrap();
+        fill_agents(
+            &mut ops,
+            &["claude".to_string(), "codex".to_string(), "agy".to_string()],
+        );
+        let panes: Vec<(Option<String>, Option<String>)> = ops
+            .panes()
+            .map(|p| (p.label.clone(), p.command.clone()))
+            .collect();
+        assert_eq!(
+            panes,
+            vec![
+                (Some("implementer".into()), Some("claude".into())),
+                (Some("reviewer".into()), Some("codex".into())),
+                (Some("tests".into()), Some("agy".into())),
+                (None, Some("cyclops ui".into())),
+            ]
+        );
+        // Still a layout cyclops will build.
+        ops.validate().expect("filled layout is applicable");
+    }
+
+    /// The ids `--agents` accepts are manifest ids, and each one becomes
+    /// the command its manifest names. Two panes may run the same CLI:
+    /// that is a fleet of two claudes, not a mistake.
+    #[test]
+    fn agent_ids_become_the_launch_commands_their_manifests_name() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-agents-ok");
+        let _ = std::fs::remove_dir_all(&home);
+        let duo = preset("duo").unwrap().unwrap();
+        let ids = ["claude".to_string(), "claude".to_string()];
+        assert_eq!(
+            resolve_agents(&home, &ids, &duo, "preset duo").unwrap(),
+            vec!["claude", "claude"]
+        );
+        // A shell that kept the spaces after the commas passed the same
+        // list, and cyclops reads it as one.
+        let spaced = ["claude".to_string(), " codex".to_string()];
+        assert_eq!(
+            resolve_agents(&home, &spaced, &duo, "preset duo").unwrap(),
+            vec!["claude", "codex"]
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Every way `--agents` is refused, and the sentence each one owes the
+    /// reader. All four happen before anything is built.
+    #[test]
+    fn agents_are_refused_by_id_by_launch_and_by_count() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-agents-no");
+        let _ = std::fs::remove_dir_all(&home);
+        let duo = preset("duo").unwrap().unwrap();
+        let refuse = |ids: &[&str], layout: &Layout, source: &str| -> String {
+            let ids: Vec<String> = ids.iter().map(|s| (*s).to_string()).collect();
+            resolve_agents(&home, &ids, layout, source).expect_err("refused")
+        };
+
+        // A typo names no manifest, and the answer is the list of ids that
+        // would have worked.
+        let why = refuse(&["cluade", "codex"], &duo, "preset duo");
+        assert!(why.starts_with("no agent CLI called \"cluade\""), "{why}");
+        assert!(why.contains("agy, claude, codex, cursor"), "{why}");
+
+        // An empty id: a stray comma, not a CLI called "".
+        assert!(refuse(&["claude", ""], &duo, "preset duo").contains("empty id"));
+
+        // Too few and too many are the same refusal, and it names what
+        // would fit rather than only what does not.
+        let few = refuse(&["claude"], &duo, "preset duo");
+        assert_eq!(
+            few,
+            "--agents named 1 agent CLI, and preset duo has 2 named panes (implementer, reviewer). Name 2, or --preset solo, which has 1."
+        );
+        let many = refuse(&["claude", "codex", "agy"], &duo, "preset duo");
+        assert!(many.contains("--preset ops, which has 3"), "{many}");
+        // Nothing ships with five named panes, so there is nothing to
+        // suggest and the line stops rather than inventing one.
+        let five = ["claude"; 5];
+        let none = refuse(&five, &duo, "preset duo");
+        assert!(none.ends_with("Name 2."), "{none}");
+
+        // A manifest that detects a CLI without saying how to start it.
+        // The line names the file, because that is where the fix goes.
+        let dir = crate::manifests::dir(&home);
+        std::fs::create_dir_all(&dir).expect("manifests dir");
+        std::fs::write(
+            dir.join("mine.toml"),
+            "[agent]\nid = \"mine\"\ndisplay_name = \"Mine\"\n",
+        )
+        .expect("write mine");
+        let solo = preset("solo").unwrap().unwrap();
+        let quiet = refuse(&["mine"], &solo, "preset solo");
+        assert!(quiet.contains("doesn't say how to start it"), "{quiet}");
+        assert!(quiet.contains("mine.toml"), "{quiet}");
+        // And it is not offered as one of the ids that would work.
+        let listed = refuse(&["nope"], &solo, "preset solo");
+        assert!(!listed.contains("mine"), "{listed}");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A workspace that names no panes has nowhere to put a fleet, and the
+    /// arithmetic line would read "0 named panes ()".
+    #[test]
+    fn agents_over_a_workspace_with_no_names_says_there_is_nowhere_to_run() {
+        let why = agent_count_mismatch(2, "workspace main", &[]);
+        assert!(why.contains("names no panes"), "{why}");
+        assert!(why.contains("solo, duo, quad, ops"), "{why}");
+    }
+
+    /// Naming CLIs at the keyboard runs them; a file naming them does not.
+    /// Both halves of the rule in one place, and the split that lets them
+    /// both hold in one run.
+    #[test]
+    fn naming_agents_runs_the_commands_and_a_bare_start_does_not() {
+        let names = ["claude".to_string()];
+        // `--agents` replays nothing off disk. The fleet it starts is
+        // carried by the panes it wrote, one at a time.
+        assert!(!Launch {
+            stored: false,
+            agents: &names
+        }
+        .replays_stored());
+        assert!(Launch {
+            stored: true,
+            agents: &[]
+        }
+        .replays_stored());
+        assert!(!Launch {
+            stored: false,
+            agents: &[]
+        }
+        .replays_stored());
+
+        // And the panes it wrote are the named ones. The `ops` dock has a
+        // command of its own and stays unmarked, so a build under
+        // `--agents` leaves it at a shell.
+        let mut ops = preset("ops").unwrap().unwrap();
+        fill_agents(
+            &mut ops,
+            &["claude".to_string(), "codex".to_string(), "agy".to_string()],
+        );
+        assert_eq!(
+            ops.panes().map(|p| p.launch_now).collect::<Vec<_>>(),
+            vec![true, true, true, false]
+        );
     }
 
     #[test]

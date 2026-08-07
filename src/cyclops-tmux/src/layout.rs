@@ -128,11 +128,22 @@ pub struct Pane {
     /// built from, which is what a shipped preset wants.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// Launch hint: what to run in the pane, and only with
-    /// [`ApplyOptions::launch`]. Captured from the foreground command tmux
-    /// reported, which carries no arguments.
+    /// Launch hint: what to run in the pane. Captured from the foreground
+    /// command tmux reported, which carries no arguments. Whether it runs
+    /// is a separate decision, and there are two of them:
+    /// [`ApplyOptions::launch`] for a command that came off disk, and
+    /// [`Pane::launch_now`] for one written onto this pane in this run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// Run [`Pane::command`] on this build whatever [`ApplyOptions::launch`]
+    /// says.
+    ///
+    /// Never read from or written to a file: it belongs to the caller that
+    /// just put the command there, which is `cyclops start --agents`, which
+    /// is the operator naming a CLI at the keyboard. Every command that was
+    /// already in the file stays a suggestion until `--launch`.
+    #[serde(skip)]
+    pub launch_now: bool,
 }
 
 impl Layout {
@@ -215,7 +226,9 @@ pub struct Capture {
 #[derive(Debug, Clone, Default)]
 pub struct ApplyOptions {
     /// Run each pane's recorded command instead of leaving a shell. Off by
-    /// default: a workspace restores structure, not live processes.
+    /// default: a workspace restores structure, not live processes. This is
+    /// the whole layout, and it is what `--launch` means; a pane carrying a
+    /// command this run wrote runs it on its own ([`Pane::launch_now`]).
     pub launch: bool,
     /// Size for the detached session tmux creates. None lets tmux use its
     /// own `default-size`, and tmux rescales the ratios when a client
@@ -305,6 +318,9 @@ pub fn capture(server: &Server, session: &str) -> Result<Capture, TmuxError> {
                     ratio: ratio(p.width, col_cells),
                     cwd: Some(p.cwd.clone()).filter(|c| !c.is_empty()),
                     command: launch_hint(&p.command),
+                    // A capture records what a pane is running. Nothing
+                    // read off a session is waiting to be started.
+                    launch_now: false,
                 });
             }
             out_rows.push(Row {
@@ -476,14 +492,20 @@ fn split(
 /// starts, and what runs in it.
 ///
 /// The command goes last because tmux reads everything after the options
-/// as the shell command. It is only ever added under `--launch`: a file on
-/// disk naming a command is a suggestion, and running it has to be the
-/// operator's decision each time.
+/// as the shell command. Whether it is added at all is two decisions, and
+/// neither implies the other:
+///
+/// - `--launch` ([`ApplyOptions::launch`]) replays every command the layout
+///   came in with. A file on disk naming a command is a suggestion, and
+///   running it has to be the operator's decision each time.
+/// - [`Pane::launch_now`] runs the command the caller wrote onto this pane
+///   in this same run, and only that pane's. Nothing else in the layout
+///   moves because of it.
 fn push_pane_args(args: &mut Vec<String>, pane: &Pane, opts: &ApplyOptions) {
     if let Some(cwd) = &pane.cwd {
         args.extend(["-c".to_string(), cwd.clone()]);
     }
-    if opts.launch {
+    if opts.launch || pane.launch_now {
         if let Some(cmd) = &pane.command {
             args.push(cmd.clone());
         }
@@ -727,7 +749,15 @@ mod tests {
             ratio,
             cwd: None,
             command: None,
+            launch_now: false,
         }
+    }
+
+    /// The tmux arguments this pane would be built with.
+    fn args_for(pane: &Pane, launch: bool) -> Vec<String> {
+        let mut args = Vec::new();
+        push_pane_args(&mut args, pane, &ApplyOptions { launch, size: None });
+        args
     }
 
     fn one_window(rows: Vec<Row>) -> Layout {
@@ -814,6 +844,69 @@ mod tests {
         ]);
         assert_eq!(l.agents(), 2);
         assert_eq!(l.pane_count(), 3);
+    }
+
+    /// Launching is per pane, so one build can start one pane's command
+    /// and leave the pane beside it at a shell. `cyclops start --agents`
+    /// is that build: it runs the CLIs it was just handed without turning
+    /// every command the file holds on.
+    #[test]
+    fn a_pane_carries_its_own_launch_decision() {
+        let stored = Pane {
+            command: Some("cyclops ui".to_string()),
+            ..pane(None, 1.0)
+        };
+        let filled = Pane {
+            command: Some("claude".to_string()),
+            launch_now: true,
+            ..pane(Some("implementer"), 1.0)
+        };
+
+        // No --launch: the pane whose command was written in this run
+        // starts it, and the pane that read its command off disk does not.
+        assert_eq!(args_for(&filled, false), ["claude"]);
+        assert!(args_for(&stored, false).is_empty());
+
+        // --launch is still the whole layout, flagged pane or not.
+        assert_eq!(args_for(&stored, true), ["cyclops ui"]);
+        assert_eq!(args_for(&filled, true), ["claude"]);
+
+        // A flag with nothing to run is nothing to run.
+        assert!(args_for(
+            &Pane {
+                launch_now: true,
+                ..pane(Some("empty"), 1.0)
+            },
+            false
+        )
+        .is_empty());
+    }
+
+    /// The mark is not part of the file format, in either direction. A
+    /// workspace on disk is data, so it cannot flag itself to run, and
+    /// `--agents` writing a fleet into one does not leave a file that
+    /// starts itself on the next build.
+    #[test]
+    fn a_file_cannot_carry_the_mark() {
+        let text = "name = \"x\"\n\n[[windows]]\nname = \"x\"\n\n\
+                    [[windows.rows]]\nratio = 1.0\n\n\
+                    [[windows.rows.panes]]\nratio = 1.0\n\
+                    command = \"claude\"\nlaunch_now = true\n";
+        let read: Layout = toml::from_str(text).expect("parses");
+        let first = read.panes().next().expect("one pane");
+        assert_eq!(first.command.as_deref(), Some("claude"));
+        assert!(!first.launch_now, "a file asked for a launch and got one");
+
+        let written = toml::to_string(&one_window(vec![Row {
+            ratio: 1.0,
+            panes: vec![Pane {
+                command: Some("claude".to_string()),
+                launch_now: true,
+                ..pane(Some("implementer"), 1.0)
+            }],
+        }]))
+        .expect("serializes");
+        assert!(!written.contains("launch_now"), "{written}");
     }
 
     #[test]

@@ -1,0 +1,80 @@
+# Forest: a stand of conifers at dusk. The ground is a near-black with
+# green left in it, the chrome steps up through needle and moss, and the
+# accent is sage, the green with the most gray left in it. The roles
+# run the canopy down to the floor: sage, fern, lichen and a stream teal,
+# then birch, bluebell, foxglove and a fallen leaf, because the four
+# non-green slots want to be the things growing between the trees rather
+# than four more greens nobody could tell apart.
+#
+# surface.dim, eye.calm and state.quiet are one value, a green-cast gray,
+# so a quiet rig recedes into the ground instead of standing on it.
+# state.dead sits below it, and palette.8 takes the same value, so ANSI
+# bright black and a pane whose process is gone read alike.
+#
+# No hand-tuning. Every fallback is what the cyclops-theme derivation
+# picks, and the eight role slots land on eight distinct entries on their
+# own. The [palette] fallbacks are the literal ANSI index, as in every
+# shipped theme.
+
+name = "forest"
+
+[surface]
+fg = { hex = "#e2ece4", c256 = 254 }
+bg = { hex = "#0c1310", c256 = 233 } # the pane ground
+dim = { hex = "#86a58a", c256 = 108 }
+accent = { hex = "#9ec9a2", c256 = 151 }
+
+[role]
+1 = { hex = "#9ec9a2", c256 = 151 } # sage, the accent
+2 = { hex = "#79c98c", c256 = 114 } # fern
+3 = { hex = "#c6d489", c256 = 186 } # lichen
+4 = { hex = "#85c8bd", c256 = 115 } # stream teal
+5 = { hex = "#d6b88c", c256 = 180 } # birch
+6 = { hex = "#a1b6de", c256 = 146 } # bluebell
+7 = { hex = "#cba1bb", c256 = 181 } # foxglove
+8 = { hex = "#dd9a72", c256 = 173 } # fallen leaf
+
+[eye]
+calm = { hex = "#86a58a", c256 = 108 }
+alert = { hex = "#9ec9a2", c256 = 151 }
+
+[state]
+healthy = { hex = "#8ecf95", c256 = 114 }   # new growth
+needs_you = { hex = "#dcc073", c256 = 179 } # amber
+terminal = { hex = "#e0797f", c256 = 174 }  # red
+quiet = { hex = "#86a58a", c256 = 108 }     # same as surface.dim
+dead = { hex = "#506355", c256 = 240 }      # below dim: the pane is gone
+
+[badge]
+healthy = { hex = "#8ecf95", c256 = 114 }
+needs_you = { hex = "#dcc073", c256 = 179 }
+terminal = { hex = "#e0797f", c256 = 174 }
+quiet = { hex = "#86a58a", c256 = 108 }
+
+# The ANSI-16 mapping for pane content: the dusk set, brights lifted
+# toward white. 1, 2 and 3 are the state colors, so a program's own red,
+# green and yellow read the same as the cells beside them.
+[palette]
+0 = { hex = "#17231b", c256 = 0 }
+1 = { hex = "#e0797f", c256 = 1 }
+2 = { hex = "#8ecf95", c256 = 2 }
+3 = { hex = "#dcc073", c256 = 3 }
+4 = { hex = "#8ab0d8", c256 = 4 }
+5 = { hex = "#c79ac0", c256 = 5 }
+6 = { hex = "#7fc9bb", c256 = 6 }
+7 = { hex = "#c4d2c6", c256 = 7 }
+8 = { hex = "#506355", c256 = 8 }
+9 = { hex = "#eb9297", c256 = 9 }
+10 = { hex = "#a9dcae", c256 = 10 }
+11 = { hex = "#e9cf93", c256 = 11 }
+12 = { hex = "#a4c4e4", c256 = 12 }
+13 = { hex = "#d7b3d2", c256 = 13 }
+14 = { hex = "#9adacd", c256 = 14 }
+15 = { hex = "#eff5f0", c256 = 15 }
+
+# The workspace chrome's grounds: needle, then moss. Both above the pane
+# ground, so the chrome reads as furniture and the panes read as the work.
+[chrome]
+text = { hex = "#e2ece4", c256 = 254 }
+panel = { hex = "#14201a", c256 = 234 }
+raised = { hex = "#24342a", c256 = 236 }

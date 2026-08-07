@@ -1015,6 +1015,388 @@ fn a_workspace_nobody_saved_says_how_to_save_one() {
     let _ = fs::remove_dir_all(&home);
 }
 
+/// A manifest whose launch command is `cat`.
+///
+/// `--agents` starts real programs in real panes, so its tests need a real
+/// command: one every machine has, that stays running when a pane hands it
+/// a terminal, and that is not a vendor CLI. Shelling out to claude or
+/// codex from the suite would need them installed and would cost a session
+/// on somebody's account.
+fn stand_in_manifest(home: &Path, id: &str) {
+    let dir = home.join("manifests");
+    fs::create_dir_all(&dir).expect("create manifests dir");
+    fs::write(
+        dir.join(format!("{id}.toml")),
+        format!(
+            "[agent]\nid = \"{id}\"\ndisplay_name = \"Stand-in\"\nprocess_names = [\"cat\"]\nlaunch = \"cat\"\n"
+        ),
+    )
+    .expect("write the stand-in manifest");
+}
+
+/// What each pane of a session is running, in position order.
+fn running(t: &TmuxServer, session: &str) -> Vec<String> {
+    let out = t.run(&[
+        "list-panes",
+        "-s",
+        "-t",
+        &format!("={session}"),
+        "-F",
+        "#{pane_left} #{pane_top} #{pane_current_command}",
+    ]);
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let mut rows: Vec<(u32, u32, String)> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            (
+                f[0].parse().unwrap(),
+                f[1].parse().unwrap(),
+                f[2].to_string(),
+            )
+        })
+        .collect();
+    rows.sort_by_key(|(left, top, _)| (*top, *left));
+    rows.into_iter().map(|(_, _, cmd)| cmd).collect()
+}
+
+/// [`running`], once tmux has caught up with the exec.
+///
+/// tmux reports the pane's foreground process, and a pane built a
+/// millisecond ago can still be reported as the process that is about to
+/// become the command. Bounded, and only in the rig: nothing in cyclops
+/// polls for this.
+fn wait_running(t: &TmuxServer, session: &str, want: &[&str]) -> Vec<String> {
+    for _ in 0..50 {
+        let now = running(t, session);
+        if now == want {
+            return now;
+        }
+        thread::sleep(std::time::Duration::from_millis(50));
+    }
+    running(t, session)
+}
+
+/// [`running`], once the first `n` panes are running `want`.
+///
+/// The panes after them are not waited on. One left at a shell reports
+/// whatever shell the machine has, and what a test asserts about that pane
+/// is what it is NOT running.
+fn wait_leading(t: &TmuxServer, session: &str, n: usize, want: &str) -> Vec<String> {
+    // A wider budget than the file's usual 50 polls, because this waits on
+    // panes tmux has to exec a real binary into, not on a state flip. The
+    // loop returns the instant the panes arrive, so the ceiling only costs
+    // a run that was going to fail anyway; at 50 it failed 2 runs in 4
+    // under a loaded machine.
+    for _ in 0..200 {
+        let now = running(t, session);
+        if now.len() >= n && now.iter().take(n).all(|c| c == want) {
+            return now;
+        }
+        thread::sleep(std::time::Duration::from_millis(50));
+    }
+    running(t, session)
+}
+
+/// A saved workspace `--agents` can only half fill: two named panes and a
+/// dock, every one of them carrying a command already.
+///
+/// The dock is the `ops` dock in miniature. It holds a command of its own
+/// and no label, so nothing addresses it and `--agents` never writes to it.
+/// Its command is deliberately one no manifest here names, so a pane
+/// running it can only have got it off disk.
+fn workspace_with_a_dock(home: &Path, name: &str) {
+    let dir = home.join("workspaces");
+    fs::create_dir_all(&dir).expect("create workspaces dir");
+    fs::write(
+        dir.join(format!("{name}.toml")),
+        format!(
+            "name = \"{name}\"\n\
+             \n\
+             [[windows]]\n\
+             name = \"{name}\"\n\
+             \n\
+             [[windows.rows]]\n\
+             ratio = 0.7\n\
+             \n\
+             [[windows.rows.panes]]\n\
+             label = \"implementer\"\n\
+             ratio = 0.5\n\
+             command = \"sleep 300\"\n\
+             \n\
+             [[windows.rows.panes]]\n\
+             label = \"reviewer\"\n\
+             ratio = 0.5\n\
+             command = \"sleep 300\"\n\
+             \n\
+             [[windows.rows]]\n\
+             ratio = 0.3\n\
+             \n\
+             [[windows.rows.panes]]\n\
+             ratio = 1.0\n\
+             command = \"sleep 300\"\n"
+        ),
+    )
+    .expect("write the workspace");
+}
+
+/// The input path a shipped preset deliberately leaves blank: which CLI
+/// runs in which pane. Naming them fills the panes it builds AND the file
+/// it writes, so the fleet is part of the workspace from then on.
+#[test]
+fn naming_agents_starts_them_and_writes_them_into_the_workspace() {
+    if !tmux_available() {
+        return;
+    }
+    let t = TmuxServer::new("ws-agents");
+    let home = scratch_home("ws-agents");
+    write_config(
+        &home,
+        &t,
+        "sessions = [\"main\"]\ndefault_workspace = \"main\"\n",
+    );
+    stand_in_manifest(&home, "demo");
+
+    let out = cyclops(
+        &home,
+        &["start", "--preset", "duo", "--agents", "demo,demo"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        stdout(&out).starts_with("✓ workspace ready · 2 agents"),
+        "{}",
+        stdout(&out)
+    );
+
+    // Both panes are running the CLI, in this same invocation and with no
+    // --launch: naming them at the keyboard is the decision to run them.
+    assert_eq!(wait_running(&t, "main", &["cat", "cat"]), ["cat", "cat"]);
+
+    // And the workspace file carries them, so the arrangement and the
+    // fleet are one thing from here on.
+    let saved = fs::read_to_string(home.join("workspaces/main.toml")).expect("start saved it");
+    assert_eq!(saved.matches("command = \"cat\"").count(), 2, "{saved}");
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// The other half of that rule, and the one that is easy to break.
+///
+/// A command written into a workspace is a suggestion; running it stays an
+/// explicit choice per run (cyclops_tmux::layout, push_pane_args). Naming
+/// agents does not weaken that: the next `cyclops start` over the same file
+/// opens shells, and only `--launch` replays what is written there.
+#[test]
+fn a_later_start_over_that_workspace_still_needs_launch() {
+    if !tmux_available() {
+        return;
+    }
+    let t = TmuxServer::new("ws-agents-again");
+    let home = scratch_home("ws-agents-again");
+    write_config(
+        &home,
+        &t,
+        "sessions = [\"main\"]\ndefault_workspace = \"main\"\n",
+    );
+    stand_in_manifest(&home, "demo");
+    assert!(cyclops(
+        &home,
+        &["start", "--preset", "duo", "--agents", "demo,demo"]
+    )
+    .status
+    .success());
+    assert_eq!(wait_running(&t, "main", &["cat", "cat"]), ["cat", "cat"]);
+
+    // Naming them again over the open session starts nothing and says so:
+    // `start` never touches a session that exists.
+    let again = cyclops(&home, &["start", "--agents", "demo,demo"]);
+    assert!(again.status.success(), "{again:?}");
+    assert!(
+        stdout(&again).contains("was already open, so --agents started nothing"),
+        "{}",
+        stdout(&again)
+    );
+
+    // The session goes away, and a bare start rebuilds it as shells.
+    t.run_ok(&["kill-session", "-t", "=main"]);
+    assert!(cyclops(&home, &["start"]).status.success());
+    let plain = running(&t, "main");
+    assert!(
+        plain.iter().all(|c| c != "cat"),
+        "a bare start replayed the stored commands: {plain:?}"
+    );
+
+    // And --launch is what runs them, exactly as it does for any other
+    // command a workspace file holds.
+    t.run_ok(&["kill-session", "-t", "=main"]);
+    assert!(cyclops(&home, &["start", "--launch"]).status.success());
+    assert_eq!(wait_running(&t, "main", &["cat", "cat"]), ["cat", "cat"]);
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// A workspace you saved is yours.
+///
+/// `--agents` over one runs the CLIs it names in the panes it builds and
+/// leaves the file exactly as it was: `start` never rewrites a saved
+/// workspace, and a flag on one run is not an edit to your record. The
+/// file it does write is the one it built from a preset a moment earlier,
+/// which is cyclops's own copy either way.
+#[test]
+fn agents_over_a_saved_workspace_run_without_rewriting_it() {
+    if !tmux_available() {
+        return;
+    }
+    let t = TmuxServer::new("ws-agents-saved");
+    let home = scratch_home("ws-agents-saved");
+    write_config(
+        &home,
+        &t,
+        "sessions = [\"main\"]\ndefault_workspace = \"main\"\n",
+    );
+    stand_in_manifest(&home, "demo");
+
+    // A workspace on disk with no commands in it, and no session.
+    assert!(cyclops(&home, &["start", "--preset", "duo"])
+        .status
+        .success());
+    let path = home.join("workspaces/main.toml");
+    let before = fs::read_to_string(&path).expect("start saved it");
+    assert!(!before.contains("command ="), "{before}");
+    t.run_ok(&["kill-session", "-t", "=main"]);
+
+    assert!(cyclops(&home, &["start", "--agents", "demo,demo"])
+        .status
+        .success());
+    assert_eq!(wait_running(&t, "main", &["cat", "cat"]), ["cat", "cat"]);
+    assert_eq!(
+        fs::read_to_string(&path).expect("still there"),
+        before,
+        "--agents rewrote a workspace file"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// The rule that makes `--agents` safe over a workspace that already holds
+/// commands: it runs the ones it just filled, and only those.
+///
+/// A pane with no label is not part of the fleet, and the command in the
+/// file for it is a suggestion like any other: it waits for `--launch`.
+/// Both halves are asserted in one run, because that is the run where they
+/// used to disagree.
+#[test]
+fn agents_run_what_they_filled_and_leave_the_dock_alone() {
+    if !tmux_available() {
+        return;
+    }
+    let t = TmuxServer::new("ws-agents-dock");
+    let home = scratch_home("ws-agents-dock");
+    write_config(
+        &home,
+        &t,
+        "sessions = [\"main\"]\ndefault_workspace = \"main\"\n",
+    );
+    stand_in_manifest(&home, "demo");
+    workspace_with_a_dock(&home, "main");
+
+    let out = cyclops(&home, &["start", "--agents", "demo,demo"]);
+    assert!(out.status.success(), "{out:?}");
+
+    // The two named panes run the CLI that was named for them, in this
+    // invocation and with no --launch.
+    let now = wait_leading(&t, "main", 2, "cat");
+    assert_eq!(now.len(), 3, "the dock is still a pane: {now:?}");
+    assert_eq!(now[..2], ["cat", "cat"], "{now:?}");
+
+    // And the dock never becomes its stored command. Sampled over a window
+    // rather than once: a pane tmux built with a command reaches it a beat
+    // after the pane exists, so one early read would pass either way.
+    for _ in 0..10 {
+        let now = running(&t, "main");
+        assert!(
+            !now.iter().any(|c| c == "sleep"),
+            "--agents replayed a command it did not write: {now:?}"
+        );
+        thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// The other half of the same rule, over the same file: `--launch` still
+/// means every command the workspace holds, the dock's included. Narrowing
+/// it to the panes an agent is named for would be the same bug pointed the
+/// other way.
+#[test]
+fn launch_still_runs_every_stored_command_including_the_docks() {
+    if !tmux_available() {
+        return;
+    }
+    let t = TmuxServer::new("ws-launch-dock");
+    let home = scratch_home("ws-launch-dock");
+    write_config(
+        &home,
+        &t,
+        "sessions = [\"main\"]\ndefault_workspace = \"main\"\n",
+    );
+    stand_in_manifest(&home, "demo");
+    workspace_with_a_dock(&home, "main");
+
+    let out = cyclops(&home, &["start", "--launch"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        wait_running(&t, "main", &["sleep", "sleep", "sleep"]),
+        ["sleep", "sleep", "sleep"],
+        "--launch is the whole workspace, dock and all"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// Every `--agents` refusal happens before anything is built. A session
+/// half opened around a typo is worse than no session: it is one the
+/// operator has to take down before trying again.
+#[test]
+fn agents_that_cannot_be_placed_build_nothing_and_say_what_would_fit() {
+    if !tmux_available() {
+        return;
+    }
+    let t = TmuxServer::new("ws-agents-no");
+    let home = scratch_home("ws-agents-no");
+    write_config(
+        &home,
+        &t,
+        "sessions = [\"main\"]\ndefault_workspace = \"main\"\n",
+    );
+    stand_in_manifest(&home, "demo");
+
+    let short = cyclops(&home, &["start", "--preset", "duo", "--agents", "demo"]);
+    assert_eq!(short.status.code(), Some(2), "usage mistakes exit 2");
+    let err = String::from_utf8_lossy(&short.stderr).to_string();
+    assert!(err.contains("preset duo has 2 named panes"), "{err}");
+    assert!(err.contains("--preset solo, which has 1"), "{err}");
+
+    let typo = cyclops(
+        &home,
+        &["start", "--preset", "duo", "--agents", "dmeo,demo"],
+    );
+    assert_eq!(typo.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&typo.stderr).to_string();
+    assert!(err.contains("no agent CLI called \"dmeo\""), "{err}");
+    assert!(err.contains("demo"), "the ids that would work: {err}");
+
+    // Neither run left anything behind.
+    assert!(
+        !t.run(&["has-session", "-t", "=main"]).status.success(),
+        "a refused start built a session"
+    );
+    assert!(!home.join("workspaces/main.toml").exists());
+
+    let _ = fs::remove_dir_all(&home);
+}
+
 #[test]
 fn an_unknown_preset_lists_the_ones_that_exist() {
     if !tmux_available() {
