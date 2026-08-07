@@ -1,7 +1,9 @@
 # The workspace UI
 
 Bare `cyclops` on a TTY opens the full-screen terminal workspace: a
-project sidebar, tab bar, and live pane canvas fed by tmux control mode.
+project sidebar and a live pane canvas fed by tmux control mode, plus a
+tab bar whenever the workspace has more than one tab; a lone tab's strip
+hides and the canvas keeps the row.
 With no tmux server running (or no sessions on it), it starts one — a
 fresh session named `main` with a single shell pane in the directory you
 ran it from. Its first tab is `1`; automatic tab names continue with `2`,
@@ -128,7 +130,9 @@ Drag the sidebar's right border to resize it. The saved width is bounded to
 keep both sidebar and terminal useful: at most 42 cells and never more than
 half the terminal.
 
-The filled `+` in the tab strip opens the new-tab dialog. Type a name and use
+The filled `+` in the tab strip opens the new-tab dialog. With a single
+tab the strip is hidden: create the second tab with `prefix+c` or the
+menu's New tab, and the strip appears with the `+`. Type a name and use
 `↵ Create`, or click that action; the tab opens in the focused pane's current
 directory with that name. An empty name uses the next numeric tab name.
 `Esc Cancel` creates nothing. Rename and pane-name dialogs use the same
@@ -154,7 +158,9 @@ Home/End, or the mouse wheel.
 
 Wheel over a pane scrolls its history; new output never pulls a scrolled
 viewport back to the tail. Drag a gutter to resize, drag a tab onto another
-tab to reorder, or onto a workspace row to move it there. Drag workspace rows
+tab to reorder, or onto a workspace row to move it there (a lone tab has
+no chip while its strip is hidden; give the workspace a second tab
+first). Drag workspace rows
 to reorder the sidebar; drag agent rows within one workspace to reorder its
 children. Both sidebar orders persist. Click-drag inside a pane selects text
 and copies it on release; double-click selects a word, and triple-click

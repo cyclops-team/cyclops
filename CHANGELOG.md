@@ -5,8 +5,25 @@ versions are unreleased until admin cuts a tag.
 
 ## [Unreleased]
 
+### Added (v4)
+
+- The tab bar earns its row. With a single tab the strip hides and the
+  pane canvas reclaims the row; it returns the moment a second tab
+  exists. The painted chrome and the tmux-declared client size derive
+  the bar's visibility from the same model snapshot, so the grid never
+  drifts a row from what tmux was told. `prefix+c` and the menu's New
+  tab still create tabs while the bar is hidden.
+
 ### Fixed (v4)
 
+- The workspace's daemon subscription outlives cyclopsd. A boot-order
+  race or a daemon restart used to kill the state-event thread
+  silently, so the idle/working words froze until a structural
+  reconcile (the alt-tab-fixes-it symptom). The subscription now
+  reconnects on a bounded backoff, refetches the full snapshot on every
+  reconnect so nothing that changed during the outage stays stale, and
+  an outage outliving the chain says so once while the loop keeps
+  retrying.
 - nord and tokyo-night lift `surface.dim` to clear the 3:1 readability
   floor on the chrome panel (the menu button, sidebar rows, inactive
   tabs): nord's dim leaves the published palette (#8892a8, annotated in

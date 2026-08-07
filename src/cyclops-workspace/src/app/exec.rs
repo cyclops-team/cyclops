@@ -1350,6 +1350,82 @@ mod tests {
         client.shutdown().await;
     }
 
+    // -- The tab bar's row must track the tmux-declared size. --
+
+    /// The live 1-to-2 and 2-to-1 tab transitions, through the real
+    /// reconcile: a second tab shows the bar and the declared client
+    /// shrinks by exactly its row; closing back to one tab hides the bar
+    /// and wins the row back. Both the chrome split and the declaration
+    /// go through `App::chrome`, so a drift between them would land here
+    /// as a declared size that does not move with the bar.
+    #[tokio::test]
+    async fn tab_transitions_redeclare_the_client_around_the_bar_row() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-tab-bar-row");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        let pane = pane_ids(&server, "s")[0].clone();
+        let client = rig_client(&server, "s").await;
+        let mut app = test_app(
+            one_tab_model("s", "@0", &pane, "$0"),
+            scratch_home("exec-tab-bar-row-home"),
+        );
+        let term = ratatui::layout::Rect::new(0, 0, app.term_size.0, app.term_size.1);
+
+        // One tab: the bar is hidden and the declaration owns its row.
+        crate::app::reconcile(&mut app, &client)
+            .await
+            .expect("initial reconcile");
+        assert_eq!(app.model.session.tabs.len(), 1);
+        assert_eq!(
+            app.chrome(term).tab_bar.height,
+            0,
+            "a lone tab must hide the bar"
+        );
+        let lone = app.declared_client_size.expect("declared for one tab");
+        let before = window_ids(&server, "s");
+
+        // 1 -> 2: the bar returns and takes its row out of the grid.
+        execute(&mut app, &client, Action::NewTab { name: None })
+            .await
+            .expect("new tab");
+        crate::app::reconcile(&mut app, &client)
+            .await
+            .expect("reconcile after new tab");
+        assert_eq!(app.model.session.tabs.len(), 2);
+        assert_eq!(
+            app.chrome(term).tab_bar.height,
+            1,
+            "a second tab must show the bar"
+        );
+        let paired = app.declared_client_size.expect("declared for two tabs");
+        assert_eq!(paired.0, lone.0);
+        assert_eq!(
+            paired.1 + 1,
+            lone.1,
+            "the second tab must cost the declared grid exactly the bar row"
+        );
+
+        // 2 -> 1: an external close arrives like any structural change.
+        let created = window_ids(&server, "s")
+            .into_iter()
+            .find(|id| !before.contains(id))
+            .expect("the new tab's window id");
+        server.run_ok(&["kill-window", "-t", &created]);
+        crate::app::reconcile(&mut app, &client)
+            .await
+            .expect("reconcile after close");
+        assert_eq!(app.model.session.tabs.len(), 1);
+        assert_eq!(app.chrome(term).tab_bar.height, 0, "the bar hides again");
+        assert_eq!(
+            app.declared_client_size,
+            Some(lone),
+            "the lone tab wins its row back"
+        );
+        client.shutdown().await;
+    }
+
     // -- A reorder persists once on drop. --
 
     #[tokio::test]

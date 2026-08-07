@@ -1104,6 +1104,102 @@ mod tests {
         assert_eq!(buf[(20, 11)].symbol(), "─", "every pane has a border");
     }
 
+    /// The 1-to-2 and 2-to-1 tab transitions: the bar row exists exactly
+    /// while a second tab does, and the painted frame and the tmux-declared
+    /// size move together because both come from one chrome split over one
+    /// tabs snapshot. If a call site ever derived the visibility predicate
+    /// from a different snapshot, the panes would paint one row off the
+    /// declared grid (the bug class of 626ec09).
+    #[test]
+    fn tab_transitions_keep_painted_rows_and_declared_size_together() {
+        let area = Rect::new(0, 0, 40, 12);
+        let solo = vec![two_pane_tab()];
+        let mut paired = vec![two_pane_tab(), two_pane_tab()];
+        paired[1].window_id = "@1".into();
+        paired[1].name = "logs".into();
+
+        // One frame, the way `draw` composes it: chrome split, declared
+        // size, tab bar, and window paint all from the same tabs slice.
+        let frame = |tabs: &[TabModel]| -> (Buffer, (u16, u16)) {
+            let areas = crate::render::chrome_areas_for(
+                area,
+                false,
+                22,
+                false,
+                crate::render::tab_bar_visible(tabs.len()),
+            );
+            let declared = tmux_client_size(areas.canvas, &tabs[0]);
+            let backend = TestBackend::new(area.width, area.height);
+            let mut term = Terminal::new(backend).unwrap();
+            let theme = Paint::for_test();
+            let mut hits = HitMap::default();
+            let runtimes = RuntimeRegistry::default();
+            term.draw(|f| {
+                paint_tab_bar(
+                    tabs,
+                    0,
+                    areas.tab_bar,
+                    f.buffer_mut(),
+                    &theme,
+                    &mut hits,
+                    &DecorationSnapshot::default(),
+                );
+                let paused = std::collections::HashSet::new();
+                let dec = DecorationSnapshot::default();
+                let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
+                paint_window(
+                    &tabs[0],
+                    &runtimes,
+                    areas.canvas,
+                    f.buffer_mut(),
+                    &theme,
+                    &mut ctx,
+                );
+            })
+            .unwrap();
+            (term.backend().buffer().clone(), declared)
+        };
+        let top_row = |buf: &Buffer| -> String {
+            (0..buf.area.width)
+                .map(|x| buf[(x, 0)].symbol().to_string())
+                .collect()
+        };
+
+        // Two tabs: the strip owns the top row and the pane ring starts
+        // under it.
+        let (with_bar, declared_with_bar) = frame(&paired);
+        assert!(
+            top_row(&with_bar).contains("main"),
+            "the strip must carry the tab chips: {}",
+            top_row(&with_bar)
+        );
+        assert_eq!(
+            with_bar[(0, 1)].symbol(),
+            "╭",
+            "ring starts under the strip"
+        );
+
+        // Back to one tab: the ring reclaims the top row, no chip remains,
+        // and the declared grid grows by exactly the reclaimed row.
+        let (lone, declared_lone) = frame(&solo);
+        assert_eq!(
+            lone[(0, 0)].symbol(),
+            "╭",
+            "the canvas reclaims the top row"
+        );
+        assert!(
+            !top_row(&lone).contains("main"),
+            "no tab chip may survive the hide: {}",
+            top_row(&lone)
+        );
+        assert_eq!(declared_lone.0, declared_with_bar.0);
+        assert_eq!(
+            declared_lone.1,
+            declared_with_bar.1 + 1,
+            "the bar row moves between chrome and the declared grid, whole"
+        );
+    }
+
     /// A column split three ways spends more rows on separator bands than
     /// its single-pane sibling, so tmux's equal columns paint unequal boxes
     /// and the deep one reads as overhanging the rest.

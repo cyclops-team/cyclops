@@ -57,6 +57,20 @@ pub struct ChromeAreas {
     pub canvas: Rect,
 }
 
+/// Whether the tab bar earns its row: only when the active workspace has
+/// a second tab to switch to. A lone tab's strip carries one chip and a
+/// `+` button, no information, so it hides and the canvas reclaims the
+/// row; tabs are still created while hidden (the prefix+c binding and the
+/// sidebar menu's "New tab"), and the strip returns with the second tab.
+///
+/// Every caller of [`chrome_areas_for`] must derive this from the same
+/// model snapshot it sizes the canvas with, or the painted grid disagrees
+/// with the tmux-declared size by one row (the bug class of 626ec09:
+/// panels painted for the wrong terminal).
+pub fn tab_bar_visible(tab_count: usize) -> bool {
+    tab_count > 1
+}
+
 /// Split one frame into the sidebar, event panel, tab bar, and pane canvas
 /// — the top-level chrome composition every painted surface below sits
 /// inside. `app` decides visibility and width; this only turns those
@@ -66,6 +80,7 @@ pub fn chrome_areas_for(
     sidebar_visible: bool,
     sidebar_width: u16,
     panel_open: bool,
+    tab_bar_visible: bool,
 ) -> ChromeAreas {
     let mut main = area;
     let sidebar = if sidebar_visible && main.width > 4 {
@@ -88,7 +103,11 @@ pub fn chrome_areas_for(
     } else {
         None
     };
-    let bar_h = TAB_BAR_HEIGHT.min(main.height);
+    let bar_h = if tab_bar_visible {
+        TAB_BAR_HEIGHT.min(main.height)
+    } else {
+        0
+    };
     let tab_bar = Rect::new(main.x, main.y, main.width, bar_h);
     let canvas = Rect::new(
         main.x,
@@ -644,7 +663,7 @@ mod tests {
 
     #[test]
     fn chrome_canvas_excludes_sidebar_and_tab_bar() {
-        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, false);
+        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, false, true);
         assert_eq!(areas.sidebar, Some(Rect::new(0, 0, 22, 50)));
         assert_eq!(areas.tab_bar, Rect::new(22, 0, 178, 1));
         assert_eq!(areas.canvas, Rect::new(22, 1, 178, 49));
@@ -653,9 +672,24 @@ mod tests {
 
     #[test]
     fn chrome_canvas_shrinks_for_event_stream() {
-        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, true);
+        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, true, true);
         assert_eq!(areas.panel, Some(Rect::new(160, 0, 40, 50)));
         assert_eq!(areas.canvas, Rect::new(22, 1, 138, 49));
+    }
+
+    /// One tab hides the strip whole: no bar rectangle, and the canvas
+    /// keeps the row the bar would have taken. The predicate itself is
+    /// pinned too, so the row can only ever come and go at the 1-to-2
+    /// boundary.
+    #[test]
+    fn a_lone_tab_hides_the_bar_and_the_canvas_reclaims_its_row() {
+        assert!(!tab_bar_visible(0));
+        assert!(!tab_bar_visible(1));
+        assert!(tab_bar_visible(2));
+
+        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, false, false);
+        assert_eq!(areas.tab_bar.height, 0);
+        assert_eq!(areas.canvas, Rect::new(22, 0, 178, 50));
     }
 
     #[test]
