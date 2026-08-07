@@ -82,11 +82,13 @@ change whenever coverage grows.
   records the rename), and `config.toml`'s `sessions` list is not rewritten,
   so a restarted daemon waits on the old name until something re-registers
   the new one.
-- Claude Code activity status in the roster / workspace chrome is unreliable:
-  a live Claude pane can stay `? unknown` (or fail to move between idle and
-  working) while Codex on the same build updates. This is a detection /
-  fusion gap, not a delivery bug. Messaging reliability work and the
-  2026-08-07 live-testing bugfixes did not address it. Tracked in
+- Agent activity status in the roster / workspace chrome is unreliable for
+  some CLIs: Codex is confirmed wrong (idle ↔ working), and Cursor Agent has
+  been seen showing `working` while the human is only typing in the composer
+  (should be idle / idle_with_input). Earlier notes also reported Claude
+  Code stuck on `? unknown`; revalidate on the current build. This is a
+  detection / fusion gap, not a delivery bug. Messaging reliability work and
+  the 2026-08-07 live-testing bugfixes did not address it. Tracked in
   [issue #7](https://github.com/cyclops-team/cyclops/issues/7).
 
 For the repository map and design boundaries, read
