@@ -380,6 +380,9 @@ pub async fn run_async() -> i32 {
         prefs.sidebar_visible,
         prefs.sidebar_width.max(crate::render::SIDEBAR_MIN_WIDTH),
         false,
+        prefs
+            .event_panel_width
+            .max(crate::render::EVENT_PANEL_MIN_WIDTH),
     )
     .canvas;
     let boot_size = crate::render::tmux_client_size(chrome_canvas, model.active_tab());
@@ -880,12 +883,19 @@ impl App {
             .max(crate::render::SIDEBAR_MIN_WIDTH)
     }
 
+    fn event_panel_width(&self) -> u16 {
+        self.prefs
+            .event_panel_width
+            .max(crate::render::EVENT_PANEL_MIN_WIDTH)
+    }
+
     fn chrome(&self, area: Rect) -> crate::render::ChromeAreas {
         crate::render::chrome_areas_for(
             area,
             self.model.sidebar_visible,
             self.sidebar_width(),
             self.event_stream_open,
+            self.event_panel_width(),
         )
     }
 
@@ -1252,6 +1262,9 @@ fn cancel_drag(app: &mut App) {
             // restore the start without a compensating tmux resize.
             app.prefs.sidebar_width = width;
         }
+        if let Some(width) = crate::render::event_panel_width_on_cancel(&drag, app.term_size.0) {
+            app.prefs.event_panel_width = width;
+        }
     }
 }
 
@@ -1342,7 +1355,17 @@ async fn handle_mouse(
                 } else {
                     action::ScrollDirection::Down
                 };
-                if let Some(action) = action::route_mouse_scroll(&target, direction) {
+                // Only a `PaneBody` hit has a pane to resolve a cell
+                // against; every other scrollable target (none exist
+                // today) would just carry `None` through unchanged.
+                let at = match &target {
+                    HitTarget::PaneBody { pane_id } => app
+                        .hit_map
+                        .pane_geometry(pane_id)
+                        .and_then(|geom| HitMap::cell_at(geom, col, row)),
+                    _ => None,
+                };
+                if let Some(action) = action::route_mouse_scroll(&target, direction, at) {
                     let outcome = exec::execute(app, client, action).await?;
                     apply_outcome(app, outcome);
                 }
@@ -1385,6 +1408,9 @@ async fn handle_mouse(
                         pane_id: pane_id.clone(),
                         at: (col, row),
                     });
+                }
+                HitTarget::EventPanel | HitTarget::EventPanelDivider => {
+                    app.open_menu(MenuState::EventPanelMenu { at: (col, row) });
                 }
                 _ => app.close_menu(),
             }
@@ -1526,6 +1552,16 @@ async fn handle_mouse(
                     app.drag = Some(DragState::on_down(DragTarget::Sidebar, col, row));
                     return Ok(());
                 }
+                HitTarget::EventPanel => {
+                    app.close_menu();
+                    app.selection.clear();
+                }
+                HitTarget::EventPanelDivider => {
+                    app.close_menu();
+                    app.selection.clear();
+                    app.drag = Some(DragState::on_down(DragTarget::EventPanel, col, row));
+                    return Ok(());
+                }
                 HitTarget::AppMenu => {
                     if app.menu == MenuState::AppMenu {
                         app.close_menu();
@@ -1552,6 +1588,12 @@ async fn handle_mouse(
                     app.prefs.sidebar_width =
                         crate::render::sidebar_width_for_column(col, app.term_size.0);
                 }
+                if app.drag.as_ref().is_some_and(|drag| {
+                    drag.is_active() && matches!(&drag.target, DragTarget::EventPanel)
+                }) {
+                    app.prefs.event_panel_width =
+                        crate::render::event_panel_width_for_column(col, app.term_size.0);
+                }
             } else if let Some(anchor) = app.selection.anchor_pane().map(str::to_string) {
                 if let Some(geom) = app.hit_map.pane_geometry(&anchor) {
                     if let Some(cell) = crate::input::mouse::HitMap::cell_at(geom, col, row) {
@@ -1570,6 +1612,17 @@ async fn handle_mouse(
             if sidebar_drag {
                 app.prefs.sidebar_width =
                     crate::render::sidebar_width_for_column(col, app.term_size.0);
+                if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
+                    log_err(&app.home, &error);
+                }
+                resize_client(app, client).await;
+            }
+            let event_panel_drag = app.drag.as_ref().is_some_and(|drag| {
+                drag.is_active() && matches!(&drag.target, DragTarget::EventPanel)
+            });
+            if event_panel_drag {
+                app.prefs.event_panel_width =
+                    crate::render::event_panel_width_for_column(col, app.term_size.0);
                 if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
                     log_err(&app.home, &error);
                 }
@@ -1605,8 +1658,8 @@ async fn handle_mouse(
 /// target under the release point through `action`'s routing, and execute
 /// whatever it resolves to. Only [`DragTarget::Tab`], `Workspace`, and
 /// `Agent` resolve here — a divider applies live during motion
-/// ([`apply_live_divider`]) and a sidebar-width drag already applied and
-/// persisted above.
+/// ([`apply_live_divider`]) and a sidebar-width or event-panel-width drag
+/// already applied and persisted above.
 ///
 /// `Workspace` is the one variant that does NOT resolve through a dropped-
 /// on hit target: [`resolve_workspace_slot_drop`] recomputes the exact
@@ -1639,7 +1692,7 @@ async fn commit_drag_drop(
             let order = agent_order_for_workspace(app, workspace_id);
             drop.and_then(|drop| action::resolve_agent_drop(workspace_id, order_key, &drop, &order))
         }
-        DragTarget::Divider { .. } | DragTarget::Sidebar => None,
+        DragTarget::Divider { .. } | DragTarget::Sidebar | DragTarget::EventPanel => None,
     };
     let Some(action) = action else {
         return Ok(());
@@ -2123,7 +2176,13 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
         .draw(|f| {
             let areas = app.chrome(f.area());
             if let Some(panel) = areas.panel {
-                paint_event_stream(&app.record, panel, f.buffer_mut(), &app.paint);
+                paint_event_stream(
+                    &app.record,
+                    panel,
+                    f.buffer_mut(),
+                    &app.paint,
+                    &mut app.hit_map,
+                );
             }
             if let Some(sidebar) = areas.sidebar {
                 paint_sidebar(

@@ -25,10 +25,15 @@ pub struct HydrationBundle {
     pub cursor_x: u16,
     pub cursor_y: u16,
     pub alternate_on: bool,
+    /// Whether the pane has any mouse-tracking DECSET on (1000, 1002, or
+    /// 1003) — tmux's `#{mouse_any_flag}`.
+    pub mouse_on: bool,
+    /// Whether the pane has SGR mouse encoding (DECSET 1006) on — tmux's
+    /// `#{mouse_sgr_flag}`.
+    pub mouse_sgr: bool,
 }
 
-const META_FORMAT: &str =
-    "#{cursor_x}\t#{cursor_y}\t#{alternate_on}\t#{pane_width}\t#{pane_height}";
+const META_FORMAT: &str = "#{cursor_x}\t#{cursor_y}\t#{alternate_on}\t#{pane_width}\t#{pane_height}\t#{mouse_any_flag}\t#{mouse_sgr_flag}";
 
 impl ControlClient {
     /// Fetch escaped visible and alternate captures plus cursor/mode metadata
@@ -37,7 +42,8 @@ impl ControlClient {
         let visible = self.capture_pane_escaped(pane_id).await?;
         let alternate = self.capture_pane_alternate_escaped(pane_id).await.ok();
         let meta = self.display(pane_id, META_FORMAT).await?;
-        let (cursor_x, cursor_y, alternate_on, cols, rows) = parse_meta(&meta)?;
+        let (cursor_x, cursor_y, alternate_on, cols, rows, mouse_on, mouse_sgr) =
+            parse_meta(&meta)?;
         Ok(HydrationBundle {
             cols,
             rows,
@@ -46,6 +52,8 @@ impl ControlClient {
             cursor_x,
             cursor_y,
             alternate_on,
+            mouse_on,
+            mouse_sgr,
         })
     }
 
@@ -133,7 +141,12 @@ async fn join_all_ordered<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
     .await
 }
 
-fn parse_meta(line: &str) -> Result<(u16, u16, bool, u16, u16), TmuxError> {
+/// `(cursor_x, cursor_y, alternate_on, cols, rows, mouse_on, mouse_sgr)`,
+/// named so [`parse_meta`]'s signature reads rather than counting tuple
+/// slots.
+type ParsedMeta = (u16, u16, bool, u16, u16, bool, bool);
+
+fn parse_meta(line: &str) -> Result<ParsedMeta, TmuxError> {
     let mut fields = line.split('\t');
     let cursor_x = fields
         .next()
@@ -161,7 +174,27 @@ fn parse_meta(line: &str) -> Result<(u16, u16, bool, u16, u16), TmuxError> {
         .ok_or_else(|| TmuxError::Protocol("hydration meta: missing pane_height".into()))?
         .parse::<u16>()
         .map_err(|e| TmuxError::Protocol(format!("hydration meta pane_height: {e}")))?;
-    Ok((cursor_x, cursor_y, alternate_on, cols, rows))
+    let mouse_on = fields
+        .next()
+        .ok_or_else(|| TmuxError::Protocol("hydration meta: missing mouse_any_flag".into()))?
+        .parse::<u8>()
+        .map_err(|e| TmuxError::Protocol(format!("hydration meta mouse_any_flag: {e}")))?
+        != 0;
+    let mouse_sgr = fields
+        .next()
+        .ok_or_else(|| TmuxError::Protocol("hydration meta: missing mouse_sgr_flag".into()))?
+        .parse::<u8>()
+        .map_err(|e| TmuxError::Protocol(format!("hydration meta mouse_sgr_flag: {e}")))?
+        != 0;
+    Ok((
+        cursor_x,
+        cursor_y,
+        alternate_on,
+        cols,
+        rows,
+        mouse_on,
+        mouse_sgr,
+    ))
 }
 
 #[cfg(test)]
@@ -170,8 +203,11 @@ mod tests {
 
     #[test]
     fn meta_format_parses() {
-        let (x, y, alt, w, h) = parse_meta("3\t5\t0\t120\t30").unwrap();
-        assert_eq!((x, y, alt, w, h), (3, 5, false, 120, 30));
+        let (x, y, alt, w, h, mouse_on, mouse_sgr) = parse_meta("3\t5\t0\t120\t30\t1\t0").unwrap();
+        assert_eq!(
+            (x, y, alt, w, h, mouse_on, mouse_sgr),
+            (3, 5, false, 120, 30, true, false)
+        );
     }
 
     #[tokio::test]

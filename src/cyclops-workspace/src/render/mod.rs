@@ -40,14 +40,15 @@ pub use tab_bar::paint_tab_bar;
 /// A chrome region's height in the tab bar. It never grows: the row is a
 /// strip, not a panel.
 const TAB_BAR_HEIGHT: u16 = 1;
-/// Fixed width of the slide-out event panel.
-const EVENT_STREAM_WIDTH: u16 = 40;
 /// Narrowest a readable sidebar can be: below this, workspace and agent
 /// names truncate into noise.
 pub(crate) const SIDEBAR_MIN_WIDTH: u16 = 22;
 /// Widest a sidebar may grow before it starts crowding the pane canvas it
 /// exists to introduce.
 const SIDEBAR_MAX_WIDTH: u16 = 42;
+/// Narrowest a readable event panel can be: below this, a row's timestamp
+/// and glyph crowd out the words they are labeling.
+pub(crate) const EVENT_PANEL_MIN_WIDTH: u16 = 24;
 
 /// Chrome rectangles for one frame.
 pub struct ChromeAreas {
@@ -66,6 +67,7 @@ pub fn chrome_areas_for(
     sidebar_visible: bool,
     sidebar_width: u16,
     panel_open: bool,
+    panel_width: u16,
 ) -> ChromeAreas {
     let mut main = area;
     let sidebar = if sidebar_visible && main.width > 4 {
@@ -76,15 +78,15 @@ pub fn chrome_areas_for(
     } else {
         None
     };
-    let panel = if panel_open && main.width > EVENT_STREAM_WIDTH + 4 {
-        let p = Rect::new(
-            main.x + main.width - EVENT_STREAM_WIDTH,
-            main.y,
-            EVENT_STREAM_WIDTH,
-            main.height,
-        );
-        main = Rect::new(main.x, main.y, main.width - EVENT_STREAM_WIDTH, main.height);
-        Some(p)
+    let panel = if panel_open {
+        let w = clamp_event_panel_width(panel_width, area.width);
+        if main.width > w + 4 {
+            let p = Rect::new(main.x + main.width - w, main.y, w, main.height);
+            main = Rect::new(main.x, main.y, main.width - w, main.height);
+            Some(p)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -123,6 +125,30 @@ pub fn sidebar_width_for_column(column: u16, terminal_width: u16) -> u16 {
 pub fn sidebar_width_on_cancel(drag: &DragState, terminal_width: u16) -> Option<u16> {
     matches!(&drag.target, DragTarget::Sidebar)
         .then(|| sidebar_width_for_column(drag.start.0, terminal_width))
+}
+
+/// Bound a requested event-panel width to what stays readable without
+/// eating more than half the terminal — the same readability contract
+/// [`clamp_sidebar_width`] applies, at the panel's own floor.
+pub fn clamp_event_panel_width(requested: u16, terminal_width: u16) -> u16 {
+    let max = (terminal_width / 2).max(1);
+    let min = EVENT_PANEL_MIN_WIDTH.min(max);
+    requested.clamp(min, max)
+}
+
+/// The event-panel width a live drag to `column` would commit. The panel is
+/// right-anchored, so its width is measured from the drag column to the
+/// terminal's right edge rather than from the left origin `sidebar_width_for_column`
+/// measures from.
+pub fn event_panel_width_for_column(column: u16, terminal_width: u16) -> u16 {
+    clamp_event_panel_width(terminal_width.saturating_sub(column), terminal_width)
+}
+
+/// The width to restore when an event-panel-resize drag is cancelled: `None`
+/// for every other drag target, which has nothing here to restore.
+pub fn event_panel_width_on_cancel(drag: &DragState, terminal_width: u16) -> Option<u16> {
+    matches!(&drag.target, DragTarget::EventPanel)
+        .then(|| event_panel_width_for_column(drag.start.0, terminal_width))
 }
 
 /// Write `text` onto one row, clipped to `bounds`.
@@ -248,7 +274,7 @@ mod tests {
 
     #[test]
     fn chrome_canvas_excludes_sidebar_and_tab_bar() {
-        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, false);
+        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, false, 40);
         assert_eq!(areas.sidebar, Some(Rect::new(0, 0, 22, 50)));
         assert_eq!(areas.tab_bar, Rect::new(22, 0, 178, 1));
         assert_eq!(areas.canvas, Rect::new(22, 1, 178, 49));
@@ -257,9 +283,53 @@ mod tests {
 
     #[test]
     fn chrome_canvas_shrinks_for_event_stream() {
-        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, true);
+        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, true, 40);
         assert_eq!(areas.panel, Some(Rect::new(160, 0, 40, 50)));
         assert_eq!(areas.canvas, Rect::new(22, 1, 138, 49));
+    }
+
+    #[test]
+    fn chrome_areas_for_honors_a_requested_panel_width() {
+        let areas = chrome_areas_for(Rect::new(0, 0, 100, 50), false, 22, true, 30);
+        assert_eq!(areas.panel, Some(Rect::new(70, 0, 30, 50)));
+        assert_eq!(areas.canvas, Rect::new(0, 1, 70, 49));
+    }
+
+    #[test]
+    fn chrome_areas_for_panel_guard_uses_the_dynamic_clamped_width() {
+        // A requested width far past half the terminal is clamped down
+        // before the open/closed guard checks it, so the panel opens at its
+        // clamped width rather than the oversized request.
+        let areas = chrome_areas_for(Rect::new(0, 0, 60, 50), false, 22, true, 1000);
+        assert_eq!(areas.panel, Some(Rect::new(30, 0, 30, 50)));
+
+        // Too narrow for even the clamped-down minimum plus the guard's
+        // margin: the panel stays closed instead of shrinking further.
+        let areas = chrome_areas_for(Rect::new(0, 0, 8, 50), false, 22, true, 100);
+        assert_eq!(areas.panel, None);
+        assert_eq!(areas.canvas, Rect::new(0, 1, 8, 49));
+    }
+
+    #[test]
+    fn event_panel_resize_is_bounded_by_readability_and_half_the_terminal() {
+        assert_eq!(clamp_event_panel_width(1, 200), EVENT_PANEL_MIN_WIDTH);
+        assert_eq!(clamp_event_panel_width(1000, 200), 100);
+        assert_eq!(clamp_event_panel_width(1000, 40), 20);
+    }
+
+    #[test]
+    fn event_panel_width_for_column_is_right_anchored_and_clamped() {
+        assert_eq!(event_panel_width_for_column(160, 200), 40);
+        assert_eq!(
+            event_panel_width_for_column(190, 200),
+            EVENT_PANEL_MIN_WIDTH,
+            "10 columns of room clamps up to the readable floor"
+        );
+        assert_eq!(
+            event_panel_width_for_column(0, 200),
+            100,
+            "the full terminal clamps down to half of it"
+        );
     }
 
     #[test]
@@ -276,5 +346,21 @@ mod tests {
             5,
         );
         assert_eq!(sidebar_width_on_cancel(&tab, 100), None);
+    }
+
+    #[test]
+    fn cancelling_an_event_panel_drag_restores_its_starting_width() {
+        let mut drag = DragState::on_down(DragTarget::EventPanel, 73, 5);
+        drag.on_move(60, 5);
+        assert_eq!(event_panel_width_on_cancel(&drag, 100), Some(27));
+
+        let tab = DragState::on_down(
+            DragTarget::Tab {
+                window_id: "@0".into(),
+            },
+            73,
+            5,
+        );
+        assert_eq!(event_panel_width_on_cancel(&tab, 100), None);
     }
 }

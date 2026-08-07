@@ -75,6 +75,11 @@ pub const MENU_NEW_WORKSPACE: &str = "New workspace";
 
 pub const MENU_TOGGLE_EVENTS: &str = "Event stream";
 
+/// The event panel's own context menu: unlike the app menu's toggle, this
+/// only ever appears while the panel is already open, so its one item names
+/// the closing act rather than the ambivalent noun `MENU_TOGGLE_EVENTS` uses.
+pub const MENU_CLOSE_EVENTS: &str = "Close event stream";
+
 pub const MENU_KEYBINDS: &str = "Keybinds";
 
 pub const MENU_DETACH: &str = "Detach";

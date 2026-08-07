@@ -15,6 +15,7 @@ use unicode_width::UnicodeWidthChar;
 use cyclops_ui::{Entry, EntryKind, Record};
 
 use crate::copy;
+use crate::input::mouse::{HitMap, HitTarget};
 use crate::theme::{self, Paint};
 
 /// One event-panel row: the entry it came from (for [`entry_row_style`])
@@ -77,21 +78,28 @@ fn entry_row_style(kind: &EntryKind, paint: &Paint) -> Style {
 /// admitted rows (E2), clipped to this narrower viewport. See
 /// [`event_stream_rows`] for the row content and ordering guarantee, and
 /// `crate::app::App::record`'s doc for what feeds it.
-pub fn paint_event_stream(record: &Record, area: Rect, buf: &mut Buffer, paint: &Paint) {
-    let w = area.width.min(40);
-    let panel = Rect::new(
-        area.x + area.width.saturating_sub(w),
-        area.y,
-        w,
-        area.height,
-    );
+///
+/// `area` is already the exact panel rect `chrome_areas_for` carved — this
+/// paints into it directly rather than re-deriving a width, so a resized
+/// panel never disagrees with the rectangle the rest of chrome measured
+/// against. Two hit regions are recorded: the panel body, then its left
+/// border column pushed last so it wins hit-testing over the body
+/// (`HitMap::hit` scans in reverse) — the border is the resize handle, and
+/// a click one cell to its right must not be mistaken for grabbing it.
+pub fn paint_event_stream(
+    record: &Record,
+    area: Rect,
+    buf: &mut Buffer,
+    paint: &Paint,
+    hits: &mut HitMap,
+) {
     let block = Block::default()
         .borders(Borders::LEFT)
         .title(" Event stream ")
         .border_style(theme::pane_border_focused(paint))
         .style(theme::menu_row(paint));
-    let inner = block.inner(panel);
-    block.render(panel, buf);
+    let inner = block.inner(area);
+    block.render(area, buf);
 
     let rows = event_stream_rows(record);
     if rows.is_empty() {
@@ -100,21 +108,26 @@ pub fn paint_event_stream(record: &Record, area: Rect, buf: &mut Buffer, paint: 
             theme::sidebar_row(paint),
         )))
         .render(inner, buf);
-        return;
+    } else {
+        // An admitted row can be several lines (a message's body) and any
+        // one of those can be wider than the panel, so "row" and "rendered
+        // line" are different units. Capping by row count let one old, wide
+        // row's wrap push the newest row's lines past the bottom of the
+        // viewport, where `Paragraph` silently drops them (it fills from
+        // its first line and stops, so overflow is lost off the end, not
+        // the start). The panel's guarantee is the last `inner.height`
+        // RENDERED lines, so this wraps to `inner.width` itself and windows
+        // the result, rather than asking `Paragraph::wrap` for a
+        // word-wrapped line count it does not expose.
+        let lines = visible_window(&rows, inner.width as usize, inner.height as usize, paint);
+        Paragraph::new(lines).render(inner, buf);
     }
 
-    // An admitted row can be several lines (a message's body) and any one
-    // of those can be wider than the panel, so "row" and "rendered line"
-    // are different units. Capping by row count let one old, wide row's
-    // wrap push the newest row's lines past the bottom of the viewport,
-    // where `Paragraph` silently drops them (it fills from its first line
-    // and stops, so overflow is lost off the end, not the start). The
-    // panel's guarantee is the last `inner.height` RENDERED lines, so this
-    // wraps to `inner.width` itself and windows the result, rather than
-    // asking `Paragraph::wrap` for a word-wrapped line count it does not
-    // expose.
-    let lines = visible_window(&rows, inner.width as usize, inner.height as usize, paint);
-    Paragraph::new(lines).render(inner, buf);
+    hits.push(area, HitTarget::EventPanel);
+    hits.push(
+        Rect::new(area.x, area.y, 1, area.height),
+        HitTarget::EventPanelDivider,
+    );
 }
 
 /// Wraps `text` at `width` display columns, matching how a narrower
@@ -248,10 +261,11 @@ mod tests {
     /// Ratatui rather than a private debug-formatted projection.
     ///
     /// A state whose word plus "reviewer" comes in under this backend's
-    /// content width: the panel caps its own width at 40 regardless of
-    /// the terminal, so the row this fixture renders has to fit inside
-    /// that fixed 39-column budget to test the glyph and word rather than
-    /// this module's own hard wrap (covered separately, below).
+    /// content width: the fixture's terminal IS the panel (the chrome split
+    /// that would otherwise narrow it happens above this module), so the
+    /// row this fixture renders has to fit inside that fixed 39-column
+    /// budget to test the glyph and word rather than this module's own hard
+    /// wrap (covered separately, below).
     #[test]
     fn event_panel_renders_the_calm_views_glyph_and_word() {
         let mut record = Record::new();
@@ -265,8 +279,9 @@ mod tests {
         let backend = TestBackend::new(40, 6);
         let mut term = Terminal::new(backend).unwrap();
         let paint = Paint::for_test();
+        let mut hits = HitMap::default();
         term.draw(|f| {
-            paint_event_stream(&record, f.area(), f.buffer_mut(), &paint);
+            paint_event_stream(&record, f.area(), f.buffer_mut(), &paint, &mut hits);
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -277,6 +292,46 @@ mod tests {
         // literal: if the state's words change, this follows.
         let word = cyclops_proto::AgentState::BlockedModal.to_string();
         assert!(text.contains(&word), "{text:?}");
+    }
+
+    /// The panel and its resize handle both paint hit regions matching what
+    /// `chrome_areas_for` carved: the whole rect answers `EventPanel`, but
+    /// the divider's border column overrides that at its own coordinates,
+    /// since it is pushed after the panel and `HitMap::hit` scans in
+    /// reverse.
+    #[test]
+    fn paint_event_stream_records_the_panel_and_divider_hit_regions() {
+        let mut record = Record::new();
+        record.live(state_entry(
+            1_000,
+            "reviewer",
+            "%1",
+            cyclops_proto::AgentState::BlockedPermission,
+        ));
+
+        let area = Rect::new(0, 0, 30, 6);
+        let backend = TestBackend::new(30, 6);
+        let mut term = Terminal::new(backend).unwrap();
+        let paint = Paint::for_test();
+        let mut hits = HitMap::default();
+        term.draw(|f| {
+            paint_event_stream(&record, area, f.buffer_mut(), &paint, &mut hits);
+        })
+        .unwrap();
+
+        assert!(
+            matches!(hits.hit(15, 3), Some(HitTarget::EventPanel)),
+            "the panel body answers inside its own rect"
+        );
+        assert!(
+            matches!(hits.hit(0, 0), Some(HitTarget::EventPanelDivider)),
+            "the border column wins over the panel body"
+        );
+        assert!(
+            matches!(hits.hit(0, 5), Some(HitTarget::EventPanelDivider)),
+            "the divider spans the panel's full height"
+        );
+        assert!(hits.hit(30, 3).is_none(), "outside the panel entirely");
     }
 
     /// Rule 11, mechanically: turn color off and read the same line. The
@@ -295,8 +350,9 @@ mod tests {
         let render_with = |paint: &Paint| -> ratatui::buffer::Buffer {
             let backend = TestBackend::new(40, 6);
             let mut term = Terminal::new(backend).unwrap();
+            let mut hits = HitMap::default();
             term.draw(|f| {
-                paint_event_stream(&record, f.area(), f.buffer_mut(), paint);
+                paint_event_stream(&record, f.area(), f.buffer_mut(), paint, &mut hits);
             })
             .unwrap();
             term.backend().buffer().clone()
@@ -347,8 +403,9 @@ mod tests {
         let backend = TestBackend::new(31, 3);
         let mut term = Terminal::new(backend).unwrap();
         let paint = Paint::for_test();
+        let mut hits = HitMap::default();
         term.draw(|f| {
-            paint_event_stream(&record, f.area(), f.buffer_mut(), &paint);
+            paint_event_stream(&record, f.area(), f.buffer_mut(), &paint, &mut hits);
         })
         .unwrap();
         let text = flatten(term.backend().buffer());
@@ -381,8 +438,9 @@ mod tests {
         let backend = TestBackend::new(21, 6);
         let mut term = Terminal::new(backend).unwrap();
         let paint = Paint::for_test();
+        let mut hits = HitMap::default();
         term.draw(|f| {
-            paint_event_stream(&record, f.area(), f.buffer_mut(), &paint);
+            paint_event_stream(&record, f.area(), f.buffer_mut(), &paint, &mut hits);
         })
         .unwrap();
         let text = flatten(term.backend().buffer());

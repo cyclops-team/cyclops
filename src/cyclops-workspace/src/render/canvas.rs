@@ -627,7 +627,7 @@ fn paint_drag_preview(drag: &DragState, buf: &mut Buffer, paint: &Paint) {
         DragTarget::Divider { .. } => "↔",
         DragTarget::Tab { .. } => "⇄",
         DragTarget::Workspace { .. } | DragTarget::Agent { .. } => "⇅",
-        DragTarget::Sidebar => "↔",
+        DragTarget::Sidebar | DragTarget::EventPanel => "↔",
     };
     if let Some(cell) = buf.cell_mut((x, y)) {
         cell.set_symbol(hint);

@@ -24,6 +24,8 @@ pub enum DragTarget {
     },
     /// Resize the application sidebar, not a tmux pane.
     Sidebar,
+    /// Resize the slide-out event panel, not a tmux pane.
+    EventPanel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,6 +228,7 @@ mod tests {
             },
             divider(),
             DragTarget::Sidebar,
+            DragTarget::EventPanel,
         ] {
             let mut drag = DragState::on_down(target.clone(), 0, 0);
             drag.on_move(10, 10);

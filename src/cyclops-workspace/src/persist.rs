@@ -11,6 +11,7 @@ use crate::decoration::DecorationSnapshot;
 pub struct WorkspacePrefs {
     pub sidebar_visible: bool,
     pub sidebar_width: u16,
+    pub event_panel_width: u16,
     pub workspace_order: Vec<String>,
     /// Stable labels, with pane-id fallbacks for unnamed detected agents.
     pub agent_order: Vec<String>,
@@ -26,6 +27,7 @@ impl Default for WorkspacePrefs {
         WorkspacePrefs {
             sidebar_visible: true,
             sidebar_width: 22,
+            event_panel_width: 40,
             workspace_order: Vec::new(),
             agent_order: Vec::new(),
             folder_tracked: Vec::new(),
@@ -71,6 +73,13 @@ pub fn load_prefs(home: &Path) -> WorkspacePrefs {
         .and_then(|v| u16::try_from(v).ok())
     {
         prefs.sidebar_width = v;
+    }
+    if let Some(v) = workspace
+        .get("event_panel_width")
+        .and_then(|v| v.as_integer())
+        .and_then(|v| u16::try_from(v).ok())
+    {
+        prefs.event_panel_width = v;
     }
     if let Some(arr) = workspace.get("workspace_order").and_then(|v| v.as_array()) {
         prefs.workspace_order = arr
@@ -135,6 +144,10 @@ pub fn save_prefs(home: &Path, prefs: &WorkspacePrefs) -> std::io::Result<()> {
     workspace.insert(
         "sidebar_width".into(),
         toml::Value::Integer(prefs.sidebar_width as i64),
+    );
+    workspace.insert(
+        "event_panel_width".into(),
+        toml::Value::Integer(prefs.event_panel_width as i64),
     );
     workspace.insert("workspace_order".into(), order);
     workspace.insert("agent_order".into(), agent_order);
@@ -283,12 +296,14 @@ mod tests {
         let prefs = WorkspacePrefs {
             sidebar_visible: false,
             sidebar_width: 28,
+            event_panel_width: 45,
             workspace_order: vec!["beta".into(), "alpha".into()],
             agent_order: vec!["name:reviewer".into(), "pane:%7".into()],
             folder_tracked: vec!["$3".into(), "$7".into()],
         };
         save_prefs(&home, &prefs).expect("save");
         let loaded = load_prefs(&home);
+        assert_eq!(loaded.event_panel_width, 45, "a resized panel persists");
         assert_eq!(loaded, prefs);
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -342,6 +357,7 @@ mod tests {
             &WorkspacePrefs {
                 sidebar_visible: true,
                 sidebar_width: 31,
+                event_panel_width: 40,
                 workspace_order: vec!["cyclops".into()],
                 agent_order: vec!["name:implementer".into()],
                 folder_tracked: vec![],

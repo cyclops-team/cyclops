@@ -41,6 +41,8 @@ pub enum HitTarget {
         order_key: String,
     },
     SidebarDivider,
+    EventPanel,
+    EventPanelDivider,
     AttentionIndicator {
         pane_id: String,
     },
@@ -189,6 +191,7 @@ pub enum MenuState {
     ContextMenu { pane_id: String, at: (u16, u16) },
     TabMenu { window_id: String, at: (u16, u16) },
     WorkspaceMenu { session: String, at: (u16, u16) },
+    EventPanelMenu { at: (u16, u16) },
 }
 
 impl MenuState {

@@ -354,6 +354,10 @@ fn paint_keybinds_dialog(
     }
 }
 
+/// Tallest the keybinds dialog may grow. The list scrolls, so the dialog
+/// stays a card rather than a wall.
+const KEYBINDS_MAX_HEIGHT: u16 = 20;
+
 fn keybind_dialog_geometry(row_count: usize, area: Rect) -> Option<(Rect, u16)> {
     if area.width < 8 || area.height < 6 {
         return None;
@@ -362,7 +366,9 @@ fn keybind_dialog_geometry(row_count: usize, area: Rect) -> Option<(Rect, u16)> 
     // Title, hint, glyph legend, one blank line before the list, one blank
     // line after it, and the footer: 6 fixed rows around the scrollable list.
     let wanted_height = u16::try_from(row_count.saturating_add(8)).unwrap_or(u16::MAX);
-    let height = wanted_height.min(area.height.saturating_sub(2)).max(6);
+    let height = wanted_height
+        .min(area.height.saturating_sub(2))
+        .clamp(6, KEYBINDS_MAX_HEIGHT);
     let dialog = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -425,6 +431,9 @@ pub fn menu_items(menu: &MenuState) -> Vec<(&'static str, BindingAction)> {
             (copy::MENU_RENAME_WORKSPACE, BindingAction::RenameWorkspace),
             (copy::MENU_CLOSE_WORKSPACE, BindingAction::CloseWorkspace),
         ],
+        MenuState::EventPanelMenu { .. } => {
+            vec![(copy::MENU_CLOSE_EVENTS, BindingAction::ToggleEventPanel)]
+        }
     }
 }
 
@@ -453,7 +462,8 @@ pub fn paint_menu(
     let (ax, ay) = match menu {
         MenuState::ContextMenu { at, .. }
         | MenuState::TabMenu { at, .. }
-        | MenuState::WorkspaceMenu { at, .. } => *at,
+        | MenuState::WorkspaceMenu { at, .. }
+        | MenuState::EventPanelMenu { at, .. } => *at,
         // App menu opens above its bottom-left button.
         _ => (area.x, (area.y + area.height).saturating_sub(h + 1)),
     };
@@ -515,6 +525,30 @@ mod tests {
             hits.hit(7, 4),
             Some(HitTarget::MenuItem {
                 action: BindingAction::SplitRight
+            })
+        ));
+    }
+
+    #[test]
+    fn event_panel_menu_paints_its_close_item_and_registers_the_hit() {
+        let backend = TestBackend::new(40, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+        let mut hits = HitMap::default();
+        let menu = MenuState::EventPanelMenu { at: (5, 2) };
+        term.draw(|f| {
+            paint_menu(&menu, f.area(), f.buffer_mut(), &theme, &mut hits, None);
+        })
+        .unwrap();
+        let flat = flatten(term.backend().buffer());
+        assert!(
+            flat.contains(copy::MENU_CLOSE_EVENTS),
+            "menu item renders: {flat}"
+        );
+        assert!(matches!(
+            hits.hit(7, 3),
+            Some(HitTarget::MenuItem {
+                action: BindingAction::ToggleEventPanel
             })
         ));
     }
@@ -717,6 +751,27 @@ mod tests {
             hits.regions().last().map(|region| &region.target),
             Some(HitTarget::DialogCancel)
         ));
+    }
+
+    #[test]
+    fn keybind_dialog_stays_a_card_in_tall_terminals() {
+        let rows: Vec<_> = (0..100)
+            .map(|i| crate::bindings::BindingHelp {
+                keys: format!("Ctrl+{}", i % 26),
+                action: format!("Action {i}"),
+            })
+            .collect();
+        let area = Rect::new(0, 0, 80, 50);
+        let (dialog, list_h) = keybind_dialog_geometry(rows.len(), area)
+            .expect("should produce geometry for large area");
+        assert_eq!(
+            dialog.height, 20,
+            "dialog should be capped at 20 rows even with many bindings"
+        );
+        assert_eq!(
+            list_h, 12,
+            "list height = dialog height - borders - padding"
+        );
     }
 
     #[test]
