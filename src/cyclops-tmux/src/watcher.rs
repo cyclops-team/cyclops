@@ -195,6 +195,14 @@ pub enum PaneEvent {
         /// Pane id.
         pane_id: String,
     },
+    /// This watcher's own session was renamed (its `$id`, resolved at
+    /// connect, matched the notification's). [`SessionWatcher::session`]
+    /// and the internal target `list-panes -s -t` uses already reflect
+    /// `name` by the time this event is sent — see [`handle_session_renamed`].
+    SessionRenamed {
+        /// The session's new name.
+        name: String,
+    },
     /// The control connection died. The table is frozen at its last state;
     /// the owner reconnects by building a new watcher.
     Disconnected,
@@ -208,7 +216,18 @@ pub struct SessionWatcher {
     events: broadcast::Sender<PaneEvent>,
     reconcile_tx: mpsc::Sender<oneshot::Sender<Result<(), TmuxError>>>,
     task: StdMutex<Option<JoinHandle<()>>>,
-    session: String,
+    /// Session name this watcher currently targets (`list-panes -s -t` and
+    /// every other session-scoped command). Shared with the event loop
+    /// (`LoopCtx::session_shared`) so a followed rename updates both at
+    /// once, synchronously with the `SessionRenamed` event that reports it.
+    session: Arc<StdMutex<String>>,
+    /// This watcher's own stable tmux `$id`, resolved once at connect
+    /// ([`resolve_session_id`]). Renaming a session never changes its id
+    /// (F37), which is what tells a rename of THIS session apart from a
+    /// rename of some other one that happens to collide on name during a
+    /// swap. None when the probe failed; every `%session-renamed` then
+    /// falls back to a bare reconcile hint for this connection's life.
+    session_id: Option<String>,
 }
 
 impl SessionWatcher {
@@ -218,13 +237,21 @@ impl SessionWatcher {
         let session = cfg.session.clone();
         let (client, notif_rx) = ControlClient::spawn(cfg).await?;
         let client = Arc::new(client);
+        // Resolved before the bootstrap reconcile so a rename notification
+        // arriving during bootstrap can already be matched; a failed probe
+        // degrades to "never follow a rename on this connection" rather
+        // than blocking connect.
+        let session_id = resolve_session_id(&client, &session).await;
         let table: Arc<StdMutex<HashMap<String, PaneRow>>> =
             Arc::new(StdMutex::new(HashMap::new()));
         let (events, _) = broadcast::channel(256);
+        let session_shared = Arc::new(StdMutex::new(session.clone()));
 
         let mut ctx = LoopCtx {
             client: Arc::clone(&client),
             session: session.clone(),
+            session_shared: Arc::clone(&session_shared),
+            session_id: session_id.clone(),
             table: Arc::clone(&table),
             events: events.clone(),
             last_output: HashMap::new(),
@@ -256,13 +283,31 @@ impl SessionWatcher {
             events,
             reconcile_tx,
             task: StdMutex::new(Some(task)),
-            session,
+            session: session_shared,
+            session_id,
         })
     }
 
-    /// Session name this watcher covers.
-    pub fn session(&self) -> &str {
-        &self.session
+    /// Current session name this watcher covers. Starts as the connect-time
+    /// name; a followed rename (this watcher's own `$id` in a
+    /// `%session-renamed`) updates it in place, live, so this always
+    /// answers with the name `list-panes -s -t` is targeting right now —
+    /// which is NOT necessarily the name a caller's own in-flight event
+    /// predates. A caller that resolves a daemon-side session slot from
+    /// this value alone can race a rename still working its way down the
+    /// same ordered event channel (`cyclopsd::handle_pane_event`'s
+    /// `SessionRenamed` arm applies it); addressing by the stable index the
+    /// daemon assigned at attach, not by this name, is what closes that
+    /// window.
+    pub fn session(&self) -> String {
+        self.session.lock().expect("session name lock").clone()
+    }
+
+    /// This watcher's own tmux `$id`, if the connect-time probe resolved
+    /// one. Exposed for tests; production code never needs it directly —
+    /// [`PaneEvent::SessionRenamed`] already carries the fact that matters.
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 
     /// The underlying control client, for typed commands (capture, paste,
@@ -323,7 +368,17 @@ impl SessionWatcher {
 /// State owned by the event loop.
 struct LoopCtx {
     client: Arc<ControlClient>,
+    /// Working copy of the session name, read by every session-scoped
+    /// command (`list_panes`, `session_gone`). No lock: only this task's
+    /// own synchronous notification handling ever writes it.
     session: String,
+    /// Mirror of `session` for [`SessionWatcher::session`]'s callers.
+    /// Updated in the same synchronous step as `session` on a followed
+    /// rename, before the `SessionRenamed` event that announces it is sent.
+    session_shared: Arc<StdMutex<String>>,
+    /// This watcher's own tmux `$id`, resolved once at connect. See the
+    /// field of the same name on [`SessionWatcher`] for what it is for.
+    session_id: Option<String>,
     table: Arc<StdMutex<HashMap<String, PaneRow>>>,
     events: broadcast::Sender<PaneEvent>,
     /// Per-pane instant of the last OutputActivity emission.
@@ -371,9 +426,15 @@ async fn watch_loop(
                 Some(ack) => {
                     let res = reconcile(&mut ctx).await;
                     let disconnected = matches!(res, Err(TmuxError::Disconnected));
+                    let failed = res.is_err();
                     let _ = ack.send(res);
                     deadline = None;
-                    if disconnected {
+                    // A non-Disconnected failure here may be the session
+                    // itself having been destroyed out from under a client
+                    // tmux switched to a survivor instead of dropping (see
+                    // the hint-deadline arm below); the probe is what tells
+                    // the two apart.
+                    if disconnected || (failed && session_gone(&ctx.client, &ctx.session).await) {
                         let _ = ctx.events.send(PaneEvent::Disconnected);
                         break;
                     }
@@ -390,7 +451,19 @@ async fn watch_loop(
                         let _ = ctx.events.send(PaneEvent::Disconnected);
                         break;
                     }
-                    Err(e) => warn!(error = %e, "hint-driven reconcile failed"),
+                    Err(e) => {
+                        // Killing the watched session does not always
+                        // disconnect this client: tmux can switch it to a
+                        // surviving session instead of detaching it, and
+                        // every reconcile against the dead name then fails
+                        // the same way forever without this probe ever
+                        // telling the loop to stop.
+                        if session_gone(&ctx.client, &ctx.session).await {
+                            let _ = ctx.events.send(PaneEvent::Disconnected);
+                            break;
+                        }
+                        warn!(error = %e, "hint-driven reconcile failed");
+                    }
                 }
             }
         }
@@ -431,6 +504,9 @@ fn handle_notification(ctx: &mut LoopCtx, n: Notification) -> Action {
             debug!(?reason, "control connection exiting");
             Action::Disconnect
         }
+        Notification::SessionRenamed { session, name } => {
+            handle_session_renamed(ctx, session, name)
+        }
         // Structural hints: something about the pane population or window
         // metadata changed. Reconcile finds out what.
         Notification::WindowAdd { .. }
@@ -443,12 +519,51 @@ fn handle_notification(ctx: &mut LoopCtx, n: Notification) -> Action {
         | Notification::WindowPaneChanged { .. }
         | Notification::PaneModeChanged { .. }
         | Notification::SessionsChanged
-        | Notification::SessionRenamed { .. }
         | Notification::SessionChanged { .. } => Action::Hint,
         Notification::ClientDetached { .. }
         | Notification::ClientSessionChanged { .. }
         | Notification::Other(_) => Action::None,
     }
+}
+
+/// A `%session-renamed`. Followed only when it names THIS watcher's own
+/// session: the id resolved at connect (`ctx.session_id`) matches the
+/// notification's. tmux identifies every renamed session by stable id,
+/// including background ones (F37), which is exactly what makes that
+/// comparison meaningful — a bare name compare could not tell "our session
+/// was renamed" from "some other session picked up a name that reminds
+/// tmux of ours for one notification".
+///
+/// A match updates `ctx.session` (what `list_panes`/`session_gone` target)
+/// and its shared mirror in the same synchronous step, then sends
+/// [`PaneEvent::SessionRenamed`] on the same ordered channel every other
+/// `PaneEvent` travels — the daemon's own rename of its session slot relies
+/// on seeing this event before any later event from this loop, and nothing
+/// here awaits between the two writes and the send, so no other code runs
+/// in between.
+///
+/// A non-match (different session, or no id resolved — older tmux, or the
+/// connect-time probe failed) is left exactly as it was before this
+/// feature: a bare reconcile hint. This is the guard the name-swap edge and
+/// the zombie-teardown path (`watcher_zombie_session.rs`) both depend on —
+/// a rename of a DIFFERENT session, including the survivor a zombie client
+/// got switched to, must never make a dead watcher's session name follow
+/// along.
+fn handle_session_renamed(ctx: &mut LoopCtx, session: Option<String>, name: String) -> Action {
+    let is_own_session = matches!(
+        (&ctx.session_id, &session),
+        (Some(id), Some(renamed)) if id == renamed
+    );
+    if !is_own_session {
+        return Action::Hint;
+    }
+    if ctx.session == name {
+        return Action::None;
+    }
+    ctx.session = name.clone();
+    *ctx.session_shared.lock().expect("session name lock") = name.clone();
+    let _ = ctx.events.send(PaneEvent::SessionRenamed { name });
+    Action::None
 }
 
 /// Emit OutputActivity, rate limited per pane. Output from a pane the table
@@ -511,7 +626,11 @@ fn apply_sub_value(ctx: &mut LoopCtx, pane: &str, value: &str) -> Action {
     let (Some(pid), Some(cmd), Some(in_mode), Some(dead), Some(title)) =
         (it.next(), it.next(), it.next(), it.next(), it.next())
     else {
-        warn!(%pane, %value, "malformed subscription value");
+        // F50: every observed occurrence is a clean-prefix truncation tmux
+        // itself sent short (tmux 3.7b, trigger not identified); the Hint
+        // below already self-heals via reconcile, so this is diagnostic
+        // noise, not a correctness signal.
+        debug!(%pane, %value, "malformed subscription value");
         return Action::Hint;
     };
     let Some(pid) = parse_pane_pid(pid) else {
@@ -553,6 +672,69 @@ fn apply_sub_value(ctx: &mut LoopCtx, pane: &str, value: &str) -> Action {
         row,
     });
     Action::None
+}
+
+/// Whether `session` is gone for good, as far as a reconcile failure can be
+/// blamed on it.
+///
+/// A reconcile error that is not [`TmuxError::Disconnected`] is ambiguous by
+/// itself: it may be the session having been destroyed, or something
+/// unrelated and transient. `has-session` resolves it — a `%error` reply
+/// means tmux no longer has a session by that name, which reconcile's own
+/// `list-panes` cannot distinguish from any other command failure. The probe
+/// finding the connection itself gone is folded in here too, so the caller
+/// has one question to ask instead of two. Anything else (the session still
+/// exists, or the probe failed for an unrelated reason such as a timeout) is
+/// not proof of anything and must not tear the watcher down on a guess.
+async fn session_gone(client: &ControlClient, session: &str) -> bool {
+    match client
+        .command(&format!("has-session -t {}", quote_arg(session)))
+        .await
+    {
+        Ok(_) => false,
+        Err(TmuxError::Disconnected) | Err(TmuxError::Command(_)) => true,
+        Err(_) => false,
+    }
+}
+
+/// Resolve this session's stable tmux `$id` right after attach, the same
+/// format [`crate::snapshot`] already reads (`#{session_id}`). Renaming a
+/// session never changes its id (F37); this is what later lets a followed
+/// rename be told apart from a rename of some other session. `=` is the
+/// same exact-match rule [`crate::cmd::session_target`] documents
+/// everywhere else in this crate — without it a session named as a prefix
+/// of another could resolve the wrong id.
+///
+/// The target carries a trailing `:` (F53, MEASURED): `display-message -t`
+/// needs to resolve down to a pane to evaluate anything, and a bare
+/// `=session` with no window/pane part resolves to nothing on tmux 3.7b —
+/// empty output, exit 0, no error — where plain `session` (no `=`) falls
+/// back to the current window and works. `=session:` names the session's
+/// window list the same way [`ControlClient::move_window_to_session`]'s
+/// target does, which gives tmux a window to fall back to and restores the
+/// exact-match safety at the same time.
+///
+/// None on any failure (tmux gone, session vanished between spawn and this
+/// call): the watcher still works, `%session-renamed` just falls back to a
+/// bare reconcile hint for this connection's whole life, same as before
+/// this feature existed.
+async fn resolve_session_id(client: &ControlClient, session: &str) -> Option<String> {
+    let cmd = format!(
+        "display-message -p -t {} {}",
+        quote_arg(&format!("{}:", crate::cmd::session_target(session))),
+        quote_arg("#{session_id}")
+    );
+    match client.command(&cmd).await {
+        Ok(mut lines) if !lines.is_empty() => Some(lines.remove(0)),
+        Ok(_) => {
+            warn!(%session, "session id probe returned no output; rename-follow disabled for this watcher");
+            None
+        }
+        Err(e) => {
+            warn!(%session, error = %e, "cannot resolve session id; rename-follow disabled for this watcher");
+            None
+        }
+    }
 }
 
 /// Query authoritative state and fold it into the table: diff, emit events,

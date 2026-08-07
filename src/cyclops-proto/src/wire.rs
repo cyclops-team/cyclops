@@ -388,6 +388,12 @@ pub struct DeliveryReceipt {
     /// Queue depth ahead of this message when state is queued.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<u32>,
+    /// Normalized reason the in-flight head delivery is held at the gate.
+    /// Additive optional field: older daemons omit it and older clients
+    /// ignore it. This is deliberately a stable token, never a manifest
+    /// rule id (for example, `blocked`, not `blocked:trust_dialog`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_by: Option<String>,
     /// Human hint, e.g. "resets in 135h57m", or the gate cause the caller
     /// words for itself, e.g. "no_manifest".
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -610,6 +616,26 @@ mod tests {
         let back: OpenDelivery = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
         assert_eq!(back.state, crate::ledger::DeliveryState::ParkedBlockedQuota);
         assert_eq!(back.to, "implementer");
+    }
+
+    #[test]
+    fn held_receipt_is_additive_and_omits_vendor_rule_ids() {
+        let old = r#"{"to":"reviewer","state":"queued","position":0}"#;
+        let receipt: DeliveryReceipt = serde_json::from_str(old).unwrap();
+        assert_eq!(receipt.held_by, None);
+
+        let receipt = DeliveryReceipt {
+            to: "reviewer".into(),
+            state: crate::ledger::DeliveryState::Queued,
+            position: Some(0),
+            held_by: Some("blocked".into()),
+            note: None,
+            pane: None,
+        };
+        let wire = serde_json::to_string(&receipt).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(value["held_by"], "blocked");
+        assert_ne!(value["held_by"], "blocked:trust_dialog");
     }
 
     /// A daemon saying "I loaded none" and a daemon too old to say are two

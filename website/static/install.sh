@@ -1,7 +1,7 @@
 #!/bin/sh
 #
 # Cyclops installer. Builds both binaries, puts them somewhere your shell
-# looks, and sets up the home directory. One command, then `cyclops start`.
+# looks, and sets up the home directory. One command, then `cyclops`.
 #
 #   ./scripts/install.sh              from a clone
 #   curl -fsSL https://www.usecyclops.dev/install.sh | sh
@@ -428,7 +428,7 @@ case "$PATH_STATE" in
     reload) first="exec ${SHELL:-sh} -l" ;;
     manual) first="add the PATH line above to your shell profile" ;;
 esac
-open="cyclops start"
+open="cyclops"
 width=${#open}
 [ -n "$first" ] && [ ${#first} -gt "$width" ] && width=${#first}
 n=1
@@ -436,7 +436,7 @@ if [ -n "$first" ]; then
     printf '  %s  %-*s  %s\n' "$n" "$width" "$first" "so your shell can find cyclops"
     n=$((n + 1))
 fi
-printf '  %s  %-*s  %s\n' "$n" "$width" "$open" "open your workspace; it prints what to do next"
+printf '  %s  %-*s  %s\n' "$n" "$width" "$open" "open your workspace and start your agents"
 
 if [ "$PATH_STATE" = ok ] && [ -n "$resolved" ] && [ "$resolved" != "$PREFIX/cyclops" ]; then
     # Another cyclops is earlier on PATH. Saying "installed" without

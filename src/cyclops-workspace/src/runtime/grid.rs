@@ -123,6 +123,15 @@ pub struct HydrationSnapshot {
     pub cursor_x: u16,
     pub cursor_y: u16,
     pub alternate_on: bool,
+    /// Whether the pane had any mouse-tracking DECSET on at capture time
+    /// (1000, 1002, or 1003) — tmux's `#{mouse_any_flag}`. A capture
+    /// restores pixels, not modes; `PaneRuntime::hydrate` re-feeds this one
+    /// so a hydrated pane keeps forwarding wheel motion instead of losing
+    /// it the moment its runtime gets rebuilt from a snapshot.
+    pub mouse_on: bool,
+    /// Whether the pane had SGR mouse encoding (DECSET 1006) on at capture
+    /// time — tmux's `#{mouse_sgr_flag}`.
+    pub mouse_sgr: bool,
 }
 
 /// An owned copy of a pane's visible cell grid — the test-facing

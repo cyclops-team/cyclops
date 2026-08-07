@@ -8,7 +8,8 @@
 <section class="section hero">
 	<div class="copy">
 		<div class="eyebrow">// Open source coordination for coding agents</div>
-		<h1 class="pixel">ONE TEAM.<br />ANY AGENT.</h1>
+		<h1 class="pixel">ONE EYE.<br />MANY AGENTS.</h1>
+		<p class="tagline">A single coordinated team.</p>
 		<p>Coordinate and track coding agents across providers in one terminal workspace.</p>
 		<div class="actions">
 			<a class="btn btn-primary" href="#install">Install Cyclops</a>
@@ -57,6 +58,17 @@
 		font-size: 16px;
 		line-height: 1.5;
 		color: var(--muted);
+	}
+
+	.tagline {
+		margin: 10px 0 0;
+		font-size: 18px;
+		font-weight: 600;
+		color: var(--ink);
+	}
+
+	.tagline + p {
+		margin-top: 10px;
 	}
 
 	.actions {

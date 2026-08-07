@@ -88,20 +88,43 @@ $ cyclops send implementer --subject "hello"
 ● queued · 1 ahead
 ```
 
-Queued means one thing: nothing has been typed into the pane yet. The
-number is a queue position, so `1 ahead` means one message is in front of
-this one. You see this when the recipient already has a delivery moving,
-or when it could not take input at the instant you asked.
+Queued means another message is in front of this one. The number is a queue
+position, so `1 ahead` means one message is in front of this one. A head
+delivery held by the target is different: it says `● held · ...` and names
+the normalized reason. You see `recipient working`, `composer has input`,
+`pane in copy mode`, `session detached`, `waiting for a decision`, or `target
+state unknown`.
 
 This one clears itself. Past the paste, a receipt reports the state it is
 actually in rather than calling it queued, so a receipt that still says
 queued is telling you the truth about where the message stands.
 
-Every other reason clears itself. A recipient mid-turn, a human typing in
-that pane, or a dialog waiting on a human decision all take the message in
-order once the pane is ready. A receipt is the state at the instant you
-asked; `cyclops history` is where each delivery actually ended up.
+Every hold clears itself when the corresponding pane or session event arrives.
+A message behind the head remains FIFO-queued and never overtakes it. A
+receipt is the state at the instant you asked; `cyclops history` is where each
+delivery actually ended up.
 [send.md](send.md).
+
+## Correlate a delivery with the ledger
+
+The receipt's message id is the join key. Start with the id in the receipt and
+fold its state lines; the daemon records causes without screen text:
+
+```
+$ jq -c 'select(.id == "m-b9125e" and (.kind == "state" or .kind == "gate")) | {seq,kind,from:.data.from,to_state:.data.to_state,action:.data.action,cause:.data.cause}' ~/.cyclops/ledger/main.ndjson
+{"seq":8,"kind":"state","from":"queued","to_state":"gating","action":null,"cause":null}
+{"seq":10,"kind":"state","from":"gating","to_state":"pasting","action":null,"cause":null}
+```
+
+The first line is the quickest split: no message id means the client request,
+sandbox, socket, or validation failed before a ledger record. A latest state
+of `gating` is a target-side hold. `pasting` followed by
+`attention_required` means paste/readback outcome unknown; `submitted`
+followed by `attention_required` means post-submit evidence unknown. The
+two state lines above are an excerpt captured from the real
+`./demos/m1-send.sh` transcript after implementation; the full filter prints
+the later transitions too. IDs and paths change on every run, so substitute
+the id and ledger path from your own receipt.
 
 ## "no manifest \"cluade\"; loaded: agy, claude, codex, cursor"
 
@@ -112,14 +135,16 @@ Adding a file needs a `cyclopsd` restart: manifests are read once at boot.
 
 ```
 $ cyclops status
-◑ 1 cyclops · watching main · tmux 3.6a · up 19s · 1 needs attention
+◑ 1 cyclops · watching main · tmux 3.7b · up 31s · 1 needs attention
 
   implementer  ○ idle  bash
-  reviewer     ○ idle  bash
+  reviewer     ○ idle  cat · hooks unverified
 
   waiting on you
-  ghost  ⚠ needs attention
+  ghost  ⚠ needs attention · no pane with that name · m-0e9a54 · just now
 ```
+
+The message id and age in this captured row change on every run.
 
 The eye opens for exactly two things: a pane in a blocked state, and a
 delivery that cannot move without you. The block under the roster names
@@ -136,9 +161,22 @@ $ cyclops send ghost --subject "Review this"
 
 The qualifier is the whole diagnosis. `no pane for "x"` means no agent by
 that name; `cyclops list` shows the ones that exist. The others are a dead
-pane, no matching manifest, and two failed delivery attempts.
+pane, no matching manifest, or a delivery whose terminal outcome is unknown.
 
 Exit code 1. The message is kept on the record either way.
+
+## A delivery says `outcome unknown`
+
+Cyclops uses `attention_required` for an ambiguous terminal write as well as
+for a proven pre-write failure. `paste_failed`, `verify_failed`,
+`pane_rebound_after_paste`, `submit_failed`, and `ack_timeout` all mean that
+the pane may already contain or have accepted the message. Inspect the named
+pane and composer before resending; Cyclops will not retry these causes
+automatically. The exact cause remains in `--json` and in the ledger.
+
+Only a failure proven before the write can consume the bounded
+`delivery_retry_max` budget: a detach or missing manifest before paste, a
+pre-paste pane rebind, or a spool/load-buffer failure.
 
 ## A send parks on quota
 

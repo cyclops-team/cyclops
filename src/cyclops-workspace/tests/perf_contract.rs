@@ -340,6 +340,56 @@ async fn sustained_output_backlog_drains_continuously() {
 /// `control.rs`'s `%pause` handler) and the rehydrate call after it are.
 /// The flood is confirmed flowing before the stall, because tmux only emits
 /// `%pause` when data is queued while the reader has genuinely stopped.
+///
+/// The stall's length races a second clock this test does not control:
+/// `pause-after` is "how long the client has been behind", which only
+/// starts counting once `yes flood`'s output has actually backed up enough
+/// to fill the OS pipe between the `tmux -C` client process and this
+/// reader (MEASURED: instrumenting the loop below under a same-machine
+/// 12-way parallel stress showed the "never saw %pause" failure paired
+/// with `age_ms` near 0 the instant draining resumed, thousands of
+/// messages deep — the connection was never actually behind once draining
+/// resumed, so the backlog needed to cross the threshold had not
+/// accumulated during the stall. That rules out the stall failing to
+/// block the reader, which reproduces fine standalone; it does not by
+/// itself say which contended process the missing backlog belongs to —
+/// not chased further). A longer single stall does not fix a contended
+/// host reliably because the contention can outlast any one fixed guess.
+/// What does: retry the stall itself with backoff. Each retry is a fresh,
+/// uninterrupted block — checking in between and continuing would let the
+/// reader drain whatever little had queued and reset the "behind" clock
+/// to zero, defeating the next attempt before it starts.
+async fn stall_until_paused(
+    notif: &mut tokio::sync::mpsc::UnboundedReceiver<Notification>,
+) -> Option<String> {
+    const ATTEMPTS: [Duration; 4] = [
+        Duration::from_secs(2),
+        Duration::from_secs(4),
+        Duration::from_secs(8),
+        Duration::from_secs(16),
+    ];
+    for (attempt, stall) in ATTEMPTS.iter().enumerate() {
+        std::thread::sleep(*stall);
+        let seen = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match notif.recv().await {
+                    Some(Notification::Pause { pane }) => return Some(pane),
+                    Some(_) => {}
+                    None => panic!("connection closed before %pause"),
+                }
+            }
+        })
+        .await;
+        match seen {
+            Ok(Some(pane)) => return Some(pane),
+            Ok(None) => unreachable!("the loop above only returns Some or panics"),
+            Err(_) if attempt + 1 < ATTEMPTS.len() => continue,
+            Err(_) => return None,
+        }
+    }
+    unreachable!("the stall-attempt loop always returns or continues to its last result");
+}
+
 #[tokio::test]
 async fn flow_control_pause_and_resume() {
     let _serial = SERIAL.lock().await;
@@ -380,7 +430,7 @@ async fn flow_control_pause_and_resume() {
             loop {
                 match notif.recv().await {
                     Some(Notification::Output { .. } | Notification::ExtendedOutput { .. }) => {
-                        break
+                        break;
                     }
                     Some(_) => {}
                     None => panic!("connection closed before the flood produced output"),
@@ -393,18 +443,7 @@ async fn flow_control_pause_and_resume() {
         // that has genuinely stopped, not just a slow one — has something
         // real to fire against.
         let paused = if flowing.is_ok() {
-            std::thread::sleep(Duration::from_secs(3));
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    match notif.recv().await {
-                        Some(Notification::Pause { pane }) => return pane,
-                        Some(_) => {}
-                        None => panic!("connection closed before %pause"),
-                    }
-                }
-            })
-            .await
-            .ok()
+            stall_until_paused(&mut notif).await
         } else {
             None
         };
@@ -631,9 +670,13 @@ fn decoration_stream_refreshes_repeatedly_during_the_stream() {
         }
         if signals >= 30 {
             regression = Some((signals, refreshes));
-            eprintln!("attempt {attempt}: a healthy {signals}-signal stream drew only {refreshes} refreshes");
+            eprintln!(
+                "attempt {attempt}: a healthy {signals}-signal stream drew only {refreshes} refreshes"
+            );
         } else {
-            eprintln!("attempt {attempt}: the driver was starved ({signals} signals over 200ms), no evidence");
+            eprintln!(
+                "attempt {attempt}: the driver was starved ({signals} signals over 200ms), no evidence"
+            );
         }
     }
     match regression {

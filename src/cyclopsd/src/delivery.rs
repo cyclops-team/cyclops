@@ -34,7 +34,7 @@ use cyclops_proto::{
     AgentState, Delivery, DeliveryReceipt, DeliveryState, Event, Kind, LedgerLine, MsgSendParams,
     MsgSendResult, NotifyLevel, VerifiedBy, WaitUntil, WireError,
 };
-use cyclops_tmux::{ControlClient, PaneEvent, PaneRow, SessionWatcher, TmuxError};
+use cyclops_tmux::{ControlClient, PaneEvent, PaneRow, SessionWatcher};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, watch, Notify};
 use tokio::task::JoinHandle;
@@ -183,6 +183,8 @@ struct HandleState {
     cause: Option<String>,
     /// Human hint carried into receipts (quota reset, attention cause).
     note: Option<String>,
+    /// Normalized gate hold token for the in-flight head, if any.
+    held_by: Option<String>,
 }
 
 impl DeliveryHandle {
@@ -218,6 +220,7 @@ impl DeliveryHandle {
                 verified_by: None,
                 cause: None,
                 note: None,
+                held_by: None,
             }),
             state_tx,
             ack: Notify::new(),
@@ -239,6 +242,7 @@ impl DeliveryHandle {
         Option<VerifiedBy>,
         Option<String>,
         Option<String>,
+        Option<String>,
     ) {
         let st = self.state.lock().expect("handle state lock");
         (
@@ -247,7 +251,12 @@ impl DeliveryHandle {
             st.verified_by,
             st.cause.clone(),
             st.note.clone(),
+            st.held_by.clone(),
         )
+    }
+
+    fn set_hold(&self, hold: Option<&str>) {
+        self.state.lock().expect("handle state lock").held_by = hold.map(str::to_string);
     }
 }
 
@@ -349,6 +358,9 @@ fn advance(
         st.cause = step.cause.map(str::to_string);
         if let Some(n) = &step.note {
             st.note = Some(n.clone());
+        }
+        if step.next != DeliveryState::Gating {
+            st.held_by = None;
         }
         (
             from,
@@ -931,6 +943,14 @@ pub(crate) async fn msg_send(
                     let first_in_line = !worker.busy.load(Ordering::SeqCst)
                         && worker.queue.lock().expect("worker queue lock").is_empty();
                     let answers_now = gate_answers_now(inner, *session_idx, pane_id);
+                    // The worker is woken asynchronously. Seed the head's
+                    // first hold disposition before enqueueing it, so a
+                    // receipt cannot race the worker between queue insertion
+                    // and its first gate evaluation and report `queued · 0
+                    // ahead` for a delivery already held on the target.
+                    if first_in_line && !answers_now {
+                        handle.set_hold(initial_hold(inner, *session_idx, pane_id));
+                    }
                     worker
                         .queue
                         .lock()
@@ -1073,7 +1093,11 @@ pub(crate) async fn msg_send(
 /// call and the gate simply takes the idle path, and the block is capped
 /// either way.
 fn gate_answers_now(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) -> bool {
-    if inner.cached_state(pane_id) == AgentState::Idle {
+    let cached = inner.cached_state(pane_id);
+    if matches!(
+        cached,
+        AgentState::Idle | AgentState::BlockedQuota | AgentState::Dead
+    ) {
         return true;
     }
     let Some(watcher) = inner.watcher_of(session_idx) else {
@@ -1083,8 +1107,30 @@ fn gate_answers_now(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) -> bo
     // A pane that left the table between resolution and here is answered
     // by the gate's no_such_pane, which is just as immediate.
     match watcher.pane(pane_id) {
-        Some(row) => fusion::bind_manifest_for(inner, &row).is_none(),
+        Some(row) => row.dead || fusion::bind_manifest_for(inner, &row).is_none(),
         None => true,
+    }
+}
+
+/// Best synchronous estimate of the first gate hold. This is only a receipt
+/// seed; the event-driven gate remains authoritative and replaces or clears
+/// it as soon as it evaluates the pane. No capture or retry is introduced.
+fn initial_hold(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) -> Option<&'static str> {
+    let Some(watcher) = inner.watcher_of(session_idx) else {
+        return Some("session_detached");
+    };
+    let Some(row) = watcher.pane(pane_id) else {
+        return Some("unknown");
+    };
+    if row.in_mode {
+        return Some("pane_in_mode");
+    }
+    match inner.cached_state(pane_id) {
+        AgentState::Working => Some("working"),
+        AgentState::IdleWithInput => Some("idle_with_input"),
+        AgentState::BlockedModal | AgentState::BlockedPermission => Some("blocked"),
+        AgentState::Unknown => Some("unknown"),
+        AgentState::Idle | AgentState::BlockedQuota | AgentState::Dead => None,
     }
 }
 
@@ -1128,7 +1174,7 @@ fn receipt_is_queued(s: DeliveryState) -> bool {
 }
 
 fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryReceipt {
-    let (state, _, _, cause, note) = handle.snapshot();
+    let (state, _, _, cause, note, held_by) = handle.snapshot();
     // The pane the delivery resolved to, so the caller can name it and
     // build the per-pane fix. Empty for a recipient that answered to no
     // pane, which is the one case there is nothing to name.
@@ -1143,6 +1189,7 @@ fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryRecei
             // it (cyclops_ui::grid::cause_words), not here.
             note: note.or(cause),
             pane,
+            held_by: None,
         };
     }
     if !receipt_is_queued(state) {
@@ -1152,6 +1199,7 @@ fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryRecei
             position: None,
             note: None,
             pane,
+            held_by: None,
         };
     }
     let position = inner
@@ -1161,13 +1209,31 @@ fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryRecei
         .expect("workers lock")
         .get(&handle.pane_id)
         .map(|w| w.position_of(handle));
+    // A prior job can finish between enqueue and this snapshot. If that
+    // handoff makes this handle position zero, recover the current target
+    // hold synchronously; followers never inherit the head's token.
+    let fallback = (position == Some(0) && held_by.is_none())
+        .then(|| initial_hold(inner, handle.session_idx, &handle.pane_id).map(str::to_string))
+        .flatten();
+    let held_by = held_by_for_position(position, held_by, fallback);
     DeliveryReceipt {
         to: handle.to.clone(),
         state: DeliveryState::Queued,
         position,
         note: None,
         pane,
+        held_by,
     }
+}
+
+fn held_by_for_position(
+    position: Option<u32>,
+    held_by: Option<String>,
+    fallback: Option<String>,
+) -> Option<String> {
+    (position == Some(0))
+        .then(|| held_by.or(fallback))
+        .flatten()
 }
 
 /// Expand the to-list: "*" means every labeled pane (explicit adoption is
@@ -1297,8 +1363,8 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
                 }
                 match attempt_delivery(inner, worker, handle, &manifest_id, pane_pid).await {
                     AttemptOutcome::Done => return,
-                    AttemptOutcome::Failed(cause) => {
-                        if !fail_attempt(inner, handle, &cause) {
+                    AttemptOutcome::Failed(failure) => {
+                        if !fail_attempt(inner, handle, &failure) {
                             return;
                         }
                         // Bounded retry: back through the gate.
@@ -1320,8 +1386,105 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
 enum AttemptOutcome {
     /// Delivery resolved (verified, unverified, or matcher-resolved).
     Done,
-    /// This attempt failed; cause feeds retry accounting.
-    Failed(String),
+    /// This attempt failed; the boundary feeds retry accounting.
+    Failed(AttemptFailure),
+}
+
+/// The irreversible boundary for one failed attempt. Once a write may have
+/// happened, repeating it is unsafe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteBoundary {
+    BeforeWrite,
+    AfterWrite,
+}
+
+/// A delivery failure and its closed, semantic boundary. Call sites select a
+/// named failure constructor, so an after-write cause cannot accidentally be
+/// marked retryable by passing a boolean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttemptFailure {
+    cause: String,
+    boundary: WriteBoundary,
+}
+
+impl AttemptFailure {
+    fn session_detached() -> Self {
+        Self {
+            cause: "session_detached".into(),
+            boundary: WriteBoundary::BeforeWrite,
+        }
+    }
+
+    fn no_manifest() -> Self {
+        Self {
+            cause: "no_manifest".into(),
+            boundary: WriteBoundary::BeforeWrite,
+        }
+    }
+
+    fn pane_rebound_before_paste() -> Self {
+        Self {
+            cause: "pane_rebound".into(),
+            boundary: WriteBoundary::BeforeWrite,
+        }
+    }
+
+    fn spool_failed() -> Self {
+        Self {
+            cause: "spool_failed".into(),
+            boundary: WriteBoundary::BeforeWrite,
+        }
+    }
+
+    fn paste_failed() -> Self {
+        Self {
+            cause: "paste_failed".into(),
+            boundary: WriteBoundary::AfterWrite,
+        }
+    }
+
+    fn verify_failed() -> Self {
+        Self {
+            cause: "verify_failed".into(),
+            boundary: WriteBoundary::AfterWrite,
+        }
+    }
+
+    fn pane_rebound_after_paste() -> Self {
+        Self {
+            cause: "pane_rebound_after_paste".into(),
+            boundary: WriteBoundary::AfterWrite,
+        }
+    }
+
+    fn submit_failed() -> Self {
+        Self {
+            cause: "submit_failed".into(),
+            boundary: WriteBoundary::AfterWrite,
+        }
+    }
+
+    fn ack_timeout() -> Self {
+        Self {
+            cause: "ack_timeout".into(),
+            boundary: WriteBoundary::AfterWrite,
+        }
+    }
+
+    /// Map the injector's closed set of pre-submit causes to the semantic
+    /// constructors above. Unknown injector errors remain conservatively
+    /// after-write; they must never gain retryability by default.
+    fn from_inject(cause: String) -> Self {
+        match cause.as_str() {
+            "spool_failed" => Self::spool_failed(),
+            "paste_failed" => Self::paste_failed(),
+            "verify_failed" => Self::verify_failed(),
+            _ => Self {
+                cause,
+                boundary: WriteBoundary::AfterWrite,
+            },
+        }
+    }
 }
 
 /// One injection attempt: paste, verify, submit, wait for an ACK tier.
@@ -1339,10 +1502,10 @@ async fn attempt_delivery(
     admitted_pid: i32,
 ) -> AttemptOutcome {
     let Some(watcher) = inner.watcher_of(worker.session_idx) else {
-        return AttemptOutcome::Failed("session_detached".to_string());
+        return AttemptOutcome::Failed(AttemptFailure::session_detached());
     };
     let Some(manifest) = inner.manifests.get(manifest_id) else {
-        return AttemptOutcome::Failed("no_manifest".to_string());
+        return AttemptOutcome::Failed(AttemptFailure::no_manifest());
     };
     let injector = TmuxInjector {
         client: watcher.client(),
@@ -1355,17 +1518,13 @@ async fn attempt_delivery(
     inject_pause(inner, "pre_paste").await;
     if let Err(detail) = occupant_unchanged(inner, &watcher, handle, manifest_id, admitted_pid) {
         gate_line(inner, handle, "rebound", None, Some(&detail));
-        let _ = advance(
-            inner,
-            handle,
-            &[DeliveryState::Pasting],
-            Step::to(DeliveryState::RetryQueued).cause("pane_rebound"),
-        );
-        return AttemptOutcome::Failed("pane_rebound".to_string());
+        return AttemptOutcome::Failed(AttemptFailure::pane_rebound_before_paste());
     }
     let (staged_window, id_staged) = match inject(&injector, handle, manifest).await {
         Ok(v) => v,
-        Err(cause) => return AttemptOutcome::Failed(cause),
+        Err(cause) => {
+            return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
+        }
     };
     if !advance(
         inner,
@@ -1389,28 +1548,15 @@ async fn attempt_delivery(
         // submit key must never reach whoever replaced it.
         unregister_ack(inner, handle);
         gate_line(inner, handle, "rebound", None, Some(&detail));
-        let _ = advance(
-            inner,
-            handle,
-            &[DeliveryState::Staged],
-            Step::to(DeliveryState::RetryQueued).cause("pane_rebound"),
-        );
-        return AttemptOutcome::Failed("pane_rebound".to_string());
+        return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
     }
     // The occupant re-check just passed: admitted_pid IS the process the
     // submit key goes to. Send-and-wait pins its wait on this pid.
     handle.submitted_pid.store(admitted_pid, Ordering::SeqCst);
     if let Err(cause) = injector.submit(&handle.pane_id, submit_key).await {
         unregister_ack(inner, handle);
-        // Move to retry_queued here; fail_attempt sees the state and only
-        // does the bookkeeping.
-        let _ = advance(
-            inner,
-            handle,
-            &[DeliveryState::Staged],
-            Step::to(DeliveryState::RetryQueued).cause(&cause),
-        );
-        return AttemptOutcome::Failed(cause);
+        debug_assert_eq!(cause, "submit_failed");
+        return AttemptOutcome::Failed(AttemptFailure::submit_failed());
     }
     if !advance(
         inner,
@@ -1450,7 +1596,7 @@ async fn attempt_delivery(
         }
         AckOutcome::Timeout => {
             unregister_ack(inner, handle);
-            AttemptOutcome::Failed("ack_timeout".to_string())
+            AttemptOutcome::Failed(AttemptFailure::ack_timeout())
         }
     }
 }
@@ -1496,9 +1642,14 @@ async fn inject_pause(inner: &Arc<Inner>, phase: &'static str) {
     }
 }
 
-/// Retry accounting. True means the caller should retry (state is
-/// RetryQueued); false means the delivery ended in attention_required.
-fn fail_attempt(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>, cause: &str) -> bool {
+/// Retry accounting. Only failures proven to precede the pane write may
+/// consume the configured retry budget. True means the caller should retry
+/// (state is RetryQueued); false means the delivery ended in attention_required.
+fn fail_attempt(
+    inner: &Arc<Inner>,
+    handle: &Arc<DeliveryHandle>,
+    failure: &AttemptFailure,
+) -> bool {
     let attempts = handle.state.lock().expect("handle state lock").attempts;
     let from = [
         DeliveryState::Pasting,
@@ -1506,32 +1657,29 @@ fn fail_attempt(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>, cause: &str) -
         DeliveryState::Submitted,
         DeliveryState::RetryQueued,
     ];
-    if attempts <= inner.cfg.delivery_retry_max {
-        if handle.state() == DeliveryState::RetryQueued {
-            return true; // submit_failed already moved it
-        }
+    if should_retry(failure, attempts, inner.cfg.delivery_retry_max) {
         advance(
             inner,
             handle,
             &from,
-            Step::to(DeliveryState::RetryQueued).cause(cause),
+            Step::to(DeliveryState::RetryQueued).cause(&failure.cause),
         )
     } else {
         let moved = advance(
             inner,
             handle,
             &from,
-            Step::to(DeliveryState::AttentionRequired)
-                .cause(cause)
-                .note(format!(
-                    "delivery failed after {attempts} attempts: {cause}"
-                )),
+            Step::to(DeliveryState::AttentionRequired).cause(&failure.cause),
         );
         if moved {
-            notify_attention(inner, handle, cause);
+            notify_attention(inner, handle, &failure.cause);
         }
         false
     }
+}
+
+fn should_retry(failure: &AttemptFailure, attempts: u32, retry_max: u32) -> bool {
+    matches!(failure.boundary, WriteBoundary::BeforeWrite) && attempts <= retry_max
 }
 
 fn notify_attention(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>, cause: &str) {
@@ -1660,8 +1808,15 @@ async fn gate(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> GateOutcome {
                         };
                     };
                     let manifest_id = manifest.agent.id.clone();
-                    let Some(det) =
-                        fusion::recompute_pane(inner, w, &handle.pane_id, true, "gate").await
+                    let Some(det) = fusion::recompute_pane(
+                        inner,
+                        handle.session_idx,
+                        w,
+                        &handle.pane_id,
+                        true,
+                        "gate",
+                    )
+                    .await
                     else {
                         return GateOutcome::Attention {
                             cause: "no_such_pane".to_string(),
@@ -1771,6 +1926,7 @@ async fn gate(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> GateOutcome {
             }
         };
         if let Some(cause) = hold {
+            handle.set_hold(Some(normalize_hold_cause(&cause)));
             if last_hold.as_deref() != Some(cause.as_str()) {
                 gate_line(inner, handle, "hold", None, Some(&cause));
                 last_hold = Some(cause.clone());
@@ -1798,6 +1954,21 @@ async fn gate(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> GateOutcome {
                 }
             }
         }
+    }
+}
+
+/// Keep receipt vocabulary stable and independent of vendor manifest rule
+/// ids. Ledger gate lines retain the exact cause for diagnostics; receipts
+/// expose only these normalized tokens.
+fn normalize_hold_cause(cause: &str) -> &'static str {
+    match cause {
+        "session_detached" => "session_detached",
+        "pane_in_mode" => "pane_in_mode",
+        "working" => "working",
+        "idle_with_input" => "idle_with_input",
+        "unknown" => "unknown",
+        c if c.split(':').next() == Some("blocked") => "blocked",
+        _ => "unknown",
     }
 }
 
@@ -1955,11 +2126,11 @@ impl Injector for TmuxInjector {
             .await
         {
             warn!(buffer = %self.buffer, error = %e, "load-buffer failed");
-            return Err(match e {
-                TmuxError::Io(_) => "spool_failed",
-                _ => "paste_failed",
-            }
-            .to_string());
+            // Loading the private spool buffer happens before tmux is asked
+            // to write to the pane, regardless of how the load command
+            // failed. It is therefore safe to retry under the bounded
+            // pre-write budget; only paste-buffer failures are ambiguous.
+            return Err("spool_failed".to_string());
         }
         if let Err(e) = self
             .client
@@ -2264,10 +2435,6 @@ async fn await_ack(
     let tier1 = manifest.hooks.ack.is_some() && manifest.hooks.ack_payload_field.is_some();
     let (id_patterns, other_patterns) = verify_patterns(manifest, &handle.msg_id);
     let patterns: Vec<String> = id_patterns.into_iter().chain(other_patterns).collect();
-    let session_name = inner
-        .session(handle.session_idx)
-        .map(|s| s.name.clone())
-        .unwrap_or_default();
     let mut ev_rx = inner.events.subscribe();
     let mut pane_rx = inner.watcher_of(handle.session_idx).map(|w| w.subscribe());
     let mut working_seen = false;
@@ -2329,14 +2496,28 @@ async fn await_ack(
                     CheckpointStep::Wait => {}
                 }
             }
+            // Reattach/detach truth for THIS session comes from
+            // `inner.watcher_of(handle.session_idx)`, resolved fresh here,
+            // never from matching a "session" event's own `data["name"]`
+            // against a name captured at function entry: a followed
+            // rename (`PaneEvent::SessionRenamed`, `rename_session_slot`
+            // in lib.rs) changes the live name mid-wait, and a stale
+            // snapshot then never matches an attach OR a detach line
+            // again — the clock freezes on the FIRST outage and never
+            // unfreezes, which is exactly the "ledger append silently
+            // drops" failure mode `emit_state`'s doc comment describes,
+            // in delivery-wait clothing. `watcher_of` cannot go stale: it
+            // reads the live link for this exact idx, so what changed is
+            // compared against what IS, not against a name.
             ev = ev_rx.recv() => {
                 if track_state_event(&ev, &handle.pane_id) {
                     working_seen = true;
                     handle.working_seen.store(true, Ordering::SeqCst);
                 }
-                match session_edge(&ev, &session_name) {
-                    Some(true) => {
-                        if let Some(w) = inner.watcher_of(handle.session_idx) {
+                if is_session_event(&ev) {
+                    let live = inner.watcher_of(handle.session_idx);
+                    if pane_rx.is_none() {
+                        if let Some(w) = live {
                             pane_rx = Some(w.subscribe());
                             clock.unfreeze(Instant::now());
                             // Reattach evidence pass, before any deadline
@@ -2354,23 +2535,19 @@ async fn await_ack(
                                 Evidence::Absent => {}
                             }
                         }
-                    }
-                    Some(false) => {
+                    } else if live.is_none() {
                         pane_rx = None;
                         clock.freeze(Instant::now());
                     }
-                    None => {
-                        // A lagged event stream can swallow the reattach
-                        // notice; reconcile against the link instead of
-                        // staying frozen forever.
-                        if matches!(ev, Err(broadcast::error::RecvError::Lagged(_)))
-                            && clock.frozen()
-                        {
-                            if let Some(w) = inner.watcher_of(handle.session_idx) {
-                                pane_rx = Some(w.subscribe());
-                                clock.unfreeze(Instant::now());
-                            }
-                        }
+                } else if matches!(ev, Err(broadcast::error::RecvError::Lagged(_)))
+                    && clock.frozen()
+                {
+                    // A lagged event stream can swallow the reattach
+                    // notice; reconcile against the link instead of
+                    // staying frozen forever.
+                    if let Some(w) = inner.watcher_of(handle.session_idx) {
+                        pane_rx = Some(w.subscribe());
+                        clock.unfreeze(Instant::now());
                     }
                 }
             }
@@ -2410,12 +2587,15 @@ fn track_state_event(ev: &Result<Event, broadcast::error::RecvError>, pane_id: &
         if e.event == "state" && e.data["pane_id"] == pane_id && e.data["state"] == "working")
 }
 
-/// Some(attached) when the event is a lifecycle edge for this session.
-fn session_edge(ev: &Result<Event, broadcast::error::RecvError>, session: &str) -> Option<bool> {
-    match ev {
-        Ok(e) if e.event == "session" && e.data["name"] == session => e.data["attached"].as_bool(),
-        _ => None,
-    }
+/// True when the event is a session lifecycle line — attach, detach, or
+/// this daemon's own rename bookkeeping riding the same "session" name
+/// (`session_lifecycle`, lib.rs). Which one, and whether it is about THIS
+/// caller's session at all, is deliberately not decided here: see the doc
+/// comment on `await_ack`'s event arm for why comparing against
+/// `inner.watcher_of(session_idx)`'s live truth, not the event's own
+/// `data["name"]`, is what a caller does with this.
+fn is_session_event(ev: &Result<Event, broadcast::error::RecvError>) -> bool {
+    matches!(ev, Ok(e) if e.event == "session")
 }
 
 /// Screen evidence for tier 2, spec conjunctive form (v1.1 amendment 1):
@@ -2672,10 +2852,6 @@ pub(crate) async fn wait_pinned(
         state,
         waited_ms: started.elapsed().as_millis() as u64,
     };
-    let session_name = inner
-        .session(session_idx)
-        .map(|s| s.name.clone())
-        .unwrap_or_default();
     // Subscribe before the first read so no edge can fall between.
     let mut ev_rx = inner.events.subscribe();
     let mut pane_rx = inner.watcher_of(session_idx).map(|w| w.subscribe());
@@ -2715,22 +2891,31 @@ pub(crate) async fn wait_pinned(
                         }
                     }
                 }
-                Ok(e) if e.event == "session" && e.data["name"] == session_name => {
-                    match e.data["attached"].as_bool() {
-                        Some(true) => {
-                            // Reattach: fresh stream, then re-verify the pin
-                            // against the live table (the pane may have died
-                            // or been replaced during the outage).
-                            pane_rx = inner.watcher_of(session_idx).map(|w| w.subscribe());
-                            if occupant_gone(inner, session_idx, pane_id, pinned_pid) {
-                                return end(WaitOutcome::OccupantChanged, state);
-                            }
+                // Attach/detach truth for THIS session comes from
+                // `inner.watcher_of(session_idx)`, resolved fresh here,
+                // never from matching this event's own `data["name"]`
+                // against a name captured at entry: a followed rename
+                // changes the live name mid-wait, and a stale snapshot
+                // then never matches an attach line again — see the doc
+                // comment on `await_ack`'s (this function's sibling wait)
+                // event arm for the full failure this avoids.
+                Ok(e) if e.event == "session" => match inner.watcher_of(session_idx) {
+                    Some(w) if pane_rx.is_none() => {
+                        // Reattach: fresh stream, then re-verify the pin
+                        // against the live table (the pane may have died
+                        // or been replaced during the outage).
+                        pane_rx = Some(w.subscribe());
+                        if occupant_gone(inner, session_idx, pane_id, pinned_pid) {
+                            return end(WaitOutcome::OccupantChanged, state);
                         }
-                        // Detached: fused state stops moving; keep waiting on
-                        // the deadline and the reattach edge.
-                        _ => pane_rx = None,
                     }
-                }
+                    // Detached: fused state stops moving; keep waiting on
+                    // the deadline and the reattach edge. Also the no-op
+                    // case (already attached, this event was about a
+                    // different session or already-applied edge).
+                    None => pane_rx = None,
+                    _ => {}
+                },
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     // Reconcile on doubt: re-read the cache and the pin.
@@ -2848,6 +3033,44 @@ fn until_word(until: WaitUntil) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_policy_only_retries_failures_proven_before_the_write() {
+        let cases = [
+            (AttemptFailure::session_detached(), "session_detached", true),
+            (AttemptFailure::no_manifest(), "no_manifest", true),
+            (
+                AttemptFailure::pane_rebound_before_paste(),
+                "pane_rebound",
+                true,
+            ),
+            (AttemptFailure::spool_failed(), "spool_failed", true),
+            (AttemptFailure::paste_failed(), "paste_failed", false),
+            (AttemptFailure::verify_failed(), "verify_failed", false),
+            (
+                AttemptFailure::pane_rebound_after_paste(),
+                "pane_rebound_after_paste",
+                false,
+            ),
+            (AttemptFailure::submit_failed(), "submit_failed", false),
+            (AttemptFailure::ack_timeout(), "ack_timeout", false),
+        ];
+        for (failure, cause, retryable) in cases {
+            assert_eq!(failure.cause, cause);
+            assert_eq!(
+                should_retry(&failure, 1, 1),
+                retryable,
+                "retry policy changed for {cause}"
+            );
+        }
+        let exhausted = AttemptFailure::spool_failed();
+        assert!(!should_retry(&exhausted, 2, 1));
+
+        // The production mapping keeps unknown injector errors conservative
+        // too: they can never opt into the pre-write retry budget.
+        let unknown = AttemptFailure::from_inject("future_failure".into());
+        assert!(!should_retry(&unknown, 1, 1));
+    }
 
     /// Every transition the pipeline can perform must be legal in the
     /// frozen state machine. If the proto table changes, this fails before
@@ -3282,6 +3505,26 @@ verify_pattern = ["<message_id>", "Pasted text"]
         ] {
             assert!(receipt_resolved(s), "{s:?}");
         }
+    }
+
+    #[test]
+    fn only_the_position_zero_head_can_recover_a_hold_token() {
+        assert_eq!(
+            held_by_for_position(None, None, Some("working".into())),
+            None
+        );
+        assert_eq!(
+            held_by_for_position(Some(1), None, Some("working".into())),
+            None
+        );
+        assert_eq!(
+            held_by_for_position(Some(0), None, Some("working".into())),
+            Some("working".into())
+        );
+        assert_eq!(
+            held_by_for_position(Some(0), Some("blocked".into()), Some("working".into())),
+            Some("blocked".into())
+        );
     }
 
     // -----------------------------------------------------------------

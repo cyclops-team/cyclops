@@ -92,7 +92,12 @@ const VERSION: &str = concat!(
 );
 
 #[derive(Parser)]
-#[command(name = "cyclops", version = VERSION, about = "One eye on every agent")]
+#[command(
+    name = "cyclops",
+    version = VERSION,
+    about = "One eye on every agent",
+    after_help = "With no command, opens the full-screen workspace (and starts the daemon if needed)."
+)]
 struct Cli {
     /// Print raw results as JSON. Anything the UI shows, scripts can read.
     #[arg(long, global = true)]
@@ -529,7 +534,7 @@ fn run(cli: &Cli) -> i32 {
     match &cli.cmd {
         None => {
             if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
-                seed_themes_for_workspace();
+                seed_home_for_workspace();
                 ensure_daemon_for_workspace();
                 cyclops_workspace::run()
             } else {
@@ -541,18 +546,27 @@ fn run(cli: &Cli) -> i32 {
 }
 
 /// Bare `cyclops` is a front door the same as `cyclops start`, so it seeds
-/// the shipped themes the same way (`themeseed::seed`) before the workspace
-/// opens. Without this, a home `start` never prepared plus a config or
-/// `$CYCLOPS_THEME` naming a shipped theme was a missing file, and the
-/// warning told the user to fix a file that was never there. Existing
-/// files are never overwritten, so running on every open costs nothing.
+/// the shipped themes and detection manifests the same way before the
+/// workspace opens. Without themes, a config or `$CYCLOPS_THEME` naming a
+/// shipped theme was a missing file and a warning about fixing one that was
+/// never there. Without manifests, every pane reads unknown and nothing can
+/// be delivered — indistinguishable from a broken install to a first-time
+/// visitor who ran bare `cyclops` after a binary-only copy. Existing files
+/// are never overwritten, so running on every open costs nothing.
 ///
-/// A problem is a note, not an exit, for the same reason as the daemon
-/// below: a home without themes still renders, in built-in colors.
-fn seed_themes_for_workspace() {
+/// A problem is a note, not an exit: a home without themes still renders in
+/// built-in colors, and a home without manifests still opens (the sidebar
+/// shows unknown) rather than refusing the front door.
+fn seed_home_for_workspace() {
     let home = cyclops_proto::cyclops_home();
     for why in themeseed::seed(&home).problems {
         eprintln!("{why}");
+    }
+    let seeded = manifests::seed(&home);
+    if seeded.none_installed() {
+        eprintln!("{}", manifests::nothing_installed(&seeded));
+    } else if !seeded.problems.is_empty() {
+        eprintln!("{}", manifests::partly_installed(&seeded));
     }
 }
 
@@ -1290,7 +1304,10 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
                 let pane = (d.note.as_deref() == Some(copy::CAUSE_NO_MANIFEST))
                     .then_some(d.pane.as_deref())
                     .flatten();
-                eprintln!("{}", copy::needs_attention(&d.to, pane));
+                eprintln!(
+                    "{}",
+                    copy::needs_attention_for(&d.to, pane, d.note.as_deref())
+                );
             }
             // Past the paste and still unresolved: the pane has the
             // payload and the confirmation is outstanding.
@@ -1554,6 +1571,7 @@ mod tests {
             position: None,
             note: None,
             pane: None,
+            held_by: None,
         }
     }
 

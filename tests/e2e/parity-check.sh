@@ -790,7 +790,7 @@ check_exit "and exits 1 for a human" 1
 run "$CYC" status --plain
 check "the eye opens with a count"       '^◑ 1 cyclops · watching main · tmux .* · 1 needs attention$'
 check "and the block names what it is"   '^  waiting on you$'
-check "one row per open item"            '^  ghost +⚠ needs attention$'
+check "one row per open item"            '^  ghost +⚠ needs attention · no pane with that name · m-[[:xdigit:]]+ · (just now|[0-9]+(s|m|h|d)( [0-9]+(m|h))? ago)$'
 
 echo
 echo "#### The first run docs/guides/QUICKSTART.md walks, from outside the repo"
@@ -1156,7 +1156,7 @@ check "and the daemon too"                "^  cyclopsd   $INST/.local/bin/cyclop
 check "and where the home is"             "^  home       $INST/.cyclops$"
 check "it reports the version it built"   '^✔ cyclops [0-9]+\.[0-9]+\.[0-9]+ \(([0-9a-f]+(\.dirty)?|unknown)\) is installed$'
 check_absent "it gives no separate daemon step" 'cyclopsd &'
-check "step 2 opens the workspace"        '^  2  cyclops start +open your workspace; it prints what to do next$'
+check "step 2 opens the workspace"        '^  2  cyclops +open your workspace and start your agents$'
 check "it names the profile it edited"    "^  three lines added to $INST/.zshrc:$"
 check "and shows the block it added"      '^    # >>> cyclops >>>$'
 check "and the PATH line inside it"       "^    export PATH=\"$INST/.local/bin:\\\$PATH\"$"

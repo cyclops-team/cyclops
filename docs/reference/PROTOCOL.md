@@ -179,8 +179,29 @@ Nothing in a body can forge the header the recipient reads.
 One `deliveries` entry per recipient. States, in order:
 `queued`, `gating`, `pasting`, `staged`, `submitted`, then
 `delivered_verified` or `delivered_unverified`; failures go to
-`retry_queued` and then `attention_required`, and quota goes to
+`retry_queued` only when the daemon proves the failure happened before any
+payload bytes reached the pane. Failures after that boundary go directly to
+`attention_required`, and quota goes to
 `parked_blocked_quota`, which is terminal and never retried.
+
+While the in-flight head is held at the gate, its otherwise-compatible
+`state: "queued"` receipt may include `held_by`. This optional field contains
+one normalized token: `working`, `idle_with_input`, `pane_in_mode`,
+`session_detached`, `blocked`, or `unknown`. It never contains a manifest
+rule id. Render these as `recipient working`, `composer has input`, `pane in
+copy mode`, `session detached`, `waiting for a decision`, and `target state
+unknown`, respectively. A follower still has only its FIFO `position` and
+renders `queued · N ahead`.
+
+The exact machine cause remains visible in the receipt's `note` field in JSON
+and in the delivery `cause` in the ledger. The pre-write causes that may
+consume `delivery_retry_max` are
+`session_detached`, `no_manifest`, `pane_rebound`, and `spool_failed`.
+`paste_failed`, `verify_failed`, `pane_rebound_after_paste`, `submit_failed`,
+and `ack_timeout` are ambiguous terminal outcomes: they may have reached the
+pane and must not trigger another paste. In those cases
+`attention_required` means the outcome is unknown, not proven non-delivery;
+inspect the recipient before resending.
 
 The daemon answers as soon as the delivery settles, capped by
 `receipt_block_ms`. Keep that under the five seconds the CLI allows itself
@@ -400,6 +421,16 @@ No params. The daemon reads the `theme` key out of `$CYCLOPS_HOME/config.toml`
 itself, so a client and the config can never disagree about what is on.
 Write the key, then call this; `cyclops theme <name>` is those two steps.
 
+It repaints every adopted pane's tmux border and returns the name now
+active. That name is what is ON SCREEN, which is not always what you just
+asked for: a theme file that will not load, or one caught mid-save, is
+refused and the borders keep the palette they had (docs/guides/themes.md). With no
+theme file anywhere the answer is `built-in`, the compiled default table.
+
+The `theme` event carries the name and no colors. Every surface resolves
+its own from the same selection; one that took a palette off the wire could
+show a theme no file on the machine holds.
+
 ### workspace_ui.get
 
 ```
@@ -420,16 +451,6 @@ after a daemon restart.
 
 Persist last-active workspace/tab for the terminal UI. Additive: older
 daemons answer `unknown_method` and the UI falls through its reopen chain.
-
-It repaints every adopted pane's tmux border and returns the name now
-active. That name is what is ON SCREEN, which is not always what you just
-asked for: a theme file that will not load, or one caught mid-save, is
-refused and the borders keep the palette they had (docs/guides/themes.md). With no
-theme file anywhere the answer is `built-in`, the compiled default table.
-
-The `theme` event carries the name and no colors. Every surface resolves
-its own from the same selection; one that took a palette off the wire could
-show a theme no file on the machine holds.
 
 ## Events
 

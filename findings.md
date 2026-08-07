@@ -47,6 +47,11 @@ than a measurement.
 | F39 | Width fixtures pin VS16 non-widening and SGR 21 as bold-off, so an engine bump fails loudly | binds |
 | F40 | One `list-panes -a` discovers every session, window, and pane; empty sessions cannot exist | binds |
 | F41 | Session fields are reachable from pane lines; the second snapshot command exists for tab-safety, not reachability | binds |
+| F50 | A malformed subscription value is a clean-prefix truncation already on tmux's own wire on tmux 3.7b, not `-u`, the line reader, or a dropped connection; the trigger did not reproduce under driving | binds |
+| F51 | tmux 3.7b's own window-index and current-window bookkeeping is racy under heavy parallel fork load, even on a fully isolated `-L` server; a test creating a second window must give it an explicit index and never read it back through a session-level (current-window) target | binds |
+| F52 | tmux 3.7b's `pause-after` clock only starts once a stalled reader's backlog has actually accumulated past the threshold; a host-contended producer can leave a stalled reader with nothing to pause against for seconds at a time | binds |
+| F53 | `display-message -t` must resolve down to a pane, and a bare `=session` exact-match target gives it nothing to fall back to (empty output, no error); target `=session:` — other session-scoped commands accept the bare form fine | binds |
+| F54 | Codex 0.147.0 keeps a multiline bracketed paste expanded, so the audited collapsed-composer shape needs no new rule on this build | binds |
 
 ## F13. refresh-client -B subscriptions work in control mode on tmux 3.6a (MEASURED)
 
@@ -843,3 +848,347 @@ neutral fills at the opposite luminance extreme to the theme's own
 panel (`matched_ground` in src/cyclops-workspace/src/render/mod.rs),
 the readability floor sets their text, and the same pane stays native
 in the dark terminal. Pinned by render::contrast_tests.
+
+## F50. A malformed subscription value is a clean-prefix truncation already on tmux's own wire; the trigger did not reproduce under driving (MEASURED, non-reproduction, tmux 3.7b only)
+
+`~/.cyclops/cyclopsd.log` carries 69 "malformed subscription value"
+warnings over 2026-08-04..07, all from `apply_sub_value`
+(`watcher.rs:524`) failing to collect all 5 pieces of a `SUB_FORMAT` push
+via `value.rsplitn(5, '\t')`. The parser itself is known-good (established
+prior to this investigation). The first question: is it `-u` (F14), the
+client's own line handling, or tmux's own output that is short.
+
+**`-u`: closed by READ.** `ControlClient::spawn` (`control.rs:316`) passes
+`-u` on every invocation unconditionally — it is not gated on any
+environment variable, so nothing about a minimal launchd/cron environment
+can omit it. The raw log bytes confirm this held for the failing
+environment too: `grep 'malformed subscription value' ~/.cyclops/cyclopsd.log
+| cat -tv` shows a real 3-byte UTF-8 glyph (`✳`, tmux's spinner character)
+and real tab bytes (`^I`) between fields in the malformed lines — exactly
+what F14's sanitization (replacement with `_`) would have destroyed. It
+was not in effect when these lines were produced.
+
+**The client's line reassembly: closed by READ.** `reader_task`
+(`control.rs:706-722`) calls `read_until(b'\n', &mut line)` in a loop; that
+call keeps reading from the child's stdout until it actually sees a `\n`
+byte (or EOF), so a value split across two underlying reads is
+reassembled before anything else touches it, and `LineRouter::feed`
+(`control.rs:231`) hands the whole line straight to the notification
+parser with no further splitting. Nothing on this path can hand the
+parser fewer bytes than actually arrived on the wire, for a connection
+that stays open.
+
+**EOF mid-write: a real code gap, closed for THIS corpus by MEASUREMENT.**
+The `Ok(_)` arm of `read_until`'s match in `reader_task` does not check
+that the accumulated `line` ends in a newline before the code proceeds —
+only the following `if line.last() == Some(&b'\n') { line.pop(); }` is
+conditional. So a connection that dies mid-write would hand the router a
+trailing partial line with no terminator, and it would be processed as if
+complete — the same shape as this bug. Cross-checking all 69 malformed
+timestamps against every "tmux connection lost; reattaching" line in the
+same log: none falls within 5 seconds of a reconnect (closest is 231s
+away; median distance is roughly 46 minutes). This corpus is not
+reconnect-adjacent, so this gap — real, and still worth closing — is not
+what produced it.
+
+**The reconcile-storm angle: checked, also not correlated.** The corpus's
+date range sits inside the session the zombie-watcher-storm fix came from,
+whose signature is a flood of "hint-driven reconcile failed" lines
+(36,608 total here, concentrated in dense bursts on 08-06 20:11-20:13 and
+08-07 07:00-10:00 and 19:00). None of the 69 malformed timestamps land
+inside those bursts: every one has 0 or at most 1 "reconcile failed" line
+within a 5-second window either side.
+
+**Live reproduction: driven, not reproduced. This machine has tmux 3.7b
+only** (`tmux -V`); nothing here says anything about 3.6a or a
+next-3.8-class build, and F13/F25 already establish those differ on
+subscription behavior. Three rounds on an isolated `tmux -L
+cyc-inv-scratch` server, each with a `tmux -u -C -L cyc-inv-scratch attach`
+control client fed through a FIFO-backed stdin (so `refresh-client -B`
+could be issued interactively) with its stdout captured in full to a log
+file, driven from a second plain `tmux -L cyc-inv-scratch ...` for
+everything else:
+
+- Round 1 (one pane, one control client): a baseline title change; 60
+  rapid plain `select-pane -T` changes; 80 rapid changes cycling five
+  spinner glyphs including `✳`; a 200-iteration OSC title flood
+  (`printf '\033]2;...\007'`) from inside the pane; 8x pane-birth races
+  (subscribe the instant after `split-window`, before the shell finishes
+  starting); 8x pane-death-mid-push (`sleep 0.05; exit 0`, subscribed the
+  instant the pane exists); and the production flow-control flag
+  (`refresh-client -f 'pause-after=300'`) enabled during a further round
+  of rapid multibyte titles. 7 `%subscription-changed` lines arrived (most
+  rapid changes coalesce into one push per tick, consistent with F23's
+  1Hz ceiling); every one carried all 4 tabs.
+- Round 2 (4 concurrently subscribed panes): simultaneous OSC-title floods
+  layered with subprocess spawn/kill churn on all 4 panes at once for
+  15s, repeated abrupt `kill -9` of each pane's foreground child while
+  subscribed, and title changes racing a tight `current_command` churn
+  loop. 132 pushes arrived, every one 4-tab.
+- Round 3 (production-shaped load): `resize-pane`/`select-layout` churn
+  alternated against the session; a SECOND control client subscribed
+  identically to the first, then frozen mid-stream with `SIGSTOP` to model
+  a stalled or duplicate attached client (the zombie-watcher-storm
+  mechanism: a client tmux does not reliably drop); the PRIMARY connection
+  concurrently issuing 400 `list-panes` commands in a tight loop —
+  reconcile-shaped command traffic sharing the same wire as the
+  notifications — while the same 4 panes kept flooding titles. 20 pushes
+  arrived, every one 4-tab; all 400 command replies closed clean with no
+  `%error`.
+
+159 `%subscription-changed` pushes captured across the three rounds, all
+well-formed. Zero reproductions of a truncated push, despite covering
+every suspect the investigation recipe named (pane birth, pane death,
+multibyte titles, rapid successive changes) plus resize churn, a stalled
+second client, and reconcile-style command traffic sharing the connection.
+
+**Shape census of the real corpus (MEASURED, log analysis).** Field-count
+histogram over the 69 lines (counting the handoff's way: fields, not
+tabs): 2 fields 48x, 4 fields 10x, 3 fields 5x, 1 field (value entirely
+empty) 6x. Representative lines:
+
+```text
+value=✳ Claude Code\t0\t0\t                        (pane %0, 4 fields)
+value=cyclops\t0\t0\t                              (pane %1, 4 fields)
+value=[ . ] Action Required | cyclops-workspace\t  (pane %1, 2 fields)
+value=                                              (pane %1, 1 field)
+```
+
+Every occurrence is a clean prefix — never a garbled byte mid-field —
+which is what the parser being fine plus something upstream stopping
+partway through the fixed suffix would produce. One precision point:
+because `rsplitn(5, '\t')` assigns its five destructure slots
+right-to-left (pid first, title last), ANY shortfall leaves `title`
+unassigned regardless of which of the four fixed fields tmux actually
+failed to emit, and shifts whatever fixed-field values did arrive into
+the wrong-named slots (a 4-field push binds the `dead` variable to the
+real title text, not to a dead flag). The log line's field COUNT is
+diagnostic of truncation depth; it cannot say which named field was
+dropped.
+
+A genuine cross-pane burst also turned up: `05:20:29.961819` (pane %1, 1
+field/empty) → `05:20:30.033197` (pane %4, 3 fields) → `05:20:30.033530`
+(pane %1, 2 fields) — three malformed pushes across two different panes
+within 72ms. Whatever this is, it is not purely a per-pane phenomenon; it
+can land on more than one pane's subscription at essentially the same
+moment.
+
+**A censoring effect worth recording (READ, new).** `apply_sub_value`'s
+destructure only fails — and only then warns — when `rsplitn(5, '\t')`
+returns fewer than 5 pieces. A truncation that stops exactly one field
+short of the end (`title\tdead\tin_mode\tcmd\t`, trailing tab present,
+pid empty) still splits into 5 pieces: `parse_pane_pid("")` returns
+`Some(-1)` by design (F25's precedent for an empty pid field), and the
+row's `pane_pid` is silently set to -1 with no warning and no
+`Action::Hint`. The 69-line corpus is therefore a floor: the same
+phenomenon, one field shallower, is invisible in the log and silently
+corrupts `pane_pid` until the next full push overwrites it — low
+consequence (self-healing, and F25 already documents `pane_pid` as
+unreliable around a pane's death), but the warn count understates how
+often the underlying truncation actually happens.
+
+**What follows for the code.** Every one of the 69 real occurrences is a
+clean-prefix truncation the handler already treats correctly:
+`Action::Hint` forces a reconcile, so the table is never stale for longer
+than one debounce window. The investigation could not identify a trigger
+despite three rounds of driving, so nothing here supports fabricating a
+value tmux never sent — padding defaults would be exactly the lie F25
+already declined to tell for a differently-shaped gap in this same
+subscription mechanism. What the measurement does support: the first
+`warn!` in `apply_sub_value` (the `rsplitn` shortfall) fires on a shape
+that is, by construction, always a clean prefix — it can only be reached
+with fewer fields, never garbled ones — so it belongs at `debug!`, not
+`warn!`. The second `warn!` in the same function (an unparseable
+`pane_pid` on an otherwise-complete 5-field push) is a different,
+still-unobserved shape and should stay at `warn!`. Proposed diff, anchored
+on the code, not applied here (concurrent edits to `watcher.rs` were in
+flight during this investigation):
+
+```rust
+     let mut it = value.rsplitn(5, '\t');
+     let (Some(pid), Some(cmd), Some(in_mode), Some(dead), Some(title)) =
+         (it.next(), it.next(), it.next(), it.next(), it.next())
+     else {
+-        warn!(%pane, %value, "malformed subscription value");
++        // F50: every observed occurrence is a clean-prefix truncation
++        // tmux itself sent short (tmux 3.7b, trigger not identified);
++        // the handler already self-heals via Action::Hint below, so
++        // this is diagnostic noise, not a correctness signal.
++        debug!(%pane, %value, "malformed subscription value");
+         return Action::Hint;
+     };
+```
+
+Probe: isolated server `tmux -L cyc-inv-scratch`, torn down at the end
+of each round (shell probes use `cyc_tmux_teardown` from
+`tests/e2e/lib/lib.sh` for this); driver
+scripts and raw capture logs kept under the investigation's scratch
+directory. Corpus analysis: `~/.cyclops/cyclopsd.log` (read-only),
+grepped for `malformed subscription value`, `tmux connection lost`, and
+`reconcile failed`, cross-referenced by timestamp.
+
+## F51. tmux 3.7b's window-index and current-window bookkeeping races under heavy parallel fork load, even on a fully isolated server (MEASURED)
+
+`src/cyclops-tmux/tests/ops.rs`'s
+`split_opens_in_the_source_panes_directory_not_the_sessions` failed once
+under a full-suite parallel run with `create window failed: index 0 in
+use` from its `new-window -t s -c <dir> /bin/sh` — a plain session target,
+letting tmux pick the next free index itself, run immediately after
+`new-session -d -s s` on the same (freshly created, single-window)
+session. This looked at first like a cross-test collision (two parallel
+tests sharing a scratch `-L` server), the working theory in the handoff
+that sent this investigation. It is not: reproduced directly with the
+`tmux` binary (no Rust harness, no `cyclops_testrig`), each of N parallel
+shell workers using its own `-L cyc-<n>-$$-$RANDOM` socket, so no two
+workers could ever share a server. A bare `-t s` target still failed
+`index 0 in use` 3/180 tries under 60-way parallel load; a bare `-t s
+-d` (suppressing focus, tried as an alternative) failed worse, 6/180.
+Giving `new-window` an explicit target index (`-t s:1`, since a
+from-scratch session's first window is always 0 under `-f /dev/null`'s
+default `base-index`) reproduced zero `index in use` failures over 360
+tries.
+
+A second, related race showed up once the first was fixed: reading the
+new window's pane back through `list-panes -t s` (a session-level target,
+which resolves to the session's *current* window) intermittently returned
+the *first* window's pane instead — `display-message -p -t s
+"#{window_index}"` read back `0` immediately after a successful,
+`-d`-less `new-window -t s:1` on 3/80 tries, even though the tmux manual
+states plainly that omitting `-d` makes the new window current. Querying
+the explicit window (`list-panes -t s:1`) instead of the session
+reproduced zero mistargeted-pane failures over 100 tries, because it does
+not depend on that current-window hand-off having landed yet.
+
+Both races are internal to a single tmux server under load, not a
+cross-process collision: every trial above used a socket name no other
+process could have touched. The specific trigger inside tmux's own
+session/window bookkeeping was not isolated further; that would need
+reading tmux's C source or building an instrumented tmux, which was out
+of scope for a test-hygiene fix. What is established is the workaround:
+prefer an explicit window index over "let tmux pick", and prefer an
+explicit window target over "read it back through the session's current
+window", whenever a test creates a second window and immediately depends
+on it.
+
+Probe (representative; run from a plain shell, no tmux session needed):
+
+```text
+$ . tests/e2e/lib/lib.sh   # cyc_tmux_teardown
+$ for i in $(seq 1 60); do
+    sock="cyc-probe-$i-$$-$RANDOM"; sdir="/tmp/p-$i-s"; pdir="/tmp/p-$i-p"
+    mkdir -p "$sdir" "$pdir"
+    ( tmux -u -L "$sock" -f /dev/null new-session -d -s s -x 120 -y 30 -c "$sdir" /bin/sh
+      tmux -u -L "$sock" -f /dev/null new-window -t s -c "$pdir" /bin/sh
+      cyc_tmux_teardown "$sock" ) &
+  done; wait
+# observed 3/180 (three such batches): create window failed: index 0 in use
+```
+
+## F52. tmux 3.7b's `pause-after` clock only starts once a stalled reader's backlog has actually crossed the threshold, not from wall-clock elapsed alone (MEASURED)
+
+`src/cyclops-workspace/tests/perf_contract.rs`'s
+`flow_control_pause_and_resume` stalls its own single-threaded tokio
+runtime for a fixed 2 seconds to reproduce a real `%pause` (see the test's
+own doc comment for why a genuine executor stall is the only bounded way
+to get tmux to emit one against the real `ControlClient`). Under a
+same-machine 12-way parallel stress (12 copies of the same test, each
+running its own isolated `yes flood`), that fixed stall failed to produce
+`%pause` within a further 5-second wait 5/12 and 6/12 tries across two
+batches — "never saw %pause after the stall".
+
+Instrumenting the wait loop to log every notification it saw (not only
+`%pause`) showed the failing runs draining thousands of `%extended-output`
+messages the instant the stall ended, every one at `age_ms` at or near 0 —
+i.e. the control connection was never actually behind once draining
+resumed. This rules out the stall itself failing to block the reader
+(the executor mechanism is sound and reproduces fine standalone); what it
+shows is that `yes flood`'s output had not backed up enough during the
+2-second stall to ever cross `pause-after`'s 1-second-behind threshold in
+the first place, so tmux had nothing to pause. Twelve parallel copies of
+an unbounded flood plus twelve parallel tmux servers is heavy CPU
+contention system-wide; this measurement identifies where the backlog
+went missing (it never accumulated) but not which specific process was
+denied the CPU to produce it — that finer attribution was not chased
+further.
+
+A fixed, single stall length cannot be raised enough to cover this
+reliably, because contention on a shared host is not bounded by anything
+this test controls. What resolved it: retry the stall itself with
+backoff (2s, 4s, 8s, 16s), each retry a fresh, *uninterrupted* block —
+checking for `%pause` in between attempts and then continuing would let
+the reader drain whatever little had queued and reset tmux's "how long
+has this client been behind" clock to zero before the next attempt even
+starts. Across 48 runs of the fixed test under the same 12-, 16-, and
+20-way parallel stress that reproduced the original failure at up to 50%,
+zero failed; most passed on the first (2s) attempt in about 2.3s, and the
+few that needed a retry still passed, up to 24s in the worst observed
+case.
+
+Probe: `env -u TMUX -u TMUX_PANE cargo test -p cyclops-workspace --test
+perf_contract flow_control_pause_and_resume -- --exact --nocapture`, run
+as N parallel copies of the built test binary
+(`target/debug/deps/perf_contract-*`) from a plain shell. The test file is
+`src/cyclops-workspace/tests/perf_contract.rs`.
+
+## F53. `display-message -t` needs a window/pane to fall back to; a bare `=session` exact-match target resolves to nothing (MEASURED, tmux 3.7b)
+
+Resolving a session's stable `$id` at watcher connect (for following a
+`%session-renamed` of the watcher's own session, `src/cyclops-tmux/src/watcher.rs`'s
+`resolve_session_id`) tried `display-message -p -t '=<session>' '#{session_id}'`
+— the same `=name` exact-match target every other session-scoped command in
+this crate uses (`crate::cmd::session_target`). It came back empty: no
+`%error`, exit fine, just a blank line where `$0` belongs, and every rename
+test built on it timed out waiting for a `SessionRenamed` that never came.
+
+`display-message -p -t 'session' '#{session_id}'` (no `=`) works and prints
+`$0`. `display-message -p -t '=session:' '#{session_id}'` (trailing colon)
+also works. The difference is what tmux falls back to: `display-message`
+has to resolve `-t` down to an actual pane to evaluate any format against,
+and a bare session name without a window part falls back to that session's
+current window; `=session` alone apparently does not carry that fallback,
+while `=session:` explicitly names the session's window list and gives
+tmux something to resolve. This is the same trailing-colon shape
+`ControlClient::move_window_to_session` already uses for a different
+reason (naming the window list rather than colliding on a window index) —
+worth remembering as the fix for `display-message -t` specifically, since
+`has-session`, `rename-session`, and `list-panes -s -t` all accept a bare
+`=session` target fine and do not need it.
+
+Probe: isolated `tmux -L cyc-dbg -f /dev/null new-session -d -s before`,
+then `tmux -L cyc-dbg display-message -p -t '=before' '#{session_id}'`
+(empty output) vs. `tmux -L cyc-dbg display-message -p -t '=before:'
+'#{session_id}'` (prints `$0`), same server, same session, only the
+trailing colon differs. `src/cyclops-tmux/tests/watcher_rename.rs`'s
+`a_renamed_session_keeps_flowing_under_the_new_name` is the regression
+test: it failed with the bare target and passes with the trailing colon.
+
+## F54. Codex 0.147.0 keeps a multiline bracketed paste expanded (MEASURED)
+
+The currently installed Codex CLI no longer reproduced the collapsed
+composer shape audited against 0.146.x. `codex --version` reported
+`codex-cli 0.147.0`; `tmux -V` reported `tmux 3.7b`. In an isolated tmux
+server, a detached 120x40 pane launched both `codex -C <scratch checkout>`
+and `codex --no-alt-screen -C <scratch checkout>`. Each probe pasted
+the same scrubbed 26-line payload (a Cyclops-shaped header, 24 short payload
+lines, and a reply hint) with `set-buffer` followed by `paste-buffer -p`.
+After one second, both `capture-pane -p` and `capture-pane -p -e` showed the
+composer glyph followed by the header and all payload lines. Neither capture
+contained a collapsed placeholder or a `Pasted` chip, and the escaped view
+carried no collapsed-composer SGR boundary to encode.
+
+Probe command shape (the payload text was scrubbed and is not retained):
+
+```text
+tmux -L cyc-codex-live -f /dev/null new-session -d -s codexprobe -x 120 -y 40 /bin/zsh
+codex [--no-alt-screen] -C <scratch checkout>
+tmux -L cyc-codex-live -f /dev/null set-buffer -b cycprobe <multiline payload>
+tmux -L cyc-codex-live -f /dev/null paste-buffer -b cycprobe -t codexprobe:0.0 -d -p
+tmux -L cyc-codex-live -f /dev/null capture-pane -p -t codexprobe:0.0
+tmux -L cyc-codex-live -f /dev/null capture-pane -p -e -t codexprobe:0.0
+```
+
+Conclusion: do not add a regex or scrubbed collapsed-paste fixture for the
+audited 0.146.x shape on this build. This closes work package 2 at the plan's
+explicit stop condition; revisit it only when a current Codex build or payload
+shape actually collapses. The existing Codex ghost/typed rules remain the only
+measured manifest change.

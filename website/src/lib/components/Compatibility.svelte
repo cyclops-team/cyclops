@@ -1,16 +1,22 @@
 <script lang="ts">
 	import SectionHead from './SectionHead.svelte';
 
-	const strip = ['claude', 'codex', 'cursor', 'agy', 'your-agent'];
+	const strip: { id: string; label?: string }[] = [
+		{ id: 'claude' },
+		{ id: 'codex' },
+		{ id: 'cursor' },
+		{ id: 'agy', label: 'Antigravity' },
+		{ id: 'your-agent' }
+	];
 </script>
 
 <section class="section">
 	<SectionHead title="COMPATIBILITY" index="03 / Any agent" />
 	<h3 class="pixel heading">If it runs in your terminal,<br />it can run in Cyclops.</h3>
 	<div class="strip">
-		{#each strip as name, i (name)}
+		{#each strip as agent, i (agent.id)}
 			<span class="item">
-				<span class="term-name">{name}</span>
+				<span class="term-name">{agent.id}{#if agent.label}&nbsp;· {agent.label}{/if}</span>
 				{#if i < strip.length - 1}<span class="dot" aria-hidden="true">·</span>{/if}
 			</span>
 		{/each}

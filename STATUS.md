@@ -74,6 +74,22 @@ change whenever coverage grows.
 - Hook-backed verification requires wiring the generated hook into the
   vendor CLI; without it, delivery can still finish with screen evidence and
   an explicitly unverified receipt.
+- Renaming a watched session (folder-following does this) is followed live:
+  the watcher matches the rename by the session's stable tmux id and the
+  daemon's slot and durable adoption records move to the new name in place,
+  so watching continues with no re-registration. Two edges remain: the open
+  ledger file keeps its old-name path for that daemon run (a system line
+  records the rename), and `config.toml`'s `sessions` list is not rewritten,
+  so a restarted daemon waits on the old name until something re-registers
+  the new one.
+- Agent activity status in the roster / workspace chrome is unreliable for
+  some CLIs: Codex is confirmed wrong (idle ↔ working), and Cursor Agent has
+  been seen showing `working` while the human is only typing in the composer
+  (should be idle / idle_with_input). Earlier notes also reported Claude
+  Code stuck on `? unknown`; revalidate on the current build. This is a
+  detection / fusion gap, not a delivery bug. Messaging reliability work and
+  the 2026-08-07 live-testing bugfixes did not address it. Tracked in
+  [issue #7](https://github.com/cyclops-team/cyclops/issues/7).
 
 For the repository map and design boundaries, read
 [docs/development/HANDOFF.md](docs/development/HANDOFF.md). For user-facing

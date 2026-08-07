@@ -130,6 +130,10 @@ async fn escaped_capture_flips_typed_text_to_idle_with_input_and_gates() {
         .await;
     let msg_id = result["msg_id"].as_str().unwrap().to_string();
     assert_eq!(result["deliveries"][0]["state"], "queued", "{result}");
+    assert_eq!(
+        result["deliveries"][0]["held_by"], "idle_with_input",
+        "the held head must expose a normalized reason: {result}"
+    );
     let hold = rig
         .ev
         .wait_event(Duration::from_secs(8), |e| {

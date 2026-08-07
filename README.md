@@ -1,11 +1,14 @@
 # Cyclops
 
-**One team. Any coding agent.**
+**One eye. Many agents. A single coordinated team.**
 
-Open source coordination for coding agents running in your terminal. Cyclops
-gives each tmux pane an identity, delivers structured messages between agents
-with verified receipts, and keeps everything on an append-only record you can
-audit months later. If it runs in your terminal, it can run in Cyclops.
+Cyclops is an open-source coordination layer for coding agents running in
+your terminal. Run the agents you already use, watch what each one is doing
+from one workspace, hand work between them, verify message delivery, and
+keep the whole workflow on an append-only record you can audit months later.
+If it runs in your terminal, it can run in Cyclops.
+
+[usecyclops.dev](https://www.usecyclops.dev) · [quickstart](docs/guides/QUICKSTART.md) · [the docs, one page per question](#docs)
 
 Pre-release, and honest about it: [STATUS.md](STATUS.md) says what is built.
 Everything below is built and tested.
@@ -35,11 +38,15 @@ More: [installation guide](docs/guides/install.md).
 Then one command, from anywhere:
 
 ```bash
-cyclops start
+cyclops
 ```
 
-It starts the daemon too, so there is no second command and no tab to
-keep open.
+Bare `cyclops` opens the full-screen workspace: your sessions and agents in
+a sidebar, tabs, and live panes. With no tmux session running it starts
+one, and it starts the daemon too, so there is no second command and no tab
+to keep open. Start the coding agents you already use inside its panes, the
+way you normally would, and talk to them there.
+[The workspace guide](docs/guides/workspace-ui.md) is the tour.
 
 ## Update
 
@@ -73,10 +80,45 @@ left off. To leave nothing behind:
 rm -rf ~/.cyclops
 ```
 
-## Start here
+## Talk to your agents, not to Cyclops
 
-One rung at a time. Each is useful on its own, and you can stop at any of
-them.
+Cyclops gives the agents in your workspace a shared way to identify one
+another, exchange structured handoffs, and prove delivery. You keep talking
+to your agents the way you already do:
+
+> Implement the rate limiter change. When you're done, send it to reviewer
+> and ask for a review.
+
+An agent that knows Cyclops runs the handoff itself — `cyclops send
+reviewer …` from its own pane. The reviewer receives a structured message
+whose sender the daemon resolved from the pane it really came from, with a
+reply hint at the bottom. The delivery lands on the record with its
+evidence, and you watch it happen from the workspace instead of relaying
+messages by hand.
+
+Three interfaces, one system:
+
+1. **You** run `cyclops`, arrange agents, and speak to them in natural
+   language.
+2. **Your agents** use the `cyclops` CLI underneath — send, reply, wait,
+   check delivery. Teaching an agent the verbs and the safety rules is one
+   file: [skills/cyclops/SKILL.md](skills/cyclops/SKILL.md). Nothing
+   installs it for you yet: copy it where your agent looks for
+   instructions (for Claude Code, `~/.claude/skills/cyclops/SKILL.md`), or
+   just tell the agent to use cyclops — every command explains itself with
+   `--help`, and every delivered message carries its own reply
+   instructions.
+3. **Scripts and CI** use the same CLI with `--json`. The ladder below is
+   that layer, rung by rung.
+
+You never have to relay a handoff by hand, but the same commands are yours
+whenever you want them — that is all the ladder below is.
+
+## The CLI, one rung at a time
+
+Everything above runs on these commands: they are what your agents and
+scripts use, and the fastest way to understand the system. Each rung is
+useful on its own, and you can stop at any of them.
 
 Every block below is real output, captured by
 [`tests/e2e/parity-check.sh`](tests/e2e/parity-check.sh) on a throwaway tmux server.
@@ -437,7 +479,8 @@ above.
 
 | Command | What it does |
 |---|---|
-| `cyclops start` | Open the default workspace: restore it, or build it from a preset. Safe to run twice |
+| `cyclops` | The workspace: sidebar, tabs, live panes. Starts a session and the daemon when none is running |
+| `cyclops start` | Build or restore the default workspace from a preset, without opening the UI. Safe to run twice |
 | `cyclops workspace save\|restore` | The shape of a session as a file: panes, sizes, names, directories |
 | `cyclops name <pane> <label>` | Name a pane so cyclops can address it; the pane's tmux border says so |
 | `cyclops list` | The roster: every named agent, how it is doing, what it is on. Inside tmux it scopes to your session; `--all` is every watched session |
@@ -488,6 +531,7 @@ Otherwise, one page per question.
 | [AGENTS.md](AGENTS.md) | The same front door for AI coding agents: the map condensed, and the gates a change must pass |
 | [install.md](docs/guides/install.md) | Build it, configure it, run the tests |
 | [QUICKSTART.md](docs/guides/QUICKSTART.md) | Two agents and a review gate, start to finish |
+| [skills/cyclops/SKILL.md](skills/cyclops/SKILL.md) | Teaching your coding agent to use Cyclops itself |
 | [send.md](docs/guides/send.md) | Sending, receipts, broadcast, quota parking |
 | [history.md](docs/guides/history.md) | Reading the record, threads, paging |
 | [wait.md](docs/guides/wait.md) | Waiting on an agent, exit codes |
@@ -503,6 +547,7 @@ Otherwise, one page per question.
 | [ARCHITECTURE.md](docs/development/ARCHITECTURE.md) | How the pieces fit |
 | [DELIVERY.md](docs/development/DELIVERY.md) | The delivery spec: states, evidence tiers, ordering |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | The development loop, the demos, and the gates a change must pass |
+| [SECURITY.md](SECURITY.md) | Reporting a vulnerability privately |
 | [INVARIANTS.md](docs/development/INVARIANTS.md) | Eleven rules a change must never break, and what breaks otherwise |
 | [findings.md](findings.md) | The measurements the design rests on, F13 onward, each with the probe that proved it |
 | [CHANGELOG.md](CHANGELOG.md) | What each milestone changed, in the order it shipped |

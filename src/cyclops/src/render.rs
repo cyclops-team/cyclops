@@ -177,7 +177,7 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
                 config_path.display()
             ),
         ];
-        out.extend(waiting_rows(&attention, style));
+        out.extend(waiting_rows(&attention, res, style));
         return out.join("\n");
     }
 
@@ -248,7 +248,7 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
         }
     }
     out.extend(unknown_rows(res, style));
-    out.extend(waiting_rows(&attention, style));
+    out.extend(waiting_rows(&attention, res, style));
     out.join("\n")
 }
 
@@ -505,12 +505,20 @@ pub fn render_named(result: &Value, style: &Style) -> String {
 /// pane grid answers for the blocked panes, so the backlog needs rows of
 /// its own or the number stands alone. Empty when the answer carried no
 /// backlog, which is also when the header counted none.
-fn waiting_rows(attention: &Attention, style: &Style) -> Vec<String> {
-    let open: Vec<(String, DeliveryState)> = attention
+fn waiting_rows(attention: &Attention, res: &StatusResult, style: &Style) -> Vec<String> {
+    let open: Vec<(String, String, DeliveryState, Option<String>, u64)> = attention
         .items()
         .into_iter()
         .filter_map(|i| match i {
-            AttentionItem::Delivery { to, state, .. } => Some((to, state)),
+            AttentionItem::Delivery { to, id, state } => {
+                let (cause, ts) = res
+                    .open_deliveries
+                    .iter()
+                    .find(|d| d.to == to && d.id == id)
+                    .map(|d| (d.cause.clone(), d.ts))
+                    .unwrap_or((None, 0));
+                Some((to, id, state, cause, ts))
+            }
             AttentionItem::Agent { .. } => None,
         })
         .collect();
@@ -519,11 +527,11 @@ fn waiting_rows(attention: &Attention, style: &Style) -> Vec<String> {
     }
     let to_w = open
         .iter()
-        .map(|(to, _)| display_width(to))
+        .map(|(to, _, _, _, _)| display_width(to))
         .max()
         .unwrap_or(0);
     let mut out = vec![String::new(), format!("  {}", style.dim("waiting on you"))];
-    out.extend(open.iter().map(|(to, state)| {
+    out.extend(open.iter().map(|(to, id, state, cause, ts)| {
         let badge = receipt_badge(
             &DeliveryReceipt {
                 to: to.clone(),
@@ -533,10 +541,21 @@ fn waiting_rows(attention: &Attention, style: &Style) -> Vec<String> {
                 // The eye counts items from the record, which names the
                 // recipient and not the pane the delivery went to.
                 pane: None,
+                held_by: None,
             },
             style,
         );
-        format!("  {}  {badge}", style.role(to, &pad(to, to_w)))
+        let cause = cause
+            .as_deref()
+            .map(grid::cause_words)
+            .unwrap_or_else(|| "cause unknown".into());
+        let when = if *ts == 0 {
+            "time unknown".into()
+        } else {
+            age(now_ms().saturating_sub(*ts))
+        };
+        let detail = style.dim(&format!("{cause} · {id} · {when}"));
+        format!("  {}  {badge} · {detail}", style.role(to, &pad(to, to_w)))
     }));
     out
 }
@@ -1029,8 +1048,14 @@ mod tests {
             id: id.into(),
             to: to.into(),
             state,
-            ts: 1_754_000_000_000,
-            cause: None,
+            ts: 0,
+            cause: Some(
+                match state {
+                    DeliveryState::ParkedBlockedQuota => "blocked_quota",
+                    _ => "verify_failed",
+                }
+                .into(),
+            ),
         }
     }
 
@@ -1520,8 +1545,8 @@ mod tests {
              \x20 %4           ? unknown  vim{UNKNOWN_NOTE}\n\
              \n\
              \x20 waiting on you\n\
-             \x20 implementer  ⊘ parked · quota\n\
-             \x20 reviewer     ⚠ needs attention"
+             \x20 implementer  ⊘ parked · quota · blocked quota · m-1 · time unknown\n\
+             \x20 reviewer     ⚠ needs attention · outcome unknown: paste verification failed · m-2 · time unknown"
         );
         assert_eq!(got, expected);
         for line in got.lines() {
@@ -1598,6 +1623,7 @@ mod tests {
             position,
             note: note.map(String::from),
             pane: None,
+            held_by: None,
         }
     }
 

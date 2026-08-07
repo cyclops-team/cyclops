@@ -127,6 +127,22 @@ impl PaneRuntime {
             }
             self.feed(b"\x1b[?1049h");
         }
+
+        // A capture restores pixels, not modes either: DECSET 1000/1002/1003
+        // (mouse tracking) and 1006 (SGR encoding) are gone from the fresh
+        // parser `reset()` built above, same as every other mode. This
+        // runtime's mode is only ever read as a gate for wheel forwarding
+        // (`wants_sgr_mouse_wheel`), and tmux reports the wheel identically
+        // under all three tracking variants, so re-asserting plain click
+        // tracking (1000h) regardless of which variant the pane actually
+        // set is coarse but cannot mislead that gate.
+        if snapshot.mouse_on {
+            self.feed(b"\x1b[?1000h");
+        }
+        if snapshot.mouse_sgr {
+            self.feed(b"\x1b[?1006h");
+        }
+
         self.replay_rows(&snapshot.visible);
 
         // The replay leaves the cursor after the last capture cell; move it
@@ -302,6 +318,23 @@ impl PaneRuntime {
         self.term.scroll_display(Scroll::Delta(-delta));
     }
 
+    /// Whether this pane wants wheel motion delivered as an SGR mouse
+    /// report instead of moving this runtime's own scroll offset: mouse
+    /// reporting is on and SGR encoding is enabled, the same pair xterm and
+    /// tmux both require before treating a wheel notch as an escape
+    /// sequence rather than a scrollback nudge.
+    pub fn wants_sgr_mouse_wheel(&self) -> bool {
+        let mode = self.term.mode();
+        mode.intersects(TermMode::MOUSE_MODE) && mode.contains(TermMode::SGR_MOUSE)
+    }
+
+    /// Whether the alternate screen is active — this pane's transcript
+    /// lives inside the running program, not in this runtime's own
+    /// scrollback, so there is nothing local to scroll into.
+    pub fn alt_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
     /// Extract selected text between two cell positions.
     ///
     /// Positions are viewport cells. Grid lines equal viewport rows only at
@@ -402,6 +435,8 @@ pub fn snapshot_from_bundle(bundle: &cyclops_tmux::HydrationBundle) -> Hydration
         cursor_x: bundle.cursor_x,
         cursor_y: bundle.cursor_y,
         alternate_on: bundle.alternate_on,
+        mouse_on: bundle.mouse_on,
+        mouse_sgr: bundle.mouse_sgr,
     }
 }
 
@@ -434,6 +469,8 @@ mod tests {
             cursor_x: 6,
             cursor_y: 0,
             alternate_on: true,
+            mouse_on: false,
+            mouse_sgr: false,
         });
 
         assert!(
@@ -454,6 +491,8 @@ mod tests {
             cursor_x: 6,
             cursor_y: 0,
             alternate_on: true,
+            mouse_on: false,
+            mouse_sgr: false,
         });
 
         rt.feed(b"\x1b[?1049l");
@@ -478,6 +517,8 @@ mod tests {
             cursor_x: 6,
             cursor_y: 0,
             alternate_on: false,
+            mouse_on: false,
+            mouse_sgr: false,
         });
 
         assert!(rt.at_tail(), "a rehydrated pane lands at the live tail");
@@ -500,6 +541,8 @@ mod tests {
             cursor_x: 6,
             cursor_y: 0,
             alternate_on: false,
+            mouse_on: false,
+            mouse_sgr: false,
         };
         let mut rt = PaneRuntime::new(8, 2);
         rt.feed(b"one\r\ntwo\r\nthree\r\nfour");
@@ -524,10 +567,77 @@ mod tests {
             cursor_x: 3,
             cursor_y: 0,
             alternate_on: false,
+            mouse_on: false,
+            mouse_sgr: false,
         });
 
         assert_eq!(rt.snapshot().row_texts()[0], "new");
         assert!(!rt.term.mode().contains(TermMode::ALT_SCREEN));
+    }
+
+    #[test]
+    fn hydrating_a_snapshot_with_mouse_flags_on_restores_sgr_wheel_wanting() {
+        let mut rt = PaneRuntime::new(10, 2);
+        rt.hydrate(&HydrationSnapshot {
+            cols: 10,
+            rows: 2,
+            visible: b"CLAUDE".to_vec(),
+            saved_primary: None,
+            cursor_x: 0,
+            cursor_y: 0,
+            alternate_on: true,
+            mouse_on: true,
+            mouse_sgr: true,
+        });
+
+        assert!(
+            rt.wants_sgr_mouse_wheel(),
+            "a rebuilt runtime must not lose the mouse-reporting mode a live pane already had"
+        );
+    }
+
+    #[test]
+    fn hydrating_a_snapshot_with_mouse_flags_off_leaves_sgr_wheel_unwanted() {
+        let mut rt = PaneRuntime::new(10, 2);
+        rt.hydrate(&HydrationSnapshot {
+            cols: 10,
+            rows: 2,
+            visible: b"CLAUDE".to_vec(),
+            saved_primary: None,
+            cursor_x: 0,
+            cursor_y: 0,
+            alternate_on: true,
+            mouse_on: false,
+            mouse_sgr: false,
+        });
+
+        assert!(
+            !rt.wants_sgr_mouse_wheel(),
+            "a pane that never asked for mouse reporting must not gain it from hydration"
+        );
+    }
+
+    #[test]
+    fn fresh_runtime_wants_neither_sgr_wheel_nor_alt_screen() {
+        let rt = PaneRuntime::new(10, 2);
+        assert!(!rt.alt_screen());
+        assert!(!rt.wants_sgr_mouse_wheel());
+    }
+
+    #[test]
+    fn alt_screen_with_sgr_mouse_reporting_wants_sgr_wheel() {
+        let mut rt = PaneRuntime::new(10, 2);
+        rt.feed(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+        assert!(rt.alt_screen());
+        assert!(rt.wants_sgr_mouse_wheel());
+    }
+
+    #[test]
+    fn alt_screen_alone_does_not_want_sgr_wheel() {
+        let mut rt = PaneRuntime::new(10, 2);
+        rt.feed(b"\x1b[?1049h");
+        assert!(rt.alt_screen());
+        assert!(!rt.wants_sgr_mouse_wheel());
     }
 
     #[test]

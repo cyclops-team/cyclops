@@ -150,7 +150,7 @@ pub(crate) async fn handle_report(
 ) -> Result<Value, WireError> {
     let event = normalize_event(&params.event);
 
-    let (row, watcher) = match inner.resolve_recipient(&params.agent) {
+    let (row, watcher, session_idx) = match inner.resolve_recipient(&params.agent) {
         Some((idx, pane_id)) => {
             let Some(watcher) = inner.watcher_of(idx) else {
                 // resolve_recipient only answers from live watchers; a
@@ -160,10 +160,10 @@ pub(crate) async fn handle_report(
             let Some(row) = watcher.pane(&pane_id) else {
                 return Ok(json!({"applied": false, "reason": "no_such_pane"}));
             };
-            (row, Some(watcher))
+            (row, Some(watcher), idx)
         }
         None => match inner.resolve_recipient_last_known(&params.agent) {
-            Some((_, row)) => (row, None),
+            Some((idx, row)) => (row, None, idx),
             None => {
                 debug!(agent = %params.agent, "state report for unknown agent dropped");
                 return Ok(json!({"applied": false, "reason": "unknown_agent"}));
@@ -251,7 +251,7 @@ pub(crate) async fn handle_report(
     // sensors to reconcile; the stored reading waits for reattach.
     let live = watcher.is_some();
     if let Some(w) = watcher {
-        fusion::recompute_pane(inner, &w, &pane_id, false, "hook_report").await;
+        fusion::recompute_pane(inner, session_idx, &w, &pane_id, false, "hook_report").await;
     }
 
     Ok(json!({"applied": true, "matched": matched, "state": mapped, "live": live}))

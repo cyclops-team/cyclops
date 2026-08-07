@@ -46,10 +46,18 @@ fn synthetic(i: u64) -> Entry {
             state: DeliveryState::DeliveredVerified,
             cause: None,
         },
+        // Alternated rather than constant: consecutive entries for the same
+        // pane land 35 apart (lcm(5, 7)), an odd step, so `i % 2` flips
+        // between them every time and none of the 10,000 is a same-state
+        // repeat `Record::ingest` would now dedupe out of the ring.
         2 => EntryKind::State {
             target: format!("agent{}", i % 7),
             pane_id: Some(format!("%{}", i % 7)),
-            state: AgentState::Working,
+            state: if i.is_multiple_of(2) {
+                AgentState::Working
+            } else {
+                AgentState::IdleWithInput
+            },
         },
         _ => EntryKind::Gate {
             to: format!("agent{}", i % 7),

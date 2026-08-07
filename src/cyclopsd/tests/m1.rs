@@ -292,6 +292,14 @@ async fn modal_without_auto_dismiss_holds_and_notifies() {
     let msg_id = result["msg_id"].as_str().unwrap().to_string();
     // Unresolved inside the receipt window: reported queued, never a lie.
     assert_eq!(result["deliveries"][0]["state"], "queued", "{result}");
+    assert_eq!(result["deliveries"][0]["held_by"], "blocked", "{result}");
+    assert!(
+        !result["deliveries"][0]["held_by"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("fake_trust_modal"),
+        "manifest rule ids must not cross the receipt boundary: {result}"
+    );
 
     // The hold is announced to the admin, naming the rule, and the
     // delivery stays in gating (no decline keys are ever sent).
@@ -437,6 +445,11 @@ async fn fifo_ordering_after_busy_target_goes_idle() {
         ids.push(r["msg_id"].as_str().unwrap().to_string());
         assert_eq!(r["deliveries"][0]["state"], "queued", "{r}");
         positions.push(r["deliveries"][0]["position"].as_u64());
+        if n == 0 {
+            assert_eq!(r["deliveries"][0]["held_by"], "working", "{r}");
+        } else {
+            assert!(r["deliveries"][0]["held_by"].is_null(), "{r}");
+        }
         if n > 0 {
             // Busy path: immediate queued receipt with the queue depth.
             // Well under the 4000ms window above, so a pass means the
@@ -531,12 +544,18 @@ async fn broadcast_fans_out_and_missing_recipient_needs_attention() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn verification_failure_retries_once_then_needs_attention() {
+async fn verification_failure_after_a_successful_paste_never_repastes() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
-    let mut rig = Rig::new("retry", BAD_VERIFY_MANIFEST, "cat", "").await;
+    let mut rig = Rig::new(
+        "retry",
+        BAD_VERIFY_MANIFEST,
+        "sh -c 'stty -echo; exec cat'",
+        "",
+    )
+    .await;
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "flaky").await;
 
@@ -549,8 +568,8 @@ async fn verification_failure_retries_once_then_needs_attention() {
         "{result}"
     );
 
-    // Exactly one bounded retry: two pasting attempts, then attention and
-    // an admin notification. Never a loop.
+    // Verification follows a successful paste. Even with one configured
+    // retry, the write's terminal outcome is ambiguous and must not repeat.
     let lines = rig.ledger_lines();
     let pastes = lines
         .iter()
@@ -558,7 +577,22 @@ async fn verification_failure_retries_once_then_needs_attention() {
             l["kind"] == "state" && l["id"] == msg_id.as_str() && l["data"]["to_state"] == "pasting"
         })
         .count();
-    assert_eq!(pastes, 2, "expected exactly 2 attempts");
+    assert_eq!(pastes, 1, "an ambiguous write must never be pasted twice");
+    let screen = rig.tmux.capture(&pane);
+    assert_eq!(
+        screen
+            .matches(&format!("[cyclops {msg_id}] FROM: admin"))
+            .count(),
+        1,
+        "screen after one paste:\n{screen}"
+    );
+    let final_line = lines
+        .iter()
+        .rev()
+        .find(|l| l["kind"] == "state" && l["id"] == msg_id.as_str())
+        .expect("final state line");
+    assert_eq!(final_line["data"]["cause"], "verify_failed");
+    assert_eq!(final_line["deliveries"][0]["attempts"], 1);
     assert_eq!(
         rig.final_state(&msg_id, "flaky").as_deref(),
         Some("attention_required")

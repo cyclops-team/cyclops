@@ -139,7 +139,7 @@ first rendered prompt glyph. Verify-before-submit catches this; a blind
 paste-then-Enter would have lost the message silently."""
 
 [context_leak]
-note = """agy auto-read ~/projects/COORDINATION.md and ~/projects/YAHIR.md on the
+note = """agy auto-read ~/projects/COORDINATION.md and ~/projects/NOTES.md on the
 very first turn in a scratch directory, i.e. it walks up beyond the working
 directory for context files. Worth knowing before running agents in scratch
 dirs under a shared parent."""

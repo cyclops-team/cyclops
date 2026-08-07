@@ -44,7 +44,7 @@ folder_tracked = []
 | `tmux_config` | Optional tmux config path passed with `-f`. |
 | `theme` | Active theme name. `cyclops theme <name>` updates it safely. |
 | `chrome` | `"on"` or `"off"`; controls Cyclops-owned tmux border decoration. |
-| Delivery timing keys | ACK, retry, receipt, and held-delivery notification settings shown above. |
+| Delivery timing keys | ACK, receipt, and held-delivery notification settings; `delivery_retry_max` retries only failures proven before any payload bytes reach the pane. |
 
 The full-screen workspace maintains `[workspace]` preferences, including
 the sidebar's visibility, width, and selected tab (`"sessions"` or

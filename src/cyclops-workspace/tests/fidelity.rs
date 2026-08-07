@@ -276,6 +276,8 @@ fn the_alternate_screen_redraws_and_exits_back_to_hydrated_content() {
         cursor_x: 5,
         cursor_y: 0,
         alternate_on: false,
+        mouse_on: false,
+        mouse_sgr: false,
     });
     assert_eq!(rt.snapshot().row_texts()[0], "shell");
 
@@ -307,6 +309,8 @@ fn hydrating_an_alternate_capture_lands_in_the_alternate_buffer() {
         cursor_x: 3,
         cursor_y: 0,
         alternate_on: true,
+        mouse_on: false,
+        mouse_sgr: false,
     });
     assert_eq!(rt.snapshot().row_texts()[0], "TUI");
 

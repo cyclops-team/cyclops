@@ -74,8 +74,10 @@ job).
 
 `resources/manifests/` and `resources/layouts/` are also compiled into the `cyclops` binary
 with `include_str!`, so a fresh install works before it has any files.
-`cyclops start` writes them into the home and never overwrites what is
-there, because an edited manifest is worth more than the shipped guess.
+The bare `cyclops` front door and `cyclops start` seed the shipped manifests
+into the home and never overwrite an edit, because an edited manifest is
+worth more than the shipped guess. Layout presets remain compiled data; they
+are applied by `cyclops start` when it builds a workspace.
 
 ## Where to start reading
 
@@ -91,6 +93,7 @@ its own home, and cleans both up.
 
 Then [QUICKSTART.md](../guides/QUICKSTART.md) for the two-agent walk with your own
 CLIs. Development loop and gates: [CONTRIBUTING.md](../../CONTRIBUTING.md).
+Preparing a release demo: [DEMO_DAY_CHECKLIST.md](../../DEMO_DAY_CHECKLIST.md).
 
 ### Explain how a message becomes a verified receipt
 
@@ -196,8 +199,12 @@ tells you where to look:
 | `no_such_pane`, `pane_dead`, `session_detached` | The target is not there | The pane table: `cyclops status` |
 | `pane_in_mode`, `working`, `idle_with_input`, `blocked:<rule id>`, `blocked_quota` | The gate is holding on purpose | Fusion: is the state right? `cyclops read <pane>` |
 | `no_manifest` | Nothing bound to the pane | The manifest's `process_names` versus what the pane is actually running |
-| `verify_failed` | The paste did not stage | The manifest's `verify_pattern`, and whether the composer is where you think |
-| `pane_rebound` | The occupant changed between admit and inject | Something restarted in that pane. Working as intended |
+| `paste_failed` | The paste command's reply was lost or failed after tmux may have applied it | Inspect the named pane and composer before resending |
+| `verify_failed` | Paste readback is inconclusive; the payload may have landed | Inspect the manifest's `verify_pattern` and the named pane before resending |
+| `pane_rebound` | The occupant changed before the payload write | Something restarted in that pane; the bounded retry re-enters the gate |
+| `pane_rebound_after_paste` | The pane changed after staged input reached the original occupant | Inspect the original pane before resending; Cyclops never retries this cause |
+| `submit_failed` | Enter may have reached the original occupant before its reply was lost | Inspect the named pane and composer before resending |
+| `ack_timeout` | The submit may have started a turn but no ACK arrived in time | Inspect the named pane and recipient state before resending |
 
 The thing to internalize: **a hold is waiting on an event, never on a
 clock.** So "it is stuck" is always the question "which event never
@@ -234,8 +241,8 @@ clients. tmux is eliminated and you control everything.
 
 **Why:** the cost was bounded with real numbers rather than argued. zmx
 does PTY persistence ALONE in 7.4k lines of Zig; herdr does the full job in
-around 206k lines of Rust, with a vendored VT engine, a patched pty crate,
-and a funded full-time maintainer. That option scored 3.40 against the
+around 206k lines of Rust, with a vendored VT engine and a patched pty
+crate. That option scored 3.40 against the
 tmux-backed design's 4.15, and it was killed by implementation cost and by
 having to rebuild observability tmux already provides. The agents are also
 already running in the user's tmux, with their config, keybindings,
@@ -425,3 +432,8 @@ maintained. Two worth knowing on day one because they look like bugs:
 - **`cyclops start` cannot tell two same-shaped arrangements apart** when
   the daemon holds no names for the session. Naming one pane closes it.
   Grid topology alone genuinely cannot answer it.
+
+One process document lives outside `docs/`:
+[DEMO_DAY_CHECKLIST.md](../../DEMO_DAY_CHECKLIST.md) is the working
+checklist for the public launch pass, kept at the root while that work is
+in flight.

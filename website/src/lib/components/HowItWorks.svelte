@@ -5,17 +5,14 @@
 	const steps = [
 		{
 			n: '01',
-			title: 'Start a workspace',
-			body: 'Start the coding agents you already use inside one Cyclops workspace.',
-			snippet: [
-				{ cls: 'dim', text: '$ cyclops start' },
-				{ cls: 'ok', text: '✔ workspace ready · 3 agents' }
-			]
+			title: 'Open the workspace',
+			body: 'Run cyclops to open the full-screen workspace — it starts a tmux session and the daemon if none are running.',
+			snippet: [{ cls: 'dim', text: '$ cyclops' }]
 		},
 		{
 			n: '02',
-			title: 'Name each pane',
-			body: 'Give each agent a stable address so every request reaches the intended terminal.',
+			title: 'Talk to your agents',
+			body: 'Start the coding agents you already use in its panes, name them, then just ask naturally.',
 			snippet: [
 				{ cls: 'dim', text: '$ cyclops name %1 reviewer' },
 				{ cls: 'ok', text: '✔ named reviewer · %1' }
@@ -23,8 +20,8 @@
 		},
 		{
 			n: '03',
-			title: 'Send a request',
-			body: 'Send structured requests between agents and verify they reach the intended terminal.',
+			title: 'Agents coordinate for you',
+			body: 'Agents run the handoff through the cyclops CLI underneath, and the workspace shows the receipt.',
 			snippet: [
 				{ cls: 'dim', text: '$ cyclops send reviewer \\' },
 				{ cls: 'dim', text: '  --subject "Review the rate limiter"' },
