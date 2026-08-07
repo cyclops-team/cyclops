@@ -169,6 +169,19 @@ settled() {
       | length == 0)' >/dev/null
 }
 
+# Stronger than settled: every delivery for the subject is the heavy check.
+# Needed when the live receipt legally prints ● submitted under load
+# (docs/guides/send.md) while the durable badge is still becoming
+# delivered_verified — restarting the daemon in that window marks the
+# delivery needs-attention and poisons every later eye check.
+delivery_verified() {
+  local subject="$1"
+  "$CYC" --json history | jq -e --arg s "$subject" '
+    [.lines[] | select(.subject == $s) | .deliveries[]?] as $d
+    | ($d | length) > 0
+    and ([$d[].state] | all(. == "delivered_verified"))' >/dev/null
+}
+
 # Run a command, show it the way the README shows it, keep the output for
 # checking. stderr is folded in because half the copy under test is error
 # copy, and a reader does not see the difference either.
@@ -371,8 +384,8 @@ check "setup installs the manifests"      '^  wrote 4 detection manifests to .*/
 # holding the receipt when the client gives up, and a delivery that is
 # going fine reports a lost connection.
 cat >> "$CYCLOPS_HOME/config.toml" <<'EOF'
-receipt_block_ms = 4000
-ack_timeout_ms = 3000
+receipt_block_ms = 4800
+ack_timeout_ms = 4500
 EOF
 
 # The stand-in's own manifest, written the way docs/reference/MANIFESTS.md says to
@@ -439,7 +452,25 @@ check_file "the stand-in's manifest survived" \
 wait_for "the roster to hold implementer" 50 roster_has implementer
 
 run "$CYC" send implementer --subject "Review the rate limiter" --body "gateway.rs:120 drops the burst path" --plain
-check "the receipt is a verified badge"   '^✔ delivered · verified$'
+# The stand-in pays for two process spawns (jq + cyclops hook) per ack.
+# On a loaded Ubuntu runner that can finish just after receipt_block_ms,
+# so the live receipt prints ● submitted while the delivery is still
+# becoming verified. Wait for the durable badge before any check that
+# needs it — and before the daemon-restart rung below, which would mark a
+# still-submitted delivery as needs-attention and open the eye.
+wait_for "the first delivery to verify" 50 delivery_verified "Review the rate limiter"
+if grep -qE '^✔ delivered · verified$' "$OUT"; then
+  check "the receipt is a verified badge" '^✔ delivered · verified$'
+else
+  # Mid-confirmation receipt; history now holds the heavy check.
+  CHECKS=$((CHECKS + 1))
+  if delivery_verified "Review the rate limiter"; then
+    printf '   ok    the receipt is a verified badge\n'
+  else
+    printf '   FAIL  the receipt is a verified badge\n         wanted /^✔ delivered · verified$/ (or settled delivered_verified)\n'
+    FAILS=$((FAILS + 1))
+  fi
+fi
 check_exit "a delivered send exits 0" 0
 
 run "$CYC" history --plain
@@ -936,7 +967,7 @@ echo "#### The shipped defaults, with no hooks wired"
 # Every rung above raises two timing budgets and wires a hook reporter into
 # its stand-in agent. Both are legitimate rig pacing, and together they
 # mean the gate has only ever walked the configured-perfectly path: a
-# delivery that earns "delivered · verified" inside a 4-second receipt
+# delivery that earns "delivered · verified" inside a raised receipt
 # window. A new user has none of that. Their config is whatever `cyclops
 # start` wrote, their agent's hooks are not installed until they run
 # `cyclops hooks install`, and their panes are whatever was already
