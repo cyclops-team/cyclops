@@ -1188,8 +1188,12 @@ echo "#### The update docs/guides/install.md documents"
 # update` as last committed, and a change to the verb that exists only
 # as uncommitted work fails the second run below until it lands. CI runs
 # on the commit, where the two are the same tree.
+# --depth=1 is not an optimization: a CI checkout is a shallow clone, and
+# a full fetch from one is refused ("shallow roots are not allowed to be
+# updated"), which is why this passed on a developer's full clone and
+# failed on both CI runners. A shallow fetch works against either.
 git init -q "$ROOT/remote" 2>/dev/null
-git -C "$ROOT/remote" fetch -q "$REPO" HEAD
+git -C "$ROOT/remote" fetch -q --depth=1 "$REPO" HEAD
 git -C "$ROOT/remote" checkout -q -B parity-update FETCH_HEAD
 git -C "$ROOT/remote" -c user.name=parity -c user.email=parity@invalid \
   commit -q --allow-empty -m "parity: one commit past the installed build"
