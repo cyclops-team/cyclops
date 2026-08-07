@@ -735,6 +735,15 @@ pub struct Record {
     entries: VecDeque<Entry>,
     next_uid: u64,
     attention: Attention,
+    /// The newest state ingested per pane, keyed the way
+    /// [`cyclops_proto::attention::observe_agent`] keys the register
+    /// (`cyclops_proto::agent_key`). What `ingest` dedupes a State line
+    /// against: the zombie-watcher bug this guards against re-emits the
+    /// surviving watcher's own last reading once a second under a fresh
+    /// `prior=None`, and nothing about the daemon's wire shape tells a
+    /// repeat apart from a real transition except that the two are
+    /// identical.
+    last_agent_state: HashMap<String, AgentState>,
 }
 
 impl Default for Record {
@@ -749,6 +758,7 @@ impl Record {
             entries: VecDeque::new(),
             next_uid: 1,
             attention: Attention::default(),
+            last_agent_state: HashMap::new(),
         }
     }
 
@@ -843,7 +853,32 @@ impl Record {
     /// run, which is what lets a caller anchor a selection or a scroll
     /// position by uid across an update instead of an index into a ring
     /// that evicts.
+    ///
+    /// A State line that says exactly what `last_agent_state` already holds
+    /// for that pane is dropped before either happens: a duplicate must
+    /// never consume a uid, and it must never occupy a ring slot that a
+    /// real transition or a firehose reader would otherwise get. PaneGone
+    /// clears the pane's entry so a pane that comes back under the same id
+    /// is judged fresh rather than against a reading from its previous
+    /// life.
     fn ingest(&mut self, mut e: Entry) {
+        match &e.kind {
+            EntryKind::State {
+                target,
+                pane_id,
+                state,
+            } => {
+                let key = cyclops_proto::agent_key(target, pane_id.as_deref()).to_string();
+                if self.last_agent_state.get(&key) == Some(state) {
+                    return;
+                }
+                self.last_agent_state.insert(key, *state);
+            }
+            EntryKind::PaneGone { pane_id } => {
+                self.last_agent_state.remove(pane_id);
+            }
+            _ => {}
+        }
         e.uid = self.next_uid;
         self.next_uid += 1;
         if self.entries.len() == RING_CAP {
@@ -955,6 +990,30 @@ impl Record {
                 None,
                 Resolved { was: item, how },
             ));
+        }
+        // 4. The dedup map has to move with the register it guards, for
+        // every pane `out` did not just write a fresh State line for. A
+        // pane whose alarm turned into the clearance just pushed above
+        // leaves no State line behind (a clearance is not one), so without
+        // this the map would keep saying "blocked" after the register
+        // itself says otherwise, and the pane's next real return to that
+        // same blocked state would be dropped as a duplicate of a reading
+        // the register no longer holds. Panes step 2 DID write a line for
+        // are excluded here on purpose: that line sets the map itself the
+        // moment the caller replays it, and setting it here first would
+        // make `ingest` mistake that very line for the duplicate it is not.
+        let just_written: HashSet<&str> = out
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::State { pane_id, .. } => pane_id.as_deref(),
+                _ => None,
+            })
+            .collect();
+        for pane in panes {
+            if !just_written.contains(pane.pane_id.as_str()) {
+                self.last_agent_state
+                    .insert(pane.pane_id.clone(), pane.state);
+            }
         }
         out
     }
@@ -1722,6 +1781,174 @@ mod tests {
             other => panic!("expected a Cleared row, got {other:?}"),
         }
         assert_eq!(record.attention_count(), 0, "the live idle cleared it");
+    }
+
+    /// The zombie-watcher bug this guards against: a dead watcher's stale
+    /// recompute re-emits the same reading a live watcher already reported,
+    /// once a second, forever. Replayed (a ledger written by that bug) or
+    /// live (the daemon still running it), the second copy must not land.
+    #[test]
+    fn replaying_two_identical_blocked_lines_admits_exactly_one() {
+        let mut r = Record::new();
+        r.replay(state_entry(
+            1_000,
+            "reviewer",
+            "%1",
+            AgentState::BlockedPermission,
+        ));
+        r.replay(state_entry(
+            2_000,
+            "reviewer",
+            "%1",
+            AgentState::BlockedPermission,
+        ));
+        assert_eq!(r.len(), 1, "the duplicate must not occupy a ring slot");
+        // Nor a uid: the next distinct line still gets uid 2.
+        r.replay(state_entry(3_000, "reviewer", "%1", AgentState::Idle));
+        let uids: Vec<u64> = r.entries().map(|e| e.uid).collect();
+        assert_eq!(
+            uids,
+            vec![1, 2],
+            "the dropped duplicate must not consume a uid"
+        );
+    }
+
+    #[test]
+    fn living_two_identical_blocked_lines_admits_exactly_one() {
+        let mut r = Record::new();
+        r.live(state_entry(
+            1_000,
+            "reviewer",
+            "%1",
+            AgentState::BlockedPermission,
+        ));
+        r.live(state_entry(
+            2_000,
+            "reviewer",
+            "%1",
+            AgentState::BlockedPermission,
+        ));
+        assert_eq!(r.len(), 1);
+        assert_eq!(
+            r.attention_count(),
+            1,
+            "the register still counts the one pane, not two"
+        );
+    }
+
+    /// The dedup answers by state, not by pane: a real transition and back
+    /// again is two rows a reader must see, with the clearance that ended
+    /// the first one sitting between them.
+    #[test]
+    fn a_real_blocked_working_blocked_cycle_admits_both_blocked_rows() {
+        let mut r = Record::new();
+        r.live(state_entry(
+            1_000,
+            "reviewer",
+            "%1",
+            AgentState::BlockedPermission,
+        ));
+        let cleared = r.live(state_entry(2_000, "reviewer", "%1", AgentState::Working));
+        assert!(
+            cleared.is_some(),
+            "working must end the first blocked alarm"
+        );
+        r.live(state_entry(
+            3_000,
+            "reviewer",
+            "%1",
+            AgentState::BlockedPermission,
+        ));
+
+        let rows: Vec<&Entry> = r.entries().collect();
+        assert_eq!(
+            rows.len(),
+            4,
+            "both blocked rows and the clearance between them must all land"
+        );
+        assert!(matches!(&rows[0].kind, EntryKind::State { state, .. } if state.is_blocked()));
+        assert!(matches!(&rows[1].kind, EntryKind::State { state, .. } if !state.is_blocked()));
+        assert!(matches!(&rows[2].kind, EntryKind::Cleared { .. }));
+        assert!(matches!(&rows[3].kind, EntryKind::State { state, .. } if state.is_blocked()));
+    }
+
+    /// The scenario the seed overwrite exists for: a replayed tail ends
+    /// on a blocked reading, the daemon's answer says the pane moved on,
+    /// and the record only gets a clearance line for that (never a State
+    /// line, since an unblocked pane is not an attention item). Without
+    /// the seed also syncing the dedup map, the map would still say
+    /// blocked, and the pane's next real return to it would be silently
+    /// dropped as a duplicate of a reading the register no longer holds.
+    #[test]
+    fn seed_overwrites_the_dedup_map_so_the_next_real_blocked_line_lands() {
+        let mut r = Record::new();
+        r.replay(state_entry(
+            1_000,
+            "reviewer",
+            "%1",
+            AgentState::BlockedPermission,
+        ));
+        let seeded = r.seed(
+            &[PaneSnapshot {
+                pane_id: "%1".into(),
+                name: "reviewer".into(),
+                state: AgentState::Idle,
+            }],
+            &[],
+        );
+        for e in seeded {
+            r.replay(e);
+        }
+        let before = r.len();
+        r.live(state_entry(
+            2_000,
+            "reviewer",
+            "%1",
+            AgentState::BlockedPermission,
+        ));
+        assert_eq!(
+            r.len(),
+            before + 1,
+            "the seed must not leave the map saying blocked forever"
+        );
+        assert_eq!(r.attention_count(), 1);
+    }
+
+    /// A pane that leaves the table and comes back under the same id (a
+    /// respawn, a session detach/reattach cycle) is judged fresh: its old
+    /// reading must not stand in for its new one.
+    #[test]
+    fn pane_gone_clears_the_dedup_key_so_a_recreated_pane_is_judged_fresh() {
+        let mut r = Record::new();
+        r.live(state_entry(
+            1_000,
+            "reviewer",
+            "%1",
+            AgentState::BlockedPermission,
+        ));
+        r.live(Entry {
+            uid: 0,
+            ts: 2_000,
+            seq: None,
+            id: None,
+            kind: EntryKind::PaneGone {
+                pane_id: "%1".into(),
+            },
+        });
+        r.live(state_entry(
+            3_000,
+            "reviewer",
+            "%1",
+            AgentState::BlockedPermission,
+        ));
+        let blocked_rows = r
+            .entries()
+            .filter(|e| matches!(&e.kind, EntryKind::State { state, .. } if state.is_blocked()))
+            .count();
+        assert_eq!(
+            blocked_rows, 2,
+            "the pane's return under the same id must not be judged a duplicate"
+        );
     }
 
     fn state_entry(ts: u64, target: &str, pane_id: &str, state: AgentState) -> Entry {
