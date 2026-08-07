@@ -130,11 +130,27 @@ pub use cyclops_proto::state_words;
 /// drifts. "no manifest" was that drift, and it also failed the GOALS test
 /// on its own, because a reader hitting it for the first time has no idea
 /// what a manifest is.
+pub fn is_after_write_cause(cause: &str) -> bool {
+    matches!(
+        cause,
+        "paste_failed"
+            | "verify_failed"
+            | "pane_rebound_after_paste"
+            | "submit_failed"
+            | "ack_timeout"
+    )
+}
+
 pub fn cause_words(cause: &str) -> String {
     match cause {
         "no_such_pane" => "no pane with that name".into(),
         "no_manifest" => "nothing detects its pane".into(),
         "daemon_restart" => "daemon restarted mid-delivery".into(),
+        "paste_failed" => "outcome unknown: paste may have reached the pane".into(),
+        "verify_failed" => "outcome unknown: paste verification failed".into(),
+        "pane_rebound_after_paste" => "outcome unknown: the pane changed after paste".into(),
+        "submit_failed" => "outcome unknown: submit may have reached the pane".into(),
+        "ack_timeout" => "outcome unknown: confirmation timed out".into(),
         _ => cause.replace('_', " "),
     }
 }
@@ -165,9 +181,12 @@ pub fn receipt_badge(r: &DeliveryReceipt, paint: &dyn Paint) -> String {
     let sep = paint.dim("·");
     let with = |head: &str, tail: &str| format!("{head} {sep} {}", paint.dim(tail));
     let words = match r.state {
-        DeliveryState::Queued => match r.position {
-            Some(n) => with("● queued", &format!("{n} ahead")),
-            None => "● queued".into(),
+        DeliveryState::Queued => match r.held_by.as_deref() {
+            Some(held) => with("● held", held_words(held)),
+            None => match r.position {
+                Some(n) => with("● queued", &format!("{n} ahead")),
+                None => "● queued".into(),
+            },
         },
         DeliveryState::Gating => "● gating".into(),
         DeliveryState::Pasting => "● pasting".into(),
@@ -195,6 +214,20 @@ pub fn receipt_badge(r: &DeliveryReceipt, paint: &dyn Paint) -> String {
     paint.badge(r.state, &words)
 }
 
+/// Human wording for the stable `DeliveryReceipt::held_by` tokens. Unknown
+/// tokens degrade safely instead of exposing a vendor rule id.
+fn held_words(token: &str) -> &'static str {
+    match token {
+        "working" => "recipient working",
+        "idle_with_input" => "composer has input",
+        "pane_in_mode" => "pane in copy mode",
+        "session_detached" => "session detached",
+        "blocked" => "waiting for a decision",
+        "unknown" => "target state unknown",
+        _ => "target state unknown",
+    }
+}
+
 /// Badge for a delivery transition, folded from the recorded state and
 /// cause: the same badge a receipt wears, fed from a record line instead
 /// of a send.
@@ -214,6 +247,7 @@ pub fn delivery_badge(
             state,
             position: None,
             note,
+            held_by: None,
             // A record line names the recipient, not the pane it lived in.
             pane: None,
         },
@@ -264,6 +298,7 @@ mod tests {
             position,
             note: note.map(String::from),
             pane: None,
+            held_by: None,
         }
     }
 
@@ -303,6 +338,20 @@ mod tests {
         for (r, want) in &cases {
             assert_eq!(receipt_badge(r, &Plain), *want);
         }
+
+        for (token, want) in [
+            ("working", "● held · recipient working"),
+            ("idle_with_input", "● held · composer has input"),
+            ("pane_in_mode", "● held · pane in copy mode"),
+            ("session_detached", "● held · session detached"),
+            ("blocked", "● held · waiting for a decision"),
+            ("unknown", "● held · target state unknown"),
+            ("blocked:vendor_rule", "● held · target state unknown"),
+        ] {
+            let mut r = receipt(Queued, Some(0), None);
+            r.held_by = Some(token.into());
+            assert_eq!(receipt_badge(&r, &Plain), want);
+        }
     }
 
     #[test]
@@ -325,6 +374,23 @@ mod tests {
             ),
             "⊘ parked · quota"
         );
+    }
+
+    #[test]
+    fn after_write_causes_say_outcome_is_unknown() {
+        for cause in [
+            "paste_failed",
+            "verify_failed",
+            "pane_rebound_after_paste",
+            "submit_failed",
+            "ack_timeout",
+        ] {
+            assert!(is_after_write_cause(cause), "{cause}");
+            let words = cause_words(cause);
+            assert!(words.contains("outcome unknown"), "{cause}: {words}");
+            assert!(!words.contains("did not get"), "{cause}: {words}");
+        }
+        assert!(!is_after_write_cause("spool_failed"));
     }
 
     #[test]

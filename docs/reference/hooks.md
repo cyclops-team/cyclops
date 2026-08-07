@@ -12,31 +12,62 @@ prepare, wire, prove.
 cyclops hooks install claude --agent reviewer
 ```
 
-Renders the hook config to `~/.cyclops/hooks/<label>/` and prints
-copy-pasteable wiring instructions. `--dry-run` prints without writing,
-`--dest <dir>` picks another directory. Cyclops refuses to write into
-`~/.claude`, `~/.codex`, `~/.gemini`, or any `.agents` or `.cursor`
-directory: you wire your real setup once, deliberately. Templates live in
-`resources/hooks/` in the repo.
+Renders a neutral artifact and prints wiring instructions. The default paths
+are vendor-isolated, so preparing one vendor cannot replace another vendor's
+same-named file:
+
+```
+$CYCLOPS_HOME/hooks/claude/<label>/settings.json
+$CYCLOPS_HOME/hooks/codex/<label>/hooks.json
+$CYCLOPS_HOME/hooks/agy/<label>/hooks.json
+$CYCLOPS_HOME/hooks/cursor/<label>/hooks.json
+```
+
+For example, `cyclops hooks install codex --agent reviewer` prepares
+`$CYCLOPS_HOME/hooks/codex/reviewer/hooks.json`. `--dry-run` prints without
+writing, and `--dest <dir>` remains an explicit directory: the selected
+vendor file is written directly inside that directory. Cyclops refuses to
+write into `~/.claude`, `~/.codex`, `~/.gemini`, or any `.agents` or `.cursor`
+directory: you wire your real setup once, deliberately. The prepare uses a
+same-directory temporary file and atomic rename, so an interrupted write
+cannot leave partial JSON. Templates live in `resources/hooks/` in the repo.
 
 Wiring per CLI:
 
-- **claude**: launch with `--settings ~/.cyclops/hooks/<label>/settings.json`,
-  or merge the `hooks` object into the settings file you already pass.
+- **claude**: launch with `--settings
+  $CYCLOPS_HOME/hooks/claude/<label>/settings.json`, or merge its `hooks`
+  object into the settings file you already pass. Preserve every unrelated
+  setting and handler; do not replace an existing shared file.
 - **codex**: codex silently loads zero hooks in an untrusted directory, and
-  `--dangerously-bypass-hook-trust` does not fix that. Either copy the
-  rendered `hooks.json` to `$CODEX_HOME/hooks.json` (user level loads
-  without directory trust), or seed trust in `config.toml`:
-  `[projects."<dir>"]` with `trust_level = "trusted"`.
-- **agy**: copy the rendered `hooks.json` to `<workspace>/.agents/hooks.json`.
-  agy has no payload-matchable ack, so its deliveries stay screen-verified;
-  these hooks feed liveness and turn detection.
-- **cursor**: copy the rendered `hooks.json` to `<workspace>/.cursor/hooks.json`
-  or `~/.cursor/hooks.json` (both load). `CURSOR_CONFIG_DIR` relocates
-  `cli-config.json` but not `hooks.json`: a file placed there fires zero
-  events, so never wire it that way. Unlike agy, cursor's `beforeSubmitPrompt`
-  carries the full prompt text, a payload-matchable ack, so its deliveries
-  reach the verified tier.
+  `--dangerously-bypass-hook-trust` does not fix that. If
+  `$CODEX_HOME/hooks.json` does not exist, copy the prepared artifact there.
+  If it exists, merge only Cyclops' event entries and preserve every
+  unrelated key and handler; never overwrite it. After merging, open Codex's
+  `/hooks` and review and trust the exact Cyclops command definition; new or
+  changed commands are skipped until that exact definition is trusted. For
+  project-local hooks, also trust the project config layer in
+  `$CODEX_HOME/config.toml`: `[projects."<dir>"]` with
+  `trust_level = "trusted"`. Reload behavior depends on the Codex version; if
+  the running process does not pick up the merged file or trust decision,
+  restart or reload Codex, then run the selftest.
+- **agy**: if `<workspace>/.agents/hooks.json` does not exist, copy the
+  rendered artifact there. If it exists, merge only Cyclops' event entries,
+  preserving every unrelated key and handler; never overwrite it. agy has no
+  payload-matchable ack, so its deliveries stay screen-verified; these hooks
+  feed liveness and turn detection.
+- **cursor**: if `<workspace>/.cursor/hooks.json` or `~/.cursor/hooks.json`
+  does not exist, copy the rendered artifact there. If it exists, merge only
+  Cyclops' event entries, preserving every unrelated key and handler; never
+  overwrite it. `CURSOR_CONFIG_DIR` relocates `cli-config.json` but not
+  `hooks.json`: a file placed there fires zero events, so never wire it that
+  way. Unlike agy, cursor's `beforeSubmitPrompt` carries the full prompt text,
+  a payload-matchable ack, so its deliveries reach the verified tier.
+
+For every vendor, a missing destination can receive the prepared file. An
+existing destination must be merged by hand so existing handlers and unrelated
+configuration survive. Configuration alone is not proof: finish by running
+`cyclops hooks verify <label>` or `cyclops hooks selftest <label>`. If a vendor
+reload is needed, run the selftest after reloading or restarting it.
 
 ## Verify (did edges ever arrive?)
 

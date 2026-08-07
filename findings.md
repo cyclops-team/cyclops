@@ -843,3 +843,34 @@ neutral fills at the opposite luminance extreme to the theme's own
 panel (`matched_ground` in src/cyclops-workspace/src/render/mod.rs),
 the readability floor sets their text, and the same pane stays native
 in the dark terminal. Pinned by render::contrast_tests.
+
+## F50. Codex 0.147.0 keeps a multiline bracketed paste expanded (MEASURED)
+
+The currently installed Codex CLI no longer reproduced the collapsed
+composer shape audited against 0.146.x. `codex --version` reported
+`codex-cli 0.147.0`; `tmux -V` reported `tmux 3.7b`. In an isolated tmux
+server, a detached 120x40 pane launched both `codex -C <scratch checkout>`
+and `codex --no-alt-screen -C <scratch checkout>`. Each probe pasted
+the same scrubbed 26-line payload (a Cyclops-shaped header, 24 short payload
+lines, and a reply hint) with `set-buffer` followed by `paste-buffer -p`.
+After one second, both `capture-pane -p` and `capture-pane -p -e` showed the
+composer glyph followed by the header and all payload lines. Neither capture
+contained a collapsed placeholder or a `Pasted` chip, and the escaped view
+carried no collapsed-composer SGR boundary to encode.
+
+Probe command shape (the payload text was scrubbed and is not retained):
+
+```text
+tmux -L cyc-codex-live -f /dev/null new-session -d -s codexprobe -x 120 -y 40 /bin/zsh
+codex [--no-alt-screen] -C <scratch checkout>
+tmux -L cyc-codex-live -f /dev/null set-buffer -b cycprobe <multiline payload>
+tmux -L cyc-codex-live -f /dev/null paste-buffer -b cycprobe -t codexprobe:0.0 -d -p
+tmux -L cyc-codex-live -f /dev/null capture-pane -p -t codexprobe:0.0
+tmux -L cyc-codex-live -f /dev/null capture-pane -p -e -t codexprobe:0.0
+```
+
+Conclusion: do not add a regex or scrubbed collapsed-paste fixture for the
+audited 0.146.x shape on this build. This closes work package 2 at the plan's
+explicit stop condition; revisit it only when a current Codex build or payload
+shape actually collapses. The existing Codex ghost/typed rules remain the only
+measured manifest change.

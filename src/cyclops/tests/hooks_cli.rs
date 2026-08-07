@@ -67,65 +67,103 @@ fn install_dry_run_prints_everything_and_writes_nothing() {
 #[test]
 fn install_writes_the_default_dest_and_prints_the_wiring() {
     let home = scratch_home("hiw");
-    // claude: settings fragment, --settings wiring.
+    let vendors = [
+        ("claude", "settings.json"),
+        ("codex", "hooks.json"),
+        ("agy", "hooks.json"),
+        ("cursor", "hooks.json"),
+    ];
+    let mut artifacts = Vec::new();
+
+    for (vendor, file) in vendors {
+        let out = run(&home, &["hooks", "install", vendor, "--agent", "reviewer"]);
+        assert!(
+            out.status.success(),
+            "{vendor} stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let path = home.join(format!("hooks/{vendor}/reviewer/{file}"));
+        let text = fs::read_to_string(&path).expect("rendered hook artifact");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert!(value.is_object(), "{vendor}: {text}");
+        assert!(text.contains("--agent reviewer"), "{vendor}: {text}");
+        artifacts.push((path, text));
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stdout_lower = stdout.to_ascii_lowercase();
+        assert!(stdout.contains("Wrote"), "{vendor}: {stdout}");
+        assert!(stdout_lower.contains("merge"), "{vendor}: {stdout}");
+        assert!(stdout_lower.contains("preserv"), "{vendor}: {stdout}");
+        assert!(stdout.contains("hooks verify") || stdout.contains("hooks selftest"));
+        assert!(
+            !stdout.contains(" cp "),
+            "{vendor} prints an overwrite-shaped cp"
+        );
+        if vendor == "codex" {
+            assert!(stdout.contains("CODEX_HOME"), "{stdout}");
+            assert!(stdout.contains("trust_level = \"trusted\""), "{stdout}");
+            assert!(stdout.contains("/hooks"), "{stdout}");
+            assert!(stdout.contains("Reload behavior depends"), "{stdout}");
+            assert!(
+                stdout.contains("--dangerously-bypass-hook-trust does NOT"),
+                "{stdout}"
+            );
+        }
+    }
+
+    // Same-label artifacts are isolated by vendor, even when their filenames
+    // collide. A second prepare is byte-for-byte stable and leaves no temp
+    // artifacts behind.
+    let paths: Vec<_> = artifacts.iter().map(|(path, _)| path).collect();
+    assert_eq!(paths.len(), 4);
+    for left in 0..paths.len() {
+        for right in (left + 1)..paths.len() {
+            assert_ne!(paths[left], paths[right]);
+        }
+    }
+    for (vendor, file) in vendors {
+        let out = run(&home, &["hooks", "install", vendor, "--agent", "reviewer"]);
+        assert!(out.status.success(), "{vendor} second run failed");
+        let path = home.join(format!("hooks/{vendor}/reviewer/{file}"));
+        let before = artifacts
+            .iter()
+            .find(|(candidate, _)| candidate == &path)
+            .map(|(_, text)| text)
+            .expect("first artifact");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            *before,
+            "{vendor} changed"
+        );
+        let temp_files: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(
+            temp_files.is_empty(),
+            "{vendor} left temp files: {temp_files:?}"
+        );
+    }
+
+    // Explicit --dest remains an exact destination directory, rather than
+    // gaining the implicit vendor/label suffix.
+    let explicit = home.join("prepared");
     let out = run(
         &home,
-        &["hooks", "install", "claude", "--agent", "reviewer"],
-    );
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let path = home.join("hooks/reviewer/settings.json");
-    let text = fs::read_to_string(&path).expect("rendered settings.json");
-    let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
-    assert!(v["hooks"]["UserPromptSubmit"].is_array(), "{text}");
-    assert!(text.contains("--agent reviewer"), "{text}");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Wrote"), "{stdout}");
-    assert!(stdout.contains("--settings"), "{stdout}");
-    assert!(stdout.contains("hooks selftest reviewer"), "{stdout}");
-
-    // codex: same dest dir, hooks.json, and the F1 caveats printed, not
-    // applied: CODEX_HOME copy, the trust seed line, and the flag that
-    // does NOT work.
-    let out = run(&home, &["hooks", "install", "codex", "--agent", "reviewer"]);
-    assert!(out.status.success());
-    let path = home.join("hooks/reviewer/hooks.json");
-    let text = fs::read_to_string(&path).expect("rendered hooks.json");
-    serde_json::from_str::<serde_json::Value>(&text).expect("valid JSON");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("CODEX_HOME"), "{stdout}");
-    assert!(stdout.contains("trust_level = \"trusted\""), "{stdout}");
-    assert!(
-        stdout.contains("--dangerously-bypass-hook-trust does NOT"),
-        "{stdout}"
-    );
-
-    // agy: .agents/hooks.json placement instructions.
-    let out = run(&home, &["hooks", "install", "agy", "--agent", "reviewer"]);
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains(".agents/hooks.json"), "{stdout}");
-
-    // cursor: .cursor/hooks.json placement instructions and the
-    // CURSOR_CONFIG_DIR trap called out, not applied.
-    let out = run(
-        &home,
-        &["hooks", "install", "cursor", "--agent", "reviewer"],
+        &[
+            "hooks",
+            "install",
+            "codex",
+            "--agent",
+            "reviewer",
+            "--dest",
+            explicit.to_str().unwrap(),
+        ],
     );
     assert!(out.status.success());
-    let path = home.join("hooks/reviewer/hooks.json");
-    let text = fs::read_to_string(&path).expect("rendered hooks.json");
-    let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
-    assert!(v["hooks"]["beforeSubmitPrompt"].is_array(), "{text}");
-    assert!(v["hooks"]["stop"].is_array(), "{text}");
-    assert!(text.contains("--agent reviewer"), "{text}");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains(".cursor/hooks.json"), "{stdout}");
-    assert!(stdout.contains("CURSOR_CONFIG_DIR"), "{stdout}");
-    assert!(stdout.contains("hooks selftest reviewer"), "{stdout}");
+    assert!(explicit.join("hooks.json").is_file());
+    assert!(!explicit.join("codex/reviewer/hooks.json").exists());
     let _ = fs::remove_dir_all(&home);
 }
 

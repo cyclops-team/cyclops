@@ -83,8 +83,9 @@ visible; the hold itself keeps waiting on events, never on a timer.
    bracketed-paste degradation is not gateable. The gate is post-paste
    composer verification: capture the bottom region and require the
    manifest's `verify_pattern` with `<message_id>` substituted. agy's first
-   paste after TUI start does not stage (manifest first_paste_caveat);
-   verification failure goes to retry_queued, not silent loss.
+   paste after TUI start does not stage (manifest first_paste_caveat). A
+   failed verification is an ambiguous post-paste outcome: it goes
+   directly to attention_required and is never re-pasted.
 3. Verified: state staged. Send the manifest's submit key (Enter):
    state submitted.
 
@@ -100,12 +101,21 @@ visible; the hold itself keeps waiting on events, never on a timer.
   activity): delivered_unverified (verified_by: screen). A late matching
   hook ACK upgrades delivered_unverified to delivered_verified (legal
   transition, keeps receipts honest).
-- Neither within 5s: retry_queued.
+- Neither within 5s: attention_required with cause `ack_timeout`. Enter may
+  already have been accepted, so the payload is never re-pasted.
 
-### Retry (bounded)
+### Retry (bounded, pre-write only)
 
-One redelivery attempt (validation soak needed zero). Second failure:
-attention_required + admin.notify action_required. Never loop.
+The configured retry budget applies only when the daemon proves that no
+payload bytes reached the pane: a detach or missing manifest before paste, a
+pre-paste occupant rebind, or a spool/load-buffer failure. Those failures
+enter `retry_queued` and re-enter the full gate. A `paste_failed`,
+`verify_failed`, post-paste occupant rebind, `submit_failed`, or `ack_timeout`
+is after the irreversible boundary and goes directly to
+`attention_required` with that exact cause. The ledger therefore preserves
+the attempt boundary and never invites a duplicate paste. `attention_required`
+can mean the terminal outcome is unknown, not that the recipient definitely
+did not receive the message.
 
 ## msg.send semantics (push state, pull context)
 
@@ -193,9 +203,12 @@ sections above are unchanged.
    immediately before the paste and again immediately before the submit
    key: the pane must still exist, be alive, keep the pane_pid it was
    admitted with, and bind to the manifest the gate admitted. Any mismatch
-   moves the delivery to retry_queued (cause: pane_rebound) with a gate
-   ledger line, and the submit key is never sent; the retry re-enters
-   gating and re-evaluates from scratch. Without this, a pane whose
+   A mismatch before the payload write moves the delivery to retry_queued
+   (cause: pane_rebound) with a gate ledger line, and the submit key is never
+   sent; the retry re-enters gating and re-evaluates from scratch. A mismatch
+   after the paste instead ends in attention_required with cause
+   `pane_rebound_after_paste`; the original occupant may already hold the
+   payload, so Cyclops never pastes it again. Without this, a pane whose
    occupant changed between admit and injection (agent exited to a shell,
    another CLI took over) would receive the payload and an Enter, and a
    shell occupant would execute the message text.

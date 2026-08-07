@@ -145,16 +145,34 @@ pub const CAUSE_NO_MANIFEST: &str = "no_manifest";
 ///
 /// The badge names the state and the reason; a reader still has to be told
 /// what became of the message, because "⚠ needs attention" on its own does
-/// not say whether it was delivered. It was not. It is on the record, and
-/// `cyclops status` is where every waiting item is listed with what to do
-/// about it.
+/// not say whether it was delivered. Proven pre-write failures say that it
+/// was not; ambiguous after-write failures direct the reader to inspect
+/// before resending. Both are on the record, and `cyclops status` is where
+/// every waiting item is listed with what to do about it.
 ///
 /// `pane` is set on the one cause whose fix is a command: a pane no
 /// manifest binds. It carries the pin, with the name the pane already
 /// answers to in it, so the line can be pasted whole. Passing the label as
 /// the target would rename an adopted pane to a placeholder, which is why
 /// `cyclops name` takes both and why both are here.
-pub fn needs_attention(to: &str, pane: Option<&str>) -> String {
+/// Follow-up for an unresolved delivery with its exact machine cause. A
+/// failure after the irreversible boundary must not be described as a
+/// proven non-delivery: the operator inspects the named pane before sending
+/// the same logical message again.
+pub fn needs_attention_for(to: &str, pane: Option<&str>, cause: Option<&str>) -> String {
+    if cause.is_some_and(cyclops_ui::grid::is_after_write_cause) {
+        let reason = cause
+            .map(cyclops_ui::grid::cause_words)
+            .unwrap_or_else(|| "outcome unknown".to_string());
+        return match pane {
+            Some(pane) => format!(
+                "{to}'s delivery {reason}. Inspect {pane} and its composer before resending; it is on the record and needs attention."
+            ),
+            None => format!(
+                "{to}'s delivery {reason}. Inspect the recipient pane before resending; it is on the record and needs attention."
+            ),
+        };
+    }
     match pane {
         Some(pane) => format!(
             "{to} did not get this message; it is on the record and needs attention. Teach cyclops what runs in {pane}: {}. cyclops status names the manifests that are loaded, and docs/reference/MANIFESTS.md is how to write one.",
@@ -443,7 +461,7 @@ mod tests {
         for said in [
             unknown_panes(1, "%4", Some("reviewer"), None),
             named_but_undetected("%4", "reviewer"),
-            needs_attention("reviewer", Some("%4")),
+            needs_attention_for("reviewer", Some("%4"), None),
         ] {
             assert!(said.contains(want), "{said}");
         }
@@ -541,15 +559,26 @@ mod tests {
     #[test]
     fn attention_copy_says_the_message_did_not_arrive_and_carries_the_fix() {
         assert_eq!(
-            needs_attention("worker", Some("%1")),
+            needs_attention_for("worker", Some("%1"), None),
             "worker did not get this message; it is on the record and needs attention. Teach cyclops what runs in %1: cyclops name %1 worker --manifest <id>. cyclops status names the manifests that are loaded, and docs/reference/MANIFESTS.md is how to write one."
         );
         // Every other cause: no pin command, because a manifest does not
         // fix a dead pane or a name nobody answers to.
         assert_eq!(
-            needs_attention("ghost", None),
+            needs_attention_for("ghost", None, None),
             "ghost did not get this message. It is on the record and needs attention; cyclops status lists what is waiting on you and what to do about each one."
         );
+    }
+
+    #[test]
+    fn after_write_attention_copy_requires_inspection_before_resend() {
+        let copy = needs_attention_for("worker", Some("%1"), Some("verify_failed"));
+        assert!(copy.contains("outcome unknown"), "{copy}");
+        assert!(
+            copy.contains("Inspect %1 and its composer before resending"),
+            "{copy}"
+        );
+        assert!(!copy.contains("did not get this message"), "{copy}");
     }
 
     #[test]

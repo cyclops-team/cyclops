@@ -29,17 +29,23 @@ Everything sent is queryable later: see [history.md](history.md).
 One badge per recipient. The send blocks while an answer is coming and
 stops blocking when it is not: an idle target holds until the delivery
 resolves, capped at 2.5 s, and a target nothing detects holds only as long
-as the refusal takes (milliseconds). A busy target answers immediately with
-its queue position, because that answer will not change until its turn ends.
+as the refusal takes (milliseconds). A busy target answers immediately; the
+head names its hold reason and followers carry their FIFO position.
 
 | Badge | Meaning |
 |---|---|
 | `✔ delivered · verified` | The recipient's own hook confirmed this exact message arrived. |
 | `✓ delivered · unverified (screen)` | Screen evidence only: the marker left the composer and a turn started. A late hook report upgrades it to verified. |
-| `● queued · 2 ahead` | Nothing has been typed into the pane yet: it is mid-turn, a human is typing, or a dialog is waiting on a human decision (you get alerted). Delivers in order once the pane is ready. |
+| `● queued · 2 ahead` | Another message is ahead of this one. The per-recipient FIFO remains in order. |
+| `● held · recipient working` | This message is the in-flight head, and the recipient is still in a turn. |
+| `● held · composer has input` | The composer contains input, so Cyclops waits rather than concatenating it. |
+| `● held · pane in copy mode` | The pane is in copy mode; leave it there or exit the mode. |
+| `● held · session detached` | The watched session is detached; Cyclops resumes on reattach. |
+| `● held · waiting for a decision` | A modal or permission prompt needs a person. |
+| `● held · target state unknown` | Sensors cannot safely decide the target state yet. |
 | `● submitted` | Rare. The payload is in the pane and the confirmation had not landed when the receipt was printed. The badge lands on `cyclops history` when it does. |
 | `⊘ parked · quota, resets in 135h` | Recipient is out of vendor quota. See below. |
-| `⚠ needs attention · no pane for "reviewer"` | A human must look. The qualifier names why: missing pane, dead pane, nothing detecting the pane, or two failed delivery attempts. |
+| `⚠ needs attention · no pane for "reviewer"` | A human must look. The qualifier names why: missing pane, dead pane, nothing detecting the pane, or a failure whose terminal outcome is unknown. |
 | `⚠ needs attention · nothing detects %4` | The recipient has a name and no manifest matches what runs in its pane, so nothing can be typed into it. See below. |
 
 Verified means proven end to end: the recipient CLI's hook reported the
@@ -87,6 +93,20 @@ cyclops has not met.
 `cyclops history` shows the same delivery as `⚠ needs attention · nothing
 detects its pane`. Same words, minus the pane id: a folded record line
 carries the recipient, not the pane the delivery went to.
+
+## A delivery outcome is unknown
+
+An attention receipt after `pasting`, `staged`, or `submitted` does not prove
+that the recipient missed the message. A paste reply can be lost after tmux
+has applied it, verification can be inconclusive, the pane can change after
+staging, Enter can be accepted before its reply is lost, or the recipient's
+ACK can time out after the turn starts. Cyclops records the exact cause and
+never automatically pastes that logical message again. Inspect the named
+recipient pane and its composer before resending.
+
+Only failures proven before the pane write consume `delivery_retry_max`:
+detach or missing manifest before paste, a pre-paste occupant rebind, and a
+spool/load-buffer failure. A retry re-enters the full gate.
 
 ## Broadcast
 
