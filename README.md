@@ -503,6 +503,7 @@ Otherwise, one page per question.
 | [ARCHITECTURE.md](docs/development/ARCHITECTURE.md) | How the pieces fit |
 | [DELIVERY.md](docs/development/DELIVERY.md) | The delivery spec: states, evidence tiers, ordering |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | The development loop, the demos, and the gates a change must pass |
+| [SECURITY.md](SECURITY.md) | Reporting a vulnerability privately |
 | [INVARIANTS.md](docs/development/INVARIANTS.md) | Eleven rules a change must never break, and what breaks otherwise |
 | [findings.md](findings.md) | The measurements the design rests on, F13 onward, each with the probe that proved it |
 | [CHANGELOG.md](CHANGELOG.md) | What each milestone changed, in the order it shipped |

@@ -1,0 +1,100 @@
+name: Bug report
+description: Something in cyclops or cyclopsd isn't working right
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Found a security vulnerability instead? Don't
+        file it here — see [SECURITY.md](https://github.com/cyclops-team/cyclops/blob/main/SECURITY.md).
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: e.g. macOS 14.5, Ubuntu 22.04
+    validations:
+      required: true
+
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal emulator
+      description: e.g. iTerm2, Alacritty, GNOME Terminal, Windows Terminal
+    validations:
+      required: true
+
+  - type: input
+    id: tmux-version
+    attributes:
+      label: tmux version
+      description: Output of `tmux -V`
+      placeholder: tmux 3.6a
+    validations:
+      required: true
+
+  - type: input
+    id: cyclops-version
+    attributes:
+      label: Cyclops version or commit
+      description: Output of `cyclops --version`
+    validations:
+      required: true
+
+  - type: dropdown
+    id: agent-cli
+    attributes:
+      label: Agent CLI involved
+      description: Which coding agent was running in the pane, if any
+      options:
+        - Claude Code
+        - Codex
+        - Cursor Agent
+        - Antigravity
+        - Other
+        - None / not agent-related
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: What you ran, in order, from a clean state if you can manage it
+      placeholder: |
+        1. cyclops start ...
+        2. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: >
+        `cyclops history` may show what the daemon saw around the time of
+        the bug. Daemon logs and the ledger are also useful if you have
+        them. Paste as text, not a screenshot.
+      render: shell
+
+  - type: checkboxes
+    id: secrets
+    attributes:
+      label: Before you submit
+      options:
+        - label: I checked the logs above for secrets, tokens, and API keys and removed them
+          required: true

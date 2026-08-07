@@ -425,3 +425,8 @@ maintained. Two worth knowing on day one because they look like bugs:
 - **`cyclops start` cannot tell two same-shaped arrangements apart** when
   the daemon holds no names for the session. Naming one pane closes it.
   Grid topology alone genuinely cannot answer it.
+
+One process document lives outside `docs/`:
+[DEMO_DAY_CHECKLIST.md](../../DEMO_DAY_CHECKLIST.md) is the working
+checklist for the public launch pass, kept at the root while that work is
+in flight.
