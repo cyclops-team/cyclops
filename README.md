@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/cyclops-logo.png" alt="Cyclops" width="128" height="128">
+</p>
+
 # Cyclops
 
 **One eye. Many agents. A single coordinated team.**
