@@ -81,7 +81,9 @@ fn run_cyclops(home: &Path, args: &[&str]) -> Output {
 
 /// run_cyclops with extra env vars and optional piped stdin. CYCLOPS_AGENT
 /// is scrubbed first so the developer's shell can't leak an identity into
-/// the hook tests.
+/// the hook tests, and TMUX/TMUX_PANE so a suite run from inside a tmux
+/// pane doesn't put every child "in tmux"; a test that needs a pane sets
+/// TMUX_PANE through `envs`, which land after the scrub.
 fn run_cyclops_io(
     home: &Path,
     envs: &[(&str, &str)],
@@ -91,6 +93,8 @@ fn run_cyclops_io(
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cyclops"));
     cmd.env("CYCLOPS_HOME", home)
         .env_remove("CYCLOPS_AGENT")
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
         .args(args);
     for (k, v) in envs {
         cmd.env(k, v);
