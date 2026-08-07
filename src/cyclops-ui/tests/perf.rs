@@ -53,7 +53,7 @@ fn synthetic(i: u64) -> Entry {
         2 => EntryKind::State {
             target: format!("agent{}", i % 7),
             pane_id: Some(format!("%{}", i % 7)),
-            state: if i % 2 == 0 {
+            state: if i.is_multiple_of(2) {
                 AgentState::Working
             } else {
                 AgentState::IdleWithInput

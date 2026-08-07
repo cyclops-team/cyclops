@@ -47,6 +47,7 @@ than a measurement.
 | F39 | Width fixtures pin VS16 non-widening and SGR 21 as bold-off, so an engine bump fails loudly | binds |
 | F40 | One `list-panes -a` discovers every session, window, and pane; empty sessions cannot exist | binds |
 | F41 | Session fields are reachable from pane lines; the second snapshot command exists for tab-safety, not reachability | binds |
+| F45 | tmux 3.7b's `pause-after` clock only starts once a stalled reader's backlog has actually accumulated past the threshold; a host-contended producer can leave a stalled reader with nothing to pause against for seconds at a time | binds |
 
 ## F13. refresh-client -B subscriptions work in control mode on tmux 3.6a (MEASURED)
 
@@ -729,3 +730,49 @@ perf_contract -- --nocapture`. The test file is
 `src/cyclops-workspace/tests/perf_contract.rs`; the complete recorded table
 and caveats are in
 `.agents/planning/2026-08-03-cyclops-workspace-tui/implementation/baselines.md`.
+
+## F45. tmux 3.7b's `pause-after` clock only starts once a stalled reader's backlog has actually crossed the threshold, not from wall-clock elapsed alone (MEASURED)
+
+`src/cyclops-workspace/tests/perf_contract.rs`'s
+`flow_control_pause_and_resume` stalls its own single-threaded tokio
+runtime for a fixed 2 seconds to reproduce a real `%pause` (see the test's
+own doc comment for why a genuine executor stall is the only bounded way
+to get tmux to emit one against the real `ControlClient`). Under a
+same-machine 12-way parallel stress (12 copies of the same test, each
+running its own isolated `yes flood`), that fixed stall failed to produce
+`%pause` within a further 5-second wait 5/12 and 6/12 tries across two
+batches — "never saw %pause after the stall".
+
+Instrumenting the wait loop to log every notification it saw (not only
+`%pause`) showed the failing runs draining thousands of `%extended-output`
+messages the instant the stall ended, every one at `age_ms` at or near 0 —
+i.e. the control connection was never actually behind once draining
+resumed. This rules out the stall itself failing to block the reader
+(the executor mechanism is sound and reproduces fine standalone); what it
+shows is that `yes flood`'s output had not backed up enough during the
+2-second stall to ever cross `pause-after`'s 1-second-behind threshold in
+the first place, so tmux had nothing to pause. Twelve parallel copies of
+an unbounded flood plus twelve parallel tmux servers is heavy CPU
+contention system-wide; this measurement identifies where the backlog
+went missing (it never accumulated) but not which specific process was
+denied the CPU to produce it — that finer attribution was not chased
+further.
+
+A fixed, single stall length cannot be raised enough to cover this
+reliably, because contention on a shared host is not bounded by anything
+this test controls. What resolved it: retry the stall itself with
+backoff (2s, 4s, 8s, 16s), each retry a fresh, *uninterrupted* block —
+checking for `%pause` in between attempts and then continuing would let
+the reader drain whatever little had queued and reset tmux's "how long
+has this client been behind" clock to zero before the next attempt even
+starts. Across 48 runs of the fixed test under the same 12-, 16-, and
+20-way parallel stress that reproduced the original failure at up to 50%,
+zero failed; most passed on the first (2s) attempt in about 2.3s, and the
+few that needed a retry still passed, up to 24s in the worst observed
+case.
+
+Probe: `env -u TMUX -u TMUX_PANE cargo test -p cyclops-workspace --test
+perf_contract flow_control_pause_and_resume -- --exact --nocapture`, run
+as N parallel copies of the built test binary
+(`target/debug/deps/perf_contract-*`) from a plain shell. The test file is
+`src/cyclops-workspace/tests/perf_contract.rs`.
