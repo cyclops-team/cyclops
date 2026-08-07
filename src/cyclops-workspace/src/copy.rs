@@ -54,6 +54,12 @@ pub const EVENT_STREAM_EMPTY: &str = "No events yet.";
 
 pub const APP_MENU_BUTTON: &str = "☰ menu";
 
+/// The sidebar's tab chips. They name what the body below them shows and
+/// take the place of the plain title the session tree used to carry.
+pub const SIDEBAR_TAB_SESSIONS: &str = "Sessions";
+
+pub const SIDEBAR_TAB_STREAM: &str = "Stream";
+
 /// Named beside the sidebar's create button while the mouse rests on it. A
 /// bare glyph does not say what it makes, and the sidebar is too narrow to
 /// carry the whole phrase at rest.

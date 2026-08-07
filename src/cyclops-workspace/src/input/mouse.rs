@@ -14,6 +14,13 @@ pub enum HitTarget {
     PaneFrame {
         pane_id: String,
     },
+    /// The one-cell swap handle in the frame's bottom-right corner. The
+    /// only frame cell that picks a pane up; every other frame cell is a
+    /// focus click, so the resize seams a frame shares with its siblings
+    /// stay resize handles.
+    PaneGrip {
+        pane_id: String,
+    },
     PaneSplitRight {
         pane_id: String,
     },
@@ -39,6 +46,10 @@ pub enum HitTarget {
         workspace_id: String,
         pane_id: String,
         order_key: String,
+    },
+    /// One chip of the sidebar's Sessions/Stream tab header.
+    SidebarTab {
+        tab: crate::persist::SidebarTab,
     },
     SidebarDivider,
     AttentionIndicator {

@@ -1,28 +1,35 @@
-//! The workspace sidebar: session rows, their expanded agent rows, the
-//! live reorder-drop rule, and the app-menu/create-workspace footer.
-//! Reorder math itself (which slot a drag previews) belongs to
-//! `crate::drag`; this only paints whatever slot it is told.
+//! The workspace sidebar: the one side panel. A one-row tab header picks
+//! what its body shows — the session tree (workspace rows, their expanded
+//! agent rows, the live reorder-drop rule) or the event stream — over a
+//! footer both tabs share. Reorder math itself (which slot a drag
+//! previews) belongs to `crate::drag` and stream rows to `super::stream`;
+//! this only paints what those hand it.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Modifier;
-use ratatui::text::Span;
-use ratatui::widgets::{Block, Borders, Widget};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+
+use cyclops_ui::Record;
 
 use crate::copy;
 use crate::decoration::DecorationSnapshot;
 use crate::drag::{DragState, DragTarget};
 use crate::input::mouse::{HitMap, HitTarget};
 use crate::model::WorkspaceRow;
+use crate::persist::SidebarTab;
 use crate::theme::{self, Paint};
 
-/// Render the workspace sidebar.
+/// Render the workspace sidebar: the tab header, the selected tab's body,
+/// and the shared footer.
 pub fn paint_sidebar(
     workspaces: &[WorkspaceRow],
     active: usize,
     active_pane: &str,
     expanded_workspaces: &std::collections::HashSet<String>,
     agent_order: &[String],
+    tab: SidebarTab,
+    record: &Record,
     area: Rect,
     buf: &mut Buffer,
     paint: &Paint,
@@ -34,15 +41,6 @@ pub fn paint_sidebar(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    // A live workspace-row drag: which row is grabbed (dimmed in the loop
-    // below) and, once the pointer is actually over this sidebar, which
-    // slot it currently previews.
-    let dragging_session = drag
-        .filter(|d| d.is_active())
-        .and_then(|d| match &d.target {
-            DragTarget::Workspace { session_id, .. } => Some(session_id.as_str()),
-            _ => None,
-        });
     buf.set_style(area, theme::chrome_panel(paint));
     let block = Block::default()
         .borders(Borders::RIGHT)
@@ -69,27 +67,132 @@ pub fn paint_sidebar(
         inner.width.saturating_sub(pad.saturating_mul(2)),
         inner.height,
     );
-    let eye = if decoration.workspace_needs_attention() {
-        " ◉"
-    } else {
-        ""
-    };
-    super::overlay_text(
-        buf,
-        content,
-        content.x,
-        content.y,
-        "Workspaces",
-        theme::sidebar_label(paint).add_modifier(Modifier::BOLD),
-    );
-    super::overlay_text(
-        buf,
-        content,
-        content.x + "Workspaces".len() as u16,
-        content.y,
-        eye,
-        theme::attention_eye(paint).patch(paint.bg_token(cyclops_theme::tokens::CHROME_PANEL)),
-    );
+    // The row both tabs stop above: the footer is shared, so neither body
+    // may paint over it.
+    let footer_y = inner.y + inner.height.saturating_sub(1);
+
+    paint_tab_header(inner, tab, buf, paint, hits, decoration);
+    match tab {
+        SidebarTab::Sessions => paint_session_tree(
+            workspaces,
+            active,
+            active_pane,
+            expanded_workspaces,
+            agent_order,
+            area,
+            inner,
+            content,
+            footer_y,
+            buf,
+            paint,
+            hits,
+            decoration,
+            drag,
+        ),
+        SidebarTab::Stream => {
+            // One cell in from the panel edge — the gutter the old
+            // right-hand panel's border used to leave — and full width up
+            // to the resize border. Stream rows are pre-formatted and wrap
+            // hard at 22 columns, so every remaining column counts; the
+            // session tree's second pad cell would cost one for nothing.
+            let x = inner.x + 1.min(inner.width);
+            let top = inner.y + 1.min(inner.height);
+            super::stream::paint_event_stream(
+                record,
+                Rect::new(
+                    x,
+                    top,
+                    inner.width.saturating_sub(1),
+                    footer_y.saturating_sub(top),
+                ),
+                buf,
+                paint,
+            );
+        }
+    }
+    paint_footer(inner, content, footer_y, buf, paint, hits, hover);
+}
+
+/// The tab header: one row of chips naming what the body below shows, with
+/// the workspace attention rollup after them.
+///
+/// It takes the row the session tree's plain "Workspaces" title used to
+/// occupy rather than adding one, so the tree below keeps the exact rows —
+/// and therefore the exact drag/reorder geometry — it had before the
+/// stream moved into this panel.
+fn paint_tab_header(
+    inner: Rect,
+    tab: SidebarTab,
+    buf: &mut Buffer,
+    paint: &Paint,
+    hits: &mut HitMap,
+    decoration: &DecorationSnapshot,
+) {
+    let row = Rect::new(inner.x, inner.y, inner.width, 1);
+    let mut spans = vec![Span::styled(" ", theme::chrome_panel(paint))];
+    let mut x = inner.x + 1.min(inner.width);
+    let right = inner.x + inner.width;
+    // Chips sit flush against each other: at the 22-column minimum both
+    // labels plus the rollup fill the row exactly, and a narrower sidebar
+    // clips from the right rather than dropping a chip.
+    for (chip, label) in [
+        (SidebarTab::Sessions, copy::SIDEBAR_TAB_SESSIONS),
+        (SidebarTab::Stream, copy::SIDEBAR_TAB_STREAM),
+    ] {
+        let style = if chip == tab {
+            theme::tab_active(paint)
+        } else {
+            theme::tab_inactive(paint)
+        };
+        let text = format!(" {label} ");
+        let w = u16::try_from(Span::raw(text.as_str()).width()).unwrap_or(u16::MAX);
+        if x < right {
+            hits.push(
+                Rect::new(x, row.y, w.min(right - x), 1),
+                HitTarget::SidebarTab { tab: chip },
+            );
+        }
+        spans.push(Span::styled(text, style));
+        x = x.saturating_add(w);
+    }
+    if decoration.workspace_needs_attention() {
+        spans.push(Span::styled(
+            " ◉",
+            theme::attention_eye(paint).patch(paint.bg_token(cyclops_theme::tokens::CHROME_PANEL)),
+        ));
+    }
+    Paragraph::new(Line::from(spans)).render(row, buf);
+}
+
+/// The Sessions tab's body: workspace rows, their expanded agent rows, and
+/// the live reorder-drop rule.
+fn paint_session_tree(
+    workspaces: &[WorkspaceRow],
+    active: usize,
+    active_pane: &str,
+    expanded_workspaces: &std::collections::HashSet<String>,
+    agent_order: &[String],
+    area: Rect,
+    inner: Rect,
+    content: Rect,
+    footer_y: u16,
+    buf: &mut Buffer,
+    paint: &Paint,
+    hits: &mut HitMap,
+    decoration: &DecorationSnapshot,
+    drag: Option<&DragState>,
+) {
+    // A live workspace-row drag: which row is grabbed (dimmed in the loop
+    // below) and, once the pointer is actually over this sidebar, which
+    // slot it currently previews.
+    let dragging_session = drag
+        .filter(|d| d.is_active())
+        .and_then(|d| match &d.target {
+            DragTarget::Workspace { session_id, .. } => Some(session_id.as_str()),
+            _ => None,
+        });
+    // The header owns row 0 and a blank row separates it from the tree, so
+    // rows start on the row the old title left them on.
     let mut y = content.y + 2;
     if !decoration.online {
         super::overlay_text(
@@ -102,7 +205,6 @@ pub fn paint_sidebar(
         );
         y += 1;
     }
-    let footer_y = inner.y + inner.height.saturating_sub(1);
     for (i, ws) in workspaces.iter().enumerate() {
         if y >= footer_y {
             break;
@@ -208,82 +310,97 @@ pub fn paint_sidebar(
             }
         }
     }
+}
 
-    // Application menu at left; a matching compact create button anchors the
-    // hierarchy at bottom-right without stealing the rest of the footer row.
-    if inner.height >= 2 {
-        let menu_row = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
-        let menu_width = u16::try_from(Span::raw(copy::APP_MENU_BUTTON).width())
-            .unwrap_or(u16::MAX)
-            .min(content.width);
-        super::overlay_text(
-            buf,
-            content,
-            content.x,
-            menu_row.y,
-            copy::APP_MENU_BUTTON,
-            theme::sidebar_label(paint),
-        );
-        hits.push(
-            Rect::new(content.x, menu_row.y, menu_width, 1),
-            HitTarget::AppMenu,
-        );
-        let plus = " + ";
-        let plus_width = u16::try_from(Span::raw(plus).width())
-            .unwrap_or(u16::MAX)
-            .min(content.width);
-        let plus_x = content
-            .x
-            .saturating_add(content.width.saturating_sub(plus_width));
-        // The button keeps one width whether or not it is pointed at, so
-        // the target never moves out from under the mouse that found it.
-        let hovered = hover.is_some_and(|(hover_col, hover_row)| {
-            hover_row == menu_row.y
-                && hover_col >= plus_x
-                && hover_col < plus_x.saturating_add(plus_width)
-        });
-        if hovered {
-            // Say what it makes, in the gutter the footer already leaves
-            // between the menu label and the button. Skipped rather than
-            // truncated when the sidebar is too narrow: half a word next to
-            // a lit button teaches nothing.
-            let hint_width =
-                u16::try_from(Span::raw(copy::NEW_WORKSPACE_HINT).width()).unwrap_or(u16::MAX);
-            let gutter = plus_x.saturating_sub(content.x.saturating_add(menu_width));
-            if hint_width < gutter {
-                super::overlay_text(
-                    buf,
-                    content,
-                    plus_x.saturating_sub(hint_width),
-                    menu_row.y,
-                    copy::NEW_WORKSPACE_HINT,
-                    theme::sidebar_label(paint),
-                );
-            }
-        }
-        super::overlay_text(
-            buf,
-            content,
-            plus_x,
-            menu_row.y,
-            plus,
-            if hovered {
-                theme::add_button_hover(paint)
-            } else {
-                theme::add_button(paint)
-            },
-        );
-        hits.push(
-            Rect::new(plus_x, menu_row.y, plus_width, 1),
-            HitTarget::NewWorkspaceButton,
-        );
+/// The footer both tabs share: the application menu at left, and a matching
+/// compact create button anchoring the hierarchy at bottom-right without
+/// stealing the rest of the row.
+///
+/// Painted for the Stream tab too. The menu button is the only mouse route
+/// to themes, keybinds, and detach, so hiding it behind a tab would strand
+/// them.
+fn paint_footer(
+    inner: Rect,
+    content: Rect,
+    footer_y: u16,
+    buf: &mut Buffer,
+    paint: &Paint,
+    hits: &mut HitMap,
+    hover: Option<(u16, u16)>,
+) {
+    if inner.height < 2 {
+        return;
     }
+    let menu_width = u16::try_from(Span::raw(copy::APP_MENU_BUTTON).width())
+        .unwrap_or(u16::MAX)
+        .min(content.width);
+    super::overlay_text(
+        buf,
+        content,
+        content.x,
+        footer_y,
+        copy::APP_MENU_BUTTON,
+        theme::sidebar_label(paint),
+    );
+    hits.push(
+        Rect::new(content.x, footer_y, menu_width, 1),
+        HitTarget::AppMenu,
+    );
+    let plus = " + ";
+    let plus_width = u16::try_from(Span::raw(plus).width())
+        .unwrap_or(u16::MAX)
+        .min(content.width);
+    let plus_x = content
+        .x
+        .saturating_add(content.width.saturating_sub(plus_width));
+    // The button keeps one width whether or not it is pointed at, so
+    // the target never moves out from under the mouse that found it.
+    let hovered = hover.is_some_and(|(hover_col, hover_row)| {
+        hover_row == footer_y
+            && hover_col >= plus_x
+            && hover_col < plus_x.saturating_add(plus_width)
+    });
+    if hovered {
+        // Say what it makes, in the gutter the footer already leaves
+        // between the menu label and the button. Skipped rather than
+        // truncated when the sidebar is too narrow: half a word next to
+        // a lit button teaches nothing.
+        let hint_width =
+            u16::try_from(Span::raw(copy::NEW_WORKSPACE_HINT).width()).unwrap_or(u16::MAX);
+        let gutter = plus_x.saturating_sub(content.x.saturating_add(menu_width));
+        if hint_width < gutter {
+            super::overlay_text(
+                buf,
+                content,
+                plus_x.saturating_sub(hint_width),
+                footer_y,
+                copy::NEW_WORKSPACE_HINT,
+                theme::sidebar_label(paint),
+            );
+        }
+    }
+    super::overlay_text(
+        buf,
+        content,
+        plus_x,
+        footer_y,
+        plus,
+        if hovered {
+            theme::add_button_hover(paint)
+        } else {
+            theme::add_button(paint)
+        },
+    );
+    hits.push(
+        Rect::new(plus_x, footer_y, plus_width, 1),
+        HitTarget::NewWorkspaceButton,
+    );
 }
 
 /// The workspace-reorder drop indicator: a full-width accent rule at row
 /// `y`, spanning `area`'s usable width. Called only while a workspace-row
 /// drag is live and the pointer sits over the sidebar — see the call site
-/// in [`paint_sidebar`].
+/// in [`paint_session_tree`].
 fn paint_insertion_rule(buf: &mut Buffer, area: Rect, y: u16, paint: &Paint) {
     if area.width == 0 || y < area.y || y >= area.y + area.height {
         return;
@@ -326,6 +443,8 @@ mod tests {
                     "%0",
                     &expanded,
                     &[],
+                    SidebarTab::Sessions,
+                    &Record::new(),
                     f.area(),
                     f.buffer_mut(),
                     &theme,
@@ -396,6 +515,8 @@ mod tests {
                 "%0",
                 &expanded,
                 &[],
+                SidebarTab::Sessions,
+                &Record::new(),
                 f.area(),
                 f.buffer_mut(),
                 &theme,
@@ -476,6 +597,8 @@ mod tests {
                     "%0",
                     &expanded,
                     &[],
+                    SidebarTab::Sessions,
+                    &Record::new(),
                     f.area(),
                     f.buffer_mut(),
                     &theme,
@@ -600,6 +723,8 @@ mod tests {
                 "%0",
                 &expanded,
                 &["pane:%1".into(), "name:reviewer".into()],
+                SidebarTab::Sessions,
+                &Record::new(),
                 frame.area(),
                 frame.buffer_mut(),
                 &theme,
@@ -675,6 +800,8 @@ mod tests {
                     "%9",
                     &expanded,
                     &[],
+                    SidebarTab::Sessions,
+                    &Record::new(),
                     f.area(),
                     f.buffer_mut(),
                     paint,
@@ -734,6 +861,266 @@ mod tests {
                 "NO_COLOR must leave no color behind for {state}, confirming \
              this compact cell does not depend on color to read"
             );
+        }
+    }
+
+    // -- The tab header: two chips over one body, the resize handle and
+    // the footer untouched by either. --
+
+    /// A sidebar rectangle narrower than the terminal, so "clipped to the
+    /// sidebar rect" is something a test can actually read: every column
+    /// past `SIDEBAR` belongs to the pane canvas.
+    const SIDEBAR: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 42,
+        height: 8,
+    };
+
+    /// One admitted stream row, short enough to render on one line at the
+    /// sidebar's widest.
+    fn one_row_record() -> Record {
+        let mut record = Record::new();
+        record.live(cyclops_ui::Entry {
+            uid: 0,
+            ts: 1_000,
+            seq: None,
+            id: None,
+            kind: cyclops_ui::EntryKind::State {
+                target: "rev".into(),
+                pane_id: Some("%1".into()),
+                state: cyclops_proto::AgentState::BlockedPermission,
+            },
+        });
+        record
+    }
+
+    /// Paint one sidebar into a 60-column terminal and hand back the whole
+    /// buffer plus the hit map, so a caller can assert on both what the
+    /// sidebar painted and what it left alone.
+    fn draw_sidebar(tab: SidebarTab, record: &Record, paint: &Paint) -> (Buffer, HitMap) {
+        let workspaces = vec![WorkspaceRow {
+            session_id: "$0".into(),
+            name: "cyclops".into(),
+            tab_count: 1,
+            window_ids: vec!["@0".into()],
+        }];
+        let expanded = std::collections::HashSet::from(["$0".to_string()]);
+        let mut term = Terminal::new(TestBackend::new(60, SIDEBAR.height)).unwrap();
+        let mut hits = HitMap::default();
+        term.draw(|f| {
+            paint_sidebar(
+                &workspaces,
+                0,
+                "%0",
+                &expanded,
+                &[],
+                tab,
+                record,
+                SIDEBAR,
+                f.buffer_mut(),
+                paint,
+                &mut hits,
+                &DecorationSnapshot::default(),
+                None,
+                None,
+            );
+        })
+        .unwrap();
+        (term.backend().buffer().clone(), hits)
+    }
+
+    /// The text inside the sidebar's own rectangle, row by row.
+    fn sidebar_text(buf: &Buffer) -> String {
+        (SIDEBAR.y..SIDEBAR.y + SIDEBAR.height)
+            .flat_map(|y| (SIDEBAR.x..SIDEBAR.x + SIDEBAR.width).map(move |x| (x, y)))
+            .map(|cell| buf[cell].symbol().to_string())
+            .collect()
+    }
+
+    /// The Stream tab shows the shared stream model's rows in the sidebar
+    /// and nowhere else: the session tree gives way, the row reads, the
+    /// footer stays, and not one cell lands past the sidebar's rectangle —
+    /// the columns the old right-hand panel used to take belong to the
+    /// pane canvas now.
+    #[test]
+    fn the_stream_tab_paints_event_rows_inside_the_sidebar_rect() {
+        let paint = Paint::for_test();
+        let record = one_row_record();
+        let word = cyclops_proto::AgentState::BlockedPermission.to_string();
+
+        let (stream_buf, _) = draw_sidebar(SidebarTab::Stream, &record, &paint);
+        let stream = sidebar_text(&stream_buf);
+        assert!(
+            stream.contains(&word),
+            "the stream row must read: {stream:?}"
+        );
+        assert!(stream.contains("rev"), "{stream:?}");
+        assert!(
+            !stream.contains("cyclops"),
+            "the session tree belongs to the other tab: {stream:?}"
+        );
+        // The button's word, not the whole label: `☰` is a wide glyph and
+        // reads back with its spacer cell spliced in, which is a property
+        // of this flattening and not of the footer.
+        assert!(
+            stream.contains("menu"),
+            "the footer is shared: the app menu must survive the tab switch: {stream:?}"
+        );
+        for y in 0..stream_buf.area.height {
+            for x in SIDEBAR.x + SIDEBAR.width..stream_buf.area.width {
+                assert_eq!(
+                    stream_buf[(x, y)].symbol(),
+                    " ",
+                    "the stream painted past the sidebar at {x},{y}"
+                );
+            }
+        }
+
+        // The control: the same call on the other tab shows the tree and
+        // no stream row, so neither assertion above passed by accident.
+        let (tree_buf, _) = draw_sidebar(SidebarTab::Sessions, &record, &paint);
+        let tree = sidebar_text(&tree_buf);
+        assert!(tree.contains("cyclops"), "{tree:?}");
+        assert!(!tree.contains(&word), "{tree:?}");
+    }
+
+    /// Both chips answer the mouse where they paint, and the selected one
+    /// is materially different from the other. Rule 11: the cue survives
+    /// `NO_COLOR`, because the accent chip reverses when there is no color
+    /// to fill it with — the same rule the tab strip follows.
+    #[test]
+    /// The header's own claim, measured at the width that actually ships
+    /// (`WorkspacePrefs::default().sidebar_width` is 22, the minimum):
+    /// both chips answer the mouse AND the attention rollup still paints.
+    /// The wider tests above would pass with a header that silently drops
+    /// the rollup on every default install.
+    fn the_header_fits_both_chips_and_the_rollup_at_the_default_width() {
+        let record = Record::new();
+        let paint = Paint::for_test();
+        let narrow = Rect::new(0, 0, 22, SIDEBAR.height);
+        let mut decoration = DecorationSnapshot::default();
+        decoration.attention.observe_agent(
+            "reviewer",
+            Some("%0"),
+            cyclops_proto::AgentState::BlockedPermission,
+        );
+        assert!(decoration.workspace_needs_attention());
+
+        let workspaces = vec![WorkspaceRow {
+            session_id: "$0".into(),
+            name: "cyclops".into(),
+            tab_count: 1,
+            window_ids: vec!["@0".into()],
+        }];
+        let mut term = Terminal::new(TestBackend::new(60, SIDEBAR.height)).unwrap();
+        let mut hits = HitMap::default();
+        term.draw(|f| {
+            paint_sidebar(
+                &workspaces,
+                0,
+                "%0",
+                &std::collections::HashSet::from(["$0".to_string()]),
+                &[],
+                SidebarTab::Sessions,
+                &record,
+                narrow,
+                f.buffer_mut(),
+                &paint,
+                &mut hits,
+                &decoration,
+                None,
+                None,
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+
+        assert!(matches!(
+            hits.hit(1, 0),
+            Some(HitTarget::SidebarTab {
+                tab: SidebarTab::Sessions
+            })
+        ));
+        assert!(matches!(
+            hits.hit(11, 0),
+            Some(HitTarget::SidebarTab {
+                tab: SidebarTab::Stream
+            })
+        ));
+        let header: String = (0..narrow.width).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            header.contains('◉'),
+            "the rollup has to survive the default width: {header:?}"
+        );
+    }
+
+    #[test]
+    fn the_tab_header_selects_and_hit_tests_its_chips() {
+        let record = Record::new();
+        let paint = Paint::for_test();
+
+        // " Sessions " is 10 wide from column 1; " Stream " follows flush.
+        let (sessions_buf, hits) = draw_sidebar(SidebarTab::Sessions, &record, &paint);
+        assert!(matches!(
+            hits.hit(1, 0),
+            Some(HitTarget::SidebarTab {
+                tab: SidebarTab::Sessions
+            })
+        ));
+        assert!(matches!(
+            hits.hit(11, 0),
+            Some(HitTarget::SidebarTab {
+                tab: SidebarTab::Stream
+            })
+        ));
+
+        let (stream_buf, _) = draw_sidebar(SidebarTab::Stream, &record, &paint);
+        let (sessions_chip, stream_chip) = ((2, 0), (12, 0));
+        assert_ne!(
+            sessions_buf[sessions_chip].bg, sessions_buf[stream_chip].bg,
+            "the selected chip needs a materially stronger fill"
+        );
+        assert_ne!(
+            sessions_buf[sessions_chip].bg, stream_buf[sessions_chip].bg,
+            "selecting the other tab must repaint the chips"
+        );
+        assert_eq!(
+            sessions_buf[sessions_chip].bg, stream_buf[stream_chip].bg,
+            "the selected chip wears one style whichever tab it is"
+        );
+
+        // Color off: the fill is gone, so the selection rides on REVERSED.
+        let plain = Paint::without_color_for_test();
+        let (plain_buf, _) = draw_sidebar(SidebarTab::Stream, &record, &plain);
+        assert!(
+            plain_buf[stream_chip]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED),
+            "NO_COLOR must still say which tab is selected"
+        );
+        assert!(!plain_buf[sessions_chip]
+            .modifier
+            .contains(ratatui::style::Modifier::REVERSED));
+    }
+
+    /// Resize by drag survives the header. The sidebar's rightmost column
+    /// is the `SidebarDivider` the drag reads (`app::handle_mouse`), on
+    /// every row of both tabs — a chip that clipped into that column, or a
+    /// header that shortened the divider, would take the handle away.
+    #[test]
+    fn the_tab_header_leaves_the_resize_divider_on_every_row() {
+        let record = one_row_record();
+        let paint = Paint::for_test();
+        let divider_x = SIDEBAR.x + SIDEBAR.width - 1;
+        for tab in [SidebarTab::Sessions, SidebarTab::Stream] {
+            let (_, hits) = draw_sidebar(tab, &record, &paint);
+            for y in SIDEBAR.y..SIDEBAR.y + SIDEBAR.height {
+                assert!(
+                    matches!(hits.hit(divider_x, y), Some(HitTarget::SidebarDivider)),
+                    "{tab:?}: row {y} lost the resize handle"
+                );
+            }
         }
     }
 }

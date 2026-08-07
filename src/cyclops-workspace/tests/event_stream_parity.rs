@@ -1,5 +1,6 @@
-//! E2 parity: the workspace event panel must show the same ordered,
-//! plain-text rows `cyclops watch` shows for the identical transcript —
+//! E2 parity: the workspace sidebar's Stream tab must show the same
+//! ordered, plain-text rows `cyclops watch` shows for the identical
+//! transcript —
 //! and it must ACQUIRE them the same way, not merely format them the
 //! same way.
 //!
@@ -14,7 +15,7 @@
 //! wait for it, a replayed ledger tail, a seq-duplicate the dedup must
 //! drop, and post-startup live traffic. If the workspace skipped the
 //! tail, reordered the seed, or showed the duplicate twice — each a real
-//! divergence at some point in this panel's history — the two row lists
+//! divergence at some point in this surface's history — the two row lists
 //! stop being identical.
 
 use cyclops_proto::{AgentState, NotifyLevel, PaneSnapshot};
@@ -174,63 +175,63 @@ fn cyclops_watch_rows(record: &Record) -> Vec<String> {
 }
 
 #[test]
-fn the_workspace_panel_acquires_and_shows_the_rows_cyclops_watch_does() {
+fn the_workspace_stream_acquires_and_shows_the_rows_cyclops_watch_does() {
     let mut watch_record = Record::new();
     let mut watch_intake = Intake::new();
-    let mut panel_record = Record::new();
-    let mut panel_intake = Intake::new();
+    let mut stream_record = Record::new();
+    let mut stream_intake = Intake::new();
 
     // Interleave per step (not per consumer) so the two `Record::seed`
     // wall-clock stamps land as close together as two calls can.
-    for (watch_step, panel_step) in transcript().into_iter().zip(transcript()) {
+    for (watch_step, stream_step) in transcript().into_iter().zip(transcript()) {
         feed_like_watch(&mut watch_record, &mut watch_intake, watch_step);
-        feed_like_workspace(&mut panel_record, &mut panel_intake, panel_step);
+        feed_like_workspace(&mut stream_record, &mut stream_intake, stream_step);
     }
 
     let watch_rows = cyclops_watch_rows(&watch_record);
-    let panel_rows: Vec<String> = cyclops_workspace::event_stream_rows(&panel_record)
+    let stream_rows: Vec<String> = cyclops_workspace::event_stream_rows(&stream_record)
         .into_iter()
         .flat_map(|row| row.lines)
         .collect();
 
     assert_eq!(
-        watch_rows, panel_rows,
+        watch_rows, stream_rows,
         "one transcript, two consumers, one history — acquisition included"
     );
 
     // The properties the transcript was built to prove, asserted on the
-    // panel's rows (already known equal to watch's above):
+    // workspace's rows (already known equal to watch's above):
     //
-    // 1. The replayed ledger tail is present — the panel does not start
+    // 1. The replayed ledger tail is present — the workspace does not start
     //    from the seed alone.
-    assert_eq!(panel_rows[0], "00:00:01  codex → admin  backfilled note");
+    assert_eq!(stream_rows[0], "00:00:01  codex → admin  backfilled note");
     // 2. The seq-6 block shows exactly once: the live copy that raced
     //    the backfill was dropped by seq, the replayed one kept. The
     //    clearance row quotes the same state word ("cleared · was …"),
     //    so it is excluded from the count rather than mistaken for a
     //    second block.
     let blocked_word = AgentState::BlockedPermission.to_string();
-    let blocked_rows = panel_rows
+    let blocked_rows = stream_rows
         .iter()
         .filter(|r| r.ends_with(&blocked_word) && !r.contains("cleared"))
         .count();
-    assert_eq!(blocked_rows, 1, "{panel_rows:#?}");
+    assert_eq!(blocked_rows, 1, "{stream_rows:#?}");
     // 3. The alarm resolved, so the record appended a clearance (rule 8:
     //    append, never retract) and the ping aimed at the alarm outlived
     //    it — admitted nowhere.
     assert!(
-        panel_rows.iter().any(|r| r.contains("cleared")),
-        "{panel_rows:#?}"
+        stream_rows.iter().any(|r| r.contains("cleared")),
+        "{stream_rows:#?}"
     );
     assert!(
-        !panel_rows.iter().any(|r| r.contains("needs you")),
-        "{panel_rows:#?}"
+        !stream_rows.iter().any(|r| r.contains("needs you")),
+        "{stream_rows:#?}"
     );
     // 4. The routine transition never surfaces in the calm view.
     assert!(
-        !panel_rows
+        !stream_rows
             .iter()
             .any(|r| r.ends_with(&AgentState::Working.to_string())),
-        "{panel_rows:#?}"
+        "{stream_rows:#?}"
     );
 }

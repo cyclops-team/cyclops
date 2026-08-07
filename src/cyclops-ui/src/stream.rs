@@ -5,7 +5,7 @@
 //!
 //! Backend-neutral on purpose: nothing here holds a socket, a terminal, or
 //! a color. `cyclops watch` (app.rs, frame.rs, entry.rs, plain.rs) is the
-//! first renderer of it; a workspace event panel is meant to be the
+//! first renderer of it; the workspace sidebar's Stream tab is the
 //! second, and both should read this module rather than keep a private
 //! copy of any of the five things it owns:
 //!

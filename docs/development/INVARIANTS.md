@@ -346,11 +346,11 @@ word: `○` idle, `●` working, `⚠` needs attention, and `✕` dead are a
 fixed, documented glyph vocabulary that a reader can learn once. The glyph
 is chosen by state, never by theme, so it renders identically under every
 theme and under `NO_COLOR`; only the `Style` painted under it changes. A
-detailed surface (the focused pane border, dialogs, the event panel),
-plain-text output, and every diagnostic show the word whenever there is
-room for it. None of them may drop straight to hiding the state just
-because the word does not fit — the fallback is always the glyph, the same
-one the compact surfaces show on purpose.
+detailed surface (the focused pane border, dialogs, the sidebar's event
+stream), plain-text output, and every diagnostic show the word whenever
+there is room for it. None of them may drop straight to hiding the state
+just because the word does not fit — the fallback is always the glyph, the
+same one the compact surfaces show on purpose.
 
 The check that matters is mechanical: turn color off and read the same
 line. If anything is missing beyond a compact surface's own documented

@@ -36,6 +36,12 @@ pub enum BindingAction {
     NewWorkspace,
     RenameWorkspace,
     CloseWorkspace,
+    /// Collapse or reopen the sidebar; the state persists across restarts.
+    ToggleSidebar,
+    /// Show the event stream on the sidebar's Stream tab, or hide the
+    /// sidebar when the stream is what's showing. The name predates the
+    /// merge of the old right-hand panel into the sidebar; the config key
+    /// (`toggle_event_panel`) keeps working unchanged.
     ToggleEventPanel,
     ShowKeybinds,
     /// No default chord: reached from the app menu, bindable via config.
@@ -173,6 +179,10 @@ pub fn default_bindings() -> HashMap<BindingAction, BindingChord> {
             BindingChord::Prefix(KeyCode::Char('K')),
         ),
         (
+            BindingAction::ToggleSidebar,
+            BindingChord::Prefix(KeyCode::Char('b')),
+        ),
+        (
             BindingAction::ToggleEventPanel,
             BindingChord::Prefix(KeyCode::Char('e')),
         ),
@@ -239,6 +249,7 @@ fn action_from_key(key: &str) -> Option<BindingAction> {
         "new_workspace" => Some(BindingAction::NewWorkspace),
         "rename_workspace" => Some(BindingAction::RenameWorkspace),
         "close_workspace" => Some(BindingAction::CloseWorkspace),
+        "toggle_sidebar" => Some(BindingAction::ToggleSidebar),
         "toggle_event_panel" => Some(BindingAction::ToggleEventPanel),
         "show_keybinds" => Some(BindingAction::ShowKeybinds),
         "show_themes" => Some(BindingAction::ShowThemes),
@@ -305,8 +316,13 @@ pub fn binding_help(bindings: &HashMap<BindingAction, BindingChord>) -> Vec<Bind
     for (offset, row) in swaps.into_iter().enumerate() {
         rows.insert(at + offset, row);
     }
-    // Copy and paste are fixed gestures, not bindings, but this reference
-    // is the one place a user looks for them.
+    // The grip, copy, and paste are fixed gestures, not bindings, but this
+    // reference is the one place a user looks for them. The grip row quotes
+    // the painted glyph so the sheet cannot drift from the chrome.
+    rows.push(BindingHelp {
+        keys: format!("Drag {}", crate::render::PANE_GRIP),
+        action: "Swap panes (bottom-right grip)".into(),
+    });
     rows.push(BindingHelp {
         keys: "Drag".into(),
         action: "Select text, copy on release".into(),
@@ -349,6 +365,7 @@ fn action_words(action: BindingAction) -> String {
         BindingAction::NewWorkspace => "New workspace here".into(),
         BindingAction::RenameWorkspace => "Rename workspace".into(),
         BindingAction::CloseWorkspace => "Close workspace".into(),
+        BindingAction::ToggleSidebar => "Toggle sidebar".into(),
         BindingAction::ToggleEventPanel => "Toggle event stream".into(),
         BindingAction::ShowKeybinds => "Keybinds".into(),
         BindingAction::ShowThemes => "Themes".into(),
@@ -381,6 +398,7 @@ fn help_rank(action: BindingAction) -> (u8, usize) {
         BindingAction::PrevWorkspace => (42, 0),
         BindingAction::RenameWorkspace => (43, 0),
         BindingAction::CloseWorkspace => (44, 0),
+        BindingAction::ToggleSidebar => (49, 0),
         BindingAction::ToggleEventPanel => (50, 0),
         BindingAction::ShowKeybinds => (51, 0),
         BindingAction::ShowThemes => (52, 0),
@@ -506,6 +524,24 @@ mod tests {
         assert!(rows.iter().any(|row| row.action == "Detach"));
     }
 
+    /// Both sidebar chords ship by default and reach the help sheet from
+    /// the live map, so the sheet teaches the collapse toggle alongside
+    /// the stream toggle it inherited.
+    #[test]
+    fn help_teaches_the_sidebar_and_stream_toggles() {
+        let rows = binding_help(&default_bindings());
+        let sidebar = rows
+            .iter()
+            .find(|row| row.action == "Toggle sidebar")
+            .expect("sidebar row");
+        assert_eq!(sidebar.keys, "Ctrl+B b");
+        let stream = rows
+            .iter()
+            .find(|row| row.action == "Toggle event stream")
+            .expect("stream row");
+        assert_eq!(stream.keys, "Ctrl+B e");
+    }
+
     #[test]
     fn help_documents_copy_and_paste() {
         let rows = binding_help(&default_bindings());
@@ -516,6 +552,19 @@ mod tests {
         assert!(rows
             .iter()
             .any(|row| row.action == "Paste into focused pane"));
+    }
+
+    /// The grip is a fixed gesture like copy and paste, and its row quotes
+    /// the glyph the frame actually paints, so a glyph change cannot leave
+    /// the sheet teaching a handle that no longer exists.
+    #[test]
+    fn help_teaches_the_grip_swap_with_the_painted_glyph() {
+        let rows = binding_help(&default_bindings());
+        let grip = rows
+            .iter()
+            .find(|row| row.action == "Swap panes (bottom-right grip)")
+            .expect("grip row");
+        assert_eq!(grip.keys, format!("Drag {}", crate::render::PANE_GRIP));
     }
 
     /// The swap rows derive from the live focus chords, right after them,

@@ -61,6 +61,26 @@ pub const PANE_GAPS: PaneGaps = PaneGaps {
     rows: 2,
 };
 
+/// The swap handle in every frame's bottom-right corner cell. Braille dots
+/// read as grabbable texture the way GUI drag grips do, stay one narrow
+/// cell in every monospace font, and belong to no box-drawing family, so
+/// the calm border language survives with exactly one cell of handle
+/// chrome. Painted with the same border tokens as the frame, focused and
+/// unfocused alike.
+pub const PANE_GRIP: &str = "⠿";
+
+/// The frame's bottom-right corner cell: where [`PANE_GRIP`] paints and
+/// the [`HitTarget::PaneGrip`] region sits. `None` when bounds clip the
+/// corner away; a grip must never land on a cell that is not the painted
+/// corner. The cell sits outside every divider band (bands span pane
+/// columns and rows only), so the grip cannot steal a resize cell.
+fn grip_cell(frame: Rect, bounds: Rect) -> Option<(u16, u16)> {
+    let x = frame.x.saturating_add(frame.width);
+    let y = frame.y.saturating_add(frame.height);
+    (x < bounds.x.saturating_add(bounds.width) && y < bounds.y.saturating_add(bounds.height))
+        .then_some((x, y))
+}
+
 /// The rectangle occupied by pane content plus internal separators: the
 /// canvas inset by [`PANE_MARGIN`] when there is room.
 pub fn pane_canvas(canvas: Rect) -> Rect {
@@ -152,11 +172,11 @@ pub fn paint_window(
         );
     }
     // Shared pane borders are resize handles. Put divider regions above the
-    // generic frame regions, then restore the visibly overlaid controls as
-    // the most specific hit targets.
+    // generic frame regions, then restore the visibly overlaid controls and
+    // the corner grip as the most specific hit targets.
     push_divider_hits(&dividers, ctx.hits);
-    for slot in &slots {
-        push_pane_overlay_hits(slot, canvas, ctx.decoration, ctx.hits);
+    for (slot, frame) in slots.iter().zip(&frames) {
+        push_pane_overlay_hits(slot, *frame, canvas, ctx.decoration, ctx.hits);
     }
     if let Some(drag) = ctx.drag.filter(|d| d.is_active()) {
         paint_drag_preview(drag, buf, paint);
@@ -354,10 +374,10 @@ fn scroll_depth(runtimes: &RuntimeRegistry, slot: &PaneSlot) -> usize {
         .map_or(0, PaneRuntime::scrolled_back)
 }
 
-/// Paint one pane's border, optional named-agent chrome, and split controls.
-/// Unnamed panes stay textually quiet; their muted boundary still makes the
-/// layout legible. `scrolled` is the pane's scrollback depth; nonzero paints
-/// a dim hint on the top border.
+/// Paint one pane's border, its corner swap grip, optional named-agent
+/// chrome, and split controls. Unnamed panes stay textually quiet; their
+/// muted boundary still makes the layout legible. `scrolled` is the pane's
+/// scrollback depth; nonzero paints a dim hint on the top border.
 fn paint_pane_frame(
     slot: &PaneSlot,
     frame: Rect,
@@ -376,6 +396,16 @@ fn paint_pane_frame(
         theme::pane_border(paint)
     };
     paint_pane_border(vis, bounds, buf, border_style);
+    // The corner '╯' becomes the grip. Painted here, per frame, right
+    // after this frame's own border: the focused frame repaints last, so
+    // a shared pass would let its accent ring overwrite another pane's
+    // grip where borders intersect.
+    if let Some((x, y)) = grip_cell(vis, bounds) {
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_symbol(PANE_GRIP);
+            cell.set_style(border_style);
+        }
+    }
 
     let left = vis.x.saturating_sub(1).max(bounds.x);
     let top = vis.y.saturating_sub(1).max(bounds.y);
@@ -569,8 +599,14 @@ fn pane_controls(slot: &PaneSlot, bounds: Rect) -> Option<PaneControls> {
     })
 }
 
+/// Hit regions for the controls painted over a pane's frame: the labeled
+/// title strip (a focus click, or the attention eye), the split buttons,
+/// and the corner swap grip. Pushed after the divider bands so these
+/// visibly overlaid cells win the hit test; the grip is the only one of
+/// them that starts a drag.
 fn push_pane_overlay_hits(
     slot: &PaneSlot,
+    frame: Rect,
     bounds: Rect,
     decoration: &DecorationSnapshot,
     hits: &mut HitMap,
@@ -604,6 +640,14 @@ fn push_pane_overlay_hits(
         hits.push(
             controls.split_down,
             HitTarget::PaneSplitDown {
+                pane_id: slot.pane_id.clone(),
+            },
+        );
+    }
+    if let Some((x, y)) = grip_cell(frame, bounds) {
+        hits.push(
+            Rect::new(x, y, 1, 1),
+            HitTarget::PaneGrip {
                 pane_id: slot.pane_id.clone(),
             },
         );
@@ -1104,6 +1148,111 @@ mod tests {
         assert_eq!(buf[(20, 11)].symbol(), "─", "every pane has a border");
     }
 
+    /// The stacked-seam regression behind the corner grip: with a LABELED
+    /// bottom pane (the normal Cyclops case, and the one the older
+    /// unlabeled-pane test above never covered) the seam rows must stay
+    /// resize handles wherever no visible control sits, and the swap
+    /// pickup must be exactly the one-cell corner grip.
+    #[test]
+    fn a_labeled_bottom_pane_keeps_its_seam_for_resize_and_gets_a_corner_grip() {
+        use crate::decoration::PaneDecoration;
+        use cyclops_proto::AgentState;
+
+        let tab = two_pane_tab();
+        let runtimes = RuntimeRegistry::default();
+        let mut decoration = DecorationSnapshot {
+            online: true,
+            ..Default::default()
+        };
+        decoration.panes.insert(
+            "%1".into(),
+            PaneDecoration {
+                pane_id: "%1".into(),
+                window_id: "@0".into(),
+                label: Some("reviewer".into()),
+                manifest: None,
+                manifest_display_name: None,
+                state: AgentState::Idle,
+                needs_attention: false,
+            },
+        );
+
+        let backend = TestBackend::new(40, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let paint = Paint::for_test();
+        let mut hits = HitMap::default();
+        term.draw(|f| {
+            let paused = std::collections::HashSet::new();
+            let mut ctx = ctx_defaults(&mut hits, &paused, &decoration);
+            paint_window(&tab, &runtimes, f.area(), f.buffer_mut(), &paint, &mut ctx);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+
+        // The seam between %0 (1,1,38,4) and %1 (1,7,38,3): row 5 is %0's
+        // bottom border, row 6 is %1's top border carrying the title.
+        assert!(
+            matches!(hits.hit(20, 5), Some(HitTarget::Divider { .. })),
+            "row A must stay a resize handle under a labeled pane"
+        );
+        assert!(
+            matches!(hits.hit(1, 6), Some(HitTarget::Divider { .. })),
+            "row B outside the title strip must stay a resize handle"
+        );
+        // The title strip keeps its click target (focus, or the eye when
+        // it is on); `app` never picks a `PaneFrame` up, so this cell can
+        // no longer shadow the seam with a swap drag.
+        assert!(matches!(
+            hits.hit(20, 6),
+            Some(HitTarget::PaneFrame { pane_id }) if pane_id == "%1"
+        ));
+
+        // The swap handle: one painted cell on each frame's bottom-right
+        // corner, outside every divider band.
+        assert!(matches!(
+            hits.hit(39, 5),
+            Some(HitTarget::PaneGrip { pane_id }) if pane_id == "%0"
+        ));
+        assert!(matches!(
+            hits.hit(39, 10),
+            Some(HitTarget::PaneGrip { pane_id }) if pane_id == "%1"
+        ));
+        assert_eq!(buf[(39, 5)].symbol(), PANE_GRIP, "focused pane's grip");
+        assert_eq!(buf[(39, 10)].symbol(), PANE_GRIP, "unfocused pane's grip");
+    }
+
+    /// The grip must read as a handle in every shipped theme and under
+    /// NO_COLOR: only its color may change, never the glyph, the same
+    /// contract the status-glyph stability test below pins.
+    #[test]
+    fn the_grip_glyph_is_stable_across_theme_and_no_color() {
+        let render_with = |paint: &Paint| -> Buffer {
+            let tab = two_pane_tab();
+            let runtimes = RuntimeRegistry::default();
+            let backend = TestBackend::new(40, 12);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| {
+                let mut hits = HitMap::default();
+                let paused = std::collections::HashSet::new();
+                let dec = DecorationSnapshot::default();
+                let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
+                paint_window(&tab, &runtimes, f.area(), f.buffer_mut(), paint, &mut ctx);
+            })
+            .unwrap();
+            term.backend().buffer().clone()
+        };
+
+        for paint in [
+            Paint::for_test(),
+            alt_test_theme_paint(),
+            Paint::without_color_for_test(),
+        ] {
+            let buf = render_with(&paint);
+            assert_eq!(buf[(39, 5)].symbol(), PANE_GRIP);
+            assert_eq!(buf[(39, 10)].symbol(), PANE_GRIP);
+        }
+    }
+
     /// The 1-to-2 and 2-to-1 tab transitions: the bar row exists exactly
     /// while a second tab does, and the painted frame and the tmux-declared
     /// size move together because both come from one chrome split over one
@@ -1125,7 +1274,6 @@ mod tests {
                 area,
                 false,
                 22,
-                false,
                 crate::render::tab_bar_visible(tabs.len()),
             );
             let declared = tmux_client_size(areas.canvas, &tabs[0]);

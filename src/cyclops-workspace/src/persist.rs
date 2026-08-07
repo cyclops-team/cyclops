@@ -6,11 +6,42 @@ use std::path::Path;
 
 use crate::decoration::DecorationSnapshot;
 
+/// Which surface the sidebar shows: the session list or the event stream.
+/// Persisted under `[workspace] sidebar_tab` as `"sessions"`/`"stream"`;
+/// an unknown value loads as the default, so a config written by a newer
+/// build cannot break an older one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum SidebarTab {
+    #[default]
+    Sessions,
+    Stream,
+}
+
+impl SidebarTab {
+    fn as_str(self) -> &'static str {
+        match self {
+            SidebarTab::Sessions => "sessions",
+            SidebarTab::Stream => "stream",
+        }
+    }
+
+    fn parse(s: &str) -> Option<SidebarTab> {
+        match s {
+            "sessions" => Some(SidebarTab::Sessions),
+            "stream" => Some(SidebarTab::Stream),
+            _ => None,
+        }
+    }
+}
+
 /// User intent persisted under `[workspace]` in config.toml.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspacePrefs {
     pub sidebar_visible: bool,
     pub sidebar_width: u16,
+    /// The sidebar tab last selected, restored on reopen like visibility
+    /// and width.
+    pub sidebar_tab: SidebarTab,
     pub workspace_order: Vec<String>,
     /// Stable labels, with pane-id fallbacks for unnamed detected agents.
     pub agent_order: Vec<String>,
@@ -26,6 +57,7 @@ impl Default for WorkspacePrefs {
         WorkspacePrefs {
             sidebar_visible: true,
             sidebar_width: 22,
+            sidebar_tab: SidebarTab::default(),
             workspace_order: Vec::new(),
             agent_order: Vec::new(),
             folder_tracked: Vec::new(),
@@ -71,6 +103,13 @@ pub fn load_prefs(home: &Path) -> WorkspacePrefs {
         .and_then(|v| u16::try_from(v).ok())
     {
         prefs.sidebar_width = v;
+    }
+    if let Some(v) = workspace
+        .get("sidebar_tab")
+        .and_then(|v| v.as_str())
+        .and_then(SidebarTab::parse)
+    {
+        prefs.sidebar_tab = v;
     }
     if let Some(arr) = workspace.get("workspace_order").and_then(|v| v.as_array()) {
         prefs.workspace_order = arr
@@ -135,6 +174,10 @@ pub fn save_prefs(home: &Path, prefs: &WorkspacePrefs) -> std::io::Result<()> {
     workspace.insert(
         "sidebar_width".into(),
         toml::Value::Integer(prefs.sidebar_width as i64),
+    );
+    workspace.insert(
+        "sidebar_tab".into(),
+        toml::Value::String(prefs.sidebar_tab.as_str().into()),
     );
     workspace.insert("workspace_order".into(), order);
     workspace.insert("agent_order".into(), agent_order);
@@ -283,6 +326,7 @@ mod tests {
         let prefs = WorkspacePrefs {
             sidebar_visible: false,
             sidebar_width: 28,
+            sidebar_tab: SidebarTab::Stream,
             workspace_order: vec!["beta".into(), "alpha".into()],
             agent_order: vec!["name:reviewer".into(), "pane:%7".into()],
             folder_tracked: vec!["$3".into(), "$7".into()],
@@ -318,11 +362,14 @@ mod tests {
         std::fs::create_dir_all(&home).expect("scratch");
         std::fs::write(
             home.join("config.toml"),
-            "[workspace]\nsidebar_visible = true\nfuture_key = 42\n",
+            "[workspace]\nsidebar_visible = true\nfuture_key = 42\nsidebar_tab = \"conga\"\n",
         )
         .expect("write");
         let loaded = load_prefs(&home);
         assert!(loaded.sidebar_visible);
+        // A tab value this build does not know falls back to the default
+        // instead of failing the whole load.
+        assert_eq!(loaded.sidebar_tab, SidebarTab::Sessions);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -342,6 +389,7 @@ mod tests {
             &WorkspacePrefs {
                 sidebar_visible: true,
                 sidebar_width: 31,
+                sidebar_tab: SidebarTab::Sessions,
                 workspace_order: vec!["cyclops".into()],
                 agent_order: vec!["name:implementer".into()],
                 folder_tracked: vec![],

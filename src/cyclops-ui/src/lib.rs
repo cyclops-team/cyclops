@@ -27,7 +27,7 @@
 //! the calm/firehose decision, and stable row identity — everything a
 //! renderer needs and nothing about how one paints. `cyclops watch`
 //! (app.rs, frame.rs, entry.rs, plain.rs) is its first renderer; a
-//! workspace event panel reading the same daemon answer through the same
+//! workspace sidebar's Stream tab reading the same daemon answer through the same
 //! model is meant to be the second.
 //!
 //! ## What it does not own

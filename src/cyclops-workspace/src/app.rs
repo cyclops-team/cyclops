@@ -48,10 +48,8 @@ use crate::input::router::{Router, RouterResult};
 use crate::layout::SplitDir;
 use crate::model::{pane_is_visible, RuntimeRegistry, TabModel, WorkspaceModel};
 use crate::naming;
-use crate::persist::{self, load_prefs, set_last_active, WorkspacePrefs};
-use crate::render::{
-    paint_dialog, paint_event_stream, paint_menu, paint_sidebar, paint_tab_bar, paint_window,
-};
+use crate::persist::{self, load_prefs, set_last_active, SidebarTab, WorkspacePrefs};
+use crate::render::{paint_dialog, paint_menu, paint_sidebar, paint_tab_bar, paint_window};
 use crate::resilience::{self, LinkState};
 use crate::selection::{self, SelectionState};
 use crate::sync::{fetch_workspace_model, hydrate_visible_tab};
@@ -173,21 +171,24 @@ struct App {
     /// not name, so a folder-following rename never asks twice; see
     /// [`crate::daemon::watch_session`].
     watched_sessions: HashSet<String>,
-    event_stream_open: bool,
+    /// Which tab the sidebar is showing. Seeded from prefs at boot and
+    /// written back on every change, so a workspace reopens on the tab it
+    /// was left on.
+    sidebar_tab: SidebarTab,
     /// The shared `cyclops watch` stream model (E2): the same ordered,
     /// identity-stable [`cyclops_ui::Entry`] rows that surface renders,
     /// fed by [`spawn_decoration_forwarder`]'s `events.subscribe`
-    /// connection so the panel never opens a second one.
+    /// connection so the Stream tab never opens a second one.
     ///
-    /// Fed whether or not the panel is open. The record is cheap (no IO
-    /// per event, and internally ring-capped) and stopping the feed while
-    /// the panel is closed would show an empty history the moment it
-    /// reopens mid-session; keeping it warm costs nothing a closed panel
-    /// would otherwise save.
+    /// Fed whether or not the Stream tab is showing. The record is cheap
+    /// (no IO per event, and internally ring-capped) and stopping the feed
+    /// while the sidebar sits on Sessions would show an empty history the
+    /// moment the tab is selected mid-session; keeping it warm costs
+    /// nothing a stopped feed would otherwise save.
     ///
     /// Built and fed through [`crate::event_record`]: the same replayed
     /// ledger tail, status seed, and live ordering `cyclops watch` runs,
-    /// so the panel and the CLI show one history rather than two that
+    /// so the Stream tab and the CLI show one history rather than two that
     /// agree only on formatting.
     record: cyclops_ui::Record,
     /// Startup ordering and seq dedup for `record`
@@ -412,16 +413,14 @@ pub async fn run_async() -> i32 {
 
     // Declare terminal cells only after the split topology is known. tmux
     // gets pane content cells; two-cell separator bands remain UI chrome.
-    // The tab-bar row comes from the same freshly fetched model the first
-    // frame paints from, the same snapshot rule `App::chrome` follows.
-    let chrome_canvas = crate::render::chrome_areas_for(
-        Rect::new(0, 0, term_size.0, term_size.1),
-        prefs.sidebar_visible,
-        prefs.sidebar_width.max(crate::render::SIDEBAR_MIN_WIDTH),
-        false,
-        crate::render::tab_bar_visible(model.session.tabs.len()),
-    )
-    .canvas;
+    // The model carries the persisted sidebar visibility BEFORE the
+    // declaration is computed, because the first frame paints from the
+    // model: a workspace quit collapsed would otherwise be declared one
+    // sidebar wide and painted another, and the first reconcile would
+    // fight the declaration. `chrome_for` is the one geometry both read.
+    model.sidebar_visible = prefs.sidebar_visible;
+    let chrome_canvas =
+        chrome_for(Rect::new(0, 0, term_size.0, term_size.1), &model, &prefs).canvas;
     let boot_size = crate::render::tmux_client_size(chrome_canvas, model.active_tab());
     let mut declared_client_size = None;
     if boot_size.0 >= 10 && boot_size.1 >= 3 {
@@ -431,7 +430,10 @@ pub async fn run_async() -> i32 {
                 // The resize can rebalance leaf dimensions. Re-list before
                 // hydration rather than replaying captures into stale slots.
                 if let Ok(resized) = fetch_workspace_model(&client, &session).await {
-                    model = resized;
+                    // A fresh snapshot knows nothing about UI-owned
+                    // preferences; re-carry visibility the same way
+                    // `install_reconciled_model` does for every later one.
+                    install_reconciled_model(&mut model, resized, prefs.sidebar_visible);
                     apply_workspace_order(&mut model, &prefs.workspace_order);
                 }
             }
@@ -478,7 +480,7 @@ pub async fn run_async() -> i32 {
         expanded_workspaces,
         expanded_for: None,
         watched_sessions: HashSet::new(),
-        event_stream_open: false,
+        sidebar_tab: prefs.sidebar_tab,
         record: cyclops_ui::Record::new(),
         intake: cyclops_ui::Intake::new(),
         cursor_style: None,
@@ -491,7 +493,6 @@ pub async fn run_async() -> i32 {
         home,
         folder_probe_at: None,
     };
-    app.model.sidebar_visible = prefs.sidebar_visible;
     // Bare `cyclops` can boot a session config.toml never mentions, so the
     // very first frame is already a frame the daemon may not be watching
     // for. Ask before drawing it.
@@ -1037,6 +1038,25 @@ async fn handle_reconnect(
     Ok(())
 }
 
+/// The chrome split one frame of `model` under `prefs` composes to.
+///
+/// The one place chrome geometry is derived, called by boot (to declare the
+/// tmux client size) and by every frame (to paint). Both must read the same
+/// inputs or the declaration and the paint disagree by the sidebar's width
+/// — the collapsed-at-boot case, and the bug class of 626ec09.
+fn chrome_for(
+    area: Rect,
+    model: &WorkspaceModel,
+    prefs: &WorkspacePrefs,
+) -> crate::render::ChromeAreas {
+    crate::render::chrome_areas_for(
+        area,
+        model.sidebar_visible,
+        prefs.sidebar_width.max(crate::render::SIDEBAR_MIN_WIDTH),
+        crate::render::tab_bar_visible(model.session.tabs.len()),
+    )
+}
+
 /// A workspace can switch or rename sessions after boot. Reconnection must
 /// follow the model's current target, never the name captured at startup.
 fn reconnect_config(base: &ControlConfig, session: &str) -> ControlConfig {
@@ -1050,20 +1070,8 @@ impl App {
         pane_is_visible(self.model.active_tab(), pane)
     }
 
-    fn sidebar_width(&self) -> u16 {
-        self.prefs
-            .sidebar_width
-            .max(crate::render::SIDEBAR_MIN_WIDTH)
-    }
-
     fn chrome(&self, area: Rect) -> crate::render::ChromeAreas {
-        crate::render::chrome_areas_for(
-            area,
-            self.model.sidebar_visible,
-            self.sidebar_width(),
-            self.event_stream_open,
-            crate::render::tab_bar_visible(self.model.session.tabs.len()),
-        )
+        chrome_for(area, &self.model, &self.prefs)
     }
 
     fn persist_active(&self) {
@@ -1563,7 +1571,9 @@ async fn handle_mouse(
                 return Ok(());
             };
             match &target {
-                HitTarget::PaneBody { pane_id } | HitTarget::PaneFrame { pane_id } => {
+                HitTarget::PaneBody { pane_id }
+                | HitTarget::PaneFrame { pane_id }
+                | HitTarget::PaneGrip { pane_id } => {
                     if let Some(action) = action::route_mouse_click(&target, MouseButton::Right) {
                         let outcome = exec::execute(app, client, action).await?;
                         apply_outcome(app, outcome);
@@ -1653,13 +1663,20 @@ async fn handle_mouse(
                         }
                     }
                 }
-                HitTarget::PaneFrame { pane_id } => {
+                HitTarget::PaneFrame { .. } => {
+                    // A frame click focuses, nothing more; the swap pickup
+                    // lives on the corner grip, so the seam cells a frame
+                    // shares with a sibling stay resize handles.
                     app.close_menu();
                     app.selection.clear();
-                    // Down on the frame starts a possible swap drag; a
-                    // below-threshold release focuses the pane instead,
-                    // matching what a frame click always did. The body is
-                    // untouched; dragging there is text selection.
+                }
+                HitTarget::PaneGrip { pane_id } => {
+                    app.close_menu();
+                    app.selection.clear();
+                    // Down on the grip starts a possible swap drag; a
+                    // below-threshold release focuses the pane, same as a
+                    // frame click. The body is untouched; dragging there
+                    // is text selection.
                     app.drag = Some(DragState::on_down(
                         DragTarget::Pane {
                             pane_id: pane_id.clone(),
@@ -1700,6 +1717,7 @@ async fn handle_mouse(
                 }
                 HitTarget::NewTabButton
                 | HitTarget::NewWorkspaceButton
+                | HitTarget::SidebarTab { .. }
                 | HitTarget::AttentionIndicator { .. } => {
                     app.close_menu();
                 }
@@ -2425,9 +2443,6 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
     terminal
         .draw(|f| {
             let areas = app.chrome(f.area());
-            if let Some(panel) = areas.panel {
-                paint_event_stream(&app.record, panel, f.buffer_mut(), &app.paint);
-            }
             if let Some(sidebar) = areas.sidebar {
                 paint_sidebar(
                     &app.model.workspaces,
@@ -2435,6 +2450,8 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
                     &app.model.active_tab().active_pane,
                     &app.expanded_workspaces,
                     &app.prefs.agent_order,
+                    app.sidebar_tab,
+                    &app.record,
                     sidebar,
                     f.buffer_mut(),
                     &app.paint,
@@ -2562,7 +2579,7 @@ mod tests {
             expanded_workspaces: HashSet::new(),
             expanded_for: None,
             watched_sessions: HashSet::new(),
-            event_stream_open: false,
+            sidebar_tab: SidebarTab::default(),
             record: cyclops_ui::Record::new(),
             intake: cyclops_ui::Intake::new(),
             cursor_style: None,
@@ -3316,6 +3333,52 @@ mod tests {
         assert_eq!(reconnect.socket_name, boot.socket_name);
     }
 
+    /// Boot's declared size and the first painted frame read one geometry
+    /// from one pair of inputs, so a workspace quit collapsed reopens
+    /// collapsed with no disagreement between what tmux was told and what
+    /// is on screen. The open case is measured too: without it the
+    /// equality below would hold even if visibility were ignored.
+    #[test]
+    fn a_collapsed_sidebar_declares_the_geometry_the_first_frame_paints() {
+        let area = Rect::new(0, 0, 200, 50);
+        let prefs = WorkspacePrefs {
+            sidebar_visible: false,
+            ..WorkspacePrefs::default()
+        };
+
+        // What `run_async` does before it declares: the persisted
+        // visibility lands on the model, then boot sizes from the model.
+        let mut model = one_pane_model();
+        model.sidebar_visible = prefs.sidebar_visible;
+        let boot = chrome_for(area, &model, &prefs);
+        let declared = crate::render::tmux_client_size(boot.canvas, model.active_tab());
+
+        let mut app = test_app(
+            model,
+            cyclops_proto::scratch::scratch_dir("app-boot-collapsed"),
+        );
+        app.prefs = prefs;
+        let painted = app.chrome(area);
+
+        assert_eq!(painted.sidebar, None, "prefs said collapsed");
+        assert_eq!(painted.canvas, boot.canvas);
+        assert_eq!(
+            crate::render::tmux_client_size(painted.canvas, app.model.active_tab()),
+            declared,
+            "the first frame must paint the canvas boot declared"
+        );
+
+        app.model.sidebar_visible = true;
+        app.prefs.sidebar_visible = true;
+        let open = app.chrome(area);
+        assert_eq!(open.sidebar, Some(Rect::new(0, 0, 22, 50)));
+        assert_ne!(
+            crate::render::tmux_client_size(open.canvas, app.model.active_tab()),
+            declared,
+            "an open sidebar really is a different declaration"
+        );
+    }
+
     #[test]
     fn workspace_disclosure_click_toggles_both_directions() {
         let mut expanded = HashSet::new();
@@ -3710,7 +3773,7 @@ mod tests {
         client.shutdown().await;
     }
 
-    // -- A pane-frame drag released on another pane dispatches one swap
+    // -- A pane-grip drag released on another pane dispatches one swap
     // through the executor. What the swap itself does to tmux is
     // `app::exec::tests`' job; this proves the resolution-to-dispatch
     // wiring against the painted hit rects. --
@@ -3817,6 +3880,382 @@ mod tests {
                 .lines()
                 .any(|line| line == format!("{target} {}", before[0].1)),
             "the target pane must take the dragged pane's slot, got {after}"
+        );
+        client.shutdown().await;
+    }
+
+    // -- The corner grip owns the swap pickup; every other frame cell is a
+    // focus click; the stacked seam resizes. The hit map comes from a real
+    // `paint_window` pass so these tests press the exact cells a user
+    // sees. --
+
+    /// A stacked two-pane app (top over bottom, the bottom labeled like an
+    /// adopted agent pane) whose hit map the real render pass painted at
+    /// the 40x12 test terminal size: pane rects (1,1,38,4) and (1,7,38,3),
+    /// seam rows 5 and 6 with the bottom pane's title strip on row 6, and
+    /// corner grips at (39,5) and (39,10).
+    fn stacked_app_with_painted_hits(top: &str, bottom: &str, home: std::path::PathBuf) -> App {
+        use crate::decoration::PaneDecoration;
+
+        let leaf = |pane_id: &str, y: u16, height: u16| crate::layout::ResolvedLayout::Leaf {
+            pane_id: pane_id.into(),
+            x: 0,
+            y,
+            width: 38,
+            height,
+        };
+        let model = WorkspaceModel {
+            workspaces: vec![crate::model::WorkspaceRow {
+                session_id: "$0".into(),
+                name: "s".into(),
+                tab_count: 1,
+                window_ids: vec!["@0".into()],
+            }],
+            active_workspace: 0,
+            session: crate::model::SessionModel {
+                session: "s".into(),
+                tabs: vec![crate::model::TabModel {
+                    window_id: "@0".into(),
+                    name: "1".into(),
+                    layout: crate::layout::ResolvedLayout::Split {
+                        dir: SplitDir::Vertical,
+                        x: 0,
+                        y: 0,
+                        width: 38,
+                        height: 8,
+                        children: vec![leaf(top, 0, 4), leaf(bottom, 5, 3)],
+                    },
+                    active_pane: bottom.into(),
+                    zoomed: false,
+                }],
+                active_tab: 0,
+            },
+            sidebar_visible: true,
+        };
+        let mut app = test_app(model, home);
+        app.decoration = DecorationSnapshot {
+            online: true,
+            ..Default::default()
+        };
+        app.decoration.panes.insert(
+            bottom.into(),
+            PaneDecoration {
+                pane_id: bottom.into(),
+                window_id: "@0".into(),
+                label: Some("reviewer".into()),
+                manifest: None,
+                manifest_display_name: None,
+                state: cyclops_proto::AgentState::Idle,
+                needs_attention: false,
+            },
+        );
+
+        let tab = app.model.active_tab().clone();
+        let backend = ratatui::backend::TestBackend::new(40, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|frame| {
+            let mut ctx = crate::render::WindowPaintCtx {
+                link: LinkState::Live,
+                paused: &app.paused_panes,
+                hits: &mut app.hit_map,
+                decoration: &app.decoration,
+                selection: None,
+                drag: None,
+                cursor: None,
+            };
+            paint_window(
+                &tab,
+                &app.runtimes,
+                frame.area(),
+                frame.buffer_mut(),
+                &app.paint,
+                &mut ctx,
+            );
+        })
+        .unwrap();
+        app
+    }
+
+    fn mouse_at(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    /// The drag-grip regression: a drag starting on the seam between a top
+    /// and bottom pane must resize the panes and never swap them, even
+    /// with the bottom pane labeled. This is the grab the operator
+    /// reported as "just grabs and does not resize".
+    #[tokio::test]
+    async fn a_drag_from_the_stacked_seam_resizes_and_never_swaps() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("app-seam-resize");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "/bin/sh",
+        ]);
+        server.run_ok(&["split-window", "-v", "-t", "s"]);
+        let heights = |server: &TmuxServer| -> Vec<(String, u16)> {
+            String::from_utf8_lossy(
+                &server
+                    .run(&["list-panes", "-t", "s", "-F", "#{pane_id} #{pane_height}"])
+                    .stdout,
+            )
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                Some((fields.next()?.to_string(), fields.next()?.parse().ok()?))
+            })
+            .collect()
+        };
+        let before = heights(&server);
+        assert_eq!(before.len(), 2);
+        let (top, bottom) = (before[0].0.clone(), before[1].0.clone());
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let mut app = stacked_app_with_painted_hits(
+            &top,
+            &bottom,
+            cyclops_proto::scratch::scratch_dir("app-seam-resize-home"),
+        );
+        let mut detached = false;
+
+        // Row A of the seam, on the columns the title strip shadowed.
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 20, 5),
+            &mut detached,
+        )
+        .await
+        .expect("down");
+        assert!(
+            matches!(
+                app.drag.as_ref().map(|drag| &drag.target),
+                Some(DragTarget::Divider {
+                    dir: SplitDir::Vertical,
+                    ..
+                })
+            ),
+            "the seam must pick up a resize, never a pane"
+        );
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Drag(MouseButton::Left), 20, 8),
+            &mut detached,
+        )
+        .await
+        .expect("drag");
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Up(MouseButton::Left), 20, 8),
+            &mut detached,
+        )
+        .await
+        .expect("up");
+
+        assert!(app.drag.is_none());
+        assert!(
+            !app.needs_reconcile,
+            "a resize applies live; a swap would have asked to reconcile"
+        );
+        let after = heights(&server);
+        assert_eq!(
+            after.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec![top.as_str(), bottom.as_str()],
+            "no swap: both panes keep their slots"
+        );
+        assert_eq!(
+            after[0].1,
+            before[0].1 + 3,
+            "the top pane must grow by the dragged rows"
+        );
+        client.shutdown().await;
+    }
+
+    /// The frame is not a drag handle anymore: left-down on a frame cell,
+    /// including the labeled title strip that used to start the swap,
+    /// focuses the pane and creates no drag, mirroring the right-click arm.
+    #[tokio::test]
+    async fn a_left_down_on_the_frame_focuses_without_picking_the_pane_up() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("app-frame-focus");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "/bin/sh",
+        ]);
+        server.run_ok(&["split-window", "-v", "-t", "s"]);
+        let out = server.run(&["list-panes", "-t", "s", "-F", "#{pane_id}"]);
+        let ids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let (top, bottom) = (ids[0].clone(), ids[1].clone());
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let mut app = stacked_app_with_painted_hits(
+            &top,
+            &bottom,
+            cyclops_proto::scratch::scratch_dir("app-frame-focus-home"),
+        );
+        let mut detached = false;
+
+        // The labeled bottom pane's title strip: the old swap pickup.
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 20, 6),
+            &mut detached,
+        )
+        .await
+        .expect("down");
+        assert!(app.drag.is_none(), "a frame cell must never start a drag");
+
+        // The top pane's frame: focus follows the click.
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 20, 0),
+            &mut detached,
+        )
+        .await
+        .expect("down");
+        assert!(app.drag.is_none());
+        assert_eq!(app.model.active_tab().active_pane, top);
+        let active = server.run(&["display-message", "-p", "-t", "s", "#{pane_id}"]);
+        assert_eq!(String::from_utf8_lossy(&active.stdout).trim(), top);
+        client.shutdown().await;
+    }
+
+    /// The one frame cell that still picks a pane up: a drag from the
+    /// bottom-right corner grip dropped on another pane swaps the two,
+    /// exactly as the frame drag used to.
+    #[tokio::test]
+    async fn a_grip_drag_dropped_on_another_pane_swaps_them() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("app-grip-swap");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "/bin/sh",
+        ]);
+        server.run_ok(&["split-window", "-v", "-t", "s"]);
+        let positions = |server: &TmuxServer| -> Vec<(String, String)> {
+            String::from_utf8_lossy(
+                &server
+                    .run(&["list-panes", "-t", "s", "-F", "#{pane_id} #{pane_top}"])
+                    .stdout,
+            )
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                Some((fields.next()?.to_string(), fields.next()?.to_string()))
+            })
+            .collect()
+        };
+        let before = positions(&server);
+        let (top, bottom) = (before[0].0.clone(), before[1].0.clone());
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let mut app = stacked_app_with_painted_hits(
+            &top,
+            &bottom,
+            cyclops_proto::scratch::scratch_dir("app-grip-swap-home"),
+        );
+        let mut detached = false;
+
+        // Down on the bottom pane's grip cell, drop on the top pane's body.
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 39, 10),
+            &mut detached,
+        )
+        .await
+        .expect("down");
+        assert!(
+            matches!(
+                app.drag.as_ref().map(|drag| &drag.target),
+                Some(DragTarget::Pane { pane_id }) if pane_id == &bottom
+            ),
+            "the grip must pick its pane up for a swap"
+        );
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Drag(MouseButton::Left), 20, 3),
+            &mut detached,
+        )
+        .await
+        .expect("drag");
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Up(MouseButton::Left), 20, 3),
+            &mut detached,
+        )
+        .await
+        .expect("up");
+
+        assert!(app.needs_reconcile, "a swap is structural");
+        let after = positions(&server);
+        assert!(
+            after
+                .iter()
+                .any(|(id, at)| id == &bottom && at == &before[0].1),
+            "the dragged pane must take the top slot, got {after:?}"
+        );
+        assert!(
+            after
+                .iter()
+                .any(|(id, at)| id == &top && at == &before[1].1),
+            "the top pane must take the dragged pane's slot, got {after:?}"
         );
         client.shutdown().await;
     }

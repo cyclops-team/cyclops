@@ -34,6 +34,7 @@ use crate::daemon;
 use crate::decoration::{self, DecorationSnapshot};
 use crate::dialog::Dialog;
 use crate::naming;
+use crate::persist::SidebarTab;
 
 /// What the caller must do after one action executed. Every field defaults
 /// to false ("nothing beyond what already happened"); an arm sets exactly
@@ -215,10 +216,46 @@ pub(super) async fn execute(
             insertion,
         } => Ok(reorder_agent(app, workspace_id, order_key, insertion)),
 
+        Action::ToggleSidebar => {
+            app.model.sidebar_visible = !app.model.sidebar_visible;
+            Ok(commit_sidebar_visibility(app, client).await)
+        }
         Action::ToggleEventPanel => {
-            app.event_stream_open = !app.event_stream_open;
-            super::resize_client(app, client).await;
-            Ok(Outcome::default())
+            // "Show me the stream", and pressed again, "take it away": the
+            // stream goes off and the session list comes back, which is
+            // what turning the old right-hand panel off did to this half
+            // of the screen. Turning it off must never hide the sidebar
+            // instead, or a keyboard-only operator lands on Stream with no
+            // route back to Sessions and the choice persists (visibility
+            // is Ctrl+B b's job alone). A hidden sidebar opens on Stream.
+            let show_stream = !(app.model.sidebar_visible && app.sidebar_tab == SidebarTab::Stream);
+            let tab = if show_stream {
+                SidebarTab::Stream
+            } else {
+                SidebarTab::Sessions
+            };
+            app.sidebar_tab = tab;
+            app.prefs.sidebar_tab = tab;
+            let was_visible = app.model.sidebar_visible;
+            app.model.sidebar_visible = true;
+            if was_visible {
+                // Same columns, different body: tmux has nothing to be told.
+                return Ok(Outcome {
+                    persist: true,
+                    ..Outcome::default()
+                });
+            }
+            Ok(commit_sidebar_visibility(app, client).await)
+        }
+        Action::SelectSidebarTab { tab } => {
+            // No resize: the sidebar keeps its columns, only its body
+            // changes, so tmux has nothing to be told.
+            app.sidebar_tab = tab;
+            app.prefs.sidebar_tab = tab;
+            Ok(Outcome {
+                persist: true,
+                ..Outcome::default()
+            })
         }
         Action::ShowKeybinds => {
             app.dialog = Some(Dialog::Keybinds {
@@ -246,6 +283,22 @@ pub(super) async fn execute(
             detach: true,
             ..Outcome::default()
         }),
+    }
+}
+
+/// Finish a sidebar show/hide: mirror the model's new visibility into
+/// prefs, re-declare the tmux client size for the width the canvas just
+/// gained or lost, and ask the caller to persist.
+///
+/// Every collapse and reopen reflows every pane, the same cost the old
+/// panel toggle carried. Visibility is persisted rather than reset at
+/// boot, so a workspace quit collapsed reopens collapsed.
+async fn commit_sidebar_visibility(app: &mut App, client: &ControlClient) -> Outcome {
+    app.prefs.sidebar_visible = app.model.sidebar_visible;
+    super::resize_client(app, client).await;
+    Outcome {
+        persist: true,
+        ..Outcome::default()
     }
 }
 
@@ -986,7 +1039,7 @@ mod tests {
             expanded_workspaces: HashSet::new(),
             expanded_for: None,
             watched_sessions: HashSet::new(),
-            event_stream_open: false,
+            sidebar_tab: SidebarTab::default(),
             record: cyclops_ui::Record::new(),
             intake: cyclops_ui::Intake::new(),
             cursor_style: None,
@@ -1678,6 +1731,143 @@ mod tests {
 
         client.shutdown().await;
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    // -- The sidebar: collapse, reopen, and which tab the stream chord
+    // lands on. Both toggles re-declare the tmux client size, so these
+    // need a real client. --
+
+    /// Collapse and reopen: the model flips, prefs mirror it, the mirrored
+    /// value survives a round trip through config.toml, and each flip
+    /// re-declares the tmux client size for the columns the canvas just
+    /// gained or lost.
+    #[tokio::test]
+    async fn toggling_the_sidebar_persists_and_redeclares_the_client_size() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-toggle-sidebar");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        let pane = pane_ids(&server, "s")[0].clone();
+        let client = rig_client(&server, "s").await;
+        let home = scratch_home("exec-toggle-sidebar-home");
+        let mut app = test_app(one_tab_model("s", "@0", &pane, "$0"), home.clone());
+        assert!(app.model.sidebar_visible, "the default is open");
+
+        let outcome = execute(&mut app, &client, Action::ToggleSidebar)
+            .await
+            .expect("collapse");
+        assert!(outcome.persist, "the new visibility belongs on disk");
+        assert!(!app.model.sidebar_visible);
+        assert!(!app.prefs.sidebar_visible, "prefs mirror the model");
+        let collapsed = app
+            .declared_client_size
+            .expect("collapsing re-declares the client size");
+
+        // What `apply_outcome` does for the real caller; the reload below
+        // has to read a file that actually exists.
+        crate::persist::save_prefs(&home, &app.prefs).expect("save prefs");
+        assert!(
+            !crate::persist::load_prefs(&home).sidebar_visible,
+            "a workspace quit collapsed must reopen collapsed"
+        );
+
+        let outcome = execute(&mut app, &client, Action::ToggleSidebar)
+            .await
+            .expect("reopen");
+        assert!(outcome.persist);
+        assert!(app.model.sidebar_visible);
+        assert!(app.prefs.sidebar_visible);
+        let reopened = app
+            .declared_client_size
+            .expect("reopening re-declares the client size");
+        assert_ne!(
+            reopened, collapsed,
+            "the canvas has to give the sidebar's columns back"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+        client.shutdown().await;
+    }
+
+    /// The stream chord keeps its meaning through the merge: it shows the
+    /// stream from wherever the sidebar is, and hides the sidebar when the
+    /// stream is already what's showing. A plain tab click is the quiet
+    /// case beside it: the tab persists and tmux is told nothing, because
+    /// the sidebar kept its columns.
+    #[tokio::test]
+    async fn the_stream_chord_toggles_the_stream_and_never_strands_a_tab() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-stream-tab");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        let pane = pane_ids(&server, "s")[0].clone();
+        let client = rig_client(&server, "s").await;
+        let home = scratch_home("exec-stream-tab-home");
+        let mut app = test_app(one_tab_model("s", "@0", &pane, "$0"), home.clone());
+        assert_eq!(app.sidebar_tab, SidebarTab::Sessions);
+
+        // Open on Sessions: the sidebar stays open and swaps tabs.
+        execute(&mut app, &client, Action::ToggleEventPanel)
+            .await
+            .expect("show the stream");
+        assert!(app.model.sidebar_visible);
+        assert_eq!(app.sidebar_tab, SidebarTab::Stream);
+        assert_eq!(app.prefs.sidebar_tab, SidebarTab::Stream);
+
+        // The stream is already what's showing: the chord takes it away
+        // and the session list comes back. It must NOT hide the sidebar,
+        // which would leave a keyboard-only operator on Stream with no
+        // route back to Sessions, persisted across restarts.
+        let declared_open = app.declared_client_size;
+        execute(&mut app, &client, Action::ToggleEventPanel)
+            .await
+            .expect("take the stream away");
+        assert!(app.model.sidebar_visible, "the sidebar never hides here");
+        assert_eq!(app.sidebar_tab, SidebarTab::Sessions);
+        assert_eq!(app.prefs.sidebar_tab, SidebarTab::Sessions);
+        assert_eq!(
+            app.declared_client_size, declared_open,
+            "the sidebar keeps its columns, so tmux hears nothing"
+        );
+        execute(&mut app, &client, Action::ToggleEventPanel)
+            .await
+            .expect("show the stream again");
+        assert!(app.model.sidebar_visible);
+        assert_eq!(app.sidebar_tab, SidebarTab::Stream);
+
+        // Collapsed and sitting on Sessions: one chord has to both open
+        // the sidebar and land it on the stream.
+        app.model.sidebar_visible = false;
+        app.sidebar_tab = SidebarTab::Sessions;
+        execute(&mut app, &client, Action::ToggleEventPanel)
+            .await
+            .expect("open onto the stream");
+        assert!(app.model.sidebar_visible);
+        assert_eq!(app.sidebar_tab, SidebarTab::Stream);
+
+        // A header click back to Sessions: persisted, no resize.
+        let declared = app.declared_client_size;
+        let outcome = execute(
+            &mut app,
+            &client,
+            Action::SelectSidebarTab {
+                tab: SidebarTab::Sessions,
+            },
+        )
+        .await
+        .expect("select the sessions tab");
+        assert!(outcome.persist);
+        assert_eq!(app.sidebar_tab, SidebarTab::Sessions);
+        assert_eq!(app.prefs.sidebar_tab, SidebarTab::Sessions);
+        assert_eq!(
+            app.declared_client_size, declared,
+            "a tab switch costs the canvas no columns, so tmux hears nothing"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+        client.shutdown().await;
     }
 
     // -- Theme picker: the listing filter, and the two ends of an apply. --

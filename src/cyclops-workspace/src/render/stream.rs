@@ -1,7 +1,9 @@
-//! The slide-out event panel: the shared `cyclops watch` stream model's
-//! admitted rows (E2), clipped to this narrower viewport. Row content,
-//! order, and filtering come from `cyclops_ui::Record`; this only turns
-//! its rows into a painted, backend-neutral text panel.
+//! The sidebar's Stream tab body: the shared `cyclops watch` stream
+//! model's admitted rows (E2), clipped to whatever rectangle the sidebar
+//! hands over. Row content, order, and filtering come from
+//! `cyclops_ui::Record`; this only turns its rows into painted,
+//! backend-neutral text. The sidebar owns the surrounding chrome (ground,
+//! border, tab header), so nothing here paints any.
 
 use std::collections::VecDeque;
 
@@ -9,7 +11,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Paragraph, Widget};
 use unicode_width::UnicodeWidthChar;
 
 use cyclops_ui::{Entry, EntryKind, Record};
@@ -17,8 +19,8 @@ use cyclops_ui::{Entry, EntryKind, Record};
 use crate::copy;
 use crate::theme::{self, Paint};
 
-/// One event-panel row: the entry it came from (for [`entry_row_style`])
-/// and the plain line(s) `cyclops watch`'s follow mode would print for it
+/// One stream row: the entry it came from (for [`entry_row_style`]) and
+/// the plain line(s) `cyclops watch`'s follow mode would print for it
 /// ([`Entry::lines`], comfortable density — a message's body hangs its
 /// first line under the subject there too).
 pub struct EventRow<'a> {
@@ -26,7 +28,7 @@ pub struct EventRow<'a> {
     pub lines: Vec<String>,
 }
 
-/// The event panel's row-producing path: every entry the record's own
+/// The Stream tab's row-producing path: every entry the record's own
 /// calm-view decision admits ([`Record::admits`]), oldest first, each
 /// turned into the exact words and glyphs [`cyclops_ui::Entry::lines`]
 /// gives any renderer. Pure and backend-neutral — no Ratatui, no color —
@@ -35,7 +37,7 @@ pub struct EventRow<'a> {
 ///
 /// Nothing here re-sorts, re-filters beyond `admits`, or rewords a line:
 /// the model owns the order and the content, this only asks for it. A
-/// caller that needs fewer rows than the record holds (the panel's
+/// caller that needs fewer rows than the record holds (the sidebar's
 /// viewport) clips the RESULT, never this call.
 pub fn event_stream_rows(record: &Record) -> Vec<EventRow<'_>> {
     let plain = cyclops_ui::Theme::none();
@@ -49,8 +51,8 @@ pub fn event_stream_rows(record: &Record) -> Vec<EventRow<'_>> {
         .collect()
 }
 
-/// Which cyclops-theme token colors one event-panel row. This only picks
-/// the token; the glyph and the word are already in the text
+/// Which cyclops-theme token colors one stream row. This only picks the
+/// token; the glyph and the word are already in the text
 /// [`event_stream_rows`] produced, so `NO_COLOR` (`paint.colors_enabled`
 /// false, `theme::style_token` folds to no style) leaves the row exactly
 /// as legible (rule 11).
@@ -65,65 +67,52 @@ fn entry_row_style(kind: &EntryKind, paint: &Paint) -> Style {
         // The daemon's own ping at a human: the eye's alert token, not a
         // state or badge group.
         EntryKind::Notify { .. } => theme::attention_eye(paint),
-        // Plain body rows: chrome text on the panel's own raised ground,
+        // Plain body rows: chrome text on the sidebar's panel ground,
         // never the terminal's foreground, which a themed ground could
         // render unreadable on a light host.
         EntryKind::Msg { .. }
         | EntryKind::Gate { .. }
         | EntryKind::Session { .. }
         | EntryKind::PaneGone { .. }
-        | EntryKind::Other { .. } => theme::menu_row(paint),
+        | EntryKind::Other { .. } => theme::chrome_panel(paint),
     }
 }
 
-/// Slide-out event panel: the shared `cyclops watch` stream model's
-/// admitted rows (E2), clipped to this narrower viewport. See
+/// Paint the stream into `area`: the shared `cyclops watch` stream
+/// model's admitted rows (E2), bottom-windowed to this viewport. See
 /// [`event_stream_rows`] for the row content and ordering guarantee, and
 /// `crate::app::App::record`'s doc for what feeds it.
-pub fn paint_event_stream(record: &Record, area: Rect, buf: &mut Buffer, paint: &Paint) {
-    let w = area.width.min(40);
-    let panel = Rect::new(
-        area.x + area.width.saturating_sub(w),
-        area.y,
-        w,
-        area.height,
-    );
-    let block = Block::default()
-        .borders(Borders::LEFT)
-        .title(" Event stream ")
-        .border_style(theme::pane_border_focused(paint))
-        .style(theme::menu_row(paint));
-    let inner = block.inner(panel);
-    block.render(panel, buf);
-
+pub(crate) fn paint_event_stream(record: &Record, area: Rect, buf: &mut Buffer, paint: &Paint) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let rows = event_stream_rows(record);
     if rows.is_empty() {
         Paragraph::new(Line::from(Span::styled(
             copy::EVENT_STREAM_EMPTY,
             theme::sidebar_row(paint),
         )))
-        .render(inner, buf);
+        .render(area, buf);
         return;
     }
 
     // An admitted row can be several lines (a message's body) and any one
-    // of those can be wider than the panel, so "row" and "rendered line"
-    // are different units. Capping by row count let one old, wide row's
-    // wrap push the newest row's lines past the bottom of the viewport,
-    // where `Paragraph` silently drops them (it fills from its first line
-    // and stops, so overflow is lost off the end, not the start). The
-    // panel's guarantee is the last `inner.height` RENDERED lines, so this
-    // wraps to `inner.width` itself and windows the result, rather than
-    // asking `Paragraph::wrap` for a word-wrapped line count it does not
-    // expose.
-    let lines = visible_window(&rows, inner.width as usize, inner.height as usize, paint);
-    Paragraph::new(lines).render(inner, buf);
+    // of those can be wider than the viewport, so "row" and "rendered
+    // line" are different units. Capping by row count let one old, wide
+    // row's wrap push the newest row's lines past the bottom, where
+    // `Paragraph` silently drops them (it fills from its first line and
+    // stops, so overflow is lost off the end, not the start). The
+    // guarantee is the last `area.height` RENDERED lines, so this wraps
+    // to `area.width` itself and windows the result, rather than asking
+    // `Paragraph::wrap` for a word-wrapped line count it does not expose.
+    let lines = visible_window(&rows, area.width as usize, area.height as usize, paint);
+    Paragraph::new(lines).render(area, buf);
 }
 
 /// Wraps `text` at `width` display columns, matching how a narrower
 /// terminal would actually break the run of glyphs `text` already is (no
-/// re-flow, no trimming — the panel's other rows are pre-formatted text,
-/// not prose).
+/// re-flow, no trimming — the stream's rows are pre-formatted text, not
+/// prose).
 ///
 /// A char whose width would overflow the open segment starts a new one; a
 /// zero-width char (a combining mark) always joins whatever segment is
@@ -156,7 +145,7 @@ fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
 ///    prepending them, so a record holding thousands of admitted rows only
 ///    ever wraps the screenful this renders rather than the whole ring.
 /// 2. Stop as soon as `height` lines have accumulated, then keep exactly
-///    the last `height` of them. A row taller than the panel is trimmed
+///    the last `height` of them. A row taller than the viewport is trimmed
 ///    from its own front, the same as the window as a whole, so it shows
 ///    its tail rather than disappearing under an older row's lines.
 ///
@@ -246,17 +235,11 @@ mod tests {
         );
     }
 
-    /// The panel renders the model's own glyph and word — the same
+    /// The Stream tab renders the model's own glyph and word — the same
     /// content `cyclops watch` shows for the identical entry — through
     /// Ratatui rather than a private debug-formatted projection.
-    ///
-    /// A state whose word plus "reviewer" comes in under this backend's
-    /// content width: the panel caps its own width at 40 regardless of
-    /// the terminal, so the row this fixture renders has to fit inside
-    /// that fixed 39-column budget to test the glyph and word rather than
-    /// this module's own hard wrap (covered separately, below).
     #[test]
-    fn event_panel_renders_the_calm_views_glyph_and_word() {
+    fn the_stream_renders_the_calm_views_glyph_and_word() {
         let mut record = Record::new();
         record.live(state_entry(
             1_000,
@@ -283,15 +266,16 @@ mod tests {
     }
 
     /// Rule 11, mechanically: turn color off and read the same lines. The
-    /// event panel's rows carry their glyph and word regardless of
+    /// stream's rows carry their glyph and word regardless of
     /// `paint.colors_enabled`; only the `Style` painted over them changes.
     /// The plain body row also proves the themed side of the contract:
-    /// chrome text on the panel ground, never the terminal's foreground.
+    /// chrome text on the sidebar's panel ground, never the terminal's
+    /// foreground.
     #[test]
-    fn event_panel_rows_read_the_same_with_color_off() {
+    fn stream_rows_read_the_same_with_color_off() {
         let mut record = Record::new();
-        // A short target keeps the state line inside the panel's 39-column
-        // inner width, so each entry is exactly one rendered row.
+        // A short target keeps the state line inside the 40-column test
+        // viewport, so each entry is exactly one rendered row.
         record.live(state_entry(
             1_000,
             "rev",
@@ -330,35 +314,35 @@ mod tests {
             flatten(&plain),
             "the words and glyphs must not depend on color"
         );
-        // Column 0 is the panel's left border and row 0 its title; the
-        // state entry renders on row 1, the message on row 2.
+        // No border, no title: the state entry renders on row 0, the
+        // message on row 1, both from column 0.
         assert_ne!(
-            colored[(1, 1)].fg,
+            colored[(0, 0)].fg,
             RtColor::Reset,
             "color on must actually paint the state row"
         );
         assert_eq!(
-            colored[(1, 2)].fg,
-            theme::menu_row(&paint).fg.expect("chrome text color"),
+            colored[(0, 1)].fg,
+            theme::chrome_panel(&paint).fg.expect("chrome text color"),
             "a plain body row wears chrome text, not the terminal's own"
         );
         assert_eq!(
-            plain[(1, 1)].fg,
+            plain[(0, 0)].fg,
             RtColor::Reset,
             "NO_COLOR must leave no color behind"
         );
         assert_eq!(
-            plain[(1, 2)].fg,
+            plain[(0, 1)].fg,
             RtColor::Reset,
             "NO_COLOR must leave the plain row uncolored too"
         );
     }
 
     /// The defect this module exists to fix: an older row's target is long
-    /// enough that its own wrapped lines alone exceed the panel's height,
-    /// so with only entries (not rendered lines) capped, Ratatui's `Wrap`
-    /// renders from the first line onward and never reaches the newer
-    /// row. The oldest lines survive; the newest entry is cut off.
+    /// enough that its own wrapped lines alone exceed the viewport's
+    /// height, so with only entries (not rendered lines) capped, Ratatui's
+    /// `Wrap` renders from the first line onward and never reaches the
+    /// newer row. The oldest lines survive; the newest entry is cut off.
     #[test]
     fn newest_entrys_lines_survive_when_an_older_entry_wraps_past_the_window() {
         let mut record = Record::new();
@@ -375,7 +359,7 @@ mod tests {
             cyclops_proto::AgentState::BlockedQuota,
         ));
 
-        let backend = TestBackend::new(31, 3);
+        let backend = TestBackend::new(30, 2);
         let mut term = Terminal::new(backend).unwrap();
         let paint = Paint::for_test();
         term.draw(|f| {
@@ -388,18 +372,17 @@ mod tests {
         assert!(text.contains(&newest_word), "{text:?}");
     }
 
-    /// A single entry taller than the panel keeps bottom-aligned
+    /// A single entry taller than the viewport keeps bottom-aligned
     /// semantics: its own trailing lines are what the reader sees, never
     /// its opening ones.
     ///
     /// The target's length is picked so the row's word lands exactly on a
-    /// wrapped line's start and fits inside one: `flatten` reads the
-    /// panel's left border once per row, so a word straddling two wrapped
-    /// lines would read back with that border cell spliced into the
-    /// middle of it, which is a property of the test's own flattening and
-    /// not of the panel.
+    /// wrapped line's start and fits inside one: `flatten` concatenates
+    /// rows, so a word straddling two wrapped lines would not read back
+    /// contiguously, which would be a property of the test's own
+    /// flattening and not of the stream.
     #[test]
-    fn a_newest_entry_taller_than_the_panel_shows_its_own_tail() {
+    fn a_newest_entry_taller_than_the_viewport_shows_its_own_tail() {
         let mut record = Record::new();
         let target = format!("head{}", "m".repeat(302));
         record.live(state_entry(
@@ -409,7 +392,7 @@ mod tests {
             cyclops_proto::AgentState::BlockedPermission,
         ));
 
-        let backend = TestBackend::new(21, 6);
+        let backend = TestBackend::new(20, 5);
         let mut term = Terminal::new(backend).unwrap();
         let paint = Paint::for_test();
         term.draw(|f| {

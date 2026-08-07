@@ -10,8 +10,9 @@ pub enum DragTarget {
         pane_id: String,
         dir: SplitDir,
     },
-    /// Swap a pane with the one it is dropped on. Picked up by its frame,
-    /// never its body: a body drag is text selection.
+    /// Swap a pane with the one it is dropped on. Picked up by its corner
+    /// grip, never its frame or body: a frame click focuses and a body
+    /// drag is text selection.
     Pane {
         pane_id: String,
     },

@@ -7,6 +7,25 @@ versions are unreleased until admin cuts a tag.
 
 ### Added (v4)
 
+- Pane swap moves to a dedicated grip. Every pane paints a one-cell `⠿`
+  handle in its bottom-right border corner, and dragging that cell onto
+  another pane swaps the two with the drop resolution and focus-follows
+  behavior frame-drag had (F43). The rest of the frame is no longer a
+  drag handle: a left-click focuses the pane, so the resize seam between
+  stacked panes is never shadowed by a swap pickup and a labeled bottom
+  pane's seam resizes again. Keyboard swap chords are untouched, and the
+  keybinds sheet teaches the grip from the painted glyph itself.
+- The sidebar collapses and carries tabs. `Ctrl+B` `b` (config key
+  `toggle_sidebar`) hands the sidebar's columns to the pane canvas; the
+  state persists, so a workspace quit collapsed reopens collapsed.
+  Collapsing takes the `☰ menu` button with it, so the chord is
+  deliberately the only route in or out: no menu item can hide the panel
+  that carries the menu.
+- The sidebar's header carries `Sessions` and `Stream` chips. Click
+  either to swap what the panel shows; the choice persists under
+  `[workspace] sidebar_tab`. The chips take the row the plain
+  "Workspaces" title used to hold, so the session tree keeps every row
+  it had.
 - `cyclops update`. One verb to rebuild from the latest source and
   replace the installed binaries in place. It names the build you are
   running, asks the source whether anything is newer first
@@ -31,6 +50,17 @@ versions are unreleased until admin cuts a tag.
   the bar's visibility from the same model snapshot, so the grid never
   drifts a row from what tmux was told. `prefix+c` and the menu's New
   tab still create tabs while the bar is hidden.
+
+### Changed (v4)
+
+- The event stream moved out of its own right-hand slide-out and into
+  the sidebar's Stream tab. It inherits the sidebar's drag-to-resize and
+  persisted width instead of a hardcoded 40 columns, and its rows still
+  come from the one `event_stream_rows` path `cyclops watch` parity is
+  proven against. `Ctrl+B` `e` and the app menu's Event stream item keep
+  their names: show the stream, press again for the session list back.
+  The trade is real: the session list and the event stream now share one
+  panel and cannot be read at the same time.
 
 ### Fixed (v4)
 

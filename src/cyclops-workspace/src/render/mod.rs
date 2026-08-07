@@ -9,19 +9,19 @@
 //!
 //! This module does not own persistence, daemon queries, or attention
 //! predicates — it reads whatever state its callers hand it and paints or
-//! measures, nothing more. Each surface below has clear seams (sidebar,
-//! pane canvas, tab bar, dialogs/menus, event panel) and lives in its own
-//! file; this file owns only what those surfaces share: the top-level
-//! chrome split (`chrome_areas_for`), the cell-to-style bridge
-//! (`cell_style`/`rt_color`), and the one text primitive
-//! (`overlay_text`) every surface paints through.
+//! measures, nothing more. Each surface below has clear seams (sidebar
+//! with its Sessions/Stream tabs, pane canvas, tab bar, dialogs/menus)
+//! and lives in its own file; this file owns only what those surfaces
+//! share: the top-level chrome split (`chrome_areas_for`), the
+//! cell-to-style bridge (`cell_style`/`rt_color`), and the one text
+//! primitive (`overlay_text`) every surface paints through.
 
 #![allow(clippy::too_many_arguments)]
 
 mod canvas;
-mod event_panel;
 mod overlay;
 mod sidebar;
+mod stream;
 mod tab_bar;
 
 use ratatui::buffer::Buffer;
@@ -31,17 +31,15 @@ use ratatui::style::{Color as RtColor, Modifier, Style};
 use crate::drag::{DragState, DragTarget};
 use crate::runtime::{Color, GridCell};
 
-pub use canvas::{paint_window, tmux_client_size, HostCursor, WindowPaintCtx};
-pub use event_panel::{event_stream_rows, paint_event_stream, EventRow};
+pub use canvas::{paint_window, tmux_client_size, HostCursor, WindowPaintCtx, PANE_GRIP};
 pub use overlay::{keybind_max_scroll, paint_dialog, paint_menu};
 pub use sidebar::paint_sidebar;
+pub use stream::{event_stream_rows, EventRow};
 pub use tab_bar::paint_tab_bar;
 
 /// A chrome region's height in the tab bar. It never grows: the row is a
 /// strip, not a panel.
 const TAB_BAR_HEIGHT: u16 = 1;
-/// Fixed width of the slide-out event panel.
-const EVENT_STREAM_WIDTH: u16 = 40;
 /// Narrowest a readable sidebar can be: below this, workspace and agent
 /// names truncate into noise.
 pub(crate) const SIDEBAR_MIN_WIDTH: u16 = 22;
@@ -52,7 +50,6 @@ const SIDEBAR_MAX_WIDTH: u16 = 42;
 /// Chrome rectangles for one frame.
 pub struct ChromeAreas {
     pub sidebar: Option<Rect>,
-    pub panel: Option<Rect>,
     pub tab_bar: Rect,
     pub canvas: Rect,
 }
@@ -71,15 +68,15 @@ pub fn tab_bar_visible(tab_count: usize) -> bool {
     tab_count > 1
 }
 
-/// Split one frame into the sidebar, event panel, tab bar, and pane canvas
-/// — the top-level chrome composition every painted surface below sits
-/// inside. `app` decides visibility and width; this only turns those
-/// decisions into rectangles.
+/// Split one frame into the sidebar, tab bar, and pane canvas — the
+/// top-level chrome composition every painted surface below sits inside.
+/// `app` decides visibility and width; this only turns those decisions
+/// into rectangles. The sidebar is the one side panel: its Stream tab
+/// hosts what used to be a separate right-hand event panel.
 pub fn chrome_areas_for(
     area: Rect,
     sidebar_visible: bool,
     sidebar_width: u16,
-    panel_open: bool,
     tab_bar_visible: bool,
 ) -> ChromeAreas {
     let mut main = area;
@@ -88,18 +85,6 @@ pub fn chrome_areas_for(
         let s = Rect::new(main.x, main.y, w, main.height);
         main = Rect::new(main.x + w, main.y, main.width - w, main.height);
         Some(s)
-    } else {
-        None
-    };
-    let panel = if panel_open && main.width > EVENT_STREAM_WIDTH + 4 {
-        let p = Rect::new(
-            main.x + main.width - EVENT_STREAM_WIDTH,
-            main.y,
-            EVENT_STREAM_WIDTH,
-            main.height,
-        );
-        main = Rect::new(main.x, main.y, main.width - EVENT_STREAM_WIDTH, main.height);
-        Some(p)
     } else {
         None
     };
@@ -117,7 +102,6 @@ pub fn chrome_areas_for(
     );
     ChromeAreas {
         sidebar,
-        panel,
         tab_bar,
         canvas,
     }
@@ -663,18 +647,22 @@ mod tests {
 
     #[test]
     fn chrome_canvas_excludes_sidebar_and_tab_bar() {
-        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, false, true);
+        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, true);
         assert_eq!(areas.sidebar, Some(Rect::new(0, 0, 22, 50)));
         assert_eq!(areas.tab_bar, Rect::new(22, 0, 178, 1));
         assert_eq!(areas.canvas, Rect::new(22, 1, 178, 49));
-        assert_eq!(areas.panel, None);
     }
 
+    /// The collapsed shape: no sidebar rectangle at all, and the canvas
+    /// owns every column. This is the geometry boot must declare when
+    /// prefs say collapsed — the sidebar's Stream tab replaced the old
+    /// right-hand carve, so nothing else may eat width here.
     #[test]
-    fn chrome_canvas_shrinks_for_event_stream() {
-        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, true, true);
-        assert_eq!(areas.panel, Some(Rect::new(160, 0, 40, 50)));
-        assert_eq!(areas.canvas, Rect::new(22, 1, 138, 49));
+    fn a_collapsed_sidebar_gives_the_canvas_the_full_terminal() {
+        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), false, 22, true);
+        assert_eq!(areas.sidebar, None);
+        assert_eq!(areas.tab_bar, Rect::new(0, 0, 200, 1));
+        assert_eq!(areas.canvas, Rect::new(0, 1, 200, 49));
     }
 
     /// One tab hides the strip whole: no bar rectangle, and the canvas
@@ -687,7 +675,7 @@ mod tests {
         assert!(!tab_bar_visible(1));
         assert!(tab_bar_visible(2));
 
-        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, false, false);
+        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, false);
         assert_eq!(areas.tab_bar.height, 0);
         assert_eq!(areas.canvas, Rect::new(22, 0, 178, 50));
     }
