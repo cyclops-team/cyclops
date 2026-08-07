@@ -319,7 +319,7 @@ fn paint_session_tree(
             content,
             content.x,
             y,
-            &format!("{grip}{marker} {} ({})", ws.name, ws.tab_count),
+            &format!("{grip}{marker} {}", ws.name),
             style,
         );
         hits.push(

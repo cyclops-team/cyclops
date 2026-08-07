@@ -15,8 +15,10 @@
 use tokio::time::{Duration, Instant};
 
 /// How long a notice stays up: long enough to read a short phrase without
-/// hunting for it, short enough to be gone before the next action.
-pub const NOTICE_TTL: Duration = Duration::from_millis(1500);
+/// hunting for it, short enough to be gone before the next action. The
+/// first number was a second and a half, which the operator read as
+/// gone-before-you-look on a border you are not already watching.
+pub const NOTICE_TTL: Duration = Duration::from_millis(3500);
 
 /// One message slot. Empty is the resting state, and an empty slot has no
 /// deadline, so an idle workspace still has no wakeups.

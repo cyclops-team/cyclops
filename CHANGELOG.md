@@ -86,7 +86,7 @@ versions are unreleased until admin cuts a tag.
   edge. `Ctrl+B` `b` still works; the chevron is its mouse half.
 - Copying says so. A short notice (`copied 12 characters`,
   `copied 4 lines`) appears on the focused pane's bottom border and
-  clears itself after about a second and a half with no keypress. It is
+  clears itself after about three and a half seconds with no keypress. It is
   painted on chrome the workspace owns, never on a pane's cells, and it
   moves no rectangle, because a reflow here would reflow every agent's
   TUI. The mechanism is a general transient notice; copy is its first

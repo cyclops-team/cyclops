@@ -198,7 +198,7 @@ selects a line.
 A copy says what it took, where the border has room for the phrase. A
 short notice (`copied 12 characters`,
 `copied 4 lines`) appears on the focused pane's bottom border and clears
-itself after about a second and a half; no keypress dismisses it. It is
+itself after about three and a half seconds; no keypress dismisses it. It is
 painted on chrome the workspace owns, never on a pane's cells, and
 nothing resizes when it appears or expires, so no agent's TUI reflows for
 it. The count comes from the selection itself, which is the only honest
