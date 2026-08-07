@@ -66,6 +66,11 @@ change whenever coverage grows.
 - Hook-backed verification requires wiring the generated hook into the
   vendor CLI; without it, delivery can still finish with screen evidence and
   an explicitly unverified receipt.
+- Renaming a watched session (folder-following does this) stops its watcher;
+  the daemon waits for the old name and the session is watched again when
+  something re-registers the new one, such as reopening the workspace. The
+  follow-up design lives in
+  [.agents/planning/2026-08-07-bugfix-follow-ups/handoff.md](.agents/planning/2026-08-07-bugfix-follow-ups/handoff.md).
 
 For the repository map and design boundaries, read
 [docs/development/HANDOFF.md](docs/development/HANDOFF.md). For user-facing
