@@ -548,6 +548,14 @@ pub async fn run_async() -> i32 {
                 // deadline that frame ends up riding on. Checked before the
                 // render deadline so the two collapse into one draw.
                 let notice_expired = app.notice.expire(now);
+                // The highlight and the notice are one confirmation with
+                // two halves, so they leave together: the selection that
+                // was copied has done its job once the words announcing
+                // it are gone, and a highlight nobody cleared reads as
+                // state the pane is still in.
+                if notice_expired {
+                    app.selection.clear();
+                }
                 if debounce.is_some_and(|deadline| deadline <= now) {
                     debounce = None;
                     let resize_applied = match apply_live_divider(&mut app, &client).await {
