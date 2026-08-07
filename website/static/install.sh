@@ -10,7 +10,8 @@
 # Flags:
 #   --prefix DIR   install the binaries here instead of picking a directory
 #   --no-path      never edit a shell profile; print the line to add instead
-#   --uninstall    remove the binaries and the profile block, keep ~/.cyclops
+#   --uninstall    stop the daemon, remove the binaries and the profile
+#                  block, keep ~/.cyclops
 #   --help
 #
 # What it will and will not do: it never uses sudo, never touches your
@@ -69,7 +70,7 @@ usage() {
     say "Options:"
     say "  --prefix DIR   install the binaries in DIR"
     say "  --no-path      do not edit a shell profile"
-    say "  --uninstall    remove binaries and the installer-owned PATH block"
+    say "  --uninstall    stop the daemon, remove binaries and the PATH block"
     say "  --help         show this help"
     exit 0
 }
@@ -174,6 +175,19 @@ strip_block() {
 
 do_uninstall() {
     step "removing cyclops"
+
+    # Stop a running daemon while the binary still exists to ask it to.
+    # Deleting the binaries out from under live processes is how "I
+    # removed it but still see it" happens: the daemon and any open
+    # workspace keep running their deleted copies until they exit.
+    stopper="$(command -v cyclops 2>/dev/null || true)"
+    [ -n "$PREFIX" ] && [ -f "$PREFIX/cyclops" ] && stopper="$PREFIX/cyclops"
+    if [ -n "$stopper" ] && [ -x "$stopper" ]; then
+        if "$stopper" daemon stop >/dev/null 2>&1; then
+            note "stopped the daemon"
+        fi
+    fi
+
     removed=0
     for name in cyclops cyclopsd; do
         # An explicit --prefix wins; otherwise take whatever the shell
