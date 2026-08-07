@@ -183,6 +183,18 @@ pub fn sidebar_label(paint: &Paint) -> Style {
         .patch(paint.bg_token(tokens::CHROME_PANEL))
 }
 
+/// The workspace's transient notice, painted on chrome the workspace owns
+/// (`render::canvas::paint_notice`). Accent ink on the chrome ground so it
+/// reads as the workspace speaking rather than as pane content; the words
+/// are the encoding, and bold is all that is left to carry it when color
+/// is off (rule 11).
+pub fn chrome_notice(paint: &Paint) -> Style {
+    paint
+        .style_token(tokens::SURFACE_ACCENT)
+        .patch(paint.bg_token(tokens::CHROME_PANEL))
+        .add_modifier(Modifier::BOLD)
+}
+
 /// Compact create buttons shared by the tab strip and sidebar footer.
 pub fn add_button(paint: &Paint) -> Style {
     chrome_raised(paint)

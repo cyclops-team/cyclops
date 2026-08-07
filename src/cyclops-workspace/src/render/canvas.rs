@@ -31,6 +31,9 @@ pub struct WindowPaintCtx<'a> {
     pub decoration: &'a DecorationSnapshot,
     pub selection: Option<&'a Selection>,
     pub drag: Option<&'a DragState>,
+    /// The workspace's transient notice, painted on the focused pane's
+    /// bottom border. See [`paint_notice`] for why that row.
+    pub notice: Option<&'a str>,
     /// The hardware cursor when the focused pane shows one.
     pub cursor: Option<HostCursor>,
 }
@@ -406,6 +409,11 @@ fn paint_pane_frame(
             cell.set_style(border_style);
         }
     }
+    if slot.focused {
+        if let Some(notice) = ctx.notice {
+            paint_notice(vis, bounds, notice, buf, paint);
+        }
+    }
 
     let left = vis.x.saturating_sub(1).max(bounds.x);
     let top = vis.y.saturating_sub(1).max(bounds.y);
@@ -535,6 +543,34 @@ fn paint_pane_frame(
             )
         },
     );
+}
+
+/// Paint the workspace's transient notice along the focused frame's bottom
+/// border.
+///
+/// That row and no other. It is chrome the workspace draws itself, so a
+/// notice never covers a cell tmux owns and never moves one: nothing
+/// resizes when a message appears or expires, which matters because a
+/// reflow here would reflow every agent's TUI. It is also the border of
+/// the pane the operator was just working in, so the confirmation lands
+/// where the eye already is instead of at a screen edge. The top border is
+/// spoken for by the pane's identity, state, and split controls, so the
+/// bottom is the free one; it does carry the corner grip, which the text
+/// stops short of, and under a stacked sibling it doubles as that pair's
+/// resize band. Painting over a band is safe where painting over a
+/// control would not be: the notice registers no hit region, so every
+/// cell it tints still drags, and it is gone in a second either way.
+///
+/// Too narrow to hold the whole phrase means nothing is painted: half a
+/// sentence on a border reads as corruption, not as feedback.
+fn paint_notice(frame: Rect, bounds: Rect, notice: &str, buf: &mut Buffer, paint: &Paint) {
+    let text = format!(" {notice} ");
+    let width = u16::try_from(Span::raw(text.as_str()).width()).unwrap_or(u16::MAX);
+    let y = frame.y.saturating_add(frame.height);
+    if width > frame.width || y >= bounds.y.saturating_add(bounds.height) {
+        return;
+    }
+    super::overlay_text(buf, bounds, frame.x, y, &text, theme::chrome_notice(paint));
 }
 
 fn pane_title_rect(slot: &PaneSlot, bounds: Rect, control_left: u16) -> Option<Rect> {
@@ -770,6 +806,7 @@ mod tests {
             decoration,
             selection: None,
             drag: None,
+            notice: None,
             cursor: None,
         }
     }
@@ -1112,6 +1149,7 @@ mod tests {
                 &theme,
                 &mut hits,
                 &DecorationSnapshot::default(),
+                None,
             );
             let paused = std::collections::HashSet::new();
             let dec = DecorationSnapshot::default();
@@ -1253,29 +1291,142 @@ mod tests {
         }
     }
 
-    /// The 1-to-2 and 2-to-1 tab transitions: the bar row exists exactly
-    /// while a second tab does, and the painted frame and the tmux-declared
-    /// size move together because both come from one chrome split over one
-    /// tabs snapshot. If a call site ever derived the visibility predicate
-    /// from a different snapshot, the panes would paint one row off the
-    /// declared grid (the bug class of 626ec09).
+    /// The notice is chrome and only chrome. It lands on the focused
+    /// frame's bottom border, where the eye already is, and NOTHING else
+    /// about the frame moves: not one pane cell, not one pane rectangle.
+    /// A notice that reflowed the canvas would reflow every agent's TUI
+    /// underneath it.
     #[test]
-    fn tab_transitions_keep_painted_rows_and_declared_size_together() {
+    fn a_notice_paints_on_the_focused_border_and_moves_no_pane_cell() {
+        let tab = two_pane_tab();
         let area = Rect::new(0, 0, 40, 12);
-        let solo = vec![two_pane_tab()];
-        let mut paired = vec![two_pane_tab(), two_pane_tab()];
-        paired[1].window_id = "@1".into();
-        paired[1].name = "logs".into();
+        let render = |notice: Option<&str>| -> (Buffer, Vec<Rect>) {
+            let runtimes = RuntimeRegistry::default();
+            let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            let mut hits = HitMap::default();
+            let paused = std::collections::HashSet::new();
+            let dec = DecorationSnapshot::default();
+            term.draw(|f| {
+                let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
+                ctx.notice = notice;
+                paint_window(
+                    &tab,
+                    &runtimes,
+                    area,
+                    f.buffer_mut(),
+                    &Paint::for_test(),
+                    &mut ctx,
+                );
+            })
+            .unwrap();
+            let bodies = hits
+                .regions()
+                .iter()
+                .filter(|region| matches!(region.target, HitTarget::PaneBody { .. }))
+                .map(|region| region.rect)
+                .collect();
+            (term.backend().buffer().clone(), bodies)
+        };
+
+        let (quiet, quiet_bodies) = render(None);
+        let (noticed, noticed_bodies) = render(Some("copied 12 characters"));
+
+        // The focused pane is %0, the top one; its frame's bottom border is
+        // the row the grip test pins at y = 5, starting one cell in from
+        // the canvas margin.
+        let row = |buf: &Buffer, y: u16| -> String {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect()
+        };
+        assert!(
+            row(&noticed, 5).contains("copied 12 characters"),
+            "the notice must land on the focused frame's bottom border: {}",
+            row(&noticed, 5)
+        );
+        assert!(
+            !row(&quiet, 5).contains("copied"),
+            "and nowhere at all when there is nothing to say"
+        );
+        assert_eq!(
+            noticed[(39, 5)].symbol(),
+            PANE_GRIP,
+            "the text must stop short of the corner grip"
+        );
+
+        // Every other cell is untouched, and the pane rectangles are
+        // identical: appearing changed no geometry, so expiring cannot
+        // either.
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if y == 5 && (1..23).contains(&x) {
+                    continue;
+                }
+                assert_eq!(
+                    noticed[(x, y)],
+                    quiet[(x, y)],
+                    "the notice disturbed cell {x},{y}"
+                );
+            }
+        }
+        assert_eq!(
+            noticed_bodies, quiet_bodies,
+            "pane rectangles must not move"
+        );
+    }
+
+    /// A border with no room for the whole phrase shows none of it: half a
+    /// sentence on a border reads as corruption, not as feedback.
+    #[test]
+    fn a_notice_too_wide_for_the_border_is_not_painted_at_all() {
+        let tab = two_pane_tab();
+        let area = Rect::new(0, 0, 40, 12);
+        let runtimes = RuntimeRegistry::default();
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        let mut hits = HitMap::default();
+        let paused = std::collections::HashSet::new();
+        let dec = DecorationSnapshot::default();
+        let long = "copied 2000 characters from a pane far too narrow to say so";
+        term.draw(|f| {
+            let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
+            ctx.notice = Some(long);
+            paint_window(
+                &tab,
+                &runtimes,
+                area,
+                f.buffer_mut(),
+                &Paint::for_test(),
+                &mut ctx,
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let border: String = (0..area.width).map(|x| buf[(x, 5)].symbol()).collect();
+        assert!(
+            !border.contains("copied"),
+            "a clipped notice must not paint at all: {border}"
+        );
+    }
+
+    /// Showing and hiding the strip: the painted frame and the
+    /// tmux-declared size move together, because both come from one chrome
+    /// split over one preference. If a call site ever read visibility from
+    /// somewhere else, the panes would paint one row off the declared grid
+    /// (the bug class of 626ec09). A lone tab keeps its strip either way,
+    /// because the `+` that makes the second tab lives there.
+    #[test]
+    fn hiding_the_tab_bar_keeps_painted_rows_and_declared_size_together() {
+        let area = Rect::new(0, 0, 40, 12);
+        let tabs = vec![two_pane_tab()];
 
         // One frame, the way `draw` composes it: chrome split, declared
-        // size, tab bar, and window paint all from the same tabs slice.
-        let frame = |tabs: &[TabModel]| -> (Buffer, (u16, u16)) {
-            let areas = crate::render::chrome_areas_for(
-                area,
-                false,
-                22,
-                crate::render::tab_bar_visible(tabs.len()),
-            );
+        // size, tab bar, and window paint all from the same inputs.
+        let frame = |tab_bar_visible: bool| -> (Buffer, Rect, (u16, u16)) {
+            // Sidebar collapsed, so its rail owns column 0 and the canvas
+            // starts at column 1: the two chrome edges compose, and the
+            // ring below is asserted against the split rather than against
+            // a hardcoded corner.
+            let areas = crate::render::chrome_areas_for(area, false, 22, tab_bar_visible);
             let declared = tmux_client_size(areas.canvas, &tabs[0]);
             let backend = TestBackend::new(area.width, area.height);
             let mut term = Terminal::new(backend).unwrap();
@@ -1284,13 +1435,14 @@ mod tests {
             let runtimes = RuntimeRegistry::default();
             term.draw(|f| {
                 paint_tab_bar(
-                    tabs,
+                    &tabs,
                     0,
                     areas.tab_bar,
                     f.buffer_mut(),
                     &theme,
                     &mut hits,
                     &DecorationSnapshot::default(),
+                    None,
                 );
                 let paused = std::collections::HashSet::new();
                 let dec = DecorationSnapshot::default();
@@ -1305,7 +1457,7 @@ mod tests {
                 );
             })
             .unwrap();
-            (term.backend().buffer().clone(), declared)
+            (term.backend().buffer().clone(), areas.canvas, declared)
         };
         let top_row = |buf: &Buffer| -> String {
             (0..buf.area.width)
@@ -1313,36 +1465,42 @@ mod tests {
                 .collect()
         };
 
-        // Two tabs: the strip owns the top row and the pane ring starts
-        // under it.
-        let (with_bar, declared_with_bar) = frame(&paired);
+        // Shown, which is what a fresh install gets: the strip owns the top
+        // row, chip and all, and the pane ring starts under it.
+        let (with_bar, canvas_with_bar, declared_with_bar) = frame(true);
         assert!(
             top_row(&with_bar).contains("main"),
             "the strip must carry the tab chips: {}",
             top_row(&with_bar)
         );
+        assert!(
+            top_row(&with_bar).contains('+'),
+            "and the button that makes tabs: {}",
+            top_row(&with_bar)
+        );
         assert_eq!(
-            with_bar[(0, 1)].symbol(),
-            "╭",
-            "ring starts under the strip"
+            with_bar[(canvas_with_bar.x, canvas_with_bar.y)].symbol(),
+            "\u{256d}",
+            "the ring has to start exactly where the chrome split put the canvas"
         );
 
-        // Back to one tab: the ring reclaims the top row, no chip remains,
-        // and the declared grid grows by exactly the reclaimed row.
-        let (lone, declared_lone) = frame(&solo);
+        // Hidden on purpose: the ring reclaims the top row, no chip
+        // remains, and the declared grid grows by exactly that row.
+        let (no_bar, canvas_no_bar, declared_no_bar) = frame(false);
+        assert_eq!(canvas_no_bar.y, canvas_with_bar.y - 1);
         assert_eq!(
-            lone[(0, 0)].symbol(),
-            "╭",
+            no_bar[(canvas_no_bar.x, canvas_no_bar.y)].symbol(),
+            "\u{256d}",
             "the canvas reclaims the top row"
         );
         assert!(
-            !top_row(&lone).contains("main"),
+            !top_row(&no_bar).contains("main"),
             "no tab chip may survive the hide: {}",
-            top_row(&lone)
+            top_row(&no_bar)
         );
-        assert_eq!(declared_lone.0, declared_with_bar.0);
+        assert_eq!(declared_no_bar.0, declared_with_bar.0);
         assert_eq!(
-            declared_lone.1,
+            declared_no_bar.1,
             declared_with_bar.1 + 1,
             "the bar row moves between chrome and the declared grid, whole"
         );
@@ -2008,6 +2166,7 @@ mod tests {
                         &theme,
                         &mut hits,
                         &dec,
+                        None,
                     );
                     let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
                     paint_window(&tab, &runtimes, canvas, f.buffer_mut(), &theme, &mut ctx);

@@ -252,6 +252,10 @@ pub enum Action {
     /// Collapse or reopen the sidebar. Visibility persists, so a
     /// workspace quit while collapsed reopens collapsed.
     ToggleSidebar,
+    /// Show or hide the tab strip. Visible is the default and hiding is an
+    /// explicit choice, so the `+` that makes tabs is on screen from a
+    /// fresh install; the choice persists like the sidebar's.
+    ToggleTabBar,
     /// Show the event stream: open the sidebar on its Stream tab. When
     /// the stream is already what's showing, hide the sidebar instead —
     /// the same "toggle the stream surface off, canvas back" meaning the
@@ -394,6 +398,7 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
             session: ctx.session.to_string(),
         }),
         BindingAction::ToggleSidebar => Some(Action::ToggleSidebar),
+        BindingAction::ToggleTabBar => Some(Action::ToggleTabBar),
         BindingAction::ToggleEventPanel => Some(Action::ToggleEventPanel),
         BindingAction::ShowKeybinds => Some(Action::ShowKeybinds),
         BindingAction::ShowThemes => Some(Action::ShowThemes),
@@ -606,6 +611,9 @@ pub fn route_mouse_click(target: &HitTarget, button: MouseButton) -> Option<Acti
             Some(Action::SelectSidebarTab { tab: *tab })
         }
         (HitTarget::NewWorkspaceButton, MouseButton::Left) => Some(Action::NewWorkspace),
+        // The chevron is the mouse's half of Ctrl+B b, on the panel edge
+        // and on the collapsed rail alike.
+        (HitTarget::SidebarToggle, MouseButton::Left) => Some(Action::ToggleSidebar),
         (HitTarget::AttentionIndicator { pane_id }, MouseButton::Left) => Some(Action::FocusPane {
             pane_id: pane_id.clone(),
         }),

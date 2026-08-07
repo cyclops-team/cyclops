@@ -65,12 +65,32 @@ versions are unreleased until admin cuts a tag.
   tmux, on no match, and with `--all`, the output is byte for byte what
   it was. `--json` scopes identically and carries the elided names as
   an additive `also_watching` field (parity, not a second shape).
-- The tab bar earns its row. With a single tab the strip hides and the
-  pane canvas reclaims the row; it returns the moment a second tab
-  exists. The painted chrome and the tmux-declared client size derive
-  the bar's visibility from the same model snapshot, so the grid never
-  drifts a row from what tmux was told. `prefix+c` and the menu's New
-  tab still create tabs while the bar is hidden.
+- Hiding the tab bar is the operator's choice, not the tab count's. The
+  strip ships visible so its `+` is always there, and the app menu's Tab
+  bar item (config key `toggle_tab_bar`) puts it away and brings it
+  back; the choice persists under `[workspace] tab_bar_visible`. The
+  painted chrome and the tmux-declared client size read that one flag
+  from the same snapshot, so the grid never drifts a row from what tmux
+  was told. An earlier build hid the strip automatically whenever a
+  workspace had one tab, which silently removed the only visible way to
+  add a tab.
+- Every visible control now answers the mouse the same way, one rule
+  written down in the render module: a control sits in the chrome of the
+  thing it acts on, as a glyph pointing the way the click moves things,
+  with a hit region as large as that chrome allows and a fill under the
+  pointer. The tab strip's `+`, the sidebar footer's `+`, and the new
+  sidebar chevron are all this.
+- A collapsed sidebar keeps a one-column rail carrying a `▸` chevron, so
+  a mouse can always reopen it and the `☰ menu` it holds is never
+  stranded. Open, the same control sits as `◂` on the sidebar's own
+  edge. `Ctrl+B` `b` still works; the chevron is its mouse half.
+- Copying says so. A short notice (`copied 12 characters`,
+  `copied 4 lines`) appears on the focused pane's bottom border and
+  clears itself after about a second and a half with no keypress. It is
+  painted on chrome the workspace owns, never on a pane's cells, and it
+  moves no rectangle, because a reflow here would reflow every agent's
+  TUI. The mechanism is a general transient notice; copy is its first
+  caller.
 
 ### Changed (v4)
 

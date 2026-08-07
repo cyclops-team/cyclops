@@ -1,15 +1,16 @@
 # The workspace UI
 
 Bare `cyclops` on a TTY opens the full-screen terminal workspace: a
-project sidebar and a live pane canvas fed by tmux control mode, plus a
-tab bar whenever the workspace has more than one tab; a lone tab's strip
-hides and the canvas keeps the row. The sidebar is the one side panel:
-its header carries a `Sessions` tab (the workspace and agent tree) and a
-`Stream` tab (the live `cyclops watch` event stream). It collapses out of
-the way with `Ctrl+B` `b`, and both the collapse and the selected tab
-persist, so the workspace reopens the way you left it. Collapsing takes
-the `☰ menu` button with it, so the chord is deliberately the only way
-in or out: no menu item can hide the panel that carries the menu.
+project sidebar, a tab bar, and a live pane canvas fed by tmux control
+mode. The tab bar shows by default however many tabs the workspace has,
+because the `+` that makes the next tab lives there; the app menu's
+`Tab bar` item is what puts it away and brings it back. The sidebar is
+the one side panel: its header carries a `Sessions` tab (the workspace
+and agent tree) and a `Stream` tab (the live `cyclops watch` event
+stream). It collapses out of the way with `Ctrl+B` `b` or with the `◂`
+chevron on its outer edge, leaving a one-column rail whose `▸` chevron
+brings it back. The collapse, the tab bar's visibility, and the selected
+sidebar tab all persist, so the workspace reopens the way you left it.
 With no tmux server running (or no sessions on it), it starts one — a
 fresh session named `main` with a single shell pane in the directory you
 ran it from. Its first tab is `1`; automatic tab names continue with `2`,
@@ -53,6 +54,10 @@ Default bindings are prefix-first (`Ctrl+B`, same shape as tmux):
 | `Ctrl+B` `b` | Collapse or reopen the sidebar |
 | `Ctrl+B` `e` | Show the event stream (sidebar's Stream tab); press again for the session list back |
 | `Ctrl+B` `?` | Open the scrollable keybinding reference |
+
+Hiding the tab bar ships with no chord: the app menu's `Tab bar` item is
+the way, so a hidden strip is always something you chose. Bind
+`toggle_tab_bar` in `config.toml` if you want a key for it.
 
 Unbound keys, including modified terminal keys such as Claude Code's
 `Shift+Tab`, pass through to the focused pane. Terminal paste is forwarded as
@@ -141,15 +146,24 @@ screen at a time.
 
 Drag the sidebar's right border to resize it, on either tab. The saved
 width is bounded to keep both sidebar and terminal useful: at most 42
-cells and never more than half the terminal. Collapsing the sidebar
-(`Ctrl+B` `b`) hands its columns back to the pane canvas; every collapse
-and reopen re-declares the tmux client size, so all panes reflow. The
-sidebar has no reopen button while it is collapsed — the chord is the way
-back.
+cells and never more than half the terminal.
 
-The filled `+` in the tab strip opens the new-tab dialog. With a single
-tab the strip is hidden: create the second tab with `prefix+c` or the
-menu's New tab, and the strip appears with the `+`. Type a name and use
+The `◂` chevron on the sidebar's outer edge, bottom corner, collapses
+the panel; the same click as `Ctrl+B` `b`. Collapsing leaves a one-column
+rail in its place carrying a `▸` chevron, and the whole column is
+clickable, so the mouse always has a way back to the panel and to the
+`☰ menu` button the panel carries. Every collapse and reopen hands the
+remaining columns to the pane canvas and re-declares the tmux client
+size, so all panes reflow.
+
+Hide the tab strip from the app menu's `Tab bar` item, and bring it back
+the same way. That item is the only visible switch, which is why the
+menu has to stay reachable from the collapsed rail. Hiding gives the
+strip's row to the pane canvas and re-declares the client size, exactly
+like a sidebar collapse.
+
+The filled `+` in the tab strip opens the new-tab dialog, whether the
+workspace has one tab or ten. Type a name and use
 `↵ Create`, or click that action; the tab opens in the focused pane's current
 directory with that name. An empty name uses the next numeric tab name.
 `Esc Cancel` creates nothing. Rename and pane-name dialogs use the same
@@ -175,13 +189,21 @@ Home/End, or the mouse wheel.
 
 Wheel over a pane scrolls its history; new output never pulls a scrolled
 viewport back to the tail. Drag a gutter to resize, drag a tab onto another
-tab to reorder, or onto a workspace row to move it there (a lone tab has
-no chip while its strip is hidden; give the workspace a second tab
-first). Drag workspace rows
+tab to reorder, or onto a workspace row to move it there. Drag workspace rows
 to reorder the sidebar; drag agent rows within one workspace to reorder its
 children. Both sidebar orders persist. Click-drag inside a pane selects text
 and copies it on release; double-click selects a word, and triple-click
 selects a line.
+
+A copy says what it took, where the border has room for the phrase. A
+short notice (`copied 12 characters`,
+`copied 4 lines`) appears on the focused pane's bottom border and clears
+itself after about a second and a half; no keypress dismisses it. It is
+painted on chrome the workspace owns, never on a pane's cells, and
+nothing resizes when it appears or expires, so no agent's TUI reflows for
+it. The count comes from the selection itself, which is the only honest
+report available: a clipboard write can never tell Cyclops what the
+terminal did with it.
 
 To rearrange panes, drag the `⠿` grip in a pane's bottom-right border
 corner onto another pane; the two swap places and the dropped pane stays
@@ -203,6 +225,7 @@ owned by another Cyclops component:
 sidebar_visible = true
 sidebar_width = 28
 sidebar_tab = "sessions"
+tab_bar_visible = true
 workspace_order = ["main", "website"]
 agent_order = ["name:implementer", "name:reviewer"]
 folder_tracked = []
@@ -210,6 +233,7 @@ folder_tracked = []
 [workspace.bindings]
 name_pane = "prefix m"
 toggle_sidebar = "prefix b"
+toggle_tab_bar = "prefix t"
 show_keybinds = "prefix ?"
 ```
 

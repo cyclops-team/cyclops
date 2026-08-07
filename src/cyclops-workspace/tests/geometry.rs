@@ -102,8 +102,11 @@ async fn window_tracks_every_canvas_redeclaration() {
     assert_eq!(rig.window_size("geo").0, 176);
     assert_eq!(rig.pane_widths("geo").iter().sum::<u16>(), 175);
 
-    // Sidebar collapsed: its 22 columns go back to the canvas, then it
-    // reopens and takes them again.
+    // A wider canvas, the shape a sidebar collapse produces: the window
+    // follows whatever the control client declares. The numbers here are
+    // driven directly rather than derived from a chrome split, because
+    // this test pins the tmux side of the contract; the split itself is
+    // pinned by the chrome tests in app.rs.
     client
         .set_client_size(198, 47)
         .await

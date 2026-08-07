@@ -42,6 +42,11 @@ pub struct WorkspacePrefs {
     /// The sidebar tab last selected, restored on reopen like visibility
     /// and width.
     pub sidebar_tab: SidebarTab,
+    /// Whether the tab strip shows. Visible is the default and hiding it
+    /// is the operator's explicit choice, so the `+` that makes tabs is on
+    /// screen from a fresh install; restored on reopen like the sidebar's
+    /// own visibility.
+    pub tab_bar_visible: bool,
     pub workspace_order: Vec<String>,
     /// Stable labels, with pane-id fallbacks for unnamed detected agents.
     pub agent_order: Vec<String>,
@@ -58,6 +63,7 @@ impl Default for WorkspacePrefs {
             sidebar_visible: true,
             sidebar_width: 22,
             sidebar_tab: SidebarTab::default(),
+            tab_bar_visible: true,
             workspace_order: Vec::new(),
             agent_order: Vec::new(),
             folder_tracked: Vec::new(),
@@ -110,6 +116,9 @@ pub fn load_prefs(home: &Path) -> WorkspacePrefs {
         .and_then(SidebarTab::parse)
     {
         prefs.sidebar_tab = v;
+    }
+    if let Some(v) = workspace.get("tab_bar_visible").and_then(|v| v.as_bool()) {
+        prefs.tab_bar_visible = v;
     }
     if let Some(arr) = workspace.get("workspace_order").and_then(|v| v.as_array()) {
         prefs.workspace_order = arr
@@ -178,6 +187,10 @@ pub fn save_prefs(home: &Path, prefs: &WorkspacePrefs) -> std::io::Result<()> {
     workspace.insert(
         "sidebar_tab".into(),
         toml::Value::String(prefs.sidebar_tab.as_str().into()),
+    );
+    workspace.insert(
+        "tab_bar_visible".into(),
+        toml::Value::Boolean(prefs.tab_bar_visible),
     );
     workspace.insert("workspace_order".into(), order);
     workspace.insert("agent_order".into(), agent_order);
@@ -327,6 +340,7 @@ mod tests {
             sidebar_visible: false,
             sidebar_width: 28,
             sidebar_tab: SidebarTab::Stream,
+            tab_bar_visible: false,
             workspace_order: vec!["beta".into(), "alpha".into()],
             agent_order: vec!["name:reviewer".into(), "pane:%7".into()],
             folder_tracked: vec!["$3".into(), "$7".into()],
@@ -370,6 +384,9 @@ mod tests {
         // A tab value this build does not know falls back to the default
         // instead of failing the whole load.
         assert_eq!(loaded.sidebar_tab, SidebarTab::Sessions);
+        // The key a config written before this build simply lacks: the
+        // strip shows, which is what a fresh install gets too.
+        assert!(loaded.tab_bar_visible);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -390,6 +407,7 @@ mod tests {
                 sidebar_visible: true,
                 sidebar_width: 31,
                 sidebar_tab: SidebarTab::Sessions,
+                tab_bar_visible: true,
                 workspace_order: vec!["cyclops".into()],
                 agent_order: vec!["name:implementer".into()],
                 folder_tracked: vec![],

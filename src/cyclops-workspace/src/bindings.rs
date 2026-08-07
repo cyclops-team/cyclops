@@ -38,6 +38,13 @@ pub enum BindingAction {
     CloseWorkspace,
     /// Collapse or reopen the sidebar; the state persists across restarts.
     ToggleSidebar,
+    /// Show or hide the tab strip; the state persists across restarts.
+    ///
+    /// No default chord. The strip ships visible and the app menu's "Tab
+    /// bar" item is the way it goes away and comes back, so hiding it can
+    /// never be something that happened by itself; bindable via config for
+    /// anyone who wants a key.
+    ToggleTabBar,
     /// Show the event stream on the sidebar's Stream tab, or hide the
     /// sidebar when the stream is what's showing. The name predates the
     /// merge of the old right-hand panel into the sidebar; the config key
@@ -250,6 +257,7 @@ fn action_from_key(key: &str) -> Option<BindingAction> {
         "rename_workspace" => Some(BindingAction::RenameWorkspace),
         "close_workspace" => Some(BindingAction::CloseWorkspace),
         "toggle_sidebar" => Some(BindingAction::ToggleSidebar),
+        "toggle_tab_bar" => Some(BindingAction::ToggleTabBar),
         "toggle_event_panel" => Some(BindingAction::ToggleEventPanel),
         "show_keybinds" => Some(BindingAction::ShowKeybinds),
         "show_themes" => Some(BindingAction::ShowThemes),
@@ -316,12 +324,28 @@ pub fn binding_help(bindings: &HashMap<BindingAction, BindingChord>) -> Vec<Bind
     for (offset, row) in swaps.into_iter().enumerate() {
         rows.insert(at + offset, row);
     }
-    // The grip, copy, and paste are fixed gestures, not bindings, but this
-    // reference is the one place a user looks for them. The grip row quotes
-    // the painted glyph so the sheet cannot drift from the chrome.
+    // The grip, the sidebar chevron, copy, and paste are fixed gestures,
+    // not bindings, but this reference is the one place a user looks for
+    // them. Each row quotes the painted glyph so the sheet cannot drift
+    // from the chrome.
     rows.push(BindingHelp {
         keys: format!("Drag {}", crate::render::PANE_GRIP),
         action: "Swap panes (bottom-right grip)".into(),
+    });
+    rows.push(BindingHelp {
+        keys: format!(
+            "Click {} / {}",
+            crate::render::SIDEBAR_COLLAPSE,
+            crate::render::SIDEBAR_EXPAND
+        ),
+        action: "Collapse / reopen the sidebar".into(),
+    });
+    // The tab strip's switch ships as a menu item and no default chord,
+    // so nothing in the bindings map would mention it. An operator who
+    // hid the strip has to be able to find the way back here.
+    rows.push(BindingHelp {
+        keys: "Menu".into(),
+        action: "Tab bar: show or hide the strip".into(),
     });
     rows.push(BindingHelp {
         keys: "Drag".into(),
@@ -366,6 +390,7 @@ fn action_words(action: BindingAction) -> String {
         BindingAction::RenameWorkspace => "Rename workspace".into(),
         BindingAction::CloseWorkspace => "Close workspace".into(),
         BindingAction::ToggleSidebar => "Toggle sidebar".into(),
+        BindingAction::ToggleTabBar => "Toggle tab bar".into(),
         BindingAction::ToggleEventPanel => "Toggle event stream".into(),
         BindingAction::ShowKeybinds => "Keybinds".into(),
         BindingAction::ShowThemes => "Themes".into(),
@@ -399,6 +424,7 @@ fn help_rank(action: BindingAction) -> (u8, usize) {
         BindingAction::RenameWorkspace => (43, 0),
         BindingAction::CloseWorkspace => (44, 0),
         BindingAction::ToggleSidebar => (49, 0),
+        BindingAction::ToggleTabBar => (49, 1),
         BindingAction::ToggleEventPanel => (50, 0),
         BindingAction::ShowKeybinds => (51, 0),
         BindingAction::ShowThemes => (52, 0),
@@ -565,6 +591,26 @@ mod tests {
             .find(|row| row.action == "Swap panes (bottom-right grip)")
             .expect("grip row");
         assert_eq!(grip.keys, format!("Drag {}", crate::render::PANE_GRIP));
+    }
+
+    /// The chevron is a fixed gesture like the grip, and its row quotes
+    /// the glyphs the chrome actually paints, so a glyph change cannot
+    /// leave the sheet teaching a control that is no longer there.
+    #[test]
+    fn help_teaches_the_sidebar_chevron_with_the_painted_glyphs() {
+        let rows = binding_help(&default_bindings());
+        let chevron = rows
+            .iter()
+            .find(|row| row.action == "Collapse / reopen the sidebar")
+            .expect("chevron row");
+        assert_eq!(
+            chevron.keys,
+            format!(
+                "Click {} / {}",
+                crate::render::SIDEBAR_COLLAPSE,
+                crate::render::SIDEBAR_EXPAND
+            )
+        );
     }
 
     /// The swap rows derive from the live focus chords, right after them,

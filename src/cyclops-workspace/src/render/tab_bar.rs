@@ -23,6 +23,7 @@ pub fn paint_tab_bar(
     paint: &Paint,
     hits: &mut HitMap,
     decoration: &DecorationSnapshot,
+    hover: Option<(u16, u16)>,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -59,18 +60,31 @@ pub fn paint_tab_bar(
         x = x.saturating_add(w + 1);
     }
     let plus = " + ";
+    let mut plus_hovered = false;
     if x < right {
-        hits.push(
-            Rect::new(
-                x,
-                area.y,
-                (plus.len() as u16).min(right - x),
-                area.height.max(1),
-            ),
-            HitTarget::NewTabButton,
+        let rect = Rect::new(
+            x,
+            area.y,
+            (plus.len() as u16).min(right - x),
+            area.height.max(1),
         );
+        // The `+` lights under the mouse like every other chrome control
+        // (render/mod.rs rule 1). Without this the strip's own button was
+        // the one control in the language that never answered the pointer.
+        plus_hovered = hover.is_some_and(|(col, row)| {
+            col >= rect.x
+                && col < rect.x + rect.width
+                && row >= rect.y
+                && row < rect.y + rect.height
+        });
+        hits.push(rect, HitTarget::NewTabButton);
     }
-    spans.push(Span::styled(plus, theme::add_button(paint)));
+    let plus_style = if plus_hovered {
+        theme::add_button_hover(paint)
+    } else {
+        theme::add_button(paint)
+    };
+    spans.push(Span::styled(plus, plus_style));
     Paragraph::new(Line::from(spans)).render(area, buf);
 }
 
@@ -100,6 +114,7 @@ mod tests {
                 &theme,
                 &mut hits,
                 &DecorationSnapshot::default(),
+                None,
             );
         })
         .unwrap();
@@ -125,5 +140,47 @@ mod tests {
             buf[(8, 0)].bg,
             "the add button should read as part of the tab strip"
         );
+    }
+
+    /// Rule 1 in render/mod.rs promises every chrome control lights under
+    /// the pointer, and names this button as one of the three. It shipped
+    /// taking no hover at all, so the strip's own button was the one
+    /// control in the language that never answered the mouse.
+    #[test]
+    fn the_add_button_lights_under_the_mouse() {
+        let paint_at = |hover: Option<(u16, u16)>| {
+            let mut term = Terminal::new(TestBackend::new(40, 2)).unwrap();
+            let mut hits = HitMap::default();
+            term.draw(|f| {
+                paint_tab_bar(
+                    &[two_pane_tab()],
+                    0,
+                    Rect::new(0, 0, 40, 1),
+                    f.buffer_mut(),
+                    &Paint::for_test(),
+                    &mut hits,
+                    &DecorationSnapshot::default(),
+                    hover,
+                );
+            })
+            .unwrap();
+            (term.backend().buffer().clone(), hits)
+        };
+
+        let (cold, hits) = paint_at(None);
+        let plus = (0..40)
+            .find(|x| matches!(hits.hit(*x, 0), Some(HitTarget::NewTabButton)))
+            .expect("the strip paints a + button");
+        let (lit, _) = paint_at(Some((plus, 0)));
+        assert_ne!(
+            cold[(plus, 0)].bg,
+            lit[(plus, 0)].bg,
+            "hovering the + has to change the cell under the pointer"
+        );
+
+        // And only under the pointer: a hover somewhere else on the strip
+        // must leave the button alone.
+        let (elsewhere, _) = paint_at(Some((1, 0)));
+        assert_eq!(cold[(plus, 0)].bg, elsewhere[(plus, 0)].bg);
     }
 }

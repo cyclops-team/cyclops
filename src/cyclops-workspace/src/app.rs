@@ -48,10 +48,13 @@ use crate::input::router::{Router, RouterResult};
 use crate::layout::SplitDir;
 use crate::model::{pane_is_visible, RuntimeRegistry, TabModel, WorkspaceModel};
 use crate::naming;
+use crate::notice::NoticeState;
 use crate::persist::{self, load_prefs, set_last_active, SidebarTab, WorkspacePrefs};
-use crate::render::{paint_dialog, paint_menu, paint_sidebar, paint_tab_bar, paint_window};
+use crate::render::{
+    paint_dialog, paint_menu, paint_sidebar, paint_sidebar_rail, paint_tab_bar, paint_window,
+};
 use crate::resilience::{self, LinkState};
-use crate::selection::{self, SelectionState};
+use crate::selection::{self, Selection, SelectionState};
 use crate::sync::{fetch_workspace_model, hydrate_visible_tab};
 use crate::term_guard::TermGuard;
 use crate::theme::Paint;
@@ -160,6 +163,11 @@ struct App {
     hover: Option<(u16, u16)>,
     selection: SelectionState,
     drag: Option<DragState>,
+    /// The one transient message slot (`crate::notice`). Its deadline
+    /// joins the loop's deadline set below, so a notice clears itself on
+    /// an idle workspace without a keypress and without a timer of its
+    /// own.
+    notice: NoticeState,
     decoration: DecorationSnapshot,
     prefs: WorkspacePrefs,
     /// Stable session ids whose agent children are visible in the sidebar.
@@ -473,6 +481,7 @@ pub async fn run_async() -> i32 {
         hover: None,
         selection: SelectionState::default(),
         drag: None,
+        notice: NoticeState::default(),
         // Nothing to fall back to on the first frame: no answer here is
         // genuinely "nothing known yet", which is what the default says.
         decoration: decoration::fetch_decoration(&home).unwrap_or_default(),
@@ -509,10 +518,15 @@ pub async fn run_async() -> i32 {
     let mut detached = false;
     let _ = draw(&mut terminal, &mut app);
     while !detached {
-        let next_deadline = [debounce, reconnect_deadline, app.folder_probe_at]
-            .into_iter()
-            .flatten()
-            .min();
+        let next_deadline = [
+            debounce,
+            reconnect_deadline,
+            app.folder_probe_at,
+            app.notice.deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         match next_wake(&mut rx, next_deadline).await {
             Wake::Message(msg) => {
                 if !handle_app_msg(
@@ -530,6 +544,10 @@ pub async fn run_async() -> i32 {
             }
             Wake::Deadline => {
                 let now = Instant::now();
+                // A timed-out notice is gone from the next frame, whichever
+                // deadline that frame ends up riding on. Checked before the
+                // render deadline so the two collapse into one draw.
+                let notice_expired = app.notice.expire(now);
                 if debounce.is_some_and(|deadline| deadline <= now) {
                     debounce = None;
                     let resize_applied = match apply_live_divider(&mut app, &client).await {
@@ -556,6 +574,10 @@ pub async fn run_async() -> i32 {
                     if let Some(watch) = theme_watch.as_mut() {
                         refresh_theme_watch(&mut app, watch);
                     }
+                    let _ = draw(&mut terminal, &mut app);
+                } else if notice_expired {
+                    // Nothing else is due: the expiry is the only reason
+                    // this frame exists, and it owes exactly one.
                     let _ = draw(&mut terminal, &mut app);
                 }
                 if app.folder_probe_at.is_some_and(|due| due <= now) {
@@ -1053,7 +1075,7 @@ fn chrome_for(
         area,
         model.sidebar_visible,
         prefs.sidebar_width.max(crate::render::SIDEBAR_MIN_WIDTH),
-        crate::render::tab_bar_visible(model.session.tabs.len()),
+        prefs.tab_bar_visible,
     )
 }
 
@@ -1380,7 +1402,7 @@ async fn handle_app_msg(
             if matches!(mouse.kind, MouseEventKind::Moved)
                 && !app.menu.is_open()
                 && app.dialog.is_none()
-                && !crate::input::mouse::motion_touches_new_workspace_button(
+                && !crate::input::mouse::motion_touches_hover_button(
                     &app.hit_map,
                     app.hover,
                     mouse.column,
@@ -1718,6 +1740,7 @@ async fn handle_mouse(
                 HitTarget::NewTabButton
                 | HitTarget::NewWorkspaceButton
                 | HitTarget::SidebarTab { .. }
+                | HitTarget::SidebarToggle
                 | HitTarget::AttentionIndicator { .. } => {
                     app.close_menu();
                 }
@@ -1825,11 +1848,7 @@ async fn handle_mouse(
                 }
             } else if app.selection.is_dragging() {
                 if let Some(sel) = app.selection.finish_drag() {
-                    if let Some(rt) = app.runtimes.get_mut(&sel.pane_id) {
-                        if let Some(text) = selection::SelectionState::extract(rt, &sel) {
-                            selection::copy_to_clipboard(&text);
-                        }
-                    }
+                    copy_selection(app, &sel);
                 }
             } else {
                 let _ = app.selection.finish_drag();
@@ -1951,11 +1970,38 @@ fn copy_active_selection(app: &mut App) {
     let Some(sel) = app.selection.active.clone() else {
         return;
     };
-    if let Some(rt) = app.runtimes.get_mut(&sel.pane_id) {
-        if let Some(text) = selection::SelectionState::extract(rt, &sel) {
-            selection::copy_to_clipboard(&text);
-        }
-    }
+    copy_selection(app, &sel);
+}
+
+/// Copy one finished selection: take the text, write the clipboard, say
+/// what landed.
+///
+/// The clipboard write is the only step with an effect outside this
+/// process, and it can never report back: OSC 52 is fire and forget and a
+/// native tool's exit code says nothing about what the terminal did with
+/// it. So the confirmation is built from what was extracted, and the two
+/// halves either side of the write are what tests drive
+/// ([`selection_text`] and [`announce_copy`]), rather than a test putting
+/// its fixture on the machine's real clipboard.
+fn copy_selection(app: &mut App, sel: &Selection) {
+    let Some(text) = selection_text(app, sel) else {
+        return;
+    };
+    selection::copy_to_clipboard(&text);
+    announce_copy(app, &text);
+}
+
+/// The text a finished selection takes. `None` when the pane is gone or
+/// the pick came back empty. An empty pick copies nothing, so it must not
+/// claim to have copied anything either.
+fn selection_text(app: &mut App, sel: &Selection) -> Option<String> {
+    let runtime = app.runtimes.get_mut(&sel.pane_id)?;
+    selection::SelectionState::extract(runtime, sel).filter(|text| !text.is_empty())
+}
+
+/// Say what a copy took, on the notice line.
+fn announce_copy(app: &mut App, text: &str) {
+    app.notice.show(copy::copied(text), Instant::now());
 }
 
 /// The divider drag's pending motion since the last applied step, if any:
@@ -2461,6 +2507,15 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
                     app.drag.as_ref(),
                 );
             }
+            if let Some(rail) = areas.rail {
+                paint_sidebar_rail(
+                    rail,
+                    f.buffer_mut(),
+                    &app.paint,
+                    &mut app.hit_map,
+                    app.hover,
+                );
+            }
             paint_tab_bar(
                 &app.model.session.tabs,
                 app.model.session.active_tab,
@@ -2469,6 +2524,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
                 &app.paint,
                 &mut app.hit_map,
                 &app.decoration,
+                app.hover,
             );
             let tab = app.model.active_tab();
             let mut ctx = crate::render::WindowPaintCtx {
@@ -2478,6 +2534,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
                 decoration: &app.decoration,
                 selection: app.selection.active.as_ref(),
                 drag: app.drag.as_ref(),
+                notice: app.notice.text(),
                 cursor: None,
             };
             paint_window(
@@ -2574,6 +2631,7 @@ mod tests {
             hover: None,
             selection: SelectionState::default(),
             drag: None,
+            notice: NoticeState::default(),
             decoration: DecorationSnapshot::default(),
             prefs: WorkspacePrefs::default(),
             expanded_workspaces: HashSet::new(),
@@ -3333,50 +3391,133 @@ mod tests {
         assert_eq!(reconnect.socket_name, boot.socket_name);
     }
 
-    /// Boot's declared size and the first painted frame read one geometry
-    /// from one pair of inputs, so a workspace quit collapsed reopens
-    /// collapsed with no disagreement between what tmux was told and what
-    /// is on screen. The open case is measured too: without it the
-    /// equality below would hold even if visibility were ignored.
+    /// Boot declares a canvas and the first frame paints one; they must be
+    /// the same canvas for every combination of the two chrome edges an
+    /// operator can put away. A disagreement here is the bug class of
+    /// 626ec09, panels painted for the wrong terminal, and it is only
+    /// impossible while boot and `App::chrome` read the SAME persisted
+    /// flags, which is what this walks.
     #[test]
-    fn a_collapsed_sidebar_declares_the_geometry_the_first_frame_paints() {
+    fn boot_declares_the_geometry_the_first_frame_paints_for_every_chrome_combination() {
         let area = Rect::new(0, 0, 200, 50);
-        let prefs = WorkspacePrefs {
-            sidebar_visible: false,
-            ..WorkspacePrefs::default()
-        };
+        for sidebar_visible in [true, false] {
+            for tab_bar_visible in [true, false] {
+                let prefs = WorkspacePrefs {
+                    sidebar_visible,
+                    tab_bar_visible,
+                    ..WorkspacePrefs::default()
+                };
+                let what = format!("sidebar {sidebar_visible}, tab bar {tab_bar_visible}");
 
-        // What `run_async` does before it declares: the persisted
-        // visibility lands on the model, then boot sizes from the model.
-        let mut model = one_pane_model();
-        model.sidebar_visible = prefs.sidebar_visible;
-        let boot = chrome_for(area, &model, &prefs);
-        let declared = crate::render::tmux_client_size(boot.canvas, model.active_tab());
+                // What `run_async` does before it declares: the persisted
+                // visibility lands on the model, then boot sizes from it.
+                let mut model = one_pane_model();
+                model.sidebar_visible = prefs.sidebar_visible;
+                let boot = chrome_for(area, &model, &prefs);
+                let declared = crate::render::tmux_client_size(boot.canvas, model.active_tab());
 
+                let mut app = test_app(
+                    model,
+                    cyclops_proto::scratch::scratch_dir("app-boot-chrome"),
+                );
+                app.prefs = prefs;
+                let painted = app.chrome(area);
+
+                assert_eq!(painted, boot, "{what}: the first frame moved the chrome");
+                assert_eq!(
+                    crate::render::tmux_client_size(painted.canvas, app.model.active_tab()),
+                    declared,
+                    "{what}: the first frame must paint the canvas boot declared"
+                );
+
+                // And each flag really does change the geometry, or the
+                // agreement above would be agreement about nothing.
+                let expected_left = if sidebar_visible { 22 } else { 1 };
+                assert_eq!(painted.canvas.x, expected_left, "{what}: canvas left edge");
+                assert_eq!(
+                    painted.sidebar.is_some(),
+                    sidebar_visible,
+                    "{what}: the panel"
+                );
+                assert_eq!(
+                    painted.rail.is_some(),
+                    !sidebar_visible,
+                    "{what}: collapsing leaves a rail, never nothing"
+                );
+                assert_eq!(
+                    painted.tab_bar.height,
+                    u16::from(tab_bar_visible),
+                    "{what}: the strip's row"
+                );
+                assert_eq!(
+                    painted.canvas.y,
+                    u16::from(tab_bar_visible),
+                    "{what}: the canvas takes the row the strip does not"
+                );
+            }
+        }
+    }
+
+    /// A copy says what it took, and says it for a while without anyone
+    /// touching a key. The text comes from a real pane runtime through the
+    /// real extraction path; only the clipboard write itself is left out,
+    /// so a test never puts its fixture on the machine's real clipboard.
+    #[test]
+    fn a_copy_announces_what_it_took_and_the_notice_expires_on_its_own() {
         let mut app = test_app(
-            model,
-            cyclops_proto::scratch::scratch_dir("app-boot-collapsed"),
+            one_pane_model(),
+            cyclops_proto::scratch::scratch_dir("app-copy-notice"),
         );
-        app.prefs = prefs;
-        let painted = app.chrome(area);
+        let mut runtime = crate::runtime::PaneRuntime::new(20, 3);
+        runtime.feed(
+            b"cargo test
+",
+        );
+        app.runtimes.insert("%0".into(), runtime);
+        app.selection.set_line("%0".into(), 0, 20);
+        let sel = app.selection.active.clone().expect("a line is selected");
 
-        assert_eq!(painted.sidebar, None, "prefs said collapsed");
-        assert_eq!(painted.canvas, boot.canvas);
+        let text = selection_text(&mut app, &sel).expect("the row has text");
+        assert_eq!(text.trim_end(), "cargo test");
+        announce_copy(&mut app, &text);
+
         assert_eq!(
-            crate::render::tmux_client_size(painted.canvas, app.model.active_tab()),
-            declared,
-            "the first frame must paint the canvas boot declared"
+            app.notice.text(),
+            Some(copy::copied(&text).as_str()),
+            "the notice has to name what landed, not just that something did"
+        );
+        assert!(
+            app.notice.text().is_some_and(|said| said.contains("10")),
+            "and the count is the selection's own: {:?}",
+            app.notice.text()
         );
 
-        app.model.sidebar_visible = true;
-        app.prefs.sidebar_visible = true;
-        let open = app.chrome(area);
-        assert_eq!(open.sidebar, Some(Rect::new(0, 0, 22, 50)));
-        assert_ne!(
-            crate::render::tmux_client_size(open.canvas, app.model.active_tab()),
-            declared,
-            "an open sidebar really is a different declaration"
+        // It goes away on its own deadline: no keypress, no timer of its
+        // own, just the instant the loop already wakes for.
+        let due = app.notice.deadline().expect("a live notice arms a wakeup");
+        assert!(!app.notice.expire(due - Duration::from_millis(1)));
+        assert!(app.notice.expire(due), "the deadline clears it");
+        assert_eq!(app.notice.text(), None);
+        assert_eq!(app.notice.deadline(), None, "and stops waking the loop");
+    }
+
+    /// An empty pick copies nothing, so it must not claim to have copied
+    /// anything: no notice, no wakeup.
+    #[test]
+    fn an_empty_selection_says_nothing() {
+        let mut app = test_app(
+            one_pane_model(),
+            cyclops_proto::scratch::scratch_dir("app-copy-notice-empty"),
         );
+        app.runtimes
+            .insert("%0".into(), crate::runtime::PaneRuntime::new(20, 3));
+        app.selection.set_line("%0".into(), 0, 20);
+        let sel = app.selection.active.clone().expect("a line is selected");
+
+        assert_eq!(selection_text(&mut app, &sel), None);
+        copy_selection(&mut app, &sel);
+        assert_eq!(app.notice.text(), None);
+        assert_eq!(app.notice.deadline(), None);
     }
 
     #[test]
@@ -3961,6 +4102,7 @@ mod tests {
                 decoration: &app.decoration,
                 selection: None,
                 drag: None,
+                notice: None,
                 cursor: None,
             };
             paint_window(

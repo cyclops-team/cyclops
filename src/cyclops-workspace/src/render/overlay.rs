@@ -575,6 +575,10 @@ pub fn menu_items(menu: &MenuState) -> Vec<(&'static str, BindingAction)> {
             (copy::MENU_NEW_TAB, BindingAction::NewTab),
             (copy::MENU_NEW_WORKSPACE, BindingAction::NewWorkspace),
             (copy::MENU_TOGGLE_EVENTS, BindingAction::ToggleEventPanel),
+            // The tab strip's only visible switch. It sits beside the
+            // stream toggle because both answer the same question: which
+            // surfaces this workspace shows.
+            (copy::MENU_TAB_BAR, BindingAction::ToggleTabBar),
             (copy::MENU_THEMES, BindingAction::ShowThemes),
             (copy::MENU_KEYBINDS, BindingAction::ShowKeybinds),
             (copy::MENU_DETACH, BindingAction::Detach),
@@ -752,8 +756,11 @@ mod tests {
         );
     }
 
+    /// The app menu is the visible route to everything that has no chrome
+    /// of its own, and the tab strip is now one of those: hidden, its item
+    /// here is the only way back, so it has to be in this list.
     #[test]
-    fn app_menu_offers_themes_between_events_and_keybinds() {
+    fn app_menu_offers_the_surface_toggles_between_new_and_keybinds() {
         let actions: Vec<_> = menu_items(&MenuState::AppMenu)
             .iter()
             .map(|(_, action)| *action)
@@ -764,6 +771,7 @@ mod tests {
                 BindingAction::NewTab,
                 BindingAction::NewWorkspace,
                 BindingAction::ToggleEventPanel,
+                BindingAction::ToggleTabBar,
                 BindingAction::ShowThemes,
                 BindingAction::ShowKeybinds,
                 BindingAction::Detach,

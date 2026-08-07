@@ -4,6 +4,12 @@
 //! footer both tabs share. Reorder math itself (which slot a drag
 //! previews) belongs to `crate::drag` and stream rows to `super::stream`;
 //! this only paints what those hand it.
+//!
+//! Collapsing never leaves nothing behind. The panel's footer carries the
+//! only pointer route to the app menu, so a collapse swaps the panel for a
+//! one-column rail ([`paint_sidebar_rail`]) whose chevron brings it back.
+//! Both states paint that chevron through [`paint_toggle`], so the two can
+//! never disagree about how the control looks or answers a mouse.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -20,8 +26,17 @@ use crate::model::WorkspaceRow;
 use crate::persist::SidebarTab;
 use crate::theme::{self, Paint};
 
+/// The chevron that moves the sidebar. It points the way the click will
+/// move the panel: `◂` on the open panel's own edge pushes it away, `▸` on
+/// the collapsed rail brings it back. Same triangle family as the session
+/// tree's own disclosure markers, one cell wide in every monospace font,
+/// and chosen by state rather than theme, so the control reads under every
+/// theme and under `NO_COLOR` (rule 11).
+pub const SIDEBAR_COLLAPSE: &str = "◂";
+pub const SIDEBAR_EXPAND: &str = "▸";
+
 /// Render the workspace sidebar: the tab header, the selected tab's body,
-/// and the shared footer.
+/// the shared footer, and the collapse chevron on its outer edge.
 pub fn paint_sidebar(
     workspaces: &[WorkspaceRow],
     active: usize,
@@ -111,6 +126,81 @@ pub fn paint_sidebar(
         }
     }
     paint_footer(inner, content, footer_y, buf, paint, hits, hover);
+    // The collapse control sits on the panel's outer edge, on the footer
+    // row. Same row as the rail's chevron, so the control stays where the
+    // eye left it when the panel goes; the column moves because the panel
+    // it was attached to did. It takes one cell of the resize divider and
+    // no more: the handle still answers on every other row, and this hit
+    // is pushed last so it wins its own.
+    paint_toggle(
+        buf,
+        Rect::new(area.x + area.width.saturating_sub(1), footer_y, 1, 1),
+        SIDEBAR_COLLAPSE,
+        paint,
+        hits,
+        hover,
+    );
+}
+
+/// Render the rail a collapsed sidebar leaves behind: one column of panel
+/// ground with the chevron that reopens the panel at its foot. The whole
+/// column is the hit target, because nothing else is painted there and a
+/// one-cell glyph makes a miserable one-cell button.
+pub fn paint_sidebar_rail(
+    area: Rect,
+    buf: &mut Buffer,
+    paint: &Paint,
+    hits: &mut HitMap,
+    hover: Option<(u16, u16)>,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    buf.set_style(area, theme::chrome_panel(paint));
+    paint_toggle(buf, area, SIDEBAR_EXPAND, paint, hits, hover);
+}
+
+/// Paint one sidebar chevron at the foot of `hit` and register that whole
+/// rectangle as the toggle. The glyph lands on the rectangle's bottom-left
+/// cell; the button fills under the mouse exactly the way the create
+/// buttons do, so every chrome control in this workspace answers a pointer
+/// the same way.
+fn paint_toggle(
+    buf: &mut Buffer,
+    hit: Rect,
+    glyph: &str,
+    paint: &Paint,
+    hits: &mut HitMap,
+    hover: Option<(u16, u16)>,
+) {
+    if hit.width == 0 || hit.height == 0 {
+        return;
+    }
+    let hovered = hover.is_some_and(|(col, row)| {
+        col >= hit.x && col < hit.x + hit.width && row >= hit.y && row < hit.y + hit.height
+    });
+    let style = if hovered {
+        theme::add_button_hover(paint)
+    } else {
+        theme::add_button(paint)
+    };
+    // The whole strip is clickable, so the whole strip lights: feedback
+    // has to appear under the pointer, and a rail is thirty rows tall
+    // with its glyph at the foot. Lighting the glyph alone answered a
+    // hover the operator made twenty-nine rows away.
+    if hovered {
+        for row in hit.y..hit.y + hit.height {
+            if let Some(cell) = buf.cell_mut((hit.x, row)) {
+                cell.set_style(style);
+            }
+        }
+    }
+    let y = hit.y + hit.height - 1;
+    if let Some(cell) = buf.cell_mut((hit.x, y)) {
+        cell.set_symbol(glyph);
+        cell.set_style(style);
+    }
+    hits.push(hit, HitTarget::SidebarToggle);
 }
 
 /// The tab header: one row of chips naming what the body below shows, with
@@ -1104,23 +1194,185 @@ mod tests {
             .contains(ratatui::style::Modifier::REVERSED));
     }
 
-    /// Resize by drag survives the header. The sidebar's rightmost column
-    /// is the `SidebarDivider` the drag reads (`app::handle_mouse`), on
-    /// every row of both tabs — a chip that clipped into that column, or a
-    /// header that shortened the divider, would take the handle away.
+    // -- The collapse chevron, in both of its states. --
+
+    /// A theme unlike the default on the one token the chevron paints
+    /// through, so a color match against the default theme would mean the
+    /// glyph check below was vacuous. The shared `alt_test_theme_paint`
+    /// moves state and eye colors, which this control never reads.
+    fn accent_test_paint() -> Paint {
+        let (theme, warnings) = cyclops_theme::Theme::parse(
+            "name = \"accent-test\"\n\
+             [surface]\n\
+             accent = \"#123456\"\n",
+            "accent-test",
+        )
+        .expect("valid test theme");
+        assert!(
+            warnings.is_empty(),
+            "unexpected theme warnings: {warnings:?}"
+        );
+        let mut paint = Paint::for_test();
+        paint.theme = theme;
+        paint
+    }
+
+    /// Paint the rail on its own and hand back the buffer plus the hit
+    /// map, the way `app::draw` calls it when prefs say collapsed.
+    fn draw_rail(paint: &Paint, hover: Option<(u16, u16)>) -> (Buffer, HitMap) {
+        let rail = Rect::new(0, 0, 1, SIDEBAR.height);
+        let mut term = Terminal::new(TestBackend::new(20, SIDEBAR.height)).unwrap();
+        let mut hits = HitMap::default();
+        term.draw(|f| paint_sidebar_rail(rail, f.buffer_mut(), paint, &mut hits, hover))
+            .unwrap();
+        (term.backend().buffer().clone(), hits)
+    }
+
+    /// The whole point of the rail: collapsing must not strand the mouse.
+    /// Every row of the one column answers as the toggle, that toggle
+    /// routes to the action the chord runs, and the chevron points the way
+    /// the click will move the panel.
     #[test]
-    fn the_tab_header_leaves_the_resize_divider_on_every_row() {
+    fn the_collapsed_rail_answers_the_mouse_and_reopens_the_sidebar() {
+        use crossterm::event::MouseButton;
+
+        let paint = Paint::for_test();
+        let (buf, hits) = draw_rail(&paint, None);
+
+        for y in 0..SIDEBAR.height {
+            assert!(
+                matches!(hits.hit(0, y), Some(HitTarget::SidebarToggle)),
+                "row {y} of the rail must be clickable"
+            );
+        }
+        assert_eq!(
+            crate::action::route_mouse_click(&HitTarget::SidebarToggle, MouseButton::Left),
+            Some(crate::action::Action::ToggleSidebar),
+            "the chevron is the mouse's half of Ctrl+B b"
+        );
+        assert_eq!(
+            buf[(0, SIDEBAR.height - 1)].symbol(),
+            SIDEBAR_EXPAND,
+            "collapsed, the chevron points the way the panel will come back"
+        );
+        // Nothing spills into the canvas: the rail is one column wide.
+        for y in 0..SIDEBAR.height {
+            assert_eq!(buf[(1, y)].symbol(), " ", "the rail painted past column 0");
+        }
+    }
+
+    /// The open panel carries the same control on the same row of its own
+    /// outer edge, pointing the other way. Same row as the rail's, so the
+    /// eye keeps its place across a collapse.
+    #[test]
+    fn the_open_sidebar_carries_the_collapse_chevron_on_its_own_edge() {
+        let paint = Paint::for_test();
+        let (panel, panel_hits) = draw_sidebar(SidebarTab::Sessions, &Record::new(), &paint);
+        let edge = (
+            SIDEBAR.x + SIDEBAR.width - 1,
+            SIDEBAR.y + SIDEBAR.height - 1,
+        );
+
+        assert!(matches!(
+            panel_hits.hit(edge.0, edge.1),
+            Some(HitTarget::SidebarToggle)
+        ));
+        assert_eq!(
+            edge.1,
+            SIDEBAR.y + SIDEBAR.height - 1,
+            "the same row the collapsed rail puts its chevron on"
+        );
+        assert_eq!(
+            panel[edge].symbol(),
+            SIDEBAR_COLLAPSE,
+            "open, the chevron points the way the panel will go"
+        );
+        assert_ne!(
+            SIDEBAR_COLLAPSE, SIDEBAR_EXPAND,
+            "the two states must not paint the same arrow"
+        );
+    }
+
+    /// The chevron is a control, so it lights under the mouse the way the
+    /// create buttons do, and it must not move while being pointed at.
+    #[test]
+    fn the_chevron_lights_under_the_mouse_without_moving() {
+        let paint = Paint::for_test();
+        let cell = (0, SIDEBAR.height - 1);
+        let (rest, rest_hits) = draw_rail(&paint, None);
+        let (hot, hot_hits) = draw_rail(&paint, Some(cell));
+
+        assert_eq!(
+            hot_hits.hit(cell.0, cell.1).cloned(),
+            rest_hits.hit(cell.0, cell.1).cloned(),
+            "the button must not move out from under the mouse that found it"
+        );
+        assert_eq!(hot[cell].symbol(), rest[cell].symbol(), "same glyph");
+        assert_ne!(
+            hot[cell].style(),
+            rest[cell].style(),
+            "pointing at the chevron must change how it paints"
+        );
+    }
+
+    /// Rule 11: the chevron is chosen by state, never by theme. Two
+    /// materially different themes and `NO_COLOR` all paint the same
+    /// glyph; only the `Style` under it may move, and it must, or the
+    /// glyph check proves nothing.
+    #[test]
+    fn the_chevron_glyph_is_stable_across_theme_and_no_color() {
+        let cell = (0, SIDEBAR.height - 1);
+        let (default_buf, _) = draw_rail(&Paint::for_test(), None);
+        let (alt_buf, _) = draw_rail(&accent_test_paint(), None);
+        let (plain_buf, _) = draw_rail(&Paint::without_color_for_test(), None);
+
+        for buf in [&default_buf, &alt_buf, &plain_buf] {
+            assert_eq!(buf[cell].symbol(), SIDEBAR_EXPAND);
+        }
+        assert_ne!(
+            default_buf[cell].fg, alt_buf[cell].fg,
+            "the theme change must actually repaint the chevron"
+        );
+        assert_eq!(
+            plain_buf[cell].fg,
+            RtColor::Reset,
+            "NO_COLOR must leave no color behind, so the glyph is the encoding"
+        );
+        assert!(
+            plain_buf[cell]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD),
+            "and the control still reads as a control with color off"
+        );
+    }
+
+    /// Resize by drag survives the header and the collapse chevron. The
+    /// sidebar's rightmost column is the `SidebarDivider` the drag reads
+    /// (`app::handle_mouse`) on every row of both tabs except the footer
+    /// row, which the chevron claims. A chip that clipped into that
+    /// column, or a header that shortened the divider, would take the
+    /// handle away.
+    #[test]
+    fn the_tab_header_leaves_the_resize_divider_on_every_row_but_the_chevrons() {
         let record = one_row_record();
         let paint = Paint::for_test();
         let divider_x = SIDEBAR.x + SIDEBAR.width - 1;
+        let chevron_y = SIDEBAR.y + SIDEBAR.height - 1;
         for tab in [SidebarTab::Sessions, SidebarTab::Stream] {
             let (_, hits) = draw_sidebar(tab, &record, &paint);
-            for y in SIDEBAR.y..SIDEBAR.y + SIDEBAR.height {
+            for y in SIDEBAR.y..chevron_y {
                 assert!(
                     matches!(hits.hit(divider_x, y), Some(HitTarget::SidebarDivider)),
                     "{tab:?}: row {y} lost the resize handle"
                 );
             }
+            assert!(
+                matches!(
+                    hits.hit(divider_x, chevron_y),
+                    Some(HitTarget::SidebarToggle)
+                ),
+                "{tab:?}: the collapse chevron owns the footer row of the edge"
+            );
         }
     }
 }

@@ -65,6 +65,22 @@ pub const SIDEBAR_TAB_STREAM: &str = "Stream";
 /// carry the whole phrase at rest.
 pub const NEW_WORKSPACE_HINT: &str = "new";
 
+/// Said on the notice line after a selection reaches the clipboard. The
+/// count is the whole point: a bare "copied" cannot tell a whole line from
+/// the one word a mis-aimed double click took, and the clipboard write
+/// itself can never report back (OSC 52 is fire and forget), so what this
+/// reports is what the selection actually extracted.
+pub fn copied(text: &str) -> String {
+    let lines = text.lines().count();
+    if lines > 1 {
+        return format!("copied {lines} lines");
+    }
+    match text.chars().count() {
+        1 => "copied 1 character".to_string(),
+        n => format!("copied {n} characters"),
+    }
+}
+
 pub const MENU_SPLIT_RIGHT: &str = "Split right";
 
 pub const MENU_SPLIT_DOWN: &str = "Split down";
@@ -88,6 +104,8 @@ pub const MENU_NEW_TAB: &str = "New tab";
 pub const MENU_NEW_WORKSPACE: &str = "New workspace";
 
 pub const MENU_TOGGLE_EVENTS: &str = "Event stream";
+
+pub const MENU_TAB_BAR: &str = "Tab bar";
 
 pub const MENU_THEMES: &str = "Themes";
 
@@ -146,4 +164,22 @@ pub fn theme_sets_no_colors(name: &str) -> String {
 /// The config could not be written, so nothing switched.
 pub fn theme_not_saved(cause: &str) -> String {
     format!("can't save the theme: {cause}. Nothing was changed.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three shapes a copy takes: a dragged block, a triple-clicked
+    /// line, and a double-clicked word. Each says what it took, because
+    /// the count is the only thing that distinguishes them on screen.
+    #[test]
+    fn copied_counts_what_the_selection_took() {
+        assert_eq!(copied("one\ntwo\nthree"), "copied 3 lines");
+        assert_eq!(copied("cargo test"), "copied 10 characters");
+        assert_eq!(copied("x"), "copied 1 character");
+        // Column-accurate, not byte-accurate: a wide glyph is one thing
+        // the operator selected, not three bytes.
+        assert_eq!(copied("你好"), "copied 2 characters");
+    }
 }

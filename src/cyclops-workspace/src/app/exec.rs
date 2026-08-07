@@ -220,6 +220,19 @@ pub(super) async fn execute(
             app.model.sidebar_visible = !app.model.sidebar_visible;
             Ok(commit_sidebar_visibility(app, client).await)
         }
+        Action::ToggleTabBar => {
+            // The strip's row moves between chrome and the declared grid
+            // whole, so every flip re-declares the client size exactly the
+            // way a sidebar collapse does. Nothing about the tab count
+            // enters into it: the strip shows because the operator has not
+            // said otherwise.
+            app.prefs.tab_bar_visible = !app.prefs.tab_bar_visible;
+            super::resize_client(app, client).await;
+            Ok(Outcome {
+                persist: true,
+                ..Outcome::default()
+            })
+        }
         Action::ToggleEventPanel => {
             // "Show me the stream", and pressed again, "take it away": the
             // stream goes off and the session list comes back, which is
@@ -227,7 +240,8 @@ pub(super) async fn execute(
             // of the screen. Turning it off must never hide the sidebar
             // instead, or a keyboard-only operator lands on Stream with no
             // route back to Sessions and the choice persists (visibility
-            // is Ctrl+B b's job alone). A hidden sidebar opens on Stream.
+            // belongs to Ctrl+B b and the edge chevron, not to this). A
+            // hidden sidebar opens on Stream.
             let show_stream = !(app.model.sidebar_visible && app.sidebar_tab == SidebarTab::Stream);
             let tab = if show_stream {
                 SidebarTab::Stream
@@ -1034,6 +1048,7 @@ mod tests {
             hover: None,
             selection: SelectionState::default(),
             drag: None,
+            notice: crate::notice::NoticeState::default(),
             decoration: DecorationSnapshot::default(),
             prefs: WorkspacePrefs::default(),
             expanded_workspaces: HashSet::new(),
@@ -1403,79 +1418,74 @@ mod tests {
         client.shutdown().await;
     }
 
-    // -- The tab bar's row must track the tmux-declared size. --
+    // -- The tab bar is the operator's own choice, and its row must track
+    // the tmux-declared size. --
 
-    /// The live 1-to-2 and 2-to-1 tab transitions, through the real
-    /// reconcile: a second tab shows the bar and the declared client
-    /// shrinks by exactly its row; closing back to one tab hides the bar
-    /// and wins the row back. Both the chrome split and the declaration
-    /// go through `App::chrome`, so a drift between them would land here
-    /// as a declared size that does not move with the bar.
+    /// Hide and show, through the executor: the preference flips, the flip
+    /// survives a round trip through config.toml, and each flip re-declares
+    /// the tmux client size by exactly the strip's row. Both the chrome
+    /// split and the declaration go through `App::chrome`, so a drift
+    /// between them would land here as a declared size that does not move
+    /// with the bar. Tab count never enters into it: this workspace has one
+    /// tab throughout and keeps its strip.
     #[tokio::test]
-    async fn tab_transitions_redeclare_the_client_around_the_bar_row() {
+    async fn toggling_the_tab_bar_persists_and_redeclares_the_client_size() {
         if !tmux_available() {
             return;
         }
-        let server = TmuxServer::new("exec-tab-bar-row");
+        let server = TmuxServer::new("exec-toggle-tab-bar");
         server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
         let pane = pane_ids(&server, "s")[0].clone();
         let client = rig_client(&server, "s").await;
-        let mut app = test_app(
-            one_tab_model("s", "@0", &pane, "$0"),
-            scratch_home("exec-tab-bar-row-home"),
-        );
+        let home = scratch_home("exec-toggle-tab-bar-home");
+        let mut app = test_app(one_tab_model("s", "@0", &pane, "$0"), home.clone());
         let term = ratatui::layout::Rect::new(0, 0, app.term_size.0, app.term_size.1);
 
-        // One tab: the bar is hidden and the declaration owns its row.
+        // A fresh install shows the strip, one tab or ten: the `+` that
+        // makes the second tab lives there.
+        assert!(app.prefs.tab_bar_visible, "the default is shown");
+        assert_eq!(app.model.session.tabs.len(), 1);
         crate::app::reconcile(&mut app, &client)
             .await
             .expect("initial reconcile");
-        assert_eq!(app.model.session.tabs.len(), 1);
-        assert_eq!(
-            app.chrome(term).tab_bar.height,
-            0,
-            "a lone tab must hide the bar"
-        );
-        let lone = app.declared_client_size.expect("declared for one tab");
-        let before = window_ids(&server, "s");
+        assert_eq!(app.chrome(term).tab_bar.height, 1, "a lone tab keeps it");
+        let shown = app.declared_client_size.expect("declared with the bar");
 
-        // 1 -> 2: the bar returns and takes its row out of the grid.
-        execute(&mut app, &client, Action::NewTab { name: None })
+        let outcome = execute(&mut app, &client, Action::ToggleTabBar)
             .await
-            .expect("new tab");
-        crate::app::reconcile(&mut app, &client)
-            .await
-            .expect("reconcile after new tab");
-        assert_eq!(app.model.session.tabs.len(), 2);
+            .expect("hide the strip");
+        assert!(outcome.persist, "the new visibility belongs on disk");
+        assert!(!app.prefs.tab_bar_visible);
+        assert_eq!(app.chrome(term).tab_bar.height, 0);
+        let hidden = app.declared_client_size.expect("declared without the bar");
+        assert_eq!(hidden.0, shown.0);
         assert_eq!(
-            app.chrome(term).tab_bar.height,
-            1,
-            "a second tab must show the bar"
-        );
-        let paired = app.declared_client_size.expect("declared for two tabs");
-        assert_eq!(paired.0, lone.0);
-        assert_eq!(
-            paired.1 + 1,
-            lone.1,
-            "the second tab must cost the declared grid exactly the bar row"
+            hidden.1,
+            shown.1 + 1,
+            "the bar row moves between chrome and the declared grid, whole"
         );
 
-        // 2 -> 1: an external close arrives like any structural change.
-        let created = window_ids(&server, "s")
-            .into_iter()
-            .find(|id| !before.contains(id))
-            .expect("the new tab's window id");
-        server.run_ok(&["kill-window", "-t", &created]);
-        crate::app::reconcile(&mut app, &client)
-            .await
-            .expect("reconcile after close");
-        assert_eq!(app.model.session.tabs.len(), 1);
-        assert_eq!(app.chrome(term).tab_bar.height, 0, "the bar hides again");
-        assert_eq!(
-            app.declared_client_size,
-            Some(lone),
-            "the lone tab wins its row back"
+        // What `apply_outcome` does for the real caller; the reload below
+        // has to read a file that actually exists.
+        crate::persist::save_prefs(&home, &app.prefs).expect("save prefs");
+        assert!(
+            !crate::persist::load_prefs(&home).tab_bar_visible,
+            "a workspace quit with the strip hidden must reopen hidden"
         );
+
+        // And back: the app menu item is the visible way here, and it puts
+        // the row and the `+` back exactly where they were.
+        let outcome = execute(&mut app, &client, Action::ToggleTabBar)
+            .await
+            .expect("show the strip");
+        assert!(outcome.persist);
+        assert!(app.prefs.tab_bar_visible);
+        assert_eq!(app.chrome(term).tab_bar.height, 1);
+        assert_eq!(app.declared_client_size, Some(shown));
+        crate::persist::save_prefs(&home, &app.prefs).expect("save prefs");
+        assert!(crate::persist::load_prefs(&home).tab_bar_visible);
+
+        let _ = std::fs::remove_dir_all(&home);
         client.shutdown().await;
     }
 

@@ -14,6 +14,7 @@ mod input;
 mod layout;
 mod model;
 mod naming;
+mod notice;
 mod persist;
 mod render;
 pub mod resilience;

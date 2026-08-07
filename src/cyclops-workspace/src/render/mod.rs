@@ -15,6 +15,22 @@
 //! share: the top-level chrome split (`chrome_areas_for`), the
 //! cell-to-style bridge (`cell_style`/`rt_color`), and the one text
 //! primitive (`overlay_text`) every surface paints through.
+//!
+//! One rule places every visible control, so the chrome reads as one
+//! language rather than a pile of idioms:
+//!
+//! 1. A control lives in the chrome of the thing it acts on, painted as a
+//!    single glyph that says which way the click moves things, with a hit
+//!    target as large as that chrome allows and a fill under the mouse
+//!    (`theme::add_button` / `add_button_hover`). The tab strip's `+`, the
+//!    sidebar footer's `+`, and the sidebar chevron are all this.
+//! 2. When a surface is put away it has no chrome left to host its own
+//!    switch, so the app menu carries it, and the app menu stays
+//!    reachable because a collapsed sidebar keeps a rail
+//!    (`SIDEBAR_RAIL_WIDTH`) rather than disappearing.
+//! 3. Feedback is not a control: the transient notice
+//!    (`crate::notice`, painted by `canvas::paint_notice`) states a fact,
+//!    registers no hit target, and moves no rectangle.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -33,7 +49,7 @@ use crate::runtime::{Color, GridCell};
 
 pub use canvas::{paint_window, tmux_client_size, HostCursor, WindowPaintCtx, PANE_GRIP};
 pub use overlay::{keybind_max_scroll, paint_dialog, paint_menu};
-pub use sidebar::paint_sidebar;
+pub use sidebar::{paint_sidebar, paint_sidebar_rail, SIDEBAR_COLLAPSE, SIDEBAR_EXPAND};
 pub use stream::{event_stream_rows, EventRow};
 pub use tab_bar::paint_tab_bar;
 
@@ -46,33 +62,34 @@ pub(crate) const SIDEBAR_MIN_WIDTH: u16 = 22;
 /// Widest a sidebar may grow before it starts crowding the pane canvas it
 /// exists to introduce.
 const SIDEBAR_MAX_WIDTH: u16 = 42;
+/// What a collapsed sidebar leaves behind: one column, carrying the
+/// chevron that brings the panel back and nothing else. Collapsing must
+/// not strand the mouse, because the panel's footer holds the only pointer
+/// route to the app menu, so the rail is the way back and the canvas gets
+/// every column the panel gave up except this one.
+pub(crate) const SIDEBAR_RAIL_WIDTH: u16 = 1;
 
-/// Chrome rectangles for one frame.
+/// Chrome rectangles for one frame. `sidebar` and `rail` are mutually
+/// exclusive: the panel is open, or its one-column rail stands in its
+/// place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChromeAreas {
     pub sidebar: Option<Rect>,
+    pub rail: Option<Rect>,
     pub tab_bar: Rect,
     pub canvas: Rect,
 }
 
-/// Whether the tab bar earns its row: only when the active workspace has
-/// a second tab to switch to. A lone tab's strip carries one chip and a
-/// `+` button, no information, so it hides and the canvas reclaims the
-/// row; tabs are still created while hidden (the prefix+c binding and the
-/// sidebar menu's "New tab"), and the strip returns with the second tab.
+/// Split one frame into the sidebar (or its rail), tab bar, and pane
+/// canvas: the top-level chrome composition every painted surface below
+/// sits inside. `app` decides visibility and width; this only turns those
+/// decisions into rectangles. The sidebar is the one side panel: its
+/// Stream tab hosts what used to be a separate right-hand event panel.
 ///
-/// Every caller of [`chrome_areas_for`] must derive this from the same
-/// model snapshot it sizes the canvas with, or the painted grid disagrees
-/// with the tmux-declared size by one row (the bug class of 626ec09:
-/// panels painted for the wrong terminal).
-pub fn tab_bar_visible(tab_count: usize) -> bool {
-    tab_count > 1
-}
-
-/// Split one frame into the sidebar, tab bar, and pane canvas — the
-/// top-level chrome composition every painted surface below sits inside.
-/// `app` decides visibility and width; this only turns those decisions
-/// into rectangles. The sidebar is the one side panel: its Stream tab
-/// hosts what used to be a separate right-hand event panel.
+/// Both visibility flags are the operator's own persisted choices, and
+/// every caller must read them from the same snapshot it sizes the canvas
+/// with, or the painted grid disagrees with the tmux-declared size (the
+/// bug class of 626ec09: panels painted for the wrong terminal).
 pub fn chrome_areas_for(
     area: Rect,
     sidebar_visible: bool,
@@ -85,6 +102,22 @@ pub fn chrome_areas_for(
         let s = Rect::new(main.x, main.y, w, main.height);
         main = Rect::new(main.x + w, main.y, main.width - w, main.height);
         Some(s)
+    } else {
+        None
+    };
+    // Only a genuine collapse leaves a rail. A terminal too narrow for the
+    // panel at all has no room to offer a control either, and painting a
+    // "reopen" chevron for a sidebar that is already meant to be open
+    // would lie about what the click does.
+    let rail = if !sidebar_visible && main.width > SIDEBAR_RAIL_WIDTH {
+        let r = Rect::new(main.x, main.y, SIDEBAR_RAIL_WIDTH, main.height);
+        main = Rect::new(
+            main.x + SIDEBAR_RAIL_WIDTH,
+            main.y,
+            main.width - SIDEBAR_RAIL_WIDTH,
+            main.height,
+        );
+        Some(r)
     } else {
         None
     };
@@ -102,6 +135,7 @@ pub fn chrome_areas_for(
     );
     ChromeAreas {
         sidebar,
+        rail,
         tab_bar,
         canvas,
     }
@@ -649,35 +683,43 @@ mod tests {
     fn chrome_canvas_excludes_sidebar_and_tab_bar() {
         let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, true);
         assert_eq!(areas.sidebar, Some(Rect::new(0, 0, 22, 50)));
+        assert_eq!(areas.rail, None, "an open panel needs no rail");
         assert_eq!(areas.tab_bar, Rect::new(22, 0, 178, 1));
         assert_eq!(areas.canvas, Rect::new(22, 1, 178, 49));
     }
 
-    /// The collapsed shape: no sidebar rectangle at all, and the canvas
-    /// owns every column. This is the geometry boot must declare when
-    /// prefs say collapsed — the sidebar's Stream tab replaced the old
-    /// right-hand carve, so nothing else may eat width here.
+    /// The collapsed shape: no panel rectangle, a one-column rail in its
+    /// place, and every other column back to the canvas. This is the
+    /// geometry boot must declare when prefs say collapsed, and the rail
+    /// column is the only thing standing between the canvas and the full
+    /// terminal.
     #[test]
-    fn a_collapsed_sidebar_gives_the_canvas_the_full_terminal() {
+    fn a_collapsed_sidebar_leaves_one_rail_column_and_gives_back_the_rest() {
         let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), false, 22, true);
         assert_eq!(areas.sidebar, None);
-        assert_eq!(areas.tab_bar, Rect::new(0, 0, 200, 1));
-        assert_eq!(areas.canvas, Rect::new(0, 1, 200, 49));
+        assert_eq!(areas.rail, Some(Rect::new(0, 0, 1, 50)));
+        assert_eq!(areas.tab_bar, Rect::new(1, 0, 199, 1));
+        assert_eq!(areas.canvas, Rect::new(1, 1, 199, 49));
     }
 
-    /// One tab hides the strip whole: no bar rectangle, and the canvas
-    /// keeps the row the bar would have taken. The predicate itself is
-    /// pinned too, so the row can only ever come and go at the 1-to-2
-    /// boundary.
+    /// Hiding the strip is the operator's own choice now, not a tab count:
+    /// no bar rectangle, and the canvas keeps the row the bar would have
+    /// taken, whatever the workspace holds.
     #[test]
-    fn a_lone_tab_hides_the_bar_and_the_canvas_reclaims_its_row() {
-        assert!(!tab_bar_visible(0));
-        assert!(!tab_bar_visible(1));
-        assert!(tab_bar_visible(2));
-
+    fn a_hidden_tab_bar_gives_the_canvas_its_row() {
         let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, false);
         assert_eq!(areas.tab_bar.height, 0);
         assert_eq!(areas.canvas, Rect::new(22, 0, 178, 50));
+    }
+
+    /// Both chrome edges gone at once: the rail keeps its column, the bar
+    /// keeps none, and the canvas is exactly what is left.
+    #[test]
+    fn a_collapsed_rail_and_a_hidden_bar_compose() {
+        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), false, 22, false);
+        assert_eq!(areas.rail, Some(Rect::new(0, 0, 1, 50)));
+        assert_eq!(areas.tab_bar.height, 0);
+        assert_eq!(areas.canvas, Rect::new(1, 0, 199, 50));
     }
 
     #[test]
