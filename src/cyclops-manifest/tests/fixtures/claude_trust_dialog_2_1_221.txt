@@ -1,4 +1,4 @@
-(base) yahirh@mac work % cd /private/tmp/cyc-claude-repro/work && command claude
+(base) user@host work % cd /private/tmp/cyc-claude-repro/work && command claude
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
  Accessing workspace:

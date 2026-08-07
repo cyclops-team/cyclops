@@ -234,8 +234,8 @@ clients. tmux is eliminated and you control everything.
 
 **Why:** the cost was bounded with real numbers rather than argued. zmx
 does PTY persistence ALONE in 7.4k lines of Zig; herdr does the full job in
-around 206k lines of Rust, with a vendored VT engine, a patched pty crate,
-and a funded full-time maintainer. That option scored 3.40 against the
+around 206k lines of Rust, with a vendored VT engine and a patched pty
+crate. That option scored 3.40 against the
 tmux-backed design's 4.15, and it was killed by implementation cost and by
 having to rebuild observability tmux already provides. The agents are also
 already running in the user's tmux, with their config, keybindings,

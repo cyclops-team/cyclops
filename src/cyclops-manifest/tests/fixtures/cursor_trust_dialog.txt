@@ -1,4 +1,4 @@
-briosolivares@Brioss-MacBook-Pro-3 curdemo % agent
+user@host curdemo % agent
 
   ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
   │                                                                                                                  │

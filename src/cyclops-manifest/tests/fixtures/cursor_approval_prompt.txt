@@ -1,4 +1,4 @@
-briosolivares@Brioss-MacBook-Pro-3 curdemo % CURSOR_CONFIG_DIR=/tmp/curcfg agent
+user@host curdemo % CURSOR_CONFIG_DIR=/tmp/curcfg agent
 
 
   Cursor Agent
