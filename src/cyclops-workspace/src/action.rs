@@ -151,12 +151,17 @@ pub enum Action {
         direction: PaneDirection,
         cells: u32,
     },
-    /// Scroll a pane's local scrollback. This never reaches tmux — the
-    /// runtime's own Alacritty display offset moves — but it is still a
-    /// stable-target, device-reachable action worth naming once.
+    /// Scroll one wheel notch over a pane. `lines` carries direction and
+    /// today's local scroll amount (negative is up); `at` is the
+    /// pane-relative cell the notch landed on, 0-based, or `None` when
+    /// hit-testing couldn't resolve one. Execution decides from there
+    /// whether that forwards to tmux as an SGR mouse report, forwards as
+    /// arrow keys, or moves this runtime's own Alacritty display offset —
+    /// see `app::exec`'s `decide_scroll`.
     ScrollPane {
         pane_id: String,
         lines: i32,
+        at: Option<crate::runtime::CellPos>,
     },
     /// Open the pane-naming dialog for `pane_id`. The dialog itself
     /// supplies the current label from decoration state at open time;
@@ -628,8 +633,15 @@ pub fn route_mouse_click(target: &HitTarget, button: MouseButton) -> Option<Acti
 }
 
 /// Route a wheel event over a painted hit target. Only a pane body
-/// scrolls; every other target ignores the wheel today.
-pub fn route_mouse_scroll(target: &HitTarget, direction: ScrollDirection) -> Option<Action> {
+/// scrolls; every other target ignores the wheel today. `at` is the
+/// pane-relative cell the caller already resolved via
+/// `HitMap::pane_geometry` and [`crate::input::mouse::HitMap::cell_at`] —
+/// this function only routes, it does no geometry lookups of its own.
+pub fn route_mouse_scroll(
+    target: &HitTarget,
+    direction: ScrollDirection,
+    at: Option<crate::runtime::CellPos>,
+) -> Option<Action> {
     let HitTarget::PaneBody { pane_id } = target else {
         return None;
     };
@@ -640,6 +652,7 @@ pub fn route_mouse_scroll(target: &HitTarget, direction: ScrollDirection) -> Opt
     Some(Action::ScrollPane {
         pane_id: pane_id.clone(),
         lines,
+        at,
     })
 }
 
@@ -1799,16 +1812,19 @@ mod tests {
 
     #[test]
     fn wheel_over_a_pane_body_scrolls_it() {
+        let at = Some(crate::runtime::CellPos { col: 4, row: 2 });
         assert_eq!(
             route_mouse_scroll(
                 &HitTarget::PaneBody {
                     pane_id: "%1".into()
                 },
                 ScrollDirection::Up,
+                at,
             ),
             Some(Action::ScrollPane {
                 pane_id: "%1".into(),
                 lines: -3,
+                at,
             })
         );
         assert_eq!(
@@ -1817,10 +1833,12 @@ mod tests {
                     pane_id: "%1".into()
                 },
                 ScrollDirection::Down,
+                at,
             ),
             Some(Action::ScrollPane {
                 pane_id: "%1".into(),
                 lines: 3,
+                at,
             })
         );
     }
@@ -1828,7 +1846,7 @@ mod tests {
     #[test]
     fn wheel_over_a_non_pane_target_resolves_nothing() {
         assert_eq!(
-            route_mouse_scroll(&HitTarget::NewTabButton, ScrollDirection::Up),
+            route_mouse_scroll(&HitTarget::NewTabButton, ScrollDirection::Up, None),
             None
         );
     }

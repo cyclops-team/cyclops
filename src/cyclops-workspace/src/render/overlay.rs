@@ -386,6 +386,10 @@ fn paint_keybinds_dialog(
     }
 }
 
+/// Tallest the keybinds dialog may grow. The list scrolls, so the dialog
+/// stays a card rather than a wall.
+const KEYBINDS_MAX_HEIGHT: u16 = 20;
+
 fn keybind_dialog_geometry(row_count: usize, area: Rect) -> Option<(Rect, u16)> {
     if area.width < 8 || area.height < 6 {
         return None;
@@ -394,7 +398,9 @@ fn keybind_dialog_geometry(row_count: usize, area: Rect) -> Option<(Rect, u16)> 
     // Title, hint, glyph legend, one blank line before the list, one blank
     // line after it, and the footer: 6 fixed rows around the scrollable list.
     let wanted_height = u16::try_from(row_count.saturating_add(8)).unwrap_or(u16::MAX);
-    let height = wanted_height.min(area.height.saturating_sub(2)).max(6);
+    let height = wanted_height
+        .min(area.height.saturating_sub(2))
+        .clamp(6, KEYBINDS_MAX_HEIGHT);
     let dialog = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -1014,6 +1020,27 @@ mod tests {
             hits.regions().last().map(|region| &region.target),
             Some(HitTarget::DialogCancel)
         ));
+    }
+
+    #[test]
+    fn keybind_dialog_stays_a_card_in_tall_terminals() {
+        let rows: Vec<_> = (0..100)
+            .map(|i| crate::bindings::BindingHelp {
+                keys: format!("Ctrl+{}", i % 26),
+                action: format!("Action {i}"),
+            })
+            .collect();
+        let area = Rect::new(0, 0, 80, 50);
+        let (dialog, list_h) = keybind_dialog_geometry(rows.len(), area)
+            .expect("should produce geometry for large area");
+        assert_eq!(
+            dialog.height, 20,
+            "dialog should be capped at 20 rows even with many bindings"
+        );
+        assert_eq!(
+            list_h, 12,
+            "list height = dialog height - borders - padding"
+        );
     }
 
     #[test]

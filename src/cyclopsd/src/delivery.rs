@@ -1660,8 +1660,15 @@ async fn gate(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> GateOutcome {
                         };
                     };
                     let manifest_id = manifest.agent.id.clone();
-                    let Some(det) =
-                        fusion::recompute_pane(inner, w, &handle.pane_id, true, "gate").await
+                    let Some(det) = fusion::recompute_pane(
+                        inner,
+                        handle.session_idx,
+                        w,
+                        &handle.pane_id,
+                        true,
+                        "gate",
+                    )
+                    .await
                     else {
                         return GateOutcome::Attention {
                             cause: "no_such_pane".to_string(),
@@ -2264,10 +2271,6 @@ async fn await_ack(
     let tier1 = manifest.hooks.ack.is_some() && manifest.hooks.ack_payload_field.is_some();
     let (id_patterns, other_patterns) = verify_patterns(manifest, &handle.msg_id);
     let patterns: Vec<String> = id_patterns.into_iter().chain(other_patterns).collect();
-    let session_name = inner
-        .session(handle.session_idx)
-        .map(|s| s.name.clone())
-        .unwrap_or_default();
     let mut ev_rx = inner.events.subscribe();
     let mut pane_rx = inner.watcher_of(handle.session_idx).map(|w| w.subscribe());
     let mut working_seen = false;
@@ -2329,14 +2332,28 @@ async fn await_ack(
                     CheckpointStep::Wait => {}
                 }
             }
+            // Reattach/detach truth for THIS session comes from
+            // `inner.watcher_of(handle.session_idx)`, resolved fresh here,
+            // never from matching a "session" event's own `data["name"]`
+            // against a name captured at function entry: a followed
+            // rename (`PaneEvent::SessionRenamed`, `rename_session_slot`
+            // in lib.rs) changes the live name mid-wait, and a stale
+            // snapshot then never matches an attach OR a detach line
+            // again — the clock freezes on the FIRST outage and never
+            // unfreezes, which is exactly the "ledger append silently
+            // drops" failure mode `emit_state`'s doc comment describes,
+            // in delivery-wait clothing. `watcher_of` cannot go stale: it
+            // reads the live link for this exact idx, so what changed is
+            // compared against what IS, not against a name.
             ev = ev_rx.recv() => {
                 if track_state_event(&ev, &handle.pane_id) {
                     working_seen = true;
                     handle.working_seen.store(true, Ordering::SeqCst);
                 }
-                match session_edge(&ev, &session_name) {
-                    Some(true) => {
-                        if let Some(w) = inner.watcher_of(handle.session_idx) {
+                if is_session_event(&ev) {
+                    let live = inner.watcher_of(handle.session_idx);
+                    if pane_rx.is_none() {
+                        if let Some(w) = live {
                             pane_rx = Some(w.subscribe());
                             clock.unfreeze(Instant::now());
                             // Reattach evidence pass, before any deadline
@@ -2354,23 +2371,19 @@ async fn await_ack(
                                 Evidence::Absent => {}
                             }
                         }
-                    }
-                    Some(false) => {
+                    } else if live.is_none() {
                         pane_rx = None;
                         clock.freeze(Instant::now());
                     }
-                    None => {
-                        // A lagged event stream can swallow the reattach
-                        // notice; reconcile against the link instead of
-                        // staying frozen forever.
-                        if matches!(ev, Err(broadcast::error::RecvError::Lagged(_)))
-                            && clock.frozen()
-                        {
-                            if let Some(w) = inner.watcher_of(handle.session_idx) {
-                                pane_rx = Some(w.subscribe());
-                                clock.unfreeze(Instant::now());
-                            }
-                        }
+                } else if matches!(ev, Err(broadcast::error::RecvError::Lagged(_)))
+                    && clock.frozen()
+                {
+                    // A lagged event stream can swallow the reattach
+                    // notice; reconcile against the link instead of
+                    // staying frozen forever.
+                    if let Some(w) = inner.watcher_of(handle.session_idx) {
+                        pane_rx = Some(w.subscribe());
+                        clock.unfreeze(Instant::now());
                     }
                 }
             }
@@ -2410,12 +2423,15 @@ fn track_state_event(ev: &Result<Event, broadcast::error::RecvError>, pane_id: &
         if e.event == "state" && e.data["pane_id"] == pane_id && e.data["state"] == "working")
 }
 
-/// Some(attached) when the event is a lifecycle edge for this session.
-fn session_edge(ev: &Result<Event, broadcast::error::RecvError>, session: &str) -> Option<bool> {
-    match ev {
-        Ok(e) if e.event == "session" && e.data["name"] == session => e.data["attached"].as_bool(),
-        _ => None,
-    }
+/// True when the event is a session lifecycle line — attach, detach, or
+/// this daemon's own rename bookkeeping riding the same "session" name
+/// (`session_lifecycle`, lib.rs). Which one, and whether it is about THIS
+/// caller's session at all, is deliberately not decided here: see the doc
+/// comment on `await_ack`'s event arm for why comparing against
+/// `inner.watcher_of(session_idx)`'s live truth, not the event's own
+/// `data["name"]`, is what a caller does with this.
+fn is_session_event(ev: &Result<Event, broadcast::error::RecvError>) -> bool {
+    matches!(ev, Ok(e) if e.event == "session")
 }
 
 /// Screen evidence for tier 2, spec conjunctive form (v1.1 amendment 1):
@@ -2672,10 +2688,6 @@ pub(crate) async fn wait_pinned(
         state,
         waited_ms: started.elapsed().as_millis() as u64,
     };
-    let session_name = inner
-        .session(session_idx)
-        .map(|s| s.name.clone())
-        .unwrap_or_default();
     // Subscribe before the first read so no edge can fall between.
     let mut ev_rx = inner.events.subscribe();
     let mut pane_rx = inner.watcher_of(session_idx).map(|w| w.subscribe());
@@ -2715,22 +2727,31 @@ pub(crate) async fn wait_pinned(
                         }
                     }
                 }
-                Ok(e) if e.event == "session" && e.data["name"] == session_name => {
-                    match e.data["attached"].as_bool() {
-                        Some(true) => {
-                            // Reattach: fresh stream, then re-verify the pin
-                            // against the live table (the pane may have died
-                            // or been replaced during the outage).
-                            pane_rx = inner.watcher_of(session_idx).map(|w| w.subscribe());
-                            if occupant_gone(inner, session_idx, pane_id, pinned_pid) {
-                                return end(WaitOutcome::OccupantChanged, state);
-                            }
+                // Attach/detach truth for THIS session comes from
+                // `inner.watcher_of(session_idx)`, resolved fresh here,
+                // never from matching this event's own `data["name"]`
+                // against a name captured at entry: a followed rename
+                // changes the live name mid-wait, and a stale snapshot
+                // then never matches an attach line again — see the doc
+                // comment on `await_ack`'s (this function's sibling wait)
+                // event arm for the full failure this avoids.
+                Ok(e) if e.event == "session" => match inner.watcher_of(session_idx) {
+                    Some(w) if pane_rx.is_none() => {
+                        // Reattach: fresh stream, then re-verify the pin
+                        // against the live table (the pane may have died
+                        // or been replaced during the outage).
+                        pane_rx = Some(w.subscribe());
+                        if occupant_gone(inner, session_idx, pane_id, pinned_pid) {
+                            return end(WaitOutcome::OccupantChanged, state);
                         }
-                        // Detached: fused state stops moving; keep waiting on
-                        // the deadline and the reattach edge.
-                        _ => pane_rx = None,
                     }
-                }
+                    // Detached: fused state stops moving; keep waiting on
+                    // the deadline and the reattach edge. Also the no-op
+                    // case (already attached, this event was about a
+                    // different session or already-applied edge).
+                    None => pane_rx = None,
+                    _ => {}
+                },
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     // Reconcile on doubt: re-read the cache and the pin.

@@ -81,10 +81,11 @@ fn run_cyclops(home: &Path, args: &[&str]) -> Output {
 
 /// run_cyclops with extra env vars and optional piped stdin. CYCLOPS_AGENT
 /// is scrubbed first so the developer's shell can't leak an identity into
-/// the hook tests. TMUX_PANE is scrubbed for the same reason: `cyclops
-/// list` scopes to the caller's session by matching it, and a suite run
-/// inside tmux would leak a pane id that can collide with the canned
-/// fixtures' (%1, %2). Tests that want one set it explicitly.
+/// the hook tests. TMUX/TMUX_PANE are scrubbed for the same reason: a suite
+/// run inside tmux would put every child "in tmux"; TMUX_PANE would also make
+/// `cyclops list` scope to the caller's session and collide with canned
+/// fixture panes (%1, %2). A test that needs a pane sets TMUX_PANE through
+/// `envs`, which land after the scrub.
 fn run_cyclops_io(
     home: &Path,
     envs: &[(&str, &str)],
@@ -94,6 +95,7 @@ fn run_cyclops_io(
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cyclops"));
     cmd.env("CYCLOPS_HOME", home)
         .env_remove("CYCLOPS_AGENT")
+        .env_remove("TMUX")
         .env_remove("TMUX_PANE")
         .args(args);
     for (k, v) in envs {

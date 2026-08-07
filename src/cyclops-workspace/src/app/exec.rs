@@ -118,12 +118,8 @@ pub(super) async fn execute(
             client.resize_pane(&pane_id, direction, cells).await?;
             Ok(Outcome::default())
         }
-        Action::ScrollPane { pane_id, lines } => {
-            // Local scrollback only; this never reaches tmux.
-            if let Some(rt) = app.runtimes.get_mut(&pane_id) {
-                rt.scroll(lines);
-            }
-            Ok(Outcome::default())
+        Action::ScrollPane { pane_id, lines, at } => {
+            scroll_pane(app, client, pane_id, lines, at).await
         }
         Action::RequestNamePane { pane_id } => {
             let buffer = app
@@ -314,6 +310,89 @@ async fn commit_sidebar_visibility(app: &mut App, client: &ControlClient) -> Out
         persist: true,
         ..Outcome::default()
     }
+}
+
+/// What one wheel notch over a pane resolves to, decided by
+/// [`decide_scroll`] from that pane's own terminal modes rather than any
+/// global setting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScrollDecision {
+    /// Forward one SGR mouse report, byte-exact, through tmux.
+    ForwardSgr(String),
+    /// Forward this many presses of the named arrow key through tmux.
+    Arrows(&'static str, usize),
+    /// Move this runtime's own scroll offset by this many lines.
+    Local(i32),
+}
+
+/// Decide what one wheel notch over a pane should do — the same choice a
+/// real terminal emulator makes for the program it hosts, restated as a
+/// pure function so it needs no tmux client to test. A program that
+/// enabled SGR mouse reporting gets the notch forwarded as one SGR event
+/// (never scaled by `lines`'s magnitude — the far end applies its own
+/// scroll amount per event, the same way this app does for its own local
+/// path). A program on the alternate screen without mouse reporting gets
+/// arrow-key presses instead, matching the xterm/tmux alternate-scroll
+/// convention: its transcript lives inside the program, so there is
+/// nothing in this runtime's own scrollback to move. Anything else — and
+/// `at` being `None`, a stale hit or a pane this caller never found a
+/// runtime for — falls back to moving this runtime's own scroll offset,
+/// exactly as it always has.
+fn decide_scroll(
+    wants_sgr_mouse_wheel: bool,
+    alt_screen: bool,
+    lines: i32,
+    at: Option<crate::runtime::CellPos>,
+) -> ScrollDecision {
+    let Some(cell) = at else {
+        return ScrollDecision::Local(lines);
+    };
+    if wants_sgr_mouse_wheel {
+        let button = if lines < 0 { 64 } else { 65 };
+        let col = u32::from(cell.col) + 1;
+        let row = u32::from(cell.row) + 1;
+        return ScrollDecision::ForwardSgr(format!("\x1b[<{button};{col};{row}M"));
+    }
+    if alt_screen {
+        let key = if lines < 0 { "Up" } else { "Down" };
+        return ScrollDecision::Arrows(key, lines.unsigned_abs() as usize);
+    }
+    ScrollDecision::Local(lines)
+}
+
+/// Execute [`Action::ScrollPane`]: one wheel notch over a pane. This is the
+/// terminal-emulation fix for Claude Code panes not scrolling — such a pane
+/// runs on the alternate screen with its own mouse reporting on, so the
+/// notch has to reach tmux (as an SGR report, or as arrows) instead of
+/// moving a local scrollback the pane never shows.
+async fn scroll_pane(
+    app: &mut App,
+    client: &ControlClient,
+    pane_id: String,
+    lines: i32,
+    at: Option<crate::runtime::CellPos>,
+) -> Result<Outcome, TmuxError> {
+    let Some(rt) = app.runtimes.get(&pane_id) else {
+        return Ok(Outcome::default());
+    };
+    let decision = decide_scroll(rt.wants_sgr_mouse_wheel(), rt.alt_screen(), lines, at);
+    match decision {
+        ScrollDecision::ForwardSgr(report) => {
+            client
+                .send_keys_unconfirmed(&pane_id, &[report.as_str()])
+                .await?;
+        }
+        ScrollDecision::Arrows(key, count) => {
+            let keys = vec![key; count];
+            client.send_keys_unconfirmed(&pane_id, &keys).await?;
+        }
+        ScrollDecision::Local(lines) => {
+            if let Some(rt) = app.runtimes.get_mut(&pane_id) {
+                rt.scroll(lines);
+            }
+        }
+    }
+    Ok(Outcome::default())
 }
 
 /// Focus a pane. Sidebar agent rows span every workspace, not just the
@@ -981,7 +1060,7 @@ fn apply_insertion(order: &mut Vec<String>, source: &str, insertion: &Insertion)
 mod tests {
     use std::collections::HashSet;
 
-    use cyclops_testrig::{tmux_available, TmuxServer};
+    use cyclops_testrig::{TmuxServer, tmux_available};
     use cyclops_tmux::{ControlClient, ControlConfig, PaneDirection, SplitDirection};
 
     use super::*;
@@ -1259,6 +1338,54 @@ mod tests {
             "5"
         );
         assert_eq!(next_numeric_tab_name(&[tab("@1", "zsh", "%0")]), "2");
+    }
+
+    // -- Scroll decision: SGR forward, arrow-key forward, local fallback. --
+
+    #[test]
+    fn sgr_mouse_wheel_forwards_one_event_with_one_based_coords() {
+        let at = Some(crate::runtime::CellPos { col: 0, row: 0 });
+        assert_eq!(
+            decide_scroll(true, true, -3, at),
+            ScrollDecision::ForwardSgr("\x1b[<64;1;1M".to_string()),
+            "up forwards button 64"
+        );
+        assert_eq!(
+            decide_scroll(true, true, 3, at),
+            ScrollDecision::ForwardSgr("\x1b[<65;1;1M".to_string()),
+            "down forwards button 65"
+        );
+    }
+
+    #[test]
+    fn alt_screen_without_sgr_mouse_forwards_arrow_keys() {
+        let at = Some(crate::runtime::CellPos { col: 4, row: 2 });
+        assert_eq!(
+            decide_scroll(false, true, -3, at),
+            ScrollDecision::Arrows("Up", 3)
+        );
+        assert_eq!(
+            decide_scroll(false, true, 3, at),
+            ScrollDecision::Arrows("Down", 3)
+        );
+    }
+
+    #[test]
+    fn plain_pane_scrolls_locally() {
+        let at = Some(crate::runtime::CellPos { col: 4, row: 2 });
+        assert_eq!(
+            decide_scroll(false, false, -3, at),
+            ScrollDecision::Local(-3)
+        );
+        assert_eq!(decide_scroll(false, false, 3, at), ScrollDecision::Local(3));
+    }
+
+    #[test]
+    fn no_resolved_cell_always_falls_back_to_local_even_with_sgr_mouse_on() {
+        assert_eq!(
+            decide_scroll(true, true, -3, None),
+            ScrollDecision::Local(-3)
+        );
     }
 
     // -- An action that mutates structure reconciles. --

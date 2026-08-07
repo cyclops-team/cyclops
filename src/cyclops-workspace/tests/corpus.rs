@@ -209,6 +209,8 @@ fn hydrate_feeds_visible_bytes() {
         cursor_x: 0,
         cursor_y: 0,
         alternate_on: false,
+        mouse_on: false,
+        mouse_sgr: false,
     };
     rt.hydrate(&snap);
     assert_eq!(rt.snapshot().row_texts()[0], "hydrated");

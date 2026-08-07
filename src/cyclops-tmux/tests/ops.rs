@@ -222,18 +222,29 @@ async fn split_opens_in_the_source_panes_directory_not_the_sessions() {
     // A window rooted somewhere else: its pane's path is the only thing
     // that distinguishes `-c #{pane_current_path}` from tmux's default,
     // which is the session's directory.
-    // `s:` is the session-typed target; bare `-t s` would prefix-match an auto-renamed window.
+    // Named window: an unnamed /bin/sh window auto-renames to `sh`, which bare
+    // `-t s` can prefix-match. Use the explicit index too: tmux 3.7b can race
+    // when choosing the next free index under parallel load.
     srv.tmux_ok(&[
         "new-window",
         "-t",
-        "s:",
+        "s:1",
         "-n",
         "work",
         "-c",
         pane_dir.to_str().expect("UTF-8 scratch path"),
         "/bin/sh",
     ]);
-    let source = pane_ids(&srv, "s")[0].clone();
+    // `s:1`, not the bare session `s`, below too: a session-level target
+    // resolves to its *current* window, and not giving `new-window` `-d`
+    // is supposed to make the window it just created current — but that
+    // hand-off MEASURED racy on the same tmux 3.7b under the same load:
+    // `display-message -p -t s "#{window_index}"` read back `0` right
+    // after a successful, `-d`-less `new-window -t s:1` 3/80 tries. Asking
+    // for window 1's panes directly does not depend on that hand-off
+    // having landed yet, and reproduced zero mistargeted-pane failures
+    // over 100 tries.
+    let source = pane_ids(&srv, "s:1")[0].clone();
     let (client, _n) = ControlClient::spawn(srv.config("s")).await.expect("spawn");
     assert!(
         same_dir(&field(&srv, &source, "#{pane_current_path}"), &pane_dir),
@@ -245,7 +256,7 @@ async fn split_opens_in_the_source_panes_directory_not_the_sessions() {
         .await
         .expect("split");
 
-    let panes = pane_ids(&srv, "s");
+    let panes = pane_ids(&srv, "s:1");
     let new = panes.iter().find(|p| **p != source).expect("new pane");
     let path = field(&srv, new, "#{pane_current_path}");
     assert!(

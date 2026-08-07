@@ -949,4 +949,19 @@ mod tests {
             assert!(!is_key_name(k), "{k} should be literal");
         }
     }
+
+    #[test]
+    fn a_literal_containing_esc_survives_the_dash_l_command_intact() {
+        // An SGR mouse report (e.g. the wheel-forwarding byte string for an
+        // alt-screen pane with mouse reporting on) is not a tmux key name,
+        // so it must ride the `-l` literal path with every byte — ESC
+        // included — untouched; `quote_arg` only strips \n, \r, and \0.
+        let report = "\x1b[<64;1;1M";
+        let commands = send_keys_commands("%3", &[report]);
+        assert_eq!(
+            commands,
+            vec![format!("send-keys -t '%3' -l -- '{report}'")],
+            "the ESC byte must reach the generated command unmodified"
+        );
+    }
 }

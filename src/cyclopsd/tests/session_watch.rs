@@ -12,6 +12,7 @@ mod common;
 
 use common::*;
 use serde_json::json;
+use std::time::{Duration, Instant};
 
 /// Boot with nothing configured, watch a session created afterwards, and
 /// see it show up on status with its pane table -- the whole point of the
@@ -103,6 +104,99 @@ async fn watching_a_session_after_boot_makes_status_see_it() {
     );
     let absent = rig.ctl.request("session.watch", json!({})).await;
     assert_eq!(absent["error"]["code"], json!("bad_request"), "{absent}");
+
+    rig.shutdown().await;
+}
+
+/// End-to-end rename contract: the live watcher keeps feeding the same
+/// daemon slot, a workspace re-registering the new name dedups, adoptions
+/// move with the session, and new state facts keep appending to the ledger
+/// that was already open under the old name.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renamed_watched_session_keeps_one_slot_registry_and_ledger() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new("session-rename", CAT_MANIFEST, "cat", "").await;
+    let original_pane = rig.pane_ids().await.remove(0);
+    rig.label(&original_pane, "implementer").await;
+
+    rig.tmux
+        .run_ok(&["rename-session", "-t", "=main", "renamed"]);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let renamed_status = loop {
+        let status = rig.ctl.request("status", json!({})).await;
+        let sessions = status["result"]["sessions"].as_array().expect("sessions");
+        if sessions.len() == 1
+            && sessions[0]["name"] == json!("renamed")
+            && sessions[0]["attached"] == json!(true)
+        {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon never followed the rename: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(
+        renamed_status["result"]["sessions"][0]["panes"][0]["agent"],
+        json!("implementer"),
+        "the adopted pane stays named after the session rename"
+    );
+
+    let rewatch = rig
+        .ctl
+        .request("session.watch", json!({"session": "renamed"}))
+        .await;
+    assert_eq!(rewatch["result"]["added"], json!(false), "{rewatch}");
+    let status = rig.ctl.request("status", json!({})).await;
+    assert_eq!(
+        status["result"]["sessions"]
+            .as_array()
+            .expect("sessions")
+            .len(),
+        1,
+        "re-registering the new name must not duplicate the slot: {status}"
+    );
+
+    let registry: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(rig.home.join("registry.json")).expect("registry readable"),
+    )
+    .expect("registry JSON");
+    assert_eq!(registry["panes"][0]["session"], json!("renamed"));
+    assert_eq!(registry["windows"][0]["session"], json!("renamed"));
+
+    rig.tmux
+        .run_ok(&["split-window", "-t", "renamed", "/bin/sh"]);
+    rig.wait_attached(2).await;
+    let pane_ids = rig.pane_ids().await;
+    let added_pane = pane_ids
+        .iter()
+        .find(|pane| **pane != original_pane)
+        .expect("new pane");
+
+    let lines = rig.ledger_lines();
+    let rename_at = lines
+        .iter()
+        .position(|line| {
+            line["data"]["event"] == json!("renamed")
+                && line["data"]["old_name"] == json!("main")
+                && line["data"]["new_name"] == json!("renamed")
+        })
+        .expect("rename fact in old-name ledger");
+    assert!(
+        lines.iter().skip(rename_at + 1).any(|line| {
+            line["kind"] == json!("state") && line["data"]["pane_id"] == json!(added_pane)
+        }),
+        "pane events after the rename must keep appending to the open ledger"
+    );
+    assert!(
+        !rig.ledger_path_for("renamed").exists(),
+        "a live rename keeps one record instead of splitting it across files"
+    );
 
     rig.shutdown().await;
 }

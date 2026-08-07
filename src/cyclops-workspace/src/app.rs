@@ -1589,7 +1589,17 @@ async fn handle_mouse(
                 } else {
                     action::ScrollDirection::Down
                 };
-                if let Some(action) = action::route_mouse_scroll(&target, direction) {
+                // Only a `PaneBody` hit has a pane to resolve a cell
+                // against; every other scrollable target (none exist
+                // today) would just carry `None` through unchanged.
+                let at = match &target {
+                    HitTarget::PaneBody { pane_id } => app
+                        .hit_map
+                        .pane_geometry(pane_id)
+                        .and_then(|geom| HitMap::cell_at(geom, col, row)),
+                    _ => None,
+                };
+                if let Some(action) = action::route_mouse_scroll(&target, direction, at) {
                     let outcome = exec::execute(app, client, action).await?;
                     apply_outcome(app, outcome);
                 }

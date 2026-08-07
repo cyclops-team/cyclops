@@ -74,6 +74,14 @@ change whenever coverage grows.
 - Hook-backed verification requires wiring the generated hook into the
   vendor CLI; without it, delivery can still finish with screen evidence and
   an explicitly unverified receipt.
+- Renaming a watched session (folder-following does this) is followed live:
+  the watcher matches the rename by the session's stable tmux id and the
+  daemon's slot and durable adoption records move to the new name in place,
+  so watching continues with no re-registration. Two edges remain: the open
+  ledger file keeps its old-name path for that daemon run (a system line
+  records the rename), and `config.toml`'s `sessions` list is not rewritten,
+  so a restarted daemon waits on the old name until something re-registers
+  the new one.
 
 For the repository map and design boundaries, read
 [docs/development/HANDOFF.md](docs/development/HANDOFF.md). For user-facing
