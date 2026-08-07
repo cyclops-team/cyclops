@@ -479,7 +479,8 @@ above.
 
 | Command | What it does |
 |---|---|
-| `cyclops start` | Open the default workspace: restore it, or build it from a preset. Safe to run twice |
+| `cyclops` | The workspace: sidebar, tabs, live panes. Starts a session and the daemon when none is running |
+| `cyclops start` | Build or restore the default workspace from a preset, without opening the UI. Safe to run twice |
 | `cyclops workspace save\|restore` | The shape of a session as a file: panes, sizes, names, directories |
 | `cyclops name <pane> <label>` | Name a pane so cyclops can address it; the pane's tmux border says so |
 | `cyclops list` | The roster: every named agent, how it is doing, what it is on. Inside tmux it scopes to your session; `--all` is every watched session |
