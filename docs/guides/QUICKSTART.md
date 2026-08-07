@@ -37,7 +37,7 @@ can already find them:
 
 Next:
   1  exec /bin/zsh -l  so your shell can find cyclops
-  2  cyclops start     open your workspace; it prints what to do next
+  2  cyclops           open your workspace and start your agents
 ```
 
 Step 1 is there only when the installer had to add a line to your shell
