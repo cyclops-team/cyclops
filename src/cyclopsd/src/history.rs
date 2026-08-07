@@ -74,11 +74,7 @@ pub(crate) fn msg_history(
     let limit = params.limit as usize;
 
     let files = read_all_sessions(inner);
-    let names: Vec<String> = inner
-        .session_slots()
-        .iter()
-        .map(|s| s.name.clone())
-        .collect();
+    let names: Vec<String> = inner.session_slots().iter().map(|s| s.name()).collect();
 
     if let Some(c2) = cursor2 {
         if params.cursor.is_some() {
@@ -224,7 +220,7 @@ fn read_all_sessions(inner: &Inner) -> Vec<Vec<LedgerLine>> {
         .map(|slot| match cyclops_ledger::read_after(slot.ledger.path(), 0) {
             Ok(lines) => lines,
             Err(e) => {
-                warn!(session = %slot.name, error = %e, "history read failed; treating as empty");
+                warn!(session = %slot.name(), error = %e, "history read failed; treating as empty");
                 Vec::new()
             }
         })

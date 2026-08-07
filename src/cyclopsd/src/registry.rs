@@ -198,6 +198,39 @@ impl Registry {
         out
     }
 
+    /// Move every session-scoped registry fact to a session's new name.
+    ///
+    /// tmux pane and window ids do not change when their session is
+    /// renamed, so the adoption itself and both chrome snapshots remain
+    /// valid. Only their human-facing session name moves. Persist before
+    /// committing, like [`Self::adopt`]: after an acknowledged rename the
+    /// next daemon must restore the same roster under the name tmux now
+    /// uses.
+    pub(crate) fn rename_session(
+        &mut self,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), std::io::Error> {
+        if old_name == new_name {
+            return Ok(());
+        }
+        let mut panes = self.panes.clone();
+        let mut windows = self.windows.clone();
+        let mut changed = false;
+        for adoption in panes.values_mut().filter(|a| a.session == old_name) {
+            adoption.session = new_name.to_string();
+            changed = true;
+        }
+        for window in windows.values_mut().filter(|w| w.session == old_name) {
+            window.session = new_name.to_string();
+            changed = true;
+        }
+        if !changed {
+            return Ok(());
+        }
+        self.commit(panes, windows)
+    }
+
     /// Window chrome snapshot for a window, if cyclops took one.
     pub(crate) fn window(&self, window_id: &str) -> Option<&WindowChrome> {
         self.windows.get(window_id)
@@ -459,6 +492,44 @@ mod tests {
             Some("old-format".into())
         );
         assert!(back.window("@0").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session rename changes no tmux identity: adopted panes and their
+    /// window snapshots must move to the new session name together, in
+    /// memory and on disk. Session-scoped repaint/restore paths otherwise
+    /// stop finding them as soon as the watcher follows the rename.
+    #[test]
+    fn a_session_rename_moves_adoptions_and_window_snapshots_durably() {
+        let dir = home("rename");
+        let (mut reg, _) = Registry::load(&dir);
+        reg.adopt(adoption("%1", "reviewer", 100, "@0"), window("@0", None))
+            .unwrap();
+
+        reg.rename_session("main", "renamed")
+            .expect("rename writes");
+
+        assert!(reg.in_session("main").is_empty());
+        assert_eq!(
+            reg.in_session("renamed")
+                .iter()
+                .map(|a| a.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["reviewer"]
+        );
+        assert_eq!(
+            reg.window("@0").map(|window| window.session.as_str()),
+            Some("renamed")
+        );
+
+        let (back, warnings) = Registry::load(&dir);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(back.in_session("main").is_empty());
+        assert_eq!(back.in_session("renamed").len(), 1);
+        assert_eq!(
+            back.window("@0").map(|window| window.session.as_str()),
+            Some("renamed")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

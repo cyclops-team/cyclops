@@ -378,8 +378,15 @@ pub(crate) fn fuse(
 /// event when the fused state changed. `force_screen` runs the full sensor
 /// set even when a title rule alone would decide (pane.read detection).
 /// Returns None when the pane is gone from the table.
+///
+/// `session_idx` is the caller's stable session-slot index, not re-derived
+/// here from `watcher.session()`: see [`crate::emit_state`]'s doc comment
+/// for the rename race that distinction closes. Every call site already
+/// has one, from wherever it entered the session (an event's own
+/// `session_task`, a resolved recipient, a delivery handle).
 pub(crate) async fn recompute_pane(
     inner: &Arc<Inner>,
+    session_idx: usize,
     watcher: &SessionWatcher,
     pane_id: &str,
     force_screen: bool,
@@ -546,7 +553,7 @@ pub(crate) async fn recompute_pane(
             cause,
             "fused state changed"
         );
-        inner.emit_state(watcher.session(), pane_id, &detection, prior, cause);
+        inner.emit_state(session_idx, pane_id, &detection, prior, cause);
         // The border says what this row says, from the same edge. No
         // timer, no second rule: an adopted pane's chrome moves exactly
         // when the fused state it names moves.

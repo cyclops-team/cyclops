@@ -724,7 +724,7 @@ pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResul
                 .map(|w| w.snapshot())
                 .unwrap_or_default();
             SessionStatus {
-                name: slot.name.clone(),
+                name: slot.name(),
                 attached: link.attached,
                 panes: rows
                     .iter()
@@ -794,7 +794,7 @@ async fn pane_read(inner: &Arc<Inner>, id: Value, params: Value) -> Response {
         Ok(p) => p,
         Err(e) => return Response::err(id, "bad_request", format!("bad pane.read params: {e}")),
     };
-    let Some((watcher, pane_id)) = resolve_target(inner, &params.target) else {
+    let Some((session_idx, watcher, pane_id)) = resolve_target(inner, &params.target) else {
         let known = known_panes(inner);
         return Response::err(
             id,
@@ -828,8 +828,15 @@ async fn pane_read(inner: &Arc<Inner>, id: Value, params: Value) -> Response {
         PaneReadSource::Detection => {
             // Reconcile on doubt: an explicit detection read refreshes with
             // the full sensor set instead of trusting the cache.
-            let det = match fusion::recompute_pane(inner, &watcher, &pane_id, true, "pane.read")
-                .await
+            let det = match fusion::recompute_pane(
+                inner,
+                session_idx,
+                &watcher,
+                &pane_id,
+                true,
+                "pane.read",
+            )
+            .await
             {
                 Some(det) => det,
                 None => return Response::err(id, "no_such_target", "pane vanished during read"),
@@ -886,14 +893,23 @@ fn cap_lines(text: String, cap: Option<u32>) -> String {
 /// same resolution order as every other verb (the CLI promises "label or
 /// pane id" everywhere). The session link lock is dropped before any
 /// await; only the Arc leaves the closure.
-fn resolve_target(inner: &Inner, target: &str) -> Option<(Arc<SessionWatcher>, String)> {
+///
+/// Returns the slot's index alongside the watcher and pane id: a caller
+/// resolving a session verdict off this (`pane.read source=detection`)
+/// needs that idx rather than a name re-derived from the watcher, for the
+/// same reason `emit_state` takes one — see its doc comment.
+fn resolve_target(inner: &Inner, target: &str) -> Option<(usize, Arc<SessionWatcher>, String)> {
     let wanted = inner.label_target(target);
-    inner.session_slots().iter().find_map(|slot| {
-        let link = slot.link.lock().expect("session link lock");
-        link.watcher
-            .as_ref()
-            .and_then(|w| w.pane(&wanted).map(|row| (Arc::clone(w), row.pane_id)))
-    })
+    inner
+        .session_slots()
+        .iter()
+        .enumerate()
+        .find_map(|(idx, slot)| {
+            let link = slot.link.lock().expect("session link lock");
+            link.watcher
+                .as_ref()
+                .and_then(|w| w.pane(&wanted).map(|row| (idx, Arc::clone(w), row.pane_id)))
+        })
 }
 
 fn known_panes(inner: &Inner) -> Vec<String> {
@@ -987,14 +1003,12 @@ mod tests {
             .sessions
             .get_mut()
             .expect("sessions lock")
-            .push(Arc::new(crate::SessionSlot {
-                name: "main".into(),
-                link: StdMutex::new(crate::SessionLink::default()),
-                ledger: Arc::new(
+            .push(Arc::new(crate::SessionSlot::new(
+                "main".into(),
+                Arc::new(
                     cyclops_ledger::LedgerWriter::open(&path, "b-test").expect("ledger opens"),
                 ),
-                last_panes: StdMutex::new(HashMap::new()),
-            }));
+            )));
         (inner, dir)
     }
 
