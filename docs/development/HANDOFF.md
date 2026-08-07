@@ -74,8 +74,10 @@ job).
 
 `resources/manifests/` and `resources/layouts/` are also compiled into the `cyclops` binary
 with `include_str!`, so a fresh install works before it has any files.
-`cyclops start` writes them into the home and never overwrites what is
-there, because an edited manifest is worth more than the shipped guess.
+The bare `cyclops` front door and `cyclops start` seed the shipped manifests
+into the home and never overwrite an edit, because an edited manifest is
+worth more than the shipped guess. Layout presets remain compiled data; they
+are applied by `cyclops start` when it builds a workspace.
 
 ## Where to start reading
 
@@ -239,8 +241,8 @@ clients. tmux is eliminated and you control everything.
 
 **Why:** the cost was bounded with real numbers rather than argued. zmx
 does PTY persistence ALONE in 7.4k lines of Zig; herdr does the full job in
-around 206k lines of Rust, with a vendored VT engine, a patched pty crate,
-and a funded full-time maintainer. That option scored 3.40 against the
+around 206k lines of Rust, with a vendored VT engine and a patched pty
+crate. That option scored 3.40 against the
 tmux-backed design's 4.15, and it was killed by implementation cost and by
 having to rebuild observability tmux already provides. The agents are also
 already running in the user's tmux, with their config, keybindings,
@@ -430,3 +432,8 @@ maintained. Two worth knowing on day one because they look like bugs:
 - **`cyclops start` cannot tell two same-shaped arrangements apart** when
   the daemon holds no names for the session. Naming one pane closes it.
   Grid topology alone genuinely cannot answer it.
+
+One process document lives outside `docs/`:
+[DEMO_DAY_CHECKLIST.md](../../DEMO_DAY_CHECKLIST.md) is the working
+checklist for the public launch pass, kept at the root while that work is
+in flight.

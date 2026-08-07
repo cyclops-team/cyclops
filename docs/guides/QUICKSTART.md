@@ -3,6 +3,14 @@
 Install cyclops, wire two agents, pass reviewed work between them, and read
 it back months later. About ten minutes, most of it waiting for agents.
 
+Day to day, you will not type most of these commands. You open the
+workspace with bare `cyclops`, start your agents in its panes, and tell
+them things like "when you're done, send it to reviewer" — an agent that
+knows Cyclops ([one file teaches it](../../skills/cyclops/SKILL.md)) runs
+the handoff itself. This page walks the layer underneath, command by
+command, so you can see what your agents do and drive every step yourself
+when you want to.
+
 The README ladder is the short version. This is the same walk from a bare
 machine, with the handoff in the middle, which is the thing Cyclops is for.
 
@@ -37,7 +45,7 @@ can already find them:
 
 Next:
   1  exec /bin/zsh -l  so your shell can find cyclops
-  2  cyclops start     open your workspace; it prints what to do next
+  2  cyclops           open your workspace and start your agents
 ```
 
 Step 1 is there only when the installer had to add a line to your shell
@@ -135,7 +143,8 @@ $ cyclops status
 Manifests loaded and none of them matching, as here, is one CLI cyclops has
 not been taught: pin one, or write one ([MANIFESTS.md](../reference/MANIFESTS.md)). The
 other sentence, `cyclopsd loaded no detection manifests`, is the whole
-install and is fixed once, with `cyclops start` and a daemon restart.
+install and is fixed once, with bare `cyclops` (or `cyclops start`) and a
+daemon restart.
 
 ### Naming a pane yourself
 
@@ -191,9 +200,11 @@ directory-trust trap and the agy caveat are in [hooks.md](../reference/hooks.md)
 
 ## 5. The handoff
 
-The implementer finishes something and hands it to the reviewer. This is run
-in the implementer's own pane, by you or by the agent itself, and its receipt
-prints there:
+The implementer finishes something and hands it to the reviewer. In the
+natural-language flow this is the moment you said "send it to reviewer and
+ask for a review", and the implementer runs the command itself. The command
+is the same either way — run in the implementer's own pane, by the agent or
+by you, and its receipt prints there:
 
 ```
 $ cyclops send reviewer --subject "Burst path fix, ready for review" --body "gateway.rs:120. Tests pass."
@@ -286,6 +297,9 @@ writes: any agent may query the whole record.
 
 ## What to read next
 
+- [skills/cyclops/SKILL.md](../../skills/cyclops/SKILL.md) to teach your
+  agent the verbs and safety rules, so the handoff above is something you
+  say rather than type
 - [install.md](install.md) for PATH, config keys, and the manifests
 - [send.md](send.md) for receipts, broadcast, and quota parking
 - [history.md](history.md) for filters, threads, and paging a long record

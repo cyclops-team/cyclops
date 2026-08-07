@@ -1060,7 +1060,7 @@ fn apply_insertion(order: &mut Vec<String>, source: &str, insertion: &Insertion)
 mod tests {
     use std::collections::HashSet;
 
-    use cyclops_testrig::{TmuxServer, tmux_available};
+    use cyclops_testrig::{tmux_available, TmuxServer};
     use cyclops_tmux::{ControlClient, ControlConfig, PaneDirection, SplitDirection};
 
     use super::*;

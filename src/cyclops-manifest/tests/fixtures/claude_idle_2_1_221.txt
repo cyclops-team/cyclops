@@ -1,7 +1,7 @@
 
 ╭─── Claude Code v2.1.221 ─────────────────────────────────────────────────────────────────────────────────────────────╮
 │                                                    │ Tips for getting started                                        │
-│                 Welcome back Yahir!                │ Ask Claude to create a new app or clone a repository            │
+│                 Welcome back Guest!                │ Ask Claude to create a new app or clone a repository            │
 │                                                    │ ─────────────────────────────────────────────────────────────── │
 │                       ▐▛███▜▌                      │ What's new                                                      │
 │                      ▝▜█████▛▘                     │ Added owner wildcard entries (`"owner/*"`) to the `strictKnown… │

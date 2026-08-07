@@ -61,11 +61,12 @@ fn scratch_home(tag: &str) -> PathBuf {
     dir
 }
 
-/// The tty path seeds the shipped themes before the workspace opens, the
-/// same way `cyclops start` does. The live failure this pins: a config or
-/// `$CYCLOPS_THEME` naming a shipped theme on a home `start` never touched
-/// was a missing themes/light.toml and a warning about fixing a file that
-/// was never there.
+/// The tty path seeds the shipped themes and detection manifests before
+/// the workspace opens, the same way `cyclops start` does. The live
+/// failures this pins: a config or `$CYCLOPS_THEME` naming a shipped theme
+/// on a home `start` never touched was a missing themes/light.toml; a
+/// binary-only first run with no manifests left every pane unknown and
+/// undeliverable.
 ///
 /// The rig goes as far as the tty branch itself: bare `cyclops` on a pty,
 /// killed once the seed is on disk. The daemon socket is held by this test
@@ -73,7 +74,7 @@ fn scratch_home(tag: &str) -> PathBuf {
 /// finds the socket held and exits at boot), and the config points tmux at
 /// an isolated testrig server in case the boot gets that far.
 #[test]
-fn bare_tty_seeds_the_shipped_themes() {
+fn bare_tty_seeds_the_shipped_themes_and_manifests() {
     if !tmux_available() {
         return;
     }
@@ -100,12 +101,14 @@ fn bare_tty_seeds_the_shipped_themes() {
         .spawn()
         .expect("run cyclops");
 
-    // The seed is the first thing the tty branch does, so the files land
-    // well before the daemon step's connect budget runs out. Bounded wait,
-    // then stop the workspace; nothing after the seed is asserted on.
+    // Themes and manifests are the first things the tty branch writes, so
+    // they land well before the daemon step's connect budget runs out.
+    // Bounded wait, then stop the workspace; nothing after the seed is
+    // asserted on.
     let light = home.join("themes/light.toml");
+    let claude = home.join("manifests/claude.toml");
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !light.is_file() && Instant::now() < deadline {
+    while !(light.is_file() && claude.is_file()) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
     let _ = child.kill();
@@ -124,5 +127,17 @@ fn bare_tty_seeds_the_shipped_themes() {
         "bare cyclops did not seed themes; the dir holds {seeded:?}"
     );
     assert!(home.join("themes/dark.toml").is_file(), "{seeded:?}");
+    let manifests: Vec<String> = std::fs::read_dir(home.join("manifests"))
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        claude.is_file(),
+        "bare cyclops did not seed manifests; the dir holds {manifests:?}"
+    );
+    assert!(home.join("manifests/codex.toml").is_file(), "{manifests:?}");
     let _ = std::fs::remove_dir_all(&home);
 }

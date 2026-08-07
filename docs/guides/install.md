@@ -72,7 +72,7 @@ the line printed and no edit.
 
 `--no-path` skips all of it and prints the line for you to add yourself.
 
-### Uninstall
+### Taking it back off
 
 ```bash
 curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
@@ -197,8 +197,10 @@ themes (dark, light, high-contrast), four ports (catppuccin,
 tokyo-night, nord, gruvbox), six bright originals (sorbet, meadow,
 periwinkle, blossom, seafoam, buttercream), and four dark originals
 (midnight, ember, forest, obsidian). A theme you edited is never
-rewritten, the same rule the manifests follow. With no theme files at all, cyclops
-renders in built-in colors.
+rewritten, the same rule the manifests follow. Detection manifests land
+in `~/.cyclops/manifests` on the same paths (`start` and bare `cyclops`),
+because without them every pane reads unknown and nothing can be
+delivered. With no theme files at all, cyclops renders in built-in colors.
 
 The tuning knobs, defaults shown:
 

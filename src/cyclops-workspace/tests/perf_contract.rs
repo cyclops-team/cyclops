@@ -23,12 +23,12 @@
 //! `target/debug/cyclops`/`cyclopsd` are not built.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cyclops_testrig::{TmuxServer, tmux_available};
+use cyclops_testrig::{tmux_available, TmuxServer};
 use cyclops_tmux::{ControlClient, ControlConfig, Notification};
-use cyclops_workspace::app::{CoalesceEnd, DecorationSignal, coalesce_decoration_signals};
+use cyclops_workspace::app::{coalesce_decoration_signals, CoalesceEnd, DecorationSignal};
 
 /// One measurement at a time. cargo runs this binary's tests on parallel
 /// threads, and these tests measure timing: the flood tests starve the

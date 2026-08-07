@@ -1,0 +1,25 @@
+name: Feature request
+description: Propose something cyclops or cyclopsd doesn't do yet
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you hitting?
+      description: What are you trying to do, and where does today's cyclops fall short?
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Desired behavior
+      description: What should happen instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other ways you tried to solve this, including workarounds you're using now
