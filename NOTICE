@@ -1,18 +1,22 @@
-commPact staged release notice
+Upstream attribution for the Cyclops v1 lineage
 
-Project license and distribution status: pending. No commPact project license is selected by this staged build.
+Cyclops (this tree) is the Rust implementation, licensed under the MIT
+License in `LICENSE`.
 
-Upstream attribution
---------------------
-The complete upstream MIT text is retained in `LICENSE`. The staged command
-behavior is adapted from the upstream tmux coordination tooling.
+The previous implementation, Cyclops v1, was a shell and Python toolkit
+built around `bin/commPact`, adapted from the upstream tmux coordination
+tooling at github.com/ShawnPana/smux (MIT). The complete upstream MIT text
+is retained in `LICENSE`. v1 remains available read-only at branch `v1`
+and tag `v1-final`.
 
-Provenance and verified local changes
--------------------------------------
+Provenance recorded at the time of adaptation
+---------------------------------------------
 Upstream: github.com/ShawnPana/smux, MIT.
 Baseline: tmux-bridge v2.1.0 at ~/.smux/bin/tmux-bridge.
 Baseline SHA-256: c40a655e62a6ddc215622e5a227d702ea2fce5d5b09573cbeedbca1ecce29ced.
-Staged candidate: bin/commPact SHA-256 5a40adf69fa234c894ff5f176ba6dab2ed457eda7cd94007c113621124cc87b9.
+Adapted: bin/commPact SHA-256 5a40adf69fa234c894ff5f176ba6dab2ed457eda7cd94007c113621124cc87b9.
+
+Changes made in the adaptation:
 
 1. Config-driven session ACL and roster replace hardcoded allow labels.
 2. Full commPact identity, metadata, and temp namespace rename ships with no alias.
@@ -22,6 +26,3 @@ Staged candidate: bin/commPact SHA-256 5a40adf69fa234c894ff5f176ba6dab2ed457eda7
 6. SHA fallback chain uses shasum, sha256sum, then openssl.
 7. Config-driven wrapper layer adds install, init, adopt, layout, msg, notice, and watchdog.
 8. Doctor and hash subcommands are new.
-
-The final commPact project license and distribution status remain pending.
-The ~/.smux tree stays untouched as the rollback vendor reference.
