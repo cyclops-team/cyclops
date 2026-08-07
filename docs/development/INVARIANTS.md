@@ -41,12 +41,12 @@ irreversible steps after it:
 ```mermaid
 flowchart TD
     g["gate: 8 ordered checks<br/>(delivery.rs, gate)"] -->|"admits: manifest id + pane_pid"| r1{"occupant still the<br/>admitted pid?"}
-    r1 -->|no| retry["retry_queued, cause pane_rebound<br/>back through the whole gate"]
+    r1 -->|"no before paste"| retry["retry_queued, cause pane_rebound<br/>back through the whole gate"]
     r1 -->|yes| paste["paste the buffer"]
     paste --> v{"composer shows this<br/>message id?"}
-    v -->|"no, after every re-read"| retry2["retry_queued, cause verify_failed<br/>Enter is never sent"]
+    v -->|"no, after every re-read"| attention["attention_required, cause verify_failed<br/>paste may have landed; never re-paste"]
     v -->|yes| r2{"occupant STILL the<br/>admitted pid?"}
-    r2 -->|no| retry
+    r2 -->|"no after paste"| attention2["attention_required, cause pane_rebound_after_paste"]
     r2 -->|yes| enter["submit key"]
 ```
 
@@ -66,6 +66,14 @@ composer that has been seen holding **this** message id. A staging pattern
 without an id can only prove that something was pasted once
 (`staged_verified` splits id-carrying patterns from generic ones for
 exactly that reason).
+
+The irreversible boundary changes retry policy. A detach, missing manifest,
+pre-paste occupant rebind, or spool failure is proven before the pane write
+and may use the configured bounded retry. A paste failure, failed readback,
+post-paste rebind, submit failure, or ACK timeout may have reached the pane;
+each goes directly to `attention_required` with its exact cause. That state
+means the terminal outcome can be unknown, not that Cyclops proved the
+recipient did not receive the message. Inspect the pane before resending.
 
 - Enforced at: `src/cyclopsd/src/delivery.rs`, `gate` (admission),
   `occupant_unchanged` (both re-checks), `attempt_delivery` (the order),

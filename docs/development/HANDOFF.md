@@ -91,6 +91,7 @@ its own home, and cleans both up.
 
 Then [QUICKSTART.md](../guides/QUICKSTART.md) for the two-agent walk with your own
 CLIs. Development loop and gates: [CONTRIBUTING.md](../../CONTRIBUTING.md).
+Preparing a release demo: [DEMO_DAY_CHECKLIST.md](../../DEMO_DAY_CHECKLIST.md).
 
 ### Explain how a message becomes a verified receipt
 
@@ -196,8 +197,12 @@ tells you where to look:
 | `no_such_pane`, `pane_dead`, `session_detached` | The target is not there | The pane table: `cyclops status` |
 | `pane_in_mode`, `working`, `idle_with_input`, `blocked:<rule id>`, `blocked_quota` | The gate is holding on purpose | Fusion: is the state right? `cyclops read <pane>` |
 | `no_manifest` | Nothing bound to the pane | The manifest's `process_names` versus what the pane is actually running |
-| `verify_failed` | The paste did not stage | The manifest's `verify_pattern`, and whether the composer is where you think |
-| `pane_rebound` | The occupant changed between admit and inject | Something restarted in that pane. Working as intended |
+| `paste_failed` | The paste command's reply was lost or failed after tmux may have applied it | Inspect the named pane and composer before resending |
+| `verify_failed` | Paste readback is inconclusive; the payload may have landed | Inspect the manifest's `verify_pattern` and the named pane before resending |
+| `pane_rebound` | The occupant changed before the payload write | Something restarted in that pane; the bounded retry re-enters the gate |
+| `pane_rebound_after_paste` | The pane changed after staged input reached the original occupant | Inspect the original pane before resending; Cyclops never retries this cause |
+| `submit_failed` | Enter may have reached the original occupant before its reply was lost | Inspect the named pane and composer before resending |
+| `ack_timeout` | The submit may have started a turn but no ACK arrived in time | Inspect the named pane and recipient state before resending |
 
 The thing to internalize: **a hold is waiting on an event, never on a
 clock.** So "it is stuck" is always the question "which event never

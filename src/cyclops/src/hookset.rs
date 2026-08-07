@@ -9,7 +9,10 @@
 //! a rendered config proves nothing until `hooks verify` or
 //! `hooks selftest` shows edges actually arriving.
 
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use clap::ValueEnum;
@@ -36,6 +39,9 @@ const SELFTEST_READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// Path components that mark a vendor CLI's own config tree. Install
 /// refuses to write anywhere inside one, whatever the --dest says.
 const VENDOR_DIRS: &[&str] = &[".claude", ".codex", ".gemini", ".agents", ".cursor"];
+
+/// Sequence for same-directory temporary artifact names.
+static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CliKind {
@@ -102,27 +108,39 @@ fn instructions(kind: CliKind, rendered: &Path, label: &str) -> String {
              \x20 claude --settings {p}\n\
              \n\
              Already passing your own --settings file? Merge the \"hooks\" object\n\
-             from {p} into it.\n\
+             from {p} into it, preserving every unrelated setting and handler.\n\
+             Do not replace the file.\n\
              Then prove it fires: cyclops hooks selftest {label}"
         ),
         CliKind::Codex => format!(
-            "Wire it. Codex loads ZERO hooks in an untrusted directory (finding F1),\n\
-             and --dangerously-bypass-hook-trust does NOT fix that. Two setups work:\n\
+            "Wire it without replacing shared config. Codex loads ZERO hooks in an\n\
+             untrusted directory (finding F1), and\n\
+             --dangerously-bypass-hook-trust does NOT fix that.\n\
              \n\
-             1. User-level hooks, no directory trust needed:\n\
-             \x20    cp {p} \"${{CODEX_HOME:-$HOME/.codex}}/hooks.json\"\n\
+             User-level hooks (no directory trust needed): if\n\
+             ${{CODEX_HOME:-$HOME/.codex}}/hooks.json does not exist, copy {p} there.\n\
+             If it already exists, merge only Cyclops' event entries from {p};\n\
+             preserve every unrelated key and handler. Never overwrite it.\n\
              \n\
-             2. Keep project-local hooks and pre-seed trust in\n\
-             \x20  ${{CODEX_HOME:-$HOME/.codex}}/config.toml (edit the path first):\n\
+             After merging, open Codex's /hooks and review and trust the exact\n\
+             Cyclops command definition. New or changed commands are skipped\n\
+             until that exact definition is trusted. For project-local hooks,\n\
+             also trust the project config layer in\n\
+             ${{CODEX_HOME:-$HOME/.codex}}/config.toml (edit the path first):\n\
              \x20    [projects.\"/path/to/your/project\"]\n\
              \x20    trust_level = \"trusted\"\n\
+             Reload behavior depends on the Codex version. If the running\n\
+             process does not pick up the merged file or trust decision, restart\n\
+             or reload Codex, then prove it fires with the selftest.\n\
              \n\
              Then prove it fires: cyclops hooks selftest {label}"
         ),
         CliKind::Agy => format!(
             "Wire it (agy reads .agents/hooks.json in the workspace it runs in):\n\
              \n\
-             \x20 mkdir -p <workspace>/.agents && cp {p} <workspace>/.agents/hooks.json\n\
+             If <workspace>/.agents/hooks.json does not exist, copy {p} there.\n\
+             If it already exists, merge only Cyclops' event entries from {p};\n\
+             preserve every unrelated key and handler. Never overwrite it.\n\
              \n\
              agy has no payload-matchable ACK (finding F7): deliveries stay on the\n\
              screen-verified tier; these hooks feed liveness and turn detection.\n\
@@ -132,15 +150,54 @@ fn instructions(kind: CliKind, rendered: &Path, label: &str) -> String {
             "Wire it (cursor reads hooks.json from the workspace it runs in, or\n\
              from your home directory):\n\
              \n\
-             \x20 mkdir -p <workspace>/.cursor && cp {p} <workspace>/.cursor/hooks.json\n\
-             \x20 # or, user level:\n\
-             \x20 mkdir -p ~/.cursor && cp {p} ~/.cursor/hooks.json\n\
+             If <workspace>/.cursor/hooks.json does not exist, copy {p} there.\n\
+             If it already exists, merge only Cyclops' event entries from {p};\n\
+             preserve every unrelated key and handler. Never overwrite it.\n\
+             The user-level alternative is ~/.cursor/hooks.json; apply the same\n\
+             merge rule there.\n\
              \n\
              CURSOR_CONFIG_DIR does NOT work for hooks: it relocates\n\
              cli-config.json but hooks.json placed there fires zero events.\n\
              Then prove it fires: cyclops hooks selftest {label}"
         ),
     }
+}
+
+/// Write a prepared artifact without exposing a partially-written JSON file.
+/// The temporary file is created beside the destination and renamed only after
+/// its contents have been flushed to disk. An existing destination is replaced
+/// by the single rename operation, so readers see either complete version.
+fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("hook");
+    let pid = std::process::id();
+
+    for _ in 0..32 {
+        let seq = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let temp = parent.join(format!(".{file_name}.tmp-{pid}-{seq}"));
+        let mut file = match OpenOptions::new().create_new(true).write(true).open(&temp) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+
+        let result = file
+            .write_all(content.as_bytes())
+            .and_then(|_| file.sync_all())
+            .and_then(|_| fs::rename(&temp, path));
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        return result;
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary hook artifact",
+    ))
 }
 
 /// True when `dest` points inside a vendor CLI's own config tree.
@@ -179,14 +236,17 @@ pub fn run_install(
         );
         return EXIT_USAGE;
     }
-    let dest_dir = dest
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| cyclops_proto::cyclops_home().join("hooks").join(label));
+    let dest_dir = dest.map(Path::to_path_buf).unwrap_or_else(|| {
+        cyclops_proto::cyclops_home()
+            .join("hooks")
+            .join(kind.name())
+            .join(label)
+    });
     if inside_vendor_dir(&dest_dir) {
         eprintln!(
             "{} is a vendor config directory; cyclops prepares files and prints \
              instructions, it never writes vendor config itself. Use a neutral \
-             --dest (default: $CYCLOPS_HOME/hooks/{label}/) and copy the file \
+             --dest (default: $CYCLOPS_HOME/hooks/<vendor>/{label}/) and copy the file \
              yourself.",
             dest_dir.display()
         );
@@ -220,7 +280,7 @@ pub fn run_install(
         eprintln!("can't create {}: {e}", dest_dir.display());
         return 1;
     }
-    if let Err(e) = std::fs::write(&path, &content) {
+    if let Err(e) = write_atomic(&path, &content) {
         eprintln!("can't write {}: {e}", path.display());
         return 1;
     }
@@ -331,6 +391,7 @@ pub fn run_selftest(c: &mut Client, json: bool, style: &Style, target: &str) -> 
                 position: None,
                 note: None,
                 pane: None,
+                held_by: None,
             },
             style,
         ),

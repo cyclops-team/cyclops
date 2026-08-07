@@ -204,7 +204,7 @@ The tuning knobs, defaults shown:
 
 ```toml
 ack_timeout_ms = 1500        # tier-1 hook ACK window per delivery
-delivery_retry_max = 1       # redelivery attempts after the first failure
+delivery_retry_max = 1       # retries only when no payload bytes reached the pane
 receipt_block_ms = 2500      # receipt cap on the idle send path
 gate_hold_notify_ms = 120000 # one admin ping when a delivery is held this long
 ```
@@ -213,6 +213,13 @@ Keep `receipt_block_ms` under 5000. The CLI gives a socket read five seconds
 before it calls the connection lost, so a longer receipt budget means
 `cyclops send` reports a lost connection over a delivery that is going fine.
 The delivery itself still completes and the record still shows it.
+
+`delivery_retry_max` applies only to failures proven before the pane write:
+detach or missing manifest before paste, a pre-paste occupant rebind, and a
+spool/load-buffer failure. A paste, verification, submit, post-paste rebind,
+or ACK timeout may have reached the pane, so it ends in `attention_required`
+with an exact cause and is never re-pasted automatically. Inspect before
+resending.
 
 Unknown keys warn and are ignored. The file is data; nothing in it executes.
 

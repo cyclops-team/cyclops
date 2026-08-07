@@ -179,8 +179,29 @@ Nothing in a body can forge the header the recipient reads.
 One `deliveries` entry per recipient. States, in order:
 `queued`, `gating`, `pasting`, `staged`, `submitted`, then
 `delivered_verified` or `delivered_unverified`; failures go to
-`retry_queued` and then `attention_required`, and quota goes to
+`retry_queued` only when the daemon proves the failure happened before any
+payload bytes reached the pane. Failures after that boundary go directly to
+`attention_required`, and quota goes to
 `parked_blocked_quota`, which is terminal and never retried.
+
+While the in-flight head is held at the gate, its otherwise-compatible
+`state: "queued"` receipt may include `held_by`. This optional field contains
+one normalized token: `working`, `idle_with_input`, `pane_in_mode`,
+`session_detached`, `blocked`, or `unknown`. It never contains a manifest
+rule id. Render these as `recipient working`, `composer has input`, `pane in
+copy mode`, `session detached`, `waiting for a decision`, and `target state
+unknown`, respectively. A follower still has only its FIFO `position` and
+renders `queued · N ahead`.
+
+The exact machine cause remains visible in the receipt's `note` field in JSON
+and in the delivery `cause` in the ledger. The pre-write causes that may
+consume `delivery_retry_max` are
+`session_detached`, `no_manifest`, `pane_rebound`, and `spool_failed`.
+`paste_failed`, `verify_failed`, `pane_rebound_after_paste`, `submit_failed`,
+and `ack_timeout` are ambiguous terminal outcomes: they may have reached the
+pane and must not trigger another paste. In those cases
+`attention_required` means the outcome is unknown, not proven non-delivery;
+inspect the recipient before resending.
 
 The daemon answers as soon as the delivery settles, capped by
 `receipt_block_ms`. Keep that under the five seconds the CLI allows itself

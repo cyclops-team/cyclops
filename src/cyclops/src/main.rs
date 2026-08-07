@@ -1290,7 +1290,10 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
                 let pane = (d.note.as_deref() == Some(copy::CAUSE_NO_MANIFEST))
                     .then_some(d.pane.as_deref())
                     .flatten();
-                eprintln!("{}", copy::needs_attention(&d.to, pane));
+                eprintln!(
+                    "{}",
+                    copy::needs_attention_for(&d.to, pane, d.note.as_deref())
+                );
             }
             // Past the paste and still unresolved: the pane has the
             // payload and the confirmation is outstanding.
@@ -1554,6 +1557,7 @@ mod tests {
             position: None,
             note: None,
             pane: None,
+            held_by: None,
         }
     }
 

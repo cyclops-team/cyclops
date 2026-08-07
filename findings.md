@@ -51,6 +51,7 @@ than a measurement.
 | F51 | tmux 3.7b's own window-index and current-window bookkeeping is racy under heavy parallel fork load, even on a fully isolated `-L` server; a test creating a second window must give it an explicit index and never read it back through a session-level (current-window) target | binds |
 | F52 | tmux 3.7b's `pause-after` clock only starts once a stalled reader's backlog has actually accumulated past the threshold; a host-contended producer can leave a stalled reader with nothing to pause against for seconds at a time | binds |
 | F53 | `display-message -t` must resolve down to a pane, and a bare `=session` exact-match target gives it nothing to fall back to (empty output, no error); target `=session:` — other session-scoped commands accept the bare form fine | binds |
+| F54 | Codex 0.147.0 keeps a multiline bracketed paste expanded, so the audited collapsed-composer shape needs no new rule on this build | binds |
 
 ## F13. refresh-client -B subscriptions work in control mode on tmux 3.6a (MEASURED)
 
@@ -1160,3 +1161,34 @@ then `tmux -L cyc-dbg display-message -p -t '=before' '#{session_id}'`
 trailing colon differs. `src/cyclops-tmux/tests/watcher_rename.rs`'s
 `a_renamed_session_keeps_flowing_under_the_new_name` is the regression
 test: it failed with the bare target and passes with the trailing colon.
+
+## F54. Codex 0.147.0 keeps a multiline bracketed paste expanded (MEASURED)
+
+The currently installed Codex CLI no longer reproduced the collapsed
+composer shape audited against 0.146.x. `codex --version` reported
+`codex-cli 0.147.0`; `tmux -V` reported `tmux 3.7b`. In an isolated tmux
+server, a detached 120x40 pane launched both `codex -C <scratch checkout>`
+and `codex --no-alt-screen -C <scratch checkout>`. Each probe pasted
+the same scrubbed 26-line payload (a Cyclops-shaped header, 24 short payload
+lines, and a reply hint) with `set-buffer` followed by `paste-buffer -p`.
+After one second, both `capture-pane -p` and `capture-pane -p -e` showed the
+composer glyph followed by the header and all payload lines. Neither capture
+contained a collapsed placeholder or a `Pasted` chip, and the escaped view
+carried no collapsed-composer SGR boundary to encode.
+
+Probe command shape (the payload text was scrubbed and is not retained):
+
+```text
+tmux -L cyc-codex-live -f /dev/null new-session -d -s codexprobe -x 120 -y 40 /bin/zsh
+codex [--no-alt-screen] -C <scratch checkout>
+tmux -L cyc-codex-live -f /dev/null set-buffer -b cycprobe <multiline payload>
+tmux -L cyc-codex-live -f /dev/null paste-buffer -b cycprobe -t codexprobe:0.0 -d -p
+tmux -L cyc-codex-live -f /dev/null capture-pane -p -t codexprobe:0.0
+tmux -L cyc-codex-live -f /dev/null capture-pane -p -e -t codexprobe:0.0
+```
+
+Conclusion: do not add a regex or scrubbed collapsed-paste fixture for the
+audited 0.146.x shape on this build. This closes work package 2 at the plan's
+explicit stop condition; revisit it only when a current Codex build or payload
+shape actually collapses. The existing Codex ghost/typed rules remain the only
+measured manifest change.

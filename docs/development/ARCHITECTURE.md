@@ -158,10 +158,10 @@ flowchart TD
     r1 -->|"no: a shell occupant would EXECUTE the text"| rb["retry_queued, cause pane_rebound"]
     r1 -->|yes| paste["load-buffer into cyc-&lt;daemon pid&gt;-&lt;seq&gt;,<br/>then paste-buffer -p -d (amendment e)"]
     paste --> ver{"did the paste stage?<br/>re-read the screen on a ladder of delays"}
-    ver -->|"no capture proved it"| vf["retry_queued, cause verify_failed"]
+    ver -->|"no capture proved it; paste may have landed"| vf["attention_required, cause verify_failed"]
     ver -->|"the message id is in the verify region,<br/>or a generic marker sits on<br/>a manifest composer line"| staged["staged, and registered<br/>for hook ACK matching"]
     staged --> r2{"occupant check, second time"}
-    r2 -->|no| rb
+    r2 -->|"no: staged input reached the original occupant"| rb2["attention_required, cause pane_rebound_after_paste"]
     r2 -->|yes| sub["send the manifest's submit key"]
     sub --> t1{"does this CLI declare an ack hook<br/>with a payload field?"}
     t1 -->|"yes: tier 1, for ack_timeout_ms"| hookw["wait for an agent.state.report<br/>whose payload carries this message id"]
@@ -171,11 +171,9 @@ flowchart TD
     t2 -->|"working state, output activity,<br/>or a changed composer with the id staged"| du(["delivered_unverified · verified_by screen"])
     t2 -->|"nobody could look: session detached,<br/>or the capture failed"| fz["freeze the clock; a reattach or<br/>pane activity looks again and resumes it"]
     fz --> t2
-    t2 -->|"looked, saw nothing, deadline spent"| ao["retry_queued, cause ack_timeout"]
+    t2 -->|"looked, saw nothing, deadline spent; Enter may have landed"| ao["attention_required, cause ack_timeout"]
     du -->|"a late hook ACK matches"| dv
     rb --> retry{"attempts left?"}
-    vf --> retry
-    ao --> retry
     retry -->|yes| g
     retry -->|no| att(["attention_required, admin pinged"])
 ```
@@ -254,17 +252,14 @@ stateDiagram-v2
     delivered_unverified --> delivered_verified: a late hook ACK matches
     delivered_verified --> [*]
 
-    gating --> retry_queued: pane rebound after admit
-    pasting --> retry_queued: step failed, attempts left
-    staged --> retry_queued: step failed, attempts left
-    submitted --> retry_queued: step failed, attempts left
+    pasting --> retry_queued: failure proven before write, attempts left
     retry_queued --> gating: retry, back through the gate
 
     queued --> attention_required: no pane for that name
     gating --> attention_required: pane dead, gone, or no manifest
-    pasting --> attention_required: attempts spent
-    staged --> attention_required: attempts spent
-    submitted --> attention_required: attempts spent
+    pasting --> attention_required: paste/readback outcome unknown
+    staged --> attention_required: submit may have landed
+    submitted --> attention_required: ACK outcome unknown
     retry_queued --> attention_required: attempts spent
 
     gating --> parked_blocked_quota: fused blocked_quota
@@ -471,7 +466,7 @@ its own CI job).
 | Detection rules are per-CLI data, not code (H2) | `cyclops-manifest`, `resources/manifests/{claude,codex,agy,cursor}.toml` |
 | NDJSON Unix socket, hello line first, version mismatch warns never rejects (S2) | `src/cyclops-proto/src/wire.rs`; server in `src/cyclopsd/src/server.rs` |
 | Append-only NDJSON ledger, monotonic seq plus boot_id, replayable by cursor (C6) | Schema in `src/cyclops-proto/src/ledger.rs`; writer in `cyclops-ledger`. The stream client backfills by reading session files directly; server-side cursor replay on `events.subscribe` is accepted and ignored, with no client that needs it |
-| Delivery pipeline: queue, gate, paste, verify, submit, ACK; failures are queued states | `src/cyclops-proto/src/ledger.rs` for the machine, `src/cyclopsd/src/delivery.rs` for the pipeline |
+| Delivery pipeline: queue, gate, paste, verify, submit, ACK; only proven pre-write failures retry, while after-write outcomes require attention | `src/cyclops-proto/src/ledger.rs` for the machine, `src/cyclopsd/src/delivery.rs` for the pipeline |
 | Turn detection from hooks via a `cyclops hook` receiver | `wire.rs` (`agent.state.report`), `src/cyclops/src/hook.rs`, `src/cyclopsd/src/ack.rs` |
 | Agent surface: thin CLI speaking NDJSON to the socket | `src/cyclops` |
 | v1 keepers: fail-closed ACL, data-only config, explicit pane adoption, identity from socket peer | `src/cyclopsd/src/identity.rs` (peer creds plus a pid-ancestry walk to a watched pane), `src/cyclopsd/src/registry.rs` |
