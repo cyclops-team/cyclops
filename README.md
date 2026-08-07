@@ -41,10 +41,22 @@ cyclops start
 It starts the daemon too, so there is no second command and no tab to
 keep open.
 
+## Update
+
+```bash
+cyclops update
+```
+
+It says which build you are running, checks the source for a newer
+commit (already-current stops right there), reruns the installer from a
+fresh clone, and reports old build to new plus the three restart steps.
+Your config, themes, manifests and record are untouched. Details:
+[installation guide](docs/guides/install.md).
+
 ## Uninstall
 
-A buggy install rarely needs this: run the installer again and it
-overwrites in place. To actually remove cyclops:
+A buggy install rarely needs this: `cyclops update` (or the installer
+run again) overwrites in place. To actually remove cyclops:
 
 ```bash
 curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
@@ -170,7 +182,12 @@ watching main · home ~/.cyclops
 
 Three columns: the name, how the agent is doing, what it is on. A named pane
 also says so on its own tmux border, and `cyclops name reviewer --clear`
-gives the border back. Details: [pane guide](docs/guides/panes.md).
+gives the border back.
+
+The roster is scoped to where you ask from: inside tmux, when the daemon
+watches more than one session, `cyclops list` shows only the session you
+are sitting in, with a dim line naming what it left out. `cyclops list
+--all` is every watched session. Details: [pane guide](docs/guides/panes.md).
 
 ### 3. Any terminal agent
 
@@ -244,6 +261,25 @@ $ cyclops start --workspace ops --session ops --preset ops
 ✓ workspace ready · 3 agents
   cyclopsd won't watch "ops" until it's listed in ~/.cyclops/config.toml. Add it to sessions there, then restart cyclopsd.
 ```
+
+A preset ships names and shapes, never CLIs: which agent belongs in which
+pane is yours to say. `--agents` says it, by manifest id, one per named
+pane in layout order.
+
+```
+cyclops start --preset duo --agents claude,codex
+```
+
+That starts them in this run. A workspace cyclops builds from a preset is
+written down as it builds it, so the file carries the fleet too; a
+workspace you saved yourself is never rewritten behind you. Either way the
+next run starts nothing on its own: a command in a file is a suggestion,
+and replaying it stays a `--launch` you type each time. An id cyclops has
+no manifest for, or more CLIs than the preset has named panes, is refused
+before a single pane is built.
+
+The CLIs come up bare. Hook wiring is `cyclops hooks install`, so receipts
+from a freshly spun fleet are screen-tier until you wire them.
 
 More: [workspace guide](docs/guides/workspaces.md).
 
@@ -365,12 +401,22 @@ every surface at once, including the pane borders:
 
 ```
 $ cyclops theme
+  blossom        ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  buttercream    ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   catppuccin     ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
 ▸ dark           ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  ember          ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  forest         ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   gruvbox        ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   high-contrast  ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   light          ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  meadow         ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  midnight       ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   nord           ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  obsidian       ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  periwinkle     ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  seafoam        ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  sorbet         ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   tokyo-night    ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
 
   cyclops theme <name> to switch
@@ -394,7 +440,7 @@ above.
 | `cyclops start` | Open the default workspace: restore it, or build it from a preset. Safe to run twice |
 | `cyclops workspace save\|restore` | The shape of a session as a file: panes, sizes, names, directories |
 | `cyclops name <pane> <label>` | Name a pane so cyclops can address it; the pane's tmux border says so |
-| `cyclops list` | The roster: every named agent, how it is doing, what it is on |
+| `cyclops list` | The roster: every named agent, how it is doing, what it is on. Inside tmux it scopes to your session; `--all` is every watched session |
 | `cyclops status` | Every watched pane with its fused state, and the eye |
 | `cyclops send <agent> --subject ...` | Deliver a message with an evidence-labeled receipt (`--wait done` blocks until the turn it starts ends) |
 | `cyclops wait <agent> --until idle\|done\|blocked` | Block until an agent is ready, finishes a turn, or needs a human |
@@ -404,12 +450,14 @@ above.
 | `cyclops hooks verify\|selftest <agent>` | Hook liveness, and one no-op delivery that proves the ack fires |
 | `cyclops watch` | The live stream: calm admin view, firehose one keypress away, jump-to-pane |
 | `cyclops theme [name]` | Switch themes, or list them with a preview of each. A switch is live at once |
+| `cyclops update` | Rebuild from the latest source and replace the installed binaries; config and record untouched |
 | `cyclops read <agent> --source detection` | Per-sensor readings behind a state verdict |
 | `cyclops ping` | Daemon round trip |
 
-All of them take `--json` and `--plain`, and honor `NO_COLOR`. (The
-deprecated `cyclops ui` alias has no `--json`; the machine stream is
-`cyclops watch --json`.)
+All of them take `--json` and `--plain`, and honor `NO_COLOR`. (Two
+exceptions have no `--json`: the deprecated `cyclops ui` alias, whose
+machine stream is `cyclops watch --json`, and `cyclops update`, whose
+output is the installer's stream.)
 
 ## How it works
 

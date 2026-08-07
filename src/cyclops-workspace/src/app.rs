@@ -10,7 +10,9 @@
 //! `%session-changed`) apply to the model directly without a full fetch.
 //! Daemon decoration events get the identical treatment on their own
 //! dedicated thread: `spawn_decoration_forwarder` arms one debounce per
-//! burst instead of fetching status once per pushed event.
+//! burst instead of fetching status once per pushed event, and its
+//! subscription outlives the daemon (`run_decoration_forwarder`
+//! reconnects on a bounded backoff and resyncs on every connect).
 //!
 //! This module owns boot, the event queue, render scheduling, reconnect
 //! orchestration, and top-level `App` state. It does not own tmux command
@@ -46,10 +48,8 @@ use crate::input::router::{Router, RouterResult};
 use crate::layout::SplitDir;
 use crate::model::{pane_is_visible, RuntimeRegistry, TabModel, WorkspaceModel};
 use crate::naming;
-use crate::persist::{self, load_prefs, set_last_active, WorkspacePrefs};
-use crate::render::{
-    paint_dialog, paint_event_stream, paint_menu, paint_sidebar, paint_tab_bar, paint_window,
-};
+use crate::persist::{self, load_prefs, set_last_active, SidebarTab, WorkspacePrefs};
+use crate::render::{paint_dialog, paint_menu, paint_sidebar, paint_tab_bar, paint_window};
 use crate::resilience::{self, LinkState};
 use crate::selection::{self, SelectionState};
 use crate::sync::{fetch_workspace_model, hydrate_visible_tab};
@@ -117,6 +117,12 @@ enum AppMsg {
         pane: String,
     },
     DecorationChanged(DecorationSnapshot),
+    /// The daemon subscription (re)connected. The handler resyncs what an
+    /// outage loses on both sides: a restarted daemon forgot every watch
+    /// ask (those live in its memory, not config.toml), and any state that
+    /// changed while nothing was subscribed produced no event, so only a
+    /// full refetch can replace it.
+    DaemonReconnected,
     /// One daemon event, already normalized onto the shared `cyclops
     /// watch` stream vocabulary (E2) by [`spawn_decoration_forwarder`]'s
     /// reader thread. Feeds `App::record` and nothing else — decoration's
@@ -165,21 +171,24 @@ struct App {
     /// not name, so a folder-following rename never asks twice; see
     /// [`crate::daemon::watch_session`].
     watched_sessions: HashSet<String>,
-    event_stream_open: bool,
+    /// Which tab the sidebar is showing. Seeded from prefs at boot and
+    /// written back on every change, so a workspace reopens on the tab it
+    /// was left on.
+    sidebar_tab: SidebarTab,
     /// The shared `cyclops watch` stream model (E2): the same ordered,
     /// identity-stable [`cyclops_ui::Entry`] rows that surface renders,
     /// fed by [`spawn_decoration_forwarder`]'s `events.subscribe`
-    /// connection so the panel never opens a second one.
+    /// connection so the Stream tab never opens a second one.
     ///
-    /// Fed whether or not the panel is open. The record is cheap (no IO
-    /// per event, and internally ring-capped) and stopping the feed while
-    /// the panel is closed would show an empty history the moment it
-    /// reopens mid-session; keeping it warm costs nothing a closed panel
-    /// would otherwise save.
+    /// Fed whether or not the Stream tab is showing. The record is cheap
+    /// (no IO per event, and internally ring-capped) and stopping the feed
+    /// while the sidebar sits on Sessions would show an empty history the
+    /// moment the tab is selected mid-session; keeping it warm costs
+    /// nothing a stopped feed would otherwise save.
     ///
     /// Built and fed through [`crate::event_record`]: the same replayed
     /// ledger tail, status seed, and live ordering `cyclops watch` runs,
-    /// so the panel and the CLI show one history rather than two that
+    /// so the Stream tab and the CLI show one history rather than two that
     /// agree only on formatting.
     record: cyclops_ui::Record,
     /// Startup ordering and seq dedup for `record`
@@ -404,13 +413,14 @@ pub async fn run_async() -> i32 {
 
     // Declare terminal cells only after the split topology is known. tmux
     // gets pane content cells; two-cell separator bands remain UI chrome.
-    let chrome_canvas = crate::render::chrome_areas_for(
-        Rect::new(0, 0, term_size.0, term_size.1),
-        prefs.sidebar_visible,
-        prefs.sidebar_width.max(crate::render::SIDEBAR_MIN_WIDTH),
-        false,
-    )
-    .canvas;
+    // The model carries the persisted sidebar visibility BEFORE the
+    // declaration is computed, because the first frame paints from the
+    // model: a workspace quit collapsed would otherwise be declared one
+    // sidebar wide and painted another, and the first reconcile would
+    // fight the declaration. `chrome_for` is the one geometry both read.
+    model.sidebar_visible = prefs.sidebar_visible;
+    let chrome_canvas =
+        chrome_for(Rect::new(0, 0, term_size.0, term_size.1), &model, &prefs).canvas;
     let boot_size = crate::render::tmux_client_size(chrome_canvas, model.active_tab());
     let mut declared_client_size = None;
     if boot_size.0 >= 10 && boot_size.1 >= 3 {
@@ -420,7 +430,10 @@ pub async fn run_async() -> i32 {
                 // The resize can rebalance leaf dimensions. Re-list before
                 // hydration rather than replaying captures into stale slots.
                 if let Ok(resized) = fetch_workspace_model(&client, &session).await {
-                    model = resized;
+                    // A fresh snapshot knows nothing about UI-owned
+                    // preferences; re-carry visibility the same way
+                    // `install_reconciled_model` does for every later one.
+                    install_reconciled_model(&mut model, resized, prefs.sidebar_visible);
                     apply_workspace_order(&mut model, &prefs.workspace_order);
                 }
             }
@@ -467,7 +480,7 @@ pub async fn run_async() -> i32 {
         expanded_workspaces,
         expanded_for: None,
         watched_sessions: HashSet::new(),
-        event_stream_open: false,
+        sidebar_tab: prefs.sidebar_tab,
         record: cyclops_ui::Record::new(),
         intake: cyclops_ui::Intake::new(),
         cursor_style: None,
@@ -480,7 +493,6 @@ pub async fn run_async() -> i32 {
         home,
         folder_probe_at: None,
     };
-    app.model.sidebar_visible = prefs.sidebar_visible;
     // Bare `cyclops` can boot a session config.toml never mentions, so the
     // very first frame is already a frame the daemon may not be watching
     // for. Ask before drawing it.
@@ -757,10 +769,11 @@ pub fn coalesce_decoration_signals(
 /// watch` stream feed. The subscription itself never polls. A split or a
 /// border drag pushes several state/label/delivery events through
 /// cyclopsd at once; a dedicated reader thread turns each subscription
-/// line into one [`DecorationSignal`] on a plain channel, and the loop
-/// below coalesces a burst of them into ONE status fetch instead of one
-/// per event — the same arm-once, never-push-back rule `arm()` and
-/// `RENDER_DEBOUNCE` use for rendering (`DECORATION_DEBOUNCE`), just built on
+/// line into one [`DecorationSignal`] on a plain channel, and
+/// [`subscribe_decoration_once`] coalesces a burst of them into ONE status
+/// fetch instead of one per event — the same arm-once, never-push-back
+/// rule `arm()` and `RENDER_DEBOUNCE` use for rendering
+/// (`DECORATION_DEBOUNCE`), just built on
 /// `std::sync::mpsc::Receiver::recv_timeout` instead of `tokio::select!`
 /// because this connection is deliberately blocking IO on its own thread,
 /// away from the input loop.
@@ -773,99 +786,201 @@ pub fn coalesce_decoration_signals(
 /// into the burst logic would only add latency the decoration path does
 /// not have today. This is the ONE connection both concerns share; see
 /// the module doc and `docs/development/INVARIANTS.md` rule 9.
+///
+/// The subscription outlives the daemon: [`run_decoration_forwarder`]
+/// reconnects on a bounded backoff, so a daemon restart or a boot-order
+/// race costs an outage, never the thread.
 fn spawn_decoration_forwarder(home: std::path::PathBuf, tx: mpsc::UnboundedSender<AppMsg>) {
     std::thread::spawn(move || {
-        use std::io::{BufRead, Write};
-        let socket = home.join(cyclops_proto::SOCK_NAME);
-        let Ok(stream) = std::os::unix::net::UnixStream::connect(socket) else {
-            return;
-        };
-        let mut reader = std::io::BufReader::new(stream);
-        let mut hello = String::new();
-        if reader
-            .read_line(&mut hello)
-            .ok()
-            .filter(|read| *read > 0)
-            .is_none()
-        {
-            return;
-        }
-        if reader
-            .get_mut()
-            .write_all(b"{\"id\":1,\"method\":\"events.subscribe\",\"params\":{}}\n")
-            .is_err()
-        {
-            return;
-        }
+        run_decoration_forwarder(&home, &tx, resilience::reconnect_delay);
+    });
+}
 
-        let (sig_tx, sig_rx) = std::sync::mpsc::channel::<DecorationSignal>();
-        let stream_tx = tx.clone();
-        std::thread::spawn(move || loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => {
-                    let _ = sig_tx.send(DecorationSignal::Closed);
-                    return;
-                }
-                Ok(_) => {}
+/// Why one subscription connection ended, deciding what the reconnect
+/// loop does next.
+#[derive(Debug, PartialEq, Eq)]
+enum SubscribeEnd {
+    /// Nothing answered on the socket, or the handshake failed.
+    ConnectFailed,
+    /// A live subscription ended: the daemon went away mid-run.
+    Closed,
+    /// The app channel is gone: the workspace itself is shutting down.
+    SinkGone,
+}
+
+/// The forwarder's whole life: subscribe, forward until the connection
+/// ends, reconnect on a bounded backoff, repeat. Unlike the tmux link
+/// there is no give-up state: the workspace works without its daemon and
+/// the daemon restarts routinely (upgrades, crashes), so the subscription
+/// must still be waiting whenever it returns; a dead thread here is a
+/// status indicator that only moves on structural reconciles. The backoff
+/// sleeps are reconnects only, never state polls (the same bound the
+/// daemon's own watcher states); while connected the loop rides
+/// subscription events alone, so rule 9 holds.
+///
+/// Offline is reported once per outage, and only after the chain has
+/// failed [`resilience::RECONNECT_CAP`] times: an outage shorter than the
+/// chain keeps the last decoration on screen instead of un-naming every
+/// agent for a restart the user never noticed (doubt vs. news, the
+/// refresh closure's rule). The empty snapshot paints the sidebar's
+/// "cyclopsd offline" line and drops the watch record so recovery
+/// re-asks; one workspace.log line says the same. `delay_for` is injected
+/// so tests can run the chain in milliseconds; production passes
+/// [`resilience::reconnect_delay`], which clamps at its last entry.
+fn run_decoration_forwarder(
+    home: &std::path::Path,
+    tx: &mpsc::UnboundedSender<AppMsg>,
+    delay_for: impl Fn(usize) -> std::time::Duration,
+) {
+    let mut attempt = 0usize;
+    let mut reported_offline = false;
+    loop {
+        match subscribe_decoration_once(home, tx) {
+            SubscribeEnd::SinkGone => return,
+            // A connection existed, so this outage starts its own chain.
+            SubscribeEnd::Closed => {
+                attempt = 0;
+                reported_offline = false;
             }
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-                continue;
-            };
-            if value.get("event").is_none() {
-                continue;
-            }
-            // E2: normalize this same line onto the shared stream model
-            // before the decoration signal below. Cheap (no IO) and
-            // per-event on purpose — it must never wait for or extend the
-            // coalescing deadline that follows. An unreadable event still
-            // reaches the decoration signal; only the record feed skips
-            // it (`Entry::from_event` never rejects a KNOWN event, but a
-            // daemon ahead of this build can still send a shape that
-            // fails to deserialize at all).
-            if let Ok(ev) = serde_json::from_value::<cyclops_proto::Event>(value) {
-                // A theme reload is not a fact about the record; the CLI
-                // stream drops it the same way (`cyclops_ui`'s own
-                // subscribe loop). It still becomes a wake-only
-                // `ThemeChanged`: the decoration signal below only
-                // repaints when a status fetch lands, and a theme switch
-                // must repaint either way. Every other vocabulary, known
-                // or not, still becomes an entry (unknown kinds render as
-                // `Other` rather than being dropped).
-                if ev.event != "theme" {
-                    let entry = cyclops_ui::Entry::from_event(&ev, now_ms());
-                    if stream_tx
-                        .send(AppMsg::StreamEntry(Box::new(entry)))
-                        .is_err()
-                    {
-                        return;
-                    }
-                } else if stream_tx.send(AppMsg::ThemeChanged).is_err() {
-                    return;
-                }
-            }
-            if sig_tx.send(DecorationSignal::Event).is_err() {
+            SubscribeEnd::ConnectFailed => attempt = attempt.saturating_add(1),
+        }
+        if !resilience::may_retry(attempt) && !reported_offline {
+            reported_offline = true;
+            if tx
+                .send(AppMsg::DecorationChanged(DecorationSnapshot::default()))
+                .is_err()
+            {
                 return;
             }
-        });
+            log_err(
+                home,
+                &format!(
+                    "cyclopsd is not answering after {} reconnect attempts; \
+                     agent decoration is offline until it returns (still retrying)",
+                    resilience::RECONNECT_CAP
+                ),
+            );
+        }
+        // The workspace shutting down closes the channel; a retry loop
+        // with nobody left to tell stops instead of probing a dead socket.
+        if tx.is_closed() {
+            return;
+        }
+        // `attempt` counts completed failures; the sleep indexes the retry
+        // about to run, so a cold boot's chain starts at RECONNECT_ATTEMPT_1
+        // exactly like a chain that follows a live close.
+        std::thread::sleep(delay_for(attempt.saturating_sub(1)));
+    }
+}
 
-        let end = coalesce_decoration_signals(sig_rx, DECORATION_DEBOUNCE, || {
-            // A refused or timed-out status call is doubt about this
-            // instant, not news about the roster: the subscription is
-            // still up, so the next burst asks again. Dropping it keeps
-            // the last known decoration on screen instead of un-naming
-            // every agent for a frame. A daemon that is really gone ends
-            // the read loop above, which is the one place "offline" is
-            // reported.
-            match decoration::fetch_decoration(&home) {
-                Some(snapshot) => tx.send(AppMsg::DecorationChanged(snapshot)).is_ok(),
-                None => true,
+/// One subscription connection, end to end: the Hello-first handshake,
+/// the `events.subscribe` request, a resync ask, then the reader thread
+/// and the coalescing loop until the connection or the app ends. See
+/// [`spawn_decoration_forwarder`] for what the reader and the coalescer
+/// each carry.
+fn subscribe_decoration_once(
+    home: &std::path::Path,
+    tx: &mpsc::UnboundedSender<AppMsg>,
+) -> SubscribeEnd {
+    use std::io::{BufRead, Write};
+    let socket = home.join(cyclops_proto::SOCK_NAME);
+    let Ok(stream) = std::os::unix::net::UnixStream::connect(socket) else {
+        return SubscribeEnd::ConnectFailed;
+    };
+    let mut reader = std::io::BufReader::new(stream);
+    let mut hello = String::new();
+    if reader
+        .read_line(&mut hello)
+        .ok()
+        .filter(|read| *read > 0)
+        .is_none()
+    {
+        return SubscribeEnd::ConnectFailed;
+    }
+    if reader
+        .get_mut()
+        .write_all(b"{\"id\":1,\"method\":\"events.subscribe\",\"params\":{}}\n")
+        .is_err()
+    {
+        return SubscribeEnd::ConnectFailed;
+    }
+    // Subscribed. Ask the app to resync before any event arrives on this
+    // connection: everything that changed while nothing was subscribed
+    // produced no event, so without this a state flip during the outage
+    // stays on screen as stale.
+    if tx.send(AppMsg::DaemonReconnected).is_err() {
+        return SubscribeEnd::SinkGone;
+    }
+
+    let (sig_tx, sig_rx) = std::sync::mpsc::channel::<DecorationSignal>();
+    let stream_tx = tx.clone();
+    std::thread::spawn(move || loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => {
+                let _ = sig_tx.send(DecorationSignal::Closed);
+                return;
             }
-        });
-        if end == CoalesceEnd::Closed {
-            let _ = tx.send(AppMsg::DecorationChanged(DecorationSnapshot::default()));
+            Ok(_) => {}
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value.get("event").is_none() {
+            continue;
+        }
+        // E2: normalize this same line onto the shared stream model
+        // before the decoration signal below. Cheap (no IO) and
+        // per-event on purpose — it must never wait for or extend the
+        // coalescing deadline that follows. An unreadable event still
+        // reaches the decoration signal; only the record feed skips
+        // it (`Entry::from_event` never rejects a KNOWN event, but a
+        // daemon ahead of this build can still send a shape that
+        // fails to deserialize at all).
+        if let Ok(ev) = serde_json::from_value::<cyclops_proto::Event>(value) {
+            // A theme reload is not a fact about the record; the CLI
+            // stream drops it the same way (`cyclops_ui`'s own
+            // subscribe loop). It still becomes a wake-only
+            // `ThemeChanged`: the decoration signal below only
+            // repaints when a status fetch lands, and a theme switch
+            // must repaint either way. Every other vocabulary, known
+            // or not, still becomes an entry (unknown kinds render as
+            // `Other` rather than being dropped).
+            if ev.event != "theme" {
+                let entry = cyclops_ui::Entry::from_event(&ev, now_ms());
+                if stream_tx
+                    .send(AppMsg::StreamEntry(Box::new(entry)))
+                    .is_err()
+                {
+                    return;
+                }
+            } else if stream_tx.send(AppMsg::ThemeChanged).is_err() {
+                return;
+            }
+        }
+        if sig_tx.send(DecorationSignal::Event).is_err() {
+            return;
         }
     });
+
+    let end = coalesce_decoration_signals(sig_rx, DECORATION_DEBOUNCE, || {
+        // A refused or timed-out status call is doubt about this
+        // instant, not news about the roster: the subscription is
+        // still up, so the next burst asks again. Dropping it keeps
+        // the last known decoration on screen instead of un-naming
+        // every agent for a frame. A daemon that is really gone ends
+        // the read loop above; whether that becomes "offline" on
+        // screen is the reconnect chain's call in
+        // [`run_decoration_forwarder`], the one place it is reported.
+        match decoration::fetch_decoration(home) {
+            Some(snapshot) => tx.send(AppMsg::DecorationChanged(snapshot)).is_ok(),
+            None => true,
+        }
+    });
+    match end {
+        CoalesceEnd::Closed => SubscribeEnd::Closed,
+        CoalesceEnd::SinkGone => SubscribeEnd::SinkGone,
+    }
 }
 
 /// Coalesce adjacent control-mode output per pane before it reaches the app
@@ -923,6 +1038,25 @@ async fn handle_reconnect(
     Ok(())
 }
 
+/// The chrome split one frame of `model` under `prefs` composes to.
+///
+/// The one place chrome geometry is derived, called by boot (to declare the
+/// tmux client size) and by every frame (to paint). Both must read the same
+/// inputs or the declaration and the paint disagree by the sidebar's width
+/// — the collapsed-at-boot case, and the bug class of 626ec09.
+fn chrome_for(
+    area: Rect,
+    model: &WorkspaceModel,
+    prefs: &WorkspacePrefs,
+) -> crate::render::ChromeAreas {
+    crate::render::chrome_areas_for(
+        area,
+        model.sidebar_visible,
+        prefs.sidebar_width.max(crate::render::SIDEBAR_MIN_WIDTH),
+        crate::render::tab_bar_visible(model.session.tabs.len()),
+    )
+}
+
 /// A workspace can switch or rename sessions after boot. Reconnection must
 /// follow the model's current target, never the name captured at startup.
 fn reconnect_config(base: &ControlConfig, session: &str) -> ControlConfig {
@@ -936,19 +1070,8 @@ impl App {
         pane_is_visible(self.model.active_tab(), pane)
     }
 
-    fn sidebar_width(&self) -> u16 {
-        self.prefs
-            .sidebar_width
-            .max(crate::render::SIDEBAR_MIN_WIDTH)
-    }
-
     fn chrome(&self, area: Rect) -> crate::render::ChromeAreas {
-        crate::render::chrome_areas_for(
-            area,
-            self.model.sidebar_visible,
-            self.sidebar_width(),
-            self.event_stream_open,
-        )
+        chrome_for(area, &self.model, &self.prefs)
     }
 
     fn persist_active(&self) {
@@ -1226,22 +1349,11 @@ async fn handle_app_msg(
             }
         }
         AppMsg::DecorationChanged(snapshot) => {
-            // A daemon that went away forgot every session it was asked to
-            // watch: those live in memory, not in config.toml. Dropping the
-            // record here is what makes the next reconcile ask again.
-            if !snapshot.online {
-                app.watched_sessions.clear();
-            }
-            if persist::migrate_agent_order_entries(
-                &mut app.prefs.agent_order,
-                &app.decoration,
-                &snapshot,
-            ) {
-                if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
-                    log_err(&app.home, &error);
-                }
-            }
-            app.decoration = snapshot;
+            apply_decoration_snapshot(app, snapshot);
+            arm(debounce);
+        }
+        AppMsg::DaemonReconnected => {
+            resync_daemon_state(app);
             arm(debounce);
         }
         // E2: per-event, not coalesced with the decoration burst above —
@@ -1459,7 +1571,9 @@ async fn handle_mouse(
                 return Ok(());
             };
             match &target {
-                HitTarget::PaneBody { pane_id } | HitTarget::PaneFrame { pane_id } => {
+                HitTarget::PaneBody { pane_id }
+                | HitTarget::PaneFrame { pane_id }
+                | HitTarget::PaneGrip { pane_id } => {
                     if let Some(action) = action::route_mouse_click(&target, MouseButton::Right) {
                         let outcome = exec::execute(app, client, action).await?;
                         apply_outcome(app, outcome);
@@ -1549,13 +1663,20 @@ async fn handle_mouse(
                         }
                     }
                 }
-                HitTarget::PaneFrame { pane_id } => {
+                HitTarget::PaneFrame { .. } => {
+                    // A frame click focuses, nothing more; the swap pickup
+                    // lives on the corner grip, so the seam cells a frame
+                    // shares with a sibling stay resize handles.
                     app.close_menu();
                     app.selection.clear();
-                    // Down on the frame starts a possible swap drag; a
-                    // below-threshold release focuses the pane instead,
-                    // matching what a frame click always did. The body is
-                    // untouched; dragging there is text selection.
+                }
+                HitTarget::PaneGrip { pane_id } => {
+                    app.close_menu();
+                    app.selection.clear();
+                    // Down on the grip starts a possible swap drag; a
+                    // below-threshold release focuses the pane, same as a
+                    // frame click. The body is untouched; dragging there
+                    // is text selection.
                     app.drag = Some(DragState::on_down(
                         DragTarget::Pane {
                             pane_id: pane_id.clone(),
@@ -1596,6 +1717,7 @@ async fn handle_mouse(
                 }
                 HitTarget::NewTabButton
                 | HitTarget::NewWorkspaceButton
+                | HitTarget::SidebarTab { .. }
                 | HitTarget::AttentionIndicator { .. } => {
                     app.close_menu();
                 }
@@ -2023,6 +2145,42 @@ fn keybind_scroll_limit(app: &App) -> u16 {
     crate::render::keybind_max_scroll(row_count, Rect::new(0, 0, app.term_size.0, app.term_size.1))
 }
 
+/// Install one decoration snapshot: the offline bookkeeping and the
+/// agent-order migration every arrival path shares (the forwarder's
+/// coalesced refresh, its offline report, and the reconnect resync).
+fn apply_decoration_snapshot(app: &mut App, snapshot: DecorationSnapshot) {
+    // A daemon that went away forgot every session it was asked to
+    // watch: those live in memory, not in config.toml. Dropping the
+    // record here is what makes the next reconcile ask again.
+    if !snapshot.online {
+        app.watched_sessions.clear();
+    }
+    if persist::migrate_agent_order_entries(&mut app.prefs.agent_order, &app.decoration, &snapshot)
+    {
+        if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
+            log_err(&app.home, &error);
+        }
+    }
+    app.decoration = snapshot;
+}
+
+/// The daemon subscription (re)connected: pull back what the outage lost
+/// on both sides, without waiting for a structural reconcile. The watch
+/// record is forgotten first because a restarted daemon has no pane table
+/// for UI-created sessions until each is re-asked (asking for a session
+/// it already watches returns the existing slot, so a reconnect that was
+/// only a socket blip costs nothing); the asks land before the fetch so
+/// the snapshot already covers them. The fetch then replaces the whole
+/// snapshot, because a state that flipped while nothing was subscribed
+/// produced no event and would otherwise stay on screen as stale.
+fn resync_daemon_state(app: &mut App) {
+    app.watched_sessions.clear();
+    ensure_sessions_watched(app);
+    if let Some(snapshot) = decoration::fetch_decoration(&app.home) {
+        apply_decoration_snapshot(app, snapshot);
+    }
+}
+
 async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_tmux::TmuxError> {
     let session = app.model.session.session.clone();
     let mut model = fetch_workspace_model(client, &session).await?;
@@ -2285,9 +2443,6 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
     terminal
         .draw(|f| {
             let areas = app.chrome(f.area());
-            if let Some(panel) = areas.panel {
-                paint_event_stream(&app.record, panel, f.buffer_mut(), &app.paint);
-            }
             if let Some(sidebar) = areas.sidebar {
                 paint_sidebar(
                     &app.model.workspaces,
@@ -2295,6 +2450,8 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
                     &app.model.active_tab().active_pane,
                     &app.expanded_workspaces,
                     &app.prefs.agent_order,
+                    app.sidebar_tab,
+                    &app.record,
                     sidebar,
                     f.buffer_mut(),
                     &app.paint,
@@ -2422,7 +2579,7 @@ mod tests {
             expanded_workspaces: HashSet::new(),
             expanded_for: None,
             watched_sessions: HashSet::new(),
-            event_stream_open: false,
+            sidebar_tab: SidebarTab::default(),
             record: cyclops_ui::Record::new(),
             intake: cyclops_ui::Intake::new(),
             cursor_style: None,
@@ -2693,6 +2850,347 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// A fake cyclopsd for subscription-lifecycle tests: serves any
+    /// number of sequential connections on the home socket, unlike the
+    /// single-connection fakes above. `events.subscribe` connections are
+    /// held open ([`FakeDaemon::push_event`] writes to them); `status`
+    /// answers with one working agent in pane %0 of session "s";
+    /// `session.watch` answers ok and records the asked name. Dropping
+    /// the handle is a daemon death: the socket file goes away and every
+    /// held subscription closes.
+    struct FakeDaemon {
+        home: std::path::PathBuf,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        subs: std::sync::Arc<std::sync::Mutex<Vec<std::os::unix::net::UnixStream>>>,
+        watches: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeDaemon {
+        fn spawn(home: &std::path::Path) -> FakeDaemon {
+            use std::io::{BufRead, Write};
+            use std::os::unix::net::UnixListener;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::{Arc, Mutex};
+
+            let socket = home.join(cyclops_proto::SOCK_NAME);
+            let _ = std::fs::remove_file(&socket);
+            let listener = UnixListener::bind(&socket).expect("bind fake daemon");
+            // Nonblocking accept so a stopped daemon's thread can notice
+            // the stop flag; bounded test-side polling only (rule 9's
+            // documented exception).
+            listener.set_nonblocking(true).expect("nonblocking accept");
+            let stop = Arc::new(AtomicBool::new(false));
+            let subs = Arc::new(Mutex::new(Vec::new()));
+            let watches = Arc::new(Mutex::new(Vec::new()));
+            let stop_bg = Arc::clone(&stop);
+            let subs_bg = Arc::clone(&subs);
+            let watches_bg = Arc::clone(&watches);
+            std::thread::spawn(move || {
+                while !stop_bg.load(Ordering::SeqCst) {
+                    let stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(_) => {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                    };
+                    // BSD-derived accepts can inherit nonblocking; every
+                    // connection below is plain blocking line IO.
+                    if stream.set_nonblocking(false).is_err() {
+                        continue;
+                    }
+                    let mut reader = std::io::BufReader::new(stream);
+                    if reader
+                        .get_mut()
+                        .write_all(b"{\"cyclops\":\"0.1.0\",\"proto\":1,\"boot_id\":\"b\"}\n")
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        continue;
+                    }
+                    let Ok(request) = serde_json::from_str::<serde_json::Value>(&line) else {
+                        continue;
+                    };
+                    match request["method"].as_str() {
+                        Some("events.subscribe") => {
+                            let mut stream = reader.into_inner();
+                            let _ = stream.write_all(b"{\"id\":1,\"result\":{}}\n");
+                            subs_bg.lock().expect("subs").push(stream);
+                        }
+                        Some("session.watch") => {
+                            if let Some(name) = request["params"]["session"].as_str() {
+                                watches_bg.lock().expect("watches").push(name.to_string());
+                            }
+                            let _ = reader.get_mut().write_all(b"{\"id\":1,\"result\":{}}\n");
+                        }
+                        Some("status") => {
+                            let body = serde_json::json!({
+                                "id": 1,
+                                "result": {
+                                    "daemon_version": "0.1.0",
+                                    "proto": 1,
+                                    "boot_id": "b",
+                                    "uptime_ms": 0,
+                                    "tmux_version": "3.4",
+                                    "sessions": [{
+                                        "name": "s",
+                                        "attached": true,
+                                        "panes": [{
+                                            "pane_id": "%0",
+                                            "window_id": "@0",
+                                            "window_name": "1",
+                                            "agent": "reviewer",
+                                            "title": "",
+                                            "current_command": "sh",
+                                            "dead": false,
+                                            "in_mode": false,
+                                            "width": 80,
+                                            "height": 24,
+                                            "state": "working",
+                                        }],
+                                    }],
+                                },
+                            });
+                            let mut out = serde_json::to_vec(&body).expect("encode status");
+                            out.push(b'\n');
+                            let _ = reader.get_mut().write_all(&out);
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            FakeDaemon {
+                home: home.to_path_buf(),
+                stop,
+                subs,
+                watches,
+            }
+        }
+
+        fn push_event(&self, line: &[u8]) {
+            use std::io::Write;
+            for stream in self.subs.lock().expect("subs").iter_mut() {
+                let _ = stream.write_all(line);
+            }
+        }
+
+        fn watched(&self) -> Vec<String> {
+            self.watches.lock().expect("watches").clone()
+        }
+    }
+
+    impl Drop for FakeDaemon {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering;
+            self.stop.store(true, Ordering::SeqCst);
+            // What a daemon death looks like from outside: connects start
+            // failing and the live subscriptions EOF.
+            let _ = std::fs::remove_file(self.home.join(cyclops_proto::SOCK_NAME));
+            self.subs.lock().expect("subs").clear();
+        }
+    }
+
+    /// Bounded wait for one matching app message. Test-side polling only
+    /// (rule 9's documented exception); the forwarder itself stays
+    /// event-armed.
+    fn wait_for_msg(
+        rx: &mut mpsc::UnboundedReceiver<AppMsg>,
+        what: &str,
+        mut matching: impl FnMut(&AppMsg) -> bool,
+    ) -> AppMsg {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(msg) if matching(&msg) => return msg,
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        panic!("gave up waiting for {what}");
+    }
+
+    /// The regression the reconnect loop exists for: the one-shot
+    /// forwarder died silently on a boot-order race or a daemon restart,
+    /// and decoration then refreshed only inside structural reconciles
+    /// (the stale status indicator the operator alt-tabbed to fix). The
+    /// subscription must survive both a daemon that is not up yet and a
+    /// daemon that dies and returns, and events on the new connection
+    /// must still become refreshes.
+    #[test]
+    fn the_decoration_subscription_survives_boot_races_and_daemon_restarts() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-dec-restart");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("scratch home");
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let home_bg = home.clone();
+        // Millisecond backoff so the whole lifecycle runs in test time;
+        // production wires resilience::reconnect_delay.
+        std::thread::spawn(move || {
+            run_decoration_forwarder(&home_bg, &tx, |_| Duration::from_millis(5));
+        });
+
+        // Boot race: nothing is listening yet. The forwarder must still
+        // be trying, not dead, when the daemon finally binds.
+        std::thread::sleep(Duration::from_millis(40));
+        let daemon = FakeDaemon::spawn(&home);
+        wait_for_msg(&mut rx, "the resync ask after the boot race", |msg| {
+            matches!(msg, AppMsg::DaemonReconnected)
+        });
+
+        // Restart: the live connection drops; before the fix the thread
+        // ended here, permanently.
+        drop(daemon);
+        let daemon = FakeDaemon::spawn(&home);
+        wait_for_msg(&mut rx, "the resync ask after the restart", |msg| {
+            matches!(msg, AppMsg::DaemonReconnected)
+        });
+
+        // A state event on the new subscription still becomes a coalesced
+        // online refresh. The push can race the daemon registering the
+        // fresh subscription, so it is re-sent on a bounded schedule;
+        // one landing is proof.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut refreshed = false;
+        'push: while std::time::Instant::now() < deadline {
+            daemon.push_event(b"{\"event\":{\"kind\":\"state\"}}\n");
+            let pause = std::time::Instant::now() + Duration::from_millis(100);
+            while std::time::Instant::now() < pause {
+                match rx.try_recv() {
+                    Ok(AppMsg::DecorationChanged(snapshot)) if snapshot.online => {
+                        refreshed = true;
+                        break 'push;
+                    }
+                    Ok(_) => {}
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        }
+        assert!(
+            refreshed,
+            "a state event after the restart must still produce a fresh online refresh"
+        );
+
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A daemon that stays gone is reported once per outage: after the
+    /// backoff chain fails `RECONNECT_CAP` times the app gets one empty
+    /// offline snapshot (the sidebar's "cyclopsd offline" line) and
+    /// workspace.log says why, while the loop keeps retrying quietly. A
+    /// daemon that finally answers is resynced like any reconnect, so
+    /// the report is a state, not a surrender.
+    #[test]
+    fn a_daemon_that_stays_gone_is_reported_offline_once_then_recovered() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-dec-offline");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("scratch home");
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let home_bg = home.clone();
+        std::thread::spawn(move || {
+            run_decoration_forwarder(&home_bg, &tx, |_| Duration::from_millis(2));
+        });
+
+        let offline = wait_for_msg(&mut rx, "the offline report", |msg| {
+            matches!(msg, AppMsg::DecorationChanged(_))
+        });
+        let AppMsg::DecorationChanged(snapshot) = offline else {
+            unreachable!("wait_for_msg matched DecorationChanged");
+        };
+        assert!(!snapshot.online, "the report is the empty offline snapshot");
+        let log_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let log_path = home.join("workspace.log");
+        while std::time::Instant::now() < log_deadline
+            && !std::fs::read_to_string(&log_path)
+                .unwrap_or_default()
+                .contains("cyclopsd is not answering")
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            std::fs::read_to_string(&log_path)
+                .unwrap_or_default()
+                .contains("cyclopsd is not answering"),
+            "the outage must leave one honest line in workspace.log"
+        );
+
+        // Once per outage: many more failed chain turns add nothing.
+        std::thread::sleep(Duration::from_millis(60));
+        while let Ok(msg) = rx.try_recv() {
+            assert!(
+                !matches!(msg, AppMsg::DecorationChanged(_)),
+                "offline must be reported once, not once per retry"
+            );
+        }
+
+        // The chain never gave up: a daemon that appears now is found.
+        let daemon = FakeDaemon::spawn(&home);
+        wait_for_msg(&mut rx, "the resync ask after recovery", |msg| {
+            matches!(msg, AppMsg::DaemonReconnected)
+        });
+
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// What the resync ask does when it lands: the stale watch record is
+    /// dropped and re-asked (a restarted daemon has no watch table), and
+    /// the snapshot is replaced whole, so a state that flipped while
+    /// nothing was subscribed cannot stay on screen as its old word.
+    #[test]
+    fn a_reconnect_resync_reasks_watches_and_replaces_the_snapshot() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-dec-resync");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("scratch home");
+        let daemon = FakeDaemon::spawn(&home);
+
+        let mut app = test_app(one_pane_model(), home.clone());
+        // Watched under the daemon that died, and showing its last word.
+        app.watched_sessions.insert("$0".into());
+        app.decoration = DecorationSnapshot {
+            online: true,
+            ..Default::default()
+        };
+        app.decoration.panes.insert(
+            "%0".into(),
+            crate::decoration::PaneDecoration {
+                pane_id: "%0".into(),
+                window_id: "@0".into(),
+                label: Some("reviewer".into()),
+                manifest: None,
+                manifest_display_name: None,
+                state: cyclops_proto::AgentState::Idle,
+                needs_attention: false,
+            },
+        );
+
+        resync_daemon_state(&mut app);
+
+        assert_eq!(
+            daemon.watched(),
+            vec!["s".to_string()],
+            "the on-screen workspace must be re-asked"
+        );
+        assert!(
+            app.watched_sessions.contains("$0"),
+            "the fresh ask is recorded again"
+        );
+        assert!(app.decoration.online);
+        assert_eq!(
+            app.decoration.pane("%0").expect("the resynced agent").state,
+            cyclops_proto::AgentState::Working,
+            "the state change the outage swallowed must be on screen"
+        );
+
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// Esc (or the Cancel button: both land in `dialog_cancel`) puts back
     /// the paint that was live when the theme picker opened.
     #[test]
@@ -2833,6 +3331,52 @@ mod tests {
 
         assert_eq!(reconnect.session, "beta");
         assert_eq!(reconnect.socket_name, boot.socket_name);
+    }
+
+    /// Boot's declared size and the first painted frame read one geometry
+    /// from one pair of inputs, so a workspace quit collapsed reopens
+    /// collapsed with no disagreement between what tmux was told and what
+    /// is on screen. The open case is measured too: without it the
+    /// equality below would hold even if visibility were ignored.
+    #[test]
+    fn a_collapsed_sidebar_declares_the_geometry_the_first_frame_paints() {
+        let area = Rect::new(0, 0, 200, 50);
+        let prefs = WorkspacePrefs {
+            sidebar_visible: false,
+            ..WorkspacePrefs::default()
+        };
+
+        // What `run_async` does before it declares: the persisted
+        // visibility lands on the model, then boot sizes from the model.
+        let mut model = one_pane_model();
+        model.sidebar_visible = prefs.sidebar_visible;
+        let boot = chrome_for(area, &model, &prefs);
+        let declared = crate::render::tmux_client_size(boot.canvas, model.active_tab());
+
+        let mut app = test_app(
+            model,
+            cyclops_proto::scratch::scratch_dir("app-boot-collapsed"),
+        );
+        app.prefs = prefs;
+        let painted = app.chrome(area);
+
+        assert_eq!(painted.sidebar, None, "prefs said collapsed");
+        assert_eq!(painted.canvas, boot.canvas);
+        assert_eq!(
+            crate::render::tmux_client_size(painted.canvas, app.model.active_tab()),
+            declared,
+            "the first frame must paint the canvas boot declared"
+        );
+
+        app.model.sidebar_visible = true;
+        app.prefs.sidebar_visible = true;
+        let open = app.chrome(area);
+        assert_eq!(open.sidebar, Some(Rect::new(0, 0, 22, 50)));
+        assert_ne!(
+            crate::render::tmux_client_size(open.canvas, app.model.active_tab()),
+            declared,
+            "an open sidebar really is a different declaration"
+        );
     }
 
     #[test]
@@ -3229,7 +3773,7 @@ mod tests {
         client.shutdown().await;
     }
 
-    // -- A pane-frame drag released on another pane dispatches one swap
+    // -- A pane-grip drag released on another pane dispatches one swap
     // through the executor. What the swap itself does to tmux is
     // `app::exec::tests`' job; this proves the resolution-to-dispatch
     // wiring against the painted hit rects. --
@@ -3336,6 +3880,382 @@ mod tests {
                 .lines()
                 .any(|line| line == format!("{target} {}", before[0].1)),
             "the target pane must take the dragged pane's slot, got {after}"
+        );
+        client.shutdown().await;
+    }
+
+    // -- The corner grip owns the swap pickup; every other frame cell is a
+    // focus click; the stacked seam resizes. The hit map comes from a real
+    // `paint_window` pass so these tests press the exact cells a user
+    // sees. --
+
+    /// A stacked two-pane app (top over bottom, the bottom labeled like an
+    /// adopted agent pane) whose hit map the real render pass painted at
+    /// the 40x12 test terminal size: pane rects (1,1,38,4) and (1,7,38,3),
+    /// seam rows 5 and 6 with the bottom pane's title strip on row 6, and
+    /// corner grips at (39,5) and (39,10).
+    fn stacked_app_with_painted_hits(top: &str, bottom: &str, home: std::path::PathBuf) -> App {
+        use crate::decoration::PaneDecoration;
+
+        let leaf = |pane_id: &str, y: u16, height: u16| crate::layout::ResolvedLayout::Leaf {
+            pane_id: pane_id.into(),
+            x: 0,
+            y,
+            width: 38,
+            height,
+        };
+        let model = WorkspaceModel {
+            workspaces: vec![crate::model::WorkspaceRow {
+                session_id: "$0".into(),
+                name: "s".into(),
+                tab_count: 1,
+                window_ids: vec!["@0".into()],
+            }],
+            active_workspace: 0,
+            session: crate::model::SessionModel {
+                session: "s".into(),
+                tabs: vec![crate::model::TabModel {
+                    window_id: "@0".into(),
+                    name: "1".into(),
+                    layout: crate::layout::ResolvedLayout::Split {
+                        dir: SplitDir::Vertical,
+                        x: 0,
+                        y: 0,
+                        width: 38,
+                        height: 8,
+                        children: vec![leaf(top, 0, 4), leaf(bottom, 5, 3)],
+                    },
+                    active_pane: bottom.into(),
+                    zoomed: false,
+                }],
+                active_tab: 0,
+            },
+            sidebar_visible: true,
+        };
+        let mut app = test_app(model, home);
+        app.decoration = DecorationSnapshot {
+            online: true,
+            ..Default::default()
+        };
+        app.decoration.panes.insert(
+            bottom.into(),
+            PaneDecoration {
+                pane_id: bottom.into(),
+                window_id: "@0".into(),
+                label: Some("reviewer".into()),
+                manifest: None,
+                manifest_display_name: None,
+                state: cyclops_proto::AgentState::Idle,
+                needs_attention: false,
+            },
+        );
+
+        let tab = app.model.active_tab().clone();
+        let backend = ratatui::backend::TestBackend::new(40, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|frame| {
+            let mut ctx = crate::render::WindowPaintCtx {
+                link: LinkState::Live,
+                paused: &app.paused_panes,
+                hits: &mut app.hit_map,
+                decoration: &app.decoration,
+                selection: None,
+                drag: None,
+                cursor: None,
+            };
+            paint_window(
+                &tab,
+                &app.runtimes,
+                frame.area(),
+                frame.buffer_mut(),
+                &app.paint,
+                &mut ctx,
+            );
+        })
+        .unwrap();
+        app
+    }
+
+    fn mouse_at(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    /// The drag-grip regression: a drag starting on the seam between a top
+    /// and bottom pane must resize the panes and never swap them, even
+    /// with the bottom pane labeled. This is the grab the operator
+    /// reported as "just grabs and does not resize".
+    #[tokio::test]
+    async fn a_drag_from_the_stacked_seam_resizes_and_never_swaps() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("app-seam-resize");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "/bin/sh",
+        ]);
+        server.run_ok(&["split-window", "-v", "-t", "s"]);
+        let heights = |server: &TmuxServer| -> Vec<(String, u16)> {
+            String::from_utf8_lossy(
+                &server
+                    .run(&["list-panes", "-t", "s", "-F", "#{pane_id} #{pane_height}"])
+                    .stdout,
+            )
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                Some((fields.next()?.to_string(), fields.next()?.parse().ok()?))
+            })
+            .collect()
+        };
+        let before = heights(&server);
+        assert_eq!(before.len(), 2);
+        let (top, bottom) = (before[0].0.clone(), before[1].0.clone());
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let mut app = stacked_app_with_painted_hits(
+            &top,
+            &bottom,
+            cyclops_proto::scratch::scratch_dir("app-seam-resize-home"),
+        );
+        let mut detached = false;
+
+        // Row A of the seam, on the columns the title strip shadowed.
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 20, 5),
+            &mut detached,
+        )
+        .await
+        .expect("down");
+        assert!(
+            matches!(
+                app.drag.as_ref().map(|drag| &drag.target),
+                Some(DragTarget::Divider {
+                    dir: SplitDir::Vertical,
+                    ..
+                })
+            ),
+            "the seam must pick up a resize, never a pane"
+        );
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Drag(MouseButton::Left), 20, 8),
+            &mut detached,
+        )
+        .await
+        .expect("drag");
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Up(MouseButton::Left), 20, 8),
+            &mut detached,
+        )
+        .await
+        .expect("up");
+
+        assert!(app.drag.is_none());
+        assert!(
+            !app.needs_reconcile,
+            "a resize applies live; a swap would have asked to reconcile"
+        );
+        let after = heights(&server);
+        assert_eq!(
+            after.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec![top.as_str(), bottom.as_str()],
+            "no swap: both panes keep their slots"
+        );
+        assert_eq!(
+            after[0].1,
+            before[0].1 + 3,
+            "the top pane must grow by the dragged rows"
+        );
+        client.shutdown().await;
+    }
+
+    /// The frame is not a drag handle anymore: left-down on a frame cell,
+    /// including the labeled title strip that used to start the swap,
+    /// focuses the pane and creates no drag, mirroring the right-click arm.
+    #[tokio::test]
+    async fn a_left_down_on_the_frame_focuses_without_picking_the_pane_up() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("app-frame-focus");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "/bin/sh",
+        ]);
+        server.run_ok(&["split-window", "-v", "-t", "s"]);
+        let out = server.run(&["list-panes", "-t", "s", "-F", "#{pane_id}"]);
+        let ids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let (top, bottom) = (ids[0].clone(), ids[1].clone());
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let mut app = stacked_app_with_painted_hits(
+            &top,
+            &bottom,
+            cyclops_proto::scratch::scratch_dir("app-frame-focus-home"),
+        );
+        let mut detached = false;
+
+        // The labeled bottom pane's title strip: the old swap pickup.
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 20, 6),
+            &mut detached,
+        )
+        .await
+        .expect("down");
+        assert!(app.drag.is_none(), "a frame cell must never start a drag");
+
+        // The top pane's frame: focus follows the click.
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 20, 0),
+            &mut detached,
+        )
+        .await
+        .expect("down");
+        assert!(app.drag.is_none());
+        assert_eq!(app.model.active_tab().active_pane, top);
+        let active = server.run(&["display-message", "-p", "-t", "s", "#{pane_id}"]);
+        assert_eq!(String::from_utf8_lossy(&active.stdout).trim(), top);
+        client.shutdown().await;
+    }
+
+    /// The one frame cell that still picks a pane up: a drag from the
+    /// bottom-right corner grip dropped on another pane swaps the two,
+    /// exactly as the frame drag used to.
+    #[tokio::test]
+    async fn a_grip_drag_dropped_on_another_pane_swaps_them() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("app-grip-swap");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "/bin/sh",
+        ]);
+        server.run_ok(&["split-window", "-v", "-t", "s"]);
+        let positions = |server: &TmuxServer| -> Vec<(String, String)> {
+            String::from_utf8_lossy(
+                &server
+                    .run(&["list-panes", "-t", "s", "-F", "#{pane_id} #{pane_top}"])
+                    .stdout,
+            )
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                Some((fields.next()?.to_string(), fields.next()?.to_string()))
+            })
+            .collect()
+        };
+        let before = positions(&server);
+        let (top, bottom) = (before[0].0.clone(), before[1].0.clone());
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let mut app = stacked_app_with_painted_hits(
+            &top,
+            &bottom,
+            cyclops_proto::scratch::scratch_dir("app-grip-swap-home"),
+        );
+        let mut detached = false;
+
+        // Down on the bottom pane's grip cell, drop on the top pane's body.
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 39, 10),
+            &mut detached,
+        )
+        .await
+        .expect("down");
+        assert!(
+            matches!(
+                app.drag.as_ref().map(|drag| &drag.target),
+                Some(DragTarget::Pane { pane_id }) if pane_id == &bottom
+            ),
+            "the grip must pick its pane up for a swap"
+        );
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Drag(MouseButton::Left), 20, 3),
+            &mut detached,
+        )
+        .await
+        .expect("drag");
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Up(MouseButton::Left), 20, 3),
+            &mut detached,
+        )
+        .await
+        .expect("up");
+
+        assert!(app.needs_reconcile, "a swap is structural");
+        let after = positions(&server);
+        assert!(
+            after
+                .iter()
+                .any(|(id, at)| id == &bottom && at == &before[0].1),
+            "the dragged pane must take the top slot, got {after:?}"
+        );
+        assert!(
+            after
+                .iter()
+                .any(|(id, at)| id == &top && at == &before[1].1),
+            "the top pane must take the dragged pane's slot, got {after:?}"
         );
         client.shutdown().await;
     }

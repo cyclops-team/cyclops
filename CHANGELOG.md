@@ -5,6 +5,101 @@ versions are unreleased until admin cuts a tag.
 
 ## [Unreleased]
 
+### Added (v4)
+
+- Ten more themes, seventeen in all. Six bright originals drawn on paper
+  rather than inverted from a dark theme (`sorbet`, `meadow`,
+  `periwinkle`, `blossom`, `seafoam`, `buttercream`) and four dark
+  originals (`midnight`, `ember`, `forest`, `obsidian`). Each carries all
+  42 tokens with explicit 256-color fallbacks and maps the ANSI-16
+  palette at ink strength, so an agent CLI printing in red, green or
+  yellow stays legible on that theme's pane ground.
+- `cyclops start --agents <id>[,<id>...]` names the CLIs for a preset's
+  labeled panes and starts them as the panes are built. Ids are matched
+  against installed manifests, and an unknown id or a count that does not
+  fit the preset is refused before a single pane exists. The commands
+  persist into the workspace file, and replaying them later still takes
+  an explicit `--launch`: naming CLIs at the keyboard is a decision about
+  this run, not a standing one. Launched CLIs have no hooks wired, so
+  their receipts stay screen-verified until `cyclops hooks install`.
+- Manifests upgrade the same way themes do. A manifest file still
+  byte-identical to a version Cyclops shipped is a seed nobody edited and
+  is replaced by the newer shipped body; anything else is the operator's
+  measurement and is never touched. Without this, `--agents` was dead on
+  every home seeded before the feature existed, because the shipped
+  `launch` key could not reach it.
+- Pane swap moves to a dedicated grip. Every pane paints a one-cell `⠿`
+  handle in its bottom-right border corner, and dragging that cell onto
+  another pane swaps the two with the drop resolution and focus-follows
+  behavior frame-drag had (F43). The rest of the frame is no longer a
+  drag handle: a left-click focuses the pane, so the resize seam between
+  stacked panes is never shadowed by a swap pickup and a labeled bottom
+  pane's seam resizes again. Keyboard swap chords are untouched, and the
+  keybinds sheet teaches the grip from the painted glyph itself.
+- The sidebar collapses and carries tabs. `Ctrl+B` `b` (config key
+  `toggle_sidebar`) hands the sidebar's columns to the pane canvas; the
+  state persists, so a workspace quit collapsed reopens collapsed.
+  Collapsing takes the `☰ menu` button with it, so the chord is
+  deliberately the only route in or out: no menu item can hide the panel
+  that carries the menu.
+- The sidebar's header carries `Sessions` and `Stream` chips. Click
+  either to swap what the panel shows; the choice persists under
+  `[workspace] sidebar_tab`. The chips take the row the plain
+  "Workspaces" title used to hold, so the session tree keeps every row
+  it had.
+- `cyclops update`. One verb to rebuild from the latest source and
+  replace the installed binaries in place. It names the build you are
+  running, asks the source whether anything is newer first
+  (`git ls-remote`, one round trip; already current exits 0 and stops;
+  a `.dirty` or `unknown` build says why there is no check and
+  proceeds), clones `CYCLOPS_REPO` at `CYCLOPS_REF` and streams that
+  clone's installer, then reports old build to new from the new
+  binary's own `--version` and closes with the three restart steps.
+  Nothing is restarted for you; config, themes, manifests and the
+  record are untouched. Wiring agent hooks stays
+  `cyclops hooks install`, a different job.
+- `cyclops list` scopes to the caller's session. Inside tmux, when
+  exactly one watched session holds the caller's pane, the roster is
+  that session's alone, with a dim line under the header naming the
+  elided sessions and `cyclops list --all` as the way out. Outside
+  tmux, on no match, and with `--all`, the output is byte for byte what
+  it was. `--json` scopes identically and carries the elided names as
+  an additive `also_watching` field (parity, not a second shape).
+- The tab bar earns its row. With a single tab the strip hides and the
+  pane canvas reclaims the row; it returns the moment a second tab
+  exists. The painted chrome and the tmux-declared client size derive
+  the bar's visibility from the same model snapshot, so the grid never
+  drifts a row from what tmux was told. `prefix+c` and the menu's New
+  tab still create tabs while the bar is hidden.
+
+### Changed (v4)
+
+- The event stream moved out of its own right-hand slide-out and into
+  the sidebar's Stream tab. It inherits the sidebar's drag-to-resize and
+  persisted width instead of a hardcoded 40 columns, and its rows still
+  come from the one `event_stream_rows` path `cyclops watch` parity is
+  proven against. `Ctrl+B` `e` and the app menu's Event stream item keep
+  their names: show the stream, press again for the session list back.
+  The trade is real: the session list and the event stream now share one
+  panel and cannot be read at the same time.
+
+### Fixed (v4)
+
+- The workspace's daemon subscription outlives cyclopsd. A boot-order
+  race or a daemon restart used to kill the state-event thread
+  silently, so the idle/working words froze until a structural
+  reconcile (the alt-tab-fixes-it symptom). The subscription now
+  reconnects on a bounded backoff, refetches the full snapshot on every
+  reconnect so nothing that changed during the outage stays stale, and
+  an outage outliving the chain says so once while the loop keeps
+  retrying.
+- nord and tokyo-night lift `surface.dim` to clear the 3:1 readability
+  floor on the chrome panel (the menu button, sidebar rows, inactive
+  tabs): nord's dim leaves the published palette (#8892a8, annotated in
+  the file header), tokyo-night's moves to its own dark5 (#737aa2). A
+  new shipped-theme test measures the pair in every theme, so it can
+  never ship unmeasured again.
+
 ### Added
 
 - Themes own the pane ground. The workspace paints `surface.fg` on

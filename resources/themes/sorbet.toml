@@ -1,0 +1,115 @@
+# Cyclops sorbet: a citrus counter on peach paper. The ground is a warm
+# apricot-tinted white, the ink a cocoa brown, and the accent a coral
+# deepened until it carries meaning alone at cell size, the way a pastel
+# picked for the swatch book never does.
+#
+# The eight role slots are the flavors on that counter, spread around the
+# wheel so eight agents stay apart at a glance while the warm end keeps
+# the theme: coral, apricot, lemon zest, lime, mint, blueberry, grape,
+# raspberry. Every one was drawn against this paper. A light theme is not
+# an inverted dark one, so nothing here is a dark value lightened until it
+# looked right.
+#
+# The eye follows the shipped pattern: calm takes surface.dim so a quiet
+# rig recedes, alert takes the coral accent.
+#
+# [state] and [badge] are the four groups at ink strength, redundant with
+# the glyph and the word as everywhere else: healthy a leaf green,
+# needs-you an apricot amber, terminal a blood-orange red, quiet the dim
+# itself, and dead ABOVE dim, because on paper the lighter cell is the
+# quieter one.
+#
+# [palette] is the sixteen ANSI colors at ink strength: an agent CLI
+# painting in red, green or yellow prints body text on this pane ground,
+# so every slot had to stay legible on peach instead of assuming a dark
+# terminal. The weakest slot measures 3.21:1 and it is the lightest rung
+# of the gray ladder; every chromatic slot clears 3.6:1. All sixteen are
+# drawn off this counter rather than off a generic terminal set, because
+# what a program paints under sorbet should look like sorbet and not like
+# the next light theme along. The gray ladder keeps its order, 0 darkest,
+# then 8, then 7, then 15, so shading still ranks instead of washing to
+# white on white.
+#
+# The chrome grounds step down from the paper into apricot: on a light
+# theme the furniture recedes by darkening, and raised is deepened past a
+# mechanical second step so a selected row does not sit flat on the panel.
+#
+# Every 256-color fallback is explicit. Outside [role] and [palette] each
+# is what the cyclops-theme derivation picks. role.8 is the one hand-tune:
+# raspberry and coral both derive to 131, and role color has to stay
+# pairwise distinct. Coral keeps that entry because it is the accent's
+# own; raspberry steps to 132, the next nearest and a truer raspberry than
+# the brick the two of them derived to. The four state groups were then
+# aimed off the role entries as well, so an agent's name and a state cell
+# never come out the same color on a 256-color terminal: mint took the
+# teal entry and healthy the green one beside it, and terminal sits on the
+# deep red below coral's. The [palette] fallbacks are the literal ANSI
+# index: the program asked for color N, and terminals remap 0..15 freely.
+
+name = "sorbet"
+
+[surface]
+fg = { hex = "#3a2b26", c256 = 236 }
+bg = { hex = "#fff6ed", c256 = 255 }
+dim = { hex = "#7a6055", c256 = 95 }
+accent = { hex = "#b84b36", c256 = 131 }
+
+[role]
+1 = { hex = "#b84b36", c256 = 131 } # coral, the accent
+2 = { hex = "#a85c25", c256 = 130 } # apricot
+3 = { hex = "#726c1a", c256 = 58 }  # lemon zest
+4 = { hex = "#487a33", c256 = 65 }  # lime
+5 = { hex = "#2a7a76", c256 = 30 }  # mint
+6 = { hex = "#4a6fae", c256 = 61 }  # blueberry
+7 = { hex = "#7d51a6", c256 = 97 }  # grape
+8 = { hex = "#b3406e", c256 = 132 } # raspberry; hand-tuned off coral
+
+[eye]
+calm = { hex = "#7a6055", c256 = 95 }
+alert = { hex = "#b84b36", c256 = 131 }
+
+[state]
+healthy = { hex = "#2a7a4a", c256 = 29 }   # leaf green
+needs_you = { hex = "#8f6416", c256 = 94 } # apricot amber
+terminal = { hex = "#a02c22", c256 = 124 } # blood orange
+quiet = { hex = "#7a6055", c256 = 95 }     # same as surface.dim
+dead = { hex = "#9f8e86", c256 = 138 }     # above dim: lighter is quieter here
+
+[badge]
+healthy = { hex = "#2a7a4a", c256 = 29 }
+needs_you = { hex = "#8f6416", c256 = 94 }
+terminal = { hex = "#a02c22", c256 = 124 }
+quiet = { hex = "#7a6055", c256 = 95 }
+
+# The ANSI-16 mapping for pane content: the counter's own flavors, one to
+# a slot. 0 is the page's ink, and 2, 3, 4 and 5 are the lime, lemon zest,
+# blueberry and raspberry the role wheel already carries. Red is a blood
+# orange and its bright is a tangerine; cyan is the mint taken cold, far
+# enough that a program asking for cyan gets one. The other brights are
+# their own normals one scoop lighter at the same hue, except bright blue,
+# which leans into the blueberry's skin. 7, 8 and 15 are the gray ladder
+# from the header, tinted cocoa so it belongs to this paper.
+[palette]
+0 = { hex = "#3a2b26", c256 = 0 }
+1 = { hex = "#a6461e", c256 = 1 }
+2 = { hex = "#487a33", c256 = 2 }
+3 = { hex = "#726c1a", c256 = 3 }
+4 = { hex = "#4a6fae", c256 = 4 }
+5 = { hex = "#b3406e", c256 = 5 }
+6 = { hex = "#27777f", c256 = 6 }
+7 = { hex = "#8f7d74", c256 = 7 }
+8 = { hex = "#6e574c", c256 = 8 }
+9 = { hex = "#c76431", c256 = 9 }
+10 = { hex = "#568e3e", c256 = 10 }
+11 = { hex = "#8b8321", c256 = 11 }
+12 = { hex = "#6d7bca", c256 = 12 }
+13 = { hex = "#cc5985", c256 = 13 }
+14 = { hex = "#378d97", c256 = 14 }
+15 = { hex = "#99877e", c256 = 15 }
+
+# The chrome grounds, both warmer and darker than the paper: apricot for
+# the flat panel, a deeper apricot for the raised rows.
+[chrome]
+text = { hex = "#3a2b26", c256 = 236 }
+panel = { hex = "#fbe7d8", c256 = 224 }
+raised = { hex = "#f3d3bd", c256 = 223 }

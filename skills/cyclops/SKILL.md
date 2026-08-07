@@ -50,6 +50,15 @@ $ cyclops list
 the pane title — on a real Claude/Codex/Cursor pane it is usually the
 agent's current task; here it is whatever the demo fixture set.)
 
+Inside tmux, when the daemon watches more than one session, `cyclops
+list` scopes to the session your pane is in: the header names the
+session it kept and a dim line names the elided ones with the way out.
+`cyclops list --all` is every watched session, and `--json` scopes
+identically: a scoped answer carries the elided session names as an
+additive `also_watching` field, and `--all` restores the full dump. Your
+own agents are always in the scoped roster, since it is your session by
+definition.
+
 `cyclops status` shows the same roster plus every watched pane nobody has
 named yet (listed by pane id), the tmux version, and the eye — whether
 anything needs a human right now:

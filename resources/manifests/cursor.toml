@@ -37,6 +37,10 @@ version_tested = "2026.07.23-e383d2b"
 process_names = ["cursor-agent"]   # does not match this install; here for a
                                    # future build that ships a real binary
 argv_basenames = ["agent", "cursor-agent"]
+# What `cyclops start --agents cursor` runs in a pane. The long entry point
+# of the two above: "agent" is a name plenty of other things on a PATH use,
+# and this one says which program is meant.
+launch = "cursor-agent"
 
 [hooks]
 # MEASURED with a logging hook installed at <workspace>/.cursor/hooks.json:

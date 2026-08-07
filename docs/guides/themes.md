@@ -8,12 +8,22 @@ cyclops theme light      # switch
 ```
 
 ```
+  blossom        ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  buttercream    ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   catppuccin     ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
 ▸ dark           ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  ember          ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  forest         ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   gruvbox        ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   high-contrast  ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   light          ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  meadow         ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  midnight       ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   nord           ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  obsidian       ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  periwinkle     ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  seafoam        ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
+  sorbet         ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
   tokyo-night    ● working  ⚠ blocked_modal  ⊘ blocked_quota  ○ idle  ✗ dead  ◉
 
   cyclops theme <name> to switch
@@ -60,12 +70,17 @@ config key and is fixed for the life of that process, and a bare name
 resolves against `./themes` relative to the daemon's own working directory
 when `~/.cyclops/themes` does not exist.
 
-Seven themes ship. Three are the usecyclops.dev identity: `dark` (the
+Seventeen themes ship. Three are the usecyclops.dev identity: `dark` (the
 default), `light`, `high-contrast`. Four are loved terminal palettes
 mapped onto the same vocabulary: `catppuccin` (Mocha), `tokyo-night`,
 `nord`, `gruvbox`; each names its upstream project (all MIT) at the top
-of its file. `cyclops start` seeds all seven into `~/.cyclops/themes`
-and never rewrites one you edited.
+of its file. Ten are this project's own rather than ports, so they carry
+no upstream credit: six lights drawn on tinted paper (`blossom`,
+`buttercream`, `meadow`, `periwinkle`, `seafoam`, `sorbet`) and four
+darks (`ember`, `forest`, `midnight`, `obsidian`). Each file header says
+what its theme is for.
+`cyclops start` seeds all seventeen into `~/.cyclops/themes` and never
+rewrites one you edited.
 A home seeded before `surface.bg` and `palette` existed keeps working:
 those tokens resolve from the compiled defaults until you delete the
 file and run `cyclops start` to reseed, or add them by hand.
@@ -147,9 +162,9 @@ are the ones the accessibility guidelines for the web use (WCAG 2.1,
 measured on relative luminance in sRGB), because they are the only
 published bar for "can a person read this".
 
-Each shipped theme's file header states its ground, the `surface.bg` it
-ships, and the ratio every token clears against it. The bars below are
-the bars, not a summary of them:
+Three themes publish a floor. Their file headers state the ground, the
+`surface.bg` they ship, and the ratio every token clears against it. The
+bars below are the bars, not a summary of them:
 `shipped_themes_meet_their_stated_contrast` in
 `src/cyclops-theme/tests/shipped.rs` measures every color against them,
 and `the_published_bars_are_the_bars_that_get_measured` fails the build if
@@ -167,11 +182,22 @@ deliberately the hardest cell to read: it marks a pane whose process is
 gone, and there is nothing to do about one. Both exceptions measure
 2.82:1 against their ground.
 
+The other fourteen publish nothing here, on purpose. A bar in a header
+is a promise something measures; a bar written to describe colors that
+already exist measures nothing and reads exactly the same. What every
+one of the seventeen is held to instead is structural and checked for
+all of them: the file loads with zero warnings, sets all 42 tokens,
+keeps its eight role fallbacks and its sixteen palette entries pairwise
+distinct, and clears the `surface.dim` bar below.
+
 `surface.bg` and the two `chrome` grounds are backgrounds, not figures,
 so they are not held to the figure floor. The chrome bar, measured by
 the same test, is that `chrome.text` stays readable on both grounds at
 the theme's floor, and that the grounds stay different in truecolor and
-256-color terminals.
+256-color terminals. Chrome's dimmed ink has its own bar: `surface.dim`
+on `chrome.panel` (the sidebar, the menu button, inactive tabs) clears
+3:1 in every shipped theme, the same `MIN_CONTRAST` floor the workspace
+holds pane cells to.
 
 `palette.*` has no bar at all: palette entries are content colors the
 running program picks, so the theme only supplies the mapping

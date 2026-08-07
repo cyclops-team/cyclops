@@ -1,0 +1,109 @@
+# Cyclops seafoam: a light theme drawn on sea glass. The ground is a
+# cool mint-white, the chrome steps down through pale aqua, and the
+# accent is a deep teal, dark enough to be the one ink on this page that
+# carries meaning alone.
+#
+# The eight role slots leave the teal corner immediately: deep teal,
+# harbor blue, indigo, violet, plum, rose, amber, leaf. The theme's
+# identity is the ground and the chrome, and spending three role slots
+# on shades of aqua would only cost a reader the difference between two
+# agents. Every ink here was measured against this ground; none of it is
+# a dark theme lightened.
+#
+# The eye follows the shipped light theme's logic: calm takes
+# surface.dim so a quiet rig recedes, alert takes the teal accent.
+#
+# [state] and [badge] are the same four groups, redundant with the glyph
+# and the word: a forest green, an ochre amber, a coral red, quiet on
+# surface.dim, and dead ABOVE dim, because on paper a lighter gray is
+# the quieter one. Which state lands in which group is dark.toml's
+# table; nothing about the grouping changes per theme.
+#
+# There is no [stream] table, for the reason written out in dark.toml:
+# the stream's gutter resolves surface.dim like every other detail
+# column.
+#
+# Two hand-tunes:
+#
+#   surface.accent is deepened well past the pale aqua the rest of the
+#   theme is built from. A seafoam green at cell size is a tint, not a
+#   marker, and the accent is what points at the row a surface is
+#   talking about.
+#
+#   state.healthy is pulled toward forest green and away from the teal
+#   accent. Both are meaning-carrying, they appear on the same row, and
+#   at cell size a sea green beside a deep teal reads as one color.
+#
+# Every 256-color fallback is explicit, and outside [palette] each is
+# exactly what the cyclops-theme derivation picks, role slots included:
+# the wheel was chosen at lightnesses where no two roles land on the
+# same entry, so nothing here overrides the algorithm. The [palette]
+# fallbacks are the literal ANSI index: the program asked for color N,
+# and terminals remap 0..15 freely.
+
+name = "seafoam"
+
+[surface]
+fg = { hex = "#1c332f", c256 = 235 }
+bg = { hex = "#f3faf7", c256 = 231 }
+dim = { hex = "#5c716e", c256 = 242 }
+accent = { hex = "#0e6b66", c256 = 23 }
+
+[role]
+1 = { hex = "#0e6b66", c256 = 23 }  # deep teal, the accent
+2 = { hex = "#346b9b", c256 = 60 }  # harbor blue
+3 = { hex = "#5260b8", c256 = 61 }  # indigo
+4 = { hex = "#8151ac", c256 = 97 }  # violet
+5 = { hex = "#994b84", c256 = 96 }  # plum
+6 = { hex = "#ac4358", c256 = 131 } # rose
+7 = { hex = "#885f20", c256 = 94 }  # amber
+8 = { hex = "#337828", c256 = 64 }  # leaf
+
+[eye]
+calm = { hex = "#5c716e", c256 = 242 }
+alert = { hex = "#0e6b66", c256 = 23 }
+
+[state]
+healthy = { hex = "#277447", c256 = 29 }   # forest green, see the header
+needs_you = { hex = "#7c6016", c256 = 94 } # ochre amber
+terminal = { hex = "#ae3f32", c256 = 131 } # coral red
+quiet = { hex = "#5c716e", c256 = 242 }    # same as surface.dim
+dead = { hex = "#829894", c256 = 246 }     # above dim: lighter is quieter here
+
+[badge]
+healthy = { hex = "#277447", c256 = 29 }
+needs_you = { hex = "#7c6016", c256 = 94 }
+terminal = { hex = "#ae3f32", c256 = 131 }
+quiet = { hex = "#5c716e", c256 = 242 }
+
+# The ANSI-16 mapping for pane content, at ink strength so every entry
+# reads on this ground: an agent printing in red, green or yellow stays
+# legible on the pane it was given. 6 is the theme's own deep teal, so a
+# program asking for cyan gets the accent rather than a wash. The three
+# grays keep the standard ladder, 0 darkest, then 8, then 7, then 15,
+# and the brights are the normals' hues lifted.
+[palette]
+0 = { hex = "#1c332f", c256 = 0 }
+1 = { hex = "#ae3f32", c256 = 1 }
+2 = { hex = "#277447", c256 = 2 }
+3 = { hex = "#7c6016", c256 = 3 }
+4 = { hex = "#3b6698", c256 = 4 }
+5 = { hex = "#9c408d", c256 = 5 }
+6 = { hex = "#0e6b66", c256 = 6 }
+7 = { hex = "#6e817e", c256 = 7 }
+8 = { hex = "#61726f", c256 = 8 }
+9 = { hex = "#d34d52", c256 = 9 }
+10 = { hex = "#218c5a", c256 = 10 }
+11 = { hex = "#987619", c256 = 11 }
+12 = { hex = "#3e7dc5", c256 = 12 }
+13 = { hex = "#c549b1", c256 = 13 }
+14 = { hex = "#1d8888", c256 = 14 }
+15 = { hex = "#7d918e", c256 = 15 }
+
+# The workspace chrome's grounds, both darker than the page: on a light
+# theme the chrome recedes by darkening, and both keep the ground's
+# green cast rather than falling back to neutral gray.
+[chrome]
+text = { hex = "#1c332f", c256 = 235 }
+panel = { hex = "#e3f2ee", c256 = 255 }
+raised = { hex = "#c4ded7", c256 = 252 }

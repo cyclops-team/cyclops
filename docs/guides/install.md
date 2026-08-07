@@ -124,7 +124,7 @@ what the installer calls and what a cargo install needs afterwards:
 $ cyclops start --setup-only
 ✔ cyclops is set up
   wrote /Users/you/.cyclops/config.toml
-  wrote 7 themes to /Users/you/.cyclops/themes
+  wrote 17 themes to /Users/you/.cyclops/themes
   wrote 4 detection manifests to /Users/you/.cyclops/manifests
 ```
 
@@ -169,10 +169,11 @@ find, so a new one lands on your next start and says so:
   wrote 1 detection manifest to /Users/you/.cyclops/manifests
 ```
 
-A file already there is never read, compared, or rewritten, so your edits
-survive every run. The other side of that: a shipped manifest that changes
-does not reach a copy you already have. Delete yours and run `cyclops
-start` again to take the new one.
+A file you edited is never rewritten, so your measurements survive every
+run. A copy still byte-identical to a version Cyclops shipped is a seed
+nobody touched, and a newer shipped version replaces it on the next run,
+so an upgrade reaches an untouched home without a reinstall. Themes
+follow the same rule.
 
 Four optional keys. The first two change how the daemon talks to tmux, so
 add them only when you mean to. `theme` changes what every surface prints,
@@ -190,10 +191,13 @@ chrome = "off"             # stop writing names onto tmux borders, see panes.md
 of this file alone, and `cyclops theme` on its own shows what each one
 looks like. Editing the key by hand does the same thing.
 
-Theme files are read from `~/.cyclops/themes`, which `cyclops start`
-fills with the shipped set (dark, light, high-contrast, catppuccin,
-tokyo-night, nord, gruvbox). A theme you edited is never rewritten, the
-same rule the manifests follow. With no theme files at all, cyclops
+Theme files are read from `~/.cyclops/themes`, which both `cyclops
+start` and bare `cyclops` fill with the shipped set: the three identity
+themes (dark, light, high-contrast), four ports (catppuccin,
+tokyo-night, nord, gruvbox), six bright originals (sorbet, meadow,
+periwinkle, blossom, seafoam, buttercream), and four dark originals
+(midnight, ember, forest, obsidian). A theme you edited is never
+rewritten, the same rule the manifests follow. With no theme files at all, cyclops
 renders in built-in colors.
 
 The tuning knobs, defaults shown:
@@ -335,8 +339,10 @@ python3 scripts/commpact-shim/test_shim.py
 `parity-check.sh` walks the README ladder against a throwaway tmux server
 and fails if a line the docs quote is no longer what the binaries print.
 `--with-installer` adds `scripts/install.sh` to the walk: it installs into
-a throwaway home, checks the shapes this page quotes, then uninstalls and
-proves the shell profile came back byte for byte. It is opt-in because it
+a throwaway home, checks the shapes this page quotes, runs `cyclops
+update` against a local mirror one commit ahead (and once more for the
+already-current path), then uninstalls and proves the shell profile came
+back byte for byte. It is opt-in because it
 does a release build, and CI runs it as its own job. The parity gate also
 requires `website/static/install.sh` to be byte-for-byte identical to the
 tested repository installer.
@@ -362,6 +368,56 @@ CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated cargo test --workspace --no-fail
 Use it when `/private/tmp` is not writable, and when you want to check
 that nothing has hardcoded a path: a relocated run on macOS takes the same
 code path Linux does. CI runs both.
+
+## Update
+
+```bash
+cyclops update
+```
+
+One command, from anywhere, no one-liner to re-find. It prints the build
+you are running and asks the source whether there is anything newer
+(`git ls-remote`, one round trip, nothing fetched). Already current
+stops right there and exits 0:
+
+```
+$ cyclops update
+cyclops 0.1.0 (1e16081)
+  source https://github.com/cyclops-team/cyclops.git at main
+✔ already the latest main · nothing to update
+```
+
+Behind a newer commit, updating is reinstalling: it clones the
+repository and runs that clone's `scripts/install.sh`, streaming its
+output. The same rules as your first install apply: binaries are
+replaced in place (copied beside, renamed over, safe under a running
+daemon), and config, themes, manifests and the record already in your
+home are never rewritten. Then it closes the loop the installer cannot:
+
+```
+✔ updated · 0.1.0 (0876ed7) → 0.1.0 (1e16081)
+
+Restart:
+  1  q                    quit any open workspace; it is still on the old build
+  2  cyclops daemon stop  the daemon is too
+  3  cyclops start        come back up on the new build
+```
+
+The left of the arrow is the binary that ran the update; the right is
+the freshly installed one answering `--version` for itself. Nothing is
+restarted for you, on purpose: the daemon and any open workspace keep
+executing the replaced binary until you take the three steps, and
+stopping a daemon under an open workspace mid-session is not the
+update's call to make.
+
+`CYCLOPS_REPO` and `CYCLOPS_REF` pick the source, exactly as they do for
+the installer; the defaults are the public repository's `main`. A build
+from edited sources (`--version` ends in `.dirty`) or from outside git
+(`unknown`) can match no commit, so it says so, skips the freshness
+check, and updates anyway.
+
+`cyclops update` updates cyclops itself. Wiring an agent CLI's hooks is
+`cyclops hooks install`, a different job.
 
 ## Uninstall
 

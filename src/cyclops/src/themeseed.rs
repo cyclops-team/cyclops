@@ -12,8 +12,18 @@
 
 use std::path::{Path, PathBuf};
 
-/// Every theme the binary carries, by file name.
+/// Every theme the binary carries, by file name. Alphabetical, and
+/// `the_shipped_list_is_the_themes_directory` holds it to every file in
+/// resources/themes/ so a new theme cannot be embedded halfway.
 const SHIPPED: &[(&str, &str)] = &[
+    (
+        "blossom.toml",
+        include_str!("../../../resources/themes/blossom.toml"),
+    ),
+    (
+        "buttercream.toml",
+        include_str!("../../../resources/themes/buttercream.toml"),
+    ),
     (
         "catppuccin.toml",
         include_str!("../../../resources/themes/catppuccin.toml"),
@@ -21,6 +31,14 @@ const SHIPPED: &[(&str, &str)] = &[
     (
         "dark.toml",
         include_str!("../../../resources/themes/dark.toml"),
+    ),
+    (
+        "ember.toml",
+        include_str!("../../../resources/themes/ember.toml"),
+    ),
+    (
+        "forest.toml",
+        include_str!("../../../resources/themes/forest.toml"),
     ),
     (
         "gruvbox.toml",
@@ -35,8 +53,32 @@ const SHIPPED: &[(&str, &str)] = &[
         include_str!("../../../resources/themes/light.toml"),
     ),
     (
+        "meadow.toml",
+        include_str!("../../../resources/themes/meadow.toml"),
+    ),
+    (
+        "midnight.toml",
+        include_str!("../../../resources/themes/midnight.toml"),
+    ),
+    (
         "nord.toml",
         include_str!("../../../resources/themes/nord.toml"),
+    ),
+    (
+        "obsidian.toml",
+        include_str!("../../../resources/themes/obsidian.toml"),
+    ),
+    (
+        "periwinkle.toml",
+        include_str!("../../../resources/themes/periwinkle.toml"),
+    ),
+    (
+        "seafoam.toml",
+        include_str!("../../../resources/themes/seafoam.toml"),
+    ),
+    (
+        "sorbet.toml",
+        include_str!("../../../resources/themes/sorbet.toml"),
     ),
     (
         "tokyo-night.toml",
@@ -62,13 +104,21 @@ pub fn dir(home: &Path) -> PathBuf {
 /// below fails until the current bodies are listed.
 const EVER_SHIPPED_FNV64: &[&str] = &[
     "079d603c4110e97a",
+    "0b4e9e0c1faf543b",
+    "103a71725e5f7e0e",
     "16659b363c97515a",
     "1c6dd03958d24189",
     "2805d33948df7087",
+    "302ae5a539549eb3",
     "3043a40966256b08",
     "31d3f87d51f24bdb",
     "3d0aad5d9b63f1d3",
+    "4148e7e8ffaff233",
     "438eef9420321e42",
+    "43e559f60ee17dfd",
+    "45df4664bb804c5d",
+    "4bd5ba7fc0eb9cfc",
+    "52c5205d7f6637f0",
     "4e04410bb72e4c83",
     "590416905c96bb96",
     "5ffdc0c45a777472",
@@ -77,21 +127,29 @@ const EVER_SHIPPED_FNV64: &[&str] = &[
     "65f6c922b4cfa360",
     "7b1f9cf910687f09",
     "7cd90c5fd2fabde5",
+    "847e29dfa0cbd4dc",
     "85bf980022c0549d",
     "88387fdff1488ef2",
     "94301aec753053fb",
     "95223edd9843dcf8",
+    "9ef86f48ff5d4311",
     "a96073b373240177",
     "aaa456eea2091dc9",
+    "ac1368318fbcdf8e",
     "af572f0c4cb4ced1",
+    "bfc17f3f626168c0",
     "c2f4f150f84798d0",
     "c776b954bfa78c16",
     "c915108a16b358cd",
     "cc7d478d863ef7dc",
+    "d71f99395f3a548b",
     "dc469fc78811f02b",
     "df7a68ea06240a04",
     "dfa5b169d8b1a128",
+    "e070908e2221ea5b",
     "e26522f98f021dd7",
+    "e2960fc8ce169c7f",
+    "e5531f9b02b29c11",
     "ec8713a84becce80",
 ];
 
@@ -241,6 +299,47 @@ mod tests {
                 fnv64(body.as_bytes())
             );
         }
+    }
+
+    /// resources/themes/ is the source of truth for what ships, and this
+    /// list is one of two that have to match it. The other is `SHIPPED`
+    /// in `src/cyclops-theme/tests/shipped.rs`, held to the same
+    /// directory by its own test; anchoring both to the directory is
+    /// what keeps two lists in two crates from drifting apart.
+    ///
+    /// The failure this closes: a theme added here but forgotten there
+    /// seeds onto every machine without one structural gate ever loading
+    /// it, so nothing checks its token coverage, its role fallbacks or
+    /// its palette until a user sees the colors.
+    #[test]
+    fn the_shipped_list_is_the_themes_directory() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../resources/themes");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .expect("resources/themes")
+            .map(|e| {
+                e.expect("theme dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|n| n.ends_with(".toml"))
+            .collect();
+        on_disk.sort();
+
+        let listed: Vec<String> = SHIPPED.iter().map(|(n, _)| (*n).to_string()).collect();
+        for name in &on_disk {
+            assert!(
+                listed.contains(name),
+                "resources/themes/{name} exists but nothing seeds it; add it to \
+                 SHIPPED in src/cyclops/src/themeseed.rs"
+            );
+        }
+        // A SHIPPED entry naming a file that is not there cannot compile,
+        // so what is left to check is order and duplicates.
+        assert_eq!(
+            listed, on_disk,
+            "SHIPPED is not resources/themes/ in alphabetical order"
+        );
     }
 
     /// Every shipped theme loads in the real engine with ZERO warnings.

@@ -62,6 +62,7 @@ deliveries. Nothing is left out:
 id = "demo"
 display_name = "Parity rig stand-in"
 process_names = ["sh", "bash", "dash", "zsh", "cat"]
+launch = "cat"
 
 [hooks]
 turn_start = "UserPromptSubmit"
@@ -100,6 +101,7 @@ safe_states = ["idle"]
 | `version_tested` | The CLI version the rules were measured against. Free text |
 | `process_names` | Bind when the pane's foreground command is one of these |
 | `argv_basenames` | Bind when `argv[0]`'s basename is one of these. The fallback for when the first list cannot work |
+| `launch` | The command that starts this CLI, for `cyclops start --agents <id>`. Optional |
 
 `argv_basenames` exists for one measured reason. tmux reports the kernel's
 name for the resolved executable, so a native Claude install, where
@@ -110,6 +112,15 @@ to reading the pane process's argv.
 When neither list matches, the pane reads `? unknown` and nothing addresses
 it. `cyclops name %4 reviewer --manifest demo` pins one by hand; the pin
 wins over both lists and sticks with the name.
+
+`launch` is the only key here that is not about detection. It is what
+`cyclops start --preset duo --agents claude,codex` runs in each named pane:
+the id comes from this file, the command comes from this key. Leave it out
+and cyclops still detects that CLI perfectly; `--agents` refuses the id
+rather than guessing at a binary name, because a wrong guess fails inside a
+pane where nobody reads the error. Write the bare command. Hook wiring is
+`cyclops hooks install` and is deliberately not composed in here, so a pane
+started this way runs on the title and screen tiers until you wire it.
 
 ## `[[rule]]`: reading state off the pane
 

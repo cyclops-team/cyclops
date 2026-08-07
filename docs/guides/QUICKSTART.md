@@ -80,6 +80,23 @@ whether one is running, `cyclops daemon stop` takes it down, and
 
 Attach, and start one agent CLI in each pane the way you normally would.
 
+Or have cyclops start them. `--agents` names them by manifest id, one per
+named pane in layout order:
+
+```
+cyclops start --preset duo --agents claude,codex
+```
+
+Typing the names is the decision to run them, so they start in that run
+with no second flag. What it does not do is change the rule for later runs:
+the commands go into the workspace file cyclops writes from the preset, and
+a file naming a command is a suggestion, so the next `cyclops start` opens
+shells unless you pass `--launch`. An id with no manifest, or a count that
+does not fit the preset's named panes, is refused before anything is built.
+
+The CLIs start bare, exactly as if you had typed their names. Step 4 wires
+the hooks; until then their receipts are screen-tier.
+
 ## 3. Check the roster
 
 ```
@@ -93,6 +110,11 @@ watching main · home ~/.cyclops
 Three columns: the name, how the agent is doing, and what it is on. Both
 names came from the preset. `duo` carries them, and `cyclops start` put them
 on the panes it built.
+
+When the daemon watches more than one session and you ask from inside
+tmux, the roster is your session's alone, and a dim line under the
+header names what was left out. `cyclops list --all` is every watched
+session.
 
 ### When a pane reads unknown
 

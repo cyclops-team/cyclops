@@ -1,11 +1,16 @@
 # Tokyo Night, mapped onto the cyclops vocabulary. Palette: the
-# tokyo-night project (MIT). The storm-blue text and comment gray carry
-# the surface, blue is the accent, and the neon set fills the roles.
+# tokyo-night project (MIT). The storm-blue text carries the surface,
+# blue is the accent, and the neon set fills the roles. surface.dim is
+# the palette's dark5, not its comment gray: the comment color measured
+# 2.35:1 on the chrome panel (the sidebar and menu-button ground), under
+# the workspace's 3:1 readability floor, and dark5 clears it at 3.49:1.
+# eye.calm, state.quiet and badge.quiet keep the comment gray, so quiet
+# marks stay the upstream comment color.
 name = "tokyo-night"
 [surface]
 fg = { hex = "#c0caf5", c256 = 189 }
 bg = { hex = "#1a1b26", c256 = 234 } # night bg, the pane ground
-dim = { hex = "#565f89", c256 = 60 }
+dim = { hex = "#737aa2", c256 = 67 } # dark5; see header
 accent = { hex = "#7aa2f7", c256 = 111 }
 [role]
 1 = { hex = "#7aa2f7", c256 = 111 } # blue

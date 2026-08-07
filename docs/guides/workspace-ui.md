@@ -1,7 +1,15 @@
 # The workspace UI
 
 Bare `cyclops` on a TTY opens the full-screen terminal workspace: a
-project sidebar, tab bar, and live pane canvas fed by tmux control mode.
+project sidebar and a live pane canvas fed by tmux control mode, plus a
+tab bar whenever the workspace has more than one tab; a lone tab's strip
+hides and the canvas keeps the row. The sidebar is the one side panel:
+its header carries a `Sessions` tab (the workspace and agent tree) and a
+`Stream` tab (the live `cyclops watch` event stream). It collapses out of
+the way with `Ctrl+B` `b`, and both the collapse and the selected tab
+persist, so the workspace reopens the way you left it. Collapsing takes
+the `☰ menu` button with it, so the chord is deliberately the only way
+in or out: no menu item can hide the panel that carries the menu.
 With no tmux server running (or no sessions on it), it starts one — a
 fresh session named `main` with a single shell pane in the directory you
 ran it from. Its first tab is `1`; automatic tab names continue with `2`,
@@ -42,7 +50,8 @@ Default bindings are prefix-first (`Ctrl+B`, same shape as tmux):
 | `Ctrl+B` `w` | Create a workspace from the focused pane's folder |
 | `Ctrl+B` `[` / `]` | Previous / next workspace |
 | `Ctrl+B` `W` / `K` | Rename / close workspace |
-| `Ctrl+B` `e` | Toggle event stream |
+| `Ctrl+B` `b` | Collapse or reopen the sidebar |
+| `Ctrl+B` `e` | Show the event stream (sidebar's Stream tab); press again for the session list back |
 | `Ctrl+B` `?` | Open the scrollable keybinding reference |
 
 Unbound keys, including modified terminal keys such as Claude Code's
@@ -102,7 +111,8 @@ Sidebar rows and inactive pane borders are compact surfaces: they show the
 bare glyph, with no word alongside it and no word substituted when one
 doesn't fit — the glyph alone is the encoding there. The focused pane's
 border pairs the glyph with its word, for example `⚠ needs attention`, when
-there is room for both; dialogs and the event panel always have that room.
+there is room for both; dialogs and the event stream always have that
+room — a narrow sidebar wraps a stream row rather than dropping its word.
 The glyph itself never changes meaning: it renders identically under every
 theme and under `NO_COLOR`, so only the surrounding color, never the glyph,
 depends on color. Cyclops never writes the pane title to show any of
@@ -124,11 +134,22 @@ every pane's top border carries
 use the accent, while the others stay dim. They are clickable without
 focusing the pane first and do not cover the child terminal's first row.
 
-Drag the sidebar's right border to resize it. The saved width is bounded to
-keep both sidebar and terminal useful: at most 42 cells and never more than
-half the terminal.
+Click either chip in the sidebar's header to switch between the session
+tree and the event stream. The footer's `☰ menu` and `+` buttons stay put
+on both tabs. The two surfaces share one panel, so only one of them is on
+screen at a time.
 
-The filled `+` in the tab strip opens the new-tab dialog. Type a name and use
+Drag the sidebar's right border to resize it, on either tab. The saved
+width is bounded to keep both sidebar and terminal useful: at most 42
+cells and never more than half the terminal. Collapsing the sidebar
+(`Ctrl+B` `b`) hands its columns back to the pane canvas; every collapse
+and reopen re-declares the tmux client size, so all panes reflow. The
+sidebar has no reopen button while it is collapsed — the chord is the way
+back.
+
+The filled `+` in the tab strip opens the new-tab dialog. With a single
+tab the strip is hidden: create the second tab with `prefix+c` or the
+menu's New tab, and the strip appears with the `+`. Type a name and use
 `↵ Create`, or click that action; the tab opens in the focused pane's current
 directory with that name. An empty name uses the next numeric tab name.
 `Esc Cancel` creates nothing. Rename and pane-name dialogs use the same
@@ -154,11 +175,19 @@ Home/End, or the mouse wheel.
 
 Wheel over a pane scrolls its history; new output never pulls a scrolled
 viewport back to the tail. Drag a gutter to resize, drag a tab onto another
-tab to reorder, or onto a workspace row to move it there. Drag workspace rows
+tab to reorder, or onto a workspace row to move it there (a lone tab has
+no chip while its strip is hidden; give the workspace a second tab
+first). Drag workspace rows
 to reorder the sidebar; drag agent rows within one workspace to reorder its
 children. Both sidebar orders persist. Click-drag inside a pane selects text
 and copies it on release; double-click selects a word, and triple-click
 selects a line.
+
+To rearrange panes, drag the `⠿` grip in a pane's bottom-right border
+corner onto another pane; the two swap places and the dropped pane stays
+focused in its new slot. The grip is the only part of the border that
+picks a pane up: clicking anywhere else on the border just focuses the
+pane, and dragging the border between two stacked panes resizes them.
 
 Mouse reporting belongs to the workspace chrome and selection layer in this
 release; mouse-aware programs inside panes do not receive those events.
@@ -173,12 +202,14 @@ owned by another Cyclops component:
 [workspace]
 sidebar_visible = true
 sidebar_width = 28
+sidebar_tab = "sessions"
 workspace_order = ["main", "website"]
 agent_order = ["name:implementer", "name:reviewer"]
 folder_tracked = []
 
 [workspace.bindings]
 name_pane = "prefix m"
+toggle_sidebar = "prefix b"
 show_keybinds = "prefix ?"
 ```
 

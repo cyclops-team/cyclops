@@ -1,0 +1,110 @@
+# Cyclops periwinkle: cool blue-violet pastels on a faintly blue white.
+# The ground is paper with a little sky left in it, the ink a deep indigo,
+# and the accent the flower the theme is named for, mixed at ink strength
+# so it still marks a row rather than tinting it.
+#
+# The role wheel stays on the cool side of the page and reaches out only
+# as far as it must to keep eight agents apart: periwinkle, iris,
+# cornflower, lagoon, sea green, orchid, rose, and one warm gold for the
+# slot that has to disagree with all of them. Every ink was drawn against
+# this ground, not lightened out of a dark palette. Rose is the only role
+# that borders state.terminal's red; it stays lighter and pinker than that
+# crimson, and takes a different 256-color entry, so a name and a state
+# cell never read as the same color.
+#
+# The eye follows the shipped pattern: calm takes surface.dim so a quiet
+# rig recedes, alert takes the periwinkle accent.
+#
+# [state] and [badge] are the four groups at ink strength, redundant with
+# the glyph and the word as everywhere else: healthy a leaf green,
+# needs-you an amber, deliberately the warm end of a cool page, terminal a
+# cool crimson, quiet the dim itself, and dead ABOVE dim, because on paper
+# the lighter cell is the quieter one.
+#
+# [palette] is the sixteen ANSI colors at ink strength: an agent CLI
+# painting in red, green or yellow prints body text on this pane ground,
+# so every slot had to stay legible on a blue-white instead of assuming a
+# dark terminal. Blue is the accent itself, since a program reaching for
+# ANSI blue on this theme should get the theme's own. The gray ladder
+# keeps its order, 0 darkest, then 8, then 7, then 15, tinted blue so it
+# belongs to this page.
+#
+# The chrome grounds step down from the paper deeper into blue: on a light
+# theme the furniture recedes by darkening, and raised is deepened past a
+# mechanical second step so a selected row does not sit flat on the panel.
+#
+# Every 256-color fallback is explicit. Outside [role] and [palette] each
+# is what the cyclops-theme derivation picks. role.3 is the one hand-tune:
+# cornflower and periwinkle both derive to 61, and role color has to stay
+# pairwise distinct. Periwinkle is the nearer of the two and the accent's
+# own ink, so it keeps that entry and cornflower steps to 67, the next
+# nearest and a bluer one. The four state groups were aimed off the role
+# entries as well, for the reason given above. The [palette] fallbacks are
+# the literal ANSI index: the program asked for color N, and terminals
+# remap 0..15 freely.
+
+name = "periwinkle"
+
+[surface]
+fg = { hex = "#272b3f", c256 = 236 }
+bg = { hex = "#f7f8ff", c256 = 231 }
+dim = { hex = "#666d85", c256 = 60 }
+accent = { hex = "#5a5fc2", c256 = 61 }
+
+[role]
+1 = { hex = "#5a5fc2", c256 = 61 }  # periwinkle, the accent
+2 = { hex = "#7b4fb0", c256 = 97 }  # iris
+3 = { hex = "#3a6bb5", c256 = 67 }  # cornflower; hand-tuned off periwinkle
+4 = { hex = "#2c7a86", c256 = 30 }  # lagoon
+5 = { hex = "#2f7a63", c256 = 29 }  # sea green
+6 = { hex = "#a8478c", c256 = 132 } # orchid
+7 = { hex = "#b04763", c256 = 131 } # rose
+8 = { hex = "#8a6a2b", c256 = 94 }  # gold
+
+[eye]
+calm = { hex = "#666d85", c256 = 60 }
+alert = { hex = "#5a5fc2", c256 = 61 }
+
+[state]
+healthy = { hex = "#2a7a2e", c256 = 28 }    # leaf green
+needs_you = { hex = "#9f5a0e", c256 = 130 } # amber
+terminal = { hex = "#a3283a", c256 = 125 }  # cool crimson
+quiet = { hex = "#666d85", c256 = 60 }      # same as surface.dim
+dead = { hex = "#8d93a9", c256 = 103 }      # above dim: lighter is quieter here
+
+[badge]
+healthy = { hex = "#2a7a2e", c256 = 28 }
+needs_you = { hex = "#9f5a0e", c256 = 130 }
+terminal = { hex = "#a3283a", c256 = 125 }
+quiet = { hex = "#666d85", c256 = 60 }
+
+# The ANSI-16 mapping for pane content. 0 is the page's own ink, 4 is the
+# periwinkle accent, and 7, 8 and 15 are the gray ladder from the header.
+# The chromatic slots lean cool the way the roles do: red carries a rose
+# cast, the greens are sea greens, and magenta is pulled toward violet, so
+# an agent's colored output reads as this theme and not as another light
+# theme's palette borrowed. Every slot clears 3.4:1 on the page.
+[palette]
+0 = { hex = "#272b3f", c256 = 0 }
+1 = { hex = "#b0384f", c256 = 1 }
+2 = { hex = "#2e7a5e", c256 = 2 }
+3 = { hex = "#8a6a2b", c256 = 3 }
+4 = { hex = "#5a5fc2", c256 = 4 }
+5 = { hex = "#a8478c", c256 = 5 }
+6 = { hex = "#2c7a86", c256 = 6 }
+7 = { hex = "#787e96", c256 = 7 }
+8 = { hex = "#5b6178", c256 = 8 }
+9 = { hex = "#cf5a63", c256 = 9 }
+10 = { hex = "#3a9478", c256 = 10 }
+11 = { hex = "#96813a", c256 = 11 }
+12 = { hex = "#7a7fd0", c256 = 12 }
+13 = { hex = "#b064c4", c256 = 13 }
+14 = { hex = "#3d92a0", c256 = 14 }
+15 = { hex = "#868ca2", c256 = 15 }
+
+# The chrome grounds, both bluer and darker than the paper: a pale blue
+# for the flat panel, a deeper one for the raised rows.
+[chrome]
+text = { hex = "#272b3f", c256 = 236 }
+panel = { hex = "#e9ebf7", c256 = 255 }
+raised = { hex = "#d7dbf0", c256 = 189 }

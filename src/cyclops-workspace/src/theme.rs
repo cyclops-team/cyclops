@@ -84,7 +84,7 @@ impl Paint {
     }
 
     /// The delivery-badge half of the same grouping `state` resolves for
-    /// agent states. Added for the event panel (E2), which colors a
+    /// agent states. Added for the event stream (E2), which colors a
     /// `Delivery`/`Cleared` row by whichever group its own state or
     /// former state belongs to.
     pub fn delivery(&self, state: cyclops_proto::DeliveryState) -> Style {

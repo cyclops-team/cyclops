@@ -180,7 +180,7 @@ contract).
 |---|---|
 | `website/` | SvelteKit 2 / Svelte 5 static marketing site for usecyclops.dev. Outside Cargo; its own CI job type-checks and builds it, and its hosted installer must match `scripts/install.sh` |
 | `resources/manifests/` | Shipped detection manifests: `agy.toml`, `claude.toml`, `codex.toml`, `cursor.toml`. Compiled into the CLI with `include_str!` and seeded to `$CYCLOPS_HOME/manifests` on first `cyclops start`, never overwritten after |
-| `resources/themes/` | 7 themes: dark, light, catppuccin, gruvbox, nord, tokyo-night, high-contrast |
+| `resources/themes/` | 17 themes: dark, light, high-contrast, catppuccin, gruvbox, nord, tokyo-night, sorbet, meadow, periwinkle, blossom, seafoam, buttercream, midnight, ember, forest, obsidian |
 | `resources/layouts/` | Presets `solo`, `duo`, `quad`, `ops` — each the previous plus a pane |
 | `resources/hooks/` | Vendor hook config templates per CLI (agy, claude, codex, cursor) rendered by `cyclops hooks install` |
 | `demos/` | Seven runnable end-to-end scripts on isolated tmux servers; `tests/e2e/parity-check.sh` is the CI gate that asserts docs and binaries agree |

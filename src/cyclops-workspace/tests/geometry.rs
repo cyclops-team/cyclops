@@ -102,11 +102,18 @@ async fn window_tracks_every_canvas_redeclaration() {
     assert_eq!(rig.window_size("geo").0, 176);
     assert_eq!(rig.pane_widths("geo").iter().sum::<u16>(), 175);
 
-    // Event panel open (40 columns), then closed again.
-    client.set_client_size(136, 47).await.expect("panel open");
-    assert_eq!(rig.window_size("geo"), (136, 47));
-    assert_eq!(rig.pane_widths("geo").iter().sum::<u16>(), 135);
-    client.set_client_size(176, 47).await.expect("panel closed");
+    // Sidebar collapsed: its 22 columns go back to the canvas, then it
+    // reopens and takes them again.
+    client
+        .set_client_size(198, 47)
+        .await
+        .expect("sidebar hidden");
+    assert_eq!(rig.window_size("geo"), (198, 47));
+    assert_eq!(rig.pane_widths("geo").iter().sum::<u16>(), 197);
+    client
+        .set_client_size(176, 47)
+        .await
+        .expect("sidebar shown");
     assert_eq!(rig.window_size("geo"), (176, 47));
 
     // Sidebar dragged to 30 columns.

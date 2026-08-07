@@ -1,0 +1,80 @@
+# Midnight: deep navy, drawn for a room with the lights off. The ground
+# is a near-black that still reads blue, the chrome steps up through two
+# darker navies, and the accent is the ice at the top of that same ramp.
+# The roles open that ramp out: ice, periwinkle, cyan and lilac come
+# straight off the night, and seafoam, moonlight, rose quartz and a
+# deeper sky fill the rest, so eight agents stay tellable apart without
+# any of them leaving it.
+#
+# surface.dim, eye.calm and state.quiet are one blued gray, so a quiet
+# rig recedes into the ground instead of standing on it. state.dead sits
+# below that, and palette.8 takes the same value: ANSI bright black and a
+# pane whose process is gone are the same idea.
+#
+# No hand-tuning. Every fallback is what the cyclops-theme derivation
+# picks, and the eight role slots land on eight distinct entries on their
+# own. The [palette] fallbacks are the literal ANSI index, as in every
+# shipped theme.
+
+name = "midnight"
+
+[surface]
+fg = { hex = "#dfe6f2", c256 = 254 }
+bg = { hex = "#080b14", c256 = 232 } # the pane ground
+dim = { hex = "#7f8ca8", c256 = 103 }
+accent = { hex = "#8fd6ff", c256 = 117 }
+
+[role]
+1 = { hex = "#8fd6ff", c256 = 117 } # ice, the accent
+2 = { hex = "#a9b5f5", c256 = 147 } # periwinkle
+3 = { hex = "#6fd2d8", c256 = 80 }  # cyan
+4 = { hex = "#c49cf2", c256 = 183 } # lilac
+5 = { hex = "#8ad9b0", c256 = 115 } # seafoam
+6 = { hex = "#e0cfa0", c256 = 187 } # moonlight, the one warm slot
+7 = { hex = "#f0a8bd", c256 = 217 } # rose quartz
+8 = { hex = "#5f9fe0", c256 = 74 }  # deep sky
+
+[eye]
+calm = { hex = "#7f8ca8", c256 = 103 }
+alert = { hex = "#8fd6ff", c256 = 117 }
+
+[state]
+healthy = { hex = "#7fd3a0", c256 = 115 }   # cool green
+needs_you = { hex = "#e8c07a", c256 = 180 } # amber
+terminal = { hex = "#ef7f92", c256 = 210 }  # red
+quiet = { hex = "#7f8ca8", c256 = 103 }     # same as surface.dim
+dead = { hex = "#4c5a78", c256 = 60 }       # below dim: the pane is gone
+
+[badge]
+healthy = { hex = "#7fd3a0", c256 = 115 }
+needs_you = { hex = "#e8c07a", c256 = 180 }
+terminal = { hex = "#ef7f92", c256 = 210 }
+quiet = { hex = "#7f8ca8", c256 = 103 }
+
+# The ANSI-16 mapping for pane content: the night set, brights lifted
+# toward white. 1, 2 and 3 are the state colors, so a program's own red,
+# green and yellow read the same as the cells beside them.
+[palette]
+0 = { hex = "#131a2b", c256 = 0 }
+1 = { hex = "#ef7f92", c256 = 1 }
+2 = { hex = "#7fd3a0", c256 = 2 }
+3 = { hex = "#e8c07a", c256 = 3 }
+4 = { hex = "#7fb0ee", c256 = 4 }
+5 = { hex = "#c49cf2", c256 = 5 }
+6 = { hex = "#6fd2d8", c256 = 6 }
+7 = { hex = "#c3cde0", c256 = 7 }
+8 = { hex = "#4c5a78", c256 = 8 }
+9 = { hex = "#f79cab", c256 = 9 }
+10 = { hex = "#9ee2b8", c256 = 10 }
+11 = { hex = "#f0d09a", c256 = 11 }
+12 = { hex = "#a3c6f5", c256 = 12 }
+13 = { hex = "#d2bef7", c256 = 13 }
+14 = { hex = "#97e2e6", c256 = 14 }
+15 = { hex = "#eef3fb", c256 = 15 }
+
+# The workspace chrome's grounds: two navies above the pane ground, so
+# the chrome reads as furniture and the panes read as the work.
+[chrome]
+text = { hex = "#dfe6f2", c256 = 254 }
+panel = { hex = "#111726", c256 = 234 }
+raised = { hex = "#1f2942", c256 = 236 }

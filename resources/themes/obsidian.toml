@@ -1,0 +1,95 @@
+# Obsidian: volcanic glass. A neutral near-black with almost no hue in it,
+# and one cool accent that carries more chroma than anything else in the
+# file. The ground, the dim, the chrome and the gray ladder all sit within
+# a hair of neutral, and nothing outruns the accent, so on this theme a
+# color reaching for you is always the same color. Restraint is the
+# palette, not an absence of one.
+#
+# The eight role slots are where the restraint stops, and they have to be.
+# Role color is one of the two meaning-carrying encodings: an agent is
+# told from another agent by it, and ash that separates only by lightness
+# does not do that job. So the roles take eight hues spread around the
+# wheel at ash strength, alternating a light rung and a dark one so
+# neighbours on the wheel differ in value as well as in hue. No two of
+# them are closer than dE76 22 in CIELAB, and none is closer than that to
+# surface.fg, which is what keeps a name in a slot from reading as
+# ordinary pane text. Held at that chroma they are still tinted ash, and
+# the accent carries more chroma than any of the eight.
+#
+# surface.dim, eye.calm and state.quiet are one neutral gray, and
+# state.dead sits below it. palette.8 takes the same value, so ANSI
+# bright black and a pane whose process is gone read alike.
+#
+# No hand-tuning. Every fallback is what the cyclops-theme derivation
+# picks, and the eight role slots land on eight distinct entries on their
+# own. None of them shares an entry with a state cell or the dim either,
+# so an agent's name and the cell beside it never come out the same color
+# on a 256-color terminal; role.1 shares the accent's entry because it is
+# the accent. The [palette] fallbacks are the literal ANSI index, as in
+# every shipped theme.
+
+name = "obsidian"
+
+[surface]
+fg = { hex = "#e8e8ea", c256 = 254 }
+bg = { hex = "#0a0a0b", c256 = 232 } # the pane ground
+dim = { hex = "#8b8b91", c256 = 245 }
+accent = { hex = "#63c4d8", c256 = 80 }
+
+[role]
+1 = { hex = "#63c4d8", c256 = 80 }  # the accent, the most saturated color here
+2 = { hex = "#84a1c1", c256 = 109 } # slate blue
+3 = { hex = "#d2b9d7", c256 = 182 } # lilac
+4 = { hex = "#b2858f", c256 = 138 } # rose
+5 = { hex = "#e8bcb0", c256 = 181 } # clay
+6 = { hex = "#9d8f73", c256 = 137 } # ochre
+7 = { hex = "#b4c9ad", c256 = 151 } # sage
+8 = { hex = "#6e998e", c256 = 66 }  # verdigris
+
+[eye]
+calm = { hex = "#8b8b91", c256 = 245 }
+alert = { hex = "#63c4d8", c256 = 80 }
+
+[state]
+healthy = { hex = "#93b89a", c256 = 108 }   # green, held down
+needs_you = { hex = "#c2aa82", c256 = 144 } # amber, held down
+terminal = { hex = "#c68a8a", c256 = 174 }  # red, held down
+quiet = { hex = "#8b8b91", c256 = 245 }     # same as surface.dim
+dead = { hex = "#5a5a5f", c256 = 59 }       # below dim: the pane is gone
+
+[badge]
+healthy = { hex = "#93b89a", c256 = 108 }
+needs_you = { hex = "#c2aa82", c256 = 144 }
+terminal = { hex = "#c68a8a", c256 = 174 }
+quiet = { hex = "#8b8b91", c256 = 245 }
+
+# The ANSI-16 mapping for pane content, at the same restraint: every slot
+# still reads as the color the program asked for, none of them shouts.
+# 1, 2 and 3 are the state colors, so a program's own red, green and
+# yellow read the same as the cells beside them; brights are lifted
+# toward white.
+[palette]
+0 = { hex = "#1c1c1f", c256 = 0 }
+1 = { hex = "#c68a8a", c256 = 1 }
+2 = { hex = "#93b89a", c256 = 2 }
+3 = { hex = "#c2aa82", c256 = 3 }
+4 = { hex = "#8aa8c2", c256 = 4 }
+5 = { hex = "#b09ab8", c256 = 5 }
+6 = { hex = "#8ab4bd", c256 = 6 }
+7 = { hex = "#c3c3c8", c256 = 7 }
+8 = { hex = "#5a5a5f", c256 = 8 }
+9 = { hex = "#d6a2a2", c256 = 9 }
+10 = { hex = "#a9cbaf", c256 = 10 }
+11 = { hex = "#d4c19b", c256 = 11 }
+12 = { hex = "#a4c0d6", c256 = 12 }
+13 = { hex = "#c6b2cd", c256 = 13 }
+14 = { hex = "#a3cbd2", c256 = 14 }
+15 = { hex = "#eeeef0", c256 = 15 }
+
+# The workspace chrome's grounds: two steps above the pane ground, as
+# close to neutral as the ground itself, so the chrome reads as furniture
+# and the panes read as the work.
+[chrome]
+text = { hex = "#e8e8ea", c256 = 254 }
+panel = { hex = "#131315", c256 = 233 }
+raised = { hex = "#26262a", c256 = 235 }

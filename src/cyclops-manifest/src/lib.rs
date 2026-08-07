@@ -95,6 +95,12 @@ pub struct AgentMeta {
     /// comm reports the bare version string and "claude" never binds.
     #[serde(default)]
     pub argv_basenames: Vec<String>,
+    /// The command that starts this CLI, for `cyclops start --agents <id>`.
+    /// Nothing in detection reads it: binding a pane is the two lists above.
+    /// Absent means cyclops cannot start this CLI, and `--agents` refuses
+    /// the id rather than guessing at a binary name.
+    #[serde(default)]
+    pub launch: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -702,6 +708,18 @@ verify_pattern = ["<message_id>"]
         assert_eq!(m.agent.argv_basenames, vec!["claude"]);
     }
 
+    #[test]
+    fn launch_parses_and_defaults_to_none() {
+        let m = Manifest::parse(MINI, Path::new("mini.toml")).unwrap();
+        assert_eq!(m.agent.launch, None, "a manifest need not say how to start");
+        let named = MINI.replace(
+            "display_name = \"Claude Code\"",
+            "display_name = \"Claude Code\"\nlaunch = \"claude\"",
+        );
+        let m = Manifest::parse(&named, Path::new("mini.toml")).unwrap();
+        assert_eq!(m.agent.launch.as_deref(), Some("claude"));
+    }
+
     /// The shipped manifests must always parse. They are the product's seed
     /// data (validation campaign drafts plus decline actions).
     #[test]
@@ -714,6 +732,11 @@ verify_pattern = ["<message_id>"]
                 .unwrap_or_else(|| panic!("missing manifest {id}"));
             assert!(!m.rules.is_empty(), "{id}: no rules");
             assert!(m.injection.verify_before_submit, "{id}: verify gate off");
+            // Every shipped CLI can be named to `cyclops start --agents`.
+            // A shipped file without this is a CLI cyclops detects but
+            // cannot start, which reads as a missing manifest to the
+            // operator who typed its id.
+            assert!(m.agent.launch.is_some(), "{id}: no launch command");
         }
         // Claude's title tier: the braille spinner must classify as working.
         let claude = &all["claude"];

@@ -271,6 +271,67 @@ pub fn client_error(e: &ClientError, asked: Option<&str>) -> String {
     }
 }
 
+/// Under a scoped roster's header: the watched sessions the caller is
+/// not in, and the way to see them. Scoping without this line would be
+/// the old "whose roster is this" defect in a new place: sessions
+/// quietly missing instead of sessions quietly mixed in.
+pub fn also_watching(sessions: &[String]) -> String {
+    format!(
+        "also watching {} · cyclops list --all to see every session",
+        sessions.join(", ")
+    )
+}
+
+/// `cyclops update` refuses --json: the bulk of its output is the
+/// installer's own stream, and a JSON wrapper around a build log would be
+/// a shape nothing could rely on.
+pub const UPDATE_NO_JSON: &str =
+    "cyclops update has no --json form: its output is the installer's stream. The machine-readable build is: cyclops --version";
+
+/// Said before an update from a build with edited sources. The freshness
+/// check is skipped rather than faked: no commit can ever match a .dirty
+/// build ref, and "an update exists" would be a guess.
+pub fn update_dirty(build_ref: &str) -> String {
+    format!(
+        "this build is {build_ref}, built from edited sources; no commit can match it, so the freshness check is skipped."
+    )
+}
+
+/// The same skip for a build stamped outside git (a source tarball).
+pub const UPDATE_UNKNOWN: &str =
+    "this build is unknown, built outside git; the freshness check is skipped.";
+
+/// The freshness check could not read the remote, so nothing was fetched
+/// and nothing was changed.
+pub fn update_unreachable(repo: &str, reff: &str, cause: &str) -> String {
+    format!(
+        "can't read {reff} from {repo}: {cause}. Check the network, or point CYCLOPS_REPO/CYCLOPS_REF at a repo and ref that exist."
+    )
+}
+
+/// The clone failed, so there is no source to build and nothing was
+/// changed. Same next step as the installer's own clone failure.
+pub fn update_clone_failed(repo: &str, reff: &str, cause: &str) -> String {
+    format!(
+        "could not clone {repo} at {reff}: {cause}. Check the network, or set CYCLOPS_REF to a branch that exists."
+    )
+}
+
+/// The installer stopped partway. It owns the explanation (it prints what
+/// went wrong and the fix as it dies), so this only points back up.
+/// `cause` is set when the installer could not be started at all.
+pub fn update_install_failed(cause: Option<&str>) -> String {
+    match cause {
+        Some(c) => format!("could not run the installer: {c}."),
+        None => "the installer did not finish; its output above says how far it got.".to_string(),
+    }
+}
+
+/// The update installed, and the new binary could not be found to answer
+/// for itself. The installer's own report is the fallback authority.
+pub const UPDATE_UNRESOLVED: &str =
+    "can't find the new cyclops on PATH to report its build; the installer's report above names it.";
+
 /// Said after a switch no daemon confirmed. The config is written either
 /// way, so this is a "when", not a "but".
 pub const THEME_NEXT_COMMAND: &str = "the next command picks it up";
@@ -555,6 +616,53 @@ mod tests {
         assert_eq!(
             wait_timeout("reviewer", "idle", Duration::from_secs(5), None),
             "reviewer didn't reach idle within 5 seconds. Give it more time with --timeout, or look in with cyclops status."
+        );
+    }
+
+    /// The note under a scoped roster has both halves or it is useless:
+    /// what was elided, and the command that shows it anyway.
+    #[test]
+    fn scoped_roster_note_names_the_sessions_and_the_way_out() {
+        assert_eq!(
+            also_watching(&["ops".into()]),
+            "also watching ops · cyclops list --all to see every session"
+        );
+        assert_eq!(
+            also_watching(&["ops".into(), "dev".into()]),
+            "also watching ops, dev · cyclops list --all to see every session"
+        );
+    }
+
+    /// Update's skip notes must be honest about WHY there is no check,
+    /// and its failure copy must name where the answer is: the repo, the
+    /// ref, or the installer's own stream.
+    #[test]
+    fn update_copy_names_the_cause_and_the_next_step() {
+        assert_eq!(
+            update_dirty("e610afc.dirty"),
+            "this build is e610afc.dirty, built from edited sources; no commit can match it, so the freshness check is skipped."
+        );
+        assert_eq!(
+            update_unreachable("https://x.example/r.git", "main", "no route"),
+            "can't read main from https://x.example/r.git: no route. Check the network, or point CYCLOPS_REPO/CYCLOPS_REF at a repo and ref that exist."
+        );
+        assert_eq!(
+            update_clone_failed("https://x.example/r.git", "nope", "not found"),
+            "could not clone https://x.example/r.git at nope: not found. Check the network, or set CYCLOPS_REF to a branch that exists."
+        );
+        assert_eq!(
+            update_install_failed(None),
+            "the installer did not finish; its output above says how far it got."
+        );
+        assert_eq!(
+            update_install_failed(Some("sh: not found")),
+            "could not run the installer: sh: not found."
+        );
+        // The refusal points at the machine-readable alternative, and the
+        // no-json sentence must not read as an error in the update itself.
+        assert!(
+            UPDATE_NO_JSON.contains("cyclops --version"),
+            "{UPDATE_NO_JSON}"
         );
     }
 

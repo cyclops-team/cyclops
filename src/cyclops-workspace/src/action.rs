@@ -46,7 +46,7 @@
 //! | Divider drag motion (coalesced per render deadline) | [`resolve_pane_resize`] |
 //! | Drag released without crossing the reorder threshold | [`route_drag_click`] |
 //! | Tab drag released onto another hit target | [`resolve_tab_drop`] |
-//! | Pane-frame drag released onto another pane | [`resolve_pane_drop`] |
+//! | Pane-grip drag released onto another pane | [`resolve_pane_drop`] |
 //! | Sidebar-agent drag released onto another row | [`resolve_agent_drop`] |
 //!
 //! Workspace-row drag release is the one exception to "every device routes
@@ -249,7 +249,19 @@ pub enum Action {
     },
 
     // -- App --
+    /// Collapse or reopen the sidebar. Visibility persists, so a
+    /// workspace quit while collapsed reopens collapsed.
+    ToggleSidebar,
+    /// Show the event stream: open the sidebar on its Stream tab. When
+    /// the stream is already what's showing, hide the sidebar instead —
+    /// the same "toggle the stream surface off, canvas back" meaning the
+    /// old right-hand slide-out gave this action its name for.
     ToggleEventPanel,
+    /// Select one of the sidebar's tabs (Sessions or Stream). The choice
+    /// persists like the sidebar's width and visibility.
+    SelectSidebarTab {
+        tab: crate::persist::SidebarTab,
+    },
     ShowKeybinds,
     /// Open the theme picker. Carries no target: the listing is read from
     /// the themes directory at execution time, so a file added or removed
@@ -381,6 +393,7 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
         BindingAction::CloseWorkspace => Some(Action::RequestCloseWorkspace {
             session: ctx.session.to_string(),
         }),
+        BindingAction::ToggleSidebar => Some(Action::ToggleSidebar),
         BindingAction::ToggleEventPanel => Some(Action::ToggleEventPanel),
         BindingAction::ShowKeybinds => Some(Action::ShowKeybinds),
         BindingAction::ShowThemes => Some(Action::ShowThemes),
@@ -564,7 +577,7 @@ fn non_empty(buffer: &str) -> Option<String> {
 /// Route an immediate mouse click (no drag involved) on a painted hit
 /// target. `HitTarget::MenuItem` is absent on purpose — see the module
 /// docs. Every other hit target that starts a drag on `Down` (pane
-/// frames, tabs, sidebar rows, sidebar agents, dividers, the sidebar
+/// grips, tabs, sidebar rows, sidebar agents, dividers, the sidebar
 /// splitter) resolves no action here; its click-without-drag fallback is
 /// [`route_drag_click`], and its drag-release commit is
 /// [`resolve_tab_drop`], [`resolve_pane_drop`],
@@ -572,12 +585,12 @@ fn non_empty(buffer: &str) -> Option<String> {
 pub fn route_mouse_click(target: &HitTarget, button: MouseButton) -> Option<Action> {
     match (target, button) {
         (
-            HitTarget::PaneBody { pane_id },
+            HitTarget::PaneBody { pane_id } | HitTarget::PaneFrame { pane_id },
             MouseButton::Left | MouseButton::Right,
         )
-        // Left-down on a frame starts a swap drag instead; only the
+        // Left-down on the grip starts a swap drag instead; only the
         // right-click (which never drags) focuses immediately.
-        | (HitTarget::PaneFrame { pane_id }, MouseButton::Right) => Some(Action::FocusPane {
+        | (HitTarget::PaneGrip { pane_id }, MouseButton::Right) => Some(Action::FocusPane {
             pane_id: pane_id.clone(),
         }),
         (HitTarget::PaneSplitRight { pane_id }, MouseButton::Left) => Some(Action::Split {
@@ -589,6 +602,9 @@ pub fn route_mouse_click(target: &HitTarget, button: MouseButton) -> Option<Acti
             direction: SplitDirection::Vertical,
         }),
         (HitTarget::NewTabButton, MouseButton::Left) => Some(Action::RequestNewTab),
+        (HitTarget::SidebarTab { tab }, MouseButton::Left) => {
+            Some(Action::SelectSidebarTab { tab: *tab })
+        }
         (HitTarget::NewWorkspaceButton, MouseButton::Left) => Some(Action::NewWorkspace),
         (HitTarget::AttentionIndicator { pane_id }, MouseButton::Left) => Some(Action::FocusPane {
             pane_id: pane_id.clone(),
@@ -681,11 +697,13 @@ pub fn resolve_tab_drop(window_id: &str, drop: &HitTarget) -> Option<Action> {
 }
 
 /// Resolve a pane drag released on another pane: dropping on a different
-/// pane's body or frame swaps the two. Dropping a pane on itself, or on
-/// anything that is not a pane, resolves nothing.
+/// pane's body, frame, or grip swaps the two. Dropping a pane on itself,
+/// or on anything that is not a pane, resolves nothing.
 pub fn resolve_pane_drop(pane_id: &str, drop: &HitTarget) -> Option<Action> {
     match drop {
-        HitTarget::PaneBody { pane_id: dst } | HitTarget::PaneFrame { pane_id: dst }
+        HitTarget::PaneBody { pane_id: dst }
+        | HitTarget::PaneFrame { pane_id: dst }
+        | HitTarget::PaneGrip { pane_id: dst }
             if dst != pane_id =>
         {
             Some(Action::SwapPanes {
@@ -836,6 +854,66 @@ mod tests {
             workspaces,
             active_workspace,
         }
+    }
+
+    // -- Sidebar toggles and tabs: chords, the app menu, and the tab
+    // header's chips all resolve into the one vocabulary. --
+
+    /// The old panel chord and menu item still resolve to
+    /// [`Action::ToggleEventPanel`] — whose meaning is now "the sidebar,
+    /// on the Stream tab" — and the new collapse chord resolves beside
+    /// it, from keyboard and app menu alike.
+    #[test]
+    fn sidebar_toggles_route_from_keyboard_and_app_menu() {
+        let tabs = [tab("@1")];
+        let workspaces = [workspace("$1", "main")];
+        let c = ctx(&tabs, 0, "%3", "main", &workspaces, 0);
+
+        assert_eq!(
+            route_binding(BindingAction::ToggleSidebar, &c),
+            Some(Action::ToggleSidebar)
+        );
+        assert_eq!(
+            route_menu_item(&MenuState::AppMenu, BindingAction::ToggleSidebar, &c),
+            Some(Action::ToggleSidebar)
+        );
+        assert_eq!(
+            route_binding(BindingAction::ToggleEventPanel, &c),
+            Some(Action::ToggleEventPanel)
+        );
+        assert_eq!(
+            route_menu_item(&MenuState::AppMenu, BindingAction::ToggleEventPanel, &c),
+            Some(Action::ToggleEventPanel)
+        );
+    }
+
+    /// A click on a header chip selects that tab; the header answers no
+    /// other button, so a right-click there opens nothing by accident.
+    #[test]
+    fn a_sidebar_tab_click_selects_that_tab() {
+        use crate::persist::SidebarTab;
+
+        let stream = HitTarget::SidebarTab {
+            tab: SidebarTab::Stream,
+        };
+        assert_eq!(
+            route_mouse_click(&stream, MouseButton::Left),
+            Some(Action::SelectSidebarTab {
+                tab: SidebarTab::Stream
+            })
+        );
+        assert_eq!(
+            route_mouse_click(
+                &HitTarget::SidebarTab {
+                    tab: SidebarTab::Sessions
+                },
+                MouseButton::Left
+            ),
+            Some(Action::SelectSidebarTab {
+                tab: SidebarTab::Sessions
+            })
+        );
+        assert_eq!(route_mouse_click(&stream, MouseButton::Right), None);
     }
 
     // -- Cross-device equivalence: the same logical operation must resolve
@@ -1471,7 +1549,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_pane_drop_onto_another_panes_body_or_frame_swaps() {
+    fn resolve_pane_drop_onto_another_panes_body_frame_or_grip_swaps() {
         let expected = Some(Action::SwapPanes {
             pane_id: "%1".into(),
             other_pane_id: "%2".into(),
@@ -1494,6 +1572,44 @@ mod tests {
             ),
             expected
         );
+        // The drop target's own grip cell is part of its frame corner; a
+        // release there must swap like any other frame cell always did.
+        assert_eq!(
+            resolve_pane_drop(
+                "%1",
+                &HitTarget::PaneGrip {
+                    pane_id: "%2".into()
+                }
+            ),
+            expected
+        );
+    }
+
+    /// The frame focuses on either button now that the swap pickup lives
+    /// on the grip; the grip itself resolves no click on left-down, since
+    /// that down starts the swap drag and its below-threshold fallback is
+    /// [`route_drag_click`]'s focus.
+    #[test]
+    fn a_frame_click_focuses_and_the_grip_left_down_resolves_nothing() {
+        let frame = HitTarget::PaneFrame {
+            pane_id: "%5".into(),
+        };
+        let grip = HitTarget::PaneGrip {
+            pane_id: "%5".into(),
+        };
+        let expected = Some(Action::FocusPane {
+            pane_id: "%5".into(),
+        });
+        assert_eq!(route_mouse_click(&frame, MouseButton::Left), expected);
+        assert_eq!(route_mouse_click(&frame, MouseButton::Right), expected);
+        assert_eq!(route_mouse_click(&grip, MouseButton::Right), expected);
+        assert_eq!(route_mouse_click(&grip, MouseButton::Left), None);
+        assert_eq!(
+            route_drag_click(&DragTarget::Pane {
+                pane_id: "%5".into()
+            }),
+            expected
+        );
     }
 
     #[test]
@@ -1511,6 +1627,16 @@ mod tests {
             resolve_pane_drop(
                 "%1",
                 &HitTarget::PaneFrame {
+                    pane_id: "%1".into()
+                }
+            ),
+            None
+        );
+        // A zoomed pane's grip has nowhere to go: a self-drop is inert.
+        assert_eq!(
+            resolve_pane_drop(
+                "%1",
+                &HitTarget::PaneGrip {
                     pane_id: "%1".into()
                 }
             ),

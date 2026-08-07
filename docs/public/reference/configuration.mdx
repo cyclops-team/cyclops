@@ -26,6 +26,7 @@ gate_hold_notify_ms = 120000
 [workspace]
 sidebar_visible = true
 sidebar_width = 22
+sidebar_tab = "sessions"
 workspace_order = ["main"]
 agent_order = ["name:implementer", "name:reviewer"]
 folder_tracked = []
@@ -45,7 +46,8 @@ folder_tracked = []
 | Delivery timing keys | ACK, retry, receipt, and held-delivery notification settings shown above. |
 
 The full-screen workspace maintains `[workspace]` preferences, including
-sidebar visibility/width and the persisted workspace and agent order. It
+the sidebar's visibility, width, and selected tab (`"sessions"` or
+`"stream"`), plus the persisted workspace and agent order. It
 also records which workspaces follow their active pane's folder in
 `folder_tracked`, and preserves unknown keys when it writes preferences.
 

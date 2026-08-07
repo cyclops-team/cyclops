@@ -1,0 +1,81 @@
+# Ember: a fire an hour after it stopped being a fire. The ground is a
+# warm near-black with the red still in it, the chrome steps up through
+# charcoal into scorched brown, and the accent is the orange of a coal
+# somebody just breathed on. The roles run the heat down from that coal
+# through amber, rust, scorched olive, ash rose and driftwood, then
+# verdigris and smolder violet at the cold end, so eight agents stay
+# tellable apart without the palette going cool on the whole.
+#
+# surface.dim, eye.calm and state.quiet are one value, the gray that ash
+# actually is: brown, not neutral. state.dead sits below it, and
+# palette.8 takes the same value, so ANSI bright black and a pane whose
+# process is gone read alike.
+#
+# No hand-tuning. Every fallback is what the cyclops-theme derivation
+# picks, and the eight role slots land on eight distinct entries on their
+# own. The [palette] fallbacks are the literal ANSI index, as in every
+# shipped theme.
+
+name = "ember"
+
+[surface]
+fg = { hex = "#f2e7db", c256 = 254 }
+bg = { hex = "#14100d", c256 = 233 } # the pane ground
+dim = { hex = "#a08b78", c256 = 138 }
+accent = { hex = "#ff9d4d", c256 = 215 }
+
+[role]
+1 = { hex = "#ff9d4d", c256 = 215 } # ember, the accent
+2 = { hex = "#e8c46a", c256 = 185 } # amber
+3 = { hex = "#dc7a5c", c256 = 173 } # rust
+4 = { hex = "#b9c47a", c256 = 150 } # scorched olive
+5 = { hex = "#eb9aa6", c256 = 175 } # ash rose
+6 = { hex = "#cfa98c", c256 = 180 } # driftwood
+7 = { hex = "#93c4b4", c256 = 115 } # verdigris, copper left out too long
+8 = { hex = "#bf94cc", c256 = 140 } # smolder violet, the top of the flame
+
+[eye]
+calm = { hex = "#a08b78", c256 = 138 }
+alert = { hex = "#ff9d4d", c256 = 215 }
+
+[state]
+healthy = { hex = "#9fc47f", c256 = 150 }   # warm green
+needs_you = { hex = "#f0b95e", c256 = 215 } # amber
+terminal = { hex = "#f2635e", c256 = 203 }  # red, the hottest thing here
+quiet = { hex = "#a08b78", c256 = 138 }     # same as surface.dim
+dead = { hex = "#6d5a4a", c256 = 240 }      # below dim: the pane is gone
+
+[badge]
+healthy = { hex = "#9fc47f", c256 = 150 }
+needs_you = { hex = "#f0b95e", c256 = 215 }
+terminal = { hex = "#f2635e", c256 = 203 }
+quiet = { hex = "#a08b78", c256 = 138 }
+
+# The ANSI-16 mapping for pane content: the warm set, brights lifted
+# toward white. 1, 2 and 3 are the state colors, so a program's own red,
+# green and yellow read the same as the cells beside them.
+[palette]
+0 = { hex = "#2b211a", c256 = 0 }
+1 = { hex = "#f2635e", c256 = 1 }
+2 = { hex = "#9fc47f", c256 = 2 }
+3 = { hex = "#f0b95e", c256 = 3 }
+4 = { hex = "#7fb0c4", c256 = 4 }
+5 = { hex = "#bf94cc", c256 = 5 }
+6 = { hex = "#93c4b4", c256 = 6 }
+7 = { hex = "#d8c8b6", c256 = 7 }
+8 = { hex = "#6d5a4a", c256 = 8 }
+9 = { hex = "#f78d86", c256 = 9 }
+10 = { hex = "#b8d698", c256 = 10 }
+11 = { hex = "#f7cd8b", c256 = 11 }
+12 = { hex = "#9cc6d8", c256 = 12 }
+13 = { hex = "#d3aede", c256 = 13 }
+14 = { hex = "#aed8c9", c256 = 14 }
+15 = { hex = "#f7ede2", c256 = 15 }
+
+# The workspace chrome's grounds: charcoal, then the brown a log goes
+# once the flame is off it. Both above the pane ground, so the chrome
+# reads as furniture and the panes read as the work.
+[chrome]
+text = { hex = "#f2e7db", c256 = 254 }
+panel = { hex = "#201a14", c256 = 234 }
+raised = { hex = "#3c2f23", c256 = 236 }

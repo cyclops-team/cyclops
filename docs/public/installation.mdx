@@ -53,8 +53,16 @@ shell or run the reload command it printed.
 
 ## Update
 
-Run the install command again. The binaries are rebuilt and replaced; your
-configuration, manifests, workspaces, and ledger remain under `~/.cyclops`.
+```bash
+cyclops update
+```
+
+It names the build you are running, asks the source whether anything is
+newer (already current stops right there), reruns the installer from a
+fresh clone, and reports old build to new plus the three restart steps.
+Your configuration, manifests, workspaces, and ledger remain under
+`~/.cyclops`. Running the install command again does the same rebuild
+without the freshness check.
 
 ## Uninstall
 
