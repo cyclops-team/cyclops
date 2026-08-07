@@ -1,11 +1,19 @@
 # Nord, mapped onto the cyclops vocabulary. Palette: the Nord project
 # (MIT). Snow Storm carries the surface, Frost the accent and the cool
-# roles, Aurora the states and the warm roles.
+# roles, Aurora the states and the warm roles. Among the semantic roles
+# one hand-tune leaves the published palette (the ANSI brights note
+# their own lifts under [palette]): nord3 as surface.dim measured
+# 1.36:1 on the chrome panel (the sidebar and menu-button ground),
+# under the workspace's 3:1
+# readability floor, and Nord has no step between Polar Night and Snow
+# Storm that clears it. Dim sits between them instead: 3.22:1 on the
+# panel, 4.00:1 on the pane ground. eye.calm, state.quiet and
+# badge.quiet keep nord3, so quiet marks stay Nord's own comment color.
 name = "nord"
 [surface]
 fg = { hex = "#d8dee9", c256 = 253 }
 bg = { hex = "#2e3440", c256 = 237 } # nord0, the pane ground
-dim = { hex = "#4c566a", c256 = 240 }
+dim = { hex = "#8892a8", c256 = 103 } # hand-tuned off nord3; see header
 accent = { hex = "#88c0d0", c256 = 110 }
 [role]
 1 = { hex = "#88c0d0", c256 = 110 } # frost, the accent

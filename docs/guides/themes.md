@@ -171,7 +171,10 @@ gone, and there is nothing to do about one. Both exceptions measure
 so they are not held to the figure floor. The chrome bar, measured by
 the same test, is that `chrome.text` stays readable on both grounds at
 the theme's floor, and that the grounds stay different in truecolor and
-256-color terminals.
+256-color terminals. Chrome's dimmed ink has its own bar: `surface.dim`
+on `chrome.panel` (the sidebar, the menu button, inactive tabs) clears
+3:1 in every shipped theme, the same `MIN_CONTRAST` floor the workspace
+holds pane cells to.
 
 `palette.*` has no bar at all: palette entries are content colors the
 running program picks, so the theme only supplies the mapping

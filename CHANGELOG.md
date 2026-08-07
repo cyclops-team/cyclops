@@ -5,6 +5,15 @@ versions are unreleased until admin cuts a tag.
 
 ## [Unreleased]
 
+### Fixed (v4)
+
+- nord and tokyo-night lift `surface.dim` to clear the 3:1 readability
+  floor on the chrome panel (the menu button, sidebar rows, inactive
+  tabs): nord's dim leaves the published palette (#8892a8, annotated in
+  the file header), tokyo-night's moves to its own dark5 (#737aa2). A
+  new shipped-theme test measures the pair in every theme, so it can
+  never ship unmeasured again.
+
 ### Added
 
 - Themes own the pane ground. The workspace paints `surface.fg` on

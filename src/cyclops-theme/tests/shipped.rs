@@ -270,6 +270,30 @@ fn shipped_themes_meet_their_stated_contrast() {
     }
 }
 
+/// The chrome's secondary ink is `surface.dim` on `chrome.panel`: the
+/// sidebar rows, the menu button, inactive tab labels. The claims above
+/// measure only the three base themes, and their chrome check measures
+/// `chrome.text`, so this pair shipped unmeasured and two branded themes
+/// shipped it unreadable (nord 1.36:1, tokyo-night 2.35:1). The bar is
+/// the workspace's own readability floor, `MIN_CONTRAST` = 3.0 in
+/// `src/cyclops-workspace/src/render/mod.rs`; the render clamp applies
+/// it to pane cells only and trusts chrome to the theme's own figures,
+/// so the figures are what get measured.
+#[test]
+fn shipped_dim_stays_readable_on_the_chrome_panel() {
+    for name in SHIPPED {
+        let theme = shipped(name);
+        let dim = theme.resolve(tokens::SURFACE_DIM).rgb;
+        let panel = theme.resolve(tokens::CHROME_PANEL).rgb;
+        let ratio = contrast(dim, panel);
+        assert!(
+            ratio >= 3.0,
+            "{name}: surface.dim {dim:?} on chrome.panel {panel:?} measures \
+             {ratio:.2}:1, under the workspace's 3:1 readability floor"
+        );
+    }
+}
+
 /// A contrast bar as the theme headers and docs/guides/themes.md write it: whole
 /// numbers bare ("7:1"), everything else to one decimal ("2.8:1").
 fn bar_words(bar: f64) -> String {
