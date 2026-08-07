@@ -371,9 +371,15 @@ async fn watch_loop(
                 Some(ack) => {
                     let res = reconcile(&mut ctx).await;
                     let disconnected = matches!(res, Err(TmuxError::Disconnected));
+                    let failed = res.is_err();
                     let _ = ack.send(res);
                     deadline = None;
-                    if disconnected {
+                    // A non-Disconnected failure here may be the session
+                    // itself having been destroyed out from under a client
+                    // tmux switched to a survivor instead of dropping (see
+                    // the hint-deadline arm below); the probe is what tells
+                    // the two apart.
+                    if disconnected || (failed && session_gone(&ctx.client, &ctx.session).await) {
                         let _ = ctx.events.send(PaneEvent::Disconnected);
                         break;
                     }
@@ -390,7 +396,19 @@ async fn watch_loop(
                         let _ = ctx.events.send(PaneEvent::Disconnected);
                         break;
                     }
-                    Err(e) => warn!(error = %e, "hint-driven reconcile failed"),
+                    Err(e) => {
+                        // Killing the watched session does not always
+                        // disconnect this client: tmux can switch it to a
+                        // surviving session instead of detaching it, and
+                        // every reconcile against the dead name then fails
+                        // the same way forever without this probe ever
+                        // telling the loop to stop.
+                        if session_gone(&ctx.client, &ctx.session).await {
+                            let _ = ctx.events.send(PaneEvent::Disconnected);
+                            break;
+                        }
+                        warn!(error = %e, "hint-driven reconcile failed");
+                    }
                 }
             }
         }
@@ -553,6 +571,29 @@ fn apply_sub_value(ctx: &mut LoopCtx, pane: &str, value: &str) -> Action {
         row,
     });
     Action::None
+}
+
+/// Whether `session` is gone for good, as far as a reconcile failure can be
+/// blamed on it.
+///
+/// A reconcile error that is not [`TmuxError::Disconnected`] is ambiguous by
+/// itself: it may be the session having been destroyed, or something
+/// unrelated and transient. `has-session` resolves it — a `%error` reply
+/// means tmux no longer has a session by that name, which reconcile's own
+/// `list-panes` cannot distinguish from any other command failure. The probe
+/// finding the connection itself gone is folded in here too, so the caller
+/// has one question to ask instead of two. Anything else (the session still
+/// exists, or the probe failed for an unrelated reason such as a timeout) is
+/// not proof of anything and must not tear the watcher down on a guess.
+async fn session_gone(client: &ControlClient, session: &str) -> bool {
+    match client
+        .command(&format!("has-session -t {}", quote_arg(session)))
+        .await
+    {
+        Ok(_) => false,
+        Err(TmuxError::Disconnected) | Err(TmuxError::Command(_)) => true,
+        Err(_) => false,
+    }
 }
 
 /// Query authoritative state and fold it into the table: diff, emit events,
