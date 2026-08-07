@@ -30,6 +30,19 @@ watched session, fuses state, delivers messages, and writes the ledger.
 workspace. Subcommands such as `cyclops status`, `cyclops send`, and
 `cyclops watch` talk to the daemon over a Unix socket.
 
+## Talking to your agents
+
+Day to day, you don't type `cyclops` subcommands at your agents — you talk
+to them the way you'd talk to a teammate: "send this to reviewer and ask
+for a review." An agent that knows the verbs turns that into a handoff
+through the `cyclops` CLI itself, and the workspace shows the receipt.
+
+That "knows the verbs" part is a manual step today: the repo ships an agent
+skill at `skills/cyclops/SKILL.md` that teaches an agent the `cyclops`
+verbs, but nothing installs it for you. Copy it to wherever your agent
+reads instructions from — for Claude Code, that's
+`~/.claude/skills/cyclops/SKILL.md`.
+
 ## Next steps
 
 - [Install Cyclops](/installation)

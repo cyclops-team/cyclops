@@ -15,12 +15,34 @@ adds a PATH block, open a new shell or run the reload command it prints.
 ## 2. Open the default workspace
 
 ```bash
-cyclops start
+cyclops
 ```
 
-The first run creates a `main` tmux session from the one-pane `solo` preset,
-starts `cyclopsd`, and writes the initial config, themes, and detection
-manifests.
+A bare `cyclops` opens the full-screen workspace, starting a `main` tmux
+session, `cyclopsd`, and the shipped themes if none of those exist yet. A
+first run opens with one empty shell pane; no preset is applied, and no
+detection manifests are written — those come from `cyclops start` (see
+below) or the installer.
+
+From here, start the coding agents you already use in the workspace's
+panes and talk to them the way you'd talk to a teammate — "send this to
+reviewer and ask for a review." The agent carries out the handoff through
+the `cyclops` CLI underneath, and the workspace shows the receipt. Steps 3
+through 6 below walk that same CLI layer command by command — useful when
+you want to drive a handoff yourself or see exactly what an agent's
+request produced. They assume the named `implementer` pane that the
+preset-built workspace below creates.
+
+**Want that named-pane layout from the start, or a specific arrangement
+for scripting or CI?** `cyclops start` is the preset-based constructor. Run
+it alone for the same one-pane `solo` layout the rest of this walkthrough
+uses, or pass `--preset` for a different shipped arrangement, such as
+`duo` for a named `reviewer` pane alongside `implementer`:
+
+```bash
+cyclops start
+cyclops start --preset duo
+```
 
 ## 3. Start an agent
 

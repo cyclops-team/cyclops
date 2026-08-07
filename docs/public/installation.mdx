@@ -44,12 +44,12 @@ curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --prefix "$HOME/bin"
 
 ```bash
 cyclops --version
-cyclops start
+cyclops
 ```
 
-`cyclops start` opens the default workspace and starts the daemon when one is
-not already running. If the installer added a PATH block, first open a new
-shell or run the reload command it printed.
+A bare `cyclops` opens the full-screen workspace, starting a tmux session
+and the daemon when neither is already running. If the installer added a
+PATH block, first open a new shell or run the reload command it printed.
 
 ## Update
 
