@@ -72,7 +72,7 @@ the line printed and no edit.
 
 `--no-path` skips all of it and prints the line for you to add yourself.
 
-### Uninstall
+### Taking it back off
 
 ```bash
 curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
