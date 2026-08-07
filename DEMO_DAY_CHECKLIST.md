@@ -1,5 +1,212 @@
 # Cyclops Demo Day Public-Readiness Checklist
 
+## Execution policy and timebox
+
+This checklist is being executed under a hard **2.5-hour / 150-minute wall-clock timebox**.
+
+The objective is **not to complete 100% of checklist items**. The objective is to produce the strongest safe, understandable, installable, and demoable public Cyclops release possible within 150 minutes.
+
+Prioritize by Demo Day impact, not checklist order.
+
+### Role of the parent agent
+
+The parent agent is the lead engineer/coordinator, not the default implementer.
+
+Keep high-value reasoning in the parent agent:
+
+- understand the checklist and repository architecture
+- determine critical path and ordering
+- make cross-cutting product/UX decisions
+- enforce the already-decided Cyclops positioning
+- identify dependencies and conflicts
+- review all delegated changes
+- run final integration and verification
+- handle human checkpoints
+- decide whether the final combined state is safe to freeze
+
+### Delegation
+
+Delegate implementation aggressively to cheaper subagents when work can be cleanly scoped and independently verified.
+
+Good delegation targets include:
+
+- documentation audits
+- scoped README/docs edits
+- website/docs consistency checks
+- internal-material inventory
+- secret/privacy audit
+- community files
+- link/path checks
+- installer audit
+- isolated cleanup
+
+Each delegated task should include:
+
+- narrow scope
+- explicit files or ownership boundaries where possible
+- acceptance criteria
+- relevant repository context
+- instruction not to modify unrelated files
+
+Do not delegate the entire checklist to one subagent.
+
+Parallelize independent tasks where safe.
+
+Do not assign multiple subagents to edit the same files simultaneously.
+
+Keep these primarily with the parent agent:
+
+- final product/UX judgment
+- final cross-repo consistency review
+- verification semantics
+- conflict resolution
+- integration of concurrent branches
+- release/freeze decisions
+
+After delegated work returns, the parent must:
+
+1. inspect the diff
+2. verify it against current code and this checklist
+3. fix it or send it back if necessary
+4. run relevant targeted checks
+
+Never accept a subagent's claim that something works without verification.
+
+### Priority levels
+
+#### P0 — must finish before Demo Day
+
+Anything that can make a visitor fail to install, launch, understand, or see the core product:
+
+- public clean install
+- bare `cyclops` launch
+- README first-run clarity
+- natural-language / Cyclops skill onboarding
+- Quickstart teaching the intended workflow
+- docs matching actual behavior
+- planned demo agents working
+- real agent-to-agent handoff
+- natural-language handoff where supported
+- accurate verified vs unverified delivery semantics
+- launch-blocking bugs
+- actual secrets/private-information blockers
+- license correctness
+- required gates on the final candidate
+
+#### P1 — do if time remains
+
+High-value public readiness that must not jeopardize P0:
+
+- `SECURITY.md`
+- issue forms
+- PR template
+- critical link/path cleanup
+- competitor/internal docs cleanup
+- GitHub metadata recommendations
+- release/tag preparation
+- branch-protection preparation
+- private vulnerability reporting
+
+#### P2 — defer unless trivial
+
+- analytics improvements
+- new install-request tracking
+- social-preview polish
+- exhaustive advanced documentation
+- nonessential cleanup
+- aesthetic refactors
+- governance polish
+- new telemetry
+- unrelated optimization
+- anything explicitly deferred elsewhere in this checklist
+
+Never spend significant time on P1/P2 while a P0 item remains unresolved.
+
+### Wall-clock plan
+
+Use elapsed wall-clock time, not checklist completion percentage.
+
+#### T+0–10 minutes
+
+- inspect repository state and authoritative instructions
+- triage checklist
+- identify P0 critical path
+- delegate independent tasks
+- immediately begin install / launch / demo-path verification
+
+#### T+10–70 minutes
+
+Focus overwhelmingly on P0:
+
+- fix install/launch issues
+- README
+- Quickstart
+- natural-language onboarding
+- Cyclops skill/setup clarity
+- demo handoff behavior
+- review delegated changes as they return
+
+#### T+70–105 minutes
+
+- integrate P0 changes
+- run targeted tests
+- fix P0 failures
+- allow high-value P1 work in parallel only if P0 is healthy
+
+#### T+105–130 minutes
+
+Build the release candidate:
+
+- clean-install smoke test
+- natural-language handoff smoke test
+- live-demo smoke test
+- broader required gates
+- README/docs/site consistency review
+
+#### T+130–140 minutes
+
+Concurrent bug-fix integration window.
+
+Do not guess which active branches should be included.
+
+Ask the human which completed branches/PRs are approved.
+
+Integrate only approved work and run affected tests.
+
+If those branches are not ready, do not wait indefinitely for them.
+
+#### T+140–150 minutes
+
+No new non-blocking work.
+
+Only:
+
+- resolve actual Demo Day blockers
+- run highest-value final checks
+- review final diff
+- produce final report
+- establish freeze candidate
+
+The human needs the remaining ~30 minutes before the event for physical setup and rehearsal.
+
+### Deadline behavior
+
+If work threatens the 150-minute deadline:
+
+- reduce scope
+- explicitly defer noncritical work
+- prioritize correctness over completeness
+- prioritize:
+
+  `install → cyclops → agents → natural-language coordination → handoff → visible receipt`
+
+- do not allow one difficult P1/P2 task to consume the remaining window
+- do not delay freeze merely to make the checklist appear complete
+
+At the end of the timebox, report incomplete work rather than continuing indefinitely.
+
+---
+
 ## Goal
 
 Prepare Cyclops for real public users arriving from Demo Day, GitHub, usecyclops.dev, or the public installer.
