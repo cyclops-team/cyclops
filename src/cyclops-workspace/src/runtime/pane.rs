@@ -517,6 +517,8 @@ mod tests {
             cursor_x: 6,
             cursor_y: 0,
             alternate_on: false,
+            mouse_on: false,
+            mouse_sgr: false,
         });
 
         assert!(rt.at_tail(), "a rehydrated pane lands at the live tail");
@@ -539,6 +541,8 @@ mod tests {
             cursor_x: 6,
             cursor_y: 0,
             alternate_on: false,
+            mouse_on: false,
+            mouse_sgr: false,
         };
         let mut rt = PaneRuntime::new(8, 2);
         rt.feed(b"one\r\ntwo\r\nthree\r\nfour");
