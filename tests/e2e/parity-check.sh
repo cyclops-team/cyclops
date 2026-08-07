@@ -40,7 +40,11 @@ export TMUX_TMPDIR="$ROOT/tmux"
 mkdir -p "$TMUX_TMPDIR"
 # An inherited $TMUX would redirect a socket-less tmux call at the server
 # the caller is attached to, which is the one server this must never touch.
+# TMUX_PANE goes with it: `cyclops list` scopes to the caller's session by
+# matching that pane id, and an id inherited from the operator's own tmux
+# can collide with a rig pane id and scope the roster mid-walk.
 unset TMUX
+unset TMUX_PANE
 export CYCLOPS_HOME="$ROOT/home"
 mkdir -p "$CYCLOPS_HOME"
 CYC="$REPO/target/debug/cyclops"
@@ -1080,27 +1084,30 @@ cp "$INST/.zshrc" "$ROOT/zshrc.before"
 #
 # SHELL only picks which profile file name to look for; nothing here runs
 # it, so /bin/zsh gives the same `.zshrc` assertions on both platforms.
+# The toolchain env, which is the part that has to survive `env -i`.
+# RUSTUP_HOME follows HOME when unset, so redirecting HOME alone hides
+# the toolchain; and CI pins a toolchain with RUSTUP_TOOLCHAIN rather
+# than setting a rustup default, so dropping it leaves cargo with no
+# version to choose. Both are the toolchain, not the operator's state.
+# One list, because the installer runs and the update leg below strip
+# the environment the same way.
+TOOLCHAIN_KEEP=(
+  "RUSTUP_HOME=${RUSTUP_HOME:-$CALLER_HOME/.rustup}"
+  "CARGO_HOME=${CARGO_HOME:-$CALLER_HOME/.cargo}"
+)
+if [ -n "${RUSTUP_TOOLCHAIN:-}" ]; then
+  TOOLCHAIN_KEEP+=("RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN")
+fi
+
 run_installer() {
   local path="$1"; shift
-  # The toolchain env, which is the part that has to survive `env -i`.
-  # RUSTUP_HOME follows HOME when unset, so redirecting HOME alone hides
-  # the toolchain; and CI pins a toolchain with RUSTUP_TOOLCHAIN rather
-  # than setting a rustup default, so dropping it leaves cargo with no
-  # version to choose. Both are the toolchain, not the operator's state.
-  local keep=(
-    "RUSTUP_HOME=${RUSTUP_HOME:-$CALLER_HOME/.rustup}"
-    "CARGO_HOME=${CARGO_HOME:-$CALLER_HOME/.cargo}"
-  )
-  if [ -n "${RUSTUP_TOOLCHAIN:-}" ]; then
-    keep+=("RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN")
-  fi
   env -i \
     PATH="$path" \
     HOME="$INST" \
     SHELL=/bin/zsh \
     TERM=dumb \
     NO_COLOR=1 \
-    "${keep[@]}" \
+    "${TOOLCHAIN_KEEP[@]}" \
     sh "$REPO/scripts/install.sh" "$@" > "$OUT" 2>&1 || true
 }
 
@@ -1131,6 +1138,89 @@ run_installer "$PATH"
 grep -c '>>> cyclops >>>' "$INST/.zshrc" > "$ROOT/blocks"
 cat "$OUT" | grep 'already has the cyclops block' || true
 check_file "a second run adds no second block" "$ROOT/blocks" '^1$'
+
+echo
+echo "#### The update docs/guides/install.md documents"
+
+# `cyclops update` clones its source and reruns the installer, so this
+# leg needs a source one commit past the installed build. A throwaway
+# mirror of this repo gets exactly that: one empty commit on a named
+# branch. Built with init+fetch rather than clone, because a CI checkout
+# can be a detached HEAD with no named branch to clone from.
+#
+# The mirror is the last COMMIT, not the working tree: fetch is the one
+# capture that cannot write into this repo. So this leg tests `cyclops
+# update` as last committed, and a change to the verb that exists only
+# as uncommitted work fails the second run below until it lands. CI runs
+# on the commit, where the two are the same tree.
+git init -q "$ROOT/remote" 2>/dev/null
+git -C "$ROOT/remote" fetch -q "$REPO" HEAD
+git -C "$ROOT/remote" checkout -q -B parity-update FETCH_HEAD
+git -C "$ROOT/remote" -c user.name=parity -c user.email=parity@invalid \
+  commit -q --allow-empty -m "parity: one commit past the installed build"
+
+# The same env -i discipline as run_installer, plus three overrides:
+#
+#   CYCLOPS_REPO      the mirror above: git clones a local path, and the
+#                     network is never touched
+#   CYCLOPS_REF       the mirror's one branch
+#   CARGO_TARGET_DIR  the build cache the install above just filled. env -i
+#                     strips it, the clone sits in a different directory,
+#                     and without threading it through the clone's release
+#                     build starts cold and this job's time doubles.
+run_update() {
+  set +e
+  env -i \
+    PATH="$INST/.local/bin:$PATH" \
+    HOME="$INST" \
+    SHELL=/bin/zsh \
+    TERM=dumb \
+    NO_COLOR=1 \
+    CYCLOPS_REPO="$ROOT/remote" \
+    CYCLOPS_REF=parity-update \
+    CARGO_TARGET_DIR="$REPO/target" \
+    "${TOOLCHAIN_KEEP[@]}" \
+    "$INST/.local/bin/cyclops" update > "$OUT" 2>&1
+  printf '%s' "$?" > "$ROOT/exit"
+  set -e
+}
+
+printf '\n$ cyclops update\n'
+run_update
+grep -v '^ *\(Compiling\|Finished\|Downloaded\|Blocking\|Updating\|Adding\)' "$OUT" | tail -24
+
+check "update names the running build"    '^cyclops [0-9]+\.[0-9]+\.[0-9]+ \(([0-9a-f]+(\.dirty)?|unknown)\)$'
+check "and its source"                    "^  source $ROOT/remote at parity-update$"
+check "it reran the installer"            '^✔ cyclops [0-9]+\.[0-9]+\.[0-9]+ \([0-9a-f]+\) is installed$'
+check "and reports old build to new"      '^✔ updated · [0-9]+\.[0-9]+\.[0-9]+ \(([0-9a-f]+(\.dirty)?|unknown)\) → [0-9]+\.[0-9]+\.[0-9]+ \([0-9a-f]+\)$'
+check "then the restart steps"            '^Restart:$'
+check "the workspace goes first"          '^  1  q +quit any open workspace; it is still on the old build$'
+check "the daemon second"                 '^  2  cyclops daemon stop +the daemon is too$'
+check "and start comes back up"           '^  3  cyclops start +come back up on the new build$'
+check_absent "it never stops the daemon itself" 'stopped cyclopsd'
+check_exit "an update exits 0" 0
+
+# A second update against the same ref: the binary just installed IS the
+# mirror's commit, so the freshness check answers and nothing rebuilds.
+printf '\n$ cyclops update    # again\n'
+run_update
+cat "$OUT"
+check "a repeat update says already current" '^✔ already the latest parity-update · nothing to update$'
+check_exit "and exits 0 saying so" 0
+
+# What an update must never cost: the home the first install set up. The
+# installer's seed rule (files already there are never rewritten) is what
+# this rides on, and this is where it is proven from the update side.
+check_file "the config survived the update" "$INST/.cyclops/config.toml" '^sessions = '
+
+# The update legs built the mirror's clone into the repo's own target dir
+# (the shared cache that keeps this job fast), which leaves the MIRROR's
+# binaries at target/release/cyclops{,d} while cargo still counts the
+# repo's own bin units fresh: a later build from this checkout would
+# silently reinstall the mirror's build. Deleting the binaries
+# un-freshens exactly the final link step; the dependency cache stays
+# warm.
+rm -f "$REPO/target/release/cyclops" "$REPO/target/release/cyclopsd"
 
 printf '\n$ ./scripts/install.sh --uninstall\n'
 run_installer "$INST/.local/bin:$PATH" --uninstall

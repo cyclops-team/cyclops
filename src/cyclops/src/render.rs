@@ -308,12 +308,29 @@ fn unknown_rows(res: &StatusResult, style: &Style) -> Vec<String> {
 /// session (the daemon refuses a duplicate), so naming the session would
 /// add a column that never disambiguates anything. The header names them
 /// once instead.
-pub fn render_list(res: &StatusResult, style: &Style, home: &Path) -> String {
-    let header = style.dim(&format!(
+///
+/// `also_watching` is the sessions a scoped roster left out (cmd_list's
+/// caller-session rule). Non-empty, it earns one dim line under the
+/// header naming them and the way out, so the header never claims the
+/// daemon watches less than it does. Empty, the output is byte for byte
+/// the unscoped grid.
+pub fn render_list(
+    res: &StatusResult,
+    style: &Style,
+    home: &Path,
+    also_watching: &[String],
+) -> String {
+    let mut header = style.dim(&format!(
         "watching {} · home {}",
         watching_words(res),
         home.display()
     ));
+    if !also_watching.is_empty() {
+        header.push_str(&format!(
+            "\n  {}",
+            style.dim(&copy::also_watching(also_watching))
+        ));
+    }
     let rows: Vec<(String, AgentState, Option<String>)> = res
         .sessions
         .iter()
@@ -1162,7 +1179,7 @@ mod tests {
     /// header line saying whose roster it is.
     #[test]
     fn list_grid_plain_is_exact() {
-        let got = render_list(&fixture(), &Style::none(), Path::new("/x"));
+        let got = render_list(&fixture(), &Style::none(), Path::new("/x"), &[]);
         let expected = "watching main · home /x\n\
                         \n\
                         \x20 reviewer     ● working  Run the tests\n\
@@ -1185,7 +1202,7 @@ mod tests {
             attached: true,
             panes: Vec::new(),
         });
-        let got = render_list(&res, &Style::none(), Path::new("/second/.cyclops"));
+        let got = render_list(&res, &Style::none(), Path::new("/second/.cyclops"), &[]);
         assert!(
             got.starts_with("watching main, ops · home /second/.cyclops\n"),
             "{got}"
@@ -1193,11 +1210,40 @@ mod tests {
 
         // A daemon watching nothing says so in status's word for it.
         res.sessions.clear();
-        let got = render_list(&res, &Style::none(), Path::new("/second/.cyclops"));
+        let got = render_list(&res, &Style::none(), Path::new("/second/.cyclops"), &[]);
         assert!(
             got.starts_with("watching nothing · home /second/.cyclops\n"),
             "{got}"
         );
+    }
+
+    /// A scoped roster's header keeps two promises at once: it names only
+    /// the session the rows come from, and the dim line under it names
+    /// every session that was elided plus the command that shows them.
+    /// This is the exact shape, on the grid's own indent.
+    #[test]
+    fn a_scoped_list_names_what_it_left_out_and_the_way_back() {
+        let got = render_list(
+            &fixture(),
+            &Style::none(),
+            Path::new("/x"),
+            &["ops".into(), "dev".into()],
+        );
+        let expected = "watching main · home /x\n\
+                        \x20 also watching ops, dev · cyclops list --all to see every session\n\
+                        \n\
+                        \x20 reviewer     ● working  Run the tests\n\
+                        \x20 implementer  ○ idle";
+        assert_eq!(got, expected);
+    }
+
+    /// And a roster that was not scoped says nothing about scoping: the
+    /// note is for elision, not decoration.
+    #[test]
+    fn an_unscoped_list_carries_no_scoping_note() {
+        let got = render_list(&fixture(), &Style::none(), Path::new("/x"), &[]);
+        assert!(!got.contains("also watching"), "{got}");
+        assert!(!got.contains("--all"), "{got}");
     }
 
     /// Painted, the grid still ends where the words end.
@@ -1215,6 +1261,7 @@ mod tests {
             &res,
             &Style::with_theme(cyclops_theme::Theme::default(), true),
             Path::new("/x"),
+            &[],
         );
         for line in painted.lines() {
             let stripped: String = {
@@ -1247,7 +1294,7 @@ mod tests {
     /// keeps the invitation, under the same header.
     #[test]
     fn list_shows_named_panes_only_and_invites_the_first_one() {
-        let got = render_list(&fixture(), &Style::none(), Path::new("/x"));
+        let got = render_list(&fixture(), &Style::none(), Path::new("/x"), &[]);
         assert!(!got.contains("%4"), "{got}");
 
         let mut res = fixture();
@@ -1255,7 +1302,7 @@ mod tests {
             p.agent = None;
         }
         assert_eq!(
-            render_list(&res, &Style::none(), Path::new("/x")),
+            render_list(&res, &Style::none(), Path::new("/x"), &[]),
             format!("watching main · home /x\n\n  {}", copy::NO_AGENTS)
         );
     }
@@ -1267,7 +1314,7 @@ mod tests {
         let mut res = fixture();
         res.sessions[0].panes[1].state = AgentState::BlockedQuota;
         res.sessions[0].panes[1].title = String::new();
-        let got = render_list(&res, &Style::none(), Path::new("/x"));
+        let got = render_list(&res, &Style::none(), Path::new("/x"), &[]);
         assert_eq!(
             got,
             "watching main · home /x\n\

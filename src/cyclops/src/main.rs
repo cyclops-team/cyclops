@@ -34,7 +34,8 @@
 //! Verbs, by the milestone that added them: `ping`, `status`, `read`,
 //! `watch` (M0); `send`, `hook` (M1); `history`, `thread`, `wait`,
 //! `send --wait`, `hooks install|verify|selftest` (M2); `ui` (M3); `name`,
-//! `list`, `start`, `workspace save|restore` (M4); `theme` (M5).
+//! `list`, `start`, `workspace save|restore` (M4); `theme` (M5);
+//! `update` (post-M5).
 
 mod client;
 mod copy;
@@ -46,6 +47,7 @@ mod render;
 mod style;
 mod theme;
 mod themeseed;
+mod update;
 mod workspace;
 
 use std::io::IsTerminal;
@@ -119,7 +121,8 @@ enum Cmd {
     /// Name a pane so cyclops can address it. `--clear` gives it back.
     Name(NameArgs),
     /// Every named agent: what it is called, how it is doing, what it is on.
-    List,
+    /// Inside tmux it scopes to your session; `--all` is every session.
+    List(ListArgs),
     /// Round-trip check against the daemon.
     Ping,
     /// Read a pane: visible screen, recent output, or the detection view.
@@ -191,6 +194,12 @@ enum Cmd {
         /// Theme to switch to, e.g. light. Omit to list what is there.
         name: Option<String>,
     },
+    /// Update cyclops itself: fetch the source, rebuild, and replace the
+    /// installed binaries. Config, themes, manifests and the record are
+    /// untouched. Prints old and new build, then the restart steps;
+    /// nothing is restarted for you. (Wiring agent hooks is `cyclops
+    /// hooks install`, a different job.)
+    Update,
     /// The daemon: stop it, ask after it, read its log. `cyclops start`
     /// starts one for you, so there is no `daemon start`.
     Daemon {
@@ -309,6 +318,14 @@ struct UiArgs {
     /// Ledger lines replayed for backfill before going live.
     #[arg(long, default_value_t = 200)]
     backfill: usize,
+}
+
+#[derive(clap::Args)]
+struct ListArgs {
+    /// Every watched session's agents. Without it, a caller inside tmux
+    /// sees only the session it is sitting in when several are watched.
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(clap::Args)]
@@ -610,6 +627,11 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
         // switch is live at once, but a down daemon costs it only that,
         // so it must not go through connect() either.
         Cmd::Theme { name } => theme::run(cli.json, &style_for(cli), name.as_deref()),
+        // Update replaces the binaries on disk and never talks to the
+        // daemon: the daemon keeps running the old build until the
+        // restart steps it prints are followed, and saying so is part of
+        // its output.
+        Cmd::Update => update::run(cli.json, &style_for(cli)),
         // All three answer about a daemon rather than through one, so a
         // daemon that is down is an answer here, not a failure.
         Cmd::Daemon { cmd } => cmd_daemon(cli, &style_for(cli), cmd),
@@ -654,7 +676,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
             )
         }
         Cmd::Status
-        | Cmd::List
+        | Cmd::List(_)
         | Cmd::Ping
         | Cmd::Read { .. }
         | Cmd::History(_)
@@ -667,7 +689,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
             let style = style_for(cli);
             match cmd {
                 Cmd::Status => cmd_status(&mut c, cli, &style),
-                Cmd::List => cmd_list(&mut c, cli, &style),
+                Cmd::List(args) => cmd_list(&mut c, cli, &style, args),
                 Cmd::Ping => cmd_ping(&mut c, cli, &style),
                 Cmd::Read {
                     target,
@@ -693,6 +715,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 | Cmd::Watch { .. }
                 | Cmd::Start(_)
                 | Cmd::Theme { .. }
+                | Cmd::Update
                 | Cmd::Workspace { .. } => {
                     unreachable!("handled above")
                 }
@@ -962,7 +985,14 @@ fn cmd_name(
 /// directory the socket lives under, so it names the daemon that answered
 /// by construction. Two daemons on two homes give two different rosters,
 /// and the header is how a reader in the wrong terminal tab finds out.
-fn cmd_list(c: &mut Client, cli: &Cli, style: &Style) -> i32 {
+///
+/// Inside tmux the roster scopes to the caller's own session: a fresh tab
+/// in session A means "my team here", not everything the daemon watches,
+/// and the header plus a note keep the elision honest. `--all`, a caller
+/// outside tmux, and a pane the daemon does not watch all get the full
+/// roster, byte for byte what it always was. `--json` scopes identically
+/// (parity, not a second shape).
+fn cmd_list(c: &mut Client, cli: &Cli, style: &Style, args: &ListArgs) -> i32 {
     let result = match c.request("status", json!({})) {
         Ok(v) => v,
         Err(e) => {
@@ -970,13 +1000,24 @@ fn cmd_list(c: &mut Client, cli: &Cli, style: &Style) -> i32 {
             return 1;
         }
     };
-    let status: StatusResult = match serde_json::from_value(result) {
+    let mut status: StatusResult = match serde_json::from_value(result) {
         Ok(s) => s,
         Err(_) => {
             eprintln!("{}", copy::UNREADABLE_ANSWER);
             return 1;
         }
     };
+    let mut also_watching: Vec<String> = Vec::new();
+    if !args.all {
+        if let Some(keep) = caller_session(&status, std::env::var("TMUX_PANE").ok().as_deref()) {
+            let kept = status.sessions.remove(keep);
+            also_watching = std::mem::take(&mut status.sessions)
+                .into_iter()
+                .map(|s| s.name)
+                .collect();
+            status.sessions = vec![kept];
+        }
+    }
     let home = cyclops_proto::cyclops_home();
     if cli.json {
         // Parity, not a second shape: the same rows the grid prints, as
@@ -990,18 +1031,50 @@ fn cmd_list(c: &mut Client, cli: &Cli, style: &Style) -> i32 {
             .filter(|p| p.agent.is_some())
             .collect();
         let sessions: Vec<&str> = status.sessions.iter().map(|s| s.name.as_str()).collect();
-        println!(
-            "{}",
-            json!({
-                "agents": serde_json::to_value(&named).expect("panes serialize"),
-                "home": home.display().to_string(),
-                "sessions": sessions,
-            })
-        );
+        let mut answer = json!({
+            "agents": serde_json::to_value(&named).expect("panes serialize"),
+            "home": home.display().to_string(),
+            "sessions": sessions,
+        });
+        // The note's fact, additive and only when something was elided,
+        // so an unscoped answer stays byte-identical to what it was.
+        if !also_watching.is_empty() {
+            answer["also_watching"] = json!(also_watching);
+        }
+        println!("{answer}");
         return 0;
     }
-    println!("{}", render::render_list(&status, style, &home));
+    println!(
+        "{}",
+        render::render_list(&status, style, &home, &also_watching)
+    );
     0
+}
+
+/// The session the caller is sitting in, when that is knowable and
+/// unambiguous: tmux puts the pane id in `TMUX_PANE` for every process it
+/// starts (the same variable `cyclops name --self` reads), and exactly
+/// one watched session holds that pane id.
+///
+/// Pane ids are unique per tmux SERVER, not per machine. A caller inside
+/// a second server (`tmux -L other`) can carry a TMUX_PANE that collides
+/// with a watched pane id on the daemon's server; the roster then scopes
+/// to a session the caller is not in, which is the pre-scoping failure
+/// mode with an honest header. Requiring exactly one match keeps the
+/// same-server case right and refuses the one ambiguity that is
+/// detectable from here.
+fn caller_session(status: &StatusResult, pane: Option<&str>) -> Option<usize> {
+    let pane = pane.filter(|p| !p.is_empty())?;
+    let mut hits = status
+        .sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.panes.iter().any(|p| p.pane_id == pane))
+        .map(|(i, _)| i);
+    match (hits.next(), hits.next()) {
+        (Some(only), None) => Some(only),
+        _ => None,
+    }
 }
 
 fn cmd_ping(c: &mut Client, cli: &Cli, style: &Style) -> i32 {
@@ -1517,5 +1590,51 @@ mod tests {
             0
         );
         assert_eq!(receipts_exit_json(&json!({})), 0);
+    }
+
+    /// A watched roster for the scoping rule: session names, each with
+    /// its pane ids. Built off the wire shape so the fixture cannot
+    /// drift from what a daemon answers.
+    fn watched(sessions: &[(&str, &[&str])]) -> StatusResult {
+        let sessions: Vec<Value> = sessions
+            .iter()
+            .map(|(name, panes)| {
+                json!({
+                    "name": name, "attached": true,
+                    "panes": panes.iter().map(|id| json!({
+                        "pane_id": id, "window_id": "@1", "window_name": "w",
+                        "title": "", "current_command": "sh", "dead": false,
+                        "in_mode": false, "width": 80, "height": 24,
+                        "state": "idle"
+                    })).collect::<Vec<Value>>()
+                })
+            })
+            .collect();
+        serde_json::from_value(json!({
+            "daemon_version": "0.1.0", "proto": 1, "boot_id": "b",
+            "uptime_ms": 0, "tmux_version": "3.6a", "sessions": sessions
+        }))
+        .expect("status fixture")
+    }
+
+    /// The scoping rule in one place: scope only when the caller's pane
+    /// is knowable AND exactly one watched session holds it. Everything
+    /// else, including the detectable ambiguity of two sessions claiming
+    /// one pane id, falls through to the full roster.
+    #[test]
+    fn the_roster_scopes_only_on_an_unambiguous_pane_match() {
+        let two = watched(&[("main", &["%1", "%2"]), ("ops", &["%7"])]);
+        // Outside tmux there is no context to scope by.
+        assert_eq!(caller_session(&two, None), None);
+        assert_eq!(caller_session(&two, Some("")), None);
+        // Inside, the one session holding the pane wins.
+        assert_eq!(caller_session(&two, Some("%2")), Some(0));
+        assert_eq!(caller_session(&two, Some("%7")), Some(1));
+        // A pane the daemon does not watch scopes nothing.
+        assert_eq!(caller_session(&two, Some("%99")), None);
+        // Two sessions claiming the pane id is the cross-server collision
+        // made visible; refusing to pick is the only honest answer.
+        let clash = watched(&[("main", &["%1"]), ("ops", &["%1"])]);
+        assert_eq!(caller_session(&clash, Some("%1")), None);
     }
 }

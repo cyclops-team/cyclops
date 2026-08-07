@@ -41,10 +41,22 @@ cyclops start
 It starts the daemon too, so there is no second command and no tab to
 keep open.
 
+## Update
+
+```bash
+cyclops update
+```
+
+It says which build you are running, checks the source for a newer
+commit (already-current stops right there), reruns the installer from a
+fresh clone, and reports old build to new plus the three restart steps.
+Your config, themes, manifests and record are untouched. Details:
+[installation guide](docs/guides/install.md).
+
 ## Uninstall
 
-A buggy install rarely needs this: run the installer again and it
-overwrites in place. To actually remove cyclops:
+A buggy install rarely needs this: `cyclops update` (or the installer
+run again) overwrites in place. To actually remove cyclops:
 
 ```bash
 curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
@@ -170,7 +182,12 @@ watching main · home ~/.cyclops
 
 Three columns: the name, how the agent is doing, what it is on. A named pane
 also says so on its own tmux border, and `cyclops name reviewer --clear`
-gives the border back. Details: [pane guide](docs/guides/panes.md).
+gives the border back.
+
+The roster is scoped to where you ask from: inside tmux, when the daemon
+watches more than one session, `cyclops list` shows only the session you
+are sitting in, with a dim line naming what it left out. `cyclops list
+--all` is every watched session. Details: [pane guide](docs/guides/panes.md).
 
 ### 3. Any terminal agent
 
@@ -394,7 +411,7 @@ above.
 | `cyclops start` | Open the default workspace: restore it, or build it from a preset. Safe to run twice |
 | `cyclops workspace save\|restore` | The shape of a session as a file: panes, sizes, names, directories |
 | `cyclops name <pane> <label>` | Name a pane so cyclops can address it; the pane's tmux border says so |
-| `cyclops list` | The roster: every named agent, how it is doing, what it is on |
+| `cyclops list` | The roster: every named agent, how it is doing, what it is on. Inside tmux it scopes to your session; `--all` is every watched session |
 | `cyclops status` | Every watched pane with its fused state, and the eye |
 | `cyclops send <agent> --subject ...` | Deliver a message with an evidence-labeled receipt (`--wait done` blocks until the turn it starts ends) |
 | `cyclops wait <agent> --until idle\|done\|blocked` | Block until an agent is ready, finishes a turn, or needs a human |
@@ -404,12 +421,14 @@ above.
 | `cyclops hooks verify\|selftest <agent>` | Hook liveness, and one no-op delivery that proves the ack fires |
 | `cyclops watch` | The live stream: calm admin view, firehose one keypress away, jump-to-pane |
 | `cyclops theme [name]` | Switch themes, or list them with a preview of each. A switch is live at once |
+| `cyclops update` | Rebuild from the latest source and replace the installed binaries; config and record untouched |
 | `cyclops read <agent> --source detection` | Per-sensor readings behind a state verdict |
 | `cyclops ping` | Daemon round trip |
 
-All of them take `--json` and `--plain`, and honor `NO_COLOR`. (The
-deprecated `cyclops ui` alias has no `--json`; the machine stream is
-`cyclops watch --json`.)
+All of them take `--json` and `--plain`, and honor `NO_COLOR`. (Two
+exceptions have no `--json`: the deprecated `cyclops ui` alias, whose
+machine stream is `cyclops watch --json`, and `cyclops update`, whose
+output is the installer's stream.)
 
 ## How it works
 

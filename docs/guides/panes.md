@@ -73,10 +73,14 @@ not already say. Agent CLIs put the current task there. So does tmux, and
 the hostname.
 
 `cyclops status` shows the same rows plus every pane nobody has named,
-and the eye. `cyclops list` is the roster alone.
+and the eye. `cyclops list` is the roster alone; run inside tmux it is
+the caller's session's roster, with a dim line naming what was elided
+and `cyclops list --all` as the way out.
 
 `cyclops list --json` prints the same rows as pane records, plus `home`
-and `sessions`: which daemon answered and what it watches.
+and `sessions`: which daemon answered and what the listing covers. It
+scopes exactly like the grid, and an additive `also_watching` field
+carries the elided session names only when something was elided.
 
 ## What a name buys
 

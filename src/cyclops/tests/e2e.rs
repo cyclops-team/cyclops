@@ -81,7 +81,10 @@ fn run_cyclops(home: &Path, args: &[&str]) -> Output {
 
 /// run_cyclops with extra env vars and optional piped stdin. CYCLOPS_AGENT
 /// is scrubbed first so the developer's shell can't leak an identity into
-/// the hook tests.
+/// the hook tests. TMUX_PANE is scrubbed for the same reason: `cyclops
+/// list` scopes to the caller's session by matching it, and a suite run
+/// inside tmux would leak a pane id that can collide with the canned
+/// fixtures' (%1, %2). Tests that want one set it explicitly.
 fn run_cyclops_io(
     home: &Path,
     envs: &[(&str, &str)],
@@ -91,6 +94,7 @@ fn run_cyclops_io(
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cyclops"));
     cmd.env("CYCLOPS_HOME", home)
         .env_remove("CYCLOPS_AGENT")
+        .env_remove("TMUX_PANE")
         .args(args);
     for (k, v) in envs {
         cmd.env(k, v);
@@ -265,6 +269,141 @@ fn list_json_carries_the_same_rows() {
     // asked through, and the sessions the daemon watches.
     assert_eq!(v["home"], json!(home.display().to_string()), "{v}");
     assert_eq!(v["sessions"], json!(["main"]), "{v}");
+    // Nothing was elided, so nothing claims to have been.
+    assert!(v.get("also_watching").is_none(), "{v}");
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// canned_status plus a second watched session, for the list-scoping
+/// tests: the daemon watches "main" and "ops", and the caller sits in
+/// one of them.
+fn canned_status_two_sessions() -> Value {
+    let mut v = canned_status();
+    v["sessions"].as_array_mut().expect("sessions").push(json!({
+        "name": "ops",
+        "attached": true,
+        "panes": [{
+            "pane_id": "%7", "window_id": "@2", "window_name": "agents",
+            "agent": "deployer", "manifest": "claude",
+            "title": "", "current_command": "claude",
+            "dead": false, "in_mode": false, "width": 120, "height": 40,
+            "state": "idle"
+        }]
+    }));
+    v
+}
+
+/// Inside tmux, the roster is the caller's session: the pane id tmux put
+/// in the environment locates it, the other sessions' agents are elided,
+/// and the header plus a dim note say exactly what happened and the way
+/// out. This is the shipped surface for the "list in a fresh tab shows a
+/// random session" defect.
+#[test]
+fn list_scopes_to_the_callers_session_inside_tmux() {
+    let home = scratch_home("lsc");
+    let canned = canned_status_two_sessions();
+    serve_once(&home, hello(1), move |req| {
+        (
+            vec![json!({"id": req["id"], "result": canned}).to_string()],
+            false,
+        )
+    });
+    // %2 is implementer's pane in "main".
+    let out = run_cyclops_io(&home, &[("TMUX_PANE", "%2")], &["list", "--plain"], None);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let expected = format!(
+        "watching main · home {}\n\
+         \x20 also watching ops · cyclops list --all to see every session\n\
+         \n\
+         \x20 reviewer     ● working  Run the tests\n\
+         \x20 implementer  ○ idle\n",
+        home.display()
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// --all restores today's full dump, note-free, even inside tmux. And
+/// with no TMUX_PANE or a pane the daemon does not watch, scoping never
+/// engages: the full roster is byte for byte what it always was.
+#[test]
+fn list_all_and_unmatched_callers_keep_the_full_roster() {
+    let home = scratch_home("lfa");
+    let canned = canned_status_two_sessions();
+    serve_conns(&home, hello(1), 3, move |req| {
+        (
+            vec![json!({"id": req["id"], "result": canned.clone()}).to_string()],
+            true,
+        )
+    });
+    let expected = format!(
+        "watching main, ops · home {}\n\
+         \n\
+         \x20 reviewer     ● working  Run the tests\n\
+         \x20 implementer  ○ idle\n\
+         \x20 deployer     ○ idle\n",
+        home.display()
+    );
+    // Inside tmux with --all.
+    let out = run_cyclops_io(
+        &home,
+        &[("TMUX_PANE", "%2")],
+        &["list", "--all", "--plain"],
+        None,
+    );
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+    // Outside tmux.
+    let out = run_cyclops(&home, &["list", "--plain"]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+    // Inside tmux, in a pane the daemon does not watch.
+    let out = run_cyclops_io(&home, &[("TMUX_PANE", "%99")], &["list", "--plain"], None);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// --json scopes exactly as the grid does (parity, not a second shape):
+/// the same elided rows, the scoped `sessions`, and the note's fact as an
+/// additive `also_watching`. With --all the answer is the full one and
+/// the additive field never appears.
+#[test]
+fn list_json_scopes_identically_and_honors_all() {
+    let home = scratch_home("lsj");
+    let canned = canned_status_two_sessions();
+    serve_conns(&home, hello(1), 2, move |req| {
+        (
+            vec![json!({"id": req["id"], "result": canned.clone()}).to_string()],
+            true,
+        )
+    });
+    // %7 is deployer's pane in "ops": the smaller session, so a scoped
+    // answer cannot be mistaken for a truncated full one.
+    let out = run_cyclops_io(&home, &[("TMUX_PANE", "%7")], &["list", "--json"], None);
+    assert!(out.status.success());
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    let agents = v["agents"].as_array().expect("agents array");
+    assert_eq!(agents.len(), 1, "{v}");
+    assert_eq!(agents[0]["agent"], json!("deployer"));
+    assert_eq!(v["sessions"], json!(["ops"]), "{v}");
+    assert_eq!(v["also_watching"], json!(["main"]), "{v}");
+
+    let out = run_cyclops_io(
+        &home,
+        &[("TMUX_PANE", "%7")],
+        &["list", "--json", "--all"],
+        None,
+    );
+    assert!(out.status.success());
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    assert_eq!(v["agents"].as_array().expect("agents").len(), 3, "{v}");
+    assert_eq!(v["sessions"], json!(["main", "ops"]), "{v}");
+    assert!(v.get("also_watching").is_none(), "{v}");
     let _ = fs::remove_dir_all(&home);
 }
 
@@ -1564,5 +1703,56 @@ fn self_names_the_calling_pane_and_says_so_when_there_is_none() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("is you"));
 
+    let _ = fs::remove_dir_all(&home);
+}
+
+// ---------------------------------------------------------------------------
+// cyclops update: the refusals that need no clone and no network
+// ---------------------------------------------------------------------------
+
+/// The update's own output is the installer's stream, so --json is a
+/// usage error that points at the machine-readable alternative. No
+/// daemon, no network, and nothing on disk moves.
+#[test]
+fn update_json_is_refused_with_the_alternative_named() {
+    let home = scratch_home("uj");
+    let out = run_cyclops(&home, &["update", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no --json form"), "{err}");
+    assert!(err.contains("cyclops --version"), "{err}");
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// A source that cannot be read fails with the repo named and exit 1,
+/// before anything is installed. The env overrides are the installer's
+/// own, so pointing them at a hole is the cheap way to prove the update
+/// never guesses past a dead source. Which sentence appears depends on
+/// this build's own ref (a clean sha fails at ls-remote, a .dirty or
+/// unknown one at the clone), and both name the repo and the ref.
+#[test]
+fn update_with_an_unreachable_source_names_it_and_exits_one() {
+    let home = scratch_home("uu");
+    let out = run_cyclops_io(
+        &home,
+        &[
+            ("CYCLOPS_REPO", "/nonexistent-cyclops-update-source"),
+            ("CYCLOPS_REF", "main"),
+        ],
+        &["update", "--plain"],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The running build and the source were said before the failure.
+    assert!(stdout.contains("cyclops "), "{stdout}");
+    assert!(
+        stdout.contains("source /nonexistent-cyclops-update-source at main"),
+        "{stdout}"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("/nonexistent-cyclops-update-source"), "{err}");
+    assert!(err.contains("main"), "{err}");
     let _ = fs::remove_dir_all(&home);
 }

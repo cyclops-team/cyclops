@@ -94,6 +94,11 @@ Three columns: the name, how the agent is doing, and what it is on. Both
 names came from the preset. `duo` carries them, and `cyclops start` put them
 on the panes it built.
 
+When the daemon watches more than one session and you ask from inside
+tmux, the roster is your session's alone, and a dim line under the
+header names what was left out. `cyclops list --all` is every watched
+session.
+
 ### When a pane reads unknown
 
 `? unknown` is not a state an agent is in. It is cyclops unable to read one,

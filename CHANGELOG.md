@@ -7,6 +7,24 @@ versions are unreleased until admin cuts a tag.
 
 ### Added (v4)
 
+- `cyclops update`. One verb to rebuild from the latest source and
+  replace the installed binaries in place. It names the build you are
+  running, asks the source whether anything is newer first
+  (`git ls-remote`, one round trip; already current exits 0 and stops;
+  a `.dirty` or `unknown` build says why there is no check and
+  proceeds), clones `CYCLOPS_REPO` at `CYCLOPS_REF` and streams that
+  clone's installer, then reports old build to new from the new
+  binary's own `--version` and closes with the three restart steps.
+  Nothing is restarted for you; config, themes, manifests and the
+  record are untouched. Wiring agent hooks stays
+  `cyclops hooks install`, a different job.
+- `cyclops list` scopes to the caller's session. Inside tmux, when
+  exactly one watched session holds the caller's pane, the roster is
+  that session's alone, with a dim line under the header naming the
+  elided sessions and `cyclops list --all` as the way out. Outside
+  tmux, on no match, and with `--all`, the output is byte for byte what
+  it was. `--json` scopes identically and carries the elided names as
+  an additive `also_watching` field (parity, not a second shape).
 - The tab bar earns its row. With a single tab the strip hides and the
   pane canvas reclaims the row; it returns the moment a second tab
   exists. The painted chrome and the tmux-declared client size derive
