@@ -156,6 +156,22 @@ clickable, so the mouse always has a way back to the panel and to the
 remaining columns to the pane canvas and re-declares the tmux client
 size, so all panes reflow.
 
+## Motion
+
+Four things fade rather than snap: a pane border taking or losing focus,
+an agent's status ink, the attention eye arriving, and a notice dissolving
+over the last stretch of its life. Nothing moves or slides. In a cell grid
+a slide reads as a shear, so only color travels, and the glyphs and words
+are at their final value on the first frame: a fade never delays the
+arrival of information.
+
+The app menu's `Motion` item is the switch, and the choice persists under
+`[workspace] motion`. Motion also turns itself off where it cannot look
+right: under `NO_COLOR`, on a terminal without truecolor (an interpolated
+color would band across four or five entries of the 256-cube), and on a
+terminal that writes frames slower than the workspace draws them.
+`CYCLOPS_MOTION=0` forces it off for one run.
+
 Hide the tab strip from the app menu's `Tab bar` item, and bring it back
 the same way. That item is the only visible switch, which is why the
 menu has to stay reachable from the collapsed rail. Hiding gives the
@@ -226,6 +242,7 @@ sidebar_visible = true
 sidebar_width = 28
 sidebar_tab = "sessions"
 tab_bar_visible = true
+motion = true
 workspace_order = ["main", "website"]
 agent_order = ["name:implementer", "name:reviewer"]
 folder_tracked = []
