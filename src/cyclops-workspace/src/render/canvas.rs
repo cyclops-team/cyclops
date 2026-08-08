@@ -492,7 +492,11 @@ fn paint_pane_frame(
     let status = DecorationSnapshot::primary_status(decoration);
     let shown_state = status.map(|status| {
         let full = format!("{} {}", status.glyph, status.word);
-        let full_suffix = 3usize.saturating_add(Span::raw(full.as_str()).width());
+        // Four, not three: " · " leads the state and a single space
+        // follows it. Without the trailing one the border rule resumes
+        // against the glyph and `○────` reads as one joined mark rather
+        // than a status next to a line.
+        let full_suffix = 4usize.saturating_add(Span::raw(full.as_str()).width());
         if slot.focused
             && Span::raw(label).width().saturating_add(full_suffix)
                 <= usize::from(title_bounds.width)
@@ -505,7 +509,7 @@ fn paint_pane_frame(
     let suffix_width = shown_state
         .as_ref()
         .map(|state| {
-            3u16.saturating_add(u16::try_from(Span::raw(state).width()).unwrap_or(u16::MAX))
+            4u16.saturating_add(u16::try_from(Span::raw(state).width()).unwrap_or(u16::MAX))
         })
         .unwrap_or(0);
     let label_width = u16::try_from(Span::raw(label).width()).unwrap_or(u16::MAX);
@@ -542,6 +546,17 @@ fn paint_pane_frame(
                     .unwrap_or(decoration.state),
             )
         },
+    );
+    // Close the label the way it opened, so the border rule restarts a cell
+    // clear of the state instead of touching it. Budgeted for above.
+    let state_width = u16::try_from(Span::raw(&shown_state).width()).unwrap_or(u16::MAX);
+    super::overlay_text(
+        buf,
+        title_bounds,
+        x.saturating_add(state_width),
+        top,
+        " ",
+        border_style,
     );
 }
 

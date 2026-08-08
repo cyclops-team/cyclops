@@ -132,14 +132,28 @@ pub fn paint_sidebar(
     // it was attached to did. It takes one cell of the resize divider and
     // no more: the handle still answers on every other row, and this hit
     // is pushed last so it wins its own.
-    paint_toggle(
-        buf,
-        Rect::new(area.x + area.width.saturating_sub(1), footer_y, 1, 1),
-        SIDEBAR_COLLAPSE,
-        paint,
-        hits,
-        hover,
-    );
+    let edge = Rect::new(area.x + area.width.saturating_sub(1), area.y, 1, area.height);
+    paint_toggle(buf, toggle_reach(edge), edge, SIDEBAR_COLLAPSE, paint, hits, hover);
+}
+
+/// The band of the panel's outer edge that answers as the collapse control,
+/// centered on the edge.
+///
+/// The whole column cannot have it: this column is also the resize divider,
+/// and a toggle that owned every row would leave no way to drag the panel
+/// wider. A single cell in the corner was the other extreme and it was the
+/// one shipped: a one-cell button on a thirty-row edge, which the operator
+/// has to hunt for. A centered band is the middle, and the eye finds the
+/// middle of an edge without looking.
+fn toggle_reach(edge: Rect) -> Rect {
+    const REACH: u16 = 5;
+    let height = REACH.min(edge.height);
+    Rect::new(
+        edge.x,
+        edge.y + edge.height.saturating_sub(height) / 2,
+        1,
+        height,
+    )
 }
 
 /// Render the rail a collapsed sidebar leaves behind: one column of panel
@@ -157,17 +171,29 @@ pub fn paint_sidebar_rail(
         return;
     }
     buf.set_style(area, theme::chrome_panel(paint));
-    paint_toggle(buf, area, SIDEBAR_EXPAND, paint, hits, hover);
+    // The rail has no resize divider to share with, so the whole column is
+    // the control. The glyph still centers, so it sits at the same height
+    // as the open panel's and the eye keeps its place across a collapse.
+    paint_toggle(buf, area, area, SIDEBAR_EXPAND, paint, hits, hover);
 }
 
-/// Paint one sidebar chevron at the foot of `hit` and register that whole
-/// rectangle as the toggle. The glyph lands on the rectangle's bottom-left
-/// cell; the button fills under the mouse exactly the way the create
-/// buttons do, so every chrome control in this workspace answers a pointer
-/// the same way.
+/// Paint one sidebar chevron centered in `hit`, register `hit` as the
+/// toggle, and light `lit` while the pointer is inside `hit`.
+///
+/// The two rectangles come apart because the open panel and the collapsed
+/// rail are not the same shape of control. The rail owns its whole column
+/// and can answer on every row of it. The panel's edge is also the resize
+/// divider, so only a band of it can answer, but the operator still reads
+/// the edge as one object and expects the whole edge to respond. So the
+/// band takes the clicks and the edge takes the light.
+///
+/// The glyph centers rather than sitting at the foot, in both states: an
+/// edge control belongs at the middle of its edge, and centering is what
+/// keeps the chevron at the same height when the panel becomes a rail.
 fn paint_toggle(
     buf: &mut Buffer,
     hit: Rect,
+    lit: Rect,
     glyph: &str,
     paint: &Paint,
     hits: &mut HitMap,
@@ -184,18 +210,25 @@ fn paint_toggle(
     } else {
         theme::add_button(paint)
     };
-    // The whole strip is clickable, so the whole strip lights: feedback
-    // has to appear under the pointer, and a rail is thirty rows tall
-    // with its glyph at the foot. Lighting the glyph alone answered a
-    // hover the operator made twenty-nine rows away.
+    // Feedback has to reach the whole object the pointer thinks it found.
+    // Lighting the glyph alone answered a hover the operator made rows
+    // away from it.
     if hovered {
-        for row in hit.y..hit.y + hit.height {
-            if let Some(cell) = buf.cell_mut((hit.x, row)) {
-                cell.set_style(style);
+        for row in lit.y..lit.y + lit.height {
+            for col in lit.x..lit.x + lit.width {
+                if let Some(cell) = buf.cell_mut((col, row)) {
+                    cell.set_style(style);
+                }
             }
         }
     }
-    let y = hit.y + hit.height - 1;
+    // Centered on the EDGE, not on the clickable band. Both states pass
+    // the whole column as `lit`, so this is the one expression that puts
+    // the chevron on the same row whether the panel is open or collapsed.
+    // Centering on `hit` instead would shift it by a row when the band is
+    // shorter than the edge. The band always contains the edge's midpoint,
+    // so the painted glyph is always clickable.
+    let y = lit.y + lit.height / 2;
     if let Some(cell) = buf.cell_mut((hit.x, y)) {
         cell.set_symbol(glyph);
         cell.set_style(style);
@@ -1251,7 +1284,7 @@ mod tests {
             "the chevron is the mouse's half of Ctrl+B b"
         );
         assert_eq!(
-            buf[(0, SIDEBAR.height - 1)].symbol(),
+            buf[(0, SIDEBAR.height / 2)].symbol(),
             SIDEBAR_EXPAND,
             "collapsed, the chevron points the way the panel will come back"
         );
@@ -1261,26 +1294,27 @@ mod tests {
         }
     }
 
-    /// The open panel carries the same control on the same row of its own
-    /// outer edge, pointing the other way. Same row as the rail's, so the
-    /// eye keeps its place across a collapse.
+    /// The open panel carries the same control on the middle of its own
+    /// outer edge, pointing the other way. The row is the one the collapsed
+    /// rail uses, so the eye keeps its place across a collapse, and that
+    /// equality is the point of the test rather than any absolute row.
     #[test]
     fn the_open_sidebar_carries_the_collapse_chevron_on_its_own_edge() {
         let paint = Paint::for_test();
         let (panel, panel_hits) = draw_sidebar(SidebarTab::Sessions, &Record::new(), &paint);
-        let edge = (
-            SIDEBAR.x + SIDEBAR.width - 1,
-            SIDEBAR.y + SIDEBAR.height - 1,
-        );
+        let edge = (SIDEBAR.x + SIDEBAR.width - 1, SIDEBAR.y + SIDEBAR.height / 2);
 
         assert!(matches!(
             panel_hits.hit(edge.0, edge.1),
             Some(HitTarget::SidebarToggle)
         ));
+        // Both states center on the full edge, so the rail's chevron row
+        // and the panel's are the same row of the screen.
+        let (rail, _) = draw_rail(&paint, None);
         assert_eq!(
-            edge.1,
-            SIDEBAR.y + SIDEBAR.height - 1,
-            "the same row the collapsed rail puts its chevron on"
+            rail[(0, SIDEBAR.height / 2)].symbol(),
+            SIDEBAR_EXPAND,
+            "the rail puts its chevron on the row the panel just used"
         );
         assert_eq!(
             panel[edge].symbol(),
@@ -1293,12 +1327,40 @@ mod tests {
         );
     }
 
+    /// The open panel's edge is shared with the resize divider, so the
+    /// toggle may not own all of it. A band answers, the rest still drags,
+    /// and the band is big enough to hit without aiming.
+    #[test]
+    fn the_collapse_control_leaves_most_of_the_resize_divider_alone() {
+        let paint = Paint::for_test();
+        let (_, hits) = draw_sidebar(SidebarTab::Sessions, &Record::new(), &paint);
+        let col = SIDEBAR.x + SIDEBAR.width - 1;
+
+        let toggle_rows: Vec<u16> = (SIDEBAR.y..SIDEBAR.y + SIDEBAR.height)
+            .filter(|y| matches!(hits.hit(col, *y), Some(HitTarget::SidebarToggle)))
+            .collect();
+
+        assert!(
+            toggle_rows.len() > 1,
+            "a one-cell button on a {}-row edge is the thing this replaced",
+            SIDEBAR.height
+        );
+        assert!(
+            toggle_rows.len() < usize::from(SIDEBAR.height),
+            "the toggle swallowed the resize divider"
+        );
+        assert!(
+            toggle_rows.contains(&(SIDEBAR.y + SIDEBAR.height / 2)),
+            "the painted chevron must be inside the band that answers"
+        );
+    }
+
     /// The chevron is a control, so it lights under the mouse the way the
     /// create buttons do, and it must not move while being pointed at.
     #[test]
     fn the_chevron_lights_under_the_mouse_without_moving() {
         let paint = Paint::for_test();
-        let cell = (0, SIDEBAR.height - 1);
+        let cell = (0, SIDEBAR.height / 2);
         let (rest, rest_hits) = draw_rail(&paint, None);
         let (hot, hot_hits) = draw_rail(&paint, Some(cell));
 
@@ -1321,7 +1383,7 @@ mod tests {
     /// glyph check proves nothing.
     #[test]
     fn the_chevron_glyph_is_stable_across_theme_and_no_color() {
-        let cell = (0, SIDEBAR.height - 1);
+        let cell = (0, SIDEBAR.height / 2);
         let (default_buf, _) = draw_rail(&Paint::for_test(), None);
         let (alt_buf, _) = draw_rail(&accent_test_paint(), None);
         let (plain_buf, _) = draw_rail(&Paint::without_color_for_test(), None);
@@ -1357,22 +1419,26 @@ mod tests {
         let record = one_row_record();
         let paint = Paint::for_test();
         let divider_x = SIDEBAR.x + SIDEBAR.width - 1;
-        let chevron_y = SIDEBAR.y + SIDEBAR.height - 1;
+        // The chevron owns a centered band of the edge now, not the footer
+        // cell. Derive it from the same function the painter uses so the
+        // test tracks the control instead of restating its arithmetic.
+        let band = toggle_reach(Rect::new(divider_x, SIDEBAR.y, 1, SIDEBAR.height));
         for tab in [SidebarTab::Sessions, SidebarTab::Stream] {
             let (_, hits) = draw_sidebar(tab, &record, &paint);
-            for y in SIDEBAR.y..chevron_y {
-                assert!(
-                    matches!(hits.hit(divider_x, y), Some(HitTarget::SidebarDivider)),
-                    "{tab:?}: row {y} lost the resize handle"
-                );
+            for y in SIDEBAR.y..SIDEBAR.y + SIDEBAR.height {
+                let in_band = y >= band.y && y < band.y + band.height;
+                if in_band {
+                    assert!(
+                        matches!(hits.hit(divider_x, y), Some(HitTarget::SidebarToggle)),
+                        "{tab:?}: row {y} is in the chevron band and must toggle"
+                    );
+                } else {
+                    assert!(
+                        matches!(hits.hit(divider_x, y), Some(HitTarget::SidebarDivider)),
+                        "{tab:?}: row {y} lost the resize handle"
+                    );
+                }
             }
-            assert!(
-                matches!(
-                    hits.hit(divider_x, chevron_y),
-                    Some(HitTarget::SidebarToggle)
-                ),
-                "{tab:?}: the collapse chevron owns the footer row of the edge"
-            );
         }
     }
 }
