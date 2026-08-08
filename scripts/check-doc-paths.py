@@ -77,7 +77,10 @@ LITERAL_SKIPS = {
     "versions/2.1.220": "a v1 release directory, quoted as history",
     "manifests": "the daemon's cwd-relative fallback directory name, not a path this repo ships",
     "themes": "the theme engine's cwd-relative fallback directory name, not a path this repo ships",
-    "tests/raw/": "soak output, gitignored on purpose (/tests/raw/ in .gitignore): 1.9MB of daemon logs and pane captures from real agent CLIs",
+    # Keyed without the trailing slash: `check_code_spans` normalizes a
+    # candidate before it gets here, so `tests/raw/` in a doc arrives as
+    # `tests/raw`.
+    "tests/raw": "soak output, gitignored on purpose (/tests/raw/ in .gitignore): 1.9MB of daemon logs and pane captures from real agent CLIs",
     "tests/raw/m1-soak/summary.json": "one such run's verdict, quoted by BENCHMARKS.md as a local artifact",
     "tests/raw/m1-soak-2/summary.json": "one such run's verdict, quoted by BENCHMARKS.md as a local artifact",
 }
@@ -150,7 +153,11 @@ def check_code_spans(page, text, bad):
         if skip_reason(candidate):
             continue
         if not (REPO / candidate).exists():
-            bad.append((page, line_of(text, m.start()), s, "code span"))
+            # Report the normalized candidate, not the span as written. A
+            # LITERAL_SKIPS entry is matched against this string, so
+            # printing `tests/raw/` while the lookup wants `tests/raw`
+            # sends the author to add a key that can never fire.
+            bad.append((page, line_of(text, m.start()), candidate, "code span"))
 
 
 def line_of(text, index):
