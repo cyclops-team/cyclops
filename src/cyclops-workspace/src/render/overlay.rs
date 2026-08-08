@@ -494,11 +494,15 @@ pub fn keybind_max_scroll(row_count: usize, area: Rect) -> u16 {
     u16::try_from(row_count.saturating_sub(list_height as usize)).unwrap_or(u16::MAX)
 }
 
-/// The theme picker: a titled list with the active row marked and the
+/// The theme picker: a titled list with the active row checked and the
 /// selected row raised. Applying repaints the whole workspace, so the
-/// rows need no swatch; the CLI's listing is the visual preview. The
-/// active marker is the stream's own "this one" marker, and it rides
-/// beside the selection highlight so the two stay readable without color.
+/// rows need no swatch; the CLI's listing is the visual preview.
+///
+/// The active marker is [`copy::MENU_CHECK`], the same glyph the app
+/// menu's toggles use, because a theme being on is the same kind of fact
+/// as motion being on and should not need a second vocabulary. It rides
+/// beside the selection highlight, so "which one is applied" and "which
+/// one is the cursor on" stay separable without color.
 fn paint_themes_dialog(
     names: &[String],
     selected: usize,
@@ -568,7 +572,11 @@ fn paint_themes_dialog(
             theme::menu_row(paint)
         };
         buf.set_style(Rect::new(left, y, usable_w, 1), style);
-        let mark = if Some(index) == active { "▸" } else { " " };
+        let mark = if Some(index) == active {
+            copy::MENU_CHECK
+        } else {
+            " "
+        };
         super::overlay_text(
             buf,
             inner,
@@ -642,43 +650,89 @@ fn input_tail(input: &str, width: usize) -> String {
     format!("{}{CURSOR}", &input[start..])
 }
 
+/// What the app menu's toggles currently read, so their rows can say so.
+///
+/// Passed in rather than reached for: this module paints and owns no
+/// state, and a menu that guessed at a preference would be a second place
+/// the answer lives.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MenuChecks {
+    pub tab_bar: bool,
+    pub motion: bool,
+    /// Whether the sidebar is showing the event stream rather than the
+    /// session tree. The item toggles between the two, so a check here
+    /// means "the stream is what you are looking at".
+    pub stream: bool,
+}
+
+/// One menu row: its label, what clicking it does, and whether it is a
+/// setting that is currently on.
+///
+/// `None` is "not a toggle", which is different from `Some(false)`: an
+/// unchecked row still reserves the check column so labels line up, and a
+/// menu with no toggles at all reserves nothing.
+pub type MenuRow = (&'static str, BindingAction, Option<bool>);
+
 /// Menu items for one open menu.
-pub fn menu_items(menu: &MenuState) -> Vec<(&'static str, BindingAction)> {
+pub fn menu_items(menu: &MenuState, checks: MenuChecks) -> Vec<MenuRow> {
     match menu {
         MenuState::None => Vec::new(),
         MenuState::AppMenu => vec![
-            (copy::MENU_NEW_TAB, BindingAction::NewTab),
-            (copy::MENU_NEW_WORKSPACE, BindingAction::NewWorkspace),
-            (copy::MENU_TOGGLE_EVENTS, BindingAction::ToggleEventPanel),
+            (copy::MENU_NEW_TAB, BindingAction::NewTab, None),
+            (copy::MENU_NEW_WORKSPACE, BindingAction::NewWorkspace, None),
+            (
+                copy::MENU_TOGGLE_EVENTS,
+                BindingAction::ToggleEventPanel,
+                Some(checks.stream),
+            ),
             // The tab strip's only visible switch. It sits beside the
             // stream toggle because both answer the same question: which
             // surfaces this workspace shows.
-            (copy::MENU_TAB_BAR, BindingAction::ToggleTabBar),
+            (
+                copy::MENU_TAB_BAR,
+                BindingAction::ToggleTabBar,
+                Some(checks.tab_bar),
+            ),
             // Same reason the tab strip's switch is here: a preference
             // with no chord needs one place a mouse can reach it.
-            (copy::MENU_MOTION, BindingAction::ToggleMotion),
-            (copy::MENU_THEMES, BindingAction::ShowThemes),
-            (copy::MENU_KEYBINDS, BindingAction::ShowKeybinds),
-            (copy::MENU_DETACH, BindingAction::Detach),
+            (
+                copy::MENU_MOTION,
+                BindingAction::ToggleMotion,
+                Some(checks.motion),
+            ),
+            // Themes opens a picker rather than flipping anything, so it
+            // carries no check of its own; the picker marks the theme
+            // that is on with the same glyph.
+            (copy::MENU_THEMES, BindingAction::ShowThemes, None),
+            (copy::MENU_KEYBINDS, BindingAction::ShowKeybinds, None),
+            (copy::MENU_DETACH, BindingAction::Detach, None),
         ],
         MenuState::ContextMenu { .. } => vec![
-            (copy::MENU_NAME_PANE, BindingAction::NamePane),
-            (copy::MENU_SPLIT_RIGHT, BindingAction::SplitRight),
-            (copy::MENU_SPLIT_DOWN, BindingAction::SplitDown),
-            (copy::MENU_SWAP_LEFT, BindingAction::SwapPaneLeft),
-            (copy::MENU_SWAP_RIGHT, BindingAction::SwapPaneRight),
-            (copy::MENU_SWAP_UP, BindingAction::SwapPaneUp),
-            (copy::MENU_SWAP_DOWN, BindingAction::SwapPaneDown),
-            (copy::MENU_ZOOM_PANE, BindingAction::ZoomPane),
-            (copy::MENU_CLOSE_PANE, BindingAction::ClosePane),
+            (copy::MENU_NAME_PANE, BindingAction::NamePane, None),
+            (copy::MENU_SPLIT_RIGHT, BindingAction::SplitRight, None),
+            (copy::MENU_SPLIT_DOWN, BindingAction::SplitDown, None),
+            (copy::MENU_SWAP_LEFT, BindingAction::SwapPaneLeft, None),
+            (copy::MENU_SWAP_RIGHT, BindingAction::SwapPaneRight, None),
+            (copy::MENU_SWAP_UP, BindingAction::SwapPaneUp, None),
+            (copy::MENU_SWAP_DOWN, BindingAction::SwapPaneDown, None),
+            (copy::MENU_ZOOM_PANE, BindingAction::ZoomPane, None),
+            (copy::MENU_CLOSE_PANE, BindingAction::ClosePane, None),
         ],
         MenuState::TabMenu { .. } => vec![
-            (copy::MENU_RENAME_TAB, BindingAction::RenameTab),
-            (copy::MENU_CLOSE_TAB, BindingAction::CloseTab),
+            (copy::MENU_RENAME_TAB, BindingAction::RenameTab, None),
+            (copy::MENU_CLOSE_TAB, BindingAction::CloseTab, None),
         ],
         MenuState::WorkspaceMenu { .. } => vec![
-            (copy::MENU_RENAME_WORKSPACE, BindingAction::RenameWorkspace),
-            (copy::MENU_CLOSE_WORKSPACE, BindingAction::CloseWorkspace),
+            (
+                copy::MENU_RENAME_WORKSPACE,
+                BindingAction::RenameWorkspace,
+                None,
+            ),
+            (
+                copy::MENU_CLOSE_WORKSPACE,
+                BindingAction::CloseWorkspace,
+                None,
+            ),
         ],
     }
 }
@@ -693,17 +747,27 @@ pub fn paint_menu(
     paint: &Paint,
     hits: &mut HitMap,
     hover: Option<(u16, u16)>,
+    checks: MenuChecks,
 ) {
-    let items = menu_items(menu);
+    let items = menu_items(menu, checks);
     if items.is_empty() {
         return;
     }
+    // The check column is reserved for the whole menu or for none of it, so
+    // labels line up down the list rather than stepping in and out as
+    // settings flip. A menu with no toggles pays nothing for it.
+    let gutter: u16 = if items.iter().any(|(_, _, c)| c.is_some()) {
+        2
+    } else {
+        0
+    };
     let w = (items
         .iter()
-        .map(|(label, _)| Span::raw(*label).width())
+        .map(|(label, _, _)| Span::raw(*label).width())
         .max()
         .unwrap_or(0) as u16)
-        .saturating_add(4);
+        .saturating_add(4)
+        .saturating_add(gutter);
     let h = items.len() as u16 + 2;
     let (ax, ay) = match menu {
         MenuState::ContextMenu { at, .. }
@@ -719,7 +783,7 @@ pub fn paint_menu(
     let block = overlay_block(paint);
     let inner = block.inner(menu_area);
     block.render(menu_area, buf);
-    for (i, (label, action)) in items.iter().enumerate() {
+    for (i, (label, action, checked)) in items.iter().enumerate() {
         let y = inner.y + i as u16;
         if y >= inner.y + inner.height {
             break;
@@ -733,7 +797,15 @@ pub fn paint_menu(
             theme::menu_row(paint)
         };
         buf.set_style(rect, style);
-        super::overlay_text(buf, inner, inner.x, y, &format!(" {label}"), style);
+        // An off toggle pays a blank, not a second glyph. A row reading
+        // "✗ Motion" beside "✓ Tab bar" is two marks to tell apart at a
+        // glance; presence against absence is one.
+        let mark = match (gutter, checked) {
+            (0, _) => String::new(),
+            (_, Some(true)) => format!("{} ", copy::MENU_CHECK),
+            (_, _) => "  ".into(),
+        };
+        super::overlay_text(buf, inner, inner.x, y, &format!(" {mark}{label}"), style);
         hits.push(rect, HitTarget::MenuItem { action: *action });
     }
 }
@@ -758,7 +830,15 @@ mod tests {
             at: (5, 2),
         };
         term.draw(|f| {
-            paint_menu(&menu, f.area(), f.buffer_mut(), &theme, &mut hits, None);
+            paint_menu(
+                &menu,
+                f.area(),
+                f.buffer_mut(),
+                &theme,
+                &mut hits,
+                None,
+                MenuChecks::default(),
+            );
         })
         .unwrap();
         let flat = flatten(term.backend().buffer());
@@ -789,6 +869,7 @@ mod tests {
                 &theme,
                 &mut hits,
                 Some((7, 3)),
+                MenuChecks::default(),
             );
         })
         .unwrap();
@@ -808,20 +889,26 @@ mod tests {
 
     #[test]
     fn tab_menu_offers_rename_and_close() {
-        let items = menu_items(&MenuState::TabMenu {
-            window_id: "@1".into(),
-            at: (0, 0),
-        });
-        let actions: Vec<_> = items.iter().map(|(_, a)| *a).collect();
+        let items = menu_items(
+            &MenuState::TabMenu {
+                window_id: "@1".into(),
+                at: (0, 0),
+            },
+            MenuChecks::default(),
+        );
+        let actions: Vec<_> = items.iter().map(|(_, a, _)| *a).collect();
         assert_eq!(
             actions,
             vec![BindingAction::RenameTab, BindingAction::CloseTab]
         );
-        let items = menu_items(&MenuState::WorkspaceMenu {
-            session: "cyclops".into(),
-            at: (0, 0),
-        });
-        let actions: Vec<_> = items.iter().map(|(_, a)| *a).collect();
+        let items = menu_items(
+            &MenuState::WorkspaceMenu {
+                session: "cyclops".into(),
+                at: (0, 0),
+            },
+            MenuChecks::default(),
+        );
+        let actions: Vec<_> = items.iter().map(|(_, a, _)| *a).collect();
         assert_eq!(
             actions,
             vec![
@@ -831,14 +918,138 @@ mod tests {
         );
     }
 
+    /// A toggle's row says what the toggle currently reads. The check is
+    /// the only difference between on and off, so the test asserts both
+    /// directions: a mark that never cleared would look identical to a
+    /// correct one on the frame where the setting is on.
+    #[test]
+    fn a_menu_toggle_is_checked_exactly_when_its_setting_is_on() {
+        let on = MenuChecks {
+            tab_bar: true,
+            motion: true,
+            stream: false,
+        };
+        let rows = menu_items(&MenuState::AppMenu, on);
+        let checked = |rows: &[MenuRow], label: &str| {
+            rows.iter()
+                .find(|(l, _, _)| *l == label)
+                .unwrap_or_else(|| panic!("{label} is not in the app menu"))
+                .2
+        };
+
+        assert_eq!(checked(&rows, copy::MENU_TAB_BAR), Some(true));
+        assert_eq!(checked(&rows, copy::MENU_MOTION), Some(true));
+        assert_eq!(checked(&rows, copy::MENU_TOGGLE_EVENTS), Some(false));
+        // Not a toggle: opening a picker is not a setting, and reserving a
+        // check for it would imply it could be on.
+        assert_eq!(checked(&rows, copy::MENU_THEMES), None);
+        assert_eq!(checked(&rows, copy::MENU_DETACH), None);
+
+        let off = MenuChecks::default();
+        let rows = menu_items(&MenuState::AppMenu, off);
+        assert_eq!(checked(&rows, copy::MENU_TAB_BAR), Some(false));
+        assert_eq!(checked(&rows, copy::MENU_MOTION), Some(false));
+    }
+
+    /// The check column is reserved for the whole menu or none of it, so
+    /// labels do not step sideways as settings flip, and a menu with no
+    /// toggles does not pay two columns for a gutter nothing uses.
+    #[test]
+    fn the_check_column_is_all_or_nothing_per_menu() {
+        let backend = TestBackend::new(60, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+
+        let render = |term: &mut Terminal<TestBackend>, menu: MenuState, checks: MenuChecks| {
+            let mut hits = HitMap::default();
+            term.draw(|f| {
+                paint_menu(
+                    &menu,
+                    f.area(),
+                    f.buffer_mut(),
+                    &theme,
+                    &mut hits,
+                    None,
+                    checks,
+                );
+            })
+            .unwrap();
+            let buf = term.backend().buffer();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let app_on = render(
+            &mut term,
+            MenuState::AppMenu,
+            MenuChecks {
+                tab_bar: true,
+                motion: false,
+                stream: false,
+            },
+        );
+        let tab_bar = app_on
+            .iter()
+            .find(|line| line.contains(copy::MENU_TAB_BAR))
+            .expect("a Tab bar row");
+        let motion = app_on
+            .iter()
+            .find(|line| line.contains(copy::MENU_MOTION))
+            .expect("a Motion row");
+        assert!(
+            tab_bar.contains(&format!("{} {}", copy::MENU_CHECK, copy::MENU_TAB_BAR)),
+            "an on toggle carries the check: {tab_bar}"
+        );
+        assert!(
+            !motion.contains(copy::MENU_CHECK),
+            "an off toggle carries no mark of its own: {motion}"
+        );
+        // Column, not byte offset: the check is three bytes and a space is
+        // one, so `find` alone reports a two-byte gap that is not on screen.
+        let column_of = |line: &str, needle: &str| {
+            line.find(needle)
+                .map(|byte| line[..byte].chars().count())
+                .expect("the label is on this line")
+        };
+        assert_eq!(
+            column_of(tab_bar, copy::MENU_TAB_BAR),
+            column_of(motion, copy::MENU_MOTION),
+            "checked and unchecked labels start in the same column"
+        );
+
+        // A menu with no toggles at all reserves nothing for them.
+        let ctx = render(
+            &mut term,
+            MenuState::ContextMenu {
+                pane_id: "%1".into(),
+                at: (0, 0),
+            },
+            MenuChecks::default(),
+        );
+        let zoom = ctx
+            .iter()
+            .find(|line| line.contains(copy::MENU_ZOOM_PANE))
+            .expect("a Zoom pane row");
+        let gutterless = format!(" {}", copy::MENU_ZOOM_PANE);
+        assert!(
+            zoom.contains(&gutterless),
+            "a menu with no toggles indents by one, not three: {zoom}"
+        );
+    }
+
     /// The app menu is the visible route to everything that has no chrome
     /// of its own, and the tab strip is now one of those: hidden, its item
     /// here is the only way back, so it has to be in this list.
     #[test]
     fn app_menu_offers_the_surface_toggles_between_new_and_keybinds() {
-        let actions: Vec<_> = menu_items(&MenuState::AppMenu)
+        let actions: Vec<_> = menu_items(&MenuState::AppMenu, MenuChecks::default())
             .iter()
-            .map(|(_, action)| *action)
+            .map(|(_, action, _)| *action)
             .collect();
         assert_eq!(
             actions,
@@ -877,7 +1088,7 @@ mod tests {
         let buf = term.backend().buffer();
         let flat = flatten(buf);
         assert!(flat.contains("Themes"), "title renders: {flat}");
-        assert!(flat.contains("▸ dark"), "active row is marked: {flat}");
+        assert!(flat.contains("✓ dark"), "active row is checked: {flat}");
         assert!(flat.contains("light") && flat.contains("solar"), "{flat}");
         assert!(flat.contains("↵ Apply"), "confirm affordance: {flat}");
         assert!(flat.contains("Esc Cancel"), "cancel affordance: {flat}");
@@ -1228,7 +1439,15 @@ mod tests {
                 if let Some(dialog) = &dialog {
                     paint_dialog(dialog, f.area(), f.buffer_mut(), &theme, &mut hits, None);
                 }
-                paint_menu(&menu, f.area(), f.buffer_mut(), &theme, &mut hits, None);
+                paint_menu(
+                    &menu,
+                    f.area(),
+                    f.buffer_mut(),
+                    &theme,
+                    &mut hits,
+                    None,
+                    MenuChecks::default(),
+                );
             })
             .unwrap();
             let flat = flatten(term.backend().buffer());
@@ -1277,8 +1496,8 @@ mod tests {
             "the themes title starts at the inset"
         );
         assert_eq!(
-            buf[(content_x, row_of(buf, "▸ dark"))].symbol(),
-            "▸",
+            buf[(content_x, row_of(buf, "✓ dark"))].symbol(),
+            copy::MENU_CHECK,
             "the active marker starts at the inset"
         );
         let confirm = hits

@@ -49,7 +49,7 @@ use crate::runtime::{Color, GridCell};
 use crate::theme::Paint;
 
 pub use canvas::{paint_window, tmux_client_size, HostCursor, WindowPaintCtx, PANE_GRIP};
-pub use overlay::{keybind_max_scroll, paint_dialog, paint_menu};
+pub use overlay::{keybind_max_scroll, paint_dialog, paint_menu, MenuChecks};
 pub use sidebar::{paint_sidebar, paint_sidebar_rail, SIDEBAR_COLLAPSE, SIDEBAR_EXPAND};
 pub use stream::{event_stream_rows, EventRow};
 pub use tab_bar::paint_tab_bar;

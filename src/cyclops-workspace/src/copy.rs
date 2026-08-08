@@ -105,6 +105,11 @@ pub const MENU_NEW_WORKSPACE: &str = "New workspace";
 
 pub const MENU_TOGGLE_EVENTS: &str = "Event stream";
 
+/// Marks a menu row whose setting is on, and the active row in the theme
+/// picker. One cell in every monospace font, chosen by state and never by
+/// theme, so it reads under `NO_COLOR` (rule 11).
+pub const MENU_CHECK: &str = "✓";
+
 pub const MENU_TAB_BAR: &str = "Tab bar";
 /// The only visible switch for chrome fades (`crate::animate`).
 pub const MENU_MOTION: &str = "Motion";

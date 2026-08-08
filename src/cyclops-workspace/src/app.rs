@@ -2717,6 +2717,11 @@ fn draw(
                 &app.paint,
                 &mut app.hit_map,
                 app.hover,
+                crate::render::MenuChecks {
+                    tab_bar: app.prefs.tab_bar_visible,
+                    motion: app.prefs.motion,
+                    stream: app.sidebar_tab == crate::persist::SidebarTab::Stream,
+                },
             );
             if let Some(dialog) = &app.dialog {
                 paint_dialog(
