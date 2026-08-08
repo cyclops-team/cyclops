@@ -218,6 +218,70 @@ fn install_reserved_label_names_the_naming_step() {
     let _ = fs::remove_dir_all(&home);
 }
 
+/// FNV-1a 64, hex. Restated here rather than reached for: the point is to
+/// hash the artifact independently of the code that recorded the hash.
+fn fnv64(data: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in data {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// The receipt is what lets a later `cyclops start` refresh this artifact
+/// instead of leaving it pointed at a binary that moved. Without it every
+/// prepared file is unmanaged forever.
+#[test]
+fn install_records_a_receipt_beside_the_artifact() {
+    let home = scratch_home("hircpt");
+    let out = run(&home, &["hooks", "install", "codex", "--agent", "reviewer"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let dir = home.join("hooks/codex/reviewer");
+    let artifact = fs::read(dir.join("hooks.json")).expect("rendered hook artifact");
+    let receipt: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.join(".cyclops-prepared.json")).unwrap())
+            .expect("receipt is JSON");
+
+    assert_eq!(receipt["vendor"], "codex");
+    assert_eq!(receipt["agent"], "reviewer");
+    assert_eq!(receipt["file"], "hooks.json");
+    assert_eq!(receipt["rendered_fnv"], fnv64(&artifact));
+    // The path the commands actually bake, so a later run can tell a
+    // prefix move from a template change.
+    assert_eq!(receipt["bin"], env!("CARGO_BIN_EXE_cyclops"));
+    assert!(
+        String::from_utf8_lossy(&artifact).contains(env!("CARGO_BIN_EXE_cyclops")),
+        "the receipt must name the path the artifact carries"
+    );
+    assert!(receipt["written_ms"].as_u64().unwrap_or(0) > 0);
+
+    // An explicit dest outside the refreshed tree says so, because
+    // nothing will ever repoint it.
+    let explicit = home.join("elsewhere");
+    let out = run(
+        &home,
+        &[
+            "hooks",
+            "install",
+            "codex",
+            "--agent",
+            "reviewer",
+            "--dest",
+            explicit.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("will not refresh it"), "{stdout}");
+    let _ = fs::remove_dir_all(&home);
+}
+
 #[test]
 fn install_refuses_vendor_dot_dirs() {
     let home = scratch_home("hiv");

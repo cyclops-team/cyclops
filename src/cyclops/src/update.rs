@@ -1,13 +1,16 @@
 //! `cyclops update`: replace the installed build with a fresh one.
 //!
 //! Reinstalling was always the update path: `scripts/install.sh` builds,
-//! copies beside the installed binaries and renames over them, and never
-//! rewrites config, themes or manifests already in the home. What was
-//! missing was the verb, a before-and-after report, and the restart
-//! steps, so updating meant re-finding the curl one-liner and guessing
-//! whether it took. This verb owns those three things and delegates the
-//! install itself to the installer, so "get a new build onto this
-//! machine" keeps exactly one implementation.
+//! copies beside the installed binaries and renames over them, and
+//! rewrites a file already in the home only when Cyclops wrote it and can
+//! prove it. Config is never rewritten; the theme and manifest seeds
+//! replace only bytes they hash as their own, and the hook refresh only
+//! artifacts its own receipt vouches for. What was missing was the verb,
+//! a before-and-after report, and the restart steps, so updating meant
+//! re-finding the curl one-liner and guessing whether it took. This verb
+//! owns those three things and delegates the install itself to the
+//! installer, so "get a new build onto this machine" keeps exactly one
+//! implementation.
 //!
 //! The source is a fresh clone of `CYCLOPS_REPO` at `CYCLOPS_REF` (the
 //! installer's own overrides, same defaults), never the hosted
@@ -121,9 +124,13 @@ impl Drop for Scratch {
     }
 }
 
-/// The newly installed binary, resolved the way a shell resolves it.
-/// Never this process: it is still the old build, and self-reporting is
-/// how an update that silently failed would go unnoticed.
+/// The installed binary, resolved the way a shell resolves it.
+///
+/// Never this process, for two different reasons. Reporting the new
+/// version: this process is still the old build, and self-reporting is how
+/// an update that silently failed would go unnoticed. Picking the prefix:
+/// the copy a shell runs is the copy an update has to land on, and this
+/// process may be a build directory nobody installed from.
 fn installed_cyclops() -> Option<PathBuf> {
     if let Some(p) = which("cyclops") {
         return Some(p);
@@ -146,6 +153,15 @@ fn which(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&path)
         .map(|d| d.join(name))
         .find(|p| p.is_file())
+}
+
+/// Where the installer must write, resolved before anything is replaced.
+///
+/// None when no cyclops resolves at all, which is the machine that has
+/// never been installed to; there the installer's own `pick_prefix` is the
+/// only answer and it makes it.
+fn install_prefix() -> Option<PathBuf> {
+    installed_cyclops()?.parent().map(Path::to_path_buf)
 }
 
 /// `<bin> --version` with the leading command name stripped, so the
@@ -225,7 +241,10 @@ fn restart_steps(style: &Style) -> String {
 /// 2. Freshness check: `git ls-remote` against the baked sha. Already
 ///    current says so and stops; a build that cannot be compared says why
 ///    and goes on.
-/// 3. Clone and run the clone's installer, streaming its output.
+/// 3. Clone and run the clone's installer, streaming its output, at the
+///    prefix the current install already uses. Its last step is
+///    `cyclops start --setup-only`, which is what repoints the prepared
+///    hook artifacts at the new binary.
 /// 4. Report old to new, from the new binary's own `--version`, then the
 ///    restart steps.
 pub fn run(json: bool, style: &Style) -> i32 {
@@ -277,10 +296,25 @@ pub fn run(json: bool, style: &Style) -> i32 {
     }
     // The clone's installer, streamed: it prints every file it touches,
     // and it is the one implementation of where binaries and home live.
-    match Command::new("sh")
-        .arg(src.join("scripts").join("install.sh"))
-        .status()
-    {
+    //
+    // --prefix pins it to the directory the install already uses. With no
+    // --prefix the installer re-picks from the current PATH, so a PATH
+    // that changed since install writes the new build somewhere else,
+    // leaves the old one in place, and every hook already wired keeps
+    // invoking it. A stale build answering hooks is worse than a missing
+    // one: the edges keep arriving, from a build the daemon no longer
+    // matches. Where it lands is printed, because a prefix is the kind of
+    // thing an operator only discovers is wrong much later.
+    let mut installer = Command::new("sh");
+    installer.arg(src.join("scripts").join("install.sh"));
+    if let Some(prefix) = install_prefix() {
+        println!(
+            "  {}",
+            style.dim(&format!("installing over {}", prefix.display()))
+        );
+        installer.arg("--prefix").arg(prefix);
+    }
+    match installer.status() {
         Ok(s) if s.success() => {}
         Ok(_) => {
             eprintln!("{}", copy::update_install_failed(None));
