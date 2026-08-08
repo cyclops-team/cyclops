@@ -46,6 +46,7 @@ use ratatui::style::{Color as RtColor, Modifier, Style};
 
 use crate::drag::{DragState, DragTarget};
 use crate::runtime::{Color, GridCell};
+use crate::theme::Paint;
 
 pub use canvas::{paint_window, tmux_client_size, HostCursor, WindowPaintCtx, PANE_GRIP};
 pub use overlay::{keybind_max_scroll, paint_dialog, paint_menu};
@@ -435,6 +436,44 @@ fn lerp(from: (u8, u8, u8), to: (u8, u8, u8), f: f64) -> (u8, u8, u8) {
     (mix(from.0, to.0), mix(from.1, to.1), mix(from.2, to.2))
 }
 
+/// One frame of a fade between two chrome styles, `t` of the way from
+/// `from` to `to`. The color half of `crate::animate`, which supplies `t`.
+///
+/// FOREGROUND ONLY. Background and every modifier come from `to` outright,
+/// because an animation may move at most one side of a contrast pair: a
+/// fill crossfade moves both, and its midpoint has no measured contrast
+/// (panel ink on panel fading to panel ink on accent measures 1.69:1 at
+/// t=0.5 in the shipped dark theme). A foreground fade against a fixed
+/// ground travels between two pairs the theme already measured, which is
+/// why the debug assert below holds every caller to a fixed ground.
+///
+/// Snaps to `to` when there is nothing to interpolate. Without truecolor an
+/// interpolated color resolves to the nearest 256-cube entry, and the whole
+/// dim-to-accent path collapses to four or five entries, so an eight-frame
+/// fade shows four steps. Banding is worse than a snap.
+///
+/// The callers are the surfaces that paint animated chrome, `canvas` (the
+/// pane border, the state cell, the notice) and `sidebar` (the row's status
+/// glyph); the allow goes with the first of them to land.
+#[allow(dead_code)]
+pub(crate) fn blend(paint: &Paint, from: Style, to: Style, t: f32) -> Style {
+    debug_assert!(
+        from.bg == to.bg,
+        "a fade moves the figure, never the ground"
+    );
+    if t <= 0.0 {
+        return from;
+    }
+    if t >= 1.0 || !paint.truecolor {
+        return to;
+    }
+    let (Some(a), Some(b)) = (from.fg.and_then(srgb), to.fg.and_then(srgb)) else {
+        return to;
+    };
+    let (r, g, blue) = lerp(a, b, f64::from(t));
+    to.fg(RtColor::Rgb(r, g, blue))
+}
+
 #[cfg(test)]
 mod contrast_tests {
     use super::*;
@@ -720,6 +759,56 @@ mod tests {
         assert_eq!(areas.rail, Some(Rect::new(0, 0, 1, 50)));
         assert_eq!(areas.tab_bar.height, 0);
         assert_eq!(areas.canvas, Rect::new(1, 0, 199, 50));
+    }
+
+    /// `Paint::for_test` builds the 256-color path; the fade only runs on
+    /// truecolor, so flip the one field that gates it.
+    fn truecolor_paint() -> Paint {
+        let mut paint = Paint::for_test();
+        paint.truecolor = true;
+        paint
+    }
+
+    /// The figure moves, the ground and the modifiers do not. A midpoint
+    /// that is neither endpoint is the whole point; a midpoint that changed
+    /// the background would be a contrast pair nobody measured.
+    #[test]
+    fn blend_moves_only_the_foreground() {
+        let paint = truecolor_paint();
+        let ground = RtColor::Rgb(26, 26, 26);
+        let from = Style::new().fg(RtColor::Rgb(0, 0, 0)).bg(ground);
+        let to = Style::new()
+            .fg(RtColor::Rgb(100, 200, 40))
+            .bg(ground)
+            .add_modifier(Modifier::BOLD);
+
+        assert_eq!(blend(&paint, from, to, 0.0), from, "t=0 is the start");
+        assert_eq!(blend(&paint, from, to, 1.0), to, "t=1 is the target");
+
+        let mid = blend(&paint, from, to, 0.5);
+        assert_eq!(mid.fg, Some(RtColor::Rgb(50, 100, 20)));
+        assert_eq!(mid.bg, Some(ground), "the ground never animates");
+        assert!(
+            mid.add_modifier.contains(Modifier::BOLD),
+            "modifiers come from the target outright"
+        );
+    }
+
+    /// Without truecolor every interpolated step would round to the same
+    /// handful of 256-cube entries, so there is no fade to show and the
+    /// target is what gets painted.
+    #[test]
+    fn blend_without_truecolor_snaps_to_the_target() {
+        let paint = Paint::for_test();
+        let from = Style::new().fg(RtColor::Rgb(0, 0, 0));
+        let to = Style::new().fg(RtColor::Rgb(100, 200, 40));
+        assert_eq!(blend(&paint, from, to, 0.5), to);
+
+        // Same for a pair whose ink is not a color at all: with NO_COLOR
+        // both endpoints are the empty style, and there is nothing to
+        // interpolate between.
+        let plain = Paint::without_color_for_test();
+        assert_eq!(blend(&plain, Style::new(), Style::new(), 0.5), Style::new());
     }
 
     #[test]

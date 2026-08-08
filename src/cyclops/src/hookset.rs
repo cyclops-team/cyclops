@@ -1,6 +1,6 @@
-//! `cyclops hooks`: install (render vendor hook configs), verify (hook
-//! liveness), selftest (one no-op round trip through the delivery
-//! pipeline).
+//! `cyclops hooks`: install (render vendor hook configs), refresh (keep
+//! the prepared ones pointed at this build), verify (hook liveness),
+//! selftest (one no-op round trip through the delivery pipeline).
 //!
 //! Install PREPARES artifacts and prints wiring instructions; it never
 //! writes into vendor dot-dirs (~/.claude, ~/.codex, ~/.gemini, .agents,
@@ -8,12 +8,18 @@
 //! Configuration does not equal subscription (amendment c, finding F1):
 //! a rendered config proves nothing until `hooks verify` or
 //! `hooks selftest` shows edges actually arriving.
+//!
+//! Refresh is a different act from install and keeps the same boundary.
+//! It rewrites bytes Cyclops itself wrote, at a path Cyclops chose, under
+//! `$CYCLOPS_HOME/hooks/`, and only when the receipt beside them proves
+//! it. Nothing it writes has any runtime effect until a human copies it,
+//! which is why it needs no consent that install has not already had.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::ValueEnum;
 use cyclops_proto::{DeliveryReceipt, DeliveryState};
@@ -39,6 +45,15 @@ const SELFTEST_READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// Path components that mark a vendor CLI's own config tree. Install
 /// refuses to write anywhere inside one, whatever the --dest says.
 const VENDOR_DIRS: &[&str] = &[".claude", ".codex", ".gemini", ".agents", ".cursor"];
+
+/// The receipt install drops beside every artifact it prepares.
+///
+/// Without it a refresh has two options and both are wrong: guess that any
+/// JSON at the path it would have used is its own, or never refresh at
+/// all. The first silently reverts the operator's edits, which is the
+/// failure manifests.rs:53-105 exists to prevent; the second leaves every
+/// prepared artifact naming a binary path that moved.
+const RECEIPT_NAME: &str = ".cyclops-prepared.json";
 
 /// Sequence for same-directory temporary artifact names.
 static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -75,6 +90,19 @@ impl CliKind {
             CliKind::Codex => "codex",
             CliKind::Agy => "agy",
             CliKind::Cursor => "cursor",
+        }
+    }
+
+    /// The inverse of [`CliKind::name`]. Refresh reads the vendor out of a
+    /// directory name install created, so the two live side by side and
+    /// cannot drift apart unnoticed.
+    fn from_name(name: &str) -> Option<CliKind> {
+        match name {
+            "claude" => Some(CliKind::Claude),
+            "codex" => Some(CliKind::Codex),
+            "agy" => Some(CliKind::Agy),
+            "cursor" => Some(CliKind::Cursor),
+            _ => None,
         }
     }
 }
@@ -200,6 +228,78 @@ fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
     ))
 }
 
+/// FNV-1a 64, hex. Not cryptographic and does not need to be: the question
+/// is "did the operator edit this file", not "is this an attack".
+/// manifests.rs and themeseed.rs each carry the same eight lines for the
+/// same question; a third copy is cheaper than a crate nobody else wants.
+fn fnv64(data: &[u8]) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in data {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// What install recorded about one prepared artifact, written beside it as
+/// [`RECEIPT_NAME`]. These five fields are what refresh compares; the file
+/// also carries a timestamp and a build string for whoever opens it.
+///
+/// Hand-parsed rather than derived: this crate carries serde_json and not
+/// serde, and five strings do not earn a dependency.
+struct Receipt {
+    vendor: String,
+    agent: String,
+    file: String,
+    bin: String,
+    rendered_fnv: String,
+}
+
+impl Receipt {
+    fn path(dir: &Path) -> PathBuf {
+        dir.join(RECEIPT_NAME)
+    }
+
+    /// None when there is no receipt, it is unreadable, or it is missing a
+    /// field. Every one of those means the artifact beside it is not
+    /// provably Cyclops', which is the same answer.
+    fn read(dir: &Path) -> Option<Receipt> {
+        let text = fs::read_to_string(Self::path(dir)).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let field = |key: &str| value[key].as_str().map(String::from);
+        Some(Receipt {
+            vendor: field("vendor")?,
+            agent: field("agent")?,
+            file: field("file")?,
+            bin: field("bin")?,
+            rendered_fnv: field("rendered_fnv")?,
+        })
+    }
+
+    /// Written after the artifact, never before. A crash between the two
+    /// leaves an artifact with no receipt, which refresh skips; the other
+    /// order would leave a receipt vouching for bytes nobody wrote.
+    fn write(&self, dir: &Path) -> io::Result<()> {
+        let body = json!({
+            "vendor": self.vendor,
+            "agent": self.agent,
+            "file": self.file,
+            "bin": self.bin,
+            "rendered_fnv": self.rendered_fnv,
+            "written_ms": now_ms(),
+            "version": crate::VERSION,
+        });
+        write_atomic(&Self::path(dir), &format!("{body}\n"))
+    }
+}
+
 /// True when `dest` points inside a vendor CLI's own config tree.
 fn inside_vendor_dir(dest: &Path) -> bool {
     dest.components().any(|c| {
@@ -216,6 +316,13 @@ fn cyclops_bin() -> String {
         .ok()
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| "cyclops".to_string())
+}
+
+/// Where install writes with no `--dest`, and the only tree [`refresh`]
+/// walks. An artifact placed anywhere else is outside refresh's reach, and
+/// install says so rather than implying coverage.
+fn hooks_root() -> PathBuf {
+    cyclops_proto::cyclops_home().join("hooks")
 }
 
 pub fn run_install(
@@ -236,12 +343,9 @@ pub fn run_install(
         );
         return EXIT_USAGE;
     }
-    let dest_dir = dest.map(Path::to_path_buf).unwrap_or_else(|| {
-        cyclops_proto::cyclops_home()
-            .join("hooks")
-            .join(kind.name())
-            .join(label)
-    });
+    let dest_dir = dest
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| hooks_root().join(kind.name()).join(label));
     if inside_vendor_dir(&dest_dir) {
         eprintln!(
             "{} is a vendor config directory; cyclops prepares files and prints \
@@ -252,7 +356,8 @@ pub fn run_install(
         );
         return EXIT_USAGE;
     }
-    let content = render(kind, label, &cyclops_bin());
+    let bin = cyclops_bin();
+    let content = render(kind, label, &bin);
     let path = dest_dir.join(kind.file_name());
     if json {
         println!(
@@ -284,12 +389,347 @@ pub fn run_install(
         eprintln!("can't write {}: {e}", path.display());
         return 1;
     }
+    // The receipt is what makes this artifact refreshable later. Its
+    // failure is a note and not the verb's: the artifact is written and
+    // correct, it is only unmanaged, and saying "install failed" over a
+    // file that works would send the operator after the wrong thing.
+    let receipt = Receipt {
+        vendor: kind.name().to_string(),
+        agent: label.to_string(),
+        file: kind.file_name().to_string(),
+        bin,
+        rendered_fnv: fnv64(content.as_bytes()),
+    };
+    if let Err(e) = receipt.write(&dest_dir) {
+        eprintln!(
+            "the hook config is written and usable, but its receipt ({}) is not: {e}. \
+             cyclops start will leave this file alone instead of refreshing it when \
+             the cyclops path changes; rerun this command to record one.",
+            Receipt::path(&dest_dir).display()
+        );
+    }
     if !json {
         println!("Wrote {}", path.display());
+        // Refresh walks only the default tree, so an explicit --dest
+        // elsewhere stays the operator's to keep current.
+        if dest.is_some() && !dest_dir.starts_with(hooks_root()) {
+            println!(
+                "  This dest is outside {}, so cyclops start will not refresh it when the \
+                 cyclops path changes. Rerun this command after an update.",
+                hooks_root().display()
+            );
+        }
         println!();
         println!("{}", instructions(kind, &path, label));
     }
     0
+}
+
+/// What one [`refresh`] run did, one classification per (vendor, label)
+/// directory under `<home>/hooks/`.
+#[derive(Default)]
+pub struct Refreshed {
+    /// The tree that was walked. Carried rather than recomputed, so a note
+    /// names the directory this run actually touched.
+    pub root: PathBuf,
+    /// Artifacts rewritten for this build's path or templates.
+    pub rewritten: Vec<PathBuf>,
+    /// Artifacts already matching what this build renders. Counted and not
+    /// named: a line on every run is noise.
+    pub current: usize,
+    /// Bytes that no longer hash to their receipt. The operator changed
+    /// them, so they are never touched.
+    pub edited: Vec<PathBuf>,
+    /// Artifacts with no usable receipt, which is everything prepared by a
+    /// build that predates them. Never touched.
+    pub unmanaged: Vec<PathBuf>,
+    /// The binary path the rewritten artifacts used to name, when this
+    /// build moved. First one wins; a home holding two is a case nobody
+    /// has and the note reads the same either way.
+    pub moved_from: Option<String>,
+    /// User-level vendor files still holding `moved_from`. Read-only
+    /// evidence that a copy the operator already merged is broken.
+    pub wired: Vec<PathBuf>,
+    /// Artifacts naming another cyclops that is still on disk, with that
+    /// path. Left alone: see [`refresh_one`].
+    pub other_build: Vec<(PathBuf, String)>,
+    /// Why a directory could not be refreshed, one sentence each.
+    pub problems: Vec<String>,
+}
+
+/// Rewrite the prepared hook artifacts this build outdated, and nothing
+/// else.
+///
+/// Called from `prepare_home`, so every `cyclops start`, every
+/// `start --setup-only` and therefore every install and every update
+/// converges. No timer is armed and nothing repeats (invariant 9): this
+/// runs once, inside a command the operator typed.
+///
+/// The rule, and it is the whole design: an artifact is rewritten only
+/// when the receipt beside it says Cyclops wrote it AND the bytes still
+/// hash to what that receipt recorded. Anything else is reported once and
+/// left exactly as it is. Nothing outside `<home>/hooks/` is written.
+///
+/// What this does NOT do: repair a copy the operator already merged into
+/// vendor config. Cyclops never wrote that file and does not know where it
+/// went, so a prefix move names it instead ([`wired_copies_holding`]).
+// The call site is workspace.rs `prepare_home`, which is not in this
+// change's file set. Delete this allow in the commit that adds it.
+#[allow(dead_code)]
+pub fn refresh(home: &Path) -> Refreshed {
+    let mut out = Refreshed {
+        root: home.join("hooks"),
+        ..Refreshed::default()
+    };
+    let bin = cyclops_bin();
+    for vendor_dir in sorted_dirs(&out.root) {
+        let Some(kind) = vendor_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(CliKind::from_name)
+        else {
+            continue;
+        };
+        for label_dir in sorted_dirs(&vendor_dir) {
+            let Some(label) = label_dir.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            // The daemon's own naming rule, from the same place install
+            // used to refuse the name. A directory it rejects cannot be a
+            // label any hook reports as.
+            if cyclops_proto::label::refusal(label).is_some() {
+                continue;
+            }
+            refresh_one(kind, label, &label_dir, &bin, &mut out);
+        }
+    }
+    if let Some(old) = out.moved_from.clone() {
+        out.wired = wired_copies_holding(&wired_candidates(), &old);
+    }
+    out
+}
+
+/// One (vendor, label) directory, classified into exactly one of the four
+/// outcomes and acted on.
+fn refresh_one(kind: CliKind, label: &str, dir: &Path, bin: &str, out: &mut Refreshed) {
+    let artifact = dir.join(kind.file_name());
+    // A receipt with no artifact beside it is the crash between the two
+    // writes. There is nothing on disk to refresh.
+    let Ok(bytes) = fs::read(&artifact) else {
+        return;
+    };
+    // A receipt describing some other file is not proof about this one.
+    let receipt = match Receipt::read(dir) {
+        Some(r) if r.vendor == kind.name() && r.agent == label && r.file == kind.file_name() => r,
+        _ => {
+            out.unmanaged.push(artifact);
+            return;
+        }
+    };
+    if fnv64(&bytes) != receipt.rendered_fnv {
+        out.edited.push(artifact);
+        return;
+    }
+    let rendered = render(kind, label, bin);
+    if rendered.as_bytes() == bytes.as_slice() {
+        out.current += 1;
+        return;
+    }
+    // The recorded binary still runs, so this is two builds on one machine
+    // and not a prefix move. A developer running ./target/release/cyclops
+    // would otherwise repoint every artifact at a path cargo clean
+    // deletes, and the installed build would repoint them back.
+    if receipt.bin != bin && Path::new(&receipt.bin).exists() {
+        out.other_build.push((artifact, receipt.bin));
+        return;
+    }
+    if let Err(e) = write_atomic(&artifact, &rendered) {
+        out.problems
+            .push(format!("refresh {}: {e}", artifact.display()));
+        return;
+    }
+    if receipt.bin != bin && out.moved_from.is_none() {
+        out.moved_from = Some(receipt.bin);
+    }
+    let next = Receipt {
+        vendor: kind.name().to_string(),
+        agent: label.to_string(),
+        file: kind.file_name().to_string(),
+        bin: bin.to_string(),
+        rendered_fnv: fnv64(rendered.as_bytes()),
+    };
+    if let Err(e) = next.write(dir) {
+        out.problems
+            .push(format!("receipt {}: {e}", Receipt::path(dir).display()));
+    }
+    out.rewritten.push(artifact);
+}
+
+/// Immediate subdirectories of `parent`, sorted, so two runs over the same
+/// home report in the same order.
+fn sorted_dirs(parent: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = match fs::read_dir(parent) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    dirs.sort();
+    dirs
+}
+
+/// The user-level files [`instructions`] tells the operator to merge a
+/// prepared artifact into.
+///
+/// Project-local `<workspace>/.agents/hooks.json` and
+/// `<workspace>/.cursor/hooks.json` are deliberately absent: nothing
+/// records which workspaces exist, and listing a path Cyclops cannot
+/// enumerate would imply coverage there is none.
+fn wired_candidates() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let codex = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"));
+    vec![
+        codex.join("hooks.json"),
+        home.join(".cursor").join("hooks.json"),
+        home.join(".claude").join("settings.json"),
+    ]
+}
+
+/// Which of `candidates` still contain `old_bin`, by plain substring.
+///
+/// This module refuses to WRITE vendor config, and that is not what this
+/// is. Reading back one literal string Cyclops itself baked into a file
+/// the operator copied is what turns "every hook fails and the vendor
+/// swallows it" into a named file and a fix. The bytes are never parsed,
+/// never echoed, and never written.
+fn wired_copies_holding(candidates: &[PathBuf], old_bin: &str) -> Vec<PathBuf> {
+    if old_bin.is_empty() {
+        return Vec::new();
+    }
+    candidates
+        .iter()
+        .filter(|p| fs::read_to_string(p).is_ok_and(|text| text.contains(old_bin)))
+        .cloned()
+        .collect()
+}
+
+/// The vendor and label a prepared artifact's path encodes, which is where
+/// [`refresh`] read them from in the first place.
+fn vendor_and_label(artifact: &Path) -> Option<(String, String)> {
+    let dir = artifact.parent()?;
+    let label = dir.file_name()?.to_str()?.to_string();
+    let vendor = dir.parent()?.file_name()?.to_str()?.to_string();
+    Some((vendor, label))
+}
+
+fn paths(list: &[PathBuf]) -> String {
+    list.iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+impl Refreshed {
+    /// The lines `prepare_home` prints under its ready line.
+    ///
+    /// Empty when nothing happened. Every entry here is something that
+    /// changed or something the operator has to act on; a note repeated
+    /// every run trains the reader to skip the run that mattered.
+    // Same pending call site as `refresh`.
+    #[allow(dead_code)]
+    pub fn notes(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        if !self.rewritten.is_empty() {
+            out.push(refreshed_note(self.rewritten.len(), &self.root));
+        }
+        if let Some(old) = &self.moved_from {
+            out.push(moved_note(old, &self.wired, &self.root));
+        }
+        if !self.edited.is_empty() {
+            out.push(edited_note(&self.edited));
+        }
+        if !self.unmanaged.is_empty() {
+            out.push(unmanaged_note(&self.unmanaged));
+        }
+        for (artifact, bin) in &self.other_build {
+            out.push(other_build_note(artifact, bin));
+        }
+        out.extend(self.problems.iter().cloned());
+        out
+    }
+}
+
+fn refreshed_note(n: usize, root: &Path) -> String {
+    let thing = if n == 1 { "config" } else { "configs" };
+    format!("refreshed {n} prepared hook {thing} in {}", root.display())
+}
+
+/// Said once after a prefix move. The prepared artifacts are fixed; a copy
+/// already merged into vendor config is not, and cannot be without the
+/// operator, so it is named rather than quietly claimed as repaired.
+fn moved_note(old_bin: &str, wired: &[PathBuf], root: &Path) -> String {
+    let held = if wired.is_empty() {
+        "Nothing under $HOME still names it, but a copy you merged into a project's \
+         .agents/ or .cursor/ is not checked."
+            .to_string()
+    } else {
+        format!(
+            "These still name it and their hooks fail silently until you change them: {}.",
+            paths(wired)
+        )
+    };
+    format!(
+        "the prepared hook configs used to run {old_bin}; they now run this build. \
+         {held} Replace the cyclops path in any wired copy, or recopy from {}.",
+        root.display()
+    )
+}
+
+fn edited_note(edited: &[PathBuf]) -> String {
+    let thing = if edited.len() == 1 {
+        "config"
+    } else {
+        "configs"
+    };
+    format!(
+        "left {} edited prepared hook {thing} alone: {}. Delete one to have \
+         cyclops hooks install prepare it fresh.",
+        edited.len(),
+        paths(edited)
+    )
+}
+
+/// Everything prepared before receipts existed. Naming the one command
+/// that brings a directory under management beats listing every path.
+fn unmanaged_note(unmanaged: &[PathBuf]) -> String {
+    let n = unmanaged.len();
+    let (thing, has, which) = if n == 1 {
+        ("config", "has", "it")
+    } else {
+        ("configs", "have", "one")
+    };
+    let cmd = vendor_and_label(&unmanaged[0])
+        .map(|(vendor, label)| format!("cyclops hooks install {vendor} --agent {label}"))
+        .unwrap_or_else(|| "cyclops hooks install".to_string());
+    format!(
+        "{n} prepared hook {thing} {has} no receipt, so cyclops leaves them alone \
+         rather than guess they are its own; {cmd} brings {which} under refresh."
+    )
+}
+
+fn other_build_note(artifact: &Path, bin: &str) -> String {
+    format!(
+        "{} runs {bin}, which is still on disk, so it was left alone. Two builds on \
+         one machine: rerun cyclops hooks install from the build you want these \
+         hooks to invoke.",
+        artifact.display()
+    )
 }
 
 pub fn run_verify(c: &mut Client, json: bool, style: &Style, target: &str) -> i32 {
@@ -560,6 +1000,198 @@ mod tests {
         }
         assert!(!inside_vendor_dir(Path::new("/Users/x/.cyclops/hooks/rev")));
         assert!(!inside_vendor_dir(Path::new("/work/agents/hooks")));
+    }
+
+    /// A home with one prepared codex artifact, rendered for `bin` and
+    /// vouched for by a matching receipt. Returns the home and the
+    /// artifact path.
+    fn prepared(tag: &str, bin: &str) -> (PathBuf, PathBuf) {
+        let home = cyclops_proto::scratch::scratch_dir(&format!("hookref-{tag}"));
+        let _ = fs::remove_dir_all(&home);
+        let dir = home.join("hooks").join("codex").join(GOLDEN_LABEL);
+        fs::create_dir_all(&dir).expect("create prepared dir");
+        let body = render(CliKind::Codex, GOLDEN_LABEL, bin);
+        let artifact = dir.join("hooks.json");
+        fs::write(&artifact, &body).expect("write artifact");
+        Receipt {
+            vendor: "codex".to_string(),
+            agent: GOLDEN_LABEL.to_string(),
+            file: "hooks.json".to_string(),
+            bin: bin.to_string(),
+            rendered_fnv: fnv64(body.as_bytes()),
+        }
+        .write(&dir)
+        .expect("write receipt");
+        (home, artifact)
+    }
+
+    #[test]
+    fn a_receipt_round_trips_through_its_own_file() {
+        let dir = cyclops_proto::scratch::scratch_dir("hookrcpt");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create dir");
+        Receipt {
+            vendor: "codex".to_string(),
+            agent: GOLDEN_LABEL.to_string(),
+            file: "hooks.json".to_string(),
+            bin: GOLDEN_BIN.to_string(),
+            rendered_fnv: fnv64(b"body"),
+        }
+        .write(&dir)
+        .expect("write receipt");
+
+        let got = Receipt::read(&dir).expect("read back");
+        assert_eq!(got.vendor, "codex");
+        assert_eq!(got.agent, GOLDEN_LABEL);
+        assert_eq!(got.file, "hooks.json");
+        assert_eq!(got.bin, GOLDEN_BIN);
+        assert_eq!(got.rendered_fnv, fnv64(b"body"));
+        // A truncated or hand-mangled receipt is no proof at all, and
+        // reads the same as no receipt.
+        fs::write(Receipt::path(&dir), "{\"vendor\":\"codex\"}").unwrap();
+        assert!(Receipt::read(&dir).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_artifact_rendered_for_this_build_is_current() {
+        let (home, artifact) = prepared("cur", &cyclops_bin());
+        let before = fs::read_to_string(&artifact).unwrap();
+
+        let got = refresh(&home);
+        assert_eq!(got.current, 1);
+        assert!(got.rewritten.is_empty());
+        assert!(got.edited.is_empty());
+        assert!(got.unmanaged.is_empty());
+        assert_eq!(fs::read_to_string(&artifact).unwrap(), before);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_hand_edited_artifact_is_never_rewritten() {
+        // The receipt vouches for the rendered bytes; the file on disk has
+        // one more event the operator added. That is a measurement, and it
+        // outranks anything this build would render.
+        let (home, artifact) = prepared("edit", &cyclops_bin());
+        let mine = format!("{}\n", fs::read_to_string(&artifact).unwrap().trim_end());
+        fs::write(&artifact, format!("{mine}// mine\n")).unwrap();
+        let before = fs::read_to_string(&artifact).unwrap();
+
+        let got = refresh(&home);
+        assert_eq!(got.edited, vec![artifact.clone()]);
+        assert!(got.rewritten.is_empty());
+        assert_eq!(fs::read_to_string(&artifact).unwrap(), before);
+        assert!(got.notes().iter().any(|n| n.contains("left 1 edited")));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_prefix_move_repoints_the_artifact_and_names_the_old_path() {
+        // The recorded binary is gone, which is exactly what a moved
+        // install prefix looks like from here.
+        let old = "/nonexistent/old-prefix/cyclops";
+        let (home, artifact) = prepared("moved", old);
+
+        let got = refresh(&home);
+        assert_eq!(got.rewritten, vec![artifact.clone()]);
+        assert_eq!(got.moved_from.as_deref(), Some(old));
+        let body = fs::read_to_string(&artifact).unwrap();
+        assert!(!body.contains(old), "old path survived: {body}");
+        assert!(body.contains(&cyclops_bin()), "{body}");
+        // The receipt now vouches for the new bytes, so a second run is a
+        // no-op rather than a rewrite loop.
+        let again = refresh(&home);
+        assert_eq!(again.current, 1);
+        assert!(again.rewritten.is_empty());
+        assert!(again.moved_from.is_none());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_artifact_naming_a_binary_that_still_exists_is_left_alone() {
+        // Two builds on one machine. Repointing here would hand the
+        // artifact to whichever build ran start last.
+        let (home, artifact) = prepared("twobuilds", "/placeholder");
+        let other = home.join("other-cyclops");
+        fs::write(&other, b"#!/bin/sh\n").unwrap();
+        let other_bin = other.to_str().unwrap().to_string();
+        let body = render(CliKind::Codex, GOLDEN_LABEL, &other_bin);
+        fs::write(&artifact, &body).unwrap();
+        let dir = artifact.parent().unwrap();
+        Receipt {
+            vendor: "codex".to_string(),
+            agent: GOLDEN_LABEL.to_string(),
+            file: "hooks.json".to_string(),
+            bin: other_bin.clone(),
+            rendered_fnv: fnv64(body.as_bytes()),
+        }
+        .write(dir)
+        .unwrap();
+
+        let got = refresh(&home);
+        assert!(got.rewritten.is_empty());
+        assert!(got.moved_from.is_none());
+        assert_eq!(got.other_build, vec![(artifact.clone(), other_bin)]);
+        assert_eq!(fs::read_to_string(&artifact).unwrap(), body);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_artifact_with_no_receipt_is_unmanaged_and_untouched() {
+        // Every home prepared by a build that predates receipts.
+        let (home, artifact) = prepared("unmanaged", "/nonexistent/old/cyclops");
+        fs::remove_file(Receipt::path(artifact.parent().unwrap())).unwrap();
+        let before = fs::read_to_string(&artifact).unwrap();
+
+        let got = refresh(&home);
+        assert_eq!(got.unmanaged, vec![artifact.clone()]);
+        assert!(got.rewritten.is_empty());
+        assert_eq!(fs::read_to_string(&artifact).unwrap(), before);
+        assert!(got
+            .notes()
+            .iter()
+            .any(|n| n.contains("cyclops hooks install codex --agent reviewer")));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn refresh_walks_only_vendor_directories_it_wrote() {
+        let (home, _) = prepared("walk", &cyclops_bin());
+        // A vendor name no CliKind answers to, and a label the daemon
+        // would refuse. Both hold a plausible artifact and a receipt.
+        for (vendor, label) in [("gemini", "reviewer"), ("codex", "admin")] {
+            let dir = home.join("hooks").join(vendor).join(label);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("hooks.json"), "{}\n").unwrap();
+        }
+
+        let got = refresh(&home);
+        assert_eq!(got.current, 1);
+        assert!(got.unmanaged.is_empty(), "{:?}", got.unmanaged);
+        assert!(got.edited.is_empty());
+        assert!(got.problems.is_empty());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_wired_search_reads_only_the_named_files_and_matches_the_literal() {
+        let dir = cyclops_proto::scratch::scratch_dir("hookwired");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let hit = dir.join("hooks.json");
+        let miss = dir.join("settings.json");
+        let absent = dir.join("never-written.json");
+        fs::write(&hit, "{\"command\":\"/old/bin/cyclops hook Stop\"}").unwrap();
+        fs::write(&miss, "{\"command\":\"/new/bin/cyclops hook Stop\"}").unwrap();
+
+        let candidates = vec![hit.clone(), miss, absent];
+        assert_eq!(
+            wired_copies_holding(&candidates, "/old/bin/cyclops"),
+            vec![hit]
+        );
+        // An empty old path would match every file; it never searches.
+        assert!(wired_copies_holding(&candidates, "").is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

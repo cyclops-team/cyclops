@@ -72,6 +72,52 @@ pub const PANE_GAPS: PaneGaps = PaneGaps {
 /// unfocused alike.
 pub const PANE_GRIP: &str = "⠿";
 
+/// The six symbols one frame draws its border with.
+///
+/// Two sets exist so focus has a shape and not only a hue. A frame already
+/// owns these cells, so the heavier set costs nothing to paint and is the
+/// encoding that survives `NO_COLOR`, a screenshot, and a reader who cannot
+/// separate two blues (rule 11). It also puts the loudest chrome on the
+/// pane being worked in rather than on the sidebar beside it.
+struct BorderGlyphs {
+    horizontal: &'static str,
+    vertical: &'static str,
+    top_left: &'static str,
+    top_right: &'static str,
+    bottom_left: &'static str,
+    bottom_right: &'static str,
+}
+
+/// A pane at rest: light lines (U+2500, U+2502) on rounded corners
+/// (U+256D..U+2570), the calm default.
+const BORDER_REST: BorderGlyphs = BorderGlyphs {
+    horizontal: "─",
+    vertical: "│",
+    top_left: "╭",
+    top_right: "╮",
+    bottom_left: "╰",
+    bottom_right: "╯",
+};
+
+/// The focused pane: the double set, U+2550..U+255D.
+///
+/// Double rather than heavy (U+2501, U+250F and neighbors) because the
+/// double set came through CP437 into every terminal font, while a font
+/// missing the heavy glyphs substitutes the light ones and erases the cue
+/// in exactly the plain terminals it exists for. Both sets sit in the Box
+/// Drawing block, so neither is wide and neither needs a spacer cell.
+///
+/// The bottom-right corner is painted and then replaced by [`PANE_GRIP`],
+/// same as the set at rest.
+const BORDER_FOCUSED: BorderGlyphs = BorderGlyphs {
+    horizontal: "═",
+    vertical: "║",
+    top_left: "╔",
+    top_right: "╗",
+    bottom_left: "╚",
+    bottom_right: "╝",
+};
+
 /// The frame's bottom-right corner cell: where [`PANE_GRIP`] paints and
 /// the [`HitTarget::PaneGrip`] region sits. `None` when bounds clip the
 /// corner away; a grip must never land on a cell that is not the painted
@@ -261,8 +307,15 @@ fn push_divider_hits(dividers: &[DividerSeg], hits: &mut HitMap) {
 
 /// A pane border in the gutter cells around `rect`, clipped to `bounds`.
 /// The margin and explicit separators guarantee those cells are chrome,
-/// never another pane's content.
-fn paint_pane_border(rect: Rect, bounds: Rect, buf: &mut Buffer, style: Style) {
+/// never another pane's content. `glyphs` says which set the frame draws
+/// with: the caller picks it by focus, the same place it picks the style.
+fn paint_pane_border(
+    rect: Rect,
+    bounds: Rect,
+    buf: &mut Buffer,
+    style: Style,
+    glyphs: &BorderGlyphs,
+) {
     if rect.width == 0 || rect.height == 0 {
         return;
     }
@@ -284,17 +337,17 @@ fn paint_pane_border(rect: Rect, bounds: Rect, buf: &mut Buffer, style: Style) {
         }
     };
     for x in rect.x as i32..right {
-        set(x, top, "─");
-        set(x, bottom, "─");
+        set(x, top, glyphs.horizontal);
+        set(x, bottom, glyphs.horizontal);
     }
     for y in rect.y as i32..bottom {
-        set(left, y, "│");
-        set(right, y, "│");
+        set(left, y, glyphs.vertical);
+        set(right, y, glyphs.vertical);
     }
-    set(left, top, "╭");
-    set(right, top, "╮");
-    set(left, bottom, "╰");
-    set(right, bottom, "╯");
+    set(left, top, glyphs.top_left);
+    set(right, top, glyphs.top_right);
+    set(left, bottom, glyphs.bottom_left);
+    set(right, bottom, glyphs.bottom_right);
 }
 
 fn paint_pane_slot(
@@ -393,14 +446,17 @@ fn paint_pane_frame(
     // The frame, not the content rect: a box grown out to the shared edge
     // must stay grabbable over the whole boundary it actually draws.
     let vis = frame;
-    let border_style = if slot.focused {
-        theme::pane_border_focused(paint)
+    // Focus moves both encodings at once, and this is the only place that
+    // decides either: the accent color, and the heavier glyph set that
+    // keeps focus readable when the color is gone.
+    let (border_style, border_glyphs) = if slot.focused {
+        (theme::pane_border_focused(paint), &BORDER_FOCUSED)
     } else {
-        theme::pane_border(paint)
+        (theme::pane_border(paint), &BORDER_REST)
     };
-    paint_pane_border(vis, bounds, buf, border_style);
-    // The corner '╯' becomes the grip. Painted here, per frame, right
-    // after this frame's own border: the focused frame repaints last, so
+    paint_pane_border(vis, bounds, buf, border_style, border_glyphs);
+    // The bottom-right corner becomes the grip. Painted here, per frame,
+    // right after this frame's own border: the focused frame repaints last, so
     // a shared pass would let its accent ring overwrite another pane's
     // grip where borders intersect.
     if let Some((x, y)) = grip_cell(vis, bounds) {
@@ -492,7 +548,11 @@ fn paint_pane_frame(
     let status = DecorationSnapshot::primary_status(decoration);
     let shown_state = status.map(|status| {
         let full = format!("{} {}", status.glyph, status.word);
-        let full_suffix = 3usize.saturating_add(Span::raw(full.as_str()).width());
+        // Four, not three: " · " leads the state and a single space
+        // follows it. Without the trailing one the border rule resumes
+        // against the glyph and `○────` reads as one joined mark rather
+        // than a status next to a line.
+        let full_suffix = 4usize.saturating_add(Span::raw(full.as_str()).width());
         if slot.focused
             && Span::raw(label).width().saturating_add(full_suffix)
                 <= usize::from(title_bounds.width)
@@ -505,7 +565,7 @@ fn paint_pane_frame(
     let suffix_width = shown_state
         .as_ref()
         .map(|state| {
-            3u16.saturating_add(u16::try_from(Span::raw(state).width()).unwrap_or(u16::MAX))
+            4u16.saturating_add(u16::try_from(Span::raw(state).width()).unwrap_or(u16::MAX))
         })
         .unwrap_or(0);
     let label_width = u16::try_from(Span::raw(label).width()).unwrap_or(u16::MAX);
@@ -542,6 +602,17 @@ fn paint_pane_frame(
                     .unwrap_or(decoration.state),
             )
         },
+    );
+    // Close the label the way it opened, so the border rule restarts a cell
+    // clear of the state instead of touching it. Budgeted for above.
+    let state_width = u16::try_from(Span::raw(&shown_state).width()).unwrap_or(u16::MAX);
+    super::overlay_text(
+        buf,
+        title_bounds,
+        x.saturating_add(state_width),
+        top,
+        " ",
+        border_style,
     );
 }
 
@@ -1167,12 +1238,13 @@ mod tests {
         );
         // Canvas starts at row 1 and panes are inset one margin cell, so
         // the focused pane's ring corners land on the canvas edge rows.
-        assert_eq!(buf[(0, 1)].symbol(), "╭", "ring top-left corner");
-        assert_eq!(buf[(39, 1)].symbol(), "╮", "ring top-right corner");
+        // %0 is the active pane, so its ring is the double set.
+        assert_eq!(buf[(0, 1)].symbol(), "╔", "ring top-left corner");
+        assert_eq!(buf[(39, 1)].symbol(), "╗", "ring top-right corner");
         // Each stacked pane keeps its border, but the old blank row between
         // those borders is gone.
-        assert_eq!(buf[(0, 6)].symbol(), "╰", "first pane bottom corner");
-        assert_eq!(buf[(5, 6)].symbol(), "─", "first pane bottom border");
+        assert_eq!(buf[(0, 6)].symbol(), "╚", "first pane bottom corner");
+        assert_eq!(buf[(5, 6)].symbol(), "═", "first pane bottom border");
         assert_eq!(buf[(5, 7)].symbol(), "─", "second pane top border");
         assert_ne!(
             buf[(5, 6)].fg,
@@ -1289,6 +1361,72 @@ mod tests {
             assert_eq!(buf[(39, 5)].symbol(), PANE_GRIP);
             assert_eq!(buf[(39, 10)].symbol(), PANE_GRIP);
         }
+    }
+
+    /// Focus is not a color. The frame around the pane being worked in
+    /// draws a heavier glyph set than every frame beside it, so "which
+    /// pane has the keyboard" survives `NO_COLOR`, a screenshot, and a
+    /// reader who cannot separate two blues (rule 11). The style carries
+    /// the same answer: accent while there is color, bold once there is
+    /// not.
+    #[test]
+    fn the_focused_frame_is_heavier_than_the_panes_around_it() {
+        let render_with = |paint: &Paint| -> Buffer {
+            let tab = two_pane_tab();
+            let runtimes = RuntimeRegistry::default();
+            let backend = TestBackend::new(40, 12);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| {
+                let mut hits = HitMap::default();
+                let paused = std::collections::HashSet::new();
+                let dec = DecorationSnapshot::default();
+                let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
+                paint_window(&tab, &runtimes, f.area(), f.buffer_mut(), paint, &mut ctx);
+            })
+            .unwrap();
+            term.backend().buffer().clone()
+        };
+
+        // %0 is `two_pane_tab`'s active pane at (1,1,38,4), so its ring is
+        // the cells around that: corners (0,0) and (39,0), bottom row 5.
+        // %1 sits at (1,7,38,3) with its top border on row 6.
+        for paint in [
+            Paint::for_test(),
+            alt_test_theme_paint(),
+            Paint::without_color_for_test(),
+        ] {
+            let buf = render_with(&paint);
+            assert_eq!(buf[(0, 0)].symbol(), "╔", "focused top-left corner");
+            assert_eq!(buf[(39, 0)].symbol(), "╗", "focused top-right corner");
+            assert_eq!(buf[(0, 5)].symbol(), "╚", "focused bottom-left corner");
+            assert_eq!(buf[(20, 0)].symbol(), "═", "focused top rule");
+            assert_eq!(buf[(0, 3)].symbol(), "║", "focused left rule");
+
+            assert_eq!(
+                buf[(0, 6)].symbol(),
+                "╭",
+                "a pane at rest keeps the calm set"
+            );
+            assert_eq!(buf[(20, 6)].symbol(), "─", "and its own light rule");
+            assert_eq!(buf[(0, 10)].symbol(), "╰", "down to its bottom corner");
+        }
+
+        // Color off, where a hue would have been the only difference: the
+        // ring keeps a weight and the frame beside it does not.
+        let plain = render_with(&Paint::without_color_for_test());
+        assert_eq!(
+            plain[(20, 0)].fg,
+            RtColor::Reset,
+            "NO_COLOR must leave no color behind to lean on"
+        );
+        assert!(
+            plain[(20, 0)].modifier.contains(Modifier::BOLD),
+            "the focused ring keeps a weight once the accent is gone"
+        );
+        assert!(
+            !plain[(20, 6)].modifier.contains(Modifier::BOLD),
+            "and a pane at rest does not, or the weight says nothing"
+        );
     }
 
     /// The notice is chrome and only chrome. It lands on the focused
@@ -1480,7 +1618,7 @@ mod tests {
         );
         assert_eq!(
             with_bar[(canvas_with_bar.x, canvas_with_bar.y)].symbol(),
-            "\u{256d}",
+            "\u{2554}",
             "the ring has to start exactly where the chrome split put the canvas"
         );
 
@@ -1490,7 +1628,7 @@ mod tests {
         assert_eq!(canvas_no_bar.y, canvas_with_bar.y - 1);
         assert_eq!(
             no_bar[(canvas_no_bar.x, canvas_no_bar.y)].symbol(),
-            "\u{256d}",
+            "\u{2554}",
             "the canvas reclaims the top row"
         );
         assert!(

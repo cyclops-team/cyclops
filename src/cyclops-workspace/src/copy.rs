@@ -106,6 +106,8 @@ pub const MENU_NEW_WORKSPACE: &str = "New workspace";
 pub const MENU_TOGGLE_EVENTS: &str = "Event stream";
 
 pub const MENU_TAB_BAR: &str = "Tab bar";
+/// The only visible switch for chrome fades (`crate::animate`).
+pub const MENU_MOTION: &str = "Motion";
 
 pub const MENU_THEMES: &str = "Themes";
 

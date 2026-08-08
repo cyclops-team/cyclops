@@ -182,5 +182,21 @@ mod tests {
         // must leave the button alone.
         let (elsewhere, _) = paint_at(Some((1, 0)));
         assert_eq!(cold[(plus, 0)].bg, elsewhere[(plus, 0)].bg);
+
+        // The hover above is only reachable if the event loop delivers the
+        // motion that drives it. `AppMsg::Mouse` drops bare `Moved` unless
+        // `motion_touches_hover_button` admits it, and the button was
+        // missing from that list, so the strip painted a state no pointer
+        // could ever reach. Both edges: arriving lights it, leaving puts
+        // it out.
+        use crate::input::mouse::motion_touches_hover_button;
+        assert!(
+            motion_touches_hover_button(&hits, None, plus, 0),
+            "arriving on the + must wake the renderer"
+        );
+        assert!(
+            motion_touches_hover_button(&hits, Some((plus, 0)), 1, 0),
+            "leaving the + must wake the renderer too, or it stays lit"
+        );
     }
 }

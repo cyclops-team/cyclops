@@ -47,6 +47,14 @@ pub struct WorkspacePrefs {
     /// screen from a fresh install; restored on reopen like the sidebar's
     /// own visibility.
     pub tab_bar_visible: bool,
+    /// Whether chrome fades between states (`crate::animate`). On by
+    /// default: the four fades are short, none moves anything, and each
+    /// one carries information the snap carried too. Off is stored rather
+    /// than inferred, because the capability gates around it (no color, no
+    /// truecolor, a terminal that cannot keep up) all answer "can we",
+    /// while this answers "should we", and an operator who finds motion
+    /// distracting must not have to re-answer it every launch.
+    pub motion: bool,
     pub workspace_order: Vec<String>,
     /// Stable labels, with pane-id fallbacks for unnamed detected agents.
     pub agent_order: Vec<String>,
@@ -64,6 +72,7 @@ impl Default for WorkspacePrefs {
             sidebar_width: 22,
             sidebar_tab: SidebarTab::default(),
             tab_bar_visible: true,
+            motion: true,
             workspace_order: Vec::new(),
             agent_order: Vec::new(),
             folder_tracked: Vec::new(),
@@ -116,6 +125,9 @@ pub fn load_prefs(home: &Path) -> WorkspacePrefs {
         .and_then(SidebarTab::parse)
     {
         prefs.sidebar_tab = v;
+    }
+    if let Some(v) = workspace.get("motion").and_then(|v| v.as_bool()) {
+        prefs.motion = v;
     }
     if let Some(v) = workspace.get("tab_bar_visible").and_then(|v| v.as_bool()) {
         prefs.tab_bar_visible = v;
@@ -188,6 +200,7 @@ pub fn save_prefs(home: &Path, prefs: &WorkspacePrefs) -> std::io::Result<()> {
         "sidebar_tab".into(),
         toml::Value::String(prefs.sidebar_tab.as_str().into()),
     );
+    workspace.insert("motion".into(), toml::Value::Boolean(prefs.motion));
     workspace.insert(
         "tab_bar_visible".into(),
         toml::Value::Boolean(prefs.tab_bar_visible),
@@ -341,6 +354,7 @@ mod tests {
             sidebar_width: 28,
             sidebar_tab: SidebarTab::Stream,
             tab_bar_visible: false,
+            motion: false,
             workspace_order: vec!["beta".into(), "alpha".into()],
             agent_order: vec!["name:reviewer".into(), "pane:%7".into()],
             folder_tracked: vec!["$3".into(), "$7".into()],
@@ -390,6 +404,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// Every preference belongs under `[workspace]`, and a key written to
+    /// the root table instead would still round-trip through `save` and
+    /// `load` in the same process while silently never reaching the
+    /// section a human edits. So this asserts the section, not the value.
+    #[test]
+    fn every_saved_preference_lands_under_the_workspace_section() {
+        let home = scratch_dir("ws-prefs-section");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("scratch");
+
+        save_prefs(&home, &WorkspacePrefs::default()).expect("save");
+        let text = std::fs::read_to_string(home.join("config.toml")).expect("read");
+        let table: toml::Table = text.parse().expect("parse");
+        let workspace = table
+            .get("workspace")
+            .and_then(|v| v.as_table())
+            .expect("a [workspace] section");
+
+        for key in [
+            "sidebar_visible",
+            "sidebar_width",
+            "sidebar_tab",
+            "tab_bar_visible",
+            "motion",
+            "workspace_order",
+            "agent_order",
+            "folder_tracked",
+        ] {
+            assert!(
+                workspace.contains_key(key),
+                "{key} is missing from [workspace]"
+            );
+            assert!(
+                !table.contains_key(key),
+                "{key} was written to the root table as well as, or instead of, [workspace]"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn saving_prefs_preserves_bindings_and_future_workspace_keys() {
         let home = scratch_dir("ws-prefs-preserve");
@@ -408,6 +462,7 @@ mod tests {
                 sidebar_width: 31,
                 sidebar_tab: SidebarTab::Sessions,
                 tab_bar_visible: true,
+                motion: true,
                 workspace_order: vec!["cyclops".into()],
                 agent_order: vec!["name:implementer".into()],
                 folder_tracked: vec![],

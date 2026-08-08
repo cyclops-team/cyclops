@@ -229,6 +229,19 @@ pub(super) async fn execute(
                 ..Outcome::default()
             })
         }
+        Action::ToggleMotion => {
+            // No client-size redeclaration and no reflow: a fade is a
+            // color, so turning it off changes what the next frame paints
+            // and nothing about the grid. The live clock is not touched
+            // here because it does not live on `App`; `draw` reads this
+            // preference every frame and settles the clock when it goes
+            // false, which also cancels whatever was mid-fade.
+            app.prefs.motion = !app.prefs.motion;
+            Ok(Outcome {
+                persist: true,
+                ..Outcome::default()
+            })
+        }
         Action::ToggleEventPanel => {
             // "Show me the stream", and pressed again, "take it away": the
             // stream goes off and the session list comes back, which is

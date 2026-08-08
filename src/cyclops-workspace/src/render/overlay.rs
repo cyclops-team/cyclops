@@ -9,13 +9,54 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::Span;
-use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap};
 
 use crate::bindings::BindingAction;
 use crate::copy;
 use crate::dialog::Dialog;
 use crate::input::mouse::{HitMap, HitTarget, MenuState};
 use crate::theme::{self, Paint};
+
+/// Columns between a box's border and its content, on both sides. One
+/// number for the plain dialogs, the two list dialogs, and the action row
+/// they all share, so a button never lands a column off the rows above it.
+const DIALOG_INSET: u16 = 2;
+
+/// What a box costs before any copy fits inside it: a border column plus
+/// the inset, on each side.
+const DIALOG_CHROME_WIDTH: u16 = 2 + 2 * DIALOG_INSET;
+
+/// Narrowest a plain dialog gets when its copy would allow less. Short
+/// prompts still read as a dialog rather than as a tooltip.
+const DIALOG_MIN_WIDTH: u16 = 40;
+
+/// The plain dialog card: title, hint, input, a blank row, the action row.
+/// Fixed, so a dialog holds its shape whichever parts it has; only the
+/// error slot under the input grows it.
+const DIALOG_INNER_ROWS: u16 = 5;
+
+/// Widest an error is allowed to make a dialog. Past this it wraps instead
+/// of stretching the box across the terminal.
+const DIALOG_ERROR_MAX_WIDTH: u16 = 68;
+
+/// Columns between two buttons on the action row.
+const DIALOG_BUTTON_GAP: u16 = 2;
+
+/// Display columns `text` occupies.
+fn text_width(text: &str) -> u16 {
+    u16::try_from(Span::raw(text).width()).unwrap_or(u16::MAX)
+}
+
+/// The frame every floating box wears. Rounded, because the pane frames
+/// are rounded (`canvas.rs` draws ╭ ╮ ╰ ╯ itself) and the workspace speaks
+/// one shape language.
+fn overlay_block(paint: &Paint) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme::pane_border_focused(paint))
+        .style(theme::menu_row(paint))
+}
 
 /// Title, optional input buffer, optional hint, and button labels for one
 /// dialog.
@@ -101,80 +142,43 @@ pub fn paint_dialog(
         Dialog::NamePane { error, .. } => error.as_deref(),
         _ => None,
     };
-    let copy_width = hint
-        .map(|hint| Span::raw(hint).width())
-        .unwrap_or(0)
-        .max(Span::raw(title).width())
-        .max(
-            error
-                .map(|error| Span::raw(error).width().min(68))
-                .unwrap_or(0),
-        );
-    let want_w = (u16::try_from(copy_width)
-        .unwrap_or(u16::MAX)
-        .saturating_add(4))
-    .max(40);
-    let w = want_w.min(area.width);
-    let error_lines = error
-        .map(|error| wrapped_line_count(error, w.saturating_sub(4)))
-        .unwrap_or(0);
-    let h = u16::try_from(7usize.saturating_add(error_lines))
-        .unwrap_or(u16::MAX)
-        .min(area.height);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let dialog_area = Rect::new(x, y, w, h);
+    let Some(dialog_area) = plain_dialog_geometry(title, hint, error, confirm_label, area) else {
+        return;
+    };
     clear_area(buf, dialog_area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::pane_border_focused(paint))
-        .style(theme::menu_row(paint));
+    let block = overlay_block(paint);
     let inner = block.inner(dialog_area);
     block.render(dialog_area, buf);
 
-    super::overlay_text(
-        buf,
-        inner,
-        inner.x + 1,
-        inner.y,
-        title,
-        theme::menu_row(paint),
-    );
-    if let Some(hint) = hint {
-        super::overlay_text(
-            buf,
-            inner,
-            inner.x + 1,
-            inner.y + 1,
-            hint,
-            theme::menu_hint(paint),
-        );
+    let left = inner.x + DIALOG_INSET;
+    let usable_w = inner.width.saturating_sub(2 * DIALOG_INSET);
+
+    super::overlay_text(buf, inner, left, inner.y, title, theme::menu_row(paint));
+    // A hint that will not fit whole is not painted. Half a sentence reads
+    // as corruption rather than as help, the rule `canvas::paint_notice`
+    // follows on the pane border. The dialog still opens: the hint is the
+    // part a narrow terminal loses, not the prompt.
+    if let Some(hint) = hint.filter(|hint| text_width(hint) <= usable_w) {
+        super::overlay_text(buf, inner, left, inner.y + 1, hint, theme::menu_hint(paint));
     }
     if let Some(input) = input {
         // The input field is inset from the dialog, but its editing cursor
-        // starts at the field's first cell — no unexplained extra indent.
+        // starts at the field's first cell. No second, accidental indent.
         let field_y = inner.y + 2;
-        if field_y < inner.y + inner.height {
-            let field = Rect::new(inner.x + 1, field_y, inner.width.saturating_sub(2), 1);
-            buf.set_style(field, theme::dialog_input(paint));
-            let visible = input_tail(input, field.width as usize);
-            super::overlay_text(
-                buf,
-                inner,
-                field.x,
-                field_y,
-                &visible,
-                theme::dialog_input(paint),
-            );
-        }
+        let field = Rect::new(left, field_y, usable_w, 1);
+        buf.set_style(field, theme::dialog_input(paint));
+        let visible = input_tail(input, field.width as usize);
+        super::overlay_text(
+            buf,
+            inner,
+            field.x,
+            field_y,
+            &visible,
+            theme::dialog_input(paint),
+        );
     }
     if let Some(error) = error {
-        let error_area = Rect::new(
-            inner.x + 1,
-            inner.y + 3,
-            inner.width.saturating_sub(2),
-            inner.height.saturating_sub(4),
-        );
+        let error_area = Rect::new(left, inner.y + 3, usable_w, inner.height.saturating_sub(4));
         Paragraph::new(error)
             .style(theme::dialog_error(paint))
             .wrap(Wrap { trim: true })
@@ -183,9 +187,85 @@ pub fn paint_dialog(
     paint_dialog_buttons(buf, inner, paint, hits, hover, confirm_label);
 }
 
+/// Where a plain dialog lands, or `None` when the terminal cannot host it.
+///
+/// Two pieces of copy are hard-clipped by `overlay_text` and so set the
+/// floor: the title, which is the dialog's question, and the action row,
+/// which is how it gets answered. Cut either and the box misstates what it
+/// is asking, so under that width nothing is painted at all. The hint and
+/// the error never gate the box, because neither has to be cut: the hint
+/// drops, the error wraps.
+fn plain_dialog_geometry(
+    title: &str,
+    hint: Option<&str>,
+    error: Option<&str>,
+    confirm_label: &str,
+    area: Rect,
+) -> Option<Rect> {
+    // 1. The floor: copy that cannot be cut, plus the box around it, and
+    //    the card's own rows. Under either, refuse.
+    let need_w = text_width(title)
+        .max(dialog_buttons_width(confirm_label))
+        .saturating_add(DIALOG_CHROME_WIDTH);
+    let base_h = DIALOG_INNER_ROWS.saturating_add(2);
+    if need_w > area.width || base_h > area.height {
+        return None;
+    }
+    // 2. What the copy would like: the hint and the error widen the box
+    //    when there is room for them.
+    let want_w = text_width(title)
+        .max(hint.map(text_width).unwrap_or(0))
+        .max(
+            error
+                .map(|error| text_width(error).min(DIALOG_ERROR_MAX_WIDTH))
+                .unwrap_or(0),
+        )
+        .saturating_add(DIALOG_CHROME_WIDTH);
+    // The floor wins over the terminal cap, which step 1 proved it fits in.
+    let w = want_w.max(DIALOG_MIN_WIDTH).min(area.width).max(need_w);
+    // 3. The error slot grows the card downward, as far as the terminal
+    //    allows and no further: the card itself never leaves the screen.
+    let error_lines = error
+        .map(|error| wrapped_line_count(error, w.saturating_sub(DIALOG_CHROME_WIDTH)))
+        .unwrap_or(0);
+    let error_h = u16::try_from(error_lines)
+        .unwrap_or(u16::MAX)
+        .min(area.height - base_h);
+    let h = base_h + error_h;
+    let x = area.x + (area.width - w) / 2;
+    let y = area.y + (area.height - h) / 2;
+    Some(Rect::new(x, y, w, h))
+}
+
+/// The two actions every dialog offers, in paint order. One list, so the
+/// width a dialog reserves and the row it paints cannot disagree.
+fn dialog_buttons(confirm_label: &str) -> [(String, HitTarget, bool); 2] {
+    [
+        (format!("↵ {confirm_label}"), HitTarget::DialogConfirm, true),
+        (
+            format!("Esc {}", copy::BUTTON_CANCEL),
+            HitTarget::DialogCancel,
+            false,
+        ),
+    ]
+}
+
+/// Columns the action row needs to show both buttons whole, gap included.
+fn dialog_buttons_width(confirm_label: &str) -> u16 {
+    let mut width = 0u16;
+    for (index, (text, _, _)) in dialog_buttons(confirm_label).iter().enumerate() {
+        if index > 0 {
+            width = width.saturating_add(DIALOG_BUTTON_GAP);
+        }
+        width = width.saturating_add(text_width(text));
+    }
+    width
+}
+
 /// Keyboard-first actions on the last inner row, recorded for the mouse.
 /// Enter confirms every modal and Escape cancels it, so one shape covers
-/// input dialogs, destructive confirms, and the theme picker alike.
+/// input dialogs, destructive confirms, and the theme picker alike. The row
+/// starts at `DIALOG_INSET`, the same column the rows above it start at.
 fn paint_dialog_buttons(
     buf: &mut Buffer,
     inner: Rect,
@@ -195,22 +275,17 @@ fn paint_dialog_buttons(
     confirm_label: &str,
 ) {
     let button_y = inner.y + inner.height.saturating_sub(1);
-    let mut bx = inner.x + 1;
-    let buttons = [
-        (format!("↵ {confirm_label}"), HitTarget::DialogConfirm, true),
-        (
-            format!("Esc {}", copy::BUTTON_CANCEL),
-            HitTarget::DialogCancel,
-            false,
-        ),
-    ];
-    for (text, target, primary) in buttons {
-        let bw = Span::raw(text.as_str()).width() as u16;
-        let available = inner.x.saturating_add(inner.width).saturating_sub(bx);
-        let rect = Rect::new(bx, button_y, bw.min(available), 1);
-        if rect.width == 0 {
+    let right = inner.x + inner.width.saturating_sub(DIALOG_INSET);
+    let mut bx = inner.x + DIALOG_INSET;
+    for (text, target, primary) in dialog_buttons(confirm_label) {
+        let bw = text_width(text.as_str());
+        // A button cut in half is a worse affordance than no button, and it
+        // would claim a hit region for a label nobody can read. The key it
+        // names works either way.
+        if bw > right.saturating_sub(bx) {
             break;
         }
+        let rect = Rect::new(bx, button_y, bw, 1);
         let hovered =
             hover.is_some_and(|(hc, hr)| hr == rect.y && hc >= rect.x && hc < rect.x + rect.width);
         let style = if hovered || primary {
@@ -220,7 +295,7 @@ fn paint_dialog_buttons(
         };
         super::overlay_text(buf, inner, bx, button_y, &text, style);
         hits.push(rect, target);
-        bx = bx.saturating_add(bw + 2);
+        bx = bx.saturating_add(bw + DIALOG_BUTTON_GAP);
     }
 }
 
@@ -284,15 +359,12 @@ fn paint_keybinds_dialog(
         return;
     };
     clear_area(buf, dialog_area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::pane_border_focused(paint))
-        .style(theme::menu_row(paint));
+    let block = overlay_block(paint);
     let inner = block.inner(dialog_area);
     block.render(dialog_area, buf);
 
-    let left = inner.x + 2;
-    let usable_w = inner.width.saturating_sub(4);
+    let left = inner.x + DIALOG_INSET;
+    let usable_w = inner.width.saturating_sub(2 * DIALOG_INSET);
     super::overlay_text(
         buf,
         inner,
@@ -447,22 +519,19 @@ fn paint_themes_dialog(
     };
     let width = area.width.saturating_sub(4).min(48);
     let notice_lines = notice
-        .map(|text| wrapped_line_count(text, width.saturating_sub(6)))
+        .map(|text| wrapped_line_count(text, width.saturating_sub(DIALOG_CHROME_WIDTH)))
         .unwrap_or(0);
     let Some((dialog_area, list_h)) = themes_dialog_geometry(names.len(), notice_lines, area)
     else {
         return;
     };
     clear_area(buf, dialog_area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::pane_border_focused(paint))
-        .style(theme::menu_row(paint));
+    let block = overlay_block(paint);
     let inner = block.inner(dialog_area);
     block.render(dialog_area, buf);
 
-    let left = inner.x + 2;
-    let usable_w = inner.width.saturating_sub(4);
+    let left = inner.x + DIALOG_INSET;
+    let usable_w = inner.width.saturating_sub(2 * DIALOG_INSET);
     super::overlay_text(
         buf,
         inner,
@@ -585,6 +654,9 @@ pub fn menu_items(menu: &MenuState) -> Vec<(&'static str, BindingAction)> {
             // stream toggle because both answer the same question: which
             // surfaces this workspace shows.
             (copy::MENU_TAB_BAR, BindingAction::ToggleTabBar),
+            // Same reason the tab strip's switch is here: a preference
+            // with no chord needs one place a mouse can reach it.
+            (copy::MENU_MOTION, BindingAction::ToggleMotion),
             (copy::MENU_THEMES, BindingAction::ShowThemes),
             (copy::MENU_KEYBINDS, BindingAction::ShowKeybinds),
             (copy::MENU_DETACH, BindingAction::Detach),
@@ -644,10 +716,7 @@ pub fn paint_menu(
     let y = ay.min((area.y + area.height).saturating_sub(h).max(area.y));
     let menu_area = Rect::new(x, y, w.min(area.width), h.min(area.height));
     clear_area(buf, menu_area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::pane_border_focused(paint))
-        .style(theme::menu_row(paint));
+    let block = overlay_block(paint);
     let inner = block.inner(menu_area);
     block.render(menu_area, buf);
     for (i, (label, action)) in items.iter().enumerate() {
@@ -778,6 +847,9 @@ mod tests {
                 BindingAction::NewWorkspace,
                 BindingAction::ToggleEventPanel,
                 BindingAction::ToggleTabBar,
+                // Motion ships with no chord either, so the menu is its
+                // only switch, for the same reason the tab strip's is.
+                BindingAction::ToggleMotion,
                 BindingAction::ShowThemes,
                 BindingAction::ShowKeybinds,
                 BindingAction::Detach,
@@ -935,11 +1007,14 @@ mod tests {
         })
         .unwrap();
 
-        let width = (Span::raw(copy::NEW_TAB_HINT).width() as u16 + 4).max(40);
+        let width = (text_width(copy::NEW_TAB_HINT) + DIALOG_CHROME_WIDTH).max(DIALOG_MIN_WIDTH);
         let left = (50 - width) / 2;
-        // Border, then one intentional field inset. There is no second,
-        // accidental indent inside the input field.
-        assert_eq!(term.backend().buffer()[(left + 2, 4)].symbol(), "▏");
+        // Border, then the one intentional inset every row shares. There is
+        // no second, accidental indent inside the input field.
+        assert_eq!(
+            term.backend().buffer()[(left + 1 + DIALOG_INSET, 4)].symbol(),
+            "▏"
+        );
     }
 
     #[test]
@@ -1066,7 +1141,8 @@ mod tests {
 
     #[test]
     fn confirm_close_dialog_renders() {
-        let backend = TestBackend::new(40, 10);
+        // 50 columns: the question is 41 wide and the box costs six more.
+        let backend = TestBackend::new(50, 10);
         let mut term = Terminal::new(backend).unwrap();
         let theme = Paint::for_test();
         let dialog = Dialog::confirm_close("%0");
@@ -1076,11 +1152,366 @@ mod tests {
         })
         .unwrap();
         let flat = flatten(term.backend().buffer());
-        assert!(flat.contains("Close this pane"));
+        assert!(flat.contains(copy::CONFIRM_CLOSE_PANE), "{flat}");
         assert!(flat.contains("↵ Confirm"), "confirm key is visible: {flat}");
         assert!(
             flat.contains("Esc Cancel"),
             "cancel action is visible: {flat}"
         );
+    }
+
+    /// Top-left cell of the only box on screen. The tests measure insets
+    /// from the frame the code actually painted rather than recomputing
+    /// geometry beside it.
+    fn box_corner(buf: &Buffer) -> (u16, u16) {
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if buf[(x, y)].symbol() == "╭" {
+                    return (x, y);
+                }
+            }
+        }
+        panic!("no rounded box was painted");
+    }
+
+    /// First row whose text contains `needle`.
+    fn row_of(buf: &Buffer, needle: &str) -> u16 {
+        (0..buf.area.height)
+            .find(|y| {
+                let line: String = (0..buf.area.width).map(|x| buf[(x, *y)].symbol()).collect();
+                line.contains(needle)
+            })
+            .unwrap_or_else(|| panic!("{needle} was not painted"))
+    }
+
+    /// The pane frames are rounded (`canvas.rs` draws ╭ ╮ ╰ ╯ itself). Every
+    /// box that floats over them is too, or the app speaks two shapes.
+    #[test]
+    fn every_floating_box_wears_the_rounded_frame() {
+        let theme = Paint::for_test();
+        let cases: Vec<(&str, Option<Dialog>, MenuState)> = vec![
+            (
+                "new tab",
+                Some(Dialog::NewTab {
+                    buffer: String::new(),
+                }),
+                MenuState::None,
+            ),
+            (
+                "keybinds",
+                Some(Dialog::Keybinds {
+                    scroll: 0,
+                    rows: vec![crate::bindings::BindingHelp {
+                        keys: "Ctrl+A".into(),
+                        action: "Attach".into(),
+                    }],
+                }),
+                MenuState::None,
+            ),
+            (
+                "themes",
+                Some(Dialog::Themes {
+                    names: vec!["dark".into()],
+                    selected: 0,
+                    active: Some(0),
+                    notice: None,
+                }),
+                MenuState::None,
+            ),
+            ("app menu", None, MenuState::AppMenu),
+        ];
+        for (name, dialog, menu) in cases {
+            let backend = TestBackend::new(72, 24);
+            let mut term = Terminal::new(backend).unwrap();
+            let mut hits = HitMap::default();
+            term.draw(|f| {
+                if let Some(dialog) = &dialog {
+                    paint_dialog(dialog, f.area(), f.buffer_mut(), &theme, &mut hits, None);
+                }
+                paint_menu(&menu, f.area(), f.buffer_mut(), &theme, &mut hits, None);
+            })
+            .unwrap();
+            let flat = flatten(term.backend().buffer());
+            assert!(
+                flat.contains('╭') && flat.contains('╯'),
+                "{name} should be rounded like the pane frames: {flat}"
+            );
+            assert!(
+                !flat.contains('┌'),
+                "{name} still paints a square corner: {flat}"
+            );
+        }
+    }
+
+    /// The action row and every row above it start at the same column, in
+    /// the plain dialogs and in the theme picker alike.
+    #[test]
+    fn every_dialog_row_starts_at_the_same_inset() {
+        let theme = Paint::for_test();
+
+        let backend = TestBackend::new(72, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut hits = HitMap::default();
+        term.draw(|f| {
+            paint_dialog(
+                &Dialog::Themes {
+                    names: vec!["dark".into(), "light".into()],
+                    selected: 0,
+                    active: Some(0),
+                    notice: None,
+                },
+                f.area(),
+                f.buffer_mut(),
+                &theme,
+                &mut hits,
+                None,
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let (corner_x, corner_y) = box_corner(buf);
+        let content_x = corner_x + 1 + DIALOG_INSET;
+        assert_eq!(
+            buf[(content_x, corner_y + 1)].symbol(),
+            "T",
+            "the themes title starts at the inset"
+        );
+        assert_eq!(
+            buf[(content_x, row_of(buf, "▸ dark"))].symbol(),
+            "▸",
+            "the active marker starts at the inset"
+        );
+        let confirm = hits
+            .regions()
+            .iter()
+            .find(|region| region.target == HitTarget::DialogConfirm)
+            .expect("apply button is clickable");
+        assert_eq!(
+            confirm.rect.x, content_x,
+            "the action row must not sit a column left of the rows above it"
+        );
+
+        let backend = TestBackend::new(72, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut hits = HitMap::default();
+        term.draw(|f| {
+            paint_dialog(
+                &Dialog::NewTab {
+                    buffer: "revw".into(),
+                },
+                f.area(),
+                f.buffer_mut(),
+                &theme,
+                &mut hits,
+                None,
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let (corner_x, corner_y) = box_corner(buf);
+        let content_x = corner_x + 1 + DIALOG_INSET;
+        assert_eq!(
+            buf[(content_x, corner_y + 1)].symbol(),
+            "N",
+            "the title starts at the inset"
+        );
+        assert_eq!(
+            buf[(content_x, corner_y + 3)].symbol(),
+            "r",
+            "the input field starts at the inset"
+        );
+        let confirm = hits
+            .regions()
+            .iter()
+            .find(|region| region.target == HitTarget::DialogConfirm)
+            .expect("create button is clickable");
+        assert_eq!(confirm.rect.x, content_x, "the action row shares the inset");
+    }
+
+    /// The hint is the line a narrow terminal loses. The prompt, the field,
+    /// and the actions stay, because a dialog that opens with three of its
+    /// four parts is still usable and half a sentence is not.
+    #[test]
+    fn a_hint_that_would_be_cut_is_dropped_and_returns_when_it_fits() {
+        let theme = Paint::for_test();
+        let paint_at = |width: u16| {
+            let backend = TestBackend::new(width, 12);
+            let mut term = Terminal::new(backend).unwrap();
+            let mut hits = HitMap::default();
+            term.draw(|f| {
+                paint_dialog(
+                    &Dialog::NamePane {
+                        pane_id: "%0".into(),
+                        buffer: "rev".into(),
+                        error: None,
+                    },
+                    f.area(),
+                    f.buffer_mut(),
+                    &theme,
+                    &mut hits,
+                    None,
+                );
+            })
+            .unwrap();
+            flatten(term.backend().buffer())
+        };
+
+        // The hint is 55 columns; 50 cannot hold it whole.
+        let narrow = paint_at(50);
+        assert!(
+            narrow.contains(copy::NAME_PANE_TITLE),
+            "the prompt still opens: {narrow}"
+        );
+        assert!(
+            narrow.contains("↵ Save"),
+            "the actions are still offered: {narrow}"
+        );
+        assert!(
+            !narrow.contains("Used to identify"),
+            "no fragment of the hint should be painted: {narrow}"
+        );
+
+        let wide = paint_at(70);
+        assert!(
+            wide.contains(copy::NAME_PANE_HINT),
+            "the whole hint returns once it fits: {wide}"
+        );
+    }
+
+    /// The question and the action row are the dialog. Neither can be cut,
+    /// so a terminal too narrow for them gets no box at all.
+    #[test]
+    fn a_dialog_too_narrow_for_its_question_is_not_painted() {
+        // The close prompt is 41 columns and the box costs six more.
+        let backend = TestBackend::new(40, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+        let mut hits = HitMap::default();
+        term.draw(|f| {
+            paint_dialog(
+                &Dialog::confirm_close("%0"),
+                f.area(),
+                f.buffer_mut(),
+                &theme,
+                &mut hits,
+                None,
+            );
+        })
+        .unwrap();
+        let flat = flatten(term.backend().buffer());
+        assert!(
+            flat.trim().is_empty(),
+            "a question that cannot be read whole is not asked: {flat}"
+        );
+        assert!(
+            hits.regions().is_empty(),
+            "an unpainted dialog claims no buttons"
+        );
+    }
+
+    /// The card is five inner rows. A terminal that cannot hold them gets
+    /// nothing, rather than a button row painted over what was typed.
+    #[test]
+    fn a_short_terminal_refuses_the_card_instead_of_stacking_it() {
+        let theme = Paint::for_test();
+        let draw_at = |height: u16| {
+            let backend = TestBackend::new(60, height);
+            let mut term = Terminal::new(backend).unwrap();
+            let mut hits = HitMap::default();
+            term.draw(|f| {
+                paint_dialog(
+                    &Dialog::NewTab {
+                        buffer: "revw".into(),
+                    },
+                    f.area(),
+                    f.buffer_mut(),
+                    &theme,
+                    &mut hits,
+                    None,
+                );
+            })
+            .unwrap();
+            (term, hits)
+        };
+
+        let (term, hits) = draw_at(5);
+        let flat = flatten(term.backend().buffer());
+        assert!(
+            flat.trim().is_empty(),
+            "five rows cannot hold the card: {flat}"
+        );
+        assert!(
+            hits.regions().is_empty(),
+            "nothing painted, nothing clickable"
+        );
+
+        // Seven rows is the exact fit: the typed name keeps its own row and
+        // the actions stay below it instead of landing on top of it.
+        let (term, _) = draw_at(7);
+        let buf = term.backend().buffer();
+        assert!(
+            row_of(buf, "↵ Create") > row_of(buf, "revw"),
+            "the action row must stay below the input row"
+        );
+    }
+
+    /// The geometry answers all three width questions in one place: refuse,
+    /// fit snug, or grow for the copy.
+    #[test]
+    fn plain_dialog_geometry_refuses_before_it_cuts() {
+        let area = Rect::new(0, 0, 80, 24);
+        let card = plain_dialog_geometry(
+            copy::NEW_TAB_TITLE,
+            Some(copy::NEW_TAB_HINT),
+            None,
+            copy::BUTTON_CREATE,
+            area,
+        )
+        .expect("a full terminal hosts the card");
+        assert_eq!(
+            card.height,
+            DIALOG_INNER_ROWS + 2,
+            "no error, so the card is exactly its five rows plus borders"
+        );
+        assert_eq!(
+            card.width,
+            text_width(copy::NEW_TAB_HINT) + DIALOG_CHROME_WIDTH,
+            "the box grows to hold the hint whole"
+        );
+
+        assert!(
+            plain_dialog_geometry(
+                copy::CONFIRM_CLOSE_PANE,
+                None,
+                None,
+                copy::BUTTON_CONFIRM,
+                Rect::new(0, 0, 40, 24)
+            )
+            .is_none(),
+            "a title that cannot be read whole refuses the box"
+        );
+        assert!(
+            plain_dialog_geometry(
+                copy::NEW_TAB_TITLE,
+                Some(copy::NEW_TAB_HINT),
+                None,
+                copy::BUTTON_CREATE,
+                Rect::new(0, 0, 80, DIALOG_INNER_ROWS + 1)
+            )
+            .is_none(),
+            "a terminal shorter than the card refuses the box"
+        );
+
+        // A long error grows the card downward, never past the terminal.
+        let error = "x ".repeat(200);
+        let card = plain_dialog_geometry(
+            copy::NAME_PANE_TITLE,
+            Some(copy::NAME_PANE_HINT),
+            Some(error.as_str()),
+            copy::BUTTON_SAVE,
+            Rect::new(0, 0, 80, 12),
+        )
+        .expect("the card still fits");
+        assert_eq!(card.height, 12, "the error stops at the terminal edge");
     }
 }

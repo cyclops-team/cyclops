@@ -5,6 +5,76 @@ versions are unreleased until admin cuts a tag.
 
 ## [Unreleased]
 
+### Added (v5)
+
+- Motion. Four things fade, all of them chrome the workspace owns and none
+  of them a cell tmux owns: a pane border taking or losing focus (120ms),
+  an agent's status ink (120ms), the attention eye arriving (320ms), and
+  the notice dissolving over the last stretch of its TTL (260ms). The rule
+  is animate color, never position, and it is arithmetic rather than
+  taste: 22 columns over 140ms is 2.5 cells a frame, and apparent motion
+  breaks down once per-frame displacement passes the feature being
+  displaced, which here is a one-cell glyph, so a sliding sidebar reads as
+  a shear. Fill crossfades are out for a second reason, that they move
+  both sides of a contrast pair; panel ink fading toward an accent ground
+  measures 1.69:1 at the midpoint under the shipped dark theme. Only the
+  figure moves. Grounds switch instantly.
+- The animation clock is a one-shot deadline like every other deadline in
+  the loop (`INVARIANTS.md` rule 9). It joins the deadline set only while
+  a fade is running and disarms itself when the last one lands, so an idle
+  workspace still arms no wakeup. A test asserts exactly that. Motion is
+  off under `NO_COLOR`, off without truecolor (an interpolated color
+  collapses to four or five entries of the 256-cube, and banding is worse
+  than a snap), off with `CYCLOPS_MOTION=0`, and off on a terminal that
+  writes frames slower than the app draws them.
+- The focused pane is legible without color. Its border takes the double
+  set (U+2550..U+255D) while a pane at rest keeps the rounded light set.
+  Double rather than heavy, because a font missing the heavy glyphs
+  substitutes the light ones and erases the cue in exactly the plain
+  terminals it exists for, while the double set came through CP437 into
+  everything. Focus carries bold and a selected row carries reverse, so
+  the two stay distinct with color off rather than collapsing into one
+  another.
+- `cyclops update` refreshes agent hooks it already installed. A hook
+  command embeds the absolute path of the binary that wrote it, so an
+  update that lands a binary elsewhere left every hook invoking the old
+  build, and a stale build answering hooks is worse than no hook at all.
+  Hooks the operator never opted into are still never written: refreshing
+  a hook that exists and installing one that does not are different acts,
+  and only the first is automatic.
+
+### Fixed (v5)
+
+- The sidebar collapse control was a one-cell button in the panel's bottom
+  corner while the collapsed rail lit its whole column. The chevron now
+  centers on the edge in both states and both light the whole edge under
+  the pointer. The edge cannot simply become the control, because that
+  column is also the resize divider, so a centered band takes the clicks
+  and the whole edge takes the light.
+- A pane's top border read `reviewer · ○────────`. The label was padded
+  before the state and not after, so the rule restarted against the glyph
+  and the two read as one mark.
+- The sidebar drew a full-height rule immediately beside a pane canvas
+  that has its own border, two parallel lines with nothing between them.
+  The border is gone and the column stays reserved as the resize handle.
+- The sidebar dropped rows off the bottom with no sign it had. The footer
+  now says how many did not fit.
+- Dialog titles and hints truncated mid-word while the same dialog's error
+  slot wrapped, and a fixed seven-row height painted the button row over
+  the input at small terminal sizes. Dialogs now size to fit, wrap on one
+  rule, and share a single inset constant, which also closes a one-column
+  disagreement between the theme picker's rows and its own footer.
+- The `+` in the tab strip never lit under the mouse. The painter and its
+  test both existed; the motion-event allowlist did not carry
+  `NewTabButton`, so the event never arrived.
+
+### Documentation (v5)
+
+- `docs/reference/BENCHMARKS.md`: latency, throughput, and render numbers,
+  each carrying its source.
+- `docs/development/V5.md`: the scope, the four sources that agree on it,
+  and what is deliberately out.
+
 ### Added (v4)
 
 - Ten more themes, seventeen in all. Six bright originals drawn on paper

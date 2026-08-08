@@ -111,8 +111,20 @@ fn rt_color(c: ThemeColor, truecolor: bool) -> RtColor {
     }
 }
 
+/// The focused pane's frame, and the same weight wherever the workspace
+/// speaks over the canvas: dialog and menu borders, the drag hint.
+///
+/// Accent ink while there is color. With color off the accent token
+/// resolves to nothing and `pane_border` does too, so bold carries the
+/// ring instead: rule 11 forbids focus that is a hue and nothing else.
+/// `render::canvas` also gives the focused frame its own glyph set, which
+/// covers terminals that ignore bold on box-drawing cells.
 pub fn pane_border_focused(paint: &Paint) -> Style {
-    paint.style_token(tokens::SURFACE_ACCENT)
+    if paint.colors_enabled {
+        paint.style_token(tokens::SURFACE_ACCENT)
+    } else {
+        Style::new().add_modifier(Modifier::BOLD)
+    }
 }
 
 pub fn pane_border(paint: &Paint) -> Style {
@@ -143,8 +155,16 @@ pub fn tab_inactive(paint: &Paint) -> Style {
         .patch(paint.bg_token(tokens::CHROME_PANEL))
 }
 
+/// The sidebar's selected agent row. A raised ground while there is color;
+/// with color off `chrome_raised` and `sidebar_row` collapse to the same
+/// nothing, so the row inverts. Same fallback the tab chips and
+/// `selection_highlight` use, because this is the same thing: a selection.
 pub fn sidebar_row_active(paint: &Paint) -> Style {
-    chrome_raised(paint)
+    if paint.colors_enabled {
+        chrome_raised(paint)
+    } else {
+        Style::new().add_modifier(Modifier::REVERSED)
+    }
 }
 
 pub fn sidebar_workspace(paint: &Paint) -> Style {
@@ -300,7 +320,6 @@ mod tests {
     fn no_color_disables_tokens_but_keeps_interaction_visible() {
         let paint = Paint::without_color_for_test();
         assert_eq!(chrome_panel(&paint), Style::new());
-        assert_eq!(pane_border_focused(&paint), Style::new());
         assert_eq!(pane_cell(&paint), Style::new());
         assert!(paint.pane_palette().is_none());
         assert_eq!(
@@ -311,5 +330,31 @@ mod tests {
             selection_highlight(&paint),
             Style::new().add_modifier(Modifier::REVERSED)
         );
+        // Focus and row selection are not tokens allowed to go quiet: each
+        // falls back to the modifier that still reads with color off.
+        assert_eq!(
+            pane_border_focused(&paint),
+            Style::new().add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(
+            sidebar_row_active(&paint),
+            Style::new().add_modifier(Modifier::REVERSED)
+        );
+    }
+
+    /// Rule 11 as one line: turn color off and the two states of a thing
+    /// must still be two different styles. Both pairs read identically
+    /// before this, because the only thing telling them apart was a token
+    /// that resolves to nothing.
+    #[test]
+    fn focus_and_row_selection_stay_distinct_with_color_off() {
+        let plain = Paint::without_color_for_test();
+        assert_ne!(pane_border_focused(&plain), pane_border(&plain));
+        assert_ne!(sidebar_row_active(&plain), sidebar_row(&plain));
+
+        // Still distinct with color on, where the hue does the work.
+        let color = Paint::for_test();
+        assert_ne!(pane_border_focused(&color), pane_border(&color));
+        assert_ne!(sidebar_row_active(&color), sidebar_row(&color));
     }
 }
