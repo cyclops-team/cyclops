@@ -39,6 +39,31 @@ fn field(srv: &TestServer, target: &str, format: &str) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// `field`, but for a format tmux fills in a moment after it answers the
+/// command that created the target.
+///
+/// `#{pane_current_path}` is the one observed doing it: tmux replies to
+/// `new-window` with the window id before the pane's process has a working
+/// directory to report, so an immediate read can come back empty. That is
+/// not a Cyclops behavior to assert against, it is a read taken too early,
+/// and it made this test fail once on the tmux-head job and pass on the
+/// next run with no change in between.
+///
+/// Bounded, and it returns whatever it last saw rather than panicking, so
+/// a genuinely empty field still fails at the caller's assertion with the
+/// caller's message instead of a timeout here.
+fn field_when_set(srv: &TestServer, target: &str, format: &str) -> String {
+    let mut last = String::new();
+    for _ in 0..50 {
+        last = field(srv, target, format);
+        if !last.is_empty() {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    last
+}
+
 /// A pane's geometry: (left, top, width).
 fn geometry(srv: &TestServer, pane: &str) -> (u16, u16, u16) {
     let raw = field(srv, pane, "#{pane_left}\t#{pane_top}\t#{pane_width}");
@@ -350,7 +375,7 @@ async fn new_window_returns_its_id_and_applies_name_and_directory() {
 
     assert!(id.starts_with('@'), "expected a window id, got {id:?}");
     assert_eq!(field(&srv, &id, "#{window_name}"), "review notes");
-    let path = field(&srv, &id, "#{pane_current_path}");
+    let path = field_when_set(&srv, &id, "#{pane_current_path}");
     assert!(
         same_dir(&path, &dir),
         "new window should start in the requested directory, got {path}"

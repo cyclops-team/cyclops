@@ -704,7 +704,15 @@ echo "#### The handoff (docs/guides/QUICKSTART.md walks this)"
 printf '\n$ (typed in the implementer pane) cyclops send reviewer --subject "Burst path fix, ready for review" --body "gateway.rs:120. Tests pass."\n'
 tmx send-keys -t "$N1" -l '@send reviewer --subject "Burst path fix, ready for review" --body "gateway.rs:120. Tests pass."'
 tmx send-keys -t "$N1" Enter
-wait_for "the handoff to settle" 50 settled "Burst path fix, ready for review"
+# `delivery_verified`, not `settled`: the check below asserts the heavy
+# check, and `settled` returns the moment nothing is in flight, which
+# includes `delivered_unverified`. Screen tier is a legal resting state, so
+# waiting for "stopped moving" and then demanding "hook verified" is a race
+# the script runs against itself. It loses on a loaded runner, twice
+# observed: once here reading the light check, and once downstream, exactly
+# as `delivery_verified`'s own comment warns, because the un-upgraded
+# delivery poisons the later eye count.
+wait_for "the handoff to verify" 100 delivery_verified "Burst path fix, ready for review"
 
 run "$CYC" history --with reviewer --limit 1 --plain
 check "the sender is the pane, not the caller" '^ +[0-9]+s +implementer → reviewer +Burst path fix, ready for review +✔ delivered · verified$'
