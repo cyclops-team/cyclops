@@ -80,8 +80,10 @@
 		margin-top: 3px;
 	}
 
+	/* The prompt takes the theme accent, not the site's brand green, which
+	   is a light sage and does not hold on the peach terminal ground. */
 	.dollar {
-		color: var(--sage);
+		color: var(--sb-accent);
 	}
 
 	button {
@@ -101,9 +103,10 @@
 		color: var(--term-text);
 	}
 
+	/* A completed copy is state.healthy, the same green a receipt uses. */
 	button.copied {
-		color: var(--sage);
-		border-color: var(--sage);
+		color: var(--sb-healthy);
+		border-color: var(--sb-healthy);
 	}
 
 	button.failed {

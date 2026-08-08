@@ -3,24 +3,26 @@
 </script>
 
 <div class="term-bar">
-	<span class="term-dot mauve"></span>
-	<span class="term-dot sage"></span>
-	<span class="term-dot neutral"></span>
+	<span class="term-dot raspberry"></span>
+	<span class="term-dot coral"></span>
+	<span class="term-dot mint"></span>
 	{#if title}
 		<span class="term-title">{title}</span>
 	{/if}
 </div>
 
 <style>
-	.mauve {
-		background: var(--mauve);
+	/* Three slots off sorbet's role wheel, spread around it the way the
+	   theme spreads eight agents so they stay apart at a glance. */
+	.raspberry {
+		background: var(--sb-role-8);
 	}
 
-	.sage {
-		background: var(--sage);
+	.coral {
+		background: var(--sb-role-1);
 	}
 
-	.neutral {
-		background: var(--term-neutral);
+	.mint {
+		background: var(--sb-role-5);
 	}
 </style>

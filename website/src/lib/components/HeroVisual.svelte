@@ -1,154 +1,414 @@
 <script lang="ts">
 	import TerminalHeader from './TerminalHeader.svelte';
 
-	const panes = [
-		{
-			role: 'implementer',
-			dot: 'var(--sage)',
-			lines: [
-				{ cls: 'dim', text: '$ claude' },
-				{ cls: 'out', text: 'Implementing rate limiter…' },
-				{ cls: 'ok', text: '✓ 3 files changed' }
-			]
-		},
-		{
-			role: 'reviewer',
-			dot: 'var(--mauve)',
-			lines: [
-				{ cls: 'dim', text: '$ codex' },
-				{ cls: 'msg', text: '[cyclops m-2f304e] FROM: admin  SUBJECT: Review' },
-				{ cls: 'msg', text: 'Check the retry ordering.' }
-			]
-		},
-		{
-			role: 'tests',
-			dot: 'var(--sage)',
-			lines: [
-				{ cls: 'dim', text: '$ cursor-agent' },
-				{ cls: 'out', text: 'Investigating auth.spec failure…' },
-				{ cls: 'out', text: '→ root cause: stale token cache' }
-			]
-		},
-		{
-			role: 'operator',
-			dot: 'var(--term-neutral)',
-			lines: [
-				{ cls: 'dim', text: '$ cyclops send reviewer \\' },
-				{ cls: 'dim', text: '  --subject "Review"' },
-				{ cls: 'ok', text: '✔ delivered · verified' }
-			]
-		}
+	// The sidebar's session tree. Workspace rows sit at the root in bold;
+	// agent rows indent under an expanded one. Glyph and color come from
+	// the same mapping the app uses (cyclops-theme state_token, and
+	// cyclops-workspace decoration): working is state.healthy, idle is
+	// state.quiet, needs-attention is state.needs_you.
+	const tree = [
+		{ kind: 'workspace', name: 'clops', arrow: '▾', selected: true },
+		{ kind: 'agent', name: 'implementer', glyph: '●', state: 'working', role: 'coral' },
+		{ kind: 'agent', name: 'reviewer', glyph: '○', state: 'quiet', role: 'blueberry' },
+		{ kind: 'agent', name: 'tests', glyph: '⚠', state: 'needs', role: 'raspberry' },
+		{ kind: 'workspace', name: 'website', arrow: '▸', selected: false }
+	] as const;
+
+	const tabs = [
+		{ name: '1', selected: false },
+		{ name: 'review', selected: true }
 	];
 </script>
 
-<div class="term visual" role="img" aria-label="A Cyclops terminal workspace with three agent panes and an operator terminal coordinating on a single change">
-	<TerminalHeader title="cyclops — one workspace, three agents" />
-	<div class="grid">
-		{#each panes as pane (pane.role)}
-			<div class="pane">
-				<div class="pane-head">
-					<span class="pane-dot" style="background: {pane.dot}"></span>
-					<span class="pane-role">{pane.role}</span>
+<div
+	class="term visual"
+	role="img"
+	aria-label="The Cyclops workspace in the sorbet theme: a sidebar listing the clops workspace with three named agents, a tab bar, and three panes whose borders carry each agent's name and state"
+>
+	<TerminalHeader title="cyclops — clops · sorbet" />
+
+	<div class="shell">
+		<aside class="sidebar">
+			<div class="chips">
+				<span class="chip on">Sessions</span>
+				<span class="chip">Stream</span>
+			</div>
+
+			<div class="tree">
+				{#each tree as row (row.name)}
+					{#if row.kind === 'workspace'}
+						<div class="row ws" class:sel={row.selected}>
+							<span class="arrow">{row.arrow}</span>{row.name}
+						</div>
+					{:else}
+						<div class="row agent">
+							<span class="glyph {row.state}">{row.glyph}</span><span class="name {row.role}"
+								>{row.name}</span
+							>
+						</div>
+					{/if}
+				{/each}
+			</div>
+
+			<div class="side-foot">
+				<span>☰ menu</span>
+				<span class="plus-sm">+</span>
+			</div>
+			<!-- The chevron that collapses the panel, on its outer edge. -->
+			<span class="collapse">◂</span>
+		</aside>
+
+		<div class="main">
+			<div class="tabbar">
+				{#each tabs as tab (tab.name)}
+					<span class="tab" class:sel={tab.selected}>{tab.name}</span>
+				{/each}
+				<span class="plus">+</span>
+			</div>
+
+			<div class="canvas">
+				<!-- The focused pane: accent border, full state word, split
+				     controls, the drag grip, and a copy notice on the bottom. -->
+				<div class="pane focus wide">
+					<span class="label">implementer<span class="sep">·</span><span class="glyph working"
+							>●</span
+						>working</span
+					>
+					<span class="ctl">[|][-]</span>
+					<div class="body">
+						<div class="dim">$ claude</div>
+						<div>Implementing the rate limiter…</div>
+						<div class="ok">✓ 3 files changed</div>
+					</div>
+					<span class="notice">copied 42 characters</span>
+					<span class="grip">⠿</span>
 				</div>
-				<div class="pane-body">
-					{#each pane.lines as line (line.text)}
-						<div class={line.cls}>{line.text}</div>
-					{/each}
+
+				<div class="pane">
+					<span class="label">reviewer<span class="sep">·</span><span class="glyph quiet">○</span
+						></span
+					>
+					<div class="body">
+						<div class="dim">$ codex</div>
+						<div class="msg">[cyclops m-2f304e]</div>
+						<div class="msg">FROM: admin</div>
+					</div>
+					<span class="grip">⠿</span>
+				</div>
+
+				<div class="pane">
+					<span class="label">tests<span class="sep">·</span><span class="glyph needs">⚠</span
+						></span
+					>
+					<div class="body">
+						<div class="dim">$ cursor-agent</div>
+						<div>auth.spec failing</div>
+						<div class="warn">⚠ waiting on you</div>
+					</div>
+					<span class="grip">⠿</span>
 				</div>
 			</div>
-		{/each}
+		</div>
 	</div>
 </div>
 
 <style>
 	.visual {
 		overflow: hidden;
+		box-shadow: 0 18px 44px rgba(58, 43, 38, 0.18);
 	}
 
-	.grid {
+	.shell {
 		display: grid;
-		grid-template-columns: 1fr 1fr;
-		grid-template-rows: 1fr 1fr;
+		grid-template-columns: 148px 1fr;
+		min-height: 268px;
 	}
 
-	.pane {
+	/* ---- sidebar ---- */
+
+	.sidebar {
+		position: relative;
+		display: flex;
+		flex-direction: column;
+		background: var(--sb-panel);
 		border-right: 1px solid var(--term-line);
-		border-bottom: 1px solid var(--term-line);
-		padding: 14px 16px;
+		padding: 8px 0 0;
+		font-size: 11px;
+	}
+
+	.chips {
+		display: flex;
+		gap: 4px;
+		padding: 0 8px 8px;
+	}
+
+	.chip {
+		padding: 2px 7px;
+		color: var(--term-dim);
+		font-size: 10px;
+	}
+
+	.chip.on {
+		background: var(--sb-raised);
+		color: var(--term-text);
+		font-weight: 600;
+	}
+
+	.tree {
+		flex: 1;
+		padding: 2px 0;
+	}
+
+	.row {
+		padding: 3px 8px;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	/* Workspace rows are bold at the root; the selected one takes the
+	   raised ground, the same stronger fill the app gives it. */
+	.row.ws {
+		font-weight: 700;
+		color: var(--term-text);
+	}
+
+	.row.ws.sel {
+		background: var(--sb-raised);
+	}
+
+	.arrow {
+		display: inline-block;
+		width: 12px;
+		color: var(--term-dim);
+	}
+
+	.row.agent {
+		padding-left: 20px;
+	}
+
+	.glyph {
+		display: inline-block;
+		width: 13px;
+	}
+
+	.glyph.working {
+		color: var(--sb-healthy);
+	}
+
+	.glyph.quiet {
+		color: var(--term-dim);
+	}
+
+	.glyph.needs {
+		color: var(--sb-needs);
+	}
+
+	.name.coral {
+		color: var(--sb-role-1);
+	}
+
+	.name.blueberry {
+		color: var(--sb-role-6);
+	}
+
+	.name.raspberry {
+		color: var(--sb-role-8);
+	}
+
+	.side-foot {
+		display: flex;
+		justify-content: space-between;
+		padding: 7px 8px;
+		border-top: 1px solid var(--term-line);
+		color: var(--term-dim);
+		font-size: 10px;
+	}
+
+	.plus-sm {
+		color: var(--sb-accent);
+		font-weight: 700;
+	}
+
+	/* Bottom of the sidebar's outer edge, where the app puts it. */
+	.collapse {
+		position: absolute;
+		right: 2px;
+		bottom: 28px;
+		color: var(--term-dim);
+		font-size: 10px;
+	}
+
+	/* ---- tab bar ---- */
+
+	.main {
+		display: flex;
+		flex-direction: column;
 		min-width: 0;
 	}
 
-	.pane:nth-child(2n) {
-		border-right: none;
-	}
-
-	.pane:nth-child(n + 3) {
-		border-bottom: none;
-	}
-
-	.pane-head {
+	.tabbar {
 		display: flex;
 		align-items: center;
-		gap: 6px;
-		margin-bottom: 10px;
+		gap: 2px;
+		padding: 5px 8px;
+		background: var(--sb-panel);
+		border-bottom: 1px solid var(--term-line);
+		font-size: 10.5px;
 	}
 
-	.pane-dot {
-		width: 6px;
-		height: 6px;
-		border-radius: 50%;
-		flex-shrink: 0;
+	.tab {
+		padding: 2px 9px;
+		color: var(--term-dim);
 	}
 
-	.pane-role {
-		font-size: 10px;
-		letter-spacing: 1px;
-		text-transform: uppercase;
+	.tab.sel {
+		background: var(--sb-raised);
+		color: var(--term-text);
+		font-weight: 600;
+	}
+
+	/* The filled + is always on the strip, whatever the tab count. */
+	.plus {
+		margin-left: 4px;
+		padding: 1px 7px;
+		background: var(--sb-accent);
+		color: #fff6ed;
+		font-weight: 700;
+	}
+
+	/* ---- pane canvas ---- */
+
+	/* The gap has to clear the labels and the notice, which hang off the
+	   borders rather than sitting inside the panes. */
+	.canvas {
+		flex: 1;
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 15px 9px;
+		padding: 10px 9px 9px;
+		align-content: start;
+	}
+
+	.pane {
+		position: relative;
+		border: 1px solid #e0c4ae;
+		padding: 11px 10px 10px;
+		min-width: 0;
+		min-height: 84px;
+	}
+
+	.wide {
+		grid-column: 1 / -1;
+	}
+
+	/* The focused pane's border takes the accent; inactive borders stay
+	   muted. Same rule the app follows. */
+	.pane.focus {
+		border-color: var(--sb-accent);
+	}
+
+	/* A pane carries its identity in the top border itself, so the label
+	   sits on the rule with the pane's own ground knocked out behind it. */
+	.label {
+		position: absolute;
+		z-index: 2;
+		top: -7px;
+		left: 9px;
+		padding: 0 5px;
+		background: var(--term-bg);
+		font-size: 10.5px;
+		color: var(--term-text);
+		white-space: nowrap;
+	}
+
+	.sep {
+		margin: 0 4px;
 		color: var(--term-faint);
 	}
 
-	.pane-body {
-		font-size: 11.5px;
-		line-height: 1.85;
+	.label .glyph {
+		width: auto;
+		margin-right: 4px;
 	}
 
-	.pane-body div {
+	.ctl {
+		position: absolute;
+		z-index: 2;
+		top: -7px;
+		right: 9px;
+		padding: 0 5px;
+		background: var(--term-bg);
+		font-size: 10.5px;
+		color: var(--sb-accent);
+		letter-spacing: -0.5px;
+	}
+
+	/* The one cell that picks a pane up. */
+	.grip {
+		position: absolute;
+		z-index: 2;
+		right: 4px;
+		bottom: -8px;
+		padding: 0 2px;
+		background: var(--term-bg);
+		color: var(--term-faint);
+		font-size: 11px;
+		line-height: 1;
+	}
+
+	/* A copy says what it took, on the focused pane's bottom border. */
+	.notice {
+		position: absolute;
+		z-index: 2;
+		bottom: -7px;
+		left: 9px;
+		padding: 0 5px;
+		background: var(--term-bg);
+		color: var(--sb-healthy);
+		font-size: 10px;
+		white-space: nowrap;
+	}
+
+	.body {
+		font-size: 11px;
+		line-height: 1.75;
+		color: var(--term-text);
+	}
+
+	.body div {
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
 
-	.pane-body .dim {
+	.body .dim {
 		color: var(--term-dim);
 	}
 
-	.pane-body .out {
-		color: var(--term-text);
+	.body .ok {
+		color: var(--sb-healthy);
 	}
 
-	.pane-body .ok {
-		color: var(--sage);
+	.body .warn {
+		color: var(--sb-needs);
 	}
 
-	.pane-body .msg {
-		color: var(--mauve);
+	.body .msg {
+		color: var(--sb-role-7);
 	}
 
 	@media (max-width: 560px) {
-		.grid {
+		.shell {
+			grid-template-columns: 116px 1fr;
+		}
+
+		.canvas {
 			grid-template-columns: 1fr;
 		}
 
-		.pane {
-			border-right: none;
-		}
-
-		.pane:nth-child(n + 3) {
-			border-bottom: 1px solid var(--term-line);
-		}
-
-		.pane:last-child {
-			border-bottom: none;
+		.wide {
+			grid-column: auto;
 		}
 	}
 </style>

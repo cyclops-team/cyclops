@@ -94,9 +94,9 @@
 	}
 
 	.tablist button.active {
-		color: var(--sage);
+		color: var(--sb-accent);
 		background: var(--term-active-bg);
-		border-bottom-color: var(--sage);
+		border-bottom-color: var(--sb-accent);
 	}
 
 	.tablist button:hover:not(.active) {

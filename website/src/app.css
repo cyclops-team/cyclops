@@ -22,7 +22,7 @@
 	--hairline: #d8d7d3;
 	--hairline-btn: #cfcec9;
 
-	/* Sorbet accents */
+	/* Brand accents */
 	--sage: #b7c396;
 	--sage-hover: #a6b382;
 	--sage-ink: #7e8a5c;
@@ -33,16 +33,38 @@
 	--link: #6e7a4e;
 	--accent-ink: #0a0a0a;
 
-	/* Terminal */
-	--term-bg: #0d0d0d;
-	--term-line: #1f1f1f;
-	--term-text: #edecec;
-	--term-dim: #777;
-	--term-faint: #666;
-	--term-control: #161616;
-	--term-control-hover: #3a3a3a;
-	--term-neutral: #cccccc;
-	--term-active-bg: rgba(183, 195, 150, 0.07);
+	/* Terminal, painted in the shipped `sorbet` theme.
+	   Values are lifted from resources/themes/sorbet.toml so what the site
+	   shows is what `cyclops theme sorbet` puts on screen. Sorbet is a light
+	   theme, so these stay light in the page's dark mode too: a depiction of
+	   the app does not invert any more than a screenshot would. */
+	--term-bg: #fff6ed; /* surface.bg, peach paper */
+	--term-line: #eed7c4; /* pane and panel rules */
+	--term-text: #3a2b26; /* surface.fg, cocoa ink */
+	--term-dim: #7a6055; /* surface.dim */
+	/* The quiet step, for separators and the drag grip. Sorbet's state.dead
+	   is #9f8e86, which measures 2.94:1 on this ground; the app refuses to
+	   paint a cell below 3:1, so the site does not either. */
+	--term-faint: #94817a;
+	--term-control: #fbe7d8; /* chrome.panel */
+	--term-control-hover: #f3d3bd; /* chrome.raised */
+	--term-neutral: #7a6055;
+	--term-active-bg: rgba(184, 75, 54, 0.09);
+
+	/* Sorbet semantics. The four state colors carry the same meaning here
+	   as they do in a pane border, and the role wheel names agents. */
+	--sb-accent: #b84b36; /* surface.accent, coral */
+	--sb-panel: #fbe7d8;
+	--sb-raised: #f3d3bd;
+	--sb-healthy: #2a7a4a; /* state.healthy, idle and verified */
+	--sb-needs: #8f6416; /* state.needs_you */
+	--sb-terminal: #a02c22; /* state.terminal, a dead pane */
+	--sb-role-1: #b84b36; /* coral */
+	--sb-role-4: #487a33; /* lime */
+	--sb-role-5: #2a7a76; /* mint */
+	--sb-role-6: #4a6fae; /* blueberry */
+	--sb-role-7: #7d51a6; /* grape */
+	--sb-role-8: #b3406e; /* raspberry */
 
 	--font-mono: 'JetBrains Mono', ui-monospace, monospace;
 	--font-pixel: 'Silkscreen', ui-monospace, monospace;
@@ -223,9 +245,13 @@ a.btn-secondary:hover {
 
 /* ---- Terminal chrome ---- */
 
+/* Terminal surfaces carry their own ink. Without this, anything inside
+   that does not set a color inherits the page's --text, which follows the
+   light/dark toggle and lands near-invisible on the peach ground. */
 .term {
-	border: 1px solid var(--term-line);
+	border: 1px solid #e3c3ab;
 	background: var(--term-bg);
+	color: var(--term-text);
 }
 
 .term-bar {
@@ -233,6 +259,7 @@ a.btn-secondary:hover {
 	align-items: center;
 	gap: 8px;
 	padding: 12px 16px;
+	background: var(--sb-panel);
 	border-bottom: 1px solid var(--term-line);
 }
 
@@ -244,7 +271,7 @@ a.btn-secondary:hover {
 
 .term-title {
 	font-size: 11px;
-	color: var(--term-faint);
+	color: var(--term-dim);
 	margin-left: 8px;
 }
 
@@ -262,12 +289,13 @@ a.btn-secondary:hover {
 	color: var(--term-text);
 }
 
+/* A receipt is state.healthy, the same green the pane border uses. */
 .term-body .ok {
-	color: var(--sage);
+	color: var(--sb-healthy);
 }
 
 .term-body .prompt {
-	color: var(--sage);
+	color: var(--sb-accent);
 }
 
 .cursor {
