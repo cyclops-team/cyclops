@@ -186,14 +186,6 @@ daemon_attached() { "$CYC" --json status | jq -e '.sessions[0].attached == true'
 # only unambiguous signal, and unlike a sleep it is not a guess about how
 # slow the machine is.
 standin_reading() { [ -f "$ROOT/ready.$1" ]; }
-# The DAEMON has noticed this pane's occupant changed, as opposed to the
-# occupant having changed. Those are different events separated by a tmux
-# subscription tick, and the tier of a delivery is decided from what the
-# daemon believes, not from what is true.
-pane_command_changed() {
-  "$CYC" --json status | jq -e --arg p "$1" --arg c "$2" \
-    '[.sessions[].panes[] | select(.pane_id == $p and .current_command != $c)] | length > 0' >/dev/null
-}
 pane_bound_to() {
   "$CYC" --json status | jq -e --arg p "$1" --arg m "$2" \
     '[.sessions[].panes[] | select(.pane_id == $p and .manifest == $m)] | length > 0' >/dev/null
@@ -482,12 +474,6 @@ cat "$OUT"
 check "the shipped set is on disk"        '^claude\.toml$'
 
 P1="$(tmx list-panes -t main -F '#{pane_id}')"
-# What the daemon believes is in the pane right now. The waits after the
-# respawn below are against this, because "not what it was" is the only
-# stable way to say "the daemon saw the change": the incoming command's
-# name is the platform's choice of /bin/sh, not ours.
-P1_WAS="$("$CYC" --json status | jq -r --arg p "$P1" \
-  '[.sessions[].panes[] | select(.pane_id == $p) | .current_command] | first // ""')"
 # A person attaches here and starts an agent. The rig starts its stand-in,
 # and clears the pane title tmux seeded with the hostname so the roster
 # below shows what an agent publishes rather than what tmux did.
@@ -512,7 +498,22 @@ tmx select-pane -t "$P1" -T ''
 # so they are waited for instead: the stand-in is reading (above, and it is
 # the slower of the two), and the daemon has bound the pane.
 wait_for "the daemon to bind the stand-in" 100 pane_bound_to "$P1" demo
-wait_for "the daemon to see the new occupant" 100 pane_command_changed "$P1" "$P1_WAS"
+# One subscription period, so the daemon has ticked at least once since the
+# occupant changed.
+#
+# This is the last constant here and it is the only one tied to a property
+# of the system rather than to machine speed: the subscription runs at 1Hz
+# (F23), so two seconds is two ticks. It cannot be waited for instead. The
+# obvious observable, current_command changing, is not one: the incoming
+# process is the platform's /bin/sh, and on a runner whose login shell is
+# already bash the before and after strings are identical, so "it changed"
+# never becomes true. That predicate is what turned this rung red on macos
+# while ubuntu passed.
+#
+# What used to be here was `sleep 4` covering this AND the stand-in's
+# startup at once. Startup is the part that scaled with load and it is now
+# waited for above, which is the half that was failing.
+sleep 2
 
 run "$CYC" start --plain
 check "a second start is one line"        '^✔ workspace ready · 1 agent$'
