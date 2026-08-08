@@ -914,10 +914,23 @@ fn quitting_leaves_the_alternate_screen_and_returns_to_a_shell_prompt() {
     // (`canvas.rs`'s module doc), and the corner glyph is stable across
     // every theme, so this does not depend on which session/window name
     // tmux happened to pick.
+    //
+    // Either corner counts. A pane at rest carries `BORDER_REST`'s rounded
+    // `╭`; the focused one carries `BORDER_FOCUSED`'s double `╔`
+    // (`canvas.rs`). This rig has a single pane, so it is always the
+    // focused one, but asserting only the focused glyph would make the
+    // test fail the day the rig grows a second pane. The property under
+    // test is that chrome reached the screen at all, not which state it
+    // is in, and neither glyph can appear unless the renderer ran.
     wait_until(
         Instant::now() + Duration::from_secs(15),
         "the workspace to paint",
-        || alternate_on(&outer, &pane) == "1" && outer.capture(&pane).contains('╭'),
+        || {
+            alternate_on(&outer, &pane) == "1" && {
+                let screen = outer.capture(&pane);
+                screen.contains('╭') || screen.contains('╔')
+            }
+        },
     );
 
     // The quit chord: prefix (`C-b`) then `d`, resolving to

@@ -197,7 +197,14 @@ pub fn motion_touches_hover_button(
     let on_button = |col: u16, row: u16| {
         matches!(
             hit_map.hit(col, row),
-            Some(HitTarget::NewWorkspaceButton | HitTarget::SidebarToggle)
+            // The three controls rule 1 in `render/mod.rs` names: the tab
+            // strip's `+`, the sidebar footer's `+`, and the sidebar
+            // chevron. `NewTabButton` was absent while `paint_tab_bar`
+            // already computed a hover for it, so that one button saw no
+            // motion event and never lit.
+            Some(
+                HitTarget::NewTabButton | HitTarget::NewWorkspaceButton | HitTarget::SidebarToggle
+            )
         )
     };
     on_button(col, row) || hover.is_some_and(|(col, row)| on_button(col, row))
@@ -325,15 +332,19 @@ mod tests {
         assert!(map.workspace_blocks().is_empty());
     }
 
-    /// Both hover-lit chrome buttons are on the filter's list, and both
-    /// edges of a motion get through: a button that lit on arrival but
+    /// All three hover-lit chrome buttons are on the filter's list, and
+    /// both edges of a motion get through: a button that lit on arrival but
     /// never heard the departure would stay lit wherever the mouse went
     /// next.
+    ///
+    /// The tab strip's `+` is here because it shipped missing: the strip
+    /// painted a hover state the filter never delivered an event for.
     #[test]
     fn motion_reaches_the_renderer_for_every_button_that_lights() {
         let mut map = HitMap::default();
         map.push(Rect::new(0, 7, 1, 1), HitTarget::SidebarToggle);
         map.push(Rect::new(15, 7, 3, 1), HitTarget::NewWorkspaceButton);
+        map.push(Rect::new(25, 0, 3, 1), HitTarget::NewTabButton);
         map.push(
             Rect::new(0, 0, 20, 5),
             HitTarget::PaneBody {
@@ -346,9 +357,14 @@ mod tests {
             motion_touches_hover_button(&map, None, 16, 7),
             "the create button"
         );
-        // Leaving either one still has to repaint it.
+        assert!(
+            motion_touches_hover_button(&map, None, 26, 0),
+            "the tab strip's +"
+        );
+        // Leaving any of them still has to repaint it.
         assert!(motion_touches_hover_button(&map, Some((0, 7)), 3, 3));
         assert!(motion_touches_hover_button(&map, Some((16, 7)), 3, 3));
+        assert!(motion_touches_hover_button(&map, Some((26, 0)), 3, 3));
         // Motion with neither end on a button is the noise the filter is
         // for.
         assert!(!motion_touches_hover_button(&map, Some((4, 4)), 3, 3));

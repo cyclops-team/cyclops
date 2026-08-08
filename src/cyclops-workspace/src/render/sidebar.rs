@@ -14,7 +14,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Paragraph, Widget};
 
 use cyclops_ui::Record;
 
@@ -57,12 +57,16 @@ pub fn paint_sidebar(
         return;
     }
     buf.set_style(area, theme::chrome_panel(paint));
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(theme::pane_border(paint))
-        .style(theme::chrome_panel(paint));
-    let inner = block.inner(area);
-    block.render(area, buf);
+    // No border down this edge. The pane canvas draws its own one column
+    // over, so a rule here stood two parallel lines beside each other with
+    // nothing between them, which reads as two windows parked side by side
+    // rather than one workspace. Panel ground runs up to the canvas now.
+    //
+    // The column is still reserved: it is the resize divider, and a handle
+    // buried under a row's fill is one the operator cannot see to grab.
+    // Reserving it also keeps every row of the body on the column it has
+    // always been on, border or no border.
+    let inner = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
     hits.push(
         Rect::new(
             area.x + area.width.saturating_sub(1),
@@ -87,7 +91,9 @@ pub fn paint_sidebar(
     let footer_y = inner.y + inner.height.saturating_sub(1);
 
     paint_tab_header(inner, tab, buf, paint, hits, decoration);
-    match tab {
+    // Tree rows that did not fit above the footer. The Stream tab does its
+    // own clipping inside `super::stream`, so it reports nothing here.
+    let clipped = match tab {
         SidebarTab::Sessions => paint_session_tree(
             workspaces,
             active,
@@ -123,17 +129,31 @@ pub fn paint_sidebar(
                 buf,
                 paint,
             );
+            0
         }
-    }
-    paint_footer(inner, content, footer_y, buf, paint, hits, hover);
-    // The collapse control sits on the panel's outer edge, on the footer
-    // row. Same row as the rail's chevron, so the control stays where the
-    // eye left it when the panel goes; the column moves because the panel
-    // it was attached to did. It takes one cell of the resize divider and
-    // no more: the handle still answers on every other row, and this hit
-    // is pushed last so it wins its own.
-    let edge = Rect::new(area.x + area.width.saturating_sub(1), area.y, 1, area.height);
-    paint_toggle(buf, toggle_reach(edge), edge, SIDEBAR_COLLAPSE, paint, hits, hover);
+    };
+    paint_footer(inner, content, footer_y, buf, paint, hits, hover, clipped);
+    // The collapse control sits centered on the panel's outer edge, on the
+    // same row as the rail's chevron, so the control stays where the eye
+    // left it when the panel goes; the column moves because the panel it
+    // was attached to did. It takes a band of the resize divider and no
+    // more: the handle still answers on every row outside the band, and
+    // this hit is pushed last so the band wins its own rows.
+    let edge = Rect::new(
+        area.x + area.width.saturating_sub(1),
+        area.y,
+        1,
+        area.height,
+    );
+    paint_toggle(
+        buf,
+        toggle_reach(edge),
+        edge,
+        SIDEBAR_COLLAPSE,
+        paint,
+        hits,
+        hover,
+    );
 }
 
 /// The band of the panel's outer edge that answers as the collapse control,
@@ -289,6 +309,11 @@ fn paint_tab_header(
 
 /// The Sessions tab's body: workspace rows, their expanded agent rows, and
 /// the live reorder-drop rule.
+///
+/// Returns the number of tree rows that did not fit above the footer. The
+/// tree does not scroll, so that count is the only thing standing between
+/// the operator and a list that stops without saying it stopped; the
+/// footer paints it.
 fn paint_session_tree(
     workspaces: &[WorkspaceRow],
     active: usize,
@@ -304,7 +329,7 @@ fn paint_session_tree(
     hits: &mut HitMap,
     decoration: &DecorationSnapshot,
     drag: Option<&DragState>,
-) {
+) -> usize {
     // A live workspace-row drag: which row is grabbed (dimmed in the loop
     // below) and, once the pointer is actually over this sidebar, which
     // slot it currently previews.
@@ -317,6 +342,12 @@ fn paint_session_tree(
     // The header owns row 0 and a blank row separates it from the tree, so
     // rows start on the row the old title left them on.
     let mut y = content.y + 2;
+    // The daemon's note owns this row whether or not it has anything to
+    // say. cyclopsd answers a beat or two after launch, and a row that
+    // existed only while the note did would slide the whole tree up one
+    // row at exactly that moment, under a pointer already on a target.
+    // Same reasoning as the pane notice line (`canvas::paint_notice`):
+    // chrome that appears and expires must not move what is around it.
     if !decoration.online {
         super::overlay_text(
             buf,
@@ -326,13 +357,23 @@ fn paint_session_tree(
             "cyclopsd offline",
             theme::sidebar_row(paint),
         );
-        y += 1;
     }
+    y += 1;
+
+    let mut clipped = 0usize;
     for (i, ws) in workspaces.iter().enumerate() {
-        if y >= footer_y {
-            break;
-        }
         let expanded = expanded_workspaces.contains(&ws.session_id);
+        // Resolved before the room check so a clipped workspace can report
+        // the agent rows it would have opened, not just itself.
+        let agents = if expanded {
+            decoration.agent_rows_for_window_ids(&ws.window_ids, agent_order)
+        } else {
+            Vec::new()
+        };
+        if y >= footer_y {
+            clipped += 1 + agents.len();
+            continue;
+        }
         let marker = if expanded { "▾" } else { "▸" };
         // The color cue (dim) is redundant with a non-color one (the grip
         // glyph prefix) — see rule 11 and `theme::sidebar_row_dragging`.
@@ -370,12 +411,10 @@ fn paint_session_tree(
         );
         y += 1;
 
-        if !expanded {
-            continue;
-        }
-        for agent in decoration.agent_rows_for_window_ids(&ws.window_ids, agent_order) {
+        for agent in agents {
             if y >= footer_y {
-                break;
+                clipped += 1;
+                continue;
             }
             let selected = i == active && agent.pane_id == active_pane;
             let row_style = if selected {
@@ -433,6 +472,8 @@ fn paint_session_tree(
             }
         }
     }
+
+    clipped
 }
 
 /// The footer both tabs share: the application menu at left, and a matching
@@ -442,6 +483,9 @@ fn paint_session_tree(
 /// Painted for the Stream tab too. The menu button is the only mouse route
 /// to themes, keybinds, and detach, so hiding it behind a tab would strand
 /// them.
+///
+/// `clipped` is how many rows the body above could not fit. Zero paints
+/// nothing.
 fn paint_footer(
     inner: Rect,
     content: Rect,
@@ -450,6 +494,7 @@ fn paint_footer(
     paint: &Paint,
     hits: &mut HitMap,
     hover: Option<(u16, u16)>,
+    clipped: usize,
 ) {
     if inner.height < 2 {
         return;
@@ -483,21 +528,34 @@ fn paint_footer(
             && hover_col >= plus_x
             && hover_col < plus_x.saturating_add(plus_width)
     });
-    if hovered {
-        // Say what it makes, in the gutter the footer already leaves
-        // between the menu label and the button. Skipped rather than
-        // truncated when the sidebar is too narrow: half a word next to
-        // a lit button teaches nothing.
-        let hint_width =
-            u16::try_from(Span::raw(copy::NEW_WORKSPACE_HINT).width()).unwrap_or(u16::MAX);
+    // One slot, right-aligned against the create button, in the gutter the
+    // footer already leaves between the menu label and that button. Two
+    // things want it, so the precedence is fixed here: hover wins, because
+    // that text explains the control the pointer is on right now, and the
+    // count is still there when the pointer leaves. Either is skipped
+    // rather than truncated when the sidebar is too narrow: half a phrase
+    // next to a lit button teaches nothing.
+    let note = if hovered {
+        // Say what the button makes. A bare glyph does not.
+        Some(copy::NEW_WORKSPACE_HINT.to_string())
+    } else if clipped > 0 {
+        // The body stops at the footer and does not scroll, so without
+        // this a workspace below the fold looks like one that does not
+        // exist. Same job as the keybinds dialog's "1–12 / 20".
+        Some(format!("+{clipped} more"))
+    } else {
+        None
+    };
+    if let Some(note) = note {
+        let note_width = u16::try_from(Span::raw(note.as_str()).width()).unwrap_or(u16::MAX);
         let gutter = plus_x.saturating_sub(content.x.saturating_add(menu_width));
-        if hint_width < gutter {
+        if note_width < gutter {
             super::overlay_text(
                 buf,
                 content,
-                plus_x.saturating_sub(hint_width),
+                plus_x.saturating_sub(note_width),
                 footer_y,
-                copy::NEW_WORKSPACE_HINT,
+                &note,
                 theme::sidebar_label(paint),
             );
         }
@@ -659,8 +717,8 @@ mod tests {
         assert!(flat.contains('▾'), "active row should be expanded");
         assert_eq!(buf[(0, 3)].symbol(), " ", "left padding cell one");
         assert_eq!(buf[(1, 3)].symbol(), " ", "left padding cell two");
-        // The title row is followed by a spacer, then the offline note,
-        // so workspaces paint on rows 3 and 4.
+        // The tab header, a spacer, then the row reserved for the daemon
+        // note, so workspaces paint on rows 3 and 4.
         assert!(matches!(
             hits.hit(3, 3),
             Some(HitTarget::SidebarRow { session, .. }) if session == "cyclops"
@@ -681,6 +739,224 @@ mod tests {
         ));
         assert!(flat.contains("menu"), "menu button should render: {flat}");
         assert!(flat.contains('+'), "create button should render: {flat}");
+    }
+
+    /// One workspace, drawn twice: once with the daemon note showing and
+    /// once without. The note's row is reserved either way.
+    ///
+    /// cyclopsd answers a beat or two after launch, so this flip happens on
+    /// a routine boot. If the row only existed while the note did, the
+    /// whole tree would jump up one row at that moment, moving every click
+    /// target out from under a pointer that had already found one.
+    #[test]
+    fn the_daemon_note_reserves_its_row_so_the_tree_never_moves() {
+        let workspaces = vec![WorkspaceRow {
+            session_id: "$0".into(),
+            name: "cyclops".into(),
+            tab_count: 1,
+            window_ids: vec!["@0".into()],
+        }];
+        let expanded = std::collections::HashSet::from(["$0".to_string()]);
+        let paint = Paint::for_test();
+
+        let render = |online: bool| {
+            let decoration = DecorationSnapshot {
+                online,
+                ..Default::default()
+            };
+            let mut term = Terminal::new(TestBackend::new(24, 8)).unwrap();
+            let mut hits = HitMap::default();
+            term.draw(|f| {
+                paint_sidebar(
+                    &workspaces,
+                    0,
+                    "%0",
+                    &expanded,
+                    &[],
+                    SidebarTab::Sessions,
+                    &Record::new(),
+                    f.area(),
+                    f.buffer_mut(),
+                    &paint,
+                    &mut hits,
+                    &decoration,
+                    None,
+                    None,
+                );
+            })
+            .unwrap();
+            (term.backend().buffer().clone(), hits)
+        };
+
+        let workspace_row = |hits: &HitMap| {
+            (0..8u16)
+                .find(|y| matches!(hits.hit(3, *y), Some(HitTarget::SidebarRow { .. })))
+                .expect("the workspace row must paint")
+        };
+
+        let (offline_buf, offline_hits) = render(false);
+        let (online_buf, online_hits) = render(true);
+
+        // The flip is real, or the row comparison below proves nothing.
+        assert!(
+            flatten(&offline_buf).contains("cyclopsd offline"),
+            "an offline daemon must still say so: {}",
+            flatten(&offline_buf)
+        );
+        assert!(
+            !flatten(&online_buf).contains("cyclopsd offline"),
+            "the note goes when the daemon answers: {}",
+            flatten(&online_buf)
+        );
+        assert_eq!(
+            workspace_row(&offline_hits),
+            workspace_row(&online_hits),
+            "the daemon coming online must not move the tree"
+        );
+    }
+
+    /// The tree stops at the footer and does not scroll, so what it
+    /// dropped has to be said somewhere: a workspace below the fold is
+    /// otherwise indistinguishable from one that does not exist.
+    #[test]
+    fn the_footer_counts_the_tree_rows_that_did_not_fit() {
+        let workspaces: Vec<WorkspaceRow> = (0..7)
+            .map(|i| WorkspaceRow {
+                session_id: format!("${i}"),
+                name: format!("ws{i}"),
+                tab_count: 1,
+                window_ids: vec![format!("@{i}")],
+            })
+            .collect();
+        let paint = Paint::for_test();
+
+        let render = |height: u16| {
+            let mut term = Terminal::new(TestBackend::new(30, height)).unwrap();
+            let mut hits = HitMap::default();
+            term.draw(|f| {
+                paint_sidebar(
+                    &workspaces,
+                    0,
+                    "%0",
+                    &std::collections::HashSet::new(),
+                    &[],
+                    SidebarTab::Sessions,
+                    &Record::new(),
+                    f.area(),
+                    f.buffer_mut(),
+                    &paint,
+                    &mut hits,
+                    &DecorationSnapshot::default(),
+                    None,
+                    None,
+                );
+            })
+            .unwrap();
+            flatten(term.backend().buffer())
+        };
+
+        // Eight rows: header, spacer, the reserved daemon-note row, four
+        // tree rows, footer. Three of the seven workspaces miss the cut.
+        let short = render(8);
+        assert!(
+            short.contains("ws3"),
+            "the four rows that fit still paint: {short}"
+        );
+        assert!(
+            !short.contains("ws4"),
+            "row five is below the fold: {short}"
+        );
+        assert!(
+            short.contains("+3 more"),
+            "the footer must count what it dropped: {short}"
+        );
+
+        // Room for every row: the footer has nothing to report.
+        let tall = render(16);
+        assert!(tall.contains("ws6"), "every workspace fits: {tall}");
+        assert!(
+            !tall.contains("more"),
+            "a count with nothing clipped is a lie: {tall}"
+        );
+    }
+
+    /// The count is rows the operator cannot see, not workspaces. A
+    /// clipped workspace that is expanded takes its agent rows down with
+    /// it, and they are just as invisible.
+    #[test]
+    fn the_clipped_count_includes_the_agents_under_a_clipped_workspace() {
+        use crate::decoration::PaneDecoration;
+        use cyclops_proto::AgentState;
+
+        let workspaces: Vec<WorkspaceRow> = (0..5)
+            .map(|i| WorkspaceRow {
+                session_id: format!("${i}"),
+                name: format!("ws{i}"),
+                tab_count: 1,
+                window_ids: vec![format!("@{i}")],
+            })
+            .collect();
+        let paint = Paint::for_test();
+
+        // Two agents live in the last workspace's window — the one that
+        // will not fit.
+        let mut decoration = DecorationSnapshot {
+            online: true,
+            ..Default::default()
+        };
+        for pane in ["%0", "%1"] {
+            decoration.panes.insert(
+                pane.into(),
+                PaneDecoration {
+                    pane_id: pane.into(),
+                    window_id: "@4".into(),
+                    label: None,
+                    manifest: Some("claude".into()),
+                    manifest_display_name: Some("Claude Code".into()),
+                    state: AgentState::Idle,
+                    needs_attention: false,
+                },
+            );
+        }
+
+        let render = |expanded: &std::collections::HashSet<String>| {
+            let mut term = Terminal::new(TestBackend::new(30, 8)).unwrap();
+            let mut hits = HitMap::default();
+            term.draw(|f| {
+                paint_sidebar(
+                    &workspaces,
+                    0,
+                    "%9",
+                    expanded,
+                    &[],
+                    SidebarTab::Sessions,
+                    &Record::new(),
+                    f.area(),
+                    f.buffer_mut(),
+                    &paint,
+                    &mut hits,
+                    &decoration,
+                    None,
+                    None,
+                );
+            })
+            .unwrap();
+            flatten(term.backend().buffer())
+        };
+
+        // Four tree rows fit, so $4 is clipped. Collapsed it is one row.
+        let collapsed = render(&std::collections::HashSet::new());
+        assert!(
+            collapsed.contains("+1 more"),
+            "one clipped workspace, one row: {collapsed}"
+        );
+
+        // Expanded it is three: itself and the two agents under it.
+        let expanded = render(&std::collections::HashSet::from(["$4".to_string()]));
+        assert!(
+            expanded.contains("+3 more"),
+            "a clipped workspace hides its open agent rows too: {expanded}"
+        );
     }
 
     /// A live workspace-row drag must (1) mark the grabbed row with a
@@ -776,7 +1052,7 @@ mod tests {
 
         // (2) The rule paints across the sidebar's usable width at row 3 —
         // the previewed boundary — and nowhere else.
-        let inner_width = 19; // area width 20 minus the 1-cell right border
+        let inner_width = 19; // area width 20 minus the 1-cell resize divider
         for x in 0..inner_width {
             assert_eq!(
                 dragging[(x, 3)].symbol(),
@@ -787,7 +1063,7 @@ mod tests {
         assert_ne!(
             dragging[(inner_width, 3)].symbol(),
             "─",
-            "the rule must not paint over the sidebar's own border column"
+            "the rule must leave the resize divider column graspable"
         );
         // Rows other than the previewed boundary are unaffected by the
         // rule (row 4 still reads as the grabbed row's own text, not a
@@ -867,9 +1143,11 @@ mod tests {
             "unknown stays diagnostic: {flat}"
         );
         assert!(!flat.contains("? reviewer"), "unknown has no glyph: {flat}");
+        // Header, spacer, the reserved daemon-note row, the workspace row:
+        // the first agent lands on row 4 online or off.
         assert!(
             matches!(
-                hits.hit(6, 3),
+                hits.hit(6, 4),
                 Some(HitTarget::SidebarAgent { pane_id, .. }) if pane_id == "%1"
             ),
             "persisted agent order should put Claude first"
@@ -942,11 +1220,11 @@ mod tests {
         let default_paint = Paint::for_test();
         let plain_paint = Paint::without_color_for_test();
 
-        // Column 5, row 3: one expanded, online workspace puts its first
-        // agent row at y = 3 (title, blank, workspace row), and the status
-        // glyph lands 3 cells past the 2-cell sidebar pad
-        // (`content.x.saturating_add(3)` in `paint_sidebar`).
-        let (gx, gy) = (5, 3);
+        // Column 5, row 4: one expanded workspace puts its first agent row
+        // at y = 4 (header, blank, reserved daemon-note row, workspace
+        // row), and the status glyph lands 3 cells past the 2-cell sidebar
+        // pad (`content.x.saturating_add(3)` in `paint_sidebar`).
+        let (gx, gy) = (5, 4);
         for (state, needs_attention, glyph) in [
             (AgentState::Idle, false, "○"),
             (AgentState::Working, false, "●"),
@@ -1302,7 +1580,10 @@ mod tests {
     fn the_open_sidebar_carries_the_collapse_chevron_on_its_own_edge() {
         let paint = Paint::for_test();
         let (panel, panel_hits) = draw_sidebar(SidebarTab::Sessions, &Record::new(), &paint);
-        let edge = (SIDEBAR.x + SIDEBAR.width - 1, SIDEBAR.y + SIDEBAR.height / 2);
+        let edge = (
+            SIDEBAR.x + SIDEBAR.width - 1,
+            SIDEBAR.y + SIDEBAR.height / 2,
+        );
 
         assert!(matches!(
             panel_hits.hit(edge.0, edge.1),
@@ -1406,6 +1687,50 @@ mod tests {
                 .contains(ratatui::style::Modifier::BOLD),
             "and the control still reads as a control with color off"
         );
+    }
+
+    /// The panel used to close itself with a full-height rule one column
+    /// from the pane canvas's own border: two parallel lines with nothing
+    /// between them, which reads as two windows parked side by side. The
+    /// panel's ground meets the canvas now. The column is still the resize
+    /// divider, which is the next test's half of the claim.
+    #[test]
+    fn the_sidebar_edge_paints_panel_ground_not_a_border() {
+        let paint = Paint::for_test();
+        let (buf, _) = draw_sidebar(SidebarTab::Sessions, &Record::new(), &paint);
+        let edge_x = SIDEBAR.x + SIDEBAR.width - 1;
+        // A cell no widget writes to: the blank row between the tab header
+        // and the tree, inside the sidebar's left pad.
+        let ground = buf[(SIDEBAR.x + 1, SIDEBAR.y + 1)].clone();
+        assert_eq!(
+            Some(ground.bg),
+            theme::chrome_panel(&paint).bg,
+            "the reference cell must actually be the panel's ground"
+        );
+
+        let text = sidebar_text(&buf);
+        assert!(
+            !text.contains('│'),
+            "no vertical rule anywhere in the panel: {text:?}"
+        );
+        for y in SIDEBAR.y..SIDEBAR.y + SIDEBAR.height {
+            let cell = &buf[(edge_x, y)];
+            // The collapse control is meant to be on this edge, and it
+            // paints itself. Every other row is bare ground.
+            if cell.symbol() == SIDEBAR_COLLAPSE {
+                continue;
+            }
+            assert_eq!(
+                cell.symbol(),
+                " ",
+                "row {y} of the sidebar's outer column still paints something"
+            );
+            assert_eq!(
+                (cell.fg, cell.bg),
+                (ground.fg, ground.bg),
+                "row {y} of the outer column must be the panel's own ground"
+            );
+        }
     }
 
     /// Resize by drag survives the header and the collapse chevron. The
