@@ -1,5 +1,8 @@
 <script lang="ts">
-	let { title }: { title?: string } = $props();
+	// `showTheme` appends the name of the theme the mock is actually painted
+	// in. It follows the page's light/dark toggle, so the title never claims
+	// a theme the pixels are not showing.
+	let { title, showTheme = false }: { title?: string; showTheme?: boolean } = $props();
 </script>
 
 <div class="term-bar">
@@ -7,7 +10,7 @@
 	<span class="term-dot coral"></span>
 	<span class="term-dot mint"></span>
 	{#if title}
-		<span class="term-title">{title}</span>
+		<span class="term-title">{title}{#if showTheme}<span class="theme-name"></span>{/if}</span>
 	{/if}
 </div>
 
@@ -24,5 +27,13 @@
 
 	.mint {
 		background: var(--sb-role-5);
+	}
+
+	.theme-name::after {
+		content: ' · sorbet';
+	}
+
+	:global(html[data-theme='dark']) .theme-name::after {
+		content: ' · ember';
 	}
 </style>

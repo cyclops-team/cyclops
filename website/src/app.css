@@ -54,6 +54,9 @@
 	   the app does not invert any more than a screenshot would. */
 	--term-bg: #fff6ed; /* surface.bg, peach paper */
 	--term-line: #eed7c4; /* pane and panel rules */
+	--term-frame: #e3c3ab; /* the outer edge of a terminal block */
+	--term-pane-line: #e0c4ae; /* an inactive pane's border */
+	--term-shadow: rgba(58, 43, 38, 0.18);
 	--term-text: #3a2b26; /* surface.fg, cocoa ink */
 	--term-dim: #7a6055; /* surface.dim */
 	/* The quiet step, for separators and the drag grip. Sorbet's state.dead
@@ -122,7 +125,37 @@
 	--mauve-ink: #c7a59b;
 	--link: #bdc99c;
 
-	/* Terminal tokens intentionally stay unchanged in both themes. */
+	/* The terminal follows the page into the dark, and it does that by
+	   changing theme rather than by dimming: this is `ember`, the shipped
+	   dark theme, straight out of resources/themes/ember.toml. Ember is
+	   sorbet's counterpart at the warm end, amber on a charcoal the color
+	   of a log the flame has left, so the two sides of the toggle are one
+	   product in two of its own themes and not a screenshot that inverted. */
+	--term-bg: #14100d; /* surface.bg, the pane ground */
+	--term-line: #33291f;
+	--term-frame: #3c2f23;
+	--term-pane-line: #362b21;
+	--term-text: #f2e7db; /* surface.fg */
+	--term-dim: #a08b78; /* surface.dim */
+	--term-faint: #8a7462; /* above state.dead, which lands under 3:1 here */
+	--term-control: #201a14; /* chrome.panel */
+	--term-control-hover: #3c2f23; /* chrome.raised */
+	--term-neutral: #a08b78;
+	--term-active-bg: rgba(255, 157, 77, 0.1);
+	--term-shadow: rgba(0, 0, 0, 0.5);
+
+	--sb-accent: #ff9d4d; /* surface.accent, ember */
+	--sb-panel: #201a14;
+	--sb-raised: #3c2f23;
+	--sb-healthy: #9fc47f;
+	--sb-needs: #f0b95e;
+	--sb-terminal: #f2635e;
+	--sb-role-1: #ff9d4d; /* ember */
+	--sb-role-4: #b9c47a; /* scorched olive */
+	--sb-role-5: #eb9aa6; /* ash rose */
+	--sb-role-6: #cfa98c; /* driftwood */
+	--sb-role-7: #93c4b4; /* verdigris */
+	--sb-role-8: #bf94cc; /* smolder violet */
 }
 
 * {
@@ -270,7 +303,7 @@ a.btn-secondary:hover {
    that does not set a color inherits the page's --text, which follows the
    light/dark toggle and lands near-invisible on the peach ground. */
 .term {
-	border: 1px solid #e3c3ab;
+	border: 1px solid var(--term-frame);
 	background: var(--term-bg);
 	color: var(--term-text);
 }

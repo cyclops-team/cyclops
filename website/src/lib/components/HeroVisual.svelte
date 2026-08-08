@@ -25,7 +25,7 @@
 	role="img"
 	aria-label="The Cyclops workspace in the sorbet theme: a sidebar listing the clops workspace with three named agents, a tab bar, and three panes whose borders carry each agent's name and state"
 >
-	<TerminalHeader title="cyclops — clops · sorbet" />
+	<TerminalHeader title="cyclops — clops" showTheme />
 
 	<div class="shell">
 		<aside class="sidebar">
@@ -115,7 +115,7 @@
 <style>
 	.visual {
 		overflow: hidden;
-		box-shadow: 0 18px 44px rgba(58, 43, 38, 0.18);
+		box-shadow: 0 18px 44px var(--term-shadow);
 	}
 
 	.shell {
@@ -269,11 +269,12 @@
 	}
 
 	/* The filled + is always on the strip, whatever the tab count. */
+	/* Text on the accent is the pane ground, so it flips with the theme. */
 	.plus {
 		margin-left: 4px;
 		padding: 1px 7px;
 		background: var(--sb-accent);
-		color: #fff6ed;
+		color: var(--term-bg);
 		font-weight: 700;
 	}
 
@@ -292,7 +293,7 @@
 
 	.pane {
 		position: relative;
-		border: 1px solid #e0c4ae;
+		border: 1px solid var(--term-pane-line);
 		padding: 11px 10px 10px;
 		min-width: 0;
 		min-height: 84px;
