@@ -547,6 +547,7 @@ Otherwise, one page per question.
 | [hooks.md](docs/reference/hooks.md) | Wiring vendor hooks, verifying they fire |
 | [MANIFESTS.md](docs/reference/MANIFESTS.md) | Teaching cyclops a new agent CLI |
 | [PROTOCOL.md](docs/reference/PROTOCOL.md) | The socket: methods, requests, responses |
+| [BENCHMARKS.md](docs/reference/BENCHMARKS.md) | Latency, throughput, and render cost, each number with its source |
 | [troubleshooting.md](docs/guides/troubleshooting.md) | When something is wrong |
 | [ARCHITECTURE.md](docs/development/ARCHITECTURE.md) | How the pieces fit |
 | [DELIVERY.md](docs/development/DELIVERY.md) | The delivery spec: states, evidence tiers, ordering |
@@ -554,6 +555,7 @@ Otherwise, one page per question.
 | [SECURITY.md](SECURITY.md) | Reporting a vulnerability privately |
 | [INVARIANTS.md](docs/development/INVARIANTS.md) | Eleven rules a change must never break, and what breaks otherwise |
 | [findings.md](findings.md) | The measurements the design rests on, F13 onward, each with the probe that proved it |
+| [V5.md](docs/development/V5.md) | What the v5 line is for, and what is deliberately out of it |
 | [CHANGELOG.md](CHANGELOG.md) | What each milestone changed, in the order it shipped |
 | [GOALS.md](docs/development/GOALS.md) | The quality bar every milestone is reviewed against |
 | [STYLE.md](docs/development/STYLE.md) | How this codebase is written, binding on every change |

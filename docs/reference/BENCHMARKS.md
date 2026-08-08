@@ -175,8 +175,13 @@ between sends so v1 was measured succeeding, not failing.
 
 `tests/e2e/m1_soak.py` drives Claude Code, Codex CLI, and Antigravity CLI in
 isolated tmux servers and reconciles every delivery against the ledger.
-Two runs are committed under `tests/raw/`. Timestamps in those ledgers put
-both on 2026-08-02.
+
+The two runs below are **not in this repository**. `/tests/raw/` is
+gitignored: a run writes 1.9MB of daemon logs and pane captures from real
+vendor CLIs, which is neither reviewable in a diff nor safe to publish
+without scrubbing. The numbers here were read off a local run on the
+machine that produced them, and reproducing them means running the soak
+yourself. Timestamps in those ledgers put both on 2026-08-02.
 
 `tests/raw/m1-soak-2/summary.json`, verdict PASS, 251.9s wall, zero detach
 events, zero shutdown wedges:
@@ -193,8 +198,8 @@ is the first state line to the last. The agy leg stopped at 21 because the
 vendor quota parked it, which is the designed outcome, not a failure.
 
 `tests/raw/m1-soak/summary.json` is the earlier run, verdict FAIL: the
-Claude leg lost one delivery and stopped at seq 29. Both are kept because
-the pair is the evidence for the fixes listed under M1 in
+Claude leg lost one delivery and stopped at seq 29. Both runs are reported
+because the pair is the evidence for the fixes listed under M1 in
 [CHANGELOG.md](../../CHANGELOG.md), and because a benchmarks page that
 publishes only the green run is advertising.
 
