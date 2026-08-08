@@ -4,10 +4,13 @@
 	type Theme = 'light' | 'dark';
 
 	const STORAGE_KEY = 'cyclops-theme';
-	const DARK_MODE_QUERY = '(prefers-color-scheme: dark)';
 
-	let theme = $state<Theme>('light');
-	let followsSystem = true;
+	// Sorbet, the light theme, is what a visitor with no saved choice gets.
+	// The OS preference is deliberately not consulted: the page is a
+	// depiction of the product, and the product's default theme is this one.
+	const DEFAULT_THEME: Theme = 'light';
+
+	let theme = $state<Theme>(DEFAULT_THEME);
 
 	function isTheme(value: string | null | undefined): value is Theme {
 		return value === 'light' || value === 'dark';
@@ -29,7 +32,6 @@
 
 	function persistTheme(nextTheme: Theme) {
 		applyTheme(nextTheme);
-		followsSystem = false;
 		try {
 			localStorage.setItem(STORAGE_KEY, nextTheme);
 		} catch {
@@ -38,29 +40,17 @@
 	}
 
 	onMount(() => {
-		const colorScheme = matchMedia(DARK_MODE_QUERY);
-		const storedTheme = readStoredTheme();
-		followsSystem = storedTheme === null;
-		applyTheme(storedTheme ?? (colorScheme.matches ? 'dark' : 'light'));
+		applyTheme(readStoredTheme() ?? DEFAULT_THEME);
 
-		function handleSystemChange(event: MediaQueryListEvent) {
-			if (followsSystem) applyTheme(event.matches ? 'dark' : 'light');
-		}
-
+		// A choice made in another tab still applies here; clearing it there
+		// returns this tab to the default rather than to the OS preference.
 		function handleStorage(event: StorageEvent) {
 			if (event.key !== STORAGE_KEY) return;
-			const nextTheme = isTheme(event.newValue) ? event.newValue : null;
-			followsSystem = nextTheme === null;
-			applyTheme(nextTheme ?? (colorScheme.matches ? 'dark' : 'light'));
+			applyTheme(isTheme(event.newValue) ? event.newValue : DEFAULT_THEME);
 		}
 
-		colorScheme.addEventListener('change', handleSystemChange);
 		window.addEventListener('storage', handleStorage);
-
-		return () => {
-			colorScheme.removeEventListener('change', handleSystemChange);
-			window.removeEventListener('storage', handleStorage);
-		};
+		return () => window.removeEventListener('storage', handleStorage);
 	});
 </script>
 

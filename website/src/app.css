@@ -1,37 +1,51 @@
-/* Cyclops design tokens — from "Cyclops Light" design system v1.0 */
+/* Cyclops design tokens. The light theme IS `sorbet`, the shipped theme of
+   the same name: values come from resources/themes/sorbet.toml so the page
+   and the app are the same citrus counter on peach paper. */
 :root {
 	color-scheme: light;
 
-	/* Surfaces */
-	--paper: #fefefe;
-	--surface: #fbfbf9;
-	--surface-mid: #f4f3f1;
-	--surface-deep: #f7f6f3;
-	--navbar-bg: rgba(254, 254, 254, 0.85);
+	/* Surfaces, stepping down from the paper into apricot the way sorbet's
+	   chrome grounds do: on a light theme the furniture recedes by
+	   darkening, not by lightening. */
+	--paper: #fff6ed; /* surface.bg */
+	--surface: #fdf0e4;
+	--surface-mid: #fbe7d8; /* chrome.panel */
+	--surface-deep: #f8ecdf;
+	--navbar-bg: rgba(255, 246, 237, 0.85);
 
-	/* Ink & grays */
-	--ink: #0a0a0a;
-	--text: #2a2a2a;
-	--muted: #6e6e6e;
-	--gray: #8a8a8a;
-	--faint: #a6a6a6;
+	/* Ink & grays, cocoa rather than neutral so they belong to the paper. */
+	--ink: #2c1f1b;
+	--text: #3a2b26; /* surface.fg */
+	--muted: #7a6055; /* surface.dim */
+	--gray: #8a6d61;
+	--faint: #94817a;
 
 	/* Lines */
-	--line: #e4e3df;
-	--line-soft: #efeeeb;
-	--hairline: #d8d7d3;
-	--hairline-btn: #cfcec9;
+	--line: #f0dccc;
+	--line-soft: #f7e9dc;
+	--hairline: #e8cdb9;
+	--hairline-btn: #dcbca6;
 
-	/* Brand accents */
-	--sage: #b7c396;
-	--sage-hover: #a6b382;
-	--sage-ink: #7e8a5c;
-	--mist: #e0e7d7;
-	--mauve: #ba9a91;
-	--mauve-hover: #a8877e;
-	--mauve-ink: #9c7e75;
-	--link: #6e7a4e;
-	--accent-ink: #0a0a0a;
+	/* The theme accent and its companion, sorbet's coral and raspberry.
+	   --accent-ink is what rides ON the accent, so it is the paper. */
+	--accent: #b84b36; /* surface.accent */
+	--accent-hover: #9e3d2b;
+	--accent-ink: #fff6ed;
+	--accent-soft: #f3d3bd; /* chrome.raised */
+	--accent-2: #b3406e; /* role.8, raspberry */
+	--accent-2-hover: #9c3560;
+	--link: #a6461e; /* palette.1, a read link on peach */
+
+	/* Historical names. Fourteen components still read these; pointing them
+	   at the accent keeps this a theme change rather than a rename, and the
+	   rename is its own commit. */
+	--sage: var(--accent);
+	--sage-hover: var(--accent-hover);
+	--sage-ink: var(--accent);
+	--mist: var(--accent-soft);
+	--mauve: var(--accent-2);
+	--mauve-hover: var(--accent-2-hover);
+	--mauve-ink: var(--accent-2);
 
 	/* Terminal, painted in the shipped `sorbet` theme.
 	   Values are lifted from resources/themes/sorbet.toml so what the site
@@ -93,11 +107,18 @@
 	--hairline: #3b3c36;
 	--hairline-btn: #484942;
 
-	/* Accents */
-	--sage-hover: #c5cfaa;
+	/* Accents. The dark theme is unchanged by the sorbet light theme: these
+	   are the values it has always rendered, restated here because the
+	   light block now defines them in sorbet rather than in sage. The
+	   --sage/--mauve aliases resolve through --accent, so overriding the
+	   accent is enough to carry them. */
+	--accent: #b7c396;
+	--accent-hover: #c5cfaa;
+	--accent-ink: #0a0a0a;
+	--accent-soft: #293021;
+	--accent-2: #ba9a91;
+	--accent-2-hover: #c5a69d;
 	--sage-ink: #bdc99c;
-	--mist: #293021;
-	--mauve-hover: #c5a69d;
 	--mauve-ink: #c7a59b;
 	--link: #bdc99c;
 

@@ -109,8 +109,10 @@
 		color: var(--term-dim);
 	}
 
+	/* Quieter than a live prompt, but still a prompt: --term-control-hover is
+	   a chrome ground, not an ink, and measured 1.32:1 on the peach paper. */
 	.soon .dollar {
-		color: var(--term-control-hover);
+		color: var(--term-faint);
 	}
 
 	@media (max-width: 480px) {

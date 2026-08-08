@@ -4,7 +4,10 @@
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<script>
-			// Resolve the saved/system theme before styles load to avoid a flash of the wrong theme.
+			// Resolve the saved theme before styles load to avoid a flash of the wrong theme.
+			// A visitor with no saved choice lands on sorbet, the light theme, whatever
+			// the OS prefers: it is the theme the product is shown in, and the toggle is
+			// one click away.
 			(() => {
 				const storageKey = 'cyclops-theme';
 				let theme;
@@ -16,7 +19,7 @@
 				}
 
 				if (theme !== 'light' && theme !== 'dark') {
-					theme = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+					theme = 'light';
 				}
 
 				document.documentElement.dataset.theme = theme;
