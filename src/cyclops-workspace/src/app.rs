@@ -36,6 +36,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Duration, Instant};
 
 use crate::action;
+use crate::animate::{Motion, Seen, StatusInk};
 use crate::bindings::load_bindings;
 use crate::config::load_tmux_config;
 use crate::copy;
@@ -515,14 +516,20 @@ pub async fn run_async() -> i32 {
 
     let mut debounce: Option<Instant> = None;
     let mut reconnect_deadline: Option<Instant> = None;
+    // The animation clock (`crate::animate`) sits with the loop's other
+    // deadlines rather than in `App`: nothing outside this loop and `draw`
+    // reads it, and its wakeups are scheduled here the same one-shot way
+    // the render debounce is.
+    let mut motion = Motion::new(app.prefs.motion && motion_capable(&app.paint));
     let mut detached = false;
-    let _ = draw(&mut terminal, &mut app);
+    let _ = draw(&mut terminal, &mut app, &mut motion, Instant::now());
     while !detached {
         let next_deadline = [
             debounce,
             reconnect_deadline,
             app.folder_probe_at,
             app.notice.deadline(),
+            motion.deadline(),
         ]
         .into_iter()
         .flatten()
@@ -556,6 +563,10 @@ pub async fn run_async() -> i32 {
                 if notice_expired {
                     app.selection.clear();
                 }
+                // Retire finished fades and arm the next frame. Before the
+                // draw below so a motion frame and a render deadline that
+                // came due together collapse into one draw.
+                let motion_frame = motion.tick(now);
                 if debounce.is_some_and(|deadline| deadline <= now) {
                     debounce = None;
                     let resize_applied = match apply_live_divider(&mut app, &client).await {
@@ -582,11 +593,12 @@ pub async fn run_async() -> i32 {
                     if let Some(watch) = theme_watch.as_mut() {
                         refresh_theme_watch(&mut app, watch);
                     }
-                    let _ = draw(&mut terminal, &mut app);
-                } else if notice_expired {
-                    // Nothing else is due: the expiry is the only reason
-                    // this frame exists, and it owes exactly one.
-                    let _ = draw(&mut terminal, &mut app);
+                    let _ = draw(&mut terminal, &mut app, &mut motion, now);
+                } else if notice_expired || motion_frame {
+                    // Nothing else is due: the expiry or the fade is the
+                    // only reason this frame exists, and it owes exactly
+                    // one.
+                    let _ = draw(&mut terminal, &mut app, &mut motion, now);
                 }
                 if app.folder_probe_at.is_some_and(|due| due <= now) {
                     app.folder_probe_at = None;
@@ -604,7 +616,11 @@ pub async fn run_async() -> i32 {
                         &mut reconnect_deadline,
                     )
                     .await;
-                    let _ = draw(&mut terminal, &mut app);
+                    // A fresh instant, not this wake's: reconnecting awaits
+                    // the server, so `now` is stale by the time this frame
+                    // is composed and the clock would date its fades to
+                    // before the work.
+                    let _ = draw(&mut terminal, &mut app, &mut motion, Instant::now());
                 }
             }
         }
@@ -628,6 +644,12 @@ pub async fn run_async() -> i32 {
 /// stamp the watch never polled is still a pending change, so the first
 /// refresh after the close adopts whatever happened while browsing. That
 /// is how the watch resumes ownership unconditionally.
+///
+/// A running fade needs nothing here, and the absence is a decision.
+/// `crate::animate` stores time and endpoints as scalars, never a color, so
+/// the next frame resolves both ends of every blend through the new theme
+/// and the fade lands on the new colors instead of chasing one the theme
+/// dropped.
 fn refresh_theme_watch(app: &mut App, watch: &mut cyclops_theme::ThemeWatch) {
     if app.theme_restore.is_some() {
         return;
@@ -1085,6 +1107,106 @@ fn chrome_for(
         prefs.sidebar_width.max(crate::render::SIDEBAR_MIN_WIDTH),
         prefs.tab_bar_visible,
     )
+}
+
+/// Whether the workspace may animate (`crate::animate`). Capability first,
+/// then intent: the first two are not preferences, they are "there is
+/// nothing to fade".
+///
+/// 1. Colors off, which `Paint::detect` collapses `NO_COLOR` and a non-tty
+///    stdout into. Every token then resolves to the same empty style, so
+///    both endpoints of every blend are identical and a fade would be a
+///    no-op with a timer behind it.
+/// 2. No truecolor. An interpolated color resolves to the nearest 256-cube
+///    entry, and the whole dim-to-accent path collapses to four or five of
+///    them, so an eight-frame fade shows four steps. Banding is worse than
+///    a snap. Note the conservatism: `Paint::detect` tests `COLORTERM ==
+///    "truecolor"` exactly, so a terminal advertising `24bit` gets no
+///    motion. That is existing detection and it fails in the safe
+///    direction.
+/// 3. `CYCLOPS_MOTION`, when it parses. Anything else is ignored rather
+///    than treated as off, the way `load_prefs` treats a value it cannot
+///    read.
+/// 4. Default on. Contingent on what animates, not on the mechanism:
+///    nothing translates, scales or scrolls, nothing repeats, and the
+///    fastest fade completes in 120ms. A moving rectangle flips this
+///    default in the same commit that adds it.
+///
+/// The `[workspace] motion` preference sits between 3 and 4 and is applied
+/// separately, in `draw`, through `Motion::set_preference`. It is not read
+/// here because this function answers "can this terminal fade" and the
+/// preference answers "should it", and the two must not be able to
+/// re-enable each other: a preference that could switch motion back on for
+/// a terminal without truecolor would paint the banding this rejects.
+fn motion_capable(paint: &Paint) -> bool {
+    if !paint.colors_enabled() {
+        return false;
+    }
+    if !paint.truecolor {
+        return false;
+    }
+    match std::env::var("CYCLOPS_MOTION")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "0" | "false" | "off" => false,
+        "1" | "true" | "on" => true,
+        _ => true,
+    }
+}
+
+/// What this frame shows, as the animation clock's diff input.
+///
+/// `&App`, never `&mut`, and the borrow is the guard: `observe` arms from
+/// the draw path, so a draw that wrote something this function reads back
+/// would let the clock sustain itself with no event behind it, which is the
+/// one way this design could break rule 9 silently.
+fn observed(app: &App) -> Seen {
+    let tab = app.model.active_tab();
+    let mut status: Vec<(String, StatusInk)> = Vec::new();
+    let mut note = |pane_id: &str, dec: &decoration::PaneDecoration| {
+        if status.iter().any(|(id, _)| id == pane_id) {
+            return;
+        }
+        if let Some(ink) = status_ink(dec) {
+            status.push((pane_id.to_string(), ink));
+        }
+    };
+    // The pane titles this tab paints (`render::canvas`).
+    for pane_id in crate::layout::pane_ids_in_layout(&tab.layout) {
+        if let Some(dec) = app.decoration.pane(&pane_id) {
+            note(&pane_id, dec);
+        }
+    }
+    // Plus the sidebar's agent rows, which can name a pane in a tab this
+    // window is not showing (`render::sidebar`). Same key space, so an
+    // agent on screen twice settles once. Rows come from the function the
+    // sidebar itself calls, so the two cannot disagree about which rows
+    // exist.
+    for workspace in &app.model.workspaces {
+        if !app.expanded_workspaces.contains(&workspace.session_id) {
+            continue;
+        }
+        for dec in app
+            .decoration
+            .agent_rows_for_window_ids(&workspace.window_ids, &app.prefs.agent_order)
+        {
+            note(&dec.pane_id, dec);
+        }
+    }
+    Seen::new(Some(tab.active_pane.clone()), status, app.notice.deadline())
+}
+
+/// The semantic source of a pane's status ink, or `None` for a pane with no
+/// status cell to paint. Never a resolved color: the painter resolves both
+/// endpoints through the live theme on every frame, which is what makes a
+/// theme change mid-fade land on the new colors.
+fn status_ink(dec: &decoration::PaneDecoration) -> Option<StatusInk> {
+    if dec.needs_attention {
+        return Some(StatusInk::Eye);
+    }
+    DecorationSnapshot::primary_status(dec).map(|status| StatusInk::State(status.color_state))
 }
 
 /// A workspace can switch or rename sessions after boot. Reconnection must
@@ -2501,9 +2623,32 @@ async fn handle_dialog_key(
     })
 }
 
-fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
+/// Compose and write one frame.
+///
+/// `now` is this wake's instant, shared with the animation clock so the
+/// factors a frame paints with and the deadline it arms come from the same
+/// reading. `observe` runs first and is the only place an animation starts;
+/// see `crate::animate` for why arming is a diff rather than a call at each
+/// site.
+fn draw(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    motion: &mut Motion,
+    now: Instant,
+) -> io::Result<()> {
+    // The preference is read here rather than pushed from the exec arm
+    // because the clock is a local of the loop, not a field of `App`. One
+    // read per frame is cheap, it cannot desynchronise from what the menu
+    // just wrote, and it also covers a `config.toml` edited under a
+    // running workspace.
+    motion.set_preference(app.prefs.motion, motion_capable(&app.paint));
+    motion.observe(observed(app), now);
     app.hit_map.clear();
     let mut shown_cursor: Option<crate::render::HostCursor> = None;
+    // The whole call, write and flush included: what the slow-terminal
+    // latch measures is the cost of putting a frame on the wire, not the
+    // composition the 570us guard already bounds.
+    let started = std::time::Instant::now();
     terminal
         .draw(|f| {
             let areas = app.chrome(f.area());
@@ -2601,6 +2746,15 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
             crate::term_guard::apply_cursor_style(hc.shape, hc.blink);
             app.cursor_style = Some(style);
         }
+    }
+    // A terminal that writes frames slower than this app draws them is
+    // spending the operator's responsiveness on decoration. The latch is
+    // one way, so this line is the only explanation it will ever give.
+    if motion.note_frame(started.elapsed()) {
+        log_err(
+            &app.home,
+            &"motion: off, this terminal writes frames slower than it draws them",
+        );
     }
     Ok(())
 }

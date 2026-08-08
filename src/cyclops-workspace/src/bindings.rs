@@ -45,6 +45,7 @@ pub enum BindingAction {
     /// never be something that happened by itself; bindable via config for
     /// anyone who wants a key.
     ToggleTabBar,
+    ToggleMotion,
     /// Show the event stream on the sidebar's Stream tab, or hide the
     /// sidebar when the stream is what's showing. The name predates the
     /// merge of the old right-hand panel into the sidebar; the config key
@@ -258,6 +259,7 @@ fn action_from_key(key: &str) -> Option<BindingAction> {
         "close_workspace" => Some(BindingAction::CloseWorkspace),
         "toggle_sidebar" => Some(BindingAction::ToggleSidebar),
         "toggle_tab_bar" => Some(BindingAction::ToggleTabBar),
+        "toggle_motion" => Some(BindingAction::ToggleMotion),
         "toggle_event_panel" => Some(BindingAction::ToggleEventPanel),
         "show_keybinds" => Some(BindingAction::ShowKeybinds),
         "show_themes" => Some(BindingAction::ShowThemes),
@@ -391,6 +393,7 @@ fn action_words(action: BindingAction) -> String {
         BindingAction::CloseWorkspace => "Close workspace".into(),
         BindingAction::ToggleSidebar => "Toggle sidebar".into(),
         BindingAction::ToggleTabBar => "Toggle tab bar".into(),
+        BindingAction::ToggleMotion => "Toggle motion".into(),
         BindingAction::ToggleEventPanel => "Toggle event stream".into(),
         BindingAction::ShowKeybinds => "Keybinds".into(),
         BindingAction::ShowThemes => "Themes".into(),
@@ -425,6 +428,7 @@ fn help_rank(action: BindingAction) -> (u8, usize) {
         BindingAction::CloseWorkspace => (44, 0),
         BindingAction::ToggleSidebar => (49, 0),
         BindingAction::ToggleTabBar => (49, 1),
+        BindingAction::ToggleMotion => (49, 2),
         BindingAction::ToggleEventPanel => (50, 0),
         BindingAction::ShowKeybinds => (51, 0),
         BindingAction::ShowThemes => (52, 0),

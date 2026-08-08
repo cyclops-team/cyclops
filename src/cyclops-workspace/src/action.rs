@@ -261,6 +261,7 @@ pub enum Action {
     /// explicit choice, so the `+` that makes tabs is on screen from a
     /// fresh install; the choice persists like the sidebar's.
     ToggleTabBar,
+    ToggleMotion,
     /// Show the event stream: open the sidebar on its Stream tab. When
     /// the stream is already what's showing, hide the sidebar instead —
     /// the same "toggle the stream surface off, canvas back" meaning the
@@ -404,6 +405,7 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
         }),
         BindingAction::ToggleSidebar => Some(Action::ToggleSidebar),
         BindingAction::ToggleTabBar => Some(Action::ToggleTabBar),
+        BindingAction::ToggleMotion => Some(Action::ToggleMotion),
         BindingAction::ToggleEventPanel => Some(Action::ToggleEventPanel),
         BindingAction::ShowKeybinds => Some(Action::ShowKeybinds),
         BindingAction::ShowThemes => Some(Action::ShowThemes),
