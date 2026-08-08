@@ -1,6 +1,9 @@
 # Cyclops detection manifest: OpenAI Codex CLI
 # Derived from MEASURED evidence in validation/raw/p0 and validation/raw/soak.
-# Verified against codex-cli 0.145.0 inside tmux 3.6a, 120x40 pane.
+# Verified against codex-cli 0.145.0 inside tmux 3.6a, 120x40 pane;
+# re-verified on 0.147.0 (live rig, 2026-08-08) when screen_working was found
+# shadowed by the composer rules. The spinner reads "• Working (0s • esc to
+# interrupt)" and the ghost composer stays on screen for the whole turn.
 #
 # Sensor summary for this CLI:
 #   title  USELESS. #{pane_title} is the static project directory name in
@@ -14,7 +17,7 @@
 [agent]
 id = "codex"
 display_name = "Codex CLI"
-version_tested = "0.145.0"
+version_tested = "0.147.0"
 process_names = ["codex"]
 # What `cyclops start --agents codex` runs in a pane. The bare CLI, so the
 # directory-trust gate in [hooks] below still applies to a pane started
@@ -105,14 +108,31 @@ evidence = "MEASURED: observed live during soak startup"
 [[rule]]
 id = "screen_working"
 state = "working"
-priority = 800
+priority = 1100
 region = "bottom_non_empty_lines(8)"
 any = [
-  { contains = ["Esc to interrupt"] },
-  { contains = ["Working"] },
-  { contains = ["Thinking"] },
+  { contains = ["esc to interrupt"] },
+  { line_regex = ['^\s*•\s+(?:Working|Thinking)\b'] },
 ]
-evidence = "MEASURED during soak turns"
+note = """This rule MUST outrank the composer rules. MEASURED: Codex keeps the
+ghost composer line on screen for the whole turn, so composer_ghost_suggestion
+and composer_empty_or_ghost match continuously while the agent generates. At
+the old priority of 800 they both won, every turn read idle, and because idle
+is in [injection].safe_states the gate would paste into a live generation.
+cursor.toml was written against this exact defect and ordered itself the other
+way; this manifest never got the same fix.
+
+Two MEASURED signals, matching how cursor.toml separates them. The primary is
+the interrupt hint, present for exactly the duration of the turn. It is
+lowercase on the wire: the previous clause spelled it 'Esc to interrupt' and
+`contains` is case-sensitive, so that clause could never fire.
+
+The second is the spinner line '• Working (0s • esc to interrupt)'. The bullet
+prefix is required by the regex because U+2022 also prefixes the agent's own
+response text, so a bare `contains = ["Working"]` would read the agent's
+prose as a live turn. That looseness was survivable at 800, where the rule lost
+to everything above it; at 1100 it would wedge a finished pane as working."""
+evidence = "MEASURED 2026-08-08, codex-cli 0.147.0, fixtures/codex_working_composer_plain.txt; captured live at 120x40 while the turn rendered"
 
 [[rule]]
 id = "trust_dialog"

@@ -9,7 +9,7 @@
 [agent]
 id = "agy"
 display_name = "Antigravity CLI"
-version_tested = "1.1.6"
+version_tested = "1.1.11"
 process_names = ["agy"]
 default_model_observed = "Gemini 3.6 Flash (High)"
 # What `cyclops start --agents agy` runs in a pane. The bare CLI; the ACK
@@ -83,15 +83,40 @@ evidence = "MEASURED: injected marker rendered as '> CYCVAL-ACK-AGY-002 ...'"
 [[rule]]
 id = "screen_working"
 state = "working"
-priority = 800
+priority = 1100
 region = "bottom_non_empty_lines(10)"
 any = [
-  { contains = ["▸ Thought for"] },
-  { contains = ["esc to"] },
-  { contains = ["Thinking"] },
+  { line_regex = ['^\s*[\x{2800}-\x{28FF}]+\s+\S'] },
 ]
-note = "Step markers use '●' for completed tool steps and '▸' for reasoning blocks."
-evidence = "MEASURED agy mid-turn capture"
+note = """This rule MUST outrank the composer rules, and none of its previous
+clauses matched a running turn. Both were found by live capture on 1.1.11.
+
+Ordering: agy clears its composer the moment a turn starts, so the bare '>' is
+on screen for the whole turn and composer_empty matched at 1000 while this rule
+sat at 800. Every turn read idle, and idle is in [injection].safe_states, so the
+gate would paste into a live generation. codex.toml carried the same inversion
+and cursor.toml was deliberately written against it.
+
+Vocabulary: the only mid-turn indicator this CLI paints is a braille spinner
+followed by a status word, observed as '⣷', '⣻', '⣾' and '⣟' with
+'Generating...' across a reasoning turn and a tool-running turn, and reported
+as 'Running' while it executes a bash command. The three clauses that were here
+match nothing while a turn runs.
+
+The match keys on the spinner, not the word, precisely because the word set is
+open: 'Generating' and 'Running' are both confirmed and there is no reason to
+believe those are the only two. Keying on the spinner also avoids the
+false-positive cursor.toml guards against, where a status word appears in the
+agent's own output.
+
+'▸ Thought for' is not merely a POST-turn summary, it PERSISTS across turns:
+the fixture here is a live tool turn and still carries the summary line from
+the turn before it. It can never distinguish running from finished. 'esc to'
+and a bare 'Thinking' were never observed on this vendor at all.
+
+Braille is unambiguous here because the only other box-drawing on screen is the
+startup logo, which is U+2580 block elements, not braille."""
+evidence = "MEASURED 2026-08-08, agy 1.1.11, fixtures/agy_working_composer_plain.txt; spinner present in frames 1-7 of a polled tool turn and absent from frame 8 on"
 
 [[rule]]
 id = "quota_exhausted"
