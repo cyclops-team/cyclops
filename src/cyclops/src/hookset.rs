@@ -96,7 +96,7 @@ impl CliKind {
     /// The inverse of [`CliKind::name`]. Refresh reads the vendor out of a
     /// directory name install created, so the two live side by side and
     /// cannot drift apart unnoticed.
-    fn from_name(name: &str) -> Option<CliKind> {
+    pub fn from_name(name: &str) -> Option<CliKind> {
         match name {
             "claude" => Some(CliKind::Claude),
             "codex" => Some(CliKind::Codex),
@@ -322,7 +322,17 @@ fn cyclops_bin() -> String {
 /// walks. An artifact placed anywhere else is outside refresh's reach, and
 /// install says so rather than implying coverage.
 fn hooks_root() -> PathBuf {
-    cyclops_proto::cyclops_home().join("hooks")
+    hooks_root_in(&cyclops_proto::cyclops_home())
+}
+
+/// [`hooks_root`] for a home named explicitly, instead of the ambient one.
+///
+/// A caller that already resolved a home must not go back to the
+/// environment for it. `cyclops start` holds one, and its tests run against
+/// a scratch home: reading CYCLOPS_HOME there would write hook artifacts
+/// into the operator's real home from a test run.
+pub fn hooks_root_in(home: &Path) -> PathBuf {
+    home.join("hooks")
 }
 
 pub fn run_install(
@@ -423,6 +433,42 @@ pub fn run_install(
         println!("{}", instructions(kind, &path, label));
     }
     0
+}
+
+/// Render `kind`'s hook config for `label` in the standard place and return
+/// its path, saying nothing on the way.
+///
+/// This is `run_install`'s default-destination path with the printing and
+/// the `--dest` handling taken off, for callers that need the artifact
+/// rather than the report. `cyclops start` uses it to hand a pane its own
+/// hook config at launch, which is the only wiring claude needs and the
+/// reason nothing under ~/.claude is ever read or written.
+///
+/// A failed receipt is not an error here, for the same reason it is not one
+/// in `run_install`: the artifact is written and correct, it is only
+/// unrefreshable later. Callers that want the artifact want it either way,
+/// and a start that refused to launch a pane over an unwritten receipt
+/// would be trading a working agent for a bookkeeping note.
+///
+/// `identical_to_the_install_verb` below pins this to `run_install`'s
+/// output so the two cannot drift.
+pub fn prepare(home: &Path, kind: CliKind, label: &str) -> Result<PathBuf, String> {
+    let dest_dir = hooks_root_in(home).join(kind.name()).join(label);
+    let bin = cyclops_bin();
+    let content = render(kind, label, &bin);
+    let path = dest_dir.join(kind.file_name());
+    std::fs::create_dir_all(&dest_dir)
+        .map_err(|e| format!("can't create {}: {e}", dest_dir.display()))?;
+    write_atomic(&path, &content).map_err(|e| format!("can't write {}: {e}", path.display()))?;
+    let receipt = Receipt {
+        vendor: kind.name().to_string(),
+        agent: label.to_string(),
+        file: kind.file_name().to_string(),
+        bin,
+        rendered_fnv: fnv64(content.as_bytes()),
+    };
+    let _ = receipt.write(&dest_dir);
+    Ok(path)
 }
 
 /// What one [`refresh`] run did, one classification per (vendor, label)

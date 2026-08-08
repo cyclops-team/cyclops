@@ -105,6 +105,35 @@ adopt_daemon() {
 }
 
 cleanup() {
+  local code=$?
+  # Say why, before tearing down the evidence.
+  #
+  # Most commands here run as `cmd > "$OUT" 2>&1` and are read by `check`
+  # afterwards. Under `set -e` a command that exits nonzero takes the script
+  # with it BEFORE the line that prints $OUT, so the one thing worth seeing,
+  # the failing command's own message, is captured to a file and then
+  # deleted with $ROOT three lines down. That produced three CI reds in a
+  # row whose entire content was "exit code 1", and cost more time guessing
+  # than every real defect this script has caught.
+  #
+  # Only on failure: a green run has already printed everything it read.
+  if [ "$code" -ne 0 ]; then
+    if [ -s "${OUT:-}" ]; then
+      echo
+      echo "== the last command's output, which set -e would otherwise discard:"
+      sed 's/^/   /' "$OUT"
+    fi
+    # The nested rigs log their daemon to a file nobody prints. When the
+    # failure is "the daemon never came up", this is the only place that
+    # says what it said on the way down.
+    for nested in duo stock; do
+      if [ -s "$ROOT/$nested/daemon.log" ]; then
+        echo
+        echo "== $nested daemon.log (last 20):"
+        tail -20 "$ROOT/$nested/daemon.log" | sed 's/^/   /'
+      fi
+    done
+  fi
   cyc_stop_daemon
   # The nested rigs run their own daemon and their own tmux server in their
   # own directories. All of them die here even when a check above exited

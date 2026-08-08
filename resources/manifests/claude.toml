@@ -28,8 +28,9 @@ process_names = ["claude"]
 # name at a shell prompt is a child of the pane's first process, so pane_pid
 # resolves to the shell ("-zsh") and binds nothing.
 argv_basenames = ["claude"]
-# What `cyclops start --agents claude` runs in a pane. The bare CLI: hook
-# wiring is `cyclops hooks install`, and nothing here renders one.
+# What `cyclops start --agents claude` runs in a pane. The bare CLI; the
+# pane's own hook config is appended at start time from [hooks].settings_flag
+# below, so a pane started this way is already reporting.
 launch = "claude"
 
 [hooks]
@@ -37,6 +38,11 @@ launch = "claude"
 # user's own ~/.claude/settings.json is never modified. MEASURED: hooks fire in
 # both interactive TUI and -p print mode.
 config_mechanism = "--settings <file>"
+# The machine-readable half of config_mechanism above. Its presence is what
+# lets `cyclops start --agents claude` hand the pane a hook config at launch
+# instead of leaving the operator to wire one by hand. Nothing under
+# ~/.claude is read or written to do it.
+settings_flag = "--settings"
 turn_start = "UserPromptSubmit"
 turn_end = "Stop"
 ack = "UserPromptSubmit"          # delivery receipt, payload contains `prompt`

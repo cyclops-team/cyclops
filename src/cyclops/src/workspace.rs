@@ -555,7 +555,7 @@ fn resolve_agents(
             None => return Err(unknown_agent(id, &known)),
             Some(m) => match &m.launch {
                 None => return Err(agent_wont_launch(id, &m.path)),
-                Some(cmd) => out.push(cmd.clone()),
+                Some(cmd) => out.push((id.to_string(), cmd.clone())),
             },
         }
     }
@@ -563,7 +563,60 @@ fn resolve_agents(
     if out.len() != labels.len() {
         return Err(agent_count_mismatch(out.len(), source, &labels));
     }
-    Ok(out)
+    // Hand each pane its own hook config, for the CLIs that take one as a
+    // launch flag. This runs after every refusal above, so a workspace that
+    // is not going to be built writes no artifacts on the way to saying so.
+    Ok(out
+        .into_iter()
+        .zip(&labels)
+        .map(|((id, cmd), label)| wire_hooks(home, &known, &id, cmd, label))
+        .collect())
+}
+
+/// Append the pane's own hook config to its launch command, for a CLI whose
+/// manifest names a flag that takes one.
+///
+/// This is the whole of hook wiring for claude, and it is why nothing under
+/// ~/.claude is read or written: claude reads hooks only from the settings
+/// file it was launched with, so handing the pane a generated file at start
+/// is both necessary and sufficient. A CLI that instead discovers hooks from
+/// a fixed path of its own (codex, agy) declares no flag and passes through
+/// here unchanged.
+///
+/// Failure returns the bare command rather than an error. A pane that starts
+/// unwired is exactly what every pane did before this existed, and it stays
+/// visible: the agent runs, its deliveries fall to the screen-verified tier,
+/// and `cyclops hooks selftest <label>` says so. Refusing to open the
+/// workspace over an unwritable hook file would trade a working fleet for a
+/// missing one.
+fn wire_hooks(
+    home: &Path,
+    known: &BTreeMap<String, crate::manifests::Known>,
+    id: &str,
+    cmd: String,
+    label: &str,
+) -> String {
+    let Some(flag) = known.get(id).and_then(|m| m.settings_flag.as_deref()) else {
+        return cmd;
+    };
+    let Some(kind) = crate::hookset::CliKind::from_name(id) else {
+        return cmd;
+    };
+    match crate::hookset::prepare(home, kind, label) {
+        Ok(path) => format!("{cmd} {flag} {}", sh_quote(&path.display().to_string())),
+        Err(_) => cmd,
+    }
+}
+
+/// Single-quote a path for the shell tmux runs the pane command with.
+///
+/// The command is a string tmux hands to a shell, and CYCLOPS_HOME is the
+/// operator's to place: a home under "My Documents" would otherwise split
+/// the argument and start claude with a settings path it cannot read. Single
+/// quotes take everything literally, so only an embedded quote needs the
+/// close-escape-reopen dance.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// Put one launch command on each pane the workspace names, in layout
@@ -1836,24 +1889,61 @@ mod tests {
     /// The ids `--agents` accepts are manifest ids, and each one becomes
     /// the command its manifest names. Two panes may run the same CLI:
     /// that is a fleet of two claudes, not a mistake.
+    ///
+    /// claude also leaves here already wired. Its manifest names a
+    /// settings flag, so each pane gets its OWN hook config, keyed by the
+    /// label that pane answers to: the hook command embeds `--agent
+    /// <label>`, so two claudes sharing one file would report each other's
+    /// turns. codex names no flag and passes through untouched.
     #[test]
     fn agent_ids_become_the_launch_commands_their_manifests_name() {
         let home = cyclops_proto::scratch::scratch_dir("cyc-agents-ok");
         let _ = std::fs::remove_dir_all(&home);
         let duo = preset("duo").unwrap().unwrap();
+        let labels: Vec<String> = duo.panes().filter_map(|p| p.label.clone()).collect();
+
         let ids = ["claude".to_string(), "claude".to_string()];
-        assert_eq!(
-            resolve_agents(&home, &ids, &duo, "preset duo").unwrap(),
-            vec!["claude", "claude"]
-        );
+        let got = resolve_agents(&home, &ids, &duo, "preset duo").unwrap();
+        for (cmd, label) in got.iter().zip(&labels) {
+            let want = crate::hookset::hooks_root_in(&home)
+                .join("claude")
+                .join(label)
+                .join("settings.json");
+            assert_eq!(cmd, &format!("claude --settings '{}'", want.display()));
+            // Wiring is a file that exists, not a path that reads well.
+            assert!(want.is_file(), "{} was not written", want.display());
+        }
+
         // A shell that kept the spaces after the commas passed the same
-        // list, and cyclops reads it as one.
+        // list, and cyclops reads it as one. codex discovers its hooks from
+        // $CODEX_HOME instead of a flag, so its command is the bare CLI.
         let spaced = ["claude".to_string(), " codex".to_string()];
-        assert_eq!(
-            resolve_agents(&home, &spaced, &duo, "preset duo").unwrap(),
-            vec!["claude", "codex"]
-        );
+        let got = resolve_agents(&home, &spaced, &duo, "preset duo").unwrap();
+        assert!(got[0].starts_with("claude --settings '"));
+        assert_eq!(got[1], "codex");
+
+        // Nothing was written outside the home it was handed.
+        assert!(crate::hookset::hooks_root_in(&home).starts_with(&home));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A home under a path with a space still starts a wired claude. The
+    /// command is a string a shell splits, so an unquoted settings path
+    /// would hand claude a truncated argument and it would start with no
+    /// hooks and no complaint.
+    #[test]
+    fn a_home_with_a_space_still_quotes_into_one_argument() {
+        let base = cyclops_proto::scratch::scratch_dir("cyc agents space");
+        let _ = std::fs::remove_dir_all(&base);
+        let duo = preset("duo").unwrap().unwrap();
+        let ids = ["claude".to_string(), "claude".to_string()];
+        let got = resolve_agents(&base, &ids, &duo, "preset duo").unwrap();
+        for cmd in &got {
+            let path = cmd.strip_prefix("claude --settings ").expect("wired");
+            assert!(path.starts_with('\'') && path.ends_with('\''));
+            assert!(Path::new(path.trim_matches('\'')).is_file());
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Every way `--agents` is refused, and the sentence each one owes the
