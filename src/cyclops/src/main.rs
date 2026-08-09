@@ -251,6 +251,20 @@ struct StartArgs {
     /// opening anything. What `scripts/install.sh` runs last.
     #[arg(long)]
     setup_only: bool,
+    /// Also put cyclops' hook entries in the config each installed agent
+    /// CLI reads on its own, so a fresh install reports turn edges and
+    /// earns verified receipts instead of detecting agents it never hears
+    /// from. Merges around whatever is already there and copies the
+    /// original aside first.
+    ///
+    /// Opt-in, and only the installer opts in. Writing into another tool's
+    /// configuration is not something a bare `--setup-only` should do to
+    /// someone who only asked for a usable home, and a default-on version
+    /// of this edits the real ~/.codex from inside a test run.
+    /// CYCLOPS_NO_VENDOR_HOOKS=1 declines it for an install that wants
+    /// nothing of the sort.
+    #[arg(long, requires = "setup_only")]
+    wire_hooks: bool,
     /// Do not start cyclopsd. For running the daemon under your own
     /// supervisor, and for a workspace you want open with nothing
     /// watching it. Without this, `start` starts one when none answers.
@@ -610,7 +624,9 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
         // The workspace verbs talk to tmux, and reach the daemon only for
         // the labels. A down daemon costs them the names, not the verb, so
         // they must not go through connect().
-        Cmd::Start(args) if args.setup_only => workspace::run_setup(cli.json, &style_for(cli)),
+        Cmd::Start(args) if args.setup_only => {
+            workspace::run_setup(cli.json, &style_for(cli), args.wire_hooks)
+        }
         Cmd::Start(args) => workspace::run_start(
             cli.json,
             &style_for(cli),

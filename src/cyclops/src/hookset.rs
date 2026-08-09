@@ -125,6 +125,167 @@ pub fn render(kind: CliKind, label: &str, cyclops_bin: &str) -> String {
     out
 }
 
+/// The name a shared config registers itself under.
+const SHARED_NAME: &str = "cyclops";
+
+/// [`render`] for a file that EVERY pane of one vendor reads.
+///
+/// The same template with the per-pane identity taken back out. codex reads
+/// a single `$CODEX_HOME/hooks.json` and agy a single `~/.agents/hooks.json`,
+/// so a label baked into either would make every pane report as one agent.
+/// With no `--agent`, each pane's CYCLOPS_AGENT names the reporter instead
+/// (hook.rs), and `cyclops start` puts it there.
+///
+/// Rendering then stripping, rather than a second set of templates, so the
+/// events and payload shapes cannot drift between the two forms. agy's
+/// named-hooks key keeps SHARED_NAME, which is a registration name and not
+/// an agent label.
+pub fn render_shared(kind: CliKind, cyclops_bin: &str) -> String {
+    render(kind, SHARED_NAME, cyclops_bin).replace(&format!(" --agent {SHARED_NAME}"), "")
+}
+
+/// The file this vendor reads hooks from without being told to, if it has
+/// one. None means the CLI takes its config as a launch argument instead,
+/// which is claude, and is why nothing under ~/.claude is ever written.
+fn vendor_hook_file(kind: CliKind) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    match kind {
+        CliKind::Claude => None,
+        // User level, and not the project-local alternative. MEASURED
+        // (finding F1): project-local .codex/hooks.json does not load until
+        // the directory is trusted, and in a non-interactive run that
+        // dialog can never be answered, so the hooks silently never fire.
+        CliKind::Codex => Some(
+            std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".codex"))
+                .join("hooks.json"),
+        ),
+        CliKind::Agy => Some(home.join(".agents").join("hooks.json")),
+        CliKind::Cursor => Some(home.join(".cursor").join("hooks.json")),
+    }
+}
+
+/// True for a hook entry this project wrote.
+///
+/// Identified by what the command runs rather than by a marker key: a
+/// marker would have to survive the vendor rewriting its own config, and
+/// some do. Any command that invokes a cyclops binary's `hook` receiver is
+/// ours to replace; everything else in the file is the operator's and is
+/// carried through untouched.
+fn is_cyclops_entry(v: &serde_json::Value) -> bool {
+    let text = v.to_string();
+    text.contains(" hook ") && text.contains("cyclops")
+}
+
+/// Merge `src` into `dst`, replacing only this project's own entries.
+///
+/// Objects recurse so an unrelated sibling key is never visited. Arrays are
+/// the case that matters: a vendor's event list holds the operator's
+/// handlers next to ours, so ours are filtered out and re-appended while
+/// theirs keep their order. That is what makes a second run a no-op instead
+/// of a file that grows a duplicate handler every update.
+fn merge_into(dst: &mut serde_json::Value, src: &serde_json::Value) {
+    use serde_json::Value;
+    match (dst, src) {
+        (Value::Object(d), Value::Object(s)) => {
+            for (k, sv) in s {
+                merge_into(d.entry(k.clone()).or_insert(Value::Null), sv);
+            }
+        }
+        (d @ Value::Array(_), Value::Array(s)) => {
+            let kept: Vec<Value> = d
+                .as_array()
+                .map(|a| a.iter().filter(|e| !is_cyclops_entry(e)).cloned().collect())
+                .unwrap_or_default();
+            *d = Value::Array(kept.into_iter().chain(s.iter().cloned()).collect());
+        }
+        (d, s) => *d = s.clone(),
+    }
+}
+
+/// What one vendor's wiring did, for the line `cyclops start` prints.
+pub struct WiredVendor {
+    pub vendor: &'static str,
+    pub path: PathBuf,
+    /// The file already said what this run would have written.
+    pub unchanged: bool,
+    /// Where the pre-existing file was copied before the first edit.
+    pub backup: Option<PathBuf>,
+}
+
+/// Put this project's hook entries in the file `kind` reads on its own.
+///
+/// Only for vendors that discover hooks from a fixed path. It writes into
+/// configuration this project does not own, so three rules hold and none is
+/// optional: the operator's entries are merged around rather than replaced
+/// ([`merge_into`]), the original is copied aside before the first edit, and
+/// a run that would change nothing writes nothing at all.
+///
+/// Ok(None) means the vendor takes its config at launch instead, or is not
+/// installed on this machine. Neither is a failure: writing a hooks.json for
+/// a CLI that is not here would leave a file nobody reads.
+pub fn wire_vendor(kind: CliKind) -> Result<Option<WiredVendor>, String> {
+    let Some(path) = vendor_hook_file(kind) else {
+        return Ok(None);
+    };
+    // The vendor's own directory existing is the test for "installed".
+    // Creating it would be this project deciding another tool is present.
+    let dir = path.parent().ok_or("hook path has no parent")?;
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc: serde_json::Value = if existing.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(&existing)
+            .map_err(|e| format!("{} is not valid JSON ({e}); left alone", path.display()))?
+    };
+    let ours: serde_json::Value = serde_json::from_str(&render_shared(kind, &cyclops_bin()))
+        .map_err(|e| {
+            format!(
+                "rendered {} hook config is not valid JSON: {e}",
+                kind.name()
+            )
+        })?;
+
+    let before = doc.clone();
+    merge_into(&mut doc, &ours);
+    if doc == before {
+        return Ok(Some(WiredVendor {
+            vendor: kind.name(),
+            path,
+            unchanged: true,
+            backup: None,
+        }));
+    }
+
+    // Copy aside before the first edit, and only then. A backup rewritten
+    // on every run would eventually hold this project's own output and
+    // stop being the thing the operator wanted back.
+    let mut backup = None;
+    if !existing.is_empty() {
+        let bak = path.with_extension("json.before-cyclops");
+        if !bak.exists() {
+            std::fs::copy(&path, &bak).map_err(|e| {
+                format!("can't back up {} to {}: {e}", path.display(), bak.display())
+            })?;
+        }
+        backup = Some(bak);
+    }
+    let mut text = serde_json::to_string_pretty(&doc)
+        .map_err(|e| format!("can't serialize {}: {e}", path.display()))?;
+    text.push('\n');
+    write_atomic(&path, &text).map_err(|e| format!("can't write {}: {e}", path.display()))?;
+    Ok(Some(WiredVendor {
+        vendor: kind.name(),
+        path,
+        unchanged: false,
+        backup,
+    }))
+}
+
 /// Copy-pasteable wiring instructions. The admin runs these once,
 /// deliberately; cyclops never touches vendor config itself.
 fn instructions(kind: CliKind, rendered: &Path, label: &str) -> String {
@@ -928,6 +1089,119 @@ mod tests {
             .join("tests/golden")
             .join(name);
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    /// A shared config is read by every pane of one vendor, so a label
+    /// inside it would make all of them report as the same agent. It must
+    /// carry no --agent at all, and must still be the same events as the
+    /// per-pane form: only the identity differs between the two.
+    #[test]
+    fn a_shared_config_names_no_agent_and_keeps_every_event() {
+        for kind in [CliKind::Codex, CliKind::Agy, CliKind::Cursor] {
+            let shared = render_shared(kind, GOLDEN_BIN);
+            assert!(
+                !shared.contains("--agent"),
+                "{} shared config still names an agent:\n{shared}",
+                kind.name()
+            );
+            let shared_v: serde_json::Value = serde_json::from_str(&shared)
+                .unwrap_or_else(|e| panic!("{} shared config is not JSON: {e}", kind.name()));
+            let pane_v: serde_json::Value =
+                serde_json::from_str(&render(kind, GOLDEN_LABEL, GOLDEN_BIN)).unwrap();
+            // Same event names on both sides, whatever the vendor's shape.
+            fn keys(v: &serde_json::Value, into: &mut Vec<String>) {
+                if let Some(o) = v.as_object() {
+                    for (k, sv) in o {
+                        into.push(k.clone());
+                        keys(sv, into);
+                    }
+                }
+            }
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            keys(&shared_v, &mut a);
+            keys(&pane_v, &mut b);
+            // agy keys its set by name, which is the one key that differs.
+            a.retain(|k| k != SHARED_NAME);
+            b.retain(|k| k != GOLDEN_LABEL);
+            assert_eq!(a, b, "{} lost an event in the shared form", kind.name());
+        }
+    }
+
+    /// The merge writes into a file this project does not own, so the two
+    /// properties that matter are that the operator keeps everything they
+    /// put there, and that running it twice is the same as running it once.
+    #[test]
+    fn the_merge_keeps_their_entries_and_is_idempotent() {
+        let theirs = serde_json::json!({
+            "hooks": {
+                "Stop": [ { "hooks": [ { "type": "command", "command": "/bin/their-notifier" } ] } ],
+                "SessionStart": [ { "hooks": [ { "type": "command", "command": "echo mine" } ] } ]
+            },
+            "unrelated": { "deeply": ["nested", "value"] }
+        });
+        let ours: serde_json::Value =
+            serde_json::from_str(&render_shared(CliKind::Codex, GOLDEN_BIN)).unwrap();
+
+        let mut doc = theirs.clone();
+        merge_into(&mut doc, &ours);
+
+        // Nothing of theirs was dropped or reordered ahead of itself.
+        assert_eq!(doc["unrelated"], theirs["unrelated"]);
+        assert_eq!(
+            doc["hooks"]["SessionStart"],
+            theirs["hooks"]["SessionStart"]
+        );
+        let stop = doc["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop[0], theirs["hooks"]["Stop"][0], "their handler moved");
+        assert_eq!(stop.len(), 2, "ours should be appended, not replace theirs");
+
+        // Twice is once. This is what keeps every update from growing a
+        // duplicate handler in the operator's file.
+        let once = doc.clone();
+        merge_into(&mut doc, &ours);
+        assert_eq!(doc, once, "a second merge changed the file");
+
+        // And a stale entry from an older cyclops path is replaced rather
+        // than accumulated beside the current one.
+        let mut stale = theirs.clone();
+        stale["hooks"]["Stop"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "hooks": [ { "type": "command", "command": "/old/path/cyclops hook Stop" } ]
+            }));
+        merge_into(&mut stale, &ours);
+        let stop = stale["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 2, "the stale cyclops entry should be gone");
+        assert!(!stale.to_string().contains("/old/path/cyclops"));
+    }
+
+    /// claude takes its hook config as a launch argument, so it has no file
+    /// here. Getting this wrong would mean writing into ~/.claude, which is
+    /// the one thing the wiring promises not to do.
+    #[test]
+    fn claude_has_no_vendor_file_to_write() {
+        assert!(vendor_hook_file(CliKind::Claude).is_none());
+        // Every other vendor resolves under the operator's home, never into
+        // a system directory, and always to the file that vendor reads.
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+        for (kind, file) in [
+            (CliKind::Codex, "hooks.json"),
+            (CliKind::Agy, "hooks.json"),
+            (CliKind::Cursor, "hooks.json"),
+        ] {
+            let p = vendor_hook_file(kind).expect("has a discovered path");
+            assert_eq!(p.file_name().unwrap(), file);
+            // CODEX_HOME can point codex's outside HOME, so it is exempt.
+            if kind != CliKind::Codex || std::env::var_os("CODEX_HOME").is_none() {
+                assert!(
+                    p.starts_with(&home),
+                    "{} escaped HOME: {}",
+                    kind.name(),
+                    p.display()
+                );
+            }
+        }
     }
 
     #[test]
