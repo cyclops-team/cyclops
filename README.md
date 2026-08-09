@@ -15,7 +15,7 @@ If it runs in your terminal, it can run in Cyclops.
 [usecyclops.dev](https://www.usecyclops.dev) · [quickstart](docs/guides/QUICKSTART.md) · [the docs, one page per question](#docs)
 
 Pre-release, and honest about it: [STATUS.md](STATUS.md) says what is built.
-Everything below is built and tested.
+Everything below is built and tested by the Cyclops team. 
 
 ## Install
 
