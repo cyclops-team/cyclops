@@ -98,6 +98,15 @@ fn dialog_parts(dialog: &Dialog) -> (&str, Option<&str>, Option<&str>, &'static 
             None,
             copy::BUTTON_CONFIRM,
         ),
+        Dialog::Compose { buffer, status, .. } => (
+            copy::COMPOSE_TITLE,
+            Some(buffer),
+            // The receipt takes the hint's place once there is one. By then
+            // the reader has evidently worked out the grammar, and what
+            // happened to their message is the more useful line to hold.
+            status.as_deref().or(Some(copy::COMPOSE_HINT)),
+            copy::BUTTON_SEND,
+        ),
         Dialog::Keybinds { .. } => unreachable!("keybinds uses its own dialog renderer"),
         Dialog::Themes { .. } => unreachable!("themes uses its own dialog renderer"),
     }

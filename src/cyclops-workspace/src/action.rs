@@ -175,6 +175,22 @@ pub enum Action {
         label: String,
     },
 
+    // -- Messaging --
+    /// Open the composer. Carries no target: the recipient is typed as
+    /// part of the message, so nothing has to be resolved to open it.
+    RequestCompose,
+    /// Send one addressed message, exactly as `cyclops send` would.
+    ///
+    /// The send is slow by design (the daemon holds the answer for the
+    /// acknowledgement window), so whoever performs this must do it off
+    /// the draw loop and report back. The composer stays open until it
+    /// does.
+    SendMessage {
+        to: String,
+        subject: String,
+        body: String,
+    },
+
     // -- Tab --
     /// Open the new-tab naming dialog. Carries no target: a new tab is not
     /// scoped to any existing window.
@@ -356,6 +372,9 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
         BindingAction::FocusDown => Some(Action::FocusDirection(PaneDirection::Down)),
         // A keyboard swap acts on the focused pane, so it carries no
         // target, exactly like the Shift upgrade of the focus chords.
+        // No target to resolve: the recipient is typed into the composer,
+        // not taken from whatever pane happens to be focused.
+        BindingAction::Compose => Some(Action::RequestCompose),
         BindingAction::SwapPaneLeft => Some(Action::SwapPaneDirection(PaneDirection::Left)),
         BindingAction::SwapPaneRight => Some(Action::SwapPaneDirection(PaneDirection::Right)),
         BindingAction::SwapPaneUp => Some(Action::SwapPaneDirection(PaneDirection::Up)),
@@ -556,6 +575,22 @@ pub fn route_dialog_confirm(dialog: &Dialog) -> Option<Action> {
         Dialog::ConfirmCloseTab { window_id } => Some(Action::CloseTab {
             window_id: window_id.clone(),
         }),
+        // A send already in flight has nothing to confirm: Enter twice must
+        // not put the same message on the record twice.
+        Dialog::Compose { sending: true, .. } => None,
+        // None here is a line that is not addressed yet, not a refusal to
+        // act. The caller re-reads the same buffer with `parse_compose` to
+        // get the sentence saying what is missing; keeping the reason out
+        // of the return type is what lets this stay a pure route.
+        Dialog::Compose { buffer, .. } => {
+            crate::dialog::parse_compose(buffer)
+                .ok()
+                .map(|c| Action::SendMessage {
+                    to: c.to,
+                    subject: c.subject,
+                    body: c.body,
+                })
+        }
         Dialog::RenameWorkspace { session, buffer } => {
             non_empty(buffer).map(|name| Action::RenameWorkspace {
                 session: session.clone(),
@@ -834,7 +869,66 @@ fn resolve_close_tab(window_id: &str, tabs: &[TabModel], session: &str) -> Actio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dialog::Dialog;
     use crate::layout::ResolvedLayout;
+
+    /// The composer's Enter carries the recipient the operator typed, not
+    /// one resolved from focus, and its body is the text as typed.
+    #[test]
+    fn a_composed_line_confirms_into_the_send_it_says() {
+        let dialog = Dialog::Compose {
+            buffer: "@reviewer gateway.rs:120 drops the burst path".into(),
+            status: None,
+            sending: false,
+        };
+        assert_eq!(
+            route_dialog_confirm(&dialog),
+            Some(Action::SendMessage {
+                to: "reviewer".into(),
+                subject: "gateway.rs:120 drops the burst path".into(),
+                body: "gateway.rs:120 drops the burst path".into(),
+            })
+        );
+    }
+
+    /// Two guards, and each is a different mistake.
+    ///
+    /// A line with no recipient is unfinished, not a command to run; Enter
+    /// has to leave the dialog open so the composer can say what is
+    /// missing. A send already in flight has nothing to confirm, and a
+    /// second Enter must not put the same message on the record twice.
+    #[test]
+    fn an_unaddressed_or_in_flight_composer_sends_nothing() {
+        for buffer in ["", "@", "@reviewer", "no recipient here"] {
+            let dialog = Dialog::Compose {
+                buffer: buffer.into(),
+                status: None,
+                sending: false,
+            };
+            assert_eq!(route_dialog_confirm(&dialog), None, "{buffer:?} sent");
+        }
+        let in_flight = Dialog::Compose {
+            buffer: "@reviewer ship it".into(),
+            status: Some("sending to reviewer…".into()),
+            sending: true,
+        };
+        assert_eq!(route_dialog_confirm(&in_flight), None);
+    }
+
+    /// Opening the composer resolves no target: the recipient is typed, so
+    /// the chord works from any pane including one nothing is named in.
+    #[test]
+    fn the_compose_chord_needs_no_target() {
+        let tabs = [tab("@0")];
+        let spaces = [workspace("$0", "main")];
+        assert_eq!(
+            route_binding(
+                BindingAction::Compose,
+                &ctx(&tabs, 0, "%0", "$0", &spaces, 0)
+            ),
+            Some(Action::RequestCompose)
+        );
+    }
 
     fn tab(window_id: &str) -> TabModel {
         TabModel {
