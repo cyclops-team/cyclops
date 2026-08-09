@@ -186,6 +186,12 @@ daemon_attached() { "$CYC" --json status | jq -e '.sessions[0].attached == true'
 # only unambiguous signal, and unlike a sleep it is not a guess about how
 # slow the machine is.
 standin_reading() { [ -f "$ROOT/ready.$1" ]; }
+# The stand-in is back at its read rather than part-way through handling a
+# line. Deliver to a busy one and the confirmation window expires against a
+# pane that was never going to answer inside it, which marks the delivery
+# needs-attention permanently and shows up two rungs later as an eye count
+# that is one too high.
+standin_free() { [ ! -f "$ROOT/busy.$1" ]; }
 pane_bound_to() {
   "$CYC" --json status | jq -e --arg p "$1" --arg m "$2" \
     '[.sessions[].panes[] | select(.pane_id == $p and .manifest == $m)] | length > 0' >/dev/null
@@ -362,7 +368,15 @@ cyc="$2"
 # when it has forked, not when the new process is reading, and the rig has
 # no other way to tell those apart: demo.toml binds the login shell too.
 : > "$3/ready.$label"
+# And announce every stretch spent NOT reading. A shell loop handling a
+# line is not at its read, so a delivery arriving then is not seen and not
+# acked, and the daemon's confirmation window expires against a pane that
+# is simply busy. The @send arm is the one that matters: it runs a full
+# `cyclops send`, which itself blocks for the recipient's ack, so this
+# stand-in can be away from its read for seconds.
+busy="$3/busy.$label"
 while IFS= read -r line; do
+  : > "$busy"
   case "$line" in
     "[cyclops m-"*)
       printf '%s' "$line" | jq -Rs '{prompt: .}' \
@@ -374,6 +388,7 @@ while IFS= read -r line; do
       eval "\"$cyc\" send $rest"
       ;;
   esac
+  rm -f "$busy"
 done
 EOF
 
@@ -783,6 +798,7 @@ echo "#### The handoff (docs/guides/QUICKSTART.md walks this)"
 # who the daemon says sent it. Identity is resolved by walking the caller's
 # process up to a watched pane; nothing in the request can claim a sender.
 printf '\n$ (typed in the implementer pane) cyclops send reviewer --subject "Burst path fix, ready for review" --body "gateway.rs:120. Tests pass."\n'
+wait_for "reviewer to be back at its read" 100 standin_free reviewer
 tmx send-keys -t "$N1" -l '@send reviewer --subject "Burst path fix, ready for review" --body "gateway.rs:120. Tests pass."'
 tmx send-keys -t "$N1" Enter
 # `delivery_verified`, not `settled`: the check below asserts the heavy
@@ -800,6 +816,11 @@ check "the sender is the pane, not the caller" '^ +[0-9]+s +implementer → revi
 
 HANDOFF="$("$CYC" --json history --with reviewer | jq -r '.lines[-1].id')"
 printf '\n$ (typed in the reviewer pane) cyclops send implementer --reply-to %s --subject "Re: Burst path fix" --body "Approved. One nit in the retry path."\n' "$HANDOFF"
+# The handoff wait above proves REVIEWER acked, which says nothing about
+# whether implementer's own `cyclops send` has exited and gone back to
+# reading. Replying into a still-busy implementer is the race that put a
+# second item in the eye and failed this rung on a loaded runner.
+wait_for "implementer to be back at its read" 100 standin_free implementer
 tmx send-keys -t "$N2" -l "@send implementer --reply-to $HANDOFF --subject \"Re: Burst path fix\" --body \"Approved. One nit in the retry path.\""
 tmx send-keys -t "$N2" Enter
 wait_for "the reply to settle" 50 settled "Re: Burst path fix"
@@ -840,6 +861,7 @@ echo "#### The blocking gate docs/guides/QUICKSTART.md section 6 hands to script
 EDGE_DRIVER=$!
 
 printf '\n$ cyclops send reviewer --subject "Review the burst path fix" --wait done --timeout 30s --json\n'
+wait_for "reviewer to be back at its read" 100 standin_free reviewer
 "$CYC" send reviewer --subject "Review the burst path fix" \
   --wait done --timeout 30s --json > "$ROOT/receipt.json" 2>&1
 GATE_EXIT=$?
