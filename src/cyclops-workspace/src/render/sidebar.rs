@@ -521,13 +521,50 @@ fn paint_footer(
     let plus_x = content
         .x
         .saturating_add(content.width.saturating_sub(plus_width));
-    // The button keeps one width whether or not it is pointed at, so
+    // The composer's button, immediately left of the create button.
+    //
+    // It lives here rather than only on the tab strip because the strip is
+    // a preference an operator can turn off, and writing to an agent has
+    // nothing to do with whether they want tabs. The sidebar is also where
+    // the agents already are: the roster is above this row.
+    let chat = " @ ";
+    let chat_width = u16::try_from(Span::raw(chat).width())
+        .unwrap_or(u16::MAX)
+        .min(content.width);
+    // The footer drops this button before it drops the note beside it.
+    //
+    // Three things compete for one row and the narrow sidebar cannot hold
+    // all of them. The note loses the least by staying: it is the only
+    // thing that says what the create button makes, while this button has
+    // two other doors, the Ctrl+B s chord and the tab strip's copy. So it
+    // is painted only when the row can still hold the longest note it
+    // might have to show afterwards.
+    let widest_note = u16::try_from(
+        Span::raw(copy::NEW_WORKSPACE_HINT)
+            .width()
+            .max(Span::raw(copy::SIDEBAR_COMPOSE_HINT).width()),
+    )
+    .unwrap_or(u16::MAX);
+    let show_chat = plus_x.saturating_sub(content.x.saturating_add(menu_width))
+        >= chat_width.saturating_add(widest_note);
+    let chat_x = if show_chat {
+        plus_x.saturating_sub(chat_width)
+    } else {
+        plus_x
+    };
+    // Both buttons keep one width whether or not they are pointed at, so
     // the target never moves out from under the mouse that found it.
-    let hovered = hover.is_some_and(|(hover_col, hover_row)| {
-        hover_row == footer_y
-            && hover_col >= plus_x
-            && hover_col < plus_x.saturating_add(plus_width)
-    });
+    let on_row = |col: u16, row: u16, x: u16, w: u16| {
+        row == footer_y && col >= x && col < x.saturating_add(w)
+    };
+    let hovered = hover
+        .is_some_and(|(hover_col, hover_row)| on_row(hover_col, hover_row, plus_x, plus_width));
+    // The create button wins a tie. They cannot overlap, but reading the
+    // precedence off the code beats inferring it from arithmetic.
+    let chat_hovered = show_chat
+        && !hovered
+        && hover
+            .is_some_and(|(hover_col, hover_row)| on_row(hover_col, hover_row, chat_x, chat_width));
     // One slot, right-aligned against the create button, in the gutter the
     // footer already leaves between the menu label and that button. Two
     // things want it, so the precedence is fixed here: hover wins, because
@@ -538,6 +575,8 @@ fn paint_footer(
     let note = if hovered {
         // Say what the button makes. A bare glyph does not.
         Some(copy::NEW_WORKSPACE_HINT.to_string())
+    } else if chat_hovered {
+        Some(copy::SIDEBAR_COMPOSE_HINT.to_string())
     } else if clipped > 0 {
         // The body stops at the footer and does not scroll, so without
         // this a workspace below the fold looks like one that does not
@@ -548,12 +587,12 @@ fn paint_footer(
     };
     if let Some(note) = note {
         let note_width = u16::try_from(Span::raw(note.as_str()).width()).unwrap_or(u16::MAX);
-        let gutter = plus_x.saturating_sub(content.x.saturating_add(menu_width));
+        let gutter = chat_x.saturating_sub(content.x.saturating_add(menu_width));
         if note_width < gutter {
             super::overlay_text(
                 buf,
                 content,
-                plus_x.saturating_sub(note_width),
+                chat_x.saturating_sub(note_width),
                 footer_y,
                 &note,
                 theme::sidebar_label(paint),
@@ -576,6 +615,24 @@ fn paint_footer(
         Rect::new(plus_x, footer_y, plus_width, 1),
         HitTarget::NewWorkspaceButton,
     );
+    if show_chat {
+        super::overlay_text(
+            buf,
+            content,
+            chat_x,
+            footer_y,
+            chat,
+            if chat_hovered {
+                theme::add_button_hover(paint)
+            } else {
+                theme::add_button(paint)
+            },
+        );
+        hits.push(
+            Rect::new(chat_x, footer_y, chat_width, 1),
+            HitTarget::ComposeButton,
+        );
+    }
 }
 
 /// The workspace-reorder drop indicator: a full-width accent rule at row
@@ -599,6 +656,88 @@ mod tests {
 
     use super::*;
     use crate::render::test_support::{alt_test_theme_paint, flatten};
+
+    /// The composer's button lives in the footer because the tab strip is
+    /// a preference that can be off, and writing to an agent has nothing to
+    /// do with wanting tabs. A wide sidebar shows it, answers the pointer,
+    /// and says what it does.
+    ///
+    /// A narrow one drops it instead of the note. Three controls do not fit
+    /// one short row, and the note is the only thing that explains the
+    /// create button, while this one also has a chord and a strip copy.
+    #[test]
+    fn the_footer_chat_button_yields_to_the_note_before_it_yields_itself() {
+        let workspaces = vec![WorkspaceRow {
+            session_id: "$0".into(),
+            name: "cyclops".into(),
+            tab_count: 1,
+            window_ids: vec!["@0".into()],
+        }];
+        let theme = Paint::for_test();
+        let expanded = std::collections::HashSet::from(["$0".to_string()]);
+        let draw = |width: u16, hover: Option<(u16, u16)>| {
+            let mut term = Terminal::new(TestBackend::new(width, 8)).unwrap();
+            let mut hits = HitMap::default();
+            term.draw(|f| {
+                paint_sidebar(
+                    &workspaces,
+                    0,
+                    "%0",
+                    &expanded,
+                    &[],
+                    SidebarTab::Sessions,
+                    &Record::new(),
+                    f.area(),
+                    f.buffer_mut(),
+                    &theme,
+                    &mut hits,
+                    &DecorationSnapshot::default(),
+                    hover,
+                    None,
+                );
+            })
+            .unwrap();
+            (term.backend().buffer().clone(), hits)
+        };
+
+        let find = |hits: &HitMap, w: u16| {
+            (0..w)
+                .flat_map(|x| (0..8u16).map(move |y| (x, y)))
+                .find(|&(x, y)| matches!(hits.hit(x, y), Some(HitTarget::ComposeButton)))
+        };
+
+        // Wide enough for all of it: the button is there and takes clicks.
+        let (wide_rest, wide_hits) = draw(40, None);
+        let chat = find(&wide_hits, 40).expect("a wide sidebar paints the chat button");
+        let (wide_hot, _) = draw(40, Some(chat));
+        assert_ne!(
+            wide_hot[chat].style(),
+            wide_rest[chat].style(),
+            "pointing at the chat button must change how it paints"
+        );
+        assert!(
+            flatten(&wide_hot).contains(copy::SIDEBAR_COMPOSE_HINT),
+            "hovering should say what it does: {}",
+            flatten(&wide_hot)
+        );
+
+        // Too narrow for all three: the button goes, the note stays.
+        let (_, narrow_hits) = draw(20, None);
+        assert!(
+            find(&narrow_hits, 20).is_none(),
+            "a narrow footer should drop the chat button"
+        );
+        let narrow_plus = (0..20u16)
+            .flat_map(|x| (0..8u16).map(move |y| (x, y)))
+            .find(|&(x, y)| matches!(narrow_hits.hit(x, y), Some(HitTarget::NewWorkspaceButton)))
+            .expect("the create button survives");
+        let (narrow_hot, _) = draw(20, Some(narrow_plus));
+        assert!(
+            flatten(&narrow_hot).contains(copy::NEW_WORKSPACE_HINT),
+            "the note is what a narrow footer keeps: {}",
+            flatten(&narrow_hot)
+        );
+    }
 
     /// The create button is a bare glyph at rest, so the mouse has to be
     /// what explains it: pointing at it fills the button and names what it
