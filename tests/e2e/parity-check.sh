@@ -123,6 +123,13 @@ cleanup() {
       echo "== the last command's output, which set -e would otherwise discard:"
       sed 's/^/   /' "$OUT"
     fi
+    # The MAIN rig's daemon, which is the one nearly every rung runs in and
+    # the one whose log was missing when a delivery quietly failed to ack.
+    if [ -s "${CYCLOPS_HOME:-}/cyclopsd.log" ]; then
+        echo
+        echo "== main daemon.log (last 30):"
+        tail -30 "$CYCLOPS_HOME/cyclopsd.log" | sed 's/^/   /'
+    fi
     # The nested rigs log their daemon to a file nobody prints. When the
     # failure is "the daemon never came up", this is the only place that
     # says what it said on the way down.
@@ -454,9 +461,25 @@ check "setup installs the manifests"      '^  wrote 4 detection manifests to .*/
 # (src/cyclops/src/client.rs, READ_TIMEOUT). Past it the daemon is still
 # holding the receipt when the client gives up, and a delivery that is
 # going fine reports a lost connection.
+#
+# ack_timeout_ms is NOT bound by that, and is deliberately far past it.
+# The two budgets answer different questions: receipt_block_ms is how long
+# the CLI waits before printing, and running past it prints `● submitted`,
+# which every rung here tolerates. ack_timeout_ms is how long the DAEMON
+# waits for the hook, and running past it is terminal: the delivery is
+# marked and no later wait can turn it into the heavy check. That is the
+# asymmetry this rig kept losing to. A wait_for budget above the send
+# cannot rescue a delivery the daemon has already given up on, which is why
+# raising those budgets twice changed nothing and this is the knob that
+# does.
+#
+# Fifteen seconds for two process spawns is absurd on an idle machine and
+# is not meant for one: a GitHub runner under a parallel cargo build has
+# taken more than the old 4500. The cost of setting it high is nothing,
+# because a passing ack returns in milliseconds and never waits.
 cat >> "$CYCLOPS_HOME/config.toml" <<'EOF'
 receipt_block_ms = 4800
-ack_timeout_ms = 4500
+ack_timeout_ms = 15000
 EOF
 
 # The stand-in's own manifest, written the way docs/reference/MANIFESTS.md says to
