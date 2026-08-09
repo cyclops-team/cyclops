@@ -115,6 +115,15 @@ fn clone(repo: &str, reff: &str, dest: &Path) -> Result<(), String> {
     }
 }
 
+/// Where update keeps its build cache, so a rebuild is incremental.
+///
+/// Under the cyclops home rather than the system cache directory: it is
+/// this tool's own scratch, an operator looking for disk knows to look
+/// here, and it is removed with the home by the uninstaller.
+fn build_cache() -> PathBuf {
+    cyclops_proto::cyclops_home().join("build-cache")
+}
+
 /// The clone's throwaway directory, removed however `run` returns.
 struct Scratch(PathBuf);
 
@@ -242,9 +251,11 @@ fn restart_steps(style: &Style) -> String {
 ///    current says so and stops; a build that cannot be compared says why
 ///    and goes on.
 /// 3. Clone and run the clone's installer, streaming its output, at the
-///    prefix the current install already uses. Its last step is
-///    `cyclops start --setup-only`, which is what repoints the prepared
-///    hook artifacts at the new binary.
+///    prefix the current install already uses, and building into a cache
+///    that outlives the clone so the compile is incremental. Its last step
+///    is `cyclops start --setup-only --wire-hooks`, which writes the hook
+///    config each installed agent CLI reads and repoints the prepared
+///    artifacts at the new binary.
 /// 4. Report old to new, from the new binary's own `--version`, then the
 ///    restart steps.
 pub fn run(json: bool, style: &Style) -> i32 {
@@ -307,6 +318,29 @@ pub fn run(json: bool, style: &Style) -> i32 {
     // thing an operator only discovers is wrong much later.
     let mut installer = Command::new("sh");
     installer.arg(src.join("scripts").join("install.sh"));
+    // Build into a directory that outlives the clone.
+    //
+    // The clone is a fresh temp dir every run, so cargo's target/ starts
+    // empty and a one-commit change pays for the whole dependency tree,
+    // roughly 130 crates. Then `Scratch` deletes the clone on the way out,
+    // taking the build with it, so the next update starts cold as well.
+    // install.sh already reads CARGO_TARGET_DIR; nothing ever set it.
+    //
+    // Pointing it somewhere persistent makes cargo do what cargo does and
+    // recompile only what moved. An operator who set their own target dir
+    // keeps it: they have already decided where builds go.
+    let cache = build_cache();
+    if std::env::var_os("CARGO_TARGET_DIR").is_none() {
+        match std::fs::create_dir_all(&cache) {
+            Ok(()) => {
+                installer.env("CARGO_TARGET_DIR", &cache);
+                println!("  {}", style.dim(&copy::update_build_cache(&cache)));
+            }
+            // Not fatal. A cache that cannot be made costs a slow build,
+            // which is what every update did before this existed.
+            Err(e) => eprintln!("  {}", style.dim(&copy::update_cache_unusable(&cache, &e))),
+        }
+    }
     if let Some(prefix) = install_prefix() {
         println!(
             "  {}",

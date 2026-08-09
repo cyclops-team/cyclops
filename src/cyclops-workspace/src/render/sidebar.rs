@@ -539,14 +539,15 @@ fn paint_footer(
     // two other doors, the Ctrl+B s chord and the tab strip's copy. So it
     // is painted only when the row can still hold the longest note it
     // might have to show afterwards.
-    let widest_note = u16::try_from(
-        Span::raw(copy::NEW_WORKSPACE_HINT)
-            .width()
-            .max(Span::raw(copy::SIDEBAR_COMPOSE_HINT).width()),
-    )
-    .unwrap_or(u16::MAX);
+    // Reserve the create button's note, and only that one. It is the note
+    // that must survive: it is the sole explanation of a bare `+`, and a
+    // test pins it. This button's own note is best-effort and drops out on
+    // the narrowest sidebars that still show the button, which costs a
+    // hover hint rather than a control. Plus one column, because the note's
+    // own fit test below is a strict `<`.
+    let kept_note = u16::try_from(Span::raw(copy::NEW_WORKSPACE_HINT).width()).unwrap_or(u16::MAX);
     let show_chat = plus_x.saturating_sub(content.x.saturating_add(menu_width))
-        >= chat_width.saturating_add(widest_note);
+        >= chat_width.saturating_add(kept_note).saturating_add(1);
     let chat_x = if show_chat {
         plus_x.saturating_sub(chat_width)
     } else {
@@ -665,6 +666,7 @@ mod tests {
     /// A narrow one drops it instead of the note. Three controls do not fit
     /// one short row, and the note is the only thing that explains the
     /// create button, while this one also has a chord and a strip copy.
+
     #[test]
     fn the_footer_chat_button_yields_to_the_note_before_it_yields_itself() {
         let workspaces = vec![WorkspaceRow {
@@ -706,19 +708,30 @@ mod tests {
                 .find(|&(x, y)| matches!(hits.hit(x, y), Some(HitTarget::ComposeButton)))
         };
 
-        // Wide enough for all of it: the button is there and takes clicks.
-        let (wide_rest, wide_hits) = draw(40, None);
-        let chat = find(&wide_hits, 40).expect("a wide sidebar paints the chat button");
-        let (wide_hot, _) = draw(40, Some(chat));
+        // The DEFAULT sidebar width, not a width chosen because it passed.
+        // The first version of this gate reserved a 16-column hover hint and
+        // so hid the button on every real sidebar; a test at 40 columns said
+        // it worked.
+        let (wide_rest, wide_hits) = draw(crate::render::SIDEBAR_MIN_WIDTH, None);
+        let chat = find(&wide_hits, crate::render::SIDEBAR_MIN_WIDTH)
+            .expect("the default sidebar paints the chat button");
+        let (wide_hot, _) = draw(crate::render::SIDEBAR_MIN_WIDTH, Some(chat));
         assert_ne!(
             wide_hot[chat].style(),
             wide_rest[chat].style(),
             "pointing at the chat button must change how it paints"
         );
+        // Its own note is best-effort: at the default width the row has no
+        // room for it, and losing a hover hint beats losing the control.
+        // A roomier sidebar shows it.
+        let (roomy, roomy_hits) = draw(30, None);
+        let _ = roomy;
+        let roomy_chat = find(&roomy_hits, 30).expect("a roomy sidebar paints it too");
+        let (roomy_hot, _) = draw(30, Some(roomy_chat));
         assert!(
-            flatten(&wide_hot).contains(copy::SIDEBAR_COMPOSE_HINT),
-            "hovering should say what it does: {}",
-            flatten(&wide_hot)
+            flatten(&roomy_hot).contains(copy::SIDEBAR_COMPOSE_HINT),
+            "a sidebar with room should say what it does: {}",
+            flatten(&roomy_hot)
         );
 
         // Too narrow for all three: the button goes, the note stays.

@@ -183,7 +183,7 @@ pub const COMPOSE_TITLE: &str = "Send a message";
 /// The sidebar footer's hover note. Short because it shares one slot with
 /// the create button's hint and the "+N more" count, and a phrase that has
 /// to be truncated teaches nothing.
-pub const SIDEBAR_COMPOSE_HINT: &str = "message an agent";
+pub const SIDEBAR_COMPOSE_HINT: &str = "send";
 pub const COMPOSE_HINT: &str = "@name then your message · Enter sends · Esc closes";
 pub const BUTTON_SEND: &str = "Send";
 

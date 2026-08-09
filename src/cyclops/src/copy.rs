@@ -329,6 +329,27 @@ pub fn update_unreachable(repo: &str, reff: &str, cause: &str) -> String {
 
 /// The clone failed, so there is no source to build and nothing was
 /// changed. Same next step as the installer's own clone failure.
+/// Where the incremental build cache lives.
+///
+/// Printed because a directory this tool creates, that grows to gigabytes,
+/// and that the operator never asked for, is one they should hear about at
+/// the time rather than discover while hunting for disk.
+pub fn update_build_cache(dir: &std::path::Path) -> String {
+    format!(
+        "building in {} (delete it any time; it only costs a slow rebuild)",
+        dir.display()
+    )
+}
+
+/// The cache could not be made. Names the cost, which is time and nothing
+/// else: the update still runs, it just runs the way it used to.
+pub fn update_cache_unusable(dir: &std::path::Path, cause: &std::io::Error) -> String {
+    format!(
+        "no build cache at {} ({cause}); this update rebuilds from scratch",
+        dir.display()
+    )
+}
+
 pub fn update_clone_failed(repo: &str, reff: &str, cause: &str) -> String {
     format!(
         "could not clone {repo} at {reff}: {cause}. Check the network, or set CYCLOPS_REF to a branch that exists."

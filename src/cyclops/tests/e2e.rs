@@ -1758,3 +1758,90 @@ fn update_with_an_unreachable_source_names_it_and_exits_one() {
     assert!(err.contains("main"), "{err}");
     let _ = fs::remove_dir_all(&home);
 }
+
+/// `cyclops update` builds into a directory that outlives the clone.
+///
+/// Without this the clone is a fresh temp dir every run, so cargo starts
+/// with an empty target/, rebuilds the whole dependency tree for a one
+/// commit change, and then `Scratch` deletes the result on the way out. The
+/// next update starts cold again. install.sh has always read
+/// CARGO_TARGET_DIR; nothing set it.
+///
+/// Driven through a stub repo whose installer only reports its environment,
+/// because the real one is a release build of the world and this is a
+/// question about one variable.
+#[test]
+fn update_builds_into_a_cache_that_outlives_the_clone() {
+    let home = scratch_home("cyc-update-cache");
+    let repo = home.join("fake-repo");
+    std::fs::create_dir_all(repo.join("scripts")).expect("stub repo");
+    std::fs::write(
+        repo.join("scripts/install.sh"),
+        "echo \"SAW ${CARGO_TARGET_DIR:-<unset>}\"\n",
+    )
+    .expect("stub installer");
+    for args in [
+        &["init", "-q", "."][..],
+        &["add", "-A"][..],
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ][..],
+    ] {
+        let ok = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .expect("git")
+            .success();
+        assert!(ok, "stub repo setup failed at {args:?}");
+    }
+
+    let cache = home.join("build-cache");
+    let out = run_cyclops_io(
+        &home,
+        &[
+            ("CYCLOPS_REPO", repo.to_str().expect("utf8")),
+            ("CYCLOPS_REF", "HEAD"),
+        ],
+        &["update", "--plain"],
+        None,
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains(&format!("SAW {}", cache.display())),
+        "the installer should build into the cache:\n{text}"
+    );
+    // Named, because a gigabyte-scale directory the operator never asked
+    // for is one they should be told about rather than find.
+    assert!(text.contains("building in"), "{text}");
+    // And it is still there once the clone is gone, which is the point.
+    assert!(cache.is_dir(), "the cache must outlive the clone");
+
+    // An operator who already chose a target dir keeps it.
+    let mine = home.join("mine");
+    let out = run_cyclops_io(
+        &home,
+        &[
+            ("CYCLOPS_REPO", repo.to_str().expect("utf8")),
+            ("CYCLOPS_REF", "HEAD"),
+            ("CARGO_TARGET_DIR", mine.to_str().expect("utf8")),
+        ],
+        &["update", "--plain"],
+        None,
+    );
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        text.contains(&format!("SAW {}", mine.display())),
+        "an explicit CARGO_TARGET_DIR must win:\n{text}"
+    );
+}
