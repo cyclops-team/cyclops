@@ -77,13 +77,16 @@ const EVER_SHIPPED_FNV64: &[&str] = &[
     "3ec9936975418c27",
     "3ee05959c01113a7",
     "3f2860fa1275d798",
+    "44c3c94fe03c18c9",
     "4af4029b9d2910e3",
     "5fb9fab4521686ad",
     "6a4f11941f4c78be",
     "7a9754b750109c5e",
     "85f276e9afffc42d",
+    "98ae3fa4eca78cf3",
     "9a67be48357ff9e0",
     "bc4bc371b40e71ca",
+    "c60d4aff7fe2a5d2",
     "f6c7c7aaa830babb",
 ];
 
@@ -180,6 +183,10 @@ pub struct Known {
     /// The file that said so, for a line telling the reader where to add
     /// the key.
     pub path: PathBuf,
+    /// `[hooks].settings_flag`, when the CLI takes its hook config as a
+    /// launch argument. Carried here so `--agents` can append one without
+    /// reparsing the manifest it already read.
+    pub settings_flag: Option<String>,
 }
 
 /// Every agent CLI this home would use, by manifest id.
@@ -247,6 +254,7 @@ fn parsed(text: &str, path: PathBuf) -> Option<(String, Known)> {
         Known {
             launch: m.agent.launch,
             path,
+            settings_flag: m.hooks.settings_flag,
         },
     ))
 }

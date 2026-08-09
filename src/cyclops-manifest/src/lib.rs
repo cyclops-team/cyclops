@@ -120,6 +120,18 @@ pub struct Hooks {
     /// Payload field carrying the injected text when `ack` is set.
     #[serde(default)]
     pub ack_payload_field: Option<String>,
+    /// Flag that points this CLI at a hook config file at launch, when it
+    /// has one. Some means the pane can be started already wired, so
+    /// nothing has to be written into the vendor's own config tree:
+    /// claude reads hooks ONLY from the settings file it was launched
+    /// with, and `--settings <path>` is the whole wiring step.
+    ///
+    /// None is the common case and means the opposite: the CLI discovers
+    /// hooks from a fixed location it owns, so wiring it is a file
+    /// placement rather than a launch argument (codex reads
+    /// $CODEX_HOME/hooks.json, agy reads <workspace>/.agents/hooks.json).
+    #[serde(default)]
+    pub settings_flag: Option<String>,
 }
 
 /// Where a rule looks.

@@ -89,6 +89,13 @@ const FOLDER_PROBE_DELAY: Duration = Duration::from_millis(600);
 const DECORATION_DEBOUNCE: Duration = Duration::from_millis(30);
 
 enum AppMsg {
+    /// A send started from the composer has an answer. Carries the
+    /// recipient so a receipt cannot be shown against a composer that has
+    /// since been reopened for someone else.
+    SendFinished {
+        to: String,
+        outcome: Result<String, String>,
+    },
     Input(KeyEvent),
     Paste(String),
     Mouse(MouseEvent),
@@ -231,6 +238,14 @@ struct App {
     /// When the next folder probe is due. `None` means none is armed; see
     /// [`arm_folder_probe`].
     folder_probe_at: Option<Instant>,
+    /// The app's own channel, for work that cannot finish on this thread.
+    ///
+    /// Nearly every action is a tmux call that returns in microseconds and
+    /// needs nothing here. A send is the exception: the daemon holds its
+    /// answer for the acknowledgement window, so it runs on a thread of its
+    /// own and posts an [`AppMsg`] back when it knows. None in tests that
+    /// build an App with no loop around it.
+    tx: Option<mpsc::UnboundedSender<AppMsg>>,
 }
 
 fn toggle_workspace_expanded(expanded: &mut HashSet<String>, session_id: String) -> bool {
@@ -502,6 +517,7 @@ pub async fn run_async() -> i32 {
         paste_seq: 0,
         home,
         folder_probe_at: None,
+        tx: Some(tx.clone()),
     };
     // Bare `cyclops` can boot a session config.toml never mentions, so the
     // very first frame is already a frame the daemon may not be watching
@@ -1370,6 +1386,35 @@ async fn handle_app_msg(
         return false;
     };
     match msg {
+        // The composer's send came back. Show what happened and let the
+        // operator type another one; closing the dialog for them would
+        // take the receipt off the screen at the moment it arrived.
+        //
+        // The recipient is checked against the open composer because the
+        // dialog may have been closed and reopened while the send was in
+        // flight, and a receipt shown under the wrong name is worse than
+        // one that is simply missed.
+        AppMsg::SendFinished { to, outcome } => {
+            if let Some(Dialog::Compose {
+                buffer,
+                status,
+                sending,
+            }) = app.dialog.as_mut()
+            {
+                *sending = false;
+                match outcome {
+                    Ok(receipt) => {
+                        *status = Some(copy::compose_sent(&receipt));
+                        // Sent means the line is spent. Clearing it back to
+                        // the same recipient is what makes a second message
+                        // to the same agent one keystroke of setup.
+                        *buffer = format!("@{to} ");
+                    }
+                    Err(cause) => *status = Some(copy::compose_failed(&to, &cause)),
+                }
+            }
+            arm(debounce);
+        }
         AppMsg::Redraw => arm(debounce),
         AppMsg::Resized(w, h) => {
             app.term_size = (w, h);
@@ -1878,6 +1923,7 @@ async fn handle_mouse(
                     return Ok(());
                 }
                 HitTarget::NewTabButton
+                | HitTarget::ComposeButton
                 | HitTarget::NewWorkspaceButton
                 | HitTarget::SidebarTab { .. }
                 | HitTarget::SidebarToggle
@@ -2826,6 +2872,7 @@ mod tests {
             paste_seq: 0,
             home,
             folder_probe_at: None,
+            tx: None,
         }
     }
 

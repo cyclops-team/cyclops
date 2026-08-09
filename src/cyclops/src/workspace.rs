@@ -555,7 +555,7 @@ fn resolve_agents(
             None => return Err(unknown_agent(id, &known)),
             Some(m) => match &m.launch {
                 None => return Err(agent_wont_launch(id, &m.path)),
-                Some(cmd) => out.push(cmd.clone()),
+                Some(cmd) => out.push((id.to_string(), cmd.clone())),
             },
         }
     }
@@ -563,7 +563,68 @@ fn resolve_agents(
     if out.len() != labels.len() {
         return Err(agent_count_mismatch(out.len(), source, &labels));
     }
-    Ok(out)
+    // Hand each pane its own hook config, for the CLIs that take one as a
+    // launch flag. This runs after every refusal above, so a workspace that
+    // is not going to be built writes no artifacts on the way to saying so.
+    Ok(out
+        .into_iter()
+        .zip(&labels)
+        .map(|((id, cmd), label)| wire_hooks(home, &known, &id, cmd, label))
+        .collect())
+}
+
+/// Append the pane's own hook config to its launch command, for a CLI whose
+/// manifest names a flag that takes one.
+///
+/// This is the whole of hook wiring for claude, and it is why nothing under
+/// ~/.claude is read or written: claude reads hooks only from the settings
+/// file it was launched with, so handing the pane a generated file at start
+/// is both necessary and sufficient. A CLI that instead discovers hooks from
+/// a fixed path of its own (codex, agy) declares no flag and passes through
+/// here unchanged.
+///
+/// Failure returns the bare command rather than an error. A pane that starts
+/// unwired is exactly what every pane did before this existed, and it stays
+/// visible: the agent runs, its deliveries fall to the screen-verified tier,
+/// and `cyclops hooks selftest <label>` says so. Refusing to open the
+/// workspace over an unwritable hook file would trade a working fleet for a
+/// missing one.
+fn wire_hooks(
+    home: &Path,
+    known: &BTreeMap<String, crate::manifests::Known>,
+    id: &str,
+    cmd: String,
+    label: &str,
+) -> String {
+    // The pane's own hook config, for a CLI that takes one as a launch flag
+    // rather than discovering it from a fixed path of its own.
+    //
+    // The pane's IDENTITY is not here. It rides in the pane environment as
+    // CYCLOPS_AGENT (see `fill_agents`), which is what lets one shared
+    // vendor config serve every pane: codex reads a single
+    // $CODEX_HOME/hooks.json and agy a single ~/.agents/hooks.json, so a
+    // label baked into either would make every pane report as one agent.
+    let Some(flag) = known.get(id).and_then(|m| m.settings_flag.as_deref()) else {
+        return cmd;
+    };
+    let Some(kind) = crate::hookset::CliKind::from_name(id) else {
+        return cmd;
+    };
+    match crate::hookset::prepare(home, kind, label) {
+        Ok(path) => format!("{cmd} {flag} {}", sh_quote(&path.display().to_string())),
+        Err(_) => cmd,
+    }
+}
+
+/// Single-quote a path for the shell tmux runs the pane command with.
+///
+/// The command is a string tmux hands to a shell, and CYCLOPS_HOME is the
+/// operator's to place: a home under "My Documents" would otherwise split
+/// the argument and start claude with a settings path it cannot read. Single
+/// quotes take everything literally, so only an embedded quote needs the
+/// close-escape-reopen dance.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// Put one launch command on each pane the workspace names, in layout
@@ -581,10 +642,20 @@ fn fill_agents(layout: &mut Layout, commands: &[String]) {
     for w in &mut layout.windows {
         for r in &mut w.rows {
             for p in &mut r.panes {
-                if p.label.is_some() {
+                if let Some(label) = p.label.clone() {
                     if let Some(cmd) = next.next() {
                         p.command = Some(cmd.clone());
                         p.launch_now = true;
+                        // Who this pane's hooks report as. Every vendor
+                        // hook command that carries no --agent of its own
+                        // reads this (hook.rs), which is what lets one
+                        // shared $CODEX_HOME/hooks.json or ~/.agents/hooks.json
+                        // serve every pane and still name them apart.
+                        //
+                        // Derived from the label at build time and never
+                        // saved, so renaming a pane and rebuilding gives it
+                        // the new name rather than the one it had.
+                        p.env = vec![("CYCLOPS_AGENT".to_string(), label)];
                     }
                 }
             }
@@ -1006,7 +1077,7 @@ fn prepare_home(
 /// first `cyclops start` would and never opens a session, because an
 /// installer that creates tmux sessions behind the operator is a surprise,
 /// and because a machine without tmux should still finish installing.
-pub fn run_setup(json_out: bool, style: &Style) -> i32 {
+pub fn run_setup(json_out: bool, style: &Style, wire_hooks: bool) -> i32 {
     let home = cyclops_proto::cyclops_home();
     let settings = Settings::read(&home);
     // The session the config will name. `start` with no arguments opens
@@ -1025,6 +1096,22 @@ pub fn run_setup(json_out: bool, style: &Style) -> i32 {
     // does not get to call itself done. The installer reads the exit code.
     let usable = !seeded.none_installed();
 
+    // Wire the vendors that read hooks from a path of their own, for every
+    // one of them that is installed here. This is the step that makes an
+    // install report turn edges and earn verified receipts instead of
+    // detecting agents it can never hear from, and it runs on update too
+    // because update calls this verb.
+    //
+    // Never fatal. A hooks.json that cannot be written leaves the agent on
+    // the screen-verified tier, which is the tier every agent was on before
+    // this existed; refusing to finish an install over it would be trading
+    // a working cyclops for none.
+    let wired = if wire_hooks && std::env::var_os("CYCLOPS_NO_VENDOR_HOOKS").is_none() {
+        wire_installed_vendors()
+    } else {
+        Vec::new()
+    };
+
     if json_out {
         println!(
             "{}",
@@ -1038,6 +1125,12 @@ pub fn run_setup(json_out: bool, style: &Style) -> i32 {
                     "kept": seeded.kept,
                 },
                 "notes": notes,
+                "hooks": wired.iter().map(|w| json!({
+                    "vendor": w.vendor,
+                    "path": w.path.display().to_string(),
+                    "unchanged": w.unchanged,
+                    "backup": w.backup.as_ref().map(|b| b.display().to_string()),
+                })).collect::<Vec<_>>(),
             })
         );
         return if usable { 0 } else { 1 };
@@ -1058,7 +1151,56 @@ pub fn run_setup(json_out: bool, style: &Style) -> i32 {
     for note in &notes {
         println!("  {}", style.dim(note));
     }
+    for note in hook_notes(&wired) {
+        println!("  {}", style.dim(&note));
+    }
     0
+}
+
+/// Wire every vendor that reads hooks from a fixed path and is installed
+/// here. Vendors that take their config at launch are absent by design:
+/// claude gets its file from `--agents`, and nothing under ~/.claude is
+/// read or written to do it.
+fn wire_installed_vendors() -> Vec<crate::hookset::WiredVendor> {
+    use crate::hookset::CliKind;
+    let mut out = Vec::new();
+    for kind in [CliKind::Codex, CliKind::Agy, CliKind::Cursor] {
+        match crate::hookset::wire_vendor(kind) {
+            Ok(Some(w)) => out.push(w),
+            // Not installed, or takes its config at launch. Both are
+            // ordinary and neither is worth a line.
+            Ok(None) => {}
+            // Say it and keep going. The operator can still wire this one
+            // by hand, and every other vendor still gets its turn.
+            Err(cause) => eprintln!("  hooks: {cause}"),
+        }
+    }
+    out
+}
+
+/// One line per vendor whose config this run touched, and one for the
+/// backups. A file this project edited that the operator did not edit is
+/// exactly the kind of thing they should hear about at the time rather
+/// than discover later.
+fn hook_notes(wired: &[crate::hookset::WiredVendor]) -> Vec<String> {
+    let changed: Vec<&crate::hookset::WiredVendor> =
+        wired.iter().filter(|w| !w.unchanged).collect();
+    if changed.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = changed
+        .iter()
+        .map(|w| format!("wired {} hooks in {}", w.vendor, w.path.display()))
+        .collect();
+    for w in changed.iter().filter(|w| w.backup.is_some()) {
+        let b = w.backup.as_ref().expect("filtered on is_some");
+        out.push(format!(
+            "kept your previous {} config at {}",
+            w.vendor,
+            b.display()
+        ));
+    }
+    out
 }
 
 fn write_first_run_config(home: &Path, session: &str) -> Result<(), String> {
@@ -1836,24 +1978,101 @@ mod tests {
     /// The ids `--agents` accepts are manifest ids, and each one becomes
     /// the command its manifest names. Two panes may run the same CLI:
     /// that is a fleet of two claudes, not a mistake.
+    ///
+    /// claude also leaves here already wired. Its manifest names a
+    /// settings flag, so each pane gets its OWN hook config, keyed by the
+    /// label that pane answers to: the hook command embeds `--agent
+    /// <label>`, so two claudes sharing one file would report each other's
+    /// turns. codex names no flag and passes through untouched.
     #[test]
     fn agent_ids_become_the_launch_commands_their_manifests_name() {
         let home = cyclops_proto::scratch::scratch_dir("cyc-agents-ok");
         let _ = std::fs::remove_dir_all(&home);
         let duo = preset("duo").unwrap().unwrap();
+        let labels: Vec<String> = duo.panes().filter_map(|p| p.label.clone()).collect();
+
         let ids = ["claude".to_string(), "claude".to_string()];
-        assert_eq!(
-            resolve_agents(&home, &ids, &duo, "preset duo").unwrap(),
-            vec!["claude", "claude"]
-        );
+        let got = resolve_agents(&home, &ids, &duo, "preset duo").unwrap();
+        for (cmd, label) in got.iter().zip(&labels) {
+            let want = crate::hookset::hooks_root_in(&home)
+                .join("claude")
+                .join(label)
+                .join("settings.json");
+            assert_eq!(cmd, &format!("claude --settings '{}'", want.display()));
+            // Wiring is a file that exists, not a path that reads well.
+            assert!(want.is_file(), "{} was not written", want.display());
+        }
+
         // A shell that kept the spaces after the commas passed the same
-        // list, and cyclops reads it as one.
+        // list, and cyclops reads it as one. codex discovers its hooks from
+        // $CODEX_HOME instead of a flag, so its command is the bare CLI.
         let spaced = ["claude".to_string(), " codex".to_string()];
-        assert_eq!(
-            resolve_agents(&home, &spaced, &duo, "preset duo").unwrap(),
-            vec!["claude", "codex"]
-        );
+        let got = resolve_agents(&home, &spaced, &duo, "preset duo").unwrap();
+        assert!(got[0].starts_with("claude --settings '"));
+        // codex reads a single $CODEX_HOME/hooks.json shared by every pane,
+        // so it takes no flag and its command is the bare CLI. Its identity
+        // rides in the pane environment instead, which is what lets that one
+        // shared file carry no --agent.
+        assert_eq!(got[1], "codex");
+
+        // Nothing was written outside the home it was handed.
+        assert!(crate::hookset::hooks_root_in(&home).starts_with(&home));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Every started pane says who its hooks report as, and says it in the
+    /// environment rather than in the command.
+    ///
+    /// This is what makes one shared vendor config correct for a fleet:
+    /// codex reads a single $CODEX_HOME/hooks.json and agy a single
+    /// ~/.agents/hooks.json, so the label cannot live in either file. A pane
+    /// nobody named gets nothing, because nothing addresses it.
+    #[test]
+    fn every_started_pane_names_who_its_hooks_report_as() {
+        let mut duo = preset("duo").unwrap().unwrap();
+        let labels: Vec<String> = duo.panes().filter_map(|p| p.label.clone()).collect();
+        fill_agents(&mut duo, &["claude".to_string(), "codex".to_string()]);
+
+        for (pane, label) in duo.panes().filter(|p| p.label.is_some()).zip(&labels) {
+            assert!(pane.launch_now, "{label} was not started");
+            assert_eq!(
+                pane.env,
+                vec![("CYCLOPS_AGENT".to_string(), label.clone())],
+                "{label} would report under the wrong name"
+            );
+            // The identity is NOT in the command; that is the whole point.
+            assert!(!pane
+                .command
+                .as_deref()
+                .unwrap_or("")
+                .contains("CYCLOPS_AGENT"));
+        }
+
+        // An unlabeled pane is part of the arrangement, not the fleet.
+        for pane in duo.panes().filter(|p| p.label.is_none()) {
+            assert!(pane.env.is_empty());
+        }
+    }
+
+    /// A home under a path with a space still starts a wired claude. The
+    /// command is a string a shell splits, so an unquoted settings path
+    /// would hand claude a truncated argument and it would start with no
+    /// hooks and no complaint.
+    #[test]
+    fn a_home_with_a_space_still_quotes_into_one_argument() {
+        let base = cyclops_proto::scratch::scratch_dir("cyc agents space");
+        let _ = std::fs::remove_dir_all(&base);
+        let duo = preset("duo").unwrap().unwrap();
+        let labels: Vec<String> = duo.panes().filter_map(|p| p.label.clone()).collect();
+        let ids = ["claude".to_string(), "claude".to_string()];
+        let got = resolve_agents(&base, &ids, &duo, "preset duo").unwrap();
+        for (cmd, label) in got.iter().zip(&labels) {
+            let _ = label;
+            let path = cmd.strip_prefix("claude --settings ").expect("wired");
+            assert!(path.starts_with('\'') && path.ends_with('\''));
+            assert!(Path::new(path.trim_matches('\'')).is_file());
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Every way `--agents` is refused, and the sentence each one owes the

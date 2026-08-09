@@ -85,6 +85,40 @@ pub fn paint_tab_bar(
         theme::add_button(paint)
     };
     spans.push(Span::styled(plus, plus_style));
+    x = x.saturating_add(plus.len() as u16);
+
+    // The chat button, beside the `+`. It is the mouse's half of Ctrl+B @,
+    // and the reason it is here rather than only in the menu: addressing an
+    // agent is a thing the admin does constantly, and a control worth a
+    // chord is worth being visible.
+    //
+    // `@` and not a speech-balloon glyph. The composer's grammar starts
+    // with `@`, so the button teaches the syntax, and a balloon is two
+    // columns wide in some fonts and one in others, which would move the
+    // strip's right edge depending on the terminal.
+    let chat = " @ ";
+    let mut chat_hovered = false;
+    if x < right {
+        let rect = Rect::new(
+            x,
+            area.y,
+            (chat.len() as u16).min(right - x),
+            area.height.max(1),
+        );
+        chat_hovered = hover.is_some_and(|(col, row)| {
+            col >= rect.x
+                && col < rect.x + rect.width
+                && row >= rect.y
+                && row < rect.y + rect.height
+        });
+        hits.push(rect, HitTarget::ComposeButton);
+    }
+    let chat_style = if chat_hovered {
+        theme::add_button_hover(paint)
+    } else {
+        theme::add_button(paint)
+    };
+    spans.push(Span::styled(chat, chat_style));
     Paragraph::new(Line::from(spans)).render(area, buf);
 }
 
@@ -146,6 +180,55 @@ mod tests {
     /// the pointer, and names this button as one of the three. It shipped
     /// taking no hover at all, so the strip's own button was the one
     /// control in the language that never answered the mouse.
+    /// The chat button is a real control: it sits after the `+`, it takes
+    /// clicks, and it lights under the pointer like every other chrome
+    /// button (render/mod.rs rule 1). One that renders but answers neither
+    /// is decoration.
+    #[test]
+    fn the_chat_button_sits_after_the_plus_and_answers_the_pointer() {
+        let paint_at = |hover: Option<(u16, u16)>| {
+            let mut term = Terminal::new(TestBackend::new(40, 2)).unwrap();
+            let mut hits = HitMap::default();
+            term.draw(|f| {
+                paint_tab_bar(
+                    &[two_pane_tab()],
+                    0,
+                    Rect::new(0, 0, 40, 1),
+                    f.buffer_mut(),
+                    &Paint::for_test(),
+                    &mut hits,
+                    &DecorationSnapshot::default(),
+                    hover,
+                );
+            })
+            .unwrap();
+            (term.backend().buffer().clone(), hits)
+        };
+
+        let (cold, hits) = paint_at(None);
+        let plus = (0..40)
+            .find(|x| matches!(hits.hit(*x, 0), Some(HitTarget::NewTabButton)))
+            .expect("the + is on the strip");
+        let chat = (0..40)
+            .find(|x| matches!(hits.hit(*x, 0), Some(HitTarget::ComposeButton)))
+            .expect("the chat button is on the strip");
+        assert!(chat > plus, "the chat button belongs after the +");
+
+        // It carries the composer's own sigil, so the button and the
+        // grammar it opens teach each other.
+        let painted: String = (0..40).map(|x| cold[(x, 0)].symbol()).collect();
+        assert!(painted.contains(" @ "), "{painted:?}");
+
+        let (lit, _) = paint_at(Some((chat, 0)));
+        assert_ne!(
+            cold[(chat, 0)].bg,
+            lit[(chat, 0)].bg,
+            "the chat button did not light under the pointer"
+        );
+        let (elsewhere, _) = paint_at(Some((0, 0)));
+        assert_eq!(cold[(chat, 0)].bg, elsewhere[(chat, 0)].bg);
+    }
+
     #[test]
     fn the_add_button_lights_under_the_mouse() {
         let paint_at = |hover: Option<(u16, u16)>| {

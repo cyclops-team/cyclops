@@ -136,6 +136,29 @@ pub(super) async fn execute(
         }
         Action::NamePane { pane_id, label } => name_pane(app, pane_id, label),
 
+        Action::RequestCompose => {
+            // Prefilled with the focused pane's label when it has one,
+            // because the agent you are looking at is the one you are
+            // usually writing to. It is only a prefill: the name is part of
+            // the text, so overtyping it addresses someone else.
+            let buffer = app
+                .decoration
+                .pane(&app.model.active_tab().active_pane)
+                .and_then(|d| d.label.clone())
+                .map(|label| format!("@{label} "))
+                .unwrap_or_else(|| "@".to_string());
+            app.dialog = Some(Dialog::Compose {
+                buffer,
+                status: None,
+                sending: false,
+            });
+            Ok(Outcome::default())
+        }
+        Action::SendMessage { to, subject, body } => {
+            send_message(app, to, subject, body);
+            Ok(Outcome::default())
+        }
+
         Action::RequestNewTab => {
             app.dialog = Some(Dialog::NewTab {
                 buffer: String::new(),
@@ -1069,6 +1092,40 @@ fn apply_insertion(order: &mut Vec<String>, source: &str, insertion: &Insertion)
     true
 }
 
+/// Start a send and return immediately.
+///
+/// The daemon holds a send's answer for the acknowledgement window, which
+/// is seconds, so doing this inline would freeze every pane in the
+/// workspace while it waited. It runs on a thread of its own and posts the
+/// receipt back as an [`AppMsg`]; the composer stays open showing that it
+/// is in flight, and `sending` keeps a second Enter from sending twice.
+///
+/// With no channel (a test App built without a loop) the send is simply not
+/// started. Spawning a thread whose answer nothing can receive would be a
+/// message on the record that the operator is never told about.
+fn send_message(app: &mut App, to: String, subject: String, body: String) {
+    let Some(tx) = app.tx.clone() else {
+        return;
+    };
+    if let Some(Dialog::Compose {
+        status, sending, ..
+    }) = app.dialog.as_mut()
+    {
+        *sending = true;
+        *status = Some(crate::copy::compose_sending(&to));
+    }
+    let home = app.home.clone();
+    std::thread::spawn(move || {
+        let outcome = daemon::send_message(&home, &to, &subject, &body);
+        // The workspace shutting down closes the channel. Nothing to do
+        // about it and nothing to report it to.
+        let _ = tx.send(super::AppMsg::SendFinished {
+            to,
+            outcome: outcome.map_err(|e| e.to_string()),
+        });
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -1126,6 +1183,10 @@ mod tests {
 
     fn test_app(model: WorkspaceModel, home: std::path::PathBuf) -> App {
         App {
+            // No loop around this App, so nothing could receive a send's
+            // answer. `send_message` declines to start one rather than put
+            // a message on the record nobody will be told about.
+            tx: None,
             model,
             runtimes: RuntimeRegistry::default(),
             router: Router::new(default_bindings()),

@@ -173,6 +173,35 @@ pub fn theme_not_saved(cause: &str) -> String {
     format!("can't save the theme: {cause}. Nothing was changed.")
 }
 
+// ---------------------------------------------------------------------------
+// Composer
+// ---------------------------------------------------------------------------
+
+/// The composer's own title. The grammar is in the title because it is the
+/// whole interface: there is no second field to Tab into.
+pub const COMPOSE_TITLE: &str = "Send a message";
+pub const COMPOSE_HINT: &str = "@name then your message · Enter sends · Esc closes";
+pub const BUTTON_SEND: &str = "Send";
+
+/// In flight. Named, because a workspace with several agents open should
+/// not make the reader work out which one is being written to.
+pub fn compose_sending(to: &str) -> String {
+    format!("sending to {to}…")
+}
+
+/// The send answered. The receipt is already in the vocabulary `cyclops
+/// send` prints, so it is passed through rather than re-worded here.
+pub fn compose_sent(receipt: &str) -> String {
+    receipt.to_string()
+}
+
+/// Nothing reached the record. Distinct from a delivery that was attempted
+/// and failed: this one is not somewhere waiting to be found, so the
+/// operator's next move is to retry rather than to go looking.
+pub fn compose_failed(to: &str, cause: &str) -> String {
+    format!("nothing sent to {to}: {cause}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

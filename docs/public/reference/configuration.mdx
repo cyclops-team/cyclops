@@ -72,5 +72,33 @@ also records which workspaces follow their active pane's folder in
 | `CYCLOPS_HOME` | Runtime home; defaults to `~/.cyclops`. |
 | `CYCLOPS_THEME` | Theme name or theme-file override. |
 | `CYCLOPS_LOG` | Daemon tracing filter, such as `debug`. |
-| `CYCLOPS_AGENT` | Agent label supplied to vendor-hook commands. |
+| `CYCLOPS_AGENT` | Agent label a vendor-hook command reports as, when the command names no `--agent` of its own. `cyclops start --agents` sets it on each pane it opens, which is what lets one shared vendor hooks file serve a whole fleet and still tell the panes apart. |
+| `CYCLOPS_NO_VENDOR_HOOKS` | Set to any value to install without editing agent CLI configuration. See below. |
 | `NO_COLOR` | Disable color without removing state words or glyphs. |
+
+## Agent hooks
+
+Detecting an agent and hearing from it are different things. Detection reads
+the pane; hooks are how a CLI reports its own turn edges, and they are what
+upgrades a delivery receipt from screen evidence to the verified check.
+
+The installer wires them, by passing `--wire-hooks` to its final
+`cyclops start --setup-only`. Where they land depends on how each CLI finds
+them:
+
+| CLI | Where its hooks go |
+| --- | --- |
+| Claude Code | Nowhere on disk. It reads hooks only from the settings file it is launched with, so `cyclops start --agents claude` generates one per pane and passes `--settings`. Nothing under `~/.claude` is read or written. |
+| Codex | `$CODEX_HOME/hooks.json`, user level. Project-local `.codex/hooks.json` does not load until the directory is trusted, and that dialog cannot be answered in a non-interactive run, so hooks placed there silently never fire. |
+| Antigravity | `~/.agents/hooks.json`. |
+| Cursor | `~/.cursor/hooks.json`. |
+
+For the three that read a file of their own, Cyclops merges its entries
+around whatever is already there, copies the original to
+`hooks.json.before-cyclops` before the first edit, and rewrites nothing on a
+run that would change nothing. A CLI that is not installed is skipped.
+
+`cyclops start --setup-only` on its own never touches agent configuration;
+only `--wire-hooks` does. To install without it, set
+`CYCLOPS_NO_VENDOR_HOOKS=1`, then wire whichever agents you want by hand with
+`cyclops hooks install <cli> --agent <label>`.

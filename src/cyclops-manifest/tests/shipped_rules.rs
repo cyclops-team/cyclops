@@ -106,6 +106,129 @@ fn codex_ghost_vs_typed_probed_fixtures() {
     assert_eq!(r.state, AgentState::Idle);
 }
 
+/// MEASURED 2026-08-08 (codex-cli 0.147.0, tmux 120x40), SAFETY: Codex keeps
+/// the ghost composer line on screen for the WHOLE turn. A live capture taken
+/// while "• Working (0s • esc to interrupt)" is rendering still carries
+/// "› Run /review on my current changes" two lines below it, so the composer
+/// rules match continuously while the agent generates.
+///
+/// This is the ordering the cursor manifest was deliberately written against
+/// (see cursor_working_outranks_the_live_composer_placeholder, which names
+/// this exact defect and declines to copy it). Codex shipped it anyway:
+/// composer_empty_or_ghost sat at 1000 and screen_working at 800, and
+/// evaluation takes the first match after sorting by descending priority, so
+/// screen_working was never reached and every Codex turn read idle.
+///
+/// The consequence is not cosmetic. idle is in [injection].safe_states, so a
+/// pane mid-generation looked safe to paste into.
+#[test]
+fn codex_working_outranks_the_live_ghost_composer() {
+    let all = shipped();
+    let codex = &all["codex"];
+    let plain = include_str!("fixtures/codex_working_composer_plain.txt");
+    let esc = include_str!("fixtures/codex_working_composer_esc.txt");
+
+    // The title tier is useless for Codex (static project directory), so the
+    // capture is the only sensor that can answer this.
+    let r = codex.evaluate_esc("cxwork", plain, Some(esc)).unwrap();
+    assert_eq!(r.id, "screen_working");
+    assert_eq!(r.state, AgentState::Working);
+
+    // The shadow is real: the idle composer rule matches this same mid-turn
+    // capture. Only the ordering keeps the pane from reading idle.
+    let ghost = codex
+        .rules
+        .iter()
+        .find(|r| r.id == "composer_empty_or_ghost")
+        .expect("composer_empty_or_ghost rule");
+    assert!(ghost.matches_esc(plain, &non_empty(plain), Some(&non_empty(esc))));
+    let working = codex
+        .rules
+        .iter()
+        .find(|r| r.id == "screen_working")
+        .expect("screen_working rule");
+    assert!(
+        working.priority > ghost.priority,
+        "screen_working ({}) must outrank composer_empty_or_ghost ({})",
+        working.priority,
+        ghost.priority
+    );
+
+    // Codex prints "esc to interrupt" lowercase. The rule carried the
+    // capitalized form only, so that clause never fired on a real pane.
+    assert!(plain.contains("esc to interrupt"));
+
+    // A plain capture with no escaped companion must reach the same verdict:
+    // the working indicator is literal text, not an SGR discrimination.
+    let r = codex.evaluate("cxwork", plain).unwrap();
+    assert_eq!(r.id, "screen_working");
+}
+
+/// MEASURED 2026-08-08 (agy 1.1.11, tmux 120x40), SAFETY: the same defect
+/// codex carried, plus a worse one. agy clears its composer the moment a turn
+/// starts, so the bare '>' matches composer_empty for the whole turn while
+/// screen_working sat below it at 800.
+///
+/// The second defect is that none of the rule's old clauses matched a running
+/// turn at all. The only mid-turn paint is a braille spinner plus
+/// "Generating...". '▸ Thought for' is a POST-turn summary that stays on
+/// screen, so simply raising the priority without fixing the vocabulary would
+/// have wedged every finished pane as working.
+///
+/// The fixture is a live capture with the operator's account address, shell
+/// prompt, and two absolute home paths replaced by neutral stand-ins. No line
+/// any rule keys on was touched: the spinner, the composer, and the step
+/// markers are byte-for-byte as captured.
+#[test]
+fn agy_working_outranks_the_cleared_composer() {
+    let all = shipped();
+    let agy = &all["agy"];
+    let plain = include_str!("fixtures/agy_working_composer_plain.txt");
+
+    // agy publishes the hostname as its title, so the capture is the only
+    // sensor with anything to say.
+    let r = agy.evaluate("mac", plain).unwrap();
+    assert_eq!(r.id, "screen_working");
+    assert_eq!(r.state, AgentState::Working);
+
+    // The shadow is real: the composer is empty mid-turn, so the idle rule
+    // matches this same capture.
+    let empty = agy
+        .rules
+        .iter()
+        .find(|r| r.id == "composer_empty")
+        .expect("composer_empty rule");
+    assert!(empty.matches(plain, &non_empty(plain)));
+    let working = agy
+        .rules
+        .iter()
+        .find(|r| r.id == "screen_working")
+        .expect("screen_working rule");
+    assert!(
+        working.priority > empty.priority,
+        "screen_working ({}) must outrank composer_empty ({})",
+        working.priority,
+        empty.priority
+    );
+
+    // The vocabulary the rule now keys on, and the one it must not. This
+    // fixture is a live tool turn that ALSO carries '▸ Thought for' from the
+    // preceding turn, which is the whole reason that string cannot be a
+    // working signal: it survives the turn that produced it.
+    assert!(plain.contains("Generating..."));
+    assert!(plain.contains("▸ Thought for"));
+
+    // A settled pane still showing that summary must read idle, not working.
+    let settled = "▸ Thought for 1s, 352 tokens\n\
+                   ────────────\n\
+                   >\n\
+                   ────────────\n";
+    assert!(!working.matches(settled, &non_empty(settled)));
+    let r = agy.evaluate("mac", settled).unwrap();
+    assert_eq!(r.id, "composer_empty");
+    assert_eq!(r.state, AgentState::Idle);
+}
+
 /// M1 soak, BINDING: native Claude installs report pane_current_command as
 /// the version string ("2.1.220"), so process_names never binds. The
 /// manifest must carry the argv fallback data the daemon binds with.

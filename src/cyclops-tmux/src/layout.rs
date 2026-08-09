@@ -144,6 +144,19 @@ pub struct Pane {
     /// already in the file stays a suggestion until `--launch`.
     #[serde(skip)]
     pub launch_now: bool,
+    /// Environment for the pane's own process, set when it is created.
+    ///
+    /// Skipped for the same reason as [`Pane::launch_now`], and one more:
+    /// every entry here is DERIVED from something else in this struct, so
+    /// writing it to a file would create a second copy that can go stale.
+    /// `CYCLOPS_AGENT` is the pane's label; saving it would leave a renamed
+    /// pane reporting hooks under the name it used to have.
+    ///
+    /// Set at creation rather than prefixed onto [`Pane::command`] so the
+    /// saved command stays the command, and so a pane that inherits it is
+    /// not one whose launch string has to be re-parsed to find out.
+    #[serde(skip)]
+    pub env: Vec<(String, String)>,
 }
 
 impl Layout {
@@ -319,8 +332,11 @@ pub fn capture(server: &Server, session: &str) -> Result<Capture, TmuxError> {
                     cwd: Some(p.cwd.clone()).filter(|c| !c.is_empty()),
                     command: launch_hint(&p.command),
                     // A capture records what a pane is running. Nothing
-                    // read off a session is waiting to be started.
+                    // read off a session is waiting to be started, and a
+                    // pane already running has whatever environment it was
+                    // given; there is nothing here to set.
                     launch_now: false,
+                    env: Vec::new(),
                 });
             }
             out_rows.push(Row {
@@ -504,6 +520,14 @@ fn split(
 fn push_pane_args(args: &mut Vec<String>, pane: &Pane, opts: &ApplyOptions) {
     if let Some(cwd) = &pane.cwd {
         args.extend(["-c".to_string(), cwd.clone()]);
+    }
+    // Only when something actually starts here. tmux keeps -e for the
+    // pane's process, so setting it without running a command would leave
+    // an environment nothing read.
+    if opts.launch || pane.launch_now {
+        for (k, v) in &pane.env {
+            args.extend(["-e".to_string(), format!("{k}={v}")]);
+        }
     }
     if opts.launch || pane.launch_now {
         if let Some(cmd) = &pane.command {
@@ -750,7 +774,62 @@ mod tests {
             cwd: None,
             command: None,
             launch_now: false,
+            env: Vec::new(),
         }
+    }
+
+    /// A pane that starts a command and names who it reports as, which is
+    /// what `cyclops start --agents` builds.
+    fn pane_with_env(label: &str, cmd: &str, env: &[(&str, &str)]) -> Pane {
+        Pane {
+            label: Some(label.to_string()),
+            ratio: 1.0,
+            cwd: None,
+            command: Some(cmd.to_string()),
+            launch_now: true,
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        }
+    }
+
+    /// Pane environment reaches tmux as -e, ahead of the command, and only
+    /// when something is actually starting. A pane whose command is only a
+    /// suggestion from a file gets neither.
+    #[test]
+    fn pane_environment_is_set_only_when_a_command_runs() {
+        let p = pane_with_env("implementer", "claude", &[("CYCLOPS_AGENT", "implementer")]);
+        let got = args_for(&p, false);
+        assert_eq!(
+            got,
+            vec!["-e", "CYCLOPS_AGENT=implementer", "claude"],
+            "launch_now should carry the environment and the command"
+        );
+
+        // Same pane off a file, with no --launch: nothing starts, so there
+        // is no process for an environment to belong to.
+        let mut suggestion = p.clone();
+        suggestion.launch_now = false;
+        assert!(args_for(&suggestion, false).is_empty());
+        // And with --launch, both come back.
+        assert_eq!(
+            args_for(&suggestion, true),
+            vec!["-e", "CYCLOPS_AGENT=implementer", "claude"]
+        );
+    }
+
+    /// The environment is derived from the label, so it must never reach
+    /// the saved file: a renamed pane would otherwise keep reporting hooks
+    /// under the name it used to have.
+    #[test]
+    fn pane_environment_is_never_written_to_a_file() {
+        let p = pane_with_env("implementer", "claude", &[("CYCLOPS_AGENT", "implementer")]);
+        let written = toml::to_string(&p).expect("pane serializes");
+        assert!(
+            !written.contains("CYCLOPS_AGENT") && !written.contains("env"),
+            "pane environment leaked into the saved layout:\n{written}"
+        );
     }
 
     /// The tmux arguments this pane would be built with.

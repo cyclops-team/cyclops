@@ -105,6 +105,35 @@ adopt_daemon() {
 }
 
 cleanup() {
+  local code=$?
+  # Say why, before tearing down the evidence.
+  #
+  # Most commands here run as `cmd > "$OUT" 2>&1` and are read by `check`
+  # afterwards. Under `set -e` a command that exits nonzero takes the script
+  # with it BEFORE the line that prints $OUT, so the one thing worth seeing,
+  # the failing command's own message, is captured to a file and then
+  # deleted with $ROOT three lines down. That produced three CI reds in a
+  # row whose entire content was "exit code 1", and cost more time guessing
+  # than every real defect this script has caught.
+  #
+  # Only on failure: a green run has already printed everything it read.
+  if [ "$code" -ne 0 ]; then
+    if [ -s "${OUT:-}" ]; then
+      echo
+      echo "== the last command's output, which set -e would otherwise discard:"
+      sed 's/^/   /' "$OUT"
+    fi
+    # The nested rigs log their daemon to a file nobody prints. When the
+    # failure is "the daemon never came up", this is the only place that
+    # says what it said on the way down.
+    for nested in duo stock; do
+      if [ -s "$ROOT/$nested/daemon.log" ]; then
+        echo
+        echo "== $nested daemon.log (last 20):"
+        tail -20 "$ROOT/$nested/daemon.log" | sed 's/^/   /'
+      fi
+    done
+  fi
   cyc_stop_daemon
   # The nested rigs run their own daemon and their own tmux server in their
   # own directories. All of them die here even when a check above exited
@@ -138,6 +167,29 @@ wait_for() {
 }
 
 daemon_attached() { "$CYC" --json status | jq -e '.sessions[0].attached == true' >/dev/null; }
+# The daemon has bound this pane to this manifest, which is what decides the
+# ACK tier of anything sent to it. Not "the pane exists" and not "the roster
+# knows the name": both are true while `manifest` is still unset, and a
+# delivery issued in that window is classified screen-tier at send time and
+# never upgrades.
+# The stand-in's read loop is running in this pane.
+#
+# tmux returns from respawn-pane when it has FORKED, not when the new
+# process is reading. A delivery issued in that gap is typed at whatever is
+# still in the pane, which is the login shell: the stand-in never sees it,
+# nothing acks it, and the delivery stays screen-tier permanently.
+#
+# MEASURED here: the pane still reports zsh for ~1.2s after respawn, and
+# demo.toml lists zsh in process_names, so the pane is already bound to the
+# manifest and already reads idle throughout the gap. Neither `manifest`
+# nor `state` can distinguish it. The stand-in writing its own flag is the
+# only unambiguous signal, and unlike a sleep it is not a guess about how
+# slow the machine is.
+standin_reading() { [ -f "$ROOT/ready.$1" ]; }
+pane_bound_to() {
+  "$CYC" --json status | jq -e --arg p "$1" --arg m "$2" \
+    '[.sessions[].panes[] | select(.pane_id == $p and .manifest == $m)] | length > 0' >/dev/null
+}
 pane_known() { "$CYC" --json status | jq -e --arg p "$1" '[.sessions[].panes[].pane_id] | index($p)' >/dev/null; }
 roster_has() { "$CYC" --json list | jq -e --arg a "$1" '[.agents[].agent] | index($a)' >/dev/null; }
 roster_empty() { "$CYC" --json list | jq -e '.agents | length == 0' >/dev/null; }
@@ -306,6 +358,10 @@ cargo build -q -p cyclops -p cyclopsd
 cat > "$ROOT/agent.sh" <<'EOF'
 label="$1"
 cyc="$2"
+# Announce the read loop BEFORE entering it. tmux returns from respawn-pane
+# when it has forked, not when the new process is reading, and the rig has
+# no other way to tell those apart: demo.toml binds the login shell too.
+: > "$3/ready.$label"
 while IFS= read -r line; do
   case "$line" in
     "[cyclops m-"*)
@@ -421,24 +477,43 @@ P1="$(tmx list-panes -t main -F '#{pane_id}')"
 # A person attaches here and starts an agent. The rig starts its stand-in,
 # and clears the pane title tmux seeded with the hostname so the roster
 # below shows what an agent publishes rather than what tmux did.
-tmx respawn-pane -k -t "$P1" "sh '$ROOT/agent.sh' implementer '$CYC'"
+rm -f "$ROOT/ready.implementer"
+tmx respawn-pane -k -t "$P1" "sh '$ROOT/agent.sh' implementer '$CYC' '$ROOT'"
+wait_for "the implementer stand-in to be reading" 100 standin_reading implementer
 tmx select-pane -t "$P1" -T ''
-# The daemon was already running when the occupant changed, so wait for it
-# to have read the new one. A person does this without noticing: they
-# start their agent and then type, and the typing is slower than a tmux
-# subscription tick.
 # Let the daemon see the new occupant before anything is delivered to it.
 #
 # It was already running when the pane changed hands, so it learns the new
 # occupant from a tmux subscription, and those tick at 1Hz (F23). Deliver
-# inside that window and the hook ack cannot arrive in time, so the receipt
-# falls to screen evidence: `✓ delivered · unverified (screen)` instead of
-# the heavy check. A person does this without noticing, because starting
-# an agent and typing at it are seconds apart.
+# before that lands and the delivery is classified screen-tier AT SEND TIME
+# and never upgrades: the receipt is `✓ delivered · unverified (screen)`
+# instead of the heavy check, permanently. Nothing the wait below the send
+# does can rescue it, which is why raising THAT wait's budget changed
+# nothing on either platform.
 #
-# MEASURED: at 0s the receipt is screen-tier every run; at 4s it is
-# hook-verified every run.
-sleep 4
+# This was `sleep 4`, from "at 0s the receipt is screen-tier every run; at
+# 4s it is hook-verified every run". True on the machine that measured it,
+# and the reason this rung has failed on loaded CI runners on both
+# platforms. The two conditions it was standing in for are both observable,
+# so they are waited for instead: the stand-in is reading (above, and it is
+# the slower of the two), and the daemon has bound the pane.
+wait_for "the daemon to bind the stand-in" 100 pane_bound_to "$P1" demo
+# One subscription period, so the daemon has ticked at least once since the
+# occupant changed.
+#
+# This is the last constant here and it is the only one tied to a property
+# of the system rather than to machine speed: the subscription runs at 1Hz
+# (F23), so two seconds is two ticks. It cannot be waited for instead. The
+# obvious observable, current_command changing, is not one: the incoming
+# process is the platform's /bin/sh, and on a runner whose login shell is
+# already bash the before and after strings are identical, so "it changed"
+# never becomes true. That predicate is what turned this rung red on macos
+# while ubuntu passed.
+#
+# What used to be here was `sleep 4` covering this AND the stand-in's
+# startup at once. Startup is the part that scaled with load and it is now
+# waited for above, which is the half that was failing.
+sleep 2
 
 run "$CYC" start --plain
 check "a second start is one line"        '^✔ workspace ready · 1 agent$'
@@ -495,7 +570,9 @@ check "ping reports the round trip"       '^✔ cyclops is up · [0-9.]+ms$'
 echo
 echo "#### Rung 2: name panes"
 
-tmx split-window -d -t main "sh '$ROOT/agent.sh' reviewer '$CYC'"
+rm -f "$ROOT/ready.reviewer"
+tmx split-window -d -t main "sh '$ROOT/agent.sh' reviewer '$CYC' '$ROOT'"
+wait_for "the reviewer stand-in to be reading" 100 standin_reading reviewer
 P2="$(tmx list-panes -t main -F '#{pane_id}' | tail -1)"
 tmx select-pane -t "$P2" -T ''
 wait_for "cyclopsd to see the new pane" 50 pane_known "$P2"
@@ -618,8 +695,12 @@ echo "#### Rung 5: structured messages with receipts"
 
 # The panes were rebuilt by the restore above, so the stand-ins go back in
 # and the roster is re-read before anything is delivered to them.
-tmx respawn-pane -k -t "$N1" "sh '$ROOT/agent.sh' implementer '$CYC'"
-tmx respawn-pane -k -t "$N2" "sh '$ROOT/agent.sh' reviewer '$CYC'"
+rm -f "$ROOT/ready.implementer"
+tmx respawn-pane -k -t "$N1" "sh '$ROOT/agent.sh' implementer '$CYC' '$ROOT'"
+wait_for "the implementer stand-in to be reading" 100 standin_reading implementer
+rm -f "$ROOT/ready.reviewer"
+tmx respawn-pane -k -t "$N2" "sh '$ROOT/agent.sh' reviewer '$CYC' '$ROOT'"
+wait_for "the reviewer stand-in to be reading" 100 standin_reading reviewer
 tmx select-pane -t "$N1" -T ''
 tmx select-pane -t "$N2" -T ''
 wait_for "both stand-ins to read idle" 50 all_idle
@@ -903,8 +984,12 @@ check "the daemon found the shipped set"  '^claude$'
 # unknown. This is the state the admin hit, and the surface has to say why
 # rather than only labelling it.
 read -r D1 D2 <<<"$(duo_tmx list-panes -t main -F '#{pane_id}' | tr '\n' ' ')"
-duo_tmx respawn-pane -k -t "$D1" "sh '$ROOT/agent.sh' implementer '$CYC'"
-duo_tmx respawn-pane -k -t "$D2" "sh '$ROOT/agent.sh' reviewer '$CYC'"
+rm -f "$ROOT/ready.implementer"
+duo_tmx respawn-pane -k -t "$D1" "sh '$ROOT/agent.sh' implementer '$CYC' '$ROOT'"
+wait_for "the implementer stand-in to be reading" 100 standin_reading implementer
+rm -f "$ROOT/ready.reviewer"
+duo_tmx respawn-pane -k -t "$D2" "sh '$ROOT/agent.sh' reviewer '$CYC' '$ROOT'"
+wait_for "the reviewer stand-in to be reading" 100 standin_reading reviewer
 duo_tmx select-pane -t "$D1" -T ''
 duo_tmx select-pane -t "$D2" -T ''
 sleep 2.5

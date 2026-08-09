@@ -52,6 +52,8 @@ pub enum BindingAction {
     /// (`toggle_event_panel`) keeps working unchanged.
     ToggleEventPanel,
     ShowKeybinds,
+    /// Open the composer: address a message without leaving the workspace.
+    Compose,
     /// No default chord: reached from the app menu, bindable via config.
     ShowThemes,
 }
@@ -198,6 +200,18 @@ pub fn default_bindings() -> HashMap<BindingAction, BindingChord> {
             BindingAction::ShowKeybinds,
             BindingChord::Prefix(KeyCode::Char('?')),
         ),
+        // `s` for send. Not `c`: that is NewTab here and in tmux, and this
+        // keymap keeps tmux's letters (% " x z , & w) so the muscle memory
+        // an operator arrives with keeps working. Not `@` either, which is
+        // what this was: it matches the composer's grammar but needs Shift
+        // on most layouts, and a control used this often should not.
+        //
+        // tmux spends `s` on its session chooser, which cyclops replaced
+        // with the sidebar, so nothing here loses a key it was using.
+        (
+            BindingAction::Compose,
+            BindingChord::Prefix(KeyCode::Char('s')),
+        ),
     ])
 }
 
@@ -262,6 +276,7 @@ fn action_from_key(key: &str) -> Option<BindingAction> {
         "toggle_motion" => Some(BindingAction::ToggleMotion),
         "toggle_event_panel" => Some(BindingAction::ToggleEventPanel),
         "show_keybinds" => Some(BindingAction::ShowKeybinds),
+        "compose" => Some(BindingAction::Compose),
         "show_themes" => Some(BindingAction::ShowThemes),
         s if s.starts_with("tab_") => s
             .strip_prefix("tab_")
@@ -396,6 +411,7 @@ fn action_words(action: BindingAction) -> String {
         BindingAction::ToggleMotion => "Toggle motion".into(),
         BindingAction::ToggleEventPanel => "Toggle event stream".into(),
         BindingAction::ShowKeybinds => "Keybinds".into(),
+        BindingAction::Compose => "Send a message".into(),
         BindingAction::ShowThemes => "Themes".into(),
     }
 }
@@ -430,6 +446,7 @@ fn help_rank(action: BindingAction) -> (u8, usize) {
         BindingAction::ToggleTabBar => (49, 1),
         BindingAction::ToggleMotion => (49, 2),
         BindingAction::ToggleEventPanel => (50, 0),
+        BindingAction::Compose => (50, 1),
         BindingAction::ShowKeybinds => (51, 0),
         BindingAction::ShowThemes => (52, 0),
         BindingAction::Detach => (53, 0),

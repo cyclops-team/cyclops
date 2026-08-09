@@ -37,6 +37,23 @@ pub enum Dialog {
         scroll: u16,
         rows: Vec<crate::bindings::BindingHelp>,
     },
+    /// Address a message from inside the workspace: `@reviewer ship it`.
+    ///
+    /// One line, because the point is to be faster than leaving for a
+    /// shell. The recipient is part of the text rather than a separate
+    /// field so the whole thing can be typed without a Tab, and so a
+    /// prefilled `@name ` can be overtyped when it is the wrong name.
+    Compose {
+        buffer: String,
+        /// What the send said, once it has said anything. The dialog stays
+        /// open across the send: it runs off this thread and can take
+        /// seconds, so it reports here instead of the workspace freezing.
+        /// None while composing, Some once it has been answered.
+        status: Option<String>,
+        /// A send is in flight. Enter is ignored while this is set, so a
+        /// second press cannot put the same message on the record twice.
+        sending: bool,
+    },
     /// Pick a theme; Enter applies it exactly like `cyclops theme <name>`.
     Themes {
         /// Loadable theme names, the same rows `cyclops theme` lists.
@@ -67,6 +84,7 @@ impl Dialog {
                 | Dialog::NamePane { .. }
                 | Dialog::RenameTab { .. }
                 | Dialog::RenameWorkspace { .. }
+                | Dialog::Compose { .. }
         )
     }
 }
@@ -127,7 +145,8 @@ pub fn dialog_buffer_mut(dialog: &mut Dialog) -> Option<&mut String> {
         Dialog::NewTab { buffer }
         | Dialog::NamePane { buffer, .. }
         | Dialog::RenameTab { buffer, .. }
-        | Dialog::RenameWorkspace { buffer, .. } => Some(buffer),
+        | Dialog::RenameWorkspace { buffer, .. }
+        | Dialog::Compose { buffer, .. } => Some(buffer),
         _ => None,
     }
 }
@@ -147,6 +166,58 @@ pub fn append_dialog_text(dialog: Option<&mut Dialog>, text: &str) -> bool {
     let before = buffer.len();
     buffer.extend(text.chars().filter(|ch| !ch.is_control()));
     buffer.len() != before
+}
+
+/// What a composer line says, once it says something addressable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Composed {
+    pub to: String,
+    pub subject: String,
+    pub body: String,
+}
+
+/// Read `@reviewer ship the rate limiter fix` into a recipient and a
+/// message, or say what is missing.
+///
+/// The whole grammar is: an `@name`, then the rest. Free text after the
+/// name is taken literally and never re-split, because a message is prose
+/// and the moment this starts interpreting `&&` or `#` it becomes a shell
+/// that only looks like one. That failure has a history here: an earlier
+/// design put this in the user's shell as a function, where `fix issue #42`
+/// silently became `fix issue` and `run make && test` ran `test`.
+///
+/// The subject is the first line's worth of the message, because the record
+/// and every list are keyed on subjects and a blank one reads as a message
+/// with nothing in it. Long messages keep the whole text as the body, so
+/// nothing typed is lost to the summary.
+pub fn parse_compose(input: &str) -> Result<Composed, &'static str> {
+    let text = input.trim();
+    let Some(rest) = text.strip_prefix('@') else {
+        return Err("start with @name, as in @reviewer take a look");
+    };
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let to = parts.next().unwrap_or_default().trim();
+    if to.is_empty() {
+        return Err("who is it for? @name, as in @reviewer take a look");
+    }
+    let message = parts.next().unwrap_or_default().trim();
+    if message.is_empty() {
+        return Err("nothing to send yet");
+    }
+    // A subject is a handle, not the message. Cut on the first line break
+    // so a pasted paragraph does not become a subject nobody can read in a
+    // list, and cap the rest at a width a roster row can hold.
+    const SUBJECT_MAX: usize = 72;
+    let first_line = message.lines().next().unwrap_or(message).trim();
+    let subject: String = match first_line.char_indices().nth(SUBJECT_MAX) {
+        None => first_line.to_string(),
+        Some((cut, _)) => format!("{}…", first_line[..cut].trim_end()),
+    };
+    Ok(Composed {
+        to: to.to_string(),
+        subject,
+        body: message.to_string(),
+    })
 }
 
 /// Resolve a [`DialogKeyAction::Scroll`] delta against the keybinds sheet's
@@ -177,6 +248,62 @@ pub fn move_theme_selection(current: usize, delta: i16, len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The composer takes free text and must never interpret it.
+    ///
+    /// These are the exact strings that broke the shell-function design
+    /// this replaced: a `#` started a comment, `&&` ran the tail as a
+    /// second command, and `*` globbed against the working directory.
+    /// Everything after the name has to arrive at the recipient byte for
+    /// byte.
+    #[test]
+    fn a_message_is_prose_and_is_never_re_split() {
+        for text in [
+            "@reviewer fix issue #42",
+            "@reviewer run make && test",
+            "@reviewer why is x*y broken?",
+            "@reviewer use `cyclops send` for this",
+            "@reviewer $HOME is not expanded; neither is $(date)",
+            "@reviewer \"quoted\" and 'quoted' both survive",
+        ] {
+            let got = parse_compose(text).expect(text);
+            assert_eq!(got.to, "reviewer");
+            let want = text.trim_start_matches("@reviewer ");
+            assert_eq!(got.body, want, "body was altered for {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_composer_line_says_what_is_missing() {
+        assert!(parse_compose("").is_err());
+        assert!(parse_compose("   ").is_err());
+        // No name at all.
+        assert!(parse_compose("just some words").is_err());
+        // A name and nothing to say.
+        assert!(parse_compose("@reviewer").is_err());
+        assert!(parse_compose("@reviewer   ").is_err());
+        // An @ with no name behind it.
+        assert!(parse_compose("@ reviewer hello").is_err());
+        // Leading and trailing space around the whole line is not input.
+        let got = parse_compose("  @reviewer  ship it  ").expect("addressed");
+        assert_eq!(got.to, "reviewer");
+        assert_eq!(got.body, "ship it");
+    }
+
+    /// The subject is a handle for a list row; the body keeps everything.
+    #[test]
+    fn a_long_message_keeps_its_body_and_shortens_only_the_subject() {
+        let long = "x".repeat(200);
+        let got = parse_compose(&format!("@reviewer {long}")).expect("addressed");
+        assert_eq!(got.body, long, "the body must keep every character");
+        assert!(got.subject.chars().count() <= 73, "{}", got.subject);
+        assert!(got.subject.ends_with('…'));
+
+        // A pasted paragraph gets a first-line subject, not a wall of text.
+        let got = parse_compose("@reviewer first line\nsecond line").expect("addressed");
+        assert_eq!(got.subject, "first line");
+        assert_eq!(got.body, "first line\nsecond line");
+    }
 
     #[test]
     fn keybind_scroll_moves_immediately_after_end_and_never_overshoots() {

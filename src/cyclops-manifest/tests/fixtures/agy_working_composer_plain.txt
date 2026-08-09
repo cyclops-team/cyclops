@@ -1,0 +1,39 @@
+agy
+(base) user@host agywork % agy
+
+      ▄▀▀▄        Antigravity CLI 1.1.11
+     ▀▀▀▀▀▀       user@example.com (Google AI Plus)
+    ▀▀▀▀▀▀▀▀      Gemini 3.6 Flash (High)
+   ▄▀▀    ▀▀▄     /private/tmp/agywork
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> Explain in three sentences what a race condition is. Do not use any tools.
+
+▸ Thought for 1s, 352 tokens
+  Defining the core concept
+  A race condition occurs when a system's behavior depends on the relative timing or sequence of concurrent
+  operations executing across multiple threads or processes. It typically happens when two or more operations access
+  shared resources simultaneously without adequate synchronization and at least one operation modifies the resource
+  state. As a result, non-deterministic execution order can lead to data corruption, inconsistent application states,
+  or unpredictable runtime bugs.
+
+────────────────────────────────────────────────────────────
+> List the files in this directory and tell me what sample.txt contains.
+
+▸ Thought for 1s, 577 tokens
+  Analyzing the Request
+
+● ListDir(/private/tmp/agywork)
+● Read(/private/tmp/agywork/NOTES.md)
+● Read(/private/tmp/agywork/GUIDE.md)
+● Read(/private/tmp/agywork/sample.txt) (ctrl+o to expand)
+⣾  Generating...
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Gemini 3.6 Flash · High · /private/tmp/agywork · Full · Ctx: 96% · (29K / 1048K) · 39K used
+
+
+
+

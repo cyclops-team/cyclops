@@ -15,15 +15,33 @@ use serde_json::{json, Value};
 
 const IO_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// Deadline for a send, which is a different kind of request from every
+/// other one here.
+///
+/// The rest are questions the daemon can answer from what it already knows,
+/// so 250ms is generous. A send is not: the daemon holds the response while
+/// it waits for the recipient to acknowledge, up to `receipt_block_ms`, and
+/// answering early is the whole point of the blocking window. Reusing
+/// IO_TIMEOUT here reports a timeout on a message that was delivered, which
+/// is the worst answer available.
+///
+/// It is only safe to wait this long because the send runs off the UI
+/// thread; nothing on this deadline may ever be called from the draw loop.
+const SEND_TIMEOUT: Duration = Duration::from_secs(15);
+
 fn connect(home: &Path) -> Result<BufReader<UnixStream>, String> {
+    connect_with(home, IO_TIMEOUT)
+}
+
+fn connect_with(home: &Path, timeout: Duration) -> Result<BufReader<UnixStream>, String> {
     let path = home.join(SOCK_NAME);
     let stream = UnixStream::connect(&path)
         .map_err(|error| format!("cyclopsd is unavailable at {}: {error}", path.display()))?;
     stream
-        .set_read_timeout(Some(IO_TIMEOUT))
+        .set_read_timeout(Some(timeout))
         .map_err(|error| format!("cannot set cyclopsd read deadline: {error}"))?;
     stream
-        .set_write_timeout(Some(IO_TIMEOUT))
+        .set_write_timeout(Some(timeout))
         .map_err(|error| format!("cannot set cyclopsd write deadline: {error}"))?;
     let mut reader = BufReader::new(stream);
 
@@ -91,6 +109,56 @@ fn read_value(reader: &mut BufReader<UnixStream>, context: &str) -> Result<Value
     }
     serde_json::from_str(line.trim())
         .map_err(|error| format!("cyclopsd sent unreadable {context}: {error}"))
+}
+
+/// Send one message, and report the receipt the way `cyclops send` does.
+///
+/// MUST NOT be called from the draw loop. It waits on [`SEND_TIMEOUT`],
+/// which is measured in seconds because the daemon holds the response for
+/// the acknowledgement window; on the UI thread that is a frozen workspace.
+/// `app` runs it on a thread of its own and takes the answer back as a
+/// message.
+///
+/// The returned string is the receipt line, already in the vocabulary the
+/// CLI prints, so the composer shows the operator the same words `cyclops
+/// send` would have. An Err is transport trouble: nothing reached the
+/// record, and the message is not somewhere waiting to be found.
+pub fn send_message(home: &Path, to: &str, subject: &str, body: &str) -> Result<String, String> {
+    let params = serde_json::to_value(cyclops_proto::MsgSendParams {
+        to: vec![to.to_string()],
+        subject: subject.to_string(),
+        body: body.to_string(),
+        fyi: false,
+        reply_to: None,
+        wait: None,
+    })
+    .map_err(|error| format!("cannot encode the message: {error}"))?;
+    let value = exchange(&mut connect_with(home, SEND_TIMEOUT)?, "msg.send", params)?;
+    let result: cyclops_proto::MsgSendResult = serde_json::from_value(value)
+        .map_err(|error| format!("cyclopsd sent an unreadable send result: {error}"))?;
+    Ok(receipt_line(&result))
+}
+
+/// One line for what happened to a send, in the receipt vocabulary.
+///
+/// The badge comes from `cyclops_ui::grid`, the same call `cyclops send`
+/// renders its receipt with, so the composer shows the operator the words
+/// they would have got at the command line. Painted Plain: this lands in a
+/// dialog that styles its own text, and a second set of color codes inside
+/// it would fight the theme.
+///
+/// A send addressed to one label has one delivery, so the first is the
+/// answer. No deliveries at all means the daemon took the message and
+/// attempted nothing, which is a record entry rather than a receipt.
+fn receipt_line(result: &cyclops_proto::MsgSendResult) -> String {
+    match result.deliveries.first() {
+        Some(d) => format!(
+            "{} · {}",
+            result.msg_id,
+            cyclops_ui::grid::receipt_badge(d, &cyclops_ui::grid::Plain)
+        ),
+        None => format!("{} · on the record", result.msg_id),
+    }
 }
 
 /// Current daemon status. Callers pass the shared protocol params so the

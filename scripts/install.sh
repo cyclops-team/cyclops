@@ -398,8 +398,16 @@ fi
 # manifests that let a pane be recognized at all. The binary owns this,
 # not the installer: `cyclops start` writes exactly the same files, so
 # there is one implementation of what a usable home is.
+#
+# --wire-hooks is the installer's to pass and nobody else's. Detecting an
+# agent and hearing from it are different things: without hooks a pane is
+# recognized but never reports a turn edge, and every delivery settles for
+# screen evidence instead of the verified receipt. Wiring them is an edit
+# to another tool's configuration, so it happens where a person has just
+# asked for an install, and it merges around what is already there. Set
+# CYCLOPS_NO_VENDOR_HOOKS=1 to install without it.
 step "setting up ${CYCLOPS_HOME:-$HOME/.cyclops}"
-"$PREFIX/cyclops" start --setup-only ||
+"$PREFIX/cyclops" start --setup-only --wire-hooks ||
     die "could not set up ${CYCLOPS_HOME:-$HOME/.cyclops}" "the output above says which file"
 
 # ---------------------------------------------------------------------------
