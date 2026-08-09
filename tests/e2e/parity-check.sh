@@ -234,6 +234,21 @@ settled() {
       | length == 0)' >/dev/null
 }
 
+# Nothing anywhere is moving. `settled` answers for one subject, which is
+# the wrong question before a broadcast: the recipient's queue can hold a
+# delivery from some OTHER message, and the broadcast lands behind it and
+# receipts `queued · 1 ahead`. The script already predicted this failure in
+# a comment and guarded it with two checks that cannot see it, one scoped
+# to a subject and one reading agent state rather than queue depth.
+nothing_in_flight() {
+  "$CYC" --json history | jq -e '
+    [.lines[].deliveries[]?
+      | select(.state == "queued" or .state == "gating" or .state == "pasting"
+               or .state == "staged" or .state == "submitted"
+               or .state == "retry_queued")]
+    | length == 0' >/dev/null
+}
+
 # Stronger than settled: every delivery for the subject is the heavy check.
 # Needed when the live receipt legally prints ● submitted under load
 # (docs/guides/send.md) while the durable badge is still becoming
@@ -473,13 +488,17 @@ check "setup installs the manifests"      '^  wrote 4 detection manifests to .*/
 # raising those budgets twice changed nothing and this is the knob that
 # does.
 #
-# Fifteen seconds for two process spawns is absurd on an idle machine and
-# is not meant for one: a GitHub runner under a parallel cargo build has
-# taken more than the old 4500. The cost of setting it high is nothing,
-# because a passing ack returns in milliseconds and never waits.
+# Ten seconds for two process spawns is absurd on an idle machine and is
+# not meant for one: a GitHub runner under a parallel cargo build has taken
+# more than the old 4500. A passing ack returns in milliseconds and never
+# waits, so the ceiling costs nothing.
+#
+# Not higher, though. This is also how long a delivery nobody answers holds
+# the recipient's queue, and one rung below stalls one on purpose. At 15000
+# the broadcast two rungs later landed behind it and receipted `queued`.
 cat >> "$CYCLOPS_HOME/config.toml" <<'EOF'
 receipt_block_ms = 4800
-ack_timeout_ms = 15000
+ack_timeout_ms = 10000
 EOF
 
 # The stand-in's own manifest, written the way docs/reference/MANIFESTS.md says to
@@ -766,6 +785,9 @@ check "a thread carries the body"         '^ +gateway\.rs:120 drops the burst pa
 # broadcast receipt reads "queued" for whichever recipient is still
 # finishing the last one. Legal, self-healing, and not reproducible.
 wait_for "the last delivery to settle" 50 settled "Review the rate limiter"
+# The one the other two cannot see. Budgeted past ack_timeout_ms, so a
+# delivery still waiting on an ack is waited out rather than raced.
+wait_for "every delivery to stop moving" 100 nothing_in_flight
 wait_for "both stand-ins to read idle" 50 all_idle
 sleep 2.5
 
