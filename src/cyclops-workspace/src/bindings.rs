@@ -200,9 +200,17 @@ pub fn default_bindings() -> HashMap<BindingAction, BindingChord> {
             BindingAction::ShowKeybinds,
             BindingChord::Prefix(KeyCode::Char('?')),
         ),
+        // `s` for send. Not `c`: that is NewTab here and in tmux, and this
+        // keymap keeps tmux's letters (% " x z , & w) so the muscle memory
+        // an operator arrives with keeps working. Not `@` either, which is
+        // what this was: it matches the composer's grammar but needs Shift
+        // on most layouts, and a control used this often should not.
+        //
+        // tmux spends `s` on its session chooser, which cyclops replaced
+        // with the sidebar, so nothing here loses a key it was using.
         (
             BindingAction::Compose,
-            BindingChord::Prefix(KeyCode::Char('@')),
+            BindingChord::Prefix(KeyCode::Char('s')),
         ),
     ])
 }

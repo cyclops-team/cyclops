@@ -649,6 +649,10 @@ pub fn route_mouse_click(target: &HitTarget, button: MouseButton) -> Option<Acti
             direction: SplitDirection::Vertical,
         }),
         (HitTarget::NewTabButton, MouseButton::Left) => Some(Action::RequestNewTab),
+        // The same action Ctrl+B @ routes to. A control that opened a
+        // different composer from the chord would be a second code path
+        // for one feature.
+        (HitTarget::ComposeButton, MouseButton::Left) => Some(Action::RequestCompose),
         (HitTarget::SidebarTab { tab }, MouseButton::Left) => {
             Some(Action::SelectSidebarTab { tab: *tab })
         }

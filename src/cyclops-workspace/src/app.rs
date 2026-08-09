@@ -1923,6 +1923,7 @@ async fn handle_mouse(
                     return Ok(());
                 }
                 HitTarget::NewTabButton
+                | HitTarget::ComposeButton
                 | HitTarget::NewWorkspaceButton
                 | HitTarget::SidebarTab { .. }
                 | HitTarget::SidebarToggle

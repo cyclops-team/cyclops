@@ -35,6 +35,9 @@ pub enum HitTarget {
         window_id: String,
     },
     NewTabButton,
+    /// The tab strip's chat button: opens the composer, the mouse's half of
+    /// Ctrl+B @.
+    ComposeButton,
     SidebarRow {
         session_id: String,
         session: String,
@@ -203,7 +206,10 @@ pub fn motion_touches_hover_button(
             // already computed a hover for it, so that one button saw no
             // motion event and never lit.
             Some(
-                HitTarget::NewTabButton | HitTarget::NewWorkspaceButton | HitTarget::SidebarToggle
+                HitTarget::NewTabButton
+                    | HitTarget::ComposeButton
+                    | HitTarget::NewWorkspaceButton
+                    | HitTarget::SidebarToggle
             )
         )
     };
