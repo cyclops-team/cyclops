@@ -35,6 +35,23 @@ use crate::theme::{self, Paint};
 pub const SIDEBAR_COLLAPSE: &str = "◂";
 pub const SIDEBAR_EXPAND: &str = "▸";
 
+/// The rule a revealed resize handle draws down the panel's outer edge.
+/// Dashed rather than solid, so the handle never reads as a second border
+/// standing beside the canvas's own.
+const SIDEBAR_GRIP: &str = "┊";
+
+/// Columns at the panel's outer edge that answer as the resize handle: the
+/// divider column plus the pad column inside it. One column is a hard
+/// target for a mouse and both of these are blank, so the wider reach costs
+/// no content. Anything painted over them (the tab header's chips, the
+/// collapse chevron) pushes its hit later and still wins its own cells.
+///
+/// The resize itself is absolute — the edge goes wherever the pointer is
+/// (`app::handle_mouse`) — so a drag begun on the inner column snaps the
+/// panel one cell narrower on its first step. That column is fat-finger
+/// tolerance; the handle is drawn on the outer one, where there is no snap.
+const SIDEBAR_GRAB_WIDTH: u16 = 2;
+
 /// Render the workspace sidebar: the tab header, the selected tab's body,
 /// the shared footer, and the collapse chevron on its outer edge.
 pub fn paint_sidebar(
@@ -67,15 +84,19 @@ pub fn paint_sidebar(
     // Reserving it also keeps every row of the body on the column it has
     // always been on, border or no border.
     let inner = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
-    hits.push(
-        Rect::new(
-            area.x + area.width.saturating_sub(1),
-            area.y,
-            1,
-            area.height,
-        ),
-        HitTarget::SidebarDivider,
+    let edge = Rect::new(
+        area.x + area.width.saturating_sub(1),
+        area.y,
+        1,
+        area.height,
     );
+    let grab = Rect::new(
+        area.x + area.width.saturating_sub(SIDEBAR_GRAB_WIDTH),
+        area.y,
+        SIDEBAR_GRAB_WIDTH.min(area.width),
+        area.height,
+    );
+    hits.push(grab, HitTarget::SidebarDivider);
 
     // Two cells of breathing room keep workspace and agent names away from
     // the outer edge and the resize border.
@@ -133,18 +154,15 @@ pub fn paint_sidebar(
         }
     };
     paint_footer(inner, content, footer_y, buf, paint, hits, hover, clipped);
+    // The resize handle shows itself before the chevron takes its band, so
+    // the chevron stays the one thing painted on its own rows.
+    paint_resize_handle(buf, edge, grab, paint, hover, drag);
     // The collapse control sits centered on the panel's outer edge, on the
     // same row as the rail's chevron, so the control stays where the eye
     // left it when the panel goes; the column moves because the panel it
     // was attached to did. It takes a band of the resize divider and no
     // more: the handle still answers on every row outside the band, and
     // this hit is pushed last so the band wins its own rows.
-    let edge = Rect::new(
-        area.x + area.width.saturating_sub(1),
-        area.y,
-        1,
-        area.height,
-    );
     paint_toggle(
         buf,
         toggle_reach(edge),
@@ -154,6 +172,43 @@ pub fn paint_sidebar(
         hits,
         hover,
     );
+}
+
+/// Draw the resize handle down the panel's outer edge while the pointer is
+/// on it, or for as long as a resize drag runs.
+///
+/// Nothing at rest. A permanent rule here stood one column from the pane
+/// canvas's own border and read as two windows parked side by side, which
+/// is why the column is blank ground; but a handle nobody can see is not a
+/// handle either, and drag-resize shipped invisible because of it. So the
+/// edge answers the approach instead of advertising itself all the time.
+///
+/// The drag case is not redundant with the hover case: `app.hover` tracks
+/// plain motion, and once a button is down the pointer's events arrive as
+/// drags, so a handle keyed only on hover would go out the moment it was
+/// grabbed.
+fn paint_resize_handle(
+    buf: &mut Buffer,
+    edge: Rect,
+    grab: Rect,
+    paint: &Paint,
+    hover: Option<(u16, u16)>,
+    drag: Option<&DragState>,
+) {
+    let pointed = hover.is_some_and(|(col, row)| {
+        col >= grab.x && col < grab.x + grab.width && row >= grab.y && row < grab.y + grab.height
+    });
+    let resizing = drag.is_some_and(|drag| matches!(drag.target, DragTarget::Sidebar));
+    if !pointed && !resizing {
+        return;
+    }
+    let style = theme::pane_border_focused(paint);
+    for row in edge.y..edge.y + edge.height {
+        if let Some(cell) = buf.cell_mut((edge.x, row)) {
+            cell.set_symbol(SIDEBAR_GRIP);
+            cell.set_style(style);
+        }
+    }
 }
 
 /// The band of the panel's outer edge that answers as the collapse control,
@@ -657,6 +712,116 @@ mod tests {
 
     use super::*;
     use crate::render::test_support::{alt_test_theme_paint, flatten};
+
+    /// Paint one sidebar at the default width with a given pointer and drag,
+    /// and hand back the buffer plus the hit map.
+    const GRAB_TEST_HEIGHT: u16 = 14;
+
+    fn draw_with(hover: Option<(u16, u16)>, drag: Option<&DragState>) -> (Buffer, HitMap) {
+        let workspaces = vec![WorkspaceRow {
+            session_id: "$0".into(),
+            name: "cyclops".into(),
+            tab_count: 1,
+            window_ids: vec!["@0".into()],
+        }];
+        let expanded = std::collections::HashSet::from(["$0".to_string()]);
+        let mut term = Terminal::new(TestBackend::new(
+            crate::render::SIDEBAR_MIN_WIDTH,
+            GRAB_TEST_HEIGHT,
+        ))
+        .unwrap();
+        let mut hits = HitMap::default();
+        term.draw(|f| {
+            paint_sidebar(
+                &workspaces,
+                0,
+                "%0",
+                &expanded,
+                &[],
+                SidebarTab::Sessions,
+                &Record::new(),
+                f.area(),
+                f.buffer_mut(),
+                &Paint::for_test(),
+                &mut hits,
+                &DecorationSnapshot::default(),
+                hover,
+                drag,
+            );
+        })
+        .unwrap();
+        (term.backend().buffer().clone(), hits)
+    }
+
+    /// A body row of the panel's outer edge: below the tab header, above the
+    /// footer, and outside the band the collapse chevron claims. Derived
+    /// from the same function the painter uses, so the tests track the
+    /// control rather than restating its arithmetic.
+    fn a_row_the_chevron_leaves_alone() -> u16 {
+        let band = toggle_reach(Rect::new(0, 0, 1, GRAB_TEST_HEIGHT));
+        (1..GRAB_TEST_HEIGHT - 1)
+            .find(|y| *y < band.y || *y >= band.y + band.height)
+            .expect("a body row outside the chevron band")
+    }
+
+    /// The resize handle is invisible at rest and shows itself on approach.
+    ///
+    /// It shipped invisible: the drag worked on the panel's outer column,
+    /// that column painted blank ground, and the only line the eye could
+    /// see was the pane canvas's own border one column further out. So the
+    /// operator grabbed a border that focuses a pane and concluded the
+    /// sidebar does not resize.
+    ///
+    /// A row outside the chevron band, because the chevron already lights
+    /// the edge on its own rows and would mask the thing under test.
+    #[test]
+    fn the_resize_handle_appears_under_the_pointer_and_stays_up_through_the_drag() {
+        let width = crate::render::SIDEBAR_MIN_WIDTH;
+        let edge_x = width - 1;
+        let row = a_row_the_chevron_leaves_alone();
+
+        let (rest, _) = draw_with(None, None);
+        assert_eq!(
+            rest[(edge_x, row)].symbol(),
+            " ",
+            "the edge must stay blank until the pointer asks for it"
+        );
+
+        let (hot, hits) = draw_with(Some((edge_x, row)), None);
+        assert_eq!(hot[(edge_x, row)].symbol(), SIDEBAR_GRIP);
+        assert!(
+            matches!(hits.hit(edge_x, row), Some(HitTarget::SidebarDivider)),
+            "the revealed handle has to be the one the drag reads"
+        );
+
+        // Once the button is down the pointer reports drags, not motion, so
+        // a handle keyed only on hover would go out the moment it was
+        // grabbed.
+        let drag = DragState::on_down(DragTarget::Sidebar, edge_x, row);
+        let (held, _) = draw_with(None, Some(&drag));
+        assert_eq!(held[(edge_x, row)].symbol(), SIDEBAR_GRIP);
+    }
+
+    /// The pad column inside the edge answers as the handle too. One column
+    /// is a hard target with a mouse, and both of these are blank, so the
+    /// wider reach costs no content.
+    #[test]
+    fn the_resize_handle_is_two_columns_wide_below_the_header() {
+        let width = crate::render::SIDEBAR_MIN_WIDTH;
+        let row = a_row_the_chevron_leaves_alone();
+        let (_, hits) = draw_with(None, None);
+        for x in [width - 2, width - 1] {
+            assert!(
+                matches!(hits.hit(x, row), Some(HitTarget::SidebarDivider)),
+                "column {x} should grab the resize handle"
+            );
+        }
+        // And no further: the column inside the band is the body's.
+        assert!(!matches!(
+            hits.hit(width - 3, row),
+            Some(HitTarget::SidebarDivider)
+        ));
+    }
 
     /// The composer's button lives in the footer because the tab strip is
     /// a preference that can be off, and writing to an agent has nothing to

@@ -715,7 +715,9 @@ pub fn route_drag_click(target: &DragTarget) -> Option<Action> {
         DragTarget::Agent { pane_id, .. } => Some(Action::FocusPane {
             pane_id: pane_id.clone(),
         }),
-        DragTarget::Divider { .. } | DragTarget::Sidebar => None,
+        // A click on one of these is a click on empty chrome: a divider or
+        // a title bar has nothing to select.
+        DragTarget::Divider { .. } | DragTarget::Sidebar | DragTarget::Dialog => None,
     }
 }
 

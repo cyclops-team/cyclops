@@ -53,6 +53,7 @@ Default bindings are prefix-first (`Ctrl+B`, same shape as tmux):
 | `Ctrl+B` `W` / `K` | Rename / close workspace |
 | `Ctrl+B` `b` | Collapse or reopen the sidebar |
 | `Ctrl+B` `e` | Show the event stream (sidebar's Stream tab); press again for the session list back |
+| `Ctrl+B` `s` | Send a message to an agent |
 | `Ctrl+B` `?` | Open the scrollable keybinding reference |
 
 Hiding the tab bar ships with no chord: the app menu's `Tab bar` item is
@@ -144,9 +145,13 @@ tree and the event stream. The footer's `☰ menu` and `+` buttons stay put
 on both tabs. The two surfaces share one panel, so only one of them is on
 screen at a time.
 
-Drag the sidebar's right border to resize it, on either tab. The saved
-width is bounded to keep both sidebar and terminal useful: at most 42
-cells and never more than half the terminal.
+Drag the sidebar's outer edge to resize it, on either tab. The edge paints
+nothing at rest, so it does not stand as a second line beside the pane
+canvas's own border; move the pointer onto it and a `┊` handle appears
+down the whole column. The two rightmost columns of the panel answer the
+grab, not just the one the handle is drawn on. The saved width is bounded
+to keep both sidebar and terminal useful: at most 42 cells and never more
+than half the terminal.
 
 The `◂` chevron on the sidebar's outer edge, bottom corner, collapses
 the panel; the same click as `Ctrl+B` `b`. Collapsing leaves a one-column
@@ -186,6 +191,24 @@ directory with that name. An empty name uses the next numeric tab name.
 keyboard-first, mouse-clickable action model. Destructive confirmations use
 the same rule: Enter or click `↵ Confirm` to proceed, Escape or click
 `Esc Cancel` to back out.
+
+Every dialog can be moved. Press its top border or title row and drag: the
+card follows the pointer and stops at the screen edge, so its action row
+stays reachable. The position lasts as long as that dialog does; the next
+one opens centered.
+
+`Ctrl+B` `s`, or the `@` button in the tab strip or the sidebar's footer,
+opens the composer. The whole grammar is `@name` and then the message, taken
+literally: nothing after the name is re-split, so `fix issue #42` and
+`run make && test` arrive as typed. Enter sends. `Alt+Enter` breaks the
+line instead (`Shift+Enter` and `Ctrl+J` do the same, for terminals that
+report only one of them), and a pasted paragraph keeps its line breaks, so
+a message can be as long as it needs to be. The field grows to six rows and
+then scrolls its tail, keeping the cursor in view. The first line becomes
+the subject every listing shows; the body keeps everything. The dialog
+stays open across the send and reports the receipt where the hint was, then
+leaves `@name ` in the field so a second message to the same agent is one
+keystroke of setup.
 
 Right-click chooses the object under the pointer, even when it is not
 active:

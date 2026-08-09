@@ -127,7 +127,7 @@ pub(super) async fn execute(
                 .pane(&pane_id)
                 .and_then(|decoration| decoration.label.clone())
                 .unwrap_or_default();
-            app.dialog = Some(Dialog::NamePane {
+            app.open_dialog(Dialog::NamePane {
                 pane_id,
                 buffer,
                 error: None,
@@ -147,7 +147,7 @@ pub(super) async fn execute(
                 .and_then(|d| d.label.clone())
                 .map(|label| format!("@{label} "))
                 .unwrap_or_else(|| "@".to_string());
-            app.dialog = Some(Dialog::Compose {
+            app.open_dialog(Dialog::Compose {
                 buffer,
                 status: None,
                 sending: false,
@@ -160,7 +160,7 @@ pub(super) async fn execute(
         }
 
         Action::RequestNewTab => {
-            app.dialog = Some(Dialog::NewTab {
+            app.open_dialog(Dialog::NewTab {
                 buffer: String::new(),
             });
             Ok(Outcome::default())
@@ -177,7 +177,7 @@ pub(super) async fn execute(
             else {
                 return Ok(Outcome::default());
             };
-            app.dialog = Some(Dialog::RenameTab {
+            app.open_dialog(Dialog::RenameTab {
                 window_id: tab.window_id.clone(),
                 buffer: tab.name.clone(),
             });
@@ -211,7 +211,7 @@ pub(super) async fn execute(
             Ok(Outcome::reconcile())
         }
         Action::RequestRenameWorkspace { session } => {
-            app.dialog = Some(Dialog::RenameWorkspace {
+            app.open_dialog(Dialog::RenameWorkspace {
                 buffer: session.clone(),
                 session,
             });
@@ -221,7 +221,7 @@ pub(super) async fn execute(
             rename_workspace(app, client, session, name).await
         }
         Action::RequestCloseWorkspace { session } => {
-            app.dialog = Some(Dialog::ConfirmCloseWorkspace { session });
+            app.open_dialog(Dialog::ConfirmCloseWorkspace { session });
             Ok(Outcome::default())
         }
         Action::CloseWorkspace { session } => close_workspace(app, client, session).await,
@@ -304,7 +304,7 @@ pub(super) async fn execute(
             })
         }
         Action::ShowKeybinds => {
-            app.dialog = Some(Dialog::Keybinds {
+            app.open_dialog(Dialog::Keybinds {
                 scroll: 0,
                 rows: app.router.help(),
             });
@@ -316,7 +316,7 @@ pub(super) async fn execute(
             // `paint.theme` directly (see [`preview_selected_theme`]), so
             // the theme that is live right now rides beside the picker.
             app.theme_restore = Some(app.paint.theme.clone());
-            app.dialog = Some(Dialog::Themes {
+            app.open_dialog(Dialog::Themes {
                 selected: active.unwrap_or(0),
                 names,
                 active,
@@ -529,7 +529,7 @@ async fn close_pane(
     let already_confirmed = matches!(&app.dialog, Some(Dialog::ConfirmClosePane { pane_id: shown }) if *shown == pane_id);
     if !already_confirmed {
         if daemon::pane_has_agent(&app.home, &pane_id) {
-            app.dialog = Some(Dialog::confirm_close(pane_id));
+            app.open_dialog(Dialog::confirm_close(pane_id));
             return Ok(Outcome::default());
         }
     } else {
@@ -562,7 +562,7 @@ async fn close_tab(
             .flatten()
             .any(|pane| daemon::pane_has_agent(&app.home, &pane));
         if has_agent {
-            app.dialog = Some(Dialog::ConfirmCloseTab { window_id });
+            app.open_dialog(Dialog::ConfirmCloseTab { window_id });
             return Ok(Outcome::default());
         }
     } else {
@@ -1191,6 +1191,7 @@ mod tests {
             runtimes: RuntimeRegistry::default(),
             router: Router::new(default_bindings()),
             paint: Paint::for_test(),
+            dialog_offset: (0, 0),
             dialog: None,
             theme_restore: None,
             link_state: LinkState::Live,
@@ -2156,7 +2157,7 @@ mod tests {
         spawn_theme_reload_daemon(&home, "solar");
         let mut app = test_app(one_tab_model("s", "@0", &pane, "$0"), home.clone());
         app.theme_restore = Some(app.paint.theme.clone());
-        app.dialog = Some(Dialog::Themes {
+        app.open_dialog(Dialog::Themes {
             names: vec!["dark".into(), "solar".into()],
             selected: 1,
             active: Some(0),
@@ -2205,7 +2206,7 @@ mod tests {
         );
         let mut app = test_app(one_tab_model("s", "@0", &pane, "$0"), home.clone());
         app.theme_restore = Some(app.paint.theme.clone());
-        app.dialog = Some(Dialog::Themes {
+        app.open_dialog(Dialog::Themes {
             names: vec!["dark".into(), "solar".into()],
             selected: 1,
             active: Some(0),
@@ -2257,7 +2258,7 @@ mod tests {
         std::fs::write(home.join("config.toml"), "theme = \"dark\"\n").expect("config");
         let mut app = test_app(one_tab_model("s", "@0", "%0", "$0"), home.clone());
         app.theme_restore = Some(app.paint.theme.clone());
-        app.dialog = Some(Dialog::Themes {
+        app.open_dialog(Dialog::Themes {
             names: vec!["dark".into(), "solar".into()],
             selected: 1,
             active: Some(0),
@@ -2302,7 +2303,7 @@ mod tests {
         app.theme_restore = Some(app.paint.theme.clone());
         // The listing only offers loadable rows, so "broken" being a row
         // means the file broke while the picker was open.
-        app.dialog = Some(Dialog::Themes {
+        app.open_dialog(Dialog::Themes {
             names: vec!["broken".into(), "lunar".into(), "solar".into()],
             selected: 2,
             active: None,

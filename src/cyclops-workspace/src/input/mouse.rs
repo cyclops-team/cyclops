@@ -69,6 +69,9 @@ pub enum HitTarget {
     },
     DialogConfirm,
     DialogCancel,
+    /// The top border and title row of an open dialog: the rows that move
+    /// the box rather than answer it.
+    DialogTitleBar,
 }
 
 /// Geometry recorded during render for cell hit-testing.
@@ -200,16 +203,22 @@ pub fn motion_touches_hover_button(
     let on_button = |col: u16, row: u16| {
         matches!(
             hit_map.hit(col, row),
-            // The three controls rule 1 in `render/mod.rs` names: the tab
-            // strip's `+`, the sidebar footer's `+`, and the sidebar
+            // The controls rule 1 in `render/mod.rs` names: the tab strip's
+            // `+` and `@`, the sidebar footer's `+`, and the sidebar
             // chevron. `NewTabButton` was absent while `paint_tab_bar`
             // already computed a hover for it, so that one button saw no
             // motion event and never lit.
+            //
+            // The sidebar's resize handle is on the list for the same
+            // reason: it paints nothing at rest and reveals itself under
+            // the pointer, so it has no state to show at all without the
+            // motion that arrives here.
             Some(
                 HitTarget::NewTabButton
                     | HitTarget::ComposeButton
                     | HitTarget::NewWorkspaceButton
                     | HitTarget::SidebarToggle
+                    | HitTarget::SidebarDivider
             )
         )
     };

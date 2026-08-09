@@ -846,6 +846,8 @@ fn paint_drag_preview(drag: &DragState, buf: &mut Buffer, paint: &Paint) {
         DragTarget::Pane { .. } | DragTarget::Tab { .. } => "⇄",
         DragTarget::Workspace { .. } | DragTarget::Agent { .. } => "⇅",
         DragTarget::Sidebar => "↔",
+        // Free in both axes, unlike every other drag here.
+        DragTarget::Dialog => "✥",
     };
     if let Some(cell) = buf.cell_mut((x, y)) {
         cell.set_symbol(hint);

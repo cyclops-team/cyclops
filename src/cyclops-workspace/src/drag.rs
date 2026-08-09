@@ -30,6 +30,10 @@ pub enum DragTarget {
     },
     /// Resize the application sidebar, not a tmux pane.
     Sidebar,
+    /// Move the open dialog off whatever it is covering. Picked up by the
+    /// box's top border and title row; the rest of the card belongs to the
+    /// controls painted on it.
+    Dialog,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

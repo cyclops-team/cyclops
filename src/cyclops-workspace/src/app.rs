@@ -153,6 +153,12 @@ struct App {
     router: Router,
     paint: Paint,
     dialog: Option<Dialog>,
+    /// How far the open dialog has been dragged off its resting center, in
+    /// cells. Cleared by [`App::open_dialog`], so a box always opens where
+    /// the eye expects it and only stays moved for as long as it is the
+    /// same box. Held to what still moves the box on screen; see
+    /// [`crate::render::clamp_dialog_offset`].
+    dialog_offset: (i16, i16),
     /// The theme that was live when the theme picker opened; `Some` for
     /// exactly as long as the picker is. Selection moves preview the
     /// highlighted theme straight into `paint.theme`
@@ -488,6 +494,7 @@ pub async fn run_async() -> i32 {
         router: Router::new(bindings),
         paint,
         dialog: None,
+        dialog_offset: (0, 0),
         theme_restore: None,
         link_state: LinkState::Live,
         paused_panes: HashSet::new(),
@@ -1234,6 +1241,17 @@ fn reconnect_config(base: &ControlConfig, session: &str) -> ControlConfig {
 }
 
 impl App {
+    /// Put a dialog on screen at its resting center.
+    ///
+    /// Every open goes through here so the drag offset is cleared with it.
+    /// A box that reopened where the last one was dragged to would look
+    /// misplaced rather than moved: the operator moved that dialog, not
+    /// this one.
+    pub(crate) fn open_dialog(&mut self, dialog: Dialog) {
+        self.dialog = Some(dialog);
+        self.dialog_offset = (0, 0);
+    }
+
     fn is_visible_pane(&self, pane: &str) -> bool {
         pane_is_visible(self.model.active_tab(), pane)
     }
@@ -1736,12 +1754,30 @@ async fn handle_mouse(
             exec::preview_selected_theme(app);
             return Ok(());
         }
-        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            match app.hit_map.hit(col, row) {
-                Some(HitTarget::DialogConfirm) => dialog_confirm(app, client).await?,
-                Some(HitTarget::DialogCancel) => dialog_cancel(app),
-                _ => {}
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // A press ends any previous pickup, whether or not it
+                // starts a new one: a button released outside the terminal
+                // never arrives here as an Up, and a card still holding the
+                // pointer would then follow the next drag anywhere.
+                drop_dialog_drag(app);
+                match app.hit_map.hit(col, row) {
+                    Some(HitTarget::DialogConfirm) => dialog_confirm(app, client).await?,
+                    Some(HitTarget::DialogCancel) => dialog_cancel(app),
+                    // Picking the card up. Nothing moves until the pointer
+                    // does; the drags below carry it.
+                    Some(HitTarget::DialogTitleBar) => {
+                        app.drag = Some(DragState::on_down(DragTarget::Dialog, col, row));
+                    }
+                    _ => {}
+                }
             }
+            MouseEventKind::Drag(MouseButton::Left) => carry_dialog_drag(app, col, row),
+            MouseEventKind::Up(MouseButton::Left) => {
+                carry_dialog_drag(app, col, row);
+                drop_dialog_drag(app);
+            }
+            _ => {}
         }
         return Ok(());
     }
@@ -1982,7 +2018,11 @@ async fn handle_mouse(
                     }
                     return Ok(());
                 }
-                HitTarget::DialogConfirm | HitTarget::DialogCancel => return Ok(()),
+                // Dialog rows only ever reach the mouse handler's own
+                // dialog-is-open branch, which returns before this match.
+                HitTarget::DialogConfirm | HitTarget::DialogCancel | HitTarget::DialogTitleBar => {
+                    return Ok(())
+                }
             }
             if let Some(action) = action::route_mouse_click(&target, MouseButton::Left) {
                 let outcome = exec::execute(app, client, action).await?;
@@ -2045,12 +2085,59 @@ async fn handle_mouse(
     Ok(())
 }
 
+/// Carry an in-flight dialog drag to the pointer.
+///
+/// The offset accumulates from the last position the drag was applied at,
+/// not from where it started, because the offset is clamped to what still
+/// moves the box: measured from the start, a pointer that ran past the
+/// screen edge would build up travel the clamp threw away, and the box
+/// would not come back until the pointer had undone all of it.
+fn carry_dialog_drag(app: &mut App, col: u16, row: u16) {
+    let Some(drag) = app.drag.as_mut() else {
+        return;
+    };
+    if !matches!(drag.target, DragTarget::Dialog) {
+        return;
+    }
+    drag.on_move(col, row);
+    let (from_col, from_row) = drag.last_applied;
+    drag.last_applied = (col, row);
+    let wanted = (
+        app.dialog_offset.0.saturating_add(travel(from_col, col)),
+        app.dialog_offset.1.saturating_add(travel(from_row, row)),
+    );
+    let area = Rect::new(0, 0, app.term_size.0, app.term_size.1);
+    app.dialog_offset = match app.dialog.as_ref() {
+        Some(dialog) => crate::render::clamp_dialog_offset(dialog, area, wanted),
+        None => (0, 0),
+    };
+}
+
+/// One axis of pointer travel as a signed cell count.
+fn travel(from: u16, to: u16) -> i16 {
+    i16::try_from(i32::from(to) - i32::from(from)).unwrap_or(0)
+}
+
+/// Put the card down. Leaves every other drag alone: the dialog branch is
+/// the only place a dialog drag is created, and it must not swallow a pane
+/// or sidebar drag that a dialog opened on top of.
+fn drop_dialog_drag(app: &mut App) {
+    if app
+        .drag
+        .as_ref()
+        .is_some_and(|drag| matches!(drag.target, DragTarget::Dialog))
+    {
+        app.drag = None;
+    }
+}
+
 /// Commit a drag that crossed its move threshold: resolve the drop hit
 /// target under the release point through `action`'s routing, and execute
 /// whatever it resolves to. Only [`DragTarget::Pane`], `Tab`, `Workspace`,
 /// and `Agent` resolve here: a divider applies live during motion
-/// ([`apply_live_divider`]) and a sidebar-width drag already applied and
-/// persisted above.
+/// ([`apply_live_divider`]), a sidebar-width drag already applied and
+/// persisted above, and a dialog drag never reaches this function at all
+/// (an open dialog returns from its own branch of `handle_mouse`).
 ///
 /// `Workspace` is the one variant that does NOT resolve through a dropped-
 /// on hit target: [`resolve_workspace_slot_drop`] recomputes the exact
@@ -2086,7 +2173,9 @@ async fn commit_drag_drop(
             let order = agent_order_for_workspace(app, workspace_id);
             drop.and_then(|drop| action::resolve_agent_drop(workspace_id, order_key, &drop, &order))
         }
-        DragTarget::Divider { .. } | DragTarget::Sidebar => None,
+        // These three apply themselves as the pointer moves and have
+        // nothing left to resolve against whatever is under the release.
+        DragTarget::Divider { .. } | DragTarget::Sidebar | DragTarget::Dialog => None,
     };
     let Some(action) = action else {
         return Ok(());
@@ -2634,6 +2723,13 @@ async fn handle_dialog_key(
             let mut encoded = [0; 4];
             dialog::append_dialog_text(app.dialog.as_mut(), c.encode_utf8(&mut encoded));
         }
+        // Straight onto the buffer rather than through `append_dialog_text`:
+        // that one filters exactly the character being asked for here.
+        DialogKeyAction::Newline => {
+            if let Some(buffer) = app.dialog.as_mut().and_then(dialog::dialog_buffer_mut) {
+                buffer.push('\n');
+            }
+        }
         DialogKeyAction::Scroll(delta) => {
             match app.dialog.as_mut() {
                 Some(Dialog::Keybinds { scroll, .. }) => {
@@ -2777,6 +2873,7 @@ fn draw(
                     &app.paint,
                     &mut app.hit_map,
                     app.hover,
+                    app.dialog_offset,
                 );
             } else if !app.menu.is_open() {
                 if let Some(hc) = cursor {
@@ -2845,6 +2942,7 @@ mod tests {
             router: Router::new(crate::bindings::default_bindings()),
             paint: Paint::for_test(),
             dialog: None,
+            dialog_offset: (0, 0),
             theme_restore: None,
             link_state: LinkState::Live,
             paused_panes: HashSet::new(),
@@ -3470,6 +3568,50 @@ mod tests {
         );
 
         drop(daemon);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A dialog drag accumulates from the last position it was applied at,
+    /// and gives back the travel it spent against the screen edge.
+    ///
+    /// Measured from the drag's start instead, a pointer that ran off the
+    /// edge would keep banking travel the clamp discards, and the box would
+    /// sit still until the pointer had walked all of it back. This is the
+    /// bug the test is here to keep out.
+    #[test]
+    fn a_dialog_drag_does_not_bank_travel_it_spent_against_the_edge() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-dialog-drag");
+        let mut app = test_app(one_pane_model(), home.clone());
+        app.term_size = (80, 24);
+        app.open_dialog(Dialog::confirm_close("%0"));
+
+        let start = (40u16, 12u16);
+        app.drag = Some(DragState::on_down(DragTarget::Dialog, start.0, start.1));
+        carry_dialog_drag(&mut app, start.0 + 4, start.1 + 3);
+        assert_eq!(app.dialog_offset, (4, 3), "the box follows the pointer");
+
+        // Off the right edge and back. The clamp caps the offset on the way
+        // out; on the way back the box has to move immediately.
+        carry_dialog_drag(&mut app, 79, start.1 + 3);
+        let pinned = app.dialog_offset;
+        let area = Rect::new(0, 0, app.term_size.0, app.term_size.1);
+        let dialog = app.dialog.clone().expect("still open");
+        assert_eq!(
+            pinned,
+            crate::render::clamp_dialog_offset(&dialog, area, (i16::MAX, 3)),
+            "past the edge the offset is the clamp, not the travel"
+        );
+        carry_dialog_drag(&mut app, 78, start.1 + 3);
+        assert_eq!(
+            app.dialog_offset.0,
+            pinned.0 - 1,
+            "one cell back is one cell of movement"
+        );
+
+        // A fresh dialog opens where the eye expects it, not where the last
+        // one was left.
+        app.open_dialog(Dialog::confirm_close("%0"));
+        assert_eq!(app.dialog_offset, (0, 0));
         let _ = std::fs::remove_dir_all(&home);
     }
 

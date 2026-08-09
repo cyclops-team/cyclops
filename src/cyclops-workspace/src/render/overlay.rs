@@ -42,6 +42,157 @@ const DIALOG_ERROR_MAX_WIDTH: u16 = 68;
 /// Columns between two buttons on the action row.
 const DIALOG_BUTTON_GAP: u16 = 2;
 
+/// Rows a multi-line field grows to before it starts scrolling its tail.
+/// Six is a short paragraph: enough that a message reads as one thought,
+/// and not so many that the card takes the terminal it floats over.
+const FIELD_MAX_ROWS: u16 = 6;
+
+/// The rows a floating box is dragged by: its top border, and the title row
+/// under it. One border row is a hard target for a pointer, and the title
+/// row carries no control of its own, so claiming it costs nothing and
+/// doubles the reach.
+const DIALOG_GRAB_ROWS: u16 = 2;
+
+/// Move a centered box by however far the operator has dragged it, and keep
+/// it whole and on screen.
+///
+/// A box that could be dragged off the edge is a box whose action row can be
+/// put somewhere nobody can click, and Escape is then the only way out of a
+/// dialog that also has a Cancel button. So the offset stops at the edge
+/// rather than the box leaving through it.
+fn shift_on_screen(rect: Rect, area: Rect, offset: (i16, i16)) -> Rect {
+    let axis = |start: u16, span: u16, bound_start: u16, bound_span: u16, delta: i16| {
+        let slack = i32::from(bound_span.saturating_sub(span));
+        let low = i32::from(bound_start);
+        (i32::from(start) + i32::from(delta)).clamp(low, low + slack) as u16
+    };
+    Rect::new(
+        axis(rect.x, rect.width, area.x, area.width, offset.0),
+        axis(rect.y, rect.height, area.y, area.height, offset.1),
+        rect.width,
+        rect.height,
+    )
+}
+
+/// Record the rows that pick a floating box up, and light them while the
+/// pointer is on them so the box says it can be moved.
+fn paint_title_bar(
+    buf: &mut Buffer,
+    dialog_area: Rect,
+    paint: &Paint,
+    hits: &mut HitMap,
+    hover: Option<(u16, u16)>,
+) {
+    let grab = Rect::new(
+        dialog_area.x,
+        dialog_area.y,
+        dialog_area.width,
+        DIALOG_GRAB_ROWS.min(dialog_area.height),
+    );
+    let hovered = hover.is_some_and(|(col, row)| {
+        col >= grab.x && col < grab.x + grab.width && row >= grab.y && row < grab.y + grab.height
+    });
+    // The border alone, not the title row: lighting the row under it would
+    // restyle the title text and read as a selection rather than a handle.
+    if hovered {
+        let style = theme::dialog_primary(paint);
+        for col in dialog_area.x..dialog_area.x + dialog_area.width {
+            if let Some(cell) = buf.cell_mut((col, dialog_area.y)) {
+                cell.set_style(style);
+            }
+        }
+    }
+    hits.push(grab, HitTarget::DialogTitleBar);
+}
+
+/// `text` broken into the visual lines a field `width` columns wide shows,
+/// honouring the line breaks the composer's own chord inserts.
+///
+/// The one wrap the field has, so the rows the card is sized for and the
+/// rows it paints cannot disagree. [`wrapped_line_count`] cannot serve:
+/// it treats a newline as one more space, so a three-line message would
+/// size a one-line field.
+fn wrap_field(text: &str, width: u16) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.split('\n') {
+        let mut rest = line;
+        loop {
+            let (take, skip) = wrap_head(rest, usize::from(width));
+            lines.push(rest[..take].to_string());
+            rest = &rest[take + skip..];
+            if rest.is_empty() {
+                break;
+            }
+        }
+    }
+    lines
+}
+
+/// Rows a field needs to show `text` whole at `width`.
+fn field_rows(text: &str, width: u16) -> usize {
+    wrap_field(text, width).len().max(1)
+}
+
+/// The last `rows` visual lines of `text` wrapped to `width`, with the
+/// editing cursor on the final one.
+///
+/// The tail rather than the head: the cursor is at the end of the buffer,
+/// and a field that scrolled off the thing being typed would be worse than
+/// no field at all.
+fn field_tail(text: &str, width: u16, rows: u16) -> Vec<String> {
+    let rows = usize::from(rows.max(1));
+    let mut lines = wrap_field(text, width);
+    if lines.len() > rows {
+        lines.drain(..lines.len() - rows);
+    }
+    // The cursor rides the last line, and `input_tail` is what keeps it
+    // visible when that line alone is wider than the field.
+    if let Some(last) = lines.pop() {
+        lines.push(input_tail(&last, usize::from(width)));
+    }
+    lines
+}
+
+/// The byte length of the longest prefix of `text` that fits in `width`
+/// display columns. Always at least one character, so a glyph wider than
+/// the whole field advances instead of looping forever.
+fn input_head(text: &str, width: usize) -> usize {
+    let mut end = 0;
+    for (index, ch) in text.char_indices() {
+        let next = index + ch.len_utf8();
+        if Span::raw(&text[..next]).width() > width && end > 0 {
+            return end;
+        }
+        end = next;
+    }
+    end
+}
+
+/// Where to break `text` for a field `width` columns wide: how many bytes
+/// go on this line, and how many to skip before the next one.
+///
+/// Words are kept whole, because the field holds prose and a message split
+/// as `da / emon` reads as a rendering fault rather than as a wrap. A
+/// single word wider than the field has no break to take and gets the hard
+/// one; the skipped byte is the space the break replaced, which would
+/// otherwise open the next line with an indent.
+fn wrap_head(text: &str, width: usize) -> (usize, usize) {
+    let hard = input_head(text, width);
+    if hard == text.len() {
+        return (hard, 0);
+    }
+    if text[hard..].starts_with(' ') {
+        return (hard, 1);
+    }
+    match text[..hard].rfind(' ') {
+        Some(space) => (space, 1),
+        None => (hard, 0),
+    }
+}
+
 /// Display columns `text` occupies.
 fn text_width(text: &str) -> u16 {
     u16::try_from(Span::raw(text).width()).unwrap_or(u16::MAX)
@@ -112,8 +263,64 @@ fn dialog_parts(dialog: &Dialog) -> (&str, Option<&str>, Option<&str>, &'static 
     }
 }
 
-/// Paint a modal dialog centered in `area`, recording its buttons as hit
-/// regions. `hover` is the mouse cell; the button under it highlights.
+/// Where an open dialog's box lands before the operator's drag is applied.
+///
+/// The one dispatch from a dialog to its geometry, so the bound a drag is
+/// held to and the rect the paint uses cannot disagree about which shape a
+/// dialog has. `paint_dialog` reaches the same three functions for the
+/// extra row counts it also needs;
+/// `every_dialog_is_dragged_to_where_it_is_painted` is what keeps the two
+/// matches saying the same thing.
+pub fn dialog_rect(dialog: &Dialog, area: Rect) -> Option<Rect> {
+    match dialog {
+        Dialog::Keybinds { rows, .. } => keybind_dialog_geometry(rows.len(), area).map(|(r, _)| r),
+        Dialog::Themes { names, notice, .. } => {
+            let width = area.width.saturating_sub(4).min(48);
+            let notice_lines = themes_notice(names, notice.as_deref())
+                .map(|text| wrapped_line_count(text, width.saturating_sub(DIALOG_CHROME_WIDTH)))
+                .unwrap_or(0);
+            themes_dialog_geometry(names.len(), notice_lines, area).map(|(r, _)| r)
+        }
+        _ => {
+            let (title, input, hint, confirm_label) = dialog_parts(dialog);
+            let error = match dialog {
+                Dialog::NamePane { error, .. } => error.as_deref(),
+                _ => None,
+            };
+            plain_dialog_geometry(
+                title,
+                hint,
+                error,
+                confirm_label,
+                input.filter(|_| dialog.is_multiline()),
+                area,
+            )
+            .map(|(r, _)| r)
+        }
+    }
+}
+
+/// Hold a dialog drag to the offsets that actually move the box.
+///
+/// Past the screen edge [`shift_on_screen`] clamps the paint anyway, and an
+/// offset that kept accumulating out there would have to be dragged all the
+/// way back before the box moved again. A dialog too big for the terminal
+/// to host has nowhere to go, so its offset is zero.
+pub fn clamp_dialog_offset(dialog: &Dialog, area: Rect, offset: (i16, i16)) -> (i16, i16) {
+    let Some(rect) = dialog_rect(dialog, area) else {
+        return (0, 0);
+    };
+    let moved = shift_on_screen(rect, area, offset);
+    (
+        i16::try_from(i32::from(moved.x) - i32::from(rect.x)).unwrap_or(0),
+        i16::try_from(i32::from(moved.y) - i32::from(rect.y)).unwrap_or(0),
+    )
+}
+
+/// Paint a modal dialog centered in `area`, recording its buttons and its
+/// title bar as hit regions. `hover` is the mouse cell; the button under it
+/// highlights. `offset` is how far the operator has dragged the box off
+/// center by its title bar.
 pub fn paint_dialog(
     dialog: &Dialog,
     area: Rect,
@@ -121,9 +328,10 @@ pub fn paint_dialog(
     paint: &Paint,
     hits: &mut HitMap,
     hover: Option<(u16, u16)>,
+    offset: (i16, i16),
 ) {
     if let Dialog::Keybinds { scroll, rows } = dialog {
-        paint_keybinds_dialog(*scroll, rows, area, buf, paint, hits, hover);
+        paint_keybinds_dialog(*scroll, rows, area, buf, paint, hits, hover, offset);
         return;
     }
     if let Dialog::Themes {
@@ -143,6 +351,7 @@ pub fn paint_dialog(
             paint,
             hits,
             hover,
+            offset,
         );
         return;
     }
@@ -151,9 +360,18 @@ pub fn paint_dialog(
         Dialog::NamePane { error, .. } => error.as_deref(),
         _ => None,
     };
-    let Some(dialog_area) = plain_dialog_geometry(title, hint, error, confirm_label, area) else {
+    let multiline = dialog.is_multiline();
+    let Some((dialog_area, field_h)) = plain_dialog_geometry(
+        title,
+        hint,
+        error,
+        confirm_label,
+        input.filter(|_| multiline),
+        area,
+    ) else {
         return;
     };
+    let dialog_area = shift_on_screen(dialog_area, area, offset);
     clear_area(buf, dialog_area);
     let block = overlay_block(paint);
     let inner = block.inner(dialog_area);
@@ -174,29 +392,38 @@ pub fn paint_dialog(
         // The input field is inset from the dialog, but its editing cursor
         // starts at the field's first cell. No second, accidental indent.
         let field_y = inner.y + 2;
-        let field = Rect::new(left, field_y, usable_w, 1);
+        let field = Rect::new(left, field_y, usable_w, field_h);
         buf.set_style(field, theme::dialog_input(paint));
-        let visible = input_tail(input, field.width as usize);
-        super::overlay_text(
-            buf,
-            inner,
-            field.x,
-            field_y,
-            &visible,
-            theme::dialog_input(paint),
-        );
+        for (row, line) in field_tail(input, field.width, field_h).iter().enumerate() {
+            super::overlay_text(
+                buf,
+                inner,
+                field.x,
+                field_y + row as u16,
+                line,
+                theme::dialog_input(paint),
+            );
+        }
     }
     if let Some(error) = error {
-        let error_area = Rect::new(left, inner.y + 3, usable_w, inner.height.saturating_sub(4));
+        let error_y = inner.y + 2 + field_h;
+        let error_area = Rect::new(
+            left,
+            error_y,
+            usable_w,
+            inner.height.saturating_sub(error_y - inner.y + 1),
+        );
         Paragraph::new(error)
             .style(theme::dialog_error(paint))
             .wrap(Wrap { trim: true })
             .render(error_area, buf);
     }
     paint_dialog_buttons(buf, inner, paint, hits, hover, confirm_label);
+    paint_title_bar(buf, dialog_area, paint, hits, hover);
 }
 
-/// Where a plain dialog lands, or `None` when the terminal cannot host it.
+/// Where a plain dialog lands and how many rows its field gets, or `None`
+/// when the terminal cannot host it.
 ///
 /// Two pieces of copy are hard-clipped by `overlay_text` and so set the
 /// floor: the title, which is the dialog's question, and the action row,
@@ -204,13 +431,19 @@ pub fn paint_dialog(
 /// is asking, so under that width nothing is painted at all. The hint and
 /// the error never gate the box, because neither has to be cut: the hint
 /// drops, the error wraps.
+///
+/// `grow_for` is the buffer of a multi-line field, and is `None` for every
+/// single-line dialog. The field grows with what has been typed rather than
+/// opening at full height, so a one-line message still gets a one-line
+/// card.
 fn plain_dialog_geometry(
     title: &str,
     hint: Option<&str>,
     error: Option<&str>,
     confirm_label: &str,
+    grow_for: Option<&str>,
     area: Rect,
-) -> Option<Rect> {
+) -> Option<(Rect, u16)> {
     // 1. The floor: copy that cannot be cut, plus the box around it, and
     //    the card's own rows. Under either, refuse.
     let need_w = text_width(title)
@@ -232,18 +465,25 @@ fn plain_dialog_geometry(
         .saturating_add(DIALOG_CHROME_WIDTH);
     // The floor wins over the terminal cap, which step 1 proved it fits in.
     let w = want_w.max(DIALOG_MIN_WIDTH).min(area.width).max(need_w);
-    // 3. The error slot grows the card downward, as far as the terminal
-    //    allows and no further: the card itself never leaves the screen.
+    let usable_w = w.saturating_sub(DIALOG_CHROME_WIDTH);
+    // 3. The field and the error slot both grow the card downward, as far as
+    //    the terminal allows and no further: the card itself never leaves
+    //    the screen. The field is served first — it is what is being typed.
+    let mut slack = area.height - base_h;
+    let field_h = grow_for
+        .map(|text| u16::try_from(field_rows(text, usable_w)).unwrap_or(u16::MAX))
+        .unwrap_or(1)
+        .clamp(1, FIELD_MAX_ROWS)
+        .min(slack + 1);
+    slack -= field_h - 1;
     let error_lines = error
-        .map(|error| wrapped_line_count(error, w.saturating_sub(DIALOG_CHROME_WIDTH)))
+        .map(|error| wrapped_line_count(error, usable_w))
         .unwrap_or(0);
-    let error_h = u16::try_from(error_lines)
-        .unwrap_or(u16::MAX)
-        .min(area.height - base_h);
-    let h = base_h + error_h;
+    let error_h = u16::try_from(error_lines).unwrap_or(u16::MAX).min(slack);
+    let h = base_h + (field_h - 1) + error_h;
     let x = area.x + (area.width - w) / 2;
     let y = area.y + (area.height - h) / 2;
-    Some(Rect::new(x, y, w, h))
+    Some((Rect::new(x, y, w, h), field_h))
 }
 
 /// The two actions every dialog offers, in paint order. One list, so the
@@ -363,10 +603,12 @@ fn paint_keybinds_dialog(
     paint: &Paint,
     hits: &mut HitMap,
     hover: Option<(u16, u16)>,
+    offset: (i16, i16),
 ) {
     let Some((dialog_area, list_h)) = keybind_dialog_geometry(rows.len(), area) else {
         return;
     };
+    let dialog_area = shift_on_screen(dialog_area, area, offset);
     clear_area(buf, dialog_area);
     let block = overlay_block(paint);
     let inner = block.inner(dialog_area);
@@ -465,6 +707,7 @@ fn paint_keybinds_dialog(
             .saturating_add(inner.width.saturating_sub(progress_w + 2));
         super::overlay_text(buf, inner, x, footer_y, &progress, theme::menu_hint(paint));
     }
+    paint_title_bar(buf, dialog_area, paint, hits, hover);
 }
 
 /// Tallest the keybinds dialog may grow. The list scrolls, so the dialog
@@ -522,14 +765,9 @@ fn paint_themes_dialog(
     paint: &Paint,
     hits: &mut HitMap,
     hover: Option<(u16, u16)>,
+    offset: (i16, i16),
 ) {
-    // An empty listing has no rows to explain the hint against; the
-    // notice slot wraps, so the where-themes-come-from line goes there.
-    let notice = if names.is_empty() {
-        Some(copy::THEMES_EMPTY)
-    } else {
-        notice
-    };
+    let notice = themes_notice(names, notice);
     let width = area.width.saturating_sub(4).min(48);
     let notice_lines = notice
         .map(|text| wrapped_line_count(text, width.saturating_sub(DIALOG_CHROME_WIDTH)))
@@ -538,6 +776,7 @@ fn paint_themes_dialog(
     else {
         return;
     };
+    let dialog_area = shift_on_screen(dialog_area, area, offset);
     clear_area(buf, dialog_area);
     let block = overlay_block(paint);
     let inner = block.inner(dialog_area);
@@ -614,6 +853,18 @@ fn paint_themes_dialog(
     }
 
     paint_dialog_buttons(buf, inner, paint, hits, hover, copy::BUTTON_APPLY);
+    paint_title_bar(buf, dialog_area, paint, hits, hover);
+}
+
+/// What the theme picker's notice slot holds. An empty listing has no rows
+/// to explain the hint against, and the notice slot wraps, so the
+/// where-themes-come-from line goes there instead.
+fn themes_notice<'a>(names: &[String], notice: Option<&'a str>) -> Option<&'a str> {
+    if names.is_empty() {
+        Some(copy::THEMES_EMPTY)
+    } else {
+        notice
+    }
 }
 
 /// Same shape as [`keybind_dialog_geometry`]: fixed rows (title, hint,
@@ -1077,6 +1328,203 @@ mod tests {
         );
     }
 
+    /// Paint one dialog into a fixed terminal at a given drag offset.
+    fn draw_dialog(dialog: &Dialog, offset: (i16, i16)) -> (Buffer, HitMap) {
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut hits = HitMap::default();
+        term.draw(|f| {
+            paint_dialog(
+                dialog,
+                f.area(),
+                f.buffer_mut(),
+                &Paint::for_test(),
+                &mut hits,
+                None,
+                offset,
+            );
+        })
+        .unwrap();
+        (term.backend().buffer().clone(), hits)
+    }
+
+    fn composer(buffer: &str) -> Dialog {
+        Dialog::Compose {
+            buffer: buffer.into(),
+            status: None,
+            sending: false,
+        }
+    }
+
+    /// One line of message gets one row; a paragraph grows the field and
+    /// the card under it. A composer that opened at full height would make
+    /// the common case look like a form.
+    #[test]
+    fn the_composer_field_grows_with_what_has_been_typed() {
+        let area = Rect::new(0, 0, 80, 24);
+        let rows_for = |text: &str| {
+            let (_, field_h) = plain_dialog_geometry(
+                copy::COMPOSE_TITLE,
+                Some(copy::COMPOSE_HINT),
+                None,
+                copy::BUTTON_SEND,
+                Some(text),
+                area,
+            )
+            .expect("the composer fits");
+            field_h
+        };
+        assert_eq!(rows_for("@reviewer ship it"), 1);
+        assert_eq!(rows_for("@reviewer one\ntwo\nthree"), 3);
+        assert_eq!(
+            rows_for(&format!("@reviewer{}", "\nx".repeat(40))),
+            FIELD_MAX_ROWS,
+            "past the cap the field scrolls instead of taking the terminal"
+        );
+
+        // And the card grew with it, rather than the field painting over
+        // the action row.
+        let (short, _) = draw_dialog(&composer("@reviewer ship it"), (0, 0));
+        let (tall, _) = draw_dialog(&composer("@reviewer one\ntwo\nthree"), (0, 0));
+        assert_eq!(
+            row_of(&tall, "↵ Send") - row_of(&short, "↵ Send"),
+            1,
+            "two extra field rows push the action row down by two on a \
+             centered card, which moves its top up by one"
+        );
+    }
+
+    /// The field shows the end of the message, because that is where the
+    /// cursor is. A field that scrolled off what was being typed would be
+    /// worse than no field.
+    #[test]
+    fn a_long_message_shows_its_tail() {
+        let lines: Vec<String> = (0..12).map(|n| format!("line{n}")).collect();
+        let (buf, _) = draw_dialog(&composer(&format!("@rev {}", lines.join("\n"))), (0, 0));
+        let flat = flatten(&buf);
+        assert!(flat.contains("line11"), "the last line must be on screen");
+        assert!(
+            !flat.contains("line0 "),
+            "the head scrolled off, not the tail: {flat}"
+        );
+    }
+
+    /// Every dialog is picked up by its top border, moves with the pointer,
+    /// and stops at the screen edge with its action row still reachable.
+    #[test]
+    fn a_dialog_moves_by_its_title_bar_and_stops_at_the_edge() {
+        let area = Rect::new(0, 0, 80, 24);
+        for dialog in [
+            composer("@reviewer ship it"),
+            Dialog::confirm_close("%0"),
+            Dialog::Themes {
+                names: vec!["dark".into(), "light".into()],
+                selected: 0,
+                active: Some(0),
+                notice: None,
+            },
+            Dialog::Keybinds {
+                scroll: 0,
+                rows: Vec::new(),
+            },
+        ] {
+            let rest = dialog_rect(&dialog, area).expect("a full terminal hosts it");
+            let (_, hits) = draw_dialog(&dialog, (0, 0));
+            assert!(
+                matches!(
+                    hits.hit(rest.x + rest.width / 2, rest.y),
+                    Some(HitTarget::DialogTitleBar)
+                ),
+                "{dialog:?}: the top border must pick the box up"
+            );
+
+            // A modest drag lands exactly where it was dragged to. One cell,
+            // because the widest of these cards (the keybinds sheet) leaves
+            // only two columns of slack in an 80-column terminal.
+            assert_eq!(clamp_dialog_offset(&dialog, area, (1, 1)), (1, 1));
+
+            // A drag off the edge stops at it, so the offset the app keeps
+            // is the one that still moves the box. Anything larger would
+            // have to be dragged back before the box budged.
+            let (dx, dy) = clamp_dialog_offset(&dialog, area, (999, 999));
+            let landed = shift_on_screen(rest, area, (dx, dy));
+            assert_eq!(landed.x + landed.width, area.width);
+            assert_eq!(landed.y + landed.height, area.height);
+            assert_eq!(
+                clamp_dialog_offset(&dialog, area, (i16::MIN, i16::MIN)),
+                (
+                    -i16::try_from(rest.x).unwrap(),
+                    -i16::try_from(rest.y).unwrap()
+                ),
+                "{dialog:?}: the far corner is the origin, not off screen"
+            );
+        }
+    }
+
+    /// `dialog_rect` and `paint_dialog` each match on the dialog to pick a
+    /// geometry. This is what keeps the two matches saying the same thing:
+    /// a variant added to one and missed in the other drags a box that is
+    /// painted somewhere else.
+    #[test]
+    fn every_dialog_is_dragged_to_where_it_is_painted() {
+        let area = Rect::new(0, 0, 80, 24);
+        for dialog in [
+            Dialog::confirm_close("%0"),
+            Dialog::NewTab {
+                buffer: "review".into(),
+            },
+            Dialog::NamePane {
+                pane_id: "%0".into(),
+                buffer: "rev".into(),
+                error: Some("that name is taken".into()),
+            },
+            Dialog::RenameTab {
+                window_id: "@0".into(),
+                buffer: "build".into(),
+            },
+            Dialog::ConfirmCloseTab {
+                window_id: "@0".into(),
+            },
+            Dialog::RenameWorkspace {
+                session: "main".into(),
+                buffer: "main".into(),
+            },
+            Dialog::ConfirmCloseWorkspace {
+                session: "main".into(),
+            },
+            composer("@reviewer one\ntwo\nthree"),
+            Dialog::Keybinds {
+                scroll: 0,
+                rows: Vec::new(),
+            },
+            Dialog::Themes {
+                names: Vec::new(),
+                selected: 0,
+                active: None,
+                notice: None,
+            },
+            Dialog::Themes {
+                names: vec!["dark".into()],
+                selected: 0,
+                active: Some(0),
+                notice: Some("the daemon is not running".into()),
+            },
+        ] {
+            let rect = dialog_rect(&dialog, area).expect("a full terminal hosts it");
+            let (_, hits) = draw_dialog(&dialog, (0, 0));
+            let painted = hits
+                .regions()
+                .iter()
+                .find(|region| region.target == HitTarget::DialogTitleBar)
+                .map(|region| region.rect)
+                .unwrap_or_else(|| panic!("{dialog:?} painted no title bar"));
+            assert_eq!(
+                (painted.x, painted.y, painted.width),
+                (rect.x, rect.y, rect.width),
+                "{dialog:?}: dragged from one rect, painted at another"
+            );
+        }
+    }
+
     #[test]
     fn themes_dialog_marks_active_raises_selected_and_offers_apply() {
         let backend = TestBackend::new(60, 16);
@@ -1090,7 +1538,15 @@ mod tests {
             notice: None,
         };
         term.draw(|f| {
-            paint_dialog(&dialog, f.area(), f.buffer_mut(), &theme, &mut hits, None);
+            paint_dialog(
+                &dialog,
+                f.area(),
+                f.buffer_mut(),
+                &theme,
+                &mut hits,
+                None,
+                (0, 0),
+            );
         })
         .unwrap();
 
@@ -1141,7 +1597,15 @@ mod tests {
             notice: Some(copy::THEME_SAVED_NO_DAEMON.into()),
         };
         term.draw(|f| {
-            paint_dialog(&dialog, f.area(), f.buffer_mut(), &theme, &mut hits, None);
+            paint_dialog(
+                &dialog,
+                f.area(),
+                f.buffer_mut(),
+                &theme,
+                &mut hits,
+                None,
+                (0, 0),
+            );
         })
         .unwrap();
         let flat = flatten(term.backend().buffer());
@@ -1164,7 +1628,15 @@ mod tests {
             notice: None,
         };
         term.draw(|f| {
-            paint_dialog(&dialog, f.area(), f.buffer_mut(), &theme, &mut hits, None);
+            paint_dialog(
+                &dialog,
+                f.area(),
+                f.buffer_mut(),
+                &theme,
+                &mut hits,
+                None,
+                (0, 0),
+            );
         })
         .unwrap();
         let flat = flatten(term.backend().buffer());
@@ -1184,7 +1656,15 @@ mod tests {
             buffer: "revw".into(),
         };
         term.draw(|f| {
-            paint_dialog(&dialog, f.area(), f.buffer_mut(), &theme, &mut hits, None);
+            paint_dialog(
+                &dialog,
+                f.area(),
+                f.buffer_mut(),
+                &theme,
+                &mut hits,
+                None,
+                (0, 0),
+            );
         })
         .unwrap();
         let flat = flatten(term.backend().buffer());
@@ -1223,6 +1703,7 @@ mod tests {
                 &theme,
                 &mut hits,
                 None,
+                (0, 0),
             );
         })
         .unwrap();
@@ -1256,6 +1737,7 @@ mod tests {
                 &theme,
                 &mut hits,
                 None,
+                (0, 0),
             );
         })
         .unwrap();
@@ -1296,6 +1778,7 @@ mod tests {
                 &theme,
                 &mut hits,
                 None,
+                (0, 0),
             );
         })
         .unwrap();
@@ -1311,10 +1794,17 @@ mod tests {
             "scroll should move the first row away"
         );
         assert_ne!(buf[(4, 3)].bg, RtColor::Reset, "modal owns a themed ground");
-        assert!(matches!(
-            hits.regions().last().map(|region| &region.target),
-            Some(HitTarget::DialogCancel)
-        ));
+        // The close control answers the mouse, and nothing the painter
+        // pushes after it takes its cells. Stated as a hit test rather than
+        // "it was pushed last", so adding a control elsewhere on the card
+        // (the title bar did) does not read as a regression here.
+        let close = hits
+            .regions()
+            .iter()
+            .find(|region| region.target == HitTarget::DialogCancel)
+            .map(|region| region.rect)
+            .expect("the sheet registers its close control");
+        assert_eq!(hits.hit(close.x, close.y), Some(&HitTarget::DialogCancel));
     }
 
     #[test]
@@ -1348,7 +1838,15 @@ mod tests {
             buffer: "a-very-long-tab-name-that-must-scroll-to-the-visible-tail".into(),
         };
         term.draw(|f| {
-            paint_dialog(&dialog, f.area(), f.buffer_mut(), &theme, &mut hits, None);
+            paint_dialog(
+                &dialog,
+                f.area(),
+                f.buffer_mut(),
+                &theme,
+                &mut hits,
+                None,
+                (0, 0),
+            );
         })
         .unwrap();
 
@@ -1368,7 +1866,15 @@ mod tests {
         let dialog = Dialog::confirm_close("%0");
         let mut hits = HitMap::default();
         term.draw(|f| {
-            paint_dialog(&dialog, f.area(), f.buffer_mut(), &theme, &mut hits, None);
+            paint_dialog(
+                &dialog,
+                f.area(),
+                f.buffer_mut(),
+                &theme,
+                &mut hits,
+                None,
+                (0, 0),
+            );
         })
         .unwrap();
         let flat = flatten(term.backend().buffer());
@@ -1446,7 +1952,15 @@ mod tests {
             let mut hits = HitMap::default();
             term.draw(|f| {
                 if let Some(dialog) = &dialog {
-                    paint_dialog(dialog, f.area(), f.buffer_mut(), &theme, &mut hits, None);
+                    paint_dialog(
+                        dialog,
+                        f.area(),
+                        f.buffer_mut(),
+                        &theme,
+                        &mut hits,
+                        None,
+                        (0, 0),
+                    );
                 }
                 paint_menu(
                     &menu,
@@ -1493,6 +2007,7 @@ mod tests {
                 &theme,
                 &mut hits,
                 None,
+                (0, 0),
             );
         })
         .unwrap();
@@ -1532,6 +2047,7 @@ mod tests {
                 &theme,
                 &mut hits,
                 None,
+                (0, 0),
             );
         })
         .unwrap();
@@ -1578,6 +2094,7 @@ mod tests {
                     &theme,
                     &mut hits,
                     None,
+                    (0, 0),
                 );
             })
             .unwrap();
@@ -1623,6 +2140,7 @@ mod tests {
                 &theme,
                 &mut hits,
                 None,
+                (0, 0),
             );
         })
         .unwrap();
@@ -1656,6 +2174,7 @@ mod tests {
                     &theme,
                     &mut hits,
                     None,
+                    (0, 0),
                 );
             })
             .unwrap();
@@ -1688,14 +2207,16 @@ mod tests {
     #[test]
     fn plain_dialog_geometry_refuses_before_it_cuts() {
         let area = Rect::new(0, 0, 80, 24);
-        let card = plain_dialog_geometry(
+        let (card, field_h) = plain_dialog_geometry(
             copy::NEW_TAB_TITLE,
             Some(copy::NEW_TAB_HINT),
             None,
             copy::BUTTON_CREATE,
+            None,
             area,
         )
         .expect("a full terminal hosts the card");
+        assert_eq!(field_h, 1, "a single-line dialog keeps its one-row field");
         assert_eq!(
             card.height,
             DIALOG_INNER_ROWS + 2,
@@ -1713,6 +2234,7 @@ mod tests {
                 None,
                 None,
                 copy::BUTTON_CONFIRM,
+                None,
                 Rect::new(0, 0, 40, 24)
             )
             .is_none(),
@@ -1724,6 +2246,7 @@ mod tests {
                 Some(copy::NEW_TAB_HINT),
                 None,
                 copy::BUTTON_CREATE,
+                None,
                 Rect::new(0, 0, 80, DIALOG_INNER_ROWS + 1)
             )
             .is_none(),
@@ -1732,11 +2255,12 @@ mod tests {
 
         // A long error grows the card downward, never past the terminal.
         let error = "x ".repeat(200);
-        let card = plain_dialog_geometry(
+        let (card, _) = plain_dialog_geometry(
             copy::NAME_PANE_TITLE,
             Some(copy::NAME_PANE_HINT),
             Some(error.as_str()),
             copy::BUTTON_SAVE,
+            None,
             Rect::new(0, 0, 80, 12),
         )
         .expect("the card still fits");

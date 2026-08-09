@@ -39,10 +39,14 @@ pub enum Dialog {
     },
     /// Address a message from inside the workspace: `@reviewer ship it`.
     ///
-    /// One line, because the point is to be faster than leaving for a
-    /// shell. The recipient is part of the text rather than a separate
-    /// field so the whole thing can be typed without a Tab, and so a
-    /// prefilled `@name ` can be overtyped when it is the wrong name.
+    /// The recipient is part of the text rather than a separate field so
+    /// the whole thing can be typed without a Tab, and so a prefilled
+    /// `@name ` can be overtyped when it is the wrong name.
+    ///
+    /// The buffer may hold newlines ([`Dialog::is_multiline`]). Enter still
+    /// sends, because that is what the button says and what the muscle
+    /// expects from a one-line composer; a paragraph is reached through
+    /// [`newline_chord`] or by pasting one.
     Compose {
         buffer: String,
         /// What the send said, once it has said anything. The dialog stays
@@ -87,6 +91,34 @@ impl Dialog {
                 | Dialog::Compose { .. }
         )
     }
+
+    /// Whether this dialog's buffer may hold more than one line.
+    ///
+    /// Only the composer. The others name a tab, a pane or a workspace, and
+    /// tmux takes those as a single line: a newline in one is not a longer
+    /// name, it is a name with a control character in it.
+    pub fn is_multiline(&self) -> bool {
+        matches!(self, Dialog::Compose { .. })
+    }
+}
+
+/// Whether this key asks a multi-line field for a line break rather than a
+/// send.
+///
+/// Three chords, because no one of them survives every terminal. Alt+Enter
+/// arrives as ESC CR nearly everywhere. Shift+Enter is only distinguishable
+/// under the kitty keyboard protocol, and folds back into a plain Enter
+/// (a send) where it is not, which is the safe direction. Ctrl+J is the
+/// oldest of the three and the one that works over a bare tty; terminals
+/// that report its 0x0A as a plain Enter also fold back into a send.
+fn newline_chord(key: &KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Enter => key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT),
+        KeyCode::Char('j') | KeyCode::Char('J') => key.modifiers.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +127,9 @@ pub enum DialogKeyAction {
     Cancel,
     Backspace,
     Append(char),
+    /// Break the line in a multi-line field. Never a confirm: the only
+    /// dialogs that produce this are the ones Enter alone still sends.
+    Newline,
     Scroll(i16),
     ScrollStart,
     ScrollEnd,
@@ -132,6 +167,9 @@ pub fn dialog_key_action(dialog: &Dialog, key: &KeyEvent) -> DialogKeyAction {
     let text_key = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
     match key.code {
         KeyCode::Esc => DialogKeyAction::Cancel,
+        // Ahead of both Enter and Char, or Ctrl+J would append a 'j' and
+        // Alt+Enter would send.
+        _ if dialog.is_multiline() && newline_chord(key) => DialogKeyAction::Newline,
         KeyCode::Enter => DialogKeyAction::Confirm,
         KeyCode::Backspace if dialog.has_input() => DialogKeyAction::Backspace,
         KeyCode::Char(c) if dialog.has_input() && text_key => DialogKeyAction::Append(c),
@@ -151,8 +189,14 @@ pub fn dialog_buffer_mut(dialog: &mut Dialog) -> Option<&mut String> {
     }
 }
 
-/// Add printable pasted text to an input dialog. Line controls belong to a
-/// pane paste, never to a tmux tab or session name.
+/// Add pasted text to an input dialog.
+///
+/// Line breaks survive into a multi-line field and are dropped everywhere
+/// else: a tab or session name is one line to tmux, so a newline in one is
+/// not a longer name but a name with a control character in it. Every other
+/// control character is dropped in both cases. CRLF and a bare CR both
+/// normalise to `\n`, so a paste from a Windows editor does not arrive as a
+/// blank line between every line.
 pub fn append_dialog_text(dialog: Option<&mut Dialog>, text: &str) -> bool {
     let Some(dialog) = dialog else {
         return false;
@@ -160,11 +204,21 @@ pub fn append_dialog_text(dialog: Option<&mut Dialog>, text: &str) -> bool {
     if let Dialog::NamePane { error, .. } = dialog {
         *error = None;
     }
+    let multiline = dialog.is_multiline();
     let Some(buffer) = dialog_buffer_mut(dialog) else {
         return false;
     };
     let before = buffer.len();
-    buffer.extend(text.chars().filter(|ch| !ch.is_control()));
+    if multiline {
+        let normalised = text.replace("\r\n", "\n").replace('\r', "\n");
+        buffer.extend(
+            normalised
+                .chars()
+                .filter(|ch| *ch == '\n' || !ch.is_control()),
+        );
+    } else {
+        buffer.extend(text.chars().filter(|ch| !ch.is_control()));
+    }
     buffer.len() != before
 }
 
@@ -380,6 +434,84 @@ mod tests {
         assert_eq!(move_theme_selection(0, 1, 3), 1);
         assert_eq!(move_theme_selection(2, 1, 3), 2);
         assert_eq!(move_theme_selection(0, 1, 0), 0);
+    }
+
+    fn composer(buffer: &str) -> Dialog {
+        Dialog::Compose {
+            buffer: buffer.into(),
+            status: None,
+            sending: false,
+        }
+    }
+
+    /// Enter sends and the newline chords break the line. Which one of the
+    /// three a terminal reports is not something the composer can choose,
+    /// so all three have to mean the same thing.
+    #[test]
+    fn the_composer_breaks_its_line_without_giving_up_enter() {
+        let dialog = composer("@reviewer ship it");
+        let key = |code, mods| KeyEvent::new(code, mods);
+
+        assert_eq!(
+            dialog_key_action(&dialog, &key(KeyCode::Enter, KeyModifiers::empty())),
+            DialogKeyAction::Confirm,
+            "a plain Enter still sends"
+        );
+        for mods in [KeyModifiers::ALT, KeyModifiers::SHIFT] {
+            assert_eq!(
+                dialog_key_action(&dialog, &key(KeyCode::Enter, mods)),
+                DialogKeyAction::Newline,
+                "{mods:?}+Enter should break the line"
+            );
+        }
+        assert_eq!(
+            dialog_key_action(&dialog, &key(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            DialogKeyAction::Newline,
+            "Ctrl+J is the chord that survives a bare tty"
+        );
+    }
+
+    /// A name is one line to tmux. The chords that break a composer line
+    /// must do nothing in the dialogs that name something.
+    #[test]
+    fn a_name_field_has_no_newline_chord() {
+        let dialog = Dialog::NewTab {
+            buffer: "review".into(),
+        };
+        assert_eq!(
+            dialog_key_action(&dialog, &KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            DialogKeyAction::Confirm,
+        );
+        assert_eq!(
+            dialog_key_action(
+                &dialog,
+                &KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)
+            ),
+            DialogKeyAction::Ignore,
+        );
+    }
+
+    /// A pasted paragraph reaches the recipient as a paragraph. Only the
+    /// line breaks survive: a paste carrying a tab or an escape is still
+    /// text the field has no way to show.
+    #[test]
+    fn a_composer_paste_keeps_its_paragraph() {
+        let mut dialog = composer("@reviewer ");
+        assert!(append_dialog_text(
+            Some(&mut dialog),
+            "first line\r\nsecond line\rthird\tline\u{7}"
+        ));
+        let Dialog::Compose { buffer, .. } = &dialog else {
+            unreachable!()
+        };
+        assert_eq!(buffer, "@reviewer first line\nsecond line\nthirdline");
+
+        let parsed = parse_compose(buffer).expect("addressed");
+        assert_eq!(
+            parsed.subject, "first line",
+            "the subject is the first line"
+        );
+        assert_eq!(parsed.body, "first line\nsecond line\nthirdline");
     }
 
     #[test]

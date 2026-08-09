@@ -184,7 +184,17 @@ pub const COMPOSE_TITLE: &str = "Send a message";
 /// the create button's hint and the "+N more" count, and a phrase that has
 /// to be truncated teaches nothing.
 pub const SIDEBAR_COMPOSE_HINT: &str = "send";
-pub const COMPOSE_HINT: &str = "@name then your message · Enter sends · Esc closes";
+/// The grammar, then the two keys that decide what Enter does.
+///
+/// This line is the widest thing on the card and so sets its width, which
+/// is why it dropped "Esc closes" to make room: the action row two rows
+/// below paints `Esc Cancel`, so the key is still on screen, and keeping
+/// both would have grown the box by 21 columns.
+///
+/// Alt+Enter stands for all three newline chords. Naming the fallbacks
+/// would cost more width than it teaches, and a reader who reaches for
+/// Shift+Enter or Ctrl+J finds it works anyway.
+pub const COMPOSE_HINT: &str = "@name then your message · Enter sends · Alt+Enter new line";
 pub const BUTTON_SEND: &str = "Send";
 
 /// In flight. Named, because a workspace with several agents open should
