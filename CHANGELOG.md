@@ -7,6 +7,47 @@ versions are unreleased until admin cuts a tag.
 
 ### Added (v5)
 
+- Agent hooks install themselves. Detecting an agent and hearing from it
+  are different things, and only the first worked out of the box: a fresh
+  install wrote detection manifests and no hooks, so every pane was
+  recognized, no turn edge was ever reported, and every delivery settled
+  for screen evidence instead of the verified check. `cyclops hooks
+  install` did not close it either, staging a file under `$CYCLOPS_HOME`
+  and refusing every vendor directory, which left roughly fifteen manual
+  steps and more for Codex. The installer now passes `--wire-hooks`, and
+  where they land differs per vendor: Claude reads hooks only from the
+  settings file it is launched with, so each pane gets its own and nothing
+  under `~/.claude` is touched; Codex takes `$CODEX_HOME/hooks.json` at
+  user level, because a project-local one does not load until the
+  directory is trusted and that dialog cannot be answered in a
+  non-interactive run; Antigravity takes `~/.agents/hooks.json`; Cursor
+  takes `~/.cursor/hooks.json`. Cyclops merges around what is already
+  there and keeps the operator's handlers in order, copies the original to
+  `hooks.json.before-cyclops` before the first edit and never again, and a
+  second run writes nothing. Opt-in, and only the installer opts in:
+  `--setup-only` on its own touches no agent configuration, and
+  `CYCLOPS_NO_VENDOR_HOOKS=1` declines it.
+- A pane says who its hooks report as. `CYCLOPS_AGENT` was documented and
+  covered by tests with nothing anywhere setting it. `cyclops start
+  --agents` now sets it per pane, as tmux `-e` at creation, which is what
+  makes one shared vendor config correct for a fleet: Codex and
+  Antigravity each read a single file, so a label baked into either would
+  make every pane report as one agent. It is derived from the label and
+  never saved, so renaming a pane and rebuilding gives it the new name
+  rather than the one it had.
+- A composer in the workspace. `Ctrl+B s`, or the chat button beside the
+  tab strip's `+`, opens a one-line composer: `@reviewer gateway.rs:120
+  drops the burst path`, Enter, and the receipt comes back in the same
+  words `cyclops send` prints. The grammar is `@name` and then the rest,
+  and the rest is never re-read, which is why this is a dialog and not the
+  shell function it nearly shipped as. Measured against a real shell,
+  `fix issue #42` arrived as `fix issue`, `run make && test` delivered
+  `run make` and ran `test`, and `why is x*y broken?` aborted on a glob.
+  Those exact strings are now a test. The send runs off the draw loop on a
+  deadline of its own, because the daemon holds a send's answer for the
+  acknowledgement window and the shared 250ms socket deadline would report
+  a timeout on a message that was delivered.
+
 - Motion. Four things fade, all of them chrome the workspace owns and none
   of them a cell tmux owns: a pane border taking or losing focus (120ms),
   an agent's status ink (120ms), the attention eye arriving (320ms), and
@@ -44,6 +85,44 @@ versions are unreleased until admin cuts a tag.
   and only the first is automatic.
 
 ### Fixed (v5)
+
+- Codex and Antigravity read idle for an entire turn. Both manifests
+  ordered `screen_working` below their composer idle rules, and evaluation
+  takes the first match after sorting by descending priority, so the rule
+  that never fired was the one that says the agent is busy. Neither CLI
+  clears its composer while it works, so the idle rule always won. Not
+  cosmetic: idle is in `[injection].safe_states`, so a pane in the middle
+  of a generation looked safe to paste into. `cursor.toml` was written
+  against this exact defect and names it in its own regression test;
+  Cursor got the fix and a fixture, and these two never did. Measured live
+  at 120x40: Codex 0.147.0 paints `• Working (0s • esc to interrupt)` with
+  its ghost composer still two lines below, and spelled the hint `Esc to
+  interrupt` while the wire says `esc`, so that clause could never fire on
+  a case-sensitive match. Antigravity was worse, matching nothing a
+  running turn paints: the only mid-turn indicator is a braille spinner
+  with `Generating...` or `Running`, and the `▸ Thought for` it did carry
+  is a post-turn summary that persists across turns. Both now sit at 1100
+  and key on a spinner prefix rather than a bare status word. The new
+  bodies are registered in `EVER_SHIPPED_FNV64`, without which the seeder
+  does not recognize them as its own and every existing home keeps the
+  manifest with the bug.
+- The parity check waited on a sleep rather than a fact. A delivery's ACK
+  tier is fixed at send time from what the daemon believes is in the pane,
+  and screen tier is terminal, so a send issued too early can never become
+  verified no matter how long anything waits afterwards. What guarded that
+  window was `sleep 4`, true on the machine that measured it and not on a
+  loaded runner. It was covering two events: the stand-in's read loop had
+  not started (tmux returns from `respawn-pane` when it has forked, not
+  when the new process is reading), and the daemon had not yet ticked its
+  1Hz subscription. The first scaled with load and is now waited for; the
+  second stays a constant, but one tied to the tick rate rather than to
+  machine speed.
+- The parity check stopped discarding the evidence. Most of its commands
+  run as `cmd > "$OUT" 2>&1`, and under `set -e` a nonzero exit skips the
+  line that prints `$OUT` before the trap deletes the whole scratch root.
+  Three CI failures in a row carried no content but `exit code 1`. The
+  trap now prints the failing command's own output and the nested rigs'
+  daemon logs.
 
 - The sidebar collapse control was a one-cell button in the panel's bottom
   corner while the collapsed rail lit its whole column. The chevron now
