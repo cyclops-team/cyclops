@@ -247,8 +247,8 @@ card follows the pointer and stops at the screen edge, so its action row
 stays reachable. The position lasts as long as that dialog does; the next
 one opens centered.
 
-`Ctrl+B` `s`, or the `@` button in the tab strip or the sidebar's footer,
-opens the composer. The whole grammar is `@name` and then the message, taken
+`Ctrl+B` `s`, or the `@` button in the sidebar's footer, opens the
+composer. The whole grammar is `@name` and then the message, taken
 literally: nothing after the name is re-split, so `fix issue #42` and
 `run make && test` arrive as typed. Enter sends. `Alt+Enter` breaks the
 line instead (`Shift+Enter` and `Ctrl+J` do the same, for terminals that
