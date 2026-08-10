@@ -43,6 +43,7 @@ mod tab_bar;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color as RtColor, Modifier, Style};
+use ratatui::text::Span;
 
 use crate::drag::{DragState, DragTarget};
 use crate::runtime::{Color, GridCell};
@@ -50,16 +51,32 @@ use crate::theme::Paint;
 
 pub use canvas::{paint_window, tmux_client_size, HostCursor, WindowPaintCtx, PANE_GRIP};
 pub use overlay::{clamp_dialog_offset, keybind_max_scroll, paint_dialog, paint_menu, MenuChecks};
-pub use sidebar::{paint_sidebar, paint_sidebar_rail, SIDEBAR_COLLAPSE, SIDEBAR_EXPAND};
+pub use sidebar::{
+    paint_sidebar, paint_sidebar_rail, paint_sidebar_resize_feedback, SIDEBAR_COLLAPSE,
+    SIDEBAR_EXPAND,
+};
 pub use stream::{event_stream_rows, EventRow};
 pub use tab_bar::paint_tab_bar;
 
 /// A chrome region's height in the tab bar. It never grows: the row is a
 /// strip, not a panel.
 const TAB_BAR_HEIGHT: u16 = 1;
-/// Narrowest a readable sidebar can be: below this, workspace and agent
-/// names truncate into noise.
-pub(crate) const SIDEBAR_MIN_WIDTH: u16 = 22;
+/// The floor a sidebar can be dragged to. Below it there is nowhere left to
+/// cut: the panel would be all chrome and no content, so collapsing to the
+/// one-column rail is the real "smaller than this," not a thinner panel.
+/// At the floor itself the panel still shows every control whole — the
+/// full "☰menu" and `+` fit the footer, both tab chips paint
+/// (ellipsized), and a workspace or agent name keeps a few cells before
+/// its own ellipsis — so it keeps doing its job in less room rather than
+/// degenerating into noise. A terminal narrow enough for the half-width
+/// cap in `clamp_sidebar_width` to undercut this floor can still produce
+/// a thinner panel, which is what the narrowest paint paths (the footer's
+/// glyph-only menu button) remain for.
+pub(crate) const SIDEBAR_MIN_WIDTH: u16 = 14;
+/// The width a fresh install opens the sidebar at. The minimum above is no
+/// longer this width — it is how far an operator may narrow the panel by
+/// dragging, not where it starts.
+pub(crate) const SIDEBAR_DEFAULT_WIDTH: u16 = 24;
 /// Widest a sidebar may grow before it starts crowding the pane canvas it
 /// exists to introduce.
 const SIDEBAR_MAX_WIDTH: u16 = 42;
@@ -152,8 +169,18 @@ pub fn clamp_sidebar_width(requested: u16, terminal_width: u16) -> u16 {
 
 /// The sidebar width a live drag to `column` would commit, bounded the same
 /// way a resting preference is.
+///
+/// The handle is the pane canvas's own left border now (`app::draw`,
+/// `sidebar::SIDEBAR_GRAB_WIDTH`), and that border sits exactly on the
+/// column the sidebar's width already treats as one past its last — the
+/// same column `chrome_areas_for` hands back as `canvas.x`. So the column
+/// under the pointer already IS the width, with no plus-one: a drag begun
+/// on the border lands snap-free. A drag begun one cell short, on the
+/// sidebar's own edge (`SIDEBAR_GRAB_WIDTH`'s fat-finger tolerance),
+/// still snaps the panel one cell narrower on its first step, same as
+/// before this column stopped being the primary handle.
 pub fn sidebar_width_for_column(column: u16, terminal_width: u16) -> u16 {
-    clamp_sidebar_width(column.saturating_add(1), terminal_width)
+    clamp_sidebar_width(column, terminal_width)
 }
 
 /// The width to restore when a sidebar-resize drag is cancelled: `None` for
@@ -171,6 +198,51 @@ fn overlay_text(buf: &mut Buffer, bounds: Rect, x: u16, y: u16, text: &str, styl
     }
     let width = (bounds.x + bounds.width - x) as usize;
     buf.set_stringn(x, y, text, width, style);
+}
+
+/// `overlay_text`'s sibling for anything long enough to outgrow a narrow
+/// sidebar: text that overflows the space from `x` to `bounds`'s right edge
+/// ends in `…` instead of being hard-clipped mid-word. A workspace or agent
+/// name that used to chop into an unreadable stub now reads "my-proj…", the
+/// same way a browser tab or a file manager shortens a name that does not
+/// fit.
+///
+/// Unicode-width aware, the same way the rest of this module measures text
+/// (`Span::raw(...).width()`): the fit check and the truncation budget are
+/// both in display columns, not bytes or chars, and the cut point never
+/// lands inside a wide glyph's own pair of cells — a glyph that would not
+/// fit whole is dropped whole, and `…` takes its place.
+fn overlay_text_ellipsized(buf: &mut Buffer, bounds: Rect, x: u16, y: u16, text: &str, style: Style) {
+    if y < bounds.y || y >= bounds.y + bounds.height || x < bounds.x || x >= bounds.x + bounds.width
+    {
+        return;
+    }
+    let available = (bounds.x + bounds.width - x) as usize;
+    if Span::raw(text).width() <= available {
+        overlay_text(buf, bounds, x, y, text, style);
+        return;
+    }
+    if available == 1 {
+        buf.set_stringn(x, y, "…", 1, style);
+        return;
+    }
+    // Keep whole chars up to the budget the trailing `…` reserves for
+    // itself, so the cut always lands on a char boundary and a wide glyph
+    // that would land half in, half out is skipped rather than split.
+    let budget = available - 1;
+    let mut kept_width = 0usize;
+    let mut kept_bytes = 0usize;
+    for ch in text.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if kept_width + w > budget {
+            break;
+        }
+        kept_width += w;
+        kept_bytes += ch.len_utf8();
+    }
+    let mut shown = text[..kept_bytes].to_string();
+    shown.push('…');
+    buf.set_stringn(x, y, &shown, available, style);
 }
 
 fn cell_style(cell: &GridCell, base: Style, palette: Option<&[RtColor; 16]>) -> Style {
@@ -716,15 +788,20 @@ mod tests {
         assert_eq!(clamp_sidebar_width(100, 200), SIDEBAR_MAX_WIDTH);
         assert_eq!(clamp_sidebar_width(100, 50), 25);
         assert_eq!(sidebar_width_for_column(30, 50), 25);
+        // Away from the clamp's edges, the column IS the width — no
+        // plus-one. The handle sits on the border column the width already
+        // treats as its own last-plus-one, so mapping it straight through
+        // is what makes a drag begun on that border snap-free.
+        assert_eq!(sidebar_width_for_column(30, 200), 30);
     }
 
     #[test]
     fn chrome_canvas_excludes_sidebar_and_tab_bar() {
-        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, true);
-        assert_eq!(areas.sidebar, Some(Rect::new(0, 0, 22, 50)));
+        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, SIDEBAR_MIN_WIDTH, true);
+        assert_eq!(areas.sidebar, Some(Rect::new(0, 0, SIDEBAR_MIN_WIDTH, 50)));
         assert_eq!(areas.rail, None, "an open panel needs no rail");
-        assert_eq!(areas.tab_bar, Rect::new(22, 0, 178, 1));
-        assert_eq!(areas.canvas, Rect::new(22, 1, 178, 49));
+        assert_eq!(areas.tab_bar, Rect::new(SIDEBAR_MIN_WIDTH, 0, 200 - SIDEBAR_MIN_WIDTH, 1));
+        assert_eq!(areas.canvas, Rect::new(SIDEBAR_MIN_WIDTH, 1, 200 - SIDEBAR_MIN_WIDTH, 49));
     }
 
     /// The collapsed shape: no panel rectangle, a one-column rail in its
@@ -746,9 +823,12 @@ mod tests {
     /// taken, whatever the workspace holds.
     #[test]
     fn a_hidden_tab_bar_gives_the_canvas_its_row() {
-        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, 22, false);
+        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, SIDEBAR_MIN_WIDTH, false);
         assert_eq!(areas.tab_bar.height, 0);
-        assert_eq!(areas.canvas, Rect::new(22, 0, 178, 50));
+        assert_eq!(
+            areas.canvas,
+            Rect::new(SIDEBAR_MIN_WIDTH, 0, 200 - SIDEBAR_MIN_WIDTH, 50)
+        );
     }
 
     /// Both chrome edges gone at once: the rail keeps its column, the bar
@@ -811,11 +891,53 @@ mod tests {
         assert_eq!(blend(&plain, Style::new(), Style::new(), 0.5), Style::new());
     }
 
+    /// `overlay_text_ellipsized`'s own contract, apart from any caller: a
+    /// fit paints exactly as given, an overflow keeps whole chars up to the
+    /// budget and ends in `…`, a one-column budget is the ellipsis by
+    /// itself, and a wide glyph that would not fit whole inside the budget
+    /// is dropped whole rather than split into an unpaired half-cell.
+    #[test]
+    fn overlay_text_ellipsized_fits_unchanged_or_ends_in_an_ellipsis() {
+        let read = |buf: &Buffer, w: u16| -> String {
+            (0..w).map(|x| buf[(x, 0)].symbol().to_string()).collect()
+        };
+
+        let bounds = Rect::new(0, 0, 5, 1);
+        let mut buf = Buffer::empty(bounds);
+        overlay_text_ellipsized(&mut buf, bounds, 0, 0, "hi", Style::new());
+        assert_eq!(read(&buf, 5), "hi   ", "a fit paints unchanged");
+
+        let mut buf = Buffer::empty(bounds);
+        overlay_text_ellipsized(&mut buf, bounds, 0, 0, "hello world", Style::new());
+        assert_eq!(read(&buf, 5), "hell…", "overflow ends in an ellipsis");
+
+        let one = Rect::new(0, 0, 1, 1);
+        let mut buf = Buffer::empty(one);
+        overlay_text_ellipsized(&mut buf, one, 0, 0, "hello", Style::new());
+        assert_eq!(read(&buf, 1), "…", "a one-column budget is the ellipsis alone");
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let empty_bounds = Rect::new(0, 0, 0, 1);
+        overlay_text_ellipsized(&mut buf, empty_bounds, 0, 0, "hello", Style::new());
+        assert_eq!(read(&buf, 1), " ", "no columns at all paints nothing");
+
+        // "视" is two columns wide; a 3-column budget can hold "a" plus the
+        // ellipsis but not "a视" plus one, so "视" must be dropped whole
+        // rather than truncated into a single stray cell.
+        let three = Rect::new(0, 0, 3, 1);
+        let mut buf = Buffer::empty(three);
+        overlay_text_ellipsized(&mut buf, three, 0, 0, "a视z", Style::new());
+        assert_eq!(read(&buf, 3), "a… ", "a wide glyph is dropped whole, never split");
+    }
+
     #[test]
     fn cancelling_a_sidebar_drag_restores_its_starting_width() {
+        // The pointer's own column is the width now (no plus-one — see
+        // `sidebar_width_for_column`), so a drag that started at column 27
+        // restores to width 27, not 28.
         let mut drag = DragState::on_down(DragTarget::Sidebar, 27, 5);
         drag.on_move(38, 5);
-        assert_eq!(sidebar_width_on_cancel(&drag, 100), Some(28));
+        assert_eq!(sidebar_width_on_cancel(&drag, 100), Some(27));
 
         let tab = DragState::on_down(
             DragTarget::Tab {

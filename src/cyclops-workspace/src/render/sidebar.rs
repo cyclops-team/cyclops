@@ -35,22 +35,26 @@ use crate::theme::{self, Paint};
 pub const SIDEBAR_COLLAPSE: &str = "◂";
 pub const SIDEBAR_EXPAND: &str = "▸";
 
-/// The rule a revealed resize handle draws down the panel's outer edge.
-/// Dashed rather than solid, so the handle never reads as a second border
-/// standing beside the canvas's own.
-const SIDEBAR_GRIP: &str = "┊";
-
-/// Columns at the panel's outer edge that answer as the resize handle: the
-/// divider column plus the pad column inside it. One column is a hard
-/// target for a mouse and both of these are blank, so the wider reach costs
-/// no content. Anything painted over them (the tab header's chips, the
-/// collapse chevron) pushes its hit later and still wins its own cells.
+/// The one column at the panel's own outer edge that still answers as the
+/// resize handle. The handle itself moved: it used to be this hidden
+/// column, revealed as a dashed rule only once the pointer found it, one
+/// cell short of the pane canvas's own visible border — which is exactly
+/// why operators never found it. The primary handle is that border now
+/// (`app::draw` pushes `HitTarget::SidebarDivider` over the canvas's
+/// leftmost column right after `paint_window`, so it wins the column from
+/// the pane frame beneath it), and this column is what is left behind: one
+/// cell of fat-finger tolerance for a drag that starts a hair short of the
+/// border. `paint_sidebar` pushes this column's hit here, before the
+/// collapse chevron's own hit, so the chevron still wins the band it
+/// claims (`paint_toggle`).
 ///
-/// The resize itself is absolute — the edge goes wherever the pointer is
-/// (`app::handle_mouse`) — so a drag begun on the inner column snaps the
-/// panel one cell narrower on its first step. That column is fat-finger
-/// tolerance; the handle is drawn on the outer one, where there is no snap.
-const SIDEBAR_GRAB_WIDTH: u16 = 2;
+/// The resize itself is absolute — the sidebar's edge lands on the column
+/// under the pointer (`render::sidebar_width_for_column`) — so a drag
+/// begun on this tolerance column, one cell short of the border, snaps the
+/// panel one cell narrower on its first step. A drag begun on the border
+/// itself is snap-free: the pointer is already riding the column the width
+/// maps to.
+const SIDEBAR_GRAB_WIDTH: u16 = 1;
 
 /// Render the workspace sidebar: the tab header, the selected tab's body,
 /// the shared footer, and the collapse chevron on its outer edge.
@@ -79,8 +83,11 @@ pub fn paint_sidebar(
     // nothing between them, which reads as two windows parked side by side
     // rather than one workspace. Panel ground runs up to the canvas now.
     //
-    // The column is still reserved: it is the resize divider, and a handle
-    // buried under a row's fill is one the operator cannot see to grab.
+    // The column is still reserved: it is fat-finger tolerance for the
+    // resize handle, which now lives one column further out on the pane
+    // canvas's own visible border (see `SIDEBAR_GRAB_WIDTH` and
+    // `paint_sidebar_resize_feedback`), and a reserved column buried under
+    // a row's fill would be as hard to grab as the old hidden one was.
     // Reserving it also keeps every row of the body on the column it has
     // always been on, border or no border.
     let inner = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
@@ -154,9 +161,11 @@ pub fn paint_sidebar(
         }
     };
     paint_footer(inner, content, footer_y, buf, paint, hits, hover, clipped);
-    // The resize handle shows itself before the chevron takes its band, so
-    // the chevron stays the one thing painted on its own rows.
-    paint_resize_handle(buf, edge, grab, paint, hover, drag);
+    // Nothing paints the resize handle here anymore: the handle is the
+    // pane canvas's own border now, one column out, and `app::draw` recolors
+    // it (`paint_sidebar_resize_feedback`) in its own pass, after
+    // `paint_window` has drawn that border for this frame. This panel only
+    // still owns the tolerance column's hit target (`grab`, pushed above).
     // The collapse control sits centered on the panel's outer edge, on the
     // same row as the rail's chevron, so the control stays where the eye
     // left it when the panel goes; the column moves because the panel it
@@ -174,38 +183,62 @@ pub fn paint_sidebar(
     );
 }
 
-/// Draw the resize handle down the panel's outer edge while the pointer is
-/// on it, or for as long as a resize drag runs.
+/// Recolor the pane canvas's own left border to show it doubles as the
+/// sidebar's resize handle: while the pointer is near it, or for as long as
+/// a resize drag runs.
 ///
-/// Nothing at rest. A permanent rule here stood one column from the pane
-/// canvas's own border and read as two windows parked side by side, which
-/// is why the column is blank ground; but a handle nobody can see is not a
-/// handle either, and drag-resize shipped invisible because of it. So the
-/// edge answers the approach instead of advertising itself all the time.
+/// This replaces the old dashed rule that used to reveal itself one column
+/// short of that border. The rule shipped invisible in practice — the eye
+/// only ever found the canvas's own border beside it, grabbed that, and
+/// focused a pane instead of resizing anything — so the handle moved onto
+/// the border operators already reach for. That means feedback is no
+/// longer drawing a hidden line into blank ground; it is recoloring a line
+/// that was already there, which is why this only ever touches `Style`
+/// (`cell.set_style`) and never `cell.set_symbol`: the pane frame's own
+/// glyphs (`canvas::BORDER_FOCUSED`/`BORDER_REST`) have to survive a resize
+/// exactly as drawn, or the box the operator is mid-drag on visibly breaks.
 ///
-/// The drag case is not redundant with the hover case: `app.hover` tracks
-/// plain motion, and once a button is down the pointer's events arrive as
-/// drags, so a handle keyed only on hover would go out the moment it was
-/// grabbed.
-fn paint_resize_handle(
+/// `divider` is the canvas's leftmost column — the same rect `app::draw`
+/// pushes as `HitTarget::SidebarDivider` right after `paint_window`, passed
+/// here unchanged. The column immediately to its left is the sidebar's own
+/// outer edge, still `SIDEBAR_GRAB_WIDTH` wide as fat-finger tolerance and
+/// still answering the same hit target (`paint_sidebar`'s own `grab`); a
+/// pointer resting there is aiming at this same handle, so it lights the
+/// same cells rather than nothing.
+///
+/// Nothing at rest, same as before: the drag case is not redundant with the
+/// hover case, because `app.hover` tracks plain motion and once a button is
+/// down the pointer's events arrive as drags, so a handle keyed only on
+/// hover would go out the moment it was grabbed.
+pub fn paint_sidebar_resize_feedback(
     buf: &mut Buffer,
-    edge: Rect,
-    grab: Rect,
+    divider: Rect,
     paint: &Paint,
     hover: Option<(u16, u16)>,
     drag: Option<&DragState>,
 ) {
-    let pointed = hover.is_some_and(|(col, row)| {
-        col >= grab.x && col < grab.x + grab.width && row >= grab.y && row < grab.y + grab.height
-    });
+    if divider.width == 0 || divider.height == 0 {
+        return;
+    }
+    // The sidebar's own edge column, one cell inside the divider — the
+    // tolerance column `SIDEBAR_GRAB_WIDTH` reserves in `paint_sidebar`.
+    let grab = Rect::new(divider.x.saturating_sub(1), divider.y, 1, divider.height);
+    let inside = |rect: Rect| {
+        hover.is_some_and(|(col, row)| {
+            col >= rect.x
+                && col < rect.x + rect.width
+                && row >= rect.y
+                && row < rect.y + rect.height
+        })
+    };
+    let pointed = inside(divider) || inside(grab);
     let resizing = drag.is_some_and(|drag| matches!(drag.target, DragTarget::Sidebar));
     if !pointed && !resizing {
         return;
     }
     let style = theme::pane_border_focused(paint);
-    for row in edge.y..edge.y + edge.height {
-        if let Some(cell) = buf.cell_mut((edge.x, row)) {
-            cell.set_symbol(SIDEBAR_GRIP);
+    for row in divider.y..divider.y + divider.height {
+        if let Some(cell) = buf.cell_mut((divider.x, row)) {
             cell.set_style(style);
         }
     }
@@ -327,39 +360,95 @@ fn paint_tab_header(
     decoration: &DecorationSnapshot,
 ) {
     let row = Rect::new(inner.x, inner.y, inner.width, 1);
-    let mut spans = vec![Span::styled(" ", theme::chrome_panel(paint))];
-    let mut x = inner.x + 1.min(inner.width);
     let right = inner.x + inner.width;
-    // Chips sit flush against each other: at the 22-column minimum both
-    // labels plus the rollup fill the row exactly, and a narrower sidebar
-    // clips from the right rather than dropping a chip.
-    for (chip, label) in [
+    let lead = 1.min(inner.width);
+    let chips = [
         (SidebarTab::Sessions, copy::SIDEBAR_TAB_SESSIONS),
         (SidebarTab::Stream, copy::SIDEBAR_TAB_STREAM),
-    ] {
+    ];
+    let full_widths = chips.map(|(_, label)| {
+        u16::try_from(Span::raw(format!(" {label} ").as_str()).width()).unwrap_or(u16::MAX)
+    });
+    let full_total = full_widths
+        .iter()
+        .fold(lead, |total, w| total.saturating_add(*w));
+
+    if inner.width >= full_total {
+        // Both full chips, plus the lead space, fit: today's rendering,
+        // unchanged. Painted as one `Paragraph` of spans so a wide sidebar
+        // never pays the ellipsis tax it has no need for.
+        let mut spans = vec![Span::styled(" ", theme::chrome_panel(paint))];
+        let mut x = inner.x + lead;
+        for ((chip, label), w) in chips.into_iter().zip(full_widths) {
+            let style = if chip == tab {
+                theme::tab_active(paint)
+            } else {
+                theme::tab_inactive(paint)
+            };
+            let text = format!(" {label} ");
+            if x < right {
+                hits.push(
+                    Rect::new(x, row.y, w.min(right - x), 1),
+                    HitTarget::SidebarTab { tab: chip },
+                );
+            }
+            spans.push(Span::styled(text, style));
+            x = x.saturating_add(w);
+        }
+        if decoration.workspace_needs_attention() {
+            spans.push(Span::styled(
+                " ◉",
+                theme::attention_eye(paint)
+                    .patch(paint.bg_token(cyclops_theme::tokens::CHROME_PANEL)),
+            ));
+        }
+        Paragraph::new(Line::from(spans)).render(row, buf);
+        return;
+    }
+
+    // Too narrow for both full chips: paint the lead space, then split
+    // whatever is left evenly between the two chips (the first keeps the
+    // odd cell) and ellipsize each label inside its own share, rather than
+    // letting the row clip the second chip clean off. Each chip is now
+    // painted as a filled rect rather than a span, because its background
+    // has to run the whole width of its share even where the ellipsized
+    // label falls short of it.
+    buf.set_style(Rect::new(row.x, row.y, lead, 1), theme::chrome_panel(paint));
+    let remaining = inner.width.saturating_sub(lead);
+    let first_share = remaining.div_ceil(2);
+    let shares = [first_share, remaining.saturating_sub(first_share)];
+    let mut x = inner.x + lead;
+    for ((chip, label), share) in chips.into_iter().zip(shares) {
+        if share == 0 {
+            continue;
+        }
         let style = if chip == tab {
             theme::tab_active(paint)
         } else {
             theme::tab_inactive(paint)
         };
-        let text = format!(" {label} ");
-        let w = u16::try_from(Span::raw(text.as_str()).width()).unwrap_or(u16::MAX);
-        if x < right {
-            hits.push(
-                Rect::new(x, row.y, w.min(right - x), 1),
-                HitTarget::SidebarTab { tab: chip },
-            );
-        }
-        spans.push(Span::styled(text, style));
-        x = x.saturating_add(w);
+        let chip_rect = Rect::new(x, row.y, share, 1);
+        buf.set_style(chip_rect, style);
+        hits.push(chip_rect, HitTarget::SidebarTab { tab: chip });
+        // Both cells of padding when the share can hold them; the leading
+        // one goes first when it can't, because the label starting flush
+        // with the chip's own edge is the smaller loss of the two.
+        let (text_x, avail) = if share >= 3 {
+            (x + 1, share - 2)
+        } else {
+            (x, share.saturating_sub(1).max(1))
+        };
+        let bounds = Rect::new(text_x, row.y, avail, 1);
+        super::overlay_text_ellipsized(buf, bounds, text_x, row.y, label, style);
+        x = x.saturating_add(share);
     }
-    if decoration.workspace_needs_attention() {
-        spans.push(Span::styled(
-            " ◉",
-            theme::attention_eye(paint).patch(paint.bg_token(cyclops_theme::tokens::CHROME_PANEL)),
-        ));
+    // The rollup only when real room is left over, never crushed flush
+    // against the second chip's own edge.
+    if decoration.workspace_needs_attention() && right.saturating_sub(x) >= 2 {
+        let rollup_style =
+            theme::attention_eye(paint).patch(paint.bg_token(cyclops_theme::tokens::CHROME_PANEL));
+        super::overlay_text(buf, row, x, row.y, " ◉", rollup_style);
     }
-    Paragraph::new(Line::from(spans)).render(row, buf);
 }
 
 /// The Sessions tab's body: workspace rows, their expanded agent rows, and
@@ -404,7 +493,7 @@ fn paint_session_tree(
     // Same reasoning as the pane notice line (`canvas::paint_notice`):
     // chrome that appears and expires must not move what is around it.
     if !decoration.online {
-        super::overlay_text(
+        super::overlay_text_ellipsized(
             buf,
             content,
             content.x,
@@ -443,7 +532,7 @@ fn paint_session_tree(
         let row = Rect::new(inner.x, y, inner.width, 1);
         buf.set_style(row, style);
         let grip = if dragging { "⇅ " } else { "" };
-        super::overlay_text(
+        super::overlay_text_ellipsized(
             buf,
             content,
             content.x,
@@ -497,7 +586,7 @@ fn paint_session_tree(
                 super::overlay_text(buf, content, x, y, status.glyph, status_style);
                 x = x.saturating_add(2);
             }
-            super::overlay_text(buf, content, x, y, name, name_style);
+            super::overlay_text_ellipsized(buf, content, x, y, name, name_style);
             let order_key = DecorationSnapshot::agent_order_key(agent);
             hits.push(
                 row,
@@ -554,7 +643,36 @@ fn paint_footer(
     if inner.height < 2 {
         return;
     }
-    let menu_width = u16::try_from(Span::raw(copy::APP_MENU_BUTTON).width())
+    let plus = " + ";
+    let plus_width = u16::try_from(Span::raw(plus).width())
+        .unwrap_or(u16::MAX)
+        .min(inner.width);
+    // The button block rides the panel's own right edge, not the content
+    // inset: only the reserved divider column stands between the create
+    // button and the pane border. The inset is breathing room for names
+    // and the menu label; a control block that hung two pad cells short
+    // of the edge read as misplaced rather than padded.
+    let plus_x = inner
+        .x
+        .saturating_add(inner.width.saturating_sub(plus_width));
+    // When the full label would run into the create button's cells the
+    // menu shrinks to its own leading glyph — read off the real label so
+    // the two copies can never drift apart — still the same control, one
+    // cell wide, same style, same hit target shape.
+    let full_menu_width =
+        u16::try_from(Span::raw(copy::APP_MENU_BUTTON).width()).unwrap_or(u16::MAX);
+    let menu_glyph = copy::APP_MENU_BUTTON
+        .chars()
+        .next()
+        .map(String::from)
+        .unwrap_or_default();
+    let menu_narrow = plus_x.saturating_sub(content.x) < full_menu_width;
+    let menu_text: &str = if menu_narrow {
+        &menu_glyph
+    } else {
+        copy::APP_MENU_BUTTON
+    };
+    let menu_width = u16::try_from(Span::raw(menu_text).width())
         .unwrap_or(u16::MAX)
         .min(content.width);
     super::overlay_text(
@@ -562,20 +680,13 @@ fn paint_footer(
         content,
         content.x,
         footer_y,
-        copy::APP_MENU_BUTTON,
+        menu_text,
         theme::sidebar_label(paint),
     );
     hits.push(
         Rect::new(content.x, footer_y, menu_width, 1),
         HitTarget::AppMenu,
     );
-    let plus = " + ";
-    let plus_width = u16::try_from(Span::raw(plus).width())
-        .unwrap_or(u16::MAX)
-        .min(content.width);
-    let plus_x = content
-        .x
-        .saturating_add(content.width.saturating_sub(plus_width));
     // The composer's button, immediately left of the create button.
     //
     // It lives here rather than only on the tab strip because the strip is
@@ -585,7 +696,7 @@ fn paint_footer(
     let chat = " @ ";
     let chat_width = u16::try_from(Span::raw(chat).width())
         .unwrap_or(u16::MAX)
-        .min(content.width);
+        .min(inner.width);
     // The footer drops this button before it drops the note beside it.
     //
     // Three things compete for one row and the narrow sidebar cannot hold
@@ -647,7 +758,7 @@ fn paint_footer(
         if note_width < gutter {
             super::overlay_text(
                 buf,
-                content,
+                inner,
                 chat_x.saturating_sub(note_width),
                 footer_y,
                 &note,
@@ -657,7 +768,7 @@ fn paint_footer(
     }
     super::overlay_text(
         buf,
-        content,
+        inner,
         plus_x,
         footer_y,
         plus,
@@ -674,7 +785,7 @@ fn paint_footer(
     if show_chat {
         super::overlay_text(
             buf,
-            content,
+            inner,
             chat_x,
             footer_y,
             chat,
@@ -764,61 +875,112 @@ mod tests {
             .expect("a body row outside the chevron band")
     }
 
-    /// The resize handle is invisible at rest and shows itself on approach.
+    /// The resize handle is the pane canvas's own left border now, not a
+    /// rule drawn into the sidebar's blank edge. `paint_sidebar_resize_feedback`
+    /// recolors that border's cells — never their glyphs — while the
+    /// pointer is near it or a resize drag runs, and leaves it alone at
+    /// rest.
     ///
-    /// It shipped invisible: the drag worked on the panel's outer column,
-    /// that column painted blank ground, and the only line the eye could
-    /// see was the pane canvas's own border one column further out. So the
-    /// operator grabbed a border that focuses a pane and concluded the
-    /// sidebar does not resize.
-    ///
-    /// A row outside the chevron band, because the chevron already lights
-    /// the edge on its own rows and would mask the thing under test.
+    /// The old handle shipped invisible: the drag lived on the panel's
+    /// outer column, that column painted blank ground, and the only line
+    /// the eye could see was the canvas's own border one column further
+    /// out. So the operator grabbed a border that focuses a pane and
+    /// concluded the sidebar does not resize. The fix puts the handle on
+    /// the border itself, rather than drawing a better-hidden line.
     #[test]
-    fn the_resize_handle_appears_under_the_pointer_and_stays_up_through_the_drag() {
-        let width = crate::render::SIDEBAR_MIN_WIDTH;
-        let edge_x = width - 1;
-        let row = a_row_the_chevron_leaves_alone();
+    fn the_resize_feedback_recolors_the_canvas_border_without_touching_its_glyphs() {
+        let divider = Rect::new(20, 0, 1, GRAB_TEST_HEIGHT);
+        let paint = Paint::for_test();
+        let row = 3;
 
-        let (rest, _) = draw_with(None, None);
-        assert_eq!(
-            rest[(edge_x, row)].symbol(),
-            " ",
-            "the edge must stay blank until the pointer asks for it"
+        // Stands in for the pane frame's own border paint (`canvas.rs`):
+        // whatever glyph the frame drew there must survive the feedback
+        // pass untouched, since only `Style` may change.
+        let buffer_with = |hover: Option<(u16, u16)>, drag: Option<&DragState>| {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 24, GRAB_TEST_HEIGHT));
+            for y in 0..GRAB_TEST_HEIGHT {
+                if let Some(cell) = buf.cell_mut((divider.x, y)) {
+                    cell.set_symbol("│");
+                    cell.set_style(theme::pane_border(&paint));
+                }
+            }
+            paint_sidebar_resize_feedback(&mut buf, divider, &paint, hover, drag);
+            buf
+        };
+
+        // `Cell::style()` always reports a concrete `fg`/`bg`/`underline_color`
+        // (Reset where nothing was ever set), so comparing it against a bare
+        // `Style` built by a theme function — which only sets the fields it
+        // cares about — never matches on the untouched fields. `fg` is the
+        // one field both `pane_border` and `pane_border_focused` set, and the
+        // one this helper ever changes, so it is what these assertions read.
+        let fg = |buf: &Buffer, x: u16, y: u16| buf[(x, y)].style().fg;
+        assert_ne!(
+            theme::pane_border(&paint).fg,
+            theme::pane_border_focused(&paint).fg,
+            "the two styles must actually differ, or the checks below prove nothing"
         );
 
-        let (hot, hits) = draw_with(Some((edge_x, row)), None);
-        assert_eq!(hot[(edge_x, row)].symbol(), SIDEBAR_GRIP);
-        assert!(
-            matches!(hits.hit(edge_x, row), Some(HitTarget::SidebarDivider)),
-            "the revealed handle has to be the one the drag reads"
+        let rest = buffer_with(None, None);
+        assert_eq!(
+            fg(&rest, divider.x, row),
+            theme::pane_border(&paint).fg,
+            "at rest the border keeps its own color until the pointer asks for it"
+        );
+
+        let hot = buffer_with(Some((divider.x, row)), None);
+        assert_eq!(
+            hot[(divider.x, row)].symbol(),
+            "│",
+            "the border's own glyph must survive — only its style may change"
+        );
+        assert_eq!(
+            fg(&hot, divider.x, row),
+            theme::pane_border_focused(&paint).fg,
+            "hovering the border recolors it to the handle's color"
+        );
+
+        // The tolerance column, one cell inside the border, must light the
+        // border too: a pointer resting there is still aiming at this
+        // handle (see `SIDEBAR_GRAB_WIDTH`).
+        let tolerant = buffer_with(Some((divider.x - 1, row)), None);
+        assert_eq!(
+            fg(&tolerant, divider.x, row),
+            theme::pane_border_focused(&paint).fg,
+            "the sidebar's own edge column must light the canvas border too"
         );
 
         // Once the button is down the pointer reports drags, not motion, so
         // a handle keyed only on hover would go out the moment it was
         // grabbed.
-        let drag = DragState::on_down(DragTarget::Sidebar, edge_x, row);
-        let (held, _) = draw_with(None, Some(&drag));
-        assert_eq!(held[(edge_x, row)].symbol(), SIDEBAR_GRIP);
+        let drag = DragState::on_down(DragTarget::Sidebar, divider.x, row);
+        let held = buffer_with(None, Some(&drag));
+        assert_eq!(
+            fg(&held, divider.x, row),
+            theme::pane_border_focused(&paint).fg,
+            "a live resize drag keeps the border lit with no hover at all"
+        );
     }
 
-    /// The pad column inside the edge answers as the handle too. One column
-    /// is a hard target with a mouse, and both of these are blank, so the
-    /// wider reach costs no content.
+    /// The grab column shrank to one cell: only the sidebar's own outer
+    /// edge still answers as the resize handle's hit target in
+    /// `paint_sidebar`. That whole column is fat-finger tolerance for the
+    /// border-based handle now (`paint_sidebar_resize_feedback`), not a
+    /// wider reach for a handle drawn here, so there is no second column
+    /// left to grab.
     #[test]
-    fn the_resize_handle_is_two_columns_wide_below_the_header() {
+    fn the_resize_handles_tolerance_column_is_one_cell_wide_below_the_header() {
         let width = crate::render::SIDEBAR_MIN_WIDTH;
         let row = a_row_the_chevron_leaves_alone();
         let (_, hits) = draw_with(None, None);
-        for x in [width - 2, width - 1] {
-            assert!(
-                matches!(hits.hit(x, row), Some(HitTarget::SidebarDivider)),
-                "column {x} should grab the resize handle"
-            );
-        }
-        // And no further: the column inside the band is the body's.
+        assert!(
+            matches!(hits.hit(width - 1, row), Some(HitTarget::SidebarDivider)),
+            "the sidebar's own edge column must still grab the resize handle"
+        );
+        // And no further: the column inside it is the body's, same as
+        // before the grab column shrank.
         assert!(!matches!(
-            hits.hit(width - 3, row),
+            hits.hit(width - 2, row),
             Some(HitTarget::SidebarDivider)
         ));
     }
@@ -876,11 +1038,13 @@ mod tests {
         // The DEFAULT sidebar width, not a width chosen because it passed.
         // The first version of this gate reserved a 16-column hover hint and
         // so hid the button on every real sidebar; a test at 40 columns said
-        // it worked.
-        let (wide_rest, wide_hits) = draw(crate::render::SIDEBAR_MIN_WIDTH, None);
-        let chat = find(&wide_hits, crate::render::SIDEBAR_MIN_WIDTH)
+        // it worked. This is no longer the clamp floor — the panel can be
+        // dragged much narrower now — but the button and its note still fit
+        // at the width a fresh install actually opens with.
+        let (wide_rest, wide_hits) = draw(crate::render::SIDEBAR_DEFAULT_WIDTH, None);
+        let chat = find(&wide_hits, crate::render::SIDEBAR_DEFAULT_WIDTH)
             .expect("the default sidebar paints the chat button");
-        let (wide_hot, _) = draw(crate::render::SIDEBAR_MIN_WIDTH, Some(chat));
+        let (wide_hot, _) = draw(crate::render::SIDEBAR_DEFAULT_WIDTH, Some(chat));
         assert_ne!(
             wide_hot[chat].style(),
             wide_rest[chat].style(),
@@ -899,17 +1063,20 @@ mod tests {
             flatten(&roomy_hot)
         );
 
-        // Too narrow for all three: the button goes, the note stays.
-        let (_, narrow_hits) = draw(20, None);
+        // Too narrow for all three: the button goes, the note stays. The
+        // block riding the panel's right edge bought two more columns, so
+        // "too narrow" sits two columns lower than it did when the block
+        // stopped at the content inset.
+        let (_, narrow_hits) = draw(17, None);
         assert!(
-            find(&narrow_hits, 20).is_none(),
+            find(&narrow_hits, 17).is_none(),
             "a narrow footer should drop the chat button"
         );
-        let narrow_plus = (0..20u16)
+        let narrow_plus = (0..17u16)
             .flat_map(|x| (0..8u16).map(move |y| (x, y)))
             .find(|&(x, y)| matches!(narrow_hits.hit(x, y), Some(HitTarget::NewWorkspaceButton)))
             .expect("the create button survives");
-        let (narrow_hot, _) = draw(20, Some(narrow_plus));
+        let (narrow_hot, _) = draw(17, Some(narrow_plus));
         assert!(
             flatten(&narrow_hot).contains(copy::NEW_WORKSPACE_HINT),
             "the note is what a narrow footer keeps: {}",
@@ -985,6 +1152,80 @@ mod tests {
         );
     }
 
+    /// Below the drag floor — which a small terminal's half-width cap in
+    /// `clamp_sidebar_width` can still force — the edge-riding create
+    /// button starts too few cells from the menu label's own column for
+    /// the full "☰menu" (5 cells; only 4 remain at width 10), so the menu
+    /// button shrinks to its own leading glyph rather than hard-clipping
+    /// into the create button's territory. Both must still answer the
+    /// mouse, and the two must never claim the same column.
+    #[test]
+    fn a_below_floor_sidebar_shrinks_the_menu_button_without_overlap() {
+        let workspaces = vec![WorkspaceRow {
+            session_id: "$0".into(),
+            name: "cyclops".into(),
+            tab_count: 1,
+            window_ids: vec!["@0".into()],
+        }];
+        let expanded = std::collections::HashSet::new();
+        let paint = Paint::for_test();
+        // Ten columns: under the floor, reachable only through the
+        // half-width cap, and the width the cell math above is counted at.
+        let width = 10;
+        let mut term = Terminal::new(TestBackend::new(width, 8)).unwrap();
+        let mut hits = HitMap::default();
+        term.draw(|f| {
+            paint_sidebar(
+                &workspaces,
+                0,
+                "%0",
+                &expanded,
+                &[],
+                SidebarTab::Sessions,
+                &Record::new(),
+                f.area(),
+                f.buffer_mut(),
+                &paint,
+                &mut hits,
+                &DecorationSnapshot::default(),
+                None,
+                None,
+            );
+        })
+        .unwrap();
+
+        // The footer row: height 8 puts it on the last row, same math
+        // `paint_footer` itself uses (`footer_y = inner.y + inner.height - 1`).
+        let footer_y = 7;
+        let cols_hit = |matches_target: fn(&HitTarget) -> bool| -> Vec<u16> {
+            (0..width)
+                .filter(|&x| hits.hit(x, footer_y).is_some_and(matches_target))
+                .collect()
+        };
+        let menu_cols = cols_hit(|h| matches!(h, HitTarget::AppMenu));
+        let plus_cols = cols_hit(|h| matches!(h, HitTarget::NewWorkspaceButton));
+
+        assert!(
+            !menu_cols.is_empty(),
+            "the menu button must still answer the mouse below the floor"
+        );
+        assert!(
+            !plus_cols.is_empty(),
+            "the create button must still answer the mouse below the floor"
+        );
+        assert!(
+            menu_cols.iter().all(|c| !plus_cols.contains(c)),
+            "the two buttons must never share a column: menu {menu_cols:?}, plus {plus_cols:?}"
+        );
+
+        let buf = term.backend().buffer().clone();
+        assert_eq!(
+            buf[(menu_cols[0], footer_y)].symbol(),
+            "☰",
+            "the shrunk menu button is its own leading glyph, not a clipped label"
+        );
+    }
+
     #[test]
     fn sidebar_rows_render_and_hit_test_aligned() {
         let workspaces = vec![
@@ -1048,10 +1289,12 @@ mod tests {
             hits.hit(2, 3),
             Some(HitTarget::SidebarDisclosure { session_id }) if session_id == "$0"
         ));
-        // Bottom row carries distinct menu and create buttons.
+        // Bottom row carries distinct menu and create buttons; the create
+        // button rides the panel's right edge, one reserved divider column
+        // short of the pane border.
         assert!(matches!(hits.hit(2, 7), Some(HitTarget::AppMenu)));
         assert!(matches!(
-            hits.hit(15, 7),
+            hits.hit(17, 7),
             Some(HitTarget::NewWorkspaceButton)
         ));
         assert!(flat.contains("menu"), "menu button should render: {flat}");
@@ -1582,6 +1825,74 @@ mod tests {
         }
     }
 
+    /// A workspace name too long for a narrow panel ends in `…` instead of
+    /// stopping mid-word, and the row never writes past `content`'s own
+    /// right edge — the two pad columns between `content` and the resize
+    /// divider stay blank, the same as any other row.
+    #[test]
+    fn a_long_workspace_name_ellipsizes_instead_of_clipping_mid_word() {
+        let workspaces = vec![WorkspaceRow {
+            session_id: "$0".into(),
+            name: "a-very-long-workspace-name-nobody-chose-on-purpose".into(),
+            tab_count: 1,
+            window_ids: vec!["@0".into()],
+        }];
+        let expanded = std::collections::HashSet::new();
+        let paint = Paint::for_test();
+        let width = crate::render::SIDEBAR_MIN_WIDTH;
+        let mut term = Terminal::new(TestBackend::new(width, 8)).unwrap();
+        let mut hits = HitMap::default();
+        term.draw(|f| {
+            paint_sidebar(
+                &workspaces,
+                0,
+                "%0",
+                &expanded,
+                &[],
+                SidebarTab::Sessions,
+                &Record::new(),
+                f.area(),
+                f.buffer_mut(),
+                &paint,
+                &mut hits,
+                &DecorationSnapshot::default(),
+                None,
+                None,
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+
+        // Header, spacer, the reserved daemon-note row: the workspace lands
+        // on row 3, same as `sidebar_rows_render_and_hit_test_aligned`.
+        let row_y = 3;
+        let row: String = (0..width).map(|x| buf[(x, row_y)].symbol().to_string()).collect();
+        assert!(
+            row.contains('…'),
+            "a name too long for the panel must ellipsize: {row:?}"
+        );
+        assert!(
+            !row.contains("purpose"),
+            "the truncated tail of the name must not survive: {row:?}"
+        );
+
+        // `content` is `inner` (width − 1) inset `pad` cells each side —
+        // the same arithmetic `paint_sidebar` itself uses — so its own
+        // right edge sits short of the resize divider. Every column from
+        // there to the divider must stay blank: the ellipsizing helper is
+        // bounded by `content`, not by the wider row it paints on.
+        let inner_width = width - 1;
+        let pad = 2.min(inner_width / 2);
+        let content_right = pad + inner_width.saturating_sub(pad.saturating_mul(2));
+        for x in content_right..inner_width {
+            assert_eq!(
+                buf[(x, row_y)].symbol(),
+                " ",
+                "column {x} is past content's right edge and must stay blank"
+            );
+        }
+    }
+
     // -- The tab header: two chips over one body, the resize handle and
     // the footer untouched by either. --
 
@@ -1716,7 +2027,7 @@ mod tests {
     fn the_header_fits_both_chips_and_the_rollup_at_the_default_width() {
         let record = Record::new();
         let paint = Paint::for_test();
-        let narrow = Rect::new(0, 0, 22, SIDEBAR.height);
+        let narrow = Rect::new(0, 0, 24, SIDEBAR.height);
         let mut decoration = DecorationSnapshot::default();
         decoration.attention.observe_agent(
             "reviewer",
@@ -1761,7 +2072,7 @@ mod tests {
             })
         ));
         assert!(matches!(
-            hits.hit(11, 0),
+            hits.hit(13, 0),
             Some(HitTarget::SidebarTab {
                 tab: SidebarTab::Stream
             })
@@ -1787,14 +2098,14 @@ mod tests {
             })
         ));
         assert!(matches!(
-            hits.hit(11, 0),
+            hits.hit(13, 0),
             Some(HitTarget::SidebarTab {
                 tab: SidebarTab::Stream
             })
         ));
 
         let (stream_buf, _) = draw_sidebar(SidebarTab::Stream, &record, &paint);
-        let (sessions_chip, stream_chip) = ((2, 0), (12, 0));
+        let (sessions_chip, stream_chip) = ((2, 0), (14, 0));
         assert_ne!(
             sessions_buf[sessions_chip].bg, sessions_buf[stream_chip].bg,
             "the selected chip needs a materially stronger fill"
@@ -1820,6 +2131,78 @@ mod tests {
         assert!(!plain_buf[sessions_chip]
             .modifier
             .contains(ratatui::style::Modifier::REVERSED));
+    }
+
+    /// Too narrow for both full chips (`draw_sidebar`'s 42-column fixture is
+    /// why the test above never exercises this path): the row splits its
+    /// width between the two instead of letting the second one clip off the
+    /// edge, and each label ellipsizes inside its own share. Both chips
+    /// stay clickable, in their original left-to-right order, and the row
+    /// reads as shortened labels rather than a word chopped in half.
+    #[test]
+    fn a_narrow_tab_header_splits_between_both_chips_and_ellipsizes_their_labels() {
+        let workspaces = vec![WorkspaceRow {
+            session_id: "$0".into(),
+            name: "cyclops".into(),
+            tab_count: 1,
+            window_ids: vec!["@0".into()],
+        }];
+        let expanded = std::collections::HashSet::from(["$0".to_string()]);
+        let paint = Paint::for_test();
+        let width = 12;
+        let mut term = Terminal::new(TestBackend::new(width, 8)).unwrap();
+        let mut hits = HitMap::default();
+        term.draw(|f| {
+            paint_sidebar(
+                &workspaces,
+                0,
+                "%0",
+                &expanded,
+                &[],
+                SidebarTab::Sessions,
+                &Record::new(),
+                f.area(),
+                f.buffer_mut(),
+                &paint,
+                &mut hits,
+                &DecorationSnapshot::default(),
+                None,
+                None,
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+
+        let sessions_chip = (0..width)
+            .find(|&x| {
+                matches!(
+                    hits.hit(x, 0),
+                    Some(HitTarget::SidebarTab {
+                        tab: SidebarTab::Sessions
+                    })
+                )
+            })
+            .expect("the Workspaces chip is still clickable at 12 columns");
+        let stream_chip = (0..width)
+            .find(|&x| {
+                matches!(
+                    hits.hit(x, 0),
+                    Some(HitTarget::SidebarTab {
+                        tab: SidebarTab::Stream
+                    })
+                )
+            })
+            .expect("the Stream chip is still clickable at 12 columns");
+        assert!(
+            stream_chip > sessions_chip,
+            "the chips keep their left-to-right order: sessions {sessions_chip}, stream {stream_chip}"
+        );
+
+        let header: String = (0..width).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert!(
+            header.contains('…'),
+            "a header too narrow for both full labels must ellipsize rather than clip: {header:?}"
+        );
     }
 
     // -- The collapse chevron, in both of its states. --

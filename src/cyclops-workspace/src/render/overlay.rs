@@ -929,8 +929,8 @@ pub struct MenuChecks {
 /// setting that is currently on.
 ///
 /// `None` is "not a toggle", which is different from `Some(false)`: an
-/// unchecked row still reserves the check column so labels line up, and a
-/// menu with no toggles at all reserves nothing.
+/// unchecked row still aligns with the check column while any check in the
+/// menu is lit, and a menu showing no lit check reserves nothing.
 pub type MenuRow = (&'static str, BindingAction, Option<bool>);
 
 /// Menu items for one open menu.
@@ -1014,9 +1014,12 @@ pub fn paint_menu(
         return;
     }
     // The check column is reserved for the whole menu or for none of it, so
-    // labels line up down the list rather than stepping in and out as
-    // settings flip. A menu with no toggles pays nothing for it.
-    let gutter: u16 = if items.iter().any(|(_, _, c)| c.is_some()) {
+    // labels line up down the list — but only while some check is actually
+    // lit. A column of blanks held for checks that are all off pushed every
+    // label three cells off the border for nothing. Alignment cannot break
+    // under the operator's pointer: a click always closes the menu
+    // (`app::handle_mouse`), so the gutter is decided once per open.
+    let gutter: u16 = if items.iter().any(|(_, _, c)| *c == Some(true)) {
         2
     } else {
         0
@@ -1212,8 +1215,9 @@ mod tests {
     }
 
     /// The check column is reserved for the whole menu or none of it, so
-    /// labels do not step sideways as settings flip, and a menu with no
-    /// toggles does not pay two columns for a gutter nothing uses.
+    /// labels do not step sideways while a check shows — and it exists only
+    /// while one does. A menu with no toggles, or whose toggles are all
+    /// off, pays nothing for a gutter no check is using.
     #[test]
     fn the_check_column_is_all_or_nothing_per_menu() {
         let backend = TestBackend::new(60, 20);
@@ -1299,6 +1303,21 @@ mod tests {
         assert!(
             zoom.contains(&gutterless),
             "a menu with no toggles indents by one, not three: {zoom}"
+        );
+
+        // And so does a menu whose toggles are all off: a column of blanks
+        // held for checks nobody lit is exactly the three-cell indent this
+        // rule exists to prevent. Same anchor as `app_on`, so the columns
+        // are comparable.
+        let app_off = render(&mut term, MenuState::AppMenu, MenuChecks::default());
+        let motion_off = app_off
+            .iter()
+            .find(|line| line.contains(copy::MENU_MOTION))
+            .expect("a Motion row");
+        assert_eq!(
+            column_of(motion, copy::MENU_MOTION) - column_of(motion_off, copy::MENU_MOTION),
+            2,
+            "an all-off menu drops the two-cell check gutter"
         );
     }
 
