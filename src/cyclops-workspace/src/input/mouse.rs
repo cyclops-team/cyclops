@@ -57,17 +57,33 @@ pub enum HitTarget {
     SidebarDivider,
     /// One entry of the file panel. Carries what a click needs so the
     /// handler never re-reads the filesystem to answer a press: `path` to
-    /// open a folder with, `reference` (root-relative) to send for a file.
+    /// walk into for a folder, `reference` (root-relative) to send for a
+    /// file.
     FileRow {
         index: usize,
         path: String,
         is_dir: bool,
         reference: String,
     },
+    /// A folder row's chevron column only. Opens or closes that folder in
+    /// place, where a click on the rest of the row walks into it.
+    ///
+    /// Two targets on one row, the same shape as [`Self::SidebarRow`] and
+    /// [`Self::SidebarDisclosure`] on a workspace row. The narrow one is
+    /// pushed second so it wins its own cells: [`HitMap::hit`] scans in
+    /// reverse, so the last region pushed over a cell is the one that
+    /// answers there.
+    FileDisclosure {
+        path: String,
+    },
     /// The file panel's climb-out row.
     FileUp,
     /// The file panel's header: re-roots on the focused pane's folder.
     FileRoot,
+    /// Retrace one step of the walk, and undo that. Only pushed while the
+    /// step exists, so neither is ever a control that answers with nothing.
+    FileBack,
+    FileForward,
     /// The seam between the session tree and the file panel.
     SidebarSplit,
     /// The chevron that collapses or reopens the sidebar: on the open
@@ -257,12 +273,23 @@ pub fn motion_touches_hover_button(
             // reason: it paints nothing at rest and reveals itself under
             // the pointer, so it has no state to show at all without the
             // motion that arrives here.
+            // Every file panel target, not just its buttons. The panel
+            // lights a row under the pointer, and a row is only a hover
+            // state like any other: nothing else redraws for it, so a row
+            // left off this list simply never lights. The rest of this
+            // list is the same lesson learned one control at a time.
             Some(
                 HitTarget::NewTabButton
                     | HitTarget::ComposeButton
                     | HitTarget::NewWorkspaceButton
                     | HitTarget::SidebarToggle
                     | HitTarget::SidebarDivider
+                    | HitTarget::FileRow { .. }
+                    | HitTarget::FileDisclosure { .. }
+                    | HitTarget::FileUp
+                    | HitTarget::FileRoot
+                    | HitTarget::FileBack
+                    | HitTarget::FileForward
             )
         )
     };

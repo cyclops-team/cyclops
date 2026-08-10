@@ -154,13 +154,32 @@ file panel and hand the whole column back to the session tree. The app
 menu's `Files` item is the way back, and the only way back, because a
 closed panel leaves no rule to grab.
 
-The panel roots itself on the focused pane's directory. Click its folder
-name to re-root there again after walking somewhere else, and click `..`
-to go up. Folders open and close on click and only opened folders are
-read, so the panel costs one directory listing over a repository of any
-size. `.git` is skipped; every other dotfile is listed, because those are
-the ones you edit. Symbolic links are leaves whatever they point at, so a
-link back into its own parent cannot walk forever.
+The panel roots itself on the focused pane's directory. Under its header
+is a navigation row: `..` climbs out at the left, and `◂` `▸` at the right
+retrace the walk and undo that. A control with nowhere to go is painted
+dim and takes no click. Click the header's folder name to jump back to the
+focused pane's directory from wherever you have wandered.
+
+A folder answers a click two ways. Click its name to walk into it, which
+makes it the panel's root and gives its contents the full width. Click its
+chevron to open it in place instead, nested under its parent, the same
+split a workspace row uses for its own disclosure marker. Only opened
+folders are read, so the panel costs one directory listing over a
+repository of any size. `.git` is skipped; every other dotfile is listed,
+because those are the ones you edit. Symbolic links are leaves whatever
+they point at, so a link back into its own parent cannot walk forever.
+
+Files lead with their type: `(md) README.md`, `(rs) main.rs`. The tag is
+there so a name the panel had to cut still says what the thing is, since
+`(md) HELL…` identifies a file and `HELLO.m…` does not. Names are cut from
+the end for the same reason, and a file with no extension keeps its place
+in the column. On a sidebar too narrow to spend the columns, the tag drops
+and the names take the space back.
+
+Walking around the tree moves the view, not the agent. A file you click
+still arrives as a path relative to the focused pane's own directory, so
+`@src/main.rs` means the same thing whether you clicked it from the
+project root or after walking into `src`.
 
 It re-reads once a second and repaints only when something you can see has
 moved: a file written into an open folder shows up on its own, one written

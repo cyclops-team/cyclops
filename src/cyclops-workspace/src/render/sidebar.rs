@@ -56,6 +56,30 @@ pub const SIDEBAR_EXPAND: &str = "▸";
 /// maps to.
 const SIDEBAR_GRAB_WIDTH: u16 = 1;
 
+/// Rows a sidebar needs before it will spend one on the footer rule: the
+/// tab header, one row of body, the rule, and the footer. Under that the
+/// panel needs its content more than it needs the line.
+const FOOTER_RULE_MIN_HEIGHT: u16 = 4;
+
+/// The last row a body may fill: one above the footer when there is room
+/// for the rule that closes it off, the footer row itself when there is
+/// not.
+///
+/// Public because two places have to agree on it and they are in different
+/// modules. [`paint_sidebar`] uses it to place the tree/files seam;
+/// `app::files_rows_for_row` uses it to turn a dropped pointer back into a
+/// stored row count. They disagreed by the rule's single row once, and the
+/// seam trailed the pointer by a row for the whole drag and settled one row
+/// high on release.
+pub fn sidebar_body_bottom(sidebar: Rect) -> u16 {
+    let footer_y = sidebar.y + sidebar.height.saturating_sub(1);
+    if sidebar.height >= FOOTER_RULE_MIN_HEIGHT {
+        footer_y.saturating_sub(1)
+    } else {
+        footer_y
+    }
+}
+
 /// Render the workspace sidebar: the tab header, the selected tab's body,
 /// the shared footer, and the collapse chevron on its outer edge.
 pub fn paint_sidebar(
@@ -119,6 +143,13 @@ pub fn paint_sidebar(
     // The row both tabs stop above: the footer is shared, so neither body
     // may paint over it.
     let footer_y = inner.y + inner.height.saturating_sub(1);
+    // What a body may fill down to, read from the one function that owns
+    // it, because `app::files_rows_for_row` has to answer the same question
+    // when it turns a dropped pointer back into a row count.
+    let body_bottom = sidebar_body_bottom(area);
+    // The rule sits on the row the bodies gave up. None when there was no
+    // row to give.
+    let bar_y = (body_bottom < footer_y).then_some(body_bottom);
 
     paint_tab_header(inner, tab, buf, paint, hits, decoration);
     // The Sessions tab is two panels sharing one column: who is running,
@@ -128,10 +159,10 @@ pub fn paint_sidebar(
     // are the sidebar's own resize handle, and a seam that reached them
     // would take the handle away on its row.
     let split = match tab {
-        SidebarTab::Sessions => files_split(content, footer_y, files_rows),
+        SidebarTab::Sessions => files_split(content, body_bottom, files_rows),
         SidebarTab::Stream => None,
     };
-    let tree_bottom = split.map_or(footer_y, |seam| seam.y);
+    let tree_bottom = split.map_or(body_bottom, |seam| seam.y);
     // Tree rows that did not fit above the footer. The Stream tab does its
     // own clipping inside `super::stream`, so it reports nothing here.
     let clipped = match tab {
@@ -165,7 +196,7 @@ pub fn paint_sidebar(
                     x,
                     top,
                     inner.width.saturating_sub(1),
-                    footer_y.saturating_sub(top),
+                    body_bottom.saturating_sub(top),
                 ),
                 buf,
                 paint,
@@ -181,13 +212,16 @@ pub fn paint_sidebar(
                 content.x,
                 seam.y + 1,
                 content.width,
-                footer_y.saturating_sub(seam.y + 1),
+                body_bottom.saturating_sub(seam.y + 1),
             ),
             buf,
             paint,
             hits,
             hover,
         );
+    }
+    if let Some(y) = bar_y {
+        paint_footer_rule(content, y, buf, paint);
     }
     paint_footer(inner, content, footer_y, buf, paint, hits, hover, clipped);
     // Nothing paints the resize handle here anymore: the handle is the
@@ -720,6 +754,33 @@ fn paint_session_tree(
     clipped
 }
 
+/// The rule closing off the panel's lists from the bar of controls under
+/// them.
+///
+/// Static, unlike the tree/files seam it matches. That one is a drag handle
+/// and lights to say so; this one only marks a boundary and never moves, so
+/// it takes the seam's resting glyph and color and nothing else. Two rules
+/// drawn the same way read as one panel divided twice, which is what this
+/// is.
+///
+/// Spans the content columns, which is where the lists above it end and
+/// where the footer's own controls now stop. The rule, the file names above
+/// it and the buttons below it all break on the same column, which is the
+/// whole point of drawing it.
+fn paint_footer_rule(content: Rect, y: u16, buf: &mut Buffer, paint: &Paint) {
+    if content.width == 0 {
+        return;
+    }
+    let rule: String = "─".repeat(usize::from(content.width));
+    buf.set_stringn(
+        content.x,
+        y,
+        &rule,
+        usize::from(content.width),
+        theme::pane_border(paint),
+    );
+}
+
 /// The footer both tabs share: the application menu at left, and a matching
 /// compact create button anchoring the hierarchy at bottom-right without
 /// stealing the rest of the row.
@@ -743,18 +804,28 @@ fn paint_footer(
     if inner.height < 2 {
         return;
     }
-    let plus = " + ";
+    // Padded on the left, not both sides. The block is the same three
+    // cells either way, so the target does not shrink, but the glyph now
+    // lands on the last content column instead of one short of it. A `+`
+    // sitting a cell inside the end of the rule directly above it is the
+    // misalignment an operator sees even when the blocks agree.
+    let plus = "  +";
     let plus_width = u16::try_from(Span::raw(plus).width())
         .unwrap_or(u16::MAX)
         .min(inner.width);
-    // The button block rides the panel's own right edge, not the content
-    // inset: only the reserved divider column stands between the create
-    // button and the pane border. The inset is breathing room for names
-    // and the menu label; a control block that hung two pad cells short
-    // of the edge read as misplaced rather than padded.
-    let plus_x = inner
+    // The button block stops on the content inset, the same column the
+    // rule above it and every name in both lists stop on.
+    //
+    // It used to ride the panel's own right edge instead, on the reasoning
+    // that a block hanging two pad cells short of the edge read as
+    // misplaced rather than padded. That was true while nothing else marked
+    // where the content column ended, so the buttons were the only thing
+    // the eye could measure against and they measured against the border.
+    // The rule marks it now, and a bar that overhangs the line drawn right
+    // above it is the misalignment operators actually see.
+    let plus_x = content
         .x
-        .saturating_add(inner.width.saturating_sub(plus_width));
+        .saturating_add(content.width.saturating_sub(plus_width));
     // When the full label would run into the create button's cells the
     // menu shrinks to its own leading glyph — read off the real label so
     // the two copies can never drift apart — still the same control, one
@@ -781,7 +852,7 @@ fn paint_footer(
         content.x,
         footer_y,
         menu_text,
-        theme::sidebar_label(paint),
+        theme::sidebar_footer_button(paint),
     );
     hits.push(
         Rect::new(content.x, footer_y, menu_width, 1),
@@ -793,7 +864,7 @@ fn paint_footer(
     // a preference an operator can turn off, and writing to an agent has
     // nothing to do with whether they want tabs. The sidebar is also where
     // the agents already are: the roster is above this row.
-    let chat = " @ ";
+    let chat = "  @";
     let chat_width = u16::try_from(Span::raw(chat).width())
         .unwrap_or(u16::MAX)
         .min(inner.width);
@@ -875,7 +946,7 @@ fn paint_footer(
         if hovered {
             theme::add_button_hover(paint)
         } else {
-            theme::add_button(paint)
+            theme::sidebar_footer_button(paint)
         },
     );
     hits.push(
@@ -892,7 +963,7 @@ fn paint_footer(
             if chat_hovered {
                 theme::add_button_hover(paint)
             } else {
-                theme::add_button(paint)
+                theme::sidebar_footer_button(paint)
             },
         );
         hits.push(
@@ -1193,6 +1264,69 @@ mod tests {
         );
     }
 
+    /// The footer is a bar of controls, and has to read as one.
+    ///
+    /// Three things were wrong at once. Nothing separated the last row of
+    /// the list from the row of buttons, so they ran together. The menu
+    /// painted dim surface ink while the two buttons painted bold accent on
+    /// a raised ground, so one row held two visual languages. And the
+    /// button block rode the panel's outer edge while every name and rule
+    /// above it stopped two columns short, so the bar overhung the content.
+    #[test]
+    fn the_footer_reads_as_one_bar_under_one_rule() {
+        let project = Project::new("sidebar-footer-bar");
+        let mut files = project.tree();
+        let height = 24;
+        // The width `draw_split` actually paints at. Read it from the same
+        // constant rather than declaring one, or the probes below index a
+        // column the buffer does not have.
+        let width = crate::render::SIDEBAR_MIN_WIDTH;
+        let (buf, hits) = draw_split(&mut files, 8, height);
+        let footer_y = height - 1;
+
+        // A rule, directly above the footer and nowhere else near it.
+        let dashes = |y: u16| (0..width).filter(|x| buf[(*x, y)].symbol() == "─").count();
+        assert!(
+            dashes(footer_y - 1) > 0,
+            "the row above the footer has to carry a rule"
+        );
+        assert_eq!(dashes(footer_y), 0, "and the footer row itself does not");
+
+        // Every control on the row rests in one style, and it is not the
+        // dim label style the menu used to take.
+        let paint = Paint::for_test();
+        let at = |x: u16| buf[(x, footer_y)].style();
+        let menu_x = (0..width)
+            .find(|x| matches!(hits.hit(*x, footer_y), Some(HitTarget::AppMenu)))
+            .expect("a menu button");
+        let plus_x = (0..width)
+            .find(|x| matches!(hits.hit(*x, footer_y), Some(HitTarget::NewWorkspaceButton)))
+            .expect("a create button");
+        assert_eq!(
+            at(menu_x).fg,
+            theme::sidebar_footer_button(&paint).fg,
+            "the menu takes the bar's own ink"
+        );
+        assert_ne!(
+            theme::sidebar_footer_button(&paint).fg,
+            theme::sidebar_label(&paint).fg,
+            "and that ink is actually different from the label style it left"
+        );
+        assert_eq!(
+            at(menu_x).bg,
+            at(plus_x + 2).bg,
+            "menu and create button stand on the same ground"
+        );
+
+        // The ink of the bar stops on the same column as the rule above it.
+        let right_of = |y: u16, want: &str| (0..width).rfind(|x| buf[(*x, y)].symbol() == want);
+        assert_eq!(
+            right_of(footer_y, "+"),
+            right_of(footer_y - 1, "─"),
+            "the create button and the rule have to end on one column"
+        );
+    }
+
     /// A short sidebar gives the whole column to the session tree. Two
     /// panels in ten rows is two panels nobody can read, and the one that
     /// was there first is the one that keeps the space.
@@ -1382,20 +1516,24 @@ mod tests {
             flatten(&roomy_hot)
         );
 
-        // Too narrow for all three: the button goes, the note stays. The
-        // block riding the panel's right edge bought two more columns, so
-        // "too narrow" sits two columns lower than it did when the block
-        // stopped at the content inset.
-        let (_, narrow_hits) = draw(17, None);
+        // Too narrow for all three: the button goes, the note stays.
+        //
+        // "Too narrow" sits two columns higher than it did while the button
+        // block rode the panel's right edge. The block stops on the content
+        // inset again, so that it breaks on the same column as the rule
+        // above it, and the two columns it gave back came out of the gutter
+        // this note has to fit in. The default width is nowhere near this
+        // and keeps both.
+        let (_, narrow_hits) = draw(19, None);
         assert!(
-            find(&narrow_hits, 17).is_none(),
+            find(&narrow_hits, 19).is_none(),
             "a narrow footer should drop the chat button"
         );
-        let narrow_plus = (0..17u16)
+        let narrow_plus = (0..19u16)
             .flat_map(|x| (0..8u16).map(move |y| (x, y)))
             .find(|&(x, y)| matches!(narrow_hits.hit(x, y), Some(HitTarget::NewWorkspaceButton)))
             .expect("the create button survives");
-        let (narrow_hot, _) = draw(17, Some(narrow_plus));
+        let (narrow_hot, _) = draw(19, Some(narrow_plus));
         assert!(
             flatten(&narrow_hot).contains(copy::NEW_WORKSPACE_HINT),
             "the note is what a narrow footer keeps: {}",
@@ -1614,14 +1752,23 @@ mod tests {
             hits.hit(2, 3),
             Some(HitTarget::SidebarDisclosure { session_id }) if session_id == "$0"
         ));
-        // Bottom row carries distinct menu and create buttons; the create
-        // button rides the panel's right edge, one reserved divider column
-        // short of the pane border.
+        // Bottom row carries distinct menu and create buttons, and the
+        // button block stops where the rule above it stops.
+        //
+        // Read off the frame rather than restated as a column number: the
+        // point is that the bar and the rule break together, and a
+        // hardcoded column passes just as happily when they drift apart.
         assert!(matches!(hits.hit(2, 7), Some(HitTarget::AppMenu)));
-        assert!(matches!(
-            hits.hit(17, 7),
-            Some(HitTarget::NewWorkspaceButton)
-        ));
+        let bar_right = (0..20)
+            .rfind(|x| matches!(hits.hit(*x, 7), Some(HitTarget::NewWorkspaceButton)))
+            .expect("a create button on the footer row");
+        let rule_right = (0..20)
+            .rfind(|x| buf[(*x, 6)].symbol() == "─")
+            .expect("a rule above the footer");
+        assert_eq!(
+            bar_right, rule_right,
+            "the button bar has to stop on the same column as the rule"
+        );
         assert!(flat.contains("menu"), "menu button should render: {flat}");
         assert!(flat.contains('+'), "create button should render: {flat}");
     }
@@ -1744,9 +1891,10 @@ mod tests {
             flatten(term.backend().buffer())
         };
 
-        // Eight rows: header, spacer, the reserved daemon-note row, four
-        // tree rows, footer. Three of the seven workspaces miss the cut.
-        let short = render(8);
+        // Nine rows: header, spacer, the reserved daemon-note row, four
+        // tree rows, the footer rule, footer. Three of the seven workspaces
+        // miss the cut.
+        let short = render(9);
         assert!(
             short.contains("ws3"),
             "the four rows that fit still paint: {short}"
@@ -1811,7 +1959,7 @@ mod tests {
         }
 
         let render = |expanded: &std::collections::HashSet<String>| {
-            let mut term = Terminal::new(TestBackend::new(30, 8)).unwrap();
+            let mut term = Terminal::new(TestBackend::new(30, 9)).unwrap();
             let mut hits = HitMap::default();
             term.draw(|f| {
                 paint_sidebar(
@@ -2816,5 +2964,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The seam lands on the row the pointer dropped it on.
+    ///
+    /// Two modules compute the same boundary from opposite ends: the drag
+    /// turns a dropped row into a stored row count, and the paint turns
+    /// that count back into a row. They have to agree exactly, and they
+    /// briefly did not: the paint gave a row to the footer rule and the
+    /// drag did not, so the seam trailed the pointer by one row for the
+    /// whole drag and settled a row high on release.
+    ///
+    /// This walks the same arithmetic `app::files_rows_for_row` runs, so
+    /// the two sides are compared rather than each being checked against a
+    /// number written here.
+    #[test]
+    fn the_seam_lands_on_the_row_the_pointer_dropped_it_on() {
+        let project = Project::new("sidebar-seam-round-trip");
+        let mut files = project.tree();
+        let height: u16 = 24;
+        let sidebar = Rect::new(0, 0, crate::render::SIDEBAR_MIN_WIDTH, height);
+        let bottom = sidebar_body_bottom(sidebar);
+
+        // Inside the travel both panels' minimums leave: a drop lower than
+        // this is held by MIN_FILES_ROWS and a drop higher by MIN_TREE_ROWS,
+        // and there the seam is SUPPOSED to stop short of the pointer.
+        for target in [8u16, 12, 17] {
+            let files_rows = bottom.saturating_sub(target).saturating_sub(1);
+            let (_, hits) = draw_split(&mut files, files_rows, height);
+            let seam = rows_of(&hits, height, |t| matches!(t, HitTarget::SidebarSplit));
+            assert_eq!(
+                seam,
+                vec![target],
+                "a drop on row {target} stored {files_rows} rows and must paint the seam back on {target}"
+            );
+        }
+
+        // And past the floor it holds rather than following. A drop that
+        // would leave the file panel fewer rows than make it a panel is
+        // held at the floor. Not a drop all the way onto the footer: zero
+        // rows is how an operator closes the panel, which is a different
+        // behavior with its own reason.
+        let files_rows = MIN_FILES_ROWS - 2;
+        let (_, hits) = draw_split(&mut files, files_rows, height);
+        let seam = rows_of(&hits, height, |t| matches!(t, HitTarget::SidebarSplit));
+        assert_eq!(
+            seam,
+            vec![bottom - MIN_FILES_ROWS - 1],
+            "the seam stops at the file panel's own floor"
+        );
     }
 }

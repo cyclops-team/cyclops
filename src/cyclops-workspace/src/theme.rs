@@ -222,6 +222,26 @@ pub fn add_button(paint: &Paint) -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// The sidebar footer's controls: the menu, the composer and the create
+/// button. One bar, so they have to read as one bar.
+///
+/// They did not. The menu painted dim surface ink while the two buttons
+/// painted bold accent on a raised ground, on the same row, which reads as
+/// a label that happens to sit beside two widgets rather than as three
+/// controls of equal standing.
+///
+/// Accent ink on the panel's own ground, not `add_button`'s raised ground:
+/// three raised chips with gaps between them read as three unrelated
+/// things, and the rule above the row is what separates the bar from the
+/// list now, so no button needs its own box to stand in. Bold carries the
+/// distinction when color is off (rule 11).
+pub fn sidebar_footer_button(paint: &Paint) -> Style {
+    paint
+        .style_token(tokens::SURFACE_ACCENT)
+        .patch(paint.bg_token(tokens::CHROME_PANEL))
+        .add_modifier(Modifier::BOLD)
+}
+
 /// The create button under the mouse. It fills rather than merely
 /// brightening, so the glyph reads as a button the moment it is pointed
 /// at instead of only once it has been clicked.

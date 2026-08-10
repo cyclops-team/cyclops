@@ -1837,7 +1837,12 @@ async fn handle_mouse(
                 // here rather than to whatever is behind the sidebar.
                 if matches!(
                     target,
-                    HitTarget::FileRow { .. } | HitTarget::FileUp | HitTarget::FileRoot
+                    HitTarget::FileRow { .. }
+                        | HitTarget::FileDisclosure { .. }
+                        | HitTarget::FileUp
+                        | HitTarget::FileRoot
+                        | HitTarget::FileBack
+                        | HitTarget::FileForward
                 ) {
                     let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
                         -3
@@ -2109,10 +2114,31 @@ async fn handle_mouse(
                     app.files_root_pending = true;
                     return Ok(());
                 }
-                HitTarget::FileRow { path, is_dir, .. } if *is_dir => {
+                HitTarget::FileBack => {
+                    app.close_menu();
+                    app.files.go_back();
+                    return Ok(());
+                }
+                HitTarget::FileForward => {
+                    app.close_menu();
+                    app.files.go_forward();
+                    return Ok(());
+                }
+                // The chevron column: open the folder where it sits, which
+                // is what the whole row used to do.
+                HitTarget::FileDisclosure { path } => {
                     app.close_menu();
                     let path = std::path::PathBuf::from(path.clone());
                     app.files.toggle(&path);
+                    return Ok(());
+                }
+                // The rest of a folder's row walks into it. The panel is
+                // narrow, so browsing one folder at a time beats nesting
+                // everything under one root and running out of columns.
+                HitTarget::FileRow { path, is_dir, .. } if *is_dir => {
+                    app.close_menu();
+                    let path = std::path::PathBuf::from(path.clone());
+                    app.files.reroot(path);
                     return Ok(());
                 }
                 HitTarget::FileRow { reference, .. } => {
@@ -2270,8 +2296,11 @@ fn files_rows_for_row(app: &App, row: u16) -> u16 {
     let Some(sidebar) = areas.sidebar else {
         return app.prefs.files_rows;
     };
-    let footer_y = sidebar.y + sidebar.height.saturating_sub(1);
-    footer_y.saturating_sub(row).saturating_sub(1)
+    // The same bottom the paint measures the seam from. Computing it here
+    // instead put the seam one row above the pointer for the whole drag,
+    // because the paint had given a row to the footer rule and this had not.
+    let bottom = crate::render::sidebar_body_bottom(sidebar);
+    bottom.saturating_sub(row).saturating_sub(1)
 }
 
 /// One axis of pointer travel as a signed cell count.
@@ -2559,6 +2588,10 @@ async fn probe_files(app: &mut App, client: &ControlClient) -> bool {
             if !cwd.is_empty() {
                 app.files_root_pending = false;
                 let before = app.files.root().to_path_buf();
+                // Both, and only here. The anchor is what references are
+                // written from, so it follows the pane rather than the
+                // browsing that happens after this.
+                app.files.anchor_at(cwd);
                 app.files.reroot(cwd);
                 changed |= app.files.root() != before;
             }

@@ -25,6 +25,11 @@ const MAX_ENTRIES_PER_DIR: usize = 500;
 /// anyone navigates into.
 const MAX_DEPTH: u16 = 16;
 
+/// Folders remembered on either side of the current one. Deep enough that
+/// no real session reaches the end of it, bounded so a workspace left open
+/// for a week does not accumulate a list nobody will ever step back through.
+const MAX_HISTORY: usize = 64;
+
 /// One painted line of the tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRow {
@@ -49,10 +54,46 @@ pub enum RowKind {
     Truncated { hidden: usize },
 }
 
+impl FileRow {
+    /// The type tag this row leads with, lowercased: `md` for `HELLO.md`.
+    ///
+    /// It exists to survive a clip. The panel is narrow and long names get
+    /// cut, and a row cut to `(md) HELL…` still says what the thing is,
+    /// where `HELLO.m…` says nothing. That is the whole reason the type
+    /// moved to the front of the row instead of staying on the end of the
+    /// name where it cannot be relied on.
+    ///
+    /// `Path::extension` decides what counts rather than a split on '.',
+    /// because it already answers the cases a hand-rolled one gets wrong: a
+    /// dotfile is its own name and not an extension of something, so
+    /// `.zshrc` has no tag; `archive.tar.gz` is a `gz`; `Makefile` has
+    /// none. A name ending in a dot yields an empty extension, which is not
+    /// a tag anyone can read, so it is dropped here.
+    ///
+    /// Directories have none. Their chevron already says what they are, and
+    /// a folder named `my.folder` is not a `folder` file.
+    pub fn type_tag(&self) -> Option<String> {
+        if !matches!(self.kind, RowKind::File) {
+            return None;
+        }
+        let ext = Path::new(&self.name).extension()?.to_string_lossy();
+        (!ext.is_empty()).then(|| ext.to_lowercase())
+    }
+}
+
 /// The sidebar's view of one directory tree.
 #[derive(Debug, Clone, Default)]
 pub struct FileTree {
     root: PathBuf,
+    /// The folder a reference is written relative to, which is NOT the
+    /// folder being browsed.
+    ///
+    /// Clicking a folder moves the view. The agent this panel is writing to
+    /// has not moved with it: after walking into `src`, a click on
+    /// `main.rs` still has to send `src/main.rs`, because the recipient
+    /// resolves what it is sent against its own working directory. Set by
+    /// the pane probe, never by browsing.
+    anchor: PathBuf,
     rows: Vec<FileRow>,
     /// Directories the operator has opened. Kept even when the tree is
     /// rerooted or a directory disappears, so re-entering a folder that
@@ -60,6 +101,15 @@ pub struct FileTree {
     expanded: BTreeSet<PathBuf>,
     /// First visible row, moved by the wheel.
     scroll: usize,
+    /// Folders stood in before this one, oldest first. Pushed by every
+    /// move the operator makes, including the climb out through `..`.
+    back: Vec<PathBuf>,
+    /// Folders stepped back out of, most recent last. Cleared the moment
+    /// the operator navigates somewhere new, because that move is a new
+    /// branch and what they had stepped out of is no longer ahead of them.
+    /// Session state only: where someone browsed is not worth restoring on
+    /// the next launch, so [`crate::persist`] never sees these.
+    forward: Vec<PathBuf>,
     /// What the last read saw, for [`FileTree::refresh`] to compare
     /// against. Not a hash of file CONTENT: this panel reports what is in
     /// a folder, so a write that leaves name, size and mtime alone is not
@@ -102,9 +152,62 @@ impl FileTree {
         if root == self.root {
             return;
         }
+        // Standing somewhere is what makes it worth remembering. The first
+        // reroot of a session moves off no folder at all, and a history
+        // entry for nowhere is a back button that empties the panel.
+        if self.has_root() {
+            self.push_back(self.root.clone());
+        }
+        self.forward.clear();
+        self.land_on(root);
+    }
+
+    /// Step back to the folder before this one. False when there is none,
+    /// so a caller can paint the control as unavailable rather than
+    /// offering a click that does nothing.
+    pub fn go_back(&mut self) -> bool {
+        let Some(previous) = self.back.pop() else {
+            return false;
+        };
+        self.forward.push(self.root.clone());
+        self.land_on(previous);
+        true
+    }
+
+    /// Step forward again, undoing a [`FileTree::go_back`].
+    pub fn go_forward(&mut self) -> bool {
+        let Some(next) = self.forward.pop() else {
+            return false;
+        };
+        self.push_back(self.root.clone());
+        self.land_on(next);
+        true
+    }
+
+    pub fn can_go_back(&self) -> bool {
+        !self.back.is_empty()
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        !self.forward.is_empty()
+    }
+
+    /// Take up a new root and read it. The scroll goes back to the top for
+    /// the reason [`FileTree::reroot`] gives; history is the caller's to
+    /// record, because stepping through history must not record itself.
+    fn land_on(&mut self, root: PathBuf) {
         self.root = root;
         self.scroll = 0;
         self.read();
+    }
+
+    /// Oldest entry falls off the front. Dropping the far end of a long
+    /// trail costs the operator nothing; growing without bound does.
+    fn push_back(&mut self, path: PathBuf) {
+        self.back.push(path);
+        if self.back.len() > MAX_HISTORY {
+            self.back.remove(0);
+        }
     }
 
     /// The directory above the current root, if there is one and it is
@@ -167,10 +270,28 @@ impl FileTree {
     /// working directory is this root, and an absolute path from another
     /// machine's home directory is noise in a transcript.
     pub fn reference(&self, path: &Path) -> String {
-        path.strip_prefix(&self.root)
+        path.strip_prefix(self.reference_root())
             .unwrap_or(path)
             .to_string_lossy()
             .into_owned()
+    }
+
+    /// Point references at the focused pane's own folder. Called by the
+    /// pane probe, which is the only thing that knows where the agent
+    /// actually is.
+    pub fn anchor_at(&mut self, path: impl Into<PathBuf>) {
+        self.anchor = path.into();
+    }
+
+    /// Empty until the first probe answers. Falling back to the browsing
+    /// root keeps a hand-built tree writing relative paths instead of
+    /// absolute ones, which is what every test that builds one expects.
+    fn reference_root(&self) -> &Path {
+        if self.anchor.as_os_str().is_empty() {
+            &self.root
+        } else {
+            &self.anchor
+        }
     }
 
     fn read(&mut self) {
@@ -520,6 +641,33 @@ mod tests {
         assert_eq!(tree.reference(&outside), "/etc/hosts");
     }
 
+    /// Walking into a folder moves the view, not the agent.
+    ///
+    /// The reference is still written from where the pane is. Without this
+    /// separation, drilling into `src` and clicking `main.rs` sends
+    /// `@main.rs` to an agent whose working directory is the project root,
+    /// and it resolves to a file that is not there.
+    #[test]
+    fn browsing_into_a_folder_does_not_move_what_a_reference_is_relative_to() {
+        let s = Scratch::new("files-anchor");
+        s.file("src/main.rs", "");
+        let mut tree = FileTree::new();
+        tree.reroot(&s.0);
+        tree.anchor_at(&s.0);
+        assert_eq!(tree.reference(&s.0.join("src/main.rs")), "src/main.rs");
+
+        tree.reroot(s.0.join("src"));
+        assert_eq!(
+            tree.reference(&s.0.join("src/main.rs")),
+            "src/main.rs",
+            "the recipient's working directory did not move with the view"
+        );
+
+        // Climbing back out is the same story from the other side.
+        tree.reroot(&s.0);
+        assert_eq!(tree.reference(&s.0.join("src/main.rs")), "src/main.rs");
+    }
+
     /// An unreadable folder is empty, not fatal, and comes back on its own
     /// when permission does.
     #[cfg(unix)]
@@ -589,6 +737,130 @@ mod tests {
         // A panel taller than the list has nothing to scroll.
         tree.clamp_scroll(40);
         assert_eq!(tree.scroll(), 0);
+    }
+
+    /// The type tag is the part of a row that has to survive being cut, so
+    /// what counts as one matters. The cases here are the ones a split on
+    /// '.' gets wrong.
+    #[test]
+    fn a_type_tag_is_only_the_part_that_names_a_kind() {
+        let row = |name: &str, kind: RowKind| FileRow {
+            path: PathBuf::from(name),
+            name: name.to_string(),
+            depth: 0,
+            kind,
+        };
+        let tag = |name: &str| row(name, RowKind::File).type_tag();
+
+        assert_eq!(tag("HELLO.md").as_deref(), Some("md"));
+        assert_eq!(tag("main.rs").as_deref(), Some("rs"));
+        assert_eq!(tag("Cargo.toml").as_deref(), Some("toml"));
+        // Case is display, not identity: .MD and .md are one kind.
+        assert_eq!(tag("READ.MD").as_deref(), Some("md"));
+        // The last extension wins; a tarball is a gz.
+        assert_eq!(tag("archive.tar.gz").as_deref(), Some("gz"));
+
+        // A dotfile is its own name. `.zshrc` is not a `zshrc` file, and
+        // tagging it as one would put a nonsense badge on every config an
+        // operator edits.
+        assert_eq!(tag(".zshrc"), None);
+        assert_eq!(tag(".gitignore"), None);
+        assert_eq!(tag(".env"), None);
+        // But a dotfile that really does carry one keeps it.
+        assert_eq!(tag(".eslintrc.json").as_deref(), Some("json"));
+
+        assert_eq!(tag("Makefile"), None);
+        assert_eq!(tag("LICENSE"), None);
+        // A trailing dot leaves an empty extension, which is not a tag.
+        assert_eq!(tag("weird."), None);
+
+        // Folders are told apart by their chevron. `my.folder` is not a
+        // `folder` file, and a truncation notice is not a thing at all.
+        assert_eq!(
+            row("my.folder", RowKind::Dir { expanded: false }).type_tag(),
+            None
+        );
+        assert_eq!(
+            row("x.rs", RowKind::Truncated { hidden: 3 }).type_tag(),
+            None
+        );
+    }
+
+    /// Walking into folders and back out again retraces exactly the path
+    /// taken, and going somewhere new from the middle of a trail drops what
+    /// was ahead, the way a browser does it.
+    #[test]
+    fn history_retraces_the_walk_and_a_new_move_forks_it() {
+        let s = Scratch::new("files-history");
+        s.file("a/deep/leaf.txt", "");
+        s.dir("b");
+        let mut tree = FileTree::new();
+
+        // The first root is where the session starts, not somewhere it
+        // came back from.
+        tree.reroot(&s.0);
+        assert!(!tree.can_go_back(), "nothing precedes the first folder");
+        assert!(!tree.can_go_forward());
+
+        tree.reroot(s.0.join("a"));
+        tree.reroot(s.0.join("a/deep"));
+        assert!(tree.can_go_back());
+
+        assert!(tree.go_back());
+        assert_eq!(tree.root(), s.0.join("a"));
+        assert!(tree.can_go_forward(), "and forward is now open");
+        assert!(tree.go_back());
+        assert_eq!(tree.root(), s.0);
+        assert!(!tree.can_go_back(), "back stops at the first folder");
+        assert!(
+            !tree.go_back(),
+            "and says so rather than doing nothing quietly"
+        );
+
+        assert!(tree.go_forward());
+        assert_eq!(tree.root(), s.0.join("a"));
+
+        // A new move from here forks: `a/deep` was ahead and is not anymore.
+        tree.reroot(s.0.join("b"));
+        assert!(!tree.can_go_forward(), "a new branch drops what was ahead");
+        assert!(tree.go_back());
+        assert_eq!(
+            tree.root(),
+            s.0.join("a"),
+            "back still retraces the new trail"
+        );
+    }
+
+    /// Climbing out through `..` is a move like any other, so it is
+    /// something back can undo. An operator who overshoots the folder they
+    /// wanted needs one click to return, not a walk back down the tree.
+    #[test]
+    fn climbing_out_is_a_step_back_can_undo() {
+        let s = Scratch::new("files-history-up");
+        s.file("project/src/main.rs", "");
+        let mut tree = FileTree::new();
+        tree.reroot(s.0.join("project/src"));
+
+        tree.reroot(tree.parent().expect("a parent above src"));
+        assert_eq!(tree.root(), s.0.join("project"));
+        assert!(tree.go_back(), "the climb is undoable");
+        assert_eq!(tree.root(), s.0.join("project/src"));
+    }
+
+    /// Re-rooting where the tree already stands is not a move. Without this
+    /// the pane-follow probe, which re-asserts the same folder on a timer,
+    /// would fill the back stack with copies of the current folder and the
+    /// back button would appear to do nothing.
+    #[test]
+    fn standing_still_is_not_history() {
+        let s = Scratch::new("files-history-still");
+        s.dir("here");
+        let mut tree = FileTree::new();
+        tree.reroot(s.0.join("here"));
+        for _ in 0..5 {
+            tree.reroot(s.0.join("here"));
+        }
+        assert!(!tree.can_go_back());
     }
 
     #[test]
