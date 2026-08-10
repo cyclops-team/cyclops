@@ -105,10 +105,23 @@ fn bare_tty_seeds_the_shipped_themes_and_manifests() {
     // they land well before the daemon step's connect budget runs out.
     // Bounded wait, then stop the workspace; nothing after the seed is
     // asserted on.
+    //
+    // Wait for every file the assertions below name, not just the first of
+    // each kind. Waiting on `claude.toml` alone killed the child mid-seed
+    // under a loaded machine: the manifests directory held claude and agy,
+    // codex had not been written yet, and the failure read as a seeder bug
+    // rather than as this loop letting go too early. Five files instead of
+    // two costs nothing when the seed is fast, which is the common case.
     let light = home.join("themes/light.toml");
     let claude = home.join("manifests/claude.toml");
+    let seeded_all = || {
+        light.is_file()
+            && home.join("themes/dark.toml").is_file()
+            && claude.is_file()
+            && home.join("manifests/codex.toml").is_file()
+    };
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !(light.is_file() && claude.is_file()) && Instant::now() < deadline {
+    while !seeded_all() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
     let _ = child.kill();
