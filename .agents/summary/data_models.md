@@ -23,17 +23,26 @@ A `Detection` carries the fused verdict plus every `SensorReading`
 (`Hook, Title, Output, Screen`), the deciding rule id, and whether sensors
 disagreed — disagreement is exposed, not treated as an error.
 
+Note: the workspace chrome uses a compact glyph set on sidebar/inactive
+borders and omits `unknown` on primary surfaces — see
+`docs/guides/workspace-ui.md`. Proto glyphs above remain the source of
+truth for CLI grids, stream, and daemon border chrome.
+
 ## The delivery state machine
 
 `DeliveryState` (`src/cyclops-proto/src/ledger.rs`); every legal move is
 encoded in `can_transition_to()` and illegal moves are loud errors. Nothing
-is ever in limbo: every delivery ends in a named state.
+is ever in limbo: every delivery ends in a named state. Spec:
+`docs/development/DELIVERY.md`.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Queued
     Queued --> Gating
+    Queued --> ParkedBlockedQuota: quota before gate
+    Queued --> AttentionRequired: unresolvable before gate
     Gating --> Pasting: gate admits (Idle)
+    Gating --> RetryQueued: defer / retry path
     Gating --> ParkedBlockedQuota: quota
     Gating --> AttentionRequired: unresolvable
     Pasting --> Staged: verify_pattern seen
@@ -44,8 +53,11 @@ stateDiagram-v2
     Submitted --> RetryQueued: ack timeout
     RetryQueued --> Gating: bounded retry
     RetryQueued --> AttentionRequired: retries exhausted
+    RetryQueued --> ParkedBlockedQuota: quota on retry
     DeliveredUnverified --> DeliveredVerified: late hook ACK (the only exit from a delivered state)
     DeliveredVerified --> [*]
+    AttentionRequired --> Queued: future operator clear (no CLI verb yet)
+    ParkedBlockedQuota --> Queued: future operator clear (no CLI verb yet)
     AttentionRequired --> [*]
     ParkedBlockedQuota --> [*]
 ```
@@ -53,7 +65,11 @@ stateDiagram-v2
 `delivered_verified` (verified_by: hook) means the agent's own hook confirmed
 this exact message; `delivered_unverified` (verified_by: screen) is
 inference from screen evidence, and the badge says so with a hollow check.
-Quota parks are terminal by design — there is no re-queue verb.
+Quota parks are terminal for the product by design — there is no re-queue
+verb (`STATUS.md`). The state machine also allows
+`AttentionRequired`/`ParkedBlockedQuota` → `Queued` as a legal transition
+for a future operator clear path; do not invent a CLI verb that does not
+exist yet.
 
 ## The ledger schema
 
@@ -81,6 +97,7 @@ back into the msg line at read time; disk is never rewritten.
 - `MsgSendParams { to, subject, body, fyi, reply_to, wait }` →
   `MsgSendResult { msg_id, seq, deliveries: Vec<DeliveryReceipt> }`.
 - `WaitSpec { until: Idle|Done|Blocked, timeout }`.
+- `WorkspaceUiGetResult` / `WorkspaceUiSetParams` — last-active session/window.
 - Cursors: single-session numeric `cursor`, multi-session opaque composite
   `cursor2`.
 
@@ -102,12 +119,14 @@ prints.
   `tmux_socket`, `tmux_config`, `manifest_dir`, `ack_timeout_ms` (1500),
   `delivery_retry_max` (1), `receipt_block_ms` (2500),
   `gate_hold_notify_ms` (120000), `theme`, `chrome` (on by default),
-  `default_workspace`.
+  `default_workspace`. Workspace UI prefs (`[workspace]` sidebar, motion,
+  bindings, orders) are consumed by `cyclops-workspace`.
 - `Manifest` (`src/cyclops-manifest/src/lib.rs`): see interfaces.md.
 - `Layout → Window → Row → Pane` (`src/cyclops-tmux/src/layout.rs`):
   grid-of-rows with normalized ratios measured against pane cells.
-- `Theme` (`src/cyclops-theme/src/lib.rs`): 25 tokens, total resolution
-  (every token always resolves through the compiled default table).
+- `Theme` (`src/cyclops-theme/src/lib.rs`): 42 tokens, total resolution
+  (every token always resolves through the compiled default table). Includes
+  pane ground (`surface.bg`), chrome tokens, and ANSI-16 `palette.0..15`.
 - `Adoption` / `WindowChrome` (`src/cyclopsd/src/registry.rs`): the
   durable roster in `registry.json`, pruned on restore when a pane id or
   root pid no longer matches.

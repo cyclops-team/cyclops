@@ -10,7 +10,7 @@ the crates shows.
 ```mermaid
 flowchart LR
     subgraph clients["what a person runs"]
-      cli["cyclops CLI<br/>send, status, list, wait"]
+      cli["cyclops CLI<br/>send, status, list, wait, update"]
       ui["cyclops watch<br/>the stream TUI"]
       ws["cyclops<br/>the full-screen workspace"]
       hk["cyclops hook<br/>(invoked by vendor hooks)"]
@@ -47,6 +47,10 @@ never poll: they subscribe once and the daemon pushes. tmux keeps owning the
 user's panes, layout, and attach — Cyclops is a guest, and a daemon crash
 loses nothing because every fact is already on disk.
 
+Bare `cyclops` opens the workspace (sidebar, tabs, embedded panes, composer).
+`cyclops watch` is the stream TUI; `cyclops ui` remains only as a deprecated
+alias. Deep workspace UX: `docs/guides/workspace-ui.md`.
+
 ## Crate dependency graph
 
 ```mermaid
@@ -65,21 +69,26 @@ graph BT
     daemon --> tmux
     daemon --> ledger
     daemon --> theme
-    cli["cyclops (CLI)"] --> proto
-    cli --> theme
-    cli --> tmux
-    cli --> ui
     workspace["cyclops-workspace"] --> proto
     workspace --> theme
     workspace --> tmux
     workspace --> ui
+    cli["cyclops (CLI)"] --> proto
+    cli --> manifest
+    cli --> theme
+    cli --> tmux
+    cli --> ui
+    cli --> workspace
     testrig["cyclops-testrig<br/>(test-only, zero deps)"]
 ```
 
 `cyclops-proto` is the root: wire types, ledger schema, the delivery state
 machine, the agent state model, and the attention rule all live there and
-nowhere else. The CLI does not depend on `cyclops-manifest` or
-`cyclops-ledger` at runtime — it asks the daemon.
+nowhere else. The CLI links `cyclops-manifest` only to read launch commands
+for `cyclops start --agents` (schema ownership stays in the manifest crate)
+and links `cyclops-workspace` so bare `cyclops` can open the full-screen UI.
+It still does not depend on `cyclops-ledger` at runtime — history goes through
+the daemon. Business rules stay in proto/daemon; renderers never recompute them.
 
 ## Ownership rule
 
@@ -93,7 +102,8 @@ should not have known about it. The boundaries (from `docs/development/HANDOFF.m
   boot.
 - `cyclops-ledger` owns append/fsync/seq mechanics; the *meaning* of a line is
   proto's.
-- `cyclopsd` owns fusion, delivery, identity, adoption, chrome, and the socket
+- `cyclopsd` owns fusion, delivery, identity, adoption, chrome, hooks
+  self-test, volatile workspace-UI last-active state, and the socket
   server — but not the wire schema or the attention rule.
 - `cyclops` (CLI), `cyclops-ui`, and `cyclops-workspace` render; they never
   recompute business rules. `cyclops-ui`'s `grid` is the CLI/stream
@@ -121,7 +131,8 @@ design repo. Summary:
 4. **Zero polling.** No interval timers anywhere. State arrives as
    control-mode notifications and subscription pushes; every timer is a
    one-shot tied to an event that already happened (debounce, backoff, verify
-   re-reads, ACK windows). A poll would hide a broken event path.
+   re-reads, ACK windows, workspace motion deadlines). A poll would hide a
+   broken event path.
 5. **The pane title is a sensor, so Cyclops never writes it.** Adoption
    decoration goes on the tmux pane *border* (`role • state`), because two of
    shipped manifests may read the title as a detection sensor.
@@ -133,7 +144,8 @@ design repo. Summary:
 ## Concurrency architecture
 
 - Multi-threaded tokio in `cyclopsd`; current-thread tokio in `cyclops-ui`;
-  the CLI is fully synchronous (`std::os::unix::net::UnixStream`).
+  the CLI is fully synchronous (`std::os::unix::net::UnixStream`); the
+  workspace uses multi-thread tokio for its own daemon client and pane pump.
 - Daemon task inventory: one `session_task` per watched session, one accept
   loop, one task per client connection, reader/writer tasks per control
   client, a debounced reconcile task per watcher, a per-pane output-settle

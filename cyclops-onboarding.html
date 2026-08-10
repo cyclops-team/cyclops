@@ -1,0 +1,1458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Cyclops, from the top</title>
+<style>
+  @import url("https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,550;9..144,700&family=Source+Sans+3:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap");
+
+  :root, [data-theme="dark"] {
+    --bg: #141816;
+    --bg-soft: #1a1f1c;
+    --bg-elevated: #222925;
+    --bg-card: #1e2521;
+    --stroke-secondary: #3f4a43;
+    --stroke-tertiary: #2c342f;
+    --text-primary: #eef2ee;
+    --text-secondary: #b7c0b8;
+    --text-tertiary: #8a948b;
+    --text-quaternary: #667068;
+    --accent: #9bb58a;
+    --accent-strong: #b5d0a3;
+    --accent-ink: #141816;
+    --fill-tertiary: rgba(155, 181, 138, 0.08);
+    --fill-hover: rgba(155, 181, 138, 0.12);
+    --info-bg: rgba(155, 181, 138, 0.10);
+    --info-border: rgba(155, 181, 138, 0.40);
+    --warn-bg: rgba(222, 170, 90, 0.10);
+    --warn-border: rgba(222, 170, 90, 0.45);
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+    --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.28);
+    --hero-glow: radial-gradient(ellipse 80% 55% at 50% -10%, rgba(155, 181, 138, 0.18), transparent 60%);
+    --surface-glow: linear-gradient(180deg, rgba(155, 181, 138, 0.04), transparent 180px);
+    color-scheme: dark;
+  }
+  [data-theme="light"] {
+    --bg: #f4f6f1;
+    --bg-soft: #eef2ea;
+    --bg-elevated: #ffffff;
+    --bg-card: #ffffff;
+    --stroke-secondary: #c5cfc0;
+    --stroke-tertiary: #dde4d8;
+    --text-primary: #1c241c;
+    --text-secondary: #445044;
+    --text-tertiary: #667266;
+    --text-quaternary: #8a948a;
+    --accent: #5f7a4e;
+    --accent-strong: #4a643c;
+    --accent-ink: #ffffff;
+    --fill-tertiary: rgba(95, 122, 78, 0.07);
+    --fill-hover: rgba(95, 122, 78, 0.11);
+    --info-bg: rgba(95, 122, 78, 0.08);
+    --info-border: rgba(95, 122, 78, 0.35);
+    --warn-bg: rgba(180, 120, 30, 0.08);
+    --warn-border: rgba(180, 120, 30, 0.4);
+    --shadow-sm: 0 1px 2px rgba(40, 55, 35, 0.05), 0 1px 3px rgba(40, 55, 35, 0.04);
+    --shadow-md: 0 10px 28px rgba(40, 55, 35, 0.08), 0 2px 8px rgba(40, 55, 35, 0.04);
+    --hero-glow: radial-gradient(ellipse 80% 55% at 50% -8%, rgba(155, 181, 138, 0.45), transparent 62%);
+    --surface-glow: linear-gradient(180deg, rgba(255, 255, 255, 0.55), transparent 200px);
+    color-scheme: light;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background:
+      var(--hero-glow),
+      var(--surface-glow),
+      var(--bg);
+    background-attachment: fixed;
+    color: var(--text-primary);
+    font-family: "Source Sans 3", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font-size: 15px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 36px 22px 72px; }
+
+  h1 {
+    font-family: Fraunces, Georgia, "Times New Roman", serif;
+    font-size: 34px;
+    font-weight: 700;
+    margin: 0;
+    letter-spacing: -0.025em;
+    line-height: 1.15;
+    color: var(--text-primary);
+  }
+  h2 {
+    font-family: Fraunces, Georgia, "Times New Roman", serif;
+    font-size: 22px;
+    font-weight: 550;
+    margin: 0 0 2px;
+    letter-spacing: -0.015em;
+    color: var(--text-primary);
+  }
+  p { margin: 0; color: var(--text-secondary); }
+  code, .mono { font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace; }
+  code {
+    font-size: 0.9em;
+    background: var(--fill-tertiary);
+    border: 1px solid var(--stroke-tertiary);
+    border-radius: 5px;
+    padding: 1px 5px;
+    color: var(--text-primary);
+  }
+  a { color: var(--accent-strong); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:hover { color: var(--accent); }
+
+  .section { margin-top: 44px; }
+  .vgap > * + * { margin-top: 12px; }
+  .vgap-sm > * + * { margin-top: 6px; }
+  .vgap-lg > * + * { margin-top: 14px; }
+
+  .small { font-size: 13px; }
+  .secondary { color: var(--text-secondary); }
+  .tertiary { color: var(--text-tertiary); }
+  .quaternary { color: var(--text-quaternary); }
+  .semibold { font-weight: 600; }
+
+  /* hero */
+  .hero {
+    position: relative;
+    padding: 22px 22px 20px;
+    border: 1px solid var(--stroke-tertiary);
+    border-radius: 18px;
+    background:
+      linear-gradient(145deg, rgba(155, 181, 138, 0.10), transparent 42%),
+      var(--bg-elevated);
+    box-shadow: var(--shadow-md);
+  }
+  .hero-top {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 14px;
+  }
+  .hero-logo {
+    width: 72px;
+    height: 72px;
+    border-radius: 16px;
+    flex: none;
+    box-shadow: var(--shadow-sm);
+    border: 1px solid var(--stroke-tertiary);
+    background: #a8b89a;
+  }
+  .hero-kicker {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 4px;
+  }
+
+  /* stats */
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 16px; }
+  .stat {
+    border: 1px solid var(--stroke-tertiary);
+    border-radius: 12px;
+    padding: 14px 14px 12px;
+    background: var(--bg-card);
+    box-shadow: var(--shadow-sm);
+    transition: transform 0.15s ease, border-color 0.15s ease;
+  }
+  .stat:hover { transform: translateY(-1px); border-color: var(--stroke-secondary); }
+  .stat-value {
+    font-family: Fraunces, Georgia, serif;
+    font-size: 28px;
+    font-weight: 700;
+    line-height: 1.15;
+    color: var(--accent-strong);
+  }
+  .stat-label { font-size: 12px; color: var(--text-tertiary); margin-top: 4px; line-height: 1.4; }
+
+  /* grids */
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .grid4boxes { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .grid-loop { display: grid; grid-template-columns: 1.1fr 1fr; gap: 14px; align-items: start; }
+  .grid-use { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
+
+  /* diagram box */
+  .dbox {
+    border: 1px solid var(--stroke-tertiary);
+    border-radius: 12px;
+    padding: 12px 12px;
+    background: var(--bg-card);
+    box-shadow: var(--shadow-sm);
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  .dbox:hover { border-color: var(--stroke-secondary); }
+  .dbox.strong {
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--stroke-secondary));
+    background:
+      linear-gradient(180deg, rgba(155, 181, 138, 0.10), transparent 70%),
+      var(--bg-elevated);
+    box-shadow: var(--shadow-sm);
+  }
+  .dbox-title {
+    color: var(--text-primary);
+    font-size: 12.5px;
+    font-weight: 600;
+    font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  }
+  .dbox-line { color: var(--text-tertiary); font-size: 12.5px; margin-top: 4px; line-height: 1.45; }
+
+  /* flow arrow */
+  .arrow { text-align: center; padding: 0 4px; max-width: 110px; justify-self: center; }
+  .arrow-glyph { color: var(--accent); font-size: 18px; }
+  .arrow-label { color: var(--text-quaternary); font-size: 11px; line-height: 1.4; }
+
+  /* big picture */
+  .bigpic { display: grid; grid-template-columns: 1fr auto 1.35fr auto 1fr; gap: 10px; align-items: center; }
+  .bigpic-left { display: flex; flex-direction: column; gap: 8px; }
+  .ledger-note {
+    border: 1px dashed color-mix(in srgb, var(--accent) 40%, var(--stroke-secondary));
+    border-radius: 12px;
+    padding: 12px 14px;
+    font-size: 12.5px;
+    color: var(--text-tertiary);
+    margin-top: 14px;
+    background: var(--fill-tertiary);
+  }
+
+  /* clickable fact (details) */
+  details.fact {
+    border: 1px solid var(--stroke-tertiary);
+    border-radius: 12px;
+    padding: 10px 12px;
+    cursor: pointer;
+    background: var(--bg-card);
+    box-shadow: var(--shadow-sm);
+    transition: border-color 0.15s ease, background 0.15s ease;
+  }
+  details.fact:hover { border-color: var(--stroke-secondary); background: var(--bg-elevated); }
+  details.fact.strong {
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--stroke-secondary));
+    background:
+      linear-gradient(180deg, rgba(155, 181, 138, 0.10), transparent 80%),
+      var(--bg-elevated);
+  }
+  details.fact > summary { list-style: none; outline: none; }
+  details.fact > summary::-webkit-details-marker { display: none; }
+  .fact-head { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+  .fact-title { font-weight: 600; font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace; font-size: 12.5px; }
+  .fact-hint { font-size: 13.5px; color: var(--text-quaternary); white-space: nowrap; }
+  .fact-hint::before { content: "▸ what's this?"; }
+  details.fact[open] .fact-hint::before { content: "▾ hide"; }
+  .fact-line { color: var(--text-tertiary); font-size: 12.5px; margin-top: 4px; }
+  .fact-detail { font-size: 13px; color: var(--text-secondary); margin-top: 10px; cursor: auto; line-height: 1.55; }
+
+  /* command block */
+  .cmd {
+    background: var(--bg-soft);
+    border: 1px solid var(--stroke-tertiary);
+    border-radius: 12px;
+    padding: 12px 14px;
+    font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+    font-size: 12.5px;
+    line-height: 1.75;
+    overflow-x: auto;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+  }
+  .cmd-line { display: flex; gap: 16px; white-space: pre; }
+  .cmd-line .c { color: var(--text-primary); }
+  .cmd-line .n { color: var(--text-quaternary); }
+
+  /* collapsible section */
+  details.sect { border-bottom: 1px solid var(--stroke-tertiary); }
+  details.sect:first-of-type { border-top: 1px solid var(--stroke-tertiary); }
+  details.sect > summary {
+    list-style: none; display: flex; gap: 10px; align-items: baseline;
+    padding: 11px 8px; cursor: pointer; outline: none;
+    border-radius: 8px;
+    transition: background 0.12s ease;
+  }
+  details.sect > summary:hover { background: var(--fill-hover); }
+  details.sect > summary::-webkit-details-marker { display: none; }
+  .sect-chev { font-size: 15px; color: var(--accent); width: 16px; flex: none; }
+  .sect-chev::before { content: "▸"; }
+  details.sect[open] > .sect-chev::before, details.sect[open] > summary .sect-chev::before { content: "▾"; }
+  .sect-title { font-weight: 600; font-size: 14px; color: var(--text-primary); }
+  .sect-title.mono { font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace; font-size: 13px; }
+  .sect-trail { margin-left: auto; font-size: 12.5px; color: var(--text-tertiary); text-align: right; }
+  .sect-count {
+    font-size: 11px; color: var(--accent-strong); border: 1px solid var(--info-border);
+    background: var(--info-bg); border-radius: 999px; padding: 0 8px; flex: none;
+  }
+  .sect-body { padding: 4px 8px 14px 30px; font-size: 13.5px; color: var(--text-secondary); }
+  .sect-body .nested details.sect:first-of-type { border-top: none; }
+
+  /* card */
+  .card {
+    border: 1px solid var(--stroke-tertiary);
+    border-radius: 14px;
+    overflow: hidden;
+    background: var(--bg-card);
+    box-shadow: var(--shadow-sm);
+  }
+  .card-head {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 12px 16px; border-bottom: 1px solid var(--stroke-tertiary);
+    font-weight: 600; font-size: 14px; background: color-mix(in srgb, var(--bg-elevated) 88%, var(--accent) 12%);
+    color: var(--text-primary);
+  }
+  .card-body { padding: 14px 16px; }
+  .pill {
+    font-size: 11px; font-weight: 600; color: var(--text-secondary);
+    border: 1px solid var(--stroke-secondary); border-radius: 999px; padding: 2px 10px; white-space: nowrap;
+    background: var(--bg-elevated);
+  }
+  .pill.info { color: var(--accent-strong); border-color: var(--info-border); background: var(--info-bg); }
+
+  /* callout */
+  .callout {
+    border: 1px solid var(--info-border);
+    background: linear-gradient(135deg, var(--info-bg), transparent 70%), var(--bg-elevated);
+    border-radius: 12px;
+    padding: 13px 16px;
+    font-size: 13.5px;
+    color: var(--text-secondary);
+    box-shadow: var(--shadow-sm);
+  }
+  .callout.warn {
+    border-color: var(--warn-border);
+    background: linear-gradient(135deg, var(--warn-bg), transparent 70%), var(--bg-elevated);
+  }
+  .callout-title { font-weight: 650; margin-bottom: 4px; font-size: 13.5px; color: var(--text-primary); }
+
+  /* table */
+  table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    font-size: 13px;
+    border: 1px solid var(--stroke-tertiary);
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: var(--shadow-sm);
+    background: var(--bg-card);
+  }
+  th, td { border-bottom: 1px solid var(--stroke-tertiary); padding: 9px 12px; text-align: left; vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  th { background: color-mix(in srgb, var(--bg-elevated) 85%, var(--accent) 15%); font-weight: 600; font-size: 12px; color: var(--text-primary); }
+  td { color: var(--text-secondary); }
+  td.center, th.center { text-align: center; }
+  td .mono, th .mono { font-size: 12px; }
+
+  /* trace explorer */
+  .trace-grid { display: grid; grid-template-columns: minmax(0, 250px) 1fr; gap: 16px; align-items: start; margin-top: 12px; }
+  #traceNav {
+    border: 1px solid var(--stroke-tertiary);
+    border-radius: 14px;
+    padding: 6px;
+    background: var(--bg-card);
+    box-shadow: var(--shadow-sm);
+  }
+  .tstep {
+    display: flex; gap: 8px; align-items: baseline; padding: 7px 10px; border-radius: 8px; cursor: pointer;
+    transition: background 0.12s ease;
+  }
+  .tstep:hover { background: var(--fill-hover); }
+  .tstep .num { font-family: "IBM Plex Mono", Menlo, monospace; font-size: 11.5px; color: var(--text-quaternary); min-width: 18px; }
+  .tstep .ttl { font-size: 13px; color: var(--text-secondary); }
+  .tstep.active { background: var(--info-bg); }
+  .tstep.active .num { color: var(--accent-strong); font-weight: 600; }
+  .tstep.active .ttl { color: var(--text-primary); font-weight: 600; }
+  .tpanel { display: none; }
+  .tpanel.active { display: block; }
+  .where { font-size: 13px; color: var(--text-tertiary); }
+  .where code { color: var(--text-secondary); background: none; border: none; padding: 0; }
+
+  /* buttons */
+  .btn {
+    font-size: 13px; font-weight: 600; border-radius: 9px; padding: 7px 14px; cursor: pointer;
+    border: 1px solid var(--stroke-secondary); background: var(--bg-elevated); color: var(--text-primary);
+    font-family: inherit;
+    box-shadow: var(--shadow-sm);
+    transition: transform 0.12s ease, background 0.12s ease, border-color 0.12s ease;
+  }
+  .btn:hover:not(:disabled) { transform: translateY(-1px); border-color: var(--accent); }
+  .btn.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-ink);
+  }
+  .btn.primary:hover:not(:disabled) { background: var(--accent-strong); border-color: var(--accent-strong); }
+  .btn:disabled { opacity: 0.4; cursor: default; transform: none; }
+  .btn-row { display: flex; gap: 8px; margin-top: 6px; }
+
+  /* tmux staircase */
+  .stair { border: 1px solid var(--stroke-tertiary); padding: 12px 14px; background: var(--bg-card); }
+  .stair + .stair { border-top: none; }
+  .stair.first {
+    background: color-mix(in srgb, var(--bg-elevated) 85%, var(--accent) 15%);
+    border-top-left-radius: 10px;
+    border-top-right-radius: 10px;
+  }
+  .stair:last-child { border-bottom-left-radius: 10px; border-bottom-right-radius: 10px; }
+  .stair-name { font-weight: 600; font-family: "IBM Plex Mono", Menlo, monospace; font-size: 13px; color: var(--text-primary); }
+  .stair-body { font-size: 13px; color: var(--text-tertiary); }
+
+  /* fusion diagram */
+  .fusion-grid { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; gap: 6px; align-items: center; }
+  .dash-row { display: flex; gap: 6px; align-items: center; margin: 8px 0; }
+  .dash-row .line { flex: 1; border-top: 1px dashed var(--stroke-tertiary); }
+  .dash-row .lbl { font-size: 11.5px; color: var(--text-quaternary); white-space: nowrap; }
+
+  /* ledger example */
+  .ledger-line {
+    background: var(--bg-soft);
+    border: 1px solid var(--stroke-tertiary);
+    border-radius: 10px;
+    padding: 12px 14px;
+    font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+    font-size: 12px;
+    line-height: 1.65;
+    overflow-x: auto;
+    white-space: pre;
+    color: var(--text-secondary);
+  }
+
+  /* read next */
+  .readnext { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .readnext-row {
+    display: flex; gap: 12px; align-items: center;
+    padding: 10px 12px;
+    border: 1px solid var(--stroke-tertiary);
+    border-radius: 12px;
+    background: var(--bg-card);
+    box-shadow: var(--shadow-sm);
+    transition: border-color 0.12s ease, transform 0.12s ease;
+  }
+  .readnext-row .btn {
+    display: inline-block;
+    white-space: nowrap;
+    cursor: default;
+    pointer-events: none;
+  }
+
+  .divider {
+    border: none;
+    height: 1px;
+    margin: 44px 0 0;
+    background: linear-gradient(90deg, transparent, var(--stroke-secondary), transparent);
+  }
+
+  /* theme toggle */
+  .theme-toggle {
+    position: fixed; top: 16px; right: 18px; z-index: 10;
+    border: 1px solid var(--stroke-secondary);
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+    border-radius: 999px;
+    width: 38px; height: 38px;
+    cursor: pointer;
+    font-size: 16px;
+    line-height: 1;
+    box-shadow: var(--shadow-md);
+    transition: transform 0.15s ease, border-color 0.15s ease;
+  }
+  .theme-toggle:hover { transform: scale(1.05); border-color: var(--accent); }
+
+  @media (max-width: 800px) {
+    h1 { font-size: 28px; }
+    .hero { padding: 16px; }
+    .hero-logo { width: 56px; height: 56px; border-radius: 12px; }
+    .stats { grid-template-columns: 1fr 1fr; }
+    .grid2, .grid3, .grid-loop, .grid-use, .readnext, .grid4boxes { grid-template-columns: 1fr; }
+    .bigpic, .fusion-grid { grid-template-columns: 1fr; }
+    .arrow { max-width: none; }
+    .arrow-glyph { transform: rotate(90deg); display: inline-block; }
+    .trace-grid { grid-template-columns: 1fr; }
+    .tmux-2col { grid-template-columns: 1fr !important; }
+  }
+</style>
+
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="Toggle light/dark">◐</button>
+<div class="wrap">
+
+  <!-- ================================ header ================================ -->
+  <div class="vgap hero">
+    <div class="hero-top">
+      <img class="hero-logo" src="data:image/png;base64,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" alt="Cyclops logo" width="72" height="72" />
+      <div>
+        <p class="hero-kicker">Onboarding</p>
+        <h1>Cyclops, from the top</h1>
+      </div>
+    </div>
+    <p>
+      One eye. Many agents. A single coordinated team. Cyclops coordinates AI coding agents that are
+      already running in your terminal. A background daemon watches your tmux panes, figures out what
+      each agent is doing (working, idle, blocked, waiting on you), delivers messages between agents by
+      literally typing into their panes at safe moments, and writes every fact to a permanent on-disk
+      record. The name is the product's one metaphor: a one-eyed giant — in
+      <code>cyclops watch</code> and <code>cyclops status</code>, the eye glyph
+      (‿ closed, ◑ opening, ◉ open) opens when something needs a human.
+    </p>
+    <div class="stats">
+      <div class="stat"><div class="stat-value">2</div><div class="stat-label">binaries that ship (cyclops + cyclopsd)</div></div>
+      <div class="stat"><div class="stat-value">10</div><div class="stat-label">crates in the Cargo workspace (9 in src/, 1 test-only)</div></div>
+      <div class="stat"><div class="stat-value">10</div><div class="stat-label">states in the delivery machine</div></div>
+      <div class="stat"><div class="stat-value">0</div><div class="stat-label">polling timers, by design</div></div>
+    </div>
+  </div>
+
+  <!-- ============================== level 1 ================================ -->
+  <div class="section vgap">
+    <h2>Level 1 — The big picture</h2>
+    <p>
+      Three audiences use one system, through the same verbs. You mostly talk to your agents, not to
+      Cyclops: tell an implementer “when you're done, send it to reviewer”, and the agent runs the
+      handoff itself from its own pane.
+    </p>
+    <div class="grid3">
+      <div class="dbox">
+        <div class="dbox-title">you</div>
+        <div class="dbox-line">run bare <code>cyclops</code>: the workspace</div>
+        <div class="dbox-line">arrange agents, talk to them in natural language</div>
+        <div class="dbox-line">message any agent without leaving (Ctrl+B s)</div>
+      </div>
+      <div class="dbox strong">
+        <div class="dbox-title">your agents</div>
+        <div class="dbox-line">use the same CLI underneath: send, reply, wait</div>
+        <div class="dbox-line">“when done, send it to reviewer” just works</div>
+        <div class="dbox-line">skills/cyclops/SKILL.md teaches the verbs</div>
+      </div>
+      <div class="dbox">
+        <div class="dbox-title">scripts &amp; CI</div>
+        <div class="dbox-line">the same CLI with --json on every command</div>
+        <div class="dbox-line">the ledger is plain NDJSON — jq needs no daemon</div>
+        <div class="dbox-line">cyclops wait &lt;agent&gt; --until done gates a pipeline</div>
+      </div>
+    </div>
+    <p>
+      Underneath, three parties and one direction of trust. Clients talk to the daemon through small
+      socket requests; the daemon is the only thing that talks to tmux for detection and delivery; and
+      everything the daemon learns or does is written to the ledger before it acts. If the daemon
+      crashes, nothing is lost — the facts were already on disk. Click any box below — each one answers
+      the question it usually raises.
+    </p>
+    <div class="bigpic">
+      <div class="bigpic-left">
+        <details class="fact">
+          <summary>
+            <div class="fact-head"><span class="fact-title">cyclops &lt;verb&gt;</span><span class="fact-hint"></span></div>
+            <div class="fact-line">the CLI: send, status, list, wait…</div>
+          </summary>
+          <div class="fact-detail">A one-shot, synchronous binary. Every invocation opens the socket, sends one JSON request, prints the reply, and exits — it holds no state between calls. Humans, agents, and scripts all use the same verbs; every command takes --json and --plain.</div>
+        </details>
+        <details class="fact">
+          <summary>
+            <div class="fact-head"><span class="fact-title">cyclops (bare)</span><span class="fact-hint"></span></div>
+            <div class="fact-line">the full-screen workspace</div>
+          </summary>
+          <div class="fact-detail">Bare <code>cyclops</code> on a TTY opens a full-screen terminal workspace: project sidebar, tabs, and a live pane canvas fed by its own tmux control-mode connection, with tmux-style Ctrl+B keys, mouse support, and a one-line composer (Ctrl+B s, or the chat button) for messaging agents. It draws the panes itself, but every fact about an agent (name, state, chrome) comes from the daemon — without one, the sidebar says <code>cyclopsd offline</code>.</div>
+        </details>
+        <details class="fact">
+          <summary>
+            <div class="fact-head"><span class="fact-title">cyclops watch</span><span class="fact-hint"></span></div>
+            <div class="fact-line">the live stream TUI</div>
+          </summary>
+          <div class="fact-detail">A long-running dashboard, not a one-shot command. It subscribes to the daemon's live event push and renders every message and state change as it happens — calm admin view by default, firehose one keypress away, the eye in the header. <code>cyclops watch --json</code> is the machine-readable stream. (The old <code>cyclops ui</code> spelling survives only as a deprecated alias.)</div>
+        </details>
+        <details class="fact">
+          <summary>
+            <div class="fact-head"><span class="fact-title">cyclops hook</span><span class="fact-hint"></span></div>
+            <div class="fact-line">invoked by agents' vendor hooks</div>
+          </summary>
+          <div class="fact-detail">Not something you run by hand. The agent CLI (Claude, Codex…) is configured to call this automatically at its own lifecycle events (a turn ending, say). It's fast and silent by design, and always exits 0 so a slow relay never disrupts the agent.</div>
+        </details>
+      </div>
+      <div class="arrow">
+        <div class="arrow-glyph">→</div>
+        <div class="arrow-label">JSON lines over a Unix socket (~/.cyclops/sock)</div>
+      </div>
+      <details class="fact strong">
+        <summary>
+          <div class="fact-head"><span class="fact-title">cyclopsd — the daemon</span><span class="fact-hint"></span></div>
+          <div class="fact-line">server — speaks the socket protocol, pushes events</div>
+          <div class="fact-line">fusion — decides what state each pane is in</div>
+          <div class="fact-line">delivery — pastes messages at safe moments</div>
+        </summary>
+        <div class="fact-detail">“Daemon” just means a long-running background process (same convention as sshd, systemd — trailing “d”). It's a second, separately compiled binary from <code>cyclops</code>: you never launch it yourself, <code>cyclops</code> and <code>cyclops start</code> do. The split exists partly so sender identity can be resolved from a fresh process's ancestry every time — that wouldn't work if sending happened inside the daemon itself.</div>
+      </details>
+      <div class="arrow">
+        <div class="arrow-glyph">→</div>
+        <div class="arrow-label">one tmux -C control client per watched session</div>
+      </div>
+      <details class="fact">
+        <summary>
+          <div class="fact-head"><span class="fact-title">your tmux server</span><span class="fact-hint"></span></div>
+          <div class="fact-line">owns the panes, layout, and attach — Cyclops is a guest</div>
+        </summary>
+        <div class="fact-detail">tmux is itself a client-server system: one background server process holds every real session, window, pane and PTY. Your interactive terminal, the cyclops workspace, and cyclopsd's control connection are all just clients of that one server — Cyclops never hosts its own terminals.</div>
+      </details>
+    </div>
+    <div class="ledger-note">
+      <span class="semibold" style="color: var(--text-secondary);">the ledger</span>
+      &nbsp;·&nbsp;
+      <span class="mono">~/.cyclops/ledger/&lt;session&gt;.ndjson</span>
+      — every message, state change, and gate decision is appended here (and fsynced) before the
+      daemon acts on it. Never rewritten; readable with jq alone.
+    </div>
+  </div>
+
+  <!-- ============================== level 2 ================================ -->
+  <div class="section vgap">
+    <h2>Level 2 — The folder map</h2>
+    <p>
+      The repo splits cleanly into: the product (Rust code in <code>src/</code>), the data the product
+      consumes (<code>resources/</code> — all TOML and templates, no code), and the things that keep it
+      honest (<code>docs/</code>, <code>demos/</code>, <code>scripts/</code>, <code>tests/</code>).
+      Expand what you're curious about; each crate row also says why it's named the way it is.
+    </p>
+    <div>
+      <details class="sect" open>
+        <summary>
+          <span class="sect-chev"></span>
+          <span class="sect-title mono">src/</span>
+          <span class="sect-count">9</span>
+          <span class="sect-trail">the product — 9 Rust crates (a 10th, test-only, lives in tests/)</span>
+        </summary>
+        <div class="sect-body vgap-sm">
+          <p class="small secondary">
+            “Crate” is Rust's word for a package; a repo holding several is a Cargo workspace. The nine
+            product crates live under <code>src/</code>, and the test-only <code>cyclops-testrig</code>
+            lives at <code>tests/testrig</code> — ten workspace members in all. Every crate name is
+            prefixed <code>cyclops-</code> so the published names don't collide with anything else.
+            Expand each one:
+          </p>
+          <div class="nested">
+            <details class="sect">
+              <summary><span class="sect-chev"></span><span class="sect-title mono">cyclops-proto</span><span class="sect-trail">“proto” as in protocol</span></summary>
+              <div class="sect-body">The shared vocabulary of the whole system: the socket protocol's message types, the ledger schema, the 10-state delivery machine, the agent-state model, scratch paths, and the attention rule (“what needs a human”). Pure data types — no file or network access, and it has never heard of tmux. Every other crate depends on it, so a rule defined here exists exactly once.</div>
+            </details>
+            <details class="sect">
+              <summary><span class="sect-chev"></span><span class="sect-title mono">cyclops-tmux</span><span class="sect-trail">the tmux adapter</span></summary>
+              <div class="sect-body">The “blast wall”: every tmux invocation in the product lives in this crate, so tmux's quirks are quarantined in one place. Holds the control-mode client (one <code>tmux -C</code> child per watched session), the zero-polling reconciling pane table, version parsing, and the workspace layout engine. One honest exception exists: the daemon runs <code>tmux -V</code> once at boot.</div>
+            </details>
+            <details class="sect">
+              <summary><span class="sect-chev"></span><span class="sect-title mono">cyclops-ledger</span><span class="sect-trail">the append-only record</span></summary>
+              <div class="sect-body">The mechanics of the on-disk record: append with fsync, seal torn lines after a crash, keep sequence numbers monotonic across restarts. What a line means is cyclops-proto's business; this crate only owns how lines get on and off disk. Deliberately no index — a 10,000-line scan measures ~7ms.</div>
+            </details>
+            <details class="sect">
+              <summary><span class="sect-chev"></span><span class="sect-title mono">cyclops-manifest</span><span class="sect-trail">a manifest declares what a vendor CLI looks like</span></summary>
+              <div class="sect-body">Parses, validates, and evaluates the TOML manifests that teach Cyclops to recognize an agent CLI (what its pane title or screen shows in each state, which keys decline its modals, how to verify a paste). It compiles the rules and answers “which rule matches?” — it does not decide pane state (fusion in the daemon does) and it never captures screens (the tmux crate does).</div>
+            </details>
+            <details class="sect">
+              <summary><span class="sect-chev"></span><span class="sect-title mono">cyclops-theme</span><span class="sect-trail">colors</span></summary>
+              <div class="sect-body">The semantic token vocabulary (role colors, state groups, the eye), theme TOML parsing that tolerates unknown tokens, 256-color fallback, and hot reload implemented as a cheap file-stat check when a repaint is already due — never a watcher thread or a timer. Renderers use tokens, never raw colors, which is why one theme file restyles every surface at once.</div>
+            </details>
+            <details class="sect">
+              <summary><span class="sect-chev"></span><span class="sect-title mono">cyclops-ui</span><span class="sect-trail">the terminal UI</span></summary>
+              <div class="sect-body">The live stream TUI behind <code>cyclops watch</code>: calm admin view, firehose one keypress away, the eye in the header, jump-to-pane. Its <code>grid</code> module is the shared rendering vocabulary for state cells, badges, and cause words that the CLI also renders through, so every surface prints things the same way. Its terminal backend is hand-rolled.</div>
+            </details>
+            <details class="sect">
+              <summary><span class="sect-chev"></span><span class="sect-title mono">cyclops-workspace</span><span class="sect-trail">the full-screen workspace</span></summary>
+              <div class="sect-body">What bare <code>cyclops</code> opens on a TTY: a project sidebar, tab bar, and live pane canvas fed by tmux control mode, with tmux-style Ctrl+B keys, mouse support, splits, drag-and-drop, and a one-line composer (Ctrl+B s, or the chat button) that sends <code>@reviewer fix the burst path</code> through the same delivery pipeline. Built on Ratatui/Crossterm with embedded per-pane VT runtimes. It draws the panes itself, but everything it knows about an agent — name, state glyph, chrome — comes from the daemon.</div>
+            </details>
+            <details class="sect">
+              <summary><span class="sect-chev"></span><span class="sect-title mono">cyclopsd</span><span class="sect-trail">trailing “d” = Unix daemon convention (like sshd, systemd)</span></summary>
+              <div class="sect-body">The long-running daemon and the heart of the system: session watching, sensor fusion (deciding each pane's state), the delivery pipeline, fail-closed sender identity, the adoption registry, pane-border chrome, the hooks self-test, and the Unix socket server. Built as a library plus a thin binary so tests can boot the entire daemon in-process.</div>
+            </details>
+            <details class="sect">
+              <summary><span class="sect-chev"></span><span class="sect-title mono">cyclops</span><span class="sect-trail">the product name</span></summary>
+              <div class="sect-body">The CLI binary. A thin synchronous socket client plus rendering: start, send, status, list, history, thread, wait, name, read, ping, theme, hooks, update, daemon, and workspace save/restore — plus <code>cyclops hook</code>, the receiver vendor hooks invoke. Every command takes <code>--json</code> and <code>--plain</code>. It asks the daemon rather than recomputing any business rule itself; its user-facing sentences live in one file, copy.rs.</div>
+            </details>
+            <details class="sect">
+              <summary><span class="sect-chev"></span><span class="sect-title mono">cyclops-testrig</span><span class="sect-trail">a “rig” for tests — lives at tests/testrig, not src/</span></summary>
+              <div class="sect-body">Test-only (<code>publish = false</code>). Gives every test its own private, throwaway tmux server so no test can ever touch your real tmux; teardown (including unlinking the socket file) happens automatically when the value is dropped. Guard tests enforce that no other file starts or kills a tmux server.</div>
+            </details>
+          </div>
+        </div>
+      </details>
+
+      <details class="sect">
+        <summary><span class="sect-chev"></span><span class="sect-title mono">resources/manifests/</span><span class="sect-trail">how Cyclops recognizes agent CLIs</span></summary>
+        <div class="sect-body">One TOML file per vendor CLI — four ship: Claude Code (claude), Codex CLI (codex), Antigravity CLI (agy), and Cursor Agent (cursor) — describing what that CLI looks like on screen in each state. Data, not code: teaching Cyclops a new agent CLI is a text edit, no compiler needed. Compiled into the binary with include_str!, seeded into ~/.cyclops/manifests on first run. The seeder never clobbers your edits, but it does refresh files whose bytes it recognizes as its own shipped versions (by hash), so unedited manifests pick up fixes automatically.</div>
+      </details>
+      <details class="sect">
+        <summary><span class="sect-chev"></span><span class="sect-title mono">resources/themes/</span><span class="sect-trail">17 color themes</span></summary>
+        <div class="sect-body">dark, light, high-contrast, catppuccin, gruvbox, nord, tokyo-night, plus ten more (ember, sorbet, obsidian, midnight, forest, meadow, seafoam, periwinkle, blossom, buttercream). Every state glyph keeps one fixed meaning under every theme and stays visible under NO_COLOR; a theme switch (<code>cyclops theme &lt;name&gt;</code>) is live at once, including the pane borders.</div>
+      </details>
+      <details class="sect">
+        <summary><span class="sect-chev"></span><span class="sect-title mono">resources/layouts/</span><span class="sect-trail">workspace presets</span></summary>
+        <div class="sect-body">solo, duo, quad, ops — each one is the previous preset plus a pane. <code>cyclops start --preset duo --agents claude,codex</code> builds a two-pane implementer/reviewer workspace and starts those CLIs in it (a preset ships names and shapes, never CLIs — the fleet is yours to say). Embedded into the CLI binary with include_str! so a fresh install works with no files.</div>
+      </details>
+      <details class="sect">
+        <summary><span class="sect-chev"></span><span class="sect-title mono">resources/hooks/</span><span class="sect-trail">vendor hook templates</span></summary>
+        <div class="sect-body">Templates for each vendor CLI's hook configuration (agy, claude, codex, cursor), rendered by <code>cyclops hooks install &lt;cli&gt; --agent &lt;label&gt;</code> into vendor-isolated paths under ~/.cyclops/hooks/. The command itself refuses to write into ~/.claude, ~/.codex, or any vendor directory — wiring your real setup is deliberate (or delegated to the installer's opt-in --wire-hooks lane).</div>
+      </details>
+      <details class="sect">
+        <summary><span class="sect-chev"></span><span class="sect-title mono">skills/</span><span class="sect-trail">teaching your agents to use Cyclops</span></summary>
+        <div class="sect-body">skills/cyclops/SKILL.md is one file that teaches a coding agent the send/wait/reply verbs and the safety rules. Nothing installs it automatically: copy it where your agent looks for instructions (for Claude Code, ~/.claude/skills/cyclops/SKILL.md) — or skip it, since every command explains itself with --help and every delivered message carries its own reply instructions.</div>
+      </details>
+      <details class="sect">
+        <summary><span class="sect-chev"></span><span class="sect-title mono">docs/</span><span class="sect-trail">23 pages in 3 sections; start at development/HANDOFF.md</span></summary>
+        <div class="sect-body">Split by audience: docs/development/ (8 pages — HANDOFF, ARCHITECTURE, DELIVERY, INVARIANTS, GOALS, STYLE, CUTOVER, V5), docs/guides/ (11 how-to pages — QUICKSTART, install, send, workspaces…), docs/reference/ (MANIFESTS, PROTOCOL, hooks, BENCHMARKS), plus docs/public/, the rendered public docs site. The developer front door is docs/development/HANDOFF.md. Unusual and important: docs are CI-enforced. Quoted terminal output must match what the binaries actually print (tests/e2e/parity-check.sh) and every quoted file path must exist (scripts/check-doc-paths.py). Treat doc edits like code edits.</div>
+      </details>
+      <details class="sect">
+        <summary><span class="sect-chev"></span><span class="sect-title mono">demos/</span><span class="sect-trail">runnable proofs</span></summary>
+        <div class="sect-body">End-to-end scripts that run the real binaries on throwaway tmux servers and touch nothing of yours: m0-status through m5-theme (send, a two-agent conversation, the stream, naming, workspace save/destroy/restore, live theme switching), plus per-step launch/record scripts. The self-contained delivery demo is m1-send.sh. House rule: ship a demo with anything a user will do end to end — on this codebase demos have caught defects four times that reading the code did not.</div>
+      </details>
+      <details class="sect">
+        <summary><span class="sect-chev"></span><span class="sect-title mono">scripts/</span><span class="sect-trail">installer + doc gate + v1 shim</span></summary>
+        <div class="sect-body">install.sh (the build-from-source installer: builds both binaries, places them on your PATH, backs up your shell profile before touching it, never uses sudo, has --uninstall, and can opt panes into vendor hook wiring), check-doc-paths.py (the doc-path CI gate), and commpact-shim/ (the prepared v1 compatibility shim and its guarded installer — nothing installs it automatically).</div>
+      </details>
+      <details class="sect">
+        <summary><span class="sect-chev"></span><span class="sect-title mono">tests/</span><span class="sect-trail">e2e gates + the test-only tmux rig</span></summary>
+        <div class="sect-body">tests/e2e/ holds parity-check.sh — the CI gate that re-runs every command shape the README and docs quote against the real binaries (over a hundred checks; more with --with-installer) — plus lib/ (the shared shell rules and the Python probe harness, the one sanctioned poller) and the m1 soak script. tests/testrig/ is the cyclops-testrig crate: the isolated tmux server every tmux-touching test must go through.</div>
+      </details>
+      <details class="sect">
+        <summary><span class="sect-chev"></span><span class="sect-title mono">website/</span><span class="sect-trail">usecyclops.dev — explicit request only</span></summary>
+        <div class="sect-body">A SvelteKit landing page, outside the Cargo workspace but checked by its own CI job. Its static/install.sh must match scripts/install.sh byte for byte — CI fails otherwise, and touching either means running parity-check.sh --with-installer. Modify only on explicit request; when you do, run npm run check and npm run build.</div>
+      </details>
+      <details class="sect">
+        <summary><span class="sect-chev"></span><span class="sect-title">root files</span><span class="sect-trail">README, AGENTS, STATUS, findings, CONTRIBUTING…</span></summary>
+        <div class="sect-body"><code>README.md</code> is the user front door — its quoted terminal output is CI-verified against the real binaries, so never hand-edit an output block. <code>AGENTS.md</code> is the condensed orientation page for AI coding agents. <code>CONTRIBUTING.md</code> holds the development loop and the five gates every change must pass. <code>STATUS.md</code> is the maintained record of what is built, verified, and deliberately not built. <code>findings.md</code> records measured facts (numbered F13+), each with the probe that proved it — when a comment cites “F24”, this is where to look it up. <code>CHANGELOG.md</code> tracks what each milestone shipped, <code>SECURITY.md</code> is the private vulnerability channel, and <code>Cargo.toml</code> is the workspace root (which deliberately excludes <code>website/</code>).</div>
+      </details>
+    </div>
+  </div>
+
+  <!-- ============================== level 3 ================================ -->
+  <div class="section vgap">
+    <h2>Level 3 — Follow one message through the system</h2>
+    <p>
+      The single most representative thing Cyclops does: one agent sends a message to another, and the
+      sender gets back a receipt it can trust. Step through what happens between the command below and
+      its receipt — the “learn more” rows expand the technology behind each step (tmux internals,
+      NDJSON, sensor fusion, workers) in place.
+    </p>
+    <div class="cmd">
+      <div class="cmd-line"><span class="c">cyclops send reviewer --subject "Burst path fix, ready for review" --body "gateway.rs:120. Tests pass."</span></div>
+    </div>
+
+    <div class="trace-grid">
+      <div id="traceNav">
+        <div class="tstep" data-step="0"><span class="num">01</span><span class="ttl">The command</span></div>
+        <div class="tstep" data-step="1"><span class="num">02</span><span class="ttl">One JSON line over the socket</span></div>
+        <div class="tstep" data-step="2"><span class="num">03</span><span class="ttl">Who is actually sending?</span></div>
+        <div class="tstep" data-step="3"><span class="num">04</span><span class="ttl">Written down before anything happens</span></div>
+        <div class="tstep" data-step="4"><span class="num">05</span><span class="ttl">Into the queue</span></div>
+        <div class="tstep" data-step="5"><span class="num">06</span><span class="ttl">The gate</span></div>
+        <div class="tstep" data-step="6"><span class="num">07</span><span class="ttl">The paste</span></div>
+        <div class="tstep" data-step="7"><span class="num">08</span><span class="ttl">Verify before submit</span></div>
+        <div class="tstep" data-step="8"><span class="num">09</span><span class="ttl">Submit</span></div>
+        <div class="tstep" data-step="9"><span class="num">10</span><span class="ttl">The receipt</span></div>
+      </div>
+
+      <div class="card" id="tracePanels">
+
+        <!-- step 1 -->
+        <div class="tpanel" data-step="0">
+          <div class="card-head"><span>Step 1 of 10 · The command</span><span class="pill">you / an agent</span></div>
+          <div class="card-body vgap">
+            <p>In the implementer's tmux pane, someone (a human, or the agent itself — agents run the same CLI) runs the send command. The <code>cyclops</code> binary parses it with clap. Notice that nothing in the command says who is sending — that gets resolved later, on the daemon's side, from evidence.</p>
+            <p class="where">Where in the code: <code>src/cyclops/src/main.rs · user-facing sentences in src/cyclops/src/copy.rs</code></p>
+            <details class="sect">
+              <summary><span class="sect-chev"></span><span class="sect-title">Why two binaries — cyclops vs. cyclopsd?</span></summary>
+              <div class="sect-body vgap-sm">
+                <p class="small">“cyclops” and “cyclopsd” are two separately compiled executables from the same workspace — not two commands inside one program. A “binary” just means a compiled, directly-runnable program file, as opposed to source code or a script an interpreter reads line by line.</p>
+                <div class="grid2">
+                  <div class="dbox">
+                    <div class="dbox-title">cyclops</div>
+                    <div class="dbox-line">one-shot: runs, does one thing, exits</div>
+                    <div class="dbox-line">invoked directly — by you, or by an agent</div>
+                  </div>
+                  <div class="dbox">
+                    <div class="dbox-title">cyclopsd</div>
+                    <div class="dbox-line">long-running: stays up, holds all the state</div>
+                    <div class="dbox-line">you never invoke it — <code>cyclops</code> starts it for you</div>
+                  </div>
+                </div>
+                <p class="small tertiary">The split matters for identity: the daemon figures out who's sending by walking the calling process's ancestry up to a watched pane — that trick only works because sending happens from a fresh, separate process each time.</p>
+              </div>
+            </details>
+            <div class="btn-row">
+              <button class="btn" disabled>Previous</button>
+              <button class="btn primary" onclick="traceGo(1)">Next step</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- step 2 -->
+        <div class="tpanel" data-step="1">
+          <div class="card-head"><span>Step 2 of 10 · One JSON line over the socket</span><span class="pill">CLI</span></div>
+          <div class="card-body vgap">
+            <p>The CLI opens the Unix socket at <code>~/.cyclops/sock</code>, reads the daemon's hello line, and writes a single JSON line: a <code>msg.send</code> request with <code>to</code>, <code>subject</code>, and <code>body</code>. The client is deliberately simple, fully synchronous code — the daemon does all the hard work.</p>
+            <p class="where">Where in the code: <code>src/cyclops/src/client.rs · types in src/cyclops-proto/src/wire.rs</code></p>
+            <details class="sect">
+              <summary><span class="sect-chev"></span><span class="sect-title">What does “one JSON line” (NDJSON) actually mean?</span></summary>
+              <div class="sect-body vgap-sm">
+                <p class="small">NDJSON = newline-delimited JSON: one complete JSON object per line, no wrapping array, no commas between records. Cyclops uses it in two places — this socket exchange is one, the on-disk ledger (a few steps ahead) is the other.</p>
+                <p class="small tertiary">Why it fits a live connection: each line is parseable the instant it arrives — no waiting for a closing <code>]</code> that a still-open socket may never send.</p>
+              </div>
+            </details>
+            <div class="btn-row">
+              <button class="btn" onclick="traceGo(0)">Previous</button>
+              <button class="btn primary" onclick="traceGo(2)">Next step</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- step 3 -->
+        <div class="tpanel" data-step="2">
+          <div class="card-head"><span>Step 3 of 10 · Who is actually sending?</span><span class="pill">daemon</span></div>
+          <div class="card-body vgap">
+            <p>The daemon reads the caller's process id from the socket's peer credentials and walks up the process tree until it reaches a process living in a watched tmux pane. The record will say “implementer → reviewer” because that is where the call physically came from — identity is never taken from the request, so nothing in a body can forge the header a recipient reads. No watched pane in the ancestry means the send is refused (fail closed).</p>
+            <p class="where">Where in the code: <code>src/cyclopsd/src/identity.rs</code></p>
+            <div class="btn-row">
+              <button class="btn" onclick="traceGo(1)">Previous</button>
+              <button class="btn primary" onclick="traceGo(3)">Next step</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- step 4 -->
+        <div class="tpanel" data-step="3">
+          <div class="card-head"><span>Step 4 of 10 · Written down before anything happens</span><span class="pill">daemon</span></div>
+          <div class="card-body vgap">
+            <p>A <code>msg</code> line is appended to the ledger file of every session involved and fsynced to disk before the daemon does anything else. From this moment the message exists durably — a daemon crash can no longer lose it. Its delivery state starts at <code>queued</code>, the first of ten named states every delivery moves through.</p>
+            <p class="where">Where in the code: <code>src/cyclops-ledger · schema in src/cyclops-proto/src/ledger.rs</code></p>
+            <p class="where">On the record: <code>msg line appended to ~/.cyclops/ledger/&lt;session&gt;.ndjson</code></p>
+            <details class="sect">
+              <summary><span class="sect-chev"></span><span class="sect-title">Show me the actual line that gets written</span></summary>
+              <div class="sect-body vgap-sm">
+                <p class="small">The exact line this step appends to <code>~/.cyclops/ledger/main.ndjson</code>:</p>
+                <div class="ledger-line">{"seq":47,"boot_id":"b-a1c2","id":"m-be0129","ts":1735900000000,
+ "kind":"msg","from":"implementer","to":["reviewer"],
+ "subject":"Burst path fix, ready for review","body":"gateway.rs:120. Tests pass.",
+ "deliveries":[{"to":"reviewer","state":"queued","attempts":0,"ts":1735900000000}]}</div>
+                <p class="small tertiary">Same NDJSON idea as the socket protocol, chosen here for a different reason: append-safety. Adding a new fact is just a new line at the end — nothing earlier is touched or re-parsed, which is exactly what a crash-safe record needs. Every later line about this message (a gate decision, a state transition) reuses this same <code>id</code>, so <code>cyclops thread m-be0129</code> can reconstruct the whole story with one filter.</p>
+              </div>
+            </details>
+            <div class="btn-row">
+              <button class="btn" onclick="traceGo(2)">Previous</button>
+              <button class="btn primary" onclick="traceGo(4)">Next step</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- step 5 -->
+        <div class="tpanel" data-step="4">
+          <div class="card-head"><span>Step 5 of 10 · Into the queue</span><span class="pill">daemon</span></div>
+          <div class="card-body vgap">
+            <p>The message is handed to the reviewer pane's delivery worker. Each target pane has exactly one worker and it processes strictly in order (first in, first out), so two messages can never interleave inside one pane's input box. The code reads in call order: msg_send → worker_for → worker_loop → process → gate → attempt_delivery.</p>
+            <p class="where">Where in the code: <code>src/cyclopsd/src/delivery.rs</code></p>
+            <details class="sect">
+              <summary><span class="sect-chev"></span><span class="sect-title">What is “a worker”, exactly?</span></summary>
+              <div class="sect-body">
+                <div class="grid2">
+                  <div class="dbox strong">
+                    <div class="dbox-title">reviewer's worker</div>
+                    <div class="dbox-line">one dedicated async task, spawned on first delivery</div>
+                    <div class="dbox-line">queue: [msg 2] [msg 3]  — strict FIFO</div>
+                    <div class="dbox-line">processing msg 1 right now: gate → paste → verify → submit → ACK</div>
+                    <div class="dbox-line">msg 2 cannot start until msg 1 fully resolves</div>
+                  </div>
+                  <div class="dbox">
+                    <div class="dbox-title">implementer's worker</div>
+                    <div class="dbox-line">a completely separate task, separate queue</div>
+                    <div class="dbox-line">unaffected if reviewer's worker is slow or parked</div>
+                    <div class="dbox-line">this is why one broadcast can return mixed receipts</div>
+                  </div>
+                </div>
+              </div>
+            </details>
+            <div class="btn-row">
+              <button class="btn" onclick="traceGo(3)">Previous</button>
+              <button class="btn primary" onclick="traceGo(5)">Next step</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- step 6 -->
+        <div class="tpanel" data-step="5">
+          <div class="card-head"><span>Step 6 of 10 · The gate</span><span class="pill">worker</span></div>
+          <div class="card-body vgap">
+            <p>Before touching the pane, the worker runs eight ordered checks: is the session attached? Is the pane still there, alive, and not in copy-mode? Is a manifest bound? Then it recomputes the pane's fused state with the screen sensor forced, and only <code>idle</code> proceeds. An agent mid-task means hold — and a hold waits on an event (the working-to-idle edge), never on a timer. A modal whose manifest declares decline keys gets auto-dismissed; an agent blocked on quota means park, which is terminal. Every gate decision becomes a ledger line carrying a one-word cause.</p>
+            <p class="where">Where in the code: <code>src/cyclopsd/src/delivery.rs · spec in docs/development/DELIVERY.md</code></p>
+            <p class="where">On the record: <code>one gate line per decision, each with a cause word</code></p>
+            <details class="sect">
+              <summary><span class="sect-chev"></span><span class="sect-title">How does the daemon know an agent's state at all?</span></summary>
+              <div class="sect-body vgap-sm">
+                <p class="small">No agent CLI exposes “am I idle” as an API. Fusion reads three imperfect signals off the plain terminal and turns them into one verdict — cheapest signal first:</p>
+                <div class="fusion-grid">
+                  <div class="dbox">
+                    <div class="dbox-title">1. title tier</div>
+                    <div class="dbox-line">#{pane_title} off the control connection</div>
+                    <div class="dbox-line">cheapest — tried first</div>
+                  </div>
+                  <div class="arrow"><div class="arrow-glyph">→</div><div class="arrow-label">decided?</div></div>
+                  <div class="dbox">
+                    <div class="dbox-title">2. screen tier</div>
+                    <div class="dbox-line">capture-pane, only if the title didn't decide</div>
+                    <div class="dbox-line">(the gate always forces it) — last resort</div>
+                  </div>
+                  <div class="arrow"><div class="arrow-glyph">→</div><div class="arrow-label">both fired?</div></div>
+                  <div class="dbox strong">
+                    <div class="dbox-title">fuse</div>
+                    <div class="dbox-line">higher-priority rule's state wins</div>
+                    <div class="dbox-line">disagreement flagged, never hidden</div>
+                  </div>
+                </div>
+                <div class="dash-row"><div class="line"></div><div class="lbl">only when rules came back Unknown</div><div class="line"></div></div>
+                <div class="dbox">
+                  <div class="dbox-title">hook sensor (agent.state.report)</div>
+                  <div class="dbox-line">a lifecycle ping the agent CLI sends itself — can only fill in “Unknown”, never overrule a rule that already decided</div>
+                  <div class="dbox-line">counts as live for 300s, dropped after 3 straight disagreements with the rules tier</div>
+                </div>
+                <p class="small tertiary">A failed screen capture is treated as doubt, never as new evidence — the prior verdict is kept rather than guessed at. That verdict is always one of exactly eight values, and only one of them is safe to paste into. <code>cyclops read &lt;agent&gt; --source detection</code> shows the per-sensor readings behind any verdict, and names the manifest rule that decided.</p>
+                <table>
+                  <thead><tr><th class="center">Glyph</th><th>State</th><th>Meaning</th><th class="center">Safe to paste into?</th></tr></thead>
+                  <tbody>
+                    <tr><td class="center">?</td><td><span class="mono">unknown</span></td><td>No manifest bound, no evidence yet, or sensors disagreed with no safe resolution.</td><td class="center">—</td></tr>
+                    <tr><td class="center">○</td><td><span class="mono">idle</span></td><td>Composer is empty and ready. The only state the gate will paste into.</td><td class="center">yes</td></tr>
+                    <tr><td class="center">◐</td><td><span class="mono">idle_with_input</span></td><td>Something is already staged in the composer — human typing wins, the gate holds.</td><td class="center">—</td></tr>
+                    <tr><td class="center">●</td><td><span class="mono">working</span></td><td>A turn is actively running.</td><td class="center">—</td></tr>
+                    <tr><td class="center">⚠</td><td><span class="mono">blocked_modal</span></td><td>A vendor dialog owns the screen. Dismissal is per-CLI manifest data, never a generic Enter/Escape.</td><td class="center">—</td></tr>
+                    <tr><td class="center">⚠</td><td><span class="mono">blocked_permission</span></td><td>An interactive approval prompt is showing. Screen-only on every tested CLI — no hook fires for it.</td><td class="center">—</td></tr>
+                    <tr><td class="center">⊘</td><td><span class="mono">blocked_quota</span></td><td>Vendor quota exhausted. Terminal: parked, alerted, never auto-retried.</td><td class="center">—</td></tr>
+                    <tr><td class="center">✗</td><td><span class="mono">dead</span></td><td>The pane's process exited.</td><td class="center">—</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </details>
+            <details class="sect">
+              <summary><span class="sect-chev"></span><span class="sect-title">Pane label vs. pane title vs. chrome — three different “names”</span></summary>
+              <div class="sect-body">
+                <div class="grid3">
+                  <div class="card">
+                    <div class="card-head">Pane label</div>
+                    <div class="card-body vgap-sm">
+                      <p class="small tertiary">Set by</p>
+                      <p class="small">you — <code>cyclops name &lt;pane&gt; &lt;label&gt;</code>, or a workspace file</p>
+                      <p class="small tertiary">Read by</p>
+                      <p class="small">everything you type: <code>cyclops send reviewer …</code></p>
+                      <p class="small tertiary">Example</p>
+                      <p class="small secondary">“implementer”, “reviewer” — pure addressing, no detection meaning</p>
+                    </div>
+                  </div>
+                  <div class="card">
+                    <div class="card-head">Pane title</div>
+                    <div class="card-body vgap-sm">
+                      <p class="small tertiary">Set by</p>
+                      <p class="small">the agent CLI itself, via an OSC escape sequence — Cyclops never writes it</p>
+                      <p class="small tertiary">Read by</p>
+                      <p class="small">fusion's title tier, straight off the tmux control connection, no screen capture needed</p>
+                      <p class="small tertiary">Example</p>
+                      <p class="small secondary">Claude Code writes a spinner glyph while working, a sparkle glyph when idle</p>
+                    </div>
+                  </div>
+                  <div class="card">
+                    <div class="card-head">Chrome</div>
+                    <div class="card-body vgap-sm">
+                      <p class="small tertiary">Set by</p>
+                      <p class="small">cyclopsd, into <code>pane-border-format</code> — the pane's decoration, not its title</p>
+                      <p class="small tertiary">Read by</p>
+                      <p class="small">your eyes, on the pane border, e.g. “implementer ● working”</p>
+                      <p class="small tertiary">Example</p>
+                      <p class="small secondary">label (role color) + • + glyph and word (state color), repainted on eight edges and no others</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </details>
+            <div class="btn-row">
+              <button class="btn" onclick="traceGo(4)">Previous</button>
+              <button class="btn primary" onclick="traceGo(6)">Next step</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- step 7 -->
+        <div class="tpanel" data-step="6">
+          <div class="card-head"><span>Step 7 of 10 · The paste</span><span class="pill">worker → tmux</span></div>
+          <div class="card-body vgap">
+            <p>The worker re-checks the pane occupant's process id (did the agent restart while we waited? a shell occupant would EXECUTE the text), then pastes the message using tmux <code>load-buffer</code> + <code>paste-buffer</code>, into a buffer named <code>cyc-&lt;daemon pid&gt;-&lt;seq&gt;</code> so concurrent senders can never race on a shared name. The tmux calls go through <code>cyclops-tmux</code>, because that crate owns every tmux invocation in the product — the “blast wall”.</p>
+            <p class="where">Where in the code: <code>src/cyclops-tmux/src/control.rs</code></p>
+            <details class="sect">
+              <summary><span class="sect-chev"></span><span class="sect-title">How does tmux itself work — server, session, pane, client?</span></summary>
+              <div class="sect-body">
+                <div class="grid2 tmux-2col" style="grid-template-columns: 1.3fr 1fr; gap: 16px; align-items: start;">
+                  <div>
+                    <div class="stair first" style="margin-left: 0;">
+                      <div class="stair-name">server</div>
+                      <div class="stair-body">One background process holding everything real: every session, window, pane, PTY, scrollback. Outlives any terminal window; starts on first use, runs until killed.</div>
+                    </div>
+                    <div class="stair" style="margin-left: 16px;">
+                      <div class="stair-name">session</div>
+                      <div class="stair-body">A named group of windows — the thing you attach/detach from. Cyclops watches at this granularity: one control client per session in <code>config.toml</code>'s <code>sessions</code> list.</div>
+                    </div>
+                    <div class="stair" style="margin-left: 32px;">
+                      <div class="stair-name">window</div>
+                      <div class="stair-body">One tab within a session, holding one or more panes arranged by splits.</div>
+                    </div>
+                    <div class="stair" style="margin-left: 48px;">
+                      <div class="stair-name">pane</div>
+                      <div class="stair-body">One rectangle running one process tree. This is the unit fusion decides state for, and the unit delivery pastes into.</div>
+                    </div>
+                  </div>
+                  <div class="card">
+                    <div class="card-head">Clients — anything attached to the server</div>
+                    <div class="card-body vgap-sm">
+                      <p class="small">A client only *looks at* the server; it holds no real state of its own.</p>
+                      <p class="small secondary">• your interactive terminal (renders panes, sends keystrokes)</p>
+                      <p class="small secondary">• the cyclops workspace, rendering the same panes its own way</p>
+                      <p class="small secondary">• cyclopsd's tmux -C control client — no rendering, just a stream of text notifications in, and commands out</p>
+                      <p class="small tertiary">This is why several people can attach to one session and see the same panes — and why Cyclops never runs its own PTYs: the tmux server does, Cyclops is just one more client.</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </details>
+            <div class="btn-row">
+              <button class="btn" onclick="traceGo(5)">Previous</button>
+              <button class="btn primary" onclick="traceGo(7)">Next step</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- step 8 -->
+        <div class="tpanel" data-step="7">
+          <div class="card-head"><span>Step 8 of 10 · Verify before submit</span><span class="pill">worker</span></div>
+          <div class="card-body vgap">
+            <p>The worker re-reads the pane's input box on a ladder of delays — 0, 120, 240, and 480ms — to confirm the message id is really sitting there. A paste can silently fail; Cyclops never assumes it worked.</p>
+            <p class="where">Where in the code: <code>src/cyclopsd/src/delivery.rs (VERIFY_DELAYS_MS)</code></p>
+            <div class="btn-row">
+              <button class="btn" onclick="traceGo(6)">Previous</button>
+              <button class="btn primary" onclick="traceGo(8)">Next step</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- step 9 -->
+        <div class="tpanel" data-step="8">
+          <div class="card-head"><span>Step 9 of 10 · Submit</span><span class="pill">worker → tmux</span></div>
+          <div class="card-body vgap">
+            <p>One more occupant-pid check, then the manifest's submit key is sent. The reviewer's agent starts its turn with your message as the prompt: a structured header with the sender's verified identity, the subject, the body, and a reply hint at the bottom.</p>
+            <p class="where">Where in the code: <code>src/cyclopsd/src/delivery.rs</code></p>
+            <p class="where">On the record: <code>state transition logged (submitted)</code></p>
+            <div class="btn-row">
+              <button class="btn" onclick="traceGo(7)">Previous</button>
+              <button class="btn primary" onclick="traceGo(9)">Next step</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- step 10 -->
+        <div class="tpanel" data-step="9">
+          <div class="card-head"><span>Step 10 of 10 · The receipt</span><span class="pill">hook → daemon</span></div>
+          <div class="card-body vgap">
+            <p>When the recipient agent's vendor hook fires, it runs <code>cyclops hook</code>, which posts a report carrying the message id back to the daemon. That marks the record <code>delivered · verified</code> — the agent itself confirmed this exact message. Without hooks wired, Cyclops falls back to screen evidence and honestly records <code>delivered · unverified (screen)</code>; a late hook report can still upgrade it — the only legal transition out of a delivered state. The sender's CLI prints one receipt per recipient (a busy pane honestly reads <code>queued · 1 ahead</code>), and every transition along the way is already on disk.</p>
+            <p class="where">Where in the code: <code>src/cyclops/src/hook.rs · src/cyclopsd/src/ack.rs</code></p>
+            <p class="where">On the record: <code>delivered_verified (hook) or delivered_unverified (screen)</code></p>
+            <details class="sect">
+              <summary><span class="sect-chev"></span><span class="sect-title">Manifests vs. hooks — what's shipped vs. what gets wired</span></summary>
+              <div class="sect-body">
+                <div class="grid2">
+                  <div class="card">
+                    <div class="card-head"><span class="mono" style="font-size: 12px;">resources/manifests/*.toml</span><span class="pill info">Shipped by Cyclops — you don't write these</span></div>
+                    <div class="card-body"><p class="small">The “peeking” rulebook: regex over pane title and screen text, per vendor CLI, empirically measured. Seeded into ~/.cyclops/manifests on first run; your edits are never clobbered, and unedited shipped copies are refreshed in place when a fix ships. Detection works with zero setup — but it can only ever produce screen-tier evidence.</p></div>
+                  </div>
+                  <div class="card">
+                    <div class="card-head"><span class="mono" style="font-size: 12px;">vendor hooks → cyclops hook</span><span class="pill info">Wired once per agent, deliberately</span></div>
+                    <div class="card-body"><p class="small">The “walkie-talkie” that upgrades receipts to <code>delivered · verified</code>. Two lanes: <code>cyclops hooks install &lt;cli&gt; --agent &lt;label&gt;</code> prepares a config under ~/.cyclops/hooks/ and prints wiring instructions (it refuses to touch vendor directories itself); the source installer can wire vendor hook files for you — merging around your existing handlers, backing the file up once, opt-out with CYCLOPS_NO_VENDOR_HOOKS=1. Either way, finish with <code>cyclops hooks selftest &lt;agent&gt;</code>, which sends one real no-op delivery and proves the ack fires. Ack ability is per-CLI: Claude, Codex, and Cursor can reach the verified tier; agy has no payload-matchable ack, so its deliveries honestly stay screen-tier.</p></div>
+                  </div>
+                </div>
+              </div>
+            </details>
+            <div class="btn-row">
+              <button class="btn" onclick="traceGo(8)">Previous</button>
+              <button class="btn primary" disabled>Next step</button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <div class="callout">
+      <div class="callout-title">The ledger is the debugger</div>
+      Every one of these transitions became a line in the ledger, so when a delivery looks stuck you
+      read the record, not the logs: find the last state line for the message id, then the gate lines
+      above it — each carries a one-word cause. A hold always waits on an event, never a clock, so
+      "stuck" always means "which event never arrived?". (The cause table is in the Contribute section
+      below.)
+    </div>
+  </div>
+
+  <!-- ============================== level 4 ================================ -->
+  <div class="section vgap">
+    <h2>Level 4 — Why it's built this way</h2>
+    <p>
+      Six decisions explain most of what looks unusual in this codebase. They're recorded in
+      <code>docs/development/HANDOFF.md</code> with the alternatives that were rejected; here's the
+      short form.
+    </p>
+    <div>
+      <details class="sect">
+        <summary><span class="sect-chev"></span><span class="sect-title">Ride tmux, don't replace it</span></summary>
+        <div class="sect-body">Cyclops attaches to your existing tmux server through control mode (<code>tmux -C</code>) instead of hosting its own terminals. Comparable systems spend 7k–200k lines owning PTYs; Cyclops rejected that cost. The trade-off: every tmux quirk is Cyclops's problem, which is why all tmux code is confined to one crate and an advisory CI job builds tmux from master as an early-warning canary.</div>
+      </details>
+      <details class="sect">
+        <summary><span class="sect-chev"></span><span class="sect-title">Manifests are data files</span></summary>
+        <div class="sect-body">Everything Cyclops knows about a vendor CLI is one TOML file. Vendor behavior in Rust would mean a review-and-release cycle for every vendor UI tweak; in a manifest it's a text edit on the machine that has the problem. The schema has grown exactly twice, both times forced by a measurement (F19, F21) — a finding first, a schema change second.</div>
+      </details>
+      <details class="sect">
+        <summary><span class="sect-chev"></span><span class="sect-title">The ledger is append-only NDJSON</span></summary>
+        <div class="sect-body">One file per session, one JSON object per line, fsynced, never rewritten — corrections are new lines. A stranger with <code>jq</code> can read the full history months later without any Cyclops software. This is also why a daemon crash loses nothing: every fact was on disk before it was acted on. Measured, not guessed: no index needed, a 10,000-line scan takes ~7ms.</div>
+      </details>
+      <details class="sect">
+        <summary><span class="sect-chev"></span><span class="sect-title">Zero polling</span></summary>
+        <div class="sect-body">There are no interval timers anywhere. State arrives as tmux control-mode notifications and subscription pushes. Every timer in the codebase is a one-shot tied to an event that already happened (a debounce, a verify re-read, an ACK window — even the workspace's fade animations disarm themselves when the last one lands). The reasoning: a poll would hide a broken event path instead of surfacing it.</div>
+      </details>
+      <details class="sect">
+        <summary><span class="sect-chev"></span><span class="sect-title">The pane title is a sensor, so Cyclops never writes it</span></summary>
+        <div class="sect-body">Vendor CLIs put state information in the pane title, and manifests read it as evidence — Claude's spinner rules ARE the title tier. So Cyclops's own decoration (role and state) goes on the tmux pane border instead: writing the title would poison its own sensor and lose the race to any agent that publishes its own title anyway.</div>
+      </details>
+      <details class="sect">
+        <summary><span class="sect-chev"></span><span class="sect-title">One trait, one implementation — on purpose</span></summary>
+        <div class="sect-body">Delivery reaches a pane through an <code>Injector</code> seam (paste, submit, capture) with exactly one implementation, TmuxInjector. That seam is the designated escape lane to per-vendor headless protocols (Claude stream-json, Codex app-server JSON-RPC, Gemini ACP) if pasting into TUIs ever becomes untenable. It looks like over-abstraction; it's a recorded decision. Don't inline it.</div>
+      </details>
+    </div>
+  </div>
+
+  <!-- ============================== level 5 ================================ -->
+  <div class="section vgap">
+    <h2>Level 5 — Use it</h2>
+    <div class="grid-use">
+      <div class="card">
+        <div class="card-head">Start using Cyclops</div>
+        <div class="card-body vgap">
+          <div class="cmd">
+            <div class="cmd-line"><span class="c">cyclops</span><span class="n"># the workspace: starts a session + the daemon</span></div>
+            <div class="cmd-line"><span class="c">cyclops start --preset duo --agents claude,codex</span><span class="n"># or: build a 2-pane fleet without the UI</span></div>
+            <div class="cmd-line"><span class="c">cyclops status</span><span class="n"># every watched pane, and the eye</span></div>
+            <div class="cmd-line"><span class="c">cyclops send reviewer --subject "hello"</span></div>
+            <div class="cmd-line"><span class="c">cyclops watch</span><span class="n"># the live stream; eye opens when needed</span></div>
+          </div>
+          <p class="small secondary">
+            Inside the workspace: Ctrl+B m names a pane, Ctrl+B s (or the chat button) messages an agent
+            without leaving. Then wire hooks — receipts upgrade from screen-verified to agent-verified
+            (fresh installs via the public installer can wire vendor hooks for you;
+            CYCLOPS_NO_VENDOR_HOOKS=1 declines):
+          </p>
+          <div class="cmd">
+            <div class="cmd-line"><span class="c">cyclops hooks install claude --agent reviewer</span></div>
+            <div class="cmd-line"><span class="c">cyclops hooks selftest reviewer</span><span class="n"># proves they fire</span></div>
+          </div>
+          <p class="small tertiary">
+            A pane showing <code>? unknown</code> means no manifest matched what's running there;
+            <code>cyclops status</code> prints the exact fix. <code>cyclops daemon status|log|stop</code>
+            manages the daemon.
+          </p>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head">Update your install</div>
+        <div class="card-body vgap">
+          <p class="small secondary">
+            Pre-release 0.1.0, no release channel yet — updating is one verb. It says which build you're
+            running, checks the source for a newer commit, reruns the installer from a fresh clone,
+            refreshes any agent hooks it installed (they embed the binary's path), and prints the
+            restart steps:
+          </p>
+          <div class="cmd">
+            <div class="cmd-line"><span class="c">cyclops update</span><span class="n"># already-current stops right there</span></div>
+            <div class="cmd-line"><span class="c">cyclops daemon stop</span><span class="n"># the running daemon is still the old binary</span></div>
+            <div class="cmd-line"><span class="c">cyclops start</span><span class="n"># brings the new one up</span></div>
+            <div class="cmd-line"><span class="c">cyclops --version</span><span class="n"># confirm</span></div>
+          </div>
+          <div class="callout warn">
+            <div class="callout-title">What updates never touch</div>
+            Your config, workspaces, and the ledger under ~/.cyclops (your message history — nothing
+            ever rewrites it). Manifests and themes you edited are never clobbered either; only unedited
+            shipped copies are refreshed in place, recognized by hash, so fixes reach you without
+            risking your changes.
+          </div>
+          <p class="small tertiary">
+            The previous shell/Python implementation lives on as the read-only <code>v1</code> branch
+            and <code>v1-final</code> tag. Nothing migrates v1 state automatically;
+            <code>docs/development/CUTOVER.md</code> is the runbook if you still run it.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================== level 6 ================================ -->
+  <div class="section vgap">
+    <h2>Level 6 — Contribute</h2>
+    <p>
+      Everything below is what a reviewer will hold your first PR to. The short version: prove changes
+      by running them (gates, fixtures, demos), never touch real tmux or a real home from a test, and
+      treat docs as code — they are CI-verified against the binaries.
+    </p>
+
+    <div class="grid-loop">
+      <div class="card">
+        <div class="card-head">The loop — five gates, in this order</div>
+        <div class="card-body vgap">
+          <p class="small secondary">These are the same five core checks CI runs, so a green run here is a green run there:</p>
+          <div class="cmd">
+            <div class="cmd-line"><span class="c">cargo fmt --all</span></div>
+            <div class="cmd-line"><span class="c">cargo clippy --workspace --all-targets -- -D warnings</span></div>
+            <div class="cmd-line"><span class="c">cargo test --workspace --no-fail-fast</span><span class="n"># the flag is not optional (F24)</span></div>
+            <div class="cmd-line"><span class="c">python3 scripts/check-doc-paths.py</span><span class="n"># every quoted path must exist</span></div>
+            <div class="cmd-line"><span class="c">./tests/e2e/parity-check.sh</span><span class="n"># docs must match binary output</span></div>
+          </div>
+          <p class="small tertiary">
+            Touching either installer adds <code>cmp scripts/install.sh website/static/install.sh</code>
+            and <code>./tests/e2e/parity-check.sh --with-installer</code> (a release build). CI also
+            reruns the suite with scratch storage relocated, tests the v1 shim, checks the website
+            build, and runs an advisory job against tmux built from master.
+          </p>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head">Debug a stuck delivery — read the record</div>
+        <div class="card-body vgap">
+          <div class="cmd">
+            <div class="cmd-line"><span class="c">jq -c 'select(.id == "m-b90b2a")' ~/.cyclops/ledger/main.ndjson</span></div>
+          </div>
+          <p class="small secondary">
+            Read the last state line first, then the gate lines above it. Each carries a one-word cause,
+            and the cause tells you where to look — see the table below. Remember: a hold waits on an
+            event, never a clock, so “stuck” is always the question “which event never arrived?”
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <table>
+      <thead><tr><th>Gate cause in the ledger</th><th>It means</th><th>Look at</th></tr></thead>
+      <tbody>
+        <tr><td><span class="mono">no_such_pane · pane_dead · session_detached</span></td><td>The target is not there</td><td>The pane table: <code>cyclops status</code></td></tr>
+        <tr><td><span class="mono">working · idle_with_input · pane_in_mode · blocked:&lt;rule&gt; · blocked_quota</span></td><td>The gate is holding on purpose</td><td>Fusion — is the state right? <code>cyclops read &lt;pane&gt;</code></td></tr>
+        <tr><td><span class="mono">no_manifest</span></td><td>Nothing is bound to the pane</td><td>The manifest's process_names vs. what the pane actually runs</td></tr>
+        <tr><td><span class="mono">verify_failed</span></td><td>The paste did not stage</td><td>The manifest's verify_pattern, and where the composer really is</td></tr>
+        <tr><td><span class="mono">pane_rebound</span></td><td>The occupant changed between admit and inject</td><td>Something restarted in that pane. Working as intended</td></tr>
+      </tbody>
+    </table>
+
+    <div class="vgap-sm">
+      <p class="semibold">House rules that bite newcomers</p>
+      <p class="small tertiary">
+        The long forms live in CONTRIBUTING.md and docs/development/INVARIANTS.md (eleven rules, each
+        with the real-world damage it prevents). If you are touching delivery, the ledger, or anything
+        that renders, read INVARIANTS first.
+      </p>
+      <div>
+        <details class="sect">
+          <summary><span class="sect-chev"></span><span class="sect-title">Tests never touch your tmux server or your real ~/.cyclops</span></summary>
+          <div class="sect-body">Every test that needs tmux gets its own throwaway server through cyclops_testrig::TmuxServer (teardown is Drop, so it survives panics), and points CYCLOPS_HOME at scratch. Never invoke tmux directly in a test. Two guard tests enforce this because the rule was fixed three times and kept getting copied back in; shell and Python go through tests/e2e/lib/lib.sh.</div>
+        </details>
+        <details class="sect">
+          <summary><span class="sect-chev"></span><span class="sect-title">Scratch paths come from cyclops_proto::scratch — never /tmp literals</span></summary>
+          <div class="sect-body">Not <code>/private/tmp</code> (macOS-only), not <code>std::env::temp_dir()</code> (its long /var/folders path blows the ~104-byte Unix socket cap). This is finding F24 and it cost two milestones. CI runs the whole suite twice, once with CYCLOPS_TEST_TMP relocated, to catch a hardcoded path.</div>
+        </details>
+        <details class="sect">
+          <summary><span class="sect-chev"></span><span class="sect-title">cargo test needs --no-fail-fast, always</span></summary>
+          <div class="sect-body">cargo stops at the first failing test *binary* and silently never runs the rest — one portability bug passed green across two milestones this way (F24). The flag makes the failure count real. CI passes it; you should too.</div>
+        </details>
+        <details class="sect">
+          <summary><span class="sect-chev"></span><span class="sect-title">Docs are CI-verified against the binaries</span></summary>
+          <div class="sect-body">Never hand-write terminal output into a doc. parity-check.sh re-runs every command the README and docs quote and fails when a line drifts; the fix is to copy the new output from its transcript into the page in the same commit. check-doc-paths.py fails CI when a doc names a file that doesn't exist or a page no front door links to.</div>
+        </details>
+        <details class="sect">
+          <summary><span class="sect-chev"></span><span class="sect-title">A behavior fix needs a test that fails before it</span></summary>
+          <div class="sect-body">Write the test, watch it fail, then fix. A test written after the fix only proves the code passes its own test. And docs ship in the same commit as the behavior — a page describing something that no longer exists is a bug, not a stale doc.</div>
+        </details>
+        <details class="sect">
+          <summary><span class="sect-chev"></span><span class="sect-title">No polling — find the event</span></summary>
+          <div class="sect-body">If you are reaching for an interval timer, you have not found the event yet (INVARIANTS.md, rule 9). Every recompute rides a tmux notification, a socket request, or a one-shot deadline tied to something that already happened.</div>
+        </details>
+        <details class="sect">
+          <summary><span class="sect-chev"></span><span class="sect-title">Wire changes are additive; vendor behavior goes in manifests</span></summary>
+          <div class="sect-body">New protocol fields are optional, unknown fields are ignored in both directions, and a version mismatch warns rather than rejects. Anything Cyclops learns about a vendor CLI goes in a TOML manifest, never in Rust.</div>
+        </details>
+        <details class="sect">
+          <summary><span class="sect-chev"></span><span class="sect-title">Record what you measured, and write plainly</span></summary>
+          <div class="sect-body">A learned fact about tmux, a vendor CLI, or a platform goes in findings.md with the probe that proved it — comments cite these F-numbers. STYLE.md is binding on code, comments, and docs: write for a tired engineer who has never seen this repo.</div>
+        </details>
+      </div>
+    </div>
+
+    <div class="vgap">
+      <p class="semibold">Great first contributions</p>
+      <div>
+        <details class="sect">
+          <summary>
+            <span class="sect-chev"></span>
+            <span class="sect-title">1. Teach Cyclops a new agent CLI</span>
+            <span class="sect-trail">one TOML file, no Rust</span>
+          </summary>
+          <div class="sect-body vgap-sm">
+            <p class="small">
+              Adding an agent is the most common thing anyone does to this system, and it is deliberately
+              code-free. Write one TOML file in resources/manifests/ (codex.toml is the closest thing to a
+              template; the full page is docs/reference/MANIFESTS.md):
+            </p>
+            <div class="grid4boxes">
+              <div class="dbox">
+                <div class="dbox-title">[agent] process_names</div>
+                <div class="dbox-line">binds the file to a pane by its foreground command</div>
+                <div class="dbox-line">add argv_basenames too if the CLI installs as a versioned symlink (F21)</div>
+              </div>
+              <div class="dbox">
+                <div class="dbox-title">[[rule]] blocks</div>
+                <div class="dbox-line">read state off the pane title or the screen, by priority</div>
+                <div class="dbox-line">titles are cheap; a title rule that decides skips capture entirely</div>
+              </div>
+              <div class="dbox">
+                <div class="dbox-title">[injection] verify_pattern</div>
+                <div class="dbox-line">must contain &lt;message_id&gt;</div>
+                <div class="dbox-line">that substitution proves the composer staged THIS message</div>
+              </div>
+              <div class="dbox">
+                <div class="dbox-title">[hooks] ack</div>
+                <div class="dbox-line">declare it if the CLI can run hooks</div>
+                <div class="dbox-line">declare nothing and the agent is tier-2 (screen receipts), which works</div>
+              </div>
+            </div>
+            <p class="small tertiary">
+              Prove it with fixtures, not by eye: put real screen captures in
+              src/cyclops-manifest/tests/fixtures/ and register them in
+              src/cyclops-manifest/tests/shipped_rules.rs. Then check it live with <code>cyclops list</code>,
+              and pin it if binding is ambiguous: <code>cyclops name %3 reviewer --manifest &lt;id&gt;</code>.
+              If you become convinced the schema itself must grow, that is a findings.md entry first and a
+              schema change second — it has grown exactly twice, both times measurement-forced.
+            </p>
+          </div>
+        </details>
+        <details class="sect">
+          <summary>
+            <span class="sect-chev"></span>
+            <span class="sect-title">2. A small UI/UX change</span>
+            <span class="sect-trail">workspace · watch · theme</span>
+          </summary>
+          <div class="sect-body vgap-sm">
+            <p class="small">
+              Good first surface: the full-screen workspace (<code>cyclops-workspace</code>), the live stream
+              <code>cyclops watch</code>, or a theme under <code>resources/themes/</code>. Examples that stay
+              reviewable: clearer empty states, denser or calmer spacing, a missing keybinding hint, a theme
+              that fixes a contrast miss. Keep the change small enough that a reviewer can see the before/after
+              in one sitting.
+            </p>
+            <p class="small tertiary">
+              Guardrails: renderers use theme tokens, never raw colors; the pane title is a sensor — never write
+              it; decoration goes on the pane border. If the change touches anything that prints (CLI tables,
+              status lines, watch chrome that docs quote), read INVARIANTS.md first and expect
+              <code>parity-check.sh</code> to notice drifted output.
+            </p>
+          </div>
+        </details>
+        <details class="sect">
+          <summary>
+            <span class="sect-chev"></span>
+            <span class="sect-title">3. Clarify the README or a public-facing guide</span>
+            <span class="sect-trail">prose, not invented output</span>
+          </summary>
+          <div class="sect-body vgap-sm">
+            <p class="small">
+              Newcomers hit README.md and <code>docs/guides/</code> first. Tightening a confusing paragraph,
+              filling a missing “what do I do next”, or making QUICKSTART match how people actually set up a
+              duo is high leverage — and docs are treated as code here.
+            </p>
+            <p class="small tertiary">
+              Guardrails: never hand-write a quoted terminal block; if output changed, copy it from the
+              <code>parity-check.sh</code> transcript in the same commit. Every path a doc names must exist
+              (<code>check-doc-paths.py</code>), and every page must be reachable from README.md or HANDOFF.md.
+              The landing site under <code>website/</code> is a separate job — only touch it on an explicit
+              request, and keep <code>website/static/install.sh</code> byte-identical to <code>scripts/install.sh</code>.
+            </p>
+          </div>
+        </details>
+      </div>
+    </div>
+  </div>
+
+  <hr class="divider" />
+
+  <!-- ============================ where to go next ========================== -->
+  <div class="section vgap">
+    <h2>Where to go next</h2>
+    <div class="readnext">
+      <div class="readnext-row">
+        <span class="btn">HANDOFF.md</span>
+        <span class="small tertiary">the developer map — read before changing code</span>
+      </div>
+      <div class="readnext-row">
+        <span class="btn">CONTRIBUTING.md</span>
+        <span class="small tertiary">the loop, the gates, and the rules in full</span>
+      </div>
+      <div class="readnext-row">
+        <span class="btn">QUICKSTART.md</span>
+        <span class="small tertiary">the two-agent review handoff, start to finish</span>
+      </div>
+      <div class="readnext-row">
+        <span class="btn">INVARIANTS.md</span>
+        <span class="small tertiary">eleven rules a change must never break</span>
+      </div>
+      <div class="readnext-row">
+        <span class="btn">ARCHITECTURE.md</span>
+        <span class="small tertiary">one message end to end, with diagrams</span>
+      </div>
+      <div class="readnext-row">
+        <span class="btn">knowledge base index</span>
+        <span class="small tertiary">generated deep-dive docs</span>
+      </div>
+    </div>
+    <p class="small tertiary">
+      One last norm worth knowing: docs/development/STYLE.md is binding on code, comments, and docs —
+      write for a tired engineer who has never seen this repo. And when you learn something surprising
+      about tmux, a vendor CLI, or a platform, it belongs in findings.md with the probe that proved it,
+      before the fix that uses it.
+    </p>
+  </div>
+
+</div>
+
+<script>
+  // ------------------------- trace explorer navigation -------------------------
+  var traceSteps = document.querySelectorAll("#traceNav .tstep");
+  var tracePanels = document.querySelectorAll("#tracePanels .tpanel");
+
+  function traceGo(i) {
+    if (i < 0 || i >= tracePanels.length) return;
+    traceSteps.forEach(function (el, idx) { el.classList.toggle("active", idx === i); });
+    tracePanels.forEach(function (el, idx) { el.classList.toggle("active", idx === i); });
+  }
+
+  traceSteps.forEach(function (el) {
+    el.addEventListener("click", function () { traceGo(parseInt(el.dataset.step, 10)); });
+  });
+
+  traceGo(0);
+
+  // -------------------------------- theme toggle -------------------------------
+  var root = document.documentElement;
+  var saved = null;
+  try { saved = localStorage.getItem("cyclops-onboarding-theme"); } catch (e) {}
+  root.dataset.theme = saved || "dark";
+
+  document.getElementById("themeToggle").addEventListener("click", function () {
+    root.dataset.theme = root.dataset.theme === "dark" ? "light" : "dark";
+    try { localStorage.setItem("cyclops-onboarding-theme", root.dataset.theme); } catch (e) {}
+  });
+</script>
+</body>
+</html>
