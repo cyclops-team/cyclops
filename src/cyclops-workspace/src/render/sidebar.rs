@@ -103,6 +103,11 @@ pub fn paint_sidebar(
     if area.width == 0 || area.height == 0 {
         return;
     }
+    // A tab that is no longer offered paints as the default one. The load
+    // path coerces too, but app state outlives a config read: a session
+    // already running when the switch flipped would otherwise sit on a
+    // panel with no chip left to leave it by.
+    let tab = tab.available();
     buf.set_style(area, theme::chrome_panel(paint));
     // No border down this edge. The pane canvas draws its own one column
     // over, so a rule here stood two parallel lines beside each other with
@@ -478,6 +483,32 @@ fn paint_toggle(
     hits.push(hit, HitTarget::SidebarToggle);
 }
 
+/// The workspace attention rollup, right-aligned on the header row.
+///
+/// Its own function because both header shapes carry it: the tab strip and
+/// the plain title a single offered tab falls back to. Painted only when
+/// real room is left over, never crushed against what precedes it.
+fn paint_attention_rollup(
+    row: Rect,
+    right: u16,
+    buf: &mut Buffer,
+    paint: &Paint,
+    decoration: &DecorationSnapshot,
+) {
+    if !decoration.workspace_needs_attention() {
+        return;
+    }
+    let style =
+        theme::attention_eye(paint).patch(paint.bg_token(cyclops_theme::tokens::CHROME_PANEL));
+    let mark = " ◉";
+    let width = u16::try_from(Span::raw(mark).width()).unwrap_or(u16::MAX);
+    let x = right.saturating_sub(width);
+    if x <= row.x {
+        return;
+    }
+    super::overlay_text(buf, row, x, row.y, mark, style);
+}
+
 /// The tab header: one row of chips naming what the body below shows, with
 /// the workspace attention rollup after them.
 ///
@@ -496,6 +527,26 @@ fn paint_tab_header(
     let row = Rect::new(inner.x, inner.y, inner.width, 1);
     let right = inner.x + inner.width;
     let lead = 1.min(inner.width);
+
+    // One tab is not a tab. With the Stream tab off there is nothing to
+    // pick between, and a lone filled chip reads as a control that does
+    // something when clicking it cannot. So the row goes back to the plain
+    // title it carried before the stream moved into this panel, keeping the
+    // row itself and therefore every row offset below it.
+    if SidebarTab::offered().len() < 2 {
+        buf.set_style(row, theme::chrome_panel(paint));
+        super::overlay_text_ellipsized(
+            buf,
+            Rect::new(row.x + lead, row.y, inner.width.saturating_sub(lead), 1),
+            row.x + lead,
+            row.y,
+            copy::SIDEBAR_TAB_SESSIONS,
+            theme::sidebar_label(paint),
+        );
+        paint_attention_rollup(row, right, buf, paint, decoration);
+        return;
+    }
+
     let chips = [
         (SidebarTab::Sessions, copy::SIDEBAR_TAB_SESSIONS),
         (SidebarTab::Stream, copy::SIDEBAR_TAB_STREAM),
@@ -1327,6 +1378,51 @@ mod tests {
         );
     }
 
+    /// With one tab offered the header is a plain title, not a lone chip,
+    /// and nothing on the row claims to switch anything.
+    ///
+    /// The Stream tab is off while it is revised. What must not happen is a
+    /// single filled chip that reads as a control and answers a click by
+    /// doing nothing, or a stray Stream hit region left behind.
+    #[test]
+    fn one_offered_tab_paints_a_title_rather_than_a_chip_that_does_nothing() {
+        if crate::persist::STREAM_TAB {
+            return;
+        }
+        let project = Project::new("sidebar-one-tab");
+        let mut files = project.tree();
+        let height = 22;
+        let width = crate::render::SIDEBAR_MIN_WIDTH;
+        let (buf, hits) = draw_split(&mut files, 8, height);
+
+        assert!(
+            (0..width)
+                .flat_map(|x| (0..height).map(move |y| (x, y)))
+                .all(|(x, y)| !matches!(hits.hit(x, y), Some(HitTarget::SidebarTab { .. }))),
+            "no tab chip answers the mouse when there is nothing to switch to"
+        );
+        let flat = flatten(&buf);
+        assert!(
+            !flat.contains(copy::SIDEBAR_TAB_STREAM),
+            "and the Stream label is gone from the panel: {flat}"
+        );
+        // The row is still there and still names what is under it, so every
+        // row offset below it is unchanged.
+        assert!(
+            flatten_row(&buf, 0).contains(copy::SIDEBAR_TAB_SESSIONS)
+                || flatten_row(&buf, 0).contains('…'),
+            "the header still names the panel: {:?}",
+            flatten_row(&buf, 0)
+        );
+    }
+
+    /// One row of the buffer as painted.
+    fn flatten_row(buf: &Buffer, y: u16) -> String {
+        (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect()
+    }
+
     /// A short sidebar gives the whole column to the session tree. Two
     /// panels in ten rows is two panels nobody can read, and the one that
     /// was there first is the one that keeps the space.
@@ -1374,6 +1470,13 @@ mod tests {
     /// file panel belongs beside the session tree, not on top of a feed.
     #[test]
     fn the_stream_tab_is_not_split() {
+        // The Stream tab is off while it is revised
+        // (`persist::STREAM_TAB`). This pins behavior that comes back with
+        // it, so it is gated rather than deleted.
+        if !crate::persist::STREAM_TAB {
+            return;
+        }
+
         let project = Project::new("sidebar-split-stream");
         let mut files = project.tree();
         let workspaces = vec![WorkspaceRow {
@@ -2467,6 +2570,13 @@ mod tests {
     /// pane canvas now.
     #[test]
     fn the_stream_tab_paints_event_rows_inside_the_sidebar_rect() {
+        // The Stream tab is off while it is revised
+        // (`persist::STREAM_TAB`). This pins behavior that comes back with
+        // it, so it is gated rather than deleted.
+        if !crate::persist::STREAM_TAB {
+            return;
+        }
+
         let paint = Paint::for_test();
         let record = one_row_record();
         let word = cyclops_proto::AgentState::BlockedPermission.to_string();
@@ -2518,6 +2628,13 @@ mod tests {
     /// The wider tests above would pass with a header that silently drops
     /// the rollup on every default install.
     fn the_header_fits_both_chips_and_the_rollup_at_the_default_width() {
+        // The Stream tab is off while it is revised
+        // (`persist::STREAM_TAB`). This pins behavior that comes back with
+        // it, so it is gated rather than deleted.
+        if !crate::persist::STREAM_TAB {
+            return;
+        }
+
         let record = Record::new();
         let paint = Paint::for_test();
         let narrow = Rect::new(0, 0, 24, SIDEBAR.height);
@@ -2581,6 +2698,13 @@ mod tests {
 
     #[test]
     fn the_tab_header_selects_and_hit_tests_its_chips() {
+        // The Stream tab is off while it is revised
+        // (`persist::STREAM_TAB`). This pins behavior that comes back with
+        // it, so it is gated rather than deleted.
+        if !crate::persist::STREAM_TAB {
+            return;
+        }
+
         let record = Record::new();
         let paint = Paint::for_test();
 
@@ -2636,6 +2760,13 @@ mod tests {
     /// reads as shortened labels rather than a word chopped in half.
     #[test]
     fn a_narrow_tab_header_splits_between_both_chips_and_ellipsizes_their_labels() {
+        // The Stream tab is off while it is revised
+        // (`persist::STREAM_TAB`). This pins behavior that comes back with
+        // it, so it is gated rather than deleted.
+        if !crate::persist::STREAM_TAB {
+            return;
+        }
+
         let workspaces = vec![WorkspaceRow {
             session_id: "$0".into(),
             name: "cyclops".into(),

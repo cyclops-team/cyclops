@@ -17,7 +17,37 @@ pub enum SidebarTab {
     Stream,
 }
 
+/// Whether the sidebar offers its Stream tab.
+///
+/// Off while the stream is revised. A switch rather than deleted code: the
+/// stream painter, its row model and their tests all still build and still
+/// run, so turning it back on is this line and nothing else. Deleting it
+/// would mean rebuilding it from the commit log.
+pub const STREAM_TAB: bool = false;
+
 impl SidebarTab {
+    /// The tabs the sidebar offers, in the order it shows them.
+    pub fn offered() -> &'static [SidebarTab] {
+        if STREAM_TAB {
+            &[SidebarTab::Sessions, SidebarTab::Stream]
+        } else {
+            &[SidebarTab::Sessions]
+        }
+    }
+
+    /// This tab if it is offered, the default otherwise.
+    ///
+    /// A config written while the Stream tab was on must not strand an
+    /// operator on a tab the sidebar no longer paints, looking at a panel
+    /// with no way back to the one that works.
+    pub fn available(self) -> SidebarTab {
+        if Self::offered().contains(&self) {
+            self
+        } else {
+            SidebarTab::default()
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             SidebarTab::Sessions => "sessions",
@@ -147,7 +177,9 @@ pub fn load_prefs(home: &Path) -> WorkspacePrefs {
         .and_then(|v| v.as_str())
         .and_then(SidebarTab::parse)
     {
-        prefs.sidebar_tab = v;
+        // Coerced on the way in, so a saved tab that is no longer offered
+        // never reaches the app state at all.
+        prefs.sidebar_tab = v.available();
     }
     if let Some(v) = workspace.get("motion").and_then(|v| v.as_bool()) {
         prefs.motion = v;
@@ -380,7 +412,10 @@ mod tests {
             sidebar_visible: false,
             sidebar_width: 28,
             files_rows: 8,
-            sidebar_tab: SidebarTab::Stream,
+            // An offered tab, so this pins the round trip and not the
+            // coercion. `a_tab_no_longer_offered_loads_as_the_default`
+            // covers the other case on its own.
+            sidebar_tab: *SidebarTab::offered().last().expect("a tab is offered"),
             tab_bar_visible: false,
             motion: false,
             workspace_order: vec!["beta".into(), "alpha".into()],
@@ -390,6 +425,32 @@ mod tests {
         save_prefs(&home, &prefs).expect("save");
         let loaded = load_prefs(&home);
         assert_eq!(loaded, prefs);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A saved tab the sidebar no longer offers loads as the default.
+    ///
+    /// The Stream tab is off while it is revised, and an operator who was
+    /// last on it must not come back to a panel with no chip left to leave
+    /// it by. Written against `available()` rather than against Stream by
+    /// name, so it keeps testing the rule when the switch flips back.
+    #[test]
+    fn a_tab_no_longer_offered_loads_as_the_default() {
+        let home = scratch_dir("ws-prefs-tab-gone");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("scratch");
+        std::fs::write(
+            home.join("workspace.toml"),
+            "[workspace]\nsidebar_tab = \"stream\"\n",
+        )
+        .expect("write");
+
+        let loaded = load_prefs(&home);
+        assert_eq!(loaded.sidebar_tab, SidebarTab::Stream.available());
+        assert!(
+            SidebarTab::offered().contains(&loaded.sidebar_tab),
+            "whatever loads has to be a tab the sidebar actually paints"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

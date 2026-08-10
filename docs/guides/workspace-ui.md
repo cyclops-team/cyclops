@@ -5,12 +5,11 @@ project sidebar, a tab bar, and a live pane canvas fed by tmux control
 mode. The tab bar shows by default however many tabs the workspace has,
 because the `+` that makes the next tab lives there; the app menu's
 `Tab bar` item is what puts it away and brings it back. The sidebar is
-the one side panel: its header carries a `Sessions` tab (the workspace
-and agent tree) and a `Stream` tab (the live `cyclops watch` event
-stream). It collapses out of the way with `Ctrl+B` `b` or with the `◂`
-chevron on its outer edge, leaving a one-column rail whose `▸` chevron
-brings it back. The collapse, the tab bar's visibility, and the selected
-sidebar tab all persist, so the workspace reopens the way you left it.
+the one side panel: the workspace and agent tree, over a file tree of
+what is on disk. It collapses out of the way with `Ctrl+B` `b` or with
+the `◂` chevron on its outer edge, leaving a one-column rail whose `▸`
+chevron brings it back. The collapse and the tab bar's visibility both
+persist, so the workspace reopens the way you left it.
 With no tmux server running (or no sessions on it), it starts one — a
 fresh session named `main` with a single shell pane in the directory you
 ran it from. Its first tab is `1`; automatic tab names continue with `2`,
@@ -52,7 +51,6 @@ Default bindings are prefix-first (`Ctrl+B`, same shape as tmux):
 | `Ctrl+B` `[` / `]` | Previous / next workspace |
 | `Ctrl+B` `W` / `K` | Rename / close workspace |
 | `Ctrl+B` `b` | Collapse or reopen the sidebar |
-| `Ctrl+B` `e` | Show the event stream (sidebar's Stream tab); press again for the session list back |
 | `Ctrl+B` `s` | Send a message to an agent |
 | `Ctrl+B` `?` | Open the scrollable keybinding reference |
 
@@ -140,15 +138,10 @@ every pane's top border carries
 use the accent, while the others stay dim. They are clickable without
 focusing the pane first and do not cover the child terminal's first row.
 
-Click either chip in the sidebar's header to switch between the session
-tree and the event stream. The footer's `☰ menu` and `+` buttons stay put
-on both tabs. The two surfaces share one panel, so only one of them is on
-screen at a time.
-
 ## The file panel
 
-The Sessions tab is two panels in one column: who is running, above, and
-what is on disk, below. A dashed rule separates them; drag it to give
+The sidebar is two panels in one column: who is running, above, and what
+is on disk, below. A dashed rule separates them; drag it to give
 either half more rows, and drag it all the way to the footer to close the
 file panel and hand the whole column back to the session tree. The app
 menu's `Files` item is the way back, and the only way back, because a

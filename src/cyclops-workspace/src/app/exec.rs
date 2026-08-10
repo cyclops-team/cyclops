@@ -291,11 +291,23 @@ pub(super) async fn execute(
             // route back to Sessions and the choice persists (visibility
             // belongs to Ctrl+B b and the edge chevron, not to this). A
             // hidden sidebar opens on Stream.
-            let show_stream = !(app.model.sidebar_visible && app.sidebar_tab == SidebarTab::Stream);
-            let tab = if show_stream {
-                SidebarTab::Stream
+            //
+            // While the Stream tab is off (`persist::STREAM_TAB`) this
+            // chord has nowhere to go, so it opens the sidebar and stops
+            // rather than toggling to a tab the panel will not paint. That
+            // is honest: the sidebar appears, which is half of what the
+            // chord promises, and nothing lands the operator on a body with
+            // no chip to leave it by.
+            let tab = if crate::persist::STREAM_TAB {
+                let show_stream =
+                    !(app.model.sidebar_visible && app.sidebar_tab == SidebarTab::Stream);
+                if show_stream {
+                    SidebarTab::Stream
+                } else {
+                    SidebarTab::Sessions
+                }
             } else {
-                SidebarTab::Sessions
+                SidebarTab::default()
             };
             app.sidebar_tab = tab;
             app.prefs.sidebar_tab = tab;
@@ -313,6 +325,11 @@ pub(super) async fn execute(
         Action::SelectSidebarTab { tab } => {
             // No resize: the sidebar keeps its columns, only its body
             // changes, so tmux has nothing to be told.
+            //
+            // Coerced, because a tab that is no longer offered must not be
+            // reachable by any route. The chips that raise this action are
+            // not painted for one, but the action is public.
+            let tab = tab.available();
             app.sidebar_tab = tab;
             app.prefs.sidebar_tab = tab;
             Ok(Outcome {
@@ -2166,6 +2183,13 @@ mod tests {
     /// the sidebar kept its columns.
     #[tokio::test]
     async fn the_stream_chord_toggles_the_stream_and_never_strands_a_tab() {
+        // The Stream tab is off while it is revised
+        // (`persist::STREAM_TAB`). The chord has nowhere to toggle to, so
+        // this pins behavior that comes back with the tab rather than
+        // behavior the build currently has.
+        if !crate::persist::STREAM_TAB {
+            return;
+        }
         if !tmux_available() {
             return;
         }
