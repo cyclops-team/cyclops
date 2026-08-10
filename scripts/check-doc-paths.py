@@ -83,6 +83,7 @@ LITERAL_SKIPS = {
     "tests/raw": "soak output, gitignored on purpose (/tests/raw/ in .gitignore): 1.9MB of daemon logs and pane captures from real agent CLIs",
     "tests/raw/m1-soak/summary.json": "one such run's verdict, quoted by BENCHMARKS.md as a local artifact",
     "tests/raw/m1-soak-2/summary.json": "one such run's verdict, quoted by BENCHMARKS.md as a local artifact",
+    "@src/main.rs": "a reference in the OPERATOR's project, not this one: workspace-ui.md uses it to show that a file panel reference stays relative to the pane's folder after browsing elsewhere",
 }
 
 # A code span is a candidate when it has a slash and no whitespace. That
