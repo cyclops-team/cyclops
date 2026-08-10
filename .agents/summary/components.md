@@ -16,7 +16,7 @@ The foundation: data types only, no IO. Modules re-exported flat from
 - `wire.rs` — the NDJSON socket protocol: `Hello`, `Request`, `Response`,
   `WireError`, `Event`, and every method's param/result types (see
   interfaces.md). Compatibility rule: unknown fields tolerated both ways;
-  version mismatch warns, never rejects.
+  version mismatch warns, never rejects. `PROTOCOL_VERSION = 1`.
 - `ledger.rs` — `LedgerLine`, `Kind` (`Msg, Fyi, System, State, Gate`),
   `Delivery`, `VerifiedBy` (`Hook|Screen`), and `DeliveryState`, the 10-state
   machine with `can_transition_to()` encoding every legal move.
@@ -28,8 +28,7 @@ The foundation: data types only, no IO. Modules re-exported flat from
   the reason spelled out).
 - `scratch.rs` — test scratch paths (`CYCLOPS_TEST_TMP` override;
   `/private/tmp` on macOS for short socket paths).
-- Also: `PROTOCOL_VERSION = 1`, `cyclops_home()` (`$CYCLOPS_HOME` or
-  `~/.cyclops`), `socket_path()`.
+- Also: `cyclops_home()` (`$CYCLOPS_HOME` or `~/.cyclops`), `socket_path()`.
 
 ### cyclops-manifest (`src/cyclops-manifest`)
 
@@ -43,6 +42,9 @@ first match wins. `load_dir()` loads a directory at daemon boot — no hot
 reload. It does *not* decide pane state (fusion does) or capture screens
 (the tmux crate does).
 
+Four manifests ship: `agy`, `claude`, `codex`, `cursor`. Fixtures and
+shipped-rule tests live under `src/cyclops-manifest/tests/`.
+
 ### cyclops-tmux (`src/cyclops-tmux`)
 
 The adapter and "blast wall": nothing outside this crate speaks to tmux.
@@ -55,7 +57,8 @@ The adapter and "blast wall": nothing outside this crate speaks to tmux.
   Per-pane `refresh-client -B` subscriptions push field changes; a
   session-wide subscription catches pane death (a per-pane one cannot, F25);
   structural notifications trigger a 30ms-debounced reconcile against
-  `list-panes`. Emits `PaneEvent` over `broadcast`.
+  `list-panes`. Emits `PaneEvent` over `broadcast`. Session renames are
+  followed by stable tmux session id so watching continues in place.
 - `notify.rs` — parses every `%`-prefixed control-mode line into
   `Notification`; unknown lines are data (`Other`), never errors; `%output`
   payloads are octal-unescaped bytes, not guaranteed UTF-8 (F22).
@@ -77,13 +80,17 @@ index. Filtering/folding lives in `src/cyclopsd/src/history.rs`.
 
 ### cyclops-theme (`src/cyclops-theme`)
 
-25 semantic tokens (`role.1..8`, `surface.*`, `eye.*`, `state.*`,
-`badge.*`); `state_token(AgentState)` and `delivery_token(DeliveryState)`
-group mappings; `Color` with hex parse and nearest-xterm-256 derivation;
-tolerant `Theme::parse` (unknown tokens warn and fall back — resolution is
-total); `select.rs` — selection order `CYCLOPS_THEME` env → `theme` key in
-config → `dark`; `ThemeWatch` hot reload as a *stat* (mtime+len stamps
-checked when a repaint is already due), never a watcher thread or timer.
+42 semantic tokens: `role.1..8`, `surface.*` (including `surface.bg` as the
+pane ground the workspace paints under pane bodies), `eye.*`, `state.*`,
+`badge.*`, `chrome.*` (workspace chrome), and `palette.0..15` (ANSI-16 for
+embedded pane VT). `state_token(AgentState)` and
+`delivery_token(DeliveryState)` group mappings; `Color` with hex parse and
+nearest-xterm-256 derivation; tolerant `Theme::parse` (unknown tokens warn
+and fall back — resolution is total); `select.rs` — selection order
+`CYCLOPS_THEME` env → `theme` key in config → `dark`; `ThemeWatch` hot
+reload as a *stat* (mtime+len stamps checked when a repaint is already due),
+never a watcher thread or timer. Homes seeded before ground/palette tokens
+existed resolve them from compiled defaults until reseeded.
 
 ### cyclops-ui (`src/cyclops-ui`)
 
@@ -103,9 +110,10 @@ Library + thin binary (all logic in the library so tests boot the daemon
 in-process).
 
 - `lib.rs` — shared `Inner` state (config, manifests, sessions, event
-  broadcast, detection cache, registry, theme watch, delivery engine),
-  the public `Daemon` handle, `boot()`, session attach/pump/reattach loop,
-  pane-event handling, output-settle debounce (300ms).
+  broadcast, detection cache, registry, theme watch, delivery engine,
+  workspace UI last-active), the public `Daemon` handle, `boot()`, session
+  attach/pump/reattach loop (including rename follow), pane-event handling,
+  output-settle debounce (300ms).
 - `config.rs` — `Config` from `$CYCLOPS_HOME/config.toml`; tolerant parse;
   missing file is a valid empty config.
 - `fusion.rs` — sensor fusion: manifest binding (pin → comm → argv basename,
@@ -114,8 +122,9 @@ in-process).
   (TTL 300s, contradiction limit 3). Emits state ledger lines + events.
 - `delivery.rs` — the delivery pipeline (spec: `docs/development/DELIVERY.md`): one FIFO
   worker per target pane; gate → paste → verify → submit → ACK; every
-  transition ledger-logged; quota parks are terminal; occupant pid re-checked
-  before paste *and* before submit.
+  transition ledger-logged; quota parks are terminal for the operator-facing
+  product (no re-queue verb); occupant pid re-checked before paste *and*
+  before submit.
 - `ack.rs` — `agent.state.report` ingestion, dedupe, ACK matching.
 - `history.rs` — read model for `msg.history` / `msg.thread`: folds delivery
   state lines back into msg lines at read time; disk never rewritten.
@@ -127,6 +136,9 @@ in-process).
   `chrome = "off"` gates all writes here and nowhere else.
 - `selftest.rs` — hook liveness keyed to occupant pid; `hooks.verify` and
   `hooks.selftest` (one fyi marker through the real pipeline).
+- `workspace_ui.rs` — volatile last-active session/window map for
+  `workspace_ui.get` / `workspace_ui.set` (not persisted across daemon
+  restarts beyond what the workspace client re-sets).
 - `server.rs` — Unix socket: stale-socket protocol, hello first, dispatch,
   event pump after `events.subscribe`, 5s write timeout drops wedged clients.
 
@@ -136,17 +148,25 @@ The CLI binary ("One eye on every agent").
 
 - `client.rs` — synchronous NDJSON client; reads `Hello` first.
 - `main.rs` — clap subcommands (see interfaces.md); global `--json` and
-  `--plain`; exit-code conventions.
-- `workspace.rs` — `cyclops start` (seed config/resources/manifests/themes, ensure
-  daemon, restore-or-build preset, name panes, attach), save/restore.
-  Presets are embedded from `resources/layouts/` with `include_str!` so a fresh
-  install works with no files.
+  `--plain`; exit-code conventions. Bare invocation (no subcommand) opens the
+  workspace after seeding themes/manifests into the home.
+- `workspace.rs` — `cyclops start` (seed config/resources/manifests/themes,
+  optional `--wire-hooks`, `--agents` launch + `CYCLOPS_AGENT` per pane,
+  ensure daemon, restore-or-build preset, name panes, attach), save/restore.
+  Presets are embedded from `resources/layouts/` with `include_str!`.
 - `daemon.rs` — `ensure_running` (spawn detached `cyclopsd`, log to
   `$CYCLOPS_HOME/cyclopsd.log`, wait ≤10s for the socket), stop, log.
 - `hook.rs` — the receiver vendor hooks invoke: fast, silent, exit 0 always,
   3s budget; failures append to `$CYCLOPS_HOME/hook-errors.log`.
-- `hookset.rs` — renders vendor hook configs (claude/codex/agy/cursor); never
-  writes into vendor dot-dirs.
+- `hookset.rs` — renders vendor hook configs (claude/codex/agy/cursor);
+  `wire_vendor` merges into the paths each CLI actually reads (installer
+  opt-in via `--setup-only --wire-hooks`); `refresh` rewrites already-installed
+  hook artifacts so absolute binary paths stay current after `cyclops update`.
+  Manual `hooks install` still never writes into vendor dot-dirs on its own —
+  it stages under `$CYCLOPS_HOME/hooks/<label>/` and prints wiring steps.
+- `update.rs` — `cyclops update`: clone `CYCLOPS_REPO`@`CYCLOPS_REF`, run the
+  installer, report old/new build, print restart steps; refreshes hooks it
+  already installed. Does not restart the daemon or workspace for you.
 - `render.rs` — layout for status/list/history/thread/receipts, reading
   proto's attention register and the UI's `grid` rather than deciding
   anything. `copy.rs` holds every user-facing sentence in one place.
@@ -155,13 +175,29 @@ The CLI binary ("One eye on every agent").
 
 ### cyclops-workspace (`src/cyclops-workspace`)
 
-The full-screen workspace behind bare `cyclops`. `app.rs` owns the event
-loop and model synchronization; `render/` paints the sidebar, tabs, pane
-canvas, dialogs, and event panel with Ratatui; `runtime/` owns the
-Alacritty-backed VT state and normalized cells; `action.rs`, `input/`, and
-`drag.rs` map keyboard and mouse gestures into tmux operations. `persist.rs`
-and `resilience.rs` preserve UI state and reconnect behavior. It uses
-`cyclops-theme` tokens and leaves daemon business rules in proto/daemon.
+The full-screen workspace behind bare `cyclops`. Authoritative UX page:
+`docs/guides/workspace-ui.md`.
+
+- `app.rs` — event loop, model sync, theme/motion selection, daemon
+  reconnect; motion is color-only fades on one-shot deadlines (off under
+  `NO_COLOR`, without truecolor, `CYCLOPS_MOTION=0`, or a slow terminal).
+- `render/` — sidebar (Sessions + Stream tabs), tab bar (with `@` chat
+  button beside `+`), pane canvas, overlays/dialogs, notices.
+- `runtime/` — Alacritty-backed VT state and normalized cells; pane bodies
+  paint the active theme's `surface.bg` and ANSI-16 `palette.*`.
+- `dialog.rs` / `action.rs` — including the **composer**: `Ctrl+B s` (or the
+  chat button) opens a one-line `@name …` dialog; Enter sends via the same
+  path as `cyclops send`, off the draw loop so the daemon's ACK window cannot
+  trip the shared short socket deadline. Free text after `@name` is never
+  re-parsed by a shell.
+- `input/`, `drag.rs`, `bindings.rs`, `selection.rs` — keyboard (prefix
+  `Ctrl+B`), mouse, pane swap grip, text select/copy.
+- `persist.rs` / `resilience.rs` / `daemon.rs` — UI prefs in `config.toml`,
+  `workspace_ui.*` last-active round-trip, reconnect behavior.
+- `decoration.rs` — compact chrome glyphs for sidebar/borders (workspace
+  omits `unknown` on primary surfaces; see the workspace-ui guide).
+
+Leaves the attention rule and delivery semantics in proto/daemon.
 
 ### cyclops-testrig (`tests/testrig`)
 
@@ -179,10 +215,14 @@ contract).
 | Component | What it is |
 |---|---|
 | `website/` | SvelteKit 2 / Svelte 5 static marketing site for usecyclops.dev. Outside Cargo; its own CI job type-checks and builds it, and its hosted installer must match `scripts/install.sh` |
-| `resources/manifests/` | Shipped detection manifests: `agy.toml`, `claude.toml`, `codex.toml`, `cursor.toml`. Compiled into the CLI with `include_str!` and seeded to `$CYCLOPS_HOME/manifests` on first `cyclops start`, never overwritten after |
-| `resources/themes/` | 17 themes: dark, light, high-contrast, catppuccin, gruvbox, nord, tokyo-night, sorbet, meadow, periwinkle, blossom, seafoam, buttercream, midnight, ember, forest, obsidian |
+| `resources/manifests/` | Shipped detection manifests: `agy.toml`, `claude.toml`, `codex.toml`, `cursor.toml`. Compiled into the CLI with `include_str!` and seeded to `$CYCLOPS_HOME/manifests` on first start/bare open, never overwritten after |
+| `resources/themes/` | 17 themes: blossom, buttercream, catppuccin, dark, ember, forest, gruvbox, high-contrast, light, meadow, midnight, nord, obsidian, periwinkle, seafoam, sorbet, tokyo-night |
 | `resources/layouts/` | Presets `solo`, `duo`, `quad`, `ops` — each the previous plus a pane |
-| `resources/hooks/` | Vendor hook config templates per CLI (agy, claude, codex, cursor) rendered by `cyclops hooks install` |
-| `demos/` | Seven runnable end-to-end scripts on isolated tmux servers; `tests/e2e/parity-check.sh` is the CI gate that asserts docs and binaries agree |
-| `scripts/` | `install.sh` (POSIX source installer: builds, places binaries, edits profile with backup, `--uninstall` restores), `check-doc-paths.py` (doc-path + orphan gate), `commpact-shim/` (v1 compatibility shim + tests) |
+| `resources/hooks/` | Vendor hook config templates per CLI (agy, claude, codex, cursor) rendered by `cyclops hooks install` / wiring |
+| `skills/cyclops/` | Agent-facing `SKILL.md` for messaging via the cyclops CLI (confirm flags with `cyclops --help` on the machine) |
+| `demos/` | Seven runnable end-to-end scripts on isolated tmux servers (`m0`–`m5`); `tests/e2e/parity-check.sh` is the CI gate that asserts docs and binaries agree |
+| `scripts/` | `install.sh` (POSIX source installer: builds, places binaries, edits profile with backup, `--uninstall` restores; can pass `--wire-hooks` via setup), `check-doc-paths.py` (doc-path + orphan gate), `commpact-shim/` (v1 compatibility shim + tests) |
 | `tests/` | Test-only tmux rig in `testrig/`; parity, soak, vocabulary, and probe machinery in `e2e/` |
+| `SECURITY.md` | Private vulnerability reporting instructions |
+| `DEMO_DAY_CHECKLIST.md` | Working checklist for the public launch pass |
+| `docs/development/V5.md` | v5 line: admin-as-participant / composer / hooks / status detection |

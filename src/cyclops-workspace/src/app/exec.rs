@@ -718,15 +718,33 @@ async fn new_workspace(app: &mut App, client: &ControlClient) -> Result<Outcome,
     let name = naming::unique_session_name(&naming::session_name_from_folder(&folder), &taken);
     let session_id = client.new_session(&name, &folder).await?;
     client.switch_to_session(&name).await?;
-    let persist = if app.prefs.folder_tracked.contains(&session_id) {
-        false
-    } else {
+    if !app.prefs.folder_tracked.contains(&session_id) {
         app.prefs.folder_tracked.push(session_id);
-        true
-    };
+    }
+    // Land the new row directly under whichever workspace was active when
+    // the operator asked for it, instead of wherever tmux's own session
+    // ordering happens to put it (often above). Rewritten wholesale from
+    // the model's current names — the same move `reorder_workspace` makes
+    // for a drag — because sidebar order lives only in preferences, and
+    // the reconcile this Outcome triggers re-applies that order over
+    // whatever tmux just handed back.
+    let mut order: Vec<String> = app
+        .model
+        .workspaces
+        .iter()
+        .map(|w| w.name.clone())
+        .collect();
+    let insert_at = app
+        .model
+        .workspaces
+        .get(app.model.active_workspace)
+        .map(|_| app.model.active_workspace + 1)
+        .unwrap_or(order.len());
+    order.insert(insert_at, name);
+    app.prefs.workspace_order = order;
     Ok(Outcome {
         reconcile: true,
-        persist,
+        persist: true,
         ..Outcome::default()
     })
 }
@@ -2001,6 +2019,83 @@ mod tests {
         assert!(
             sessions.lines().any(|name| name == expected),
             "expected a deduplicated name {expected:?}, got {sessions}"
+        );
+        // "host" was the active workspace (index 0) when the new one was
+        // created, so the new name must be spliced directly below it — not
+        // appended after "existing", which is where tmux's own session
+        // ordering would otherwise have left it.
+        assert_eq!(
+            app.prefs.workspace_order,
+            vec!["host".to_string(), expected, folder_name],
+            "the new workspace must land directly under the workspace that was active, not wherever tmux's ordering puts it"
+        );
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// A sibling of the naming test above, focused purely on placement: the
+    /// active workspace sits in the *middle* of a longer sidebar list, so
+    /// the new row landing right after it (rather than at the front or the
+    /// back, both of which a less careful splice could produce by accident)
+    /// proves the splice targets whichever workspace is active.
+    #[tokio::test]
+    async fn new_workspace_splices_into_the_order_right_after_the_active_workspace() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-new-workspace-splice");
+        let folder =
+            cyclops_proto::scratch::scratch_dir("cyclops-exec-new-workspace-splice-folder");
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).expect("folder");
+        let folder_name = folder.file_name().unwrap().to_string_lossy().to_string();
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "host",
+            "-c",
+            folder.to_str().expect("UTF-8 scratch path"),
+            "/bin/sh",
+        ]);
+        let pane = pane_ids(&server, "host")[0].clone();
+        let client = rig_client(&server, "host").await;
+        // "host" (the active tab's own session) sits first, with "alpha" and
+        // "beta" trailing behind it — but the active row is moved to
+        // "alpha", the middle of the three, so the splice target is neither
+        // the first nor the last row in the list.
+        let mut model = one_tab_model("host", "@0", &pane, "$host");
+        model.workspaces.push(WorkspaceRow {
+            session_id: "$alpha".into(),
+            name: "alpha".into(),
+            tab_count: 1,
+            window_ids: Vec::new(),
+        });
+        model.workspaces.push(WorkspaceRow {
+            session_id: "$beta".into(),
+            name: "beta".into(),
+            tab_count: 1,
+            window_ids: Vec::new(),
+        });
+        model.active_workspace = 1;
+        let mut app = test_app(model, scratch_home("exec-new-workspace-splice-home"));
+
+        let outcome = execute(&mut app, &client, Action::NewWorkspace)
+            .await
+            .expect("create workspace");
+
+        assert!(outcome.reconcile);
+        assert!(outcome.persist, "the rewritten order must be saved");
+        assert_eq!(
+            app.prefs.workspace_order,
+            vec![
+                "host".to_string(),
+                "alpha".to_string(),
+                folder_name,
+                "beta".to_string(),
+            ],
+            "the new row belongs directly after the active workspace (alpha), not at the front or back of the list"
         );
 
         client.shutdown().await;

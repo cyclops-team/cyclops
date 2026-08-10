@@ -24,7 +24,13 @@ activity arms a 300ms settle debounce; a removed pane drops its cached state
 and emits the event that lets clients drop it from the eye count. Broadcast
 lag triggers a full reconcile — level-triggered, so missed events cost
 freshness, never correctness. Disconnects freeze the pane table, log a
-`detach` line, and reconnect with 200ms→5s backoff.
+`detach` line, and reconnect with 200ms→5s backoff. Session renames are
+matched by stable tmux session id so the watcher and adoption records move
+in place (ledger file path for that run stays on the old name; see
+`STATUS.md`).
+
+Clients can also call `session.watch` to attach a session the daemon was
+not booted with.
 
 ## Sensor fusion
 
@@ -42,11 +48,15 @@ freshness, never correctness. Disconnects freeze the pane table, log a
 On change: one `state` ledger line + one pushed event + a border repaint.
 Rule ids and causes go on the record; raw screen contents never do.
 
+Known detection gap (not a delivery bug): some CLIs still report wrong
+activity (Codex idle↔working confirmed; Cursor Agent seen as `working`
+while typing). Tracked in GitHub issue #7 / `STATUS.md`.
+
 ## Message delivery (send → receipt)
 
 ```mermaid
 sequenceDiagram
-    participant S as sender (CLI/agent)
+    participant S as sender (CLI/workspace/agent)
     participant D as cyclopsd
     participant W as per-pane worker
     participant T as tmux pane
@@ -69,17 +79,24 @@ Every transition is a ledger line, so **the ledger is the debugger**: read
 the last state line for a message, then the gate lines above it — each
 carries a cause word. A hold is waiting on an event, never on a clock, so
 "stuck" always means "which event never arrived". A hold longer than
-`gate_hold_notify_ms` pings the admin once.
+`gate_hold_notify_ms` pings the admin once. Spec:
+`docs/development/DELIVERY.md`. Call order in
+`src/cyclopsd/src/delivery.rs`: `msg_send` → `worker_loop` → `process` →
+`gate` → `attempt_delivery`.
 
 ## The hook path
 
-Vendor hook config (rendered by `cyclops hooks install`) → invokes
-`cyclops hook <event>` with the payload on stdin → posts
-`agent.state.report` within a 3s budget, silent, exit 0 always → the daemon
-dedupes, records liveness edges keyed to the occupant pid (a restart
-invalidates its predecessor's edges), matches delivery ACK markers, and
-feeds fusion. A late hook ACK upgrades `delivered_unverified` to
+Vendor hook config → invokes `cyclops hook <event>` with the payload on
+stdin → posts `agent.state.report` within a 3s budget, silent, exit 0 always
+→ the daemon dedupes, records liveness edges keyed to the occupant pid (a
+restart invalidates its predecessor's edges), matches delivery ACK markers,
+and feeds fusion. A late hook ACK upgrades `delivered_unverified` to
 `delivered_verified` — the only legal exit from a delivered state.
+
+Fresh installs that opt into `--wire-hooks` merge configs into the paths
+each vendor CLI actually reads so turn edges arrive without fifteen manual
+steps. `cyclops update` refreshes absolute binary paths in artifacts it
+already installed. Details: `docs/reference/hooks.md`.
 
 ## The UI stream
 
@@ -90,21 +107,46 @@ attention register), subscribes to events, and reads one ledger backfill
 theme hot-reload stat rides each wake; the eye animates one 120ms one-shot
 step at a time. Enter on a row jumps tmux focus to that pane.
 
-## Workspace start
+## Workspace (bare `cyclops`) and composer
 
-`cyclops start`: seed config, manifests, and themes into `$CYCLOPS_HOME`
-(never overwriting existing files) → ensure the daemon is running (spawn
-detached, wait ≤10s for the socket) → restore the saved workspace or build a
-preset via the layout engine → name panes via `pane.label` → print next
+Bare `cyclops` on a TTY opens the full-screen workspace: project sidebar
+(Sessions + Stream tabs), tab bar, live pane canvas via tmux control mode.
+It seeds shipped themes/manifests, starts cyclopsd when none answers, and
+can create a fresh `main` session when no tmux server exists. UX:
+`docs/guides/workspace-ui.md`.
+
+**Composer (v5):** `Ctrl+B s` or the tab-strip `@` chat button opens a
+one-line dialog. Grammar is `@name` then free text; Enter sends through
+`msg.send` off the draw loop (the daemon holds the reply for the ACK
+window). Receipt wording matches `cyclops send`. Motion fades (focus border,
+status ink, eye, notice) use one-shot deadlines only while a fade runs —
+still zero polling when idle (`CYCLOPS_MOTION=0` / `NO_COLOR` / no truecolor
+force off).
+
+## Workspace start (`cyclops start`)
+
+Seed config, manifests, and themes into `$CYCLOPS_HOME` (never overwriting
+existing files) → optional `--wire-hooks` via setup → ensure the daemon is
+running (spawn detached, wait ≤10s for the socket) → restore the saved
+workspace or build a preset (`--preset`, optional `--agents` to launch CLIs
+and set `CYCLOPS_AGENT` per pane) → name panes via `pane.label` → print next
 steps. Safe to run twice: the first run rebuilds panes, the second applies
-names once the daemon has the session.
+names once the daemon has the session. Known limit: cannot tell two
+same-shaped live layouts apart until a pane is named.
 
 ## Theme switch
 
 `cyclops theme <name>` writes the config key and calls `theme.reload`; the
 daemon re-stats, repaints every adopted border, and emits a `theme` event; a
-running UI wakes and re-reads the selection itself — no palette crosses the
-wire.
+running UI/workspace wakes and re-reads the selection itself — no palette
+crosses the wire. Workspace pane bodies repaint ground + ANSI-16 from the
+active theme without restart.
+
+## Update
+
+`cyclops update` clones `CYCLOPS_REPO`@`CYCLOPS_REF`, runs the installer path,
+reports old vs new build, refreshes already-installed hooks, and prints the
+restart steps. Nothing is restarted automatically.
 
 ## The development loop
 
@@ -124,7 +166,8 @@ Touching either installer requires `scripts/install.sh` and
 Testing rules that bite: every
 tmux-touching test goes through `cyclops-testrig` (never the default tmux
 server), and every scratch path comes from `cyclops_proto::scratch` (never
-`/tmp` literals or `std::env::temp_dir()`).
+`/tmp` literals or `std::env::temp_dir()`). Run `cargo test` from a plain
+shell, not inside tmux (see `AGENTS.md` Custom Instructions).
 
 ## CI (`.github/workflows/ci.yml`)
 
@@ -156,4 +199,4 @@ tmux-head job is early warning, not a merge blocker — but it has caught a
 real issue before (F25), so read it when it goes red.
 
 There is no release automation; installation is build-from-source via
-`scripts/install.sh`.
+`scripts/install.sh` (or `cyclops update` thereafter).

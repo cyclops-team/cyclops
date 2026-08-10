@@ -52,7 +52,8 @@ use crate::naming;
 use crate::notice::NoticeState;
 use crate::persist::{self, load_prefs, set_last_active, SidebarTab, WorkspacePrefs};
 use crate::render::{
-    paint_dialog, paint_menu, paint_sidebar, paint_sidebar_rail, paint_tab_bar, paint_window,
+    paint_dialog, paint_menu, paint_sidebar, paint_sidebar_rail, paint_sidebar_resize_feedback,
+    paint_tab_bar, paint_window,
 };
 use crate::resilience::{self, LinkState};
 use crate::selection::{self, Selection, SelectionState};
@@ -3101,6 +3102,28 @@ fn draw(
                 &mut ctx,
             );
             let cursor = ctx.cursor;
+            // The pane canvas's own left border is the resize handle now
+            // (`render::sidebar`'s `SIDEBAR_GRAB_WIDTH` doc has the
+            // history). Pushed here, after `paint_window`'s own
+            // `PaneFrame` hits, this wins the column from the pane frame
+            // beneath it, so grabbing the border the operator can actually
+            // see resizes the sidebar instead of focusing whatever pane
+            // sits behind it. Known and accepted: the leftmost cell of any
+            // pane frame or divider that lands on this column answers as
+            // the sidebar's resize handle instead of pane focus/resize for
+            // its own row — one column, traded on purpose so there is a
+            // visible line to grab instead of a hidden one to hunt for.
+            if areas.sidebar.is_some() && areas.canvas.width > 0 && areas.canvas.height > 0 {
+                let divider = Rect::new(areas.canvas.x, areas.canvas.y, 1, areas.canvas.height);
+                app.hit_map.push(divider, HitTarget::SidebarDivider);
+                paint_sidebar_resize_feedback(
+                    f.buffer_mut(),
+                    divider,
+                    &app.paint,
+                    app.hover,
+                    app.drag.as_ref(),
+                );
+            }
             // Menus paint after panes so their hit regions shadow them.
             paint_menu(
                 &app.menu,
@@ -4132,8 +4155,16 @@ mod tests {
                 );
 
                 // And each flag really does change the geometry, or the
-                // agreement above would be agreement about nothing.
-                let expected_left = if sidebar_visible { 22 } else { 1 };
+                // agreement above would be agreement about nothing. The
+                // default prefs width (`WorkspacePrefs::default()`) is no
+                // longer clamped up to the minimum — the minimum is a drag
+                // floor now, well below the default — so the expected edge
+                // is the default width the fresh prefs above actually carry.
+                let expected_left = if sidebar_visible {
+                    crate::render::SIDEBAR_DEFAULT_WIDTH
+                } else {
+                    1
+                };
                 assert_eq!(painted.canvas.x, expected_left, "{what}: canvas left edge");
                 assert_eq!(
                     painted.sidebar.is_some(),

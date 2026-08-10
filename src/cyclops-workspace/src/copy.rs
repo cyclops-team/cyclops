@@ -52,11 +52,13 @@ pub const SERVER_GONE_OFFER: &str = "tmux server is gone. Run cyclops again to s
 
 pub const EVENT_STREAM_EMPTY: &str = "No events yet.";
 
-pub const APP_MENU_BUTTON: &str = "☰ menu";
+// No space after the glyph: ☰ is ambiguous-width and most fonts already
+// draw it with a right shoulder, so a literal space read as a two-cell gap.
+pub const APP_MENU_BUTTON: &str = "☰menu";
 
 /// The sidebar's tab chips. They name what the body below them shows and
 /// take the place of the plain title the session tree used to carry.
-pub const SIDEBAR_TAB_SESSIONS: &str = "Sessions";
+pub const SIDEBAR_TAB_SESSIONS: &str = "Workspaces";
 
 pub const SIDEBAR_TAB_STREAM: &str = "Stream";
 

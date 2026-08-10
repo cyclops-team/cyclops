@@ -77,7 +77,11 @@ impl Default for WorkspacePrefs {
     fn default() -> Self {
         WorkspacePrefs {
             sidebar_visible: true,
-            sidebar_width: 22,
+            // Matches `render::SIDEBAR_DEFAULT_WIDTH`: the width a fresh
+            // install opens at. Not the clamp floor any more — an operator
+            // can drag well below this — so a fresh config should not
+            // start pinned to the minimum just because it once matched it.
+            sidebar_width: crate::render::SIDEBAR_DEFAULT_WIDTH,
             sidebar_tab: SidebarTab::default(),
             // Eight rows: a folder name, a way out, and six entries. Enough
             // to be a file tree on the 24-row terminal that is the floor,
