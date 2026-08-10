@@ -161,8 +161,12 @@ pub(super) async fn execute(
         Action::InsertFileRef { reference } => insert_file_ref(app, client, reference).await,
 
         Action::RequestNewTab => {
+            // Prefilled with the name the tab would get anyway, rather than
+            // left blank for the same rule to apply invisibly downstream.
+            // Enter alone still does the common thing, and now the operator
+            // can see what that thing is and edit it instead of guessing.
             app.open_dialog(Dialog::NewTab {
-                buffer: String::new(),
+                buffer: next_numeric_tab_name(&app.model.session.tabs),
             });
             Ok(Outcome::default())
         }

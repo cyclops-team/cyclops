@@ -5144,11 +5144,23 @@ mod tests {
         );
         let mut detached = false;
 
-        // Down on the bottom pane's grip cell, drop on the top pane's body.
+        // Down on the bottom pane's grip, drop on the top pane's body.
+        // The grip sits in the control row on the pane's TOP border now,
+        // beside [|] and [-], so its cell is found from the hit map rather
+        // than written here.
+        let (grip_x, grip_y) = (0..40u16)
+            .flat_map(|x| (0..12u16).map(move |y| (x, y)))
+            .find(|&(x, y)| {
+                matches!(
+                    app.hit_map.hit(x, y),
+                    Some(HitTarget::PaneGrip { pane_id }) if pane_id == &bottom
+                )
+            })
+            .expect("the bottom pane has a grip");
         handle_mouse(
             &mut app,
             &client,
-            mouse_at(MouseEventKind::Down(MouseButton::Left), 39, 10),
+            mouse_at(MouseEventKind::Down(MouseButton::Left), grip_x, grip_y),
             &mut detached,
         )
         .await

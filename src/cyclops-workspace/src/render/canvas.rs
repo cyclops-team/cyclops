@@ -70,7 +70,7 @@ pub const PANE_GAPS: PaneGaps = PaneGaps {
 /// the calm border language survives with exactly one cell of handle
 /// chrome. Painted with the same border tokens as the frame, focused and
 /// unfocused alike.
-pub const PANE_GRIP: &str = "⠿";
+pub const PANE_GRIP: &str = "[⠿]";
 
 /// The six symbols one frame draws its border with.
 ///
@@ -107,7 +107,8 @@ const BORDER_REST: BorderGlyphs = BorderGlyphs {
 /// in exactly the plain terminals it exists for. Both sets sit in the Box
 /// Drawing block, so neither is wide and neither needs a spacer cell.
 ///
-/// The bottom-right corner is painted and then replaced by [`PANE_GRIP`],
+/// The bottom-right corner is a plain corner: the grip moved to the top
+/// border beside the split controls. Kept in the set because
 /// same as the set at rest.
 const BORDER_FOCUSED: BorderGlyphs = BorderGlyphs {
     horizontal: "═",
@@ -117,18 +118,6 @@ const BORDER_FOCUSED: BorderGlyphs = BorderGlyphs {
     bottom_left: "╚",
     bottom_right: "╝",
 };
-
-/// The frame's bottom-right corner cell: where [`PANE_GRIP`] paints and
-/// the [`HitTarget::PaneGrip`] region sits. `None` when bounds clip the
-/// corner away; a grip must never land on a cell that is not the painted
-/// corner. The cell sits outside every divider band (bands span pane
-/// columns and rows only), so the grip cannot steal a resize cell.
-fn grip_cell(frame: Rect, bounds: Rect) -> Option<(u16, u16)> {
-    let x = frame.x.saturating_add(frame.width);
-    let y = frame.y.saturating_add(frame.height);
-    (x < bounds.x.saturating_add(bounds.width) && y < bounds.y.saturating_add(bounds.height))
-        .then_some((x, y))
-}
 
 /// The rectangle occupied by pane content plus internal separators: the
 /// canvas inset by [`PANE_MARGIN`] when there is room.
@@ -221,11 +210,13 @@ pub fn paint_window(
         );
     }
     // Shared pane borders are resize handles. Put divider regions above the
-    // generic frame regions, then restore the visibly overlaid controls and
-    // the corner grip as the most specific hit targets.
+    // generic frame regions, then restore the visibly overlaid controls as
+    // the most specific hit targets. The frame rects are not needed here
+    // any more: all three controls, the grip included, are placed from the
+    // slot's own rect by `pane_controls`.
     push_divider_hits(&dividers, ctx.hits);
-    for (slot, frame) in slots.iter().zip(&frames) {
-        push_pane_overlay_hits(slot, *frame, canvas, ctx.decoration, ctx.hits);
+    for slot in slots.iter() {
+        push_pane_overlay_hits(slot, canvas, ctx.decoration, ctx.hits);
     }
     if let Some(drag) = ctx.drag.filter(|d| d.is_active()) {
         paint_drag_preview(drag, buf, paint);
@@ -459,12 +450,6 @@ fn paint_pane_frame(
     // right after this frame's own border: the focused frame repaints last, so
     // a shared pass would let its accent ring overwrite another pane's
     // grip where borders intersect.
-    if let Some((x, y)) = grip_cell(vis, bounds) {
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_symbol(PANE_GRIP);
-            cell.set_style(border_style);
-        }
-    }
     if slot.focused {
         if let Some(notice) = ctx.notice {
             paint_notice(vis, bounds, notice, buf, paint);
@@ -508,8 +493,16 @@ fn paint_pane_frame(
     // Controls live in the border instead of overwriting the first row of
     // the child TUI. They remain available on unfocused panes.
     let controls = pane_controls(slot, bounds);
-    let control_left = controls.map_or(right, |controls| controls.split_right.x);
+    let control_left = controls.map_or(right, |controls| controls.grip.x);
     if let Some(controls) = controls {
+        super::overlay_text(
+            buf,
+            bounds,
+            controls.grip.x,
+            controls.grip.y,
+            PANE_GRIP,
+            border_style,
+        );
         super::overlay_text(
             buf,
             bounds,
@@ -685,6 +678,7 @@ fn paint_scroll_hint(
 
 #[derive(Debug, Clone, Copy)]
 struct PaneControls {
+    grip: Rect,
     split_right: Rect,
     split_down: Rect,
 }
@@ -694,13 +688,18 @@ fn pane_controls(slot: &PaneSlot, bounds: Rect) -> Option<PaneControls> {
     let left = vis.x.saturating_sub(1).max(bounds.x);
     let top = vis.y.saturating_sub(1).max(bounds.y);
     let right = (vis.x + vis.width).min(bounds.x + bounds.width - 1);
-    if right.saturating_sub(left) < 8 {
+    // Three controls of three cells, plus two of border either side of
+    // them. Under this a pane paints no controls at all rather than a
+    // partial set, which is the rule the two-control version already had.
+    if right.saturating_sub(left) < 11 {
         return None;
     }
 
     let split_down = Rect::new(right.saturating_sub(3), top, 3, 1);
     let split_right = Rect::new(split_down.x.saturating_sub(3), top, 3, 1);
+    let grip = Rect::new(split_right.x.saturating_sub(3), top, 3, 1);
     Some(PaneControls {
+        grip,
         split_right,
         split_down,
     })
@@ -713,14 +712,13 @@ fn pane_controls(slot: &PaneSlot, bounds: Rect) -> Option<PaneControls> {
 /// them that starts a drag.
 fn push_pane_overlay_hits(
     slot: &PaneSlot,
-    frame: Rect,
     bounds: Rect,
     decoration: &DecorationSnapshot,
     hits: &mut HitMap,
 ) {
     let right = (slot.rect.x + slot.rect.width).min(bounds.x + bounds.width - 1);
     let controls = pane_controls(slot, bounds);
-    let control_left = controls.map_or(right, |controls| controls.split_right.x);
+    let control_left = controls.map_or(right, |controls| controls.grip.x);
     if let Some((pane, rect)) = decoration
         .pane(&slot.pane_id)
         .filter(|pane| pane.label.is_some())
@@ -750,10 +748,10 @@ fn push_pane_overlay_hits(
                 pane_id: slot.pane_id.clone(),
             },
         );
-    }
-    if let Some((x, y)) = grip_cell(frame, bounds) {
+        // The grip's hit rides with the other two now. It used to sit on
+        // the opposite corner of the frame, one cell wide.
         hits.push(
-            Rect::new(x, y, 1, 1),
+            controls.grip,
             HitTarget::PaneGrip {
                 pane_id: slot.pane_id.clone(),
             },
@@ -1345,18 +1343,24 @@ mod tests {
         );
         assert!(grabbable(5) > 30, "the upper pane's bottom border too");
 
-        // The swap handle: one painted cell on each frame's bottom-right
-        // corner, outside every divider band.
-        assert!(matches!(
-            hits.hit(39, 5),
-            Some(HitTarget::PaneGrip { pane_id }) if pane_id == "%0"
-        ));
-        assert!(matches!(
-            hits.hit(39, 10),
-            Some(HitTarget::PaneGrip { pane_id }) if pane_id == "%1"
-        ));
-        assert_eq!(buf[(39, 5)].symbol(), PANE_GRIP, "focused pane's grip");
-        assert_eq!(buf[(39, 10)].symbol(), PANE_GRIP, "unfocused pane's grip");
+        // The swap handle: three cells on each frame's TOP border, beside
+        // the split controls. Found through the hit map rather than at a
+        // column written here, so moving the control row again does not
+        // silently pass this.
+        let grip_of = |want: &str| {
+            (0..40u16)
+                .flat_map(|x| (0..12u16).map(move |y| (x, y)))
+                .find(|&(x, y)| {
+                    matches!(hits.hit(x, y), Some(HitTarget::PaneGrip { pane_id }) if pane_id == want)
+                })
+                .unwrap_or_else(|| panic!("{want} has a grip"))
+        };
+        let (gx, gy) = grip_of("%0");
+        assert_eq!(gy, 0, "the focused pane's grip is on its top border");
+        let painted: String = (gx..gx + 3).map(|x| buf[(x, gy)].symbol()).collect();
+        assert_eq!(painted, PANE_GRIP, "and it paints where it answers");
+        let (_, gy1) = grip_of("%1");
+        assert!(gy1 > gy, "the lower pane's grip is on its own top border");
     }
 
     /// The grip must read as a handle in every shipped theme and under
@@ -1380,14 +1384,20 @@ mod tests {
             term.backend().buffer().clone()
         };
 
+        // Read off the frame: the grip is a run of cells on a top border
+        // now, so the assertion looks for the glyph rather than probing a
+        // corner that no longer holds it.
         for paint in [
             Paint::for_test(),
             alt_test_theme_paint(),
             Paint::without_color_for_test(),
         ] {
             let buf = render_with(&paint);
-            assert_eq!(buf[(39, 5)].symbol(), PANE_GRIP);
-            assert_eq!(buf[(39, 10)].symbol(), PANE_GRIP);
+            let rows: Vec<String> = (0..12u16)
+                .map(|y| (0..40u16).map(|x| buf[(x, y)].symbol()).collect())
+                .collect();
+            let found = rows.iter().filter(|r| r.contains(PANE_GRIP)).count();
+            assert_eq!(found, 2, "one grip per pane, whatever the theme");
         }
     }
 
@@ -1514,10 +1524,13 @@ mod tests {
             !row(&quiet, 5).contains("copied"),
             "and nowhere at all when there is nothing to say"
         );
+        // The grip moved to the top border, so the bottom-right cell is a
+        // plain corner again. What still matters here is that the notice
+        // stops before it rather than overwriting the frame.
         assert_eq!(
             noticed[(39, 5)].symbol(),
-            PANE_GRIP,
-            "the text must stop short of the corner grip"
+            quiet[(39, 5)].symbol(),
+            "the notice must stop short of the frame's corner"
         );
 
         // Every other cell is untouched, and the pane rectangles are
