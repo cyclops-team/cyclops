@@ -101,6 +101,16 @@ pub struct FileTree {
     expanded: BTreeSet<PathBuf>,
     /// First visible row, moved by the wheel.
     scroll: usize,
+    /// The keyboard cursor's row, or `None` when the keyboard is not in
+    /// this panel.
+    ///
+    /// Held here rather than on `App` because this is what owns the row
+    /// list: a poll that shortens the list has to clamp the cursor in the
+    /// same breath, and anywhere else that is a second place to remember.
+    /// `None` is load-bearing, not an empty state: it is how the key
+    /// handler knows the panel does not have the keyboard, and therefore
+    /// how bare arrows keep reaching the focused pane.
+    cursor: Option<usize>,
     /// Folders stood in before this one, oldest first. Pushed by every
     /// move the operator makes, including the climb out through `..`.
     back: Vec<PathBuf>,
@@ -263,6 +273,66 @@ impl FileTree {
         self.scroll = self.scroll.min(self.rows.len().saturating_sub(height));
     }
 
+    pub fn cursor(&self) -> Option<usize> {
+        self.cursor
+    }
+
+    /// Put the keyboard in this panel, on the row it left or the first one.
+    ///
+    /// A panel with no rows takes nothing. A cursor there would point at a
+    /// row that does not exist, paint no highlight, and still swallow every
+    /// key: a mode with no visible sign it is on and nothing to navigate,
+    /// which is the definition of a trap. Keys keep reaching the pane.
+    pub fn take_cursor(&mut self) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let at = self
+            .cursor
+            .unwrap_or(0)
+            .min(self.rows.len().saturating_sub(1));
+        self.cursor = Some(at);
+    }
+
+    /// Give the keyboard back to the focused pane.
+    pub fn release_cursor(&mut self) {
+        self.cursor = None;
+    }
+
+    /// Move the cursor and return the row it landed on.
+    ///
+    /// Stops at both ends rather than wrapping. A list that wraps sends an
+    /// operator holding a key back to the top without them noticing, and
+    /// this list is a directory, where the ends mean something.
+    pub fn move_cursor(&mut self, delta: i32) -> Option<&FileRow> {
+        let current = self.cursor?;
+        let last = self.rows.len().saturating_sub(1);
+        let next = current.saturating_add_signed(delta as isize).min(last);
+        self.cursor = Some(next);
+        self.rows.get(next)
+    }
+
+    /// The row under the cursor.
+    pub fn cursor_row(&self) -> Option<&FileRow> {
+        self.rows.get(self.cursor?)
+    }
+
+    /// Scroll so the cursor is on screen, given how many rows show.
+    ///
+    /// Called by the painter, which is the only thing that knows the
+    /// height. Moving the cursor off the bottom scrolls by one rather than
+    /// recentering: a list that jumps under a held key is unreadable.
+    pub fn reveal_cursor(&mut self, height: usize) {
+        let Some(at) = self.cursor else {
+            return;
+        };
+        if at < self.scroll {
+            self.scroll = at;
+        } else if height > 0 && at >= self.scroll + height {
+            self.scroll = at + 1 - height;
+        }
+    }
+
     /// `path` written the way a message should carry it: relative to the
     /// tree's root when it is under it, absolute when it is not.
     ///
@@ -299,6 +369,11 @@ impl FileTree {
         let mut stamp = Fnv::new();
         stamp.write(self.root.to_string_lossy().as_bytes());
         self.walk(&self.root.clone(), 0, &mut rows, &mut stamp);
+        // A poll can shorten the list under a cursor that was valid a
+        // moment ago, so it is clamped here rather than at every reader.
+        if let Some(at) = self.cursor {
+            self.cursor = Some(at.min(rows.len().saturating_sub(1)));
+        }
         self.rows = rows;
         self.stamp = stamp.finish();
     }
@@ -666,6 +741,68 @@ mod tests {
         // Climbing back out is the same story from the other side.
         tree.reroot(&s.0);
         assert_eq!(tree.reference(&s.0.join("src/main.rs")), "src/main.rs");
+    }
+
+    /// The cursor exists only when the keyboard is in the panel, moves one
+    /// row at a time, and stops at both ends.
+    ///
+    /// `None` is the load-bearing state: it is what tells the key handler
+    /// the panel does not have the keyboard, and therefore what keeps bare
+    /// arrows reaching the focused pane. A cursor that defaulted to row
+    /// zero would silently steal every arrow key in the workspace.
+    #[test]
+    fn the_cursor_exists_only_once_the_keyboard_is_handed_over() {
+        let s = Scratch::new("files-cursor");
+        for n in 0..4 {
+            s.file(&format!("f{n}.txt"), "");
+        }
+        let mut tree = s.tree();
+
+        assert_eq!(tree.cursor(), None, "no cursor until one is asked for");
+        assert!(tree.move_cursor(1).is_none(), "and nothing to move");
+
+        tree.take_cursor();
+        assert_eq!(tree.cursor(), Some(0), "it lands on the first row");
+
+        tree.move_cursor(1);
+        tree.move_cursor(1);
+        assert_eq!(tree.cursor(), Some(2));
+        assert_eq!(tree.cursor_row().map(|r| r.name.as_str()), Some("f2.txt"));
+
+        // Both ends hold rather than wrapping. A directory listing has ends
+        // that mean something, and a wrap under a held key is invisible.
+        tree.move_cursor(50);
+        assert_eq!(tree.cursor(), Some(3), "the last row is the last row");
+        tree.move_cursor(-50);
+        assert_eq!(tree.cursor(), Some(0), "and the first is the first");
+
+        tree.release_cursor();
+        assert_eq!(tree.cursor(), None, "Esc gives the keyboard back");
+    }
+
+    /// A poll that shortens the list must not strand the cursor past its
+    /// end. The tree is re-read on a timer, so this happens without anyone
+    /// touching the keyboard.
+    #[test]
+    fn a_shrinking_list_pulls_the_cursor_back_with_it() {
+        let s = Scratch::new("files-cursor-shrink");
+        for n in 0..6 {
+            s.file(&format!("f{n}.txt"), "");
+        }
+        let mut tree = s.tree();
+        tree.take_cursor();
+        tree.move_cursor(5);
+        assert_eq!(tree.cursor(), Some(5));
+
+        for n in 2..6 {
+            std::fs::remove_file(s.0.join(format!("f{n}.txt"))).expect("rm");
+        }
+        assert!(tree.refresh(), "the list really did change");
+        assert_eq!(tree.cursor(), Some(1), "the cursor rides the new end");
+        assert!(
+            tree.cursor_row().is_some(),
+            "and still points at a row that exists"
+        );
     }
 
     /// An unreadable folder is empty, not fatal, and comes back on its own

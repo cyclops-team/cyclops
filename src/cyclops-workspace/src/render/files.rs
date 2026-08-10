@@ -121,9 +121,13 @@ pub fn paint_file_panel(
     let overflows = total > usize::from(body);
     let shown = if overflows { body - 1 } else { body };
     tree.clamp_scroll(usize::from(shown));
+    // Then follow the keyboard cursor, which may sit outside that window.
+    // Order matters: clamping after this would undo the reveal.
+    tree.reveal_cursor(usize::from(shown));
 
     let list = Rect::new(area.x, area.y + CHROME_ROWS, area.width, shown);
     let badge = badge_field(tree, list.width);
+    let cursor = tree.cursor();
     let start = tree.scroll();
     // `index` is the row's place in the tree, which a click reports; `y` is
     // where it lands on screen. They differ by the scroll, so the screen row
@@ -146,6 +150,7 @@ pub fn paint_file_panel(
             paint,
             hits,
             hover,
+            cursor == Some(index),
         );
     }
 
@@ -396,8 +401,12 @@ fn paint_row(
     paint: &Paint,
     hits: &mut HitMap,
     hover: Option<(u16, u16)>,
+    under_cursor: bool,
 ) {
-    let lit = hovered(hover, rect);
+    // The keyboard cursor outranks the pointer's hover. Both are "the row
+    // you are about to act on", and only one of them is holding the
+    // keyboard, so when they disagree the keyboard wins.
+    let lit = under_cursor || hovered(hover, rect);
     if lit {
         buf.set_style(rect, theme::menu_row_hover(paint));
     }

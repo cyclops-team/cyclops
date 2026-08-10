@@ -47,6 +47,9 @@ pub enum BindingAction {
     ToggleTabBar,
     /// Open or close the sidebar's file panel.
     ToggleFiles,
+    /// Put the keyboard in the file panel. Arrows move a cursor there
+    /// until Esc gives the keyboard back to the focused pane.
+    FocusFiles,
     ToggleMotion,
     /// Show the event stream on the sidebar's Stream tab, or hide the
     /// sidebar when the stream is what's showing. The name predates the
@@ -170,6 +173,12 @@ pub fn default_bindings() -> HashMap<BindingAction, BindingChord> {
             BindingAction::CloseTab,
             BindingChord::Prefix(KeyCode::Char('&')),
         ),
+        // `g` for "go to the panel". Free of any tmux default, so an
+        // operator arriving with tmux habits loses nothing to it.
+        (
+            BindingAction::FocusFiles,
+            BindingChord::Prefix(KeyCode::Char('g')),
+        ),
         (
             BindingAction::NextWorkspace,
             BindingChord::Prefix(KeyCode::Char(']')),
@@ -276,6 +285,7 @@ fn action_from_key(key: &str) -> Option<BindingAction> {
         "toggle_sidebar" => Some(BindingAction::ToggleSidebar),
         "toggle_tab_bar" => Some(BindingAction::ToggleTabBar),
         "toggle_files" => Some(BindingAction::ToggleFiles),
+        "focus_files" => Some(BindingAction::FocusFiles),
         "toggle_motion" => Some(BindingAction::ToggleMotion),
         "toggle_event_panel" => Some(BindingAction::ToggleEventPanel),
         "show_keybinds" => Some(BindingAction::ShowKeybinds),
@@ -412,6 +422,7 @@ fn action_words(action: BindingAction) -> String {
         BindingAction::ToggleSidebar => "Toggle sidebar".into(),
         BindingAction::ToggleTabBar => "Toggle tab bar".into(),
         BindingAction::ToggleFiles => "Toggle file panel".into(),
+        BindingAction::FocusFiles => "Keyboard into the file panel".into(),
         BindingAction::ToggleMotion => "Toggle motion".into(),
         BindingAction::ToggleEventPanel => "Toggle event stream".into(),
         BindingAction::ShowKeybinds => "Keybinds".into(),
@@ -449,6 +460,7 @@ fn help_rank(action: BindingAction) -> (u8, usize) {
         BindingAction::ToggleSidebar => (49, 0),
         BindingAction::ToggleTabBar => (49, 1),
         BindingAction::ToggleFiles => (49, 2),
+        BindingAction::FocusFiles => (50, 2),
         BindingAction::ToggleMotion => (49, 2),
         BindingAction::ToggleEventPanel => (50, 0),
         BindingAction::Compose => (50, 1),

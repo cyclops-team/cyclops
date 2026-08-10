@@ -273,6 +273,26 @@ pub(super) async fn execute(
                 ..Outcome::default()
             })
         }
+        Action::FocusFiles => {
+            // Open what the cursor is going to live in. Focusing a panel
+            // the operator cannot see reads as a chord that did nothing.
+            let was_hidden = !app.model.sidebar_visible;
+            app.model.sidebar_visible = true;
+            if app.prefs.files_rows == 0 {
+                app.prefs.files_rows = crate::persist::WorkspacePrefs::default().files_rows;
+            }
+            app.files.take_cursor();
+            if was_hidden {
+                // The panel took columns back from the canvas, so tmux has
+                // to be told before the next frame paints panes at the old
+                // width.
+                return Ok(commit_sidebar_visibility(app, client).await);
+            }
+            Ok(Outcome {
+                persist: true,
+                ..Outcome::default()
+            })
+        }
         Action::ToggleMotion => {
             // No client-size redeclaration and no reflow: a fade is a
             // color, so turning it off changes what the next frame paints
