@@ -157,29 +157,31 @@ A message that lands in your pane looks like this (real capture):
 [cyclops m-d7e4ba] FROM: admin  SUBJECT: Review the rate limiter
 Please look at retry.rs before the next run.
 Both lines paste as one message.
-Reply: cyclops send admin --subject "..."
 ```
 
 `m-d7e4ba` is the message id. `FROM` is daemon-resolved from who actually
 sent it (the pane, not anything the sender's request claimed), so you can
-trust it — and it is exactly who your reply should go to. The hint line
-omits `--reply-to`; add it yourself so your reply chains into the same
-thread instead of starting a new, unlinked message. If `FROM` is another
-agent's name, send straight back to it:
+trust it, and it is exactly who your reply should go to.
+
+A message from another agent ends in one more line,
+`Reply: cyclops send <name> --subject "..."`. That line omits
+`--reply-to`; add it yourself so your reply chains into the same thread
+instead of starting a new, unlinked message:
 
 ```
 $ cyclops send implementer --reply-to m-d7e4ba --subject "Re: Review the rate limiter" --body "Looked at retry.rs. Tests pass."
 ✓ delivered · unverified (screen)
 ```
 
-One real gotcha worth knowing before you hit it: when `FROM` is `admin`
-(the message came from a human's shell, not another agent's pane), the
-hint's literal command does not work — `admin` is an identity, not an
-addressable pane, and `cyclops send admin ...` fails with
-`⚠ needs attention · no pane for "admin"` (confirmed by running it). There
-is no pane to reply to in that case; do the work and let the record speak
-(`cyclops history`, `cyclops thread <id>`), or use whatever channel you
-already have with that human.
+A message from `admin` carries no reply line, and that is deliberate:
+`admin` is a human's shell, not an addressable pane, and
+`cyclops send admin ...` fails with
+`⚠ needs attention · no pane for "admin"` (confirmed by running it). An
+earlier build printed the hint anyway, so an agent doing as it was told
+filed a failed delivery and raised attention for it. There is nothing to
+reply to. Do the work and let the record speak (`cyclops history`,
+`cyclops thread <id>`), or use whatever channel you already have with
+that human.
 
 Reading the message back later, as a thread, oldest first (real capture,
 same exchange):

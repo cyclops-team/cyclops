@@ -20,7 +20,12 @@ Reply: cyclops send codex --subject "..."
   the body is not stripped but cannot forge the envelope: the header the
   recipient sees is daemon-built from socket-peer identity (v1 keeper made
   structural).
-- The reply hint line is included unless the message is `--fyi`.
+- The reply hint line is included unless the message is `--fyi`, or the
+  sender is `admin`. `admin` is reserved by `cyclops_proto::label` so no
+  pane can hold it, which makes `cyclops send admin` a guaranteed
+  `no_such_target`: an agent following the hint files a failed delivery
+  and raises attention for it. A route back to the operator is the admin
+  inbox, not a command that cannot run.
 
 ## Sender identity (fail-closed)
 

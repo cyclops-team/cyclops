@@ -775,7 +775,11 @@ tmx capture-pane -p -t "$N2" | grep -v '^$' > "$OUT"
 cat "$OUT"
 check "the recipient reads a stamped header" "^\[cyclops $MID\] FROM: admin  SUBJECT: Review the rate limiter\$"
 check "the body arrives verbatim"            '^gateway\.rs:120 drops the burst path$'
-check "and the reply line names the sender"  '^Reply: cyclops send admin --subject'
+# No reply line from admin. The name is reserved, so `cyclops send admin`
+# answers no_such_target: an agent doing as the hint told it would file a
+# failed delivery and raise attention for it. The agent-to-agent case does
+# get one, and `payload_shape_matches_spec` in delivery.rs holds that.
+check_absent "no reply line an agent cannot use" '^Reply: cyclops send admin'
 
 run "$CYC" thread "$MID" --plain
 check "a thread carries the body"         '^ +gateway\.rs:120 drops the burst path$'

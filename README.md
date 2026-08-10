@@ -338,8 +338,12 @@ recipient's model actually reads:
 $ tmux capture-pane -p -t %1
 [cyclops m-2f304e] FROM: admin  SUBJECT: Review the rate limiter
 gateway.rs:120 drops the burst path
-Reply: cyclops send admin --subject "..."
 ```
+
+A message from another agent ends in `Reply: cyclops send <name> --subject
+"..."`. One from `admin` does not: `admin` is you, the name is reserved so
+no pane can hold it, and a reply addressed there would have nowhere to
+land.
 
 The daemon builds that header from the sender's real identity, resolved from
 the process behind the socket. Nothing in a body can forge it.

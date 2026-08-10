@@ -750,6 +750,18 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
 
 /// Render the injected payload. The daemon builds the envelope; nothing in
 /// the request body can forge it (sender identity is structural).
+///
+/// The reply line is dropped for two senders, for the same reason both
+/// times: the command would not work.
+///
+/// - An `fyi` expects no answer, and offering one invites a reply the
+///   sender did not ask for.
+/// - `admin` is the operator, and [`cyclops_proto::label`] reserves that
+///   name so no pane can ever hold it. `cyclops send admin` therefore has
+///   no target and fails with `no_such_target`, every time. Pasting it into
+///   an agent's composer spends a turn teaching the agent that the obvious
+///   move fails. Saying nothing is honest; a route back to the operator is
+///   the admin inbox, which does not exist yet.
 pub(crate) fn render_payload(
     msg_id: &str,
     from: &str,
@@ -763,7 +775,7 @@ pub(crate) fn render_payload(
     if !body.is_empty() {
         lines.push(body.to_string());
     }
-    if !fyi {
+    if !fyi && from != cyclops_proto::label::ADMIN {
         lines.push(format!("Reply: cyclops send {from} --subject \"...\""));
     }
     lines.join("\n")
@@ -3109,13 +3121,33 @@ mod tests {
 
     #[test]
     fn fyi_payload_has_no_reply_hint() {
-        let p = render_payload("m-1", "admin", "heads up", "body", true);
+        let p = render_payload("m-1", "codex", "heads up", "body", true);
         assert!(!p.contains("Reply:"));
+    }
+
+    /// A message from the operator carries no reply line.
+    ///
+    /// `admin` is reserved (`cyclops_proto::label`), so no pane can hold
+    /// it and `cyclops send admin` answers `no_such_target` every time.
+    /// The workspace composer sends as `admin`, which made this the
+    /// COMMON case: nearly every message a human writes was arriving with
+    /// a command that cannot run attached to it.
+    #[test]
+    fn a_message_from_the_operator_offers_no_reply_that_would_fail() {
+        let p = render_payload("m-1", cyclops_proto::label::ADMIN, "ship it", "now", false);
+        assert!(!p.contains("Reply:"), "{p}");
+        assert_eq!(
+            p, "[cyclops m-1] FROM: admin  SUBJECT: ship it\nnow",
+            "the header and the body, and nothing else"
+        );
+        // An agent-to-agent message still gets one: those targets exist.
+        let p = render_payload("m-2", "reviewer", "ship it", "now", false);
+        assert!(p.contains("Reply: cyclops send reviewer"), "{p}");
     }
 
     #[test]
     fn empty_body_payload_is_header_plus_hint() {
-        let p = render_payload("m-1", "admin", "s", "", false);
+        let p = render_payload("m-1", "codex", "s", "", false);
         assert_eq!(p.lines().count(), 2);
     }
 

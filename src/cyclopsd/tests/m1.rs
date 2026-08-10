@@ -43,7 +43,7 @@ async fn screen_tier_delivery_end_to_end() {
     assert_eq!(d["to"], "worker");
     assert_eq!(d["state"], "delivered_unverified", "{result}");
 
-    // The payload is in the pane: daemon-built envelope, body, reply hint.
+    // The payload is in the pane: daemon-built envelope and body.
     let screen = rig.tmux.capture(&pane);
     assert!(
         screen.contains(&format!(
@@ -52,7 +52,15 @@ async fn screen_tier_delivery_end_to_end() {
         "payload not on screen:\n{screen}"
     );
     assert!(screen.contains("line two"), "{screen}");
-    assert!(screen.contains("Reply: cyclops send admin"), "{screen}");
+    // And no reply line, because this one is from admin. That name is
+    // reserved, so `cyclops send admin` answers no_such_target and an
+    // agent obeying the hint would file a failed delivery and raise
+    // attention for it. `in_process_send_with_custom_sender` holds the
+    // agent-to-agent case, where the hint still names a real target.
+    assert!(
+        !screen.contains("Reply: cyclops send admin"),
+        "pasted a reply command that cannot run:\n{screen}"
+    );
 
     // Events arrived as they happened: msg, then the delivery-state walk.
     rig.ev
