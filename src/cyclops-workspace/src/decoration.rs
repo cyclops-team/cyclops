@@ -34,6 +34,20 @@ pub struct PrimaryStatus {
 #[derive(Debug, Clone, Default)]
 pub struct DecorationSnapshot {
     pub panes: HashMap<String, PaneDecoration>,
+    /// The daemon's attention register.
+    ///
+    /// Nothing in the workspace reads it any more. Its per-pane half is
+    /// already folded into `panes[..].needs_attention` by `apply`, which is
+    /// what the tab strip and the agent rows mark from. Its delivery half
+    /// had exactly one surface, the sidebar header's rollup dot, and that
+    /// dot could not go out: a delivery in `attention_required` leaves only
+    /// through `queued`, and nothing in the product writes that transition.
+    ///
+    /// Kept on the struct because the register itself is correct and the
+    /// admin inbox is the surface that should read it. What is NOT kept is
+    /// asking the daemon to compute the delivery half every poll: see
+    /// `open_deliveries` at the fetch below.
+    #[allow(dead_code)]
     pub attention: Attention,
     /// True when the daemon answered the last status query.
     pub online: bool,
@@ -48,10 +62,6 @@ impl DecorationSnapshot {
         self.panes
             .values()
             .any(|p| p.window_id == window_id && p.needs_attention)
-    }
-
-    pub fn workspace_needs_attention(&self) -> bool {
-        self.attention.count() > 0
     }
 
     /// Sidebar display name: explicit label → manifest display name → id.
@@ -187,7 +197,12 @@ pub fn fetch_decoration(home: &Path) -> Option<DecorationSnapshot> {
     crate::daemon::status(
         home,
         StatusParams {
-            open_deliveries: true,
+            // Off. The only thing that read the answer was a rollup dot
+            // that could never clear, and computing it is not cheap: the
+            // daemon folds every ledger file from byte zero with no window,
+            // on every poll. The admin inbox turns this back on when it has
+            // somewhere to show the result.
+            open_deliveries: false,
         },
     )
     .map(|status| snapshot_from_status(&status))
