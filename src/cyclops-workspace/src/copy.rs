@@ -216,6 +216,43 @@ pub fn compose_failed(to: &str, cause: &str) -> String {
     format!("nothing sent to {to}: {cause}")
 }
 
+// ---------------------------------------------------------------------------
+// File panel
+// ---------------------------------------------------------------------------
+
+/// The panel's name before it knows which folder it is looking at. Once it
+/// does, the folder's own name takes this row.
+pub const FILES_TITLE: &str = "Files";
+
+/// The app menu's switch for the panel. Named for the thing, not the
+/// verb, like every other toggle on that menu.
+pub const MENU_FILES: &str = "Files";
+
+/// No folder yet. The panel roots itself on the focused pane's directory,
+/// which takes one tmux round trip after launch, so this shows for a beat
+/// on a cold start and indefinitely if that probe never answers.
+pub const FILES_NO_ROOT: &str = "no folder yet";
+
+/// Rows below the fold. Same words the session tree uses for the same
+/// fact, so one vocabulary covers both halves of the sidebar.
+pub fn more_below(count: usize) -> String {
+    format!("+{count} more")
+}
+
+/// A folder too large to list whole. Distinct wording from
+/// [`more_below`]: that one scrolls, this one does not, and telling the
+/// reader to scroll for rows that are not there would be a lie.
+pub fn more_files(count: usize) -> String {
+    format!("… {count} not shown")
+}
+
+/// What the workspace says after a file's path goes to a pane. Named,
+/// because the operator clicked in one panel and the text landed in
+/// another, and the notice is the only thing tying the two together.
+pub fn file_sent(reference: &str, pane: &str) -> String {
+    format!("{reference} → {pane}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -190,6 +190,20 @@ pub enum Action {
         subject: String,
         body: String,
     },
+    /// Type a file's path into the focused pane, as `@path `.
+    ///
+    /// Typed, not sent: it lands in whatever the pane is running, next to
+    /// whatever is already on that line, and the operator says what to do
+    /// with it. Every coding agent in the roster reads `@path` as "this
+    /// file", which is why the sigil is here rather than left to the
+    /// reader to add.
+    ///
+    /// The reference is already root-relative
+    /// ([`crate::files::FileTree::reference`]); nothing downstream
+    /// re-derives it, so what was clicked is what arrives.
+    InsertFileRef {
+        reference: String,
+    },
 
     // -- Tab --
     /// Open the new-tab naming dialog. Carries no target: a new tab is not
@@ -277,6 +291,8 @@ pub enum Action {
     /// explicit choice, so the `+` that makes tabs is on screen from a
     /// fresh install; the choice persists like the sidebar's.
     ToggleTabBar,
+    /// Open or close the sidebar's file panel.
+    ToggleFiles,
     ToggleMotion,
     /// Show the event stream: open the sidebar on its Stream tab. When
     /// the stream is already what's showing, hide the sidebar instead —
@@ -375,6 +391,7 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
         // No target to resolve: the recipient is typed into the composer,
         // not taken from whatever pane happens to be focused.
         BindingAction::Compose => Some(Action::RequestCompose),
+        BindingAction::ToggleFiles => Some(Action::ToggleFiles),
         BindingAction::SwapPaneLeft => Some(Action::SwapPaneDirection(PaneDirection::Left)),
         BindingAction::SwapPaneRight => Some(Action::SwapPaneDirection(PaneDirection::Right)),
         BindingAction::SwapPaneUp => Some(Action::SwapPaneDirection(PaneDirection::Up)),
@@ -715,9 +732,16 @@ pub fn route_drag_click(target: &DragTarget) -> Option<Action> {
         DragTarget::Agent { pane_id, .. } => Some(Action::FocusPane {
             pane_id: pane_id.clone(),
         }),
-        // A click on one of these is a click on empty chrome: a divider or
-        // a title bar has nothing to select.
-        DragTarget::Divider { .. } | DragTarget::Sidebar | DragTarget::Dialog => None,
+        // A seam grabbed through a pane's own top border focuses that pane
+        // when the press never became a drag: the title strip painted there
+        // is a focus control, and pressing it must still do what pressing
+        // it always did. A seam grabbed in the bare gutter carries no pane
+        // and stays a no-op, as does a title bar: neither has anything to
+        // select.
+        DragTarget::Divider { focus_on_click, .. } => focus_on_click
+            .clone()
+            .map(|pane_id| Action::FocusPane { pane_id }),
+        DragTarget::Sidebar | DragTarget::SidebarSplit | DragTarget::Dialog => None,
     }
 }
 
@@ -1857,14 +1881,31 @@ mod tests {
                 pane_id: "%1".into()
             })
         );
+        // A seam grabbed in the bare gutter: nothing was pressed, so a
+        // release that never moved has nothing to focus.
         assert_eq!(
             route_drag_click(&DragTarget::Divider {
                 pane_id: "%1".into(),
                 dir: SplitDir::Horizontal,
+                focus_on_click: None,
             }),
             None
         );
+        // The same seam grabbed through a pane's own border. `%1` is the
+        // resize target on the far side; `%2` is the border that was
+        // pressed, and it is the one a click focuses.
+        assert_eq!(
+            route_drag_click(&DragTarget::Divider {
+                pane_id: "%1".into(),
+                dir: SplitDir::Vertical,
+                focus_on_click: Some("%2".into()),
+            }),
+            Some(Action::FocusPane {
+                pane_id: "%2".into()
+            })
+        );
         assert_eq!(route_drag_click(&DragTarget::Sidebar), None);
+        assert_eq!(route_drag_click(&DragTarget::Dialog), None);
     }
 
     // -- Divider resize resolution. --

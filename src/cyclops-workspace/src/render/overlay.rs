@@ -923,6 +923,9 @@ pub struct MenuChecks {
     /// session tree. The item toggles between the two, so a check here
     /// means "the stream is what you are looking at".
     pub stream: bool,
+    /// Whether the sidebar's file panel is open. Stored as a row count, so
+    /// this is "more than zero rows" rather than a flag of its own.
+    pub files: bool,
 }
 
 /// One menu row: its label, what clicking it does, and whether it is a
@@ -955,6 +958,14 @@ pub fn menu_items(menu: &MenuState, checks: MenuChecks) -> Vec<MenuRow> {
             ),
             // Same reason the tab strip's switch is here: a preference
             // with no chord needs one place a mouse can reach it.
+            // The file panel can also be closed by dragging its seam to the
+            // footer, which leaves no seam to grab afterwards. This is the
+            // way back, and the reason a drag is allowed to close it at all.
+            (
+                copy::MENU_FILES,
+                BindingAction::ToggleFiles,
+                Some(checks.files),
+            ),
             (
                 copy::MENU_MOTION,
                 BindingAction::ToggleMotion,
@@ -1185,6 +1196,7 @@ mod tests {
     #[test]
     fn a_menu_toggle_is_checked_exactly_when_its_setting_is_on() {
         let on = MenuChecks {
+            files: true,
             tab_bar: true,
             motion: true,
             stream: false,
@@ -1248,6 +1260,7 @@ mod tests {
             &mut term,
             MenuState::AppMenu,
             MenuChecks {
+                files: true,
                 tab_bar: true,
                 motion: false,
                 stream: false,
@@ -1318,6 +1331,9 @@ mod tests {
                 BindingAction::NewWorkspace,
                 BindingAction::ToggleEventPanel,
                 BindingAction::ToggleTabBar,
+                // The file panel's only switch: its seam can close it, and
+                // a closed panel leaves no seam to reopen with.
+                BindingAction::ToggleFiles,
                 // Motion ships with no chord either, so the menu is its
                 // only switch, for the same reason the tab strip's is.
                 BindingAction::ToggleMotion,

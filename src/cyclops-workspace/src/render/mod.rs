@@ -35,6 +35,7 @@
 #![allow(clippy::too_many_arguments)]
 
 mod canvas;
+mod files;
 mod overlay;
 mod sidebar;
 mod stream;
@@ -49,6 +50,13 @@ use crate::runtime::{Color, GridCell};
 use crate::theme::Paint;
 
 pub use canvas::{paint_window, tmux_client_size, HostCursor, WindowPaintCtx, PANE_GRIP};
+/// For the arithmetic check in
+/// `app::tests::narrowing_the_sidebar_strands_canvas_columns_until_tmux_is_told`,
+/// which adds the panel, the declared grid, these two, and the layout's
+/// gap overhead back up to the terminal's width. Nothing outside a test
+/// needs them: every caller that spends these cells is inside `canvas`.
+#[cfg(test)]
+pub use canvas::{PANE_GAPS, PANE_MARGIN};
 pub use overlay::{clamp_dialog_offset, keybind_max_scroll, paint_dialog, paint_menu, MenuChecks};
 pub use sidebar::{paint_sidebar, paint_sidebar_rail, SIDEBAR_COLLAPSE, SIDEBAR_EXPAND};
 pub use stream::{event_stream_rows, EventRow};

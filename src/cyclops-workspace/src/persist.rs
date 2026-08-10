@@ -42,6 +42,14 @@ pub struct WorkspacePrefs {
     /// The sidebar tab last selected, restored on reopen like visibility
     /// and width.
     pub sidebar_tab: SidebarTab,
+    /// Rows the sidebar's file panel gets, counted up from the footer.
+    ///
+    /// A row count, not a fraction: what the operator sized was the list,
+    /// and a fraction would grow that list on a tall terminal and shrink
+    /// it on a short one. Clamped against both panels' minimums at paint
+    /// time (`render::sidebar`), so a stored value from a bigger terminal
+    /// is bounded rather than rejected.
+    pub files_rows: u16,
     /// Whether the tab strip shows. Visible is the default and hiding it
     /// is the operator's explicit choice, so the `+` that makes tabs is on
     /// screen from a fresh install; restored on reopen like the sidebar's
@@ -71,6 +79,10 @@ impl Default for WorkspacePrefs {
             sidebar_visible: true,
             sidebar_width: 22,
             sidebar_tab: SidebarTab::default(),
+            // Eight rows: a folder name, a way out, and six entries. Enough
+            // to be a file tree on the 24-row terminal that is the floor,
+            // and the session tree above it still shows several workspaces.
+            files_rows: 8,
             tab_bar_visible: true,
             motion: true,
             workspace_order: Vec::new(),
@@ -118,6 +130,13 @@ pub fn load_prefs(home: &Path) -> WorkspacePrefs {
         .and_then(|v| u16::try_from(v).ok())
     {
         prefs.sidebar_width = v;
+    }
+    if let Some(v) = workspace
+        .get("files_rows")
+        .and_then(|v| v.as_integer())
+        .and_then(|v| u16::try_from(v).ok())
+    {
+        prefs.files_rows = v;
     }
     if let Some(v) = workspace
         .get("sidebar_tab")
@@ -195,6 +214,10 @@ pub fn save_prefs(home: &Path, prefs: &WorkspacePrefs) -> std::io::Result<()> {
     workspace.insert(
         "sidebar_width".into(),
         toml::Value::Integer(prefs.sidebar_width as i64),
+    );
+    workspace.insert(
+        "files_rows".into(),
+        toml::Value::Integer(prefs.files_rows as i64),
     );
     workspace.insert(
         "sidebar_tab".into(),
@@ -352,6 +375,7 @@ mod tests {
         let prefs = WorkspacePrefs {
             sidebar_visible: false,
             sidebar_width: 28,
+            files_rows: 8,
             sidebar_tab: SidebarTab::Stream,
             tab_bar_visible: false,
             motion: false,
@@ -458,6 +482,7 @@ mod tests {
         save_prefs(
             &home,
             &WorkspacePrefs {
+                files_rows: 8,
                 sidebar_visible: true,
                 sidebar_width: 31,
                 sidebar_tab: SidebarTab::Sessions,

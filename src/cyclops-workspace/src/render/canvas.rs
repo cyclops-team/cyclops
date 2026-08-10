@@ -846,6 +846,8 @@ fn paint_drag_preview(drag: &DragState, buf: &mut Buffer, paint: &Paint) {
         DragTarget::Pane { .. } | DragTarget::Tab { .. } => "⇄",
         DragTarget::Workspace { .. } | DragTarget::Agent { .. } => "⇅",
         DragTarget::Sidebar => "↔",
+        // Vertical only: the sidebar's two panels trade rows, not columns.
+        DragTarget::SidebarSplit => "↕",
         // Free in both axes, unlike every other drag here.
         DragTarget::Dialog => "✥",
     };
@@ -1318,6 +1320,30 @@ mod tests {
             hits.hit(20, 6),
             Some(HitTarget::PaneFrame { pane_id }) if pane_id == "%1"
         ));
+        // It shadows the seam for `hit`, though, which is why `app` asks
+        // `divider_at` as well: the row under the title is still the seam
+        // between the two panes, and pressing it has to move that seam.
+        assert_eq!(
+            hits.divider_at(20, 6).map(|(pane, _)| pane),
+            Some("%0"),
+            "the seam under the title strip must still be grabbable"
+        );
+
+        // Counted, not sampled. The version this replaced left exactly one
+        // cell of the lower pane's top border grabbable, so the pane could
+        // only be resized from its far edge, and a spot check on the right
+        // cell would have passed anyway.
+        let grabbable = |row: u16| {
+            (0..40)
+                .filter(|x| hits.divider_at(*x, row).is_some())
+                .count()
+        };
+        assert!(
+            grabbable(6) > 30,
+            "only {} cells of the lower pane's top border can grab the seam",
+            grabbable(6)
+        );
+        assert!(grabbable(5) > 30, "the upper pane's bottom border too");
 
         // The swap handle: one painted cell on each frame's bottom-right
         // corner, outside every divider band.

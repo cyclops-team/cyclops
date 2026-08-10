@@ -62,6 +62,8 @@ pub fn paint_sidebar(
     agent_order: &[String],
     tab: SidebarTab,
     record: &Record,
+    files: &mut crate::files::FileTree,
+    files_rows: u16,
     area: Rect,
     buf: &mut Buffer,
     paint: &Paint,
@@ -112,6 +114,17 @@ pub fn paint_sidebar(
     let footer_y = inner.y + inner.height.saturating_sub(1);
 
     paint_tab_header(inner, tab, buf, paint, hits, decoration);
+    // The Sessions tab is two panels sharing one column: who is running,
+    // and what is on disk. The seam between them is where the session tree
+    // stops; the Stream tab has no second panel and keeps the whole body.
+    // Over the content columns, not the whole panel: the outer two columns
+    // are the sidebar's own resize handle, and a seam that reached them
+    // would take the handle away on its row.
+    let split = match tab {
+        SidebarTab::Sessions => files_split(content, footer_y, files_rows),
+        SidebarTab::Stream => None,
+    };
+    let tree_bottom = split.map_or(footer_y, |seam| seam.y);
     // Tree rows that did not fit above the footer. The Stream tab does its
     // own clipping inside `super::stream`, so it reports nothing here.
     let clipped = match tab {
@@ -124,7 +137,7 @@ pub fn paint_sidebar(
             area,
             inner,
             content,
-            footer_y,
+            tree_bottom,
             buf,
             paint,
             hits,
@@ -153,6 +166,22 @@ pub fn paint_sidebar(
             0
         }
     };
+    if let Some(seam) = split {
+        paint_split(seam, buf, paint, hits, hover, drag);
+        super::files::paint_file_panel(
+            files,
+            Rect::new(
+                content.x,
+                seam.y + 1,
+                content.width,
+                footer_y.saturating_sub(seam.y + 1),
+            ),
+            buf,
+            paint,
+            hits,
+            hover,
+        );
+    }
     paint_footer(inner, content, footer_y, buf, paint, hits, hover, clipped);
     // The resize handle shows itself before the chevron takes its band, so
     // the chevron stays the one thing painted on its own rows.
@@ -172,6 +201,77 @@ pub fn paint_sidebar(
         hits,
         hover,
     );
+}
+
+/// Fewest rows the session tree keeps when the file panel is open: the
+/// header, a blank, the daemon note, and one workspace row. Below that the
+/// tree stops being a tree and the split has taken the panel it was
+/// splitting.
+const MIN_TREE_ROWS: u16 = 5;
+
+/// Fewest rows the file panel is worth opening at: its folder name, the
+/// climb-out row, and two entries. Under that it teaches nothing and the
+/// session tree keeps the whole column.
+const MIN_FILES_ROWS: u16 = 4;
+
+/// The seam row between the session tree and the file panel, or `None`
+/// when the sidebar is too short to hold both.
+///
+/// `files_rows` is the operator's stored preference for how many rows the
+/// file panel gets, counted from the footer up. It is a row count rather
+/// than a ratio so the panel keeps its size when the terminal is resized:
+/// a ratio would grow the file list on a tall terminal and shrink it on a
+/// short one, and what the operator sized was the list.
+///
+/// `content` is the sidebar's inset column range, so the seam never
+/// reaches the outer columns the resize handle owns.
+fn files_split(content: Rect, footer_y: u16, files_rows: u16) -> Option<Rect> {
+    // Zero is closed. Dragging the seam to the footer is how an operator
+    // says "give the tree its column back", and it has to be reachable
+    // from the same handle that opened it rather than from a menu they
+    // would have to go looking for.
+    if files_rows == 0 {
+        return None;
+    }
+    let inner = content;
+    let body = footer_y.saturating_sub(inner.y);
+    // One row for the seam itself, on top of both panels' minimums.
+    if body < MIN_TREE_ROWS + MIN_FILES_ROWS + 1 {
+        return None;
+    }
+    let most = body - MIN_TREE_ROWS - 1;
+    let rows = files_rows.clamp(MIN_FILES_ROWS, most);
+    Some(Rect::new(inner.x, footer_y - rows - 1, inner.width, 1))
+}
+
+/// The horizontal rule between the sidebar's two panels, and the handle
+/// that moves it.
+///
+/// Painted, unlike the sidebar's outer edge: this seam separates two lists
+/// that would otherwise run into each other, and there is no second line
+/// beside it for it to be confused with. It lights under the pointer for
+/// the same reason the outer handle reveals itself — a divider that gives
+/// no sign it can move is one nobody moves.
+fn paint_split(
+    seam: Rect,
+    buf: &mut Buffer,
+    paint: &Paint,
+    hits: &mut HitMap,
+    hover: Option<(u16, u16)>,
+    drag: Option<&DragState>,
+) {
+    let pointed =
+        hover.is_some_and(|(col, row)| row == seam.y && col >= seam.x && col < seam.x + seam.width);
+    let moving = drag.is_some_and(|drag| matches!(drag.target, DragTarget::SidebarSplit));
+    let style = if pointed || moving {
+        theme::pane_border_focused(paint)
+    } else {
+        theme::pane_border(paint)
+    };
+    let glyph = if pointed || moving { "┅" } else { "─" };
+    let rule: String = glyph.repeat(usize::from(seam.width));
+    buf.set_stringn(seam.x, seam.y, &rule, usize::from(seam.width), style);
+    hits.push(seam, HitTarget::SidebarSplit);
 }
 
 /// Draw the resize handle down the panel's outer edge while the pointer is
@@ -740,6 +840,8 @@ mod tests {
                 &[],
                 SidebarTab::Sessions,
                 &Record::new(),
+                &mut crate::files::FileTree::new(),
+                crate::persist::WorkspacePrefs::default().files_rows,
                 f.area(),
                 f.buffer_mut(),
                 &Paint::for_test(),
@@ -823,6 +925,221 @@ mod tests {
         ));
     }
 
+    /// A scratch project to point the file panel at.
+    struct Project(std::path::PathBuf);
+
+    impl Project {
+        fn new(name: &str) -> Self {
+            let root = cyclops_proto::scratch::scratch_dir(name);
+            let _ = std::fs::remove_dir_all(&root);
+            for rel in ["src/main.rs", "docs/GUIDE.md", "Cargo.toml", "README.md"] {
+                let path = root.join(rel);
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir -p");
+                std::fs::write(path, "").expect("write");
+            }
+            Project(root)
+        }
+
+        fn tree(&self) -> crate::files::FileTree {
+            let mut tree = crate::files::FileTree::new();
+            tree.reroot(&self.0);
+            tree
+        }
+    }
+
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Paint a sidebar with the file panel open, at a given height.
+    fn draw_split(
+        files: &mut crate::files::FileTree,
+        files_rows: u16,
+        height: u16,
+    ) -> (Buffer, HitMap) {
+        let workspaces = vec![WorkspaceRow {
+            session_id: "$0".into(),
+            name: "clops".into(),
+            tab_count: 1,
+            window_ids: vec!["@0".into()],
+        }];
+        let expanded = std::collections::HashSet::from(["$0".to_string()]);
+        let width = crate::render::SIDEBAR_MIN_WIDTH;
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut hits = HitMap::default();
+        term.draw(|f| {
+            paint_sidebar(
+                &workspaces,
+                0,
+                "%0",
+                &expanded,
+                &[],
+                SidebarTab::Sessions,
+                &Record::new(),
+                files,
+                files_rows,
+                f.area(),
+                f.buffer_mut(),
+                &Paint::for_test(),
+                &mut hits,
+                &DecorationSnapshot::default(),
+                None,
+                None,
+            );
+        })
+        .unwrap();
+        (term.backend().buffer().clone(), hits)
+    }
+
+    /// Rows where ANY column answers `want`.
+    ///
+    /// Any column, not a chosen one: a workspace row's first cells are its
+    /// disclosure marker, which has its own hit target, so probing a fixed
+    /// column reports the row as absent.
+    fn rows_of(hits: &HitMap, height: u16, want: fn(&HitTarget) -> bool) -> Vec<u16> {
+        let width = crate::render::SIDEBAR_MIN_WIDTH;
+        (0..height)
+            .filter(|y| (0..width).any(|x| hits.hit(x, *y).is_some_and(want)))
+            .collect()
+    }
+
+    /// The Sessions tab is two panels: who is running, and what is on disk.
+    /// The seam sits between them and both halves answer the mouse.
+    #[test]
+    fn the_sessions_tab_shows_the_session_tree_over_the_file_panel() {
+        let project = Project::new("sidebar-split");
+        let mut files = project.tree();
+        let (_, hits) = draw_split(&mut files, 8, 22);
+
+        let workspaces = rows_of(&hits, 22, |t| matches!(t, HitTarget::SidebarRow { .. }));
+        let seam = rows_of(&hits, 22, |t| matches!(t, HitTarget::SidebarSplit));
+        let entries = rows_of(&hits, 22, |t| matches!(t, HitTarget::FileRow { .. }));
+
+        assert!(!workspaces.is_empty(), "the session tree still paints");
+        assert_eq!(seam.len(), 1, "exactly one seam");
+        assert!(!entries.is_empty(), "and the file panel paints under it");
+        assert!(
+            workspaces.iter().all(|y| *y < seam[0]),
+            "workspaces above the seam"
+        );
+        assert!(
+            entries.iter().all(|y| *y > seam[0]),
+            "files below it: {entries:?} vs seam {}",
+            seam[0]
+        );
+    }
+
+    /// A short sidebar gives the whole column to the session tree. Two
+    /// panels in ten rows is two panels nobody can read, and the one that
+    /// was there first is the one that keeps the space.
+    #[test]
+    fn a_short_sidebar_keeps_one_panel() {
+        let project = Project::new("sidebar-split-short");
+        let mut files = project.tree();
+        for height in [8, 10] {
+            let (_, hits) = draw_split(&mut files, 8, height);
+            assert!(
+                rows_of(&hits, height, |t| matches!(t, HitTarget::SidebarSplit)).is_empty(),
+                "height {height} has no room to split"
+            );
+            assert!(
+                rows_of(&hits, height, |t| matches!(t, HitTarget::FileRow { .. })).is_empty(),
+                "height {height} paints no file panel"
+            );
+        }
+    }
+
+    /// The stored row count is a preference, not a promise: a value saved
+    /// on a taller terminal must not squeeze the session tree out of the
+    /// panel it is sharing.
+    #[test]
+    fn a_stored_row_count_cannot_starve_the_session_tree() {
+        let project = Project::new("sidebar-split-clamp");
+        let mut files = project.tree();
+        let height = 16;
+        let (_, hits) = draw_split(&mut files, 900, height);
+
+        let seam = rows_of(&hits, height, |t| matches!(t, HitTarget::SidebarSplit));
+        assert_eq!(seam.len(), 1, "it still splits rather than refusing");
+        assert!(
+            seam[0] >= MIN_TREE_ROWS,
+            "the session tree keeps its floor: seam at {}",
+            seam[0]
+        );
+        assert!(
+            !rows_of(&hits, height, |t| matches!(t, HitTarget::SidebarRow { .. })).is_empty(),
+            "and still has a workspace row to show"
+        );
+    }
+
+    /// The Stream tab has no second panel, so it keeps the whole body. The
+    /// file panel belongs beside the session tree, not on top of a feed.
+    #[test]
+    fn the_stream_tab_is_not_split() {
+        let project = Project::new("sidebar-split-stream");
+        let mut files = project.tree();
+        let workspaces = vec![WorkspaceRow {
+            session_id: "$0".into(),
+            name: "clops".into(),
+            tab_count: 1,
+            window_ids: vec!["@0".into()],
+        }];
+        let expanded = std::collections::HashSet::new();
+        let mut term =
+            Terminal::new(TestBackend::new(crate::render::SIDEBAR_MIN_WIDTH, 22)).unwrap();
+        let mut hits = HitMap::default();
+        term.draw(|f| {
+            paint_sidebar(
+                &workspaces,
+                0,
+                "%0",
+                &expanded,
+                &[],
+                SidebarTab::Stream,
+                &Record::new(),
+                &mut files,
+                8,
+                f.area(),
+                f.buffer_mut(),
+                &Paint::for_test(),
+                &mut hits,
+                &DecorationSnapshot::default(),
+                None,
+                None,
+            );
+        })
+        .unwrap();
+
+        assert!(rows_of(&hits, 22, |t| matches!(t, HitTarget::SidebarSplit)).is_empty());
+        assert!(rows_of(&hits, 22, |t| matches!(t, HitTarget::FileRow { .. })).is_empty());
+    }
+
+    /// The seam must not eat the sidebar's own resize handle on its row.
+    /// Both are drag handles a cell apart, and the wrong one answering is
+    /// a resize that moves the wrong thing.
+    #[test]
+    fn the_seam_leaves_the_outer_resize_handle_alone() {
+        let project = Project::new("sidebar-split-handle");
+        let mut files = project.tree();
+        let height = 22;
+        let (_, hits) = draw_split(&mut files, 8, height);
+        let seam = rows_of(&hits, height, |t| matches!(t, HitTarget::SidebarSplit));
+        let y = seam[0];
+        let width = crate::render::SIDEBAR_MIN_WIDTH;
+
+        // Not SidebarSplit: whether these two columns answer as the resize
+        // divider or as the collapse chevron is the chevron band's business
+        // and predates this seam. What the seam must not do is take them.
+        for x in [width - 2, width - 1] {
+            assert!(
+                !matches!(hits.hit(x, y), Some(HitTarget::SidebarSplit)),
+                "the seam took column {x}, which belongs to the sidebar's own edge"
+            );
+        }
+    }
+
     /// The composer's button lives in the footer because the tab strip is
     /// a preference that can be off, and writing to an agent has nothing to
     /// do with wanting tabs. A wide sidebar shows it, answers the pointer,
@@ -854,6 +1171,8 @@ mod tests {
                     &[],
                     SidebarTab::Sessions,
                     &Record::new(),
+                    &mut crate::files::FileTree::new(),
+                    crate::persist::WorkspacePrefs::default().files_rows,
                     f.area(),
                     f.buffer_mut(),
                     &theme,
@@ -943,6 +1262,8 @@ mod tests {
                     &[],
                     SidebarTab::Sessions,
                     &Record::new(),
+                    &mut crate::files::FileTree::new(),
+                    crate::persist::WorkspacePrefs::default().files_rows,
                     f.area(),
                     f.buffer_mut(),
                     &theme,
@@ -1015,6 +1336,8 @@ mod tests {
                 &[],
                 SidebarTab::Sessions,
                 &Record::new(),
+                &mut crate::files::FileTree::new(),
+                crate::persist::WorkspacePrefs::default().files_rows,
                 f.area(),
                 f.buffer_mut(),
                 &theme,
@@ -1092,6 +1415,8 @@ mod tests {
                     &[],
                     SidebarTab::Sessions,
                     &Record::new(),
+                    &mut crate::files::FileTree::new(),
+                    crate::persist::WorkspacePrefs::default().files_rows,
                     f.area(),
                     f.buffer_mut(),
                     &paint,
@@ -1159,6 +1484,8 @@ mod tests {
                     &[],
                     SidebarTab::Sessions,
                     &Record::new(),
+                    &mut crate::files::FileTree::new(),
+                    crate::persist::WorkspacePrefs::default().files_rows,
                     f.area(),
                     f.buffer_mut(),
                     &paint,
@@ -1188,8 +1515,10 @@ mod tests {
             "the footer must count what it dropped: {short}"
         );
 
-        // Room for every row: the footer has nothing to report.
-        let tall = render(16);
+        // Room for every row: the footer has nothing to report. Tall
+        // enough for the file panel too, which shares this column at the
+        // shipped default and takes its rows off the tree's end.
+        let tall = render(22);
         assert!(tall.contains("ws6"), "every workspace fits: {tall}");
         assert!(
             !tall.contains("more"),
@@ -1248,6 +1577,8 @@ mod tests {
                     &[],
                     SidebarTab::Sessions,
                     &Record::new(),
+                    &mut crate::files::FileTree::new(),
+                    crate::persist::WorkspacePrefs::default().files_rows,
                     f.area(),
                     f.buffer_mut(),
                     &paint,
@@ -1315,6 +1646,8 @@ mod tests {
                     &[],
                     SidebarTab::Sessions,
                     &Record::new(),
+                    &mut crate::files::FileTree::new(),
+                    crate::persist::WorkspacePrefs::default().files_rows,
                     f.area(),
                     f.buffer_mut(),
                     &theme,
@@ -1441,6 +1774,8 @@ mod tests {
                 &["pane:%1".into(), "name:reviewer".into()],
                 SidebarTab::Sessions,
                 &Record::new(),
+                &mut crate::files::FileTree::new(),
+                crate::persist::WorkspacePrefs::default().files_rows,
                 frame.area(),
                 frame.buffer_mut(),
                 &theme,
@@ -1520,6 +1855,8 @@ mod tests {
                     &[],
                     SidebarTab::Sessions,
                     &Record::new(),
+                    &mut crate::files::FileTree::new(),
+                    crate::persist::WorkspacePrefs::default().files_rows,
                     f.area(),
                     f.buffer_mut(),
                     paint,
@@ -1635,6 +1972,8 @@ mod tests {
                 &[],
                 tab,
                 record,
+                &mut crate::files::FileTree::new(),
+                crate::persist::WorkspacePrefs::default().files_rows,
                 SIDEBAR,
                 f.buffer_mut(),
                 paint,
@@ -1742,6 +2081,8 @@ mod tests {
                 &[],
                 SidebarTab::Sessions,
                 &record,
+                &mut crate::files::FileTree::new(),
+                crate::persist::WorkspacePrefs::default().files_rows,
                 narrow,
                 f.buffer_mut(),
                 &paint,

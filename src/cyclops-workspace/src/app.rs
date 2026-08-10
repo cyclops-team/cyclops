@@ -197,6 +197,19 @@ struct App {
     /// written back on every change, so a workspace reopens on the tab it
     /// was left on.
     sidebar_tab: SidebarTab,
+    /// The sidebar's file panel. Rooted on the focused pane's directory the
+    /// first time that probe answers, and then only where the operator
+    /// walks it.
+    files: crate::files::FileTree,
+    /// When the file tree is next re-read. `None` while nothing is armed;
+    /// see [`arm_files_probe`], which is what keeps this off the clock when
+    /// the panel is not on screen.
+    files_probe_at: Option<Instant>,
+    /// The next file probe should also re-root the tree on the focused
+    /// pane's folder. Set at boot and whenever the operator asks for it;
+    /// cleared once the probe answers, so a pane that has since gone does
+    /// not leave the request armed forever.
+    files_root_pending: bool,
     /// The shared `cyclops watch` stream model (E2): the same ordered,
     /// identity-stable [`cyclops_ui::Entry`] rows that surface renders,
     /// fed by [`spawn_decoration_forwarder`]'s `events.subscribe`
@@ -513,6 +526,9 @@ pub async fn run_async() -> i32 {
         expanded_for: None,
         watched_sessions: HashSet::new(),
         sidebar_tab: prefs.sidebar_tab,
+        files: crate::files::FileTree::new(),
+        files_probe_at: None,
+        files_root_pending: true,
         record: cyclops_ui::Record::new(),
         intake: cyclops_ui::Intake::new(),
         cursor_style: None,
@@ -547,10 +563,19 @@ pub async fn run_async() -> i32 {
     let mut detached = false;
     let _ = draw(&mut terminal, &mut app, &mut motion, Instant::now());
     while !detached {
+        // Every iteration, because everything that turns the file panel on
+        // is somewhere else: the sidebar reopening, the tab going back to
+        // Sessions, the menu toggle, the first frame needing a folder at
+        // all. Arming from each of those was four places to forget one; the
+        // call is a no-op when a probe is already armed or the panel is not
+        // on screen, so asking every time is both cheaper to reason about
+        // and the only version that cannot go stale.
+        arm_files_probe(&mut app);
         let next_deadline = [
             debounce,
             reconnect_deadline,
             app.folder_probe_at,
+            app.files_probe_at,
             app.notice.deadline(),
             motion.deadline(),
         ]
@@ -599,6 +624,9 @@ pub async fn run_async() -> i32 {
                             false
                         }
                     };
+                    // The sidebar's own drag, on the same beat as a pane
+                    // divider's.
+                    apply_live_sidebar(&mut app, &client).await;
                     if app.needs_reconcile {
                         app.needs_reconcile = false;
                         if let Err(e) = reconcile(&mut app, &client).await {
@@ -627,6 +655,16 @@ pub async fn run_async() -> i32 {
                     app.folder_probe_at = None;
                     if let Err(e) = follow_workspace_folder(&mut app, &client).await {
                         log_err(&app.home, &e);
+                    }
+                }
+                if app.files_probe_at.is_some_and(|due| due <= now) {
+                    app.files_probe_at = None;
+                    // Only a change earns a frame. The poll runs once a
+                    // second and answers "nothing moved" nearly every time;
+                    // redrawing on each of those would be a workspace that
+                    // repaints forever over a folder nobody touched.
+                    if probe_files(&mut app, &client).await {
+                        let _ = draw(&mut terminal, &mut app, &mut motion, Instant::now());
                     }
                 }
                 if reconnect_deadline.is_some_and(|deadline| deadline <= now) {
@@ -1792,6 +1830,22 @@ async fn handle_mouse(
                 } else {
                     action::ScrollDirection::Down
                 };
+                // The file panel scrolls its own list. It is the only
+                // sidebar surface with more rows than it shows and a
+                // pointer already over them, so the wheel belongs to it
+                // here rather than to whatever is behind the sidebar.
+                if matches!(
+                    target,
+                    HitTarget::FileRow { .. } | HitTarget::FileUp | HitTarget::FileRoot
+                ) {
+                    let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                        -3
+                    } else {
+                        3
+                    };
+                    app.files.scroll_by(delta, files_panel_rows(app));
+                    return Ok(());
+                }
                 // Only a `PaneBody` hit has a pane to resolve a cell
                 // against; every other scrollable target (none exist
                 // today) would just carry `None` through unchanged.
@@ -1906,12 +1960,30 @@ async fn handle_mouse(
                         }
                     }
                 }
-                HitTarget::PaneFrame { .. } => {
+                HitTarget::PaneFrame { pane_id } => {
                     // A frame click focuses, nothing more; the swap pickup
                     // lives on the corner grip, so the seam cells a frame
                     // shares with a sibling stay resize handles.
                     app.close_menu();
                     app.selection.clear();
+                    // Except that a pane's top border is also the seam
+                    // between it and the pane above, and the title strip
+                    // painted along it had taken the whole row: a stacked
+                    // pane could only be resized from its far edge. Press
+                    // it and the seam moves; release without moving and it
+                    // is the focus click it has always been.
+                    if let Some((seam, dir)) = app.hit_map.divider_at(col, row) {
+                        app.drag = Some(DragState::on_down(
+                            DragTarget::Divider {
+                                pane_id: seam.to_string(),
+                                dir,
+                                focus_on_click: Some(pane_id.clone()),
+                            },
+                            col,
+                            row,
+                        ));
+                        return Ok(());
+                    }
                 }
                 HitTarget::PaneGrip { pane_id } => {
                     app.close_menu();
@@ -1938,6 +2010,10 @@ async fn handle_mouse(
                         DragTarget::Divider {
                             pane_id: pane_id.clone(),
                             dir: *dir,
+                            // Bare gutter: no pane was pressed, so a
+                            // release that never moved has nothing to
+                            // focus.
+                            focus_on_click: None,
                         },
                         col,
                         row,
@@ -2010,6 +2086,43 @@ async fn handle_mouse(
                     app.drag = Some(DragState::on_down(DragTarget::Sidebar, col, row));
                     return Ok(());
                 }
+                HitTarget::SidebarSplit => {
+                    app.close_menu();
+                    app.selection.clear();
+                    app.drag = Some(DragState::on_down(DragTarget::SidebarSplit, col, row));
+                    return Ok(());
+                }
+                HitTarget::FileUp => {
+                    app.close_menu();
+                    if let Some(parent) = app.files.parent() {
+                        app.files.reroot(parent);
+                    }
+                    return Ok(());
+                }
+                HitTarget::FileRoot => {
+                    app.close_menu();
+                    // Back to where the work is. Asking the pane where it
+                    // is costs a tmux round trip, so this only records the
+                    // request; the loop's next pass arms the probe that
+                    // answers it.
+                    app.files_root_pending = true;
+                    return Ok(());
+                }
+                HitTarget::FileRow { path, is_dir, .. } if *is_dir => {
+                    app.close_menu();
+                    let path = std::path::PathBuf::from(path.clone());
+                    app.files.toggle(&path);
+                    return Ok(());
+                }
+                HitTarget::FileRow { reference, .. } => {
+                    app.close_menu();
+                    let reference = reference.clone();
+                    let outcome =
+                        exec::execute(app, client, action::Action::InsertFileRef { reference })
+                            .await?;
+                    apply_outcome(app, outcome);
+                    return Ok(());
+                }
                 HitTarget::AppMenu => {
                     if app.menu == MenuState::AppMenu {
                         app.close_menu();
@@ -2040,6 +2153,11 @@ async fn handle_mouse(
                     app.prefs.sidebar_width =
                         crate::render::sidebar_width_for_column(col, app.term_size.0);
                 }
+                if app.drag.as_ref().is_some_and(|drag| {
+                    drag.is_active() && matches!(&drag.target, DragTarget::SidebarSplit)
+                }) {
+                    app.prefs.files_rows = files_rows_for_row(app, row);
+                }
             } else if let Some(anchor) = app.selection.anchor_pane().map(str::to_string) {
                 if let Some(geom) = app.hit_map.pane_geometry(&anchor) {
                     if let Some(cell) = crate::input::mouse::HitMap::cell_at(geom, col, row) {
@@ -2062,6 +2180,17 @@ async fn handle_mouse(
                     log_err(&app.home, &error);
                 }
                 resize_client(app, client).await;
+            }
+            let split_drag = app.drag.as_ref().is_some_and(|drag| {
+                drag.is_active() && matches!(&drag.target, DragTarget::SidebarSplit)
+            });
+            if split_drag {
+                app.prefs.files_rows = files_rows_for_row(app, row);
+                // No `resize_client`: this seam is inside the sidebar, so
+                // no column changed hands and no pane reflows.
+                if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
+                    log_err(&app.home, &error);
+                }
             }
             apply_live_divider(app, client).await?;
             if let Some(drag) = app.drag.take() {
@@ -2111,6 +2240,37 @@ fn carry_dialog_drag(app: &mut App, col: u16, row: u16) {
         Some(dialog) => crate::render::clamp_dialog_offset(dialog, area, wanted),
         None => (0, 0),
     };
+}
+
+/// How many list rows the file panel is showing right now, for the wheel
+/// to clamp against.
+///
+/// Read from the hit map the last frame pushed rather than recomputed from
+/// the layout: what the wheel scrolls is the list the operator is looking
+/// at, and a second derivation of the same number is a second thing that
+/// can disagree with the paint.
+fn files_panel_rows(app: &App) -> usize {
+    app.hit_map
+        .regions()
+        .iter()
+        .filter(|region| matches!(region.target, HitTarget::FileRow { .. }))
+        .count()
+}
+
+/// The file panel's row count for a seam dragged to `row`.
+///
+/// Counted from the footer up, which is the same direction the preference
+/// is stored in, so dragging the seam up grows the file panel. The paint
+/// clamps against both panels' minimums, so an out-of-range answer here is
+/// bounded rather than wrong; clamping to zero is only to keep the
+/// unsigned arithmetic honest when the pointer runs past the footer.
+fn files_rows_for_row(app: &App, row: u16) -> u16 {
+    let areas = app.chrome(Rect::new(0, 0, app.term_size.0, app.term_size.1));
+    let Some(sidebar) = areas.sidebar else {
+        return app.prefs.files_rows;
+    };
+    let footer_y = sidebar.y + sidebar.height.saturating_sub(1);
+    footer_y.saturating_sub(row).saturating_sub(1)
 }
 
 /// One axis of pointer travel as a signed cell count.
@@ -2173,9 +2333,12 @@ async fn commit_drag_drop(
             let order = agent_order_for_workspace(app, workspace_id);
             drop.and_then(|drop| action::resolve_agent_drop(workspace_id, order_key, &drop, &order))
         }
-        // These three apply themselves as the pointer moves and have
-        // nothing left to resolve against whatever is under the release.
-        DragTarget::Divider { .. } | DragTarget::Sidebar | DragTarget::Dialog => None,
+        // These apply themselves as the pointer moves and have nothing
+        // left to resolve against whatever is under the release.
+        DragTarget::Divider { .. }
+        | DragTarget::Sidebar
+        | DragTarget::SidebarSplit
+        | DragTarget::Dialog => None,
     };
     let Some(action) = action else {
         return Ok(());
@@ -2288,7 +2451,7 @@ fn pending_divider_resize(app: &App) -> Option<(String, SplitDir, i32)> {
     if !drag.is_active() {
         return None;
     }
-    let DragTarget::Divider { pane_id, dir } = drag.target.clone() else {
+    let DragTarget::Divider { pane_id, dir, .. } = drag.target.clone() else {
         return None;
     };
     let delta = match dir {
@@ -2316,6 +2479,91 @@ async fn apply_live_divider(
         drag.last_applied = drag.current;
     }
     Ok(true)
+}
+
+/// Hand the pane canvas its new width while a sidebar drag is still
+/// running, rather than only when it ends.
+///
+/// The sidebar's own rectangle follows the pointer on every motion event,
+/// but the panes inside the canvas are laid out by tmux and do not move
+/// until tmux is told the client changed size. Told only on release, the
+/// columns the sidebar gave up sat as empty gutter for the whole drag:
+/// the pane canvas is grounded in panel color first, so what the operator
+/// saw was a widening dead strip down the right edge that snapped shut
+/// when they let go. The geometry was never wrong — the sidebar's width,
+/// the declared grid, the margins and the gap overhead account for every
+/// column of the terminal at every width — the panes were simply still
+/// the size they had been told to be.
+///
+/// This rides the render debounce, which is exactly where
+/// [`apply_live_divider`] puts the same problem for pane dividers, and
+/// [`resize_client`]'s own `declared_client_size` check collapses a burst
+/// of motion into one tmux call per column actually crossed. A resize per
+/// motion event would instead reflow every agent's TUI dozens of times a
+/// second, which is the cost that put this on mouse-up to begin with.
+async fn apply_live_sidebar(app: &mut App, client: &ControlClient) {
+    let dragging = app
+        .drag
+        .as_ref()
+        .is_some_and(|drag| drag.is_active() && matches!(drag.target, DragTarget::Sidebar));
+    if dragging {
+        resize_client(app, client).await;
+    }
+}
+
+/// How often the file panel re-reads what it is showing.
+///
+/// A poll rather than a filesystem watch, which is the same call the theme
+/// reload and the folder-follow already make. It costs one `read_dir` per
+/// OPEN directory and answers "nothing moved" with a single integer
+/// comparison ([`crate::files::FileTree::refresh`]), so a second is far
+/// more often than it needs to be and still cheap. A watch would mean a
+/// new dependency with a platform backend per OS, in a binary whose build
+/// time is already something the operator notices.
+const FILES_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Arm the next file-panel poll, unless one is already armed or the panel
+/// is not on screen to poll for.
+///
+/// Three ways to be off screen, and all three have to gate this or the
+/// loop wakes once a second forever to read a folder nobody is looking at:
+/// the sidebar collapsed, the sidebar showing the event stream, and the
+/// panel itself toggled shut. `files_root_pending` overrides them, because
+/// that request is a tmux round trip the panel needs answered before it
+/// can show anything at all, and it clears itself once it lands.
+fn arm_files_probe(app: &mut App) {
+    if app.files_probe_at.is_some() {
+        return;
+    }
+    let showing = app.model.sidebar_visible
+        && app.sidebar_tab == SidebarTab::Sessions
+        && app.prefs.files_rows > 0;
+    if showing || app.files_root_pending {
+        app.files_probe_at = Some(Instant::now() + FILES_PROBE_INTERVAL);
+    }
+}
+
+/// Re-read the file panel, and root it first if that is still owed.
+///
+/// Returns whether anything a reader would see moved, which is the only
+/// thing that earns a redraw. Nothing here is fatal: a tmux probe that
+/// fails leaves the request armed for the next poll, and an unreadable
+/// folder simply lists as empty.
+async fn probe_files(app: &mut App, client: &ControlClient) -> bool {
+    let mut changed = false;
+    if app.files_root_pending {
+        let pane = app.model.active_tab().active_pane.clone();
+        if let Ok(cwd) = client.display(&pane, "#{pane_current_path}").await {
+            let cwd = cwd.trim();
+            if !cwd.is_empty() {
+                app.files_root_pending = false;
+                let before = app.files.root().to_path_buf();
+                app.files.reroot(cwd);
+                changed |= app.files.root() != before;
+            }
+        }
+    }
+    changed | app.files.refresh()
 }
 
 /// Arm one delayed folder probe, if the active workspace follows its folder
@@ -2803,6 +3051,8 @@ fn draw(
                     &app.prefs.agent_order,
                     app.sidebar_tab,
                     &app.record,
+                    &mut app.files,
+                    app.prefs.files_rows,
                     sidebar,
                     f.buffer_mut(),
                     &app.paint,
@@ -2863,6 +3113,7 @@ fn draw(
                     tab_bar: app.prefs.tab_bar_visible,
                     motion: app.prefs.motion,
                     stream: app.sidebar_tab == crate::persist::SidebarTab::Stream,
+                    files: app.prefs.files_rows > 0,
                 },
             );
             if let Some(dialog) = &app.dialog {
@@ -2959,6 +3210,9 @@ mod tests {
             expanded_for: None,
             watched_sessions: HashSet::new(),
             sidebar_tab: SidebarTab::default(),
+            files: crate::files::FileTree::new(),
+            files_probe_at: None,
+            files_root_pending: true,
             record: cyclops_ui::Record::new(),
             intake: cyclops_ui::Intake::new(),
             cursor_style: None,
@@ -3569,6 +3823,87 @@ mod tests {
 
         drop(daemon);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The dead strip down the right edge, stated as arithmetic.
+    ///
+    /// Dragging the sidebar narrower widens the pane canvas immediately,
+    /// because the sidebar's rectangle is the app's own. The grid tmux was
+    /// told about does not change until something tells it, so between
+    /// those two facts sits a run of columns the canvas owns and no pane
+    /// fills. This measures that gap directly: it is zero before the drag,
+    /// grows with every column crossed, and is what `apply_live_sidebar`
+    /// exists to keep at zero.
+    ///
+    /// The geometry itself is not at fault and this pins that too: at
+    /// every width the sidebar, the declared grid, the canvas margins and
+    /// the layout's gap overhead account for every column of the terminal.
+    #[test]
+    fn narrowing_the_sidebar_strands_canvas_columns_until_tmux_is_told() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-sidebar-live");
+        let mut app = test_app(one_pane_model(), home.clone());
+        app.term_size = (120, 30);
+        let full = Rect::new(0, 0, app.term_size.0, app.term_size.1);
+
+        let declared_for = |app: &App| {
+            crate::render::tmux_client_size(app.chrome(full).canvas, app.model.active_tab())
+        };
+
+        // Settled: what tmux was told is what the canvas wants.
+        let start = 30u16;
+        app.prefs.sidebar_width = start;
+        app.declared_client_size = Some(declared_for(&app));
+        assert_eq!(stranded_columns(&app, full), 0);
+
+        // Now drag the edge left, the way a pointer walks it, without
+        // telling tmux. Every column the sidebar gives up is a column the
+        // canvas has and no pane covers.
+        //
+        // The floor comes from `clamp_sidebar_width`, not a number written
+        // here: it has already moved once, and a test that restated it
+        // would measure the clamp rather than the strip.
+        let floor = crate::render::clamp_sidebar_width(0, full.width);
+        assert!(floor < start, "the drag has somewhere to go");
+        for width in (floor..start).rev() {
+            app.prefs.sidebar_width = width;
+            assert_eq!(
+                stranded_columns(&app, full),
+                i32::from(start - width),
+                "width {width}: the strip is exactly the columns not handed over"
+            );
+        }
+
+        // Telling tmux is what closes it, which is all the fix does.
+        app.declared_client_size = Some(declared_for(&app));
+        assert_eq!(stranded_columns(&app, full), 0);
+
+        // And the geometry never loses a column of its own: at every width
+        // the panel, the grid, the margins and the gaps add up to the
+        // terminal.
+        let tab = app.model.active_tab().clone();
+        let (gap_w, _) = crate::layout::layout_gap_overhead(&tab.layout, crate::render::PANE_GAPS);
+        for want in 10..=50u16 {
+            let width = crate::render::clamp_sidebar_width(want, full.width);
+            app.prefs.sidebar_width = width;
+            let (grid, _) = declared_for(&app);
+            assert_eq!(
+                i32::from(width)
+                    + i32::from(grid)
+                    + 2 * i32::from(crate::render::PANE_MARGIN)
+                    + i32::from(gap_w),
+                i32::from(full.width),
+                "width {width} loses a column somewhere"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Canvas columns no pane can be covering: what the canvas is now
+    /// versus the grid tmux was last told to lay out.
+    fn stranded_columns(app: &App, full: Rect) -> i32 {
+        let want = crate::render::tmux_client_size(app.chrome(full).canvas, app.model.active_tab());
+        let told = app.declared_client_size.unwrap_or(want);
+        i32::from(want.0) - i32::from(told.0)
     }
 
     /// A dialog drag accumulates from the last position it was applied at,
@@ -4600,9 +4935,16 @@ mod tests {
         client.shutdown().await;
     }
 
-    /// The frame is not a drag handle anymore: left-down on a frame cell,
-    /// including the labeled title strip that used to start the swap,
-    /// focuses the pane and creates no drag, mirroring the right-click arm.
+    /// The frame never picks a pane UP. The labeled title strip used to
+    /// start the swap, so a click and a twitch on a pane's own title
+    /// rearranged the workspace; the swap pickup is the corner grip now and
+    /// nothing else.
+    ///
+    /// What the title strip may start is a resize, because the row it is
+    /// painted on is also the seam between this pane and the one above, and
+    /// the strip had taken every cell of it. That is a different drag: the
+    /// panes keep their slots and only the boundary moves. A release that
+    /// never moved is still the focus click it always was.
     #[tokio::test]
     async fn a_left_down_on_the_frame_focuses_without_picking_the_pane_up() {
         use cyclops_testrig::{tmux_available, TmuxServer};
@@ -4641,7 +4983,8 @@ mod tests {
         );
         let mut detached = false;
 
-        // The labeled bottom pane's title strip: the old swap pickup.
+        // The labeled bottom pane's title strip: the old swap pickup, and
+        // the seam this pane shares with the one above it.
         handle_mouse(
             &mut app,
             &client,
@@ -4650,9 +4993,28 @@ mod tests {
         )
         .await
         .expect("down");
-        assert!(app.drag.is_none(), "a frame cell must never start a drag");
+        match app.drag.as_ref().map(|drag| &drag.target) {
+            Some(DragTarget::Divider { focus_on_click, .. }) => assert_eq!(
+                focus_on_click.as_deref(),
+                Some(bottom.as_str()),
+                "a release that never moved has to focus the pane pressed"
+            ),
+            other => panic!("a frame cell must never pick a pane up, got {other:?}"),
+        }
+        // Released without moving: the seam stays put and the pane focuses.
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Up(MouseButton::Left), 20, 6),
+            &mut detached,
+        )
+        .await
+        .expect("up");
+        assert!(app.drag.is_none());
+        assert_eq!(app.model.active_tab().active_pane, bottom);
 
-        // The top pane's frame: focus follows the click.
+        // The top pane's own top border has no pane above it, so there is
+        // no seam there and the press is a plain focus click.
         handle_mouse(
             &mut app,
             &client,

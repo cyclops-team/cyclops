@@ -158,6 +158,7 @@ pub(super) async fn execute(
             send_message(app, to, subject, body);
             Ok(Outcome::default())
         }
+        Action::InsertFileRef { reference } => insert_file_ref(app, client, reference).await,
 
         Action::RequestNewTab => {
             app.open_dialog(Dialog::NewTab {
@@ -247,6 +248,22 @@ pub(super) async fn execute(
             // said otherwise.
             app.prefs.tab_bar_visible = !app.prefs.tab_bar_visible;
             super::resize_client(app, client).await;
+            Ok(Outcome {
+                persist: true,
+                ..Outcome::default()
+            })
+        }
+        Action::ToggleFiles => {
+            // Stored as the row count, so "off" is zero rows and "on" is
+            // whatever it was last. There is no separate visibility flag to
+            // fall out of step with the size.
+            app.prefs.files_rows = if app.prefs.files_rows == 0 {
+                crate::persist::WorkspacePrefs::default().files_rows
+            } else {
+                0
+            };
+            // No `resize_client`: the seam is inside the sidebar, so no
+            // column changed hands and no pane reflows.
             Ok(Outcome {
                 persist: true,
                 ..Outcome::default()
@@ -1103,6 +1120,48 @@ fn apply_insertion(order: &mut Vec<String>, source: &str, insertion: &Insertion)
 /// With no channel (a test App built without a loop) the send is simply not
 /// started. Spawning a thread whose answer nothing can receive would be a
 /// message on the record that the operator is never told about.
+/// Type `@<reference> ` into the focused pane.
+///
+/// Typed, not submitted. The path lands beside whatever is already on that
+/// line and the operator decides what to do with it, which is the whole
+/// point: clicking a file in the tree is how you say "this one" while you
+/// are still composing a sentence about it.
+///
+/// The trailing space is not decoration. Without it a second click
+/// concatenates two paths into one nonexistent one, and that is the
+/// failure the agent on the other end reports rather than the two files
+/// that were meant.
+async fn insert_file_ref(
+    app: &mut App,
+    client: &ControlClient,
+    reference: String,
+) -> Result<Outcome, cyclops_tmux::TmuxError> {
+    // Control mode is line based: a literal carrying a line break ends the
+    // command, and tmux reads the rest as another one. A path may legally
+    // contain a newline on unix, so this is a real input rather than a
+    // theoretical one, and the safe answer is to type nothing.
+    if reference.contains('\n') || reference.contains('\r') {
+        return Ok(Outcome::default());
+    }
+    let pane = app.model.active_tab().active_pane.clone();
+    client
+        .send_keys(&pane, &[&format!("@{reference} ")])
+        .await?;
+    // Named by label where the pane has one. The click happened in the
+    // sidebar and the text landed somewhere else, so the notice is the
+    // only thing that says where it went.
+    let where_to = app
+        .decoration
+        .pane(&pane)
+        .and_then(|d| d.label.clone())
+        .unwrap_or_else(|| pane.clone());
+    app.notice.show(
+        crate::copy::file_sent(&reference, &where_to),
+        tokio::time::Instant::now(),
+    );
+    Ok(Outcome::default())
+}
+
 fn send_message(app: &mut App, to: String, subject: String, body: String) {
     let Some(tx) = app.tx.clone() else {
         return;
@@ -1192,6 +1251,9 @@ mod tests {
             router: Router::new(default_bindings()),
             paint: Paint::for_test(),
             dialog_offset: (0, 0),
+            files: crate::files::FileTree::new(),
+            files_probe_at: None,
+            files_root_pending: false,
             dialog: None,
             theme_restore: None,
             link_state: LinkState::Live,

@@ -145,6 +145,37 @@ tree and the event stream. The footer's `☰ menu` and `+` buttons stay put
 on both tabs. The two surfaces share one panel, so only one of them is on
 screen at a time.
 
+## The file panel
+
+The Sessions tab is two panels in one column: who is running, above, and
+what is on disk, below. A dashed rule separates them; drag it to give
+either half more rows, and drag it all the way to the footer to close the
+file panel and hand the whole column back to the session tree. The app
+menu's `Files` item is the way back, and the only way back, because a
+closed panel leaves no rule to grab.
+
+The panel roots itself on the focused pane's directory. Click its folder
+name to re-root there again after walking somewhere else, and click `..`
+to go up. Folders open and close on click and only opened folders are
+read, so the panel costs one directory listing over a repository of any
+size. `.git` is skipped; every other dotfile is listed, because those are
+the ones you edit. Symbolic links are leaves whatever they point at, so a
+link back into its own parent cannot walk forever.
+
+It re-reads once a second and repaints only when something you can see has
+moved: a file written into an open folder shows up on its own, one written
+into a closed one does not, because nothing on screen would change. A
+folder with more than 500 entries is listed short and says how many it
+left out.
+
+Click a file and its path is typed into the focused pane as `@src/main.rs `,
+relative to the panel's root, with a trailing space so a second click does
+not run two paths together. Nothing is submitted: the path lands beside
+whatever you were already typing and you say what to do with it. Every
+agent in the roster reads `@path` as "this file". The notice line names
+the pane it went to, since the click happened in one panel and the text
+appeared in another.
+
 Drag the sidebar's outer edge to resize it, on either tab. The edge paints
 nothing at rest, so it does not stand as a second line beside the pane
 canvas's own border; move the pointer onto it and a `┊` handle appears
@@ -263,6 +294,7 @@ owned by another Cyclops component:
 [workspace]
 sidebar_visible = true
 sidebar_width = 28
+files_rows = 8
 sidebar_tab = "sessions"
 tab_bar_visible = true
 motion = true

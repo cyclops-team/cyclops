@@ -9,6 +9,16 @@ pub enum DragTarget {
     Divider {
         pane_id: String,
         dir: SplitDir,
+        /// The pane a below-threshold release focuses.
+        ///
+        /// `None` for the bare gutter, which has no pane to focus. `Some`
+        /// when the seam was grabbed through a pane's own top border: the
+        /// title strip painted there is a focus control and keeps its
+        /// click, while the row it sits on stays the resize handle it also
+        /// is. The pane focused is the one whose border was pressed, never
+        /// `pane_id` — that is the pane on the far side of the seam, the
+        /// one `resize-pane` targets.
+        focus_on_click: Option<String>,
     },
     /// Swap a pane with the one it is dropped on. Picked up by its corner
     /// grip, never its frame or body: a frame click focuses and a body
@@ -30,6 +40,10 @@ pub enum DragTarget {
     },
     /// Resize the application sidebar, not a tmux pane.
     Sidebar,
+    /// Move the seam between the sidebar's session tree and its file
+    /// panel. Vertical only, and it resizes no tmux pane: both halves
+    /// belong to the application.
+    SidebarSplit,
     /// Move the open dialog off whatever it is covering. Picked up by the
     /// box's top border and title row; the rest of the card belongs to the
     /// controls painted on it.
@@ -185,6 +199,7 @@ mod tests {
         DragTarget::Divider {
             pane_id: "%0".into(),
             dir: SplitDir::Horizontal,
+            focus_on_click: None,
         }
     }
 

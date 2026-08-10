@@ -55,6 +55,21 @@ pub enum HitTarget {
         tab: crate::persist::SidebarTab,
     },
     SidebarDivider,
+    /// One entry of the file panel. Carries what a click needs so the
+    /// handler never re-reads the filesystem to answer a press: `path` to
+    /// open a folder with, `reference` (root-relative) to send for a file.
+    FileRow {
+        index: usize,
+        path: String,
+        is_dir: bool,
+        reference: String,
+    },
+    /// The file panel's climb-out row.
+    FileUp,
+    /// The file panel's header: re-roots on the focused pane's folder.
+    FileRoot,
+    /// The seam between the session tree and the file panel.
+    SidebarSplit,
     /// The chevron that collapses or reopens the sidebar: on the open
     /// panel's outer edge, and on the one-column rail a collapse leaves
     /// behind. One target for both, because it is one control.
@@ -153,6 +168,36 @@ impl HitMap {
         blocks
     }
 
+    /// The resize seam under `col`/`row`, whatever is painted over it.
+    ///
+    /// [`HitMap::hit`] answers with the topmost region, and on a pane's top
+    /// border that is the pane's own title strip or a split button. Those
+    /// are real controls and keep their clicks, but the row they sit on is
+    /// also the seam between two stacked panes, and a seam nobody can grab
+    /// is a pane that can only be resized from its far edge. Measured: of
+    /// the 40 cells on a two-pane seam's lower row, one was grabbable.
+    ///
+    /// Last pushed wins, the same rule `hit` uses, so the two can never
+    /// disagree about which of two overlapping bands a cell belongs to.
+    /// Bands from different levels of a split tree do not overlap today
+    /// (an outer divider sits outside every child's rect), so the rule is
+    /// only load-bearing if that ever stops being true.
+    pub fn divider_at(&self, col: u16, row: u16) -> Option<(&str, SplitDir)> {
+        self.regions
+            .iter()
+            .rev()
+            .filter(|r| {
+                col >= r.rect.x
+                    && col < r.rect.x + r.rect.width
+                    && row >= r.rect.y
+                    && row < r.rect.y + r.rect.height
+            })
+            .find_map(|r| match &r.target {
+                HitTarget::Divider { pane_id, dir } => Some((pane_id.as_str(), *dir)),
+                _ => None,
+            })
+    }
+
     pub fn hit(&self, col: u16, row: u16) -> Option<&HitTarget> {
         self.regions
             .iter()
@@ -166,7 +211,6 @@ impl HitMap {
             .map(|r| &r.target)
     }
 
-    #[cfg(test)]
     pub fn regions(&self) -> &[HitRegion] {
         &self.regions
     }
