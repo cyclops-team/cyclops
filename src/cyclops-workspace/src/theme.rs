@@ -222,6 +222,18 @@ pub fn add_button(paint: &Paint) -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// The Cyclops mark in the canvas margin.
+///
+/// The dimmest ink the theme has, on the chrome ground it sits on. It is
+/// branding in a band the eye passes over, so it must read as part of the
+/// frame and never compete with a pane border for attention. Anything
+/// brighter turns a quiet edge into a second thing to look at.
+pub fn wordmark(paint: &Paint) -> Style {
+    paint
+        .style_token(tokens::SURFACE_DIM)
+        .patch(paint.bg_token(tokens::CHROME_PANEL))
+}
+
 /// The sidebar footer's controls: the menu, the composer and the create
 /// button. One bar, so they have to read as one bar.
 ///

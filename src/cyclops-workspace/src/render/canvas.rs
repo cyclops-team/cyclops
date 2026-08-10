@@ -123,6 +123,38 @@ const BORDER_FOCUSED: BorderGlyphs = BorderGlyphs {
     bottom_right: "╝",
 };
 
+/// The Cyclops mark, low and dim in the canvas's bottom margin.
+///
+/// It costs no cells. `pane_canvas` already insets by [`PANE_MARGIN`] all
+/// round, so this row exists whether or not anything is written in it, and
+/// until now nothing was. That margin is the "dead space" complaint from
+/// the inside: the operator reads the whole outer band as wasted, and the
+/// part of it we actually own is this.
+///
+/// The part we do not own is the terminal emulator's own window padding,
+/// outside the character grid entirely. Nothing here can reach it; that is
+/// a setting in their terminal.
+///
+/// Right-aligned, one column in from the edge so it sits under the pane
+/// frames rather than flush against nothing. Dropped whole when the canvas
+/// is too small to have a margin at all, because at that size every row is
+/// content.
+fn paint_wordmark(canvas: Rect, buf: &mut Buffer, paint: &Paint) {
+    let inner = pane_canvas(canvas);
+    // No inset means no margin row to write in.
+    if inner == canvas || canvas.height == 0 {
+        return;
+    }
+    let text = concat!("[> -] ", "cyclops");
+    let width = u16::try_from(Span::raw(text).width()).unwrap_or(u16::MAX);
+    let row = canvas.y + canvas.height - 1;
+    if canvas.width < width + 2 * PANE_MARGIN {
+        return;
+    }
+    let x = canvas.x + canvas.width - PANE_MARGIN - width;
+    super::overlay_text(buf, canvas, x, row, text, theme::wordmark(paint));
+}
+
 /// The rectangle occupied by pane content plus internal separators: the
 /// canvas inset by [`PANE_MARGIN`] when there is room.
 pub fn pane_canvas(canvas: Rect) -> Rect {
@@ -222,6 +254,7 @@ pub fn paint_window(
     for slot in slots.iter() {
         push_pane_overlay_hits(slot, canvas, ctx.decoration, ctx.hits);
     }
+    paint_wordmark(canvas, buf, paint);
     if let Some(drag) = ctx.drag.filter(|d| d.is_active()) {
         paint_drag_preview(drag, buf, paint);
     }
