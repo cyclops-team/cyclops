@@ -539,10 +539,10 @@ fn lerp(from: (u8, u8, u8), to: (u8, u8, u8), f: f64) -> (u8, u8, u8) {
 /// dim-to-accent path collapses to four or five entries, so an eight-frame
 /// fade shows four steps. Banding is worse than a snap.
 ///
-/// The callers are the surfaces that paint animated chrome, `canvas` (the
-/// pane border, the state cell, the notice) and `sidebar` (the row's status
-/// glyph); the allow goes with the first of them to land.
-#[allow(dead_code)]
+/// The pane border is the caller that landed first (`canvas`, the focus
+/// fade). The state cell, the notice and the sidebar row's status glyph are
+/// still staged: `MotionFrame` already answers for them, and wiring each is
+/// a call to this function at the point that picks its style.
 pub(crate) fn blend(paint: &Paint, from: Style, to: Style, t: f32) -> Style {
     debug_assert!(
         from.bg == to.bg,

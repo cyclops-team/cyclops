@@ -36,6 +36,10 @@ pub struct WindowPaintCtx<'a> {
     pub notice: Option<&'a str>,
     /// The hardware cursor when the focused pane shows one.
     pub cursor: Option<HostCursor>,
+    /// This frame's position in any fade the motion clock is running.
+    /// [`crate::animate::MotionFrame::none`] when motion is off, which
+    /// makes every read below snap straight to the destination style.
+    pub motion: crate::animate::MotionFrame<'a>,
 }
 
 /// What the focused pane asks the host terminal's real cursor to do this
@@ -440,11 +444,28 @@ fn paint_pane_frame(
     // Focus moves both encodings at once, and this is the only place that
     // decides either: the accent color, and the heavier glyph set that
     // keeps focus readable when the color is gone.
-    let (border_style, border_glyphs) = if slot.focused {
-        (theme::pane_border_focused(paint), &BORDER_FOCUSED)
+    //
+    // The glyph set flips at once and the color crosses over time. That
+    // split is deliberate: the heavier glyphs are the encoding that has to
+    // survive NO_COLOR and a screenshot, so they must never be caught
+    // mid-way, while the accent is the part an eye can follow moving. With
+    // motion off `focus` returns the endpoint and the blend is a snap.
+    let border_glyphs = if slot.focused {
+        &BORDER_FOCUSED
     } else {
-        (theme::pane_border(paint), &BORDER_REST)
+        &BORDER_REST
     };
+    // The endpoints never swap. `focus` answers how much accent this border
+    // carries right now, 0.0 at rest and 1.0 focused, so the blend always
+    // runs rest to focused and only `t` moves. Flipping the ends by focus
+    // state applies the fade twice and lands a resting pane on the wrong
+    // one.
+    let border_style = super::blend(
+        paint,
+        theme::pane_border(paint),
+        theme::pane_border_focused(paint),
+        ctx.motion.focus(&slot.pane_id, slot.focused),
+    );
     paint_pane_border(vis, bounds, buf, border_style, border_glyphs);
     // The bottom-right corner becomes the grip. Painted here, per frame,
     // right after this frame's own border: the focused frame repaints last, so
@@ -881,6 +902,10 @@ mod tests {
             drag: None,
             notice: None,
             cursor: None,
+            // No clock: every fade reads as its endpoint, which is what
+            // these tests assert about. The fade itself is covered by
+            // `animate`'s own tests and by the focus-fade test below.
+            motion: crate::animate::MotionFrame::none(),
         }
     }
 
@@ -1361,6 +1386,83 @@ mod tests {
         assert_eq!(painted, PANE_GRIP, "and it paints where it answers");
         let (_, gy1) = grip_of("%1");
         assert!(gy1 > gy, "the lower pane's grip is on its own top border");
+    }
+
+    /// Motion actually moves something now.
+    ///
+    /// The clock, the easing and the color interpolator all shipped built
+    /// and wired to the event loop, and no painter read any of it: turning
+    /// motion on scheduled 16ms wakes that composed frames identical to the
+    /// ones before them. This is the first painter to read the clock, so it
+    /// is also the first test that could have caught that.
+    ///
+    /// Mid-fade the border must be neither endpoint. The glyph set is
+    /// checked to be already at its destination in the same frame, because
+    /// weight is the encoding that has to survive NO_COLOR and must never
+    /// be caught half way.
+    #[test]
+    fn a_focus_change_fades_the_border_rather_than_snapping_it() {
+        use crate::animate::{Motion, MotionFrame, Seen};
+        use std::time::Duration;
+        // The clock runs on tokio's Instant, the same one the event loop
+        // arms its deadlines with.
+        use tokio::time::Instant;
+
+        let mut paint = Paint::for_test();
+        paint.truecolor = true;
+        let tab = two_pane_tab();
+        // `two_pane_tab` focuses %0; the grip tests above rely on the same.
+        let focused = "%0".to_string();
+
+        let mut motion = Motion::new(true);
+        let start = Instant::now();
+        // First frame establishes what was on screen; the second moves
+        // focus, which is what arms the fade.
+        motion.observe(Seen::new(None, Vec::new(), None), start);
+        motion.observe(Seen::new(Some(focused.clone()), Vec::new(), None), start);
+
+        let border_at = |motion: &Motion, at: Instant| {
+            let runtimes = RuntimeRegistry::default();
+            let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
+            term.draw(|f| {
+                let mut hits = HitMap::default();
+                let paused = std::collections::HashSet::new();
+                let dec = DecorationSnapshot::default();
+                let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
+                ctx.motion = MotionFrame::new(motion, at);
+                paint_window(&tab, &runtimes, f.area(), f.buffer_mut(), &paint, &mut ctx);
+            })
+            .unwrap();
+            term.backend().buffer().clone()
+        };
+
+        // A cell on the focused pane's own top border, left of its controls.
+        let probe = (2u16, 0u16);
+        let mid = border_at(&motion, start + Duration::from_millis(60));
+        let done = border_at(
+            &motion,
+            start + crate::animate::FOCUS + Duration::from_millis(1),
+        );
+
+        let rest = theme::pane_border(&paint).fg;
+        let lit = theme::pane_border_focused(&paint).fg;
+        assert_ne!(rest, lit, "the two ends must differ or this proves nothing");
+
+        assert_eq!(
+            done[probe].style().fg,
+            lit,
+            "the fade has to arrive at the focused color"
+        );
+        let half = mid[probe].style().fg;
+        assert_ne!(half, rest, "and leave the resting color behind");
+        assert_ne!(half, lit, "without jumping straight to the end");
+
+        // Weight is not interpolated: it is already heavy mid-fade.
+        assert_eq!(
+            mid[probe].symbol(),
+            done[probe].symbol(),
+            "the glyph set flips at once, only the color crosses over"
+        );
     }
 
     /// The grip must read as a handle in every shipped theme and under

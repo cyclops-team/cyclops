@@ -3125,6 +3125,11 @@ fn draw(
                 drag: app.drag.as_ref(),
                 notice: app.notice.text(),
                 cursor: None,
+                // Where every fade this frame stands. `none()` while motion
+                // is off, and a fade that has finished reads as its
+                // endpoint, so the painters below need no motion branch of
+                // their own.
+                motion: crate::animate::MotionFrame::new(motion, now),
             };
             paint_window(
                 tab,
@@ -4869,6 +4874,7 @@ mod tests {
                 drag: None,
                 notice: None,
                 cursor: None,
+                motion: crate::animate::MotionFrame::none(),
             };
             paint_window(
                 &tab,
