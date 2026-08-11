@@ -121,10 +121,13 @@ detection diagnostics. Every other state maps to one of four glyphs:
 
 | Glyph | Meaning |
 |-------|---------|
-| `○`   | idle — safe to send a message |
-| `●`   | working — a turn is running, or the composer holds staged text |
+| `○`   | idle — no turn is running, including when the composer holds text |
+| `●`   | working — a turn is running |
 | `⚠`   | needs attention — the daemon's attention register has an open item for this pane |
 | `✕`   | dead — the pane's process exited |
+
+Composer text remains `idle_with_input` internally. Delivery still holds
+rather than overwriting it; only the compact workspace presentation says idle.
 
 Sidebar rows and inactive pane borders are compact surfaces: they show the
 bare glyph, with no word alongside it and no word substituted when one

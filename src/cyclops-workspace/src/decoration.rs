@@ -85,9 +85,9 @@ impl DecorationSnapshot {
     }
 
     /// Primary UI status. Unknown stays absent, while diagnostics continue
-    /// to expose it. A staged composer is unavailable for another prompt, so
-    /// the compact UI groups it with working rather than falsely calling it
-    /// idle.
+    /// to expose it. A staged composer is unavailable for another prompt but
+    /// is not a running turn, so the primary UI presents it as idle while the
+    /// exact state remains available to diagnostics and delivery.
     ///
     /// `needs_attention` is the only attention predicate: it is copied
     /// straight from the daemon's authoritative `cyclops_proto::attention`
@@ -96,9 +96,9 @@ impl DecorationSnapshot {
     /// — can only ever paper over a disagreement between that register and
     /// the UI; it must never manufacture attention the daemon didn't raise.
     /// A blocked state the register left unflagged is therefore not an
-    /// attention item: it groups with `working` below, the same "occupied,
-    /// not free" bucket `idle_with_input` uses, colored by the pane's exact
-    /// state rather than the generic `Working` the shared glyph implies.
+    /// attention item: it groups with `working` below as an "occupied, not
+    /// free" fallback, colored by the pane's exact state rather than the
+    /// generic `Working` the shared glyph implies.
     pub fn primary_status(dec: &PaneDecoration) -> Option<PrimaryStatus> {
         if dec.needs_attention {
             return Some(PrimaryStatus {
@@ -114,16 +114,21 @@ impl DecorationSnapshot {
                 word: "idle",
                 color_state: AgentState::Idle,
             }),
+            AgentState::IdleWithInput => Some(PrimaryStatus {
+                glyph: "○",
+                word: "idle",
+                color_state: AgentState::IdleWithInput,
+            }),
             AgentState::Dead => Some(PrimaryStatus {
                 glyph: "✕",
                 word: "dead",
                 color_state: AgentState::Dead,
             }),
-            // Occupied, not free: real work, a composer holding input, and
-            // a block the register has not flagged all read ● on a compact
-            // surface. Whether a block needs a human is the register's call
-            // alone (`needs_attention` above); the exact state only picks
-            // the color token, through the one owner of "is this blocked".
+            // Occupied, not free: real work and a block the register has not
+            // flagged both read ● on a compact surface. Whether a block needs
+            // a human is the register's call alone (`needs_attention` above);
+            // the exact state only picks the color token, through the one
+            // owner of "is this blocked".
             state => Some(PrimaryStatus {
                 glyph: "●",
                 word: "working",
@@ -360,12 +365,32 @@ mod tests {
         );
     }
 
+    /// Sidebar rows and pane chrome share this primary status. Composer
+    /// input is visually idle because no turn is running, but the underlying
+    /// state remains unsafe to inject into.
+    #[test]
+    fn composer_input_is_presented_as_idle_without_becoming_injectable() {
+        let input = pane_decoration(
+            &pane("%0", "@0", Some("reviewer"), AgentState::IdleWithInput),
+            false,
+        );
+
+        assert!(!input.state.safe_to_inject());
+        assert_eq!(
+            DecorationSnapshot::primary_status(&input),
+            Some(PrimaryStatus {
+                glyph: "○",
+                word: "idle",
+                color_state: AgentState::IdleWithInput,
+            })
+        );
+    }
+
     /// The daemon's attention register is the only source of an attention
     /// item (rule: never recompute attention in decoration). A blocked pane
     /// the register did not flag — the daemon hasn't raised it yet, or the
     /// two disagree — must not be relabeled into attention by a second,
-    /// local guess; it renders as its own occupied state instead, the same
-    /// bucket `idle_with_input` shares with `working`.
+    /// local guess; it renders as its own occupied state instead.
     #[test]
     fn blocked_without_an_attention_item_is_not_shown_as_attention() {
         // Every state, filtered by the owner's own predicate: the blocked

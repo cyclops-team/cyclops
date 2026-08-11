@@ -350,10 +350,12 @@ share a cell.
 
 The workspace's compact surfaces — sidebar rows, inactive pane borders —
 are the one narrow exception, and it is not a color standing in for a
-word: `○` idle, `●` working, `⚠` needs attention, and `✕` dead are a
-fixed, documented glyph vocabulary that a reader can learn once. The glyph
-is chosen by state, never by theme, so it renders identically under every
-theme and under `NO_COLOR`; only the `Style` painted under it changes. A
+word: `○` idle, `●` working, `⚠` needs attention, and `✕` dead are a fixed,
+documented glyph vocabulary that a reader can learn once. `idle_with_input`
+shares the idle presentation because no turn is running, but it remains a
+distinct, unsafe state in diagnostics and delivery. The
+glyph is chosen by state, never by theme, so it renders identically under
+every theme and under `NO_COLOR`; only the `Style` painted under it changes. A
 detailed surface (the focused pane border, dialogs, the sidebar's event
 stream), plain-text output, and every diagnostic show the word whenever
 there is room for it. None of them may drop straight to hiding the state

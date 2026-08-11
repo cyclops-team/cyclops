@@ -2257,6 +2257,48 @@ mod tests {
     }
 
     #[test]
+    fn composer_input_reads_idle_in_focused_pane_chrome() {
+        use crate::decoration::{DecorationSnapshot, PaneDecoration};
+        use cyclops_proto::AgentState;
+
+        let tab = two_pane_tab();
+        let runtimes = RuntimeRegistry::default();
+        let mut decoration = DecorationSnapshot {
+            online: true,
+            ..Default::default()
+        };
+        decoration.panes.insert(
+            "%0".into(),
+            PaneDecoration {
+                pane_id: "%0".into(),
+                window_id: "@0".into(),
+                label: Some("reviewer".into()),
+                manifest: Some("codex".into()),
+                manifest_display_name: Some("Codex CLI".into()),
+                state: AgentState::IdleWithInput,
+                needs_attention: false,
+            },
+        );
+        let backend = TestBackend::new(40, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+        term.draw(|f| {
+            let mut hits = HitMap::default();
+            let paused = std::collections::HashSet::new();
+            let mut ctx = ctx_defaults(&mut hits, &paused, &decoration);
+            paint_window(&tab, &runtimes, f.area(), f.buffer_mut(), &theme, &mut ctx);
+        })
+        .unwrap();
+
+        let flat = flatten(term.backend().buffer());
+        assert!(flat.contains("reviewer · ○ idle"), "pane chrome: {flat}");
+        assert!(
+            !flat.contains("reviewer · ● working"),
+            "pane chrome: {flat}"
+        );
+    }
+
+    #[test]
     fn unknown_is_not_painted_in_primary_pane_chrome() {
         use crate::decoration::{DecorationSnapshot, PaneDecoration};
         use cyclops_proto::AgentState;

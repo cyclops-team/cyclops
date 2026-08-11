@@ -2438,6 +2438,7 @@ mod tests {
         let (gx, gy) = (5, 4);
         for (state, needs_attention, glyph) in [
             (AgentState::Idle, false, "○"),
+            (AgentState::IdleWithInput, false, "○"),
             (AgentState::Working, false, "●"),
             (AgentState::BlockedPermission, true, "⚠"),
             (AgentState::Dead, false, "✕"),
