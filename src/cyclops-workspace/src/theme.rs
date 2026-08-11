@@ -102,6 +102,22 @@ impl Paint {
     }
 }
 
+impl Paint {
+    /// The chrome ground as literal rgb, for the one place that needs a
+    /// color rather than a `Style`: the terminal's own default background
+    /// (`term_guard::apply_window_background`).
+    ///
+    /// `None` when color is off. Repainting the host terminal's background
+    /// under `NO_COLOR` would be the one piece of color the workspace
+    /// emitted anyway, and rule 11 has no exception for the frame.
+    pub fn chrome_ground_rgb(&self) -> Option<(u8, u8, u8)> {
+        if !self.colors_enabled {
+            return None;
+        }
+        Some(self.theme.resolve(tokens::CHROME_PANEL).rgb)
+    }
+}
+
 fn rt_color(c: ThemeColor, truecolor: bool) -> RtColor {
     if truecolor {
         let (r, g, b) = c.rgb;

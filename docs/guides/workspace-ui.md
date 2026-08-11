@@ -138,6 +138,15 @@ depends on color. Cyclops never writes the pane title to show any of
 this—the title remains a sensor. See [panes.md](panes.md) for naming and
 identity rules.
 
+Cyclops paints every cell your terminal gives it, and also asks the
+terminal to make its own default background the theme's chrome color
+(OSC 11). That is what fills the few pixels of window padding a terminal
+reserves outside the character grid, which no amount of cell painting can
+reach. It is handed back (OSC 111) on every exit path, panic included, so
+your shell gets its own background returned. A terminal that does not
+understand the sequence ignores it and shows its own padding color as
+before.
+
 Pane content still maps one terminal cell to one tmux cell. The gutter is
 removed from the client size reported to tmux; it never scales or covers a
 pane grid. See [themes.md](themes.md) for the `chrome.text`,
