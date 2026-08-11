@@ -170,6 +170,10 @@ struct App {
     theme_restore: Option<cyclops_theme::Theme>,
     link_state: LinkState,
     paused_panes: HashSet<String>,
+    /// The chrome ground last handed to the terminal as its own default
+    /// background. Compared each frame so the escape goes out on a theme
+    /// change and on no other frame.
+    window_bg: Option<(u8, u8, u8)>,
     /// Panes collapsed to their title bar, mapped to the height each had
     /// before. Not persisted: a minimized pane is where you left the
     /// furniture this afternoon, not a preference, and restoring one on
@@ -518,6 +522,7 @@ pub async fn run_async() -> i32 {
         link_state: LinkState::Live,
         paused_panes: HashSet::new(),
         minimized: std::collections::HashMap::new(),
+        window_bg: None,
         reconnect_attempt: 0,
         hit_map: HitMap::default(),
         menu: MenuState::None,
@@ -3176,6 +3181,19 @@ fn draw(
     // read per frame is cheap, it cannot desynchronise from what the menu
     // just wrote, and it also covers a `config.toml` edited under a
     // running workspace.
+    // Repaint the host terminal's own background when the theme's ground
+    // changes, which is what fills the window padding around the grid.
+    // Here rather than at each theme site because the paint changes through
+    // three of them: boot, the ThemeWatch reload, and the picker's live
+    // preview. One comparison catches all three and emits nothing on the
+    // frames between.
+    let ground = app.paint.chrome_ground_rgb();
+    if ground != app.window_bg {
+        if let Some(rgb) = ground {
+            crate::term_guard::apply_window_background(rgb);
+        }
+        app.window_bg = ground;
+    }
     motion.set_preference(app.prefs.motion, motion_capable(&app.paint));
     motion.observe(observed(app), now);
     app.hit_map.clear();
@@ -3420,6 +3438,7 @@ mod tests {
             link_state: LinkState::Live,
             paused_panes: HashSet::new(),
             minimized: std::collections::HashMap::new(),
+            window_bg: None,
             reconnect_attempt: 0,
             hit_map: HitMap::default(),
             menu: MenuState::None,

@@ -1353,6 +1353,7 @@ mod tests {
             link_state: LinkState::Live,
             paused_panes: HashSet::new(),
             minimized: std::collections::HashMap::new(),
+            window_bg: None,
             reconnect_attempt: 0,
             hit_map: HitMap::default(),
             menu: MenuState::None,

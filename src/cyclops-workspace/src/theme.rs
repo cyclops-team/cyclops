@@ -102,6 +102,22 @@ impl Paint {
     }
 }
 
+impl Paint {
+    /// The chrome ground as literal rgb, for the one place that needs a
+    /// color rather than a `Style`: the terminal's own default background
+    /// (`term_guard::apply_window_background`).
+    ///
+    /// `None` when color is off. Repainting the host terminal's background
+    /// under `NO_COLOR` would be the one piece of color the workspace
+    /// emitted anyway, and rule 11 has no exception for the frame.
+    pub fn chrome_ground_rgb(&self) -> Option<(u8, u8, u8)> {
+        if !self.colors_enabled {
+            return None;
+        }
+        Some(self.theme.resolve(tokens::CHROME_PANEL).rgb)
+    }
+}
+
 fn rt_color(c: ThemeColor, truecolor: bool) -> RtColor {
     if truecolor {
         let (r, g, b) = c.rgb;
@@ -220,18 +236,6 @@ pub fn add_button(paint: &Paint) -> Style {
     chrome_raised(paint)
         .patch(paint.style_token(tokens::SURFACE_ACCENT))
         .add_modifier(Modifier::BOLD)
-}
-
-/// The Cyclops mark in the canvas margin.
-///
-/// The dimmest ink the theme has, on the chrome ground it sits on. It is
-/// branding in a band the eye passes over, so it must read as part of the
-/// frame and never compete with a pane border for attention. Anything
-/// brighter turns a quiet edge into a second thing to look at.
-pub fn wordmark(paint: &Paint) -> Style {
-    paint
-        .style_token(tokens::SURFACE_DIM)
-        .patch(paint.bg_token(tokens::CHROME_PANEL))
 }
 
 /// The sidebar footer's controls: the menu, the composer and the create

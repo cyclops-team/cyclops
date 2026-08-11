@@ -35,6 +35,38 @@ pub fn apply_cursor_style(shape: CursorShape, blink: bool) {
     let _ = out.execute(style);
 }
 
+/// Paint the host terminal's own default background the theme's chrome
+/// color (OSC 11).
+///
+/// This is the only way to reach the band around the grid. A terminal
+/// reserves a few pixels of window padding and fills them with its default
+/// background, and no amount of cell painting touches it: the workspace
+/// already fills every cell it is given, so the strip an operator sees at
+/// the edges is outside the grid entirely. OSC 11 changes the color that
+/// strip is filled with, which is why it is here rather than in a painter.
+///
+/// Lives beside the guard for the same reason `apply_cursor_style` does:
+/// it changes terminal state that outlives the process unless something
+/// undoes it, and `restore` is what undoes it, on every exit path
+/// including a panic. Leaving a shell with the workspace's background
+/// would be a worse bug than the padding it fixes.
+///
+/// Unsupported terminals ignore the sequence, so there is nothing to
+/// detect and no fallback to write.
+pub fn apply_window_background(rgb: (u8, u8, u8)) {
+    let (r, g, b) = rgb;
+    let mut out = io::stdout();
+    // ST rather than BEL: both terminate an OSC, and a stray BEL in a
+    // terminal that did not understand the sequence rings the bell.
+    let _ = write!(out, "\x1b]11;#{r:02x}{g:02x}{b:02x}\x1b\\");
+    let _ = out.flush();
+}
+
+/// Hand the terminal's default background back (OSC 111).
+fn reset_window_background(out: &mut impl Write) {
+    let _ = write!(out, "\x1b]111\x1b\\");
+}
+
 /// Owns the terminal mode until dropped.
 pub struct TermGuard {
     active: bool,
@@ -65,6 +97,10 @@ impl TermGuard {
         // before leaving the alternate screen, so the user's shell gets its
         // own configured cursor back rather than the last pane's.
         let _ = out.execute(SetCursorStyle::DefaultUserShape);
+        // Before leaving the alternate screen, so the shell underneath is
+        // revealed already wearing its own background rather than flashing
+        // the workspace's for a frame.
+        reset_window_background(&mut out);
         let _ = out.execute(LeaveAlternateScreen);
         let _ = disable_raw_mode();
         let _ = out.flush();
@@ -94,6 +130,35 @@ fn install_panic_hook() {
 mod tests {
     use super::*;
     use std::io::IsTerminal;
+
+    /// The two escapes are the exact pair a terminal needs to change its
+    /// default background and hand it back.
+    ///
+    /// Pinned as bytes because this is the one thing the workspace writes
+    /// that outlives the process. A malformed set is a cosmetic bug; a
+    /// malformed or missing reset leaves the operator's shell wearing the
+    /// workspace's background after cyclops exits, which is the failure
+    /// that matters. ST terminates rather than BEL so a terminal that does
+    /// not understand the sequence stays silent instead of ringing.
+    #[test]
+    fn the_background_escapes_set_and_hand_back() {
+        let mut out: Vec<u8> = Vec::new();
+        reset_window_background(&mut out);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b]111\x1b\\",
+            "OSC 111 with an ST terminator is what returns the default"
+        );
+
+        // The setter writes to stdout, so its format is checked against the
+        // same construction rather than by capturing a real terminal.
+        let (r, g, b) = (0xfa_u8, 0xf6_u8, 0xe6_u8);
+        assert_eq!(
+            format!("\x1b]11;#{r:02x}{g:02x}{b:02x}\x1b\\"),
+            "\x1b]11;#faf6e6\x1b\\",
+            "channels are two lowercase hex digits each, zero padded"
+        );
+    }
 
     #[test]
     #[should_panic(expected = "guard restore probe")]
