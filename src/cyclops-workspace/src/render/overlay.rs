@@ -489,10 +489,19 @@ fn plain_dialog_geometry(
 /// The two actions every dialog offers, in paint order. One list, so the
 /// width a dialog reserves and the row it paints cannot disagree.
 fn dialog_buttons(confirm_label: &str) -> [(String, HitTarget, bool); 2] {
+    // One space of padding inside each label, because the style fills the
+    // label's own cells: without it the filled block ends on the glyph and
+    // the button reads as highlighted text rather than as a button. A real
+    // border was the other option and costs two rows on a one-row action
+    // row, which the shortest dialogs do not have to give.
     [
-        (format!("↵ {confirm_label}"), HitTarget::DialogConfirm, true),
         (
-            format!("Esc {}", copy::BUTTON_CANCEL),
+            format!(" ↵ {confirm_label} "),
+            HitTarget::DialogConfirm,
+            true,
+        ),
+        (
+            format!(" Esc {} ", copy::BUTTON_CANCEL),
             HitTarget::DialogCancel,
             false,
         ),

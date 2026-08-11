@@ -33,11 +33,16 @@ impl Router {
         }
     }
 
-    /// Whether the prefix chord is armed for the next key. Only a test
-    /// checks this directly; product code reads the `RouterResult` `route`
-    /// returns instead.
-    #[cfg(test)]
-    fn prefix_armed(&self) -> bool {
+    /// Whether the prefix is waiting for its second key.
+    ///
+    /// Read by the file panel's key gate, so a half-typed chord finishes at
+    /// the router instead of being taken as a navigation key. It used to be
+    /// test-only, on the reasoning that product code should read the
+    /// `RouterResult` from `route` instead. That still holds for anything
+    /// deciding what a key MEANS; this asks only whether the router is
+    /// mid-chord, which is a question `route` cannot answer without first
+    /// consuming the key.
+    pub fn prefix_armed(&self) -> bool {
         self.prefix_armed
     }
 

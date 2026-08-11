@@ -27,6 +27,10 @@ use crate::theme::{self, Paint};
 pub struct WindowPaintCtx<'a> {
     pub link: LinkState,
     pub paused: &'a std::collections::HashSet<String>,
+    /// Panes collapsed to their title bar, mapped to the height each had
+    /// before. Read here only to pick which chevron a pane's minimize
+    /// control shows.
+    pub minimized: &'a std::collections::HashMap<String, u16>,
     pub hits: &'a mut HitMap,
     pub decoration: &'a DecorationSnapshot,
     pub selection: Option<&'a Selection>,
@@ -36,6 +40,10 @@ pub struct WindowPaintCtx<'a> {
     pub notice: Option<&'a str>,
     /// The hardware cursor when the focused pane shows one.
     pub cursor: Option<HostCursor>,
+    /// This frame's position in any fade the motion clock is running.
+    /// [`crate::animate::MotionFrame::none`] when motion is off, which
+    /// makes every read below snap straight to the destination style.
+    pub motion: crate::animate::MotionFrame<'a>,
 }
 
 /// What the focused pane asks the host terminal's real cursor to do this
@@ -70,7 +78,25 @@ pub const PANE_GAPS: PaneGaps = PaneGaps {
 /// the calm border language survives with exactly one cell of handle
 /// chrome. Painted with the same border tokens as the frame, focused and
 /// unfocused alike.
-pub const PANE_GRIP: &str = "⠿";
+pub const PANE_GRIP: &str = "[⠿]";
+
+/// The minimize control, at the LEFT end of a pane's top border.
+///
+/// Chevrons rather than a `_`/`□` pair, because the rest of the chrome
+/// already says "this opens" with `▾` and "this is shut" with `▸`. These
+/// point the way the click moves the pane: `▴` collapses it up into its own
+/// title bar, `▾` brings it back down.
+///
+/// Left, opposite the split and swap controls, because it acts on the whole
+/// pane rather than on its edges, and because the right end is already
+/// three controls deep.
+pub const PANE_MINIMIZE: &str = "[▴]";
+pub const PANE_RESTORE: &str = "[▾]";
+
+/// Rows a minimized pane keeps. tmux clamps to its own floor, so asking for
+/// one row gets whatever the smallest real pane is; the identity an
+/// operator is looking for is painted on the border above it either way.
+pub const MINIMIZED_ROWS: u16 = 1;
 
 /// The six symbols one frame draws its border with.
 ///
@@ -107,7 +133,8 @@ const BORDER_REST: BorderGlyphs = BorderGlyphs {
 /// in exactly the plain terminals it exists for. Both sets sit in the Box
 /// Drawing block, so neither is wide and neither needs a spacer cell.
 ///
-/// The bottom-right corner is painted and then replaced by [`PANE_GRIP`],
+/// The bottom-right corner is a plain corner: the grip moved to the top
+/// border beside the split controls. Kept in the set because
 /// same as the set at rest.
 const BORDER_FOCUSED: BorderGlyphs = BorderGlyphs {
     horizontal: "═",
@@ -118,16 +145,36 @@ const BORDER_FOCUSED: BorderGlyphs = BorderGlyphs {
     bottom_right: "╝",
 };
 
-/// The frame's bottom-right corner cell: where [`PANE_GRIP`] paints and
-/// the [`HitTarget::PaneGrip`] region sits. `None` when bounds clip the
-/// corner away; a grip must never land on a cell that is not the painted
-/// corner. The cell sits outside every divider band (bands span pane
-/// columns and rows only), so the grip cannot steal a resize cell.
-fn grip_cell(frame: Rect, bounds: Rect) -> Option<(u16, u16)> {
-    let x = frame.x.saturating_add(frame.width);
-    let y = frame.y.saturating_add(frame.height);
-    (x < bounds.x.saturating_add(bounds.width) && y < bounds.y.saturating_add(bounds.height))
-        .then_some((x, y))
+/// The Cyclops mark, low and dim in the canvas's bottom margin.
+///
+/// It costs no cells. `pane_canvas` already insets by [`PANE_MARGIN`] all
+/// round, so this row exists whether or not anything is written in it, and
+/// until now nothing was. That margin is the "dead space" complaint from
+/// the inside: the operator reads the whole outer band as wasted, and the
+/// part of it we actually own is this.
+///
+/// The part we do not own is the terminal emulator's own window padding,
+/// outside the character grid entirely. Nothing here can reach it; that is
+/// a setting in their terminal.
+///
+/// Right-aligned, one column in from the edge so it sits under the pane
+/// frames rather than flush against nothing. Dropped whole when the canvas
+/// is too small to have a margin at all, because at that size every row is
+/// content.
+fn paint_wordmark(canvas: Rect, buf: &mut Buffer, paint: &Paint) {
+    let inner = pane_canvas(canvas);
+    // No inset means no margin row to write in.
+    if inner == canvas || canvas.height == 0 {
+        return;
+    }
+    let text = concat!("[> -] ", "cyclops");
+    let width = u16::try_from(Span::raw(text).width()).unwrap_or(u16::MAX);
+    let row = canvas.y + canvas.height - 1;
+    if canvas.width < width + 2 * PANE_MARGIN {
+        return;
+    }
+    let x = canvas.x + canvas.width - PANE_MARGIN - width;
+    super::overlay_text(buf, canvas, x, row, text, theme::wordmark(paint));
 }
 
 /// The rectangle occupied by pane content plus internal separators: the
@@ -201,6 +248,7 @@ pub fn paint_window(
     for (slot, frame) in slots.iter().zip(&frames).filter(|(slot, _)| !slot.focused) {
         paint_pane_frame(
             slot,
+            has_vertical_neighbour(slot, &slots),
             *frame,
             canvas,
             buf,
@@ -212,6 +260,7 @@ pub fn paint_window(
     for (slot, frame) in slots.iter().zip(&frames).filter(|(slot, _)| slot.focused) {
         paint_pane_frame(
             slot,
+            has_vertical_neighbour(slot, &slots),
             *frame,
             canvas,
             buf,
@@ -221,12 +270,21 @@ pub fn paint_window(
         );
     }
     // Shared pane borders are resize handles. Put divider regions above the
-    // generic frame regions, then restore the visibly overlaid controls and
-    // the corner grip as the most specific hit targets.
+    // generic frame regions, then restore the visibly overlaid controls as
+    // the most specific hit targets. The frame rects are not needed here
+    // any more: all three controls, the grip included, are placed from the
+    // slot's own rect by `pane_controls`.
     push_divider_hits(&dividers, ctx.hits);
-    for (slot, frame) in slots.iter().zip(&frames) {
-        push_pane_overlay_hits(slot, *frame, canvas, ctx.decoration, ctx.hits);
+    for slot in slots.iter() {
+        push_pane_overlay_hits(
+            slot,
+            has_vertical_neighbour(slot, &slots),
+            canvas,
+            ctx.decoration,
+            ctx.hits,
+        );
     }
+    paint_wordmark(canvas, buf, paint);
     if let Some(drag) = ctx.drag.filter(|d| d.is_active()) {
         paint_drag_preview(drag, buf, paint);
     }
@@ -436,6 +494,7 @@ fn scroll_depth(runtimes: &RuntimeRegistry, slot: &PaneSlot) -> usize {
 /// scrollback depth; nonzero paints a dim hint on the top border.
 fn paint_pane_frame(
     slot: &PaneSlot,
+    can_shrink: bool,
     frame: Rect,
     bounds: Rect,
     buf: &mut Buffer,
@@ -449,22 +508,33 @@ fn paint_pane_frame(
     // Focus moves both encodings at once, and this is the only place that
     // decides either: the accent color, and the heavier glyph set that
     // keeps focus readable when the color is gone.
-    let (border_style, border_glyphs) = if slot.focused {
-        (theme::pane_border_focused(paint), &BORDER_FOCUSED)
+    //
+    // The glyph set flips at once and the color crosses over time. That
+    // split is deliberate: the heavier glyphs are the encoding that has to
+    // survive NO_COLOR and a screenshot, so they must never be caught
+    // mid-way, while the accent is the part an eye can follow moving. With
+    // motion off `focus` returns the endpoint and the blend is a snap.
+    let border_glyphs = if slot.focused {
+        &BORDER_FOCUSED
     } else {
-        (theme::pane_border(paint), &BORDER_REST)
+        &BORDER_REST
     };
+    // The endpoints never swap. `focus` answers how much accent this border
+    // carries right now, 0.0 at rest and 1.0 focused, so the blend always
+    // runs rest to focused and only `t` moves. Flipping the ends by focus
+    // state applies the fade twice and lands a resting pane on the wrong
+    // one.
+    let border_style = super::blend(
+        paint,
+        theme::pane_border(paint),
+        theme::pane_border_focused(paint),
+        ctx.motion.focus(&slot.pane_id, slot.focused),
+    );
     paint_pane_border(vis, bounds, buf, border_style, border_glyphs);
     // The bottom-right corner becomes the grip. Painted here, per frame,
     // right after this frame's own border: the focused frame repaints last, so
     // a shared pass would let its accent ring overwrite another pane's
     // grip where borders intersect.
-    if let Some((x, y)) = grip_cell(vis, bounds) {
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_symbol(PANE_GRIP);
-            cell.set_style(border_style);
-        }
-    }
     if slot.focused {
         if let Some(notice) = ctx.notice {
             paint_notice(vis, bounds, notice, buf, paint);
@@ -505,11 +575,36 @@ fn paint_pane_frame(
         },
     );
 
+    // The minimize control, at the left end of the top border.
+    //
+    // Only when the pane can actually shrink. A pane spanning the full
+    // canvas height is the only pane in its column, and `resize-pane -y`
+    // has nothing to take from it, so the control would sit there taking
+    // clicks and doing nothing. That is the failure mode this chrome
+    // language exists to avoid.
+    let minimized = ctx.minimized.contains_key(&slot.pane_id);
+    if let Some(cell) = minimize_cell(slot, bounds, can_shrink) {
+        let glyph = if minimized {
+            PANE_RESTORE
+        } else {
+            PANE_MINIMIZE
+        };
+        super::overlay_text(buf, bounds, cell.x, cell.y, glyph, border_style);
+    }
+
     // Controls live in the border instead of overwriting the first row of
     // the child TUI. They remain available on unfocused panes.
     let controls = pane_controls(slot, bounds);
-    let control_left = controls.map_or(right, |controls| controls.split_right.x);
+    let control_left = controls.map_or(right, |controls| controls.grip.x);
     if let Some(controls) = controls {
+        super::overlay_text(
+            buf,
+            bounds,
+            controls.grip.x,
+            controls.grip.y,
+            PANE_GRIP,
+            border_style,
+        );
         super::overlay_text(
             buf,
             bounds,
@@ -685,8 +780,48 @@ fn paint_scroll_hint(
 
 #[derive(Debug, Clone, Copy)]
 struct PaneControls {
+    grip: Rect,
     split_right: Rect,
     split_down: Rect,
+}
+
+/// Whether `slot` has a pane stacked above or below it.
+///
+/// Sharing columns is what makes two panes vertical neighbours, and a
+/// vertical neighbour is the only thing that can absorb the rows a
+/// minimize gives up. Two panes side by side both span the window's full
+/// height, so neither can shrink for the other.
+fn has_vertical_neighbour(slot: &PaneSlot, slots: &[PaneSlot]) -> bool {
+    slots.iter().any(|other| {
+        other.pane_id != slot.pane_id
+            && other.rect.x < slot.rect.x + slot.rect.width
+            && slot.rect.x < other.rect.x + other.rect.width
+    })
+}
+
+/// Where a pane's minimize control paints, or `None` when the pane cannot
+/// be minimized.
+///
+/// Two reasons it can be `None`. A pane with nothing stacked above or below
+/// it has nowhere to put the rows it would give up, and `resize-pane -y`
+/// simply will not move it; offering the control there is offering a click
+/// that does nothing. And a pane too narrow to hold both this and the
+/// right-hand trio without them touching keeps the trio, which is the older
+/// and more used set.
+fn minimize_cell(slot: &PaneSlot, bounds: Rect, can_shrink: bool) -> Option<Rect> {
+    if !can_shrink {
+        return None;
+    }
+    let vis = slot.rect;
+    let left = vis.x.saturating_sub(1).max(bounds.x);
+    let top = vis.y.saturating_sub(1).max(bounds.y);
+    let right = (vis.x + vis.width).min(bounds.x + bounds.width - 1);
+    // Three cells for this, three each for the trio, and two of border to
+    // keep the two groups from meeting in the middle.
+    if right.saturating_sub(left) < 14 {
+        return None;
+    }
+    Some(Rect::new(left + 1, top, 3, 1))
 }
 
 fn pane_controls(slot: &PaneSlot, bounds: Rect) -> Option<PaneControls> {
@@ -694,13 +829,18 @@ fn pane_controls(slot: &PaneSlot, bounds: Rect) -> Option<PaneControls> {
     let left = vis.x.saturating_sub(1).max(bounds.x);
     let top = vis.y.saturating_sub(1).max(bounds.y);
     let right = (vis.x + vis.width).min(bounds.x + bounds.width - 1);
-    if right.saturating_sub(left) < 8 {
+    // Three controls of three cells, plus two of border either side of
+    // them. Under this a pane paints no controls at all rather than a
+    // partial set, which is the rule the two-control version already had.
+    if right.saturating_sub(left) < 11 {
         return None;
     }
 
     let split_down = Rect::new(right.saturating_sub(3), top, 3, 1);
     let split_right = Rect::new(split_down.x.saturating_sub(3), top, 3, 1);
+    let grip = Rect::new(split_right.x.saturating_sub(3), top, 3, 1);
     Some(PaneControls {
+        grip,
         split_right,
         split_down,
     })
@@ -713,14 +853,14 @@ fn pane_controls(slot: &PaneSlot, bounds: Rect) -> Option<PaneControls> {
 /// them that starts a drag.
 fn push_pane_overlay_hits(
     slot: &PaneSlot,
-    frame: Rect,
+    can_shrink: bool,
     bounds: Rect,
     decoration: &DecorationSnapshot,
     hits: &mut HitMap,
 ) {
     let right = (slot.rect.x + slot.rect.width).min(bounds.x + bounds.width - 1);
     let controls = pane_controls(slot, bounds);
-    let control_left = controls.map_or(right, |controls| controls.split_right.x);
+    let control_left = controls.map_or(right, |controls| controls.grip.x);
     if let Some((pane, rect)) = decoration
         .pane(&slot.pane_id)
         .filter(|pane| pane.label.is_some())
@@ -750,11 +890,19 @@ fn push_pane_overlay_hits(
                 pane_id: slot.pane_id.clone(),
             },
         );
-    }
-    if let Some((x, y)) = grip_cell(frame, bounds) {
+        // The grip's hit rides with the other two now. It used to sit on
+        // the opposite corner of the frame, one cell wide.
         hits.push(
-            Rect::new(x, y, 1, 1),
+            controls.grip,
             HitTarget::PaneGrip {
+                pane_id: slot.pane_id.clone(),
+            },
+        );
+    }
+    if let Some(cell) = minimize_cell(slot, bounds, can_shrink) {
+        hits.push(
+            cell,
+            HitTarget::PaneMinimize {
                 pane_id: slot.pane_id.clone(),
             },
         );
@@ -867,7 +1015,12 @@ mod tests {
     use crate::decoration::DecorationSnapshot;
     use crate::layout::{parse_layout, resolve_layout};
     use crate::render::paint_tab_bar;
-    use crate::render::test_support::{alt_test_theme_paint, flatten, two_pane_tab};
+    use crate::render::test_support::{
+        alt_test_theme_paint, flatten, single_pane_tab, two_pane_tab,
+    };
+
+    static EMPTY_MINIMIZED: std::sync::LazyLock<std::collections::HashMap<String, u16>> =
+        std::sync::LazyLock::new(std::collections::HashMap::new);
 
     fn ctx_defaults<'a>(
         hits: &'a mut HitMap,
@@ -882,7 +1035,12 @@ mod tests {
             selection: None,
             drag: None,
             notice: None,
+            minimized: &EMPTY_MINIMIZED,
             cursor: None,
+            // No clock: every fade reads as its endpoint, which is what
+            // these tests assert about. The fade itself is covered by
+            // `animate`'s own tests and by the focus-fade test below.
+            motion: crate::animate::MotionFrame::none(),
         }
     }
 
@@ -1309,9 +1467,17 @@ mod tests {
             matches!(hits.hit(20, 5), Some(HitTarget::Divider { .. })),
             "row A must stay a resize handle under a labeled pane"
         );
+        // The minimize control owns the left end of this border now, and
+        // the title strip follows it, so no single column here is reliably
+        // the seam. What must hold is that the control took its own cells
+        // and the seam kept enough of the rest to grab, which the count
+        // assertion below measures directly.
         assert!(
-            matches!(hits.hit(1, 6), Some(HitTarget::Divider { .. })),
-            "row B outside the title strip must stay a resize handle"
+            matches!(
+                hits.hit(1, 6),
+                Some(HitTarget::PaneMinimize { pane_id }) if pane_id == "%1"
+            ),
+            "the left end of the border is the minimize control"
         );
         // The title strip keeps its click target (focus, or the eye when
         // it is on); `app` never picks a `PaneFrame` up, so this cell can
@@ -1345,18 +1511,178 @@ mod tests {
         );
         assert!(grabbable(5) > 30, "the upper pane's bottom border too");
 
-        // The swap handle: one painted cell on each frame's bottom-right
-        // corner, outside every divider band.
-        assert!(matches!(
-            hits.hit(39, 5),
-            Some(HitTarget::PaneGrip { pane_id }) if pane_id == "%0"
-        ));
-        assert!(matches!(
-            hits.hit(39, 10),
-            Some(HitTarget::PaneGrip { pane_id }) if pane_id == "%1"
-        ));
-        assert_eq!(buf[(39, 5)].symbol(), PANE_GRIP, "focused pane's grip");
-        assert_eq!(buf[(39, 10)].symbol(), PANE_GRIP, "unfocused pane's grip");
+        // The swap handle: three cells on each frame's TOP border, beside
+        // the split controls. Found through the hit map rather than at a
+        // column written here, so moving the control row again does not
+        // silently pass this.
+        let grip_of = |want: &str| {
+            (0..40u16)
+                .flat_map(|x| (0..12u16).map(move |y| (x, y)))
+                .find(|&(x, y)| {
+                    matches!(hits.hit(x, y), Some(HitTarget::PaneGrip { pane_id }) if pane_id == want)
+                })
+                .unwrap_or_else(|| panic!("{want} has a grip"))
+        };
+        let (gx, gy) = grip_of("%0");
+        assert_eq!(gy, 0, "the focused pane's grip is on its top border");
+        let painted: String = (gx..gx + 3).map(|x| buf[(x, gy)].symbol()).collect();
+        assert_eq!(painted, PANE_GRIP, "and it paints where it answers");
+        let (_, gy1) = grip_of("%1");
+        assert!(gy1 > gy, "the lower pane's grip is on its own top border");
+    }
+
+    /// The minimize control appears only on a pane that can actually
+    /// shrink, and says which way the click will move it.
+    ///
+    /// A pane spanning the whole canvas height is the only pane in its
+    /// column. `resize-pane -y` has nothing to take from it, so a control
+    /// there would sit in the border collecting clicks and doing nothing,
+    /// which is the exact failure this chrome language exists to avoid and
+    /// the one the swap grip was already moved for.
+    #[test]
+    fn only_a_pane_with_room_to_give_offers_to_minimize() {
+        let paint = Paint::for_test();
+        let runtimes = RuntimeRegistry::default();
+
+        let render = |tab: &crate::model::TabModel,
+                      minimized: &std::collections::HashMap<String, u16>| {
+            let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
+            let mut hits = HitMap::default();
+            term.draw(|f| {
+                let paused = std::collections::HashSet::new();
+                let dec = DecorationSnapshot::default();
+                let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
+                ctx.minimized = minimized;
+                paint_window(tab, &runtimes, f.area(), f.buffer_mut(), &paint, &mut ctx);
+            })
+            .unwrap();
+            (term.backend().buffer().clone(), hits)
+        };
+
+        let none = std::collections::HashMap::new();
+        let stacked = two_pane_tab();
+        let (buf, hits) = render(&stacked, &none);
+
+        // Stacked panes can each give rows to the other, so both offer it.
+        let offered: Vec<&str> = (0..40u16)
+            .flat_map(|x| (0..12u16).map(move |y| (x, y)))
+            .filter_map(|(x, y)| match hits.hit(x, y) {
+                Some(HitTarget::PaneMinimize { pane_id }) => Some(pane_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            offered.contains(&"%0") && offered.contains(&"%1"),
+            "both stacked panes can shrink: {offered:?}"
+        );
+        let flat = flatten(&buf);
+        assert!(flat.contains(PANE_MINIMIZE), "and say so: {flat}");
+        assert!(
+            !flat.contains(PANE_RESTORE),
+            "neither is collapsed, so neither offers to expand"
+        );
+
+        // Already collapsed: the chevron turns around.
+        let mut down = std::collections::HashMap::new();
+        down.insert("%1".to_string(), 9u16);
+        let (buf, _) = render(&stacked, &down);
+        assert!(
+            flatten(&buf).contains(PANE_RESTORE),
+            "a collapsed pane offers to come back: {}",
+            flatten(&buf)
+        );
+
+        // A single full-height pane has nowhere to put the rows.
+        let solo = single_pane_tab();
+        let (buf, hits) = render(&solo, &none);
+        assert!(
+            (0..40u16)
+                .flat_map(|x| (0..12u16).map(move |y| (x, y)))
+                .all(|(x, y)| !matches!(hits.hit(x, y), Some(HitTarget::PaneMinimize { .. }))),
+            "a pane with no sibling to give rows to offers nothing"
+        );
+        assert!(
+            !flatten(&buf).contains(PANE_MINIMIZE),
+            "and paints nothing either: {}",
+            flatten(&buf)
+        );
+    }
+
+    /// Motion actually moves something now.
+    ///
+    /// The clock, the easing and the color interpolator all shipped built
+    /// and wired to the event loop, and no painter read any of it: turning
+    /// motion on scheduled 16ms wakes that composed frames identical to the
+    /// ones before them. This is the first painter to read the clock, so it
+    /// is also the first test that could have caught that.
+    ///
+    /// Mid-fade the border must be neither endpoint. The glyph set is
+    /// checked to be already at its destination in the same frame, because
+    /// weight is the encoding that has to survive NO_COLOR and must never
+    /// be caught half way.
+    #[test]
+    fn a_focus_change_fades_the_border_rather_than_snapping_it() {
+        use crate::animate::{Motion, MotionFrame, Seen};
+        use std::time::Duration;
+        // The clock runs on tokio's Instant, the same one the event loop
+        // arms its deadlines with.
+        use tokio::time::Instant;
+
+        let mut paint = Paint::for_test();
+        paint.truecolor = true;
+        let tab = two_pane_tab();
+        // `two_pane_tab` focuses %0; the grip tests above rely on the same.
+        let focused = "%0".to_string();
+
+        let mut motion = Motion::new(true);
+        let start = Instant::now();
+        // First frame establishes what was on screen; the second moves
+        // focus, which is what arms the fade.
+        motion.observe(Seen::new(None, Vec::new(), None), start);
+        motion.observe(Seen::new(Some(focused.clone()), Vec::new(), None), start);
+
+        let border_at = |motion: &Motion, at: Instant| {
+            let runtimes = RuntimeRegistry::default();
+            let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
+            term.draw(|f| {
+                let mut hits = HitMap::default();
+                let paused = std::collections::HashSet::new();
+                let dec = DecorationSnapshot::default();
+                let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
+                ctx.motion = MotionFrame::new(motion, at);
+                paint_window(&tab, &runtimes, f.area(), f.buffer_mut(), &paint, &mut ctx);
+            })
+            .unwrap();
+            term.backend().buffer().clone()
+        };
+
+        // A cell on the focused pane's own top border, left of its controls.
+        let probe = (2u16, 0u16);
+        let mid = border_at(&motion, start + Duration::from_millis(60));
+        let done = border_at(
+            &motion,
+            start + crate::animate::FOCUS + Duration::from_millis(1),
+        );
+
+        let rest = theme::pane_border(&paint).fg;
+        let lit = theme::pane_border_focused(&paint).fg;
+        assert_ne!(rest, lit, "the two ends must differ or this proves nothing");
+
+        assert_eq!(
+            done[probe].style().fg,
+            lit,
+            "the fade has to arrive at the focused color"
+        );
+        let half = mid[probe].style().fg;
+        assert_ne!(half, rest, "and leave the resting color behind");
+        assert_ne!(half, lit, "without jumping straight to the end");
+
+        // Weight is not interpolated: it is already heavy mid-fade.
+        assert_eq!(
+            mid[probe].symbol(),
+            done[probe].symbol(),
+            "the glyph set flips at once, only the color crosses over"
+        );
     }
 
     /// The grip must read as a handle in every shipped theme and under
@@ -1380,14 +1706,20 @@ mod tests {
             term.backend().buffer().clone()
         };
 
+        // Read off the frame: the grip is a run of cells on a top border
+        // now, so the assertion looks for the glyph rather than probing a
+        // corner that no longer holds it.
         for paint in [
             Paint::for_test(),
             alt_test_theme_paint(),
             Paint::without_color_for_test(),
         ] {
             let buf = render_with(&paint);
-            assert_eq!(buf[(39, 5)].symbol(), PANE_GRIP);
-            assert_eq!(buf[(39, 10)].symbol(), PANE_GRIP);
+            let rows: Vec<String> = (0..12u16)
+                .map(|y| (0..40u16).map(|x| buf[(x, y)].symbol()).collect())
+                .collect();
+            let found = rows.iter().filter(|r| r.contains(PANE_GRIP)).count();
+            assert_eq!(found, 2, "one grip per pane, whatever the theme");
         }
     }
 
@@ -1514,10 +1846,13 @@ mod tests {
             !row(&quiet, 5).contains("copied"),
             "and nowhere at all when there is nothing to say"
         );
+        // The grip moved to the top border, so the bottom-right cell is a
+        // plain corner again. What still matters here is that the notice
+        // stops before it rather than overwriting the frame.
         assert_eq!(
             noticed[(39, 5)].symbol(),
-            PANE_GRIP,
-            "the text must stop short of the corner grip"
+            quiet[(39, 5)].symbol(),
+            "the notice must stop short of the frame's corner"
         );
 
         // Every other cell is untouched, and the pane rectangles are
@@ -1946,8 +2281,10 @@ mod tests {
         .unwrap();
         let flat = flatten(term.backend().buffer());
         assert!(flat.contains("working"), "badge word should render: {flat}");
+        // Past the minimize control, which owns columns 1 to 3 of every
+        // top border that can be collapsed.
         assert!(matches!(
-            hits.hit(3, 0),
+            hits.hit(6, 0),
             Some(HitTarget::PaneFrame { pane_id }) if pane_id == "%0"
         ));
     }

@@ -292,7 +292,17 @@ pub enum Action {
     /// fresh install; the choice persists like the sidebar's.
     ToggleTabBar,
     /// Open or close the sidebar's file panel.
+    /// Collapse a pane to its own title bar, or put it back to the height
+    /// it had. Session state: a minimized pane is not a preference, it is
+    /// where you left the furniture this afternoon.
+    ToggleMinimizePane {
+        pane_id: String,
+    },
     ToggleFiles,
+    /// Put the keyboard in the file panel, opening the sidebar and the
+    /// panel first if either is away. A chord that focused a panel the
+    /// operator cannot see would look like it did nothing.
+    FocusFiles,
     ToggleMotion,
     /// Show the event stream: open the sidebar on its Stream tab. When
     /// the stream is already what's showing, hide the sidebar instead —
@@ -392,6 +402,7 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
         // not taken from whatever pane happens to be focused.
         BindingAction::Compose => Some(Action::RequestCompose),
         BindingAction::ToggleFiles => Some(Action::ToggleFiles),
+        BindingAction::FocusFiles => Some(Action::FocusFiles),
         BindingAction::SwapPaneLeft => Some(Action::SwapPaneDirection(PaneDirection::Left)),
         BindingAction::SwapPaneRight => Some(Action::SwapPaneDirection(PaneDirection::Right)),
         BindingAction::SwapPaneUp => Some(Action::SwapPaneDirection(PaneDirection::Up)),

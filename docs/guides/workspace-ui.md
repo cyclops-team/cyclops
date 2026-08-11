@@ -47,10 +47,11 @@ Default bindings are prefix-first (`Ctrl+B`, same shape as tmux):
 | `Ctrl+B` `z` | Zoom pane |
 | `Ctrl+B` `m` | Name the focused pane / agent |
 | `Ctrl+B` `,` / `&` | Rename / close tab |
-| `Ctrl+B` `w` | Create a workspace from the focused pane's folder |
-| `Ctrl+B` `[` / `]` | Previous / next workspace |
-| `Ctrl+B` `W` / `K` | Rename / close workspace |
+| `Ctrl+B` `w` | Create a session from the focused pane's folder |
+| `Ctrl+B` `[` / `]` | Previous / next session |
+| `Ctrl+B` `W` / `K` | Rename / close session |
 | `Ctrl+B` `b` | Collapse or reopen the sidebar |
+| `Ctrl+B` `g` | Put the keyboard in the file panel; Esc gives it back |
 | `Ctrl+B` `s` | Send a message to an agent |
 | `Ctrl+B` `?` | Open the scrollable keybinding reference |
 
@@ -59,8 +60,22 @@ the way, so a hidden strip is always something you chose. Bind
 `toggle_tab_bar` in `config.toml` if you want a key for it.
 
 Unbound keys, including modified terminal keys such as Claude Code's
-`Shift+Tab`, pass through to the focused pane. Terminal paste is forwarded as
-one bracketed paste rather than one tmux command per character.
+`Shift+Tab`, pass through to the focused pane. Bare arrow keys are part of
+that promise: every shell and agent in a pane uses them for history and
+menus, so cyclops never takes them globally.
+
+`Ctrl+B` `g` is the one exception, and it is opt-in. It puts the keyboard
+in the file panel and opens the panel if it is away. While the cursor is
+there, `↑`/`↓` (or `k`/`j`) move it, `→` (or `l`, or Enter) walks into a
+folder or sends the file under the cursor, `←` (or `h`) climbs out, and Esc
+hands the keyboard back to the pane. The prefix keeps working throughout,
+so `Ctrl+B` `d` still detaches and `Ctrl+B` `b` still collapses the panel
+the cursor is sitting in. Nothing else reaches the pane until you press
+Esc, and the panel highlights the row that has the keyboard so it is
+never a mystery where your typing is going.
+
+Terminal paste is forwarded as one bracketed paste rather than one tmux
+command per character.
 
 Creating a workspace is immediate. Cyclops uses the focused pane's current
 folder as both the new session's directory and its name, makes the name safe
@@ -132,8 +147,17 @@ pane grid. See [themes.md](themes.md) for the `chrome.text`,
 
 Click a pane, its border, a tab, a workspace row, or a nested agent row to
 focus or switch to it. Click a workspace disclosure arrow to expand or
-collapse its agent children without switching workspaces. The upper-right of
-every pane's top border carries
+collapse its agent children without switching workspaces.
+
+The left end of a pane's top border carries `[▴]`, which collapses that
+pane to its own title bar so only its identity shows, and `[▾]`, which puts
+it back to the height it had. It appears only on a pane with another pane
+stacked above or below it: two panes side by side both span the window's
+full height, so neither has anywhere to put the rows it would give up, and
+a control that cannot work is one this UI does not paint. A collapsed pane
+is session state and is not restored on the next launch.
+
+The upper-right of every pane's top border carries
 `[|][-]` controls for split right and split down; the focused pane's controls
 use the accent, while the others stay dim. They are clickable without
 focusing the pane first and do not cover the child terminal's first row.

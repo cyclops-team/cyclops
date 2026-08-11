@@ -170,6 +170,11 @@ struct App {
     theme_restore: Option<cyclops_theme::Theme>,
     link_state: LinkState,
     paused_panes: HashSet<String>,
+    /// Panes collapsed to their title bar, mapped to the height each had
+    /// before. Not persisted: a minimized pane is where you left the
+    /// furniture this afternoon, not a preference, and restoring one on
+    /// launch would hide a pane an operator has no memory of collapsing.
+    minimized: std::collections::HashMap<String, u16>,
     reconnect_attempt: usize,
     hit_map: HitMap,
     menu: MenuState,
@@ -512,6 +517,7 @@ pub async fn run_async() -> i32 {
         theme_restore: None,
         link_state: LinkState::Live,
         paused_panes: HashSet::new(),
+        minimized: std::collections::HashMap::new(),
         reconnect_attempt: 0,
         hit_map: HitMap::default(),
         menu: MenuState::None,
@@ -1991,6 +1997,19 @@ async fn handle_mouse(
                         return Ok(());
                     }
                 }
+                HitTarget::PaneMinimize { pane_id } => {
+                    app.close_menu();
+                    let outcome = exec::execute(
+                        app,
+                        client,
+                        action::Action::ToggleMinimizePane {
+                            pane_id: pane_id.clone(),
+                        },
+                    )
+                    .await?;
+                    apply_outcome(app, outcome);
+                    return Ok(());
+                }
                 HitTarget::PaneGrip { pane_id } => {
                     app.close_menu();
                     app.selection.clear();
@@ -2301,6 +2320,83 @@ fn files_rows_for_row(app: &App, row: u16) -> u16 {
     // because the paint had given a row to the footer rule and this had not.
     let bottom = crate::render::sidebar_body_bottom(sidebar);
     bottom.saturating_sub(row).saturating_sub(1)
+}
+
+/// Whether this key is the prefix itself (`Ctrl+B`).
+///
+/// The file panel's key gate lets it through untouched so every chord keeps
+/// working while the cursor is in the panel.
+fn is_prefix_key(key: &KeyEvent) -> bool {
+    key.code == crossterm::event::KeyCode::Char('b')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// Keys the file panel takes while it holds the cursor.
+///
+/// `None` means "not mine": the key falls through to the router, which is
+/// how the prefix chords keep working from inside the panel. Everything
+/// else is swallowed rather than forwarded to the pane. A half-mode where
+/// arrows move a highlighted row but letters land in an agent's prompt is
+/// worse than losing the keystrokes.
+async fn handle_files_key(
+    app: &mut App,
+    client: &ControlClient,
+    key: KeyEvent,
+) -> Result<Option<InputOutcome>, cyclops_tmux::TmuxError> {
+    use crossterm::event::KeyCode;
+
+    match key.code {
+        // Esc hands the keyboard back. It is the same key that cancels a
+        // selection or a chrome drag, so those are cleared on the way in
+        // (see `Action::FocusFiles`) and Esc has one owner at a time.
+        KeyCode::Esc => {
+            app.files.release_cursor();
+            Ok(Some(InputOutcome::Redraw))
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.files.move_cursor(-1);
+            Ok(Some(InputOutcome::Redraw))
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.files.move_cursor(1);
+            Ok(Some(InputOutcome::Redraw))
+        }
+        // Left climbs out, right walks in: the two directions the panel
+        // already navigates by mouse, on the keys that mean them.
+        KeyCode::Left | KeyCode::Char('h') => {
+            if let Some(parent) = app.files.parent() {
+                app.files.reroot(parent);
+            }
+            Ok(Some(InputOutcome::Redraw))
+        }
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
+            let Some(row) = app.files.cursor_row() else {
+                return Ok(Some(InputOutcome::Redraw));
+            };
+            match row.kind {
+                crate::files::RowKind::Dir { .. } => {
+                    let path = row.path.clone();
+                    app.files.reroot(path);
+                    Ok(Some(InputOutcome::Redraw))
+                }
+                crate::files::RowKind::File => {
+                    // Same act the mouse performs, through the same
+                    // action, so the two devices cannot drift apart.
+                    let reference = app.files.reference(&row.path.clone());
+                    let outcome =
+                        exec::execute(app, client, action::Action::InsertFileRef { reference })
+                            .await?;
+                    apply_outcome(app, outcome);
+                    // The cursor stays: inserting several files in a row is
+                    // the normal case, unlike walking into a folder.
+                    Ok(Some(InputOutcome::Redraw))
+                }
+                // A truncation notice is not a row anything acts on.
+                crate::files::RowKind::Truncated { .. } => Ok(Some(InputOutcome::Redraw)),
+            }
+        }
+        _ => Ok(Some(InputOutcome::Redraw)),
+    }
 }
 
 /// One axis of pointer travel as a signed cell count.
@@ -2928,6 +3024,21 @@ async fn handle_key(
     if app.dialog.is_some() {
         return handle_dialog_key(app, client, key).await;
     }
+    // The file panel holds the keyboard only while its cursor exists, and
+    // only a chord creates that cursor. That is the whole reason bare
+    // arrows still reach the focused pane: with no cursor this branch is
+    // not taken, nothing about the router changes, and every shell and
+    // agent keeps its history recall and its menus.
+    //
+    // Ctrl+B is handed on rather than eaten. A mode that swallowed the
+    // prefix could not detach, could not switch tabs, and could not
+    // collapse the very panel the cursor sits in, which makes it a trap
+    // rather than a mode.
+    if app.files.cursor().is_some() && !is_prefix_key(&key) && !app.router.prefix_armed() {
+        if let Some(outcome) = handle_files_key(app, client, key).await? {
+            return Ok(outcome);
+        }
+    }
     match app.router.route(key) {
         RouterResult::PrefixArmed => Ok(InputOutcome::NoRedraw),
         RouterResult::Consumed => Ok(InputOutcome::NoRedraw),
@@ -3124,7 +3235,13 @@ fn draw(
                 selection: app.selection.active.as_ref(),
                 drag: app.drag.as_ref(),
                 notice: app.notice.text(),
+                minimized: &app.minimized,
                 cursor: None,
+                // Where every fade this frame stands. `none()` while motion
+                // is off, and a fade that has finished reads as its
+                // endpoint, so the painters below need no motion branch of
+                // their own.
+                motion: crate::animate::MotionFrame::new(motion, now),
             };
             paint_window(
                 tab,
@@ -3242,6 +3359,55 @@ mod tests {
     /// A minimal `App` for tests that only need model/prefs/drag state, not
     /// a live pane runtime — mirrors `exec::tests::test_app`, which is
     /// private to that module and so cannot be reused directly here.
+    /// Bare arrows keep reaching the focused pane, and only stop when the
+    /// operator has explicitly handed the keyboard to the file panel.
+    ///
+    /// This is the promise the whole design of the focus mode exists to
+    /// keep. Every shell and every agent CLI in every pane uses bare
+    /// arrows for history and menus, and `docs/guides/workspace-ui.md`
+    /// states that unbound keys pass through. Taking them globally would
+    /// break all of it, invisibly, in a way no other test here would
+    /// notice.
+    ///
+    /// Written against the router rather than through tmux, because what
+    /// is being pinned is the routing decision: with no cursor, an arrow
+    /// must come back as `PassThrough` and reach `send_keys`.
+    #[test]
+    fn bare_arrows_reach_the_pane_until_the_file_panel_is_given_the_keyboard() {
+        use crossterm::event::KeyCode;
+
+        let mut router = Router::new(crate::bindings::default_bindings());
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::empty());
+
+        assert!(
+            matches!(router.route(up), RouterResult::PassThrough(_)),
+            "a bare arrow is nobody's binding, so it belongs to the pane"
+        );
+        // And it still encodes as a real arrow for tmux to deliver.
+        assert_eq!(crate::input::encode_send_keys(&up), vec!["Up".to_string()]);
+
+        // The gate in `handle_key` is a cursor test and nothing else, so
+        // the panel can only take keys after `take_cursor`.
+        let mut tree = crate::files::FileTree::new();
+        assert_eq!(
+            tree.cursor(),
+            None,
+            "a fresh panel does not hold the keyboard"
+        );
+        tree.take_cursor();
+        assert_eq!(
+            tree.cursor(),
+            None,
+            "and an empty panel still does not: there is no row to sit on"
+        );
+
+        // The prefix itself is never swallowed by the panel, or a mode
+        // becomes a trap with no way to detach or switch tabs.
+        let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(is_prefix_key(&ctrl_b));
+        assert!(!is_prefix_key(&up));
+    }
+
     fn test_app(model: WorkspaceModel, home: std::path::PathBuf) -> App {
         App {
             model,
@@ -3253,6 +3419,7 @@ mod tests {
             theme_restore: None,
             link_state: LinkState::Live,
             paused_panes: HashSet::new(),
+            minimized: std::collections::HashMap::new(),
             reconnect_attempt: 0,
             hit_map: HitMap::default(),
             menu: MenuState::None,
@@ -4868,7 +5035,9 @@ mod tests {
                 selection: None,
                 drag: None,
                 notice: None,
+                minimized: &std::collections::HashMap::new(),
                 cursor: None,
+                motion: crate::animate::MotionFrame::none(),
             };
             paint_window(
                 &tab,
@@ -5144,11 +5313,23 @@ mod tests {
         );
         let mut detached = false;
 
-        // Down on the bottom pane's grip cell, drop on the top pane's body.
+        // Down on the bottom pane's grip, drop on the top pane's body.
+        // The grip sits in the control row on the pane's TOP border now,
+        // beside [|] and [-], so its cell is found from the hit map rather
+        // than written here.
+        let (grip_x, grip_y) = (0..40u16)
+            .flat_map(|x| (0..12u16).map(move |y| (x, y)))
+            .find(|&(x, y)| {
+                matches!(
+                    app.hit_map.hit(x, y),
+                    Some(HitTarget::PaneGrip { pane_id }) if pane_id == &bottom
+                )
+            })
+            .expect("the bottom pane has a grip");
         handle_mouse(
             &mut app,
             &client,
-            mouse_at(MouseEventKind::Down(MouseButton::Left), 39, 10),
+            mouse_at(MouseEventKind::Down(MouseButton::Left), grip_x, grip_y),
             &mut detached,
         )
         .await

@@ -161,8 +161,12 @@ pub(super) async fn execute(
         Action::InsertFileRef { reference } => insert_file_ref(app, client, reference).await,
 
         Action::RequestNewTab => {
+            // Prefilled with the name the tab would get anyway, rather than
+            // left blank for the same rule to apply invisibly downstream.
+            // Enter alone still does the common thing, and now the operator
+            // can see what that thing is and edit it instead of guessing.
             app.open_dialog(Dialog::NewTab {
-                buffer: String::new(),
+                buffer: next_numeric_tab_name(&app.model.session.tabs),
             });
             Ok(Outcome::default())
         }
@@ -264,6 +268,61 @@ pub(super) async fn execute(
             };
             // No `resize_client`: the seam is inside the sidebar, so no
             // column changed hands and no pane reflows.
+            Ok(Outcome {
+                persist: true,
+                ..Outcome::default()
+            })
+        }
+        Action::ToggleMinimizePane { pane_id } => {
+            // The height to go back to is the height it has right now, read
+            // from the frame that is on screen. tmux is the authority on
+            // pane geometry and the render follows it 1:1, so the painted
+            // height IS the tmux height.
+            match app.minimized.remove(&pane_id) {
+                Some(rows) => {
+                    client.resize_pane_height(&pane_id, rows).await?;
+                }
+                None => {
+                    let Some(geometry) = app.hit_map.pane_geometry(&pane_id) else {
+                        // Nothing painted it this frame, so there is no
+                        // height to remember and nothing to collapse.
+                        return Ok(Outcome::default());
+                    };
+                    let was = geometry.inner.height;
+                    // A pane already at the floor has nothing to give, and
+                    // recording that as its restore height would make the
+                    // restore a no-op forever after.
+                    if was <= crate::render::MINIMIZED_ROWS {
+                        return Ok(Outcome::default());
+                    }
+                    app.minimized.insert(pane_id.clone(), was);
+                    client
+                        .resize_pane_height(&pane_id, crate::render::MINIMIZED_ROWS)
+                        .await?;
+                }
+            }
+            // tmux moved the layout, so the model has to be re-read before
+            // the next frame paints panes at the old geometry.
+            Ok(Outcome {
+                reconcile: true,
+                ..Outcome::default()
+            })
+        }
+        Action::FocusFiles => {
+            // Open what the cursor is going to live in. Focusing a panel
+            // the operator cannot see reads as a chord that did nothing.
+            let was_hidden = !app.model.sidebar_visible;
+            app.model.sidebar_visible = true;
+            if app.prefs.files_rows == 0 {
+                app.prefs.files_rows = crate::persist::WorkspacePrefs::default().files_rows;
+            }
+            app.files.take_cursor();
+            if was_hidden {
+                // The panel took columns back from the canvas, so tmux has
+                // to be told before the next frame paints panes at the old
+                // width.
+                return Ok(commit_sidebar_visibility(app, client).await);
+            }
             Ok(Outcome {
                 persist: true,
                 ..Outcome::default()
@@ -1293,6 +1352,7 @@ mod tests {
             theme_restore: None,
             link_state: LinkState::Live,
             paused_panes: HashSet::new(),
+            minimized: std::collections::HashMap::new(),
             reconnect_attempt: 0,
             hit_map: HitMap::default(),
             menu: MenuState::None,

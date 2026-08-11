@@ -3,7 +3,7 @@
 /// Session bare `cyclops` creates when the server has nothing to attach to.
 pub const DEFAULT_SESSION_NAME: &str = "main";
 
-pub const DETACHED: &str = "Detached from workspace.";
+pub const DETACHED: &str = "Detached from session.";
 
 pub const HELP_HINT: &str = "Run cyclops --help for commands.";
 
@@ -30,9 +30,9 @@ pub const KEYBINDS_HINT: &str = "Scroll with ↑/↓, PgUp/PgDn, or the mouse wh
 /// the glyph half of it.
 pub const STATE_GLYPH_LEGEND: &str = "Status:  ○ idle   ● working   ⚠ needs attention   ✕ dead";
 
-pub const RENAME_WORKSPACE_PROMPT: &str = "Rename workspace";
+pub const RENAME_WORKSPACE_PROMPT: &str = "Rename session";
 
-pub const CONFIRM_CLOSE_WORKSPACE: &str = "Close this workspace?";
+pub const CONFIRM_CLOSE_WORKSPACE: &str = "Close this session?";
 
 pub const BUTTON_CREATE: &str = "Create";
 
@@ -58,9 +58,18 @@ pub const APP_MENU_BUTTON: &str = "☰menu";
 
 /// The sidebar's tab chips. They name what the body below them shows and
 /// take the place of the plain title the session tree used to carry.
-pub const SIDEBAR_TAB_SESSIONS: &str = "Workspaces";
+pub const SIDEBAR_TAB_SESSIONS: &str = "Sessions";
 
 pub const SIDEBAR_TAB_STREAM: &str = "Stream";
+
+/// The Cyclops mark, right-aligned on the sidebar header.
+///
+/// A terminal cannot show the logo, so this is the logo's shape in text:
+/// the prompt glyph inside its frame. It replaced a rollup dot that could
+/// not go out (see `render::sidebar::paint_tab_header`), so the row went
+/// from carrying a broken signal to carrying no signal, which is what a
+/// wordmark is for.
+pub const WORDMARK: &str = "[> -]";
 
 /// Named beside the sidebar's create button while the mouse rests on it. A
 /// bare glyph does not say what it makes, and the sidebar is too narrow to
@@ -103,7 +112,7 @@ pub const MENU_CLOSE_PANE: &str = "Close pane";
 
 pub const MENU_NEW_TAB: &str = "New tab";
 
-pub const MENU_NEW_WORKSPACE: &str = "New workspace";
+pub const MENU_NEW_WORKSPACE: &str = "New session";
 
 pub const MENU_TOGGLE_EVENTS: &str = "Event stream";
 
@@ -126,9 +135,9 @@ pub const MENU_RENAME_TAB: &str = "Rename tab";
 
 pub const MENU_CLOSE_TAB: &str = "Close tab";
 
-pub const MENU_RENAME_WORKSPACE: &str = "Rename workspace";
+pub const MENU_RENAME_WORKSPACE: &str = "Rename session";
 
-pub const MENU_CLOSE_WORKSPACE: &str = "Close workspace";
+pub const MENU_CLOSE_WORKSPACE: &str = "Close session";
 
 pub const THEMES_TITLE: &str = "Themes";
 

@@ -76,6 +76,11 @@ pub enum HitTarget {
     FileDisclosure {
         path: String,
     },
+    /// A pane's minimize control, at the left end of its top border.
+    /// Collapses the pane to its title, and restores it.
+    PaneMinimize {
+        pane_id: String,
+    },
     /// The file panel's climb-out row.
     FileUp,
     /// The file panel's header: re-roots on the focused pane's folder.

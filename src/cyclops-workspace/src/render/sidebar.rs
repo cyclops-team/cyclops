@@ -156,7 +156,7 @@ pub fn paint_sidebar(
     // row to give.
     let bar_y = (body_bottom < footer_y).then_some(body_bottom);
 
-    paint_tab_header(inner, tab, buf, paint, hits, decoration);
+    paint_tab_header(inner, tab, buf, paint, hits);
     // The Sessions tab is two panels sharing one column: who is running,
     // and what is on disk. The seam between them is where the session tree
     // stops; the Stream tab has no second panel and keeps the whole body.
@@ -483,34 +483,42 @@ fn paint_toggle(
     hits.push(hit, HitTarget::SidebarToggle);
 }
 
-/// The workspace attention rollup, right-aligned on the header row.
+/// The Cyclops mark, right-aligned on the header row.
 ///
-/// Its own function because both header shapes carry it: the tab strip and
-/// the plain title a single offered tab falls back to. Painted only when
-/// real room is left over, never crushed against what precedes it.
-fn paint_attention_rollup(
-    row: Rect,
-    right: u16,
-    buf: &mut Buffer,
-    paint: &Paint,
-    decoration: &DecorationSnapshot,
-) {
-    if !decoration.workspace_needs_attention() {
+/// It stands where a rollup dot used to. That dot read the attention
+/// register's raw count, and the delivery half of that count is a latch:
+/// `attention_required` and `parked_blocked_quota` can only leave through
+/// `queued`, and nothing in the product writes that transition. There is no
+/// requeue RPC and no requeue command, and the fold reads the ledger from
+/// byte zero with no window, so one failed send lit the dot for the life of
+/// the ledger file, across restarts. It also pointed at nothing a reader
+/// could act on: a delivery item carries a recipient and a message id, not
+/// a pane, so it can never be attributed to a row in this tree.
+///
+/// The scoped predicate next to it is healthy and still in use: the tab
+/// strip marks a tab whose own panes are blocked, and that one clears.
+///
+/// Dropped rather than shrunk when the row is too narrow. A mark is
+/// branding, and branding yields to the name of the thing you are looking
+/// at.
+fn paint_wordmark(row: Rect, right: u16, used: u16, buf: &mut Buffer, paint: &Paint) {
+    let width = u16::try_from(Span::raw(copy::WORDMARK).width()).unwrap_or(u16::MAX);
+    // One column of air between the title and the mark.
+    if right.saturating_sub(row.x + used) < width + 1 {
         return;
     }
-    let style =
-        theme::attention_eye(paint).patch(paint.bg_token(cyclops_theme::tokens::CHROME_PANEL));
-    let mark = " ◉";
-    let width = u16::try_from(Span::raw(mark).width()).unwrap_or(u16::MAX);
-    let x = right.saturating_sub(width);
-    if x <= row.x {
-        return;
-    }
-    super::overlay_text(buf, row, x, row.y, mark, style);
+    super::overlay_text(
+        buf,
+        row,
+        right - width,
+        row.y,
+        copy::WORDMARK,
+        theme::sidebar_label(paint),
+    );
 }
 
 /// The tab header: one row of chips naming what the body below shows, with
-/// the workspace attention rollup after them.
+/// the Cyclops mark after them.
 ///
 /// It takes the row the session tree's plain "Workspaces" title used to
 /// occupy rather than adding one, so the tree below keeps the exact rows —
@@ -522,7 +530,6 @@ fn paint_tab_header(
     buf: &mut Buffer,
     paint: &Paint,
     hits: &mut HitMap,
-    decoration: &DecorationSnapshot,
 ) {
     let row = Rect::new(inner.x, inner.y, inner.width, 1);
     let right = inner.x + inner.width;
@@ -543,7 +550,9 @@ fn paint_tab_header(
             copy::SIDEBAR_TAB_SESSIONS,
             theme::sidebar_label(paint),
         );
-        paint_attention_rollup(row, right, buf, paint, decoration);
+        let used =
+            lead + u16::try_from(Span::raw(copy::SIDEBAR_TAB_SESSIONS).width()).unwrap_or(u16::MAX);
+        paint_wordmark(row, right, used, buf, paint);
         return;
     }
 
@@ -580,14 +589,8 @@ fn paint_tab_header(
             spans.push(Span::styled(text, style));
             x = x.saturating_add(w);
         }
-        if decoration.workspace_needs_attention() {
-            spans.push(Span::styled(
-                " ◉",
-                theme::attention_eye(paint)
-                    .patch(paint.bg_token(cyclops_theme::tokens::CHROME_PANEL)),
-            ));
-        }
         Paragraph::new(Line::from(spans)).render(row, buf);
+        paint_wordmark(row, right, x.saturating_sub(row.x), buf, paint);
         return;
     }
 
@@ -627,13 +630,7 @@ fn paint_tab_header(
         super::overlay_text_ellipsized(buf, bounds, text_x, row.y, label, style);
         x = x.saturating_add(share);
     }
-    // The rollup only when real room is left over, never crushed flush
-    // against the second chip's own edge.
-    if decoration.workspace_needs_attention() && right.saturating_sub(x) >= 2 {
-        let rollup_style =
-            theme::attention_eye(paint).patch(paint.bg_token(cyclops_theme::tokens::CHROME_PANEL));
-        super::overlay_text(buf, row, x, row.y, " ◉", rollup_style);
-    }
+    paint_wordmark(row, right, x.saturating_sub(row.x), buf, paint);
 }
 
 /// The Sessions tab's body: workspace rows, their expanded agent rows, and
@@ -1421,6 +1418,70 @@ mod tests {
         (0..buf.area.width)
             .map(|x| buf[(x, y)].symbol().to_string())
             .collect()
+    }
+
+    /// The header carries the Cyclops mark and no attention dot.
+    ///
+    /// The dot it replaced could not go out. A delivery in
+    /// `attention_required` leaves that state only through `queued`, and
+    /// nothing in the product writes that transition, so one failed send
+    /// lit the header for the life of the ledger file. It also pointed at
+    /// nothing: a delivery carries a recipient and a message id, never a
+    /// pane, so no row in this tree could ever be the thing it meant.
+    ///
+    /// The per-tab mark is a different predicate and is deliberately still
+    /// alive; this only pins the header.
+    #[test]
+    fn the_header_carries_the_mark_and_no_attention_dot() {
+        let project = Project::new("sidebar-wordmark");
+        let mut files = project.tree();
+        let width = crate::render::SIDEBAR_DEFAULT_WIDTH;
+        let height = 22;
+        let workspaces = vec![WorkspaceRow {
+            session_id: "$0".into(),
+            name: "clops".into(),
+            tab_count: 1,
+            window_ids: vec!["@0".into()],
+        }];
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut hits = HitMap::default();
+        term.draw(|f| {
+            paint_sidebar(
+                &workspaces,
+                0,
+                "%0",
+                &std::collections::HashSet::from(["$0".to_string()]),
+                &[],
+                SidebarTab::Sessions,
+                &Record::new(),
+                &mut files,
+                8,
+                f.area(),
+                f.buffer_mut(),
+                &Paint::for_test(),
+                &mut hits,
+                &DecorationSnapshot::default(),
+                None,
+                None,
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let header: String = (0..width).map(|x| buf[(x, 0)].symbol()).collect();
+
+        assert!(
+            header.contains(copy::WORDMARK),
+            "the mark belongs on the header: {header:?}"
+        );
+        assert!(
+            header.contains(copy::SIDEBAR_TAB_SESSIONS),
+            "and it does not push the panel's name off: {header:?}"
+        );
+        assert!(
+            !flatten(&buf).contains('◉'),
+            "no attention dot anywhere in the panel: {}",
+            flatten(&buf)
+        );
     }
 
     /// A short sidebar gives the whole column to the session tree. Two
@@ -2624,10 +2685,10 @@ mod tests {
     #[test]
     /// The header's own claim, measured at the width that actually ships
     /// (`WorkspacePrefs::default().sidebar_width` is 22, the minimum):
-    /// both chips answer the mouse AND the attention rollup still paints.
-    /// The wider tests above would pass with a header that silently drops
-    /// the rollup on every default install.
-    fn the_header_fits_both_chips_and_the_rollup_at_the_default_width() {
+    /// both chips answer the mouse AND the Cyclops mark still paints. The
+    /// wider tests above would pass with a header that silently drops the
+    /// mark on every default install.
+    fn the_header_fits_both_chips_and_the_mark_at_the_default_width() {
         // The Stream tab is off while it is revised
         // (`persist::STREAM_TAB`). This pins behavior that comes back with
         // it, so it is gated rather than deleted.
@@ -2638,13 +2699,7 @@ mod tests {
         let record = Record::new();
         let paint = Paint::for_test();
         let narrow = Rect::new(0, 0, 24, SIDEBAR.height);
-        let mut decoration = DecorationSnapshot::default();
-        decoration.attention.observe_agent(
-            "reviewer",
-            Some("%0"),
-            cyclops_proto::AgentState::BlockedPermission,
-        );
-        assert!(decoration.workspace_needs_attention());
+        let decoration = DecorationSnapshot::default();
 
         let workspaces = vec![WorkspaceRow {
             session_id: "$0".into(),
@@ -2691,8 +2746,8 @@ mod tests {
         ));
         let header: String = (0..narrow.width).map(|x| buf[(x, 0)].symbol()).collect();
         assert!(
-            header.contains('◉'),
-            "the rollup has to survive the default width: {header:?}"
+            header.contains(copy::WORDMARK),
+            "the mark has to survive the default width: {header:?}"
         );
     }
 

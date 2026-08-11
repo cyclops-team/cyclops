@@ -142,6 +142,23 @@ impl ControlClient {
         .map(|_| ())
     }
 
+    /// Set `pane_id` to exactly `rows` rows high (`resize-pane -y`).
+    ///
+    /// Absolute, unlike [`Self::resize_pane`], which pushes an edge by a
+    /// delta. Minimize and restore both know the height they want, and
+    /// expressing that as a delta would mean reading the current height
+    /// first and racing every other client against the answer.
+    ///
+    /// tmux clamps to its own minimum and refuses a pane that has no room
+    /// to give, so a pane spanning the window's full height simply does not
+    /// move. Callers that must not offer a control which does nothing check
+    /// that before painting it.
+    pub async fn resize_pane_height(&self, pane_id: &str, rows: u16) -> Result<(), TmuxError> {
+        self.command(&format!("resize-pane -t {} -y {rows}", quote_arg(pane_id)))
+            .await
+            .map(|_| ())
+    }
+
     /// Toggle zoom on the window holding `pane_id` (`resize-pane -Z`).
     ///
     /// tmux owns the flag, so this is a toggle rather than a set: asking for

@@ -50,7 +50,9 @@ use crate::drag::{DragState, DragTarget};
 use crate::runtime::{Color, GridCell};
 use crate::theme::Paint;
 
-pub use canvas::{paint_window, tmux_client_size, HostCursor, WindowPaintCtx, PANE_GRIP};
+pub use canvas::{
+    paint_window, tmux_client_size, HostCursor, WindowPaintCtx, MINIMIZED_ROWS, PANE_GRIP,
+};
 /// For the arithmetic check in
 /// `app::tests::narrowing_the_sidebar_strands_canvas_columns_until_tmux_is_told`,
 /// which adds the panel, the declared grid, these two, and the layout's
@@ -285,6 +287,10 @@ fn cell_style(cell: &GridCell, base: Style, palette: Option<&[RtColor; 16]>) -> 
             if let (Some(bg), Some(ground)) = (style.bg, base.bg) {
                 if let Some(panel) = matched_ground(bg, ground, base.fg, palette) {
                     style.bg = Some(panel);
+                } else if let Some(flipped) = mirrored_tint(bg, ground, palette) {
+                    // A diff band and the like: keep the hue, move the
+                    // lightness to this theme's side of the ground.
+                    style.bg = Some(flipped);
                 }
             }
         }
@@ -354,6 +360,13 @@ const FOREIGN_LIGHT_MIN_L: f64 = 0.70;
 /// chromatic dark (a diff's green fill, a powerline segment) is
 /// content, not a mistaken ground, and keeps its color.
 const NEUTRAL_SPREAD_MAX: u8 = 24;
+/// How far a TINTED fill's lightness has to be from the theme's ground
+/// before it counts as painted for the other kind of terminal. Looser than
+/// the neutral thresholds beside it, because a diff band is deliberately
+/// not black: a dark-theme red sits around 0.10 to 0.25, and holding it to
+/// 0.10 would leave every one of them dark on a light theme.
+const FOREIGN_TINT_DARK_MAX_L: f64 = 0.30;
+const FOREIGN_TINT_LIGHT_MIN_L: f64 = 0.62;
 
 /// How far the replacement panel leans from the ground toward the ink:
 /// enough to keep a composer box visible as a box, no more.
@@ -431,6 +444,90 @@ fn matched_ground(
     };
     let ink = ink.and_then(srgb).unwrap_or(pole);
     Some(emit(lerp(g, ink, PANEL_TINT), palette))
+}
+
+/// A tinted fill from the other kind of terminal: a diff's red or green
+/// band, chosen for a dark ground and still dark under a light theme.
+///
+/// [`matched_ground`] deliberately refuses these, and it is right to. It
+/// re-grounds NEUTRAL fills, where the exact grey the agent picked means
+/// nothing and the theme's own panel is a better answer. A tinted band is
+/// the opposite case: the hue is the information. Replacing a diff's red
+/// with the panel color deletes the diff.
+///
+/// So hue and saturation survive untouched and only lightness moves. The
+/// color is mirrored across mid-lightness, which turns a dark red into a
+/// light red: still obviously the removed side, now legible on a light
+/// ground. Under a dark theme the same mirror pulls a band painted for a
+/// light terminal back down.
+///
+/// Fires only for a fill that is genuinely foreign, meaning its lightness
+/// sits at the far pole from the theme's own ground. A band already on the
+/// right side of the ground is left exactly as the agent drew it.
+fn mirrored_tint(bg: RtColor, ground: RtColor, palette: Option<&[RtColor; 16]>) -> Option<RtColor> {
+    let (Some(b), Some(g)) = (srgb(bg), srgb(ground)) else {
+        return None;
+    };
+    // Neutral fills belong to `matched_ground`; this is only for the ones
+    // it declined.
+    let spread = b.0.max(b.1).max(b.2) - b.0.min(b.1).min(b.2);
+    if spread <= NEUTRAL_SPREAD_MAX {
+        return None;
+    }
+    let (bl, gl) = (luminance(b), luminance(g));
+    let foreign = if gl >= 0.5 {
+        bl <= FOREIGN_TINT_DARK_MAX_L
+    } else {
+        bl >= FOREIGN_TINT_LIGHT_MIN_L
+    };
+    if !foreign {
+        return None;
+    }
+    let (h, sat, l) = to_hsl(b);
+    Some(emit(from_hsl(h, sat, 1.0 - l), palette))
+}
+
+/// RGB to hue, saturation and lightness, each 0.0 to 1.0 (hue in turns).
+fn to_hsl(c: (u8, u8, u8)) -> (f64, f64, f64) {
+    let (r, g, b) = (
+        f64::from(c.0) / 255.0,
+        f64::from(c.1) / 255.0,
+        f64::from(c.2) / 255.0,
+    );
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+    let d = max - min;
+    if d.abs() < f64::EPSILON {
+        return (0.0, 0.0, l);
+    }
+    let s = d / (1.0 - (2.0 * l - 1.0).abs());
+    let h = if (max - r).abs() < f64::EPSILON {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if (max - g).abs() < f64::EPSILON {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    } / 6.0;
+    (h, s, l)
+}
+
+/// The inverse of [`to_hsl`].
+fn from_hsl(h: f64, s: f64, l: f64) -> (u8, u8, u8) {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = h * 6.0;
+    let x = c * (1.0 - (hp.rem_euclid(2.0) - 1.0).abs());
+    let (r, g, b) = match hp as u8 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    let to8 = |v: f64| ((v + m).clamp(0.0, 1.0) * 255.0).round() as u8;
+    (to8(r), to8(g), to8(b))
 }
 
 /// Block elements, shades, braille, and the legacy-computing set: cells
@@ -539,10 +636,10 @@ fn lerp(from: (u8, u8, u8), to: (u8, u8, u8), f: f64) -> (u8, u8, u8) {
 /// dim-to-accent path collapses to four or five entries, so an eight-frame
 /// fade shows four steps. Banding is worse than a snap.
 ///
-/// The callers are the surfaces that paint animated chrome, `canvas` (the
-/// pane border, the state cell, the notice) and `sidebar` (the row's status
-/// glyph); the allow goes with the first of them to land.
-#[allow(dead_code)]
+/// The pane border is the caller that landed first (`canvas`, the focus
+/// fade). The state cell, the notice and the sidebar row's status glyph are
+/// still staged: `MotionFrame` already answers for them, and wiring each is
+/// a call to this function at the point that picks its style.
 pub(crate) fn blend(paint: &Paint, from: Style, to: Style, t: f32) -> Style {
     debug_assert!(
         from.bg == to.bg,
@@ -621,20 +718,73 @@ mod contrast_tests {
         assert!(contrast(fg, bg) >= MIN_CONTRAST, "{fg:?} on {bg:?}");
     }
 
-    /// A chromatic dark fill (a diff's green, a powerline segment) is
-    /// content: the fill keeps its color and only its text gets the
-    /// floor.
+    /// A chromatic fill (a diff's green, a powerline segment) keeps its
+    /// HUE, and only its lightness moves to this theme's side of the
+    /// ground.
+    ///
+    /// The rule used to keep the color outright, on the reasoning that a
+    /// chromatic fill is content and recoloring it destroys meaning. That
+    /// reasoning is right and is why this does not re-ground the fill the
+    /// way a neutral panel gets re-grounded: the hue IS the meaning, and a
+    /// diff's red replaced by the theme's panel is a diff with the removed
+    /// side erased.
+    ///
+    /// What the old rule missed is that lightness is not part of that
+    /// meaning. A band painted at 5% lightness for a dark terminal stays a
+    /// dark slab under a light theme, which is what the report was about.
+    /// Mirroring lightness keeps green green and red red while putting
+    /// both on the right side of the ground.
     #[test]
-    fn a_chromatic_dark_fill_keeps_its_color() {
+    fn a_chromatic_dark_fill_keeps_its_hue_and_flips_its_lightness() {
         let base = Style::new().fg(INK).bg(WHITE);
         let style = cell_style(
             &cell(Color::Default, Color::Rgb(14, 53, 18)),
             base,
             Some(&PALETTE),
         );
-        assert_eq!(style.bg.unwrap(), RtColor::Rgb(14, 53, 18));
+        let bg = srgb(style.bg.unwrap()).unwrap();
+        assert_ne!(bg, (14, 53, 18), "a dark slab on a light theme has to move");
+        assert!(
+            luminance(bg) > luminance((14, 53, 18)),
+            "and it moves toward the ground, not away: {bg:?}"
+        );
+
+        // Still green: the channel that led still leads, by the same
+        // margin in hue terms.
+        let (hue_before, sat_before, _) = to_hsl((14, 53, 18));
+        let (hue_after, sat_after, _) = to_hsl(bg);
+        assert!(
+            (hue_before - hue_after).abs() < 0.02,
+            "hue must survive: {hue_before} then {hue_after}"
+        );
+        assert!(
+            (sat_before - sat_after).abs() < 0.02,
+            "and so must saturation: {sat_before} then {sat_after}"
+        );
+        assert!(
+            bg.1 > bg.0 && bg.1 > bg.2,
+            "green is still the lead: {bg:?}"
+        );
+
+        // And the text on it still clears the floor.
         let fg = srgb(style.fg.unwrap()).unwrap();
-        assert!(contrast(fg, (14, 53, 18)) >= MIN_CONTRAST, "{fg:?}");
+        assert!(contrast(fg, bg) >= MIN_CONTRAST, "{fg:?} on {bg:?}");
+    }
+
+    /// A fill already on the theme's own side is native and untouched. The
+    /// mirror is for foreign fills only, or every powerline segment an
+    /// operator deliberately themed would get flipped.
+    #[test]
+    fn a_chromatic_fill_that_already_suits_the_ground_is_left_alone() {
+        let base = Style::new().fg(INK).bg(WHITE);
+        // A mid-light green: at home on a light ground.
+        let native = Color::Rgb(180, 226, 185);
+        let style = cell_style(&cell(Color::Default, native), base, Some(&PALETTE));
+        assert_eq!(
+            style.bg.unwrap(),
+            RtColor::Rgb(180, 226, 185),
+            "nothing foreign about it, so nothing to correct"
+        );
     }
 
     /// The mirror: a near-white panel painted for a light terminal
@@ -750,6 +900,20 @@ pub(crate) mod test_support {
     /// 38x9 pane canvas used by the frame tests.
     pub(crate) fn two_pane_tab() -> TabModel {
         let node = parse_layout("4c3e,38x8,0,0[38x4,0,0,0,38x3,0,5,1]").unwrap();
+        let layout = resolve_layout(&node, &[]).unwrap();
+        TabModel {
+            window_id: "@0".to_string(),
+            name: "main".to_string(),
+            layout,
+            active_pane: "%0".to_string(),
+            zoomed: false,
+        }
+    }
+
+    /// One pane filling the window: the case where a control that takes
+    /// rows from a sibling has no sibling to take them from.
+    pub(crate) fn single_pane_tab() -> TabModel {
+        let node = parse_layout("b26f,38x8,0,0,0").unwrap();
         let layout = resolve_layout(&node, &[]).unwrap();
         TabModel {
             window_id: "@0".to_string(),
