@@ -273,6 +273,41 @@ pub(super) async fn execute(
                 ..Outcome::default()
             })
         }
+        Action::ToggleMinimizePane { pane_id } => {
+            // The height to go back to is the height it has right now, read
+            // from the frame that is on screen. tmux is the authority on
+            // pane geometry and the render follows it 1:1, so the painted
+            // height IS the tmux height.
+            match app.minimized.remove(&pane_id) {
+                Some(rows) => {
+                    client.resize_pane_height(&pane_id, rows).await?;
+                }
+                None => {
+                    let Some(geometry) = app.hit_map.pane_geometry(&pane_id) else {
+                        // Nothing painted it this frame, so there is no
+                        // height to remember and nothing to collapse.
+                        return Ok(Outcome::default());
+                    };
+                    let was = geometry.inner.height;
+                    // A pane already at the floor has nothing to give, and
+                    // recording that as its restore height would make the
+                    // restore a no-op forever after.
+                    if was <= crate::render::MINIMIZED_ROWS {
+                        return Ok(Outcome::default());
+                    }
+                    app.minimized.insert(pane_id.clone(), was);
+                    client
+                        .resize_pane_height(&pane_id, crate::render::MINIMIZED_ROWS)
+                        .await?;
+                }
+            }
+            // tmux moved the layout, so the model has to be re-read before
+            // the next frame paints panes at the old geometry.
+            Ok(Outcome {
+                reconcile: true,
+                ..Outcome::default()
+            })
+        }
         Action::FocusFiles => {
             // Open what the cursor is going to live in. Focusing a panel
             // the operator cannot see reads as a chord that did nothing.
@@ -1317,6 +1352,7 @@ mod tests {
             theme_restore: None,
             link_state: LinkState::Live,
             paused_panes: HashSet::new(),
+            minimized: std::collections::HashMap::new(),
             reconnect_attempt: 0,
             hit_map: HitMap::default(),
             menu: MenuState::None,

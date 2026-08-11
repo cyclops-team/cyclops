@@ -147,8 +147,17 @@ pane grid. See [themes.md](themes.md) for the `chrome.text`,
 
 Click a pane, its border, a tab, a workspace row, or a nested agent row to
 focus or switch to it. Click a workspace disclosure arrow to expand or
-collapse its agent children without switching workspaces. The upper-right of
-every pane's top border carries
+collapse its agent children without switching workspaces.
+
+The left end of a pane's top border carries `[▴]`, which collapses that
+pane to its own title bar so only its identity shows, and `[▾]`, which puts
+it back to the height it had. It appears only on a pane with another pane
+stacked above or below it: two panes side by side both span the window's
+full height, so neither has anywhere to put the rows it would give up, and
+a control that cannot work is one this UI does not paint. A collapsed pane
+is session state and is not restored on the next launch.
+
+The upper-right of every pane's top border carries
 `[|][-]` controls for split right and split down; the focused pane's controls
 use the accent, while the others stay dim. They are clickable without
 focusing the pane first and do not cover the child terminal's first row.

@@ -170,6 +170,11 @@ struct App {
     theme_restore: Option<cyclops_theme::Theme>,
     link_state: LinkState,
     paused_panes: HashSet<String>,
+    /// Panes collapsed to their title bar, mapped to the height each had
+    /// before. Not persisted: a minimized pane is where you left the
+    /// furniture this afternoon, not a preference, and restoring one on
+    /// launch would hide a pane an operator has no memory of collapsing.
+    minimized: std::collections::HashMap<String, u16>,
     reconnect_attempt: usize,
     hit_map: HitMap,
     menu: MenuState,
@@ -512,6 +517,7 @@ pub async fn run_async() -> i32 {
         theme_restore: None,
         link_state: LinkState::Live,
         paused_panes: HashSet::new(),
+        minimized: std::collections::HashMap::new(),
         reconnect_attempt: 0,
         hit_map: HitMap::default(),
         menu: MenuState::None,
@@ -1991,6 +1997,19 @@ async fn handle_mouse(
                         return Ok(());
                     }
                 }
+                HitTarget::PaneMinimize { pane_id } => {
+                    app.close_menu();
+                    let outcome = exec::execute(
+                        app,
+                        client,
+                        action::Action::ToggleMinimizePane {
+                            pane_id: pane_id.clone(),
+                        },
+                    )
+                    .await?;
+                    apply_outcome(app, outcome);
+                    return Ok(());
+                }
                 HitTarget::PaneGrip { pane_id } => {
                     app.close_menu();
                     app.selection.clear();
@@ -3216,6 +3235,7 @@ fn draw(
                 selection: app.selection.active.as_ref(),
                 drag: app.drag.as_ref(),
                 notice: app.notice.text(),
+                minimized: &app.minimized,
                 cursor: None,
                 // Where every fade this frame stands. `none()` while motion
                 // is off, and a fade that has finished reads as its
@@ -3399,6 +3419,7 @@ mod tests {
             theme_restore: None,
             link_state: LinkState::Live,
             paused_panes: HashSet::new(),
+            minimized: std::collections::HashMap::new(),
             reconnect_attempt: 0,
             hit_map: HitMap::default(),
             menu: MenuState::None,
@@ -5014,6 +5035,7 @@ mod tests {
                 selection: None,
                 drag: None,
                 notice: None,
+                minimized: &std::collections::HashMap::new(),
                 cursor: None,
                 motion: crate::animate::MotionFrame::none(),
             };

@@ -292,6 +292,12 @@ pub enum Action {
     /// fresh install; the choice persists like the sidebar's.
     ToggleTabBar,
     /// Open or close the sidebar's file panel.
+    /// Collapse a pane to its own title bar, or put it back to the height
+    /// it had. Session state: a minimized pane is not a preference, it is
+    /// where you left the furniture this afternoon.
+    ToggleMinimizePane {
+        pane_id: String,
+    },
     ToggleFiles,
     /// Put the keyboard in the file panel, opening the sidebar and the
     /// panel first if either is away. A chord that focused a panel the

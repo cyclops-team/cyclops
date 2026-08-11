@@ -50,7 +50,9 @@ use crate::drag::{DragState, DragTarget};
 use crate::runtime::{Color, GridCell};
 use crate::theme::Paint;
 
-pub use canvas::{paint_window, tmux_client_size, HostCursor, WindowPaintCtx, PANE_GRIP};
+pub use canvas::{
+    paint_window, tmux_client_size, HostCursor, WindowPaintCtx, MINIMIZED_ROWS, PANE_GRIP,
+};
 /// For the arithmetic check in
 /// `app::tests::narrowing_the_sidebar_strands_canvas_columns_until_tmux_is_told`,
 /// which adds the panel, the declared grid, these two, and the layout's
@@ -898,6 +900,20 @@ pub(crate) mod test_support {
     /// 38x9 pane canvas used by the frame tests.
     pub(crate) fn two_pane_tab() -> TabModel {
         let node = parse_layout("4c3e,38x8,0,0[38x4,0,0,0,38x3,0,5,1]").unwrap();
+        let layout = resolve_layout(&node, &[]).unwrap();
+        TabModel {
+            window_id: "@0".to_string(),
+            name: "main".to_string(),
+            layout,
+            active_pane: "%0".to_string(),
+            zoomed: false,
+        }
+    }
+
+    /// One pane filling the window: the case where a control that takes
+    /// rows from a sibling has no sibling to take them from.
+    pub(crate) fn single_pane_tab() -> TabModel {
+        let node = parse_layout("b26f,38x8,0,0,0").unwrap();
         let layout = resolve_layout(&node, &[]).unwrap();
         TabModel {
             window_id: "@0".to_string(),
