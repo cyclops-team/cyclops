@@ -25,6 +25,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::hash::fnv64;
+
 /// Every manifest the binary carries, by file name.
 const SHIPPED: &[(&str, &str)] = &[
     (
@@ -90,17 +92,6 @@ const EVER_SHIPPED_FNV64: &[&str] = &[
     "c60d4aff7fe2a5d2",
     "f6c7c7aaa830babb",
 ];
-
-/// FNV-1a 64, hex. Not cryptographic and does not need to be: the question
-/// is "did the operator edit this file", not "is this an attack".
-fn fnv64(data: &[u8]) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in data {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("{h:016x}")
-}
 
 /// True when these bytes are a manifest this project wrote, so replacing
 /// them loses nothing the operator put there.

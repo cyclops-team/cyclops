@@ -40,6 +40,7 @@
 mod client;
 mod copy;
 mod daemon;
+mod hash;
 mod hook;
 mod hookset;
 mod manifests;

@@ -12,6 +12,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::hash::fnv64;
+
 /// Every theme the binary carries, by file name. Alphabetical, and
 /// `the_shipped_list_is_the_themes_directory` holds it to every file in
 /// resources/themes/ so a new theme cannot be embedded halfway.
@@ -152,17 +154,6 @@ const EVER_SHIPPED_FNV64: &[&str] = &[
     "e5531f9b02b29c11",
     "ec8713a84becce80",
 ];
-
-/// FNV-1a 64, hex. Not cryptographic and does not need to be: the
-/// question is "did the user edit this file", not "is this an attack".
-fn fnv64(data: &[u8]) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in data {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("{h:016x}")
-}
 
 /// What one [`seed`] run did.
 pub struct Seeded {

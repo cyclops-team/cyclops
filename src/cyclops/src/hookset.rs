@@ -26,6 +26,7 @@ use cyclops_proto::{DeliveryReceipt, DeliveryState};
 use serde_json::json;
 
 use crate::client::Client;
+use crate::hash::fnv64;
 use crate::render::{display_width, human_duration, pad, receipt_badge};
 use crate::style::Style;
 use crate::{copy, EXIT_USAGE};
@@ -387,19 +388,6 @@ fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
         io::ErrorKind::AlreadyExists,
         "could not allocate a unique temporary hook artifact",
     ))
-}
-
-/// FNV-1a 64, hex. Not cryptographic and does not need to be: the question
-/// is "did the operator edit this file", not "is this an attack".
-/// manifests.rs and themeseed.rs each carry the same eight lines for the
-/// same question; a third copy is cheaper than a crate nobody else wants.
-fn fnv64(data: &[u8]) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in data {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("{h:016x}")
 }
 
 fn now_ms() -> u64 {
