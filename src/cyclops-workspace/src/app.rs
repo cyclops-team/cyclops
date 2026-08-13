@@ -508,7 +508,7 @@ pub async fn run_async() -> i32 {
         chrome_for(Rect::new(0, 0, term_size.0, term_size.1), &model, &prefs).canvas;
     let boot_size = crate::render::tmux_client_size(chrome_canvas, model.active_tab());
     let mut declared_client_size = None;
-    if boot_size.0 >= 10 && boot_size.1 >= 3 {
+    if declarable(boot_size) {
         match client.set_client_size(boot_size.0, boot_size.1).await {
             Ok(()) => {
                 declared_client_size = Some(boot_size);
@@ -1420,13 +1420,25 @@ enum InputOutcome {
     NoRedraw,
 }
 
+/// The smallest grid worth declaring to tmux. Below this the terminal is
+/// nearly all chrome, and declaring the leftover sliver would reshape
+/// every pane in the session to fit it. Boot and every later resize must
+/// apply the same floor: if they disagree, a terminal declarable at boot
+/// stops being declarable on the first resize, or the reverse, and the
+/// panes are painted for a size tmux was never told about.
+const MIN_DECLARABLE_SIZE: (u16, u16) = (10, 3);
+
+fn declarable(size: (u16, u16)) -> bool {
+    size.0 >= MIN_DECLARABLE_SIZE.0 && size.1 >= MIN_DECLARABLE_SIZE.1
+}
+
 async fn resize_client(app: &mut App, client: &ControlClient) {
     let (w, h) = app.term_size;
     let size = crate::render::tmux_client_size(
         app.chrome(Rect::new(0, 0, w, h)).canvas,
         app.model.active_tab(),
     );
-    if size.0 < 10 || size.1 < 3 || app.declared_client_size == Some(size) {
+    if !declarable(size) || app.declared_client_size == Some(size) {
         return;
     }
     match client.set_client_size(size.0, size.1).await {
