@@ -1378,6 +1378,16 @@ impl App {
         set_last_active(&self.home, &self.model.session.session, &tab.window_id);
     }
 
+    /// Write the prefs, logging a failure instead of surfacing it: prefs
+    /// are comfort, and no preference is worth interrupting the operator's
+    /// session over. Every save goes through here so that trade-off is
+    /// decided once.
+    fn save_prefs_or_log(&self) {
+        if let Err(error) = persist::save_prefs(&self.home, &self.prefs) {
+            log_err(&self.home, &error);
+        }
+    }
+
     fn open_menu(&mut self, menu: MenuState) {
         self.menu = menu;
         self.hover = None;
@@ -1618,9 +1628,7 @@ async fn handle_app_msg(
                         &old_name,
                         &name,
                     ) {
-                        if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
-                            log_err(&app.home, &error);
-                        }
+                        app.save_prefs_or_log();
                     }
                 }
             }
@@ -1840,9 +1848,7 @@ fn route_context(app: &App) -> action::RouteContext<'_> {
 /// branch of `handle_mouse`) each have their own way of ending the loop.
 fn apply_outcome(app: &mut App, outcome: exec::Outcome) {
     if outcome.persist {
-        if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
-            log_err(&app.home, &error);
-        }
+        app.save_prefs_or_log();
     }
     if outcome.reconcile {
         app.needs_reconcile = true;
@@ -2390,9 +2396,7 @@ async fn handle_mouse(
             if sidebar_drag {
                 app.prefs.sidebar_width =
                     crate::render::sidebar_width_for_column(col, app.term_size.0);
-                if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
-                    log_err(&app.home, &error);
-                }
+                app.save_prefs_or_log();
                 resize_client(app, client).await;
             }
             let split_drag = app.drag.as_ref().is_some_and(|drag| {
@@ -2992,9 +2996,7 @@ async fn follow_workspace_folder(
         row.name = next.clone();
     }
     if persist::migrate_order_entry(&mut app.prefs.workspace_order, &current_name, &next) {
-        if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
-            log_err(&app.home, &error);
-        }
+        app.save_prefs_or_log();
     }
     app.needs_reconcile = true;
     Ok(())
@@ -3079,9 +3081,7 @@ fn apply_decoration_snapshot(app: &mut App, snapshot: DecorationSnapshot) {
     }
     if persist::migrate_agent_order_entries(&mut app.prefs.agent_order, &app.decoration, &snapshot)
     {
-        if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
-            log_err(&app.home, &error);
-        }
+        app.save_prefs_or_log();
     }
     app.decoration = snapshot;
 }
