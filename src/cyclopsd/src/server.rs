@@ -583,6 +583,28 @@ fn from_result(id: Value, result: Result<Value, cyclops_proto::WireError>) -> Re
     }
 }
 
+/// The identity boundary both authenticated verbs stand on: the peer must
+/// present credentials and be the daemon's own user. Fail-closed, and in
+/// one place, because msg.send (sender attribution) and agent.state.report
+/// (hook-ACK evidence) must never disagree about who is allowed in — a
+/// tightening applied to one and not the other would leave the record
+/// trusting a peer the other verb turns away.
+fn daemon_peer(peer: Peer) -> Result<(u32, i32), WireError> {
+    let deny = |message: String| WireError {
+        code: "denied".to_string(),
+        message,
+        data: None,
+    };
+    let Some((uid, pid)) = peer else {
+        return Err(deny("peer credentials unavailable".to_string()));
+    };
+    let daemon_uid = unsafe { libc::getuid() };
+    if uid != daemon_uid {
+        return Err(deny(format!("uid {uid} is not the daemon's user")));
+    }
+    Ok((uid, pid))
+}
+
 /// msg.send over the socket: resolve the sender from peer credentials
 /// (fail-closed: no credentials or a foreign uid is denied, and nothing
 /// in the request body can override the resolved sender), then hand off
@@ -592,13 +614,10 @@ async fn msg_send(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> R
         Ok(p) => p,
         Err(e) => return Response::err(id, "bad_request", format!("bad msg.send params: {e}")),
     };
-    let Some((uid, pid)) = peer else {
-        return Response::err(id, "denied", "peer credentials unavailable");
+    let (uid, pid) = match daemon_peer(peer) {
+        Ok(v) => v,
+        Err(e) => return Response::err(id, &e.code, e.message),
     };
-    let daemon_uid = unsafe { libc::getuid() };
-    if uid != daemon_uid {
-        return Response::err(id, "denied", format!("uid {uid} is not the daemon's user"));
-    }
     let panes = sender_panes(inner);
     let from = match identity::resolve_sender(uid, pid, &panes) {
         identity::Sender::Agent(label) => label,
@@ -669,13 +688,7 @@ fn verify_report_origin(inner: &Inner, peer: Peer, agent: &str) -> Result<(), Wi
         message,
         data: None,
     };
-    let Some((uid, pid)) = peer else {
-        return Err(deny("peer credentials unavailable".to_string()));
-    };
-    let daemon_uid = unsafe { libc::getuid() };
-    if uid != daemon_uid {
-        return Err(deny(format!("uid {uid} is not the daemon's user")));
-    }
+    let (uid, pid) = daemon_peer(peer)?;
     let panes = report_panes(inner);
     let allowed = match identity::resolve_sender(uid, pid, &panes) {
         identity::Sender::Agent(label) => {
