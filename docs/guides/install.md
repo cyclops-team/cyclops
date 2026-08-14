@@ -167,6 +167,15 @@ the cyclops verbs without being taught by hand. Both steps run only for
 CLIs whose directory already exists, never overwrite a file you edited,
 and are skipped entirely when `CYCLOPS_NO_VENDOR_HOOKS` is set.
 
+That consent outlives the run that gave it. `--wire-hooks` records it at
+`~/.cyclops/vendor-wiring-consented`, and every later `cyclops` or
+`cyclops start` finishes the wiring for an agent CLI that was not there
+yet — install cyclops before Claude Code and the skill still lands on
+the first start after Claude Code arrives, with a line saying what was
+placed. A boot that finds nothing new writes nothing and says nothing.
+Delete the marker file to withdraw the consent; `CYCLOPS_NO_VENDOR_HOOKS`
+declines the step for one run without deleting anything.
+
 The long way, by hand. Create `~/.cyclops/config.toml`:
 
 ```toml

@@ -17,6 +17,16 @@ versions are unreleased until admin cuts a tag.
 
 ### Fixed
 
+- Installing cyclops before the agent CLIs no longer strands the vendor
+  wiring. The installer's `--wire-hooks` consent lived only in its one
+  run: with no `~/.claude` yet, the hook configs and the agent skill
+  were rightly skipped, and nothing ever came back for them — only the
+  installer and `cyclops update` pass the flag. Setup now records the
+  consent at `~/.cyclops/vendor-wiring-consented`, and every ordinary
+  boot (`cyclops`, `cyclops start`) finishes the wiring for agent CLIs
+  that appeared since, printing a line only when something was actually
+  written. Deleting the marker withdraws the consent, and
+  `CYCLOPS_NO_VENDOR_HOOKS=1` still declines everything.
 - `cyclops start` now actually refreshes the prepared hook configs, the
   repair `cyclops hooks install` has promised since receipts existed.
   The refresh machinery was built and tested but never called: after an

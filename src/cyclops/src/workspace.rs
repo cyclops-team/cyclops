@@ -801,6 +801,10 @@ pub fn run_start(
             return 1;
         }
     };
+    // And the vendor homes, when the installer's consent is on file: an
+    // agent CLI installed after cyclops gets its skill and hook config on
+    // this boot instead of never. Quiet unless something was written.
+    notes.extend(finish_deferred_wiring(&home));
 
     // 4. Make sure there is a daemon, starting one if there is not.
     //
@@ -1103,32 +1107,29 @@ pub fn run_setup(json_out: bool, style: &Style, wire_hooks: bool) -> i32 {
     // does not get to call itself done. The installer reads the exit code.
     let usable = !seeded.none_installed();
 
-    // Wire the vendors that read hooks from a path of their own, for every
-    // one of them that is installed here. This is the step that makes an
-    // install report turn edges and earn verified receipts instead of
-    // detecting agents it can never hear from, and it runs on update too
-    // because update calls this verb.
+    // Wire the vendor homes, behind the installer's opt-in. This is the
+    // step that makes an install report turn edges and earn verified
+    // receipts instead of detecting agents it can never hear from, and it
+    // runs on update too because update calls this verb.
     //
     // Never fatal. A hooks.json that cannot be written leaves the agent on
     // the screen-verified tier, which is the tier every agent was on before
     // this existed; refusing to finish an install over it would be trading
     // a working cyclops for none.
-    let wired = if wire_hooks && std::env::var_os("CYCLOPS_NO_VENDOR_HOOKS").is_none() {
-        wire_installed_vendors()
+    //
+    // The consent outlives this run. `wire_vendor_homes` skips any vendor
+    // whose directory is not there, and on a machine where cyclops was
+    // installed first, that is every vendor; recording the consent is what
+    // lets an ordinary boot finish the job once one appears
+    // (`finish_deferred_wiring`).
+    let consented = wire_hooks && std::env::var_os("CYCLOPS_NO_VENDOR_HOOKS").is_none();
+    if consented {
+        record_wiring_consent(&home);
+    }
+    let (wired, skills) = if consented {
+        wire_vendor_homes()
     } else {
-        Vec::new()
-    };
-
-    // The agent skill rides the same opt-in as the vendor hooks, because
-    // it is the same kind of act: writing into another tool's home so
-    // that tool's agent can use cyclops. Behind `--wire-hooks` it reaches
-    // every install (the installer passes the flag) and no test run
-    // (nothing else does), and it skips machines where the agent CLI is
-    // not present rather than inventing a ~/.claude for it.
-    let skills = if wire_hooks && std::env::var_os("CYCLOPS_NO_VENDOR_HOOKS").is_none() {
-        crate::skillseed::seed()
-    } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
 
     if json_out {
@@ -1190,6 +1191,26 @@ pub fn run_setup(json_out: bool, style: &Style, wire_hooks: bool) -> i32 {
     0
 }
 
+/// The pair of vendor-home writes install consent covers: hook entries
+/// into the config each installed vendor CLI reads on its own
+/// (`wire_installed_vendors`), and the agent skill into every skill
+/// folder present (`crate::skillseed::seed`). One function because they
+/// are one act — editing another tool's home so its agent can use
+/// cyclops — and two moments perform it: setup behind `--wire-hooks`,
+/// and every ordinary boot once [`consent_marker`] is on file. Gated the
+/// same way in both places or the two halves drift apart, which is how
+/// the skill once shipped without its hooks.
+///
+/// Both halves skip any vendor whose directory does not exist and never
+/// replace bytes this project did not write, so calling this again is a
+/// stat, not a write.
+fn wire_vendor_homes() -> (
+    Vec<crate::hookset::WiredVendor>,
+    Vec<crate::skillseed::SeededSkill>,
+) {
+    (wire_installed_vendors(), crate::skillseed::seed())
+}
+
 /// Wire every vendor that reads hooks from a fixed path and is installed
 /// here. Vendors that take their config at launch are absent by design:
 /// claude gets its file from `--agents`, and nothing under ~/.claude is
@@ -1211,6 +1232,82 @@ fn wire_installed_vendors() -> Vec<crate::hookset::WiredVendor> {
     out
 }
 
+/// The file that makes `--wire-hooks` consent outlive the run it was
+/// given in.
+///
+/// Without it the consent lived only in the installer's one invocation:
+/// on a machine where cyclops was installed before the agent CLIs, every
+/// vendor dir was (rightly) absent, both writes were skipped, and nothing
+/// ever came back for them — only the installer and `cyclops update` pass
+/// the flag. While this file exists, every ordinary boot may finish the
+/// wiring for a vendor that appeared since ([`finish_deferred_wiring`]).
+///
+/// [`record_wiring_consent`] is the single writer. Deleting the file
+/// withdraws the consent; `CYCLOPS_NO_VENDOR_HOOKS` declines it without
+/// deleting anything.
+fn consent_marker(home: &Path) -> PathBuf {
+    home.join("vendor-wiring-consented")
+}
+
+/// Record that `--wire-hooks` was asked for, so later boots may finish
+/// the vendor wiring. Never fatal, same as the wiring itself: a marker
+/// that cannot be written costs the deferred retry, not the setup, and
+/// the line says so.
+fn record_wiring_consent(home: &Path) {
+    let path = consent_marker(home);
+    let text = "Consent to wire vendor homes, recorded by `cyclops start --setup-only \
+                --wire-hooks` (the installer's last step).\n\
+                While this file exists, every ordinary boot finishes that wiring for \
+                agent CLIs installed after cyclops: hook entries in the config each \
+                vendor CLI reads on its own, and the agent skill for Claude Code.\n\
+                Delete this file to withdraw the consent; CYCLOPS_NO_VENDOR_HOOKS=1 \
+                declines it for one run.\n";
+    if let Err(e) = std::fs::write(&path, text) {
+        eprintln!(
+            "  hooks: can't record wiring consent at {}: {e}",
+            path.display()
+        );
+    }
+}
+
+/// Finish the install's vendor wiring for agent CLIs that appeared after
+/// it ran. Returns the lines to print — only when something was actually
+/// written, because on every ordinary boot after the first this finds
+/// everything current and a note repeated forever is noise.
+///
+/// The boot path for bare `cyclops` and `cyclops start` calls this; the
+/// daemon never does — writing into vendor homes stays a CLI act, done
+/// where a person just ran a command. Without the marker, or with
+/// `CYCLOPS_NO_VENDOR_HOOKS` set, no vendor home is even looked at.
+pub fn finish_deferred_wiring(home: &Path) -> Vec<String> {
+    if !consent_marker(home).is_file() || std::env::var_os("CYCLOPS_NO_VENDOR_HOOKS").is_some() {
+        return Vec::new();
+    }
+    let (wired, skills) = wire_vendor_homes();
+    let mut notes: Vec<String> = Vec::new();
+    for w in wired.iter().filter(|w| !w.unchanged) {
+        notes.push(format!(
+            "{} appeared since install — wired cyclops hooks in {}",
+            w.vendor,
+            w.path.display()
+        ));
+        notes.extend(kept_backup(w));
+    }
+    for s in &skills {
+        match &s.outcome {
+            crate::skillseed::Outcome::Written => notes.push(format!(
+                "Claude Code appeared since install — placed the cyclops skill at {}",
+                s.path.display()
+            )),
+            // A failure someone can fix, said each boot until it is: the
+            // quiet alternative is a consent that silently never lands.
+            crate::skillseed::Outcome::Problem(_) => notes.extend(crate::skillseed::note(s)),
+            crate::skillseed::Outcome::Kept | crate::skillseed::Outcome::NoAgent => {}
+        }
+    }
+    notes
+}
+
 /// One line per vendor whose config this run touched, and one for the
 /// backups. A file this project edited that the operator did not edit is
 /// exactly the kind of thing they should hear about at the time rather
@@ -1225,15 +1322,17 @@ fn hook_notes(wired: &[crate::hookset::WiredVendor]) -> Vec<String> {
         .iter()
         .map(|w| format!("wired {} hooks in {}", w.vendor, w.path.display()))
         .collect();
-    for w in changed.iter().filter(|w| w.backup.is_some()) {
-        let b = w.backup.as_ref().expect("filtered on is_some");
-        out.push(format!(
-            "kept your previous {} config at {}",
-            w.vendor,
-            b.display()
-        ));
-    }
+    out.extend(changed.iter().filter_map(|w| kept_backup(w)));
     out
+}
+
+/// The backup line, one sentence wherever a vendor config was edited —
+/// setup and the deferred boot both print it, because a file this project
+/// copied aside is worth hearing about at the time, whichever run did it.
+fn kept_backup(w: &crate::hookset::WiredVendor) -> Option<String> {
+    w.backup
+        .as_ref()
+        .map(|b| format!("kept your previous {} config at {}", w.vendor, b.display()))
 }
 
 fn write_first_run_config(home: &Path, session: &str) -> Result<(), String> {

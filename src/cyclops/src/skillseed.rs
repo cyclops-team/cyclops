@@ -13,13 +13,14 @@
 //! Where it goes is another tool's home (`~/.claude/skills/cyclops/`),
 //! which `crate::hookset` deliberately refuses to touch for `hooks
 //! install`. Writing here follows the rules `hookset::wire_vendor`
-//! already set for vendor homes: only behind the installer's
-//! `--wire-hooks` opt-in, only when the vendor's directory already exists
-//! (its presence is what says the agent CLI is installed; this module
-//! never creates `~/.claude` itself), honoring `CYCLOPS_NO_VENDOR_HOOKS`,
-//! and never replacing bytes this project did not write
-//! ([`EVER_SHIPPED_FNV64`], the same edit-detection rule as
-//! `crate::manifests`).
+//! already set for vendor homes: only under the installer's
+//! `--wire-hooks` consent (given at install time, or recorded then and
+//! honored by a later boot: `workspace::finish_deferred_wiring`), only
+//! when the vendor's directory already exists (its presence is what says
+//! the agent CLI is installed; this module never creates `~/.claude`
+//! itself), honoring `CYCLOPS_NO_VENDOR_HOOKS`, and never replacing
+//! bytes this project did not write ([`EVER_SHIPPED_FNV64`], the same
+//! edit-detection rule as `crate::manifests`).
 
 use std::path::{Path, PathBuf};
 

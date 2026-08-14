@@ -69,6 +69,24 @@ configuration survive. Configuration alone is not proof: finish by running
 `cyclops hooks verify <label>` or `cyclops hooks selftest <label>`. If a vendor
 reload is needed, run the selftest after reloading or restarting it.
 
+## Install-time wiring
+
+`scripts/install.sh` ends with `cyclops start --setup-only --wire-hooks`,
+the one opt-in that lets cyclops do the wiring above itself: it merges
+cyclops' hook entries into the config each installed vendor CLI reads on
+its own (`$CODEX_HOME/hooks.json`, `~/.agents/hooks.json`,
+`~/.cursor/hooks.json`) and places the agent skill for Claude Code at
+`~/.claude/skills/cyclops/SKILL.md`. A vendor directory that does not
+exist is never created, your own entries are merged around rather than
+replaced, and the original file is copied aside before the first edit.
+
+The consent is recorded at `~/.cyclops/vendor-wiring-consented`, so an
+agent CLI installed after cyclops is not stranded: the next `cyclops` or
+`cyclops start` finds it, wires it the same way, and prints one line
+saying so — silence means nothing needed writing. Delete the marker to
+withdraw the consent; `CYCLOPS_NO_VENDOR_HOOKS=1` declines the whole
+step, at install time and after.
+
 ## Verify (did edges ever arrive?)
 
 ```
