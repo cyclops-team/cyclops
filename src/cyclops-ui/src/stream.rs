@@ -237,6 +237,55 @@ fn ping_deliveries(d: &Value) -> Vec<PingDelivery> {
         .collect()
 }
 
+/// One `Delivery` entry: recipient, new state, and why it moved (when
+/// given). Called from `from_event` and `from_ledger` so a field or
+/// fallback change cannot land in one and miss the other.
+fn delivery_kind(d: &Value) -> EntryKind {
+    EntryKind::Delivery {
+        to: str_of(d, "to"),
+        state: state_of(d, "to_state"),
+        cause: opt_str(d, "cause"),
+    }
+}
+
+/// One `Gate` entry: recipient, the gate's action, and its cause — falling
+/// back to the older `rule` key when `cause` is absent. Called from
+/// `from_event` and `from_ledger` so the fallback order lives in one place.
+fn gate_kind(d: &Value) -> EntryKind {
+    EntryKind::Gate {
+        to: str_of(d, "to"),
+        action: str_of(d, "action"),
+        detail: opt_str(d, "cause").or_else(|| opt_str(d, "rule")),
+    }
+}
+
+/// One `State` entry: target, its pane, and the state it moved to. Called
+/// from `from_event` and `from_ledger` so a field change cannot land in one
+/// and miss the other.
+fn state_kind(d: &Value) -> EntryKind {
+    EntryKind::State {
+        target: str_of(d, "target"),
+        pane_id: opt_str(d, "pane_id"),
+        state: agent_state_of(d, "state"),
+    }
+}
+
+/// One `Notify` entry: level, what it points at, and any batch it
+/// summarizes. `subject` is a parameter because it is the one field the two
+/// callers read from different places — `d` on the live path, the ledger
+/// line's own field on replay. Called from `from_event` and `from_ledger`
+/// so the rest of the field list lives in one place.
+fn notify_kind(d: &Value, subject: String) -> EntryKind {
+    EntryKind::Notify {
+        level: serde_json::from_value(d.get("level").cloned().unwrap_or(Value::Null))
+            .unwrap_or(NotifyLevel::Fyi),
+        subject,
+        pane_id: opt_str(d, "pane_id"),
+        to: opt_str(d, "to"),
+        deliveries: ping_deliveries(d),
+    }
+}
+
 impl Entry {
     /// One live event from events.subscribe. Unknown vocabularies still
     /// render (as Other), never drop.
@@ -251,29 +300,10 @@ impl Entry {
                 body: opt_str(d, "body").filter(|b| !b.is_empty()),
                 fyi: d.get("fyi").and_then(Value::as_bool).unwrap_or(false),
             },
-            "delivery-state" => EntryKind::Delivery {
-                to: str_of(d, "to"),
-                state: state_of(d, "to_state"),
-                cause: opt_str(d, "cause"),
-            },
-            "gate" => EntryKind::Gate {
-                to: str_of(d, "to"),
-                action: str_of(d, "action"),
-                detail: opt_str(d, "cause").or_else(|| opt_str(d, "rule")),
-            },
-            "admin-notify" => EntryKind::Notify {
-                level: serde_json::from_value(d.get("level").cloned().unwrap_or(Value::Null))
-                    .unwrap_or(NotifyLevel::Fyi),
-                subject: str_of(d, "subject"),
-                pane_id: opt_str(d, "pane_id"),
-                to: opt_str(d, "to"),
-                deliveries: ping_deliveries(d),
-            },
-            "state" => EntryKind::State {
-                target: str_of(d, "target"),
-                pane_id: opt_str(d, "pane_id"),
-                state: agent_state_of(d, "state"),
-            },
+            "delivery-state" => delivery_kind(d),
+            "gate" => gate_kind(d),
+            "admin-notify" => notify_kind(d, str_of(d, "subject")),
+            "state" => state_kind(d),
             "session" => EntryKind::Session {
                 name: str_of(d, "name"),
                 text: session_text(d),
@@ -312,43 +342,21 @@ impl Entry {
                 // Delivery transitions carry to_state; fused agent states
                 // carry state. The two share Kind::State on disk.
                 if d.get("to_state").is_some() {
-                    EntryKind::Delivery {
-                        to: str_of(d, "to"),
-                        state: state_of(d, "to_state"),
-                        cause: opt_str(d, "cause"),
-                    }
+                    delivery_kind(d)
                 } else {
-                    EntryKind::State {
-                        target: str_of(d, "target"),
-                        pane_id: opt_str(d, "pane_id"),
-                        state: agent_state_of(d, "state"),
-                    }
+                    state_kind(d)
                 }
             }
-            Kind::Gate => {
-                let d = line.data.as_ref()?;
-                EntryKind::Gate {
-                    to: str_of(d, "to"),
-                    action: str_of(d, "action"),
-                    detail: opt_str(d, "cause").or_else(|| opt_str(d, "rule")),
-                }
-            }
+            Kind::Gate => gate_kind(line.data.as_ref()?),
             Kind::System => {
                 let d = line.data.as_ref()?;
                 match d.get("event").and_then(Value::as_str) {
-                    Some("admin_notify") => EntryKind::Notify {
-                        level: serde_json::from_value(
-                            d.get("level").cloned().unwrap_or(Value::Null),
-                        )
-                        .unwrap_or(NotifyLevel::Fyi),
-                        subject: line.subject.clone().unwrap_or_default(),
-                        // The line's own `to` is the ping's audience
-                        // (always admin); what it is ABOUT rides the data
-                        // object beside the level.
-                        pane_id: opt_str(d, "pane_id"),
-                        to: opt_str(d, "to"),
-                        deliveries: ping_deliveries(d),
-                    },
+                    // The line's own `to` is the ping's audience (always
+                    // admin); what it is ABOUT rides the data object beside
+                    // the level.
+                    Some("admin_notify") => {
+                        notify_kind(d, line.subject.clone().unwrap_or_default())
+                    }
                     Some("attach") => EntryKind::Session {
                         name: str_of(d, "session"),
                         text: "attached".into(),
