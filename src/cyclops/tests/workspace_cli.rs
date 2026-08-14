@@ -75,6 +75,31 @@ fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+/// `cyclops` with the OS home relocated to scratch, for the vendor-wiring
+/// tests: the writes behind install consent resolve ~/.claude and
+/// ~/.codex from $HOME, so pointing HOME at a directory this test owns is
+/// what keeps them off the real one. CODEX_HOME is scrubbed because it
+/// overrides that resolution, and CYCLOPS_NO_VENDOR_HOOKS because a
+/// developer who set it would change what these tests assert.
+fn cyclops_in_user_home(home: &Path, user: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
+    let mut argv: Vec<&str> = args.to_vec();
+    if args.first() == Some(&"start") && !args.contains(&"--setup-only") {
+        argv.push("--no-daemon");
+    }
+    Command::new(env!("CARGO_BIN_EXE_cyclops"))
+        .env("CYCLOPS_HOME", home)
+        .env("HOME", user)
+        .env("NO_COLOR", "1")
+        .env_remove("CYCLOPS_THEME")
+        .env_remove("TMUX")
+        .env_remove("CODEX_HOME")
+        .env_remove("CYCLOPS_NO_VENDOR_HOOKS")
+        .envs(env.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+        .args(&argv)
+        .output()
+        .expect("run cyclops")
+}
+
 /// Panes of a session in position order, as tmux reports them.
 fn panes(t: &TmuxServer, session: &str) -> Vec<(String, u32, u32)> {
     let out = t.run(&[
@@ -378,6 +403,164 @@ fn setup_only_refreshes_receipted_hook_configs_after_a_bin_move() {
     assert!(!again.contains("refreshed"), "{again}");
 
     let _ = fs::remove_dir_all(&home);
+}
+
+/// `--wire-hooks` consent becomes a file, and only actual consent does:
+/// neither a bare `--setup-only` nor a declined (`CYCLOPS_NO_VENDOR_HOOKS`)
+/// install may leave a marker that later boots would act on.
+#[test]
+fn wire_hooks_consent_is_recorded_only_when_given() {
+    let home = scratch_home("ws-consent");
+    let user = scratch_home("ws-consent-user");
+    let marker = home.join("vendor-wiring-consented");
+
+    // No flag: nobody consented to vendor-home writes.
+    let out = cyclops_in_user_home(&home, &user, &[], &["start", "--setup-only"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(!marker.exists(), "a bare setup recorded consent");
+
+    // The flag, declined by the env: declined means declined, durably too.
+    let out = cyclops_in_user_home(
+        &home,
+        &user,
+        &[("CYCLOPS_NO_VENDOR_HOOKS", "1")],
+        &["start", "--setup-only", "--wire-hooks"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert!(!marker.exists(), "a declined install recorded consent");
+
+    // The flag alone: recorded, and no vendor dir invented to go with it.
+    let out = cyclops_in_user_home(
+        &home,
+        &user,
+        &[],
+        &["start", "--setup-only", "--wire-hooks"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert!(marker.is_file(), "consent was not recorded");
+    assert!(
+        !user.join(".claude").exists(),
+        "setup invented a vendor home"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&user);
+}
+
+/// The install-order gap: cyclops installed before the agent CLIs used to
+/// wire nothing and never retry, because the consent lived only in the
+/// installer's one run. With the marker on file, an ordinary boot
+/// finishes the job the day the CLI appears — and says so, once.
+#[test]
+fn a_boot_finishes_the_wiring_for_agent_clis_that_appear_after_install() {
+    if !tmux_available() {
+        return;
+    }
+    let t = TmuxServer::new("ws-deferred");
+    let home = scratch_home("ws-deferred");
+    let user = scratch_home("ws-deferred-user");
+    write_config(
+        &home,
+        &t,
+        "sessions = [\"solo\"]\ndefault_workspace = \"solo\"\n",
+    );
+
+    // Install with consent, before any agent CLI exists: the marker
+    // lands, nothing else does.
+    let out = cyclops_in_user_home(
+        &home,
+        &user,
+        &[],
+        &["start", "--setup-only", "--wire-hooks"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert!(home.join("vendor-wiring-consented").is_file());
+    assert!(!user.join(".claude").exists());
+
+    // A boot with no vendor in sight writes nothing and says nothing.
+    let out = cyclops_in_user_home(&home, &user, &[], &["start"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(!stdout(&out).contains("appeared since install"), "{out:?}");
+    assert!(!user.join(".claude").exists(), "a boot invented ~/.claude");
+
+    // Claude Code and codex arrive (their dot-directories appear).
+    fs::create_dir_all(user.join(".claude")).expect("create .claude");
+    fs::create_dir_all(user.join(".codex")).expect("create .codex");
+
+    // CYCLOPS_NO_VENDOR_HOOKS still declines, consent on file or not.
+    let out = cyclops_in_user_home(
+        &home,
+        &user,
+        &[("CYCLOPS_NO_VENDOR_HOOKS", "1")],
+        &["start"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        !user.join(".claude/skills").exists() && !user.join(".codex/hooks.json").exists(),
+        "the decline env did not decline"
+    );
+
+    // The next ordinary boot completes the install's wiring and says so.
+    let out = cyclops_in_user_home(&home, &user, &[], &["start"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = stdout(&out);
+    assert!(
+        user.join(".claude/skills/cyclops/SKILL.md").is_file(),
+        "the skill never landed: {text}"
+    );
+    assert!(
+        user.join(".codex/hooks.json").is_file(),
+        "codex hooks never landed: {text}"
+    );
+    assert!(
+        text.contains("Claude Code appeared since install — placed the cyclops skill at"),
+        "{text}"
+    );
+    assert!(
+        text.contains("codex appeared since install — wired cyclops hooks in"),
+        "{text}"
+    );
+
+    // Steady state is silent: everything is current, nothing to say.
+    let again = stdout(&cyclops_in_user_home(&home, &user, &[], &["start"]));
+    assert!(!again.contains("appeared since install"), "{again}");
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&user);
+}
+
+/// Without the marker, a boot must never look at a vendor home: presence
+/// of ~/.claude is not consent, and `cyclops start` predates the marker
+/// on plenty of machines.
+#[test]
+fn no_consent_means_a_boot_never_touches_vendor_homes() {
+    if !tmux_available() {
+        return;
+    }
+    let t = TmuxServer::new("ws-noconsent");
+    let home = scratch_home("ws-noconsent");
+    let user = scratch_home("ws-noconsent-user");
+    write_config(
+        &home,
+        &t,
+        "sessions = [\"solo\"]\ndefault_workspace = \"solo\"\n",
+    );
+    fs::create_dir_all(user.join(".claude")).expect("create .claude");
+    fs::create_dir_all(user.join(".codex")).expect("create .codex");
+
+    let out = cyclops_in_user_home(&home, &user, &[], &["start"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        !user.join(".claude/skills").exists(),
+        "a boot without consent wrote the skill"
+    );
+    assert!(
+        !user.join(".codex/hooks.json").exists(),
+        "a boot without consent wired codex"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&user);
 }
 
 /// The `tmux attach` step follows where you are, not what this run built.

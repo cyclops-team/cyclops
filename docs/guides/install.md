@@ -34,11 +34,13 @@ builds both binaries, puts them where your shell looks, writes the config
 and detection manifests, proves the result runs, and removes the clone.
 It never uses sudo.
 
-The build step dominates the install time: it is a full release compile
-of a Rust workspace, a few minutes on a fast machine and noticeably
-longer on older or low-power hardware. That cost returns on `cyclops
-update`, which rebuilds the same way. Prebuilt binaries are not published
-yet.
+The build step dominates the install time: an optimized compile of the
+two binaries and their dependencies, a few minutes on a fast machine and
+noticeably longer on older or low-power hardware. The installer builds
+the `dist` profile — release optimizations without the link-time
+optimization pass, which would add minutes for runtime margin this tool
+does not need. That cost returns on `cyclops update`, which rebuilds the
+same way. Prebuilt binaries are not published yet.
 
 To inspect the installer before running it, clone the repository instead:
 
@@ -164,6 +166,15 @@ Claude Code at `~/.claude/skills/cyclops/SKILL.md` so agents there know
 the cyclops verbs without being taught by hand. Both steps run only for
 CLIs whose directory already exists, never overwrite a file you edited,
 and are skipped entirely when `CYCLOPS_NO_VENDOR_HOOKS` is set.
+
+That consent outlives the run that gave it. `--wire-hooks` records it at
+`~/.cyclops/vendor-wiring-consented`, and every later `cyclops` or
+`cyclops start` finishes the wiring for an agent CLI that was not there
+yet — install cyclops before Claude Code and the skill still lands on
+the first start after Claude Code arrives, with a line saying what was
+placed. A boot that finds nothing new writes nothing and says nothing.
+Delete the marker file to withdraw the consent; `CYCLOPS_NO_VENDOR_HOOKS`
+declines the step for one run without deleting anything.
 
 The long way, by hand. Create `~/.cyclops/config.toml`:
 

@@ -265,6 +265,11 @@ struct StartArgs {
     /// of this edits the real ~/.codex from inside a test run.
     /// CYCLOPS_NO_VENDOR_HOOKS=1 declines it for an install that wants
     /// nothing of the sort.
+    ///
+    /// The consent is recorded ($CYCLOPS_HOME/vendor-wiring-consented), so
+    /// an agent CLI installed after cyclops still gets wired: the next
+    /// ordinary `cyclops` or `cyclops start` finishes the job. Delete the
+    /// marker to withdraw that.
     #[arg(long, requires = "setup_only")]
     wire_hooks: bool,
     /// Do not start cyclopsd. For running the daemon under your own
@@ -583,6 +588,13 @@ fn seed_home_for_workspace() {
         eprintln!("{}", manifests::nothing_installed(&seeded));
     } else if !seeded.problems.is_empty() {
         eprintln!("{}", manifests::partly_installed(&seeded));
+    }
+    // The vendor homes too, when the installer's consent is on file: an
+    // agent CLI installed after cyclops gets its skill and hook config on
+    // this boot instead of never. Quiet unless something was written, so
+    // the front door stays silent on every ordinary open.
+    for note in workspace::finish_deferred_wiring(&home) {
+        eprintln!("{note}");
     }
 }
 
