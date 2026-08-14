@@ -25,9 +25,10 @@ gate_hold_notify_ms = 120000
 
 [workspace]
 sidebar_visible = true
-sidebar_width = 22
-sidebar_tab = "sessions"
+sidebar_width = 24
+files_rows = 8
 tab_bar_visible = true
+motion = true
 workspace_order = ["main"]
 agent_order = ["name:implementer", "name:reviewer"]
 folder_tracked = []
@@ -46,12 +47,13 @@ folder_tracked = []
 | `chrome` | `"on"` or `"off"`; controls Cyclops-owned tmux border decoration. |
 | Delivery timing keys | ACK, receipt, and held-delivery notification settings; `delivery_retry_max` retries only failures proven before any payload bytes reach the pane. |
 
-The full-screen workspace maintains `[workspace]` preferences, including
-the sidebar's visibility, width, and selected tab (`"sessions"` or
-`"stream"`), whether the tab bar shows, plus the persisted workspace and
-agent order. It
-also records which workspaces follow their active pane's folder in
-`folder_tracked`, and preserves unknown keys when it writes preferences.
+The full-screen workspace maintains `[workspace]` preferences: the
+sidebar's visibility and width, how many rows its file panel gets
+(`files_rows`), whether the tab bar shows, whether chrome fades between
+states (`motion`), the persisted workspace and agent order, which
+workspaces follow their active pane's folder (`folder_tracked`), and
+where the pinned file browser points (`files_pinned_root`). Unknown keys
+are preserved when it writes preferences.
 
 ## Runtime files
 

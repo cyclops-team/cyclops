@@ -73,6 +73,12 @@ Your configuration, manifests, workspaces, and ledger remain under
 `~/.cyclops`. Running the install command again does the same rebuild
 without the freshness check.
 
+The first `cyclops start` on the new build also repairs the prepared
+hook configs under `~/.cyclops/hooks/`: any that still invoke the
+replaced binary are re-rendered and a note says how many. Files you
+edited, or copies you merged into an agent CLI's own config, are named
+and left alone.
+
 ## Uninstall
 
 From a clone:
