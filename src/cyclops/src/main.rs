@@ -815,6 +815,43 @@ fn connect() -> Result<Client, i32> {
     }
 }
 
+/// Ask the daemon `method` and decode the reply with `decode`. `Ok(None)`
+/// means `--json` already printed the raw answer and the caller returns
+/// 0; `Err(code)` means the failure was already printed and the caller
+/// returns `code`.
+///
+/// `decode` is always `serde_json::from_value`, passed in rather than
+/// called here because naming the `DeserializeOwned` bound would need a
+/// direct serde dependency this crate does not otherwise have; the call
+/// site's `let x: T` supplies the concrete type instead.
+fn ask<T>(
+    c: &mut Client,
+    method: &str,
+    params: Value,
+    json: bool,
+    asked: Option<&str>,
+    decode: fn(Value) -> serde_json::Result<T>,
+) -> Result<Option<T>, i32> {
+    let result = match c.request(method, params) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}", copy::client_error(&e, asked));
+            return Err(1);
+        }
+    };
+    if json {
+        println!("{result}");
+        return Ok(None);
+    }
+    match decode(result) {
+        Ok(v) => Ok(Some(v)),
+        Err(_) => {
+            eprintln!("{}", copy::UNREADABLE_ANSWER);
+            Err(1)
+        }
+    }
+}
+
 /// `status` params for a surface that SHOWS the eye.
 ///
 /// Half the rule is the open-delivery backlog, and the daemon folds it
@@ -830,23 +867,17 @@ fn eye_status_params() -> Value {
 }
 
 fn cmd_status(c: &mut Client, cli: &Cli, style: &Style) -> i32 {
-    let result = match c.request("status", eye_status_params()) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("{}", copy::client_error(&e, None));
-            return 1;
-        }
-    };
-    if cli.json {
-        println!("{result}");
-        return 0;
-    }
-    let status: StatusResult = match serde_json::from_value(result) {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("{}", copy::UNREADABLE_ANSWER);
-            return 1;
-        }
+    let status: StatusResult = match ask(
+        c,
+        "status",
+        eye_status_params(),
+        cli.json,
+        None,
+        serde_json::from_value,
+    ) {
+        Ok(Some(s)) => s,
+        Ok(None) => return 0,
+        Err(code) => return code,
     };
     let config = cyclops_proto::cyclops_home().join("config.toml");
     println!("{}", render::render_status(&status, style, &config));
@@ -890,23 +921,17 @@ fn cmd_daemon(cli: &Cli, style: &Style, cmd: &DaemonCmd) -> i32 {
                     return 0;
                 }
             };
-            let result = match client.request("status", json!({})) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("{}", copy::client_error(&e, None));
-                    return 1;
-                }
-            };
-            if cli.json {
-                println!("{result}");
-                return 0;
-            }
-            let status: StatusResult = match serde_json::from_value(result) {
-                Ok(s) => s,
-                Err(_) => {
-                    eprintln!("{}", copy::UNREADABLE_ANSWER);
-                    return 1;
-                }
+            let status: StatusResult = match ask(
+                &mut client,
+                "status",
+                json!({}),
+                cli.json,
+                None,
+                serde_json::from_value,
+            ) {
+                Ok(Some(s)) => s,
+                Ok(None) => return 0,
+                Err(code) => return code,
             };
             println!("{}", render::daemon_running(&status, style));
             println!("  {}", style.dim(&format!("log: {}", log.display())));
@@ -1167,23 +1192,17 @@ fn cmd_read(
         include_raw: raw,
     })
     .expect("pane.read params serialize");
-    let result = match c.request("pane.read", params) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("{}", copy::client_error(&e, Some(target)));
-            return 1;
-        }
-    };
-    if cli.json {
-        println!("{result}");
-        return 0;
-    }
-    let read: PaneReadResult = match serde_json::from_value(result) {
-        Ok(r) => r,
-        Err(_) => {
-            eprintln!("{}", copy::UNREADABLE_ANSWER);
-            return 1;
-        }
+    let read: PaneReadResult = match ask(
+        c,
+        "pane.read",
+        params,
+        cli.json,
+        Some(target),
+        serde_json::from_value,
+    ) {
+        Ok(Some(r)) => r,
+        Ok(None) => return 0,
+        Err(code) => return code,
     };
     if let Some(det) = &read.detection {
         println!(
@@ -1417,23 +1436,17 @@ fn cmd_history(c: &mut Client, cli: &Cli, style: &Style, args: &HistoryArgs) -> 
         cursor: args.cursor,
     })
     .expect("msg.history params serialize");
-    let result = match c.request("msg.history", params) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("{}", copy::client_error(&e, None));
-            return 1;
-        }
-    };
-    if cli.json {
-        println!("{result}");
-        return 0;
-    }
-    let history: HistoryResult = match serde_json::from_value(result) {
-        Ok(h) => h,
-        Err(_) => {
-            eprintln!("{}", copy::UNREADABLE_ANSWER);
-            return 1;
-        }
+    let history: HistoryResult = match ask(
+        c,
+        "msg.history",
+        params,
+        cli.json,
+        None,
+        serde_json::from_value,
+    ) {
+        Ok(Some(h)) => h,
+        Ok(None) => return 0,
+        Err(code) => return code,
     };
     if history.lines.is_empty() {
         // Empty states invite the next action. Name the filtered agent when
@@ -1452,23 +1465,17 @@ fn cmd_history(c: &mut Client, cli: &Cli, style: &Style, args: &HistoryArgs) -> 
 
 /// One thread: the message, its replies, and each delivery's current badge.
 fn cmd_thread(c: &mut Client, cli: &Cli, style: &Style, id: &str) -> i32 {
-    let result = match c.request("msg.thread", json!({"id": id})) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("{}", copy::client_error(&e, None));
-            return 1;
-        }
-    };
-    if cli.json {
-        println!("{result}");
-        return 0;
-    }
-    let thread: ThreadResult = match serde_json::from_value(result) {
-        Ok(t) => t,
-        Err(_) => {
-            eprintln!("{}", copy::UNREADABLE_ANSWER);
-            return 1;
-        }
+    let thread: ThreadResult = match ask(
+        c,
+        "msg.thread",
+        json!({"id": id}),
+        cli.json,
+        None,
+        serde_json::from_value,
+    ) {
+        Ok(Some(t)) => t,
+        Ok(None) => return 0,
+        Err(code) => return code,
     };
     println!(
         "{}",
