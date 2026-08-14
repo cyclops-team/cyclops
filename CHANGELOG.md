@@ -5,6 +5,17 @@ versions are unreleased until admin cuts a tag.
 
 ## [Unreleased]
 
+### Fixed
+
+- `cyclops start` now actually refreshes the prepared hook configs, the
+  repair `cyclops hooks install` has promised since receipts existed.
+  The refresh machinery was built and tested but never called: after an
+  update moved the binary, every receipted artifact kept invoking the
+  old path and its hooks failed silently. Setup now re-renders receipted
+  artifacts whose recorded binary is gone, prints what it changed, and
+  still never touches an edited file, an unreceipted file, or a copy
+  merged into vendor config (those are named instead).
+
 ### Added (v7)
 
 - The installer installs Rust itself. Cyclops builds from source, and

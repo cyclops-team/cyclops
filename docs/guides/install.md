@@ -448,6 +448,15 @@ executing the replaced binary until you take the three steps, and
 stopping a daemon under an open workspace mid-session is not the
 update's call to make.
 
+That `cyclops start` also repairs the prepared hook configs under
+`~/.cyclops/hooks/`: any that still invoke a cyclops path that no longer
+exists are re-rendered for the new build and a note says how many. The
+receipt recorded beside each artifact is how start tells its own writing
+from yours — a file you edited, or one with no receipt, is named and left
+alone. A copy you already merged into vendor config is out of reach the
+same way; the note names it so the hooks that would otherwise fail
+silently point somewhere you can fix.
+
 `CYCLOPS_REPO` and `CYCLOPS_REF` pick the source, exactly as they do for
 the installer; the defaults are the public repository's `main`. A build
 from edited sources (`--version` ends in `.dirty`) or from outside git

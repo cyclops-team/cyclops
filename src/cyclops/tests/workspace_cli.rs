@@ -310,6 +310,76 @@ fn setup_only_writes_the_home_and_opens_nothing() {
     let _ = fs::remove_dir_all(&home);
 }
 
+/// FNV-1a 64, hex. Restated here rather than reached for: the fixture
+/// below must hash exactly as the receipt writer does, and hashing it
+/// independently is what makes the assertion say so.
+fn fnv64(data: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in data {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// A receipted hook config naming a binary that no longer exists is what
+/// an update leaves behind, and the receipt's whole promise — printed by
+/// `cyclops hooks install` — is that the next start repairs it.
+/// hooks_cli.rs pins what the receipt records; this pins the wiring:
+/// setup actually runs the refresh and says what it did.
+#[test]
+fn setup_only_refreshes_receipted_hook_configs_after_a_bin_move() {
+    let home = scratch_home("ws-refresh");
+    let out = cyclops(&home, &["hooks", "install", "codex", "--agent", "reviewer"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let dir = home.join("hooks/codex/reviewer");
+    let artifact = dir.join("hooks.json");
+    let receipt_path = dir.join(".cyclops-prepared.json");
+    let current_bin = env!("CARGO_BIN_EXE_cyclops");
+    let content = fs::read_to_string(&artifact).expect("installed artifact");
+    assert!(content.contains(current_bin), "{content}");
+
+    // Rewind to the install an update orphaned: artifact and receipt both
+    // name a binary that is gone. The path is scratch-unique, so no file
+    // outside this home can accidentally contain it.
+    let old_bin = home.join("gone-build/cyclops");
+    let old_bin = old_bin.to_str().expect("utf-8 scratch path");
+    let stale = content.replace(current_bin, old_bin);
+    fs::write(&artifact, &stale).expect("write stale artifact");
+    let mut receipt: Value =
+        serde_json::from_str(&fs::read_to_string(&receipt_path).expect("receipt"))
+            .expect("receipt is JSON");
+    receipt["bin"] = json!(old_bin);
+    receipt["rendered_fnv"] = json!(fnv64(stale.as_bytes()));
+    fs::write(&receipt_path, format!("{receipt}\n")).expect("write stale receipt");
+
+    let out = cyclops(&home, &["start", "--setup-only"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = stdout(&out);
+    let refreshed = fs::read_to_string(&artifact).expect("refreshed artifact");
+    assert!(
+        refreshed.contains(current_bin),
+        "the artifact must run this build again: {refreshed}"
+    );
+    assert!(!refreshed.contains(old_bin), "{refreshed}");
+    assert!(text.contains("refreshed 1 prepared hook config"), "{text}");
+    assert!(text.contains("they now run this build"), "{text}");
+    // The repaired receipt is what keeps the NEXT refresh honest.
+    let receipt: Value = serde_json::from_str(&fs::read_to_string(&receipt_path).expect("receipt"))
+        .expect("receipt is JSON");
+    assert_eq!(receipt["bin"], current_bin);
+
+    // A second run finds everything current and says nothing about hooks.
+    let again = stdout(&cyclops(&home, &["start", "--setup-only"]));
+    assert!(!again.contains("refreshed"), "{again}");
+
+    let _ = fs::remove_dir_all(&home);
+}
+
 /// The `tmux attach` step follows where you are, not what this run built.
 ///
 /// It used to appear only when `start` created the session, which dropped

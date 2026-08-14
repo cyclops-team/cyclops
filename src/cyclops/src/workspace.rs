@@ -1068,6 +1068,13 @@ fn prepare_home(
             notes.push(crate::manifests::partly_installed(&seeded));
         }
     }
+
+    // 4. The prepared hook configs, every run. An update moves the
+    //    binary, and every receipted artifact still naming the old path
+    //    reports to nothing until it is re-rendered; this is the repair
+    //    the receipt beside each artifact was recorded to allow
+    //    (crate::hookset::refresh). Quiet when everything is current.
+    notes.extend(crate::hookset::refresh(home).notes());
     Ok((notes, seeded))
 }
 

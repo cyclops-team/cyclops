@@ -671,9 +671,6 @@ pub struct Refreshed {
 /// What this does NOT do: repair a copy the operator already merged into
 /// vendor config. Cyclops never wrote that file and does not know where it
 /// went, so a prefix move names it instead ([`wired_copies_holding`]).
-// The call site is workspace.rs `prepare_home`, which is not in this
-// change's file set. Delete this allow in the commit that adds it.
-#[allow(dead_code)]
 pub fn refresh(home: &Path) -> Refreshed {
     let mut out = Refreshed {
         root: home.join("hooks"),
@@ -839,8 +836,6 @@ impl Refreshed {
     /// Empty when nothing happened. Every entry here is something that
     /// changed or something the operator has to act on; a note repeated
     /// every run trains the reader to skip the run that mattered.
-    // Same pending call site as `refresh`.
-    #[allow(dead_code)]
     pub fn notes(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         if !self.rewritten.is_empty() {
