@@ -41,7 +41,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, error, warn};
 
-use crate::{fusion, unix_ms, Inner};
+use crate::{daemon_line, fusion, unix_ms, Inner};
 
 /// Delivery gives up on evidence this long after submit (spec: neither ACK
 /// tier within 5s goes to retry_queued).
@@ -339,23 +339,18 @@ fn emit_delivery_state(
     record: &Delivery,
 ) -> Option<u64> {
     let line = LedgerLine {
-        seq: 0,
-        boot_id: String::new(),
-        id: msg_id.to_string(),
-        ts: 0,
-        kind: Kind::State,
-        from: "cyclopsd".to_string(),
         to: vec![to.to_string()],
-        subject: None,
-        body: None,
-        reply_to: None,
         deliveries: vec![record.clone()],
-        data: Some(json!({
-            "to": to,
-            "from": from,
-            "to_state": next,
-            "cause": cause,
-        })),
+        ..daemon_line(
+            Kind::State,
+            msg_id.to_string(),
+            json!({
+                "to": to,
+                "from": from,
+                "to_state": next,
+                "cause": cause,
+            }),
+        )
     };
     // Every session file carrying this delivery's msg line gets the state
     // line too; a per-session ledger is a complete stream on its own.
@@ -465,23 +460,17 @@ fn gate_line(
     cause: Option<&str>,
 ) {
     let line = LedgerLine {
-        seq: 0,
-        boot_id: String::new(),
-        id: handle.msg_id.clone(),
-        ts: 0,
-        kind: Kind::Gate,
-        from: "cyclopsd".to_string(),
         to: vec![handle.to.clone()],
-        subject: None,
-        body: None,
-        reply_to: None,
-        deliveries: Vec::new(),
-        data: Some(json!({
-            "to": handle.to,
-            "action": action,
-            "rule": rule,
-            "cause": cause,
-        })),
+        ..daemon_line(
+            Kind::Gate,
+            handle.msg_id.clone(),
+            json!({
+                "to": handle.to,
+                "action": action,
+                "rule": rule,
+                "cause": cause,
+            }),
+        )
     };
     let seq = inner.append_line(handle.session_idx, line);
     inner.emit(
@@ -605,12 +594,6 @@ pub(crate) fn admin_notify(
         v
     };
     let line = LedgerLine {
-        seq: 0,
-        boot_id: String::new(),
-        id: id.clone(),
-        ts: 0,
-        kind: Kind::System,
-        from: "cyclopsd".to_string(),
         to: vec!["admin".to_string()],
         subject: Some(subject.to_string()),
         body: if body.is_empty() {
@@ -618,9 +601,11 @@ pub(crate) fn admin_notify(
         } else {
             Some(body.to_string())
         },
-        reply_to: None,
-        deliveries: Vec::new(),
-        data: Some(with_about(json!({"event": "admin_notify", "level": level}))),
+        ..daemon_line(
+            Kind::System,
+            id.clone(),
+            with_about(json!({"event": "admin_notify", "level": level})),
+        )
     };
     let sessions: Vec<usize> = match session_idx {
         Some(i) => vec![i],

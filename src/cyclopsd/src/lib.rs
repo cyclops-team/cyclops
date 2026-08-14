@@ -257,6 +257,31 @@ pub(crate) struct DetEntry {
     pub(crate) since: std::time::Instant,
 }
 
+/// A ledger line the daemon itself is authoring, not relaying for an agent.
+/// `seq`, `boot_id`, and `ts` are placeholders here on purpose: the ledger
+/// writer fills all three in at append time (`cyclops-ledger`), so a value
+/// set here would just be discarded. `from` is always "cyclopsd" — every
+/// caller of this constructor is the daemon reporting on itself (state
+/// changes, boot/attach/detach/rename facts, gate/delivery-state lines,
+/// self-test results), never a message on an agent's behalf. Callers that
+/// need `to`, `subject`, `body`, or `deliveries` set those on the result.
+pub(crate) fn daemon_line(kind: Kind, id: String, data: Value) -> LedgerLine {
+    LedgerLine {
+        seq: 0,
+        boot_id: String::new(),
+        id,
+        ts: 0,
+        kind,
+        from: "cyclopsd".to_string(),
+        to: Vec::new(),
+        subject: None,
+        body: None,
+        reply_to: None,
+        deliveries: Vec::new(),
+        data: Some(data),
+    }
+}
+
 impl Inner {
     /// The slot at `idx`, if one exists. Locks, clones the `Arc`, releases:
     /// safe to call right before an `.await`.
@@ -321,19 +346,10 @@ impl Inner {
             .unwrap_or_else(|| pane_id.to_string());
         let seq = self.append_line(
             session_idx,
-            LedgerLine {
-                seq: 0,
-                boot_id: String::new(),
-                id: self.mint_event_id(),
-                ts: 0,
-                kind: Kind::State,
-                from: "cyclopsd".to_string(),
-                to: Vec::new(),
-                subject: None,
-                body: None,
-                reply_to: None,
-                deliveries: Vec::new(),
-                data: Some(json!({
+            daemon_line(
+                Kind::State,
+                self.mint_event_id(),
+                json!({
                     "pane_id": pane_id,
                     "target": target,
                     "state": det.state,
@@ -341,8 +357,8 @@ impl Inner {
                     "disagreement": det.disagreement,
                     "decided_by": det.decided_by,
                     "cause": cause,
-                })),
-            },
+                }),
+            ),
         );
         self.emit(
             "state",
@@ -735,25 +751,16 @@ pub(crate) async fn label_pane(
     // 5. Record.
     let seq = inner.append_line(
         session_idx,
-        LedgerLine {
-            seq: 0,
-            boot_id: String::new(),
-            id: inner.mint_event_id(),
-            ts: 0,
-            kind: Kind::System,
-            from: "cyclopsd".to_string(),
-            to: Vec::new(),
-            subject: None,
-            body: None,
-            reply_to: None,
-            deliveries: Vec::new(),
-            data: Some(json!({
+        daemon_line(
+            Kind::System,
+            inner.mint_event_id(),
+            json!({
                 "event": "pane_labeled",
                 "pane_id": pane_id,
                 "label": label,
                 "manifest": manifest,
-            })),
-        },
+            }),
+        ),
     );
     inner.emit(
         "session",
@@ -1201,25 +1208,16 @@ pub(crate) async fn reload_theme(inner: &Arc<Inner>) -> String {
 /// these to every configured session; [`watch_session`] appends the same
 /// line to a session that joins afterwards.
 fn boot_fact_line(inner: &Inner, manifest_ids: &[String], session: &str) -> LedgerLine {
-    LedgerLine {
-        seq: 0,
-        boot_id: String::new(),
-        id: inner.mint_event_id(),
-        ts: 0,
-        kind: Kind::System,
-        from: "cyclopsd".to_string(),
-        to: Vec::new(),
-        subject: None,
-        body: None,
-        reply_to: None,
-        deliveries: Vec::new(),
-        data: Some(json!({
+    daemon_line(
+        Kind::System,
+        inner.mint_event_id(),
+        json!({
             "event": "boot",
             "tmux_version": inner.tmux_version,
             "manifests": manifest_ids,
             "session": session,
-        })),
-    }
+        }),
+    )
 }
 
 /// Boot the daemon: probe tmux, load manifests, bind the socket, spawn one
@@ -1715,23 +1713,14 @@ fn session_lifecycle(inner: &Arc<Inner>, idx: usize, attached: bool) {
         .name();
     let seq = inner.append_line(
         idx,
-        LedgerLine {
-            seq: 0,
-            boot_id: String::new(),
-            id: inner.mint_event_id(),
-            ts: 0,
-            kind: Kind::System,
-            from: "cyclopsd".to_string(),
-            to: Vec::new(),
-            subject: None,
-            body: None,
-            reply_to: None,
-            deliveries: Vec::new(),
-            data: Some(json!({
+        daemon_line(
+            Kind::System,
+            inner.mint_event_id(),
+            json!({
                 "event": if attached { "attach" } else { "detach" },
                 "session": name,
-            })),
-        },
+            }),
+        ),
     );
     inner.emit("session", json!({"name": name, "attached": attached}), seq);
 }
@@ -1779,24 +1768,15 @@ fn rename_session_slot(inner: &Arc<Inner>, idx: usize, new_name: String) {
     info!(old_name = %old_name, new_name = %new_name, "session renamed; daemon slot now follows tmux");
     inner.append_line(
         idx,
-        LedgerLine {
-            seq: 0,
-            boot_id: String::new(),
-            id: inner.mint_event_id(),
-            ts: 0,
-            kind: Kind::System,
-            from: "cyclopsd".to_string(),
-            to: Vec::new(),
-            subject: None,
-            body: None,
-            reply_to: None,
-            deliveries: Vec::new(),
-            data: Some(json!({
+        daemon_line(
+            Kind::System,
+            inner.mint_event_id(),
+            json!({
                 "event": "renamed",
                 "old_name": old_name,
                 "new_name": new_name,
-            })),
-        },
+            }),
+        ),
     );
 }
 

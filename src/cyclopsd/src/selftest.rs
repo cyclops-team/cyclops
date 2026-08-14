@@ -32,7 +32,7 @@ use cyclops_proto::{
 use serde_json::{json, Value};
 use tokio::time::{Duration, Instant};
 
-use crate::{ack, delivery, unix_ms, Inner};
+use crate::{ack, daemon_line, delivery, unix_ms, Inner};
 
 /// Default and ceiling for how long hooks.selftest waits for its delivery
 /// to resolve. The happy path resolves inside the receipt block; this only
@@ -419,23 +419,17 @@ pub(crate) async fn selftest(
     inner.append_line(
         session_idx,
         LedgerLine {
-            seq: 0,
-            boot_id: String::new(),
-            id: msg_id,
-            ts: 0,
-            kind: Kind::System,
-            from: "cyclopsd".to_string(),
             to: vec![params.target],
-            subject: None,
-            body: None,
-            reply_to: None,
-            deliveries: Vec::new(),
-            data: Some(json!({
-                "event": "hook_selftest",
-                "tier": tier,
-                "state": state,
-                "hook_ack": hook_ack,
-            })),
+            ..daemon_line(
+                Kind::System,
+                msg_id,
+                json!({
+                    "event": "hook_selftest",
+                    "tier": tier,
+                    "state": state,
+                    "hook_ack": hook_ack,
+                }),
+            )
         },
     );
     Ok(serde_json::to_value(result).expect("hooks.selftest result serializes"))
