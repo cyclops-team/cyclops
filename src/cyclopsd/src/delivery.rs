@@ -320,6 +320,69 @@ const PIPELINE_TRANSITIONS: &[(DeliveryState, DeliveryState)] = {
     ]
 };
 
+/// Write one delivery transition to the record: the `Kind::State` line in
+/// every named session ledger, then the matching `delivery-state` event.
+/// One writer for both the running pipeline ([`advance`]) and the restart
+/// closure ([`close_limbo`]): each used to build these by hand, and the
+/// restart event had already lost three fields (`verified_by`, `attempts`,
+/// `note`) the live one carried.
+#[allow(clippy::too_many_arguments)]
+fn emit_delivery_state(
+    inner: &Arc<Inner>,
+    sessions: &[usize],
+    msg_id: &str,
+    to: &str,
+    from: DeliveryState,
+    next: DeliveryState,
+    cause: Option<&str>,
+    note: Option<&str>,
+    record: &Delivery,
+) -> Option<u64> {
+    let line = LedgerLine {
+        seq: 0,
+        boot_id: String::new(),
+        id: msg_id.to_string(),
+        ts: 0,
+        kind: Kind::State,
+        from: "cyclopsd".to_string(),
+        to: vec![to.to_string()],
+        subject: None,
+        body: None,
+        reply_to: None,
+        deliveries: vec![record.clone()],
+        data: Some(json!({
+            "to": to,
+            "from": from,
+            "to_state": next,
+            "cause": cause,
+        })),
+    };
+    // Every session file carrying this delivery's msg line gets the state
+    // line too; a per-session ledger is a complete stream on its own.
+    let mut seq = None;
+    for idx in sessions {
+        let s = inner.append_line(*idx, line.clone());
+        if seq.is_none() {
+            seq = s;
+        }
+    }
+    inner.emit(
+        "delivery-state",
+        json!({
+            "id": msg_id,
+            "to": to,
+            "from": from,
+            "to_state": next,
+            "cause": cause,
+            "verified_by": record.verified_by,
+            "attempts": record.attempts,
+            "note": note,
+        }),
+        seq,
+    );
+    seq
+}
+
 /// Apply one transition if the delivery is still in an expected state.
 /// Returns false when a concurrent actor (ACK matcher vs worker timeout)
 /// already moved it; the caller treats that as "someone else resolved it".
@@ -374,47 +437,16 @@ fn advance(
             },
         )
     };
-    let line = LedgerLine {
-        seq: 0,
-        boot_id: String::new(),
-        id: handle.msg_id.clone(),
-        ts: 0,
-        kind: Kind::State,
-        from: "cyclopsd".to_string(),
-        to: vec![handle.to.clone()],
-        subject: None,
-        body: None,
-        reply_to: None,
-        deliveries: vec![record.clone()],
-        data: Some(json!({
-            "to": handle.to,
-            "from": from,
-            "to_state": step.next,
-            "cause": step.cause,
-        })),
-    };
-    // Every session file carrying this delivery's msg line gets the state
-    // line too; a per-session ledger is a complete stream on its own.
-    let mut seq = None;
-    for idx in &handle.ledger_sessions {
-        let s = inner.append_line(*idx, line.clone());
-        if seq.is_none() {
-            seq = s;
-        }
-    }
-    inner.emit(
-        "delivery-state",
-        json!({
-            "id": handle.msg_id,
-            "to": handle.to,
-            "from": from,
-            "to_state": step.next,
-            "cause": step.cause,
-            "verified_by": record.verified_by,
-            "attempts": record.attempts,
-            "note": step.note,
-        }),
-        seq,
+    emit_delivery_state(
+        inner,
+        &handle.ledger_sessions,
+        &handle.msg_id,
+        &handle.to,
+        from,
+        step.next,
+        step.cause,
+        step.note.as_deref(),
+        &record,
     );
     // send_replace, not send: watch::Sender::send drops the value when no
     // receiver exists, and receipt blocking subscribes late. A worker that
@@ -682,36 +714,16 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
                 ts: unix_ms(),
                 cause: Some("daemon_restart".to_string()),
             };
-            let line = LedgerLine {
-                seq: 0,
-                boot_id: String::new(),
-                id: id.clone(),
-                ts: 0,
-                kind: Kind::State,
-                from: "cyclopsd".to_string(),
-                to: vec![to.clone()],
-                subject: None,
-                body: None,
-                reply_to: None,
-                deliveries: vec![record],
-                data: Some(json!({
-                    "to": to,
-                    "from": state,
-                    "to_state": DeliveryState::AttentionRequired,
-                    "cause": "daemon_restart",
-                })),
-            };
-            let seq = inner.append_line(*idx, line);
-            inner.emit(
-                "delivery-state",
-                json!({
-                    "id": id,
-                    "to": to,
-                    "from": state,
-                    "to_state": DeliveryState::AttentionRequired,
-                    "cause": "daemon_restart",
-                }),
-                seq,
+            emit_delivery_state(
+                inner,
+                &[*idx],
+                &id,
+                &to,
+                state,
+                DeliveryState::AttentionRequired,
+                Some("daemon_restart"),
+                None,
+                &record,
             );
             closed.push(format!("{id} -> {to}"));
             named.push(DeliveryRef {
