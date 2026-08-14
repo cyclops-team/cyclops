@@ -37,11 +37,12 @@ to them the way you'd talk to a teammate: "send this to reviewer and ask
 for a review." An agent that knows the verbs turns that into a handoff
 through the `cyclops` CLI itself, and the workspace shows the receipt.
 
-That "knows the verbs" part is a manual step today: the repo ships an agent
-skill at `skills/cyclops/SKILL.md` that teaches an agent the `cyclops`
-verbs, but nothing installs it for you. Copy it to wherever your agent
-reads instructions from — for Claude Code, that's
-`~/.claude/skills/cyclops/SKILL.md`.
+That "knows the verbs" part comes with the install: the agent skill at
+`skills/cyclops/SKILL.md` teaches an agent the `cyclops` verbs, and the
+installer's setup step places it for Claude Code at
+`~/.claude/skills/cyclops/SKILL.md` when Claude Code is present. A copy
+you edited is never overwritten. Using a different agent? Copy the file
+to wherever that agent reads instructions from.
 
 ## Next steps
 

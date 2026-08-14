@@ -120,6 +120,12 @@ pub struct HydrationSnapshot {
     /// *primary* screen as it was when the TUI took over. It is what the
     /// user sees again after the TUI exits, never the TUI itself (F38).
     pub saved_primary: Option<Vec<u8>>,
+    /// Plain scrollback above the visible screen, oldest first, joined
+    /// with LF. Used only when the runtime has no local history of its
+    /// own (`PaneRuntime::hydrate`): a runtime meeting its pane for the
+    /// first time starts with tmux's transcript instead of a scrollback
+    /// wall at the attach moment.
+    pub history: Vec<u8>,
     pub cursor_x: u16,
     pub cursor_y: u16,
     pub alternate_on: bool,

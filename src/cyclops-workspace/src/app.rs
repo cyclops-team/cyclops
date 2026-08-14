@@ -56,7 +56,7 @@ use crate::render::{
     paint_tab_bar, paint_window,
 };
 use crate::resilience::{self, LinkState};
-use crate::selection::{self, Selection, SelectionState};
+use crate::selection::{self, SelectionState};
 use crate::sync::{fetch_workspace_model, hydrate_visible_tab};
 use crate::term_guard::TermGuard;
 use crate::theme::Paint;
@@ -100,6 +100,12 @@ enum AppMsg {
     Input(KeyEvent),
     Paste(String),
     Mouse(MouseEvent),
+    /// The terminal's focus moved onto (`true`) or off (`false`) the
+    /// workspace's tab. Drives the window background only: the theme's
+    /// ground is painted onto the terminal while the workspace is looked
+    /// at and handed back the moment it is not, so a shell in another tab
+    /// of the same window never wears the workspace's color.
+    Focus(bool),
     OutputBatch(Vec<(String, Vec<u8>)>),
     Redraw,
     Resized(u16, u16),
@@ -174,18 +180,33 @@ struct App {
     /// background. Compared each frame so the escape goes out on a theme
     /// change and on no other frame.
     window_bg: Option<(u8, u8, u8)>,
+    /// Whether the terminal's focus is on the workspace. While it is not,
+    /// the draw path leaves the terminal's own background alone
+    /// (`AppMsg::Focus` hands it back), so a frame drawn for pane output
+    /// arriving in an unfocused tab cannot re-paint the operator's
+    /// terminal behind their back. Starts `true`: focus reporting only
+    /// speaks on changes, and a workspace is launched by someone looking
+    /// at it.
+    window_focused: bool,
     /// Panes collapsed to their title bar, mapped to the height each had
     /// before. Not persisted: a minimized pane is where you left the
     /// furniture this afternoon, not a preference, and restoring one on
     /// launch would hide a pane an operator has no memory of collapsing.
     minimized: std::collections::HashMap<String, u16>,
     reconnect_attempt: usize,
+    /// One-shot, set by the reconnect path: the next reconcile rehydrates
+    /// every visible pane instead of only size-stale ones, because a link
+    /// outage misses `%output` without moving any pane's size.
+    needs_forced_hydrate: bool,
     hit_map: HitMap,
     menu: MenuState,
     /// Mouse cell, tracked while a menu or dialog is open so its rows can
     /// paint a hover highlight.
     hover: Option<(u16, u16)>,
     selection: SelectionState,
+    /// Cmd+A's one-key arm: the next delete clears the focused pane's
+    /// input line (`crate::input::SelectAll`).
+    select_all: crate::input::SelectAll,
     drag: Option<DragState>,
     /// The one transient message slot (`crate::notice`). Its deadline
     /// joins the loop's deadline set below, so a notice clears itself on
@@ -211,6 +232,12 @@ struct App {
     /// first time that probe answers, and then only where the operator
     /// walks it.
     files: crate::files::FileTree,
+    /// The pinned browser. `files` above follows the focused agent's
+    /// folder; this one stays wherever the operator last browsed it and
+    /// remembers that across restarts (`prefs.files_pinned_root`).
+    files_pinned: crate::files::FileTree,
+    /// Which of the two the panel is showing.
+    files_view: crate::files::FilesView,
     /// When the file tree is next re-read. `None` while nothing is armed;
     /// see [`arm_files_probe`], which is what keeps this off the clock when
     /// the panel is not on screen.
@@ -397,7 +424,12 @@ pub async fn run_async() -> i32 {
             Ok(Event::Resize(w, h)) => {
                 let _ = input_tx.send(AppMsg::Resized(w, h));
             }
-            Ok(_) => {}
+            Ok(Event::FocusGained) => {
+                let _ = input_tx.send(AppMsg::Focus(true));
+            }
+            Ok(Event::FocusLost) => {
+                let _ = input_tx.send(AppMsg::Focus(false));
+            }
             Err(_) => break,
         }
     });
@@ -523,7 +555,10 @@ pub async fn run_async() -> i32 {
         paused_panes: HashSet::new(),
         minimized: std::collections::HashMap::new(),
         window_bg: None,
+        window_focused: true,
+        select_all: crate::input::SelectAll::default(),
         reconnect_attempt: 0,
+        needs_forced_hydrate: false,
         hit_map: HitMap::default(),
         menu: MenuState::None,
         hover: None,
@@ -539,6 +574,14 @@ pub async fn run_async() -> i32 {
         watched_sessions: HashSet::new(),
         sidebar_tab: prefs.sidebar_tab,
         files: crate::files::FileTree::new(),
+        files_pinned: {
+            let mut pinned = crate::files::FileTree::new();
+            if let Some(root) = &prefs.files_pinned_root {
+                pinned.reroot(root.clone());
+            }
+            pinned
+        },
+        files_view: crate::files::FilesView::default(),
         files_probe_at: None,
         files_root_pending: true,
         record: cyclops_ui::Record::new(),
@@ -621,7 +664,7 @@ pub async fn run_async() -> i32 {
                 // it are gone, and a highlight nobody cleared reads as
                 // state the pane is still in.
                 if notice_expired {
-                    app.selection.clear();
+                    clear_selection(&mut app);
                 }
                 // Retire finished fades and arm the next frame. Before the
                 // draw below so a motion frame and a render deadline that
@@ -1146,6 +1189,9 @@ async fn handle_reconnect(
             app.declared_client_size = None;
             app.pinned_windows.clear();
             resize_client(app, client).await;
+            // The gap this flag exists for: %output missed while the link
+            // was down, with no size change to mark any pane stale.
+            app.needs_forced_hydrate = true;
             reconcile(app, client).await?;
             app.link_state = LinkState::Live;
             app.reconnect_attempt = 0;
@@ -1304,6 +1350,23 @@ impl App {
 
     fn is_visible_pane(&self, pane: &str) -> bool {
         pane_is_visible(self.model.active_tab(), pane)
+    }
+
+    /// The file browser the panel is showing. Everything the operator does
+    /// to "the file panel" — clicks, keys, the wheel, painting — goes
+    /// through these two, so a view switch swaps all of it at once.
+    fn files_tree(&self) -> &crate::files::FileTree {
+        match self.files_view {
+            crate::files::FilesView::Agent => &self.files,
+            crate::files::FilesView::Pinned => &self.files_pinned,
+        }
+    }
+
+    fn files_tree_mut(&mut self) -> &mut crate::files::FileTree {
+        match self.files_view {
+            crate::files::FilesView::Agent => &mut self.files,
+            crate::files::FilesView::Pinned => &mut self.files_pinned,
+        }
     }
 
     fn chrome(&self, area: Rect) -> crate::render::ChromeAreas {
@@ -1484,6 +1547,22 @@ async fn handle_app_msg(
             arm(debounce);
         }
         AppMsg::Redraw => arm(debounce),
+        AppMsg::Focus(focused) => {
+            app.window_focused = focused;
+            if focused {
+                // Forget what the terminal was last told so the next draw
+                // re-emits the theme's ground even though it has not
+                // changed since focus left.
+                app.window_bg = None;
+                arm(debounce);
+            } else {
+                // Immediately, not on a frame: an unfocused workspace may
+                // not draw again until something happens in it, and the
+                // operator is looking at their own shell right now.
+                crate::term_guard::yield_window_background();
+                app.window_bg = None;
+            }
+        }
         AppMsg::Resized(w, h) => {
             app.term_size = (w, h);
             app.hit_map.clear();
@@ -1695,10 +1774,10 @@ async fn handle_app_msg(
             }
             if crate::input::escape_cancels_visual_state(
                 key.code,
-                app.selection.active.is_some(),
+                app.selection.active_pane().is_some(),
                 app.drag.is_some(),
             ) {
-                app.selection.cancel_drag();
+                clear_selection(app);
                 cancel_drag(app);
                 // Escape belongs to the chrome operation it just cancelled;
                 // do not leak it into the child TUI as a second action.
@@ -1833,8 +1912,22 @@ async fn handle_mouse(
     }
     match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            if app.menu.is_open() || app.selection.is_dragging() {
+            if app.menu.is_open() {
                 return Ok(());
+            }
+            // Mid-drag, the wheel stays live over the pane being selected
+            // so a selection can grow past one screen: exec's local scroll
+            // moves the viewport and re-extends the selection under the
+            // pointer. Every other target stays inert until the button
+            // lifts, which is what the old whole-screen gate meant.
+            if let Some(dragging) = app.selection.dragging_pane().map(str::to_string) {
+                let over_dragging = matches!(
+                    app.hit_map.hit(col, row),
+                    Some(HitTarget::PaneBody { pane_id }) if *pane_id == dragging
+                );
+                if !over_dragging {
+                    return Ok(());
+                }
             }
             if let Some(target) = app.hit_map.hit(col, row).cloned() {
                 let direction = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
@@ -1860,7 +1953,8 @@ async fn handle_mouse(
                     } else {
                         3
                     };
-                    app.files.scroll_by(delta, files_panel_rows(app));
+                    let rows = files_panel_rows(app);
+                    app.files_tree_mut().scroll_by(delta, rows);
                     return Ok(());
                 }
                 // Only a `PaneBody` hit has a pane to resolve a cell
@@ -1925,7 +2019,7 @@ async fn handle_mouse(
         MouseEventKind::Down(MouseButton::Left) => {
             let Some(target) = app.hit_map.hit(col, row).cloned() else {
                 app.close_menu();
-                app.selection.clear();
+                clear_selection(app);
                 return Ok(());
             };
             match &target {
@@ -1954,25 +2048,44 @@ async fn handle_mouse(
                         pane_id: pane_id.clone(),
                     };
                     let clicks = app.selection.register_click(&hit, col, row);
-                    if let Some(geom) = app.hit_map.pane_geometry(&pane_id) {
-                        if let Some(cell) = crate::input::mouse::HitMap::cell_at(geom, col, row) {
-                            match clicks {
-                                2 => {
-                                    if let Some(rt) = app.runtimes.get(&pane_id) {
-                                        let row_text = rt.row_text(cell.row);
-                                        app.selection.set_word(pane_id.clone(), cell, &row_text);
-                                    }
-                                    copy_active_selection(app);
+                    // Copied out so the hit-map borrow ends before the
+                    // arms below take `app` mutably.
+                    let picked = app.hit_map.pane_geometry(&pane_id).and_then(|geom| {
+                        crate::input::mouse::HitMap::cell_at(geom, col, row)
+                            .map(|cell| (cell, geom.inner.width))
+                    });
+                    if let Some((cell, width)) = picked {
+                        match clicks {
+                            2 => {
+                                clear_selection(app);
+                                if let Some(rt) = app.runtimes.get_mut(&pane_id) {
+                                    let row_text = rt.row_text(cell.row);
+                                    let (from, to) = crate::selection::word_range(&row_text, cell);
+                                    rt.anchor_selection(from, to);
+                                    app.selection.set_active(pane_id.clone());
                                 }
-                                3 => {
-                                    app.selection.set_line(
-                                        pane_id.clone(),
-                                        cell.row,
-                                        geom.inner.width,
+                                copy_active_selection(app);
+                            }
+                            3 => {
+                                clear_selection(app);
+                                if let Some(rt) = app.runtimes.get_mut(&pane_id) {
+                                    rt.anchor_selection(
+                                        crate::runtime::CellPos {
+                                            col: 0,
+                                            row: cell.row,
+                                        },
+                                        crate::runtime::CellPos {
+                                            col: width.saturating_sub(1),
+                                            row: cell.row,
+                                        },
                                     );
-                                    copy_active_selection(app);
+                                    app.selection.set_active(pane_id.clone());
                                 }
-                                _ => app.selection.press(pane_id.clone(), cell),
+                                copy_active_selection(app);
+                            }
+                            _ => {
+                                clear_selection(app);
+                                app.selection.press(pane_id.clone(), cell);
                             }
                         }
                     }
@@ -1982,7 +2095,7 @@ async fn handle_mouse(
                     // lives on the corner grip, so the seam cells a frame
                     // shares with a sibling stay resize handles.
                     app.close_menu();
-                    app.selection.clear();
+                    clear_selection(app);
                     // Except that a pane's top border is also the seam
                     // between it and the pane above, and the title strip
                     // painted along it had taken the whole row: a stacked
@@ -2017,7 +2130,7 @@ async fn handle_mouse(
                 }
                 HitTarget::PaneGrip { pane_id } => {
                     app.close_menu();
-                    app.selection.clear();
+                    clear_selection(app);
                     // Down on the grip starts a possible swap drag; a
                     // below-threshold release focuses the pane, same as a
                     // frame click. The body is untouched; dragging there
@@ -2035,7 +2148,7 @@ async fn handle_mouse(
                     app.close_menu();
                 }
                 HitTarget::Divider { pane_id, dir } => {
-                    app.selection.clear();
+                    clear_selection(app);
                     app.drag = Some(DragState::on_down(
                         DragTarget::Divider {
                             pane_id: pane_id.clone(),
@@ -2052,7 +2165,7 @@ async fn handle_mouse(
                 }
                 HitTarget::Tab { window_id } => {
                     app.close_menu();
-                    app.selection.clear();
+                    clear_selection(app);
                     // Down starts a possible reorder drag; a below-threshold
                     // release selects the tab instead.
                     app.drag = Some(DragState::on_down(
@@ -2077,7 +2190,7 @@ async fn handle_mouse(
                     session,
                 } => {
                     app.close_menu();
-                    app.selection.clear();
+                    clear_selection(app);
                     app.drag = Some(DragState::on_down(
                         DragTarget::Workspace {
                             session_id: session_id.clone(),
@@ -2098,7 +2211,7 @@ async fn handle_mouse(
                     order_key,
                 } => {
                     app.close_menu();
-                    app.selection.clear();
+                    clear_selection(app);
                     app.drag = Some(DragState::on_down(
                         DragTarget::Agent {
                             workspace_id: workspace_id.clone(),
@@ -2112,40 +2225,65 @@ async fn handle_mouse(
                 }
                 HitTarget::SidebarDivider => {
                     app.close_menu();
-                    app.selection.clear();
+                    clear_selection(app);
                     app.drag = Some(DragState::on_down(DragTarget::Sidebar, col, row));
                     return Ok(());
                 }
                 HitTarget::SidebarSplit => {
                     app.close_menu();
-                    app.selection.clear();
+                    clear_selection(app);
                     app.drag = Some(DragState::on_down(DragTarget::SidebarSplit, col, row));
                     return Ok(());
                 }
                 HitTarget::FileUp => {
                     app.close_menu();
-                    if let Some(parent) = app.files.parent() {
-                        app.files.reroot(parent);
+                    if let Some(parent) = app.files_tree().parent() {
+                        app.files_tree_mut().reroot(parent);
+                        remember_pinned_root(app);
                     }
                     return Ok(());
                 }
                 HitTarget::FileRoot => {
                     app.close_menu();
-                    // Back to where the work is. Asking the pane where it
-                    // is costs a tmux round trip, so this only records the
-                    // request; the loop's next pass arms the probe that
-                    // answers it.
-                    app.files_root_pending = true;
+                    match app.files_view {
+                        // Back to where the work is. Asking the pane where
+                        // it is costs a tmux round trip, so this only
+                        // records the request; the loop's next pass arms
+                        // the probe that answers it.
+                        crate::files::FilesView::Agent => app.files_root_pending = true,
+                        // Back to the folder the operator pinned. Saved
+                        // state, no probe to wait for.
+                        crate::files::FilesView::Pinned => {
+                            if let Some(root) = app.prefs.files_pinned_root.clone() {
+                                app.files_pinned.reroot(root);
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                HitTarget::FilesViewToggle => {
+                    app.close_menu();
+                    // The outgoing view surrenders the keyboard: its
+                    // cursor would otherwise sit armed and silently
+                    // swallow bare keys the moment the operator toggles
+                    // back, a mode nobody re-entered on purpose.
+                    app.files_tree_mut().release_cursor();
+                    app.files_view = app.files_view.other();
+                    // The probe follows the panel; a fresh view may need
+                    // its first root or a refresh right away.
+                    arm_files_probe(app);
                     return Ok(());
                 }
                 HitTarget::FileBack => {
                     app.close_menu();
-                    app.files.go_back();
+                    app.files_tree_mut().go_back();
+                    remember_pinned_root(app);
                     return Ok(());
                 }
                 HitTarget::FileForward => {
                     app.close_menu();
-                    app.files.go_forward();
+                    app.files_tree_mut().go_forward();
+                    remember_pinned_root(app);
                     return Ok(());
                 }
                 // The chevron column: open the folder where it sits, which
@@ -2153,7 +2291,7 @@ async fn handle_mouse(
                 HitTarget::FileDisclosure { path } => {
                     app.close_menu();
                     let path = std::path::PathBuf::from(path.clone());
-                    app.files.toggle(&path);
+                    app.files_tree_mut().toggle(&path);
                     return Ok(());
                 }
                 // The rest of a folder's row walks into it. The panel is
@@ -2162,7 +2300,8 @@ async fn handle_mouse(
                 HitTarget::FileRow { path, is_dir, .. } if *is_dir => {
                     app.close_menu();
                     let path = std::path::PathBuf::from(path.clone());
-                    app.files.reroot(path);
+                    app.files_tree_mut().reroot(path);
+                    remember_pinned_root(app);
                     return Ok(());
                 }
                 HitTarget::FileRow { reference, .. } => {
@@ -2212,7 +2351,19 @@ async fn handle_mouse(
             } else if let Some(anchor) = app.selection.anchor_pane().map(str::to_string) {
                 if let Some(geom) = app.hit_map.pane_geometry(&anchor) {
                     if let Some(cell) = crate::input::mouse::HitMap::cell_at(geom, col, row) {
-                        app.selection.drag_to(&anchor, cell);
+                        let step = app.selection.drag_to(&anchor, cell);
+                        if let Some(rt) = app.runtimes.get_mut(&anchor) {
+                            match step {
+                                crate::selection::DragStep::Begin { start, now } => {
+                                    rt.begin_selection(start);
+                                    rt.extend_selection(now);
+                                }
+                                crate::selection::DragStep::Extend { now } => {
+                                    rt.extend_selection(now);
+                                }
+                                crate::selection::DragStep::None => {}
+                            }
+                        }
                     }
                 }
             }
@@ -2253,8 +2404,8 @@ async fn handle_mouse(
                     apply_outcome(app, outcome);
                 }
             } else if app.selection.is_dragging() {
-                if let Some(sel) = app.selection.finish_drag() {
-                    copy_selection(app, &sel);
+                if let Some(pane) = app.selection.finish_drag() {
+                    copy_selection(app, &pane);
                 }
             } else {
                 let _ = app.selection.finish_drag();
@@ -2355,39 +2506,41 @@ async fn handle_files_key(
         // selection or a chrome drag, so those are cleared on the way in
         // (see `Action::FocusFiles`) and Esc has one owner at a time.
         KeyCode::Esc => {
-            app.files.release_cursor();
+            app.files_tree_mut().release_cursor();
             Ok(Some(InputOutcome::Redraw))
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            app.files.move_cursor(-1);
+            app.files_tree_mut().move_cursor(-1);
             Ok(Some(InputOutcome::Redraw))
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            app.files.move_cursor(1);
+            app.files_tree_mut().move_cursor(1);
             Ok(Some(InputOutcome::Redraw))
         }
         // Left climbs out, right walks in: the two directions the panel
         // already navigates by mouse, on the keys that mean them.
         KeyCode::Left | KeyCode::Char('h') => {
-            if let Some(parent) = app.files.parent() {
-                app.files.reroot(parent);
+            if let Some(parent) = app.files_tree().parent() {
+                app.files_tree_mut().reroot(parent);
+                remember_pinned_root(app);
             }
             Ok(Some(InputOutcome::Redraw))
         }
         KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
-            let Some(row) = app.files.cursor_row() else {
+            let Some(row) = app.files_tree().cursor_row() else {
                 return Ok(Some(InputOutcome::Redraw));
             };
             match row.kind {
                 crate::files::RowKind::Dir { .. } => {
                     let path = row.path.clone();
-                    app.files.reroot(path);
+                    app.files_tree_mut().reroot(path);
+                    remember_pinned_root(app);
                     Ok(Some(InputOutcome::Redraw))
                 }
                 crate::files::RowKind::File => {
                     // Same act the mouse performs, through the same
                     // action, so the two devices cannot drift apart.
-                    let reference = app.files.reference(&row.path.clone());
+                    let reference = app.files_tree().reference(&row.path.clone());
                     let outcome =
                         exec::execute(app, client, action::Action::InsertFileRef { reference })
                             .await?;
@@ -2536,10 +2689,10 @@ fn agent_order_for_workspace(app: &App, workspace_id: &str) -> Vec<String> {
 }
 
 fn copy_active_selection(app: &mut App) {
-    let Some(sel) = app.selection.active.clone() else {
+    let Some(pane) = app.selection.active_pane().map(str::to_string) else {
         return;
     };
-    copy_selection(app, &sel);
+    copy_selection(app, &pane);
 }
 
 /// Copy one finished selection: take the text, write the clipboard, say
@@ -2552,20 +2705,38 @@ fn copy_active_selection(app: &mut App) {
 /// halves either side of the write are what tests drive
 /// ([`selection_text`] and [`announce_copy`]), rather than a test putting
 /// its fixture on the machine's real clipboard.
-fn copy_selection(app: &mut App, sel: &Selection) {
-    let Some(text) = selection_text(app, sel) else {
+fn copy_selection(app: &mut App, pane_id: &str) {
+    let Some(text) = selection_text(app, pane_id) else {
+        // An empty pick posts no notice, and the notice's expiry is what
+        // normally clears the highlight state. Left active with nothing
+        // to expire it, that state would eat the operator's next Escape,
+        // which for an agent pane is an interrupt that never lands.
+        clear_selection(app);
         return;
     };
     selection::copy_to_clipboard(&text);
     announce_copy(app, &text);
 }
 
-/// The text a finished selection takes. `None` when the pane is gone or
+/// The text a pane's selection takes. `None` when the pane is gone or
 /// the pick came back empty. An empty pick copies nothing, so it must not
 /// claim to have copied anything either.
-fn selection_text(app: &mut App, sel: &Selection) -> Option<String> {
-    let runtime = app.runtimes.get_mut(&sel.pane_id)?;
-    selection::SelectionState::extract(runtime, sel).filter(|text| !text.is_empty())
+fn selection_text(app: &mut App, pane_id: &str) -> Option<String> {
+    let runtime = app.runtimes.get(pane_id)?;
+    selection::SelectionState::extract(runtime).filter(|text| !text.is_empty())
+}
+
+/// Forget the selection everywhere it lives: this state machine and the
+/// owning pane's runtime, whose engine holds the geometry. Every clear
+/// goes through here, because state cleared without the runtime leaves a
+/// highlight nothing owns and no later event unpaints.
+fn clear_selection(app: &mut App) {
+    if let Some(pane) = app.selection.take_active() {
+        if let Some(rt) = app.runtimes.get_mut(&pane) {
+            rt.clear_selection();
+        }
+    }
+    app.selection.clear();
 }
 
 /// Say what a copy took, on the notice line.
@@ -2674,7 +2845,7 @@ fn arm_files_probe(app: &mut App) {
     }
 }
 
-/// Re-read the file panel, and root it first if that is still owed.
+/// Re-read the file panel, and keep the agent view where the agent is.
 ///
 /// Returns whether anything a reader would see moved, which is the only
 /// thing that earns a redraw. Nothing here is fatal: a tmux probe that
@@ -2682,23 +2853,58 @@ fn arm_files_probe(app: &mut App) {
 /// folder simply lists as empty.
 async fn probe_files(app: &mut App, client: &ControlClient) -> bool {
     let mut changed = false;
-    if app.files_root_pending {
-        let pane = app.model.active_tab().active_pane.clone();
-        if let Ok(cwd) = client.display(&pane, "#{pane_current_path}").await {
-            let cwd = cwd.trim();
-            if !cwd.is_empty() {
+    let pane = app.model.active_tab().active_pane.clone();
+    if let Ok(cwd) = client.display(&pane, "#{pane_current_path}").await {
+        let cwd = cwd.trim();
+        if !cwd.is_empty() {
+            // The agent view follows the agent. An answer that differs
+            // from the anchor means the agent itself moved — focus changed
+            // panes, or the pane cd'd — and the view goes where it went.
+            // An answer matching the anchor is the agent standing still,
+            // so browsing the operator did inside the view is left alone.
+            // (A cd has no tmux notification to subscribe to; this rides
+            // the same once-a-second probe the panel already runs.)
+            let moved = app.files.anchor() != std::path::Path::new(cwd);
+            if app.files_root_pending || moved {
                 app.files_root_pending = false;
                 let before = app.files.root().to_path_buf();
-                // Both, and only here. The anchor is what references are
-                // written from, so it follows the pane rather than the
-                // browsing that happens after this.
+                // Anchor and root together, and only here: the anchor is
+                // what references are written from, so it follows the pane
+                // rather than the browsing that happens after this.
                 app.files.anchor_at(cwd);
                 app.files.reroot(cwd);
                 changed |= app.files.root() != before;
             }
+            // References from the pinned view are sent to the same agent,
+            // so its anchor tracks the same folder. Its ROOT does not: the
+            // one exception is a pinned view that has never been anywhere,
+            // which starts at the agent's folder so it is browsable at all
+            // (browsing it afterwards is what pins it, and what persists:
+            // `remember_pinned_root`).
+            app.files_pinned.anchor_at(cwd);
+            if !app.files_pinned.has_root() {
+                app.files_pinned.reroot(cwd);
+            }
         }
     }
-    changed | app.files.refresh()
+    changed | app.files_tree_mut().refresh()
+}
+
+/// A browse in the pinned view is what "pin it" means: the folder the
+/// operator lands on becomes the saved pinned root. Called after every
+/// user navigation; the agent view saves nothing (following is its whole
+/// contract), and an unchanged root writes nothing.
+fn remember_pinned_root(app: &mut App) {
+    if app.files_view != crate::files::FilesView::Pinned || !app.files_pinned.has_root() {
+        return;
+    }
+    let root = Some(app.files_pinned.root().to_string_lossy().into_owned());
+    if app.prefs.files_pinned_root != root {
+        app.prefs.files_pinned_root = root;
+        if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
+            log_err(&app.home, &error);
+        }
+    }
 }
 
 /// Arm one delayed folder probe, if the active workspace follows its folder
@@ -2917,7 +3123,21 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
     )
     .await;
     resize_client(app, client).await;
-    hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await;
+    // Forced only when continuity was actually lost: a control-mode
+    // reconnect missed %output while the layout stood still, so the size
+    // check would leave same-sized panes showing stale content and stale
+    // VT modes until something resized them (the scroll bug an operator
+    // could only fix by resizing). Every OTHER reconcile keeps the size
+    // gate — this path also runs on %window-renamed, which tmux's
+    // automatic-rename fires for every command a shell pane runs, and a
+    // forced hydrate there would snap scrolled viewports to the tail once
+    // a second.
+    if std::mem::take(&mut app.needs_forced_hydrate) {
+        crate::sync::hydrate_visible_tab_forced(client, app.model.active_tab(), &mut app.runtimes)
+            .await;
+    } else {
+        hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await;
+    }
     app.needs_hydrate = false;
     Ok(())
 }
@@ -3039,7 +3259,7 @@ async fn handle_key(
     // prefix could not detach, could not switch tabs, and could not
     // collapse the very panel the cursor sits in, which makes it a trap
     // rather than a mode.
-    if app.files.cursor().is_some() && !is_prefix_key(&key) && !app.router.prefix_armed() {
+    if app.files_tree().cursor().is_some() && !is_prefix_key(&key) && !app.router.prefix_armed() {
         if let Some(outcome) = handle_files_key(app, client, key).await? {
             return Ok(outcome);
         }
@@ -3080,6 +3300,16 @@ async fn handle_key(
         }
         RouterResult::PassThrough(key) => {
             let pane = app.model.active_tab().active_pane.clone();
+            match app.select_all.on_key(&pane, &key) {
+                crate::input::SelectAllOutcome::Armed => return Ok(InputOutcome::NoRedraw),
+                crate::input::SelectAllOutcome::ClearLine => {
+                    // Cursor to end first, so kill-to-start takes the
+                    // whole line no matter where the cursor sat.
+                    client.send_keys_unconfirmed(&pane, &["C-e", "C-u"]).await?;
+                    return Ok(InputOutcome::NoRedraw);
+                }
+                crate::input::SelectAllOutcome::Forward => {}
+            }
             let encoded = encode_send_keys(&key);
             if !encoded.is_empty() {
                 let keys: Vec<&str> = encoded.iter().map(String::as_str).collect();
@@ -3104,7 +3334,7 @@ async fn handle_dialog_key(
         DialogKeyAction::Cancel => {
             dialog_cancel(app);
             if key.code == crossterm::event::KeyCode::Esc {
-                app.selection.cancel_drag();
+                clear_selection(app);
                 cancel_drag(app);
             }
         }
@@ -3187,8 +3417,12 @@ fn draw(
     // three of them: boot, the ThemeWatch reload, and the picker's live
     // preview. One comparison catches all three and emits nothing on the
     // frames between.
+    // Only while focus is here: a frame drawn for output arriving in an
+    // unfocused tab must not restyle the terminal the operator is using
+    // for something else (`AppMsg::Focus` hands the color back on leave
+    // and clears `window_bg` so return reapplies it).
     let ground = app.paint.chrome_ground_rgb();
-    if ground != app.window_bg {
+    if app.window_focused && ground != app.window_bg {
         if let Some(rgb) = ground {
             crate::term_guard::apply_window_background(rgb);
         }
@@ -3214,7 +3448,11 @@ fn draw(
                     &app.prefs.agent_order,
                     app.sidebar_tab,
                     &app.record,
-                    &mut app.files,
+                    match app.files_view {
+                        crate::files::FilesView::Agent => &mut app.files,
+                        crate::files::FilesView::Pinned => &mut app.files_pinned,
+                    },
+                    app.files_view,
                     app.prefs.files_rows,
                     sidebar,
                     f.buffer_mut(),
@@ -3250,7 +3488,7 @@ fn draw(
                 paused: &app.paused_panes,
                 hits: &mut app.hit_map,
                 decoration: &app.decoration,
-                selection: app.selection.active.as_ref(),
+                selection: app.selection.active_pane(),
                 drag: app.drag.as_ref(),
                 notice: app.notice.text(),
                 minimized: &app.minimized,
@@ -3439,7 +3677,10 @@ mod tests {
             paused_panes: HashSet::new(),
             minimized: std::collections::HashMap::new(),
             window_bg: None,
+            window_focused: true,
+            select_all: crate::input::SelectAll::default(),
             reconnect_attempt: 0,
+            needs_forced_hydrate: false,
             hit_map: HitMap::default(),
             menu: MenuState::None,
             hover: None,
@@ -3453,6 +3694,8 @@ mod tests {
             watched_sessions: HashSet::new(),
             sidebar_tab: SidebarTab::default(),
             files: crate::files::FileTree::new(),
+            files_pinned: crate::files::FileTree::new(),
+            files_view: crate::files::FilesView::default(),
             files_probe_at: None,
             files_root_pending: true,
             record: cyclops_ui::Record::new(),
@@ -4425,10 +4668,15 @@ mod tests {
 ",
         );
         app.runtimes.insert("%0".into(), runtime);
-        app.selection.set_line("%0".into(), 0, 20);
-        let sel = app.selection.active.clone().expect("a line is selected");
+        if let Some(rt) = app.runtimes.get_mut("%0") {
+            rt.anchor_selection(
+                crate::runtime::CellPos { col: 0, row: 0 },
+                crate::runtime::CellPos { col: 19, row: 0 },
+            );
+        }
+        app.selection.set_active("%0".into());
 
-        let text = selection_text(&mut app, &sel).expect("the row has text");
+        let text = selection_text(&mut app, "%0").expect("the row has text");
         assert_eq!(text.trim_end(), "cargo test");
         announce_copy(&mut app, &text);
 
@@ -4462,11 +4710,16 @@ mod tests {
         );
         app.runtimes
             .insert("%0".into(), crate::runtime::PaneRuntime::new(20, 3));
-        app.selection.set_line("%0".into(), 0, 20);
-        let sel = app.selection.active.clone().expect("a line is selected");
+        if let Some(rt) = app.runtimes.get_mut("%0") {
+            rt.anchor_selection(
+                crate::runtime::CellPos { col: 0, row: 0 },
+                crate::runtime::CellPos { col: 19, row: 0 },
+            );
+        }
+        app.selection.set_active("%0".into());
 
-        assert_eq!(selection_text(&mut app, &sel), None);
-        copy_selection(&mut app, &sel);
+        assert_eq!(selection_text(&mut app, "%0"), None);
+        copy_selection(&mut app, "%0");
         assert_eq!(app.notice.text(), None);
         assert_eq!(app.notice.deadline(), None);
     }

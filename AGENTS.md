@@ -32,7 +32,9 @@ fact to an NDJSON ledger. A generated knowledge base with diagrams lives at
 
 ## The gates a change must pass
 
-Same five core checks, in order (full detail: [CONTRIBUTING.md](CONTRIBUTING.md)):
+Same five core checks, in order (full detail: [CONTRIBUTING.md](CONTRIBUTING.md)).
+`./scripts/check.sh` runs them all, cheapest first; `--fast` stops after
+the test suite.
 
 ```bash
 cargo fmt --all

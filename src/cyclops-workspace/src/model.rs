@@ -51,8 +51,34 @@ pub struct SessionModel {
 }
 
 impl SessionModel {
+    /// The tab everything renders and routes against.
+    ///
+    /// Total, not indexed: `active_tab` can go stale between a
+    /// `%window-close` and the reconcile that repairs it, and this getter
+    /// sits on the `%output` hot path (`is_visible_pane`), so one closing
+    /// window in a churning session must not take the workspace down. A
+    /// stale index answers with the last tab, and an empty list (a
+    /// session snapshot caught mid-teardown) answers with a blank
+    /// placeholder tab; either paints wrong for at most one frame before
+    /// reconcile lands, which beats both panics.
     pub fn active_tab(&self) -> &TabModel {
-        &self.tabs[self.active_tab]
+        static EMPTY: std::sync::LazyLock<TabModel> = std::sync::LazyLock::new(|| TabModel {
+            window_id: String::new(),
+            name: String::new(),
+            layout: crate::layout::ResolvedLayout::Leaf {
+                pane_id: String::new(),
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            },
+            active_pane: String::new(),
+            zoomed: false,
+        });
+        self.tabs
+            .get(self.active_tab)
+            .or_else(|| self.tabs.last())
+            .unwrap_or(&EMPTY)
     }
 }
 

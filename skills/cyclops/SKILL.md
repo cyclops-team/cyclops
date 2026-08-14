@@ -33,7 +33,7 @@ matches `$TMUX_PANE`, if you are inside tmux. The plain roster prints
 labels, not pane ids. If you are running
 without a name, `cyclops name <label> --self` registers you using the pane
 you are sitting in — the form to use for yourself, since it needs no pane
-id lookup. Full detail: [../../docs/guides/panes.md](../../docs/guides/panes.md).
+id lookup. Full detail: [docs/guides/panes.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/panes.md).
 
 ## 1. Discover peers and inspect state
 
@@ -93,11 +93,11 @@ pane is genuinely in that state."
 
 Every command above, and every command below, takes `--json` for scripts
 and honors `--plain`/`NO_COLOR`. See
-[../../docs/guides/panes.md](../../docs/guides/panes.md) for naming and the roster, and
-[../../docs/guides/troubleshooting.md](../../docs/guides/troubleshooting.md) if a pane
+[docs/guides/panes.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/panes.md) for naming and the roster, and
+[docs/guides/troubleshooting.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/troubleshooting.md) if a pane
 reads `? unknown` (no manifest matches what is running there — a shell,
 not an agent, or a CLI cyclops has not been taught; see
-[../../docs/reference/MANIFESTS.md](../../docs/reference/MANIFESTS.md)).
+[docs/reference/MANIFESTS.md](https://github.com/cyclops-team/cyclops/blob/main/docs/reference/MANIFESTS.md)).
 
 ## 2. Send a message and verify delivery
 
@@ -132,8 +132,8 @@ A late hook can upgrade `delivered_unverified` to `delivered_verified` —
 the only legal transition backwards into more confidence, never less. On a
 fresh install, before hooks are wired, every delivery is screen-tier —
 that is normal, not degraded. Full spec:
-[../../docs/development/DELIVERY.md](../../docs/development/DELIVERY.md);
-[../../docs/guides/send.md](../../docs/guides/send.md) for the rest of the badge
+[docs/development/DELIVERY.md](https://github.com/cyclops-team/cyclops/blob/main/docs/development/DELIVERY.md);
+[docs/guides/send.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/send.md) for the rest of the badge
 vocabulary (`queued`, `parked`, `needs attention`) and quota parking.
 
 <!-- F2: capture from a real run — a delivered_verified receipt needs a
@@ -199,7 +199,7 @@ $ cyclops thread m-d7e4ba
 `--fyi` messages (announcements) drop the reply-hint line — treat their
 absence of a hint as intentional, not as something to invent a reply to.
 `cyclops history --with <agent>` reconstructs a whole conversation, both
-directions: [../../docs/guides/history.md](../../docs/guides/history.md).
+directions: [docs/guides/history.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/history.md).
 
 ## 4. Wait for work
 
@@ -244,7 +244,7 @@ jq -e '.wait[0].outcome == "reached"' receipt.json > /dev/null   # this is the l
 
 `outcome` is one of `reached`, `timeout`, `occupant_changed`, or
 `not_delivered` (delivery never got far enough to start a turn — nothing
-to wait for). Full detail: [../../docs/guides/wait.md](../../docs/guides/wait.md).
+to wait for). Full detail: [docs/guides/wait.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/wait.md).
 
 <!-- F2: capture from a real run — a `--wait done` that actually reaches
      `reached` needs a real agent CLI to run a turn (working -> idle
@@ -282,7 +282,7 @@ Read the last state line first, then the gate lines above it. A stuck
 delivery is the same shape with the last line further back — held in
 `gating`, or moved to `retry_queued` — and the cause on that line tells
 you where to look next (cause table from
-[../../docs/development/HANDOFF.md](../../docs/development/HANDOFF.md)):
+[docs/development/HANDOFF.md](https://github.com/cyclops-team/cyclops/blob/main/docs/development/HANDOFF.md)):
 
 | Cause | It means | Look at |
 |---|---|---|
@@ -309,13 +309,13 @@ delivery itself. A delivery held past `gate_hold_notify_ms` (default
 If the daemon itself is confusing rather than the ledger, `cyclops read
 <agent> --source detection --raw` and `CYCLOPS_LOG=debug cyclopsd`
 (operator-run) are the next layer down:
-[../../docs/guides/troubleshooting.md](../../docs/guides/troubleshooting.md).
+[docs/guides/troubleshooting.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/troubleshooting.md).
 
 ## 6. Safety rules you must never work around
 
 These are invariants, not preferences — each one exists because breaking
 it already did something specific and bad
-([../../docs/development/INVARIANTS.md](../../docs/development/INVARIANTS.md) has the full list
+([docs/development/INVARIANTS.md](https://github.com/cyclops-team/cyclops/blob/main/docs/development/INVARIANTS.md) has the full list
 and the proof).
 
 - **Never bypass the delivery gate.** Do not `tmux send-keys` (or paste,
@@ -343,18 +343,20 @@ and the proof).
 
 ## Read more
 
-- [../../docs/development/DELIVERY.md](../../docs/development/DELIVERY.md) — the delivery spec:
+- [docs/development/DELIVERY.md](https://github.com/cyclops-team/cyclops/blob/main/docs/development/DELIVERY.md) — the delivery spec:
   states, evidence tiers, ordering.
-- [../../docs/reference/MANIFESTS.md](../../docs/reference/MANIFESTS.md) — teaching cyclops a
+- [docs/reference/MANIFESTS.md](https://github.com/cyclops-team/cyclops/blob/main/docs/reference/MANIFESTS.md) — teaching cyclops a
   new agent CLI (one TOML file, no code) when a pane reads `? unknown`.
-- [../../docs/guides/troubleshooting.md](../../docs/guides/troubleshooting.md) — real
+- [docs/guides/troubleshooting.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/troubleshooting.md) — real
   output for every common failure, with the fix.
-- [../../docs/guides/send.md](../../docs/guides/send.md), [../../docs/guides/wait.md](../../docs/guides/wait.md),
-  [../../docs/guides/history.md](../../docs/guides/history.md),
-  [../../docs/guides/panes.md](../../docs/guides/panes.md) — one page per verb.
+- [docs/guides/send.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/send.md), [docs/guides/wait.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/wait.md),
+  [docs/guides/history.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/history.md),
+  [docs/guides/panes.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/panes.md) — one page per verb.
 
-These doc paths follow the migrated repository layout (docs sorted into
-`guides/`, `reference/`, and `development/`). The three output blocks
+Doc links point at the repository on GitHub, so this file works from
+wherever it is installed (`cyclops start --setup-only --wire-hooks`
+copies it into `~/.claude/skills/cyclops/` when Claude Code is present;
+other agents get it copied by hand). The three output blocks
 above marked for F2 are externally blocked, not pending polish: each
 needs a live, hook-wired vendor CLI session (a verified-tier receipt, a
 wait that reaches `done`, a genuinely blocked ledger chain), and no

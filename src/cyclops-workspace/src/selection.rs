@@ -1,22 +1,36 @@
-//! Text selection state and clipboard export (memory-only; never logged).
+//! Text selection lifecycle and clipboard export (memory-only; never
+//! logged). The selection's geometry does not live here: the pane's VT
+//! engine owns it ([`PaneRuntime::begin_selection`] and friends), anchored
+//! to grid content so it stays on its text through scrolling and new
+//! output. What this module tracks is whose selection exists and what the
+//! mouse is in the middle of doing about it.
 
 use std::time::{Duration, Instant};
 
 use crate::input::mouse::HitTarget;
 use crate::runtime::{CellPos, PaneRuntime};
 
-/// Active selection in one pane body.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Selection {
-    pub pane_id: String,
-    pub from: CellPos,
-    pub to: CellPos,
+/// One step of a drag, for the caller to apply to the pane's runtime.
+/// Returned rather than applied here because the runtime lives in the
+/// registry, keyed by pane, and this state machine deliberately holds no
+/// reference into it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DragStep {
+    /// Not a selection drag (no press, or a different pane).
+    None,
+    /// The drag left its press cell: begin at the press cell, extend to
+    /// the current one.
+    Begin { start: CellPos, now: CellPos },
+    /// An in-flight drag moved.
+    Extend { now: CellPos },
 }
 
 /// Tracks click-drag selection and double/triple-click word/line picks.
 #[derive(Default)]
 pub struct SelectionState {
-    pub active: Option<Selection>,
+    /// The pane holding a live selection, while one exists. The geometry
+    /// is in that pane's runtime; this is who to ask and who to clear.
+    active: Option<String>,
     dragging: Option<(String, CellPos)>,
     /// Button-down cell waiting for movement. A press alone never selects;
     /// the selection starts on the first drag into a different cell.
@@ -34,16 +48,30 @@ struct ClickTracker {
 const CLICK_WINDOW: Duration = Duration::from_millis(400);
 
 impl SelectionState {
+    /// Forget the selection here. The caller clears the owning runtime's
+    /// geometry with what [`Self::take_active`] returns; state alone
+    /// cannot, and a highlight with no owner would never unpaint.
     pub fn clear(&mut self) {
         self.active = None;
         self.dragging = None;
         self.pending = None;
     }
 
-    pub fn cancel_drag(&mut self) {
+    /// The pane whose selection exists, surrendered for clearing.
+    pub fn take_active(&mut self) -> Option<String> {
+        self.active.take()
+    }
+
+    /// The pane whose selection exists (paint and copy read this).
+    pub fn active_pane(&self) -> Option<&str> {
+        self.active.as_deref()
+    }
+
+    /// A selection now exists in this pane (word/line picks and begun
+    /// drags both land here).
+    pub fn set_active(&mut self, pane_id: String) {
+        self.active = Some(pane_id);
         self.dragging = None;
-        self.active = None;
-        self.pending = None;
     }
 
     /// Button down inside a pane body: remember the cell, clear any old
@@ -54,20 +82,25 @@ impl SelectionState {
         self.pending = Some((pane_id, pos));
     }
 
-    /// Drag motion inside a pane body. Starts the selection once the drag
-    /// leaves the press cell; extends it afterwards.
-    pub fn drag_to(&mut self, pane_id: &str, pos: CellPos) {
-        if self.dragging.is_some() {
-            self.update_drag(pos);
-            return;
+    /// Drag motion inside a pane body. Reports the step for the caller to
+    /// apply to the pane's runtime: the selection starts once the drag
+    /// leaves the press cell and extends afterwards.
+    pub fn drag_to(&mut self, pane_id: &str, pos: CellPos) -> DragStep {
+        if let Some((dragging_pane, _)) = &self.dragging {
+            if dragging_pane == pane_id {
+                return DragStep::Extend { now: pos };
+            }
+            return DragStep::None;
         }
         if let Some((pending_pane, start)) = self.pending.clone() {
             if pending_pane == pane_id && start != pos {
                 self.pending = None;
-                self.start_drag(pending_pane, start);
-                self.update_drag(pos);
+                self.dragging = Some((pending_pane.clone(), start));
+                self.active = Some(pending_pane);
+                return DragStep::Begin { start, now: pos };
             }
         }
+        DragStep::None
     }
 
     /// Pane the press or drag is anchored in, if any.
@@ -76,6 +109,14 @@ impl SelectionState {
             .as_ref()
             .map(|(p, _)| p.as_str())
             .or(self.pending.as_ref().map(|(p, _)| p.as_str()))
+    }
+
+    /// Pane with a drag in flight, if any. The wheel reads this: local
+    /// scrolling is allowed to continue mid-drag so a selection can grow
+    /// past one screen, and the caller re-extends to the pointer after
+    /// each scroll.
+    pub fn dragging_pane(&self) -> Option<&str> {
+        self.dragging.as_ref().map(|(p, _)| p.as_str())
     }
 
     /// Record a click for double/triple detection. Returns 1, 2, or 3.
@@ -100,65 +141,22 @@ impl SelectionState {
         self.click.count
     }
 
-    pub fn start_drag(&mut self, pane_id: String, pos: CellPos) {
-        self.dragging = Some((pane_id.clone(), pos));
-        self.active = Some(Selection {
-            pane_id,
-            from: pos,
-            to: pos,
-        });
-    }
-
-    pub fn update_drag(&mut self, pos: CellPos) {
-        if let Some(sel) = &mut self.active {
-            sel.to = pos;
-        }
-    }
-
     pub fn is_dragging(&self) -> bool {
         self.dragging.is_some()
     }
 
-    /// End a drag and return the finished selection. A press that never
-    /// moved returns None.
-    pub fn finish_drag(&mut self) -> Option<Selection> {
+    /// End a drag and return the pane whose selection finished. A press
+    /// that never moved returns None. The selection stays active (the
+    /// highlight outlives the button) until something clears it.
+    pub fn finish_drag(&mut self) -> Option<String> {
         self.pending = None;
-        self.dragging.take()?;
-        self.active.clone()
+        let (pane, _) = self.dragging.take()?;
+        Some(pane)
     }
 
-    /// Select the word around a double-click. `row_text` is the clicked
-    /// row with one char per column (`PaneRuntime::row_text`).
-    pub fn set_word(&mut self, pane_id: String, pos: CellPos, row_text: &str) {
-        let (from, to) = word_range(row_text, pos);
-        self.dragging = None;
-        self.active = Some(Selection { pane_id, from, to });
-    }
-
-    pub fn set_line(&mut self, pane_id: String, row: u16, cols: u16) {
-        self.dragging = None;
-        self.active = Some(Selection {
-            pane_id,
-            from: CellPos { col: 0, row },
-            to: CellPos {
-                col: cols.saturating_sub(1),
-                row,
-            },
-        });
-    }
-
-    /// Extract selected text from a runtime. Selection is never logged.
-    pub fn extract(runtime: &mut PaneRuntime, sel: &Selection) -> Option<String> {
-        let (from, to) = normalize(sel.from, sel.to);
-        runtime.select(from, to)
-    }
-}
-
-fn normalize(from: CellPos, to: CellPos) -> (CellPos, CellPos) {
-    if from.row < to.row || (from.row == to.row && from.col <= to.col) {
-        (from, to)
-    } else {
-        (to, from)
+    /// Extract a pane's selected text from its runtime. Never logged.
+    pub fn extract(runtime: &PaneRuntime) -> Option<String> {
+        runtime.selection_text()
     }
 }
 
@@ -166,7 +164,7 @@ fn normalize(from: CellPos, to: CellPos) -> (CellPos, CellPos) {
 /// (`PaneRuntime::row_text`). Indexing chars, not bytes, keeps the columns
 /// honest on rows holding wide or multi-byte characters — the old
 /// grid-view version indexed bytes and drifted right of every CJK glyph.
-fn word_range(row_text: &str, pos: CellPos) -> (CellPos, CellPos) {
+pub fn word_range(row_text: &str, pos: CellPos) -> (CellPos, CellPos) {
     let row = pos.row;
     let chars: Vec<char> = row_text.chars().collect();
     if chars.is_empty() {
@@ -312,34 +310,95 @@ mod tests {
     fn selection_extracts_across_cells() {
         let mut rt = PaneRuntime::new(10, 2);
         rt.feed(b"abcdef\r\n");
-        let from = CellPos { col: 1, row: 0 };
-        let to = CellPos { col: 4, row: 0 };
-        let text = rt.select(from, to).expect("text");
+        rt.anchor_selection(CellPos { col: 1, row: 0 }, CellPos { col: 4, row: 0 });
+        let text = rt.selection_text().expect("text");
         assert_eq!(text.trim(), "bcde");
     }
 
+    /// The v7 bug, both halves. A selection is anchored to its text, not
+    /// to screen rows: scrolling the viewport after selecting must not
+    /// slide the selection onto different rows, and the copy must return
+    /// what was highlighted when the mouse picked it.
     #[test]
-    fn extract_while_scrolled_copies_the_rows_on_screen() {
+    fn a_selection_stays_on_its_text_while_the_viewport_scrolls() {
         let mut rt = PaneRuntime::new(8, 2);
         rt.feed(b"one\r\ntwo\r\nthree\r\nfour");
-        // Two rows scrolled into history; the viewport now shows them.
+        // Scroll back so "one" is on screen and select it there.
         rt.scroll(-2);
-        assert_eq!(
-            rt.row_text(0).trim_end(),
-            "one",
-            "rig premise: the viewport must be showing history"
-        );
+        assert_eq!(rt.row_text(0).trim_end(), "one", "rig premise");
+        rt.anchor_selection(CellPos { col: 0, row: 0 }, CellPos { col: 2, row: 0 });
+        assert_eq!(rt.selection_text().expect("text").trim_end(), "one");
 
-        let sel = Selection {
-            pane_id: "%0".into(),
-            from: CellPos { col: 0, row: 0 },
-            to: CellPos { col: 2, row: 0 },
-        };
-        let text = SelectionState::extract(&mut rt, &sel).expect("text");
+        // Scroll away: the highlight leaves the screen with its text
+        // instead of restyling whatever landed under it...
+        rt.scroll(2);
         assert_eq!(
-            text.trim_end(),
-            "one",
-            "the copied text must be the row the user sees highlighted"
+            rt.selection_screen_range(),
+            None,
+            "the highlight must follow the text off screen"
+        );
+        // ...and the copy is still the text the user picked.
+        assert_eq!(rt.selection_text().expect("text").trim_end(), "one");
+
+        // Scrolling back re-projects the highlight where the text is.
+        rt.scroll(-2);
+        let (from, to) = rt.selection_screen_range().expect("visible again");
+        assert_eq!((from.row, to.row), (0, 0));
+        assert_eq!((from.col, to.col), (0, 2));
+    }
+
+    /// Drags run backwards as often as forwards, and the engine's side
+    /// semantics trim endpoint cells on swapped ranges: with fixed sides a
+    /// leftward drag lost the cells under both the press and the pointer,
+    /// and a one-cell leftward drag selected nothing. Every direction must
+    /// keep exactly the cells the operator touched.
+    #[test]
+    fn a_backwards_drag_keeps_the_cells_the_pointer_touched() {
+        let mut rt = PaneRuntime::new(12, 3);
+        rt.feed(b"abcdefghij\r\nklmnopqrst\r\nuvwxyz");
+
+        // Rightward, the baseline.
+        rt.begin_selection(CellPos { col: 2, row: 0 });
+        rt.extend_selection(CellPos { col: 5, row: 0 });
+        assert_eq!(rt.selection_text().expect("text").trim_end(), "cdef");
+
+        // The same span dragged leftward selects the same text.
+        rt.begin_selection(CellPos { col: 5, row: 0 });
+        rt.extend_selection(CellPos { col: 2, row: 0 });
+        assert_eq!(rt.selection_text().expect("text").trim_end(), "cdef");
+
+        // One cell leftward: both cells, not none.
+        rt.begin_selection(CellPos { col: 1, row: 1 });
+        rt.extend_selection(CellPos { col: 0, row: 1 });
+        assert_eq!(rt.selection_text().expect("text").trim_end(), "kl");
+
+        // Upward across rows: the press row's cell survives.
+        rt.begin_selection(CellPos { col: 0, row: 2 });
+        rt.extend_selection(CellPos { col: 8, row: 1 });
+        let text = rt.selection_text().expect("text");
+        assert!(
+            text.starts_with("st") && text.trim_end().ends_with('u'),
+            "an upward drag keeps both endpoints: {text:?}"
+        );
+    }
+
+    /// New output rotates the grid; the engine rotates the selection with
+    /// it, so text arriving mid-selection cannot slide the highlight onto
+    /// lines the user never touched.
+    #[test]
+    fn new_output_moves_the_selection_with_its_text() {
+        let mut rt = PaneRuntime::new(8, 3);
+        rt.feed(b"alpha\r\nbeta");
+        // Select "alpha" on the top row, at the tail.
+        rt.anchor_selection(CellPos { col: 0, row: 0 }, CellPos { col: 4, row: 0 });
+        assert_eq!(rt.selection_text().expect("text").trim_end(), "alpha");
+
+        // Two more lines push "alpha" up and into history.
+        rt.feed(b"\r\ngamma\r\ndelta");
+        assert_eq!(
+            rt.selection_text().expect("text").trim_end(),
+            "alpha",
+            "the selection must ride the scroll, not stay at row 0"
         );
     }
 
@@ -358,12 +417,30 @@ mod tests {
     fn drag_lifecycle() {
         let mut state = SelectionState::default();
         let pos = CellPos { col: 0, row: 0 };
-        state.start_drag("%0".into(), pos);
+        state.press("%0".into(), pos);
+        assert!(!state.is_dragging(), "a press alone never selects");
+        // Motion within the press cell is not a drag yet.
+        assert_eq!(state.drag_to("%0", pos), DragStep::None);
+        assert_eq!(
+            state.drag_to("%0", CellPos { col: 3, row: 0 }),
+            DragStep::Begin {
+                start: pos,
+                now: CellPos { col: 3, row: 0 }
+            }
+        );
         assert!(state.is_dragging());
-        state.update_drag(CellPos { col: 3, row: 0 });
-        let sel = state.finish_drag().expect("selection");
-        assert_eq!(sel.from, pos);
-        assert_eq!(sel.to.col, 3);
+        assert_eq!(state.dragging_pane(), Some("%0"));
+        assert_eq!(
+            state.drag_to("%0", CellPos { col: 5, row: 1 }),
+            DragStep::Extend {
+                now: CellPos { col: 5, row: 1 }
+            }
+        );
+        assert_eq!(state.finish_drag(), Some("%0".to_string()));
+        // The selection outlives the button: still active until cleared.
+        assert_eq!(state.active_pane(), Some("%0"));
+        assert_eq!(state.take_active(), Some("%0".to_string()));
+        assert_eq!(state.active_pane(), None);
     }
 
     #[test]

@@ -5,13 +5,19 @@ description: "Build and install the current Rust implementation of Cyclops."
 
 Cyclops currently installs from source. The installer builds both `cyclops`
 and `cyclopsd`, places them in a user-writable bin directory, and creates the
-initial `~/.cyclops` configuration.
+initial `~/.cyclops` configuration. The build is a full release compile of a
+Rust workspace: budget a few minutes on a fast machine, longer on older or
+low-power hardware. Prebuilt binaries are not published yet.
 
 ## Requirements
 
 - macOS or Linux
 - tmux 3.2 or newer
-- A Rust toolchain with `cargo`
+- A Rust toolchain with `cargo`, recent stable (1.85+). Cyclops builds
+  from source, so this is a hard requirement. Missing it? Install Rust
+  with [rustup](https://rustup.rs), not Homebrew or apt: package-manager
+  Rust pins the compiler it shipped with, and rustup is what keeps a
+  stable toolchain current.
 - curl and Git when using the one-line installer
 
 ## Install

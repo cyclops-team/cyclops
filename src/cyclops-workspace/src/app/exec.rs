@@ -316,7 +316,7 @@ pub(super) async fn execute(
             if app.prefs.files_rows == 0 {
                 app.prefs.files_rows = crate::persist::WorkspacePrefs::default().files_rows;
             }
-            app.files.take_cursor();
+            app.files_tree_mut().take_cursor();
             if was_hidden {
                 // The panel took columns back from the canvas, so tmux has
                 // to be told before the next frame paints panes at the old
@@ -505,19 +505,38 @@ async fn scroll_pane(
         return Ok(Outcome::default());
     };
     let decision = decide_scroll(rt.wants_sgr_mouse_wheel(), rt.alt_screen(), lines, at);
+    // Mid-drag over this pane the wheel means "grow the selection past
+    // one screen", which only local scrollback can do. Forwarded wheels
+    // would make the pane's program repaint under a selection still being
+    // built, so those stay swallowed mid-drag, exactly as every wheel was
+    // before selections could scroll.
+    let dragging_here = app.selection.dragging_pane() == Some(pane_id.as_str());
     match decision {
         ScrollDecision::ForwardSgr(report) => {
-            client
-                .send_keys_unconfirmed(&pane_id, &[report.as_str()])
-                .await?;
+            if !dragging_here {
+                client
+                    .send_keys_unconfirmed(&pane_id, &[report.as_str()])
+                    .await?;
+            }
         }
         ScrollDecision::Arrows(key, count) => {
-            let keys = vec![key; count];
-            client.send_keys_unconfirmed(&pane_id, &keys).await?;
+            if !dragging_here {
+                let keys = vec![key; count];
+                client.send_keys_unconfirmed(&pane_id, &keys).await?;
+            }
         }
         ScrollDecision::Local(lines) => {
             if let Some(rt) = app.runtimes.get_mut(&pane_id) {
                 rt.scroll(lines);
+                // The viewport moved under the still-held pointer, so the
+                // selection's live end moves to the text now under it.
+                // This is what makes scroll-while-dragging extend the
+                // selection instead of sliding the highlight.
+                if dragging_here {
+                    if let Some(at) = at {
+                        rt.extend_selection(at);
+                    }
+                }
             }
         }
     }
@@ -558,6 +577,12 @@ async fn focus_pane_in_session(
     pane_id: &str,
     index: usize,
 ) -> Result<Outcome, TmuxError> {
+    // A click resolves against the frame it was aimed at, and a window can
+    // close between that frame and this handler. A stale index is a spent
+    // click, not a request.
+    if index >= app.model.session.tabs.len() {
+        return Ok(Outcome::default());
+    }
     let prior_tab = app.model.session.active_tab;
     let prior_pane = app.model.active_tab().active_pane.clone();
     if index == prior_tab && prior_pane == pane_id {
@@ -1346,6 +1371,8 @@ mod tests {
             paint: Paint::for_test(),
             dialog_offset: (0, 0),
             files: crate::files::FileTree::new(),
+            files_pinned: crate::files::FileTree::new(),
+            files_view: crate::files::FilesView::default(),
             files_probe_at: None,
             files_root_pending: false,
             dialog: None,
@@ -1354,7 +1381,10 @@ mod tests {
             paused_panes: HashSet::new(),
             minimized: std::collections::HashMap::new(),
             window_bg: None,
+            window_focused: true,
+            select_all: crate::input::SelectAll::default(),
             reconnect_attempt: 0,
+            needs_forced_hydrate: false,
             hit_map: HitMap::default(),
             menu: MenuState::None,
             hover: None,

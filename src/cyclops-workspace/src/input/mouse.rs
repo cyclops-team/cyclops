@@ -83,8 +83,12 @@ pub enum HitTarget {
     },
     /// The file panel's climb-out row.
     FileUp,
-    /// The file panel's header: re-roots on the focused pane's folder.
+    /// The file panel's header: re-roots on the focused pane's folder
+    /// (agent view) or the saved pinned folder (pinned view).
     FileRoot,
+    /// The header chip that flips the panel between the agent-following
+    /// browser and the pinned one.
+    FilesViewToggle,
     /// Retrace one step of the walk, and undo that. Only pushed while the
     /// step exists, so neither is ever a control that answers with nothing.
     FileBack,
@@ -293,6 +297,7 @@ pub fn motion_touches_hover_button(
                     | HitTarget::FileDisclosure { .. }
                     | HitTarget::FileUp
                     | HitTarget::FileRoot
+                    | HitTarget::FilesViewToggle
                     | HitTarget::FileBack
                     | HitTarget::FileForward
             )

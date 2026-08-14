@@ -44,6 +44,7 @@ mod hook;
 mod hookset;
 mod manifests;
 mod render;
+mod skillseed;
 mod style;
 mod theme;
 mod themeseed;

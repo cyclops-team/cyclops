@@ -54,7 +54,20 @@ pub struct PaneRuntime {
 }
 
 impl PaneRuntime {
+    /// The engine's own floor, which it documents but does not enforce:
+    /// `Term::resize` takes whatever it is given, and a grid built at zero
+    /// width panics on the first byte that writes a cell (`row[Column(0)]`
+    /// on an empty row). Dimensions arrive from tmux layout parsing and can
+    /// pass through zero while windows churn — a nested tmux client
+    /// redrawing over ssh is exactly the workload that churns them — so
+    /// the clamp lives here, on every path that sizes the engine, and not
+    /// in any single caller.
+    fn clamped(cols: u16, rows: u16) -> (u16, u16) {
+        (cols.max(2), rows.max(1))
+    }
+
     pub fn new(cols: u16, rows: u16) -> Self {
+        let (cols, rows) = Self::clamped(cols, rows);
         let size = Size {
             cols: cols as usize,
             rows: rows as usize,
@@ -74,6 +87,7 @@ impl PaneRuntime {
 
     /// Resize the visible grid.
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        let (cols, rows) = Self::clamped(cols, rows);
         self.cols = cols;
         self.rows = rows;
         let size = Size {
@@ -90,6 +104,7 @@ impl PaneRuntime {
     /// saved cursors, and stale primary/alternate buffers that the capture
     /// cannot describe.
     fn reset(&mut self, cols: u16, rows: u16) {
+        let (cols, rows) = Self::clamped(cols, rows);
         let size = Size {
             cols: cols as usize,
             rows: rows as usize,
@@ -109,7 +124,21 @@ impl PaneRuntime {
     pub fn hydrate(&mut self, snapshot: &HydrationSnapshot) {
         let history = self.history_lines();
         self.reset(snapshot.cols, snapshot.rows);
-        self.refill_history(&history);
+        if history.is_empty() && !snapshot.history.is_empty() {
+            // First sight of this pane: tmux's transcript is the history.
+            // Without it the wheel hits a wall at the attach moment, and
+            // the only thing that "fixed" it was a resize resetting the
+            // viewport to the tail. Local history wins on every later
+            // hydrate: it already contains everything tmux would say,
+            // plus whatever arrived since.
+            let lines: Vec<String> = String::from_utf8_lossy(&snapshot.history)
+                .split('\n')
+                .map(str::to_string)
+                .collect();
+            self.refill_history(&lines);
+        } else {
+            self.refill_history(&history);
+        }
 
         // A capture restores pixels, not VT modes. Full-screen TUIs such as
         // Claude and Codex are already in the alternate buffer; record that
@@ -335,20 +364,98 @@ impl PaneRuntime {
         self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
-    /// Extract selected text between two cell positions.
-    ///
-    /// Positions are viewport cells. Grid lines equal viewport rows only at
-    /// the live tail; a viewport scrolled back starts `display_offset` lines
-    /// up in history, and skipping that shift makes a scrolled selection
-    /// copy rows the user cannot even see.
-    pub fn select(&mut self, from: CellPos, to: CellPos) -> Option<String> {
-        use alacritty_terminal::selection::{Selection, SelectionType};
+    /// A viewport cell as a grid point, through the current display
+    /// offset. This is the only place viewport rows become grid lines:
+    /// everything selection-related converts on the way IN and never
+    /// stores a viewport coordinate, which is what keeps a selection on
+    /// its text when the viewport moves afterwards.
+    fn grid_point(&self, cell: CellPos) -> Point {
         let offset = self.scrolled_back() as i32;
-        let start = Point::new(Line(from.row as i32 - offset), Column(from.col as usize));
-        let end = Point::new(Line(to.row as i32 - offset), Column(to.col as usize));
-        self.term.selection = Some(Selection::new(SelectionType::Simple, start, Side::Left));
-        self.term.selection.as_mut()?.update(end, Side::Right);
+        let col = (cell.col as usize).min((self.cols as usize).saturating_sub(1));
+        Point::new(Line(cell.row as i32 - offset), Column(col))
+    }
+
+    /// Start a selection at a viewport cell. The engine owns it from here:
+    /// grid rotation moves it with the text when new output scrolls the
+    /// screen, and the display offset projects it back for painting, so
+    /// neither scrolling nor fresh output can slide the highlight off what
+    /// the user picked.
+    pub fn begin_selection(&mut self, cell: CellPos) {
+        use alacritty_terminal::selection::{Selection, SelectionType};
+        let point = self.grid_point(cell);
+        let mut selection = Selection::new(SelectionType::Simple, point, Side::Left);
+        selection.include_all();
+        self.term.selection = Some(selection);
+    }
+
+    /// Move the live end of the selection to a viewport cell.
+    ///
+    /// `include_all` after every move, because a cell has no half-cell
+    /// pointer position to derive a `Side` from. The engine trims a cell
+    /// off an endpoint whose side faces away from the selection, which is
+    /// right for pixel mice and wrong here: with fixed sides, a leftward
+    /// or upward drag lost its first and last cells, and a one-cell
+    /// leftward drag selected nothing at all. `include_all` recomputes
+    /// both sides from the endpoint order so every drag direction keeps
+    /// the cells the operator touched.
+    pub fn extend_selection(&mut self, cell: CellPos) {
+        let point = self.grid_point(cell);
+        if let Some(sel) = self.term.selection.as_mut() {
+            sel.update(point, Side::Right);
+            sel.include_all();
+        }
+    }
+
+    /// Select a fixed viewport range in one step (word and line picks).
+    pub fn anchor_selection(&mut self, from: CellPos, to: CellPos) {
+        self.begin_selection(from);
+        self.extend_selection(to);
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.term.selection = None;
+    }
+
+    /// The selected text, exactly as the engine holds it: wide characters
+    /// once, soft-wrapped rows joined. Never logged.
+    pub fn selection_text(&self) -> Option<String> {
         self.term.selection_to_string()
+    }
+
+    /// The selection projected onto the current viewport, clamped to its
+    /// edges, or None when there is no selection or none of it is on
+    /// screen. Painting reads this every frame, which is the other half of
+    /// content anchoring: the highlight is recomputed from the text's
+    /// position, not remembered from where it was last drawn.
+    pub fn selection_screen_range(&self) -> Option<(CellPos, CellPos)> {
+        let range = self.term.selection.as_ref()?.to_range(&self.term)?;
+        let offset = self.scrolled_back() as i32;
+        let start_row = range.start.line.0 + offset;
+        let end_row = range.end.line.0 + offset;
+        let rows = self.rows as i32;
+        if end_row < 0 || start_row >= rows {
+            return None;
+        }
+        let start = if start_row < 0 {
+            CellPos { col: 0, row: 0 }
+        } else {
+            CellPos {
+                col: range.start.column.0 as u16,
+                row: start_row as u16,
+            }
+        };
+        let end = if end_row >= rows {
+            CellPos {
+                col: self.cols.saturating_sub(1),
+                row: (rows - 1) as u16,
+            }
+        } else {
+            CellPos {
+                col: range.end.column.0 as u16,
+                row: end_row as u16,
+            }
+        };
+        Some((start, end))
     }
 }
 
@@ -428,6 +535,7 @@ fn map_color(c: AnsiColor) -> Color {
 /// workspace names it for what it holds (F38).
 pub fn snapshot_from_bundle(bundle: &cyclops_tmux::HydrationBundle) -> HydrationSnapshot {
     HydrationSnapshot {
+        history: bundle.history.clone(),
         cols: bundle.cols,
         rows: bundle.rows,
         visible: bundle.visible_escaped.clone(),
@@ -460,6 +568,7 @@ mod tests {
     fn alternate_hydration_restores_the_buffer_mode_as_well_as_pixels() {
         let mut rt = PaneRuntime::new(10, 2);
         rt.hydrate(&HydrationSnapshot {
+            history: Vec::new(),
             cols: 10,
             rows: 2,
             // What the user is looking at: the agent TUI.
@@ -484,6 +593,7 @@ mod tests {
     fn leaving_a_hydrated_alternate_screen_reveals_the_saved_shell() {
         let mut rt = PaneRuntime::new(10, 2);
         rt.hydrate(&HydrationSnapshot {
+            history: Vec::new(),
             cols: 10,
             rows: 2,
             visible: b"CLAUDE".to_vec(),
@@ -510,6 +620,7 @@ mod tests {
         // The resize path rehydrates from a screen-only capture; the two
         // rows already in history must come along.
         rt.hydrate(&HydrationSnapshot {
+            history: Vec::new(),
             cols: 10,
             rows: 3,
             visible: b"prompt".to_vec(),
@@ -534,6 +645,7 @@ mod tests {
     #[test]
     fn rehydrating_twice_keeps_history_exact() {
         let snapshot = HydrationSnapshot {
+            history: Vec::new(),
             cols: 10,
             rows: 3,
             visible: b"prompt".to_vec(),
@@ -560,6 +672,7 @@ mod tests {
         let mut rt = PaneRuntime::new(10, 2);
         rt.feed(b"stale");
         rt.hydrate(&HydrationSnapshot {
+            history: Vec::new(),
             cols: 10,
             rows: 2,
             visible: b"new".to_vec(),
@@ -579,6 +692,7 @@ mod tests {
     fn hydrating_a_snapshot_with_mouse_flags_on_restores_sgr_wheel_wanting() {
         let mut rt = PaneRuntime::new(10, 2);
         rt.hydrate(&HydrationSnapshot {
+            history: Vec::new(),
             cols: 10,
             rows: 2,
             visible: b"CLAUDE".to_vec(),
@@ -600,6 +714,7 @@ mod tests {
     fn hydrating_a_snapshot_with_mouse_flags_off_leaves_sgr_wheel_unwanted() {
         let mut rt = PaneRuntime::new(10, 2);
         rt.hydrate(&HydrationSnapshot {
+            history: Vec::new(),
             cols: 10,
             rows: 2,
             visible: b"CLAUDE".to_vec(),

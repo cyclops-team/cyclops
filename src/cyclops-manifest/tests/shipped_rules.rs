@@ -28,13 +28,97 @@ fn claude_staged_input_outranks_idle_sparkle() {
         ────────────────────────────────────────\n\
         \u{20}\u{20}Haiku 4.5 · /tmp/proj · Ctx: 86%\n\
         \u{20}\u{20}⏵⏵ bypass permissions on (shift+tab to cycle)";
-    let r = claude.evaluate("\u{2733} Done", screen).unwrap();
+    // The escaped view of the same screen, carrying the measured composer
+    // signature (F55): 'ESC[39m' + glyph + NBSP, draft text unstyled.
+    let esc = screen.replace("❯ draft text", "\u{1b}[39m❯\u{a0}draft text");
+    let r = claude
+        .evaluate_esc("\u{2733} Done", screen, Some(&esc))
+        .unwrap();
     assert_eq!(r.id, "composer_has_staged_input");
     assert_eq!(r.state, AgentState::IdleWithInput);
 
     // The same screen with an empty composer still reads idle by title.
     let idle_screen = screen.replace("❯ draft text", "❯ ");
-    let r = claude.evaluate("\u{2733} Done", &idle_screen).unwrap();
+    let idle_esc = esc.replace("\u{1b}[39m❯\u{a0}draft text", "\u{1b}[39m❯\u{a0}");
+    let r = claude
+        .evaluate_esc("\u{2733} Done", &idle_screen, Some(&idle_esc))
+        .unwrap();
+    assert_eq!(r.state, AgentState::Idle);
+}
+
+/// F55 (ghost probe, Claude Code 2.1.222, 2026-08-13): the plain capture
+/// cannot separate a human draft from ghost/suggestion text or from the
+/// submitted-prompt echo in scrollback — all three render '❯ <text>'. The
+/// escaped capture can: real input follows the composer's NBSP unstyled,
+/// a suggestion arrives styled, and the echo repaints the glyph with its
+/// own colors and a plain space. Locked against the probe's real captures
+/// where they exist; the ghost line itself never rendered during the probe
+/// and is constructed from the convention codex and cursor both measured
+/// (ESC[2m after the glyph), so the discriminator has a test even before
+/// a live Claude ghost is captured.
+#[test]
+fn claude_ghost_echo_and_chip_read_off_the_escaped_capture() {
+    let all = shipped();
+    let claude = &all["claude"];
+
+    // Typed text (real capture): idle_with_input, never inject over it.
+    let typed_plain = include_str!("fixtures/claude_typed_composer_plain.txt");
+    let typed_esc = include_str!("fixtures/claude_typed_composer_esc.txt");
+    let r = claude
+        .evaluate_esc("proj", typed_plain, Some(typed_esc))
+        .unwrap();
+    assert_eq!(r.id, "composer_has_staged_input");
+    assert_eq!(r.state, AgentState::IdleWithInput);
+
+    // The collapsed paste chip (real capture) renders unstyled after the
+    // NBSP, exactly like typed text: still staged input.
+    let chip_plain = include_str!("fixtures/claude_pasted_chip_plain.txt");
+    let chip_esc = include_str!("fixtures/claude_pasted_chip_esc.txt");
+    let r = claude
+        .evaluate_esc("proj", chip_plain, Some(chip_esc))
+        .unwrap();
+    assert_eq!(r.id, "composer_has_staged_input");
+    assert_eq!(r.state, AgentState::IdleWithInput);
+
+    // A submitted-prompt echo sitting inside the bottom window (its '❯ '
+    // uses a plain space and its own colors, F55) with an empty composer
+    // below it: the old plain-only rule held delivery on this, and it must
+    // read idle now.
+    let echo_plain = "❯ Reply with exactly the word OK and nothing else.\n\
+        ────────────────────────────────────────\n\
+        ❯ \n\
+        ────────────────────────────────────────\n\
+        \u{20}\u{20}Opus 5 · ~/proj · 1000K window\n\
+        \u{20}\u{20}⏸ manual mode on";
+    let echo_esc = echo_plain.replace(
+        "❯ Reply with exactly the word OK and nothing else.",
+        "\u{1b}[38;5;239m\u{1b}[48;5;237m❯ \u{1b}[38;5;231mReply with exactly the word OK and nothing else.\u{1b}[39m",
+    );
+    let echo_esc = echo_esc.replace("❯ \n", "\u{1b}[39m❯\u{a0}\n");
+    let r = claude
+        .evaluate_esc("proj", echo_plain, Some(&echo_esc))
+        .unwrap();
+    assert_eq!(r.state, AgentState::Idle);
+
+    // Ghost text: styled right after the NBSP. Idle, and named as the
+    // ghost so `--source detection` says what was actually on screen.
+    let ghost_plain = echo_plain.replace("❯ \n", "❯ Try \"fix the tests\"\n");
+    let ghost_esc = echo_esc.replace(
+        "\u{1b}[39m❯\u{a0}\n",
+        "\u{1b}[39m❯\u{a0}\u{1b}[2mTry \"fix the tests\"\u{1b}[0m\n",
+    );
+    let r = claude
+        .evaluate_esc("proj", &ghost_plain, Some(&ghost_esc))
+        .unwrap();
+    assert_eq!(r.id, "composer_ghost_suggestion");
+    assert_eq!(r.state, AgentState::Idle);
+
+    // Without an escaped capture the staged rule fails closed and the
+    // title tier answers (a real Claude pane always has one). This is the
+    // residual gap's direction: a missing -e capture plus an idle title
+    // reads idle, the same trade codex and cursor accepted.
+    let r = claude.evaluate("\u{2733} Done", typed_plain).unwrap();
+    assert_eq!(r.id, "title_idle_sparkle");
     assert_eq!(r.state, AgentState::Idle);
 }
 

@@ -269,6 +269,7 @@ fn the_cursor_reports_its_position_visibility_and_shape() {
 fn the_alternate_screen_redraws_and_exits_back_to_hydrated_content() {
     let mut rt = PaneRuntime::new(10, 2);
     rt.hydrate(&HydrationSnapshot {
+        history: Vec::new(),
         cols: 10,
         rows: 2,
         visible: b"shell".to_vec(),
@@ -300,6 +301,7 @@ fn the_alternate_screen_redraws_and_exits_back_to_hydrated_content() {
 fn hydrating_an_alternate_capture_lands_in_the_alternate_buffer() {
     let mut rt = PaneRuntime::new(10, 2);
     rt.hydrate(&HydrationSnapshot {
+        history: Vec::new(),
         cols: 10,
         rows: 2,
         // `capture-pane` reads the screen in front of the user — the TUI.
@@ -422,4 +424,61 @@ fn shipped_agent_tui_output_renders_as_the_user_sees_it() {
     // Cursor: a box-drawing frame around a prompt.
     let grid = render("╭──╮\r\n│ok│\r\n╰──╯".as_bytes(), 8, 3);
     assert_eq!(grid.row_texts(), vec!["╭──╮", "│ok│", "╰──╯"]);
+}
+
+/// F56: a tmux client running INSIDE a pane (ssh to a remote machine, tmux
+/// attached there) crashed the workspace. The pane is an opaque terminal:
+/// its byte stream is just another full-screen program, and the runtime
+/// must stay total over it at every geometry, including the zero and
+/// one-cell sizes tmux layout parsing can pass through while windows
+/// churn — the engine underneath documents 2x1 as its floor and does not
+/// enforce it, and a grid built below the floor panics on the first byte
+/// that writes a cell.
+///
+/// The fixture is a real recording (pipe-pane, tmux 3.7b): an inner tmux
+/// starting, attaching with a full redraw and status bar, running seq and
+/// ls, splitting a window, and detaching.
+#[test]
+fn a_nested_tmux_client_byte_stream_never_panics_the_runtime() {
+    let bytes: &[u8] = include_bytes!("fixtures/nested_tmux_client.raw");
+    for (cols, rows) in [
+        (140u16, 40u16),
+        (80, 24),
+        (5, 3),
+        (2, 1),
+        (1, 1),
+        (0, 3),
+        (0, 0),
+    ] {
+        let mut rt = PaneRuntime::new(cols, rows);
+        rt.feed(bytes);
+        // Every read surface the app touches on a live pane.
+        let (c, r) = rt.size();
+        assert!(c >= 2 && r >= 1, "the engine floor holds at {cols}x{rows}");
+        for row in 0..r {
+            let _ = rt.row_text(row);
+        }
+        let _ = rt.snapshot();
+        let _ = rt.cursor();
+        rt.scroll(10);
+        rt.scroll(-10);
+        // The churn path a remote redraw provokes: resize through the
+        // degenerate sizes and hydrate from a snapshot carrying them.
+        rt.resize(0, 0);
+        rt.feed(bytes);
+        rt.hydrate(&HydrationSnapshot {
+            history: Vec::new(),
+            cols: 0,
+            rows: 0,
+            visible: b"remote".to_vec(),
+            saved_primary: None,
+            cursor_x: 0,
+            cursor_y: 0,
+            alternate_on: true,
+            mouse_on: true,
+            mouse_sgr: true,
+        });
+        rt.feed(bytes);
+        let _ = rt.snapshot();
+    }
 }

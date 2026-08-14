@@ -146,6 +146,36 @@ pub async fn hydrate_visible_tab(
     tab: &TabModel,
     registry: &mut RuntimeRegistry,
 ) {
+    hydrate_tab(client, tab, registry, false).await;
+}
+
+/// [`hydrate_visible_tab`] with the size check overridden: every visible
+/// pane rehydrates. For the paths where continuity was lost without a
+/// size change — a daemon or control-mode reconnect misses `%output`
+/// while the layout stands still, and the size-gated hydrate would leave
+/// those panes stale (content and VT modes both) until something happened
+/// to resize them. Not for the resize path, which is a hot loop and where
+/// the size check is exactly right.
+pub async fn hydrate_visible_tab_forced(
+    client: &ControlClient,
+    tab: &TabModel,
+    registry: &mut RuntimeRegistry,
+) {
+    hydrate_tab(client, tab, registry, true).await;
+}
+
+/// How much scrollback a runtime meeting its pane for the first time asks
+/// tmux for. Below the engine's own 10k cap and above what fits any real
+/// screen; the point is that the wheel finds the pane's transcript above
+/// the attach moment instead of a wall.
+const FIRST_SIGHT_HISTORY_LINES: u16 = 2000;
+
+async fn hydrate_tab(
+    client: &ControlClient,
+    tab: &TabModel,
+    registry: &mut RuntimeRegistry,
+    force: bool,
+) {
     let dims = visible_pane_dims(tab);
     let pane_ids: Vec<String> = dims.iter().map(|(id, _, _)| id.clone()).collect();
     registry.retain_visible(&pane_ids);
@@ -153,17 +183,29 @@ pub async fn hydrate_visible_tab(
     let stale: Vec<(String, u16, u16)> = dims
         .into_iter()
         .filter(|(pane_id, cols, rows)| {
-            !registry
-                .get(pane_id)
-                .is_some_and(|rt| rt.size() == (*cols, *rows))
+            force
+                || !registry
+                    .get(pane_id)
+                    .is_some_and(|rt| rt.size() == (*cols, *rows))
         })
         .collect();
     if stale.is_empty() {
         return;
     }
 
+    // A pane without a runtime yet gets the deeper bundle: its runtime has
+    // no local history to carry, and tmux's transcript is what puts lines
+    // above the attach moment under the wheel. Panes that already have a
+    // runtime keep the cheap bundle — their history rides across the
+    // hydrate — so the resize path pays nothing new.
     let stale_ids: Vec<&str> = stale.iter().map(|(id, _, _)| id.as_str()).collect();
-    let results = client.hydrate_panes(&stale_ids).await;
+    let fresh: Vec<bool> = stale
+        .iter()
+        .map(|(id, _, _)| registry.get(id).is_none())
+        .collect();
+    let results = client
+        .hydrate_panes_seeding(&stale_ids, &fresh, FIRST_SIGHT_HISTORY_LINES)
+        .await;
     for ((pane_id, _, _), result) in stale.into_iter().zip(results) {
         if let Ok(bundle) = result {
             let snapshot = snapshot_from_bundle(&bundle);
@@ -469,6 +511,84 @@ mod tests {
         assert!(
             runtime.row_text(0).contains("history"),
             "the lines that scrolled off before the resize are still there"
+        );
+
+        client.shutdown().await;
+    }
+
+    /// The wall an operator could only fix by resizing: before history
+    /// seeding, a runtime meeting its pane for the first time started with
+    /// empty scrollback, so the wheel stopped dead at the attach moment
+    /// even though tmux held the pane's whole transcript. A first-sight
+    /// hydration must put that transcript above the screen.
+    #[tokio::test]
+    async fn a_fresh_runtime_can_scroll_into_the_panes_pre_attach_history() {
+        if !tmux_available() {
+            eprintln!("skipping: no tmux binary on PATH");
+            return;
+        }
+        let server = TmuxServer::new("hyd-seed-history");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "seed",
+            "-x",
+            "80",
+            "-y",
+            "10",
+            "/bin/sh",
+        ]);
+        // Fill tmux's own history well past one screen BEFORE any client
+        // attaches: this is the transcript the operator expects the wheel
+        // to reach.
+        server.run_ok(&[
+            "send-keys",
+            "-t",
+            "seed",
+            "for i in $(seq 1 60); do echo preattach$i; done",
+            "Enter",
+        ]);
+        // The loop is fast, but it still has to run: wait until the last
+        // line is on the pane before hydrating.
+        for _ in 0..50 {
+            let out = server.run(&["capture-pane", "-p", "-t", "seed"]);
+            if String::from_utf8_lossy(&out.stdout).contains("preattach60") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        let (client, _notif) = ControlClient::spawn(config(&server, "seed"))
+            .await
+            .expect("attach");
+        let leaf = TabModel {
+            window_id: "@0".to_string(),
+            name: "1".to_string(),
+            layout: ResolvedLayout::Leaf {
+                pane_id: "%0".to_string(),
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 10,
+            },
+            active_pane: "%0".to_string(),
+            zoomed: false,
+        };
+
+        let mut registry = RuntimeRegistry::default();
+        hydrate_visible_tab(&client, &leaf, &mut registry).await;
+
+        let runtime = registry.get_mut("%0").expect("runtime");
+        runtime.scroll(-30);
+        assert!(
+            !runtime.at_tail(),
+            "the wheel must reach the pane's pre-attach transcript"
+        );
+        let shown: String = (0..10).map(|r| runtime.row_text(r)).collect();
+        assert!(
+            shown.contains("preattach"),
+            "scrolled back, the viewport must show pre-attach lines: {shown:?}"
         );
 
         client.shutdown().await;

@@ -63,6 +63,9 @@
 		>
 			{#if method.status === 'live' && method.lines}
 				<CopyableCommand lines={method.lines} />
+				{#if method.note}
+					<div class="prereq">{method.note}</div>
+				{/if}
 			{:else}
 				<div class="soon"><span class="dollar">$</span>&nbsp;{method.note ?? 'Coming soon.'}</div>
 			{/if}
@@ -106,6 +109,15 @@
 	.soon {
 		padding: 11px 14px;
 		font-size: 13px;
+		color: var(--term-dim);
+	}
+
+	/* One quiet line under the live command: the prerequisites a visitor
+	   needs before pasting it. Same ink as .soon so it reads as a footnote,
+	   not a second prompt. */
+	.prereq {
+		padding: 0 14px 10px;
+		font-size: 12px;
 		color: var(--term-dim);
 	}
 

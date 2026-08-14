@@ -202,6 +202,7 @@ fn hydrate_feeds_visible_bytes() {
     use cyclops_workspace::HydrationSnapshot;
     let mut rt = PaneRuntime::new(10, 2);
     let snap = HydrationSnapshot {
+        history: Vec::new(),
         cols: 10,
         rows: 2,
         visible: b"hydrated\r\n".to_vec(),

@@ -101,6 +101,11 @@ pub struct WorkspacePrefs {
     /// what renames the name, so the name can't be the thing that survives
     /// the rename.
     pub folder_tracked: Vec<String>,
+    /// Where the pinned file browser points. The agent browser follows the
+    /// focused pane and needs no memory; this one is "locked to whatever
+    /// you set it to", and what makes that true across restarts is saving
+    /// the folder the operator last browsed it to. None until they do.
+    pub files_pinned_root: Option<String>,
 }
 
 impl Default for WorkspacePrefs {
@@ -122,6 +127,7 @@ impl Default for WorkspacePrefs {
             workspace_order: Vec::new(),
             agent_order: Vec::new(),
             folder_tracked: Vec::new(),
+            files_pinned_root: None,
         }
     }
 }
@@ -205,6 +211,9 @@ pub fn load_prefs(home: &Path) -> WorkspacePrefs {
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
     }
+    if let Some(v) = workspace.get("files_pinned_root").and_then(|v| v.as_str()) {
+        prefs.files_pinned_root = Some(v.to_string());
+    }
     prefs
 }
 
@@ -267,6 +276,12 @@ pub fn save_prefs(home: &Path, prefs: &WorkspacePrefs) -> std::io::Result<()> {
     workspace.insert("workspace_order".into(), order);
     workspace.insert("agent_order".into(), agent_order);
     workspace.insert("folder_tracked".into(), folder_tracked);
+    if let Some(root) = &prefs.files_pinned_root {
+        workspace.insert(
+            "files_pinned_root".into(),
+            toml::Value::String(root.clone()),
+        );
+    }
     table.insert("workspace".into(), toml::Value::Table(workspace));
     let mut body = toml::to_string_pretty(&table)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
@@ -421,6 +436,7 @@ mod tests {
             workspace_order: vec!["beta".into(), "alpha".into()],
             agent_order: vec!["name:reviewer".into(), "pane:%7".into()],
             folder_tracked: vec!["$3".into(), "$7".into()],
+            files_pinned_root: Some("/somewhere/desk".into()),
         };
         save_prefs(&home, &prefs).expect("save");
         let loaded = load_prefs(&home);
@@ -461,6 +477,7 @@ mod tests {
         std::fs::create_dir_all(&home).expect("scratch");
         let prefs = WorkspacePrefs {
             folder_tracked: vec!["$3".into()],
+            files_pinned_root: None,
             ..WorkspacePrefs::default()
         };
         save_prefs(&home, &prefs).expect("save");
@@ -556,6 +573,7 @@ mod tests {
                 workspace_order: vec!["cyclops".into()],
                 agent_order: vec!["name:implementer".into()],
                 folder_tracked: vec![],
+                files_pinned_root: None,
             },
         )
         .expect("save");

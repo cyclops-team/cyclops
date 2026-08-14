@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -67,6 +69,19 @@ fn reset_window_background(out: &mut impl Write) {
     let _ = write!(out, "\x1b]111\x1b\\");
 }
 
+/// Hand the background back while the workspace keeps running.
+///
+/// Focus left the workspace's tab. The operator is now looking at their
+/// own shell or another program in the same terminal window, and it
+/// should wear the terminal's own background, not the theme's. The same
+/// escape `restore` sends on exit; focus return reapplies the theme
+/// through the ordinary draw path.
+pub fn yield_window_background() {
+    let mut out = io::stdout();
+    reset_window_background(&mut out);
+    let _ = out.flush();
+}
+
 /// Owns the terminal mode until dropped.
 pub struct TermGuard {
     active: bool,
@@ -81,6 +96,22 @@ impl TermGuard {
         out.execute(EnterAlternateScreen)?;
         let _ = out.execute(EnableMouseCapture);
         let _ = out.execute(EnableBracketedPaste);
+        // Focus reporting drives the window background: the theme's ground
+        // is only painted onto the terminal while the workspace is the
+        // thing being looked at (app.rs, AppMsg::Focus).
+        let _ = out.execute(EnableFocusChange);
+        // The kitty keyboard protocol's disambiguate level, pushed blind
+        // rather than after a support query: the query's reply arrives as
+        // an input event, and the reader thread that would eat it is
+        // already running when this guard enters. The protocol is built
+        // for exactly this: a terminal that does not speak it ignores the
+        // push and the pop, and keys keep their legacy shapes. Where it is
+        // spoken, chords the legacy encoding cannot carry become real
+        // events: Ctrl+Backspace stops arriving as Ctrl+H, and Cmd chords
+        // arrive at all (input.rs translates both for the focused pane).
+        let _ = out.execute(PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+        ));
         let _ = out.flush();
         install_panic_hook();
         Ok(TermGuard { active: true })
@@ -91,6 +122,10 @@ impl TermGuard {
             return;
         }
         let mut out = io::stdout();
+        // Pop first, matching the push order in reverse. A terminal that
+        // never took the push ignores the pop the same way.
+        let _ = out.execute(PopKeyboardEnhancementFlags);
+        let _ = out.execute(DisableFocusChange);
         let _ = out.execute(DisableBracketedPaste);
         let _ = out.execute(DisableMouseCapture);
         // Undo any DECSCUSR a focused pane asked for (`apply_cursor_style`)
