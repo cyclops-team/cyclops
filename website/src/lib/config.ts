@@ -28,7 +28,7 @@ export const INSTALL_METHODS: InstallMethod[] = [
 		label: 'Script',
 		status: 'live',
 		lines: ['curl -fsSL https://www.usecyclops.dev/install.sh | sh'],
-		note: 'Builds from source: needs tmux 3.2+ and a Rust toolchain. No cargo? Get Rust from rustup.rs, not Homebrew.'
+		note: 'Builds from source: needs tmux 3.2+. No Rust toolchain? The installer gets one from rustup.rs itself.'
 	},
 	{
 		id: 'homebrew',

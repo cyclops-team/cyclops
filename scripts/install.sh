@@ -241,9 +241,29 @@ elif [ "$tmux_major" = "3" ] && [ -n "$tmux_minor" ] && [ "$tmux_minor" -lt 2 ] 
 fi
 note "tmux $tmux_version"
 
+# Cyclops builds from source, so a machine without cargo cannot finish.
+# Rather than stopping to hand the operator the rustup command, run it:
+# rustup's own installer is non-interactive with -y, --no-modify-path
+# keeps it out of shell profiles (this installer already manages PATH for
+# its own prefix and does not want a second writer), and sourcing the env
+# file puts cargo on PATH for this run only. CYCLOPS_NO_RUSTUP=1 declines
+# and gets the old refusal with the command to run by hand.
 if ! have cargo; then
-    die "cargo is not installed; cyclops builds from source" \
-        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+    if [ -n "${CYCLOPS_NO_RUSTUP:-}" ]; then
+        die "cargo is not installed; cyclops builds from source" \
+            "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+    fi
+    step "cargo not found; installing Rust with rustup (CYCLOPS_NO_RUSTUP=1 declines)"
+    if ! curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --default-toolchain stable; then
+        die "the rustup install failed" \
+            "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+    fi
+    # shellcheck disable=SC1091
+    . "${CARGO_HOME:-$HOME/.cargo}/env"
+    have cargo || die "rustup finished but cargo is still not on PATH" \
+        "open a new shell and run this installer again"
+    note "installed rust via rustup"
 fi
 note "cargo $(cargo --version 2>/dev/null | awk '{print $2}')"
 

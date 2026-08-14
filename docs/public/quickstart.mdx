@@ -9,11 +9,11 @@ description: "Open a Cyclops workspace and send your first message."
 curl -fsSL https://www.usecyclops.dev/install.sh | sh
 ```
 
-The installer needs tmux 3.2 or newer, curl, Git, and a Rust toolchain
-(Cyclops builds from source). No Rust? Install it with
-[rustup](https://rustup.rs) rather than a package manager. If the
-installer adds a PATH block, open a new shell or run the reload command
-it prints.
+The installer needs tmux 3.2 or newer, curl, and Git; Cyclops builds
+from source, and when no Rust toolchain is present the installer
+installs one itself with [rustup](https://rustup.rs)
+(`CYCLOPS_NO_RUSTUP=1` declines). If it adds a PATH block, open a new
+shell or run the reload command it prints.
 
 ## 2. Open the default workspace
 

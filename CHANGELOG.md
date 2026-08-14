@@ -7,6 +7,12 @@ versions are unreleased until admin cuts a tag.
 
 ### Added (v7)
 
+- The installer installs Rust itself. Cyclops builds from source, and
+  the old behavior on a machine without `cargo` was a refusal with the
+  rustup command to run by hand. The installer now runs that same rustup
+  step on its own — non-interactive, shell profiles untouched, cargo on
+  PATH for the run — and continues into the build. `CYCLOPS_NO_RUSTUP=1`
+  declines and restores the refusal.
 - The agent skill installs itself. `skills/cyclops/SKILL.md` taught an
   agent the cyclops verbs but lived only in the repo, so "use the cyclops
   skill" failed on every install. The binary now carries it, and setup

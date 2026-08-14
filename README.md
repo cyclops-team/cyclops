@@ -19,12 +19,15 @@ Everything below is built and tested by the Cyclops team.
 
 ## Install
 
-Needs tmux 3.2+, curl, Git, and a Rust toolchain: Cyclops builds from
-source, so `cargo` is not optional. No Rust on the machine? Install it
-with [rustup](https://rustup.rs), not Homebrew or apt. The build tracks
-recent stable (1.85+), package-manager Rust pins whatever it shipped
-with, and rustup is what keeps a toolchain current. The public installer
-builds the current Rust implementation from source:
+Needs tmux 3.2+, curl, and Git. Cyclops builds from source, so it also
+needs a Rust toolchain — and the installer takes care of that itself:
+when `cargo` is missing it installs Rust with [rustup](https://rustup.rs)
+(non-interactive, your shell profiles untouched; `CYCLOPS_NO_RUSTUP=1`
+declines) and continues. If you install Rust yourself, use rustup rather
+than Homebrew or apt: the build tracks recent stable (1.85+),
+package-manager Rust pins whatever it shipped with, and rustup is what
+keeps a toolchain current. The public installer builds the current Rust
+implementation from source:
 
 ```bash
 curl -fsSL https://www.usecyclops.dev/install.sh | sh

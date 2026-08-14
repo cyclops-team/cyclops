@@ -17,8 +17,10 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 Use rustup rather than Homebrew or apt. A package-manager Rust pins the
 compiler it shipped with and cannot switch toolchains; this build tracks
 recent stable, and rustup's `rustup update stable` is what keeps one
-current. The installer checks for `cargo` before it builds and prints
-this same command when it is missing.
+current. You rarely need to run this yourself: when `cargo` is missing,
+the installer runs this same rustup step on its own (non-interactive,
+profiles untouched) and continues. `CYCLOPS_NO_RUSTUP=1` declines, and
+the installer stops with the command to run by hand instead.
 
 ## Install
 
