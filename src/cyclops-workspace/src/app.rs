@@ -2406,9 +2406,7 @@ async fn handle_mouse(
                 app.prefs.files_rows = files_rows_for_row(app, row);
                 // No `resize_client`: this seam is inside the sidebar, so
                 // no column changed hands and no pane reflows.
-                if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
-                    log_err(&app.home, &error);
-                }
+                app.save_prefs_or_log();
             }
             apply_live_divider(app, client).await?;
             if let Some(drag) = app.drag.take() {
@@ -2917,9 +2915,7 @@ fn remember_pinned_root(app: &mut App) {
     let root = Some(app.files_pinned.root().to_string_lossy().into_owned());
     if app.prefs.files_pinned_root != root {
         app.prefs.files_pinned_root = root;
-        if let Err(error) = persist::save_prefs(&app.home, &app.prefs) {
-            log_err(&app.home, &error);
-        }
+        app.save_prefs_or_log();
     }
 }
 
