@@ -42,6 +42,11 @@ pub fn pad(s: &str, width: usize) -> String {
     }
 }
 
+/// Max display width across a column's cells; an empty column costs 0.
+fn column_width<S: AsRef<str>>(cells: impl Iterator<Item = S>) -> usize {
+    cells.map(|s| display_width(s.as_ref())).max().unwrap_or(0)
+}
+
 /// Compact humane duration: "42s", "2m", "3h 12m", "5d 2h".
 pub fn human_duration(ms: u64) -> String {
     let s = ms / 1000;
@@ -122,6 +127,30 @@ fn detail_for(p: &PaneStatus, label: &str) -> Option<String> {
         return None;
     }
     Some(cmd.to_string())
+}
+
+/// One agent row: the name cell, already painted by the caller, then the
+/// state cell, then an optional detail after a dim separator.
+///
+/// The state cell is padded only when a detail follows it. The padding
+/// lives INSIDE the color run, so a trailing-space trim could not reach it
+/// afterwards: a row with nothing to say takes the unpadded cell instead,
+/// leaving no invisible column for a trim to miss.
+fn agent_row(
+    painted_name: &str,
+    state: AgentState,
+    detail: Option<&str>,
+    state_w: usize,
+    style: &Style,
+) -> String {
+    match detail {
+        Some(d) => format!(
+            "  {painted_name}  {}  {}",
+            style.state(state, &pad(&state_words(state), state_w)),
+            style.dim(d)
+        ),
+        None => format!("  {painted_name}  {}", grid::state_cell(state, style)),
+    }
 }
 
 pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> String {
@@ -207,16 +236,8 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
         }
     }
 
-    let label_w = rows
-        .iter()
-        .map(|r| display_width(&r.label))
-        .max()
-        .unwrap_or(0);
-    let state_w = rows
-        .iter()
-        .map(|r| display_width(&state_words(r.state)))
-        .max()
-        .unwrap_or(0);
+    let label_w = column_width(rows.iter().map(|r| r.label.as_str()));
+    let state_w = column_width(rows.iter().map(|r| state_words(r.state)));
 
     let multi = res.sessions.len() > 1;
     let mut out = vec![header, String::new()];
@@ -233,18 +254,13 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
             } else {
                 style.dim(&pad(&r.label, label_w))
             };
-            // Padded before painting: the column is measured on the
-            // words, and padding after the paint would count escape
-            // bytes as columns.
-            let line = match &r.detail {
-                Some(d) => format!(
-                    "  {label}  {}  {}",
-                    style.state(r.state, &pad(&state_words(r.state), state_w)),
-                    style.dim(d)
-                ),
-                None => format!("  {label}  {}", grid::state_cell(r.state, style)),
-            };
-            out.push(line);
+            out.push(agent_row(
+                &label,
+                r.state,
+                r.detail.as_deref(),
+                state_w,
+                style,
+            ));
         }
     }
     out.extend(unknown_rows(res, style));
@@ -347,32 +363,13 @@ pub fn render_list(
         // its own empty state.
         return format!("{header}\n\n  {}", copy::NO_AGENTS);
     }
-    let label_w = rows
-        .iter()
-        .map(|(l, _, _)| display_width(l))
-        .max()
-        .unwrap_or(0);
-    let state_w = rows
-        .iter()
-        .map(|(_, s, _)| display_width(&state_words(*s)))
-        .max()
-        .unwrap_or(0);
+    let label_w = column_width(rows.iter().map(|(l, _, _)| l.as_str()));
+    let state_w = column_width(rows.iter().map(|(_, s, _)| state_words(*s)));
     let grid = rows
         .iter()
         .map(|(label, state, hint)| {
             let name = style.role(label, &pad(label, label_w));
-            // The state cell is padded only when a hint follows it. The
-            // padding lives INSIDE the color run, so a trailing-space trim
-            // could not reach it afterwards: a row with nothing to say
-            // must take the unpadded cell, exactly as `status` does.
-            match hint {
-                Some(h) => format!(
-                    "  {name}  {}  {}",
-                    style.state(*state, &pad(&state_words(*state), state_w)),
-                    style.dim(h)
-                ),
-                None => format!("  {name}  {}", grid::state_cell(*state, style)),
-            }
+            agent_row(&name, *state, hint.as_deref(), state_w, style)
         })
         .collect::<Vec<_>>()
         .join("\n");
