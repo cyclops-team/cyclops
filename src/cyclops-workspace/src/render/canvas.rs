@@ -654,7 +654,10 @@ fn paint_pane_frame(
     };
     let label_bounds = Rect::new(title_bounds.x, top, label_budget, 1);
     super::overlay_text(buf, label_bounds, label_bounds.x, top, label, label_style);
-    let Some(shown_state) = shown_state.filter(|_| title_bounds.width > suffix_width) else {
+    let (Some(status), Some(shown_state)) = (
+        status,
+        shown_state.filter(|_| title_bounds.width > suffix_width),
+    ) else {
         return;
     };
     let mut x = title_bounds.x.saturating_add(label_budget);
@@ -666,14 +669,10 @@ fn paint_pane_frame(
         x,
         top,
         &shown_state,
-        if shown_state.starts_with('⚠') {
+        if status.attention {
             theme::attention_eye(paint)
         } else {
-            paint.state(
-                status
-                    .map(|status| status.color_state)
-                    .unwrap_or(decoration.state),
-            )
+            paint.state(status.color_state)
         },
     );
     // Close the label the way it opened, so the border rule restarts a cell

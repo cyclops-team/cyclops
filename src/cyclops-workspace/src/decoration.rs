@@ -28,6 +28,10 @@ pub struct PrimaryStatus {
     pub word: &'static str,
     /// Exact state whose semantic color represents this simplified status.
     pub color_state: AgentState,
+    /// Whether this status is the attention state. Two renderers used to
+    /// re-derive this by string-matching `glyph`, each a different way;
+    /// this field gives them the one answer `primary_status` already knows.
+    pub attention: bool,
 }
 
 /// Snapshot of daemon decoration for the workspace render pass.
@@ -105,6 +109,7 @@ impl DecorationSnapshot {
                 glyph: "⚠",
                 word: "needs attention",
                 color_state: dec.state,
+                attention: true,
             });
         }
         match dec.state {
@@ -113,16 +118,19 @@ impl DecorationSnapshot {
                 glyph: "○",
                 word: "idle",
                 color_state: AgentState::Idle,
+                attention: false,
             }),
             AgentState::IdleWithInput => Some(PrimaryStatus {
                 glyph: "○",
                 word: "idle",
                 color_state: AgentState::IdleWithInput,
+                attention: false,
             }),
             AgentState::Dead => Some(PrimaryStatus {
                 glyph: "✕",
                 word: "dead",
                 color_state: AgentState::Dead,
+                attention: false,
             }),
             // Occupied, not free: real work and a block the register has not
             // flagged both read ● on a compact surface. Whether a block needs
@@ -137,6 +145,7 @@ impl DecorationSnapshot {
                 } else {
                     AgentState::Working
                 },
+                attention: false,
             }),
         }
     }
@@ -361,6 +370,7 @@ mod tests {
                 glyph: "⚠",
                 word: "needs attention",
                 color_state: AgentState::BlockedPermission,
+                attention: true,
             })
         );
     }
@@ -382,6 +392,7 @@ mod tests {
                 glyph: "○",
                 word: "idle",
                 color_state: AgentState::IdleWithInput,
+                attention: false,
             })
         );
     }
@@ -414,6 +425,7 @@ mod tests {
                     glyph: "●",
                     word: "working",
                     color_state: state,
+                    attention: false,
                 }),
                 "{state} without needs_attention must not read as needs attention"
             );

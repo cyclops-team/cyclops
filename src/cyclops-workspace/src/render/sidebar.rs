@@ -762,7 +762,7 @@ fn paint_session_tree(
             // (`● Claude Code`). Unknown deliberately contributes no text.
             let mut x = content.x.saturating_add(3);
             if let Some(status) = DecorationSnapshot::primary_status(agent) {
-                let status_style = if status.glyph == "⚠" {
+                let status_style = if status.attention {
                     theme::attention_eye(paint)
                 } else {
                     paint.state(status.color_state)
