@@ -33,6 +33,7 @@
         "group": "Guides",
         "icon": "book",
         "pages": [
+          "guides/workspace",
           "guides/attach-tmux",
           "guides/coordinate-agents",
           "guides/sessions"

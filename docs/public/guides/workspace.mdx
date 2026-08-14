@@ -13,7 +13,7 @@ With no tmux server running, or none with sessions on it, Cyclops starts
 one: a fresh session named `main`, a single shell pane in the directory you
 ran it from, and tabs numbered `1`, `2`, `3`... No preset or manual
 `tmux new` is required. `cyclops start` is still the front door when you
-want a saved workspace or preset-built layout instead of a blank session.
+want a saved workspace or preset-built layout instead.
 
 Cyclops starts `cyclopsd` too, if nothing is answering. Every detected
 name, status glyph, and pane border decoration comes from the daemon, so
@@ -34,8 +34,8 @@ the sidebar reads `cyclopsd offline` for as long as that's true.
   `☰ menu` button and a `+` that creates a workspace from the focused
   pane's folder.
 
-A pane Cyclops has named carries that identity in its top border, for
-example `implementer · ● working`. Status collapses to one of four glyphs:
+A named pane carries its identity in its top border, e.g.
+`implementer · ● working`. Status collapses to one of four glyphs:
 
 | Glyph | Meaning |
 |-------|---------|
@@ -44,16 +44,15 @@ example `implementer · ● working`. Status collapses to one of four glyphs:
 | `⚠` | needs attention — an open item in the daemon's attention register |
 | `✕` | dead — the pane's process exited |
 
-Cyclops also asks the terminal to paint its own background in the theme's
-chrome color (OSC 11), which is the only way to reach the pixels of window
-padding outside the character grid. It's handed back the moment focus
-leaves the terminal and reapplied when focus returns.
+Cyclops also paints the terminal's own background in the theme's chrome
+color while the workspace has focus, and hands it back the moment focus
+leaves — the one way to reach the window padding outside the cell grid.
 
 ## Driving it
 
 Default bindings are prefix-first — `Ctrl+B` then a key — the same shape
 as tmux. There's no separate quit: `Ctrl+B` `d` detaches, and the tmux
-session (and anything running in it) keeps going in the background.
+session keeps running in the background.
 
 | Key | Action |
 |-----|--------|
@@ -65,7 +64,6 @@ session (and anything running in it) keeps going in the background.
 | `Ctrl+B` `x` / `z` | Close / zoom pane |
 | `Ctrl+B` `m` | Name the focused pane or agent |
 | `Ctrl+B` `w` | Create a session from the focused pane's folder |
-| `Ctrl+B` `[` / `]` | Previous / next session |
 | `Ctrl+B` `b` | Collapse or reopen the sidebar |
 | `Ctrl+B` `g` | Put the keyboard in the file panel; Esc gives it back |
 | `Ctrl+B` `s` | Send a message to an agent |
@@ -73,14 +71,9 @@ session (and anything running in it) keeps going in the background.
 
 Unbound keys, including modified keys like Claude Code's `Shift+Tab`, pass
 through to the focused pane — bare arrow keys included, since every shell
-and agent needs them for history and menus.
-
-A session made with `Ctrl+B` `w` (or the footer's `+`) uses the focused
-pane's folder as both its directory and its name — sanitized for tmux,
-with `-2`, `-3`... appended on conflicts — and keeps following that folder
-afterward: `cd` in its pane and the name updates to match. Rename it by
-hand (`Ctrl+B` `W`, or the right-click menu) and Cyclops stops touching the
-name for good.
+and agent needs them for history and menus. A session made with `Ctrl+B`
+`w` takes the folder's name and keeps following it on `cd`; a hand-typed
+rename (`Ctrl+B` `W`, or right-click) sticks for good.
 
 ### Mouse
 
@@ -88,36 +81,34 @@ name for good.
 - Drag the `⠿` grip in a pane's bottom-right corner onto another pane to
   swap them; the dropped pane stays focused in its new slot.
 - Drag the border between two stacked panes to resize them; drag the
-  sidebar's outer edge to resize it (capped at 42 cells, and never more
-  than half the terminal).
-- `[▴]` on a pane's top border collapses it to its own title bar, showing
-  only its identity; `[▾]` restores it. It only appears on a pane stacked
-  above or below another — a side-by-side pane has no rows to give up.
-  Collapsed state isn't saved between launches.
+  sidebar's outer edge to resize the sidebar (capped at 42 cells).
+- `[▴]` on a pane's top border collapses it to its own title bar; `[▾]`
+  restores it. It only appears on a pane stacked above or below another —
+  side-by-side panes have no rows to give up — and the collapse isn't
+  saved between launches.
 - Right-click a pane, tab, or workspace row for its menu (name, split,
   zoom, close, rename...).
 
 To send a message: `Ctrl+B` `s` or the `@` button, then `@name` followed
-by the message, taken literally — nothing after the name is re-split.
-Enter sends; `Alt+Enter` (or `Shift+Enter` / `Ctrl+J`) inserts a newline
-instead. The dialog stays open across the send and leaves `@name ` in the
-field, so a follow-up to the same agent is one keystroke away.
+by the message, taken literally. Enter sends; `Alt+Enter` (or
+`Shift+Enter` / `Ctrl+J`) inserts a newline instead. The dialog stays open
+across the send and leaves `@name ` in the field, so a follow-up to the
+same agent is one keystroke away.
 
 ## The file panel
 
 The sidebar's lower half is two browsers behind one header. The **agent
-browser** follows the focused agent's working directory — switch panes or
-let the agent `cd`, and within a second the panel matches. The **pinned
-browser** stays wherever you last left it and remembers that across
-launches (`files_pinned_root` in `config.toml`). The chip at the header's
-right end flips between them: `[pin]` while following the agent, `[agent]`
-while pinned.
+browser** follows the focused agent's working directory, within a second
+of a pane switch or a `cd`. The **pinned browser** stays wherever you last
+left it and remembers that across launches (`files_pinned_root` in
+`config.toml`). The header's chip flips between them: `[pin]` while
+following the agent, `[agent]` while pinned.
 
 Click a file and its path is typed into the focused pane as
-`@src/main.rs `, relative to the panel's root, with a trailing space.
-Nothing is submitted — you decide what to do with it. A file clicked in
-the pinned view still resolves for the focused agent: relative to its own
-folder when the file is under it, absolute otherwise.
+`@src/main.rs `, relative to the panel's root — nothing is submitted, you
+decide what to do with it. A file clicked in the pinned view still
+resolves for the focused agent: relative to its own folder when the file
+is under it, absolute otherwise.
 
 ## Preferences
 
@@ -133,24 +124,22 @@ motion = true
 ```
 
 Motion is what makes a pane border, status glyph, or dissolving notice
-fade instead of snap; nothing slides. It turns itself off under
-`NO_COLOR`, without a truecolor terminal, or on a terminal too slow to
-keep up, and `CYCLOPS_MOTION=0` forces it off for one run. Toggle it from
-the app menu's `Motion` item.
+fade instead of snap; it turns itself off under `NO_COLOR`, without
+truecolor, or on a slow terminal, and `CYCLOPS_MOTION=0` forces it off for
+one run. Toggle it from the app menu's `Motion` item.
 
 See [Configuration](/reference/configuration) for the rest of the
-`[workspace]` keys, including `files_pinned_root`, `workspace_order`, and
-custom `[workspace.bindings]`.
+`[workspace]` keys, including `files_pinned_root` and custom
+`[workspace.bindings]`.
 
 ## Related
 
 - `cyclops start` builds or restores a saved workspace or preset without
   opening the full-screen UI.
-- `cyclops watch` (formerly `cyclops ui`, which still works but prints a
-  deprecation note) is the narrower stream TUI: live events, no pane
-  canvas. `cyclops watch --json` and `--plain` give machine-readable or
-  line-oriented output instead.
+- `cyclops watch` (formerly `cyclops ui`, still works but deprecated) is
+  the narrower stream TUI — live events, no pane canvas. `--json` and
+  `--plain` give machine-readable or line-oriented output instead.
 - Plain `tmux attach -t <session>` (see
-  [Watch tmux sessions](/guides/attach-tmux)) reaches the same session but
-  without the workspace's chrome — no status glyphs, composer, or file
-  panel, since those belong to the workspace TUI, not to tmux itself.
+  [Watch tmux sessions](/guides/attach-tmux)) reaches the same session
+  without the workspace's chrome — no glyphs, composer, or file panel,
+  since those belong to the workspace TUI, not to tmux itself.
