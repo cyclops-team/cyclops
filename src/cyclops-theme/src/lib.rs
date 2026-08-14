@@ -26,14 +26,18 @@
 //! What it does not own: any layout, any glyph, and any word. A state's
 //! check mark, its name, and the column it sits in are `cyclops_ui::grid`
 //! and the CLI's renderers; this crate says only what color that cell
-//! takes. It also writes nothing: `cyclops theme <name>` writes the config
-//! key and the daemon repaints borders, both outside here. Reload is a
-//! stat that rides an event a caller was already handling
-//! ([`ThemeWatch`]), never a watcher thread and never a timer.
+//! takes. It writes exactly one thing, the config key that picks a theme
+//! ([`set_config_theme`]), which `cyclops theme <name>` and the
+//! workspace's theme picker both call instead of each carrying a writer of
+//! their own; the daemon repainting borders after that write is still
+//! outside here. Reload is a stat that rides an event a caller was already
+//! handling ([`ThemeWatch`]), never a watcher thread and never a timer.
 
 mod select;
 
-pub use select::{active, active_with, path_for, themes_dir, Selection, ThemeWatch, THEME_ENV};
+pub use select::{
+    active, active_with, path_for, set_config_theme, themes_dir, Selection, ThemeWatch, THEME_ENV,
+};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

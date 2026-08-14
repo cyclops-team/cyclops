@@ -17,7 +17,6 @@
 //! other surface resolves, through the same engine, so a preview that
 //! looked wrong would mean the theme is wrong.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use cyclops_proto::{AgentState, EYE_OPEN};
@@ -253,7 +252,7 @@ fn set(json: bool, style: &Style, name: &str) -> i32 {
     }
 
     let config = home.join("config.toml");
-    if let Err(e) = write_theme_key(&config, name) {
+    if let Err(e) = cyclops_theme::set_config_theme(&home, name) {
         eprintln!("{}", copy::theme_not_saved(&config, &e));
         return 1;
     }
@@ -342,63 +341,6 @@ fn nudge_daemon(want: &str) -> Switch {
         // An answer that names no theme confirms nothing about the screen.
         None => Switch::SavedNotLive(None),
     }
-}
-
-/// Set `theme = "<name>"` in the config, leaving the rest of the file
-/// exactly as the person who wrote it left it.
-///
-/// A rewrite through a TOML serializer would cost the file its comments
-/// and its key order. `cyclops start` refuses to touch a config you wrote
-/// for that reason, so this edits one line and adds nothing else.
-///
-/// Steps:
-/// 1. Read what is there. No file means one is created holding this key
-///    and nothing else. `cyclops start` writes the keys it owns only when
-///    there is no config at all, so a theme chosen before a first `start`
-///    gets that run's "add the session" line instead of a written one.
-/// 2. Find a top-level `theme =` line, which means before the first
-///    `[table]` header, and replace its value in place.
-/// 3. With no such line, insert one at the end of the top-level keys.
-/// 4. Write through a temp file and rename, so a crash mid-write cannot
-///    leave a half-written config where a whole one was.
-fn write_theme_key(path: &Path, name: &str) -> Result<(), String> {
-    let key = format!("theme = \"{name}\"");
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(format!("read {}: {e}", path.display())),
-    };
-
-    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    let top = lines
-        .iter()
-        .position(|l| l.trim_start().starts_with('['))
-        .unwrap_or(lines.len());
-    match lines[..top].iter().position(|l| is_theme_key(l)) {
-        Some(i) => lines[i] = key,
-        None => lines.insert(top, key),
-    }
-    let mut body = lines.join("\n");
-    body.push('\n');
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
-    let tmp = path.with_extension("toml.tmp");
-    let mut f = std::fs::File::create(&tmp).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    f.write_all(body.as_bytes())
-        .and_then(|()| f.sync_all())
-        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("write {}: {e}", path.display()))
-}
-
-/// A line that assigns the top-level `theme` key. Not a substring match:
-/// `default_workspace = "theme"` and a commented-out `# theme = "dark"`
-/// both contain the word and neither one sets anything.
-fn is_theme_key(line: &str) -> bool {
-    line.trim_start()
-        .strip_prefix("theme")
-        .is_some_and(|rest| rest.trim_start().starts_with('='))
 }
 
 #[cfg(test)]
@@ -492,57 +434,6 @@ mod tests {
                 .iter()
                 .collect::<std::collections::BTreeSet<_>>()
                 .len()
-        );
-    }
-
-    fn config_after(before: Option<&str>, name: &str) -> String {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        if let Some(b) = before {
-            std::fs::write(&path, b).expect("seed config");
-        }
-        write_theme_key(&path, name).expect("write theme key");
-        std::fs::read_to_string(&path).expect("read config")
-    }
-
-    /// The switch edits one line. Comments, key order, and every other key
-    /// survive it, because the file belongs to whoever wrote it.
-    #[test]
-    fn the_config_key_is_edited_not_rewritten() {
-        let before = "# my config\nsessions = [\"main\"]\ntheme = \"dark\"\nchrome = \"off\"\n";
-        assert_eq!(
-            config_after(Some(before), "light"),
-            "# my config\nsessions = [\"main\"]\ntheme = \"light\"\nchrome = \"off\"\n"
-        );
-        // No key yet: added after the top-level keys.
-        assert_eq!(
-            config_after(Some("sessions = [\"main\"]\n"), "light"),
-            "sessions = [\"main\"]\ntheme = \"light\"\n"
-        );
-        // No file yet.
-        assert_eq!(config_after(None, "light"), "theme = \"light\"\n");
-    }
-
-    /// A `theme` key has to be a key. A comment and a value that happens to
-    /// contain the word are neither, and rewriting one would silently
-    /// change something else or leave the real key alone.
-    #[test]
-    fn only_a_real_top_level_key_is_rewritten() {
-        assert_eq!(
-            config_after(
-                Some("# theme = \"dark\"\ndefault_workspace = \"theme\"\n"),
-                "light"
-            ),
-            "# theme = \"dark\"\ndefault_workspace = \"theme\"\ntheme = \"light\"\n"
-        );
-        // A key under a table is not the top-level key, so the new one
-        // goes above the table where the daemon will read it.
-        assert_eq!(
-            config_after(
-                Some("sessions = [\"main\"]\n[other]\ntheme = \"x\"\n"),
-                "light"
-            ),
-            "sessions = [\"main\"]\ntheme = \"light\"\n[other]\ntheme = \"x\"\n"
         );
     }
 }

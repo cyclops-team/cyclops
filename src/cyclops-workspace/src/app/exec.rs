@@ -1138,63 +1138,8 @@ fn save_theme_choice(home: &Path, name: &str) -> Result<String, String> {
     if !theme.paints_anything() {
         return Err(copy::theme_sets_no_colors(name));
     }
-    write_theme_key(&home.join("config.toml"), name).map_err(|e| copy::theme_not_saved(&e))?;
+    cyclops_theme::set_config_theme(home, name).map_err(|e| copy::theme_not_saved(&e))?;
     Ok(theme.name().to_string())
-}
-
-/// Set `theme = "<name>"` in the config, leaving the rest of the file
-/// exactly as the person who wrote it left it. A mirror of the CLI's
-/// `write_theme_key` (src/cyclops/src/theme.rs), kept line for line so
-/// the two writers cannot drift; change both together.
-///
-/// Steps:
-/// 1. Read what is there. No file means one is created holding this key
-///    and nothing else.
-/// 2. Find a top-level `theme =` line, which means before the first
-///    `[table]` header, and replace its value in place.
-/// 3. With no such line, insert one at the end of the top-level keys.
-/// 4. Write through a temp file and rename, so a crash mid-write cannot
-///    leave a half-written config where a whole one was.
-fn write_theme_key(path: &Path, name: &str) -> Result<(), String> {
-    use std::io::Write;
-
-    let key = format!("theme = \"{name}\"");
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(format!("read {}: {e}", path.display())),
-    };
-
-    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    let top = lines
-        .iter()
-        .position(|l| l.trim_start().starts_with('['))
-        .unwrap_or(lines.len());
-    match lines[..top].iter().position(|l| is_theme_key(l)) {
-        Some(i) => lines[i] = key,
-        None => lines.insert(top, key),
-    }
-    let mut body = lines.join("\n");
-    body.push('\n');
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
-    let tmp = path.with_extension("toml.tmp");
-    let mut f = std::fs::File::create(&tmp).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    f.write_all(body.as_bytes())
-        .and_then(|()| f.sync_all())
-        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("write {}: {e}", path.display()))
-}
-
-/// A line that assigns the top-level `theme` key. Not a substring match:
-/// `default_workspace = "theme"` and a commented-out `# theme = "dark"`
-/// both contain the word and neither one sets anything.
-fn is_theme_key(line: &str) -> bool {
-    line.trim_start()
-        .strip_prefix("theme")
-        .is_some_and(|rest| rest.trim_start().starts_with('='))
 }
 
 /// Move `source` to sit immediately before/after `insertion`'s target.
@@ -2604,31 +2549,6 @@ mod tests {
         );
         select(&mut app, 1);
         assert_eq!(dim(&app), (0x33, 0x33, 0x33), "the picker is not wedged");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// The writer mirrors the CLI's: one line edited, everything else kept.
-    #[test]
-    fn the_theme_key_is_edited_not_rewritten() {
-        let home = scratch_home("exec-write-theme-key");
-        let config = home.join("config.toml");
-        std::fs::write(
-            &config,
-            "# note\nsessions = [\"main\"]\n[other]\ntheme = \"x\"\n",
-        )
-        .expect("seed config");
-        write_theme_key(&config, "light").expect("write key");
-        assert_eq!(
-            std::fs::read_to_string(&config).expect("read config"),
-            "# note\nsessions = [\"main\"]\ntheme = \"light\"\n[other]\ntheme = \"x\"\n"
-        );
-        // No file yet: created holding the key alone.
-        std::fs::remove_file(&config).expect("remove config");
-        write_theme_key(&config, "light").expect("write key");
-        assert_eq!(
-            std::fs::read_to_string(&config).expect("read config"),
-            "theme = \"light\"\n"
-        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
