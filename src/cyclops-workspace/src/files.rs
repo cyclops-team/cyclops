@@ -81,6 +81,40 @@ impl FileRow {
     }
 }
 
+/// Which of the panel's two browsers is showing.
+///
+/// Two trees, one panel: the agent browser re-roots itself onto the
+/// focused pane's working directory, and the pinned browser stays
+/// wherever the operator last put it (a downloads folder, a spec
+/// directory), surviving restarts through
+/// `persist::WorkspacePrefs::files_pinned_root`. One panel because the
+/// sidebar has one panel's worth of rows; the header chip flips between
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FilesView {
+    #[default]
+    Agent,
+    Pinned,
+}
+
+impl FilesView {
+    pub fn other(self) -> Self {
+        match self {
+            FilesView::Agent => FilesView::Pinned,
+            FilesView::Pinned => FilesView::Agent,
+        }
+    }
+
+    /// The header chip: names the view you would switch TO, because the
+    /// chip is a button and a button says what it does, not what is.
+    pub fn chip(self) -> &'static str {
+        match self {
+            FilesView::Agent => "[pin]",
+            FilesView::Pinned => "[agent]",
+        }
+    }
+}
+
 /// The sidebar's view of one directory tree.
 #[derive(Debug, Clone, Default)]
 pub struct FileTree {
@@ -351,6 +385,14 @@ impl FileTree {
     /// actually is.
     pub fn anchor_at(&mut self, path: impl Into<PathBuf>) {
         self.anchor = path.into();
+    }
+
+    /// The folder references are written relative to. Empty until the
+    /// first probe answers. The probe also reads this to tell "the agent
+    /// moved" from "the operator browsed": browsing moves `root`, never
+    /// this.
+    pub fn anchor(&self) -> &Path {
+        &self.anchor
     }
 
     /// Empty until the first probe answers. Falling back to the browsing

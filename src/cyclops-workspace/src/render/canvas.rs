@@ -20,7 +20,6 @@ use crate::layout::{layout_gap_overhead, layout_geometry, DividerSeg, PaneGaps};
 use crate::model::{PaneSlot, RuntimeRegistry, TabModel};
 use crate::resilience::LinkState;
 use crate::runtime::{CellPos, PaneRuntime};
-use crate::selection::Selection;
 use crate::theme::{self, Paint};
 
 /// Chrome state passed through the window paint pass.
@@ -33,7 +32,10 @@ pub struct WindowPaintCtx<'a> {
     pub minimized: &'a std::collections::HashMap<String, u16>,
     pub hits: &'a mut HitMap,
     pub decoration: &'a DecorationSnapshot,
-    pub selection: Option<&'a Selection>,
+    /// The pane holding the live selection, if any. Only the owner's id
+    /// travels here: the geometry lives in that pane's runtime, anchored
+    /// to content, and the painter projects it per frame.
+    pub selection: Option<&'a str>,
     pub drag: Option<&'a DragState>,
     /// The workspace's transient notice, painted on the focused pane's
     /// bottom border. See [`paint_notice`] for why that row.
@@ -391,10 +393,10 @@ fn paint_pane_slot(
         base = base.add_modifier(Modifier::DIM);
     }
     if let Some(runtime) = runtimes.get(&slot.pane_id) {
-        let selection = ctx.selection.filter(|s| s.pane_id == slot.pane_id);
+        let selected = ctx.selection == Some(slot.pane_id.as_str());
         paint_pane_cells(
             runtime,
-            selection,
+            selected,
             vis,
             buf,
             base,
@@ -558,6 +560,7 @@ fn paint_pane_frame(
         };
         super::overlay_text(buf, bounds, cell.x, cell.y, glyph, border_style);
     }
+    let title_left = title_left(slot, bounds, can_shrink);
 
     // Controls live in the border instead of overwriting the first row of
     // the child TUI. They remain available on unfocused panes.
@@ -594,7 +597,15 @@ fn paint_pane_frame(
     // against the split controls. The title budget below stops at the
     // returned boundary, so the hint never collides with the title text,
     // and the frame's drag hit regions are untouched.
-    let control_left = paint_scroll_hint(slot, bounds, control_left, scrolled, buf, border_style);
+    let control_left = paint_scroll_hint(
+        slot,
+        bounds,
+        control_left,
+        title_left,
+        scrolled,
+        buf,
+        border_style,
+    );
 
     let Some(decoration) = ctx
         .decoration
@@ -604,7 +615,7 @@ fn paint_pane_frame(
         return;
     };
     let label = DecorationSnapshot::sidebar_name(decoration);
-    let Some(title_bounds) = pane_title_rect(slot, bounds, control_left) else {
+    let Some(title_bounds) = pane_title_rect(slot, bounds, control_left, title_left) else {
         return;
     };
     let status = DecorationSnapshot::primary_status(decoration);
@@ -706,9 +717,16 @@ fn paint_notice(frame: Rect, bounds: Rect, notice: &str, buf: &mut Buffer, paint
     super::overlay_text(buf, bounds, frame.x, y, &text, theme::chrome_notice(paint));
 }
 
-fn pane_title_rect(slot: &PaneSlot, bounds: Rect, control_left: u16) -> Option<Rect> {
+/// The columns the title strip may paint: from `title_left` (already
+/// clear of the collapse control, see `paint_pane_frame`) up to the
+/// leftmost control on the right.
+fn pane_title_rect(
+    slot: &PaneSlot,
+    bounds: Rect,
+    control_left: u16,
+    title_left: u16,
+) -> Option<Rect> {
     let top = slot.rect.y.saturating_sub(1).max(bounds.y);
-    let title_left = slot.rect.x.saturating_add(1);
     (title_left < control_left).then(|| Rect::new(title_left, top, control_left - title_left, 1))
 }
 
@@ -720,6 +738,7 @@ fn paint_scroll_hint(
     slot: &PaneSlot,
     bounds: Rect,
     control_left: u16,
+    title_left: u16,
     scrolled: usize,
     buf: &mut Buffer,
     border_style: Style,
@@ -729,7 +748,6 @@ fn paint_scroll_hint(
     }
     let text = format!(" {scrolled} back ");
     let width = u16::try_from(text.chars().count()).unwrap_or(u16::MAX);
-    let title_left = slot.rect.x.saturating_add(1);
     let Some(x) = control_left.checked_sub(width).filter(|x| *x > title_left) else {
         return control_left;
     };
@@ -775,6 +793,19 @@ fn has_vertical_neighbour(slot: &PaneSlot, slots: &[PaneSlot]) -> bool {
 /// that does nothing. And a pane too narrow to hold both this and the
 /// right-hand trio without them touching keeps the trio, which is the older
 /// and more used set.
+/// The first column the title strip may use: clear of the collapse
+/// control when it is painted, the pane's own left edge plus one
+/// otherwise. One owner, read by both the painter and the hit-test —
+/// the title burying the control was exactly the two of them agreeing
+/// on the wrong floor, and two copies of this match is how they drift
+/// apart again.
+fn title_left(slot: &PaneSlot, bounds: Rect, can_shrink: bool) -> u16 {
+    match minimize_cell(slot, bounds, can_shrink) {
+        Some(cell) => cell.x + cell.width + 1,
+        None => slot.rect.x.saturating_add(1),
+    }
+}
+
 fn minimize_cell(slot: &PaneSlot, bounds: Rect, can_shrink: bool) -> Option<Rect> {
     if !can_shrink {
         return None;
@@ -828,10 +859,11 @@ fn push_pane_overlay_hits(
     let right = (slot.rect.x + slot.rect.width).min(bounds.x + bounds.width - 1);
     let controls = pane_controls(slot, bounds);
     let control_left = controls.map_or(right, |controls| controls.grip.x);
+    let title_left = title_left(slot, bounds, can_shrink);
     if let Some((pane, rect)) = decoration
         .pane(&slot.pane_id)
         .filter(|pane| pane.label.is_some())
-        .zip(pane_title_rect(slot, bounds, control_left))
+        .zip(pane_title_rect(slot, bounds, control_left, title_left))
     {
         let target = if pane.needs_attention {
             HitTarget::AttentionIndicator {
@@ -881,20 +913,21 @@ fn push_pane_overlay_hits(
 /// cell in the same visit instead of a second walk over a mirrored grid.
 fn paint_pane_cells(
     runtime: &PaneRuntime,
-    selection: Option<&Selection>,
+    selected: bool,
     area: Rect,
     buf: &mut Buffer,
     base: Style,
     highlight: Style,
     palette: Option<&[RtColor; 16]>,
 ) {
-    let range = selection.map(|sel| {
-        if sel.from.row < sel.to.row || (sel.from.row == sel.to.row && sel.from.col <= sel.to.col) {
-            (sel.from, sel.to)
-        } else {
-            (sel.to, sel.from)
-        }
-    });
+    // Projected fresh from the engine's content-anchored selection every
+    // frame: scrolling and new output move the text, and the highlight has
+    // to be wherever the text is now, not where it was last painted.
+    let range = if selected {
+        runtime.selection_screen_range()
+    } else {
+        None
+    };
     runtime.for_each_visible_cell(|col, row, cell| {
         if col >= area.width || row >= area.height {
             return;
@@ -1029,7 +1062,7 @@ mod tests {
         term.draw(|f| {
             paint_pane_cells(
                 &rt,
-                None,
+                false,
                 f.area(),
                 f.buffer_mut(),
                 theme::pane_cell(&theme),
@@ -1061,7 +1094,7 @@ mod tests {
         term.draw(|f| {
             paint_pane_cells(
                 &rt,
-                None,
+                false,
                 f.area(),
                 f.buffer_mut(),
                 theme::pane_cell(&theme),
@@ -1154,7 +1187,7 @@ mod tests {
         term.draw(|f| {
             paint_pane_cells(
                 &rt,
-                None,
+                false,
                 f.area(),
                 f.buffer_mut(),
                 theme::pane_cell(paint),
@@ -1272,7 +1305,7 @@ mod tests {
         term.draw(|f| {
             paint_pane_cells(
                 &rt,
-                None,
+                false,
                 f.area(),
                 f.buffer_mut(),
                 theme::pane_cell(&paint),
@@ -2168,18 +2201,14 @@ mod tests {
     #[test]
     fn selection_highlight_renders_on_test_backend() {
         use crate::runtime::CellPos;
-        use crate::selection::Selection;
 
         let tab = two_pane_tab();
         let mut runtimes = RuntimeRegistry::default();
         let mut rt = crate::runtime::PaneRuntime::new(5, 2);
         rt.feed(b"hello\r\n");
+        // The geometry lives in the runtime now; the ctx names the owner.
+        rt.anchor_selection(CellPos { col: 0, row: 0 }, CellPos { col: 2, row: 0 });
         runtimes.insert("%0".into(), rt);
-        let sel = Selection {
-            pane_id: "%0".into(),
-            from: CellPos { col: 0, row: 0 },
-            to: CellPos { col: 2, row: 0 },
-        };
         let backend = TestBackend::new(40, 12);
         let mut term = Terminal::new(backend).unwrap();
         let theme = Paint::for_test();
@@ -2188,7 +2217,7 @@ mod tests {
             let paused = std::collections::HashSet::new();
             let dec = DecorationSnapshot::default();
             let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
-            ctx.selection = Some(&sel);
+            ctx.selection = Some("%0");
             paint_window(&tab, &runtimes, f.area(), f.buffer_mut(), &theme, &mut ctx);
         })
         .unwrap();
@@ -2210,6 +2239,62 @@ mod tests {
             buf[(4, 1)].bg,
             ground,
             "cells past the selection keep the pane ground"
+        );
+    }
+
+    /// The v7 report: the agent title painted from the pane's top-left
+    /// buried the collapse control under the label, leaving a dead `[`.
+    /// With a labeled, shrinkable pane both must be whole: the control's
+    /// three cells untouched, the label starting after them.
+    #[test]
+    fn agent_title_never_covers_the_collapse_control() {
+        use crate::decoration::{DecorationSnapshot, PaneDecoration};
+        use cyclops_proto::AgentState;
+
+        let tab = two_pane_tab();
+        let runtimes = RuntimeRegistry::default();
+        let mut decoration = DecorationSnapshot {
+            online: true,
+            ..Default::default()
+        };
+        decoration.panes.insert(
+            "%0".into(),
+            PaneDecoration {
+                pane_id: "%0".into(),
+                window_id: "@0".into(),
+                label: Some("implementer".into()),
+                manifest: Some("claude".into()),
+                manifest_display_name: None,
+                state: AgentState::Idle,
+                needs_attention: false,
+            },
+        );
+
+        let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let mut hits = HitMap::default();
+        let paint = Paint::for_test();
+        term.draw(|f| {
+            let paused = std::collections::HashSet::new();
+            let mut ctx = ctx_defaults(&mut hits, &paused, &decoration);
+            paint_window(&tab, &runtimes, f.area(), f.buffer_mut(), &paint, &mut ctx);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let flat = flatten(buf);
+        assert!(
+            flat.contains(PANE_MINIMIZE),
+            "the collapse control survives a labeled pane: {flat}"
+        );
+        assert!(flat.contains("implementer"), "and the label still shows");
+        // Order on the shared border row: control first, label after it.
+        let row: String = (0..40u16)
+            .map(|x| buf[(x, 0)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        let control = row.find("[▴]").expect("control on the top border");
+        let label = row.find("implementer").expect("label on the top border");
+        assert!(
+            label > control + 2,
+            "the label must start after the control ends: {row}"
         );
     }
 

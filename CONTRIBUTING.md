@@ -35,6 +35,16 @@ python3 scripts/check-doc-paths.py
 Clippy and the test suite take a few minutes; the rest are usually quick.
 Run formatting and clippy while you work.
 
+One command runs all five in that order, cheapest first, with per-gate
+timing: `./scripts/check.sh`. Its `--fast` flag stops after the test
+suite, which is the right pass while iterating; the full run is for the
+moment before a push. Neither changes any flag CI uses.
+
+While working inside one crate, the honest inner loop is smaller still:
+`cargo test -p <crate>` plus clippy on save. The full workspace suite
+exists to catch what crosses crate boundaries, and it only has to run
+before the tree leaves your machine.
+
 Touching `scripts/install.sh`, `website/static/install.sh`, or installer
 output adds one more check, and it does a release build. The two installer
 files must remain byte-for-byte identical:

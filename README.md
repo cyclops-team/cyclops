@@ -19,15 +19,22 @@ Everything below is built and tested by the Cyclops team.
 
 ## Install
 
-Needs tmux 3.2+, curl, Git, and a Rust toolchain. The public installer builds
-the current Rust implementation from source:
+Needs tmux 3.2+, curl, Git, and a Rust toolchain: Cyclops builds from
+source, so `cargo` is not optional. No Rust on the machine? Install it
+with [rustup](https://rustup.rs), not Homebrew or apt. The build tracks
+recent stable (1.85+), package-manager Rust pins whatever it shipped
+with, and rustup is what keeps a toolchain current. The public installer
+builds the current Rust implementation from source:
 
 ```bash
 curl -fsSL https://www.usecyclops.dev/install.sh | sh
 ```
 
 That builds both binaries, puts them where your shell looks, and writes
-the config and detection manifests. It prints every file it touches, backs
+the config and detection manifests. Budget a few minutes for the first
+run: it is a full release compile of a Rust workspace, and on older or
+low-power machines it can take considerably longer. `cyclops update`
+rebuilds the same way. It prints every file it touches, backs
 up any shell profile it edits, and never uses sudo. `--prefix DIR` picks
 where the binaries go, `--no-path` leaves your profile alone, and
 `--uninstall` takes it all back off. To install a clone instead:
@@ -106,12 +113,13 @@ Three interfaces, one system:
    language.
 2. **Your agents** use the `cyclops` CLI underneath — send, reply, wait,
    check delivery. Teaching an agent the verbs and the safety rules is one
-   file: [skills/cyclops/SKILL.md](skills/cyclops/SKILL.md). Nothing
-   installs it for you yet: copy it where your agent looks for
-   instructions (for Claude Code, `~/.claude/skills/cyclops/SKILL.md`), or
-   just tell the agent to use cyclops — every command explains itself with
-   `--help`, and every delivered message carries its own reply
-   instructions.
+   file: [skills/cyclops/SKILL.md](skills/cyclops/SKILL.md). The installer
+   places it for Claude Code by itself: setup writes
+   `~/.claude/skills/cyclops/SKILL.md` when `~/.claude` exists, and never
+   overwrites a copy you edited. For other agents, copy it where that
+   agent looks for instructions, or just tell the agent to use cyclops —
+   every command explains itself with `--help`, and every delivered
+   message carries its own reply instructions.
 3. **Scripts and CI** use the same CLI with `--json`. The ladder below is
    that layer, rung by rung.
 

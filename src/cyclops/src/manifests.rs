@@ -71,6 +71,7 @@ pub fn dir(home: &Path) -> PathBuf {
 /// hash to append.
 const EVER_SHIPPED_FNV64: &[&str] = &[
     "000da241c916d3cb",
+    "0e7c902fb67d702a",
     "12765e334728f40b",
     "2893de300e4fc944",
     "3292eae226f54f79",

@@ -1,0 +1,39 @@
+
+╭─── Claude Code v2.1.227 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                                            │
+│                 Welcome back Yahir!                │ Run /init to create a CLAUDE.md file with instructions for Claude                   │
+│                                                    │ ─────────────────────────────────────────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                                                          │
+│                      ▝▜█████▛▘                     │ Fixed feature flags being evaluated without the user's subscription tier when a se… │
+│                        ▘▘ ▝▝                       │ Fixed every Bash command failing under `claude-code-action` with `allowed_non_writ… │
+│     Opus 5 with xhigh effort · Claude Pro ·        │ Fixed `/tui` bringing back a conversation that had been rewound to before its firs… │
+│     yahirhernandez304@gmail.com's Organization     │ /release-notes for more                                                             │
+│                  ~/projects/clops                  │                                                                                     │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ▎ Fable 5 is now a standard part of your Max plan
+ ▎ You can use up to 50% of your weekly usage limit on Fable 5. If you hit your limit, you can continue on Fable 5 with usage credits. Fable
+ ▎ 5 draws down usage faster than Opus 5. Run /model and select Fable to use it. Learn more:
+ ▎ https://support.claude.com/en/articles/15424964-claude-fable-5-promotional-access
+
+❯ Reply with exactly the word OK and nothing else.
+
+⏺ OK
+
+✻ Cooked for 2s
+
+
+
+
+
+
+
+
+
+
+                                                                                                               Ctrl+Y to paste deleted text
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ [Pasted text #1 +8 lines]
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Opus 5 · xhigh · ~/projects/clops · Ctx: 97% · 5h: 93% · 7d: 94% · 1000K window · 28K used
+  paste again to expand

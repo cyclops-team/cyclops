@@ -1112,6 +1112,18 @@ pub fn run_setup(json_out: bool, style: &Style, wire_hooks: bool) -> i32 {
         Vec::new()
     };
 
+    // The agent skill rides the same opt-in as the vendor hooks, because
+    // it is the same kind of act: writing into another tool's home so
+    // that tool's agent can use cyclops. Behind `--wire-hooks` it reaches
+    // every install (the installer passes the flag) and no test run
+    // (nothing else does), and it skips machines where the agent CLI is
+    // not present rather than inventing a ~/.claude for it.
+    let skills = if wire_hooks && std::env::var_os("CYCLOPS_NO_VENDOR_HOOKS").is_none() {
+        crate::skillseed::seed()
+    } else {
+        Vec::new()
+    };
+
     if json_out {
         println!(
             "{}",
@@ -1131,6 +1143,15 @@ pub fn run_setup(json_out: bool, style: &Style, wire_hooks: bool) -> i32 {
                     "unchanged": w.unchanged,
                     "backup": w.backup.as_ref().map(|b| b.display().to_string()),
                 })).collect::<Vec<_>>(),
+                // Additive, like every wire change. Machines without the
+                // agent CLI report nothing rather than a "no_agent" row,
+                // because absence is the ordinary case, not an event.
+                "skill": skills.iter()
+                    .filter(|s| s.outcome != crate::skillseed::Outcome::NoAgent)
+                    .map(|s| json!({
+                        "path": s.path.display().to_string(),
+                        "outcome": crate::skillseed::json_word(&s.outcome),
+                    })).collect::<Vec<_>>(),
             })
         );
         return if usable { 0 } else { 1 };
@@ -1153,6 +1174,11 @@ pub fn run_setup(json_out: bool, style: &Style, wire_hooks: bool) -> i32 {
     }
     for note in hook_notes(&wired) {
         println!("  {}", style.dim(&note));
+    }
+    for s in &skills {
+        if let Some(note) = crate::skillseed::note(s) {
+            println!("  {}", style.dim(&note));
+        }
     }
     0
 }

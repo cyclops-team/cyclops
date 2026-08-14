@@ -1192,3 +1192,74 @@ audited 0.146.x shape on this build. This closes work package 2 at the plan's
 explicit stop condition; revisit it only when a current Codex build or payload
 shape actually collapses. The existing Codex ghost/typed rules remain the only
 measured manifest change.
+
+## F55. Claude Code 2.1.222 composer byte shapes: NBSP is the composer's signature (MEASURED)
+
+A live delivery held with cause `idle_with_input` against a Claude pane
+whose composer was empty except for ghost/suggestion text. The shipped
+plain rule `^\s*❯\s+\S` cannot tell a human draft from anything else that
+paints text after a `❯`, so the escaped capture had to carry the
+discriminator, and the exact bytes had not been measured for Claude. An
+isolated probe measured them: `claude` launched in a detached 140x40 pane
+on its own tmux socket, captured with `capture-pane -p` and `-p -e` while
+empty, with typed text, with a collapsed paste chip, and after a completed
+turn.
+
+Measured shapes (escaped capture):
+
+```text
+empty composer   ESC[39m❯<NBSP>
+typed text       ESC[39m❯<NBSP>fix
+paste chip       ESC[39m❯<NBSP>[Pasted text #1 +8 lines]
+submitted echo   ESC[38;5;239mESC[48;5;237m❯ ESC[38;5;231mReply with…ESC[39m
+```
+
+Probe command shape:
+
+```text
+tmux -L cycprobe new-session -d -x 140 -y 40 -c <repo> "env -u CLAUDECODE claude"
+tmux -L cycprobe send-keys -t %0 -l 'fix'          # then C-u, then paste-buffer -p
+tmux -L cycprobe capture-pane -p -t %0             # and capture-pane -e -p
+```
+
+Three facts matter. The live composer line is `ESC[39m` + glyph + a
+NO-BREAK space (U+00A0), and real input, typed or pasted, follows that
+NBSP with no styling at all. The submitted-prompt echo in scrollback
+repaints the glyph with its own colors and a PLAIN space, so it can never
+carry the NBSP signature, which closes a second latent false positive:
+that echo matches the plain staged-input regex whenever it lands in the
+bottom window. The ghost line itself never rendered during this probe
+(history prefixes, slash prefixes, and a completed turn all failed to
+produce one on 2.1.222), so its dim-run shape is carried by the same
+convention codex and cursor measured (F19); the staged-input esc clause
+does not depend on it, only on real input being unstyled after the NBSP.
+
+Fixtures: `src/cyclops-manifest/tests/fixtures/claude_{typed_composer,pasted_chip,prompt_echo}_{plain,esc}.txt`.
+
+## F56. The VT engine's 2x1 floor is documented but not enforced (MEASURED)
+
+A cyclops pane in which the operator ssh'd to a remote machine and
+attached tmux there crashed the workspace. The pane's content is just a
+full-screen program's byte stream; what killed the app was geometry, not
+bytes. alacritty_terminal 0.26 declares `MIN_COLUMNS = 2` and
+`MIN_SCREEN_LINES = 1` and enforces neither: `Term::new` and
+`Term::resize` accept zero, and a grid sized below the floor panics on
+the next cell write or resize (measured: the engine's grid/resize.rs
+line 291, in the registry copy of alacritty_terminal 0.26.0, panics when
+the recorded nested-tmux stream is fed through a `resize(0, 0)`; a
+zero-width grid also panics on the first byte that writes a cell). Pane dimensions
+reach `PaneRuntime` from tmux layout parsing and can pass through zero
+while windows churn, which an attaching full-screen client provokes.
+
+Probe: `src/cyclops-workspace/tests/fixtures/nested_tmux_client.raw` is a real pipe-pane
+recording (tmux 3.7b, 140x40) of an inner `tmux -L nestinner` starting,
+attaching, running seq and ls, splitting, and detaching. The regression
+test `a_nested_tmux_client_byte_stream_never_panics_the_runtime` feeds it
+at seven geometries down to 0x0; before the clamp it dies inside the
+engine, after it every read surface stays total.
+
+Fix shape: `PaneRuntime` clamps every path that sizes the engine
+(`new`, `resize`, `reset`) to the engine's own floor. Nothing detects or
+manages the nested tmux itself: the pane is an opaque terminal on
+purpose, and the daemon already reads it as `? unknown` (ssh matches no
+manifest).

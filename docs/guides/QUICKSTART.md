@@ -33,6 +33,9 @@ else should match line for line.
 curl -fsSL https://www.usecyclops.dev/install.sh | sh
 ```
 
+Building from source needs tmux 3.2+ and a Rust toolchain; [install.md](install.md)
+covers getting Rust with rustup when `cargo` is missing.
+
 It builds both binaries, puts them where your shell looks, and writes the
 config and detection manifests. It ends by telling you whether this shell
 can already find them:

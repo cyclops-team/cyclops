@@ -4,8 +4,21 @@
 
 - macOS or Linux
 - tmux 3.2 or newer (`tmux -V`)
-- Rust toolchain (`cargo`)
+- Rust toolchain (`cargo`), recent stable (1.85+) — Cyclops builds from
+  source, so this is a hard requirement, not a contributor extra
 - curl and Git (for the one-line source install)
+
+No Rust on the machine? Install it with [rustup](https://rustup.rs):
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Use rustup rather than Homebrew or apt. A package-manager Rust pins the
+compiler it shipped with and cannot switch toolchains; this build tracks
+recent stable, and rustup's `rustup update stable` is what keeps one
+current. The installer checks for `cargo` before it builds and prints
+this same command when it is missing.
 
 ## Install
 
@@ -18,6 +31,12 @@ tests. It clones the current `main` branch into a temporary directory,
 builds both binaries, puts them where your shell looks, writes the config
 and detection manifests, proves the result runs, and removes the clone.
 It never uses sudo.
+
+The build step dominates the install time: it is a full release compile
+of a Rust workspace, a few minutes on a fast machine and noticeably
+longer on older or low-power hardware. That cost returns on `cyclops
+update`, which rebuilds the same way. Prebuilt binaries are not published
+yet.
 
 To inspect the installer before running it, clone the repository instead:
 
@@ -135,6 +154,14 @@ them every pane reads `? unknown` and no message can be delivered to one.
 `--setup-only` writes them and opens nothing. A plain `cyclops start`
 writes the same files on its way to opening a workspace, so a machine that
 has run either one is set up.
+
+The installer passes one more flag, `--wire-hooks`, which extends setup
+into the agent CLIs installed on the machine: it wires ack hooks for the
+vendors that read them from a file, and it places the agent skill for
+Claude Code at `~/.claude/skills/cyclops/SKILL.md` so agents there know
+the cyclops verbs without being taught by hand. Both steps run only for
+CLIs whose directory already exists, never overwrite a file you edited,
+and are skipped entirely when `CYCLOPS_NO_VENDOR_HOOKS` is set.
 
 The long way, by hand. Create `~/.cyclops/config.toml`:
 

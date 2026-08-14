@@ -5,6 +5,75 @@ versions are unreleased until admin cuts a tag.
 
 ## [Unreleased]
 
+### Added (v7)
+
+- The agent skill installs itself. `skills/cyclops/SKILL.md` taught an
+  agent the cyclops verbs but lived only in the repo, so "use the cyclops
+  skill" failed on every install. The binary now carries it, and setup
+  behind the installer's `--wire-hooks` opt-in places it at
+  `~/.claude/skills/cyclops/SKILL.md` when Claude Code is present, under
+  the same rules as the vendor hooks: the vendor directory is never
+  created, a copy the operator edited is never replaced, and
+  `CYCLOPS_NO_VENDOR_HOOKS=1` declines the whole step. Its doc links now
+  point at the repository on GitHub so the file works from wherever it is
+  installed.
+- The file panel is two browsers. The agent browser follows the focused
+  agent's working directory (a pane switch or a `cd` retargets it within
+  a second); the pinned browser stays wherever the operator last browsed
+  it and remembers that across launches. The header chip flips between
+  them, and pinned-view references still resolve for the agent: relative
+  under its folder, absolute outside it.
+- Editing chords for pane input. `Ctrl+Backspace` reaches the pane as
+  delete-word-back, `Cmd+Backspace` as kill-to-line-start, and `Cmd+A`
+  arms the GUI gesture: the delete pressed next clears the whole input
+  line, anything else forgets the arm. The workspace requests the kitty
+  keyboard protocol for the chords terminals cannot deliver natively and
+  degrades silently where it is not spoken.
+- The window background follows focus. The theme's ground is painted onto
+  the terminal only while the workspace is being looked at: focus leaves
+  and the terminal's own background comes back, focus returns and the
+  theme does.
+- `./scripts/check.sh` runs the five CI gates in one command, cheapest
+  first, with per-gate timing; `--fast` stops after the test suite for
+  the inner loop.
+
+### Fixed (v7)
+
+- A remote tmux inside a pane crashed the workspace. The pane's bytes
+  were never the problem — the churned geometry was: the VT engine
+  documents a 2x1 floor and does not enforce it, and a zero-sized grid
+  panics on the next cell write or resize (F56). `PaneRuntime` now clamps
+  every path that sizes the engine, a stale tab index from a closing
+  window is clamped instead of indexed, and a recorded nested-tmux byte
+  stream pins all of it at seven geometries down to 0x0.
+- Ghost text in the Claude Code composer read as staged input and held
+  deliveries forever. The plain capture cannot tell a draft from a
+  suggestion, so the manifest now reads the escaped capture: real input,
+  typed or pasted, follows the composer's no-break space unstyled, and
+  anything styled there is the product's own painting (F55). The
+  submitted-prompt echo in scrollback, which matched the old regex
+  whenever it drifted into the bottom window, is excluded by the same
+  signature.
+- A selection stayed on screen rows while the text scrolled under it, so
+  scroll-then-copy took the wrong lines. Selections are now anchored to
+  content in the VT engine: the highlight moves with its text, survives
+  new output, and scrolling mid-drag extends the selection instead of
+  sliding it.
+- Scrolling hit a dead wall at the moment cyclops attached, and only a
+  resize (which snapped the viewport back to the tail) made the wheel
+  feel alive again. A runtime meeting its pane for the first time now
+  seeds its scrollback from tmux's own history (skipped for panes with no
+  history and for alternate-screen panes, where the capture would seed a
+  visible row twice), and the first reconcile after a control-mode
+  reconnect — that one, not every reconcile — rehydrates without the size
+  gate that let same-sized panes stay stale across an outage.
+- The agent title painted over the pane's collapse control, leaving a
+  dead `[`. The title now starts after the control, and the click region
+  matches what the eye sees.
+- Install docs name the Rust toolchain as a hard requirement, say to get
+  it from rustup rather than a package manager, and warn that the
+  from-source build takes minutes.
+
 ### Added (v5)
 
 - Agent hooks install themselves. Detecting an agent and hearing from it

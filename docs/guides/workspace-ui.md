@@ -147,6 +147,12 @@ your shell gets its own background returned. A terminal that does not
 understand the sequence ignores it and shows its own padding color as
 before.
 
+The color also follows your focus. Switch to another tab or window of the
+same terminal and the background is handed back the moment focus leaves,
+so whatever you switched to wears the terminal's own color; come back and
+the theme's ground is reapplied. This rides terminal focus reporting, so
+a terminal without it simply keeps the color until exit, as before.
+
 Pane content still maps one terminal cell to one tmux cell. The gutter is
 removed from the client size reported to tmux; it never scales or covers a
 pane grid. See [themes.md](themes.md) for the `chrome.text`,
@@ -180,11 +186,23 @@ file panel and hand the whole column back to the session tree. The app
 menu's `Files` item is the way back, and the only way back, because a
 closed panel leaves no rule to grab.
 
-The panel roots itself on the focused pane's directory. Under its header
-is a navigation row: `..` climbs out at the left, and `◂` `▸` at the right
-retrace the walk and undo that. A control with nowhere to go is painted
-dim and takes no click. Click the header's folder name to jump back to the
-focused pane's directory from wherever you have wandered.
+The panel is two browsers behind one header. The agent browser follows
+the focused agent: switch panes or let the agent `cd` and within a second
+the panel is looking at its working directory. The pinned browser stays
+wherever you last put it — a downloads folder, a spec directory — and
+remembers that across launches (`files_pinned_root` in `config.toml`,
+written when you browse the pinned view). The chip at the header's right
+end flips between them and is named for the view it switches to: `[pin]`
+while you are following the agent, `[agent]` while you are pinned. A file
+clicked in the pinned view still writes a reference the focused agent can
+resolve: relative to the agent's own folder when the file is under it,
+absolute otherwise.
+
+Under the header is a navigation row: `..` climbs out at the left, and
+`◂` `▸` at the right retrace the walk and undo that. A control with
+nowhere to go is painted dim and takes no click. Click the header's
+folder name to go home: the focused pane's directory in the agent view,
+the saved pinned folder in the pinned one.
 
 A folder answers a click two ways. Click its name to walk into it, which
 makes it the panel's root and gives its contents the full width. Click its
@@ -310,6 +328,12 @@ children. Both sidebar orders persist. Click-drag inside a pane selects text
 and copies it on release; double-click selects a word, and triple-click
 selects a line.
 
+A selection is anchored to the text, not to screen rows: scroll after
+selecting and the highlight moves with its lines, leaves the screen with
+them, and comes back when they do, and the copy is always what was
+highlighted. Scrolling mid-drag grows the selection past one screen — the
+viewport moves and the selection's live end follows the pointer.
+
 A copy says what it took, where the border has room for the phrase. A
 short notice (`copied 12 characters`,
 `copied 4 lines`) appears on the focused pane's bottom border and clears
@@ -326,10 +350,23 @@ focused in its new slot. The grip is the only part of the border that
 picks a pane up: clicking anywhere else on the border just focuses the
 pane, and dragging the border between two stacked panes resizes them.
 
-Mouse reporting belongs to the workspace chrome and selection layer in this
-release; mouse-aware programs inside panes do not receive those events.
-Every workspace action has a keyboard binding, and ordinary pane input and
-paste still pass through.
+Mouse clicks and drags belong to the workspace chrome and selection layer.
+The wheel is the exception: over a pane whose program asked for mouse
+reporting, each notch is forwarded to that program as the report it
+expects, which is how full-screen TUIs scroll themselves. Every workspace
+action has a keyboard binding, and ordinary pane input and paste still
+pass through.
+
+Two editing chords are translated for the pane rather than passed as-is,
+because no terminal can deliver them natively: `Ctrl+Backspace` arrives
+in the pane as delete-word-back, and on macOS `Cmd+Backspace` arrives as
+kill-to-line-start. `Cmd+A` arms the GUI gesture it starts everywhere
+else: the delete pressed next clears the pane's whole input line, and any
+other key forgets the arm and passes through untouched. All three chords
+need a terminal that speaks the kitty keyboard protocol — legacy
+encodings deliver Ctrl+Backspace as a plain backspace and Cmd chords not
+at all — so the workspace requests it and degrades silently where it is
+not spoken.
 
 Workspace preferences and rebindings live in the shared `config.toml`. A
 sidebar drag updates `sidebar_width` without replacing bindings or settings

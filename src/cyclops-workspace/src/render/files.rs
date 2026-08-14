@@ -69,6 +69,7 @@ const FILE_PREFIX: u16 = 2;
 /// ended up.
 pub fn paint_file_panel(
     tree: &mut FileTree,
+    view: crate::files::FilesView,
     area: Rect,
     buf: &mut Buffer,
     paint: &Paint,
@@ -79,7 +80,7 @@ pub fn paint_file_panel(
         return;
     }
     buf.set_style(area, theme::chrome_panel(paint));
-    paint_header(tree, area, buf, paint, hits, hover);
+    paint_header(tree, view, area, buf, paint, hits, hover);
     if area.height <= 1 {
         return;
     }
@@ -168,9 +169,11 @@ pub fn paint_file_panel(
     }
 }
 
-/// The folder this panel is looking at. Its own row, above everything.
+/// The folder this panel is looking at, and the chip that flips which
+/// browser is looking. Its own row, above everything.
 fn paint_header(
     tree: &FileTree,
+    view: crate::files::FilesView,
     area: Rect,
     buf: &mut Buffer,
     paint: &Paint,
@@ -185,30 +188,52 @@ fn paint_header(
     } else {
         copy::FILES_TITLE.to_string()
     };
-    let rect = Rect::new(area.x, area.y, area.width, 1);
-    let lit = hovered(hover, rect);
-    let style = if lit {
+    // The view chip owns the right end of the row; the name takes the
+    // rest. The chip names the browser a click switches TO, and the name
+    // still says WHERE you are — the two facts a two-browser panel needs
+    // on its one header row.
+    let chip = view.chip();
+    let chip_width = width_of(chip);
+    let name_width = area.width.saturating_sub(chip_width.saturating_add(1));
+    let name_rect = Rect::new(area.x, area.y, name_width, 1);
+    let name_lit = hovered(hover, name_rect);
+    let style = if name_lit {
         theme::menu_row_hover(paint)
     } else {
         theme::sidebar_workspace(paint)
     };
-    if lit {
-        buf.set_style(rect, style);
+    if name_lit {
+        buf.set_style(name_rect, style);
     }
-    // The whole width for the name. Everything else this panel navigates
-    // with lives on the row below, so the one thing that says WHERE you are
-    // never competes with a control for columns.
     super::overlay_text(
         buf,
-        rect,
+        name_rect,
         area.x,
         area.y,
-        &clip_head(&name, area.width),
+        &clip_head(&name, name_width),
         style,
     );
-    // Clicking the folder name re-roots on the focused pane's directory:
-    // the panel's "take me where the work is" control.
-    hits.push(rect, HitTarget::FileRoot);
+    // Clicking the folder name goes home: the focused pane's directory in
+    // the agent view, the saved pinned folder in the pinned one.
+    hits.push(name_rect, HitTarget::FileRoot);
+
+    if area.width >= chip_width {
+        let chip_rect = Rect::new(area.x + area.width - chip_width, area.y, chip_width, 1);
+        let chip_lit = hovered(hover, chip_rect);
+        super::overlay_text(
+            buf,
+            chip_rect,
+            chip_rect.x,
+            area.y,
+            chip,
+            if chip_lit {
+                theme::menu_row_hover(paint)
+            } else {
+                theme::menu_hint(paint)
+            },
+        );
+        hits.push(chip_rect, HitTarget::FilesViewToggle);
+    }
 }
 
 /// The navigation row: climb out at the left, retrace at the right.
@@ -584,6 +609,7 @@ mod tests {
         term.draw(|f| {
             paint_file_panel(
                 tree,
+                crate::files::FilesView::default(),
                 f.area(),
                 f.buffer_mut(),
                 &Paint::for_test(),
@@ -593,6 +619,34 @@ mod tests {
         })
         .unwrap();
         (term.backend().buffer().clone(), hits)
+    }
+
+    /// v7.9: the header carries the view chip, named for the browser a
+    /// click switches TO, and the folder name keeps the rest of the row.
+    /// The chip must be clickable and must not swallow the name's
+    /// go-home click region.
+    #[test]
+    fn the_header_offers_the_other_browser_and_keeps_the_go_home_click() {
+        let scratch = Scratch::new("files-view-chip");
+        scratch.file("a.rs", "");
+        let mut tree = FileTree::new();
+        tree.reroot(scratch.0.clone());
+
+        let (buf, hits) = draw(&mut tree, None);
+        let header = line(&buf, 0);
+        assert!(
+            header.contains(crate::files::FilesView::Agent.chip()),
+            "the agent view offers the pin chip: {header:?}"
+        );
+        let chip_x = col_of(&buf, crate::files::FilesView::Agent.chip(), 0);
+        assert!(
+            matches!(hits.hit(chip_x, 0), Some(HitTarget::FilesViewToggle)),
+            "the chip answers as the toggle"
+        );
+        assert!(
+            matches!(hits.hit(0, 0), Some(HitTarget::FileRoot)),
+            "the name still answers as go-home"
+        );
     }
 
     /// Row index of the first row whose painted text contains `needle`.
