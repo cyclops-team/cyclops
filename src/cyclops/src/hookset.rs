@@ -540,26 +540,14 @@ pub fn run_install(
         }
         return 0;
     }
-    if let Err(e) = std::fs::create_dir_all(&dest_dir) {
-        eprintln!("can't create {}: {e}", dest_dir.display());
-        return 1;
-    }
-    if let Err(e) = write_atomic(&path, &content) {
-        eprintln!("can't write {}: {e}", path.display());
-        return 1;
-    }
-    // The receipt is what makes this artifact refreshable later. Its
-    // failure is a note and not the verb's: the artifact is written and
-    // correct, it is only unmanaged, and saying "install failed" over a
-    // file that works would send the operator after the wrong thing.
-    let receipt = Receipt {
-        vendor: kind.name().to_string(),
-        agent: label.to_string(),
-        file: kind.file_name().to_string(),
-        bin,
-        rendered_fnv: fnv64(content.as_bytes()),
+    let receipt_problem = match write_artifact(&dest_dir, kind, label, &bin, &content) {
+        Ok(problem) => problem,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
     };
-    if let Err(e) = receipt.write(&dest_dir) {
+    if let Some(e) = receipt_problem {
         eprintln!(
             "the hook config is written and usable, but its receipt ({}) is not: {e}. \
              cyclops start will leave this file alone instead of refreshing it when \
@@ -587,37 +575,52 @@ pub fn run_install(
 /// Render `kind`'s hook config for `label` in the standard place and return
 /// its path, saying nothing on the way.
 ///
+/// Write one rendered artifact and the receipt that makes it refreshable.
+/// Both writers go through here — `run_install` for the verb, [`prepare`]
+/// for launch wiring — so what lands on disk cannot drift between them.
+///
+/// A failed receipt comes back as `Ok(Some(reason))`, not `Err`: the
+/// artifact is written and correct, it is only unrefreshable later, and
+/// saying "install failed" over a file that works would send the operator
+/// after the wrong thing. Callers decide whether that note is worth a
+/// sentence.
+fn write_artifact(
+    dest_dir: &Path,
+    kind: CliKind,
+    label: &str,
+    bin: &str,
+    content: &str,
+) -> Result<Option<String>, String> {
+    std::fs::create_dir_all(dest_dir)
+        .map_err(|e| format!("can't create {}: {e}", dest_dir.display()))?;
+    let path = dest_dir.join(kind.file_name());
+    write_atomic(&path, content).map_err(|e| format!("can't write {}: {e}", path.display()))?;
+    let receipt = Receipt {
+        vendor: kind.name().to_string(),
+        agent: label.to_string(),
+        file: kind.file_name().to_string(),
+        bin: bin.to_string(),
+        rendered_fnv: fnv64(content.as_bytes()),
+    };
+    Ok(receipt.write(dest_dir).err().map(|e| e.to_string()))
+}
+
 /// This is `run_install`'s default-destination path with the printing and
 /// the `--dest` handling taken off, for callers that need the artifact
 /// rather than the report. `cyclops start` uses it to hand a pane its own
 /// hook config at launch, which is the only wiring claude needs and the
 /// reason nothing under ~/.claude is ever read or written.
 ///
-/// A failed receipt is not an error here, for the same reason it is not one
-/// in `run_install`: the artifact is written and correct, it is only
-/// unrefreshable later. Callers that want the artifact want it either way,
-/// and a start that refused to launch a pane over an unwritten receipt
-/// would be trading a working agent for a bookkeeping note.
-///
-/// `identical_to_the_install_verb` below pins this to `run_install`'s
-/// output so the two cannot drift.
+/// A failed receipt is not worth even a note here: callers that want the
+/// artifact want it either way, and a start that refused to launch a pane
+/// over an unwritten receipt would be trading a working agent for a
+/// bookkeeping line.
 pub fn prepare(home: &Path, kind: CliKind, label: &str) -> Result<PathBuf, String> {
     let dest_dir = hooks_root_in(home).join(kind.name()).join(label);
     let bin = cyclops_bin();
     let content = render(kind, label, &bin);
-    let path = dest_dir.join(kind.file_name());
-    std::fs::create_dir_all(&dest_dir)
-        .map_err(|e| format!("can't create {}: {e}", dest_dir.display()))?;
-    write_atomic(&path, &content).map_err(|e| format!("can't write {}: {e}", path.display()))?;
-    let receipt = Receipt {
-        vendor: kind.name().to_string(),
-        agent: label.to_string(),
-        file: kind.file_name().to_string(),
-        bin,
-        rendered_fnv: fnv64(content.as_bytes()),
-    };
-    let _ = receipt.write(&dest_dir);
-    Ok(path)
+    write_artifact(&dest_dir, kind, label, &bin, &content)?;
+    Ok(dest_dir.join(kind.file_name()))
 }
 
 /// What one [`refresh`] run did, one classification per (vendor, label)
