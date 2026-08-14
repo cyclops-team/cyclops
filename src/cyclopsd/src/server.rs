@@ -239,6 +239,22 @@ pub(crate) fn kind_matches(kinds: &[String], event: &str) -> bool {
     kinds.is_empty() || kinds.iter().any(|k| event.starts_with(k.as_str()))
 }
 
+/// Decode a request's params, or the bad_request response that names what
+/// was wrong. The noun is caller-supplied ("msg.history params", "state
+/// report") so every denial keeps its exact sentence; clients and tests
+/// match on them.
+// The Err is a full Response, built once on the cold path and immediately
+// written to the socket; boxing it would cost every call site an unwrap.
+#[allow(clippy::result_large_err)]
+fn decode_params<T: serde::de::DeserializeOwned>(
+    id: &Value,
+    params: Value,
+    what: &str,
+) -> Result<T, Response> {
+    serde_json::from_value(params)
+        .map_err(|e| Response::err(id.clone(), "bad_request", format!("bad {what}: {e}")))
+}
+
 /// Method dispatch. Returns the response plus subscribe params when the
 /// connection should switch to push mode.
 pub(crate) async fn dispatch(
@@ -278,14 +294,9 @@ pub(crate) async fn dispatch(
             // eye must set open_deliveries.
             let params: StatusParams = match req.params {
                 Value::Null => StatusParams::default(),
-                given => match serde_json::from_value(given) {
+                given => match decode_params(&id, given, "status params") {
                     Ok(p) => p,
-                    Err(e) => {
-                        return (
-                            Response::err(id, "bad_request", format!("bad status params: {e}")),
-                            None,
-                        )
-                    }
+                    Err(r) => return (r, None),
                 },
             };
             let result = status_result(inner, params.open_deliveries);
@@ -309,15 +320,11 @@ pub(crate) async fn dispatch(
                     )
                 }
             };
-            let params: cyclops_proto::HistoryParams = match serde_json::from_value(req.params) {
-                Ok(p) => p,
-                Err(e) => {
-                    return (
-                        Response::err(id, "bad_request", format!("bad msg.history params: {e}")),
-                        None,
-                    )
-                }
-            };
+            let params: cyclops_proto::HistoryParams =
+                match decode_params(&id, req.params, "msg.history params") {
+                    Ok(p) => p,
+                    Err(r) => return (r, None),
+                };
             (
                 from_result(
                     id,
@@ -327,29 +334,20 @@ pub(crate) async fn dispatch(
             )
         }
         "msg.thread" => {
-            let params: cyclops_proto::ThreadParams = match serde_json::from_value(req.params) {
-                Ok(p) => p,
-                Err(e) => {
-                    return (
-                        Response::err(id, "bad_request", format!("bad msg.thread params: {e}")),
-                        None,
-                    )
-                }
-            };
+            let params: cyclops_proto::ThreadParams =
+                match decode_params(&id, req.params, "msg.thread params") {
+                    Ok(p) => p,
+                    Err(r) => return (r, None),
+                };
             (
                 from_result(id, crate::history::msg_thread(inner, &params.id)),
                 None,
             )
         }
         "agent.state.report" => {
-            let params: StateReportParams = match serde_json::from_value(req.params) {
+            let params: StateReportParams = match decode_params(&id, req.params, "state report") {
                 Ok(p) => p,
-                Err(e) => {
-                    return (
-                        Response::err(id, "bad_request", format!("bad state report: {e}")),
-                        None,
-                    )
-                }
+                Err(r) => return (r, None),
             };
             // Hook reports feed liveness and tier-1 ACK evidence, so a
             // forged one lets the record lie. The socket path is pinned to
@@ -371,15 +369,11 @@ pub(crate) async fn dispatch(
             )
         }
         "admin.notify" => {
-            let params: AdminNotifyParams = match serde_json::from_value(req.params) {
-                Ok(p) => p,
-                Err(e) => {
-                    return (
-                        Response::err(id, "bad_request", format!("bad admin.notify params: {e}")),
-                        None,
-                    )
-                }
-            };
+            let params: AdminNotifyParams =
+                match decode_params(&id, req.params, "admin.notify params") {
+                    Ok(p) => p,
+                    Err(r) => return (r, None),
+                };
             let seq = delivery::admin_notify(
                 inner,
                 params.level,
@@ -405,14 +399,10 @@ pub(crate) async fn dispatch(
             (Response::ok(id, json!({"theme": name})), None)
         }
         "agent.wait" => {
-            let params: AgentWaitParams = match serde_json::from_value(req.params) {
+            let params: AgentWaitParams = match decode_params(&id, req.params, "agent.wait params")
+            {
                 Ok(p) => p,
-                Err(e) => {
-                    return (
-                        Response::err(id, "bad_request", format!("bad agent.wait params: {e}")),
-                        None,
-                    )
-                }
+                Err(r) => return (r, None),
             };
             (
                 from_result(id, delivery::agent_wait(inner, params).await),
@@ -470,16 +460,11 @@ pub(crate) async fn dispatch(
             }
         }
         "hooks.verify" => {
-            let params: cyclops_proto::HooksVerifyParams = match serde_json::from_value(req.params)
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    return (
-                        Response::err(id, "bad_request", format!("bad hooks.verify params: {e}")),
-                        None,
-                    )
-                }
-            };
+            let params: cyclops_proto::HooksVerifyParams =
+                match decode_params(&id, req.params, "hooks.verify params") {
+                    Ok(p) => p,
+                    Err(r) => return (r, None),
+                };
             (
                 from_result(id, crate::selftest::verify(inner, params).await),
                 None,
@@ -487,18 +472,9 @@ pub(crate) async fn dispatch(
         }
         "hooks.selftest" => {
             let params: cyclops_proto::HooksSelftestParams =
-                match serde_json::from_value(req.params) {
+                match decode_params(&id, req.params, "hooks.selftest params") {
                     Ok(p) => p,
-                    Err(e) => {
-                        return (
-                            Response::err(
-                                id,
-                                "bad_request",
-                                format!("bad hooks.selftest params: {e}"),
-                            ),
-                            None,
-                        )
-                    }
+                    Err(r) => return (r, None),
                 };
             (
                 from_result(id, crate::selftest::selftest(inner, params).await),
@@ -610,9 +586,9 @@ fn daemon_peer(peer: Peer) -> Result<(u32, i32), WireError> {
 /// in the request body can override the resolved sender), then hand off
 /// to the delivery pipeline.
 async fn msg_send(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
-    let params: MsgSendParams = match serde_json::from_value(params) {
+    let params: MsgSendParams = match decode_params(&id, params, "msg.send params") {
         Ok(p) => p,
-        Err(e) => return Response::err(id, "bad_request", format!("bad msg.send params: {e}")),
+        Err(r) => return r,
     };
     let (uid, pid) = match daemon_peer(peer) {
         Ok(v) => v,
@@ -803,9 +779,9 @@ pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResul
 /// pane.read: resolve the target, then capture or return the detection
 /// view. Targets are pane ids until the adoption registry lands (M1).
 async fn pane_read(inner: &Arc<Inner>, id: Value, params: Value) -> Response {
-    let params: PaneReadParams = match serde_json::from_value(params) {
+    let params: PaneReadParams = match decode_params(&id, params, "pane.read params") {
         Ok(p) => p,
-        Err(e) => return Response::err(id, "bad_request", format!("bad pane.read params: {e}")),
+        Err(r) => return r,
     };
     let Some((session_idx, watcher, pane_id)) = resolve_target(inner, &params.target) else {
         let known = known_panes(inner);
