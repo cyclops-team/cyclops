@@ -300,6 +300,42 @@ pub fn also_watching(sessions: &[String]) -> String {
     )
 }
 
+/// `cyclops ui` refuses --json: the machine stream lives on `watch`, and
+/// pointing there beats emitting a shape nothing should rely on.
+pub const UI_NO_JSON: &str =
+    "cyclops ui has no --json form. The machine stream is: cyclops watch --json";
+
+/// Said on stderr every `cyclops ui` run, so scripts keep working while
+/// their authors learn the verb that replaced it.
+pub const UI_DEPRECATED: &str = "cyclops ui is deprecated; use cyclops watch";
+
+/// `cyclops daemon log` with no log file. Not an error state: it means no
+/// detached daemon has ever run from this home, and the sentence says what
+/// makes one appear.
+pub fn no_daemon_log(log: &std::path::Path) -> String {
+    format!(
+        "no daemon log at {}. One appears the first time `cyclops start` starts a daemon for you.",
+        log.display()
+    )
+}
+
+/// `cyclops name --self` outside tmux. The flag reads $TMUX_PANE, so a
+/// shell with none set cannot mean any pane; the sentence hands over the
+/// by-id spelling instead.
+pub fn self_outside_tmux(name: &str) -> String {
+    format!(
+        "--self names the pane this command is running in, and this shell is not in one. \
+         Run it inside tmux, or name the pane by id: cyclops name %0 {name}."
+    )
+}
+
+/// `--raw` beside a non-detection source. The other sources ARE the raw
+/// capture, so the flag there is a misunderstanding worth a sentence
+/// rather than a silent no-op.
+pub const RAW_NEEDS_DETECTION: &str =
+    "--raw pairs with --source detection: it adds the capture the sensors read to the \
+     detection view. This source is already the raw capture.";
+
 /// `cyclops update` refuses --json: the bulk of its output is the
 /// installer's own stream, and a JSON wrapper around a build log would be
 /// a shape nothing could rely on.

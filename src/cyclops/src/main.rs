@@ -779,10 +779,10 @@ fn cmd_watch(cli: &Cli, style: &Style, kinds: &[String], ui: &UiArgs) -> i32 {
 /// cyclops ui: deprecated alias for `cyclops watch`.
 fn cmd_ui(cli: &Cli, args: &UiArgs) -> i32 {
     if cli.json {
-        eprintln!("cyclops ui has no --json form. The machine stream is: cyclops watch --json");
+        eprintln!("{}", copy::UI_NO_JSON);
         return EXIT_USAGE;
     }
-    eprintln!("cyclops ui is deprecated; use cyclops watch");
+    eprintln!("{}", copy::UI_DEPRECATED);
     run_stream_ui(cli, args)
 }
 
@@ -960,13 +960,7 @@ fn cmd_daemon(cli: &Cli, style: &Style, cmd: &DaemonCmd) -> i32 {
                 0
             }
             Err(_) => {
-                // No log is not an error: it means no detached daemon has
-                // ever run from this home.
-                eprintln!(
-                    "no daemon log at {}. One appears the first time `cyclops \
-                     start` starts a daemon for you.",
-                    log.display()
-                );
+                eprintln!("{}", copy::no_daemon_log(&log));
                 1
             }
         },
@@ -988,10 +982,8 @@ fn resolve_name(args: &NameArgs) -> Result<(String, Option<String>), i32> {
             Ok(p) if !p.is_empty() => (p, args.target.clone()),
             _ => {
                 eprintln!(
-                    "--self names the pane this command is running in, and this \
-                     shell is not in one. Run it inside tmux, or name the pane by \
-                     id: cyclops name %0 {}.",
-                    args.target.as_deref().unwrap_or("<name>")
+                    "{}",
+                    copy::self_outside_tmux(args.target.as_deref().unwrap_or("<name>"))
                 );
                 return Err(EXIT_USAGE);
             }
@@ -1175,14 +1167,8 @@ fn cmd_read(
     source: PaneReadSource,
     raw: bool,
 ) -> i32 {
-    // The other two sources ARE the raw capture, so --raw beside them is
-    // a misunderstanding worth a sentence rather than a silent no-op.
     if raw && source != PaneReadSource::Detection {
-        eprintln!(
-            "--raw pairs with --source detection: it adds the capture the \
-             sensors read to the detection view. This source is already the \
-             raw capture."
-        );
+        eprintln!("{}", copy::RAW_NEEDS_DETECTION);
         return EXIT_USAGE;
     }
     let params = serde_json::to_value(PaneReadParams {
