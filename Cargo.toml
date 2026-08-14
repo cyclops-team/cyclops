@@ -48,3 +48,11 @@ cyclops-workspace = { path = "src/cyclops-workspace" }
 
 [profile.release]
 lto = "thin"
+
+# What the installer builds. Release minus the thin-LTO link step: that
+# step buys runtime margin an I/O-bound tmux orchestrator never feels,
+# and it costs minutes on every installing machine. Developer and CI
+# `--release` builds keep the LTO above.
+[profile.dist]
+inherits = "release"
+lto = false

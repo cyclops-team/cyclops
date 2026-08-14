@@ -54,9 +54,9 @@ DAEMON_PID=""
 CHECKS=0
 FAILS=0
 
-# The installer section is opt-in because it runs `cargo build --release`,
-# and everything else here reuses the debug binaries that are already
-# built. Off by default it costs nothing; on, it is a cold release compile.
+# The installer section is opt-in because it runs the installer's dist
+# build, and everything else here reuses the debug binaries that are
+# already built. Off by default it costs nothing; on, it is a cold compile.
 # CI runs it as its own job so it does not sit in front of the test results.
 WITH_INSTALLER=0
 # The real home, kept because the installer section runs with HOME pointed
@@ -1400,7 +1400,7 @@ git -C "$ROOT/remote" -c user.name=parity -c user.email=parity@invalid \
 #   CYCLOPS_REF       the mirror's one branch
 #   CARGO_TARGET_DIR  the build cache the install above just filled. env -i
 #                     strips it, the clone sits in a different directory,
-#                     and without threading it through the clone's release
+#                     and without threading it through the clone's dist
 #                     build starts cold and this job's time doubles.
 run_update() {
   set +e
@@ -1449,12 +1449,12 @@ check_file "the config survived the update" "$INST/.cyclops/config.toml" '^sessi
 
 # The update legs built the mirror's clone into the repo's own target dir
 # (the shared cache that keeps this job fast), which leaves the MIRROR's
-# binaries at target/release/cyclops{,d} while cargo still counts the
+# binaries at target/dist/cyclops{,d} while cargo still counts the
 # repo's own bin units fresh: a later build from this checkout would
 # silently reinstall the mirror's build. Deleting the binaries
 # un-freshens exactly the final link step; the dependency cache stays
 # warm.
-rm -f "$REPO/target/release/cyclops" "$REPO/target/release/cyclopsd"
+rm -f "$REPO/target/dist/cyclops" "$REPO/target/dist/cyclopsd"
 
 printf '\n$ ./scripts/install.sh --uninstall\n'
 run_installer "$INST/.local/bin:$PATH" --uninstall

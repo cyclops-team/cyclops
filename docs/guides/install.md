@@ -34,11 +34,13 @@ builds both binaries, puts them where your shell looks, writes the config
 and detection manifests, proves the result runs, and removes the clone.
 It never uses sudo.
 
-The build step dominates the install time: it is a full release compile
-of a Rust workspace, a few minutes on a fast machine and noticeably
-longer on older or low-power hardware. That cost returns on `cyclops
-update`, which rebuilds the same way. Prebuilt binaries are not published
-yet.
+The build step dominates the install time: an optimized compile of the
+two binaries and their dependencies, a few minutes on a fast machine and
+noticeably longer on older or low-power hardware. The installer builds
+the `dist` profile — release optimizations without the link-time
+optimization pass, which would add minutes for runtime margin this tool
+does not need. That cost returns on `cyclops update`, which rebuilds the
+same way. Prebuilt binaries are not published yet.
 
 To inspect the installer before running it, clone the repository instead:
 

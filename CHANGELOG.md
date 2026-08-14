@@ -5,6 +5,16 @@ versions are unreleased until admin cuts a tag.
 
 ## [Unreleased]
 
+### Changed
+
+- The from-source install builds faster. The installer now compiles only
+  the two installed binaries, under a new `dist` cargo profile: release
+  optimizations without the thin-LTO link step, whose runtime margin an
+  I/O-bound tmux orchestrator never feels and whose cost every
+  installing machine paid. Developer and CI `--release` builds are
+  unchanged, and `cyclops update` inherits the faster build because it
+  runs the same installer.
+
 ### Fixed
 
 - `cyclops start` now actually refreshes the prepared hook configs, the

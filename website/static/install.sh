@@ -308,9 +308,12 @@ fi
 
 step "building cyclops and cyclopsd"
 say "${DIM}  a first build takes a few minutes${OFF}"
-( cd "$SRC" && cargo build --release ) || die "the build failed" "the cargo output above says why"
+# The dist profile is release without the thin-LTO link step, and the two
+# named packages skip workspace members an install never runs. Both trims
+# exist because this compile happens on every installing machine.
+( cd "$SRC" && cargo build --profile dist -p cyclops -p cyclopsd ) || die "the build failed" "the cargo output above says why"
 
-TARGET="${CARGO_TARGET_DIR:-$SRC/target}/release"
+TARGET="${CARGO_TARGET_DIR:-$SRC/target}/dist"
 for name in cyclops cyclopsd; do
     [ -x "$TARGET/$name" ] || die "the build finished but $TARGET/$name is missing"
 done
