@@ -190,6 +190,47 @@ fn codex_ghost_vs_typed_probed_fixtures() {
     assert_eq!(r.state, AgentState::Idle);
 }
 
+/// MEASURED 2026-08-17 (codex-cli 0.147.0, live pane at 120x40): a paste long
+/// enough to collapse renders as a COLORED chip, so the first significant
+/// character after the glyph is an SGR introducer rather than a byte. The
+/// typed rule required a bare byte there, so a staged chip read idle — which
+/// let the gate paste a second message onto the first, and left delivery
+/// unable to verify its own staging (the field failure: a long message stayed
+/// in codex's composer, unsubmitted, behind "outcome unknown").
+///
+/// The fixtures are a real capture of that exact state, so a future rule
+/// edit is checked against what codex draws, not against a hand-written
+/// approximation of it.
+#[test]
+fn codex_collapsed_paste_chip_is_staged_input() {
+    let all = shipped();
+    let codex = &all["codex"];
+    let chip_plain = include_str!("fixtures/codex_pasted_chip_plain.txt");
+    let chip_esc = include_str!("fixtures/codex_pasted_chip_esc.txt");
+
+    let r = codex
+        .evaluate_esc("proj", chip_plain, Some(chip_esc))
+        .unwrap();
+    assert_eq!(r.id, "composer_typed_input");
+    assert_eq!(r.state, AgentState::IdleWithInput);
+
+    // The transcript renders a past turn with a bold-DIM glyph, while the
+    // composer's is bold only. The rule pins the composer glyph exactly, so
+    // residue one line up can never read as a live composer — the same
+    // trap that made verification accept stale text before fix B.
+    let transcript = "\u{1b}[1;2m›  \u{1b}[0m[cyclops m-diag01] FROM: tester  SUBJECT: s\n\
+        \u{1b}[1m›\u{1b}[0m \u{1b}[2mSummarize recent commits\u{1b}[0m\n\
+        \u{1b}[38;2;246;226;183mgpt-5.6-sol high\u{1b}[0m · ~/proj";
+    let r = codex
+        .evaluate_esc("proj", &cyclops_manifest::strip_csi(transcript), Some(transcript))
+        .unwrap();
+    assert_eq!(
+        r.state,
+        AgentState::Idle,
+        "a submitted turn in the transcript is not a staged composer"
+    );
+}
+
 /// MEASURED 2026-08-08 (codex-cli 0.147.0, tmux 120x40), SAFETY: Codex keeps
 /// the ghost composer line on screen for the WHOLE turn. A live capture taken
 /// while "• Working (0s • esc to interrupt)" is rendering still carries

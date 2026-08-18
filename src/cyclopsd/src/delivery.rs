@@ -3680,48 +3680,64 @@ verify_pattern = ["<message_id>", "Pasted text"]
         m
     }
 
-    /// The field failure this fixes, pinned on the shipped manifest:
-    /// before the escaped verify capture, the generic "Pasted" tier could
-    /// never fire for codex (its composer rule is esc-only and the verify
-    /// read was plain), so a long message the composer collapsed into a
-    /// "[Pasted Content N chars]" chip — hiding the message id — failed
-    /// every verify re-read. verify_before_submit then withheld Enter: the
-    /// payload sat staged in the recipient's composer, undelivered, behind
-    /// a receipt saying only "outcome unknown".
+    /// Lines as codex-cli 0.147.0 actually draws them, captured from a
+    /// live pane on 2026-08-17 (the full screens are
+    /// cyclops-manifest/tests/fixtures/codex_pasted_chip_*). The chip is
+    /// COLORED and the transcript glyph is bold-DIM where the composer's
+    /// is bold-only; both facts decide the assertions below, and an
+    /// invented approximation of either passed while the real thing
+    /// failed.
+    const CODEX_COMPOSER_CHIP: &str =
+        "\u{1b}[1m›\u{1b}[0m \u{1b}[38;5;6m[Pasted Content 2828 chars]\u{1b}[39m";
+    const CODEX_COMPOSER_GHOST: &str =
+        "\u{1b}[1m›\u{1b}[0m \u{1b}[2mSummarize recent commits\u{1b}[0m";
+    const CODEX_TRANSCRIPT_LINE: &str =
+        "\u{1b}[1;2m›  \u{1b}[0m[cyclops m-diag01] FROM: tester  SUBJECT: verify chip rendering";
+
+    /// The field failure this fixes, pinned on the shipped manifest and
+    /// real captures: a message long enough to collapse renders as a
+    /// "[Pasted Content N chars]" chip that hides the id, so the generic
+    /// "Pasted" tier is the only staging evidence left — and that tier
+    /// pins the marker to the composer line, which for codex is
+    /// recognizable only in an escaped capture. Every verify re-read
+    /// failed, verify_before_submit withheld Enter, and the payload sat
+    /// staged in the recipient's composer behind "outcome unknown".
     #[test]
     fn codex_collapsed_paste_verifies_through_the_escaped_composer_line() {
         let m = codex_manifest();
         let (id, other) = verify_patterns(&m, "m-jean01");
 
-        // The collapsed chip on the composer line, in the manifest's own
-        // measured escape shape: the generic tier pins the staging.
-        let staged = "transcript above\n\u{1b}[1m›\u{1b}[0m [Pasted Content 1263 chars]\n\u{1b}[2m? for shortcuts\u{1b}[0m";
-        assert_eq!(staged_verified(&m, staged, &id, &other), Some(false));
+        let staged = format!("transcript above\n{CODEX_COMPOSER_CHIP}\n  gpt-5.6-sol high · ~/proj");
+        assert_eq!(staged_verified(&m, &staged, &id, &other), Some(false));
 
-        // The same chip as transcript residue over a ghost-suggestion
-        // composer: nothing staged, and it must not verify.
-        let stale = "you: [Pasted Content 900 chars]\ndone\n\u{1b}[1m›\u{1b}[0m \u{1b}[2mFind and fix a bug in @filename\u{1b}[0m";
-        assert_eq!(staged_verified(&m, stale, &id, &other), None);
+        // A chip in the TRANSCRIPT (bold-dim glyph) over an empty
+        // composer: an earlier message, already submitted. Nothing staged.
+        let stale = format!(
+            "\u{1b}[1;2m›  \u{1b}[0m[Pasted Content 900 chars]\n{CODEX_COMPOSER_GHOST}\n  gpt-5.6-sol high · ~/proj"
+        );
+        assert_eq!(staged_verified(&m, &stale, &id, &other), None);
 
         // A short message renders literally: the id proves it anywhere in
         // the region, chip or no chip.
-        let literal = "transcript\n\u{1b}[1m›\u{1b}[0m [cyclops m-jean01] hello\n\u{1b}[2m? for shortcuts\u{1b}[0m";
-        assert_eq!(staged_verified(&m, literal, &id, &other), Some(true));
+        let literal = format!(
+            "{CODEX_TRANSCRIPT_LINE}\n\u{1b}[1m›\u{1b}[0m [cyclops m-jean01] hello\n  gpt-5.6-sol high"
+        );
+        assert_eq!(staged_verified(&m, &literal, &id, &other), Some(true));
     }
 
     /// The whole inject() path against the codex manifest: the escaped
-    /// capture is the one that decides — its de-escaped sibling offers no
-    /// composer discriminator at all — and the delivery proceeds to submit
-    /// instead of erroring verify_failed.
+    /// capture is the one that decides — its de-escaped sibling cannot
+    /// tell the composer glyph from the transcript's — and the delivery
+    /// proceeds to submit instead of erroring verify_failed.
     #[tokio::test(start_paused = true)]
     async fn inject_verifies_codex_collapse_via_the_escaped_capture() {
         let m = codex_manifest();
         let handle = DeliveryHandle::new("m-jean01", "codex", "%1", 0, "payload".into());
-        let staged = "transcript above\n\u{1b}[1m›\u{1b}[0m [Pasted Content 1263 chars]\n\u{1b}[2m? for shortcuts\u{1b}[0m";
-        let mock = MockInjector::new(vec![staged]);
+        let staged = format!("transcript above\n{CODEX_COMPOSER_CHIP}\n  gpt-5.6-sol high · ~/proj");
+        let mock = MockInjector::new(vec![staged.as_str()]);
         let (window, id_staged) = inject(&mock, &handle, &m).await.expect("collapse stages");
         assert!(!id_staged, "the chip hides the id; the composer line proved it");
-        assert!(window.contains("[Pasted Content 1263 chars]"), "{window}");
+        assert!(window.contains("[Pasted Content 2828 chars]"), "{window}");
         // The ACK comparison window is de-escaped, so later SGR churn
         // cannot fake a changed composer.
         assert!(!window.contains('\u{1b}'), "{window}");
