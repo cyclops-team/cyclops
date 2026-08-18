@@ -93,11 +93,17 @@ async fn send_and_wait_starts_after_delivery_resolution() {
     rig.shutdown().await;
 }
 
-/// Fix C: a daemon restart must close every delivery the previous run left
-/// in flight (limbo is a bug): attention_required with cause
-/// daemon_restart, plus ONE aggregated admin notification.
+/// Fix C, amended by the restart requeue: a daemon restart must leave no
+/// delivery in limbo, and the pre-write boundary decides how each chain
+/// ends. This one was GATING when the daemon died — nothing had touched
+/// the pane — so the reboot requeues it (retry_queued, cause
+/// daemon_restart), it re-enters the gate on the new run, and no human is
+/// summoned for a message that was never at risk. The closure path for
+/// chains past the paste, and for recipients no pane answers to, is
+/// pinned by `restart_closes_pre_hosted_field_ledger_chains`
+/// (m1_blockers) and restart_eye.
 #[tokio::test(flavor = "multi_thread")]
-async fn restart_closes_limbo_deliveries() {
+async fn restart_requeues_prepaste_deliveries() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -130,41 +136,117 @@ async fn restart_closes_limbo_deliveries() {
     // the same home.
     let rig = rig.reboot().await;
 
-    // The rebooted daemon closed the chain with a named cause.
-    assert_eq!(
-        rig.final_state(&msg_id, "limboed").as_deref(),
-        Some("attention_required"),
-        "restart left the delivery in limbo"
-    );
+    // The chain went back in the queue with the restart named as cause
+    // (written by close_limbo inside boot, so it is on disk already)…
     let lines = rig.ledger_lines();
-    let closure = lines
+    let requeue = lines
         .iter()
-        .rev()
-        .find(|l| l["kind"] == "state" && l["id"] == msg_id.as_str())
-        .expect("closure line");
-    assert_eq!(closure["data"]["cause"], "daemon_restart", "{closure}");
+        .find(|l| {
+            l["kind"] == "state"
+                && l["id"] == msg_id.as_str()
+                && l["data"]["to_state"] == "retry_queued"
+        })
+        .expect("no requeue line after reboot");
+    assert_eq!(requeue["data"]["cause"], "daemon_restart", "{requeue}");
+    // …and no attention closure exists for it: nobody is summoned.
+    assert!(
+        !lines.iter().any(|l| l["kind"] == "state"
+            && l["id"] == msg_id.as_str()
+            && l["data"]["to_state"] == "attention_required"),
+        "requeue must not also close the chain"
+    );
+    assert!(
+        !lines.iter().any(|l| l["kind"] == "system"
+            && l["subject"]
+                .as_str()
+                .is_some_and(|s| s.contains("interrupted by daemon restart"))),
+        "no action-required restart ping for a requeued chain"
+    );
 
-    // Exactly ONE aggregated notification, naming the delivery.
-    let notifies: Vec<&Value> = lines
+    // One FYI names the requeue instead.
+    let fyis: Vec<&Value> = lines
         .iter()
         .filter(|l| {
             l["kind"] == "system"
                 && l["subject"]
                     .as_str()
-                    .is_some_and(|s| s.contains("interrupted by daemon restart"))
+                    .is_some_and(|s| s.contains("requeued after daemon restart"))
         })
         .collect();
-    assert_eq!(
-        notifies.len(),
-        1,
-        "want one aggregated notify: {notifies:?}"
-    );
+    assert_eq!(fyis.len(), 1, "want one requeue FYI: {fyis:?}");
     assert!(
-        notifies[0]["body"].as_str().unwrap().contains(&msg_id),
-        "{notifies:?}"
+        fyis[0]["body"].as_str().unwrap().contains(&msg_id),
+        "{fyis:?}"
     );
 
+    // The requeued delivery re-enters the gate on the new run. Polled off
+    // the ledger, not the event stream: the transition can race the
+    // rebooted rig's subscribe, and events do not replay.
+    let requeue_seq = requeue["seq"].as_u64().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let lines = rig.ledger_lines();
+        let re_entered = lines.iter().any(|l| {
+            l["kind"] == "state"
+                && l["id"] == msg_id.as_str()
+                && l["data"]["to_state"] == "gating"
+                && l["seq"].as_u64().unwrap_or(0) > requeue_seq
+        });
+        if re_entered {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "requeued delivery never re-entered the gate: {lines:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
     rig.assert_ledger_legal(&["BUSY-MARKER"]);
+    rig.shutdown().await;
+}
+
+/// `daemon.quiesce` is quiet over pre-paste deliveries: they ride a
+/// restart (the requeue above), so only a delivery past the paste may
+/// hold up a stop. The one here is held at the gate by a busy pane —
+/// mid-flight forever from a sender's view, and still no reason to
+/// refuse.
+#[tokio::test(flavor = "multi_thread")]
+async fn quiesce_is_quiet_over_prepaste_deliveries() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "quiesce",
+        BUSY_MANIFEST,
+        &hold_script("BUSY-MARKER"),
+        "receipt_block_ms = 200\n",
+    )
+    .await;
+    rig.tmux.wait_screen("main", "BUSY-MARKER");
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "held").await;
+
+    let (result, _) = rig
+        .send(json!({"to": ["held"], "subject": "s", "body": "b"}))
+        .await;
+    let msg_id = result["msg_id"].as_str().unwrap().to_string();
+    rig.ev
+        .wait_event(Duration::from_secs(5), |e| {
+            e["event"] == "delivery-state"
+                && e["data"]["id"] == msg_id.as_str()
+                && e["data"]["to_state"] == "gating"
+        })
+        .await;
+
+    let resp = rig.ctl.request("daemon.quiesce", json!({})).await;
+    assert_eq!(resp["result"]["quiet"], true, "{resp}");
+    assert!(
+        resp["result"]["in_flight"].as_array().is_none_or(Vec::is_empty),
+        "{resp}"
+    );
+
     rig.shutdown().await;
 }
 

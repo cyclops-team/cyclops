@@ -90,13 +90,38 @@ pub struct Event {
 // Method params and results. Methods use dot notation: "ping", "status",
 // "msg.send", "msg.history", "msg.thread", "agent.wait", "agent.state.report",
 // "pane.read", "events.subscribe", "admin.notify", "hooks.verify",
-// "hooks.selftest", "theme.reload".
+// "hooks.selftest", "theme.reload", "daemon.quiesce".
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PingResult {
     pub pong: bool,
     pub ts: u64,
+}
+
+/// `daemon.quiesce` params: hold the delivery pipeline still so a restart
+/// loses nothing. Every member defaults so a bare call gets the shipped
+/// bounds.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QuiesceParams {
+    /// Bound on waiting for deliveries already past the paste to resolve.
+    /// None takes the daemon's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+/// `daemon.quiesce` result. `quiet: true` means nothing is between the
+/// paste and a resolved state anywhere in the fleet, and the pipeline is
+/// held still for the stop that should follow (the daemon un-holds itself
+/// if none does). Deliveries that have not reached a pane yet do not block
+/// quiet: a restart requeues them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuiesceResult {
+    pub quiet: bool,
+    /// `"<msg id> -> <recipient>"` for each delivery still past the paste
+    /// when the wait ran out. Empty when quiet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub in_flight: Vec<String>,
 }
 
 /// `status` params. Absent on every caller that predates the field, which

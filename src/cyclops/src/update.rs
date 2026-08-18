@@ -18,9 +18,14 @@
 //! deploy, and a clone always runs the installer that matches the code
 //! it builds.
 //!
-//! Nothing is restarted here. The daemon and any open workspace keep
-//! executing the replaced binary until they exit, which is why the last
-//! thing printed is the three steps that put the new build in charge.
+//! The daemon is restarted here when that is safe unattended: it is asked
+//! to quiesce (`daemon.quiesce` — nothing between the paste and a
+//! resolved state anywhere), then stopped and started on the new
+//! binaries; messages that have not reached a pane ride through the
+//! restart (the boot requeue). A fleet that stays mid-flight is never
+//! interrupted — the fallback steps print instead. An open workspace is a
+//! person's screen and is never touched either way; it keeps executing
+//! the replaced binary until they detach, and one line says so.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -215,17 +220,27 @@ fn updated_badge(old: &str, new: &str, style: &Style) -> String {
     )
 }
 
-/// The three steps that put the new build in charge, in the grid shape
-/// `cyclops start` prints its `Next:` block in. Exactly three, and never
-/// run for the user: stopping the daemon out from under an open
-/// workspace mid-session is the one thing an update must not do on its
-/// own. Labeled `Restart:` because the installer's stream above already
-/// printed a `Next:` of its own.
+/// The fallback steps that put the new build in charge by hand, printed
+/// when the daemon could not be restarted unattended (a delivery stayed
+/// mid-flight, or the stop/start itself failed). Grid shape matches
+/// `cyclops start`'s `Next:` block; labeled `Restart:` because the
+/// installer's stream above already printed a `Next:` of its own.
+///
+/// The first step is a keystroke, not a command: the workspace's detach
+/// chord. An earlier build said `q` here, which the workspace does not
+/// bind anywhere, and the numbered grid read as an interactive menu that
+/// answered nothing.
 fn restart_steps(style: &Style) -> String {
     let steps: [(&str, &str); 3] = [
-        ("q", "quit any open workspace; it is still on the old build"),
-        ("cyclops daemon stop", "the daemon is too"),
-        ("cyclops start", "come back up on the new build"),
+        (
+            "ctrl+b d",
+            "detach any open workspace; it is still on the old build",
+        ),
+        (
+            "cyclops daemon restart",
+            "retry when quiet; it refuses while a message is mid-flight",
+        ),
+        ("cyclops", "reopen the workspace on the new build"),
     ];
     let w = steps
         .iter()
@@ -256,8 +271,12 @@ fn restart_steps(style: &Style) -> String {
 ///    is `cyclops start --setup-only --wire-hooks`, which writes the hook
 ///    config each installed agent CLI reads and repoints the prepared
 ///    artifacts at the new binary.
-/// 4. Report old to new, from the new binary's own `--version`, then the
-///    restart steps.
+/// 4. Report old to new, from the new binary's own `--version`.
+/// 5. Put the new build in charge where that is safe unattended: quiesce
+///    and restart the daemon (`daemon::restart`). A mid-flight delivery
+///    refuses the restart and the fallback steps print instead; no
+///    daemon at all leaves one start hint. An open workspace is never
+///    touched — one dim line says how to bring it over.
 pub fn run(json: bool, style: &Style) -> i32 {
     if json {
         eprintln!("{}", copy::UPDATE_NO_JSON);
@@ -367,9 +386,32 @@ pub fn run(json: bool, style: &Style) -> i32 {
         None => println!("  {}", style.dim(copy::UPDATE_UNRESOLVED)),
     }
     println!();
-    println!("{}", restart_steps(style));
+
+    // 5.
+    if crate::daemon::is_up() {
+        match crate::daemon::restart(&cyclops_proto::cyclops_home()) {
+            Ok(old_pid) => {
+                println!("{}", crate::render::daemon_restarted(old_pid, style));
+                println!("  {}", style.dim(WORKSPACE_NOTE));
+            }
+            Err(why) => {
+                eprintln!("  {}", style.dim(&format!("daemon not restarted: {why}")));
+                println!();
+                println!("{}", restart_steps(style));
+            }
+        }
+    } else {
+        println!(
+            "Next: cyclops start  {}",
+            style.dim("come up on the new build (no daemon was running)")
+        );
+    }
     0
 }
+
+/// The one thing the update never restarts, and how to bring it over.
+const WORKSPACE_NOTE: &str =
+    "an open workspace stays on the old build until you detach (ctrl+b d) and run cyclops again";
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key)
@@ -433,16 +475,18 @@ mod tests {
         );
     }
 
-    /// Exactly three steps, in the only order that works: a stopped
+    /// Exactly three steps, in the only order that works: a restarted
     /// daemon under a still-open workspace leaves the workspace blind,
-    /// so the workspace goes first.
+    /// so the workspace goes first. Step 1 is the detach chord, a real
+    /// binding — the `q` an earlier build printed here bound nothing and
+    /// read as a menu.
     #[test]
     fn the_restart_steps_are_three_and_ordered() {
         let got = restart_steps(&Style::none());
         let expected = "Restart:\n\
-                        \x20 1  q                    quit any open workspace; it is still on the old build\n\
-                        \x20 2  cyclops daemon stop  the daemon is too\n\
-                        \x20 3  cyclops start        come back up on the new build";
+                        \x20 1  ctrl+b d                detach any open workspace; it is still on the old build\n\
+                        \x20 2  cyclops daemon restart  retry when quiet; it refuses while a message is mid-flight\n\
+                        \x20 3  cyclops                 reopen the workspace on the new build";
         assert_eq!(got, expected);
     }
 }

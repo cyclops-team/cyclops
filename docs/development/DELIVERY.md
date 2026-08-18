@@ -144,13 +144,45 @@ fabricated wait result.
 
 ## Daemon restart
 
-At boot the daemon replays each session ledger and closes every delivery
-whose latest state is still in flight: a state line to attention_required
-(cause: daemon_restart) per dangling chain, plus ONE aggregated
-admin.notify listing them. Limbo is a bug (GOALS); a restart never leaves
-a chain open. msg lines carry a `hosted` list naming the recipients whose
-delivery chains live in that file, so a cross-session broadcast closes
-only where it is hosted.
+At boot the daemon replays each session ledger and resolves every
+delivery whose latest state is still in flight, and the pre-write
+boundary — the same one the running pipeline retries by — decides how:
+
+- **Before the paste** (queued, gating, retry_queued): nothing has
+  touched the pane, so the chain is REQUEUED — payload rebuilt from the
+  msg line's from/subject/body, handle re-enqueued against the adopted
+  pane (or the raw pane id), and the delivery re-enters the gate as if
+  the restart were a long hold. A gating chain steps back through
+  retry_queued (cause: daemon_restart) first; queued and retry_queued
+  re-enter as recorded. ONE aggregated FYI names everything requeued.
+- **Past the paste** (pasting, staged, submitted): the outcome is
+  unknowable from here, so the chain closes with a state line to
+  attention_required (cause: daemon_restart), plus ONE aggregated
+  action-required admin.notify listing them.
+- A pre-paste chain whose recipient maps to no pane this boot (label not
+  adopted, session not watched) closes the same way: there is nothing to
+  requeue into.
+
+Limbo is a bug (GOALS); a restart never leaves a chain open. msg lines
+carry a `hosted` list naming the recipients whose delivery chains live
+in that file, so a cross-session broadcast resolves only where it is
+hosted.
+
+## Quiesce (`daemon.quiesce`)
+
+The pre-restart hold, and what makes `cyclops daemon restart` (and the
+restart `cyclops update` performs) safe unattended. The daemon holds the
+workers still — each finishes the delivery it is on and starts no new
+one, and the gate's proceed re-checks the hold so nothing crosses the
+paste boundary (a delivery caught at that edge parks back to
+retry_queued, cause: quiesce) — then waits out every delivery already
+past the paste, bounded (default 5s, ceiling 30s; those windows are
+seconds by construction). Quiet means nothing is between the paste and a
+resolved state anywhere: the pipeline stays held for the stop that
+should follow, releasing itself after 30s if none does. Not quiet
+releases the hold immediately and names what is still moving; the caller
+refuses to restart. Pre-paste deliveries never block quiet — the boot
+requeue above is what carries them across.
 
 ## Ledger and privacy
 

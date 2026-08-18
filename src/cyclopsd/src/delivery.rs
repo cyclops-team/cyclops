@@ -32,7 +32,7 @@ use std::time::Duration;
 use cyclops_manifest::Manifest;
 use cyclops_proto::{
     AgentState, Delivery, DeliveryReceipt, DeliveryState, Event, Kind, LedgerLine, MsgSendParams,
-    MsgSendResult, NotifyLevel, VerifiedBy, WaitUntil, WireError,
+    MsgSendResult, NotifyLevel, QuiesceResult, VerifiedBy, WaitUntil, WireError,
 };
 use cyclops_tmux::{ControlClient, PaneEvent, PaneRow, SessionWatcher};
 use serde_json::{json, Value};
@@ -65,6 +65,18 @@ const MAX_DECLINES: u32 = 3;
 /// Default and ceiling for agent.wait / send-and-wait timeouts.
 const WAIT_DEFAULT_MS: u64 = 60_000;
 const WAIT_MAX_MS: u64 = 600_000;
+/// Default and ceiling for `daemon.quiesce`: how long to wait for
+/// deliveries already past the paste to resolve. Past-the-paste windows
+/// are seconds by construction (the verify re-reads and ACK deadline
+/// above), so a small bound covers the honest case and a caller cannot
+/// wedge the pipeline with a huge one.
+const QUIESCE_DEFAULT_MS: u64 = 5_000;
+const QUIESCE_MAX_MS: u64 = 30_000;
+/// How long a quiet quiesce holds the pipeline still waiting for the stop
+/// that should follow. If none arrives (the caller died between the
+/// answer and the signal), the pipeline un-holds itself rather than
+/// freezing deliveries forever.
+const QUIESCE_HOLD_FALLBACK_MS: u64 = 30_000;
 /// Upgradeable delivered_unverified handles kept per pane for late hook
 /// ACK upgrades.
 const ACK_REGISTRY_CAP: usize = 32;
@@ -83,6 +95,14 @@ pub(crate) struct Engine {
     buffer_seq: AtomicU64,
     /// Deliveries awaiting or upgradeable by a hook ACK, per pane id.
     acks: StdMutex<HashMap<String, Vec<Arc<DeliveryHandle>>>>,
+    /// Weak refs to every handle the pipeline has created, for the
+    /// quiesce sweep. Pruned as it is read; the pipeline itself never
+    /// looks here.
+    open: StdMutex<Vec<std::sync::Weak<DeliveryHandle>>>,
+    /// Set while a quiesce holds the pipeline still: workers finish the
+    /// delivery they are on, start no new one, and nothing crosses the
+    /// paste boundary (the gate's proceed re-checks it).
+    paused: AtomicBool,
 }
 
 impl Engine {
@@ -93,6 +113,31 @@ impl Engine {
             issued: StdMutex::new(HashSet::new()),
             buffer_seq: AtomicU64::new(0),
             acks: StdMutex::new(HashMap::new()),
+            open: StdMutex::new(Vec::new()),
+            paused: AtomicBool::new(false),
+        }
+    }
+
+    /// Remember a handle for the quiesce sweep, dropping entries whose
+    /// deliveries are gone.
+    fn track(&self, handle: &Arc<DeliveryHandle>) {
+        let mut open = self.open.lock().expect("open handles lock");
+        open.retain(|w| w.strong_count() > 0);
+        open.push(Arc::downgrade(handle));
+    }
+
+    /// Every delivery handle still alive.
+    fn open_handles(&self) -> Vec<Arc<DeliveryHandle>> {
+        let mut open = self.open.lock().expect("open handles lock");
+        open.retain(|w| w.strong_count() > 0);
+        open.iter().filter_map(std::sync::Weak::upgrade).collect()
+    }
+
+    /// Un-hold the pipeline and wake every worker.
+    fn resume_workers(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        for worker in self.workers.lock().expect("workers lock").values() {
+            worker.notify.notify_one();
         }
     }
 
@@ -302,6 +347,7 @@ const PIPELINE_TRANSITIONS: &[(DeliveryState, DeliveryState)] = {
         (Queued, AttentionRequired),
         (Queued, ParkedBlockedQuota),
         (Gating, Pasting),
+        (Gating, RetryQueued),
         (Gating, AttentionRequired),
         (Gating, ParkedBlockedQuota),
         (Pasting, Staged),
@@ -627,30 +673,130 @@ pub(crate) fn admin_notify(
 }
 
 // ---------------------------------------------------------------------------
+// Quiesce
+// ---------------------------------------------------------------------------
+
+/// `daemon.quiesce`: hold the delivery pipeline still so a stop that
+/// follows loses nothing.
+///
+/// Holds the workers (they finish the delivery they are on and start no
+/// new one; the gate's proceed re-checks the hold so nothing crosses the
+/// paste boundary), then waits out every delivery already past the paste.
+/// Those windows are seconds by construction — the verify re-reads and
+/// the ACK deadline — so on a healthy fleet this answers quickly.
+///
+/// Deliveries that have not reached a pane do not block quiet: a restart
+/// requeues them ([`close_limbo`]). Quiet keeps the pipeline held for the
+/// stop that should follow, with a bounded self-release in case the
+/// caller died between the answer and the signal. Not-quiet releases the
+/// hold immediately and names what is still moving.
+pub(crate) async fn quiesce(inner: &Arc<Inner>, timeout_ms: Option<u64>) -> QuiesceResult {
+    let bound = timeout_ms.unwrap_or(QUIESCE_DEFAULT_MS).min(QUIESCE_MAX_MS);
+    let deadline = Instant::now() + Duration::from_millis(bound);
+    inner.engine.paused.store(true, Ordering::SeqCst);
+    loop {
+        // Re-collected each pass: a worker that popped its job before the
+        // hold landed can still carry one delivery past the paste, and
+        // that one must be waited out too.
+        let in_flight: Vec<Arc<DeliveryHandle>> = inner
+            .engine
+            .open_handles()
+            .into_iter()
+            .filter(|h| {
+                let s = h.state();
+                !receipt_resolved(s) && !receipt_is_queued(s)
+            })
+            .collect();
+        if in_flight.is_empty() {
+            let held = Arc::clone(inner);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(QUIESCE_HOLD_FALLBACK_MS)).await;
+                if held.engine.paused.load(Ordering::SeqCst) {
+                    warn!("quiesce hold expired with no stop; resuming deliveries");
+                    held.engine.resume_workers();
+                }
+            });
+            return QuiesceResult {
+                quiet: true,
+                in_flight: Vec::new(),
+            };
+        }
+        let mut timed_out = false;
+        for handle in &in_flight {
+            let mut rx = handle.state_tx.subscribe();
+            if tokio::time::timeout_at(deadline, rx.wait_for(|s| receipt_resolved(*s)))
+                .await
+                .is_err()
+            {
+                timed_out = true;
+                break;
+            }
+        }
+        if timed_out {
+            inner.engine.resume_workers();
+            return QuiesceResult {
+                quiet: false,
+                in_flight: in_flight
+                    .iter()
+                    .filter(|h| !receipt_resolved(h.state()))
+                    .map(|h| format!("{} -> {}", h.msg_id, h.to))
+                    .collect(),
+            };
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Restart-limbo closure
 // ---------------------------------------------------------------------------
 
-/// Close deliveries a previous daemon run left unresolved (GOALS: limbo is
-/// a bug). Runs once at boot over the replayed session ledgers: any
-/// delivery whose latest state is still in-flight gets a state line to
-/// attention_required (cause: daemon_restart), and ONE aggregated
-/// admin.notify lists everything closed.
+/// Resolve deliveries a previous daemon run left unresolved (GOALS: limbo
+/// is a bug). Runs once at boot over the replayed session ledgers, and
+/// the pre-write boundary decides each chain's fate, the same boundary
+/// the running pipeline retries by:
+///
+/// - Before the paste (queued, gating, retry_queued): nothing has touched
+///   the pane, so the chain is REQUEUED — payload rebuilt from the msg
+///   line, handle re-enqueued, and the delivery re-enters the gate as if
+///   the restart were a long hold. One aggregated FYI names them.
+/// - Past the paste: the outcome is unknowable from here, so the chain
+///   closes as attention_required (cause: daemon_restart) and ONE
+///   aggregated action-required admin.notify lists everything closed.
+/// - A pre-paste chain whose recipient no longer maps to any pane (label
+///   not adopted, session not watched this boot) has nothing to requeue
+///   into and closes the same way.
 ///
 /// A msg line's `hosted` list names the recipients whose chains live in
 /// that file, so a chain recorded in another session's file is never
 /// falsely closed here; a delivery that died before its first state line
 /// still closes through its hosted msg record.
 pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine>)]) {
+    /// What `render_payload` needs to rebuild a requeued delivery's bytes,
+    /// straight off the msg line.
+    struct Envelope {
+        from: String,
+        subject: String,
+        body: String,
+        fyi: bool,
+    }
     let mut closed: Vec<String> = Vec::new();
+    let mut requeued: Vec<String> = Vec::new();
     // The same closures as identities, so the one ping can name them and
     // a reader can hold it to the register (cyclops-ui `App::admits`).
     let mut named: Vec<DeliveryRef> = Vec::new();
     for (idx, lines) in replayed {
         // (msg id, recipient) -> (latest state, attempts).
         let mut chains: HashMap<(String, String), (DeliveryState, u32)> = HashMap::new();
+        let mut envelopes: HashMap<String, Envelope> = HashMap::new();
         for line in lines {
             match line.kind {
                 Kind::Msg | Kind::Fyi => {
+                    envelopes.entry(line.id.clone()).or_insert(Envelope {
+                        from: line.from.clone(),
+                        subject: line.subject.clone().unwrap_or_default(),
+                        body: line.body.clone().unwrap_or_default(),
+                        fyi: matches!(line.kind, Kind::Fyi),
+                    });
                     // `hosted` names the recipients whose chains live in
                     // this file. Ledgers from before the field existed were
                     // single-file: a msg line with no hosted list hosts
@@ -691,6 +837,67 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
             .collect();
         dangling.sort_by(|a, b| a.0.cmp(&b.0));
         for ((id, to), (state, attempts)) in dangling {
+            if receipt_is_queued(state) {
+                let target = envelopes
+                    .get(&id)
+                    .zip(requeue_target(inner, &to, *idx));
+                if let Some((env, (sess_idx, pane_id))) = target {
+                    let payload = render_payload(&id, &env.from, &env.subject, &env.body, env.fyi);
+                    // Gating cannot survive the run that was doing the
+                    // gating; the recorded step back is retry_queued, the
+                    // pre-paste retry state. Queued and retry_queued are
+                    // already accurate and re-enter silently.
+                    let requeue_state = if state == DeliveryState::Gating {
+                        let record = Delivery {
+                            to: to.clone(),
+                            state: DeliveryState::RetryQueued,
+                            verified_by: None,
+                            attempts,
+                            ts: unix_ms(),
+                            cause: Some("daemon_restart".to_string()),
+                        };
+                        emit_delivery_state(
+                            inner,
+                            &[*idx],
+                            &id,
+                            &to,
+                            state,
+                            DeliveryState::RetryQueued,
+                            Some("daemon_restart"),
+                            None,
+                            &record,
+                        );
+                        DeliveryState::RetryQueued
+                    } else {
+                        state
+                    };
+                    let handle = DeliveryHandle::with_ledger_sessions(
+                        &id,
+                        &to,
+                        &pane_id,
+                        sess_idx,
+                        vec![*idx],
+                        payload,
+                    );
+                    {
+                        let mut st = handle.state.lock().expect("handle state lock");
+                        st.state = requeue_state;
+                        st.attempts = attempts;
+                    }
+                    inner.engine.track(&handle);
+                    let worker = worker_for(inner, sess_idx, &pane_id);
+                    worker
+                        .queue
+                        .lock()
+                        .expect("worker queue lock")
+                        .push_back(handle);
+                    worker.notify.notify_one();
+                    requeued.push(format!("{id} -> {to}"));
+                    continue;
+                }
+                // No pane to requeue into: close below, like any other
+                // chain the restart cannot carry forward.
+            }
             let record = Delivery {
                 to: to.clone(),
                 state: DeliveryState::AttentionRequired,
@@ -717,6 +924,25 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
             });
         }
     }
+    if !requeued.is_empty() {
+        requeued.sort();
+        requeued.dedup();
+        // Fyi, not action-required: these deliveries are being handled,
+        // and a ping that claims a human is needed while naming nothing a
+        // human can do is the contradiction M3 banned.
+        admin_notify(
+            inner,
+            NotifyLevel::Fyi,
+            "deliveries requeued after daemon restart",
+            &format!(
+                "nothing had reached a pane; requeued: {}",
+                requeued.join(", ")
+            ),
+            None,
+            None,
+            About::default(),
+        );
+    }
     if closed.is_empty() {
         return;
     }
@@ -739,6 +965,24 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
         // over "action required" once the batch had been dealt with.
         About::deliveries(named),
     );
+}
+
+/// Where a requeued delivery should go: the adopted pane for a label, in
+/// the session the adoption names, provided that session is watched this
+/// boot; or the name itself when it already is a pane id (such a chain
+/// lives in the session file that hosted it, which is the session the
+/// pane resolved into at send time). None means there is nothing to
+/// requeue into and the chain closes instead.
+fn requeue_target(inner: &Arc<Inner>, to: &str, hosted_idx: usize) -> Option<(usize, String)> {
+    let adopted = {
+        let reg = inner.registry.lock().expect("registry lock");
+        reg.pane_for_label(to)
+            .and_then(|pane| reg.get(&pane).map(|a| (a.session.clone(), pane)))
+    };
+    if let Some((session, pane)) = adopted {
+        return inner.session_index(&session).map(|idx| (idx, pane));
+    }
+    to.starts_with('%').then(|| (hosted_idx, to.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -933,6 +1177,7 @@ pub(crate) async fn msg_send(
             Some((session_idx, pane_id)) => {
                 let handle =
                     DeliveryHandle::new(&msg_id, name, pane_id, *session_idx, payload.clone());
+                inner.engine.track(&handle);
                 let worker = worker_for(inner, *session_idx, pane_id);
                 let parked_hint = worker.parked.lock().expect("parked lock").clone();
                 if let Some(hint) = parked_hint {
@@ -1302,6 +1547,13 @@ fn worker_for(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) -> Arc<Work
 
 async fn worker_loop(inner: Arc<Inner>, worker: Arc<Worker>) {
     loop {
+        // A quiesce holds the pipeline still: finish nothing new until
+        // resume_workers notifies. Jobs stay queued (pre-paste, safe
+        // across the restart the quiesce is for).
+        if inner.engine.paused.load(Ordering::SeqCst) {
+            worker.notify.notified().await;
+            continue;
+        }
         let job = worker.queue.lock().expect("worker queue lock").pop_front();
         match job {
             Some(handle) => {
@@ -1330,10 +1582,12 @@ async fn worker_loop(inner: Arc<Inner>, worker: Arc<Worker>) {
 
 /// Drive one delivery through gate, inject, submit, ACK, bounded retry.
 async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<DeliveryHandle>) {
+    // retry_queued alongside queued: a chain requeued across a daemon
+    // restart, or parked by a quiesce, re-enters here in that state.
     if !advance(
         inner,
         handle,
-        &[DeliveryState::Queued],
+        &[DeliveryState::Queued, DeliveryState::RetryQueued],
         Step::to(DeliveryState::Gating),
     ) {
         return;
@@ -1358,6 +1612,26 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
                 manifest_id,
                 pane_pid,
             } => {
+                // A quiesce that landed while this delivery was at the
+                // gate: nothing may cross the paste boundary now. Park
+                // pre-paste and hand the job back; it re-enters when the
+                // pipeline resumes — or requeues across the restart the
+                // quiesce was for.
+                if inner.engine.paused.load(Ordering::SeqCst) {
+                    if advance(
+                        inner,
+                        handle,
+                        &[DeliveryState::Gating],
+                        Step::to(DeliveryState::RetryQueued).cause("quiesce"),
+                    ) {
+                        worker
+                            .queue
+                            .lock()
+                            .expect("worker queue lock")
+                            .push_front(Arc::clone(handle));
+                    }
+                    return;
+                }
                 {
                     let mut st = handle.state.lock().expect("handle state lock");
                     st.attempts += 1;

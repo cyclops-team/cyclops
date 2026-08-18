@@ -446,27 +446,37 @@ home are never rewritten. Then it closes the loop the installer cannot:
 ```
 ✔ updated · 0.1.0 (0876ed7) → 0.1.0 (1e16081)
 
-Restart:
-  1  q                    quit any open workspace; it is still on the old build
-  2  cyclops daemon stop  the daemon is too
-  3  cyclops start        come back up on the new build
+✔ restarted cyclopsd · was pid 4242, now on the installed binaries; queued messages rode through
+  an open workspace stays on the old build until you detach (ctrl+b d) and run cyclops again
 ```
 
 The left of the arrow is the binary that ran the update; the right is
-the freshly installed one answering `--version` for itself. Nothing is
-restarted for you, on purpose: the daemon and any open workspace keep
-executing the replaced binary until you take the three steps, and
-stopping a daemon under an open workspace mid-session is not the
-update's call to make.
+the freshly installed one answering `--version` for itself. Then the
+daemon is restarted for you when that is safe unattended: it is asked to
+quiesce first (`daemon.quiesce`), and a restart only proceeds when no
+message is between the paste and a resolved delivery anywhere. Messages
+that have not reached a pane ride through — the rebooted daemon requeues
+them. Your open workspace is a different matter: it is your screen, so
+it is never touched, and one dim line says how to bring it over.
 
-That `cyclops start` also repairs the prepared hook configs under
-`~/.cyclops/hooks/`: any that still invoke a cyclops path that no longer
-exists are re-rendered for the new build and a note says how many. The
-receipt recorded beside each artifact is how start tells its own writing
-from yours — a file you edited, or one with no receipt, is named and left
-alone. A copy you already merged into vendor config is out of reach the
-same way; the note names it so the hooks that would otherwise fail
-silently point somewhere you can fix.
+A fleet that stays mid-flight refuses the restart and prints the manual
+steps instead — the same three you can take any time:
+
+```
+Restart:
+  1  ctrl+b d                detach any open workspace; it is still on the old build
+  2  cyclops daemon restart  retry when quiet; it refuses while a message is mid-flight
+  3  cyclops                 reopen the workspace on the new build
+```
+
+Reopening with `cyclops` (or any `cyclops start`) also repairs the
+prepared hook configs under `~/.cyclops/hooks/`: any that still invoke a
+cyclops path that no longer exists are re-rendered for the new build and
+a note says how many. The receipt recorded beside each artifact is how
+start tells its own writing from yours — a file you edited, or one with
+no receipt, is named and left alone. A copy you already merged into
+vendor config is out of reach the same way; the note names it so the
+hooks that would otherwise fail silently point somewhere you can fix.
 
 `CYCLOPS_REPO` and `CYCLOPS_REF` pick the source, exactly as they do for
 the installer; the defaults are the public repository's `main`. A build

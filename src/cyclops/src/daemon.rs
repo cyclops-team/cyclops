@@ -198,6 +198,86 @@ fn which(name: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// How long a restart waits for the stopped daemon to actually leave the
+/// socket before giving up rather than racing a second one up.
+const STOP_WAIT: Duration = Duration::from_secs(10);
+
+/// The quiesce bound a restart asks for: enough to cover a delivery's
+/// whole post-submit ACK window (5s) with margin, so a restart attempted
+/// mid-delivery waits it out instead of refusing.
+const QUIESCE_ASK_MS: u64 = 8_000;
+
+/// Restart the daemon on the binaries installed now, losing nothing:
+/// quiesce, stop, wait it out, start.
+///
+/// Refuses rather than interrupts. A delivery between the paste and a
+/// resolved state is the one thing a restart could orphan, so the daemon
+/// is asked to hold the pipeline and wait those windows out first
+/// (`daemon.quiesce`); a fleet that stays mid-flight past the bound gets
+/// an error naming what is still moving, and nothing is stopped.
+/// Deliveries that have not reached a pane never block this: the next
+/// boot requeues them.
+pub fn restart(home: &Path) -> Result<u32, String> {
+    // The quiesce lawfully blocks for its whole bound (deliveries past
+    // the paste can take the full 5s ACK window to resolve), so this one
+    // request gets a read deadline with headroom over the bound it asks
+    // for, instead of the default that would race it.
+    let mut client = match Client::connect_with_timeouts(
+        Duration::from_secs(2),
+        Duration::from_millis(QUIESCE_ASK_MS + 5_000),
+    ) {
+        Ok(c) => c,
+        Err(ClientError::NotRunning) => return Err("cyclopsd is not running.".to_string()),
+        Err(e) => return Err(crate::copy::client_error(&e, None)),
+    };
+    let quiesced = client
+        .request(
+            "daemon.quiesce",
+            serde_json::json!({ "timeout_ms": QUIESCE_ASK_MS }),
+        )
+        .map_err(|e| crate::copy::client_error(&e, None))?;
+    if !quiesced
+        .get("quiet")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        let open: Vec<String> = quiesced
+            .get("in_flight")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let named = if open.is_empty() {
+            "a delivery is mid-flight".to_string()
+        } else {
+            format!("mid-flight: {}", open.join(", "))
+        };
+        return Err(format!(
+            "{named}. Nothing was restarted; try again when it resolves."
+        ));
+    }
+    drop(client);
+    let pid = stop()?;
+    // Wait for the old daemon to leave the socket: a new one refuses to
+    // boot while another still answers there.
+    let deadline = Instant::now() + STOP_WAIT;
+    while is_up() {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "cyclopsd (pid {pid}) is still answering {}s after the stop; \
+                 not starting a second one.",
+                STOP_WAIT.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    ensure_running(home)?;
+    Ok(pid)
+}
+
 /// Ask the running daemon to shut down, by signalling the process that
 /// holds the socket.
 ///

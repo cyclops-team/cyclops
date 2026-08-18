@@ -205,6 +205,9 @@ tells you where to look:
 | `pane_rebound_after_paste` | The pane changed after staged input reached the original occupant | Inspect the original pane before resending; Cyclops never retries this cause |
 | `submit_failed` | Enter may have reached the original occupant before its reply was lost | Inspect the named pane and composer before resending |
 | `ack_timeout` | The submit may have started a turn but no ACK arrived in time | Inspect the named pane and recipient state before resending |
+| `quiesce` | A pre-restart hold parked the delivery pre-paste; it re-enters when the pipeline resumes | Nothing — this is the restart machinery working |
+| `daemon_restart` on `retry_queued` | The chain rode a restart: nothing had reached the pane, so the new run requeued it | Nothing — the delivery is back in the queue |
+| `daemon_restart` on `attention_required` | The restart could not carry the chain: past the paste, or no pane answers to the recipient now | Inspect the recipient pane before resending |
 
 The thing to internalize: **a hold is waiting on an event, never on a
 clock.** So "it is stuck" is always the question "which event never

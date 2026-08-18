@@ -203,9 +203,9 @@ enum Cmd {
     },
     /// Update cyclops itself: fetch the source, rebuild, and replace the
     /// installed binaries. Config, themes, manifests and the record are
-    /// untouched. Prints old and new build, then the restart steps;
-    /// nothing is restarted for you. (Wiring agent hooks is `cyclops
-    /// hooks install`, a different job.)
+    /// untouched. Prints old and new build, then restarts the daemon when
+    /// nothing is mid-flight; an open workspace is never touched. (Wiring
+    /// agent hooks is `cyclops hooks install`, a different job.)
     Update,
     /// The daemon: stop it, ask after it, read its log. `cyclops start`
     /// starts one for you, so there is no `daemon start`.
@@ -221,6 +221,10 @@ enum DaemonCmd {
     Status,
     /// Stop it. Your tmux sessions and the record are untouched.
     Stop,
+    /// Stop it and start it again on the binaries installed now. Refuses
+    /// while a delivery is mid-flight; messages that have not reached a
+    /// pane ride through.
+    Restart,
     /// Print the daemon's log, which is where a detached one writes.
     Log {
         /// How many lines from the end.
@@ -955,6 +959,20 @@ fn cmd_daemon(cli: &Cli, style: &Style, cmd: &DaemonCmd) -> i32 {
                     println!("{}", json!({"stopped": true, "pid": pid}));
                 } else {
                     println!("{}", render::daemon_stopped(pid, style));
+                }
+                0
+            }
+            Err(why) => {
+                eprintln!("{why}");
+                1
+            }
+        },
+        DaemonCmd::Restart => match daemon::restart(&home) {
+            Ok(old_pid) => {
+                if cli.json {
+                    println!("{}", json!({"restarted": true, "stopped_pid": old_pid}));
+                } else {
+                    println!("{}", render::daemon_restarted(old_pid, style));
                 }
                 0
             }

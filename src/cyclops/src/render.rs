@@ -450,6 +450,17 @@ pub fn daemon_stopped(pid: u32, style: &Style) -> String {
     )
 }
 
+pub fn daemon_restarted(old_pid: u32, style: &Style) -> String {
+    let sep = style.dim("·");
+    format!(
+        "{} {sep} {}",
+        style.bold(&format!("{} restarted cyclopsd", check(true))),
+        style.dim(&format!(
+            "was pid {old_pid}, now on the installed binaries; queued messages rode through"
+        ))
+    )
+}
+
 /// The answer to `cyclops name`, in the badge voice: what happened, then
 /// the detail after a dim separator.
 ///

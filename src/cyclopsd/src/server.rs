@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use cyclops_proto::{
     AdminNotifyParams, AgentWaitParams, Event, Hello, MsgSendParams, PaneReadParams,
-    PaneReadResult, PaneReadSource, PingResult, Request, Response, SessionStatus,
+    PaneReadResult, PaneReadSource, PingResult, QuiesceParams, Request, Response, SessionStatus,
     StateReportParams, StatusParams, StatusResult, SubscribeParams, WireError, PROTOCOL_VERSION,
 };
 use cyclops_tmux::SessionWatcher;
@@ -306,6 +306,22 @@ pub(crate) async fn dispatch(
             )
         }
         "pane.read" => (pane_read(inner, id, req.params).await, None),
+        "daemon.quiesce" => {
+            // The pre-restart hold. Absent params take the shipped bounds,
+            // like `status`; the daemon owns the ceiling either way.
+            let params: QuiesceParams = match req.params {
+                Value::Null => QuiesceParams::default(),
+                given => match decode_params(&id, given, "daemon.quiesce params") {
+                    Ok(p) => p,
+                    Err(r) => return (r, None),
+                },
+            };
+            let result = delivery::quiesce(inner, params.timeout_ms).await;
+            (
+                Response::ok(id, serde_json::to_value(result).expect("quiesce serializes")),
+                None,
+            )
+        }
         "msg.send" => (msg_send(inner, id, req.params, peer).await, None),
         "msg.history" => {
             // cursor2 travels outside the HistoryParams struct (wire-additive;

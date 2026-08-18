@@ -544,6 +544,43 @@ fn daemon_not_running_copy_and_exit_code() {
 }
 
 #[test]
+fn daemon_restart_without_a_daemon_says_so() {
+    let home = scratch_home("rnr");
+    let out = run_cyclops(&home, &["daemon", "restart"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "cyclopsd is not running.",
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// A restart never interrupts a delivery past the paste: a not-quiet
+/// quiesce answer refuses the whole verb, names what is moving, and no
+/// stop is attempted (the canned server would have seen its request).
+#[test]
+fn daemon_restart_refuses_while_mid_flight() {
+    let home = scratch_home("rmf");
+    serve_once(&home, hello(1), |req| {
+        assert_eq!(req["method"], "daemon.quiesce", "{req}");
+        (
+            vec![json!({
+                "id": req["id"],
+                "result": {"quiet": false, "in_flight": ["m-abc123 -> codex"]},
+            })
+            .to_string()],
+            true,
+        )
+    });
+    let out = run_cyclops(&home, &["daemon", "restart"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("m-abc123 -> codex"), "{err}");
+    assert!(err.contains("Nothing was restarted"), "{err}");
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
 fn proto_mismatch_warns_and_continues() {
     let home = scratch_home("pm");
     let canned = canned_status();
