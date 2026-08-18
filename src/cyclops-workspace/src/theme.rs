@@ -219,6 +219,22 @@ pub fn sidebar_label(paint: &Paint) -> Style {
         .patch(paint.bg_token(tokens::CHROME_PANEL))
 }
 
+/// The prompt glyph inside the sidebar wordmark: accent ink so the mark
+/// reads as the logo's lit eye rather than five uniformly dim characters.
+/// Branding only — the row deliberately carries no signal (the rollup dot
+/// it replaced latched forever; see `render::sidebar::paint_wordmark`) —
+/// so with colors off this is `sidebar_label` unchanged rather than bold:
+/// a lone bold glyph in a dim mark would read as an indicator.
+pub fn sidebar_wordmark_eye(paint: &Paint) -> Style {
+    if !paint.colors_enabled {
+        return sidebar_label(paint);
+    }
+    paint
+        .style_token(tokens::SURFACE_ACCENT)
+        .patch(paint.bg_token(tokens::CHROME_PANEL))
+        .add_modifier(Modifier::BOLD)
+}
+
 /// The workspace's transient notice, painted on chrome the workspace owns
 /// (`render::canvas::paint_notice`). Accent ink on the chrome ground so it
 /// reads as the workspace speaking rather than as pane content; the words

@@ -509,14 +509,18 @@ fn paint_wordmark(row: Rect, right: u16, used: u16, buf: &mut Buffer, paint: &Pa
     if right.saturating_sub(row.x + used) < width + 1 {
         return;
     }
-    super::overlay_text(
-        buf,
-        row,
-        right - width,
-        row.y,
-        copy::WORDMARK,
-        theme::sidebar_label(paint),
-    );
+    // Three segments, one string: the prompt glyph is the logo's eye and
+    // takes accent ink; the frame stays label-dim. The fit check above
+    // still measures `WORDMARK` whole.
+    let mut x = right - width;
+    for (text, style) in [
+        (copy::WORDMARK_FRAME_OPEN, theme::sidebar_label(paint)),
+        (copy::WORDMARK_EYE, theme::sidebar_wordmark_eye(paint)),
+        (copy::WORDMARK_FRAME_CLOSE, theme::sidebar_label(paint)),
+    ] {
+        super::overlay_text(buf, row, x, row.y, text, style);
+        x = x.saturating_add(u16::try_from(Span::raw(text).width()).unwrap_or(u16::MAX));
+    }
 }
 
 /// The tab header: one row of chips naming what the body below shows, with
@@ -1477,6 +1481,31 @@ mod tests {
         assert!(
             header.contains(copy::WORDMARK),
             "the mark belongs on the header: {header:?}"
+        );
+        // The mark's eye takes accent ink while its frame stays label-dim
+        // (paint_wordmark). Found by position inside the whole mark so the
+        // assertion cannot latch onto a '>' some other chip painted.
+        // Ink and weight only: a buffer cell materializes every style
+        // field (underline color reads back as Reset), so whole-style
+        // equality against a theme style can never hold.
+        let mark_x = header.find(copy::WORDMARK).unwrap() as u16;
+        let eye_x = mark_x + copy::WORDMARK_FRAME_OPEN.len() as u16;
+        let paint = Paint::for_test();
+        let ink = |x: u16| {
+            let s = buf[(x, 0)].style();
+            (s.fg, s.add_modifier)
+        };
+        let eye = theme::sidebar_wordmark_eye(&paint);
+        assert_eq!(
+            ink(eye_x),
+            (eye.fg, eye.add_modifier),
+            "the prompt glyph is the lit eye"
+        );
+        let frame = theme::sidebar_label(&paint);
+        assert_eq!(
+            ink(mark_x),
+            (frame.fg, frame.add_modifier),
+            "and the frame around it stays dim"
         );
         assert!(
             header.contains(copy::SIDEBAR_TAB_SESSIONS),

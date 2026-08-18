@@ -71,6 +71,17 @@ pub const SIDEBAR_TAB_STREAM: &str = "Stream";
 /// wordmark is for.
 pub const WORDMARK: &str = "[> -]";
 
+/// The mark split where its ink changes: the prompt glyph is the logo's
+/// eye and takes accent ink, while the frame around it stays label-dim
+/// (`render::sidebar::paint_wordmark`). The three concatenate to exactly
+/// `WORDMARK`, which remains the one string everything measures and
+/// asserts against.
+pub const WORDMARK_FRAME_OPEN: &str = "[";
+
+pub const WORDMARK_EYE: &str = ">";
+
+pub const WORDMARK_FRAME_CLOSE: &str = " -]";
+
 /// Named beside the sidebar's create button while the mouse rests on it. A
 /// bare glyph does not say what it makes, and the sidebar is too narrow to
 /// carry the whole phrase at rest.
@@ -271,6 +282,17 @@ mod tests {
     /// The three shapes a copy takes: a dragged block, a triple-clicked
     /// line, and a double-clicked word. Each says what it took, because
     /// the count is the only thing that distinguishes them on screen.
+    /// The header paints the mark in three segments so the eye can take
+    /// accent ink; every width check and containment assertion still reads
+    /// `WORDMARK` whole, so the segments must reassemble it exactly.
+    #[test]
+    fn wordmark_segments_reassemble_the_mark() {
+        assert_eq!(
+            format!("{WORDMARK_FRAME_OPEN}{WORDMARK_EYE}{WORDMARK_FRAME_CLOSE}"),
+            WORDMARK
+        );
+    }
+
     #[test]
     fn copied_counts_what_the_selection_took() {
         assert_eq!(copied("one\ntwo\nthree"), "copied 3 lines");
