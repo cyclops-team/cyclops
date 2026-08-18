@@ -976,8 +976,14 @@ fn cmd_daemon(cli: &Cli, style: &Style, cmd: &DaemonCmd) -> i32 {
                 }
                 0
             }
-            Err(why) => {
-                eprintln!("{why}");
+            Err(refusal) => {
+                eprintln!("{}", refusal.why());
+                // A daemon too old for the quiesce handshake cannot be
+                // restarted by this verb at all, so the fix is named here
+                // rather than left to a retry that can only fail again.
+                if matches!(refusal, daemon::RestartRefusal::Predates) {
+                    eprintln!("{}", copy::RESTART_PREDATES_FIX);
+                }
                 1
             }
         },

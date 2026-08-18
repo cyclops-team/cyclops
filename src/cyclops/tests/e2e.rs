@@ -555,6 +555,35 @@ fn daemon_restart_without_a_daemon_says_so() {
     let _ = fs::remove_dir_all(&home);
 }
 
+/// The bootstrap crossing, seen in the field: the daemon still running is
+/// the build being replaced, so it answers unknown_method to the restart
+/// handshake. That is not an error to retry — it is an old daemon — so
+/// the copy says which pair of commands crosses instead of leaving a raw
+/// protocol code on screen.
+#[test]
+fn daemon_restart_against_an_older_daemon_names_the_one_time_fix() {
+    let home = scratch_home("rold");
+    serve_once(&home, hello(1), |req| {
+        assert_eq!(req["method"], "daemon.quiesce", "{req}");
+        (
+            vec![json!({
+                "id": req["id"],
+                "error": {"code": "unknown_method", "message": "unknown method \"daemon.quiesce\""},
+            })
+            .to_string()],
+            true,
+        )
+    });
+    let out = run_cyclops(&home, &["daemon", "restart"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("predates this feature"), "{err}");
+    assert!(err.contains("cyclops daemon stop"), "{err}");
+    // The raw wire code is a diagnostic, not an instruction.
+    assert!(!err.contains("unknown_method"), "{err}");
+    let _ = fs::remove_dir_all(&home);
+}
+
 /// A restart never interrupts a delivery past the paste: a not-quiet
 /// quiesce answer refuses the whole verb, names what is moving, and no
 /// stop is attempted (the canned server would have seen its request).

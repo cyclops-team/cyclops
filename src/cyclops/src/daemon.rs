@@ -207,6 +207,33 @@ const STOP_WAIT: Duration = Duration::from_secs(10);
 /// mid-delivery waits it out instead of refusing.
 const QUIESCE_ASK_MS: u64 = 8_000;
 
+/// Why a restart did not happen. The caller words each case; only
+/// [`RestartRefusal::Predates`] has a different fix from the others.
+pub enum RestartRefusal {
+    /// The running daemon does not answer `daemon.quiesce`, so it predates
+    /// the verb entirely — the build being replaced, still serving. It
+    /// cannot be restarted this way (nor by `cyclops daemon restart`,
+    /// which asks the same question), and the one-time way across is a
+    /// plain stop and start.
+    Predates,
+    /// Something is between the paste and a resolved delivery. Carries the
+    /// sentence naming it.
+    Busy(String),
+    /// Anything else: no daemon, a broken socket, a failed spawn.
+    Failed(String),
+}
+
+impl RestartRefusal {
+    pub fn why(&self) -> &str {
+        match self {
+            RestartRefusal::Predates => {
+                "the running daemon predates this feature; it is the build you just replaced"
+            }
+            RestartRefusal::Busy(why) | RestartRefusal::Failed(why) => why,
+        }
+    }
+}
+
 /// Restart the daemon on the binaries installed now, losing nothing:
 /// quiesce, stop, wait it out, start.
 ///
@@ -217,7 +244,7 @@ const QUIESCE_ASK_MS: u64 = 8_000;
 /// an error naming what is still moving, and nothing is stopped.
 /// Deliveries that have not reached a pane never block this: the next
 /// boot requeues them.
-pub fn restart(home: &Path) -> Result<u32, String> {
+pub fn restart(home: &Path) -> Result<u32, RestartRefusal> {
     // The quiesce lawfully blocks for its whole bound (deliveries past
     // the paste can take the full 5s ACK window to resolve), so this one
     // request gets a read deadline with headroom over the bound it asks
@@ -227,15 +254,23 @@ pub fn restart(home: &Path) -> Result<u32, String> {
         Duration::from_millis(QUIESCE_ASK_MS + 5_000),
     ) {
         Ok(c) => c,
-        Err(ClientError::NotRunning) => return Err("cyclopsd is not running.".to_string()),
-        Err(e) => return Err(crate::copy::client_error(&e, None)),
+        Err(ClientError::NotRunning) => {
+            return Err(RestartRefusal::Failed("cyclopsd is not running.".to_string()))
+        }
+        Err(e) => return Err(RestartRefusal::Failed(crate::copy::client_error(&e, None))),
     };
-    let quiesced = client
-        .request(
-            "daemon.quiesce",
-            serde_json::json!({ "timeout_ms": QUIESCE_ASK_MS }),
-        )
-        .map_err(|e| crate::copy::client_error(&e, None))?;
+    let quiesced = match client.request(
+        "daemon.quiesce",
+        serde_json::json!({ "timeout_ms": QUIESCE_ASK_MS }),
+    ) {
+        Ok(v) => v,
+        // A daemon that does not know the verb IS an old daemon, and no
+        // amount of retrying teaches it. Its own fix is a stop and start.
+        Err(ClientError::Server { ref code, .. }) if code == "unknown_method" => {
+            return Err(RestartRefusal::Predates)
+        }
+        Err(e) => return Err(RestartRefusal::Failed(crate::copy::client_error(&e, None))),
+    };
     if !quiesced
         .get("quiet")
         .and_then(serde_json::Value::as_bool)
@@ -255,26 +290,26 @@ pub fn restart(home: &Path) -> Result<u32, String> {
         } else {
             format!("mid-flight: {}", open.join(", "))
         };
-        return Err(format!(
+        return Err(RestartRefusal::Busy(format!(
             "{named}. Nothing was restarted; try again when it resolves."
-        ));
+        )));
     }
     drop(client);
-    let pid = stop()?;
+    let pid = stop().map_err(RestartRefusal::Failed)?;
     // Wait for the old daemon to leave the socket: a new one refuses to
     // boot while another still answers there.
     let deadline = Instant::now() + STOP_WAIT;
     while is_up() {
         if Instant::now() >= deadline {
-            return Err(format!(
+            return Err(RestartRefusal::Failed(format!(
                 "cyclopsd (pid {pid}) is still answering {}s after the stop; \
                  not starting a second one.",
                 STOP_WAIT.as_secs()
-            ));
+            )));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    ensure_running(home)?;
+    ensure_running(home).map_err(RestartRefusal::Failed)?;
     Ok(pid)
 }
 

@@ -459,6 +459,13 @@ that have not reached a pane ride through — the rebooted daemon requeues
 them. Your open workspace is a different matter: it is your screen, so
 it is never touched, and one dim line says how to bring it over.
 
+Once, on the update that first installs this: the daemon still running
+is the build being replaced, so it does not know the restart handshake
+and says so. That crossing is a plain `cyclops daemon stop` followed by
+`cyclops` — the printed steps say exactly that, because
+`cyclops daemon restart` would ask the same old daemon the same question.
+Every update after it restarts on its own.
+
 A fleet that stays mid-flight refuses the restart and prints the manual
 steps instead — the same three you can take any time:
 

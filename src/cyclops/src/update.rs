@@ -230,18 +230,37 @@ fn updated_badge(old: &str, new: &str, style: &Style) -> String {
 /// chord. An earlier build said `q` here, which the workspace does not
 /// bind anywhere, and the numbered grid read as an interactive menu that
 /// answered nothing.
-fn restart_steps(style: &Style) -> String {
-    let steps: [(&str, &str); 3] = [
-        (
-            "ctrl+b d",
-            "detach any open workspace; it is still on the old build",
-        ),
-        (
-            "cyclops daemon restart",
-            "retry when quiet; it refuses while a message is mid-flight",
-        ),
-        ("cyclops", "reopen the workspace on the new build"),
-    ];
+fn restart_steps(style: &Style, predates: bool) -> String {
+    // Step 2 has to be a command that can actually work from here. A
+    // daemon too old to answer `daemon.quiesce` is too old for
+    // `cyclops daemon restart`, which asks the same question and would
+    // refuse the same way — so that one crossing is a plain stop, and the
+    // start comes with reopening the workspace.
+    let steps: [(&str, &str); 3] = if predates {
+        [
+            (
+                "ctrl+b d",
+                "detach any open workspace; it is still on the old build",
+            ),
+            (
+                "cyclops daemon stop",
+                "the old daemon cannot restart itself; this once, stop it",
+            ),
+            ("cyclops", "reopen the workspace; it starts the new daemon"),
+        ]
+    } else {
+        [
+            (
+                "ctrl+b d",
+                "detach any open workspace; it is still on the old build",
+            ),
+            (
+                "cyclops daemon restart",
+                "retry when quiet; it refuses while a message is mid-flight",
+            ),
+            ("cyclops", "reopen the workspace on the new build"),
+        ]
+    };
     let w = steps
         .iter()
         .map(|(cmd, _)| cyclops_ui::grid::display_width(cmd))
@@ -394,10 +413,14 @@ pub fn run(json: bool, style: &Style) -> i32 {
                 println!("{}", crate::render::daemon_restarted(old_pid, style));
                 println!("  {}", style.dim(WORKSPACE_NOTE));
             }
-            Err(why) => {
-                eprintln!("  {}", style.dim(&format!("daemon not restarted: {why}")));
+            Err(refusal) => {
+                let predates = matches!(refusal, crate::daemon::RestartRefusal::Predates);
+                eprintln!(
+                    "  {}",
+                    style.dim(&format!("daemon not restarted: {}", refusal.why()))
+                );
                 println!();
-                println!("{}", restart_steps(style));
+                println!("{}", restart_steps(style, predates));
             }
         }
     } else {
@@ -482,11 +505,26 @@ mod tests {
     /// read as a menu.
     #[test]
     fn the_restart_steps_are_three_and_ordered() {
-        let got = restart_steps(&Style::none());
+        let got = restart_steps(&Style::none(), false);
         let expected = "Restart:\n\
                         \x20 1  ctrl+b d                detach any open workspace; it is still on the old build\n\
                         \x20 2  cyclops daemon restart  retry when quiet; it refuses while a message is mid-flight\n\
                         \x20 3  cyclops                 reopen the workspace on the new build";
         assert_eq!(got, expected);
+    }
+
+    /// The bootstrap crossing: the daemon still running is the build being
+    /// replaced, so it cannot answer the restart handshake — and step 2
+    /// must therefore not be `cyclops daemon restart`, which asks that
+    /// same daemon the same question and refuses the same way. Telling
+    /// someone to run a command that cannot work is the bug this pins.
+    #[test]
+    fn steps_for_a_daemon_that_predates_the_verb_do_not_send_it_back_to_restart() {
+        let got = restart_steps(&Style::none(), true);
+        assert!(
+            !got.contains("cyclops daemon restart"),
+            "an old daemon cannot restart itself: {got}"
+        );
+        assert!(got.contains("cyclops daemon stop"), "{got}");
     }
 }

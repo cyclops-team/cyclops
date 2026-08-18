@@ -14,6 +14,12 @@ pub use cyclops_proto::NOT_RUNNING;
 /// `cyclops daemon status` with nothing to report on.
 pub const DAEMON_DOWN: &str = "○ cyclopsd is not running · start it with: cyclops start";
 
+/// Said when the running daemon is too old to answer the restart
+/// handshake. Retrying this verb can only fail the same way, so the copy
+/// names the pair of commands that do cross, once.
+pub const RESTART_PREDATES_FIX: &str =
+    "Stop and start it once by hand: cyclops daemon stop, then cyclops start.";
+
 pub const NO_RECIPIENT: &str =
     "no recipient. Name one (cyclops send reviewer --subject \"...\"), or pass --to or --all.";
 
