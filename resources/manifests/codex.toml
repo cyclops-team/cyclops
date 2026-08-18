@@ -178,6 +178,14 @@ auto_dismiss = false
 method = "load-buffer + paste-buffer -p"
 submit = "Enter"
 verify_before_submit = true
+# The composer collapses a long paste into a "[Pasted Content N chars]"
+# chip, hiding the message id — so for long messages the "Pasted" pattern
+# on the composer line is the ONLY verifiable staging evidence, and the
+# composer line is only recognizable in an escaped capture (the esc rules
+# above). The daemon takes the escaped verify capture because this
+# manifest carries esc clauses; without that pairing every long delivery
+# read verify_failed and was left staged, unsubmitted (observed in the
+# field, 2026-08-17).
 verify_pattern = ["<message_id>", "Pasted"]
 safe_states = ["idle"]
 unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

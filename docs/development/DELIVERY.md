@@ -87,7 +87,15 @@ visible; the hold itself keeps waiting on events, never on a timer.
 2. `bracket_paste_flag` is unavailable through tmux 3.6a (amendment b), so
    bracketed-paste degradation is not gateable. The gate is post-paste
    composer verification: capture the bottom region and require the
-   manifest's `verify_pattern` with `<message_id>` substituted. agy's first
+   manifest's `verify_pattern` with `<message_id>` substituted. The
+   capture flavor follows the manifest: SGR-escaped (`capture-pane -e`)
+   when any rule carries `line_regex_esc` clauses, plain otherwise —
+   pattern text is matched on de-escaped lines either way, while the
+   composer-line pinning also consults the esc clauses against the raw
+   lines. This matters for a composer that collapses a long paste into a
+   "[Pasted Content N chars]" chip (codex): the message id is hidden
+   inside the chip, and the escaped composer line is the only thing left
+   that can verify the staging. agy's first
    paste after TUI start does not stage (manifest first_paste_caveat). A
    failed verification is an ambiguous post-paste outcome: it goes
    directly to attention_required and is never re-pasted.

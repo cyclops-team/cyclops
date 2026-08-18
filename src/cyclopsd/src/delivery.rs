@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use cyclops_manifest::Manifest;
+use cyclops_manifest::{strip_csi, Manifest};
 use cyclops_proto::{
     AgentState, Delivery, DeliveryReceipt, DeliveryState, Event, Kind, LedgerLine, MsgSendParams,
     MsgSendResult, NotifyLevel, QuiesceResult, VerifiedBy, WaitUntil, WireError,
@@ -2388,6 +2388,11 @@ pub(crate) trait Injector {
     async fn submit(&self, pane_id: &str, key: &str) -> Result<(), String>;
     /// Read back the visible grid (this backend's verification sensor).
     async fn capture(&self, pane_id: &str) -> Result<String, String>;
+    /// Read back the grid with SGR escapes (capture-pane -e). Verification
+    /// takes this flavor when the manifest's composer discriminators are
+    /// `line_regex_esc` clauses (codex.toml), which a plain capture can
+    /// never satisfy.
+    async fn capture_escaped(&self, pane_id: &str) -> Result<String, String>;
 }
 
 /// The tmux paste path: load-buffer through the adapter's private spool
@@ -2443,6 +2448,13 @@ impl Injector for TmuxInjector {
             .await
             .map_err(|e| e.to_string())
     }
+
+    async fn capture_escaped(&self, pane_id: &str) -> Result<String, String> {
+        self.client
+            .capture_pane_escaped(pane_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Paste the payload and verify the composer staged it. Returns the
@@ -2459,18 +2471,32 @@ async fn inject<I: Injector>(
 ) -> Result<(String, bool), String> {
     injector.paste(&handle.pane_id, &handle.payload).await?;
     let (id_patterns, other_patterns) = verify_patterns(manifest, &handle.msg_id);
+    // The capture flavor follows the manifest's composer discriminators:
+    // esc rules need the SGR-escaped grid or they fail closed, and a
+    // composer that collapses a long paste into a "[Pasted Content …]"
+    // chip leaves the escaped composer line as the ONLY thing that can
+    // verify the staging (the message id is hidden inside the chip).
+    let escaped = manifest.has_escaped_rules();
     let mut last_delay = 0;
     for delay in VERIFY_DELAYS_MS {
         if delay > last_delay {
             tokio::time::sleep(Duration::from_millis(delay - last_delay)).await;
         }
         last_delay = delay;
-        match injector.capture(&handle.pane_id).await {
+        let capture = if escaped {
+            injector.capture_escaped(&handle.pane_id).await
+        } else {
+            injector.capture(&handle.pane_id).await
+        };
+        match capture {
             Ok(screen) => {
                 if let Some(id_staged) =
                     staged_verified(manifest, &screen, &id_patterns, &other_patterns)
                 {
-                    return Ok((bottom_window(&screen, COMPOSER_WINDOW), id_staged));
+                    // The comparison window is de-escaped text either way,
+                    // so SGR churn (a blink, a focus change) can never fake
+                    // a "changed composer" for the ACK tier.
+                    return Ok((bottom_window(&strip_csi(&screen), COMPOSER_WINDOW), id_staged));
                 }
             }
             Err(e) => debug!(error = %e, "verify capture failed"),
@@ -2484,13 +2510,18 @@ async fn inject<I: Injector>(
 /// patterns ("Pasted text") count only on a manifest composer line, so
 /// residue from an EARLIER message in the transcript can never verify a
 /// paste that did not stage. Some(id_matched) when staged.
+///
+/// `screen` may be an SGR-escaped capture; pattern text is matched on the
+/// de-escaped lines (stripping is the identity on a plain capture), while
+/// the composer-line pinning also consults `line_regex_esc` clauses
+/// against the raw lines ([`marker_in_composer`]).
 fn staged_verified(
     manifest: &Manifest,
     screen: &str,
     id_patterns: &[String],
     other_patterns: &[String],
 ) -> Option<bool> {
-    let region = bottom_window(screen, VERIFY_REGION);
+    let region = bottom_window(&strip_csi(screen), VERIFY_REGION);
     if patterns_hit(&region, id_patterns) {
         return Some(true);
     }
@@ -2911,10 +2942,18 @@ async fn screen_evidence(
     let Some(watcher) = inner.watcher_of(handle.session_idx) else {
         return Evidence::Unobservable;
     };
-    let Ok(screen) = watcher.client().capture_pane(&handle.pane_id).await else {
+    // Same capture flavor the staging verify used, so the marker check can
+    // pin the composer line through esc-only discriminators and the window
+    // comparison is against like text (staged_window is de-escaped).
+    let capture = if manifest.has_escaped_rules() {
+        watcher.client().capture_pane_escaped(&handle.pane_id).await
+    } else {
+        watcher.client().capture_pane(&handle.pane_id).await
+    };
+    let Ok(screen) = capture else {
         return Evidence::Unobservable;
     };
-    let changed = bottom_window(&screen, COMPOSER_WINDOW) != staged_window;
+    let changed = bottom_window(&strip_csi(&screen), COMPOSER_WINDOW) != staged_window;
     if !marker_in_composer(manifest, &screen, patterns)
         && tier2_evidence(changed, id_staged, working_seen, output_seen)
     {
@@ -2933,15 +2972,28 @@ fn tier2_evidence(changed: bool, id_staged: bool, working_seen: bool, output_see
 /// True when a manifest idle_with_input rule matches a line in its own
 /// region that carries one of the substituted patterns: the staged text is
 /// still sitting in the composer, so the submit did not consume it.
+///
+/// `screen` may be an SGR-escaped capture. The pattern text and line
+/// emptiness are judged on de-escaped lines (identity for a plain
+/// capture); the composer pinning consults plain `line_regex` clauses
+/// against the de-escaped line AND `line_regex_esc` clauses against the
+/// raw one. Without the esc half, a manifest whose only composer
+/// discriminators are escaped (codex.toml, deliberately — a plain capture
+/// cannot tell its ghost text from typed text) could never pin a marker,
+/// so a long paste the composer collapsed into a "[Pasted Content …]"
+/// chip read as verify_failed and the submit key was withheld: the
+/// message sat staged in the recipient's composer, never delivered, while
+/// the receipt said only "outcome unknown".
 fn marker_in_composer(
     manifest: &cyclops_manifest::Manifest,
     screen: &str,
     patterns: &[String],
 ) -> bool {
-    let bottom_up: Vec<&str> = screen
+    let bottom_up: Vec<(&str, String)> = screen
         .lines()
         .rev()
-        .filter(|l| !l.trim().is_empty())
+        .map(|l| (l, strip_csi(l)))
+        .filter(|(_, plain)| !plain.trim().is_empty())
         .collect();
     for rule in manifest
         .rules
@@ -2951,16 +3003,13 @@ fn marker_in_composer(
         let cyclops_manifest::Region::BottomNonEmptyLines(n) = rule.region else {
             continue;
         };
-        for line in bottom_up.iter().take(n) {
-            if !patterns_hit(line, patterns) {
+        for (raw, plain) in bottom_up.iter().take(n) {
+            if !patterns_hit(plain, patterns) {
                 continue;
             }
-            let composer_line = rule
-                .matcher
-                .line_regex
-                .iter()
-                .chain(rule.any.iter().flat_map(|m| m.line_regex.iter()))
-                .any(|r| r.is_match(line));
+            let matchers = std::iter::once(&rule.matcher).chain(rule.any.iter());
+            let composer_line = matchers.clone().flat_map(|m| m.line_regex.iter()).any(|r| r.is_match(plain))
+                || matchers.flat_map(|m| m.line_regex_esc.iter()).any(|r| r.is_match(raw));
             if composer_line {
                 return true;
             }
@@ -3580,7 +3629,14 @@ verify_pattern = ["<message_id>", "Pasted text"]
         async fn submit(&self, _pane_id: &str, _key: &str) -> Result<(), String> {
             Ok(())
         }
+        // The canned screens are authored in whichever flavor the test's
+        // manifest asks for: the escaped read returns them raw, the plain
+        // read returns them de-escaped (identity for plain fixtures) —
+        // the same relationship the two tmux captures have.
         async fn capture(&self, _pane_id: &str) -> Result<String, String> {
+            self.capture_escaped(_pane_id).await.map(|s| strip_csi(&s))
+        }
+        async fn capture_escaped(&self, _pane_id: &str) -> Result<String, String> {
             let screens = self.screens.lock().unwrap();
             let i = self.cursor.fetch_add(1, Ordering::Relaxed);
             Ok(screens[i.min(screens.len() - 1)].clone())
@@ -3605,6 +3661,70 @@ verify_pattern = ["<message_id>", "Pasted text"]
         let (window, id_staged) = inject(&mock, &handle, &m).await.expect("staged verifies");
         assert!(!id_staged, "generic pattern staged it, not the id");
         assert!(window.contains("Pasted text #2"));
+    }
+
+    /// The shipped codex manifest, parsed as data for the two tests below:
+    /// its only composer discriminators are `line_regex_esc` clauses, on
+    /// purpose (a plain capture cannot tell its ghost text from typed
+    /// text).
+    fn codex_manifest() -> Manifest {
+        let m = Manifest::parse(
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../resources/manifests/codex.toml"
+            )),
+            std::path::Path::new("codex.toml"),
+        )
+        .expect("shipped codex manifest parses");
+        assert!(m.has_escaped_rules(), "codex discriminates by SGR");
+        m
+    }
+
+    /// The field failure this fixes, pinned on the shipped manifest:
+    /// before the escaped verify capture, the generic "Pasted" tier could
+    /// never fire for codex (its composer rule is esc-only and the verify
+    /// read was plain), so a long message the composer collapsed into a
+    /// "[Pasted Content N chars]" chip — hiding the message id — failed
+    /// every verify re-read. verify_before_submit then withheld Enter: the
+    /// payload sat staged in the recipient's composer, undelivered, behind
+    /// a receipt saying only "outcome unknown".
+    #[test]
+    fn codex_collapsed_paste_verifies_through_the_escaped_composer_line() {
+        let m = codex_manifest();
+        let (id, other) = verify_patterns(&m, "m-jean01");
+
+        // The collapsed chip on the composer line, in the manifest's own
+        // measured escape shape: the generic tier pins the staging.
+        let staged = "transcript above\n\u{1b}[1m›\u{1b}[0m [Pasted Content 1263 chars]\n\u{1b}[2m? for shortcuts\u{1b}[0m";
+        assert_eq!(staged_verified(&m, staged, &id, &other), Some(false));
+
+        // The same chip as transcript residue over a ghost-suggestion
+        // composer: nothing staged, and it must not verify.
+        let stale = "you: [Pasted Content 900 chars]\ndone\n\u{1b}[1m›\u{1b}[0m \u{1b}[2mFind and fix a bug in @filename\u{1b}[0m";
+        assert_eq!(staged_verified(&m, stale, &id, &other), None);
+
+        // A short message renders literally: the id proves it anywhere in
+        // the region, chip or no chip.
+        let literal = "transcript\n\u{1b}[1m›\u{1b}[0m [cyclops m-jean01] hello\n\u{1b}[2m? for shortcuts\u{1b}[0m";
+        assert_eq!(staged_verified(&m, literal, &id, &other), Some(true));
+    }
+
+    /// The whole inject() path against the codex manifest: the escaped
+    /// capture is the one that decides — its de-escaped sibling offers no
+    /// composer discriminator at all — and the delivery proceeds to submit
+    /// instead of erroring verify_failed.
+    #[tokio::test(start_paused = true)]
+    async fn inject_verifies_codex_collapse_via_the_escaped_capture() {
+        let m = codex_manifest();
+        let handle = DeliveryHandle::new("m-jean01", "codex", "%1", 0, "payload".into());
+        let staged = "transcript above\n\u{1b}[1m›\u{1b}[0m [Pasted Content 1263 chars]\n\u{1b}[2m? for shortcuts\u{1b}[0m";
+        let mock = MockInjector::new(vec![staged]);
+        let (window, id_staged) = inject(&mock, &handle, &m).await.expect("collapse stages");
+        assert!(!id_staged, "the chip hides the id; the composer line proved it");
+        assert!(window.contains("[Pasted Content 1263 chars]"), "{window}");
+        // The ACK comparison window is de-escaped, so later SGR churn
+        // cannot fake a changed composer.
+        assert!(!window.contains('\u{1b}'), "{window}");
     }
 
     // -----------------------------------------------------------------
