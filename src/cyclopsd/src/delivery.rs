@@ -838,9 +838,7 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
         dangling.sort_by(|a, b| a.0.cmp(&b.0));
         for ((id, to), (state, attempts)) in dangling {
             if receipt_is_queued(state) {
-                let target = envelopes
-                    .get(&id)
-                    .zip(requeue_target(inner, &to, *idx));
+                let target = envelopes.get(&id).zip(requeue_target(inner, &to, *idx));
                 if let Some((env, (sess_idx, pane_id))) = target {
                     let payload = render_payload(&id, &env.from, &env.subject, &env.body, env.fyi);
                     // Gating cannot survive the run that was doing the
@@ -1019,7 +1017,19 @@ pub(crate) fn render_payload(
     if !fyi && from != cyclops_proto::label::ADMIN {
         lines.push(format!("Reply: cyclops send {from} --subject \"...\""));
     }
+    lines.push(sentinel_for(msg_id));
     lines.join("\n")
+}
+
+/// The terminal sentinel: the last line of every payload.
+///
+/// Verification used to hunt only the leading id, which is the one token a
+/// wrapped payload provably scrolls out of the bottom capture region while
+/// the tail stays on screen. This token sits where the capture can always
+/// see it. It is deliberately not the reply hint: transport evidence must
+/// not depend on human-facing copy that changes.
+pub(crate) fn sentinel_for(msg_id: &str) -> String {
+    format!("[cyclops:end {msg_id}]")
 }
 
 /// The msg.send entry: ledger the message, fan deliveries out to per-pane
@@ -2107,11 +2117,31 @@ async fn gate(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> GateOutcome {
                     };
                     match det.state {
                         AgentState::Idle => {
-                            gate_line(inner, handle, "proceed", Some(&det.decided_by), None);
-                            return GateOutcome::Proceed {
-                                manifest_id,
-                                pane_pid: row.pane_pid,
-                            };
+                            // Runtime idle is not permission to write
+                            // (INVARIANTS rule 12). A turn-end hook can put
+                            // the pane in idle while the composer holds a
+                            // staged payload the screen sensor could not
+                            // read; proceeding there pastes over it.
+                            match det.write_ready() {
+                                Ok(()) => {
+                                    gate_line(
+                                        inner,
+                                        handle,
+                                        "proceed",
+                                        Some(&det.decided_by),
+                                        None,
+                                    );
+                                    return GateOutcome::Proceed {
+                                        manifest_id,
+                                        pane_pid: row.pane_pid,
+                                    };
+                                }
+                                // Hold on an event, never a clock: the next
+                                // pane change re-evaluates, and a screen
+                                // sensor that can see the composer resolves
+                                // it without anyone pasting blind.
+                                Err(reason) => Some(format!("not_write_ready:{reason}")),
+                            }
                         }
                         AgentState::Dead => {
                             return GateOutcome::Attention {
@@ -2251,6 +2281,10 @@ fn normalize_hold_cause(cause: &str) -> &'static str {
         "idle_with_input" => "idle_with_input",
         "unknown" => "unknown",
         c if c.split(':').next() == Some("blocked") => "blocked",
+        // Rule 12: idle by runtime state, but nothing proved the composer
+        // was clean. Receipts say so plainly; the exact reason stays on
+        // the gate ledger line.
+        c if c.split(':').next() == Some("not_write_ready") => "not_write_ready",
         _ => "unknown",
     }
 }
@@ -2490,13 +2524,20 @@ async fn inject<I: Injector>(
         };
         match capture {
             Ok(screen) => {
-                if let Some(id_staged) =
-                    staged_verified(manifest, &screen, &id_patterns, &other_patterns)
-                {
+                if let Some(id_staged) = staged_verified(
+                    manifest,
+                    &screen,
+                    &id_patterns,
+                    &other_patterns,
+                    &handle.msg_id,
+                ) {
                     // The comparison window is de-escaped text either way,
                     // so SGR churn (a blink, a focus change) can never fake
                     // a "changed composer" for the ACK tier.
-                    return Ok((bottom_window(&strip_csi(&screen), COMPOSER_WINDOW), id_staged));
+                    return Ok((
+                        bottom_window(&strip_csi(&screen), COMPOSER_WINDOW),
+                        id_staged,
+                    ));
                 }
             }
             Err(e) => debug!(error = %e, "verify capture failed"),
@@ -2520,15 +2561,51 @@ fn staged_verified(
     screen: &str,
     id_patterns: &[String],
     other_patterns: &[String],
+    msg_id: &str,
 ) -> Option<bool> {
     let region = bottom_window(&strip_csi(screen), VERIFY_REGION);
     if patterns_hit(&region, id_patterns) {
+        return Some(true);
+    }
+    // The leading id can be off-screen while the payload is intact; the
+    // sentinel is the token that survives wrapping.
+    if sentinel_verified(manifest, screen, msg_id) {
         return Some(true);
     }
     if marker_in_composer(manifest, screen, other_patterns) {
         return Some(false);
     }
     None
+}
+
+/// Is this delivery's sentinel the final payload token on screen?
+///
+/// Proves, in order: the exact sentinel for THIS message is present as a
+/// whole line; nothing but declared vendor chrome follows it. A truncated
+/// or wrapped sentinel matches no line and fails closed, which is the
+/// intended answer: a split token proves nothing about what else the
+/// capture lost. Chrome vocabulary is manifest data
+/// (`injection.composer_trailer_regex`); the terminality rule here is
+/// generic and carries no vendor branches.
+fn sentinel_verified(manifest: &Manifest, screen: &str, msg_id: &str) -> bool {
+    let want = sentinel_for(msg_id);
+    let plain = strip_csi(screen);
+    let lines: Vec<&str> = plain
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    let Some(at) = lines.iter().rposition(|l| l.trim() == want) else {
+        return false;
+    };
+    // Everything below the sentinel must be chrome the vendor declared.
+    // An empty trailer list means the sentinel must simply be last.
+    lines[at + 1..].iter().all(|l| {
+        manifest
+            .composer_trailers
+            .iter()
+            .any(|re| re.is_match(l.trim()))
+    })
 }
 
 /// Substituted staging patterns, split into id-carrying (contain the
@@ -3008,8 +3085,13 @@ fn marker_in_composer(
                 continue;
             }
             let matchers = std::iter::once(&rule.matcher).chain(rule.any.iter());
-            let composer_line = matchers.clone().flat_map(|m| m.line_regex.iter()).any(|r| r.is_match(plain))
-                || matchers.flat_map(|m| m.line_regex_esc.iter()).any(|r| r.is_match(raw));
+            let composer_line = matchers
+                .clone()
+                .flat_map(|m| m.line_regex.iter())
+                .any(|r| r.is_match(plain))
+                || matchers
+                    .flat_map(|m| m.line_regex_esc.iter())
+                    .any(|r| r.is_match(raw));
             if composer_line {
                 return true;
             }
@@ -3445,6 +3527,32 @@ mod tests {
         assert!(!p.contains("Reply:"));
     }
 
+    /// Every payload ends with the terminal sentinel, whatever else the
+    /// envelope carries. The measured failure is that a long payload wraps
+    /// and pushes the leading id out of the verify region while the tail
+    /// stays visible, so verification needs a token at the end.
+    #[test]
+    fn payload_ends_with_the_terminal_sentinel() {
+        for (fyi, from) in [(false, "codex"), (true, "codex"), (false, "admin")] {
+            let p = render_payload("m-3f9c2a", from, "subject", "body", fyi);
+            assert_eq!(
+                p.lines().next_back(),
+                Some("[cyclops:end m-3f9c2a]"),
+                "fyi={fyi} from={from}"
+            );
+        }
+    }
+
+    /// The sentinel is deliberately not the reply hint: transport
+    /// verification must not depend on human-facing CLI copy.
+    #[test]
+    fn sentinel_is_independent_of_the_reply_hint() {
+        let with_hint = render_payload("m-a", "codex", "s", "b", false);
+        let without_hint = render_payload("m-a", "codex", "s", "b", true);
+        assert!(with_hint.ends_with("[cyclops:end m-a]"));
+        assert!(without_hint.ends_with("[cyclops:end m-a]"));
+    }
+
     /// A message from the operator carries no reply line.
     ///
     /// `admin` is reserved (`cyclops_proto::label`), so no pane can hold
@@ -3457,8 +3565,8 @@ mod tests {
         let p = render_payload("m-1", cyclops_proto::label::ADMIN, "ship it", "now", false);
         assert!(!p.contains("Reply:"), "{p}");
         assert_eq!(
-            p, "[cyclops m-1] FROM: admin  SUBJECT: ship it\nnow",
-            "the header and the body, and nothing else"
+            p, "[cyclops m-1] FROM: admin  SUBJECT: ship it\nnow\n[cyclops:end m-1]",
+            "the header, the body, and the sentinel: no reply hint"
         );
         // An agent-to-agent message still gets one: those targets exist.
         let p = render_payload("m-2", "reviewer", "ship it", "now", false);
@@ -3468,7 +3576,10 @@ mod tests {
     #[test]
     fn empty_body_payload_is_header_plus_hint() {
         let p = render_payload("m-1", "codex", "s", "", false);
-        assert_eq!(p.lines().count(), 2);
+        let lines: Vec<&str> = p.lines().collect();
+        assert_eq!(lines.len(), 3, "header, hint, sentinel: no empty body line");
+        assert_eq!(lines[0], "[cyclops m-1] FROM: codex  SUBJECT: s");
+        assert_eq!(lines[2], "[cyclops:end m-1]");
     }
 
     #[test]
@@ -3496,6 +3607,117 @@ verify_pattern = ["<message_id>", "Pasted text"]
         let (id, other) = verify_patterns(&empty, "m-1");
         assert_eq!(id, vec!["m-1".to_string()]);
         assert!(other.is_empty());
+    }
+
+    /// Manifest with a composer prompt rule and the trailing chrome the
+    /// vendor renders below it. Chrome is what makes terminality decidable.
+    fn sentinel_manifest() -> cyclops_manifest::Manifest {
+        cyclops_manifest::Manifest::parse(
+            r#"
+[agent]
+id = "s"
+display_name = "s"
+
+[[rule]]
+id = "composer_has_staged_input"
+state = "idle_with_input"
+priority = 950
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^\s*❯\s+\S']
+
+[injection]
+composer_trailer_regex = ['^\?\s+for shortcuts', '^\s*\d+%\s+context left']
+"#,
+            std::path::Path::new("s.toml"),
+        )
+        .unwrap()
+    }
+
+    /// The failure this whole unit exists for: a long payload wraps, the
+    /// leading id scrolls out of the verify region, and only the tail is
+    /// visible. The sentinel is in that tail.
+    #[test]
+    fn sentinel_verifies_a_wrapped_payload_whose_id_left_the_region() {
+        let m = sentinel_manifest();
+        let screen = "❯ [cyclops m-3f9c2a] FROM: codex  SUBJECT: long\n\
+             wrapped continuation line one\n\
+             wrapped continuation line two\n\
+             Reply: cyclops send codex --subject \"...\"\n\
+             [cyclops:end m-3f9c2a]\n\
+             ? for shortcuts";
+        assert!(sentinel_verified(&m, screen, "m-3f9c2a"));
+    }
+
+    /// Requirement 2: completeness. A sentinel split by the terminal edge
+    /// proves nothing about what else is missing, so it fails closed.
+    #[test]
+    fn truncated_or_wrapped_sentinel_fails_closed() {
+        let m = sentinel_manifest();
+        for tail in [
+            "[cyclops:end m-3f9c",
+            "[cyclops:end\nm-3f9c2a]",
+            "cyclops:end m-3f9c2a]",
+        ] {
+            let screen = format!("❯ [cyclops m-3f9c2a] body\n{tail}\n? for shortcuts");
+            assert!(
+                !sentinel_verified(&m, &screen, "m-3f9c2a"),
+                "must fail closed on {tail:?}"
+            );
+        }
+    }
+
+    /// Requirements 3 and 4: terminal in NORMALIZED composer content.
+    /// Payload after the sentinel means the capture is not the whole
+    /// story, so it cannot be treated as staged.
+    #[test]
+    fn payload_after_the_sentinel_fails_closed() {
+        let m = sentinel_manifest();
+        let screen = "❯ [cyclops m-3f9c2a] body\n\
+             [cyclops:end m-3f9c2a]\n\
+             stray text nobody expected\n\
+             ? for shortcuts";
+        assert!(!sentinel_verified(&m, screen, "m-3f9c2a"));
+    }
+
+    /// Chrome below the composer is not payload; it may follow.
+    #[test]
+    fn known_trailing_chrome_does_not_break_terminality() {
+        let m = sentinel_manifest();
+        let screen = "❯ [cyclops m-1] body\n\
+             [cyclops:end m-1]\n\
+             ? for shortcuts\n\
+             42% context left";
+        assert!(sentinel_verified(&m, screen, "m-1"));
+    }
+
+    /// A sentinel from an earlier delivery never verifies this one.
+    #[test]
+    fn foreign_sentinel_never_verifies() {
+        let m = sentinel_manifest();
+        let screen = "❯ [cyclops m-old] body\n[cyclops:end m-old]\n? for shortcuts";
+        assert!(!sentinel_verified(&m, screen, "m-new"));
+        assert!(!sentinel_verified(
+            &m,
+            "❯ nothing here\n? for shortcuts",
+            "m-new"
+        ));
+    }
+
+    /// A manifest that declares no trailer chrome still works: the
+    /// sentinel must then be the final non-empty line.
+    #[test]
+    fn without_declared_chrome_the_sentinel_must_be_last() {
+        let bare = cyclops_manifest::Manifest::parse(
+            "[agent]\nid = \"x\"\ndisplay_name = \"x\"\n",
+            std::path::Path::new("x.toml"),
+        )
+        .unwrap();
+        assert!(sentinel_verified(&bare, "❯ body\n[cyclops:end m-1]", "m-1"));
+        assert!(!sentinel_verified(
+            &bare,
+            "❯ body\n[cyclops:end m-1]\n? for shortcuts",
+            "m-1"
+        ));
     }
 
     #[test]
@@ -3592,14 +3814,20 @@ verify_pattern = ["<message_id>", "Pasted text"]
         // "Pasted text" from a PREVIOUS message sits in the transcript;
         // the composer is empty. Nothing staged.
         let screen = "you: [Pasted text #1 +9 lines]\nassistant: done\n❯ \n? for shortcuts";
-        assert_eq!(staged_verified(&m, screen, &id, &other), None);
+        assert_eq!(staged_verified(&m, screen, &id, &other, "m-new01"), None);
         // The same chip ON the composer line is a real staging.
         let staged = "transcript\n❯ [Pasted text #2 +9 lines]\n? for shortcuts";
-        assert_eq!(staged_verified(&m, staged, &id, &other), Some(false));
+        assert_eq!(
+            staged_verified(&m, staged, &id, &other, "m-new01"),
+            Some(false)
+        );
         // The substituted id counts anywhere in the region: it is unique
         // to this delivery.
         let id_anywhere = "transcript\n❯ [cyclops m-new01] hello\n? for shortcuts";
-        assert_eq!(staged_verified(&m, id_anywhere, &id, &other), Some(true));
+        assert_eq!(
+            staged_verified(&m, id_anywhere, &id, &other, "m-new01"),
+            Some(true)
+        );
     }
 
     /// The whole inject() path with a mock backend: the stale screen fails
@@ -3707,22 +3935,29 @@ verify_pattern = ["<message_id>", "Pasted text"]
         let m = codex_manifest();
         let (id, other) = verify_patterns(&m, "m-jean01");
 
-        let staged = format!("transcript above\n{CODEX_COMPOSER_CHIP}\n  gpt-5.6-sol high · ~/proj");
-        assert_eq!(staged_verified(&m, &staged, &id, &other), Some(false));
+        let staged =
+            format!("transcript above\n{CODEX_COMPOSER_CHIP}\n  gpt-5.6-sol high · ~/proj");
+        assert_eq!(
+            staged_verified(&m, &staged, &id, &other, "m-x"),
+            Some(false)
+        );
 
         // A chip in the TRANSCRIPT (bold-dim glyph) over an empty
         // composer: an earlier message, already submitted. Nothing staged.
         let stale = format!(
             "\u{1b}[1;2m›  \u{1b}[0m[Pasted Content 900 chars]\n{CODEX_COMPOSER_GHOST}\n  gpt-5.6-sol high · ~/proj"
         );
-        assert_eq!(staged_verified(&m, &stale, &id, &other), None);
+        assert_eq!(staged_verified(&m, &stale, &id, &other, "m-x"), None);
 
         // A short message renders literally: the id proves it anywhere in
         // the region, chip or no chip.
         let literal = format!(
             "{CODEX_TRANSCRIPT_LINE}\n\u{1b}[1m›\u{1b}[0m [cyclops m-jean01] hello\n  gpt-5.6-sol high"
         );
-        assert_eq!(staged_verified(&m, &literal, &id, &other), Some(true));
+        assert_eq!(
+            staged_verified(&m, &literal, &id, &other, "m-x"),
+            Some(true)
+        );
     }
 
     /// The whole inject() path against the codex manifest: the escaped
@@ -3733,10 +3968,14 @@ verify_pattern = ["<message_id>", "Pasted text"]
     async fn inject_verifies_codex_collapse_via_the_escaped_capture() {
         let m = codex_manifest();
         let handle = DeliveryHandle::new("m-jean01", "codex", "%1", 0, "payload".into());
-        let staged = format!("transcript above\n{CODEX_COMPOSER_CHIP}\n  gpt-5.6-sol high · ~/proj");
+        let staged =
+            format!("transcript above\n{CODEX_COMPOSER_CHIP}\n  gpt-5.6-sol high · ~/proj");
         let mock = MockInjector::new(vec![staged.as_str()]);
         let (window, id_staged) = inject(&mock, &handle, &m).await.expect("collapse stages");
-        assert!(!id_staged, "the chip hides the id; the composer line proved it");
+        assert!(
+            !id_staged,
+            "the chip hides the id; the composer line proved it"
+        );
         assert!(window.contains("[Pasted Content 2828 chars]"), "{window}");
         // The ACK comparison window is de-escaped, so later SGR churn
         // cannot fake a changed composer.

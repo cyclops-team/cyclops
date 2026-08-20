@@ -39,7 +39,7 @@ pub fn skill_path(agent_dir: &Path) -> PathBuf {
 /// replace it; any other content is the operator's and is never touched.
 /// The test below fails until the current body is listed, and prints the
 /// hash to append.
-const EVER_SHIPPED_FNV64: &[&str] = &["7ebc1453af11b931"];
+const EVER_SHIPPED_FNV64: &[&str] = &["7ebc1453af11b931", "c626205b3d1fa685"];
 
 /// FNV-1a 64, hex. Same non-cryptographic question as the manifest seed:
 /// "did the operator edit this file", not "is this an attack".

@@ -1,6 +1,6 @@
 # Rules this system must never break
 
-Eleven of them. They are not style preferences: each one is here because
+Twelve of them. They are not style preferences: each one is here because
 breaking it does something specific and bad to a person using Cyclops, and
 most of them are here because something already went wrong once.
 
@@ -23,6 +23,7 @@ second place, that is the bug: this page is where they live.
 | [9](#9-zero-polling) | Zero polling | Idle battery burn, and a broken event path that looks fine |
 | [10](#10-vendor-quirks-are-data-not-code) | Vendor quirks are data, not code | A vendor ships a new dialog and you ship a release |
 | [11](#11-color-is-redundant-and-never-the-only-encoding) | Color is redundant and never the only encoding | The state is invisible under `NO_COLOR`, `--plain`, or a screen reader |
+| [12](#12-runtime-idleness-never-implies-terminal-write-readiness) | Runtime idleness never implies terminal write-readiness | A hook edge authorizes a paste over the human's staged text |
 
 ## 1. A payload never reaches a pane the gate did not admit
 
@@ -383,6 +384,44 @@ glyph, the glyph or the word is doing too little.
   `inactive_pane_border_glyph_is_stable_across_theme_and_no_color`, which
   feed the same state through two unrelated themes and `NO_COLOR` and
   assert the glyph never moves while its `Style` does.
+
+## 12. Runtime idleness never implies terminal write-readiness
+
+**A composer write requires current positive clean-input evidence from the
+admitted pane, and no conflicting working, blocked, modal, pane-mode,
+unknown, or input-present evidence. Hook-derived idle alone never
+authorizes a write.**
+
+What breaks: the same damage as rule 3, reached from the opposite
+direction. Rule 3 holds when the screen sensor SEES staged text. This rule
+covers the case where it sees nothing usable and something else says idle
+anyway. A turn-end hook (`Stop` on agy, and its siblings elsewhere) maps to
+`Idle`; fusion adopts a live hook reading when the screen rules resolve to
+`unknown`; and `unknown` is exactly what a long staged payload produces
+when its head scrolls past the fixed bottom region the rules read. So a
+pane holding an intact, unsubmitted payload can read `idle`, and a gate
+that trusts the fused verdict alone will paste a second message on top of
+the first and press Enter.
+
+That path was closed before it could ship: repairing hook identity is what
+would have made those hook edges arrive in the first place, so the identity
+fix and this rule belong to the same shipping unit. Ship one without the
+other and the fleet gains a new way to overwrite a person's draft.
+
+The distinction the rule forces is between two different questions. "Is a
+turn running?" is answered by any sensor. "May I write into the composer?"
+is answered only by the sensor that can see the composer, saying it is
+empty, right now, with nothing live contradicting it. Absence of evidence
+is not clean evidence; a contested verdict is not clean evidence.
+
+- Enforced at: `cyclops_proto::Detection::write_ready` (the rule, one
+  owner); `src/cyclopsd/src/delivery.rs`, the `AgentState::Idle` arm of
+  `gate`, which holds on `not_write_ready:<reason>` instead of proceeding.
+- Proven by: `src/cyclops-proto/src/state.rs`,
+  `hook_idle_over_unknown_screen_is_not_write_ready`,
+  `hook_idle_alone_is_not_write_ready`, and
+  `disagreement_is_never_write_ready`.
+
 
 ## Where these came from
 

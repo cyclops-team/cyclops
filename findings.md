@@ -1263,3 +1263,37 @@ Fix shape: `PaneRuntime` clamps every path that sizes the engine
 manages the nested tmux itself: the pane is an opaque terminal on
 purpose, and the daemon already reads it as `? unknown` (ssh matches no
 manifest).
+
+## F-P0-1: `bare_tty_seeds_the_shipped_themes_and_manifests` fails on `dfe963a`
+
+Measured 2026-08-20 on macOS 15.5, while implementing the P0 sentinel.
+The test spawns `cyclops` on a PTY and waits 10s for the tty branch to
+seed `themes/` and `manifests/`; the themes directory stays empty and
+the assertion prints `the dir holds []`.
+
+Probe: `cargo test -p cyclops --test bare_cyclops` fails on the P0
+branch, then `git stash push -u` back to clean `dfe963a` and the same
+command fails identically (25s both times, reproducible, not a load
+flake). So it predates the P0 work and is not caused by the terminal
+sentinel, the manifest `composer_trailer_regex` key, or the
+write-readiness rule.
+
+Not fixed here: it is outside the P0-A scope in ADMIN-DIRECTIVE-P0.md
+and fixing an unrelated seeding path inside the atomic safety unit
+would widen the blast radius of a gated change. Filed so the next
+person does not re-diagnose it, and so the P0 gate is read as "green
+except one pre-existing failure", not "green".
+
+## F-P0-2: local rustfmt 1.9.0 disagrees with the tree on three untouched files
+
+Measured 2026-08-20. `cargo fmt --all` on `dfe963a` rewrites
+`src/cyclops/src/daemon.rs:255`, `src/cyclopsd/src/server.rs:318`, and
+`src/cyclopsd/tests/m1_fixes.rs:243` — all pre-existing code, none of it
+touched by P0. The tree is formatted by whatever rustfmt CI runs, so the
+local toolchain is the newer one.
+
+Handled by reverting those three files, so the P0 diff stays scoped to
+the change. Everything P0 wrote is clean under both readings.
+If CI ever fails formatting on this branch, this is why: pin the
+toolchain rather than reformatting unrelated files inside a gated
+safety change.

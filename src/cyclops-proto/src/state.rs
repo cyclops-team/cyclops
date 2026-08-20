@@ -138,6 +138,53 @@ pub struct Detection {
     pub decided_by: String,
 }
 
+impl Detection {
+    /// May a payload be written into this pane's composer right now?
+    ///
+    /// Runtime idleness and terminal write-readiness are different
+    /// questions (INVARIANTS rule 12). A turn-end hook proves generation
+    /// stopped; it cannot prove the composer is empty, and a pane whose
+    /// screen rules read `unknown` while a hook says `idle` is exactly the
+    /// shape of a long staged payload waiting to be pasted over.
+    ///
+    /// A write therefore needs positive, current, clean-composer evidence
+    /// from the sensor that can actually see the composer, and no live
+    /// reading that contradicts it. `Err` carries the reason for the gate
+    /// ledger line.
+    pub fn write_ready(&self) -> Result<(), &'static str> {
+        if self.state != AgentState::Idle {
+            return Err("not_idle");
+        }
+        if self.disagreement {
+            return Err("sensor_disagreement");
+        }
+        // Only the screen sensor reads the composer; a hook or title edge
+        // says nothing about what is staged in it.
+        let clean = self
+            .readings
+            .iter()
+            .any(|r| r.sensor == Sensor::Screen && r.state == AgentState::Idle);
+        if !clean {
+            return Err("no_clean_composer_evidence");
+        }
+        let conflict = self.readings.iter().any(|r| {
+            matches!(
+                r.state,
+                AgentState::Working
+                    | AgentState::IdleWithInput
+                    | AgentState::BlockedModal
+                    | AgentState::BlockedPermission
+                    | AgentState::BlockedQuota
+                    | AgentState::Unknown
+            )
+        });
+        if conflict {
+            return Err("conflicting_evidence");
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +215,101 @@ mod tests {
             assert!(!s.safe_to_inject(), "{s} must not be injectable");
         }
         assert!(AgentState::Idle.safe_to_inject());
+    }
+}
+
+#[cfg(test)]
+mod write_ready_tests {
+    use super::*;
+
+    fn reading(sensor: Sensor, state: AgentState) -> SensorReading {
+        SensorReading {
+            sensor,
+            state,
+            rule: "r".into(),
+            ts: 0,
+        }
+    }
+
+    fn det(state: AgentState, readings: Vec<SensorReading>, disagreement: bool) -> Detection {
+        Detection {
+            state,
+            readings,
+            disagreement,
+            decided_by: "d".into(),
+        }
+    }
+
+    /// The case that made this rule necessary: a turn-end hook maps to
+    /// idle, fusion adopts it because the screen rules read unknown, and
+    /// the composer is actually holding a long staged payload. Before rule
+    /// 12 the gate proceeded here and pasted over it.
+    #[test]
+    fn hook_idle_over_unknown_screen_is_not_write_ready() {
+        let d = det(
+            AgentState::Idle,
+            vec![
+                reading(Sensor::Hook, AgentState::Idle),
+                reading(Sensor::Screen, AgentState::Unknown),
+            ],
+            false,
+        );
+        // The screen looked and could not tell: that is an absence of
+        // clean evidence, which is the precise reason, not a conflict.
+        assert_eq!(d.write_ready(), Err("no_clean_composer_evidence"));
+    }
+
+    /// A hook edge with no screen reading at all cannot authorize a write:
+    /// nothing looked at the composer.
+    #[test]
+    fn hook_idle_alone_is_not_write_ready() {
+        let d = det(
+            AgentState::Idle,
+            vec![reading(Sensor::Hook, AgentState::Idle)],
+            false,
+        );
+        assert_eq!(d.write_ready(), Err("no_clean_composer_evidence"));
+    }
+
+    /// The reverse race: screen rules say idle while a live hook says
+    /// working. Fusion records disagreement and keeps the rule verdict;
+    /// a write must not ride on a contested verdict.
+    #[test]
+    fn disagreement_is_never_write_ready() {
+        let d = det(
+            AgentState::Idle,
+            vec![
+                reading(Sensor::Screen, AgentState::Idle),
+                reading(Sensor::Hook, AgentState::Working),
+            ],
+            true,
+        );
+        assert_eq!(d.write_ready(), Err("sensor_disagreement"));
+    }
+
+    /// Staged input is the whole point of the rule.
+    #[test]
+    fn staged_input_is_never_write_ready() {
+        let d = det(
+            AgentState::IdleWithInput,
+            vec![reading(Sensor::Screen, AgentState::IdleWithInput)],
+            false,
+        );
+        assert_eq!(d.write_ready(), Err("not_idle"));
+    }
+
+    /// The one shape that admits a write: the sensor that sees the
+    /// composer says it is empty, and nothing live contradicts it.
+    #[test]
+    fn positive_clean_screen_evidence_is_write_ready() {
+        let d = det(
+            AgentState::Idle,
+            vec![
+                reading(Sensor::Screen, AgentState::Idle),
+                reading(Sensor::Hook, AgentState::Idle),
+            ],
+            false,
+        );
+        assert_eq!(d.write_ready(), Ok(()));
     }
 }

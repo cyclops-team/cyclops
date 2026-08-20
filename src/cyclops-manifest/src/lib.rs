@@ -75,6 +75,10 @@ pub struct Manifest {
     pub hooks: Hooks,
     pub rules: Vec<CompiledRule>,
     pub injection: Injection,
+    /// Compiled `injection.composer_trailer_regex`, validated at parse time
+    /// like rule patterns so a bad regex is a load error, not a surprise
+    /// during a delivery.
+    pub composer_trailers: Vec<regex::Regex>,
     /// Source path, for reload and error messages.
     pub path: PathBuf,
 }
@@ -296,6 +300,12 @@ pub struct Injection {
     /// (measured on Claude). Absent means unestablished: gate on idle.
     #[serde(default)]
     pub busy_behavior: Option<String>,
+    /// Lines the vendor may render BELOW the composer, which are never
+    /// payload: shortcut hints, context meters, status rows. Used only to
+    /// decide terminal-sentinel position; anything after the sentinel that
+    /// matches none of these fails verification closed.
+    #[serde(default)]
+    pub composer_trailer_regex: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -423,11 +433,26 @@ impl Manifest {
         }
         // Highest priority first; evaluation takes the first match.
         rules.sort_by_key(|r| std::cmp::Reverse(r.priority));
+        let composer_trailers = raw
+            .injection
+            .composer_trailer_regex
+            .iter()
+            .map(|p| {
+                let translated = p.replace("\\x{", "\\u{");
+                regex::Regex::new(&translated).map_err(|e| ManifestError::BadRegex {
+                    id: raw.agent.id.clone(),
+                    rule: "injection.composer_trailer_regex".into(),
+                    pattern: p.clone(),
+                    source: e,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Manifest {
             agent: raw.agent,
             hooks: raw.hooks,
             rules,
             injection: raw.injection,
+            composer_trailers,
             path: path.into(),
         })
     }

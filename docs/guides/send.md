@@ -16,10 +16,16 @@ The recipient's model reads:
 ```
 [cyclops m-3f9c2a] FROM: admin  SUBJECT: Review the rate limiter
 gateway.rs:120
+[cyclops:end m-3f9c2a]
 ```
 
-A message from another agent carries one more line, `Reply: cyclops send
-<name> --subject "..."`. One from `admin` does not. `admin` is the
+The final `[cyclops:end <id>]` line is transport machinery: Cyclops
+proves a paste staged by finding that token, because a long message
+wraps and carries the opening id out of the region the daemon captures.
+Recipients ignore it.
+
+A message from another agent carries one more line above it, `Reply:
+cyclops send <name> --subject "..."`. One from `admin` does not. `admin` is the
 operator, the name is reserved so no pane can hold it, and `cyclops send
 admin` answers `no_such_target`: an agent that obeyed the hint would file
 a failed delivery and raise attention for it.

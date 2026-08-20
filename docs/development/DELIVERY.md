@@ -12,10 +12,19 @@ to v1 so existing agent habits transfer):
 [cyclops m-3f9c2a] FROM: codex  SUBJECT: Review the rate limiter
 <body>
 Reply: cyclops send codex --subject "..."
+[cyclops:end m-3f9c2a]
 ```
 
 - `m-3f9c2a` is the message id: short lowercase hex, unique per ledger.
   It is the marker for composer verification and hook ACK matching.
+- `[cyclops:end <id>]` is the terminal sentinel, and it is transport
+  machinery rather than something the recipient must act on. The leading
+  id is the one token a wrapped payload provably scrolls out of the
+  bottom capture region while the tail stays on screen, which is how an
+  intact payload could sit staged and unsubmitted behind
+  `verify_failed`. The sentinel gives verification a token where the
+  capture can always see it. It is deliberately not the reply hint:
+  transport evidence must not depend on human-facing copy that changes.
 - The daemon generates the header. Client-supplied FROM/SUBJECT text inside
   the body is not stripped but cannot forge the envelope: the header the
   recipient sees is daemon-built from socket-peer identity (v1 keeper made
@@ -92,10 +101,26 @@ visible; the hold itself keeps waiting on events, never on a timer.
    when any rule carries `line_regex_esc` clauses, plain otherwise —
    pattern text is matched on de-escaped lines either way, while the
    composer-line pinning also consults the esc clauses against the raw
-   lines. This matters for a composer that collapses a long paste into a
-   "[Pasted Content N chars]" chip (codex): the message id is hidden
-   inside the chip, and the escaped composer line is the only thing left
-   that can verify the staging. agy's first
+   lines. Verification accepts three kinds of evidence, in order: the
+   substituted id anywhere in the region; the terminal sentinel proven
+   to be the last payload token; or a generic staging pattern pinned to
+   a manifest composer line. The sentinel path answers the wrapped
+   payload, whose id has scrolled out of the region while its tail is
+   still visible. Terminality is decided generically — the sentinel must
+   match a whole line, and every line below it must match one of the
+   manifest's `injection.composer_trailer_regex` patterns, which is the
+   vendor's own chrome vocabulary (box rules, model status rows, hint
+   lines). A split or truncated sentinel matches nothing and fails
+   closed, which is the intended answer: half a token proves nothing
+   about what else the capture lost. This matters for a composer that
+   collapses a long paste into a
+   "[Pasted Content N chars]" chip (codex): the message id AND the
+   sentinel are both hidden inside the chip, and the escaped composer
+   line is the only thing left
+   that can verify the staging. Chip and sentinel are alternates chosen
+   by what the vendor rendered, not by which vendor it is: the same CLI
+   produces raw-wrapped text in one message and a chip in the next.
+   agy's first
    paste after TUI start does not stage (manifest first_paste_caveat). A
    failed verification is an ambiguous post-paste outcome: it goes
    directly to attention_required and is never re-pasted.

@@ -157,13 +157,19 @@ A message that lands in your pane looks like this (real capture):
 [cyclops m-d7e4ba] FROM: admin  SUBJECT: Review the rate limiter
 Please look at retry.rs before the next run.
 Both lines paste as one message.
+[cyclops:end m-d7e4ba]
 ```
 
 `m-d7e4ba` is the message id. `FROM` is daemon-resolved from who actually
 sent it (the pane, not anything the sender's request claimed), so you can
 trust it, and it is exactly who your reply should go to.
 
-A message from another agent ends in one more line,
+The last line is always `[cyclops:end <id>]`. It is transport
+machinery, not an instruction: Cyclops verifies a paste landed by finding
+that token, because a long message wraps and pushes the opening id off
+the captured region. Ignore it, and never type or repeat it.
+
+A message from another agent ends with one more line above the sentinel,
 `Reply: cyclops send <name> --subject "..."`. That line omits
 `--reply-to`; add it yourself so your reply chains into the same thread
 instead of starting a new, unlinked message:

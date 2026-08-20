@@ -222,9 +222,14 @@ there is no hook edge, so timing evidence is screen evidence.
 
 ### Know which invariants not to break
 
-[INVARIANTS.md](INVARIANTS.md). Eleven rules, each with the real-world
+[INVARIANTS.md](INVARIANTS.md). Twelve rules, each with the real-world
 damage and the line of code that stops it. If you are touching delivery,
-read rules 1 to 5 before you write anything.
+read rules 1 to 5 before you write anything, and rule 12 before you touch
+anything that decides a pane is ready to be written into.
+
+Work in flight against the messaging plan is scoped in
+[P0-TASK.md](P0-TASK.md), which freezes the authorization, the base
+commit, and the stop conditions.
 
 ## Decisions, and what was rejected
 

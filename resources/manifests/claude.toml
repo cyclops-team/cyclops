@@ -216,3 +216,14 @@ busy_note = """MEASURED: text pasted while a turn is running stages in the compo
 and is submitted as its own separate turn once the current turn ends. It is not
 merged into the running turn and is not lost. Gating on idle is therefore a
 correctness nicety for ordering, not a loss-prevention necessity, on this CLI."""
+# MEASURED (fixtures claude_idle_2_1_221.txt, claude_pasted_chip_plain.txt):
+# below the composer Claude renders a box rule, a model status row, and
+# optional hint/mode rows. None of it is payload, so the terminal sentinel
+# may be followed by these and still be the last payload token.
+composer_trailer_regex = [
+  '^─+$',
+  '^\s*.*\b\d+K window\b',
+  '^\s*paste again to expand\s*$',
+  '^\s*⏸\s',
+  '^\s*\?\s+for shortcuts\s*$',
+]

@@ -163,6 +163,13 @@ first_paste_caveat = """MEASURED: the first paste after TUI startup did not stag
 first rendered prompt glyph. Verify-before-submit catches this; a blind
 paste-then-Enter would have lost the message silently."""
 
+# MEASURED (live 2026-08-20 capture): the composer is a box, so below the
+# staged text come the closing rule and one model status row.
+composer_trailer_regex = [
+  '^─+$',
+  '^\s*Gemini\b.*·.*\bCtx:\s*\d+%',
+]
+
 [context_leak]
 note = """agy auto-read ~/projects/COORDINATION.md and ~/projects/NOTES.md on the
 very first turn in a scratch directory, i.e. it walks up beyond the working

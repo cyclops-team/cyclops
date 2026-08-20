@@ -222,7 +222,11 @@ fn codex_collapsed_paste_chip_is_staged_input() {
         \u{1b}[1m›\u{1b}[0m \u{1b}[2mSummarize recent commits\u{1b}[0m\n\
         \u{1b}[38;2;246;226;183mgpt-5.6-sol high\u{1b}[0m · ~/proj";
     let r = codex
-        .evaluate_esc("proj", &cyclops_manifest::strip_csi(transcript), Some(transcript))
+        .evaluate_esc(
+            "proj",
+            &cyclops_manifest::strip_csi(transcript),
+            Some(transcript),
+        )
         .unwrap();
     assert_eq!(
         r.state,
@@ -643,4 +647,59 @@ fn cursor_ghost_vs_typed_probed_fixtures() {
     let r = cursor.evaluate("Cursor Agent", typed_plain).unwrap();
     assert_eq!(r.id, "composer_plain_fallback");
     assert_eq!(r.state, AgentState::Idle);
+}
+
+/// Every shipped trailer pattern must match the chrome captured from a real
+/// session, and must NOT match ordinary payload text. A trailer regex that
+/// matches payload would let content after the sentinel pass as chrome,
+/// which is the one direction that is unsafe.
+#[test]
+fn shipped_composer_trailers_match_captured_chrome_only() {
+    let cases: &[(&str, &[&str], &[&str])] = &[
+        (
+            "claude",
+            &[
+                "────────────────────────",
+                "  Opus 5 · xhigh · ~/projects/clops · Ctx: 97% · 5h: 93% · 1000K window · 28K used",
+                "  paste again to expand",
+                "  ⏸ manual mode on · ← for agents",
+            ],
+            &["review the auth change", "[cyclops:end m-1]", "· a line with a dot ·"],
+        ),
+        (
+            "codex",
+            &[
+                "  gpt-5.6-sol xhigh · ~ · Full Access · Context 87% left · weekly 97% left",
+                "  gpt-5.6-sol high · /tmp/x · 258K window · 2.87M used",
+            ],
+            &["please review this", "[cyclops:end m-1]", "a · b · c"],
+        ),
+        (
+            "agy",
+            &[
+                "────────────────────────",
+                "Gemini 3.7 Flash · High · ~ · Full · Ctx: 79% · 97% 5h, 83% wk · (195K / 1048K)",
+            ],
+            &["run the tests", "[cyclops:end m-1]", "Gemini said something"],
+        ),
+    ];
+    for (id, chrome, payload) in cases {
+        let m = &shipped()[*id];
+        assert!(
+            !m.composer_trailers.is_empty(),
+            "{id}: no trailer patterns shipped"
+        );
+        for line in *chrome {
+            assert!(
+                m.composer_trailers.iter().any(|r| r.is_match(line)),
+                "{id}: captured chrome unmatched: {line:?}"
+            );
+        }
+        for line in *payload {
+            assert!(
+                !m.composer_trailers.iter().any(|r| r.is_match(line)),
+                "{id}: payload text matched a trailer pattern: {line:?}"
+            );
+        }
+    }
 }
