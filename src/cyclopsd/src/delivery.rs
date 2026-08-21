@@ -1912,6 +1912,13 @@ fn occupant_unchanged(
     if row.dead {
         return Err("pane_dead".to_string());
     }
+    // Copy-mode after admission: the human is scrolling, and a paste now
+    // lands somewhere neither of us can see. The gate checks this before
+    // admitting, but admission is a decision about a moment and the human
+    // can enter copy-mode inside the window that follows.
+    if row.in_mode {
+        return Err("pane_in_mode".to_string());
+    }
     if row.pane_pid != admitted_pid {
         return Err("pane_pid_changed".to_string());
     }
@@ -2563,17 +2570,30 @@ fn staged_verified(
     other_patterns: &[String],
     msg_id: &str,
 ) -> Option<bool> {
-    let region = bottom_window(&strip_csi(screen), VERIFY_REGION);
-    if patterns_hit(&region, id_patterns) {
-        return Some(true);
-    }
-    // The leading id can be off-screen while the payload is intact; the
-    // sentinel is the token that survives wrapping.
+    // Strongest first: the sentinel proves the WHOLE payload staged,
+    // because it is the last byte the daemon wrote.
     if sentinel_verified(manifest, screen, msg_id) {
         return Some(true);
     }
+    // The collapsed-paste chip is the vendor's alternate representation:
+    // it hides the id and the sentinel alike, so a composer-pinned generic
+    // pattern is the only evidence that survives it.
     if marker_in_composer(manifest, screen, other_patterns) {
         return Some(false);
+    }
+    // Legacy leading-id evidence, and deliberately last. It proves only
+    // that SOME bytes of this delivery reached the screen, not that the
+    // tail did, so a truncated paste passes it. It is therefore accepted
+    // only where terminality cannot be decided at all: a manifest that
+    // declares no composer chrome gives the sentinel check nothing to
+    // measure "last" against, and that lane keeps the behavior it had
+    // before the sentinel existed rather than losing verification
+    // entirely (ADMIN-DIRECTIVE-P0 section 9, vendor limitation).
+    if manifest.composer_trailers.is_empty() {
+        let region = bottom_window(&strip_csi(screen), VERIFY_REGION);
+        if patterns_hit(&region, id_patterns) {
+            return Some(true);
+        }
     }
     None
 }
@@ -2588,23 +2608,38 @@ fn staged_verified(
 /// (`injection.composer_trailer_regex`); the terminality rule here is
 /// generic and carries no vendor branches.
 fn sentinel_verified(manifest: &Manifest, screen: &str, msg_id: &str) -> bool {
+    if manifest.composer_trailers.is_empty() {
+        // Nothing declares what sits below the composer, so "last payload
+        // token" is not a decidable question here. Fail closed.
+        return false;
+    }
     let want = sentinel_for(msg_id);
     let plain = strip_csi(screen);
-    let lines: Vec<&str> = plain
+    // Bounded to the same region every other verification reads: evidence
+    // from further up the transcript is not evidence about the composer.
+    let all: Vec<&str> = plain
         .lines()
         .map(str::trim_end)
         .filter(|l| !l.trim().is_empty())
+        .collect();
+    let lines: Vec<&str> = all
+        .iter()
+        .rev()
+        .take(VERIFY_REGION)
+        .rev()
+        .copied()
         .collect();
     let Some(at) = lines.iter().rposition(|l| l.trim() == want) else {
         return false;
     };
     // Everything below the sentinel must be chrome the vendor declared.
-    // An empty trailer list means the sentinel must simply be last.
+    // This is also what binds the sentinel to the ACTIVE composer: a
+    // same-id sentinel left behind in the transcript has the composer
+    // itself between it and the chrome, and a composer line is not
+    // chrome, so the echo fails here rather than authorizing a submit.
     lines[at + 1..].iter().all(|l| {
-        manifest
-            .composer_trailers
-            .iter()
-            .any(|re| re.is_match(l.trim()))
+        let t = l.trim();
+        manifest.composer_trailers.iter().any(|re| re.is_match(t))
     })
 }
 
@@ -3703,19 +3738,95 @@ composer_trailer_regex = ['^\?\s+for shortcuts', '^\s*\d+%\s+context left']
         ));
     }
 
-    /// A manifest that declares no trailer chrome still works: the
-    /// sentinel must then be the final non-empty line.
+    /// Superseded by `without_chrome_vocabulary_the_sentinel_path_refuses`.
+    /// The original rule here was "with no declared chrome, the sentinel
+    /// must simply be last", which quietly assumed the capture ended at
+    /// the composer. Codey's review of d3ca75d showed that assumption is
+    /// how a transcript echo gets in, so an undeclared vendor now refuses
+    /// the sentinel path outright instead.
     #[test]
-    fn without_declared_chrome_the_sentinel_must_be_last() {
+    fn an_undeclared_vendor_never_verifies_by_sentinel() {
         let bare = cyclops_manifest::Manifest::parse(
             "[agent]\nid = \"x\"\ndisplay_name = \"x\"\n",
             std::path::Path::new("x.toml"),
         )
         .unwrap();
-        assert!(sentinel_verified(&bare, "❯ body\n[cyclops:end m-1]", "m-1"));
+        assert!(!sentinel_verified(
+            &bare,
+            "❯ body\n[cyclops:end m-1]",
+            "m-1"
+        ));
         assert!(!sentinel_verified(
             &bare,
             "❯ body\n[cyclops:end m-1]\n? for shortcuts",
+            "m-1"
+        ));
+    }
+
+    /// S1 (codey review of d3ca75d): a visible leading id must NOT be
+    /// enough on its own. Every one of these renders the header inside the
+    /// region while the tail is missing or malformed, which is exactly what
+    /// a truncated paste looks like, and each must refuse to verify.
+    #[test]
+    fn a_visible_leading_id_never_verifies_without_a_sound_sentinel() {
+        let m = sentinel_manifest();
+        let (id, other) = verify_patterns(&m, "m-3f9c2a");
+        let head = "❯ [cyclops m-3f9c2a] FROM: codex  SUBJECT: long";
+        for (name, screen) in [
+            ("missing sentinel", format!("{head}\nbody\n? for shortcuts")),
+            (
+                "truncated sentinel",
+                format!("{head}\nbody\n[cyclops:end m-3f9\n? for shortcuts"),
+            ),
+            (
+                "wrapped sentinel",
+                format!("{head}\nbody\n[cyclops:end\nm-3f9c2a]\n? for shortcuts"),
+            ),
+            (
+                "payload after sentinel",
+                format!("{head}\nbody\n[cyclops:end m-3f9c2a]\nstray tail\n? for shortcuts"),
+            ),
+        ] {
+            assert_eq!(
+                staged_verified(&m, &screen, &id, &other, "m-3f9c2a"),
+                None,
+                "{name} must not verify on the leading id alone"
+            );
+        }
+        // The sound rendering still verifies.
+        let ok = format!("{head}\nbody\n[cyclops:end m-3f9c2a]\n? for shortcuts");
+        assert_eq!(
+            staged_verified(&m, &ok, &id, &other, "m-3f9c2a"),
+            Some(true)
+        );
+    }
+
+    /// S2: a sentinel that scrolled into transcript history, with an empty
+    /// composer below it, must never authorize a submit. The composer line
+    /// is not chrome, so it breaks the chrome-only tail that binds the
+    /// sentinel to the active composer.
+    #[test]
+    fn a_transcript_echo_of_the_sentinel_never_verifies() {
+        let m = sentinel_manifest();
+        let echo = "[cyclops:end m-1]\n❯ \n? for shortcuts";
+        assert!(!sentinel_verified(&m, echo, "m-1"));
+        // Same bytes, but the composer is the thing holding it: verifies.
+        let staged = "❯ [cyclops m-1] hi\n[cyclops:end m-1]\n? for shortcuts";
+        assert!(sentinel_verified(&m, staged, "m-1"));
+    }
+
+    /// A manifest with no declared chrome cannot decide "last token", so
+    /// the sentinel path refuses rather than guessing.
+    #[test]
+    fn without_chrome_vocabulary_the_sentinel_path_refuses() {
+        let bare = cyclops_manifest::Manifest::parse(
+            "[agent]\nid = \"x\"\ndisplay_name = \"x\"\n",
+            std::path::Path::new("x.toml"),
+        )
+        .unwrap();
+        assert!(!sentinel_verified(
+            &bare,
+            "❯ body\n[cyclops:end m-1]",
             "m-1"
         ));
     }
@@ -3951,11 +4062,16 @@ verify_pattern = ["<message_id>", "Pasted text"]
 
         // A short message renders literally: the id proves it anywhere in
         // the region, chip or no chip.
+        // A short message renders literally, so its sentinel is on screen
+        // too, and that is what verifies it now: a visible leading id is no
+        // longer sufficient on its own (S1). The status row below it is
+        // declared chrome, which proves the sentinel is the last payload
+        // token rather than the middle of a truncated paste.
         let literal = format!(
-            "{CODEX_TRANSCRIPT_LINE}\n\u{1b}[1m›\u{1b}[0m [cyclops m-jean01] hello\n  gpt-5.6-sol high"
+            "{CODEX_TRANSCRIPT_LINE}\n\u{1b}[1m›\u{1b}[0m [cyclops m-jean01] hello\n[cyclops:end m-jean01]\n  gpt-5.6-sol high · 258K window"
         );
         assert_eq!(
-            staged_verified(&m, &literal, &id, &other, "m-x"),
+            staged_verified(&m, &literal, &id, &other, "m-jean01"),
             Some(true)
         );
     }

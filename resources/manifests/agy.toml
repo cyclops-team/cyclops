@@ -78,7 +78,20 @@ state = "idle_with_input"
 priority = 1050
 region = "bottom_non_empty_lines(4)"
 line_regex = ['^\s*>\s+\S']
-evidence = "MEASURED: injected marker rendered as '> CYCVAL-ACK-AGY-002 ...'"
+note = """Plain-only on purpose, unlike the claude and codex composer rules
+which need an SGR discriminator to separate a human draft from ghost text.
+MEASURED 2026-08-20 (issue 18, agy 1.1.13, `capture-pane -e` on a live idle
+pane): an empty composer renders exactly 'ESC[94m>ESC[39m' and paints NO
+placeholder or suggestion text after the glyph, so there is nothing here
+for a ghost rule to discriminate against. If a future version does paint
+one, this rule reads it as a human draft and deliveries hold forever:
+benign, visible, and the direction to fail in. Re-probe before relaxing it.
+
+The observation covers the idle state on one version; typed-input styling
+was not captured, because the only agy pane available was a colleague's
+live session and typing into it to take a measurement is exactly what the
+gate exists to prevent."""
+evidence = "MEASURED: injected marker rendered as '> CYCVAL-ACK-AGY-002 ...'; empty composer 'ESC[94m>ESC[39m' with no ghost text (2026-08-20, agy 1.1.13)"
 
 [[rule]]
 id = "screen_working"
@@ -167,7 +180,7 @@ paste-then-Enter would have lost the message silently."""
 # staged text come the closing rule and one model status row.
 composer_trailer_regex = [
   '^─+$',
-  '^\s*Gemini\b.*·.*\bCtx:\s*\d+%',
+  '^\s{0,4}Gemini [^·]+(?: · [^·]+){2,} · Ctx: \d+%(?: · .+)?\s*$',
 ]
 
 [context_leak]

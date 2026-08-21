@@ -106,7 +106,7 @@ visible; the hold itself keeps waiting on events, never on a timer.
    to be the last payload token; or a generic staging pattern pinned to
    a manifest composer line. The sentinel path answers the wrapped
    payload, whose id has scrolled out of the region while its tail is
-   still visible. Terminality is decided generically — the sentinel must
+   still visible. Terminality is decided generically: the sentinel must
    match a whole line, and every line below it must match one of the
    manifest's `injection.composer_trailer_regex` patterns, which is the
    vendor's own chrome vocabulary (box rules, model status rows, hint

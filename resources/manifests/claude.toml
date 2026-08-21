@@ -128,16 +128,36 @@ state = "idle"
 priority = 1040
 region = "bottom_non_empty_lines(6)"
 line_regex = ['^\s*❯\s+\S']
-line_regex_esc = ['❯\x{a0}(?:\x1b\[[0-9;]*m)+\S']
-note = """Text after the composer glyph that arrives styled is a suggestion
-the product painted, not something a human staged: real input follows the
-NBSP unstyled (F55, and the codex/cursor ghost probes measured the same
-convention as ESC[2m). Idle on purpose, so a pane showing only a suggestion
-delivers instead of holding forever on input nobody typed. Sits between
-composer_has_staged_input (1050), which already refuses this line via its
-esc clause, and title_idle_sparkle (1000), so the diagnostic names the
-ghost instead of the title having to answer for it."""
+line_regex_esc = ['❯\x{a0}\x1b\[2m\S']
+note = """A suggestion the product painted, not something a human staged.
+Matches the DIM convention only (ESC[2m), never "any styling": a typed
+slash command renders styled too (ESC[38;5;153m on 2.1.232), and treating
+all styling as ghost read a human's half-typed /model as idle and pasted
+over it. That is the destructive direction of the F55 fix, so this clause
+is deliberately narrow: an unrecognized styling falls through to
+composer_styled_input below and HOLDS. A ghost we fail to recognize costs
+a delivery that waits; a draft we fail to recognize costs the human's
+work. Sits between composer_has_staged_input (1050), which refuses this
+line via its esc clause, and composer_styled_input (1035)."""
 evidence = "MEASURED F55: real input is unstyled after the NBSP; ghost styling per the F19 codex/cursor probes, not yet captured live on Claude"
+
+[[rule]]
+id = "composer_styled_input"
+state = "idle_with_input"
+priority = 1035
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^\s*❯\s+\S']
+line_regex_esc = ['\x1b\[39m❯\x{a0}\x1b\[']
+note = """Composer content that is styled but not the dim ghost above.
+MEASURED on 2.1.232: a typed slash command renders
+'ESC[39m❯<NBSP>ESC[38;5;153m/model', which the staged-input clause cannot
+see (it requires a non-ESC byte after the NBSP) and the ghost clause must
+not claim. Without this rule that screen read idle and the gate pasted
+into the human's draft and submitted it.
+
+This is the fail-safe floor for the composer: anything styled that is not
+provably a ghost is treated as a human's text and held."""
+evidence = "MEASURED 2026-08-20 (issue 16, Claude Code 2.1.232): typed '/model' renders ESC[39m + glyph + NBSP + ESC[38;5;153m, while real ghost styling is dim ESC[2m"
 
 [[rule]]
 id = "screen_working"
@@ -222,8 +242,8 @@ correctness nicety for ordering, not a loss-prevention necessity, on this CLI.""
 # may be followed by these and still be the last payload token.
 composer_trailer_regex = [
   '^─+$',
-  '^\s*.*\b\d+K window\b',
-  '^\s*paste again to expand\s*$',
-  '^\s*⏸\s',
-  '^\s*\?\s+for shortcuts\s*$',
+  '^\s{0,4}\S[^·]*(?: · [^·]+){3,} · \d+K window(?: · \d+K used)?\s*$',
+  '^\s{0,4}paste again to expand\s*$',
+  '^\s{0,4}⏸ [^·]*\b(?:on|off)\b(?: · .+)?\s*$',
+  '^\s{0,4}\? for shortcuts\s*$',
 ]

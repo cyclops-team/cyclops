@@ -363,6 +363,7 @@ pub(crate) fn fuse(
             state: w.state,
             disagreement: matches!((title, screen), (Some(t), Some(s)) if t.state != s.state),
             decided_by: w.id.clone(),
+            stale: false,
             readings,
         },
         None => Detection {
@@ -370,6 +371,7 @@ pub(crate) fn fuse(
             readings,
             disagreement: false,
             decided_by: "no_rule".into(),
+            stale: false,
         },
     }
 }
@@ -419,6 +421,7 @@ pub(crate) async fn recompute_pane(
                     readings: Vec::new(),
                     disagreement: false,
                     decided_by: "pane_in_mode".into(),
+                    stale: false,
                 };
                 map.insert(
                     pane_id.to_string(),
@@ -440,6 +443,7 @@ pub(crate) async fn recompute_pane(
             readings: Vec::new(),
             disagreement: false,
             decided_by: "pane_dead".into(),
+            stale: false,
         }
     } else if let Some(m) = manifest {
         let t_rule = title_winner(m, &row.title);
@@ -458,7 +462,12 @@ pub(crate) async fn recompute_pane(
                         .expect("detections lock")
                         .get(pane_id)
                         .map(|entry| entry.detection.clone());
-                    if let Some(p) = prior {
+                    if let Some(mut p) = prior {
+                        // Reporting keeps the last known answer; writing
+                        // must not. Marking it stale is what stops the
+                        // gate from reading a retained clean composer as
+                        // permission to paste (rule 12).
+                        p.stale = true;
                         return Some(p);
                     }
                     capture_failed = true;
@@ -485,6 +494,7 @@ pub(crate) async fn recompute_pane(
             readings: Vec::new(),
             disagreement: false,
             decided_by: "no_manifest".into(),
+            stale: false,
         }
     };
 

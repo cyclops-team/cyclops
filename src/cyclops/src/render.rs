@@ -911,6 +911,17 @@ pub fn render_detection(target: &str, det: &Detection, style: &Style, now_ms: u6
         " {sep} {}",
         style.dim(&format!("decided by {}", det.decided_by))
     ));
+    // Runtime state and write-readiness are two answers, and the diagnostic
+    // shows both (rule 12). The verdict comes from the one owner of the
+    // rule, never recomputed here, so the surface cannot drift from the
+    // gate's decision.
+    header.push_str(&format!(
+        " {sep} {}",
+        match det.write_ready() {
+            Ok(()) => style.dim("write-ready"),
+            Err(reason) => style.dim(&format!("not write-ready: {reason}")),
+        }
+    ));
     if det.readings.is_empty() {
         return header;
     }
@@ -1986,6 +1997,7 @@ mod tests {
             state: AgentState::Working,
             disagreement: true,
             decided_by: "hook:Stop".into(),
+            stale: false,
             readings: vec![
                 SensorReading {
                     sensor: Sensor::Hook,
@@ -2008,7 +2020,7 @@ mod tests {
             ],
         };
         let got = render_detection("reviewer", &det, &Style::none(), now);
-        let expected = "reviewer · ● working · ⚠ sensors disagree · decided by hook:Stop\n\
+        let expected = "reviewer · ● working · ⚠ sensors disagree · decided by hook:Stop · not write-ready: not_idle\n\
              \n\
              \x20 hook    ● working  Stop            2s ago\n\
              \x20 title   ● working  spinner         2s ago\n\

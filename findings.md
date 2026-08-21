@@ -1284,11 +1284,25 @@ would widen the blast radius of a gated change. Filed so the next
 person does not re-diagnose it, and so the P0 gate is read as "green
 except one pre-existing failure", not "green".
 
+## F-P0-1b: `shell_teardown` tests fail on `dfe963a` in this environment
+
+Measured 2026-08-20, same method as F-P0-1: all three tests in
+`tests/testrig/tests/shell_teardown.rs` fail with
+`tests/e2e/lib/lib.sh: Os { code: 2, kind: NotFound }`, and they fail
+identically after `git stash push -u` back to clean `dfe963a`. The file
+is present and `tests/testrig/../e2e/lib/lib.sh` resolves from a shell,
+so this is an environment-specific canonicalize failure in the test
+harness, not a missing file and not P0 work.
+
+Recorded rather than fixed, for the same reason as F-P0-1: it is outside
+the P0-A scope, and the honest reading of the gate is "green except two
+pre-existing environment failures".
+
 ## F-P0-2: local rustfmt 1.9.0 disagrees with the tree on three untouched files
 
 Measured 2026-08-20. `cargo fmt --all` on `dfe963a` rewrites
 `src/cyclops/src/daemon.rs:255`, `src/cyclopsd/src/server.rs:318`, and
-`src/cyclopsd/tests/m1_fixes.rs:243` — all pre-existing code, none of it
+`src/cyclopsd/tests/m1_fixes.rs:243`, all pre-existing code, none of it
 touched by P0. The tree is formatted by whatever rustfmt CI runs, so the
 local toolchain is the newer one.
 
@@ -1297,3 +1311,69 @@ the change. Everything P0 wrote is clean under both readings.
 If CI ever fails formatting on this branch, this is why: pin the
 toolchain rather than reformatting unrelated files inside a gated
 safety change.
+
+## F-P0-3: agy paints no composer ghost text (issue 18)
+
+Measured 2026-08-20, agy 1.1.13, live idle pane, `tmux capture-pane -e -p`.
+An empty agy composer renders exactly `ESC[94m>ESC[39m`: the prompt glyph
+is styled, and nothing follows it. No placeholder, suggestion, or ghost
+text of any kind.
+
+So `composer_has_input` needs no SGR discriminator today, and issue 18
+resolves by record rather than by rule: any content after that glyph is
+a human's. If a later version paints a suggestion there, the rule reads
+it as a draft and deliveries hold forever, which is the benign direction
+and is visible in `cyclops read <agent> --source detection`.
+
+Scope limit, stated because it matters: this covers the idle state on one
+version. Typed-input styling was not captured, since the only live agy
+pane belonged to another agent's working session, and typing into someone
+else's composer to take a measurement is the exact act the delivery gate
+exists to prevent. Adding an esc clause on one observation would also
+flip agy's capture flavor to escaped for every delivery, which is a
+bigger behavioral change than the finding supports.
+
+Same capture confirmed the `composer_trailer_regex` chrome shipped for
+agy: the box rules de-escape to `────…` and the status row to
+`Gemini 3.7 Flash · … · Ctx: 78% · …`.
+
+## F-P0-4: composer chrome vocabulary, measured per vendor (issue: trailer regexes)
+
+The terminal sentinel can only prove it is the LAST payload token if
+something says which rows below the composer are not payload. That
+vocabulary is `injection.composer_trailer_regex`, and these are the
+captures it was written from.
+
+Procedure. For a live pane: `tmux capture-pane -e -p -t <pane>` on an
+idle composer, then read the tail rows. For the fixture vendors:
+`src/cyclops-manifest/tests/fixtures/*_plain.txt`, whose tails were
+captured the same way during the M1 soak and the F55 probe.
+
+Measured rows, 2026-08-20 unless noted:
+
+- claude (fixtures `claude_idle_2_1_221.txt`,
+  `claude_pasted_chip_plain.txt`): a box rule `────…`; a status row
+  `  Opus 5 · xhigh · ~/projects/clops · Ctx: 97% · 5h: 93% · 7d: 94% ·
+  1000K window · 28K used`; a hint row `  paste again to expand`; a mode
+  row `  ⏸ manual mode on · ← for agents`.
+- codex (fixture `codex_pasted_chip_plain.txt` plus a live capture):
+  a blank line, then `  gpt-5.6-sol high · <cwd> · 258K window · 2.87M
+  used`, live variant `  gpt-5.6-sol xhigh · ~ · Full Access · Context
+  87% left · weekly 97% left · 258K window · 2.87M used`.
+- agy (live, agy 1.1.13, `tmux capture-pane -e -p`): box rules render
+  `ESC[90m────…`, the empty composer is `ESC[94m>ESC[39m`, and the
+  status row de-escapes to `Gemini 3.7 Flash · High · ~ · Full · Ctx:
+  78% · 93% 5h, … · 507K used`.
+- cursor: NOT measured. No cursor pane exists in this fleet and none was
+  installed to make one. Cursor therefore ships no trailer vocabulary,
+  which makes the sentinel path undecidable for it, and that lane keeps
+  the leading-id evidence it had before.
+
+Consequence worth stating plainly, because it bounds what these patterns
+can promise: a status row and a sentence are both text, and a pattern
+loose enough to match the row can match prose. `context · budget · 128K
+window` is structurally identical to codex's real row, so the codex
+pattern is anchored on the model-name shape instead, and it fails closed
+when the model family is renamed. `shipped_trailers_reject_adversarial_
+payload_text` holds the line: every pattern is tested against prose
+derived from it, and a pattern that matches payload is a bug.

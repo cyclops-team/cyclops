@@ -136,6 +136,12 @@ pub struct Detection {
     pub disagreement: bool,
     /// Rule/priority that won.
     pub decided_by: String,
+    /// True when this verdict is a retained prior one, kept because a
+    /// sensor read failed. The runtime state may still be the best answer
+    /// available, but nothing here was observed just now, so it can never
+    /// authorize a write (rule 12).
+    #[serde(default)]
+    pub stale: bool,
 }
 
 impl Detection {
@@ -154,6 +160,11 @@ impl Detection {
     pub fn write_ready(&self) -> Result<(), &'static str> {
         if self.state != AgentState::Idle {
             return Err("not_idle");
+        }
+        // A retained verdict is doubt wearing the last known answer: the
+        // capture that was supposed to look at the composer failed.
+        if self.stale {
+            return Err("stale_screen_evidence");
         }
         if self.disagreement {
             return Err("sensor_disagreement");
@@ -237,6 +248,7 @@ mod write_ready_tests {
             readings,
             disagreement,
             decided_by: "d".into(),
+            stale: false,
         }
     }
 
@@ -311,5 +323,21 @@ mod write_ready_tests {
             false,
         );
         assert_eq!(d.write_ready(), Ok(()));
+    }
+
+    /// S3 (codey review of d3ca75d): fusion keeps the prior verdict when a
+    /// forced capture fails, which is right for reporting state and wrong
+    /// for authorizing a write. The retained reading looks clean because it
+    /// WAS clean, seconds ago, before the read that failed.
+    #[test]
+    fn a_retained_verdict_is_never_write_ready() {
+        let mut d = det(
+            AgentState::Idle,
+            vec![reading(Sensor::Screen, AgentState::Idle)],
+            false,
+        );
+        assert_eq!(d.write_ready(), Ok(()));
+        d.stale = true;
+        assert_eq!(d.write_ready(), Err("stale_screen_evidence"));
     }
 }

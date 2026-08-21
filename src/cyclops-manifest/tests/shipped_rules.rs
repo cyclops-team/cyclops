@@ -703,3 +703,81 @@ fn shipped_composer_trailers_match_captured_chrome_only() {
         }
     }
 }
+
+/// Issue 16, the destructive direction of F55: on Claude Code 2.1.232 a
+/// typed slash command renders STYLED
+/// ('ESC[39m' + glyph + NBSP + 'ESC[38;5;153m/model'), which the
+/// staged-input clause cannot see, and a ghost rule that claimed all
+/// styling read it as idle. The gate then pasted into the human's draft
+/// and submitted it. Styling that is not provably the dim ghost must hold.
+#[test]
+fn claude_typed_slash_command_is_never_idle() {
+    let claude = &shipped()["claude"];
+    let plain = "transcript\n────────\n❯ /model\n────────\n  Opus 5 · 1000K window";
+    let esc = "transcript\n────────\n\u{1b}[39m❯\u{a0}\u{1b}[38;5;153m/model\u{1b}[39m\n────────\n  Opus 5 · 1000K window";
+    let r = claude.evaluate_esc("proj", plain, Some(esc)).unwrap();
+    assert_eq!(
+        r.state,
+        AgentState::IdleWithInput,
+        "a typed slash command must hold, not invite a paste (rule {})",
+        r.id
+    );
+    assert_eq!(r.id, "composer_styled_input");
+
+    // The dim ghost convention still reads idle: F55's benefit is intact.
+    let ghost_esc = "transcript\n────────\n\u{1b}[39m❯\u{a0}\u{1b}[2mTry \"fix the tests\"\u{1b}[0m\n────────\n  Opus 5 · 1000K window";
+    let ghost_plain =
+        "transcript\n────────\n❯ Try \"fix the tests\"\n────────\n  Opus 5 · 1000K window";
+    let r = claude
+        .evaluate_esc("proj", ghost_plain, Some(ghost_esc))
+        .unwrap();
+    assert_eq!(r.id, "composer_ghost_suggestion");
+    assert_eq!(r.state, AgentState::Idle);
+
+    // Unstyled typed text is unchanged: the staged clause still wins.
+    let typed_esc =
+        "transcript\n────────\n\u{1b}[39m❯\u{a0}fix the parser\n────────\n  Opus 5 · 1000K window";
+    let typed_plain = "transcript\n────────\n❯ fix the parser\n────────\n  Opus 5 · 1000K window";
+    let r = claude
+        .evaluate_esc("proj", typed_plain, Some(typed_esc))
+        .unwrap();
+    assert_eq!(r.id, "composer_has_staged_input");
+    assert_eq!(r.state, AgentState::IdleWithInput);
+}
+
+/// D1 (codey review of d3ca75d): a trailer pattern that also matches
+/// ordinary prose lets payload text after the sentinel pass as chrome, and
+/// `sentinel_verified` would then submit a truncated paste. These are
+/// adversarial lines derived from each shipped pattern: text a person could
+/// plausibly write, shaped as closely as prose gets to a status row.
+#[test]
+fn shipped_trailers_reject_adversarial_payload_text() {
+    let adversarial = [
+        // Derived from the "N K window" patterns.
+        "please use a 128K window",
+        "we should bump it to a 200K window and retest",
+        "context · budget · 128K window",
+        // Derived from the codex "Context N% left" pattern.
+        "Context 50% left is not enough for this refactor",
+        "note · warning · Context 12% left",
+        // Derived from the agy status row.
+        "Gemini said · the answer · Ctx: 50%",
+        "Gemini 3.7 · Ctx: 90%",
+        // Derived from the hint rows.
+        "paste again to expand the section",
+        "? for shortcuts, otherwise read the guide",
+        "⏸ pause the run before merging",
+        // Box-rule lookalikes that are not a full rule row.
+        "──── section heading ────",
+        "see ─ the dash above",
+    ];
+    for id in ["claude", "codex", "agy"] {
+        let m = &shipped()[id];
+        for line in adversarial {
+            assert!(
+                !m.composer_trailers.iter().any(|r| r.is_match(line.trim())),
+                "{id}: payload text would be treated as chrome: {line:?}"
+            );
+        }
+    }
+}

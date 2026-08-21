@@ -210,6 +210,12 @@ unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]
 # MEASURED (fixture codex_pasted_chip_plain.txt and a live 2026-08-20
 # capture): a blank line then one model status row below the composer.
 composer_trailer_regex = [
-  '^\s*\S.*·.*\bContext \d+% left\b',
-  '^\s*\S.*·.*\b\d+K window\b',
+  '^\s{0,4}\S[^·]*(?: · [^·]+){2,} · Context \d+% left(?: · .+)?\s*$',
+  '^\s{0,4}gpt-\S+(?: \S+)?(?: · [^·]+)+\s*$',
 ]
+# The second pattern is anchored on the model-name shape rather than on
+# "N K window", because a generic status-row shape cannot be separated from
+# ordinary prose: 'context · budget · 128K window' is structurally identical
+# to the real row. Anchoring costs coverage when the model family is renamed,
+# and that failure is closed: the sentinel simply stops verifying on this
+# lane and delivery falls back to the chip evidence it used before.

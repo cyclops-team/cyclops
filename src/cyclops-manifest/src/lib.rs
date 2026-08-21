@@ -23,11 +23,14 @@
 //!   is the delivery gate's, and it is the gate that decides whether a
 //!   modal may be dismissed at all.
 //!
-//! Two schema fields exist for vendor quirks that plain text cannot express:
-//! `agent.argv_basenames` (bind by pane argv when the kernel comm name is
-//! useless, e.g. native Claude installs reporting "2.1.220") and rule
+//! Three schema fields exist for vendor quirks that plain text cannot
+//! express: `agent.argv_basenames` (bind by pane argv when the kernel comm
+//! name is useless, e.g. native Claude installs reporting "2.1.220"), rule
 //! `line_regex_esc` (match against a capture-pane -e capture, e.g. codex
-//! ghost suggestions are only distinguishable from typed text by SGR dim).
+//! ghost suggestions are only distinguishable from typed text by SGR dim),
+//! and `injection.composer_trailer_regex` (which rows below the composer
+//! are vendor chrome rather than payload, so the delivery pipeline can
+//! decide whether the terminal sentinel is the last payload token).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
