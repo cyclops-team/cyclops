@@ -17,14 +17,11 @@ Reply: cyclops send codex --subject "..."
 
 - `m-3f9c2a` is the message id: short lowercase hex, unique per ledger.
   It is the marker for composer verification and hook ACK matching.
-- `[cyclops:end <id>]` is the terminal sentinel, and it is transport
-  machinery rather than something the recipient must act on. The leading
-  id is the one token a wrapped payload provably scrolls out of the
-  bottom capture region while the tail stays on screen, which is how an
-  intact payload could sit staged and unsubmitted behind
-  `verify_failed`. The sentinel gives verification a token where the
-  capture can always see it. It is deliberately not the reply hint:
-  transport evidence must not depend on human-facing copy that changes.
+- `[cyclops:end <id>]` is the terminal sentinel: transport machinery,
+  not something the recipient acts on, and deliberately not the reply
+  hint, since transport evidence must not depend on human-facing copy
+  that changes. Why the leading id alone could not carry verification is
+  in findings F-P0-10.
 - The daemon generates the header. Client-supplied FROM/SUBJECT text inside
   the body is not stripped but cannot forge the envelope: the header the
   recipient sees is daemon-built from socket-peer identity (v1 keeper made
@@ -81,9 +78,17 @@ timer. In order:
      (GOALS: queued lands within 1s of turn end).
    - `idle_with_input` (human typing, human always wins): hold in gating,
      re-check on the pane's next state change.
-   - `idle`: proceed.
+   - `idle`: proceed only on a positive write-readiness stamp. A refusal
+     holds in gating and the gate line names it
+     (`not_write_ready:<reason>`). `composer_hold` is the one that
+     outlives the frame it was raised on: a pane seen holding text stays
+     refused until a turn end with a clean screen reading proves the text
+     left (INVARIANTS rule 12).
 4. Just before pasting, re-read title and capture once more (the gate
-   snapshot must be fresher than any human keystroke round-trip).
+   snapshot must be fresher than any human keystroke round-trip). The
+   admitted pid is the agent's, resolved fresh; a process table that
+   cannot be read is `occupant_unprovable`, not a fallback to the pane's
+   shell.
 
 A delivery held in gating longer than `gate_hold_notify_ms` (config,
 default 120000) pings the admin once (action_required) so a wedged hold is
@@ -98,44 +103,35 @@ visible; the hold itself keeps waiting on events, never on a timer.
    composer verification: capture the bottom region and require the
    manifest's `verify_pattern` with `<message_id>` substituted. The
    capture flavor follows the manifest: SGR-escaped (`capture-pane -e`)
-   when any rule carries `line_regex_esc` clauses, plain otherwise —
-   pattern text is matched on de-escaped lines either way, while the
-   composer-line pinning also consults the esc clauses against the raw
-   lines. Verification accepts two kinds of evidence, in this order:
-   the terminal sentinel proven to be the last payload row of the active
-   composer, then a generic staging pattern pinned to a manifest composer
-   line. A visible leading id is NOT evidence: it proves the head of the
-   payload arrived, which is what a truncated paste also proves.
-   The sentinel path answers the wrapped payload, whose id has scrolled
-   out of the region while its tail is still visible. Terminality is
-   structural and generic: the sentinel must match a whole row, at least
-   one row must follow it, and those rows must be an ordered
-   subsequence of the vendor's measured layout, never more rows than the
-   layout has. The layout is `injection.composer_trailer_regex` and
+   when any rule carries `line_regex_esc` clauses, plain otherwise.
+   Pattern text is matched on de-escaped lines either way; the
+   composer-line pinning also runs the esc clauses against the raw
+   lines.
+
+   Two kinds of evidence are accepted, in this order: the terminal
+   sentinel proven to be the last payload row of the active composer,
+   then the vendor's paste chip pinned to a manifest composer line. A
+   visible leading id is NOT evidence (F-P0-10).
+
+   The sentinel is terminal only if it matches a whole row, at least one
+   row follows it, and the rows that follow are an ordered subsequence of
+   the vendor's measured trailer layout, never more rows than the layout
+   has. That layout is `injection.composer_trailer_regex` and
    `composer_trailer_regex_esc`, entry i describing row i of what the
-   vendor paints below the composer (box rule, model status row, hint or
-   mode row) in plain and escaped form. Both forms must match. On the vendors
-   measured so far, chrome arrives painted while a pasted payload row does
-   not, so prose shaped like a status row fails the escaped half. That is a
-   measured property of those layouts, not a universal law about terminals:
-   a vendor that paints pasted text would need its own measurement, and
-   until it has one the sentinel path refuses there. Order
-   and cardinality are what bind the sentinel to the ACTIVE composer, since
-   a sentinel left in the transcript has composer rows between it and the
-   chrome and those claim no layout entry. A split or truncated sentinel
-   matches nothing and fails closed, which is the intended answer: half a
-   token proves nothing about what else the capture lost. This matters for a composer that
-   collapses a long paste into a
-   "[Pasted Content N chars]" chip (codex): the message id AND the
-   sentinel are both hidden inside the chip, and the escaped composer
-   line is the only thing left
-   that can verify the staging. Chip and sentinel are alternates chosen
-   by what the vendor rendered, not by which vendor it is: the same CLI
-   produces raw-wrapped text in one message and a chip in the next.
-   agy's first
-   paste after TUI start does not stage (manifest first_paste_caveat). A
-   failed verification is an ambiguous post-paste outcome: it goes
-   directly to attention_required and is never re-pasted.
+   vendor paints below the composer; both forms must match. Order and
+   cardinality are what bind the sentinel to the ACTIVE composer. A
+   vendor with no measured layout has no sentinel path and refuses
+   there. A split or truncated sentinel matches nothing and fails
+   closed.
+
+   Which of the two applies is decided per message, by what the capture
+   shows, never per vendor.
+
+   A manifest declaring neither a trailer layout nor a chip has no
+   staging proof, and every delivery to it refuses. A manifest declaring
+   `first_paste_caveat` does not stage its first paste after TUI start.
+   A failed verification is an ambiguous post-paste outcome: it goes
+   straight to attention_required and is never re-pasted.
 3. Verified: state staged. Send the manifest's submit key (Enter):
    state submitted.
 

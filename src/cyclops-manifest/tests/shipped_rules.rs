@@ -781,3 +781,61 @@ fn shipped_trailers_reject_adversarial_payload_text() {
         }
     }
 }
+
+/// The stop-condition cell (ADMIN-DIRECTIVE-P0 section 9): on 2.1.236 an
+/// active turn keeps the idle sparkle title AND the composer prompt, so
+/// title and screen agreed on idle and the gate could admit a write into
+/// a pane mid-generation.
+///
+/// The capture is the real one, taken live during a running tool task.
+/// Its plain sibling is derived here rather than captured separately: two
+/// captures are two moments, and the claim being tested is about one.
+#[test]
+fn claude_active_status_row_reads_working_not_idle() {
+    let claude = &shipped()["claude"];
+    let esc = include_str!("fixtures/claude_working_2_1_236_esc.txt");
+    let plain = strip_sgr(esc);
+    let r = claude
+        .evaluate_esc("\u{2733} Cooking", &plain, Some(esc))
+        .unwrap();
+    assert_eq!(
+        r.state,
+        AgentState::Working,
+        "an active turn must not read idle (rule {})",
+        r.id
+    );
+    assert_eq!(r.id, "composer_working_spinner_status");
+
+    // A completed step keeps its words on screen forever, so the
+    // discriminator has to be the styling rather than the verb: uniform
+    // gray, no running timer, and the pane is free again.
+    let done_esc = "\u{1b}[38;5;246m⏺ Cooked for 28m 7s\u{1b}[39m\n\u{1b}[38;5;244m────────\n\u{1b}[39m❯\u{a0}\n\u{1b}[39m  \u{1b}[38;5;174mOpus 5\u{1b}[38;5;246m · 1000K window";
+    let r = claude
+        .evaluate_esc("\u{2733} Done", &strip_sgr(done_esc), Some(done_esc))
+        .unwrap();
+    assert_ne!(
+        r.state,
+        AgentState::Working,
+        "a completed step must not pin the pane as working forever"
+    );
+}
+
+/// De-escape a capture the way the daemon does before matching plain
+/// patterns, so a fixture can be its own plain sibling.
+fn strip_sgr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('\u{1b}') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        match rest.find('m') {
+            Some(end) => rest = &rest[end + 1..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}

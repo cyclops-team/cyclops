@@ -147,30 +147,60 @@ fn dedupe_ids(payload: &Value) -> Option<(String, String)> {
 pub(crate) async fn handle_report(
     inner: &Arc<Inner>,
     params: StateReportParams,
+    origin: crate::server::ReportOrigin,
 ) -> Result<Value, WireError> {
     let event = normalize_event(&params.event);
 
-    let (row, watcher, session_idx) = match inner.resolve_recipient(&params.agent) {
-        Some((idx, pane_id)) => {
+    // The origin was resolved from the socket peer during verification,
+    // and it is what everything below uses. Re-resolving the request's own
+    // name here would reopen the window it was verified to close: a pane
+    // can change hands between the two lookups, and the second one would
+    // answer for whoever holds it now.
+    let recipient = origin.recipient.clone();
+    let pane_id = origin.pane_id.clone();
+    let (row, watcher, session_idx) = match inner.resolve_recipient(&pane_id) {
+        Some((idx, id)) => {
             let Some(watcher) = inner.watcher_of(idx) else {
                 // resolve_recipient only answers from live watchers; a
                 // detach between the two calls lands on the fallback.
                 return Ok(json!({"applied": false, "reason": "session_detached"}));
             };
-            let Some(row) = watcher.pane(&pane_id) else {
+            let Some(row) = watcher.pane(&id) else {
                 return Ok(json!({"applied": false, "reason": "no_such_pane"}));
             };
             (row, Some(watcher), idx)
         }
-        None => match inner.resolve_recipient_last_known(&params.agent) {
+        None => match inner.resolve_recipient_last_known(&pane_id) {
             Some((idx, row)) => (row, None, idx),
             None => {
-                debug!(agent = %params.agent, "state report for unknown agent dropped");
+                debug!(agent = %recipient, "state report for unknown agent dropped");
                 return Ok(json!({"applied": false, "reason": "unknown_agent"}));
             }
         },
     };
-    let pane_id = row.pane_id.clone();
+    // A report the daemon could not attribute to a process is not a
+    // report about anyone: refused first, so an unplaceable origin is
+    // never reported as somebody else having taken the pane.
+    if origin.pane_pid == 0 {
+        return Ok(json!({"applied": false, "reason": "unattributable_origin"}));
+    }
+    // The pane must still be held by the same agent process AND still be
+    // read by the same rules. A pid alone is not the binding: a manifest
+    // pin or a config change can reinterpret an old hook under new
+    // semantics without the process ever changing. Exact equality, with
+    // no zero-pid escape hatch, because "we could not tell" is not "it
+    // matches".
+    //
+    // Both halves come from the same place the origin did: the agent
+    // instance proven from the process tree, never the pane's pin and
+    // never whoever currently holds the tty.
+    let admitted = fusion::admitted_vendor(inner, &row);
+    if admitted.as_ref().map(|(_, pid)| *pid) != Some(origin.pane_pid) {
+        return Ok(json!({"applied": false, "reason": "occupant_changed"}));
+    }
+    if admitted.map(|(m, _)| m.agent.id.clone()) != origin.manifest {
+        return Ok(json!({"applied": false, "reason": "manifest_changed"}));
+    }
 
     // Hook liveness (amendment c): any report that resolves to a pane
     // proves its hook config is loaded and firing. Recorded before dedupe
@@ -178,18 +208,23 @@ pub(crate) async fn handle_report(
     // pid so a restarted occupant never inherits its predecessor's edges.
     inner
         .hook_liveness
-        .record(&pane_id, &params.event, unix_ms(), row.pane_pid);
+        .record(&pane_id, &params.event, unix_ms(), origin.pane_pid);
+
+    // Dedupe windows belong to an occupant, not to a name: a label can
+    // move between panes and a pane can change hands, and either would
+    // otherwise let one process inherit another's counter.
+    let dedupe_ns = format!("{}#{}", origin.pane_id, origin.pane_pid);
 
     // Dedupe: exact repost (same reporter seq), then cross-config
     // duplicates on (session_id, turn_id, event) (amendment d).
     if let Some(seq) = params.seq {
-        if inner.ack_state.seen_seq(&params.agent, seq) {
+        if inner.ack_state.seen_seq(&dedupe_ns, seq) {
             return Ok(json!({"applied": false, "duplicate": true}));
         }
     }
     if let Some((s, t)) = dedupe_ids(&params.payload) {
         let key = format!("{s}|{t}|{event}");
-        if inner.ack_state.seen_key(&params.agent, key.as_str()) {
+        if inner.ack_state.seen_key(&dedupe_ns, key.as_str()) {
             return Ok(json!({"applied": false, "duplicate": true}));
         }
     }
@@ -197,29 +232,15 @@ pub(crate) async fn handle_report(
     let manifest = fusion::bind_manifest_for(inner, &row);
 
     // ACK matching: the manifest hooks.ack event whose ack_payload_field
-    // contains a waiting delivery's message id.
-    let mut matched = false;
-    if let Some(m) = manifest {
-        let is_ack = m
-            .hooks
-            .ack
-            .as_deref()
-            .is_some_and(|a| normalize_event(a) == event);
-        if is_ack {
-            if let Some(field) = &m.hooks.ack_payload_field {
-                if let Some(text) = params.payload.get(field).and_then(Value::as_str) {
-                    for handle in delivery::ack_candidates(inner, &pane_id) {
-                        if text.contains(&handle.msg_id) {
-                            matched |= delivery::resolve_hook_ack(inner, &handle);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Fusion: a hook edge is a sensor reading. Only the turn-boundary
-    // events map to states; everything else is a reconcile trigger.
+    // Fusion first, ACK second, and the order is load-bearing. Resolving
+    // an ACK can complete a delivery, which wakes the next one for this
+    // recipient, and that delivery gates on the fused state this very
+    // reading feeds. Store the reading afterwards and the woken delivery
+    // reads a pane that has not yet been told a turn started.
+    //
+    // The reading carries the binding it came from for the same reason
+    // the ACK does: a hook is a fact about one occupant under one set of
+    // rules, and fusion drops it when the pane no longer matches.
     let mapped = manifest.and_then(|m| {
         let is =
             |name: &Option<String>| name.as_deref().is_some_and(|n| normalize_event(n) == event);
@@ -238,14 +259,44 @@ pub(crate) async fn handle_report(
             .expect("hook readings lock")
             .insert(
                 pane_id.clone(),
-                fusion::HookEntry::new(SensorReading {
-                    sensor: Sensor::Hook,
-                    state,
-                    rule: params.event.clone(),
-                    ts: unix_ms(),
-                }),
+                fusion::HookEntry::bound(
+                    origin.pane_pid,
+                    origin.manifest.clone(),
+                    SensorReading {
+                        sensor: Sensor::Hook,
+                        state,
+                        rule: params.event.clone(),
+                        ts: unix_ms(),
+                    },
+                ),
             );
     }
+    // contains a waiting delivery's message id.
+    let mut matched = false;
+    if let Some(m) = manifest {
+        let is_ack = m
+            .hooks
+            .ack
+            .as_deref()
+            .is_some_and(|a| normalize_event(a) == event);
+        if is_ack {
+            if let Some(field) = &m.hooks.ack_payload_field {
+                if let Some(text) = params.payload.get(field).and_then(Value::as_str) {
+                    for handle in delivery::ack_candidates(inner, &pane_id) {
+                        if text.contains(&handle.msg_id) {
+                            matched |= delivery::resolve_hook_ack(
+                                inner,
+                                &handle,
+                                origin.pane_pid,
+                                &m.agent.id,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Reconcile on the edge; the recompute emits the state event and the
     // ledger line if the fused verdict moved. Detached sessions have no
     // sensors to reconcile; the stored reading waits for reattach.

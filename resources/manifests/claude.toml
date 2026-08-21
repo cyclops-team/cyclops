@@ -96,6 +96,24 @@ a live title tier: title_working_spinner (1100) outranking it is what keeps
 the fused verdict right while the model works."""
 evidence = "MEASURED claude_idle_composer.txt; matches mid-turn on 2.1.221"
 
+# The active-turn status row. MEASURED live on 2.1.236: while a tool task
+# runs, Claude keeps the idle sparkle in the title AND keeps the composer
+# prompt on screen, so title and screen both read idle and a delivery
+# could be admitted into a pane mid-generation. The row that separates the
+# two states is this one, and only in the escaped capture: an active step
+# paints its glyph and gerund in 38;5;215 with a running timer in
+# 38;5;246 right after. Completed steps in the transcript render with a
+# solid glyph in uniform 38;5;246 or 38;5;231 and never combine the two,
+# which is why this is style-bound rather than a text match on the verb:
+# finished rows keep their words forever.
+[[rule]]
+id = "composer_working_spinner_status"
+state = "working"
+priority = 1150
+region = "bottom_non_empty_lines(10)"
+line_regex_esc = ['\x1b\[38;5;215m[·✶✽✳✢✻]\x1b\[39m\s+\x1b\[38;5;215m[A-Z][a-z]+…\s+\x1b\[38;5;246m\(\d+[smhd]']
+evidence = "MEASURED live capture on Claude Code 2.1.236 (2026-08-20): active frames 'ESC[38;5;215m· ESC[39m ESC[38;5;215mKneading… ESC[38;5;246m(28m 7s · 30.3k tokens)' and the same shape for Jitterbugging; completed steps render uniform gray or white"
+
 [[rule]]
 id = "composer_has_staged_input"
 state = "idle_with_input"
@@ -256,3 +274,12 @@ composer_trailer_regex_esc = [
   '^\s*\x1b\[38;5;\d+mpaste again to expand',
   '^\x1b\[39m\s+\x1b\[38;5;\d+m⏸',
 ]
+# The first 2 rows are painted every time; the rest are optional.
+composer_trailer_required_prefix = 2
+# The collapsed-paste chip, as a whole composer row. MEASURED (fixture
+# claude_pasted_chip_esc.txt): the composer glyph, then the chip painted
+# in 38;5;6. Matching the row rather than the word "Pasted" is the point:
+# a message whose subject contained that word used to verify a paste
+# whose sentinel had never arrived.
+composer_chip_regex = ['^\s*❯\s+\[Pasted text #\d+( \+\d+ lines)?\]\s*$']
+composer_chip_regex_esc = ['\x1b\[39m❯\x{a0}\[Pasted text #\d+( \+\d+ lines)?\]']

@@ -286,6 +286,10 @@ mod tests {
             state_ms: None,
             hooks_verified: None,
             manifest_display_name: None,
+            // Runtime state and write-readiness are separate answers
+            // (rule 12); decoration reads only the first.
+            write_ready: false,
+            write_block: None,
         }
     }
 
@@ -385,7 +389,7 @@ mod tests {
             false,
         );
 
-        assert!(!input.state.safe_to_inject());
+        assert_eq!(input.state, AgentState::IdleWithInput);
         assert_eq!(
             DecorationSnapshot::primary_status(&input),
             Some(PrimaryStatus {

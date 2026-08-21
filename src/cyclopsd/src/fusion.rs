@@ -9,16 +9,21 @@
 //! still goes to the higher-priority rule but the disagreement is exposed
 //! on the Detection (GOALS: observable, not an error).
 //!
-//! Screen capture is evidence of last resort (amendment h): when a
-//! pane_title rule alone decides, capture-pane is skipped entirely. An
-//! explicit `pane.read source=detection` forces the full sensor set,
-//! which is the reconcile-on-doubt path.
+//! Screen capture is consulted last (amendment h): when a pane_title rule
+//! alone decides the STATE, capture-pane is skipped entirely.
+//!
+//! That skip is a cost decision about state, and it is never allowed to
+//! decide a write. Only the screen sensor can see a composer, so
+//! write-readiness needs a positive clean-composer reading from it (rule
+//! 12), and a verdict reached without one refuses. Every caller who is
+//! about to write, and `pane.read source=detection`, passes
+//! `force_screen` for exactly that reason.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use cyclops_manifest::{strip_csi, CompiledRule, Manifest, Region};
-use cyclops_proto::{AgentState, Detection, Sensor, SensorReading};
+use cyclops_proto::{AgentState, ComposerHold, Detection, Sensor, SensorReading};
 use cyclops_tmux::{PaneRow, SessionWatcher, TmuxError};
 use tracing::debug;
 
@@ -35,16 +40,40 @@ const HOOK_DISAGREE_LIMIT: u32 = 3;
 /// Stored hook sensor state per pane: the reading plus how many deciding
 /// rules-tier recomputes have contradicted it in a row.
 pub(crate) struct HookEntry {
+    /// The occupant that reported it, and the rules it was read under.
+    pane_pid: i32,
+    manifest: Option<String>,
     pub(crate) reading: SensorReading,
     pub(crate) disagreements: u32,
 }
 
 impl HookEntry {
-    pub(crate) fn new(reading: SensorReading) -> HookEntry {
+    /// A reading that remembers whose turn it reported.
+    ///
+    /// A hook edge is a fact about one process read through one set of
+    /// rules. Kept unbound, it outlives both: a replacement occupant
+    /// inherits the predecessor's "working", and a pane whose manifest
+    /// changed keeps being read by rules that no longer apply.
+    pub(crate) fn bound(
+        pane_pid: i32,
+        manifest: Option<String>,
+        reading: SensorReading,
+    ) -> HookEntry {
         HookEntry {
             reading,
             disagreements: 0,
+            pane_pid,
+            manifest,
         }
+    }
+
+    /// Does this reading still describe the pane in front of us?
+    ///
+    /// Exact equality, with no escape hatch. A zero pid would mean nobody
+    /// established whose turn this was, and a reading nobody can attribute
+    /// must not be usable as evidence about whoever holds the pane now.
+    fn describes(&self, pane_pid: i32, manifest: Option<&str>) -> bool {
+        self.pane_pid == pane_pid && self.manifest.as_deref() == manifest
     }
 }
 
@@ -101,6 +130,39 @@ pub(crate) fn bind_manifest_for<'a>(inner: &'a Inner, row: &PaneRow) -> Option<&
     argv_bound_manifest(inner, &row.pane_id, foreground_pid(row.pane_pid))
 }
 
+/// The agent instance a process is working for, proven from the process
+/// tree and its argv.
+///
+/// [`bind_manifest_for`] answers which RULES should read a pane, and an
+/// operator's pin is good evidence for that. This answers who is
+/// ALLOWED to speak for the pane, and a pin cannot establish that: it is
+/// a claim about the pane, and a pane sitting at its shell prompt keeps
+/// its pin while anyone at that prompt runs anything they like. So this
+/// route reads only live argv, refuses when nothing between `from` and
+/// the pane root is a program the daemon ships a manifest for, and
+/// refuses when ps cannot be read at all.
+pub(crate) fn vendor_between<'a>(
+    inner: &'a Inner,
+    pane_id: &str,
+    from: i32,
+    root: i32,
+) -> Option<(&'a Manifest, i32)> {
+    let pid = crate::identity::vendor_ancestor(from, root, |p| {
+        argv_bound_manifest(inner, pane_id, p).is_some()
+    })?;
+    argv_bound_manifest(inner, pane_id, pid).map(|m| (m, pid))
+}
+
+/// The agent instance this pane is running right now, by the same rule.
+///
+/// Starts from the terminal's foreground leader and walks up, so it lands
+/// on the agent whether the agent itself holds the tty or has handed it
+/// to something it spawned.
+pub(crate) fn admitted_vendor<'a>(inner: &'a Inner, row: &PaneRow) -> Option<(&'a Manifest, i32)> {
+    let leader = foreground_pid_checked(row.pane_pid)?;
+    vendor_between(inner, &row.pane_id, leader, row.pane_pid)
+}
+
 /// The manifest that claims this argv[0] basename, by either declared name.
 pub(crate) fn manifest_for_basename<'a>(
     manifests: &'a BTreeMap<String, Manifest>,
@@ -123,22 +185,79 @@ pub(crate) fn manifest_for_basename<'a>(
 /// `ps -o args=` on that pid "-zsh" — nothing in either sensor says
 /// "claude", so the pane bound no manifest and carried no state at all.
 ///
+/// The agent instance's identity, and the reason a pane id and a pane pid
+/// are not one.
+///
+/// `pane_pid` is the process tmux spawned, which for an interactive pane
+/// is the SHELL, and it does not change for the pane's whole life. Bind
+/// safety evidence to it and an agent can exit, another can be launched
+/// at the same prompt, and the second inherits everything the first was
+/// trusted for: same pane, same root pid, same command, same manifest.
+///
 /// The tty's foreground process group is the job the terminal is actually
 /// talking to, and a process group's id is its leader's pid, so `tpgid`
 /// resolves straight to the running agent. A shell idle at its prompt is
 /// its own foreground group and resolves back to `pane_pid` unchanged,
 /// which is what makes the agent's exit unbind the manifest again.
-fn foreground_pid(pane_pid: i32) -> i32 {
-    let Ok(out) = std::process::Command::new("ps")
+pub(crate) fn foreground_pid(pane_pid: i32) -> i32 {
+    foreground_pid_checked(pane_pid).unwrap_or(pane_pid)
+}
+
+/// The same lookup, with the observation failure kept separate from the
+/// answer.
+///
+/// [`foreground_pid`] reports the pane root when `ps` cannot be read. That
+/// is right for BINDING a manifest: a pane nobody can observe binds
+/// nothing new, and the shell is the honest fallback identity. It is wrong
+/// for holding a pin. A caller comparing a stored agent pid against a
+/// silently substituted shell pid compares two different domains and gets
+/// a confident wrong answer, so a pin resolves through this and treats
+/// `None` as the occupant being gone.
+pub(crate) fn foreground_pid_checked(pane_pid: i32) -> Option<i32> {
+    let out = std::process::Command::new("ps")
         .args(["-o", "tpgid=", "-p", &pane_pid.to_string()])
         .output()
-    else {
-        return pane_pid;
-    };
+        .ok()?;
     if !out.status.success() {
-        return pane_pid;
+        return None;
     }
-    parse_tpgid(&String::from_utf8_lossy(&out.stdout)).unwrap_or(pane_pid)
+    parse_tpgid(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Keep a pane's last verdict after its capture failed, as a refusal.
+///
+/// Reporting keeps the last known answer; writing must not. Marking it
+/// stale is what stops the gate from reading a retained clean composer as
+/// permission to paste (rule 12), and the restamp is where that becomes
+/// a refusal rather than a fact each reader has to re-derive.
+///
+/// It is written back, not just returned. The map is what status and
+/// every other consumer read, so handing the refusal to the immediate
+/// caller alone would leave all of them on the pre-failure record, which
+/// still says write_ready. `since` is left alone: the state did not
+/// change, only the confidence in it.
+fn retain_stale(
+    map: &mut std::collections::HashMap<String, DetEntry>,
+    pane_id: &str,
+    in_mode: bool,
+    occupant: Option<i32>,
+    manifest: Option<&str>,
+) -> Option<Detection> {
+    // Exact match on both, and an unprovable occupant matches nothing.
+    // A pane id names a place: an agent can exit and another start at the
+    // same shell prompt, inheriting the pane id, the root pid and often
+    // the manifest too. Retaining on the pane id alone would hand the
+    // newcomer a turn its predecessor was having, and the stale flag does
+    // not repair that. It blocks the write; the record still names the
+    // wrong agent as working.
+    let entry = map.get_mut(pane_id).filter(|e| {
+        occupant.is_some() && e.occupant == occupant && e.manifest.as_deref() == manifest
+    })?;
+    let mut p = entry.detection.clone();
+    p.stale = true;
+    let p = p.stamped(in_mode, entry.hold);
+    entry.detection = p.clone();
+    Some(p)
 }
 
 /// A `ps -o tpgid=` line as a pid. A pane with no controlling terminal
@@ -408,15 +527,28 @@ pub(crate) async fn recompute_pane(
     };
     let manifest = bind_manifest_for(inner, &row);
     let manifest_id = manifest.map(|m| m.agent.id.clone());
+    // Kept for the emitted event: the verdict below consumes manifest_id.
+    let source_manifest = manifest_id.clone().unwrap_or_default();
     let ts = unix_ms();
 
     if !row.dead && row.in_mode {
         // Copy-mode and friends gate delivery in M1; they are not agent
         // states. Keep the prior verdict; status exposes in_mode per row.
+        //
+        // Resolved before the lock: it spawns a process, and nothing else
+        // in the daemon should wait on the detection cache while a `ps`
+        // runs.
+        let occupant = foreground_pid_checked(row.pane_pid);
         let mut map = inner.detections.lock().expect("detections lock");
+        // Stamped INTO the cache, not just onto the returned copy. The
+        // cache is what status and pane.read read, so stamping only the
+        // return value would leave every surface reporting the readiness
+        // this pane had before the human started scrolling.
         let det = match map.get_mut(pane_id) {
             Some(e) => {
                 e.manifest = manifest_id;
+                e.occupant = occupant;
+                e.detection = e.detection.clone().stamped(true, e.hold);
                 e.detection.clone()
             }
             None => {
@@ -428,12 +560,15 @@ pub(crate) async fn recompute_pane(
                     stale: false,
                     write_ready: false,
                     write_block: None,
-                };
+                }
+                .stamped(true, ComposerHold::default());
                 map.insert(
                     pane_id.to_string(),
                     DetEntry {
                         detection: det.clone(),
                         manifest: manifest_id,
+                        occupant,
+                        hold: ComposerHold::default(),
                         since: std::time::Instant::now(),
                     },
                 );
@@ -464,20 +599,23 @@ pub(crate) async fn recompute_pane(
                     // Sensor failure is doubt, not evidence: keep the prior
                     // verdict rather than flipping state on a broken read.
                     debug!(pane = pane_id, error = %e, "capture failed; keeping prior state");
-                    let prior = inner
-                        .detections
-                        .lock()
-                        .expect("detections lock")
-                        .get(pane_id)
-                        .map(|entry| entry.detection.clone());
-                    if let Some(mut p) = prior {
-                        // Reporting keeps the last known answer; writing
-                        // must not. Marking it stale is what stops the
-                        // gate from reading a retained clean composer as
-                        // permission to paste (rule 12).
-                        p.stale = true;
+                    let retained = retain_stale(
+                        &mut inner.detections.lock().expect("detections lock"),
+                        pane_id,
+                        row.in_mode,
+                        foreground_pid_checked(row.pane_pid),
+                        manifest_id.as_deref(),
+                    );
+                    if let Some(p) = retained {
                         return Some(p);
                     }
+                    // Nothing cached describes whoever is in the pane now,
+                    // so there is nothing to retain. Fall through and let
+                    // the title tier answer for the current occupant: a
+                    // fresh reading of a different sensor is not
+                    // inheritance, it refuses the write on its own (no
+                    // screen reading, rule 12), and a verdict with no
+                    // reading at all is relabelled sensor_error below.
                     capture_failed = true;
                     (None, None)
                 }
@@ -520,6 +658,16 @@ pub(crate) async fn recompute_pane(
             let mut map = inner.hook_readings.lock().expect("hook readings lock");
             match map.get_mut(pane_id) {
                 None => None,
+                // A reading from a different occupant, or read under rules
+                // this pane no longer uses, is not a reading about this
+                // pane at all. Dropping it is the point: kept, it would
+                // let a predecessor's turn describe its successor.
+                Some(entry)
+                    if !entry.describes(foreground_pid(row.pane_pid), manifest_id.as_deref()) =>
+                {
+                    map.remove(pane_id);
+                    None
+                }
                 Some(entry) => match hook_action(entry, detection.state, ts) {
                     HookAction::Use => Some(entry.reading.clone()),
                     HookAction::Drop => {
@@ -542,9 +690,23 @@ pub(crate) async fn recompute_pane(
         }
     }
 
-    let prior = {
+    let occupant = foreground_pid_checked(row.pane_pid);
+    let (prior, detection) = {
         let mut map = inner.detections.lock().expect("detections lock");
-        let prior = map.get(pane_id).map(|e| e.detection.state);
+        let prior_entry = map.get(pane_id);
+        let prior = prior_entry.map(|e| e.detection.state);
+        // The hold describes one agent's composer, so a pane that changed
+        // hands starts with none: the new occupant never staged the old
+        // one's text, and an unprovable occupant is not the same occupant.
+        let hold = prior_entry
+            .filter(|e| occupant.is_some() && e.occupant == occupant)
+            .map(|e| e.hold)
+            .unwrap_or_default()
+            .advance(&detection);
+        // Stamped BEFORE it is cached, because the cache is what the gate
+        // and every status surface read. Stamping afterwards would leave
+        // them all reading a verdict nobody finished.
+        let detection = detection.stamped(row.in_mode, hold);
         // `since` marks the state CHANGING, so a recompute that confirms
         // the same state carries the old mark forward. Without this the
         // elapsed column would reset on every unrelated event.
@@ -557,10 +719,12 @@ pub(crate) async fn recompute_pane(
             DetEntry {
                 detection: detection.clone(),
                 manifest: manifest_id,
+                occupant,
+                hold,
                 since,
             },
         );
-        prior
+        (prior, detection)
     };
     // First sight of a pane that reads Unknown is baseline, not a change.
     let changed = prior != Some(detection.state)
@@ -573,7 +737,14 @@ pub(crate) async fn recompute_pane(
             cause,
             "fused state changed"
         );
-        inner.emit_state(session_idx, pane_id, &detection, prior, cause);
+        inner.emit_state(
+            session_idx,
+            pane_id,
+            &detection,
+            prior,
+            cause,
+            (foreground_pid(row.pane_pid), source_manifest.as_str()),
+        );
         // The border says what this row says, from the same edge. No
         // timer, no second rule: an adopted pane's chrome moves exactly
         // when the fused state it names moves.
@@ -612,6 +783,116 @@ line_regex = ['^FIXPROMPT']
 
     fn manifest() -> Manifest {
         Manifest::parse(FIXTURE, Path::new("bash.toml")).unwrap()
+    }
+
+    /// A failed capture has to leave the same refusal everywhere.
+    ///
+    /// The bug this pins: the retained verdict was returned to the caller
+    /// that asked for it and never written back, so `status` and every
+    /// other cache reader kept the pre-failure record, which still said
+    /// write_ready. Two consumers, two answers, from one observation
+    /// failure.
+    #[test]
+    fn a_failed_capture_refuses_in_the_cache_too() {
+        let clean = Detection {
+            state: AgentState::Idle,
+            readings: vec![SensorReading {
+                sensor: Sensor::Screen,
+                state: AgentState::Idle,
+                rule: "composer_empty".into(),
+                ts: 1,
+            }],
+            disagreement: false,
+            decided_by: "composer_empty".into(),
+            stale: false,
+            write_ready: false,
+            write_block: None,
+        }
+        .stamped(false, ComposerHold::Clear);
+        assert!(clean.write_ready, "fixture must start write-ready");
+
+        let mut map = std::collections::HashMap::new();
+        let since = std::time::Instant::now();
+        map.insert(
+            "%1".to_string(),
+            DetEntry {
+                detection: clean,
+                manifest: Some("bash".into()),
+                occupant: Some(4242),
+                hold: ComposerHold::Clear,
+                since,
+            },
+        );
+
+        let returned =
+            retain_stale(&mut map, "%1", false, Some(4242), Some("bash")).expect("same occupant");
+        let cached = &map["%1"].detection;
+        for (who, det) in [("returned", &returned), ("cached", cached)] {
+            assert!(det.stale, "{who} verdict is not marked stale");
+            assert!(!det.write_ready, "{who} verdict still authorizes a write");
+            assert_eq!(
+                det.write_block.as_deref(),
+                Some("stale_screen_evidence"),
+                "{who} verdict names the wrong reason"
+            );
+            assert_eq!(det.state, AgentState::Idle, "{who} state must not move");
+        }
+        assert_eq!(map["%1"].since, since, "confidence changed, not the state");
+    }
+
+    /// The pane id outlives the agent, so a retained verdict must not.
+    ///
+    /// Shape: agent A runs in a pane and is observed working. A exits back
+    /// to the same shell, agent B starts at the same prompt, and B's first
+    /// capture fails. Same pane id, same root pid, possibly the same
+    /// manifest. Retaining on pane id alone hands B a turn A was having,
+    /// and the stale flag does not fix that: it blocks the write, while
+    /// the record still says the wrong agent is working.
+    #[test]
+    fn a_retained_verdict_never_describes_a_replacement_occupant() {
+        let working = Detection {
+            state: AgentState::Working,
+            readings: vec![SensorReading {
+                sensor: Sensor::Screen,
+                state: AgentState::Working,
+                rule: "screen_busy".into(),
+                ts: 1,
+            }],
+            disagreement: false,
+            decided_by: "screen_busy".into(),
+            stale: false,
+            write_ready: false,
+            write_block: None,
+        }
+        .stamped(false, ComposerHold::Clear);
+        let entry_a = || DetEntry {
+            detection: working.clone(),
+            manifest: Some("agent-a".into()),
+            occupant: Some(111),
+            hold: ComposerHold::Clear,
+            since: std::time::Instant::now(),
+        };
+
+        // Each of these is a different occupant from A's: a new leader, a
+        // different manifest, and an unprovable foreground.
+        for (case, occupant, manifest) in [
+            ("agent B took the prompt", Some(222), Some("agent-a")),
+            ("the manifest changed", Some(111), Some("agent-b")),
+            ("nobody could prove it", None, Some("agent-a")),
+        ] {
+            let mut map = std::collections::HashMap::new();
+            map.insert("%1".to_string(), entry_a());
+            assert!(
+                retain_stale(&mut map, "%1", false, occupant, manifest).is_none(),
+                "{case}: A's verdict was handed to somebody else"
+            );
+            // Refusing to retain also has to leave A's record alone
+            // rather than half-editing it: the caller's fall-through is
+            // what replaces it, with readings taken for whoever is there.
+            let cached = &map["%1"];
+            assert_eq!(cached.occupant, Some(111), "{case}");
+            assert!(!cached.detection.stale, "{case}: A's record was edited");
+        }
     }
 
     #[test]
@@ -677,12 +958,16 @@ line_regex = ['^FIXPROMPT']
     }
 
     fn entry(state: AgentState, ts: u64) -> HookEntry {
-        HookEntry::new(SensorReading {
-            sensor: Sensor::Hook,
-            state,
-            rule: "Stop".into(),
-            ts,
-        })
+        HookEntry::bound(
+            0,
+            None,
+            SensorReading {
+                sensor: Sensor::Hook,
+                state,
+                rule: "Stop".into(),
+                ts,
+            },
+        )
     }
 
     #[test]

@@ -219,7 +219,10 @@ polling `cyclops status` in a loop.
 cyclops wait <agent> --until idle|done|blocked [--timeout 90s]
 ```
 
-- `idle` — the composer is ready and no turn is running.
+- `idle` means no turn is running. That is a statement about the turn, not
+  permission to write: whether a message may be pasted is the separate
+  write-readiness answer the daemon stamps, which `cyclops read <agent>
+  --source detection` shows beside the state.
 - `done` — the current or next turn ends (working → idle). If the agent is
   already idle, it must start and finish a turn first.
 - `blocked` — the agent hit a vendor modal, a permission prompt, or quota.

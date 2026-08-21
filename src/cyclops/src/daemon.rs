@@ -255,7 +255,9 @@ pub fn restart(home: &Path) -> Result<u32, RestartRefusal> {
     ) {
         Ok(c) => c,
         Err(ClientError::NotRunning) => {
-            return Err(RestartRefusal::Failed("cyclopsd is not running.".to_string()))
+            return Err(RestartRefusal::Failed(
+                "cyclopsd is not running.".to_string(),
+            ))
         }
         Err(e) => return Err(RestartRefusal::Failed(crate::copy::client_error(&e, None))),
     };

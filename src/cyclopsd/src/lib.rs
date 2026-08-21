@@ -250,6 +250,18 @@ pub(crate) struct DetEntry {
     pub(crate) detection: Detection,
     /// Manifest id bound at the last recompute.
     pub(crate) manifest: Option<String>,
+    /// The foreground process-group leader this verdict describes, when it
+    /// could be proven. A pane id names a place, not an occupant: an agent
+    /// can exit and another start at the same shell prompt, inheriting the
+    /// pane id, the root pid and the manifest. Without this, a retained
+    /// verdict is attributed to whoever is there now.
+    ///
+    /// None means nobody proved it, which never matches a proven binding.
+    pub(crate) occupant: Option<i32>,
+    /// What this pane's composer has proven since text was last seen
+    /// staged in it. Carried across recomputes, dropped with the
+    /// occupant: a hold is about one agent's composer, not the place.
+    pub(crate) hold: cyclops_proto::ComposerHold,
     /// When the fused STATE last changed, not when it was last computed.
     /// A recompute that lands on the same state keeps this, which is what
     /// lets `status` say "working for 13m" instead of "working since the
@@ -340,6 +352,7 @@ impl Inner {
         det: &Detection,
         prior: Option<AgentState>,
         cause: &str,
+        source: (i32, &str),
     ) {
         let target = self
             .label_of(pane_id)
@@ -360,6 +373,12 @@ impl Inner {
                 }),
             ),
         );
+        // The binding that produced this verdict travels with it. A pane
+        // id is reusable, so a consumer asking "is this event about my
+        // delivery" cannot answer from the id alone, and looking the row
+        // up later answers about whoever holds the pane by then rather
+        // than about whoever produced the event.
+        let (source_pid, source_manifest) = source;
         self.emit(
             "state",
             json!({
@@ -369,6 +388,8 @@ impl Inner {
                 "prior": prior,
                 "disagreement": det.disagreement,
                 "decided_by": det.decided_by,
+                "source_pid": source_pid,
+                "source_manifest": source_manifest,
             }),
             seq,
         );
@@ -585,7 +606,51 @@ impl Daemon {
     /// reporting pane via peer credentials and denies everything else,
     /// because hook reports are liveness and ACK evidence.
     pub async fn report_state(&self, params: StateReportParams) -> Result<Value, WireError> {
-        ack::handle_report(&self.inner, params).await
+        // The in-process path is pre-trusted, so it states the origin the
+        // socket path would have derived: the named pane, as it stands
+        // right now. A caller that names nothing cannot be placed.
+        let Some(name) = params.agent.clone() else {
+            return Err(WireError {
+                code: "denied".to_string(),
+                message: "an in-process report must name the pane it speaks for".to_string(),
+                data: None,
+            });
+        };
+        let (pane_id, pane_pid, manifest) = match self.inner.resolve_recipient(&name) {
+            Some((idx, pane_id)) => {
+                let row = self.inner.watcher_of(idx).and_then(|w| w.pane(&pane_id));
+                // Same domain the socket path derives and the ACK
+                // check re-derives: the agent instance proven from the
+                // process tree.
+                let admitted = row
+                    .as_ref()
+                    .and_then(|r| fusion::admitted_vendor(&self.inner, r));
+                let pid = admitted.as_ref().map(|(_, pid)| *pid).unwrap_or_default();
+                let manifest = admitted.map(|(m, _)| m.agent.id.clone());
+                (pane_id, pid, manifest)
+            }
+            // Detached, so the live table cannot place the pane. The
+            // last-known row can, and the socket path already derives
+            // origins from it during an outage. Dropping to a zero pid
+            // here instead refused every hook that fired inside the one
+            // window this whole path exists to cover.
+            None => match self.inner.resolve_recipient_last_known(&name) {
+                Some((_, row)) => {
+                    let admitted = fusion::admitted_vendor(&self.inner, &row);
+                    let pid = admitted.as_ref().map(|(_, pid)| *pid).unwrap_or_default();
+                    let manifest = admitted.map(|(m, _)| m.agent.id.clone());
+                    (row.pane_id.clone(), pid, manifest)
+                }
+                None => (name.clone(), 0, None),
+            },
+        };
+        let origin = server::ReportOrigin {
+            recipient: name,
+            pane_id,
+            pane_pid,
+            manifest,
+        };
+        ack::handle_report(&self.inner, params, origin).await
     }
 
     /// In-process hooks.verify: hook liveness for one target pane.

@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 pub enum AgentState {
     /// No evidence yet, or sensors disagree without a safe resolution.
     Unknown,
-    /// Composer ready, safe to inject.
+    /// No turn is running. A statement about the turn ONLY: whether the
+    /// composer is empty is the separate write-readiness question, and
+    /// `Detection::write_ready` is the one place it is answered (rule 12).
     Idle,
     /// Composer holds staged text. Injection would concatenate; unsafe.
     IdleWithInput,
@@ -33,11 +35,6 @@ pub enum AgentState {
 }
 
 impl AgentState {
-    /// True when the delivery pipeline may paste into this pane.
-    pub fn safe_to_inject(self) -> bool {
-        matches!(self, AgentState::Idle)
-    }
-
     /// True for states that should raise operator attention.
     pub fn is_blocked(self) -> bool {
         matches!(
@@ -110,8 +107,11 @@ pub enum Sensor {
     Title,
     /// %output activity from the control connection.
     Output,
-    /// capture-pane bottom-region rules from the manifest. Evidence of last
-    /// resort, and the only sensor that sees blocked states.
+    /// capture-pane bottom-region rules from the manifest. Consulted last,
+    /// because it costs a capture the title tier can often avoid, but not
+    /// a fallback: it is the only sensor that sees blocked states, and the
+    /// only one that can see a composer, so write-readiness REQUIRES a
+    /// positive clean-composer reading from it (rule 12).
     Screen,
 }
 
@@ -152,24 +152,95 @@ pub struct Detection {
     pub write_block: Option<String>,
 }
 
+/// What a pane's composer has proven since text was last seen staged in
+/// it.
+///
+/// Runtime idleness and an empty composer are different facts (rule 12),
+/// and so are an empty composer and a composer that was never holding
+/// anything. A screen rule reads one frame: a pane holding somebody's
+/// half-typed message can render as clean for a frame while it redraws,
+/// or while the text sits somewhere the rule does not look. Admitting a
+/// write on that frame pastes into a person's sentence.
+///
+/// So a pane that has been seen holding text stays refused until a TURN
+/// proves the text left, which is the only positive evidence any vendor
+/// gives. Nothing here is inferred from elapsed time or from a hook that
+/// did not arrive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerHold {
+    /// Nothing staged has been seen, or a turn has since consumed it.
+    #[default]
+    Clear,
+    /// Text was seen staged, and nothing has proven it left.
+    Staged,
+    /// A turn started while text was staged: the agent took it. The hold
+    /// lifts on the first clean-composer reading after the turn ends.
+    TurnStarted,
+}
+
+impl ComposerHold {
+    /// Advance the hold on one fused verdict.
+    ///
+    /// Only the two positive edges move it: seeing text staged, and a
+    /// turn running. A pane that goes quiet moves nothing, which is the
+    /// whole point.
+    pub fn advance(self, det: &Detection) -> ComposerHold {
+        match det.state {
+            // A pane whose process is gone holds nothing for anyone; the
+            // next occupant starts with no history.
+            AgentState::Dead => ComposerHold::Clear,
+            AgentState::IdleWithInput => ComposerHold::Staged,
+            AgentState::Working if self != ComposerHold::Clear => ComposerHold::TurnStarted,
+            AgentState::Idle if self == ComposerHold::TurnStarted && det.screen_says_clean() => {
+                ComposerHold::Clear
+            }
+            _ => self,
+        }
+    }
+
+    /// Does this hold refuse a write?
+    pub fn refuses(self) -> bool {
+        self != ComposerHold::Clear
+    }
+}
+
 impl Detection {
-    /// May a payload be written into this pane's composer right now?
+    /// Stamp the final readiness verdict: the sensor policy, then the
+    /// composer hold, then the pane's own mode. One writer, one answer,
+    /// and every surface, the gate included, reads the stamped fields
+    /// rather than re-deriving.
+    pub fn stamped(mut self, in_mode: bool, hold: ComposerHold) -> Detection {
+        if in_mode {
+            // Copy-mode is the human reading their own scrollback. The
+            // sensors can say whatever they like about the composer; the
+            // pane is not theirs to write into right now.
+            self.write_ready = false;
+            self.write_block = Some("pane_in_mode".to_string());
+            return self;
+        }
+        let mut det = self.with_write_block();
+        if det.write_ready && hold.refuses() {
+            det.write_ready = false;
+            det.write_block = Some("composer_hold".to_string());
+        }
+        det
+    }
+
+    /// Did the sensor that can see a composer say, just now, that it is
+    /// clean?
     ///
-    /// Runtime idleness and terminal write-readiness are different
-    /// questions (INVARIANTS rule 12). A turn-end hook proves generation
-    /// stopped; it cannot prove the composer is empty, and a pane whose
-    /// screen rules read `unknown` while a hook says `idle` is exactly the
-    /// shape of a long staged payload waiting to be pasted over.
-    ///
-    /// A write therefore needs positive, current, clean-composer evidence
-    /// from the sensor that can actually see the composer, and no live
-    /// reading that contradicts it. `Err` carries the reason for the gate
-    /// ledger line.
-    /// Stamp [`Self::write_block`] from the rule, for surfaces that
-    /// serialize a detection. Keeps one owner: the field is a rendering of
-    /// `write_ready`, never a second opinion.
-    pub fn with_write_block(mut self) -> Detection {
-        match self.write_ready() {
+    /// The one definition of that evidence, used by the readiness rule
+    /// and by the hold that releases on it. A title or a hook reports a
+    /// turn boundary, which is a different fact.
+    pub fn screen_says_clean(&self) -> bool {
+        self.readings
+            .iter()
+            .any(|r| r.sensor == Sensor::Screen && r.state == AgentState::Idle)
+    }
+
+    fn with_write_block(mut self) -> Detection {
+        match self.base_write_ready() {
             Ok(()) => {
                 self.write_ready = true;
                 self.write_block = None;
@@ -182,7 +253,14 @@ impl Detection {
         self
     }
 
-    pub fn write_ready(&self) -> Result<(), &'static str> {
+    /// The sensor half of write-readiness.
+    ///
+    /// Deliberately not public: it cannot see pane mode or any temporal
+    /// hold, so a caller consulting it directly would be answering a
+    /// narrower question than the one delivery asks and could overwrite
+    /// an authoritative refusal with a cheerful one. Fusion stamps the
+    /// final verdict onto the Detection; everyone else reads that.
+    fn base_write_ready(&self) -> Result<(), &'static str> {
         if self.state != AgentState::Idle {
             return Err("not_idle");
         }
@@ -208,11 +286,7 @@ impl Detection {
         // now, that the composer is clean. A manifest that cannot produce
         // that reading cannot authorize a write; that is a gap in the
         // manifest, not a licence to guess.
-        let screen_clean = self
-            .readings
-            .iter()
-            .any(|r| r.sensor == Sensor::Screen && r.state == AgentState::Idle);
-        if !screen_clean {
+        if !self.screen_says_clean() {
             return Err("no_clean_composer_evidence");
         }
         let conflict = self.readings.iter().any(|r| {
@@ -250,19 +324,30 @@ mod tests {
     }
 
     #[test]
-    fn only_idle_is_injectable() {
+    fn blocked_states_are_the_blocked_ones() {
+        // Runtime state no longer answers "may I write". It could not:
+        // idle says no turn is running, which a pane holding somebody's
+        // half-typed message also says. The answer lives on Detection,
+        // stamped once, with the evidence behind it.
+        // is_blocked still has to name exactly the three blocked states,
+        // so both directions are asserted: dropping a variant from the
+        // match and adding a non-blocked one both have to fail here.
         for s in [
-            AgentState::Unknown,
-            AgentState::IdleWithInput,
-            AgentState::Working,
             AgentState::BlockedModal,
             AgentState::BlockedPermission,
             AgentState::BlockedQuota,
+        ] {
+            assert!(s.is_blocked(), "{s} is a blocked state");
+        }
+        for s in [
+            AgentState::Unknown,
+            AgentState::Idle,
+            AgentState::IdleWithInput,
+            AgentState::Working,
             AgentState::Dead,
         ] {
-            assert!(!s.safe_to_inject(), "{s} must not be injectable");
+            assert!(!s.is_blocked(), "{s} is not a blocked state");
         }
-        assert!(AgentState::Idle.safe_to_inject());
     }
 }
 
@@ -308,7 +393,7 @@ mod write_ready_tests {
         d.decided_by = "hook:Stop".into();
         // The hook stood in for a screen that read nothing, which is the
         // exact shape of a composer holding a long staged payload.
-        assert_eq!(d.write_ready(), Err("hook_derived_idle"));
+        assert_eq!(d.base_write_ready(), Err("hook_derived_idle"));
     }
 
     /// A hook edge with no screen reading at all cannot authorize a write:
@@ -321,7 +406,7 @@ mod write_ready_tests {
             false,
         );
         d.decided_by = "hook:Stop".into();
-        assert_eq!(d.write_ready(), Err("hook_derived_idle"));
+        assert_eq!(d.base_write_ready(), Err("hook_derived_idle"));
     }
 
     /// The reverse race: screen rules say idle while a live hook says
@@ -337,7 +422,7 @@ mod write_ready_tests {
             ],
             true,
         );
-        assert_eq!(d.write_ready(), Err("sensor_disagreement"));
+        assert_eq!(d.base_write_ready(), Err("sensor_disagreement"));
     }
 
     /// Staged input is the whole point of the rule.
@@ -348,7 +433,7 @@ mod write_ready_tests {
             vec![reading(Sensor::Screen, AgentState::IdleWithInput)],
             false,
         );
-        assert_eq!(d.write_ready(), Err("not_idle"));
+        assert_eq!(d.base_write_ready(), Err("not_idle"));
     }
 
     /// The one shape that admits a write: the sensor that sees the
@@ -363,7 +448,7 @@ mod write_ready_tests {
             ],
             false,
         );
-        assert_eq!(d.write_ready(), Ok(()));
+        assert_eq!(d.base_write_ready(), Ok(()));
     }
 
     /// Fusion keeps the prior verdict when a forced capture fails, which
@@ -377,8 +462,99 @@ mod write_ready_tests {
             vec![reading(Sensor::Screen, AgentState::Idle)],
             false,
         );
-        assert_eq!(d.write_ready(), Ok(()));
+        assert_eq!(d.base_write_ready(), Ok(()));
         d.stale = true;
-        assert_eq!(d.write_ready(), Err("stale_screen_evidence"));
+        assert_eq!(d.base_write_ready(), Err("stale_screen_evidence"));
+    }
+
+    /// Copy-mode is the human reading their own scrollback, and it
+    /// outranks whatever the sensors think of the composer. The stamp is
+    /// where the two are combined, once, so no surface can answer this
+    /// question differently from the gate.
+    #[test]
+    fn pane_mode_refuses_however_clean_the_screen_is() {
+        let clean = det(
+            AgentState::Idle,
+            vec![reading(Sensor::Screen, AgentState::Idle)],
+            false,
+        );
+        assert_eq!(clean.base_write_ready(), Ok(()));
+        let stamped = clean.clone().stamped(true, ComposerHold::Clear);
+        assert!(!stamped.write_ready);
+        assert_eq!(stamped.write_block.as_deref(), Some("pane_in_mode"));
+        let stamped = clean.clone().stamped(false, ComposerHold::Clear);
+        assert!(stamped.write_ready);
+        assert_eq!(stamped.write_block, None);
+    }
+
+    /// One frame of a clean composer is not proof the composer is empty.
+    ///
+    /// A pane holding somebody's half-typed message can render clean
+    /// while it redraws, or while the text sits somewhere the screen rule
+    /// does not look. The sensor rule cannot tell that frame from a
+    /// genuinely empty composer, which is why the hold is a separate
+    /// answer and why it outranks a clean reading.
+    #[test]
+    fn a_pane_that_was_holding_text_refuses_a_clean_frame() {
+        let clean = det(
+            AgentState::Idle,
+            vec![reading(Sensor::Screen, AgentState::Idle)],
+            false,
+        );
+        for hold in [ComposerHold::Staged, ComposerHold::TurnStarted] {
+            let stamped = clean.clone().stamped(false, hold);
+            assert!(!stamped.write_ready, "{hold:?} admitted a write");
+            assert_eq!(stamped.write_block.as_deref(), Some("composer_hold"));
+        }
+    }
+
+    /// The hold moves on positive edges only: text seen staged, and a
+    /// turn running. Silence moves nothing, and nothing here reads a
+    /// clock.
+    #[test]
+    fn the_hold_releases_only_on_a_completed_turn() {
+        let clean = det(
+            AgentState::Idle,
+            vec![reading(Sensor::Screen, AgentState::Idle)],
+            false,
+        );
+        let staged = det(
+            AgentState::IdleWithInput,
+            vec![reading(Sensor::Screen, AgentState::IdleWithInput)],
+            false,
+        );
+        let working = det(
+            AgentState::Working,
+            vec![reading(Sensor::Screen, AgentState::Working)],
+            false,
+        );
+        // Somebody's text is in the composer.
+        let h = ComposerHold::Clear.advance(&staged);
+        assert_eq!(h, ComposerHold::Staged);
+        // It stops being visible. That is not evidence it left, so a
+        // clean frame, however many times it repeats, changes nothing.
+        let h = h.advance(&clean).advance(&clean).advance(&clean);
+        assert_eq!(h, ComposerHold::Staged);
+        assert!(h.refuses());
+        // A turn starts: the agent took the text.
+        let h = h.advance(&working);
+        assert_eq!(h, ComposerHold::TurnStarted);
+        // The turn ending is still not enough on its own. Only a turn
+        // that ends WITH a clean composer releases it, and the clean
+        // half has to come from the screen.
+        let title_only = det(
+            AgentState::Idle,
+            vec![reading(Sensor::Title, AgentState::Idle)],
+            false,
+        );
+        assert_eq!(h.advance(&title_only), ComposerHold::TurnStarted);
+        assert_eq!(h.advance(&clean), ComposerHold::Clear);
+    }
+
+    /// A pane whose process is gone holds nothing for whoever comes next.
+    #[test]
+    fn death_clears_the_hold() {
+        let dead = det(AgentState::Dead, vec![], false);
+        assert_eq!(ComposerHold::Staged.advance(&dead), ComposerHold::Clear);
     }
 }

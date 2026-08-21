@@ -131,6 +131,11 @@ impl PaneRow {
             width: self.width,
             height: self.height,
             state,
+            // Readiness is fusion's stamp, and the adapter has no fusion:
+            // refused here, filled in by the daemon alongside the fields
+            // below. Absent evidence is not permission.
+            write_ready: false,
+            write_block: None,
             // Elapsed-in-state, hook liveness, and the manifest's display
             // name are daemon knowledge; the daemon fills all three in.
             state_ms: None,

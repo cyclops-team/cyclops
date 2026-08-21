@@ -253,6 +253,15 @@ pub struct PaneStatus {
     pub current_command: String,
     pub dead: bool,
     pub in_mode: bool,
+    /// The second status answer, additive and stamped by fusion: may a
+    /// terminal write go into this pane right now. `state` alone cannot
+    /// say, because idle means no turn is running, which is also true of a
+    /// pane holding somebody's half-typed message. An older daemon sends
+    /// neither field, and absent evidence is not permission.
+    #[serde(default)]
+    pub write_ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_block: Option<String>,
     pub width: u32,
     pub height: u32,
     pub state: AgentState,
@@ -389,7 +398,10 @@ pub struct WaitSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WaitUntil {
-    /// Composer ready, no turn running.
+    /// No turn is running. A runtime state only: reaching it does NOT
+    /// prove the composer is empty or that a write would be accepted.
+    /// Write-readiness is `Detection::write_ready`, and delivery asks it
+    /// again at paste time regardless of what a wait returned.
     Idle,
     /// The turn started by our delivery ended.
     Done,
@@ -501,10 +513,20 @@ pub struct AgentWaitParams {
 /// detectable (hooks are separate short-lived processes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateReportParams {
-    /// Cyclops label of the reporting agent pane.
-    pub agent: String,
+    /// Cyclops label of the reporting agent pane, when the hook knows it.
+    ///
+    /// Optional because a hook often does not know it. The daemon derives
+    /// the reporting origin from the authenticated socket peer, which it
+    /// must compute anyway to verify the report; a value supplied here is
+    /// an ASSERTION about that origin, checked against it and denied when
+    /// it disagrees, never trusted on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// Normalized event name, e.g. "UserPromptSubmit", "Stop".
     pub event: String,
+    /// Per-label counter, sent only by a client that HAS a label. A
+    /// label-free report carries none, so a dedupe window is never keyed
+    /// by a name the daemon has not verified.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
     /// Raw vendor payload, passed through for matching and audit.

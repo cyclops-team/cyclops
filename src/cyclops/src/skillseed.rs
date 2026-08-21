@@ -32,14 +32,18 @@ pub fn skill_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("skills").join("cyclops").join("SKILL.md")
 }
 
-/// FNV-1a 64 of every skill body this project has ever shipped, the
-/// current one included. Same contract as
-/// `crate::manifests::EVER_SHIPPED_FNV64`: a file on disk whose hash is
-/// in this list is a seed nobody edited, so a newer shipped body may
-/// replace it; any other content is the operator's and is never touched.
-/// The test below fails until the current body is listed, and prints the
-/// hash to append.
-const EVER_SHIPPED_FNV64: &[&str] = &["7ebc1453af11b931", "c626205b3d1fa685"];
+/// FNV-1a 64 of every skill body this project has released, the current
+/// one included. Same contract as `crate::manifests::EVER_SHIPPED_FNV64`:
+/// a file on disk whose hash is in this list is a seed nobody edited, so
+/// a newer shipped body may replace it; any other content is the
+/// operator's and is never touched. The test below fails until the
+/// current body is listed, and prints the hash to append.
+///
+/// Released, not every body that ever compiled. A hash here is permission
+/// to overwrite a file on somebody's disk, and an unreleased intermediate
+/// was never seeded onto one, so listing it would only claim that
+/// authority over bytes that could just as well be an operator's own.
+const EVER_SHIPPED_FNV64: &[&str] = &["7ebc1453af11b931", "cf5916d45a60081c"];
 
 /// FNV-1a 64, hex. Same non-cryptographic question as the manifest seed:
 /// "did the operator edit this file", not "is this an attack".

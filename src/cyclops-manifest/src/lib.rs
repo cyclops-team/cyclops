@@ -37,6 +37,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+pub use regex::Regex;
+
 use cyclops_proto::AgentState;
 use serde::Deserialize;
 
@@ -86,6 +88,9 @@ pub struct Manifest {
     pub composer_trailers: Vec<regex::Regex>,
     /// Compiled `injection.composer_trailer_regex_esc`.
     pub composer_trailers_esc: Vec<regex::Regex>,
+    /// Compiled collapsed-chip row patterns, plain and escaped.
+    pub composer_chips: Vec<regex::Regex>,
+    pub composer_chips_esc: Vec<regex::Regex>,
     /// Source path, for reload and error messages.
     pub path: PathBuf,
 }
@@ -258,6 +263,26 @@ impl CompiledMatcher {
     }
 }
 
+impl CompiledRule {
+    /// Does this rule hold for ONE row, given in both forms?
+    ///
+    /// For callers that have already isolated a row and need to know
+    /// whether the manifest recognizes it. Going through the rule keeps
+    /// the manifest's own semantics: clauses within a matcher AND
+    /// together, `any` alternatives are alternatives, and an esc clause
+    /// with no escaped capture fails closed. A caller that reimplements
+    /// this as "plain matched OR escaped matched" quietly weakens every
+    /// rule that relies on both halves, and the vendor's plain pattern
+    /// stops being load-bearing without anyone noticing.
+    pub fn matches_row(&self, plain: &str, esc: &str) -> bool {
+        let lines = [plain];
+        let esc_lines = [esc];
+        std::iter::once(&self.matcher)
+            .chain(self.any.iter())
+            .any(|m| m.matches_esc(plain, &lines, Some(&esc_lines)))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CompiledRule {
     pub id: String,
@@ -322,6 +347,29 @@ pub struct Injection {
     /// escaped capture is available.
     #[serde(default)]
     pub composer_trailer_regex_esc: Vec<String>,
+    /// How many of those rows are REQUIRED, counted from the top of the
+    /// layout. The rows below a composer are not an unordered set: the
+    /// vendor paints its box rule and status row every time, its hint or
+    /// mode rows only sometimes. Without this the anchors can simply be
+    /// absent while an arbitrary plausible tail still passes. Zero,
+    /// missing, or larger than the layout means the layout is not
+    /// measured, and the sentinel path refuses.
+    #[serde(default)]
+    pub composer_trailer_required_prefix: usize,
+    /// The vendor's collapsed-paste chip, as a WHOLE composer row, in
+    /// plain and escaped form. Both are required together.
+    ///
+    /// This replaced a substring test. A generic `verify_pattern` such as
+    /// "Pasted" was matched anywhere on a composer row, so a message whose
+    /// own subject contained that word verified a paste whose sentinel had
+    /// never arrived: the truncated payload submitted itself. A chip is a
+    /// specific rendering, so proving it means matching the row the vendor
+    /// actually draws, styling included. A manifest with no measured chip
+    /// syntax has no chip lane at all.
+    #[serde(default)]
+    pub composer_chip_regex: Vec<String>,
+    #[serde(default)]
+    pub composer_chip_regex_esc: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -471,11 +519,45 @@ impl Manifest {
             &raw.injection.composer_trailer_regex_esc,
             "injection.composer_trailer_regex_esc",
         )?;
+        let composer_chips = compile_trailers(
+            &raw.injection.composer_chip_regex,
+            "injection.composer_chip_regex",
+        )?;
+        let composer_chips_esc = compile_trailers(
+            &raw.injection.composer_chip_regex_esc,
+            "injection.composer_chip_regex_esc",
+        )?;
+        if composer_chips.len() != composer_chips_esc.len() {
+            return Err(ManifestError::BadRegion {
+                id: raw.agent.id.clone(),
+                rule: "injection.composer_chip_regex_esc".into(),
+                region: format!(
+                    "{} escaped chip rows against {} plain",
+                    composer_chips_esc.len(),
+                    composer_chips.len()
+                ),
+            });
+        }
+        // A required prefix is a claim about a measured layout, so it is
+        // only meaningful when the layout is actually there. Declaring one
+        // without the rows, or a count the rows cannot satisfy, describes
+        // nothing.
+        let required = raw.injection.composer_trailer_required_prefix;
+        let declares_layout = !composer_trailers.is_empty() || !composer_trailers_esc.is_empty();
+        if (declares_layout || required != 0)
+            && (required == 0 || required > composer_trailers.len())
+        {
+            return Err(ManifestError::BadRegion {
+                id: raw.agent.id.clone(),
+                rule: "injection.composer_trailer_required_prefix".into(),
+                region: format!("{required} required of {} rows", composer_trailers.len()),
+            });
+        }
         // The two lists are one layout described twice: entry i is row i of
         // the measured sequence below the composer, in plain and escaped
         // form. Different lengths mean the layout is not actually measured,
         // and a half-described layout must not verify anything.
-        if !composer_trailers_esc.is_empty()
+        if (!composer_trailers.is_empty() || !composer_trailers_esc.is_empty())
             && composer_trailers_esc.len() != composer_trailers.len()
         {
             return Err(ManifestError::BadRegion {
@@ -495,6 +577,8 @@ impl Manifest {
             injection: raw.injection,
             composer_trailers,
             composer_trailers_esc,
+            composer_chips,
+            composer_chips_esc,
             path: path.into(),
         })
     }
@@ -561,7 +645,11 @@ impl Manifest {
     /// rule set needs an SGR-escaped capture (capture-pane -e) to fire.
     /// The daemon uses this to decide whether to take the second capture.
     pub fn has_escaped_rules(&self) -> bool {
-        !self.composer_trailers_esc.is_empty()
+        // A chip-only manifest declares its escaped proof here and
+        // nowhere else; without this it would be handed a plain capture
+        // and could never satisfy the very pattern it declared.
+        !self.composer_chips_esc.is_empty()
+            || !self.composer_trailers_esc.is_empty()
             || self.rules.iter().any(|r| {
                 !r.matcher.line_regex_esc.is_empty()
                     || r.any.iter().any(|m| !m.line_regex_esc.is_empty())
@@ -849,5 +937,58 @@ verify_pattern = ["<message_id>"]
             .evaluate("mac", "⚠ Individual quota reached. Please upgrade your subscription to increase your limits.")
             .unwrap();
         assert_eq!(quota.state, AgentState::BlockedQuota);
+    }
+}
+
+#[cfg(test)]
+mod trailer_layout_tests {
+    use super::*;
+
+    fn parse(body: &str) -> Result<Manifest, ManifestError> {
+        let src = format!("[agent]\nid = \"t\"\ndisplay_name = \"t\"\n\n[injection]\n{body}");
+        Manifest::parse(&src, Path::new("t.toml"))
+    }
+
+    /// A layout is two descriptions of the same rows plus how many of them
+    /// are mandatory. Every way of describing it incompletely is a load
+    /// error rather than a lane that silently never verifies.
+    #[test]
+    fn a_half_described_layout_is_a_load_error() {
+        let plain = "composer_trailer_regex = ['^a$', '^b$']\n";
+        let esc = "composer_trailer_regex_esc = ['^a$', '^b$']\n";
+        let req = "composer_trailer_required_prefix = 2\n";
+
+        assert!(
+            parse(&format!("{plain}{esc}{req}")).is_ok(),
+            "complete layout"
+        );
+
+        for (case, body) in [
+            ("missing required prefix", format!("{plain}{esc}")),
+            (
+                "zero required",
+                format!("{plain}{esc}composer_trailer_required_prefix = 0\n"),
+            ),
+            (
+                "required out of range",
+                format!("{plain}{esc}composer_trailer_required_prefix = 3\n"),
+            ),
+            ("plain only", format!("{plain}{req}")),
+            ("escaped only", format!("{esc}{req}")),
+            (
+                "length mismatch",
+                format!("{plain}composer_trailer_regex_esc = ['^a$']\n{req}"),
+            ),
+        ] {
+            assert!(parse(&body).is_err(), "{case} must not load");
+        }
+    }
+
+    /// A manifest that declares no layout at all still loads: it simply
+    /// cannot use the sentinel path.
+    #[test]
+    fn no_layout_at_all_is_not_an_error() {
+        let m = parse("submit = \"Enter\"\n").expect("loads");
+        assert!(m.composer_trailers.is_empty());
     }
 }

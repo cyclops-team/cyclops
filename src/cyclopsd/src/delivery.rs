@@ -219,6 +219,12 @@ pub(crate) struct DeliveryHandle {
     /// impostor that swaps in between must read occupant_changed, never a
     /// report about itself. 0 until a submit happened.
     submitted_pid: AtomicI32,
+    /// The manifest bound to the pane when the submit key was sent. Paired
+    /// with `submitted_pid` it is the delivery's BINDING: the process and
+    /// the vendor rules that Enter actually reached. Receipt evidence is
+    /// only evidence about that binding, so a replacement occupant cannot
+    /// resolve, or upgrade, a delivery it never received.
+    submitted_manifest: StdMutex<Option<String>>,
 }
 
 struct HandleState {
@@ -233,6 +239,24 @@ struct HandleState {
 }
 
 impl DeliveryHandle {
+    /// Is this report from the process and rules the submit key reached?
+    ///
+    /// False before a submit has happened at all, which is the point: the
+    /// ACK registry is deliberately populated earlier so a fast hook is
+    /// not missed, and a delivery that has not been submitted has no
+    /// binding for a hook to match.
+    fn submitted_binding_is(&self, pid: i32, manifest_id: &str) -> bool {
+        let want_pid = self.submitted_pid.load(Ordering::SeqCst);
+        if want_pid == 0 || want_pid != pid {
+            return false;
+        }
+        self.submitted_manifest
+            .lock()
+            .expect("submitted manifest lock")
+            .as_deref()
+            == Some(manifest_id)
+    }
+
     fn new(
         msg_id: &str,
         to: &str,
@@ -272,6 +296,7 @@ impl DeliveryHandle {
             early_ack: AtomicBool::new(false),
             working_seen: AtomicBool::new(false),
             submitted_pid: AtomicI32::new(0),
+            submitted_manifest: StdMutex::new(None),
         })
     }
 
@@ -1757,6 +1782,16 @@ impl AttemptFailure {
         }
     }
 
+    /// The pane changed hands after Enter. Terminal, and after the write
+    /// boundary: the original occupant may well have received the message,
+    /// so this says the outcome is unknown rather than claiming a failure.
+    fn receipt_occupant_changed() -> Self {
+        Self {
+            cause: "receipt_occupant_changed".into(),
+            boundary: WriteBoundary::AfterWrite,
+        }
+    }
+
     fn ack_timeout() -> Self {
         Self {
             cause: "ack_timeout".into(),
@@ -1813,12 +1848,54 @@ async fn attempt_delivery(
         gate_line(inner, handle, "rebound", None, Some(&detail));
         return AttemptOutcome::Failed(AttemptFailure::pane_rebound_before_paste());
     }
-    let (staged_window, id_staged) = match inject(&injector, handle, manifest).await {
-        Ok(v) => v,
-        Err(cause) => {
-            return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
+    // The gate's clean-composer evidence was current when it admitted, and
+    // admission is a decision about a moment. A person can start typing in
+    // the gap that follows, and the occupant re-check above would not
+    // notice: same pane, same pid, same manifest, new draft. So the
+    // readiness rule is asked again here, against a capture taken now,
+    // immediately before the write that cannot be taken back.
+    match fusion::recompute_pane(
+        inner,
+        handle.session_idx,
+        &watcher,
+        &handle.pane_id,
+        true,
+        "pre_paste",
+    )
+    .await
+    {
+        Some(det) => {
+            // Permission is a positive stamp, never the absence of a
+            // refusal: an unstamped verdict means nobody decided, and
+            // nobody deciding is not the same as deciding yes.
+            if !det.write_ready {
+                let reason = det.write_block.as_deref().unwrap_or("unstamped");
+                gate_line(
+                    inner,
+                    handle,
+                    "hold",
+                    None,
+                    Some(&format!("not_write_ready:{reason}")),
+                );
+                return AttemptOutcome::Failed(AttemptFailure::pane_rebound_before_paste());
+            }
         }
-    };
+        None => return AttemptOutcome::Failed(AttemptFailure::session_detached()),
+    }
+    // That recompute took a capture, so who owns the pane is checked again
+    // after it: otherwise the newest fact about the composer would rest on
+    // an older fact about whose composer it is.
+    if let Err(detail) = occupant_unchanged(inner, &watcher, handle, manifest_id, admitted_pid) {
+        gate_line(inner, handle, "rebound", None, Some(&detail));
+        return AttemptOutcome::Failed(AttemptFailure::pane_rebound_before_paste());
+    }
+    let (staged_window, id_staged, payload_at_proof) =
+        match inject(&injector, handle, manifest).await {
+            Ok(v) => v,
+            Err(cause) => {
+                return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
+            }
+        };
     if !advance(
         inner,
         handle,
@@ -1827,9 +1904,7 @@ async fn attempt_delivery(
     ) {
         return AttemptOutcome::Done;
     }
-    // Register for hook ACK matching before the submit key: the measured
-    // hook edge is 21-28ms after Enter and must not race the registry.
-    register_ack(inner, handle);
+
     let submit_key = if manifest.injection.submit.is_empty() {
         "Enter"
     } else {
@@ -1843,9 +1918,66 @@ async fn attempt_delivery(
         gate_line(inner, handle, "rebound", None, Some(&detail));
         return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
     }
+    // Verification proved a representation at a moment, and Enter is sent
+    // at a later one. A person can append to the staged text, or replace
+    // it, in between; pressing Enter then submits something nobody
+    // verified and nobody wrote. So the exact staged representation is
+    // proven again here, from a capture taken now.
+    let recheck = if manifest.has_escaped_rules() {
+        injector.capture_escaped(&handle.pane_id).await
+    } else {
+        injector.capture(&handle.pane_id).await
+    };
+    match recheck {
+        Ok(now) => {
+            // Not just "something valid is staged": the SAME thing must be
+            // staged. A human can replace one verified representation with
+            // another between the proof and the key, and a check that only
+            // asks "is this a valid staging?" would wave that through.
+            let (id_patterns, other_patterns) = verify_patterns(manifest, &handle.msg_id);
+            let still_staged = staged_verified(
+                manifest,
+                &now,
+                &id_patterns,
+                &other_patterns,
+                &handle.msg_id,
+            );
+            if payload_proof(manifest, &now, &handle.msg_id).as_deref()
+                != Some(payload_at_proof.as_str())
+                || still_staged != Some(id_staged)
+            {
+                unregister_ack(inner, handle);
+                gate_line(inner, handle, "rebound", None, Some("staging_changed"));
+                return AttemptOutcome::Failed(AttemptFailure::verify_failed());
+            }
+        }
+        Err(_) => {
+            // Nobody looked, so nobody may press Enter.
+            unregister_ack(inner, handle);
+            gate_line(inner, handle, "rebound", None, Some("recheck_unobservable"));
+            return AttemptOutcome::Failed(AttemptFailure::verify_failed());
+        }
+    }
+    // The capture above took time, so the occupant is checked once more
+    // after it. Otherwise the last thing proven about who owns the pane is
+    // older than the last thing proven about what is in it.
+    if let Err(detail) = occupant_unchanged(inner, &watcher, handle, manifest_id, admitted_pid) {
+        unregister_ack(inner, handle);
+        gate_line(inner, handle, "rebound", None, Some(&detail));
+        return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
+    }
     // The occupant re-check just passed: admitted_pid IS the process the
     // submit key goes to. Send-and-wait pins its wait on this pid.
     handle.submitted_pid.store(admitted_pid, Ordering::SeqCst);
+    *handle
+        .submitted_manifest
+        .lock()
+        .expect("submitted manifest lock") = Some(manifest_id.to_string());
+    // Registered here, after every proof and immediately before the key:
+    // the measured hook edge lands 21-28ms after Enter, so this is early
+    // enough, and it closes the window where a stale ACK from the same
+    // occupant could set the early flag before any submit was attempted.
+    register_ack(inner, handle);
     if let Err(cause) = injector.submit(&handle.pane_id, submit_key).await {
         unregister_ack(inner, handle);
         debug_assert_eq!(cause, "submit_failed");
@@ -1891,7 +2023,42 @@ async fn attempt_delivery(
             unregister_ack(inner, handle);
             AttemptOutcome::Failed(AttemptFailure::ack_timeout())
         }
+        AckOutcome::Rebound => {
+            unregister_ack(inner, handle);
+            AttemptOutcome::Failed(AttemptFailure::receipt_occupant_changed())
+        }
     }
+}
+
+/// Is the pane still held by the process and rules that Enter reached?
+///
+/// Receipt evidence answers "did the message land", and it can only
+/// answer that about the occupant it was sent to. A pane id is reusable,
+/// so a replacement process can clear the marker, change the window, emit
+/// output, and even fire a hook carrying the old message id. None of that
+/// is evidence about the delivery, and treating it as evidence is how a
+/// record starts to lie.
+fn submitted_binding_holds(
+    inner: &Arc<Inner>,
+    watcher: &Arc<SessionWatcher>,
+    handle: &Arc<DeliveryHandle>,
+) -> bool {
+    let want_pid = handle.submitted_pid.load(Ordering::SeqCst);
+    let want_manifest = handle
+        .submitted_manifest
+        .lock()
+        .expect("submitted manifest lock")
+        .clone();
+    let (Some(want_manifest), Some(row)) = (want_manifest, watcher.pane(&handle.pane_id)) else {
+        return false;
+    };
+    // The agent instance, not the pane's root process: a shell outlives
+    // the agent that ran inside it, so pinning the root would let the
+    // next agent launched at the same prompt inherit this delivery.
+    if row.dead || fusion::foreground_pid(row.pane_pid) != want_pid {
+        return false;
+    }
+    fusion::bind_manifest_for(inner, &row).is_some_and(|m| m.agent.id == want_manifest)
 }
 
 /// Pane-rebind re-check between the gate's admitting recompute and the
@@ -1919,7 +2086,7 @@ fn occupant_unchanged(
     if row.in_mode {
         return Err("pane_in_mode".to_string());
     }
-    if row.pane_pid != admitted_pid {
+    if fusion::foreground_pid(row.pane_pid) != admitted_pid {
         return Err("pane_pid_changed".to_string());
     }
     match fusion::bind_manifest_for(inner, &row) {
@@ -2129,8 +2296,23 @@ async fn gate(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> GateOutcome {
                             // the pane in idle while the composer holds a
                             // staged payload the screen sensor could not
                             // read; proceeding there pastes over it.
-                            match det.write_ready() {
-                                Ok(()) => {
+                            match (det.write_ready, det.write_block.as_deref()) {
+                                (true, _) => {
+                                    // The admitted pid is what every
+                                    // receipt is later held against, so an
+                                    // unreadable process table is a
+                                    // refusal, not a shrug. Falling back
+                                    // to the pane root here would pin the
+                                    // delivery to the SHELL and then
+                                    // resolve receipts against whoever
+                                    // sits at that prompt next.
+                                    let Some(pane_pid) =
+                                        fusion::foreground_pid_checked(row.pane_pid)
+                                    else {
+                                        return GateOutcome::Attention {
+                                            cause: "occupant_unprovable".to_string(),
+                                        };
+                                    };
                                     gate_line(
                                         inner,
                                         handle,
@@ -2140,14 +2322,17 @@ async fn gate(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> GateOutcome {
                                     );
                                     return GateOutcome::Proceed {
                                         manifest_id,
-                                        pane_pid: row.pane_pid,
+                                        pane_pid,
                                     };
                                 }
                                 // Hold on an event, never a clock: the next
                                 // pane change re-evaluates, and a screen
                                 // sensor that can see the composer resolves
                                 // it without anyone pasting blind.
-                                Err(reason) => Some(format!("not_write_ready:{reason}")),
+                                (false, reason) => Some(format!(
+                                    "not_write_ready:{}",
+                                    reason.unwrap_or("unstamped")
+                                )),
                             }
                         }
                         AgentState::Dead => {
@@ -2509,7 +2694,7 @@ async fn inject<I: Injector>(
     injector: &I,
     handle: &Arc<DeliveryHandle>,
     manifest: &Manifest,
-) -> Result<(String, bool), String> {
+) -> Result<(String, bool, String), String> {
     injector.paste(&handle.pane_id, &handle.payload).await?;
     let (id_patterns, other_patterns) = verify_patterns(manifest, &handle.msg_id);
     // The capture flavor follows the manifest's composer discriminators:
@@ -2544,6 +2729,7 @@ async fn inject<I: Injector>(
                     return Ok((
                         bottom_window(&strip_csi(&screen), COMPOSER_WINDOW),
                         id_staged,
+                        payload_proof(manifest, &screen, &handle.msg_id).unwrap_or_default(),
                     ));
                 }
             }
@@ -2573,7 +2759,7 @@ fn staged_verified(
     manifest: &Manifest,
     screen: &str,
     _id_patterns: &[String],
-    other_patterns: &[String],
+    _other_patterns: &[String],
     msg_id: &str,
 ) -> Option<bool> {
     // 1. Whole-payload evidence.
@@ -2581,7 +2767,7 @@ fn staged_verified(
         return Some(true);
     }
     // 2. The vendor's collapsed representation.
-    if marker_in_composer(manifest, screen, other_patterns) {
+    if marker_in_composer(manifest, screen) {
         return Some(false);
     }
     None
@@ -2600,15 +2786,22 @@ fn staged_verified(
 ///
 /// 1. The layout is measured for this vendor, and an escaped capture is in
 ///    hand. Neither is inferable, so both missing means refuse.
-/// 2. The exact sentinel for this delivery appears as a whole row.
+/// 2. The exact sentinel for this delivery appears as a whole row, and
+///    exactly once. The comparison keeps left-side bytes: a row reading
+///    " [cyclops:end <id>]" carries a leading space that the composer put
+///    there, and two identical sentinels are an ambiguity about which one
+///    transport owns rather than a reason to prefer the lower.
 /// 3. At least one row follows it. Every measured vendor paints chrome
 ///    below the composer, so a capture that ends at the sentinel is a
 ///    capture that did not see the composer.
-/// 4. The rows that follow are an ordered subsequence of the layout,
-///    never more rows than the layout has. Order and cardinality are what
-///    bind the sentinel to the active composer: a sentinel left behind in
-///    the transcript has composer rows between it and the chrome, and
-///    those match no layout entry.
+/// 4. The layout's REQUIRED prefix appears first, in order, immediately
+///    below the sentinel, and anything after it is a later declared row,
+///    still in order and never more rows than the layout has. Requiring
+///    the anchors is what stops an arbitrary plausible tail from passing
+///    with the box rule and status row simply absent, and order plus
+///    cardinality is what binds the sentinel to the ACTIVE composer: a
+///    sentinel left in the transcript has composer rows between it and
+///    the chrome, and those claim no layout entry.
 /// 5. Each following row matches its layout entry in BOTH forms. The
 ///    escaped form is the discriminator plain text cannot carry: on every
 ///    layout measured so far the vendor paints its chrome while a pasted
@@ -2619,54 +2812,108 @@ fn staged_verified(
 /// Anything unproven refuses. A truncated or wrapped sentinel matches no
 /// row; an unknown row ends the walk; a missing style ends it too.
 fn sentinel_verified(manifest: &Manifest, screen: &str, msg_id: &str) -> bool {
+    sentinel_proof(manifest, screen, msg_id).is_some()
+}
+
+/// The proven staged rows, when the sentinel path validates: every visible
+/// row through the unique exact sentinel, and nothing after it.
+///
+/// The boundary comes from the proof rather than from pattern matching,
+/// which matters because a payload row can read exactly like chrome. If
+/// rows were dropped merely for looking like a status row, a human could
+/// edit one and the comparison would never see it.
+fn sentinel_proof(manifest: &Manifest, screen: &str, msg_id: &str) -> Option<String> {
     let layout = &manifest.composer_trailers;
     let layout_esc = &manifest.composer_trailers_esc;
     // 1. Unmeasured layout, or a plain capture where the escaped one is
     //    required, cannot answer the question.
     if layout.is_empty() || layout_esc.len() != layout.len() {
-        return false;
+        return None;
     }
     if !screen.contains('\u{1b}') {
-        return false;
+        return None;
+    }
+    let required = manifest.injection.composer_trailer_required_prefix;
+    if required == 0 || required > layout.len() {
+        return None;
     }
     let want = sentinel_for(msg_id);
-    let rows: Vec<(&str, String)> = screen
+    // Physical rows, in order, with only two normalizations, each of which
+    // is the terminal's doing rather than the composer's: the grid's blank
+    // padding below the last content, and the padding each row is spaced
+    // out to. A blank row BETWEEN content survives both, because it is
+    // composer content and it means the sentinel was not the last thing.
+    let mut rows: Vec<(&str, String)> = screen
         .lines()
-        .map(|raw| (raw, strip_csi(raw)))
-        .filter(|(_, plain)| !plain.trim().is_empty())
+        .map(|raw| (raw.trim_end(), strip_csi(raw).trim_end().to_string()))
         .collect();
-    let rows: Vec<(&str, String)> = rows.into_iter().rev().take(VERIFY_REGION).rev().collect();
-    // 2. The sentinel itself, as a whole row.
-    let Some(at) = rows.iter().rposition(|(_, plain)| plain.trim() == want) else {
-        return false;
+    while rows.last().is_some_and(|(_, plain)| plain.is_empty()) {
+        rows.pop();
+    }
+    // The bounded tail is where the sentinel is looked for, so a token
+    // further up the transcript can never be mistaken for the staged one.
+    // The PROOF returned below still spans every visible row through it:
+    // an edit above the search window is still an edit to the payload.
+    let start = rows.len().saturating_sub(VERIFY_REGION);
+    let full = rows.clone();
+    let rows = &rows[start..];
+    // 2. Exactly one exact sentinel for THIS delivery. Two is ambiguity
+    //    about which one transport owns, and ambiguity fails closed.
+    let hits: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, plain))| *plain == want)
+        .map(|(i, _)| i)
+        .collect();
+    let [at] = hits[..] else {
+        return None;
     };
     let suffix = &rows[at + 1..];
     // 3. Chrome always follows a real composer.
     if suffix.is_empty() {
-        return false;
+        return None;
     }
-    // 4 and 5. Walk the measured layout forward; every row must claim the
-    //    next entry it can, in both forms.
-    if suffix.len() > layout.len() {
-        return false;
+    // 4 and 5. The required prefix first, in order, then only later
+    //    declared rows, still in order, and never more rows than the
+    //    layout has. Every row matches in both forms.
+    if suffix.len() < required || suffix.len() > layout.len() {
+        return None;
     }
-    let mut next = 0usize;
-    for (raw, plain) in suffix {
-        let p = plain.trim();
+    // Full span on the plain row, generically: a manifest that forgot an
+    // anchor would otherwise accept trailing payload on a chrome row, and
+    // no vendor should be able to weaken terminality by omission. The
+    // escaped half supplies the style evidence, where a partial match is
+    // meaningful because SGR runs surround the text.
+    let matches = |i: usize, raw: &str, plain: &str| {
+        whole_row(&layout[i], plain) && layout_esc[i].is_match(raw)
+    };
+    for (i, (raw, plain)) in suffix.iter().enumerate().take(required) {
+        if !matches(i, raw, plain) {
+            return None;
+        }
+    }
+    let mut next = required;
+    for (raw, plain) in &suffix[required..] {
         let mut claimed = false;
         while next < layout.len() {
             let i = next;
             next += 1;
-            if layout[i].is_match(p) && layout_esc[i].is_match(raw) {
+            if matches(i, raw, plain) {
                 claimed = true;
                 break;
             }
         }
         if !claimed {
-            return false;
+            return None;
         }
     }
-    true
+    Some(
+        full[..=start + at]
+            .iter()
+            .map(|(_, plain)| plain.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 /// Substituted staging patterns, split into id-carrying (contain the
@@ -2700,10 +2947,6 @@ fn bottom_window(screen: &str, n: usize) -> String {
     lines.join("\n")
 }
 
-fn patterns_hit(region: &str, patterns: &[String]) -> bool {
-    patterns.iter().any(|p| region.contains(p.as_str()))
-}
-
 // ---------------------------------------------------------------------------
 // ACK tiers
 // ---------------------------------------------------------------------------
@@ -2711,6 +2954,9 @@ fn patterns_hit(region: &str, patterns: &[String]) -> bool {
 enum AckOutcome {
     /// The matcher resolved it (delivered_verified is on the handle).
     Resolved,
+    /// The pane changed hands after Enter, so no later evidence belongs to
+    /// this delivery.
+    Rebound,
     /// Screen evidence: marker left the composer and the pane moved.
     Screen,
     /// Neither tier inside the deadline.
@@ -2728,6 +2974,10 @@ enum Evidence {
     /// the lifecycle event is broadcast) or the capture failed. Doubt,
     /// never expiry, mirroring fusion's capture-failure handling.
     Unobservable,
+    /// The pane changed hands after the submit key. Whatever is on screen
+    /// now belongs to somebody else, so it can neither confirm nor deny
+    /// this delivery, and waiting longer cannot fix that.
+    Rebound,
 }
 
 /// What one checkpoint pass means for the ACK loop. Expiry may stand only
@@ -2736,6 +2986,7 @@ enum Evidence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckpointStep {
     Deliver,
+    Rebound,
     Freeze,
     Expire,
     Wait,
@@ -2744,6 +2995,10 @@ enum CheckpointStep {
 fn checkpoint_step(evidence: Evidence, expired: bool) -> CheckpointStep {
     match evidence {
         Evidence::Confirmed => CheckpointStep::Deliver,
+        // Its own outcome, deliberately: folding it into expiry would
+        // record an ack timeout for a pane that changed hands, which is a
+        // different fact and a worse one to leave in the ledger.
+        Evidence::Rebound => CheckpointStep::Rebound,
         Evidence::Unobservable => CheckpointStep::Freeze,
         Evidence::Absent if expired => CheckpointStep::Expire,
         Evidence::Absent => CheckpointStep::Wait,
@@ -2890,7 +3145,7 @@ async fn await_ack(
     let mut ev_rx = inner.events.subscribe();
     let mut pane_rx = inner.watcher_of(handle.session_idx).map(|w| w.subscribe());
     let mut working_seen = false;
-    let mut output_seen = false;
+    let output_seen = false;
     let mut clock = AckClock::new(
         submit_at,
         tier1.then(|| Duration::from_millis(inner.cfg.ack_timeout_ms)),
@@ -2937,6 +3192,7 @@ async fn await_ack(
                 match checkpoint_step(evidence, clock.expired(Instant::now())) {
                     CheckpointStep::Deliver => return AckOutcome::Screen,
                     CheckpointStep::Expire => return AckOutcome::Timeout,
+                    CheckpointStep::Rebound => return AckOutcome::Rebound,
                     CheckpointStep::Freeze => {
                         // The pass could not look (watcher cleared before
                         // its detach event, or the capture failed): a
@@ -2962,7 +3218,7 @@ async fn await_ack(
             // reads the live link for this exact idx, so what changed is
             // compared against what IS, not against a name.
             ev = ev_rx.recv() => {
-                if track_state_event(&ev, &handle.pane_id) {
+                if track_state_event(&ev, handle) {
                     working_seen = true;
                     handle.working_seen.store(true, Ordering::SeqCst);
                 }
@@ -2984,6 +3240,9 @@ async fn await_ack(
                                 // frozen rather than letting the shifted
                                 // deadlines run on an unobserved pane.
                                 Evidence::Unobservable => clock.freeze(Instant::now()),
+                                // Nothing this pane does now speaks for
+                                // the delivery: stop waiting for it to.
+                                Evidence::Rebound => return AckOutcome::Rebound,
                                 Evidence::Absent => {}
                             }
                         }
@@ -3006,7 +3265,14 @@ async fn await_ack(
             pe = recv_pane(&mut pane_rx) => {
                 match pe {
                     Ok(PaneEvent::OutputActivity { pane_id: p, .. }) if p == handle.pane_id => {
-                        output_seen = true;
+                        // Output is a CUE to look, not evidence in itself.
+                        // %output carries a pane id and bytes, never the
+                        // pid that wrote them, and the watcher table can
+                        // still hold the previous occupant when a
+                        // replacement speaks first. Attributing those
+                        // bytes to this delivery would be a guess, so the
+                        // look below is what decides, and it checks the
+                        // binding on both sides of its capture.
                         // A frozen clock with a live pane stream is doubt
                         // from a failed capture; the pane speaking again
                         // is the cue to look and, if observable, resume.
@@ -3017,6 +3283,7 @@ async fn await_ack(
                             ).await {
                                 Evidence::Confirmed => return AckOutcome::Screen,
                                 Evidence::Absent => clock.unfreeze(Instant::now()),
+                                Evidence::Rebound => return AckOutcome::Rebound,
                                 Evidence::Unobservable => {}
                             }
                         }
@@ -3034,9 +3301,25 @@ async fn await_ack(
 }
 
 /// True when the event is a working fused-state change for this pane.
-fn track_state_event(ev: &Result<Event, broadcast::error::RecvError>, pane_id: &str) -> bool {
-    matches!(ev, Ok(e)
-        if e.event == "state" && e.data["pane_id"] == pane_id && e.data["state"] == "working")
+fn track_state_event(
+    ev: &Result<Event, broadcast::error::RecvError>,
+    handle: &Arc<DeliveryHandle>,
+) -> bool {
+    let Ok(e) = ev else { return false };
+    if e.event != "state" || e.data["pane_id"] != handle.pane_id.as_str() {
+        return false;
+    }
+    if e.data["state"] != "working" {
+        return false;
+    }
+    // The event carries the binding that produced it, so this asks whether
+    // the turn belongs to the delivery rather than whether it happened in
+    // a pane that once did. Comparing against the row as it looks now
+    // would accept a replacement's turn, and would keep accepting it for
+    // as long as the pane happened to look familiar again.
+    let pid = e.data["source_pid"].as_i64().unwrap_or_default() as i32;
+    let manifest = e.data["source_manifest"].as_str().unwrap_or_default();
+    handle.submitted_binding_is(pid, manifest)
 }
 
 /// True when the event is a session lifecycle line — attach, detach, or
@@ -3082,6 +3365,12 @@ async fn screen_evidence(
     };
     // Same capture flavor the staging verify used, so the marker check can
     // pin the composer line through esc-only discriminators and the window
+    // The binding is checked on both sides of the read: a capture is not
+    // instantaneous, and evidence about a pane whose occupant changed
+    // while it was being read is evidence about nobody.
+    if !submitted_binding_holds(inner, &watcher, handle) {
+        return Evidence::Rebound;
+    }
     // comparison is against like text (staged_window is de-escaped).
     let capture = if manifest.has_escaped_rules() {
         watcher.client().capture_pane_escaped(&handle.pane_id).await
@@ -3091,10 +3380,21 @@ async fn screen_evidence(
     let Ok(screen) = capture else {
         return Evidence::Unobservable;
     };
+    if !submitted_binding_holds(inner, &watcher, handle) {
+        return Evidence::Rebound;
+    }
     let changed = bottom_window(&strip_csi(&screen), COMPOSER_WINDOW) != staged_window;
-    if !marker_in_composer(manifest, &screen, patterns)
-        && tier2_evidence(changed, id_staged, working_seen, output_seen)
-    {
+    // "The marker left the COMPOSER", and the emphasis is the whole
+    // point: a submitted message stays on screen, it just stops being
+    // staged input. Asking whether the id appears anywhere in the bottom
+    // region would answer yes forever, because the transcript keeps it.
+    // So this asks the same two questions staging asked, which are both
+    // composer-pinned: is our sentinel still the staged row, or is the
+    // vendor's chip still on the composer line.
+    let _ = patterns;
+    let marker_present = sentinel_verified(manifest, &screen, &handle.msg_id)
+        || marker_in_composer(manifest, &screen);
+    if !marker_present && tier2_evidence(changed, id_staged, working_seen, output_seen) {
         Evidence::Confirmed
     } else {
         Evidence::Absent
@@ -3104,33 +3404,75 @@ async fn screen_evidence(
 /// The tier-2 turn-evidence rule, factored for the unit test: a changed
 /// window alone is only evidence when the id demonstrably staged.
 fn tier2_evidence(changed: bool, id_staged: bool, working_seen: bool, output_seen: bool) -> bool {
-    working_seen || output_seen || (changed && id_staged)
+    let _ = output_seen;
+    working_seen || (changed && id_staged)
 }
 
-/// True when a manifest idle_with_input rule matches a line in its own
-/// region that carries one of the substituted patterns: the staged text is
-/// still sitting in the composer, so the submit did not consume it.
+/// Did the vendor collapse this paste into its chip, on the composer row?
 ///
-/// `screen` may be an SGR-escaped capture. The pattern text and line
-/// emptiness are judged on de-escaped lines (identity for a plain
-/// capture); the composer pinning consults plain `line_regex` clauses
-/// against the de-escaped line AND `line_regex_esc` clauses against the
-/// raw one. Without the esc half, a manifest whose only composer
-/// discriminators are escaped (codex.toml, deliberately — a plain capture
-/// cannot tell its ghost text from typed text) could never pin a marker,
-/// so a long paste the composer collapsed into a "[Pasted Content …]"
-/// chip read as verify_failed and the submit key was withheld: the
-/// message sat staged in the recipient's composer, never delivered, while
-/// the receipt said only "outcome unknown".
-fn marker_in_composer(
-    manifest: &cyclops_manifest::Manifest,
-    screen: &str,
-    patterns: &[String],
-) -> bool {
-    let bottom_up: Vec<(&str, String)> = screen
+/// The chip is the alternate representation: it hides the message id and
+/// the sentinel alike, so nothing else on screen can prove the staging.
+/// Proving the chip therefore means matching the row the vendor actually
+/// draws, in both plain and escaped form, on a row a composer rule pins.
+///
+/// It used to be a substring test against the generic `verify_pattern`
+/// entries, which is why this is written the long way now: a message
+/// whose own subject contained the word "Pasted" satisfied it, and a
+/// truncated payload whose sentinel never arrived submitted itself.
+/// What the submit key is bound to: the staged representation exactly as
+/// the proof that validated it saw, and nothing else.
+///
+/// The boundary is taken from that proof rather than from pattern
+/// matching. Dropping rows because they look like chrome would hand the
+/// collision adversary a way in: a payload row reading like a status row
+/// would vanish from the comparison, and a human edit to it with it.
+///
+/// Chrome is excluded because chrome animates. Claude counts context
+/// down, codex counts a turn up, and binding rows that change on their
+/// own would refuse every delivery slower than a tick.
+fn payload_proof(manifest: &Manifest, screen: &str, msg_id: &str) -> Option<String> {
+    sentinel_proof(manifest, screen, msg_id).or_else(|| chip_proof(manifest, screen))
+}
+
+/// Does this pattern match the ENTIRE row, rather than some run inside it?
+///
+/// Terminality again, in a second place: a chip pattern that matches a
+/// substring proves a chip appeared somewhere on the row, not that the row
+/// IS the chip, and a row carrying payload either side of it would pass.
+/// Anchors in manifest data cannot be relied on for that, so the span is
+/// checked here where no vendor can forget it.
+fn whole_row(re: &cyclops_manifest::Regex, row: &str) -> bool {
+    re.find(row)
+        .is_some_and(|m| m.start() == 0 && m.end() == row.len())
+}
+
+fn marker_in_composer(manifest: &Manifest, screen: &str) -> bool {
+    chip_proof(manifest, screen).is_some()
+}
+
+/// The proven chip row, when the collapsed representation validates.
+///
+/// Equality against this row is equality of the SCREEN representation and
+/// nothing more: the payload behind a chip is not on screen, so it cannot
+/// be compared. That is the same limit the directive accepts by keeping
+/// the chip as an alternate at all.
+fn chip_proof(manifest: &Manifest, screen: &str) -> Option<String> {
+    if manifest.composer_chips.is_empty()
+        || manifest.composer_chips.len() != manifest.composer_chips_esc.len()
+    {
+        return None;
+    }
+    // No separate "is this an escaped capture" guard: the escaped half of
+    // a measured chip contains escape bytes, so a plain capture fails it
+    // on its own. Adding a guard on top would only stop a vendor whose
+    // chip genuinely renders unstyled from ever declaring one.
+    // Trailing padding is the terminal's, not the vendor's: capture-pane
+    // pads rows out to the pane width, and a whole-row match that counted
+    // those spaces would never match anything.
+    let rows: Vec<(&str, String)> = screen
         .lines()
         .rev()
-        .map(|l| (l, strip_csi(l)))
+        .map(|raw| (raw.trim_end(), strip_csi(raw)))
         .filter(|(_, plain)| !plain.trim().is_empty())
         .collect();
     for rule in manifest
@@ -3141,24 +3483,25 @@ fn marker_in_composer(
         let cyclops_manifest::Region::BottomNonEmptyLines(n) = rule.region else {
             continue;
         };
-        for (raw, plain) in bottom_up.iter().take(n) {
-            if !patterns_hit(plain, patterns) {
+        for (raw, plain) in rows.iter().take(n) {
+            let chip = manifest
+                .composer_chips
+                .iter()
+                .zip(manifest.composer_chips_esc.iter())
+                .any(|(p, e)| whole_row(p, plain.trim()) && whole_row(e, raw));
+            if !chip {
                 continue;
             }
-            let matchers = std::iter::once(&rule.matcher).chain(rule.any.iter());
-            let composer_line = matchers
-                .clone()
-                .flat_map(|m| m.line_regex.iter())
-                .any(|r| r.is_match(plain))
-                || matchers
-                    .flat_map(|m| m.line_regex_esc.iter())
-                    .any(|r| r.is_match(raw));
-            if composer_line {
-                return true;
+            // The manifest decides whether this row is its composer, with
+            // its own clause semantics. Reimplementing that as "plain
+            // matched OR escaped matched" would let either half carry a
+            // rule that was written to need both.
+            if rule.matches_row(plain, raw) {
+                return Some(plain.trim().to_string());
             }
         }
     }
-    false
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -3209,7 +3552,22 @@ pub(crate) fn ack_candidates(inner: &Arc<Inner>, pane_id: &str) -> Vec<Arc<Deliv
 /// a screen-verified one (the legal DeliveredUnverified -> Verified move
 /// that keeps receipts honest). Racing ahead of the Submitted line sets
 /// the early-ack flag the worker consumes.
-pub(crate) fn resolve_hook_ack(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> bool {
+pub(crate) fn resolve_hook_ack(
+    inner: &Arc<Inner>,
+    handle: &Arc<DeliveryHandle>,
+    reporter_pid: i32,
+    reporter_manifest: &str,
+) -> bool {
+    // A hook proves a process ran a turn, and a pane id is reusable, so
+    // the report has to come from the process Enter actually reached. The
+    // caller already authenticated the reporting process and resolved its
+    // row and manifest, so that binding is compared directly here. Looking
+    // it up again through a live watcher would be worse than redundant: a
+    // detached control connection has no watcher, and a legitimate hook
+    // arriving during an outage would be thrown away.
+    if !handle.submitted_binding_is(reporter_pid, reporter_manifest) {
+        return false;
+    }
     let state = handle.state();
     let moved = match state {
         DeliveryState::Submitted => advance(
@@ -3220,6 +3578,10 @@ pub(crate) fn resolve_hook_ack(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>)
                 .cause("hook_ack")
                 .verified(VerifiedBy::Hook),
         ),
+        // A screen receipt that already resolved stands. The replacement
+        // occupant cannot upgrade it, and it must not be taken away
+        // either: the original binding earned it before the pane changed
+        // hands, and the record does not retract what was true.
         DeliveryState::DeliveredUnverified => advance(
             inner,
             handle,
@@ -3331,14 +3693,44 @@ pub(crate) async fn wait_pinned(
     let mut ev_rx = inner.events.subscribe();
     let mut pane_rx = inner.watcher_of(session_idx).map(|w| w.subscribe());
     let mut state = inner.cached_state(pane_id);
-    // Pin the occupant. A pane already dead or gone can never honestly
-    // reach `until`, and a caller-pinned occupant that is already replaced
-    // is already an occupant change.
-    let pinned_pid = match occupant_of(inner, session_idx, pane_id) {
-        Some(row) if !row.dead && pinned.is_none_or(|p| p == row.pane_pid) => {
-            pinned.unwrap_or(row.pane_pid)
-        }
-        _ => return end(WaitOutcome::OccupantChanged, state),
+    // Pin the occupant, in two domains that are NOT interchangeable.
+    //
+    // `pane_pid` is the process tmux spawned, which for an interactive
+    // pane is the shell and never changes for the pane's life. The
+    // caller's pin is a delivery's admitted pid, which is the FOREGROUND
+    // leader: the agent. Comparing one against the other is how a wait
+    // that should have run its course returned occupant_changed the
+    // instant it started, on every pane where an agent runs under a
+    // shell.
+    //
+    // So the root pin guards the cheap continuous checks (a respawned
+    // pane is an occupant change no matter what is in front), and the
+    // foreground pin guards the answer: it is re-resolved before the wait
+    // may report Reached, which is the one moment a stale identity would
+    // be reported as success. Resolution failure counts as gone.
+    let Some(row) = occupant_of(inner, session_idx, pane_id).filter(|r| !r.dead) else {
+        return end(WaitOutcome::OccupantChanged, state);
+    };
+    let pinned_pid = row.pane_pid;
+    let Some(pinned_fg) =
+        fusion::foreground_pid_checked(row.pane_pid).filter(|fg| pinned.is_none_or(|p| p == *fg))
+    else {
+        return end(WaitOutcome::OccupantChanged, state);
+    };
+    // Re-proving the foreground costs a process spawn, so it runs on the
+    // wakes that are rare (a pane edge, a reattach, a lagged stream, the
+    // moment before success) and not on output, which arrives
+    // continuously while an agent streams a turn. Output keeps the cheap
+    // root check it always had, which is there for a silent respawn.
+    //
+    // The pane row's command text is a WAKE, never the answer. It is not
+    // an identity: the row can be a queued snapshot older than the pin,
+    // and the same process reads "Python" here and "python3" there. Both
+    // of those turned a live agent into a false occupant change. So a
+    // pane edge re-reads the table and asks ps, and ps decides.
+    let gone = |inner: &Arc<Inner>| {
+        occupant_gone(inner, session_idx, pane_id, pinned_pid)
+            || fusion::foreground_pid_checked(pinned_pid) != Some(pinned_fg)
     };
     let mut working_seen = working_pre || state == AgentState::Working;
     loop {
@@ -3353,6 +3745,12 @@ pub(crate) async fn wait_pinned(
             }
         };
         if satisfied {
+            // The state edge says the turn ended. It does not say WHOSE
+            // turn, so the identity is re-proven before the wait calls it
+            // reached.
+            if gone(inner) {
+                return end(WaitOutcome::OccupantChanged, state);
+            }
             return end(WaitOutcome::Reached, state);
         }
         tokio::select! {
@@ -3380,7 +3778,7 @@ pub(crate) async fn wait_pinned(
                         // against the live table (the pane may have died
                         // or been replaced during the outage).
                         pane_rx = Some(w.subscribe());
-                        if occupant_gone(inner, session_idx, pane_id, pinned_pid) {
+                        if gone(inner) {
                             return end(WaitOutcome::OccupantChanged, state);
                         }
                     }
@@ -3398,7 +3796,7 @@ pub(crate) async fn wait_pinned(
                     if state == AgentState::Working {
                         working_seen = true;
                     }
-                    if occupant_gone(inner, session_idx, pane_id, pinned_pid) {
+                    if gone(inner) {
                         return end(WaitOutcome::OccupantChanged, state);
                     }
                 }
@@ -3411,7 +3809,7 @@ pub(crate) async fn wait_pinned(
                     return end(WaitOutcome::OccupantChanged, state);
                 }
                 Ok(PaneEvent::PaneChanged { id, row, .. }) if id == pane_id => {
-                    if row.dead || row.pane_pid != pinned_pid {
+                    if row.dead || gone(inner) {
                         return end(WaitOutcome::OccupantChanged, state);
                     }
                 }
@@ -3426,7 +3824,7 @@ pub(crate) async fn wait_pinned(
                     pane_rx = None;
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    if occupant_gone(inner, session_idx, pane_id, pinned_pid) {
+                    if gone(inner) {
                         return end(WaitOutcome::OccupantChanged, state);
                     }
                 }
@@ -3689,6 +4087,7 @@ line_regex = ['^\s*❯\s+\S']
 [injection]
 composer_trailer_regex = ['^─+$', '^\s*Model \S+ · Ctx: \d+%$']
 composer_trailer_regex_esc = ['^\x1b\[90m─', '^\x1b\[38;5;\d+mModel\b']
+composer_trailer_required_prefix = 2
 "#,
             std::path::Path::new("s.toml"),
         )
@@ -3735,6 +4134,44 @@ composer_trailer_regex_esc = ['^\x1b\[90m─', '^\x1b\[38;5;\d+mModel\b']
         let m = sentinel_manifest();
         let screen = format!("\u{1b}[39m❯ body\n[cyclops:end m-1]\nstray text\n{CHROME}");
         assert!(!sentinel_verified(&m, &screen, "m-1"));
+    }
+
+    /// Two identical sentinels are an ambiguity about which row transport
+    /// owns, not a reason to prefer the lower one.
+    #[test]
+    fn a_duplicate_sentinel_fails_closed() {
+        let m = sentinel_manifest();
+        let screen = format!("\u{1b}[39m❯ body\n[cyclops:end m-1]\n[cyclops:end m-1]\n{CHROME}");
+        assert!(!sentinel_verified(&m, &screen, "m-1"));
+    }
+
+    /// A blank row after the sentinel is composer content: the sentinel
+    /// was not the last thing on the row below. Filtering it away and
+    /// accepting the chrome underneath is how a payload gap disappears.
+    #[test]
+    fn a_blank_row_after_the_sentinel_fails_closed() {
+        let m = sentinel_manifest();
+        for gap in ["\n", "\n\n"] {
+            let screen = format!("\u{1b}[39m❯ body\n[cyclops:end m-1]{gap}\n{CHROME}");
+            assert!(
+                !sentinel_verified(&m, &screen, "m-1"),
+                "blank payload row must refuse: {gap:?}"
+            );
+        }
+    }
+
+    /// Leading bytes belong to the composer, so the row is not the exact
+    /// transport token however familiar it looks.
+    #[test]
+    fn leading_bytes_before_the_sentinel_fail_closed() {
+        let m = sentinel_manifest();
+        for lead in [" ", "\t", "x "] {
+            let screen = format!("\u{1b}[39m❯ body\n{lead}[cyclops:end m-1]\n{CHROME}");
+            assert!(
+                !sentinel_verified(&m, &screen, "m-1"),
+                "leading {lead:?} must refuse"
+            );
+        }
     }
 
     /// A capture that ends at the sentinel never saw the composer's chrome,
@@ -3843,9 +4280,12 @@ composer_trailer_regex_esc = ['^\x1b\[90m─', '^\x1b\[38;5;\d+mModel\b']
         );
     }
 
+    /// The chip proof is manifest data plus a composer pin, and it needs
+    /// both halves: the row must render as the vendor's chip AND sit on a
+    /// row a composer rule recognizes. A manifest that declares no chip
+    /// syntax has no chip lane at all.
     #[test]
     fn marker_in_composer_is_manifest_driven() {
-        // Claude-style: staged input matches the idle_with_input line rule.
         let m = cyclops_manifest::Manifest::parse(
             r#"
 [agent]
@@ -3858,24 +4298,28 @@ state = "idle_with_input"
 priority = 950
 region = "bottom_non_empty_lines(6)"
 line_regex = ['^\s*❯\s+\S']
+line_regex_esc = ['\x1b\[39m❯\x{a0}']
+
+[injection]
+composer_chip_regex = ['^\s*❯\s+\[Pasted text #\d+\]\s*$']
+composer_chip_regex_esc = ['\x1b\[39m❯\x{a0}\[Pasted text #\d+\]']
 "#,
             std::path::Path::new("c.toml"),
         )
         .unwrap();
-        let patterns = vec!["m-ab12".to_string()];
-        // Staged and unsubmitted: the composer line carries the marker.
-        let staged = "transcript\n❯ [cyclops m-ab12] hello\n? for shortcuts";
-        assert!(marker_in_composer(&m, staged, &patterns));
-        // Submitted: composer cleared, marker only in the transcript.
-        let submitted = "old [cyclops m-ab12] text\n❯ \n? for shortcuts";
-        assert!(!marker_in_composer(&m, submitted, &patterns));
-        // A manifest with no idle_with_input rule can never pin the marker.
+        // Staged and unsubmitted: the composer row IS the chip.
+        let staged = "transcript\n\u{1b}[39m❯\u{a0}[Pasted text #1]\n? for shortcuts";
+        assert!(marker_in_composer(&m, staged));
+        // Submitted: composer cleared, the chip only in the transcript.
+        let submitted = "old [Pasted text #1]\n\u{1b}[39m❯\u{a0}\n? for shortcuts";
+        assert!(!marker_in_composer(&m, submitted));
+        // A manifest with no chip syntax can never pin one.
         let bare = cyclops_manifest::Manifest::parse(
             "[agent]\nid = \"x\"\ndisplay_name = \"x\"\n",
             std::path::Path::new("x.toml"),
         )
         .unwrap();
-        assert!(!marker_in_composer(&bare, staged, &patterns));
+        assert!(!marker_in_composer(&bare, staged));
     }
 
     #[test]
@@ -3919,11 +4363,14 @@ state = "idle_with_input"
 priority = 1050
 region = "bottom_non_empty_lines(6)"
 line_regex = ['^\s*❯\s+\S']
+line_regex_esc = ['\x1b\[39m❯\x{a0}']
 
 [injection]
 submit = "Enter"
 verify_before_submit = true
-verify_pattern = ["<message_id>", "Pasted text"]
+verify_pattern = ["<message_id>"]
+composer_chip_regex = ['^\s*❯\s+\[Pasted text #\d+( \+\d+ lines)?\]\s*$']
+composer_chip_regex_esc = ['\x1b\[39m❯\x{a0}\[Pasted text #\d+( \+\d+ lines)?\]']
 "#;
 
     fn composer_manifest() -> Manifest {
@@ -3936,10 +4383,11 @@ verify_pattern = ["<message_id>", "Pasted text"]
         let (id, other) = verify_patterns(&m, "m-new01");
         // "Pasted text" from a PREVIOUS message sits in the transcript;
         // the composer is empty. Nothing staged.
-        let screen = "you: [Pasted text #1 +9 lines]\nassistant: done\n❯ \n? for shortcuts";
+        let screen =
+            "you: [Pasted text #1 +9 lines]\nassistant: done\n\u{1b}[39m❯\u{a0}\n? for shortcuts";
         assert_eq!(staged_verified(&m, screen, &id, &other, "m-new01"), None);
         // The same chip ON the composer line is a real staging.
-        let staged = "transcript\n❯ [Pasted text #2 +9 lines]\n? for shortcuts";
+        let staged = "transcript\n\u{1b}[39m❯\u{a0}[Pasted text #2 +9 lines]\n? for shortcuts";
         assert_eq!(
             staged_verified(&m, staged, &id, &other, "m-new01"),
             Some(false)
@@ -3999,7 +4447,7 @@ verify_pattern = ["<message_id>", "Pasted text"]
         let m = composer_manifest();
         let handle = DeliveryHandle::new("m-new01", "worker", "%1", 0, "payload".into());
 
-        let stale = "you: [Pasted text #1 +9 lines]\nold turn\n❯ \n? for shortcuts";
+        let stale = "you: [Pasted text #1 +9 lines]\nold turn\n\u{1b}[39m❯\u{a0}\n? for shortcuts";
         let mock = MockInjector::new(vec![stale]);
         assert_eq!(
             inject(&mock, &handle, &m).await,
@@ -4007,9 +4455,10 @@ verify_pattern = ["<message_id>", "Pasted text"]
         );
         assert_eq!(mock.pasted.lock().unwrap().len(), 1, "payload was pasted");
 
-        let staged = "transcript\n❯ [Pasted text #2 +9 lines]\n? for shortcuts";
+        let staged = "transcript\n\u{1b}[39m❯\u{a0}[Pasted text #2 +9 lines]\n? for shortcuts";
         let mock = MockInjector::new(vec![stale, staged]);
-        let (window, id_staged) = inject(&mock, &handle, &m).await.expect("staged verifies");
+        let (window, id_staged, _proof) =
+            inject(&mock, &handle, &m).await.expect("staged verifies");
         assert!(!id_staged, "generic pattern staged it, not the id");
         assert!(window.contains("Pasted text #2"));
     }
@@ -4078,8 +4527,11 @@ verify_pattern = ["<message_id>", "Pasted text"]
         // and is what verifies it: the id alone never does. The status row
         // below it must arrive PAINTED, which is what separates the real
         // chrome from prose shaped like it.
+        // The blank separator row is part of what codex paints below the
+        // composer (F-P0-12), so it is part of what a real capture shows
+        // between the sentinel and the status row.
         let literal = format!(
-            "{CODEX_TRANSCRIPT_LINE}\n\u{1b}[1m›\u{1b}[0m [cyclops m-jean01] hello\n[cyclops:end m-jean01]\n  \u{1b}[38;2;246;226;183mgpt-5.6-sol high\u{1b}[39m · /tmp/x"
+            "{CODEX_TRANSCRIPT_LINE}\n\u{1b}[1m›\u{1b}[0m [cyclops m-jean01] hello\n[cyclops:end m-jean01]\n\n  \u{1b}[38;2;246;226;183mgpt-5.6-sol high\u{1b}[39m · /tmp/x"
         );
         assert_eq!(
             staged_verified(&m, &literal, &id, &other, "m-jean01"),
@@ -4098,7 +4550,8 @@ verify_pattern = ["<message_id>", "Pasted text"]
         let staged =
             format!("transcript above\n{CODEX_COMPOSER_CHIP}\n  gpt-5.6-sol high · ~/proj");
         let mock = MockInjector::new(vec![staged.as_str()]);
-        let (window, id_staged) = inject(&mock, &handle, &m).await.expect("collapse stages");
+        let (window, id_staged, _proof) =
+            inject(&mock, &handle, &m).await.expect("collapse stages");
         assert!(
             !id_staged,
             "the chip hides the id; the composer line proved it"
@@ -4120,7 +4573,11 @@ verify_pattern = ["<message_id>", "Pasted text"]
         assert!(!tier2_evidence(true, false, false, false));
         assert!(tier2_evidence(true, true, false, false));
         assert!(tier2_evidence(false, false, true, false));
-        assert!(tier2_evidence(false, false, false, true));
+        // Output activity is no longer evidence on its own: %output names
+        // a pane and its bytes, never the process that wrote them, so a
+        // replacement occupant's noise could otherwise resolve a delivery
+        // it never received. It survives as a cue to look.
+        assert!(!tier2_evidence(false, false, false, true));
         // Marker gone but nothing else moved: not evidence.
         assert!(!tier2_evidence(false, true, false, false));
     }
@@ -4423,5 +4880,280 @@ contains = ["OTHER-DIALOG"]
         );
         client.shutdown().await;
         let _ = std::fs::remove_dir_all(&spool);
+    }
+}
+
+#[cfg(test)]
+mod chip_proof {
+    use super::*;
+
+    fn chip_manifest() -> Manifest {
+        Manifest::parse(
+            r#"
+[agent]
+id = "c"
+display_name = "c"
+
+[[rule]]
+id = "composer_has_staged_input"
+state = "idle_with_input"
+priority = 950
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^\s*❯\s+\S']
+line_regex_esc = ['\x1b\[39m❯\x{a0}']
+
+[injection]
+composer_chip_regex = ['^\s*❯\s+\[Pasted text #\d+( \+\d+ lines)?\]\s*$']
+composer_chip_regex_esc = ['\x1b\[39m❯\x{a0}\[Pasted text #\d+( \+\d+ lines)?\]']
+"#,
+            std::path::Path::new("c.toml"),
+        )
+        .unwrap()
+    }
+
+    /// The chip is the alternate proof of a whole staged payload, so it
+    /// has to be the whole row. Anything else on the row means the row is
+    /// not the chip, and the payload around it is unaccounted for.
+    #[test]
+    fn a_chip_with_text_around_it_is_not_a_chip() {
+        let m = chip_manifest();
+        let good = "\u{1b}[39m❯\u{a0}[Pasted text #1 +8 lines]";
+        assert!(marker_in_composer(&m, good), "the measured row must pass");
+
+        for bad in [
+            "\u{1b}[39m❯\u{a0}[Pasted text #1 +8 lines] and then some",
+            "\u{1b}[39m❯\u{a0}see [Pasted text #1 +8 lines]",
+        ] {
+            assert!(
+                !marker_in_composer(&m, bad),
+                "payload beside the chip must refuse: {bad:?}"
+            );
+        }
+    }
+
+    /// The exact collision that made the old substring test unsafe: a
+    /// message whose SUBJECT contains the word verified a paste whose
+    /// sentinel had never arrived, and the truncated payload submitted
+    /// itself.
+    #[test]
+    fn a_subject_containing_the_chip_words_never_verifies() {
+        let m = chip_manifest();
+        for row in [
+            "\u{1b}[39m❯\u{a0}[cyclops m-1] FROM: codex  SUBJECT: Pasted text handling",
+            "\u{1b}[39m❯\u{a0}[cyclops m-1] FROM: codex  SUBJECT: Pasted",
+        ] {
+            assert!(
+                !marker_in_composer(&m, row),
+                "a subject is not a chip: {row:?}"
+            );
+        }
+    }
+
+    /// A chip that scrolled into the transcript is not the composer's.
+    #[test]
+    fn a_transcript_echo_of_a_chip_never_verifies() {
+        let m = chip_manifest();
+        let echo = "you: [Pasted text #1 +8 lines]\n\u{1b}[39m❯\u{a0}";
+        assert!(!marker_in_composer(&m, echo));
+    }
+
+    /// Without an escaped capture the styling half cannot be checked.
+    #[test]
+    fn a_plain_capture_never_proves_a_chip() {
+        let m = chip_manifest();
+        assert!(!marker_in_composer(&m, "❯ [Pasted text #1 +8 lines]"));
+    }
+}
+
+#[cfg(test)]
+mod shipped_chip_proof {
+    use super::*;
+
+    fn claude() -> Manifest {
+        Manifest::parse(
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../resources/manifests/claude.toml"
+            )),
+            std::path::Path::new("claude.toml"),
+        )
+        .expect("shipped claude manifest parses")
+    }
+
+    fn codex() -> Manifest {
+        Manifest::parse(
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../resources/manifests/codex.toml"
+            )),
+            std::path::Path::new("codex.toml"),
+        )
+        .expect("shipped codex manifest parses")
+    }
+
+    /// Codex paints a blank row between the composer and its model status
+    /// row, so a raw-wrapped sentinel's suffix starts with a row the
+    /// layout has to describe. It did not, and every raw-wrapped codex
+    /// delivery refused: correct fail-closed behaviour, and a whole
+    /// vendor lane with no sentinel path.
+    ///
+    /// The chrome here is verbatim from the real capture, both rows and
+    /// both forms. The composer row is synthesized, because no real
+    /// raw-wrap capture off codex exists in the tree (F-P0-12): what this
+    /// proves is that the declared layout matches what codex actually
+    /// paints below the composer, not what codex does to a long paste.
+    #[test]
+    fn a_codex_raw_wrap_verifies_through_its_measured_blank_separator() {
+        let real = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cyclops-manifest/tests/fixtures/codex_pasted_chip_esc.txt"
+        ));
+        let mut rows: Vec<String> = real.split('\n').map(str::to_string).collect();
+        let chip = rows
+            .iter()
+            .position(|r| r.contains("[Pasted Content"))
+            .expect("the real capture's composer row");
+        // A raw wrap puts the payload in the composer instead of a chip,
+        // and the sentinel is its last row.
+        rows[chip] = "\u{1b}[1m›\u{1b}[0m the last line of the body".to_string();
+        rows.insert(chip + 1, sentinel_for("m-9f1"));
+        let screen = rows.join("\n");
+        assert!(
+            sentinel_verified(&codex(), &screen, "m-9f1"),
+            "the shipped codex layout still refuses its own chrome:\n{screen}"
+        );
+
+        // The blank row is declared, not ignored. A SECOND blank is a row
+        // the layout does not describe, which is what a truncated capture
+        // looks like, and it still refuses.
+        let mut extra = rows.clone();
+        extra.insert(chip + 2, String::new());
+        assert!(
+            !sentinel_verified(&codex(), &extra.join("\n"), "m-9f1"),
+            "an undeclared blank row was accepted"
+        );
+    }
+
+    /// The shipped manifest against real captures, through the production
+    /// proof rather than an inline fixture shaped to suit it.
+    ///
+    /// An inline manifest proves the algorithm; it cannot prove that the
+    /// patterns Cyclops actually ships match the screens Claude actually
+    /// draws. Those are different claims, and only the second one is
+    /// about delivering a message to a real agent.
+    #[test]
+    fn the_shipped_claude_chip_verifies_and_its_echo_does_not() {
+        let m = claude();
+        let staged = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cyclops-manifest/tests/fixtures/claude_pasted_chip_esc.txt"
+        ));
+        assert!(
+            marker_in_composer(&m, staged),
+            "the shipped chip row must prove a staged paste"
+        );
+
+        // The prompt-echo capture is the same CLI with no chip on the
+        // composer: whatever else is on screen, nothing there is a staged
+        // payload, and claiming otherwise would submit on a redraw.
+        let echo = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cyclops-manifest/tests/fixtures/claude_prompt_echo_esc.txt"
+        ));
+        assert!(
+            !marker_in_composer(&m, echo),
+            "an echo with no composer chip must not verify"
+        );
+
+        // The plain sibling of that capture is what a manifest without
+        // escaped rules would be handed. The chip proof needs the styling
+        // half, so this refuses too, and the two fixtures are now both
+        // load-bearing rather than one of them sitting unreferenced.
+        let echo_plain = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cyclops-manifest/tests/fixtures/claude_prompt_echo_plain.txt"
+        ));
+        assert!(!marker_in_composer(&m, echo_plain));
+    }
+
+    /// The halves disagreeing is the case an OR cannot survive: the chip
+    /// row renders exactly as the vendor draws it, the escaped composer
+    /// clause holds, and the plain one does not. Under "plain OR escaped"
+    /// the escaped half alone would carry the proof; under the manifest's
+    /// own semantics both are required and this refuses.
+    #[test]
+    fn a_row_that_satisfies_only_the_escaped_clause_refuses() {
+        let m = Manifest::parse(
+            r#"
+[agent]
+id = "d"
+display_name = "d"
+
+[[rule]]
+id = "composer_has_staged_input"
+state = "idle_with_input"
+priority = 950
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^NEVER-MATCHES-THIS-ROW$']
+line_regex_esc = ['\x1b\[39m❯\x{a0}']
+
+[injection]
+composer_chip_regex = ['^\s*❯\s+\[Pasted text #\d+\]\s*$']
+composer_chip_regex_esc = ['\x1b\[39m❯\x{a0}\[Pasted text #\d+\]']
+"#,
+            std::path::Path::new("d.toml"),
+        )
+        .unwrap();
+        let row = "\u{1b}[39m❯\u{a0}[Pasted text #1]";
+        assert!(
+            !marker_in_composer(&m, row),
+            "one satisfied clause is not the rule the manifest wrote"
+        );
+    }
+
+    /// Both shipped clauses have to carry the proof, so breaking either
+    /// one must make production refuse.
+    ///
+    /// This is the half of the contract a passing test cannot show on its
+    /// own: with an OR, the escaped clause alone kept the proof alive and
+    /// the vendor's plain pattern could rot untouched for as long as
+    /// nobody looked. Each half is broken here in turn, against the same
+    /// real capture, and each break must be fatal.
+    #[test]
+    fn breaking_either_shipped_clause_refuses_the_chip() {
+        let staged = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cyclops-manifest/tests/fixtures/claude_pasted_chip_esc.txt"
+        ));
+        assert!(marker_in_composer(&claude(), staged), "baseline");
+
+        let shipped = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../resources/manifests/claude.toml"
+        ));
+        for (half, broken) in [
+            (
+                "plain",
+                shipped.replace(
+                    "line_regex = ['^\\s*❯\\s+\\S']",
+                    "line_regex = ['^NEVER-MATCHES-THIS-ROW$']",
+                ),
+            ),
+            (
+                "escaped",
+                shipped.replace(
+                    "line_regex_esc = ['\\x1b\\[39m❯\\x{a0}[^\\x1b]']",
+                    "line_regex_esc = ['NEVER-MATCHES-THIS-ROW']",
+                ),
+            ),
+        ] {
+            assert_ne!(broken, shipped, "the {half} clause moved; update this test");
+            let m = Manifest::parse(&broken, std::path::Path::new("claude.toml"))
+                .expect("broken manifest still parses");
+            assert!(
+                !marker_in_composer(&m, staged),
+                "breaking the shipped {half} clause must refuse the chip"
+            );
+        }
     }
 }

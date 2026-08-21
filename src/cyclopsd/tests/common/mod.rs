@@ -46,55 +46,43 @@ use tokio::net::UnixStream;
 /// Lifecycle only. It proves receipts and liveness, not INVARIANTS rule 12
 /// and not sentinel completeness; a pane that paints no chrome under a
 /// paste cannot decide terminality at all.
-/// The composer loop body, reusable by fixtures that must reach this
-/// behavior after their own setup (a quota banner, an update notice).
+/// The composer process behind the lifecycle fixtures: a small fake TUI
+/// that stages a paste, paints chrome below it, and consumes the staged
+/// text when the submit key arrives.
 ///
-/// Rows that arrive newline-terminated are consumed into a transcript
-/// file and left off the screen. The final sentinel row carries no
-/// newline, so the tty echo holds it on screen as staged input, which is
-/// what the staging check reads. When the daemon's Enter finally
-/// terminates that row, the loop repaints: transcript back (header and
-/// body, never the sentinel, because a receipt test asserts the payload
-/// is visible while the marker is gone), then a transient working row,
-/// then the idle prompt.
+/// It exists because `cat` cannot model a composer. `cat` echoes a paste
+/// and never gives the screen back, so the staged marker never leaves
+/// and no receipt can resolve, and it paints nothing below the paste, so
+/// terminality is undecidable and the sentinel can never be proven
+/// last. Fixtures built on it end up claiming a representation the pane
+/// does not produce.
 ///
-/// The pause before the working row is not decoration. `await_ack` opens
-/// its subscriptions only after the submit call returns, so a working
-/// edge painted the instant Enter lands can be gone before anyone is
-/// listening, and the row would sit there proving nothing. Waiting a beat
-/// puts the edge after the subscription, every time. It has to stay short
-/// as well as non-zero: a fixture that takes longer to paint and clear
-/// than the tightest configured ACK window would time the delivery out
-/// before its own evidence arrived.
-///
-/// The working row is the point. With the leading-id path gone these
-/// fixtures stage through the generic marker, so `id_staged` is false,
-/// and the screen ACK tier then refuses a changed window as turn
-/// evidence and requires working or output evidence instead. That is a
-/// production invariant worth keeping, so the fixture produces the
-/// evidence rather than the pipeline relaxing what it accepts.
-pub const COMPOSER_SH: &str = "T=$(mktemp); trap \"rm -f $T\" EXIT; \
-     printf \"CYCFIX>\\n\"; \
-     while IFS= read -r l; do case \"$l\" in \
-     *\"[cyclops:end \"*) sleep 0.15; printf \"\\033[2J\\033[H\"; cat \"$T\"; \
-     printf \"CYCFIX-WORKING\\n\"; sleep 0.4; \
-     printf \"\\033[2J\\033[H\"; cat \"$T\"; printf \"CYCFIX>\\n\";; \
-     *) printf \"%s\\n\" \"$l\" >> \"$T\";; esac; done";
-
-/// A deterministic composer process for the lifecycle fixtures.
-///
-/// Lifecycle only. It proves receipts and liveness, not INVARIANTS rule
-/// 12 and not sentinel completeness; a pane that paints no chrome under a
-/// paste cannot decide terminality at all.
+/// See `common/faketui.py` for what it draws.
 pub fn composer_pane() -> String {
-    format!("sh -c '{COMPOSER_SH}'")
+    format!("python3 {}", faketui_path())
+}
+
+/// The fake TUI's script path, for fixtures that start it themselves
+/// (a pane whose root is a shell types the command instead of tmux
+/// exec'ing it).
+pub fn faketui_path() -> String {
+    format!("{}/tests/common/faketui.py", env!("CARGO_MANIFEST_DIR"))
+}
+
+/// The same process after a fixture's own setup has run, for panes that
+/// must first show a modal or a banner and then behave like a composer.
+pub fn composer_tail() -> String {
+    format!(
+        "exec python3 {}/tests/common/faketui.py",
+        env!("CARGO_MANIFEST_DIR")
+    )
 }
 
 pub const CAT_MANIFEST: &str = r#"
 [agent]
 id = "fix"
 display_name = "Cat fixture"
-process_names = ["cat", "sh", "bash", "dash"]
+process_names = ["python3", "python", "Python", "cat", "sh", "bash", "dash"]
 
 [[rule]]
 id = "always_idle"
@@ -111,8 +99,8 @@ regex = ['^']
 id = "composer_empty"
 state = "idle"
 priority = 90
-region = "bottom_non_empty_lines(1)"
-line_regex = ['^CYCFIX>\s*$']
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^❯\s*$']
 
 # The FINAL payload row, which is the one row a fixed bottom region can
 # never lose: `cat` echoes every pasted line, so the header scrolls away
@@ -128,8 +116,8 @@ line_regex = ['^CYCFIX>\s*$']
 id = "composer_holds_paste"
 state = "idle_with_input"
 priority = 80
-region = "bottom_non_empty_lines(6)"
-line_regex = ['^\[cyclops:end ']
+region = "bottom_non_empty_lines(10)"
+line_regex = ['^\s*❯\s+\S']
 
 # The transient row the composer paints after consuming the sentinel.
 # Screen ACK evidence needs a turn, and a generic-marker staging does not
@@ -138,14 +126,23 @@ line_regex = ['^\[cyclops:end ']
 id = "composer_working"
 state = "working"
 priority = 300
-region = "bottom_non_empty_lines(2)"
-line_regex = ['^CYCFIX-WORKING$']
+region = "bottom_non_empty_lines(5)"
+line_regex = ['^FAKETUI-WORKING$']
 
 [injection]
 method = "load-buffer + paste-buffer -p"
 submit = "Enter"
 verify_before_submit = true
-verify_pattern = ["<message_id>", "[cyclops:end "]
+verify_pattern = ["<message_id>"]
+# The staged sentinel row as this pane renders it. A shell composer echoes
+# the paste unstyled, so the two halves of the pair are the same shape
+# here; a real vendor's chip is painted and its escaped half says so.
+# What the fake TUI paints below the composer, in order and in both
+# forms. Two rows, both required, both painted: this is the authentic
+# sentinel lane rather than a chip declared over raw text.
+composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
+composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
+composer_trailer_required_prefix = 2
 safe_states = ["idle"]
 "#;
 
@@ -154,7 +151,7 @@ pub const HOOK_MANIFEST: &str = r#"
 [agent]
 id = "fix"
 display_name = "Hook fixture"
-process_names = ["cat", "sh", "bash", "dash"]
+process_names = ["python3", "python", "Python", "cat", "sh", "bash", "dash"]
 
 [hooks]
 turn_start = "UserPromptSubmit"
@@ -177,8 +174,8 @@ regex = ['^']
 id = "composer_empty"
 state = "idle"
 priority = 90
-region = "bottom_non_empty_lines(1)"
-line_regex = ['^CYCFIX>\s*$']
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^❯\s*$']
 
 # The FINAL payload row, which is the one row a fixed bottom region can
 # never lose: `cat` echoes every pasted line, so the header scrolls away
@@ -194,8 +191,8 @@ line_regex = ['^CYCFIX>\s*$']
 id = "composer_holds_paste"
 state = "idle_with_input"
 priority = 80
-region = "bottom_non_empty_lines(6)"
-line_regex = ['^\[cyclops:end ']
+region = "bottom_non_empty_lines(10)"
+line_regex = ['^\s*❯\s+\S']
 
 # The transient row the composer paints after consuming the sentinel.
 # Screen ACK evidence needs a turn, and a generic-marker staging does not
@@ -204,13 +201,22 @@ line_regex = ['^\[cyclops:end ']
 id = "composer_working"
 state = "working"
 priority = 300
-region = "bottom_non_empty_lines(2)"
-line_regex = ['^CYCFIX-WORKING$']
+region = "bottom_non_empty_lines(5)"
+line_regex = ['^FAKETUI-WORKING$']
 
 [injection]
 submit = "Enter"
 verify_before_submit = true
-verify_pattern = ["<message_id>", "[cyclops:end "]
+verify_pattern = ["<message_id>"]
+# The staged sentinel row as this pane renders it. A shell composer echoes
+# the paste unstyled, so the two halves of the pair are the same shape
+# here; a real vendor's chip is painted and its escaped half says so.
+# What the fake TUI paints below the composer, in order and in both
+# forms. Two rows, both required, both painted: this is the authentic
+# sentinel lane rather than a chip declared over raw text.
+composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
+composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
+composer_trailer_required_prefix = 2
 "#;
 
 /// Modal fixture: one auto-dismissable rule with explicit decline keys and
@@ -219,7 +225,7 @@ pub const MODAL_MANIFEST: &str = r#"
 [agent]
 id = "fix"
 display_name = "Modal fixture"
-process_names = ["cat", "sh", "bash", "dash"]
+process_names = ["python3", "python", "Python", "cat", "sh", "bash", "dash"]
 
 [[rule]]
 id = "fake_update_modal"
@@ -253,8 +259,8 @@ regex = ['^']
 id = "composer_empty"
 state = "idle"
 priority = 90
-region = "bottom_non_empty_lines(1)"
-line_regex = ['^CYCFIX>\s*$']
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^❯\s*$']
 
 # The FINAL payload row, which is the one row a fixed bottom region can
 # never lose: `cat` echoes every pasted line, so the header scrolls away
@@ -270,8 +276,8 @@ line_regex = ['^CYCFIX>\s*$']
 id = "composer_holds_paste"
 state = "idle_with_input"
 priority = 80
-region = "bottom_non_empty_lines(6)"
-line_regex = ['^\[cyclops:end ']
+region = "bottom_non_empty_lines(10)"
+line_regex = ['^\s*❯\s+\S']
 
 # The transient row the composer paints after consuming the sentinel.
 # Screen ACK evidence needs a turn, and a generic-marker staging does not
@@ -280,13 +286,22 @@ line_regex = ['^\[cyclops:end ']
 id = "composer_working"
 state = "working"
 priority = 300
-region = "bottom_non_empty_lines(2)"
-line_regex = ['^CYCFIX-WORKING$']
+region = "bottom_non_empty_lines(5)"
+line_regex = ['^FAKETUI-WORKING$']
 
 [injection]
 submit = "Enter"
 verify_before_submit = true
-verify_pattern = ["<message_id>", "[cyclops:end "]
+verify_pattern = ["<message_id>"]
+# The staged sentinel row as this pane renders it. A shell composer echoes
+# the paste unstyled, so the two halves of the pair are the same shape
+# here; a real vendor's chip is painted and its escaped half says so.
+# What the fake TUI paints below the composer, in order and in both
+# forms. Two rows, both required, both painted: this is the authentic
+# sentinel lane rather than a chip declared over raw text.
+composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
+composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
+composer_trailer_required_prefix = 2
 "#;
 
 /// Quota fixture: the agy quota phrase parks the recipient.
@@ -294,7 +309,7 @@ pub const QUOTA_MANIFEST: &str = r#"
 [agent]
 id = "fix"
 display_name = "Quota fixture"
-process_names = ["cat", "sh", "bash", "dash"]
+process_names = ["python3", "python", "Python", "cat", "sh", "bash", "dash"]
 
 [[rule]]
 id = "quota_exhausted"
@@ -318,8 +333,8 @@ regex = ['^']
 id = "composer_empty"
 state = "idle"
 priority = 90
-region = "bottom_non_empty_lines(1)"
-line_regex = ['^CYCFIX>\s*$']
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^❯\s*$']
 
 # The FINAL payload row, which is the one row a fixed bottom region can
 # never lose: `cat` echoes every pasted line, so the header scrolls away
@@ -335,8 +350,8 @@ line_regex = ['^CYCFIX>\s*$']
 id = "composer_holds_paste"
 state = "idle_with_input"
 priority = 80
-region = "bottom_non_empty_lines(6)"
-line_regex = ['^\[cyclops:end ']
+region = "bottom_non_empty_lines(10)"
+line_regex = ['^\s*❯\s+\S']
 
 # The transient row the composer paints after consuming the sentinel.
 # Screen ACK evidence needs a turn, and a generic-marker staging does not
@@ -345,13 +360,22 @@ line_regex = ['^\[cyclops:end ']
 id = "composer_working"
 state = "working"
 priority = 300
-region = "bottom_non_empty_lines(2)"
-line_regex = ['^CYCFIX-WORKING$']
+region = "bottom_non_empty_lines(5)"
+line_regex = ['^FAKETUI-WORKING$']
 
 [injection]
 submit = "Enter"
 verify_before_submit = true
-verify_pattern = ["<message_id>", "[cyclops:end "]
+verify_pattern = ["<message_id>"]
+# The staged sentinel row as this pane renders it. A shell composer echoes
+# the paste unstyled, so the two halves of the pair are the same shape
+# here; a real vendor's chip is painted and its escaped half says so.
+# What the fake TUI paints below the composer, in order and in both
+# forms. Two rows, both required, both painted: this is the authentic
+# sentinel lane rather than a chip declared over raw text.
+composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
+composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
+composer_trailer_required_prefix = 2
 "#;
 
 /// Busy fixture: a screen marker keeps the pane working until released.
@@ -359,7 +383,7 @@ pub const BUSY_MANIFEST: &str = r#"
 [agent]
 id = "fix"
 display_name = "Busy fixture"
-process_names = ["cat", "sh", "bash", "dash"]
+process_names = ["python3", "python", "Python", "cat", "sh", "bash", "dash"]
 
 [[rule]]
 id = "busy_marker"
@@ -383,8 +407,8 @@ regex = ['^']
 id = "composer_empty"
 state = "idle"
 priority = 90
-region = "bottom_non_empty_lines(1)"
-line_regex = ['^CYCFIX>\s*$']
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^❯\s*$']
 
 # The FINAL payload row, which is the one row a fixed bottom region can
 # never lose: `cat` echoes every pasted line, so the header scrolls away
@@ -400,8 +424,8 @@ line_regex = ['^CYCFIX>\s*$']
 id = "composer_holds_paste"
 state = "idle_with_input"
 priority = 80
-region = "bottom_non_empty_lines(6)"
-line_regex = ['^\[cyclops:end ']
+region = "bottom_non_empty_lines(10)"
+line_regex = ['^\s*❯\s+\S']
 
 # The transient row the composer paints after consuming the sentinel.
 # Screen ACK evidence needs a turn, and a generic-marker staging does not
@@ -410,13 +434,22 @@ line_regex = ['^\[cyclops:end ']
 id = "composer_working"
 state = "working"
 priority = 300
-region = "bottom_non_empty_lines(2)"
-line_regex = ['^CYCFIX-WORKING$']
+region = "bottom_non_empty_lines(5)"
+line_regex = ['^FAKETUI-WORKING$']
 
 [injection]
 submit = "Enter"
 verify_before_submit = true
-verify_pattern = ["<message_id>", "[cyclops:end "]
+verify_pattern = ["<message_id>"]
+# The staged sentinel row as this pane renders it. A shell composer echoes
+# the paste unstyled, so the two halves of the pair are the same shape
+# here; a real vendor's chip is painted and its escaped half says so.
+# What the fake TUI paints below the composer, in order and in both
+# forms. Two rows, both required, both painted: this is the authentic
+# sentinel lane rather than a chip declared over raw text.
+composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
+composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
+composer_trailer_required_prefix = 2
 "#;
 
 /// Verification-failure fixture: the pattern can never appear on screen,
@@ -425,7 +458,7 @@ pub const BAD_VERIFY_MANIFEST: &str = r#"
 [agent]
 id = "fix"
 display_name = "Bad verify fixture"
-process_names = ["cat", "sh", "bash", "dash"]
+process_names = ["python3", "python", "Python", "cat", "sh", "bash", "dash"]
 
 [[rule]]
 id = "always_idle"
@@ -442,8 +475,8 @@ regex = ['^']
 id = "composer_empty"
 state = "idle"
 priority = 90
-region = "bottom_non_empty_lines(1)"
-line_regex = ['^CYCFIX>\s*$']
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^❯\s*$']
 
 [injection]
 submit = "Enter"
@@ -873,5 +906,6 @@ pub async fn wait_pane_state(rig: &mut Rig, want: &str) {
 /// only proves anything if what follows can actually take a message:
 /// admit a write, hold the staged sentinel, and clear it on Enter.
 pub fn hold_script(marker: &str) -> String {
-    format!("sh -c 'echo {marker}; read x; printf \"\\033[2J\\033[H\"; {COMPOSER_SH}'")
+    let tail = composer_tail();
+    format!("sh -c 'echo {marker}; read x; printf \"\\033[2J\\033[H\"; {tail}'")
 }

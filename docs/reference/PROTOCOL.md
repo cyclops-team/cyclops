@@ -146,9 +146,16 @@ cap; the third returns the reasoning behind a state.
 ```
 -> {"id":3,"method":"pane.read","params":{"target":"reviewer","source":"detection"}}
 <- {"id":3,"result":{"detection":{"decided_by":"title_idle","disagreement":false,"stale":false,"write_ready":true,
-    "readings":[{"rule":"title_idle","sensor":"title","state":"idle","ts":1785744822828}],
+    "readings":[{"rule":"title_idle","sensor":"title","state":"idle","ts":1785744822828},
+                {"rule":"composer_empty","sensor":"screen","state":"idle","ts":1785744822831}],
     "state":"idle"},"pane_id":"%1","target":"reviewer"}}
 ```
+
+The screen reading is not decoration. Had the title rule been the only
+sensor to report, the same `idle` state would have come back with
+`write_ready:false` and `write_block:"no_clean_composer_evidence"`: a
+title says the turn ended, and only the screen can say the composer is
+empty.
 
 `decided_by` names the manifest rule that won. `readings` is what each
 sensor saw, one per sensor that read anything (`title`, `screen`, `hook`).

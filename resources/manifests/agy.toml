@@ -189,6 +189,8 @@ composer_trailer_regex_esc = [
   '^\x1b\[90m─',
   '^\x1b\[38;5;\d+mGemini\b',
 ]
+# The first 2 rows are painted every time; the rest are optional.
+composer_trailer_required_prefix = 2
 
 [context_leak]
 note = """agy auto-read ~/projects/COORDINATION.md and ~/projects/NOTES.md on the

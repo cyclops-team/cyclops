@@ -19,11 +19,18 @@ three steps away.
 $ cyclops read reviewer --source detection
 reviewer · ○ idle · decided by title_idle · write-ready
 
-  title  ○ idle  title_idle  just now
+  title   ○ idle  title_idle      just now
+  screen  ○ idle  composer_empty  just now
 ```
 
 `decided by` names the rule that produced the verdict. A wrong reading is
 one rule to fix.
+
+`write-ready` is the second answer and a different question: may a
+message be pasted right now. Only a screen rule can answer it, because
+only the screen can see the composer. A manifest with no idle screen rule
+reads `not write-ready: no_clean_composer_evidence` however confidently
+its title rule says idle.
 
 Add `--raw` and the same answer carries the pane capture the sensors
 read, under the readings. One answer means one moment: a separate
@@ -32,9 +39,10 @@ you are staring at contradicts the verdict it is supposed to explain.
 
 ```
 $ cyclops read reviewer --source detection --raw
-reviewer · ○ idle · decided by title_idle
+reviewer · ○ idle · decided by title_idle · write-ready
 
-  title  ○ idle  title_idle  just now
+  title   ○ idle  title_idle      just now
+  screen  ○ idle  composer_empty  just now
 
 what the sensors read (%1):
 ...the pane, verbatim...

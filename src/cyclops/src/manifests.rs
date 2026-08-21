@@ -67,37 +67,41 @@ pub fn dir(home: &Path) -> PathBuf {
 /// already found. That is the maintainer's own machines, and every install
 /// that predates the key.
 ///
-/// Regenerate when a shipped manifest changes: hash every historical blob
-/// of resources/manifests/ (and the old manifests/ path) across all refs.
-/// The test below fails until the current bodies are listed, and prints the
-/// hash to append.
+/// Regenerate when a shipped manifest changes: hash the historical blobs
+/// of resources/manifests/ (and the old manifests/ path) on released
+/// refs, plus the current bodies. The test below fails until the current
+/// bodies are listed, and prints the hash to append.
+///
+/// Two things stay out. Bodies from an unreleased branch: nobody was ever
+/// seeded with those, so listing one only claims replacement authority
+/// over bytes that could just as well be an operator's own. And hashes
+/// from any other seeded file: this list answers "did the operator edit
+/// this manifest", and a skill body's hash landing here would make an
+/// edited manifest look untouched.
 const EVER_SHIPPED_FNV64: &[&str] = &[
     "000da241c916d3cb",
     "0e7c902fb67d702a",
-    "1268dea6a50bcf37",
     "12765e334728f40b",
-    "1ad818abd9ad7e43",
     "2893de300e4fc944",
     "3292eae226f54f79",
-    "3822eeaabab23994",
     "3ec9936975418c27",
     "3ee05959c01113a7",
     "3f2860fa1275d798",
     "44c3c94fe03c18c9",
-    "48d96c014d04e5fb",
     "4af4029b9d2910e3",
     "57c2bf8d8b894ce0",
     "5fb9fab4521686ad",
+    "645013f86f1bcb41",
     "6a4f11941f4c78be",
     "7a9754b750109c5e",
     "821ec0a1af0f8cc1",
     "85f276e9afffc42d",
+    "8bea35e21e858dd7",
     "98ae3fa4eca78cf3",
     "9a67be48357ff9e0",
-    "b85d7bde8bc0691b",
     "bc4bc371b40e71ca",
     "c60d4aff7fe2a5d2",
-    "f669f15396349210",
+    "dcf8e732f46b397c",
     "f6c7c7aaa830babb",
 ];
 

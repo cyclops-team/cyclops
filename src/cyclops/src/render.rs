@@ -917,9 +917,12 @@ pub fn render_detection(target: &str, det: &Detection, style: &Style, now_ms: u6
     // gate's decision.
     header.push_str(&format!(
         " {sep} {}",
-        match det.write_ready() {
-            Ok(()) => style.dim("write-ready"),
-            Err(reason) => style.dim(&format!("not write-ready: {reason}")),
+        match det.write_block.as_deref() {
+            None if det.write_ready => style.dim("write-ready"),
+            // An older daemon stamps neither field. Absent evidence is
+            // not permission, so it reads as refused rather than ready.
+            None => style.dim("not write-ready: unstamped"),
+            Some(reason) => style.dim(&format!("not write-ready: {reason}")),
         }
     ));
     if det.readings.is_empty() {
@@ -1047,6 +1050,8 @@ mod tests {
             current_command: cmd.into(),
             dead: false,
             in_mode: false,
+            write_ready: false,
+            write_block: None,
             width: 120,
             height: 40,
             state,
@@ -2022,7 +2027,7 @@ mod tests {
             ],
         };
         let got = render_detection("reviewer", &det, &Style::none(), now);
-        let expected = "reviewer · ● working · ⚠ sensors disagree · decided by hook:Stop · not write-ready: not_idle\n\
+        let expected = "reviewer · ● working · ⚠ sensors disagree · decided by hook:Stop · not write-ready: unstamped\n\
              \n\
              \x20 hook    ● working  Stop            2s ago\n\
              \x20 title   ● working  spinner         2s ago\n\

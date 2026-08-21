@@ -12,5 +12,10 @@ target/
 __pycache__/
 *.py[cod]
 /tests/raw/
+# Raw pane captures taken while probing a live agent. They are evidence,
+# not fixtures: a live capture holds whatever was on that pane's screen,
+# which the secrets rule keeps out of the record. A capture that becomes
+# a fixture gets read line by line first and moves under tests/fixtures/.
+/scratch/
 *.ndjson.tmp
 /.claude/

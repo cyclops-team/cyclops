@@ -207,17 +207,31 @@ verify_pattern = ["<message_id>", "Pasted"]
 safe_states = ["idle"]
 unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]
 
-# MEASURED (fixture codex_pasted_chip_plain.txt and a live 2026-08-20
-# capture): a blank line then one model status row below the composer.
-# MEASURED (fixture codex_pasted_chip_esc.txt and a live 2026-08-20
-# capture): one model status row below the composer, painted in truecolor.
+# MEASURED (fixtures codex_pasted_chip_plain.txt and codex_pasted_chip_esc.txt,
+# rows 37 and 38 of the same capture, plus a live 2026-08-20 capture): a
+# blank row, then one model status row painted in truecolor.
 # The two lists are one layout: entry i is row i, plain and escaped.
+#
+# The blank row is declared, not filtered. It is a row codex paints, so
+# leaving it out made a raw-wrapped sentinel refuse on this vendor: the
+# suffix began with a row the layout did not describe. Dropping blank
+# rows instead would have been worse, because an undeclared blank after
+# the sentinel is exactly how a truncated capture looks.
 composer_trailer_regex = [
+  '^\s*$',
   '^\s{0,4}gpt-\S+(?: \S+)?(?: · [^·]+)+\s*$',
 ]
 composer_trailer_regex_esc = [
+  '^\s*$',
   '^\s*\x1b\[38;2;\d+;\d+;\d+mgpt-',
 ]
+# Required prefix length: 2. Both rows are painted every time.
+composer_trailer_required_prefix = 2
+# The collapsed-paste chip, as a whole composer row. MEASURED (fixture
+# codex_pasted_chip_esc.txt): the bold composer glyph, then the chip
+# painted in 38;5;6.
+composer_chip_regex = ['^\s*›\s+\[Pasted Content \d+ chars\]\s*$']
+composer_chip_regex_esc = ['\x1b\[1m›\x1b\[0m\s*\x1b\[38;5;\d+m\[Pasted Content \d+ chars\]\x1b\[39m']
 # The second pattern is anchored on the model-name shape rather than on
 # "N K window", because a generic status-row shape cannot be separated from
 # ordinary prose: 'context · budget · 128K window' is structurally identical

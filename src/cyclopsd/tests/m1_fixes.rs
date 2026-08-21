@@ -243,7 +243,9 @@ async fn quiesce_is_quiet_over_prepaste_deliveries() {
     let resp = rig.ctl.request("daemon.quiesce", json!({})).await;
     assert_eq!(resp["result"]["quiet"], true, "{resp}");
     assert!(
-        resp["result"]["in_flight"].as_array().is_none_or(Vec::is_empty),
+        resp["result"]["in_flight"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
         "{resp}"
     );
 
@@ -510,7 +512,8 @@ async fn decline_aborts_when_the_modal_changes_between_keys() {
     }
     // Raw tty so dd returns on exactly one byte (the first decline key
     // "3"); the dialog then vanishes and the pane becomes a plain cat.
-    let script = &format!("sh -c 'echo FAKE-UPDATE-AVAILABLE; stty -icanon -echo min 1 time 0; dd bs=1 count=1 >/dev/null 2>&1; stty sane; printf \"\\033[2J\\033[H\"; {COMPOSER_SH}'");
+    let tail = composer_tail();
+    let script = &format!("sh -c 'echo FAKE-UPDATE-AVAILABLE; stty -icanon -echo min 1 time 0; dd bs=1 count=1 >/dev/null 2>&1; stty sane; printf \"\\033[2J\\033[H\"; {tail}'");
     let mut rig = Rig::new("toctou", MODAL_MANIFEST, script, "receipt_block_ms = 200\n").await;
     rig.tmux.wait_screen("main", "FAKE-UPDATE-AVAILABLE");
     let pane = rig.pane_ids().await[0].clone();

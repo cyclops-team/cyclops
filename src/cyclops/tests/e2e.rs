@@ -1090,12 +1090,28 @@ fn hook_daemon_down_exits_zero_and_logs() {
         "1"
     );
 
-    // Without any identity the hook still exits 0 and says why in the log.
+    // Without a label the hook no longer refuses before it connects.
+    // That refusal was F-P0-9: the shipped codex and agy hook files pass
+    // no --agent and the panes carry no CYCLOPS_AGENT, so every hook edge
+    // in the fleet died in this branch and hooks_verified was false
+    // everywhere. The daemon derives the origin from the authenticated
+    // socket peer now, so the only thing left to fail here is the
+    // connect, and it still exits 0 and still says why.
     let out = run_cyclops_io(&home, &[], &["hook", "Stop"], Some("{}"));
     assert_eq!(out.status.code(), Some(0));
     assert!(out.stdout.is_empty() && out.stderr.is_empty());
     let log = fs::read_to_string(home.join("hook-errors.log")).expect("hook error log");
-    assert!(log.contains("no agent identity"), "log: {log}");
+    assert!(!log.contains("no agent identity"), "log: {log}");
+    assert_eq!(log.trim().lines().count(), 2, "log: {log}");
+    assert!(
+        log.trim()
+            .lines()
+            .all(|l| l.contains("cyclops isn't running")),
+        "log: {log}"
+    );
+    // A label-free hook consumes no counter: it would otherwise share one
+    // namespace with every other label-free hook on the machine.
+    assert!(!home.join("hookseq").join("Stop").exists());
     let _ = fs::remove_dir_all(&home);
 }
 

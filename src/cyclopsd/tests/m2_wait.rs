@@ -19,7 +19,7 @@ const WAIT_MANIFEST: &str = r#"
 [agent]
 id = "fix"
 display_name = "Wait fixture"
-process_names = ["cat", "sh", "bash", "dash"]
+process_names = ["python3", "python", "Python", "cat", "sh", "bash", "dash"]
 
 [[rule]]
 id = "title_working"
@@ -50,27 +50,30 @@ regex = ['^']
 id = "composer_working"
 state = "working"
 priority = 300
-region = "bottom_non_empty_lines(2)"
-line_regex = ['^CYCFIX-WORKING$']
+region = "bottom_non_empty_lines(5)"
+line_regex = ['^FAKETUI-WORKING$']
 
 [[rule]]
 id = "composer_holds_paste"
 state = "idle_with_input"
 priority = 80
 region = "bottom_non_empty_lines(6)"
-line_regex = ['^\[cyclops:end ']
+line_regex = ['^\s*❯\s+\S']
 
 [[rule]]
 id = "composer_empty"
 state = "idle"
 priority = 90
-region = "bottom_non_empty_lines(1)"
-line_regex = ['^CYCFIX>\s*$']
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^❯\s*$']
 
 [injection]
 submit = "Enter"
 verify_before_submit = true
-verify_pattern = ["<message_id>", "[cyclops:end "]
+verify_pattern = ["<message_id>"]
+composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
+composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
+composer_trailer_required_prefix = 2
 "#;
 
 /// Run tmux commands against the rig's server from a helper thread after a
@@ -479,5 +482,193 @@ async fn send_wait_done_round_trip() {
         Some("delivered_unverified")
     );
     rig.assert_ledger_legal(&[]);
+    rig.shutdown().await;
+}
+
+/// The pane shape an adopted agent actually has: tmux spawned the SHELL,
+/// and the agent is a job that shell put in the terminal's foreground.
+///
+/// A delivery pins the foreground leader, because that is the process the
+/// message went to and the one whose exit invalidates the receipt. The
+/// wait pinned the pane root. On every other fixture in this file those
+/// are the same number, because tmux execs the fake TUI directly, so the
+/// two domains could be compared for free and nothing ever noticed. Here
+/// they differ, and comparing them made `send --wait` answer
+/// occupant_changed the instant it started, on every interactive pane in
+/// the fleet.
+#[tokio::test]
+async fn send_wait_holds_when_the_agent_is_a_child_of_the_pane_shell() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    if std::process::Command::new("zsh")
+        .arg("--version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipping: no zsh to be the pane's shell");
+        return;
+    }
+    // An INTERACTIVE shell, because job control is what puts the child in
+    // its own process group and makes it the tty's foreground. A `sh -c`
+    // would leave the child in the shell's group and collapse the two
+    // identities all over again.
+    let mut rig = Rig::new("waitchild", WAIT_MANIFEST, "zsh -f", "").await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.tmux.run_ok(&[
+        "send-keys",
+        "-t",
+        &pane,
+        &format!("exec 2>/dev/null; python3 {}", faketui_path()),
+        "Enter",
+    ]);
+    rig.tmux.wait_screen(&pane, "❯");
+    rig.label(&pane, "worker").await;
+
+    // The premise, asserted rather than assumed: if this platform ever
+    // stops splitting the two, the test below would pass while proving
+    // nothing.
+    let root = String::from_utf8_lossy(
+        &rig.tmux
+            .run(&["display-message", "-p", "-t", &pane, "#{pane_pid}"])
+            .stdout,
+    )
+    .trim()
+    .parse::<i32>()
+    .expect("pane_pid");
+    let fg = String::from_utf8_lossy(
+        &std::process::Command::new("ps")
+            .args(["-o", "tpgid=", "-p", &root.to_string()])
+            .output()
+            .expect("ps")
+            .stdout,
+    )
+    .trim()
+    .parse::<i32>()
+    .expect("tpgid");
+    assert_ne!(
+        root, fg,
+        "the pane root and its foreground leader collapsed; this fixture no longer \
+         reproduces the shape it exists for"
+    );
+
+    let socket = rig.tmux.socket().to_string();
+    let pane_for_driver = pane.clone();
+    let driver = std::thread::spawn(move || {
+        let tmux = |args: &[&str]| {
+            let _ = std::process::Command::new("tmux")
+                .args(["-u", "-L", &socket, "-f", "/dev/null"])
+                .args(args)
+                .status();
+        };
+        let capture = || {
+            std::process::Command::new("tmux")
+                .args(["-u", "-L", &socket, "-f", "/dev/null"])
+                .args(["capture-pane", "-p", "-t", &pane_for_driver])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default()
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !capture().contains("[cyclops") && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        tmux(&[
+            "select-pane",
+            "-t",
+            &pane_for_driver,
+            "-T",
+            "WORKING the turn",
+        ]);
+        std::thread::sleep(Duration::from_millis(2000));
+        tmux(&["select-pane", "-t", &pane_for_driver, "-T", "READY done"]);
+    });
+
+    let (result, _) = rig
+        .send(json!({
+            "to": ["worker"],
+            "subject": "run this",
+            "body": "a\nb",
+            "wait": {"until": "done", "timeout_ms": 10000},
+        }))
+        .await;
+    driver.join().expect("driver thread");
+
+    let wait = &result["wait"][0];
+    assert_ne!(
+        wait["outcome"], "occupant_changed",
+        "the agent never went anywhere: {result}"
+    );
+    assert_eq!(wait["outcome"], "reached", "{result}");
+    assert_eq!(wait["state"], "idle", "{result}");
+    rig.shutdown().await;
+}
+
+/// The other half of the same binding: when the agent exits and its shell
+/// survives, the wait must say occupant_changed, not sit out its budget.
+///
+/// The pane root never moves here, because the root IS the shell, so the
+/// root-pid comparison sees nothing. What changes is the process in front
+/// of the tty, and the answer has to come from that domain.
+#[tokio::test]
+async fn a_foreground_agent_exiting_ends_the_wait_even_though_the_shell_survives() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    if std::process::Command::new("zsh")
+        .arg("--version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipping: no zsh to be the pane's shell");
+        return;
+    }
+    let mut rig = Rig::new("waitexit", WAIT_MANIFEST, "zsh -f", "").await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.tmux.run_ok(&[
+        "send-keys",
+        "-t",
+        &pane,
+        &format!("exec 2>/dev/null; python3 {}", faketui_path()),
+        "Enter",
+    ]);
+    rig.tmux.wait_screen(&pane, "❯");
+    rig.label(&pane, "worker").await;
+    // A turn is running, so nothing about the fused state will satisfy
+    // the wait on its own: only the occupant check can end it.
+    rig.tmux
+        .run_ok(&["select-pane", "-t", &pane, "-T", "WORKING the turn"]);
+    wait_pane_state(&mut rig, "working").await;
+
+    let socket = rig.tmux.socket().to_string();
+    let pane_for_driver = pane.clone();
+    let driver = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        // Ctrl-C: the fake TUI exits and zsh, which tmux spawned and
+        // which is still very much alive, comes back to the foreground.
+        let _ = std::process::Command::new("tmux")
+            .args(["-u", "-L", &socket, "-f", "/dev/null"])
+            .args(["send-keys", "-t", &pane_for_driver, "C-c"])
+            .status();
+    });
+
+    let resp = rig
+        .ctl
+        .request(
+            "agent.wait",
+            json!({"target": "worker", "until": "done", "timeout_ms": 6000}),
+        )
+        .await;
+    driver.join().expect("driver thread");
+
+    assert_eq!(
+        resp["error"]["data"]["outcome"], "occupant_changed",
+        "the agent it was waiting on is gone: {resp}"
+    );
     rig.shutdown().await;
 }

@@ -318,7 +318,10 @@ pub(crate) async fn dispatch(
             };
             let result = delivery::quiesce(inner, params.timeout_ms).await;
             (
-                Response::ok(id, serde_json::to_value(result).expect("quiesce serializes")),
+                Response::ok(
+                    id,
+                    serde_json::to_value(result).expect("quiesce serializes"),
+                ),
                 None,
             )
         }
@@ -369,18 +372,21 @@ pub(crate) async fn dispatch(
             // forged one lets the record lie. The socket path is pinned to
             // the reporting pane exactly like msg.send pins senders; only
             // the in-process Daemon::report_state path is pre-trusted.
-            if let Err(e) = verify_report_origin(inner, peer, &params.agent) {
-                return (
-                    Response {
-                        id,
-                        result: None,
-                        error: Some(e),
-                    },
-                    None,
-                );
-            }
+            let origin = match verify_report_origin(inner, peer, params.agent.as_deref()) {
+                Ok(o) => o,
+                Err(e) => {
+                    return (
+                        Response {
+                            id,
+                            result: None,
+                            error: Some(e),
+                        },
+                        None,
+                    )
+                }
+            };
             (
-                from_result(id, ack::handle_report(inner, params).await),
+                from_result(id, ack::handle_report(inner, params, origin).await),
                 None,
             )
         }
@@ -674,7 +680,29 @@ fn report_panes(inner: &Inner) -> Vec<(String, Option<String>, i32)> {
 /// Everything else is denied and NOT ingested: a same-uid process outside
 /// the pane (the admin shell included) could otherwise forge hook liveness
 /// and tier-1 ACK evidence, and the record must never lie.
-fn verify_report_origin(inner: &Inner, peer: Peer, agent: &str) -> Result<(), WireError> {
+/// Who a hook report is really from.
+///
+/// Derived from the socket peer and the pane table, never from the
+/// request. Everything downstream uses THIS, so a respawn between
+/// verification and ingestion cannot hand one occupant's hook to another.
+pub(crate) struct ReportOrigin {
+    /// The canonical name the daemon files this report under.
+    pub(crate) recipient: String,
+    pub(crate) pane_id: String,
+    /// The AGENT INSTANCE that reported, which is the tty's foreground
+    /// process-group leader, not the pane's root process. A pane root is
+    /// usually a shell and outlives the agents run inside it, so pinning
+    /// it would let the next agent launched at that prompt inherit
+    /// everything the previous one was trusted for.
+    pub(crate) pane_pid: i32,
+    pub(crate) manifest: Option<String>,
+}
+
+fn verify_report_origin(
+    inner: &Inner,
+    peer: Peer,
+    agent: Option<&str>,
+) -> Result<ReportOrigin, WireError> {
     let deny = |message: String| WireError {
         code: "denied".to_string(),
         message,
@@ -682,25 +710,95 @@ fn verify_report_origin(inner: &Inner, peer: Peer, agent: &str) -> Result<(), Wi
     };
     let (uid, pid) = daemon_peer(peer)?;
     let panes = report_panes(inner);
-    let allowed = match identity::resolve_sender(uid, pid, &panes) {
-        identity::Sender::Agent(label) => {
-            // The report may name the pane by label or by pane id.
-            agent == label
-                || panes
-                    .iter()
-                    .any(|(pane_id, l, _)| l.as_deref() == Some(label.as_str()) && pane_id == agent)
-        }
-        identity::Sender::Pane(pane_id) => agent == pane_id,
-        identity::Sender::Admin => false,
+    // The origin is whichever watched pane this process actually lives in.
+    // A shell outside every pane resolves to admin, which has no pane and
+    // therefore no hooks to report.
+    // One walk, one row: the pane whose pid the ancestry actually matched.
+    let Some((pane_id, label, pane_root_pid)) = identity::resolve_report_origin(uid, pid, &panes)
+    else {
+        return Err(deny(
+            "hook reports come from inside an agent pane; this peer is outside every \
+             watched pane (admin cannot post hook reports)"
+                .to_string(),
+        ));
     };
-    if allowed {
-        Ok(())
-    } else {
-        Err(deny(format!(
-            "hook reports for {agent:?} are only accepted from a process inside that pane; \
-             this peer is not (admin cannot post hook reports)"
-        )))
+    let recipient = label.clone().unwrap_or_else(|| pane_id.clone());
+    // A supplied name is an assertion about that origin, so it has to
+    // agree with it. Disagreement is a denial rather than a correction:
+    // whichever of the two is wrong, acting on the report would file it
+    // under a name its own sender did not believe.
+    if let Some(claim) = agent {
+        if claim != recipient && claim != pane_id {
+            return Err(deny(format!(
+                "this report claims to be {claim:?} but comes from {recipient:?}"
+            )));
+        }
     }
+    // Live row first, last-known row second. A detached session has no
+    // watcher, and deriving this live-only would make every honest hook
+    // during an outage look like it came from rules the pane no longer
+    // uses. The detach-aware contract is older than this check and the
+    // check must not quietly repeal it.
+    let row = inner
+        .resolve_recipient(&pane_id)
+        .and_then(|(idx, id)| inner.watcher_of(idx).and_then(|w| w.pane(&id)))
+        .or_else(|| {
+            inner
+                .resolve_recipient_last_known(&pane_id)
+                .map(|(_, row)| row)
+        });
+    if row.is_none() {
+        return Err(deny(
+            "this pane is gone; there is nothing for a hook report to speak for".to_string(),
+        ));
+    }
+    // Authentication, and the pin is not evidence for it.
+    //
+    // Landing inside the pane only proves the peer is SOMEWHERE in it,
+    // and a pane sitting at its shell prompt keeps its adoption and its
+    // manifest pin while anyone at that prompt runs anything. Reading the
+    // terminal's current foreground does not fix that either: a
+    // hand-started `cyclops hook` holds the tty while it runs, so it
+    // would present itself as the pane's agent and the pin would agree
+    // with it.
+    //
+    // What actually admits a report is descent: the nearest process at or
+    // above the peer, up to the pane root, whose own argv says it is an
+    // agent this daemon ships a manifest for. A hook helper is a child of
+    // the agent that ran it, so that walk lands on the agent whether the
+    // agent holds the tty or handed it over; a helper nobody's agent
+    // started has no such ancestor and is refused.
+    let Some((vendor, agent_pid)) = fusion::vendor_between(inner, &pane_id, pid, pane_root_pid)
+    else {
+        return Err(deny(
+            "hook reports come from an agent process; nothing between this peer and the pane's \
+             shell is an agent cyclops has a manifest for"
+                .to_string(),
+        ));
+    };
+    // The pin says which rules read the pane. It cannot admit a process,
+    // but it must not contradict one either: if the operator pinned this
+    // pane to one vendor and another is running in it, the two records
+    // disagree and neither is safe to act on.
+    let pinned = inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .manifest_of(&pane_id);
+    if let Some(pinned) = pinned {
+        if pinned != vendor.agent.id {
+            return Err(deny(format!(
+                "this pane is pinned to {pinned:?} but {:?} is what is running in it",
+                vendor.agent.id
+            )));
+        }
+    }
+    Ok(ReportOrigin {
+        recipient,
+        pane_id,
+        pane_pid: agent_pid,
+        manifest: Some(vendor.agent.id.clone()),
+    })
 }
 
 /// Assemble StatusResult from the session slots and the detection cache.
@@ -746,17 +844,39 @@ pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResul
                         // the change mark fusion keeps. The roster's
                         // elapsed column is this number and nothing else.
                         ps.state_ms = entry.map(|e| e.since.elapsed().as_millis() as u64);
+                        // The second answer, carried from the same stamp
+                        // the gate obeys. A pane with no cached detection
+                        // has nothing behind it, so it stays refused.
+                        ps.write_ready = entry.is_some_and(|e| e.detection.write_ready);
+                        ps.write_block = entry.and_then(|e| e.detection.write_block.clone());
                         // Hook liveness (amendment c): adopted panes whose
                         // manifest declares hooks carry the verified bit,
                         // scoped to the current occupant (edges from a
                         // replaced occupant count for nothing).
-                        ps.hooks_verified = crate::selftest::hooks_verified_for(
-                            inner,
-                            &r.pane_id,
-                            labels.contains_key(&r.pane_id),
-                            entry.and_then(|e| e.manifest.as_deref()),
-                            r.pane_pid,
-                        );
+                        //
+                        // The occupant lookup shells out, so it runs only
+                        // for panes whose answer can be anything but
+                        // false. A manifest that declares no hooks
+                        // already settles it, and status should not spawn
+                        // a process per pane to reprint that.
+                        //
+                        // The occupant recorded on the detection entry is
+                        // NOT a substitute (R19): that pid describes the
+                        // verdict, and a pane can change hands without a
+                        // recompute, at which point liveness would still
+                        // be answered for the dead occupant. Proven by
+                        // `occupant_swap_invalidates_liveness_and_renews_the_f1_ping`,
+                        // which hangs on the cached value.
+                        let bound = entry.and_then(|e| e.manifest.as_deref());
+                        ps.hooks_verified = bound.and_then(|m| {
+                            crate::selftest::hooks_verified_for(
+                                inner,
+                                &r.pane_id,
+                                labels.contains_key(&r.pane_id),
+                                Some(m),
+                                fusion::foreground_pid(r.pane_pid),
+                            )
+                        });
                         // The manifest's own display name, from the same
                         // load the daemon did at boot: a client renders
                         // daemon identity data instead of re-parsing
@@ -843,10 +963,10 @@ async fn pane_read(inner: &Arc<Inner>, id: Value, params: Value) -> Response {
             )
             .await
             {
-                // Both answers travel together: the runtime state and,
-                // stamped from the one rule that owns it, whether a
-                // terminal write is allowed right now.
-                Some(det) => det.with_write_block(),
+                // Both answers travel together, and neither is computed
+                // here: fusion stamped them when it produced the verdict,
+                // so this surface cannot disagree with the gate.
+                Some(det) => det,
                 None => return Response::err(id, "no_such_target", "pane vanished during read"),
             };
             // --raw: the screen beside what the sensors made of it, in the

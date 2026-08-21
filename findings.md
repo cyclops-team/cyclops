@@ -1366,8 +1366,19 @@ Measured rows, 2026-08-20 unless noted:
   78% · 93% 5h, … · 507K used`.
 - cursor: NOT measured. No cursor pane exists in this fleet and none was
   installed to make one. Cursor therefore ships no trailer vocabulary,
-  which makes the sentinel path undecidable for it, and that lane keeps
-  the leading-id evidence it had before.
+  and no chip pattern either, since it does not collapse a paste.
+
+  CORRECTED 2026-08-21. An earlier version of this line said that lane
+  "keeps the leading-id evidence it had before". It does not, and cannot:
+  `staged_verified` accepts the terminal sentinel or the composer chip
+  and nothing else, so `verify_pattern = ["<message_id>"]` is now inert
+  and every Cursor staging verify refuses. That is the correct fail-closed
+  answer for a vendor nobody measured, and restoring leading-id
+  acceptance would reintroduce exactly the defect the sentinel exists to
+  fix (F-P0-10). It is also a live blocker rather than a soak-only
+  concern: on this tree, every Cursor delivery ends in
+  attention_required. Closing it needs a capture off a current Cursor,
+  not a decision.
 
 Consequence worth stating plainly, because it bounds what these patterns
 can promise: a status row and a sentence are both text, and a pattern
@@ -1377,3 +1388,156 @@ pattern is anchored on the model-name shape instead, and it fails closed
 when the model family is renamed. `shipped_trailers_reject_adversarial_
 payload_text` holds the line: every pattern is tested against prose
 derived from it, and a pattern that matches payload is a bug.
+
+## F-P0-8: Claude 2.1.236 keeps the idle sparkle through a long turn
+
+Measured 2026-08-20 on macOS 15.5, live, Claude Code 2.1.236. A tool
+execution ran continuously for over 28 minutes while `cyclops status`
+reported the pane idle.
+
+Cause, and it takes two rules agreeing to produce it. Claude sets the
+terminal title to "✳ <summary>" when a turn ends and KEEPS that title
+through whatever runs next, so `title_idle_sparkle` matched. The input
+composer stays drawn below the streaming output, so `composer_empty`
+matched too. Title and screen agreed on idle, disagreement was false,
+and under INVARIANTS rule 12 that shape is write-ready: the gate would
+have pasted into a pane mid-generation.
+
+Probe: read-only sampling across animated frames. The active status row
+cycles a leading glyph (·, ✶, ✽, ✳, ✢, ✻) and a gerund verb
+("Kneading…", "Jitterbugging…") painted in SGR 38;5;215, followed by a
+running timer envelope in 38;5;246. Captured to
+`src/cyclops-manifest/tests/fixtures/claude_working_2_1_236_esc.txt`,
+sha256 fc76fae03393c4a1a7bed76e6ee9f03e2753ef6b78b9f1f9060399edb8ace883, a real escaped capture. Its plain sibling is derived from
+those bytes in the test rather than captured separately: two captures
+are two moments, and the claim is about one.
+
+Negative separation, which is why the rule is style-bound and not a word
+match: completed steps stay in the transcript forever, rendered with ⏺
+or "Cooked for" in uniform 38;5;246 or 38;5;231. They never combine the
+215 glyph and verb with the 246 timer envelope in the bottom region.
+
+Fix: `composer_working_spinner_status` in
+`resources/manifests/claude.toml`, priority 1150, region
+`bottom_non_empty_lines(10)`, matching the escaped row. 1150 puts it
+above `title_idle_sparkle` (1000) and `composer_empty` (900), so an
+active turn outranks both halves of the agreement that produced the
+false idle.
+
+## F-P0-9: hook reports required a label the hooks did not have
+
+Measured 2026-08-20. `~/.cyclops/hook-errors.log` grew continuously with
+`no agent identity; set CYCLOPS_AGENT or pass --agent`, and no hook edge
+had ever reached the daemon from any pane.
+
+What is proven: `cyclops hook` refused before connecting unless a label
+was supplied, the codex and agy hook files invoke it with no `--agent`,
+and the panes running them had no `CYCLOPS_AGENT` in their environment.
+The claude pane had no hook wiring at all, so it contributed no errors
+and no edges either.
+
+What is NOT proven, and worth stating because it is the tempting story:
+whether a vendor strips the environment for hook subshells, or the panes
+were simply launched without the variable. Nobody probed that, and the
+fix does not depend on the answer.
+
+Consequence: `hooks_verified` was false fleet-wide and every receipt
+degraded to the screen tier. The fix makes the label optional and has
+the daemon derive the origin from the authenticated socket peer, which
+it already computed in order to verify reports. A supplied label stays
+an assertion, checked against that origin and denied on disagreement.
+
+## F-P0-10: why the leading id is not evidence, and why chip vs sentinel is a per-message question
+
+Two facts DELIVERY.md now states as rules. Both were measured during P0;
+the reasoning lives here so the normative doc stays short.
+
+**A visible `[cyclops <id>]` proves only that the head of the payload
+arrived.** A truncated paste proves exactly the same thing, and that is
+the failure the sentinel exists to catch: with a long payload the id
+scrolls out of the verify region while the tail is still on screen, so
+the id is simultaneously the weakest evidence and the one most likely to
+be missing. Accepting it would submit half a message; requiring the
+sentinel instead moves the proof to the END of the payload, where
+"arrived" and "arrived whole" are the same question.
+
+**Terminality is decided by the escaped capture, not by prose.** On every
+vendor measured so far (F-P0-4), composer chrome arrives painted with SGR
+attributes while a pasted payload row arrives plain, so prose shaped like
+a status row fails the escaped half of the trailer layout. That is a
+measured property of those three layouts, not a law about terminals. A
+vendor that paints pasted text would need its own measurement, and until
+somebody takes it the sentinel path refuses on that vendor rather than
+guessing.
+
+**Chip and sentinel are chosen by the render, not the vendor.** The same
+CLI at the same version produces a raw-wrapped payload for one message
+and a collapsed "[Pasted Content N chars]" chip for the next, depending
+on size and content (F54, Codex 0.147.0). So the two evidence paths
+cannot be assigned per vendor at manifest-write time; verification tries
+the sentinel first and falls to the chip on what the capture actually
+shows.
+
+## F-P0-11: the in-process report origin could not place a pane during a detach
+
+Measured 2026-08-21 by `hook_ack_during_detach_resolves_the_delivery`,
+which failed with `{"applied":false,"reason":"occupant_changed"}`.
+
+`Daemon::report_state` is the pre-trusted in-process entry for hook
+reports. It states the origin the socket path would have derived rather
+than trusting the caller, which is right. But it derived that origin
+through `resolve_recipient`, and that function answers only from LIVE
+watchers by design. During a detach it returns None, and the fallback
+was `(name, 0, None)`: pane id replaced by the label, pid zero.
+
+Downstream, `handle_report` resolves the pane through
+`resolve_recipient_last_known`, so it found a real row with a real pid
+and compared it against the origin's zero. Exact-equality pid binding
+(R15) then refused the report as an occupant change, and it refused it
+BEFORE reaching the branch that names an unattributable origin, so the
+reason was wrong as well.
+
+The window this broke is the one the path exists for: a vendor hook
+fires while nobody is attached, which is the case that motivated the
+in-process trusted path in the first place. Refusing it re-opens the
+duplicate-delivery hole the soak found.
+
+Fix: derive the detached origin from `resolve_recipient_last_known`, the
+same record `handle_report` uses, and keep the zero pid for panes that
+genuinely cannot be placed. The daemon still derives the origin itself,
+so nothing about the trust boundary moves.
+
+## F-P0-12: codex paints a blank row below the composer, and the layout did not declare it
+
+MEASURED, from rows 36 to 38 of `codex_pasted_chip_plain.txt` and
+`codex_pasted_chip_esc.txt`, which are the same capture in both forms:
+
+```
+36  › [Pasted Content 2828 chars]
+37
+38    gpt-5.6-sol high · /private/tmp/... · ...
+```
+
+Row 37 is blank in both forms, with no SGR at all in the escaped one. The
+shipped `composer_trailer_regex` listed only the model row, so a
+raw-wrapped codex sentinel produced a suffix of [blank, model] whose
+first row matched nothing in the layout, and `sentinel_proof` refused.
+Correct behaviour for an undeclared row, and it left codex with no
+sentinel path: every raw-wrapped delivery to it went to
+attention_required.
+
+The fix declares the blank as layout entry 0, with the required prefix
+raised to 2. Filtering blank rows out instead would have been the wrong
+repair in the same way for both vendors: an undeclared blank after the
+sentinel is exactly what a truncated capture looks like, and that
+refusal is load-bearing (`a_blank_row_after_the_sentinel_fails_closed`).
+
+What is NOT proven, and matters for R12: no real raw-wrap capture off
+codex exists in this tree. The regression
+(`a_codex_raw_wrap_verifies_through_its_measured_blank_separator`) uses
+the real chrome rows verbatim in both forms and synthesizes only the
+composer row. It proves the declared layout matches what codex paints
+below the composer. It does not prove what codex does to a long paste,
+including whether continuation rows carry leading indentation, which
+would change whether the sentinel is a whole row. That needs a capture
+off a live codex.

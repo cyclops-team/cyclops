@@ -132,6 +132,87 @@ pub fn resolve_sender(uid: u32, pid: i32, panes: &[(String, Option<String>, i32)
     resolve_with(pid, panes, parent_of)
 }
 
+/// The same walk, returning the PANE it landed on rather than a name.
+///
+/// A hook report has to be pinned to the exact row whose `pane_pid`
+/// matched the ancestry. Resolving to a label and then looking the label
+/// up again throws that away: two panes can carry the same label across
+/// sessions, and the table can drift between the two lookups, so the
+/// second one can answer with a different pane than the walk found.
+pub fn resolve_report_origin(
+    uid: u32,
+    pid: i32,
+    panes: &[(String, Option<String>, i32)],
+) -> Option<(String, Option<String>, i32)> {
+    let _ = uid;
+    resolve_row_with(pid, panes, parent_of)
+}
+
+/// The first process at or above `pid`, stopping at `root`, that
+/// `is_vendor` accepts.
+///
+/// This answers "which agent instance is this process working for",
+/// which is a different question from "which pane is it in". A hook
+/// helper is a child of the agent that ran it, so the agent is found by
+/// walking up from the helper; whoever currently holds the terminal has
+/// no bearing on it. The walk stops at the pane root because nothing
+/// above the pane is the pane's business.
+pub fn vendor_ancestor<F: Fn(i32) -> bool>(pid: i32, root: i32, is_vendor: F) -> Option<i32> {
+    vendor_ancestor_with(pid, root, is_vendor, parent_of)
+}
+
+fn vendor_ancestor_with<F, P>(pid: i32, root: i32, is_vendor: F, parent: P) -> Option<i32>
+where
+    F: Fn(i32) -> bool,
+    P: Fn(i32) -> Option<i32>,
+{
+    let mut current = pid;
+    let mut seen: HashSet<i32> = HashSet::new();
+    for _ in 0..MAX_ANCESTRY_DEPTH {
+        if current <= 0 || !seen.insert(current) {
+            break;
+        }
+        if is_vendor(current) {
+            return Some(current);
+        }
+        // The root is examined, never passed: the pane's own shell is the
+        // last honest candidate, and its parent is tmux.
+        if current == root {
+            break;
+        }
+        match parent(current) {
+            Some(p) => current = p,
+            None => break,
+        }
+    }
+    None
+}
+
+fn resolve_row_with<F>(
+    pid: i32,
+    panes: &[(String, Option<String>, i32)],
+    parent: F,
+) -> Option<(String, Option<String>, i32)>
+where
+    F: Fn(i32) -> Option<i32>,
+{
+    let mut current = pid;
+    let mut seen: HashSet<i32> = HashSet::new();
+    for _ in 0..MAX_ANCESTRY_DEPTH {
+        if current <= 0 || !seen.insert(current) {
+            break;
+        }
+        if let Some(row) = panes.iter().find(|(_, _, pp)| *pp == current) {
+            return Some(row.clone());
+        }
+        match parent(current) {
+            Some(p) => current = p,
+            None => break,
+        }
+    }
+    None
+}
+
 /// The walk, with the parent lookup injected so tests drive it over
 /// synthetic process trees.
 fn resolve_with<F>(pid: i32, panes: &[(String, Option<String>, i32)], parent: F) -> Sender
@@ -221,6 +302,67 @@ mod tests {
     fn tree(edges: &[(i32, i32)]) -> impl Fn(i32) -> Option<i32> + '_ {
         let map: HashMap<i32, i32> = edges.iter().copied().collect();
         move |pid| map.get(&pid).copied()
+    }
+
+    /// The pane's own shell prompt is the attack surface: an adopted pane
+    /// keeps its label, its adoption and its manifest pin while its agent
+    /// is not running, and anyone at that prompt can start anything.
+    ///
+    /// So being inside the pane is not enough, and neither is holding the
+    /// terminal: a hand-started helper holds it while it runs. What
+    /// admits a report is descent from an agent process.
+    #[test]
+    fn a_helper_nobody_started_from_an_agent_is_not_admitted() {
+        // 100 is the pane's zsh. The operator typed the helper at its
+        // prompt, so 500's only ancestor is the shell.
+        let parent = tree(&[(500, 100), (100, 1)]);
+        let is_agent = |pid: i32| pid == 300;
+        assert_eq!(
+            vendor_ancestor_with(500, 100, is_agent, parent),
+            None,
+            "a pane pinned to an agent still admitted a process the agent never started"
+        );
+    }
+
+    #[test]
+    fn a_helper_the_agent_started_is_admitted_as_that_agent() {
+        // cyclops hook (500) under a shell (400) under claude (300) under
+        // the pane's zsh (100), which is how a vendor runs a hook.
+        let parent = tree(&[(500, 400), (400, 300), (300, 100), (100, 1)]);
+        assert_eq!(
+            vendor_ancestor_with(500, 100, |pid| pid == 300, parent),
+            Some(300),
+            "the report belongs to the agent that ran the hook"
+        );
+    }
+
+    #[test]
+    fn a_pane_that_execs_its_agent_directly_is_admitted_at_the_root() {
+        // tmux spawned the agent itself, so the pane root IS the agent
+        // and the walk has to examine it rather than stop before it.
+        let parent = tree(&[(500, 100), (100, 1)]);
+        assert_eq!(
+            vendor_ancestor_with(500, 100, |pid| pid == 100, parent),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn the_walk_stops_at_the_pane_root() {
+        // 1 is above the pane. Whatever it is, it is not this pane's
+        // agent, and admitting it would let a process outside the pane
+        // vouch for one inside it.
+        let parent = tree(&[(500, 100), (100, 1)]);
+        assert_eq!(vendor_ancestor_with(500, 100, |pid| pid == 1, parent), None);
+    }
+
+    #[test]
+    fn a_cycle_in_the_tree_ends_the_vendor_walk() {
+        let parent = tree(&[(500, 400), (400, 500)]);
+        assert_eq!(
+            vendor_ancestor_with(500, 100, |pid| pid == 300, parent),
+            None
+        );
     }
 
     #[test]

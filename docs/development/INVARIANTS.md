@@ -197,16 +197,35 @@ The resolution walks the peer pid's ancestry until a pid matches a watched
 pane's `pane_pid`. Labeled pane: that agent. Unlabeled pane: the pane id.
 No watched pane in the ancestry: `admin`, because a same-uid shell outside
 every pane is the human. A uid other than the daemon's is denied before any
-request is parsed. The same rule guards `agent.state.report`: only a
-process inside the pane it speaks for may report for it.
+request is parsed.
 
-- Enforced at: `src/cyclopsd/src/identity.rs`, `peer_of` and
-  `resolve_sender`; `src/cyclopsd/src/server.rs`,
-  `verify_report_origin`.
+`agent.state.report` needs one more thing, because being in the pane is
+weaker than it sounds. An adopted pane keeps its label, its adoption and
+its manifest pin while its agent is not running, so anyone at that pane's
+shell prompt can start anything, and reading the terminal's current
+foreground does not help: a hand-started helper holds the tty while it
+runs and would present itself as the pane's agent, with the pin agreeing.
+
+What admits a report is descent. The daemon walks from the peer up to the
+pane root and takes the first process whose own argv says it is an agent
+it ships a manifest for; a hook helper is a child of the agent that ran
+it, so that walk lands on the agent whether the agent holds the tty or
+handed it over. A peer with no such ancestor is refused, and a pin that
+disagrees with the process found is refused rather than believed. The
+same proven pid and manifest are what the ACK path re-derives, so both
+ends of a report speak about the same process.
+
+- Enforced at: `src/cyclopsd/src/identity.rs`, `peer_of`,
+  `resolve_sender` and `vendor_ancestor`; `src/cyclopsd/src/server.rs`,
+  `verify_report_origin`; `src/cyclopsd/src/fusion.rs`,
+  `vendor_between` and `admitted_vendor`.
 - Proven by: `src/cyclopsd/src/server.rs`,
   `msg_send_fails_closed_without_peer_credentials`;
   `src/cyclopsd/tests/m2_hooks.rs`,
-  `forged_report_over_the_socket_is_denied_and_ingests_nothing`.
+  `forged_report_over_the_socket_is_denied_and_ingests_nothing`;
+  `src/cyclopsd/src/identity.rs`,
+  `a_helper_nobody_started_from_an_agent_is_not_admitted` and
+  `a_helper_the_agent_started_is_admitted_as_that_agent`.
 
 ## 7. Secrets never enter the ledger
 
@@ -414,13 +433,38 @@ is answered only by the sensor that can see the composer, saying it is
 empty, right now, with nothing live contradicting it. Absence of evidence
 is not clean evidence; a contested verdict is not clean evidence.
 
-- Enforced at: `cyclops_proto::Detection::write_ready` (the rule, one
-  owner); `src/cyclopsd/src/delivery.rs`, the `AgentState::Idle` arm of
-  `gate`, which holds on `not_write_ready:<reason>` instead of proceeding.
+One clean frame is not clean evidence either, once text has been seen in
+the composer. A screen rule reads one frame, and a pane holding somebody's
+half-typed message can render clean for a frame while it redraws, or while
+the text sits somewhere the rule does not look. So a pane observed holding
+text is refused (`composer_hold`) until a TURN proves the text left:
+`working` while it was held, then a turn end WITH a clean screen reading.
+That is the only positive evidence any vendor gives that a composer was
+emptied. Nothing releases it on elapsed time or on a hook that never
+arrived, and a person who clears their own draft by hand stays held until
+their next completed turn. Conservative, and named in the gate line.
+
+Two dispositions this leaves open, both deliberate. A daemon restart
+starts with no cache, so a pane whose draft is staged but invisible in the
+first reading has no hold; nothing recorded before the restart can be
+recovered, and a timer would not have recovered it either. And a hold
+belongs to an occupant: a pane that changes hands starts clear, because
+the new agent never staged the old one's text.
+
+- Enforced at: `cyclops_proto::Detection::stamped`, which combines the
+  sensor policy with the pane's own mode and writes the verdict onto the
+  detection; `src/cyclopsd/src/fusion.rs` stamps before caching, so the
+  cache every surface reads already carries it. `src/cyclopsd/src/delivery.rs`
+  requires that positive stamp at the gate and again immediately before
+  the paste, holding on `not_write_ready:<reason>`. Nothing re-derives the
+  answer: a caller that could only see the sensors would answer a
+  narrower question and could overwrite an authoritative refusal.
 - Proven by: `src/cyclops-proto/src/state.rs`,
   `hook_idle_over_unknown_screen_is_not_write_ready`,
-  `hook_idle_alone_is_not_write_ready`, and
-  `disagreement_is_never_write_ready`.
+  `hook_idle_alone_is_not_write_ready`,
+  `disagreement_is_never_write_ready`,
+  `a_pane_that_was_holding_text_refuses_a_clean_frame`, and
+  `the_hold_releases_only_on_a_completed_turn`.
 
 
 ## Where these came from

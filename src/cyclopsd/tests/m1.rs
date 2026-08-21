@@ -587,10 +587,10 @@ async fn verification_failure_after_a_successful_paste_never_repastes() {
     let mut rig = Rig::new(
         "retry",
         BAD_VERIFY_MANIFEST,
-        // Deliberately non-verifying: echo stays off so the paste never
-        // shows, which is the point. It still needs a clean screen to be
-        // admitted at all, so the prompt is painted first.
-        "sh -c 'printf \"CYCFIX>\\n\"; stty -echo; exec cat'",
+        // Deliberately non-verifying: the pane stages the paste like any
+        // composer, and the manifest's verify pattern is a token that
+        // never appears. Admission is real; the proof is what fails.
+        &composer_pane(),
         "",
     )
     .await;

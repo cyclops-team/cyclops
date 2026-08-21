@@ -16,7 +16,7 @@ cyclops send codex --subject "Run the tests" --wait done
 
 | Until | Resolves when |
 |---|---|
-| `idle` | The composer is ready and no turn is running. |
+| `idle` | No turn is running. Not the same as being writable: whether a message may be pasted is the daemon-stamped write-readiness answer. |
 | `done` | The current or next turn ends (the working to idle edge). An agent that is already idle must start and finish a turn first. |
 | `blocked` | The agent hits any blocked state: vendor modal, permission prompt, or quota. |
 
