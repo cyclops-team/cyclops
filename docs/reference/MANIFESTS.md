@@ -17,7 +17,7 @@ three steps away.
 
 ```
 $ cyclops read reviewer --source detection
-reviewer · ○ idle · decided by title_idle
+reviewer · ○ idle · decided by title_idle · write-ready
 
   title  ○ idle  title_idle  just now
 ```

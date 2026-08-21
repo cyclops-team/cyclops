@@ -178,9 +178,16 @@ paste-then-Enter would have lost the message silently."""
 
 # MEASURED (live 2026-08-20 capture): the composer is a box, so below the
 # staged text come the closing rule and one model status row.
+# MEASURED (live 2026-08-20 capture, agy 1.1.13): the composer is a box, so
+# the closing rule and one model status row follow the staged text, both
+# painted. The two lists are one layout: entry i is row i, plain and escaped.
 composer_trailer_regex = [
   '^─+$',
   '^\s{0,4}Gemini [^·]+(?: · [^·]+){2,} · Ctx: \d+%(?: · .+)?\s*$',
+]
+composer_trailer_regex_esc = [
+  '^\x1b\[90m─',
+  '^\x1b\[38;5;\d+mGemini\b',
 ]
 
 [context_leak]

@@ -364,6 +364,8 @@ pub(crate) fn fuse(
             disagreement: matches!((title, screen), (Some(t), Some(s)) if t.state != s.state),
             decided_by: w.id.clone(),
             stale: false,
+            write_ready: false,
+            write_block: None,
             readings,
         },
         None => Detection {
@@ -372,6 +374,8 @@ pub(crate) fn fuse(
             disagreement: false,
             decided_by: "no_rule".into(),
             stale: false,
+            write_ready: false,
+            write_block: None,
         },
     }
 }
@@ -422,6 +426,8 @@ pub(crate) async fn recompute_pane(
                     disagreement: false,
                     decided_by: "pane_in_mode".into(),
                     stale: false,
+                    write_ready: false,
+                    write_block: None,
                 };
                 map.insert(
                     pane_id.to_string(),
@@ -444,6 +450,8 @@ pub(crate) async fn recompute_pane(
             disagreement: false,
             decided_by: "pane_dead".into(),
             stale: false,
+            write_ready: false,
+            write_block: None,
         }
     } else if let Some(m) = manifest {
         let t_rule = title_winner(m, &row.title);
@@ -495,6 +503,8 @@ pub(crate) async fn recompute_pane(
             disagreement: false,
             decided_by: "no_manifest".into(),
             stale: false,
+            write_ready: false,
+            write_block: None,
         }
     };
 

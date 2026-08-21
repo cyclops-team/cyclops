@@ -240,10 +240,19 @@ correctness nicety for ordering, not a loss-prevention necessity, on this CLI.""
 # below the composer Claude renders a box rule, a model status row, and
 # optional hint/mode rows. None of it is payload, so the terminal sentinel
 # may be followed by these and still be the last payload token.
+# MEASURED (fixtures claude_typed_composer_esc.txt, claude_pasted_chip_esc.txt):
+# the rows below the composer arrive in this order, and each is painted by
+# the product, so each carries an SGR prefix a pasted human line never has.
+# The two lists are one layout: entry i is row i, plain and escaped.
 composer_trailer_regex = [
   '^─+$',
   '^\s{0,4}\S[^·]*(?: · [^·]+){3,} · \d+K window(?: · \d+K used)?\s*$',
   '^\s{0,4}paste again to expand\s*$',
   '^\s{0,4}⏸ [^·]*\b(?:on|off)\b(?: · .+)?\s*$',
-  '^\s{0,4}\? for shortcuts\s*$',
+]
+composer_trailer_regex_esc = [
+  '^\x1b\[38;5;244m─',
+  '^\x1b\[39m\s+\x1b\[38;5;\d+m\S',
+  '^\s*\x1b\[38;5;\d+mpaste again to expand',
+  '^\x1b\[39m\s+\x1b\[38;5;\d+m⏸',
 ]

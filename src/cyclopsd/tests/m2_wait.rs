@@ -42,10 +42,35 @@ priority = 100
 region = "pane_title"
 regex = ['^']
 
+# Lifecycle rules, matching the shared fixtures: a write needs positive
+# clean-composer screen evidence (INVARIANTS rule 12), the staged sentinel
+# row is the staging evidence a blank pane can still show, and the
+# transient working row is the turn evidence the screen ACK tier needs.
+[[rule]]
+id = "composer_working"
+state = "working"
+priority = 300
+region = "bottom_non_empty_lines(2)"
+line_regex = ['^CYCFIX-WORKING$']
+
+[[rule]]
+id = "composer_holds_paste"
+state = "idle_with_input"
+priority = 80
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^\[cyclops:end ']
+
+[[rule]]
+id = "composer_empty"
+state = "idle"
+priority = 90
+region = "bottom_non_empty_lines(1)"
+line_regex = ['^CYCFIX>\s*$']
+
 [injection]
 submit = "Enter"
 verify_before_submit = true
-verify_pattern = ["<message_id>"]
+verify_pattern = ["<message_id>", "[cyclops:end "]
 "#;
 
 /// Run tmux commands against the rig's server from a helper thread after a
@@ -78,7 +103,7 @@ async fn agent_wait_idle_answers_immediately_and_unknown_targets_fail() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
-    let mut rig = Rig::new("waitnow", WAIT_MANIFEST, "cat", "").await;
+    let mut rig = Rig::new("waitnow", WAIT_MANIFEST, &composer_pane(), "").await;
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
 
@@ -117,7 +142,7 @@ async fn agent_wait_done_resolves_on_the_working_to_idle_edge() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
-    let mut rig = Rig::new("waitdone", WAIT_MANIFEST, "cat", "").await;
+    let mut rig = Rig::new("waitdone", WAIT_MANIFEST, &composer_pane(), "").await;
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
 
@@ -181,7 +206,7 @@ async fn agent_wait_blocked_resolves_on_a_blocked_state() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
-    let mut rig = Rig::new("waitblk", WAIT_MANIFEST, "cat", "").await;
+    let mut rig = Rig::new("waitblk", WAIT_MANIFEST, &composer_pane(), "").await;
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
 
@@ -208,7 +233,7 @@ async fn agent_wait_timeout_is_a_wire_error_naming_the_state() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
-    let mut rig = Rig::new("waitto", WAIT_MANIFEST, "cat", "").await;
+    let mut rig = Rig::new("waitto", WAIT_MANIFEST, &composer_pane(), "").await;
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
 
@@ -245,7 +270,7 @@ async fn agent_wait_pins_the_occupant_and_reports_a_killed_pane() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
-    let mut rig = Rig::new("waitocc", WAIT_MANIFEST, "cat", "").await;
+    let mut rig = Rig::new("waitocc", WAIT_MANIFEST, &composer_pane(), "").await;
     // Keep a second pane so the session survives the kill.
     rig.tmux
         .run_ok(&["split-window", "-d", "-t", "main:0", "cat"]);
@@ -295,7 +320,13 @@ async fn send_wait_pins_the_submitted_occupant_not_the_impostor() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
-    let mut rig = Rig::new("waitpin", WAIT_MANIFEST, "cat", "receipt_block_ms = 5000\n").await;
+    let mut rig = Rig::new(
+        "waitpin",
+        WAIT_MANIFEST,
+        &composer_pane(),
+        "receipt_block_ms = 5000\n",
+    )
+    .await;
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
 
@@ -337,12 +368,18 @@ async fn send_wait_pins_the_submitted_occupant_not_the_impostor() {
             .expect("send reached the pre_wait seam");
         // Swap the occupant (cat -> sh) and wait until the watcher table
         // saw it: command and pid travel in the same subscription push.
-        tmux.run_ok(&["respawn-pane", "-k", "-t", &pane, "sh"]);
+        // The impostor is `cat` on purpose. The first occupant is the
+        // composer, which is a shell, so respawning another shell would
+        // leave "the command changed" true from the start and the seam
+        // would resume against the very row it is supposed to catch
+        // changing. The pane pid would be the exact discriminator, but
+        // status does not carry it, so the command name has to differ.
+        tmux.run_ok(&["respawn-pane", "-k", "-t", &pane, "cat"]);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             let status = ctl.request("status", json!({})).await;
             let cmd = status["result"]["sessions"][0]["panes"][0]["current_command"].clone();
-            if cmd != "cat" {
+            if cmd == "cat" {
                 break;
             }
             assert!(
@@ -374,7 +411,7 @@ async fn send_wait_done_round_trip() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
-    let mut rig = Rig::new("sendwait", WAIT_MANIFEST, "cat", "").await;
+    let mut rig = Rig::new("sendwait", WAIT_MANIFEST, &composer_pane(), "").await;
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
 

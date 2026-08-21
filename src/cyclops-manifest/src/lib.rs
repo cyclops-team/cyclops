@@ -28,9 +28,11 @@
 //! name is useless, e.g. native Claude installs reporting "2.1.220"), rule
 //! `line_regex_esc` (match against a capture-pane -e capture, e.g. codex
 //! ghost suggestions are only distinguishable from typed text by SGR dim),
-//! and `injection.composer_trailer_regex` (which rows below the composer
-//! are vendor chrome rather than payload, so the delivery pipeline can
-//! decide whether the terminal sentinel is the last payload token).
+//! and the `injection.composer_trailer_regex` pair (the measured sequence
+//! of rows below the composer, in plain and escaped form, so the delivery
+//! pipeline can decide whether the terminal sentinel is the last payload
+//! row; the escaped half is the quirk plain text cannot express, since
+//! chrome is painted and pasted human text is not).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -82,6 +84,8 @@ pub struct Manifest {
     /// like rule patterns so a bad regex is a load error, not a surprise
     /// during a delivery.
     pub composer_trailers: Vec<regex::Regex>,
+    /// Compiled `injection.composer_trailer_regex_esc`.
+    pub composer_trailers_esc: Vec<regex::Regex>,
     /// Source path, for reload and error messages.
     pub path: PathBuf,
 }
@@ -309,6 +313,15 @@ pub struct Injection {
     /// matches none of these fails verification closed.
     #[serde(default)]
     pub composer_trailer_regex: Vec<String>,
+    /// The same rows matched against the SGR-escaped capture. Required
+    /// alongside the plain patterns: chrome is painted by the vendor and
+    /// therefore styled, while text a human pasted into the composer is
+    /// not, so the escaped form is what separates a status row from prose
+    /// that merely reads like one. A row counts as chrome only when both
+    /// forms match, and a manifest carrying these fails closed when no
+    /// escaped capture is available.
+    #[serde(default)]
+    pub composer_trailer_regex_esc: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -436,26 +449,52 @@ impl Manifest {
         }
         // Highest priority first; evaluation takes the first match.
         rules.sort_by_key(|r| std::cmp::Reverse(r.priority));
-        let composer_trailers = raw
-            .injection
-            .composer_trailer_regex
-            .iter()
-            .map(|p| {
-                let translated = p.replace("\\x{", "\\u{");
-                regex::Regex::new(&translated).map_err(|e| ManifestError::BadRegex {
-                    id: raw.agent.id.clone(),
-                    rule: "injection.composer_trailer_regex".into(),
-                    pattern: p.clone(),
-                    source: e,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let compile_trailers =
+            |pats: &[String], field: &str| -> Result<Vec<regex::Regex>, ManifestError> {
+                pats.iter()
+                    .map(|p| {
+                        let translated = p.replace("\\x{", "\\u{");
+                        regex::Regex::new(&translated).map_err(|e| ManifestError::BadRegex {
+                            id: raw.agent.id.clone(),
+                            rule: field.into(),
+                            pattern: p.clone(),
+                            source: e,
+                        })
+                    })
+                    .collect()
+            };
+        let composer_trailers = compile_trailers(
+            &raw.injection.composer_trailer_regex,
+            "injection.composer_trailer_regex",
+        )?;
+        let composer_trailers_esc = compile_trailers(
+            &raw.injection.composer_trailer_regex_esc,
+            "injection.composer_trailer_regex_esc",
+        )?;
+        // The two lists are one layout described twice: entry i is row i of
+        // the measured sequence below the composer, in plain and escaped
+        // form. Different lengths mean the layout is not actually measured,
+        // and a half-described layout must not verify anything.
+        if !composer_trailers_esc.is_empty()
+            && composer_trailers_esc.len() != composer_trailers.len()
+        {
+            return Err(ManifestError::BadRegion {
+                id: raw.agent.id.clone(),
+                rule: "injection.composer_trailer_regex_esc".into(),
+                region: format!(
+                    "{} escaped rows against {} plain rows",
+                    composer_trailers_esc.len(),
+                    composer_trailers.len()
+                ),
+            });
+        }
         Ok(Manifest {
             agent: raw.agent,
             hooks: raw.hooks,
             rules,
             injection: raw.injection,
             composer_trailers,
+            composer_trailers_esc,
             path: path.into(),
         })
     }
@@ -522,10 +561,11 @@ impl Manifest {
     /// rule set needs an SGR-escaped capture (capture-pane -e) to fire.
     /// The daemon uses this to decide whether to take the second capture.
     pub fn has_escaped_rules(&self) -> bool {
-        self.rules.iter().any(|r| {
-            !r.matcher.line_regex_esc.is_empty()
-                || r.any.iter().any(|m| !m.line_regex_esc.is_empty())
-        })
+        !self.composer_trailers_esc.is_empty()
+            || self.rules.iter().any(|r| {
+                !r.matcher.line_regex_esc.is_empty()
+                    || r.any.iter().any(|m| !m.line_regex_esc.is_empty())
+            })
     }
 }
 

@@ -745,11 +745,11 @@ fn claude_typed_slash_command_is_never_idle() {
     assert_eq!(r.state, AgentState::IdleWithInput);
 }
 
-/// D1 (codey review of d3ca75d): a trailer pattern that also matches
-/// ordinary prose lets payload text after the sentinel pass as chrome, and
-/// `sentinel_verified` would then submit a truncated paste. These are
-/// adversarial lines derived from each shipped pattern: text a person could
-/// plausibly write, shaped as closely as prose gets to a status row.
+/// A trailer pattern that also matches ordinary prose would let payload
+/// text after the sentinel pass as chrome, and a truncated paste would then
+/// be submitted. These are adversarial lines derived from each shipped
+/// pattern: text a person could plausibly write, shaped as closely as prose
+/// gets to a status row.
 #[test]
 fn shipped_trailers_reject_adversarial_payload_text() {
     let adversarial = [

@@ -1998,6 +1998,8 @@ mod tests {
             disagreement: true,
             decided_by: "hook:Stop".into(),
             stale: false,
+            write_ready: false,
+            write_block: None,
             readings: vec![
                 SensorReading {
                     sensor: Sensor::Hook,

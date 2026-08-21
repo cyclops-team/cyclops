@@ -26,6 +26,70 @@ use tokio::net::UnixStream;
 
 /// Screen-tier fixture bound to plain cat/sh panes: title tier always says
 /// idle, staging is verified by the message id, no hook ACK (tier 2).
+/// A deterministic composer process for the lifecycle fixtures.
+///
+/// `cat` cannot model a composer: it echoes a paste and never gives the
+/// screen back, so the staged marker never leaves and the screen-evidence
+/// ACK tier can never resolve. This read loop models the two things a real
+/// composer does.
+///
+/// A paste arrives as one burst, so the tty echoes every row of it at once,
+/// including the final sentinel row, which carries no newline and therefore
+/// stays in the input buffer as staged text. The loop consumes the
+/// newline-terminated rows silently, leaving that echo on screen for the
+/// staging check to find. Only when the daemon's Enter finally terminates
+/// the sentinel row does the loop repaint: screen cleared, prompt back,
+/// marker gone, which is the evidence the screen ACK tier waits for.
+/// Repainting on every row instead would erase the sentinel's echo before
+/// anything could verify it.
+///
+/// Lifecycle only. It proves receipts and liveness, not INVARIANTS rule 12
+/// and not sentinel completeness; a pane that paints no chrome under a
+/// paste cannot decide terminality at all.
+/// The composer loop body, reusable by fixtures that must reach this
+/// behavior after their own setup (a quota banner, an update notice).
+///
+/// Rows that arrive newline-terminated are consumed into a transcript
+/// file and left off the screen. The final sentinel row carries no
+/// newline, so the tty echo holds it on screen as staged input, which is
+/// what the staging check reads. When the daemon's Enter finally
+/// terminates that row, the loop repaints: transcript back (header and
+/// body, never the sentinel, because a receipt test asserts the payload
+/// is visible while the marker is gone), then a transient working row,
+/// then the idle prompt.
+///
+/// The pause before the working row is not decoration. `await_ack` opens
+/// its subscriptions only after the submit call returns, so a working
+/// edge painted the instant Enter lands can be gone before anyone is
+/// listening, and the row would sit there proving nothing. Waiting a beat
+/// puts the edge after the subscription, every time. It has to stay short
+/// as well as non-zero: a fixture that takes longer to paint and clear
+/// than the tightest configured ACK window would time the delivery out
+/// before its own evidence arrived.
+///
+/// The working row is the point. With the leading-id path gone these
+/// fixtures stage through the generic marker, so `id_staged` is false,
+/// and the screen ACK tier then refuses a changed window as turn
+/// evidence and requires working or output evidence instead. That is a
+/// production invariant worth keeping, so the fixture produces the
+/// evidence rather than the pipeline relaxing what it accepts.
+pub const COMPOSER_SH: &str = "T=$(mktemp); trap \"rm -f $T\" EXIT; \
+     printf \"CYCFIX>\\n\"; \
+     while IFS= read -r l; do case \"$l\" in \
+     *\"[cyclops:end \"*) sleep 0.15; printf \"\\033[2J\\033[H\"; cat \"$T\"; \
+     printf \"CYCFIX-WORKING\\n\"; sleep 0.4; \
+     printf \"\\033[2J\\033[H\"; cat \"$T\"; printf \"CYCFIX>\\n\";; \
+     *) printf \"%s\\n\" \"$l\" >> \"$T\";; esac; done";
+
+/// A deterministic composer process for the lifecycle fixtures.
+///
+/// Lifecycle only. It proves receipts and liveness, not INVARIANTS rule
+/// 12 and not sentinel completeness; a pane that paints no chrome under a
+/// paste cannot decide terminality at all.
+pub fn composer_pane() -> String {
+    format!("sh -c '{COMPOSER_SH}'")
+}
+
 pub const CAT_MANIFEST: &str = r#"
 [agent]
 id = "fix"
@@ -39,11 +103,49 @@ priority = 100
 region = "pane_title"
 regex = ['^']
 
+# The screen sensor must be able to answer for these panes, because a
+# write needs positive clean-composer evidence from the sensor that sees
+# the composer (INVARIANTS rule 12). A blank fixture pane IS a clean
+# composer, so the empty bottom region is the evidence.
+[[rule]]
+id = "composer_empty"
+state = "idle"
+priority = 90
+region = "bottom_non_empty_lines(1)"
+line_regex = ['^CYCFIX>\s*$']
+
+# The FINAL payload row, which is the one row a fixed bottom region can
+# never lose: `cat` echoes every pasted line, so the header scrolls away
+# while the sentinel stays. Paired with the generic '[cyclops:end '
+# pattern, this is what lets marker_in_composer reach the submit step.
+#
+# These shared fixtures exercise delivery LIFECYCLE only. They do not
+# prove INVARIANTS rule 12 and they do not prove sentinel completeness:
+# a blank pane paints no chrome under a paste, so terminality is not
+# decidable here at all. Those claims belong to the dedicated tests in
+# m1_blockers.rs and the sentinel unit tests in delivery.rs.
+[[rule]]
+id = "composer_holds_paste"
+state = "idle_with_input"
+priority = 80
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^\[cyclops:end ']
+
+# The transient row the composer paints after consuming the sentinel.
+# Screen ACK evidence needs a turn, and a generic-marker staging does not
+# license "the window changed" as proof of one.
+[[rule]]
+id = "composer_working"
+state = "working"
+priority = 300
+region = "bottom_non_empty_lines(2)"
+line_regex = ['^CYCFIX-WORKING$']
+
 [injection]
 method = "load-buffer + paste-buffer -p"
 submit = "Enter"
 verify_before_submit = true
-verify_pattern = ["<message_id>"]
+verify_pattern = ["<message_id>", "[cyclops:end "]
 safe_states = ["idle"]
 "#;
 
@@ -67,10 +169,48 @@ priority = 100
 region = "pane_title"
 regex = ['^']
 
+# The screen sensor must be able to answer for these panes, because a
+# write needs positive clean-composer evidence from the sensor that sees
+# the composer (INVARIANTS rule 12). A blank fixture pane IS a clean
+# composer, so the empty bottom region is the evidence.
+[[rule]]
+id = "composer_empty"
+state = "idle"
+priority = 90
+region = "bottom_non_empty_lines(1)"
+line_regex = ['^CYCFIX>\s*$']
+
+# The FINAL payload row, which is the one row a fixed bottom region can
+# never lose: `cat` echoes every pasted line, so the header scrolls away
+# while the sentinel stays. Paired with the generic '[cyclops:end '
+# pattern, this is what lets marker_in_composer reach the submit step.
+#
+# These shared fixtures exercise delivery LIFECYCLE only. They do not
+# prove INVARIANTS rule 12 and they do not prove sentinel completeness:
+# a blank pane paints no chrome under a paste, so terminality is not
+# decidable here at all. Those claims belong to the dedicated tests in
+# m1_blockers.rs and the sentinel unit tests in delivery.rs.
+[[rule]]
+id = "composer_holds_paste"
+state = "idle_with_input"
+priority = 80
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^\[cyclops:end ']
+
+# The transient row the composer paints after consuming the sentinel.
+# Screen ACK evidence needs a turn, and a generic-marker staging does not
+# license "the window changed" as proof of one.
+[[rule]]
+id = "composer_working"
+state = "working"
+priority = 300
+region = "bottom_non_empty_lines(2)"
+line_regex = ['^CYCFIX-WORKING$']
+
 [injection]
 submit = "Enter"
 verify_before_submit = true
-verify_pattern = ["<message_id>"]
+verify_pattern = ["<message_id>", "[cyclops:end "]
 "#;
 
 /// Modal fixture: one auto-dismissable rule with explicit decline keys and
@@ -105,10 +245,48 @@ priority = 100
 region = "pane_title"
 regex = ['^']
 
+# The screen sensor must be able to answer for these panes, because a
+# write needs positive clean-composer evidence from the sensor that sees
+# the composer (INVARIANTS rule 12). A blank fixture pane IS a clean
+# composer, so the empty bottom region is the evidence.
+[[rule]]
+id = "composer_empty"
+state = "idle"
+priority = 90
+region = "bottom_non_empty_lines(1)"
+line_regex = ['^CYCFIX>\s*$']
+
+# The FINAL payload row, which is the one row a fixed bottom region can
+# never lose: `cat` echoes every pasted line, so the header scrolls away
+# while the sentinel stays. Paired with the generic '[cyclops:end '
+# pattern, this is what lets marker_in_composer reach the submit step.
+#
+# These shared fixtures exercise delivery LIFECYCLE only. They do not
+# prove INVARIANTS rule 12 and they do not prove sentinel completeness:
+# a blank pane paints no chrome under a paste, so terminality is not
+# decidable here at all. Those claims belong to the dedicated tests in
+# m1_blockers.rs and the sentinel unit tests in delivery.rs.
+[[rule]]
+id = "composer_holds_paste"
+state = "idle_with_input"
+priority = 80
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^\[cyclops:end ']
+
+# The transient row the composer paints after consuming the sentinel.
+# Screen ACK evidence needs a turn, and a generic-marker staging does not
+# license "the window changed" as proof of one.
+[[rule]]
+id = "composer_working"
+state = "working"
+priority = 300
+region = "bottom_non_empty_lines(2)"
+line_regex = ['^CYCFIX-WORKING$']
+
 [injection]
 submit = "Enter"
 verify_before_submit = true
-verify_pattern = ["<message_id>"]
+verify_pattern = ["<message_id>", "[cyclops:end "]
 "#;
 
 /// Quota fixture: the agy quota phrase parks the recipient.
@@ -132,10 +310,48 @@ priority = 100
 region = "pane_title"
 regex = ['^']
 
+# The screen sensor must be able to answer for these panes, because a
+# write needs positive clean-composer evidence from the sensor that sees
+# the composer (INVARIANTS rule 12). A blank fixture pane IS a clean
+# composer, so the empty bottom region is the evidence.
+[[rule]]
+id = "composer_empty"
+state = "idle"
+priority = 90
+region = "bottom_non_empty_lines(1)"
+line_regex = ['^CYCFIX>\s*$']
+
+# The FINAL payload row, which is the one row a fixed bottom region can
+# never lose: `cat` echoes every pasted line, so the header scrolls away
+# while the sentinel stays. Paired with the generic '[cyclops:end '
+# pattern, this is what lets marker_in_composer reach the submit step.
+#
+# These shared fixtures exercise delivery LIFECYCLE only. They do not
+# prove INVARIANTS rule 12 and they do not prove sentinel completeness:
+# a blank pane paints no chrome under a paste, so terminality is not
+# decidable here at all. Those claims belong to the dedicated tests in
+# m1_blockers.rs and the sentinel unit tests in delivery.rs.
+[[rule]]
+id = "composer_holds_paste"
+state = "idle_with_input"
+priority = 80
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^\[cyclops:end ']
+
+# The transient row the composer paints after consuming the sentinel.
+# Screen ACK evidence needs a turn, and a generic-marker staging does not
+# license "the window changed" as proof of one.
+[[rule]]
+id = "composer_working"
+state = "working"
+priority = 300
+region = "bottom_non_empty_lines(2)"
+line_regex = ['^CYCFIX-WORKING$']
+
 [injection]
 submit = "Enter"
 verify_before_submit = true
-verify_pattern = ["<message_id>"]
+verify_pattern = ["<message_id>", "[cyclops:end "]
 "#;
 
 /// Busy fixture: a screen marker keeps the pane working until released.
@@ -159,10 +375,48 @@ priority = 100
 region = "pane_title"
 regex = ['^']
 
+# The screen sensor must be able to answer for these panes, because a
+# write needs positive clean-composer evidence from the sensor that sees
+# the composer (INVARIANTS rule 12). A blank fixture pane IS a clean
+# composer, so the empty bottom region is the evidence.
+[[rule]]
+id = "composer_empty"
+state = "idle"
+priority = 90
+region = "bottom_non_empty_lines(1)"
+line_regex = ['^CYCFIX>\s*$']
+
+# The FINAL payload row, which is the one row a fixed bottom region can
+# never lose: `cat` echoes every pasted line, so the header scrolls away
+# while the sentinel stays. Paired with the generic '[cyclops:end '
+# pattern, this is what lets marker_in_composer reach the submit step.
+#
+# These shared fixtures exercise delivery LIFECYCLE only. They do not
+# prove INVARIANTS rule 12 and they do not prove sentinel completeness:
+# a blank pane paints no chrome under a paste, so terminality is not
+# decidable here at all. Those claims belong to the dedicated tests in
+# m1_blockers.rs and the sentinel unit tests in delivery.rs.
+[[rule]]
+id = "composer_holds_paste"
+state = "idle_with_input"
+priority = 80
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^\[cyclops:end ']
+
+# The transient row the composer paints after consuming the sentinel.
+# Screen ACK evidence needs a turn, and a generic-marker staging does not
+# license "the window changed" as proof of one.
+[[rule]]
+id = "composer_working"
+state = "working"
+priority = 300
+region = "bottom_non_empty_lines(2)"
+line_regex = ['^CYCFIX-WORKING$']
+
 [injection]
 submit = "Enter"
 verify_before_submit = true
-verify_pattern = ["<message_id>"]
+verify_pattern = ["<message_id>", "[cyclops:end "]
 "#;
 
 /// Verification-failure fixture: the pattern can never appear on screen,
@@ -179,6 +433,17 @@ state = "idle"
 priority = 100
 region = "pane_title"
 regex = ['^']
+
+# Screen-idle evidence only: this fixture exists to make verification
+# FAIL, so it deliberately carries no staged-payload marker. Without the
+# idle rule the gate could never admit a write at all and the test would
+# prove nothing.
+[[rule]]
+id = "composer_empty"
+state = "idle"
+priority = 90
+region = "bottom_non_empty_lines(1)"
+line_regex = ['^CYCFIX>\s*$']
 
 [injection]
 submit = "Enter"
@@ -580,8 +845,33 @@ fn write_config(home: &Path, socket: &str, sessions: &[String], cfg_extra: &str)
     .expect("write config");
 }
 
+/// Poll daemon status until the first pane reports `want`.
+///
+/// Status is the daemon's own view, which is the one that matters: tmux
+/// can already be in a state the watcher table has not consumed yet.
+pub async fn wait_pane_state(rig: &mut Rig, want: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let resp = rig.ctl.request("status", json!({})).await;
+        let state = resp["result"]["sessions"][0]["panes"][0]["state"].clone();
+        if state == json!(want) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pane never reached state {want}: {resp}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Pane command: print a marker, hold until any input line, clear the
-/// screen, become cat.
+/// screen, then behave like the composer for the rest of its life.
+///
+/// The tail matters as much as the marker. These fixtures exist to hold a
+/// delivery (a modal, a busy pane) and then release it, and the release
+/// only proves anything if what follows can actually take a message:
+/// admit a write, hold the staged sentinel, and clear it on Enter.
 pub fn hold_script(marker: &str) -> String {
-    format!("sh -c 'echo {marker}; read x; printf \"\\033[2J\\033[H\"; exec cat'")
+    format!("sh -c 'echo {marker}; read x; printf \"\\033[2J\\033[H\"; {COMPOSER_SH}'")
 }

@@ -101,18 +101,30 @@ visible; the hold itself keeps waiting on events, never on a timer.
    when any rule carries `line_regex_esc` clauses, plain otherwise —
    pattern text is matched on de-escaped lines either way, while the
    composer-line pinning also consults the esc clauses against the raw
-   lines. Verification accepts three kinds of evidence, in order: the
-   substituted id anywhere in the region; the terminal sentinel proven
-   to be the last payload token; or a generic staging pattern pinned to
-   a manifest composer line. The sentinel path answers the wrapped
-   payload, whose id has scrolled out of the region while its tail is
-   still visible. Terminality is decided generically: the sentinel must
-   match a whole line, and every line below it must match one of the
-   manifest's `injection.composer_trailer_regex` patterns, which is the
-   vendor's own chrome vocabulary (box rules, model status rows, hint
-   lines). A split or truncated sentinel matches nothing and fails
-   closed, which is the intended answer: half a token proves nothing
-   about what else the capture lost. This matters for a composer that
+   lines. Verification accepts two kinds of evidence, in this order:
+   the terminal sentinel proven to be the last payload row of the active
+   composer, then a generic staging pattern pinned to a manifest composer
+   line. A visible leading id is NOT evidence: it proves the head of the
+   payload arrived, which is what a truncated paste also proves.
+   The sentinel path answers the wrapped payload, whose id has scrolled
+   out of the region while its tail is still visible. Terminality is
+   structural and generic: the sentinel must match a whole row, at least
+   one row must follow it, and those rows must be an ordered
+   subsequence of the vendor's measured layout, never more rows than the
+   layout has. The layout is `injection.composer_trailer_regex` and
+   `composer_trailer_regex_esc`, entry i describing row i of what the
+   vendor paints below the composer (box rule, model status row, hint or
+   mode row) in plain and escaped form. Both forms must match. On the vendors
+   measured so far, chrome arrives painted while a pasted payload row does
+   not, so prose shaped like a status row fails the escaped half. That is a
+   measured property of those layouts, not a universal law about terminals:
+   a vendor that paints pasted text would need its own measurement, and
+   until it has one the sentinel path refuses there. Order
+   and cardinality are what bind the sentinel to the ACTIVE composer, since
+   a sentinel left in the transcript has composer rows between it and the
+   chrome and those claim no layout entry. A split or truncated sentinel
+   matches nothing and fails closed, which is the intended answer: half a
+   token proves nothing about what else the capture lost. This matters for a composer that
    collapses a long paste into a
    "[Pasted Content N chars]" chip (codex): the message id AND the
    sentinel are both hidden inside the chip, and the escaped composer

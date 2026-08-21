@@ -142,6 +142,14 @@ pub struct Detection {
     /// authorize a write (rule 12).
     #[serde(default)]
     pub stale: bool,
+    /// The second answer, carried on the wire so a JSON consumer gets it
+    /// without re-deriving policy. Always present, because an absent field
+    /// cannot be told apart from an older daemon that never computed one.
+    #[serde(default)]
+    pub write_ready: bool,
+    /// Why a write is refused, content-free, absent when it is allowed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_block: Option<String>,
 }
 
 impl Detection {
@@ -157,6 +165,23 @@ impl Detection {
     /// from the sensor that can actually see the composer, and no live
     /// reading that contradicts it. `Err` carries the reason for the gate
     /// ledger line.
+    /// Stamp [`Self::write_block`] from the rule, for surfaces that
+    /// serialize a detection. Keeps one owner: the field is a rendering of
+    /// `write_ready`, never a second opinion.
+    pub fn with_write_block(mut self) -> Detection {
+        match self.write_ready() {
+            Ok(()) => {
+                self.write_ready = true;
+                self.write_block = None;
+            }
+            Err(reason) => {
+                self.write_ready = false;
+                self.write_block = Some(reason.to_string());
+            }
+        }
+        self
+    }
+
     pub fn write_ready(&self) -> Result<(), &'static str> {
         if self.state != AgentState::Idle {
             return Err("not_idle");
@@ -169,13 +194,25 @@ impl Detection {
         if self.disagreement {
             return Err("sensor_disagreement");
         }
-        // Only the screen sensor reads the composer; a hook or title edge
-        // says nothing about what is staged in it.
-        let clean = self
+        // A hook edge reports that generation stopped. It cannot see the
+        // composer, so when fusion had to fall back to one because the
+        // screen rules resolved to nothing, there is no clean-input
+        // evidence at all: that is the shape a long staged payload makes.
+        if self.decided_by.starts_with("hook:") {
+            return Err("hook_derived_idle");
+        }
+        // Only the screen sensor can see a composer. A title or hook edge
+        // reports a turn boundary, which is a different fact: the pane can
+        // be between turns with a person's half-written message sitting in
+        // it. So the write needs the screen saying, positively and just
+        // now, that the composer is clean. A manifest that cannot produce
+        // that reading cannot authorize a write; that is a gap in the
+        // manifest, not a licence to guess.
+        let screen_clean = self
             .readings
             .iter()
             .any(|r| r.sensor == Sensor::Screen && r.state == AgentState::Idle);
-        if !clean {
+        if !screen_clean {
             return Err("no_clean_composer_evidence");
         }
         let conflict = self.readings.iter().any(|r| {
@@ -249,6 +286,8 @@ mod write_ready_tests {
             disagreement,
             decided_by: "d".into(),
             stale: false,
+            write_ready: false,
+            write_block: None,
         }
     }
 
@@ -258,7 +297,7 @@ mod write_ready_tests {
     /// 12 the gate proceeded here and pasted over it.
     #[test]
     fn hook_idle_over_unknown_screen_is_not_write_ready() {
-        let d = det(
+        let mut d = det(
             AgentState::Idle,
             vec![
                 reading(Sensor::Hook, AgentState::Idle),
@@ -266,21 +305,23 @@ mod write_ready_tests {
             ],
             false,
         );
-        // The screen looked and could not tell: that is an absence of
-        // clean evidence, which is the precise reason, not a conflict.
-        assert_eq!(d.write_ready(), Err("no_clean_composer_evidence"));
+        d.decided_by = "hook:Stop".into();
+        // The hook stood in for a screen that read nothing, which is the
+        // exact shape of a composer holding a long staged payload.
+        assert_eq!(d.write_ready(), Err("hook_derived_idle"));
     }
 
     /// A hook edge with no screen reading at all cannot authorize a write:
     /// nothing looked at the composer.
     #[test]
     fn hook_idle_alone_is_not_write_ready() {
-        let d = det(
+        let mut d = det(
             AgentState::Idle,
             vec![reading(Sensor::Hook, AgentState::Idle)],
             false,
         );
-        assert_eq!(d.write_ready(), Err("no_clean_composer_evidence"));
+        d.decided_by = "hook:Stop".into();
+        assert_eq!(d.write_ready(), Err("hook_derived_idle"));
     }
 
     /// The reverse race: screen rules say idle while a live hook says
@@ -325,10 +366,10 @@ mod write_ready_tests {
         assert_eq!(d.write_ready(), Ok(()));
     }
 
-    /// S3 (codey review of d3ca75d): fusion keeps the prior verdict when a
-    /// forced capture fails, which is right for reporting state and wrong
-    /// for authorizing a write. The retained reading looks clean because it
-    /// WAS clean, seconds ago, before the read that failed.
+    /// Fusion keeps the prior verdict when a forced capture fails, which
+    /// is right for reporting state and wrong for authorizing a write. The
+    /// retained reading looks clean because it WAS clean, seconds ago,
+    /// before the read that failed.
     #[test]
     fn a_retained_verdict_is_never_write_ready() {
         let mut d = det(

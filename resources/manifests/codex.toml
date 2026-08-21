@@ -209,9 +209,14 @@ unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]
 
 # MEASURED (fixture codex_pasted_chip_plain.txt and a live 2026-08-20
 # capture): a blank line then one model status row below the composer.
+# MEASURED (fixture codex_pasted_chip_esc.txt and a live 2026-08-20
+# capture): one model status row below the composer, painted in truecolor.
+# The two lists are one layout: entry i is row i, plain and escaped.
 composer_trailer_regex = [
-  '^\s{0,4}\S[^·]*(?: · [^·]+){2,} · Context \d+% left(?: · .+)?\s*$',
   '^\s{0,4}gpt-\S+(?: \S+)?(?: · [^·]+)+\s*$',
+]
+composer_trailer_regex_esc = [
+  '^\s*\x1b\[38;2;\d+;\d+;\d+mgpt-',
 ]
 # The second pattern is anchored on the model-name shape rather than on
 # "N K window", because a generic status-row shape cannot be separated from

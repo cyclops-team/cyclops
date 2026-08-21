@@ -843,7 +843,10 @@ async fn pane_read(inner: &Arc<Inner>, id: Value, params: Value) -> Response {
             )
             .await
             {
-                Some(det) => det,
+                // Both answers travel together: the runtime state and,
+                // stamped from the one rule that owns it, whether a
+                // terminal write is allowed right now.
+                Some(det) => det.with_write_block(),
                 None => return Response::err(id, "no_such_target", "pane vanished during read"),
             };
             // --raw: the screen beside what the sensors made of it, in the

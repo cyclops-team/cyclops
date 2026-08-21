@@ -30,7 +30,7 @@ async fn selftest_verifies_with_simulated_hook_edge() {
     let mut rig = Rig::new(
         "sthook",
         HOOK_MANIFEST,
-        "cat",
+        &composer_pane(),
         "receipt_block_ms = 300\nack_timeout_ms = 1500\n",
     )
     .await;
@@ -144,7 +144,7 @@ async fn f1_zero_edge_tier1_downgrades_notifies_once_and_loses_nothing() {
     let mut rig = Rig::new(
         "f1",
         HOOK_MANIFEST,
-        "cat",
+        &composer_pane(),
         "receipt_block_ms = 2500\nack_timeout_ms = 300\n",
     )
     .await;
@@ -236,7 +236,7 @@ async fn forged_report_over_the_socket_is_denied_and_ingests_nothing() {
     let mut rig = Rig::new(
         "forge",
         HOOK_MANIFEST,
-        "cat",
+        &composer_pane(),
         "receipt_block_ms = 100\nack_timeout_ms = 1200\n",
     )
     .await;
@@ -327,7 +327,7 @@ async fn occupant_swap_invalidates_liveness_and_renews_the_f1_ping() {
     let mut rig = Rig::new(
         "occf1",
         HOOK_MANIFEST,
-        "cat",
+        &composer_pane(),
         "receipt_block_ms = 2500\nack_timeout_ms = 300\n",
     )
     .await;
@@ -357,7 +357,11 @@ async fn occupant_swap_invalidates_liveness_and_renews_the_f1_ping() {
     // Occupant swap: same command, new process. The watcher's pane_pid
     // updates on the subscription tick; hooks_verified must revert as soon
     // as it does, because the edges belong to the dead occupant.
-    rig.tmux.run_ok(&["respawn-pane", "-k", "-t", &pane, "cat"]);
+    // The new occupant must be able to take a delivery too: the test
+    // sends to it below, and a pane that cannot show a clean composer
+    // would hold on write-readiness rather than exercising the F1 path.
+    rig.tmux
+        .run_ok(&["respawn-pane", "-k", "-t", &pane, &composer_pane()]);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let status = rig.ctl.request("status", json!({})).await;
@@ -407,7 +411,7 @@ async fn screen_tier_pane_reports_tier2_and_no_verified_bit() {
     // CAT_MANIFEST declares no hooks at all: hooks_verified stays absent
     // (configuration cannot be unverified when nothing is configured) and
     // verify reports the screen tier with no events.
-    let mut rig = Rig::new("t2", CAT_MANIFEST, "cat", "").await;
+    let mut rig = Rig::new("t2", CAT_MANIFEST, &composer_pane(), "").await;
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "screeny").await;
 

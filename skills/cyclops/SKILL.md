@@ -78,11 +78,14 @@ A closed eye (`‿`) means nothing needs a human. An open one prints a
 default, the scrollback tail with `--source recent`, capped by `--lines N`.
 
 `cyclops read <agent> --source detection` is the diagnostic view: which
-sensor decided the state, and which rule fired.
+sensor decided the state, which rule fired, and whether the pane is
+write-ready. Those last two are different questions: an agent can be idle
+and still not accept a write, because nothing proved its composer was
+empty just now.
 
 ```
 $ cyclops read reviewer --source detection
-reviewer · ○ idle · decided by always_idle
+reviewer · ○ idle · decided by always_idle · write-ready
 
   title  ○ idle  always_idle  just now
 ```

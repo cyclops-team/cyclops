@@ -664,11 +664,12 @@ echo
 echo "#### Rung 3: any terminal agent"
 
 run "$CYC" read reviewer --source detection --plain
-check "detection names the deciding rule" '^reviewer · ○ idle · decided by title_idle$'
+check "detection names the deciding rule" '^reviewer · ○ idle · decided by title_idle · '
+check "and answers write-readiness too"  '^reviewer · ○ idle · decided by title_idle · (write-ready|not write-ready: [a-z_]+)$'
 check "and shows the sensor that read it" '^ +title +○ idle +title_idle'
 
 run "$CYC" read reviewer --source detection --raw --plain
-check "--raw keeps the verdict"           '^reviewer · ○ idle · decided by title_idle$'
+check "--raw keeps the verdict"           '^reviewer · ○ idle · decided by title_idle · '
 check "and adds the capture it read"      '^what the sensors read \(%[0-9]+\):$'
 
 run "$CYC" read reviewer --raw --plain

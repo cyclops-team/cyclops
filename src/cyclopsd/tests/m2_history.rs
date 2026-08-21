@@ -32,7 +32,13 @@ async fn recipients_are_ledgered_by_label_however_addressed() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
-    let mut rig = Rig::new("canon", CAT_MANIFEST, "cat", "receipt_block_ms = 10000\n").await;
+    let mut rig = Rig::new(
+        "canon",
+        CAT_MANIFEST,
+        &composer_pane(),
+        "receipt_block_ms = 10000\n",
+    )
+    .await;
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "canon").await;
 
@@ -83,7 +89,7 @@ async fn multi_session_paging_is_gapless_and_refuses_the_raw_seq_cursor() {
     let mut rig = Rig::new_multi(
         "m2page",
         CAT_MANIFEST,
-        &[("alpha", "cat"), ("beta", "cat")],
+        &[("alpha", &composer_pane()), ("beta", &composer_pane())],
         "receipt_block_ms = 10000\n",
     )
     .await;
@@ -157,9 +163,15 @@ async fn history_reconstructs_a_two_pane_conversation() {
     // Generous receipt cap, as in the m1 fan-out test: this asserts read
     // semantics, not the 2.5s budget, and parallel-workspace load can push
     // the second screen-tier delivery past the default cap.
-    let mut rig = Rig::new("m2hist", CAT_MANIFEST, "cat", "receipt_block_ms = 10000\n").await;
+    let mut rig = Rig::new(
+        "m2hist",
+        CAT_MANIFEST,
+        &composer_pane(),
+        "receipt_block_ms = 10000\n",
+    )
+    .await;
     rig.tmux
-        .run_ok(&["split-window", "-d", "-t", "main:0", "cat"]);
+        .run_ok(&["split-window", "-d", "-t", "main:0", &composer_pane()]);
     rig.wait_attached(2).await;
     let panes = rig.pane_ids().await;
     rig.label(&panes[0], "codex").await;

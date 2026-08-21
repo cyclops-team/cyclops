@@ -274,7 +274,7 @@ async fn hook_ack_during_detach_resolves_the_delivery() {
     let mut rig = Rig::new(
         "dethook",
         HOOK_MANIFEST,
-        "cat",
+        &composer_pane(),
         "receipt_block_ms = 100\nack_timeout_ms = 8000\n",
     )
     .await;
@@ -367,7 +367,7 @@ async fn ack_deadlines_freeze_across_detach() {
     let mut rig = Rig::new(
         "detfrz",
         HOOK_MANIFEST,
-        "cat",
+        &composer_pane(),
         "receipt_block_ms = 100\nack_timeout_ms = 2000\n",
     )
     .await;
@@ -473,14 +473,24 @@ verify_pattern = ["<message_id>"]
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "native").await;
 
-    // Without the fallback the gate answers no_manifest and the delivery
-    // dead-ends in attention_required.
+    // The claim is binding, so the assertion is binding: status names the
+    // manifest the pane resolved to. It used to assert a delivered
+    // receipt instead, which proved binding only as a side effect and
+    // could not survive a pane that cannot model a composer. This pane
+    // deliberately cannot: it IS the symlinked `cat` whose argv basename
+    // is the thing under test.
+    let resp = rig.ctl.request("status", json!({})).await;
+    let bound = &resp["result"]["sessions"][0]["panes"][0]["manifest"];
+    assert_eq!(bound, "fix", "manifest never bound: {resp}");
+
+    // And the gate agrees: a bound manifest holds on write-readiness,
+    // where an unbound one dead-ends in attention_required instead.
     let (result, _) = rig
         .send(json!({"to": ["native"], "subject": "bind me", "body": "a\nb"}))
         .await;
     assert_eq!(
-        result["deliveries"][0]["state"], "delivered_unverified",
-        "manifest never bound: {result}"
+        result["deliveries"][0]["held_by"], "not_write_ready",
+        "an unbound pane would have failed differently: {result}"
     );
     rig.assert_ledger_legal(&[]);
     rig.shutdown().await;
@@ -500,7 +510,7 @@ async fn decline_aborts_when_the_modal_changes_between_keys() {
     }
     // Raw tty so dd returns on exactly one byte (the first decline key
     // "3"); the dialog then vanishes and the pane becomes a plain cat.
-    let script = "sh -c 'echo FAKE-UPDATE-AVAILABLE; stty -icanon -echo min 1 time 0; dd bs=1 count=1 >/dev/null 2>&1; stty sane; printf \"\\033[2J\\033[H\"; exec cat'";
+    let script = &format!("sh -c 'echo FAKE-UPDATE-AVAILABLE; stty -icanon -echo min 1 time 0; dd bs=1 count=1 >/dev/null 2>&1; stty sane; printf \"\\033[2J\\033[H\"; {COMPOSER_SH}'");
     let mut rig = Rig::new("toctou", MODAL_MANIFEST, script, "receipt_block_ms = 200\n").await;
     rig.tmux.wait_screen("main", "FAKE-UPDATE-AVAILABLE");
     let pane = rig.pane_ids().await[0].clone();
@@ -555,7 +565,7 @@ async fn cross_session_ledgers_are_complete_streams() {
     let mut rig = Rig::new_multi(
         "xsess",
         CAT_MANIFEST,
-        &[("main", "cat"), ("aux", "cat")],
+        &[("main", "cat"), ("aux", &composer_pane())],
         "receipt_block_ms = 4000\n",
     )
     .await;
