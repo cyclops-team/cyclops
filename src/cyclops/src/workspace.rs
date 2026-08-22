@@ -582,12 +582,10 @@ fn resolve_agents(
 /// Append the pane's own hook config to its launch command, for a CLI whose
 /// manifest names a flag that takes one.
 ///
-/// This is the whole of hook wiring for claude, and it is why nothing under
-/// ~/.claude is read or written: claude reads hooks only from the settings
-/// file it was launched with, so handing the pane a generated file at start
-/// is both necessary and sufficient. A CLI that instead discovers hooks from
-/// a fixed path of its own (codex, agy) declares no flag and passes through
-/// here unchanged.
+/// Cyclops-created Claude panes use an isolated settings file. Normal direct
+/// Claude launches use the safely merged default settings file instead. A CLI
+/// that discovers hooks from a fixed path of its own declares no flag and
+/// passes through here unchanged.
 ///
 /// Failure returns the bare command rather than an error. A pane that starts
 /// unwired is exactly what every pane did before this existed, and it stays
@@ -1211,18 +1209,22 @@ fn wire_vendor_homes() -> (
     (wire_installed_vendors(), crate::skillseed::seed())
 }
 
-/// Wire every vendor that reads hooks from a fixed path and is installed
-/// here. Vendors that take their config at launch are absent by design:
-/// claude gets its file from `--agents`, and nothing under ~/.claude is
-/// read or written to do it.
+/// Wire every installed vendor's default hook configuration.
+///
+/// Claude receives both this safe merge for normal direct launches and a
+/// per-pane settings file when Cyclops starts the pane itself.
 fn wire_installed_vendors() -> Vec<crate::hookset::WiredVendor> {
     use crate::hookset::CliKind;
     let mut out = Vec::new();
-    for kind in [CliKind::Codex, CliKind::Agy, CliKind::Cursor] {
+    for kind in [
+        CliKind::Claude,
+        CliKind::Codex,
+        CliKind::Agy,
+        CliKind::Cursor,
+    ] {
         match crate::hookset::wire_vendor(kind) {
             Ok(Some(w)) => out.push(w),
-            // Not installed, or takes its config at launch. Both are
-            // ordinary and neither is worth a line.
+            // Not installed is ordinary and not worth a line.
             Ok(None) => {}
             // Say it and keep going. The operator can still wire this one
             // by hand, and every other vendor still gets its turn.

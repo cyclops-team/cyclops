@@ -1111,7 +1111,7 @@ fn setup_check_reports_complete_setup_and_changes_no_metadata() {
         assert_eq!(consumer["mailbox"]["doorbell_ready"], true, "{consumer}");
         assert_eq!(consumer["mailbox"]["transport"], "doorbell", "{consumer}");
     }
-    assert_eq!(consumers[0]["hook"]["state"], "on_launch");
+    assert_eq!(consumers[0]["hook"]["state"], "current");
     assert_eq!(consumers[0]["hook"]["required_receipt_tier"], 1);
     assert_eq!(consumers[0]["hook"]["ack_capable"], true);
     assert_eq!(consumers[0]["hook"]["receipt_ready"], true);
@@ -1260,7 +1260,7 @@ fn setup_check_identifies_missing_installed_consumer_files_without_writing() {
 }
 
 #[test]
-fn setup_check_does_not_claim_claude_launch_wiring_without_its_manifest_flag() {
+fn setup_check_keeps_direct_claude_wiring_when_launch_flag_is_missing() {
     let home = scratch_home("ws-setup-check-claude-flag");
     let user = scratch_home("ws-setup-check-claude-flag-user");
     fs::create_dir_all(user.join(".claude")).expect("create Claude home");
@@ -1282,11 +1282,11 @@ fn setup_check_does_not_claim_claude_launch_wiring_without_its_manifest_flag() {
     let home_before = tree_snapshot(&home);
     let user_before = tree_snapshot(&user);
     let out = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "check"]);
-    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.status.success(), "{out:?}");
     let report: Value = serde_json::from_slice(&out.stdout).expect("setup check JSON");
     let claude = &report["consumers"][0];
     assert_eq!(claude["manifest"]["state"], "edited", "{claude}");
-    assert_eq!(claude["hook"]["state"], "missing_launch_flag", "{claude}");
+    assert_eq!(claude["hook"]["state"], "current", "{claude}");
     assert_eq!(claude["hook"]["required_receipt_tier"], 1, "{claude}");
     assert_eq!(claude["hook"]["ack_capable"], true, "{claude}");
     assert_eq!(claude["hook"]["receipt_ready"], true, "{claude}");
@@ -1368,6 +1368,10 @@ fn a_boot_finishes_the_wiring_for_agent_clis_that_appear_after_install() {
         "codex hooks never landed: {text}"
     );
     assert!(
+        user.join(".claude/settings.json").is_file(),
+        "Claude hooks never landed: {text}"
+    );
+    assert!(
         text.contains("Claude Code appeared since install: placed the cyclops skill at"),
         "{text}"
     );
@@ -1377,6 +1381,10 @@ fn a_boot_finishes_the_wiring_for_agent_clis_that_appear_after_install() {
     );
     assert!(
         text.contains("codex appeared since install: wired cyclops hooks in"),
+        "{text}"
+    );
+    assert!(
+        text.contains("claude appeared since install: wired cyclops hooks in"),
         "{text}"
     );
 

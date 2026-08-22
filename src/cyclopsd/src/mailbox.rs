@@ -869,6 +869,7 @@ impl MailboxProjection {
                         | NotificationState::Gating
                         | NotificationState::QuotaHeld
                         | NotificationState::QuotaResetObserved
+                        | NotificationState::AttentionRequired
                 ));
                 Box::new(WithdrawnNotification {
                     key,
@@ -1008,6 +1009,7 @@ impl MailboxProjection {
                         | NotificationState::Gating
                         | NotificationState::QuotaHeld
                         | NotificationState::QuotaResetObserved
+                        | NotificationState::AttentionRequired
                 )
             })
             .map(|current| {
@@ -5340,7 +5342,7 @@ mod tests {
     }
 
     #[test]
-    fn claim_withdraws_the_current_attempt_in_its_own_fact() {
+    fn claim_withdraws_an_attention_attempt_in_its_own_fact() {
         let scratch = StoreScratch::new("claim-withdrawal");
         let root = scratch.root();
         let journal = Path::new("workspaces/current/messages.ndjson");
@@ -5359,18 +5361,16 @@ mod tests {
             .send(service.admin(), mailbox_send("reviewer", "Task", "Body"))
             .unwrap();
         let queued = service.prepare_oldest_notification(bob).unwrap().unwrap();
-        service
-            .store()
-            .unwrap()
-            .advance_notification(
-                accepted.message_id.clone(),
+        {
+            let mut store = service.store().unwrap();
+            alarm(
+                &mut store,
+                &accepted.message_id,
                 bob,
                 queued.attempt_id,
-                NotificationState::Gating,
-                None,
-                None,
-            )
-            .unwrap();
+                3,
+            );
+        }
 
         let ClaimOutcome::Claimed {
             withdrawn_attempt, ..
@@ -5380,8 +5380,8 @@ mod tests {
         };
         assert_eq!(withdrawn_attempt, Some(queued.attempt_id));
         let lines = service.journal_lines().unwrap();
-        assert_eq!(lines.len(), 4);
-        assert_eq!(lines[3].data.as_ref().unwrap()["type"], "message_claimed");
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines[5].data.as_ref().unwrap()["type"], "message_claimed");
         let withdrawn = service
             .store()
             .unwrap()
@@ -5390,7 +5390,7 @@ mod tests {
             .cloned()
             .unwrap();
         assert_eq!(withdrawn.state, NotificationState::Superseded);
-        assert_eq!(withdrawn.updated_seq, lines[3].seq);
+        assert_eq!(withdrawn.updated_seq, lines[5].seq);
 
         drop(service);
         let reopened = MessageStore::open(&root, journal, workspace, "boot-2").unwrap();
@@ -8620,14 +8620,10 @@ mod tests {
         );
     }
 
-    /// Alarms are selected across every recipient of a message, but only
-    /// a message still waiting to be claimed can be redelivered. Appending
-    /// per alarm and aborting on the first non-pending one left earlier
-    /// recipients holding fresh attempt ids while the operator was told
-    /// the requeue failed: the ids they previewed were gone, no reply
-    /// named the replacements, and every retry failed the same way.
+    /// A claim settles that recipient's wake alarm. Requeueing a broadcast
+    /// then creates a new attempt only for recipients still waiting.
     #[test]
-    fn a_requeue_skips_nonpending_alarms_before_appending() {
+    fn claim_retires_its_alarm_before_a_broadcast_requeue() {
         let scratch = StoreScratch::new("requeue-whole");
         let root = scratch.root();
         let journal = Path::new("workspaces/current/messages.ndjson");
@@ -8645,15 +8641,14 @@ mod tests {
         // carol's alarm is the older one, so it is processed first.
         alarm(&mut store, &message_id, carol, attempt(2), 2);
         alarm(&mut store, &message_id, bob, attempt(1), 10);
-        // bob claims, which leaves bob's alarm standing on an entry that
-        // can no longer be redelivered.
+        // Bob claims his message, so his wake alarm is settled.
         store.claim_at(bob, message_id.clone(), 20).unwrap();
         assert_eq!(
             store
                 .projection()
                 .open_alarms_for_message(&message_id)
                 .len(),
-            2
+            1
         );
 
         let directory = MailboxDirectory::new(
@@ -8690,8 +8685,7 @@ mod tests {
         );
 
         let store = service.store().expect("store lock");
-        // Exactly one fact, and bob's alarm is untouched rather than
-        // half-processed.
+        // Exactly one fact is appended for Carol's new attempt.
         assert_eq!(
             store.projection().last_sequence(),
             before.map(|s| s + 1),
@@ -8699,9 +8693,8 @@ mod tests {
         );
         let bobs = store.projection().notification(bob, &message_id).unwrap();
         assert_eq!(bobs.attempt_id, attempt(1));
-        assert_eq!(bobs.state, NotificationState::AttentionRequired);
-        // bob's alarm stays visible, because acknowledging it is still valid.
-        assert!(store.projection().alarm_by_attempt(attempt(1)).is_some());
+        assert_eq!(bobs.state, NotificationState::Superseded);
+        assert!(store.projection().alarm_by_attempt(attempt(1)).is_none());
     }
 
     /// The reason an alarm was raised survives a restart.

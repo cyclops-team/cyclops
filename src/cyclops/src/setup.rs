@@ -39,7 +39,6 @@ struct ManifestCheck {
     path: PathBuf,
     state: FileState,
     ack_capable: bool,
-    launch_flag_present: bool,
     mailbox_capability_file: Option<PathBuf>,
 }
 
@@ -126,7 +125,6 @@ fn manifest_check(home: &Path, id: &str) -> ManifestCheck {
             path,
             state,
             ack_capable: false,
-            launch_flag_present: false,
             mailbox_capability_file: None,
         };
     };
@@ -137,7 +135,6 @@ fn manifest_check(home: &Path, id: &str) -> ManifestCheck {
                 path,
                 state: FileState::Invalid,
                 ack_capable: false,
-                launch_flag_present: false,
                 mailbox_capability_file: None,
             };
         }
@@ -153,11 +150,6 @@ fn manifest_check(home: &Path, id: &str) -> ManifestCheck {
         path,
         state,
         ack_capable: parsed.hooks.ack.is_some(),
-        launch_flag_present: parsed
-            .hooks
-            .settings_flag
-            .as_deref()
-            .is_some_and(|flag| !flag.trim().is_empty()),
         mailbox_capability_file: parsed.messaging.mailbox_capability_file,
     }
 }
@@ -181,8 +173,6 @@ fn consumer_check(cyclops_home: &Path, user_home: &Path, spec: &Spec) -> Consume
     let wiring = crate::hookset::inspect_wiring(spec.kind);
     let (hook_state, hook_ready) = if !installed {
         ("not_installed", true)
-    } else if spec.kind == CliKind::Claude && !manifest.launch_flag_present {
-        ("missing_launch_flag", false)
     } else {
         (wiring.state.word(), wiring.state.ready())
     };
@@ -347,10 +337,5 @@ mod tests {
         assert!(FileState::Edited.ready());
         assert!(!FileState::Invalid.ready());
         assert!(!FileState::Unreadable.ready());
-    }
-
-    #[test]
-    fn wiring_state_words_are_stable_for_the_report() {
-        assert_eq!(crate::hookset::WiringState::OnLaunch.word(), "on_launch");
     }
 }

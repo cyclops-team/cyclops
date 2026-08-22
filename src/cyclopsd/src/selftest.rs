@@ -189,9 +189,10 @@ pub(crate) fn f1_cause(manifest_id: &str) -> String {
             --dangerously-bypass-hook-trust does NOT fix this. \
             Run: cyclops hooks install codex --agent <label>"
             .to_string(),
-        "claude" => "claude only reads hooks from a settings file it was launched with; \
-            it was probably started without --settings pointing at the rendered config. \
-            Run: cyclops hooks install claude --agent <label>"
+        "claude" => "Claude has no live hook edges. Its active settings file probably \
+            lacks Cyclops entries. Run: cyclops start --setup-only --wire-hooks, then \
+            restart Claude. For an isolated --settings launch, run: cyclops hooks install \
+            claude --agent <label>"
             .to_string(),
         "agy" => "agy only reads .agents/hooks.json in the workspace; the file is \
             probably missing where this agent runs. \
@@ -595,12 +596,13 @@ mod tests {
     }
 
     #[test]
-    fn f1_cause_names_the_codex_trap() {
+    fn f1_cause_names_vendor_wiring_traps() {
         let c = f1_cause("codex");
         assert!(c.contains("untrusted directory"));
         assert!(c.contains("CODEX_HOME"));
         assert!(c.contains("trust_level"));
         assert!(c.contains("does NOT fix"));
+        assert!(f1_cause("claude").contains("--wire-hooks"));
         assert!(f1_cause("claude").contains("--settings"));
         assert!(f1_cause("agy").contains(".agents/hooks.json"));
         assert!(f1_cause("cursor").contains("CURSOR_CONFIG_DIR"));

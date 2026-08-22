@@ -160,8 +160,9 @@ writes the same files on its way to opening a workspace, so a machine that
 has run either one is set up.
 
 The installer passes one more flag, `--wire-hooks`, which extends setup
-into the agent CLIs installed on the machine. It wires Cyclops hooks for
-the vendors that read them from a file, and it places the Cyclops skill at
+into the agent CLIs installed on the machine. It safely merges Cyclops hooks
+into each installed vendor's default configuration, including
+`~/.claude/settings.json` for normal direct Claude launches, and it places the Cyclops skill at
 the canonical destination for each installed consumer:
 
 - Claude Code: `~/.claude/skills/cyclops/SKILL.md`

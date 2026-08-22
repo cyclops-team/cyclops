@@ -75,8 +75,8 @@ reload is needed, run the selftest after reloading or restarting it.
 `scripts/install.sh` ends with `cyclops start --setup-only --wire-hooks`,
 the one opt-in that lets cyclops do the wiring above itself: it merges
 cyclops' hook entries into the config each installed vendor CLI reads on
-its own (`$CODEX_HOME/hooks.json`, `~/.agents/hooks.json`,
-`~/.cursor/hooks.json`). It also seeds the same agent skill at each canonical
+its own (`~/.claude/settings.json`, `$CODEX_HOME/hooks.json`,
+`~/.agents/hooks.json`, `~/.cursor/hooks.json`). It also seeds the same agent skill at each canonical
 destination: `~/.claude/skills/cyclops/SKILL.md`, one shared
 `~/.agents/skills/cyclops/SKILL.md` for Codex and Cursor, and
 `~/.gemini/antigravity-cli/skills/cyclops/SKILL.md` for AGY. It never creates

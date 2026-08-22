@@ -146,13 +146,16 @@ pub fn render_shared(kind: CliKind, cyclops_bin: &str) -> String {
     render(kind, SHARED_NAME, cyclops_bin).replace(&format!(" --agent {SHARED_NAME}"), "")
 }
 
-/// The file this vendor reads hooks from without being told to, if it has
-/// one. None means the CLI takes its config as a launch argument instead,
-/// which is claude, and is why nothing under ~/.claude is ever written.
+/// The default file this vendor reads hooks from when started normally.
+///
+/// Claude also accepts an explicit settings file at launch. That is useful
+/// for panes Cyclops creates, but normal direct launches read
+/// `~/.claude/settings.json`. Treating Claude as launch-only leaves those
+/// sessions permanently without lifecycle hooks.
 fn vendor_hook_file(kind: CliKind) -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     match kind {
-        CliKind::Claude => None,
+        CliKind::Claude => Some(home.join(".claude").join("settings.json")),
         // User level, and not the project-local alternative. MEASURED
         // (finding F1): project-local .codex/hooks.json does not load until
         // the directory is trusted, and in a non-interactive run that
@@ -203,7 +206,6 @@ fn merge_into(dst: &mut serde_json::Value, src: &serde_json::Value) {
 
 #[derive(Clone, Copy)]
 pub(crate) enum WiringState {
-    OnLaunch,
     Missing,
     Current,
     NeedsUpdate,
@@ -214,7 +216,6 @@ pub(crate) enum WiringState {
 impl WiringState {
     pub(crate) fn word(self) -> &'static str {
         match self {
-            WiringState::OnLaunch => "on_launch",
             WiringState::Missing => "missing",
             WiringState::Current => "current",
             WiringState::NeedsUpdate => "needs_update",
@@ -224,7 +225,7 @@ impl WiringState {
     }
 
     pub(crate) fn ready(self) -> bool {
-        matches!(self, WiringState::OnLaunch | WiringState::Current)
+        matches!(self, WiringState::Current)
     }
 }
 
@@ -233,13 +234,12 @@ pub(crate) struct WiringCheck {
     pub state: WiringState,
 }
 
-/// Inspect fixed wiring by applying the current merge in memory. Claude
-/// reports launch wiring because it has no fixed hook file.
+/// Inspect fixed wiring by applying the current merge in memory.
 pub(crate) fn inspect_wiring(kind: CliKind) -> WiringCheck {
     let Some(path) = vendor_hook_file(kind) else {
         return WiringCheck {
             path: None,
-            state: WiringState::OnLaunch,
+            state: WiringState::Unreadable,
         };
     };
     let text = match std::fs::read_to_string(&path) {
@@ -296,15 +296,14 @@ pub struct WiredVendor {
 
 /// Put this project's hook entries in the file `kind` reads on its own.
 ///
-/// Only for vendors that discover hooks from a fixed path. It writes into
-/// configuration this project does not own, so three rules hold and none is
+/// It writes into configuration this project does not own, so three rules hold and none is
 /// optional: the operator's entries are merged around rather than replaced
 /// ([`merge_into`]), the original is copied aside before the first edit, and
 /// a run that would change nothing writes nothing at all.
 ///
-/// Ok(None) means the vendor takes its config at launch instead, or is not
-/// installed on this machine. Neither is a failure: writing a hooks.json for
-/// a CLI that is not here would leave a file nobody reads.
+/// Ok(None) means the vendor is not installed on this machine. That is not a
+/// failure: writing a config for a CLI that is not here would leave a file
+/// nobody reads.
 pub fn wire_vendor(kind: CliKind) -> Result<Option<WiredVendor>, String> {
     let Some(path) = vendor_hook_file(kind) else {
         return Ok(None);
@@ -374,19 +373,28 @@ pub fn wire_vendor(kind: CliKind) -> Result<Option<WiredVendor>, String> {
     }))
 }
 
-/// Copy-pasteable wiring instructions. The admin runs these once,
-/// deliberately; cyclops never touches vendor config itself.
+/// Copy-pasteable wiring instructions for an isolated config artifact.
+///
+/// `hooks install` never changes vendor configuration. The separate
+/// `start --setup-only --wire-hooks` path safely merges default config for
+/// installed direct-launch CLIs after explicit consent.
 fn instructions(kind: CliKind, rendered: &Path, label: &str) -> String {
     let p = rendered.display();
     match kind {
         CliKind::Claude => format!(
-            "Wire it (claude reads hooks only from settings it is launched with):\n\
+            "Use this isolated config with an explicit Claude launch:\n\
              \n\
              \x20 claude --settings {p}\n\
              \n\
              Already passing your own --settings file? Merge the \"hooks\" object\n\
              from {p} into it, preserving every unrelated setting and handler.\n\
              Do not replace the file.\n\
+             \n\
+             For normal direct Claude launches, run:\n\
+             \n\
+             \x20 cyclops start --setup-only --wire-hooks\n\
+             \n\
+             then restart Claude.\n\
              Then prove it fires: cyclops hooks selftest {label}"
         ),
         CliKind::Codex => format!(
@@ -754,8 +762,9 @@ fn write_artifact(
 /// This is `run_install`'s default-destination path with the printing and
 /// the `--dest` handling taken off, for callers that need the artifact
 /// rather than the report. `cyclops start` uses it to hand a pane its own
-/// hook config at launch, which is the only wiring claude needs and the
-/// reason nothing under ~/.claude is ever read or written.
+/// hook config at launch. It isolates a Cyclops-created Claude pane from the
+/// user's default settings; direct Claude launches use the default settings
+/// file wired by `start --setup-only --wire-hooks`.
 ///
 /// A failed receipt is not worth even a note here: callers that want the
 /// artifact want it either way, and a start that refused to launch a pane
@@ -1350,16 +1359,14 @@ mod tests {
         assert!(!stale.to_string().contains("/old/path/cyclops"));
     }
 
-    /// claude takes its hook config as a launch argument, so it has no file
-    /// here. Getting this wrong would mean writing into ~/.claude, which is
-    /// the one thing the wiring promises not to do.
+    /// Claude's normal direct launch reads its default settings file. An
+    /// explicit --settings launch remains supported, but must not be the
+    /// only route to lifecycle hooks.
     #[test]
-    fn claude_has_no_vendor_file_to_write() {
-        assert!(vendor_hook_file(CliKind::Claude).is_none());
-        // Every other vendor resolves under the operator's home, never into
-        // a system directory, and always to the file that vendor reads.
+    fn every_supported_vendor_has_a_default_hook_file() {
         let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
         for (kind, file) in [
+            (CliKind::Claude, "settings.json"),
             (CliKind::Codex, "hooks.json"),
             (CliKind::Agy, "hooks.json"),
             (CliKind::Cursor, "hooks.json"),
