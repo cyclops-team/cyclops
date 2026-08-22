@@ -1216,7 +1216,12 @@ fn wire_vendor_homes() -> (
 fn wire_installed_vendors() -> Vec<crate::hookset::WiredVendor> {
     use crate::hookset::CliKind;
     let mut out = Vec::new();
-    for kind in [CliKind::Claude, CliKind::Codex, CliKind::Agy, CliKind::Cursor] {
+    for kind in [
+        CliKind::Claude,
+        CliKind::Codex,
+        CliKind::Agy,
+        CliKind::Cursor,
+    ] {
         match crate::hookset::wire_vendor(kind) {
             Ok(Some(w)) => out.push(w),
             // Not installed is ordinary and not worth a line.

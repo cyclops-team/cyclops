@@ -39,7 +39,6 @@ struct ManifestCheck {
     path: PathBuf,
     state: FileState,
     ack_capable: bool,
-    launch_flag_present: bool,
     mailbox_capability_file: Option<PathBuf>,
 }
 
@@ -126,7 +125,6 @@ fn manifest_check(home: &Path, id: &str) -> ManifestCheck {
             path,
             state,
             ack_capable: false,
-            launch_flag_present: false,
             mailbox_capability_file: None,
         };
     };
@@ -137,7 +135,6 @@ fn manifest_check(home: &Path, id: &str) -> ManifestCheck {
                 path,
                 state: FileState::Invalid,
                 ack_capable: false,
-                launch_flag_present: false,
                 mailbox_capability_file: None,
             };
         }
@@ -153,11 +150,6 @@ fn manifest_check(home: &Path, id: &str) -> ManifestCheck {
         path,
         state,
         ack_capable: parsed.hooks.ack.is_some(),
-        launch_flag_present: parsed
-            .hooks
-            .settings_flag
-            .as_deref()
-            .is_some_and(|flag| !flag.trim().is_empty()),
         mailbox_capability_file: parsed.messaging.mailbox_capability_file,
     }
 }
@@ -346,5 +338,4 @@ mod tests {
         assert!(!FileState::Invalid.ready());
         assert!(!FileState::Unreadable.ready());
     }
-
 }

@@ -1513,15 +1513,7 @@ async fn refresh_status_detections(inner: &Arc<Inner>) {
             .map(|pane| pane.pane_id)
             .collect();
         for pane_id in pane_ids {
-            fusion::recompute_pane(
-                inner,
-                session_idx,
-                &watcher,
-                &pane_id,
-                true,
-                "status",
-            )
-            .await;
+            fusion::recompute_pane(inner, session_idx, &watcher, &pane_id, true, "status").await;
         }
     }
 }
