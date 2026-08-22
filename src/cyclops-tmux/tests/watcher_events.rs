@@ -46,3 +46,50 @@ async fn split_and_kill_are_reflected_via_events() {
 
     w.shutdown().await;
 }
+
+#[tokio::test]
+async fn session_removal_does_not_report_a_server_wide_moved_pane_as_gone() {
+    let Some(srv) = TestServer::new("events-cross-session") else {
+        return;
+    };
+    srv.new_session("source");
+    srv.tmux_ok(&["split-window", "-t", "source", "/bin/sh"]);
+    srv.new_session("destination");
+
+    let w = SessionWatcher::connect(srv.config("source"))
+        .await
+        .expect("connect");
+    let moved = w
+        .snapshot()
+        .into_iter()
+        .find(|row| !row.active)
+        .expect("source has a movable pane");
+    let mut rx = w.subscribe();
+
+    srv.tmux_ok(&["join-pane", "-d", "-s", &moved.pane_id, "-t", "destination"]);
+    await_event(
+        &mut rx,
+        "moved PaneRemoved",
+        |event| matches!(event, PaneEvent::PaneRemoved(id) if id == &moved.pane_id),
+    )
+    .await;
+
+    assert_eq!(
+        w.client()
+            .server_pane_pid(&moved.pane_id)
+            .await
+            .expect("server-wide pane lookup"),
+        Some(moved.pane_pid),
+        "the source route disappeared but the physical pane survived"
+    );
+
+    srv.tmux_ok(&["kill-pane", "-t", &moved.pane_id]);
+    assert_eq!(
+        w.client()
+            .server_pane_pid(&moved.pane_id)
+            .await
+            .expect("server-wide pane lookup after kill"),
+        None
+    );
+    w.shutdown().await;
+}

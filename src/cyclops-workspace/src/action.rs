@@ -605,7 +605,10 @@ pub fn route_dialog_confirm(dialog: &Dialog) -> Option<Action> {
         }),
         // A send already in flight has nothing to confirm: Enter twice must
         // not put the same message on the record twice.
-        Dialog::Compose { sending: true, .. } => None,
+        Dialog::Compose { send, .. } if send.is_sending() => None,
+        // Confirmation is handled by the dialog owner. It is not a terminal
+        // action and must never fall through into another send.
+        Dialog::Compose { send, .. } if send.is_confirming_abandon() => None,
         // None here is a line that is not addressed yet, not a refusal to
         // act. The caller re-reads the same buffer with `parse_compose` to
         // get the sentence saying what is missing; keeping the reason out
@@ -920,7 +923,7 @@ mod tests {
         let dialog = Dialog::Compose {
             buffer: "@reviewer gateway.rs:120 drops the burst path".into(),
             status: None,
-            sending: false,
+            send: crate::dialog::ComposeSendState::Ready,
         };
         assert_eq!(
             route_dialog_confirm(&dialog),
@@ -944,14 +947,17 @@ mod tests {
             let dialog = Dialog::Compose {
                 buffer: buffer.into(),
                 status: None,
-                sending: false,
+                send: crate::dialog::ComposeSendState::Ready,
             };
             assert_eq!(route_dialog_confirm(&dialog), None, "{buffer:?} sent");
         }
         let in_flight = Dialog::Compose {
             buffer: "@reviewer ship it".into(),
             status: Some("sending to reviewer…".into()),
-            sending: true,
+            send: crate::dialog::ComposeSendState::Sending(crate::dialog::ComposeAttempt {
+                message: crate::dialog::parse_compose("@reviewer ship it").expect("message"),
+                client_key: "key".into(),
+            }),
         };
         assert_eq!(route_dialog_confirm(&in_flight), None);
     }

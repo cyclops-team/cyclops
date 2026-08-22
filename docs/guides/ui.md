@@ -1,4 +1,4 @@
-# The stream UI
+# The stream and Messages UI
 
 Watch the whole team live. `cyclops watch` turns the terminal into the
 stream: every message and state change as it happens, on the record.
@@ -13,6 +13,15 @@ cyclops watch --plain        # line-oriented follow, no screen takeover
 cyclops watch --with reviewer
 ```
 
+Filtered watch uses current display labels. Discover them first with
+`cyclops list --all`. An unknown active label fails immediately instead of
+opening a stream that can never match. Display labels can be renamed, so
+`--with`, `--from`, and `--to` are human view filters, not durable endpoint
+selectors. Automation that needs the next message should use `cyclops inbox
+next --timeout 30s`. Its optional `--from` accepts the canonical sender key
+shown by `cyclops inbox list --json`, never a display label.
+The JSON event stream accepts `--kinds`, not the three TUI display filters.
+
 The admin stream shows only what is aimed at you: messages addressed to
 admin, deliveries that parked or need attention, agents entering a
 blocked state, deliveries held at the gate by a blocked pane, daemon
@@ -21,6 +30,25 @@ of it: a delivery queued behind a turn, or behind a human in copy-mode,
 is the pipeline working. The firehose is one keypress away and shows
 every message, delivery transition, state change, gate decision, session
 event, ping, and clearance. A message to admin appears in both.
+
+Tab opens a third view, Messages. It is a body-free work queue backed by
+whole mailbox snapshots. Attention stays above ordinary inbox work, and
+daemon FIFO order stays intact inside each group. A row keeps the exact
+message, recipient, and notification attempt it represents, so a live
+update cannot move an action to a neighboring row.
+
+Messages has four scopes: Work, All, Inbox, and Outbound. Press `s` to
+cycle them. Work is the daemon's answer about what needs this operator,
+not a client-side guess. Enter opens the selected row in a full-width
+detail. Message bodies appear only after the daemon authorizes the read.
+Terminal actions show the daemon's evidence, require confirmation, and
+name the exact notification attempt they will change.
+
+The Messages footer always reports connection truth. While connecting or
+refreshing after a change, actions are unavailable. After a lost
+connection or failed snapshot read, the last authenticated snapshot stays
+visible as stale data and `R` starts one explicit reconnect. Cyclops never
+starts parallel reconnects or retries on a timer.
 
 A ping points at something rather than being it, so a ping saying a
 human is needed shows here only while the thing it points at is still
@@ -91,10 +119,10 @@ it; the wheel scrolls three rows a notch, and scrolling up unpins from
 the tail exactly like `↑`. Everything the mouse does has a key, so a
 terminal with no mouse reporting loses convenience and nothing else.
 
-## Keys
+## Stream keys
 
 ```
-tab      admin stream / firehose
+tab      admin stream / firehose / messages
 a        agents panel on / off (wide terminals)
 w f t    filter with / from / to (enter applies, esc cancels, empty clears)
 enter    jump tmux focus to the pane behind the selected entry
@@ -104,6 +132,24 @@ c        density: comfortable or compact
 ?        cheatsheet overlay
 q        quit
 ```
+
+## Messages keys
+
+```
+tab      next view
+s        next scope: Work / All / Inbox / Outbound
+enter    open the selected message
+up down  move the selection; j and k work too
+?        Messages cheatsheet
+R        reconnect after connection loss
+q        quit
+```
+
+Stream-only controls such as density, agent-panel visibility, filters,
+and tail pinning do nothing in Messages. A selected row is tracked by its
+durable target, not its screen position. If an update or scope change
+removes that target, selection clears and Enter asks for a new selection
+instead of opening the row that took its place.
 
 Filters mirror the history flags: `with` is either direction, `from` and
 `to` one each, and `with` replaces the other two. While pinned to the
@@ -167,9 +213,10 @@ daemon at one instant always agree.
 Anything the count knows about gets a line in the stream, timestamped
 when it happened, so a park from this morning reads as this morning. It
 runs both ways: a line already on screen that the daemon's current answer
-no longer counts gets its clearance written under it at startup. The wire
-model permits a future additive client to requeue a delivery, but this
-release ships no requeue command.
+no longer counts gets its clearance written under it at startup. Legacy
+direct-delivery quota parks remain terminal. Standard mailbox notifications
+have a separate explicit `cyclops requeue <message-id>` recovery path after the
+daemon records that a quota reset was observed; it never retries on its own.
 
 ### Every count has a line
 

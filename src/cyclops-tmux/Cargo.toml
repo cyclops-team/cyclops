@@ -6,6 +6,7 @@ description = "The tmux adapter. Every tmux-specific behavior in Cyclops lives i
 
 [dependencies]
 cyclops-proto.workspace = true
+cyclops-state.workspace = true
 serde.workspace = true
 tokio.workspace = true
 thiserror.workspace = true

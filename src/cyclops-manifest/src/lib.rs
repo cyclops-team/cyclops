@@ -23,17 +23,26 @@
 //!   is the delivery gate's, and it is the gate that decides whether a
 //!   modal may be dismissed at all.
 //!
-//! Two schema fields exist for vendor quirks that plain text cannot express:
-//! `agent.argv_basenames` (bind by pane argv when the kernel comm name is
-//! useless, e.g. native Claude installs reporting "2.1.220") and rule
+//! Three schema fields exist for vendor quirks that plain text cannot
+//! express: `agent.argv_basenames` (bind by pane argv when the kernel comm
+//! name is useless, e.g. native Claude installs reporting "2.1.220"), rule
 //! `line_regex_esc` (match against a capture-pane -e capture, e.g. codex
-//! ghost suggestions are only distinguishable from typed text by SGR dim).
+//! ghost suggestions are only distinguishable from typed text by SGR dim),
+//! and the `injection.composer_trailer_regex` pair (the measured sequence
+//! of rows below the composer, in plain and escaped form, so the delivery
+//! pipeline can decide whether the terminal sentinel is the last payload
+//! row; the escaped half is the quirk plain text cannot express, since
+//! chrome is painted and pasted human text is not).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+pub use regex::Regex;
+
 use cyclops_proto::AgentState;
 use serde::Deserialize;
+
+pub mod mailbox_capability;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
@@ -66,6 +75,84 @@ pub enum ManifestError {
         rule: String,
         state: String,
     },
+    #[error("manifest {id}: hooks.turn_key_fields: {why}")]
+    BadTurnKey { id: String, why: String },
+    #[error("manifest {id}: hooks: {why}")]
+    BadHooks { id: String, why: String },
+    #[error("manifest {id}: injection: {why}")]
+    BadInjection { id: String, why: String },
+    #[error("manifest {id}: messaging: {why}")]
+    BadMessaging { id: String, why: String },
+}
+
+/// Event names as the runtime compares them: ASCII alphanumerics only,
+/// lowercased.
+///
+/// Vendors spell the same event differently across their own documents
+/// and payloads, so the runtime matches on this reduced form. Anything
+/// validating event names has to reduce them the same way or it validates
+/// a spelling nobody compares.
+pub fn normalize_event(event: &str) -> String {
+    event
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// Do two turn roles reduce to the same event?
+///
+/// An exact lifecycle asks one question of every hook payload: is this
+/// the start of a turn, or the end of one. If both roles reduce to the
+/// same event, one report answers both, and a start can record its own
+/// end: the turn is over before it began, and the composer barrier
+/// releases against a turn nothing ran. An acknowledgment that reduces to
+/// the end name is the same defect on the receipt path, where an end
+/// would verify a delivery and start the turn it just ended.
+///
+/// Start and acknowledgment MAY be the same event, and are in the shipped
+/// vendors: taking the prompt is both the receipt and the beginning of
+/// the turn. That one is a fact about the vendor, not a collision.
+fn colliding_turn_roles(hooks: &Hooks) -> Option<String> {
+    fn declared(e: &Option<String>) -> Option<&str> {
+        e.as_deref().filter(|n| !n.trim().is_empty())
+    }
+    // A declared role has to reduce to a name the runtime can compare.
+    // Punctuation and non-ASCII spellings reduce to nothing, so such a
+    // role never matches the event it meant, and any two of them are
+    // indistinguishable from each other and from an incoming event that
+    // also reduces to nothing.
+    for (field, raw) in [
+        ("turn_start", &hooks.turn_start),
+        ("turn_end", &hooks.turn_end),
+        ("ack", &hooks.ack),
+    ] {
+        if let Some(name) = declared(raw) {
+            if normalize_event(name).is_empty() {
+                return Some(format!("{field} {name:?} has no comparable name"));
+            }
+        }
+    }
+    let named = |e: &Option<String>| declared(e).map(normalize_event);
+    // Each pair is checked on its own. A manifest that declares only an
+    // acknowledgment and an end still runs both roles at runtime, so
+    // requiring a start before looking would let that one through.
+    let end = named(&hooks.turn_end);
+    if let (Some(start), Some(end)) = (named(&hooks.turn_start), end.as_deref()) {
+        if start == end {
+            return Some(format!(
+                "hooks.turn_start and hooks.turn_end are the same event {end:?}"
+            ));
+        }
+    }
+    if let (Some(ack), Some(end)) = (named(&hooks.ack), end.as_deref()) {
+        if ack == end {
+            return Some(format!(
+                "hooks.ack and hooks.turn_end are the same event {end:?}"
+            ));
+        }
+    }
+    None
 }
 
 /// A parsed, validated manifest with compiled regexes.
@@ -73,10 +160,30 @@ pub enum ManifestError {
 pub struct Manifest {
     pub agent: AgentMeta,
     pub hooks: Hooks,
+    pub messaging: Messaging,
     pub rules: Vec<CompiledRule>,
     pub injection: Injection,
+    /// Compiled `injection.composer_trailer_regex`, validated at parse time
+    /// like rule patterns so a bad regex is a load error, not a surprise
+    /// during a delivery.
+    pub composer_trailers: Vec<regex::Regex>,
+    /// Compiled `injection.composer_trailer_regex_esc`.
+    pub composer_trailers_esc: Vec<regex::Regex>,
+    /// Compiled collapsed-chip row patterns, plain and escaped.
+    pub composer_chips: Vec<regex::Regex>,
+    pub composer_chips_esc: Vec<regex::Regex>,
+    /// Plain joined-capture row that starts the active composer.
+    pub composer_prompt: Option<regex::Regex>,
+    /// Plain joined-capture row for every later logical composer line.
+    pub composer_continuation: Option<regex::Regex>,
     /// Source path, for reload and error messages.
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct Messaging {
+    #[serde(default)]
+    pub mailbox_capability_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -120,6 +227,18 @@ pub struct Hooks {
     /// Payload field carrying the injected text when `ack` is set.
     #[serde(default)]
     pub ack_payload_field: Option<String>,
+    /// Payload fields that together name ONE turn, in declared order.
+    ///
+    /// Declaring these opts a vendor into exact turn correlation: a start
+    /// and an end whose values match on every field are the same turn,
+    /// and nothing else is. Empty means the vendor cannot prove that, and
+    /// its turns run on screen evidence instead.
+    ///
+    /// Every field has to appear on BOTH the start and the end event, or
+    /// the pair can never match. Ordering is part of the declaration
+    /// because the values are compared positionally.
+    #[serde(default)]
+    pub turn_key_fields: Vec<String>,
     /// Flag that points this CLI at a hook config file at launch, when it
     /// has one. Some means the pane can be started already wired, so
     /// nothing has to be written into the vendor's own config tree:
@@ -247,6 +366,26 @@ impl CompiledMatcher {
     }
 }
 
+impl CompiledRule {
+    /// Does this rule hold for ONE row, given in both forms?
+    ///
+    /// For callers that have already isolated a row and need to know
+    /// whether the manifest recognizes it. Going through the rule keeps
+    /// the manifest's own semantics: clauses within a matcher AND
+    /// together, `any` alternatives are alternatives, and an esc clause
+    /// with no escaped capture fails closed. A caller that reimplements
+    /// this as "plain matched OR escaped matched" quietly weakens every
+    /// rule that relies on both halves, and the vendor's plain pattern
+    /// stops being load-bearing without anyone noticing.
+    pub fn matches_row(&self, plain: &str, esc: &str) -> bool {
+        let lines = [plain];
+        let esc_lines = [esc];
+        std::iter::once(&self.matcher)
+            .chain(self.any.iter())
+            .any(|m| m.matches_esc(plain, &lines, Some(&esc_lines)))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CompiledRule {
     pub id: String,
@@ -282,6 +421,10 @@ pub struct Injection {
     pub method: String,
     #[serde(default)]
     pub submit: String,
+    /// Exact tmux key names that clear the whole staged composer.
+    /// Empty means this vendor has no measured discard capability.
+    #[serde(default)]
+    pub clear_keys: Vec<String>,
     #[serde(default)]
     pub verify_before_submit: bool,
     /// Substrings proving the paste staged; "<message_id>" is replaced with
@@ -296,6 +439,50 @@ pub struct Injection {
     /// (measured on Claude). Absent means unestablished: gate on idle.
     #[serde(default)]
     pub busy_behavior: Option<String>,
+    /// Lines the vendor may render BELOW the composer, which are never
+    /// payload: shortcut hints, context meters, status rows. Used only to
+    /// decide terminal-sentinel position; anything after the sentinel that
+    /// matches none of these fails verification closed.
+    #[serde(default)]
+    pub composer_trailer_regex: Vec<String>,
+    /// The same rows matched against the SGR-escaped capture. Required
+    /// alongside the plain patterns: chrome is painted by the vendor and
+    /// therefore styled, while text a human pasted into the composer is
+    /// not, so the escaped form is what separates a status row from prose
+    /// that merely reads like one. A row counts as chrome only when both
+    /// forms match, and a manifest carrying these fails closed when no
+    /// escaped capture is available.
+    #[serde(default)]
+    pub composer_trailer_regex_esc: Vec<String>,
+    /// How many of those rows are REQUIRED, counted from the top of the
+    /// layout. The rows below a composer are not an unordered set: the
+    /// vendor paints its box rule and status row every time, its hint or
+    /// mode rows only sometimes. Without this the anchors can simply be
+    /// absent while an arbitrary plausible tail still passes. Zero,
+    /// missing, or larger than the layout means the layout is not
+    /// measured, and the sentinel path refuses.
+    #[serde(default)]
+    pub composer_trailer_required_prefix: usize,
+    /// The vendor's collapsed-paste chip, as a WHOLE composer row, in
+    /// plain and escaped form. Both are required together.
+    ///
+    /// This replaced a substring test. A generic `verify_pattern` such as
+    /// "Pasted" was matched anywhere on a composer row, so a message whose
+    /// own subject contained that word verified a paste whose sentinel had
+    /// never arrived: the truncated payload submitted itself. A chip is a
+    /// specific rendering, so proving it means matching the row the vendor
+    /// actually draws, styling included. A manifest with no measured chip
+    /// syntax has no chip lane at all.
+    #[serde(default)]
+    pub composer_chip_regex: Vec<String>,
+    #[serde(default)]
+    pub composer_chip_regex_esc: Vec<String>,
+    /// Joined-capture row patterns with one named `content` capture.
+    /// Both are required for exact visible composer extraction.
+    #[serde(default)]
+    pub composer_prompt_regex: Option<String>,
+    #[serde(default)]
+    pub composer_continuation_regex: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -303,6 +490,8 @@ struct RawManifest {
     agent: AgentMeta,
     #[serde(default)]
     hooks: Hooks,
+    #[serde(default)]
+    messaging: Messaging,
     #[serde(default, rename = "rule")]
     rules: Vec<RawRule>,
     #[serde(default)]
@@ -377,6 +566,56 @@ pub fn strip_csi(s: &str) -> String {
     out
 }
 
+/// A named tmux key or modified chord, excluding text and edit aliases.
+fn clear_key_name(key: &str) -> bool {
+    const NAMED_NON_TEXT: &[&str] = &[
+        "escape", "up", "down", "left", "right", "home", "end", "npage", "ppage",
+    ];
+    const NAMED_TEXT_OR_EDIT: &[&str] = &[
+        "space",
+        "bspace",
+        "backspace",
+        "tab",
+        "btab",
+        "dc",
+        "delete",
+        "ic",
+        "insert",
+        "enter",
+        "return",
+        "kpenter",
+        "linefeed",
+    ];
+
+    let normalized = key.to_ascii_lowercase();
+    let parts: Vec<&str> = normalized.split('-').collect();
+    let Some((base, modifiers)) = parts.split_last() else {
+        return false;
+    };
+    if NAMED_TEXT_OR_EDIT.contains(base) {
+        return false;
+    }
+    if modifiers
+        .iter()
+        .any(|modifier| !matches!(*modifier, "c" | "m" | "s"))
+    {
+        return false;
+    }
+    if modifiers.contains(&"c") && matches!(*base, "m" | "j") {
+        return false;
+    }
+    let function_key = base
+        .strip_prefix('f')
+        .and_then(|number| number.parse::<u8>().ok())
+        .is_some_and(|number| (1..=24).contains(&number));
+    let named = NAMED_NON_TEXT.contains(base) || function_key;
+    if modifiers.is_empty() {
+        named
+    } else {
+        named || (base.len() == 1 && base.chars().all(|character| character.is_ascii_graphic()))
+    }
+}
+
 impl Manifest {
     pub fn load(path: &Path) -> Result<Manifest, ManifestError> {
         let text = std::fs::read_to_string(path).map_err(|e| ManifestError::Io {
@@ -423,11 +662,207 @@ impl Manifest {
         }
         // Highest priority first; evaluation takes the first match.
         rules.sort_by_key(|r| std::cmp::Reverse(r.priority));
+        let compile_trailers =
+            |pats: &[String], field: &str| -> Result<Vec<regex::Regex>, ManifestError> {
+                pats.iter()
+                    .map(|p| {
+                        let translated = p.replace("\\x{", "\\u{");
+                        regex::Regex::new(&translated).map_err(|e| ManifestError::BadRegex {
+                            id: raw.agent.id.clone(),
+                            rule: field.into(),
+                            pattern: p.clone(),
+                            source: e,
+                        })
+                    })
+                    .collect()
+            };
+        let composer_trailers = compile_trailers(
+            &raw.injection.composer_trailer_regex,
+            "injection.composer_trailer_regex",
+        )?;
+        let composer_trailers_esc = compile_trailers(
+            &raw.injection.composer_trailer_regex_esc,
+            "injection.composer_trailer_regex_esc",
+        )?;
+        let composer_chips = compile_trailers(
+            &raw.injection.composer_chip_regex,
+            "injection.composer_chip_regex",
+        )?;
+        let composer_chips_esc = compile_trailers(
+            &raw.injection.composer_chip_regex_esc,
+            "injection.composer_chip_regex_esc",
+        )?;
+        let compile_content_row = |pattern: &Option<String>,
+                                   field: &str|
+         -> Result<Option<regex::Regex>, ManifestError> {
+            let Some(pattern) = pattern else {
+                return Ok(None);
+            };
+            let translated = pattern.replace("\\x{", "\\u{");
+            let compiled =
+                regex::Regex::new(&translated).map_err(|source| ManifestError::BadRegex {
+                    id: raw.agent.id.clone(),
+                    rule: field.into(),
+                    pattern: pattern.clone(),
+                    source,
+                })?;
+            if !pattern.starts_with('^')
+                || !pattern.ends_with('$')
+                || !compiled
+                    .capture_names()
+                    .flatten()
+                    .any(|name| name == "content")
+            {
+                return Err(ManifestError::BadInjection {
+                    id: raw.agent.id.clone(),
+                    why: format!(
+                        "{field} must anchor the whole row and define a named 'content' capture"
+                    ),
+                });
+            }
+            Ok(Some(compiled))
+        };
+        let composer_prompt = compile_content_row(
+            &raw.injection.composer_prompt_regex,
+            "injection.composer_prompt_regex",
+        )?;
+        let composer_continuation = compile_content_row(
+            &raw.injection.composer_continuation_regex,
+            "injection.composer_continuation_regex",
+        )?;
+        if let Some(capability_file) = &raw.messaging.mailbox_capability_file {
+            let shown = capability_file.to_string_lossy();
+            let path_is_supported =
+                capability_file.is_absolute() || shown == "~" || shown.starts_with("~/");
+            if !path_is_supported {
+                return Err(ManifestError::BadMessaging {
+                    id: raw.agent.id.clone(),
+                    why: "mailbox_capability_file must be absolute or start with ~/".into(),
+                });
+            }
+        }
+        if composer_prompt.is_some() != composer_continuation.is_some() {
+            return Err(ManifestError::BadInjection {
+                id: raw.agent.id.clone(),
+                why: "composer_prompt_regex and composer_continuation_regex must be declared together"
+                    .into(),
+            });
+        }
+        if !raw.injection.clear_keys.is_empty() {
+            if composer_prompt.is_none() {
+                return Err(ManifestError::BadInjection {
+                    id: raw.agent.id.clone(),
+                    why: "clear_keys requires measured composer extraction patterns".into(),
+                });
+            }
+            for key in &raw.injection.clear_keys {
+                if key.len() <= 1
+                    || !key.chars().all(|character| character.is_ascii_graphic())
+                    || !clear_key_name(key)
+                    || key.eq_ignore_ascii_case(&raw.injection.submit)
+                {
+                    return Err(ManifestError::BadInjection {
+                        id: raw.agent.id.clone(),
+                        why: format!("clear_keys contains unsafe key {key:?}"),
+                    });
+                }
+            }
+        }
+        if composer_chips.len() != composer_chips_esc.len() {
+            return Err(ManifestError::BadRegion {
+                id: raw.agent.id.clone(),
+                rule: "injection.composer_chip_regex_esc".into(),
+                region: format!(
+                    "{} escaped chip rows against {} plain",
+                    composer_chips_esc.len(),
+                    composer_chips.len()
+                ),
+            });
+        }
+        // A required prefix is a claim about a measured layout, so it is
+        // only meaningful when the layout is actually there. Declaring one
+        // without the rows, or a count the rows cannot satisfy, describes
+        // nothing.
+        let required = raw.injection.composer_trailer_required_prefix;
+        let declares_layout = !composer_trailers.is_empty() || !composer_trailers_esc.is_empty();
+        if (declares_layout || required != 0)
+            && (required == 0 || required > composer_trailers.len())
+        {
+            return Err(ManifestError::BadRegion {
+                id: raw.agent.id.clone(),
+                rule: "injection.composer_trailer_required_prefix".into(),
+                region: format!("{required} required of {} rows", composer_trailers.len()),
+            });
+        }
+        // A turn key is a claim that two EVENTS can be matched, so it is
+        // meaningless without both of them, and a field that is empty or
+        // repeated cannot carry a position in an ordered comparison.
+        // Rejecting is the point: a partial declaration that degraded
+        // silently would put a vendor on the screen lifecycle while its
+        // manifest says otherwise.
+        // Roles first, and for EVERY declared lifecycle. The runtime maps a
+        // report to start, end or acknowledgment the same way whether or
+        // not a turn key exists, so a collision is wrong wherever it
+        // appears; checking it only for keyed vendors would leave the
+        // screen lane holding the same contradiction.
+        if let Some(why) = colliding_turn_roles(&raw.hooks) {
+            return Err(ManifestError::BadHooks {
+                id: raw.agent.id.clone(),
+                why,
+            });
+        }
+        let key = &raw.hooks.turn_key_fields;
+        if !key.is_empty() {
+            let named = |e: &Option<String>| e.as_deref().is_some_and(|n| !n.trim().is_empty());
+            let why = if !named(&raw.hooks.turn_start) || !named(&raw.hooks.turn_end) {
+                // Blank counts as absent: an event name that never matches
+                // anything loads a manifest claiming exact correlation
+                // whose lane can never complete a turn.
+                Some("declared without both hooks.turn_start and hooks.turn_end".to_string())
+            } else if key.iter().any(|f| f.trim().is_empty()) {
+                Some("empty field name".to_string())
+            } else {
+                key.iter()
+                    .enumerate()
+                    .find(|(i, f)| key[..*i].contains(f))
+                    .map(|(_, f)| format!("duplicate field {f:?}"))
+            };
+            if let Some(why) = why {
+                return Err(ManifestError::BadTurnKey {
+                    id: raw.agent.id.clone(),
+                    why,
+                });
+            }
+        }
+        // The two lists are one layout described twice: entry i is row i of
+        // the measured sequence below the composer, in plain and escaped
+        // form. Different lengths mean the layout is not actually measured,
+        // and a half-described layout must not verify anything.
+        if (!composer_trailers.is_empty() || !composer_trailers_esc.is_empty())
+            && composer_trailers_esc.len() != composer_trailers.len()
+        {
+            return Err(ManifestError::BadRegion {
+                id: raw.agent.id.clone(),
+                rule: "injection.composer_trailer_regex_esc".into(),
+                region: format!(
+                    "{} escaped rows against {} plain rows",
+                    composer_trailers_esc.len(),
+                    composer_trailers.len()
+                ),
+            });
+        }
         Ok(Manifest {
             agent: raw.agent,
             hooks: raw.hooks,
+            messaging: raw.messaging,
             rules,
             injection: raw.injection,
+            composer_trailers,
+            composer_trailers_esc,
+            composer_chips,
+            composer_chips_esc,
+            composer_prompt,
+            composer_continuation,
             path: path.into(),
         })
     }
@@ -494,10 +929,15 @@ impl Manifest {
     /// rule set needs an SGR-escaped capture (capture-pane -e) to fire.
     /// The daemon uses this to decide whether to take the second capture.
     pub fn has_escaped_rules(&self) -> bool {
-        self.rules.iter().any(|r| {
-            !r.matcher.line_regex_esc.is_empty()
-                || r.any.iter().any(|m| !m.line_regex_esc.is_empty())
-        })
+        // A chip-only manifest declares its escaped proof here and
+        // nowhere else; without this it would be handed a plain capture
+        // and could never satisfy the very pattern it declared.
+        !self.composer_chips_esc.is_empty()
+            || !self.composer_trailers_esc.is_empty()
+            || self.rules.iter().any(|r| {
+                !r.matcher.line_regex_esc.is_empty()
+                    || r.any.iter().any(|m| !m.line_regex_esc.is_empty())
+            })
     }
 }
 
@@ -615,6 +1055,31 @@ unsafe_states = ["blocked_modal"]
     fn no_match_is_none() {
         let m = manifest();
         assert!(m.evaluate("plain", "nothing to see").is_none());
+    }
+
+    #[test]
+    fn mailbox_capability_is_generic_manifest_data() {
+        let body = format!(
+            "{MINI}\n[messaging]\nmailbox_capability_file = \"/agent/skills/cyclops/SKILL.md\"\n"
+        );
+        let manifest = Manifest::parse(&body, Path::new("capable.toml")).unwrap();
+        let capability_file = manifest
+            .messaging
+            .mailbox_capability_file
+            .expect("manifest declares mailbox capability evidence");
+        assert_eq!(
+            capability_file,
+            PathBuf::from("/agent/skills/cyclops/SKILL.md")
+        );
+
+        let malformed = body.replace(
+            "/agent/skills/cyclops/SKILL.md",
+            "relative/skills/cyclops/SKILL.md",
+        );
+        assert!(matches!(
+            Manifest::parse(&malformed, Path::new("bad-capability.toml")),
+            Err(ManifestError::BadMessaging { .. })
+        ));
     }
 
     #[test]
@@ -781,5 +1246,311 @@ verify_pattern = ["<message_id>"]
             .evaluate("mac", "⚠ Individual quota reached. Please upgrade your subscription to increase your limits.")
             .unwrap();
         assert_eq!(quota.state, AgentState::BlockedQuota);
+    }
+}
+
+#[cfg(test)]
+mod trailer_layout_tests {
+    use super::*;
+
+    fn parse(body: &str) -> Result<Manifest, ManifestError> {
+        let src = format!("[agent]\nid = \"t\"\ndisplay_name = \"t\"\n\n[injection]\n{body}");
+        Manifest::parse(&src, Path::new("t.toml"))
+    }
+
+    /// A turn key is a claim that two events can be matched, so an
+    /// incomplete or ambiguous declaration is a load error rather than a
+    /// vendor that quietly falls back to screen evidence while its
+    /// manifest says it correlates turns.
+    #[test]
+    fn a_partial_turn_key_is_a_load_error() {
+        let hooks = |body: &str| {
+            let src = format!("[agent]\nid = \"t\"\ndisplay_name = \"t\"\n\n[hooks]\n{body}");
+            Manifest::parse(&src, Path::new("t.toml"))
+        };
+        let both = "turn_start = \"Start\"\nturn_end = \"Stop\"\n";
+
+        assert!(
+            hooks(&format!(
+                "{both}turn_key_fields = [\"session_id\", \"turn_id\"]\n"
+            ))
+            .is_ok(),
+            "a complete declaration loads"
+        );
+        assert!(hooks(both).is_ok(), "declaring no key at all is fine");
+        // Start and acknowledgment MAY be the same event, and are in
+        // every shipped vendor: taking the prompt is both the receipt and
+        // the beginning of the turn.
+        assert!(
+            hooks(&format!(
+                "{both}ack = \"Start\"\nturn_key_fields = [\"turn_id\"]\n"
+            ))
+            .is_ok(),
+            "a start that is also the acknowledgment is a fact about the vendor"
+        );
+
+        for (case, body) in [
+            (
+                "no start",
+                "turn_end = \"Stop\"\nturn_key_fields = [\"turn_id\"]\n".to_string(),
+            ),
+            (
+                "no end",
+                "turn_start = \"Start\"\nturn_key_fields = [\"turn_id\"]\n".to_string(),
+            ),
+            (
+                "blank start",
+                "turn_start = \"  \"\nturn_end = \"Stop\"\nturn_key_fields = [\"turn_id\"]\n"
+                    .to_string(),
+            ),
+            (
+                "blank end",
+                "turn_start = \"Start\"\nturn_end = \"\"\nturn_key_fields = [\"turn_id\"]\n"
+                    .to_string(),
+            ),
+            (
+                "empty field",
+                format!("{both}turn_key_fields = [\"turn_id\", \"\"]\n"),
+            ),
+            (
+                "duplicate field",
+                format!("{both}turn_key_fields = [\"turn_id\", \"turn_id\"]\n"),
+            ),
+        ] {
+            assert!(
+                matches!(hooks(&body), Err(ManifestError::BadTurnKey { .. })),
+                "{case} loaded"
+            );
+        }
+    }
+
+    /// One event cannot hold two turn roles, keyed lane or not.
+    ///
+    /// The bug this pins: the parser required both role names to be
+    /// present but never that they DIFFER. The runtime maps a report to
+    /// start, end or acknowledgment by reduced name, so a manifest whose
+    /// start and end reduce to the same event makes one report answer
+    /// both questions: a start records its own end, the turn is over
+    /// before it began, and the composer barrier releases against a turn
+    /// nothing ran. An acknowledgment that reduces to the end name is the
+    /// same defect on the receipt path, where an end would verify a
+    /// delivery and start the turn it had just ended.
+    #[test]
+    fn one_event_cannot_hold_two_turn_roles() {
+        let head = "[agent]\nid = \"t\"\ndisplay_name = \"t\"\n\n[hooks]\n";
+        let load = |body: &str| Manifest::parse(&format!("{head}{body}"), Path::new("t.toml"));
+
+        for (case, body) in [
+            (
+                "start and end are one event",
+                "turn_start = \"Stop\"\nturn_end = \"Stop\"\n",
+            ),
+            (
+                "differing only by punctuation and case",
+                "turn_start = \"turn-end\"\nturn_end = \"Turn_End\"\n",
+            ),
+            (
+                "acknowledgment is the end event",
+                "turn_start = \"Start\"\nturn_end = \"Stop\"\nack = \"stop\"\n",
+            ),
+            // Each pair stands alone: a manifest with no start still runs
+            // both of the roles it does declare.
+            (
+                "acknowledgment is the end event, with no start declared",
+                "turn_end = \"Stop\"\nack = \"Stop\"\n",
+            ),
+            // A role that reduces to nothing names no event, and two of
+            // them cannot be told apart from each other or from an
+            // incoming event that also reduces to nothing.
+            (
+                "punctuation-only role names",
+                "turn_start = \"!!!\"\nturn_end = \"???\"\n",
+            ),
+            (
+                "non-ASCII role name",
+                "turn_start = \"Start\"\nturn_end = \"\u{7d42}\u{4e86}\"\n",
+            ),
+            (
+                "punctuation-only acknowledgment",
+                "turn_start = \"Start\"\nturn_end = \"Stop\"\nack = \"--\"\n",
+            ),
+        ] {
+            assert!(
+                matches!(load(body), Err(ManifestError::BadHooks { .. })),
+                "{case} loaded"
+            );
+        }
+
+        // Checked for every declared lifecycle, not only for vendors that
+        // can name their turns: the screen lane maps the same roles.
+        for keyed in [
+            "turn_start = \"Stop\"\nturn_end = \"Stop\"\nturn_key_fields = [\"t\"]\n",
+            "turn_start = \"!!!\"\nturn_end = \"Stop\"\nturn_key_fields = [\"t\"]\n",
+        ] {
+            assert!(
+                matches!(load(keyed), Err(ManifestError::BadHooks { .. })),
+                "a keyed manifest is not a special case: {keyed:?}"
+            );
+        }
+
+        // A start that is ALSO the acknowledgment is a fact about the
+        // vendor, not a collision: taking the prompt is both the receipt
+        // and the beginning of the turn, which is the shipped shape.
+        assert!(load("turn_start = \"Start\"\nturn_end = \"Stop\"\nack = \"Start\"\n").is_ok());
+        // And a lifecycle nobody declared has no roles to collide.
+        assert!(load("config_mechanism = \"none\"\n").is_ok());
+    }
+
+    /// Order is part of the declaration, because the values are compared
+    /// positionally: two manifests naming the same fields in different
+    /// orders describe different keys.
+    #[test]
+    fn turn_key_fields_keep_their_declared_order() {
+        let src = "[agent]\nid = \"t\"\ndisplay_name = \"t\"\n\n[hooks]\n\
+                   turn_start = \"Start\"\nturn_end = \"Stop\"\n\
+                   turn_key_fields = [\"b\", \"a\"]\n";
+        let m = Manifest::parse(src, Path::new("t.toml")).expect("loads");
+        assert_eq!(m.hooks.turn_key_fields, vec!["b", "a"]);
+    }
+
+    /// A layout is two descriptions of the same rows plus how many of them
+    /// are mandatory. Every way of describing it incompletely is a load
+    /// error rather than a lane that silently never verifies.
+    #[test]
+    fn a_half_described_layout_is_a_load_error() {
+        let plain = "composer_trailer_regex = ['^a$', '^b$']\n";
+        let esc = "composer_trailer_regex_esc = ['^a$', '^b$']\n";
+        let req = "composer_trailer_required_prefix = 2\n";
+
+        assert!(
+            parse(&format!("{plain}{esc}{req}")).is_ok(),
+            "complete layout"
+        );
+
+        for (case, body) in [
+            ("missing required prefix", format!("{plain}{esc}")),
+            (
+                "zero required",
+                format!("{plain}{esc}composer_trailer_required_prefix = 0\n"),
+            ),
+            (
+                "required out of range",
+                format!("{plain}{esc}composer_trailer_required_prefix = 3\n"),
+            ),
+            ("plain only", format!("{plain}{req}")),
+            ("escaped only", format!("{esc}{req}")),
+            (
+                "length mismatch",
+                format!("{plain}composer_trailer_regex_esc = ['^a$']\n{req}"),
+            ),
+        ] {
+            assert!(parse(&body).is_err(), "{case} must not load");
+        }
+    }
+
+    /// A manifest that declares no layout at all still loads: it simply
+    /// cannot use the sentinel path.
+    #[test]
+    fn no_layout_at_all_is_not_an_error() {
+        let m = parse("submit = \"Enter\"\n").expect("loads");
+        assert!(m.composer_trailers.is_empty());
+    }
+
+    #[test]
+    fn composer_actions_require_a_complete_safe_declaration() {
+        let extraction = "composer_prompt_regex = '^> (?P<content>.*)$'\n\
+                          composer_continuation_regex = '^  (?P<content>.*)$'\n";
+        let manifest = parse(&format!(
+            "submit = \"Enter\"\nclear_keys = [\"C-c\"]\n{extraction}"
+        ))
+        .expect("measured clear action loads");
+        assert_eq!(manifest.injection.clear_keys, ["C-c"]);
+        assert!(manifest.composer_prompt.is_some());
+        assert!(manifest.composer_continuation.is_some());
+        let chord_sequence = parse(&format!(
+            "submit = \"Enter\"\nclear_keys = [\"C-a\", \"C-k\"]\n{extraction}"
+        ))
+        .expect("measured control-key sequence loads");
+        assert_eq!(chord_sequence.injection.clear_keys, ["C-a", "C-k"]);
+
+        for (case, body) in [
+            (
+                "clear without extraction",
+                "submit = \"Enter\"\nclear_keys = [\"C-c\"]\n".to_string(),
+            ),
+            (
+                "one extraction half",
+                "composer_prompt_regex = '^> (?P<content>.*)$'\n".to_string(),
+            ),
+            (
+                "unanchored extraction",
+                "composer_prompt_regex = '> (?P<content>.*)'\n\
+                 composer_continuation_regex = '^  (?P<content>.*)$'\n"
+                    .to_string(),
+            ),
+            (
+                "missing content capture",
+                "composer_prompt_regex = '^> (.*)$'\n\
+                 composer_continuation_regex = '^  (?P<content>.*)$'\n"
+                    .to_string(),
+            ),
+            (
+                "submit key clears",
+                format!("submit = \"Enter\"\nclear_keys = [\"Enter\"]\n{extraction}"),
+            ),
+            (
+                "newline key clears",
+                format!("submit = \"Enter\"\nclear_keys = [\"C-m\"]\n{extraction}"),
+            ),
+            (
+                "literal key clears",
+                format!("submit = \"Enter\"\nclear_keys = [\"x\"]\n{extraction}"),
+            ),
+            (
+                "named literal key clears",
+                format!("submit = \"Enter\"\nclear_keys = [\"Space\"]\n{extraction}"),
+            ),
+            (
+                "named editing key clears",
+                format!("submit = \"Enter\"\nclear_keys = [\"BSpace\"]\n{extraction}"),
+            ),
+            (
+                "unknown key expands to text",
+                format!("submit = \"Enter\"\nclear_keys = [\"clear\"]\n{extraction}"),
+            ),
+            (
+                "modified submit key clears",
+                format!("submit = \"Enter\"\nclear_keys = [\"M-Enter\"]\n{extraction}"),
+            ),
+        ] {
+            assert!(
+                matches!(parse(&body), Err(ManifestError::BadInjection { .. })),
+                "{case} loaded"
+            );
+        }
+        for key in [
+            "Space",
+            "BSpace",
+            "Backspace",
+            "Tab",
+            "BTab",
+            "DC",
+            "Delete",
+            "IC",
+            "Insert",
+            "Enter",
+            "Return",
+            "KPEnter",
+            "Linefeed",
+            "C-m",
+            "C-j",
+            "M-Enter",
+        ] {
+            let body = format!("submit = \"Enter\"\nclear_keys = [\"{key}\"]\n{extraction}");
+            assert!(
+                matches!(parse(&body), Err(ManifestError::BadInjection { .. })),
+                "unsafe key {key:?} loaded"
+            );
+        }
     }
 }

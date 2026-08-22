@@ -9,6 +9,7 @@ description = "Semantic color tokens: theme files, 256-color fallback derivation
 # vocabulary, so the mapping lives with the tokens rather than once per
 # renderer. That needs the state enums; cyclops-proto is data types only.
 cyclops-proto.workspace = true
+cyclops-state.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 

@@ -38,6 +38,8 @@ use crate::error::TmuxError;
 use crate::notify::{parse_notification_bytes, Notification};
 use crate::quote::quote_arg;
 
+static SPOOL_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 /// How the control client reaches its session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlMode {
@@ -73,6 +75,8 @@ pub struct ControlConfig {
     /// Payload files are always created 0o600 either way; point this at a
     /// private directory so payloads never touch a shared temp dir at all.
     pub buffer_spool_dir: Option<PathBuf>,
+    /// Held state root and descendant directory for Cyclops-owned spool files.
+    pub state_buffer_spool: Option<(Arc<cyclops_state::StateRoot>, PathBuf)>,
 }
 
 impl ControlConfig {
@@ -86,6 +90,7 @@ impl ControlConfig {
             initial_window_name: None,
             command_timeout: Duration::from_secs(10),
             buffer_spool_dir: None,
+            state_buffer_spool: None,
         }
     }
 
@@ -125,6 +130,16 @@ impl ControlConfig {
     /// temp dir. The directory is created 0o700 on first use.
     pub fn with_buffer_spool_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.buffer_spool_dir = Some(dir.into());
+        self
+    }
+
+    /// Spool through a held state root while tmux consumes the pathname.
+    pub fn with_state_buffer_spool(
+        mut self,
+        root: Arc<cyclops_state::StateRoot>,
+        descendant: impl Into<PathBuf>,
+    ) -> Self {
+        self.state_buffer_spool = Some((root, descendant.into()));
         self
     }
 }
@@ -290,6 +305,7 @@ pub struct ControlClient {
     timeout: Duration,
     buffer_file_seq: AtomicU64,
     spool_dir: Option<PathBuf>,
+    state_spool: Option<(Arc<cyclops_state::StateRoot>, PathBuf)>,
 }
 
 impl ControlClient {
@@ -385,6 +401,7 @@ impl ControlClient {
             timeout: cfg.command_timeout,
             buffer_file_seq: AtomicU64::new(0),
             spool_dir: cfg.buffer_spool_dir,
+            state_spool: cfg.state_buffer_spool,
         };
 
         // Handshake plus flow control in one command. A %error reply still
@@ -470,6 +487,17 @@ impl ControlClient {
         Ok(out.join("\n"))
     }
 
+    /// Visible grid with SGR preserved and tmux-wrapped rows joined.
+    ///
+    /// Application-rendered line breaks remain separate. This is the
+    /// capture used when exact composer extraction needs logical rows.
+    pub async fn capture_pane_joined_escaped(&self, pane_id: &str) -> Result<String, TmuxError> {
+        let out = self
+            .command(&format!("capture-pane -e -J -p -t {}", quote_arg(pane_id)))
+            .await?;
+        Ok(out.join("\n"))
+    }
+
     /// Visible grid plus the last `lines` of scrollback.
     pub async fn capture_pane_history(
         &self,
@@ -495,6 +523,21 @@ impl ControlClient {
             ))
             .await?;
         Ok(out.join("\n"))
+    }
+
+    /// Resolve one pane's root pid from the whole tmux server.
+    ///
+    /// A session watcher reports a pane as removed when it moves to another
+    /// session. `list-panes -a` distinguishes that route change from physical
+    /// pane loss without polling or opening another client.
+    pub async fn server_pane_pid(&self, pane_id: &str) -> Result<Option<i32>, TmuxError> {
+        let out = self
+            .command(&format!(
+                "list-panes -a -F {}",
+                quote_arg("#{pane_id}\t#{pane_pid}")
+            ))
+            .await?;
+        parse_server_pane_pid(&out, pane_id)
     }
 
     /// Send keys to a pane. Each element is either a tmux key name (Enter,
@@ -532,15 +575,22 @@ impl ControlClient {
     /// Control-mode stdin is the command channel, so the content travels via
     /// a spool file that `load-buffer` reads; the file is created 0o600
     /// (payloads are never world-readable, even transiently) under the
-    /// configured spool dir ([`ControlConfig::with_buffer_spool_dir`]) or
-    /// the system temp dir, and is deleted afterwards whether or not the
-    /// command succeeded. Buffer names are caller-owned; the daemon
+    /// held state root, configured spool dir, or system temp dir. A held
+    /// root cleans up only the exact published inode. Every form deletes
+    /// the file after the command. Buffer names are caller-owned; the daemon
     /// guarantees per-delivery uniqueness (amendment e, F4: named buffers
     /// are server-global and concurrent reuse corrupts).
     pub async fn load_buffer(&self, name: &str, bytes: &[u8]) -> Result<(), TmuxError> {
         debug_assert!(!name.is_empty(), "buffer name must be nonempty");
         let seq = self.buffer_file_seq.fetch_add(1, Ordering::Relaxed);
-        let path = write_spool_file(self.spool_dir.as_deref(), seq, bytes).await?;
+        let state_file = match &self.state_spool {
+            Some((root, directory)) => Some(create_state_spool_file(root, directory, seq, bytes)?),
+            None => None,
+        };
+        let path = match &state_file {
+            Some(file) => file.path().to_path_buf(),
+            None => write_spool_file(self.spool_dir.as_deref(), seq, bytes).await?,
+        };
         let cmd = format!(
             "load-buffer -b {} {}",
             quote_arg(name),
@@ -548,7 +598,14 @@ impl ControlClient {
         );
         let res = self.command(&cmd).await;
         // Message content must not linger on disk.
-        let _ = tokio::fs::remove_file(&path).await;
+        match state_file {
+            Some(file) => {
+                let _ = file.remove();
+            }
+            None => {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+        }
         res.map(|_| ())
     }
 
@@ -629,6 +686,33 @@ impl ControlClient {
     }
 }
 
+fn parse_server_pane_pid(lines: &[String], pane_id: &str) -> Result<Option<i32>, TmuxError> {
+    let mut found = None;
+    for line in lines {
+        let Some((id, raw_pid)) = line.split_once('\t') else {
+            return Err(TmuxError::Protocol(format!(
+                "list-panes -a line has no pid field: {line:?}"
+            )));
+        };
+        if id != pane_id {
+            continue;
+        }
+        if raw_pid.is_empty() {
+            return Ok(None);
+        }
+        let pid = raw_pid.parse::<i32>().map_err(|_| {
+            TmuxError::Protocol(format!("list-panes -a has invalid pane pid: {line:?}"))
+        })?;
+        if found.is_some_and(|prior| prior != pid) {
+            return Err(TmuxError::Protocol(format!(
+                "list-panes -a disagrees about {pane_id}: {line:?}"
+            )));
+        }
+        found = Some(pid);
+    }
+    Ok(found)
+}
+
 fn send_keys_commands(pane_id: &str, keys: &[&str]) -> Vec<String> {
     let target = quote_arg(pane_id);
     let mut commands = Vec::new();
@@ -655,9 +739,8 @@ fn send_keys_commands(pane_id: &str, keys: &[&str]) -> Vec<String> {
 }
 
 /// Write one load-buffer payload spool file: exclusive create, mode 0o600,
-/// under `dir` (created 0o700 when missing) or the system temp dir. A stale
-/// same-named file (a dead process that reused our pid) is removed first so
-/// the exclusive create cannot write through it.
+/// under `dir` (created 0o700 when missing) or the system temp dir. Names
+/// are process-global and collisions are retried without removing anything.
 async fn write_spool_file(
     dir: Option<&std::path::Path>,
     seq: u64,
@@ -677,14 +760,54 @@ async fn write_spool_file(
         }
         None => std::env::temp_dir(),
     };
-    let path = dir.join(format!("cyclops-buf-{}-{seq}", std::process::id()));
-    let _ = tokio::fs::remove_file(&path).await;
     let mut opts = tokio::fs::OpenOptions::new();
     opts.write(true).create_new(true).mode(0o600);
-    let mut f = opts.open(&path).await?;
-    f.write_all(bytes).await?;
-    f.flush().await?;
-    Ok(path)
+    for _ in 0..32 {
+        let path = dir.join(spool_file_name(seq));
+        let mut file = match opts.open(&path).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        };
+        file.write_all(bytes).await?;
+        file.flush().await?;
+        return Ok(path);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not reserve a tmux spool file",
+    )
+    .into())
+}
+
+fn create_state_spool_file(
+    root: &cyclops_state::StateRoot,
+    directory: &std::path::Path,
+    seq: u64,
+    bytes: &[u8],
+) -> Result<cyclops_state::TransientStateFile, TmuxError> {
+    for _ in 0..32 {
+        let descendant = directory.join(spool_file_name(seq));
+        match root.create_transient_file(&descendant, bytes) {
+            Ok(file) => return Ok(file),
+            Err(cyclops_state::StateError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                continue;
+            }
+            Err(error) => return Err(std::io::Error::other(error.to_string()).into()),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not reserve a state tmux spool file",
+    )
+    .into())
+}
+
+fn spool_file_name(seq: u64) -> String {
+    let unique = SPOOL_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("cyclops-buf-{}-{seq}-{unique}", std::process::id())
 }
 
 /// Reads the control stream: resolves reply blocks against the pending FIFO
@@ -939,6 +1062,27 @@ mod tests {
     }
 
     #[test]
+    fn state_spool_is_owner_only_and_exactly_cleaned_up() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = cyclops_proto::scratch::scratch_dir("cyclops-state-spool-test");
+        let _ = std::fs::remove_dir_all(&base);
+        let root = cyclops_state::StateRoot::open_or_create(&base).unwrap();
+        let file =
+            create_state_spool_file(&root, std::path::Path::new("spool"), 9, b"secret").unwrap();
+        let path = file.path().to_path_buf();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"secret");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(file);
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn key_name_classification() {
         for k in [
             "Enter", "Escape", "Tab", "BSpace", "F5", "C-c", "M-Enter", "C-M-x", "S-Up",
@@ -948,6 +1092,23 @@ mod tests {
         for k in ["hello", "a", "5", "echo hi", "C-", "X-a", "-l", "ls -la"] {
             assert!(!is_key_name(k), "{k} should be literal");
         }
+    }
+
+    #[test]
+    fn server_pane_lookup_accepts_linked_duplicates_but_rejects_disagreement() {
+        let linked = vec!["%7\t410".into(), "%2\t220".into(), "%7\t410".into()];
+        assert_eq!(parse_server_pane_pid(&linked, "%7").unwrap(), Some(410));
+        assert_eq!(parse_server_pane_pid(&linked, "%9").unwrap(), None);
+
+        let disagreement = vec!["%7\t410".into(), "%7\t411".into()];
+        assert!(matches!(
+            parse_server_pane_pid(&disagreement, "%7"),
+            Err(TmuxError::Protocol(_))
+        ));
+        assert!(matches!(
+            parse_server_pane_pid(&["%7".into()], "%7"),
+            Err(TmuxError::Protocol(_))
+        ));
     }
 
     #[test]

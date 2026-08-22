@@ -1,7 +1,7 @@
 # AGENTS.md
 
 Orientation for AI coding agents working on this repo. The human-written map
-is [docs/development/HANDOFF.md](docs/development/HANDOFF.md) — read it before any non-trivial
+is [docs/development/HANDOFF.md](docs/development/HANDOFF.md). Read it before any non-trivial
 change; this page is the condensed agent view plus the gates that are easy
 to trip.
 
@@ -75,7 +75,7 @@ python3 scripts/check-doc-paths.py
    found the event yet (`docs/development/INVARIANTS.md`, rule 9).
 5. **Wire changes are additive.** New fields optional; unknown fields
    ignored in both directions; version mismatch warns, never rejects.
-6. **The pane title is a sensor — never write it.** Adoption decoration goes
+6. **The pane title is a sensor. Never write it.** Adoption decoration goes
    on the pane border only.
 7. **A behavior fix needs a test that fails before it**, and docs ship in
    the same commit as the behavior.
@@ -97,16 +97,18 @@ python3 scripts/check-doc-paths.py
 - What state a pane is in and why: `src/cyclopsd/src/fusion.rs`;
   per-sensor readings via `cyclops read <agent> --source detection`.
 - "What needs a human" (the eye): one owner,
-  `src/cyclops-proto/src/attention.rs` — never recompute it elsewhere.
+  `src/cyclops-proto/src/attention.rs`. Never recompute it elsewhere.
 - Debugging a stuck delivery: the ledger is the debugger; every gate
   decision is a line with a cause. See the cause table in
   [docs/development/HANDOFF.md](docs/development/HANDOFF.md).
-- Adding an agent CLI: one TOML file, no code —
+- Adding an agent CLI: one TOML file, no code.
   [docs/reference/MANIFESTS.md](docs/reference/MANIFESTS.md), fixtures in
   `src/cyclops-manifest/tests/fixtures/`.
 - What is built vs. planned: [STATUS.md](STATUS.md). Two non-bugs to know:
-  a quota park has no re-queue verb (by design), and `cyclops start` cannot
-  tell two same-shaped layouts apart until one pane is named.
+  a legacy direct-delivery quota park has no requeue verb, while a mailbox
+  quota hold requires observed reset plus explicit admin requeue; and
+  `cyclops start` cannot tell two same-shaped layouts apart until one pane is
+  named.
 
 ## Custom Instructions
 
@@ -122,7 +124,7 @@ Cloud VMs start with Rust 1.83 pinned as `rustup` default; this tree's
 "feature `edition2024` is required", re-run `rustup default stable`.
 
 Standard lint/test/build/run commands are in this file and
-[CONTRIBUTING.md](CONTRIBUTING.md) — follow those. Non-obvious
+[CONTRIBUTING.md](CONTRIBUTING.md). Follow those. Non-obvious
 caveats for this environment:
 
 - **Run `cargo test` from a plain shell, not inside tmux.** The e2e tests
@@ -137,7 +139,7 @@ caveats for this environment:
   and rely on mtime advancing between writes microseconds apart. This
   kernel's per-tick inode timestamps are coarse (confirmed on overlayfs
   and tmpfs), so the theme watcher can miss the change. Not a code
-  defect — do not "fix" it. Everything else in the suite passes.
+  defect. Do not "fix" it. Everything else in the suite passes.
 - For a self-contained end-to-end delivery demo that provisions its own
   detectable pane, run `./demos/m1-send.sh` (isolated tmux server +
   throwaway home). A live `cyclops start` pane reads `? unknown` unless

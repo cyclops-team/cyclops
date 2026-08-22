@@ -17,13 +17,20 @@ three steps away.
 
 ```
 $ cyclops read reviewer --source detection
-reviewer · ○ idle · decided by title_idle
+reviewer · ○ idle · decided by title_idle · write-ready
 
-  title  ○ idle  title_idle  just now
+  title   ○ idle  title_idle      just now
+  screen  ○ idle  composer_empty  just now
 ```
 
 `decided by` names the rule that produced the verdict. A wrong reading is
 one rule to fix.
+
+`write-ready` is the second answer and a different question: may a
+message be pasted right now. Only a screen rule can answer it, because
+only the screen can see the composer. A manifest with no idle screen rule
+reads `not write-ready: no_clean_composer_evidence` however confidently
+its title rule says idle.
 
 Add `--raw` and the same answer carries the pane capture the sensors
 read, under the readings. One answer means one moment: a separate
@@ -32,9 +39,10 @@ you are staring at contradicts the verdict it is supposed to explain.
 
 ```
 $ cyclops read reviewer --source detection --raw
-reviewer · ○ idle · decided by title_idle
+reviewer · ○ idle · decided by title_idle · write-ready
 
-  title  ○ idle  title_idle  just now
+  title   ○ idle  title_idle      just now
+  screen  ○ idle  composer_empty  just now
 
 what the sensors read (%1):
 ...the pane, verbatim...
@@ -103,6 +111,9 @@ safe_states = ["idle"]
 | `argv_basenames` | Bind when `argv[0]`'s basename is one of these. The fallback for when the first list cannot work |
 | `launch` | The command that starts this CLI, for `cyclops start --agents <id>`. Optional |
 
+Each shipped `version_tested` value is parity-tested against one authoritative
+full-ruleset fixture. A newer partial capture does not promote that claim.
+
 `argv_basenames` exists for one measured reason. tmux reports the kernel's
 name for the resolved executable, so a native Claude install, where
 `~/.local/bin/claude` is a symlink into `versions/2.1.220`, reports
@@ -165,21 +176,21 @@ says so. `auto_dismiss = false` means report and park the delivery; a human
 decides. Claude's folder-trust dialog is `false` for a measured reason:
 Escape on that dialog exits the CLI.
 
-## `[hooks]`: turn edges and delivery receipts
+## `[hooks]`: turn edges and legacy self-test receipts
 
 | Key | What it does |
 |---|---|
 | `config_mechanism` | How this CLI is told about hooks. Free text, printed by `cyclops hooks install` |
 | `turn_start`, `turn_end` | Event names for the two turn edges |
-| `ack` | The event whose payload can prove a delivery arrived |
+| `ack` | The event whose payload can prove a legacy direct-delivery self-test arrived |
 | `ack_payload_field` | The field in that payload holding the injected text |
 | `available` | Every event name the CLI can fire. Documentation for whoever writes the next rule |
 
-`ack` plus `ack_payload_field` is what earns `✔ delivered · verified`: the
-hook fires, the payload carries the text, cyclops finds this message's id
-inside it. A CLI with no matchable ack still works; its deliveries land as
-`✓ delivered · unverified (screen)`, which means the paste left the composer
-and a turn started. Both are delivered; only the evidence differs.
+`ack` plus `ack_payload_field` is what earns a legacy self-test
+`✔ delivered · verified`: the hook fires, the payload carries the text, and
+Cyclops finds the test message id inside it. Standard mailbox delivery does not
+paste the body or use these receipt tiers. It uses lifecycle edges and manifest
+readiness to guard a one-line notification.
 
 Wiring the hooks on the CLI side is [hooks.md](hooks.md).
 
@@ -189,11 +200,14 @@ Wiring the hooks on the CLI side is [hooks.md](hooks.md).
 |---|---|
 | `method` | How the text goes in. `load-buffer + paste-buffer -p` for every shipped CLI |
 | `submit` | The key that sends it, usually `Enter` |
+| `clear_keys` | Measured key sequence that clears the whole composer. Empty means unsupported |
 | `verify_before_submit` | Read the composer back before pressing submit |
 | `verify_pattern` | What must be visible for the paste to count as staged. `<message_id>` is replaced with this delivery's marker |
 | `safe_states` | Deliver only when the agent is in one of these |
 | `unsafe_states` | Never deliver in these |
 | `busy_behavior` | `"queues"` when text pasted mid-turn stages and runs as its own turn. Leave it out unless you measured it |
+| `composer_prompt_regex` | Whole joined-capture row that starts the active composer, with a named `content` capture |
+| `composer_continuation_regex` | Whole joined-capture row for each later logical payload line, with a named `content` capture |
 
 `verify_before_submit = true` with `verify_pattern = ["<message_id>"]` is the
 gate that keeps a message out of the wrong pane: cyclops pastes, reads the
@@ -202,6 +216,18 @@ holds the same process, and only then presses Enter. Leave both on.
 
 `safe_states = ["idle"]` is the conservative default and the right one until
 you have measured what the CLI does with text pasted mid-turn.
+
+The two composer patterns are declared together and are matched after
+`capture-pane -J -e` joins tmux physical wraps and Cyclops removes SGR codes.
+They remove only measured prompt chrome. Extraction still refuses unless one
+same-id header reaches one terminal sentinel followed immediately by the
+vendor's styled trailer. A duplicate header, duplicate sentinel, transcript
+echo, undeclared trailing row, or collapsed chip is not visible payload.
+
+`clear_keys` is capability data, not a generic cleanup path. It is valid only
+with both extraction patterns. Each entry must be a named non-text key or a
+modified chord; text, editing, and submit key names are rejected. It is empty
+for an unmeasured vendor. Delivery never invokes it.
 
 ## Write down what you measured
 

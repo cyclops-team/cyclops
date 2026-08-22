@@ -1,6 +1,7 @@
 # When something is wrong
 
-Every message below is real output. Find yours, do the next step.
+Examples below show the stable output shape. Dynamic ids, clocks, paths, and
+notification timing vary. Find the matching condition, then take the next step.
 
 ## "cyclops isn't running. Start it with: cyclops start"
 
@@ -48,8 +49,9 @@ $ cyclops status
   %0  ? unknown  mac
 ```
 
-No manifest matched the process in that pane, so cyclops has no rules for
-reading it and will not deliver to it. Three causes, in order of likelihood:
+No manifest matched the process in that pane, so Cyclops has no rules for
+reading it and cannot safely write a mailbox notification. Three causes, in
+order of likelihood:
 
 1. **The pane is running a shell**, not an agent. Expected. Start the agent.
 2. **The process name is not what the manifest expects.** A wrapper script,
@@ -61,77 +63,61 @@ reading it and will not deliver to it. Three causes, in order of likelihood:
    at all, means the directory was empty, missing, or one file failed to
    parse and took the rest with it. See [MANIFESTS.md](../reference/MANIFESTS.md).
 
-## A send to a pane nothing detects
+## A send is accepted but the pane receives no notification
+
+Standard send returns after the mailbox write:
 
 ```
-$ cyclops send ghost --subject "hello"
-⚠ needs attention · nothing detects %1
-ghost did not get this message; it is on the record and needs attention.
-Teach cyclops what runs in %1: cyclops name %1 ghost --manifest <id>.
-cyclops status names the manifests that are loaded, and docs/reference/MANIFESTS.md
-is how to write one.
+$ cyclops send reviewer --subject "hello"
+accepted m-<full-uuid-suffix>
+✓ accepted · wake queued
 ```
 
-Exit code 1, and the message is on the record rather than lost. Cyclops
-will not type into a pane it cannot read, so the delivery never starts.
-Fix the binding, not the receipt: `cyclops status` names what is loaded and
-what to pin.
+The second line is a snapshot of the one-line wake, not proof that the body was
+claimed. Run `cyclops messages` to inspect the current mailbox and notification
+state. If the target pane is unknown, start its agent or pin the correct
+manifest. The body remains in the mailbox and is never pasted into the pane.
 
-Hooks are a different axis and do not help here. They upgrade a delivered
-receipt from screen evidence to hook-verified, and a pane nothing detects
-never gets that far.
+If the notification reaches `needs attention`, run `cyclops alarm preview
+--older-than 0s` and inspect the exact attempt with `cyclops attention show
+<attempt-id> --diff`. Do not resend or requeue blindly.
 
-## A send says "● queued"
+## A receipt says `1 ahead`
 
 ```
 $ cyclops send implementer --subject "hello"
-● queued · 1 ahead
+accepted m-<full-uuid-suffix>
+✓ accepted · 1 ahead · wake queued
 ```
 
-Queued means another message is in front of this one. The number is a queue
-position, so `1 ahead` means one message is in front of this one. A head
-delivery held by the target is different: it says `● held · ...` and names
-the normalized reason. You see `recipient working`, `composer has input`,
-`pane in copy mode`, `session detached`, `waiting for a decision`, or `target
-state unknown`.
+The position is the recipient mailbox's FIFO order. One older pending message
+must be claimed before this one becomes oldest. Cyclops never overtakes it.
+Use `cyclops messages` for current state and `cyclops inbox list` from the
+recipient pane for pending metadata.
 
-This one clears itself. Past the paste, a receipt reports the state it is
-actually in rather than calling it queued, so a receipt that still says
-queued is telling you the truth about where the message stands.
+## Correlate a message with the workspace journal
 
-Every hold clears itself when the corresponding pane or session event arrives.
-A message behind the head remains FIFO-queued and never overtakes it. A
-receipt is the state at the instant you asked; `cyclops history` is where each
-delivery actually ended up.
-[send.md](send.md).
+The receipt id is the join key. Discover the workspace id from the authenticated,
+body-free snapshot:
 
-## Correlate a delivery with the ledger
-
-The receipt's message id is the join key. Start with the id in the receipt and
-fold its state lines; the daemon records causes without screen text:
-
-```
-$ jq -c 'select(.id == "m-b9125e" and (.kind == "state" or .kind == "gate")) | {seq,kind,from:.data.from,to_state:.data.to_state,action:.data.action,cause:.data.cause}' ~/.cyclops/ledger/main.ndjson
-{"seq":8,"kind":"state","from":"queued","to_state":"gating","action":null,"cause":null}
-{"seq":10,"kind":"state","from":"gating","to_state":"pasting","action":null,"cause":null}
+```bash
+workspace_id=$(cyclops --json messages | jq -r .workspace_id)
+cyclops_home="${CYCLOPS_HOME:-$HOME/.cyclops}"
+jq -c 'select(.id == "m-<full-uuid-suffix>")' \
+  "$cyclops_home/workspaces/$workspace_id/messages.ndjson"
 ```
 
-The first line is the quickest split: no message id means the client request,
-sandbox, socket, or validation failed before a ledger record. A latest state
-of `gating` is a target-side hold. `pasting` followed by
-`attention_required` means paste/readback outcome unknown; `submitted`
-followed by `attention_required` means post-submit evidence unknown. The
-two state lines above are an excerpt captured from the real
-`./demos/m1-send.sh` transcript after implementation; the full filter prints
-the later transitions too. IDs and paths change on every run, so substitute
-the id and ledger path from your own receipt.
+That append-only journal owns immutable messages, mailbox mutations,
+notification transitions, and recovery facts. Session ledgers under
+`$CYCLOPS_HOME/ledger/` own pane state and legacy direct delivery. Use the CLI
+instead of raw journal bytes when caller-scoped body visibility matters.
 
 ## "no manifest \"cluade\"; loaded: agy, claude, codex, cursor"
 
 A typo, or a manifest the daemon has not read. The list is what it has.
 Adding a file needs a `cyclopsd` restart: manifests are read once at boot.
 
-## The eye is open and something is "waiting on you"
+## `cyclops status` says something is waiting on you
 
 ```
 $ cyclops status
@@ -144,71 +130,45 @@ $ cyclops status
   ghost  ⚠ needs attention · no pane with that name · m-0e9a54 · just now
 ```
 
-The message id and age in this captured row change on every run.
+The id and age in this compatibility example change on every run. This status
+surface owns blocked panes, legacy direct-delivery attention, and the unread
+admin count. It does not own standard mailbox notification alarms. Use
+`cyclops messages` and `cyclops alarm preview --older-than <age>` for those.
 
-The eye opens for exactly two things: a pane in a blocked state, and a
-delivery that cannot move without you. The block under the roster names
-them, and the header counts them. Nothing closes it but the thing itself
-clearing, and a clearance line follows the alarm in `cyclops watch` so a closed
-eye can never sit over a stale warning.
+## A mailbox notification says `needs attention`
 
-## A send says "needs attention"
+The send itself was already accepted. `cyclops messages` names the current
+content-free notification state and attempt id. Inspect that exact attempt:
 
-```
-$ cyclops send ghost --subject "Review this"
-⚠ needs attention · no pane for "ghost"
-```
-
-The qualifier is the whole diagnosis. `no pane for "x"` means no agent by
-that name; `cyclops list` shows the ones that exist. The others are a dead
-pane, no matching manifest, or a delivery whose terminal outcome is unknown.
-
-Exit code 1. The message is kept on the record either way.
-
-## A delivery says `outcome unknown`
-
-Cyclops uses `attention_required` for an ambiguous terminal write as well as
-for a proven pre-write failure. `paste_failed`, `verify_failed`,
-`pane_rebound_after_paste`, `submit_failed`, and `ack_timeout` all mean that
-the pane may already contain or have accepted the message. Inspect the named
-pane and composer before resending; Cyclops will not retry these causes
-automatically. The exact cause remains in `--json` and in the ledger.
-
-Only a failure proven before the write can consume the bounded
-`delivery_retry_max` budget: a detach or missing manifest before paste, a
-pre-paste pane rebind, or a spool/load-buffer failure.
-
-## A send parks on quota
-
-```
-reviewer is out of quota, resets in 135h. The message is kept as parked; requeue it once the quota resets.
+```bash
+cyclops attention show <attempt-id> --diff
 ```
 
-Parked deliveries are never retried automatically, and new sends to that
-recipient park immediately behind them. That is deliberate: a retry loop
-against an exhausted quota burns the reset. Despite the receipt's wording,
-this release has no requeue verb: the parked record remains terminal. Send
-new work after the reset or use a different agent now. [send.md](send.md).
+`show` is read-only. If the evidence still matches, `attention complete` or
+`attention discard` performs one guarded action. An uncertain action outcome
+must be inspected and must not be repeated. Only use `cyclops requeue
+<message-id>` after resolving the cause and confirming that the notification is
+eligible.
 
-## Deliveries always land unverified
+## A legacy hook self-test lands unverified
 
 ```
 ✓ delivered · unverified (screen)
 ```
 
-The message arrived. What is missing is the recipient's own hook confirming
-it, so the evidence is screen-tier: the paste left the composer and a turn
-started.
+This is the legacy direct-delivery self-test result. The injected test payload
+reached screen evidence, but the recipient's acknowledgement hook did not fire.
+It is not a standard mailbox receipt.
 
 ```
 cyclops hooks verify reviewer    # which edges have ever arrived
 cyclops hooks selftest reviewer  # one no-op delivery, proves the ack fires
 ```
 
-Most common cause by far is Codex CLI in an untrusted directory: it silently
+The most common cause is Codex CLI in an untrusted directory: it silently
 loads zero hooks and `--dangerously-bypass-hook-trust` does not fix it.
 Wiring per CLI, including that one: [hooks.md](../reference/hooks.md). Antigravity has no
-payload-matchable ack at all, so its deliveries are screen-tier by design.
+payload-matchable acknowledgement, so its self-test is screen-tier by design.
 
 ## `hooks unverified` on a pane that was fine a minute ago
 
@@ -350,8 +310,11 @@ same answer carries the pane capture those sensors read, so the evidence
 and the verdict are one moment. `cyclops watch` streams what the daemon is
 seeing, live. `CYCLOPS_LOG=debug cyclopsd` says the rest.
 
-The record never lies and never needs the daemon:
+The workspace journal can be read without the daemon. Discover its path instead
+of guessing it:
 
 ```bash
-jq -c 'select(.id == "m-914b34")' ~/.cyclops/ledger/main.ndjson
+workspace_id=$(cyclops --json messages | jq -r .workspace_id)
+jq -c 'select(.id == "m-914b34")' \
+  "${CYCLOPS_HOME:-$HOME/.cyclops}/workspaces/$workspace_id/messages.ndjson"
 ```

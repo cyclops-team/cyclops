@@ -1,6 +1,14 @@
 //! M1 end-to-end: the delivery pipeline against a real tmux server on an
-//! isolated `-L` socket, the daemon booted in-process, NDJSON clients on
-//! the Unix socket. The rig lives in tests/common.
+//! isolated `-L` socket, with the daemon booted in-process. The rig lives
+//! in tests/common.
+//!
+//! Sends go through the attributed in-process boundary with the sender
+//! already resolved, because these tests are about DELIVERY. Who the
+//! daemon believes sent a message is resolved from the calling process's
+//! ancestry, which would make every one of these tests depend on where
+//! the suite was launched; that question has its own tests over the real
+//! socket in `tests/sender_identity.rs`. Everything else here, including
+//! status, labels and events, is still NDJSON over the Unix socket.
 
 mod common;
 
@@ -19,7 +27,7 @@ async fn screen_tier_delivery_end_to_end() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
-    let mut rig = Rig::new("cat", CAT_MANIFEST, "cat", "").await;
+    let mut rig = Rig::new("cat", CAT_MANIFEST, &composer_pane(), "").await;
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
 
@@ -127,7 +135,7 @@ async fn tier1_hook_ack_and_late_upgrade() {
     let mut rig = Rig::new(
         "hook",
         HOOK_MANIFEST,
-        "cat",
+        &composer_pane(),
         "receipt_block_ms = 300\nack_timeout_ms = 800\n",
     )
     .await;
@@ -156,7 +164,13 @@ async fn tier1_hook_ack_and_late_upgrade() {
                 "agent": "hooky",
                 "event": "UserPromptSubmit",
                 "seq": 1,
-                "payload": {"prompt": format!("staged text {m1} etc"), "session_id": "s1", "turn_id": "t1"},
+                // The exact payload: a hook acknowledgement verifies the
+                // bytes this delivery sent, or it verifies nothing.
+                "payload": {
+                    "prompt": cyclopsd::render_payload(&m1, "admin", "one", "a\nb\nc", false),
+                    "session_id": "s1",
+                    "turn_id": "t1",
+                },
             }))
             .unwrap(),
         )
@@ -181,13 +195,40 @@ async fn tier1_hook_ack_and_late_upgrade() {
                 "agent": "hooky",
                 "event": "UserPromptSubmit",
                 "seq": 2,
-                "payload": {"prompt": format!("staged text {m1} etc"), "session_id": "s1", "turn_id": "t1"},
+                // The exact payload: a hook acknowledgement verifies the
+                // bytes this delivery sent, or it verifies nothing.
+                "payload": {
+                    "prompt": cyclopsd::render_payload(&m1, "admin", "one", "a\nb\nc", false),
+                    "session_id": "s1",
+                    "turn_id": "t1",
+                },
             }))
             .unwrap(),
         )
         .await
         .expect("report ok");
     assert_eq!(dup["duplicate"], true, "{dup}");
+
+    // The turn that UserPromptSubmit opened has to be closed before the
+    // next message, and closing it is the agent's job to report. Until a
+    // turn-end edge arrives the hook still reads working, and a working
+    // hook against an idle screen is a contradiction: rule 12 holds the
+    // write rather than picking the reading it likes. Waiting for the two
+    // sensors to agree is what makes the next send deterministic instead
+    // of a race against a hook reading ageing out.
+    rig.daemon
+        .report_state(
+            serde_json::from_value(json!({
+                "agent": "hooky",
+                "event": "Stop",
+                "seq": 3,
+                "payload": {"session_id": "s1", "turn_id": "t1"},
+            }))
+            .unwrap(),
+        )
+        .await
+        .expect("report ok");
+    wait_pane_state(&mut rig, "idle").await;
 
     // Message 2: no hook inside the window -> screen tier resolves it,
     // then a late matching ACK upgrades it (receipts stay honest).
@@ -208,8 +249,12 @@ async fn tier1_hook_ack_and_late_upgrade() {
             serde_json::from_value(json!({
                 "agent": "hooky",
                 "event": "user_prompt_submit",
-                "seq": 3,
-                "payload": {"prompt": format!("late but matching {m2}"), "session_id": "s1", "turn_id": "t2"},
+                "seq": 4,
+                "payload": {
+                    "prompt": cyclopsd::render_payload(&m2, "admin", "two", "a\nb\nc", false),
+                    "session_id": "s1",
+                    "turn_id": "t2",
+                },
             }))
             .unwrap(),
         )
@@ -503,9 +548,15 @@ async fn broadcast_fans_out_and_missing_recipient_needs_attention() {
     // Generous receipt cap: this test asserts fan-out semantics, not the
     // 2.5s budget. Under full-workspace parallel load the second screen-tier
     // delivery can outlast the default cap, and a queued receipt is legal.
-    let mut rig = Rig::new("cast", CAT_MANIFEST, "cat", "receipt_block_ms = 10000\n").await;
+    let mut rig = Rig::new(
+        "cast",
+        CAT_MANIFEST,
+        &composer_pane(),
+        "receipt_block_ms = 10000\n",
+    )
+    .await;
     rig.tmux
-        .run_ok(&["split-window", "-d", "-t", "main:0", "cat"]);
+        .run_ok(&["split-window", "-d", "-t", "main:0", &composer_pane()]);
     rig.wait_attached(2).await;
     let panes = rig.pane_ids().await;
     rig.label(&panes[0], "impl").await;
@@ -560,7 +611,10 @@ async fn verification_failure_after_a_successful_paste_never_repastes() {
     let mut rig = Rig::new(
         "retry",
         BAD_VERIFY_MANIFEST,
-        "sh -c 'stty -echo; exec cat'",
+        // Deliberately non-verifying: the pane stages the paste like any
+        // composer, and the manifest's verify pattern is a token that
+        // never appears. Admission is real; the proof is what fails.
+        &composer_pane(),
         "",
     )
     .await;
@@ -614,15 +668,16 @@ async fn verification_failure_after_a_successful_paste_never_repastes() {
     rig.shutdown().await;
 }
 
-/// The in-process embedding path: a caller with an already-resolved sender
-/// (the socket path resolves identity first, tested above via "admin").
+/// The in-process embedding path: a caller with an already-resolved
+/// sender. The socket path resolves identity from the caller's process
+/// tree first, which has its own tests in `tests/sender_identity.rs`.
 #[tokio::test(flavor = "multi_thread")]
 async fn in_process_send_with_custom_sender() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
-    let mut rig = Rig::new("embed", CAT_MANIFEST, "cat", "").await;
+    let mut rig = Rig::new("embed", CAT_MANIFEST, &composer_pane(), "").await;
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "peer").await;
 
@@ -632,7 +687,11 @@ async fn in_process_send_with_custom_sender() {
         "body": "a\nb\nc",
     }))
     .unwrap();
-    let result = rig.daemon.msg_send("codex", params).await.expect("send ok");
+    let result = rig
+        .daemon
+        .deliver_payload("codex", params)
+        .await
+        .expect("send ok");
     assert_eq!(
         result["deliveries"][0]["state"], "delivered_unverified",
         "{result}"

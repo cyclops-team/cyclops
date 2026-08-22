@@ -27,10 +27,12 @@
 //! person's screen and is never touched either way; it keeps executing
 //! the replaced binary until they detach, and one line says so.
 
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::copy;
+use crate::hash::fnv64;
 use crate::render;
 use crate::style::Style;
 
@@ -122,11 +124,11 @@ fn clone(repo: &str, reff: &str, dest: &Path) -> Result<(), String> {
 
 /// Where update keeps its build cache, so a rebuild is incremental.
 ///
-/// Under the cyclops home rather than the system cache directory: it is
-/// this tool's own scratch, an operator looking for disk knows to look
-/// here, and it is removed with the home by the uninstaller.
-fn build_cache() -> PathBuf {
-    cyclops_proto::cyclops_home().join("build-cache")
+/// Outside the state root because Cargo writes executable build artifacts.
+fn build_cache(home: &Path) -> PathBuf {
+    let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+    let home_key = fnv64(home.as_os_str().as_bytes());
+    temp.join(format!("cyclops-build-cache-{home_key}"))
 }
 
 /// The clone's throwaway directory, removed however `run` returns.
@@ -367,16 +369,24 @@ pub fn run(json: bool, style: &Style) -> i32 {
     // Pointing it somewhere persistent makes cargo do what cargo does and
     // recompile only what moved. An operator who set their own target dir
     // keeps it: they have already decided where builds go.
-    let cache = build_cache();
+    let cache = build_cache(&cyclops_proto::cyclops_home());
+    let mut held_cache = None;
     if std::env::var_os("CARGO_TARGET_DIR").is_none() {
-        match std::fs::create_dir_all(&cache) {
-            Ok(()) => {
-                installer.env("CARGO_TARGET_DIR", &cache);
-                println!("  {}", style.dim(&copy::update_build_cache(&cache)));
+        match cyclops_state::StateRoot::open_or_create(&cache) {
+            Ok(root) => {
+                installer.env("CARGO_TARGET_DIR", root.path());
+                println!("  {}", style.dim(&copy::update_build_cache(root.path())));
+                held_cache = Some(root);
             }
             // Not fatal. A cache that cannot be made costs a slow build,
             // which is what every update did before this existed.
-            Err(e) => eprintln!("  {}", style.dim(&copy::update_cache_unusable(&cache, &e))),
+            Err(e) => {
+                let error = std::io::Error::other(e.to_string());
+                eprintln!(
+                    "  {}",
+                    style.dim(&copy::update_cache_unusable(&cache, &error))
+                );
+            }
         }
     }
     if let Some(prefix) = install_prefix() {
@@ -397,6 +407,7 @@ pub fn run(json: bool, style: &Style) -> i32 {
             return 1;
         }
     }
+    drop(held_cache);
 
     // 4.
     println!();

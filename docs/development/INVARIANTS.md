@@ -1,6 +1,6 @@
 # Rules this system must never break
 
-Eleven of them. They are not style preferences: each one is here because
+Twelve of them. They are not style preferences: each one is here because
 breaking it does something specific and bad to a person using Cyclops, and
 most of them are here because something already went wrong once.
 
@@ -23,6 +23,7 @@ second place, that is the bug: this page is where they live.
 | [9](#9-zero-polling) | Zero polling | Idle battery burn, and a broken event path that looks fine |
 | [10](#10-vendor-quirks-are-data-not-code) | Vendor quirks are data, not code | A vendor ships a new dialog and you ship a release |
 | [11](#11-color-is-redundant-and-never-the-only-encoding) | Color is redundant and never the only encoding | The state is invisible under `NO_COLOR`, `--plain`, or a screen reader |
+| [12](#12-runtime-idleness-never-implies-terminal-write-readiness) | Runtime idleness never implies terminal write-readiness | A hook edge authorizes a paste over the human's staged text |
 
 ## 1. A payload never reaches a pane the gate did not admit
 
@@ -196,16 +197,35 @@ The resolution walks the peer pid's ancestry until a pid matches a watched
 pane's `pane_pid`. Labeled pane: that agent. Unlabeled pane: the pane id.
 No watched pane in the ancestry: `admin`, because a same-uid shell outside
 every pane is the human. A uid other than the daemon's is denied before any
-request is parsed. The same rule guards `agent.state.report`: only a
-process inside the pane it speaks for may report for it.
+request is parsed.
 
-- Enforced at: `src/cyclopsd/src/identity.rs`, `peer_of` and
-  `resolve_sender`; `src/cyclopsd/src/server.rs`,
-  `verify_report_origin`.
+`agent.state.report` needs one more thing, because being in the pane is
+weaker than it sounds. An adopted pane keeps its label, its adoption and
+its manifest pin while its agent is not running, so anyone at that pane's
+shell prompt can start anything, and reading the terminal's current
+foreground does not help: a hand-started helper holds the tty while it
+runs and would present itself as the pane's agent, with the pin agreeing.
+
+What admits a report is descent. The daemon walks from the peer up to the
+pane root and takes the first process whose own argv says it is an agent
+it ships a manifest for; a hook helper is a child of the agent that ran
+it, so that walk lands on the agent whether the agent holds the tty or
+handed it over. A peer with no such ancestor is refused, and a pin that
+disagrees with the process found is refused rather than believed. The
+same proven pid and manifest are what the ACK path re-derives, so both
+ends of a report speak about the same process.
+
+- Enforced at: `src/cyclopsd/src/identity.rs`, `peer_of`,
+  `resolve_sender` and `vendor_ancestor`; `src/cyclopsd/src/server.rs`,
+  `verify_report_origin`; `src/cyclopsd/src/fusion.rs`,
+  `vendor_between` and `admitted_vendor`.
 - Proven by: `src/cyclopsd/src/server.rs`,
   `msg_send_fails_closed_without_peer_credentials`;
   `src/cyclopsd/tests/m2_hooks.rs`,
-  `forged_report_over_the_socket_is_denied_and_ingests_nothing`.
+  `forged_report_over_the_socket_is_denied_and_ingests_nothing`;
+  `src/cyclopsd/src/identity.rs`,
+  `a_helper_nobody_started_from_an_agent_is_not_admitted` and
+  `a_helper_the_agent_started_is_admitted_as_that_agent`.
 
 ## 7. Secrets never enter the ledger
 
@@ -348,8 +368,8 @@ to know (healthy, needs-you, terminal, quiet) rather than one hue per
 state. Role hues stay on the agent name alone, so the two encodings never
 share a cell.
 
-The workspace's compact surfaces — sidebar rows, inactive pane borders —
-are the one narrow exception, and it is not a color standing in for a
+The workspace's compact surfaces, including sidebar rows and inactive pane
+borders, are the one narrow exception, and it is not a color standing in for a
 word: `○` idle, `●` working, `⚠` needs attention, and `✕` dead are a fixed,
 documented glyph vocabulary that a reader can learn once. `idle_with_input`
 shares the idle presentation because no turn is running, but it remains a
@@ -359,7 +379,7 @@ every theme and under `NO_COLOR`; only the `Style` painted under it changes. A
 detailed surface (the focused pane border, dialogs, the sidebar's event
 stream), plain-text output, and every diagnostic show the word whenever
 there is room for it. None of them may drop straight to hiding the state
-just because the word does not fit — the fallback is always the glyph, the
+just because the word does not fit: the fallback is always the glyph, the
 same one the compact surfaces show on purpose.
 
 The check that matters is mechanical: turn color off and read the same
@@ -383,6 +403,151 @@ glyph, the glyph or the word is doing too little.
   `inactive_pane_border_glyph_is_stable_across_theme_and_no_color`, which
   feed the same state through two unrelated themes and `NO_COLOR` and
   assert the glyph never moves while its `Style` does.
+
+## 12. Runtime idleness never implies terminal write-readiness
+
+**A composer write requires current positive clean-input evidence from the
+admitted pane, and no conflicting working, blocked, modal, pane-mode,
+unknown, or input-present evidence. Hook-derived idle alone never
+authorizes a write.**
+
+What breaks: the same damage as rule 3, reached from the opposite
+direction. Rule 3 holds when the screen sensor SEES staged text. This rule
+covers the case where it sees nothing usable and something else says idle
+anyway. A turn-end hook (`Stop` on agy, and its siblings elsewhere) maps to
+`Idle`; fusion adopts a live hook reading when the screen rules resolve to
+`unknown`; and `unknown` is exactly what a long staged payload produces
+when its head scrolls past the fixed bottom region the rules read. So a
+pane holding an intact, unsubmitted payload can read `idle`, and a gate
+that trusts the fused verdict alone will paste a second message on top of
+the first and press Enter.
+
+Authenticated hook identity does not make hook-derived `Idle` sufficient
+for a write. A hook proves a turn edge, not composer contents, so current
+clean screen evidence remains mandatory.
+
+The distinction the rule forces is between two different questions. "Is a
+turn running?" is answered by any sensor. "May I write into the composer?"
+is answered only by the sensor that can see the composer, saying it is
+empty, right now, with nothing live contradicting it. Absence of evidence
+is not clean evidence; a contested verdict is not clean evidence.
+
+One clean frame is not clean evidence either, once text has been seen in
+the composer. A screen rule reads one frame, and a pane holding somebody's
+half-typed message can render clean for a frame while it redraws, or while
+the text sits somewhere the rule does not look. So a pane observed holding
+text is refused (`composer_hold`) until a TURN proves the text left. That
+is the only positive evidence any vendor gives that a composer was
+emptied. Nothing releases it on elapsed time or on a hook that never
+arrived, and a person who clears their own draft by hand stays held until
+their next completed turn. Conservative, and named in the gate line.
+
+The release reads the EVIDENCE, not the fused winner. The winner is one
+state chosen by priority, so a pane can win `idle` off a composer rule
+while the title or a hook still reports the turn that is running;
+releasing on that is the same false-idle class from the other direction.
+Any live reading of `working` keeps the hold. A receipt carrying a
+manifest-declared TurnKey moves that hold onto the exact lifecycle. Only
+an end carrying the same key can release it, and release still waits for a
+current clean screen. Arrival order and retained hook state do not
+correlate turns. A hold without an exact receipt stays on the screen
+lifecycle, including a pane whose hooks were never installed, so it never
+waits forever for an end nobody can name.
+
+Cyclops latches its own paste the moment the payload is staged, rather
+than waiting for a sensor to notice: the pane is holding text exactly the
+way a person's draft holds it, and the next delivery for that recipient
+must not gate on a composer that reads clean only because nobody has
+looked since the paste.
+
+It promotes that hold on the RECEIPT, never on the submit key. `send-keys`
+returning Ok proves tmux accepted a keystroke and nothing else: an Enter
+swallowed by a modal or routed to a mode leaves the payload staged, which
+is the staged-never-sent class this unit exists for. A receipt is the
+first thing that proves the composer was consumed. A receipt with a
+TurnKey binds the exact lifecycle. A receipt without one keeps the screen
+lifecycle and records its submit or observed-turn timestamp for diagnosis,
+not as a substitute for structural correlation.
+
+A mailbox notification arms a durable composer barrier at `writing`, before
+the external paste. The binding records the exact recipient, agent process
+generation, and manifest. New rows also record the foreground leader; older
+rows without it still arm the restart barrier. A later bound `writing` fact
+compacts only an older barrier for the same exact `RecipientKey`. It never
+compacts another recipient or a pane that merely shares a label.
+
+Restart recovery is state-sensitive and fail-closed. `notified` is the only
+state carrying receipt proof, so that state may retire when the same bound
+agent and manifest have a fresh, current clean-composer observation. `writing`,
+`staged`, `submitted`, and `attention_required` always restore the hold first,
+even when the first screen is clean. Hook-derived idle is not authority for
+either path.
+
+Composer continuity is the agent process generation plus manifest. The
+foreground leader may change as the agent runs a tool and returns. Exact
+foreground leader equality remains mandatory for operator complete/discard,
+but a leader transition alone neither replaces nor wedges a recovered hold.
+A different agent generation or manifest is one authenticated replacement
+observation and durably retires the old occupant's barrier.
+
+A restored barrier starts without a pre-restart lifecycle key. An exact
+manifest-declared turn start observed after restoration may bind that recovered
+owner. Only the same exact turn end plus a later fresh clean screen permits
+automatic retirement. Cyclops appends the retirement fact before fusion clears
+the runtime hold or consumes the end. A failed append keeps both reusable; an
+unknown writer outcome requires reopening the journal and never retries into
+an uncertain tail.
+
+Session-local pane removal is not physical loss. Recovery follows the
+server-wide pane id across a session transfer while journal compaction remains
+scoped to the old exact recipient. `pane_gone` retirement requires a
+server-wide absence or a different pane-root generation. Either watcher attach
+order preserves the barrier, manifest pin, runtime hold, and exact end.
+
+A hold belongs to an occupant: a pane that changes hands starts clear,
+because the new agent never staged the old one's text.
+
+Because the two answers move independently, a hold lifting can leave the
+runtime state untouched, and a delivery sleeping on the refusal would
+sleep through its own release. Fusion broadcasts a `readiness` event for
+that, carrying the pane and the new answer. It is not a state line:
+nothing happened to the pane's runtime state, and writing one would be a
+transition that never occurred.
+
+- Enforced at: `cyclops_proto::Detection::stamped`, which combines the
+  sensor policy with the pane's own mode and writes the verdict onto the
+  detection; `src/cyclopsd/src/fusion.rs` stamps before caching, so the
+  cache every surface reads already carries it. `src/cyclopsd/src/delivery.rs`
+  requires that positive stamp at the gate and again immediately before
+  the paste, holding on `not_write_ready:<reason>`. Nothing re-derives the
+  answer: a caller that could only see the sensors would answer a
+  narrower question and could overwrite an authoritative refusal.
+- Proven by: `src/cyclops-proto/src/state.rs`,
+  `hook_idle_over_unknown_screen_is_not_write_ready`,
+  `hook_idle_alone_is_not_write_ready`,
+  `disagreement_is_never_write_ready`,
+  `a_pane_that_was_holding_text_refuses_a_clean_frame`,
+  `the_hold_releases_only_on_a_completed_turn`,
+  `a_sensor_still_reporting_the_turn_keeps_the_hold`, and
+  `a_hook_vendor_needs_an_edge_from_this_turn`;
+  `src/cyclopsd/src/composer_recovery.rs`,
+  `only_a_notified_attempt_may_retire_from_current_clean_evidence`,
+  `foreground_leader_changes_do_not_replace_the_composer_occupant`,
+  `a_manifest_change_replaces_the_occupant_even_when_the_agent_is_unchanged`,
+  `a_recovered_barrier_follows_its_physical_pane_across_a_session_route`;
+  `src/cyclopsd/src/fusion.rs`,
+  `a_recovered_exact_end_is_durable_before_runtime_clearance`;
+  `src/cyclopsd/src/mailbox.rs`,
+  `a_leaderless_write_binding_arms_restart_recovery_through_replay`;
+  `src/cyclops-tmux/tests/watcher_events.rs`,
+  `session_removal_does_not_report_a_server_wide_moved_pane_as_gone`;
+  `src/cyclopsd/tests/m1_fixes.rs`,
+  `a_readiness_change_with_no_state_change_is_still_broadcast` and
+  `a_second_message_waits_for_the_first_turn_and_then_lands`;
+  `src/cyclopsd/tests/m1_blockers.rs`,
+  `escaped_capture_flips_typed_text_to_idle_with_input_and_gates`, which
+  proves the refusal and the release end to end.
+
 
 ## Where these came from
 

@@ -144,6 +144,11 @@ fn serve_canned(home: &Path) {
                     "agent": "reviewer", "manifest": "claude", "title": "reviewer",
                     "current_command": "claude", "dead": false, "in_mode": false,
                     "width": 120, "height": 40, "state": "idle"
+                }, {
+                    "pane_id": "%2", "window_id": "@1", "window_name": "agents",
+                    "agent": "codex", "manifest": "codex", "title": "codex",
+                    "current_command": "codex", "dead": false, "in_mode": false,
+                    "width": 120, "height": 40, "state": "idle"
                 }]}]
             }})
             .to_string()],

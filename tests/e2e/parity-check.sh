@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-# Every command shape README.md and docs/ show, run for real and checked
-# against what the binaries print today.
+# Exercise the stable CLI shapes and state transitions used by the primary
+# documentation against binaries built from this checkout.
 #
-# A doc describing output the binaries no longer print is a bug (GOALS.md,
-# truth rule). This is the regression that catches it: it walks the README
-# ladder rung by rung on a throwaway rig, prints each command and its
-# output, and asserts the shapes the docs promise. Exit 0 means the docs
-# and the binaries still agree.
+# A doc describing output the binaries no longer print is a bug. This gate
+# walks the representative README setup and messaging flows on a throwaway
+# rig, prints each command and output, and asserts the documented shapes.
+# It does not claim to execute every command shown anywhere in docs/.
 #
-# The transcript this prints is where the README's output blocks come from.
-# Change a line the README quotes and this fails, so the two move together.
+# The transcript is diagnostic evidence for the assertions below. Documentation
+# examples remain prose and must not treat this output as generated source.
 #
 # Isolation is TMUX_TMPDIR, not `tmux -L`. Rung 1 is the first run with no
 # config file, and the config file is the only place a tmux socket name can
@@ -49,6 +48,7 @@ export CYCLOPS_HOME="$ROOT/home"
 mkdir -p "$CYCLOPS_HOME"
 CYC="$REPO/target/debug/cyclops"
 CYCD="$REPO/target/debug/cyclopsd"
+COMPOSER_COMMAND="python3 '$REPO/src/cyclopsd/tests/common/faketui.py'"
 OUT="$ROOT/out"
 DAEMON_PID=""
 CHECKS=0
@@ -174,30 +174,11 @@ wait_for() {
 }
 
 daemon_attached() { "$CYC" --json status | jq -e '.sessions[0].attached == true' >/dev/null; }
-# The daemon has bound this pane to this manifest, which is what decides the
-# ACK tier of anything sent to it. Not "the pane exists" and not "the roster
-# knows the name": both are true while `manifest` is still unset, and a
-# delivery issued in that window is classified screen-tier at send time and
-# never upgrades.
-# The stand-in's read loop is running in this pane.
-#
-# tmux returns from respawn-pane when it has FORKED, not when the new
-# process is reading. A delivery issued in that gap is typed at whatever is
-# still in the pane, which is the login shell: the stand-in never sees it,
-# nothing acks it, and the delivery stays screen-tier permanently.
-#
-# MEASURED here: the pane still reports zsh for ~1.2s after respawn, and
-# demo.toml lists zsh in process_names, so the pane is already bound to the
-# manifest and already reads idle throughout the gap. Neither `manifest`
-# nor `state` can distinguish it. The stand-in writing its own flag is the
-# only unambiguous signal, and unlike a sleep it is not a guess about how
-# slow the machine is.
+# The stand-in announces its read loop. tmux returns from respawn-pane after
+# forking, which is earlier than the fixture process becoming ready to receive
+# a doorbell or a fixture command.
 standin_reading() { [ -f "$ROOT/ready.$1" ]; }
-# The stand-in is back at its read rather than part-way through handling a
-# line. Deliver to a busy one and the confirmation window expires against a
-# pane that was never going to answer inside it, which marks the delivery
-# needs-attention permanently and shows up two rungs later as an eye count
-# that is one too high.
+# The stand-in is back at its read rather than handling a fixture command.
 standin_free() { [ ! -f "$ROOT/busy.$1" ]; }
 pane_bound_to() {
   "$CYC" --json status | jq -e --arg p "$1" --arg m "$2" \
@@ -206,60 +187,57 @@ pane_bound_to() {
 pane_known() { "$CYC" --json status | jq -e --arg p "$1" '[.sessions[].panes[].pane_id] | index($p)' >/dev/null; }
 roster_has() { "$CYC" --json list | jq -e --arg a "$1" '[.agents[].agent] | index($a)' >/dev/null; }
 roster_empty() { "$CYC" --json list | jq -e '.agents | length == 0' >/dev/null; }
-all_idle() { "$CYC" --json list | jq -e '[.agents[].state] | all(. == "idle")' >/dev/null; }
 
-# One named message has reached the record AND every delivery it carries
-# has stopped moving. Badges are read from the record, so a read taken
-# mid-flight shows a legal in-flight state and the transcript stops being
-# reproducible.
-#
-# Naming the message is the load-bearing part, and two weaker versions of
-# this check have already shipped and failed. "Nothing is in flight" is
-# true of an empty record, so it settled before a send typed into a pane
-# had reached the daemon at all. Counting lines then settled on messages
-# an earlier rung had already delivered. Both are the same mistake: absence
-# of evidence read as evidence of completion.
-#
-# Requiring at least one delivery matters too: a message exists in the
-# record before any delivery attempt is written against it.
-settled() {
-  local subject="$1"
-  "$CYC" --json history | jq -e --arg s "$subject" '
-    [.lines[] | select(.subject == $s)] as $m
-    | ($m | length) > 0
-    and ([$m[].deliveries[]?] | length) > 0
-    and ([$m[].deliveries[].state
-      | select(. == "queued" or . == "gating" or . == "pasting"
-               or . == "staged" or . == "submitted" or . == "retry_queued")]
-      | length == 0)' >/dev/null
+pane_command_done() { [ -f "$ROOT/done.$1" ]; }
+pane_has_text() { tmx capture-pane -p -t "$1" | grep -Fq -- "$2"; }
+
+# Issue a Cyclops command from an ordinary shell that is itself the watched
+# pane root. This mirrors the real sender-identity integration test and avoids
+# borrowing the process ancestry of the agent running this gate.
+shell_command() {
+  local label="$1" pane="$2" command="$3" line
+  rm -f "$ROOT/result.$label" "$ROOT/exit.$label" "$ROOT/done.$label"
+  printf '\n$ (typed in the %s pane) cyclops %s\n' "$label" "$command"
+  line="\"$CYC\" $command > \"$ROOT/result.$label\" 2>&1; code=\$?; printf '%s' \"\$code\" > \"$ROOT/exit.$label\"; : > \"$ROOT/done.$label\""
+  tmx send-keys -t "$pane" -l "$line"
+  tmx send-keys -t "$pane" Enter
+  wait_for "the $label shell command" 100 pane_command_done "$label"
+  cp "$ROOT/result.$label" "$OUT"
+  cp "$ROOT/exit.$label" "$ROOT/exit"
+  cat "$OUT"
 }
 
-# Nothing anywhere is moving. `settled` answers for one subject, which is
-# the wrong question before a broadcast: the recipient's queue can hold a
-# delivery from some OTHER message, and the broadcast lands behind it and
-# receipts `queued · 1 ahead`. The script already predicted this failure in
-# a comment and guarded it with two checks that cannot see it, one scoped
-# to a subject and one reading agent state rather than queue depth.
-nothing_in_flight() {
-  "$CYC" --json history | jq -e '
-    [.lines[].deliveries[]?
-      | select(.state == "queued" or .state == "gating" or .state == "pasting"
-               or .state == "staged" or .state == "submitted"
-               or .state == "retry_queued")]
-    | length == 0' >/dev/null
+shell_ready() { [ -f "$ROOT/shell-ready.$1" ]; }
+prepare_shell() {
+  local label="$1" pane="$2"
+  rm -f "$ROOT/shell-ready.$label"
+  tmx send-keys -t "$pane" -l ": > '$ROOT/shell-ready.$label'"
+  tmx send-keys -t "$pane" Enter
+  wait_for "the $label shell" 100 shell_ready "$label"
 }
 
-# Stronger than settled: every delivery for the subject is the heavy check.
-# Needed when the live receipt legally prints ● submitted under load
-# (docs/guides/send.md) while the durable badge is still becoming
-# delivered_verified — restarting the daemon in that window marks the
-# delivery needs-attention and poisons every later eye check.
-delivery_verified() {
-  local subject="$1"
-  "$CYC" --json history | jq -e --arg s "$subject" '
-    [.lines[] | select(.subject == $s) | .deliveries[]?] as $d
-    | ($d | length) > 0
-    and ([$d[].state] | all(. == "delivered_verified"))' >/dev/null
+pane_write_ready() {
+  "$CYC" read "$1" --source detection --plain | grep -q 'write-ready$'
+}
+pane_is_shell() {
+  case "$(tmx display-message -p -t "$1" '#{pane_current_command}')" in
+    sh|bash|dash|zsh) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+start_composer() {
+  local label="$1" pane="$2"
+  tmx resize-window -t "$pane" -x 500 -y 40
+  tmx send-keys -t "$pane" -l "$COMPOSER_COMMAND"
+  tmx send-keys -t "$pane" Enter
+  wait_for "the $label composer" 100 pane_has_text "$pane" 'Model x · Ctx: 78%'
+  wait_for "the $label composer to be write-ready" 100 pane_write_ready "$label"
+}
+stop_composer() {
+  local label="$1" pane="$2"
+  tmx send-keys -t "$pane" C-c
+  wait_for "the $label composer to exit" 100 pane_is_shell "$pane"
+  prepare_shell "$label" "$pane"
 }
 
 # Run a command, show it the way the README shows it, keep the output for
@@ -370,49 +348,37 @@ cargo build -q -p cyclops -p cyclopsd
 # The stand-in agent. It is a shell loop, not a vendor CLI, and that is the
 # point of rung 3: cyclops can address it because of one manifest file.
 #
-# It reacts to two line shapes and ignores everything else:
-#
-#   [cyclops m-...]  a delivered header. It reports the line through the
-#                    real `cyclops hook` receiver exactly as a wired vendor
-#                    hook would, so deliveries here earn
-#                    "delivered · verified" the same way a real CLI does.
-#                    Both turn edges, not just the ack: a CLI that opened
-#                    turns and never closed them would leave the pane
-#                    looking mid-turn forever, and the next delivery would
-#                    queue behind a turn that already ended.
-#   @send <args>     run `cyclops send` from INSIDE this pane, so the
-#                    daemon resolves the sender from the process rather
-#                    than from anything the request says.
+# It ignores mailbox doorbells and runs lines prefixed with `@cyclops` from
+# inside the pane. That lets the daemon prove sender and recipient identity
+# from process ancestry.
 cat > "$ROOT/agent.sh" <<'EOF'
 label="$1"
 cyc="$2"
 # Announce the read loop BEFORE entering it. tmux returns from respawn-pane
-# when it has forked, not when the new process is reading, and the rig has
-# no other way to tell those apart: demo.toml binds the login shell too.
+# when it has forked, not when the new process is reading, and the rig uses
+# this flag to distinguish those moments.
 : > "$3/ready.$label"
-# And announce every stretch spent NOT reading. A shell loop handling a
-# line is not at its read, so a delivery arriving then is not seen and not
-# acked, and the daemon's confirmation window expires against a pane that
-# is simply busy. The @send arm is the one that matters: it runs a full
-# `cyclops send`, which itself blocks for the recipient's ack, so this
-# stand-in can be away from its read for seconds.
+# Announce every stretch spent outside the read so the rig does not type a
+# second fixture command into a command that is still running.
 busy="$3/busy.$label"
 while IFS= read -r line; do
   : > "$busy"
   case "$line" in
-    "[cyclops m-"*)
-      printf '%s' "$line" | jq -Rs '{prompt: .}' \
-        | "$cyc" hook UserPromptSubmit --agent "$label"
-      printf '{}' | "$cyc" hook Stop --agent "$label"
-      ;;
-    "@send "*)
-      rest=${line#"@send "}
-      eval "\"$cyc\" send $rest"
+    "@cyclops "*)
+      rest=${line#"@cyclops "}
+      eval "\"$cyc\" $rest" > "$3/result.$label" 2>&1
+      code=$?
+      printf '%s' "$code" > "$3/exit.$label"
+      : > "$3/done.$label"
       ;;
   esac
   rm -f "$busy"
 done
 EOF
+
+# Give the fixture process a name that cannot also match the shell running the
+# gate. Sender authentication can then stop at the exact watched pane root.
+ln -s "$(command -v sh)" "$ROOT/cycagent"
 
 # The stand-in's manifest. Written AFTER the first `cyclops start`, not
 # before: seeding the home with the shipped manifests is that command's job
@@ -422,7 +388,8 @@ DEMO_MANIFEST=$(cat <<'EOF'
 [agent]
 id = "demo"
 display_name = "Parity rig stand-in"
-process_names = ["sh", "bash", "dash", "zsh", "cat"]
+process_names = ["cycagent", "cat", "python3", "python", "Python", "zsh", "bash"]
+argv_basenames = ["cycagent"]
 launch = "cat"
 
 [hooks]
@@ -430,6 +397,9 @@ turn_start = "UserPromptSubmit"
 turn_end = "Stop"
 ack = "UserPromptSubmit"
 ack_payload_field = "prompt"
+
+[messaging]
+mailbox_capability_file = "__CYCLOPS_MAILBOX_CAPABILITY__"
 
 [[rule]]
 id = "title_working"
@@ -441,65 +411,60 @@ regex = ['^Implementing|^Reviewing']
 [[rule]]
 id = "title_idle"
 state = "idle"
-priority = 1000
+priority = 100
 region = "pane_title"
 regex = ['^']
+
+[[rule]]
+id = "composer_empty"
+state = "idle"
+priority = 90
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^❯\s*$']
+
+[[rule]]
+id = "composer_holds_paste"
+state = "idle_with_input"
+priority = 80
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^\s*❯\s+\S']
+line_regex_esc = ['^❯']
+
+[[rule]]
+id = "composer_working"
+state = "working"
+priority = 300
+region = "bottom_non_empty_lines(5)"
+line_regex = ['^FAKETUI-WORKING$']
 
 [injection]
 method = "load-buffer + paste-buffer -p"
 submit = "Enter"
 verify_before_submit = true
 verify_pattern = ["<message_id>"]
+composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
+composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
+composer_trailer_required_prefix = 2
 safe_states = ["idle"]
 EOF
 )
 
+# Doorbell transport requires exact installed skill evidence. The fixture
+# gets the reviewed skill bytes in its isolated root rather than borrowing
+# any agent installation from the operator's home.
+DEMO_SKILL="$ROOT/cyclops-skill.md"
+cp "$REPO/skills/cyclops/SKILL.md" "$DEMO_SKILL"
+DEMO_MANIFEST="${DEMO_MANIFEST/__CYCLOPS_MAILBOX_CAPABILITY__/$DEMO_SKILL}"
+
 echo
 echo "#### Rung 1: one pane, persistence, history"
 
-# Setup first, so the tuning below is in the config before the daemon
-# that `cyclops start` spawns reads it. This is what install.sh runs, so
-# the rig takes the same two steps a person installing does.
+# Setup first. This is what install.sh runs, so the rig takes the same two
+# steps as an installed workspace.
 run "$CYC" start --setup-only --plain
 check "setup writes the config"           'wrote .*/config\.toml$'
 check "setup installs the themes"         '^  wrote 17 themes to .*/themes$'
 check "setup installs the manifests"      '^  wrote 4 detection manifests to .*/manifests$'
-
-# Two budgets raised above their defaults, for the rig and not for cyclops.
-# The stand-in answers a delivery by spawning jq and `cyclops hook`, which
-# costs far more than a vendor hook already loaded in the agent's process,
-# so at the shipped defaults the receipt returns "queued" and the ack lands
-# after the window. Raising both makes the transcript reproducible instead
-# of racing this machine.
-#
-# receipt_block_ms stays under the CLI's own 5-second socket read deadline
-# (src/cyclops/src/client.rs, READ_TIMEOUT). Past it the daemon is still
-# holding the receipt when the client gives up, and a delivery that is
-# going fine reports a lost connection.
-#
-# ack_timeout_ms is NOT bound by that, and is deliberately far past it.
-# The two budgets answer different questions: receipt_block_ms is how long
-# the CLI waits before printing, and running past it prints `● submitted`,
-# which every rung here tolerates. ack_timeout_ms is how long the DAEMON
-# waits for the hook, and running past it is terminal: the delivery is
-# marked and no later wait can turn it into the heavy check. That is the
-# asymmetry this rig kept losing to. A wait_for budget above the send
-# cannot rescue a delivery the daemon has already given up on, which is why
-# raising those budgets twice changed nothing and this is the knob that
-# does.
-#
-# Ten seconds for two process spawns is absurd on an idle machine and is
-# not meant for one: a GitHub runner under a parallel cargo build has taken
-# more than the old 4500. A passing ack returns in milliseconds and never
-# waits, so the ceiling costs nothing.
-#
-# Not higher, though. This is also how long a delivery nobody answers holds
-# the recipient's queue, and one rung below stalls one on purpose. At 15000
-# the broadcast two rungs later landed behind it and receipted `queued`.
-cat >> "$CYCLOPS_HOME/config.toml" <<'EOF'
-receipt_block_ms = 4800
-ack_timeout_ms = 10000
-EOF
 
 # The stand-in's own manifest, written the way docs/reference/MANIFESTS.md says to
 # write one: a file in the home directory the daemon reads at boot. It
@@ -517,7 +482,7 @@ check "step 1 attaches"                   '^  1  tmux attach -t main +open the w
 check "step 2 sends the first message"    '^  2  cyclops send implementer --subject "hello" +send the first message$'
 # The heavy check is the load-bearing one. It means cyclopsd confirmed the
 # roster in this run, which is what starting the daemon here buys: before
-# it, the first run named nothing and a second was needed (F33).
+# it, the first run named nothing and a second was needed.
 check_absent "and needs no second run"    'nothing was named yet'
 check_absent "and no daemon step"         'cyclopsd &'
 
@@ -535,41 +500,12 @@ P1="$(tmx list-panes -t main -F '#{pane_id}')"
 # and clears the pane title tmux seeded with the hostname so the roster
 # below shows what an agent publishes rather than what tmux did.
 rm -f "$ROOT/ready.implementer"
-tmx respawn-pane -k -t "$P1" "sh '$ROOT/agent.sh' implementer '$CYC' '$ROOT'"
+tmx respawn-pane -k -t "$P1" "'$ROOT/cycagent' '$ROOT/agent.sh' implementer '$CYC' '$ROOT'"
 wait_for "the implementer stand-in to be reading" 100 standin_reading implementer
 tmx select-pane -t "$P1" -T ''
-# Let the daemon see the new occupant before anything is delivered to it.
-#
-# It was already running when the pane changed hands, so it learns the new
-# occupant from a tmux subscription, and those tick at 1Hz (F23). Deliver
-# before that lands and the delivery is classified screen-tier AT SEND TIME
-# and never upgrades: the receipt is `✓ delivered · unverified (screen)`
-# instead of the heavy check, permanently. Nothing the wait below the send
-# does can rescue it, which is why raising THAT wait's budget changed
-# nothing on either platform.
-#
-# This was `sleep 4`, from "at 0s the receipt is screen-tier every run; at
-# 4s it is hook-verified every run". True on the machine that measured it,
-# and the reason this rung has failed on loaded CI runners on both
-# platforms. The two conditions it was standing in for are both observable,
-# so they are waited for instead: the stand-in is reading (above, and it is
-# the slower of the two), and the daemon has bound the pane.
+# Wait until the daemon binds the new occupant before testing its notification.
 wait_for "the daemon to bind the stand-in" 100 pane_bound_to "$P1" demo
-# One subscription period, so the daemon has ticked at least once since the
-# occupant changed.
-#
-# This is the last constant here and it is the only one tied to a property
-# of the system rather than to machine speed: the subscription runs at 1Hz
-# (F23), so two seconds is two ticks. It cannot be waited for instead. The
-# obvious observable, current_command changing, is not one: the incoming
-# process is the platform's /bin/sh, and on a runner whose login shell is
-# already bash the before and after strings are identical, so "it changed"
-# never becomes true. That predicate is what turned this rung red on macos
-# while ubuntu passed.
-#
-# What used to be here was `sleep 4` covering this AND the stand-in's
-# startup at once. Startup is the part that scaled with load and it is now
-# waited for above, which is the half that was failing.
+# Allow one subscription cycle for the new occupant's readiness stamp.
 sleep 2
 
 run "$CYC" start --plain
@@ -583,39 +519,11 @@ check_file "the stand-in's manifest survived" \
 
 wait_for "the roster to hold implementer" 50 roster_has implementer
 
-run "$CYC" send implementer --subject "Review the rate limiter" --body "gateway.rs:120 drops the burst path" --plain
-# The stand-in pays for two process spawns (jq + cyclops hook) per ack.
-# On a loaded Ubuntu runner that can finish just after receipt_block_ms,
-# so the live receipt prints ● submitted while the delivery is still
-# becoming verified. Wait for the durable badge before any check that
-# needs it — and before the daemon-restart rung below, which would mark a
-# still-submitted delivery as needs-attention and open the eye.
-wait_for "the first delivery to verify" 50 delivery_verified "Review the rate limiter"
-if grep -qE '^✔ delivered · verified$' "$OUT"; then
-  check "the receipt is a verified badge" '^✔ delivered · verified$'
-else
-  # Mid-confirmation receipt; history now holds the heavy check.
-  CHECKS=$((CHECKS + 1))
-  if delivery_verified "Review the rate limiter"; then
-    printf '   ok    the receipt is a verified badge\n'
-  else
-    printf '   FAIL  the receipt is a verified badge\n         wanted /^✔ delivered · verified$/ (or settled delivered_verified)\n'
-    FAILS=$((FAILS + 1))
-  fi
-fi
-check_exit "a delivered send exits 0" 0
-
-run "$CYC" history --plain
-check "history folds the delivery badge"  '^ +[0-9]+s +admin → implementer +Review the rate limiter +✔ delivered · verified$'
-
 echo
-echo "-- the record survives a daemon restart"
+echo "-- the roster survives a daemon restart"
 cyc_stop_daemon
 start_daemon
 wait_for "the roster to come back" 50 roster_has implementer
-
-run "$CYC" history --plain
-check "the record is still there"         'admin → implementer +Review the rate limiter +✔ delivered · verified$'
 
 run "$CYC" list --plain
 check "the name is still there"           '^ +implementer +○ idle$'
@@ -628,7 +536,7 @@ echo
 echo "#### Rung 2: name panes"
 
 rm -f "$ROOT/ready.reviewer"
-tmx split-window -d -t main "sh '$ROOT/agent.sh' reviewer '$CYC' '$ROOT'"
+tmx split-window -d -t main "'$ROOT/cycagent' '$ROOT/agent.sh' reviewer '$CYC' '$ROOT'"
 wait_for "the reviewer stand-in to be reading" 100 standin_reading reviewer
 P2="$(tmx list-panes -t main -F '#{pane_id}' | tail -1)"
 tmx select-pane -t "$P2" -T ''
@@ -664,11 +572,12 @@ echo
 echo "#### Rung 3: any terminal agent"
 
 run "$CYC" read reviewer --source detection --plain
-check "detection names the deciding rule" '^reviewer · ○ idle · decided by title_idle$'
+check "detection names the deciding rule" '^reviewer · ○ idle · decided by title_idle · '
+check "and answers write-readiness too"  '^reviewer · ○ idle · decided by title_idle · (write-ready|not write-ready: [a-z_]+)$'
 check "and shows the sensor that read it" '^ +title +○ idle +title_idle'
 
 run "$CYC" read reviewer --source detection --raw --plain
-check "--raw keeps the verdict"           '^reviewer · ○ idle · decided by title_idle$'
+check "--raw keeps the verdict"           '^reviewer · ○ idle · decided by title_idle · '
 check "and adds the capture it read"      '^what the sensors read \(%[0-9]+\):$'
 
 run "$CYC" read reviewer --raw --plain
@@ -748,61 +657,40 @@ check "and names the arrangement that fits"  '\-\-preset solo, which has 1'
 check_exit "and exits 2" 2
 
 echo
-echo "#### Rung 5: structured messages with receipts"
+echo "#### Rung 5: durable mailbox acceptance and claim"
 
-# The panes were rebuilt by the restore above, so the stand-ins go back in
-# and the roster is re-read before anything is delivered to them.
-rm -f "$ROOT/ready.implementer"
-tmx respawn-pane -k -t "$N1" "sh '$ROOT/agent.sh' implementer '$CYC' '$ROOT'"
-wait_for "the implementer stand-in to be reading" 100 standin_reading implementer
-rm -f "$ROOT/ready.reviewer"
-tmx respawn-pane -k -t "$N2" "sh '$ROOT/agent.sh' reviewer '$CYC' '$ROOT'"
-wait_for "the reviewer stand-in to be reading" 100 standin_reading reviewer
+# Both watched pane roots remain the shells adopted with the session. The
+# reviewer runs the deterministic composer as a child, then returns to the
+# same shell root for claim commands.
+prepare_shell implementer "$N1"
+prepare_shell reviewer "$N2"
 tmx select-pane -t "$N1" -T ''
 tmx select-pane -t "$N2" -T ''
-wait_for "both stand-ins to read idle" 50 all_idle
-# The roster can read idle before fusion has recomputed the respawned pane,
-# and the delivery gate reads fusion. tmux re-evaluates its subscriptions
-# once a second (F23), so give it two ticks before delivering.
-sleep 2.5
+start_composer reviewer "$N2"
+run "$CYC" read reviewer --source detection --plain
+check "the reviewer composer is write-ready" 'decided by .* · write-ready$'
 
-run "$CYC" send reviewer --subject "Review the rate limiter" --body "gateway.rs:120 drops the burst path" --plain
-check "the receipt is a verified badge"   '^✔ delivered · verified$'
-
-MID="$("$CYC" --json history --limit 1 | jq -r '.lines[-1].id')"
+shell_command implementer "$N1" 'send reviewer --subject "Release notes review" --body "Check the mailbox contract." --client-key parity-review --plain'
+check "acceptance is separate from notification" '^accepted m-[[:xdigit:]]{32}$'
+check "the wake is a second fact" '^✓ accepted( · [0-9]+ ahead)? · wake (not started|queued|checking readiness|writing|staged|submitted|notified|needs attention)$'
+check_exit "mailbox acceptance exits 0" 0
+REVIEW_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
+wait_for "the reviewer mailbox doorbell" 100 pane_has_text "$N2" "cyclops inbox claim $REVIEW_ID"
 printf '\n$ tmux capture-pane -p -t %s\n' "$N2"
 tmx capture-pane -p -t "$N2" | grep -v '^$' > "$OUT"
 cat "$OUT"
-check "the recipient reads a stamped header" "^\[cyclops $MID\] FROM: admin  SUBJECT: Review the rate limiter\$"
-check "the body arrives verbatim"            '^gateway\.rs:120 drops the burst path$'
-# No reply line from admin. The name is reserved, so `cyclops send admin`
-# answers no_such_target: an agent doing as the hint told it would file a
-# failed delivery and raise attention for it. The agent-to-agent case does
-# get one, and `payload_shape_matches_spec` in delivery.rs holds that.
-check_absent "no reply line an agent cannot use" '^Reply: cyclops send admin'
+check "the recipient sees only the doorbell" "^❯ cyclops inbox claim $REVIEW_ID\$"
+check_absent "the pane does not receive the body" '^Check the mailbox contract\.$'
 
-run "$CYC" thread "$MID" --plain
-check "a thread carries the body"         '^ +gateway\.rs:120 drops the burst path$'
-
-# Both halves, and a tick between them: the record has to hold no moving
-# delivery AND fusion has to have caught up with the panes, or the
-# broadcast receipt reads "queued" for whichever recipient is still
-# finishing the last one. Legal, self-healing, and not reproducible.
-wait_for "the last delivery to settle" 50 settled "Review the rate limiter"
-# The one the other two cannot see. Budgeted past ack_timeout_ms, so a
-# delivery still waiting on an ack is waited out rather than raced.
-wait_for "every delivery to stop moving" 100 nothing_in_flight
-wait_for "both stand-ins to read idle" 50 all_idle
-sleep 2.5
-
-run "$CYC" send --all --subject "Standup in 5" --fyi --plain
-check "a broadcast receipts per recipient" '^ +implementer +(✔|✓|●) '
-check "one row each"                       '^ +reviewer +(✔|✓|●) '
-
-wait_for "the broadcast to settle" 50 settled "Standup in 5"
-run "$CYC" history --plain
-check "a broadcast is one line with N badges" '^ +[0-9]+s +admin → 2 agents +fyi +Standup in 5$'
-check "and one badge row per recipient"       '^ +implementer +✔ delivered · verified$'
+# Return to the same durable recipient shell for authenticated claim.
+stop_composer reviewer "$N2"
+shell_command reviewer "$N2" "inbox list --plain"
+check "inbox list exposes metadata" "^$REVIEW_ID implementer · Release notes review\$"
+shell_command reviewer "$N2" "inbox claim $REVIEW_ID --plain"
+check "claim fetches the envelope" "^\[cyclops $REVIEW_ID\] FROM: implementer  SUBJECT: Release notes review\$"
+check "claim fetches the body" '^Check the mailbox contract\.$'
+shell_command reviewer "$N2" "inbox claim $REVIEW_ID --plain"
+check "plain repeat claim returns the same payload" '^Check the mailbox contract\.$'
 
 run "$CYC" wait reviewer --until idle --plain
 check "wait reports the state and how long" '^○ idle · waited [0-9]+s$'
@@ -820,14 +708,26 @@ check "cyclops pipe is not built yet"     'unrecognized subcommand'
 check_exit "so it exits on usage" 2
 
 printf '\n$ cyclops --json history | jq -r \x27.lines[] | "\\(.from) -> \\(.to[0])  \\(.subject)"\x27\n'
-"$CYC" --json history | jq -r '.lines[] | "\(.from) -> \(.to[0])  \(.subject)"' > "$OUT"
+shell_command implementer "$N1" '--json history'
+jq -r '.lines[] | "\(.from) -> \(.to[0])  \(.subject)"' "$OUT" > "$ROOT/history-jq"
+cp "$ROOT/history-jq" "$OUT"
 cat "$OUT"
-check "every message is jq-able"          '^admin -> implementer  Review the rate limiter$'
+check "every message is jq-able"          '^implementer -> reviewer  Release notes review$'
 
-printf '\n$ jq -c \x27select(.kind == "msg") | {ts, from, to, subject}\x27 ~/.cyclops/ledger/main.ndjson\n'
-jq -c 'select(.kind == "msg") | {ts, from, to, subject}' "$CYCLOPS_HOME/ledger/main.ndjson" > "$OUT"
+shell_command implementer "$N1" '--json messages'
+WORKSPACE_ID="$(jq -r '.workspace_id' "$OUT")"
+MESSAGE_JOURNAL="$CYCLOPS_HOME/workspaces/$WORKSPACE_ID/messages.ndjson"
+printf '\n$ cyclops --json messages | jq -r .workspace_id\n'
+printf '%s\n' "$WORKSPACE_ID" > "$OUT"
 cat "$OUT"
-check "the ledger is plain NDJSON"        '"kind"|"subject":"Review the rate limiter"'
+check "the workspace projection names a durable UUID" \
+  '^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$'
+printf '\n$ jq -c \x27select(.kind == "msg") | {ts, from, to, subject}\x27 %s\n' "$MESSAGE_JOURNAL"
+jq -c 'select(.kind == "msg") | {ts, from, to, subject}' "$MESSAGE_JOURNAL" > "$OUT"
+cat "$OUT"
+check "the workspace journal is plain NDJSON" '"subject":"Release notes review"'
+check_file_absent "standard messages are not copied to the session ledger" \
+  "$CYCLOPS_HOME/ledger/main.ndjson" '"subject":"Release notes review"'
 
 run "$CYC" --json ui
 check "ui points machine readers at watch" 'cyclops watch --json'
@@ -846,142 +746,61 @@ echo "#### The handoff (docs/guides/QUICKSTART.md walks this)"
 # Typed into the pane, not run from here, because the thing under test is
 # who the daemon says sent it. Identity is resolved by walking the caller's
 # process up to a watched pane; nothing in the request can claim a sender.
-printf '\n$ (typed in the implementer pane) cyclops send reviewer --subject "Burst path fix, ready for review" --body "gateway.rs:120. Tests pass."\n'
-wait_for "reviewer to be back at its read" 100 standin_free reviewer
-tmx send-keys -t "$N1" -l '@send reviewer --subject "Burst path fix, ready for review" --body "gateway.rs:120. Tests pass."'
-tmx send-keys -t "$N1" Enter
-# `delivery_verified`, not `settled`: the check below asserts the heavy
-# check, and `settled` returns the moment nothing is in flight, which
-# includes `delivered_unverified`. Screen tier is a legal resting state, so
-# waiting for "stopped moving" and then demanding "hook verified" is a race
-# the script runs against itself. It loses on a loaded runner, twice
-# observed: once here reading the light check, and once downstream, exactly
-# as `delivery_verified`'s own comment warns, because the un-upgraded
-# delivery poisons the later eye count.
-wait_for "the handoff to verify" 100 delivery_verified "Burst path fix, ready for review"
+start_composer reviewer "$N2"
+shell_command implementer "$N1" 'send reviewer --subject "Burst path fix, ready for review" --body "gateway.rs:120. Tests pass." --client-key parity-handoff --plain'
+check "the handoff is accepted from the pane" '^accepted m-[[:xdigit:]]{32}$'
+check_exit "the handoff exits 0" 0
+HANDOFF="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
+wait_for "the handoff doorbell" 100 pane_has_text "$N2" "cyclops inbox claim $HANDOFF"
 
-run "$CYC" history --with reviewer --limit 1 --plain
-check "the sender is the pane, not the caller" '^ +[0-9]+s +implementer → reviewer +Burst path fix, ready for review +✔ delivered · verified$'
+stop_composer reviewer "$N2"
+shell_command reviewer "$N2" 'history --with reviewer --limit 1 --plain'
+check "the sender is the pane, not the caller" '^ +[0-9]+s +implementer → reviewer +Burst path fix, ready for review$'
 
-HANDOFF="$("$CYC" --json history --with reviewer | jq -r '.lines[-1].id')"
-printf '\n$ (typed in the reviewer pane) cyclops send implementer --reply-to %s --subject "Re: Burst path fix" --body "Approved. One nit in the retry path."\n' "$HANDOFF"
-# The handoff wait above proves REVIEWER acked, which says nothing about
-# whether implementer's own `cyclops send` has exited and gone back to
-# reading. Replying into a still-busy implementer is the race that put a
-# second item in the eye and failed this rung on a loaded runner.
-wait_for "implementer to be back at its read" 100 standin_free implementer
-tmx send-keys -t "$N2" -l "@send implementer --reply-to $HANDOFF --subject \"Re: Burst path fix\" --body \"Approved. One nit in the retry path.\""
-tmx send-keys -t "$N2" Enter
-wait_for "the reply to settle" 50 settled "Re: Burst path fix"
+shell_command reviewer "$N2" "inbox claim $HANDOFF --plain"
+check "the reviewer claims the handoff body" '^gateway\.rs:120\. Tests pass\.$'
 
-run "$CYC" thread "$HANDOFF" --plain
+start_composer implementer "$N1"
+shell_command reviewer "$N2" "reply $HANDOFF --body \"Approved. One nit in the retry path.\" --client-key parity-reply --plain"
+check "reply derives routing from the parent" '^accepted m-[[:xdigit:]]{32}$'
+check_exit "an accepted reply exits 0" 0
+REPLY_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
+wait_for "the reply doorbell" 100 pane_has_text "$N1" "cyclops inbox claim $REPLY_ID"
+stop_composer implementer "$N1"
+shell_command implementer "$N1" "inbox claim $REPLY_ID --plain"
+check "the implementer claims the verdict" '^Approved\. One nit in the retry path\.$'
+
+shell_command reviewer "$N2" "thread $HANDOFF --plain"
 check "the thread holds the request"      '^ +[0-9]+s +implementer → reviewer +Burst path fix, ready for review'
-check "and the reply under it"            '^ +[0-9]+s +reviewer → implementer +Re: Burst path fix'
+check "and the reply under it"            '^ +[0-9]+s +reviewer → implementer +Re: Burst path fix, ready for review'
 check "with the review verdict"           '^ +Approved\. One nit in the retry path\.$'
 
-printf '\n$ jq -c \x27select(.kind == "msg") | {from, to, subject, reply_to}\x27 ~/.cyclops/ledger/main.ndjson | tail -2\n'
-jq -c 'select(.kind == "msg") | {from, to, subject, reply_to}' "$CYCLOPS_HOME/ledger/main.ndjson" | tail -2 > "$OUT"
+printf '\n$ jq -c \x27select(.kind == "msg") | {from, to, subject, reply_to}\x27 %s | tail -2\n' "$MESSAGE_JOURNAL"
+jq -c 'select(.kind == "msg") | {from, to, subject, reply_to}' "$MESSAGE_JOURNAL" | tail -2 > "$OUT"
 cat "$OUT"
 check "the record links the reply to it"  "\"reply_to\":\"$HANDOFF\""
 
 echo
-echo "#### The blocking gate docs/guides/QUICKSTART.md section 6 hands to scripts"
+echo "#### The admin mailbox"
 
-# That section tells scripts to gate on `.wait[0].outcome`, and explains
-# why the exit code is not enough. Both halves are checked here, because
-# the explanation is the load-bearing part: a reader who trusts `set -e`
-# alone ships a gate that passes when no review happened.
-
-# The turn has to be driven, and the order is the whole difficulty.
-#
-# Two rules constrain it, and between them the stand-in's own answer is
-# unusable. `done` deliberately refuses a working phase that predates the
-# delivery (src/cyclopsd/tests/m1_fixes.rs, fix A), so the turn cannot
-# be started before the send. And a working phase shorter than tmux's 1Hz
-# subscription tick is invisible (F23), so the stand-in's instant
-# hook-fired turn leaves no edge to return on.
-#
-# So: wait for the delivery to resolve, then run a turn long enough to
-# see, then end it. That is a real agent's shape, slowed down.
-( wait_for "the gate delivery to resolve" 100 settled "Review the burst path fix"
-  tmx select-pane -t "$N2" -T 'Reviewing the burst path'
-  sleep 2.5
-  tmx select-pane -t "$N2" -T '' ) &
-EDGE_DRIVER=$!
-
-printf '\n$ cyclops send reviewer --subject "Review the burst path fix" --wait done --timeout 30s --json\n'
-wait_for "reviewer to be back at its read" 100 standin_free reviewer
-"$CYC" send reviewer --subject "Review the burst path fix" \
-  --wait done --timeout 30s --json > "$ROOT/receipt.json" 2>&1
-GATE_EXIT=$?
-wait "$EDGE_DRIVER" 2>/dev/null || true
-jq -c '.wait[0]' "$ROOT/receipt.json" > "$OUT"
-cat "$OUT"
-check "there is one wait entry per recipient" '"to":"reviewer"'
-# The five fields the section names. A gate that branches on `outcome`
-# breaks the moment one of them is renamed, and renaming one is easy.
-for field in to outcome state waited_ms delivery; do
-  check "the wait entry carries $field"      "\"$field\":"
-done
-
-# The exact predicate the documented script runs. Not a paraphrase of it:
-# this is the line a reader copies.
-if jq -e '.wait[0].outcome == "reached"' "$ROOT/receipt.json" >/dev/null; then
-  printf '   ok    the documented jq gate passes on a finished turn\n'
-else
-  printf '   FAIL  the documented jq gate passes on a finished turn\n'
-  FAILS=$((FAILS + 1))
-fi
-CHECKS=$((CHECKS + 1))
-[ "$GATE_EXIT" -eq 0 ] || { printf '   FAIL  a reached wait exits 0 (got %s)\n' "$GATE_EXIT"; FAILS=$((FAILS + 1)); }
-CHECKS=$((CHECKS + 1))
-
-# The other half, and the reason that jq line exists. A recipient that
-# takes the message and never finishes a turn: `cat` is in the stand-in
-# manifest's process_names, so the pane stays detected and the delivery
-# still lands, but nothing fires a hook and no turn ever ends.
-printf '\n$ cyclops send reviewer --subject "Never answered" --wait done --timeout 3s --json    # reviewer is not answering\n'
-tmx respawn-pane -k -t "$N2" "cat"
-tmx select-pane -t "$N2" -T ''
-sleep 2.5
-"$CYC" send reviewer --subject "Never answered" \
-  --wait done --timeout 3s --json > "$ROOT/timeout.json" 2>&1
-STALL_EXIT=$?
-jq -c '{exit: '"$STALL_EXIT"', outcome: .wait[0].outcome, delivered: .deliveries[0].state}' \
-  "$ROOT/timeout.json" > "$OUT"
-cat "$OUT"
-check "a wait that runs out says timeout"  '"outcome":"timeout"'
-# The claim the whole section is built on. If this ever exits non-zero the
-# warning in the docs is wrong, and if it ever stops being 0 silently, a
-# documented gate starts passing on an unreviewed change.
-[ "$STALL_EXIT" -eq 0 ] \
-  && printf '   ok    but the delivery landed, so it still exits 0\n' \
-  || { printf '   FAIL  but the delivery landed, so it still exits 0 (got %s)\n' "$STALL_EXIT"; FAILS=$((FAILS + 1)); }
-CHECKS=$((CHECKS + 1))
-
-if jq -e '.wait[0].outcome == "reached"' "$ROOT/timeout.json" >/dev/null 2>&1; then
-  printf '   FAIL  and the documented jq gate stops it\n'
-  FAILS=$((FAILS + 1))
-else
-  printf '   ok    and the documented jq gate stops it\n'
-fi
-CHECKS=$((CHECKS + 1))
-
-echo
-echo "#### The open eye (docs/guides/troubleshooting.md quotes both of these)"
-
-# Last, because it leaves an item on the record that nothing clears. A send
-# to a name nobody holds is the cheapest way to raise one, and the point is
-# the two surfaces agreeing: the receipt names the reason, and the eye
-# opens because a delivery is now waiting on a human.
-run "$CYC" send ghost --subject "Review this" --plain
-check "the receipt names why it stopped" '^⚠ needs attention · no pane for "ghost"$'
-check_exit "and exits 1 for a human" 1
+# A pane agent can address admin, but admin has no pane and receives no wake.
+shell_command implementer "$N1" 'send admin --subject "Operator review" --body "The release note is ready." --client-key parity-admin --plain'
+check "admin is a durable recipient" '^accepted m-[[:xdigit:]]{32}$'
+check "admin receives no pane wake" '^✓ accepted · wake not started$'
+check_exit "the admin send exits 0" 0
+ADMIN_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
 
 run "$CYC" status --plain
-check "the eye opens with a count"       '^◑ 1 cyclops · watching main · tmux .* · 1 needs attention$'
-check "and the block names what it is"   '^  waiting on you$'
-check "one row per open item"            '^  ghost +⚠ needs attention · no pane with that name · m-[[:xdigit:]]+ · (just now|[0-9]+(s|m|h|d)( [0-9]+(m|h))? ago)$'
+check "status reports the unread admin count" '^‿ cyclops · watching main · tmux .* · admin inbox 1$'
+
+shell_command implementer "$N1" '--json messages'
+jq -r --arg id "$ADMIN_ID" '
+  .rows[] | select(.message_id == $id) | .recipients[]
+  | select(.label == "admin") | "\(.mailbox.status) \(.notification.state)"' \
+  "$OUT" > "$ROOT/admin-state"
+cp "$ROOT/admin-state" "$OUT"
+cat "$OUT"
+check "the admin mailbox stays pending without a wake" '^pending not_started$'
 
 echo
 echo "#### The first run docs/guides/QUICKSTART.md walks, from outside the repo"
@@ -1001,6 +820,38 @@ duo_tmx() { duo tmux -u "$@"; }
 duo_daemon_up() { duo "$CYC" --json status >/dev/null 2>&1; }
 duo_attached() { duo "$CYC" --json status | jq -e '.sessions[0].attached == true' >/dev/null; }
 duo_roster_has() { duo "$CYC" --json list | jq -e --arg a "$1" '[.agents[].agent] | index($a)' >/dev/null; }
+duo_pane_has_text() { duo_tmx capture-pane -p -t "$1" | grep -Fq -- "$2"; }
+duo_shell_command() {
+  local label="$1" pane="$2" command="$3"
+  rm -f "$ROOT/result.$label" "$ROOT/exit.$label" "$ROOT/done.$label"
+  printf '\n$ (typed in the %s pane) cyclops %s\n' "$label" "$command"
+  local line="CYCLOPS_HOME=\"$DUO_HOME\" TMUX_TMPDIR=\"$ROOT/duo/tmux\" \"$CYC\" $command > \"$ROOT/result.$label\" 2>&1; code=\$?; printf '%s' \"\$code\" > \"$ROOT/exit.$label\"; : > \"$ROOT/done.$label\""
+  duo_tmx send-keys -t "$pane" -l "$line"
+  duo_tmx send-keys -t "$pane" Enter
+  wait_for "the second rig shell command" 100 pane_command_done "$label"
+  cp "$ROOT/result.$label" "$OUT"
+  cp "$ROOT/exit.$label" "$ROOT/exit"
+  cat "$OUT"
+}
+duo_shell_ready() { [ -f "$ROOT/duo/shell-ready.$1" ]; }
+duo_prepare_shell() {
+  local label="$1" pane="$2"
+  rm -f "$ROOT/duo/shell-ready.$label"
+  duo_tmx send-keys -t "$pane" -l ": > '$ROOT/duo/shell-ready.$label'"
+  duo_tmx send-keys -t "$pane" Enter
+  wait_for "the second rig $label shell" 100 duo_shell_ready "$label"
+}
+duo_pane_write_ready() {
+  duo "$CYC" read "$1" --source detection --plain | grep -q 'write-ready$'
+}
+duo_start_composer() {
+  local label="$1" pane="$2"
+  duo_tmx resize-window -t "$pane" -x 500 -y 40
+  duo_tmx send-keys -t "$pane" -l "$COMPOSER_COMMAND"
+  duo_tmx send-keys -t "$pane" Enter
+  wait_for "the second rig $label composer" 100 duo_pane_has_text "$pane" 'Model x · Ctx: 78%'
+  wait_for "the second rig $label composer to be write-ready" 100 duo_pane_write_ready "$label"
+}
 
 # `exec env` so $! is cyclopsd's own pid. Without it the subshell is what
 # gets killed on restart, the daemon under it lives on holding the socket,
@@ -1056,10 +907,10 @@ check "the daemon found the shipped set"  '^claude$'
 # rather than only labelling it.
 read -r D1 D2 <<<"$(duo_tmx list-panes -t main -F '#{pane_id}' | tr '\n' ' ')"
 rm -f "$ROOT/ready.implementer"
-duo_tmx respawn-pane -k -t "$D1" "sh '$ROOT/agent.sh' implementer '$CYC' '$ROOT'"
+duo_tmx respawn-pane -k -t "$D1" "'$ROOT/cycagent' '$ROOT/agent.sh' implementer '$CYC' '$ROOT'"
 wait_for "the implementer stand-in to be reading" 100 standin_reading implementer
 rm -f "$ROOT/ready.reviewer"
-duo_tmx respawn-pane -k -t "$D2" "sh '$ROOT/agent.sh' reviewer '$CYC' '$ROOT'"
+duo_tmx respawn-pane -k -t "$D2" "'$ROOT/cycagent' '$ROOT/agent.sh' reviewer '$CYC' '$ROOT'"
 wait_for "the reviewer stand-in to be reading" 100 standin_reading reviewer
 duo_tmx select-pane -t "$D1" -T ''
 duo_tmx select-pane -t "$D2" -T ''
@@ -1077,10 +928,6 @@ check "and what to do about it"           'Pin one: cyclops name .* --manifest <
 printf '\n$ $EDITOR ~/.cyclops/manifests/demo.toml\n$ (restart cyclopsd)\n'
 printf '%s\n' "$DEMO_MANIFEST" > "$DUO_HOME/manifests/demo.toml"
 stop_duo_daemon
-cat >> "$DUO_HOME/config.toml" <<'EOF'
-receipt_block_ms = 4000
-ack_timeout_ms = 3000
-EOF
 start_duo_daemon
 wait_for "the second daemon to re-attach" 60 duo_attached
 
@@ -1110,52 +957,37 @@ check "one row each"                      '^ +reviewer +○ idle$'
 # the main rig's.
 check "the header names the second home"  '^watching main · home .*/duo/home$'
 
-printf '\n$ cyclops send implementer --subject "hello"\n'
-duo "$CYC" send implementer --subject "hello" --plain > "$OUT" 2>&1
-cat "$OUT"
-check "the first message is delivered"    '^✔ delivered · verified$'
+stop_duo_daemon
+duo_tmx respawn-pane -k -t "$D1" "/bin/sh"
+duo_prepare_shell implementer "$D1"
+duo_tmx respawn-pane -k -t "$D2" "/bin/sh"
+duo_prepare_shell reviewer "$D2"
+start_duo_daemon
+wait_for "the second daemon to re-attach to shell roots" 60 duo_attached
+duo "$CYC" name "$D1" implementer --plain > /dev/null
+duo "$CYC" name "$D2" reviewer --plain > /dev/null
+duo_start_composer reviewer "$D2"
+
+printf '\n$ cyclops send reviewer --subject "hello"\n'
+duo_shell_command implementer "$D1" 'send reviewer --subject "hello" --client-key parity-duo --plain'
+check "the first message is accepted"     '^accepted m-[[:xdigit:]]{32}$'
+check "and reports notification separately" '^✓ accepted( · [0-9]+ ahead)? · wake (not started|queued|checking readiness|writing|staged|submitted|notified|needs attention)$'
+check_exit "and accepted send exits 0" 0
+DUO_MESSAGE_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
+wait_for "the second rig reviewer doorbell" 100 duo_pane_has_text "$D2" "cyclops inbox claim $DUO_MESSAGE_ID"
 
 printf '\n$ cyclops history\n'
-duo "$CYC" history --plain > "$OUT" 2>&1
-cat "$OUT"
-check "and the record holds the receipt"  '^ +[0-9]+s +admin → implementer +hello +✔ delivered · verified$'
+duo_shell_command implementer "$D1" 'history --plain'
+check "and history holds the message fact" '^ +[0-9]+s +implementer → reviewer +hello$'
 
 stop_duo_daemon
 
 echo
-echo "#### The shipped defaults, with no hooks wired"
+echo "#### The shipped defaults"
 
-# The leg this gate did not have, and the reason two receipt defects
-# shipped under 81 passing checks.
-#
-# Every rung above raises two timing budgets and wires a hook reporter into
-# its stand-in agent. Both are legitimate rig pacing, and together they
-# mean the gate has only ever walked the configured-perfectly path: a
-# delivery that earns "delivered · verified" inside a raised receipt
-# window. A new user has none of that. Their config is whatever `cyclops
-# start` wrote, their agent's hooks are not installed until they run
-# `cyclops hooks install`, and their panes are whatever was already
-# running in them.
-#
-# So this rig touches no config knob and reports no hook, and asserts the
-# two shapes a first-timer actually gets. They are different failures with
-# the same old symptom, which is why both are pinned here:
-#
-#   bound, unhooked   the manifest binds the pane and declares an ACK hook
-#                     that nothing ever fires. The delivery is real and
-#                     lands on screen evidence, so the receipt owes the
-#                     screen-tier badge INSIDE the default receipt window.
-#                     MEASURED before the fix: "● queued" at 2.507s, with
-#                     the record reaching delivered_unverified at 3.03s,
-#                     because the tier-1 window suppressed every screen
-#                     checkpoint under it and the ladder resumed past the
-#                     window. No unhooked agent could land a badge at all.
-#
-#   nothing binds it  the pane has a name and no manifest matches what runs
-#                     there, so nothing can be typed into it. This one is
-#                     not slow, it is impossible, and the receipt has to
-#                     say so while the sender is still there: it reported
-#                     "● queued · 0 ahead" and exited 0.
+# This leg keeps the generated config untouched. Standard send must accept the
+# mailbox write whether hooks are wired or the target pane currently has a
+# usable manifest. Those conditions affect only the one-line notification.
 mkdir -p "$ROOT/stock/home" "$ROOT/stock/tmux" "$ROOT/stock/elsewhere"
 STOCK_HOME="$ROOT/stock/home"
 stock() { ( cd "$ROOT/stock/elsewhere" && CYCLOPS_HOME="$STOCK_HOME" \
@@ -1166,6 +998,38 @@ stock_attached() { stock "$CYC" --json status | jq -e '.sessions[0].attached == 
 stock_roster_has() { stock "$CYC" --json list | jq -e --arg a "$1" '[.agents[].agent] | index($a)' >/dev/null; }
 stock_idle() { stock "$CYC" --json list | jq -e --arg a "$1" \
   '[.agents[] | select(.agent == $a and .state == "idle")] | length == 1' >/dev/null; }
+stock_pane_has_text() { stock_tmx capture-pane -p -t "$1" | grep -Fq -- "$2"; }
+stock_shell_command() {
+  local label="$1" pane="$2" command="$3"
+  rm -f "$ROOT/result.$label" "$ROOT/exit.$label" "$ROOT/done.$label"
+  printf '\n$ (typed in the %s pane) cyclops %s\n' "$label" "$command"
+  local line="CYCLOPS_HOME=\"$STOCK_HOME\" TMUX_TMPDIR=\"$ROOT/stock/tmux\" \"$CYC\" $command > \"$ROOT/result.$label\" 2>&1; code=\$?; printf '%s' \"\$code\" > \"$ROOT/exit.$label\"; : > \"$ROOT/done.$label\""
+  stock_tmx send-keys -t "$pane" -l "$line"
+  stock_tmx send-keys -t "$pane" Enter
+  wait_for "the defaults rig shell command" 100 pane_command_done "$label"
+  cp "$ROOT/result.$label" "$OUT"
+  cp "$ROOT/exit.$label" "$ROOT/exit"
+  cat "$OUT"
+}
+stock_shell_ready() { [ -f "$ROOT/stock/shell-ready.$1" ]; }
+stock_prepare_shell() {
+  local label="$1" pane="$2"
+  rm -f "$ROOT/stock/shell-ready.$label"
+  stock_tmx send-keys -t "$pane" -l ": > '$ROOT/stock/shell-ready.$label'"
+  stock_tmx send-keys -t "$pane" Enter
+  wait_for "the defaults rig $label shell" 100 stock_shell_ready "$label"
+}
+stock_pane_write_ready() {
+  stock "$CYC" read "$1" --source detection --plain | grep -q 'write-ready$'
+}
+stock_start_composer() {
+  local label="$1" pane="$2"
+  stock_tmx resize-window -t "$pane" -x 500 -y 40
+  stock_tmx send-keys -t "$pane" -l "$COMPOSER_COMMAND"
+  stock_tmx send-keys -t "$pane" Enter
+  wait_for "the defaults rig $label composer" 100 stock_pane_has_text "$pane" 'Model x · Ctx: 78%'
+  wait_for "the defaults rig $label composer to be write-ready" 100 stock_pane_write_ready "$label"
+}
 
 # `run` prints and records the exit code but cannot carry this rig's env.
 # Same contract, same $OUT and $ROOT/exit, so check and check_exit work
@@ -1206,15 +1070,12 @@ stop_stock_daemon() {
 stock_run "$CYC" start --preset duo --no-daemon --plain
 check "duo opens two panes"               '^✓ workspace ready · 2 agents$'
 
-# One manifest, shaped like a shipped one: it binds the panes AND declares
-# an ACK hook. claude.toml and codex.toml both do, which is what makes an
-# unwired agent the default case rather than an edge case.
+# One fixture manifest binds the first pane. Standard mailbox behavior does
+# not depend on an acknowledgement hook.
 printf '\n$ $EDITOR ~/.cyclops/manifests/demo.toml\n'
 printf '%s\n' "$DEMO_MANIFEST" > "$STOCK_HOME/manifests/demo.toml"
 
-# NOTHING is appended to the config. That is the whole point of this leg,
-# and it is asserted rather than assumed: an override added here later
-# would quietly turn this back into another configured-perfectly rung.
+# Nothing is appended to the config. The gate exercises generated defaults.
 check_file_absent "this leg runs on untouched defaults" \
   "$STOCK_HOME/config.toml" 'receipt_block_ms|ack_timeout_ms'
 
@@ -1222,11 +1083,11 @@ start_stock_daemon
 wait_for "the defaults daemon to attach" 60 stock_attached
 
 read -r S1 S2 <<<"$(stock_tmx list-panes -t main -F '#{pane_id}' | tr '\n' ' ')"
-# Pane 1 is the agent: bound by the manifest, and it never reports a hook,
-# because a first run has not installed any. Plain `cat` is the honest
-# stand-in for that: it takes the paste and echoes it, which is exactly the
-# screen evidence tier 2 reads, and it reports nothing.
-stock_tmx respawn-pane -k -t "$S1" "cat"
+# Pane 1 is bound by the fixture manifest and reports no hook. The fixture
+# loop keeps its one-line doorbell visible and can issue authenticated sends.
+rm -f "$ROOT/ready.implementer"
+stock_tmx respawn-pane -k -t "$S1" "'$ROOT/cycagent' '$ROOT/agent.sh' implementer '$CYC' '$ROOT'"
+wait_for "the defaults implementer fixture" 100 standin_reading implementer
 # Pane 2 is the pane nothing detects. `sleep` is in no manifest's
 # process_names, which is the state every pane is in before its agent CLI
 # starts.
@@ -1249,36 +1110,33 @@ wait_for "the roster to hold implementer" 60 stock_roster_has implementer
 wait_for "implementer to read idle" 60 stock_idle implementer
 sleep 2.5
 
-# Shape 1. An agent with no hooks wired is delivered to on screen evidence,
-# and the badge has to be on the receipt the sender reads, not only in the
-# record half a second later.
-stock_run "$CYC" send implementer --subject "hello" --plain
-check "an unhooked agent gets the screen-tier badge" '^✓ delivered · unverified \(screen\)$'
-check_exit "and a delivered send exits 0" 0
+# Standard defaults accept the mailbox write and send only a doorbell to a
+# bound recipient. The sender is an ordinary watched shell.
+stop_stock_daemon
+stock_tmx respawn-pane -k -t "$S1" "/bin/sh"
+stock_prepare_shell implementer "$S1"
+stock_tmx respawn-pane -k -t "$S2" "/bin/sh"
+stock_prepare_shell reviewer "$S2"
+start_stock_daemon
+wait_for "the defaults daemon to re-attach to shell roots" 60 stock_attached
+stock_run "$CYC" name "$S1" implementer --plain
+stock_run "$CYC" name "$S2" reviewer --plain
+stock_start_composer reviewer "$S2"
 
-# Shape 2. The pane nothing binds. Not slow: impossible. The receipt names
-# the pane and the exit code keeps a script from reading it as delivered.
-stock_run "$CYC" send ghostpane --subject "hello" --plain
-check "a pane nothing detects refuses the message" "^⚠ needs attention · nothing detects $S2\$"
-# The badge names the pane and the reason; the line under it has to leave
-# the reader somewhere to go, and for this one cause the way out is a
-# command. It carries the pane as the target and the name the pane already
-# answers to as the label, so it can be pasted whole: passing the label as
-# the target would rename an adopted pane to a placeholder.
-check "and names the command that fixes it" \
-  "cyclops name $S2 ghostpane --manifest <id>"
-check_exit "and it does NOT exit 0" 1
+stock_shell_command implementer "$S1" 'send reviewer --subject "bound hello" --body "private default body" --client-key parity-stock-bound --plain'
+check "the default bound send is accepted" '^accepted m-[[:xdigit:]]{32}$'
+check "its wake state is separate" '^✓ accepted( · [0-9]+ ahead)? · wake (not started|queued|checking readiness|writing|staged|submitted|notified|needs attention)$'
+check_exit "the default bound send exits 0" 0
+STOCK_BOUND_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
+wait_for "the defaults reviewer doorbell" 100 stock_pane_has_text "$S2" "cyclops inbox claim $STOCK_BOUND_ID"
+stock_tmx capture-pane -p -t "$S2" > "$OUT"
+check "the default pane gets the doorbell" "^❯ cyclops inbox claim $STOCK_BOUND_ID\$"
+check_absent "the default pane does not get the body" '^private default body$'
 
-# The record agrees with both receipts. A receipt that says one thing while
-# the ledger says another is the defect these two checks exist to catch.
-stock_run "$CYC" history --plain
-check "the delivered one is on the record" '^ +[0-9]+s +admin → implementer +hello +✓ delivered · unverified \(screen\)$'
-# One cause, one wording. The receipt above named the pane because it had
-# one; a folded record line carries the recipient and not the pane, so it
-# says the same sentence without the id. Both come out of
-# cyclops_ui::grid::cause_words, which is the only place this cause becomes
-# English.
-check "and the refused one too"            '^ +[0-9]+s +admin → ghostpane +hello +⚠ needs attention · nothing detects its pane$'
+# History owns message facts, not standard notification badges.
+stock_shell_command implementer "$S1" 'history --plain'
+check "the bound message is on the record" '^ +[0-9]+s +implementer → reviewer +bound hello$'
+check_absent "history has no standard delivery badge" 'delivered ·|needs attention ·'
 
 stop_stock_daemon
 
@@ -1476,7 +1334,7 @@ fi
 echo
 echo "== $((CHECKS - FAILS))/$CHECKS checks passed"
 if [ "$FAILS" -ne 0 ]; then
-  echo "== $FAILS shape(s) the docs claim and the binaries no longer print"
+  echo "== $FAILS documented shape check(s) failed"
   exit 1
 fi
-echo "== docs and binaries agree"
+echo "== representative documentation parity checks passed"

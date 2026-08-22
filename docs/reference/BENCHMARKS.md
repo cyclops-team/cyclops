@@ -9,7 +9,73 @@ Two things get measured. Delivery, which the previous implementation also
 did, so it can be compared directly. And the workspace, which is new, so it
 is measured against itself.
 
-## The machine
+## Current mailbox, socket, and raw tmux comparison
+
+Measured on 2026-08-22 against frozen candidate
+`c108dea169241f8891e2bfdd3c0ff19280a11c45`. The rig used an isolated
+Cyclops home, daemon, tmux server, sender pane, and recipient pane. It did not
+launch a vendor CLI or touch the live daemon. Sampling was serial at a load
+average of 3.7 on the 18-core machine described below.
+
+Latency is in milliseconds. CPU/op is client CPU time per operation.
+Processes/op counts child processes started by the client. Byte counts are
+combined request and response traffic where the harness measured them.
+
+| Lane | n | p50 | p95 | p99 | CPU/op | Processes/op | Bytes/op |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Persistent socket ping | 50 | 0.012 | 0.032 | 0.098 | 0.012 | 0 | 94.6 |
+| Persistent socket status | 50 | 0.023 | 0.037 | 0.048 | 0.015 | 0 | 1,037.0 |
+| Socket connect and handshake | 50 | 0.019 | 0.029 | 0.063 | 0.016 | 0 | not recorded |
+| Cold Cyclops CLI floor | 50 | 2.476 | 2.777 | 3.109 | 2.180 | 1 | not recorded |
+| `msg.send` over an open socket | 50 | 5.063 | 17.999 | 30.053 | 0.038 | 0 | 360.6 |
+| `cyclops send` CLI | 50 | 10.991 | 12.966 | 14.961 | 2.538 | 1 | not recorded |
+| Peer CLI send until visible in inbox | 10 | 16.085 | 28.452 | 28.452 | 4.209 | 1 | 4,979.3 |
+| Claim over an open socket | 10 | 10.003 | 15.801 | 15.801 | 0.068 | 0 | 488.1 |
+| Peer CLI send through exact claim | 10 | 27.033 | 34.016 | 34.016 | 4.598 | 1 | 1,064.0 |
+| Cold `tmux capture-pane` floor | 50 | 3.953 | 4.436 | 4.720 | 3.605 | 1 | not recorded |
+| Raw `tmux send-keys`, fire and forget | 50 | 3.945 | 5.002 | 6.252 | 3.694 | 1 | not recorded |
+| Raw tmux write plus capture verification | 10 | 8.014 | 8.988 | 8.988 | 7.268 | 2 | not recorded |
+
+The open socket is the cheap path. A held socket ping is 206 times faster at
+the median than starting the Cyclops CLI. The CLI floor contributes 2.476ms
+before a message operation begins. Subtracting that floor from `cyclops send`
+leaves 8.515ms at p50 and 10.189ms at p95 for the command's remaining work.
+
+Raw `tmux send-keys` and a no-op `capture-pane` cost the same at the median.
+The 3.945ms fire-and-forget result therefore measures a tmux client process
+starting and the tmux server accepting a command. It does not prove that the
+composer received intact text, that the submit key was accepted, or that a
+recipient read anything. Adding a capture check raises the median to 8.014ms
+and requires two child processes, but still provides no durable message,
+sender attestation, queue, exact claim, reply chain, or recovery record.
+
+The 27.033ms send-to-claim result is the closest complete messaging number in
+this run. It includes a real `cyclops send` started inside the peer pane, the
+durable mutation path, mailbox visibility, and an exact recipient claim. It
+does not include model turnaround because no vendor CLI ran in the isolated
+panes. The p95 and p99 values for the ten-sample lanes are both the
+second-slowest sample and should be read only as a small-sample tail.
+
+A corrected durability probe resolved the workspace journal before sending and
+read it in process immediately after each response. All 30 of 30 messages were
+present when `msg.send` returned. None appeared late or remained absent after
+five seconds. The earlier probe watched the session ledger and is invalid.
+This result proves that the measured send response includes the synchronous
+durable append rather than a promise to write later.
+
+The remaining measured lanes spawned 734 processes, moved 17,212 request bytes
+and 126,138 response bytes, and used 604ms of client CPU plus 1,498ms in child
+processes. These figures describe one host and one boot, not a cross-machine
+performance guarantee. Final audit corrections after `c108dea` changed
+documentation, a test fixture, a comment, and the Linux-only peer-credential
+implementation. They did not change the measured macOS paths.
+
+The measurements below this point are historical. They describe the legacy
+full-payload direct-delivery lane and the workspace renderer as measured on
+2026-08-08. That direct lane remains a compatibility fallback, but it is not
+the default mailbox and doorbell architecture measured above.
+
+## Historical machine context
 
 Everything labeled "measured here" ran on this box on 2026-08-08, in the
 `release` profile.
@@ -37,7 +103,7 @@ compiling in another checkout at the same time, which is the contention
 already documents as worth 1.6x to 9x on some metrics. Trust shapes over
 absolute milliseconds, and rerun anything that matters.
 
-## What is being compared
+## Historical comparison: direct delivery and commPact v1
 
 Cyclops is the Rust implementation: `cyclopsd` holds one tmux control-mode
 connection per watched session, an append-only NDJSON ledger records every
@@ -74,7 +140,7 @@ pressed Enter". Cyclops answers "this ended in this state, verified this
 way". The tables below compare them at the one milestone they share and then
 report the work Cyclops does past it.
 
-## Delivery latency
+## Historical direct-delivery latency
 
 ### The deadlines, and what each one bounds
 
@@ -93,7 +159,7 @@ they answer to.
 | `DECLINE_SPACING` | 250ms | Spacing between a manifest's modal decline keys | `src/cyclopsd/src/delivery.rs` |
 | CLI connect / read | 2s / 5s | The `cyclops` client's own socket budget. The 5s read budget has to exceed `receipt_block_ms`, and does | `src/cyclops/src/client.rs` |
 | Workspace `IO_TIMEOUT` | 250ms | The full-screen workspace's budget for its small decoration, naming, and confirmation requests to the daemon. It never sends messages through this path | `src/cyclops-workspace/src/daemon.rs` |
-| `WAIT_DEFAULT_MS` / `WAIT_MAX_MS` | 60s / 600s | `--wait` and `agent.wait` | `src/cyclopsd/src/delivery.rs` |
+| `WAIT_DEFAULT_MS` / `WAIT_MAX_MS` | 60s / 600s | `agent.wait` | `src/cyclopsd/src/delivery.rs` |
 
 The tiers those deadlines serve, in full, are in
 [DELIVERY.md](../development/DELIVERY.md); the receipts a user sees are in

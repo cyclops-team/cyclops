@@ -2,8 +2,8 @@
 //! the eye animation. Pure state transitions here; no IO, no terminal, so
 //! every behavior is unit-testable.
 //!
-//! The record itself — the entry ring, the attention register, and the
-//! calm/firehose decision — is not this file's. [`crate::stream::Record`]
+//! The record itself (the entry ring, the attention register, and the
+//! calm/firehose decision) is not this file's. [`crate::stream::Record`]
 //! owns it, backend-neutral, so a future workspace panel reads the same
 //! ordering and the same judgement. `App` holds one and is otherwise this
 //! renderer's own state: the sidebar roster and the focus-jump map (both
@@ -22,6 +22,9 @@ use crate::theme::Theme;
 pub enum View {
     Admin,
     Firehose,
+    /// The work queue. A sibling of the stream views, reading the
+    /// messages snapshot rather than the event record.
+    Messages,
 }
 
 impl View {
@@ -29,6 +32,7 @@ impl View {
         match self {
             View::Admin => "admin stream",
             View::Firehose => "firehose",
+            View::Messages => "messages",
         }
     }
 }
@@ -42,6 +46,7 @@ pub enum Density {
 /// One agent row in the sidebar: who, where they stand, since when.
 #[derive(Debug)]
 pub struct RosterRow {
+    pub session_idx: usize,
     pub name: String,
     pub pane_id: String,
     pub state: cyclops_proto::AgentState,
@@ -62,6 +67,26 @@ enum Since {
     Observed(std::time::Instant),
     /// Nobody has said. The elapsed cell stays empty.
     Unknown,
+}
+
+/// One daemon session slot and one tmux pane id.
+///
+/// Pane ids stay globally unique on the supported single tmux server, but a
+/// transfer crosses two independently scheduled session watchers. Keeping the
+/// source slot prevents its late removal from erasing the destination route.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct PaneRoute {
+    session_idx: usize,
+    pane_id: String,
+}
+
+impl PaneRoute {
+    fn new(session_idx: usize, pane_id: &str) -> Self {
+        Self {
+            session_idx,
+            pane_id: pane_id.to_string(),
+        }
+    }
 }
 
 impl RosterRow {
@@ -148,6 +173,9 @@ impl Which {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Quit,
+    /// Open a fresh event subscription. Only ever from a keystroke: the
+    /// UI does not retry a dead socket on its own.
+    Reconnect,
     /// Jump focus to this pane id or agent label.
     Focus(String),
 }
@@ -186,13 +214,59 @@ pub struct App {
     /// is this renderer's own.
     record: Record,
     eye: Eye,
-    /// Agent label -> pane id, harvested from status and events only
+    /// Agent label -> exact route, harvested from status and events only
     /// (zero polling). Backs the focus jump.
-    panes: HashMap<String, String>,
-    /// Every watched pane, keyed by pane id: the sidebar's rows. Seeded
+    panes: HashMap<String, PaneRoute>,
+    /// Every watched pane, keyed by exact route: the sidebar's rows. Seeded
     /// from the one status answer, then moved by live events alone, the
     /// same contract the attention register keeps.
-    roster: BTreeMap<String, RosterRow>,
+    roster: BTreeMap<PaneRoute, RosterRow>,
+    admin_unread: u64,
+    /// The messages work queue. Only the Messages view reads it, and it
+    /// is filled by whole snapshot replacement, never patched.
+    pub queue: crate::queue::HumanQueue,
+    /// Snapshot invalidation and connection state.
+    pub refresh: crate::messages::RefreshGate,
+    /// The open detail, if the reader opened one.
+    pub detail: Option<crate::detail::Detail>,
+    /// A request the reader confirmed, resolved at that moment and
+    /// waiting for the loop to send it.
+    ///
+    /// Never a bare action. Resolving at drain time read whatever detail
+    /// was open by then, so confirming on one row, leaving, and opening
+    /// another built the first row's verb against the second's target.
+    pending: Option<(
+        crate::action_io::RequestToken,
+        crate::action_io::ActionRequest,
+    )>,
+    /// The one request that is out. Its answer is the only one allowed
+    /// to touch the detail.
+    in_flight: Option<crate::action_io::RequestToken>,
+    /// The size the last frame was drawn at.
+    ///
+    /// Kept so the key handler can ask the same question the renderer
+    /// answered: is there room to show what a destructive key would do.
+    /// A key must not act on something the frame could not display.
+    pub last_size: (usize, usize),
+    /// A reconnect the loop still owes. Set by the key, taken by the
+    /// event loop, which is the only place that can spawn a task.
+    pub reconnect_owed: bool,
+    /// The terminal is mid-paste. Set by PasteStart, cleared by PasteEnd.
+    ///
+    /// While true nothing between the brackets is interpreted, which is
+    /// the only reliable defence: a pasted `q` is a `q` by the time it
+    /// reaches the key handler and cannot be told from a typed one.
+    pasting: bool,
+}
+
+/// One idempotency key per draft.
+///
+/// A uuid rather than a pid and a counter. The daemon keys idempotency on
+/// sender plus client key, and both a pid and a counter reset, so a
+/// restarted UI could mint a pair an older journal entry already holds
+/// and have a fresh message treated as a repeat of an old one.
+fn next_client_key() -> String {
+    format!("ui-{}", uuid::Uuid::new_v4())
 }
 
 impl App {
@@ -216,7 +290,294 @@ impl App {
             eye: Eye::Closed,
             panes: HashMap::new(),
             roster: BTreeMap::new(),
+            admin_unread: 0,
+            queue: crate::queue::HumanQueue::new(),
+            refresh: crate::messages::RefreshGate::new(),
+            detail: None,
+            pending: None,
+            in_flight: None,
+            pasting: false,
+            reconnect_owed: false,
+            // Assume a usable frame until one is drawn. A fresh App has
+            // not rendered, and refusing every action before the first
+            // frame would be its own defect.
+            last_size: (80, 24),
         }
+    }
+
+    /// The request that is out, if any.
+    pub fn in_flight(&self) -> Option<&crate::action_io::RequestToken> {
+        self.in_flight.as_ref()
+    }
+
+    /// Is a confirmed request waiting to be sent?
+    pub fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Does an open detail still owe a read?
+    pub fn detail_read_owed(&self) -> bool {
+        self.detail
+            .as_ref()
+            .is_some_and(|d| matches!(d.stage(), crate::detail::Stage::Opening) || d.needs_reload())
+    }
+
+    /// Apply what came back, if it belongs to what is on screen.
+    ///
+    /// Two checks and both are load bearing. The token must be the one
+    /// still in flight, which drops an answer to a request the reader
+    /// has moved on from. And its target must be the detail's, which is
+    /// the privacy half: without it, closing one detail and opening
+    /// another lets the first message's body render in the second's
+    /// frame. A response failing either check is dropped whole, and
+    /// nothing about it reaches the screen.
+    pub fn apply_action(
+        &mut self,
+        token: crate::action_io::RequestToken,
+        outcome: crate::action_io::ActionOutcome,
+    ) {
+        use crate::action_io::ActionOutcome;
+        if self.in_flight.as_ref() != Some(&token) {
+            return;
+        }
+        self.in_flight = None;
+        let action = token.action();
+        let Some(detail) = self.detail.as_mut() else {
+            return;
+        };
+        // BOTH halves. The row decides which detail may apply this, and
+        // survives an alarm appearing or clearing underneath it. The
+        // attempt decides what the answer was about: a requeue replaces
+        // it, and an answer naming the old attempt must not land on a
+        // detail now looking at the new one.
+        if detail.target().target != *token.row() || detail.target().attempt != token.attempt() {
+            return;
+        }
+        match outcome {
+            ActionOutcome::Opened(loaded) => detail.loaded_ok(*loaded),
+            ActionOutcome::Done(note) => match action {
+                Some(action) => {
+                    detail.done(action, note);
+                    // What the daemon holds has moved, so the list is
+                    // owed a read as well.
+                    self.refresh.mark_dirty();
+                }
+                None => detail.loaded_ok(crate::detail::Loaded::default()),
+            },
+            ActionOutcome::Refused { code, message } => detail.refused(action, &code, message),
+            ActionOutcome::NotSent(why) => detail.not_sent(action, why),
+            // A read is not automatically harmless. An open that claims
+            // is a mutation, so its unanswered request is unknown rather
+            // than absent, and must never be reported as nothing having
+            // changed. A claim is safely reopenable, which is why the
+            // detail stays usable either way.
+            ActionOutcome::Uncertain(why) => detail.uncertain(action, why),
+        }
+    }
+
+    /// Open the selected row, freezing its target and the watermark.
+    ///
+    /// Refused while a detail is already open, which is what stops a
+    /// second Enter opening a second read against the same row.
+    pub fn open_detail(&mut self) -> Option<()> {
+        use crate::detail::Detail;
+
+        // Refused while a detail is open, which is what stops a second
+        // Enter starting a second read. Not refused merely because a
+        // request is out: leaving a slow read and opening something else
+        // has to work, or a reader is stuck until it times out. The
+        // answer to the abandoned read is dropped on its token.
+        if self.detail.is_some() {
+            return None;
+        }
+        let row = self.queue.selected()?.clone();
+        self.detail = Some(Detail::open(&row, self.queue.watermark()));
+        Some(())
+    }
+
+    /// The read an open detail is owed, with the token naming it.
+    ///
+    /// One place decides what a detail's read looks like, so opening it
+    /// and reloading it after its facts moved cannot drift apart.
+    pub fn detail_read(
+        &self,
+    ) -> Option<(
+        crate::action_io::RequestToken,
+        crate::action_io::ActionRequest,
+    )> {
+        use crate::action_io::{ActionRequest, RequestKind, RequestToken};
+        use crate::queue::{Direction, MailboxWord};
+
+        let detail = self.detail.as_ref()?;
+        let frozen = detail.target().clone();
+        // One read per open, and the alarm wins when this reader may act
+        // on it. Recovery is the time-sensitive job and it is the one
+        // that needs evidence on screen before a verb is offered.
+        let (request, claims) = match frozen.attempt {
+            Some(attempt_id) if detail.can_manage_attention() => {
+                (ActionRequest::OpenAttention { attempt_id }, false)
+            }
+            _ => {
+                // Claim only what is genuinely yours and still waiting,
+                // and only on the first open. Observing somebody else's
+                // mailbox must not take it, and a reload is a read.
+                let claims = matches!(detail.stage(), crate::detail::Stage::Opening)
+                    && detail.direction() == Direction::Inbound
+                    && detail.mailbox() == MailboxWord::Pending;
+                (
+                    ActionRequest::OpenMessage {
+                        message_id: frozen.target.message_id.clone(),
+                        claim: claims,
+                    },
+                    claims,
+                )
+            }
+        };
+        Some((
+            RequestToken::new(frozen, RequestKind::Read { claims }),
+            request,
+        ))
+    }
+
+    /// Turn a confirmed action into the exact request it will send.
+    ///
+    /// Called at the yes, never at the drain. Resolving at drain time
+    /// read whatever detail was open by then, so confirming on one row,
+    /// leaving, and opening another built the first row's verb against
+    /// the second row's target.
+    fn resolve_action(
+        &mut self,
+        action: crate::detail::Action,
+    ) -> Option<(
+        crate::action_io::RequestToken,
+        crate::action_io::ActionRequest,
+    )> {
+        use crate::action_io::{RequestKind, RequestToken};
+        use crate::detail::Action;
+        let detail = self.detail.as_mut()?;
+        let frozen = detail.target().clone();
+        let request = match (frozen.attempt, action) {
+            (_, Action::Reply) => {
+                let key = detail.draft_mut().key_for_send(next_client_key);
+                crate::action_io::ActionRequest::Reply {
+                    message_id: frozen.target.message_id.clone(),
+                    body: detail.draft().text().to_string(),
+                    client_key: key,
+                }
+            }
+            // The FROZEN attempt, never the row's current one. Between
+            // the read and the yes an alarm can be cleared and requeued
+            // under a new attempt, and the operator confirmed against the
+            // evidence they were shown.
+            (Some(attempt_id), Action::ClearAlarm) => {
+                crate::action_io::ActionRequest::ClearAlarm { attempt_id }
+            }
+            (Some(attempt_id), Action::AttentionComplete) => {
+                crate::action_io::ActionRequest::AttentionComplete { attempt_id }
+            }
+            (Some(attempt_id), Action::AttentionDiscard) => {
+                crate::action_io::ActionRequest::AttentionDiscard { attempt_id }
+            }
+            // An attention verb with no attempt frozen never becomes a
+            // request.
+            (None, _) => return None,
+        };
+        Some((RequestToken::new(frozen, RequestKind::Act(action)), request))
+    }
+
+    /// Resolve an approved action and hold it for the loop.
+    ///
+    /// The resolution happens here, at the yes, so the request names the
+    /// target the operator was looking at when they approved it.
+    fn confirm_action(&mut self, action: crate::detail::Action) {
+        // Never against a connection that is not acknowledged. Writing a
+        // non-idempotent verb into a socket on its way down is exactly
+        // the ambiguity the whole Uncertain path exists to report, and
+        // refusing up front is cheaper than reporting it afterwards.
+        if !self.refresh.may_mutate() {
+            self.notice = Some("not connected: nothing was sent".into());
+            return;
+        }
+        self.pending = self.resolve_action(action);
+    }
+
+    /// The confirmed request the loop should send. Taking it marks it in
+    /// flight, so exactly one request is out and its answer can be
+    /// matched back to it.
+    pub fn take_pending(
+        &mut self,
+    ) -> Option<(
+        crate::action_io::RequestToken,
+        crate::action_io::ActionRequest,
+    )> {
+        if self.in_flight.is_some() {
+            return None;
+        }
+        let (token, request) = self.pending.take()?;
+        self.in_flight = Some(token.clone());
+        Some((token, request))
+    }
+
+    /// The read a detail is owed, marked in flight.
+    pub fn take_detail_read(
+        &mut self,
+    ) -> Option<(
+        crate::action_io::RequestToken,
+        crate::action_io::ActionRequest,
+    )> {
+        if !self.refresh.may_mutate() || self.in_flight.is_some() || !self.detail_read_owed() {
+            return None;
+        }
+        let (token, request) = self.detail_read()?;
+        self.in_flight = Some(token.clone());
+        Some((token, request))
+    }
+
+    /// Tell an open detail whether its row is still listed. Never
+    /// retargets it and never cancels a confirmation.
+    fn resync_detail(&mut self) {
+        let Some(detail) = self.detail.as_mut() else {
+            return;
+        };
+        // Across the whole snapshot, not the current scope. A claim
+        // moves its row out of Work, and looking only at what is visible
+        // would mark the detail stale the moment its own claim landed.
+        let current = self.queue.row_for(&detail.target().target).cloned();
+        detail.observe_snapshot(current.as_ref());
+    }
+
+    /// Replace the queue with one authenticated snapshot.
+    ///
+    /// Whole replacement, never a merge: the daemon's answer is the
+    /// state, and a client that patched rows would be a second read
+    /// model free to disagree with it.
+    pub fn apply_messages(&mut self, snapshot: &cyclops_proto::MessagesSnapshotResult) {
+        self.queue
+            .replace(crate::messages::rows_from_snapshot(snapshot));
+        // The queue moved, so a detail's frozen target may no longer be
+        // in it. Integration's gate owns finishing the request; this is
+        // only about what the detail is looking at.
+        self.resync_detail();
+    }
+
+    /// Apply a response only if it belongs to the current connection and
+    /// covers every durable change already observed on the stream.
+    pub fn apply_messages_response(
+        &mut self,
+        request: crate::messages::RefreshRequest,
+        snapshot: &cyclops_proto::MessagesSnapshotResult,
+    ) -> bool {
+        if !self.refresh.finish_snapshot(request, snapshot) {
+            return false;
+        }
+        self.apply_messages(snapshot);
+        true
+    }
+
+    /// Return the next snapshot request, if one is owed. Asked once per
+    /// loop turn.
+    pub fn wants_messages(&mut self) -> Option<crate::messages::RefreshRequest> {
+        self.refresh.begin()
     }
 
     /// The sidebar's rows, in pane-id order: stable across frames, so a
@@ -250,6 +611,10 @@ impl App {
         self.record.attention_count()
     }
 
+    pub fn admin_unread(&self) -> u64 {
+        self.admin_unread
+    }
+
     /// The eye as currently drawn (it may still be mid-tick).
     pub fn eye(&self) -> Eye {
         self.eye
@@ -280,7 +645,7 @@ impl App {
 
     /// One live event from the daemon: it goes on the record AND moves the
     /// register ([`crate::stream::Record::live`]). This renderer's own
-    /// navigation state — the sidebar row and the focus-jump map — moves
+    /// navigation state (the sidebar row and the focus-jump map) moves
     /// on the same live edge, and only live: a replayed line is old news
     /// and must not restart anyone's clock.
     ///
@@ -293,16 +658,21 @@ impl App {
         match &e.kind {
             EntryKind::State {
                 target,
+                session_idx,
                 pane_id: Some(p),
                 state,
-            } => self.roster_observe(p, target, *state),
-            // A pane leaving the table is its last transition. The jump
-            // map and the sidebar row go with it: "no pane known for
-            // reviewer" is honest, and a jump to a pane id tmux has
-            // retired is not.
-            EntryKind::PaneGone { pane_id } => {
-                self.panes.retain(|_, p| p != pane_id);
-                self.roster.remove(pane_id);
+            } => self.roster_observe(*session_idx, p, target, *state),
+            // Remove only the route this watcher lost. A transfer can
+            // publish the destination state before this source edge, and
+            // both routes carry the same tmux pane id.
+            EntryKind::PaneGone {
+                session_idx,
+                pane_id,
+                ..
+            } => {
+                let route = PaneRoute::new(*session_idx, pane_id);
+                self.panes.retain(|_, current| current != &route);
+                self.roster.remove(&route);
             }
             _ => {}
         }
@@ -316,11 +686,13 @@ impl App {
     fn observe_pane_name(&mut self, e: &Entry) {
         if let EntryKind::State {
             target,
+            session_idx,
             pane_id: Some(p),
             ..
         } = &e.kind
         {
-            self.panes.insert(target.clone(), p.clone());
+            self.panes
+                .insert(target.clone(), PaneRoute::new(*session_idx, p));
         }
     }
 
@@ -330,8 +702,15 @@ impl App {
     /// state re-observed (the daemon re-emits on unrelated recomputes) is
     /// confirmation, not a transition, and a clock that reset on it would
     /// show every long-running agent as seconds old.
-    fn roster_observe(&mut self, pane_id: &str, name: &str, state: cyclops_proto::AgentState) {
-        match self.roster.get_mut(pane_id) {
+    fn roster_observe(
+        &mut self,
+        session_idx: usize,
+        pane_id: &str,
+        name: &str,
+        state: cyclops_proto::AgentState,
+    ) {
+        let route = PaneRoute::new(session_idx, pane_id);
+        match self.roster.get_mut(&route) {
             Some(row) => {
                 row.name = name.to_string();
                 if row.state != state {
@@ -342,8 +721,9 @@ impl App {
             None => {
                 // A pane the seed never saw: it appeared after startup.
                 self.roster.insert(
-                    pane_id.to_string(),
+                    route,
                     RosterRow {
+                        session_idx,
                         name: name.to_string(),
                         pane_id: pane_id.to_string(),
                         state,
@@ -372,6 +752,7 @@ impl App {
     /// Event-driven only: called once at startup and never on a timer.
     /// After that the register moves on live events alone ([`App::live`]).
     pub fn seed_status(&mut self, seed: StatusSeed) -> Vec<Entry> {
+        self.admin_unread = seed.admin_unread;
         // 1. The sidebar's roster is the answer's pane list, replaced
         //    whole for the same reason the register is: anything the
         //    answer does not list is gone. The daemon's own elapsed
@@ -382,8 +763,9 @@ impl App {
             .iter()
             .map(|r| {
                 (
-                    r.pane_id.clone(),
+                    PaneRoute::new(r.session_idx, &r.pane_id),
                     RosterRow {
+                        session_idx: r.session_idx,
                         name: r.name.clone(),
                         pane_id: r.pane_id.clone(),
                         state: r.state,
@@ -401,11 +783,17 @@ impl App {
             .collect();
         // 2. Refresh the jump map, which outlives the roster: a label the
         //    answer still names points at the pane the answer named.
-        for p in &seed.panes {
-            self.panes.insert(p.name.clone(), p.pane_id.clone());
+        for p in &seed.roster {
+            self.panes
+                .insert(p.name.clone(), PaneRoute::new(p.session_idx, &p.pane_id));
         }
         // 3. The register and the backlog's lines are the model's job.
-        self.record.seed(&seed.panes, &seed.open)
+        let routes = seed
+            .roster
+            .iter()
+            .map(|pane| (pane.pane_id.clone(), pane.session_idx))
+            .collect();
+        self.record.seed_routed(&seed.panes, &seed.open, &routes)
     }
 
     /// Every attention item as one phrase, in the stream's own voice
@@ -462,10 +850,304 @@ impl App {
 
     /// Handle one key. Returns a command for the runtime when the key
     /// asks for more than state change.
+    /// Keys while a detail is open.
+    ///
+    /// Actions are chosen from the numbered list the footer shows, never
+    /// from a bare letter: a destructive verb should not be one keystroke
+    /// away from a reader who is scrolling. Anything that mutates then
+    /// asks for `y` against a sentence naming the target.
+    fn handle_detail_key(&mut self, key: Key) -> Option<Command> {
+        // The composer comes FIRST, before the size and busy guards.
+        //
+        // Both of those refuse `y` and digits, and both can arm without a
+        // keystroke: a background snapshot sets needs_reload, which puts a
+        // read in flight, and a pane can be resized under an open
+        // composer. Running them above this branch meant a `y` or a digit
+        // typed into a reply body was swallowed by a guard meant for
+        // actions, and the body went out mangled with nothing on screen
+        // to show it. While a reply is being written the keyboard belongs
+        // to it, which is what this ordering finally makes true.
+        let composing = self
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.is_composing());
+        if composing {
+            if key == Key::CtrlD && !self.refresh.may_mutate() {
+                if self.notice.is_none() {
+                    self.notice = Some("not connected: nothing was sent".into());
+                }
+                return None;
+            }
+            // Sending is the one thing a too-small frame still refuses,
+            // because a frame that cannot draw the draft cannot show what
+            // is about to be sent. Typing and cancelling stay live.
+            if key == Key::CtrlD
+                && !crate::detail::can_show_actions(self.last_size.0, self.detail_action_height())
+            {
+                self.notice = Some("open a larger window to send this".into());
+                return None;
+            }
+            if key == Key::CtrlD && (self.in_flight.is_some() || self.pending.is_some()) {
+                self.notice = Some("waiting for the last action to answer".into());
+                return None;
+            }
+            let mut send_reply = false;
+            let detail = self.detail.as_mut()?;
+            match key {
+                Key::CtrlC => return Some(Command::Quit),
+                Key::Esc => detail.end_compose(),
+                Key::Backspace => detail.draft_mut().backspace(),
+                // Enter is a newline, never a send. A pasted newline and a
+                // typed one are the same byte by the time they arrive, so
+                // a composer that sent on Enter would send whatever came
+                // before the first line break of a paste.
+                Key::Enter => detail.draft_mut().push('\n'),
+                Key::CtrlD => {
+                    // request() again, at the moment of sending. It is the
+                    // staleness gate, and the row can go stale while the
+                    // reader types. It also stamps Acting here, where
+                    // something really is about to be on the wire.
+                    if !detail.draft().is_empty() {
+                        match detail.request(crate::detail::Action::Reply) {
+                            crate::detail::Request::Perform(_) => {
+                                detail.end_compose();
+                                send_reply = true;
+                            }
+                            _ => {
+                                detail.end_compose();
+                                self.notice = Some("this row is no longer available".into());
+                            }
+                        }
+                    }
+                }
+                Key::Char(c) => detail.draft_mut().push(c),
+                _ => {}
+            }
+            if send_reply {
+                self.confirm_action(crate::detail::Action::Reply);
+            }
+            return None;
+        }
+        if key == Key::Char('?') {
+            self.notice = Some("detail keys are shown below; esc returns to the queue".into());
+            return None;
+        }
+        // Read before the detail is borrowed: the question is about the
+        // frame, not about the detail.
+        let can_act =
+            crate::detail::can_show_actions(self.last_size.0, self.detail_action_height());
+        if !self.refresh.may_mutate() && matches!(key, Key::Char('y') | Key::Char('1'..='9')) {
+            if self.notice.is_none() {
+                self.notice = Some("not connected: nothing was sent".into());
+            }
+            return None;
+        }
+        if !can_act && matches!(key, Key::Char('y') | Key::Char('1'..='9')) {
+            self.notice = Some("open a larger window to act on this".into());
+            return None;
+        }
+        // A request is out. Anything that could start a second one, or
+        // change what the first was about, waits for its answer.
+        // Scrolling and leaving stay live: neither can retarget, and a
+        // response arriving after the reader left is dropped on its
+        // token anyway.
+        let busy = self.in_flight.is_some() || self.pending.is_some();
+        if busy && matches!(key, Key::Char('y') | Key::Char('1'..='9')) {
+            self.notice = Some("waiting for the last action to answer".into());
+            return None;
+        }
+        let detail = self.detail.as_mut()?;
+        match key {
+            Key::Char('q') | Key::CtrlC => return Some(Command::Quit),
+            Key::Esc => {
+                if detail.escape() == crate::detail::Back::Closed {
+                    self.detail = None;
+                    // Nothing is waiting on those answers any more. The
+                    // requests may still land, and their tokens no
+                    // longer match, so they are dropped when they do.
+                    // Forgetting them here is what frees the reader to
+                    // open something else instead of waiting out a slow
+                    // read they have already left.
+                    self.in_flight = None;
+                    self.pending = None;
+                }
+            }
+            Key::Char('y') => {
+                if let Some(action) = detail.confirm() {
+                    self.confirm_action(action);
+                }
+            }
+            Key::Char(c) if c.is_ascii_digit() && c != '0' => {
+                let index = (c as u8 - b'1') as usize;
+                let allowed = detail.allowed();
+                if let Some(&action) = allowed.get(index) {
+                    // Every verb goes through request(), reply included.
+                    // request() is where "a stale detail offers nothing at
+                    // all" is enforced, so the one action that skipped it
+                    // was the one action a stale detail could still
+                    // perform: the header read "(no longer listed)" and
+                    // the footer "no actions available" while the keyboard
+                    // still sent a message.
+                    match detail.request(action) {
+                        // Reply opens the composer rather than sending an
+                        // empty body. It is the only Perform that is not a
+                        // request to the daemon yet.
+                        crate::detail::Request::Perform(crate::detail::Action::Reply) => {
+                            detail.begin_reply()
+                        }
+                        crate::detail::Request::Perform(action) => self.confirm_action(action),
+                        // The stage now holds the confirmation; the footer
+                        // draws the sentence and waits for a yes.
+                        crate::detail::Request::Confirm(_) => {}
+                        crate::detail::Request::Refused(why) => self.notice = Some(why.to_string()),
+                    }
+                }
+            }
+            // Ask again, by hand. A failed reload stops being owed so the
+            // loop cannot spin on it, which means nothing retries on its
+            // own and the evidence stays marked stale until this.
+            Key::Char('r') => detail.retry_reload(),
+            // A long body scrolls under the same keys the list uses.
+            Key::Up | Key::Char('k') | Key::WheelUp => detail.scroll_by(-1),
+            Key::Down | Key::Char('j') | Key::WheelDown => detail.scroll_by(1),
+            _ => {}
+        }
+        None
+    }
+
+    /// Is a reply composer open right now? The only place pasted bytes
+    /// are allowed to land.
+    fn composing_now(&self) -> bool {
+        self.view == View::Messages
+            && self
+                .detail
+                .as_ref()
+                .is_some_and(|detail| detail.is_composing())
+    }
+
+    /// Height available to evidence after the Messages status row.
+    fn detail_action_height(&self) -> usize {
+        let status_visible = !self.refresh.may_mutate() || self.notice.is_some();
+        self.last_size.1.saturating_sub(usize::from(status_visible))
+    }
+
+    /// Put one pasted character into the open draft, or drop it.
+    fn paste_into_draft(&mut self, ch: Option<char>) {
+        if !self.composing_now() {
+            return;
+        }
+        if let (Some(detail), Some(ch)) = (self.detail.as_mut(), ch) {
+            detail.draft_mut().push(ch);
+        }
+    }
+
     pub fn handle_key(&mut self, key: Key) -> Option<Command> {
+        // Bracketed paste is settled HERE, above every route, because
+        // every route below reads keys as commands. A guard further down
+        // only protected the detail: a paste landing on the queue, on a
+        // filter input line, or on either stream view still ran its bytes
+        // as keystrokes, so a pasted q quit and pasted digits acted.
+        //
+        // Inside a paste exactly one thing is admitted, an active reply
+        // draft. Everywhere else the bytes are dropped.
+        if self.pasting {
+            match key {
+                Key::PasteEnd => self.pasting = false,
+                Key::Char(c) => self.paste_into_draft(Some(c)),
+                Key::Enter => self.paste_into_draft(Some('\n')),
+                // Nothing else. No key inside a paste ends the paste,
+                // acts, or quits, including Esc and Ctrl-C: a clipboard
+                // can legally carry either, and any byte that could
+                // return the UI to command mode early would let the bytes
+                // behind it run as commands. The decoder guarantees a
+                // PasteEnd for every PasteStart it emits, so this cannot
+                // strand the keyboard.
+                _ => {}
+            }
+            return None;
+        }
+        if key == Key::PasteStart {
+            self.pasting = true;
+            if !self.composing_now() {
+                self.notice = Some("paste ignored: open the reply first".into());
+            }
+            return None;
+        }
         // An open input line captures everything except control keys.
         if self.input.is_some() {
             return self.handle_input_key(key);
+        }
+        // Reconnect is explicit and single-flight. A reply draft still
+        // owns every printable character, including uppercase R.
+        if key == Key::Char('R') && !self.composing_now() && self.refresh.reconnecting() {
+            self.notice = None;
+            self.reconnect_owed = true;
+            return Some(Command::Reconnect);
+        }
+        // A detail owns the keyboard while it is open, so a stream key
+        // cannot move something underneath it.
+        if self.view == View::Messages && self.detail.is_some() {
+            return self.handle_detail_key(key);
+        }
+        // With no detail open, Messages navigates the queue. Without
+        // this the arrows moved the stream's record instead, so only the
+        // row the snapshot seeded was ever reachable and three of the
+        // four scopes could not be entered at all.
+        if self.view == View::Messages {
+            match key {
+                Key::Char('q') | Key::CtrlC => return Some(Command::Quit),
+                Key::Char('?') => {
+                    self.overlay = !self.overlay;
+                    return None;
+                }
+                Key::Esc => {
+                    self.overlay = false;
+                    self.notice = None;
+                    return None;
+                }
+                Key::Tab => {
+                    self.overlay = false;
+                    self.view = View::Admin;
+                    self.repin();
+                    return None;
+                }
+                _ if self.overlay => return None,
+                Key::Up | Key::Char('k') | Key::WheelUp => {
+                    self.queue.select_previous();
+                    return None;
+                }
+                Key::Down | Key::Char('j') | Key::WheelDown => {
+                    self.queue.select_next();
+                    return None;
+                }
+                // One key, forward through the four scopes. The current
+                // one is already named in the queue header, so there is
+                // nothing to remember.
+                Key::Char('s') => {
+                    let order = crate::queue::Scope::ORDER;
+                    let at = order
+                        .iter()
+                        .position(|s| *s == self.queue.scope())
+                        .unwrap_or(0);
+                    self.queue.set_scope(order[(at + 1) % order.len()]);
+                    return None;
+                }
+                Key::Enter => {
+                    if !self.refresh.may_mutate() {
+                        return None;
+                    }
+                    self.notice = None;
+                    if self.open_detail().is_none() {
+                        self.notice = Some(if self.queue.is_empty() {
+                            "nothing to open".into()
+                        } else {
+                            "message changed; select a row".into()
+                        });
+                    }
+                    return None;
+                }
+                _ => return None,
+            }
         }
         match key {
             Key::Char('q') | Key::CtrlC => return Some(Command::Quit),
@@ -477,7 +1159,8 @@ impl App {
             Key::Tab => {
                 self.view = match self.view {
                     View::Admin => View::Firehose,
-                    View::Firehose => View::Admin,
+                    View::Firehose => View::Messages,
+                    View::Messages => View::Admin,
                 };
                 // The other view is a different list; stale anchors would
                 // land anywhere. Rejoin the tail.
@@ -651,7 +1334,7 @@ impl App {
             return Some(name);
         }
         match self.panes.get(&name) {
-            Some(pane) => Some(pane.clone()),
+            Some(route) => Some(route.pane_id.clone()),
             None => {
                 self.notice = Some(format!("no pane known for {name}"));
                 None
@@ -707,6 +1390,7 @@ mod tests {
             id: Some("e-1".into()),
             kind: EntryKind::State {
                 target: target.into(),
+                session_idx: 0,
                 pane_id: pane_id.map(String::from),
                 state: s,
             },
@@ -760,9 +1444,11 @@ mod tests {
                 })
                 .collect(),
             open,
+            admin_unread: 0,
             roster: panes
                 .iter()
                 .map(|(name, pane_id, state)| RosterSeed {
+                    session_idx: 0,
                     pane_id: (*pane_id).into(),
                     name: (*name).into(),
                     state: *state,

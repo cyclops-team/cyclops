@@ -111,6 +111,15 @@ fn read_value(reader: &mut BufReader<UnixStream>, context: &str) -> Result<Value
         .map_err(|error| format!("cyclopsd sent unreadable {context}: {error}"))
 }
 
+/// Result of a composer send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SendOutcome {
+    Accepted(String),
+    Rejected(String),
+    /// The request write began, but no trustworthy response arrived.
+    Unknown(String),
+}
+
 /// Send one message, and report the receipt the way `cyclops send` does.
 ///
 /// MUST NOT be called from the draw loop. It waits on [`SEND_TIMEOUT`],
@@ -121,41 +130,82 @@ fn read_value(reader: &mut BufReader<UnixStream>, context: &str) -> Result<Value
 ///
 /// The returned string is the receipt line, already in the vocabulary the
 /// CLI prints, so the composer shows the operator the same words `cyclops
-/// send` would have. An Err is transport trouble: nothing reached the
-/// record, and the message is not somewhere waiting to be found.
-pub fn send_message(home: &Path, to: &str, subject: &str, body: &str) -> Result<String, String> {
-    let params = serde_json::to_value(cyclops_proto::MsgSendParams {
+/// send` would have. Once the request write begins, transport failure is
+/// outcome-unknown because the daemon may already have accepted it.
+pub fn send_message(
+    home: &Path,
+    to: &str,
+    subject: &str,
+    body: &str,
+    client_key: &str,
+) -> SendOutcome {
+    let params = match serde_json::to_value(cyclops_proto::MsgSendParams {
         to: vec![to.to_string()],
         subject: subject.to_string(),
         body: body.to_string(),
         fyi: false,
+        client_key: Some(client_key.to_string()),
         reply_to: None,
+        supersedes: None,
         wait: None,
-    })
-    .map_err(|error| format!("cannot encode the message: {error}"))?;
-    let value = exchange(&mut connect_with(home, SEND_TIMEOUT)?, "msg.send", params)?;
-    let result: cyclops_proto::MsgSendResult = serde_json::from_value(value)
-        .map_err(|error| format!("cyclopsd sent an unreadable send result: {error}"))?;
-    Ok(receipt_line(&result))
+    }) {
+        Ok(params) => params,
+        Err(error) => {
+            return SendOutcome::Rejected(format!("cannot encode the message: {error}"));
+        }
+    };
+    let mut reader = match connect_with(home, SEND_TIMEOUT) {
+        Ok(reader) => reader,
+        Err(error) => return SendOutcome::Rejected(error),
+    };
+    if let Err(error) = write_request(reader.get_mut(), "msg.send", params) {
+        return SendOutcome::Unknown(error);
+    }
+    let value = match read_value(&mut reader, "msg.send") {
+        Ok(value) => value,
+        Err(error) => return SendOutcome::Unknown(error),
+    };
+    let response = match serde_json::from_value::<Response>(value) {
+        Ok(response) => response,
+        Err(error) => {
+            return SendOutcome::Unknown(format!(
+                "cyclopsd sent an unreadable msg.send response: {error}"
+            ));
+        }
+    };
+    if response.id != json!(1) {
+        return SendOutcome::Unknown(
+            "cyclopsd replied to msg.send with the wrong request id".to_string(),
+        );
+    }
+    if let Some(error) = response.error {
+        return SendOutcome::Rejected(error.message);
+    }
+    let Some(value) = response.result else {
+        return SendOutcome::Unknown("cyclopsd omitted the msg.send result".to_string());
+    };
+    let result: cyclops_proto::MsgSendResult = match serde_json::from_value(value) {
+        Ok(result) => result,
+        Err(error) => {
+            return SendOutcome::Unknown(format!(
+                "cyclopsd sent an unreadable send result: {error}"
+            ));
+        }
+    };
+    if result.inserted == Some(false) {
+        SendOutcome::Accepted(format!("already accepted {}", result.msg_id))
+    } else {
+        SendOutcome::Accepted(format!("accepted {}", receipt_line(&result)))
+    }
 }
 
 /// One line for what happened to a send, in the receipt vocabulary.
-///
-/// The badge comes from `cyclops_ui::grid`, the same call `cyclops send`
-/// renders its receipt with, so the composer shows the operator the words
-/// they would have got at the command line. Painted Plain: this lands in a
-/// dialog that styles its own text, and a second set of color codes inside
-/// it would fight the theme.
-///
-/// A send addressed to one label has one delivery, so the first is the
-/// answer. No deliveries at all means the daemon took the message and
-/// attempted nothing, which is a record entry rather than a receipt.
 fn receipt_line(result: &cyclops_proto::MsgSendResult) -> String {
     match result.deliveries.first() {
-        Some(d) => format!(
+        Some(delivery) => format!(
             "{} · {}",
             result.msg_id,
-            cyclops_ui::grid::receipt_badge(d, &cyclops_ui::grid::Plain)
+            cyclops_ui::grid::receipt_badge(delivery, &cyclops_ui::grid::Plain)
         ),
         None => format!("{} · on the record", result.msg_id),
     }
@@ -281,6 +331,100 @@ mod tests {
 
         let response = request(&home, "ping", json!({})).expect("request succeeds");
         assert_eq!(response["pong"], true);
+        server.join().expect("server");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_lost_acceptance_response_retries_to_the_original_message() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-send-idempotent-retry");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("scratch home");
+        let listener = UnixListener::bind(home.join(SOCK_NAME)).expect("listen");
+        let server = std::thread::spawn(move || {
+            let mut accepted_key = None;
+            for attempt in 0..2 {
+                let (stream, _) = listener.accept().expect("accept");
+                let mut reader = BufReader::new(stream);
+                reader
+                    .get_mut()
+                    .write_all(b"{\"cyclops\":\"0.1.0\",\"proto\":1,\"boot_id\":\"b\"}\n")
+                    .expect("hello");
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("request");
+                let request: Value = serde_json::from_str(&line).expect("JSON request");
+                assert_eq!(request["method"], "msg.send");
+                let key = request["params"]["client_key"]
+                    .as_str()
+                    .expect("client key")
+                    .to_string();
+
+                if attempt == 0 {
+                    accepted_key = Some(key);
+                    continue;
+                }
+                assert_eq!(Some(&key), accepted_key.as_ref());
+                reader
+                    .get_mut()
+                    .write_all(
+                        b"{\"id\":1,\"result\":{\"msg_id\":\"m-original\",\"seq\":7,\"deliveries\":[],\"inserted\":false}}\n",
+                    )
+                    .expect("retry response");
+            }
+            accepted_key.expect("first request was accepted")
+        });
+
+        let first = send_message(
+            &home,
+            "reviewer",
+            "ship it",
+            "ship it",
+            "workspace-stable-key",
+        );
+        assert!(matches!(first, SendOutcome::Unknown(_)), "{first:?}");
+        let retry = send_message(
+            &home,
+            "reviewer",
+            "ship it",
+            "ship it",
+            "workspace-stable-key",
+        );
+        assert_eq!(
+            retry,
+            SendOutcome::Accepted("already accepted m-original".to_string())
+        );
+        assert_eq!(server.join().expect("server"), "workspace-stable-key");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_daemon_refusal_is_rejected_not_outcome_unknown() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-send-rejected");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("scratch home");
+        let listener = UnixListener::bind(home.join(SOCK_NAME)).expect("listen");
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream);
+            reader
+                .get_mut()
+                .write_all(b"{\"cyclops\":\"0.1.0\",\"proto\":1,\"boot_id\":\"b\"}\n")
+                .expect("hello");
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("request");
+            reader
+                .get_mut()
+                .write_all(
+                    b"{\"id\":1,\"error\":{\"code\":\"unknown_recipient\",\"message\":\"no such recipient\"}}\n",
+                )
+                .expect("response");
+        });
+
+        let outcome = send_message(&home, "missing", "hello", "hello", "workspace-rejected-key");
+        assert_eq!(
+            outcome,
+            SendOutcome::Rejected("no such recipient".to_string())
+        );
         server.join().expect("server");
         let _ = std::fs::remove_dir_all(home);
     }

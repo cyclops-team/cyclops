@@ -16,6 +16,7 @@ tempfile = "3"
 
 [dependencies]
 cyclops-proto.workspace = true
+cyclops-state.workspace = true
 # The CLI ships the detection manifests as text and seeds them. It reads
 # them for one key: `cyclops start --agents <id>` needs the launch command
 # a manifest names, and the schema has exactly one owner (AGENTS.md).

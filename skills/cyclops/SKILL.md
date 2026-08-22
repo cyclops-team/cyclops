@@ -7,8 +7,9 @@ description: Communicate with other AI agents running in tmux panes via the cycl
 
 Cyclops is the coordination layer for agents already running in tmux. It
 does not run your agent or type on your behalf outside a message you asked
-it to send: it names panes, delivers messages between them with a receipt
-you can trust, and keeps every fact in a ledger you can `jq`.
+it to send: it names panes, durably accepts mailbox messages, writes a
+content-free notification when safe, and keeps append-only facts you can
+inspect.
 
 Everything here is `cyclops <subcommand>`. Confirm the exact flags on your
 machine before relying on a command in this page: `cyclops --help` and
@@ -32,8 +33,8 @@ Find your own name with `cyclops list --json`: the entry whose `pane_id`
 matches `$TMUX_PANE`, if you are inside tmux. The plain roster prints
 labels, not pane ids. If you are running
 without a name, `cyclops name <label> --self` registers you using the pane
-you are sitting in — the form to use for yourself, since it needs no pane
-id lookup. Full detail: [docs/guides/panes.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/panes.md).
+you are sitting in. Use this form for yourself because it needs no pane id
+lookup. Full detail: [docs/guides/panes.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/panes.md).
 
 ## 1. Discover peers and inspect state
 
@@ -47,7 +48,7 @@ $ cyclops list
 ```
 
 (Real output, captured from an isolated demo session. The third column is
-the pane title — on a real Claude/Codex/Cursor pane it is usually the
+the pane title. On a real Claude/Codex/Cursor pane it is usually the
 agent's current task; here it is whatever the demo fixture set.)
 
 Inside tmux, when the daemon watches more than one session, `cyclops
@@ -59,8 +60,15 @@ additive `also_watching` field, and `--all` restores the full dump. Your
 own agents are always in the scoped roster, since it is your session by
 definition.
 
+Run `cyclops list --all` before starting a filtered `cyclops watch`.
+`--with`, `--from`, and `--to` match current display labels. Cyclops refuses
+an unknown active label instead of waiting silently. A rename can invalidate
+a running display filter, so these filters are for human views, not durable
+automation.
+With `watch --json`, use `--kinds`; TUI display filters are refused.
+
 `cyclops status` shows the same roster plus every watched pane nobody has
-named yet (listed by pane id), the tmux version, and the eye — whether
+named yet (listed by pane id), the tmux version, and the eye: whether
 anything needs a human right now:
 
 ```
@@ -78,290 +86,258 @@ A closed eye (`‿`) means nothing needs a human. An open one prints a
 default, the scrollback tail with `--source recent`, capped by `--lines N`.
 
 `cyclops read <agent> --source detection` is the diagnostic view: which
-sensor decided the state, and which rule fired.
+sensor decided the state, which rule fired, and whether the pane is
+write-ready. Those last two are different questions: an agent can be idle
+and still not accept a write, because nothing proved its composer was
+empty just now.
 
 ```
 $ cyclops read reviewer --source detection
-reviewer · ○ idle · decided by always_idle
+reviewer · ○ idle · decided by always_idle · write-ready
 
   title  ○ idle  always_idle  just now
 ```
 
 Add `--raw` to see the pane capture the sensors read, next to the verdict,
-in the same answer — the fastest way to tell "cyclops is wrong" from "the
+in the same answer. This is the fastest way to tell "cyclops is wrong" from "the
 pane is genuinely in that state."
 
 Every command above, and every command below, takes `--json` for scripts
 and honors `--plain`/`NO_COLOR`. See
 [docs/guides/panes.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/panes.md) for naming and the roster, and
 [docs/guides/troubleshooting.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/troubleshooting.md) if a pane
-reads `? unknown` (no manifest matches what is running there — a shell,
+reads `? unknown` (no manifest matches what is running there: a shell,
 not an agent, or a CLI cyclops has not been taught; see
 [docs/reference/MANIFESTS.md](https://github.com/cyclops-team/cyclops/blob/main/docs/reference/MANIFESTS.md)).
 
-## 2. Send a message and verify delivery
+## 2. Send a durable message
 
 ```
 cyclops send <agent> --subject "One line" --body "Details" [--reply-to <id>] [--fyi]
 ```
 
-The receipt is the whole point: it tells you what actually happened, not
-what you hoped happened.
+`send` records one immutable message in each recipient's mailbox and returns
+after durable acceptance. The receipt separates that fact from the one-line
+pane notification:
 
 ```
 $ cyclops send implementer --subject "Run the tests" --body "make test"
-✓ delivered · unverified (screen)
+accepted m-18bfdb
+✓ accepted · wake queued
 ```
 
-(Real output, isolated demo session — `--json` on the same call:)
+(The exact wake state may advance before the receipt is rendered.)
+Examples abbreviate message ids; live ids use `m-` plus 32 lowercase
+hexadecimal UUID digits.
+
+`accepted` proves the durable record and mailbox entry exist. `wake queued`
+means terminal delivery is queued. Neither proves the recipient claimed or
+received the payload, or completed the task. Use `--client-key <key>` when an
+uncertain client call must be retried exactly.
+
+If the connection drops before the response arrives, inspect current state
+first. The request may already be durable. Repeat a send or reply only with the
+same explicit `--client-key`; an unkeyed retry can create a second message.
+
+With the exact shipped claim skill, Cyclops writes one content-free doorbell
+after proving a clean composer:
+
+```text
+cyclops inbox claim m-18bfdb
+```
+
+Claim that message to read its payload. If the exact skill proof is absent,
+outdated, edited, unreadable, or changes before the write, Cyclops instead
+writes the full canonical payload ending in `[cyclops:end <id>]`. That direct
+fallback is recorded as `delivered_direct`, not as a claim, so do not run
+`inbox claim` for a payload already delivered this way.
+
+Both transports are one-shot. If the outcome is ambiguous, attention is
+raised. Never resend or requeue blindly. The full workflow and attention
+commands are in
+[docs/guides/send.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/send.md).
+
+Older full-payload session records may use `delivered_verified` and
+`delivered_unverified`. Current mailbox fallback uses `delivered_direct`; none
+of those states means an authenticated claim occurred.
+
+## 3. List, claim, and reply
+
+The wake line names the exact message. List pending metadata if you need the
+queue:
+
+```console
+$ cyclops inbox list
+m-d7e4ba admin · Review the rate limiter
+```
+
+Claim only that id. This atomically marks the recipient mailbox entry claimed
+and returns the immutable payload:
 
 ```
-$ cyclops send implementer --subject "Run the tests" --body "make test" --json
-{"deliveries":[{"note":"screen_evidence","pane":"%0","state":"delivered_unverified","to":"implementer"}],"msg_id":"m-18bfdb","seq":5}
-```
-
-**Never blur the two evidence tiers.** They are different claims about the
-same word "delivered":
-
-| Badge | `state` | Meaning |
-|---|---|---|
-| `✔ delivered · verified` | `delivered_verified` | The recipient's own hook fired and reported this exact message id. The agent itself confirmed receipt. |
-| `✓ delivered · unverified (screen)` | `delivered_unverified` | No hook, or it was late: cyclops saw the paste leave the composer and the turn start. That is strong evidence, not a confirmation from the agent. |
-
-A late hook can upgrade `delivered_unverified` to `delivered_verified` —
-the only legal transition backwards into more confidence, never less. On a
-fresh install, before hooks are wired, every delivery is screen-tier —
-that is normal, not degraded. Full spec:
-[docs/development/DELIVERY.md](https://github.com/cyclops-team/cyclops/blob/main/docs/development/DELIVERY.md);
-[docs/guides/send.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/send.md) for the rest of the badge
-vocabulary (`queued`, `parked`, `needs attention`) and quota parking.
-
-<!-- F2: capture from a real run — a delivered_verified receipt needs a
-     hook-wired agent CLI (claude/codex/cursor) actually running and firing its
-     ack hook on this message id. Replace with real --json output once
-     the fleet has one, e.g.:
-     $ cyclops send reviewer --subject "..." --json
-     {"deliveries":[{"note":"hook","state":"delivered_verified", ...}]}
--->
-
-Exit codes for `send`: `0` cyclops has the message (delivered, or queued
-behind another one), `1` parked or needs attention (also: daemon
-unreachable), `2` usage error. The line between `0` and `1` is whether
-waiting helps.
-
-## 3. Receive and reply
-
-A message that lands in your pane looks like this (real capture):
-
-```
+$ cyclops inbox claim m-d7e4ba
 [cyclops m-d7e4ba] FROM: admin  SUBJECT: Review the rate limiter
 Please look at retry.rs before the next run.
-Both lines paste as one message.
+Reply: cyclops reply m-d7e4ba --body "..."
 ```
 
-`m-d7e4ba` is the message id. `FROM` is daemon-resolved from who actually
-sent it (the pane, not anything the sender's request claimed), so you can
-trust it, and it is exactly who your reply should go to.
-
-A message from another agent ends in one more line,
-`Reply: cyclops send <name> --subject "..."`. That line omits
-`--reply-to`; add it yourself so your reply chains into the same thread
-instead of starting a new, unlinked message:
+A repeat claim returns the same payload and creates no second task. A claim
+proves retrieval, not completion. Reply using the id so the daemon derives the
+recipient, thread, and subject from the parent:
 
 ```
-$ cyclops send implementer --reply-to m-d7e4ba --subject "Re: Review the rate limiter" --body "Looked at retry.rs. Tests pass."
-✓ delivered · unverified (screen)
+$ cyclops reply m-d7e4ba --body "Looked at retry.rs. Tests pass."
+accepted m-42b817
 ```
 
-A message from `admin` carries no reply line, and that is deliberate:
-`admin` is a human's shell, not an addressable pane, and
-`cyclops send admin ...` fails with
-`⚠ needs attention · no pane for "admin"` (confirmed by running it). An
-earlier build printed the hint anyway, so an agent doing as it was told
-filed a failed delivery and raised attention for it. There is nothing to
-reply to. Do the work and let the record speak (`cyclops history`,
-`cyclops thread <id>`), or use whatever channel you already have with
-that human.
-
-Reading the message back later, as a thread, oldest first (real capture,
-same exchange):
+For a bounded automation step, wait for and claim the oldest pending message
+through the daemon socket:
 
 ```
-$ cyclops thread m-d7e4ba
-  2s  admin → implementer  Review the rate limiter      ✓ delivered · unverified (screen)
-      Please look at retry.rs before the next run.
-      Both lines paste as one message.
-
-  1s  admin → implementer  Re: Review the rate limiter  ✓ delivered · unverified (screen)
-      Looked at retry.rs. Tests pass.
+$ cyclops inbox next --timeout 30s
 ```
 
-`--fyi` messages (announcements) drop the reply-hint line — treat their
-absence of a hint as intentional, not as something to invent a reply to.
-`cyclops history --with <agent>` reconstructs a whole conversation, both
-directions: [docs/guides/history.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/history.md).
+The command subscribes before checking the inbox, claims at most one message,
+and exits `2` if none arrives before the deadline. It never writes to the pane,
+so it still works while the foreground command makes the agent read as
+working. Do not run `cyclops watch` or a polling loop in the foreground while
+waiting for a paste-dependent notification. That foreground tool keeps the
+pane working and can gate the notification it is waiting for. Return to the
+prompt for the normal wake, or use bounded `inbox next` for automation.
 
-## 4. Wait for work
+For one sender, copy the canonical `sender` key from `cyclops inbox list
+--json` and use `inbox next --from <recipient-key>`. Do not pass a display
+label. Exit `1` with `claim_outcome_unknown` means the claim was sent but its
+answer missed the deadline. Inspect the message id before retrying.
 
-`cyclops wait` blocks on an event, never a fixed sleep — use it instead of
+`admin` is a valid durable mailbox address even though no pane may use that
+label. Send to it with `cyclops send admin ...`. Admin gets no pane wake; the
+operator sees the pending count in `cyclops status`. Only an operator caller
+proven outside every watched pane has the `admin` inbox identity; a shell
+inside a watched pane retains that pane's agent identity. `--all` targets
+agent panes only, so address admin explicitly.
+
+`cyclops messages` shows body-free inbox, outbound, and notification state.
+`cyclops history --with <agent>` and `cyclops thread <id>` reconstruct the
+durable conversation.
+
+## 4. Wait for pane activity
+
+`cyclops wait` blocks on an event, never a fixed sleep. Use it instead of
 polling `cyclops status` in a loop.
 
 ```
 cyclops wait <agent> --until idle|done|blocked [--timeout 90s]
 ```
 
-- `idle` — the composer is ready and no turn is running.
-- `done` — the current or next turn ends (working → idle). If the agent is
-  already idle, it must start and finish a turn first.
-- `blocked` — the agent hit a vendor modal, a permission prompt, or quota.
+- `idle` means no turn is running. That is a statement about the turn, not
+  permission to write: whether a notification may be written is the separate
+  write-readiness answer the daemon stamps, which `cyclops read <agent>
+  --source detection` shows beside the state.
+- `done`: a turn runs on the pane and reaches idle. If the agent is already
+  idle, it must start and finish a turn first. This is not correlated to a
+  message or task.
+- `blocked`: the agent hit a vendor modal, a permission prompt, or quota.
 
 Exit codes: `0` reached, `1` daemon unreachable/unknown target, `2`
 timeout, `3` the pane died or changed occupant mid-wait (the wait is
-pinned to the process it started watching, on purpose — it will not
+pinned to the process it started watching, on purpose; it will not
 answer for whoever took over the pane).
 
-The handoff idiom composes send and wait in one call: `--wait` on `send`
-waits only after the delivery itself resolves, so `done` can never be
-satisfied by a turn that predates your message.
+Message completion is a different fact. A claim proves an authenticated
+recipient fetched the payload, not that work finished. Use a reply or an
+explicit operator verdict when a workflow needs durable completion.
+Full detail: [docs/guides/wait.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/wait.md).
 
-```
-$ cyclops send implementer --subject "Run the tests" --wait done --timeout 3s
-✓ delivered · unverified (screen)
-wait: ⚠ wait timed out · still idle
-```
+## 5. Diagnose mailbox and notification state
 
-(Real output — a `cat` demo fixture never starts a turn, so `done` always
-times out here; the point to notice is the exit code.) That command
-exited `0`. **The exit code follows the delivery, not the wait** — a
-message that was delivered and then simply outran its wait budget is
-still success from `send`'s point of view. A script that wants to gate on
-the wait outcome must check it explicitly:
+Start with the body-free durable projection:
 
 ```bash
-cyclops send reviewer --subject "..." --wait done --timeout 10m --json > receipt.json
-jq -e '.wait[0].outcome == "reached"' receipt.json > /dev/null   # this is the line that actually gates
+cyclops messages
+cyclops alarm preview --older-than <age>
+cyclops status
 ```
 
-`outcome` is one of `reached`, `timeout`, `occupant_changed`, or
-`not_delivered` (delivery never got far enough to start a turn — nothing
-to wait for). Full detail: [docs/guides/wait.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/wait.md).
-
-<!-- F2: capture from a real run — a `--wait done` that actually reaches
-     `reached` needs a real agent CLI to run a turn (working -> idle
-     edge); a `cat` fixture is always idle and can never produce one.
-     Replace with real output once the fleet has a live agent, e.g.:
-     $ cyclops wait reviewer --until done --timeout 5m
-     ○ idle · waited <Ns>
--->
-
-## 5. Diagnose a stuck delivery through the ledger
-
-The ledger is the debugger. Every gate decision is a line, and every line
-carries a cause — read it with `jq`, no daemon required:
+`messages` shows each message's mailbox state and each recipient's separate
+wake state. `alarm preview` lists unresolved notification attempts and their
+exact ids. `status` owns pane and legacy-delivery attention plus the admin
+unread count; it is not the mailbox alarm source. If a wake attempt needs
+attention, inspect its exact id before taking an action:
 
 ```bash
-jq -c 'select(.id == "<message-id>")' ~/.cyclops/ledger/<session>.ndjson
+cyclops attention show <attempt-id> --diff
 ```
 
-Real capture, a message that delivered cleanly (`m-d8510b`, default
-session `demo`) — this is the shape to recognize, `kind=msg` once, then
-one `kind=state` line per transition, plus a `kind=gate` line naming the
-rule that admitted it:
+`show` is read-only. `complete` submits the exact staged notification and
+`discard` clears it without submitting, but both are allowed only when all
+five safety checks pass again immediately before the key. An uncertain action
+must not be repeated.
 
+Clear known alarms by explicit id. For an age-selected operator cleanup,
+`cyclops alarm clear --older-than <age>` prints and freezes the previewed ids,
+then requires typing `clear` at a prompt that names the count and cutoff. There
+is no clear-all form. In scripts, preview with `--json` and pass the exact ids
+to `alarm clear`.
+
+The workspace journal remains the final debugger. It is append-only and can be
+read without the daemon. Discover the workspace id from the body-free snapshot
+instead of guessing a directory name:
+
+```bash
+workspace_id=$(cyclops --json messages | jq -r .workspace_id)
+cyclops_home="${CYCLOPS_HOME:-$HOME/.cyclops}"
+jq -c 'select(.id == "<message-id>")' \
+  "$cyclops_home/workspaces/$workspace_id/messages.ndjson"
 ```
-{"seq":7,"id":"m-d8510b","kind":"msg","from":"admin","to":["implementer"],"subject":"Run the tests", ...}
-{"seq":8,"id":"m-d8510b","kind":"state","data":{"from":"queued","to":"implementer","to_state":"gating","cause":null}}
-{"seq":9,"id":"m-d8510b","kind":"gate","data":{"action":"proceed","cause":null,"rule":"always_idle","to":"implementer"}}
-{"seq":10,"id":"m-d8510b","kind":"state","data":{"from":"gating","to":"implementer","to_state":"pasting","cause":null}}
-{"seq":11,"id":"m-d8510b","kind":"state","data":{"from":"pasting","to":"implementer","to_state":"staged","cause":null}}
-{"seq":12,"id":"m-d8510b","kind":"state","data":{"from":"staged","to":"implementer","to_state":"submitted","cause":null}}
-{"seq":13,"id":"m-d8510b","kind":"state","data":{"from":"submitted","to":"implementer","to_state":"delivered_unverified","cause":"screen_evidence"}}
-```
 
-Read the last state line first, then the gate lines above it. A stuck
-delivery is the same shape with the last line further back — held in
-`gating`, or moved to `retry_queued` — and the cause on that line tells
-you where to look next (cause table from
-[docs/development/HANDOFF.md](https://github.com/cyclops-team/cyclops/blob/main/docs/development/HANDOFF.md)):
+`$CYCLOPS_HOME/ledger/<session>.ndjson` is the separate session record for
+pane state and legacy direct delivery, not the mailbox journal.
 
-| Cause | It means | Look at |
-|---|---|---|
-| `no_such_pane`, `pane_dead`, `session_detached` | The target is not there | The pane table: `cyclops status` |
-| `pane_in_mode`, `working`, `idle_with_input`, `blocked:<rule id>`, `blocked_quota` | The gate is holding on purpose | Fusion: is the state right? `cyclops read <agent>` |
-| `no_manifest` | Nothing bound to the pane | The manifest's `process_names` versus what the pane is actually running |
-| `verify_failed` | The paste did not stage | The manifest's `verify_pattern`, and whether the composer is where you think |
-| `pane_rebound` | The occupant changed between admit and inject | Something restarted in that pane. Working as intended |
-
-The rule underneath all of it: **a hold waits on an event, never a
-clock.** "It is stuck" always means "which event never arrived" — and the
-answer is upstream of delivery, in fusion or the pane watcher, not in
-delivery itself. A delivery held past `gate_hold_notify_ms` (default
-120s) pings the admin once so a wedged hold is at least visible.
-
-<!-- F2: capture from a real run — a genuinely stuck chain (held in
-     `gating` on a real `blocked_modal` or ending in `retry_queued` with
-     cause `verify_failed`) needs a live vendor CLI that actually opens a
-     modal or fails to stage; a `cat` fixture never blocks. Replace with
-     a real `jq` transcript once such a case is reproduced, e.g.:
-     {"kind":"gate","data":{"action":"hold","cause":"blocked_modal", ...}}
--->
-
-If the daemon itself is confusing rather than the ledger, `cyclops read
-<agent> --source detection --raw` and `CYCLOPS_LOG=debug cyclopsd`
-(operator-run) are the next layer down:
-[docs/guides/troubleshooting.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/troubleshooting.md).
+If pane readiness is confusing, use `cyclops read <agent> --source detection
+--raw`. Human workflow details live in
+[docs/guides/send.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/send.md).
 
 ## 6. Safety rules you must never work around
 
-These are invariants, not preferences — each one exists because breaking
+These are invariants, not preferences. Each one exists because breaking
 it already did something specific and bad
 ([docs/development/INVARIANTS.md](https://github.com/cyclops-team/cyclops/blob/main/docs/development/INVARIANTS.md) has the full list
 and the proof).
 
-- **Never bypass the delivery gate.** Do not `tmux send-keys` (or paste,
+- **Never bypass the notification gate.** Do not `tmux send-keys` (or paste,
   or otherwise type) directly into another agent's pane to "save time" or
-  route around a hold. The gate exists because a payload can land in a
-  pane whose occupant changed — a shell, not the agent you meant — and a
-  shell **executes** what a composer would have only read. Every message
-  goes through `cyclops send`, with no exceptions, even when it is
-  slower.
+  route around a hold. The selected doorbell or direct payload is admitted only after
+  Cyclops proves the current occupant and a clean composer. Every message
+  goes through `cyclops send`, even when a direct write looks faster.
 - **Never write the pane title.** It is a sensor cyclops (and the agent
   itself) reads to tell working from idle, not a place for your own
   decoration. If you want to announce a name or status, that is
   `cyclops name`, which paints the pane **border** and leaves the title
   alone.
-- **A quota park is terminal.** `blocked_quota` never auto-retries, by
-  design — a retry loop against an exhausted quota burns the reset and
-  can cost money. If a recipient is parked, wait out the reset or send to
-  a different agent; there is no re-queue verb. An operator resends after
-  the quota resets.
+- **Notification ambiguity never auto-retries.** The immutable body remains
+  in the mailbox, and a direct payload may also be staged in the composer.
+  Inspect the exact attempt. An operator may use `cyclops
+  requeue <message-id>` only after resolving the cause and confirming the
+  attempt is eligible.
 - **The ledger appends; it never retracts.** Do not expect a corrected or
-  resolved fact to replace an old line — it lands as a **new** line
+  resolved fact to replace an old line. It lands as a **new** line
   (e.g., an alarm followed later by a clearance). If you are parsing the
   ledger yourself, read forward and let the last line for an id win;
   never assume you can edit or delete one.
 
 ## Read more
 
-- [docs/development/DELIVERY.md](https://github.com/cyclops-team/cyclops/blob/main/docs/development/DELIVERY.md) — the delivery spec:
-  states, evidence tiers, ordering.
-- [docs/reference/MANIFESTS.md](https://github.com/cyclops-team/cyclops/blob/main/docs/reference/MANIFESTS.md) — teaching cyclops a
+- [docs/guides/send.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/send.md), the mailbox, notification, and recovery workflow.
+- [docs/reference/MANIFESTS.md](https://github.com/cyclops-team/cyclops/blob/main/docs/reference/MANIFESTS.md): teaching cyclops a
   new agent CLI (one TOML file, no code) when a pane reads `? unknown`.
-- [docs/guides/troubleshooting.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/troubleshooting.md) — real
+- [docs/guides/troubleshooting.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/troubleshooting.md): real
   output for every common failure, with the fix.
-- [docs/guides/send.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/send.md), [docs/guides/wait.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/wait.md),
+- [docs/guides/wait.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/wait.md),
   [docs/guides/history.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/history.md),
-  [docs/guides/panes.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/panes.md) — one page per verb.
+  [docs/guides/panes.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/panes.md): one page per verb.
 
 Doc links point at the repository on GitHub, so this file works from
-wherever it is installed (`cyclops start --setup-only --wire-hooks`
-copies it into `~/.claude/skills/cyclops/` when Claude Code is present;
-other agents get it copied by hand). The three output blocks
-above marked for F2 are externally blocked, not pending polish: each
-needs a live, hook-wired vendor CLI session (a verified-tier receipt, a
-wait that reaches `done`, a genuinely blocked ledger chain), and no
-isolated fixture can produce one — a fixture pane is always idle, never
-verifies, and never blocks. Every other example in this skill is real
-captured output; those three are annotated placeholders until a real
-session is captured, and the skill should be read as complete-except-
-blocked rather than finished.
+wherever it is installed. `cyclops start --setup-only --wire-hooks` seeds it
+for installed Claude Code, Codex or Cursor, and Antigravity CLI consumers
+without overwriting operator-edited copies.

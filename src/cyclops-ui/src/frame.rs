@@ -37,6 +37,34 @@ const SIDEBAR_MAX_W: usize = 30;
 /// only thing that knows what ended up where, so it is the only thing
 /// that can tell a click what it landed on.
 pub fn build(app: &mut App, width: usize, height: usize) -> Vec<String> {
+    // Remembered so the key handler can ask whether this frame had room
+    // to show what a destructive key targets.
+    app.last_size = (width, height);
+    // The work queue is its own list with its own model. It shares the
+    // frame budget and nothing else, so it renders here and returns
+    // before the stream's walk begins.
+    if app.view == crate::app::View::Messages {
+        let status = messages_status(app);
+        let rows = if app.overlay {
+            messages_help(width, height, status.as_deref())
+        } else {
+            // A detail takes the whole frame. One surface at a time: a
+            // list behind a confirmation is a list somebody can act on
+            // by mistake.
+            match &app.detail {
+                Some(detail) => {
+                    crate::detail::render_with_status(detail, width, height, status.as_deref())
+                }
+                None => {
+                    crate::queue::render_with_status(&app.queue, width, height, status.as_deref())
+                }
+            }
+        };
+        // Messages is keyboard-only. Clicks have no target to resolve.
+        app.row_targets = vec![(RowTarget::Nothing, RowTarget::Nothing); height];
+        app.sidebar_w = 0;
+        return rows;
+    }
     let mut rows = Vec::with_capacity(height);
     let mut targets = vec![(RowTarget::Nothing, RowTarget::Nothing); height];
     let mut sidebar_w = 0usize;
@@ -110,6 +138,55 @@ pub fn build(app: &mut App, width: usize, height: usize) -> Vec<String> {
     rows.push(footer(app));
     app.row_targets = targets;
     app.sidebar_w = sidebar_w;
+    rows
+}
+
+fn messages_status(app: &App) -> Option<String> {
+    match app.refresh.link() {
+        crate::messages::Link::Connecting => Some(match &app.notice {
+            Some(notice) => format!("connecting to cyclops; actions unavailable; {notice}"),
+            None => "connecting to cyclops; actions unavailable".into(),
+        }),
+        crate::messages::Link::Lost => Some(match &app.notice {
+            Some(notice) => {
+                format!("connection lost; R reconnect; {notice}; shown data may be stale")
+            }
+            None => "connection lost; R reconnect; shown data may be stale".into(),
+        }),
+        crate::messages::Link::Connected if !app.refresh.may_mutate() => Some(match &app.notice {
+            Some(notice) => format!(
+                "refreshing messages; actions unavailable; {notice}; shown data may be stale"
+            ),
+            None => "refreshing messages; actions unavailable; shown data may be stale".into(),
+        }),
+        crate::messages::Link::Connected => app.notice.clone(),
+    }
+}
+
+fn messages_help(width: usize, height: usize, status: Option<&str>) -> Vec<String> {
+    let lines = [
+        "Messages keys",
+        "",
+        "  tab    next view",
+        "  s      next scope",
+        "  enter  open selected message",
+        "  up/down or j/k  move selection",
+        "  R      reconnect after connection loss",
+        "  ?      close this help",
+        "  q      quit",
+    ];
+    let content_height = height.saturating_sub(usize::from(status.is_some()));
+    let mut rows: Vec<String> = lines
+        .iter()
+        .take(content_height)
+        .map(|line| crate::queue::fit(line, width))
+        .collect();
+    while rows.len() < content_height {
+        rows.push(crate::queue::fit("", width));
+    }
+    if let Some(status) = status {
+        rows.push(crate::queue::fit(status, width));
+    }
     rows
 }
 
@@ -223,6 +300,9 @@ fn header(app: &App) -> String {
     if let Some(tail) = eye.tail {
         parts.push(tail);
     }
+    if app.admin_unread() > 0 {
+        parts.push(format!("inbox {}", app.admin_unread()));
+    }
     if app.conn_lost {
         parts.push("connection lost".into());
     }
@@ -310,7 +390,7 @@ fn cheatsheet(height: usize) -> Vec<String> {
     let lines = [
         "  keys",
         "",
-        "  tab    admin stream / firehose",
+        "  tab    admin stream / firehose / messages",
         "  a      agents panel · on wide terminals",
         "  w f t  filter with / from / to · enter applies · esc cancels",
         "  enter  jump to the entry's pane",
@@ -337,12 +417,13 @@ fn cheatsheet(height: usize) -> Vec<String> {
 /// named it. Gating this copy on the window alone is what once let the
 /// body say "All calm" under a header saying one needs attention.
 fn empty_state(app: &App) -> String {
-    if app.attention_count() > 0 {
+    if app.attention_count() > 0 || app.admin_unread() > 0 {
         return String::new();
     }
     match app.view {
         View::Admin => "  All calm. tab shows the firehose.".to_string(),
         View::Firehose => "  Nothing yet. Events land here as they arrive.".to_string(),
+        View::Messages => "  No messages.".to_string(),
     }
 }
 
@@ -526,6 +607,7 @@ mod tests {
             id: Some("e-1".into()),
             kind: EntryKind::State {
                 target: "reviewer".into(),
+                session_idx: 0,
                 pane_id: Some("%1".into()),
                 state: AgentState::BlockedPermission,
             },
@@ -580,6 +662,7 @@ mod tests {
             id: Some("e-2".into()),
             kind: EntryKind::State {
                 target: "reviewer".into(),
+                session_idx: 0,
                 pane_id: Some("%1".into()),
                 state: AgentState::Idle,
             },
@@ -684,6 +767,18 @@ mod tests {
         a.view = View::Firehose;
         let got = build(&mut a, 80, 8);
         assert_eq!(got[2], "  Nothing yet. Events land here as they arrive.");
+    }
+
+    #[test]
+    fn unread_admin_messages_are_visible_without_stream_rows() {
+        let mut app = App::new(Theme::none(), View::Admin, Filter::default());
+        app.seed_status(crate::stream::StatusSeed {
+            admin_unread: 2,
+            ..Default::default()
+        });
+        let rows = build(&mut app, 80, 8);
+        assert!(rows[0].contains("inbox 2"), "{:?}", rows[0]);
+        assert!(!rows.iter().any(|row| row.contains("All calm")));
     }
 
     /// The band exists to get a hidden line back, so it has to name the

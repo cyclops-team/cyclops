@@ -10,15 +10,15 @@ what is on disk. It collapses out of the way with `Ctrl+B` `b` or with
 the `◂` chevron on its outer edge, leaving a one-column rail whose `▸`
 chevron brings it back. The collapse and the tab bar's visibility both
 persist, so the workspace reopens the way you left it.
-With no tmux server running (or no sessions on it), it starts one — a
+With no tmux server running (or no sessions on it), it starts one: a
 fresh session named `main` with a single shell pane in the directory you
 ran it from. Its first tab is `1`; automatic tab names continue with `2`,
 `3`, and so on. No preset or manual `tmux new` required; `cyclops start`
 remains the front door for preset-built workspaces.
 
 It starts cyclopsd too, when none is answering. Everything the workspace
-shows about an agent — the detected name, the status glyph, the pane
-chrome — comes from the daemon, so a workspace without one is a workspace
+shows about an agent, including the detected name, status glyph, and pane
+chrome, comes from the daemon, so a workspace without one is a workspace
 where nothing is ever detected and no state ever changes. The sidebar says
 `cyclopsd offline` for as long as that is true.
 
@@ -84,8 +84,8 @@ is no folder prompt.
 
 A workspace created this way keeps following its folder afterward: `cd` in
 its pane and the workspace's name updates to match the new directory, sanitized
-and de-duplicated the same way creation is. Renaming a workspace by hand —
-`Ctrl+B` `W` or the right-click menu — hands the name back to you permanently;
+and de-duplicated the same way creation is. Renaming a workspace by hand with
+`Ctrl+B` `W` or the right-click menu hands the name back to you permanently;
 Cyclops never renames it out from under you again. Pre-existing sessions the
 TUI didn't create, such as the default `main` session, never start following
 a folder in the first place.
@@ -121,24 +121,24 @@ detection diagnostics. Every other state maps to one of four glyphs:
 
 | Glyph | Meaning |
 |-------|---------|
-| `○`   | idle — no turn is running, including when the composer holds text |
-| `●`   | working — a turn is running |
-| `⚠`   | needs attention — the daemon's attention register has an open item for this pane |
-| `✕`   | dead — the pane's process exited |
+| `○`   | idle: no turn is running, including when the composer holds text |
+| `●`   | working: a turn is running |
+| `⚠`   | needs attention: the daemon's attention register has an open item for this pane |
+| `✕`   | dead: the pane's process exited |
 
 Composer text remains `idle_with_input` internally. Delivery still holds
 rather than overwriting it; only the compact workspace presentation says idle.
 
 Sidebar rows and inactive pane borders are compact surfaces: they show the
 bare glyph, with no word alongside it and no word substituted when one
-doesn't fit — the glyph alone is the encoding there. The focused pane's
+doesn't fit: the glyph alone is the encoding there. The focused pane's
 border pairs the glyph with its word, for example `⚠ needs attention`, when
 there is room for both; dialogs and the event stream always have that
-room — a narrow sidebar wraps a stream row rather than dropping its word.
+room: a narrow sidebar wraps a stream row rather than dropping its word.
 The glyph itself never changes meaning: it renders identically under every
 theme and under `NO_COLOR`, so only the surrounding color, never the glyph,
 depends on color. Cyclops never writes the pane title to show any of
-this—the title remains a sensor. See [panes.md](panes.md) for naming and
+this, the title remains a sensor. See [panes.md](panes.md) for naming and
 identity rules.
 
 Cyclops paints every cell your terminal gives it, and also asks the
@@ -192,8 +192,8 @@ closed panel leaves no rule to grab.
 The panel is two browsers behind one header. The agent browser follows
 the focused agent: switch panes or let the agent `cd` and within a second
 the panel is looking at its working directory. The pinned browser stays
-wherever you last put it — a downloads folder, a spec directory — and
-remembers that across launches (`files_pinned_root` in `config.toml`,
+wherever you last put it, such as a downloads folder or spec directory,
+and remembers that across launches (`files_pinned_root` in `config.toml`,
 written when you browse the pinned view). The chip at the header's right
 end flips between them and is named for the view it switches to: `[pin]`
 while you are following the agent, `[agent]` while you are pinned. A file
@@ -334,7 +334,7 @@ selects a line.
 A selection is anchored to the text, not to screen rows: scroll after
 selecting and the highlight moves with its lines, leaves the screen with
 them, and comes back when they do, and the copy is always what was
-highlighted. Scrolling mid-drag grows the selection past one screen — the
+highlighted. Scrolling mid-drag grows the selection past one screen: the
 viewport moves and the selection's live end follows the pointer.
 
 A copy says what it took, where the border has room for the phrase. A
@@ -366,9 +366,9 @@ in the pane as delete-word-back, and on macOS `Cmd+Backspace` arrives as
 kill-to-line-start. `Cmd+A` arms the GUI gesture it starts everywhere
 else: the delete pressed next clears the pane's whole input line, and any
 other key forgets the arm and passes through untouched. All three chords
-need a terminal that speaks the kitty keyboard protocol — legacy
+need a terminal that speaks the kitty keyboard protocol: legacy
 encodings deliver Ctrl+Backspace as a plain backspace and Cmd chords not
-at all — so the workspace requests it and degrades silently where it is
+at all: so the workspace requests it and degrades silently where it is
 not spoken.
 
 Workspace preferences and rebindings live in the shared `config.toml`. A

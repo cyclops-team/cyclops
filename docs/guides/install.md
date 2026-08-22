@@ -4,7 +4,7 @@
 
 - macOS or Linux
 - tmux 3.2 or newer (`tmux -V`)
-- Rust toolchain (`cargo`), recent stable (1.85+) — Cyclops builds from
+- Rust toolchain (`cargo`), recent stable (1.85+): Cyclops builds from
   source, so this is a hard requirement, not a contributor extra
 - curl and Git (for the one-line source install)
 
@@ -37,7 +37,7 @@ It never uses sudo.
 The build step dominates the install time: an optimized compile of the
 two binaries and their dependencies, a few minutes on a fast machine and
 noticeably longer on older or low-power hardware. The installer builds
-the `dist` profile — release optimizations without the link-time
+the `dist` profile: release optimizations without the link-time
 optimization pass, which would add minutes for runtime margin this tool
 does not need. That cost returns on `cyclops update`, which rebuilds the
 same way. Prebuilt binaries are not published yet.
@@ -160,21 +160,51 @@ writes the same files on its way to opening a workspace, so a machine that
 has run either one is set up.
 
 The installer passes one more flag, `--wire-hooks`, which extends setup
-into the agent CLIs installed on the machine: it wires ack hooks for the
-vendors that read them from a file, and it places the agent skill for
-Claude Code at `~/.claude/skills/cyclops/SKILL.md` so agents there know
-the cyclops verbs without being taught by hand. Both steps run only for
-CLIs whose directory already exists, never overwrite a file you edited,
-and are skipped entirely when `CYCLOPS_NO_VENDOR_HOOKS` is set.
+into the agent CLIs installed on the machine. It wires Cyclops hooks for
+the vendors that read them from a file, and it places the Cyclops skill at
+the canonical destination for each installed consumer:
+
+- Claude Code: `~/.claude/skills/cyclops/SKILL.md`
+- Codex and Cursor: `~/.agents/skills/cyclops/SKILL.md`
+- Antigravity CLI: `~/.gemini/antigravity-cli/skills/cyclops/SKILL.md`
+
+Codex and Cursor share one copy. Codex is installed when `$CODEX_HOME`, or
+`~/.codex` when unset, exists; Cursor is installed when `~/.cursor` exists.
+The shared destination alone does not trigger either consumer. Claude Code
+requires `~/.claude`, and Antigravity CLI requires
+`~/.gemini/antigravity-cli`. Setup creates no home for an absent
+consumer and never seeds duplicate skill locations. It keeps current
+and edited copies unchanged, and upgrades an unedited copy from a known
+Cyclops release. The entire wiring step is skipped when
+`CYCLOPS_NO_VENDOR_HOOKS` is set.
 
 That consent outlives the run that gave it. `--wire-hooks` records it at
 `~/.cyclops/vendor-wiring-consented`, and every later `cyclops` or
 `cyclops start` finishes the wiring for an agent CLI that was not there
-yet — install cyclops before Claude Code and the skill still lands on
-the first start after Claude Code arrives, with a line saying what was
-placed. A boot that finds nothing new writes nothing and says nothing.
+yet. Install Cyclops before an agent CLI and its skill still lands on the
+first start after that CLI arrives, with a line saying what was placed.
+A boot that finds nothing new writes nothing and says nothing.
 Delete the marker file to withdraw the consent; `CYCLOPS_NO_VENDOR_HOOKS`
 declines the step for one run without deleting anything.
+
+Inspect the setup without changing it:
+
+```
+$ cyclops setup check
+```
+
+The check reports all four shipped manifests plus each supported consumer's
+install state, hook wiring, required receipt tier, observed acknowledgment
+capability, and canonical skill destination. Claude, Codex, and Cursor require
+tier 1; AGY requires tier 2. An installed tier-1 consumer whose acknowledgment
+cannot match a payload is incomplete rather than silently relabeled tier 2.
+Its `mailbox` line predicts the terminal
+transport from the same exact-skill check the daemon uses: `doorbell` or
+`direct payload`. An operator-edited skill is preserved, but cannot prove the
+claim contract and therefore selects direct fallback. It exits 0 when setup is
+complete for the installed consumers and 1 when setup needs repair. Add
+`--json` for a stable machine-readable report. The check reads setup state
+only. Use `cyclops start --setup-only --wire-hooks` to install or repair it.
 
 The long way, by hand. Create `~/.cyclops/config.toml`:
 
@@ -242,26 +272,27 @@ in `~/.cyclops/manifests` on the same paths (`start` and bare `cyclops`),
 because without them every pane reads unknown and nothing can be
 delivered. With no theme files at all, cyclops renders in built-in colors.
 
-The tuning knobs, defaults shown:
+Notification-worker and legacy direct-delivery tuning, with defaults shown:
 
 ```toml
-ack_timeout_ms = 1500        # tier-1 hook ACK window per delivery
-delivery_retry_max = 1       # retries only when no payload bytes reached the pane
-receipt_block_ms = 2500      # receipt cap on the idle send path
-gate_hold_notify_ms = 120000 # one admin ping when a delivery is held this long
+ack_timeout_ms = 1500        # hook ACK window after a notification or legacy test write
+delivery_retry_max = 1       # retries only when no notification or legacy payload bytes reached the pane
+receipt_block_ms = 2500      # legacy direct-delivery receipt cap
+gate_hold_notify_ms = 120000 # one admin ping when a worker is held this long
 ```
 
-Keep `receipt_block_ms` under 5000. The CLI gives a socket read five seconds
-before it calls the connection lost, so a longer receipt budget means
-`cyclops send` reports a lost connection over a delivery that is going fine.
-The delivery itself still completes and the record still shows it.
+These settings do not delay standard `cyclops send` acceptance. Standard send
+returns after the durable mailbox write and reports the current one-line wake
+state. Keep `receipt_block_ms` under 5000 for legacy direct-delivery operations:
+the CLI gives a socket read five seconds before it calls the connection lost.
 
-`delivery_retry_max` applies only to failures proven before the pane write:
-detach or missing manifest before paste, a pre-paste occupant rebind, and a
-spool/load-buffer failure. A paste, verification, submit, post-paste rebind,
-or ACK timeout may have reached the pane, so it ends in `attention_required`
-with an exact cause and is never re-pasted automatically. Inspect before
-resending.
+`delivery_retry_max` applies only to failures proven before a notification or
+legacy payload write: detach or missing manifest, a pre-write occupant rebind,
+and a spool or load-buffer failure. Verification, submit, post-write rebind,
+or ACK failure may follow bytes that reached the pane, so the attempt ends in
+`attention_required` with an exact cause and is never written again
+automatically. Inspect before taking a recovery action. The durable mailbox
+message remains available for an exact claim throughout.
 
 Unknown keys warn and are ignored. The file is data; nothing in it executes.
 
@@ -318,7 +349,7 @@ cyclops daemon stop     # your tmux panes and the record are untouched
 ```
 
 There is no `daemon start`: `cyclops start` is that, and so is bare
-`cyclops` — both start one when none answers, so whichever way you open a
+`cyclops`: both start one when none answers, so whichever way you open a
 workspace there is a daemon watching it. To run the daemon under your own
 supervisor instead, `cyclops start --no-daemon` leaves it alone.
 
@@ -332,8 +363,9 @@ is never modified by watching it.
 
 ## Wire the hooks
 
-Hooks turn receipts from screen-verified into hook-verified and give the
-daemon instant turn edges:
+Hooks give the daemon authenticated turn edges for state detection and safe
+one-line notification. The self-test separately reports whether a legacy
+direct-delivery acknowledgement hook fired:
 
 ```bash
 cyclops hooks install claude --agent reviewer   # renders config + prints wiring
@@ -455,19 +487,19 @@ the freshly installed one answering `--version` for itself. Then the
 daemon is restarted for you when that is safe unattended: it is asked to
 quiesce first (`daemon.quiesce`), and a restart only proceeds when no
 message is between the paste and a resolved delivery anywhere. Messages
-that have not reached a pane ride through — the rebooted daemon requeues
+that have not reached a pane ride through. The rebooted daemon requeues
 them. Your open workspace is a different matter: it is your screen, so
 it is never touched, and one dim line says how to bring it over.
 
-Once, on the update that first installs this: the daemon still running
+On the first update that installs this behavior, the daemon still running
 is the build being replaced, so it does not know the restart handshake
 and says so. That crossing is a plain `cyclops daemon stop` followed by
-`cyclops` — the printed steps say exactly that, because
+`cyclops`. The printed steps say exactly that because
 `cyclops daemon restart` would ask the same old daemon the same question.
 Every update after it restarts on its own.
 
 A fleet that stays mid-flight refuses the restart and prints the manual
-steps instead — the same three you can take any time:
+steps instead. These are the same three you can take any time:
 
 ```
 Restart:
@@ -480,7 +512,7 @@ Reopening with `cyclops` (or any `cyclops start`) also repairs the
 prepared hook configs under `~/.cyclops/hooks/`: any that still invoke a
 cyclops path that no longer exists are re-rendered for the new build and
 a note says how many. The receipt recorded beside each artifact is how
-start tells its own writing from yours — a file you edited, or one with
+start tells its own writing from yours: a file you edited, or one with
 no receipt, is named and left alone. A copy you already merged into
 vendor config is out of reach the same way; the note names it so the
 hooks that would otherwise fail silently point somewhere you can fix.
@@ -504,5 +536,8 @@ curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
 ```
 
 If you also want to delete all Cyclops configuration and records, stop the
-daemon, copy out any history you want to keep from `~/.cyclops/ledger/`,
-then remove `~/.cyclops` yourself.
+daemon and copy out any history you want to keep before removing
+`~/.cyclops`. Canonical mailbox journals are under
+`~/.cyclops/workspaces/<workspace-id>/messages.ndjson`; session state and
+legacy direct-delivery records are under `~/.cyclops/ledger/`. Copy the whole
+Cyclops home if you need both.

@@ -2,7 +2,8 @@
 # Derived from MEASURED evidence in validation/raw/p0 and validation/raw/soak.
 # Verified against Claude Code 2.1.220 running inside tmux 3.6a, 120x40 pane;
 # re-verified on 2.1.221 (live rig, 2026-08-06); composer byte shapes
-# re-measured on 2.1.222 (F55 ghost probe, 2026-08-13, 140x40 pane).
+# re-measured on 2.1.222 (F55 ghost probe, 2026-08-13, 140x40 pane);
+# composer extraction and clear action re-measured on 2.1.239 (2026-08-21).
 # On 2.1.221 the idle title is
 # "✳ <conversation summary>" and the pre-OSC title is the tmux hostname
 # seed; the ^ anchors cover both, do not tighten them to fixed strings.
@@ -34,6 +35,9 @@ argv_basenames = ["claude"]
 # pane's own hook config is appended at start time from [hooks].settings_flag
 # below, so a pane started this way is already reporting.
 launch = "claude"
+
+[messaging]
+mailbox_capability_file = "~/.claude/skills/cyclops/SKILL.md"
 
 [hooks]
 # Configured via --settings <file>; the file may be generated per pane so the
@@ -96,6 +100,24 @@ a live title tier: title_working_spinner (1100) outranking it is what keeps
 the fused verdict right while the model works."""
 evidence = "MEASURED claude_idle_composer.txt; matches mid-turn on 2.1.221"
 
+# The active-turn status row. MEASURED live on 2.1.236: while a tool task
+# runs, Claude keeps the idle sparkle in the title AND keeps the composer
+# prompt on screen, so title and screen both read idle and a delivery
+# could be admitted into a pane mid-generation. The row that separates the
+# two states is this one, and only in the escaped capture: an active step
+# paints its glyph and gerund in 38;5;215 with a running timer in
+# 38;5;246 right after. Completed steps in the transcript render with a
+# solid glyph in uniform 38;5;246 or 38;5;231 and never combine the two,
+# which is why this is style-bound rather than a text match on the verb:
+# finished rows keep their words forever.
+[[rule]]
+id = "composer_working_spinner_status"
+state = "working"
+priority = 1150
+region = "bottom_non_empty_lines(10)"
+line_regex_esc = ['\x1b\[38;5;215m[·✶✽✳✢✻]\x1b\[39m\s+\x1b\[38;5;215m[A-Z][a-z]+…\s+\x1b\[38;5;246m\(\d+[smhd]']
+evidence = "MEASURED live capture on Claude Code 2.1.236 (2026-08-20): active frames 'ESC[38;5;215m· ESC[39m ESC[38;5;215mKneading… ESC[38;5;246m(28m 7s · 30.3k tokens)' and the same shape for Jitterbugging; completed steps render uniform gray or white"
+
 [[rule]]
 id = "composer_has_staged_input"
 state = "idle_with_input"
@@ -128,16 +150,36 @@ state = "idle"
 priority = 1040
 region = "bottom_non_empty_lines(6)"
 line_regex = ['^\s*❯\s+\S']
-line_regex_esc = ['❯\x{a0}(?:\x1b\[[0-9;]*m)+\S']
-note = """Text after the composer glyph that arrives styled is a suggestion
-the product painted, not something a human staged: real input follows the
-NBSP unstyled (F55, and the codex/cursor ghost probes measured the same
-convention as ESC[2m). Idle on purpose, so a pane showing only a suggestion
-delivers instead of holding forever on input nobody typed. Sits between
-composer_has_staged_input (1050), which already refuses this line via its
-esc clause, and title_idle_sparkle (1000), so the diagnostic names the
-ghost instead of the title having to answer for it."""
+line_regex_esc = ['❯\x{a0}\x1b\[2m\S']
+note = """A suggestion the product painted, not something a human staged.
+Matches the DIM convention only (ESC[2m), never "any styling": a typed
+slash command renders styled too (ESC[38;5;153m on 2.1.232), and treating
+all styling as ghost read a human's half-typed /model as idle and pasted
+over it. That is the destructive direction of the F55 fix, so this clause
+is deliberately narrow: an unrecognized styling falls through to
+composer_styled_input below and HOLDS. A ghost we fail to recognize costs
+a delivery that waits; a draft we fail to recognize costs the human's
+work. Sits between composer_has_staged_input (1050), which refuses this
+line via its esc clause, and composer_styled_input (1035)."""
 evidence = "MEASURED F55: real input is unstyled after the NBSP; ghost styling per the F19 codex/cursor probes, not yet captured live on Claude"
+
+[[rule]]
+id = "composer_styled_input"
+state = "idle_with_input"
+priority = 1035
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^\s*❯\s+\S']
+line_regex_esc = ['\x1b\[39m❯\x{a0}\x1b\[']
+note = """Composer content that is styled but not the dim ghost above.
+MEASURED on 2.1.232: a typed slash command renders
+'ESC[39m❯<NBSP>ESC[38;5;153m/model', which the staged-input clause cannot
+see (it requires a non-ESC byte after the NBSP) and the ghost clause must
+not claim. Without this rule that screen read idle and the gate pasted
+into the human's draft and submitted it.
+
+This is the fail-safe floor for the composer: anything styled that is not
+provably a ghost is treated as a human's text and held."""
+evidence = "MEASURED 2026-08-20 (issue 16, Claude Code 2.1.232): typed '/model' renders ESC[39m + glyph + NBSP + ESC[38;5;153m, while real ghost styling is dim ESC[2m"
 
 [[rule]]
 id = "screen_working"
@@ -207,6 +249,10 @@ auto_dismiss = false
 # MEASURED: 4 KB / 80 lines arrives as one collapsed block, zero premature submits.
 method = "load-buffer + paste-buffer -p"
 submit = "Enter"
+# MEASURED 2026-08-21, Claude Code 2.1.239: one C-c clears the
+# whole raw multiline composer and a 92-line collapsed paste chip without
+# submitting or exiting. C-e C-u cleared only the final logical line.
+clear_keys = ["C-c"]
 verify_before_submit = true
 verify_pattern = ["<message_id>", "Pasted text"]
 safe_states = ["idle"]
@@ -216,3 +262,38 @@ busy_note = """MEASURED: text pasted while a turn is running stages in the compo
 and is submitted as its own separate turn once the current turn ends. It is not
 merged into the running turn and is not lost. Gating on idle is therefore a
 correctness nicety for ordering, not a loss-prevention necessity, on this CLI."""
+# MEASURED (fixtures claude_idle_2_1_221.txt, claude_pasted_chip_plain.txt):
+# below the composer Claude renders a box rule, a model status row, and
+# optional hint/mode rows. None of it is payload, so the terminal sentinel
+# may be followed by these and still be the last payload token.
+# MEASURED (fixtures claude_typed_composer_esc.txt, claude_pasted_chip_esc.txt):
+# the rows below the composer arrive in this order, and each is painted by
+# the product, so each carries an SGR prefix a pasted human line never has.
+# The two lists are one layout: entry i is row i, plain and escaped.
+# MEASURED 2026-08-22 at 60, 80, 100, and 125 columns: a long status
+# row keeps the model and effort fields, then ends one later field with ….
+composer_trailer_regex = [
+  '^─+$',
+  '^\s{0,4}(?:\S[^·]*(?: · [^·]+){3,} · \d+K window(?: · \d+K used)?|(?:Opus|Sonnet|Haiku) \d+(?:\.\d+)?(?: \([^·]*\))? · (?:xhigh|high|medium|low)(?: · [^·]+)* · [^·]*…)\s*$',
+  '^\s{0,4}paste again to expand\s*$',
+  '^\s{0,4}(?:⏸|⏵⏵) [^·]*\b(?:on|off)\b(?: · .+| \(.+\))?\s*$',
+]
+composer_trailer_regex_esc = [
+  '^\x1b\[38;5;244m─',
+  '^\x1b\[39m\s+\x1b\[38;5;\d+m\S',
+  '^\s*\x1b\[38;5;\d+mpaste again to expand',
+  '^(?:\x1b\[[0-9;:]*m)*\s+\x1b\[38;5;\d+m(?:⏸|⏵⏵)',
+]
+# The first 2 rows are painted every time; the rest are optional.
+composer_trailer_required_prefix = 2
+# The collapsed-paste chip, as a whole composer row. MEASURED (fixture
+# claude_pasted_chip_esc.txt): the composer glyph, then the chip painted
+# in 38;5;6. Matching the row rather than the word "Pasted" is the point:
+# a message whose subject contained that word used to verify a paste
+# whose sentinel had never arrived.
+composer_chip_regex = ['^\s*❯\s+\[Pasted text #\d+( \+\d+ lines)?\]\s*$']
+composer_chip_regex_esc = ['\x1b\[39m❯\x{a0}\[Pasted text #\d+( \+\d+ lines)?\]']
+# capture-pane -J joins tmux physical wraps. These patterns remove only
+# Claude's measured prompt and continuation chrome from the logical rows.
+composer_prompt_regex = '^❯(?: |\x{a0})(?P<content>.*)$'
+composer_continuation_regex = '^  (?P<content>.*)$'

@@ -15,7 +15,7 @@ use cyclops_proto::{AgentState, Sensor, SensorReading, StateReportParams, WireEr
 use serde_json::{json, Value};
 use tracing::debug;
 
-use crate::{delivery, fusion, unix_ms, Inner};
+use crate::{delivery, fusion, turnkey, unix_ms, Inner, PaneKey};
 
 /// Dedupe memory per agent; old keys roll off.
 const SEEN_CAP: usize = 256;
@@ -112,15 +112,33 @@ impl AckState {
 /// Vendor event names differ in casing conventions; comparisons happen on
 /// this normalized form ("UserPromptSubmit" == "user_prompt_submit").
 pub(crate) fn normalize_event(event: &str) -> String {
-    event
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect::<String>()
-        .to_ascii_lowercase()
+    // One normalizer, shared with the parser. Two copies of this would be
+    // two definitions of "the same event", and the parser's refusals
+    // would stop matching the runtime's comparisons.
+    cyclops_manifest::normalize_event(event)
 }
 
-/// (session_id, turn_id) from a vendor payload, tolerant of the three
-/// observed key spellings. Both must be present for amendment-d dedupe.
+/// The rules this report was AUTHENTICATED under.
+///
+/// Never a fresh bind: re-deriving here would let an operator's pin, or a
+/// stale watcher command, reinterpret an authenticated report under
+/// another vendor's rules. The server proved which agent this is, and
+/// these are the rules it proved it under.
+fn manifest_of<'a>(
+    inner: &'a Inner,
+    origin: &crate::server::ReportOrigin,
+) -> Option<&'a cyclops_manifest::Manifest> {
+    origin
+        .manifest
+        .as_deref()
+        .and_then(|id| inner.manifests.get(id))
+}
+
+/// (session_id, turn_id) from a vendor payload, tolerant of the observed
+/// key spellings. The fallback route, for vendors that declare no turn
+/// fields: it stringifies and joins, so it cannot tell the number 7 from
+/// the string "7". That is acceptable only where the alternative is no
+/// dedupe at all.
 fn dedupe_ids(payload: &Value) -> Option<(String, String)> {
     let get = |keys: &[&str]| -> Option<String> {
         keys.iter().find_map(|k| {
@@ -147,79 +165,158 @@ fn dedupe_ids(payload: &Value) -> Option<(String, String)> {
 pub(crate) async fn handle_report(
     inner: &Arc<Inner>,
     params: StateReportParams,
+    origin: crate::server::ReportOrigin,
 ) -> Result<Value, WireError> {
     let event = normalize_event(&params.event);
 
-    let (row, watcher, session_idx) = match inner.resolve_recipient(&params.agent) {
-        Some((idx, pane_id)) => {
-            let Some(watcher) = inner.watcher_of(idx) else {
-                // resolve_recipient only answers from live watchers; a
-                // detach between the two calls lands on the fallback.
-                return Ok(json!({"applied": false, "reason": "session_detached"}));
-            };
-            let Some(row) = watcher.pane(&pane_id) else {
-                return Ok(json!({"applied": false, "reason": "no_such_pane"}));
-            };
-            (row, Some(watcher), idx)
-        }
-        None => match inner.resolve_recipient_last_known(&params.agent) {
-            Some((idx, row)) => (row, None, idx),
-            None => {
-                debug!(agent = %params.agent, "state report for unknown agent dropped");
-                return Ok(json!({"applied": false, "reason": "unknown_agent"}));
-            }
-        },
+    // The origin was resolved from the socket peer during verification,
+    // and it is what everything below uses. Re-resolving the request's own
+    // name here would reopen the window it was verified to close: a pane
+    // can change hands between the two lookups, and the second one would
+    // answer for whoever holds it now.
+    let recipient = origin.recipient.clone();
+    let pane_id = origin.pane_id.clone();
+    let session_idx = origin.session_idx;
+    let Some((row, watcher)) = crate::server::report_route_row(inner, &origin) else {
+        debug!(agent = %recipient, "state report for stale exact route dropped");
+        return Ok(json!({"applied": false, "reason": "occupant_changed"}));
     };
-    let pane_id = row.pane_id.clone();
+    let pane = PaneKey::new(session_idx, &pane_id);
+    // A report the daemon could not attribute to a process is not a
+    // report about anyone: refused first, so an unplaceable origin is
+    // never reported as somebody else having taken the pane.
+    if origin.agent.pid == 0 {
+        return Ok(json!({"applied": false, "reason": "unattributable_origin"}));
+    }
+    // The pane must still be held by the same agent process AND still be
+    // read by the same rules. A pid alone is not the binding: a manifest
+    // pin or a config change can reinterpret an old hook under new
+    // semantics without the process ever changing. Exact equality, with
+    // no zero-pid escape hatch, because "we could not tell" is not "it
+    // matches".
+    //
+    // Both halves come from the same place the origin did: the agent
+    // instance proven from the process tree, never the pane's pin and
+    // never whoever currently holds the tty.
+    let admitted = fusion::admitted_vendor(inner, session_idx, &row);
+    if admitted.as_ref().map(|(_, proc)| *proc) != Some(origin.agent) {
+        return Ok(json!({"applied": false, "reason": "occupant_changed"}));
+    }
+    if admitted.map(|(m, _)| m.agent.id.clone()) != origin.manifest {
+        return Ok(json!({"applied": false, "reason": "manifest_changed"}));
+    }
 
     // Hook liveness (amendment c): any report that resolves to a pane
     // proves its hook config is loaded and firing. Recorded before dedupe
     // on purpose: a duplicate is still a live edge. Keyed by the occupant
     // pid so a restarted occupant never inherits its predecessor's edges.
+
+    // Dedupe windows belong to an occupant, not to a name: a label can
+    // move between panes and a pane can change hands, and either would
+    // otherwise let one process inherit another's counter.
+    // The FULL identity, birth included. A dedupe window is a claim
+    // about one process's counter, and a reused pid would otherwise
+    // inherit its predecessor's window: the replacement's very first
+    // report would be discarded as a duplicate of a report it never sent.
+    // The manifest belongs in the namespace too. A process identity
+    // survives an in-place exec, which this project explicitly supports
+    // (a vendor launcher execs itself), so the same pid and birth can
+    // change from one vendor's rules to another's. Without the manifest,
+    // the new vendor's first report inherits its predecessor's sequence
+    // and turn-key windows and can be discarded as a duplicate of
+    // something it never sent.
+    let dedupe_ns = format!(
+        "{}#{}.{}@{}",
+        origin.recipient_key,
+        origin.agent.pid,
+        origin.agent.birth,
+        origin.manifest.as_deref().unwrap_or("-")
+    );
+
+    // One timestamp for this edge, taken once, so nothing downstream
+    // re-reads a clock or a mutable slot that may already hold a later
+    // edge.
+    //
+    // This edge arrived, whatever else is wrong with it. Wiring liveness
+    // is recorded before anything can refuse the report, because it
+    // answers a different question from the rest of this function: are
+    // this pane's hooks wired and firing at all. A payload that names no
+    // turn still proves that much, and it is the ONLY thing such a
+    // payload is allowed to change.
+    let edge_ms = unix_ms();
     inner
         .hook_liveness
-        .record(&pane_id, &params.event, unix_ms(), row.pane_pid);
+        .record(&pane, &params.event, edge_ms, origin.agent);
+
+    // Only the events that make up a turn have to name one. Turn fields
+    // describe the turn lifecycle, not every hook a vendor emits: a
+    // SessionStart or a tool-use edge legitimately carries no turn id,
+    // and demanding one would refuse valid reports.
+    let lifecycle_event = manifest_of(inner, &origin).is_some_and(|m| {
+        [&m.hooks.turn_start, &m.hooks.turn_end, &m.hooks.ack]
+            .iter()
+            .filter_map(|n| n.as_deref())
+            .any(|n| normalize_event(n) == event)
+    });
+    // Correlation before any window is touched. A malformed lifecycle
+    // event is refused, and a refusal has to leave nothing behind:
+    // consuming its sequence number would make the next VALID event
+    // carrying that number look like a repost, so one bad payload could
+    // swallow a real turn edge.
+    let correlation = lifecycle_event
+        .then(|| manifest_of(inner, &origin).map(|m| turnkey::correlate(m, &params.payload)))
+        .flatten();
+    if let Some(turnkey::TurnCorrelation::Invalid(why)) = correlation {
+        debug!(pane = %pane_id, why, "lifecycle event names no turn; refused");
+        return Ok(json!({"applied": false, "reason": "unnameable_turn"}));
+    }
 
     // Dedupe: exact repost (same reporter seq), then cross-config
-    // duplicates on (session_id, turn_id, event) (amendment d).
+    // duplicates on the turn this event names plus the event itself.
     if let Some(seq) = params.seq {
-        if inner.ack_state.seen_seq(&params.agent, seq) {
+        if inner.ack_state.seen_seq(&dedupe_ns, seq) {
             return Ok(json!({"applied": false, "duplicate": true}));
         }
     }
-    if let Some((s, t)) = dedupe_ids(&params.payload) {
-        let key = format!("{s}|{t}|{event}");
-        if inner.ack_state.seen_key(&params.agent, key.as_str()) {
+    // A vendor that names its turns is deduped over those typed values.
+    // The legacy route stringifies each scalar and joins with a bar, so
+    // it cannot tell the number 7 from the string "7", nor `["x|y", "z"]`
+    // from `["x", "y|z"]`. That is acceptable only where the alternative
+    // is no dedupe at all.
+    let dupe_key = match &correlation {
+        Some(turnkey::TurnCorrelation::Exact(turn)) => Some(turn.dedupe_key(&event)),
+        _ => dedupe_ids(&params.payload).map(|(s, t)| format!("{s}|{t}|{event}")),
+    };
+    if let Some(key) = dupe_key {
+        if inner.ack_state.seen_key(&dedupe_ns, key.as_str()) {
             return Ok(json!({"applied": false, "duplicate": true}));
         }
     }
 
-    let manifest = fusion::bind_manifest_for(inner, &row);
+    let manifest = manifest_of(inner, &origin);
 
     // ACK matching: the manifest hooks.ack event whose ack_payload_field
-    // contains a waiting delivery's message id.
-    let mut matched = false;
-    if let Some(m) = manifest {
-        let is_ack = m
-            .hooks
-            .ack
+    // Fusion first, ACK second, and the order is load-bearing. Resolving
+    // an ACK can complete a delivery, which wakes the next one for this
+    // recipient, and that delivery gates on the fused state this very
+    // reading feeds. Store the reading afterwards and the woken delivery
+    // reads a pane that has not yet been told a turn started.
+    //
+    // The reading carries the binding it came from for the same reason
+    // the ACK does: a hook is a fact about one occupant under one set of
+    // rules, and fusion drops it when the pane no longer matches.
+    let is_turn_start = manifest.is_some_and(|m| {
+        m.hooks
+            .turn_start
             .as_deref()
-            .is_some_and(|a| normalize_event(a) == event);
-        if is_ack {
-            if let Some(field) = &m.hooks.ack_payload_field {
-                if let Some(text) = params.payload.get(field).and_then(Value::as_str) {
-                    for handle in delivery::ack_candidates(inner, &pane_id) {
-                        if text.contains(&handle.msg_id) {
-                            matched |= delivery::resolve_hook_ack(inner, &handle);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Fusion: a hook edge is a sensor reading. Only the turn-boundary
-    // events map to states; everything else is a reconcile trigger.
+            .is_some_and(|n| normalize_event(n) == event)
+    });
+    let is_turn_end = manifest.is_some_and(|m| {
+        m.hooks
+            .turn_end
+            .as_deref()
+            .is_some_and(|n| normalize_event(n) == event)
+    });
     let mapped = manifest.and_then(|m| {
         let is =
             |name: &Option<String>| name.as_deref().is_some_and(|n| normalize_event(n) == event);
@@ -231,21 +328,123 @@ pub(crate) async fn handle_report(
             None
         }
     });
+    // A turn END is lifecycle evidence, stored where the runtime sensor's
+    // eviction rules cannot reach it and matched by the turn it names
+    // rather than by when it arrived. The composer hold may not consume
+    // it for seconds, and a vendor still painting its working row when
+    // the end arrives would otherwise have the record erased for
+    // disagreeing with the screen three times running.
+    //
+    // The correlation is the one computed above, not a second call: two
+    // reads of a payload invite drift between them. A vendor that names
+    // no turns stores nothing, because its lifecycle is the screen, and a
+    // malformed one never reaches here at all.
+    if is_turn_end {
+        if let (Some(turnkey::TurnCorrelation::Exact(turn)), Some(id)) =
+            (&correlation, origin.manifest.as_deref())
+        {
+            turnkey::PaneEnds::record(
+                &mut inner.turn_ends.lock().expect("turn ends lock"),
+                &pane,
+                origin.agent,
+                id,
+                turn.clone(),
+            );
+        }
+    }
+    // A START for a turn this pane has ALREADY seen the end of is not a
+    // turn running. Hook reports arrive out of order, and a delayed start
+    // that published `working` would leave the runtime saying so with no
+    // later event to correct it: the turn is over, so nothing else is
+    // coming. The hold would then wait forever on a clean composer it can
+    // never be released against.
+    //
+    // Publishing nothing rather than `idle`: a stale start says nothing
+    // about what the pane is doing NOW, and asserting idle would be a
+    // second wrong answer. The end already stored is what releases the
+    // hold, through the recompute below.
+    let mapped = match (mapped, &correlation) {
+        (Some(AgentState::Working), Some(turnkey::TurnCorrelation::Exact(turn))) => {
+            let ended = origin.manifest.as_deref().is_some_and(|id| {
+                turnkey::PaneEnds::holds(
+                    &inner.turn_ends.lock().expect("turn ends lock"),
+                    &pane,
+                    origin.agent,
+                    id,
+                    turn,
+                )
+            });
+            (!ended).then_some(AgentState::Working)
+        }
+        (m, _) => m,
+    };
     if let Some(state) = mapped {
         inner
             .hook_readings
             .lock()
             .expect("hook readings lock")
             .insert(
-                pane_id.clone(),
-                fusion::HookEntry::new(SensorReading {
-                    sensor: Sensor::Hook,
-                    state,
-                    rule: params.event.clone(),
-                    ts: unix_ms(),
-                }),
+                pane.clone(),
+                fusion::HookEntry::bound(
+                    origin.agent,
+                    origin.manifest.clone(),
+                    SensorReading {
+                        sensor: Sensor::Hook,
+                        state,
+                        rule: params.event.clone(),
+                        ts: edge_ms,
+                    },
+                ),
             );
     }
+    if is_turn_start {
+        if let Some(turnkey::TurnCorrelation::Exact(turn)) = &correlation {
+            crate::composer_recovery::bind_post_recovery_turn(
+                inner,
+                origin.session_idx,
+                &pane_id,
+                turn.clone(),
+                edge_ms,
+            );
+        }
+    }
+    // Resolve any waiting delivery whose own payload framing owns this
+    // prompt. Not any prompt that mentions its id: see `prompt_names`.
+    let mut matched = false;
+    if let Some(m) = manifest {
+        let is_ack = m
+            .hooks
+            .ack
+            .as_deref()
+            .is_some_and(|a| normalize_event(a) == event);
+        if is_ack {
+            if let Some(field) = &m.hooks.ack_payload_field {
+                if let Some(text) = params.payload.get(field).and_then(Value::as_str) {
+                    for handle in delivery::ack_candidates(inner, session_idx, &pane_id) {
+                        if handle.claims_prompt(text) {
+                            // The turn the vendor named in THIS payload,
+                            // correlated once above. A delivery whose
+                            // acknowledgement names its turn binds to it
+                            // and leaves the screen lifecycle behind.
+                            let turn = match &correlation {
+                                Some(turnkey::TurnCorrelation::Exact(turn)) => Some(turn.clone()),
+                                _ => None,
+                            };
+                            matched |= delivery::resolve_hook_ack(
+                                inner,
+                                &handle,
+                                origin.agent,
+                                &m.agent.id,
+                                edge_ms,
+                                turn,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Reconcile on the edge; the recompute emits the state event and the
     // ledger line if the fused verdict moved. Detached sessions have no
     // sensors to reconcile; the stored reading waits for reattach.

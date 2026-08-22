@@ -30,7 +30,7 @@ async fn selftest_verifies_with_simulated_hook_edge() {
     let mut rig = Rig::new(
         "sthook",
         HOOK_MANIFEST,
-        "cat",
+        &composer_pane(),
         "receipt_block_ms = 300\nack_timeout_ms = 1500\n",
     )
     .await;
@@ -85,7 +85,17 @@ async fn selftest_verifies_with_simulated_hook_edge() {
                     "agent": "hooky",
                     "event": "UserPromptSubmit",
                     "seq": 1,
-                    "payload": {"prompt": format!("{SELFTEST_SUBJECT} {msg_id} Reply not needed.")},
+                    // The exact payload: a hook acknowledgement verifies
+                    // the bytes this delivery sent, or nothing. The
+                    // self-test sends as `cyclopsd` with fyi set, so
+                    // there is no reply hint.
+                    "payload": {"prompt": cyclopsd::render_payload(
+                        &msg_id,
+                        "cyclopsd",
+                        SELFTEST_SUBJECT,
+                        "Reply not needed.",
+                        true,
+                    )},
                 }))
                 .unwrap(),
             )
@@ -144,7 +154,7 @@ async fn f1_zero_edge_tier1_downgrades_notifies_once_and_loses_nothing() {
     let mut rig = Rig::new(
         "f1",
         HOOK_MANIFEST,
-        "cat",
+        &composer_pane(),
         "receipt_block_ms = 2500\nack_timeout_ms = 300\n",
     )
     .await;
@@ -236,7 +246,7 @@ async fn forged_report_over_the_socket_is_denied_and_ingests_nothing() {
     let mut rig = Rig::new(
         "forge",
         HOOK_MANIFEST,
-        "cat",
+        &composer_pane(),
         "receipt_block_ms = 100\nack_timeout_ms = 1200\n",
     )
     .await;
@@ -319,7 +329,7 @@ async fn forged_report_over_the_socket_is_denied_and_ingests_nothing() {
 /// F1 downgrade notification for the NEW occupant instead of hiding behind
 /// the old one's edges.
 #[tokio::test(flavor = "multi_thread")]
-async fn occupant_swap_invalidates_liveness_and_renews_the_f1_ping() {
+async fn occupant_swap_requires_fresh_adoption_and_renews_the_f1_ping() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -327,7 +337,7 @@ async fn occupant_swap_invalidates_liveness_and_renews_the_f1_ping() {
     let mut rig = Rig::new(
         "occf1",
         HOOK_MANIFEST,
-        "cat",
+        &composer_pane(),
         "receipt_block_ms = 2500\nack_timeout_ms = 300\n",
     )
     .await;
@@ -354,24 +364,65 @@ async fn occupant_swap_invalidates_liveness_and_renews_the_f1_ping() {
     let status = rig.ctl.request("status", json!({})).await;
     assert_eq!(status_pane(&status)["hooks_verified"], true, "{status}");
 
-    // Occupant swap: same command, new process. The watcher's pane_pid
-    // updates on the subscription tick; hooks_verified must revert as soon
-    // as it does, because the edges belong to the dead occupant.
-    rig.tmux.run_ok(&["respawn-pane", "-k", "-t", &pane, "cat"]);
+    // Occupant swap: same command, new process. Exact adoption is bound to
+    // the former process instance, so the replacement first becomes
+    // unadopted and carries no hook verdict.
+    rig.tmux
+        .run_ok(&["respawn-pane", "-k", "-t", &pane, &composer_pane()]);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let status = rig.ctl.request("status", json!({})).await;
-        if status_pane(&status)["hooks_verified"] == false {
+        let pane_status = status_pane(&status);
+        if pane_status["agent"].is_null() && pane_status["hooks_verified"].is_null() {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "hooks_verified never reverted after the occupant swap: {status}"
+            "the replacement inherited its predecessor's adoption: {status}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Tier-1 delivery to the hook-less new occupant: screen downgrade plus
+    // Re-adopting the replacement restores the label but not the old
+    // process's hook proof. This hookless occupant must get its own F1
+    // notification after the delivery below.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let response = rig
+            .ctl
+            .request("pane.label", json!({"target": pane, "label": "hooky"}))
+            .await;
+        if response["result"]["label"] == "hooky" {
+            break;
+        }
+        assert_eq!(response["error"]["code"], "no_such_target", "{response}");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("changed during adoption")),
+            "{response}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the replacement route never stabilized: {response}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = rig.ctl.request("status", json!({})).await;
+        let pane_status = status_pane(&status);
+        if pane_status["agent"] == "hooky" && pane_status["hooks_verified"] == false {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the replacement did not acquire a fresh hook verdict: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Tier-1 delivery to the hookless new occupant: screen downgrade plus
     // the F1 notification, which the old occupant's edges used to suppress.
     let (result, _) = rig
         .send(json!({"to": ["hooky"], "subject": "after swap", "body": "b"}))
@@ -407,7 +458,7 @@ async fn screen_tier_pane_reports_tier2_and_no_verified_bit() {
     // CAT_MANIFEST declares no hooks at all: hooks_verified stays absent
     // (configuration cannot be unverified when nothing is configured) and
     // verify reports the screen tier with no events.
-    let mut rig = Rig::new("t2", CAT_MANIFEST, "cat", "").await;
+    let mut rig = Rig::new("t2", CAT_MANIFEST, &composer_pane(), "").await;
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "screeny").await;
 

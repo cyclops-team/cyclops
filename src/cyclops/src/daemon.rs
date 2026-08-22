@@ -20,13 +20,13 @@
 //! 3. Never outlive its own output. Logs go to a file under the home, so
 //!    a detached daemon is not writing onto somebody's terminal.
 
-use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::client::{Client, ClientError};
+use cyclops_state::StateRoot;
 
 /// How long to wait for a spawned daemon to answer its socket. Boot is
 /// milliseconds; this is the margin for a loaded machine.
@@ -77,16 +77,8 @@ pub fn ensure_running(home: &Path) -> Result<Started, String> {
     // 3. The log is opened before the spawn so a failure to open it is
     //    this function's error rather than a daemon that starts with
     //    nowhere to write.
-    std::fs::create_dir_all(home).map_err(|e| format!("create {}: {e}", home.display()))?;
     let log = log_path(home);
-    let out = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)
-        .map_err(|e| format!("open {}: {e}", log.display()))?;
-    let errs = out
-        .try_clone()
-        .map_err(|e| format!("open {}: {e}", log.display()))?;
+    let (out, errs) = open_log_files(home)?;
 
     let mut cmd = Command::new(&exe);
     cmd.stdin(Stdio::null()).stdout(out).stderr(errs);
@@ -123,6 +115,20 @@ pub fn ensure_running(home: &Path) -> Result<Started, String> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Open both daemon output handles through the validated state root.
+fn open_log_files(home: &Path) -> Result<(std::fs::File, std::fs::File), String> {
+    let state_root = StateRoot::open_or_create(home)
+        .map_err(|e| format!("open state root {}: {e}", home.display()))?;
+    let log = log_path(home);
+    let out = state_root
+        .open_append(Path::new("cyclopsd.log"))
+        .map_err(|e| format!("open {}: {e}", log.display()))?;
+    let errs = state_root
+        .open_append(Path::new("cyclopsd.log"))
+        .map_err(|e| format!("open {}: {e}", log.display()))?;
+    Ok((out.into_file(), errs.into_file()))
 }
 
 /// The message for a daemon that exited during boot.
@@ -255,7 +261,9 @@ pub fn restart(home: &Path) -> Result<u32, RestartRefusal> {
     ) {
         Ok(c) => c,
         Err(ClientError::NotRunning) => {
-            return Err(RestartRefusal::Failed("cyclopsd is not running.".to_string()))
+            return Err(RestartRefusal::Failed(
+                "cyclopsd is not running.".to_string(),
+            ))
         }
         Err(e) => return Err(RestartRefusal::Failed(crate::copy::client_error(&e, None))),
     };
@@ -352,4 +360,34 @@ pub fn stop() -> Result<u32, String> {
         }
     }
     Ok(pid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn daemon_log_handles_are_owner_only_and_append() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-daemon-log-state");
+        let _ = std::fs::remove_dir_all(&home);
+        let (mut out, mut errs) = open_log_files(&home).unwrap();
+
+        out.write_all(b"out\n").unwrap();
+        errs.write_all(b"err\n").unwrap();
+        drop((out, errs));
+
+        let log = log_path(&home);
+        assert_eq!(std::fs::read(&log).unwrap(), b"out\nerr\n");
+        assert_eq!(
+            std::fs::metadata(&home).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }

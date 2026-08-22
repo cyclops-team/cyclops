@@ -1,11 +1,10 @@
 //! cyclops-ui: the live stream behind `cyclops ui`.
 //!
-//! Two views of one record: the admin stream (only what is aimed at the
-//! human plus the states that need one) and the firehose (everything),
-//! one keypress apart. Data comes from the daemon's events.subscribe push
-//! plus a one-time ledger tail for backfill; all IO lives on its own
-//! tasks feeding one channel, so the event loop never blocks on the
-//! daemon and a keypress never waits on IO.
+//! Three views share one terminal: the admin stream (only what is aimed at
+//! the human plus states that need one), the firehose (everything), and
+//! Messages (the durable mailbox and notification queue). Data comes from
+//! daemon pushes plus whole snapshots; IO runs on separate tasks feeding
+//! one channel, so the event loop never blocks on the daemon.
 //!
 //! The terminal layer is hand-rolled (termios raw mode plus ANSI frames,
 //! see term.rs): the build environment is offline and carries no TUI
@@ -24,7 +23,7 @@
 //!
 //! [`Record`] is the backend-neutral event-stream model: entry
 //! normalization, backfill/live ordering ([`Intake`]), resolution rows,
-//! the calm/firehose decision, and stable row identity — everything a
+//! the calm/firehose decision, and stable row identity: everything a
 //! renderer needs and nothing about how one paints. `cyclops watch`
 //! (app.rs, frame.rs, entry.rs, plain.rs) is its first renderer; a
 //! workspace sidebar's Stream tab reading the same daemon answer through the same
@@ -37,26 +36,38 @@
 //!   accepts and asks it for the count.
 //! - Any color value. Every paint names a `cyclops-theme` token, and the
 //!   state-to-group mapping is that crate's too.
-//! - The daemon. It reads `events.subscribe` and one `status`, asks
-//!   nothing else, and jumps focus through `cyclops_tmux::focus_pane`,
-//!   which is the only tmux call anywhere near it.
+//! - The daemon. It reads `events.subscribe`, one `status`, and whole
+//!   `messages.snapshot` answers after content-free change edges. Focus
+//!   jumps through `cyclops_tmux::focus_pane`, which is the only tmux call
+//!   anywhere near it.
 
+pub mod action_io;
 mod app;
 mod data;
+pub mod detail;
 mod entry;
 mod frame;
 pub mod grid;
 mod input;
+pub mod messages;
 mod plain;
+pub mod queue;
 mod stream;
 mod term;
 mod theme;
 
+pub use action_io::{perform, ActionOutcome, ActionRequest, RequestKind, RequestToken};
 pub use app::{App, Command, Density, RosterRow, RowTarget, View};
 pub use cyclops_proto::{Attention, AttentionItem, Eye, PaneSnapshot};
 pub use data::{read_backfill, UiMsg};
+pub use detail::{Action, Back, Check, Detail, Draft, Loaded, Request, Stage, ThreadEntry};
 pub use frame::build;
 pub use input::Key;
+pub use messages::{rows_from_snapshot, Link, RefreshGate, RefreshRequest};
+pub use queue::{
+    Counts, Direction, FrozenTarget, HumanQueue, MailboxWord, QueueRow, QueueTarget, Scope,
+    Snapshot, WakeWord,
+};
 pub use stream::{
     Backfilled, Entry, EntryKind, Filter, Intake, PingDelivery, Record, RosterSeed, StatusSeed,
 };
@@ -151,7 +162,7 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
     let mut app = App::new(Theme::detect(), view, opts.filter());
 
     let (tx, mut rx) = unbounded_channel();
-    data::spawn_io(&tx, home, opts.backfill);
+    let io = data::spawn_io(&tx, home, opts.backfill);
     // Keys ride the same channel as data, decoded off-thread.
     let (key_tx, mut key_rx) = unbounded_channel();
     input::spawn_reader(key_tx);
@@ -207,6 +218,9 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
                     quit = true;
                     break;
                 }
+                if std::mem::take(&mut app.reconnect_owed) {
+                    data::spawn_subscribe(&tx, home);
+                }
                 n += 1;
                 if n >= BATCH {
                     break;
@@ -216,6 +230,24 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
         }
         if quit {
             break;
+        }
+        // One fetch per batch at most, and only when something said the
+        // state moved. The gate refuses while a fetch is in flight, so a
+        // burst of edges costs one follow-up rather than one read each.
+        if let Some(request) = app.wants_messages() {
+            if io.refresh.send(request).is_err() {
+                break;
+            }
+        }
+        // One detail read or action at a time, off the frame path. A
+        // confirmed action goes first: the reader is waiting on it.
+        // Both takers mark the request in flight and hand back the token
+        // its answer must carry.
+        let next = app.take_pending().or_else(|| app.take_detail_read());
+        if let Some(sent) = next {
+            if io.action.send(sent).is_err() {
+                break;
+            }
         }
         // A theme edit, or a `cyclops theme <name>`, applies on this
         // render. A reload the engine refused (a file half-written, a
@@ -257,6 +289,9 @@ fn handle(
     match msg {
         UiMsg::Key(k) => match app.handle_key(k) {
             Some(Command::Quit) => return true,
+            // The loop spawns it; `reconnect_owed` carries the request
+            // out to where a task can be started.
+            Some(Command::Reconnect) => {}
             Some(Command::Focus(pane)) => {
                 // The jump runs off-loop; a slow tmux answer can never
                 // hold a frame or a keypress.
@@ -295,7 +330,30 @@ fn handle(
                 seed_status(app, *seed);
             }
         }
-        UiMsg::ConnLost(_) => app.conn_lost = true,
+        // The acknowledgement closes the startup race: only now may the
+        // snapshot socket open, because later changes cannot be missed.
+        UiMsg::Subscribed => {
+            app.conn_lost = false;
+            app.refresh.connected();
+        }
+        UiMsg::ConnLost(why) => {
+            app.conn_lost = true;
+            app.refresh.disconnected();
+            app.notice = Some(why);
+        }
+        UiMsg::MessagesChanged(changed) => app.refresh.messages_changed(&changed),
+        UiMsg::MessagesRouteChanged => app.refresh.mark_dirty(),
+        UiMsg::Messages { request, snapshot } => {
+            app.apply_messages_response(request, &snapshot);
+        }
+        // The last good snapshot stays on screen. Replacing it with
+        // nothing would read as an empty mailbox.
+        UiMsg::MessagesFailed { request, why } => {
+            if app.refresh.finish_failure(request) {
+                app.notice = Some(format!("messages unavailable: {why}"));
+            }
+        }
+        UiMsg::ActionDone { token, outcome } => app.apply_action(token, *outcome),
         UiMsg::Notice(n) => app.notice = Some(n),
         UiMsg::EyeTick => *tick_armed = false,
         // Nothing to apply: waking the loop is the whole message, and the
@@ -365,6 +423,7 @@ mod tests {
             id: Some("e-1".into()),
             kind: EntryKind::State {
                 target: "reviewer".into(),
+                session_idx: 0,
                 pane_id: Some("%1".into()),
                 state: cyclops_proto::AgentState::BlockedPermission,
             },
@@ -379,5 +438,67 @@ mod tests {
         assert!(rows[0].contains("1 needs attention"), "{:?}", rows[0]);
         assert!(rows[2].contains("⚠ blocked_permission"), "{:?}", rows[2]);
         assert!(rows.last().unwrap().contains("? keys"));
+    }
+
+    #[test]
+    fn a_snapshot_failure_keeps_the_last_good_queue_and_posts_one_notice() {
+        let mut app = App::new(Theme::none(), View::Messages, Filter::default());
+        app.queue.replace(Snapshot {
+            watermark: 17,
+            rows: Vec::new(),
+        });
+        let mut intake = Intake::new();
+        let mut tick_armed = false;
+        let (tx, _rx) = unbounded_channel();
+
+        assert!(!handle(
+            &mut app,
+            &mut intake,
+            &mut tick_armed,
+            &tx,
+            UiMsg::Subscribed,
+        ));
+        let request = app.wants_messages().unwrap();
+        assert!(!handle(
+            &mut app,
+            &mut intake,
+            &mut tick_armed,
+            &tx,
+            UiMsg::MessagesFailed {
+                request,
+                why: "socket closed".into(),
+            },
+        ));
+
+        assert_eq!(app.queue.watermark(), 17);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("messages unavailable: socket closed")
+        );
+        assert_eq!(app.refresh.link(), crate::messages::Link::Lost);
+        assert!(!app.refresh.is_fetching());
+    }
+
+    #[test]
+    fn an_initial_connection_failure_is_visible_and_retryable() {
+        let mut app = App::new(Theme::none(), View::Messages, Filter::default());
+        let mut intake = Intake::new();
+        let mut tick_armed = false;
+        let (tx, _rx) = unbounded_channel();
+
+        assert!(!handle(
+            &mut app,
+            &mut intake,
+            &mut tick_armed,
+            &tx,
+            UiMsg::ConnLost("daemon socket unavailable".into()),
+        ));
+
+        assert_eq!(app.refresh.link(), crate::messages::Link::Lost);
+        assert_eq!(app.notice.as_deref(), Some("daemon socket unavailable"));
+        let frame = build(&mut app, 80, 24).join("\n");
+        assert!(frame.contains("R reconnect"), "{frame}");
+        assert!(frame.contains("daemon socket unavailable"), "{frame}");
+        assert_eq!(app.handle_key(Key::Char('R')), Some(Command::Reconnect));
     }
 }

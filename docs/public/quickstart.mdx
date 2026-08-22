@@ -28,12 +28,12 @@ is applied. Use `cyclops start` (see below) when you want a named shipped
 layout instead.
 
 From here, start the coding agents you already use in the workspace's
-panes and talk to them the way you'd talk to a teammate — "send this to
+panes and talk to them the way you'd talk to a teammate: "send this to
 reviewer and ask for a review." The agent carries out the handoff through
 the `cyclops` CLI underneath, and the workspace shows the receipt. Steps 3
-through 6 below walk that same CLI layer command by command — useful when
-you want to drive a handoff yourself or see exactly what an agent's
-request produced. They assume the named `implementer` pane that the
+through 6 below walk that same CLI layer command by command. Use them when
+you want to drive a handoff yourself or see exactly what an agent's request
+produced. They assume the named `implementer` pane that the
 preset-built workspace below creates.
 
 **Want that named-pane layout from the start, or a specific arrangement
@@ -79,9 +79,10 @@ cyclops name %1 reviewer
 cyclops send implementer --subject "Summarize the README" --body "Call out the setup steps and test commands."
 ```
 
-The receipt says whether the agent's own hook verified the delivery or
-Cyclops confirmed it from screen evidence. Messages and their final delivery
-states remain available through `cyclops history`.
+The receipt confirms durable acceptance and reports the current one-line wake
+state. The recipient lists pending metadata, claims the exact message id, and
+then reads the body. Use `cyclops messages` for body-free mailbox and wake
+state, and `cyclops history` for the durable conversation.
 
 ## 6. Watch the work
 
@@ -89,8 +90,10 @@ states remain available through `cyclops history`.
 cyclops watch
 ```
 
-`cyclops watch` opens the live event stream. A bare `cyclops` opens the
-full-screen workspace with the sidebar, tabs, and live pane canvases.
+`cyclops watch` opens the full-screen admin stream. Tab cycles through the
+firehose and the body-free Messages work queue. In Messages, `s` changes
+scope, Enter opens the selected row, and `?` shows the view's keys. A bare
+`cyclops` opens the workspace with the sidebar, tabs, and live pane canvases.
 
 ## Next steps
 

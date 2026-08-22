@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-08-06. Cyclops is pre-release software at version `0.1.0`.
+Updated 2026-08-22. Cyclops is pre-release software at version `0.1.0`.
 The Rust implementation on `main` is the current product; the shell/Python
 implementation remains available as the read-only `v1` branch and
 `v1-final` tag.
@@ -11,11 +11,18 @@ implementation remains available as the read-only `v1` branch and
   manifest and hook signals into agent state, and persists an append-only
   NDJSON ledger.
 - The CLI starts workspaces, names panes, reports state, sends messages,
-  waits for completion, reads history and threads, manages hooks and themes,
+  waits on occupant-pinned pane state, reads history and threads, manages hooks and themes,
   and saves or restores workspace layouts.
 - Message delivery has per-recipient ordering, gate decisions, occupant
   checks, verified or screen-inferred receipts, retry limits, and ledgered
   causes.
+- Durable workspace mailboxes accept messages before any terminal write,
+  expose body-free inbox and notification state, require an exact claim for
+  payload access, preserve reply routing across label changes, and provide an
+  authenticated administrator inbox.
+- Notification recovery is append-only and operator explicit. Eligible
+  messages can be requeued, and alarms can be cleared by exact id or through
+  an age preview whose exact id set is confirmed before mutation.
 - Bare `cyclops` opens the full-screen workspace, seeding the shipped
   themes on the way in. It provides a workspace sidebar, tabs, embedded
   pane terminals, split controls, pane swapping by keyboard or drag,
@@ -58,13 +65,16 @@ with `./tests/e2e/parity-check.sh --with-installer`, and builds and checks the
 website. An advisory job also tests against tmux built from its current
 development branch.
 
-The parity walk currently contains 115 checks, or 131 when installer checks
-are included. Test counts are intentionally not pinned here because they
-change whenever coverage grows.
+The parity walk currently contains 123 checks before the optional installer
+exercise. Test counts are intentionally not pinned here because they change
+whenever coverage grows.
 
 ## Known limits
 
-- Quota-parked deliveries have no requeue verb by design.
+- A quota-held mailbox notification never retries automatically. After fresh
+  screen evidence records that quota has reset, the workspace administrator
+  must run `cyclops requeue <message-id>`. Legacy direct-delivery quota parks
+  remain terminal and require a fresh send.
 - `cyclops start` cannot distinguish two otherwise identical live layouts
   until at least one pane has a Cyclops name.
 - Pipe orchestration and automatic attention routing are not built. There is
@@ -82,13 +92,19 @@ change whenever coverage grows.
   records the rename), and `config.toml`'s `sessions` list is not rewritten,
   so a restarted daemon waits on the old name until something re-registers
   the new one.
-- Agent activity status in the roster / workspace chrome is unreliable for
-  some CLIs: Codex is confirmed wrong (idle ↔ working), and Cursor Agent has
-  been seen showing `working` while the human is only typing in the composer
-  (should be idle / idle_with_input). Earlier notes also reported Claude
-  Code stuck on `? unknown`; revalidate on the current build. This is a
-  detection / fusion gap, not a delivery bug. Messaging reliability work and
-  the 2026-08-07 live-testing bugfixes did not address it. Tracked in
+- Agent activity detection remains version-specific and conservative. Unknown
+  chrome or a vendor version without sufficient current evidence holds terminal
+  writes instead of guessing. The 2026-08-22 evidence snapshot is:
+
+  | Vendor | Shipped full-ruleset fixture | Newer live evidence | Remaining gap |
+  | --- | --- | --- | --- |
+  | Claude Code | 2.1.221 | 2.1.239 composer extraction, clearing, and stage-and-clear soak | Current idle, working, staged, modal, and quota matrix |
+  | Codex CLI | 0.147.0 | 0.149.0 composer extraction, clearing, title spinner, and stage-and-clear soak | Current full matrix and live hook payload capture |
+  | Antigravity CLI | 1.1.11 | 1.1.18 stage-and-clear soak | Current full matrix and exact composer recovery evidence |
+  | Cursor Agent CLI | 2026.07.23-e383d2b | No installed binary on the evidence host | Installed current binary, full matrix, and paired start and end hook payloads |
+
+  The soak proves staging verification and cleanup only. It does not promote a
+  whole manifest to the newer version. Detection gaps remain tracked in
   [issue #7](https://github.com/cyclops-team/cyclops/issues/7).
 
 For the repository map and design boundaries, read

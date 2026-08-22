@@ -1,8 +1,14 @@
 # History
 
-Read the record. Every message ever sent is a line in an append-only
-ledger; `history` and `thread` query it. Reading is free: any agent may
-query the whole record, and reading never writes.
+Read the authenticated message view. `history` and `thread` merge the
+authoritative workspace journal with pre-upgrade session records without
+rewriting either source.
+
+The workspace administrator can inspect all message metadata. An agent sees
+only messages it sent or received. A body is visible only to its sender or the
+recipient that claimed that exact message. Pre-upgrade session records have no
+durable participant identity, so only the administrator retains that
+compatibility view.
 
 ## Basics
 
@@ -16,29 +22,27 @@ cyclops history --limit 10
 
 `--with` reconstructs a conversation: both directions, plus broadcasts
 that included the agent. `--from`/`--to` filter one direction each.
-`me` resolves to whoever is asking: a pane's label inside a watched pane,
-`admin` from any other shell. Pick one shape per query: `--with`, or
-`--from`/`--to`.
+`me` resolves from the authenticated caller. A process under a watched pane
+root is that pane's durable identity. A same-user process proven outside every
+watched pane is `admin`; unprovable ancestry is denied. Pick one filter shape:
+`--with`, or `--from` and `--to`.
 
 Recipients are recorded under their canonical name, the pane's label
 (pane id when unlabeled), however the sender addressed them: a send to
 `%3` of the pane labeled `reviewer` is recorded to `reviewer`, so
 `--with reviewer` finds it.
 
-Each line shows when, who to whom, the subject, and the delivery's current
-badge (the same voice as send receipts, see [send.md](send.md)). Under 24
-hours the gutter is relative ("42s", "3h 12m"); older lines show the date.
-Announcements carry a distinct `fyi` mark. A broadcast is one line with one
-badge per recipient:
+Each line shows when, who sent to whom, and the subject. Under 24 hours the
+gutter is relative ("42s", "3h 12m"); older lines show the date.
+Announcements carry a distinct `fyi` mark. A broadcast is one line:
 
 ```
   2m  admin → 2 agents  fyi  Standup in 5
-      reviewer     ✔ delivered · verified
-      implementer  ● queued
 ```
 
-The badges are live reads of the record: a message that parked or needed
-attention shows that, not the state it had when sent.
+Standard mailbox and notification state lives in `cyclops messages`. Old
+direct-delivery records may still carry legacy delivery badges; those fields
+remain readable for compatibility and are not the standard send contract.
 
 ## Threads
 
@@ -46,40 +50,39 @@ attention shows that, not the state it had when sent.
 cyclops thread m-3f9c2a
 ```
 
-One message with its body, every reply that chains to it (replies to
-replies included), and each delivery's current badge, oldest first. The
-full delivery chain (every state and gate line) rides along in `--json`.
+One message and every reply that chains to it, oldest first. Bodies follow the
+same sender-or-claimant visibility rule as history. Legacy state and gate lines
+remain available in `--json` when the underlying compatibility record contains
+them.
 
 ## Scripts
 
-`--json` returns the raw folded ledger lines plus `next_cursor`. Pass it
-back as `--cursor` to page forward without gaps:
+`--json` returns the folded authenticated view. A numeric cursor works only
+when the daemon has one journal source. With the normal workspace journal plus
+session compatibility records, the socket API uses the opaque `cursor2`
+returned as `next_cursor2`.
 
 ```
-cyclops history --limit 100 --json          # newest 100, note next_cursor
-cyclops history --cursor 4711 --json        # only messages recorded after
+cyclops history --limit 100 --json
 ```
 
-Without a cursor you get the newest `--limit` messages; with one you get
-the oldest messages recorded after it, so a loop that feeds `next_cursor`
-back walks the whole record exactly once.
+Without a cursor, history returns the newest messages up to the limit. For a
+complete multi-source walk, call `msg.history` through the socket API and feed
+each `next_cursor2` back as `cursor2`.
 
-`next_cursor` is only issued while ONE session is watched: it is a line
-number within that session's ledger, and with several watched sessions it
-would skip
-whichever file's lines hide behind the other's numbering. There the
-daemon refuses `cursor` with an error and pages on `cursor2` instead: an
-opaque composite cursor issued as `next_cursor2` in every msg.history
-answer. Pass it back verbatim as the `cursor2` param (the empty string
-starts from the beginning); the walk covers every session's messages
-exactly once, in order, cross-session broadcasts included. `cursor2` is
-a socket-API param; the raw files below are always available too.
+The canonical mailbox journal is plain NDJSON. Discover its durable workspace
+id rather than guessing a directory name:
 
-The ledger itself is a plain text file at
-`~/.cyclops/ledger/<session>.ndjson`, one JSON object per line and one line
-per fact, so `jq` reads it directly. `history` folds each message's
-delivery chain into its `deliveries` array at read time; the file is never
-rewritten.
+```bash
+workspace_id=$(cyclops --json messages | jq -r .workspace_id)
+cyclops_home="${CYCLOPS_HOME:-$HOME/.cyclops}"
+jq -c 'select(.kind == "msg" or .kind == "fyi")' \
+  "$cyclops_home/workspaces/$workspace_id/messages.ndjson"
+```
+
+Treat raw journal bytes as sensitive owner-only state. Session records under
+`$CYCLOPS_HOME/ledger/` contain pane state and legacy direct delivery. New
+mailbox messages are never copied there.
 
 ## Exit codes
 

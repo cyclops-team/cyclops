@@ -1,10 +1,11 @@
 # Hooks
 
-Vendor hooks are how a delivery earns `✔ delivered · verified`: the
-recipient CLI's own hook reports the injected text back to the daemon.
-Configuration does not equal subscription: a rendered config proves
-nothing until an edge actually arrives, so cyclops splits the job into
-prepare, wire, prove.
+Vendor hooks report authenticated lifecycle edges. Standard mailbox messaging
+uses them with pane detection to decide whether a content-free notification is
+safe to write. The legacy direct-delivery self-test also uses an acknowledgement
+hook to prove that its injected test payload arrived. A rendered config proves
+nothing until an edge actually arrives, so Cyclops splits the job into prepare,
+wire, and prove.
 
 ## Install (prepare; vendor config is never touched)
 
@@ -53,8 +54,8 @@ Wiring per CLI:
 - **agy**: if `<workspace>/.agents/hooks.json` does not exist, copy the
   rendered artifact there. If it exists, merge only Cyclops' event entries,
   preserving every unrelated key and handler; never overwrite it. agy has no
-  payload-matchable ack, so its deliveries stay screen-verified; these hooks
-  feed liveness and turn detection.
+  payload-matchable acknowledgement, so its legacy self-test stays
+  screen-verified; these hooks feed liveness and turn detection.
 - **cursor**: if `<workspace>/.cursor/hooks.json` or `~/.cursor/hooks.json`
   does not exist, copy the rendered artifact there. If it exists, merge only
   Cyclops' event entries, preserving every unrelated key and handler; never
@@ -75,15 +76,18 @@ reload is needed, run the selftest after reloading or restarting it.
 the one opt-in that lets cyclops do the wiring above itself: it merges
 cyclops' hook entries into the config each installed vendor CLI reads on
 its own (`$CODEX_HOME/hooks.json`, `~/.agents/hooks.json`,
-`~/.cursor/hooks.json`) and places the agent skill for Claude Code at
-`~/.claude/skills/cyclops/SKILL.md`. A vendor directory that does not
-exist is never created, your own entries are merged around rather than
-replaced, and the original file is copied aside before the first edit.
+`~/.cursor/hooks.json`). It also seeds the same agent skill at each canonical
+destination: `~/.claude/skills/cyclops/SKILL.md`, one shared
+`~/.agents/skills/cyclops/SKILL.md` for Codex and Cursor, and
+`~/.gemini/antigravity-cli/skills/cyclops/SKILL.md` for AGY. It never creates
+duplicate vendor copies. A vendor directory that does not exist is never
+created, your own entries are merged around rather than replaced, and the
+original file is copied aside before the first edit.
 
 The consent is recorded at `~/.cyclops/vendor-wiring-consented`, so an
 agent CLI installed after cyclops is not stranded: the next `cyclops` or
 `cyclops start` finds it, wires it the same way, and prints one line
-saying so — silence means nothing needed writing. Delete the marker to
+saying so: silence means nothing needed writing. Delete the marker to
 withdraw the consent; `CYCLOPS_NO_VENDOR_HOOKS=1` declines the whole
 step, at install time and after.
 
@@ -93,7 +97,8 @@ step, at install time and after.
 cyclops hooks verify reviewer
 ```
 
-Prints the pane's ack tier and the last-seen age of every hook event.
+Prints the pane's legacy acknowledgement tier and the last-seen age of every
+hook event.
 `cyclops status` carries the same bit: `hooks unverified` marks an adopted
 pane whose configured hooks have never fired this daemon run. Exit 1 while
 unverified, so scripts can gate on it.
@@ -112,8 +117,14 @@ inside the very pane it reports for, verified against the connection's
 kernel peer credentials the same way send identity is. Real hooks pass by
 construction: `cyclops hook` runs as a child of the vendor CLI inside the
 pane. Anything else, the admin shell included, is denied and nothing is
-ingested, so neither the `hooks verified` bit nor a `delivered · verified`
-receipt can be forged by a process that merely shares your user id.
+ingested, so neither the `hooks verified` bit nor a legacy
+`delivered · verified` self-test receipt can be forged by a process that merely
+shares your user id.
+
+The daemon resolves that process to the exact watched session, pane id, and
+current process generation. A client-provided agent label is optional and is
+never authority. Reusing a pane id in another tmux session or replacing the
+occupant cannot inherit hook liveness from the original route.
 
 ## Selftest (prove the round trip)
 
@@ -121,7 +132,7 @@ receipt can be forged by a process that merely shares your user id.
 cyclops hooks selftest reviewer
 ```
 
-The daemon sends one fyi message through the normal delivery pipeline
+The daemon sends one fyi message through the legacy direct-delivery pipeline
 (subject `[cyclops] hook self-test`, body "Reply not needed.") and reports
 whether the ack hook fired carrying the marker. Costs the recipient one
 trivial turn; the result is also recorded in the ledger. Exit 0 when the
@@ -130,10 +141,8 @@ is no ack hook to fire, the delivery state is the whole answer).
 
 ## When hooks never fire
 
-Deliveries still land: the tier-1 ack window times out, the delivery
-downgrades to screen evidence (`✓ delivered · unverified (screen)`), and the first
-such delivery on a pane whose occupant has zero edges sends the admin one
-`action_required` notification naming the likely cause. For codex that is
-almost always the directory-trust trap above. One ping per pane occupant
-(a restarted CLI without hooks earns its own), never a loop, nothing
-lost.
+The legacy self-test can still land without an acknowledgement. Its tier-1
+window times out and the result downgrades to screen evidence
+(`✓ delivered · unverified (screen)`). This does not describe standard
+`cyclops send`, which accepts a mailbox message first and reports notification
+state separately.

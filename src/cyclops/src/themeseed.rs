@@ -10,7 +10,10 @@
 //! copy the files in by hand, which is exactly the friction the installer
 //! exists to remove.
 
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+
+use cyclops_state::{CreateFileOutcome, StateRoot};
 
 use crate::hash::fnv64;
 
@@ -182,22 +185,52 @@ pub fn seed(home: &Path) -> Seeded {
         written: Vec::new(),
         problems: Vec::new(),
     };
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        out.problems.push(format!("create {}: {e}", dir.display()));
-        return out;
-    }
+    let root = match StateRoot::open_or_create(home) {
+        Ok(root) => root,
+        Err(e) => {
+            out.problems.push(format!("create {}: {e}", dir.display()));
+            return out;
+        }
+    };
     for (name, body) in SHIPPED {
         let path = dir.join(name);
-        if let Ok(existing) = std::fs::read(&path) {
+        let descendant = Path::new("themes").join(name);
+        let existing = match root.open_read(&descendant) {
+            Ok(Some(mut file)) => {
+                let mut bytes = Vec::new();
+                if let Err(e) = file.read_to_end(&mut bytes) {
+                    out.problems.push(format!("read {}: {e}", path.display()));
+                    continue;
+                }
+                Some(bytes)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                out.problems.push(format!("read {}: {e}", path.display()));
+                continue;
+            }
+        };
+        if let Some(existing) = existing {
             let unedited = EVER_SHIPPED_FNV64.contains(&fnv64(&existing).as_str());
             if existing == body.as_bytes() || !unedited {
                 continue;
             }
-        } else if path.exists() {
+            match root.replace_file(&descendant, body.as_bytes()) {
+                Ok(()) => out.written.push((*name).to_string()),
+                Err(e) => out.problems.push(format!("write {}: {e}", path.display())),
+            }
             continue;
         }
-        match std::fs::write(&path, body) {
-            Ok(()) => out.written.push((*name).to_string()),
+        match root.create_file_once(&descendant, body.as_bytes()) {
+            Ok(CreateFileOutcome::Created) => out.written.push((*name).to_string()),
+            Ok(CreateFileOutcome::AlreadyExists) => match root.open_read(&descendant) {
+                Ok(Some(_)) => {}
+                Ok(None) => out.problems.push(format!(
+                    "write {}: file disappeared after concurrent creation",
+                    path.display()
+                )),
+                Err(e) => out.problems.push(format!("read {}: {e}", path.display())),
+            },
             Err(e) => out.problems.push(format!("write {}: {e}", path.display())),
         }
     }
@@ -216,6 +249,7 @@ pub fn installed(seeded: &Seeded) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt as _};
 
     fn scratch(tag: &str) -> PathBuf {
         let d = cyclops_proto::scratch::scratch_dir(tag);
@@ -230,6 +264,22 @@ mod tests {
         let first = seed(&home);
         assert_eq!(first.written.len(), SHIPPED.len(), "{:?}", first.problems);
         assert!(home.join("themes/catppuccin.toml").is_file());
+        assert_eq!(
+            std::fs::metadata(home.join("themes"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(home.join("themes/catppuccin.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
 
         // An edited copy survives every later run, byte for byte.
         std::fs::write(home.join("themes/nord.toml"), "name = \"mine\"\n").unwrap();
@@ -240,6 +290,28 @@ mod tests {
             "name = \"mine\"\n"
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_linked_theme_directory_is_refused_without_touching_its_target() {
+        let home = scratch("cyc-theme-link-home");
+        let external = scratch("cyc-theme-link-external");
+        let target = external.join("dark.toml");
+        std::fs::write(&target, b"external\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&external, home.join("themes")).unwrap();
+
+        let seeded = seed(&home);
+
+        assert!(seeded.written.is_empty());
+        assert!(!seeded.problems.is_empty());
+        assert_eq!(std::fs::read(&target).unwrap(), b"external\n");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&external);
     }
 
     /// The stale-seed trap, closed: a file identical to a version this

@@ -2,6 +2,7 @@
 //! keeping a persisted order list correct when the identity it was keyed
 //! on renames or is replaced.
 
+use std::io::Read as _;
 use std::path::Path;
 
 use crate::decoration::DecorationSnapshot;
@@ -150,10 +151,16 @@ pub enum ReopenTarget {
 
 /// Read `[workspace]` keys from `<home>/config.toml`. Unknown keys are ignored.
 pub fn load_prefs(home: &Path) -> WorkspacePrefs {
-    let path = home.join("config.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(Some(root)) = cyclops_state::StateRoot::open_existing(home) else {
         return WorkspacePrefs::default();
     };
+    let Ok(Some(mut file)) = root.open_read(Path::new("config.toml")) else {
+        return WorkspacePrefs::default();
+    };
+    let mut text = String::new();
+    if file.read_to_string(&mut text).is_err() {
+        return WorkspacePrefs::default();
+    }
     let Ok(table) = text.parse::<toml::Table>() else {
         return WorkspacePrefs::default();
     };
@@ -220,12 +227,18 @@ pub fn load_prefs(home: &Path) -> WorkspacePrefs {
 /// Merge `[workspace]` keys into config.toml, preserving other sections.
 pub fn save_prefs(home: &Path, prefs: &WorkspacePrefs) -> std::io::Result<()> {
     let path = home.join("config.toml");
-    let mut table: toml::Table = if path.exists() {
-        std::fs::read_to_string(&path)?
-            .parse()
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
-    } else {
-        toml::Table::new()
+    let root = cyclops_state::StateRoot::open_or_create(home).map_err(std::io::Error::other)?;
+    let mut table: toml::Table = match root
+        .open_read(Path::new("config.toml"))
+        .map_err(std::io::Error::other)?
+    {
+        Some(mut file) => {
+            let mut text = String::new();
+            file.read_to_string(&mut text)?;
+            text.parse()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
+        }
+        None => toml::Table::new(),
     };
     let order = toml::Value::Array(
         prefs
@@ -289,27 +302,8 @@ pub fn save_prefs(home: &Path, prefs: &WorkspacePrefs) -> std::io::Result<()> {
         body.push('\n');
     }
 
-    // A sidebar drag must never leave a torn shared config behind. The pid
-    // keeps simultaneous workspace processes from sharing a temp file; the
-    // final rename is atomic on the Unix platforms this crate supports. An
-    // existing symlink is resolved so a dotfiles-managed link stays a link.
-    std::fs::create_dir_all(home)?;
-    let destination = if path.exists() {
-        std::fs::canonicalize(&path)?
-    } else {
-        path.clone()
-    };
-    let tmp = destination.with_extension(format!("toml.workspace-{}.tmp", std::process::id()));
-    {
-        use std::io::Write as _;
-        let mut file = std::fs::File::create(&tmp)?;
-        if let Ok(metadata) = std::fs::metadata(&path) {
-            file.set_permissions(metadata.permissions())?;
-        }
-        file.write_all(body.as_bytes())?;
-        file.sync_all()?;
-    }
-    std::fs::rename(tmp, destination)
+    root.replace_file(Path::new("config.toml"), body.as_bytes())
+        .map_err(|error| std::io::Error::other(format!("write {}: {error}", path.display())))
 }
 
 /// Query last-active state from cyclopsd. Returns None when the daemon is
@@ -417,6 +411,7 @@ pub fn migrate_agent_order_entries(
 mod tests {
     use super::*;
     use cyclops_proto::scratch::scratch_dir;
+    use std::os::unix::fs::{symlink, PermissionsExt as _};
 
     #[test]
     fn prefs_round_trip_under_scratch_home() {
@@ -441,7 +436,40 @@ mod tests {
         save_prefs(&home, &prefs).expect("save");
         let loaded = load_prefs(&home);
         assert_eq!(loaded, prefs);
+        assert_eq!(
+            std::fs::metadata(home.join("config.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn saving_prefs_refuses_a_linked_config_without_touching_its_target() {
+        let home = scratch_dir("ws-prefs-link-home");
+        let external = scratch_dir("ws-prefs-link-external");
+        for path in [&home, &external] {
+            let _ = std::fs::remove_dir_all(path);
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let target = external.join("config.toml");
+        std::fs::write(&target, b"theme = \"external\"\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&target, home.join("config.toml")).unwrap();
+
+        let error = save_prefs(&home, &WorkspacePrefs::default()).unwrap_err();
+
+        assert!(error.to_string().contains("linked or not a regular file"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"theme = \"external\"\n");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&external);
     }
 
     /// A saved tab the sidebar no longer offers loads as the default.

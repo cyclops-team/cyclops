@@ -121,7 +121,12 @@ impl Entry {
                     theme.dim(&format!("session {name} · {text}"))
                 }
             }
-            EntryKind::PaneGone { pane_id } => theme.dim(&format!("{pane_id} closed")),
+            EntryKind::PaneGone {
+                pane_id,
+                physical_gone: true,
+                ..
+            } => theme.dim(&format!("{pane_id} closed")),
+            EntryKind::PaneGone { pane_id, .. } => theme.dim(&format!("{pane_id} moved")),
             EntryKind::Other { event, detail } => match detail {
                 Some(d) => format!("{event}  {}", theme.dim(d)),
                 None => event.clone(),
@@ -206,6 +211,7 @@ mod tests {
             id: Some("e-1".into()),
             kind: EntryKind::State {
                 target: "reviewer".into(),
+                session_idx: 0,
                 pane_id: Some("%1".into()),
                 state: AgentState::BlockedPermission,
             },
@@ -365,6 +371,7 @@ mod tests {
             id: Some("e-1".into()),
             kind: EntryKind::State {
                 target: "reviewer".into(),
+                session_idx: 0,
                 pane_id: Some("%1".into()),
                 state: AgentState::BlockedPermission,
             },

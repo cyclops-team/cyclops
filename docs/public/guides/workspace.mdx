@@ -9,8 +9,8 @@ description: "The full-screen TUI a bare cyclops opens: session tree, file brows
 cyclops                   # workspace (TTY required)
 ```
 
-With no tmux server running, or none with sessions on it, Cyclops starts one
-— session `main`, one shell pane in the directory you ran it from, tabs
+With no tmux server running, or none with sessions on it, Cyclops starts one:
+session `main`, one shell pane in the directory you ran it from, and tabs
 numbered `1`, `2`, `3`... No preset or manual `tmux new` needed. Cyclops
 starts `cyclopsd` too, if nothing answers: every detected name, status
 glyph, and pane border decoration comes from the daemon, so the sidebar
@@ -18,15 +18,15 @@ reads `cyclopsd offline` until one is running.
 
 ## What's on screen
 
-- **Sidebar** (left) — a session tree of workspaces and agents, over a file
+- **Sidebar** (left): a session tree of workspaces and agents, over a file
   browser. Drag the dashed rule between them to resize either half.
-- **Tab bar** (top) — one tab per tmux window, plus `+` for the next one.
+- **Tab bar** (top): one tab per tmux window, plus `+` for the next one.
   Hide it from the app menu's `Tab bar` item.
-- **Pane canvas** — the live tmux panes, one terminal cell to one tmux
+- **Pane canvas**: the live tmux panes, one terminal cell to one tmux
   cell, each with its own border. The workspace also paints the terminal's
   own background in the theme's color while it has focus, handing it back
   the moment focus leaves.
-- **Composer / footer** — `Ctrl+B s`, or the sidebar footer's `@` button,
+- **Composer / footer**: `Ctrl+B s`, or the sidebar footer's `@` button,
   opens a one-line message composer; the footer also has `☰ menu` and a `+`
   for a new workspace from the focused pane's folder.
 
@@ -35,10 +35,10 @@ A named pane carries its identity in its top border, e.g.
 
 | Glyph | Meaning |
 |-------|---------|
-| `○` | idle — no turn running |
-| `●` | working — a turn is running |
-| `⚠` | needs attention — open item in the daemon's attention register |
-| `✕` | dead — the pane's process exited |
+| `○` | idle: no turn running |
+| `●` | working: a turn is running |
+| `⚠` | needs attention: open item in the daemon's attention register |
+| `✕` | dead: the pane's process exited |
 
 ## Driving it
 
@@ -84,7 +84,7 @@ browser** stays where you last left it, remembered across launches
 (`files_pinned_root`). The header's chip flips between them: `[pin]` while
 following the agent, `[agent]` while pinned. Click a file and its path is
 typed into the focused pane as `@src/main.rs `, relative to the panel's
-root — nothing is submitted. A file clicked in the pinned view still
+root: nothing is submitted. A file clicked in the pinned view still
 resolves for the agent: relative under its folder, absolute outside it.
 
 ## Preferences
@@ -113,5 +113,5 @@ snapping, and turns itself off under `NO_COLOR` or without truecolor. See
   narrower stream TUI: live events, no panes, with `--json` / `--plain`
   output.
 - Plain [`tmux attach`](/guides/attach-tmux) reaches the same session
-  without the chrome — no glyphs, composer, or file panel; those belong to
+  without the chrome: no glyphs, composer, or file panel; those belong to
   the workspace TUI, not tmux.

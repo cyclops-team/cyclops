@@ -40,6 +40,15 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
 
     while let Some(msg) = rx.recv().await {
         match msg {
+            // Plain output has no messages surface yet. Dropping the
+            // snapshot keeps this stream line-oriented rather than
+            // half-rendering a list it cannot navigate.
+            UiMsg::Messages { .. }
+            | UiMsg::MessagesFailed { .. }
+            | UiMsg::MessagesChanged(_)
+            | UiMsg::MessagesRouteChanged
+            | UiMsg::Subscribed
+            | UiMsg::ActionDone { .. } => {}
             UiMsg::Entry(e) => {
                 for e in intake.entry(*e) {
                     live(&mut app, e, &mut stdout);
@@ -173,6 +182,7 @@ mod tests {
             id: Some("e-1".into()),
             kind: EntryKind::State {
                 target: target.into(),
+                session_idx: 0,
                 pane_id: None,
                 state: s,
             },
@@ -266,6 +276,7 @@ mod tests {
                 watched: vec!["main".into()],
                 panes: Vec::new(),
                 roster: Vec::new(),
+                admin_unread: 0,
                 open: vec![cyclops_proto::OpenDelivery {
                     id: "m-park".into(),
                     to: "implementer".into(),

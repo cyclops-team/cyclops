@@ -1,0 +1,12 @@
+[package]
+name = "cyclops-state"
+version.workspace = true
+edition.workspace = true
+description = "Descriptor-anchored access to owner-only Cyclops state files."
+
+[dependencies]
+libc.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

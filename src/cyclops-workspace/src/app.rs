@@ -91,11 +91,11 @@ const DECORATION_DEBOUNCE: Duration = Duration::from_millis(30);
 
 enum AppMsg {
     /// A send started from the composer has an answer. Carries the
-    /// recipient so a receipt cannot be shown against a composer that has
-    /// since been reopened for someone else.
+    /// attempt so a receipt cannot be shown against a composer that has
+    /// since been reopened or changed to a different send.
     SendFinished {
-        to: String,
-        outcome: Result<String, String>,
+        attempt: dialog::ComposeAttempt,
+        outcome: crate::daemon::SendOutcome,
     },
     Input(KeyEvent),
     Paste(String),
@@ -357,6 +357,13 @@ fn boot_target(reopen: &persist::ReopenTarget) -> (String, bool) {
 /// Run the workspace on a tty. Returns the process exit code.
 pub async fn run_async() -> i32 {
     let home = cyclops_proto::cyclops_home();
+    let state_root = match cyclops_state::StateRoot::open_or_create(&home) {
+        Ok(root) => std::sync::Arc::new(root),
+        Err(error) => {
+            eprintln!("open state root {}: {error}", home.display());
+            return 1;
+        }
+    };
     let prefs = load_prefs(&home);
     let tmux_cfg = load_tmux_config(&home);
     let socket_name = tmux_cfg.socket.clone();
@@ -385,9 +392,9 @@ pub async fn run_async() -> i32 {
     if let Some(path) = tmux_cfg.config_file {
         cfg = cfg.with_config_file(path);
     }
-    // Pasted text is transient but can still be sensitive. Keep its 0600
-    // spool files under Cyclops' private home instead of a shared temp root.
-    cfg = cfg.with_buffer_spool_dir(home.join("spool"));
+    // tmux needs a pathname for pasted text. The held root still owns
+    // creation and exact-inode cleanup.
+    cfg = cfg.with_state_buffer_spool(state_root, "spool");
     let control_cfg = cfg.clone();
     let (mut client, notif_rx) = match ControlClient::spawn(cfg).await {
         Ok(pair) => pair,
@@ -1405,12 +1412,10 @@ impl App {
 /// owns stderr while the workspace runs; printing there corrupts the frame.
 fn log_err(home: &std::path::Path, err: &dyn std::fmt::Display) {
     use std::io::Write;
-    let path = home.join("workspace.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
+    if let Ok(root) = cyclops_state::StateRoot::open_or_create(home) {
+        let Ok(mut f) = root.open_append(std::path::Path::new("workspace.log")) else {
+            return;
+        };
         let _ = writeln!(f, "{} {err}", chrono_stamp());
     }
 }
@@ -1526,6 +1531,44 @@ fn rename_targets_active_session(active: Option<&str>, renamed: Option<&str>) ->
     renamed.is_none_or(|id| Some(id) == active)
 }
 
+fn finish_compose_send(
+    dialog: Option<&mut Dialog>,
+    completed: dialog::ComposeAttempt,
+    outcome: crate::daemon::SendOutcome,
+) {
+    let Some(Dialog::Compose {
+        buffer,
+        status,
+        send,
+    }) = dialog
+    else {
+        return;
+    };
+    if send.attempt() != Some(&completed) {
+        return;
+    }
+
+    match outcome {
+        crate::daemon::SendOutcome::Accepted(receipt) => {
+            let sent_draft_is_unchanged =
+                dialog::parse_compose(buffer).ok().as_ref() == Some(&completed.message);
+            *status = Some(copy::compose_sent(&receipt));
+            *send = dialog::ComposeSendState::Ready;
+            if sent_draft_is_unchanged {
+                *buffer = format!("@{} ", completed.message.to);
+            }
+        }
+        crate::daemon::SendOutcome::Rejected(cause) => {
+            *status = Some(copy::compose_rejected(&completed.message.to, &cause));
+            *send = dialog::ComposeSendState::Ready;
+        }
+        crate::daemon::SendOutcome::Unknown(cause) => {
+            *status = Some(copy::compose_unknown(&completed.message.to, &cause));
+            *send = dialog::ComposeSendState::Retryable(completed);
+        }
+    }
+}
+
 /// Handle one app message. Returns false when the channel closed.
 async fn handle_app_msg(
     msg: Option<AppMsg>,
@@ -1543,29 +1586,11 @@ async fn handle_app_msg(
         // operator type another one; closing the dialog for them would
         // take the receipt off the screen at the moment it arrived.
         //
-        // The recipient is checked against the open composer because the
+        // The attempt key is checked against the open composer because the
         // dialog may have been closed and reopened while the send was in
-        // flight, and a receipt shown under the wrong name is worse than
-        // one that is simply missed.
-        AppMsg::SendFinished { to, outcome } => {
-            if let Some(Dialog::Compose {
-                buffer,
-                status,
-                sending,
-            }) = app.dialog.as_mut()
-            {
-                *sending = false;
-                match outcome {
-                    Ok(receipt) => {
-                        *status = Some(copy::compose_sent(&receipt));
-                        // Sent means the line is spent. Clearing it back to
-                        // the same recipient is what makes a second message
-                        // to the same agent one keystroke of setup.
-                        *buffer = format!("@{to} ");
-                    }
-                    Err(cause) => *status = Some(copy::compose_failed(&to, &cause)),
-                }
-            }
+        // flight. A stale receipt must not rewrite a newer draft.
+        AppMsg::SendFinished { attempt, outcome } => {
+            finish_compose_send(app.dialog.as_mut(), attempt, outcome);
             arm(debounce);
         }
         AppMsg::Redraw => arm(debounce),
@@ -1813,6 +1838,133 @@ async fn handle_app_msg(
         }
     }
     true
+}
+
+#[cfg(test)]
+mod compose_send_tests {
+    use super::*;
+
+    fn composer(buffer: &str) -> Dialog {
+        Dialog::Compose {
+            buffer: buffer.to_string(),
+            status: None,
+            send: dialog::ComposeSendState::Ready,
+        }
+    }
+
+    #[test]
+    fn escape_after_unknown_keeps_the_key_for_an_exact_retry() {
+        let mut dialog = composer("@reviewer ship it");
+        let message = dialog::parse_compose("@reviewer ship it").expect("message");
+        let first = dialog::begin_compose_send(Some(&mut dialog), message.clone(), || {
+            "stable-key".to_string()
+        })
+        .expect("first attempt");
+        finish_compose_send(
+            Some(&mut dialog),
+            first.clone(),
+            crate::daemon::SendOutcome::Unknown("connection closed".to_string()),
+        );
+        let Dialog::Compose { status, send, .. } = &dialog else {
+            unreachable!()
+        };
+        assert!(status
+            .as_deref()
+            .is_some_and(|text| text.starts_with("acceptance unknown for reviewer:")));
+        assert_eq!(
+            send.attempt().map(|attempt| attempt.client_key.as_str()),
+            Some("stable-key")
+        );
+
+        assert_eq!(
+            dialog::request_compose_cancel(&mut dialog),
+            dialog::ComposeCancel::KeepOpen
+        );
+        let Dialog::Compose { send, .. } = &dialog else {
+            unreachable!()
+        };
+        assert!(matches!(
+            send,
+            dialog::ComposeSendState::ConfirmAbandon {
+                resume: dialog::ComposeResume::Retryable,
+                ..
+            }
+        ));
+        assert_eq!(
+            dialog::request_compose_cancel(&mut dialog),
+            dialog::ComposeCancel::KeepOpen
+        );
+
+        let retry = dialog::begin_compose_send(Some(&mut dialog), message, || {
+            panic!("an exact retry must not generate another key")
+        })
+        .expect("retry attempt");
+        assert_eq!(retry.client_key, first.client_key);
+
+        finish_compose_send(
+            Some(&mut dialog),
+            retry,
+            crate::daemon::SendOutcome::Accepted("already accepted m-original".to_string()),
+        );
+        let Dialog::Compose {
+            buffer,
+            status,
+            send,
+        } = dialog
+        else {
+            unreachable!()
+        };
+        assert_eq!(buffer, "@reviewer ");
+        assert_eq!(status.as_deref(), Some("already accepted m-original"));
+        assert_eq!(send, dialog::ComposeSendState::Ready);
+    }
+
+    #[test]
+    fn editing_or_rejection_starts_a_new_attempt() {
+        let mut dialog = composer("@reviewer ship it");
+        let original = dialog::parse_compose("@reviewer ship it").expect("message");
+        let first = dialog::begin_compose_send(Some(&mut dialog), original, || "key-1".into())
+            .expect("first attempt");
+        finish_compose_send(
+            Some(&mut dialog),
+            first.clone(),
+            crate::daemon::SendOutcome::Unknown("connection closed".to_string()),
+        );
+
+        let Dialog::Compose { buffer, .. } = &mut dialog else {
+            unreachable!()
+        };
+        *buffer = "@reviewer ship the corrected patch".to_string();
+        let edited = dialog::parse_compose(buffer).expect("edited message");
+        let second =
+            dialog::begin_compose_send(Some(&mut dialog), edited.clone(), || "key-2".into())
+                .expect("edited attempt");
+        assert_ne!(second.client_key, first.client_key);
+
+        finish_compose_send(
+            Some(&mut dialog),
+            second,
+            crate::daemon::SendOutcome::Rejected("recipient is unavailable".to_string()),
+        );
+        let Dialog::Compose {
+            buffer,
+            status,
+            send,
+            ..
+        } = &dialog
+        else {
+            unreachable!()
+        };
+        assert_eq!(buffer, "@reviewer ship the corrected patch");
+        assert_eq!(
+            status.as_deref(),
+            Some("not accepted for reviewer: recipient is unavailable")
+        );
+        assert_eq!(*send, dialog::ComposeSendState::Ready);
+        let third = dialog::begin_compose_send(Some(&mut dialog), edited, || "key-3".into())
+            .expect("attempt after rejection");
+        assert_eq!(third.client_key, "key-3");
+    }
 }
 
 fn cancel_drag(app: &mut App) {
@@ -3008,6 +3160,9 @@ async fn dialog_confirm(
     app: &mut App,
     client: &ControlClient,
 ) -> Result<(), cyclops_tmux::TmuxError> {
+    if handle_compose_confirm(app) {
+        return Ok(());
+    }
     let Some(dialog) = app.dialog.clone() else {
         return Ok(());
     };
@@ -3022,7 +3177,28 @@ async fn dialog_confirm(
     Ok(())
 }
 
+fn handle_compose_confirm(app: &mut App) -> bool {
+    let Some(Dialog::Compose { send, .. }) = app.dialog.as_ref() else {
+        return false;
+    };
+    if send.is_sending() {
+        return true;
+    }
+    if send.is_confirming_abandon() {
+        app.dialog = None;
+        app.hover = None;
+        return true;
+    }
+    false
+}
+
 fn dialog_cancel(app: &mut App) {
+    if let Some(open) = app.dialog.as_mut() {
+        if dialog::request_compose_cancel(open) == dialog::ComposeCancel::KeepOpen {
+            app.hover = None;
+            return;
+        }
+    }
     // Close-without-apply: the theme picker previews over the live paint,
     // so the theme that was live when it opened goes back. `None` for
     // every other dialog, and for an applied picker (the apply drops it).
@@ -3619,6 +3795,32 @@ pub fn print_help_and_exit() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_log_refuses_a_link_without_touching_its_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let home = cyclops_proto::scratch::scratch_dir("workspace-log-link-home");
+        let external = cyclops_proto::scratch::scratch_dir("workspace-log-link-external");
+        for path in [&home, &external] {
+            let _ = std::fs::remove_dir_all(path);
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let target = external.join("workspace.log");
+        std::fs::write(&target, b"external\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&target, home.join("workspace.log")).unwrap();
+
+        log_err(&home, &"new error");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"external\n");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&external);
+    }
 
     /// A minimal `App` for tests that only need model/prefs/drag state, not
     /// a live pane runtime — mirrors `exec::tests::test_app`, which is
@@ -4441,6 +4643,80 @@ mod tests {
         app.open_dialog(Dialog::confirm_close("%0"));
         assert_eq!(app.dialog_offset, (0, 0));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn escape_during_send_requires_explicit_abandon_before_dropping_the_key() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-compose-cancel");
+        let mut app = test_app(one_pane_model(), home.clone());
+        let old_attempt = dialog::ComposeAttempt {
+            message: dialog::parse_compose("@reviewer ship it").expect("message"),
+            client_key: "stable-key".into(),
+        };
+        app.dialog = Some(Dialog::Compose {
+            buffer: "@reviewer ship it".into(),
+            status: Some("sending to reviewer…".into()),
+            send: dialog::ComposeSendState::Sending(old_attempt.clone()),
+        });
+
+        assert!(handle_compose_confirm(&mut app));
+        assert!(matches!(
+            app.dialog.as_ref(),
+            Some(Dialog::Compose {
+                send: dialog::ComposeSendState::Sending(_),
+                ..
+            })
+        ));
+
+        dialog_cancel(&mut app);
+
+        let Some(Dialog::Compose { buffer, send, .. }) = app.dialog.as_ref() else {
+            panic!("Esc must not discard the composer");
+        };
+        assert_eq!(buffer, "@reviewer ship it");
+        assert!(send.is_confirming_abandon());
+        assert_eq!(
+            send.attempt().map(|attempt| attempt.client_key.as_str()),
+            Some("stable-key")
+        );
+
+        dialog_cancel(&mut app);
+        let Some(Dialog::Compose { buffer, send, .. }) = app.dialog.as_ref() else {
+            panic!("cancelling abandon must restore the composer");
+        };
+        assert_eq!(buffer, "@reviewer ship it");
+        assert!(send.is_sending());
+        assert_eq!(
+            send.attempt().map(|attempt| attempt.client_key.as_str()),
+            Some("stable-key")
+        );
+
+        dialog_cancel(&mut app);
+        assert!(handle_compose_confirm(&mut app));
+        assert!(app.dialog.is_none(), "explicit abandon closes the composer");
+
+        app.open_dialog(Dialog::Compose {
+            buffer: "@reviewer ship it".into(),
+            status: None,
+            send: dialog::ComposeSendState::Ready,
+        });
+        finish_compose_send(
+            app.dialog.as_mut(),
+            old_attempt,
+            crate::daemon::SendOutcome::Accepted("accepted m-old".into()),
+        );
+        let Some(Dialog::Compose {
+            buffer,
+            status,
+            send,
+        }) = app.dialog.as_ref()
+        else {
+            panic!("the reopened composer must remain open");
+        };
+        assert_eq!(buffer, "@reviewer ship it");
+        assert!(status.is_none());
+        assert_eq!(*send, dialog::ComposeSendState::Ready);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     /// Esc (or the Cancel button: both land in `dialog_cancel`) puts back

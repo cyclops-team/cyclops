@@ -20,7 +20,14 @@ const ESC_MANIFEST: &str = r#"
 [agent]
 id = "fix"
 display_name = "Codex esc fixture"
-process_names = ["cat", "sh", "bash", "dash"]
+process_names = ["python3", "python", "Python", "cat", "sh", "bash", "dash"]
+
+[[rule]]
+id = "title_working"
+state = "working"
+priority = 1200
+region = "pane_title"
+regex = ['^WORKING']
 
 [[rule]]
 id = "composer_typed_input"
@@ -49,40 +56,26 @@ verify_before_submit = true
 verify_pattern = ["<message_id>"]
 "#;
 
-/// Poll status until the pane's fused state reads `want` (test-side wait,
-/// outside the daemon's zero-polling contract).
-async fn wait_pane_state(rig: &mut Rig, want: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let resp = rig.ctl.request("status", json!({})).await;
-        let state = resp["result"]["sessions"][0]["panes"][0]["state"].clone();
-        if state == json!(want) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "pane never reached state {want}: {resp}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// Poll status until the pane's foreground command is no longer `old`
-/// (macOS reports /bin/sh's comm as "bash", so the new name is not
-/// portable). The subscription push that carries the command change
-/// carries the new pane_pid too, so this doubles as "the watcher table
-/// saw the occupant swap".
-async fn wait_pane_command_away_from(rig: &mut Rig, old: &str) {
+/// Poll status until the pane's foreground command is one of `want`.
+///
+/// Waiting for the command to LEAVE a name does not work here: the
+/// composer pane already runs something other than the impostor, so
+/// "not cat" is true before the swap has happened and the test races
+/// past the thing it means to observe. The subscription push that
+/// carries the command change carries the new pane_pid too, so arriving
+/// at the impostor's name doubles as "the watcher saw the occupant
+/// swap". macOS reports /bin/sh's comm as "bash", hence the set.
+async fn wait_pane_command_is(rig: &mut Rig, want: &[&str]) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let resp = rig.ctl.request("status", json!({})).await;
         let cmd = resp["result"]["sessions"][0]["panes"][0]["current_command"].clone();
-        if cmd != json!(old) && !cmd.is_null() {
+        if want.iter().any(|w| cmd == json!(w)) {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "pane command never left {old}: {resp}"
+            "pane command never became one of {want:?}: {resp}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -149,17 +142,48 @@ async fn escaped_capture_flips_typed_text_to_idle_with_input_and_gates() {
         "payload pasted over typed human text"
     );
 
-    // The typed text goes away, only ghost text remains: idle again, and
-    // the held delivery proceeds on the state change.
+    // The typed text goes away and only ghost text remains, so the pane
+    // reads idle again. That is NOT admission: the composer was seen
+    // holding somebody's text, and one clean frame does not prove the
+    // text left. Nothing here says whether the human
+    // submitted their draft or is mid-redraw, so the hold stands.
     rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
-    rig.ev
-        .wait_event(Duration::from_secs(10), |e| {
-            e["event"] == "delivery-state"
+    wait_pane_state(&mut rig, "idle").await;
+    let held = rig
+        .ev
+        .wait_event(Duration::from_secs(8), |e| {
+            e["event"] == "gate"
                 && e["data"]["id"] == msg_id.as_str()
-                && e["data"]["to_state"] == "delivered_unverified"
+                && e["data"]["action"] == "hold"
+                && e["data"]["cause"] == "not_write_ready:composer_hold"
         })
         .await;
-    assert!(rig.tmux.capture(&pane).contains(&msg_id));
+    assert_eq!(held["data"]["to"], "codexy", "{held}");
+    assert!(
+        !rig.tmux.capture(&pane).contains("[cyclops"),
+        "payload pasted over a composer still under hold"
+    );
+
+    // A turn is the evidence the hold waits for: it is the one thing any
+    // vendor does that consumes a composer. Running one, then coming back
+    // to a clean composer, releases the hold and admits the delivery.
+    // Admission is where this test ends. What happens to the paste
+    // afterwards is staging verification, which has its own fixtures and
+    // its own tests; a `cat` pane paints no chrome under a paste and so
+    // cannot produce the evidence a real composer does.
+    rig.tmux
+        .run_ok(&["select-pane", "-t", &pane, "-T", "WORKING the draft"]);
+    wait_pane_state(&mut rig, "working").await;
+    rig.tmux.run_ok(&["select-pane", "-t", &pane, "-T", "done"]);
+    let proceed = rig
+        .ev
+        .wait_event(Duration::from_secs(10), |e| {
+            e["event"] == "gate"
+                && e["data"]["id"] == msg_id.as_str()
+                && e["data"]["action"] == "proceed"
+        })
+        .await;
+    assert_eq!(proceed["data"]["to"], "codexy", "{proceed}");
 
     // Screen text stays out of the ledger.
     rig.assert_ledger_legal(&["gateway.rs", "Find and fix a bug"]);
@@ -169,23 +193,88 @@ async fn escaped_capture_flips_typed_text_to_idle_with_input_and_gates() {
 /// Manifest binding only cat: after the occupant swap to a plain sh the
 /// gate can no longer bind, so the retry ends in attention_required
 /// instead of re-admitting.
-const CAT_ONLY_MANIFEST: &str = r#"
+/// Binds ONLY the composer process, so an occupant swap to a plain shell
+/// leaves the gate unable to bind at all. That is the point of it: the
+/// rebind tests need a manifest that stops matching the moment the pane
+/// changes hands.
+const COMPOSER_ONLY_MANIFEST: &str = r#"
 [agent]
 id = "fix"
-display_name = "Cat-only fixture"
-process_names = ["cat"]
+display_name = "Fake-TUI fixture, single binding"
+process_names = ["python3", "python", "Python"]
 
 [[rule]]
-id = "always_idle"
+id = "composer_has_input"
+state = "idle_with_input"
+priority = 200
+region = "bottom_non_empty_lines(8)"
+line_regex = ['^\s*❯\s+\S']
+line_regex_esc = ['^❯']
+
+[[rule]]
+id = "composer_empty"
 state = "idle"
-priority = 100
-region = "pane_title"
-regex = ['^']
+priority = 90
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^❯\s*$']
+
+[[rule]]
+id = "composer_working"
+state = "working"
+priority = 300
+region = "bottom_non_empty_lines(5)"
+line_regex = ['^FAKETUI-WORKING$']
 
 [injection]
 submit = "Enter"
 verify_before_submit = true
 verify_pattern = ["<message_id>"]
+composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
+composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
+composer_trailer_required_prefix = 2
+"#;
+
+/// The lifecycle fixture: the fake TUI's own layout.
+///
+/// It reaches the submit boundary through the authentic sentinel path,
+/// because the pane genuinely paints chrome below the staged text. The
+/// earlier version of this fixture declared a collapsed-paste chip over
+/// raw sentinel text, which claimed a representation no pane produced.
+const FAKETUI_MANIFEST: &str = r#"
+[agent]
+id = "fix"
+display_name = "Fake-TUI fixture"
+process_names = ["python3", "python", "Python"]
+
+[[rule]]
+id = "composer_has_input"
+state = "idle_with_input"
+priority = 200
+region = "bottom_non_empty_lines(8)"
+line_regex = ['^\s*❯\s+\S']
+line_regex_esc = ['^❯']
+
+[[rule]]
+id = "composer_empty"
+state = "idle"
+priority = 90
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^❯\s*$']
+
+[[rule]]
+id = "composer_working"
+state = "working"
+priority = 300
+region = "bottom_non_empty_lines(5)"
+line_regex = ['^FAKETUI-WORKING$']
+
+[injection]
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
+composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
+composer_trailer_required_prefix = 2
 "#;
 
 /// Install an inject-pause seam that parks the delivery at `phase` and
@@ -229,8 +318,8 @@ async fn pane_rebound_before_paste_never_pastes_into_the_new_occupant() {
     }
     let mut rig = Rig::new(
         "rbpaste",
-        CAT_ONLY_MANIFEST,
-        "cat",
+        COMPOSER_ONLY_MANIFEST,
+        &composer_pane(),
         "receipt_block_ms = 100\n",
     )
     .await;
@@ -246,9 +335,12 @@ async fn pane_rebound_before_paste_never_pastes_into_the_new_occupant() {
     // The gate admitted and the paste path is parked at the seam. Replace
     // the occupant with a plain shell and wait until the watcher table
     // saw the swap (command and pid travel in the same push).
-    entered.recv().await.expect("paste path reached the seam");
+    tokio::time::timeout(Duration::from_secs(10), entered.recv())
+        .await
+        .expect("paste path reached the seam within 10s")
+        .expect("seam channel open");
     rig.tmux.run_ok(&["respawn-pane", "-k", "-t", &pane, "sh"]);
-    wait_pane_command_away_from(&mut rig, "cat").await;
+    wait_pane_command_is(&mut rig, &["sh", "bash", "dash"]).await;
     release.add_permits(1);
 
     // The re-check caught the rebind: gate line, retry, and the retry's
@@ -306,8 +398,8 @@ async fn pane_rebound_before_submit_withholds_the_submit_key() {
     }
     let mut rig = Rig::new(
         "rbsub",
-        CAT_ONLY_MANIFEST,
-        "cat",
+        FAKETUI_MANIFEST,
+        &composer_pane(),
         "receipt_block_ms = 100\n",
     )
     .await;
@@ -321,9 +413,12 @@ async fn pane_rebound_before_submit_withholds_the_submit_key() {
     let msg_id = result["msg_id"].as_str().unwrap().to_string();
 
     // Paste and verification ran; the path is parked just before Enter.
-    entered.recv().await.expect("submit path reached the seam");
+    tokio::time::timeout(Duration::from_secs(10), entered.recv())
+        .await
+        .expect("submit path reached the seam within 10s")
+        .expect("seam channel open");
     rig.tmux.run_ok(&["respawn-pane", "-k", "-t", &pane, "sh"]);
-    wait_pane_command_away_from(&mut rig, "cat").await;
+    wait_pane_command_is(&mut rig, &["sh", "bash", "dash"]).await;
     release.add_permits(1);
 
     let rebound = rig
@@ -374,7 +469,13 @@ async fn send_and_wait_reports_paneless_recipients() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
-    let mut rig = Rig::new("waitless", CAT_MANIFEST, "cat", "receipt_block_ms = 100\n").await;
+    let mut rig = Rig::new(
+        "waitless",
+        CAT_MANIFEST,
+        &composer_pane(),
+        "receipt_block_ms = 100\n",
+    )
+    .await;
     let (result, _) = rig
         .send(json!({
             "to": ["ghost"],
@@ -457,4 +558,112 @@ async fn restart_closes_pre_hosted_field_ledger_chains() {
         "no aggregated restart notification"
     );
     daemon.shutdown().await;
+}
+
+/// Copy-mode entered after the gate admitted, before the paste. The gate
+/// checks `in_mode` before admitting, but admission is a decision about a
+/// moment, and a human can start scrolling inside the window that follows.
+/// A paste then lands somewhere neither of them can see.
+#[tokio::test(flavor = "multi_thread")]
+async fn pane_mode_entered_after_admission_withholds_the_paste() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "modepaste",
+        COMPOSER_ONLY_MANIFEST,
+        &composer_pane(),
+        "receipt_block_ms = 100\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    let (mut entered, release) = park_at(&rig, "pre_paste");
+
+    let (result, _) = rig
+        .send(json!({"to": ["worker"], "subject": "scrolling", "body": "not while reading"}))
+        .await;
+    let msg_id = result["msg_id"].as_str().unwrap().to_string();
+
+    // Admitted and parked at the seam: now the human scrolls.
+    tokio::time::timeout(Duration::from_secs(10), entered.recv())
+        .await
+        .expect("paste path reached the seam within 10s")
+        .expect("seam channel open");
+    rig.tmux.run_ok(&["copy-mode", "-t", &pane]);
+
+    // Wait for the DAEMON to see it, not tmux. The pre-paste re-check
+    // reads the watcher's pane table, so releasing on tmux's own view
+    // races the control-mode push that fills that table.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let resp = rig.ctl.request("status", json!({})).await;
+        let seen = resp["result"]["sessions"][0]["panes"]
+            .as_array()
+            .expect("panes array")
+            .iter()
+            .any(|p| p["pane_id"] == pane.as_str() && p["in_mode"] == json!(true));
+        if seen {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon never saw the pane enter copy-mode: {resp}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    release.add_permits(1);
+
+    // The pre-paste re-check refuses, and the delivery goes back through
+    // the gate rather than writing into a pane in copy-mode.
+    let rebound = rig
+        .ev
+        .wait_event(Duration::from_secs(8), |e| {
+            e["event"] == "gate"
+                && e["data"]["id"] == msg_id.as_str()
+                && e["data"]["action"] == "rebound"
+        })
+        .await;
+    assert_eq!(rebound["data"]["cause"], "pane_in_mode", "{rebound}");
+
+    // THE assertion, and it is about the pane rather than the record:
+    // zero staged facts says the pipeline believes it did not write, while
+    // the capture says whether anything reached the human's screen. Taken
+    // while copy-mode is still up, which is when a stray paste would show.
+    let screen = rig.tmux.capture(&pane);
+    assert!(
+        !screen.contains(msg_id.as_str()) && !screen.contains("not while reading"),
+        "payload reached a pane in copy-mode:\n{screen}"
+    );
+    let staged = rig
+        .ledger_lines()
+        .iter()
+        .filter(|l| {
+            l["kind"] == "state" && l["id"] == msg_id.as_str() && l["data"]["to_state"] == "staged"
+        })
+        .count();
+    assert_eq!(staged, 0, "a pane in copy-mode still staged a paste");
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "q"]);
+    rig.shutdown().await;
+}
+
+/// The fake TUI's stream parser owns the one thing a PTY makes hard:
+/// telling a pasted payload from the submit key that follows it. Its
+/// regressions live with it, and this runs them.
+#[test]
+fn faketui_stream_parser_selftest() {
+    let out = std::process::Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/faketui.py"
+        ))
+        .arg("--selftest")
+        .output()
+        .expect("run faketui selftest");
+    assert!(
+        out.status.success(),
+        "parser regressions failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

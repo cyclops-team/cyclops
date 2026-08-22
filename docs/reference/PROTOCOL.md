@@ -4,7 +4,10 @@ Anything the UI does, a script can do. The CLI is a thin client over one
 Unix socket at `$CYCLOPS_HOME/sock`, and the wire is NDJSON: one JSON object
 per line, in both directions.
 
-Every example below is a real exchange, captured from a running daemon.
+Examples show current protocol shapes. Additive optional fields may be omitted
+when they are not relevant to the behavior being explained.
+Message ids are abbreviated for readability. Newly minted ids use `m-`
+followed by all 32 lowercase hexadecimal UUID digits.
 
 ## Talk to it
 
@@ -20,10 +23,11 @@ line per request.
 ```
 
 `boot_id` changes on every daemon restart, so a client can tell which
-daemon run wrote a line and see where a restart fell. It does NOT mean
-`seq` restarted: the writer continues numbering from the tail of the file
-it finds, so seq is strictly increasing over the whole ledger and ordering
-by it is correct across restarts.
+daemon run wrote a line and see where a restart fell. It does NOT mean a
+journal sequence restarted: each writer continues from that journal's tail.
+Sequences are ordered within their owning journal, not across session ledgers
+and the workspace message journal. Messaging snapshots and invalidations name
+their workspace journal position explicitly as `workspace_seq`.
 
 `proto` mismatching yours is a warning, never a disconnect: unknown fields
 are ignored in both directions, so a newer client and an older daemon keep
@@ -40,7 +44,7 @@ sequenceDiagram
     C->>D: {"id":2,"method":"events.subscribe","params":{}}
     D-->>C: {"id":2,"result":{"subscribed":true}}
     Note over C,D: this connection is now in push mode
-    D-->>C: {"event":"msg","data":{...},"seq":16}
+    D-->>C: {"event":"messages.changed","data":{"changed":["mailboxes"],"workspace_seq":16},"seq":16}
     D-->>C: {"event":"state","data":{...},"seq":17}
 ```
 
@@ -62,17 +66,25 @@ A response carries exactly one of `result` or `error`:
 <- {"id":12,"error":{"code":"unknown_method","message":"unknown method \"nope.nope\""}}
 ```
 
-Error codes are stable; messages are for humans. Every code the daemon can
-answer with:
+Error codes are stable; messages are for humans. Common codes include:
 
 | Code | When |
 |---|---|
 | `unknown_method` | no such method |
+| `unimplemented` | the method name is reserved but its milestone has not shipped |
 | `bad_request` | the params did not parse, or a value is not allowed |
-| `no_such_target` | no pane answers to that name |
-| `denied` | the caller may not do this (a foreign uid, or a hook report from outside the pane) |
+| `no_such_target` | no mailbox recipient or pane answers to that address |
+| `no_such_message` | the named message does not exist or is not visible to this caller |
+| `message_not_pending` | the named mailbox entry is no longer claimable, for example because it was superseded |
+| `denied` | the caller may not do this, or its exact mailbox identity could not be proven |
+| `mailbox_unavailable` | the workspace mailbox service is not available |
+| `ambiguous_attention` | more than one attention item could match the requested action |
+| `attention_evidence_failed` | the terminal safety evidence changed before the action |
+| `discard_unsupported` | this notification cannot be cleared with discard |
 | `timeout` | `agent.wait` only: the deadline passed. `data.state` carries the state the target was last in |
 | `occupant_changed` | `agent.wait` only: the pinned pane died or changed occupant |
+| `notification_unavailable` | `msg.send` only: an obsolete caller requested the removed send-and-wait composition |
+| `attention_action_uncertain` | an attention action may have crossed its terminal write boundary; inspect the pane and do not retry |
 | `tmux_error` | `pane.read` only: tmux refused the capture |
 | `internal` | `pane.label` only: the registry file could not be written |
 | `chrome_not_restored` | `pane.label` with `"label": null` only: the name came off and the border could not be put back |
@@ -90,7 +102,17 @@ alphabet.
 | `pane.read` | A pane's screen, its recent output, or the detection view |
 | `pane.label` | Give a pane a name, or take it back |
 | `session.watch` | Start watching a tmux session the daemon was not booted with |
-| `msg.send` | Deliver a message; returns a receipt per recipient |
+| `msg.send` | Durably accept a message into one or more recipient mailboxes |
+| `msg.reply` | Reply using routing and subject derived from a visible message |
+| `inbox.list` | List pending mailbox metadata without bodies |
+| `inbox.claim` | Atomically claim one message and return its payload |
+| `messages.snapshot` | Read body-free inbox, outbound, and notification state |
+| `msg.requeue` | Explicitly requeue a notification that permits the transition |
+| `alarm.preview` | Preview unresolved notification alarms older than a duration |
+| `attention.show` | Read safety checks for one staged notification attempt |
+| `attention.complete` | Submit one exact staged notification attempt |
+| `attention.discard` | Clear one exact staged notification attempt without submitting it |
+| `alarm.clear` | Append clearance facts for explicit alarm identifiers |
 | `msg.history` | Messages from the record, filtered and paged |
 | `msg.thread` | One message, its replies, and its full delivery chain |
 | `agent.wait` | Block until an agent is idle, done, or blocked |
@@ -100,6 +122,7 @@ alphabet.
 | `events.subscribe` | Switch this connection to push mode |
 | `admin.notify` | Raise something for the human |
 | `theme.reload` | Re-read the theme selection and repaint every named pane's border |
+| `daemon.quiesce` | Hold the delivery pipeline at a restart-safe boundary |
 | `workspace_ui.get` | Last-active workspace and tab for the terminal workspace UI |
 | `workspace_ui.set` | Persist last-active workspace and tab (not a ledger fact) |
 
@@ -137,6 +160,26 @@ record. Each entry is `{id, to, state, ts, cause}`. Anything that shows the
 attention indicator must ask for it, because that is half the rule; a caller
 that only wants pane state leaves it off and pays nothing.
 
+`admin_unread` is the number of pending messages in the workspace
+administrator's durable inbox. Older daemons omit it and clients read zero.
+
+### daemon.quiesce
+
+`daemon.quiesce` accepts optional `timeout_ms`. The daemon pauses new delivery
+writes, waits up to the bounded timeout for attempts already past the paste
+boundary to resolve, and returns `{quiet, in_flight}`. `quiet: true` means the
+pipeline is safe to stop and remains paused for the bounded restart window;
+pre-write attempts do not block it because restart recovery requeues them. A
+false result names each unresolved `"<message id> -> <recipient>"`, resumes the
+pipeline, and requires the caller to refuse the restart.
+
+`diagnostics` is omitted when empty. A `deadlock_risk` entry identifies one
+exact notification attempt whose durable route is `gating` while the routed
+pane is `working` and the terminal's foreground process is `cyclops watch`.
+It carries only the message id, notification attempt id, recipient key,
+recipient label, and pane id. Missing route or process evidence produces no
+diagnostic.
+
 ### pane.read
 
 `source` is `visible` (the screen), `recent` (the screen plus scrollback),
@@ -145,15 +188,36 @@ cap; the third returns the reasoning behind a state.
 
 ```
 -> {"id":3,"method":"pane.read","params":{"target":"reviewer","source":"detection"}}
-<- {"id":3,"result":{"detection":{"decided_by":"title_idle","disagreement":false,
-    "readings":[{"rule":"title_idle","sensor":"title","state":"idle","ts":1785744822828}],
+<- {"id":3,"result":{"detection":{"decided_by":"title_idle","disagreement":false,"stale":false,"write_ready":true,
+    "readings":[{"rule":"title_idle","sensor":"title","state":"idle","ts":1785744822828},
+                {"rule":"composer_empty","sensor":"screen","state":"idle","ts":1785744822831}],
     "state":"idle"},"pane_id":"%1","target":"reviewer"}}
 ```
+
+The screen reading is not decoration. Had the title rule been the only
+sensor to report, the same `idle` state would have come back with
+`write_ready:false` and `write_block:"no_clean_composer_evidence"`: a
+title says the turn ended, and only the screen can say the composer is
+empty.
 
 `decided_by` names the manifest rule that won. `readings` is what each
 sensor saw, one per sensor that read anything (`title`, `screen`, `hook`).
 `disagreement` is true when sensors contradicted each other; the
 higher-priority rule still decided.
+
+Two additive fields carry the authorization answer, which is a different
+question from the runtime state. `stale` is true when this verdict is a
+retained earlier one, kept because the sensor read that should have
+refreshed it failed; the state may still be the best guess available, but
+nothing in it was observed just now. `write_ready` is always present and answers it
+directly; `write_block` is absent when a terminal write into the composer
+is allowed right now, and otherwise carries the content-free reason it is
+not (`not_idle`,
+`stale_screen_evidence`, `sensor_disagreement`, `no_clean_composer_evidence`,
+`conflicting_evidence`). An agent can be `idle` and still carry a
+`write_block`: idleness says no turn is running, while write-readiness
+says the composer was proven empty just now. Delivery gates on the second
+answer, never the first.
 
 A `detection` read is not free and not passive: it forces the full sensor
 set, which means a `capture-pane` the daemon would otherwise have skipped.
@@ -164,50 +228,195 @@ That is the point of it (reconcile on doubt), but do not put it in a loop.
 ```
 -> {"id":4,"method":"msg.send","params":{"to":["reviewer"],
     "subject":"Review the rate limiter","body":"gateway.rs:120 drops the burst path"}}
-<- {"id":4,"result":{"deliveries":[{"note":"hook_ack","state":"delivered_verified",
-    "to":"reviewer"}],"msg_id":"m-7fe0df","seq":7}}
+<- {"id":4,"result":{"deliveries":[{"notification_state":"queued",
+    "state":"queued","to":"reviewer"}],"inserted":true,
+    "msg_id":"m-7fe0df","seq":7}}
 ```
 
 `to` takes several labels, or `"*"` for every named pane. Optional params:
-`fyi` (an announcement, drops the reply hint), `reply_to` (a message id),
-and `wait` (`{"until":"done","timeout_ms":300000}`) to compose send-and-wait.
+`fyi` (an announcement), `client_key` (sender-scoped exact-retry key),
+`reply_to` (a visible message id) and `supersedes` (one unclaimed message
+with the same sender, recipient, and thread). The deprecated `wait` field
+is retained in protocol v1 only so the daemon can reject old callers with
+`notification_unavailable` instead of silently ignoring their request.
 
 The sender is never in the request. The daemon resolves it from the calling
-process, walking it up to a watched pane; unresolvable callers are `admin`.
+process, walking it up to a watched pane. A same-user process proven outside
+every watched pane is `admin`; an unprovable ancestry is denied.
 Nothing in a body can forge the header the recipient reads.
 
-One `deliveries` entry per recipient. States, in order:
-`queued`, `gating`, `pasting`, `staged`, `submitted`, then
-`delivered_verified` or `delivered_unverified`; failures go to
-`retry_queued` only when the daemon proves the failure happened before any
-payload bytes reached the pane. Failures after that boundary go directly to
-`attention_required`, and quota goes to
-`parked_blocked_quota`, which is terminal and never retried.
+The response proves durable acceptance. `inserted` is false when the
+sender-scoped `client_key` resolves to an existing exact request. Each
+`deliveries` entry names one recipient mailbox. Its compatibility `state` is
+`queued`; `notification_state` is the authoritative asynchronous wake state.
+`position`, when present, is the number of older pending entries in that
+recipient's FIFO.
 
-While the in-flight head is held at the gate, its otherwise-compatible
-`state: "queued"` receipt may include `held_by`. This optional field contains
-one normalized token: `working`, `idle_with_input`, `pane_in_mode`,
-`session_detached`, `blocked`, or `unknown`. It never contains a manifest
-rule id. Render these as `recipient working`, `composer has input`, `pane in
-copy mode`, `session detached`, `waiting for a decision`, and `target state
-unknown`, respectively. A follower still has only its FIFO `position` and
-renders `queued · N ahead`.
+For a non-admin recipient, the daemon selects one transport at the terminal
+write boundary. An exact installed claim skill selects the content-free
+doorbell:
 
-The exact machine cause remains visible in the receipt's `note` field in JSON
-and in the delivery `cause` in the ledger. The pre-write causes that may
-consume `delivery_retry_max` are
-`session_detached`, `no_manifest`, `pane_rebound`, and `spool_failed`.
-`paste_failed`, `verify_failed`, `pane_rebound_after_paste`, `submit_failed`,
-and `ack_timeout` are ambiguous terminal outcomes: they may have reached the
-pane and must not trigger another paste. In those cases
-`attention_required` means the outcome is unknown, not proven non-delivery;
-inspect the recipient before resending.
+```text
+cyclops inbox claim m-7fe0df
+```
 
-The daemon answers as soon as the delivery settles, capped by
-`receipt_block_ms`. Keep that under the five seconds the CLI allows itself
-for a socket read, or the CLI gives up on a delivery that is going fine.
+If that exact capability is absent, outdated, edited, unreadable, or changes
+before the write, the daemon submits the canonical full payload ending in
+`[cyclops:end <id>]`. A successful fallback appends
+`message_delivered_direct`; it does not append `message_claimed` and has no
+claimant.
+
+The notification states are `not_started`, `queued`, `gating`, `writing`,
+`staged`, `submitted`, `notified`, `attention_required`, and `superseded`.
+An ambiguous terminal outcome moves to `attention_required` and never triggers
+an automatic second write. A doorbell message remains pending until claim. A
+successful direct fallback settles the mailbox entry as `delivered_direct`.
+Admin has no pane route, so an accepted admin message reports `not_started` and
+remains in the durable admin inbox without a notification attempt.
+
+The Writing transition carries `transport: "doorbell" | "direct_payload"`
+beside `binding`. A current doorbell also carries `doorbell_format: 1`, which
+fixes the compact claim command bytes for later recovery. A missing format
+identifies the original verbose doorbell. Unknown numeric formats replay but
+cannot authorize an attention recovery action. Binding contains recipient,
+foreground leader generation, agent generation, and manifest only. Transport
+and doorbell format are delivery metadata, not occupant identity. Later
+transitions retain the projected values without repeating them. A Writing fact
+with no transport means the original doorbell format.
+
+`writing` is also the durable composer-barrier boundary. Its content-free
+binding records the exact recipient, agent process generation, manifest, and,
+for current rows, foreground leader. Older rows without a leader still arm the
+barrier. A later `writing` compacts an older barrier only for the same exact
+recipient.
+
+After a daemon restart, only `notified`, which carries receipt proof, may retire
+from a fresh clean screen for the same agent generation and manifest. Earlier
+post-write states and `attention_required` restore a hold first. A recovered
+hold can then bind an exact manifest-declared turn observed after restart. Its
+matching end and a later fresh clean screen produce a content-free
+`notification_barrier_retired` fact before the runtime hold is released.
+Foreground leader changes do not change composer ownership; operator terminal
+actions still require the exact recorded leader. Agent-generation or manifest
+replacement, explicit operator resolution, and proven physical pane loss are
+the other retirement paths. Session-local pane removal alone is not pane loss.
+
+### mailbox and notification control
+
+`inbox.list` accepts an optional `limit` and authoritative `sender` recipient
+key. Sender filtering happens before the limit, so the result is the oldest
+matching pending message. Bodies never appear in this result:
+
+```text
+-> {"id":5,"method":"inbox.list","params":{"limit":20}}
+<- {"id":5,"result":{"entries":[{"message_id":"m-7fe0df",
+    "sender":{"kind":"admin","workspace_id":"2863a6ef-0f58-46ad-a87d-7b4157ba8e6a"},
+    "sender_label":"admin","subject":"Review the rate limiter",
+    "thread_root":"m-7fe0df","ts":1785744824837}]}}
+```
+
+`inbox.claim` takes one exact `message_id`, atomically claims that caller's
+mailbox entry, and returns the immutable payload:
+
+```text
+-> {"id":6,"method":"inbox.claim","params":{"message_id":"m-7fe0df"}}
+<- {"id":6,"result":{"disposition":"claimed","message":{
+    "body":"gateway.rs:120 drops the burst path","kind":"msg",
+    "message_id":"m-7fe0df",
+    "sender":{"kind":"admin","workspace_id":"2863a6ef-0f58-46ad-a87d-7b4157ba8e6a"},
+    "sender_label":"admin",
+    "subject":"Review the rate limiter","thread_root":"m-7fe0df"}}}
+```
+
+Reclaiming the same id returns `already_claimed` with the same payload and
+appends no second claim. An entry that is no longer claimable returns
+`message_not_pending`; a subscribed receive client should list again within its
+original deadline. A claim proves retrieval, not task completion.
+
+`messages.snapshot` returns one atomic body-free projection for the
+authenticated caller. Agents see only messages they sent or received. The
+workspace administrator sees all message metadata. Every active message is
+returned along with a bounded recent settled tail controlled by
+`recent_settled` (default 20, maximum 100). Counts cover every visible message,
+including settled rows outside that tail. Rows carry per-recipient mailbox and
+FIFO state, current notification attempt and cause, attention clearance,
+operator resolution, uncertain resolution intent, and a workspace sequence
+watermark. A notification resolution is reported separately as `complete` or
+`discard`; a resolved attempt is not open attention. Direction is relative to
+the caller: `inbound`, `outbound`, `self_addressed`, or administrator-only
+`workspace`. Both the message and each recipient row carry their own direction
+and `needs_action` answer. A per-recipient surface must use the recipient fields
+so one broadcast mailbox cannot inherit another's state. Counts include
+caller-relative inbox, outbound, and Work totals even when settled rows are
+outside the returned tail. An agent's Work is a pending mailbox item for that
+agent. Administrator Work also includes messages with an uncleared attention
+attempt. `needs_action` applies the same rule to each returned row.
+Per-recipient `can_manage_attention` is the daemon-owned authority for an
+operator action on that exact row. It defaults false for older records and is
+false for non-administrators, resolved or cleared attempts, and uncertain
+resolution intent. A client must not infer it from `needs_action`.
+
+A recipient with no notification attempt reports `not_started`; the read model
+never invents a queued attempt. Per-recipient `available` comes from the current
+durable route directory keyed by recipient identity. It is current route
+metadata and is not covered by `workspace_seq`. Mailbox state can be `pending`,
+`claimed`, `delivered_direct`, or `superseded`; `delivered_direct` authorizes
+body access for that exact recipient but reports no claimant. A replacement
+process or session therefore cannot inherit the old recipient's availability.
+Bodies, terminal captures, notification bindings, and diffs never appear in
+the result.
+
+For a live mailbox surface, subscribe to `messages.changed` on the stream
+connection before requesting this snapshot on a second connection. The event
+and snapshot both carry a workspace sequence. An event at or below the
+snapshot sequence is already represented. A higher sequence requires one
+new snapshot.
+
+`msg.reply` takes `message_id`, `body`, and optional `client_key`. The daemon
+derives the sole recipient, thread root, and `Re: ` subject from the visible
+parent. The `reply_to` field on `msg.send` uses the same validation.
+
+`admin` is a first-class durable mailbox recipient, not a pane. An agent may
+send or reply to admin. Admin messages create no notification attempt and no
+terminal wake. The authenticated admin caller lists and claims that inbox with
+the same methods above. The `admin_unread` status field is its pending count.
+Broadcast `*` addresses adopted agent panes only.
+
+`msg.requeue` takes one `message_id`. `alarm.preview` takes `older_than_ms`.
+`alarm.clear` takes a non-empty list of explicit alarm ids; there is no
+clear-all or age-selected daemon mutation. The human CLI implements
+`alarm clear --older-than <age>` by calling preview once, printing the exact
+selected ids, naming the count and cutoff in its confirmation, and sending
+only that frozen id set to `alarm.clear`. Alarms created after the preview
+cannot be swept into the request. Requeues and clearances are append-only
+workspace facts.
+
+`attention.show` takes `id` and optional `diff`. The id is an exact
+notification attempt id, or a message id only when that message has one
+unresolved attention attempt. It returns five checks: `notification_exact`,
+`trailer_anchored`, `process_matches`, `manifest_matches`, and
+`terminal_action_safe`. These prove the exact selected transport payload, its
+measured terminal layout, the full foreground and agent process generations,
+the manifest, and a positively classified staged composer. With `diff`, it
+also returns the expected payload and safely extracted composer content so the
+CLI can compute a local diff. A direct fallback diff contains the message body
+and is available only to the authenticated workspace administrator. Diff bytes
+are never journaled, logged, or emitted as events.
+`attention.complete` and `attention.discard` take the same id shape. Both
+require all five checks again immediately before the key sequence. Complete
+uses the manifest submit key. Discard uses only the manifest clear sequence
+and refuses a manifest without one. Before sending the terminal key, the
+daemon appends a content-free `notification_resolution_intent` fact. A known
+pre-key refusal appends `notification_resolution_intent_withdrawn` and may be
+retried. An accepted key is followed by one content-free
+`notification_resolved` fact. An unmatched intent reports an uncertain
+outcome and must not be repeated. Repeated or ambiguous resolutions refuse.
 
 ### msg.history and msg.thread
+
+The next example is a legacy direct-delivery record. Standard mailbox and
+notification state is read through `messages.snapshot`; history retains old
+delivery fields so earlier journals remain readable.
 
 ```
 -> {"id":5,"method":"msg.history","params":{"with":"reviewer","limit":2}}
@@ -223,6 +432,15 @@ Filters: `with` (both directions plus broadcasts), or `from` and `to`. Pick
 one shape. Lines come back oldest first, so the newest is last. Each line's
 `deliveries` are folded to the current state per recipient at read time; the
 files themselves are never rewritten.
+
+Message metadata and body access are separate. A sender can read its authored
+body. A recipient receives no `body` field until it claims that exact message
+or its mailbox records `delivered_direct` for the exact direct attempt.
+An admin can inspect workspace metadata, but sees a body only when the admin
+sent or claimed that message. Pre-upgrade session records have no durable
+sender and recipient identities, so their bodies are always omitted. Messages
+where the caller is neither sender nor recipient stay absent from history and
+answer `no_such_message` from thread lookup.
 
 Page with `next_cursor` fed back as `cursor`. With more than one watched
 session the daemon issues `next_cursor2` instead and takes it back as
@@ -250,10 +468,9 @@ all sharing the message id:
 `id`, `ts`, `from`, `to`, `deliveries`, and inside `data` the recipient and
 a null `cause`. The full lines are in the ledger file.)
 
-That chain is the whole delivery: `queued`, `gating`, the gate's own
-decision line, `pasting`, `staged`, `submitted`, `delivered_verified`. Seven
-lines for one message is normal, and every one of them is a fact somebody
-can check later.
+That chain is the legacy direct delivery: `queued`, `gating`, the gate's own
+decision line, `pasting`, `staged`, `submitted`, `delivered_verified`. New
+mailbox notification transitions are content-free system facts instead.
 
 ### agent.wait
 
@@ -266,6 +483,9 @@ can check later.
 `until` is `idle`, `done`, or `blocked`. The daemon watches its own state
 stream and holds the response; nothing polls, on either side. Set your read
 deadline above `timeout_ms`.
+
+This wait observes pane state. It does not correlate the observed turn to a
+message or prove that a specific task completed.
 
 Two failures have their own codes rather than an outcome: `timeout` (its
 `data` carries the state the target was last in) and `occupant_changed`, the
@@ -332,9 +552,17 @@ configured session that has not been created yet.
 ### agent.state.report
 
 This is the one method a script should not call. It is how a vendor hook
-reports a turn edge, and it is accepted only from a process running inside
-the pane it speaks for, checked against the connection's kernel peer
-credentials:
+reports a turn edge, and being inside the pane is not enough to post one.
+
+The connection's kernel peer credentials place the process in a pane, and
+then the daemon walks from that process up to the pane's root looking for
+one whose own argv says it is an agent cyclops ships a manifest for. That
+ancestor is the reporting agent, and the report is filed under it. A peer
+with no such ancestor is refused, however deep inside the pane it sits,
+because an adopted pane keeps its name and its manifest while its agent
+is not running, and anyone at that shell prompt can start anything. A
+manifest pin that disagrees with the process found is also refused,
+rather than believed.
 
 ```
 -> {"id":11,"method":"agent.state.report","params":{"agent":"reviewer","event":"Stop","payload":{}}}
@@ -343,9 +571,11 @@ credentials:
     reports)"}}
 ```
 
-Real hooks pass by construction: `cyclops hook` runs as a child of the agent
-CLI inside the pane. So neither a verified receipt nor the `hooks verified`
-bit can be forged by something that merely shares your user id.
+Real hooks pass by construction: `cyclops hook` runs as a child of the
+agent CLI, so the walk lands on that CLI whether it holds the terminal
+itself or handed it to the helper. So neither a verified receipt nor the
+`hooks verified` bit can be forged by something that merely shares your
+user id, or by something merely sharing the pane.
 
 ### hooks.verify and hooks.selftest
 
@@ -395,10 +625,10 @@ Sending it switches the connection to push mode. Responses to earlier
 requests still arrive; unsolicited event lines now arrive too.
 
 ```
--> {"id":1,"method":"events.subscribe","params":{"kinds":["msg","state"]}}
+-> {"id":1,"method":"events.subscribe","params":{"kinds":["messages","state"]}}
 <- {"id":1,"result":{"subscribed":true}}
-<= {"event":"msg","data":{"body":"x","from":"admin","fyi":false,"id":"m-e0ccf9",
-    "reply_to":null,"subject":"ping the stream","to":["reviewer"]},"seq":15}
+<= {"event":"messages.changed","data":{"changed":["mailboxes","notifications"],
+    "workspace_id":"00000000-0000-0000-0000-000000000001","workspace_seq":15},"seq":15}
 ```
 
 `kinds` filters by event-name prefix; leave it empty for everything. An
@@ -439,7 +669,7 @@ show a theme no file on the machine holds.
 ```
 
 Returns the last workspace and tab the terminal UI focused. Absent fields
-mean nothing was saved yet. Not a ledger fact — losing it costs one click
+mean nothing was saved yet. Not a ledger fact; losing it costs one click
 after a daemon restart.
 
 ### workspace_ui.set
@@ -459,18 +689,42 @@ name prefix, so these are the strings to filter on.
 
 | Event | What happened | `seq` |
 |---|---|---|
-| `msg` | a message was sent | yes |
-| `delivery-state` | one delivery moved to a new state | yes |
-| `gate` | the delivery gate decided about a recipient | yes |
+| `msg` | a message entered the legacy direct-delivery session record | yes |
+| `messages.changed` | the durable workspace messaging projection changed | yes |
+| `messages.route_changed` | live mailbox route availability changed | no |
+| `delivery-state` | one legacy direct delivery moved to a new state | yes |
+| `gate` | the legacy direct-delivery gate decided about a recipient | yes |
 | `state` | a pane's fused state changed | yes |
+| `readiness` | a pane's write-readiness changed, its state did not | no |
 | `session` | a watched session attached or detached, or a pane was named | yes |
 | `admin-notify` | something was raised for the human | yes |
 | `pane-removed` | a watched pane closed | no |
 | `theme` | the active theme was re-read | no |
 
+`readiness` carries `pane_id`, `write_ready`, and `write_block`. It exists
+because the two answers move independently: a pane can be `idle` before
+and after a composer hold lifts, so there is no state edge, and anything
+waiting on the refusal would wait through its own release. It is
+deliberately not a `state` line. Nothing happened to the pane's runtime
+state, and writing one to the record would be a transition that never
+occurred.
+
+`messages.changed` is a content-free invalidation signal. Its data contains
+exactly `workspace_id`, `workspace_seq`, and `changed`. The changed set uses
+the closed values `messages`, `mailboxes`, `notifications`, and `attention`.
+Clients fetch `messages.snapshot` for current state. The event never carries a
+subject, body, recipient, terminal capture, diff, pane content, or notification
+attempt details.
+
+`messages.route_changed` is the matching content-free edge for live session
+and pane availability, which is intentionally outside the workspace journal
+watermark. It carries no message or recipient data. A mailbox client responds
+by fetching the same authenticated whole snapshot.
+
 `seq` is the ledger seq of the line the event corresponds to, so a client
-can go from an event to the record and back. Two events have no line
-behind them. A pane closing appends nothing to the ledger, so `pane-removed`
+can go from an event to the record and back. For `messages.changed`, both
+`seq` and `data.workspace_seq` name the workspace journal line. Three events
+have no line behind them. A pane closing appends nothing to the ledger, so `pane-removed`
 is the only notice a subscriber gets that a pane is gone; it is still a
 fact about a pane and the UI shows it in the stream. `theme` is the one
 event that is not a fact about the record at all: nothing happened to any
@@ -489,8 +743,10 @@ what a daemon restart produces. A client showing the ping beside a count
 holds it against those, so a ping about something already resolved stops
 being shown.
 
-Real lines, off two isolated rigs, one send and one pane close on the
-first and the state, session and notify edges on the second:
+Real compatibility lines from two isolated rigs follow. The `msg`, `gate`, and
+`delivery-state` events belong to legacy direct delivery. Standard messaging
+invalidates clients with `messages.changed` and never puts a message body on
+the event stream.
 
 ```
 {"event":"msg","data":{"body":"y","from":"admin","fyi":false,"id":"m-ebefe2","reply_to":null,"subject":"second","to":["reviewer"]},"seq":22}
@@ -506,20 +762,31 @@ first and the state, session and notify edges on the second:
 New event names are additive: an unknown one is a line with an `event` your
 client does not know, and ignoring it is correct.
 
-## The record underneath
+## The records underneath
 
-The socket is a live view of files you can read directly:
-`~/.cyclops/ledger/<session>.ndjson`, one line per fact, append-only, never
-rewritten. Line shape matches what `msg.history` returns, minus the read-time
-folding. No daemon needs to be running.
+The canonical mailbox record is one append-only workspace journal. Discover
+its durable id from the body-free projection instead of assuming a directory
+name:
 
 ```bash
-jq -c 'select(.kind == "msg")' ~/.cyclops/ledger/main.ndjson
-jq -c 'select(.id == "m-914b34")' ~/.cyclops/ledger/main.ndjson   # one message, everything that happened to it
+workspace_id=$(cyclops --json messages | jq -r .workspace_id)
+cyclops_home="${CYCLOPS_HOME:-$HOME/.cyclops}"
+jq -c 'select(.id == "m-914b34")' \
+  "$cyclops_home/workspaces/$workspace_id/messages.ndjson"
 ```
 
-`kind` is `msg`, `fyi`, `state`, `gate`, or `system`. Secrets never enter
-these files.
+This journal holds immutable message bodies, mailbox mutations, notification
+transitions, composer-barrier retirement facts, and operator recovery facts.
+Barrier retirement records one of exact lifecycle reconciliation, clean
+receipt-bearing composer observation, occupant replacement, or proven physical
+pane loss. Notification facts and events are content-free. `msg.history`,
+`msg.thread`, and `messages.snapshot` apply the authenticated caller's
+visibility rules rather than exposing raw journal bytes.
+
+Session records remain separately under
+`$CYCLOPS_HOME/ledger/<session>.ndjson`. They own pane state and legacy direct
+delivery compatibility. They are not the mailbox journal. Both record families
+are append-only owner-only state and can be read without a running daemon.
 
 ## Or just use the CLI
 

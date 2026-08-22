@@ -4,9 +4,10 @@
 //! roster, the border, the record. Three strings already mean something
 //! else in that namespace, so a pane wearing one could not be addressed:
 //!
-//! 1. `admin` is the operator. Every message sent from a terminal rather
-//!    than from inside a pane is from `admin`, so the record would read
-//!    `admin → admin` and `cyclops send admin` would have two answers.
+//! 1. `admin` is the operator's durable mailbox identity. It is a valid
+//!    message address, but no pane may wear it. Only a same-user caller proven
+//!    outside every watched pane resolves as `admin`; a pane with that label
+//!    would make identity ambiguous.
 //! 2. `*` addresses every agent at once.
 //! 3. `%0`, `%1` and so on are tmux's own pane ids, which cyclops accepts
 //!    anywhere a label is accepted.
@@ -34,9 +35,9 @@ pub fn refusal(label: &str) -> Option<String> {
     }
     if label == ADMIN {
         return Some(format!(
-            "\"{ADMIN}\" is you. Every message you send from a terminal is from \
-             \"{ADMIN}\", so a pane called that could not be told apart from you \
-             on the record. Pick another name, e.g. lead."
+            "\"{ADMIN}\" is you. A same-user terminal caller outside every watched \
+             pane sends as \"{ADMIN}\", so a pane called that would collide with \
+             the operator on the record. Pick another name, e.g. lead."
         ));
     }
     if label == EVERYONE {

@@ -7,6 +7,7 @@ description = "Cyclops terminal workspace: pane VT runtimes and the full-screen 
 [dependencies]
 alacritty_terminal = "0.26"
 cyclops-proto.workspace = true
+cyclops-state.workspace = true
 cyclops-theme.workspace = true
 cyclops-tmux.workspace = true
 cyclops-ui.workspace = true
@@ -17,6 +18,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 toml.workspace = true
 unicode-width = "0.2.2"
+uuid.workspace = true
 
 [dev-dependencies]
 cyclops-testrig.workspace = true

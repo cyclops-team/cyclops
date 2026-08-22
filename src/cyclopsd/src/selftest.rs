@@ -32,7 +32,7 @@ use cyclops_proto::{
 use serde_json::{json, Value};
 use tokio::time::{Duration, Instant};
 
-use crate::{ack, daemon_line, delivery, unix_ms, Inner};
+use crate::{ack, daemon_line, delivery, unix_ms, Inner, PaneKey};
 
 /// Default and ceiling for how long hooks.selftest waits for its delivery
 /// to resolve. The happy path resolves inside the receipt block; this only
@@ -49,18 +49,18 @@ type PaneEdges = HashMap<String, (String, u64)>;
 /// occupant restart without hooks must not keep showing hooks_verified
 /// behind the previous occupant's edges (the F1 stale-liveness hole).
 struct OccupantEdges {
-    pane_pid: i32,
+    pane_pid: crate::identity::ProcId,
     edges: PaneEdges,
 }
 
-/// Per-pane hook edge record. Keys are pane ids. In-memory and
+/// Per-pane hook edge record. Keys are exact watched routes. In-memory and
 /// boot-scoped: "ever" means "this daemon run", which is exactly the
 /// question at adoption/boot (did THIS setup ever produce an edge).
 pub(crate) struct HookLiveness {
-    edges: StdMutex<HashMap<String, OccupantEdges>>,
-    /// Occupant (pane id -> pane_pid) whose F1 notification already went
-    /// out: one ping per occupant, never a loop.
-    f1_notified: StdMutex<HashMap<String, i32>>,
+    edges: StdMutex<HashMap<PaneKey, OccupantEdges>>,
+    /// Occupant whose F1 notification already went out: one ping per
+    /// occupant, never a loop.
+    f1_notified: StdMutex<HashMap<PaneKey, crate::identity::ProcId>>,
 }
 
 impl HookLiveness {
@@ -75,14 +75,18 @@ impl HookLiveness {
     /// Duplicates count: a duplicate still proves the hook config is loaded
     /// and firing. An edge from a NEW occupant retires the old occupant's
     /// edges: they were never evidence about this process.
-    pub(crate) fn record(&self, pane_id: &str, raw_event: &str, ts: u64, pane_pid: i32) {
+    pub(crate) fn record(
+        &self,
+        pane: &PaneKey,
+        raw_event: &str,
+        ts: u64,
+        pane_pid: crate::identity::ProcId,
+    ) {
         let mut edges = self.edges.lock().expect("hook liveness lock");
-        let entry = edges
-            .entry(pane_id.to_string())
-            .or_insert_with(|| OccupantEdges {
-                pane_pid,
-                edges: PaneEdges::new(),
-            });
+        let entry = edges.entry(pane.clone()).or_insert_with(|| OccupantEdges {
+            pane_pid,
+            edges: PaneEdges::new(),
+        });
         if entry.pane_pid != pane_pid {
             entry.edges.clear();
             entry.pane_pid = pane_pid;
@@ -95,46 +99,43 @@ impl HookLiveness {
     /// True once any hook edge has been seen from the CURRENT occupant of
     /// this pane. Edges recorded under a different pane_pid are a previous
     /// occupant's and count for nothing.
-    pub(crate) fn seen_any(&self, pane_id: &str, current_pid: i32) -> bool {
+    pub(crate) fn seen_any(&self, pane: &PaneKey, current_pid: crate::identity::ProcId) -> bool {
         self.edges
             .lock()
             .expect("hook liveness lock")
-            .get(pane_id)
+            .get(pane)
             .is_some_and(|o| o.pane_pid == current_pid && !o.edges.is_empty())
     }
 
     /// Last-seen unix ms per normalized event, with the raw spelling.
     /// Empty when the recorded edges belong to a previous occupant.
-    fn snapshot(&self, pane_id: &str, current_pid: i32) -> PaneEdges {
+    fn snapshot(&self, pane: &PaneKey, current_pid: crate::identity::ProcId) -> PaneEdges {
         self.edges
             .lock()
             .expect("hook liveness lock")
-            .get(pane_id)
+            .get(pane)
             .filter(|o| o.pane_pid == current_pid)
             .map(|o| o.edges.clone())
             .unwrap_or_default()
     }
 
     /// Pane closed: its edges and its F1 one-shot die with it.
-    pub(crate) fn forget(&self, pane_id: &str) {
-        self.edges
-            .lock()
-            .expect("hook liveness lock")
-            .remove(pane_id);
+    pub(crate) fn forget(&self, pane: &PaneKey) {
+        self.edges.lock().expect("hook liveness lock").remove(pane);
         self.f1_notified
             .lock()
             .expect("f1 notified lock")
-            .remove(pane_id);
+            .remove(pane);
     }
 
     /// True exactly once per pane occupant: the caller sends the F1
     /// notification. A new occupant gets its own one-shot.
-    fn first_f1(&self, pane_id: &str, current_pid: i32) -> bool {
+    fn first_f1(&self, pane: &PaneKey, current_pid: crate::identity::ProcId) -> bool {
         let mut notified = self.f1_notified.lock().expect("f1 notified lock");
-        if notified.get(pane_id) == Some(&current_pid) {
+        if notified.get(pane) == Some(&current_pid) {
             return false;
         }
-        notified.insert(pane_id.to_string(), current_pid);
+        notified.insert(pane.clone(), current_pid);
         true
     }
 }
@@ -159,10 +160,10 @@ pub(crate) fn tier_of(m: &Manifest) -> u8 {
 /// the caller's already-held status locks so nothing re-locks here.
 pub(crate) fn hooks_verified_for(
     inner: &Inner,
-    pane_id: &str,
+    pane: &PaneKey,
     adopted: bool,
     manifest_id: Option<&str>,
-    pane_pid: i32,
+    agent: Option<crate::identity::ProcId>,
 ) -> Option<bool> {
     if !adopted {
         return None;
@@ -171,7 +172,11 @@ pub(crate) fn hooks_verified_for(
     if !declares_hooks(m) {
         return None;
     }
-    Some(inner.hook_liveness.seen_any(pane_id, pane_pid))
+    // The ADMITTED AGENT, not the pane's root process. Reports are filed
+    // under the agent's own identity, and a pane root is a shell that
+    // never emitted a hook in its life. An agent nobody can identify
+    // right now has no proven liveness either.
+    Some(agent.is_some_and(|a| inner.hook_liveness.seen_any(pane, a)))
 }
 
 /// The likely reason a configured hook set never fires, per CLI. F1 is the
@@ -214,19 +219,23 @@ pub(crate) fn notify_f1_once(
     session_idx: usize,
     manifest_id: &str,
 ) {
-    // The current occupant's pid from the live table; a vanished pane has
-    // no occupant to warn about.
-    let Some(pane_pid) = inner
+    // The admitted AGENT, not the pane root. F1 is about an agent whose
+    // hooks are not firing, and the pane's shell has no hooks to fire. A
+    // pane whose agent cannot be identified right now has nobody to warn
+    // about.
+    let Some(agent) = inner
         .watcher_of(session_idx)
         .and_then(|w| w.pane(pane_id))
-        .map(|row| row.pane_pid)
+        .and_then(|row| crate::fusion::admitted_vendor(inner, session_idx, &row))
+        .map(|(_, proc)| proc)
     else {
         return;
     };
-    if inner.hook_liveness.seen_any(pane_id, pane_pid) {
+    let pane = PaneKey::new(session_idx, pane_id);
+    if inner.hook_liveness.seen_any(&pane, agent) {
         return;
     }
-    if !inner.hook_liveness.first_f1(pane_id, pane_pid) {
+    if !inner.hook_liveness.first_f1(&pane, agent) {
         return;
     }
     delivery::admin_notify(
@@ -254,7 +263,7 @@ pub(crate) async fn verify(
     inner: &Arc<Inner>,
     params: HooksVerifyParams,
 ) -> Result<Value, WireError> {
-    let Some((_, pane_id)) = inner.resolve_recipient(&params.target) else {
+    let Some((session_idx, pane_id)) = inner.resolve_recipient(&params.target) else {
         return Err(WireError {
             code: "no_such_target".to_string(),
             message: format!("no such target {:?}", params.target),
@@ -262,35 +271,29 @@ pub(crate) async fn verify(
         });
     };
     let row = inner
-        .session_slots()
-        .iter()
-        .find_map(|slot| {
-            let link = slot.link.lock().expect("session link lock");
-            link.watcher.as_ref().and_then(|w| w.pane(&pane_id))
-        })
+        .watcher_of(session_idx)
+        .and_then(|watcher| watcher.pane(&pane_id))
         .ok_or_else(|| WireError {
             code: "no_such_target".to_string(),
             message: "pane vanished during verify".to_string(),
             data: None,
         })?;
-    let manifest = crate::fusion::bind_manifest_for(inner, &row);
-    let adopted = inner.label_of(&pane_id).is_some();
+    let manifest = crate::fusion::bind_manifest_for(inner, session_idx, &row);
+    let adopted = inner.label_for_route(session_idx, &pane_id).is_some();
     let (manifest_id, tier) = match manifest {
         Some(m) => (Some(m.agent.id.clone()), tier_of(m)),
         None => (None, 2),
     };
-    let hooks_verified = hooks_verified_for(
-        inner,
-        &pane_id,
-        adopted,
-        manifest_id.as_deref(),
-        row.pane_pid,
-    );
+    let agent = crate::fusion::admitted_vendor(inner, session_idx, &row).map(|(_, proc)| proc);
+    let pane = PaneKey::new(session_idx, &pane_id);
+    let hooks_verified = hooks_verified_for(inner, &pane, adopted, manifest_id.as_deref(), agent);
 
     // Declared key events first (manifest order: ack, turn_start,
     // turn_end, deduped on the normalized name), then anything else that
     // actually fired. Edges from a previous occupant are not listed.
-    let seen = inner.hook_liveness.snapshot(&pane_id, row.pane_pid);
+    let seen = agent
+        .map(|a| inner.hook_liveness.snapshot(&pane, a))
+        .unwrap_or_default();
     let now = unix_ms();
     let mut events: Vec<HookEdgeAge> = Vec::new();
     let mut listed: HashSet<String> = HashSet::new();
@@ -346,14 +349,10 @@ pub(crate) async fn selftest(
         });
     };
     let (manifest_id, tier) = inner
-        .session_slots()
-        .iter()
-        .find_map(|slot| {
-            let link = slot.link.lock().expect("session link lock");
-            link.watcher.as_ref().and_then(|w| w.pane(&pane_id))
-        })
+        .watcher_of(session_idx)
+        .and_then(|watcher| watcher.pane(&pane_id))
         .and_then(|row| {
-            crate::fusion::bind_manifest_for(inner, &row)
+            crate::fusion::bind_manifest_for(inner, session_idx, &row)
                 .map(|m| (Some(m.agent.id.clone()), tier_of(m)))
         })
         .unwrap_or((None, 2));
@@ -371,7 +370,9 @@ pub(crate) async fn selftest(
         subject: "[cyclops] hook self-test".to_string(),
         body: "Reply not needed.".to_string(),
         fyi: true,
+        client_key: None,
         reply_to: None,
+        supersedes: None,
         wait: None,
     };
     let receipt = delivery::msg_send(inner, "cyclopsd", send_params).await?;
@@ -454,7 +455,7 @@ fn ledger_state(
     to: &str,
 ) -> Option<DeliveryState> {
     let slot = inner.session(session_idx)?;
-    let lines = cyclops_ledger::read_after(slot.ledger.path(), 0).ok()?;
+    let lines = slot.ledger.read_after(0).ok()?;
     lines
         .iter()
         .rev()
@@ -473,23 +474,58 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// A synthetic identity: tests care that two of them differ, not what
+    /// the kernel would have said.
+    fn proc(pid: i32) -> crate::identity::ProcId {
+        crate::identity::ProcId {
+            pid,
+            birth: pid as u64 * 10,
+        }
+    }
+
+    fn pane(id: &str) -> PaneKey {
+        PaneKey::new(0, id)
+    }
+
     #[test]
     fn liveness_records_and_forgets() {
         let l = HookLiveness::new();
-        assert!(!l.seen_any("%1", 100));
-        l.record("%1", "UserPromptSubmit", 1_000, 100);
-        l.record("%1", "user_prompt_submit", 2_000, 100);
-        assert!(l.seen_any("%1", 100));
+        assert!(!l.seen_any(&pane("%1"), proc(100)));
+        l.record(&pane("%1"), "UserPromptSubmit", 1_000, proc(100));
+        l.record(&pane("%1"), "user_prompt_submit", 2_000, proc(100));
+        assert!(l.seen_any(&pane("%1"), proc(100)));
         // Normalized spellings share a slot; the raw name and ts are the
         // latest ones.
-        let snap = l.snapshot("%1", 100);
+        let snap = l.snapshot(&pane("%1"), proc(100));
         assert_eq!(snap.len(), 1);
         assert_eq!(
             snap.get("userpromptsubmit"),
             Some(&("user_prompt_submit".to_string(), 2_000))
         );
-        l.forget("%1");
-        assert!(!l.seen_any("%1", 100));
+        l.forget(&pane("%1"));
+        assert!(!l.seen_any(&pane("%1"), proc(100)));
+    }
+
+    #[test]
+    fn exact_route_liveness_separates_duplicate_pane_ids() {
+        let liveness = HookLiveness::new();
+        let first = PaneKey::new(0, "%1");
+        let second = PaneKey::new(1, "%1");
+        liveness.record(&first, "Stop", 1_000, proc(100));
+
+        assert!(liveness.seen_any(&first, proc(100)));
+        assert!(
+            !liveness.seen_any(&second, proc(100)),
+            "a hook edge cannot cross watched session routes"
+        );
+
+        liveness.record(&second, "UserPromptSubmit", 2_000, proc(200));
+        liveness.forget(&first);
+        assert!(!liveness.seen_any(&first, proc(100)));
+        assert!(
+            liveness.seen_any(&second, proc(200)),
+            "forgetting one route cannot erase the duplicate pane in another session"
+        );
     }
 
     /// The F1 stale-liveness hole: edges belong to the occupant that
@@ -498,21 +534,21 @@ mod tests {
     #[test]
     fn occupant_swap_invalidates_liveness() {
         let l = HookLiveness::new();
-        l.record("%1", "UserPromptSubmit", 1_000, 100);
-        assert!(l.seen_any("%1", 100));
+        l.record(&pane("%1"), "UserPromptSubmit", 1_000, proc(100));
+        assert!(l.seen_any(&pane("%1"), proc(100)));
         // The occupant restarted: same pane, new pid, no edges from it yet.
         assert!(
-            !l.seen_any("%1", 200),
+            !l.seen_any(&pane("%1"), proc(200)),
             "old occupant's edges must not count"
         );
-        assert!(l.snapshot("%1", 200).is_empty());
+        assert!(l.snapshot(&pane("%1"), proc(200)).is_empty());
         // The old pid's view is still intact until the new occupant speaks.
-        assert!(l.seen_any("%1", 100));
+        assert!(l.seen_any(&pane("%1"), proc(100)));
         // First edge from the new occupant retires the old record entirely.
-        l.record("%1", "Stop", 3_000, 200);
-        assert!(l.seen_any("%1", 200));
-        assert!(!l.seen_any("%1", 100));
-        let snap = l.snapshot("%1", 200);
+        l.record(&pane("%1"), "Stop", 3_000, proc(200));
+        assert!(l.seen_any(&pane("%1"), proc(200)));
+        assert!(!l.seen_any(&pane("%1"), proc(100)));
+        let snap = l.snapshot(&pane("%1"), proc(200));
         assert_eq!(snap.len(), 1, "old occupant's edges were retired");
         assert!(snap.contains_key("stop"));
     }
@@ -520,14 +556,14 @@ mod tests {
     #[test]
     fn f1_notify_is_once_per_occupant_and_resets_with_the_pane() {
         let l = HookLiveness::new();
-        assert!(l.first_f1("%1", 100));
-        assert!(!l.first_f1("%1", 100));
-        assert!(l.first_f1("%2", 300));
+        assert!(l.first_f1(&pane("%1"), proc(100)));
+        assert!(!l.first_f1(&pane("%1"), proc(100)));
+        assert!(l.first_f1(&pane("%2"), proc(300)));
         // A new occupant of the same pane gets its own one-shot.
-        assert!(l.first_f1("%1", 200));
-        assert!(!l.first_f1("%1", 200));
-        l.forget("%1");
-        assert!(l.first_f1("%1", 200));
+        assert!(l.first_f1(&pane("%1"), proc(200)));
+        assert!(!l.first_f1(&pane("%1"), proc(200)));
+        l.forget(&pane("%1"));
+        assert!(l.first_f1(&pane("%1"), proc(200)));
     }
 
     #[test]

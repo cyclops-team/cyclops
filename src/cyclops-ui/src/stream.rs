@@ -57,6 +57,7 @@ pub struct StatusSeed {
     /// transposition of label and pane id cannot compile.
     pub panes: Vec<PaneSnapshot>,
     pub open: Vec<OpenDelivery>,
+    pub admin_unread: u64,
     /// The same panes again, in the roster's richer shape. Separate from
     /// `panes` because the register's PaneSnapshot is the attention
     /// rule's input and grows for nobody else's convenience.
@@ -66,6 +67,7 @@ pub struct StatusSeed {
 /// One pane as a roster wants it seeded: everything a sidebar shows.
 #[derive(Debug, Clone)]
 pub struct RosterSeed {
+    pub session_idx: usize,
     pub pane_id: String,
     pub name: String,
     pub state: AgentState,
@@ -94,16 +96,20 @@ impl StatusSeed {
                 })
                 .collect(),
             open: res.open_deliveries.clone(),
+            admin_unread: res.admin_unread,
             roster: res
                 .sessions
                 .iter()
-                .flat_map(|s| &s.panes)
-                .map(|p| RosterSeed {
-                    pane_id: p.pane_id.clone(),
-                    name: p.display_name().to_string(),
-                    state: p.state,
-                    manifest: p.manifest.clone(),
-                    state_ms: p.state_ms,
+                .enumerate()
+                .flat_map(|(session_idx, session)| {
+                    session.panes.iter().map(move |p| RosterSeed {
+                        session_idx,
+                        pane_id: p.pane_id.clone(),
+                        name: p.display_name().to_string(),
+                        state: p.state,
+                        manifest: p.manifest.clone(),
+                        state_ms: p.state_ms,
+                    })
                 })
                 .collect(),
         }
@@ -166,6 +172,7 @@ pub enum EntryKind {
     },
     State {
         target: String,
+        session_idx: usize,
         pane_id: Option<String>,
         state: AgentState,
     },
@@ -186,12 +193,12 @@ pub enum EntryKind {
         name: String,
         text: String,
     },
-    /// A pane left the tmux table. The pane's last transition, and the
-    /// only thing that can drop its attention item while the process runs
-    /// (`cyclops_proto::attention`): no state event ever arrives for a
-    /// pane that is gone.
+    /// A pane route left one watched session. `physical_gone` distinguishes
+    /// a closed pane from a transfer to another watched session.
     PaneGone {
+        session_idx: usize,
         pane_id: String,
+        physical_gone: bool,
     },
     Other {
         event: String,
@@ -265,6 +272,11 @@ fn gate_kind(d: &Value) -> EntryKind {
 fn state_kind(d: &Value) -> EntryKind {
     EntryKind::State {
         target: str_of(d, "target"),
+        session_idx: d
+            .get("session_idx")
+            .and_then(Value::as_u64)
+            .and_then(|idx| usize::try_from(idx).ok())
+            .unwrap_or_default(),
         pane_id: opt_str(d, "pane_id"),
         state: agent_state_of(d, "state"),
     }
@@ -309,7 +321,16 @@ impl Entry {
                 text: session_text(d),
             },
             "pane-removed" => EntryKind::PaneGone {
+                session_idx: d
+                    .get("session_idx")
+                    .and_then(Value::as_u64)
+                    .and_then(|idx| usize::try_from(idx).ok())
+                    .unwrap_or_default(),
                 pane_id: str_of(d, "pane_id"),
+                physical_gone: d
+                    .get("physical_gone")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
             },
             other => EntryKind::Other {
                 event: other.to_string(),
@@ -833,17 +854,21 @@ impl Record {
                 target,
                 pane_id,
                 state,
+                ..
             } => self
                 .attention
                 .observe_agent(target, pane_id.as_deref(), *state),
             EntryKind::Delivery { to, state, .. } => {
                 self.attention.observe_delivery(to, e.id.as_deref(), *state)
             }
-            // A pane leaving the table is its last transition, and the
-            // only thing that can drop its attention item while the
-            // process runs: no state event ever arrives for a pane that
-            // is gone.
-            EntryKind::PaneGone { pane_id } => self.attention.forget_agent(pane_id),
+            // Only physical loss drops attention. A route transfer keeps
+            // the same pane and may already have published its destination
+            // state before this source removal arrives.
+            EntryKind::PaneGone {
+                pane_id,
+                physical_gone: true,
+                ..
+            } => self.attention.forget_agent(pane_id),
             _ => None,
         };
         let (ts, id) = (e.ts, e.id.clone());
@@ -865,16 +890,17 @@ impl Record {
     /// A State line that says exactly what `last_agent_state` already holds
     /// for that pane is dropped before either happens: a duplicate must
     /// never consume a uid, and it must never occupy a ring slot that a
-    /// real transition or a firehose reader would otherwise get. PaneGone
-    /// clears the pane's entry so a pane that comes back under the same id
-    /// is judged fresh rather than against a reading from its previous
-    /// life.
+    /// real transition or a firehose reader would otherwise get. Physical
+    /// pane loss clears the entry so a reused id is judged fresh rather
+    /// than against a reading from its previous life. A route transfer does
+    /// not: it is still the same pane.
     fn ingest(&mut self, mut e: Entry) {
         match &e.kind {
             EntryKind::State {
                 target,
                 pane_id,
                 state,
+                ..
             } => {
                 let key = cyclops_proto::agent_key(target, pane_id.as_deref()).to_string();
                 if self.last_agent_state.get(&key) == Some(state) {
@@ -882,7 +908,11 @@ impl Record {
                 }
                 self.last_agent_state.insert(key, *state);
             }
-            EntryKind::PaneGone { pane_id } => {
+            EntryKind::PaneGone {
+                pane_id,
+                physical_gone: true,
+                ..
+            } => {
                 self.last_agent_state.remove(pane_id);
             }
             _ => {}
@@ -920,6 +950,20 @@ impl Record {
     /// After that the register moves on live events alone, and a pane
     /// leaving the table is one of them ([`Record::live`]).
     pub fn seed(&mut self, panes: &[PaneSnapshot], open: &[OpenDelivery]) -> Vec<Entry> {
+        self.seed_routed(panes, open, &HashMap::new())
+    }
+
+    /// Seed with the daemon session slot for each pane.
+    ///
+    /// The public record remains usable without renderer routing state. The
+    /// watch app supplies this map so any state line synthesized from status
+    /// carries the same exact route as a later live edge.
+    pub(crate) fn seed_routed(
+        &mut self,
+        panes: &[PaneSnapshot],
+        open: &[OpenDelivery],
+        routes: &HashMap<String, usize>,
+    ) -> Vec<Entry> {
         // 1. Replace both halves of the register with the answer.
         self.attention.snapshot_agents(panes.iter().cloned());
         self.attention.snapshot_deliveries(open);
@@ -961,6 +1005,7 @@ impl Record {
                     id: None,
                     kind: EntryKind::State {
                         target: name.clone(),
+                        session_idx: routes.get(pane_id).copied().unwrap_or_default(),
                         pane_id: Some(pane_id.clone()),
                         state: *state,
                     },
@@ -1205,6 +1250,7 @@ fn alarm_item(e: &Entry) -> Option<AttentionItem> {
             target,
             pane_id,
             state,
+            ..
         } if state.is_blocked() => Some(AttentionItem::Agent {
             pane_id: cyclops_proto::agent_key(target, pane_id.as_deref()).to_string(),
             name: target.clone(),
@@ -1706,6 +1752,7 @@ mod tests {
                 state: AgentState::BlockedPermission,
             }],
             open: Vec::new(),
+            admin_unread: 0,
             roster: Vec::new(),
         };
         assert!(intake.status(Box::new(status)).is_none());
@@ -1940,7 +1987,9 @@ mod tests {
             seq: None,
             id: None,
             kind: EntryKind::PaneGone {
+                session_idx: 0,
                 pane_id: "%1".into(),
+                physical_gone: true,
             },
         });
         r.live(state_entry(
@@ -1967,6 +2016,7 @@ mod tests {
             id: None,
             kind: EntryKind::State {
                 target: target.into(),
+                session_idx: 0,
                 pane_id: Some(pane_id.into()),
                 state,
             },

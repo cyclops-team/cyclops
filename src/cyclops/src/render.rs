@@ -193,6 +193,9 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
     if let Some(tail) = &eye.tail {
         header.push_str(&format!(" {sep} {tail}"));
     }
+    if res.admin_unread > 0 {
+        header.push_str(&format!(" {sep} admin inbox {}", res.admin_unread));
+    }
 
     if res.sessions.is_empty() {
         // Empty state invites the next action instead of erroring. The
@@ -206,6 +209,7 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
                 config_path.display()
             ),
         ];
+        out.extend(diagnostic_rows(res, style));
         out.extend(waiting_rows(&attention, res, style));
         return out.join("\n");
     }
@@ -264,8 +268,38 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
         }
     }
     out.extend(unknown_rows(res, style));
+    out.extend(diagnostic_rows(res, style));
     out.extend(waiting_rows(&attention, res, style));
     out.join("\n")
+}
+
+fn diagnostic_rows(res: &StatusResult, style: &Style) -> Vec<String> {
+    let risks: Vec<_> = res
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "deadlock_risk")
+        .collect();
+    if risks.is_empty() {
+        return Vec::new();
+    }
+
+    let mut rows = vec![String::new(), format!("  {}", style.dim("deadlock risk"))];
+    for risk in risks {
+        rows.push(format!(
+            "  {} {} {} · cyclops watch holds this pane working while its notification is gated",
+            style.role(&risk.recipient_label, &risk.recipient_label),
+            style.dim(&risk.pane_id),
+            style.accent(risk.message_id.as_str())
+        ));
+        rows.push(format!(
+            "  {}",
+            style.dim(&format!(
+                "In {} ({}), interrupt cyclops watch, then run from that pane: cyclops inbox next --timeout 30s",
+                risk.recipient_label, risk.pane_id
+            ))
+        ));
+    }
+    rows
 }
 
 /// The sentence under the grid explaining every `? unknown` row on it.
@@ -544,6 +578,8 @@ fn waiting_rows(attention: &Attention, res: &StatusResult, style: &Style) -> Vec
             &DeliveryReceipt {
                 to: to.clone(),
                 state: *state,
+                notification_state: None,
+                quota_state: None,
                 position: None,
                 note: None,
                 // The eye counts items from the record, which names the
@@ -637,38 +673,6 @@ pub fn wait_badge(
         },
         other => other.to_string(),
     }
-}
-
-/// The `wait` array of a send-and-wait receipt. One recipient renders a
-/// bare badge line prefixed `wait:`; a broadcast renders the same aligned
-/// grid as receipts.
-pub fn render_wait_entries(entries: &[Value], style: &Style) -> String {
-    let badge = |e: &Value| {
-        wait_badge(
-            e["outcome"].as_str().unwrap_or_default(),
-            serde_json::from_value::<AgentState>(e["state"].clone()).ok(),
-            e["waited_ms"].as_u64(),
-            e["delivery"].as_str(),
-            style,
-        )
-    };
-    if entries.len() == 1 {
-        return format!("wait: {}", badge(&entries[0]));
-    }
-    let to_of = |e: &Value| e["to"].as_str().unwrap_or_default().to_string();
-    let to_w = entries
-        .iter()
-        .map(|e| display_width(&to_of(e)))
-        .max()
-        .unwrap_or(0);
-    entries
-        .iter()
-        .map(|e| {
-            let to = to_of(e);
-            format!("  {}  {}", style.role(&to, &pad(&to, to_w)), badge(e))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Pad with spaces on the left to `width` display columns (right-aligned
@@ -911,6 +915,20 @@ pub fn render_detection(target: &str, det: &Detection, style: &Style, now_ms: u6
         " {sep} {}",
         style.dim(&format!("decided by {}", det.decided_by))
     ));
+    // Runtime state and write-readiness are two answers, and the diagnostic
+    // shows both (rule 12). The verdict comes from the one owner of the
+    // rule, never recomputed here, so the surface cannot drift from the
+    // gate's decision.
+    header.push_str(&format!(
+        " {sep} {}",
+        match det.write_block.as_deref() {
+            None if det.write_ready => style.dim("write-ready"),
+            // An older daemon stamps neither field. Absent evidence is
+            // not permission, so it reads as refused rather than ready.
+            None => style.dim("not write-ready: unstamped"),
+            Some(reason) => style.dim(&format!("not write-ready: {reason}")),
+        }
+    ));
     if det.readings.is_empty() {
         return header;
     }
@@ -1036,6 +1054,8 @@ mod tests {
             current_command: cmd.into(),
             dead: false,
             in_mode: false,
+            write_ready: false,
+            write_block: None,
             width: 120,
             height: 40,
             state,
@@ -1100,10 +1120,12 @@ mod tests {
                     pane("%4", None, None, "", "vim", AgentState::Unknown),
                 ],
             }],
+            admin_unread: 0,
             // The daemon serves this half only when the caller asks for
             // it. An answer without it counts panes alone, which is what
             // the calm-rig cases below pin.
             open_deliveries: Vec::new(),
+            diagnostics: Vec::new(),
             manifests: Some(cyclops_proto::Manifests {
                 ids: vec!["agy".into(), "claude".into(), "codex".into()],
                 dir: Some("/x/manifests".into()),
@@ -1128,6 +1150,44 @@ mod tests {
              \x20 %4           ? unknown  vim{UNKNOWN_NOTE}"
         );
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn status_header_reports_admin_unread_messages() {
+        let mut status = fixture();
+        status.admin_unread = 3;
+        let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
+        assert!(rendered.lines().next().unwrap().contains("admin inbox 3"));
+    }
+
+    #[test]
+    fn status_names_a_content_free_watch_deadlock_and_the_pull_exit() {
+        let mut status = fixture();
+        status.diagnostics.push(cyclops_proto::StatusDiagnostic {
+            code: "deadlock_risk".into(),
+            message_id: "m-startup".parse().unwrap(),
+            notification_attempt: "att-00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            recipient: serde_json::from_value(serde_json::json!({
+                "kind": "agent",
+                "workspace_id": "00000000-0000-0000-0000-000000000001",
+                "session_instance_id": "00000000-0000-0000-0000-000000000002",
+                "pane_id": "%1"
+            }))
+            .unwrap(),
+            recipient_label: "reviewer".into(),
+            pane_id: "%1".into(),
+        });
+
+        let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
+        assert!(rendered.contains("deadlock risk"), "{rendered}");
+        assert!(rendered.contains("reviewer %1 m-startup"), "{rendered}");
+        assert!(
+            rendered.contains(
+                "In reviewer (%1), interrupt cyclops watch, then run from that pane: cyclops inbox next --timeout 30s"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("secret body"), "{rendered}");
     }
 
     /// An unknown pane is the one cell on the grid that is not a state the
@@ -1628,6 +1688,8 @@ mod tests {
         DeliveryReceipt {
             to: "reviewer".into(),
             state,
+            notification_state: None,
+            quota_state: None,
             position,
             note: note.map(String::from),
             pane: None,
@@ -1944,33 +2006,6 @@ mod tests {
     }
 
     #[test]
-    fn wait_entries_render_single_line_and_grid() {
-        let s = Style::none();
-        let single = vec![serde_json::json!({
-            "to": "reviewer", "outcome": "reached", "state": "idle",
-            "waited_ms": 3000, "delivery": "delivered_verified",
-        })];
-        assert_eq!(render_wait_entries(&single, &s), "wait: ○ idle · waited 3s");
-        let multi = vec![
-            serde_json::json!({
-                "to": "reviewer", "outcome": "reached", "state": "idle",
-                "waited_ms": 3000, "delivery": "delivered_verified",
-            }),
-            serde_json::json!({
-                "to": "implementer", "outcome": "timeout", "state": "working",
-                "waited_ms": 60_000, "delivery": "delivered_unverified",
-            }),
-        ];
-        let got = render_wait_entries(&multi, &s);
-        let expected = "\x20 reviewer     ○ idle · waited 3s\n\
-                        \x20 implementer  ⚠ wait timed out · still working";
-        assert_eq!(got, expected);
-        for line in got.lines() {
-            assert_eq!(line, line.trim_end(), "trailing space in: {line:?}");
-        }
-    }
-
-    #[test]
     fn ping_line_is_exact() {
         assert_eq!(render_ping(0.42, &Style::none()), "✔ cyclops is up · 0.4ms");
         assert_eq!(
@@ -1986,6 +2021,9 @@ mod tests {
             state: AgentState::Working,
             disagreement: true,
             decided_by: "hook:Stop".into(),
+            stale: false,
+            write_ready: false,
+            write_block: None,
             readings: vec![
                 SensorReading {
                     sensor: Sensor::Hook,
@@ -2008,7 +2046,7 @@ mod tests {
             ],
         };
         let got = render_detection("reviewer", &det, &Style::none(), now);
-        let expected = "reviewer · ● working · ⚠ sensors disagree · decided by hook:Stop\n\
+        let expected = "reviewer · ● working · ⚠ sensors disagree · decided by hook:Stop · not write-ready: unstamped\n\
              \n\
              \x20 hook    ● working  Stop            2s ago\n\
              \x20 title   ● working  spinner         2s ago\n\

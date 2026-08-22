@@ -1,50 +1,87 @@
-# Delivery pipeline design
+# Delivery and notification pipeline
 
-Fixed by ADR-001, the validation amendments, and GOALS.md. This is the
-current delivery spec.
+This file owns the delivery decision and terminal safety contract. Protocol
+shapes belong to `src/cyclops-proto` and `docs/reference/PROTOCOL.md`.
 
-## Message rendering
+## Mailbox transport decision
 
-The injected payload is what the recipient's model reads. Shape (kept close
-to v1 so existing agent habits transfer):
+`msg.send` always records the message and one mailbox entry per recipient
+before terminal delivery begins. Each recipient then gets exactly one of two
+transport shapes:
+
+- **Doorbell:** when the admitted agent's manifest declares a mailbox
+  capability file and that opened regular file exactly matches the claim skill
+  compiled into this release, Cyclops writes the exact content-free claim
+  command. The recipient runs it to read the durable payload.
+- **Direct payload fallback:** when that exact capability proof is absent,
+  unreadable, outdated, edited, or changes before the write, Cyclops rebuilds
+  the canonical full payload from the workspace journal and writes it through
+  the same gated terminal pipeline. Successful delivery appends
+  `message_delivered_direct`. It never forges `message_claimed`.
+
+Transport is selected per attempt, not per vendor. A target can move between
+the two paths as its installed skill changes. Capability evidence is rechecked
+with the exact recipient, process generation, manifest, and file digest at the
+terminal write boundary. Losing proof before the paste returns to gating and
+selects again. It never downgrades after any pane write.
+
+Transport is write metadata on the notification record. It is not part of the
+mailbox state and not part of the terminal occupant identity binding. Current
+doorbell writes keep `transport: "doorbell"` and add `doorbell_format: 1`.
+Missing format metadata selects the original verbose row. Unknown numeric
+formats replay but cannot authorize an attention recovery action. Missing
+transport metadata on an old journal transition also means the original
+doorbell format.
+
+Both paths are one-shot. An ambiguous paste, verification, submit, or receipt
+opens one attention entry and never writes the payload a second time. Attention
+recovery rebuilds the expected bytes from the durable transport: the fixed row
+for a doorbell, or the canonical message payload for direct fallback.
+
+## Direct payload rendering
+
+The fallback and legacy direct paths use this exact shape:
 
 ```
 [cyclops m-3f9c2a] FROM: codex  SUBJECT: Review the rate limiter
 <body>
 Reply: cyclops send codex --subject "..."
+[cyclops:end m-3f9c2a]
 ```
 
-- `m-3f9c2a` is the message id: short lowercase hex, unique per ledger.
+- `m-3f9c2a` is an abbreviated legacy message id in this example.
   It is the marker for composer verification and hook ACK matching.
+- `[cyclops:end <id>]` is the terminal sentinel: transport machinery,
+  not something the recipient acts on, and deliberately not the reply
+  hint, since transport evidence must not depend on human-facing copy
+  that changes. The leading id cannot prove the payload tail arrived.
 - The daemon generates the header. Client-supplied FROM/SUBJECT text inside
   the body is not stripped but cannot forge the envelope: the header the
   recipient sees is daemon-built from socket-peer identity (v1 keeper made
   structural).
 - The reply hint line is included unless the message is `--fyi`, or the
-  sender is `admin`. `admin` is reserved by `cyclops_proto::label` so no
-  pane can hold it, which makes `cyclops send admin` a guaranteed
-  `no_such_target`: an agent following the hint files a failed delivery
-  and raises attention for it. A route back to the operator is the admin
-  inbox, not a command that cannot run.
+  sender is `admin`. `admin` is a durable mailbox address, not a pane label.
+  A recipient replying to an admin message uses the message id so the daemon
+  derives the admin inbox route.
 
 ## Sender identity (fail-closed)
 
 - Socket peer credentials give (uid, pid). Non-matching uid: denied.
 - The client pid's ancestry is walked to a `pane_pid` of a watched pane.
   Resolved pane with a label: sender is that label. Resolved pane without a
-  label: sender is the pane id. Unresolvable (a shell outside any watched
-  pane, same uid): sender is `admin`.
+  label: sender is the pane id. A same-user caller proven outside every
+  watched pane resolves as `admin`.
 - Nothing in the request body can override the resolved sender.
 
 ## Per-recipient pipeline
 
-One worker per target pane; deliveries to one recipient are strictly FIFO
-(GOALS: ordering holds per recipient). Broadcast writes ONE msg ledger line
-with N delivery records, each advancing independently.
+One worker per durable recipient; notifications to one mailbox are strictly
+FIFO. Broadcast writes one message row with one mailbox entry and one
+notification record per recipient.
 
-States and transitions are `cyclops_proto::DeliveryState` and its
-`can_transition_to` table. Every transition appends a ledger line
-(kind=state, id = message id, data = {to, from, to_state, cause}).
+Mailbox notifications use `cyclops_proto::NotificationState`. Each transition
+is a content-free workspace journal fact. Legacy direct deliveries still use
+`cyclops_proto::DeliveryState` in session ledgers.
 
 ### Gate (amendments b, f, g; GOALS invariants)
 
@@ -72,9 +109,17 @@ timer. In order:
      (GOALS: queued lands within 1s of turn end).
    - `idle_with_input` (human typing, human always wins): hold in gating,
      re-check on the pane's next state change.
-   - `idle`: proceed.
+   - `idle`: proceed only on a positive write-readiness stamp. A refusal
+     holds in gating and the gate line names it
+     (`not_write_ready:<reason>`). `composer_hold` is the one that
+     outlives the frame it was raised on: a pane seen holding text stays
+     refused until a turn end with a clean screen reading proves the text
+     left (INVARIANTS rule 12).
 4. Just before pasting, re-read title and capture once more (the gate
-   snapshot must be fresher than any human keystroke round-trip).
+   snapshot must be fresher than any human keystroke round-trip). The
+   admitted pid is the agent's, resolved fresh; a process table that
+   cannot be read is `occupant_unprovable`, not a fallback to the pane's
+   shell.
 
 A delivery held in gating longer than `gate_hold_notify_ms` (config,
 default 120000) pings the admin once (action_required) so a wedged hold is
@@ -84,37 +129,63 @@ visible; the hold itself keeps waiting on events, never on a timer.
 
 1. `load-buffer` from a temp file into buffer `cyc-<bootpid>-<seq>` (unique
    per delivery, amendment e), `paste-buffer -p -d`.
-2. `bracket_paste_flag` is unavailable through tmux 3.6a (amendment b), so
+2. Doorbells require the exact fixed row in the active composer. Direct
+   payloads require either the terminal sentinel or a measured collapsed-paste
+   chip in the active composer. Both shapes use the same manifest-owned
+   composer extraction and terminal-layout proof.
+
+   `bracket_paste_flag` is unavailable through tmux 3.6a (amendment b), so
    bracketed-paste degradation is not gateable. The gate is post-paste
    composer verification: capture the bottom region and require the
    manifest's `verify_pattern` with `<message_id>` substituted. The
    capture flavor follows the manifest: SGR-escaped (`capture-pane -e`)
-   when any rule carries `line_regex_esc` clauses, plain otherwise —
-   pattern text is matched on de-escaped lines either way, while the
-   composer-line pinning also consults the esc clauses against the raw
-   lines. This matters for a composer that collapses a long paste into a
-   "[Pasted Content N chars]" chip (codex): the message id is hidden
-   inside the chip, and the escaped composer line is the only thing left
-   that can verify the staging. agy's first
-   paste after TUI start does not stage (manifest first_paste_caveat). A
-   failed verification is an ambiguous post-paste outcome: it goes
-   directly to attention_required and is never re-pasted.
+   when any rule carries `line_regex_esc` clauses, plain otherwise.
+   Pattern text is matched on de-escaped lines either way; the
+   composer-line pinning also runs the esc clauses against the raw
+   lines.
+
+   Two kinds of evidence are accepted, in this order: the terminal
+   sentinel proven to be the last payload row of the active composer,
+   then the vendor's paste chip pinned to a manifest composer line. A
+   visible leading id is not evidence because it cannot prove completeness.
+
+   The sentinel is terminal only if it matches a whole row, at least one
+   row follows it, and the rows that follow are an ordered subsequence of
+   the vendor's measured trailer layout, never more rows than the layout
+   has. That layout is `injection.composer_trailer_regex` and
+   `composer_trailer_regex_esc`, entry i describing row i of what the
+   vendor paints below the composer; both forms must match. Order and
+   cardinality are what bind the sentinel to the ACTIVE composer. A
+   vendor with no measured layout has no sentinel path and refuses
+   there. A split or truncated sentinel matches nothing and fails
+   closed.
+
+   Which of the two applies is decided per message, by what the capture
+   shows, never per vendor.
+
+   A manifest declaring neither a trailer layout nor a chip has no
+   staging proof, and every delivery to it refuses. A manifest declaring
+   `first_paste_caveat` does not stage its first paste after TUI start.
+   A failed verification is an ambiguous post-paste outcome: it goes
+   straight to attention_required and is never re-pasted.
 3. Verified: state staged. Send the manifest's submit key (Enter):
    state submitted.
 
-### ACK tiers (amendment: per-agent capability tiers)
+### Receipt tiers
 
 - Tier 1 (claude, codex, cursor): the manifest `hooks.ack` event arrives via
   `agent.state.report` within the ACK window (default 1500ms; measured p95
   is under 40ms) and its `ack_payload_field` contains the message id:
-  delivered_verified (verified_by: hook). Codex duplicate hook events are
+  a hook receipt. Codex duplicate hook events are
   deduped on (session_id, turn_id, event) before matching (amendment d).
-- Tier 2 (agy, or tier 1 timeout): screen evidence: the marker left the
+- Tier 2 (agy, or tier 1 timeout): screen evidence shows the marker left the
   composer and turn-start evidence appeared (working state or output
-  activity): delivered_unverified (verified_by: screen). A late matching
-  hook ACK upgrades delivered_unverified to delivered_verified (legal
-  transition, keeps receipts honest).
-- Neither within 5s: attention_required with cause `ack_timeout`. Enter may
+  activity). A late matching hook may strengthen the internal receipt without
+  changing mailbox ownership.
+- Either valid tier advances the notification to `notified`. A direct fallback
+  then appends `message_delivered_direct` and retires that mailbox entry. A
+  doorbell leaves the entry pending until an authenticated claim.
+- Neither within 5s: `attention_required` with cause `ack_timeout`. Enter may
   already have been accepted, so the payload is never re-pasted.
 
 ### Retry (bounded, pre-write only)
@@ -130,34 +201,39 @@ the attempt boundary and never invites a duplicate paste. `attention_required`
 can mean the terminal outcome is unknown, not that the recipient definitely
 did not receive the message.
 
-## msg.send semantics (push state, pull context)
+## `msg.send` semantics
 
-The receipt returns the target's disposition, never auto-attached history:
+The response proves durable acceptance and reports the current asynchronous
+notification state and FIFO position for each recipient. It does not block for
+delivery, claim, or task completion. The protocol v1 `wait` field is rejected.
+`agent.wait` observes a pane and cannot prove which message a turn handled.
 
-- Target idle at send: block until a terminal-or-parked disposition, capped
-  at 2.5s (GOALS: pasted under 1s, receipt under 2s on this path), return
-  delivered_verified / delivered_unverified.
-- Target busy: return immediately: queued with position (N ahead).
-- Target parked: return immediately: parked_blocked_quota with the reset
-  hint in `note`.
+`delivered_direct` and `claimed` are separate mailbox outcomes. Both authorize
+that exact recipient to read the body. Direct delivery never records a claimant.
 
-`wait` (send-and-wait) composes agent.wait onto the same call: after the
-delivery resolves, block until the recipient reaches `until` (idle | done |
-blocked) or `timeout_ms`. The wait starts only once the delivery reaches a
-resolved state, and `done` counts only working phases observed at or after
-this delivery's submit; a turn that predates the delivery never satisfies
-it. A delivery that resolves anywhere but delivered has no turn to watch:
-its wait entry reports the delivery state (`delivery` field) instead of a
-fabricated wait result.
+Legacy session delivery receipts retain their older behavior: idle targets wait
+for a terminal or parked disposition, busy targets return their queue position,
+and quota-blocked targets return the reset hint. The mailbox `msg.send` endpoint
+does not use those receipt states.
 
 ## Daemon restart
 
+The workspace journal replays mailbox, notification, transport, and attention
+facts before scheduling. A `notified` direct attempt whose mailbox entry is
+still pending is repaired to `delivered_direct` before the next FIFO item is
+scheduled. A doorbell never receives that repair. Writing, staged, or submitted
+attempts without a terminal receipt become attention and are not retried.
+
+The following session-ledger rules apply to legacy direct deliveries:
+
+### Legacy direct delivery
+
 At boot the daemon replays each session ledger and resolves every
-delivery whose latest state is still in flight, and the pre-write
-boundary — the same one the running pipeline retries by — decides how:
+delivery whose latest state is still in flight. The same pre-write boundary
+used by the running pipeline decides how:
 
 - **Before the paste** (queued, gating, retry_queued): nothing has
-  touched the pane, so the chain is REQUEUED — payload rebuilt from the
+  touched the pane, so the chain is REQUEUED: payload rebuilt from the
   msg line's from/subject/body, handle re-enqueued against the adopted
   pane (or the raw pane id), and the delivery re-enters the gate as if
   the restart were a long hold. A gating chain steps back through
@@ -176,21 +252,50 @@ carry a `hosted` list naming the recipients whose delivery chains live
 in that file, so a cross-session broadcast resolves only where it is
 hosted.
 
+### Mailbox notification composer barriers
+
+Mailbox notifications recover from the workspace message journal separately
+from the legacy session-ledger chain above. Every `writing` transition with a
+binding arms a durable barrier before the paste, including older bindings that
+do not record a foreground leader. The barrier remains active through
+`staged`, `submitted`, `notified`, and `attention_required`. A later bound write
+replaces an older barrier only for the same exact durable recipient.
+
+At startup, unresolved `writing`, `staged`, and `submitted` attempts close to
+`attention_required` with `daemon_restart`, but their composer barriers remain
+active. Recovery compares the recorded and current agent process generations
+and manifests. A foreground leader change is normal agent continuity. A
+different agent generation or manifest is authoritative replacement and is
+journaled before the old barrier is released.
+
+Only a receipt-bearing `notified` attempt may retire from a fresh clean screen
+for the same occupant. Every other post-write state restores the composer hold
+even if the first frame is clean. It retires automatically only after an exact
+post-recovery turn start, its matching end, and a later fresh clean screen.
+That retirement is appended before the runtime hold clears and before the end
+is consumed. Hook idle alone never releases recovery state. Unknown or failed
+journal writes keep the hold and require conservative retry or reopen.
+
+A pane disappearing from one watched session may have moved to another.
+Recovery follows the server-wide pane id across that route change, independent
+of watcher attach order, while durable compaction stays scoped to the original
+`RecipientKey`. Pane-loss retirement requires server-wide absence or a
+different root-process generation.
+
 ## Quiesce (`daemon.quiesce`)
 
-The pre-restart hold, and what makes `cyclops daemon restart` (and the
-restart `cyclops update` performs) safe unattended. The daemon holds the
-workers still — each finishes the delivery it is on and starts no new
-one, and the gate's proceed re-checks the hold so nothing crosses the
-paste boundary (a delivery caught at that edge parks back to
-retry_queued, cause: quiesce) — then waits out every delivery already
-past the paste, bounded (default 5s, ceiling 30s; those windows are
-seconds by construction). Quiet means nothing is between the paste and a
-resolved state anywhere: the pipeline stays held for the stop that
-should follow, releasing itself after 30s if none does. Not quiet
-releases the hold immediately and names what is still moving; the caller
-refuses to restart. Pre-paste deliveries never block quiet — the boot
-requeue above is what carries them across.
+The pre-restart hold is what makes `cyclops daemon restart` and the restart
+performed by `cyclops update` safe unattended. The daemon holds the workers
+still. Each finishes its current delivery and starts no new one. The gate
+rechecks the hold before proceeding so nothing crosses the paste boundary. A
+delivery caught at that edge parks back in `retry_queued` with cause
+`quiesce`. The daemon then waits out every delivery already past the paste,
+with a default bound of 5s and a ceiling of 30s. Quiet means nothing is
+between the paste and a resolved state anywhere. The pipeline stays held for
+the stop that should follow and releases itself after 30s if none does. If it
+is not quiet, the daemon releases the hold immediately and names what is still
+moving; the caller refuses to restart. Pre-paste deliveries never block quiet.
+The boot requeue above carries them across.
 
 ## Ledger and privacy
 
@@ -207,12 +312,18 @@ requeue above is what carries them across.
 - queued delivery starts within 1s of the turn-end state change (the worker
   wakes on the event, nothing polls).
 
-## Later surfaces and current limit
+## Operator recovery
 
-- `cyclops hooks install`, hook verification, history, and thread queries
-  shipped after the original delivery milestone.
-- There is still no operator requeue verb for parked or attention-required
-  deliveries. Send a new message after resolving the cause.
+`attention show` is read-only. `attention complete` and `attention discard`
+require the exact unresolved attempt, the original process and manifest
+binding, exact expected composer bytes, anchored trailer layout, and a current
+safe terminal state. Diff inputs can contain a direct fallback payload. They
+are returned only to the authenticated workspace administrator and never enter
+the journal or daemon log. Requeue and alarm clearance remain explicit
+operator actions and never create an automatic retry loop.
+
+The legacy session-delivery path has no operator requeue verb. Standard mailbox
+notifications use the guarded `cyclops requeue <message-id>` recovery command.
 
 ## v1.1 amendments (M1 gate)
 

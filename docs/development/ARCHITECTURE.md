@@ -146,8 +146,9 @@ call returns and every transition still lands in the ledger; the sender is
 told where it stood when the daemon answered, which is the only thing the
 daemon knew.
 
-`send --wait` composes `agent.wait` onto the same call after step 10: it
-appends a `wait` array and never changes the receipts.
+The mailbox endpoint does not compose pane waiting onto `msg.send`.
+Durable acceptance and pane state are separate facts. The protocol keeps
+the old `wait` field only to reject obsolete callers explicitly.
 
 ### The chain: gate, paste, submit, prove
 
@@ -214,7 +215,9 @@ flowchart TD
     s5 -->|no| nomanifest["attention_required: no_manifest"]
     s5 -->|yes| s6["6. recompute fused state,<br/>screen sensor forced"]
     s6 --> s7{"7. fused state"}
-    s7 -->|idle| ok["proceed: paste"]
+    s7 -->|idle| s8{"8. write-ready?<br/>(daemon-stamped)"}
+    s8 -->|"no: write_block"| holdready["hold in gating<br/>not_write_ready:&lt;reason&gt;"]
+    s8 -->|yes| ok["proceed: paste"]
     s7 -->|dead| deadout
     s7 -->|blocked_quota| park["park: quota never auto-retries"]
     s7 -->|"modal or permission, the rule auto-dismisses<br/>and declines remain"| decline["send that rule's decline keys,<br/>then re-read the screen"]
@@ -439,6 +442,7 @@ what it deliberately does not; read that before changing one.
 | `cyclops` | The CLI: a thin NDJSON client plus the human-facing renderers, `cyclops hook`, and the workspace verbs. |
 | `cyclops-ui` | The stream behind `cyclops watch`: admin view, firehose, the eye, jump-to-pane, windowed rendering over a 10k ring (docs/guides/ui.md). |
 | `cyclops-workspace` | The full-screen workspace behind bare `cyclops`: Ratatui/Crossterm chrome, embedded pane VT runtimes, direct manipulation, dialogs, and persistence. |
+| `cyclops-state` | Owner-only state paths beneath one validated root descriptor. Refuses links, unexpected file types, foreign owners, and paths that escape the root. |
 | `cyclops-ledger` | Crash-safe append-only NDJSON writer and cursor reader. Fsync before acknowledging; torn final lines are sealed, never rewritten. |
 | `cyclops-theme` | The semantic token vocabulary, theme files, 256-color fallback, selection and hot reload (docs/guides/themes.md). |
 | `cyclops-testrig` | Test-only. The isolated tmux server and the one statement of its teardown rule. |

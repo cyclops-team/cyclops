@@ -13,6 +13,128 @@ fn shipped() -> std::collections::HashMap<String, Manifest> {
     load_dir(&dir).unwrap()
 }
 
+fn version_between<'a>(capture: &'a str, start: &str, end: &str) -> &'a str {
+    let value = capture
+        .split_once(start)
+        .unwrap_or_else(|| panic!("fixture lacks version marker {start:?}"))
+        .1;
+    value
+        .split_once(end)
+        .unwrap_or_else(|| panic!("fixture version lacks terminator {end:?}"))
+        .0
+}
+
+/// `version_tested` names the capture that anchors each shipped ruleset.
+/// Newer partial captures do not silently strengthen that whole-manifest
+/// claim. Promoting it requires a new authoritative fixture and this table
+/// changing together.
+#[test]
+fn version_tested_matches_each_authoritative_fixture() {
+    let all = shipped();
+    let cases = [
+        (
+            "claude",
+            version_between(
+                include_str!("fixtures/claude_idle_2_1_221.txt"),
+                "Claude Code v",
+                " ",
+            ),
+        ),
+        (
+            "codex",
+            version_between(
+                include_str!("fixtures/codex_working_composer_plain.txt"),
+                "OpenAI Codex (v",
+                ")",
+            ),
+        ),
+        (
+            "agy",
+            version_between(
+                include_str!("fixtures/agy_working_composer_plain.txt"),
+                "Antigravity CLI ",
+                "\n",
+            ),
+        ),
+        (
+            "cursor",
+            version_between(
+                include_str!("fixtures/cursor_working_composer_plain.txt"),
+                "\n  v",
+                "\n",
+            ),
+        ),
+    ];
+
+    for (id, fixture_version) in cases {
+        assert_eq!(
+            all[id].agent.version_tested, fixture_version,
+            "{id}: version_tested diverged from its authoritative fixture"
+        );
+    }
+}
+
+/// Cursor's checked-in evidence contains terminal captures, not paired
+/// start and end hook payloads. Prose stating that both events carried a
+/// generation id is not enough to select the exact lifecycle.
+#[test]
+fn cursor_turn_correlation_waits_for_paired_hook_payload_fixtures() {
+    let all = shipped();
+    let cursor = &all["cursor"];
+    assert!(
+        cursor.hooks.turn_key_fields.is_empty(),
+        "Cursor needs paired current start and end payload fixtures first"
+    );
+
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mut cursor_fixtures = 0;
+    for entry in std::fs::read_dir(dir).expect("fixture directory") {
+        let path = entry.expect("fixture entry").path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("cursor_") {
+            continue;
+        }
+        cursor_fixtures += 1;
+        let bytes = std::fs::read(&path).expect("Cursor fixture");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("generation_id") && !text.contains("hook_event_name"),
+            "{name} became hook evidence; review turn_key_fields instead of keeping this limitation"
+        );
+    }
+    assert!(cursor_fixtures > 0, "Cursor fixture inventory is empty");
+}
+
+#[test]
+fn composer_actions_ship_only_for_measured_vendors() {
+    let all = shipped();
+    for id in ["claude", "codex"] {
+        let manifest = &all[id];
+        assert_eq!(manifest.injection.clear_keys, ["C-c"], "{id}");
+        assert!(manifest.composer_prompt.is_some(), "{id}");
+        assert!(manifest.composer_continuation.is_some(), "{id}");
+    }
+    for id in ["agy", "cursor"] {
+        let manifest = &all[id];
+        assert!(manifest.injection.clear_keys.is_empty(), "{id}");
+        assert!(manifest.composer_prompt.is_none(), "{id}");
+        assert!(manifest.composer_continuation.is_none(), "{id}");
+    }
+    for manifest in all.values() {
+        assert!(
+            manifest
+                .injection
+                .clear_keys
+                .iter()
+                .all(|key| !matches!(key.as_str(), "C-e" | "C-u")),
+            "{} ships a partial-line clear sequence",
+            manifest.agent.id
+        );
+    }
+}
+
 /// M1 review, HIGH: with the sparkle title at 1000 and staged input at 950,
 /// the fused state read idle while a human draft sat in the composer, and
 /// the gate would paste over it and auto-submit. The staged-input rule must
@@ -214,15 +336,18 @@ fn codex_collapsed_paste_chip_is_staged_input() {
     assert_eq!(r.id, "composer_typed_input");
     assert_eq!(r.state, AgentState::IdleWithInput);
 
-    // The transcript renders a past turn with a bold-DIM glyph, while the
-    // composer's is bold only. The rule pins the composer glyph exactly, so
-    // residue one line up can never read as a live composer — the same
-    // trap that made verification accept stale text before fix B.
+    // The transcript renders a past turn with a bold-dim glyph, while the
+    // composer's is bold only. Exact composer matching prevents transcript
+    // residue from satisfying active-composer verification.
     let transcript = "\u{1b}[1;2m›  \u{1b}[0m[cyclops m-diag01] FROM: tester  SUBJECT: s\n\
         \u{1b}[1m›\u{1b}[0m \u{1b}[2mSummarize recent commits\u{1b}[0m\n\
         \u{1b}[38;2;246;226;183mgpt-5.6-sol high\u{1b}[0m · ~/proj";
     let r = codex
-        .evaluate_esc("proj", &cyclops_manifest::strip_csi(transcript), Some(transcript))
+        .evaluate_esc(
+            "proj",
+            &cyclops_manifest::strip_csi(transcript),
+            Some(transcript),
+        )
         .unwrap();
     assert_eq!(
         r.state,
@@ -287,6 +412,60 @@ fn codex_working_outranks_the_live_ghost_composer() {
     // the working indicator is literal text, not an SGR discrimination.
     let r = codex.evaluate("cxwork", plain).unwrap();
     assert_eq!(r.id, "screen_working");
+}
+
+#[test]
+fn codex_title_spinner_survives_queued_input_below_screen_spinner() {
+    let all = shipped();
+    let codex = &all["codex"];
+    let idle_plain = include_str!("fixtures/codex_ghost_composer_plain.txt");
+    let idle_esc = include_str!("fixtures/codex_ghost_composer_esc.txt");
+    for frame in ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] {
+        let title = format!("{frame} project");
+        let rule = codex
+            .evaluate_esc(&title, idle_plain, Some(idle_esc))
+            .unwrap();
+        assert_eq!(rule.id, "title_working_spinner");
+        assert_eq!(rule.state, AgentState::Working);
+    }
+
+    let idle = codex
+        .evaluate_esc("project", idle_plain, Some(idle_esc))
+        .unwrap();
+    assert_eq!(idle.state, AgentState::Idle);
+    assert_ne!(idle.id, "title_working_spinner");
+
+    for title in ["project ⠋ active", "⠋project", "⠋ "] {
+        let rule = codex
+            .evaluate_esc(title, idle_plain, Some(idle_esc))
+            .unwrap();
+        assert_ne!(rule.id, "title_working_spinner");
+    }
+
+    let queued = [
+        "» [tmux-bridge from:peer] queued message",
+        "  queued line 2",
+        "  queued line 3",
+        "  queued line 4",
+        "  queued line 5",
+        "  queued line 6",
+        "  queued line 7",
+        "  tab to queue message",
+    ]
+    .join("\n");
+    let plain = format!("• Working (51s • esc to interrupt)\n{queued}");
+
+    let spinner_from_bottom = plain
+        .lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .position(|line| line.contains("esc to interrupt"));
+    assert_eq!(spinner_from_bottom, Some(8));
+
+    assert!(codex.evaluate("project", &plain).is_none());
+    let rule = codex.evaluate("⠴ project", &plain).unwrap();
+    assert_eq!(rule.id, "title_working_spinner");
+    assert_eq!(rule.state, AgentState::Working);
 }
 
 /// MEASURED 2026-08-08 (agy 1.1.11, tmux 120x40), SAFETY: the same defect
@@ -643,4 +822,201 @@ fn cursor_ghost_vs_typed_probed_fixtures() {
     let r = cursor.evaluate("Cursor Agent", typed_plain).unwrap();
     assert_eq!(r.id, "composer_plain_fallback");
     assert_eq!(r.state, AgentState::Idle);
+}
+
+/// Every shipped trailer pattern must match the chrome captured from a real
+/// session, and must NOT match ordinary payload text. A trailer regex that
+/// matches payload would let content after the sentinel pass as chrome,
+/// which is the one direction that is unsafe.
+#[test]
+fn shipped_composer_trailers_match_captured_chrome_only() {
+    let cases: &[(&str, &[&str], &[&str])] = &[
+        (
+            "claude",
+            &[
+                "────────────────────────",
+                "  Opus 5 · xhigh · ~/projects/clops · Ctx: 97% · 5h: 93% · 1000K window · 28K used",
+                "  Opus 5 (1M context) · xhigh · ~/projects/agentic_dev/cy…",
+                "  Opus 5 (1M context) · xhigh · ~/projects/agentic_dev/cyclops-worktrees/mess…",
+                "  Opus 5 (1M context) · xhigh · ~/projects/agentic_dev/cyclops-worktrees/messaging-integration · …",
+                "  Opus 5 (1M context) · xhigh · ~/projects/agentic_dev/cyclops-worktrees/messaging-integration · Ctx: 95% · 5h: 93% · 7d: …",
+                "  paste again to expand",
+                "  ⏸ manual mode on · ← for agents",
+            ],
+            &["review the auth change", "[cyclops:end m-1]", "· a line with a dot ·"],
+        ),
+        (
+            "codex",
+            &[
+                "  gpt-5.6-sol xhigh · ~ · Full Access · Context 87% left · weekly 97% left",
+                "  gpt-5.6-sol high · /tmp/x · 258K window · 2.87M used",
+            ],
+            &["please review this", "[cyclops:end m-1]", "a · b · c"],
+        ),
+        (
+            "agy",
+            &[
+                "────────────────────────",
+                "Gemini 3.7 Flash · High · ~ · Full · Ctx: 79% · 97% 5h, 83% wk · (195K / 1048K)",
+            ],
+            &["run the tests", "[cyclops:end m-1]", "Gemini said something"],
+        ),
+    ];
+    for (id, chrome, payload) in cases {
+        let m = &shipped()[*id];
+        assert!(
+            !m.composer_trailers.is_empty(),
+            "{id}: no trailer patterns shipped"
+        );
+        for line in *chrome {
+            assert!(
+                m.composer_trailers.iter().any(|r| r.is_match(line)),
+                "{id}: captured chrome unmatched: {line:?}"
+            );
+        }
+        for line in *payload {
+            assert!(
+                !m.composer_trailers.iter().any(|r| r.is_match(line)),
+                "{id}: payload text matched a trailer pattern: {line:?}"
+            );
+        }
+    }
+}
+
+/// Issue 16, the destructive direction of F55: on Claude Code 2.1.232 a
+/// typed slash command renders STYLED
+/// ('ESC[39m' + glyph + NBSP + 'ESC[38;5;153m/model'), which the
+/// staged-input clause cannot see, and a ghost rule that claimed all
+/// styling read it as idle. The gate then pasted into the human's draft
+/// and submitted it. Styling that is not provably the dim ghost must hold.
+#[test]
+fn claude_typed_slash_command_is_never_idle() {
+    let claude = &shipped()["claude"];
+    let plain = "transcript\n────────\n❯ /model\n────────\n  Opus 5 · 1000K window";
+    let esc = "transcript\n────────\n\u{1b}[39m❯\u{a0}\u{1b}[38;5;153m/model\u{1b}[39m\n────────\n  Opus 5 · 1000K window";
+    let r = claude.evaluate_esc("proj", plain, Some(esc)).unwrap();
+    assert_eq!(
+        r.state,
+        AgentState::IdleWithInput,
+        "a typed slash command must hold, not invite a paste (rule {})",
+        r.id
+    );
+    assert_eq!(r.id, "composer_styled_input");
+
+    // The dim ghost convention still reads idle: F55's benefit is intact.
+    let ghost_esc = "transcript\n────────\n\u{1b}[39m❯\u{a0}\u{1b}[2mTry \"fix the tests\"\u{1b}[0m\n────────\n  Opus 5 · 1000K window";
+    let ghost_plain =
+        "transcript\n────────\n❯ Try \"fix the tests\"\n────────\n  Opus 5 · 1000K window";
+    let r = claude
+        .evaluate_esc("proj", ghost_plain, Some(ghost_esc))
+        .unwrap();
+    assert_eq!(r.id, "composer_ghost_suggestion");
+    assert_eq!(r.state, AgentState::Idle);
+
+    // Unstyled typed text is unchanged: the staged clause still wins.
+    let typed_esc =
+        "transcript\n────────\n\u{1b}[39m❯\u{a0}fix the parser\n────────\n  Opus 5 · 1000K window";
+    let typed_plain = "transcript\n────────\n❯ fix the parser\n────────\n  Opus 5 · 1000K window";
+    let r = claude
+        .evaluate_esc("proj", typed_plain, Some(typed_esc))
+        .unwrap();
+    assert_eq!(r.id, "composer_has_staged_input");
+    assert_eq!(r.state, AgentState::IdleWithInput);
+}
+
+/// A trailer pattern that also matches ordinary prose would let payload
+/// text after the sentinel pass as chrome, and a truncated paste would then
+/// be submitted. These are adversarial lines derived from each shipped
+/// pattern: text a person could plausibly write, shaped as closely as prose
+/// gets to a status row.
+#[test]
+fn shipped_trailers_reject_adversarial_payload_text() {
+    let adversarial = [
+        // Derived from the "N K window" patterns.
+        "please use a 128K window",
+        "we should bump it to a 200K window and retest",
+        "context · budget · 128K window",
+        // Derived from the codex "Context N% left" pattern.
+        "Context 50% left is not enough for this refactor",
+        "note · warning · Context 12% left",
+        // Derived from the agy status row.
+        "Gemini said · the answer · Ctx: 50%",
+        "Gemini 3.7 · Ctx: 90%",
+        "Opus 5 said · xhigh · this is prose…",
+        // Derived from the hint rows.
+        "paste again to expand the section",
+        "? for shortcuts, otherwise read the guide",
+        "⏸ pause the run before merging",
+        // Box-rule lookalikes that are not a full rule row.
+        "──── section heading ────",
+        "see ─ the dash above",
+    ];
+    for id in ["claude", "codex", "agy"] {
+        let m = &shipped()[id];
+        for line in adversarial {
+            assert!(
+                !m.composer_trailers.iter().any(|r| r.is_match(line.trim())),
+                "{id}: payload text would be treated as chrome: {line:?}"
+            );
+        }
+    }
+}
+
+/// On Claude Code 2.1.236 an active turn keeps the idle sparkle title and
+/// the composer prompt, so
+/// title and screen agreed on idle and the gate could admit a write into
+/// a pane mid-generation.
+///
+/// The fixture is minimized from a live escaped capture of a running tool
+/// task. Transcript prose above the evidence window is neutralized while
+/// row count, styling, and the active status and composer rows are retained.
+/// Its plain sibling is derived here so both forms describe one moment.
+#[test]
+fn claude_active_status_row_reads_working_not_idle() {
+    let claude = &shipped()["claude"];
+    let esc = include_str!("fixtures/claude_working_2_1_236_esc.txt");
+    let plain = strip_sgr(esc);
+    let r = claude
+        .evaluate_esc("\u{2733} Cooking", &plain, Some(esc))
+        .unwrap();
+    assert_eq!(
+        r.state,
+        AgentState::Working,
+        "an active turn must not read idle (rule {})",
+        r.id
+    );
+    assert_eq!(r.id, "composer_working_spinner_status");
+
+    // A completed step keeps its words on screen forever, so the
+    // discriminator has to be the styling rather than the verb: uniform
+    // gray, no running timer, and the pane is free again.
+    let done_esc = "\u{1b}[38;5;246m⏺ Cooked for 28m 7s\u{1b}[39m\n\u{1b}[38;5;244m────────\n\u{1b}[39m❯\u{a0}\n\u{1b}[39m  \u{1b}[38;5;174mOpus 5\u{1b}[38;5;246m · 1000K window";
+    let r = claude
+        .evaluate_esc("\u{2733} Done", &strip_sgr(done_esc), Some(done_esc))
+        .unwrap();
+    assert_ne!(
+        r.state,
+        AgentState::Working,
+        "a completed step must not pin the pane as working forever"
+    );
+}
+
+/// De-escape a capture the way the daemon does before matching plain
+/// patterns, so a fixture can be its own plain sibling.
+fn strip_sgr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('\u{1b}') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        match rest.find('m') {
+            Some(end) => rest = &rest[end + 1..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }

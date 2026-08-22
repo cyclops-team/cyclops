@@ -59,6 +59,58 @@ async fn capture_pane_returns_visible_content() {
 }
 
 #[tokio::test]
+async fn joined_capture_reconstructs_tmux_physical_wraps() {
+    let Some(srv) = TestServer::new("capture-joined") else {
+        return;
+    };
+    srv.new_session("joined");
+    let (client, _notif) = ControlClient::spawn(srv.config("joined"))
+        .await
+        .expect("spawn");
+    client
+        .command("resize-window -t joined -x 24 -y 12")
+        .await
+        .expect("resize window");
+
+    let marker = "CYCAP_WRAP_abcdefghijklmnopqrstuvwxyz0123456789";
+    let trailing = "CYCAP_TRAILING_CELL";
+    client
+        .send_keys("%0", &[&format!("printf '%s\\n' {marker}"), "Enter"])
+        .await
+        .expect("write marker");
+    client
+        .send_keys("%0", &[&format!("printf '%s \\n' {trailing}"), "Enter"])
+        .await
+        .expect("write trailing cell");
+
+    let mut joined = String::new();
+    for _ in 0..100 {
+        joined = client
+            .capture_pane_joined_escaped("%0")
+            .await
+            .expect("joined capture");
+        if joined.contains(marker) && joined.lines().any(|line| line == format!("{trailing} ")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(joined.contains(marker), "joined capture: {joined:?}");
+    assert!(
+        joined.lines().any(|line| line == format!("{trailing} ")),
+        "joined capture lost a meaningful trailing cell: {joined:?}"
+    );
+    assert!(
+        !client
+            .capture_pane("%0")
+            .await
+            .expect("physical capture")
+            .contains(marker),
+        "fixture did not wrap the marker"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
 async fn unconfirmed_key_send_keeps_later_reply_correlation() {
     let Some(srv) = TestServer::new("send-unconfirmed") else {
         return;

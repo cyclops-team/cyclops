@@ -96,6 +96,9 @@ back into the msg line at read time; disk is never rewritten.
   the snapshot that seeds every client's attention register.
 - `MsgSendParams { to, subject, body, fyi, reply_to, wait }` →
   `MsgSendResult { msg_id, seq, deliveries: Vec<DeliveryReceipt> }`.
+- `MsgSendParams.wait` is protocol-v1 compatibility only. Any non-null
+  value is rejected before message acceptance because pane state cannot
+  prove message or task completion.
 - `WaitSpec { until: Idle|Done|Blocked, timeout }`.
 - `WorkspaceUiGetResult` / `WorkspaceUiSetParams` — last-active session/window.
 - Cursors: single-session numeric `cursor`, multi-session opaque composite

@@ -52,6 +52,7 @@ fn synthetic(i: u64) -> Entry {
         // repeat `Record::ingest` would now dedupe out of the ring.
         2 => EntryKind::State {
             target: format!("agent{}", i % 7),
+            session_idx: 0,
             pane_id: Some(format!("%{}", i % 7)),
             state: if i.is_multiple_of(2) {
                 AgentState::Working
@@ -81,6 +82,7 @@ fn synthetic(i: u64) -> Entry {
 fn backlog(open: usize) -> StatusSeed {
     StatusSeed {
         watched: vec!["main".into()],
+        admin_unread: 0,
         roster: Vec::new(),
         panes: if open == 0 {
             Vec::new()
