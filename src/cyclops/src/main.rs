@@ -1148,25 +1148,11 @@ fn ask<T>(
     }
 }
 
-/// `status` params for a surface that SHOWS the eye.
-///
-/// Half the rule is the open-delivery backlog, and the daemon folds it
-/// only for a caller that asks (`cyclops_proto::StatusParams`). Asking
-/// with an empty object served the pane half alone, so this grid counted
-/// blocked panes while `cyclops ui` counted both against the same daemon
-/// at the same instant, and the two eyes contradicted each other.
-fn eye_status_params() -> Value {
-    serde_json::to_value(cyclops_proto::StatusParams {
-        open_deliveries: true,
-    })
-    .expect("status params serialize")
-}
-
 fn cmd_status(c: &mut Client, cli: &Cli, style: &Style) -> i32 {
     let status: StatusResult = match ask(
         c,
         "status",
-        eye_status_params(),
+        json!({}),
         cli.json,
         None,
         serde_json::from_value,
