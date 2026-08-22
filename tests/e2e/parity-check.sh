@@ -1285,10 +1285,7 @@ check "update names the running build"    '^cyclops [0-9]+\.[0-9]+\.[0-9]+ \(([0
 check "and its source"                    "^  source $ROOT/remote at parity-update$"
 check "it reran the installer"            '^✔ cyclops [0-9]+\.[0-9]+\.[0-9]+ \([0-9a-f]+\) is installed$'
 check "and reports old build to new"      '^✔ updated · [0-9]+\.[0-9]+\.[0-9]+ \(([0-9a-f]+(\.dirty)?|unknown)\) → [0-9]+\.[0-9]+\.[0-9]+ \([0-9a-f]+\)$'
-check "then the restart steps"            '^Restart:$'
-check "the workspace goes first"          '^  1  q +quit any open workspace; it is still on the old build$'
-check "the daemon second"                 '^  2  cyclops daemon stop +the daemon is too$'
-check "and start comes back up"           '^  3  cyclops start +come back up on the new build$'
+check "then names the no-daemon next step" '^Next: cyclops start +come up on the new build \(no daemon was running\)$'
 check_absent "it never stops the daemon itself" 'stopped cyclopsd'
 check_exit "an update exits 0" 0
 

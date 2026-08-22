@@ -401,6 +401,8 @@ async fn me_on_the_read_side_is_the_calling_pane() {
 /// The pid does not change across an exec, and neither does a start time.
 /// What separates the two is the kernel's own execution generation, which
 /// is why the daemon asks the kernel again rather than remembering.
+/// macOS exposes that generation. Linux can only pin the process birth.
+#[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_client_that_execs_loses_the_connection_it_opened() {
     if !tmux_available() {

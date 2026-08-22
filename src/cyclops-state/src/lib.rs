@@ -2302,6 +2302,7 @@ mod tests {
         assert_eq!(snapshot(&external), before);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn recursive_repair_refuses_an_opaque_directory_without_mutation() {
         let temp = tempfile::tempdir().unwrap();
@@ -2325,6 +2326,26 @@ mod tests {
             child_file.metadata().unwrap().permissions().mode() & 0o777,
             0o666
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recursive_repair_uses_a_pinned_handle_for_an_opaque_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = root_in(&temp);
+        let directory = root.path().join("opaque");
+        fs::create_dir(&directory).unwrap();
+        let child = directory.join("hidden.ndjson");
+        fs::write(&child, b"hidden\n").unwrap();
+        set_mode(&child, 0o666);
+        set_mode(&directory, 0o000);
+
+        let summary = root.repair_descendant_permissions(None).unwrap();
+
+        assert_eq!(summary.directories, 1);
+        assert_eq!(summary.regular_files, 1);
+        assert_eq!(mode(&directory), DIRECTORY_MODE);
+        assert_eq!(mode(&child), FILE_MODE);
     }
 
     #[test]

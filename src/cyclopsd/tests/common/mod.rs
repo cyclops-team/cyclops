@@ -101,7 +101,9 @@ pub const CAT_MANIFEST: &str = r#"
 [agent]
 id = "fix"
 display_name = "Cat fixture"
-process_names = ["python3", "python", "Python", "cat", "sh", "bash", "dash"]
+# Keep the GitHub Actions driver out of the fixture's vendor set. Otherwise
+# socket requests from the test process look like an agent outside the rig.
+process_names = ["python3", "python", "Python", "cat", "sh", "dash"]
 
 [[rule]]
 id = "always_idle"
