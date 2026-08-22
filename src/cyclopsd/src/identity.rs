@@ -500,6 +500,7 @@ pub fn resolve_pane_origin(
             pane_id,
             label,
             pane_root,
+            ..
         } => Some((pane_id, label, pane_root.pid)),
         PeerOrigin::Admin | PeerOrigin::Unprovable => None,
     }
@@ -516,6 +517,7 @@ pub fn resolve_pane_origin_observed(
             pane_id,
             label,
             pane_root,
+            ..
         } => Some((pane_id, label, pane_root.pid)),
         PeerOrigin::Admin | PeerOrigin::Unprovable => None,
     }
