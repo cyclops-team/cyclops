@@ -31,9 +31,20 @@ struct ActionRoute {
     manifest: Manifest,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolutionPathKind {
+    TerminalKey,
+    ComposerAlreadyClear,
+}
+
+enum ResolutionPath {
+    TerminalKey(ActionRoute),
+    ComposerAlreadyClear(ActionRoute),
+}
+
 struct Assessment {
     result: AttentionShowResult,
-    route: Option<ActionRoute>,
+    path: Option<ResolutionPath>,
 }
 
 pub(crate) async fn show(
@@ -55,32 +66,25 @@ pub(crate) async fn resolve(
     let attempt_id = target.record.attempt_id;
 
     let first = assess(inner, service, target, false).await;
-    if !first.result.checks.all_pass() {
+    let Some(path_kind) = resolution_path(&first, resolution) else {
         service.cancel_attention_resolution(attempt_id)?;
         return Err(AttentionActionError::Evidence(Box::new(first.result)));
-    }
-    if resolution == NotificationResolution::Discard
-        && first
-            .route
-            .as_ref()
-            .is_none_or(|route| route.manifest.injection.clear_keys.is_empty())
+    };
+    if matches!(first.path.as_ref(), Some(ResolutionPath::TerminalKey(route)) if resolution == NotificationResolution::Discard && route.manifest.injection.clear_keys.is_empty())
     {
         service.cancel_attention_resolution(attempt_id)?;
         return Err(AttentionActionError::DiscardUnsupported);
     }
 
-    // Rebuild every proof immediately before the terminal write. This is
-    // the same irreducible capture-to-key window as normal staged submit.
+    // Rebuild before recording the operator action. A clear-composer
+    // discard writes no key, but it still requires two current observations.
     let second = assess(inner, service, target, false).await;
-    if !second.result.checks.all_pass() {
+    if resolution_path(&second, resolution) != Some(path_kind) {
         service.cancel_attention_resolution(attempt_id)?;
         return Err(AttentionActionError::Evidence(Box::new(second.result)));
     }
-    let Some(second_route) = second.route else {
-        service.cancel_attention_resolution(attempt_id)?;
-        return Err(AttentionActionError::Evidence(Box::new(second.result)));
-    };
-    if action_keys(&second_route.manifest, resolution).is_none() {
+    if matches!(second.path.as_ref(), Some(ResolutionPath::TerminalKey(route)) if action_keys(&route.manifest, resolution).is_none())
+    {
         service.cancel_attention_resolution(attempt_id)?;
         return Err(AttentionActionError::DiscardUnsupported);
     }
@@ -91,39 +95,39 @@ pub(crate) async fn resolve(
     }
     delivery::inject_pause(inner, "attention_after_intent").await;
 
-    // The journal append takes time. Rebuild the full proof after it and
-    // immediately before the terminal key rather than trusting the pane
-    // observation that authorized the intent.
+    // The journal append takes time. Rebuild the proof before the terminal
+    // key or the no-key resolution rather than trusting an earlier capture.
     let final_assessment = assess(inner, service, target, false).await;
-    if !final_assessment.result.checks.all_pass() {
+    if resolution_path(&final_assessment, resolution) != Some(path_kind) {
         withdraw_pre_key(service, target, resolution)?;
         return Err(AttentionActionError::Evidence(Box::new(
             final_assessment.result,
         )));
     }
-    let Some(route) = final_assessment.route else {
-        withdraw_pre_key(service, target, resolution)?;
-        return Err(AttentionActionError::Evidence(Box::new(
-            final_assessment.result,
-        )));
+    let route = match final_assessment.path {
+        Some(ResolutionPath::TerminalKey(route)) => {
+            let Some(keys) = action_keys(&route.manifest, resolution) else {
+                withdraw_pre_key(service, target, resolution)?;
+                return Err(AttentionActionError::DiscardUnsupported);
+            };
+            if route
+                .watcher
+                .client()
+                .send_keys(&route.row.pane_id, &keys)
+                .await
+                .is_err()
+            {
+                let _ = service.cancel_attention_resolution(attempt_id);
+                // The durable intent remains ambiguous. No automatic retry may
+                // press a second key sequence.
+                return Err(AttentionActionError::Uncertain);
+            }
+            delivery::inject_pause(inner, "attention_after_key").await;
+            route
+        }
+        Some(ResolutionPath::ComposerAlreadyClear(route)) => route,
+        None => unreachable!("resolution path was checked above"),
     };
-    let Some(keys) = action_keys(&route.manifest, resolution) else {
-        withdraw_pre_key(service, target, resolution)?;
-        return Err(AttentionActionError::DiscardUnsupported);
-    };
-    if route
-        .watcher
-        .client()
-        .send_keys(&route.row.pane_id, &keys)
-        .await
-        .is_err()
-    {
-        let _ = service.cancel_attention_resolution(attempt_id);
-        // The durable intent remains ambiguous. No automatic retry may
-        // press a second key sequence.
-        return Err(AttentionActionError::Uncertain);
-    }
-    delivery::inject_pause(inner, "attention_after_key").await;
 
     if let Err(error) = service.resolve_attention(target, resolution) {
         tracing::error!(
@@ -149,6 +153,21 @@ pub(crate) async fn resolve(
         attempt_id,
         resolution,
     })
+}
+
+fn resolution_path(
+    assessment: &Assessment,
+    resolution: NotificationResolution,
+) -> Option<ResolutionPathKind> {
+    match assessment.path.as_ref()? {
+        ResolutionPath::TerminalKey(_) => Some(ResolutionPathKind::TerminalKey),
+        ResolutionPath::ComposerAlreadyClear(_)
+            if resolution == NotificationResolution::Discard =>
+        {
+            Some(ResolutionPathKind::ComposerAlreadyClear)
+        }
+        ResolutionPath::ComposerAlreadyClear(_) => None,
+    }
 }
 
 fn withdraw_pre_key(
@@ -184,7 +203,7 @@ async fn assess(
         terminal_action_safe: false,
     };
     let mut observed = None;
-    let mut action_route = None;
+    let mut action_path = None;
 
     let Some(binding) = target.record.binding.as_ref() else {
         return assessment_result(
@@ -193,7 +212,7 @@ async fn assess(
             expected,
             observed,
             include_diff,
-            action_route,
+            action_path,
         );
     };
     let Some(route) = crate::messaging::notification_route(inner, service, target.record.recipient)
@@ -206,7 +225,7 @@ async fn assess(
             expected,
             observed,
             include_diff,
-            action_route,
+            action_path,
         );
     };
     let session_idx = route.session_idx;
@@ -219,7 +238,7 @@ async fn assess(
             expected,
             observed,
             include_diff,
-            action_route,
+            action_path,
         );
     };
 
@@ -232,7 +251,7 @@ async fn assess(
             expected,
             observed,
             include_diff,
-            action_route,
+            action_path,
         );
     }
 
@@ -247,7 +266,7 @@ async fn assess(
             expected,
             observed,
             include_diff,
-            action_route,
+            action_path,
         );
     };
     let Some(now) = watcher.pane(&row.pane_id) else {
@@ -257,7 +276,7 @@ async fn assess(
             expected,
             observed,
             include_diff,
-            action_route,
+            action_path,
         );
     };
     let after = fusion::admitted_binding(inner, session_idx, &now);
@@ -269,7 +288,7 @@ async fn assess(
             expected,
             observed,
             include_diff,
-            action_route,
+            action_path,
         );
     }
 
@@ -293,22 +312,26 @@ async fn assess(
     // Composer extraction proves the terminal layout independently from
     // equality. An operator asking for a diff needs the actual mismatch,
     // while a terminal action still requires exact normalized content.
-    if let delivery::ComposerContentProof::Visible(content) =
-        delivery::exact_composer_content_from_joined_capture(&manifest, &capture)
-    {
+    let content_proof = delivery::exact_composer_content_from_joined_capture(&manifest, &capture);
+    if let delivery::ComposerContentProof::Visible(content) = &content_proof {
         checks.trailer_anchored = true;
         checks.notification_exact = expected.as_deref() == Some(content.as_str());
         if include_diff {
-            observed = Some(content);
+            observed = Some(content.clone());
         }
     }
+    let screen_state =
+        fusion::screen_winner_esc(&manifest, &plain, Some(&capture)).map(|rule| rule.state);
+    let route = ActionRoute {
+        session_idx,
+        watcher,
+        row: now,
+        manifest,
+    };
     if checks.all_pass() {
-        action_route = Some(ActionRoute {
-            session_idx,
-            watcher,
-            row: now,
-            manifest,
-        });
+        action_path = Some(ResolutionPath::TerminalKey(route));
+    } else if discard_absent_is_safe(&checks, screen_state, &content_proof) {
+        action_path = Some(ResolutionPath::ComposerAlreadyClear(route));
     }
     assessment_result(
         target,
@@ -316,7 +339,7 @@ async fn assess(
         expected,
         observed,
         include_diff,
-        action_route,
+        action_path,
     )
 }
 
@@ -326,7 +349,7 @@ fn assessment_result(
     expected: Option<String>,
     observed: Option<String>,
     include_diff: bool,
-    route: Option<ActionRoute>,
+    path: Option<ResolutionPath>,
 ) -> Assessment {
     Assessment {
         result: AttentionShowResult {
@@ -337,8 +360,26 @@ fn assessment_result(
             expected: include_diff.then_some(expected).flatten(),
             observed: include_diff.then_some(observed).flatten(),
         },
-        route,
+        path,
     }
+}
+
+fn discard_absent_is_safe(
+    checks: &AttentionChecks,
+    screen_state: Option<AgentState>,
+    content_proof: &delivery::ComposerContentProof,
+) -> bool {
+    // Do not send clear keys when the exact staged payload is gone. The
+    // screen rule must independently prove an empty composer for this pane.
+    checks.process_matches
+        && checks.manifest_matches
+        && checks.terminal_action_safe
+        && screen_state == Some(AgentState::Idle)
+        && matches!(
+            content_proof,
+            delivery::ComposerContentProof::Unprovable
+                | delivery::ComposerContentProof::Unsupported
+        )
 }
 
 fn process_matches(current: crate::identity::ProcId, expected: ProcessInstanceId) -> bool {
@@ -521,6 +562,42 @@ composer_continuation_regex = '^  (?P<content>.*)$'
             assert!(!staged_composer_state_is_safe(Some(state)));
         }
         assert!(!staged_composer_state_is_safe(None));
+    }
+
+    #[test]
+    fn clear_composer_discard_requires_current_binding_and_screen_proof() {
+        let checks = AttentionChecks {
+            notification_exact: false,
+            trailer_anchored: false,
+            process_matches: true,
+            manifest_matches: true,
+            terminal_action_safe: true,
+        };
+        assert!(discard_absent_is_safe(
+            &checks,
+            Some(AgentState::Idle),
+            &delivery::ComposerContentProof::Unprovable,
+        ));
+        assert!(!discard_absent_is_safe(
+            &checks,
+            Some(AgentState::IdleWithInput),
+            &delivery::ComposerContentProof::Unprovable,
+        ));
+        assert!(!discard_absent_is_safe(
+            &checks,
+            Some(AgentState::Idle),
+            &delivery::ComposerContentProof::Hidden,
+        ));
+
+        let wrong_process = AttentionChecks {
+            process_matches: false,
+            ..checks
+        };
+        assert!(!discard_absent_is_safe(
+            &wrong_process,
+            Some(AgentState::Idle),
+            &delivery::ComposerContentProof::Unprovable,
+        ));
     }
 
     #[test]

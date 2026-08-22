@@ -178,9 +178,11 @@ cyclops attention complete <attempt-id>
 cyclops attention discard <attempt-id>
 ```
 
-`show` is read-only. `complete` and `discard` recheck the exact notification,
-terminal layout, process generations, manifest, and current terminal safety
-before acting. An uncertain action outcome must be inspected and must not be
+`show` is read-only. `complete` and a staged `discard` recheck the exact
+notification, terminal layout, process generations, manifest, and current
+terminal safety before acting. If a fresh screen rule proves that the composer
+is already empty, `discard` records that resolution without typing a clear
+sequence. An uncertain action outcome must be inspected and must not be
 repeated.
 
 `show --diff` returns the exact selected transport bytes to the authenticated
