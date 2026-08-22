@@ -475,6 +475,48 @@ fn name_sends_the_label_and_the_pin() {
     let _ = fs::remove_dir_all(&home);
 }
 
+/// A new tmux pane reaches its first shell command before the daemon's watcher
+/// necessarily publishes it. `name --self` waits through that one bounded
+/// discovery race without retrying any other naming failure.
+#[test]
+fn self_name_retries_a_new_pane_until_the_watcher_publishes_it() {
+    let home = scratch_home("name-self-discovery");
+    serve_conns(&home, hello(1), 1, move |req| {
+        assert_eq!(req["method"], "pane.label");
+        assert_eq!(req["params"]["target"], json!("%18"));
+        assert_eq!(req["params"]["label"], json!("codey-research"));
+        let answer = if req["id"] == json!(1) {
+            json!({
+                "id": req["id"],
+                "error": {"code": "no_such_target", "message": "pane is not published yet"}
+            })
+        } else {
+            json!({
+                "id": req["id"],
+                "result": {"target": "%18", "pane_id": "%18", "label": "codey-research"}
+            })
+        };
+        (vec![answer.to_string()], false)
+    });
+
+    let out = run_cyclops_io(
+        &home,
+        &[("TMUX_PANE", "%18")],
+        &["name", "codey-research", "--self", "--plain"],
+        None,
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "✔ named codey-research · %18\n"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
 /// A name is required unless it is being taken back, and the two cannot
 /// be asked for at once. Usage mistakes never reach the daemon.
 #[test]
