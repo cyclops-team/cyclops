@@ -1,3 +1,8 @@
+#![cfg_attr(
+    target_os = "linux",
+    allow(clippy::unnecessary_cast, clippy::useless_conversion)
+)]
+
 //! Owner-only state paths anchored beneath one validated directory descriptor.
 //!
 //! A [`StateRoot`] is the only path-based entry point. Every later lookup is
@@ -1645,7 +1650,7 @@ fn stat_pinned(file: &File, path: &Path) -> Result<libc::stat, StateError> {
     let result = unsafe {
         libc::fstatat(
             file.as_raw_fd(),
-            b"\0".as_ptr() as *const libc::c_char,
+            c"".as_ptr(),
             metadata.as_mut_ptr(),
             libc::AT_EMPTY_PATH,
         )

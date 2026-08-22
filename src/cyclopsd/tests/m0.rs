@@ -253,7 +253,12 @@ async fn m0_shadow_daemon_end_to_end() {
         let session = &resp["result"]["sessions"][0];
         if session["attached"] == json!(true) {
             let pane = &session["panes"][0];
-            if pane["current_command"] == "bash"
+            // tmux reports either the symlink basename or its shell target,
+            // depending on the host platform.
+            if matches!(
+                pane["current_command"].as_str(),
+                Some("bash") | Some("cyc-m0-agent")
+            )
                 && pane["manifest"] == "fixture"
                 && pane["state"] == "working"
             {

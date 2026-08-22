@@ -75,13 +75,15 @@ async fn joined_capture_reconstructs_tmux_physical_wraps() {
     let marker = "CYCAP_WRAP_abcdefghijklmnopqrstuvwxyz0123456789";
     let trailing = "CYCAP_TRAILING_CELL";
     client
-        .send_keys("%0", &[&format!("printf '%s\\n' {marker}"), "Enter"])
+        .send_keys(
+            "%0",
+            &[
+                &format!("printf '%s\\n%s \\n' {marker} {trailing}"),
+                "Enter",
+            ],
+        )
         .await
-        .expect("write marker");
-    client
-        .send_keys("%0", &[&format!("printf '%s \\n' {trailing}"), "Enter"])
-        .await
-        .expect("write trailing cell");
+        .expect("write capture fixture");
 
     let mut joined = String::new();
     for _ in 0..100 {
