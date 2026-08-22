@@ -258,8 +258,7 @@ async fn m0_shadow_daemon_end_to_end() {
             if matches!(
                 pane["current_command"].as_str(),
                 Some("bash") | Some("cyc-m0-agent")
-            )
-                && pane["manifest"] == "fixture"
+            ) && pane["manifest"] == "fixture"
                 && pane["state"] == "working"
             {
                 assert_eq!(session["name"], "main");
