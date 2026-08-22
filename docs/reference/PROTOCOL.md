@@ -402,13 +402,17 @@ also returns the expected payload and safely extracted composer content so the
 CLI can compute a local diff. A direct fallback diff contains the message body
 and is available only to the authenticated workspace administrator. Diff bytes
 are never journaled, logged, or emitted as events.
-`attention.complete` and `attention.discard` take the same id shape. Both
-require all five checks again immediately before the key sequence. Complete
-uses the manifest submit key. Discard uses only the manifest clear sequence
-and refuses a manifest without one. Before sending the terminal key, the
+`attention.complete` and `attention.discard` take the same id shape. Complete
+requires all five checks again immediately before the submit key. Discard uses
+the same guarded clear sequence when the exact notification remains staged.
+When a fresh screen rule proves the composer empty, discard instead requires
+the recorded process and manifest bindings plus terminal safety, rechecks them
+before recording the resolution, and sends no terminal key. A hidden or typed
+composer never qualifies for that path. Before either resolution path, the
 daemon appends a content-free `notification_resolution_intent` fact. A known
-pre-key refusal appends `notification_resolution_intent_withdrawn` and may be
-retried. An accepted key is followed by one content-free
+refusal before a terminal key or no-key resolution appends
+`notification_resolution_intent_withdrawn` and may be retried. An accepted
+key or no-key resolution is followed by one content-free
 `notification_resolved` fact. An unmatched intent reports an uncertain
 outcome and must not be repeated. Repeated or ambiguous resolutions refuse.
 

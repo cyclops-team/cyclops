@@ -5463,9 +5463,22 @@ pub(crate) async fn wait_pinned(
         state,
         waited_ms: started.elapsed().as_millis() as u64,
     };
-    // Subscribe before the first read so no edge can fall between.
+    // Subscribe before the baseline refresh so no state edge can fall
+    // between the fresh observation and the wait loop.
     let mut ev_rx = inner.events.subscribe();
-    let mut pane_rx = inner.watcher_of(session_idx).map(|w| w.subscribe());
+    let watcher = inner.watcher_of(session_idx);
+    let mut pane_rx = watcher.as_ref().map(|w| w.subscribe());
+    if let Some(watcher) = watcher.as_ref() {
+        fusion::recompute_pane(
+            inner,
+            session_idx,
+            watcher,
+            pane_id,
+            false,
+            "agent_wait_baseline",
+        )
+        .await;
+    }
     let mut state = inner.cached_state(session_idx, pane_id);
     // Pin the occupant, in two domains that are NOT interchangeable.
     //
