@@ -541,14 +541,15 @@ pub fn render_named(result: &Value, style: &Style) -> String {
     }
 }
 
-/// The deliveries the header counted, one row each.
+/// Status is a current operational surface, not an alarm archive.
 ///
-/// A count with nothing behind it is the same defect on any surface: the
-/// pane grid answers for the blocked panes, so the backlog needs rows of
-/// its own or the number stands alone. Empty when the answer carried no
-/// backlog, which is also when the header counted none.
+/// Keep the newest alarms visible and point to the operator tools for the
+/// rest. The header retains the full count, so the summary never hides that
+/// work remains.
+const STATUS_DELIVERY_ROW_LIMIT: usize = 8;
+
 fn waiting_rows(attention: &Attention, res: &StatusResult, style: &Style) -> Vec<String> {
-    let open: Vec<(String, String, DeliveryState, Option<String>, u64)> = attention
+    let mut open: Vec<(String, String, DeliveryState, Option<String>, u64)> = attention
         .items()
         .into_iter()
         .filter_map(|i| match i {
@@ -567,13 +568,23 @@ fn waiting_rows(attention: &Attention, res: &StatusResult, style: &Style) -> Vec
     if open.is_empty() {
         return Vec::new();
     }
-    let to_w = open
+
+    open.sort_by(|left, right| {
+        right
+            .4
+            .cmp(&left.4)
+            .then_with(|| left.0.cmp(&right.0))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    let hidden = open.len().saturating_sub(STATUS_DELIVERY_ROW_LIMIT);
+    let shown = &open[..open.len().min(STATUS_DELIVERY_ROW_LIMIT)];
+    let to_w = shown
         .iter()
         .map(|(to, _, _, _, _)| display_width(to))
         .max()
         .unwrap_or(0);
     let mut out = vec![String::new(), format!("  {}", style.dim("waiting on you"))];
-    out.extend(open.iter().map(|(to, id, state, cause, ts)| {
+    out.extend(shown.iter().map(|(to, id, state, cause, ts)| {
         let badge = receipt_badge(
             &DeliveryReceipt {
                 to: to.clone(),
@@ -601,6 +612,14 @@ fn waiting_rows(attention: &Attention, res: &StatusResult, style: &Style) -> Vec
         let detail = style.dim(&format!("{cause} · {id} · {when}"));
         format!("  {}  {badge} · {detail}", style.role(to, &pad(to, to_w)))
     }));
+    if hidden > 0 {
+        out.push(format!(
+            "  {}",
+            style.dim(&format!(
+                "{hidden} older alarms not shown · inspect or clear: cyclops alarm preview --older-than <age>"
+            ))
+        ));
+    }
     out
 }
 
@@ -1639,6 +1658,34 @@ mod tests {
         let got = render_status(&res, &Style::none(), Path::new("/x/config.toml"));
         assert!(!got.contains("waiting on you"), "{got}");
         assert!(got.starts_with("‿ cyclops"), "{got}");
+    }
+
+    #[test]
+    fn status_bounds_historical_delivery_rows() {
+        let mut res = fixture();
+        res.open_deliveries = (0..10)
+            .map(|index| {
+                let mut delivery = open_delivery(
+                    &format!("m-{index:02}"),
+                    "reviewer",
+                    DeliveryState::AttentionRequired,
+                );
+                delivery.ts = index + 1;
+                delivery
+            })
+            .collect();
+
+        let got = render_status(&res, &Style::none(), Path::new("/x/config.toml"));
+        assert!(got.contains("m-09"), "{got}");
+        assert!(got.contains("m-02"), "{got}");
+        assert!(!got.contains("m-01"), "{got}");
+        assert!(!got.contains("m-00"), "{got}");
+        assert!(
+            got.contains(
+                "2 older alarms not shown · inspect or clear: cyclops alarm preview --older-than <age>"
+            ),
+            "{got}"
+        );
     }
 
     #[test]

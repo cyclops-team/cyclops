@@ -1100,10 +1100,23 @@ pub(crate) fn mailbox_caller(
     let caller = match origin {
         identity::PeerOrigin::Admin => service.admin(),
         identity::PeerOrigin::Pane {
-            pane_id, pane_root, ..
+            pane_id,
+            pane_root,
+            vendor_below,
+            ..
         } => {
-            let route =
-                report_pane_at(&panes, &pane_id, pane_root).ok_or_else(mailbox_origin_denied)?;
+            // A shell is the local operator unless its ancestry crosses an
+            // agent vendor. Labels are mutable display data and cannot grant
+            // or revoke administrative authority.
+            if !vendor_below {
+                let admin = service.admin();
+                return Ok((service, admin));
+            }
+            let Some(route) = report_pane_at(&panes, &pane_id, pane_root) else {
+                // An unconfigured vendor cannot acquire administrative
+                // authority by running a Cyclops command.
+                return Err(mailbox_origin_denied());
+            };
             let root = ProcessInstanceId::new(route.root.pid, route.root.birth)
                 .map_err(|_| mailbox_origin_denied())?;
             if inner
@@ -2840,6 +2853,7 @@ mod tests {
                     pane_id: "%1".into(),
                     label: Some("stale-display-name".into()),
                     pane_root: root_process,
+                    vendor_below: true,
                 },
             )
             .unwrap()
@@ -2858,6 +2872,7 @@ mod tests {
                 pane_id: "%1".into(),
                 label: None,
                 pane_root: root_process,
+                vendor_below: true,
             },
         )
         .unwrap_err();
@@ -2881,6 +2896,7 @@ mod tests {
                 pane_id: "%1".into(),
                 label: None,
                 pane_root: root_process,
+                vendor_below: true,
             },
         )
         .unwrap_err();
@@ -2892,6 +2908,7 @@ mod tests {
                 pane_id: "%2".into(),
                 label: None,
                 pane_root: identity::ProcId { pid: 30, birth: 2 },
+                vendor_below: true,
             },
         )
         .unwrap_err();
