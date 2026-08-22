@@ -114,6 +114,7 @@ mod tests {
             id: None,
             kind: EntryKind::State {
                 target: target.into(),
+                session_idx: 0,
                 pane_id: Some(pane_id.into()),
                 state,
             },
@@ -129,6 +130,7 @@ mod tests {
                 state,
             }],
             open: Vec::new(),
+            admin_unread: 0,
             roster: Vec::new(),
         })
     }

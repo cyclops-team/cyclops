@@ -29,6 +29,7 @@ stage() {
     printf '   %ss\n' "$(( $(date +%s) - start ))"
 }
 
+stage "messaging docs" ./tests/e2e/messaging-docs-parity.sh
 stage "fmt" cargo fmt --all --check
 stage "clippy" cargo clippy --workspace --all-targets -- -D warnings
 stage "doc paths" python3 scripts/check-doc-paths.py

@@ -8,7 +8,7 @@
 
 Cyclops is an open-source coordination layer for coding agents running in
 your terminal. Run the agents you already use, watch them from one
-workspace, hand work between them with verified delivery, and keep it all
+workspace, hand work between them through durable mailboxes, and keep it all
 on an append-only record you can audit later. If it runs in your terminal,
 it can run in Cyclops.
 
@@ -46,43 +46,52 @@ Details, options, and troubleshooting: [installation guide](docs/guides/install.
 cyclops
 ```
 
-One command, from anywhere. It opens the full-screen workspace — your
-sessions and agents in a sidebar, tabs, live panes — starting a tmux
+One command, from anywhere. It opens the full-screen workspace with your
+sessions and agents in a sidebar, tabs, and live panes, starting a tmux
 session and the daemon if none is running. Start your coding agents inside
 its panes the way you normally would, and talk to them there.
 
 ## What using it looks like
 
 You keep talking to your agents in natural language; Cyclops gives them a
-shared way to address one another and prove delivery:
+shared way to address one another through durable mailboxes:
 
 > Implement the rate limiter change. When you're done, send it to
 > reviewer and ask for a review.
 
-The agent runs the handoff itself — `cyclops send reviewer …` from its own
-pane. The daemon resolves the sender from the pane the message really came
-from, delivers it with an evidence-labeled receipt, and appends it to a
-plain-text record you can read with `jq`. You watch it happen from the
-workspace instead of relaying messages by hand.
+The agent runs `cyclops send reviewer ...` from its own pane. The daemon
+resolves the sender from the calling process, accepts the message into the
+durable workspace mailbox, and queues a content-free wake for the reviewer.
+The reviewer claims the exact message before reading its body. You watch the
+handoff from the workspace instead of relaying it by hand.
 
-Your agents learn the verbs from one file —
+Your agents learn the verbs from one file:
 [skills/cyclops/SKILL.md](skills/cyclops/SKILL.md), which the installer
-places for Claude Code automatically — and scripts use the same CLI with
-`--json`. The commands you will actually type:
+places at the canonical skill destination for every installed supported
+consumer. Codex and Cursor share one copy under `~/.agents`; setup never
+creates duplicate vendor copies. Scripts use the same CLI with `--json`.
+The commands you will actually type:
 
 | Command | What it does |
 |---|---|
 | `cyclops` | Open the workspace (starts tmux and the daemon when needed) |
 | `cyclops name <pane> <label>` | Name a pane so cyclops can address it |
-| `cyclops send <agent> --subject ...` | Deliver a message with a receipt naming its evidence |
+| `cyclops send <agent> --subject ...` | Accept a durable message and report its wake state |
+| `cyclops inbox list`; `cyclops inbox claim <id>` | List pending metadata or claim one exact payload |
+| `cyclops reply <message-id>` | Reply using the parent message's route and thread |
+| `cyclops messages` | Read body-free mailbox and notification state |
+| `cyclops alarm preview --older-than <age>` | Preview exact unresolved alarm ids without changing them |
+| `cyclops alarm clear <id>...` | Clear exact alarms; the age-selected form previews and confirms first |
 | `cyclops list` | Every named agent, how it is doing, what it is on |
 | `cyclops history` | The message record, newest last |
-| `cyclops wait <agent> --until idle` | Block until an agent is ready, done, or needs a human |
-| `cyclops watch` | The live event stream |
+| `cyclops wait <agent> --until idle` | Block on an occupant-pinned pane state; does not prove task completion |
+| `cyclops watch` | Live admin, firehose, and Messages views |
 | `cyclops update` | Rebuild from the latest source; config and record untouched |
 
-Every command explains itself with `--help` and takes `--json`. The
-two-agent review handoff, start to finish, is the
+Every command explains itself with `--help`. Daemon reads and direct
+mutations take `--json`. The guarded `alarm clear --older-than` form is
+interactive by design; scripts preview JSON and pass the returned exact ids
+to `alarm clear`. The two-agent review handoff, start to finish, is the
 [quickstart](docs/guides/QUICKSTART.md).
 
 ## How it works
@@ -90,16 +99,17 @@ two-agent review handoff, start to finish, is the
 A Rust daemon (`cyclopsd`) holds one scripted connection to tmux per
 watched session, over tmux control mode: cyclops asks, tmux answers, and
 tmux keeps owning your panes and layout. Agent state comes from sensor
-fusion — vendor hook events, pane titles, output activity, screen evidence —
+fusion from vendor hook events, pane titles, output activity, and screen evidence,
 with per-CLI detection rules shipped as data in
 [`resources/manifests/`](resources/manifests/), not code, so any terminal
-agent works without an SDK or a wrapper. Every message and state change
-lands in an append-only ledger, one JSON object per line.
+agent works without an SDK or a wrapper. Mailbox messages and claims use one
+append-only journal per durable workspace. Pane state and legacy direct
+delivery remain in separate append-only session ledgers.
 
 ## Docs
 
 **Going to work on the code? Start at
-[HANDOFF.md](docs/development/HANDOFF.md)** — the map, and the decisions
+[HANDOFF.md](docs/development/HANDOFF.md)**, the map and decisions
 behind it. Otherwise, one page per question.
 
 | | |
@@ -107,13 +117,13 @@ behind it. Otherwise, one page per question.
 | [QUICKSTART.md](docs/guides/QUICKSTART.md) | Two agents and a review gate, start to finish |
 | [install.md](docs/guides/install.md) | Build it, configure it, update it, run the tests |
 | [skills/cyclops/SKILL.md](skills/cyclops/SKILL.md) | Teaching your coding agent to use Cyclops itself |
-| [send.md](docs/guides/send.md) | Sending, receipts, broadcast, quota parking |
+| [send.md](docs/guides/send.md) | Acceptance, claim, reply, notification, and recovery |
 | [history.md](docs/guides/history.md) | Reading the record, threads, paging |
 | [wait.md](docs/guides/wait.md) | Waiting on an agent, exit codes |
 | [panes.md](docs/guides/panes.md) | Naming, the roster, the tmux border |
 | [workspaces.md](docs/guides/workspaces.md) | Presets, save and restore, `cyclops start` |
 | [workspace-ui.md](docs/guides/workspace-ui.md) | The full-screen workspace (`cyclops`) |
-| [ui.md](docs/guides/ui.md) | The stream TUI (`cyclops watch`) |
+| [ui.md](docs/guides/ui.md) | The stream and Messages TUI (`cyclops watch`) |
 | [themes.md](docs/guides/themes.md) | Semantic color tokens, shipped themes |
 | [hooks.md](docs/reference/hooks.md) | Wiring vendor hooks, verifying they fire |
 | [MANIFESTS.md](docs/reference/MANIFESTS.md) | Teaching cyclops a new agent CLI |
@@ -123,7 +133,7 @@ behind it. Otherwise, one page per question.
 | [HANDOFF.md](docs/development/HANDOFF.md) | Start here to work on the codebase |
 | [AGENTS.md](AGENTS.md) | The same front door for AI coding agents |
 | [ARCHITECTURE.md](docs/development/ARCHITECTURE.md) | How the pieces fit |
-| [DELIVERY.md](docs/development/DELIVERY.md) | The delivery spec: states, evidence tiers, ordering |
+| [DELIVERY.md](docs/development/DELIVERY.md) | Legacy direct-delivery compatibility design |
 | [INVARIANTS.md](docs/development/INVARIANTS.md) | Rules a change must never break |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | The development loop and the gates a change must pass |
 | [SECURITY.md](SECURITY.md) | Reporting a vulnerability privately |

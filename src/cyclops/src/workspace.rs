@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use cyclops_state::{CreateFileOutcome, StateRoot};
 use cyclops_tmux::layout::{self, ApplyOptions, Capture, Layout, Server};
 use serde_json::{json, Value};
 
@@ -95,11 +96,16 @@ pub fn load(home: &Path, name: &str) -> Option<Result<Layout, String>> {
 /// Write a workspace file, creating the directory.
 fn store(home: &Path, name: &str, layout: &Layout) -> Result<PathBuf, String> {
     let path = path_of(home, name);
-    let dir = path.parent().expect("workspaces path has a parent");
-    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let body = toml::to_string_pretty(layout).map_err(|e| e.to_string())?;
     let text = format!("{}{body}", saved_header(name));
-    std::fs::write(&path, text).map_err(|e| format!("write {}: {e}", path.display()))?;
+    StateRoot::open_or_create(home)
+        .and_then(|root| {
+            root.replace_file(
+                &Path::new("workspaces").join(format!("{name}.toml")),
+                text.as_bytes(),
+            )
+        })
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(path)
 }
 
@@ -1038,8 +1044,9 @@ fn prepare_home(
     //    saying what to add when it does not name this session.
     if !settings.exists {
         let path = config_path(home);
-        write_first_run_config(home, session)?;
-        notes.push(format!("wrote {}", path.display()));
+        if write_first_run_config(home, session)? {
+            notes.push(format!("wrote {}", path.display()));
+        }
     } else if !settings.watches(session) {
         notes.push(config_hint(&config_path(home), session));
     }
@@ -1157,6 +1164,7 @@ pub fn run_setup(json_out: bool, style: &Style, wire_hooks: bool) -> i32 {
                 "skill": skills.iter()
                     .filter(|s| s.outcome != crate::skillseed::Outcome::NoAgent)
                     .map(|s| json!({
+                        "consumer": s.consumer,
                         "path": s.path.display().to_string(),
                         "outcome": crate::skillseed::json_word(&s.outcome),
                     })).collect::<Vec<_>>(),
@@ -1191,19 +1199,11 @@ pub fn run_setup(json_out: bool, style: &Style, wire_hooks: bool) -> i32 {
     0
 }
 
-/// The pair of vendor-home writes install consent covers: hook entries
-/// into the config each installed vendor CLI reads on its own
-/// (`wire_installed_vendors`), and the agent skill into every skill
-/// folder present (`crate::skillseed::seed`). One function because they
-/// are one act — editing another tool's home so its agent can use
-/// cyclops — and two moments perform it: setup behind `--wire-hooks`,
-/// and every ordinary boot once [`consent_marker`] is on file. Gated the
-/// same way in both places or the two halves drift apart, which is how
-/// the skill once shipped without its hooks.
+/// Keep hook and skill writes on the same consent path during setup and
+/// deferred wiring.
 ///
-/// Both halves skip any vendor whose directory does not exist and never
-/// replace bytes this project did not write, so calling this again is a
-/// stat, not a write.
+/// Both halves gate on consumer homes and preserve bytes Cyclops did not
+/// write. A current setup performs no writes.
 fn wire_vendor_homes() -> (
     Vec<crate::hookset::WiredVendor>,
     Vec<crate::skillseed::SeededSkill>,
@@ -1259,10 +1259,26 @@ fn record_wiring_consent(home: &Path) {
                 --wire-hooks` (the installer's last step).\n\
                 While this file exists, every ordinary boot finishes that wiring for \
                 agent CLIs installed after cyclops: hook entries in the config each \
-                vendor CLI reads on its own, and the agent skill for Claude Code.\n\
+                vendor CLI reads on its own, and agent skills at the canonical \
+                destinations of installed consumers.\n\
                 Delete this file to withdraw the consent; CYCLOPS_NO_VENDOR_HOOKS=1 \
                 declines it for one run.\n";
-    if let Err(e) = std::fs::write(&path, text) {
+    let result = StateRoot::open_or_create(home).and_then(|root| {
+        match root.create_file_once(Path::new("vendor-wiring-consented"), text.as_bytes())? {
+            CreateFileOutcome::Created => Ok(()),
+            CreateFileOutcome::AlreadyExists => root
+                .open_read(Path::new("vendor-wiring-consented"))
+                .and_then(|winner| {
+                    winner
+                        .map(|_| ())
+                        .ok_or_else(|| cyclops_state::StateError::Io {
+                            path: path.clone(),
+                            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                        })
+                }),
+        }
+    });
+    if let Err(e) = result {
         eprintln!(
             "  hooks: can't record wiring consent at {}: {e}",
             path.display()
@@ -1287,7 +1303,7 @@ pub fn finish_deferred_wiring(home: &Path) -> Vec<String> {
     let mut notes: Vec<String> = Vec::new();
     for w in wired.iter().filter(|w| !w.unchanged) {
         notes.push(format!(
-            "{} appeared since install — wired cyclops hooks in {}",
+            "{} appeared since install: wired cyclops hooks in {}",
             w.vendor,
             w.path.display()
         ));
@@ -1296,7 +1312,8 @@ pub fn finish_deferred_wiring(home: &Path) -> Vec<String> {
     for s in &skills {
         match &s.outcome {
             crate::skillseed::Outcome::Written => notes.push(format!(
-                "Claude Code appeared since install — placed the cyclops skill at {}",
+                "{} appeared since install: placed the cyclops skill at {}",
+                s.consumer,
                 s.path.display()
             )),
             // A failure someone can fix, said each boot until it is: the
@@ -1335,11 +1352,24 @@ fn kept_backup(w: &crate::hookset::WiredVendor) -> Option<String> {
         .map(|b| format!("kept your previous {} config at {}", w.vendor, b.display()))
 }
 
-fn write_first_run_config(home: &Path, session: &str) -> Result<(), String> {
-    std::fs::create_dir_all(home).map_err(|e| format!("create {}: {e}", home.display()))?;
+fn write_first_run_config(home: &Path, session: &str) -> Result<bool, String> {
     let path = config_path(home);
-    std::fs::write(&path, first_run_config(session))
-        .map_err(|e| format!("write {}: {e}", path.display()))
+    let root =
+        StateRoot::open_or_create(home).map_err(|e| format!("create {}: {e}", home.display()))?;
+    match root
+        .create_file_once(
+            Path::new("config.toml"),
+            first_run_config(session).as_bytes(),
+        )
+        .map_err(|e| format!("write {}: {e}", path.display()))?
+    {
+        CreateFileOutcome::Created => Ok(true),
+        CreateFileOutcome::AlreadyExists => root
+            .open_read(Path::new("config.toml"))
+            .map_err(|e| format!("read {}: {e}", path.display()))?
+            .map(|_| false)
+            .ok_or_else(|| format!("read {}: file disappeared after creation", path.display())),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2312,6 +2342,8 @@ mod tests {
 
     #[test]
     fn a_saved_workspace_round_trips_through_the_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let dir = cyclops_proto::scratch::scratch_dir("cyc-ws-file");
         let _ = std::fs::remove_dir_all(&dir);
         let layout = preset("ops").unwrap().unwrap();
@@ -2319,8 +2351,50 @@ mod tests {
         assert!(path.ends_with("workspaces/saved.toml"));
         let back = load(&dir, "saved").expect("file is there").expect("parses");
         assert_eq!(back, layout);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
         assert!(load(&dir, "absent").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_linked_workspace_directory_is_refused_without_touching_its_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let home = cyclops_proto::scratch::scratch_dir("cyc-ws-link-home");
+        let external = cyclops_proto::scratch::scratch_dir("cyc-ws-link-external");
+        for path in [&home, &external] {
+            let _ = std::fs::remove_dir_all(path);
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let target = external.join("saved.toml");
+        std::fs::write(&target, b"external\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&external, home.join("workspaces")).unwrap();
+
+        let error = store(&home, "saved", &preset("solo").unwrap().unwrap()).unwrap_err();
+
+        assert!(
+            error.contains("linked or non-directory component"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"external\n");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&external);
     }
 
     /// A layout as if it had just been read off a live session.
@@ -2494,6 +2568,77 @@ mod tests {
         assert_eq!(table["sessions"].as_array().unwrap().len(), 1);
         assert_eq!(table["sessions"][0].as_str(), Some("main"));
         assert_eq!(table["default_workspace"].as_str(), Some("main"));
+    }
+
+    #[test]
+    fn first_run_config_and_consent_are_created_once_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = cyclops_proto::scratch::scratch_dir("cyc-first-run-owner-only");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert!(write_first_run_config(&home, "main").unwrap());
+        assert!(!write_first_run_config(&home, "other").unwrap());
+        assert!(std::fs::read_to_string(config_path(&home))
+            .unwrap()
+            .contains("main"));
+        assert_eq!(
+            std::fs::metadata(config_path(&home))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        record_wiring_consent(&home);
+        assert_eq!(
+            std::fs::metadata(consent_marker(&home))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn first_run_create_once_writers_refuse_linked_winners() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let home = cyclops_proto::scratch::scratch_dir("cyc-first-run-link-home");
+        let external = cyclops_proto::scratch::scratch_dir("cyc-first-run-link-external");
+        for path in [&home, &external] {
+            let _ = std::fs::remove_dir_all(path);
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let config_target = external.join("config.toml");
+        let consent_target = external.join("consent");
+        std::fs::write(&config_target, b"external config\n").unwrap();
+        std::fs::write(&consent_target, b"external consent\n").unwrap();
+        for path in [&config_target, &consent_target] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        symlink(&config_target, config_path(&home)).unwrap();
+        symlink(&consent_target, consent_marker(&home)).unwrap();
+
+        assert!(write_first_run_config(&home, "main").is_err());
+        record_wiring_consent(&home);
+
+        assert_eq!(std::fs::read(&config_target).unwrap(), b"external config\n");
+        assert_eq!(
+            std::fs::read(&consent_target).unwrap(),
+            b"external consent\n"
+        );
+        for path in [&config_target, &consent_target] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&external);
     }
 
     #[test]

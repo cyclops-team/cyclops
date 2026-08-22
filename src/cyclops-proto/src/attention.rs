@@ -601,6 +601,8 @@ mod tests {
             current_command: "claude".into(),
             dead: false,
             in_mode: false,
+            write_ready: false,
+            write_block: None,
             width: 120,
             height: 40,
             state,
@@ -622,7 +624,9 @@ mod tests {
                 attached: true,
                 panes,
             }],
+            admin_unread: 0,
             open_deliveries: open,
+            diagnostics: Vec::new(),
             manifests: None,
             pid: None,
         }

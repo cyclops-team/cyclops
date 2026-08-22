@@ -45,20 +45,39 @@
 //! main.rs is a thin wrapper adding signals and logging.
 
 mod ack;
+mod attention_resolution;
 mod chrome;
+mod composer_recovery;
 pub mod config;
+mod deadlock;
 mod delivery;
 mod fusion;
 mod history;
 pub mod identity;
+mod livesession;
+pub mod mailbox;
+mod messaging;
+mod notification_adapter;
 mod registry;
 mod selftest;
 mod server;
+mod sessionid;
+mod sessionstore;
+pub(crate) mod turnkey;
 mod workspace_ui;
+// Removed when daemon startup reads the workspace identity.
+#[allow(dead_code)]
+mod workspaceid;
 
 pub use config::Config;
+/// The exact bytes a delivery puts in a composer. Public because it IS
+/// the payload contract: the hook acknowledgement matcher compares a
+/// vendor's reported prompt against these bytes, so anything that needs
+/// to reason about a delivery's text has to build it the same way.
+pub use delivery::render_payload;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -68,8 +87,10 @@ use cyclops_ledger::LedgerWriter;
 use cyclops_manifest::Manifest;
 use cyclops_proto::{
     AdminNotifyParams, AgentState, Detection, Event, Kind, LedgerLine, MsgSendParams,
-    StateReportParams, WireError,
+    ProcessInstanceId, RecipientKey, SessionIdentityBinding, SessionInstanceId, StateReportParams,
+    TmuxPaneId, TmuxSessionId, WireError, WorkspaceId,
 };
+use cyclops_state::{RepairSummary, StateRoot};
 use cyclops_tmux::{
     ControlConfig, PaneEvent, PaneField, PaneRow, SessionWatcher, TmuxError, TmuxVersion,
 };
@@ -100,10 +121,48 @@ pub(crate) type InjectPause = Arc<
         + Sync,
 >;
 
+/// One pane inside one append-only daemon session slot.
+///
+/// tmux pane ids are unique only inside a tmux server. Two watched servers
+/// may both have `%1`, so every boot-scoped runtime cache uses the slot as
+/// part of the key. The slot index is stable for the daemon's lifetime.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct PaneKey {
+    pub(crate) session_idx: usize,
+    pub(crate) pane_id: String,
+}
+
+impl PaneKey {
+    pub(crate) fn new(session_idx: usize, pane_id: &str) -> Self {
+        Self {
+            session_idx,
+            pane_id: pane_id.to_string(),
+        }
+    }
+}
+
 /// Shared daemon state. Everything the socket server and the fusion engine
 /// need lives here behind one Arc.
 pub(crate) struct Inner {
     pub(crate) cfg: Config,
+    /// Validated descriptor anchoring every session-ledger open in this daemon.
+    pub(crate) state_root: Arc<StateRoot>,
+    /// One boot-wide aggregate recorded on each session's boot fact.
+    pub(crate) state_repair: RepairSummary,
+    /// Durable identity of this state root. Loaded before any mailbox or
+    /// session identity is opened.
+    pub(crate) workspace_id: WorkspaceId,
+    /// Durable live-session assignments. Persistence and adoption happen
+    /// while this lock is held; the lock is never held across an await.
+    pub(crate) session_identities: StdMutex<sessionstore::SessionIdentities>,
+    pub(crate) mailbox: Option<Arc<mailbox::MailboxService>>,
+    /// Boot-scoped reconciliation state for barriers derived from the
+    /// canonical workspace projection.
+    pub(crate) composer_recovery: StdMutex<composer_recovery::RecoveryCoordinator>,
+    /// Serializes route state, directory replacement, and authenticated reads.
+    pub(crate) mailbox_publication: StdMutex<()>,
+    #[cfg(test)]
+    mailbox_publish_pause: StdMutex<Option<MailboxPublishPause>>,
     pub(crate) boot_id: String,
     pub(crate) started: Instant,
     /// Raw `tmux -V` text, "unavailable" when the probe failed.
@@ -132,8 +191,8 @@ pub(crate) struct Inner {
     pub(crate) sessions: StdMutex<Vec<Arc<SessionSlot>>>,
     /// Push stream for events.subscribe connections.
     pub(crate) events: broadcast::Sender<Event>,
-    /// Cached fusion verdict per pane id.
-    pub(crate) detections: StdMutex<HashMap<String, DetEntry>>,
+    /// Cached fusion verdict per exact watched pane route.
+    pub(crate) detections: StdMutex<HashMap<PaneKey, DetEntry>>,
     /// Adoption registry: which pane wears which label, what manifest is
     /// pinned to it, and the tmux chrome it wore before cyclops arrived.
     /// Explicit adoption via pane.label (v1 keeper), durable across
@@ -143,16 +202,29 @@ pub(crate) struct Inner {
     /// change that is about to repaint (cyclops-theme's hot reload rule:
     /// the stat rides an event, no timer exists).
     pub(crate) theme: StdMutex<cyclops_theme::ThemeWatch>,
-    /// Latest hook sensor reading per pane id (agent.state.report), plus
+    /// Latest hook sensor reading per exact watched pane route, plus
     /// the aging state that keeps a stale edge from pinning fused state.
-    pub(crate) hook_readings: StdMutex<HashMap<String, fusion::HookEntry>>,
-    /// argv-basename cache for manifest binding, per (pane id, pane pid).
+    pub(crate) hook_readings: StdMutex<HashMap<PaneKey, fusion::HookEntry>>,
+    /// Authenticated turn ENDS, kept apart from the runtime hook reading
+    /// above and never evicted by it.
+    ///
+    /// The two answer different questions. A hook reading is an ephemeral
+    /// opinion about what the pane is doing NOW, and fusion is right to
+    /// age it out or drop it when the rules contradict it three times
+    /// running. A turn end is a fact about a turn that happened, and the
+    /// composer hold consumes it possibly seconds later. Storing one in
+    /// the other let the runtime eviction destroy lifecycle evidence: a
+    /// `Stop` recorded while the vendor was still painting its working
+    /// row disagreed with the rules, hit the disagreement limit, and was
+    /// erased before the hold it belonged to could read it.
+    pub(crate) turn_ends: StdMutex<turnkey::Ends>,
+    /// argv-basename cache for manifest binding, per (route, pane pid).
     /// Filled lazily when comm-name binding misses (F21); entries die with
     /// the pane. Only a basename that actually bound a manifest is ever
     /// stored, so a miss means "not settled yet" rather than "no agent" —
     /// see [`fusion::argv_bound_manifest`] for the exec race that rule
     /// exists to survive.
-    pub(crate) argv_cache: StdMutex<HashMap<(String, i32), String>>,
+    pub(crate) argv_cache: StdMutex<HashMap<(PaneKey, identity::ProcId), String>>,
     /// Delivery pipeline state.
     pub(crate) engine: delivery::Engine,
     /// Hook report dedupe state.
@@ -198,10 +270,21 @@ pub(crate) struct SessionSlot {
     /// this handle and opening a second file mid-session) would split one
     /// session's record across two files with no line in either saying so.
     pub(crate) ledger: Arc<LedgerWriter>,
-    /// Pane table as of the last detach. Hook reports arriving while the
-    /// control connection is down resolve against this (a report does not
-    /// need the tmux connection); the live table wins whenever attached.
-    pub(crate) last_panes: StdMutex<HashMap<String, PaneRow>>,
+    /// Pane table and exact root generations retained across a detach.
+    pub(crate) last_panes: StdMutex<HashMap<String, ObservedPane>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ObservedPane {
+    pub(crate) row: PaneRow,
+    pub(crate) root: Option<identity::ProcId>,
+}
+
+impl ObservedPane {
+    fn capture(row: PaneRow) -> ObservedPane {
+        let root = identity::ProcId::of(row.pane_pid);
+        ObservedPane { row, root }
+    }
 }
 
 impl SessionSlot {
@@ -238,18 +321,94 @@ impl SessionSlot {
         }
         Some(std::mem::replace(&mut *name, new_name))
     }
+
+    /// Current observed rows while attached, otherwise the retained rows.
+    fn mailbox_route(&self) -> Option<MailboxSessionRoute> {
+        let (identity, panes, attached) = {
+            let link = self.link.lock().expect("session link lock");
+            (
+                link.identity.clone(),
+                link.mailbox_panes.values().cloned().collect::<Vec<_>>(),
+                link.attached,
+            )
+        };
+        let instance_id = identity?.session_instance_id();
+        let rows = if attached {
+            panes
+        } else {
+            self.last_panes
+                .lock()
+                .expect("last panes lock")
+                .values()
+                .cloned()
+                .collect()
+        };
+        Some(MailboxSessionRoute {
+            session_idx: usize::MAX,
+            instance_id,
+            attached,
+            panes: rows,
+        })
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct SessionLink {
     pub(crate) attached: bool,
     pub(crate) watcher: Option<Arc<SessionWatcher>>,
+    /// Published only after the live key has been observed and persisted.
+    /// Kept while detached so a last-known pane retains its mailbox.
+    pub(crate) identity: Option<SessionIdentityBinding>,
+    mailbox_panes: HashMap<String, ObservedPane>,
 }
 
+#[derive(Clone)]
 pub(crate) struct DetEntry {
     pub(crate) detection: Detection,
     /// Manifest id bound at the last recompute.
     pub(crate) manifest: Option<String>,
+    /// The foreground process-group leader this verdict describes, when it
+    /// could be proven. A pane id names a place, not an occupant: an agent
+    /// can exit and another start at the same shell prompt, inheriting the
+    /// pane id, the root pid and the manifest. Without this, a retained
+    /// verdict is attributed to whoever is there now.
+    ///
+    /// None means nobody proved it, which never matches a proven binding.
+    pub(crate) occupant: Option<i32>,
+    /// The admitted AGENT identity behind this verdict, resolved by the
+    /// recompute that produced it.
+    ///
+    /// Published with the stamp so readers do not each go and inspect
+    /// processes: `status` walks every pane under one lock, and doing
+    /// identity work there put a process spawn per pane on the hot path
+    /// and held the detection lock across all of them.
+    pub(crate) agent: Option<identity::ProcId>,
+    /// Whether the pane was in a mode at the last recompute. Kept so a
+    /// hold change can re-stamp the cached verdict without going back to
+    /// tmux for a fact that has not moved.
+    pub(crate) in_mode: bool,
+    /// Whether this exact occupant has produced a fresh, agreeing,
+    /// non-quota screen observation this boot. It gates the one durable
+    /// quota-reset scan and survives title-only redraws that carry no new
+    /// screen evidence.
+    pub(crate) quota_screen_clear: bool,
+    /// What this pane's composer has proven since text was last seen
+    /// staged in it. Carried across recomputes, dropped with the
+    /// occupant: a hold is about one agent's composer, not the place.
+    pub(crate) hold: cyclops_proto::ComposerHold,
+    /// The turn that hold is waiting on, when the vendor can name one.
+    /// Structural and daemon-internal, which is why it sits beside the
+    /// hold rather than inside it.
+    pub(crate) turn: Option<turnkey::TurnKey>,
+    /// Which delivery attempt owns the barrier, content-free.
+    ///
+    /// A pane binding is not enough, because evidence outlives the
+    /// delivery it belongs to. A resolved delivery stays in the hook ACK
+    /// registry, so a late upgrade for delivery A can arrive after A's
+    /// turn ended and B claimed the composer. Without an owner, A's edge
+    /// would settle B's barrier: promoting, releasing or clearing a
+    /// hold that belongs to a payload A never wrote.
+    pub(crate) hold_owner: Option<String>,
     /// When the fused STATE last changed, not when it was last computed.
     /// A recompute that lands on the same state keeps this, which is what
     /// lets `status` say "working for 13m" instead of "working since the
@@ -340,9 +499,10 @@ impl Inner {
         det: &Detection,
         prior: Option<AgentState>,
         cause: &str,
+        source: (Option<crate::identity::ProcId>, &str),
     ) {
         let target = self
-            .label_of(pane_id)
+            .label_for_route(session_idx, pane_id)
             .unwrap_or_else(|| pane_id.to_string());
         let seq = self.append_line(
             session_idx,
@@ -351,6 +511,7 @@ impl Inner {
                 self.mint_event_id(),
                 json!({
                     "pane_id": pane_id,
+                    "session_idx": session_idx,
                     "target": target,
                     "state": det.state,
                     "prior": prior,
@@ -360,15 +521,25 @@ impl Inner {
                 }),
             ),
         );
+        // The binding that produced this verdict travels with it. A pane
+        // id is reusable, so a consumer asking "is this event about my
+        // delivery" cannot answer from the id alone, and looking the row
+        // up later answers about whoever holds the pane by then rather
+        // than about whoever produced the event.
+        let (source_agent, source_manifest) = source;
         self.emit(
             "state",
             json!({
                 "target": target,
                 "pane_id": pane_id,
+                "session_idx": session_idx,
                 "state": det.state,
                 "prior": prior,
                 "disagreement": det.disagreement,
                 "decided_by": det.decided_by,
+                "source_pid": source_agent.map(|a| a.pid),
+                "source_birth": source_agent.map(|a| a.birth),
+                "source_manifest": source_manifest,
             }),
             seq,
         );
@@ -402,22 +573,95 @@ impl Inner {
         format!("e-{}", &uuid::Uuid::new_v4().simple().to_string()[..6])
     }
 
-    /// Cached fused state for a pane; Unknown when never computed.
-    pub(crate) fn cached_state(&self, pane_id: &str) -> AgentState {
+    /// Cached fused state for one exact pane route; Unknown when never computed.
+    pub(crate) fn cached_state(&self, session_idx: usize, pane_id: &str) -> AgentState {
         self.detections
             .lock()
             .expect("detections lock")
-            .get(pane_id)
+            .get(&PaneKey::new(session_idx, pane_id))
             .map(|e| e.detection.state)
             .unwrap_or(AgentState::Unknown)
     }
 
-    /// Label of a pane, if adopted.
-    pub(crate) fn label_of(&self, pane_id: &str) -> Option<String> {
+    /// Durable recipient for a pane inside one exact daemon session slot.
+    pub(crate) fn recipient_key(&self, session_idx: usize, pane_id: &str) -> Option<RecipientKey> {
+        let slot = self.session(session_idx)?;
+        let instance_id = slot
+            .link
+            .lock()
+            .expect("session link lock")
+            .identity
+            .as_ref()?
+            .session_instance_id();
+        Some(RecipientKey::agent(
+            self.workspace_id,
+            instance_id,
+            pane_id.parse().ok()?,
+        ))
+    }
+
+    /// Adoption for one current route, including its pane-root generation.
+    pub(crate) fn adoption_for_route(
+        &self,
+        session_idx: usize,
+        pane_id: &str,
+    ) -> Option<registry::Adoption> {
+        let recipient = self.recipient_key(session_idx, pane_id)?;
+        let slot = self.session(session_idx)?;
+        let (attached, watcher) = {
+            let link = slot.link.lock().expect("session link lock");
+            (link.attached, link.watcher.as_ref().map(Arc::clone))
+        };
+        let root = if attached {
+            let row = watcher?.pane(pane_id)?;
+            identity::ProcId::of(row.pane_pid)?
+        } else {
+            slot.last_panes
+                .lock()
+                .expect("last panes lock")
+                .get(pane_id)?
+                .root?
+        };
+        let root = ProcessInstanceId::new(root.pid, root.birth).ok()?;
         self.registry
             .lock()
             .expect("registry lock")
-            .label_of(pane_id)
+            .for_route(recipient, root)
+            .cloned()
+    }
+
+    /// Adoption for an exact route or a same-server pane transfer.
+    ///
+    /// An exact adoption wins even when it has no manifest pin. A physical
+    /// fallback is valid only while two durable sessions describe the same
+    /// tmux server generation. Pane IDs and pane roots alone are not identities
+    /// across a server restart.
+    pub(crate) fn adoption_for_observed_route(
+        &self,
+        recipient: RecipientKey,
+        pane_id: &str,
+        pane_root: ProcessInstanceId,
+    ) -> Option<registry::Adoption> {
+        let physical = {
+            let registry = self.registry.lock().expect("registry lock");
+            if let Some(exact) = registry.for_route(recipient, pane_root) {
+                return Some(exact.clone());
+            }
+            registry.for_physical_pane(pane_id, pane_root)?.clone()
+        };
+        let current_session = recipient.session_instance_id()?;
+        let physical_session = physical.recipient?.session_instance_id()?;
+        self.session_identities
+            .lock()
+            .expect("session identities lock")
+            .same_tmux_server_generation(current_session, physical_session)
+            .then_some(physical)
+    }
+
+    /// Exact adopted label for a route, independent of duplicate tmux pane ids.
+    pub(crate) fn label_for_route(&self, session_idx: usize, pane_id: &str) -> Option<String> {
+        self.adoption_for_route(session_idx, pane_id)
+            .map(|adoption| adoption.label)
     }
 
     /// pane id -> label for every adopted pane. The surfaces that render
@@ -456,19 +700,61 @@ impl Inner {
     /// Resolve a recipient/target name: label first, then pane id. Only
     /// panes that currently exist resolve.
     pub(crate) fn resolve_recipient(&self, name: &str) -> Option<(usize, String)> {
-        let wanted = self.label_target(name);
+        let exact = self
+            .registry
+            .lock()
+            .expect("registry lock")
+            .for_label(name)
+            .and_then(|adoption| adoption.recipient);
+        if let Some(recipient) = exact {
+            let session_instance_id = recipient.session_instance_id()?;
+            let pane_id = recipient.pane_id()?.to_string();
+            for (idx, slot) in self.session_slots().into_iter().enumerate() {
+                let watcher = {
+                    let link = slot.link.lock().expect("session link lock");
+                    if link
+                        .identity
+                        .as_ref()
+                        .map(SessionIdentityBinding::session_instance_id)
+                        != Some(session_instance_id)
+                    {
+                        continue;
+                    }
+                    link.watcher.as_ref().map(Arc::clone)
+                };
+                if let Some(row) = watcher.and_then(|watcher| watcher.pane(&pane_id)) {
+                    let addressable = identity::ProcId::of(row.pane_pid)
+                        .and_then(|root| ProcessInstanceId::new(root.pid, root.birth).ok())
+                        .is_some_and(|pane_root| {
+                            self.registry
+                                .lock()
+                                .expect("registry lock")
+                                .for_route(recipient, pane_root)
+                                .is_some()
+                        });
+                    if addressable {
+                        return Some((idx, row.pane_id));
+                    }
+                }
+            }
+            return None;
+        }
+        let wanted = name;
+        let mut found = None;
         for (idx, slot) in self.session_slots().into_iter().enumerate() {
             let watcher = {
                 let link = slot.link.lock().expect("session link lock");
                 link.watcher.as_ref().map(Arc::clone)
             };
             if let Some(w) = watcher {
-                if let Some(row) = w.pane(&wanted) {
-                    return Some((idx, row.pane_id));
+                if let Some(row) = w.pane(wanted) {
+                    if found.replace((idx, row.pane_id)).is_some() {
+                        return None;
+                    }
                 }
             }
         }
-        None
+        found
     }
 
     /// Resolve a name against the last-known pane tables of DETACHED
@@ -476,27 +762,330 @@ impl Inner {
     /// a pane that existed at detach must still match ACKs, or every detach
     /// blinds tier 1 (the m1 soak's duplicate-delivery failure).
     pub(crate) fn resolve_recipient_last_known(&self, name: &str) -> Option<(usize, PaneRow)> {
-        let wanted = self.label_target(name);
+        let exact = self
+            .registry
+            .lock()
+            .expect("registry lock")
+            .for_label(name)
+            .and_then(|adoption| adoption.recipient);
+        if let Some(recipient) = exact {
+            let session_instance_id = recipient.session_instance_id()?;
+            let pane_id = recipient.pane_id()?.to_string();
+            for (idx, slot) in self.session_slots().into_iter().enumerate() {
+                let link = slot.link.lock().expect("session link lock");
+                if link.attached
+                    || link
+                        .identity
+                        .as_ref()
+                        .map(SessionIdentityBinding::session_instance_id)
+                        != Some(session_instance_id)
+                {
+                    continue;
+                }
+                drop(link);
+                let pane = slot
+                    .last_panes
+                    .lock()
+                    .expect("last panes lock")
+                    .get(&pane_id)
+                    .cloned();
+                if let Some(pane) = pane {
+                    let addressable = pane
+                        .root
+                        .and_then(|root| ProcessInstanceId::new(root.pid, root.birth).ok())
+                        .is_some_and(|pane_root| {
+                            self.registry
+                                .lock()
+                                .expect("registry lock")
+                                .for_route(recipient, pane_root)
+                                .is_some()
+                        });
+                    if addressable {
+                        return Some((idx, pane.row));
+                    }
+                }
+            }
+            return None;
+        }
+        let wanted = name;
+        let mut found = None;
         for (idx, slot) in self.session_slots().into_iter().enumerate() {
             if slot.link.lock().expect("session link lock").attached {
                 continue; // live table is authoritative while attached
             }
             let last = slot.last_panes.lock().expect("last panes lock");
-            if let Some(row) = last.get(&wanted) {
-                return Some((idx, row.clone()));
+            if let Some(pane) = last.get(wanted) {
+                if found.replace((idx, pane.row.clone())).is_some() {
+                    return None;
+                }
             }
         }
-        None
+        found
     }
+}
 
-    /// Pane id a label points at, or the name itself when unlabeled.
-    fn label_target(&self, name: &str) -> String {
-        self.registry
+struct MailboxRouteOverride<'a> {
+    session_idx: usize,
+    instance_id: SessionInstanceId,
+    rows: &'a [ObservedPane],
+}
+
+struct MailboxSessionRoute {
+    session_idx: usize,
+    instance_id: SessionInstanceId,
+    attached: bool,
+    panes: Vec<ObservedPane>,
+}
+
+struct MailboxPaneChoice {
+    attached: bool,
+    pane: Option<(usize, SessionInstanceId, ObservedPane)>,
+}
+
+#[cfg(test)]
+struct MailboxPublishPause {
+    entered: std::sync::mpsc::Sender<()>,
+    release: Arc<std::sync::Barrier>,
+}
+
+/// Snapshot mailbox routing without nesting daemon locks.
+///
+/// Lock order is snapshots only: sessions, then each session link or pane
+/// table, then registry labels, then the mailbox directory. Every guard is
+/// dropped before the next lock is taken, and no guard crosses an await.
+fn mailbox_routes(
+    inner: &Inner,
+    proposed: Option<&MailboxRouteOverride<'_>>,
+) -> Vec<MailboxSessionRoute> {
+    inner
+        .session_slots()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, slot)| {
+            proposed
+                .filter(|route| route.session_idx == idx)
+                .map(|route| MailboxSessionRoute {
+                    session_idx: idx,
+                    instance_id: route.instance_id,
+                    attached: true,
+                    panes: route.rows.to_vec(),
+                })
+                .or_else(|| {
+                    slot.mailbox_route().map(|mut route| {
+                        route.session_idx = idx;
+                        route
+                    })
+                })
+        })
+        .collect()
+}
+
+/// Resolve each exact recipient once. Live routes outrank retained routes;
+/// equal-rank conflicts for the same durable recipient are omitted because
+/// neither root generation is provable.
+fn mailbox_panes(
+    inner: &Inner,
+    proposed: Option<&MailboxRouteOverride<'_>>,
+) -> Vec<(usize, SessionInstanceId, ObservedPane)> {
+    let mut selected: BTreeMap<RecipientKey, MailboxPaneChoice> = BTreeMap::new();
+    for route in mailbox_routes(inner, proposed) {
+        for pane in route.panes {
+            let Ok(pane_id) = pane.row.pane_id.parse() else {
+                continue;
+            };
+            let recipient = RecipientKey::agent(inner.workspace_id, route.instance_id, pane_id);
+            match selected.entry(recipient) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(MailboxPaneChoice {
+                        attached: route.attached,
+                        pane: Some((route.session_idx, route.instance_id, pane)),
+                    });
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let selected = entry.get_mut();
+                    if route.attached && !selected.attached {
+                        selected.attached = true;
+                        selected.pane = Some((route.session_idx, route.instance_id, pane));
+                    } else if route.attached == selected.attached
+                        && !selected
+                            .pane
+                            .as_ref()
+                            .is_some_and(|(_, instance_id, existing)| {
+                                *instance_id == route.instance_id && existing.root == pane.root
+                            })
+                    {
+                        selected.pane = None;
+                    }
+                }
+            }
+        }
+    }
+    selected
+        .into_values()
+        .filter_map(|selected| selected.pane)
+        .collect()
+}
+
+fn replace_mailbox_directory_unlocked(
+    inner: &Inner,
+    proposed: Option<&MailboxRouteOverride<'_>>,
+) -> Result<(), String> {
+    let Some(service) = inner.mailbox.as_ref() else {
+        return Ok(());
+    };
+    let panes = mailbox_panes(inner, proposed);
+    #[cfg(test)]
+    let pause = inner
+        .mailbox_publish_pause
+        .lock()
+        .expect("mailbox publish pause lock")
+        .take();
+    #[cfg(test)]
+    if let Some(pause) = pause {
+        pause.entered.send(()).expect("publish pause receiver");
+        pause.release.wait();
+    }
+    let mut agents = Vec::new();
+    for (_, session_instance_id, pane) in panes {
+        let row = &pane.row;
+        let pane_id: TmuxPaneId = row
+            .pane_id
+            .parse()
+            .map_err(|error| format!("invalid pane id {}: {error}", row.pane_id))?;
+        let key = RecipientKey::agent(inner.workspace_id, session_instance_id, pane_id);
+        let Some(root) = pane.root else {
+            continue;
+        };
+        let Ok(pane_root) = ProcessInstanceId::new(root.pid, root.birth) else {
+            continue;
+        };
+        let label = inner
+            .registry
             .lock()
             .expect("registry lock")
-            .pane_for_label(name)
-            .unwrap_or_else(|| name.to_string())
+            .for_route(key, pane_root)
+            .map(|adoption| adoption.label.clone());
+        let Some(label) = label else {
+            continue;
+        };
+        agents.push(mailbox::MailboxIdentity { key, label });
     }
+    let directory = mailbox::MailboxDirectory::new(inner.workspace_id, agents)
+        .map_err(|error| error.to_string())?;
+    service
+        .replace_directory(directory)
+        .map_err(|error| error.to_string())
+}
+
+fn publish_mailbox_transition(
+    inner: &Inner,
+    proposed: &MailboxRouteOverride<'_>,
+    commit: impl FnOnce(),
+) -> Result<(), String> {
+    let _publication = inner
+        .mailbox_publication
+        .lock()
+        .expect("mailbox publication lock");
+    replace_mailbox_directory_unlocked(inner, Some(proposed))?;
+    commit();
+    Ok(())
+}
+
+fn refresh_mailbox_directory_unlocked(inner: &Inner) {
+    if let Err(error) = replace_mailbox_directory_unlocked(inner, None) {
+        error!(error = %error, "cannot refresh mailbox directory");
+        let Some(service) = inner.mailbox.as_ref() else {
+            return;
+        };
+        let empty = mailbox::MailboxDirectory::new(
+            inner.workspace_id,
+            std::iter::empty::<mailbox::MailboxIdentity>(),
+        )
+        .expect("an empty directory is valid");
+        if let Err(clear_error) = service.replace_directory(empty) {
+            error!(error = %clear_error, "cannot close stale mailbox directory");
+        }
+    }
+}
+
+fn refresh_mailbox_directory(inner: &Inner) {
+    let _publication = inner
+        .mailbox_publication
+        .lock()
+        .expect("mailbox publication lock");
+    refresh_mailbox_directory_unlocked(inner);
+}
+
+fn update_mailbox_route(inner: &Inner, update: impl FnOnce()) {
+    let _publication = inner
+        .mailbox_publication
+        .lock()
+        .expect("mailbox publication lock");
+    update();
+    refresh_mailbox_directory_unlocked(inner);
+    inner.emit("messages.route_changed", json!({}), None);
+}
+
+fn refresh_mailbox_and_schedule(inner: &Arc<Inner>) {
+    refresh_mailbox_directory(inner);
+    messaging::schedule_available(inner);
+}
+
+/// Resolve a pane origin to its current durable key.
+///
+/// The captured root generation must match the selected pane route. A reused
+/// pane id or numeric PID therefore refuses the previous session's mailbox.
+#[cfg(test)]
+pub(crate) fn mailbox_recipient_for_origin(
+    inner: &Inner,
+    pane_id: TmuxPaneId,
+    pane_root: identity::ProcId,
+) -> Option<RecipientKey> {
+    let pane_text = pane_id.to_string();
+    let mut matches = mailbox_panes(inner, None)
+        .into_iter()
+        .filter(move |(_, _, pane)| pane.row.pane_id == pane_text)
+        .filter_map(move |(_, session_instance_id, pane)| {
+            if pane.root != Some(pane_root) {
+                return None;
+            }
+            let recipient = RecipientKey::agent(inner.workspace_id, session_instance_id, pane_id);
+            let root = ProcessInstanceId::new(pane_root.pid, pane_root.birth).ok()?;
+            inner
+                .registry
+                .lock()
+                .expect("registry lock")
+                .for_route(recipient, root)
+                .map(|_| recipient)
+        });
+    let found = matches.next()?;
+    matches.next().is_none().then_some(found)
+}
+
+async fn observe_session_identity(
+    inner: &Inner,
+    watcher: &SessionWatcher,
+) -> Result<SessionIdentityBinding, String> {
+    let session_id: TmuxSessionId = watcher
+        .session_id()
+        .ok_or_else(|| "tmux session id is unavailable".to_string())?
+        .parse()
+        .map_err(|error| format!("invalid tmux session id: {error}"))?;
+    let live_key =
+        livesession::observe_watched(&watcher.client(), session_id, inner.workspace_id, |pid| {
+            identity::ProcId::of(pid).map(|process| process.birth)
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let instance_id = inner
+        .session_identities
+        .lock()
+        .map_err(|_| "session identity lock is poisoned".to_string())?
+        .resolve(&inner.state_root, &live_key, || {
+            SessionInstanceId::from_uuid(uuid::Uuid::new_v4()).expect("non-nil UUID")
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(SessionIdentityBinding::new(live_key, instance_id))
 }
 
 /// A booted daemon. Dropping it does not stop the tasks; call
@@ -505,6 +1094,7 @@ pub struct Daemon {
     inner: Arc<Inner>,
     stop: watch::Sender<bool>,
     tasks: StdMutex<Vec<JoinHandle<()>>>,
+    socket_cleanup: StdMutex<Option<cyclops_state::BoundSocketCleanup>>,
 }
 
 impl Daemon {
@@ -551,12 +1141,20 @@ impl Daemon {
         for w in workers {
             w.abort();
         }
-        let _ = std::fs::remove_file(self.socket_path());
+        if let Some(cleanup) = self
+            .socket_cleanup
+            .lock()
+            .expect("socket cleanup lock")
+            .take()
+        {
+            let _ = cleanup.remove();
+        }
         info!("cyclopsd stopped");
     }
 
-    /// Subscribe to the daemon event stream (msg, delivery-state, gate,
-    /// admin-notify, state, session). Same stream events.subscribe serves.
+    /// Subscribe to the daemon event stream (msg, messages.changed,
+    /// delivery-state, gate, admin-notify, state, session). Same stream
+    /// events.subscribe serves.
     pub fn subscribe_events(&self) -> broadcast::Receiver<Event> {
         self.inner.events.subscribe()
     }
@@ -572,10 +1170,51 @@ impl Daemon {
         server::status_result(&self.inner, open_deliveries)
     }
 
-    /// In-process msg.send with an already-resolved sender. The socket
-    /// path resolves the sender from peer credentials first; embedders and
-    /// tests supply it directly.
+    /// In-process workspace message send with an already-resolved sender.
+    /// The socket path resolves the sender from peer credentials first.
     pub async fn msg_send(&self, from: &str, params: MsgSendParams) -> Result<Value, WireError> {
+        if params.wait.is_some() {
+            return Err(WireError {
+                code: "notification_unavailable".to_string(),
+                message: "send wait is not supported for mailbox notifications".to_string(),
+                data: None,
+            });
+        }
+        if params.reply_to.is_some() && (params.fyi || params.supersedes.is_some()) {
+            return Err(WireError {
+                code: "bad_request".to_string(),
+                message: "a reply cannot be an announcement or supersede another message"
+                    .to_string(),
+                data: None,
+            });
+        }
+        let service = self.inner.mailbox.as_ref().ok_or_else(|| WireError {
+            code: "mailbox_unavailable".to_string(),
+            message: "durable workspace identity is not connected".to_string(),
+            data: None,
+        })?;
+        let sender = service
+            .identity_for_address(from)
+            .map_err(server::mailbox_service_error)?;
+        let result = messaging::send(&self.inner, service, sender, params)
+            .map_err(server::mailbox_service_error)?;
+        serde_json::to_value(result).map_err(|error| WireError {
+            code: "internal".to_string(),
+            message: error.to_string(),
+            data: None,
+        })
+    }
+
+    /// Legacy in-process delivery seam used by transport tests and embedders.
+    ///
+    /// This bypasses the durable mailbox contract. Its optional composed
+    /// wait is an occupant-pinned pane-state heuristic, not proof that a
+    /// specific message or task completed.
+    pub async fn deliver_payload(
+        &self,
+        from: &str,
+        params: MsgSendParams,
+    ) -> Result<Value, WireError> {
         delivery::msg_send(&self.inner, from, params).await
     }
 
@@ -585,7 +1224,83 @@ impl Daemon {
     /// reporting pane via peer credentials and denies everything else,
     /// because hook reports are liveness and ACK evidence.
     pub async fn report_state(&self, params: StateReportParams) -> Result<Value, WireError> {
-        ack::handle_report(&self.inner, params).await
+        // The in-process path is pre-trusted, so it states the origin the
+        // socket path would have derived: the named pane, as it stands
+        // right now. A caller that names nothing cannot be placed.
+        let Some(name) = params.agent.clone() else {
+            return Err(WireError {
+                code: "denied".to_string(),
+                message: "an in-process report must name the pane it speaks for".to_string(),
+                data: None,
+            });
+        };
+        let (session_idx, pane_id, pane_root, agent, manifest) =
+            match self.inner.resolve_recipient(&name) {
+                Some((idx, pane_id)) => {
+                    let row = self.inner.watcher_of(idx).and_then(|w| w.pane(&pane_id));
+                    // Same domain the socket path derives and the ACK
+                    // check re-derives: the agent instance proven from the
+                    // process tree.
+                    let admitted = row
+                        .as_ref()
+                        .and_then(|r| fusion::admitted_vendor(&self.inner, idx, r));
+                    let pane_root = row.as_ref().and_then(|r| identity::ProcId::of(r.pane_pid));
+                    let agent = admitted.as_ref().map(|(_, proc)| *proc);
+                    let manifest = admitted.map(|(m, _)| m.agent.id.clone());
+                    (idx, pane_id, pane_root, agent, manifest)
+                }
+                // Detached, so the live table cannot place the pane. The
+                // last-known row can, and the socket path already derives
+                // origins from it during an outage. Dropping to a zero pid
+                // here instead refused every hook that fired inside the one
+                // window this whole path exists to cover.
+                None => match self.inner.resolve_recipient_last_known(&name) {
+                    Some((idx, row)) => {
+                        let admitted = fusion::admitted_vendor(&self.inner, idx, &row);
+                        let pane_root = identity::ProcId::of(row.pane_pid);
+                        let agent = admitted.as_ref().map(|(_, proc)| *proc);
+                        let manifest = admitted.map(|(m, _)| m.agent.id.clone());
+                        (idx, row.pane_id.clone(), pane_root, agent, manifest)
+                    }
+                    None => (usize::MAX, name.clone(), None, None, None),
+                },
+            };
+        // An origin the daemon could not place names no agent, and a
+        // report about nobody is refused downstream rather than guessed
+        // at here.
+        let Some(agent) = agent else {
+            return Err(WireError {
+                code: "denied".to_string(),
+                message: "this pane's agent could not be identified; a hook report has to \
+                          name a process"
+                    .to_string(),
+                data: None,
+            });
+        };
+        let Some(pane_root) = pane_root else {
+            return Err(WireError {
+                code: "denied".to_string(),
+                message: "this pane's root process could not be identified".to_string(),
+                data: None,
+            });
+        };
+        let Some(recipient_key) = self.inner.recipient_key(session_idx, &pane_id) else {
+            return Err(WireError {
+                code: "denied".to_string(),
+                message: "this pane has no durable session identity".to_string(),
+                data: None,
+            });
+        };
+        let origin = server::ReportOrigin {
+            recipient: name,
+            pane_id,
+            session_idx,
+            recipient_key,
+            pane_root,
+            agent,
+            manifest,
+        };
+        ack::handle_report(&self.inner, params, origin).await
     }
 
     /// In-process hooks.verify: hook liveness for one target pane.
@@ -619,10 +1334,9 @@ impl Daemon {
         Ok(json!({"notified": true, "seq": seq}))
     }
 
-    /// Test-only seam: pause the delivery injection path at a named phase
-    /// ("pre_paste", "pre_submit"), between the gate's admit and the
-    /// occupant re-check, so integration tests can change the pane
-    /// occupant deterministically. Not part of the public API surface.
+    /// Test-only seam: pause a terminal mutation at a named phase so an
+    /// integration test can move the pane or stop the daemon at a precise
+    /// boundary. Not part of the public API surface.
     #[doc(hidden)]
     pub fn set_inject_pause<F>(&self, f: F)
     where
@@ -696,6 +1410,10 @@ pub(crate) async fn label_pane(
         .expect("session_idx valid: resolve_recipient just returned it")
         .name();
     let label = label.filter(|l| !l.is_empty());
+    let watcher = inner.watcher_of(session_idx);
+    let route = watcher
+        .as_ref()
+        .and_then(|watcher| adoption_route(inner, watcher, session_idx, &pane_id));
 
     // 2. Validate the label. The rule and its wording are
     //    cyclops_proto::label, so every surface refuses the same names
@@ -704,14 +1422,18 @@ pub(crate) async fn label_pane(
         if let Some(why) = cyclops_proto::label::refusal(l) {
             return Err(bad_request(why));
         }
+        let Some((recipient, _, _)) = route.as_ref() else {
+            return Err(WireError {
+                code: "no_such_target".to_string(),
+                message: format!("target {target:?} changed during adoption"),
+                data: None,
+            });
+        };
         let holder = {
             let reg = inner.registry.lock().expect("registry lock");
-            if reg.label_taken_by_other(l, &pane_id) {
-                let pane = reg.pane_for_label(l).expect("taken means a holder exists");
-                reg.get(&pane).cloned()
-            } else {
-                None
-            }
+            reg.for_label(l)
+                .filter(|holder| holder.recipient != Some(*recipient))
+                .cloned()
         };
         if let Some(holder) = holder {
             return Err(bad_request(label_taken_words(inner, l, &holder)));
@@ -731,7 +1453,6 @@ pub(crate) async fn label_pane(
     }
 
     // 4. Adopt or un-adopt.
-    let watcher = inner.watcher_of(session_idx);
     match &label {
         Some(l) => {
             adopt_pane(
@@ -782,7 +1503,7 @@ pub(crate) async fn label_pane(
             .detections
             .lock()
             .expect("detections lock")
-            .get(&pane_id)
+            .get(&PaneKey::new(session_idx, &pane_id))
             .and_then(|e| e.manifest.clone())),
     }))
 }
@@ -791,8 +1512,19 @@ pub(crate) async fn label_pane(
 /// out. "already taken" alone once had an operator staring at an empty
 /// roster and a refused name at the same time, with nothing to act on.
 fn label_taken_words(inner: &Inner, label: &str, holder: &registry::Adoption) -> String {
-    let attached = inner
-        .session_index(&holder.session)
+    let session_idx = inner.session_index(&holder.session).or_else(|| {
+        let instance_id = holder.recipient?.session_instance_id()?;
+        inner.session_slots().iter().position(|slot| {
+            slot.link
+                .lock()
+                .expect("session link lock")
+                .identity
+                .as_ref()
+                .map(|identity| identity.session_instance_id())
+                == Some(instance_id)
+        })
+    });
+    let attached = session_idx
         .and_then(|idx| inner.session(idx))
         .map(|slot| slot.link.lock().expect("session link lock").attached)
         .unwrap_or(false);
@@ -802,7 +1534,11 @@ fn label_taken_words(inner: &Inner, label: &str, holder: &registry::Adoption) ->
              Free it with: cyclops name {pane} --clear, or pick another name.",
             pane = holder.pane_id,
             session = holder.session,
-            state = cyclops_proto::state_words(inner.cached_state(&holder.pane_id)),
+            state = cyclops_proto::state_words(
+                session_idx
+                    .map(|idx| inner.cached_state(idx, &holder.pane_id))
+                    .unwrap_or(AgentState::Unknown)
+            ),
         )
     } else {
         format!(
@@ -833,6 +1569,32 @@ fn label_taken_words(inner: &Inner, label: &str, holder: &registry::Adoption) ->
 /// 4. Re-read the pane, which is what makes an explicit `--manifest` take
 ///    effect now instead of at the next unrelated event; it repaints again
 ///    if the pin changed the verdict.
+fn adoption_route(
+    inner: &Inner,
+    watcher: &Arc<SessionWatcher>,
+    session_idx: usize,
+    pane_id: &str,
+) -> Option<(RecipientKey, ProcessInstanceId, PaneRow)> {
+    let slot = inner.session(session_idx)?;
+    let session_instance_id = {
+        let link = slot.link.lock().expect("session link lock");
+        let current = link.watcher.as_ref()?;
+        if !link.attached || !Arc::ptr_eq(current, watcher) {
+            return None;
+        }
+        link.identity.as_ref()?.session_instance_id()
+    };
+    let row = watcher.pane(pane_id)?;
+    let pane: TmuxPaneId = pane_id.parse().ok()?;
+    let root = identity::ProcId::of(row.pane_pid)?;
+    let pane_root = ProcessInstanceId::new(root.pid, root.birth).ok()?;
+    Some((
+        RecipientKey::agent(inner.workspace_id, session_instance_id, pane),
+        pane_root,
+        row,
+    ))
+}
+
 async fn adopt_pane(
     inner: &Arc<Inner>,
     watcher: Option<&Arc<SessionWatcher>>,
@@ -842,7 +1604,15 @@ async fn adopt_pane(
     label: &str,
     manifest: Option<&str>,
 ) -> Result<(), WireError> {
-    let Some(row) = watcher.and_then(|w| w.pane(pane_id)) else {
+    let Some(watcher) = watcher else {
+        return Err(WireError {
+            code: "no_such_target".to_string(),
+            message: format!("no such target {target:?}"),
+            data: None,
+        });
+    };
+    let Some((recipient, pane_root, row)) = adoption_route(inner, watcher, session_idx, pane_id)
+    else {
         return Err(WireError {
             code: "no_such_target".to_string(),
             message: format!("no such target {target:?}"),
@@ -859,23 +1629,44 @@ async fn adopt_pane(
     // is exactly that case.
     let (known_format, known_status) = {
         let reg = inner.registry.lock().expect("registry lock");
-        (
-            reg.get(pane_id).map(|a| a.border_format.clone()),
-            reg.window(&row.window_id).map(|w| w.border_status.clone()),
-        )
-    };
-    let read = match watcher {
-        Some(w) if known_format.is_none() || known_status.is_none() => {
-            match chrome::snapshot(&w.client(), pane_id, &row.window_id).await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(pane = %pane_id, error = %e, "cannot read pane chrome; adopting without it");
-                    chrome::Snapshot::none()
-                }
-            }
+        match reg.for_route(recipient, pane_root) {
+            Some(adoption) => (
+                Some(adoption.border_format.clone()),
+                reg.window(&row.window_id)
+                    .map(|window| window.border_status.clone()),
+            ),
+            None => (None, None),
         }
-        _ => chrome::Snapshot::none(),
     };
+    let read = match known_format.is_none() || known_status.is_none() {
+        true => match chrome::snapshot(&watcher.client(), pane_id, &row.window_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(pane = %pane_id, error = %e, "cannot read pane chrome; adopting without it");
+                chrome::Snapshot::none()
+            }
+        },
+        false => chrome::Snapshot::none(),
+    };
+    let Some((current_recipient, current_root, current_row)) =
+        adoption_route(inner, watcher, session_idx, pane_id)
+    else {
+        return Err(WireError {
+            code: "no_such_target".to_string(),
+            message: format!("target {target:?} changed during adoption"),
+            data: None,
+        });
+    };
+    if current_recipient != recipient
+        || current_root != pane_root
+        || current_row.window_id != row.window_id
+    {
+        return Err(WireError {
+            code: "no_such_target".to_string(),
+            message: format!("target {target:?} changed during adoption"),
+            data: None,
+        });
+    }
     // 2. Write the registry.
     let session = inner
         .session(session_idx)
@@ -885,6 +1676,8 @@ async fn adopt_pane(
         session: session.clone(),
         pane_id: pane_id.to_string(),
         label: label.to_string(),
+        recipient: Some(recipient),
+        pane_root: Some(pane_root),
         manifest: manifest.map(str::to_string),
         pane_pid: row.pane_pid,
         window_id: row.window_id.clone(),
@@ -907,12 +1700,11 @@ async fn adopt_pane(
             data: None,
         });
     }
+    refresh_mailbox_and_schedule(inner);
     // 3. Paint.
     paint_chrome(inner, session_idx, pane_id).await;
     // 4. Re-read.
-    if let Some(w) = watcher {
-        fusion::recompute_pane(inner, session_idx, w, pane_id, false, "pane_labeled").await;
-    }
+    fusion::recompute_pane(inner, session_idx, watcher, pane_id, false, "pane_labeled").await;
     Ok(())
 }
 
@@ -947,12 +1739,16 @@ async fn unadopt_pane(
     session_idx: usize,
     pane_id: &str,
 ) -> Result<(), WireError> {
+    let route = watcher.and_then(|watcher| adoption_route(inner, watcher, session_idx, pane_id));
+    let Some((recipient, pane_root, _)) = route else {
+        return Ok(());
+    };
     // 1. Look, do not commit.
     let pending = inner
         .registry
         .lock()
         .expect("registry lock")
-        .pending_clear(pane_id);
+        .pending_clear(recipient, pane_root);
     // 2. Restore, with the snapshot still on file.
     if let (Some((adoption, freed)), Some(w)) = (&pending, watcher) {
         if let Err(e) = restore_for_clear(inner, w, adoption, freed.as_ref()).await {
@@ -973,12 +1769,13 @@ async fn unadopt_pane(
         .registry
         .lock()
         .expect("registry lock")
-        .clear(pane_id)
+        .clear(recipient, pane_root)
         .map_err(|e| WireError {
             code: "internal".to_string(),
             message: format!("cannot record the change: {e}"),
             data: None,
         })?;
+    refresh_mailbox_and_schedule(inner);
     // 5. Re-read.
     if let Some(w) = watcher {
         fusion::recompute_pane(inner, session_idx, w, pane_id, false, "pane_unlabeled").await;
@@ -1094,6 +1891,7 @@ fn bad_request(message: String) -> WireError {
 /// gives. `chrome = "off"` is chrome.rs's answer, not this function's.
 async fn paint_adoptions(
     inner: &Arc<Inner>,
+    session_idx: usize,
     watcher: &SessionWatcher,
     adoptions: &[registry::Adoption],
 ) {
@@ -1104,7 +1902,7 @@ async fn paint_adoptions(
     // otherwise leave one window wearing two palettes.
     let theme = inner.theme_now();
     for a in adoptions {
-        let state = inner.cached_state(&a.pane_id);
+        let state = inner.cached_state(session_idx, &a.pane_id);
         if let Err(e) = chrome::apply(
             &watcher.client(),
             inner.cfg.chrome,
@@ -1130,33 +1928,32 @@ pub(crate) async fn paint_chrome(inner: &Arc<Inner>, session_idx: usize, pane_id
     let Some(watcher) = inner.watcher_of(session_idx) else {
         return;
     };
-    let Some(adoption) = inner
-        .registry
-        .lock()
-        .expect("registry lock")
-        .get(pane_id)
-        .cloned()
-    else {
+    let Some(adoption) = inner.adoption_for_route(session_idx, pane_id) else {
         return;
     };
-    paint_adoptions(inner, &watcher, std::slice::from_ref(&adoption)).await;
+    paint_adoptions(
+        inner,
+        session_idx,
+        &watcher,
+        std::slice::from_ref(&adoption),
+    )
+    .await;
 }
 
 /// Repaint the state half of an adopted pane's border. Called from the one
 /// place a fused state change is recorded (fusion::recompute_pane), so a
 /// border can never disagree with the row `cyclops list` prints.
-pub(crate) async fn repaint_chrome(inner: &Arc<Inner>, watcher: &SessionWatcher, pane_id: &str) {
-    let Some(adoption) = inner
-        .registry
-        .lock()
-        .expect("registry lock")
-        .get(pane_id)
-        .cloned()
-    else {
+pub(crate) async fn repaint_chrome(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    watcher: &SessionWatcher,
+    pane_id: &str,
+) {
+    let Some(adoption) = inner.adoption_for_route(session_idx, pane_id) else {
         return;
     };
     let theme = inner.theme_now();
-    let state = inner.cached_state(pane_id);
+    let state = inner.cached_state(session_idx, pane_id);
     if let Err(e) = chrome::repaint(
         &watcher.client(),
         inner.cfg.chrome,
@@ -1197,7 +1994,7 @@ pub(crate) async fn reload_theme(inner: &Arc<Inner>) -> String {
             .lock()
             .expect("registry lock")
             .in_session(&watcher.session());
-        paint_adoptions(inner, &watcher, &adopted).await;
+        paint_adoptions(inner, idx, &watcher, &adopted).await;
     }
     inner.emit("theme", json!({"name": name}), None);
     name
@@ -1216,12 +2013,35 @@ fn boot_fact_line(inner: &Inner, manifest_ids: &[String], session: &str) -> Ledg
             "tmux_version": inner.tmux_version,
             "manifests": manifest_ids,
             "session": session,
+            "state_permission_repair": {
+                "directories": inner.state_repair.directories,
+                "regular_files": inner.state_repair.regular_files,
+                "live_socket_preserved": inner.state_repair.live_socket_preserved,
+            },
         }),
     )
 }
 
-/// Boot the daemon: probe tmux, load manifests, bind the socket, spawn one
-/// watcher task per configured session plus the accept loop.
+fn require_bound_socket_in_state_root(
+    repair: &RepairSummary,
+    state_root: &StateRoot,
+) -> anyhow::Result<()> {
+    if !repair.live_socket_preserved {
+        anyhow::bail!(
+            "bound socket is not inside the validated state root {}",
+            state_root.path().display()
+        );
+    }
+    if !state_root.path_matches_held_root()? {
+        anyhow::bail!(
+            "state root path changed during socket bind {}",
+            state_root.path().display()
+        );
+    }
+    Ok(())
+}
+
+/// Boot the daemon, secure its state, and spawn its watcher and server tasks.
 pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     let boot_id = uuid::Uuid::new_v4().to_string();
     let started = Instant::now();
@@ -1247,21 +2067,62 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         }
     };
 
+    // Every session-ledger open is anchored to this validated state root.
+    let state_root = Arc::new(
+        StateRoot::open_or_create(&cfg.home)
+            .map_err(|error| anyhow::anyhow!("open state root {}: {error}", cfg.home.display()))?,
+    );
+    let bound_socket = server::bind_socket(&state_root).await?;
+    let repair = state_root
+        .repair_descendant_permissions(Some(OsStr::new(cyclops_proto::SOCK_NAME)))
+        .map_err(|error| anyhow::anyhow!("repair state root {}: {error}", cfg.home.display()))?;
+    require_bound_socket_in_state_root(&repair, &state_root)?;
+    info!(
+        directories = repair.directories,
+        regular_files = repair.regular_files,
+        live_socket_preserved = repair.live_socket_preserved,
+        "state permissions repaired"
+    );
+    let workspace_id = workspaceid::load_or_create(&state_root)
+        .map_err(|error| anyhow::anyhow!("load workspace identity: {error}"))?;
+    let session_identities = sessionstore::SessionIdentities::open(&state_root)
+        .map_err(|error| anyhow::anyhow!("load session identities: {error}"))?;
+    let message_journal = PathBuf::from("workspaces")
+        .join(workspace_id.to_string())
+        .join("messages.ndjson");
+    let (events, _) = broadcast::channel(EVENT_BUFFER);
+    let mut message_store =
+        mailbox::MessageStore::open(&state_root, &message_journal, workspace_id, &boot_id)
+            .map_err(|error| anyhow::anyhow!("open workspace message journal: {error}"))?;
+    let recovered_notifications = message_store
+        .recover_notifications_after_restart()
+        .map_err(|error| anyhow::anyhow!("recover workspace notifications: {error}"))?;
+    if !recovered_notifications.is_empty() {
+        info!(
+            notifications = recovered_notifications.len(),
+            "closed ambiguous workspace notifications after restart"
+        );
+    }
+    let mailbox_directory = mailbox::MailboxDirectory::new(
+        workspace_id,
+        std::iter::empty::<mailbox::MailboxIdentity>(),
+    )
+    .map_err(|error| anyhow::anyhow!("open mailbox directory: {error}"))?;
     let (manifests, manifest_dir) = load_manifests(&cfg);
-
-    // One crash-safe ledger per watched session. A daemon that cannot
-    // record must not deliver, so open failures fail the boot.
-    let ledger_dir = cfg.home.join("ledger");
     let mut sessions = Vec::with_capacity(cfg.sessions.len());
     let mut replayed: Vec<(usize, Vec<LedgerLine>)> = Vec::new();
     let engine = delivery::Engine::new();
     for (idx, name) in cfg.sessions.iter().enumerate() {
-        let path = ledger_dir.join(format!("{name}.ndjson"));
-        let ledger = LedgerWriter::open(&path, &boot_id)
-            .map_err(|e| anyhow::anyhow!("open ledger {}: {e}", path.display()))?;
+        let descendant = PathBuf::from("ledger").join(format!("{name}.ndjson"));
+        let ledger = LedgerWriter::open(&state_root, &descendant, &boot_id).map_err(|error| {
+            anyhow::anyhow!(
+                "open ledger {}: {error}",
+                state_root.path().join(&descendant).display()
+            )
+        })?;
         // Message ids stay unique per ledger across restarts; the replayed
         // lines also feed the restart-limbo scan below.
-        match cyclops_ledger::read_after(&path, 0) {
+        match ledger.read_after(0) {
             Ok(lines) => {
                 engine.preload_ids(&lines);
                 replayed.push((idx, lines));
@@ -1273,7 +2134,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     // Adoptions from the previous run. Nothing is trusted onto a pane
     // yet; each session prunes its own entries against the live pane
     // table when it attaches (registry::restore_session).
-    let (mut adoptions, warnings) = registry::Registry::load(&cfg.home);
+    let (mut adoptions, warnings) = registry::Registry::load(Arc::clone(&state_root));
     for w in warnings {
         warn!("registry: {w}");
     }
@@ -1288,9 +2149,34 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
             continue;
         }
         if tmux_session_missing(&cfg, &session).await {
-            release_gone_session(&mut adoptions, &session);
+            let removed = adoptions.in_session(&session);
+            let mut gone = Vec::new();
+            for adoption in &removed {
+                match composer_recovery::pane_root_gone(adoption) {
+                    Ok(true) => gone.extend(adoption.recipient),
+                    Ok(false) => {}
+                    Err(reason) => anyhow::bail!(
+                        "cannot prove physical pane loss for {}: {reason}",
+                        adoption.pane_id
+                    ),
+                }
+            }
+            composer_recovery::retire_gone_in_store(&mut message_store, gone.iter().copied())
+                .map_err(|error| anyhow::anyhow!("retire barriers for missing session: {error}"))?;
+            release_gone_recipients(&mut adoptions, gone);
         }
     }
+    let recovered_barrier_ids: Vec<_> = message_store
+        .projection()
+        .active_notification_barriers()
+        .into_iter()
+        .map(|record| record.attempt_id)
+        .collect();
+    let mailbox = Arc::new(mailbox::MailboxService::new_with_events(
+        mailbox_directory,
+        message_store,
+        events.clone(),
+    ));
     let mut theme = cyclops_theme::ThemeWatch::new(&cfg.home);
     for w in theme.take_warnings() {
         warn!("theme: {w}");
@@ -1300,9 +2186,19 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     // watched after boot (watch_session) hands its session_task the same
     // receiver every configured session got. boot keeps the sender.
     let (stop, stop_rx) = watch::channel(false);
-    let (events, _) = broadcast::channel(EVENT_BUFFER);
     let inner = Arc::new(Inner {
         cfg,
+        state_root,
+        state_repair: repair,
+        workspace_id,
+        session_identities: StdMutex::new(session_identities),
+        mailbox: Some(mailbox),
+        composer_recovery: StdMutex::new(composer_recovery::RecoveryCoordinator::new(
+            recovered_barrier_ids,
+        )),
+        mailbox_publication: StdMutex::new(()),
+        #[cfg(test)]
+        mailbox_publish_pause: StdMutex::new(None),
         boot_id,
         started,
         tmux_version,
@@ -1314,6 +2210,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         registry: StdMutex::new(adoptions),
         theme: StdMutex::new(theme),
         hook_readings: StdMutex::new(HashMap::new()),
+        turn_ends: StdMutex::new(turnkey::Ends::new()),
         argv_cache: StdMutex::new(HashMap::new()),
         engine,
         ack_state: ack::AckState::new(),
@@ -1367,7 +2264,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     delivery::close_limbo(&inner, &replayed);
     drop(replayed);
 
-    let listener = server::bind_socket(&inner.cfg.home).await?;
+    let (listener, socket_cleanup) = bound_socket.into_parts();
     let mut tasks = Vec::new();
     for idx in 0..inner.session_count() {
         tasks.push(tokio::spawn(session_task(
@@ -1392,6 +2289,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         inner,
         stop,
         tasks: StdMutex::new(tasks),
+        socket_cleanup: StdMutex::new(Some(socket_cleanup)),
     })
 }
 
@@ -1444,15 +2342,19 @@ pub(crate) async fn watch_session(
         rename_session_slot(inner, idx, name.to_string());
         return Ok((idx, false));
     }
-    let path = inner.cfg.home.join("ledger").join(format!("{name}.ndjson"));
-    let ledger = LedgerWriter::open(&path, &inner.boot_id).map_err(|e| WireError {
-        code: "internal".to_string(),
-        message: format!("open ledger {}: {e}", path.display()),
-        data: None,
-    })?;
+    let descendant = PathBuf::from("ledger").join(format!("{name}.ndjson"));
+    let path = inner.state_root.path().join(&descendant);
+    let ledger =
+        LedgerWriter::open(&inner.state_root, &descendant, &inner.boot_id).map_err(|e| {
+            WireError {
+                code: "internal".to_string(),
+                message: format!("open ledger {}: {e}", path.display()),
+                data: None,
+            }
+        })?;
     // Same id-preload boot does: message ids stay unique across restarts
     // and across every session this daemon has ever watched.
-    match cyclops_ledger::read_after(&path, 0) {
+    match ledger.read_after(0) {
         Ok(lines) => inner.engine.preload_ids(&lines),
         Err(e) => warn!(session = %name, error = %e, "ledger replay for id preload failed"),
     }
@@ -1564,16 +2466,36 @@ async fn tmux_session_missing(cfg: &Config, session: &str) -> bool {
     .unwrap_or(false)
 }
 
-/// Release every adoption recorded for a session tmux says is gone.
+/// Release only adoptions whose physical pane loss was proven.
 ///
-/// The panes died with the session, so each label is free again, and
-/// there is no chrome to put back: the windows died too. `forget`, not
-/// `clear`, so the entry goes even when the registry file cannot be
-/// rewritten; a dead pane must not keep its name claimed.
-fn release_gone_session(reg: &mut registry::Registry, session: &str) {
-    for a in reg.in_session(session) {
-        reg.forget(&a.pane_id);
-        info!(session = %session, pane = %a.pane_id, label = %a.label, "released a label whose session is gone");
+/// A missing session can also mean its pane moved to another session. Those
+/// adoptions retain the pinned manifest needed for composer recovery until a
+/// server-wide observation proves the pane itself is gone.
+fn release_gone_recipients(
+    reg: &mut registry::Registry,
+    recipients: impl IntoIterator<Item = RecipientKey>,
+) {
+    for recipient in recipients {
+        let Some(adoption) = reg.for_recipient(recipient).cloned() else {
+            continue;
+        };
+        let Some(pane_root) = adoption.pane_root else {
+            continue;
+        };
+        reg.forget(recipient, pane_root);
+        info!(
+            session = %adoption.session,
+            pane = %adoption.pane_id,
+            label = %adoption.label,
+            "released a label whose physical pane is gone"
+        );
+    }
+}
+
+async fn reconnect_delay(stop: &mut watch::Receiver<bool>, delay: Duration) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => false,
+        _ = stop.changed() => true,
     }
 }
 
@@ -1599,10 +2521,10 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
         // the name tmux actually calls this session now, not the name this
         // task started with.
         let name = slot.name();
-        // Payload spool files stay under the 0700 cyclops home, never the
-        // shared system temp dir.
-        let mut ccfg =
-            ControlConfig::attach(&name).with_buffer_spool_dir(inner.cfg.home.join("spool"));
+        // tmux needs a pathname, but creation and cleanup stay anchored to
+        // the held state root.
+        let mut ccfg = ControlConfig::attach(&name)
+            .with_state_buffer_spool(Arc::clone(&inner.state_root), "spool");
         if let Some(sock) = &inner.cfg.tmux_socket {
             ccfg = ccfg.on_socket(sock.clone());
         }
@@ -1611,39 +2533,69 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
         }
         match SessionWatcher::connect(ccfg).await {
             Ok(watcher) => {
+                let watcher = Arc::new(watcher);
+                let binding = match observe_session_identity(&inner, &watcher).await {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        warn!(session = %name, error = %error, "cannot establish durable session identity");
+                        watcher.shutdown().await;
+                        if reconnect_delay(&mut stop, backoff).await {
+                            return;
+                        }
+                        backoff = (backoff * 2).min(RECONNECT_MAX);
+                        continue;
+                    }
+                };
+                if !run_session(&inner, idx, &watcher, binding, stop.clone()).await {
+                    watcher.shutdown().await;
+                    if reconnect_delay(&mut stop, backoff).await {
+                        return;
+                    }
+                    backoff = (backoff * 2).min(RECONNECT_MAX);
+                    continue;
+                }
                 announced_missing = false;
                 backoff = RECONNECT_MIN;
-                let watcher = Arc::new(watcher);
-                {
+                // Keep the root generations captured while each pane was
+                // authoritative. A detached numeric PID must never be
+                // observed again as a new process.
+                update_mailbox_route(&inner, || {
                     let mut link = slot.link.lock().expect("session link lock");
-                    link.attached = true;
-                    link.watcher = Some(Arc::clone(&watcher));
-                }
-                info!(session = %name, "attached to tmux session");
-                session_lifecycle(&inner, idx, true);
-                run_session(&inner, idx, &watcher, stop.clone()).await;
-                // Freeze the pane table as of this detach: hook reports
-                // arriving during the outage resolve against it.
-                {
-                    let mut last = slot.last_panes.lock().expect("last panes lock");
-                    *last = watcher
-                        .snapshot()
-                        .into_iter()
-                        .map(|r| (r.pane_id.clone(), r))
-                        .collect();
-                }
-                {
-                    let mut link = slot.link.lock().expect("session link lock");
+                    let panes = std::mem::take(&mut link.mailbox_panes);
                     link.attached = false;
                     link.watcher = None;
-                }
+                    drop(link);
+                    *slot.last_panes.lock().expect("last panes lock") = panes;
+                });
+                messaging::schedule_available(&inner);
                 session_lifecycle(&inner, idx, false);
-                // Detached panes have no live sensors; drop their cached
-                // verdicts instead of serving stale state.
+                // Detached panes have no live sensors, so their runtime
+                // verdict goes: serving a stale one would let a reader
+                // treat a frame nobody can see as current.
+                //
+                // The composer barrier does NOT go with it. It is not a
+                // sensor reading, it is what this daemon knows about a
+                // composer it wrote into, and the outage is exactly when
+                // that matters: a delivery can be staged, the pane can
+                // detach before its receipt, and dropping the barrier
+                // would let the first clean frame after reattach admit
+                // the next paste on top of it. So the hold, the binding
+                // it belongs to and the turn it waits on are kept, and
+                // everything observational is cleared. The binding is
+                // what makes that safe: the next recompute carries the
+                // hold only if the same admitted agent and manifest are
+                // proven again, and a replacement clears it.
                 {
                     let mut det = inner.detections.lock().expect("detections lock");
                     for row in watcher.snapshot() {
-                        det.remove(&row.pane_id);
+                        if let Some(entry) = det.get_mut(&PaneKey::new(idx, &row.pane_id)) {
+                            entry.detection.state = AgentState::Unknown;
+                            entry.detection.readings.clear();
+                            entry.detection.decided_by = "detached".into();
+                            entry.detection.stale = true;
+                            entry.detection.write_ready = false;
+                            entry.detection.write_block = Some("session_detached".into());
+                        }
                     }
                 }
                 watcher.shutdown().await;
@@ -1660,11 +2612,10 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                 if announced_missing {
                     debug!(session = %name, error = %e, "attach retry failed");
                 }
-                // Adoptions recorded for a session that does not exist
-                // name panes that died with it. The reattach reconcile
-                // can never release them, because a session that never
-                // comes back never reattaches; without this, its labels
-                // stay claimed forever while no roster shows the holder.
+                // A missing session does not prove its panes died. tmux can
+                // move a pane into another session while preserving its id,
+                // root process and composer. Release only roots whose loss is
+                // independently proven.
                 let stale = !inner
                     .registry
                     .lock()
@@ -1674,8 +2625,45 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                 if stale || !announced_missing {
                     let missing = session_missing(&inner, &name).await;
                     if stale && missing {
-                        let mut reg = inner.registry.lock().expect("registry lock");
-                        release_gone_session(&mut reg, &name);
+                        let adoptions = inner
+                            .registry
+                            .lock()
+                            .expect("registry lock")
+                            .in_session(&name);
+                        let mut gone = Vec::new();
+                        for adoption in &adoptions {
+                            match crate::composer_recovery::pane_root_gone(adoption) {
+                                Ok(false) => {}
+                                Ok(true) => {
+                                    if let Some(recipient) = adoption.recipient {
+                                        match crate::composer_recovery::retire_gone_recipient(
+                                            &inner, recipient,
+                                        ) {
+                                            Ok(()) => gone.push(recipient),
+                                            Err(reason) => {
+                                                warn!(session = %name, %reason, "cannot retire composer barrier for missing session");
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(reason) => {
+                                    warn!(session = %name, pane = %adoption.pane_id, %reason, "cannot prove physical pane loss for missing session");
+                                }
+                            }
+                        }
+                        if !gone.is_empty() {
+                            let mut reg = inner.registry.lock().expect("registry lock");
+                            release_gone_recipients(&mut reg, gone);
+                        }
+                    }
+                    if missing {
+                        update_mailbox_route(&inner, || {
+                            slot.last_panes.lock().expect("last panes lock").clear();
+                            let mut link = slot.link.lock().expect("session link lock");
+                            link.identity = None;
+                            link.mailbox_panes.clear();
+                        });
+                        messaging::schedule_available(&inner);
                     }
                     if !announced_missing {
                         // Two different situations reach this arm, and only
@@ -1696,9 +2684,8 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                 }
             }
         }
-        tokio::select! {
-            _ = tokio::time::sleep(backoff) => {}
-            _ = stop.changed() => return,
+        if reconnect_delay(&mut stop, backoff).await {
+            return;
         }
         backoff = (backoff * 2).min(RECONNECT_MAX);
     }
@@ -1765,6 +2752,7 @@ fn rename_session_slot(inner: &Arc<Inner>, idx: usize, new_name: String) {
     {
         error!(old_name = %old_name, new_name = %new_name, error = %e, "cannot persist session rename in adoption registry");
     }
+    refresh_mailbox_and_schedule(inner);
     info!(old_name = %old_name, new_name = %new_name, "session renamed; daemon slot now follows tmux");
     inner.append_line(
         idx,
@@ -1785,8 +2773,9 @@ async fn run_session(
     inner: &Arc<Inner>,
     idx: usize,
     watcher: &Arc<SessionWatcher>,
+    binding: SessionIdentityBinding,
     mut stop: watch::Receiver<bool>,
-) {
+) -> bool {
     let mut rx = watcher.subscribe();
     // A rename can land after SessionWatcher::connect returns but before
     // this receiver exists. Broadcast channels do not replay that event;
@@ -1798,23 +2787,64 @@ async fn run_session(
     if inner.session(idx).is_some_and(|s| s.name() != live_name) {
         rename_session_slot(inner, idx, live_name);
     }
+    let kept = match reconcile_adoption_records(inner, watcher, binding.session_instance_id()).await
+    {
+        Ok(kept) => kept,
+        Err(error) => {
+            warn!(session = %watcher.session(), %error, "cannot reconcile recovered composer barriers");
+            return false;
+        }
+    };
+    let rows: Vec<ObservedPane> = watcher
+        .snapshot()
+        .into_iter()
+        .map(ObservedPane::capture)
+        .collect();
+    let route = MailboxRouteOverride {
+        session_idx: idx,
+        instance_id: binding.session_instance_id(),
+        rows: &rows,
+    };
+    if let Err(error) = publish_mailbox_transition(inner, &route, || {
+        let slot = inner
+            .session(idx)
+            .expect("session_idx valid: append-only, never removed");
+        let mut link = slot.link.lock().expect("session link lock");
+        link.identity = Some(binding);
+        link.attached = true;
+        link.watcher = Some(Arc::clone(watcher));
+        link.mailbox_panes = rows
+            .iter()
+            .cloned()
+            .map(|pane| (pane.row.pane_id.clone(), pane))
+            .collect();
+    }) {
+        warn!(session = %watcher.session(), error = %error, "cannot publish mailbox directory");
+        return false;
+    }
+    let slot = inner
+        .session(idx)
+        .expect("session_idx valid: append-only, never removed");
+    info!(session = %slot.name(), "attached to tmux session");
+    session_lifecycle(inner, idx, true);
     // Bootstrap: the watcher's table is already authoritative; evaluate
     // every pane once so status answers immediately. Adoptions are
     // reconciled against that table first, so the very first recompute
     // already knows which panes are named and which manifest is pinned.
-    reconcile_adoptions(inner, watcher).await;
+    reconcile_adoptions(inner, idx, watcher, &kept).await;
     for row in watcher.snapshot() {
         fusion::recompute_pane(inner, idx, watcher, &row.pane_id, false, "bootstrap").await;
     }
+    messaging::schedule_available(inner);
     // Per-pane debounce kickers for output activity.
     let mut debounce: HashMap<String, mpsc::Sender<()>> = HashMap::new();
     loop {
         tokio::select! {
-            _ = stop.changed() => return,
+            _ = stop.changed() => return true,
             ev = rx.recv() => match ev {
                 Ok(ev) => {
                     if handle_pane_event(inner, idx, watcher, &mut debounce, ev).await {
-                        return;
+                        return true;
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
@@ -1836,42 +2866,95 @@ async fn run_session(
                     }
                     warn!(session = %watcher.session(), missed, "event stream lagged; reconciling");
                     if watcher.reconcile_now().await.is_err() {
-                        return;
+                        return true;
                     }
+                    refresh_mailbox_and_schedule(inner);
                     for row in watcher.snapshot() {
                         fusion::recompute_pane(inner, idx, watcher, &row.pane_id, false, "lag_reconcile").await;
                     }
                 }
-                Err(broadcast::error::RecvError::Closed) => return,
+                Err(broadcast::error::RecvError::Closed) => return true,
             }
         }
     }
 }
 
-/// Bring the registry back in step with a session that just attached, and
-/// repaint what survives.
-///
-/// This runs on every attach, not only at boot: a reattach after tmux went
-/// away can find a completely different set of panes, and a label pointing
-/// at a pane id that now belongs to somebody else is how a message reaches
-/// the wrong terminal.
-async fn reconcile_adoptions(inner: &Arc<Inner>, watcher: &Arc<SessionWatcher>) {
-    let live: Vec<(String, i32)> = watcher
+/// Paint the adoptions that survived attach-time registry reconciliation.
+/// Directory publication happens first so mailbox routing and pane chrome
+/// become visible in the same attach cycle.
+async fn reconcile_adoptions(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    watcher: &Arc<SessionWatcher>,
+    kept: &[registry::Adoption],
+) {
+    paint_adoptions(inner, session_idx, watcher, kept).await;
+}
+
+async fn reconcile_adoption_records(
+    inner: &Arc<Inner>,
+    watcher: &Arc<SessionWatcher>,
+    session_instance_id: SessionInstanceId,
+) -> Result<Vec<registry::Adoption>, &'static str> {
+    let live: Vec<(String, ProcessInstanceId)> = watcher
         .snapshot()
         .into_iter()
-        .map(|r| (r.pane_id, r.pane_pid))
+        .filter_map(|row| {
+            let root = identity::ProcId::of(row.pane_pid)?;
+            let pane_root = ProcessInstanceId::new(root.pid, root.birth).ok()?;
+            Some((row.pane_id, pane_root))
+        })
         .collect();
-    let kept = {
-        let mut reg = inner.registry.lock().expect("registry lock");
-        match reg.restore_session(&watcher.session(), &live) {
-            Ok(kept) => kept,
-            Err(e) => {
-                error!(session = %watcher.session(), error = %e, "cannot rewrite the registry; keeping it in memory only");
-                reg.in_session(&watcher.session())
-            }
+    let existing = inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .in_session(&watcher.session());
+    let removed = stale_adoption_recipients(&existing, session_instance_id, &live);
+    let mut transferred = HashSet::new();
+    for recipient in removed {
+        let adoption = existing
+            .iter()
+            .find(|adoption| adoption.recipient == Some(recipient))
+            .ok_or("composer_recovery_pane_root_unproven")?;
+        if crate::composer_recovery::physical_pane_gone(watcher, adoption).await? {
+            crate::composer_recovery::retire_gone_recipient(inner, recipient)?;
+        } else {
+            transferred.insert(recipient);
         }
-    };
-    paint_adoptions(inner, watcher, &kept).await;
+    }
+    let mut reg = inner.registry.lock().expect("registry lock");
+    match reg.restore_session_preserving(
+        &watcher.session(),
+        session_instance_id,
+        &live,
+        &transferred,
+    ) {
+        Ok(kept) => Ok(kept),
+        Err(e) => {
+            error!(session = %watcher.session(), error = %e, "cannot rewrite the registry; keeping it in memory only");
+            Ok(reg.in_session(&watcher.session()))
+        }
+    }
+}
+
+/// Exact routes disproved by one authoritative session snapshot.
+fn stale_adoption_recipients(
+    existing: &[registry::Adoption],
+    session_instance_id: SessionInstanceId,
+    live: &[(String, ProcessInstanceId)],
+) -> Vec<RecipientKey> {
+    existing
+        .iter()
+        .filter(|adoption| {
+            adoption.recipient.is_some_and(|recipient| {
+                recipient.session_instance_id() != Some(session_instance_id)
+            }) || !live.iter().any(|(pane_id, pane_root)| {
+                *pane_id == adoption.pane_id && adoption.pane_root == Some(*pane_root)
+            })
+        })
+        .filter_map(|adoption| adoption.recipient)
+        .collect()
 }
 
 /// An adopted pane moved to another window (tmux `join-pane`,
@@ -1899,9 +2982,18 @@ async fn move_chrome(
     let Some(row) = watcher.pane(pane_id) else {
         return;
     };
+    let Some((recipient, pane_root, _)) = adoption_route(inner, watcher, session_idx, pane_id)
+    else {
+        return;
+    };
     // Nothing to do for a pane nobody named, or one already recorded in
     // the window it is now in.
-    match inner.registry.lock().expect("registry lock").get(pane_id) {
+    match inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .for_route(recipient, pane_root)
+    {
         Some(a) if a.window_id != row.window_id => {}
         _ => return,
     }
@@ -1926,7 +3018,8 @@ async fn move_chrome(
         }
     };
     let freed = match inner.registry.lock().expect("registry lock").move_window(
-        pane_id,
+        recipient,
+        pane_root,
         &row.window_id,
         destination_status,
     ) {
@@ -1961,6 +3054,17 @@ async fn handle_pane_event(
 ) -> bool {
     match ev {
         PaneEvent::PaneAdded(row) => {
+            update_mailbox_route(inner, || {
+                let Some(slot) = inner.session(session_idx) else {
+                    return;
+                };
+                slot.link
+                    .lock()
+                    .expect("session link lock")
+                    .mailbox_panes
+                    .insert(row.pane_id.clone(), ObservedPane::capture(row.clone()));
+            });
+            messaging::schedule_available(inner);
             fusion::recompute_pane(
                 inner,
                 session_idx,
@@ -1973,47 +3077,128 @@ async fn handle_pane_event(
             false
         }
         PaneEvent::PaneRemoved(id) => {
-            debounce.remove(&id);
-            inner
-                .detections
-                .lock()
-                .expect("detections lock")
-                .remove(&id);
-            // Adoption ends with the pane; hook history and the argv
-            // binding cache die with it too. There is no chrome to put
-            // back: the pane that wore it is gone, and its window only
-            // keeps the border on while some other adopted pane is left.
-            let freed = inner
-                .registry
-                .lock()
-                .expect("registry lock")
-                .forget(&id)
-                .and_then(|(a, freed)| freed.map(|f| (a, f)));
-            if let Some((adoption, window)) = freed {
-                if let Err(e) = chrome::restore_window(
-                    &watcher.client(),
-                    inner.cfg.chrome,
-                    &adoption.window_id,
-                    window.border_status.as_deref(),
-                )
-                .await
-                {
-                    warn!(window = %adoption.window_id, error = %e, "cannot restore window border after the last adopted pane closed");
+            let recipient = inner.session(session_idx).and_then(|slot| {
+                let link = slot.link.lock().expect("session link lock");
+                let current = link.watcher.as_ref()?;
+                if !Arc::ptr_eq(current, watcher) {
+                    return None;
+                }
+                let pane = id.parse().ok()?;
+                Some(RecipientKey::agent(
+                    inner.workspace_id,
+                    link.identity.as_ref()?.session_instance_id(),
+                    pane,
+                ))
+            });
+            let adoptions = inner.registry.lock().expect("registry lock").in_pane(&id);
+            let expected = recipient
+                .and_then(|recipient| {
+                    adoptions
+                        .iter()
+                        .find(|adoption| adoption.recipient == Some(recipient))
+                })
+                .or_else(|| (adoptions.len() == 1).then(|| &adoptions[0]));
+            let physical_gone = match expected {
+                Some(adoption) => {
+                    crate::composer_recovery::physical_pane_gone(watcher, adoption).await
+                }
+                None => {
+                    crate::composer_recovery::physical_pane_gone_with_expected(watcher, &id, None)
+                        .await
+                }
+            };
+            let physical_gone = match physical_gone {
+                Ok(gone) => gone,
+                Err(reason) => {
+                    warn!(pane = %id, %reason, "cannot prove physical pane loss before pane cleanup");
+                    return true;
+                }
+            };
+            if physical_gone {
+                let gone_recipients: HashSet<_> = recipient
+                    .into_iter()
+                    .chain(expected.and_then(|adoption| adoption.recipient))
+                    .collect();
+                for recipient in gone_recipients {
+                    if let Err(reason) =
+                        crate::composer_recovery::retire_gone_recipient(inner, recipient)
+                    {
+                        warn!(pane = %id, %reason, "cannot retire composer barrier before pane cleanup");
+                        return true;
+                    }
                 }
             }
-            inner
-                .hook_readings
-                .lock()
-                .expect("hook readings lock")
-                .remove(&id);
-            inner
-                .argv_cache
-                .lock()
-                .expect("argv cache lock")
-                .retain(|(pane, _), _| pane != &id);
-            inner.hook_liveness.forget(&id);
-            // The pane's last transition, and the only one a subscriber
-            // can hear: every other event names a pane that still exists.
+            update_mailbox_route(inner, || {
+                let Some(slot) = inner.session(session_idx) else {
+                    return;
+                };
+                slot.link
+                    .lock()
+                    .expect("session link lock")
+                    .mailbox_panes
+                    .remove(&id);
+            });
+            debounce.remove(&id);
+            if physical_gone {
+                let pane = PaneKey::new(session_idx, &id);
+                inner
+                    .detections
+                    .lock()
+                    .expect("detections lock")
+                    .remove(&pane);
+                // Stored turn ends die only with the physical pane. A
+                // session transfer keeps the exact end and composer hold
+                // under its source route until the destination recompute
+                // restores the durable barrier.
+                turnkey::PaneEnds::forget(
+                    &mut inner.turn_ends.lock().expect("turn ends lock"),
+                    &pane,
+                );
+                // Adoption, hook history and argv identity also belong to
+                // this exact route. Clear them only after the same proof.
+                // A duplicate pane id in another watched tmux server must
+                // retain its independent state and adoption.
+                let route = recipient
+                    .and_then(|recipient| {
+                        adoptions
+                            .iter()
+                            .find(|adoption| adoption.recipient == Some(recipient))
+                    })
+                    .or(expected)
+                    .and_then(|adoption| Some((adoption.recipient?, adoption.pane_root?)));
+                let freed = route.and_then(|(recipient, pane_root)| {
+                    let mut registry = inner.registry.lock().expect("registry lock");
+                    registry
+                        .forget(recipient, pane_root)
+                        .and_then(|(adoption, freed)| freed.map(|window| (adoption, window)))
+                });
+                if let Some((adoption, window)) = freed {
+                    if let Err(e) = chrome::restore_window(
+                        &watcher.client(),
+                        inner.cfg.chrome,
+                        &adoption.window_id,
+                        window.border_status.as_deref(),
+                    )
+                    .await
+                    {
+                        warn!(window = %adoption.window_id, error = %e, "cannot restore window border after the last adopted pane closed");
+                    }
+                }
+                inner
+                    .hook_readings
+                    .lock()
+                    .expect("hook readings lock")
+                    .remove(&pane);
+                inner
+                    .argv_cache
+                    .lock()
+                    .expect("argv cache lock")
+                    .retain(|(cached, _), _| cached != &pane);
+                inner.hook_liveness.forget(&pane);
+            }
+            messaging::schedule_available(inner);
+            // The source session's last transition for this pane. The pane
+            // may still exist under another session after a route transfer.
             // A client counting what needs a human takes its roster from
             // one `status` answer at startup and moves it on events after
             // that (cyclops_proto::attention), so without this edge a pane
@@ -2034,7 +3219,9 @@ async fn handle_pane_event(
                 json!({
                     "ts": unix_ms(),
                     "session": session,
+                    "session_idx": session_idx,
                     "pane_id": id,
+                    "physical_gone": physical_gone,
                 }),
                 None,
             );
@@ -2177,15 +3364,107 @@ pub(crate) fn unix_ms() -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn boot_rejects_a_socket_outside_the_held_state_root() {
+        let repair = RepairSummary::default();
+        let home = cyclops_proto::scratch::scratch_dir("cyc-boot-socket-root");
+        let _ = std::fs::remove_dir_all(&home);
+        let state_root = StateRoot::open_or_create(&home).unwrap();
+
+        let error = require_bound_socket_in_state_root(&repair, &state_root).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("not inside the validated state root"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn boot_fact_replays_the_upgraded_install_repair_summary() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tag = "cyc-repair-boot-fact";
+        let home = cyclops_proto::scratch::scratch_dir(tag);
+        let _ = std::fs::remove_dir_all(&home);
+        let mut inner = bare_inner(tag);
+        let legacy = home.join("legacy");
+        let legacy_file = legacy.join("state.json");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(&legacy_file, b"legacy\n").unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(&legacy_file, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let repair = inner
+            .state_root
+            .repair_descendant_permissions(None)
+            .unwrap();
+        Arc::get_mut(&mut inner).unwrap().state_repair = repair;
+        let ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/main.ndjson"),
+            &inner.boot_id,
+        )
+        .unwrap();
+        Arc::get_mut(&mut inner)
+            .unwrap()
+            .sessions
+            .get_mut()
+            .unwrap()
+            .push(Arc::new(SessionSlot::new("main".into(), Arc::new(ledger))));
+        inner.append_line(0, boot_fact_line(&inner, &[], "main"));
+
+        let lines = inner.session(0).unwrap().ledger.read_after(0).unwrap();
+        let fact = lines
+            .iter()
+            .filter_map(|line| line.data.as_ref())
+            .find(|data| data["event"] == "boot")
+            .unwrap();
+        assert_eq!(fact["state_permission_repair"]["directories"], 2);
+        assert_eq!(fact["state_permission_repair"]["regular_files"], 2);
+        assert_eq!(
+            fact["state_permission_repair"]["live_socket_preserved"],
+            false
+        );
+        assert_eq!(
+            std::fs::metadata(&home).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&legacy).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&legacy_file)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// Minimal `Inner` with no sessions, no manifests, no tmux — enough to
     /// exercise slot bookkeeping without a live daemon or a tmux server.
     /// Mirrors `server::tests::bare_inner`, kept separate because that one
     /// is private to its own module.
     fn bare_inner(tag: &str) -> Arc<Inner> {
         let home = cyclops_proto::scratch::scratch_dir(tag);
-        let (registry, _) = registry::Registry::load(&home);
+        let state_root = Arc::new(StateRoot::open_or_create(&home).unwrap());
+        let (registry, _) = registry::Registry::load(Arc::clone(&state_root));
+        let workspace_id = workspaceid::load_or_create(&state_root).unwrap();
+        let session_identities = sessionstore::SessionIdentities::open(&state_root).unwrap();
         Arc::new(Inner {
             cfg: Config::defaults(&home),
+            state_root,
+            state_repair: RepairSummary::default(),
+            workspace_id,
+            session_identities: StdMutex::new(session_identities),
+            mailbox: None,
+            composer_recovery: StdMutex::new(composer_recovery::RecoveryCoordinator::default()),
+            mailbox_publication: StdMutex::new(()),
+            mailbox_publish_pause: StdMutex::new(None),
             boot_id: "b-test".into(),
             started: Instant::now(),
             tmux_version: "3.6a".into(),
@@ -2197,6 +3476,7 @@ mod tests {
             registry: StdMutex::new(registry),
             theme: StdMutex::new(cyclops_theme::ThemeWatch::new(&home)),
             hook_readings: StdMutex::new(HashMap::new()),
+            turn_ends: StdMutex::new(turnkey::Ends::new()),
             argv_cache: StdMutex::new(HashMap::new()),
             engine: delivery::Engine::new(),
             ack_state: ack::AckState::new(),
@@ -2207,6 +3487,887 @@ mod tests {
             stop: watch::channel(false).1,
             extra_tasks: StdMutex::new(Vec::new()),
         })
+    }
+
+    fn enable_mailbox(inner: &mut Arc<Inner>) {
+        let directory = mailbox::MailboxDirectory::new(
+            inner.workspace_id,
+            std::iter::empty::<mailbox::MailboxIdentity>(),
+        )
+        .unwrap();
+        let store = mailbox::MessageStore::open(
+            &inner.state_root,
+            Path::new("workspaces/test/messages.ndjson"),
+            inner.workspace_id,
+            &inner.boot_id,
+        )
+        .unwrap();
+        let events = inner.events.clone();
+        Arc::get_mut(inner).unwrap().mailbox = Some(Arc::new(
+            mailbox::MailboxService::new_with_events(directory, store, events),
+        ));
+    }
+
+    fn test_pane(pane_id: &str, pane_pid: i32) -> PaneRow {
+        PaneRow {
+            pane_id: pane_id.into(),
+            window_id: "@1".into(),
+            window_name: "test".into(),
+            title: String::new(),
+            dead: false,
+            in_mode: false,
+            current_command: "test".into(),
+            width: 80,
+            height: 24,
+            active: true,
+            pane_pid,
+        }
+    }
+
+    fn test_live_key(
+        workspace_id: WorkspaceId,
+        server_pid: i32,
+        server_birth: u64,
+        session_id: &str,
+    ) -> cyclops_proto::LiveSessionKey {
+        cyclops_proto::LiveSessionKey::new(
+            workspace_id,
+            cyclops_proto::OsBootId::new("boot-test").unwrap(),
+            cyclops_proto::ProcessInstanceId::new(server_pid, server_birth).unwrap(),
+            session_id.parse().unwrap(),
+        )
+    }
+
+    fn persist_test_binding(
+        inner: &Inner,
+        live_key: cyclops_proto::LiveSessionKey,
+    ) -> SessionIdentityBinding {
+        let instance_id = inner
+            .session_identities
+            .lock()
+            .unwrap()
+            .resolve(&inner.state_root, &live_key, || {
+                SessionInstanceId::from_uuid(uuid::Uuid::new_v4()).unwrap()
+            })
+            .unwrap();
+        SessionIdentityBinding::new(live_key, instance_id)
+    }
+
+    fn add_detached_route(
+        inner: &Inner,
+        name: &str,
+        row: PaneRow,
+        binding: SessionIdentityBinding,
+    ) -> Arc<SessionSlot> {
+        let descendant = PathBuf::from("ledger").join(format!("{name}.ndjson"));
+        let ledger = LedgerWriter::open(&inner.state_root, &descendant, &inner.boot_id).unwrap();
+        let slot = Arc::new(SessionSlot::new(name.into(), Arc::new(ledger)));
+        let pane = ObservedPane::capture(row);
+        slot.last_panes
+            .lock()
+            .unwrap()
+            .insert(pane.row.pane_id.clone(), pane);
+        slot.link.lock().unwrap().identity = Some(binding);
+        inner.sessions.lock().unwrap().push(Arc::clone(&slot));
+        slot
+    }
+
+    fn set_test_label(inner: &Inner, session: &str, pane: TmuxPaneId, pane_pid: i32, label: &str) {
+        let session_instance_id = inner
+            .session_index(session)
+            .and_then(|idx| inner.session(idx))
+            .and_then(|slot| {
+                slot.link
+                    .lock()
+                    .unwrap()
+                    .identity
+                    .as_ref()
+                    .map(SessionIdentityBinding::session_instance_id)
+            })
+            .unwrap();
+        let root = identity::ProcId::of(pane_pid).unwrap();
+        inner
+            .registry
+            .lock()
+            .unwrap()
+            .adopt(
+                registry::Adoption {
+                    session: session.into(),
+                    pane_id: pane.to_string(),
+                    label: label.into(),
+                    recipient: Some(RecipientKey::agent(
+                        inner.workspace_id,
+                        session_instance_id,
+                        pane,
+                    )),
+                    pane_root: Some(ProcessInstanceId::new(root.pid, root.birth).unwrap()),
+                    manifest: None,
+                    pane_pid,
+                    window_id: "@1".into(),
+                    border_format: None,
+                },
+                registry::WindowChrome {
+                    session: session.into(),
+                    window_id: "@1".into(),
+                    border_status: None,
+                },
+            )
+            .unwrap();
+        refresh_mailbox_directory(inner);
+    }
+
+    fn send_test_message(
+        service: &mailbox::MailboxService,
+        address: String,
+    ) -> Result<mailbox::AcceptResult, mailbox::MailboxServiceError> {
+        service.send(
+            service.admin(),
+            mailbox::MailboxSend {
+                addresses: vec![address],
+                subject: "Test".into(),
+                body: String::new(),
+                fyi: false,
+                client_key: None,
+                supersedes: None,
+            },
+        )
+    }
+
+    #[test]
+    fn a_reused_pane_id_retires_the_old_exact_session_route() {
+        let workspace_id = WorkspaceId::from_uuid(uuid::Uuid::from_u128(1)).unwrap();
+        let old_session = SessionInstanceId::from_uuid(uuid::Uuid::from_u128(2)).unwrap();
+        let new_session = SessionInstanceId::from_uuid(uuid::Uuid::from_u128(3)).unwrap();
+        let pane: TmuxPaneId = "%1".parse().unwrap();
+        let old_root = ProcessInstanceId::new(41, 141).unwrap();
+        let new_root = ProcessInstanceId::new(42, 142).unwrap();
+        let old_recipient = RecipientKey::agent(workspace_id, old_session, pane);
+        let existing = vec![registry::Adoption {
+            session: "main".into(),
+            pane_id: pane.to_string(),
+            label: "reviewer".into(),
+            recipient: Some(old_recipient),
+            pane_root: Some(old_root),
+            manifest: Some("codex".into()),
+            pane_pid: old_root.pid(),
+            window_id: "@1".into(),
+            border_format: None,
+        }];
+
+        assert_eq!(
+            stale_adoption_recipients(&existing, new_session, &[(pane.to_string(), new_root)]),
+            vec![old_recipient]
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_restart_reopens_one_workspace_mailbox() {
+        let home = cyclops_proto::scratch::scratch_dir(&format!(
+            "cyc-workspace-restart-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let first = boot(Config::defaults(&home)).await.unwrap();
+        let workspace_id = first.inner.workspace_id;
+        let service = first.inner.mailbox.as_ref().unwrap();
+        let accepted = service
+            .send(
+                service.admin(),
+                mailbox::MailboxSend {
+                    addresses: vec!["admin".into()],
+                    subject: "Restart".into(),
+                    body: "Persisted".into(),
+                    fyi: false,
+                    client_key: Some("restart-test".into()),
+                    supersedes: None,
+                },
+            )
+            .unwrap();
+        let message_id = accepted.message_id.clone();
+        first.shutdown().await;
+        drop(first);
+
+        let second = boot(Config::defaults(&home)).await.unwrap();
+        assert_eq!(second.inner.workspace_id, workspace_id);
+        let inbox = second
+            .inner
+            .mailbox
+            .as_ref()
+            .unwrap()
+            .list(RecipientKey::admin(workspace_id), None, None)
+            .unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].entry.message_id, message_id);
+        second.shutdown().await;
+        drop(second);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn session_and_label_renames_keep_durable_routing() {
+        let mut inner = bare_inner("cyc-mailbox-renames");
+        enable_mailbox(&mut inner);
+        let pane: TmuxPaneId = "%1".parse().unwrap();
+        let root = identity::ProcId::of(std::process::id() as i32).unwrap();
+        let binding =
+            persist_test_binding(&inner, test_live_key(inner.workspace_id, 900, 1000, "$1"));
+        let expected = RecipientKey::agent(inner.workspace_id, binding.session_instance_id(), pane);
+        let slot = add_detached_route(
+            &inner,
+            "before",
+            test_pane(&pane.to_string(), root.pid),
+            binding,
+        );
+        set_test_label(&inner, "before", pane, root.pid, "reviewer");
+
+        rename_session_slot(&inner, 0, "after".into());
+        assert_eq!(slot.name(), "after");
+        assert_eq!(
+            inner
+                .mailbox
+                .as_ref()
+                .unwrap()
+                .agent_for_pane(pane)
+                .unwrap()
+                .unwrap()
+                .key,
+            expected
+        );
+
+        set_test_label(&inner, "after", pane, root.pid, "driver");
+        let service = inner.mailbox.as_ref().unwrap();
+        assert!(send_test_message(service, "reviewer".into()).is_err());
+        send_test_message(service, "driver".into()).unwrap();
+
+        inner
+            .registry
+            .lock()
+            .unwrap()
+            .clear(
+                expected,
+                ProcessInstanceId::new(root.pid, root.birth).unwrap(),
+            )
+            .unwrap();
+        refresh_mailbox_directory(&inner);
+        assert!(send_test_message(service, "driver".into()).is_err());
+        assert!(send_test_message(service, pane.to_string()).is_err());
+    }
+
+    #[test]
+    fn mailbox_directory_and_broadcast_include_only_adopted_panes() {
+        let mut inner = bare_inner("cyc-mailbox-adopted-only");
+        enable_mailbox(&mut inner);
+        let root = identity::ProcId::of(std::process::id() as i32).unwrap();
+        let binding =
+            persist_test_binding(&inner, test_live_key(inner.workspace_id, 900, 1000, "$1"));
+        let adopted: TmuxPaneId = "%1".parse().unwrap();
+        let unadopted: TmuxPaneId = "%2".parse().unwrap();
+        let slot = add_detached_route(
+            &inner,
+            "main",
+            test_pane(&adopted.to_string(), root.pid),
+            binding,
+        );
+        let observed = ObservedPane::capture(test_pane(&unadopted.to_string(), root.pid));
+        slot.last_panes
+            .lock()
+            .unwrap()
+            .insert(observed.row.pane_id.clone(), observed);
+        set_test_label(&inner, "main", adopted, root.pid, "reviewer");
+
+        let service = inner.mailbox.as_ref().unwrap();
+        let broadcast = send_test_message(service, "*".into()).unwrap();
+        assert_eq!(broadcast.recipient_keys.len(), 1);
+        assert_eq!(
+            broadcast.recipient_keys[0].pane_id(),
+            Some(adopted),
+            "broadcast escaped the adopted roster"
+        );
+        assert!(service.agent_for_pane(unadopted).unwrap().is_none());
+        assert!(send_test_message(service, unadopted.to_string()).is_err());
+    }
+
+    #[test]
+    fn exact_adoptions_with_the_same_pane_id_coexist_in_broadcasts() {
+        let mut inner = bare_inner("cyc-mailbox-same-pane-id");
+        enable_mailbox(&mut inner);
+        let root = identity::ProcId::of(std::process::id() as i32).unwrap();
+        let pane: TmuxPaneId = "%1".parse().unwrap();
+        let first =
+            persist_test_binding(&inner, test_live_key(inner.workspace_id, 900, 1000, "$1"));
+        let first_key = RecipientKey::agent(inner.workspace_id, first.session_instance_id(), pane);
+        add_detached_route(
+            &inner,
+            "first",
+            test_pane(&pane.to_string(), root.pid),
+            first,
+        );
+        set_test_label(&inner, "first", pane, root.pid, "reviewer");
+
+        let second =
+            persist_test_binding(&inner, test_live_key(inner.workspace_id, 901, 2000, "$1"));
+        let second_key =
+            RecipientKey::agent(inner.workspace_id, second.session_instance_id(), pane);
+        add_detached_route(
+            &inner,
+            "second",
+            test_pane(&pane.to_string(), root.pid),
+            second,
+        );
+        set_test_label(&inner, "second", pane, root.pid, "implementer");
+
+        let service = inner.mailbox.as_ref().unwrap();
+        let broadcast = send_test_message(service, "*".into()).unwrap();
+        assert_eq!(
+            broadcast
+                .recipient_keys
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from([first_key, second_key])
+        );
+    }
+
+    #[test]
+    fn replacement_route_does_not_inherit_a_stale_manifest_pin() {
+        let mut inner = bare_inner("cyc-stale-manifest-pin");
+        let auto = Manifest::parse(
+            r#"
+[agent]
+id = "auto"
+display_name = "Auto"
+process_names = ["test"]
+"#,
+            Path::new("auto.toml"),
+        )
+        .unwrap();
+        let pinned = Manifest::parse(
+            r#"
+[agent]
+id = "pinned"
+display_name = "Pinned"
+process_names = ["never"]
+"#,
+            Path::new("pinned.toml"),
+        )
+        .unwrap();
+        Arc::get_mut(&mut inner)
+            .unwrap()
+            .manifests
+            .extend([("auto".into(), auto), ("pinned".into(), pinned)]);
+        let pane: TmuxPaneId = "%1".parse().unwrap();
+        let root = identity::ProcId::of(std::process::id() as i32).unwrap();
+        let old_binding =
+            persist_test_binding(&inner, test_live_key(inner.workspace_id, 900, 1000, "$1"));
+        let old_recipient =
+            RecipientKey::agent(inner.workspace_id, old_binding.session_instance_id(), pane);
+        add_detached_route(
+            &inner,
+            "old",
+            test_pane(&pane.to_string(), root.pid),
+            old_binding,
+        );
+        inner
+            .registry
+            .lock()
+            .unwrap()
+            .adopt(
+                registry::Adoption {
+                    session: "old".into(),
+                    pane_id: pane.to_string(),
+                    label: "reviewer".into(),
+                    recipient: Some(old_recipient),
+                    pane_root: Some(ProcessInstanceId::new(root.pid, root.birth).unwrap()),
+                    manifest: Some("pinned".into()),
+                    pane_pid: root.pid,
+                    window_id: "@1".into(),
+                    border_format: None,
+                },
+                registry::WindowChrome {
+                    session: "old".into(),
+                    window_id: "@1".into(),
+                    border_status: None,
+                },
+            )
+            .unwrap();
+
+        let new_binding =
+            persist_test_binding(&inner, test_live_key(inner.workspace_id, 901, 2000, "$1"));
+        let new_recipient =
+            RecipientKey::agent(inner.workspace_id, new_binding.session_instance_id(), pane);
+        let new_slot = add_detached_route(
+            &inner,
+            "new",
+            test_pane(&pane.to_string(), root.pid),
+            new_binding,
+        );
+        new_slot.link.lock().unwrap().attached = true;
+        let row = new_slot.last_panes.lock().unwrap()[&pane.to_string()]
+            .row
+            .clone();
+
+        assert_eq!(
+            fusion::bind_manifest_for(&inner, 1, &row).map(|manifest| manifest.agent.id.as_str()),
+            Some("auto")
+        );
+        let pane_root = ProcessInstanceId::new(root.pid, root.birth).unwrap();
+        assert!(
+            inner
+                .adoption_for_observed_route(new_recipient, &row.pane_id, pane_root)
+                .is_none(),
+            "a different tmux server generation is not the same physical route"
+        );
+
+        let moved_binding =
+            persist_test_binding(&inner, test_live_key(inner.workspace_id, 900, 1000, "$2"));
+        let moved_recipient = RecipientKey::agent(
+            inner.workspace_id,
+            moved_binding.session_instance_id(),
+            pane,
+        );
+        let moved_slot = add_detached_route(
+            &inner,
+            "moved",
+            test_pane(&pane.to_string(), root.pid),
+            moved_binding,
+        );
+        moved_slot.link.lock().unwrap().attached = true;
+        let moved_row = moved_slot.last_panes.lock().unwrap()[&pane.to_string()]
+            .row
+            .clone();
+        assert_eq!(
+            fusion::bind_manifest_for(&inner, 2, &moved_row)
+                .map(|manifest| manifest.agent.id.as_str()),
+            Some("pinned"),
+            "a pane transfer within one tmux server keeps its explicit pin"
+        );
+        assert_eq!(
+            inner
+                .adoption_for_observed_route(moved_recipient, &moved_row.pane_id, pane_root)
+                .and_then(|adoption| adoption.manifest),
+            Some("pinned".into())
+        );
+    }
+
+    #[test]
+    fn concurrent_attach_publications_keep_both_routes() {
+        let mut inner = bare_inner("cyc-mailbox-concurrent-attach");
+        enable_mailbox(&mut inner);
+        let root = identity::ProcId::of(std::process::id() as i32).unwrap();
+        let binding_a =
+            persist_test_binding(&inner, test_live_key(inner.workspace_id, 900, 1000, "$1"));
+        let binding_b =
+            persist_test_binding(&inner, test_live_key(inner.workspace_id, 900, 1000, "$2"));
+        let slot_a = add_detached_route(&inner, "a", test_pane("%1", root.pid), binding_a.clone());
+        let slot_b = add_detached_route(&inner, "b", test_pane("%2", root.pid), binding_b.clone());
+        set_test_label(&inner, "a", "%1".parse().unwrap(), root.pid, "first");
+        set_test_label(&inner, "b", "%2".parse().unwrap(), root.pid, "second");
+        slot_a.link.lock().unwrap().identity = None;
+        slot_b.link.lock().unwrap().identity = None;
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *inner.mailbox_publish_pause.lock().unwrap() = Some(MailboxPublishPause {
+            entered: entered_tx,
+            release: Arc::clone(&release),
+        });
+        let rows_a: Vec<_> = slot_a
+            .last_panes
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        let rows_b: Vec<_> = slot_b
+            .last_panes
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let inner_a = Arc::clone(&inner);
+            let slot_a = Arc::clone(&slot_a);
+            let attach_a = scope.spawn(move || {
+                let route = MailboxRouteOverride {
+                    session_idx: 0,
+                    instance_id: binding_a.session_instance_id(),
+                    rows: &rows_a,
+                };
+                publish_mailbox_transition(&inner_a, &route, || {
+                    slot_a.link.lock().unwrap().identity = Some(binding_a);
+                })
+                .unwrap();
+            });
+            entered_rx.recv().unwrap();
+
+            let inner_b = Arc::clone(&inner);
+            let slot_b = Arc::clone(&slot_b);
+            let attach_b = scope.spawn(move || {
+                let route = MailboxRouteOverride {
+                    session_idx: 1,
+                    instance_id: binding_b.session_instance_id(),
+                    rows: &rows_b,
+                };
+                publish_mailbox_transition(&inner_b, &route, || {
+                    slot_b.link.lock().unwrap().identity = Some(binding_b);
+                })
+                .unwrap();
+                done_tx.send(()).unwrap();
+            });
+            let overlapped = done_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+            release.wait();
+            attach_a.join().unwrap();
+            attach_b.join().unwrap();
+            assert!(!overlapped, "mailbox publications overlapped");
+        });
+
+        let service = inner.mailbox.as_ref().unwrap();
+        assert!(service
+            .agent_for_pane("%1".parse().unwrap())
+            .unwrap()
+            .is_some());
+        assert!(service
+            .agent_for_pane("%2".parse().unwrap())
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn a_paused_snapshot_cannot_resurrect_a_removed_route() {
+        let mut inner = bare_inner("cyc-mailbox-stale-removal");
+        enable_mailbox(&mut inner);
+        let root = identity::ProcId::of(std::process::id() as i32).unwrap();
+        let binding =
+            persist_test_binding(&inner, test_live_key(inner.workspace_id, 900, 1000, "$1"));
+        let slot = add_detached_route(&inner, "a", test_pane("%1", root.pid), binding);
+        refresh_mailbox_directory(&inner);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *inner.mailbox_publish_pause.lock().unwrap() = Some(MailboxPublishPause {
+            entered: entered_tx,
+            release: Arc::clone(&release),
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let stale_inner = Arc::clone(&inner);
+            let stale = scope.spawn(move || refresh_mailbox_directory(&stale_inner));
+            entered_rx.recv().unwrap();
+            slot.last_panes.lock().unwrap().clear();
+
+            let current_inner = Arc::clone(&inner);
+            let current = scope.spawn(move || {
+                refresh_mailbox_directory(&current_inner);
+                done_tx.send(()).unwrap();
+            });
+            let overlapped = done_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+            release.wait();
+            stale.join().unwrap();
+            current.join().unwrap();
+            assert!(!overlapped, "mailbox publications overlapped");
+        });
+
+        assert!(inner
+            .mailbox
+            .as_ref()
+            .unwrap()
+            .agent_for_pane("%1".parse().unwrap())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn attached_replacement_wins_a_reused_pane_id_without_hiding_old_mail() {
+        let mut inner = bare_inner("cyc-mailbox-reused-pane-id");
+        enable_mailbox(&mut inner);
+        let pane: TmuxPaneId = "%1".parse().unwrap();
+        let live_root = identity::ProcId::of(std::process::id() as i32).unwrap();
+        let stale_root = identity::ProcId {
+            pid: live_root.pid,
+            birth: live_root.birth.checked_sub(1).unwrap_or(1),
+        };
+        let old_binding =
+            persist_test_binding(&inner, test_live_key(inner.workspace_id, 900, 1000, "$1"));
+        let old_key =
+            RecipientKey::agent(inner.workspace_id, old_binding.session_instance_id(), pane);
+        let old_slot =
+            add_detached_route(&inner, "old", test_pane("%1", live_root.pid), old_binding);
+        set_test_label(&inner, "old", pane, live_root.pid, "old-worker");
+        refresh_mailbox_directory(&inner);
+        send_test_message(inner.mailbox.as_ref().unwrap(), "old-worker".into()).unwrap();
+        old_slot
+            .last_panes
+            .lock()
+            .unwrap()
+            .get_mut("%1")
+            .unwrap()
+            .root = Some(stale_root);
+        refresh_mailbox_directory(&inner);
+
+        let new_binding =
+            persist_test_binding(&inner, test_live_key(inner.workspace_id, 901, 2000, "$1"));
+        let new_key =
+            RecipientKey::agent(inner.workspace_id, new_binding.session_instance_id(), pane);
+        let new_slot =
+            add_detached_route(&inner, "new", test_pane("%1", live_root.pid), new_binding);
+        let panes = std::mem::take(&mut *new_slot.last_panes.lock().unwrap());
+        {
+            let mut link = new_slot.link.lock().unwrap();
+            link.attached = true;
+            link.mailbox_panes = panes;
+        }
+        refresh_mailbox_directory(&inner);
+
+        let service = inner.mailbox.as_ref().unwrap();
+        set_test_label(&inner, "new", pane, live_root.pid, "reviewer");
+        let routed = service.agent_for_pane(pane).unwrap().unwrap();
+        assert_eq!(routed.key, new_key);
+        assert_eq!(routed.label, "reviewer");
+        assert_eq!(
+            send_test_message(service, "reviewer".into())
+                .unwrap()
+                .recipients,
+            vec!["reviewer"]
+        );
+        assert_eq!(
+            mailbox_recipient_for_origin(&inner, pane, live_root),
+            Some(new_key)
+        );
+        assert_eq!(mailbox_recipient_for_origin(&inner, pane, stale_root), None);
+        assert_eq!(service.list(old_key, None, None).unwrap().len(), 1);
+        assert_eq!(service.list(new_key, None, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn composite_cursor_survives_rename_and_rejects_a_reused_name() {
+        let inner = bare_inner("cyc-history-cursor-rename");
+        let old_ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/before.ndjson"),
+            &inner.boot_id,
+        )
+        .unwrap();
+        let old = Arc::new(SessionSlot::new("before".into(), Arc::new(old_ledger)));
+        for id in ["m-first", "m-second"] {
+            let mut line = daemon_line(Kind::Msg, id.into(), Value::Null);
+            line.from = "admin".into();
+            line.to = vec!["agent".into()];
+            old.ledger.append(line).unwrap();
+        }
+        let side_ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/side.ndjson"),
+            &inner.boot_id,
+        )
+        .unwrap();
+        inner.sessions.lock().unwrap().extend([
+            Arc::clone(&old),
+            Arc::new(SessionSlot::new("side".into(), Arc::new(side_ledger))),
+        ]);
+        let params = cyclops_proto::HistoryParams {
+            with: None,
+            from: None,
+            to: None,
+            limit: 1,
+            cursor: None,
+        };
+
+        let first =
+            history::msg_history(&inner, params.clone(), Some(String::new()), None).unwrap();
+        assert_eq!(first["lines"][0]["id"], "m-first");
+        let cursor = first["next_cursor2"].as_str().unwrap().to_string();
+        old.rename("after".into());
+
+        let second = history::msg_history(&inner, params.clone(), Some(cursor), None).unwrap();
+        assert_eq!(second["lines"][0]["id"], "m-second");
+        let cursor = second["next_cursor2"].as_str().unwrap().to_string();
+
+        let replacement_ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/replacement.ndjson"),
+            &inner.boot_id,
+        )
+        .unwrap();
+        let replacement = Arc::new(SessionSlot::new(
+            "before".into(),
+            Arc::new(replacement_ledger),
+        ));
+        let mut line = daemon_line(Kind::Msg, "m-replacement".into(), Value::Null);
+        line.from = "admin".into();
+        line.to = vec!["agent".into()];
+        replacement.ledger.append(line).unwrap();
+        inner.sessions.lock().unwrap().push(replacement);
+
+        let stale = history::msg_history(&inner, params, Some(cursor), None).unwrap_err();
+        assert_eq!(stale.code, "bad_request");
+    }
+
+    async fn wait_for_session_binding(
+        slot: &Arc<SessionSlot>,
+        previous: Option<SessionInstanceId>,
+    ) -> SessionIdentityBinding {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let binding = slot
+                    .link
+                    .lock()
+                    .unwrap()
+                    .identity
+                    .clone()
+                    .filter(|binding| {
+                        previous.is_none_or(|id| binding.session_instance_id() != id)
+                    });
+                if let Some(binding) = binding {
+                    return binding;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("session identity was not published")
+    }
+
+    fn assert_current_mailbox_route(
+        inner: &Inner,
+        slot: &SessionSlot,
+        binding: &SessionIdentityBinding,
+    ) {
+        let row = slot
+            .link
+            .lock()
+            .unwrap()
+            .watcher
+            .as_ref()
+            .unwrap()
+            .snapshot()[0]
+            .clone();
+        let pane: TmuxPaneId = row.pane_id.parse().unwrap();
+        let root = identity::ProcId::of(row.pane_pid).unwrap();
+        inner
+            .registry
+            .lock()
+            .unwrap()
+            .adopt(
+                registry::Adoption {
+                    session: slot.name(),
+                    pane_id: row.pane_id,
+                    label: "worker".into(),
+                    recipient: Some(RecipientKey::agent(
+                        inner.workspace_id,
+                        binding.session_instance_id(),
+                        pane,
+                    )),
+                    pane_root: Some(ProcessInstanceId::new(root.pid, root.birth).unwrap()),
+                    manifest: None,
+                    pane_pid: row.pane_pid,
+                    window_id: row.window_id.clone(),
+                    border_format: None,
+                },
+                registry::WindowChrome {
+                    session: slot.name(),
+                    window_id: row.window_id,
+                    border_status: None,
+                },
+            )
+            .unwrap();
+        refresh_mailbox_directory(inner);
+        let routed = inner
+            .mailbox
+            .as_ref()
+            .unwrap()
+            .agent_for_pane(pane)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            routed.key,
+            RecipientKey::agent(inner.workspace_id, binding.session_instance_id(), pane)
+        );
+    }
+
+    #[tokio::test]
+    async fn live_rename_and_replacement_preserve_identity_boundaries() {
+        if !cyclops_testrig::tmux_available() {
+            return;
+        }
+        let tmux = cyclops_testrig::TmuxServer::new("durable-session-wiring");
+        tmux.run_ok(&["new-session", "-d", "-s", "before"]);
+        let home = cyclops_proto::scratch::scratch_dir(&format!(
+            "cyc-durable-session-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut cfg = Config::defaults(&home);
+        cfg.sessions.push("before".into());
+        cfg.tmux_socket = Some(tmux.socket().to_string());
+        cfg.tmux_config = Some(PathBuf::from("/dev/null"));
+        let daemon = boot(cfg).await.unwrap();
+        let slot = daemon.inner.session(0).unwrap();
+        let first = wait_for_session_binding(&slot, None).await;
+        assert!(
+            slot.link.lock().unwrap().attached,
+            "watcher detached during bootstrap"
+        );
+        assert_current_mailbox_route(&daemon.inner, &slot, &first);
+        let reopened = sessionstore::SessionIdentities::open(&daemon.inner.state_root).unwrap();
+        assert_eq!(
+            reopened.instance_of(first.live_session_key()),
+            Some(first.session_instance_id())
+        );
+
+        tmux.run_ok(&["rename-session", "-t", "=before", "after"]);
+        let renamed = tokio::time::timeout(Duration::from_secs(10), async {
+            while slot.name() != "after" {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if renamed.is_err() {
+            let (attached, watched_name) = {
+                let link = slot.link.lock().unwrap();
+                (
+                    link.attached,
+                    link.watcher.as_ref().map(|watcher| watcher.session()),
+                )
+            };
+            panic!(
+                "session rename was not applied: slot={}, attached={attached}, watcher={watched_name:?}",
+                slot.name()
+            );
+        }
+        assert_eq!(
+            slot.link
+                .lock()
+                .unwrap()
+                .identity
+                .as_ref()
+                .unwrap()
+                .session_instance_id(),
+            first.session_instance_id()
+        );
+
+        drop(tmux);
+        let tmux = cyclops_testrig::TmuxServer::new("durable-session-wiring");
+        tmux.run_ok(&["new-session", "-d", "-s", "after"]);
+        let second = wait_for_session_binding(&slot, Some(first.session_instance_id())).await;
+        assert_current_mailbox_route(&daemon.inner, &slot, &second);
+        assert_ne!(
+            second.live_session_key().tmux_server(),
+            first.live_session_key().tmux_server()
+        );
+
+        tmux.run_ok(&["new-session", "-d", "-s", "anchor"]);
+        tmux.run_ok(&["kill-session", "-t", "=after"]);
+        tmux.run_ok(&["new-session", "-d", "-s", "after"]);
+        let third = wait_for_session_binding(&slot, Some(second.session_instance_id())).await;
+        assert_current_mailbox_route(&daemon.inner, &slot, &third);
+        assert_ne!(
+            third.live_session_key().tmux_session_id(),
+            second.live_session_key().tmux_session_id()
+        );
+        daemon.shutdown().await;
+        drop(daemon);
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     /// A rename that lands on the daemon's own slot (`rename_session_slot`,
@@ -2221,10 +4382,14 @@ mod tests {
         let inner = bare_inner("cyc-rename-unit");
         let dir = cyclops_proto::scratch::scratch_dir("cyc-rename-unit-ledger");
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("ledger")).expect("scratch ledger dir");
         let ledger_path = dir.join("ledger/old-name.ndjson");
-        let ledger =
-            cyclops_ledger::LedgerWriter::open(&ledger_path, &inner.boot_id).expect("ledger opens");
+        let state_root = StateRoot::open_or_create(&dir).expect("state root opens");
+        let ledger = cyclops_ledger::LedgerWriter::open(
+            &state_root,
+            Path::new("ledger/old-name.ndjson"),
+            &inner.boot_id,
+        )
+        .expect("ledger opens");
         let idx = {
             let mut sessions = inner.sessions.lock().expect("sessions lock");
             sessions.push(Arc::new(SessionSlot::new(
@@ -2296,9 +4461,9 @@ mod tests {
 
         let inner = bare_inner("cyc-rename-watch-race");
         let home = inner.cfg.home.clone();
-        std::fs::create_dir_all(home.join("ledger")).expect("scratch ledger dir");
         let ledger = cyclops_ledger::LedgerWriter::open(
-            &home.join("ledger/old-name.ndjson"),
+            &inner.state_root,
+            Path::new("ledger/old-name.ndjson"),
             &inner.boot_id,
         )
         .expect("ledger opens");
@@ -2354,10 +4519,13 @@ mod tests {
         let inner = bare_inner("cyc-rename-noop-unit");
         let dir = cyclops_proto::scratch::scratch_dir("cyc-rename-noop-unit-ledger");
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("ledger")).expect("scratch ledger dir");
-        let ledger_path = dir.join("ledger/same-name.ndjson");
-        let ledger =
-            cyclops_ledger::LedgerWriter::open(&ledger_path, &inner.boot_id).expect("ledger opens");
+        let state_root = StateRoot::open_or_create(&dir).expect("state root opens");
+        let ledger = cyclops_ledger::LedgerWriter::open(
+            &state_root,
+            Path::new("ledger/same-name.ndjson"),
+            &inner.boot_id,
+        )
+        .expect("ledger opens");
         let idx = {
             let mut sessions = inner.sessions.lock().expect("sessions lock");
             sessions.push(Arc::new(SessionSlot::new(
@@ -2367,9 +4535,19 @@ mod tests {
             sessions.len() - 1
         };
 
-        let before = cyclops_ledger::read_after(&ledger_path, 0).expect("ledger reads");
+        let before = inner
+            .session(idx)
+            .unwrap()
+            .ledger
+            .read_after(0)
+            .expect("ledger reads");
         rename_session_slot(&inner, idx, "same-name".to_string());
-        let after = cyclops_ledger::read_after(&ledger_path, 0).expect("ledger reads");
+        let after = inner
+            .session(idx)
+            .unwrap()
+            .ledger
+            .read_after(0)
+            .expect("ledger reads");
         assert_eq!(
             before.len(),
             after.len(),

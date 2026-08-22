@@ -10,36 +10,47 @@
 //! the same reason: an install is two binaries, and it has to work before
 //! it has files.
 //!
-//! Where it goes is another tool's home (`~/.claude/skills/cyclops/`),
+//! Where it goes is another tool's skill directory,
 //! which `crate::hookset` deliberately refuses to touch for `hooks
 //! install`. Writing here follows the rules `hookset::wire_vendor`
 //! already set for vendor homes: only under the installer's
 //! `--wire-hooks` consent (given at install time, or recorded then and
-//! honored by a later boot: `workspace::finish_deferred_wiring`), only
-//! when the vendor's directory already exists (its presence is what says
-//! the agent CLI is installed; this module never creates `~/.claude`
-//! itself), honoring `CYCLOPS_NO_VENDOR_HOOKS`, and never replacing
-//! bytes this project did not write ([`EVER_SHIPPED_FNV64`], the same
-//! edit-detection rule as `crate::manifests`).
+//! honored by a later boot: `workspace::finish_deferred_wiring`), only when
+//! a consumer's own directory already exists, honoring
+//! `CYCLOPS_NO_VENDOR_HOOKS`, and never replacing bytes this project did
+//! not write ([`EVER_SHIPPED_FNV64`], the same edit-detection rule as
+//! `crate::manifests`).
 
 use std::path::{Path, PathBuf};
 
 /// The skill body the binary carries.
-const SHIPPED: &str = include_str!("../../../skills/cyclops/SKILL.md");
+pub(crate) const SHIPPED: &str = include_str!("../../../skills/cyclops/SKILL.md");
 
 /// Where the skill goes under the agent's dot-directory.
 pub fn skill_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("skills").join("cyclops").join("SKILL.md")
 }
 
-/// FNV-1a 64 of every skill body this project has ever shipped, the
-/// current one included. Same contract as
-/// `crate::manifests::EVER_SHIPPED_FNV64`: a file on disk whose hash is
-/// in this list is a seed nobody edited, so a newer shipped body may
-/// replace it; any other content is the operator's and is never touched.
-/// The test below fails until the current body is listed, and prints the
-/// hash to append.
-const EVER_SHIPPED_FNV64: &[&str] = &["7ebc1453af11b931"];
+/// FNV-1a 64 of every skill body this project has released, the current
+/// one included. Same contract as `crate::manifests::EVER_SHIPPED_FNV64`:
+/// a file on disk whose hash is in this list is a seed nobody edited, so
+/// a newer shipped body may replace it; any other content is the
+/// operator's and is never touched. The test below fails until the
+/// current body is listed, and prints the hash to append.
+///
+/// Released, not every body that ever compiled. A hash here is permission
+/// to overwrite a file on somebody's disk, and an unreleased intermediate
+/// was never seeded onto one, so listing it would only claim that
+/// authority over bytes that could just as well be an operator's own.
+const EVER_SHIPPED_FNV64: &[&str] = &[
+    "7ebc1453af11b931",
+    "cf5916d45a60081c",
+    "2a2b7ed80b7a8f81",
+    "a765a5ba2ec5ede0",
+    "74bc4c099fc6dd15",
+    "d4300589bfb3064e",
+    "63f27822adc1850e",
+];
 
 /// FNV-1a 64, hex. Same non-cryptographic question as the manifest seed:
 /// "did the operator edit this file", not "is this an attack".
@@ -52,6 +63,10 @@ fn fnv64(data: &[u8]) -> String {
     format!("{h:016x}")
 }
 
+pub(crate) fn unedited_seed(data: &[u8]) -> bool {
+    EVER_SHIPPED_FNV64.contains(&fnv64(data).as_str())
+}
+
 /// What one [`seed_into`] run did, in the order a caller checks them.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -61,10 +76,7 @@ pub enum Outcome {
     /// A file was already there and was left alone: either it is already
     /// current, or the operator edited it and their copy outranks ours.
     Kept,
-    /// The agent's directory does not exist, so that CLI is not installed
-    /// here and there is nowhere the skill would be read from. Nothing
-    /// was created: making `~/.claude` for a tool that is not installed
-    /// would be this project inventing another tool's home.
+    /// No consumer for this destination is installed. Nothing was created.
     NoAgent,
     /// The write failed; the sentence says where and why.
     Problem(String),
@@ -72,22 +84,17 @@ pub enum Outcome {
 
 /// One seed attempt against one agent directory.
 pub struct SeededSkill {
+    pub consumer: &'static str,
     pub path: PathBuf,
     pub outcome: Outcome,
 }
 
-/// Put the shipped skill at `<agent_dir>/skills/cyclops/SKILL.md`,
-/// keeping any copy the operator edited.
-///
-/// `agent_dir` is the agent CLI's own dot-directory (`~/.claude` in
-/// production; tests hand in scratch). Its existence is the gate; the
-/// `skills/cyclops` levels under it are this module's to create, the same
-/// way `wire_vendor` writes a hooks.json into a vendor directory it
-/// refuses to create.
-pub fn seed_into(agent_dir: &Path) -> SeededSkill {
+/// Put the shipped skill under `agent_dir`, keeping any operator edit.
+fn seed_into(consumer: &'static str, installed: bool, agent_dir: &Path) -> SeededSkill {
     let path = skill_path(agent_dir);
-    if !agent_dir.is_dir() {
+    if !installed {
         return SeededSkill {
+            consumer,
             path,
             outcome: Outcome::NoAgent,
         };
@@ -95,10 +102,9 @@ pub fn seed_into(agent_dir: &Path) -> SeededSkill {
     if let Ok(existing) = std::fs::read(&path) {
         // Already current needs no write, and anything the operator
         // typed outranks the shipped copy.
-        if existing == SHIPPED.as_bytes()
-            || !EVER_SHIPPED_FNV64.contains(&fnv64(&existing).as_str())
-        {
+        if existing == SHIPPED.as_bytes() || !unedited_seed(&existing) {
             return SeededSkill {
+                consumer,
                 path,
                 outcome: Outcome::Kept,
             };
@@ -106,6 +112,7 @@ pub fn seed_into(agent_dir: &Path) -> SeededSkill {
     } else if path.exists() {
         // There but unreadable: not ours to replace.
         return SeededSkill {
+            consumer,
             path,
             outcome: Outcome::Kept,
         };
@@ -119,18 +126,35 @@ pub fn seed_into(agent_dir: &Path) -> SeededSkill {
         Ok(()) => Outcome::Written,
         Err(cause) => Outcome::Problem(cause),
     };
-    SeededSkill { path, outcome }
+    SeededSkill {
+        consumer,
+        path,
+        outcome,
+    }
 }
 
-/// Seed the skill for every agent CLI installed on this machine that
-/// reads skills from a folder. One entry today: Claude Code reads
-/// `~/.claude/skills/`. Codex, Agy and Cursor have no skill folder to
-/// write into, so they are taught by hand (the README says how).
+/// Seed canonical destinations only when their consumer homes exist.
 pub fn seed() -> Vec<SeededSkill> {
     let Some(home) = std::env::var_os("HOME") else {
         return Vec::new();
     };
-    vec![seed_into(&PathBuf::from(home).join(".claude"))]
+    let home = PathBuf::from(home);
+    let claude = crate::consumer::root(crate::hookset::CliKind::Claude, &home);
+    let codex_installed = crate::consumer::root(crate::hookset::CliKind::Codex, &home).is_dir();
+    let cursor_installed = crate::consumer::root(crate::hookset::CliKind::Cursor, &home).is_dir();
+    let (shared_consumer, shared_installed) = match (codex_installed, cursor_installed) {
+        (true, true) => ("Codex and Cursor", true),
+        (true, false) => ("Codex", true),
+        (false, true) => ("Cursor", true),
+        (false, false) => ("Codex and Cursor", false),
+    };
+    let shared = home.join(".agents");
+    let agy = crate::consumer::root(crate::hookset::CliKind::Agy, &home);
+    vec![
+        seed_into("Claude Code", claude.is_dir(), &claude),
+        seed_into(shared_consumer, shared_installed, &shared),
+        seed_into("Antigravity CLI", agy.is_dir(), &agy),
+    ]
 }
 
 /// The note `cyclops start --setup-only` prints for one seed attempt.
@@ -140,7 +164,8 @@ pub fn seed() -> Vec<SeededSkill> {
 pub fn note(seeded: &SeededSkill) -> Option<String> {
     match &seeded.outcome {
         Outcome::Written => Some(format!(
-            "installed the agent skill at {}",
+            "installed the {} skill at {}",
+            seeded.consumer,
             seeded.path.display()
         )),
         Outcome::Problem(cause) => Some(format!("skill: {cause}")),
@@ -207,14 +232,14 @@ mod tests {
         let agent_dir = root.join(".claude");
 
         // Not installed: nothing appears, not even the directory.
-        let absent = seed_into(&agent_dir);
+        let absent = seed_into("test agent", agent_dir.is_dir(), &agent_dir);
         assert_eq!(absent.outcome, Outcome::NoAgent);
         assert!(!agent_dir.exists(), "seeding invented the vendor dir");
         assert_eq!(note(&absent), None);
 
         // Installed: the skill lands and says so.
         std::fs::create_dir_all(&agent_dir).expect("create agent dir");
-        let first = seed_into(&agent_dir);
+        let first = seed_into("test agent", agent_dir.is_dir(), &agent_dir);
         assert_eq!(first.outcome, Outcome::Written);
         assert_eq!(
             std::fs::read_to_string(&first.path).expect("written"),
@@ -222,16 +247,16 @@ mod tests {
         );
         assert!(note(&first)
             .expect("a write speaks")
-            .contains("installed the agent skill"));
+            .contains("installed the test agent skill"));
 
         // Rerun: current file, no write, no note.
-        let second = seed_into(&agent_dir);
+        let second = seed_into("test agent", agent_dir.is_dir(), &agent_dir);
         assert_eq!(second.outcome, Outcome::Kept);
         assert_eq!(note(&second), None);
 
         // An operator edit outranks the shipped copy on every later run.
         std::fs::write(&first.path, "# my own notes\n").expect("edit");
-        let third = seed_into(&agent_dir);
+        let third = seed_into("test agent", agent_dir.is_dir(), &agent_dir);
         assert_eq!(third.outcome, Outcome::Kept);
         assert_eq!(
             std::fs::read_to_string(&first.path).unwrap(),

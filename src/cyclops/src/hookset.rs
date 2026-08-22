@@ -16,13 +16,14 @@
 //! which is why it needs no consent that install has not already had.
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::ValueEnum;
 use cyclops_proto::{DeliveryReceipt, DeliveryState};
+use cyclops_state::StateRoot;
 use serde_json::json;
 
 use crate::client::Client;
@@ -156,14 +157,9 @@ fn vendor_hook_file(kind: CliKind) -> Option<PathBuf> {
         // (finding F1): project-local .codex/hooks.json does not load until
         // the directory is trusted, and in a non-interactive run that
         // dialog can never be answered, so the hooks silently never fire.
-        CliKind::Codex => Some(
-            std::env::var_os("CODEX_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".codex"))
-                .join("hooks.json"),
-        ),
+        CliKind::Codex => Some(crate::consumer::root(kind, &home).join("hooks.json")),
         CliKind::Agy => Some(home.join(".agents").join("hooks.json")),
-        CliKind::Cursor => Some(home.join(".cursor").join("hooks.json")),
+        CliKind::Cursor => Some(crate::consumer::root(kind, &home).join("hooks.json")),
     }
 }
 
@@ -205,6 +201,89 @@ fn merge_into(dst: &mut serde_json::Value, src: &serde_json::Value) {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum WiringState {
+    OnLaunch,
+    Missing,
+    Current,
+    NeedsUpdate,
+    Invalid,
+    Unreadable,
+}
+
+impl WiringState {
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            WiringState::OnLaunch => "on_launch",
+            WiringState::Missing => "missing",
+            WiringState::Current => "current",
+            WiringState::NeedsUpdate => "needs_update",
+            WiringState::Invalid => "invalid",
+            WiringState::Unreadable => "unreadable",
+        }
+    }
+
+    pub(crate) fn ready(self) -> bool {
+        matches!(self, WiringState::OnLaunch | WiringState::Current)
+    }
+}
+
+pub(crate) struct WiringCheck {
+    pub path: Option<PathBuf>,
+    pub state: WiringState,
+}
+
+/// Inspect fixed wiring by applying the current merge in memory. Claude
+/// reports launch wiring because it has no fixed hook file.
+pub(crate) fn inspect_wiring(kind: CliKind) -> WiringCheck {
+    let Some(path) = vendor_hook_file(kind) else {
+        return WiringCheck {
+            path: None,
+            state: WiringState::OnLaunch,
+        };
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return WiringCheck {
+                path: Some(path),
+                state: WiringState::Missing,
+            };
+        }
+        Err(_) => {
+            return WiringCheck {
+                path: Some(path),
+                state: WiringState::Unreadable,
+            };
+        }
+    };
+    let mut document: serde_json::Value = if text.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        match serde_json::from_str(&text) {
+            Ok(document) => document,
+            Err(_) => {
+                return WiringCheck {
+                    path: Some(path),
+                    state: WiringState::Invalid,
+                };
+            }
+        }
+    };
+    let before = document.clone();
+    let expected = serde_json::from_str(&render_shared(kind, &cyclops_bin()))
+        .expect("shipped hook template is valid JSON");
+    merge_into(&mut document, &expected);
+    WiringCheck {
+        path: Some(path),
+        state: if document == before {
+            WiringState::Current
+        } else {
+            WiringState::NeedsUpdate
+        },
+    }
+}
+
 /// What one vendor's wiring did, for the line `cyclops start` prints.
 pub struct WiredVendor {
     pub vendor: &'static str,
@@ -230,11 +309,19 @@ pub fn wire_vendor(kind: CliKind) -> Result<Option<WiredVendor>, String> {
     let Some(path) = vendor_hook_file(kind) else {
         return Ok(None);
     };
-    // The vendor's own directory existing is the test for "installed".
-    // Creating it would be this project deciding another tool is present.
     let dir = path.parent().ok_or("hook path has no parent")?;
-    if !dir.is_dir() {
+    // AGY's generic .agents hook directory may belong to another consumer.
+    // Its own CLI home is the install gate.
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .expect("vendor hook path requires HOME");
+    let installed_root = crate::consumer::root(kind, &home);
+    if !installed_root.is_dir() {
         return Ok(None);
+    }
+    if !dir.is_dir() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("can't create hook directory {}: {e}", dir.display()))?;
     }
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let mut doc: serde_json::Value = if existing.trim().is_empty() {
@@ -419,9 +506,21 @@ impl Receipt {
     /// None when there is no receipt, it is unreadable, or it is missing a
     /// field. Every one of those means the artifact beside it is not
     /// provably Cyclops', which is the same answer.
+    #[cfg(test)]
     fn read(dir: &Path) -> Option<Receipt> {
-        let text = fs::read_to_string(Self::path(dir)).ok()?;
-        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+        Self::parse(&fs::read(Self::path(dir)).ok()?)
+    }
+
+    fn read_owned(root: &StateRoot, dir: &Path) -> Result<Option<Receipt>, String> {
+        let path = dir.join(RECEIPT_NAME);
+        let Some(bytes) = read_owned(root, &path)? else {
+            return Ok(None);
+        };
+        Ok(Self::parse(&bytes))
+    }
+
+    fn parse(bytes: &[u8]) -> Option<Receipt> {
+        let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
         let field = |key: &str| value[key].as_str().map(String::from);
         Some(Receipt {
             vendor: field("vendor")?,
@@ -436,6 +535,16 @@ impl Receipt {
     /// leaves an artifact with no receipt, which refresh skips; the other
     /// order would leave a receipt vouching for bytes nobody wrote.
     fn write(&self, dir: &Path) -> io::Result<()> {
+        write_atomic(&Self::path(dir), &self.body())
+    }
+
+    fn write_owned(&self, root: &StateRoot, dir: &Path) -> Result<(), String> {
+        let path = dir.join(RECEIPT_NAME);
+        root.replace_file(&path, self.body().as_bytes())
+            .map_err(|e| format!("can't write {}: {e}", root.path().join(path).display()))
+    }
+
+    fn body(&self) -> String {
         let body = json!({
             "vendor": self.vendor,
             "agent": self.agent,
@@ -445,8 +554,22 @@ impl Receipt {
             "written_ms": now_ms(),
             "version": crate::VERSION,
         });
-        write_atomic(&Self::path(dir), &format!("{body}\n"))
+        format!("{body}\n")
     }
+}
+
+fn read_owned(root: &StateRoot, descendant: &Path) -> Result<Option<Vec<u8>>, String> {
+    let path = root.path().join(descendant);
+    let Some(mut file) = root
+        .open_read(descendant)
+        .map_err(|e| format!("can't read {}: {e}", path.display()))?
+    else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| format!("can't read {}: {e}", path.display()))?;
+    Ok(Some(bytes))
 }
 
 /// True when `dest` points inside a vendor CLI's own config tree.
@@ -502,9 +625,10 @@ pub fn run_install(
         );
         return EXIT_USAGE;
     }
+    let home = cyclops_proto::cyclops_home();
     let dest_dir = dest
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| hooks_root().join(kind.name()).join(label));
+        .unwrap_or_else(|| hooks_root_in(&home).join(kind.name()).join(label));
     if inside_vendor_dir(&dest_dir) {
         eprintln!(
             "{} is a vendor config directory; cyclops prepares files and prints \
@@ -540,7 +664,7 @@ pub fn run_install(
         }
         return 0;
     }
-    let receipt_problem = match write_artifact(&dest_dir, kind, label, &bin, &content) {
+    let receipt_problem = match write_artifact(&home, &dest_dir, kind, label, &bin, &content) {
         Ok(problem) => problem,
         Err(e) => {
             eprintln!("{e}");
@@ -585,12 +709,34 @@ pub fn run_install(
 /// after the wrong thing. Callers decide whether that note is worth a
 /// sentence.
 fn write_artifact(
+    home: &Path,
     dest_dir: &Path,
     kind: CliKind,
     label: &str,
     bin: &str,
     content: &str,
 ) -> Result<Option<String>, String> {
+    if let Ok(descendant_dir) = dest_dir.strip_prefix(home) {
+        let root = StateRoot::open_or_create(home)
+            .map_err(|e| format!("can't open {}: {e}", home.display()))?;
+        let artifact = descendant_dir.join(kind.file_name());
+        root.replace_file(&artifact, content.as_bytes())
+            .map_err(|e| {
+                format!(
+                    "can't write {}: {e}",
+                    dest_dir.join(kind.file_name()).display()
+                )
+            })?;
+        let receipt = Receipt {
+            vendor: kind.name().to_string(),
+            agent: label.to_string(),
+            file: kind.file_name().to_string(),
+            bin: bin.to_string(),
+            rendered_fnv: fnv64(content.as_bytes()),
+        };
+        return Ok(receipt.write_owned(&root, descendant_dir).err());
+    }
+
     std::fs::create_dir_all(dest_dir)
         .map_err(|e| format!("can't create {}: {e}", dest_dir.display()))?;
     let path = dest_dir.join(kind.file_name());
@@ -619,7 +765,7 @@ pub fn prepare(home: &Path, kind: CliKind, label: &str) -> Result<PathBuf, Strin
     let dest_dir = hooks_root_in(home).join(kind.name()).join(label);
     let bin = cyclops_bin();
     let content = render(kind, label, &bin);
-    write_artifact(&dest_dir, kind, label, &bin, &content)?;
+    write_artifact(home, &dest_dir, kind, label, &bin, &content)?;
     Ok(dest_dir.join(kind.file_name()))
 }
 
@@ -676,6 +822,15 @@ pub fn refresh(home: &Path) -> Refreshed {
         root: home.join("hooks"),
         ..Refreshed::default()
     };
+    let root = match StateRoot::open_existing(home) {
+        Ok(Some(root)) => root,
+        Ok(None) => return out,
+        Err(e) => {
+            out.problems
+                .push(format!("refresh {}: {e}", out.root.display()));
+            return out;
+        }
+    };
     let bin = cyclops_bin();
     for vendor_dir in sorted_dirs(&out.root) {
         let Some(kind) = vendor_dir
@@ -695,7 +850,16 @@ pub fn refresh(home: &Path) -> Refreshed {
             if cyclops_proto::label::refusal(label).is_some() {
                 continue;
             }
-            refresh_one(kind, label, &label_dir, &bin, &mut out);
+            let descendant_dir = Path::new("hooks").join(kind.name()).join(label);
+            refresh_one(
+                &root,
+                kind,
+                label,
+                &descendant_dir,
+                &label_dir,
+                &bin,
+                &mut out,
+            );
         }
     }
     if let Some(old) = out.moved_from.clone() {
@@ -706,16 +870,38 @@ pub fn refresh(home: &Path) -> Refreshed {
 
 /// One (vendor, label) directory, classified into exactly one of the four
 /// outcomes and acted on.
-fn refresh_one(kind: CliKind, label: &str, dir: &Path, bin: &str, out: &mut Refreshed) {
+fn refresh_one(
+    root: &StateRoot,
+    kind: CliKind,
+    label: &str,
+    descendant_dir: &Path,
+    dir: &Path,
+    bin: &str,
+    out: &mut Refreshed,
+) {
+    let artifact_descendant = descendant_dir.join(kind.file_name());
     let artifact = dir.join(kind.file_name());
     // A receipt with no artifact beside it is the crash between the two
     // writes. There is nothing on disk to refresh.
-    let Ok(bytes) = fs::read(&artifact) else {
-        return;
+    let bytes = match read_owned(root, &artifact_descendant) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return,
+        Err(e) => {
+            out.problems.push(e);
+            return;
+        }
     };
     // A receipt describing some other file is not proof about this one.
-    let receipt = match Receipt::read(dir) {
-        Some(r) if r.vendor == kind.name() && r.agent == label && r.file == kind.file_name() => r,
+    let receipt = match Receipt::read_owned(root, descendant_dir) {
+        Ok(Some(r))
+            if r.vendor == kind.name() && r.agent == label && r.file == kind.file_name() =>
+        {
+            r
+        }
+        Err(e) => {
+            out.problems.push(e);
+            return;
+        }
         _ => {
             out.unmanaged.push(artifact);
             return;
@@ -738,7 +924,7 @@ fn refresh_one(kind: CliKind, label: &str, dir: &Path, bin: &str, out: &mut Refr
         out.other_build.push((artifact, receipt.bin));
         return;
     }
-    if let Err(e) = write_atomic(&artifact, &rendered) {
+    if let Err(e) = root.replace_file(&artifact_descendant, rendered.as_bytes()) {
         out.problems
             .push(format!("refresh {}: {e}", artifact.display()));
         return;
@@ -753,7 +939,7 @@ fn refresh_one(kind: CliKind, label: &str, dir: &Path, bin: &str, out: &mut Refr
         bin: bin.to_string(),
         rendered_fnv: fnv64(rendered.as_bytes()),
     };
-    if let Err(e) = next.write(dir) {
+    if let Err(e) = next.write_owned(root, descendant_dir) {
         out.problems
             .push(format!("receipt {}: {e}", Receipt::path(dir).display()));
     }
@@ -1021,6 +1207,8 @@ pub fn run_selftest(c: &mut Client, json: bool, style: &Style, target: &str) -> 
             &DeliveryReceipt {
                 to: target.to_string(),
                 state: s,
+                notification_state: None,
+                quota_state: None,
                 position: None,
                 note: None,
                 pane: None,
@@ -1306,6 +1494,64 @@ mod tests {
         }
         assert!(!inside_vendor_dir(Path::new("/Users/x/.cyclops/hooks/rev")));
         assert!(!inside_vendor_dir(Path::new("/work/agents/hooks")));
+    }
+
+    #[test]
+    fn a_linked_owned_hooks_directory_is_refused_without_touching_its_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let home = cyclops_proto::scratch::scratch_dir("hook-link-home");
+        let external = cyclops_proto::scratch::scratch_dir("hook-link-external");
+        for path in [&home, &external] {
+            let _ = fs::remove_dir_all(path);
+            fs::create_dir_all(path).unwrap();
+        }
+        let label_dir = external.join("codex").join(GOLDEN_LABEL);
+        fs::create_dir_all(&label_dir).unwrap();
+        let target = label_dir.join("hooks.json");
+        fs::write(&target, b"external\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&external, home.join("hooks")).unwrap();
+
+        let error = prepare(&home, CliKind::Codex, GOLDEN_LABEL).unwrap_err();
+
+        assert!(
+            error.contains("linked or non-directory component"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"external\n");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&external);
+    }
+
+    #[test]
+    fn prepared_owned_hooks_and_receipts_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = cyclops_proto::scratch::scratch_dir("hook-owned-modes");
+        let _ = fs::remove_dir_all(&home);
+        let artifact = prepare(&home, CliKind::Codex, GOLDEN_LABEL).unwrap();
+        let receipt = Receipt::path(artifact.parent().unwrap());
+
+        for path in [&artifact, &receipt] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(
+            fs::metadata(artifact.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let _ = fs::remove_dir_all(&home);
     }
 
     /// A home with one prepared codex artifact, rendered for `bin` and

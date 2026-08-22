@@ -42,7 +42,14 @@ impl Term {
         // coordinates are not capped at 223, and the one every terminal
         // this decade speaks). A terminal that knows neither ignores both
         // and the UI is keyboard-only, exactly as before.
-        print!("\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1000;1006h");
+        //
+        // 2004 is bracketed paste: the terminal wraps pasted bytes in
+        // ESC[200~ and ESC[201~ so they can be told apart from typing.
+        // Without it a pasted newline sends a half-written reply and the
+        // rest of the paste is read as commands. A terminal that does not
+        // know 2004 ignores it, and the reply composer stays single-line
+        // safe because Enter no longer sends on its own.
+        print!("\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1000;1006h\x1b[?2004h");
         let _ = std::io::stdout().flush();
         Ok(Term { orig })
     }
@@ -87,7 +94,7 @@ impl Drop for Term {
         // way this UI could outlive itself. Then leave the alternate
         // screen, restore wrap and cursor, then the saved termios. Errors
         // are moot: the process is on its way out.
-        print!("\x1b[?1000;1006l\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l");
+        print!("\x1b[?2004l\x1b[?1000;1006l\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l");
         let _ = std::io::stdout().flush();
         unsafe {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.orig);

@@ -4,7 +4,7 @@
 
 use cyclops_ui::{build, App, Command, Entry, EntryKind, Filter, Key, RowTarget, View};
 
-use cyclops_proto::AgentState;
+use cyclops_proto::{AgentState, Event, PaneStatus, SessionStatus, StatusResult};
 use cyclops_ui::{RosterSeed, StatusSeed, Theme};
 
 const WIDE: usize = 120;
@@ -17,8 +17,10 @@ fn seeded_app() -> App {
         watched: vec!["main".into()],
         panes: Vec::new(),
         open: Vec::new(),
+        admin_unread: 0,
         roster: vec![
             RosterSeed {
+                session_idx: 0,
                 pane_id: "%0".into(),
                 name: "implementer".into(),
                 state: AgentState::Working,
@@ -26,6 +28,7 @@ fn seeded_app() -> App {
                 state_ms: Some(5_000),
             },
             RosterSeed {
+                session_idx: 0,
                 pane_id: "%1".into(),
                 name: "reviewer".into(),
                 state: AgentState::Idle,
@@ -45,6 +48,7 @@ fn state_event(uid_ts: u64, name: &str, pane: &str, state: AgentState) -> Entry 
         id: Some("e-t".into()),
         kind: EntryKind::State {
             target: name.into(),
+            session_idx: 0,
             pane_id: Some(pane.into()),
             state,
         },
@@ -166,12 +170,148 @@ fn a_gone_pane_leaves_the_panel() {
         seq: None,
         id: None,
         kind: EntryKind::PaneGone {
+            session_idx: 0,
             pane_id: "%0".into(),
+            physical_gone: true,
         },
     });
     assert_eq!(app.roster_len(), 1);
     let rows = build(&mut app, WIDE, H);
     assert!(!rows.join("\n").contains("implementer"));
+}
+
+/// A transfer is reported by two independently scheduled session watchers.
+/// The destination state can arrive before the source removal, and that late
+/// source edge must not erase the pane at its new route.
+#[test]
+fn a_late_source_removal_keeps_the_transferred_pane_focusable() {
+    let pane = PaneStatus {
+        pane_id: "%1".into(),
+        window_id: "@1".into(),
+        window_name: "source-window".into(),
+        agent: Some("reviewer".into()),
+        manifest: Some("claude".into()),
+        title: String::new(),
+        current_command: "claude".into(),
+        dead: false,
+        in_mode: false,
+        write_ready: false,
+        write_block: None,
+        width: 120,
+        height: 40,
+        state: AgentState::Idle,
+        state_ms: Some(5_000),
+        hooks_verified: None,
+        manifest_display_name: None,
+    };
+    let status = StatusResult {
+        daemon_version: "0.1.0".into(),
+        proto: 1,
+        boot_id: "boot".into(),
+        uptime_ms: 1_000,
+        tmux_version: "3.6a".into(),
+        sessions: vec![
+            SessionStatus {
+                name: "source".into(),
+                attached: true,
+                panes: vec![pane],
+            },
+            SessionStatus {
+                name: "destination".into(),
+                attached: true,
+                panes: Vec::new(),
+            },
+        ],
+        admin_unread: 0,
+        open_deliveries: Vec::new(),
+        diagnostics: Vec::new(),
+        manifests: None,
+        pid: None,
+    };
+    let mut app = App::new(Theme::none(), View::Firehose, Filter::default());
+    app.seed_status(StatusSeed::from_status(&status));
+
+    app.live(Entry::from_event(
+        &Event {
+            event: "state".into(),
+            data: serde_json::json!({
+                "target": "reviewer",
+                "pane_id": "%1",
+                "session_idx": 1,
+                "state": "blocked_permission",
+            }),
+            seq: None,
+        },
+        2,
+    ));
+    app.live(Entry::from_event(
+        &Event {
+            event: "pane-removed".into(),
+            data: serde_json::json!({
+                "session": "source",
+                "session_idx": 0,
+                "pane_id": "%1",
+                "physical_gone": false,
+            }),
+            seq: None,
+        },
+        3,
+    ));
+
+    assert_eq!(app.roster_len(), 1);
+    let row = app
+        .roster()
+        .find(|row| row.pane_id == "%1")
+        .expect("the destination route remains in the roster");
+    assert_eq!(row.state, AgentState::BlockedPermission);
+    assert_eq!(row.session_idx, 1);
+    assert_eq!(app.attention_count(), 1);
+
+    let state_uid = app
+        .entries()
+        .find(|entry| {
+            matches!(
+                &entry.kind,
+                EntryKind::State {
+                    target,
+                    session_idx: 1,
+                    pane_id: Some(pane_id),
+                    ..
+                } if target == "reviewer" && pane_id == "%1"
+            )
+        })
+        .expect("the destination state remains in the stream")
+        .uid;
+    app.selected = Some(state_uid);
+    app.pinned = false;
+    assert_eq!(
+        app.handle_key(Key::Enter),
+        Some(Command::Focus("%1".into()))
+    );
+
+    app.live(Entry {
+        uid: 0,
+        ts: 4,
+        seq: None,
+        id: Some("m-route".into()),
+        kind: EntryKind::Msg {
+            from: "reviewer".into(),
+            to: vec!["admin".into()],
+            subject: "route check".into(),
+            body: None,
+            fyi: false,
+        },
+    });
+    let message_uid = app
+        .entries()
+        .find(|entry| entry.id.as_deref() == Some("m-route"))
+        .expect("the label-targeted entry is in the stream")
+        .uid;
+    app.selected = Some(message_uid);
+    assert_eq!(
+        app.handle_key(Key::Enter),
+        Some(Command::Focus("%1".into()))
+    );
 }
 
 /// The uncolored dashboard carries everything the colored one does: the

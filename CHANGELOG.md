@@ -7,6 +7,10 @@ versions are unreleased until admin cuts a tag.
 
 ### Changed
 
+- `cyclops send` no longer advertises the nonfunctional `--wait` option.
+  Durable message acceptance and occupant-pinned pane waiting remain
+  separate contracts because a pane state edge cannot prove that a
+  specific message or task completed.
 - The from-source install builds faster. The installer now compiles only
   the two installed binaries, under a new `dist` cargo profile: release
   optimizations without the thin-LTO link step, whose runtime margin an
@@ -17,10 +21,21 @@ versions are unreleased until admin cuts a tag.
 
 ### Fixed
 
+- Mailbox doorbells now fit the validated 60-column terminal lane. The former
+  129-character row could be application-wrapped by Claude at 125 columns,
+  which correctly made exact staging verification refuse the submit key. The
+  new format is the exact 54-character `cyclops inbox claim <id>` command for a
+  generated message id. Its numeric format is recorded at the write boundary,
+  legacy rows remain recoverable, and unknown future formats fail closed.
+  Claude's measured status truncation at 60, 80, 100, and 125 columns is
+  recognized without weakening the required prompt, styling, or trailer checks.
+- Codex working-state detection now uses the measured ten-frame active pane
+  title when queued terminal input displaces the screen spinner. Static titles
+  keep using the existing narrow screen rule.
 - Installing cyclops before the agent CLIs no longer strands the vendor
   wiring. The installer's `--wire-hooks` consent lived only in its one
   run: with no `~/.claude` yet, the hook configs and the agent skill
-  were rightly skipped, and nothing ever came back for them — only the
+  were rightly skipped, and nothing ever came back for them. Only the
   installer and `cyclops update` pass the flag. Setup now records the
   consent at `~/.cyclops/vendor-wiring-consented`, and every ordinary
   boot (`cyclops`, `cyclops start`) finishes the wiring for agent CLIs
@@ -41,8 +56,8 @@ versions are unreleased until admin cuts a tag.
 - The installer installs Rust itself. Cyclops builds from source, and
   the old behavior on a machine without `cargo` was a refusal with the
   rustup command to run by hand. The installer now runs that same rustup
-  step on its own — non-interactive, shell profiles untouched, cargo on
-  PATH for the run — and continues into the build. `CYCLOPS_NO_RUSTUP=1`
+  step on its own, non-interactively, with shell profiles untouched and cargo
+  on PATH for the run, then continues into the build. `CYCLOPS_NO_RUSTUP=1`
   declines and restores the refusal.
 - The agent skill installs itself. `skills/cyclops/SKILL.md` taught an
   agent the cyclops verbs but lived only in the repo, so "use the cyclops
@@ -77,7 +92,7 @@ versions are unreleased until admin cuts a tag.
 ### Fixed (v7)
 
 - A remote tmux inside a pane crashed the workspace. The pane's bytes
-  were never the problem — the churned geometry was: the VT engine
+  were never the problem. The churned geometry was: the VT engine
   documents a 2x1 floor and does not enforce it, and a zero-sized grid
   panics on the next cell write or resize (F56). `PaneRuntime` now clamps
   every path that sizes the engine, a stale tab index from a closing
@@ -102,7 +117,7 @@ versions are unreleased until admin cuts a tag.
   seeds its scrollback from tmux's own history (skipped for panes with no
   history and for alternate-screen panes, where the capture would seed a
   visible row twice), and the first reconcile after a control-mode
-  reconnect — that one, not every reconcile — rehydrates without the size
+  reconnect, and only that reconcile, rehydrates without the size
   gate that let same-sized panes stay stale across an outage.
 - The agent title painted over the pane's collapse control, leaving a
   dead `[`. The title now starts after the control, and the click region

@@ -23,7 +23,10 @@
 //! and same reason as [`crate::themeseed`].
 
 use std::collections::BTreeMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+
+use cyclops_state::{CreateFileOutcome, StateRoot};
 
 use crate::hash::fnv64;
 
@@ -67,16 +70,26 @@ pub fn dir(home: &Path) -> PathBuf {
 /// already found. That is the maintainer's own machines, and every install
 /// that predates the key.
 ///
-/// Regenerate when a shipped manifest changes: hash every historical blob
-/// of resources/manifests/ (and the old manifests/ path) across all refs.
-/// The test below fails until the current bodies are listed, and prints the
-/// hash to append.
+/// Regenerate when a shipped manifest changes: hash the historical blobs
+/// of resources/manifests/ (and the old manifests/ path) on released
+/// refs, plus the current bodies. The test below fails until the current
+/// bodies are listed, and prints the hash to append.
+///
+/// Two things stay out. Bodies from an unreleased branch: nobody was ever
+/// seeded with those, so listing one only claims replacement authority
+/// over bytes that could just as well be an operator's own. And hashes
+/// from any other seeded file: this list answers "did the operator edit
+/// this manifest", and a skill body's hash landing here would make an
+/// edited manifest look untouched.
 const EVER_SHIPPED_FNV64: &[&str] = &[
     "000da241c916d3cb",
     "0e7c902fb67d702a",
     "12765e334728f40b",
+    "21a94a206aefa357",
     "2893de300e4fc944",
+    "2a8c5b29dff89435",
     "3292eae226f54f79",
+    "3e966f9f7049d206",
     "3ec9936975418c27",
     "3ee05959c01113a7",
     "3f2860fa1275d798",
@@ -84,21 +97,39 @@ const EVER_SHIPPED_FNV64: &[&str] = &[
     "4af4029b9d2910e3",
     "57c2bf8d8b894ce0",
     "5fb9fab4521686ad",
+    "645013f86f1bcb41",
+    "6680bd20b0f93e56",
     "6a4f11941f4c78be",
+    "75f3c5daed1304f1",
     "7a9754b750109c5e",
     "821ec0a1af0f8cc1",
+    "84b0dfa8ce699bb0",
     "85f276e9afffc42d",
+    "884a6e869dbdea99",
+    "970aabc764b3acd4",
+    "97778c580f34b125",
     "98ae3fa4eca78cf3",
     "9a67be48357ff9e0",
     "bc4bc371b40e71ca",
     "c60d4aff7fe2a5d2",
+    "c86ba6c35e662ee6",
+    "cd2508367907b954",
+    "dcf8e732f46b397c",
     "f6c7c7aaa830babb",
 ];
 
 /// True when these bytes are a manifest this project wrote, so replacing
 /// them loses nothing the operator put there.
-fn unedited_seed(body: &[u8]) -> bool {
+pub(crate) fn unedited_seed(body: &[u8]) -> bool {
     EVER_SHIPPED_FNV64.contains(&fnv64(body).as_str())
+}
+
+pub(crate) fn shipped_body(id: &str) -> Option<&'static str> {
+    let name = format!("{id}.toml");
+    SHIPPED
+        .iter()
+        .find(|(shipped_name, _)| *shipped_name == name)
+        .map(|(_, body)| *body)
 }
 
 /// What one [`seed`] run did.
@@ -140,26 +171,52 @@ pub fn seed(home: &Path) -> Seeded {
         kept: Vec::new(),
         problems: Vec::new(),
     };
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        out.problems.push(format!("create {}: {e}", dir.display()));
-        return out;
-    }
+    let root = match StateRoot::open_or_create(home) {
+        Ok(root) => root,
+        Err(e) => {
+            out.problems.push(format!("create {}: {e}", dir.display()));
+            return out;
+        }
+    };
     for (name, body) in SHIPPED {
         let path = dir.join(name);
-        if let Ok(existing) = std::fs::read(&path) {
-            // Already current needs no write, and anything the operator
-            // typed outranks the shipped guess.
+        let descendant = Path::new("manifests").join(name);
+        let existing = match root.open_read(&descendant) {
+            Ok(Some(mut file)) => {
+                let mut bytes = Vec::new();
+                if let Err(e) = file.read_to_end(&mut bytes) {
+                    out.problems.push(format!("read {}: {e}", path.display()));
+                    continue;
+                }
+                Some(bytes)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                out.problems.push(format!("read {}: {e}", path.display()));
+                continue;
+            }
+        };
+        if let Some(existing) = existing {
             if existing == body.as_bytes() || !unedited_seed(&existing) {
                 out.kept.push((*name).to_string());
                 continue;
             }
-        } else if path.exists() {
-            // There but unreadable: not ours to replace.
-            out.kept.push((*name).to_string());
+            match root.replace_file(&descendant, body.as_bytes()) {
+                Ok(()) => out.written.push((*name).to_string()),
+                Err(e) => out.problems.push(format!("write {}: {e}", path.display())),
+            }
             continue;
         }
-        match std::fs::write(&path, body) {
-            Ok(()) => out.written.push((*name).to_string()),
+        match root.create_file_once(&descendant, body.as_bytes()) {
+            Ok(CreateFileOutcome::Created) => out.written.push((*name).to_string()),
+            Ok(CreateFileOutcome::AlreadyExists) => match root.open_read(&descendant) {
+                Ok(Some(_)) => out.kept.push((*name).to_string()),
+                Ok(None) => out.problems.push(format!(
+                    "write {}: file disappeared after concurrent creation",
+                    path.display()
+                )),
+                Err(e) => out.problems.push(format!("read {}: {e}", path.display())),
+            },
             Err(e) => out.problems.push(format!("write {}: {e}", path.display())),
         }
     }
@@ -302,6 +359,7 @@ pub fn partly_installed(seeded: &Seeded) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt as _};
 
     /// The body the binary carries under `name`.
     fn shipped(name: &str) -> &'static str {
@@ -368,6 +426,18 @@ mod tests {
         assert_eq!(first.written.len(), SHIPPED.len(), "{:?}", first.problems);
         assert!(first.kept.is_empty());
         assert!(!first.none_installed());
+        assert_eq!(
+            std::fs::metadata(dir(&home)).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(dir(&home).join("claude.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
 
         // An edit, and a manifest of the reader's own.
         let edited = dir(&home).join("claude.toml");
@@ -656,5 +726,31 @@ mod tests {
         assert!(words.contains("cyclops start again"), "{words}");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_linked_manifest_directory_is_refused_without_touching_its_target() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-manifest-link-home");
+        let external = cyclops_proto::scratch::scratch_dir("cyc-manifest-link-external");
+        for path in [&home, &external] {
+            let _ = std::fs::remove_dir_all(path);
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let target = external.join("claude.toml");
+        std::fs::write(&target, b"external\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&external, dir(&home)).unwrap();
+
+        let seeded = seed(&home);
+
+        assert!(seeded.written.is_empty());
+        assert!(!seeded.problems.is_empty());
+        assert_eq!(std::fs::read(&target).unwrap(), b"external\n");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&external);
     }
 }

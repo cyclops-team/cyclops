@@ -22,7 +22,10 @@
 //! pins that), and the CLI's `pad`/`pad_left` measure through it too, so
 //! the two surfaces cannot disagree about how wide a badge is.
 
-use cyclops_proto::{AgentState, AttentionItem, Clearance, DeliveryReceipt, DeliveryState};
+use cyclops_proto::{
+    AgentState, AttentionItem, Clearance, DeliveryReceipt, DeliveryState, MessageNotificationState,
+    MessageQuotaState,
+};
 
 /// The caller's color, for the cells this module composes.
 ///
@@ -89,6 +92,44 @@ fn char_width(c: char) -> usize {
         | '\u{1f300}'..='\u{1faff}' => 2,
         _ => 1,
     }
+}
+
+/// Make one untrusted string safe to put in a frame.
+///
+/// Message bodies, subjects, labels and pane extracts are written by
+/// other agents and by people. They reach this crate as opaque text and
+/// are drawn straight into a terminal, so an unfiltered one can do
+/// whatever a terminal does: `ESC[2J` clears the screen, OSC 52 writes
+/// the reader's clipboard, a carriage return puts the rest of a body over
+/// the top of the row it was on. `char_width` scores every control byte
+/// as one column, so the frame's own width arithmetic agrees with the
+/// attack rather than catching it.
+///
+/// Applied where untrusted text ENTERS the UI, never to a composed frame:
+/// the renderer's own escapes are added after this and must survive.
+///
+/// - Newline is kept. It is the one control with a meaning here, and both
+///   `wrap` and the draft renderer split on it.
+/// - Tab becomes four spaces, so a width is a width.
+/// - Carriage return is dropped rather than shown; it carries no
+///   information a reader wants and pairs with newline constantly.
+/// - Every other C0, DEL, and every C1 becomes a visible dot. C1 matters
+///   because 0x9b is a one-byte CSI on a terminal in 8-bit mode.
+/// - Everything else, including every non-Latin script and emoji, is
+///   left exactly as it was.
+pub fn safe_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' => out.push('\n'),
+            '\t' => out.push_str("    "),
+            '\r' => {}
+            c if (c as u32) < 0x20 || c == '\u{7f}' => out.push('·'),
+            c if ('\u{80}'..='\u{9f}').contains(&c) => out.push('·'),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 pub fn display_width(s: &str) -> usize {
@@ -178,6 +219,10 @@ pub fn cause_words_for(cause: &str, pane: Option<&str>) -> String {
 /// group color and the qualifier dim. That holds only because a badge
 /// never puts an unpainted word AFTER a dim run.
 pub fn receipt_badge(r: &DeliveryReceipt, paint: &dyn Paint) -> String {
+    if let Some(notification) = r.notification_state {
+        return mailbox_receipt_badge(r, notification, paint);
+    }
+
     let sep = paint.dim("·");
     let with = |head: &str, tail: &str| format!("{head} {sep} {}", paint.dim(tail));
     let words = match r.state {
@@ -214,6 +259,37 @@ pub fn receipt_badge(r: &DeliveryReceipt, paint: &dyn Paint) -> String {
     paint.badge(r.state, &words)
 }
 
+/// A mailbox receipt reports durable acceptance and wake state separately.
+/// The legacy delivery state is only a compatibility field on this path.
+fn mailbox_receipt_badge(
+    receipt: &DeliveryReceipt,
+    notification: MessageNotificationState,
+    paint: &dyn Paint,
+) -> String {
+    let sep = paint.dim("·");
+    let mut words = "✓ accepted".to_string();
+    if let Some(ahead) = receipt.position.filter(|ahead| *ahead > 0) {
+        words.push_str(&format!(" {sep} {ahead} ahead"));
+    }
+    let wake = match receipt.quota_state {
+        Some(MessageQuotaState::Held) => "quota held",
+        Some(MessageQuotaState::ResetObserved) => "quota reset observed",
+        None => match notification {
+            MessageNotificationState::NotStarted => "not started",
+            MessageNotificationState::Queued => "queued",
+            MessageNotificationState::Gating => "checking readiness",
+            MessageNotificationState::Writing => "writing",
+            MessageNotificationState::Staged => "staged",
+            MessageNotificationState::Submitted => "submitted",
+            MessageNotificationState::Notified => "notified",
+            MessageNotificationState::AttentionRequired => "needs attention",
+            MessageNotificationState::Superseded => "superseded",
+        },
+    };
+    words.push_str(&format!(" {sep} wake {wake}"));
+    paint.badge(receipt.state, &words)
+}
+
 /// Human wording for the stable `DeliveryReceipt::held_by` tokens. Unknown
 /// tokens degrade safely instead of exposing a vendor rule id.
 fn held_words(token: &str) -> &'static str {
@@ -245,6 +321,8 @@ pub fn delivery_badge(
         &DeliveryReceipt {
             to: to.to_string(),
             state,
+            notification_state: None,
+            quota_state: None,
             position: None,
             note,
             held_by: None,
@@ -295,6 +373,8 @@ mod tests {
         DeliveryReceipt {
             to: "reviewer".into(),
             state,
+            notification_state: None,
+            quota_state: None,
             position,
             note: note.map(String::from),
             pane: None,
@@ -352,6 +432,54 @@ mod tests {
             r.held_by = Some(token.into());
             assert_eq!(receipt_badge(&r, &Plain), want);
         }
+    }
+
+    #[test]
+    fn a_mailbox_receipt_keeps_acceptance_and_wake_state_separate() {
+        use MessageNotificationState::*;
+        let cases = [
+            (NotStarted, "not started"),
+            (Queued, "queued"),
+            (Gating, "checking readiness"),
+            (Writing, "writing"),
+            (Staged, "staged"),
+            (Submitted, "submitted"),
+            (Notified, "notified"),
+            (AttentionRequired, "needs attention"),
+            (Superseded, "superseded"),
+        ];
+        for (state, word) in cases {
+            let mut r = receipt(DeliveryState::Queued, Some(2), None);
+            r.notification_state = Some(state);
+            assert_eq!(
+                receipt_badge(&r, &Plain),
+                format!("✓ accepted · 2 ahead · wake {word}")
+            );
+        }
+
+        for (quota, word) in [
+            (MessageQuotaState::Held, "quota held"),
+            (MessageQuotaState::ResetObserved, "quota reset observed"),
+        ] {
+            let mut r = receipt(DeliveryState::Queued, Some(2), None);
+            r.notification_state = Some(AttentionRequired);
+            r.quota_state = Some(quota);
+            assert_eq!(
+                receipt_badge(&r, &Plain),
+                format!("✓ accepted · 2 ahead · wake {word}")
+            );
+        }
+
+        let mut admin = receipt(DeliveryState::Queued, None, None);
+        admin.notification_state = Some(NotStarted);
+        assert_eq!(
+            receipt_badge(&admin, &Plain),
+            "✓ accepted · wake not started"
+        );
+
+        let mut oldest = receipt(DeliveryState::Queued, Some(0), None);
+        oldest.notification_state = Some(Queued);
+        assert_eq!(receipt_badge(&oldest, &Plain), "✓ accepted · wake queued");
     }
 
     #[test]

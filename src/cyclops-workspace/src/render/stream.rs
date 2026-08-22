@@ -201,6 +201,7 @@ mod tests {
             id: None,
             kind: EntryKind::State {
                 target: target.into(),
+                session_idx: 0,
                 pane_id: Some(pane_id.into()),
                 state,
             },

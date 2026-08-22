@@ -25,6 +25,8 @@ pub enum ClientError {
     NotRunning,
     /// Connect did not finish inside the carried budget.
     ConnectTimeout(Duration),
+    /// A bounded socket read reached its caller-supplied deadline.
+    ReadTimeout(Duration),
     /// The daemon answered a request with a wire error.
     Server {
         code: String,
@@ -200,7 +202,14 @@ impl Client {
                         return Ok(t.to_string());
                     }
                 }
-                Err(e) => return Err(ClientError::Broken(read_cause(&e, self.read_timeout))),
+                Err(e) => {
+                    return Err(match (e.kind(), self.read_timeout) {
+                        (ErrorKind::WouldBlock | ErrorKind::TimedOut, Some(d)) => {
+                            ClientError::ReadTimeout(d)
+                        }
+                        _ => ClientError::Broken(e.to_string()),
+                    })
+                }
             }
         }
     }

@@ -8,11 +8,11 @@
 //! line first on every connection. Version mismatch warns, never rejects.
 //! All deserialization tolerates unknown fields.
 //!
-//! Two rules over those types live here because every surface has to agree
-//! on them: the delivery state machine ([`ledger::DeliveryState`]) and
-//! what needs a human ([`attention`], which owns the eye). A rule earns a
-//! place here by being one more than one crate would otherwise implement,
-//! and both of these were implemented twice before they were moved.
+//! Rules over those types live here when every surface has to agree on
+//! them. That includes the delivery state machine
+//! ([`ledger::DeliveryState`]), the one-shot wake notification state
+//! machine ([`notification::NotificationState`]), and what needs a human
+//! ([`attention`], which owns the eye).
 //!
 //! ## What does not live here
 //!
@@ -31,14 +31,20 @@
 //! and it sits in the crate every other crate already depends on.
 
 pub mod attention;
+pub mod identity;
 pub mod label;
 pub mod ledger;
+pub mod mailbox;
+pub mod notification;
 pub mod scratch;
 pub mod state;
 pub mod wire;
 
 pub use attention::*;
+pub use identity::*;
 pub use ledger::*;
+pub use mailbox::*;
+pub use notification::*;
 pub use state::*;
 pub use wire::*;
 

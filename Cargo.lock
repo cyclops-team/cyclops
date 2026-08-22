@@ -384,6 +384,7 @@ dependencies = [
  "clap",
  "cyclops-manifest",
  "cyclops-proto",
+ "cyclops-state",
  "cyclops-testrig",
  "cyclops-theme",
  "cyclops-tmux",
@@ -400,6 +401,7 @@ name = "cyclops-ledger"
 version = "0.1.0"
 dependencies = [
  "cyclops-proto",
+ "cyclops-state",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",
@@ -411,8 +413,10 @@ name = "cyclops-manifest"
 version = "0.1.0"
 dependencies = [
  "cyclops-proto",
+ "libc",
  "regex",
  "serde",
+ "sha2",
  "thiserror 2.0.19",
  "toml",
  "tracing",
@@ -424,6 +428,17 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
+ "thiserror 2.0.19",
+ "uuid",
+]
+
+[[package]]
+name = "cyclops-state"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
  "thiserror 2.0.19",
 ]
 
@@ -436,6 +451,7 @@ name = "cyclops-theme"
 version = "0.1.0"
 dependencies = [
  "cyclops-proto",
+ "cyclops-state",
  "tempfile",
  "thiserror 2.0.19",
  "toml",
@@ -446,6 +462,7 @@ name = "cyclops-tmux"
 version = "0.1.0"
 dependencies = [
  "cyclops-proto",
+ "cyclops-state",
  "cyclops-testrig",
  "serde",
  "thiserror 2.0.19",
@@ -461,12 +478,14 @@ version = "0.1.0"
 dependencies = [
  "cyclops-ledger",
  "cyclops-proto",
+ "cyclops-state",
  "cyclops-theme",
  "cyclops-tmux",
  "libc",
  "serde_json",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -476,6 +495,7 @@ dependencies = [
  "alacritty_terminal",
  "crossterm",
  "cyclops-proto",
+ "cyclops-state",
  "cyclops-testrig",
  "cyclops-theme",
  "cyclops-tmux",
@@ -486,6 +506,7 @@ dependencies = [
  "tokio",
  "toml",
  "unicode-width",
+ "uuid",
 ]
 
 [[package]]
@@ -497,6 +518,7 @@ dependencies = [
  "cyclops-ledger",
  "cyclops-manifest",
  "cyclops-proto",
+ "cyclops-state",
  "cyclops-testrig",
  "cyclops-theme",
  "cyclops-tmux",

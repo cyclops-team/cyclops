@@ -12,7 +12,7 @@ use cyclopsd::Config;
 #[command(
     name = "cyclopsd",
     version,
-    about = "The Cyclops daemon (M0: shadow mode, read-only)"
+    about = "The Cyclops daemon for pane state, durable mailboxes, and safe notifications"
 )]
 struct Cli {}
 

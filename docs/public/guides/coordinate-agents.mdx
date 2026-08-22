@@ -9,9 +9,19 @@ description: "Send work, broadcast announcements, wait for turns, and review the
 cyclops send reviewer --subject "Review the last commit" --body "Check correctness and test coverage."
 ```
 
-Cyclops waits until the pane is safe to inject, stages the message, submits
-it, and returns a receipt. A hook-verified receipt is stronger evidence than
-a screen-verified one, and the badge says which you received.
+Cyclops durably accepts the message before returning. It then queues a
+content-free wake for the recipient pane. The receipt keeps those facts
+separate: `accepted` covers the mailbox record, while `wake <state>` reports
+the current notification attempt.
+
+The recipient retrieves the body only by claiming the exact id named by the
+wake:
+
+```bash
+cyclops inbox list
+cyclops inbox claim <message-id>
+cyclops reply <message-id> --body "Reviewed. One issue."
+```
 
 ## Broadcast
 
@@ -19,19 +29,19 @@ a screen-verified one, and the badge says which you received.
 cyclops send --all --subject "Standup in 5" --fyi
 ```
 
-A broadcast creates one delivery per recipient. Each one advances
-independently and keeps its own final state.
+A broadcast creates one immutable message with one mailbox entry and one wake
+state per recipient. `--all` targets adopted agents, not the admin inbox.
 
-## Wait for the work
+## Wait for pane activity
 
 ```bash
 cyclops wait reviewer --until done --timeout 2m
-cyclops send reviewer --subject "Run the suite" --wait done --timeout 5m
 ```
 
 `done` means the working-to-idle edge for the same pane occupant. If the
 process in the pane changes while waiting, Cyclops exits separately rather
-than claiming the new process finished the old turn.
+than claiming the new process finished the old turn. This observes pane
+activity and does not prove a specific message or task was completed.
 
 ## Watch live
 
@@ -51,8 +61,13 @@ cyclops history --with reviewer --limit 20
 cyclops thread m-3f9c2a
 ```
 
-The ledger is append-only. Delivery updates are new lines, and history folds
-those lines into the current receipt when you read it.
+The workspace message journal is append-only. `history` applies caller-scoped
+visibility to the durable conversation. `messages` is the body-free view of
+mailbox and wake state:
+
+```bash
+cyclops messages
+```
 
 Cyclops does not currently implement a `pipe` command or a `send --from`
 shortcut. Put the relevant context in `--body`, pipe it through

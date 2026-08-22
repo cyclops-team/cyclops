@@ -4,6 +4,7 @@ members = [
     "src/cyclops-proto",
     "src/cyclops-manifest",
     "src/cyclops-tmux",
+    "src/cyclops-state",
     "src/cyclops-ledger",
     "src/cyclops-theme",
     "src/cyclops-ui",
@@ -35,11 +36,13 @@ regex = "1"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
 libc = "0.2"
 
 cyclops-proto = { path = "src/cyclops-proto" }
 cyclops-manifest = { path = "src/cyclops-manifest" }
 cyclops-tmux = { path = "src/cyclops-tmux" }
+cyclops-state = { path = "src/cyclops-state" }
 cyclops-ledger = { path = "src/cyclops-ledger" }
 cyclops-theme = { path = "src/cyclops-theme" }
 cyclops-ui = { path = "src/cyclops-ui" }

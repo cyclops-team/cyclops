@@ -26,13 +26,14 @@
 use std::path::{Path, PathBuf};
 
 use cyclops_tmux::{ControlClient, TmuxError};
+use uuid::Uuid;
 
 use super::App;
 use crate::action::{Action, Insertion, TabDestination};
 use crate::copy;
 use crate::daemon;
 use crate::decoration::{self, DecorationSnapshot};
-use crate::dialog::Dialog;
+use crate::dialog::{Composed, Dialog};
 use crate::naming;
 use crate::persist::SidebarTab;
 
@@ -150,7 +151,7 @@ pub(super) async fn execute(
             app.open_dialog(Dialog::Compose {
                 buffer,
                 status: None,
-                sending: false,
+                send: crate::dialog::ComposeSendState::Ready,
             });
             Ok(Outcome::default())
         }
@@ -1179,7 +1180,7 @@ fn apply_insertion(order: &mut Vec<String>, source: &str, insertion: &Insertion)
 /// is seconds, so doing this inline would freeze every pane in the
 /// workspace while it waited. It runs on a thread of its own and posts the
 /// receipt back as an [`AppMsg`]; the composer stays open showing that it
-/// is in flight, and `sending` keeps a second Enter from sending twice.
+/// is in flight, and its send state keeps a second Enter from sending twice.
 ///
 /// With no channel (a test App built without a loop) the send is simply not
 /// started. Spawning a thread whose answer nothing can receive would be a
@@ -1230,22 +1231,28 @@ fn send_message(app: &mut App, to: String, subject: String, body: String) {
     let Some(tx) = app.tx.clone() else {
         return;
     };
-    if let Some(Dialog::Compose {
-        status, sending, ..
-    }) = app.dialog.as_mut()
-    {
-        *sending = true;
-        *status = Some(crate::copy::compose_sending(&to));
+    let message = Composed { to, subject, body };
+    let Some(attempt) = crate::dialog::begin_compose_send(app.dialog.as_mut(), message, || {
+        format!("workspace-{}", Uuid::new_v4())
+    }) else {
+        return;
+    };
+    if let Some(Dialog::Compose { status, .. }) = app.dialog.as_mut() {
+        let to = &attempt.message.to;
+        *status = Some(crate::copy::compose_sending(to));
     }
     let home = app.home.clone();
     std::thread::spawn(move || {
-        let outcome = daemon::send_message(&home, &to, &subject, &body);
+        let outcome = daemon::send_message(
+            &home,
+            &attempt.message.to,
+            &attempt.message.subject,
+            &attempt.message.body,
+            &attempt.client_key,
+        );
         // The workspace shutting down closes the channel. Nothing to do
         // about it and nothing to report it to.
-        let _ = tx.send(super::AppMsg::SendFinished {
-            to,
-            outcome: outcome.map_err(|e| e.to_string()),
-        });
+        let _ = tx.send(super::AppMsg::SendFinished { attempt, outcome });
     });
 }
 

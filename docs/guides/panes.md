@@ -38,13 +38,10 @@ tmux there is no pane to name, and it says so.
 
 ## Three names a pane cannot have
 
-```
-$ cyclops name %4 admin
-"admin" is you. Every message you send from a terminal is from "admin", so a pane called that could not be told apart from you on the record. Pick another name, e.g. lead.
-```
-
-`admin` is your own identity on the record. `*` addresses every agent at
-once. Anything starting with `%` is a tmux pane id, which cyclops accepts
+`admin` is the durable operator mailbox identity, so no pane may wear it.
+Only a same-user caller proven outside every watched pane resolves as admin; a
+shell inside a watched pane retains that pane's agent identity. `*` addresses
+every agent at once. Anything starting with `%` is a tmux pane id, which Cyclops accepts
 anywhere it accepts a name, so a pane called `%9` could mean two panes.
 Each refusal says which of the three it is and what to use instead; none
 of them is a rule you have to remember in advance.

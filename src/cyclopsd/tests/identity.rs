@@ -16,8 +16,15 @@ use std::time::Duration;
 
 use cyclops_testrig::{tmux_available, TmuxServer};
 use cyclops_tmux::{ControlConfig, SessionWatcher};
-use cyclopsd::identity::{peer_of, resolve_sender, Sender};
+use cyclopsd::identity::{peer_of, resolve_sender, Sender, Vendorship};
 use tokio::net::UnixStream;
+
+/// Nothing in these synthetic trees is an agent process, and every hop
+/// reads: the pane rows are what decide, which is what these tests are
+/// about.
+fn no_vendors(_: i32) -> Vendorship {
+    Vendorship::NotVendor
+}
 
 #[tokio::test]
 async fn peer_of_reports_own_uid_and_pid_over_socketpair() {
@@ -126,21 +133,21 @@ async fn ancestry_walk_resolves_real_child_in_pane() {
     // Labeled pane: the child resolves to the label.
     let labeled = vec![(row.pane_id.clone(), Some("codex".to_string()), row.pane_pid)];
     assert_eq!(
-        resolve_sender(uid, sleep_pid, &labeled),
+        resolve_sender(uid, sleep_pid, &labeled, no_vendors),
         Sender::Agent("codex".to_string())
     );
 
     // Unlabeled pane: the child resolves to the pane id.
     let unlabeled = vec![(row.pane_id.clone(), None, row.pane_pid)];
     assert_eq!(
-        resolve_sender(uid, sleep_pid, &unlabeled),
+        resolve_sender(uid, sleep_pid, &unlabeled, no_vendors),
         Sender::Pane(row.pane_id.clone())
     );
 
     // This test process lives outside the tmux tree: same uid, no pane in
     // its ancestry, so it is the human.
     assert_eq!(
-        resolve_sender(uid, std::process::id() as i32, &labeled),
+        resolve_sender(uid, std::process::id() as i32, &labeled, no_vendors),
         Sender::Admin
     );
 

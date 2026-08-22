@@ -5,6 +5,8 @@
 //! Server -> client: [`Response`] lines echoing that `id`, plus unsolicited
 //! [`Event`] lines on connections that subscribed via `events.subscribe`.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -86,6 +88,24 @@ pub struct Event {
     pub seq: Option<u64>,
 }
 
+/// Coarse workspace projections invalidated by a durable messaging fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessagesChangedArea {
+    Messages,
+    Mailboxes,
+    Notifications,
+    Attention,
+}
+
+/// Content-free wake signal for clients that rebuild from messages.snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessagesChangedData {
+    pub workspace_id: crate::identity::WorkspaceId,
+    pub workspace_seq: u64,
+    pub changed: BTreeSet<MessagesChangedArea>,
+}
+
 // ---------------------------------------------------------------------------
 // Method params and results. Methods use dot notation: "ping", "status",
 // "msg.send", "msg.history", "msg.thread", "agent.wait", "agent.state.report",
@@ -139,6 +159,19 @@ pub struct StatusParams {
     pub open_deliveries: bool,
 }
 
+/// Content-free warning about a notification that cannot wake its recipient.
+/// The durable recipient key and attempt id keep the warning bound to one
+/// route and one notification while display labels remain presentation only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusDiagnostic {
+    pub code: String,
+    pub message_id: crate::mailbox::MessageId,
+    pub notification_attempt: crate::notification::NotificationAttemptId,
+    pub recipient: crate::identity::RecipientKey,
+    pub recipient_label: String,
+    pub pane_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResult {
     pub daemon_version: String,
@@ -147,6 +180,9 @@ pub struct StatusResult {
     pub uptime_ms: u64,
     pub tmux_version: String,
     pub sessions: Vec<SessionStatus>,
+    /// Pending messages in the workspace administrator's durable inbox.
+    #[serde(default)]
+    pub admin_unread: u64,
     /// Deliveries whose latest recorded state still needs a human, folded
     /// from the whole record rather than a recent window, so age never
     /// hides one. Served only when [`StatusParams::open_deliveries`] asked
@@ -154,6 +190,9 @@ pub struct StatusResult {
     /// ignore it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_deliveries: Vec<OpenDelivery>,
+    /// Content-free operational diagnostics derived from exact live routes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<StatusDiagnostic>,
     /// The detection manifests this daemon is running on. Additive optional
     /// field: old daemons omit it, old clients ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -253,6 +292,15 @@ pub struct PaneStatus {
     pub current_command: String,
     pub dead: bool,
     pub in_mode: bool,
+    /// The second status answer, additive and stamped by fusion: may a
+    /// terminal write go into this pane right now. `state` alone cannot
+    /// say, because idle means no turn is running, which is also true of a
+    /// pane holding somebody's half-typed message. An older daemon sends
+    /// neither field, and absent evidence is not permission.
+    #[serde(default)]
+    pub write_ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_block: Option<String>,
     pub width: u32,
     pub height: u32,
     pub state: AgentState,
@@ -372,9 +420,17 @@ pub struct MsgSendParams {
     /// Announcement expecting no reply.
     #[serde(default)]
     pub fyi: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Sender-scoped idempotency key for exact retry deduplication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<String>,
+    /// Message this send replies to. Routing and subject are derived by the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
-    /// Compose send-and-wait: block until the recipient reaches a state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<crate::mailbox::MessageId>,
+    /// Removed send-and-wait field retained for protocol compatibility.
+    /// The mailbox `msg.send` endpoint rejects any non-null value because
+    /// pane state cannot prove that a specific message was completed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait: Option<WaitSpec>,
 }
@@ -389,9 +445,13 @@ pub struct WaitSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WaitUntil {
-    /// Composer ready, no turn running.
+    /// No turn is running. A runtime state only: reaching it does NOT
+    /// prove the composer is empty or that a write would be accepted.
+    /// Write-readiness is `Detection::write_ready`, and delivery asks it
+    /// again at paste time regardless of what a wait returned.
     Idle,
-    /// The turn started by our delivery ended.
+    /// A working-to-idle edge was observed for the same pane occupant.
+    /// This does not identify which message or task the turn handled.
     Done,
     /// The agent entered any blocked_* state.
     Blocked,
@@ -404,12 +464,24 @@ pub struct MsgSendResult {
     pub msg_id: String,
     pub seq: u64,
     pub deliveries: Vec<DeliveryReceipt>,
+    /// False when a client idempotency key matched an existing message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inserted: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliveryReceipt {
     pub to: String,
     pub state: crate::ledger::DeliveryState,
+    /// Durable mailbox notification state when this receipt came from the
+    /// workspace messaging path. Absent on legacy payload deliveries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_state: Option<MessageNotificationState>,
+    /// Exact quota disposition for workspace notifications. The legacy
+    /// `notification_state` remains `attention_required` so older clients
+    /// can decode the receipt and still treat it as operator-visible work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_state: Option<MessageQuotaState>,
     /// Queue depth ahead of this message when state is queued.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<u32>,
@@ -488,6 +560,367 @@ pub struct ThreadResult {
     pub lines: Vec<crate::ledger::LedgerLine>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InboxListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Match the authoritative sender endpoint, never its display label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<crate::identity::RecipientKey>,
+}
+
+/// One body-free pending inbox summary for the authenticated caller.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxSummaryEntry {
+    pub message_id: crate::mailbox::MessageId,
+    /// Authoritative endpoint. Older daemons omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<crate::identity::RecipientKey>,
+    pub sender_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    pub ts: u64,
+    pub thread_root: crate::mailbox::MessageId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxListResult {
+    pub entries: Vec<InboxSummaryEntry>,
+}
+
+fn default_recent_settled() -> u32 {
+    20
+}
+
+/// Body-free workspace message snapshot parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessagesSnapshotParams {
+    /// Keep every active message plus this many most-recent settled messages.
+    #[serde(default = "default_recent_settled")]
+    pub recent_settled: u32,
+}
+
+impl Default for MessagesSnapshotParams {
+    fn default() -> Self {
+        Self {
+            recent_settled: default_recent_settled(),
+        }
+    }
+}
+
+/// A message's direction relative to the authenticated caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDirection {
+    Inbound,
+    Outbound,
+    SelfAddressed,
+    /// An administrator observing a message they did not send or receive.
+    Workspace,
+}
+
+fn default_recipient_direction() -> MessageDirection {
+    MessageDirection::Workspace
+}
+
+/// Read-side notification state. `NotStarted` means no attempt exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageNotificationState {
+    NotStarted,
+    Queued,
+    Gating,
+    Writing,
+    Staged,
+    Submitted,
+    Notified,
+    AttentionRequired,
+    Superseded,
+}
+
+impl From<crate::notification::NotificationState> for MessageNotificationState {
+    fn from(state: crate::notification::NotificationState) -> Self {
+        use crate::notification::NotificationState;
+        match state {
+            NotificationState::Queued => Self::Queued,
+            NotificationState::Gating => Self::Gating,
+            // Keep the original closed wire vocabulary decodable by old
+            // clients. New clients read `quota_state` for the exact phase.
+            NotificationState::QuotaHeld | NotificationState::QuotaResetObserved => {
+                Self::AttentionRequired
+            }
+            NotificationState::Writing => Self::Writing,
+            NotificationState::Staged => Self::Staged,
+            NotificationState::Submitted => Self::Submitted,
+            NotificationState::Notified => Self::Notified,
+            NotificationState::AttentionRequired => Self::AttentionRequired,
+            NotificationState::Superseded => Self::Superseded,
+        }
+    }
+}
+
+/// Additive quota detail for a notification whose compatibility state is
+/// `attention_required`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageQuotaState {
+    Held,
+    ResetObserved,
+}
+
+impl MessageQuotaState {
+    pub fn from_notification(state: crate::notification::NotificationState) -> Option<Self> {
+        use crate::notification::NotificationState;
+        match state {
+            NotificationState::QuotaHeld => Some(Self::Held),
+            NotificationState::QuotaResetObserved => Some(Self::ResetObserved),
+            _ => None,
+        }
+    }
+}
+
+/// Current body-free notification projection for one recipient.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageNotificationSummary {
+    pub state: MessageNotificationState,
+    /// Exact quota phase. When present, `state` remains
+    /// `attention_required` for old-client compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_state: Option<MessageQuotaState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<crate::notification::NotificationAttemptId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<crate::notification::NotificationAttentionCause>,
+    /// Present only for attention-required attempts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_cleared: Option<bool>,
+    /// Explicit operator resolution of this exact attention attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<crate::notification::NotificationResolution>,
+    /// Terminal action crossed its write boundary without a final outcome.
+    /// Inspect the pane. Never repeat this action automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_intent: Option<crate::notification::NotificationResolution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<u64>,
+}
+
+/// One recipient's mailbox and notification state for a message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageRecipientSummary {
+    pub recipient: crate::identity::RecipientKey,
+    pub label: String,
+    /// This recipient row's direction relative to the authenticated caller.
+    #[serde(default = "default_recipient_direction")]
+    pub direction: MessageDirection,
+    /// Whether this recipient row belongs in the caller's Work view.
+    #[serde(default)]
+    pub needs_action: bool,
+    /// Whether the authenticated caller may resolve this recipient's open alarm.
+    ///
+    /// Clients must not infer this authority from direction, mailbox state, or
+    /// notification state. The daemon answers it for the exact recipient row.
+    #[serde(default)]
+    pub can_manage_attention: bool,
+    /// Current route availability, outside the workspace journal watermark.
+    pub available: bool,
+    pub mailbox: crate::mailbox::MailboxEntryState,
+    /// One-based position among the recipient's currently pending messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fifo_position: Option<u64>,
+    pub notification: MessageNotificationSummary,
+}
+
+/// Stable body-free row returned by `messages.snapshot`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageSnapshotRow {
+    pub message_id: crate::mailbox::MessageId,
+    pub seq: u64,
+    pub ts: u64,
+    pub kind: crate::ledger::Kind,
+    pub direction: MessageDirection,
+    pub sender: crate::identity::RecipientKey,
+    pub sender_label: String,
+    pub recipients: Vec<MessageRecipientSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<crate::mailbox::MessageId>,
+    pub thread_root: crate::mailbox::MessageId,
+    /// Number of messages in this thread visible to the caller.
+    pub thread_message_count: u64,
+    pub active: bool,
+    /// Whether this row belongs in the authenticated caller's Work view.
+    pub needs_action: bool,
+}
+
+/// Counts cover every visible message, including settled rows omitted by the bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessagesSnapshotCounts {
+    pub visible_messages: u64,
+    pub returned_messages: u64,
+    pub inbox_messages: u64,
+    pub outbound_messages: u64,
+    pub work_messages: u64,
+    pub active_messages: u64,
+    pub settled_messages: u64,
+    pub pending_entries: u64,
+    pub claimed_entries: u64,
+    pub open_attention_entries: u64,
+}
+
+/// One authenticated, body-free read of workspace messaging state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessagesSnapshotResult {
+    pub workspace_id: crate::identity::WorkspaceId,
+    /// Highest workspace journal sequence folded into this snapshot.
+    pub workspace_seq: u64,
+    pub counts: MessagesSnapshotCounts,
+    pub rows: Vec<MessageSnapshotRow>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimDisposition {
+    Claimed,
+    AlreadyClaimed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxClaimParams {
+    pub message_id: crate::mailbox::MessageId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxClaimResult {
+    pub disposition: ClaimDisposition,
+    pub message: InboxMessage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxMessage {
+    pub message_id: crate::mailbox::MessageId,
+    pub kind: crate::ledger::Kind,
+    /// Authoritative endpoint. Older daemons omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<crate::identity::RecipientKey>,
+    pub sender_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<crate::mailbox::MessageId>,
+    pub thread_root: crate::mailbox::MessageId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplyParams {
+    pub message_id: crate::mailbox::MessageId,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequeueParams {
+    pub message_id: crate::mailbox::MessageId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequeueResult {
+    pub message_id: crate::mailbox::MessageId,
+    pub requeued: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlarmPreviewParams {
+    pub older_than_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlarmSummary {
+    pub id: String,
+    pub message_id: String,
+    pub recipient: String,
+    pub state: crate::ledger::DeliveryState,
+    /// Why the attempt needs attention. Closed set, so an operator can
+    /// tell a failed verify from a failed submit without reading the
+    /// message.
+    pub cause: crate::notification::NotificationAttentionCause,
+    pub ts: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlarmPreviewResult {
+    pub entries: Vec<AlarmSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlarmClearParams {
+    pub ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlarmClearResult {
+    pub cleared_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttentionShowParams {
+    /// Exact notification attempt id, or a message id with one unresolved match.
+    pub id: String,
+    /// Return the two local diff inputs to the authenticated client.
+    #[serde(default)]
+    pub diff: bool,
+}
+
+/// Five fail-closed checks for a staged notification attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionChecks {
+    pub notification_exact: bool,
+    pub trailer_anchored: bool,
+    pub process_matches: bool,
+    pub manifest_matches: bool,
+    pub terminal_action_safe: bool,
+}
+
+impl AttentionChecks {
+    pub fn all_pass(&self) -> bool {
+        self.notification_exact
+            && self.trailer_anchored
+            && self.process_matches
+            && self.manifest_matches
+            && self.terminal_action_safe
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttentionShowResult {
+    pub attempt_id: crate::notification::NotificationAttemptId,
+    pub message_id: crate::mailbox::MessageId,
+    pub recipient: crate::identity::RecipientKey,
+    pub checks: AttentionChecks,
+    /// Present only for an explicit diff request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
+    /// Present only when exact visible extraction succeeded for a diff request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttentionResolveParams {
+    /// Exact notification attempt id, or a message id with one unresolved match.
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttentionResolveResult {
+    pub attempt_id: crate::notification::NotificationAttemptId,
+    pub resolution: crate::notification::NotificationResolution,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentWaitParams {
     pub target: String,
@@ -501,10 +934,20 @@ pub struct AgentWaitParams {
 /// detectable (hooks are separate short-lived processes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateReportParams {
-    /// Cyclops label of the reporting agent pane.
-    pub agent: String,
+    /// Cyclops label of the reporting agent pane, when the hook knows it.
+    ///
+    /// Optional because a hook often does not know it. The daemon derives
+    /// the reporting origin from the authenticated socket peer, which it
+    /// must compute anyway to verify the report; a value supplied here is
+    /// an ASSERTION about that origin, checked against it and denied when
+    /// it disagrees, never trusted on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// Normalized event name, e.g. "UserPromptSubmit", "Stop".
     pub event: String,
+    /// Per-label counter, sent only by a client that HAS a label. A
+    /// label-free report carries none, so a dedupe window is never keyed
+    /// by a name the daemon has not verified.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
     /// Raw vendor payload, passed through for matching and audit.
@@ -606,6 +1049,111 @@ mod tests {
     }
 
     #[test]
+    fn messages_changed_has_an_exact_content_free_wire_shape() {
+        let workspace_id =
+            serde_json::from_value(serde_json::json!("00000000-0000-0000-0000-000000000001"))
+                .unwrap();
+        let data = MessagesChangedData {
+            workspace_id,
+            workspace_seq: 41,
+            changed: [
+                MessagesChangedArea::Mailboxes,
+                MessagesChangedArea::Notifications,
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let event = Event {
+            event: "messages.changed".into(),
+            data: serde_json::to_value(&data).unwrap(),
+            seq: Some(41),
+        };
+
+        let wire = serde_json::to_value(event).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "event": "messages.changed",
+                "data": {
+                    "workspace_id": "00000000-0000-0000-0000-000000000001",
+                    "workspace_seq": 41,
+                    "changed": ["mailboxes", "notifications"]
+                },
+                "seq": 41
+            })
+        );
+        let round_trip: MessagesChangedData = serde_json::from_value(wire["data"].clone()).unwrap();
+        assert_eq!(round_trip, data);
+    }
+
+    #[test]
+    fn deadlock_risk_has_an_exact_content_free_wire_shape() {
+        let diagnostic = StatusDiagnostic {
+            code: "deadlock_risk".into(),
+            message_id: "m-startup".parse().unwrap(),
+            notification_attempt: "att-00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            recipient: serde_json::from_value(serde_json::json!({
+                "kind": "agent",
+                "workspace_id": "00000000-0000-0000-0000-000000000001",
+                "session_instance_id": "00000000-0000-0000-0000-000000000002",
+                "pane_id": "%1"
+            }))
+            .unwrap(),
+            recipient_label: "codex-test".into(),
+            pane_id: "%1".into(),
+        };
+
+        let wire = serde_json::to_value(diagnostic).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "code": "deadlock_risk",
+                "message_id": "m-startup",
+                "notification_attempt": "att-00000000-0000-4000-8000-000000000001",
+                "recipient": {
+                    "kind": "agent",
+                    "workspace_id": "00000000-0000-0000-0000-000000000001",
+                    "session_instance_id": "00000000-0000-0000-0000-000000000002",
+                    "pane_id": "%1"
+                },
+                "recipient_label": "codex-test",
+                "pane_id": "%1"
+            })
+        );
+        assert!(wire.get("body").is_none());
+        assert!(wire.get("subject").is_none());
+    }
+
+    #[test]
+    fn inbox_summary_exposes_a_durable_sender_without_content() {
+        let sender: crate::identity::RecipientKey =
+            "agent:00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000002/%9"
+                .parse()
+                .unwrap();
+        let entry = InboxSummaryEntry {
+            message_id: "m-startup".parse().unwrap(),
+            sender: Some(sender),
+            sender_label: "gemini-test".into(),
+            subject: Some("Startup retrospective".into()),
+            ts: 12,
+            thread_root: "m-startup".parse().unwrap(),
+        };
+
+        let wire = serde_json::to_value(entry).unwrap();
+        assert_eq!(wire["sender"]["pane_id"], "%9");
+        assert_eq!(wire["sender_label"], "gemini-test");
+        assert!(wire.get("body").is_none());
+        let old: InboxSummaryEntry = serde_json::from_value(serde_json::json!({
+            "message_id": "m-old",
+            "sender_label": "gemini-test",
+            "ts": 11,
+            "thread_root": "m-old"
+        }))
+        .unwrap();
+        assert_eq!(old.sender, None);
+    }
+
+    #[test]
     fn missing_params_defaults_to_null() {
         let req: Request = serde_json::from_str(r#"{"id":"a","method":"status"}"#).unwrap();
         assert!(req.params.is_null());
@@ -648,10 +1196,14 @@ mod tests {
         let old = r#"{"to":"reviewer","state":"queued","position":0}"#;
         let receipt: DeliveryReceipt = serde_json::from_str(old).unwrap();
         assert_eq!(receipt.held_by, None);
+        assert_eq!(receipt.notification_state, None);
+        assert_eq!(receipt.quota_state, None);
 
         let receipt = DeliveryReceipt {
             to: "reviewer".into(),
             state: crate::ledger::DeliveryState::Queued,
+            notification_state: None,
+            quota_state: None,
             position: Some(0),
             held_by: Some("blocked".into()),
             note: None,
@@ -661,6 +1213,84 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&wire).unwrap();
         assert_eq!(value["held_by"], "blocked");
         assert_ne!(value["held_by"], "blocked:trust_dialog");
+    }
+
+    #[test]
+    fn mailbox_notification_state_is_optional_and_keeps_its_own_vocabulary() {
+        for (state, expected) in [
+            (MessageNotificationState::NotStarted, "not_started"),
+            (MessageNotificationState::Queued, "queued"),
+            (MessageNotificationState::Gating, "gating"),
+        ] {
+            let receipt = DeliveryReceipt {
+                to: "reviewer".into(),
+                state: crate::ledger::DeliveryState::Queued,
+                notification_state: Some(state),
+                quota_state: None,
+                position: None,
+                held_by: None,
+                note: None,
+                pane: None,
+            };
+            let wire = serde_json::to_value(&receipt).unwrap();
+            let round_trip: DeliveryReceipt = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(round_trip.notification_state, Some(state));
+            assert_eq!(wire["notification_state"], expected);
+            assert_eq!(wire["state"], "queued");
+        }
+
+        let legacy: serde_json::Value = serde_json::to_value(DeliveryReceipt {
+            to: "reviewer".into(),
+            state: crate::ledger::DeliveryState::Queued,
+            notification_state: None,
+            quota_state: None,
+            position: None,
+            held_by: None,
+            note: None,
+            pane: None,
+        })
+        .unwrap();
+        assert!(legacy.get("notification_state").is_none());
+    }
+
+    #[test]
+    fn durable_send_result_preserves_protocol_v1_receipts() {
+        let result = MsgSendResult {
+            msg_id: "m-compatible".into(),
+            seq: 7,
+            deliveries: vec![DeliveryReceipt {
+                to: "reviewer".into(),
+                state: crate::ledger::DeliveryState::Queued,
+                notification_state: None,
+                quota_state: None,
+                position: None,
+                held_by: None,
+                note: None,
+                pane: None,
+            }],
+            inserted: Some(true),
+        };
+        let wire = serde_json::to_value(&result).unwrap();
+
+        #[derive(Deserialize)]
+        struct LegacyMsgSendResult {
+            msg_id: String,
+            seq: u64,
+            deliveries: Vec<DeliveryReceipt>,
+        }
+        let old: LegacyMsgSendResult = serde_json::from_value(wire).unwrap();
+        assert_eq!(old.msg_id, "m-compatible");
+        assert_eq!(old.seq, 7);
+        assert_eq!(old.deliveries.len(), 1);
+
+        let legacy_wire = serde_json::json!({
+            "msg_id": "m-compatible",
+            "seq": 7,
+            "deliveries": [{"to": "reviewer", "state": "queued"}]
+        });
+        let current: MsgSendResult = serde_json::from_value(legacy_wire).unwrap();
+        assert_eq!(current.msg_id, "m-compatible");
+        assert_eq!(current.inserted, None);
     }
 
     /// A daemon saying "I loaded none" and a daemon too old to say are two
@@ -687,5 +1317,228 @@ mod tests {
         let m = s.manifests.expect("the daemon said so");
         assert_eq!(m.ids, vec!["agy", "claude"]);
         assert_eq!(m.dir.as_deref(), Some("/h/manifests"));
+    }
+
+    /// An alarm summary names why attention is needed, in the closed
+    /// vocabulary, and still carries no message content.
+    ///
+    /// The distinction the operator acts on is verify against submit: one
+    /// says the composer never took the text, the other says it took it
+    /// and the send did not land.
+    #[test]
+    fn an_alarm_summary_names_its_cause_and_no_content() {
+        use crate::notification::NotificationAttentionCause;
+
+        let summary = AlarmSummary {
+            id: "att-00000000-0000-4000-8000-000000000001".into(),
+            message_id: "m-1".into(),
+            recipient: "reviewer".into(),
+            state: crate::ledger::DeliveryState::AttentionRequired,
+            cause: NotificationAttentionCause::VerifyFailed,
+            ts: 7,
+        };
+        let value = serde_json::to_value(&summary).expect("summary serializes");
+        let mut keys: Vec<_> = value.as_object().expect("object").keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["cause", "id", "message_id", "recipient", "state", "ts"]
+        );
+        assert_eq!(value["cause"], "verify_failed");
+
+        // The two causes an operator most needs to tell apart stay apart.
+        let submit = AlarmSummary {
+            cause: NotificationAttentionCause::SubmitFailed,
+            ..summary.clone()
+        };
+        assert_eq!(
+            serde_json::to_value(&submit).expect("summary serializes")["cause"],
+            "submit_failed"
+        );
+
+        let decoded: AlarmSummary =
+            serde_json::from_value(serde_json::to_value(&summary).unwrap()).expect("round trip");
+        assert_eq!(decoded.cause, NotificationAttentionCause::VerifyFailed);
+    }
+
+    #[test]
+    fn legacy_recipient_summary_defaults_new_work_fields_safely() {
+        let workspace = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let session = "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let recipient = crate::RecipientKey::agent(workspace, session, "%3".parse().unwrap());
+        let current = MessageRecipientSummary {
+            recipient,
+            label: "reviewer".into(),
+            direction: MessageDirection::Inbound,
+            needs_action: true,
+            can_manage_attention: true,
+            available: true,
+            mailbox: crate::MailboxEntryState::Pending,
+            fifo_position: Some(1),
+            notification: MessageNotificationSummary {
+                state: MessageNotificationState::NotStarted,
+                quota_state: None,
+                attempt_id: None,
+                cause: None,
+                attention_cleared: None,
+                resolution: None,
+                resolution_intent: None,
+                updated_at: None,
+            },
+        };
+        let mut legacy = serde_json::to_value(current).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("direction");
+        object.remove("needs_action");
+        object.remove("can_manage_attention");
+
+        let decoded: MessageRecipientSummary = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.direction, MessageDirection::Workspace);
+        assert!(!decoded.needs_action);
+        assert!(!decoded.can_manage_attention);
+    }
+
+    #[test]
+    fn notification_resolution_is_optional_and_round_trips() {
+        let unresolved = MessageNotificationSummary {
+            state: MessageNotificationState::AttentionRequired,
+            quota_state: None,
+            attempt_id: None,
+            cause: Some(crate::NotificationAttentionCause::VerifyFailed),
+            attention_cleared: Some(false),
+            resolution: None,
+            resolution_intent: None,
+            updated_at: Some(7),
+        };
+        let unresolved_wire = serde_json::to_value(&unresolved).unwrap();
+        assert!(unresolved_wire.get("resolution").is_none());
+        let decoded: MessageNotificationSummary = serde_json::from_value(unresolved_wire).unwrap();
+        assert_eq!(decoded.resolution, None);
+
+        let resolved = MessageNotificationSummary {
+            resolution: Some(crate::NotificationResolution::Discard),
+            ..unresolved
+        };
+        let resolved_wire = serde_json::to_value(&resolved).unwrap();
+        assert_eq!(resolved_wire["resolution"], "discard");
+        let decoded: MessageNotificationSummary = serde_json::from_value(resolved_wire).unwrap();
+        assert_eq!(
+            decoded.resolution,
+            Some(crate::NotificationResolution::Discard)
+        );
+    }
+
+    #[test]
+    fn quota_detail_keeps_the_old_notification_enum_decodable() {
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        #[serde(rename_all = "snake_case")]
+        enum LegacyNotificationState {
+            NotStarted,
+            Queued,
+            Gating,
+            Writing,
+            Staged,
+            Submitted,
+            Notified,
+            AttentionRequired,
+            Superseded,
+        }
+
+        #[derive(Deserialize)]
+        struct LegacySummary {
+            state: LegacyNotificationState,
+        }
+
+        for (internal, quota) in [
+            (crate::NotificationState::QuotaHeld, MessageQuotaState::Held),
+            (
+                crate::NotificationState::QuotaResetObserved,
+                MessageQuotaState::ResetObserved,
+            ),
+        ] {
+            let summary = MessageNotificationSummary {
+                state: internal.into(),
+                quota_state: MessageQuotaState::from_notification(internal),
+                attempt_id: None,
+                cause: None,
+                attention_cleared: None,
+                resolution: None,
+                resolution_intent: None,
+                updated_at: Some(7),
+            };
+            let wire = serde_json::to_value(&summary).unwrap();
+            assert_eq!(wire["state"], "attention_required");
+            assert_eq!(wire["quota_state"], serde_json::to_value(quota).unwrap());
+
+            let legacy: LegacySummary = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(legacy.state, LegacyNotificationState::AttentionRequired);
+            let current: MessageNotificationSummary = serde_json::from_value(wire).unwrap();
+            assert_eq!(current.quota_state, Some(quota));
+        }
+
+        let old_wire = serde_json::json!({"state": "attention_required"});
+        let current: MessageNotificationSummary = serde_json::from_value(old_wire).unwrap();
+        assert_eq!(current.quota_state, None);
+    }
+
+    #[test]
+    fn uncertain_resolution_intent_is_optional_and_distinct_from_completion() {
+        let summary = MessageNotificationSummary {
+            state: MessageNotificationState::AttentionRequired,
+            quota_state: None,
+            attempt_id: None,
+            cause: Some(crate::NotificationAttentionCause::VerifyFailed),
+            attention_cleared: Some(false),
+            resolution: None,
+            resolution_intent: Some(crate::NotificationResolution::Complete),
+            updated_at: Some(7),
+        };
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert_eq!(wire["resolution_intent"], "complete");
+        assert!(wire.get("resolution").is_none());
+        let decoded: MessageNotificationSummary = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            decoded.resolution_intent,
+            Some(crate::NotificationResolution::Complete)
+        );
+        assert_eq!(decoded.resolution, None);
+    }
+
+    #[test]
+    fn attention_show_omits_diff_inputs_until_requested() {
+        let workspace = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let session = "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let base = AttentionShowResult {
+            attempt_id: crate::NotificationAttemptId::parse(
+                "att-00000000-0000-4000-8000-000000000003",
+            )
+            .unwrap(),
+            message_id: crate::MessageId::new("m-private").unwrap(),
+            recipient: crate::RecipientKey::agent(workspace, session, "%3".parse().unwrap()),
+            checks: AttentionChecks {
+                notification_exact: true,
+                trailer_anchored: true,
+                process_matches: true,
+                manifest_matches: true,
+                terminal_action_safe: true,
+            },
+            expected: None,
+            observed: None,
+        };
+
+        let value = serde_json::to_value(&base).unwrap();
+        assert!(value.get("expected").is_none());
+        assert!(value.get("observed").is_none());
+        assert!(base.checks.all_pass());
+
+        let with_diff = AttentionShowResult {
+            expected: Some("expected bytes".into()),
+            observed: Some("observed bytes".into()),
+            ..base
+        };
+        let value = serde_json::to_value(&with_diff).unwrap();
+        assert_eq!(value["expected"], "expected bytes");
+        assert_eq!(value["observed"], "observed bytes");
+        assert!(value.get("diff").is_none());
     }
 }

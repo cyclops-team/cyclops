@@ -218,6 +218,10 @@ pub const SIDEBAR_COMPOSE_HINT: &str = "send";
 /// Shift+Enter or Ctrl+J finds it works anyway.
 pub const COMPOSE_HINT: &str = "@name then your message · Enter sends · Alt+Enter new line";
 pub const BUTTON_SEND: &str = "Send";
+pub const COMPOSE_ABANDON_TITLE: &str = "Abandon send attempt?";
+pub const COMPOSE_ABANDON_HINT: &str =
+    "Message may already be accepted. Enter loses safe retry. Esc keeps this draft and retry key.";
+pub const BUTTON_ABANDON: &str = "Abandon";
 
 /// In flight. Named, because a workspace with several agents open should
 /// not make the reader work out which one is being written to.
@@ -231,11 +235,14 @@ pub fn compose_sent(receipt: &str) -> String {
     receipt.to_string()
 }
 
-/// Nothing reached the record. Distinct from a delivery that was attempted
-/// and failed: this one is not somewhere waiting to be found, so the
-/// operator's next move is to retry rather than to go looking.
-pub fn compose_failed(to: &str, cause: &str) -> String {
-    format!("nothing sent to {to}: {cause}")
+/// The daemon answered and did not accept the request.
+pub fn compose_rejected(to: &str, cause: &str) -> String {
+    format!("not accepted for {to}: {cause}")
+}
+
+/// The request may be durable, so retry must keep its idempotency key.
+pub fn compose_unknown(to: &str, cause: &str) -> String {
+    format!("acceptance unknown for {to}: {cause} · Enter retries safely")
 }
 
 // ---------------------------------------------------------------------------

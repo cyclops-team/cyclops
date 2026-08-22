@@ -5,16 +5,23 @@
 //! own broadcast receiver, a lagged receiver is dropped with a warning,
 //! and writes carry a timeout so a wedged client costs one connection.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
+#[cfg(test)]
+use cyclops_proto::TmuxPaneId;
 use cyclops_proto::{
-    AdminNotifyParams, AgentWaitParams, Event, Hello, MsgSendParams, PaneReadParams,
-    PaneReadResult, PaneReadSource, PingResult, QuiesceParams, Request, Response, SessionStatus,
-    StateReportParams, StatusParams, StatusResult, SubscribeParams, WireError, PROTOCOL_VERSION,
+    AdminNotifyParams, AgentWaitParams, AlarmClearParams, AlarmClearResult, AlarmPreviewParams,
+    AlarmPreviewResult, AlarmSummary, AttentionResolveParams, AttentionShowParams,
+    ClaimDisposition, DeliveryState, Event, Hello, InboxClaimParams, InboxClaimResult,
+    InboxListParams, InboxListResult, InboxSummaryEntry, MessagesSnapshotParams, MsgSendParams,
+    NotificationAttemptId, NotificationAttentionCause, NotificationResolution, PaneReadParams,
+    PaneReadResult, PaneReadSource, PingResult, ProcessInstanceId, QuiesceParams, RecipientKey,
+    ReplyParams, Request, RequeueParams, RequeueResult, Response, SessionStatus, StateReportParams,
+    StatusParams, StatusResult, SubscribeParams, WireError, PROTOCOL_VERSION,
 };
+use cyclops_state::{BoundSocketCleanup, StateRoot};
 use cyclops_tmux::SessionWatcher;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -28,14 +35,42 @@ use crate::{ack, delivery, fusion, identity, unix_ms, Inner};
 /// Peer credentials captured once per connection, before the stream is
 /// split. None means the kernel could not report them; identity-gated
 /// methods fail closed on it.
-type Peer = Option<(u32, i32)>;
+type Peer = Option<identity::PeerConn>;
 
 /// A write that does not finish inside this window means the client is
 /// wedged; the connection is dropped rather than buffered without bound.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
+pub(crate) struct BoundSocket {
+    listener: Option<UnixListener>,
+    cleanup: Option<BoundSocketCleanup>,
+}
+
+impl BoundSocket {
+    pub(crate) fn into_parts(mut self) -> (UnixListener, BoundSocketCleanup) {
+        (
+            self.listener.take().expect("bound socket has one listener"),
+            self.cleanup
+                .take()
+                .expect("bound socket has one cleanup guard"),
+        )
+    }
+}
+
+impl Drop for BoundSocket {
+    fn drop(&mut self) {
+        drop(self.listener.take());
+        if let Some(cleanup) = self.cleanup.take() {
+            let _ = cleanup.remove();
+        }
+    }
+}
+
 /// Scrollback lines for pane.read source=recent when the caller gave none.
 const DEFAULT_RECENT_LINES: u32 = 200;
+
+/// Settled history is context, not an unbounded transcript.
+const MAX_RECENT_SETTLED_MESSAGES: u32 = 100;
 
 /// Protocol v1 methods that exist but land in a later milestone. One list,
 /// so a new milestone replaces entries here instead of hunting through
@@ -47,22 +82,23 @@ const UNIMPLEMENTED: &[(&str, &str)] = &[];
 /// Stale socket handling: if something answers at the path another daemon
 /// is running and boot fails loudly; a refused connect means a leftover
 /// file from a dead daemon, which is removed and rebound.
-pub(crate) async fn bind_socket(home: &Path) -> anyhow::Result<UnixListener> {
-    if !home.exists() {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(home)
-            .with_context(|| format!("create {}", home.display()))?;
+pub(crate) async fn bind_socket(state_root: &StateRoot) -> anyhow::Result<BoundSocket> {
+    let home = state_root.path();
+    if !state_root.path_matches_held_root()? {
+        anyhow::bail!("state root path changed before socket bind");
     }
     let sock = home.join(cyclops_proto::SOCK_NAME);
     if sock.exists() {
         match UnixStream::connect(&sock).await {
             Ok(_) => anyhow::bail!("another cyclopsd is already running at {}", sock.display()),
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                if !state_root.path_matches_held_root()? {
+                    anyhow::bail!("state root path changed during stale socket check");
+                }
                 info!(socket = %sock.display(), "removing stale socket");
-                std::fs::remove_file(&sock)
+                state_root
+                    .bound_socket_cleanup(std::ffi::OsStr::new(cyclops_proto::SOCK_NAME))?
+                    .remove()
                     .with_context(|| format!("remove stale {}", sock.display()))?;
             }
             Err(e) => {
@@ -77,7 +113,22 @@ pub(crate) async fn bind_socket(home: &Path) -> anyhow::Result<UnixListener> {
             }
         }
     }
-    UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))
+    if !state_root.path_matches_held_root()? {
+        anyhow::bail!("state root path changed before socket bind");
+    }
+    let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
+    let cleanup = state_root
+        .bound_socket_cleanup(std::ffi::OsStr::new(cyclops_proto::SOCK_NAME))
+        .with_context(|| format!("validate bound socket {}", sock.display()))?;
+    let bound = BoundSocket {
+        listener: Some(listener),
+        cleanup: Some(cleanup),
+    };
+    if !state_root.path_matches_held_root()? {
+        drop(bound);
+        anyhow::bail!("state root path changed during socket bind");
+    }
+    Ok(bound)
 }
 
 /// Accept loop. Errors are logged and retried after a short pause so a
@@ -120,10 +171,17 @@ enum Pumped {
 pub(crate) async fn handle_conn(inner: Arc<Inner>, stream: UnixStream) {
     // Peer credentials are read once, before the split consumes the
     // stream. Identity-gated methods (msg.send) fail closed without them.
-    let peer: Peer = match identity::peer_of(&stream) {
-        Ok((uid, pid)) => {
-            debug!(uid, pid, "client connected");
-            Some((uid, pid))
+    // Read once, and kept with the descriptor it came from so every
+    // identity-gated request can ask again: a connection outlives a
+    // request, and the process behind it need not.
+    let fd = {
+        use std::os::fd::AsRawFd;
+        stream.as_raw_fd()
+    };
+    let peer: Peer = match identity::peer_identity(&stream) {
+        Ok(id) => {
+            debug!(uid = id.uid, pid = id.pid, "client connected");
+            Some(identity::PeerConn { id, fd })
         }
         Err(e) => {
             debug!(error = %e, "client connected; peer credentials unavailable");
@@ -318,11 +376,37 @@ pub(crate) async fn dispatch(
             };
             let result = delivery::quiesce(inner, params.timeout_ms).await;
             (
-                Response::ok(id, serde_json::to_value(result).expect("quiesce serializes")),
+                Response::ok(
+                    id,
+                    serde_json::to_value(result).expect("quiesce serializes"),
+                ),
                 None,
             )
         }
         "msg.send" => (msg_send(inner, id, req.params, peer).await, None),
+        "msg.reply" => (msg_reply(inner, id, req.params, peer), None),
+        "inbox.list" => (inbox_list(inner, id, req.params, peer), None),
+        "inbox.claim" => (inbox_claim(inner, id, req.params, peer), None),
+        "messages.snapshot" => (messages_snapshot(inner, id, req.params, peer), None),
+        "msg.requeue" => (msg_requeue(inner, id, req.params, peer), None),
+        "alarm.preview" => (alarm_preview(inner, id, req.params, peer), None),
+        "alarm.clear" => (alarm_clear(inner, id, req.params, peer), None),
+        "attention.show" => (attention_show(inner, id, req.params, peer).await, None),
+        "attention.complete" => (
+            attention_resolve(
+                inner,
+                id,
+                req.params,
+                peer,
+                NotificationResolution::Complete,
+            )
+            .await,
+            None,
+        ),
+        "attention.discard" => (
+            attention_resolve(inner, id, req.params, peer, NotificationResolution::Discard).await,
+            None,
+        ),
         "msg.history" => {
             // cursor2 travels outside the HistoryParams struct (wire-additive;
             // the struct is shared with clients that predate the field).
@@ -356,7 +440,7 @@ pub(crate) async fn dispatch(
                     Err(r) => return (r, None),
                 };
             (
-                from_result(id, crate::history::msg_thread(inner, &params.id)),
+                from_result(id, crate::history::msg_thread(inner, &params.id, peer)),
                 None,
             )
         }
@@ -369,18 +453,21 @@ pub(crate) async fn dispatch(
             // forged one lets the record lie. The socket path is pinned to
             // the reporting pane exactly like msg.send pins senders; only
             // the in-process Daemon::report_state path is pre-trusted.
-            if let Err(e) = verify_report_origin(inner, peer, &params.agent) {
-                return (
-                    Response {
-                        id,
-                        result: None,
-                        error: Some(e),
-                    },
-                    None,
-                );
-            }
+            let origin = match verify_report_origin(inner, peer, params.agent.as_deref()) {
+                Ok(o) => o,
+                Err(e) => {
+                    return (
+                        Response {
+                            id,
+                            result: None,
+                            error: Some(e),
+                        },
+                        None,
+                    )
+                }
+            };
             (
-                from_result(id, ack::handle_report(inner, params).await),
+                from_result(id, ack::handle_report(inner, params, origin).await),
                 None,
             )
         }
@@ -587,40 +674,557 @@ fn daemon_peer(peer: Peer) -> Result<(u32, i32), WireError> {
         message,
         data: None,
     };
-    let Some((uid, pid)) = peer else {
+    let Some(conn) = peer else {
         return Err(deny("peer credentials unavailable".to_string()));
     };
+    // Asked again, now. The credentials this connection was accepted with
+    // belong to the process that opened it, and that process can exit, be
+    // replaced at the same number, or re-execute into another program
+    // while the socket stays open.
+    let Some(id) = conn.current() else {
+        return Err(deny(
+            "the process that opened this connection is no longer the one on it".to_string(),
+        ));
+    };
     let daemon_uid = unsafe { libc::getuid() };
-    if uid != daemon_uid {
-        return Err(deny(format!("uid {uid} is not the daemon's user")));
+    if id.uid != daemon_uid {
+        return Err(deny(format!("uid {} is not the daemon's user", id.uid)));
     }
-    Ok((uid, pid))
+    Ok((id.uid, id.pid))
 }
 
-/// msg.send over the socket: resolve the sender from peer credentials
-/// (fail-closed: no credentials or a foreign uid is denied, and nothing
-/// in the request body can override the resolved sender), then hand off
-/// to the delivery pipeline.
 async fn msg_send(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
     let params: MsgSendParams = match decode_params(&id, params, "msg.send params") {
         Ok(p) => p,
         Err(r) => return r,
     };
-    let (uid, pid) = match daemon_peer(peer) {
-        Ok(v) => v,
-        Err(e) => return Response::err(id, &e.code, e.message),
+    if params.wait.is_some() {
+        return Response::err(
+            id,
+            "notification_unavailable",
+            "send wait is not supported for mailbox notifications",
+        );
+    }
+    let (service, sender) = match mailbox_caller(inner, peer) {
+        Ok(caller) => caller,
+        Err(error) => return wire_error_response(id, error),
     };
-    let panes = sender_panes(inner);
-    let from = match identity::resolve_sender(uid, pid, &panes) {
-        identity::Sender::Agent(label) => label,
-        identity::Sender::Pane(pane_id) => pane_id,
-        identity::Sender::Admin => "admin".to_string(),
+    if params.reply_to.is_some() && (params.fyi || params.supersedes.is_some()) {
+        return Response::err(
+            id,
+            "bad_request",
+            "a reply cannot be an announcement or supersede another message",
+        );
+    }
+    match crate::messaging::send(inner, &service, sender, params) {
+        Ok(result) => Response::ok(
+            id,
+            serde_json::to_value(result).expect("message acceptance serializes"),
+        ),
+        Err(error) => wire_error_response(id, mailbox_service_error(error)),
+    }
+}
+
+fn msg_reply(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
+    let params: ReplyParams = match decode_params(&id, params, "msg.reply params") {
+        Ok(params) => params,
+        Err(response) => return response,
     };
-    from_result(id, delivery::msg_send(inner, &from, params).await)
+    let (service, sender) = match mailbox_caller(inner, peer) {
+        Ok(caller) => caller,
+        Err(error) => return wire_error_response(id, error),
+    };
+    match crate::messaging::reply(
+        inner,
+        &service,
+        sender,
+        params.message_id,
+        params.body,
+        params.client_key,
+    ) {
+        Ok(result) => Response::ok(
+            id,
+            serde_json::to_value(result).expect("reply acceptance serializes"),
+        ),
+        Err(error) => wire_error_response(id, mailbox_service_error(error)),
+    }
+}
+
+fn inbox_list(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
+    let params: InboxListParams = match decode_params(&id, params, "inbox.list params") {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    let (service, caller) = match mailbox_caller(inner, peer) {
+        Ok(caller) => caller,
+        Err(error) => return wire_error_response(id, error),
+    };
+    match service.list(caller.key, params.sender, params.limit) {
+        Ok(entries) => {
+            let entries = entries
+                .into_iter()
+                .map(|item| InboxSummaryEntry {
+                    message_id: item.entry.message_id,
+                    sender: Some(item.sender),
+                    sender_label: item.sender_label,
+                    subject: item.subject,
+                    ts: item.entry.created_at,
+                    thread_root: item.thread_root,
+                })
+                .collect();
+            Response::ok(
+                id,
+                serde_json::to_value(InboxListResult { entries }).expect("inbox list serializes"),
+            )
+        }
+        Err(error) => wire_error_response(id, mailbox_service_error(error)),
+    }
+}
+
+fn inbox_claim(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
+    let params: InboxClaimParams = match decode_params(&id, params, "inbox.claim params") {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    let (service, caller) = match mailbox_caller(inner, peer) {
+        Ok(caller) => caller,
+        Err(error) => return wire_error_response(id, error),
+    };
+    let result = match crate::messaging::claim(inner, &service, caller.key, params.message_id) {
+        Ok(crate::mailbox::ClaimOutcome::Claimed { message, .. }) => InboxClaimResult {
+            disposition: ClaimDisposition::Claimed,
+            message,
+        },
+        Ok(crate::mailbox::ClaimOutcome::AlreadyClaimed { message, .. }) => InboxClaimResult {
+            disposition: ClaimDisposition::AlreadyClaimed,
+            message,
+        },
+        Err(error) => return wire_error_response(id, mailbox_service_error(error)),
+    };
+    Response::ok(
+        id,
+        serde_json::to_value(result).expect("inbox claim serializes"),
+    )
+}
+
+fn messages_snapshot(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
+    let params: MessagesSnapshotParams =
+        match decode_params(&id, params, "messages.snapshot params") {
+            Ok(params) => params,
+            Err(response) => return response,
+        };
+    if params.recent_settled > MAX_RECENT_SETTLED_MESSAGES {
+        return Response::err(
+            id,
+            "bad_request",
+            format!("recent_settled cannot exceed {MAX_RECENT_SETTLED_MESSAGES}"),
+        );
+    }
+    let (service, caller) = match mailbox_caller(inner, peer) {
+        Ok(caller) => caller,
+        Err(error) => return wire_error_response(id, error),
+    };
+    match service.messages_snapshot(caller.key, params.recent_settled) {
+        Ok(snapshot) => Response::ok(
+            id,
+            serde_json::to_value(snapshot).expect("messages snapshot serializes"),
+        ),
+        Err(error) => wire_error_response(id, mailbox_service_error(error)),
+    }
+}
+
+fn msg_requeue(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
+    let params: RequeueParams = match decode_params(&id, params, "msg.requeue params") {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    if let Err(error) = require_mailbox_admin(inner, peer) {
+        return wire_error_response(id, error);
+    }
+    let service = match mailbox_service(inner) {
+        Ok(service) => service,
+        Err(error) => return wire_error_response(id, error),
+    };
+    let requeued = match crate::messaging::requeue(inner, &service, params.message_id.clone()) {
+        Ok(requeued) => requeued,
+        Err(error) => return wire_error_response(id, mailbox_service_error(error)),
+    };
+    let result = RequeueResult {
+        message_id: params.message_id,
+        requeued,
+    };
+    Response::ok(
+        id,
+        serde_json::to_value(result).expect("requeue result serializes"),
+    )
+}
+
+fn alarm_preview(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
+    let params: AlarmPreviewParams = match decode_params(&id, params, "alarm.preview params") {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    if let Err(error) = require_mailbox_admin(inner, peer) {
+        return wire_error_response(id, error);
+    }
+    let service = match mailbox_service(inner) {
+        Ok(service) => service,
+        Err(error) => return wire_error_response(id, error),
+    };
+    let records = match service.alarms_older_than(params.older_than_ms) {
+        Ok(records) => records,
+        Err(error) => return wire_error_response(id, mailbox_service_error(error)),
+    };
+    // Identity, state and age only. No subject and no body: an operator
+    // deciding what to clear does not need the message contents.
+    let entries = records
+        .into_iter()
+        .map(|record| AlarmSummary {
+            id: record.attempt_id.to_string(),
+            message_id: record.message_id.to_string(),
+            recipient: record.recipient.to_string(),
+            state: DeliveryState::AttentionRequired,
+            // An attention record always carries a cause. If one ever
+            // reached here without it, the honest answer is that the
+            // outcome is unknown, not a specific failure it did not have.
+            cause: record
+                .cause
+                .unwrap_or(NotificationAttentionCause::TransportOutcomeUnknown),
+            ts: record.updated_at,
+        })
+        .collect();
+    Response::ok(
+        id,
+        serde_json::to_value(AlarmPreviewResult { entries })
+            .expect("alarm preview result serializes"),
+    )
+}
+
+fn alarm_clear(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
+    let params: AlarmClearParams = match decode_params(&id, params, "alarm.clear params") {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    if let Err(error) = require_mailbox_admin(inner, peer) {
+        return wire_error_response(id, error);
+    }
+    if params.ids.is_empty() {
+        return Response::err(id, "bad_request", "alarm.clear requires explicit alarm ids");
+    }
+    let mut attempts = Vec::with_capacity(params.ids.len());
+    for raw in &params.ids {
+        match NotificationAttemptId::parse(raw) {
+            Ok(attempt) => attempts.push(attempt),
+            Err(_) => return Response::err(id, "bad_request", format!("invalid alarm id '{raw}'")),
+        }
+    }
+    let service = match mailbox_service(inner) {
+        Ok(service) => service,
+        Err(error) => return wire_error_response(id, error),
+    };
+    let cleared = match service.clear_alarms(&attempts) {
+        Ok(cleared) => cleared,
+        Err(error) => return wire_error_response(id, mailbox_service_error(error)),
+    };
+    let result = AlarmClearResult {
+        cleared_ids: cleared.iter().map(ToString::to_string).collect(),
+    };
+    Response::ok(
+        id,
+        serde_json::to_value(result).expect("alarm clear result serializes"),
+    )
+}
+
+async fn attention_show(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
+    let params: AttentionShowParams = match decode_params(&id, params, "attention.show params") {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    let (service, caller) = match mailbox_caller(inner, peer) {
+        Ok(caller) => caller,
+        Err(error) => return wire_error_response(id, error),
+    };
+    if !caller.key.is_admin() {
+        return wire_error_response(id, mailbox_admin_required());
+    }
+    let target = match attention_target(&service, &params.id) {
+        Ok(target) => target,
+        Err(error) => return wire_error_response(id, error),
+    };
+    // Diff mode returns the exact payload selected at the write boundary.
+    // Direct compatibility attempts can therefore include message content.
+    // The endpoint is admin-only, and neither diff input is logged or stored.
+    let result = crate::attention_resolution::show(inner, &service, &target, params.diff).await;
+    Response::ok(
+        id,
+        serde_json::to_value(result).expect("attention show result serializes"),
+    )
+}
+
+async fn attention_resolve(
+    inner: &Arc<Inner>,
+    id: Value,
+    params: Value,
+    peer: Peer,
+    resolution: NotificationResolution,
+) -> Response {
+    let params: AttentionResolveParams =
+        match decode_params(&id, params, "attention resolution params") {
+            Ok(params) => params,
+            Err(response) => return response,
+        };
+    let (service, caller) = match mailbox_caller(inner, peer) {
+        Ok(caller) => caller,
+        Err(error) => return wire_error_response(id, error),
+    };
+    if !caller.key.is_admin() {
+        return wire_error_response(id, mailbox_admin_required());
+    }
+    let target = match attention_target(&service, &params.id) {
+        Ok(target) => target,
+        Err(error) => return wire_error_response(id, error),
+    };
+    match crate::attention_resolution::resolve(inner, &service, &target, resolution).await {
+        Ok(result) => Response::ok(
+            id,
+            serde_json::to_value(result).expect("attention resolution result serializes"),
+        ),
+        Err(error) => wire_error_response(id, attention_action_error(error)),
+    }
+}
+
+fn attention_target(
+    service: &Arc<crate::mailbox::MailboxService>,
+    raw: &str,
+) -> Result<crate::mailbox::AttentionTarget, WireError> {
+    match service.attention_target(raw) {
+        Ok(target) => Ok(target),
+        Err(crate::mailbox::MailboxServiceError::Store(
+            crate::mailbox::MessageStoreError::Mailbox(error),
+        )) => {
+            if let crate::mailbox::MailboxError::AmbiguousAttentionTarget { candidates, .. } =
+                error.as_ref()
+            {
+                return Err(WireError {
+                    code: "ambiguous_attention".to_string(),
+                    message: error.to_string(),
+                    data: Some(json!({
+                        "candidates": candidates.iter().map(ToString::to_string).collect::<Vec<_>>()
+                    })),
+                });
+            }
+            Err(mailbox_service_error(
+                crate::mailbox::MailboxServiceError::Store(
+                    crate::mailbox::MessageStoreError::Mailbox(error),
+                ),
+            ))
+        }
+        Err(error) => Err(mailbox_service_error(error)),
+    }
+}
+
+fn attention_action_error(error: crate::attention_resolution::AttentionActionError) -> WireError {
+    use crate::attention_resolution::AttentionActionError;
+
+    match error {
+        AttentionActionError::Store(error) => mailbox_service_error(error),
+        AttentionActionError::Evidence(result) => WireError {
+            code: "attention_evidence_failed".to_string(),
+            message: "the staged notification did not pass every safety check".to_string(),
+            data: Some(serde_json::to_value(result).expect("attention evidence serializes")),
+        },
+        AttentionActionError::DiscardUnsupported => WireError {
+            code: "discard_unsupported".to_string(),
+            message: error.to_string(),
+            data: None,
+        },
+        AttentionActionError::Uncertain => WireError {
+            code: "attention_action_uncertain".to_string(),
+            message: error.to_string(),
+            data: None,
+        },
+    }
+}
+
+fn require_mailbox_admin(inner: &Arc<Inner>, peer: Peer) -> Result<(), WireError> {
+    let (_, identity) = mailbox_caller(inner, peer)?;
+    if identity.key.is_admin() {
+        Ok(())
+    } else {
+        Err(mailbox_admin_required())
+    }
+}
+
+fn mailbox_admin_required() -> WireError {
+    WireError {
+        code: "denied".to_string(),
+        message: "this operation requires the workspace administrator".to_string(),
+        data: None,
+    }
+}
+
+fn mailbox_service(inner: &Arc<Inner>) -> Result<Arc<crate::mailbox::MailboxService>, WireError> {
+    inner.mailbox.clone().ok_or_else(|| WireError {
+        code: "mailbox_unavailable".to_string(),
+        message: "durable workspace identity is not connected".to_string(),
+        data: None,
+    })
+}
+
+pub(crate) fn mailbox_caller(
+    inner: &Arc<Inner>,
+    peer: Peer,
+) -> Result<
+    (
+        Arc<crate::mailbox::MailboxService>,
+        crate::mailbox::MailboxIdentity,
+    ),
+    WireError,
+> {
+    let (uid, pid) = daemon_peer(peer)?;
+    let _publication = inner
+        .mailbox_publication
+        .lock()
+        .expect("mailbox publication lock");
+    let service = mailbox_service(inner)?;
+    let panes = report_panes(inner);
+    let observed: Vec<_> = panes
+        .iter()
+        .enumerate()
+        .map(|(idx, pane)| (idx.to_string(), None, pane.root))
+        .collect();
+    let origin = identity::resolve_peer_origin_observed(uid, pid, &observed, |process| {
+        crate::fusion::is_vendor_now(inner, process)
+    });
+    let caller = match origin {
+        identity::PeerOrigin::Admin => service.admin(),
+        identity::PeerOrigin::Pane {
+            pane_id, pane_root, ..
+        } => {
+            let route =
+                report_pane_at(&panes, &pane_id, pane_root).ok_or_else(mailbox_origin_denied)?;
+            let root = ProcessInstanceId::new(route.root.pid, route.root.birth)
+                .map_err(|_| mailbox_origin_denied())?;
+            if inner
+                .registry
+                .lock()
+                .expect("registry lock")
+                .for_route(route.recipient_key, root)
+                .is_none()
+            {
+                return Err(mailbox_origin_denied());
+            }
+            service
+                .identity_for_recipient(route.recipient_key)
+                .map_err(mailbox_service_error)?
+                .ok_or_else(mailbox_origin_denied)?
+        }
+        identity::PeerOrigin::Unprovable => return Err(mailbox_origin_denied()),
+    };
+    Ok((service, caller))
+}
+
+fn mailbox_origin_denied() -> WireError {
+    WireError {
+        code: "denied".to_string(),
+        message: "the socket peer does not resolve to one exact mailbox identity".to_string(),
+        data: None,
+    }
+}
+
+#[cfg(test)]
+fn mailbox_identity_from_origin(
+    inner: &Inner,
+    service: &crate::mailbox::MailboxService,
+    origin: identity::PeerOrigin,
+) -> Result<crate::mailbox::MailboxIdentity, WireError> {
+    match origin {
+        identity::PeerOrigin::Admin => Ok(service.admin()),
+        identity::PeerOrigin::Pane {
+            pane_id, pane_root, ..
+        } => {
+            let pane = pane_id.parse::<TmuxPaneId>().map_err(|error| WireError {
+                code: "denied".to_string(),
+                message: error.to_string(),
+                data: None,
+            })?;
+            let expected = crate::mailbox_recipient_for_origin(inner, pane, pane_root)
+                .ok_or_else(mailbox_origin_denied)?;
+            let identity = service
+                .identity_for_recipient(expected)
+                .map_err(mailbox_service_error)?
+                .ok_or_else(mailbox_origin_denied)?;
+            if identity.key != expected {
+                return Err(mailbox_origin_denied());
+            }
+            Ok(identity)
+        }
+        identity::PeerOrigin::Unprovable => Err(WireError {
+            code: "denied".to_string(),
+            message: "the sending process could not be placed".to_string(),
+            data: None,
+        }),
+    }
+}
+
+pub(crate) fn mailbox_service_error(error: crate::mailbox::MailboxServiceError) -> WireError {
+    use crate::mailbox::{MailboxDirectoryError, MailboxError, MailboxServiceError};
+
+    let (code, message) = match error {
+        MailboxServiceError::Directory(MailboxDirectoryError::UnknownRecipient(target)) => {
+            ("no_such_target", format!("no mailbox recipient {target:?}"))
+        }
+        MailboxServiceError::Directory(error) => ("bad_request", error.to_string()),
+        MailboxServiceError::Store(crate::mailbox::MessageStoreError::Mailbox(error)) => {
+            match error.as_ref() {
+                MailboxError::MessageNotFound(_) | MailboxError::EntryNotFound { .. } => {
+                    ("no_such_message", error.to_string())
+                }
+                MailboxError::MessageNotPending(_) => ("message_not_pending", error.to_string()),
+                MailboxError::Type(_) => ("bad_request", error.to_string()),
+                MailboxError::ReplyNotVisible { .. } | MailboxError::ClaimantMismatch { .. } => {
+                    ("denied", error.to_string())
+                }
+                MailboxError::NotificationAttemptUnknown(_) => ("no_such_alarm", error.to_string()),
+                MailboxError::DuplicateIdempotencyKey { .. }
+                | MailboxError::AlreadyClaimed { .. }
+                | MailboxError::NotificationAttemptMismatch { .. }
+                | MailboxError::NotificationClearRequiresAttention
+                | MailboxError::NotificationRequeueRequiresAttention => {
+                    ("conflict", error.to_string())
+                }
+                MailboxError::NoUnresolvedAttention(_)
+                | MailboxError::NotificationAlreadyResolved(_)
+                | MailboxError::NotificationResolutionInProgress(_)
+                | MailboxError::NotificationResolutionAmbiguous(_) => {
+                    ("conflict", error.to_string())
+                }
+                MailboxError::InvalidAttentionTarget(_) => ("bad_request", error.to_string()),
+                _ => ("mailbox_error", error.to_string()),
+            }
+        }
+        MailboxServiceError::Store(error) => ("mailbox_error", error.to_string()),
+        MailboxServiceError::Poisoned | MailboxServiceError::ForeignDirectory => {
+            ("mailbox_error", error.to_string())
+        }
+    };
+    WireError {
+        code: code.to_string(),
+        message,
+        data: None,
+    }
+}
+
+fn wire_error_response(id: Value, error: WireError) -> Response {
+    Response {
+        id,
+        result: None,
+        error: Some(error),
+    }
 }
 
 /// (pane_id, label, pane_pid) rows for sender resolution, across every
-/// attached session. Shared with msg.history's "me" resolution.
+/// attached session. Retained for pre-upgrade history identity.
 pub(crate) fn sender_panes(inner: &Inner) -> Vec<(String, Option<String>, i32)> {
     let labels = inner.labels();
     inner
@@ -640,31 +1244,93 @@ pub(crate) fn sender_panes(inner: &Inner) -> Vec<(String, Option<String>, i32)> 
         .collect()
 }
 
-/// (pane_id, label, pane_pid) rows for hook-report origin resolution:
-/// every live pane plus, for DETACHED sessions, the last-known pane table.
-/// A hook report does not need the tmux connection (the pane and its
-/// process tree outlive a control-mode outage), so the reporter's ancestry
-/// must still be resolvable while the daemon is detached.
-fn report_panes(inner: &Inner) -> Vec<(String, Option<String>, i32)> {
-    let mut rows = sender_panes(inner);
-    let labels = inner.labels();
-    for slot in inner.session_slots() {
-        if slot.link.lock().expect("session link lock").attached {
+/// One exact row eligible to authenticate a hook report.
+struct ReportPane {
+    session_idx: usize,
+    recipient_key: RecipientKey,
+    pane_id: String,
+    label: Option<String>,
+    root: identity::ProcId,
+}
+
+/// Rows for authenticated hook origins. Detached sessions use their
+/// last-known panes because the process tree can outlive control mode.
+fn report_panes(inner: &Inner) -> Vec<ReportPane> {
+    let panes = crate::mailbox_panes(inner, None);
+    let mut rows = Vec::new();
+    for (session_idx, session_instance_id, pane) in panes {
+        let Some(root) = pane.root else {
             continue;
-        }
-        let last = slot.last_panes.lock().expect("last panes lock");
-        for row in last.values() {
-            if rows.iter().any(|(id, _, _)| id == &row.pane_id) {
-                continue;
-            }
-            rows.push((
-                row.pane_id.clone(),
-                labels.get(&row.pane_id).cloned(),
-                row.pane_pid,
-            ));
-        }
+        };
+        let Ok(pane_id) = pane.row.pane_id.parse() else {
+            continue;
+        };
+        let recipient_key = RecipientKey::agent(inner.workspace_id, session_instance_id, pane_id);
+        let pane_root = ProcessInstanceId::new(root.pid, root.birth).ok();
+        let label = pane_root.and_then(|pane_root| {
+            inner
+                .registry
+                .lock()
+                .expect("registry lock")
+                .for_route(recipient_key, pane_root)
+                .map(|adoption| adoption.label.clone())
+        });
+        rows.push(ReportPane {
+            session_idx,
+            recipient_key,
+            pane_id: pane.row.pane_id.clone(),
+            label,
+            root,
+        });
     }
     rows
+}
+
+/// Resolve the opaque route token returned by the process ancestry walk.
+/// The token is an index into this one snapshot, never a tmux pane id.
+/// Matching the observed root as well prevents a route from crossing to a
+/// different session row or to a replacement process generation.
+fn report_pane_at<'a>(
+    panes: &'a [ReportPane],
+    route_token: &str,
+    pane_root: identity::ProcId,
+) -> Option<&'a ReportPane> {
+    let route_idx = route_token.parse::<usize>().ok()?;
+    panes.get(route_idx).filter(|pane| pane.root == pane_root)
+}
+
+/// Re-read one authenticated route without resolving its raw pane id in a
+/// different watched session.
+pub(crate) fn report_route_row(
+    inner: &Inner,
+    origin: &ReportOrigin,
+) -> Option<(cyclops_tmux::PaneRow, Option<Arc<SessionWatcher>>)> {
+    let slot = inner.session(origin.session_idx)?;
+    let (attached, watcher, instance_id) = {
+        let link = slot.link.lock().expect("session link lock");
+        (
+            link.attached,
+            link.watcher.as_ref().map(Arc::clone),
+            link.identity.as_ref()?.session_instance_id(),
+        )
+    };
+    if origin.recipient_key.session_instance_id() != Some(instance_id) {
+        return None;
+    }
+    if attached {
+        let watcher = watcher?;
+        let row = watcher.pane(&origin.pane_id)?;
+        (identity::ProcId::of(row.pane_pid) == Some(origin.pane_root))
+            .then_some((row, Some(watcher)))
+    } else {
+        let pane = slot
+            .last_panes
+            .lock()
+            .expect("last panes lock")
+            .get(&origin.pane_id)
+            .cloned()?;
+        (pane.root == Some(origin.pane_root)).then_some((pane.row, None))
+    }
 }
 
 /// Fail-closed origin check for agent.state.report over the socket: the
@@ -674,7 +1340,36 @@ fn report_panes(inner: &Inner) -> Vec<(String, Option<String>, i32)> {
 /// Everything else is denied and NOT ingested: a same-uid process outside
 /// the pane (the admin shell included) could otherwise forge hook liveness
 /// and tier-1 ACK evidence, and the record must never lie.
-fn verify_report_origin(inner: &Inner, peer: Peer, agent: &str) -> Result<(), WireError> {
+/// Who a hook report is really from.
+///
+/// Derived from the socket peer and the pane table, never from the
+/// request. Everything downstream uses THIS, so a respawn between
+/// verification and ingestion cannot hand one occupant's hook to another.
+pub(crate) struct ReportOrigin {
+    /// The canonical name the daemon files this report under.
+    pub(crate) recipient: String,
+    pub(crate) pane_id: String,
+    pub(crate) session_idx: usize,
+    pub(crate) recipient_key: RecipientKey,
+    pub(crate) pane_root: identity::ProcId,
+    /// The AGENT INSTANCE that reported: the nearest process at or above
+    /// the peer whose own argv says it is an agent this daemon ships a
+    /// manifest for. Not the pane's root, which is usually a shell that
+    /// outlives every agent run inside it, and not the tty's current
+    /// foreground group, which can be a tool the agent handed the
+    /// terminal to.
+    ///
+    /// An identity rather than a number, so a reused pid is a different
+    /// agent instead of an heir to this one's trust.
+    pub(crate) agent: crate::identity::ProcId,
+    pub(crate) manifest: Option<String>,
+}
+
+fn verify_report_origin(
+    inner: &Inner,
+    peer: Peer,
+    agent: Option<&str>,
+) -> Result<ReportOrigin, WireError> {
     let deny = |message: String| WireError {
         code: "denied".to_string(),
         message,
@@ -682,25 +1377,121 @@ fn verify_report_origin(inner: &Inner, peer: Peer, agent: &str) -> Result<(), Wi
     };
     let (uid, pid) = daemon_peer(peer)?;
     let panes = report_panes(inner);
-    let allowed = match identity::resolve_sender(uid, pid, &panes) {
-        identity::Sender::Agent(label) => {
-            // The report may name the pane by label or by pane id.
-            agent == label
-                || panes
-                    .iter()
-                    .any(|(pane_id, l, _)| l.as_deref() == Some(label.as_str()) && pane_id == agent)
+    let observed: Vec<_> = panes
+        .iter()
+        .enumerate()
+        .map(|(idx, pane)| (idx.to_string(), None, pane.root))
+        .collect();
+    // The origin is whichever watched pane this process actually lives in.
+    // A shell outside every pane resolves to admin, which has no pane and
+    // therefore no hooks to report.
+    // One walk, one row: the pane whose pid the ancestry actually matched.
+    let (route_idx, pane_root) =
+        match identity::resolve_peer_origin_observed(uid, pid, &observed, |_| {
+            identity::Vendorship::NotVendor
+        }) {
+            identity::PeerOrigin::Pane {
+                pane_id, pane_root, ..
+            } => (pane_id, pane_root),
+            identity::PeerOrigin::Admin | identity::PeerOrigin::Unprovable => {
+                return Err(deny(
+                    "hook reports come from inside an agent pane; this peer is outside every \
+                     watched pane (admin cannot post hook reports)"
+                        .to_string(),
+                ));
+            }
+        };
+    let pane = report_pane_at(&panes, &route_idx, pane_root).ok_or_else(|| {
+        deny("the authenticated hook route vanished during verification".to_string())
+    })?;
+    let pane_id = pane.pane_id.clone();
+    let label = pane.label.clone();
+    let pane_root = pane.root;
+    let recipient = label.clone().unwrap_or_else(|| pane_id.clone());
+    // A supplied name is an assertion about that origin, so it has to
+    // agree with it. Disagreement is a denial rather than a correction:
+    // whichever of the two is wrong, acting on the report would file it
+    // under a name its own sender did not believe.
+    if let Some(claim) = agent {
+        if claim != recipient && claim != pane_id {
+            return Err(deny(format!(
+                "this report claims to be {claim:?} but comes from {recipient:?}"
+            )));
         }
-        identity::Sender::Pane(pane_id) => agent == pane_id,
-        identity::Sender::Admin => false,
-    };
-    if allowed {
-        Ok(())
-    } else {
-        Err(deny(format!(
-            "hook reports for {agent:?} are only accepted from a process inside that pane; \
-             this peer is not (admin cannot post hook reports)"
-        )))
     }
+    // Live row first, last-known row second. A detached session has no
+    // watcher, and deriving this live-only would make every honest hook
+    // during an outage look like it came from rules the pane no longer
+    // uses. The detach-aware contract is older than this check and the
+    // check must not quietly repeal it.
+    let provisional = ReportOrigin {
+        recipient: recipient.clone(),
+        pane_id: pane_id.clone(),
+        session_idx: pane.session_idx,
+        recipient_key: pane.recipient_key,
+        pane_root,
+        agent: identity::ProcId { pid: 0, birth: 0 },
+        manifest: None,
+    };
+    if report_route_row(inner, &provisional).is_none() {
+        return Err(deny(
+            "this pane is gone; there is nothing for a hook report to speak for".to_string(),
+        ));
+    }
+    // Authentication, and the pin is not evidence for it.
+    //
+    // Landing inside the pane only proves the peer is SOMEWHERE in it,
+    // and a pane sitting at its shell prompt keeps its adoption and its
+    // manifest pin while anyone at that prompt runs anything. Reading the
+    // terminal's current foreground does not fix that either: a
+    // hand-started `cyclops hook` holds the tty while it runs, so it
+    // would present itself as the pane's agent and the pin would agree
+    // with it.
+    //
+    // What actually admits a report is descent: the nearest process at or
+    // above the peer, up to the pane root, whose own argv says it is an
+    // agent this daemon ships a manifest for. A hook helper is a child of
+    // the agent that ran it, so that walk lands on the agent whether the
+    // agent holds the tty or handed it over; a helper nobody's agent
+    // started has no such ancestor and is refused.
+    let Some((vendor, agent_pid)) =
+        fusion::vendor_between(inner, pane.session_idx, &pane_id, pid, pane_root.pid)
+    else {
+        return Err(deny(
+            "hook reports come from an agent process; nothing between this peer and the pane's \
+             shell is an agent cyclops has a manifest for"
+                .to_string(),
+        ));
+    };
+    // The pin says which rules read the pane. It cannot admit a process,
+    // but it must not contradict one either: if the operator pinned this
+    // pane to one vendor and another is running in it, the two records
+    // disagree and neither is safe to act on.
+    let pane_root = ProcessInstanceId::new(pane_root.pid, pane_root.birth)
+        .map_err(|_| deny("this pane root has no valid process identity".to_string()))?;
+    let pinned = inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .for_route(pane.recipient_key, pane_root)
+        .and_then(|adoption| adoption.manifest.clone());
+    if let Some(pinned) = pinned {
+        if pinned != vendor.agent.id {
+            return Err(deny(format!(
+                "this pane is pinned to {pinned:?} but {:?} is what is running in it",
+                vendor.agent.id
+            )));
+        }
+    }
+    Ok(ReportOrigin {
+        recipient,
+        pane_id,
+        session_idx: pane.session_idx,
+        recipient_key: pane.recipient_key,
+        pane_root: pane.root,
+        agent: agent_pid,
+        manifest: Some(vendor.agent.id.clone()),
+    })
 }
 
 /// Assemble StatusResult from the session slots and the detection cache.
@@ -716,13 +1507,28 @@ pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResul
     } else {
         Vec::new()
     };
+    let admin_unread = inner
+        .mailbox
+        .as_ref()
+        .and_then(|service| service.pending_count(service.admin().key).ok())
+        .unwrap_or(0) as u64;
+    let adoptions = inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .exact_adoptions();
+    let diagnostics = crate::deadlock::status_diagnostics(inner);
     let detections = inner.detections.lock().expect("detections lock");
-    let labels = inner.labels();
     let sessions = inner
         .session_slots()
         .iter()
-        .map(|slot| {
+        .enumerate()
+        .map(|(session_idx, slot)| {
             let link = slot.link.lock().expect("session link lock");
+            let instance_id = link
+                .identity
+                .as_ref()
+                .map(|identity| identity.session_instance_id());
             let rows = link
                 .watcher
                 .as_ref()
@@ -734,9 +1540,25 @@ pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResul
                 panes: rows
                     .iter()
                     .map(|r| {
-                        let entry = detections.get(&r.pane_id);
+                        let pane = crate::PaneKey::new(session_idx, &r.pane_id);
+                        let entry = detections.get(&pane);
+                        let recipient = instance_id.and_then(|instance_id| {
+                            Some(RecipientKey::agent(
+                                inner.workspace_id,
+                                instance_id,
+                                r.pane_id.parse().ok()?,
+                            ))
+                        });
+                        let pane_root = identity::ProcId::of(r.pane_pid)
+                            .and_then(|root| ProcessInstanceId::new(root.pid, root.birth).ok());
+                        let adoption = recipient.and_then(|recipient| {
+                            adoptions.iter().find(|adoption| {
+                                adoption.recipient == Some(recipient)
+                                    && adoption.pane_root == pane_root
+                            })
+                        });
                         let mut ps = r.to_status(
-                            labels.get(&r.pane_id).cloned(),
+                            adoption.map(|adoption| adoption.label.clone()),
                             entry.and_then(|e| e.manifest.clone()),
                             entry
                                 .map(|e| e.detection.state)
@@ -746,17 +1568,40 @@ pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResul
                         // the change mark fusion keeps. The roster's
                         // elapsed column is this number and nothing else.
                         ps.state_ms = entry.map(|e| e.since.elapsed().as_millis() as u64);
+                        // The second answer, carried from the same stamp
+                        // the gate obeys. A pane with no cached detection
+                        // has nothing behind it, so it stays refused.
+                        ps.write_ready = entry.is_some_and(|e| e.detection.write_ready);
+                        ps.write_block = entry.and_then(|e| e.detection.write_block.clone());
                         // Hook liveness (amendment c): adopted panes whose
                         // manifest declares hooks carry the verified bit,
                         // scoped to the current occupant (edges from a
                         // replaced occupant count for nothing).
-                        ps.hooks_verified = crate::selftest::hooks_verified_for(
-                            inner,
-                            &r.pane_id,
-                            labels.contains_key(&r.pane_id),
-                            entry.and_then(|e| e.manifest.as_deref()),
-                            r.pane_pid,
-                        );
+                        //
+                        // The occupant lookup shells out, so it runs only
+                        // for panes whose answer can be anything but
+                        // false. A manifest that declares no hooks
+                        // already settles it, and status should not spawn
+                        // a process per pane to reprint that.
+                        //
+                        // The agent identity comes off the same stamp as
+                        // everything else in this row, and deliberately so:
+                        // resolving it here would inspect processes once
+                        // per pane, on a call whose whole job is to print
+                        // what the daemon already knows, and would hold
+                        // the detection lock across all of it. A pane that
+                        // changes hands is republished by the recompute
+                        // its own output triggers.
+                        let bound = entry.and_then(|e| e.manifest.as_deref());
+                        ps.hooks_verified = bound.and_then(|m| {
+                            crate::selftest::hooks_verified_for(
+                                inner,
+                                &pane,
+                                adoption.is_some(),
+                                Some(m),
+                                entry.and_then(|e| e.agent),
+                            )
+                        });
                         // The manifest's own display name, from the same
                         // load the daemon did at boot: a client renders
                         // daemon identity data instead of re-parsing
@@ -779,7 +1624,9 @@ pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResul
         uptime_ms: inner.started.elapsed().as_millis() as u64,
         tmux_version: inner.tmux_version.clone(),
         sessions,
+        admin_unread,
         open_deliveries,
+        diagnostics,
         // Always answered, empty set included: "I loaded none" is the fact
         // a client needs to explain an unknown pane, and it is exactly the
         // fact an omitted field would hide.
@@ -843,6 +1690,9 @@ async fn pane_read(inner: &Arc<Inner>, id: Value, params: Value) -> Response {
             )
             .await
             {
+                // Both answers travel together, and neither is computed
+                // here: fusion stamped them when it produced the verdict,
+                // so this surface cannot disagree with the gate.
                 Some(det) => det,
                 None => return Response::err(id, "no_such_target", "pane vanished during read"),
             };
@@ -904,17 +1754,12 @@ fn cap_lines(text: String, cap: Option<u32>) -> String {
 /// needs that idx rather than a name re-derived from the watcher, for the
 /// same reason `emit_state` takes one — see its doc comment.
 fn resolve_target(inner: &Inner, target: &str) -> Option<(usize, Arc<SessionWatcher>, String)> {
-    let wanted = inner.label_target(target);
-    inner
-        .session_slots()
-        .iter()
-        .enumerate()
-        .find_map(|(idx, slot)| {
-            let link = slot.link.lock().expect("session link lock");
-            link.watcher
-                .as_ref()
-                .and_then(|w| w.pane(&wanted).map(|row| (idx, Arc::clone(w), row.pane_id)))
-        })
+    let (idx, pane_id) = inner.resolve_recipient(target)?;
+    inner.watcher_of(idx).and_then(|watcher| {
+        watcher
+            .pane(&pane_id)
+            .map(|row| (idx, watcher, row.pane_id))
+    })
 }
 
 fn known_panes(inner: &Inner) -> Vec<String> {
@@ -955,15 +1800,144 @@ async fn write_line(w: &mut OwnedWriteHalf, line: &str) -> bool {
 mod tests {
     use super::*;
     use crate::{Config, DetEntry};
+    use cyclops_proto::{
+        LiveSessionKey, MessagesChangedArea, MessagesChangedData, MessagesSnapshotResult, OsBootId,
+        ProcessInstanceId, RecipientKey, SessionIdentityBinding, SessionInstanceId, TmuxPaneId,
+        TmuxSessionId, WorkspaceId,
+    };
     use std::collections::{BTreeMap, HashMap};
+    use std::path::Path;
+    use std::str::FromStr;
     use std::sync::Mutex as StdMutex;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_nonpending_claim_has_a_recoverable_wire_code() {
+        let error = mailbox_service_error(crate::mailbox::MailboxServiceError::from(
+            crate::mailbox::MailboxError::MessageNotPending("m-old".parse().unwrap()),
+        ));
+
+        assert_eq!(error.code, "message_not_pending");
+    }
+
+    #[tokio::test]
+    async fn stale_socket_is_replaced_before_recursive_state_repair() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-stale-socket-repair");
+        let _ = std::fs::remove_dir_all(&home);
+        let state_root = cyclops_state::StateRoot::open_or_create(&home).unwrap();
+        let socket_path = home.join(cyclops_proto::SOCK_NAME);
+        let stale = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        drop(stale);
+
+        let bound = bind_socket(&state_root).await.unwrap();
+        let summary = state_root
+            .repair_descendant_permissions(Some(std::ffi::OsStr::new(cyclops_proto::SOCK_NAME)))
+            .unwrap();
+
+        assert!(summary.live_socket_preserved);
+        UnixStream::connect(&socket_path).await.unwrap();
+        drop(bound);
+        assert!(!socket_path.exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn root_swap_is_refused_and_cleanup_does_not_touch_the_replacement() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let home = cyclops_proto::scratch::scratch_dir("cyc-bound-root-swap");
+        let displaced = cyclops_proto::scratch::scratch_dir("cyc-bound-root-displaced");
+        let replacement = cyclops_proto::scratch::scratch_dir("cyc-bound-root-replacement");
+        for path in [&home, &displaced, &replacement] {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        let state_root = cyclops_state::StateRoot::open_or_create(&home).unwrap();
+        let bound = bind_socket(&state_root).await.unwrap();
+
+        std::fs::create_dir_all(&replacement).unwrap();
+        let external_socket_path = replacement.join(cyclops_proto::SOCK_NAME);
+        let external_socket =
+            std::os::unix::net::UnixListener::bind(&external_socket_path).unwrap();
+        let sentinel = replacement.join("sentinel");
+        std::fs::write(&sentinel, b"external\n").unwrap();
+        std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let socket_before = std::fs::symlink_metadata(&external_socket_path).unwrap();
+        let sentinel_before = std::fs::metadata(&sentinel).unwrap();
+
+        std::fs::rename(&home, &displaced).unwrap();
+        std::fs::rename(&replacement, &home).unwrap();
+        let repair = state_root
+            .repair_descendant_permissions(Some(std::ffi::OsStr::new(cyclops_proto::SOCK_NAME)))
+            .unwrap();
+
+        assert!(crate::require_bound_socket_in_state_root(&repair, &state_root).is_err());
+        drop(bound);
+
+        assert!(!displaced.join(cyclops_proto::SOCK_NAME).exists());
+        let socket_after = std::fs::symlink_metadata(home.join(cyclops_proto::SOCK_NAME)).unwrap();
+        let sentinel_after = std::fs::metadata(home.join("sentinel")).unwrap();
+        assert_eq!(socket_after.dev(), socket_before.dev());
+        assert_eq!(socket_after.ino(), socket_before.ino());
+        assert_eq!(socket_after.mode(), socket_before.mode());
+        assert_eq!(sentinel_after.dev(), sentinel_before.dev());
+        assert_eq!(sentinel_after.ino(), sentinel_before.ino());
+        assert_eq!(sentinel_after.mode(), sentinel_before.mode());
+        assert_eq!(std::fs::read(home.join("sentinel")).unwrap(), b"external\n");
+
+        drop(external_socket);
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&displaced);
+    }
+
+    #[tokio::test]
+    async fn bound_socket_cleanup_refuses_a_replaced_socket_entry() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let home = cyclops_proto::scratch::scratch_dir("cyc-bound-socket-replaced");
+        let external = cyclops_proto::scratch::scratch_dir("cyc-bound-socket-external");
+        for path in [&home, &external] {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        let state_root = cyclops_state::StateRoot::open_or_create(&home).unwrap();
+        let bound = bind_socket(&state_root).await.unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let external_path = external.join("replacement.sock");
+        let external_socket = std::os::unix::net::UnixListener::bind(&external_path).unwrap();
+        let bound_path = home.join(cyclops_proto::SOCK_NAME);
+        std::fs::remove_file(&bound_path).unwrap();
+        std::fs::rename(&external_path, &bound_path).unwrap();
+        let before = std::fs::symlink_metadata(&bound_path).unwrap();
+
+        drop(bound);
+
+        let after = std::fs::symlink_metadata(&bound_path).unwrap();
+        assert_eq!(after.dev(), before.dev());
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.mode(), before.mode());
+        drop(external_socket);
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&external);
+    }
 
     fn bare_inner() -> Arc<Inner> {
-        let home = cyclops_proto::scratch::scratch_dir("cyc-unit");
-        let (registry, _) = crate::registry::Registry::load(&home);
+        let home =
+            cyclops_proto::scratch::scratch_dir(&format!("cyc-unit-{}", uuid::Uuid::new_v4()));
+        let state_root = Arc::new(cyclops_state::StateRoot::open_or_create(&home).unwrap());
+        let (registry, _) = crate::registry::Registry::load(Arc::clone(&state_root));
+        let workspace_id = crate::workspaceid::load_or_create(&state_root).unwrap();
+        let session_identities = crate::sessionstore::SessionIdentities::open(&state_root).unwrap();
         Arc::new(Inner {
             cfg: Config::defaults(&home),
+            state_root,
+            state_repair: cyclops_state::RepairSummary::default(),
+            workspace_id,
+            session_identities: StdMutex::new(session_identities),
+            mailbox: None,
+            composer_recovery: StdMutex::new(
+                crate::composer_recovery::RecoveryCoordinator::default(),
+            ),
+            mailbox_publication: StdMutex::new(()),
+            mailbox_publish_pause: StdMutex::new(None),
             boot_id: "b-test".into(),
             started: Instant::now(),
             tmux_version: "3.6a".into(),
@@ -971,10 +1945,11 @@ mod tests {
             manifest_dir: None,
             sessions: StdMutex::new(Vec::new()),
             events: broadcast::channel(16).0,
-            detections: StdMutex::new(HashMap::<String, DetEntry>::new()),
+            detections: StdMutex::new(HashMap::<crate::PaneKey, DetEntry>::new()),
             registry: StdMutex::new(registry),
             theme: StdMutex::new(cyclops_theme::ThemeWatch::new(&home)),
             hook_readings: StdMutex::new(HashMap::new()),
+            turn_ends: StdMutex::new(crate::turnkey::Ends::new()),
             argv_cache: StdMutex::new(HashMap::new()),
             engine: crate::delivery::Engine::new(),
             ack_state: crate::ack::AckState::new(),
@@ -995,13 +1970,16 @@ mod tests {
     fn inner_with_ledger(tag: &str) -> (Arc<Inner>, std::path::PathBuf) {
         let dir = cyclops_proto::scratch::scratch_dir(tag);
         let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("ledger/main.ndjson");
-        std::fs::create_dir_all(path.parent().expect("ledger dir")).expect("scratch dir");
-        std::fs::copy(
+        let fixture = std::fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/history.ndjson"),
-            &path,
         )
-        .expect("fixture copies");
+        .expect("fixture reads");
+        let state_root = cyclops_state::StateRoot::open_or_create(&dir).expect("state root opens");
+        let mut fixture_file = state_root
+            .open_append(std::path::Path::new("ledger/main.ndjson"))
+            .expect("fixture file opens");
+        std::io::Write::write_all(&mut fixture_file, &fixture).expect("fixture writes");
+        fixture_file.sync_data().expect("fixture syncs");
         let mut inner = bare_inner();
         Arc::get_mut(&mut inner)
             .expect("sole owner")
@@ -1011,7 +1989,12 @@ mod tests {
             .push(Arc::new(crate::SessionSlot::new(
                 "main".into(),
                 Arc::new(
-                    cyclops_ledger::LedgerWriter::open(&path, "b-test").expect("ledger opens"),
+                    cyclops_ledger::LedgerWriter::open(
+                        &state_root,
+                        std::path::Path::new("ledger/main.ndjson"),
+                        "b-test",
+                    )
+                    .expect("ledger opens"),
                 ),
             )));
         (inner, dir)
@@ -1151,6 +2134,494 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A daemon whose mailbox is connected and empty.
+    fn inner_with_mailbox(tag: &str) -> (Arc<Inner>, std::path::PathBuf) {
+        let path = cyclops_proto::scratch::scratch_dir(tag);
+        let _ = std::fs::remove_dir_all(&path);
+        let root = cyclops_state::StateRoot::open_or_create(&path).unwrap();
+        let workspace = WorkspaceId::from_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let directory = crate::mailbox::MailboxDirectory::new(workspace, []).unwrap();
+        let store = crate::mailbox::MessageStore::open(
+            &root,
+            Path::new("workspaces/current/messages.ndjson"),
+            workspace,
+            "boot",
+        )
+        .unwrap();
+        let mut inner = bare_inner();
+        let service =
+            crate::mailbox::MailboxService::new_with_events(directory, store, inner.events.clone());
+        Arc::get_mut(&mut inner).expect("sole owner").mailbox = Some(Arc::new(service));
+        (inner, path)
+    }
+
+    /// A daemon whose mailbox holds one message with one alarm on it.
+    ///
+    /// Built through the real store so the alarm the operator commands
+    /// read is the one the projection produces, not a hand-made record.
+    fn inner_with_alarm(
+        tag: &str,
+        cause: cyclops_proto::NotificationAttentionCause,
+    ) -> (
+        Arc<Inner>,
+        std::path::PathBuf,
+        NotificationAttemptId,
+        String,
+    ) {
+        use cyclops_proto::{
+            Kind, MessagePresentation, NotificationBinding, NotificationManifestId,
+            NotificationState, ProcessInstanceId, RecipientPresentation,
+        };
+
+        let path = cyclops_proto::scratch::scratch_dir(tag);
+        let _ = std::fs::remove_dir_all(&path);
+        let root = cyclops_state::StateRoot::open_or_create(&path).unwrap();
+        let workspace = WorkspaceId::from_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let session = SessionInstanceId::from_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let pane = TmuxPaneId::from_str("%1").unwrap();
+        let agent = RecipientKey::agent(workspace, session, pane);
+        let admin = RecipientKey::admin(workspace);
+
+        let directory = crate::mailbox::MailboxDirectory::new(
+            workspace,
+            [crate::mailbox::MailboxIdentity {
+                key: agent,
+                label: "reviewer".into(),
+            }],
+        )
+        .unwrap();
+        let mut store = crate::mailbox::MessageStore::open(
+            &root,
+            Path::new("workspaces/current/messages.ndjson"),
+            workspace,
+            "boot",
+        )
+        .unwrap();
+
+        let message_id = cyclops_proto::MessageId::new("m-alarm").unwrap();
+        store
+            .accept(
+                message_id.clone(),
+                crate::mailbox::MessageDraft {
+                    kind: Kind::Msg,
+                    sender: admin,
+                    recipients: vec![agent],
+                    subject: Some("Subject".into()),
+                    body: Some("Body".into()),
+                    client_key: None,
+                    supersedes: None,
+                    presentation: MessagePresentation {
+                        sender_label: "admin".into(),
+                        recipient_labels: vec![RecipientPresentation {
+                            recipient: agent,
+                            label: "reviewer".into(),
+                        }],
+                    },
+                },
+            )
+            .unwrap();
+
+        let attempt_id = NotificationAttemptId::generate();
+        let binding = NotificationBinding {
+            recipient: agent,
+            leader: Some(ProcessInstanceId::new(4000, 818_000).unwrap()),
+            agent: ProcessInstanceId::new(4242, 818_221).unwrap(),
+            manifest: NotificationManifestId::new("codex").unwrap(),
+        };
+        store
+            .queue_notification(message_id.clone(), agent, attempt_id)
+            .unwrap();
+        let mut steps = vec![
+            (NotificationState::Gating, None),
+            (NotificationState::Writing, Some(binding)),
+        ];
+        // Ask the closed cause vocabulary which state it belongs after,
+        // rather than hard-coding one path and hitting an illegal cause.
+        if !cause.valid_after(NotificationState::Writing) {
+            steps.push((NotificationState::Staged, None));
+        }
+        for (state, binding) in steps {
+            store
+                .advance_notification(message_id.clone(), agent, attempt_id, state, binding, None)
+                .unwrap();
+        }
+        store
+            .advance_notification(
+                message_id.clone(),
+                agent,
+                attempt_id,
+                NotificationState::AttentionRequired,
+                None,
+                Some(cause),
+            )
+            .unwrap();
+
+        let mut inner = bare_inner();
+        let service =
+            crate::mailbox::MailboxService::new_with_events(directory, store, inner.events.clone());
+        Arc::get_mut(&mut inner).expect("sole owner").mailbox = Some(Arc::new(service));
+        (inner, path, attempt_id, message_id.to_string())
+    }
+
+    async fn ask_inner(inner: &Arc<Inner>, method: &str, params: Value) -> Response {
+        let request = Request {
+            params,
+            ..req(method)
+        };
+        let (response, _) = dispatch(inner, request, own_peer()).await;
+        response
+    }
+
+    #[tokio::test]
+    async fn send_and_reply_report_the_authoritative_workspace_state() {
+        let (inner, path) = inner_with_mailbox("workspace-send-reply");
+        let sent = ask_inner(
+            &inner,
+            "msg.send",
+            json!({
+                "to": ["admin"],
+                "subject": "Workspace message",
+                "body": "Body",
+                "client_key": "send-key"
+            }),
+        )
+        .await;
+        assert!(sent.error.is_none(), "{:?}", sent.error);
+        let sent = sent.result.unwrap();
+        assert_eq!(sent["deliveries"][0]["notification_state"], "not_started");
+
+        let reply = ask_inner(
+            &inner,
+            "msg.reply",
+            json!({
+                "message_id": sent["msg_id"],
+                "body": "Reply",
+                "client_key": "reply-key"
+            }),
+        )
+        .await;
+        assert!(reply.error.is_none(), "{:?}", reply.error);
+        assert_eq!(
+            reply.result.as_ref().unwrap()["deliveries"][0]["notification_state"],
+            "not_started"
+        );
+
+        let lines = inner.mailbox.as_ref().unwrap().journal_lines().unwrap();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| {
+                    matches!(
+                        line.kind,
+                        cyclops_proto::Kind::Msg | cyclops_proto::Kind::Fyi
+                    )
+                })
+                .count(),
+            2
+        );
+        assert_eq!(lines[1].reply_to.as_deref(), sent["msg_id"].as_str());
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[tokio::test]
+    async fn removed_send_wait_is_rejected_before_message_acceptance() {
+        let (inner, path) = inner_with_mailbox("removed-send-wait");
+        let response = ask_inner(
+            &inner,
+            "msg.send",
+            json!({
+                "to": ["admin"],
+                "subject": "Do work",
+                "wait": {"until": "done", "timeout_ms": 60_000}
+            }),
+        )
+        .await;
+
+        assert_eq!(response.error.unwrap().code, "notification_unavailable");
+        assert!(inner
+            .mailbox
+            .as_ref()
+            .unwrap()
+            .journal_lines()
+            .unwrap()
+            .is_empty());
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[tokio::test]
+    async fn subscribe_before_snapshot_closes_the_workspace_change_race() {
+        let (inner, path) = inner_with_mailbox("workspace-change-race");
+        let mut events = inner.events.subscribe();
+        let send_params = json!({
+            "to": ["admin"],
+            "subject": "Workspace message",
+            "body": "Private body",
+            "client_key": "race-key"
+        });
+
+        let sent = ask_inner(&inner, "msg.send", send_params.clone()).await;
+        assert!(sent.error.is_none(), "{:?}", sent.error);
+        let sent = sent.result.unwrap();
+        let snapshot = ask_inner(&inner, "messages.snapshot", json!({"recent_settled": 20})).await;
+        let snapshot: MessagesSnapshotResult =
+            serde_json::from_value(snapshot.result.unwrap()).unwrap();
+
+        let event = events.recv().await.unwrap();
+        assert_eq!(event.event, "messages.changed");
+        let data: MessagesChangedData = serde_json::from_value(event.data).unwrap();
+        assert_eq!(event.seq, Some(data.workspace_seq));
+        assert_eq!(data.workspace_id, snapshot.workspace_id);
+        assert!(data.workspace_seq <= snapshot.workspace_seq);
+        assert_eq!(
+            data.changed,
+            [
+                MessagesChangedArea::Messages,
+                MessagesChangedArea::Mailboxes,
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let claimed = ask_inner(&inner, "inbox.claim", json!({"message_id": sent["msg_id"]})).await;
+        assert!(claimed.error.is_none(), "{:?}", claimed.error);
+        let claim_event = events.recv().await.unwrap();
+        let claim_data: MessagesChangedData = serde_json::from_value(claim_event.data).unwrap();
+        assert_eq!(
+            claim_data.changed,
+            [MessagesChangedArea::Mailboxes].into_iter().collect()
+        );
+        assert!(claim_data.workspace_seq > data.workspace_seq);
+
+        let reply_params = json!({
+            "message_id": sent["msg_id"],
+            "body": "Reply body",
+            "client_key": "race-reply-key"
+        });
+        let replied = ask_inner(&inner, "msg.reply", reply_params.clone()).await;
+        assert!(replied.error.is_none(), "{:?}", replied.error);
+        let reply_event = events.recv().await.unwrap();
+        let reply_data: MessagesChangedData = serde_json::from_value(reply_event.data).unwrap();
+        assert_eq!(
+            reply_data.changed,
+            [
+                MessagesChangedArea::Messages,
+                MessagesChangedArea::Mailboxes,
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(reply_data.workspace_seq > claim_data.workspace_seq);
+
+        for (method, params) in [
+            ("inbox.claim", json!({"message_id": sent["msg_id"]})),
+            ("msg.send", send_params),
+            ("msg.reply", reply_params),
+            ("inbox.list", json!({})),
+            ("messages.snapshot", json!({"recent_settled": 20})),
+            ("alarm.preview", json!({"older_than_ms": 0})),
+            (
+                "msg.reply",
+                json!({
+                    "message_id": "m-does-not-exist",
+                    "body": "Rejected",
+                    "client_key": "failed-reply"
+                }),
+            ),
+        ] {
+            let _ = ask_inner(&inner, method, params).await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), events.recv())
+                .await
+                .is_err(),
+            "a read, retry, re-claim, or failed mutation emitted a change"
+        );
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[tokio::test]
+    async fn attention_show_is_read_only_and_failed_resolution_writes_nothing() {
+        let (inner, path, attempt_id, _) = inner_with_alarm(
+            "cyc-attention-show-read-only",
+            NotificationAttentionCause::VerifyFailed,
+        );
+        let journal = path.join("workspaces/current/messages.ndjson");
+        let before = std::fs::read_to_string(&journal).unwrap();
+
+        let response = ask_inner(
+            &inner,
+            "attention.show",
+            json!({"id": attempt_id.to_string(), "diff": true}),
+        )
+        .await;
+        let shown: cyclops_proto::AttentionShowResult =
+            serde_json::from_value(response.result.unwrap()).unwrap();
+        assert_eq!(shown.attempt_id, attempt_id);
+        assert!(!shown.checks.all_pass());
+        assert!(shown.expected.is_some());
+        assert!(shown.observed.is_none());
+        assert_eq!(std::fs::read_to_string(&journal).unwrap(), before);
+
+        let response = ask_inner(
+            &inner,
+            "attention.complete",
+            json!({"id": attempt_id.to_string()}),
+        )
+        .await;
+        assert_eq!(response.error.unwrap().code, "attention_evidence_failed");
+        assert_eq!(std::fs::read_to_string(&journal).unwrap(), before);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn a_post_intent_failure_is_never_reported_as_a_safe_refusal() {
+        let error =
+            attention_action_error(crate::attention_resolution::AttentionActionError::Uncertain);
+        assert_eq!(error.code, "attention_action_uncertain");
+        assert!(error.message.contains("outcome is uncertain"));
+    }
+
+    /// Preview names why an attempt needs attention, so an operator can
+    /// tell a composer that never took the text from one that took it and
+    /// did not send.
+    #[tokio::test]
+    async fn preview_reports_the_cause_without_message_content() {
+        for (cause, expected) in [
+            (
+                cyclops_proto::NotificationAttentionCause::VerifyFailed,
+                "verify_failed",
+            ),
+            (
+                cyclops_proto::NotificationAttentionCause::SubmitFailed,
+                "submit_failed",
+            ),
+        ] {
+            let (inner, path, attempt_id, message_id) =
+                inner_with_alarm(&format!("operator-cause-{expected}"), cause);
+            let response = ask_inner(&inner, "alarm.preview", json!({"older_than_ms": 0})).await;
+            assert!(response.error.is_none(), "{:?}", response.error);
+            let value = response.result.unwrap();
+            let entry = &value["entries"][0];
+            assert_eq!(entry["cause"], expected);
+            assert_eq!(entry["id"], attempt_id.to_string());
+            assert_eq!(entry["message_id"], message_id);
+            // The subject and body the message carries stay behind.
+            assert!(entry.get("subject").is_none() && entry.get("body").is_none());
+            std::fs::remove_dir_all(path).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_snapshot_answers_from_the_authenticated_workspace_projection() {
+        let (inner, path, attempt_id, message_id) = inner_with_alarm(
+            "messages-snapshot",
+            cyclops_proto::NotificationAttentionCause::VerifyFailed,
+        );
+        let response = ask_inner(&inner, "messages.snapshot", json!({})).await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let value = response.result.unwrap();
+        let row = &value["rows"][0];
+        assert_eq!(row["message_id"], message_id);
+        assert_eq!(row["direction"], "outbound");
+        assert_eq!(row["needs_action"], true);
+        assert_eq!(value["counts"]["work_messages"], 1);
+        assert_eq!(value["counts"]["outbound_messages"], 1);
+        assert_eq!(value["counts"]["inbox_messages"], 0);
+        assert_eq!(row["recipients"][0]["available"], true);
+        assert_eq!(row["recipients"][0]["mailbox"]["status"], "pending");
+        assert_eq!(
+            row["recipients"][0]["notification"]["state"],
+            "attention_required"
+        );
+        assert_eq!(
+            row["recipients"][0]["notification"]["attempt_id"],
+            attempt_id.to_string()
+        );
+        assert_eq!(
+            row["recipients"][0]["notification"]["cause"],
+            "verify_failed"
+        );
+        assert_eq!(
+            row["recipients"][0]["notification"]["attention_cleared"],
+            false
+        );
+        assert!(row.get("body").is_none());
+        assert!(!value.to_string().contains("Body"));
+
+        let too_large =
+            ask_inner(&inner, "messages.snapshot", json!({"recent_settled": 101})).await;
+        assert_eq!(too_large.error.unwrap().code, "bad_request");
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    /// A message nobody has heard of is a mistake worth reporting. A known
+    /// message with nothing in attention is a quiet, honest no.
+    #[tokio::test]
+    async fn requeue_separates_an_unknown_message_from_a_quiet_one() {
+        let (inner, path, _, message_id) = inner_with_alarm(
+            "operator-requeue-known",
+            cyclops_proto::NotificationAttentionCause::SubmitFailed,
+        );
+
+        let response = ask_inner(&inner, "msg.requeue", json!({"message_id": "m-nobody"})).await;
+        assert_eq!(response.error.unwrap().code, "no_such_message");
+
+        // The alarm on the known message is requeued once.
+        let response = ask_inner(&inner, "msg.requeue", json!({"message_id": message_id})).await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        assert_eq!(response.result.unwrap()["requeued"], true);
+
+        // The fresh attempt is queued, not an alarm, so a second requeue
+        // has nothing to act on and says so without failing.
+        let response = ask_inner(&inner, "msg.requeue", json!({"message_id": message_id})).await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        assert_eq!(response.result.unwrap()["requeued"], false);
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    async fn call(tag: &str, method: &str, params: Value) -> Response {
+        let (inner, path) = inner_with_mailbox(&format!("operator-{tag}"));
+        let request = Request {
+            params,
+            ..req(method)
+        };
+        let (response, _) = dispatch(&inner, request, own_peer()).await;
+        std::fs::remove_dir_all(path).ok();
+        response
+    }
+
+    /// The operator commands answer from the durable projection instead of
+    /// reporting it unavailable, and each one refuses what it cannot name.
+    ///
+    /// Every case runs through `dispatch`, so the admin gate each handler
+    /// applies is exercised rather than bypassed.
+    #[tokio::test]
+    async fn operator_commands_answer_from_the_durable_projection() {
+        // Preview on an empty workspace is an empty list, not an error.
+        let response = call("preview", "alarm.preview", json!({"older_than_ms": 0})).await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result: AlarmPreviewResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert!(result.entries.is_empty());
+
+        // A malformed identifier never reaches the store.
+        let response = call("bad-id", "alarm.clear", json!({"ids": ["not-an-attempt"]})).await;
+        assert_eq!(response.error.unwrap().code, "bad_request");
+
+        // A well-formed identifier that names no alarm is refused.
+        let unknown = NotificationAttemptId::generate().to_string();
+        let response = call("unknown-id", "alarm.clear", json!({"ids": [unknown]})).await;
+        assert_eq!(response.error.unwrap().code, "no_such_alarm");
+
+        // Clearing nothing is refused rather than treated as success.
+        let response = call("empty-ids", "alarm.clear", json!({"ids": []})).await;
+        assert_eq!(response.error.unwrap().code, "bad_request");
+
+        // A message this workspace never saw is named, not reported as a
+        // quiet no. The quiet no belongs to a message that exists.
+        let response = call("requeue", "msg.requeue", json!({"message_id": "m-absent"})).await;
+        assert_eq!(response.error.unwrap().code, "no_such_message");
+    }
+
     fn req(method: &str) -> Request {
         Request {
             id: json!(1),
@@ -1159,38 +2630,294 @@ mod tests {
         }
     }
 
+    /// This process, over a real socket, so the peer is attested the way
+    /// a client's would be rather than asserted by the test.
+    ///
+    /// The pair is leaked deliberately: the descriptor has to stay open
+    /// for the whole test, because every gated request asks it again.
     fn own_peer() -> Peer {
-        Some((unsafe { libc::getuid() }, std::process::id() as i32))
+        use std::os::fd::AsRawFd;
+        let (a, b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let fd = a.as_raw_fd();
+        let id = identity::peer_identity_fd(fd).expect("peer identity");
+        std::mem::forget(a);
+        std::mem::forget(b);
+        Some(identity::PeerConn { id, fd })
     }
 
-    /// Every protocol v1 method answers with something that is not
-    /// unknown_method: implemented, unimplemented, or a param error.
-    /// Every method protocol v1 answers. One list, read by the dispatch
-    /// check below and by the page that documents the wire.
-    const PROTOCOL_V1: [&str; 17] = [
-        "ping",
-        "status",
-        "msg.send",
-        "msg.history",
-        "msg.thread",
-        "agent.wait",
-        "agent.state.report",
-        "pane.read",
-        "pane.label",
-        "session.watch",
-        "events.subscribe",
-        "admin.notify",
-        "hooks.verify",
-        "hooks.selftest",
-        "theme.reload",
-        "workspace_ui.get",
-        "workspace_ui.set",
-    ];
+    #[test]
+    fn mailbox_caller_waits_for_route_publication() {
+        let inner = bare_inner();
+        let peer = own_peer();
+        let publication = inner.mailbox_publication.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let inner = Arc::clone(&inner);
+            let reader = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                let _ = mailbox_caller(&inner, peer);
+                done_tx.send(()).unwrap();
+            });
+            started_rx.recv().unwrap();
+            let overlapped = done_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_ok();
+            drop(publication);
+            reader.join().unwrap();
+            assert!(!overlapped, "mailbox caller observed a partial publication");
+        });
+    }
+
+    #[test]
+    fn exact_route_tokens_separate_duplicate_pane_ids_and_reject_crossed_roots() {
+        let workspace = WorkspaceId::from_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let pane = TmuxPaneId::from_str("%1").unwrap();
+        let first_session =
+            SessionInstanceId::from_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let second_session =
+            SessionInstanceId::from_str("00000000-0000-0000-0000-000000000003").unwrap();
+        let first_root = identity::ProcId { pid: 41, birth: 1 };
+        let second_root = identity::ProcId { pid: 42, birth: 2 };
+        let panes = vec![
+            ReportPane {
+                session_idx: 0,
+                recipient_key: RecipientKey::agent(workspace, first_session, pane),
+                pane_id: pane.to_string(),
+                label: Some("first".into()),
+                root: first_root,
+            },
+            ReportPane {
+                session_idx: 1,
+                recipient_key: RecipientKey::agent(workspace, second_session, pane),
+                pane_id: pane.to_string(),
+                label: Some("second".into()),
+                root: second_root,
+            },
+        ];
+
+        let selected = report_pane_at(&panes, "1", second_root).unwrap();
+        assert_eq!(selected.session_idx, 1);
+        assert_eq!(selected.label.as_deref(), Some("second"));
+        assert_eq!(
+            selected.recipient_key,
+            RecipientKey::agent(workspace, second_session, pane)
+        );
+
+        assert!(
+            report_pane_at(&panes, "1", first_root).is_none(),
+            "a route token cannot borrow another session's matching pane root"
+        );
+        assert!(report_pane_at(&panes, "%1", second_root).is_none());
+    }
+
+    #[test]
+    fn mailbox_origin_requires_the_current_durable_pane_binding() {
+        let inner = bare_inner();
+        let path = inner.state_root.path().to_path_buf();
+        let workspace = inner.workspace_id;
+        let session = SessionInstanceId::from_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let pane = TmuxPaneId::from_str("%1").unwrap();
+        let key = RecipientKey::agent(workspace, session, pane);
+        let root_process = identity::ProcId::of(std::process::id() as i32).unwrap();
+        let ledger = cyclops_ledger::LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/mailbox-origin.ndjson"),
+            "boot",
+        )
+        .unwrap();
+        let slot = Arc::new(crate::SessionSlot::new(
+            "mailbox-origin".into(),
+            Arc::new(ledger),
+        ));
+        slot.last_panes.lock().unwrap().insert(
+            pane.to_string(),
+            crate::ObservedPane {
+                row: cyclops_tmux::PaneRow {
+                    pane_id: pane.to_string(),
+                    window_id: "@1".into(),
+                    window_name: "mailbox".into(),
+                    title: String::new(),
+                    dead: false,
+                    in_mode: false,
+                    current_command: "test".into(),
+                    width: 80,
+                    height: 24,
+                    active: true,
+                    pane_pid: root_process.pid,
+                },
+                root: Some(root_process),
+            },
+        );
+        slot.link.lock().unwrap().identity = Some(SessionIdentityBinding::new(
+            LiveSessionKey::new(
+                workspace,
+                OsBootId::new("boot-test").unwrap(),
+                ProcessInstanceId::new(900, 1000).unwrap(),
+                TmuxSessionId::from_str("$1").unwrap(),
+            ),
+            session,
+        ));
+        inner.sessions.lock().unwrap().push(Arc::clone(&slot));
+        inner
+            .registry
+            .lock()
+            .unwrap()
+            .adopt(
+                crate::registry::Adoption {
+                    session: "mailbox-origin".into(),
+                    pane_id: pane.to_string(),
+                    label: "reviewer".into(),
+                    recipient: Some(key),
+                    pane_root: Some(
+                        ProcessInstanceId::new(root_process.pid, root_process.birth).unwrap(),
+                    ),
+                    manifest: None,
+                    pane_pid: root_process.pid,
+                    window_id: "@1".into(),
+                    border_format: None,
+                },
+                crate::registry::WindowChrome {
+                    session: "mailbox-origin".into(),
+                    window_id: "@1".into(),
+                    border_status: None,
+                },
+            )
+            .unwrap();
+        let directory = crate::mailbox::MailboxDirectory::new(
+            workspace,
+            [crate::mailbox::MailboxIdentity {
+                key,
+                label: "reviewer".into(),
+            }],
+        )
+        .unwrap();
+        let store = crate::mailbox::MessageStore::open(
+            &inner.state_root,
+            Path::new("workspaces/current/messages.ndjson"),
+            workspace,
+            "boot",
+        )
+        .unwrap();
+        let service = crate::mailbox::MailboxService::new(directory, store);
+
+        assert_eq!(
+            mailbox_identity_from_origin(&inner, &service, identity::PeerOrigin::Admin)
+                .unwrap()
+                .key,
+            RecipientKey::admin(workspace)
+        );
+        assert_eq!(
+            mailbox_identity_from_origin(
+                &inner,
+                &service,
+                identity::PeerOrigin::Pane {
+                    pane_id: "%1".into(),
+                    label: Some("stale-display-name".into()),
+                    pane_root: root_process,
+                },
+            )
+            .unwrap()
+            .key,
+            key
+        );
+        let predecessor_root = identity::ProcId {
+            pid: root_process.pid,
+            birth: root_process.birth.checked_sub(1).unwrap_or(1),
+        };
+        slot.last_panes.lock().unwrap().get_mut("%1").unwrap().root = Some(predecessor_root);
+        let reused_pid = mailbox_identity_from_origin(
+            &inner,
+            &service,
+            identity::PeerOrigin::Pane {
+                pane_id: "%1".into(),
+                label: None,
+                pane_root: root_process,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(reused_pid.code, "denied");
+        slot.last_panes.lock().unwrap().get_mut("%1").unwrap().root = Some(root_process);
+        let replacement_session =
+            SessionInstanceId::from_str("00000000-0000-0000-0000-000000000003").unwrap();
+        slot.link.lock().unwrap().identity = Some(SessionIdentityBinding::new(
+            LiveSessionKey::new(
+                workspace,
+                OsBootId::new("boot-test").unwrap(),
+                ProcessInstanceId::new(901, 2000).unwrap(),
+                TmuxSessionId::from_str("$2").unwrap(),
+            ),
+            replacement_session,
+        ));
+        let stale_directory = mailbox_identity_from_origin(
+            &inner,
+            &service,
+            identity::PeerOrigin::Pane {
+                pane_id: "%1".into(),
+                label: None,
+                pane_root: root_process,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(stale_directory.code, "denied");
+        let missing = mailbox_identity_from_origin(
+            &inner,
+            &service,
+            identity::PeerOrigin::Pane {
+                pane_id: "%2".into(),
+                label: None,
+                pane_root: identity::ProcId { pid: 30, birth: 2 },
+            },
+        )
+        .unwrap_err();
+        assert_eq!(missing.code, "denied");
+        let unprovable =
+            mailbox_identity_from_origin(&inner, &service, identity::PeerOrigin::Unprovable)
+                .unwrap_err();
+        assert_eq!(unprovable.code, "denied");
+        drop(service);
+        drop(inner);
+        drop(slot);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    /// Read the public method literals from the dispatch match itself.
+    ///
+    /// This deliberately mirrors [`emitted_events`]: the daemon has one
+    /// executable catalogue, so documentation parity cannot stay green
+    /// after a dispatch arm is added without its protocol entry. Methods
+    /// reserved for a later milestone also answer through the fallback and
+    /// remain part of the advertised catalogue.
+    fn protocol_v1_methods() -> Vec<&'static str> {
+        let source = include_str!("server.rs");
+        let dispatch = source
+            .split_once("match req.method.as_str() {")
+            .expect("dispatch method match")
+            .1
+            .split_once("\n        method => {")
+            .expect("dispatch fallback arm")
+            .0;
+        let mut methods: Vec<&str> = dispatch
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("        \"")
+                    .and_then(|line| line.split_once("\" =>").map(|(method, _)| method))
+            })
+            .collect();
+        methods.extend(UNIMPLEMENTED.iter().map(|(method, _)| *method));
+
+        let mut unique = std::collections::BTreeSet::new();
+        for method in &methods {
+            assert!(unique.insert(*method), "duplicate protocol method {method}");
+        }
+        methods
+    }
 
     #[tokio::test]
     async fn dispatch_covers_protocol_v1() {
         let inner = bare_inner();
-        for method in PROTOCOL_V1 {
+        for method in protocol_v1_methods() {
             let (resp, _) = dispatch(&inner, req(method), own_peer()).await;
             if let Some(err) = &resp.error {
                 assert_ne!(err.code, "unknown_method", "{method} fell through dispatch");
@@ -1214,7 +2941,7 @@ mod tests {
         let page = std::fs::read_to_string(root.join("../../docs/reference/PROTOCOL.md"))
             .expect("read docs/reference/PROTOCOL.md");
         let mut missing: Vec<String> = Vec::new();
-        for method in PROTOCOL_V1 {
+        for method in protocol_v1_methods() {
             if !page.contains(&format!("`{method}`")) {
                 missing.push(format!("method {method}"));
             }
@@ -1362,22 +3089,17 @@ mod tests {
         assert_eq!(resp.error.unwrap().code, "denied");
     }
 
-    #[tokio::test]
-    async fn msg_send_denies_foreign_uid() {
-        let inner = bare_inner();
-        let foreign = unsafe { libc::getuid() }.wrapping_add(1);
-        let (resp, _) = dispatch(
-            &inner,
-            Request {
-                id: json!(9),
-                method: "msg.send".into(),
-                params: json!({"to": ["reviewer"], "subject": "hi"}),
-            },
-            Some((foreign, 1)),
-        )
-        .await;
-        assert_eq!(resp.error.unwrap().code, "denied");
-    }
+    // Authority is checked when it is USED, not when the socket was
+    // accepted, and that cannot be proven from inside one process: both
+    // ends of a socketpair are this process, so the attested identity a
+    // re-read returns is always this execution's own. The regression
+    // lives in `tests/sender_identity.rs`, where a real client execs on
+    // a connection it already opened.
+    //
+    // The foreign-uid case is gone with it. The uid now comes from the
+    // kernel rather than from the caller, so it cannot be asserted, and
+    // that branch is reachable only from a socket another user really
+    // connected.
 
     #[tokio::test]
     async fn ping_and_status_answer_without_tmux() {

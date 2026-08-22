@@ -4,12 +4,16 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
 
 use serde_json::{json, Value};
+
+const GEMINI_ENDPOINT: &str =
+    "agent:00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000002/%9";
 
 /// Scratch home unique per test and process, under the relocatable
 /// scratch root. Kept short: Unix socket paths cap out around 104 bytes
@@ -79,6 +83,20 @@ fn run_cyclops(home: &Path, args: &[&str]) -> Output {
     run_cyclops_io(home, &[], args, None)
 }
 
+fn assert_json_failure(out: &Output, exit: i32, expected: Value) {
+    assert_eq!(out.status.code(), Some(exit));
+    assert!(
+        out.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<_> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "stdout: {stdout}");
+    let actual: Value = serde_json::from_str(lines[0]).expect("one JSON failure object");
+    assert_eq!(actual, expected);
+}
+
 /// run_cyclops with extra env vars and optional piped stdin. CYCLOPS_AGENT
 /// is scrubbed first so the developer's shell can't leak an identity into
 /// the hook tests. TMUX/TMUX_PANE are scrubbed for the same reason: a suite
@@ -97,6 +115,8 @@ fn run_cyclops_io(
         .env_remove("CYCLOPS_AGENT")
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
+        // Installer cache tests choose their own target directory.
+        .env_remove("CARGO_TARGET_DIR")
         .args(args);
     for (k, v) in envs {
         cmd.env(k, v);
@@ -698,6 +718,783 @@ fn watch_json_streams_events_then_reports_the_close() {
 }
 
 #[test]
+fn watch_rejects_every_unknown_display_alias_before_it_waits() {
+    let home = scratch_home("wuf");
+    serve_once(&home, hello(1), move |req| {
+        assert_eq!(req["method"], "status");
+        (
+            vec![json!({"id": req["id"], "result": canned_status()}).to_string()],
+            true,
+        )
+    });
+
+    let out = run_cyclops(
+        &home,
+        &["watch", "--from", "gemini", "--to", "me", "--plain"],
+    );
+
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown active display labels \"gemini\", \"me\""),
+        "{stderr}"
+    );
+    assert!(stderr.contains("cyclops list --all"), "{stderr}");
+    assert!(
+        stderr.contains("cyclops inbox next --timeout 30s"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("renaming"), "{stderr}");
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn deprecated_ui_rejects_the_same_unknown_display_alias() {
+    let home = scratch_home("uuf");
+    serve_once(&home, hello(1), move |req| {
+        assert_eq!(req["method"], "status");
+        (
+            vec![json!({"id": req["id"], "result": canned_status()}).to_string()],
+            true,
+        )
+    });
+
+    let out = run_cyclops(&home, &["ui", "--from", "gemini", "--plain"]);
+
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cyclops ui is deprecated"), "{stderr}");
+    assert!(
+        stderr.contains("unknown active display label \"gemini\""),
+        "{stderr}"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn watch_json_refuses_tui_only_display_filters_as_json() {
+    let home = scratch_home("wjf");
+
+    let out = run_cyclops(&home, &["watch", "--from", "ghost", "--json"]);
+
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stderr.is_empty());
+    let value: Value = serde_json::from_slice(&out.stdout).expect("JSON usage error");
+    assert_eq!(value["code"], "unsupported_watch_filter");
+    assert!(value["message"].as_str().unwrap().contains("--from"));
+    assert!(value["message"].as_str().unwrap().contains("--json"));
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_next_subscribes_before_listing_and_claims_after_one_event() {
+    let home = scratch_home("inx");
+    let mut step = 0_u8;
+    serve_once(&home, hello(1), move |req| {
+        step += 1;
+        match step {
+            1 => {
+                assert_eq!(req["method"], "events.subscribe");
+                assert_eq!(req["params"]["kinds"], json!(["messages.changed"]));
+                (
+                    vec![json!({"id": req["id"], "result": {"subscribed": true}}).to_string()],
+                    false,
+                )
+            }
+            2 => {
+                assert_eq!(req["method"], "inbox.list");
+                assert_eq!(req["params"]["limit"], 1);
+                assert_eq!(
+                    req["params"]["sender"],
+                    json!({
+                        "kind": "agent",
+                        "workspace_id": "00000000-0000-4000-8000-000000000001",
+                        "session_instance_id": "00000000-0000-4000-8000-000000000002",
+                        "pane_id": "%9"
+                    })
+                );
+                let changed = json!({
+                    "event": "messages.changed",
+                    "data": {
+                        "workspace_id": "00000000-0000-0000-0000-000000000001",
+                        "workspace_seq": 8,
+                        "changed": ["mailboxes"]
+                    },
+                    "seq": 8
+                })
+                .to_string();
+                (
+                    vec![
+                        json!({"id": req["id"], "result": {"entries": []}}).to_string(),
+                        changed.clone(),
+                        changed.clone(),
+                        changed,
+                    ],
+                    false,
+                )
+            }
+            3 => {
+                assert_eq!(req["method"], "inbox.list");
+                (
+                    vec![json!({"id": req["id"], "result": {"entries": [{
+                        "message_id": "m-live-use",
+                        "sender": {
+                            "kind": "agent",
+                            "workspace_id": "00000000-0000-4000-8000-000000000001",
+                            "session_instance_id": "00000000-0000-4000-8000-000000000002",
+                            "pane_id": "%9"
+                        },
+                        "sender_label": "gemini-test",
+                        "subject": "Startup retrospective",
+                        "ts": 8,
+                        "thread_root": "m-live-use"
+                    }]}})
+                    .to_string()],
+                    false,
+                )
+            }
+            4 => {
+                assert_eq!(req["method"], "inbox.claim");
+                assert_eq!(req["params"]["message_id"], "m-live-use");
+                (
+                    vec![json!({"id": req["id"], "result": {
+                        "disposition": "claimed",
+                        "message": {
+                            "message_id": "m-live-use",
+                            "kind": "msg",
+                            "sender": {
+                                "kind": "agent",
+                                "workspace_id": "00000000-0000-4000-8000-000000000001",
+                                "session_instance_id": "00000000-0000-4000-8000-000000000002",
+                                "pane_id": "%9"
+                            },
+                            "sender_label": "gemini-test",
+                            "subject": "Startup retrospective",
+                            "body": "The socket path breaks the circular wait.",
+                            "thread_root": "m-live-use"
+                        }
+                    }})
+                    .to_string()],
+                    true,
+                )
+            }
+            _ => panic!("unexpected request {req}"),
+        }
+    });
+
+    let out = run_cyclops(
+        &home,
+        &[
+            "inbox",
+            "next",
+            "--from",
+            GEMINI_ENDPOINT,
+            "--timeout",
+            "1s",
+            "--plain",
+        ],
+    );
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[cyclops m-live-use] FROM: gemini-test  SUBJECT: Startup retrospective\n\
+         The socket path breaks the circular wait.\n\
+         Reply: cyclops reply m-live-use --body \"...\"\n"
+    );
+    assert!(out.stderr.is_empty());
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_next_relists_when_the_selected_message_was_superseded() {
+    let home = scratch_home("ins");
+    let mut step = 0_u8;
+    serve_once(&home, hello(1), move |req| {
+        step += 1;
+        match step {
+            1 => (
+                vec![json!({"id": req["id"], "result": {"subscribed": true}}).to_string()],
+                false,
+            ),
+            2 => (
+                vec![json!({"id": req["id"], "result": {"entries": [{
+                    "message_id": "m-old",
+                    "sender": {
+                        "kind": "agent",
+                        "workspace_id": "00000000-0000-4000-8000-000000000001",
+                        "session_instance_id": "00000000-0000-4000-8000-000000000002",
+                        "pane_id": "%9"
+                    },
+                    "sender_label": "gemini-test",
+                    "subject": "Old request",
+                    "ts": 1,
+                    "thread_root": "m-old"
+                }]}})
+                .to_string()],
+                false,
+            ),
+            3 => {
+                assert_eq!(req["method"], "inbox.claim");
+                assert_eq!(req["params"]["message_id"], "m-old");
+                let changed = json!({
+                    "event": "messages.changed",
+                    "data": {
+                        "workspace_id": "00000000-0000-4000-8000-000000000001",
+                        "workspace_seq": 9,
+                        "changed": ["messages", "mailboxes", "notifications"]
+                    },
+                    "seq": 9
+                });
+                (
+                    vec![
+                        changed.to_string(),
+                        json!({
+                            "id": req["id"],
+                            "error": {
+                                "code": "message_not_pending",
+                                "message": "message 'm-old' is no longer pending"
+                            }
+                        })
+                        .to_string(),
+                    ],
+                    false,
+                )
+            }
+            4 => (
+                vec![json!({"id": req["id"], "result": {"entries": [{
+                    "message_id": "m-new",
+                    "sender": {
+                        "kind": "agent",
+                        "workspace_id": "00000000-0000-4000-8000-000000000001",
+                        "session_instance_id": "00000000-0000-4000-8000-000000000002",
+                        "pane_id": "%9"
+                    },
+                    "sender_label": "gemini-test",
+                    "subject": "Replacement request",
+                    "ts": 9,
+                    "thread_root": "m-new"
+                }]}})
+                .to_string()],
+                false,
+            ),
+            5 => (
+                vec![json!({"id": req["id"], "result": {
+                    "disposition": "claimed",
+                    "message": {
+                        "message_id": "m-new",
+                        "kind": "msg",
+                        "sender": {
+                            "kind": "agent",
+                            "workspace_id": "00000000-0000-4000-8000-000000000001",
+                            "session_instance_id": "00000000-0000-4000-8000-000000000002",
+                            "pane_id": "%9"
+                        },
+                        "sender_label": "gemini-test",
+                        "subject": "Replacement request",
+                        "body": "Use the replacement.",
+                        "thread_root": "m-new"
+                    }
+                }})
+                .to_string()],
+                true,
+            ),
+            _ => panic!("unexpected request {req}"),
+        }
+    });
+
+    let out = run_cyclops(
+        &home,
+        &[
+            "inbox",
+            "next",
+            "--from",
+            GEMINI_ENDPOINT,
+            "--timeout",
+            "1s",
+            "--plain",
+        ],
+    );
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("[cyclops m-new]"),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_next_has_a_bounded_no_message_exit() {
+    let home = scratch_home("int");
+    serve_once(&home, hello(1), move |req| match req["method"].as_str() {
+        Some("events.subscribe") => (
+            vec![json!({"id": req["id"], "result": {"subscribed": true}}).to_string()],
+            false,
+        ),
+        Some("inbox.list") => (
+            vec![json!({"id": req["id"], "result": {"entries": []}}).to_string()],
+            false,
+        ),
+        _ => panic!("unexpected request {req}"),
+    });
+
+    let out = run_cyclops(&home, &["inbox", "next", "--timeout", "100ms", "--plain"]);
+
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "no pending message arrived within 100ms. Increase --timeout or inspect the queue with cyclops inbox list."
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_next_timeout_has_a_stable_json_outcome() {
+    let home = scratch_home("inj");
+    serve_once(&home, hello(1), move |req| match req["method"].as_str() {
+        Some("events.subscribe") => (
+            vec![json!({"id": req["id"], "result": {"subscribed": true}}).to_string()],
+            false,
+        ),
+        Some("inbox.list") => {
+            assert_eq!(
+                req["params"]["sender"]["pane_id"], "%9",
+                "the no-match wait keeps its durable sender filter"
+            );
+            (
+                vec![json!({"id": req["id"], "result": {"entries": []}}).to_string()],
+                false,
+            )
+        }
+        _ => panic!("unexpected request {req}"),
+    });
+
+    let out = run_cyclops(
+        &home,
+        &[
+            "inbox",
+            "next",
+            "--from",
+            GEMINI_ENDPOINT,
+            "--timeout",
+            "10ms",
+            "--json",
+        ],
+    );
+
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stderr.is_empty());
+    let value: Value = serde_json::from_slice(&out.stdout).expect("JSON timeout answer");
+    assert_eq!(value["code"], "timeout");
+    assert_eq!(value["data"]["pending"], false);
+    assert_eq!(value["data"]["waited_ms"], 10);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_next_json_reports_one_structured_daemon_failure() {
+    let home = scratch_home("ine");
+    serve_once(&home, hello(1), move |req| {
+        assert_eq!(req["method"], "events.subscribe");
+        (
+            vec![json!({
+                "id": req["id"],
+                "error": {
+                    "code": "unknown_method",
+                    "message": "events.subscribe is unavailable"
+                }
+            })
+            .to_string()],
+            true,
+        )
+    });
+
+    let out = run_cyclops(&home, &["inbox", "next", "--timeout", "1s", "--json"]);
+
+    assert_json_failure(
+        &out,
+        1,
+        json!({
+            "code": "unknown_method",
+            "message": "events.subscribe is unavailable",
+            "data": null
+        }),
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_next_json_reports_one_structured_list_failure() {
+    let home = scratch_home("inr");
+    let mut step = 0_u8;
+    serve_once(&home, hello(1), move |req| {
+        step += 1;
+        match step {
+            1 => (
+                vec![json!({"id": req["id"], "result": {"subscribed": true}}).to_string()],
+                false,
+            ),
+            2 => (
+                vec![json!({
+                    "id": req["id"],
+                    "error": {
+                        "code": "mailbox_error",
+                        "message": "mailbox projection is unavailable"
+                    }
+                })
+                .to_string()],
+                true,
+            ),
+            _ => panic!("unexpected request {req}"),
+        }
+    });
+
+    let out = run_cyclops(&home, &["inbox", "next", "--timeout", "1s", "--json"]);
+
+    assert_json_failure(
+        &out,
+        1,
+        json!({
+            "code": "mailbox_error",
+            "message": "mailbox projection is unavailable",
+            "data": null
+        }),
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_next_json_reports_an_unreadable_answer_as_one_object() {
+    let home = scratch_home("inu");
+    let mut step = 0_u8;
+    serve_once(&home, hello(1), move |req| {
+        step += 1;
+        match step {
+            1 => (
+                vec![json!({"id": req["id"], "result": {"subscribed": true}}).to_string()],
+                false,
+            ),
+            2 => (
+                vec![json!({"id": req["id"], "result": "not an inbox list"}).to_string()],
+                true,
+            ),
+            _ => panic!("unexpected request {req}"),
+        }
+    });
+
+    let out = run_cyclops(&home, &["inbox", "next", "--timeout", "1s", "--json"]);
+
+    assert_json_failure(
+        &out,
+        1,
+        json!({
+            "code": "unreadable_answer",
+            "message": "cyclops answered in a shape this client doesn't understand. The daemon and CLI are probably far apart in version; update the older one.",
+            "data": null
+        }),
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_next_json_reports_a_dropped_stream_as_one_object() {
+    let home = scratch_home("ing");
+    let mut step = 0_u8;
+    serve_once(&home, hello(1), move |req| {
+        step += 1;
+        match step {
+            1 => (
+                vec![json!({"id": req["id"], "result": {"subscribed": true}}).to_string()],
+                false,
+            ),
+            2 => (
+                vec![json!({"id": req["id"], "result": {"entries": []}}).to_string()],
+                true,
+            ),
+            _ => panic!("unexpected request {req}"),
+        }
+    });
+
+    let out = run_cyclops(&home, &["inbox", "next", "--timeout", "1s", "--json"]);
+
+    assert_json_failure(
+        &out,
+        1,
+        json!({
+            "code": "connection_lost",
+            "message": "lost the connection to cyclops: the connection closed. The request may already have landed. Check that cyclopsd is running and inspect current state. Only repeat a send or reply with the same explicit --client-key.",
+            "data": null
+        }),
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_next_json_reports_one_structured_claim_failure() {
+    let home = scratch_home("inf");
+    let mut step = 0_u8;
+    serve_once(&home, hello(1), move |req| {
+        step += 1;
+        match step {
+            1 => (
+                vec![json!({"id": req["id"], "result": {"subscribed": true}}).to_string()],
+                false,
+            ),
+            2 => (
+                vec![json!({"id": req["id"], "result": {"entries": [{
+                    "message_id": "m-denied",
+                    "sender": {
+                        "kind": "admin",
+                        "workspace_id": "00000000-0000-4000-8000-000000000001"
+                    },
+                    "sender_label": "admin",
+                    "ts": 1,
+                    "thread_root": "m-denied"
+                }]}})
+                .to_string()],
+                false,
+            ),
+            3 => (
+                vec![json!({
+                    "id": req["id"],
+                    "error": {
+                        "code": "denied",
+                        "message": "claimant no longer owns this mailbox",
+                        "data": {"message_id": "m-denied"}
+                    }
+                })
+                .to_string()],
+                true,
+            ),
+            _ => panic!("unexpected request {req}"),
+        }
+    });
+
+    let out = run_cyclops(&home, &["inbox", "next", "--timeout", "1s", "--json"]);
+
+    assert_json_failure(
+        &out,
+        1,
+        json!({
+            "code": "denied",
+            "message": "claimant no longer owns this mailbox",
+            "data": {"message_id": "m-denied"}
+        }),
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_next_names_an_uncertain_claim_instead_of_an_empty_timeout() {
+    let home = scratch_home("inc");
+    let mut step = 0_u8;
+    serve_once(&home, hello(1), move |req| {
+        step += 1;
+        match step {
+            1 => (
+                vec![json!({"id": req["id"], "result": {"subscribed": true}}).to_string()],
+                false,
+            ),
+            2 => (
+                vec![json!({"id": req["id"], "result": {"entries": [{
+                    "message_id": "m-uncertain",
+                    "sender": {
+                        "kind": "admin",
+                        "workspace_id": "00000000-0000-4000-8000-000000000001"
+                    },
+                    "sender_label": "admin",
+                    "ts": 1,
+                    "thread_root": "m-uncertain"
+                }]}})
+                .to_string()],
+                false,
+            ),
+            3 => {
+                assert_eq!(req["method"], "inbox.claim");
+                assert_eq!(req["params"]["message_id"], "m-uncertain");
+                (Vec::new(), false)
+            }
+            _ => panic!("unexpected request {req}"),
+        }
+    });
+
+    let out = run_cyclops(&home, &["inbox", "next", "--timeout", "50ms", "--json"]);
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stderr.is_empty());
+    let value: Value = serde_json::from_slice(&out.stdout).expect("JSON uncertain answer");
+    assert_eq!(value["code"], "claim_outcome_unknown");
+    assert_eq!(value["data"]["message_id"], "m-uncertain");
+    assert!(value["message"]
+        .as_str()
+        .unwrap()
+        .contains("may already be claimed"));
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_next_never_claims_when_the_daemon_omits_the_selected_sender() {
+    let home = scratch_home("inm");
+    let mut step = 0_u8;
+    serve_once(&home, hello(1), move |req| {
+        step += 1;
+        match step {
+            1 => (
+                vec![json!({"id": req["id"], "result": {"subscribed": true}}).to_string()],
+                false,
+            ),
+            2 => (
+                vec![json!({"id": req["id"], "result": {"entries": [{
+                    "message_id": "m-old-daemon",
+                    "sender_label": "gemini-test",
+                    "ts": 1,
+                    "thread_root": "m-old-daemon"
+                }]}})
+                .to_string()],
+                true,
+            ),
+            _ => panic!("the unproven entry must not be claimed: {req}"),
+        }
+    });
+
+    let out = run_cyclops(
+        &home,
+        &[
+            "inbox",
+            "next",
+            "--from",
+            GEMINI_ENDPOINT,
+            "--timeout",
+            "1s",
+            "--json",
+        ],
+    );
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stderr.is_empty());
+    let value: Value = serde_json::from_slice(&out.stdout).expect("JSON compatibility answer");
+    assert_eq!(value["code"], "sender_filter_unavailable");
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_next_rejects_a_zero_budget_before_waiting() {
+    let home = scratch_home("inz");
+    let out = run_cyclops(&home, &["inbox", "next", "--timeout", "0ms"]);
+
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "can't read \"0ms\" as a duration. Use forms like 90s, 2m, 1m30s, or 500ms."
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_next_json_reports_invalid_input_as_one_object() {
+    let home = scratch_home("inb");
+    let out = run_cyclops(&home, &["inbox", "next", "--timeout", "0ms", "--json"]);
+
+    assert_json_failure(
+        &out,
+        2,
+        json!({
+            "code": "bad_duration",
+            "message": "can't read \"0ms\" as a duration. Use forms like 90s, 2m, 1m30s, or 500ms.",
+            "data": {"value": "0ms"}
+        }),
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_next_rejects_an_unrepresentable_budget_before_connecting() {
+    let home = scratch_home("ino");
+    let out = run_cyclops(
+        &home,
+        &["inbox", "next", "--timeout", "18446744073709551615s"],
+    );
+
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("can't read"));
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_next_rejects_a_display_label_as_a_sender_selector() {
+    let home = scratch_home("inl");
+    let out = run_cyclops(
+        &home,
+        &["inbox", "next", "--from", "gemini-test", "--timeout", "1s"],
+    );
+
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("recipient key must use canonical"));
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_next_json_reports_an_invalid_sender_as_one_object() {
+    let home = scratch_home("ini");
+    let out = run_cyclops(
+        &home,
+        &[
+            "inbox",
+            "next",
+            "--from",
+            "gemini-test",
+            "--timeout",
+            "1s",
+            "--json",
+        ],
+    );
+
+    assert_json_failure(
+        &out,
+        2,
+        json!({
+            "code": "invalid_recipient_key",
+            "message": "recipient key must use canonical admin:<workspace-id> or agent:<workspace-id>/<session-instance-id>/%<pane> form",
+            "data": {"value": "gemini-test"}
+        }),
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_next_json_reports_a_connection_failure_as_one_object() {
+    let home = scratch_home("ind");
+    let out = run_cyclops(&home, &["inbox", "next", "--timeout", "1s", "--json"]);
+
+    assert_json_failure(
+        &out,
+        1,
+        json!({
+            "code": "not_running",
+            "message": cyclops_proto::NOT_RUNNING,
+            "data": null
+        }),
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
 fn send_happy_path_stdin_body_delivers_verified() {
     let home = scratch_home("sd");
     serve_once(&home, hello(1), move |req| {
@@ -1090,12 +1887,23 @@ fn hook_daemon_down_exits_zero_and_logs() {
         "1"
     );
 
-    // Without any identity the hook still exits 0 and says why in the log.
+    // Label-free hooks reach the daemon, which derives their origin from
+    // authenticated socket credentials. Only the connection fails here.
     let out = run_cyclops_io(&home, &[], &["hook", "Stop"], Some("{}"));
     assert_eq!(out.status.code(), Some(0));
     assert!(out.stdout.is_empty() && out.stderr.is_empty());
     let log = fs::read_to_string(home.join("hook-errors.log")).expect("hook error log");
-    assert!(log.contains("no agent identity"), "log: {log}");
+    assert!(!log.contains("no agent identity"), "log: {log}");
+    assert_eq!(log.trim().lines().count(), 2, "log: {log}");
+    assert!(
+        log.trim()
+            .lines()
+            .all(|l| l.contains("cyclops isn't running")),
+        "log: {log}"
+    );
+    // A label-free hook consumes no counter: it would otherwise share one
+    // namespace with every other label-free hook on the machine.
+    assert!(!home.join("hookseq").join("Stop").exists());
     let _ = fs::remove_dir_all(&home);
 }
 
@@ -1489,53 +2297,6 @@ fn wait_bad_duration_is_a_usage_error() {
     let _ = fs::remove_dir_all(&home);
 }
 
-#[test]
-fn send_wait_passes_the_spec_and_renders_the_outcome() {
-    let home = scratch_home("sw");
-    serve_once(&home, hello(1), move |req| {
-        assert_eq!(req["method"], "msg.send");
-        assert_eq!(req["params"]["wait"]["until"], "done");
-        assert_eq!(req["params"]["wait"]["timeout_ms"], 120_000);
-        (
-            vec![json!({"id": req["id"], "result": {
-                "msg_id": "m-dd", "seq": 12,
-                "deliveries": [{"to": "reviewer", "state": "delivered_verified"}],
-                "wait": [{
-                    "to": "reviewer", "outcome": "reached", "state": "idle",
-                    "waited_ms": 42_000, "delivery": "delivered_verified"
-                }]
-            }})
-            .to_string()],
-            false,
-        )
-    });
-    let out = run_cyclops(
-        &home,
-        &[
-            "send",
-            "reviewer",
-            "--subject",
-            "go",
-            "--body",
-            "b",
-            "--wait",
-            "done",
-            "--timeout",
-            "2m",
-        ],
-    );
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        "✔ delivered · verified\nwait: ○ idle · waited 42s\n"
-    );
-    let _ = fs::remove_dir_all(&home);
-}
-
 // ---------------------------------------------------------------------------
 // M2 hooks verify/selftest rendering: canned daemon, exact copy
 // ---------------------------------------------------------------------------
@@ -1868,7 +2629,6 @@ fn update_builds_into_a_cache_that_outlives_the_clone() {
         assert!(ok, "stub repo setup failed at {args:?}");
     }
 
-    let cache = home.join("build-cache");
     let out = run_cyclops_io(
         &home,
         &[
@@ -1883,15 +2643,25 @@ fn update_builds_into_a_cache_that_outlives_the_clone() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    let cache = text
+        .lines()
+        .find_map(|line| line.strip_prefix("SAW "))
+        .map(PathBuf::from)
+        .expect("the installer should report its cache path");
     assert!(
-        text.contains(&format!("SAW {}", cache.display())),
-        "the installer should build into the cache:\n{text}"
+        !cache.starts_with(&home),
+        "Cargo build artifacts must stay outside CYCLOPS_HOME: {}",
+        cache.display()
     );
     // Named, because a gigabyte-scale directory the operator never asked
     // for is one they should be told about rather than find.
     assert!(text.contains("building in"), "{text}");
     // And it is still there once the clone is gone, which is the point.
     assert!(cache.is_dir(), "the cache must outlive the clone");
+    assert_eq!(
+        fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
 
     // An operator who already chose a target dir keeps it.
     let mine = home.join("mine");
@@ -1910,4 +2680,5 @@ fn update_builds_into_a_cache_that_outlives_the_clone() {
         text.contains(&format!("SAW {}", mine.display())),
         "an explicit CARGO_TARGET_DIR must win:\n{text}"
     );
+    let _ = fs::remove_dir_all(&cache);
 }

@@ -5,10 +5,11 @@
 //! Two jobs, and nothing between them. It speaks NDJSON over the daemon's
 //! Unix socket (`client.rs`, types from `cyclops-proto`), and it renders
 //! what comes back for a human (`render.rs` layout, `style.rs` color,
-//! `copy.rs` words). Every verb takes `--json` and then prints exactly the
-//! socket answer, which is the promise the rendering exists to be optional
-//! against. `cyclops ui` is the one verb with no `--json`; the machine
-//! stream is `cyclops watch --json`.
+//! `copy.rs` words). Daemon reads and direct mutations take `--json` and
+//! print exactly the socket answer, which is the promise the rendering
+//! exists to be optional against. Guarded age-selected alarm clearance is
+//! interactive because it must confirm a frozen preview. `cyclops ui` has
+//! no `--json`; the machine stream is `cyclops watch --json`.
 //!
 //! Three things here are not that shape and say why:
 //!
@@ -33,11 +34,12 @@
 //!
 //! Verbs, by the milestone that added them: `ping`, `status`, `read`,
 //! `watch` (M0); `send`, `hook` (M1); `history`, `thread`, `wait`,
-//! `send --wait`, `hooks install|verify|selftest` (M2); `ui` (M3); `name`,
+//! `hooks install|verify|selftest` (M2); `ui` (M3); `name`,
 //! `list`, `start`, `workspace save|restore` (M4); `theme` (M5);
-//! `update` (post-M5).
+//! `update`; `setup check` (setup inspection).
 
 mod client;
+mod consumer;
 mod copy;
 mod daemon;
 mod hash;
@@ -45,6 +47,7 @@ mod hook;
 mod hookset;
 mod manifests;
 mod render;
+mod setup;
 mod skillseed;
 mod style;
 mod theme;
@@ -52,8 +55,8 @@ mod themeseed;
 mod update;
 mod workspace;
 
-use std::io::IsTerminal;
 use std::io::Write;
+use std::io::{BufRead, IsTerminal};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -63,7 +66,7 @@ use client::{Client, ClientError};
 use cyclops_proto::{
     delivery_needs_human, DeliveryReceipt, DeliveryState, Event, HistoryParams, HistoryResult,
     MsgSendParams, MsgSendResult, PaneReadParams, PaneReadResult, PaneReadSource, PaneStatus,
-    StatusResult, SubscribeParams, ThreadResult, WaitSpec, WaitUntil, PROTOCOL_VERSION,
+    StatusResult, SubscribeParams, ThreadResult, WaitUntil, PROTOCOL_VERSION,
 };
 use style::Style;
 
@@ -118,6 +121,12 @@ enum Cmd {
     /// Open the default workspace: restore it, or build it from a preset.
     /// Safe to run twice; a session that is already there is left alone.
     Start(StartArgs),
+    /// Inspect manifests, hook wiring, and agent skill installation.
+    /// Reads setup state without changing it.
+    Setup {
+        #[command(subcommand)]
+        cmd: SetupCmd,
+    },
     /// Save and restore the shape of a session: panes, sizes, names.
     Workspace {
         #[command(subcommand)]
@@ -157,9 +166,20 @@ enum Cmd {
         #[command(flatten)]
         ui: UiArgs,
     },
-    /// Send a message. The receipt names each delivery's state; exit 0 on
-    /// delivered/queued, 1 on parked or needs attention.
+    /// Store a durable message in one or more recipient inboxes.
     Send(SendArgs),
+    /// List or claim messages in the authenticated caller's inbox.
+    Inbox(InboxArgs),
+    /// Body-free inbox, outbound, and delivery state in one workspace snapshot.
+    Messages(MessagesArgs),
+    /// Reply to a visible message using its sender and thread.
+    Reply(ReplyArgs),
+    /// Requeue a message by identifier.
+    Requeue(RequeueArgs),
+    /// Preview or clear delivery alarms.
+    Alarm(AlarmArgs),
+    /// Inspect or resolve an exact staged notification attempt.
+    Attention(AttentionArgs),
     /// Messages from the record, newest last. Filter by agent or direction.
     History(HistoryArgs),
     /// One message with its replies and delivery record, oldest first.
@@ -172,7 +192,8 @@ enum Cmd {
     Wait {
         /// Agent label or pane id, e.g. reviewer or %4.
         target: String,
-        /// idle: composer ready. done: the current or next turn ends.
+        /// idle: no turn is running (NOT permission to write). done: the
+        /// current or next turn ends.
         /// blocked: any blocked state (modal, permission, quota).
         #[arg(long, value_enum)]
         until: UntilArg,
@@ -231,6 +252,12 @@ enum DaemonCmd {
         #[arg(long, default_value = "40")]
         lines: usize,
     },
+}
+
+#[derive(Subcommand)]
+enum SetupCmd {
+    /// Report setup and whether messaging uses a doorbell or direct fallback.
+    Check,
 }
 
 #[derive(clap::Args)]
@@ -341,13 +368,13 @@ struct UiArgs {
     /// Start in the firehose: every message and state event live.
     #[arg(long)]
     firehose: bool,
-    /// Only entries involving this agent (either direction).
+    /// In the TUI, only entries involving this agent (either direction).
     #[arg(long, conflicts_with_all = ["from", "to"])]
     with: Option<String>,
-    /// Only messages from this sender.
+    /// In the TUI, only messages from this sender.
     #[arg(long)]
     from: Option<String>,
-    /// Only messages to this recipient.
+    /// In the TUI, only messages to this recipient.
     #[arg(long)]
     to: Option<String>,
     /// Ledger lines replayed for backfill before going live.
@@ -394,7 +421,7 @@ struct NameArgs {
 
 #[derive(clap::Args)]
 struct SendArgs {
-    /// Recipient label or pane id, e.g. reviewer. Merges with --to.
+    /// Recipient label, pane id, or admin. Merges with --to.
     target: Option<String>,
     /// One line the recipient sees first.
     #[arg(long)]
@@ -411,19 +438,138 @@ struct SendArgs {
     /// Every adopted agent.
     #[arg(long, conflicts_with_all = ["target", "to"])]
     all: bool,
-    /// Announcement expecting no reply; the reply hint is dropped.
+    /// Announcement expecting no reply.
     #[arg(long)]
     fyi: bool,
-    /// Message id this replies to, e.g. m-3f9c2a.
+    /// Sender-scoped idempotency key for exact retries.
     #[arg(long)]
+    client_key: Option<String>,
+    /// Message id this replies to. Recipient and subject come from the referenced message.
+    #[arg(long, conflicts_with = "supersedes")]
     reply_to: Option<String>,
-    /// After delivery, also wait for the recipient: idle, done, or blocked.
-    /// The receipt gains a wait outcome per recipient.
-    #[arg(long, value_enum)]
-    wait: Option<UntilArg>,
-    /// Wait budget for --wait, e.g. 90s, 2m. Default 60s, max 10m.
-    #[arg(long, requires = "wait", default_value = WAIT_TIMEOUT_DEFAULT)]
-    timeout: String,
+    /// Replace one unclaimed message before its notification starts writing.
+    #[arg(long, conflicts_with = "reply_to")]
+    supersedes: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct InboxArgs {
+    #[command(subcommand)]
+    cmd: InboxCmd,
+}
+
+#[derive(clap::Args)]
+struct MessagesArgs {
+    /// Recent settled messages to keep beside every active message.
+    #[arg(long, default_value_t = 20)]
+    recent_settled: u32,
+}
+
+#[derive(Subcommand)]
+enum InboxCmd {
+    /// List pending messages without their bodies.
+    List {
+        /// Cap the number of returned entries.
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Claim one message and print its payload.
+    Claim {
+        /// Message identifier to claim.
+        message_id: String,
+    },
+    /// Wait for and claim the oldest pending message over the daemon socket.
+    Next {
+        /// Only messages from this canonical sender endpoint.
+        #[arg(long, value_name = "RECIPIENT_KEY")]
+        from: Option<String>,
+        /// Stop waiting when no pending message arrives within this duration.
+        #[arg(long, default_value = "30s")]
+        timeout: String,
+    },
+}
+
+#[derive(clap::Args)]
+struct ReplyArgs {
+    /// Message identifier being answered.
+    message_id: String,
+    /// Reply body text.
+    #[arg(long, conflicts_with = "body_file")]
+    body: Option<String>,
+    /// Read the reply body from a file; - reads stdin.
+    #[arg(long)]
+    body_file: Option<String>,
+    /// Sender-scoped idempotency key.
+    #[arg(long)]
+    client_key: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct RequeueArgs {
+    /// Message identifier to requeue.
+    message_id: String,
+}
+
+#[derive(clap::Args)]
+struct AlarmArgs {
+    #[command(subcommand)]
+    cmd: AlarmCmd,
+}
+
+#[derive(Subcommand)]
+enum AlarmCmd {
+    /// Preview alarms older than a duration without changing them.
+    Preview {
+        /// Minimum alarm age, e.g. 30m or 2h.
+        #[arg(long)]
+        older_than: String,
+    },
+    /// Clear exact alarms, directly by id or through a guarded age preview.
+    Clear {
+        /// Exact alarm identifiers returned by preview.
+        #[arg(
+            value_name = "ID",
+            required_unless_present = "older_than",
+            conflicts_with = "older_than"
+        )]
+        ids: Vec<String>,
+        /// Preview alarms at least this old, then confirm the frozen id set.
+        #[arg(
+            long,
+            value_name = "AGE",
+            required_unless_present = "ids",
+            conflicts_with = "ids"
+        )]
+        older_than: Option<String>,
+    },
+}
+
+#[derive(clap::Args)]
+struct AttentionArgs {
+    #[command(subcommand)]
+    cmd: AttentionCmd,
+}
+
+#[derive(Subcommand)]
+enum AttentionCmd {
+    /// Report all safety checks without changing terminal or journal state.
+    Show {
+        /// Notification attempt id, or a message id with one unresolved attempt.
+        id: String,
+        /// Print a local expected-versus-observed line diff.
+        #[arg(long)]
+        diff: bool,
+    },
+    /// Submit the exact staged notification.
+    Complete {
+        /// Notification attempt id, or a message id with one unresolved attempt.
+        id: String,
+    },
+    /// Clear the exact staged notification without submitting it.
+    Discard {
+        /// Notification attempt id, or a message id with one unresolved attempt.
+        id: String,
+    },
 }
 
 #[derive(clap::Args)]
@@ -481,11 +627,8 @@ fn parse_duration(input: &str) -> Result<Duration, ()> {
         return Err(());
     }
     if let Ok(secs) = s.parse::<u64>() {
-        return if secs == 0 {
-            Err(())
-        } else {
-            Ok(Duration::from_secs(secs))
-        };
+        let duration = Duration::from_secs(secs);
+        return duration_is_usable(duration).then_some(duration).ok_or(());
     }
     let mut total = Duration::ZERO;
     let mut rest = s;
@@ -501,20 +644,27 @@ fn parse_duration(input: &str) -> Result<Duration, ()> {
                 .trim_start_matches(|c: char| c.is_ascii_alphabetic())
                 .len();
         let (unit, tail) = tail.split_at(unit);
-        total += match unit {
+        let segment = match unit {
             "ms" => Duration::from_millis(n),
             "s" => Duration::from_secs(n),
-            "m" => Duration::from_secs(n * 60),
-            "h" => Duration::from_secs(n * 3600),
+            "m" => Duration::from_secs(n.checked_mul(60).ok_or(())?),
+            "h" => Duration::from_secs(n.checked_mul(3_600).ok_or(())?),
             _ => return Err(()),
         };
+        total = total.checked_add(segment).ok_or(())?;
         rest = tail;
     }
-    if total.is_zero() {
-        Err(())
-    } else {
-        Ok(total)
-    }
+    duration_is_usable(total).then_some(total).ok_or(())
+}
+
+fn duration_is_usable(duration: Duration) -> bool {
+    !duration.is_zero() && Instant::now().checked_add(duration).is_some()
+}
+
+/// Protocol durations use unsigned millisecond fields. A duration can fit
+/// [`Duration`] while exceeding that wire range, so the conversion is checked.
+fn parse_wire_duration_ms(input: &str) -> Result<u64, ()> {
+    u64::try_from(parse_duration(input)?.as_millis()).map_err(|_| ())
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -645,6 +795,9 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
         Cmd::Start(args) if args.setup_only => {
             workspace::run_setup(cli.json, &style_for(cli), args.wire_hooks)
         }
+        Cmd::Setup {
+            cmd: SetupCmd::Check,
+        } => setup::run_check(cli.json, &style_for(cli)),
         Cmd::Start(args) => workspace::run_start(
             cli.json,
             &style_for(cli),
@@ -691,14 +844,54 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
         // All three answer about a daemon rather than through one, so a
         // daemon that is down is an answer here, not a failure.
         Cmd::Daemon { cmd } => cmd_daemon(cli, &style_for(cli), cmd),
-        // Send and wait validate usage before touching the daemon, so
-        // usage errors don't hide behind a down daemon.
+        // Message bodies and identifiers are validated before connecting.
         Cmd::Send(args) => cmd_send(cli, &style_for(cli), args),
+        Cmd::Reply(args) => cmd_reply(cli, &style_for(cli), args),
         Cmd::Wait {
             target,
             until,
             timeout,
         } => cmd_wait(cli, &style_for(cli), target, *until, timeout),
+        Cmd::Inbox(InboxArgs {
+            cmd: InboxCmd::Next { timeout, .. },
+        }) if parse_duration(timeout).is_err() => inbox_next_failed(
+            cli,
+            "bad_duration",
+            copy::bad_duration(timeout),
+            json!({"value": timeout}),
+            EXIT_USAGE,
+        ),
+        Cmd::Inbox(InboxArgs {
+            cmd: InboxCmd::Next {
+                from: Some(from), ..
+            },
+        }) if from.parse::<cyclops_proto::RecipientKey>().is_err() => {
+            let error = from
+                .parse::<cyclops_proto::RecipientKey>()
+                .expect_err("guard rejects invalid sender keys");
+            inbox_next_failed(
+                cli,
+                "invalid_recipient_key",
+                error.to_string(),
+                json!({"value": from}),
+                EXIT_USAGE,
+            )
+        }
+        Cmd::Inbox(InboxArgs {
+            cmd: InboxCmd::Next { timeout, from },
+        }) => {
+            let mut client = match Client::connect() {
+                Ok(client) => client,
+                Err(error) => return inbox_next_client_failed(cli, &error),
+            };
+            if client.hello().proto != PROTOCOL_VERSION {
+                eprintln!(
+                    "{}",
+                    copy::proto_mismatch(client.hello().proto, PROTOCOL_VERSION)
+                );
+            }
+            cmd_inbox_next(&mut client, cli, timeout, from.as_deref())
+        }
         // Install renders and instructs without a daemon; verify and
         // selftest ask the daemon for hook liveness.
         Cmd::Hooks {
@@ -737,6 +930,11 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
         | Cmd::Read { .. }
         | Cmd::History(_)
         | Cmd::Thread { .. }
+        | Cmd::Inbox(_)
+        | Cmd::Messages(_)
+        | Cmd::Requeue(_)
+        | Cmd::Alarm(_)
+        | Cmd::Attention(_)
         | Cmd::Hooks { .. } => {
             let mut c = match connect() {
                 Ok(c) => c,
@@ -755,6 +953,11 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 } => cmd_read(&mut c, cli, &style, target, *lines, (*source).into(), *raw),
                 Cmd::History(args) => cmd_history(&mut c, cli, &style, args),
                 Cmd::Thread { id } => cmd_thread(&mut c, cli, &style, id),
+                Cmd::Inbox(args) => cmd_inbox(&mut c, cli, &style, args),
+                Cmd::Messages(args) => cmd_messages(&mut c, cli, &style, args),
+                Cmd::Requeue(args) => cmd_requeue(&mut c, cli, &style, args),
+                Cmd::Alarm(args) => cmd_alarm(&mut c, cli, &style, args),
+                Cmd::Attention(args) => cmd_attention(&mut c, cli, &style, args),
                 Cmd::Hooks {
                     cmd: HooksCmd::Verify { target },
                 } => hookset::run_verify(&mut c, cli.json, &style, target),
@@ -762,6 +965,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                     cmd: HooksCmd::Selftest { target },
                 } => hookset::run_selftest(&mut c, cli.json, &style, target),
                 Cmd::Send(_)
+                | Cmd::Reply(_)
                 | Cmd::Hook { .. }
                 | Cmd::Name(_)
                 | Cmd::Daemon { .. }
@@ -770,6 +974,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 | Cmd::Ui(_)
                 | Cmd::Watch { .. }
                 | Cmd::Start(_)
+                | Cmd::Setup { .. }
                 | Cmd::Theme { .. }
                 | Cmd::Update
                 | Cmd::Workspace { .. } => {
@@ -782,14 +987,84 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
 
 /// cyclops watch: stream TUI by default; `--json` is the machine stream.
 fn cmd_watch(cli: &Cli, style: &Style, kinds: &[String], ui: &UiArgs) -> i32 {
+    // Display filters belong to the TUI. Refuse them in JSON mode instead of
+    // accepting options the machine stream does not apply.
     if cli.json {
+        if ui.with.is_some() || ui.from.is_some() || ui.to.is_some() {
+            println!(
+                "{}",
+                json!({
+                    "code": "unsupported_watch_filter",
+                    "message": copy::WATCH_JSON_FILTER_UNSUPPORTED
+                })
+            );
+            return EXIT_USAGE;
+        }
         let mut c = match connect() {
             Ok(c) => c,
             Err(code) => return code,
         };
         return cmd_watch_json(&mut c, cli, style, kinds);
     }
+    let checked = match preflight_watch_filters(ui) {
+        Ok(checked) => checked,
+        Err(code) => return code,
+    };
+    drop(checked);
     run_stream_ui(cli, ui)
+}
+
+fn preflight_watch_filters(ui: &UiArgs) -> Result<Option<Client>, i32> {
+    if ui.with.is_none() && ui.from.is_none() && ui.to.is_none() {
+        return Ok(None);
+    }
+    let mut client = connect()?;
+    validate_watch_filters(&mut client, ui)?;
+    Ok(Some(client))
+}
+
+/// Watch filters are display conveniences, not endpoint selectors. Validate
+/// them against the current active roster so a typo cannot block forever.
+fn validate_watch_filters(c: &mut Client, ui: &UiArgs) -> Result<(), i32> {
+    let value = c
+        .request(
+            "status",
+            serde_json::to_value(cyclops_proto::StatusParams {
+                open_deliveries: false,
+            })
+            .expect("status params serialize"),
+        )
+        .map_err(|error| {
+            eprintln!("{}", copy::client_error(&error, None));
+            1
+        })?;
+    let status: StatusResult = serde_json::from_value(value).map_err(|_| {
+        eprintln!("{}", copy::UNREADABLE_ANSWER);
+        1
+    })?;
+    let mut labels = vec!["admin".to_string()];
+    labels.extend(
+        status
+            .sessions
+            .iter()
+            .flat_map(|session| &session.panes)
+            .filter(|pane| !pane.dead)
+            .map(|pane| pane.display_name().to_string()),
+    );
+    labels.sort();
+    labels.dedup();
+
+    let unknown: Vec<&str> = [&ui.with, &ui.from, &ui.to]
+        .into_iter()
+        .flatten()
+        .map(String::as_str)
+        .filter(|asked| !labels.iter().any(|known| known == asked))
+        .collect();
+    if !unknown.is_empty() {
+        eprintln!("{}", copy::unknown_watch_filters(&unknown));
+        return Err(EXIT_USAGE);
+    }
+    Ok(())
 }
 
 /// cyclops ui: deprecated alias for `cyclops watch`.
@@ -799,6 +1074,11 @@ fn cmd_ui(cli: &Cli, args: &UiArgs) -> i32 {
         return EXIT_USAGE;
     }
     eprintln!("{}", copy::UI_DEPRECATED);
+    let checked = match preflight_watch_filters(args) {
+        Ok(checked) => checked,
+        Err(code) => return code,
+    };
+    drop(checked);
     run_stream_ui(cli, args)
 }
 
@@ -1255,7 +1535,6 @@ fn cmd_read(
 }
 
 fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
-    // Positional target merges into the to-list; --all is the whole list.
     let mut to: Vec<String> = Vec::new();
     if args.all {
         to.push("*".into());
@@ -1280,50 +1559,40 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
         },
         (None, None) => String::new(),
     };
-    // --wait composes send-and-wait; the timeout parses before connecting.
-    let wait = match &args.wait {
-        None => None,
-        Some(until) => {
-            let Ok(budget) = parse_duration(&args.timeout) else {
-                eprintln!("{}", copy::bad_duration(&args.timeout));
-                return EXIT_USAGE;
-            };
-            Some(WaitSpec {
-                until: (*until).into(),
-                timeout_ms: Some(budget.as_millis() as u64),
-            })
-        }
-    };
     let mut c = match connect() {
         Ok(c) => c,
         Err(code) => return code,
     };
-    if let Some(spec) = &wait {
-        // The daemon holds the response until delivery plus wait resolve.
-        c.set_read_timeout(
-            Duration::from_millis(spec.timeout_ms.unwrap_or_default()) + WAIT_READ_SLACK,
-        );
-    }
+    let supersedes = match args.supersedes.as_deref() {
+        Some(id) => match cyclops_proto::MessageId::new(id) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                eprintln!("invalid superseded message id: {error}");
+                return EXIT_USAGE;
+            }
+        },
+        None => None,
+    };
     let params = serde_json::to_value(MsgSendParams {
         to: to.clone(),
         subject: args.subject.clone(),
         body,
         fyi: args.fyi,
+        client_key: args.client_key.clone(),
         reply_to: args.reply_to.clone(),
-        wait,
+        supersedes,
+        wait: None,
     })
     .expect("msg.send params serialize");
-    // With one recipient the unknown-target copy can name it; a broadcast
-    // failure passes the daemon's copy through.
     let asked = if to.len() == 1 {
         Some(to[0].as_str())
     } else {
         None
     };
     let result = match c.request("msg.send", params) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("{}", copy::client_error(&e, asked));
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("{}", copy::client_error(&error, asked));
             return 1;
         }
     };
@@ -1331,52 +1600,842 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
         println!("{result}");
         return receipts_exit_json(&result);
     }
-    let waits: Vec<Value> = result
-        .get("wait")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
     let receipt: MsgSendResult = match serde_json::from_value(result) {
-        Ok(r) => r,
+        Ok(receipt) => receipt,
         Err(_) => {
             eprintln!("{}", copy::UNREADABLE_ANSWER);
             return 1;
         }
     };
-    println!("{}", render::render_receipts(&receipt.deliveries, style));
-    if !waits.is_empty() {
-        println!("{}", render::render_wait_entries(&waits, style));
+    if let Some(inserted) = receipt.inserted {
+        let verb = if inserted {
+            "accepted"
+        } else {
+            "already accepted"
+        };
+        println!("{verb} {}", style.accent(&receipt.msg_id));
     }
-    // A badge is a state, not an outcome. Every receipt that is not a
-    // delivery gets one line saying what became of the message, because
-    // that is the sentence a sender is actually looking for.
-    for d in &receipt.deliveries {
-        match d.state {
+    println!("{}", render::render_receipts(&receipt.deliveries, style));
+    for delivery in &receipt.deliveries {
+        match delivery.state {
             DeliveryState::ParkedBlockedQuota => {
-                eprintln!("{}", copy::parked(&d.to, d.note.as_deref()));
+                eprintln!("{}", copy::parked(&delivery.to, delivery.note.as_deref()));
             }
             DeliveryState::AttentionRequired => {
-                // The pin command is offered for the one cause it fixes.
-                // A dead pane or a name nobody answers to is not taught
-                // away with a manifest, and offering it there would send
-                // the reader after the wrong thing.
-                let pane = (d.note.as_deref() == Some(copy::CAUSE_NO_MANIFEST))
-                    .then_some(d.pane.as_deref())
+                let pane = (delivery.note.as_deref() == Some(copy::CAUSE_NO_MANIFEST))
+                    .then_some(delivery.pane.as_deref())
                     .flatten();
                 eprintln!(
                     "{}",
-                    copy::needs_attention_for(&d.to, pane, d.note.as_deref())
+                    copy::needs_attention_for(&delivery.to, pane, delivery.note.as_deref())
                 );
             }
-            // Past the paste and still unresolved: the pane has the
-            // payload and the confirmation is outstanding.
             DeliveryState::Pasting | DeliveryState::Staged | DeliveryState::Submitted => {
-                eprintln!("{}", copy::in_flight(&d.to));
+                eprintln!("{}", copy::in_flight(&delivery.to));
             }
             _ => {}
         }
     }
     receipts_exit(&receipt.deliveries)
+}
+
+fn cmd_inbox(c: &mut Client, cli: &Cli, style: &Style, args: &InboxArgs) -> i32 {
+    match &args.cmd {
+        InboxCmd::List { limit } => {
+            let params = serde_json::to_value(cyclops_proto::InboxListParams {
+                limit: *limit,
+                sender: None,
+            })
+            .expect("inbox.list params serialize");
+            let result: cyclops_proto::InboxListResult = match ask(
+                c,
+                "inbox.list",
+                params,
+                cli.json,
+                None,
+                serde_json::from_value,
+            ) {
+                Ok(Some(result)) => result,
+                Ok(None) => return 0,
+                Err(code) => return code,
+            };
+            for entry in result.entries {
+                let subject = entry.subject.as_deref().unwrap_or("(no subject)");
+                println!(
+                    "{} {} · {}",
+                    style.accent(entry.message_id.as_str()),
+                    entry.sender_label,
+                    subject
+                );
+            }
+            0
+        }
+        InboxCmd::Claim { message_id } => {
+            let message_id = match cyclops_proto::MessageId::new(message_id) {
+                Ok(id) => id,
+                Err(error) => {
+                    eprintln!("{error}");
+                    return EXIT_USAGE;
+                }
+            };
+            let params = serde_json::to_value(cyclops_proto::InboxClaimParams { message_id })
+                .expect("inbox.claim params serialize");
+            let result: cyclops_proto::InboxClaimResult = match ask(
+                c,
+                "inbox.claim",
+                params,
+                cli.json,
+                None,
+                serde_json::from_value,
+            ) {
+                Ok(Some(result)) => result,
+                Ok(None) => return 0,
+                Err(code) => return code,
+            };
+            print_claim_payload(&result.message);
+            0
+        }
+        InboxCmd::Next { .. } => unreachable!("inbox next owns its bounded connection"),
+    }
+}
+
+/// Subscribe before the first list so an arrival cannot fall between the
+/// empty read and the event wait. Every subsequent read uses the same durable
+/// mailbox projection as `inbox list` and the same atomic claim operation.
+fn cmd_inbox_next(c: &mut Client, cli: &Cli, timeout: &str, from: Option<&str>) -> i32 {
+    let budget = match parse_duration(timeout) {
+        Ok(value) => value,
+        Err(()) => {
+            return inbox_next_failed(
+                cli,
+                "bad_duration",
+                copy::bad_duration(timeout),
+                json!({"value": timeout}),
+                EXIT_USAGE,
+            );
+        }
+    };
+    let Some(deadline) = Instant::now().checked_add(budget) else {
+        return inbox_next_failed(
+            cli,
+            "bad_duration",
+            copy::bad_duration(timeout),
+            json!({"value": timeout}),
+            EXIT_USAGE,
+        );
+    };
+    let sender = match from.map(str::parse::<cyclops_proto::RecipientKey>) {
+        Some(Ok(sender)) => Some(sender),
+        Some(Err(error)) => {
+            return inbox_next_failed(
+                cli,
+                "invalid_recipient_key",
+                error.to_string(),
+                json!({"value": from}),
+                EXIT_USAGE,
+            );
+        }
+        None => None,
+    };
+    if let Err(code) = inbox_next_set_remaining(c, cli, budget, deadline) {
+        return code;
+    }
+    let subscribe = serde_json::to_value(SubscribeParams {
+        kinds: vec!["messages.changed".into()],
+        cursor: None,
+    })
+    .expect("events.subscribe params serialize");
+    if let Err(error) = c.request("events.subscribe", subscribe) {
+        return match error {
+            ClientError::ReadTimeout(_) => inbox_next_timed_out(cli, budget),
+            error => inbox_next_client_failed(cli, &error),
+        };
+    }
+
+    loop {
+        if let Err(code) = inbox_next_set_remaining(c, cli, budget, deadline) {
+            return code;
+        }
+        let list = match inbox_list_one(c, sender) {
+            Ok(list) => list,
+            Err(InboxListOneError::Client(ClientError::ReadTimeout(_))) => {
+                return inbox_next_timed_out(cli, budget)
+            }
+            Err(InboxListOneError::Client(error)) => return inbox_next_client_failed(cli, &error),
+            Err(InboxListOneError::Unreadable) => {
+                return inbox_next_failed(
+                    cli,
+                    "unreadable_answer",
+                    copy::UNREADABLE_ANSWER.to_string(),
+                    Value::Null,
+                    1,
+                );
+            }
+        };
+        if let Some(entry) = list.entries.into_iter().next() {
+            if sender.is_some() && entry.sender != sender {
+                return inbox_sender_filter_unavailable(cli);
+            }
+            if let Err(code) = inbox_next_set_remaining(c, cli, budget, deadline) {
+                return code;
+            }
+            let message_id = entry.message_id;
+            let params = serde_json::to_value(cyclops_proto::InboxClaimParams {
+                message_id: message_id.clone(),
+            })
+            .expect("inbox.claim params serialize");
+            let raw = match c.request("inbox.claim", params) {
+                Ok(value) => value,
+                Err(ClientError::ReadTimeout(_)) => {
+                    return inbox_claim_outcome_unknown(cli, &message_id);
+                }
+                Err(ClientError::Server { code, .. }) if code == "message_not_pending" => {
+                    continue;
+                }
+                Err(error) => return inbox_next_client_failed(cli, &error),
+            };
+            let result: cyclops_proto::InboxClaimResult = match serde_json::from_value(raw.clone())
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    return inbox_next_failed(
+                        cli,
+                        "unreadable_answer",
+                        copy::UNREADABLE_ANSWER.to_string(),
+                        Value::Null,
+                        1,
+                    );
+                }
+            };
+            if result.disposition == cyclops_proto::ClaimDisposition::Claimed {
+                if cli.json {
+                    println!("{raw}");
+                } else {
+                    print_claim_payload(&result.message);
+                }
+                return 0;
+            }
+            // Another consumer for this mailbox won the claim. Its
+            // messages.changed event is already queued on this connection.
+            continue;
+        }
+
+        if let Err(code) = inbox_next_set_remaining(c, cli, budget, deadline) {
+            return code;
+        }
+        match c.next_line() {
+            Ok(line) => {
+                let Ok(event) = serde_json::from_str::<Event>(&line) else {
+                    continue;
+                };
+                if event.event != "messages.changed" {
+                    continue;
+                }
+            }
+            Err(ClientError::ReadTimeout(_)) => {
+                return inbox_next_timed_out(cli, budget);
+            }
+            Err(error) => return inbox_next_client_failed(cli, &error),
+        }
+    }
+}
+
+fn inbox_next_set_remaining(
+    c: &mut Client,
+    cli: &Cli,
+    budget: Duration,
+    deadline: Instant,
+) -> Result<(), i32> {
+    let Some(remaining) = inbox_next_remaining(deadline, Instant::now()) else {
+        return Err(inbox_next_timed_out(cli, budget));
+    };
+    c.set_read_timeout(remaining);
+    Ok(())
+}
+
+fn inbox_next_remaining(deadline: Instant, now: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(now)
+        .filter(|remaining| !remaining.is_zero())
+}
+
+fn inbox_next_timed_out(cli: &Cli, budget: Duration) -> i32 {
+    inbox_next_failed(
+        cli,
+        "timeout",
+        copy::inbox_next_timeout(budget),
+        json!({"pending": false, "waited_ms": budget.as_millis() as u64}),
+        EXIT_WAIT_TIMEOUT,
+    )
+}
+
+fn inbox_claim_outcome_unknown(cli: &Cli, message_id: &cyclops_proto::MessageId) -> i32 {
+    inbox_next_failed(
+        cli,
+        "claim_outcome_unknown",
+        copy::inbox_claim_outcome_unknown(message_id.as_str()),
+        json!({"message_id": message_id}),
+        1,
+    )
+}
+
+fn inbox_sender_filter_unavailable(cli: &Cli) -> i32 {
+    inbox_next_failed(
+        cli,
+        "sender_filter_unavailable",
+        copy::INBOX_SENDER_FILTER_UNAVAILABLE.to_string(),
+        Value::Null,
+        1,
+    )
+}
+
+fn inbox_next_failed(cli: &Cli, code: &str, message: String, data: Value, exit: i32) -> i32 {
+    if cli.json {
+        println!(
+            "{}",
+            json!({"code": code, "message": message, "data": data})
+        );
+    } else {
+        eprintln!("{message}");
+    }
+    exit
+}
+
+fn inbox_next_client_failed(cli: &Cli, error: &ClientError) -> i32 {
+    if !cli.json {
+        return inbox_next_failed(
+            cli,
+            "client_error",
+            copy::client_error(error, None),
+            Value::Null,
+            1,
+        );
+    }
+    let (code, message, data) = match error {
+        ClientError::NotRunning => ("not_running", copy::client_error(error, None), Value::Null),
+        ClientError::ConnectTimeout(waited) => (
+            "connect_timeout",
+            copy::client_error(error, None),
+            json!({"waited_ms": waited.as_millis() as u64}),
+        ),
+        ClientError::ReadTimeout(waited) => (
+            "read_timeout",
+            copy::client_error(error, None),
+            json!({"waited_ms": waited.as_millis() as u64}),
+        ),
+        ClientError::Server {
+            code,
+            message,
+            data,
+            ..
+        } => (code.as_str(), message.clone(), data.clone()),
+        ClientError::Broken(_) => (
+            "connection_lost",
+            copy::client_error(error, None),
+            Value::Null,
+        ),
+    };
+    inbox_next_failed(cli, code, message, data, 1)
+}
+
+enum InboxListOneError {
+    Client(ClientError),
+    Unreadable,
+}
+
+fn inbox_list_one(
+    c: &mut Client,
+    sender: Option<cyclops_proto::RecipientKey>,
+) -> Result<cyclops_proto::InboxListResult, InboxListOneError> {
+    let params = serde_json::to_value(cyclops_proto::InboxListParams {
+        limit: Some(1),
+        sender,
+    })
+    .expect("inbox.list params serialize");
+    let value = c
+        .request("inbox.list", params)
+        .map_err(InboxListOneError::Client)?;
+    serde_json::from_value(value).map_err(|_| InboxListOneError::Unreadable)
+}
+
+fn cmd_messages(c: &mut Client, cli: &Cli, style: &Style, args: &MessagesArgs) -> i32 {
+    let params = serde_json::to_value(cyclops_proto::MessagesSnapshotParams {
+        recent_settled: args.recent_settled,
+    })
+    .expect("messages.snapshot params serialize");
+    let snapshot: cyclops_proto::MessagesSnapshotResult = match ask(
+        c,
+        "messages.snapshot",
+        params,
+        cli.json,
+        None,
+        serde_json::from_value,
+    ) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return 0,
+        Err(code) => return code,
+    };
+
+    println!(
+        "workspace {} · seq {} · {} work · {} inbox · {} outbound · {} active · {} settled · {} attention · {} shown of {}",
+        snapshot.workspace_id,
+        snapshot.workspace_seq,
+        snapshot.counts.work_messages,
+        snapshot.counts.inbox_messages,
+        snapshot.counts.outbound_messages,
+        snapshot.counts.active_messages,
+        snapshot.counts.settled_messages,
+        snapshot.counts.open_attention_entries,
+        snapshot.counts.returned_messages,
+        snapshot.counts.visible_messages
+    );
+    for row in &snapshot.rows {
+        println!(
+            "{}",
+            message_snapshot_line(style.accent(row.message_id.as_str()), row)
+        );
+    }
+    0
+}
+
+fn message_snapshot_line(styled_id: String, row: &cyclops_proto::MessageSnapshotRow) -> String {
+    let direction = match row.direction {
+        cyclops_proto::MessageDirection::Inbound => "inbound",
+        cyclops_proto::MessageDirection::Outbound => "outbound",
+        cyclops_proto::MessageDirection::SelfAddressed => "self addressed",
+        cyclops_proto::MessageDirection::Workspace => "workspace",
+    };
+    let work = if row.needs_action { " · work" } else { "" };
+    let recipients = row
+        .recipients
+        .iter()
+        .map(|recipient| message_recipient_cell(&row.message_id, recipient))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let subject = row.subject.as_deref().unwrap_or("(no subject)");
+    format!(
+        "{styled_id} {direction}{work} · {} -> {recipients} · {subject} · thread {}",
+        row.sender_label, row.thread_message_count
+    )
+}
+
+fn message_recipient_cell(
+    message_id: &cyclops_proto::MessageId,
+    recipient: &cyclops_proto::MessageRecipientSummary,
+) -> String {
+    let mailbox = match &recipient.mailbox {
+        cyclops_proto::MailboxEntryState::Pending => match recipient.fifo_position {
+            Some(1) => "pending · oldest".to_string(),
+            Some(position) => format!("pending · {} ahead", position.saturating_sub(1)),
+            None => "pending".to_string(),
+        },
+        cyclops_proto::MailboxEntryState::Claimed { .. } => "claimed".to_string(),
+        cyclops_proto::MailboxEntryState::DeliveredDirect { .. } => {
+            "delivered directly".to_string()
+        }
+        cyclops_proto::MailboxEntryState::Superseded { .. } => "superseded".to_string(),
+    };
+    let mut notification = match recipient.notification.resolution {
+        Some(cyclops_proto::NotificationResolution::Complete) => "operator submitted".to_string(),
+        Some(cyclops_proto::NotificationResolution::Discard) => "operator discarded".to_string(),
+        None => match recipient.notification.quota_state {
+            Some(cyclops_proto::MessageQuotaState::Held) => {
+                "quota held · wait for quota reset · no automatic resume".to_string()
+            }
+            Some(cyclops_proto::MessageQuotaState::ResetObserved) => format!(
+                "quota reset observed · admin next: cyclops requeue {message_id} · message wide"
+            ),
+            None => match recipient.notification.state {
+                cyclops_proto::MessageNotificationState::NotStarted => "not started".to_string(),
+                cyclops_proto::MessageNotificationState::Gating => "checking readiness".to_string(),
+                cyclops_proto::MessageNotificationState::AttentionRequired => {
+                    "needs attention".to_string()
+                }
+                state => wire_word(serde_json::to_value(state).unwrap_or(Value::Null)),
+            },
+        },
+    };
+    if recipient.notification.resolution.is_none() {
+        if let Some(intent) = recipient.notification.resolution_intent {
+            notification = copy::attention_action_uncertain(intent);
+        }
+        if let Some(cause) = recipient.notification.cause {
+            notification.push(':');
+            notification.push_str(&wire_word(
+                serde_json::to_value(cause).unwrap_or(Value::Null),
+            ));
+        }
+        if let Some(cleared) = recipient.notification.attention_cleared {
+            notification.push(':');
+            notification.push_str(if cleared { "cleared" } else { "open" });
+        }
+    }
+    if let Some(attempt_id) = recipient.notification.attempt_id {
+        notification.push(' ');
+        notification.push_str(&attempt_id.to_string());
+    }
+    let availability = if recipient.available {
+        ""
+    } else {
+        "; unavailable"
+    };
+    format!(
+        "{} [{mailbox}; {notification}{availability}]",
+        recipient.label
+    )
+}
+
+fn print_claim_payload(message: &cyclops_proto::InboxMessage) {
+    let subject = message.subject.as_deref().unwrap_or("(no subject)");
+    println!(
+        "[cyclops {}] FROM: {}  SUBJECT: {}",
+        message.message_id, message.sender_label, subject
+    );
+    if let Some(body) = &message.body {
+        println!("{body}");
+    }
+    if message.kind != cyclops_proto::Kind::Fyi {
+        println!("Reply: cyclops reply {} --body \"...\"", message.message_id);
+    }
+}
+
+fn cmd_reply(cli: &Cli, style: &Style, args: &ReplyArgs) -> i32 {
+    let message_id = match cyclops_proto::MessageId::new(&args.message_id) {
+        Ok(id) => id,
+        Err(error) => {
+            eprintln!("{error}");
+            return EXIT_USAGE;
+        }
+    };
+    let body = match (&args.body, &args.body_file) {
+        (Some(body), _) => body.clone(),
+        (None, Some(path)) => match read_body_file(path) {
+            Ok(body) => body,
+            Err(cause) => {
+                eprintln!("{}", copy::body_file_unreadable(path, &cause));
+                return EXIT_USAGE;
+            }
+        },
+        (None, None) => String::new(),
+    };
+    let mut c = match connect() {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let params = serde_json::to_value(cyclops_proto::ReplyParams {
+        message_id,
+        body,
+        client_key: args.client_key.clone(),
+    })
+    .expect("msg.reply params serialize");
+    let result: MsgSendResult = match ask(
+        &mut c,
+        "msg.reply",
+        params,
+        cli.json,
+        None,
+        serde_json::from_value,
+    ) {
+        Ok(Some(result)) => result,
+        Ok(None) => return 0,
+        Err(code) => return code,
+    };
+    let verb = if result.inserted.unwrap_or(true) {
+        "accepted"
+    } else {
+        "already accepted"
+    };
+    println!("{verb} {}", style.accent(&result.msg_id));
+    0
+}
+
+fn cmd_requeue(c: &mut Client, cli: &Cli, style: &Style, args: &RequeueArgs) -> i32 {
+    let message_id = match cyclops_proto::MessageId::new(&args.message_id) {
+        Ok(id) => id,
+        Err(error) => {
+            eprintln!("{error}");
+            return EXIT_USAGE;
+        }
+    };
+    let params = serde_json::to_value(cyclops_proto::RequeueParams { message_id })
+        .expect("msg.requeue params serialize");
+    let result: cyclops_proto::RequeueResult = match ask(
+        c,
+        "msg.requeue",
+        params,
+        cli.json,
+        None,
+        serde_json::from_value,
+    ) {
+        Ok(Some(result)) => result,
+        Ok(None) => return 0,
+        Err(code) => return code,
+    };
+    if result.requeued {
+        println!("requeued {}", style.accent(result.message_id.as_str()));
+        0
+    } else {
+        eprintln!("message is not requeueable");
+        1
+    }
+}
+
+/// The wire spelling of one serializable value, for display.
+///
+/// Printing what the daemon sent keeps the shown word and the JSON field
+/// identical. A separate Display impl would be a second spelling to keep
+/// in step with the protocol.
+/// One preview line: who, which message, and why it needs attention.
+///
+/// Built as a value so the shape is testable. The identifier arrives
+/// already styled because colour is the caller's business, not this
+/// function's.
+fn alarm_line(styled_id: &str, alarm: &cyclops_proto::AlarmSummary) -> String {
+    format!(
+        "{} {} · {} · {} · {}",
+        styled_id,
+        alarm.recipient,
+        alarm.message_id,
+        wire_word(serde_json::to_value(alarm.state).unwrap_or(Value::Null)),
+        wire_word(serde_json::to_value(alarm.cause).unwrap_or(Value::Null))
+    )
+}
+
+fn wire_word(value: Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Ask once for the exact age-selected set. The caller either renders it
+/// as a preview or freezes its ids before asking the operator to clear.
+fn alarm_preview(
+    c: &mut Client,
+    cli: &Cli,
+    older_than: &str,
+) -> Result<Option<cyclops_proto::AlarmPreviewResult>, i32> {
+    let older_than_ms = match parse_wire_duration_ms(older_than) {
+        Ok(age) => age,
+        Err(()) => {
+            eprintln!("{}", copy::bad_duration(older_than));
+            return Err(EXIT_USAGE);
+        }
+    };
+    let params = serde_json::to_value(cyclops_proto::AlarmPreviewParams { older_than_ms })
+        .expect("alarm.preview params serialize");
+    ask(
+        c,
+        "alarm.preview",
+        params,
+        cli.json,
+        None,
+        serde_json::from_value,
+    )
+}
+
+/// Confirmation is exact and deliberately stronger than a generic yes.
+/// The prompt names the frozen selection's count and age cutoff.
+fn confirm_age_clear<R: BufRead, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    count: usize,
+    older_than: &str,
+) -> std::io::Result<bool> {
+    write!(
+        output,
+        "{}",
+        copy::alarm_clear_confirmation(count, older_than)
+    )?;
+    output.flush()?;
+    let mut answer = String::new();
+    input.read_line(&mut answer)?;
+    Ok(answer.trim() == "clear")
+}
+
+fn clear_alarm_ids(c: &mut Client, cli: &Cli, style: &Style, ids: Vec<String>) -> i32 {
+    let params = serde_json::to_value(cyclops_proto::AlarmClearParams { ids })
+        .expect("alarm.clear params serialize");
+    let result: cyclops_proto::AlarmClearResult = match ask(
+        c,
+        "alarm.clear",
+        params,
+        cli.json,
+        None,
+        serde_json::from_value,
+    ) {
+        Ok(Some(result)) => result,
+        Ok(None) => return 0,
+        Err(code) => return code,
+    };
+    for id in result.cleared_ids {
+        println!("cleared {}", style.accent(&id));
+    }
+    0
+}
+
+fn cmd_alarm(c: &mut Client, cli: &Cli, style: &Style, args: &AlarmArgs) -> i32 {
+    match &args.cmd {
+        AlarmCmd::Preview { older_than } => {
+            let result = match alarm_preview(c, cli, older_than) {
+                Ok(Some(result)) => result,
+                Ok(None) => return 0,
+                Err(code) => return code,
+            };
+            for alarm in result.entries {
+                println!("{}", alarm_line(&style.accent(&alarm.id), &alarm));
+            }
+            0
+        }
+        AlarmCmd::Clear { ids, older_than } => {
+            let Some(older_than) = older_than else {
+                return clear_alarm_ids(c, cli, style, ids.clone());
+            };
+            if cli.json {
+                eprintln!("{}", copy::ALARM_CLEAR_JSON_REQUIRES_CONFIRMATION);
+                return EXIT_USAGE;
+            }
+            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                eprintln!("{}", copy::ALARM_CLEAR_TERMINAL_REQUIRED);
+                return EXIT_USAGE;
+            }
+            let result = match alarm_preview(c, cli, older_than) {
+                Ok(Some(result)) => result,
+                Ok(None) => unreachable!("interactive age clear never uses JSON output"),
+                Err(code) => return code,
+            };
+            if result.entries.is_empty() {
+                println!("{}", copy::no_unresolved_alarms(older_than));
+                return 0;
+            }
+            for alarm in &result.entries {
+                println!("{}", alarm_line(&style.accent(&alarm.id), alarm));
+            }
+            let ids: Vec<String> = result.entries.into_iter().map(|alarm| alarm.id).collect();
+            let confirmed = confirm_age_clear(
+                &mut std::io::stdin().lock(),
+                &mut std::io::stdout().lock(),
+                ids.len(),
+                older_than,
+            );
+            match confirmed {
+                Ok(true) => clear_alarm_ids(c, cli, style, ids),
+                Ok(false) => {
+                    println!("{}", copy::ALARM_CLEARANCE_CANCELLED);
+                    0
+                }
+                Err(error) => {
+                    eprintln!("{}", copy::alarm_clear_confirmation_unreadable(&error));
+                    1
+                }
+            }
+        }
+    }
+}
+
+fn cmd_attention(c: &mut Client, cli: &Cli, style: &Style, args: &AttentionArgs) -> i32 {
+    match &args.cmd {
+        AttentionCmd::Show { id, diff } => {
+            let params = serde_json::to_value(cyclops_proto::AttentionShowParams {
+                id: id.clone(),
+                diff: *diff,
+            })
+            .expect("attention.show params serialize");
+            let result: cyclops_proto::AttentionShowResult = match ask(
+                c,
+                "attention.show",
+                params,
+                cli.json,
+                None,
+                serde_json::from_value,
+            ) {
+                Ok(Some(result)) => result,
+                Ok(None) => return 0,
+                Err(code) => return code,
+            };
+            print_attention_checks(style, &result);
+            if *diff {
+                match (result.expected.as_deref(), result.observed.as_deref()) {
+                    (Some(expected), Some(observed)) => {
+                        print!("{}", local_line_diff(expected, observed))
+                    }
+                    _ => println!("{}", copy::ATTENTION_DIFF_UNAVAILABLE),
+                }
+            }
+            0
+        }
+        AttentionCmd::Complete { id } => resolve_attention(c, cli, style, id, "attention.complete"),
+        AttentionCmd::Discard { id } => resolve_attention(c, cli, style, id, "attention.discard"),
+    }
+}
+
+fn resolve_attention(c: &mut Client, cli: &Cli, style: &Style, id: &str, method: &str) -> i32 {
+    let params = serde_json::to_value(cyclops_proto::AttentionResolveParams { id: id.to_string() })
+        .expect("attention resolution params serialize");
+    let result: cyclops_proto::AttentionResolveResult =
+        match ask(c, method, params, cli.json, None, serde_json::from_value) {
+            Ok(Some(result)) => result,
+            Ok(None) => return 0,
+            Err(code) => return code,
+        };
+    let verb = copy::attention_resolution_verb(result.resolution);
+    println!("{verb} {}", style.accent(&result.attempt_id.to_string()));
+    0
+}
+
+fn print_attention_checks(style: &Style, result: &cyclops_proto::AttentionShowResult) {
+    println!(
+        "{} · {} · {}",
+        style.accent(&result.attempt_id.to_string()),
+        result.recipient,
+        result.message_id
+    );
+    for (name, passed) in copy::attention_check_rows(&result.checks) {
+        println!("  {name}: {}", copy::attention_check_value(passed));
+    }
+}
+
+/// Compact line diff computed by the client. The daemon never receives it.
+fn local_line_diff(expected: &str, observed: &str) -> String {
+    let expected: Vec<_> = expected.split('\n').collect();
+    let observed: Vec<_> = observed.split('\n').collect();
+    let mut prefix = 0;
+    while prefix < expected.len() && prefix < observed.len() && expected[prefix] == observed[prefix]
+    {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < expected.len().saturating_sub(prefix)
+        && suffix < observed.len().saturating_sub(prefix)
+        && expected[expected.len() - 1 - suffix] == observed[observed.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let mut out = String::from("--- expected\n+++ composer\n");
+    let context_start = prefix.saturating_sub(2);
+    for line in &expected[context_start..prefix] {
+        out.push_str("  ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    for line in &expected[prefix..expected.len().saturating_sub(suffix)] {
+        out.push_str("- ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    for line in &observed[prefix..observed.len().saturating_sub(suffix)] {
+        out.push_str("+ ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    let suffix_start = expected.len().saturating_sub(suffix);
+    for line in expected.iter().skip(suffix_start).take(2) {
+        out.push_str("  ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// cyclops wait <target> --until idle|done|blocked [--timeout 60s].
@@ -1606,15 +2665,370 @@ mod tests {
 
     #[test]
     fn bad_durations_are_rejected() {
-        for bad in ["", "0", "0s", "nope", "10x", "s", "-5s", "1.5s", "5s junk"] {
+        for bad in [
+            "",
+            "0",
+            "0s",
+            "nope",
+            "10x",
+            "s",
+            "-5s",
+            "1.5s",
+            "5s junk",
+            "18446744073709551615m",
+        ] {
             assert_eq!(parse_duration(bad), Err(()), "{bad:?} should not parse");
         }
+        assert_eq!(parse_duration("18446744073709551615m"), Err(()));
+        assert_eq!(parse_duration("18446744073709551615s1s"), Err(()));
+        assert_eq!(parse_wire_duration_ms("18446744073709551615"), Err(()));
+    }
+
+    #[test]
+    fn inbox_next_recomputes_one_budget_before_each_socket_operation() {
+        let start = Instant::now();
+        let deadline = start.checked_add(Duration::from_millis(200)).unwrap();
+        assert_eq!(
+            inbox_next_remaining(deadline, start + Duration::from_millis(120)),
+            Some(Duration::from_millis(80))
+        );
+        assert_eq!(inbox_next_remaining(deadline, deadline), None);
+        assert_eq!(
+            inbox_next_remaining(deadline, deadline + Duration::from_millis(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn send_keeps_reply_and_supersession_flags() {
+        let reply = Cli::try_parse_from([
+            "cyclops",
+            "send",
+            "reviewer",
+            "--subject",
+            "ignored for validated reply",
+            "--reply-to",
+            "m-parent",
+            "--client-key",
+            "retry-1",
+        ])
+        .unwrap();
+        let Some(Cmd::Send(args)) = reply.cmd else {
+            panic!("send command")
+        };
+        assert_eq!(args.reply_to.as_deref(), Some("m-parent"));
+        assert_eq!(args.client_key.as_deref(), Some("retry-1"));
+
+        let supersession = Cli::try_parse_from([
+            "cyclops",
+            "send",
+            "reviewer",
+            "--subject",
+            "replacement",
+            "--supersedes",
+            "m-old",
+        ])
+        .unwrap();
+        let Some(Cmd::Send(args)) = supersession.cmd else {
+            panic!("send command")
+        };
+        assert_eq!(args.supersedes.as_deref(), Some("m-old"));
+        assert!(args.reply_to.is_none());
+    }
+
+    #[test]
+    fn send_rejects_the_removed_wait_option() {
+        assert!(Cli::try_parse_from([
+            "cyclops",
+            "send",
+            "reviewer",
+            "--subject",
+            "run tests",
+            "--wait",
+            "done",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn send_help_does_not_advertise_removed_wait_options() {
+        let error = match Cli::try_parse_from(["cyclops", "send", "--help"]) {
+            Ok(_) => panic!("send --help returned a command instead of help"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = error.to_string();
+        assert!(!help.contains("--wait"), "{help}");
+        assert!(!help.contains("--timeout"), "{help}");
+    }
+
+    #[test]
+    fn alarm_clear_requires_explicit_identifiers() {
+        assert!(Cli::try_parse_from(["cyclops", "alarm", "clear"]).is_err());
+        assert!(Cli::try_parse_from(["cyclops", "alarm", "clear", "a-1"]).is_ok());
+        assert!(Cli::try_parse_from(["cyclops", "alarm", "clear", "--older-than", "30m"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["cyclops", "alarm", "clear", "a-1", "--older-than", "30m"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["cyclops", "alarm", "clear", "--all"]).is_err());
+    }
+
+    #[test]
+    fn age_clear_confirmation_names_the_frozen_selection() {
+        let mut input = std::io::Cursor::new(b"clear\n");
+        let mut output = Vec::new();
+        assert!(confirm_age_clear(&mut input, &mut output, 3, "30m").unwrap());
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Clear 3 alarms selected by --older-than 30m? Type clear to confirm: "
+        );
+
+        for answer in [b"yes\n".as_slice(), b"CLEAR\n", b"\n"] {
+            let mut input = std::io::Cursor::new(answer);
+            assert!(!confirm_age_clear(&mut input, &mut Vec::new(), 3, "30m").unwrap());
+        }
+    }
+
+    #[test]
+    fn attention_commands_require_one_explicit_target() {
+        assert!(Cli::try_parse_from(["cyclops", "attention", "show"]).is_err());
+        let shown =
+            Cli::try_parse_from(["cyclops", "attention", "show", "att-1", "--diff"]).unwrap();
+        let Some(Cmd::Attention(AttentionArgs {
+            cmd: AttentionCmd::Show { id, diff },
+        })) = shown.cmd
+        else {
+            panic!("attention show command")
+        };
+        assert_eq!(id, "att-1");
+        assert!(diff);
+
+        for verb in ["complete", "discard"] {
+            assert!(Cli::try_parse_from(["cyclops", "attention", verb]).is_err());
+            assert!(Cli::try_parse_from(["cyclops", "attention", verb, "m-1"]).is_ok());
+        }
+    }
+
+    #[test]
+    fn attention_diff_is_computed_locally() {
+        assert_eq!(
+            local_line_diff("same\nold\ntail", "same\nnew\ntail"),
+            "--- expected\n+++ composer\n  same\n- old\n+ new\n  tail\n"
+        );
+    }
+
+    /// Preview needs an explicit age, and requeue an explicit message.
+    /// Neither operator command has a default that acts on everything.
+    #[test]
+    fn operator_commands_require_an_explicit_target() {
+        assert!(Cli::try_parse_from(["cyclops", "alarm", "preview"]).is_err());
+        assert!(
+            Cli::try_parse_from(["cyclops", "alarm", "preview", "--older-than", "30m"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["cyclops", "requeue"]).is_err());
+        assert!(Cli::try_parse_from(["cyclops", "requeue", "m-1"]).is_ok());
+    }
+
+    #[test]
+    fn messages_command_keeps_the_settled_bound() {
+        let default = Cli::try_parse_from(["cyclops", "messages"]).unwrap();
+        let Some(Cmd::Messages(args)) = default.cmd else {
+            panic!("messages command")
+        };
+        assert_eq!(args.recent_settled, 20);
+
+        let given = Cli::try_parse_from(["cyclops", "messages", "--recent-settled", "7"]).unwrap();
+        let Some(Cmd::Messages(args)) = given.cmd else {
+            panic!("messages command")
+        };
+        assert_eq!(args.recent_settled, 7);
+    }
+
+    #[test]
+    fn messages_plain_line_and_json_name_the_same_body_free_state() {
+        let workspace: cyclops_proto::WorkspaceId =
+            "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let session: cyclops_proto::SessionInstanceId =
+            "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let sender = cyclops_proto::RecipientKey::admin(workspace);
+        let recipient =
+            cyclops_proto::RecipientKey::agent(workspace, session, "%1".parse().unwrap());
+        let attempt =
+            cyclops_proto::NotificationAttemptId::parse("att-00000000-0000-4000-8000-000000000001")
+                .unwrap();
+        let message_id = cyclops_proto::MessageId::new("m-1").unwrap();
+        let row = cyclops_proto::MessageSnapshotRow {
+            message_id: message_id.clone(),
+            seq: 1,
+            ts: 2,
+            kind: cyclops_proto::Kind::Msg,
+            direction: cyclops_proto::MessageDirection::Outbound,
+            sender,
+            sender_label: "admin".into(),
+            recipients: vec![cyclops_proto::MessageRecipientSummary {
+                recipient,
+                label: "reviewer".into(),
+                direction: cyclops_proto::MessageDirection::Outbound,
+                needs_action: true,
+                can_manage_attention: false,
+                available: true,
+                mailbox: cyclops_proto::MailboxEntryState::Pending,
+                fifo_position: Some(2),
+                notification: cyclops_proto::MessageNotificationSummary {
+                    state: cyclops_proto::MessageNotificationState::AttentionRequired,
+                    quota_state: None,
+                    attempt_id: Some(attempt),
+                    cause: Some(cyclops_proto::NotificationAttentionCause::VerifyFailed),
+                    attention_cleared: Some(false),
+                    resolution: None,
+                    resolution_intent: None,
+                    updated_at: Some(3),
+                },
+            }],
+            subject: Some("Review".into()),
+            reply_to: None,
+            thread_root: message_id,
+            thread_message_count: 3,
+            active: true,
+            needs_action: true,
+        };
+
+        let line = message_snapshot_line("m-1".into(), &row);
+        assert_eq!(
+            line,
+            "m-1 outbound · work · admin -> reviewer [pending · 1 ahead; needs attention:verify_failed:open att-00000000-0000-4000-8000-000000000001] · Review · thread 3"
+        );
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["direction"], "outbound");
+        assert_eq!(json["recipients"][0]["fifo_position"], 2);
+        assert_eq!(
+            json["recipients"][0]["notification"]["state"],
+            "attention_required"
+        );
+        assert_eq!(
+            json["recipients"][0]["notification"]["cause"],
+            "verify_failed"
+        );
+        assert!(json.get("body").is_none());
+
+        let mut not_started = row.recipients[0].clone();
+        not_started.fifo_position = Some(1);
+        not_started.notification = cyclops_proto::MessageNotificationSummary {
+            state: cyclops_proto::MessageNotificationState::NotStarted,
+            quota_state: None,
+            attempt_id: None,
+            cause: None,
+            attention_cleared: None,
+            resolution: None,
+            resolution_intent: None,
+            updated_at: None,
+        };
+        assert_eq!(
+            message_recipient_cell(&row.message_id, &not_started),
+            "reviewer [pending · oldest; not started]"
+        );
+
+        let mut gating = row.recipients[0].clone();
+        gating.available = false;
+        gating.notification = cyclops_proto::MessageNotificationSummary {
+            state: cyclops_proto::MessageNotificationState::Gating,
+            quota_state: None,
+            attempt_id: Some(attempt),
+            cause: None,
+            attention_cleared: None,
+            resolution: None,
+            resolution_intent: None,
+            updated_at: Some(3),
+        };
+        assert_eq!(
+            message_recipient_cell(&row.message_id, &gating),
+            "reviewer [pending · 1 ahead; checking readiness att-00000000-0000-4000-8000-000000000001; unavailable]"
+        );
+
+        let mut held = gating.clone();
+        held.available = true;
+        held.notification.state = cyclops_proto::MessageNotificationState::AttentionRequired;
+        held.notification.quota_state = Some(cyclops_proto::MessageQuotaState::Held);
+        let held_cell = message_recipient_cell(&row.message_id, &held);
+        assert!(held_cell.contains("wait for quota reset"), "{held_cell}");
+        assert!(held_cell.contains("no automatic resume"), "{held_cell}");
+
+        let mut reset = held.clone();
+        reset.notification.quota_state = Some(cyclops_proto::MessageQuotaState::ResetObserved);
+        let reset_cell = message_recipient_cell(&row.message_id, &reset);
+        assert!(reset_cell.contains("cyclops requeue m-1"), "{reset_cell}");
+        assert!(reset_cell.contains("message wide"), "{reset_cell}");
+
+        let mut resolved = row.recipients[0].clone();
+        resolved.notification.resolution = Some(cyclops_proto::NotificationResolution::Complete);
+        assert_eq!(
+            message_recipient_cell(&row.message_id, &resolved),
+            "reviewer [pending · 1 ahead; operator submitted att-00000000-0000-4000-8000-000000000001]"
+        );
+        assert_eq!(
+            serde_json::to_value(gating.notification.state).unwrap(),
+            "gating"
+        );
+
+        let mut uncertain = row.recipients[0].clone();
+        uncertain.notification.resolution_intent =
+            Some(cyclops_proto::NotificationResolution::Complete);
+        let cell = message_recipient_cell(&row.message_id, &uncertain);
+        assert!(
+            cell.contains("submit action outcome uncertain; inspect, do not retry"),
+            "{cell}"
+        );
+    }
+
+    /// The preview line shows the cause in the protocol's own spelling.
+    ///
+    /// The word printed and the word in --json output have to be the
+    /// same one, or an operator reading a script and an operator reading
+    /// the terminal are looking at different vocabularies. The wire shape
+    /// itself is asserted in cyclops-proto.
+    #[test]
+    fn a_previewed_alarm_prints_the_cause_the_protocol_named() {
+        use cyclops_proto::NotificationAttentionCause;
+
+        for (cause, expected) in [
+            (NotificationAttentionCause::VerifyFailed, "verify_failed"),
+            (NotificationAttentionCause::SubmitFailed, "submit_failed"),
+            (NotificationAttentionCause::AckTimeout, "ack_timeout"),
+        ] {
+            assert_eq!(
+                wire_word(serde_json::to_value(cause).unwrap()),
+                expected,
+                "{cause:?} printed under another name"
+            );
+        }
+
+        // A value the daemon sent that is not a string is named, not
+        // dropped: a blank column would read as an alarm with no cause.
+        assert_eq!(wire_word(Value::Null), "unknown");
+
+        // The whole line, so a cause dropped from the render is caught
+        // rather than only a cause spelled wrong.
+        let alarm = cyclops_proto::AlarmSummary {
+            id: "att-00000000-0000-4000-8000-000000000001".into(),
+            message_id: "m-1".into(),
+            recipient: "reviewer".into(),
+            state: DeliveryState::AttentionRequired,
+            cause: NotificationAttentionCause::VerifyFailed,
+            ts: 7,
+        };
+        assert_eq!(
+            alarm_line("att-1", &alarm),
+            "att-1 reviewer · m-1 · attention_required · verify_failed"
+        );
     }
 
     fn receipt(state: DeliveryState) -> DeliveryReceipt {
         DeliveryReceipt {
             to: "reviewer".into(),
             state,
+            notification_state: None,
+            quota_state: None,
             position: None,
             note: None,
             pane: None,

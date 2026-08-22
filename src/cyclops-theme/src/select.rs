@@ -31,6 +31,7 @@
 //!   L -- no --> W[keep the colors on screen, one warning]
 //! ```
 
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -220,17 +221,24 @@ fn config_path(home: &Path) -> PathBuf {
 /// 2. Find a top-level `theme =` line, which means before the first
 ///    `[table]` header, and replace its value in place.
 /// 3. With no such line, insert one at the end of the top-level keys.
-/// 4. Write through a temp file and rename, so a crash mid-write cannot
-///    leave a half-written config where a whole one was.
+/// 4. Replace through the held state directory, so readers see a complete
+///    old or new config and linked paths are refused.
 pub fn set_config_theme(home: &Path, name: &str) -> Result<(), String> {
-    use std::io::Write;
-
     let path = config_path(home);
+    let root = cyclops_state::StateRoot::open_or_create(home)
+        .map_err(|e| format!("open {}: {e}", home.display()))?;
     let key = format!("theme = \"{name}\"");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    let text = match root
+        .open_read(Path::new("config.toml"))
+        .map_err(|e| format!("read {}: {e}", path.display()))?
+    {
+        Some(mut file) => {
+            let mut text = String::new();
+            file.read_to_string(&mut text)
+                .map_err(|e| format!("read {}: {e}", path.display()))?;
+            text
+        }
+        None => String::new(),
     };
 
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
@@ -245,15 +253,8 @@ pub fn set_config_theme(home: &Path, name: &str) -> Result<(), String> {
     let mut body = lines.join("\n");
     body.push('\n');
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
-    let tmp = path.with_extension("toml.tmp");
-    let mut f = std::fs::File::create(&tmp).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    f.write_all(body.as_bytes())
-        .and_then(|()| f.sync_all())
-        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("write {}: {e}", path.display()))
+    root.replace_file(Path::new("config.toml"), body.as_bytes())
+        .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// A line that assigns the top-level `theme` key. Not a substring match:
@@ -483,11 +484,12 @@ mod tests {
     /// `set_config_theme`'s home-relative path, read back after a write.
     fn config_after(before: Option<&str>, name: &str) -> String {
         let dir = tempfile::tempdir().expect("tempdir");
+        let home = std::fs::canonicalize(dir.path()).expect("canonical tempdir");
         if let Some(b) = before {
-            std::fs::write(dir.path().join("config.toml"), b).expect("seed config");
+            std::fs::write(home.join("config.toml"), b).expect("seed config");
         }
-        set_config_theme(dir.path(), name).expect("write theme key");
-        std::fs::read_to_string(dir.path().join("config.toml")).expect("read config")
+        set_config_theme(&home, name).expect("write theme key");
+        std::fs::read_to_string(home.join("config.toml")).expect("read config")
     }
 
     /// The switch edits one line. Comments, key order, and every other key
@@ -506,6 +508,51 @@ mod tests {
         );
         // No file yet.
         assert_eq!(config_after(None, "light"), "theme = \"light\"\n");
+    }
+
+    #[test]
+    fn a_linked_config_is_refused_without_touching_its_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let home = cyclops_proto::scratch::scratch_dir("cyc-theme-config-link-home");
+        let external = cyclops_proto::scratch::scratch_dir("cyc-theme-config-link-external");
+        for path in [&home, &external] {
+            let _ = std::fs::remove_dir_all(path);
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let target = external.join("config.toml");
+        std::fs::write(&target, b"theme = \"external\"\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&target, home.join("config.toml")).unwrap();
+
+        let error = set_config_theme(&home, "light").unwrap_err();
+
+        assert!(error.contains("linked or not a regular file"), "{error}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"theme = \"external\"\n");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&external);
+    }
+
+    #[test]
+    fn a_new_config_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = cyclops_proto::scratch::scratch_dir("cyc-theme-config-mode");
+        let _ = std::fs::remove_dir_all(&home);
+        set_config_theme(&home, "light").unwrap();
+        assert_eq!(
+            std::fs::metadata(home.join("config.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// A `theme` key has to be a key. A comment and a value that happens to

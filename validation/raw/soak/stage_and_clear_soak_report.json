@@ -1,0 +1,79 @@
+{
+  "timestamp": "2026-08-22T05:30:00Z",
+  "submitted_receipt_gate": "NOT_EXECUTED_IN_STAGE_CLEAR_HARNESS: isolated stage-and-clear soak intentionally isolates staging verification and teardown without submitting turns",
+  "results": [
+    {
+      "vendor": "codex",
+      "installed": true,
+      "version": "codex-cli 0.149.0",
+      "trials_total": 100,
+      "widths_tested": [
+        60,
+        100
+      ],
+      "visible_exact": 80,
+      "terminal_anchored": 0,
+      "collapsed_chip": 20,
+      "total_verified": 100,
+      "clean_clears": 100,
+      "verification_failures": 0,
+      "clear_failures": 0,
+      "status": "PASSED",
+      "notes": "100 trials completed across widths 60 and 100. Evidence: visible_exact=80, terminal_anchored=0, collapsed_chip=20, clean_clears=100"
+    },
+    {
+      "vendor": "claude",
+      "installed": true,
+      "version": "2.1.239 (Claude Code)",
+      "trials_total": 100,
+      "widths_tested": [
+        60,
+        100
+      ],
+      "visible_exact": 0,
+      "terminal_anchored": 0,
+      "collapsed_chip": 100,
+      "total_verified": 100,
+      "clean_clears": 100,
+      "verification_failures": 0,
+      "clear_failures": 0,
+      "status": "PASSED",
+      "notes": "100 trials completed across widths 60 and 100. Evidence: visible_exact=0, terminal_anchored=0, collapsed_chip=100, clean_clears=100"
+    },
+    {
+      "vendor": "agy",
+      "installed": true,
+      "version": "1.1.18",
+      "trials_total": 100,
+      "widths_tested": [
+        60,
+        100
+      ],
+      "visible_exact": 0,
+      "terminal_anchored": 80,
+      "collapsed_chip": 20,
+      "total_verified": 100,
+      "clean_clears": 100,
+      "verification_failures": 0,
+      "clear_failures": 0,
+      "status": "PASSED",
+      "notes": "100 trials completed across widths 60 and 100. Evidence: visible_exact=0, terminal_anchored=80, collapsed_chip=20, clean_clears=100"
+    },
+    {
+      "vendor": "cursor",
+      "installed": false,
+      "version": "unavailable (offline fixture only)",
+      "trials_total": 0,
+      "widths_tested": [],
+      "visible_exact": 0,
+      "terminal_anchored": 0,
+      "collapsed_chip": 0,
+      "total_verified": 0,
+      "clean_clears": 0,
+      "verification_failures": 0,
+      "clear_failures": 0,
+      "status": "UNAVAILABLE_OFFLINE_GATE",
+      "notes": "Binary unavailable on host; validated via deterministic manifest fixture test"
+    }
+  ]
+}

@@ -131,6 +131,11 @@ impl PaneRow {
             width: self.width,
             height: self.height,
             state,
+            // Readiness is fusion's stamp, and the adapter has no fusion:
+            // refused here, filled in by the daemon alongside the fields
+            // below. Absent evidence is not permission.
+            write_ready: false,
+            write_block: None,
             // Elapsed-in-state, hook liveness, and the manifest's display
             // name are daemon knowledge; the daemon fills all three in.
             state_ms: None,
@@ -195,10 +200,9 @@ pub enum PaneEvent {
         /// Pane id.
         pane_id: String,
     },
-    /// This watcher's own session was renamed (its `$id`, resolved at
-    /// connect, matched the notification's). [`SessionWatcher::session`]
-    /// and the internal target `list-panes -s -t` uses already reflect
-    /// `name` by the time this event is sent — see [`handle_session_renamed`].
+    /// This watcher's own session was renamed. The stable `$id` either
+    /// matched a notification or resolved the new name after a failed
+    /// snapshot. The internal target already reflects `name` when sent.
     SessionRenamed {
         /// The session's new name.
         name: String,
@@ -259,7 +263,7 @@ impl SessionWatcher {
 
         // Bootstrap: full snapshot before any subscriber exists, so the
         // events it produces vanish and the table starts authoritative.
-        if let Err(e) = reconcile(&mut ctx).await {
+        if let Err(e) = reconcile_current_session(&mut ctx).await {
             client.shutdown().await;
             return Err(e);
         }
@@ -289,23 +293,16 @@ impl SessionWatcher {
     }
 
     /// Current session name this watcher covers. Starts as the connect-time
-    /// name; a followed rename (this watcher's own `$id` in a
-    /// `%session-renamed`) updates it in place, live, so this always
-    /// answers with the name `list-panes -s -t` is targeting right now —
-    /// which is NOT necessarily the name a caller's own in-flight event
-    /// predates. A caller that resolves a daemon-side session slot from
-    /// this value alone can race a rename still working its way down the
-    /// same ordered event channel (`cyclopsd::handle_pane_event`'s
-    /// `SessionRenamed` arm applies it); addressing by the stable index the
-    /// daemon assigned at attach, not by this name, is what closes that
-    /// window.
+    /// name. A rename notification or stable-id recovery updates it before
+    /// emitting [`PaneEvent::SessionRenamed`]. A caller still addresses its
+    /// daemon slot by stable index because the event can remain in flight.
     pub fn session(&self) -> String {
         self.session.lock().expect("session name lock").clone()
     }
 
     /// This watcher's own tmux `$id`, if the connect-time probe resolved
-    /// one. Exposed for tests; production code never needs it directly —
-    /// [`PaneEvent::SessionRenamed`] already carries the fact that matters.
+    /// one. The daemon binds durable session identity to this immutable id;
+    /// [`PaneEvent::SessionRenamed`] carries display-name changes.
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
     }
@@ -424,7 +421,7 @@ async fn watch_loop(
             },
             req = reconcile_rx.recv() => match req {
                 Some(ack) => {
-                    let res = reconcile(&mut ctx).await;
+                    let res = reconcile_current_session(&mut ctx).await;
                     let disconnected = matches!(res, Err(TmuxError::Disconnected));
                     let failed = res.is_err();
                     let _ = ack.send(res);
@@ -434,7 +431,8 @@ async fn watch_loop(
                     // tmux switched to a survivor instead of dropping (see
                     // the hint-deadline arm below); the probe is what tells
                     // the two apart.
-                    if disconnected || (failed && session_gone(&ctx.client, &ctx.session).await) {
+                    let target = ctx.session_id.as_deref().unwrap_or(&ctx.session);
+                    if disconnected || (failed && session_gone(&ctx.client, target).await) {
                         let _ = ctx.events.send(PaneEvent::Disconnected);
                         break;
                     }
@@ -445,7 +443,7 @@ async fn watch_loop(
                 deadline.unwrap_or_else(tokio::time::Instant::now)
             ), if deadline.is_some() => {
                 deadline = None;
-                match reconcile(&mut ctx).await {
+                match reconcile_current_session(&mut ctx).await {
                     Ok(()) => {}
                     Err(TmuxError::Disconnected) => {
                         let _ = ctx.events.send(PaneEvent::Disconnected);
@@ -458,7 +456,8 @@ async fn watch_loop(
                         // every reconcile against the dead name then fails
                         // the same way forever without this probe ever
                         // telling the loop to stop.
-                        if session_gone(&ctx.client, &ctx.session).await {
+                        let target = ctx.session_id.as_deref().unwrap_or(&ctx.session);
+                        if session_gone(&ctx.client, target).await {
                             let _ = ctx.events.send(PaneEvent::Disconnected);
                             break;
                         }
@@ -557,13 +556,46 @@ fn handle_session_renamed(ctx: &mut LoopCtx, session: Option<String>, name: Stri
     if !is_own_session {
         return Action::Hint;
     }
+    follow_session_name(ctx, name);
+    Action::None
+}
+
+fn follow_session_name(ctx: &mut LoopCtx, name: String) -> bool {
     if ctx.session == name {
-        return Action::None;
+        return false;
     }
     ctx.session = name.clone();
     *ctx.session_shared.lock().expect("session name lock") = name.clone();
     let _ = ctx.events.send(PaneEvent::SessionRenamed { name });
-    Action::None
+    true
+}
+
+/// Snapshot this watcher's stable session id and refresh its display name.
+/// A mutable name is only a fallback when the connect-time id probe failed.
+async fn reconcile_current_session(ctx: &mut LoopCtx) -> Result<(), TmuxError> {
+    let Some(session_id) = ctx.session_id.clone() else {
+        return reconcile(ctx).await;
+    };
+    if let Some(name) = recover_session_name(ctx, &session_id).await {
+        follow_session_name(ctx, name);
+    }
+    reconcile_target(ctx, &session_id).await
+}
+
+async fn recover_session_name(ctx: &LoopCtx, session_id: &str) -> Option<String> {
+    let target = format!("{session_id}:");
+    let cmd = format!(
+        "display-message -p -t {} {}",
+        quote_arg(&target),
+        quote_arg("#{session_name}")
+    );
+    let Ok(mut lines) = ctx.client.command(&cmd).await else {
+        return None;
+    };
+    if lines.len() != 1 || lines[0].is_empty() {
+        return None;
+    }
+    Some(lines.remove(0))
 }
 
 /// Emit OutputActivity, rate limited per pane. Output from a pane the table
@@ -740,7 +772,12 @@ async fn resolve_session_id(client: &ControlClient, session: &str) -> Option<Str
 /// Query authoritative state and fold it into the table: diff, emit events,
 /// keep subscriptions in step with the pane population.
 async fn reconcile(ctx: &mut LoopCtx) -> Result<(), TmuxError> {
-    let fresh = list_panes(&ctx.client, &ctx.session).await?;
+    let session = ctx.session.clone();
+    reconcile_target(ctx, &session).await
+}
+
+async fn reconcile_target(ctx: &mut LoopCtx, session: &str) -> Result<(), TmuxError> {
+    let fresh = list_panes(&ctx.client, session).await?;
 
     let mut added: Vec<PaneRow> = Vec::new();
     let mut removed: Vec<String> = Vec::new();
@@ -929,6 +966,107 @@ fn unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn stale_session_context(
+        server: &cyclops_testrig::TmuxServer,
+        session: &str,
+    ) -> (LoopCtx, broadcast::Receiver<PaneEvent>) {
+        let cfg = ControlConfig::attach(session)
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _notifications) = ControlClient::spawn(cfg).await.unwrap();
+        let client = Arc::new(client);
+        let session_id = resolve_session_id(&client, session).await;
+        let (events, receiver) = broadcast::channel(16);
+        (
+            LoopCtx {
+                client,
+                session: session.to_string(),
+                session_shared: Arc::new(StdMutex::new(session.to_string())),
+                session_id,
+                table: Arc::new(StdMutex::new(HashMap::new())),
+                events,
+                last_output: HashMap::new(),
+            },
+            receiver,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_failed_snapshot_recovers_the_same_session_by_id() {
+        if !cyclops_testrig::tmux_available() {
+            return;
+        }
+        let server = cyclops_testrig::TmuxServer::new("watcher-early-rename");
+        server.run_ok(&["new-session", "-d", "-s", "before"]);
+        let (mut ctx, mut events) = stale_session_context(&server, "before").await;
+        assert!(ctx.session_id.is_some());
+
+        server.run_ok(&["rename-session", "-t", "=before", "after"]);
+        reconcile_current_session(&mut ctx).await.unwrap();
+
+        assert_eq!(ctx.session, "after");
+        assert_eq!(ctx.session_shared.lock().unwrap().as_str(), "after");
+        assert!(matches!(
+            events.try_recv(),
+            Ok(PaneEvent::SessionRenamed { name }) if name == "after"
+        ));
+        while events.try_recv().is_ok() {}
+        let session_id = ctx.session_id.clone().unwrap();
+        let _ = handle_session_renamed(&mut ctx, Some(session_id), "after".into());
+        assert!(events.try_recv().is_err());
+        ctx.client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_reused_name_cannot_redirect_the_authoritative_snapshot() {
+        if !cyclops_testrig::tmux_available() {
+            return;
+        }
+        let server = cyclops_testrig::TmuxServer::new("watcher-reused-name");
+        server.run_ok(&["new-session", "-d", "-s", "before"]);
+        server.run_ok(&["new-session", "-d", "-s", "other"]);
+        let pane_id = |session: &str| {
+            let out = server.run(&["list-panes", "-t", session, "-F", "#{pane_id}"]);
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let original = pane_id("=before");
+        let replacement = pane_id("=other");
+        let (mut ctx, _events) = stale_session_context(&server, "before").await;
+        reconcile_current_session(&mut ctx).await.unwrap();
+
+        server.run_ok(&["rename-session", "-t", "=before", "after"]);
+        server.run_ok(&["rename-session", "-t", "=other", "before"]);
+        reconcile_current_session(&mut ctx).await.unwrap();
+
+        {
+            let table = ctx.table.lock().unwrap();
+            assert!(table.contains_key(&original));
+            assert!(!table.contains_key(&replacement));
+        }
+        assert_eq!(ctx.session, "after");
+        ctx.client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_deleted_session_id_cannot_recover_as_a_survivor() {
+        if !cyclops_testrig::tmux_available() {
+            return;
+        }
+        let server = cyclops_testrig::TmuxServer::new("watcher-deleted-session");
+        server.run_ok(&["new-session", "-d", "-s", "dies"]);
+        server.run_ok(&["new-session", "-d", "-s", "survivor"]);
+        server.run_ok(&["set-option", "-g", "detach-on-destroy", "off"]);
+        let (mut ctx, mut events) = stale_session_context(&server, "dies").await;
+
+        server.run_ok(&["kill-session", "-t", "=dies"]);
+        assert!(reconcile_current_session(&mut ctx).await.is_err());
+
+        assert_eq!(ctx.session, "dies");
+        assert!(events.try_recv().is_err());
+        ctx.client.shutdown().await;
+    }
 
     #[test]
     fn pane_row_parses_and_survives_tabbed_title() {

@@ -16,6 +16,9 @@ default_model_observed = "Gemini 3.6 Flash (High)"
 # gap below is a property of this vendor and a pane started here has it too.
 launch = "agy"
 
+[messaging]
+mailbox_capability_file = "~/.gemini/antigravity-cli/skills/cyclops/SKILL.md"
+
 [hooks]
 # From the binary's embedded docs (strings extraction) and confirmed live.
 config_mechanism = ".agents/hooks.json in the customization root"
@@ -78,7 +81,20 @@ state = "idle_with_input"
 priority = 1050
 region = "bottom_non_empty_lines(4)"
 line_regex = ['^\s*>\s+\S']
-evidence = "MEASURED: injected marker rendered as '> CYCVAL-ACK-AGY-002 ...'"
+note = """Plain-only on purpose, unlike the claude and codex composer rules
+which need an SGR discriminator to separate a human draft from ghost text.
+MEASURED 2026-08-20 (issue 18, agy 1.1.13, `capture-pane -e` on a live idle
+pane): an empty composer renders exactly 'ESC[94m>ESC[39m' and paints NO
+placeholder or suggestion text after the glyph, so there is nothing here
+for a ghost rule to discriminate against. If a future version does paint
+one, this rule reads it as a human draft and deliveries hold forever:
+benign, visible, and the direction to fail in. Re-probe before relaxing it.
+
+The observation covers the idle state on one version; typed-input styling
+was not captured, because the only agy pane available was a colleague's
+live session and typing into it to take a measurement is exactly what the
+gate exists to prevent."""
+evidence = "MEASURED: injected marker rendered as '> CYCVAL-ACK-AGY-002 ...'; empty composer 'ESC[94m>ESC[39m' with no ghost text (2026-08-20, agy 1.1.13)"
 
 [[rule]]
 id = "screen_working"
@@ -162,6 +178,22 @@ first_paste_caveat = """MEASURED: the first paste after TUI startup did not stag
 (staged_in_composer=false) while the second did. Composer readiness lags the
 first rendered prompt glyph. Verify-before-submit catches this; a blind
 paste-then-Enter would have lost the message silently."""
+
+# MEASURED (live 2026-08-20 capture): the composer is a box, so below the
+# staged text come the closing rule and one model status row.
+# MEASURED (live 2026-08-20 capture, agy 1.1.13): the composer is a box, so
+# the closing rule and one model status row follow the staged text, both
+# painted. The two lists are one layout: entry i is row i, plain and escaped.
+composer_trailer_regex = [
+  '^─+$',
+  '^\s{0,4}Gemini [^·]+(?: · [^·]+){2,} · Ctx: \d+%(?: · .+)?\s*$',
+]
+composer_trailer_regex_esc = [
+  '^\x1b\[90m─',
+  '^\x1b\[38;5;\d+mGemini\b',
+]
+# The first 2 rows are painted every time; the rest are optional.
+composer_trailer_required_prefix = 2
 
 [context_leak]
 note = """agy auto-read ~/projects/COORDINATION.md and ~/projects/NOTES.md on the

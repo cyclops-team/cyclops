@@ -23,6 +23,66 @@ pub const RESTART_PREDATES_FIX: &str =
 pub const NO_RECIPIENT: &str =
     "no recipient. Name one (cyclops send reviewer --subject \"...\"), or pass --to or --all.";
 
+pub const ATTENTION_DIFF_UNAVAILABLE: &str =
+    "diff unavailable: exact visible composer extraction failed";
+
+pub const ALARM_CLEAR_JSON_REQUIRES_CONFIRMATION: &str = "alarm clear --older-than requires interactive confirmation; use alarm preview --json, then alarm clear with its exact ids";
+
+pub const ALARM_CLEAR_TERMINAL_REQUIRED: &str = "alarm clear --older-than requires an interactive terminal; use alarm preview, then alarm clear with its exact ids";
+
+pub const ALARM_CLEARANCE_CANCELLED: &str = "alarm clearance cancelled";
+
+pub const SETUP_HOME_UNAVAILABLE: &str = "HOME is not set, so setup paths cannot be inspected";
+
+pub fn alarm_clear_confirmation(count: usize, older_than: &str) -> String {
+    format!("Clear {count} alarms selected by --older-than {older_than}? Type clear to confirm: ")
+}
+
+pub fn no_unresolved_alarms(older_than: &str) -> String {
+    format!("no unresolved alarms selected by --older-than {older_than}")
+}
+
+pub fn alarm_clear_confirmation_unreadable(error: &std::io::Error) -> String {
+    format!("could not read alarm clearance confirmation: {error}")
+}
+
+pub fn attention_resolution_verb(
+    resolution: cyclops_proto::NotificationResolution,
+) -> &'static str {
+    match resolution {
+        cyclops_proto::NotificationResolution::Complete => "submitted",
+        cyclops_proto::NotificationResolution::Discard => "discarded",
+    }
+}
+
+pub fn attention_check_rows(checks: &cyclops_proto::AttentionChecks) -> [(&'static str, bool); 5] {
+    [
+        ("notification exact", checks.notification_exact),
+        ("trailer anchored", checks.trailer_anchored),
+        ("process binding matches", checks.process_matches),
+        ("manifest matches", checks.manifest_matches),
+        ("terminal action safe", checks.terminal_action_safe),
+    ]
+}
+
+pub fn attention_check_value(passed: bool) -> &'static str {
+    if passed {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+pub fn attention_action_uncertain(resolution: cyclops_proto::NotificationResolution) -> String {
+    format!(
+        "{} action outcome uncertain; inspect, do not retry",
+        match resolution {
+            cyclops_proto::NotificationResolution::Complete => "submit",
+            cyclops_proto::NotificationResolution::Discard => "discard",
+        }
+    )
+}
+
 /// Empty roster invites the next action, and names the command that fills
 /// it. `cyclops status` is the way to find the pane id to hand it.
 pub const NO_AGENTS: &str =
@@ -225,7 +285,9 @@ pub const UNREADABLE_ANSWER: &str =
     "cyclops answered in a shape this client doesn't understand. The daemon and CLI are probably far apart in version; update the older one.";
 
 pub fn broken(cause: &str) -> String {
-    format!("lost the connection to cyclops: {cause}. Check that cyclopsd is still running, then retry.")
+    format!(
+        "lost the connection to cyclops: {cause}. The request may already have landed. Check that cyclopsd is running and inspect current state. Only repeat a send or reply with the same explicit --client-key."
+    )
 }
 
 pub fn unknown_target(asked: &str, known: &[String]) -> String {
@@ -245,6 +307,39 @@ pub fn proto_mismatch(server: u32, client: u32) -> String {
 
 pub fn bad_duration(input: &str) -> String {
     format!("can't read \"{input}\" as a duration. Use forms like 90s, 2m, 1m30s, or 500ms.")
+}
+
+pub fn inbox_next_timeout(d: Duration) -> String {
+    format!(
+        "no pending message arrived within {}. Increase --timeout or inspect the queue with cyclops inbox list.",
+        timeout_words(d)
+    )
+}
+
+pub fn inbox_claim_outcome_unknown(message_id: &str) -> String {
+    format!(
+        "cyclops sent the claim for {message_id}, but the daemon did not answer before the deadline. The message may already be claimed. Inspect it with cyclops thread {message_id} or cyclops inbox list before retrying."
+    )
+}
+
+pub const INBOX_SENDER_FILTER_UNAVAILABLE: &str = "the daemon did not prove the sender endpoint on its inbox answer, so cyclops refused to claim a possibly different message. Update cyclopsd or remove --from.";
+
+pub const WATCH_JSON_FILTER_UNSUPPORTED: &str = "--from, --to, and --with filter the interactive TUI and are not available with --json. Use --kinds for the event stream or cyclops inbox next --from <recipient-key> for bounded receive automation.";
+
+pub fn unknown_watch_filters(asked: &[&str]) -> String {
+    let names = asked
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let label = if asked.len() == 1 {
+        "unknown active display label"
+    } else {
+        "unknown active display labels"
+    };
+    format!(
+        "{label} {names}. Watch filters use current display labels, not durable endpoint identities, and renaming a pane can invalidate one. Run cyclops list --all to discover active labels. For automation, use cyclops inbox next --timeout 30s."
+    )
 }
 
 /// Wait timed out (exit 2). Names what was waited for, how long, the state
@@ -273,6 +368,7 @@ pub fn client_error(e: &ClientError, asked: Option<&str>) -> String {
     match e {
         ClientError::NotRunning => NOT_RUNNING.into(),
         ClientError::ConnectTimeout(d) => connect_timeout(*d),
+        ClientError::ReadTimeout(d) => broken(&format!("no answer within {}", timeout_words(*d))),
         ClientError::Server {
             code,
             message,
@@ -492,6 +588,45 @@ pub fn theme_not_saved(path: &std::path::Path, cause: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn attention_copy_owns_resolution_and_check_vocabulary() {
+        assert_eq!(
+            attention_resolution_verb(cyclops_proto::NotificationResolution::Complete),
+            "submitted"
+        );
+        assert_eq!(
+            attention_resolution_verb(cyclops_proto::NotificationResolution::Discard),
+            "discarded"
+        );
+        let checks = cyclops_proto::AttentionChecks {
+            notification_exact: true,
+            trailer_anchored: true,
+            process_matches: true,
+            manifest_matches: true,
+            terminal_action_safe: true,
+        };
+        let labels: Vec<_> = attention_check_rows(&checks)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "notification exact",
+                "trailer anchored",
+                "process binding matches",
+                "manifest matches",
+                "terminal action safe",
+            ]
+        );
+        assert_eq!(attention_check_value(true), "yes");
+        assert_eq!(attention_check_value(false), "no");
+        assert_eq!(
+            attention_action_uncertain(cyclops_proto::NotificationResolution::Complete),
+            "submit action outcome uncertain; inspect, do not retry"
+        );
+    }
+
     /// Three causes, three sentences, and the difference between them is
     /// the whole point: an empty manifest set is fixed once for the
     /// machine, a set that binds nothing in one pane is fixed for that
@@ -590,6 +725,14 @@ mod tests {
             data: serde_json::Value::Null,
         };
         assert_eq!(client_error(&bare, None), "cyclops refused: denied");
+    }
+
+    #[test]
+    fn a_lost_response_never_recommends_an_unkeyed_retry() {
+        let answer = broken("timed out waiting for a reply");
+        assert!(answer.contains("may already have landed"), "{answer}");
+        assert!(answer.contains("same explicit --client-key"), "{answer}");
+        assert!(!answer.ends_with("then retry."), "{answer}");
     }
 
     #[test]

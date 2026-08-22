@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use cyclops_proto::{DeliveryState, Kind, LedgerLine};
@@ -19,6 +20,14 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+const MAX_CONCURRENT_RIGS: usize = 8;
+
+fn rig_slots() -> &'static Arc<Semaphore> {
+    static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SLOTS.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_RIGS)))
+}
 
 // ---------------------------------------------------------------------------
 // Fixture manifests
@@ -26,11 +35,75 @@ use tokio::net::UnixStream;
 
 /// Screen-tier fixture bound to plain cat/sh panes: title tier always says
 /// idle, staging is verified by the message id, no hook ACK (tier 2).
+/// A deterministic composer process for the lifecycle fixtures.
+///
+/// `cat` cannot model a composer: it echoes a paste and never gives the
+/// screen back, so the staged marker never leaves and the screen-evidence
+/// ACK tier can never resolve. This read loop models the two things a real
+/// composer does.
+///
+/// A paste arrives as one burst, so the tty echoes every row of it at once,
+/// including the final sentinel row, which carries no newline and therefore
+/// stays in the input buffer as staged text. The loop consumes the
+/// newline-terminated rows silently, leaving that echo on screen for the
+/// staging check to find. Only when the daemon's Enter finally terminates
+/// the sentinel row does the loop repaint: screen cleared, prompt back,
+/// marker gone, which is the evidence the screen ACK tier waits for.
+/// Repainting on every row instead would erase the sentinel's echo before
+/// anything could verify it.
+///
+/// Lifecycle only. It proves receipts and liveness, not INVARIANTS rule 12
+/// and not sentinel completeness; a pane that paints no chrome under a
+/// paste cannot decide terminality at all.
+/// The composer process behind the lifecycle fixtures: a small fake TUI
+/// that stages a paste, paints chrome below it, and consumes the staged
+/// text when the submit key arrives.
+///
+/// It exists because `cat` cannot model a composer. `cat` echoes a paste
+/// and never gives the screen back, so the staged marker never leaves
+/// and no receipt can resolve, and it paints nothing below the paste, so
+/// terminality is undecidable and the sentinel can never be proven
+/// last. Fixtures built on it end up claiming a representation the pane
+/// does not produce.
+///
+/// See `common/faketui.py` for what it draws.
+pub fn composer_pane() -> String {
+    format!("python3 {}", faketui_path())
+}
+
+/// The composer that ACCEPTS the submit key and does nothing with it:
+/// the staged text stays put and no turn runs.
+///
+/// The staged-never-sent class c shape, which is what a modal or a mode
+/// does to an Enter. `send-keys` succeeds, so any inference from that
+/// success is wrong here, and the payload is still in the composer.
+pub fn swallowing_composer_pane() -> String {
+    format!("python3 {} --swallow-submit", faketui_path())
+}
+
+/// The fake TUI's script path, for fixtures that start it themselves
+/// (a pane whose root is a shell types the command instead of tmux
+/// exec'ing it).
+pub fn faketui_path() -> String {
+    format!("{}/tests/common/faketui.py", env!("CARGO_MANIFEST_DIR"))
+}
+
+/// The same process after a fixture's own setup has run, for panes that
+/// must first show a modal or a banner and then behave like a composer.
+pub fn composer_tail() -> String {
+    format!(
+        "exec python3 {}/tests/common/faketui.py",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
 pub const CAT_MANIFEST: &str = r#"
 [agent]
 id = "fix"
 display_name = "Cat fixture"
-process_names = ["cat", "sh", "bash", "dash"]
+# Keep the GitHub Actions driver out of the fixture's vendor set. Otherwise
+# socket requests from the test process look like an agent outside the rig.
+process_names = ["python3", "python", "Python", "cat", "sh", "dash"]
 
 [[rule]]
 id = "always_idle"
@@ -39,11 +112,61 @@ priority = 100
 region = "pane_title"
 regex = ['^']
 
+# The screen sensor must be able to answer for these panes, because a
+# write needs positive clean-composer evidence from the sensor that sees
+# the composer (INVARIANTS rule 12). A blank fixture pane IS a clean
+# composer, so the empty bottom region is the evidence.
+[[rule]]
+id = "composer_empty"
+state = "idle"
+priority = 90
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^❯\s*$']
+
+# The FINAL payload row, which is the one row a fixed bottom region can
+# never lose: `cat` echoes every pasted line, so the header scrolls away
+# while the sentinel stays. Paired with the generic '[cyclops:end '
+# pattern, this is what lets marker_in_composer reach the submit step.
+#
+# These shared fixtures exercise delivery LIFECYCLE only. They do not
+# prove INVARIANTS rule 12 and they do not prove sentinel completeness:
+# a blank pane paints no chrome under a paste, so terminality is not
+# decidable here at all. Those claims belong to the dedicated tests in
+# m1_blockers.rs and the sentinel unit tests in delivery.rs.
+[[rule]]
+id = "composer_holds_paste"
+state = "idle_with_input"
+priority = 80
+# The active composer only. The escaped matcher rejects the dim transcript
+# prompt that the fixture paints after consuming a turn.
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^\s*❯\s+\S']
+line_regex_esc = ['^❯']
+
+# The transient row the composer paints after consuming the sentinel.
+# Screen ACK evidence needs a turn, and a generic-marker staging does not
+# license "the window changed" as proof of one.
+[[rule]]
+id = "composer_working"
+state = "working"
+priority = 300
+region = "bottom_non_empty_lines(5)"
+line_regex = ['^FAKETUI-WORKING$']
+
 [injection]
 method = "load-buffer + paste-buffer -p"
 submit = "Enter"
 verify_before_submit = true
 verify_pattern = ["<message_id>"]
+# The staged sentinel row as this pane renders it. A shell composer echoes
+# the paste unstyled, so the two halves of the pair are the same shape
+# here; a real vendor's chip is painted and its escaped half says so.
+# What the fake TUI paints below the composer, in order and in both
+# forms. Two rows, both required, both painted: this is the authentic
+# sentinel lane rather than a chip declared over raw text.
+composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
+composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
+composer_trailer_required_prefix = 2
 safe_states = ["idle"]
 "#;
 
@@ -52,7 +175,7 @@ pub const HOOK_MANIFEST: &str = r#"
 [agent]
 id = "fix"
 display_name = "Hook fixture"
-process_names = ["cat", "sh", "bash", "dash"]
+process_names = ["python3", "python", "Python", "cat", "sh", "bash", "dash"]
 
 [hooks]
 turn_start = "UserPromptSubmit"
@@ -67,10 +190,60 @@ priority = 100
 region = "pane_title"
 regex = ['^']
 
+# The screen sensor must be able to answer for these panes, because a
+# write needs positive clean-composer evidence from the sensor that sees
+# the composer (INVARIANTS rule 12). A blank fixture pane IS a clean
+# composer, so the empty bottom region is the evidence.
+[[rule]]
+id = "composer_empty"
+state = "idle"
+priority = 90
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^❯\s*$']
+
+# The FINAL payload row, which is the one row a fixed bottom region can
+# never lose: `cat` echoes every pasted line, so the header scrolls away
+# while the sentinel stays. Paired with the generic '[cyclops:end '
+# pattern, this is what lets marker_in_composer reach the submit step.
+#
+# These shared fixtures exercise delivery LIFECYCLE only. They do not
+# prove INVARIANTS rule 12 and they do not prove sentinel completeness:
+# a blank pane paints no chrome under a paste, so terminality is not
+# decidable here at all. Those claims belong to the dedicated tests in
+# m1_blockers.rs and the sentinel unit tests in delivery.rs.
+[[rule]]
+id = "composer_holds_paste"
+state = "idle_with_input"
+priority = 80
+# The active composer only. The escaped matcher rejects the dim transcript
+# prompt that the fixture paints after consuming a turn.
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^\s*❯\s+\S']
+line_regex_esc = ['^❯']
+
+# The transient row the composer paints after consuming the sentinel.
+# Screen ACK evidence needs a turn, and a generic-marker staging does not
+# license "the window changed" as proof of one.
+[[rule]]
+id = "composer_working"
+state = "working"
+priority = 300
+region = "bottom_non_empty_lines(5)"
+line_regex = ['^FAKETUI-WORKING$']
+
 [injection]
 submit = "Enter"
 verify_before_submit = true
 verify_pattern = ["<message_id>"]
+# The staged sentinel row as this pane renders it. A shell composer echoes
+# the paste unstyled, so the two halves of the pair are the same shape
+# here; a real vendor's chip is painted and its escaped half says so.
+# What the fake TUI paints below the composer, in order and in both
+# forms. Two rows, both required, both painted: this is the authentic
+# sentinel lane rather than a chip declared over raw text.
+composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
+composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
+composer_trailer_required_prefix = 2
 "#;
 
 /// Modal fixture: one auto-dismissable rule with explicit decline keys and
@@ -79,7 +252,7 @@ pub const MODAL_MANIFEST: &str = r#"
 [agent]
 id = "fix"
 display_name = "Modal fixture"
-process_names = ["cat", "sh", "bash", "dash"]
+process_names = ["python3", "python", "Python", "cat", "sh", "bash", "dash"]
 
 [[rule]]
 id = "fake_update_modal"
@@ -105,10 +278,60 @@ priority = 100
 region = "pane_title"
 regex = ['^']
 
+# The screen sensor must be able to answer for these panes, because a
+# write needs positive clean-composer evidence from the sensor that sees
+# the composer (INVARIANTS rule 12). A blank fixture pane IS a clean
+# composer, so the empty bottom region is the evidence.
+[[rule]]
+id = "composer_empty"
+state = "idle"
+priority = 90
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^❯\s*$']
+
+# The FINAL payload row, which is the one row a fixed bottom region can
+# never lose: `cat` echoes every pasted line, so the header scrolls away
+# while the sentinel stays. Paired with the generic '[cyclops:end '
+# pattern, this is what lets marker_in_composer reach the submit step.
+#
+# These shared fixtures exercise delivery LIFECYCLE only. They do not
+# prove INVARIANTS rule 12 and they do not prove sentinel completeness:
+# a blank pane paints no chrome under a paste, so terminality is not
+# decidable here at all. Those claims belong to the dedicated tests in
+# m1_blockers.rs and the sentinel unit tests in delivery.rs.
+[[rule]]
+id = "composer_holds_paste"
+state = "idle_with_input"
+priority = 80
+# The active composer only. The escaped matcher rejects the dim transcript
+# prompt that the fixture paints after consuming a turn.
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^\s*❯\s+\S']
+line_regex_esc = ['^❯']
+
+# The transient row the composer paints after consuming the sentinel.
+# Screen ACK evidence needs a turn, and a generic-marker staging does not
+# license "the window changed" as proof of one.
+[[rule]]
+id = "composer_working"
+state = "working"
+priority = 300
+region = "bottom_non_empty_lines(5)"
+line_regex = ['^FAKETUI-WORKING$']
+
 [injection]
 submit = "Enter"
 verify_before_submit = true
 verify_pattern = ["<message_id>"]
+# The staged sentinel row as this pane renders it. A shell composer echoes
+# the paste unstyled, so the two halves of the pair are the same shape
+# here; a real vendor's chip is painted and its escaped half says so.
+# What the fake TUI paints below the composer, in order and in both
+# forms. Two rows, both required, both painted: this is the authentic
+# sentinel lane rather than a chip declared over raw text.
+composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
+composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
+composer_trailer_required_prefix = 2
 "#;
 
 /// Quota fixture: the agy quota phrase parks the recipient.
@@ -116,7 +339,7 @@ pub const QUOTA_MANIFEST: &str = r#"
 [agent]
 id = "fix"
 display_name = "Quota fixture"
-process_names = ["cat", "sh", "bash", "dash"]
+process_names = ["python3", "python", "Python", "cat", "sh", "bash", "dash"]
 
 [[rule]]
 id = "quota_exhausted"
@@ -132,10 +355,60 @@ priority = 100
 region = "pane_title"
 regex = ['^']
 
+# The screen sensor must be able to answer for these panes, because a
+# write needs positive clean-composer evidence from the sensor that sees
+# the composer (INVARIANTS rule 12). A blank fixture pane IS a clean
+# composer, so the empty bottom region is the evidence.
+[[rule]]
+id = "composer_empty"
+state = "idle"
+priority = 90
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^❯\s*$']
+
+# The FINAL payload row, which is the one row a fixed bottom region can
+# never lose: `cat` echoes every pasted line, so the header scrolls away
+# while the sentinel stays. Paired with the generic '[cyclops:end '
+# pattern, this is what lets marker_in_composer reach the submit step.
+#
+# These shared fixtures exercise delivery LIFECYCLE only. They do not
+# prove INVARIANTS rule 12 and they do not prove sentinel completeness:
+# a blank pane paints no chrome under a paste, so terminality is not
+# decidable here at all. Those claims belong to the dedicated tests in
+# m1_blockers.rs and the sentinel unit tests in delivery.rs.
+[[rule]]
+id = "composer_holds_paste"
+state = "idle_with_input"
+priority = 80
+# The active composer only. The escaped matcher rejects the dim transcript
+# prompt that the fixture paints after consuming a turn.
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^\s*❯\s+\S']
+line_regex_esc = ['^❯']
+
+# The transient row the composer paints after consuming the sentinel.
+# Screen ACK evidence needs a turn, and a generic-marker staging does not
+# license "the window changed" as proof of one.
+[[rule]]
+id = "composer_working"
+state = "working"
+priority = 300
+region = "bottom_non_empty_lines(5)"
+line_regex = ['^FAKETUI-WORKING$']
+
 [injection]
 submit = "Enter"
 verify_before_submit = true
 verify_pattern = ["<message_id>"]
+# The staged sentinel row as this pane renders it. A shell composer echoes
+# the paste unstyled, so the two halves of the pair are the same shape
+# here; a real vendor's chip is painted and its escaped half says so.
+# What the fake TUI paints below the composer, in order and in both
+# forms. Two rows, both required, both painted: this is the authentic
+# sentinel lane rather than a chip declared over raw text.
+composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
+composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
+composer_trailer_required_prefix = 2
 "#;
 
 /// Busy fixture: a screen marker keeps the pane working until released.
@@ -143,7 +416,7 @@ pub const BUSY_MANIFEST: &str = r#"
 [agent]
 id = "fix"
 display_name = "Busy fixture"
-process_names = ["cat", "sh", "bash", "dash"]
+process_names = ["python3", "python", "Python", "cat", "sh", "bash", "dash"]
 
 [[rule]]
 id = "busy_marker"
@@ -159,10 +432,60 @@ priority = 100
 region = "pane_title"
 regex = ['^']
 
+# The screen sensor must be able to answer for these panes, because a
+# write needs positive clean-composer evidence from the sensor that sees
+# the composer (INVARIANTS rule 12). A blank fixture pane IS a clean
+# composer, so the empty bottom region is the evidence.
+[[rule]]
+id = "composer_empty"
+state = "idle"
+priority = 90
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^❯\s*$']
+
+# The FINAL payload row, which is the one row a fixed bottom region can
+# never lose: `cat` echoes every pasted line, so the header scrolls away
+# while the sentinel stays. Paired with the generic '[cyclops:end '
+# pattern, this is what lets marker_in_composer reach the submit step.
+#
+# These shared fixtures exercise delivery LIFECYCLE only. They do not
+# prove INVARIANTS rule 12 and they do not prove sentinel completeness:
+# a blank pane paints no chrome under a paste, so terminality is not
+# decidable here at all. Those claims belong to the dedicated tests in
+# m1_blockers.rs and the sentinel unit tests in delivery.rs.
+[[rule]]
+id = "composer_holds_paste"
+state = "idle_with_input"
+priority = 80
+# The active composer only. The escaped matcher rejects the dim transcript
+# prompt that the fixture paints after consuming a turn.
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^\s*❯\s+\S']
+line_regex_esc = ['^❯']
+
+# The transient row the composer paints after consuming the sentinel.
+# Screen ACK evidence needs a turn, and a generic-marker staging does not
+# license "the window changed" as proof of one.
+[[rule]]
+id = "composer_working"
+state = "working"
+priority = 300
+region = "bottom_non_empty_lines(5)"
+line_regex = ['^FAKETUI-WORKING$']
+
 [injection]
 submit = "Enter"
 verify_before_submit = true
 verify_pattern = ["<message_id>"]
+# The staged sentinel row as this pane renders it. A shell composer echoes
+# the paste unstyled, so the two halves of the pair are the same shape
+# here; a real vendor's chip is painted and its escaped half says so.
+# What the fake TUI paints below the composer, in order and in both
+# forms. Two rows, both required, both painted: this is the authentic
+# sentinel lane rather than a chip declared over raw text.
+composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
+composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
+composer_trailer_required_prefix = 2
 "#;
 
 /// Verification-failure fixture: the pattern can never appear on screen,
@@ -171,7 +494,7 @@ pub const BAD_VERIFY_MANIFEST: &str = r#"
 [agent]
 id = "fix"
 display_name = "Bad verify fixture"
-process_names = ["cat", "sh", "bash", "dash"]
+process_names = ["python3", "python", "Python", "cat", "sh", "bash", "dash"]
 
 [[rule]]
 id = "always_idle"
@@ -179,6 +502,17 @@ state = "idle"
 priority = 100
 region = "pane_title"
 regex = ['^']
+
+# Screen-idle evidence only: this fixture exists to make verification
+# FAIL, so it deliberately carries no staged-payload marker. Without the
+# idle rule the gate could never admit a write at all and the test would
+# prove nothing.
+[[rule]]
+id = "composer_empty"
+state = "idle"
+priority = 90
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^❯\s*$']
 
 [injection]
 submit = "Enter"
@@ -290,6 +624,7 @@ impl TestClient {
 /// One booted rig: isolated tmux server, scratch home, in-process daemon,
 /// a request client, and an events-subscribed client.
 pub struct Rig {
+    _descriptor_slot: OwnedSemaphorePermit,
     pub tmux: TmuxGuard,
     pub home: PathBuf,
     home_guard: HomeGuard,
@@ -306,6 +641,16 @@ impl Rig {
         Rig::new_multi(tag, manifest, &[("main", pane_cmd)], cfg_extra).await
     }
 
+    /// Boot without installed mailbox capability evidence.
+    pub async fn new_without_mailbox_capability(
+        tag: &str,
+        manifest: &str,
+        pane_cmd: &str,
+        cfg_extra: &str,
+    ) -> Rig {
+        Rig::new_multi_inner(tag, manifest, &[("main", pane_cmd)], cfg_extra, false).await
+    }
+
     /// Boot with several watched sessions, each with one starting pane.
     pub async fn new_multi(
         tag: &str,
@@ -313,6 +658,24 @@ impl Rig {
         sessions: &[(&str, &str)],
         cfg_extra: &str,
     ) -> Rig {
+        Rig::new_multi_inner(tag, manifest, sessions, cfg_extra, true).await
+    }
+
+    async fn new_multi_inner(
+        tag: &str,
+        manifest: &str,
+        sessions: &[(&str, &str)],
+        cfg_extra: &str,
+        install_mailbox_capability: bool,
+    ) -> Rig {
+        // A rig owns a tmux server, daemon, ledgers, and socket clients.
+        // Bound per-process concurrency so the suite also passes with the
+        // macOS default 256-file descriptor limit.
+        let descriptor_slot = rig_slots()
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("rig semaphore remains open");
         // Debug aid: CYC_TEST_LOG=debug turns daemon tracing on.
         if let Ok(filter) = std::env::var("CYC_TEST_LOG") {
             let _ = tracing_subscriber::fmt()
@@ -328,6 +691,20 @@ impl Rig {
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(home.join("manifests")).expect("create scratch home");
         let home_guard = HomeGuard(home.clone());
+        let manifest = if install_mailbox_capability && !manifest.contains("[messaging]") {
+            let capability = home.join("cyclops-skill.md");
+            std::fs::write(
+                &capability,
+                include_bytes!("../../../../skills/cyclops/SKILL.md"),
+            )
+            .expect("write mailbox capability evidence");
+            format!(
+                "{manifest}\n[messaging]\nmailbox_capability_file = {:?}\n",
+                capability.display().to_string()
+            )
+        } else {
+            manifest.to_string()
+        };
         std::fs::write(home.join("manifests/fix.toml"), manifest).expect("write manifest");
         let names: Vec<String> = sessions.iter().map(|(n, _)| n.to_string()).collect();
         write_config(&home, socket, &names, cfg_extra);
@@ -354,6 +731,7 @@ impl Rig {
         let ack = ev.request("events.subscribe", json!({})).await;
         assert_eq!(ack["result"]["subscribed"], true);
         let mut rig = Rig {
+            _descriptor_slot: descriptor_slot,
             tmux,
             home,
             home_guard,
@@ -378,6 +756,7 @@ impl Rig {
     /// server, with fresh clients. The ledger persists across the two runs.
     pub async fn reboot(self) -> Rig {
         let Rig {
+            _descriptor_slot,
             tmux,
             home,
             home_guard,
@@ -394,6 +773,7 @@ impl Rig {
         let ack = ev.request("events.subscribe", json!({})).await;
         assert_eq!(ack["result"]["subscribed"], true);
         Rig {
+            _descriptor_slot,
             tmux,
             home,
             home_guard,
@@ -449,14 +829,28 @@ impl Rig {
         assert_eq!(resp["result"]["label"], label, "{resp}");
     }
 
-    /// msg.send over the socket (sender resolves to admin: the test
-    /// process is same-uid and outside every watched pane).
+    /// msg.send with the sender already resolved, for tests about
+    /// DELIVERY rather than about who sent it.
+    ///
+    /// Deliberately not the socket path. Socket sends resolve the sender
+    /// from the calling process's ancestry, and a test runner's ancestry
+    /// is not the daemon's business: a suite run from inside an agent CLI
+    /// is a vendor descendant outside every watched pane, which the
+    /// daemon correctly refuses to call the operator. Routing delivery
+    /// tests through that would make them pass or fail on where the suite
+    /// happened to be started.
+    ///
+    /// This is the documented embedding entry point, not a test-only
+    /// door, and it resolves nothing. Attribution has its own tests,
+    /// over the real socket with real process trees, in
+    /// `tests/sender_identity.rs`.
     pub async fn send(&mut self, params: Value) -> (Value, Duration) {
+        let params = serde_json::from_value(params).expect("msg.send params");
         let t = Instant::now();
-        let resp = self.ctl.request("msg.send", params).await;
+        let result = self.daemon.deliver_payload("admin", params).await;
         let elapsed = t.elapsed();
-        assert!(resp["error"].is_null(), "msg.send failed: {resp}");
-        (resp["result"].clone(), elapsed)
+        let result = result.unwrap_or_else(|e| panic!("msg.send failed: {}", e.message));
+        (result, elapsed)
     }
 
     pub fn ledger_path(&self) -> PathBuf {
@@ -580,8 +974,34 @@ fn write_config(home: &Path, socket: &str, sessions: &[String], cfg_extra: &str)
     .expect("write config");
 }
 
+/// Poll daemon status until the first pane reports `want`.
+///
+/// Status is the daemon's own view, which is the one that matters: tmux
+/// can already be in a state the watcher table has not consumed yet.
+pub async fn wait_pane_state(rig: &mut Rig, want: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let resp = rig.ctl.request("status", json!({})).await;
+        let state = resp["result"]["sessions"][0]["panes"][0]["state"].clone();
+        if state == json!(want) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pane never reached state {want}: {resp}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Pane command: print a marker, hold until any input line, clear the
-/// screen, become cat.
+/// screen, then behave like the composer for the rest of its life.
+///
+/// The tail matters as much as the marker. These fixtures exist to hold a
+/// delivery (a modal, a busy pane) and then release it, and the release
+/// only proves anything if what follows can actually take a message:
+/// admit a write, hold the staged sentinel, and clear it on Enter.
 pub fn hold_script(marker: &str) -> String {
-    format!("sh -c 'echo {marker}; read x; printf \"\\033[2J\\033[H\"; exec cat'")
+    let tail = composer_tail();
+    format!("sh -c 'echo {marker}; read x; printf \"\\033[2J\\033[H\"; {tail}'")
 }

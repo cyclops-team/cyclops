@@ -80,7 +80,7 @@ async fn an_unhooked_agent_still_gets_a_delivery_badge_at_shipped_defaults() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
-    let mut rig = Rig::new("unhooked", HOOK_MANIFEST, "cat", "").await;
+    let mut rig = Rig::new("unhooked", HOOK_MANIFEST, &composer_pane(), "").await;
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
 

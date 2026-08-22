@@ -18,6 +18,12 @@ use cyclops_ui::{
 
 const BASE: u64 = 43_000_000;
 
+fn ledger_dir(temp: &tempfile::TempDir) -> std::path::PathBuf {
+    std::fs::canonicalize(temp.path())
+        .expect("tempdir resolves")
+        .join("ledger")
+}
+
 /// A ledger whose oldest lines are the two shapes of attention, buried
 /// under enough later traffic to fall out of a 200-line tail:
 ///
@@ -26,8 +32,11 @@ const BASE: u64 = 43_000_000;
 /// - a pane blocked on a prompt, whose pane is gone by the time the UI
 ///   starts, so nothing will ever report it again.
 fn ledger_with_a_buried_park(dir: &std::path::Path) {
-    std::fs::create_dir_all(dir).expect("ledger dir");
-    let w = cyclops_ledger::LedgerWriter::open(&dir.join("main.ndjson"), "b-test")
+    let home = dir.parent().expect("ledger has state root");
+    let state_root = cyclops_state::StateRoot::open_or_create(home).expect("state root opens");
+    let descendant =
+        std::path::Path::new(dir.file_name().expect("ledger dir name")).join("main.ndjson");
+    let w = cyclops_ledger::LedgerWriter::open(&state_root, &descendant, "b-test")
         .expect("ledger opens");
     let line = |id: &str, ts: u64, kind: Kind| LedgerLine {
         seq: 0,
@@ -107,6 +116,7 @@ fn started(dir: &std::path::Path, backfill: usize, seed: StatusSeed) -> App {
 fn daemon_answer() -> StatusSeed {
     StatusSeed {
         watched: vec!["main".into()],
+        admin_unread: 0,
         roster: Vec::new(),
         panes: vec![
             PaneSnapshot {
@@ -133,7 +143,7 @@ fn daemon_answer() -> StatusSeed {
 #[test]
 fn backfill_decides_what_is_displayed_never_what_is_counted() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let dir = tmp.path().join("ledger");
+    let dir = ledger_dir(&tmp);
     ledger_with_a_buried_park(&dir);
     let watched = ["main".to_string()];
 
@@ -204,7 +214,7 @@ fn backfill_decides_what_is_displayed_never_what_is_counted() {
 #[test]
 fn a_replayed_alarm_the_answer_no_longer_counts_gets_its_clearance() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let dir = tmp.path().join("ledger");
+    let dir = ledger_dir(&tmp);
     ledger_with_a_buried_park(&dir);
 
     let mut app = started(&dir, 400, daemon_answer());
@@ -239,7 +249,7 @@ fn a_replayed_alarm_the_answer_no_longer_counts_gets_its_clearance() {
 #[test]
 fn a_blocked_pane_that_disappears_stops_being_counted() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let dir = tmp.path().join("ledger");
+    let dir = ledger_dir(&tmp);
     ledger_with_a_buried_park(&dir);
     let mut app = started(&dir, 400, daemon_answer());
     assert_eq!(app.attention_count(), 2);
@@ -260,7 +270,7 @@ fn a_blocked_pane_that_disappears_stops_being_counted() {
 #[test]
 fn a_pane_removed_mid_stream_drops_its_item_without_a_second_snapshot() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let dir = tmp.path().join("ledger");
+    let dir = ledger_dir(&tmp);
     ledger_with_a_buried_park(&dir);
     let mut app = started(&dir, 400, daemon_answer());
     assert_eq!(app.attention_count(), 2);
@@ -309,7 +319,7 @@ fn pane_removed(pane_id: &str) -> Entry {
 #[test]
 fn every_count_has_a_line_the_reader_can_reach() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let dir = tmp.path().join("ledger");
+    let dir = ledger_dir(&tmp);
     ledger_with_a_buried_park(&dir);
     let mut app = started(&dir, 200, daemon_answer());
 
@@ -423,7 +433,7 @@ fn a_ping_the_register_cannot_back_stays_out_of_the_calm_view() {
 #[test]
 fn a_ping_about_a_live_item_reaches_the_calm_view() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let dir = tmp.path().join("ledger");
+    let dir = ledger_dir(&tmp);
     ledger_with_a_buried_park(&dir);
     let mut app = started(&dir, 0, daemon_answer());
     assert_eq!(app.attention_count(), 2);

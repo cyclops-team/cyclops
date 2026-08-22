@@ -42,6 +42,9 @@ argv_basenames = ["agent", "cursor-agent"]
 # and this one says which program is meant.
 launch = "cursor-agent"
 
+[messaging]
+mailbox_capability_file = "~/.agents/skills/cyclops/SKILL.md"
+
 [hooks]
 # MEASURED with a logging hook installed at <workspace>/.cursor/hooks.json:
 # every event below fired, with the payloads recorded in this file's notes.
@@ -68,9 +71,11 @@ postToolUse, afterAgentThought x8. Payload keys common to every event:
 conversation_id, generation_id, session_id, hook_event_name, model,
 cursor_version, workspace_roots, user_email, transcript_path. beforeSubmitPrompt
 adds `prompt` (full text, verified against the submitted string) and
-`attachments`. stop adds status, loop_count and the token counters, and its
-generation_id equals the beforeSubmitPrompt generation_id for the same turn,
-which is the pair a turn is deduped on."""
+`attachments`. stop adds status, loop_count and the token counters. Operator
+notes recorded equal generation_id values for one paired start and stop, but
+no raw paired hook payload fixture is checked in and no current Cursor binary
+is installed. This manifest therefore declares no turn_key_fields and uses
+screen lifecycle evidence until a current paired fixture proves correlation."""
 
 config_location = """MEASURED DEPLOYMENT FACT. Hooks are read from
 ~/.cursor/hooks.json and <workspace>/.cursor/hooks.json. CURSOR_CONFIG_DIR

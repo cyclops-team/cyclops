@@ -60,7 +60,8 @@ are preserved when it writes preferences.
 | Path | Purpose |
 | --- | --- |
 | `$CYCLOPS_HOME/sock` | Unix socket used by the CLI and daemon. |
-| `$CYCLOPS_HOME/ledger/*.ndjson` | Append-only message and event record. |
+| `$CYCLOPS_HOME/workspaces/<workspace-id>/messages.ndjson` | Canonical workspace mailbox journal. |
+| `$CYCLOPS_HOME/ledger/*.ndjson` | Pane state and legacy direct-delivery session records. |
 | `$CYCLOPS_HOME/registry.json` | Durable pane names and adoption identity. |
 | `$CYCLOPS_HOME/workspaces/*.toml` | Saved workspace layouts. |
 | `$CYCLOPS_HOME/manifests/` | Per-CLI detection rules. |
@@ -82,7 +83,9 @@ are preserved when it writes preferences.
 
 Detecting an agent and hearing from it are different things. Detection reads
 the pane; hooks are how a CLI reports its own turn edges, and they are what
-upgrades a delivery receipt from screen evidence to the verified check.
+lets the legacy direct-delivery self-test use hook evidence instead of screen
+evidence. Standard mailbox receipts report durable acceptance and notification
+state separately.
 
 The installer wires them, by passing `--wire-hooks` to its final
 `cyclops start --setup-only`. Where they land depends on how each CLI finds

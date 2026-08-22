@@ -46,6 +46,7 @@ fn state(ts: u64, seq: Option<u64>, target: &str, pane_id: &str, state: AgentSta
         id: None,
         kind: EntryKind::State {
             target: target.into(),
+            session_idx: 0,
             pane_id: Some(pane_id.into()),
             state,
         },
@@ -102,6 +103,7 @@ fn transcript() -> Vec<Step> {
                 state: AgentState::BlockedPermission,
             }],
             open: Vec::new(),
+            admin_unread: 0,
             roster: Vec::new(),
         })),
         Step::Backfill(

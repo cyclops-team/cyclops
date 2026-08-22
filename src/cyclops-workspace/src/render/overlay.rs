@@ -249,6 +249,12 @@ fn dialog_parts(dialog: &Dialog) -> (&str, Option<&str>, Option<&str>, &'static 
             None,
             copy::BUTTON_CONFIRM,
         ),
+        Dialog::Compose { send, .. } if send.is_confirming_abandon() => (
+            copy::COMPOSE_ABANDON_TITLE,
+            None,
+            Some(copy::COMPOSE_ABANDON_HINT),
+            copy::BUTTON_ABANDON,
+        ),
         Dialog::Compose { buffer, status, .. } => (
             copy::COMPOSE_TITLE,
             Some(buffer),
@@ -1395,8 +1401,34 @@ mod tests {
         Dialog::Compose {
             buffer: buffer.into(),
             status: None,
-            sending: false,
+            send: crate::dialog::ComposeSendState::Ready,
         }
+    }
+
+    #[test]
+    fn abandon_confirmation_names_the_safe_retry_loss() {
+        let message = crate::dialog::parse_compose("@reviewer ship it").expect("message");
+        let dialog = Dialog::Compose {
+            buffer: "@reviewer ship it".into(),
+            status: Some("sending to reviewer…".into()),
+            send: crate::dialog::ComposeSendState::ConfirmAbandon {
+                attempt: crate::dialog::ComposeAttempt {
+                    message,
+                    client_key: "stable-key".into(),
+                },
+                resume: crate::dialog::ComposeResume::Sending,
+            },
+        };
+
+        assert_eq!(
+            dialog_parts(&dialog),
+            (
+                copy::COMPOSE_ABANDON_TITLE,
+                None,
+                Some(copy::COMPOSE_ABANDON_HINT),
+                copy::BUTTON_ABANDON,
+            )
+        );
     }
 
     /// One line of message gets one row; a paragraph grows the field and

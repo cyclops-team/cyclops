@@ -243,7 +243,9 @@ async fn quiesce_is_quiet_over_prepaste_deliveries() {
     let resp = rig.ctl.request("daemon.quiesce", json!({})).await;
     assert_eq!(resp["result"]["quiet"], true, "{resp}");
     assert!(
-        resp["result"]["in_flight"].as_array().is_none_or(Vec::is_empty),
+        resp["result"]["in_flight"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
         "{resp}"
     );
 
@@ -274,7 +276,7 @@ async fn hook_ack_during_detach_resolves_the_delivery() {
     let mut rig = Rig::new(
         "dethook",
         HOOK_MANIFEST,
-        "cat",
+        &composer_pane(),
         "receipt_block_ms = 100\nack_timeout_ms = 8000\n",
     )
     .await;
@@ -312,7 +314,13 @@ async fn hook_ack_during_detach_resolves_the_delivery() {
                 "agent": "hooky",
                 "event": "UserPromptSubmit",
                 "seq": 1,
-                "payload": {"prompt": format!("staged {msg_id} text"), "session_id": "s", "turn_id": "t"},
+                // The exact payload: a hook acknowledgement verifies the
+                // bytes this delivery sent, or it verifies nothing.
+                "payload": {
+                    "prompt": cyclopsd::render_payload(&msg_id, "admin", "over the gap", "a\nb", false),
+                    "session_id": "s",
+                    "turn_id": "t",
+                },
             }))
             .unwrap(),
         )
@@ -367,7 +375,7 @@ async fn ack_deadlines_freeze_across_detach() {
     let mut rig = Rig::new(
         "detfrz",
         HOOK_MANIFEST,
-        "cat",
+        &composer_pane(),
         "receipt_block_ms = 100\nack_timeout_ms = 2000\n",
     )
     .await;
@@ -473,14 +481,24 @@ verify_pattern = ["<message_id>"]
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "native").await;
 
-    // Without the fallback the gate answers no_manifest and the delivery
-    // dead-ends in attention_required.
+    // The claim is binding, so the assertion is binding: status names the
+    // manifest the pane resolved to. It used to assert a delivered
+    // receipt instead, which proved binding only as a side effect and
+    // could not survive a pane that cannot model a composer. This pane
+    // deliberately cannot: it IS the symlinked `cat` whose argv basename
+    // is the thing under test.
+    let resp = rig.ctl.request("status", json!({})).await;
+    let bound = &resp["result"]["sessions"][0]["panes"][0]["manifest"];
+    assert_eq!(bound, "fix", "manifest never bound: {resp}");
+
+    // And the gate agrees: a bound manifest holds on write-readiness,
+    // where an unbound one dead-ends in attention_required instead.
     let (result, _) = rig
         .send(json!({"to": ["native"], "subject": "bind me", "body": "a\nb"}))
         .await;
     assert_eq!(
-        result["deliveries"][0]["state"], "delivered_unverified",
-        "manifest never bound: {result}"
+        result["deliveries"][0]["held_by"], "not_write_ready",
+        "an unbound pane would have failed differently: {result}"
     );
     rig.assert_ledger_legal(&[]);
     rig.shutdown().await;
@@ -500,7 +518,8 @@ async fn decline_aborts_when_the_modal_changes_between_keys() {
     }
     // Raw tty so dd returns on exactly one byte (the first decline key
     // "3"); the dialog then vanishes and the pane becomes a plain cat.
-    let script = "sh -c 'echo FAKE-UPDATE-AVAILABLE; stty -icanon -echo min 1 time 0; dd bs=1 count=1 >/dev/null 2>&1; stty sane; printf \"\\033[2J\\033[H\"; exec cat'";
+    let tail = composer_tail();
+    let script = &format!("sh -c 'echo FAKE-UPDATE-AVAILABLE; stty -icanon -echo min 1 time 0; dd bs=1 count=1 >/dev/null 2>&1; stty sane; printf \"\\033[2J\\033[H\"; {tail}'");
     let mut rig = Rig::new("toctou", MODAL_MANIFEST, script, "receipt_block_ms = 200\n").await;
     rig.tmux.wait_screen("main", "FAKE-UPDATE-AVAILABLE");
     let pane = rig.pane_ids().await[0].clone();
@@ -555,7 +574,7 @@ async fn cross_session_ledgers_are_complete_streams() {
     let mut rig = Rig::new_multi(
         "xsess",
         CAT_MANIFEST,
-        &[("main", "cat"), ("aux", "cat")],
+        &[("main", "cat"), ("aux", &composer_pane())],
         "receipt_block_ms = 4000\n",
     )
     .await;
@@ -695,4 +714,205 @@ async fn briefly_stalled_subscriber_survives_event_burst() {
     })
     .await;
     daemon.shutdown().await;
+}
+
+/// Write-readiness and runtime state move independently, so a pane can
+/// refuse and then allow with no state edge between. Anything waiting on
+/// the refusal has to be woken by something, and a `state` line would be
+/// a transition that never happened.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_readiness_change_with_no_state_change_is_still_broadcast() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new("readywake", CAT_MANIFEST, &composer_pane(), "").await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    // Copy mode refuses the write without touching the runtime state: the
+    // pane is idle before and idle after.
+    rig.tmux.run_ok(&["copy-mode", "-t", &pane]);
+    let ev = rig
+        .ev
+        .wait_event(Duration::from_secs(10), |e| {
+            e["event"] == "readiness"
+                && e["data"]["session_idx"] == 0
+                && e["data"]["pane_id"] == pane.as_str()
+                && e["data"]["write_block"] == "pane_in_mode"
+        })
+        .await;
+    assert_eq!(ev["data"]["write_ready"], false, "{ev}");
+    assert_eq!(ev["data"]["write_block"], "pane_in_mode", "{ev}");
+    assert!(
+        ev["seq"].is_null(),
+        "a readiness wake names no ledger line: {ev}"
+    );
+    let status = rig.ctl.request("status", json!({})).await;
+    let pane_status = &status["result"]["sessions"][0]["panes"][0];
+    assert_eq!(pane_status["state"], "idle", "{status}");
+    assert_eq!(pane_status["in_mode"], true, "{status}");
+    assert_eq!(pane_status["write_ready"], false, "{status}");
+    assert_eq!(pane_status["write_block"], "pane_in_mode", "{status}");
+
+    // And the record does not gain a transition for it.
+    let states: Vec<&Value> = rig
+        .ledger_lines()
+        .iter()
+        .filter(|l| l["kind"] == "state" && l["data"]["cause"] == "pane_in_mode")
+        .cloned()
+        .collect::<Vec<Value>>()
+        .leak()
+        .iter()
+        .collect();
+    assert!(states.is_empty(), "copy mode wrote a state transition");
+    rig.shutdown().await;
+}
+
+/// Two messages back to back through one recipient, which is where a
+/// hold that never releases would show up as a wedge rather than as a
+/// refusal.
+///
+/// Cyclops latches its OWN paste: after the payload lands, the pane is
+/// holding text exactly the way a person's draft holds it, so the second
+/// delivery must not paste until a turn has consumed the first. The turn
+/// then has to release it, or the recipient takes one message and never
+/// another.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_message_waits_for_the_first_turn_and_then_lands() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new("fifohold", CAT_MANIFEST, &composer_pane(), "").await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let mut ids = Vec::new();
+    for subject in ["first", "second"] {
+        let (result, _) = rig
+            .send(json!({"to": ["worker"], "subject": subject, "body": "a\nb"}))
+            .await;
+        ids.push(result["msg_id"].as_str().expect("msg id").to_string());
+    }
+
+    // Both resolve, in order. The second one landing at all is the
+    // assertion that matters: it can only have gated after the first
+    // turn released the hold this delivery's own paste latched.
+    for id in &ids {
+        let done = rig
+            .ev
+            .wait_event(Duration::from_secs(30), |e| {
+                e["event"] == "delivery-state"
+                    && e["data"]["id"] == id.as_str()
+                    && e["data"]["to_state"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("delivered_"))
+            })
+            .await;
+        assert_eq!(done["data"]["to"], "worker", "{done}");
+    }
+
+    // Nothing was pasted on top of anything: each payload got its own
+    // gate/proceed, and they are ordered.
+    let lines = rig.ledger_lines();
+    let proceeds: Vec<String> = lines
+        .iter()
+        .filter(|l| l["kind"] == "gate" && l["data"]["action"] == "proceed")
+        .filter_map(|l| l["id"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(proceeds, ids, "one proceed each, in order: {proceeds:?}");
+    rig.shutdown().await;
+}
+
+/// Submit command accepted, composer NOT consumed: the staged-never-sent
+/// class c, which is what a modal or a mode does to an Enter.
+///
+/// `send-keys` succeeds here, so anything that treated that success as
+/// proof of a turn would promote the hold and let the next delivery paste
+/// over a payload that never went anywhere. The delivery has to end in
+/// attention with the payload intact, and the pane has to stay refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_swallowed_submit_keeps_the_hold_and_the_payload() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "swallow",
+        CAT_MANIFEST,
+        &swallowing_composer_pane(),
+        "receipt_block_ms = 200\nack_timeout_ms = 800\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let (result, _) = rig
+        .send(json!({"to": ["worker"], "subject": "one", "body": "a\nb"}))
+        .await;
+    let first = result["msg_id"].as_str().expect("msg id").to_string();
+
+    // The pipeline gets as far as submitted and no further: nothing ever
+    // proves consumption, so the chain closes for a human.
+    let closed = rig
+        .ev
+        .wait_event(Duration::from_secs(20), |e| {
+            e["event"] == "delivery-state"
+                && e["data"]["id"] == first.as_str()
+                && e["data"]["to_state"] == "attention_required"
+        })
+        .await;
+    assert_eq!(closed["data"]["from"], "submitted", "{closed}");
+
+    // The payload is still sitting in the composer, which is the whole
+    // point: nothing consumed it.
+    let screen = rig.tmux.capture(&pane);
+    assert!(
+        screen.contains(&format!("[cyclops:end {first}]")),
+        "the payload left a composer nothing consumed: {screen}"
+    );
+
+    // Now the payload stops being VISIBLE without being consumed, which
+    // is the wrapped-payload shape: it is really there and the screen
+    // rules cannot see it. Done after the first delivery has already
+    // closed, so this redraw cannot be mistaken for its screen receipt.
+    // With the composer reading clean and the sensors agreeing, the hold
+    // is the only thing left that can refuse.
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "C-g"]);
+    wait_pane_state(&mut rig, "idle").await;
+    let screen = rig.tmux.capture(&pane);
+    assert!(
+        !screen.contains(&format!("[cyclops:end {first}]")),
+        "the fixture is still drawing the payload: {screen}"
+    );
+
+    let (second, _) = rig
+        .send(json!({"to": ["worker"], "subject": "two", "body": "c"}))
+        .await;
+    let second_id = second["msg_id"].as_str().expect("msg id").to_string();
+    let held = rig
+        .ev
+        .wait_event(Duration::from_secs(15), |e| {
+            e["event"] == "gate"
+                && e["data"]["id"] == second_id.as_str()
+                && e["data"]["action"] == "hold"
+        })
+        .await;
+    // Exactly the hold. The screen reads clean and the sensors agree, so
+    // every other refusal is out of the way: if the receipt had wrongly
+    // promoted this hold, the paste would have gone in.
+    assert_eq!(
+        held["data"]["cause"], "not_write_ready:composer_hold",
+        "the second delivery gated on something other than the hold: {held}"
+    );
+    let screen = rig.tmux.capture(&pane);
+    assert!(
+        !screen.contains(&format!("[cyclops:end {second_id}]")),
+        "a second payload was pasted over the first: {screen}"
+    );
+    rig.shutdown().await;
 }

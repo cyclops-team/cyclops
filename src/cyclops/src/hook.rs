@@ -9,7 +9,6 @@
 //! payloads carry no event-name field at all (F7): every vendor hook
 //! entry registers a distinct self-tagging command.
 
-use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::mpsc;
@@ -21,6 +20,7 @@ use serde_json::{json, Value};
 use crate::client::Client;
 use crate::copy;
 use cyclops_proto::StateReportParams;
+use cyclops_state::StateRoot;
 
 /// Reporting agent label when --agent is absent.
 const AGENT_ENV: &str = "CYCLOPS_AGENT";
@@ -48,10 +48,13 @@ fn remaining(deadline: Instant) -> Duration {
 }
 
 fn post(event: &str, agent_flag: Option<&str>, deadline: Instant) -> Result<(), String> {
+    // The label is optional: the daemon derives the reporting origin from
+    // the authenticated socket peer, so a hook that does not know its own
+    // name can still report. A label supplied here is an assertion about
+    // that origin, checked against it and denied on disagreement.
     let agent = agent_flag
         .map(String::from)
-        .or_else(|| std::env::var(AGENT_ENV).ok().filter(|a| !a.is_empty()))
-        .ok_or_else(|| format!("no agent identity; set {AGENT_ENV} or pass --agent"))?;
+        .or_else(|| std::env::var(AGENT_ENV).ok().filter(|a| !a.is_empty()));
     let home = cyclops_proto::cyclops_home();
     // Payload trouble is logged but never fatal: the event edge matters
     // more than its audit payload.
@@ -62,7 +65,12 @@ fn post(event: &str, agent_flag: Option<&str>, deadline: Instant) -> Result<(), 
             Value::Null
         }
     };
-    let seq = next_seq(&home, &agent)?;
+    // The counter is per-label, so a report without one carries none
+    // rather than sharing a namespace with every other label-free hook.
+    let seq = match &agent {
+        Some(a) => Some(next_seq(&home, a)?),
+        None => None,
+    };
     let mut c = Client::connect_with_timeouts(
         remaining(deadline).min(CONNECT_TIMEOUT),
         remaining(deadline).min(HELLO_TIMEOUT).max(MIN_WAIT),
@@ -74,7 +82,7 @@ fn post(event: &str, agent_flag: Option<&str>, deadline: Instant) -> Result<(), 
     let params = serde_json::to_value(StateReportParams {
         agent,
         event: event.to_string(),
-        seq: Some(seq),
+        seq,
         payload,
     })
     .expect("state report params serialize");
@@ -113,17 +121,14 @@ fn read_stdin(timeout: Duration) -> Result<Value, String> {
 /// processes, so monotonicity has to live in a file; the OS file lock
 /// serializes concurrent invocations for the same agent.
 fn next_seq(home: &Path, agent: &str) -> Result<u64, String> {
-    let dir = home.join("hookseq");
-    fs::create_dir_all(&dir).map_err(|e| format!("can't create {}: {e}", dir.display()))?;
     // Labels are daemon-validated, but a hook config can carry anything;
     // never let one path-traverse out of hookseq.
-    let path = dir.join(agent.replace('/', "_"));
-    let mut f = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
+    let descendant = Path::new("hookseq").join(agent.replace('/', "_"));
+    let state_root = StateRoot::open_or_create(home)
+        .map_err(|e| format!("can't open state root {}: {e}", home.display()))?;
+    let path = state_root.path().join(&descendant);
+    let mut f = state_root
+        .open_append(&descendant)
         .map_err(|e| format!("can't open {}: {e}", path.display()))?;
     f.lock()
         .map_err(|e| format!("can't lock {}: {e}", path.display()))?;
@@ -145,14 +150,14 @@ fn next_seq(home: &Path, agent: &str) -> Result<u64, String> {
 /// never errors; a hook's stdio belongs to the vendor CLI.
 fn log_error(event: &str, cause: &str) {
     let home = cyclops_proto::cyclops_home();
-    if fs::create_dir_all(&home).is_err() {
+    log_error_at(&home, event, cause);
+}
+
+fn log_error_at(home: &Path, event: &str, cause: &str) {
+    let Ok(state_root) = StateRoot::open_or_create(home) else {
         return;
-    }
-    let Ok(mut f) = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(home.join("hook-errors.log"))
-    else {
+    };
+    let Ok(mut f) = state_root.open_append(Path::new("hook-errors.log")) else {
         return;
     };
     let _ = writeln!(
@@ -193,6 +198,12 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
 
     #[test]
     fn utc_stamp_known_instants() {
@@ -220,6 +231,45 @@ mod tests {
         // Labels cannot escape the hookseq dir.
         assert_eq!(next_seq(&home, "../evil").unwrap(), 1);
         assert!(home.join("hookseq/.._evil").exists());
+        assert_eq!(mode(&home), 0o700);
+        assert_eq!(mode(&home.join("hookseq")), 0o700);
+        assert_eq!(mode(&home.join("hookseq/reviewer")), 0o600);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn seq_counter_refuses_a_symlink_without_mutating_its_target() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-hookseq-link");
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join("hookseq")).unwrap();
+        let external = home.with_extension("external");
+        let _ = fs::remove_file(&external);
+        fs::write(&external, "41").unwrap();
+        fs::set_permissions(&external, fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&external, home.join("hookseq/reviewer")).unwrap();
+
+        assert!(next_seq(&home, "reviewer").is_err());
+        assert_eq!(fs::read_to_string(&external).unwrap(), "41");
+        assert_eq!(mode(&external), 0o640);
+
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_file(&external);
+    }
+
+    #[test]
+    fn hook_error_log_is_owner_only_and_appends() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-hook-errors");
+        let _ = fs::remove_dir_all(&home);
+
+        log_error_at(&home, "Stop", "first");
+        log_error_at(&home, "Stop", "second");
+
+        let path = home.join("hook-errors.log");
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("hook Stop: first"));
+        assert!(text.contains("hook Stop: second"));
+        assert_eq!(mode(&home), 0o700);
+        assert_eq!(mode(&path), 0o600);
         let _ = fs::remove_dir_all(&home);
     }
 }

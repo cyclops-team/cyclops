@@ -54,9 +54,8 @@ pub enum Dialog {
         /// seconds, so it reports here instead of the workspace freezing.
         /// None while composing, Some once it has been answered.
         status: Option<String>,
-        /// A send is in flight. Enter is ignored while this is set, so a
-        /// second press cannot put the same message on the record twice.
-        sending: bool,
+        /// The request identity and the only valid transitions around it.
+        send: ComposeSendState,
     },
     /// Pick a theme; Enter applies it exactly like `cyclops theme <name>`.
     Themes {
@@ -82,14 +81,14 @@ impl Dialog {
 
     /// Whether the dialog takes typed input (vs a yes/no confirm).
     pub fn has_input(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Dialog::NewTab { .. }
-                | Dialog::NamePane { .. }
-                | Dialog::RenameTab { .. }
-                | Dialog::RenameWorkspace { .. }
-                | Dialog::Compose { .. }
-        )
+            | Dialog::NamePane { .. }
+            | Dialog::RenameTab { .. }
+            | Dialog::RenameWorkspace { .. } => true,
+            Dialog::Compose { send, .. } => !send.is_confirming_abandon(),
+            _ => false,
+        }
     }
 
     /// Whether this dialog's buffer may hold more than one line.
@@ -98,7 +97,10 @@ impl Dialog {
     /// tmux takes those as a single line: a newline in one is not a longer
     /// name, it is a name with a control character in it.
     pub fn is_multiline(&self) -> bool {
-        matches!(self, Dialog::Compose { .. })
+        matches!(
+            self,
+            Dialog::Compose { send, .. } if !send.is_confirming_abandon()
+        )
     }
 }
 
@@ -183,8 +185,8 @@ pub fn dialog_buffer_mut(dialog: &mut Dialog) -> Option<&mut String> {
         Dialog::NewTab { buffer }
         | Dialog::NamePane { buffer, .. }
         | Dialog::RenameTab { buffer, .. }
-        | Dialog::RenameWorkspace { buffer, .. }
-        | Dialog::Compose { buffer, .. } => Some(buffer),
+        | Dialog::RenameWorkspace { buffer, .. } => Some(buffer),
+        Dialog::Compose { buffer, send, .. } if !send.is_confirming_abandon() => Some(buffer),
         _ => None,
     }
 }
@@ -228,6 +230,107 @@ pub struct Composed {
     pub to: String,
     pub subject: String,
     pub body: String,
+}
+
+/// One semantic message and the idempotency key bound to its send attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposeAttempt {
+    pub message: Composed,
+    pub client_key: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposeResume {
+    Sending,
+    Retryable,
+}
+
+/// Lifecycle of the process-local idempotency key owned by one composer.
+/// Explicit abandon may drop it; process restart remains unrecoverable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComposeSendState {
+    Ready,
+    Sending(ComposeAttempt),
+    Retryable(ComposeAttempt),
+    ConfirmAbandon {
+        attempt: ComposeAttempt,
+        resume: ComposeResume,
+    },
+}
+
+impl ComposeSendState {
+    pub fn attempt(&self) -> Option<&ComposeAttempt> {
+        match self {
+            ComposeSendState::Ready => None,
+            ComposeSendState::Sending(attempt)
+            | ComposeSendState::Retryable(attempt)
+            | ComposeSendState::ConfirmAbandon { attempt, .. } => Some(attempt),
+        }
+    }
+
+    pub fn is_sending(&self) -> bool {
+        matches!(self, ComposeSendState::Sending(_))
+    }
+
+    pub fn is_confirming_abandon(&self) -> bool {
+        matches!(self, ComposeSendState::ConfirmAbandon { .. })
+    }
+}
+
+/// Whether Esc may close the dialog without losing a retry key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposeCancel {
+    Close,
+    KeepOpen,
+}
+
+pub fn request_compose_cancel(dialog: &mut Dialog) -> ComposeCancel {
+    let Dialog::Compose { send, .. } = dialog else {
+        return ComposeCancel::Close;
+    };
+    let current = std::mem::replace(send, ComposeSendState::Ready);
+    *send = match current {
+        ComposeSendState::Ready => return ComposeCancel::Close,
+        ComposeSendState::Sending(attempt) => ComposeSendState::ConfirmAbandon {
+            attempt,
+            resume: ComposeResume::Sending,
+        },
+        ComposeSendState::Retryable(attempt) => ComposeSendState::ConfirmAbandon {
+            attempt,
+            resume: ComposeResume::Retryable,
+        },
+        ComposeSendState::ConfirmAbandon { attempt, resume } => match resume {
+            ComposeResume::Sending => ComposeSendState::Sending(attempt),
+            ComposeResume::Retryable => ComposeSendState::Retryable(attempt),
+        },
+    };
+    ComposeCancel::KeepOpen
+}
+
+/// Start a send, reusing an uncertain attempt only when its message is exact.
+pub fn begin_compose_send(
+    dialog: Option<&mut Dialog>,
+    message: Composed,
+    new_client_key: impl FnOnce() -> String,
+) -> Option<ComposeAttempt> {
+    let Some(Dialog::Compose { send, .. }) = dialog else {
+        return None;
+    };
+
+    let selected = match send {
+        ComposeSendState::Ready => ComposeAttempt {
+            message,
+            client_key: new_client_key(),
+        },
+        ComposeSendState::Retryable(existing) if existing.message == message => existing.clone(),
+        ComposeSendState::Retryable(_) => ComposeAttempt {
+            message,
+            client_key: new_client_key(),
+        },
+        ComposeSendState::Sending(_) | ComposeSendState::ConfirmAbandon { .. } => return None,
+    };
+    *send = ComposeSendState::Sending(selected.clone());
+    Some(selected)
 }
 
 /// Read `@reviewer ship the rate limiter fix` into a recipient and a
@@ -440,7 +543,7 @@ mod tests {
         Dialog::Compose {
             buffer: buffer.into(),
             status: None,
-            sending: false,
+            send: ComposeSendState::Ready,
         }
     }
 
@@ -468,6 +571,32 @@ mod tests {
             dialog_key_action(&dialog, &key(KeyCode::Char('j'), KeyModifiers::CONTROL)),
             DialogKeyAction::Newline,
             "Ctrl+J is the chord that survives a bare tty"
+        );
+    }
+
+    #[test]
+    fn abandon_confirmation_keeps_the_draft_read_only() {
+        let mut dialog = composer("@reviewer ship it");
+        let message = parse_compose("@reviewer ship it").expect("message");
+        begin_compose_send(Some(&mut dialog), message, || "stable-key".into()).expect("attempt");
+        assert_eq!(request_compose_cancel(&mut dialog), ComposeCancel::KeepOpen);
+
+        assert!(!dialog.has_input());
+        assert!(!append_dialog_text(Some(&mut dialog), " changed"));
+        assert_eq!(
+            dialog_key_action(
+                &dialog,
+                &KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty())
+            ),
+            DialogKeyAction::Ignore
+        );
+        let Dialog::Compose { buffer, send, .. } = dialog else {
+            unreachable!()
+        };
+        assert_eq!(buffer, "@reviewer ship it");
+        assert_eq!(
+            send.attempt().map(|attempt| attempt.client_key.as_str()),
+            Some("stable-key")
         );
     }
 

@@ -1,156 +1,219 @@
 # Send
 
-Deliver a message to any watched agent pane. The daemon gates on the
-recipient's state, pastes, verifies the composer, submits, and returns a
-receipt. Nothing is typed into the wrong pane and nothing is lost silently.
+`cyclops send` records one immutable message in each recipient's durable
+mailbox and returns after acceptance. Terminal delivery is asynchronous. A
+recipient with the exact shipped claim skill gets a content-free doorbell. A
+recipient without that proof gets the full canonical payload through the same
+safe terminal gate.
 
-## Basics
+## Send
 
+```console
+$ cyclops send reviewer --subject "Review the rate limiter" --body "gateway.rs:120"
+accepted m-3f9c2a
+✓ accepted · wake queued
 ```
-cyclops send reviewer --subject "Review the rate limiter" --body "gateway.rs:120"
-printf 'longer body' | cyclops send reviewer --subject "Handoff" --body-file -
+
+Message ids are abbreviated in prose examples. The daemon emits `m-` followed
+by the full 32 lowercase hexadecimal UUID digits.
+
+Use `--body-file -` for stdin, `--client-key <key>` for an exact retry, and
+`--fyi` for an announcement that should not be answered. A successful result
+proves the message is durable. It does not prove that the recipient claimed it
+or completed the work.
+
+If the connection drops before the response arrives, the request may already
+be durable. Inspect the mailbox or message history first. Repeat a send or reply
+only with the same explicit `--client-key`; an unkeyed retry can create a second
+message.
+
+The receipt reports two separate facts:
+
+- `accepted` means the durable message and recipient mailbox entries exist.
+- `wake <state>` reports the current terminal notification attempt. It may be
+  `not started`, `queued`, `checking readiness`, `writing`, `staged`,
+  `submitted`, `notified`, `needs attention`, or `superseded`.
+
+A position such as `2 ahead` is the recipient mailbox's FIFO position. The
+daemon never bypasses an older pending message.
+
+## Receive
+
+The preferred path is this content-free notification:
+
+```text
+cyclops inbox claim m-3f9c2a
 ```
 
-The recipient's model reads:
+The daemon selects it only when `cyclops setup check` reports `mailbox
+doorbell`. The recipient then claims the message as described below.
 
+If setup reports `mailbox direct payload`, Cyclops writes the full message
+envelope instead. This compatibility path exists for an absent, edited,
+outdated, unreadable, or changed claim skill. A successful direct delivery is
+recorded as `delivered_direct`, not as a claim, and the recipient does not run
+`inbox claim` for that message.
+
+Both shapes are written once, only after proving the pane occupant, manifest,
+and clean composer. An ambiguous write or submit raises attention. Cyclops does
+not write either shape again automatically.
+
+## Claim a doorbell message
+
+List pending metadata without exposing bodies:
+
+```console
+$ cyclops inbox list
+m-3f9c2a admin · Review the rate limiter
 ```
+
+Automation can wait for and claim the oldest pending message in one bounded,
+event-driven command:
+
+```console
+$ cyclops inbox next --timeout 30s
+```
+
+Cyclops subscribes to mailbox changes before the first list, then uses the
+same durable list and claim operations shown below. It claims at most one
+message, does not poll, and never writes to the terminal composer. Exit `2`
+means no pending message arrived before the deadline. With `--json`, that
+outcome is a `timeout` object with `data.pending: false`. Every failure in JSON
+mode is one object on stdout with stable `code`, `message`, and `data` fields.
+
+To wait for one durable sender, copy its canonical `sender` key from
+`cyclops inbox list --json` and pass it to `--from`. Labels such as
+`gemini-test` are presentation text and are not accepted as endpoint keys:
+
+```console
+$ cyclops inbox next --from 'agent:<workspace-id>/<session-instance-id>/%12' --timeout 30s
+```
+
+If the claim request is sent but its answer misses the deadline, JSON reports
+`claim_outcome_unknown`. Inspect the named message before retrying because the
+claim may already be durable.
+
+Claim exactly the named message to fetch its immutable payload:
+
+```console
+$ cyclops inbox claim m-3f9c2a
 [cyclops m-3f9c2a] FROM: admin  SUBJECT: Review the rate limiter
 gateway.rs:120
+Reply: cyclops reply m-3f9c2a --body "..."
 ```
 
-A message from another agent carries one more line, `Reply: cyclops send
-<name> --subject "..."`. One from `admin` does not. `admin` is the
-operator, the name is reserved so no pane can hold it, and `cyclops send
-admin` answers `no_such_target`: an agent that obeyed the hint would file
-a failed delivery and raise attention for it.
+A claim is authenticated to the recipient mailbox. In plain output, repeating
+the claim returns the same payload. In JSON, the repeated result has
+`disposition: "already_claimed"`. It does not create a second task. A claim
+proves payload retrieval, not task completion.
 
-The daemon builds the header from the sender's real identity (socket peer,
-resolved to a pane). Nothing in the body can forge it. Replying to a
-specific message? `--reply-to m-3f9c2a` links the two in the record.
-Everything sent is queryable later: see [history.md](history.md).
+Reply using the message id so the daemon derives the recipient, thread, and
+subject from the visible parent:
 
-## Receipts
-
-One badge per recipient. The send blocks while an answer is coming and
-stops blocking when it is not: an idle target holds until the delivery
-resolves, capped at 2.5 s, and a target nothing detects holds only as long
-as the refusal takes (milliseconds). A busy target answers immediately; the
-head names its hold reason and followers carry their FIFO position.
-
-| Badge | Meaning |
-|---|---|
-| `✔ delivered · verified` | The recipient's own hook confirmed this exact message arrived. |
-| `✓ delivered · unverified (screen)` | Screen evidence only: the marker left the composer and a turn started. A late hook report upgrades it to verified. |
-| `● queued · 2 ahead` | Another message is ahead of this one. The per-recipient FIFO remains in order. |
-| `● held · recipient working` | This message is the in-flight head, and the recipient is still in a turn. |
-| `● held · composer has input` | The composer contains input, so Cyclops waits rather than concatenating it. |
-| `● held · pane in copy mode` | The pane is in copy mode; leave it there or exit the mode. |
-| `● held · session detached` | The watched session is detached; Cyclops resumes on reattach. |
-| `● held · waiting for a decision` | A modal or permission prompt needs a person. |
-| `● held · target state unknown` | Sensors cannot safely decide the target state yet. |
-| `● submitted` | Rare. The payload is in the pane and the confirmation had not landed when the receipt was printed. The badge lands on `cyclops history` when it does. |
-| `⊘ parked · quota, resets in 135h` | Recipient is out of vendor quota. See below. |
-| `⚠ needs attention · no pane for "reviewer"` | A human must look. The qualifier names why: missing pane, dead pane, nothing detecting the pane, or a failure whose terminal outcome is unknown. |
-| `⚠ needs attention · nothing detects %4` | The recipient has a name and no manifest matches what runs in its pane, so nothing can be typed into it. See below. |
-
-Verified means proven end to end: the recipient CLI's hook reported the
-injected text and it contained this message's id. Unverified means the
-screen showed the paste left the composer and the recipient started a turn,
-but no hook vouched for it. Both are delivered; only the evidence differs,
-and the check carries it: heavy `✔` is hook-verified, light `✓` is
-screen-tier.
-A recipient that always lands unverified probably has hooks that never
-load: `cyclops hooks verify <target>` shows the evidence, [hooks.md](../reference/hooks.md)
-the fix.
-
-Until you wire hooks, every delivery is screen-tier, so `✓ delivered ·
-unverified (screen)` is the normal receipt on a fresh install. It is a
-delivered message, not a degraded one.
-
-Add `--json` for the raw receipt. Anything the badge shows, scripts can read.
-
-## A recipient nothing detects
-
-```
-$ cyclops send ghostpane --subject "hello"
-⚠ needs attention · nothing detects %4
-ghostpane did not get this message; it is on the record and needs attention.
-Teach cyclops what runs in %4: cyclops name %4 ghostpane --manifest <id>.
-cyclops status names the manifests that are loaded, and docs/reference/MANIFESTS.md is
-how to write one.
+```console
+$ cyclops reply m-3f9c2a --body "Reviewed. One issue in the retry path."
+accepted m-a912ef
 ```
 
-Naming a pane makes it addressable, not readable. Cyclops types into a pane
-only when a manifest tells it what is running there and how to tell a busy
-composer from an idle one, so a pane no manifest binds can receive nothing.
+Use a reply or another explicit workflow fact when completion must be durable.
+Pane state cannot prove which message a turn handled.
 
-The send stops there rather than queueing: nothing is pasted, the message is
-kept on the record as needs attention, and the exit code is `1`. That code is
-the contract a script depends on. Exit `0` means cyclops has the message and
-will deliver it; a recipient nothing detects is not going to be delivered to
-by waiting, so it must never share an exit code with one that is.
+Do not run a foreground `cyclops watch` or polling loop to wait for a
+notification that must be written into the same pane. The wait makes the pane
+working, which safely gates the write and creates a circular wait. Return to
+the prompt for the normal one-line wake, or use bounded `inbox next` to pull
+and claim through the socket.
 
-The pin command comes pasteable: the pane as the target, the name the pane
-already answers to as the label. `cyclops status` lists the manifest ids to
-choose from, and [MANIFESTS.md](../reference/MANIFESTS.md) is how to write one for a CLI
-cyclops has not met.
+## The admin inbox
 
-`cyclops history` shows the same delivery as `⚠ needs attention · nothing
-detects its pane`. Same words, minus the pane id: a folded record line
-carries the recipient, not the pane the delivery went to.
+`admin` is a durable mailbox address even though no pane may use that label.
+An agent can send to it normally:
 
-## A delivery outcome is unknown
-
-An attention receipt after `pasting`, `staged`, or `submitted` does not prove
-that the recipient missed the message. A paste reply can be lost after tmux
-has applied it, verification can be inconclusive, the pane can change after
-staging, Enter can be accepted before its reply is lost, or the recipient's
-ACK can time out after the turn starts. Cyclops records the exact cause and
-never automatically pastes that logical message again. Inspect the named
-recipient pane and its composer before resending.
-
-Only failures proven before the pane write consume `delivery_retry_max`:
-detach or missing manifest before paste, a pre-paste occupant rebind, and a
-spool/load-buffer failure. A retry re-enters the full gate.
-
-## Broadcast
-
+```console
+$ cyclops send admin --subject "Review needed" --body "Attempt n-42 is blocked."
+accepted m-c82d11
+✓ accepted · wake not started
 ```
-cyclops send reviewer --to implementer,researcher --subject "Standup in 5"
+
+Admin mail receives no pane notification. `cyclops status` shows the pending
+admin count. An operator caller whose process ancestry is proven outside every
+watched pane reads it with the same `cyclops inbox list` and `cyclops inbox
+claim <id>` commands. A terminal inside a watched pane keeps that pane's agent
+identity. Broadcast `*` targets agent panes only; name `admin` explicitly when
+the operator needs a durable message.
+
+## Broadcast, reply, and supersession
+
+```bash
+cyclops send --to implementer,reviewer --subject "Standup in 5" --fyi
 cyclops send --all --subject "Rebase landed" --fyi
+cyclops send reviewer --subject "Corrected handoff" --body-file note.txt \
+  --supersedes m-old
 ```
 
-`--all` targets every labeled pane. A broadcast is one message in the
-record with one delivery per recipient, each advancing on its own; the
-receipt is a grid of recipient badges.
+A broadcast is one message with one mailbox entry and one notification state
+per recipient. `--all` targets every adopted agent, not admin. Supersession is
+limited to one recipient and only succeeds while the old message is unclaimed
+and its notification has not crossed the write boundary. History remains
+append-only.
 
-## --fyi
+Prefer `cyclops reply <id>` to `send --reply-to <id>`. Both use the same daemon
+validation, but `reply` avoids supplying routing or subject that the daemon
+will ignore.
 
-An announcement expecting no reply. The reply hint line is dropped from
-what the recipient reads, and the record marks the message as fyi.
+## Attention and operator recovery
 
-## --wait
+`cyclops messages` is the body-free combined view of mailbox and notification
+state. `cyclops alarm preview --older-than <age>` lists unresolved notification
+alarms and their exact attempt ids. `cyclops status` reports pane and legacy
+delivery attention plus the admin unread count; it is not the mailbox alarm
+source.
 
-`--wait idle|done|blocked` turns the send into send-and-wait: after the
-delivery resolves, the receipt also reports when the recipient reached
-that state. `--wait done` is the handoff idiom: deliver the task, return
-when the turn it started has ended. Budget with `--timeout` (default 60s).
-Details, outcomes, and exit semantics: [wait.md](wait.md).
+An ambiguous notification is never an invitation to resend blindly. Use its
+exact notification attempt id:
 
-## Exit codes
+```bash
+cyclops attention show <attempt-id> --diff
+cyclops attention complete <attempt-id>
+cyclops attention discard <attempt-id>
+```
 
-- `0` cyclops has the message: delivered, queued, or in flight
-- `1` parked or needs attention (also: daemon unreachable)
-- `2` usage error (no recipient, unreadable body file)
+`show` is read-only. `complete` and `discard` recheck the exact notification,
+terminal layout, process generations, manifest, and current terminal safety
+before acting. An uncertain action outcome must be inspected and must not be
+repeated.
 
-The line between `0` and `1` is whether waiting helps. Exit `0` means the
-message is cyclops's problem now. Exit `1` means it is yours.
+`show --diff` returns the exact selected transport bytes to the authenticated
+workspace administrator. A direct fallback diff therefore contains the message
+payload. The daemon does not write those diff inputs to its journal or log.
 
-## Quota parking
+`cyclops requeue <message-id>` is an explicit operator action for a notification
+that is still eligible. `cyclops alarm clear <attempt-id>...` appends explicit
+clearances to the content-free notification alarm register. For an age-selected
+set, `cyclops alarm clear --older-than <age>` previews and prints the exact ids,
+then requires typing `clear` at a confirmation that names the count and cutoff.
+The clear request contains only those frozen ids, so a newer alarm cannot enter
+the operation. There is no clear-all form. Scripts use `alarm preview --json`
+and pass its ids explicitly rather than using the interactive age form. None of
+these commands changes or deletes the message.
 
-When a recipient's vendor quota runs out, its deliveries park with the
-reset hint read from its screen, and everything queued behind them parks
-too. Parked messages are never retried automatically, and new sends to
-that recipient park immediately. The message is kept in the record: wait
-out the reset (the badge carries the hint), then send again, or send to a
-different agent now.
+## Direct delivery records
+
+Current compatibility fallback and older direct records can show a full payload
+ending in `[cyclops:end <id>]`. Current mailbox fallback settles as
+`delivered_direct` and carries no claimant. Older session-ledger delivery may
+show `delivered_verified` or `delivered_unverified`; those receipt tiers are not
+the `msg.send` mailbox contract.
+
+## Exit and waiting semantics
+
+- `0`: the message was accepted, or the idempotency key named an existing
+  accepted message
+- `1`: no success response was received. The daemon may have refused the
+  request, or the response may have been lost after durable acceptance. Inspect
+  current state and reuse the same explicit client key for any exact retry
+- `2`: local command usage was invalid
+
+`cyclops send` does not wait for task completion. `cyclops wait <target>
+--until idle|done|blocked` observes a pane, not a message. See
+[wait.md](wait.md).

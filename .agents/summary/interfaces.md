@@ -25,7 +25,7 @@ mismatch warns and never rejects. Types live in
 | `pane.read` | Pane content: `visible`, `recent`, or `detection` (per-sensor readings behind the verdict) |
 | `pane.label` | Adopt (name) or clear a pane |
 | `session.watch` | Start watching a tmux session the daemon was not booted with |
-| `msg.send` | Deliver a message; optional `wait` (until idle/done/blocked) |
+| `msg.send` | Durably accept a message and schedule its notification; the compatibility-only `wait` field is rejected |
 | `msg.history` / `msg.thread` | The record, with delivery chains folded in at read time |
 | `agent.state.report` | Posted by `cyclops hook` when a vendor hook fires; feeds fusion and ACK matching |
 | `agent.wait` | Block until an agent reaches a state; pinned to the occupant pid |
@@ -57,7 +57,7 @@ alias has no JSON form.
 | `workspace save\|restore` | Session shape to/from `$CYCLOPS_HOME/workspaces` |
 | `name <pane> <label>` | Adopt a pane (`--manifest` to pin, `--clear` to release, `--self` for the calling pane) |
 | `status` / `list` / `ping` | Roster and health (`list` scopes to the caller's tmux session; `--all` for every watched session) |
-| `send <agent> --subject … [--body …] [--all] [--fyi] [--reply-to] [--wait …]` | Deliver with a receipt; exit 0 delivered/queued, 1 parked/attention |
+| `send <agent> --subject … [--body …] [--all] [--fyi] [--reply-to]` | Deliver with a receipt; exit 0 delivered/queued, 1 parked/attention |
 | `wait <agent> --until idle\|done\|blocked` | Exit 0 reached, 2 timeout, 3 occupant changed/died |
 | `history` / `thread <id>` | The record |
 | `read <agent> --source visible\|recent\|detection` | Pane content / sensor readings (`--raw` with detection) |

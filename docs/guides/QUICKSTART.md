@@ -5,7 +5,7 @@ it back months later. About ten minutes, most of it waiting for agents.
 
 Day to day, you will not type most of these commands. You open the
 workspace with bare `cyclops`, start your agents in its panes, and tell
-them things like "when you're done, send it to reviewer" — an agent that
+them things like "when you're done, send it to reviewer". An agent that
 knows Cyclops ([one file teaches it](../../skills/cyclops/SKILL.md)) runs
 the handoff itself. This page walks the layer underneath, command by
 command, so you can see what your agents do and drive every step yourself
@@ -14,18 +14,14 @@ when you want to.
 The README ladder is the short version. This is the same walk from a bare
 machine, with the handoff in the middle, which is the thing Cyclops is for.
 
-Output here is real, captured by
+The command shapes here are exercised by
 [`tests/e2e/parity-check.sh`](../../tests/e2e/parity-check.sh) on a throwaway tmux
-server. Three things are edited and nothing else: the home directory is
-shortened to `~/.cyclops`, color is off, and a `Next:` block already shown
-once is left out the second time.
+server. The examples abbreviate full UUID-based message ids for readability.
+Color, paths, clocks, pane ids, and notification timing vary by run.
 
-Some of it follows your machine rather than that run: message ids and clock
-values, the pane ids tmux hands out (`%0`, `%1`), the home directory in
-`command -v` output, the shell a status row names for a pane running one
-(`bash` below, `zsh` on plenty of machines), and the tmux version and
-loaded-manifest list the daemon reports in `cyclops status`. Everything
-else should match line for line.
+Other values also follow the machine: the shell a status row names, the tmux
+version, and the loaded-manifest list. Treat the examples as stable output
+shapes, not byte-for-byte transcripts.
 
 ## 1. Install
 
@@ -106,7 +102,7 @@ shells unless you pass `--launch`. An id with no manifest, or a count that
 does not fit the preset's named panes, is refused before anything is built.
 
 The CLIs start bare, exactly as if you had typed their names. Step 4 wires
-the hooks; until then their receipts are screen-tier.
+the lifecycle hooks used by state detection and notification safety.
 
 ## 3. Check the roster
 
@@ -178,19 +174,10 @@ an agent. [panes.md](panes.md).
 
 ## 4. Wire the hooks
 
-Skip this and everything still works. Without hooks a delivery is confirmed
-by what cyclops can see on the screen, and the receipt says so in those
-words:
-
-```
-✓ delivered · unverified (screen)
-```
-
-The light check is not a lesser delivery. It means the message landed and
-the evidence is screen-tier, which is the honest thing to say when the
-agent itself has not confirmed. Wiring hooks takes a minute and upgrades
-every receipt to the heavy check, `✔ delivered · verified`, where the
-recipient's own hook confirmed this exact message:
+Standard messaging prefers a content-free doorbell when the exact claim skill
+is installed. Without that capability proof it safely delivers the full
+payload instead. Hooks report authenticated lifecycle edges that help Cyclops
+distinguish a running turn from a clean composer on either path.
 
 ```
 cyclops hooks install claude --agent reviewer   # renders config, prints wiring
@@ -205,98 +192,98 @@ directory-trust trap and the agy caveat are in [hooks.md](../reference/hooks.md)
 
 The implementer finishes something and hands it to the reviewer. In the
 natural-language flow this is the moment you said "send it to reviewer and
-ask for a review", and the implementer runs the command itself. The command
-is the same either way — run in the implementer's own pane, by the agent or
-by you, and its receipt prints there:
+ask for a review", and the implementer runs the command itself:
 
 ```
 $ cyclops send reviewer --subject "Burst path fix, ready for review" --body "gateway.rs:120. Tests pass."
+accepted m-be0129
+✓ accepted · wake queued
 ```
 
 Nothing in that command says who is sending. The daemon resolves it by
 walking the calling process up to a watched pane, so the record names the
-pane rather than anything the request claimed:
+pane rather than anything the request claimed. The body is durable, but the
+reviewer's pane receives only a one-line wake:
 
-```
-$ cyclops history --with reviewer --limit 1
-  4s  implementer → reviewer  Burst path fix, ready for review  ✔ delivered · verified
-```
-
-The reviewer replies, chaining to the message id:
-
-```
-$ cyclops send implementer --reply-to m-be0129 --subject "Re: Burst path fix" --body "Approved. One nit in the retry path."
+```text
+cyclops inbox claim m-be0129
 ```
 
-And the thread reads back whole, oldest first:
+The reviewer lists metadata, claims that exact id, and then replies:
+
+```console
+$ cyclops inbox list
+m-be0129 implementer · Burst path fix, ready for review
+
+$ cyclops inbox claim m-be0129
+[cyclops m-be0129] FROM: implementer  SUBJECT: Burst path fix, ready for review
+gateway.rs:120. Tests pass.
+Reply: cyclops reply m-be0129 --body "..."
+
+$ cyclops reply m-be0129 --body "Approved. One nit in the retry path."
+accepted m-a94c10
+```
+
+A claim is atomic and recipient-authenticated. Repeating it returns the same
+payload without creating a second task. A reply is the durable review verdict;
+pane state is not.
+
+From the reviewer pane, the thread reads back whole, oldest first. That caller
+may see the request body because it claimed the message and the reply body
+because it authored the reply:
 
 ```
 $ cyclops thread m-be0129
-  5s  implementer → reviewer  Burst path fix, ready for review  ✔ delivered · verified
+  5s  implementer → reviewer  Burst path fix, ready for review
       gateway.rs:120. Tests pass.
 
-  0s  reviewer → implementer  Re: Burst path fix                ✔ delivered · verified
+  0s  reviewer → implementer  Re: Burst path fix, ready for review
       Approved. One nit in the retry path.
 ```
 
-That is the gate: work does not move until a message with a verdict moves
-with it, and both halves are on the record with the delivery evidence
-attached.
+In this review workflow, the durable reply is the gate: work does not move
+until a message with a verdict moves with it. Cyclops records the facts but
+does not enforce that project policy.
 
-## 6. Make the gate blocking
+`admin` uses the same mailbox. An agent can run `cyclops send admin ...`.
+No pane wake is attempted; `cyclops status` shows the pending admin count and
+an operator caller proven outside every watched pane uses `cyclops inbox list`
+and `cyclops inbox claim <id>`. A shell inside a watched pane retains that
+pane's agent identity.
 
-The handoff above is fire and forget. To hold until the reviewer has
-actually finished the turn your message started, wait for it:
+## 6. Observe pane activity
+
+`cyclops wait` blocks on a pane state edge without polling:
 
 ```
-cyclops send reviewer --subject "Review the burst path fix" --wait done --timeout 5m
+cyclops wait reviewer --until done --timeout 5m
 ```
 
-`--wait done` returns on the working-to-idle edge of the turn your delivery
-started, never a turn that predates it, and it is pinned to the pane
-occupant the message was submitted to. Exit codes and the pinning rule:
-[wait.md](wait.md).
-
-A script gate around it has to read two answers, because the exit code is
-only the first one:
-
-```bash
-set -e
-cyclops send reviewer --subject "Review $BRANCH" --body-file diff.txt \
-  --wait done --timeout 10m --json > receipt.json
-jq -e '.wait[0].outcome == "reached"' receipt.json > /dev/null
-```
-
-The exit code follows the delivery, not the wait: 0 delivered or queued, 1
-parked or needing a human, 2 a usage error. So a message that landed and
-then ran out of wait budget still exits 0, and `set -e` alone lets the
-script march on as if the review had happened. The `jq -e` line is the half
-that gates: it stops on anything but a finished turn.
-
-There is one wait entry per recipient, each `{to, outcome, state,
-waited_ms, delivery}`. `outcome` is `reached`, `timeout`,
-`occupant_changed` when the pane's occupant changed mid-wait, or
-`not_delivered` when the delivery never got far enough to start a turn. A
-gate that wants to tell those apart branches on that field instead of
-testing it against one value.
+`done` means a turn ran on that pane and reached idle while the same
+process occupied it. It does not identify which message or task the turn
+handled. Use the reviewer's reply from section 5 as the durable verdict.
+Do not treat a pane state transition as proof that a specific review
+finished. Exit codes and the occupant pinning rule are in [wait.md](wait.md).
 
 ## 7. Audit it later
 
-The record is a file per watched session, one JSON object per line, never
-rewritten. It does not need a daemon to read:
+The mailbox journal is one append-only file per durable workspace. Ask the
+body-free snapshot for its id instead of guessing a directory name:
 
+```bash
+workspace_id=$(cyclops --json messages | jq -r .workspace_id)
+cyclops_home="${CYCLOPS_HOME:-$HOME/.cyclops}"
+jq -c 'select(.kind == "msg") | {from, to, subject, reply_to}' \
+  "$cyclops_home/workspaces/$workspace_id/messages.ndjson" | tail -2
 ```
-$ jq -c 'select(.kind == "msg") | {from, to, subject, reply_to}' ~/.cyclops/ledger/main.ndjson | tail -2
-{"from":"implementer","to":["reviewer"],"subject":"Burst path fix, ready for review","reply_to":null}
-{"from":"reviewer","to":["implementer"],"subject":"Re: Burst path fix","reply_to":"m-be0129"}
-```
 
-Every delivery attempt, gate decision, state change and ack is a line in the
-same file, sharing the message id, so one `jq` filter reconstructs a message
-and everything that happened to it. Secrets never enter it.
+The immutable body, mailbox mutations, and content-free notification facts
+are append-only. Treat the journal as sensitive owner-only state. Use the CLI
+when caller-scoped body access matters. Session records under
+`$CYCLOPS_HOME/ledger/` cover pane state and legacy direct delivery; they are
+not the canonical mailbox journal.
 
-Back it up by copying `~/.cyclops/ledger/`. Reading is free and never
-writes: any agent may query the whole record.
+Reading either journal is free and never writes.
 
 ## What to read next
 
@@ -304,7 +291,7 @@ writes: any agent may query the whole record.
   agent the verbs and safety rules, so the handoff above is something you
   say rather than type
 - [install.md](install.md) for PATH, config keys, and the manifests
-- [send.md](send.md) for receipts, broadcast, and quota parking
+- [send.md](send.md) for acceptance, claim, reply, and attention recovery
 - [history.md](history.md) for filters, threads, and paging a long record
 - [ui.md](ui.md) for the live stream
 - [workspaces.md](workspaces.md) for presets and saving your own arrangement

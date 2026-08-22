@@ -22,15 +22,15 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 
-/// Fixture manifest: binds plain bash panes and gives fusion one title
+/// Fixture manifest: binds one test-owned shell alias and gives fusion one title
 /// tier and one screen tier with deliberately different states, so both
 /// the title-decides path and the disagreement path are exercised without
 /// any vendor CLI.
 const FIXTURE_MANIFEST: &str = r#"
 [agent]
-id = "bash"
-display_name = "Bash fixture"
-process_names = ["bash"]
+id = "fixture"
+display_name = "M0 fixture"
+process_names = ["cyc-m0-agent"]
 
 [[rule]]
 id = "title_idle"
@@ -158,7 +158,13 @@ async fn m0_shadow_daemon_end_to_end() {
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(home.join("manifests")).expect("create scratch home");
     let _home_guard = HomeGuard(home.clone());
-    std::fs::write(home.join("manifests/bash.toml"), FIXTURE_MANIFEST).expect("write manifest");
+    std::fs::write(home.join("manifests/fixture.toml"), FIXTURE_MANIFEST).expect("write manifest");
+    let fixture_bin = cyclops_proto::scratch::scratch_dir("cyc-m0-bin");
+    let _ = std::fs::remove_dir_all(&fixture_bin);
+    std::fs::create_dir_all(&fixture_bin).expect("create fixture bin");
+    let _bin_guard = HomeGuard(fixture_bin.clone());
+    let fixture_shell = fixture_bin.join("cyc-m0-agent");
+    std::os::unix::fs::symlink("/bin/bash", &fixture_shell).expect("link fixture shell");
     std::fs::write(
         home.join("config.toml"),
         format!(
@@ -182,7 +188,7 @@ async fn m0_shadow_daemon_end_to_end() {
         "100",
         "-y",
         "30",
-        "bash --norc --noprofile",
+        &format!("{} --norc --noprofile", fixture_shell.display()),
     ]);
     tmux.run_ok(&["send-keys", "-t", "main", "PS1='FIXPROMPT '", "Enter"]);
     // Wait until the fixture prompt renders (screen tier signal).
@@ -247,8 +253,12 @@ async fn m0_shadow_daemon_end_to_end() {
         let session = &resp["result"]["sessions"][0];
         if session["attached"] == json!(true) {
             let pane = &session["panes"][0];
-            if pane["current_command"] == "bash"
-                && pane["manifest"] == "bash"
+            // tmux reports either the symlink basename or its shell target,
+            // depending on the host platform.
+            if matches!(
+                pane["current_command"].as_str(),
+                Some("bash") | Some("cyc-m0-agent")
+            ) && pane["manifest"] == "fixture"
                 && pane["state"] == "working"
             {
                 assert_eq!(session["name"], "main");

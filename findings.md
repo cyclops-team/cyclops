@@ -39,6 +39,7 @@ than a measurement.
 | F29 | A script matching daemon output textually matches one field, or uses `jq` | binds |
 | F30, F31 | Never allocated. The gap is deliberate and the numbers stay unused | bookkeeping |
 | F32 | A theme reload applies whole or not at all: a file that stops setting a token it set before is refused | binds |
+| F33 | `cyclops start` derives its next steps from daemon reachability, not the pane count | binds |
 | F34 | `libghostty-vt` needs Zig at build time; the corpus used `vt100` as the comparison engine instead | binds |
 | F35 | `alacritty_terminal` passes the workspace VT fixture corpus 12/12; `vt100` passes 5/12 | binds |
 | F36 | Cloud-agent VM stdout accepts OSC 52 clipboard writes; native fallback uses wl-copy/xclip when present | binds |
@@ -47,11 +48,32 @@ than a measurement.
 | F39 | Width fixtures pin VS16 non-widening and SGR 21 as bold-off, so an engine bump fails loudly | binds |
 | F40 | One `list-panes -a` discovers every session, window, and pane; empty sessions cannot exist | binds |
 | F41 | Session fields are reachable from pane lines; the second snapshot command exists for tab-safety, not reachability | binds |
+| F42 | Workspace performance measurements prove shape and scaling, not universal wall-clock budgets | binds |
+| F43 | `swap-pane` focuses the destination pane unless `-d` preserves the active slot | binds |
+| F44 | OSC 52 output requires terminal support; native clipboard fallback remains necessary | binds |
+| F45 | Timing tests must prove their runner was scheduled before treating a timeout as product evidence | binds |
+| F46 | A stalled control-mode client accumulates queued notifications before tmux can report pause | binds |
+| F47 | Killing a session closes control mode without per-pane death events | binds |
+| F48 | `window-size latest` lets an ordinary client change the canvas observed by a control client | binds |
+| F49 | Pane applications render against tmux's reported ground, which may serve two terminals | binds |
 | F50 | A malformed subscription value is a clean-prefix truncation already on tmux's own wire on tmux 3.7b, not `-u`, the line reader, or a dropped connection; the trigger did not reproduce under driving | binds |
 | F51 | tmux 3.7b's own window-index and current-window bookkeeping is racy under heavy parallel fork load, even on a fully isolated `-L` server; a test creating a second window must give it an explicit index and never read it back through a session-level (current-window) target | binds |
 | F52 | tmux 3.7b's `pause-after` clock only starts once a stalled reader's backlog has actually accumulated past the threshold; a host-contended producer can leave a stalled reader with nothing to pause against for seconds at a time | binds |
 | F53 | `display-message -t` must resolve down to a pane, and a bare `=session` exact-match target gives it nothing to fall back to (empty output, no error); target `=session:` — other session-scoped commands accept the bare form fine | binds |
-| F54 | Codex 0.147.0 keeps a multiline bracketed paste expanded, so the audited collapsed-composer shape needs no new rule on this build | binds |
+| F54 | Codex 0.147.0 can keep a multiline paste expanded; F62 later proved representation is chosen per message | binds, amended by F62 |
+| F55 | Claude composer input is identified by its NBSP boundary and style, not by visible text alone | binds |
+| F56 | The terminal engine accepts geometry below its documented floor, so every sizing path clamps first | binds |
+| F57 | State files need one descriptor-anchored owner; path-based opens inherit unsafe permissions and cannot contain link races | binds |
+| F58 | Antigravity 1.1.13 paints no idle ghost text; content after its prompt is treated as input | binds |
+| F59 | Composer chrome and trailer anchoring are measured manifest data, never Rust vendor branches | binds |
+| F60 | Claude can retain an idle title throughout active work, so its styled working row outranks the title | binds |
+| F61 | Hook callers may have no Cyclops label; authenticated server-derived process identity is authoritative | binds |
+| F62 | Raw composer, anchored sentinel, and collapsed chip are per-message evidence classes; a leading id is never completeness proof | binds |
+| F63 | Detached hook origin uses the same last-known route record as report handling | binds |
+| F64 | Codex paints a blank separator below the composer and the declared trailer must include it | binds |
+| F65 | Whole-composer clearing is measured for Claude and Codex; Antigravity and Cursor refuse unsupported actions | binds |
+| F66 | The isolated stage-and-clear soak passed 100 trials each for Codex, Claude, and Antigravity; Cursor was unavailable | evidence |
+| F67 | A one-line doorbell must fit the narrow lane because application wrapping is not exact composer evidence | binds |
 
 ## F13. refresh-client -B subscriptions work in control mode on tmux 3.6a (MEASURED)
 
@@ -1162,7 +1184,7 @@ trailing colon differs. `src/cyclops-tmux/tests/watcher_rename.rs`'s
 `a_renamed_session_keeps_flowing_under_the_new_name` is the regression
 test: it failed with the bare target and passes with the trailing colon.
 
-## F54. Codex 0.147.0 keeps a multiline bracketed paste expanded (MEASURED)
+## F54. Codex 0.147.0 can keep a multiline bracketed paste expanded (MEASURED)
 
 The currently installed Codex CLI no longer reproduced the collapsed
 composer shape audited against 0.146.x. `codex --version` reported
@@ -1187,11 +1209,11 @@ tmux -L cyc-codex-live -f /dev/null capture-pane -p -t codexprobe:0.0
 tmux -L cyc-codex-live -f /dev/null capture-pane -p -e -t codexprobe:0.0
 ```
 
-Conclusion: do not add a regex or scrubbed collapsed-paste fixture for the
-audited 0.146.x shape on this build. This closes work package 2 at the plan's
-explicit stop condition; revisit it only when a current Codex build or payload
-shape actually collapses. The existing Codex ghost/typed rules remain the only
-measured manifest change.
+Correction from F62: this probe established one raw representation, not a
+version-wide rendering contract. Later measurements on the same Codex version
+produced both raw composer content and collapsed chips depending on the
+individual paste. The verifier therefore classifies each observed
+representation and never selects one from the vendor version alone.
 
 ## F55. Claude Code 2.1.222 composer byte shapes: NBSP is the composer's signature (MEASURED)
 
@@ -1263,3 +1285,396 @@ Fix shape: `PaneRuntime` clamps every path that sizes the engine
 manages the nested tmux itself: the pane is an opaque terminal on
 purpose, and the daemon already reads it as `? unknown` (ssh matches no
 manifest).
+
+## F57. State files need one descriptor-anchored owner (READ, high severity)
+
+The ledger created directories and files through caller-supplied paths, so
+permissions depended on the process umask and validation could not bind a
+checked path to the inode later read or changed. A symlink or hard link also
+made permission repair capable of changing an external target.
+
+Ledger access now begins with one validated root descriptor supplied by the
+reusable state-path crate. Descendants are relative names, directory and file
+ownership is checked before repair, and links or unexpected file types are
+refused before their bytes are exposed. The dedicated umask child is
+`src/cyclops-state/src/lib.rs::tests::creation_is_owner_only_under_permissive_and_restrictive_umasks`.
+The production-writer contract, startup repair, symlink, and hard-link probes
+are in `src/cyclopsd/tests/state_permission_contract.rs`. The remaining state
+writers were migrated through the same owner before the messaging candidate
+was frozen.
+
+## F58. agy paints no composer ghost text
+
+Measured 2026-08-20, agy 1.1.13, live idle pane, `tmux capture-pane -e -p`.
+An empty agy composer renders exactly `ESC[94m>ESC[39m`: the prompt glyph
+is styled, and nothing follows it. No placeholder, suggestion, or ghost
+text of any kind.
+
+So `composer_has_input` needs no SGR discriminator today: any content after
+that glyph is a human's. If a later version paints a suggestion there, the
+rule reads it as a draft and deliveries hold forever, which is the benign
+direction and is visible in `cyclops read <agent> --source detection`.
+
+Scope limit, stated because it matters: this covers the idle state on one
+version. Typed-input styling was not captured, since the only live agy
+pane belonged to another agent's working session, and typing into someone
+else's composer to take a measurement is the exact act the delivery gate
+exists to prevent. Adding an esc clause on one observation would also
+flip agy's capture flavor to escaped for every delivery, which is a
+bigger behavioral change than the finding supports.
+
+Same capture confirmed the `composer_trailer_regex` chrome shipped for
+agy: the box rules de-escape to `────…` and the status row to
+`Gemini 3.7 Flash · … · Ctx: 78% · …`.
+
+## F59. Composer chrome vocabulary is vendor-specific (MEASURED)
+
+The terminal sentinel can only prove it is the LAST payload token if
+something says which rows below the composer are not payload. That
+vocabulary is `injection.composer_trailer_regex`, and these are the
+captures it was written from.
+
+Procedure. For a live pane: `tmux capture-pane -e -p -t <pane>` on an
+idle composer, then read the tail rows. For the fixture vendors:
+`src/cyclops-manifest/tests/fixtures/*_plain.txt`, whose tails were
+captured the same way in earlier delivery tests and the F55 probe.
+
+Measured rows, 2026-08-20 unless noted:
+
+- claude (fixtures `claude_idle_2_1_221.txt`,
+  `claude_pasted_chip_plain.txt`): a box rule `────…`; a status row
+  `  Opus 5 · xhigh · ~/projects/clops · Ctx: 97% · 5h: 93% · 7d: 94% ·
+  1000K window · 28K used`; a hint row `  paste again to expand`; a mode
+  row `  ⏸ manual mode on · ← for agents`.
+- codex (fixture `codex_pasted_chip_plain.txt` plus a live capture):
+  a blank line, then `  gpt-5.6-sol high · <cwd> · 258K window · 2.87M
+  used`, live variant `  gpt-5.6-sol xhigh · ~ · Full Access · Context
+  87% left · weekly 97% left · 258K window · 2.87M used`.
+- agy (live, agy 1.1.13, `tmux capture-pane -e -p`): box rules render
+  `ESC[90m────…`, the empty composer is `ESC[94m>ESC[39m`, and the
+  status row de-escapes to `Gemini 3.7 Flash · High · ~ · Full · Ctx:
+  78% · 93% 5h, … · 507K used`.
+- cursor: NOT measured. No cursor pane exists in this fleet and none was
+  installed to make one. Cursor therefore ships no trailer vocabulary,
+  and no chip pattern either, since it does not collapse a paste.
+
+  CORRECTED 2026-08-21. An earlier version of this line said that lane
+  "keeps the leading-id evidence it had before". It does not, and cannot:
+  `staged_verified` accepts the terminal sentinel or the composer chip
+  and nothing else, so `verify_pattern = ["<message_id>"]` is now inert
+  and every Cursor staging verify refuses. That is the correct fail-closed
+  answer for a vendor nobody measured, and restoring leading-id
+  acceptance would reintroduce the failure described in F62. It is also a
+  live blocker rather than a soak-only
+  concern: on this tree, every Cursor delivery ends in
+  attention_required. Closing it needs a capture off a current Cursor,
+  not a decision.
+
+Consequence worth stating plainly, because it bounds what these patterns
+can promise: a status row and a sentence are both text, and a pattern
+loose enough to match the row can match prose. `context · budget · 128K
+window` is structurally identical to codex's real row, so the codex
+pattern is anchored on the model-name shape instead, and it fails closed
+when the model family is renamed. `shipped_trailers_reject_adversarial_
+payload_text` holds the line: every pattern is tested against prose
+derived from it, and a pattern that matches payload is a bug.
+
+## F60. Claude 2.1.236 keeps the idle sparkle through a long turn
+
+Measured 2026-08-20 on macOS 15.5, live, Claude Code 2.1.236. A tool
+execution ran continuously for over 28 minutes while `cyclops status`
+reported the pane idle.
+
+Cause, and it takes two rules agreeing to produce it. Claude sets the
+terminal title to "✳ <summary>" when a turn ends and KEEPS that title
+through whatever runs next, so `title_idle_sparkle` matched. The input
+composer stays drawn below the streaming output, so `composer_empty`
+matched too. Title and screen agreed on idle, disagreement was false,
+and under INVARIANTS rule 12 that shape is write-ready: the gate would
+have pasted into a pane mid-generation.
+
+Probe: read-only sampling across animated frames. The active status row
+cycles a leading glyph (·, ✶, ✽, ✳, ✢, ✻) and a gerund verb
+("Kneading…", "Jitterbugging…") painted in SGR 38;5;215, followed by a
+running timer envelope in 38;5;246. Captured to
+`src/cyclops-manifest/tests/fixtures/claude_working_2_1_236_esc.txt`,
+sha256 81f8b3b89c3c6c894ce8cfdb2b88748afe36d6d7d064e424b14d454a8e61a6ed,
+a minimized fixture derived from one live escaped capture. Transcript prose
+above the evidence window is neutralized while its row count and styling are
+retained. The active status, composer, and chrome rows are unchanged. The test
+derives the plain form from those same bytes so both forms describe one moment.
+
+Negative separation, which is why the rule is style-bound and not a word
+match: completed steps stay in the transcript forever, rendered with ⏺
+or "Cooked for" in uniform 38;5;246 or 38;5;231. They never combine the
+215 glyph and verb with the 246 timer envelope in the bottom region.
+
+Fix: `composer_working_spinner_status` in
+`resources/manifests/claude.toml`, priority 1150, region
+`bottom_non_empty_lines(10)`, matching the escaped row. 1150 puts it
+above `title_idle_sparkle` (1000) and `composer_empty` (900), so an
+active turn outranks both halves of the agreement that produced the
+false idle.
+
+## F61. Hook reports required a label the hooks did not have
+
+Measured 2026-08-20. `~/.cyclops/hook-errors.log` grew continuously with
+`no agent identity; set CYCLOPS_AGENT or pass --agent`, and no hook edge
+had ever reached the daemon from any pane.
+
+What is proven: `cyclops hook` refused before connecting unless a label
+was supplied, the codex and agy hook files invoke it with no `--agent`,
+and the panes running them had no `CYCLOPS_AGENT` in their environment.
+The claude pane had no hook wiring at all, so it contributed no errors
+and no edges either.
+
+What is NOT proven, and worth stating because it is the tempting story:
+whether a vendor strips the environment for hook subshells, or the panes
+were simply launched without the variable. Nobody probed that, and the
+fix does not depend on the answer.
+
+Consequence: `hooks_verified` was false fleet-wide and every receipt
+degraded to the screen tier. The fix makes the label optional and has
+the daemon derive the origin from the authenticated socket peer, which
+it already computed in order to verify reports. A supplied label stays
+an assertion, checked against that origin and denied on disagreement.
+
+## F62. The leading id is not evidence, and chip versus sentinel is a per-message decision
+
+DELIVERY.md states both properties as rules. The captured layouts and paste
+behavior below provide their evidence.
+
+**A visible `[cyclops <id>]` proves only that the head of the payload
+arrived.** A truncated paste proves exactly the same thing, and that is
+the failure the sentinel exists to catch: with a long payload the id
+scrolls out of the verify region while the tail is still on screen, so
+the id is simultaneously the weakest evidence and the one most likely to
+be missing. Accepting it would submit half a message; requiring the
+sentinel instead moves the proof to the END of the payload, where
+"arrived" and "arrived whole" are the same question.
+
+**Terminality is decided by the escaped capture, not by prose.** On every
+vendor measured so far (F59), composer chrome arrives painted with SGR
+attributes while a pasted payload row arrives plain, so prose shaped like
+a status row fails the escaped half of the trailer layout. That is a
+measured property of those three layouts, not a law about terminals. A
+vendor that paints pasted text would need its own measurement, and until
+somebody takes it the sentinel path refuses on that vendor rather than
+guessing.
+
+**Chip and sentinel are chosen by the render, not the vendor.** The same
+CLI at the same version produces a raw-wrapped payload for one message
+and a collapsed "[Pasted Content N chars]" chip for the next, depending
+on size and content (F54, Codex 0.147.0). So the two evidence paths
+cannot be assigned per vendor at manifest-write time; verification tries
+the sentinel first and falls to the chip on what the capture actually
+shows.
+
+## F63. The in-process report origin could not place a pane during a detach
+
+Measured 2026-08-21 by `hook_ack_during_detach_resolves_the_delivery`,
+which failed with `{"applied":false,"reason":"occupant_changed"}`.
+
+`Daemon::report_state` is the pre-trusted in-process entry for hook
+reports. It states the origin the socket path would have derived rather
+than trusting the caller, which is right. But it derived that origin
+through `resolve_recipient`, and that function answers only from LIVE
+watchers by design. During a detach it returns None, and the fallback
+was `(name, 0, None)`: pane id replaced by the label, pid zero.
+
+Downstream, `handle_report` resolves the pane through
+`resolve_recipient_last_known`, so it found a real row with a real pid
+and compared it against the origin's zero. Exact process-identity binding
+then refused the report as an occupant change, and it refused it
+BEFORE reaching the branch that names an unattributable origin, so the
+reason was wrong as well.
+
+The window this broke is the one the path exists for: a vendor hook
+fires while nobody is attached, which is the case that motivated the
+in-process trusted path in the first place. Refusing it re-opens the
+duplicate-delivery hole the soak found.
+
+Fix: derive the detached origin from `resolve_recipient_last_known`, the
+same record `handle_report` uses, and keep the zero pid for panes that
+genuinely cannot be placed. The daemon still derives the origin itself,
+so nothing about the trust boundary moves.
+
+## F64. codex paints a blank row below the composer, and the layout did not declare it
+
+MEASURED, from rows 36 to 38 of `codex_pasted_chip_plain.txt` and
+`codex_pasted_chip_esc.txt`, which are the same capture in both forms:
+
+```
+36  › [Pasted Content 2828 chars]
+37
+38    gpt-5.6-sol high · /private/tmp/... · ...
+```
+
+Row 37 is blank in both forms, with no SGR at all in the escaped one. The
+shipped `composer_trailer_regex` listed only the model row, so a
+raw-wrapped codex sentinel produced a suffix of [blank, model] whose
+first row matched nothing in the layout, and `sentinel_proof` refused.
+Correct behaviour for an undeclared row, and it left codex with no
+sentinel path: every raw-wrapped delivery to it went to
+attention_required.
+
+The fix declares the blank as layout entry 0, with the required prefix
+raised to 2. Filtering blank rows out instead would have been the wrong
+repair in the same way for both vendors: an undeclared blank after the
+sentinel is exactly what a truncated capture looks like, and that
+refusal is load-bearing (`a_blank_row_after_the_sentinel_fails_closed`).
+
+What is NOT proven, and matters for terminality: no real raw-wrap capture off
+codex exists in this tree. The regression
+(`a_codex_raw_wrap_verifies_through_its_measured_blank_separator`) uses
+the real chrome rows verbatim in both forms and synthesizes only the
+composer row. It proves the declared layout matches what codex paints
+below the composer. It does not prove what codex does to a long paste,
+including whether continuation rows carry leading indentation, which
+would change whether the sentinel is a whole row. That needs a capture
+off a live codex.
+
+CORRECTED 2026-08-21. F65 adds the missing live Codex 0.149.0 raw-wrap
+capture and proves its continuation indentation and styled trailer against
+the generic structural extractor. The paragraph above records the evidence
+boundary when F64 was written; it is no longer the current boundary.
+
+## F65. Whole-composer clearing is measured on Claude and Codex only
+
+Measured 2026-08-21 on macOS with tmux 3.6a, Claude Code 2.1.239,
+Codex CLI 0.149.0, and Antigravity CLI 1.1.18. Each probe ran in its own
+scratch tmux session under
+`/private/tmp/cyclops-attention-resolution`. The trust prompts were
+accepted. Probe payloads were staged but never submitted to a model.
+
+One `C-c` cleared both a visible three-line payload and a collapsed
+92-line paste on Claude and Codex. The pane process remained alive. The
+candidate sequence `C-e C-u` was unsafe on all three CLIs because it
+removed only the last logical line and left the header and body staged.
+Antigravity also kept the staged payload after `C-c`, `Escape`,
+`C-a C-k`, and `Home C-k`. It therefore has no shipped clear sequence.
+Cursor was not installed and remains unmeasured.
+
+`tmux capture-pane -e -J` reconstructed Claude and Codex physical wraps
+as logical rows. Both use two spaces before later logical composer lines,
+so removing the measured prompt row and continuation prefix reproduced
+the exact normalized `render_payload` bytes, including the terminal
+sentinel. Antigravity hard-wraps the long line into separate padded rows
+inside the application, so tmux has no physical-wrap marker to join.
+Its underlying composer bytes cannot be reconstructed from this capture.
+
+The current captures also exposed three stale layout assumptions in the
+existing manifest data:
+
+- Claude 2.1.239 can paint `⏵⏵ auto mode on (shift+tab to cycle)` below
+  the composer. The old optional trailer row recognized only the `⏸`
+  form.
+- Codex 0.149.0 emits an SGR reset before its blank separator and status
+  row.
+- Codex 0.149.0 carries the composer background SGR before its collapsed
+  chip and may reset the chip color on the next row.
+
+The minimized escaped fixtures preserve the measured composer and trailer
+bytes. Codex fixtures use lossless hex text because their measured captures
+contain meaningful trailing cells; each hash below covers the decoded bytes:
+
+- `claude_raw_composer_2_1_239_esc.txt`, sha256
+  `0410f48937a9793fa75ff15d6126780f48a3da7f41122c853d4c30240d92cf4c`
+- `codex_raw_composer_0_149_0_esc.hex`, decoded sha256
+  `00e3ad2daa9fcf5c0e5482fbe9232597af5eff546f72b811e2d918cc6bbd1f7f`
+- `claude_collapsed_chip_2_1_239_esc.txt`, sha256
+  `43d85f35dffa75a1ebc6ec38c02a18a4a4d05f2a6bb7c803429c30acae6d578d`
+- `codex_collapsed_chip_0_149_0_esc.hex`, decoded sha256
+  `a9cd65669abafef5c4ac149e92a06a5b5b575d61fc0ef508bf4d1070d7a44ed3`
+
+A collapsed chip proves that hidden bytes exist, not what those bytes are.
+The structural extractor reports that distinction and never reconstructs
+content from a count or chip label. Antigravity and Cursor report the
+separate unsupported capability. Neither result permits a terminal action.
+
+## Manifest version evidence snapshot, 2026-08-22
+
+Verified locally 2026-08-22. The shipped `version_tested` values still match
+their authoritative full-ruleset fixtures, and an automated parity test now
+keeps each claim tied to that fixture. Current installed versions are newer:
+
+| Vendor | `version_tested` and fixture | Installed | Remaining evidence gap |
+| --- | --- | --- | --- |
+| Claude | 2.1.221 | 2.1.239 | Complete current idle, working, staged, modal, and quota matrix |
+| Codex | 0.147.0 | 0.149.0 | Complete current matrix and live hook payload capture |
+| Antigravity | 1.1.11 | 1.1.18 | Complete current matrix and exact composer recovery evidence |
+| Cursor | 2026.07.23-e383d2b | unavailable | Installed current binary, complete matrix, and paired start and end hook payloads |
+
+The `claude_raw_composer_2_1_239_esc.txt` and
+`codex_raw_composer_0_149_0_esc.hex` captures prove only the extraction and
+clearing behavior they measured. They do not promote the whole ruleset's
+version claim. Cursor's manifest prose records one observed generation id
+pair, but no raw paired hook payload fixture is checked in. Cursor therefore
+keeps `turn_key_fields` empty instead of treating prose or field names as
+correlation proof.
+
+## F66. The isolated stage-and-clear soak passed every installed vendor lane
+
+MEASURED 2026-08-22 on macOS with tmux 3.6a. Commit `8a93ace` produced the
+reported results. The safe opt-in harness is frozen on branch
+`evidence-harness-final` at `876795d`; intermediate correction `0d47f57` and
+the branch tip make the live vendor run explicit and ignored by ordinary
+tests. The checked result is
+`validation/raw/soak/stage_and_clear_soak_report.json`.
+
+Each installed vendor ran 100 generated payloads at 60 and 100 columns. The
+corpus covered short text, Unicode, structured blank lines, code fences, long
+unbroken content, and long multiline bodies. Results were:
+
+| Vendor | Exact visible | Anchored trailer | Collapsed chip | Clean clears | Failures |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Codex 0.149.0 | 80 | 0 | 20 | 100 | 0 |
+| Claude Code 2.1.239 | 0 | 0 | 100 | 100 | 0 |
+| Antigravity 1.1.18 | 0 | 80 | 20 | 100 | 0 |
+
+Cursor was not installed and remains `UNAVAILABLE_OFFLINE_GATE`; deterministic
+fixtures do not replace the current-version live requirement. The harness
+proved staging verification and clean teardown only. It deliberately did not
+submit turns or claim a submitted receipt, so those guarantees come from the
+separate delivery and receipt suites. The harness stays on its evidence branch
+because its live vendor launches and dated artifact rewrite are opt-in
+validation operations, not ordinary repository tests.
+
+## F67. Application-wrapped doorbells cannot pass exact staging proof
+
+MEASURED 2026-08-22 on macOS with tmux 3.6a and Claude Code 2.1.239. The
+installed `14dfc91` daemon wrote its 129-character verbose doorbell to a
+125-column Claude pane. Claude rendered the input as a prompt row plus a
+continuation row. `tmux capture-pane -J` did not join the application-created
+break. Strict exact-row verification therefore withheld Enter and opened one
+`verify_failed` attention attempt. No message body reached the pane.
+
+The earlier stage-and-clear soak did not exercise this representation. Its
+Claude trials all used collapsed chips, with zero visible exact doorbells.
+Reconstructing a wrapped line would be unsafe because the capture cannot
+distinguish application wrapping from a newline typed by a person at the same
+boundary.
+
+The current doorbell is `cyclops inbox claim <id>`. It is 54 characters with a
+full generated message id and fits beside a two-cell prompt in the validated
+60-column lane. The Writing fact keeps transport `doorbell` and records
+`doorbell_format: 1`. Missing format selects the legacy verbose bytes. Unknown
+numeric formats replay but cannot authorize an attention recovery action.
+
+The first installed candidate exposed a second boundary in the same live pane.
+The compact row stayed on one physical line, but Claude truncated its required
+status trailer. Before a turn it ended at `1000K…`; after a turn it ended at
+`7d: …`. Resizing that temporary pane measured stable styled prefixes at 60,
+80, 100, and 125 columns. Exact verification failed closed for every undeclared
+shape. The Claude manifest now accepts the bounded model-and-effort prefix plus
+its styled truncated field while retaining full-row matching, escaped-style
+proof, and both required trailer rows.
+
+The final installed-candidate check exposed the inverse layout problem on Codex
+0.149.0. The active spinner was the ninth non-empty row because a queued bridge
+message occupied the eight rows below it, so the bounded plain-text working rule
+could not see it and status failed closed to unknown. Twenty title samples
+captured the complete ten-frame Braille cycle while active; the same-version
+idle title had no prefix. A separate title rule now recognizes only that exact
+cycle. The screen window remains narrow, and old static titles retain the
+existing screen path.

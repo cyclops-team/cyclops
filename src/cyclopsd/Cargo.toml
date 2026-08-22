@@ -19,6 +19,7 @@ cyclops-proto.workspace = true
 cyclops-manifest.workspace = true
 cyclops-tmux.workspace = true
 cyclops-ledger.workspace = true
+cyclops-state.workspace = true
 # The pane border chrome is painted from the same semantic tokens the CLI
 # and the stream paint from, so a theme edit moves all three together.
 cyclops-theme.workspace = true

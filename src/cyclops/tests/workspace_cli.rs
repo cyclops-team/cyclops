@@ -9,6 +9,7 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -43,8 +44,256 @@ fn cyclops(home: &Path, args: &[&str]) -> Output {
 
 /// `cyclops` with `start` allowed to launch a daemon, for the one test
 /// that is about that.
-fn cyclops_with_daemon(home: &Path, args: &[&str]) -> Output {
-    cyclops_raw(home, args, false)
+/// Owns the daemon a test starts, and proves it is gone before removing
+/// the scratch home.
+///
+/// Armed before the daemon can exist: a guard armed after the assertions
+/// only runs when they pass. Identity is the daemon's own pid plus kernel
+/// birth, captured between two matching status reads. The home is kept
+/// when exit cannot be proven, because it is the only evidence of which
+/// run leaked.
+struct DaemonHome {
+    home: PathBuf,
+    /// Plain ownership: a guard is local to one scope and never shared,
+    /// so a lock here would only add a way for teardown to fail.
+    pid: Option<Daemon>,
+}
+
+impl DaemonHome {
+    fn new(home: &Path) -> DaemonHome {
+        DaemonHome {
+            home: home.to_path_buf(),
+            pid: None,
+        }
+    }
+
+    /// Record who the daemon is, before any assertion runs.
+    ///
+    /// Reads the exact `pid` field from `--json`; the human status line
+    /// carries other numbers. Birth comes with it, because a pid alone is
+    /// a number the kernel reuses.
+    /// `by` is the caller's own deadline, and every subprocess below is
+    /// capped at what remains of it. Per-call timeouts compose: two ten
+    /// second asks inside a thirty second loop is a seventy second wait
+    /// wearing a thirty second label.
+    fn record_pid(&mut self, by: std::time::Instant) {
+        self.pid = next_identity(
+            self.pid.take(),
+            |d| birth_of(d.pid) == Some(d.birth),
+            || {
+                let (pid, boot_id) = self.ask(by)?;
+                let birth = birth_of(pid)?;
+                // Asked again AFTER the birth read, and both answers must
+                // name the same pid and run: otherwise a daemon can exit
+                // and a replacement take its pid between the two reads,
+                // arming this guard against the wrong process.
+                (self.ask(by) == Some((pid, boot_id.clone()))).then_some(Daemon {
+                    pid,
+                    birth,
+                    boot_id,
+                })
+            },
+        );
+    }
+
+    /// The daemon's own pid and run id, or None when nothing answers.
+    fn ask(&self, by: std::time::Instant) -> Option<(u32, String)> {
+        let left = by.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        let text = cyclops_bounded(&self.home, &["daemon", "status", "--json"], left)?;
+        let parsed: serde_json::Value = serde_json::from_str(&text).ok()?;
+        Some((
+            parsed.get("pid")?.as_u64()? as u32,
+            parsed.get("boot_id")?.as_str()?.to_string(),
+        ))
+    }
+
+    fn recorded(&self) -> Option<Daemon> {
+        self.pid.clone()
+    }
+
+    /// Is the exact process this guard recorded still alive?
+    ///
+    /// Birth alone, and deliberately: a daemon can outlive its socket,
+    /// and that IS the leak. Whether it still answers is a different
+    /// question, already settled by the bracketed capture that recorded
+    /// it, and asking again would spend another subprocess to learn less.
+    fn alive(&self) -> bool {
+        self.recorded()
+            .is_some_and(|d| birth_of(d.pid) == Some(d.birth))
+    }
+}
+
+/// Which identity a capture should end up owning.
+///
+/// A still-live recorded process WINS: it needs no recapture, and
+/// recapturing would hand ownership to whatever the home reports now
+/// while the recorded one is still running. Only once that exact birth
+/// is dead does the reported daemon take its place, and a capture that
+/// fails then leaves nothing behind rather than a dead predecessor
+/// standing in for whatever is live.
+///
+/// Split out so the rule is testable without a daemon.
+fn next_identity(
+    prior: Option<Daemon>,
+    live: impl Fn(&Daemon) -> bool,
+    reported: impl FnOnce() -> Option<Daemon>,
+) -> Option<Daemon> {
+    match prior.filter(live) {
+        Some(alive) => Some(alive),
+        None => reported(),
+    }
+}
+
+/// One process, told apart from whatever inherits its number later.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Daemon {
+    pid: u32,
+    /// Kernel start time, microseconds. Compared, never interpreted.
+    birth: u64,
+    /// The daemon's own run identity, so the bracket below proves the
+    /// SAME daemon answered twice rather than a replacement.
+    boot_id: String,
+}
+
+/// Kernel start time of a pid, microseconds, or None when it is gone.
+/// Second-resolution sources alias two processes inside one second,
+/// which is the aliasing this identity exists to prevent.
+#[cfg(target_os = "macos")]
+fn birth_of(pid: u32) -> Option<u64> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            size,
+        )
+    };
+    if rc != size {
+        return None;
+    }
+    Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+}
+
+#[cfg(target_os = "linux")]
+fn birth_of(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = stat.rsplit_once(')')?.1;
+    after.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn birth_of(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Wait for a child with a deadline, killing and reaping it if it
+/// overruns. None means it did not finish in time.
+///
+/// Every wait in this harness goes through here: a blocking `output()`
+/// in an ownership path outlives the deadline meant to bound it.
+fn wait_bounded(
+    mut child: std::process::Child,
+    within: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// A cyclops CLI call that cannot outlive its deadline. Only a complete,
+/// successful run answers; a timeout is killed, reaped, and reported as
+/// nothing.
+fn cyclops_bounded(home: &Path, args: &[&str], within: std::time::Duration) -> Option<String> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cyclops"))
+        .env("CYCLOPS_HOME", home)
+        .env("NO_COLOR", "1")
+        .env_remove("CYCLOPS_THEME")
+        .env_remove("TMUX")
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut out = child.stdout.take()?;
+    let reader = thread::spawn(move || {
+        let mut buf = String::new();
+        use std::io::Read as _;
+        let _ = out.read_to_string(&mut buf);
+        buf
+    });
+    let status = wait_bounded(child, within)?;
+    let text = reader.join().ok()?;
+    status.success().then_some(text)
+}
+
+impl Drop for DaemonHome {
+    fn drop(&mut self) {
+        let daemon = self.pid.clone();
+        if self.home.join("sock").exists() {
+            if let Ok(child) = Command::new(env!("CARGO_BIN_EXE_cyclops"))
+                .env("CYCLOPS_HOME", &self.home)
+                .env("NO_COLOR", "1")
+                .args(["daemon", "stop"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                wait_bounded(child, std::time::Duration::from_secs(5));
+            }
+        }
+        for _ in 0..50 {
+            if !self.home.join("sock").exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // Exact-pid fallback, and only while that pid is still the
+        // daemon: signalling a number the kernel has since handed to
+        // something else is the bug this whole session is about.
+        if let Some(d) = &daemon {
+            if birth_of(d.pid) == Some(d.birth) {
+                // Direct signal: another external command inside Drop is
+                // another unbounded wait.
+                unsafe { libc::kill(d.pid as i32, libc::SIGTERM) };
+                for _ in 0..50 {
+                    if birth_of(d.pid) != Some(d.birth) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+        // Only once the exact process is proven gone. A guard that never
+        // learned an identity has proven nothing and keeps the home.
+        let gone = daemon
+            .as_ref()
+            .is_some_and(|d| birth_of(d.pid) != Some(d.birth));
+        if gone {
+            let _ = fs::remove_dir_all(&self.home);
+        } else {
+            eprintln!(
+                "LEAK: daemon still up for {}; home kept as evidence",
+                self.home.display()
+            );
+        }
+    }
 }
 
 /// `no_daemon` adds `--no-daemon` to a `start`, because these tests are
@@ -98,6 +347,79 @@ fn cyclops_in_user_home(home: &Path, user: &Path, env: &[(&str, &str)], args: &[
         .args(&argv)
         .output()
         .expect("run cyclops")
+}
+
+fn shipped_skill() -> Vec<u8> {
+    fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/cyclops/SKILL.md"))
+        .expect("read shipped skill")
+}
+
+fn released_skill_at(commit: &str) -> Option<Vec<u8>> {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let object = format!("{commit}:skills/cyclops/SKILL.md");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["show", &object])
+        .output()
+        .ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TreeEntry {
+    path: PathBuf,
+    kind: &'static str,
+    mode: u32,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+    body: Vec<u8>,
+}
+
+fn tree_snapshot(root: &Path) -> Vec<TreeEntry> {
+    fn walk(root: &Path, path: &Path, entries: &mut Vec<TreeEntry>) {
+        let metadata = fs::symlink_metadata(path).expect("tree metadata");
+        let kind = if metadata.is_dir() {
+            "dir"
+        } else if metadata.is_file() {
+            "file"
+        } else if metadata.file_type().is_symlink() {
+            "symlink"
+        } else {
+            "other"
+        };
+        entries.push(TreeEntry {
+            path: path
+                .strip_prefix(root)
+                .expect("path under root")
+                .to_path_buf(),
+            kind,
+            mode: metadata.mode(),
+            len: metadata.len(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+            body: if metadata.is_file() {
+                fs::read(path).expect("tree file")
+            } else {
+                Vec::new()
+            },
+        });
+        if metadata.is_dir() {
+            let mut children: Vec<PathBuf> = fs::read_dir(path)
+                .expect("tree directory")
+                .map(|entry| entry.expect("tree entry").path())
+                .collect();
+            children.sort();
+            for child in children {
+                walk(root, &child, entries);
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    walk(root, root, &mut entries);
+    entries
 }
 
 /// Panes of a session in position order, as tmux reports them.
@@ -438,10 +760,539 @@ fn wire_hooks_consent_is_recorded_only_when_given() {
     );
     assert!(out.status.success(), "{out:?}");
     assert!(marker.is_file(), "consent was not recorded");
-    assert!(
-        !user.join(".claude").exists(),
-        "setup invented a vendor home"
+    for path in [
+        user.join(".claude"),
+        user.join(".codex"),
+        user.join(".cursor"),
+        user.join(".agents"),
+        user.join(".gemini"),
+    ] {
+        assert!(!path.exists(), "setup invented {}", path.display());
+    }
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&user);
+}
+
+#[test]
+fn setup_seeds_each_installed_consumer_at_its_canonical_skill_path() {
+    let home = scratch_home("ws-skills-fresh");
+    let user = scratch_home("ws-skills-fresh-user");
+    fs::create_dir_all(user.join(".claude")).expect("create Claude home");
+    fs::create_dir_all(user.join(".codex")).expect("create Codex home");
+    fs::create_dir_all(user.join(".gemini/antigravity-cli")).expect("create AGY home");
+
+    let out = cyclops_in_user_home(
+        &home,
+        &user,
+        &[],
+        &["start", "--setup-only", "--wire-hooks"],
     );
+    assert!(out.status.success(), "{out:?}");
+
+    let expected = shipped_skill();
+    for path in [
+        user.join(".claude/skills/cyclops/SKILL.md"),
+        user.join(".agents/skills/cyclops/SKILL.md"),
+        user.join(".gemini/antigravity-cli/skills/cyclops/SKILL.md"),
+    ] {
+        assert_eq!(
+            fs::read(&path).expect("seeded skill"),
+            expected,
+            "{}",
+            path.display()
+        );
+    }
+    for path in [
+        user.join(".codex/skills/cyclops/SKILL.md"),
+        user.join(".gemini/skills/cyclops/SKILL.md"),
+    ] {
+        assert!(!path.exists(), "unexpected duplicate at {}", path.display());
+    }
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&user);
+}
+
+#[test]
+fn agy_only_setup_wires_hooks_without_seeding_the_shared_skill() {
+    let home = scratch_home("ws-skills-agy-only");
+    let user = scratch_home("ws-skills-agy-only-user");
+    fs::create_dir_all(user.join(".gemini/antigravity-cli")).expect("create AGY home");
+
+    let out = cyclops_in_user_home(
+        &home,
+        &user,
+        &[],
+        &["start", "--setup-only", "--wire-hooks"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        user.join(".gemini/antigravity-cli/skills/cyclops/SKILL.md")
+            .is_file(),
+        "AGY skill is missing"
+    );
+    assert!(
+        user.join(".agents/hooks.json").is_file(),
+        "AGY hooks are missing"
+    );
+    assert!(
+        !user.join(".agents/skills").exists(),
+        "AGY triggered the Codex and Cursor skill"
+    );
+
+    let check = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "check"]);
+    assert!(check.status.success(), "{check:?}");
+    let report: Value = serde_json::from_slice(&check.stdout).expect("setup check JSON");
+    assert_eq!(report["complete"], true, "{report}");
+    assert_eq!(report["consumers"][3]["hook"]["state"], "current");
+    assert_eq!(report["consumers"][3]["hook"]["required_receipt_tier"], 2);
+    assert_eq!(report["consumers"][3]["hook"]["ack_capable"], false);
+    assert_eq!(report["consumers"][3]["hook"]["receipt_ready"], true);
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&user);
+}
+
+#[test]
+fn codex_and_cursor_share_one_skill_seed() {
+    let home = scratch_home("ws-skills-shared");
+    let user = scratch_home("ws-skills-shared-user");
+    fs::create_dir_all(user.join(".codex")).expect("create Codex home");
+    fs::create_dir_all(user.join(".cursor")).expect("create Cursor home");
+
+    let out = cyclops_in_user_home(
+        &home,
+        &user,
+        &[],
+        &["--json", "start", "--setup-only", "--wire-hooks"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let report: Value = serde_json::from_slice(&out.stdout).expect("setup JSON");
+    let skills = report["skill"].as_array().expect("skill results");
+    assert_eq!(skills.len(), 1, "{report}");
+    assert_eq!(
+        skills[0]["path"],
+        user.join(".agents/skills/cyclops/SKILL.md")
+            .display()
+            .to_string()
+    );
+    assert!(!user.join(".codex/skills").exists());
+    assert!(!user.join(".cursor/skills").exists());
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&user);
+}
+
+#[test]
+fn relocated_codex_home_drives_wiring_seeding_and_setup_check() {
+    let home = scratch_home("ws-skills-relocated-codex");
+    let user = scratch_home("ws-skills-relocated-codex-user");
+    let codex_home = user.join("vendor-config/codex");
+    fs::create_dir_all(&codex_home).expect("create relocated Codex home");
+    let codex_home_text = codex_home.to_str().expect("UTF-8 scratch path");
+    let env = [("CODEX_HOME", codex_home_text)];
+
+    let out = cyclops_in_user_home(
+        &home,
+        &user,
+        &env,
+        &["start", "--setup-only", "--wire-hooks"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert!(codex_home.join("hooks.json").is_file());
+    assert!(user.join(".agents/skills/cyclops/SKILL.md").is_file());
+    assert!(!user.join(".codex").exists());
+    assert!(!codex_home.join("skills").exists());
+
+    let check = cyclops_in_user_home(&home, &user, &env, &["--json", "setup", "check"]);
+    assert!(check.status.success(), "{check:?}");
+    let report: Value = serde_json::from_slice(&check.stdout).expect("setup check JSON");
+    let codex = &report["consumers"][1];
+    assert_eq!(codex["installed"], true, "{codex}");
+    assert_eq!(
+        codex["hook"]["path"],
+        codex_home.join("hooks.json").display().to_string(),
+        "{codex}"
+    );
+    assert_eq!(codex["hook"]["required_receipt_tier"], 1, "{codex}");
+    assert_eq!(codex["hook"]["ack_capable"], true, "{codex}");
+    assert_eq!(codex["hook"]["receipt_ready"], true, "{codex}");
+    assert_eq!(
+        codex["skill"]["path"],
+        user.join(".agents/skills/cyclops/SKILL.md")
+            .display()
+            .to_string(),
+        "{codex}"
+    );
+    assert_eq!(codex["skill"]["state"], "current", "{codex}");
+    assert_eq!(codex["mailbox"]["doorbell_ready"], true, "{codex}");
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&user);
+}
+
+#[test]
+fn a_shared_skill_destination_does_not_count_as_an_installed_consumer() {
+    let home = scratch_home("ws-skills-no-consumer");
+    let user = scratch_home("ws-skills-no-consumer-user");
+    let destination = user.join(".agents/skills/cyclops/SKILL.md");
+    fs::create_dir_all(destination.parent().expect("skill parent")).expect("create destination");
+    fs::write(&destination, b"# existing shared skill\n").expect("write existing skill");
+
+    let out = cyclops_in_user_home(
+        &home,
+        &user,
+        &[],
+        &["--json", "start", "--setup-only", "--wire-hooks"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let report: Value = serde_json::from_slice(&out.stdout).expect("setup JSON");
+    assert_eq!(report["skill"].as_array().expect("skill results").len(), 0);
+    assert_eq!(
+        fs::read(&destination).expect("read existing skill"),
+        b"# existing shared skill\n"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&user);
+}
+
+#[test]
+fn setup_preserves_edits_at_every_canonical_skill_path() {
+    let home = scratch_home("ws-skills-edited");
+    let user = scratch_home("ws-skills-edited-user");
+    fs::create_dir_all(user.join(".claude")).expect("create Claude home");
+    fs::create_dir_all(user.join(".cursor")).expect("create Cursor home");
+    fs::create_dir_all(user.join(".gemini/antigravity-cli")).expect("create AGY home");
+    let args = ["start", "--setup-only", "--wire-hooks"];
+    assert!(cyclops_in_user_home(&home, &user, &[], &args)
+        .status
+        .success());
+
+    let paths = [
+        user.join(".claude/skills/cyclops/SKILL.md"),
+        user.join(".agents/skills/cyclops/SKILL.md"),
+        user.join(".gemini/antigravity-cli/skills/cyclops/SKILL.md"),
+    ];
+    for (index, path) in paths.iter().enumerate() {
+        fs::write(path, format!("# operator edit {index}\n")).expect("edit skill");
+    }
+
+    assert!(cyclops_in_user_home(&home, &user, &[], &args)
+        .status
+        .success());
+    for (index, path) in paths.iter().enumerate() {
+        assert_eq!(
+            fs::read_to_string(path).expect("read edited skill"),
+            format!("# operator edit {index}\n")
+        );
+    }
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&user);
+}
+
+#[test]
+fn setup_upgrades_unedited_skill_bytes_from_a_previous_release() {
+    let Some(previous) = released_skill_at("a9ba6634f87e14246969fef3c89e704314a1e234") else {
+        return;
+    };
+    assert_eq!(fnv64(&previous), "7ebc1453af11b931");
+
+    let home = scratch_home("ws-skills-upgrade");
+    let user = scratch_home("ws-skills-upgrade-user");
+    let paths = [
+        user.join(".claude/skills/cyclops/SKILL.md"),
+        user.join(".agents/skills/cyclops/SKILL.md"),
+        user.join(".gemini/antigravity-cli/skills/cyclops/SKILL.md"),
+    ];
+    fs::create_dir_all(user.join(".claude")).expect("create Claude home");
+    fs::create_dir_all(user.join(".codex")).expect("create Codex home");
+    fs::create_dir_all(user.join(".gemini/antigravity-cli")).expect("create AGY home");
+    for path in &paths {
+        fs::create_dir_all(path.parent().expect("skill parent")).expect("create skill parent");
+        fs::write(path, &previous).expect("write previous skill");
+    }
+
+    let out = cyclops_in_user_home(
+        &home,
+        &user,
+        &[],
+        &["start", "--setup-only", "--wire-hooks"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let current = shipped_skill();
+    assert_ne!(previous, current);
+    for path in &paths {
+        assert_eq!(fs::read(path).expect("read upgraded skill"), current);
+    }
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&user);
+}
+
+#[test]
+fn setup_check_reports_an_incomplete_empty_home_without_writing() {
+    let home = scratch_home("ws-setup-check-empty");
+    let user = scratch_home("ws-setup-check-empty-user");
+    assert!(fs::read_dir(&home).expect("read home").next().is_none());
+    assert!(fs::read_dir(&user)
+        .expect("read user home")
+        .next()
+        .is_none());
+
+    let out = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "check"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let report: Value = serde_json::from_slice(&out.stdout).expect("setup check JSON");
+    assert_eq!(report["complete"], false, "{report}");
+    let consumers = report["consumers"].as_array().expect("consumer rows");
+    assert_eq!(
+        consumers
+            .iter()
+            .map(|row| row["id"].as_str().expect("consumer id"))
+            .collect::<Vec<_>>(),
+        ["claude", "codex", "cursor", "agy"]
+    );
+    assert_eq!(
+        consumers[0]["skill"]["path"],
+        user.join(".claude/skills/cyclops/SKILL.md")
+            .display()
+            .to_string()
+    );
+    assert_eq!(
+        consumers[1]["skill"]["path"],
+        user.join(".agents/skills/cyclops/SKILL.md")
+            .display()
+            .to_string()
+    );
+    assert_eq!(consumers[2]["skill"]["path"], consumers[1]["skill"]["path"]);
+    assert_eq!(
+        consumers[3]["skill"]["path"],
+        user.join(".gemini/antigravity-cli/skills/cyclops/SKILL.md")
+            .display()
+            .to_string()
+    );
+    assert!(fs::read_dir(&home).expect("read home").next().is_none());
+    assert!(fs::read_dir(&user)
+        .expect("read user home")
+        .next()
+        .is_none());
+}
+
+#[test]
+fn setup_check_reports_complete_setup_and_changes_no_metadata() {
+    let home = scratch_home("ws-setup-check-complete");
+    let user = scratch_home("ws-setup-check-complete-user");
+    for consumer in [
+        user.join(".claude"),
+        user.join(".codex"),
+        user.join(".cursor"),
+        user.join(".gemini/antigravity-cli"),
+    ] {
+        fs::create_dir_all(consumer).expect("create consumer home");
+    }
+    let setup = ["start", "--setup-only", "--wire-hooks"];
+    assert!(cyclops_in_user_home(&home, &user, &[], &setup)
+        .status
+        .success());
+
+    let home_before = tree_snapshot(&home);
+    let user_before = tree_snapshot(&user);
+    let out = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "check"]);
+    assert!(out.status.success(), "{out:?}");
+    let report: Value = serde_json::from_slice(&out.stdout).expect("setup check JSON");
+    assert_eq!(report["complete"], true, "{report}");
+    let consumers = report["consumers"].as_array().expect("consumer rows");
+    for consumer in consumers {
+        assert_eq!(consumer["installed"], true, "{consumer}");
+        assert_eq!(consumer["manifest"]["state"], "current", "{consumer}");
+        assert_eq!(consumer["skill"]["state"], "current", "{consumer}");
+        assert_eq!(consumer["mailbox"]["doorbell_ready"], true, "{consumer}");
+        assert_eq!(consumer["mailbox"]["transport"], "doorbell", "{consumer}");
+    }
+    assert_eq!(consumers[0]["hook"]["state"], "on_launch");
+    assert_eq!(consumers[0]["hook"]["required_receipt_tier"], 1);
+    assert_eq!(consumers[0]["hook"]["ack_capable"], true);
+    assert_eq!(consumers[0]["hook"]["receipt_ready"], true);
+    assert_eq!(consumers[1]["hook"]["state"], "current");
+    assert_eq!(consumers[1]["hook"]["required_receipt_tier"], 1);
+    assert_eq!(consumers[1]["hook"]["ack_capable"], true);
+    assert_eq!(consumers[1]["hook"]["receipt_ready"], true);
+    assert_eq!(consumers[2]["hook"]["state"], "current");
+    assert_eq!(consumers[2]["hook"]["required_receipt_tier"], 1);
+    assert_eq!(consumers[2]["hook"]["ack_capable"], true);
+    assert_eq!(consumers[2]["hook"]["receipt_ready"], true);
+    assert_eq!(consumers[3]["hook"]["state"], "current");
+    assert_eq!(consumers[3]["hook"]["required_receipt_tier"], 2);
+    assert_eq!(consumers[3]["hook"]["ack_capable"], false);
+    assert_eq!(consumers[3]["hook"]["receipt_ready"], true);
+
+    let human = cyclops_in_user_home(&home, &user, &[], &["--plain", "setup", "check"]);
+    assert!(human.status.success(), "{human:?}");
+    let human = stdout(&human);
+    assert!(human.contains("required tier 1 · ack capable"), "{human}");
+    assert!(human.contains("required tier 2"), "{human}");
+    assert_eq!(
+        tree_snapshot(&home),
+        home_before,
+        "setup check wrote the Cyclops home"
+    );
+    assert_eq!(
+        tree_snapshot(&user),
+        user_before,
+        "setup check wrote the user home"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&user);
+}
+
+#[test]
+fn setup_check_refuses_tier_one_manifests_without_ack_capability() {
+    for (id, consumer_dir, index) in [
+        ("claude", ".claude", 0usize),
+        ("codex", ".codex", 1usize),
+        ("cursor", ".cursor", 2usize),
+    ] {
+        let home = scratch_home(&format!("ws-setup-check-no-ack-{id}"));
+        let user = scratch_home(&format!("ws-setup-check-no-ack-{id}-user"));
+        fs::create_dir_all(user.join(consumer_dir)).expect("create consumer home");
+        let setup = ["start", "--setup-only", "--wire-hooks"];
+        assert!(cyclops_in_user_home(&home, &user, &[], &setup)
+            .status
+            .success());
+
+        let manifest_path = home.join(format!("manifests/{id}.toml"));
+        let body = fs::read_to_string(&manifest_path).expect("read seeded manifest");
+        let without_ack = body
+            .lines()
+            .filter(|line| {
+                let line = line.trim_start();
+                !line.starts_with("ack = ") && !line.starts_with("ack_payload_field = ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&manifest_path, without_ack).expect("remove ack capability");
+
+        let out = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "check"]);
+        assert_eq!(out.status.code(), Some(1), "{id}: {out:?}");
+        let report: Value = serde_json::from_slice(&out.stdout).expect("setup check JSON");
+        let consumer = &report["consumers"][index];
+        assert_eq!(consumer["manifest"]["state"], "edited", "{consumer}");
+        assert_eq!(consumer["hook"]["required_receipt_tier"], 1, "{consumer}");
+        assert_eq!(consumer["hook"]["ack_capable"], false, "{consumer}");
+        assert_eq!(consumer["hook"]["receipt_ready"], false, "{consumer}");
+        assert_eq!(report["complete"], false, "{report}");
+
+        let human = cyclops_in_user_home(&home, &user, &[], &["--plain", "setup", "check"]);
+        assert_eq!(human.status.code(), Some(1), "{id}: {human:?}");
+        assert!(stdout(&human).contains("required tier 1 · ack missing"));
+
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&user);
+    }
+}
+
+#[test]
+fn setup_check_reports_direct_fallback_for_an_edited_claim_skill() {
+    let home = scratch_home("ws-setup-check-edited-mailbox-skill");
+    let user = scratch_home("ws-setup-check-edited-mailbox-skill-user");
+    fs::create_dir_all(user.join(".codex")).expect("create Codex home");
+    let setup = ["start", "--setup-only", "--wire-hooks"];
+    assert!(cyclops_in_user_home(&home, &user, &[], &setup)
+        .status
+        .success());
+    let skill = user.join(".agents/skills/cyclops/SKILL.md");
+    fs::write(&skill, b"operator-owned mailbox instructions\n").expect("edit skill");
+
+    let out = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "check"]);
+    assert!(out.status.success(), "{out:?}");
+    let report: Value = serde_json::from_slice(&out.stdout).expect("setup check JSON");
+    let codex = &report["consumers"][1];
+    assert_eq!(codex["skill"]["state"], "edited", "{codex}");
+    assert_eq!(codex["mailbox"]["doorbell_ready"], false, "{codex}");
+    assert_eq!(codex["mailbox"]["transport"], "direct_payload", "{codex}");
+    assert_eq!(
+        codex["mailbox"]["capability_path"],
+        skill.display().to_string(),
+        "{codex}"
+    );
+
+    let human = cyclops_in_user_home(&home, &user, &[], &["--plain", "setup", "check"]);
+    assert!(stdout(&human).contains("mailbox   direct payload"));
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&user);
+}
+
+#[test]
+fn setup_check_identifies_missing_installed_consumer_files_without_writing() {
+    let home = scratch_home("ws-setup-check-missing");
+    let user = scratch_home("ws-setup-check-missing-user");
+    fs::create_dir_all(user.join(".codex")).expect("create Codex home");
+    fs::write(user.join(".codex/hooks.json"), b"").expect("create empty hooks file");
+    fs::write(
+        home.join("vendor-wiring-consented"),
+        b"test consent marker\n",
+    )
+    .expect("write consent marker");
+
+    let home_before = tree_snapshot(&home);
+    let user_before = tree_snapshot(&user);
+    let out = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "check"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let report: Value = serde_json::from_slice(&out.stdout).expect("setup check JSON");
+    let codex = &report["consumers"][1];
+    assert_eq!(codex["installed"], true, "{codex}");
+    assert_eq!(codex["manifest"]["state"], "missing", "{codex}");
+    assert_eq!(codex["hook"]["state"], "needs_update", "{codex}");
+    assert_eq!(codex["hook"]["required_receipt_tier"], 1, "{codex}");
+    assert_eq!(codex["hook"]["ack_capable"], false, "{codex}");
+    assert_eq!(codex["hook"]["receipt_ready"], false, "{codex}");
+    assert_eq!(codex["skill"]["state"], "missing", "{codex}");
+    assert_eq!(tree_snapshot(&home), home_before);
+    assert_eq!(tree_snapshot(&user), user_before);
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&user);
+}
+
+#[test]
+fn setup_check_does_not_claim_claude_launch_wiring_without_its_manifest_flag() {
+    let home = scratch_home("ws-setup-check-claude-flag");
+    let user = scratch_home("ws-setup-check-claude-flag-user");
+    fs::create_dir_all(user.join(".claude")).expect("create Claude home");
+    let setup = cyclops_in_user_home(
+        &home,
+        &user,
+        &[],
+        &["start", "--setup-only", "--wire-hooks"],
+    );
+    assert!(setup.status.success(), "{setup:?}");
+    let manifest_path = home.join("manifests/claude.toml");
+    let manifest = fs::read_to_string(&manifest_path).expect("read Claude manifest");
+    fs::write(
+        &manifest_path,
+        manifest.replace("settings_flag = \"--settings\"\n", ""),
+    )
+    .expect("edit Claude manifest");
+
+    let home_before = tree_snapshot(&home);
+    let user_before = tree_snapshot(&user);
+    let out = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "check"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let report: Value = serde_json::from_slice(&out.stdout).expect("setup check JSON");
+    let claude = &report["consumers"][0];
+    assert_eq!(claude["manifest"]["state"], "edited", "{claude}");
+    assert_eq!(claude["hook"]["state"], "missing_launch_flag", "{claude}");
+    assert_eq!(claude["hook"]["required_receipt_tier"], 1, "{claude}");
+    assert_eq!(claude["hook"]["ack_capable"], true, "{claude}");
+    assert_eq!(claude["hook"]["receipt_ready"], true, "{claude}");
+    assert_eq!(claude["skill"]["state"], "current", "{claude}");
+    assert_eq!(tree_snapshot(&home), home_before);
+    assert_eq!(tree_snapshot(&user), user_before);
 
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&user);
@@ -509,15 +1360,23 @@ fn a_boot_finishes_the_wiring_for_agent_clis_that_appear_after_install() {
         "the skill never landed: {text}"
     );
     assert!(
+        user.join(".agents/skills/cyclops/SKILL.md").is_file(),
+        "the shared skill never landed: {text}"
+    );
+    assert!(
         user.join(".codex/hooks.json").is_file(),
         "codex hooks never landed: {text}"
     );
     assert!(
-        text.contains("Claude Code appeared since install — placed the cyclops skill at"),
+        text.contains("Claude Code appeared since install: placed the cyclops skill at"),
         "{text}"
     );
     assert!(
-        text.contains("codex appeared since install — wired cyclops hooks in"),
+        text.contains("Codex appeared since install: placed the cyclops skill at"),
+        "{text}"
+    );
+    assert!(
+        text.contains("codex appeared since install: wired cyclops hooks in"),
         "{text}"
     );
 
@@ -1678,15 +2537,25 @@ fn start_starts_a_daemon_when_none_is_running() {
     }
     let t = TmuxServer::new("ws-daemon");
     let home = scratch_home("ws-daemon");
+    // Armed before anything can spawn: every exit from here on, panic
+    // included, takes the daemon down with it.
+    let mut _daemon_home = DaemonHome::new(&home);
     write_config(
         &home,
         &t,
         "sessions = [\"solo\"]\ndefault_workspace = \"solo\"\n",
     );
 
-    let out = cyclops_with_daemon(&home, &["start"]);
-    let text = stdout(&out);
-    assert!(out.status.success(), "{text}");
+    // Every call here is bounded: this is the one test that owns a real
+    // daemon, and a hung CLI would let the runner kill the test before
+    // its guard could run.
+    let secs = std::time::Duration::from_secs(30);
+    let text = cyclops_bounded(&home, &["start"], secs);
+    // Identity first, and regardless of how the start went: a CLI that
+    // stalled after spawning the daemon would otherwise leave teardown
+    // with nothing to signal.
+    _daemon_home.record_pid(std::time::Instant::now() + secs);
+    let text = text.expect("start");
     assert!(text.contains("started cyclopsd"), "{text}");
     assert!(home.join("cyclopsd.log").is_file(), "no log was written");
 
@@ -1701,17 +2570,17 @@ fn start_starts_a_daemon_when_none_is_running() {
     assert!(!text.contains("cyclopsd &"), "{text}");
 
     // A second run finds it and says nothing about starting one.
-    let again = stdout(&cyclops_with_daemon(&home, &["start"]));
+    let again = cyclops_bounded(&home, &["start"], secs).expect("second start");
     assert!(
         !again.contains("started cyclopsd"),
         "started a second: {again}"
     );
 
     // `cyclops daemon status` sees it, and stop takes it down.
-    let status = stdout(&cyclops(&home, &["daemon", "status"]));
+    let status = cyclops_bounded(&home, &["daemon", "status"], secs).expect("status");
     assert!(status.contains("cyclopsd is running"), "{status}");
 
-    let stopped = stdout(&cyclops(&home, &["daemon", "stop"]));
+    let stopped = cyclops_bounded(&home, &["daemon", "stop"], secs).expect("stop");
     assert!(stopped.contains("stopped cyclopsd"), "{stopped}");
     for _ in 0..50 {
         if !home.join("sock").exists() {
@@ -1719,8 +2588,250 @@ fn start_starts_a_daemon_when_none_is_running() {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    let after = stdout(&cyclops(&home, &["daemon", "status"]));
+    let after = cyclops_bounded(&home, &["daemon", "status"], secs).expect("status");
     assert!(after.contains("not running"), "still up: {after}");
+}
 
-    let _ = fs::remove_dir_all(&home);
+/// A capture that fails must not leave a dead predecessor standing in
+/// for whatever is running now.
+///
+/// Trace: the parent records daemon A; A exits and B comes up under the
+/// same home; B's bracket fails transiently. Keeping A means teardown
+/// later proves A gone, calls that a clean exit, and removes the home
+/// while B is still running.
+#[test]
+fn a_dead_recorded_daemon_is_not_kept() {
+    let a = Daemon {
+        pid: 4242,
+        birth: 100,
+        boot_id: "run-a".to_string(),
+    };
+    let b = || {
+        Some(Daemon {
+            pid: 4242,
+            birth: 200,
+            boot_id: "run-b".to_string(),
+        })
+    };
+    // A live recorded process keeps ownership even while the home reports
+    // a different daemon: overwriting it would leave A running with
+    // nobody owning it, and teardown would prove only B exited.
+    assert_eq!(next_identity(Some(a.clone()), |_| true, b), Some(a.clone()));
+    // Dead: the reported daemon takes its place.
+    assert_eq!(next_identity(Some(a.clone()), |_| false, b), b());
+    // Dead, and nothing reported: nothing recorded, so teardown cannot
+    // claim an exit it never observed.
+    assert_eq!(next_identity(Some(a), |_| false, || None), None);
+    assert_eq!(next_identity(None, |_| true, b), b());
+}
+
+/// The guard has to run when the test does NOT: the leak was a daemon
+/// stopped only after every assertion, so one timeout mid-test left it
+/// running.
+#[test]
+fn a_panicking_test_still_takes_its_daemon_down() {
+    if !tmux_available() {
+        return;
+    }
+    if let Ok(home) = std::env::var(LEAK_CHILD) {
+        let hs = std::env::var(LEAK_HANDSHAKE).expect("child needs a handshake dir");
+        leak_child(Path::new(&home), Path::new(&hs));
+        return;
+    }
+    leak_case("ws-panic");
+}
+
+/// One leak case: the child does something fatal to itself, and the
+/// daemon it started has to be gone afterwards.
+///
+/// The component under test runs in a SUBPROCESS so its failure cannot
+/// take the observer with it. That covers a hang as well as a panic: an
+/// in-process guard that wedges in `Drop` never reaches any outer
+/// cleanup.
+fn leak_case(tag: &str) {
+    let t = TmuxServer::new(tag);
+    let home = scratch_home(tag);
+    write_config(
+        &home,
+        &t,
+        "sessions = [\"solo\"]\ndefault_workspace = \"solo\"\n",
+    );
+
+    // The PARENT owns the same scratch home. Ownership cannot depend on
+    // the child's stdout or its exit: if the guard under test hangs, the
+    // child is killed with its pipe undrained, and a parent that learned
+    // the identity only from that pipe would have nothing to clean up.
+    let mut watcher = DaemonHome::new(&home);
+    // A directory of its own, owned by the parent. Inside the daemon home
+    // the child's teardown would delete `seen` before the parent could
+    // read it; beside the home they would survive every failing path.
+    let hs = HandshakeDir::new(&home);
+    let ready = hs.0.join("ready");
+    let go = hs.0.join("go");
+    let abort = hs.0.join("abort");
+    let seen_go = hs.0.join("seen");
+    let _ = fs::remove_file(&ready);
+    let _ = fs::remove_file(&go);
+    let child = Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", "a_panicking_test_still_takes_its_daemon_down"])
+        .args(["--nocapture", "--test-threads", "1"])
+        .env(LEAK_CHILD, &home)
+        .env(LEAK_HANDSHAKE, &hs.0)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the panicking child");
+    // Child::drop neither kills nor waits, so an assertion unwinding
+    // before the wait below would leave this process running.
+    let child = ChildGuard(Some(child));
+
+    // A handshake, not a poll. The child holds still after starting its
+    // daemon, so the parent is guaranteed to observe it: a correct guard
+    // can otherwise tear the daemon down before any poll sees it, and the
+    // test would fail as "never started" for being too good.
+    //
+    // The parent keeps trying to identify the daemon while it waits, so a
+    // child that dies before signalling is still owned. No assertion runs
+    // until the child has been reaped.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        watcher.record_pid(deadline);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let signalled = fs::read_to_string(&ready).unwrap_or_default();
+    watcher.record_pid(deadline);
+    let parent_saw = watcher.recorded();
+    // Both sides identified the daemon independently, and all three parts
+    // have to agree. A marker file plus a later status read would prove
+    // only that SOME daemon was up at some point.
+    // Both halves: the two sides named the same daemon, and that process
+    // is still alive. Text agreement alone would release the child over
+    // an identity that had already gone away.
+    let agreed = parent_saw
+        .as_ref()
+        .is_some_and(|d| signalled.trim() == format!("{} {} {}", d.pid, d.birth, d.boot_id))
+        && watcher.alive();
+    // Two controls, never a kill. Continue asks for the forced panic;
+    // abort asks the child to unwind through its OWN daemon guard. A
+    // child killed outright would skip that guard and orphan the daemon
+    // the parent has just failed to identify, which is the opposite of
+    // what this test is for.
+    let _ = fs::write(if agreed { &go } else { &abort }, "1");
+    let status = wait_bounded(child.take(), std::time::Duration::from_secs(60));
+    assert!(!signalled.is_empty(), "the child never signalled a daemon");
+    assert!(agreed, "the two sides identified different daemons");
+    let Some(status) = status else {
+        panic!("the child never exited: the guard's own teardown hangs");
+    };
+    assert!(
+        seen_go.exists(),
+        "the child never observed continue, so the forced panic was not the case under test"
+    );
+    let Some(d) = parent_saw else {
+        panic!("the parent could not identify the daemon the child started");
+    };
+    // A child that skipped its panic proves nothing.
+    assert!(
+        !status.success(),
+        "the child exited cleanly, so no unwind was exercised"
+    );
+
+    // The exact process has to be gone, and the guard under test is the
+    // only thing that could have done it.
+    let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while birth_of(d.pid) == Some(d.birth) && std::time::Instant::now() < gone_by {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        birth_of(d.pid) != Some(d.birth),
+        "the daemon outlived the test that started it: {d:?}"
+    );
+    assert!(!home.join("sock").exists(), "socket left behind");
+}
+
+/// Owns a spawned child so no unwind leaves it running: `Child` neither
+/// kills nor waits on drop.
+struct ChildGuard(Option<std::process::Child>);
+
+impl ChildGuard {
+    fn take(mut self) -> std::process::Child {
+        self.0.take().expect("child taken once")
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+/// Env var that switches this test binary into the child role.
+const LEAK_CHILD: &str = "CYCLOPS_TEST_LEAK_CHILD";
+/// Where the two sides leave their handshake files.
+const LEAK_HANDSHAKE: &str = "CYCLOPS_TEST_LEAK_HANDSHAKE";
+
+/// Parent-owned handshake directory, removed on every path.
+struct HandshakeDir(PathBuf);
+
+impl HandshakeDir {
+    fn new(home: &Path) -> HandshakeDir {
+        let dir = home.with_extension("handshake");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("handshake dir");
+        HandshakeDir(dir)
+    }
+}
+
+impl Drop for HandshakeDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The child: start a daemon under the guard, report what it started, and
+/// die without cleaning up. Everything after the panic is the guard's job.
+fn leak_child(home: &Path, hs: &Path) {
+    let mut guard = DaemonHome::new(home);
+    let started = cyclops_bounded(home, &["start"], std::time::Duration::from_secs(30));
+    // Identity before the first assertion: a guard that learns nothing
+    // before something fails is the gap itself.
+    guard.record_pid(std::time::Instant::now() + std::time::Duration::from_secs(30));
+    assert!(started.is_some(), "the child could not start a daemon");
+    // Hold still until the parent has taken ownership, then die. The
+    // signal carries the identity this guard armed, so the parent can
+    // prove both sides captured the same run.
+    let armed = guard.recorded().expect("the child guard armed no identity");
+    // Written then renamed, so the parent never observes a half-created
+    // file: `fs::write` creates before it fills, and a reader that
+    // catches that instant sees an empty signal and concludes no daemon
+    // was ever started.
+    let tmp = hs.join("ready.partial");
+    fs::write(
+        &tmp,
+        format!("{} {} {}", armed.pid, armed.birth, armed.boot_id),
+    )
+    .expect("stage ready");
+    fs::rename(&tmp, hs.join("ready")).expect("signal ready");
+    let go = hs.join("go");
+    let abort = hs.join("abort");
+    let by = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !go.exists() && !abort.exists() && std::time::Instant::now() < by {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if abort.exists() {
+        // The parent could not take ownership. Leave the way any ordinary
+        // test leaves: through this child's own daemon guard.
+        return;
+    }
+    if !go.exists() {
+        // A different ending on purpose, so a broken continue path cannot
+        // pass by looking like the case under test.
+        panic!("the parent never released this child");
+    }
+    // Proof this child reached the forced panic through the handshake.
+    fs::write(hs.join("seen"), "go").expect("record continue");
+    panic!("forced: this stands in for a timed-out assertion");
 }
