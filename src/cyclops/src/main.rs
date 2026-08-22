@@ -1317,7 +1317,7 @@ fn cmd_name(
         "label": if args.clear { Value::Null } else { json!(label) },
         "manifest": args.manifest,
     });
-    let result = match c.request("pane.label", params) {
+    let result = match name_request(c, params, args.self_) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{}", copy::client_error(&e, Some(target)));
@@ -1330,6 +1330,28 @@ fn cmd_name(
     }
     println!("{}", render::render_named(&result, style));
     0
+}
+
+/// A shell in a new tmux pane can run before its watcher publishes the pane.
+/// Retrying only `--self` is safe because `TMUX_PANE` cannot change here and
+/// only a missing target is retried.
+fn name_request(c: &mut Client, params: Value, self_target: bool) -> Result<Value, ClientError> {
+    let mut result = c.request("pane.label", params.clone());
+    if !self_target {
+        return result;
+    }
+
+    for delay in [50, 100, 200, 400, 800].map(Duration::from_millis) {
+        if !matches!(
+            &result,
+            Err(ClientError::Server { code, .. }) if code == "no_such_target"
+        ) {
+            break;
+        }
+        std::thread::sleep(delay);
+        result = c.request("pane.label", params.clone());
+    }
+    result
 }
 
 /// cyclops list: the roster, one named agent per row, under a header
