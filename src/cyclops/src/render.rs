@@ -217,6 +217,9 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
     let mut rows: Vec<Row> = Vec::new();
     for (si, sess) in res.sessions.iter().enumerate() {
         for p in &sess.panes {
+            if unmanaged_shell(p) {
+                continue;
+            }
             let (label, adopted) = match &p.agent {
                 Some(a) => (a.clone(), true),
                 None => (p.pane_id.clone(), false),
@@ -314,7 +317,7 @@ fn unknown_rows(res: &StatusResult, style: &Style) -> Vec<String> {
         .sessions
         .iter()
         .flat_map(|s| s.panes.iter())
-        .filter(|p| p.state == AgentState::Unknown)
+        .filter(|p| p.state == AgentState::Unknown && !unmanaged_shell(p))
         .collect();
     let Some(first) = unknown.first() else {
         return Vec::new();
@@ -336,6 +339,15 @@ fn unknown_rows(res: &StatusResult, style: &Style) -> Vec<String> {
             ))
         ),
     ]
+}
+
+/// An ordinary terminal in a watched tmux session is not an unconfigured
+/// agent. Keep it out of the agent roster and its setup guidance.
+fn unmanaged_shell(pane: &PaneStatus) -> bool {
+    pane.agent.is_none()
+        && pane.manifest.is_none()
+        && pane.state == AgentState::Unknown
+        && matches!(pane.current_command.as_str(), "bash" | "fish" | "sh" | "zsh")
 }
 
 /// The roster: one row per named agent, on the same grid as `status`.
@@ -1284,6 +1296,16 @@ mod tests {
         res.sessions[0].panes.pop();
         let got = render_status(&res, &Style::none(), Path::new("/x"));
         assert!(!got.contains("unknown"), "{got}");
+    }
+
+    #[test]
+    fn an_unmanaged_shell_is_not_an_unknown_agent() {
+        let mut res = fixture();
+        let shell = res.sessions[0].panes.last_mut().expect("fixture has a shell");
+        shell.current_command = "zsh".into();
+        let got = render_status(&res, &Style::none(), Path::new("/x"));
+        assert!(!got.contains("%4"), "{got}");
+        assert!(!got.contains("reads unknown"), "{got}");
     }
 
     /// The roster grid, pinned exactly. This is the shape the landing page
