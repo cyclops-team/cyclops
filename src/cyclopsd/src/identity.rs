@@ -54,6 +54,10 @@ pub enum PeerOrigin {
         pane_id: String,
         label: Option<String>,
         pane_root: ProcId,
+        /// True when the peer reached this pane through a vendor process.
+        /// A bare shell in an unassigned pane is the local operator, not an
+        /// anonymous agent.
+        vendor_below: bool,
     },
     Unprovable,
 }
@@ -428,11 +432,17 @@ where
         if let Some((pane_id, label, pane_root)) =
             panes.iter().find(|(_, _, pane_root)| *pane_root == current)
         {
+            let vendor_below = match is_vendor(current) {
+                Vendorship::Vendor => true,
+                Vendorship::NotVendor => vendor_below,
+                Vendorship::Unprovable => return PeerOrigin::Unprovable,
+            };
             return if path_is_current(&path, &parent, &is_live) {
                 PeerOrigin::Pane {
                     pane_id: pane_id.clone(),
                     label: label.clone(),
                     pane_root: *pane_root,
+                    vendor_below,
                 }
             } else {
                 PeerOrigin::Unprovable
@@ -1000,6 +1010,29 @@ mod tests {
             resolve_peer_origin_with(id(500), &pane_rows, no_vendor, changing_parent, |_| true),
             PeerOrigin::Unprovable
         );
+    }
+
+    #[test]
+    fn pane_origin_keeps_vendor_ancestry_at_the_pane_root() {
+        let pane_rows = vec![("%1".to_string(), Some("codex".to_string()), id(200))];
+        let origin = resolve_peer_origin_with(
+            id(500),
+            &pane_rows,
+            |process| {
+                (process.pid == 200)
+                    .then_some(Vendorship::Vendor)
+                    .unwrap_or(Vendorship::NotVendor)
+            },
+            origin_tree(&[(500, 200), (200, 1)]),
+            |_| true,
+        );
+        assert!(matches!(
+            origin,
+            PeerOrigin::Pane {
+                vendor_below: true,
+                ..
+            }
+        ));
     }
 
     /// The pane's own shell prompt is the attack surface: an adopted pane
