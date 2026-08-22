@@ -869,6 +869,7 @@ impl MailboxProjection {
                         | NotificationState::Gating
                         | NotificationState::QuotaHeld
                         | NotificationState::QuotaResetObserved
+                        | NotificationState::AttentionRequired
                 ));
                 Box::new(WithdrawnNotification {
                     key,
@@ -1008,6 +1009,7 @@ impl MailboxProjection {
                         | NotificationState::Gating
                         | NotificationState::QuotaHeld
                         | NotificationState::QuotaResetObserved
+                        | NotificationState::AttentionRequired
                 )
             })
             .map(|current| {
@@ -5043,9 +5045,9 @@ mod tests {
                 message_id.clone(),
                 bob,
                 attempt_id,
-                NotificationState::Gating,
+                NotificationState::AttentionRequired,
                 None,
-                None,
+                Some(NotificationAttentionCause::VerifyFailed),
                 3,
             )
             .unwrap();
@@ -5340,7 +5342,7 @@ mod tests {
     }
 
     #[test]
-    fn claim_withdraws_the_current_attempt_in_its_own_fact() {
+    fn claim_withdraws_an_attention_attempt_in_its_own_fact() {
         let scratch = StoreScratch::new("claim-withdrawal");
         let root = scratch.root();
         let journal = Path::new("workspaces/current/messages.ndjson");

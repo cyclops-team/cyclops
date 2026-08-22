@@ -93,15 +93,15 @@ them:
 
 | CLI | Where its hooks go |
 | --- | --- |
-| Claude Code | Nowhere on disk. It reads hooks only from the settings file it is launched with, so `cyclops start --agents claude` generates one per pane and passes `--settings`. Nothing under `~/.claude` is read or written. |
+| Claude Code | `~/.claude/settings.json` for normal direct launches. Cyclops safely merges its entries there after explicit `--wire-hooks` consent and copies the original aside before the first edit. `cyclops start --agents claude` still generates an isolated settings file for each pane and passes `--settings`. |
 | Codex | `$CODEX_HOME/hooks.json`, user level. Project-local `.codex/hooks.json` does not load until the directory is trusted, and that dialog cannot be answered in a non-interactive run, so hooks placed there silently never fire. |
 | Antigravity | `~/.agents/hooks.json`. |
 | Cursor | `~/.cursor/hooks.json`. |
 
-For the three that read a file of their own, Cyclops merges its entries
-around whatever is already there, copies the original to
-`hooks.json.before-cyclops` before the first edit, and rewrites nothing on a
-run that would change nothing. A CLI that is not installed is skipped.
+For the vendors that read a file of their own, Cyclops merges its entries
+around whatever is already there, copies the original to a sibling file named
+`<config>.before-cyclops` before the first edit, and rewrites nothing on a run
+that would change nothing. A CLI that is not installed is skipped.
 
 `cyclops start --setup-only` on its own never touches agent configuration;
 only `--wire-hooks` does. To install without it, set

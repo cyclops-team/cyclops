@@ -357,6 +357,7 @@ pub(crate) async fn dispatch(
                     Err(r) => return (r, None),
                 },
             };
+            refresh_status_detections(inner).await;
             let result = status_result(inner, params.open_deliveries);
             (
                 Response::ok(id, serde_json::to_value(result).expect("status serializes")),
@@ -1492,6 +1493,37 @@ fn verify_report_origin(
         agent: agent_pid,
         manifest: Some(vendor.agent.id.clone()),
     })
+}
+
+/// Refresh every live pane before returning the operator status surface.
+///
+/// Status is an explicit decision point for people and delivery automation.
+/// Returning a cached idle after a pane has started working makes both the
+/// displayed state and the next delivery unsafe. The normal event loop stays
+/// cache-driven; only this on-demand inspection pays for a current screen
+/// observation.
+async fn refresh_status_detections(inner: &Arc<Inner>) {
+    for session_idx in 0..inner.session_slots().len() {
+        let Some(watcher) = inner.watcher_of(session_idx) else {
+            continue;
+        };
+        let pane_ids: Vec<String> = watcher
+            .snapshot()
+            .into_iter()
+            .map(|pane| pane.pane_id)
+            .collect();
+        for pane_id in pane_ids {
+            fusion::recompute_pane(
+                inner,
+                session_idx,
+                &watcher,
+                &pane_id,
+                true,
+                "status",
+            )
+            .await;
+        }
+    }
 }
 
 /// Assemble StatusResult from the session slots and the detection cache.
