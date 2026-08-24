@@ -15,7 +15,7 @@ second place, that is the bug: this page is where they live.
 | [1](#1-a-payload-never-reaches-a-pane-the-gate-did-not-admit) | A payload never reaches a pane the gate did not admit | A shell executes the message |
 | [2](#2-a-modal-is-never-cleared-generically) | A modal is never cleared generically | Escape exits the agent CLI |
 | [3](#3-human-typing-always-wins) | Human typing always wins | The human's half-written sentence is sent as part of the message |
-| [4](#4-blocked_quota-parks-and-never-auto-retries) | `blocked_quota` parks and never auto-retries | A loop that cannot succeed, against a metered API |
+| [4](#4-legacy-blocked_quota-parks-and-never-auto-retries) | Legacy `blocked_quota` parks and never auto-retries | A loop that cannot succeed, against a metered API |
 | [5](#5-every-delivery-ends-in-a-named-state) | Every delivery ends in a named state | Nobody chases what has no state |
 | [6](#6-the-sender-is-whoever-connected-not-whoever-says-so) | The sender is whoever connected, not whoever says so | The audit trail can be forged |
 | [7](#7-secrets-never-enter-the-ledger) | Secrets never enter the ledger | An API key on screen becomes a permanent plain-text record |
@@ -134,10 +134,10 @@ gate reads a typing human as an idle agent.
 - Proven by: `src/cyclopsd/tests/m1_blockers.rs`,
   `escaped_capture_flips_typed_text_to_idle_with_input_and_gates`.
 
-## 4. `blocked_quota` parks and never auto-retries
+## 4. Legacy `blocked_quota` parks and never auto-retries
 
-**A quota park is terminal in the record. Only an operator sending again
-moves it.**
+**A legacy direct-delivery quota park is terminal in the session record. Only
+an operator sending again moves it.**
 
 What breaks: a retry against an exhausted quota is a request that cannot
 succeed. It costs money on a metered plan, and on some plans it extends the
@@ -149,6 +149,11 @@ Parking is per recipient, not per delivery: the in-flight delivery and
 everything queued behind it park together, because they are all aimed at
 the same exhausted agent. The admin is alerted once, with the reset hint
 parsed off the screen.
+
+Standard mailbox notifications use a separate notification state machine.
+They never retry automatically, but an administrator may start a fresh attempt
+with the guarded `cyclops requeue <message-id>` command after resolving the
+cause.
 
 - Enforced at: `src/cyclopsd/src/delivery.rs`, `park_recipient`;
   `ParkedBlockedQuota` has no outgoing transition in
@@ -431,6 +436,18 @@ turn running?" is answered by any sensor. "May I write into the composer?"
 is answered only by the sensor that can see the composer, saying it is
 empty, right now, with nothing live contradicting it. Absence of evidence
 is not clean evidence; a contested verdict is not clean evidence.
+
+An authenticated turn start owns runtime `Working` before the first visual
+output frame. Idle title and composer frames can lag that edge, so repeated
+captures cannot erase it and elapsed time cannot convert it to `Idle`. An
+exactly keyed start accepts only the matching end. An unkeyed manifest accepts
+the next authenticated end from the same process binding only when its vendor
+runs lifecycle command hooks synchronously. Claude's generated hooks omit
+`async`, and its command-hook contract blocks execution until completion. A
+future asynchronous configuration requires an exact turn key instead.
+Process-binding retirement also clears the start.
+Permission, modal, and quota screens remain authoritative blocked states. None
+of these runtime rules weaken the clean-composer requirement above.
 
 One clean frame is not clean evidence either, once text has been seen in
 the composer. A screen rule reads one frame, and a pane holding somebody's

@@ -4,6 +4,10 @@ A map, not a summary. Where things live, where to start reading for the
 job you have been handed, and which decisions were deliberate so you do not
 spend a day undoing one.
 
+For the current reliability release, start with
+[RELIABILITY_ROADMAP.md](RELIABILITY_ROADMAP.md). It owns implementation order
+and frozen release gates; this file remains the codebase ownership map.
+
 Cyclops coordinates terminal coding agents that are already running in your
 tmux session. It watches panes, works out whether each agent is idle,
 working or blocked, accepts messages into durable workspace mailboxes, and
@@ -66,7 +70,7 @@ are a rule implemented in a crate that should not have known about it.
 | `cyclops-theme` | The semantic token vocabulary, the state-to-group mapping, theme files, selection, the reload rule | Painting. It resolves a token to a color; renderers turn colors into escape sequences |
 | `cyclopsd` | The daemon: fusion, durable mailboxes, the notification worker, the legacy direct-delivery pipeline, the socket server, sender identity, the adoption registry, pane border chrome, hooks self-test, and journal read side | tmux specifics (adapter), the wire schema (proto), the attention rule (proto). It renders exactly one string: the border format |
 | `cyclops` | The CLI: a thin NDJSON client plus rendering on the shared grid | Business logic. `cyclops list` asks `status` for the roster rather than holding a second one |
-| `cyclops-ui` | The stream: two views, filters, backfill, the terminal backend (`cyclops watch`) |
+| `cyclops-ui` | The Admin, Firehose, and Messages views, filters, backfill, and the terminal backend (`cyclops watch`) |
 | `cyclops-workspace` | The full-screen workspace (`cyclops`): sidebar, tabs, pane canvas, mouse | The attention rule (reads proto), tmux (one focus helper in the adapter) |
 | `cyclops-testrig` | The isolated tmux server and its teardown rule, in one place | Anything shipped. `publish = false`, test-only |
 

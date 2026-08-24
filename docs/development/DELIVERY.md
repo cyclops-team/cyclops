@@ -77,11 +77,28 @@ Reply: cyclops send codex --subject "..."
 
 One worker per durable recipient; notifications to one mailbox are strictly
 FIFO. Broadcast writes one message row with one mailbox entry and one
-notification record per recipient.
+notification record per recipient. A worker retires after its queue drains.
+Enqueue and retirement share one registry lock, so a concurrent send either
+joins the existing FIFO or creates its replacement without losing the handle.
+An unexpected worker exit is not yet fully supervised. A later enqueue can
+replace the dead registry task, but an in-flight attempt removed from its queue
+can remain stranded. The reliability release must reconstruct that exact
+attempt from durable state and classify it at the write boundary before
+restarting work.
 
 Mailbox notifications use `cyclops_proto::NotificationState`. Each transition
 is a content-free workspace journal fact. Legacy direct deliveries still use
 `cyclops_proto::DeliveryState` in session ledgers.
+
+An authenticated mailbox claim settles notification work inside the same
+`message_claimed` fact. `queued`, `gating`, `quota_held`, and
+`quota_reset_observed` become `withdrawn`, clear their binding and cause, and
+cancel that exact pending attempt. A staged or submitted doorbell becomes `notified`
+and retains its binding and composer barrier. `writing`, direct-payload
+post-write states, `attention_required`, and existing `notified` records stay
+unchanged. `superseded` is reserved for an actual message replacement. Claim
+settlement proves retrieval only; it does not prove task completion or erase a
+post-write alarm.
 
 ### Gate (amendments b, f, g; GOALS invariants)
 
@@ -93,10 +110,12 @@ timer. In order:
 2. `pane_dead`: attention_required. `pane_in_mode` (human scrolling in
    copy-mode): hold in gating; %pane-mode-changed re-triggers.
 3. Fused state:
-   - `blocked_quota`: park ALL queued deliveries for this recipient as
-     parked_blocked_quota, admin.notify urgent with the reset hint parsed
-     from screen. Never auto-retried (amendment f). After the reset, the
-     operator sends a fresh message; there is no requeue verb.
+   - On the legacy direct-delivery path, `blocked_quota` parks ALL queued
+     deliveries for this recipient as `parked_blocked_quota` and sends one
+     urgent admin notification with the reset hint parsed from screen. It never
+     auto-retries (amendment f). After the reset, the operator sends a fresh
+     message; this legacy state has no requeue verb. Standard mailbox
+     notifications use the explicit guarded requeue command described below.
    - `blocked_modal`: if the matched manifest rule has `auto_dismiss` and
      `decline_keys`, send the decline keys in order with ~250ms spacing,
      ledger a gate line naming the rule, re-evaluate. Multi-key declines
