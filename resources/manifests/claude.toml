@@ -311,7 +311,7 @@ composer_trailer_regex = [
   '^─+$',
   '^\s{0,4}(?:\S[^·]*(?: · [^·]+){2,} · \d+K window(?: · \d+K used)?|(?:Opus|Sonnet|Haiku) \d+(?:\.\d+)?(?: \([^·]*\))? · (?:xhigh|high|medium|low)(?: · [^·]+)* · [^·]*…)\s*$',
   '^\s{0,4}paste again to expand\s*$',
-  '^\s{0,4}(?:⏸|⏵⏵) [^·]*\b(?:on|off)\b(?: · .+| \(.+\))?\s*$',
+  '^\s{0,4}(?:⏸|⏵⏵) [^·]*\b(?:on|off)\b(?: \([^)]*\))?(?: · .+)?\s*$',
 ]
 composer_trailer_regex_esc = [
   '^\x1b\[38;5;244m─',

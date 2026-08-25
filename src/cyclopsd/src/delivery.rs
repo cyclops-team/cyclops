@@ -7399,7 +7399,7 @@ fn exact_composer_content_for_state(
         };
         content.push(line.to_string());
     }
-    // tmux 3.6a can retain right-padding cells in a joined capture. Normalize
+    // tmux 3.6a retains right-padding cells in a joined capture. Normalize
     // them only after a manifest rule has classified one prompt row as clean.
     // Occupied composer rows keep every byte for exact ownership checks.
     if state == AgentState::Idle
@@ -12412,6 +12412,12 @@ mod composer_content_proof {
         assert_eq!(
             composer_content_for_projection_from_joined_capture(&shipped("claude"), capture),
             ComposerContentProof::Visible(String::new())
+        );
+
+        let unexpected = format!("{capture}\nunexpected text");
+        assert_eq!(
+            composer_content_for_projection_from_joined_capture(&shipped("claude"), &unexpected),
+            ComposerContentProof::Unprovable
         );
     }
 
