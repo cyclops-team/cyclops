@@ -135,8 +135,17 @@ pub(crate) fn build_cache(home: &Path) -> PathBuf {
 /// The build-cache lease shared by update and cleanup.
 pub(crate) const BUILD_CACHE_LEASE: &str = ".lease";
 
-/// Hold the build cache against cleanup for the lifetime of the returned file.
-pub(crate) fn lock_build_cache(root: &cyclops_state::StateRoot) -> Result<File, String> {
+/// A held advisory lock that is released before its descriptor is closed.
+pub(crate) struct ExclusiveLease(File);
+
+impl Drop for ExclusiveLease {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// Hold the build cache against cleanup for the lifetime of the returned lease.
+pub(crate) fn lock_build_cache(root: &cyclops_state::StateRoot) -> Result<ExclusiveLease, String> {
     let lease = root
         .open_append(Path::new(BUILD_CACHE_LEASE))
         .map_err(|error| format!("open build-cache lease: {error}"))?
@@ -147,7 +156,7 @@ pub(crate) fn lock_build_cache(root: &cyclops_state::StateRoot) -> Result<File, 
             std::io::Error::last_os_error()
         ));
     }
-    Ok(lease)
+    Ok(ExclusiveLease(lease))
 }
 
 pub(crate) const SCRATCH_MARKER: &str = ".cyclops-update-owner";
@@ -162,7 +171,7 @@ struct Scratch {
     inode: u64,
     marker_device: u64,
     marker_inode: u64,
-    _lease: File,
+    _lease: ExclusiveLease,
 }
 
 impl Scratch {
@@ -223,7 +232,7 @@ impl Scratch {
                         inode: metadata.ino(),
                         marker_device: marker_metadata.dev(),
                         marker_inode: marker_metadata.ino(),
-                        _lease: lease,
+                        _lease: ExclusiveLease(lease),
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -355,7 +364,7 @@ struct PairStore {
     owner_inode: u64,
     lease_device: u64,
     lease_inode: u64,
-    _lease: File,
+    _lease: ExclusiveLease,
 }
 
 // Owner-only directories separate local accounts. The kernel lease and inode
@@ -490,7 +499,9 @@ impl PairStore {
                 std::io::Error::last_os_error()
             ));
         }
+        let lease = ExclusiveLease(lease);
         let lease_metadata = lease
+            .0
             .metadata()
             .map_err(|error| format!("inspect pair update lease: {error}"))?;
         let root_metadata = std::fs::symlink_metadata(&root)
@@ -2795,9 +2806,25 @@ sys.exit(43)"#,
         let cache = scratch.path().join("cache");
         let root = cyclops_state::StateRoot::open_or_create(&cache).unwrap();
         let held = lock_build_cache(&root).unwrap();
+        let inherited = held.0.try_clone().unwrap();
         assert!(lock_build_cache(&root).unwrap_err().contains("in use"));
         drop(held);
         assert!(lock_build_cache(&root).is_ok());
+        drop(inherited);
+    }
+
+    #[test]
+    fn pair_store_drop_unlocks_an_inherited_descriptor() {
+        let scratch = Scratch::create().unwrap();
+        let prefix = scratch.path().join("bin");
+        directory(&prefix);
+        let store = PairStore::open(&prefix).unwrap();
+        let inherited = store._lease.0.try_clone().unwrap();
+
+        drop(store);
+        assert!(PairStore::open_existing(&prefix).unwrap().is_some());
+
+        drop(inherited);
     }
 
     #[test]

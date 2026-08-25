@@ -209,7 +209,7 @@ pub struct StateInspector {
 /// Dropping the handle without calling [`BoundStateRemoval::remove`] changes nothing.
 pub struct BoundStateRemoval {
     parent: File,
-    target: File,
+    target: UnlockOnDropFile,
     name: CString,
     path: PathBuf,
     expected: InspectedEntry,
@@ -751,7 +751,7 @@ impl StateInspector {
 
         Ok(BoundStateRemoval {
             parent,
-            target,
+            target: UnlockOnDropFile::new(target),
             name,
             path: expected.path.clone(),
             expected: expected.clone(),
@@ -1246,7 +1246,7 @@ impl StateRoot {
         sync_create_capable_entry(&directory, &file, &display_path, create)?;
 
         Ok(Some(StateFile {
-            file,
+            file: UnlockOnDropFile::new(file),
             path: display_path,
         }))
     }
@@ -1422,8 +1422,43 @@ impl Drop for TransientStateFile {
 
 /// A validated regular state file.
 pub struct StateFile {
-    file: File,
+    file: UnlockOnDropFile,
     path: PathBuf,
+}
+
+/// A descriptor that explicitly releases any held lock before closing.
+struct UnlockOnDropFile(Option<File>);
+
+impl UnlockOnDropFile {
+    fn new(file: File) -> Self {
+        Self(Some(file))
+    }
+
+    fn into_inner(mut self) -> File {
+        self.0.take().expect("state descriptor is present")
+    }
+}
+
+impl std::ops::Deref for UnlockOnDropFile {
+    type Target = File;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("state descriptor is present")
+    }
+}
+
+impl std::ops::DerefMut for UnlockOnDropFile {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect("state descriptor is present")
+    }
+}
+
+impl Drop for UnlockOnDropFile {
+    fn drop(&mut self) {
+        if let Some(file) = self.0.as_ref() {
+            let _ = file.unlock();
+        }
+    }
 }
 
 struct DirectoryStream(*mut libc::DIR);
@@ -1772,7 +1807,7 @@ impl StateFile {
         let start = length.saturating_sub(keep as u64);
         self.file.seek(SeekFrom::Start(start))?;
         let mut tail = Vec::with_capacity(keep);
-        Read::by_ref(&mut self.file)
+        Read::by_ref(&mut *self.file)
             .take(keep as u64)
             .read_to_end(&mut tail)?;
         if start > 0 {
@@ -1800,7 +1835,7 @@ impl StateFile {
 
     /// Return the validated descriptor as a standard file handle.
     pub fn into_file(self) -> File {
-        self.file
+        self.file.into_inner()
     }
 }
 
@@ -3769,9 +3804,11 @@ mod tests {
         let second = root.open_append(Path::new("hook-errors.log")).unwrap();
 
         first.lock().unwrap();
+        let inherited = first.file.try_clone().unwrap();
         assert!(!second.try_lock().unwrap());
         drop(first);
         assert!(second.try_lock().unwrap());
+        drop(inherited);
     }
 
     #[test]

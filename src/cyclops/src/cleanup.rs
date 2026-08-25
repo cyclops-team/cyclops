@@ -1185,11 +1185,11 @@ fn mount_identity(entry: &InspectedEntry) -> Result<MountIdentity, String> {
             entry.path.display()
         ));
     }
-    let kind = match u32::from(metadata.stx_mode) & libc::S_IFMT as u32 {
-        value if value == libc::S_IFDIR as u32 => InspectedKind::Directory,
-        value if value == libc::S_IFREG as u32 => InspectedKind::RegularFile,
-        value if value == libc::S_IFSOCK as u32 => InspectedKind::Socket,
-        value if value == libc::S_IFLNK as u32 => InspectedKind::Symlink,
+    let kind = match u32::from(metadata.stx_mode) & libc::S_IFMT {
+        value if value == libc::S_IFDIR => InspectedKind::Directory,
+        value if value == libc::S_IFREG => InspectedKind::RegularFile,
+        value if value == libc::S_IFSOCK => InspectedKind::Socket,
+        value if value == libc::S_IFLNK => InspectedKind::Symlink,
         _ => InspectedKind::Other,
     };
     let device = libc::makedev(metadata.stx_dev_major, metadata.stx_dev_minor);

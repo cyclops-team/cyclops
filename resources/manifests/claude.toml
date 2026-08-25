@@ -21,7 +21,7 @@
 [agent]
 id = "claude"
 display_name = "Claude Code"
-version_tested = "2.1.243"
+version_tested = "2.1.221"
 process_names = ["claude"]
 # MEASURED (m1 soak): on native installs ~/.local/bin/claude is a symlink to
 # ~/.local/share/claude/versions/2.1.220 and macOS derives the process comm

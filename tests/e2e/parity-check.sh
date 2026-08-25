@@ -429,6 +429,8 @@ method = "load-buffer + paste-buffer -p"
 submit = "Enter"
 verify_before_submit = true
 verify_pattern = ["<message_id>"]
+composer_prompt_regex = '^❯ (?P<content>.*)$'
+composer_continuation_regex = '^(?P<content>.*)$'
 composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
 composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
 composer_trailer_required_prefix = 2
@@ -668,7 +670,7 @@ wait_for "the reviewer mailbox doorbell" 100 pane_has_text "$N2" "cyclops inbox 
 printf '\n$ tmux capture-pane -p -t %s\n' "$N2"
 tmx capture-pane -p -t "$N2" | grep -v '^$' > "$OUT"
 cat "$OUT"
-check "the recipient sees only the doorbell" "^❯ cyclops inbox claim $REVIEW_ID\$"
+check "the recipient sees only the exact attempt doorbell" "^❯ cyclops inbox claim $REVIEW_ID #c:[A-Za-z0-9_-]{22}\$"
 check_absent "the pane does not receive the body" '^Check the mailbox contract\.$'
 wait_for "the reviewer doorbell to be submitted" 100 notification_crossed_submit "$REVIEW_ID"
 
@@ -1155,7 +1157,7 @@ STOCK_BOUND_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
 wait_for "the defaults reviewer doorbell" 100 stock_pane_has_text "$S2" "cyclops inbox claim $STOCK_BOUND_ID"
 wait_for "the defaults doorbell to be submitted" 100 stock_notification_crossed_submit "$STOCK_BOUND_ID"
 stock_tmx capture-pane -p -t "$S2" > "$OUT"
-check "the default pane gets the doorbell" "^❯ cyclops inbox claim $STOCK_BOUND_ID\$"
+check "the default pane gets the exact attempt doorbell" "^❯ cyclops inbox claim $STOCK_BOUND_ID #c:[A-Za-z0-9_-]{22}\$"
 check_absent "the default pane does not get the body" '^private default body$'
 
 # History owns message facts, not standard notification badges.

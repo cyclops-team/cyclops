@@ -246,6 +246,27 @@ async fn history_reconstructs_a_two_pane_conversation() {
         }
     }
 
+    // Delivery finality can precede the pane watcher's return to the clean
+    // composer. Wait for both panes so the read-only assertion starts from a
+    // quiescent ledger rather than racing the final runtime observation.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let status = rig.ctl.request("status", json!({})).await;
+        let all_idle = status["result"]["sessions"][0]["panes"]
+            .as_array()
+            .is_some_and(|panes| {
+                panes.len() == 2 && panes.iter().all(|pane| pane["state"] == "idle")
+            });
+        if all_idle {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "conversation panes did not become quiescent: {status}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
     let ledger_before = rig.ledger_lines().len();
 
     // --with reviewer reconstructs the conversation: both directions plus
