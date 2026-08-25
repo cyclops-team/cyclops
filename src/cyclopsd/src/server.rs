@@ -178,7 +178,9 @@ pub(crate) async fn accept_loop(
             _ = stop.changed() => return,
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
-                    tokio::spawn(handle_conn(Arc::clone(&inner), stream));
+                    inner
+                        .engine
+                        .spawn_descendant_task(handle_conn(Arc::clone(&inner), stream));
                 }
                 Err(e) => {
                     warn!(error = %e, "accept failed");
@@ -238,14 +240,20 @@ pub(crate) async fn handle_conn(inner: Arc<Inner>, stream: UnixStream) {
     }
     let mut lines = BufReader::new(read_half).lines();
     let mut sub: Option<(broadcast::Receiver<Event>, Vec<String>)> = None;
+    let mut stop = inner.stop.clone();
 
     loop {
-        let pumped = match &mut sub {
-            Some((rx, _)) => tokio::select! {
-                ev = rx.recv() => Pumped::Ev(ev),
-                line = lines.next_line() => Pumped::Line(line),
-            },
-            None => Pumped::Line(lines.next_line().await),
+        let pumped = tokio::select! {
+            _ = stop.changed() => return,
+            pumped = async {
+                match &mut sub {
+                    Some((rx, _)) => tokio::select! {
+                        ev = rx.recv() => Pumped::Ev(ev),
+                        line = lines.next_line() => Pumped::Line(line),
+                    },
+                    None => Pumped::Line(lines.next_line().await),
+                }
+            } => pumped,
         };
         match pumped {
             Pumped::Ev(Ok(ev)) => {
@@ -266,7 +274,10 @@ pub(crate) async fn handle_conn(inner: Arc<Inner>, stream: UnixStream) {
                 return;
             }
             Pumped::Ev(Err(broadcast::error::RecvError::Closed)) => return,
-            Pumped::Line(Ok(Some(line))) => match handle_line(&inner, &line, peer, &mut w).await {
+            Pumped::Line(Ok(Some(line))) => match tokio::select! {
+                _ = stop.changed() => return,
+                outcome = handle_line(&inner, &line, peer, &mut w) => outcome,
+            } {
                 LineOutcome::Continue => {}
                 LineOutcome::Drop => return,
                 LineOutcome::Subscribed(kinds, rx) => sub = Some((rx, kinds)),
@@ -1681,10 +1692,11 @@ async fn refresh_status_detections(inner: &Arc<Inner>) -> HashSet<crate::PaneKey
             ));
         }
     }
-    run_status_refresh_jobs(jobs, deadline, STATUS_REFRESH_CONCURRENCY).await
+    run_status_refresh_jobs(&inner.engine, jobs, deadline, STATUS_REFRESH_CONCURRENCY).await
 }
 
 async fn run_status_refresh_jobs(
+    engine: &delivery::Engine,
     mut pending: VecDeque<StatusRefreshJob>,
     deadline: tokio::time::Instant,
     concurrency: usize,
@@ -1698,21 +1710,23 @@ async fn run_status_refresh_jobs(
             let Some((pane, refresh)) = pending.pop_front() else {
                 break;
             };
-            running.spawn(async move { (pane, refresh.await) });
+            running.spawn(engine.track_descendant(async move { (pane, refresh.await) }));
         }
         if running.is_empty() {
             break;
         }
         match tokio::time::timeout_at(deadline, running.join_next()).await {
-            Ok(Some(Ok((pane, true)))) => {
+            Ok(Some(Ok(Some((pane, true))))) => {
                 incomplete.remove(&pane);
             }
-            Ok(Some(Ok((_, false))) | Some(Err(_))) => {}
+            Ok(Some(Ok(Some((_, false)))) | Some(Ok(None)) | Some(Err(_))) => {}
             Ok(None) => break,
             Err(_) => {
                 // Pane recomputation can publish state and journal facts. It
                 // is not cancellation-safe, so overdue work finishes in the
                 // background while this answer refuses its cached result.
+                // The daemon lifetime still owns it and cancels it before
+                // sealing the old boot's journals during shutdown.
                 running.detach_all();
                 break;
             }
@@ -2296,6 +2310,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn status_refresh_has_one_budget_and_bounded_concurrency() {
+        let engine = delivery::Engine::new();
         let started = Arc::new(AtomicUsize::new(0));
         let mut jobs = VecDeque::new();
         for index in 0..(STATUS_REFRESH_CONCURRENCY + 3) {
@@ -2313,7 +2328,8 @@ mod tests {
         let before = tokio::time::Instant::now();
 
         let incomplete =
-            run_status_refresh_jobs(jobs, before + budget, STATUS_REFRESH_CONCURRENCY).await;
+            run_status_refresh_jobs(&engine, jobs, before + budget, STATUS_REFRESH_CONCURRENCY)
+                .await;
 
         assert_eq!(tokio::time::Instant::now() - before, budget);
         assert_eq!(started.load(Ordering::SeqCst), STATUS_REFRESH_CONCURRENCY);
@@ -2322,6 +2338,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn overdue_status_refresh_finishes_after_the_response_budget() {
+        let engine = delivery::Engine::new();
         let completed = Arc::new(AtomicUsize::new(0));
         let completed_by_job = Arc::clone(&completed);
         let pane = crate::PaneKey::new(0, "%1");
@@ -2335,7 +2352,8 @@ mod tests {
         )]);
         let before = tokio::time::Instant::now();
 
-        let incomplete = run_status_refresh_jobs(jobs, before + Duration::from_millis(25), 1).await;
+        let incomplete =
+            run_status_refresh_jobs(&engine, jobs, before + Duration::from_millis(25), 1).await;
 
         assert_eq!(incomplete, HashSet::from([pane]));
         assert_eq!(
@@ -2650,6 +2668,7 @@ mod tests {
             manifests: BTreeMap::new(),
             manifest_dir: None,
             sessions: StdMutex::new(Vec::new()),
+            session_registration: StdMutex::new(()),
             events: broadcast::channel(16).0,
             detections: StdMutex::new(HashMap::<crate::PaneKey, DetEntry>::new()),
             pane_recomputes: StdMutex::new(HashMap::new()),

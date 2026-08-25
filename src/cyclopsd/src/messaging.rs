@@ -487,13 +487,13 @@ fn schedule_claimed_notification_recovery(
     let pane_id = route.pane_id.clone();
     let watcher = Arc::clone(&route.watcher);
     enqueue_prepared_notification(inner, service, recipient, route, record, true);
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+    if tokio::runtime::Handle::try_current().is_err() {
         return Ok(());
-    };
-    let inner = Arc::clone(inner);
-    runtime.spawn(async move {
+    }
+    let task_inner = Arc::clone(inner);
+    inner.engine.spawn_descendant_task(async move {
         crate::fusion::recompute_pane(
-            &inner,
+            &task_inner,
             session_idx,
             &watcher,
             &pane_id,

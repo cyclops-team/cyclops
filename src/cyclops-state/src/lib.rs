@@ -1730,6 +1730,11 @@ impl StateFile {
         }
     }
 
+    /// Release an exclusive lock held by this descriptor.
+    pub fn unlock(&self) -> std::io::Result<()> {
+        self.file.unlock()
+    }
+
     /// Append one record while keeping the file within a fixed byte limit.
     ///
     /// Rotation keeps recent complete lines from the old tail. A record larger

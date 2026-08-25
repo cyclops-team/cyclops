@@ -190,6 +190,10 @@ pub(crate) struct Inner {
     /// lock: every read here is a snapshot (clone of the `Arc`s, or of the
     /// whole `Vec`) taken and released before any work happens.
     pub(crate) sessions: StdMutex<Vec<Arc<SessionSlot>>>,
+    /// Serializes the check, open, and publish transaction for a runtime
+    /// session registration with a followed rename. The protected section
+    /// never awaits.
+    pub(crate) session_registration: StdMutex<()>,
     /// Push stream for events.subscribe connections.
     pub(crate) events: broadcast::Sender<Event>,
     /// Cached fusion verdict per exact watched pane route.
@@ -1199,7 +1203,27 @@ impl Daemon {
         // the latch turns that into a durable pending item instead of an
         // untracked task that outlives shutdown.
         self.inner.engine.begin_stopping();
-        restore_all_chrome(&self.inner).await;
+        // Wait for a registration that crossed the stopping edge to finish.
+        // Later session.watch calls acquire this lock, observe stopping, and
+        // refuse before opening a ledger or publishing a task.
+        {
+            let _registration = self
+                .inner
+                .session_registration
+                .lock()
+                .expect("session registration lock");
+        }
+        let descendants_stopped = tokio::time::timeout(
+            SHUTDOWN_GRACE,
+            self.inner.engine.wait_for_descendant_tasks(),
+        )
+        .await
+        .is_ok();
+        if descendants_stopped {
+            restore_all_chrome(&self.inner).await;
+        } else {
+            warn!("descendant tasks exceeded shutdown grace; skipping chrome restore");
+        }
         let _ = self.stop.send(true);
         let mut tasks: Vec<JoinHandle<()>> =
             std::mem::take(&mut *self.tasks.lock().expect("tasks lock"));
@@ -1216,6 +1240,7 @@ impl Daemon {
                 .is_err()
             {
                 task.abort();
+                let _ = task.await;
             }
         }
         let mut workers = self.inner.engine.take_legacy_worker_tasks();
@@ -1224,7 +1249,32 @@ impl Daemon {
             worker.abort();
         }
         for mut worker in workers {
-            let _ = tokio::time::timeout(SHUTDOWN_GRACE, &mut worker).await;
+            if tokio::time::timeout(SHUTDOWN_GRACE, &mut worker)
+                .await
+                .is_err()
+            {
+                worker.abort();
+                let _ = worker.await;
+            }
+        }
+        if tokio::time::timeout(
+            SHUTDOWN_GRACE,
+            self.inner.engine.wait_for_descendant_tasks(),
+        )
+        .await
+        .is_err()
+        {
+            warn!("descendant tasks exceeded shutdown grace; sealing journals");
+        }
+        if let Some(mailbox) = &self.inner.mailbox {
+            if let Err(error) = mailbox.seal() {
+                error!(%error, "cannot seal workspace journal during shutdown");
+            }
+        }
+        for slot in self.inner.session_slots() {
+            if let Err(error) = slot.ledger.seal() {
+                error!(session = %slot.name(), %error, "cannot seal session journal during shutdown");
+            }
         }
         if let Some(cleanup) = self
             .socket_cleanup
@@ -2352,6 +2402,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         manifests,
         manifest_dir,
         sessions: StdMutex::new(sessions),
+        session_registration: StdMutex::new(()),
         events,
         detections: StdMutex::new(HashMap::new()),
         pane_recomputes: StdMutex::new(HashMap::new()),
@@ -2463,6 +2514,17 @@ pub(crate) async fn watch_session(
     inner: &Arc<Inner>,
     name: &str,
 ) -> Result<(usize, bool), WireError> {
+    let _registration = inner
+        .session_registration
+        .lock()
+        .expect("session registration lock");
+    if inner.engine.is_stopping() {
+        return Err(WireError {
+            code: "daemon_stopping".to_string(),
+            message: "daemon is stopping; session.watch refused".to_string(),
+            data: None,
+        });
+    }
     if let Some(idx) = inner.session_index(name) {
         return Ok((idx, false));
     }
@@ -2489,7 +2551,7 @@ pub(crate) async fn watch_session(
                 .then_some(idx)
         })
     {
-        rename_session_slot(inner, idx, name.to_string());
+        rename_session_slot_locked(inner, idx, name.to_string());
         return Ok((idx, false));
     }
     let descendant = PathBuf::from("ledger").join(format!("{name}.ndjson"));
@@ -2887,6 +2949,20 @@ fn session_lifecycle(inner: &Arc<Inner>, idx: usize, attached: bool) {
 /// rename of one. A restart re-reads `sessions` and watches the OLD name
 /// again, same as it always has).
 fn rename_session_slot(inner: &Arc<Inner>, idx: usize, new_name: String) {
+    let _registration = inner
+        .session_registration
+        .lock()
+        .expect("session registration lock");
+    // Shutdown crosses this same lock before restoring chrome. A rename that
+    // lands after that barrier would split the slot name from the registry
+    // name while restore is reading both, leaving Cyclops chrome behind.
+    if inner.engine.is_stopping() {
+        return;
+    }
+    rename_session_slot_locked(inner, idx, new_name);
+}
+
+fn rename_session_slot_locked(inner: &Arc<Inner>, idx: usize, new_name: String) {
     let Some(slot) = inner.session(idx) else {
         return;
     };
@@ -3885,7 +3961,7 @@ fn kick_debounce(
     }
     let (tx, rx) = watch::channel(evidence_ms);
     debounce.insert(pane_id.clone(), tx);
-    tokio::spawn(debounce_task(
+    inner.engine.spawn_descendant_task(debounce_task(
         rx,
         Arc::clone(inner),
         session_idx,
@@ -4112,6 +4188,7 @@ mod tests {
             manifests: BTreeMap::new(),
             manifest_dir: None,
             sessions: StdMutex::new(Vec::new()),
+            session_registration: StdMutex::new(()),
             events: broadcast::channel(16).0,
             detections: StdMutex::new(HashMap::new()),
             pane_recomputes: StdMutex::new(HashMap::new()),
@@ -5820,6 +5897,59 @@ process_names = ["never"]
         assert!(!dir.join("ledger/new-name.ndjson").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stopping_refuses_a_new_session_without_publishing_state() {
+        let inner = bare_inner("cyc-watch-after-stop");
+        inner.engine.begin_stopping();
+
+        let error = watch_session(&inner, "late-session")
+            .await
+            .expect_err("a stopped daemon must not register a session");
+
+        assert_eq!(error.code, "daemon_stopping");
+        assert_eq!(inner.session_count(), 0);
+        assert!(inner
+            .extra_tasks
+            .lock()
+            .expect("extra tasks lock")
+            .is_empty());
+        assert!(!inner
+            .state_root
+            .path()
+            .join("ledger/late-session.ndjson")
+            .exists());
+    }
+
+    #[test]
+    fn stopping_refuses_a_followed_session_rename() {
+        let inner = bare_inner("cyc-rename-after-stop");
+        let dir = cyclops_proto::scratch::scratch_dir("cyc-rename-after-stop-ledger");
+        let _ = std::fs::remove_dir_all(&dir);
+        let state_root = StateRoot::open_or_create(&dir).expect("state root opens");
+        let ledger = cyclops_ledger::LedgerWriter::open(
+            &state_root,
+            Path::new("ledger/original.ndjson"),
+            &inner.boot_id,
+        )
+        .expect("ledger opens");
+        let idx = {
+            let mut sessions = inner.sessions.lock().expect("sessions lock");
+            sessions.push(Arc::new(SessionSlot::new(
+                "original".to_string(),
+                Arc::new(ledger),
+            )));
+            sessions.len() - 1
+        };
+
+        inner.engine.begin_stopping();
+        rename_session_slot(&inner, idx, "too-late".to_string());
+
+        assert_eq!(inner.session_index("original"), Some(idx));
+        assert_eq!(inner.session_index("too-late"), None);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The watcher updates its own name before the daemon consumes the

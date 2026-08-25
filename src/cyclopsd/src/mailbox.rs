@@ -4123,6 +4123,14 @@ impl MailboxService {
         self.workspace_id
     }
 
+    pub(crate) fn seal(&self) -> Result<(), MailboxServiceError> {
+        self.store()?
+            .writer
+            .seal()
+            .map_err(MessageStoreError::from)?;
+        Ok(())
+    }
+
     pub fn admin(&self) -> MailboxIdentity {
         MailboxIdentity {
             key: RecipientKey::admin(self.workspace_id),
@@ -13814,6 +13822,7 @@ mod tests {
             vec![recovered[0].clone()]
         );
 
+        drop(reopened);
         let replayed = MessageStore::open(&root, journal, workspace, "boot-3").unwrap();
         assert_eq!(
             replayed
@@ -13882,6 +13891,7 @@ mod tests {
         assert_eq!(record.binding.as_ref(), Some(&binding));
         assert_eq!(reopened.projection().last_sequence(), Some(6));
 
+        drop(reopened);
         let replayed = MessageStore::open(&root, journal, workspace, "boot-3").unwrap();
         let record = replayed
             .projection()

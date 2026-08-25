@@ -7575,6 +7575,7 @@ regex = ['^IDLE']
             manifests,
             manifest_dir: None,
             sessions: StdMutex::new(Vec::new()),
+            session_registration: StdMutex::new(()),
             events: tokio::sync::broadcast::channel(16).0,
             detections: StdMutex::new(HashMap::new()),
             pane_recomputes: StdMutex::new(HashMap::new()),

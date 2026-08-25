@@ -638,6 +638,19 @@ impl TestClient {
         }
     }
 
+    async fn expect_closed(&mut self) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match self.lines.next_line().await.expect("read shutdown EOF") {
+                    Some(_) => continue,
+                    None => return,
+                }
+            }
+        })
+        .await
+        .expect("connection closes within 5s");
+    }
+
     /// Next event matching `pred`, scanning buffered then incoming lines.
     pub async fn wait_event<F: Fn(&Value) -> bool>(&mut self, within: Duration, pred: F) -> Value {
         if let Some(i) = self.pending_events.iter().position(&pred) {
@@ -800,10 +813,13 @@ impl Rig {
             home,
             home_guard,
             daemon,
+            mut ctl,
+            mut ev,
             sessions,
-            ..
         } = self;
         daemon.shutdown().await;
+        ctl.expect_closed().await;
+        ev.expect_closed().await;
         let (cfg, _) = cyclopsd::Config::load(&home).expect("config loads");
         let daemon = cyclopsd::boot(cfg).await.expect("daemon reboots");
         let sock = daemon.socket_path();

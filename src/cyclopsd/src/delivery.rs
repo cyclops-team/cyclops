@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -254,10 +254,54 @@ pub(crate) struct Engine {
     /// Set before shutdown drains task handles. Once set, no worker registry
     /// may publish new work.
     stopping: AtomicBool,
+    /// Every spawned task below a registered daemon root. Shutdown waits
+    /// for this tree to become empty.
+    descendant_tasks: Arc<DescendantTaskDrain>,
+    /// Cancels descendant work at the same boundary that closes worker
+    /// creation. The journal seal remains the final write barrier.
+    descendant_stop: watch::Sender<bool>,
+}
+
+#[derive(Default)]
+struct DescendantTaskDrain {
+    active: AtomicUsize,
+    empty: Notify,
+}
+
+struct DescendantTaskGuard {
+    drain: Arc<DescendantTaskDrain>,
+}
+
+impl Drop for DescendantTaskGuard {
+    fn drop(&mut self) {
+        if self.drain.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.drain.empty.notify_one();
+        }
+    }
+}
+
+impl DescendantTaskDrain {
+    fn enter(self: &Arc<Self>) -> DescendantTaskGuard {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        DescendantTaskGuard {
+            drain: Arc::clone(self),
+        }
+    }
+
+    async fn wait_empty(&self) {
+        loop {
+            let empty = self.empty.notified();
+            if self.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            empty.await;
+        }
+    }
 }
 
 impl Engine {
     pub(crate) fn new() -> Engine {
+        let (descendant_stop, _) = watch::channel(false);
         Engine {
             workers: StdMutex::new(HashMap::new()),
             notification_workers: StdMutex::new(HashMap::new()),
@@ -269,12 +313,55 @@ impl Engine {
             notification_attempts: StdMutex::new(HashMap::new()),
             paused: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
+            descendant_tasks: Arc::new(DescendantTaskDrain::default()),
+            descendant_stop,
         }
+    }
+
+    /// Wrap work in the daemon's descendant lifetime.
+    ///
+    /// `None` means shutdown cancelled the work. Callers that need a result
+    /// must treat that as an incomplete operation, never as success.
+    pub(crate) fn track_descendant<F>(
+        &self,
+        future: F,
+    ) -> impl std::future::Future<Output = Option<F::Output>> + Send + 'static
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let guard = self.descendant_tasks.enter();
+        let mut stop = self.descendant_stop.subscribe();
+        async move {
+            let _guard = guard;
+            if *stop.borrow() {
+                return None;
+            }
+            tokio::select! {
+                _ = stop.changed() => None,
+                output = future => Some(output),
+            }
+        }
+    }
+
+    pub(crate) fn spawn_descendant_task<F>(&self, future: F) -> JoinHandle<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let tracked = self.track_descendant(future);
+        tokio::spawn(async move {
+            let _ = tracked.await;
+        })
+    }
+
+    pub(crate) async fn wait_for_descendant_tasks(&self) {
+        self.descendant_tasks.wait_empty().await;
     }
 
     pub(crate) fn begin_stopping(&self) {
         self.stopping.store(true, Ordering::SeqCst);
         self.paused.store(true, Ordering::SeqCst);
+        self.descendant_stop.send_replace(true);
         for worker in self.workers.lock().expect("workers lock").values() {
             worker.notify.notify_waiters();
         }
@@ -1513,11 +1600,16 @@ pub(crate) async fn quiesce(inner: &Arc<Inner>, timeout_ms: Option<u64>) -> Quie
             .collect();
         if in_flight.is_empty() {
             let held = Arc::clone(inner);
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(QUIESCE_HOLD_FALLBACK_MS)).await;
-                if held.engine.paused.load(Ordering::SeqCst) {
-                    warn!("quiesce hold expired with no stop; resuming deliveries");
-                    held.engine.resume_workers();
+            let mut stop = held.stop.clone();
+            inner.engine.spawn_descendant_task(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(QUIESCE_HOLD_FALLBACK_MS)) => {
+                        if held.engine.paused.load(Ordering::SeqCst) {
+                            warn!("quiesce hold expired with no stop; resuming deliveries");
+                            held.engine.resume_workers();
+                        }
+                    }
+                    _ = stop.changed() => {}
                 }
             });
             return QuiesceResult {
@@ -2560,7 +2652,11 @@ fn recover_outer_worker(inner: &Arc<Inner>, worker: &Arc<Worker>) -> bool {
 
 async fn worker_supervisor(inner: Arc<Inner>, worker: Arc<Worker>) {
     supervise_worker_task(
-        || tokio::spawn(worker_loop(Arc::clone(&inner), Arc::clone(&worker))),
+        || {
+            inner
+                .engine
+                .spawn_descendant_task(worker_loop(Arc::clone(&inner), Arc::clone(&worker)))
+        },
         || recover_outer_worker(&inner, &worker),
     )
     .await;
@@ -2573,7 +2669,7 @@ async fn notification_worker_supervisor(
 ) {
     supervise_worker_task(
         || {
-            tokio::spawn(notification_worker_loop(
+            inner.engine.spawn_descendant_task(notification_worker_loop(
                 Arc::clone(&inner),
                 recipient,
                 Arc::clone(&worker),
@@ -2708,11 +2804,11 @@ async fn supervised_process(
     worker: &Arc<Worker>,
     handle: &Arc<DeliveryHandle>,
 ) -> Result<(), tokio::task::JoinError> {
-    let inner = Arc::clone(inner);
+    let task_inner = Arc::clone(inner);
     let worker = Arc::clone(worker);
     let handle = Arc::clone(handle);
-    let mut task = DeliveryTask(tokio::spawn(async move {
-        process(&inner, &worker, &handle).await;
+    let mut task = DeliveryTask(inner.engine.spawn_descendant_task(async move {
+        process(&task_inner, &worker, &handle).await;
     }));
     task.wait().await
 }
@@ -6823,12 +6919,17 @@ fn schedule_missing_hook_diagnostic(
     let Some(binding) = inner.hook_liveness.binding(&pane, agent, manifest_id) else {
         return;
     };
-    let inner = Arc::clone(inner);
+    let task_inner = Arc::clone(inner);
     let msg_id = handle.msg_id.clone();
     let to = handle.to.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep_until(deadline).await;
-        crate::selftest::notify_f1_once(&inner, &msg_id, &to, binding);
+    let mut stop = inner.stop.clone();
+    inner.engine.spawn_descendant_task(async move {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                crate::selftest::notify_f1_once(&task_inner, &msg_id, &to, binding);
+            }
+            _ = stop.changed() => {}
+        }
     });
 }
 
@@ -8669,6 +8770,65 @@ mod tests {
         assert_eq!(recoveries.load(Ordering::SeqCst), 1);
         task.abort();
         let _ = task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_drain_waits_for_an_aborted_worker_child() {
+        struct DropSignal(Arc<AtomicBool>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let engine = Arc::new(Engine::new());
+        let started = Arc::new(Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let spawn_engine = Arc::clone(&engine);
+        let spawn_started = Arc::clone(&started);
+        let spawn_dropped = Arc::clone(&dropped);
+        let supervisor = tokio::spawn(supervise_worker_task(
+            move || {
+                let started = Arc::clone(&spawn_started);
+                let marker = DropSignal(Arc::clone(&spawn_dropped));
+                spawn_engine.spawn_descendant_task(async move {
+                    let _marker = marker;
+                    started.notify_one();
+                    std::future::pending::<()>().await;
+                })
+            },
+            || false,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("tracked worker child starts");
+        supervisor.abort();
+        let _ = supervisor.await;
+        tokio::time::timeout(Duration::from_secs(1), engine.wait_for_descendant_tasks())
+            .await
+            .expect("shutdown drain observes the child cancellation");
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn stopping_cancels_a_tracked_descendant() {
+        let engine = Engine::new();
+        let started = Arc::new(Notify::new());
+        let task_started = Arc::clone(&started);
+        let task = engine.spawn_descendant_task(async move {
+            task_started.notify_one();
+            std::future::pending::<()>().await;
+        });
+
+        started.notified().await;
+        engine.begin_stopping();
+
+        tokio::time::timeout(Duration::from_secs(1), engine.wait_for_descendant_tasks())
+            .await
+            .expect("shutdown cancels tracked descendants");
+        task.await.expect("tracked task exits without panic");
     }
 
     #[tokio::test]
