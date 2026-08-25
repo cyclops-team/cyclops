@@ -12654,7 +12654,7 @@ mod composer_content_proof {
     }
 
     #[test]
-    fn claude_2_1_243_fable_empty_composer_is_visible_to_recovery() {
+    fn claude_current_fable_empty_composer_is_visible_across_box_palette() {
         let capture = concat!(
             "\u{1b}[38;5;244m────────────────────────────────────────────────\n",
             "\u{1b}[39m❯\u{a0}                                                \n",
@@ -12663,16 +12663,24 @@ mod composer_content_proof {
             "\u{1b}[39m  \u{1b}[38;5;210m⏵⏵ bypass permissions on\u{1b}[38;5;246m (shift+tab to cycle) · ← 1 agent",
         );
 
-        assert_eq!(
-            composer_content_for_projection_from_joined_capture(&shipped("claude"), capture),
-            ComposerContentProof::Visible(String::new())
-        );
+        for capture in [
+            capture.to_string(),
+            capture.replace("\u{1b}[38;5;244m─", "\u{1b}[38;5;116m─"),
+        ] {
+            assert_eq!(
+                composer_content_for_projection_from_joined_capture(&shipped("claude"), &capture),
+                ComposerContentProof::Visible(String::new())
+            );
 
-        let unexpected = format!("{capture}\nunexpected text");
-        assert_eq!(
-            composer_content_for_projection_from_joined_capture(&shipped("claude"), &unexpected),
-            ComposerContentProof::Unprovable
-        );
+            let unexpected = format!("{capture}\nunexpected text");
+            assert_eq!(
+                composer_content_for_projection_from_joined_capture(
+                    &shipped("claude"),
+                    &unexpected,
+                ),
+                ComposerContentProof::Unprovable
+            );
+        }
     }
 
     #[test]
