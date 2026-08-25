@@ -2516,6 +2516,25 @@ mod tests {
         let stale = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         drop(stale);
 
+        // A connectable socket is not the stale fixture this test intends.
+        // Confirm the dropped listener is gone before testing classification.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match tokio::time::timeout(Duration::from_millis(50), UnixStream::connect(&socket_path))
+                .await
+            {
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => break,
+                Ok(Ok(stream)) => drop(stream),
+                Ok(Err(error)) => panic!("stale socket fixture failed: {error}"),
+                Err(_) => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stale socket fixture remained connectable"
+            );
+            tokio::task::yield_now().await;
+        }
+
         let bound = bind_socket(&state_root).await.unwrap();
         let summary = state_root
             .repair_descendant_permissions(Some(std::ffi::OsStr::new(cyclops_proto::SOCK_NAME)))

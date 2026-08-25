@@ -290,7 +290,20 @@ async fn m0_shadow_daemon_end_to_end() {
         .await;
     assert_eq!(ack["result"]["subscribed"], true);
     tmux.run_ok(&["select-pane", "-t", "main", "-T", "IDLE ready"]);
-    let ev = watcher_client.next_event(Duration::from_secs(5)).await;
+    // A settled output recompute can publish a Working-certainty edge after
+    // subscription. Wait for the title transition this step requested.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let ev = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "no idle title event within 5s");
+        let event = watcher_client.next_event(remaining).await;
+        if event["event"] == "state"
+            && event["data"]["pane_id"].as_str() == Some(pane_id.as_str())
+            && event["data"]["state"] == "idle"
+        {
+            break event;
+        }
+    };
     assert_eq!(ev["event"], "state");
     assert_eq!(ev["data"]["pane_id"].as_str(), Some(pane_id.as_str()));
     assert_eq!(ev["data"]["state"], "idle");
