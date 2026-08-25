@@ -391,6 +391,7 @@ impl Store {
     /// A replacement Stop can reuse the same turn key with a new generation.
     /// Keeping selection and removal under one store lock prevents a stale
     /// selection from spinning against repeated replacements.
+    #[cfg(test)]
     pub(crate) fn settle_next_ready_terminal(
         &mut self,
         pane: &PaneKey,
@@ -399,13 +400,32 @@ impl Store {
         preferred: Option<&TurnKey>,
         observed_ms: u64,
     ) -> Option<TerminalSettlement> {
+        self.settle_next_ready_terminal_with_evidence(
+            pane,
+            agent,
+            manifest,
+            preferred,
+            observed_ms,
+            observed_ms,
+        )
+    }
+
+    pub(crate) fn settle_next_ready_terminal_with_evidence(
+        &mut self,
+        pane: &PaneKey,
+        agent: ProcId,
+        manifest: &str,
+        preferred: Option<&TurnKey>,
+        observed_ms: u64,
+        evidence_ms: u64,
+    ) -> Option<TerminalSettlement> {
         let revision = self.visual_revisions.get(pane).copied().unwrap_or_default();
         let pending = self.pending.get(pane)?;
         let eligible = |edge: &&Candidate| {
             edge.agent == agent
                 && edge.manifest == manifest
                 && revision > edge.visual_revision
-                && edge.edge_ms < observed_ms
+                && edge.edge_ms < evidence_ms
                 && edge.ready_at_ms <= observed_ms
         };
         let preferred_end = preferred
@@ -864,6 +884,39 @@ mod tests {
 
         assert_eq!(settled.end.turn, ready);
         assert!(store.end_is_current(&pane, &future));
+    }
+
+    #[test]
+    fn a_delayed_capture_cannot_settle_an_edge_newer_than_its_source() {
+        let pane = PaneKey::new(0, "%1");
+        let turn = TurnKey::for_test(&["session", "prompt"]);
+        let mut store = Store::new();
+        let candidate = store.record_end(&pane, agent(10), "claude", turn.clone(), "Stop", 30, 0);
+        store.note_visual_change(&pane);
+
+        assert!(store
+            .settle_next_ready_terminal_with_evidence(
+                &pane,
+                agent(10),
+                "claude",
+                Some(&turn),
+                50,
+                20,
+            )
+            .is_none());
+        assert!(store.end_is_current(&pane, &candidate));
+
+        let settled = store
+            .settle_next_ready_terminal_with_evidence(
+                &pane,
+                agent(10),
+                "claude",
+                Some(&turn),
+                50,
+                40,
+            )
+            .expect("later terminal evidence settles the exact Stop");
+        assert_eq!(settled.end.turn, turn);
     }
 
     #[test]

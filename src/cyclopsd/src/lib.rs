@@ -3085,7 +3085,7 @@ async fn run_session(
         messaging::schedule_route_changed(inner, idx, &row.pane_id);
     }
     // Per-pane debounce kickers for output activity.
-    let mut debounce: HashMap<String, mpsc::Sender<()>> = HashMap::new();
+    let mut debounce: HashMap<String, watch::Sender<u64>> = HashMap::new();
     loop {
         tokio::select! {
             _ = stop.changed() => return true,
@@ -3580,7 +3580,7 @@ async fn handle_pane_event(
     inner: &Arc<Inner>,
     session_idx: usize,
     watcher: &Arc<SessionWatcher>,
-    debounce: &mut HashMap<String, mpsc::Sender<()>>,
+    debounce: &mut HashMap<String, watch::Sender<u64>>,
     ev: PaneEvent,
 ) -> bool {
     match ev {
@@ -3803,7 +3803,7 @@ async fn handle_pane_event(
             }
             false
         }
-        PaneEvent::OutputActivity { pane_id, .. } => {
+        PaneEvent::OutputActivity { pane_id, ts } => {
             let Some(row) = watcher.pane(&pane_id) else {
                 return false;
             };
@@ -3815,7 +3815,7 @@ async fn handle_pane_event(
                     return true;
                 }
             }
-            kick_debounce(inner, session_idx, watcher, debounce, pane_id);
+            kick_debounce(inner, session_idx, watcher, debounce, pane_id, ts);
             false
         }
         PaneEvent::Paused { pane_id } => {
@@ -3867,26 +3867,22 @@ async fn handle_pane_event(
     }
 }
 
-/// Feed a pane's debounce task, spawning it on first activity. A full
-/// channel means a recompute is already pending; nothing to do.
+/// Feed a pane's debounce task, spawning it on first activity. An existing
+/// task keeps only the newest output evidence timestamp for the pane.
 fn kick_debounce(
     inner: &Arc<Inner>,
     session_idx: usize,
     watcher: &Arc<SessionWatcher>,
-    debounce: &mut HashMap<String, mpsc::Sender<()>>,
+    debounce: &mut HashMap<String, watch::Sender<u64>>,
     pane_id: String,
+    evidence_ms: u64,
 ) {
     if let Some(tx) = debounce.get(&pane_id) {
-        match tx.try_send(()) {
-            Ok(()) => return,
-            Err(mpsc::error::TrySendError::Full(())) => return,
-            // Task ended (should not happen while the sender lives, but a
-            // panic inside it would); fall through and respawn.
-            Err(mpsc::error::TrySendError::Closed(())) => {}
+        if update_output_evidence(tx, evidence_ms) {
+            return;
         }
     }
-    let (tx, rx) = mpsc::channel(8);
-    let _ = tx.try_send(());
+    let (tx, rx) = watch::channel(evidence_ms);
     debounce.insert(pane_id.clone(), tx);
     tokio::spawn(debounce_task(
         rx,
@@ -3895,6 +3891,16 @@ fn kick_debounce(
         Arc::clone(watcher),
         pane_id,
     ));
+}
+
+fn update_output_evidence(tx: &watch::Sender<u64>, evidence_ms: u64) -> bool {
+    if tx.receiver_count() == 0 {
+        return false;
+    }
+    // A watch channel has no full state. The settle task always sees the
+    // newest causal timestamp even when it falls behind an output burst.
+    tx.send_modify(|current| *current = (*current).max(evidence_ms));
+    true
 }
 
 /// Output settle debounce: a reset timer, not an interval. The sleep only
@@ -3910,34 +3916,47 @@ fn kick_debounce(
 /// append-only-stable for the daemon's whole life regardless of how many
 /// times the slot it names gets renamed.
 async fn debounce_task(
-    mut rx: mpsc::Receiver<()>,
+    mut rx: watch::Receiver<u64>,
     inner: Arc<Inner>,
     session_idx: usize,
     watcher: Arc<SessionWatcher>,
     pane_id: String,
 ) {
-    while rx.recv().await.is_some() {
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(OUTPUT_SETTLE) => break,
-                more = rx.recv() => {
-                    if more.is_none() {
-                        return;
-                    }
-                    // Another burst of output: restart the settle window.
-                }
-            }
-        }
-        fusion::recompute_pane(
+    loop {
+        let Some(evidence_ms) = settled_output_evidence(&mut rx).await else {
+            return;
+        };
+        fusion::recompute_pane_from_output(
             &inner,
             session_idx,
             &watcher,
             &pane_id,
             false,
             "output_settled",
+            evidence_ms,
         )
         .await;
         messaging::schedule_route_changed(&inner, session_idx, &pane_id);
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Wait for one quiet output window and return the newest causal timestamp.
+async fn settled_output_evidence(rx: &mut watch::Receiver<u64>) -> Option<u64> {
+    let mut evidence_ms = *rx.borrow_and_update();
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(OUTPUT_SETTLE) => return Some(evidence_ms),
+            changed = rx.changed() => {
+                if changed.is_err() {
+                    return None;
+                }
+                evidence_ms = evidence_ms.max(*rx.borrow_and_update());
+                // Another burst of output: restart the settle window.
+            }
+        }
     }
 }
 
@@ -3952,6 +3971,38 @@ pub(crate) fn unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_debounce_retains_the_newest_causal_timestamp() {
+        let (tx, mut rx) = watch::channel(10);
+
+        assert!(update_output_evidence(&tx, 30));
+        assert!(update_output_evidence(&tx, 20));
+        assert!(update_output_evidence(&tx, 40));
+        assert_eq!(*rx.borrow_and_update(), 40);
+
+        drop(rx);
+        assert!(!update_output_evidence(&tx, 50));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn output_debounce_resets_and_returns_the_newest_source_edge() {
+        let (tx, mut rx) = watch::channel(10);
+        let settled = tokio::spawn(async move { settled_output_evidence(&mut rx).await });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(update_output_evidence(&tx, 30));
+        tokio::task::yield_now().await;
+        tokio::time::advance(OUTPUT_SETTLE - Duration::from_millis(1)).await;
+        assert!(!settled.is_finished());
+        assert!(update_output_evidence(&tx, 20));
+        assert!(update_output_evidence(&tx, 40));
+        tokio::task::yield_now().await;
+        tokio::time::advance(OUTPUT_SETTLE).await;
+
+        assert_eq!(settled.await.unwrap(), Some(40));
+    }
 
     #[test]
     fn boot_rejects_a_socket_outside_the_held_state_root() {

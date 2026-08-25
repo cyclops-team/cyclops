@@ -288,6 +288,28 @@ async fn c6_human_prompt_holds_an_unrelated_cyclops_delivery() {
         })
         .await;
 
+    // Claude can accept a prompt before it paints output. A later clean frame
+    // is still neutral, so elapsed time cannot make the pane write-ready.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let status = rig.ctl.request("status", json!({})).await;
+    let pane_status = status["result"]["sessions"][0]["panes"]
+        .as_array()
+        .and_then(|panes| panes.iter().find(|row| row["pane_id"] == pane.as_str()))
+        .unwrap_or_else(|| panic!("pane missing after delayed prompt start: {status}"));
+    assert_eq!(pane_status["state"], "working", "{status}");
+    assert_eq!(pane_status["working_confirmed"], false, "{status}");
+
+    let (sent, _) = rig
+        .send(json!({"to": ["keyed"], "subject": "held", "body": "body"}))
+        .await;
+    let id = sent["msg_id"].as_str().unwrap().to_string();
+    wait_delivery_state(&mut rig, &id, "gating").await;
+    assert_eq!(rig.final_state(&id, "keyed").as_deref(), Some("gating"));
+    assert!(
+        !rig.tmux.capture(&pane).contains(&id),
+        "the unrelated delivery wrote while the human turn was working"
+    );
+
     // Visual output confirms only the pane runtime. The unmatched human
     // prompt did not claim any Cyclops notification receipt.
     send_fixture_key(&rig, &pane, "C-t");
@@ -299,16 +321,10 @@ async fn c6_human_prompt_holds_an_unrelated_cyclops_delivery() {
                 && event["data"]["working_confirmed"] == true
         })
         .await;
-
-    let (sent, _) = rig
-        .send(json!({"to": ["keyed"], "subject": "held", "body": "body"}))
-        .await;
-    let id = sent["msg_id"].as_str().unwrap().to_string();
-    wait_delivery_state(&mut rig, &id, "gating").await;
     assert_eq!(rig.final_state(&id, "keyed").as_deref(), Some("gating"));
     assert!(
         !rig.tmux.capture(&pane).contains(&id),
-        "the unrelated delivery wrote while the human turn was working"
+        "visual confirmation released a delivery before the turn ended"
     );
 
     send_fixture_key(&rig, &pane, "C-y");
@@ -366,9 +382,16 @@ async fn unconfirmed_dispatch_cannot_be_revived_by_a_later_human_prompt() {
         })
         .await;
 
-    // No visual Working frame follows. The bounded one-shot recheck retires
-    // both the pane overlay and this exact receipt candidate.
-    wait_pane_state(&mut rig, "idle").await;
+    // No visual Working frame follows. A clean frame cannot reject the hook
+    // edge based only on age, so runtime remains conservatively Working.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let status = rig.ctl.request("status", json!({})).await;
+    let pane_status = status["result"]["sessions"][0]["panes"]
+        .as_array()
+        .and_then(|panes| panes.iter().find(|row| row["pane_id"] == pane.as_str()))
+        .unwrap_or_else(|| panic!("pane missing after unconfirmed dispatch: {status}"));
+    assert_eq!(pane_status["state"], "working", "{status}");
+    assert_eq!(pane_status["working_confirmed"], false, "{status}");
     assert_ne!(
         rig.final_state(&id, "keyed").as_deref(),
         Some("delivered_verified"),
@@ -592,8 +615,6 @@ async fn claude_blocked_stop_can_be_retried_for_the_same_prompt() {
         first_stop["state"].is_null(),
         "candidate Stop claimed idle: {first_stop}"
     );
-    send_fixture_key(&rig, &pane, "C-l");
-    tokio::time::sleep(Duration::from_millis(250)).await;
     let read = rig
         .ctl
         .request(
