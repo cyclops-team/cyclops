@@ -363,7 +363,9 @@ requires the matching terminal-action intent and the resolution-specific
 action and consumption evidence. A missing proof version is accepted only for
 historical format 1 or older doorbells and legacy direct payloads with the
 incomplete process binding. This compatibility path cannot authorize a new
-terminal action.
+terminal action. Replay also accepts the historical direct `staged` to
+`submitted` edge for those same records. Live writes still require the current
+`submitting` boundary.
 
 `writing` is also the durable composer-barrier boundary. Its content-free
 binding records the exact recipient, pane-root generation, foreground leader

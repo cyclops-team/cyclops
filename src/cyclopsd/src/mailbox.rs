@@ -474,6 +474,35 @@ struct NotificationProjectionUpdate {
     record: NotificationRecord,
 }
 
+fn uses_legacy_notification_write_contract(record: &NotificationRecord) -> bool {
+    let legacy_transport = match record.transport {
+        NotificationTransport::Doorbell => matches!(
+            record.doorbell_format,
+            None | Some(DOORBELL_FORMAT_COMPACT_CLAIM)
+        ),
+        NotificationTransport::DirectPayload => record.doorbell_format.is_none(),
+    };
+    legacy_transport
+        && record
+            .binding
+            .as_ref()
+            .is_some_and(|binding| binding.pane_root.is_none())
+}
+
+/// Accept the direct Staged to Submitted edge written before submit intent
+/// became its own durable state. Current process bindings use the strict graph.
+fn notification_transition_allowed(
+    record: &NotificationRecord,
+    next: NotificationState,
+    replaying: bool,
+) -> bool {
+    record.state.can_transition_to(next)
+        || (replaying
+            && record.state == NotificationState::Staged
+            && next == NotificationState::Submitted
+            && uses_legacy_notification_write_contract(record))
+}
+
 struct ReplyDerivation {
     recipient: RecipientKey,
     recipient_label: String,
@@ -797,7 +826,21 @@ impl MailboxProjection {
         Ok(())
     }
 
+    fn apply_replayed_owned(&mut self, line: LedgerLine) -> Result<(), MailboxError> {
+        let prepared = self.prepare_line_inner(&line, true)?;
+        self.commit_line(line, prepared);
+        Ok(())
+    }
+
     fn prepare_line(&self, line: &LedgerLine) -> Result<PreparedMutation, MailboxError> {
+        self.prepare_line_inner(line, false)
+    }
+
+    fn prepare_line_inner(
+        &self,
+        line: &LedgerLine,
+        replaying: bool,
+    ) -> Result<PreparedMutation, MailboxError> {
         let previous = self.last_workspace_seq.unwrap_or(0);
         let expected = previous
             .checked_add(1)
@@ -814,7 +857,7 @@ impl MailboxProjection {
 
         match line.kind {
             Kind::Msg | Kind::Fyi => self.prepare_message(line),
-            Kind::State => self.prepare_state(line),
+            Kind::State => self.prepare_state(line, replaying),
             _ => Err(MailboxError::UncanonicalRow(format!(
                 "unsupported workspace row kind {:?} seq {}",
                 line.kind, line.seq
@@ -822,7 +865,11 @@ impl MailboxProjection {
         }
     }
 
-    fn prepare_state(&self, line: &LedgerLine) -> Result<PreparedMutation, MailboxError> {
+    fn prepare_state(
+        &self,
+        line: &LedgerLine,
+        replaying: bool,
+    ) -> Result<PreparedMutation, MailboxError> {
         let fact_type = line
             .data
             .as_ref()
@@ -831,7 +878,9 @@ impl MailboxProjection {
         match fact_type {
             Some("message_claimed") => self.prepare_claim(line),
             Some("message_delivered_direct") => self.prepare_delivered_direct(line),
-            Some("notification_transition") => self.prepare_notification_transition(line),
+            Some("notification_transition") => {
+                self.prepare_notification_transition(line, replaying)
+            }
             Some("notification_requeued") => self.prepare_notification_requeue(line),
             Some("notifications_requeued") => self.prepare_notification_requeues(line),
             Some("notification_cleared") => self.prepare_notification_clear(line),
@@ -1269,6 +1318,7 @@ impl MailboxProjection {
     fn prepare_notification_transition(
         &self,
         line: &LedgerLine,
+        replaying: bool,
     ) -> Result<PreparedMutation, MailboxError> {
         let fact: NotificationFact = serde_json::from_value(
             line.data
@@ -1319,7 +1369,7 @@ impl MailboxProjection {
             {
                 return Err(MailboxError::NotificationPreWriteReopenExhausted);
             }
-            Some(current) if !current.state.can_transition_to(state) => {
+            Some(current) if !notification_transition_allowed(current, state, replaying) => {
                 return Err(MailboxError::InvalidNotificationTransition {
                     from: current.state,
                     to: state,
@@ -1908,19 +1958,7 @@ impl MailboxProjection {
                 // Legacy final facts predate separate action and consumption
                 // boundaries. Limit this compatibility path to the incomplete
                 // bindings and doorbell formats written by shipped daemons.
-                let legacy_transport = match current.transport {
-                    NotificationTransport::Doorbell => matches!(
-                        current.doorbell_format,
-                        None | Some(DOORBELL_FORMAT_COMPACT_CLAIM)
-                    ),
-                    NotificationTransport::DirectPayload => current.doorbell_format.is_none(),
-                };
-                let legacy_writing = legacy_transport
-                    && current
-                        .binding
-                        .as_ref()
-                        .is_some_and(|binding| binding.pane_root.is_none());
-                if !legacy_writing
+                if !uses_legacy_notification_write_contract(current)
                     || self.resolution_actions_accepted.contains_key(&attempt_id)
                     || self.resolution_consumptions.contains_key(&attempt_id)
                     || self
@@ -5216,7 +5254,7 @@ impl MessageStore {
         let (writer, lines) = LedgerWriter::open_strict_with_replay(root, descendant, boot_id)?;
         let mut projection = MailboxProjection::new(workspace_id);
         for line in lines {
-            projection.apply_owned(line)?;
+            projection.apply_replayed_owned(line)?;
         }
         Ok(Self {
             writer,
@@ -9198,11 +9236,12 @@ mod tests {
         }
     }
 
-    fn sample_queued_notification_line(
+    fn sample_notification_state_line(
         seq: u64,
         message_id: MessageId,
         recipient: RecipientKey,
         attempt_id: NotificationAttemptId,
+        state: NotificationState,
     ) -> LedgerLine {
         LedgerLine {
             seq,
@@ -9222,7 +9261,7 @@ mod tests {
                     attempt_id,
                     message_id,
                     recipient,
-                    state: NotificationState::Queued,
+                    state,
                     binding: None,
                     transport: None,
                     doorbell_format: None,
@@ -9233,6 +9272,21 @@ mod tests {
                 .unwrap(),
             ),
         }
+    }
+
+    fn sample_queued_notification_line(
+        seq: u64,
+        message_id: MessageId,
+        recipient: RecipientKey,
+        attempt_id: NotificationAttemptId,
+    ) -> LedgerLine {
+        sample_notification_state_line(
+            seq,
+            message_id,
+            recipient,
+            attempt_id,
+            NotificationState::Queued,
+        )
     }
 
     #[test]
@@ -11645,6 +11699,187 @@ mod tests {
         assert!(!recipient.needs_action);
         assert_eq!(snapshot.counts.open_attention_entries, 0);
         assert_eq!(snapshot.counts.work_messages, 0);
+    }
+
+    fn assert_legacy_staged_submit_replays(
+        tag: &str,
+        transport: NotificationTransport,
+        doorbell_format: Option<u32>,
+    ) {
+        let scratch = StoreScratch::new(tag);
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, admin, bob, _) = test_context();
+        let message_id = MessageId::new(format!("m-{tag}")).unwrap();
+        let submitted = {
+            let mut store = MessageStore::open(&root, journal, workspace, "boot-1").unwrap();
+            store
+                .accept_at(message_id.clone(), draft(admin, vec![bob], "Op", None), 1)
+                .unwrap();
+            for (offset, state) in [NotificationState::Queued, NotificationState::Gating]
+                .into_iter()
+                .enumerate()
+            {
+                store
+                    .append_notification_transition_at(
+                        message_id.clone(),
+                        bob,
+                        attempt(1),
+                        state,
+                        None,
+                        None,
+                        2 + offset as u64,
+                    )
+                    .unwrap();
+            }
+            store
+                .append_notification_transition_with_transport_at(
+                    message_id.clone(),
+                    bob,
+                    attempt(1),
+                    NotificationState::Writing,
+                    Some(legacy_notification_binding(bob)),
+                    Some(transport),
+                    doorbell_format,
+                    None,
+                    4,
+                )
+                .unwrap();
+            store
+                .append_notification_transition_at(
+                    message_id.clone(),
+                    bob,
+                    attempt(1),
+                    NotificationState::Staged,
+                    None,
+                    None,
+                    5,
+                )
+                .unwrap();
+            let line = sample_notification_state_line(
+                store.projection().last_sequence().unwrap() + 1,
+                message_id.clone(),
+                bob,
+                attempt(1),
+                NotificationState::Submitted,
+            );
+            assert!(matches!(
+                store.projection.apply_line(&line),
+                Err(MailboxError::InvalidNotificationTransition {
+                    from: NotificationState::Staged,
+                    to: NotificationState::Submitted,
+                })
+            ));
+            line
+        };
+        let mut file = root.open_append(journal).unwrap();
+        serde_json::to_writer(&mut file, &submitted).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.sync_data().unwrap();
+
+        let reopened = MessageStore::open(&root, journal, workspace, "boot-2").unwrap();
+        assert_eq!(
+            reopened
+                .projection()
+                .notification(bob, &message_id)
+                .unwrap()
+                .state,
+            NotificationState::Submitted
+        );
+    }
+
+    #[test]
+    fn shipped_staged_submit_edges_replay_without_weakening_live_appends() {
+        assert_legacy_staged_submit_replays(
+            "legacy-verbose-submit",
+            NotificationTransport::Doorbell,
+            None,
+        );
+        assert_legacy_staged_submit_replays(
+            "legacy-doorbell-submit",
+            NotificationTransport::Doorbell,
+            Some(DOORBELL_FORMAT_COMPACT_CLAIM),
+        );
+        assert_legacy_staged_submit_replays(
+            "legacy-direct-submit",
+            NotificationTransport::DirectPayload,
+            None,
+        );
+    }
+
+    #[test]
+    fn current_staged_submit_edge_is_rejected_during_replay() {
+        let scratch = StoreScratch::new("current-direct-submit-refused");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, admin, bob, _) = test_context();
+        let message_id = MessageId::new("m-current-direct-submit").unwrap();
+        let submitted = {
+            let mut store = MessageStore::open(&root, journal, workspace, "boot-1").unwrap();
+            store
+                .accept_at(message_id.clone(), draft(admin, vec![bob], "Op", None), 1)
+                .unwrap();
+            for (offset, state) in [NotificationState::Queued, NotificationState::Gating]
+                .into_iter()
+                .enumerate()
+            {
+                store
+                    .append_notification_transition_at(
+                        message_id.clone(),
+                        bob,
+                        attempt(1),
+                        state,
+                        None,
+                        None,
+                        2 + offset as u64,
+                    )
+                    .unwrap();
+            }
+            store
+                .append_notification_transition_with_transport_at(
+                    message_id.clone(),
+                    bob,
+                    attempt(1),
+                    NotificationState::Writing,
+                    Some(notification_binding(bob)),
+                    Some(NotificationTransport::Doorbell),
+                    Some(DOORBELL_FORMAT_ATTEMPT_CLAIM),
+                    None,
+                    4,
+                )
+                .unwrap();
+            store
+                .append_notification_transition_at(
+                    message_id.clone(),
+                    bob,
+                    attempt(1),
+                    NotificationState::Staged,
+                    None,
+                    None,
+                    5,
+                )
+                .unwrap();
+            sample_notification_state_line(
+                store.projection().last_sequence().unwrap() + 1,
+                message_id.clone(),
+                bob,
+                attempt(1),
+                NotificationState::Submitted,
+            )
+        };
+        let mut file = root.open_append(journal).unwrap();
+        serde_json::to_writer(&mut file, &submitted).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.sync_data().unwrap();
+
+        assert!(matches!(
+            MessageStore::open(&root, journal, workspace, "boot-2"),
+            Err(MessageStoreError::Mailbox(error))
+                if matches!(error.as_ref(), MailboxError::InvalidNotificationTransition {
+                    from: NotificationState::Staged,
+                    to: NotificationState::Submitted,
+                })
+        ));
     }
 
     #[test]

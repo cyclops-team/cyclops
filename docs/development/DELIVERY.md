@@ -46,6 +46,8 @@ Current terminal-action settlements append `notification_resolved` with
 consumption facts. Missing proof versions are limited to historical format 1
 or older doorbells and legacy direct payloads with incomplete process bindings.
 They settle the old attempt during replay but cannot authorize a new action.
+The same replay-only contract accepts the historical direct `Staged` to
+`Submitted` edge. Current writes must pass through `Submitting`.
 
 ## Direct payload rendering
 
