@@ -8043,6 +8043,7 @@ mod tests {
         );
 
         drop(reopened_context);
+        drop(context);
         drop(service);
         let directory = MailboxDirectory::new(
             workspace,
