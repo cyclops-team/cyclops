@@ -22,6 +22,7 @@ use cyclops_proto::{
     NotificationState, NotificationTransport, ProcessInstanceId, RecipientKey, RequestDigest,
     StatusBlockedNotification, StatusNextAction, TmuxPaneId, WorkspaceId, CANONICAL_RECORD_VERSION,
     DOORBELL_FORMAT_ATTEMPT_CLAIM, DOORBELL_FORMAT_COMPACT_CLAIM,
+    NOTIFICATION_RESOLUTION_PROOF_VERSION,
 };
 use cyclops_state::StateRoot;
 use tokio::sync::broadcast;
@@ -1873,6 +1874,7 @@ impl MailboxProjection {
         .map_err(|error| MailboxError::InvalidNotificationFact(error.to_string()))?;
         let NotificationFact::NotificationResolved {
             record_version,
+            proof_version,
             attempt_id,
             message_id,
             recipient,
@@ -1901,22 +1903,63 @@ impl MailboxProjection {
         if self.resolved_attempts.contains_key(&attempt_id) {
             return Err(MailboxError::NotificationAlreadyResolved(attempt_id));
         }
-        if self.resolution_intents.get(&attempt_id) != Some(&resolution) {
-            return Err(MailboxError::NotificationResolutionAmbiguous(attempt_id));
-        }
-        match (
-            resolution,
-            self.resolution_actions_accepted.get(&attempt_id).copied(),
-            self.resolution_consumptions.get(&attempt_id),
-        ) {
-            (
-                NotificationResolution::Complete,
-                Some(NotificationResolution::Complete),
-                Some(observation),
-            ) if observation.evidence.proves_exact_consumption() => {}
-            (NotificationResolution::Discard, None, None)
-            | (NotificationResolution::Discard, Some(NotificationResolution::Discard), None) => {}
-            _ => return Err(MailboxError::NotificationResolutionAmbiguous(attempt_id)),
+        match proof_version {
+            0 => {
+                // Legacy final facts predate separate action and consumption
+                // boundaries. Limit this compatibility path to the incomplete
+                // bindings and doorbell formats written by shipped daemons.
+                let legacy_transport = match current.transport {
+                    NotificationTransport::Doorbell => matches!(
+                        current.doorbell_format,
+                        None | Some(DOORBELL_FORMAT_COMPACT_CLAIM)
+                    ),
+                    NotificationTransport::DirectPayload => current.doorbell_format.is_none(),
+                };
+                let legacy_writing = legacy_transport
+                    && current
+                        .binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.pane_root.is_none());
+                if !legacy_writing
+                    || self.resolution_actions_accepted.contains_key(&attempt_id)
+                    || self.resolution_consumptions.contains_key(&attempt_id)
+                    || self
+                        .resolution_intents
+                        .get(&attempt_id)
+                        .is_some_and(|recorded| *recorded != resolution)
+                {
+                    return Err(MailboxError::NotificationResolutionAmbiguous(attempt_id));
+                }
+            }
+            NOTIFICATION_RESOLUTION_PROOF_VERSION => {
+                if self.resolution_intents.get(&attempt_id) != Some(&resolution) {
+                    return Err(MailboxError::NotificationResolutionAmbiguous(attempt_id));
+                }
+                match (
+                    resolution,
+                    self.resolution_actions_accepted.get(&attempt_id).copied(),
+                    self.resolution_consumptions.get(&attempt_id),
+                ) {
+                    (
+                        NotificationResolution::Complete,
+                        Some(NotificationResolution::Complete),
+                        Some(observation),
+                    ) if observation.evidence.proves_exact_consumption() => {}
+                    (
+                        NotificationResolution::Discard,
+                        Some(NotificationResolution::Discard),
+                        None,
+                    ) => {}
+                    _ => {
+                        return Err(MailboxError::NotificationResolutionAmbiguous(attempt_id));
+                    }
+                }
+            }
+            unsupported => {
+                return Err(MailboxError::InvalidNotificationFact(format!(
+                    "unsupported notification resolution proof version {unsupported}"
+                )));
+            }
         }
         Ok(PreparedMutation::NotificationResolved {
             attempt_id,
@@ -6007,6 +6050,7 @@ impl MessageStore {
     ) -> Result<NotificationRecord, MessageStoreError> {
         let fact = NotificationFact::NotificationResolved {
             record_version: CANONICAL_RECORD_VERSION,
+            proof_version: NOTIFICATION_RESOLUTION_PROOF_VERSION,
             attempt_id,
             message_id: message_id.clone(),
             recipient,
@@ -6434,6 +6478,13 @@ mod tests {
             leader: Some(ProcessInstanceId::new(4000, 818_000).unwrap()),
             agent: ProcessInstanceId::new(4242, 818_221).unwrap(),
             manifest: NotificationManifestId::new("codex").unwrap(),
+        }
+    }
+
+    fn legacy_notification_binding(recipient: RecipientKey) -> NotificationBinding {
+        NotificationBinding {
+            pane_root: None,
+            ..notification_binding(recipient)
         }
     }
 
@@ -10544,6 +10595,81 @@ mod tests {
             .unwrap();
     }
 
+    fn legacy_alarm(
+        store: &mut MessageStore,
+        message_id: &MessageId,
+        recipient: RecipientKey,
+        attempt_id: NotificationAttemptId,
+        transport: NotificationTransport,
+        doorbell_format: Option<u32>,
+        base_ts: u64,
+    ) {
+        for (offset, state) in [NotificationState::Queued, NotificationState::Gating]
+            .into_iter()
+            .enumerate()
+        {
+            store
+                .append_notification_transition_at(
+                    message_id.clone(),
+                    recipient,
+                    attempt_id,
+                    state,
+                    None,
+                    None,
+                    base_ts + offset as u64,
+                )
+                .unwrap();
+        }
+        store
+            .append_notification_transition_with_transport_at(
+                message_id.clone(),
+                recipient,
+                attempt_id,
+                NotificationState::Writing,
+                Some(legacy_notification_binding(recipient)),
+                Some(transport),
+                doorbell_format,
+                None,
+                base_ts + 2,
+            )
+            .unwrap();
+        store
+            .append_notification_transition_at(
+                message_id.clone(),
+                recipient,
+                attempt_id,
+                NotificationState::AttentionRequired,
+                None,
+                Some(NotificationAttentionCause::VerifyFailed),
+                base_ts + 3,
+            )
+            .unwrap();
+    }
+
+    fn append_resolution_at(
+        store: &mut MessageStore,
+        message_id: &MessageId,
+        recipient: RecipientKey,
+        attempt_id: NotificationAttemptId,
+        proof_version: u32,
+        resolution: NotificationResolution,
+        ts: u64,
+    ) -> Result<NotificationRecord, MessageStoreError> {
+        store.append_notification_fact_at(
+            message_id.clone(),
+            recipient,
+            NotificationFact::NotificationResolved {
+                record_version: CANONICAL_RECORD_VERSION,
+                proof_version,
+                attempt_id,
+                message_id: message_id.clone(),
+                recipient,
+                resolution,
+            },
+            ts,
+        )
+    }
+
     fn quota_hold(
         store: &mut MessageStore,
         message_id: &MessageId,
@@ -11497,6 +11623,7 @@ mod tests {
             let data = resolution.data.as_ref().unwrap();
             assert_eq!(data["type"], "notification_resolved");
             assert_eq!(data["resolution"], "complete");
+            assert_eq!(data["proof_version"], NOTIFICATION_RESOLUTION_PROOF_VERSION);
             assert!(data.get("composer").is_none());
             assert!(data.get("diff").is_none());
         }
@@ -11518,6 +11645,241 @@ mod tests {
         assert!(!recipient.needs_action);
         assert_eq!(snapshot.counts.open_attention_entries, 0);
         assert_eq!(snapshot.counts.work_messages, 0);
+    }
+
+    #[test]
+    fn legacy_resolution_replays_only_for_legacy_write_contracts() {
+        let scratch = StoreScratch::new("legacy-resolution-replay");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, admin, bob, carol) = test_context();
+        let message_id = MessageId::new("m-legacy-resolution").unwrap();
+        {
+            let mut store = MessageStore::open(&root, journal, workspace, "boot-1").unwrap();
+            store
+                .accept_at(
+                    message_id.clone(),
+                    draft(admin, vec![bob, carol], "Op", None),
+                    1,
+                )
+                .unwrap();
+            legacy_alarm(
+                &mut store,
+                &message_id,
+                bob,
+                attempt(1),
+                NotificationTransport::Doorbell,
+                Some(DOORBELL_FORMAT_COMPACT_CLAIM),
+                2,
+            );
+            legacy_alarm(
+                &mut store,
+                &message_id,
+                carol,
+                attempt(2),
+                NotificationTransport::DirectPayload,
+                None,
+                10,
+            );
+            store
+                .record_notification_resolution_intent(
+                    message_id.clone(),
+                    bob,
+                    attempt(1),
+                    NotificationResolution::Complete,
+                )
+                .unwrap();
+            for (recipient, attempt_id, ts) in [(bob, attempt(1), 20), (carol, attempt(2), 21)] {
+                append_resolution_at(
+                    &mut store,
+                    &message_id,
+                    recipient,
+                    attempt_id,
+                    0,
+                    NotificationResolution::Complete,
+                    ts,
+                )
+                .unwrap();
+            }
+            let text = std::fs::read_to_string(store.journal_path()).unwrap();
+            let resolved: serde_json::Value =
+                serde_json::from_str(text.lines().last().unwrap()).unwrap();
+            assert!(resolved["data"].get("proof_version").is_none());
+        }
+
+        let reopened = MessageStore::open(&root, journal, workspace, "boot-2").unwrap();
+        assert!(reopened.projection().attention_resolved(attempt(1)));
+        assert!(reopened.projection().attention_resolved(attempt(2)));
+        assert!(reopened.projection().open_alarms().is_empty());
+        assert!(reopened
+            .projection()
+            .active_notification_barriers()
+            .is_empty());
+        assert!(reopened.projection().resolution_actions_accepted.is_empty());
+        assert!(reopened.projection().resolution_consumptions.is_empty());
+    }
+
+    #[test]
+    fn legacy_resolution_refuses_downgrades_mismatches_and_hybrids() {
+        let (_scratch, mut store, message_id, bob) = operator_store("legacy-resolution-refuse");
+        alarm(&mut store, &message_id, bob, attempt(1), 2);
+        store
+            .record_notification_resolution_intent(
+                message_id.clone(),
+                bob,
+                attempt(1),
+                NotificationResolution::Complete,
+            )
+            .unwrap();
+        let before = store.projection().last_sequence();
+        assert!(matches!(
+            append_resolution_at(
+                &mut store,
+                &message_id,
+                bob,
+                attempt(1),
+                0,
+                NotificationResolution::Complete,
+                10,
+            ),
+            Err(MessageStoreError::Mailbox(error))
+                if matches!(error.as_ref(), MailboxError::NotificationResolutionAmbiguous(id) if *id == attempt(1))
+        ));
+        assert_eq!(store.projection().last_sequence(), before);
+
+        let (_scratch, mut store, message_id, bob) =
+            operator_store("legacy-resolution-intent-mismatch");
+        legacy_alarm(
+            &mut store,
+            &message_id,
+            bob,
+            attempt(1),
+            NotificationTransport::Doorbell,
+            Some(DOORBELL_FORMAT_COMPACT_CLAIM),
+            2,
+        );
+        store
+            .record_notification_resolution_intent(
+                message_id.clone(),
+                bob,
+                attempt(1),
+                NotificationResolution::Discard,
+            )
+            .unwrap();
+        assert!(matches!(
+            append_resolution_at(
+                &mut store,
+                &message_id,
+                bob,
+                attempt(1),
+                0,
+                NotificationResolution::Complete,
+                10,
+            ),
+            Err(MessageStoreError::Mailbox(error))
+                if matches!(error.as_ref(), MailboxError::NotificationResolutionAmbiguous(id) if *id == attempt(1))
+        ));
+
+        let (_scratch, mut store, message_id, bob) = operator_store("legacy-resolution-hybrid");
+        legacy_alarm(
+            &mut store,
+            &message_id,
+            bob,
+            attempt(1),
+            NotificationTransport::Doorbell,
+            Some(DOORBELL_FORMAT_COMPACT_CLAIM),
+            2,
+        );
+        store
+            .record_notification_resolution_intent(
+                message_id.clone(),
+                bob,
+                attempt(1),
+                NotificationResolution::Discard,
+            )
+            .unwrap();
+        store
+            .record_notification_resolution_action_accepted(
+                message_id.clone(),
+                bob,
+                attempt(1),
+                NotificationResolution::Discard,
+            )
+            .unwrap();
+        assert!(matches!(
+            append_resolution_at(
+                &mut store,
+                &message_id,
+                bob,
+                attempt(1),
+                0,
+                NotificationResolution::Discard,
+                10,
+            ),
+            Err(MessageStoreError::Mailbox(error))
+                if matches!(error.as_ref(), MailboxError::NotificationResolutionAmbiguous(id) if *id == attempt(1))
+        ));
+    }
+
+    #[test]
+    fn unknown_resolution_proof_version_is_rejected() {
+        let (_scratch, mut store, message_id, bob) = operator_store("resolution-proof-version");
+        alarm(&mut store, &message_id, bob, attempt(1), 2);
+        let before = store.projection().last_sequence();
+        assert!(matches!(
+            append_resolution_at(
+                &mut store,
+                &message_id,
+                bob,
+                attempt(1),
+                99,
+                NotificationResolution::Complete,
+                10,
+            ),
+            Err(MessageStoreError::Mailbox(error))
+                if matches!(error.as_ref(), MailboxError::InvalidNotificationFact(message)
+                    if message.contains("unsupported notification resolution proof version 99"))
+        ));
+        assert_eq!(store.projection().last_sequence(), before);
+    }
+
+    #[test]
+    fn current_discard_requires_terminal_action_acceptance() {
+        let (_scratch, mut store, message_id, bob) = operator_store("discard-proof-boundary");
+        alarm(&mut store, &message_id, bob, attempt(1), 2);
+        store
+            .record_notification_resolution_intent(
+                message_id.clone(),
+                bob,
+                attempt(1),
+                NotificationResolution::Discard,
+            )
+            .unwrap();
+        let before_acceptance = store.projection().last_sequence();
+        assert!(matches!(
+            store.resolve_notification(
+                message_id.clone(),
+                bob,
+                attempt(1),
+                NotificationResolution::Discard,
+            ),
+            Err(MessageStoreError::Mailbox(error))
+                if matches!(error.as_ref(), MailboxError::NotificationResolutionAmbiguous(id) if *id == attempt(1))
+        ));
+        assert_eq!(store.projection().last_sequence(), before_acceptance);
+
+        store
+            .record_notification_resolution_action_accepted(
+                message_id.clone(),
+                bob,
+                attempt(1),
+                NotificationResolution::Discard,
+            )
+            .unwrap();
+        store
+            .resolve_notification(message_id, bob, attempt(1), NotificationResolution::Discard)
+            .unwrap();
+        assert!(store.projection().attention_resolved(attempt(1)));
     }
 
     #[test]

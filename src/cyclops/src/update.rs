@@ -19,7 +19,7 @@
 //! keeps executing its current process until the operator detaches it.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::{Read as _, Seek as _, Write as _};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{
@@ -1571,6 +1571,88 @@ fn binary_identity(binary: &Path, expected_name: &str) -> Result<String, String>
     Ok(identity.to_string())
 }
 
+const REPLAY_DIAGNOSTIC_TAIL_BYTES: u64 = 8 * 1024;
+const REPLAY_DIAGNOSTIC_MAX_CHARS: usize = 512;
+
+/// Read one bounded tail through the state root's held descriptors.
+fn replay_log_tail(root_path: &Path, descendant: &Path) -> Option<Vec<u8>> {
+    let root = cyclops_state::StateRoot::open_existing(root_path)
+        .ok()
+        .flatten()?;
+    let mut file = root.open_read(descendant).ok().flatten()?;
+    let length = file.seek(std::io::SeekFrom::End(0)).ok()?;
+    file.seek(std::io::SeekFrom::Start(
+        length.saturating_sub(REPLAY_DIAGNOSTIC_TAIL_BYTES),
+    ))
+    .ok()?;
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(length.min(REPLAY_DIAGNOSTIC_TAIL_BYTES)).unwrap_or(0));
+    file.take(REPLAY_DIAGNOSTIC_TAIL_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(bytes)
+}
+
+/// Keep a terminal-safe, single-line diagnostic from an untrusted child log.
+fn sanitize_replay_diagnostic(line: &str) -> Option<String> {
+    let clean: String = line
+        .trim()
+        .chars()
+        .take(REPLAY_DIAGNOSTIC_MAX_CHARS)
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let clean = clean.trim();
+    (!clean.is_empty()).then(|| clean.to_string())
+}
+
+fn daemon_replay_failure_line(bytes: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .rev()
+        .find_map(|raw| {
+            let line = sanitize_replay_diagnostic(raw)?;
+            if !line.contains("ERROR")
+                && !line.contains("boot failed")
+                && !line.contains("cyclopsd panic")
+            {
+                return None;
+            }
+            let detail = line
+                .split_once("boot failed: ")
+                .map(|(_, detail)| detail)
+                .or_else(|| line.split_once("ERROR ").map(|(_, detail)| detail))
+                .unwrap_or(&line);
+            sanitize_replay_diagnostic(detail)
+        })
+}
+
+fn captured_replay_failure_line(bytes: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .rev()
+        .find_map(sanitize_replay_diagnostic)
+}
+
+/// Prefer the daemon's boot log. Diagnostic read failures never replace the
+/// child exit status, and captured stdout or stderr remains the fallback.
+fn candidate_replay_failure_detail(probe_home: &Path, scratch_root: &Path) -> String {
+    replay_log_tail(probe_home, Path::new("cyclopsd.log"))
+        .as_deref()
+        .and_then(daemon_replay_failure_line)
+        .or_else(|| {
+            replay_log_tail(scratch_root, Path::new("candidate-replay.log"))
+                .as_deref()
+                .and_then(captured_replay_failure_line)
+        })
+        .unwrap_or_else(|| "no log output".to_string())
+}
+
 /// Boot the candidate against a private copy of current state. A ready hello
 /// proves that its real daemon startup replayed every configured journal.
 fn prove_candidate_replay(
@@ -1623,10 +1705,9 @@ fn prove_candidate_replay(
             .try_wait()
             .map_err(|error| format!("wait for candidate replay: {error}"))?
         {
-            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            let detail = candidate_replay_failure_detail(&probe_home, scratch.path());
             return Err(format!(
-                "candidate journal replay exited with {status}: {}",
-                log.lines().last().unwrap_or("no log output")
+                "candidate journal replay exited with {status}: {detail}"
             ));
         }
         if std::time::Instant::now() >= deadline {
@@ -2505,6 +2586,26 @@ mod tests {
         .unwrap();
     }
 
+    fn replay_exiting_pair(path: &Path, build: &str, body: &str) {
+        directory(path);
+        write_new(
+            &path.join("cyclops"),
+            format!("#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo 'cyclops 0.1.0 ({build})'\n")
+                .as_bytes(),
+            0o755,
+        )
+        .unwrap();
+        write_new(
+            &path.join("cyclopsd"),
+            format!(
+                "#!/usr/bin/env python3\nimport os, sys\nif len(sys.argv) > 1 and sys.argv[1] == '--version':\n    print('cyclopsd 0.1.0 ({build})')\n    sys.exit(0)\n{body}\n"
+            )
+            .as_bytes(),
+            0o755,
+        )
+        .unwrap();
+    }
+
     fn pair_source_with_execution_probe(path: &Path, build: &str, probe: &Path) {
         directory(path);
         for name in ["cyclops", "cyclopsd"] {
@@ -2610,6 +2711,69 @@ mod tests {
             "unexpected replay failure: {error}"
         );
         assert_replay_probe_reaped(&scratch);
+    }
+
+    #[test]
+    fn candidate_replay_failure_surfaces_the_bounded_daemon_boot_cause() {
+        let scratch = Scratch::create().unwrap();
+        let pair = scratch.path().join("pair");
+        replay_exiting_pair(
+            &pair,
+            "build",
+            r#"home = os.environ['CYCLOPS_HOME']
+path = os.path.join(home, 'cyclopsd.log')
+descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(descriptor, 'wb') as log:
+    log.write(b'x' * 9000 + b'\n')
+    log.write(b'ERROR earlier-secret-must-not-surface\n')
+    log.write(b'2026 ERROR cyclopsd: boot failed: replay-sentinel\x1b[31m\tunsafe\rfield ' + b'z' * 700 + b'\n')
+sys.exit(42)"#,
+        );
+
+        let error =
+            prove_candidate_replay(&pair, &scratch.path().join("absent"), &scratch).unwrap_err();
+
+        assert!(error.contains("exit status: 42"), "{error}");
+        assert!(error.contains("replay-sentinel"), "{error}");
+        assert!(
+            !error.contains("earlier-secret-must-not-surface"),
+            "{error}"
+        );
+        assert!(!error.contains("no log output"), "{error}");
+        assert!(
+            !error
+                .chars()
+                .any(|character| matches!(character, '\u{1b}' | '\r' | '\t')),
+            "{error:?}"
+        );
+        assert!(error.chars().count() <= 600, "diagnostic was not bounded");
+    }
+
+    #[test]
+    fn candidate_replay_failure_falls_back_when_the_daemon_log_is_unreadable() {
+        let scratch = Scratch::create().unwrap();
+        let pair = scratch.path().join("pair");
+        replay_exiting_pair(
+            &pair,
+            "build",
+            r#"home = os.environ['CYCLOPS_HOME']
+os.mkdir(os.path.join(home, 'cyclopsd.log'), 0o700)
+sys.stderr.write('captured-replay-fallback\x1b[31m\tunsafe\rfield\n')
+sys.exit(43)"#,
+        );
+
+        let error =
+            prove_candidate_replay(&pair, &scratch.path().join("absent"), &scratch).unwrap_err();
+
+        assert!(error.contains("exit status: 43"), "{error}");
+        assert!(error.contains("captured-replay-fallback"), "{error}");
+        assert!(!error.contains("no log output"), "{error}");
+        assert!(
+            !error
+                .chars()
+                .any(|character| matches!(character, '\u{1b}' | '\r' | '\t')),
+            "{error:?}"
+        );
     }
 
     #[test]

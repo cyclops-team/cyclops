@@ -358,6 +358,13 @@ doorbell format are delivery metadata, not occupant identity. Later transitions
 retain the projected values without repeating them. A Writing fact with no
 transport means the original doorbell format.
 
+Current `notification_resolved` facts carry `proof_version: 1`. Version 1
+requires the matching terminal-action intent and the resolution-specific
+action and consumption evidence. A missing proof version is accepted only for
+historical format 1 or older doorbells and legacy direct payloads with the
+incomplete process binding. This compatibility path cannot authorize a new
+terminal action.
+
 `writing` is also the durable composer-barrier boundary. Its content-free
 binding records the exact recipient, pane-root generation, foreground leader
 generation, admitted agent generation, and manifest. Older incomplete rows

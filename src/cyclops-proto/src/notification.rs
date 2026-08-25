@@ -442,6 +442,11 @@ pub enum NotificationTransport {
 pub const DOORBELL_FORMAT_COMPACT_CLAIM: u32 = 1;
 /// Claim-command doorbell carrying an injective token for the exact attempt.
 pub const DOORBELL_FORMAT_ATTEMPT_CLAIM: u32 = 2;
+/// Current proof contract for a terminal-action resolution fact.
+///
+/// Missing values identify legacy facts written before action acceptance and
+/// exact consumption became separate durable boundaries.
+pub const NOTIFICATION_RESOLUTION_PROOF_VERSION: u32 = 1;
 
 /// Content-free identity observed immediately before writing to the pane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -644,6 +649,8 @@ pub enum NotificationFact {
     /// positive post-action composer evidence.
     NotificationResolved {
         record_version: u32,
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        proof_version: u32,
         attempt_id: NotificationAttemptId,
         message_id: MessageId,
         recipient: RecipientKey,
@@ -675,6 +682,10 @@ pub enum NotificationFact {
 }
 
 fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
+}
+
+fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 
@@ -1163,6 +1174,7 @@ mod tests {
         let session = "00000000-0000-0000-0000-000000000002".parse().unwrap();
         let fact = NotificationFact::NotificationResolved {
             record_version: 1,
+            proof_version: NOTIFICATION_RESOLUTION_PROOF_VERSION,
             attempt_id: NotificationAttemptId::parse("att-00000000-0000-4000-8000-000000000003")
                 .unwrap(),
             message_id: MessageId::new("m-private").unwrap(),
@@ -1178,16 +1190,31 @@ mod tests {
             [
                 "attempt_id",
                 "message_id",
+                "proof_version",
                 "recipient",
                 "record_version",
                 "resolution",
                 "type",
             ]
         );
+        assert_eq!(
+            value["proof_version"],
+            NOTIFICATION_RESOLUTION_PROOF_VERSION
+        );
         assert_eq!(value["resolution"], "discard");
         assert!(value.get("body").is_none());
         assert!(value.get("composer").is_none());
         assert!(value.get("diff").is_none());
+
+        let mut legacy = value;
+        legacy.as_object_mut().unwrap().remove("proof_version");
+        assert!(matches!(
+            serde_json::from_value::<NotificationFact>(legacy).unwrap(),
+            NotificationFact::NotificationResolved {
+                proof_version: 0,
+                ..
+            }
+        ));
     }
 
     #[test]

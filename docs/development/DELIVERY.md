@@ -41,6 +41,12 @@ opens one attention entry and never writes the payload a second time. Attention
 recovery rebuilds the expected bytes from the durable transport: the fixed row
 for a doorbell, or the canonical message payload for direct fallback.
 
+Current terminal-action settlements append `notification_resolved` with
+`proof_version: 1` and replay only after the exact intent, action, and required
+consumption facts. Missing proof versions are limited to historical format 1
+or older doorbells and legacy direct payloads with incomplete process bindings.
+They settle the old attempt during replay but cannot authorize a new action.
+
 ## Direct payload rendering
 
 The fallback and legacy direct paths use this exact shape:
