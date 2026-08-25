@@ -3133,21 +3133,39 @@ fn reset_immediate_regates(handle: &DeliveryHandle) {
         .regate_reproof_used = [false; 2];
 }
 
-/// Resolve the live watcher that still owns this handle's route.
+/// Result of checking the live route against its durable mailbox binding.
+enum HandleRoute {
+    Exact(Arc<SessionWatcher>),
+    BindingChanged,
+    BindingUnprovable { pane_pid: i32 },
+    Unavailable,
+}
+
+/// Classify the live watcher without treating an identity mismatch as absence.
 ///
-/// Direct delivery keeps its legacy slot lookup. A mailbox notification is
-/// addressable only while the same session instance remains attached in the
-/// original slot and still contains the recipient's exact pane.
-fn watcher_for_handle(inner: &Inner, handle: &DeliveryHandle) -> Option<Arc<SessionWatcher>> {
+/// A pane replacement can reach the watcher before the ordered registry event.
+/// That route is present but changed, so the pre-write barrier must record a
+/// reprovable identity change instead of a permanent session-unavailable block.
+fn handle_route(inner: &Inner, handle: &DeliveryHandle) -> HandleRoute {
     let Some(notification) = &handle.notification else {
-        return inner.watcher_of(handle.session_idx);
+        return inner
+            .watcher_of(handle.session_idx)
+            .map(HandleRoute::Exact)
+            .unwrap_or(HandleRoute::Unavailable);
     };
     let recipient = notification.recipient();
-    let session_instance_id = recipient.session_instance_id()?;
-    if recipient.pane_id()?.to_string() != handle.pane_id {
-        return None;
+    let Some(session_instance_id) = recipient.session_instance_id() else {
+        return HandleRoute::Unavailable;
+    };
+    let Some(pane_id) = recipient.pane_id() else {
+        return HandleRoute::Unavailable;
+    };
+    if pane_id.to_string() != handle.pane_id {
+        return HandleRoute::BindingChanged;
     }
-    let slot = inner.session(handle.session_idx)?;
+    let Some(slot) = inner.session(handle.session_idx) else {
+        return HandleRoute::Unavailable;
+    };
     let watcher = {
         let link = slot.link.lock().expect("session link lock");
         if !link.attached
@@ -3157,19 +3175,62 @@ fn watcher_for_handle(inner: &Inner, handle: &DeliveryHandle) -> Option<Arc<Sess
                 .map(|identity| identity.session_instance_id())
                 != Some(session_instance_id)
         {
-            return None;
+            return HandleRoute::Unavailable;
         }
         link.watcher.as_ref().map(Arc::clone)
-    }?;
-    let row = watcher.pane(&handle.pane_id)?;
-    let root = crate::identity::ProcId::of(row.pane_pid)?;
-    let pane_root = ProcessInstanceId::new(root.pid, root.birth).ok()?;
-    inner
-        .registry
-        .lock()
-        .expect("registry lock")
-        .for_route(recipient, pane_root)?;
-    Some(watcher)
+    };
+    let Some(watcher) = watcher else {
+        return HandleRoute::Unavailable;
+    };
+    let Some(row) = watcher.pane(&handle.pane_id) else {
+        return HandleRoute::Unavailable;
+    };
+    let Some(root) = crate::identity::ProcId::of(row.pane_pid) else {
+        return HandleRoute::BindingUnprovable {
+            pane_pid: row.pane_pid,
+        };
+    };
+    let Ok(pane_root) = ProcessInstanceId::new(root.pid, root.birth) else {
+        return HandleRoute::BindingUnprovable {
+            pane_pid: row.pane_pid,
+        };
+    };
+    let registry = inner.registry.lock().expect("registry lock");
+    if registry.for_route(recipient, pane_root).is_some() {
+        HandleRoute::Exact(watcher)
+    } else if registry.for_recipient(recipient).is_some() {
+        HandleRoute::BindingChanged
+    } else {
+        HandleRoute::BindingUnprovable {
+            pane_pid: row.pane_pid,
+        }
+    }
+}
+
+/// Resolve only a watcher whose durable route binding is exact.
+fn watcher_for_handle(inner: &Inner, handle: &DeliveryHandle) -> Option<Arc<SessionWatcher>> {
+    match handle_route(inner, handle) {
+        HandleRoute::Exact(watcher) => Some(watcher),
+        HandleRoute::BindingChanged
+        | HandleRoute::BindingUnprovable { .. }
+        | HandleRoute::Unavailable => None,
+    }
+}
+
+/// Resolve the route for a write that has not crossed the terminal boundary.
+fn exact_prewrite_watcher(
+    inner: &Inner,
+    handle: &DeliveryHandle,
+    manifest_id: &str,
+) -> Result<Arc<SessionWatcher>, AttemptFailure> {
+    match handle_route(inner, handle) {
+        HandleRoute::Exact(watcher) => Ok(watcher),
+        HandleRoute::BindingChanged => Err(AttemptFailure::pane_rebound_before_paste()),
+        HandleRoute::BindingUnprovable { pane_pid } => Err(AttemptFailure::binding_unprovable(
+            Some(binding_unprovable_observation(pane_pid, manifest_id)),
+        )),
+        HandleRoute::Unavailable => Err(AttemptFailure::session_detached()),
+    }
 }
 
 /// Drive one delivery through gate, inject, submit, ACK, bounded retry.
@@ -3576,6 +3637,8 @@ impl AttemptFailure {
             // transport failure. It goes back to the gate rather than to
             // a human.
             "barrier_held" => Self::barrier_held(),
+            "prewrite_session_detached" => Self::session_detached(),
+            "prewrite_binding_unprovable" => Self::binding_unprovable(None),
             // The pane's binding moved between the proof and the write.
             // Nothing was written, and re-proving it is the gate's job.
             "binding_changed" | "capability_changed" => Self {
@@ -3615,8 +3678,9 @@ async fn attempt_delivery(
     manifest_id: &str,
     admitted_pid: i32,
 ) -> AttemptOutcome {
-    let Some(watcher) = watcher_for_handle(inner, handle) else {
-        return AttemptOutcome::Failed(AttemptFailure::session_detached());
+    let watcher = match exact_prewrite_watcher(inner, handle, manifest_id) {
+        Ok(watcher) => watcher,
+        Err(failure) => return AttemptOutcome::Failed(failure),
     };
     let Some(manifest) = inner.manifests.get(manifest_id) else {
         return AttemptOutcome::Failed(AttemptFailure::no_manifest());
@@ -3629,8 +3693,8 @@ async fn attempt_delivery(
             inner.engine.buffer_seq.fetch_add(1, Ordering::Relaxed)
         ),
     };
-    let observed = watcher_for_handle(inner, handle)
-        .and_then(|watcher| watcher.pane(&handle.pane_id))
+    let observed = watcher
+        .pane(&handle.pane_id)
         .and_then(|row| fusion::admitted_binding(inner, handle.session_idx, &row));
     let selected = match select_attempt_payload(handle, manifest, observed.as_ref()) {
         Ok(selected) => selected,
@@ -3652,14 +3716,31 @@ async fn attempt_delivery(
         return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
     }
     inject_pause(inner, "pre_paste").await;
-    let Some(watcher) = watcher_for_handle(inner, handle) else {
-        injector.discard().await;
-        return AttemptOutcome::Failed(AttemptFailure::session_detached());
+    let watcher = match exact_prewrite_watcher(inner, handle, manifest_id) {
+        Ok(watcher) => watcher,
+        Err(failure) => {
+            injector.discard().await;
+            if failure.cause == "pane_rebound" {
+                gate_line(
+                    inner,
+                    handle,
+                    "rebound",
+                    None,
+                    Some("route_binding_changed"),
+                );
+            }
+            return AttemptOutcome::Failed(failure);
+        }
     };
     if let Err(detail) = occupant_unchanged(inner, &watcher, handle, manifest_id, admitted_pid) {
         injector.discard().await;
         gate_line(inner, handle, "rebound", None, Some(&detail));
-        return AttemptOutcome::Failed(AttemptFailure::pane_rebound_before_paste());
+        let failure = if detail == "pane_gone" {
+            AttemptFailure::session_detached()
+        } else {
+            AttemptFailure::pane_rebound_before_paste()
+        };
+        return AttemptOutcome::Failed(failure);
     }
     // The gate's clean-composer evidence was current when it admitted, and
     // admission is a decision about a moment. A person can start typing in
@@ -3702,23 +3783,32 @@ async fn attempt_delivery(
     // That recompute took a capture, so who owns the pane is checked again
     // after it: otherwise the newest fact about the composer would rest on
     // an older fact about whose composer it is.
-    let Some(watcher) = watcher_for_handle(inner, handle) else {
-        injector.discard().await;
-        return AttemptOutcome::Failed(AttemptFailure::session_detached());
+    let watcher = match exact_prewrite_watcher(inner, handle, manifest_id) {
+        Ok(watcher) => watcher,
+        Err(failure) => {
+            injector.discard().await;
+            return AttemptOutcome::Failed(failure);
+        }
     };
     if let Err(detail) = occupant_unchanged(inner, &watcher, handle, manifest_id, admitted_pid) {
         gate_line(inner, handle, "rebound", None, Some(&detail));
         injector.discard().await;
-        return AttemptOutcome::Failed(AttemptFailure::pane_rebound_before_paste());
+        let failure = if detail == "pane_gone" {
+            AttemptFailure::session_detached()
+        } else {
+            AttemptFailure::pane_rebound_before_paste()
+        };
+        return AttemptOutcome::Failed(failure);
     }
     // The binding this write depends on, proven ONCE here, immediately
     // after the last capture that admitted it. Three lookups taken
     // separately can disagree with each other; this is one observation of
     // the leader, the agent and the rules that agent is running under.
-    let final_row = watcher_for_handle(inner, handle).and_then(|w| w.pane(&handle.pane_id));
-    let observed_binding = final_row
-        .as_ref()
-        .and_then(|row| fusion::admitted_binding(inner, handle.session_idx, row));
+    let Some(final_row) = watcher.pane(&handle.pane_id) else {
+        injector.discard().await;
+        return AttemptOutcome::Failed(AttemptFailure::session_detached());
+    };
+    let observed_binding = fusion::admitted_binding(inner, handle.session_idx, &final_row);
     let observation =
         handle
             .notification
@@ -3777,10 +3867,21 @@ async fn attempt_delivery(
             // payload: the same binding, read again, and equal. Nothing
             // has been written yet, so a change here is the world moving
             // rather than a transport failure.
-            let now = watcher_for_handle(inner, handle)
-                .and_then(|w| w.pane(&handle.pane_id))
-                .and_then(|row| fusion::admitted_binding(inner, handle.session_idx, &row));
-            if now.as_ref() != Some(&proven) {
+            let now = match handle_route(inner, handle) {
+                HandleRoute::Exact(watcher) => watcher
+                    .pane(&handle.pane_id)
+                    .ok_or_else(|| "prewrite_session_detached".to_string())
+                    .and_then(|row| {
+                        fusion::admitted_binding(inner, handle.session_idx, &row)
+                            .ok_or_else(|| "prewrite_binding_unprovable".to_string())
+                    })?,
+                HandleRoute::BindingChanged => return Err("binding_changed".to_string()),
+                HandleRoute::BindingUnprovable { .. } => {
+                    return Err("prewrite_binding_unprovable".to_string())
+                }
+                HandleRoute::Unavailable => return Err("prewrite_session_detached".to_string()),
+            };
+            if now != proven {
                 return Err("binding_changed".to_string());
             }
             if matches!(selected.transport, Some(NotificationTransport::Doorbell)) {

@@ -958,16 +958,16 @@ pub(crate) fn render_with_status(
     out.push(fit(&format!("{id}  {}", detail.recipient_label()), width));
     out.push(fit(
         &format!(
-            "message {}  mailbox {}  wake {}  {}{}{}",
+            "message {}{}  mailbox {}  wake {}  {}{}",
             detail.message_id(),
-            detail.mailbox().cell(),
-            detail.wake().cell(),
-            stage_word(detail.stage()),
             if detail.is_stale() {
                 "  (no longer listed)"
             } else {
                 ""
             },
+            detail.mailbox().cell(),
+            detail.wake().cell(),
+            stage_word(detail.stage()),
             if detail.needs_reload() {
                 "  (changed, reopening)"
             } else {
