@@ -25,6 +25,7 @@ const LEGACY_UPDATE_PREFIX: &str = "cyclops-update.";
 const CLEANUP_BUILD_PREFIX: &str = ".cyclops-cleanup.build-cache.";
 const CLEANUP_UPDATE_PREFIX: &str = ".cyclops-cleanup.update-scratch.";
 const NONCE_BYTES: usize = 32;
+const CACHE_KEY_BYTES: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum AssetClass {
@@ -376,7 +377,7 @@ fn inspect_operational_candidate(
         }
         let allowed_mount = mount_identity(temp.root())?;
         let inventory =
-            inventory_on_mount(&inspector, allowed_mount).map_err(|(_, error)| error)?;
+            inventory_on_mount(&inspector, class, allowed_mount).map_err(|(_, error)| error)?;
         if let Some(error) = validation_error {
             return Err(error);
         }
@@ -666,10 +667,7 @@ fn cleanup_tombstone(path: &Path) -> Option<CleanupTombstone> {
         let device = parts.next()?;
         let inode = parts.next()?;
         let (device, inode) = parse_cleanup_identity(device, inode)?;
-        if parts.next().is_some()
-            || key.is_empty()
-            || !key.bytes().all(|byte| byte.is_ascii_digit())
-        {
+        if parts.next().is_some() || !is_cache_key(key) {
             return None;
         }
         return Some(CleanupTombstone {
@@ -725,7 +723,14 @@ fn cache_key(path: &Path) -> Option<&str> {
     path.file_name()?
         .to_str()?
         .strip_prefix("cyclops-build-cache-")
-        .filter(|key| !key.is_empty() && key.bytes().all(|byte| byte.is_ascii_digit()))
+        .filter(|key| is_cache_key(key))
+}
+
+fn is_cache_key(key: &str) -> bool {
+    key.len() == CACHE_KEY_BYTES
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn parse_cleanup_identity(device: &str, inode: &str) -> Option<(u64, u64)> {
@@ -745,20 +750,24 @@ fn cleanup_tombstone_name(
     class: AssetClass,
     marker: Option<&str>,
     entry: &InspectedEntry,
-) -> String {
+) -> Result<String, String> {
     match class {
-        AssetClass::BuildCache => format!(
-            "{CLEANUP_BUILD_PREFIX}{}.{:016x}.{:016x}",
-            cache_key(&entry.path).expect("build cache carries its home key"),
-            entry.device,
-            entry.inode
-        ),
-        AssetClass::UpdateScratch => format!(
-            "{CLEANUP_UPDATE_PREFIX}{}.{:016x}.{:016x}",
-            marker.expect("update scratch carries its nonce"),
-            entry.device,
-            entry.inode
-        ),
+        AssetClass::BuildCache => {
+            let key = cache_key(&entry.path).ok_or_else(|| {
+                "build cache has no exact 16-character lowercase hexadecimal key".to_string()
+            })?;
+            Ok(format!(
+                "{CLEANUP_BUILD_PREFIX}{key}.{:016x}.{:016x}",
+                entry.device, entry.inode
+            ))
+        }
+        AssetClass::UpdateScratch => {
+            let marker = marker.ok_or_else(|| "update scratch has no owner nonce".to_string())?;
+            Ok(format!(
+                "{CLEANUP_UPDATE_PREFIX}{marker}.{:016x}.{:016x}",
+                entry.device, entry.inode
+            ))
+        }
     }
 }
 
@@ -921,7 +930,7 @@ fn prepare_asset<'a>(
     }
     let allowed_mount =
         mount_identity(temp.root()).map_err(|error| (CandidateState::Unsafe, error))?;
-    let inventory = inventory_on_mount(&inspector, allowed_mount)?;
+    let inventory = inventory_on_mount(&inspector, class, allowed_mount)?;
     if lease.is_none() && !inventory.entries.is_empty() {
         return Err((
             CandidateState::Unsafe,
@@ -980,13 +989,15 @@ fn validate_update_marker_if_present(
 
 fn inventory_on_mount(
     inspector: &StateInspector,
+    class: AssetClass,
     allowed_mount: MountIdentity,
 ) -> Result<Inventory, (CandidateState, String)> {
-    inventory_with_mount_probe(inspector, allowed_mount, mount_identity)
+    inventory_with_mount_probe(inspector, class, allowed_mount, mount_identity)
 }
 
 fn inventory_with_mount_probe<F>(
     inspector: &StateInspector,
+    class: AssetClass,
     allowed_mount: MountIdentity,
     mut mount_probe: F,
 ) -> Result<Inventory, (CandidateState, String)>
@@ -1017,6 +1028,7 @@ where
         &mut queue,
         &mut name_bytes,
         &mut bytes,
+        class,
         allowed_mount,
         &mut mount_probe,
     )?;
@@ -1058,6 +1070,7 @@ where
             &mut queue,
             &mut name_bytes,
             &mut bytes,
+            class,
             allowed_mount,
             &mut mount_probe,
         )?;
@@ -1078,6 +1091,7 @@ fn add_entries(
     queue: &mut VecDeque<(InspectedEntry, usize)>,
     name_bytes: &mut usize,
     bytes: &mut u64,
+    class: AssetClass,
     allowed_mount: MountIdentity,
     mount_probe: &mut impl FnMut(&InspectedEntry) -> Result<MountIdentity, String>,
 ) -> Result<(), (CandidateState, String)> {
@@ -1106,7 +1120,7 @@ fn add_entries(
             ));
         }
         match entry.kind {
-            InspectedKind::Directory if entry.mode == 0o700 && entry.safe() => {
+            InspectedKind::Directory if directory_safe_for_asset(&entry, class) => {
                 require_same_mount(&entry, allowed_mount, mount_probe)?;
                 directories.insert(entry.path.clone(), entry.clone());
                 queue.push_back((entry.clone(), depth));
@@ -1130,6 +1144,17 @@ fn add_entries(
         entries.push(entry);
     }
     Ok(())
+}
+
+fn directory_safe_for_asset(entry: &InspectedEntry, class: AssetClass) -> bool {
+    match class {
+        // Cargo creates traversable 0755 directories. The verified 0700 cache
+        // root contains those broader descendant modes.
+        AssetClass::BuildCache => {
+            entry.mode & 0o700 == 0o700 && entry.safe_beneath_owner_only_parent()
+        }
+        AssetClass::UpdateScratch => entry.mode == 0o700 && entry.safe(),
+    }
 }
 
 fn require_same_mount(
@@ -1228,7 +1253,7 @@ fn remove_prepared(
         if is_verified_tombstone(&temp_entry, class, marker).map_err(|(_, error)| error)? {
             temp_entry.clone()
         } else {
-            let name = cleanup_tombstone_name(class, marker, &temp_entry);
+            let name = cleanup_tombstone_name(class, marker, &temp_entry)?;
             temp.isolate_direct_child_directory(&temp_entry, std::ffi::OsStr::new(&name))
                 .map_err(|error| format!("isolate {}: {error}", temp_entry.path.display()))?
         };
@@ -1518,14 +1543,17 @@ mod tests {
     }
 
     fn build_cache(temp: &Path) -> PathBuf {
-        let path = temp.join("cyclops-build-cache-1234");
+        let path = temp.join("cyclops-build-cache-a5594e28ab74faba");
         fs::create_dir(&path).unwrap();
         set_mode(&path, 0o700);
         fs::write(path.join(BUILD_CACHE_LEASE), b"").unwrap();
         set_mode(&path.join(BUILD_CACHE_LEASE), 0o600);
         fs::create_dir(path.join("nested")).unwrap();
-        set_mode(&path.join("nested"), 0o700);
+        set_mode(&path.join("nested"), 0o755);
         fs::write(path.join("nested/output"), b"rebuildable").unwrap();
+        set_mode(&path.join("nested/output"), 0o644);
+        fs::write(path.join("nested/executable"), b"binary").unwrap();
+        set_mode(&path.join("nested/executable"), 0o755);
         path
     }
 
@@ -1592,6 +1620,36 @@ mod tests {
         }
         assert!(json.contains("state_journals_and_messages"));
         assert!(plain.contains("state_journals_and_messages"));
+    }
+
+    #[test]
+    fn cache_keys_match_the_updater_and_invalid_names_fail_without_panicking() {
+        let valid = Path::new("/tmp/cyclops-build-cache-a5594e28ab74faba");
+        assert_eq!(cache_key(valid), Some("a5594e28ab74faba"));
+        for invalid in [
+            "/tmp/cyclops-build-cache-1234",
+            "/tmp/cyclops-build-cache-A5594E28AB74FABA",
+            "/tmp/cyclops-build-cache-g5594e28ab74faba",
+            "/tmp/cyclops-build-cache-a5594e28ab74fab",
+            "/tmp/cyclops-build-cache-a5594e28ab74fabaa",
+        ] {
+            assert_eq!(cache_key(Path::new(invalid)), None, "{invalid}");
+        }
+
+        let temp = private_temp();
+        let invalid = temp.path().join("cyclops-build-cache-1234");
+        fs::create_dir(&invalid).unwrap();
+        set_mode(&invalid, 0o700);
+        fs::write(invalid.join(BUILD_CACHE_LEASE), b"").unwrap();
+        set_mode(&invalid.join(BUILD_CACHE_LEASE), 0o600);
+        fs::write(invalid.join("payload"), b"rebuildable").unwrap();
+
+        let report = collect_at(temp.path(), &invalid, &[AssetClass::BuildCache], true);
+        assert_eq!(report.candidates[0].state, CandidateState::Failed);
+        assert!(report.candidates[0]
+            .reason
+            .contains("no exact 16-character lowercase hexadecimal key"));
+        assert_eq!(fs::read(invalid.join("payload")).unwrap(), b"rebuildable");
     }
 
     #[test]
@@ -1682,7 +1740,7 @@ mod tests {
             .iter()
             .find(|entry| entry.path == cache)
             .unwrap();
-        let name = cleanup_tombstone_name(AssetClass::BuildCache, None, entry);
+        let name = cleanup_tombstone_name(AssetClass::BuildCache, None, entry).unwrap();
         let isolated = inspector
             .isolate_direct_child_directory(entry, std::ffi::OsStr::new(&name))
             .unwrap();
@@ -1711,7 +1769,7 @@ mod tests {
             .find(|entry| entry.path == scratch)
             .unwrap();
         let scratch_name =
-            cleanup_tombstone_name(AssetClass::UpdateScratch, Some(nonce), &scratch_entry);
+            cleanup_tombstone_name(AssetClass::UpdateScratch, Some(nonce), &scratch_entry).unwrap();
         let isolated_scratch = temp_inspector
             .isolate_direct_child_directory(&scratch_entry, std::ffi::OsStr::new(&scratch_name))
             .unwrap();
@@ -1736,11 +1794,13 @@ mod tests {
             .into_iter()
             .find(|entry| entry.path == cache)
             .unwrap();
-        let cache_name = cleanup_tombstone_name(AssetClass::BuildCache, None, &cache_entry);
+        let cache_name =
+            cleanup_tombstone_name(AssetClass::BuildCache, None, &cache_entry).unwrap();
         let isolated_cache = temp_inspector
             .isolate_direct_child_directory(&cache_entry, std::ffi::OsStr::new(&cache_name))
             .unwrap();
         fs::remove_file(isolated_cache.path.join("nested/output")).unwrap();
+        fs::remove_file(isolated_cache.path.join("nested/executable")).unwrap();
         fs::remove_dir(isolated_cache.path.join("nested")).unwrap();
         fs::remove_file(isolated_cache.path.join(BUILD_CACHE_LEASE)).unwrap();
 
@@ -1796,7 +1856,7 @@ mod tests {
             .into_iter()
             .find(|entry| entry.path == cache)
             .unwrap();
-        let name = cleanup_tombstone_name(AssetClass::BuildCache, None, &entry);
+        let name = cleanup_tombstone_name(AssetClass::BuildCache, None, &entry).unwrap();
         let isolated = inspector
             .isolate_direct_child_directory(&entry, std::ffi::OsStr::new(&name))
             .unwrap();
@@ -1821,26 +1881,28 @@ mod tests {
             device: inspector.root().device,
             mount_id: 41,
         };
-        let root_error = inventory_with_mount_probe(&inspector, allowed, |entry| {
-            Ok(MountIdentity {
-                device: entry.device,
-                mount_id: 42,
+        let root_error =
+            inventory_with_mount_probe(&inspector, AssetClass::BuildCache, allowed, |entry| {
+                Ok(MountIdentity {
+                    device: entry.device,
+                    mount_id: 42,
+                })
             })
-        })
-        .err()
-        .expect("a candidate-root mount boundary must fail closed");
+            .err()
+            .expect("a candidate-root mount boundary must fail closed");
         assert_eq!(root_error.0, CandidateState::Unsafe);
         assert!(root_error.1.contains("mount boundary"));
 
         let nested = cache.join("nested");
-        let nested_error = inventory_with_mount_probe(&inspector, allowed, |entry| {
-            Ok(MountIdentity {
-                device: entry.device,
-                mount_id: if entry.path == nested { 42 } else { 41 },
+        let nested_error =
+            inventory_with_mount_probe(&inspector, AssetClass::BuildCache, allowed, |entry| {
+                Ok(MountIdentity {
+                    device: entry.device,
+                    mount_id: if entry.path == nested { 42 } else { 41 },
+                })
             })
-        })
-        .err()
-        .expect("a same-device descendant mount boundary must fail closed");
+            .err()
+            .expect("a same-device descendant mount boundary must fail closed");
         assert_eq!(nested_error.0, CandidateState::Unsafe);
         assert!(nested_error.1.contains("mount boundary"));
         assert!(cache.join("nested/output").is_file());
@@ -1874,9 +1936,12 @@ mod tests {
     }
 
     #[test]
-    fn operational_inventory_refuses_nested_links_and_unsafe_modes() {
+    fn operational_inventory_accepts_cargo_modes_but_refuses_nested_links() {
         let temp = private_temp();
         let cache = build_cache(temp.path());
+        let report = operational_candidate(temp.path(), &cache, AssetClass::BuildCache, None);
+        assert!(report.safe, "{:?}", report.error);
+
         let outside = temp.path().join("outside-operational");
         fs::write(&outside, b"outside").unwrap();
         symlink(&outside, cache.join("nested/linked")).unwrap();
@@ -1891,9 +1956,8 @@ mod tests {
         assert_eq!(fs::read(&outside).unwrap(), b"outside");
 
         fs::remove_file(cache.join("nested/linked")).unwrap();
-        set_mode(&cache.join("nested"), 0o755);
         let report = operational_candidate(temp.path(), &cache, AssetClass::BuildCache, None);
-        assert!(!report.safe);
+        assert!(report.safe, "{:?}", report.error);
     }
 
     #[test]
@@ -1935,6 +1999,26 @@ mod tests {
         assert!(current.safe);
         assert_eq!(current.marker, "current");
         assert_eq!(current.lease, "current");
+
+        fs::create_dir(scratch.join("nested")).unwrap();
+        set_mode(&scratch.join("nested"), 0o755);
+        let widened_directory = operational_candidate(
+            temp.path(),
+            &scratch,
+            AssetClass::UpdateScratch,
+            Some(nonce),
+        );
+        assert!(!widened_directory.safe);
+        let absent_cache = temp.path().join("cyclops-build-cache-0000000000000000");
+        let apply = collect_at(
+            temp.path(),
+            &absent_cache,
+            &[AssetClass::UpdateScratch],
+            true,
+        );
+        assert_eq!(apply.candidates[0].state, CandidateState::Unsafe);
+        assert!(scratch.exists());
+        fs::remove_dir(scratch.join("nested")).unwrap();
 
         fs::remove_file(scratch.join(SCRATCH_MARKER)).unwrap();
         let missing_marker = operational_candidate(
