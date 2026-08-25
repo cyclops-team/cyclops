@@ -484,8 +484,20 @@ fn observe_process(pid: i32) -> Option<ProcessInstanceId> {
         return None;
     }
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_linux_process_stat(pid, &stat)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_process_stat(pid: i32, stat: &str) -> Option<ProcessInstanceId> {
     let after = stat.rsplit_once(')')?.1;
-    let birth = after.split_whitespace().nth(19)?.parse().ok()?;
+    let mut fields = after.split_whitespace();
+    let state = fields.next()?;
+    // A dead child remains in /proc until its parent reaps it. It cannot
+    // execute or own the authenticated socket, so it has left for stop proof.
+    if matches!(state, "Z" | "X" | "x") {
+        return None;
+    }
+    let birth = fields.nth(18)?.parse().ok()?;
     ProcessInstanceId::new(pid, birth).ok()
 }
 
@@ -807,6 +819,55 @@ mod tests {
         assert!(generation_matches(expected, Some(expected)));
         assert!(!generation_matches(expected, Some(reused)));
         assert!(!generation_matches(expected, None));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linux_zombie_has_left_its_process_generation() {
+        let fields_before_birth = ["0"; 18].join(" ");
+        let live = format!("4242 (cyclopsd worker) S {fields_before_birth} 9001");
+        let zombie = format!("4242 (cyclopsd worker) Z {fields_before_birth} 9001");
+
+        assert_eq!(
+            parse_linux_process_stat(4242, &live),
+            ProcessInstanceId::new(4242, 9001).ok()
+        );
+        assert_eq!(parse_linux_process_stat(4242, &zombie), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unreaped_linux_child_is_already_gone_for_stop_proof() {
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn immediate-exit child");
+        let pid = child.id() as i32;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let observed_zombie = loop {
+            let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(')')?
+                        .1
+                        .split_whitespace()
+                        .next()
+                        .map(str::to_string)
+                });
+            if state.as_deref() == Some("Z") {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let observed_generation = observe_process(pid);
+        let status = child.wait().expect("reap immediate-exit child");
+
+        assert!(observed_zombie, "child never entered the zombie state");
+        assert_eq!(observed_generation, None);
+        assert!(status.success());
     }
 
     #[test]
