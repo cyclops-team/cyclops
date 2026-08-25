@@ -377,9 +377,10 @@ argv_basenames = ["cycagent"]
 launch = "cat"
 
 [hooks]
+# This stand-in exposes one event-local start and dispatch fact, not a turn key.
 turn_start = "UserPromptSubmit"
-turn_end = "Stop"
 ack = "UserPromptSubmit"
+ack_evidence = "dispatch"
 ack_payload_field = "prompt"
 
 [messaging]
