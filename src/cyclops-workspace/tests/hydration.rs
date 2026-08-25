@@ -208,7 +208,9 @@ async fn mid_stream_rehydrate_matches_capture() {
         "send-keys",
         "-t",
         "%0",
-        r"printf '\033[H\033[2J'; yes MID_STREAM | head -n 20",
+        // Keep the rendered marker out of the echoed command. The wait must
+        // observe program output, not text the shell is about to clear.
+        r"printf '\033[H\033[2J'; yes MID_''STREAM | head -n 20",
         "Enter",
     ]);
     rig.server.wait_screen("%0", "MID_STREAM");
