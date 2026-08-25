@@ -4287,6 +4287,16 @@ impl MailboxService {
             .claimed_notification_barrier(recipient)
             .cloned()
         {
+            // A durable operator action owns this exact barrier until it is
+            // reconciled or explicitly withdrawn. Starting the automatic
+            // claimed-barrier path here could settle the notification first
+            // and leave the operator chain permanently incomplete.
+            if store
+                .projection()
+                .attention_resolution_pending(record.attempt_id)
+            {
+                return Ok(None);
+            }
             return Ok(Some(record));
         }
         loop {
@@ -7771,6 +7781,109 @@ mod tests {
         let next = service.prepare_oldest_notification(bob).unwrap().unwrap();
         assert_eq!(next.message_id, second_id);
         assert_ne!(next.attempt_id, first_attempt);
+    }
+
+    #[test]
+    fn pending_operator_resolution_owns_the_claimed_barrier_after_restart() {
+        let scratch = StoreScratch::new("operator-resolution-barrier");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, _, bob, _) = test_context();
+        let directory = || {
+            MailboxDirectory::new(
+                workspace,
+                [MailboxIdentity {
+                    key: bob,
+                    label: "reviewer".into(),
+                }],
+            )
+            .unwrap()
+        };
+        let attempt_id;
+        let later_message_id;
+
+        {
+            let store = MessageStore::open(&root, journal, workspace, "boot-1").unwrap();
+            let service = MailboxService::new(directory(), store);
+            let first = service
+                .send(service.admin(), mailbox_send("reviewer", "First", "Body"))
+                .unwrap();
+            let later = service
+                .send(service.admin(), mailbox_send("reviewer", "Later", "Body"))
+                .unwrap();
+            later_message_id = later.message_id;
+            let queued = service.prepare_oldest_notification(bob).unwrap().unwrap();
+            attempt_id = queued.attempt_id;
+            let context = crate::notification_adapter::NotificationContext::new(
+                service.store_handle(),
+                first.message_id.clone(),
+                bob,
+                attempt_id,
+            );
+            context.record_gating().unwrap();
+            context
+                .record_writing(
+                    notification_binding(bob).pane_root.unwrap(),
+                    notification_binding(bob).leader.unwrap(),
+                    notification_binding(bob).agent,
+                    "codex",
+                    NotificationTransport::Doorbell,
+                    Some(DOORBELL_FORMAT_ATTEMPT_CLAIM),
+                )
+                .unwrap();
+            context.record_staged().unwrap();
+            context.reserve_submit().unwrap();
+            context.record_submitted().unwrap();
+            context
+                .record_attention(NotificationAttentionCause::AckTimeout)
+                .unwrap();
+            service.claim(bob, first.message_id).unwrap();
+
+            let target = service.attention_target(&attempt_id.to_string()).unwrap();
+            service
+                .record_attention_resolution_intent(&target, NotificationResolution::Complete)
+                .unwrap();
+            service
+                .record_attention_resolution_action_accepted(
+                    &target,
+                    NotificationResolution::Complete,
+                )
+                .unwrap();
+            service
+                .record_attention_resolution_consumption_observed(&target, exact_consumption(23))
+                .unwrap();
+        }
+
+        let store = MessageStore::open(&root, journal, workspace, "boot-2").unwrap();
+        let service = MailboxService::new(directory(), store);
+        assert!(service.prepare_oldest_notification(bob).unwrap().is_none());
+        let target = service.attention_target(&attempt_id.to_string()).unwrap();
+        assert_eq!(
+            service
+                .begin_attention_resolution(&target, NotificationResolution::Complete)
+                .unwrap(),
+            AttentionResolutionStart::ReconcileOnly
+        );
+        {
+            let store = service.store().unwrap();
+            assert!(store
+                .projection()
+                .notification(bob, &later_message_id)
+                .is_none());
+            assert_eq!(
+                store
+                    .projection()
+                    .claimed_notification_barrier(bob)
+                    .map(|record| record.attempt_id),
+                Some(attempt_id)
+            );
+        }
+        service
+            .resolve_attention(&target, NotificationResolution::Complete)
+            .unwrap();
+        let next = service.prepare_oldest_notification(bob).unwrap().unwrap();
+        assert_eq!(next.message_id, later_message_id);
+        assert_ne!(next.attempt_id, attempt_id);
     }
 
     #[test]

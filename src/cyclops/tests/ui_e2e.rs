@@ -84,6 +84,30 @@ fn stdout_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+fn empty_messages_snapshot(req: &Value) -> (Vec<String>, bool) {
+    (
+        vec![json!({"id": req["id"], "result": {
+            "workspace_id": "00000000-0000-0000-0000-000000000001",
+            "workspace_seq": 0,
+            "counts": {
+                "visible_messages": 0,
+                "returned_messages": 0,
+                "inbox_messages": 0,
+                "outbound_messages": 0,
+                "work_messages": 0,
+                "active_messages": 0,
+                "settled_messages": 0,
+                "pending_entries": 0,
+                "claimed_entries": 0,
+                "open_attention_entries": 0
+            },
+            "rows": []
+        }})
+        .to_string()],
+        true,
+    )
+}
+
 /// Two msg facts in the session ledger: one to admin (seq 1), one agent
 /// to agent (seq 2). Timestamps are fixed so the clock gutter is exact.
 ///
@@ -114,7 +138,7 @@ fn write_ledger(home: &Path) {
 /// line too, not just the backfill path. Seq 11 carries an empty body,
 /// which is the same as none: no second line.
 fn serve_canned(home: &Path) {
-    serve_conns(home, 2, move |req| match req["method"].as_str() {
+    serve_conns(home, 3, move |req| match req["method"].as_str() {
         Some("events.subscribe") => (
             vec![
                 json!({"id": req["id"], "result": {"subscribed": true}}).to_string(),
@@ -176,6 +200,7 @@ fn serve_canned(home: &Path) {
             .to_string()],
             true,
         ),
+        Some("messages.snapshot") => empty_messages_snapshot(&req),
         other => panic!("unexpected method {other:?}"),
     });
 }
@@ -324,9 +349,9 @@ fn answer(open_deliveries: bool) -> Value {
 #[test]
 fn status_stays_live_while_the_stream_carries_durable_attention() {
     let home = scratch_home("two");
-    // Three connections: the status grid takes one, the plain follow takes
-    // its subscription and its own status.
-    serve_conns(&home, 3, move |req| match req["method"].as_str() {
+    // Four connections: the status grid takes one, while the plain follow
+    // takes its subscription, status seed, and message snapshot.
+    serve_conns(&home, 4, move |req| match req["method"].as_str() {
         Some("status") => {
             let asked = req["params"]["open_deliveries"] == json!(true);
             (
@@ -338,6 +363,7 @@ fn status_stays_live_while_the_stream_carries_durable_attention() {
             vec![json!({"id": req["id"], "result": {"subscribed": true}}).to_string()],
             true,
         ),
+        Some("messages.snapshot") => empty_messages_snapshot(&req),
         other => panic!("unexpected method {other:?}"),
     });
 
@@ -376,7 +402,7 @@ fn status_stays_live_while_the_stream_carries_durable_attention() {
 #[test]
 fn a_pane_that_closes_takes_its_attention_item_with_it() {
     let home = scratch_home("gone");
-    serve_conns(&home, 2, move |req| match req["method"].as_str() {
+    serve_conns(&home, 4, move |req| match req["method"].as_str() {
         Some("events.subscribe") => (
             vec![
                 json!({"id": req["id"], "result": {"subscribed": true}}).to_string(),
@@ -390,6 +416,7 @@ fn a_pane_that_closes_takes_its_attention_item_with_it() {
             vec![json!({"id": req["id"], "result": answer(false)}).to_string()],
             true,
         ),
+        Some("messages.snapshot") => empty_messages_snapshot(&req),
         other => panic!("unexpected method {other:?}"),
     });
     let stream = stdout_of(&run_ui(&home, &["ui", "--plain", "--firehose"]));

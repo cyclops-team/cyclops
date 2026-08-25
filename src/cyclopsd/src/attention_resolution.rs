@@ -15,7 +15,7 @@ use crate::mailbox::{
     AttentionConsumptionSignal, AttentionResolutionStart, AttentionTarget, MailboxService,
     MailboxServiceError,
 };
-use crate::{delivery, fusion, unix_ms, Inner};
+use crate::{delivery, fusion, messaging, unix_ms, Inner};
 
 // Bound terminal-action settlement while allowing slower terminal clients to
 // render the clean composer that proves the exact action took effect.
@@ -130,7 +130,7 @@ pub(crate) async fn resolve(
     // key rather than trusting an earlier capture.
     let final_assessment = assess(inner, service, target, false).await;
     if resolution_path(&final_assessment, resolution) != Some(path_kind) {
-        withdraw_pre_key(service, target, resolution)?;
+        withdraw_pre_key(inner, service, target, resolution)?;
         return Err(AttentionActionError::Evidence(Box::new(
             final_assessment.result,
         )));
@@ -138,14 +138,14 @@ pub(crate) async fn resolve(
     let route = match final_assessment.path {
         Some(ResolutionPath::TerminalKey(route)) => {
             let Some(keys) = action_keys(&route.manifest, resolution) else {
-                withdraw_pre_key(service, target, resolution)?;
+                withdraw_pre_key(inner, service, target, resolution)?;
                 return Err(AttentionActionError::DiscardUnsupported);
             };
             let mut evidence_events = inner.events.subscribe();
             let dispatch_started_ms = unix_ms();
             let consumption_registration = if resolution == NotificationResolution::Complete {
                 let Some(expected_payload) = expected_notification(service, target) else {
-                    withdraw_pre_key(service, target, resolution)?;
+                    withdraw_pre_key(inner, service, target, resolution)?;
                     return Err(AttentionActionError::Uncertain);
                 };
                 let signal = match service.register_attention_consumption_candidate(
@@ -157,7 +157,7 @@ pub(crate) async fn resolve(
                 ) {
                     Ok(signal) => signal,
                     Err(error) => {
-                        withdraw_pre_key(service, target, resolution)?;
+                        withdraw_pre_key(inner, service, target, resolution)?;
                         return Err(AttentionActionError::Store(error));
                     }
                 };
@@ -333,6 +333,13 @@ async fn settle_resolution(
     }
     delivery::inject_pause(inner, "attention_after_resolution").await;
     resolve_staged_hold(inner, target, &route);
+    if let Err(error) = messaging::schedule_recipient(inner, service, target.record.recipient) {
+        tracing::error!(
+            recipient = %target.record.recipient,
+            %error,
+            "cannot schedule mailbox notification after attention resolution"
+        );
+    }
     Ok(AttentionResolveResult {
         attempt_id,
         resolution,
@@ -554,7 +561,8 @@ fn resolution_path(
 }
 
 fn withdraw_pre_key(
-    service: &MailboxService,
+    inner: &Arc<Inner>,
+    service: &Arc<MailboxService>,
     target: &AttentionTarget,
     resolution: NotificationResolution,
 ) -> Result<(), AttentionActionError> {
@@ -568,6 +576,13 @@ fn withdraw_pre_key(
         return Err(AttentionActionError::Uncertain);
     }
     service.cancel_attention_resolution(target.record.attempt_id)?;
+    if let Err(error) = messaging::schedule_recipient(inner, service, target.record.recipient) {
+        tracing::error!(
+            recipient = %target.record.recipient,
+            %error,
+            "cannot schedule mailbox notification after attention intent withdrawal"
+        );
+    }
     Ok(())
 }
 
