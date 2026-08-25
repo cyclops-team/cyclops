@@ -350,13 +350,14 @@ clears or submits again. A second failure leaves the durable attempt `staged`,
 keeps the exact worker and FIFO barrier active, and reports
 `notification_settlement_storage_failed`. The operator runs `cyclops health`,
 repairs state storage, then restarts the daemon so the same attempt reconciles.
-One upgrade-only exception covers an `attention_required` format 1 or original
-doorbell whose binding lacks pane-root generation. An exact recipient claim
-ordered after that attempt's `writing` fact, the same current manifest, and
-fresh semantic-clean, exact visible-empty composer proof may append a
-content-free `recipient_claimed_composer_clear` barrier retirement. It sends no
-terminal key, clears no bytes, and leaves both the attention outcome and claimed
-mailbox state intact. Legacy direct payloads do not qualify.
+One upgrade-only exception covers a stable `attention_required` or `notified`
+format 1 or original doorbell whose binding lacks pane-root generation. An
+exact recipient claim ordered after that attempt's `writing` fact, the same
+current manifest, and fresh semantic-clean, exact visible-empty composer proof
+may append a content-free `recipient_claimed_composer_clear` barrier
+retirement. It sends no terminal key, clears no bytes, and leaves the historical
+notification outcome and claimed mailbox state intact. Legacy direct payloads
+do not qualify.
 Recovery compares the recorded and current agent process generations and
 manifests. A foreground leader change is normal agent continuity. A different
 agent generation or manifest is authoritative replacement and is journaled

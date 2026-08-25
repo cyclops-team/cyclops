@@ -388,15 +388,15 @@ hold first. A recovered hold can then bind an exact manifest-declared turn
 observed after restart. Its matching end and a later fresh clean screen produce
 a content-free `notification_barrier_retired` fact before the runtime hold is
 released.
-One upgrade-only compatibility path handles an `attention_required` format 1
-or original doorbell whose `writing` fact lacks a pane-root generation. The
-exact durable recipient claim must follow that attempt's `writing` fact, and
-the same recipient and manifest must prove a semantic `clean` composer with
-exact visible empty extraction. Cyclops then appends only
+One upgrade-only compatibility path handles a stable `attention_required` or
+`notified` format 1 or original doorbell whose `writing` fact lacks a pane-root
+generation. The exact durable recipient claim must follow that attempt's
+`writing` fact, and the same recipient and manifest must prove a semantic
+`clean` composer with exact visible empty extraction. Cyclops then appends only
 `notification_barrier_retired` with cause
 `recipient_claimed_composer_clear`. It sends no terminal key, clears no bytes,
-leaves the mailbox `claimed` and notification `attention_required`, and proves
-retrieval only. Legacy direct payloads do not qualify.
+leaves the mailbox `claimed` and preserves the historical notification state,
+and proves retrieval only. Legacy direct payloads do not qualify.
 Foreground leader changes do not change composer ownership; operator terminal
 actions still require the exact recorded leader. Agent-generation or manifest
 replacement, explicit operator resolution, and proven physical pane loss are
