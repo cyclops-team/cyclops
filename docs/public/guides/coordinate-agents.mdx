@@ -9,22 +9,27 @@ description: "Send work, broadcast announcements, wait for turns, and review the
 cyclops send reviewer --subject "Review the last commit" --body "Check correctness and test coverage."
 ```
 
-Cyclops durably accepts the message before returning. It then queues a
-content-free wake for the recipient pane. The receipt keeps those facts
-separate: `accepted` covers the mailbox record, while `wake <state>` reports
-the current notification attempt.
+Cyclops durably accepts the message before returning. When setup reports
+`mailbox doorbell`, it queues a content-free wake for the recipient pane. The
+receipt keeps those facts separate: `accepted` covers the mailbox record,
+while `wake <state>` reports the current notification attempt.
 
 A socket claim may complete without any body appearing in the composer. The
 Messages view records the mailbox and wake outcomes separately.
 
-The recipient retrieves the body only by claiming the exact id named by the
-wake:
+In doorbell mode, the recipient retrieves the body only by claiming the exact
+id named by the wake:
 
 ```bash
 cyclops inbox list
 cyclops inbox claim <message-id>
 cyclops reply <message-id> --body "Reviewed. One issue."
 ```
+
+If claim-skill proof is absent, outdated, edited, unreadable, or changes before
+the write, Cyclops uses the visible full-payload compatibility path instead. It
+records that outcome as `delivered_direct`; the recipient does not claim that
+message again.
 
 The wake is one-shot. An ambiguous terminal outcome raises one attention item
 and leaves the message claimable. Do not resend or requeue blindly. Follow

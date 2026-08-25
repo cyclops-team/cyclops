@@ -67,9 +67,11 @@ shared way to address one another through durable mailboxes:
 
 The agent runs `cyclops send reviewer ...` from its own pane. The daemon
 resolves the sender from the calling process, accepts the message into the
-durable workspace mailbox, and queues a content-free wake for the reviewer.
-The reviewer claims the exact message before reading its body. You watch the
-handoff from the workspace instead of relaying it by hand.
+durable workspace mailbox, and queues a guarded pane notification. When setup
+reports `mailbox doorbell`, that notification is content-free and the reviewer
+claims the exact message before reading its body. If claim-skill proof is not
+current, Cyclops uses the visible full-payload compatibility path instead. You
+watch the handoff from the workspace instead of relaying it by hand.
 
 Your agents learn the verbs from one file:
 [skills/cyclops/SKILL.md](skills/cyclops/SKILL.md), which the installer
