@@ -711,15 +711,13 @@ impl StateInspector {
         validate_removal_stat(&before, expected, kind)?;
         let target = match kind {
             RemovalKind::RegularFile => {
-                open_inspection_at(&parent, &name, InspectedKind::RegularFile)
-                    .map_err(|error| {
-                        path_error(
-                            &expected.path,
-                            error,
-                            "removal target changed before binding",
-                        )
-                    })?
-                    .expect("regular inspection returns a descriptor")
+                open_lockable_regular_at(&parent, &name).map_err(|error| {
+                    path_error(
+                        &expected.path,
+                        error,
+                        "removal target changed before binding",
+                    )
+                })?
             }
             RemovalKind::EmptyDirectory => open_directory_at(&parent, &name).map_err(|error| {
                 path_error(
@@ -2244,6 +2242,19 @@ fn open_inspection_at(
     }
 }
 
+fn open_lockable_regular_at(parent: &File, name: &CString) -> std::io::Result<File> {
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    // SAFETY: parent and name are held values. The returned descriptor is
+    // retained through removal and supports flock on Linux, unlike O_PATH.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: fd is a fresh successful openat result owned here.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
 fn inspect_directory_descriptor(
     directory: File,
     path: PathBuf,
@@ -3587,6 +3598,30 @@ mod tests {
 
         assert!(!path.exists());
         assert_eq!(fs::read(&keep).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn bound_regular_removal_retains_a_lockable_descriptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+        let path = root_path.join("entry");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(&path, b"lease").unwrap();
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let snapshot = inspector.inspect_root(InspectionLimits::default()).unwrap();
+        let removal = inspector
+            .bind_regular_file_for_removal(&snapshot.entries[0])
+            .unwrap();
+
+        assert!(removal.try_lock().unwrap());
+        let competing = fs::File::open(&path).unwrap();
+        assert_ne!(
+            unsafe { libc::flock(competing.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "the bound removal must retain the lock"
+        );
     }
 
     #[test]

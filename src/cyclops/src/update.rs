@@ -3123,9 +3123,8 @@ sys.exit(43)"#,
             .unwrap()
             .write_all(b"# changed\n")
             .unwrap();
-        assert!(installed_pair_descriptor(&prefix)
-            .unwrap_err()
-            .contains("changed after its install proof"));
+        let error = installed_pair_descriptor(&prefix).unwrap_err();
+        assert!(error.contains("changed after its install proof"), "{error}");
 
         std::fs::write(&pair_path, std::fs::read(source.join("cyclops")).unwrap()).unwrap();
         let mut descriptor: serde_json::Value =

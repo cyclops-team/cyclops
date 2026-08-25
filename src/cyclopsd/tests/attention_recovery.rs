@@ -8,7 +8,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{faketui_path, tmux_available, Rig, CAT_MANIFEST};
-use cyclops_proto::{Kind, LedgerLine, MessageId, MsgSendParams, NotificationResolution};
+use cyclops_proto::{
+    Kind, LedgerLine, MessageId, MsgSendParams, NotificationResolution,
+    NOTIFICATION_RESOLUTION_PROOF_VERSION,
+};
 use serde_json::json;
 
 fn recovery_manifest() -> String {
@@ -181,6 +184,7 @@ fn assert_content_free_resolution(line: &LedgerLine, resolution: NotificationRes
         data["resolution"],
         serde_json::to_value(resolution).unwrap()
     );
+    assert_eq!(data["proof_version"], NOTIFICATION_RESOLUTION_PROOF_VERSION);
     let mut keys: Vec<_> = data
         .as_object()
         .unwrap()
@@ -193,6 +197,7 @@ fn assert_content_free_resolution(line: &LedgerLine, resolution: NotificationRes
         [
             "attempt_id",
             "message_id",
+            "proof_version",
             "recipient",
             "record_version",
             "resolution",

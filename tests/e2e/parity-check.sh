@@ -403,6 +403,7 @@ regex = ['^']
 [[rule]]
 id = "composer_empty"
 state = "idle"
+composer_semantic = "clean"
 priority = 90
 region = "bottom_non_empty_lines(4)"
 line_regex = ['^❯\s*$']
@@ -410,6 +411,7 @@ line_regex = ['^❯\s*$']
 [[rule]]
 id = "composer_holds_paste"
 state = "idle_with_input"
+composer_semantic = "human_input"
 priority = 80
 region = "bottom_non_empty_lines(3)"
 line_regex = ['^\s*❯\s+\S']

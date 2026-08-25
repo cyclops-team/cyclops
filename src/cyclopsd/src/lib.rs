@@ -5292,10 +5292,8 @@ process_names = ["never"]
         }
         let tmux = cyclops_testrig::TmuxServer::new("mailbox-lagged-respawn");
         tmux.run_ok(&["new-session", "-d", "-s", "main", "sleep 60"]);
-        let home = cyclops_proto::scratch::scratch_dir(&format!(
-            "cyc-mailbox-lagged-respawn-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let home =
+            cyclops_proto::scratch::scratch_dir(&format!("cyc-mbox-lag-{}", uuid::Uuid::new_v4()));
         let mut cfg = Config::defaults(&home);
         cfg.sessions.push("main".into());
         cfg.tmux_socket = Some(tmux.socket().to_string());
@@ -5482,7 +5480,7 @@ process_names = ["never"]
         let tmux = cyclops_testrig::TmuxServer::new("mailbox-offline-respawn");
         tmux.run_ok(&["new-session", "-d", "-s", "main", "sleep 60"]);
         let home = cyclops_proto::scratch::scratch_dir(&format!(
-            "cyc-mailbox-offline-respawn-{}",
+            "cyc-mbox-offline-{}",
             uuid::Uuid::new_v4()
         ));
         let mut cfg = Config::defaults(&home);

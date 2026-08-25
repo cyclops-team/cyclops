@@ -732,7 +732,7 @@ fn compact_attempt_token(attempt_id: NotificationAttemptId) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let bytes = attempt_id.0.as_bytes();
     let mut encoded = String::with_capacity(22);
-    for chunk in bytes[..15].chunks_exact(3) {
+    for chunk in bytes[..15].as_chunks::<3>().0 {
         encoded.push(ALPHABET[(chunk[0] >> 2) as usize] as char);
         encoded.push(ALPHABET[(((chunk[0] & 0x03) << 4) | (chunk[1] >> 4)) as usize] as char);
         encoded.push(ALPHABET[(((chunk[1] & 0x0f) << 2) | (chunk[2] >> 6)) as usize] as char);
@@ -757,8 +757,10 @@ fn decode_attempt_token(encoded: &str) -> Option<NotificationAttemptId> {
     }
     let mut bytes = [0_u8; 16];
     for (chunk, values) in bytes[..15]
-        .chunks_exact_mut(3)
-        .zip(values[..20].chunks_exact(4))
+        .as_chunks_mut::<3>()
+        .0
+        .iter_mut()
+        .zip(values[..20].as_chunks::<4>().0)
     {
         chunk[0] = (values[0] << 2) | (values[1] >> 4);
         chunk[1] = (values[1] << 4) | (values[2] >> 2);
