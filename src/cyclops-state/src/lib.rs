@@ -166,9 +166,9 @@ impl InspectedEntry {
         self.unsafe_reason.is_none()
     }
 
-    /// Whether an owner-only parent contains every reported risk.
+    /// Whether an owner-only enclosing directory contains every reported risk.
     ///
-    /// Broader leaf mode bits are harmless behind a 0700 parent. Links,
+    /// Broader entry mode bits are harmless behind a 0700 ancestor. Links,
     /// foreign ownership, and unsupported file types remain unsafe.
     pub fn safe_beneath_owner_only_parent(&self) -> bool {
         self.safe()
