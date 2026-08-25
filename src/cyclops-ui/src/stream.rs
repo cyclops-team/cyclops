@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use cyclops_proto::{
     AgentState, Attention, AttentionItem, Clearance, DeliveryState, Event, Half, Kind, LedgerLine,
-    NotifyLevel, OpenDelivery, PaneSnapshot, Resolved,
+    NotifyLevel, OpenDelivery, PaneSnapshot, RecipientKey, Resolved,
 };
 use serde_json::Value;
 
@@ -58,6 +58,8 @@ pub struct StatusSeed {
     pub panes: Vec<PaneSnapshot>,
     pub open: Vec<OpenDelivery>,
     pub admin_unread: u64,
+    /// Current display labels bound to immutable mailbox endpoints.
+    pub mailbox_routes: Vec<EndpointFilter>,
     /// The same panes again, in the roster's richer shape. Separate from
     /// `panes` because the register's PaneSnapshot is the attention
     /// rule's input and grows for nobody else's convenience.
@@ -97,6 +99,11 @@ impl StatusSeed {
                 .collect(),
             open: res.open_deliveries.clone(),
             admin_unread: res.admin_unread,
+            mailbox_routes: res
+                .mailbox_routes
+                .iter()
+                .map(|route| EndpointFilter::new(route.recipient, route.label.clone()))
+                .collect(),
             roster: res
                 .sessions
                 .iter()
@@ -142,17 +149,22 @@ pub enum EntryKind {
     Msg {
         from: String,
         to: Vec<String>,
+        /// Exact endpoints when the entry came from an authenticated
+        /// workspace snapshot. Legacy ledger and event rows have labels only.
+        endpoints: Option<MessageEndpoints>,
         subject: String,
         body: Option<String>,
         fyi: bool,
     },
     Delivery {
         to: String,
+        recipient: Option<RecipientKey>,
         state: DeliveryState,
         cause: Option<String>,
     },
     Gate {
         to: String,
+        recipient: Option<RecipientKey>,
         action: String,
         detail: Option<String>,
     },
@@ -172,6 +184,7 @@ pub enum EntryKind {
     },
     State {
         target: String,
+        recipient: Option<RecipientKey>,
         session_idx: usize,
         pane_id: Option<String>,
         state: AgentState,
@@ -187,6 +200,7 @@ pub enum EntryKind {
     /// retract).
     Cleared {
         was: AttentionItem,
+        recipient: Option<RecipientKey>,
         how: Clearance,
     },
     Session {
@@ -204,6 +218,13 @@ pub enum EntryKind {
         event: String,
         detail: Option<String>,
     },
+}
+
+/// Immutable parties carried by an authenticated durable message row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageEndpoints {
+    pub sender: RecipientKey,
+    pub recipients: Vec<RecipientKey>,
 }
 
 /// One delivery a batch ping names, keyed the way the register keys it.
@@ -250,6 +271,7 @@ fn ping_deliveries(d: &Value) -> Vec<PingDelivery> {
 fn delivery_kind(d: &Value) -> EntryKind {
     EntryKind::Delivery {
         to: str_of(d, "to"),
+        recipient: recipient_of(d),
         state: state_of(d, "to_state"),
         cause: opt_str(d, "cause"),
     }
@@ -261,6 +283,7 @@ fn delivery_kind(d: &Value) -> EntryKind {
 fn gate_kind(d: &Value) -> EntryKind {
     EntryKind::Gate {
         to: str_of(d, "to"),
+        recipient: recipient_of(d),
         action: str_of(d, "action"),
         detail: opt_str(d, "cause").or_else(|| opt_str(d, "rule")),
     }
@@ -272,6 +295,7 @@ fn gate_kind(d: &Value) -> EntryKind {
 fn state_kind(d: &Value) -> EntryKind {
     EntryKind::State {
         target: str_of(d, "target"),
+        recipient: recipient_of(d),
         session_idx: d
             .get("session_idx")
             .and_then(Value::as_u64)
@@ -308,6 +332,7 @@ impl Entry {
             "msg" => EntryKind::Msg {
                 from: str_of(d, "from"),
                 to: vec_of(d, "to"),
+                endpoints: None,
                 subject: str_of(d, "subject"),
                 body: opt_str(d, "body").filter(|b| !b.is_empty()),
                 fyi: d.get("fyi").and_then(Value::as_bool).unwrap_or(false),
@@ -354,6 +379,7 @@ impl Entry {
             Kind::Msg | Kind::Fyi => EntryKind::Msg {
                 from: line.from.clone(),
                 to: line.to.clone(),
+                endpoints: None,
                 subject: line.subject.clone().unwrap_or_default(),
                 body: line.body.clone().filter(|b| !b.is_empty()),
                 fyi: line.kind == Kind::Fyi,
@@ -412,7 +438,12 @@ impl Entry {
     /// `ts` is when it stopped, and `id` the record the transition carried,
     /// so the clearance sits in the stream at the moment it happened and
     /// under the same message id as the delivery it ends.
-    pub fn cleared(ts: u64, id: Option<String>, resolved: Resolved) -> Entry {
+    pub fn cleared(
+        ts: u64,
+        id: Option<String>,
+        recipient: Option<RecipientKey>,
+        resolved: Resolved,
+    ) -> Entry {
         Entry {
             uid: 0,
             ts,
@@ -420,6 +451,7 @@ impl Entry {
             id,
             kind: EntryKind::Cleared {
                 was: resolved.was,
+                recipient,
                 how: resolved.how,
             },
         }
@@ -500,31 +532,131 @@ impl Entry {
         }
     }
 
-    /// Parties for filtering: (senders, recipients, everyone involved).
-    fn parties(&self) -> (Vec<&str>, Vec<&str>, Vec<&str>) {
+    /// Parties for filtering: labels for legacy rows and exact endpoints
+    /// for authenticated durable message rows.
+    fn parties(&self) -> Parties<'_> {
         match &self.kind {
-            EntryKind::Msg { from, to, .. } => {
+            EntryKind::Msg {
+                from,
+                to,
+                endpoints,
+                ..
+            } => {
                 let tos: Vec<&str> = to.iter().map(String::as_str).collect();
                 let mut all = tos.clone();
                 all.push(from);
-                (vec![from], tos, all)
+                let (sender_keys, recipient_keys) = endpoints
+                    .as_ref()
+                    .map(|endpoints| (vec![endpoints.sender], endpoints.recipients.clone()))
+                    .unwrap_or_default();
+                let mut all_keys = recipient_keys.clone();
+                all_keys.extend(sender_keys.iter().copied());
+                Parties {
+                    sender_labels: vec![from],
+                    recipient_labels: tos,
+                    all_labels: all,
+                    sender_keys,
+                    recipient_keys,
+                    all_keys,
+                }
             }
-            EntryKind::Delivery { to, .. } | EntryKind::Gate { to, .. } => {
-                (vec![], vec![to.as_str()], vec![to.as_str()])
+            EntryKind::Delivery { to, recipient, .. } | EntryKind::Gate { to, recipient, .. } => {
+                Parties::with_keys(
+                    Vec::new(),
+                    vec![to.as_str()],
+                    Vec::new(),
+                    recipient.iter().copied().collect(),
+                )
             }
-            EntryKind::Notify { .. } => (vec![], vec!["admin"], vec!["admin"]),
-            EntryKind::State { target, .. } => (vec![target.as_str()], vec![], vec![target]),
+            EntryKind::Notify { .. } => Parties::labels(Vec::new(), vec!["admin"]),
+            EntryKind::State {
+                target, recipient, ..
+            } => Parties::with_keys(
+                vec![target.as_str()],
+                Vec::new(),
+                recipient.iter().copied().collect(),
+                Vec::new(),
+            ),
             // A clearance filters exactly as the row it answers does, or a
             // filter that admitted the alarm would hide its ending and put
             // the reader back where this whole rule started.
-            EntryKind::Cleared { was, .. } => match was {
-                AttentionItem::Agent { name, .. } => (vec![name.as_str()], vec![], vec![name]),
-                AttentionItem::Delivery { to, .. } => (vec![], vec![to.as_str()], vec![to]),
+            EntryKind::Cleared { was, recipient, .. } => match was {
+                AttentionItem::Agent { name, .. } => Parties::with_keys(
+                    vec![name.as_str()],
+                    Vec::new(),
+                    recipient.iter().copied().collect(),
+                    Vec::new(),
+                ),
+                AttentionItem::Delivery { to, .. } => Parties::with_keys(
+                    Vec::new(),
+                    vec![to.as_str()],
+                    Vec::new(),
+                    recipient.iter().copied().collect(),
+                ),
             },
             EntryKind::Session { .. } | EntryKind::PaneGone { .. } | EntryKind::Other { .. } => {
-                (vec![], vec![], vec![])
+                Parties::labels(Vec::new(), Vec::new())
             }
         }
+    }
+}
+
+struct Parties<'a> {
+    sender_labels: Vec<&'a str>,
+    recipient_labels: Vec<&'a str>,
+    all_labels: Vec<&'a str>,
+    sender_keys: Vec<RecipientKey>,
+    recipient_keys: Vec<RecipientKey>,
+    all_keys: Vec<RecipientKey>,
+}
+
+impl<'a> Parties<'a> {
+    fn labels(sender_labels: Vec<&'a str>, recipient_labels: Vec<&'a str>) -> Self {
+        Self::with_keys(sender_labels, recipient_labels, Vec::new(), Vec::new())
+    }
+
+    fn with_keys(
+        sender_labels: Vec<&'a str>,
+        recipient_labels: Vec<&'a str>,
+        sender_keys: Vec<RecipientKey>,
+        recipient_keys: Vec<RecipientKey>,
+    ) -> Self {
+        let mut all_labels = recipient_labels.clone();
+        all_labels.extend(sender_labels.iter().copied());
+        let mut all_keys = recipient_keys.clone();
+        all_keys.extend(sender_keys.iter().copied());
+        Self {
+            sender_labels,
+            recipient_labels,
+            all_labels,
+            sender_keys,
+            recipient_keys,
+            all_keys,
+        }
+    }
+}
+
+/// One display selector resolved once to an immutable mailbox endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointFilter {
+    recipient: RecipientKey,
+    label: String,
+}
+
+impl EndpointFilter {
+    pub fn new(recipient: RecipientKey, label: impl Into<String>) -> Self {
+        Self {
+            recipient,
+            label: label.into(),
+        }
+    }
+
+    pub fn recipient(&self) -> RecipientKey {
+        self.recipient
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
     }
 }
 
@@ -532,9 +664,9 @@ impl Entry {
 /// one direction each. All set filters must pass.
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
-    pub with: Option<String>,
-    pub from: Option<String>,
-    pub to: Option<String>,
+    pub with: Option<EndpointFilter>,
+    pub from: Option<EndpointFilter>,
+    pub to: Option<EndpointFilter>,
 }
 
 impl Filter {
@@ -546,19 +678,19 @@ impl Filter {
         if self.is_empty() {
             return true;
         }
-        let (froms, tos, involved) = e.parties();
+        let parties = e.parties();
         if let Some(w) = &self.with {
-            if !involved.iter().any(|p| p == w) {
+            if !party_matches(w, &parties.all_labels, &parties.all_keys) {
                 return false;
             }
         }
         if let Some(f) = &self.from {
-            if !froms.iter().any(|p| p == f) {
+            if !party_matches(f, &parties.sender_labels, &parties.sender_keys) {
                 return false;
             }
         }
         if let Some(t) = &self.to {
-            if !tos.iter().any(|p| p == t) {
+            if !party_matches(t, &parties.recipient_labels, &parties.recipient_keys) {
                 return false;
             }
         }
@@ -569,19 +701,27 @@ impl Filter {
     pub fn words(&self) -> Option<String> {
         let mut parts = Vec::new();
         if let Some(w) = &self.with {
-            parts.push(format!("with {w}"));
+            parts.push(format!("with {}", w.label()));
         }
         if let Some(f) = &self.from {
-            parts.push(format!("from {f}"));
+            parts.push(format!("from {}", f.label()));
         }
         if let Some(t) = &self.to {
-            parts.push(format!("to {t}"));
+            parts.push(format!("to {}", t.label()));
         }
         if parts.is_empty() {
             None
         } else {
             Some(parts.join(" · "))
         }
+    }
+}
+
+fn party_matches(filter: &EndpointFilter, labels: &[&str], keys: &[RecipientKey]) -> bool {
+    if keys.is_empty() {
+        labels.iter().any(|label| *label == filter.label())
+    } else {
+        keys.contains(&filter.recipient())
     }
 }
 
@@ -594,6 +734,10 @@ fn str_of(d: &Value, key: &str) -> String {
 
 fn opt_str(d: &Value, key: &str) -> Option<String> {
     d.get(key).and_then(Value::as_str).map(String::from)
+}
+
+fn recipient_of(d: &Value) -> Option<RecipientKey> {
+    serde_json::from_value(d.get("recipient")?.clone()).ok()
 }
 
 fn vec_of(d: &Value, key: &str) -> Vec<String> {
@@ -849,6 +993,13 @@ impl Record {
     /// (`--plain`) has no frame to reconcile, so a line it never sees is a
     /// line it never prints.
     pub fn live(&mut self, e: Entry) -> Option<Entry> {
+        let recipient = match &e.kind {
+            EntryKind::State { recipient, .. }
+            | EntryKind::Delivery { recipient, .. }
+            | EntryKind::Gate { recipient, .. }
+            | EntryKind::Cleared { recipient, .. } => *recipient,
+            _ => None,
+        };
         let resolved = match &e.kind {
             EntryKind::State {
                 target,
@@ -876,7 +1027,7 @@ impl Record {
         // Nothing ended: the transition is on the record and that is all
         // there is to say about it.
         let resolved = resolved?;
-        self.ingest(Entry::cleared(ts, id, resolved));
+        self.ingest(Entry::cleared(ts, id, recipient, resolved));
         // Copied back off the ring so the caller's entry carries the uid
         // the ring gave it, not a placeholder.
         self.entries.back().cloned()
@@ -950,7 +1101,7 @@ impl Record {
     /// After that the register moves on live events alone, and a pane
     /// leaving the table is one of them ([`Record::live`]).
     pub fn seed(&mut self, panes: &[PaneSnapshot], open: &[OpenDelivery]) -> Vec<Entry> {
-        self.seed_routed(panes, open, &HashMap::new())
+        self.seed_routed(panes, open, &HashMap::new(), &HashMap::new())
     }
 
     /// Seed with the daemon session slot for each pane.
@@ -963,6 +1114,7 @@ impl Record {
         panes: &[PaneSnapshot],
         open: &[OpenDelivery],
         routes: &HashMap<String, usize>,
+        recipients: &HashMap<String, RecipientKey>,
     ) -> Vec<Entry> {
         // 1. Replace both halves of the register with the answer.
         self.attention.snapshot_agents(panes.iter().cloned());
@@ -1005,6 +1157,7 @@ impl Record {
                     id: None,
                     kind: EntryKind::State {
                         target: name.clone(),
+                        recipient: recipients.get(pane_id).copied(),
                         session_idx: routes.get(pane_id).copied().unwrap_or_default(),
                         pane_id: Some(pane_id.clone()),
                         state: *state,
@@ -1022,6 +1175,9 @@ impl Record {
                         id: Some(id.clone()),
                         kind: EntryKind::Delivery {
                             to: to.clone(),
+                            recipient: record
+                                .and_then(|delivery| delivery.recipient)
+                                .or_else(|| recipients.get(to).copied()),
                             state: *state,
                             cause: record.and_then(|d| d.cause.clone()),
                         },
@@ -1037,10 +1193,11 @@ impl Record {
         //    line the calm view takes. The register says which alarms
         //    those are and how each one ended; the clearance is what puts
         //    that under the row the reader is looking at.
-        for (item, how) in self.alarms_the_answer_cleared() {
+        for (item, recipient, how) in self.alarms_the_answer_cleared() {
             out.push(Entry::cleared(
                 crate::data::now_ms(),
                 None,
+                recipient,
                 Resolved { was: item, how },
             ));
         }
@@ -1079,18 +1236,19 @@ impl Record {
     /// (one pane has one current state), and a clearance already on the
     /// record retires it. Sorted by name so a startup over a long tail
     /// always writes them in the same order.
-    fn alarms_the_answer_cleared(&self) -> Vec<(AttentionItem, Clearance)> {
+    fn alarms_the_answer_cleared(&self) -> Vec<(AttentionItem, Option<RecipientKey>, Clearance)> {
         // Owned keys: the map outlives each entry's borrow, and the
         // identity is two strings either way.
         let key = |item: &AttentionItem| {
             let (half, name, id) = item.identity();
             (half, name.to_string(), id.to_string())
         };
-        let mut open: HashMap<(Half, String, String), AttentionItem> = HashMap::new();
+        let mut open: HashMap<(Half, String, String), (AttentionItem, Option<RecipientKey>)> =
+            HashMap::new();
         for e in &self.entries {
             match (alarm_item(e), &e.kind) {
                 (Some(item), _) => {
-                    open.insert(key(&item), item);
+                    open.insert(key(&item), (item, entry_recipient(e)));
                 }
                 (None, EntryKind::Cleared { was, .. }) => {
                     open.remove(&key(was));
@@ -1098,14 +1256,14 @@ impl Record {
                 _ => {}
             }
         }
-        let mut out: Vec<(AttentionItem, Clearance)> = open
+        let mut out: Vec<(AttentionItem, Option<RecipientKey>, Clearance)> = open
             .into_values()
-            .filter_map(|item| {
+            .filter_map(|(item, recipient)| {
                 let how = self.attention.clearance(item.identity())?;
-                Some((item, how))
+                Some((item, recipient, how))
             })
             .collect();
-        out.sort_by(|(a, _), (b, _)| (a.name(), a.identity()).cmp(&(b.name(), b.identity())));
+        out.sort_by(|(a, _, _), (b, _, _)| (a.name(), a.identity()).cmp(&(b.name(), b.identity())));
         out
     }
 
@@ -1237,6 +1395,18 @@ fn entry_identity(e: &Entry) -> Option<(Half, &str, &str)> {
     }
 }
 
+/// Exact mailbox endpoint carried by an event row. Rows written before
+/// endpoint identity was added return `None` and retain label matching.
+fn entry_recipient(e: &Entry) -> Option<RecipientKey> {
+    match &e.kind {
+        EntryKind::Delivery { recipient, .. }
+        | EntryKind::Gate { recipient, .. }
+        | EntryKind::State { recipient, .. }
+        | EntryKind::Cleared { recipient, .. } => *recipient,
+        _ => None,
+    }
+}
+
 /// The item this line raises, when the line says a human is needed.
 ///
 /// The judgement is `Entry::admin_visible`'s, asked of the same rule: what
@@ -1341,6 +1511,7 @@ mod tests {
             kind: EntryKind::Msg {
                 from: from.into(),
                 to: to.iter().map(|t| t.to_string()).collect(),
+                endpoints: None,
                 subject: subject.into(),
                 body: None,
                 fyi: false,
@@ -1354,6 +1525,15 @@ mod tests {
             data,
             seq: None,
         }
+    }
+
+    fn endpoint(label: &str) -> EndpointFilter {
+        EndpointFilter::new(
+            "admin:00000000-0000-0000-0000-000000000001"
+                .parse()
+                .unwrap(),
+            label,
+        )
     }
 
     #[test]
@@ -1481,32 +1661,32 @@ mod tests {
         let c = msg("admin", &["reviewer", "implementer"], "s");
 
         let with = Filter {
-            with: Some("reviewer".into()),
+            with: Some(endpoint("reviewer")),
             ..Filter::default()
         };
         assert!(with.matches(&a) && with.matches(&b) && with.matches(&c));
         let with_codex = Filter {
-            with: Some("codex".into()),
+            with: Some(endpoint("codex")),
             ..Filter::default()
         };
         assert!(with_codex.matches(&a) && with_codex.matches(&b) && !with_codex.matches(&c));
 
         let from = Filter {
-            from: Some("codex".into()),
+            from: Some(endpoint("codex")),
             ..Filter::default()
         };
         assert!(from.matches(&a) && !from.matches(&b));
 
         let to = Filter {
-            to: Some("codex".into()),
+            to: Some(endpoint("codex")),
             ..Filter::default()
         };
         assert!(!to.matches(&a) && to.matches(&b));
 
         // from plus to must both hold.
         let both = Filter {
-            from: Some("codex".into()),
-            to: Some("reviewer".into()),
+            from: Some(endpoint("codex")),
+            to: Some(endpoint("reviewer")),
             ..Filter::default()
         };
         assert!(both.matches(&a) && !both.matches(&b));
@@ -1518,7 +1698,7 @@ mod tests {
         );
         assert!(with.matches(&st));
         let from_reviewer = Filter {
-            from: Some("reviewer".into()),
+            from: Some(endpoint("reviewer")),
             ..Filter::default()
         };
         assert!(from_reviewer.matches(&st));
@@ -1526,13 +1706,79 @@ mod tests {
 
         assert_eq!(
             Filter {
-                with: Some("reviewer".into()),
+                with: Some(endpoint("reviewer")),
                 from: None,
-                to: Some("codex".into())
+                to: Some(endpoint("codex"))
             }
             .words()
             .as_deref(),
             Some("with reviewer · to codex")
+        );
+    }
+
+    #[test]
+    fn exact_event_routes_survive_a_display_rename() {
+        let recipient = endpoint("before-rename").recipient();
+        let filter = Filter {
+            with: Some(EndpointFilter::new(recipient, "before-rename")),
+            ..Filter::default()
+        };
+        let events = [
+            ev(
+                "state",
+                json!({
+                    "target": "after-rename",
+                    "recipient": recipient,
+                    "state": "working"
+                }),
+            ),
+            ev(
+                "gate",
+                json!({
+                    "to": "after-rename",
+                    "recipient": recipient,
+                    "action": "hold",
+                    "cause": "working"
+                }),
+            ),
+            ev(
+                "delivery-state",
+                json!({
+                    "to": "after-rename",
+                    "recipient": recipient,
+                    "to_state": "gating"
+                }),
+            ),
+        ];
+        for event in events {
+            assert!(filter.matches(&Entry::from_event(&event, 0)));
+        }
+
+        let cleared = Entry::cleared(
+            0,
+            Some("m-1".into()),
+            Some(recipient),
+            Resolved {
+                was: AttentionItem::Delivery {
+                    to: "after-rename".into(),
+                    id: "m-1".into(),
+                    state: DeliveryState::AttentionRequired,
+                },
+                how: Clearance::Moved,
+            },
+        );
+        assert!(filter.matches(&cleared));
+
+        let legacy = Entry::from_event(
+            &ev(
+                "state",
+                json!({"target": "after-rename", "state": "working"}),
+            ),
+            0,
+        );
+        assert!(
+            !filter.matches(&legacy),
+            "label fallback applies only when the legacy row still carries the resolved label"
         );
     }
 
@@ -1753,6 +1999,7 @@ mod tests {
             }],
             open: Vec::new(),
             admin_unread: 0,
+            mailbox_routes: Vec::new(),
             roster: Vec::new(),
         };
         assert!(intake.status(Box::new(status)).is_none());
@@ -1829,7 +2076,7 @@ mod tests {
         assert_eq!(cleared_rows.len(), 1);
         assert_eq!(cleared_rows[0].uid, rows[3].uid);
         match &cleared_rows[0].kind {
-            EntryKind::Cleared { was, how } => {
+            EntryKind::Cleared { was, how, .. } => {
                 assert!(matches!(was, AttentionItem::Agent { name, .. } if name == "reviewer"));
                 assert_eq!(*how, Clearance::Moved);
             }
@@ -2016,6 +2263,7 @@ mod tests {
             id: None,
             kind: EntryKind::State {
                 target: target.into(),
+                recipient: None,
                 session_idx: 0,
                 pane_id: Some(pane_id.into()),
                 state,

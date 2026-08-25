@@ -37,12 +37,14 @@ fn synthetic(i: u64) -> Entry {
         0 => EntryKind::Msg {
             from: format!("agent{}", i % 7),
             to: vec![format!("agent{}", (i + 1) % 7)],
+            endpoints: None,
             subject: format!("message number {i} with a realistic subject line"),
             body: Some("first body line\nsecond body line".into()),
             fyi: i.is_multiple_of(8),
         },
         1 => EntryKind::Delivery {
             to: format!("agent{}", i % 7),
+            recipient: None,
             state: DeliveryState::DeliveredVerified,
             cause: None,
         },
@@ -52,6 +54,7 @@ fn synthetic(i: u64) -> Entry {
         // repeat `Record::ingest` would now dedupe out of the ring.
         2 => EntryKind::State {
             target: format!("agent{}", i % 7),
+            recipient: None,
             session_idx: 0,
             pane_id: Some(format!("%{}", i % 7)),
             state: if i.is_multiple_of(2) {
@@ -62,6 +65,7 @@ fn synthetic(i: u64) -> Entry {
         },
         _ => EntryKind::Gate {
             to: format!("agent{}", i % 7),
+            recipient: None,
             action: "proceed".into(),
             detail: Some("prompt_visible".into()),
         },
@@ -83,6 +87,7 @@ fn backlog(open: usize) -> StatusSeed {
     StatusSeed {
         watched: vec!["main".into()],
         admin_unread: 0,
+        mailbox_routes: Vec::new(),
         roster: Vec::new(),
         panes: if open == 0 {
             Vec::new()
@@ -97,6 +102,7 @@ fn backlog(open: usize) -> StatusSeed {
             .map(|n| OpenDelivery {
                 id: format!("m-park-{n:04}"),
                 to: format!("agent{}", n % 7),
+                recipient: None,
                 state: DeliveryState::ParkedBlockedQuota,
                 ts: 1_754_000_000_000,
                 cause: Some("blocked_quota".into()),

@@ -34,6 +34,12 @@ uses `sudo`. It prefers a bin directory already on your `PATH`; otherwise it
 uses `~/.local/bin` and offers to add that directory to your shell profile,
 after making a timestamped backup.
 
+Setup also merges Cyclops-owned hook entries into detected agent CLI configs
+and places the Cyclops skill in each supported skill home. It preserves
+unrelated vendor settings, backs up a vendor config before its first edit, and
+does not create homes for agent CLIs that are not installed. Set
+`CYCLOPS_NO_VENDOR_HOOKS=1` to skip hook and skill wiring.
+
 To build a clone you already have:
 
 ```bash
@@ -60,24 +66,67 @@ A bare `cyclops` opens the full-screen workspace, starting a tmux session
 and the daemon when neither is already running. If the installer added a
 PATH block, first open a new shell or run the reload command it printed.
 
+### If Codex reports `TERM=dumb`
+
+Do not continue into the interactive TUI from that shell. Run:
+
+```bash
+printf '%s\n' "$TERM"
+```
+
+An agent pane inside tmux normally reports `tmux-256color`; a regular terminal
+outside tmux commonly reports `xterm-256color`. Cyclops does not set
+`TERM=dumb`. Remove that value from the shell profile, launcher, or automation
+that created the shell, then start a fresh terminal. Do not claim richer
+terminal capabilities in a non-interactive pipe merely to suppress the warning.
+
+Headless tmux control clients may report `dumb` without changing an agent
+pane. Check the value in the exact pane where the agent starts. The full
+diagnostic is in the repository's
+[troubleshooting guide](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/troubleshooting.md#codex-warns-that-term-is-dumb).
+
 ## Update
 
 ```bash
 cyclops update
 ```
 
-It names the build you are running, asks the source whether anything is
-newer (already current stops right there), reruns the installer from a
-fresh clone, and reports old build to new plus the three restart steps.
-Your configuration, manifests, workspaces, and ledger remain under
-`~/.cyclops`. Running the install command again does the same rebuild
-without the freshness check.
+It names the running build, checks the source, and builds a candidate matched
+CLI and daemon pair. Before activation, the candidate proves its build identity
+and replays a private copy of the current journals. One selector activates the
+pair after the exact running daemon generation quiesces. The previous pair is
+retained for recovery. A daemon that was running is restarted on the selected
+pair. When no daemon was running, update leaves it stopped; the next `cyclops`
+or `cyclops start` starts the selected daemon.
 
-The first `cyclops start` on the new build also repairs the prepared
-hook configs under `~/.cyclops/hooks/`: any that still invoke the
-replaced binary are re-rendered and a note says how many. Files you
-edited, or copies you merged into an agent CLI's own config, are named
-and left alone.
+```bash
+cyclops update --rollback
+```
+
+Rollback validates the retained pair and proves that it can replay a private
+copy of the current journals before changing the selector. Configuration,
+manifests, workspaces, and journals remain under `~/.cyclops`; rollback does
+not restore earlier state or promise compatibility beyond that replay proof.
+A running daemon is quiesced and restarted. A stopped daemon stays stopped.
+Operator-edited setup files stay unchanged. Known unedited shipped themes,
+manifests, hook artifacts, and skills may advance with the installed release.
+Update also refreshes Cyclops-owned vendor hook entries and known unedited
+skills unless `CYCLOPS_NO_VENDOR_HOOKS=1` is set.
+
+Pair activation is the update commit point. If later home setup needs repair,
+the matched pair remains active and the installer prints the exact
+`cyclops start --setup-only --wire-hooks` repair command.
+
+An older daemon that cannot report its exact process generation is never
+stopped automatically. The update prints a one-time manual stop and rerun
+sequence. A legacy direct pair without matching source-build identity is used
+only to preserve executable continuity during migration, never as rollback.
+
+The first setup on the new build also repairs prepared hook artifacts under
+`~/.cyclops/hooks/` when their receipts prove they are still unedited. With
+vendor wiring enabled, setup also refreshes Cyclops-owned hook entries already
+merged into installed agent configs. Edited or unreceipted files are named and
+left unchanged.
 
 ## Uninstall
 
@@ -93,7 +142,12 @@ Without a clone:
 curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
 ```
 
-Uninstall removes the two binaries and the installer-owned profile block. It
-leaves `~/.cyclops` in place because that directory contains your record.
+Uninstall removes the two public binary links, the validated managed pair
+store, and the installer-owned profile block. It refuses an altered pair store
+instead of deleting an unproven tree. It leaves `~/.cyclops` in place because
+that directory contains your record. Both public names are removed only from
+one prefix, selected by `--prefix` or by the `cyclops` command on `PATH`.
+Uninstall never resolves `cyclopsd` from a different prefix. If no `cyclops`
+anchor exists but `cyclopsd` is present, it refuses and asks for `--prefix`.
 
 Homebrew and Nix packages are not published yet.

@@ -101,9 +101,10 @@ the line printed and no edit.
 curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
 ```
 
-Removes both binaries and takes the block back out of your profile,
-backing it up again first. It leaves `~/.cyclops` alone and says how to
-remove that too; the ledger under it is your message history.
+The managed uninstall removes both public binary links, the validated pair
+store, and the installer-owned PATH block. It preserves `~/.cyclops`, including
+the mailbox journal and session ledgers, and refuses an altered pair store or an
+ambiguous install prefix. The full safety contract is in [Uninstall](#uninstall).
 
 From a clone, use `./scripts/install.sh --uninstall`.
 
@@ -119,8 +120,10 @@ Both go to `~/.cargo/bin`, and cargo warns when that is not on your PATH.
 `~/.local/bin/cyclops` instead; the root is the prefix, not the directory,
 and cargo appends `bin`.
 
-Installing this way does no setup, so run `cyclops start --setup-only`
-after it to write the config and the manifests.
+Installing this way does no setup. Run `cyclops start --setup-only --wire-hooks`
+to write the config and manifests, merge Cyclops-owned hook entries, and seed
+the agent skill for installed supported consumers. Omit `--wire-hooks` when you
+want config and manifests only, then wire each agent explicitly.
 
 To build without installing, `cargo build --release` puts both in
 `target/release/`.
@@ -358,9 +361,11 @@ supervisor instead, `cyclops start --no-daemon` leaves it alone.
 the first time. `--preset duo|quad|ops` picks a bigger one;
 [workspaces.md](workspaces.md) covers saving and restoring your own.
 
-Logs go to stderr; set `CYCLOPS_LOG=debug` for more. Stop with Ctrl-C or
-SIGTERM; the daemon removes its socket and exits cleanly. Your tmux session
-is never modified by watching it.
+Normal tracing goes to the bounded `$CYCLOPS_HOME/cyclopsd.log`, including
+when the daemon runs in the foreground. Set `CYCLOPS_LOG=debug` for more and
+use `cyclops daemon log` to read it. Stop with Ctrl-C or SIGTERM; the daemon
+removes its socket and exits cleanly. Your tmux session is never modified by
+watching it.
 
 ## Wire the hooks
 
@@ -373,9 +378,11 @@ cyclops hooks install claude --agent reviewer   # renders config + prints wiring
 cyclops hooks selftest reviewer                 # proves the hooks actually fire
 ```
 
-Install never touches vendor config directories; it prepares files under
-`~/.cyclops/hooks/` and tells you the one command to wire each CLI.
-Details and the codex trust caveat: [hooks.md](../reference/hooks.md).
+The standalone `cyclops hooks install` command only prepares an artifact under
+`~/.cyclops/hooks/` and prints the wiring step. The main installer and updater
+use recorded `--wire-hooks` consent to merge Cyclops-owned entries and seed the
+agent skill while preserving unrelated vendor settings. Details and the Codex
+trust caveat: [hooks.md](../reference/hooks.md).
 
 ## Verify
 
@@ -405,7 +412,11 @@ whole install and not one pane:
 ```
 
 The shipped manifests cover Claude Code, Codex CLI, Antigravity CLI, and
-Cursor Agent CLI.
+Cursor Agent CLI. Cursor detection has fixture coverage, but the current-version
+terminal notification path has not completed live validation because no current
+Cursor binary was available on the evidence host. It fails closed when exact
+evidence is unavailable; socket claims remain usable. See
+[Known limits](../../STATUS.md#known-limits).
 Teaching it another one is a single TOML file:
 [MANIFESTS.md](../reference/MANIFESTS.md). More symptoms and their next steps:
 [troubleshooting.md](troubleshooting.md).
@@ -469,54 +480,79 @@ cyclops 0.1.0 (1e16081)
 ✔ already the latest main · nothing to update
 ```
 
-Behind a newer commit, updating is reinstalling: it clones the
-repository and runs that clone's `scripts/install.sh`, streaming its
-output. The same rules as your first install apply: binaries are
-replaced in place (copied beside, renamed over, safe under a running
-daemon), and config, themes, manifests and the record already in your
-home are never rewritten. Then it closes the loop the installer cannot:
+Behind a newer commit, updating clones the repository and builds a candidate
+pair. The candidate CLI and daemon must report one build, then the candidate
+daemon must replay a private copy of the current journals before either
+installed selector changes. Durable records and operator-edited setup files in
+your home are preserved. Known unedited shipped themes, manifests, hook
+artifacts, and skills may advance with the installed release.
 
 ```
+  activated matched pair 1e16081
+  no daemon was running; the selected pair remains stopped
+
 ✔ updated · 0.1.0 (0876ed7) → 0.1.0 (1e16081)
 
-✔ restarted cyclopsd · was pid 4242, now on the installed binaries; queued messages rode through
   an open workspace stays on the old build until you detach (ctrl+b d) and run cyclops again
 ```
 
 The left of the arrow is the binary that ran the update; the right is
-the freshly installed one answering `--version` for itself. Then the
-daemon is restarted for you when that is safe unattended: it is asked to
-quiesce first (`daemon.quiesce`), and a restart only proceeds when no
-message is between the paste and a resolved delivery anywhere. Messages
-that have not reached a pane ride through. The rebooted daemon requeues
-them. Your open workspace is a different matter: it is your screen, so
-it is never touched, and one dim line says how to bring it over.
+the freshly installed one answering `--version` for itself. Each release is a
+directory containing the matched pair. The public commands pass through one
+`active` selector, so there is no moment where a new CLI names an old daemon.
+The previous matched pair remains as `known-good`.
+
+If a daemon was running, update restarts that exact selected generation on the
+new pair. If no daemon was running, update leaves it stopped; the next
+`cyclops` or `cyclops start` starts the selected daemon.
+
+Pair activation is the update commit point. If later home setup needs repair,
+the matched pair remains active and the installer prints the exact
+`cyclops start --setup-only --wire-hooks` repair command. It does not report a
+generic update failure that implies activation never happened.
+
+Before changing `active`, update asks the authenticated daemon to quiesce. It
+stops only when the daemon's PID, kernel start value, boot id, and socket answer
+still identify the same process. The new daemon starts from the selected pair.
+If startup or build identity fails, update first proves that it can stop the
+exact failed candidate. It then restores the prior selector and starts the
+known-good daemon. If that ownership proof fails, update leaves automatic
+rollback held and reports the exact recovery action instead of signalling or
+replacing an unproven process.
 
 On the first update that installs this behavior, the daemon still running
-is the build being replaced, so it does not know the restart handshake
-and says so. That crossing is a plain `cyclops daemon stop` followed by
-`cyclops`. The printed steps say exactly that because
-`cyclops daemon restart` would ask the same old daemon the same question.
-Every update after it restarts on its own.
+may not know the exact-generation shutdown handshake. Update refuses to stop
+that daemon and prints the manual crossing: run `cyclops daemon stop` with the
+old CLI, then rerun `cyclops update`. The old direct binary bytes remain
+executable while both public names move behind the selector. If the old CLI and
+daemon do not both expose the same source build, they are migration-only and
+are not retained as known-good. The proven candidate is retained instead.
+Every later update restarts on its own and retains the previous matched pair.
 
-A fleet that stays mid-flight refuses the restart and prints the manual
-steps instead. These are the same three you can take any time:
+A delivery that stays mid-flight refuses the selector change. Nothing is
+stopped and the active pair does not move.
 
+To restore the retained pair explicitly:
+
+```bash
+cyclops update --rollback
 ```
-Restart:
-  1  ctrl+b d                detach any open workspace; it is still on the old build
-  2  cyclops daemon restart  retry when quiet; it refuses while a message is mid-flight
-  3  cyclops                 reopen the workspace on the new build
-```
 
-Reopening with `cyclops` (or any `cyclops start`) also repairs the
-prepared hook configs under `~/.cyclops/hooks/`: any that still invoke a
-cyclops path that no longer exists are re-rendered for the new build and
-a note says how many. The receipt recorded beside each artifact is how
-start tells its own writing from yours: a file you edited, or one with
-no receipt, is named and left alone. A copy you already merged into
-vendor config is out of reach the same way; the note names it so the
-hooks that would otherwise fail silently point somewhere you can fix.
+Rollback validates the retained pair and proves it can replay a private copy
+of the current journals before changing the selector. It does not copy
+binaries, rewrite journals, restore earlier configuration, or promise
+compatibility beyond that replay proof. A running daemon is quiesced and
+restarted on the retained pair. A stopped daemon stays stopped.
+After a legacy first migration, rollback becomes available after the next
+matched update because no unproven legacy pair is advertised as known-good.
+
+Reopening with `cyclops` (or any `cyclops start`) repairs prepared hook
+artifacts under `~/.cyclops/hooks/` when their receipts prove they are still
+unedited. A file you edited, or one with no receipt, is named and left alone.
+The installer and updater run setup with vendor-wiring consent: Cyclops-owned
+hook entries in installed agent configs and known unedited Cyclops skills may
+be refreshed, while unrelated vendor entries stay unchanged. Set
+`CYCLOPS_NO_VENDOR_HOOKS=1` to skip that wiring for one run.
 
 `CYCLOPS_REPO` and `CYCLOPS_REF` pick the source, exactly as they do for
 the installer; the defaults are the public repository's `main`. A build
@@ -524,13 +560,18 @@ from edited sources (`--version` ends in `.dirty`) or from outside git
 (`unknown`) can match no commit, so it says so, skips the freshness
 check, and updates anyway.
 
-`cyclops update` updates cyclops itself. Wiring an agent CLI's hooks is
-`cyclops hooks install`, a different job.
+`cyclops hooks install` remains the explicit repair command for vendor hook
+wiring outside install and update.
 
 ## Uninstall
 
-The installer removes the binaries and its PATH block but preserves your
-data:
+The installer removes the binaries, the validated managed pair store, and its
+PATH block but preserves your data. Pair-store removal holds the update lease
+and refuses unknown, linked, or ownership-changing entries instead of deleting
+an unproven tree. Both public names are removed only from one prefix, selected
+by `--prefix` or by the `cyclops` command on `PATH`. It never resolves a
+`cyclopsd` from another prefix. If only `cyclopsd` can be found, uninstall
+refuses and asks for an explicit prefix:
 
 ```bash
 curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall

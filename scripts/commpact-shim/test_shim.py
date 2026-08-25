@@ -84,9 +84,10 @@ class CannedDaemon:
     """Accepts NDJSON connections like cyclopsd: hello line first, then one
     reply per request line. Records every request for assertions."""
 
-    def __init__(self, sock_path):
+    def __init__(self, sock_path, build):
         self.requests = []
         self.lock = threading.Lock()
+        self.build = build
         self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.listener.bind(str(sock_path))
         self.listener.listen(8)
@@ -102,7 +103,12 @@ class CannedDaemon:
 
     def _handle(self, conn):
         f = conn.makefile("rwb")
-        hello = {"cyclops": "0.1.0", "proto": 1, "boot_id": "b-shim"}
+        hello = {
+            "cyclops": "0.1.0",
+            "build": self.build,
+            "proto": 1,
+            "boot_id": "b-shim",
+        }
         f.write((json.dumps(hello) + "\n").encode())
         f.flush()
         for line in f:
@@ -226,7 +232,11 @@ def main():
             text=True, env=env(extra_env),
         )
 
-    daemon = CannedDaemon(ch / "sock")
+    version = subprocess.run(
+        [str(CYCLOPS), "--version"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    build = version.rsplit("(", 1)[1].removesuffix(")")
+    daemon = CannedDaemon(ch / "sock", build)
     try:
         # send: the exact COORDINATION.md pattern. First shim call, so the
         # deprecation note must be the only stderr line.

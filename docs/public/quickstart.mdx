@@ -58,6 +58,11 @@ tmux attach -t main
 The default pane is named `implementer`. Start Claude Code, Codex CLI, Cursor
 Agent, or another CLI for which you have a detection manifest.
 
+Cursor detection ships, but its current-version terminal-notification path has
+not completed live validation. It fails closed when exact evidence is missing;
+use `cyclops inbox next` or `cyclops inbox claim` over the socket. See
+[Recover a notification](/guides/recovery).
+
 ## 4. Check the roster
 
 From another terminal:

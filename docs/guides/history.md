@@ -22,10 +22,11 @@ cyclops history --limit 10
 
 `--with` reconstructs a conversation: both directions, plus broadcasts
 that included the agent. `--from`/`--to` filter one direction each.
-`me` resolves from the authenticated caller. A process under a watched pane
-root is that pane's durable identity. A same-user process proven outside every
-watched pane is `admin`; unprovable ancestry is denied. Pick one filter shape:
-`--with`, or `--from` and `--to`.
+`me` resolves from the authenticated caller. A same-user shell with no
+agent-vendor ancestor is `admin`, including inside a watched pane. A vendor
+process gets a durable agent identity only through its current watched pane;
+unprovable ancestry is denied. Pick one filter shape: `--with`, or `--from`
+and `--to`.
 
 Recipients are recorded under their canonical name, the pane's label
 (pane id when unlabeled), however the sender addressed them: a send to

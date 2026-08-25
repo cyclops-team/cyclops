@@ -5,7 +5,7 @@
 //! Install PREPARES artifacts and prints wiring instructions; it never
 //! writes into vendor dot-dirs (~/.claude, ~/.codex, ~/.gemini, .agents,
 //! .cursor).
-//! Configuration does not equal subscription (amendment c, finding F1):
+//! Configuration does not equal subscription:
 //! a rendered config proves nothing until `hooks verify` or
 //! `hooks selftest` shows edges actually arriving.
 //!
@@ -135,8 +135,8 @@ const SHARED_NAME: &str = "cyclops";
 /// The same template with the per-pane identity taken back out. codex reads
 /// a single `$CODEX_HOME/hooks.json` and agy a single `~/.agents/hooks.json`,
 /// so a label baked into either would make every pane report as one agent.
-/// With no `--agent`, each pane's CYCLOPS_AGENT names the reporter instead
-/// (hook.rs), and `cyclops start` puts it there.
+/// With no `--agent`, the daemon derives the reporter from the authenticated
+/// socket peer. `CYCLOPS_AGENT` only namespaces the hook sequence counter.
 ///
 /// Rendering then stripping, rather than a second set of templates, so the
 /// events and payload shapes cannot drift between the two forms. agy's
@@ -157,7 +157,7 @@ fn vendor_hook_file(kind: CliKind) -> Option<PathBuf> {
     match kind {
         CliKind::Claude => Some(home.join(".claude").join("settings.json")),
         // User level, and not the project-local alternative. MEASURED
-        // (finding F1): project-local .codex/hooks.json does not load until
+        // Project-local .codex/hooks.json does not load until
         // the directory is trusted, and in a non-interactive run that
         // dialog can never be answered, so the hooks silently never fire.
         CliKind::Codex => Some(crate::consumer::root(kind, &home).join("hooks.json")),
@@ -234,6 +234,30 @@ pub(crate) struct WiringCheck {
     pub state: WiringState,
 }
 
+/// Evaluate hook wiring from bytes obtained by a caller-owned safe reader.
+pub(crate) fn inspect_wiring_bytes(kind: CliKind, bytes: &[u8]) -> WiringState {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return WiringState::Unreadable;
+    };
+    let mut document: serde_json::Value = if text.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        match serde_json::from_str(text) {
+            Ok(document) => document,
+            Err(_) => return WiringState::Invalid,
+        }
+    };
+    let before = document.clone();
+    let expected = serde_json::from_str(&render_shared(kind, &cyclops_bin()))
+        .expect("shipped hook template is valid JSON");
+    merge_into(&mut document, &expected);
+    if document == before {
+        WiringState::Current
+    } else {
+        WiringState::NeedsUpdate
+    }
+}
+
 /// Inspect fixed wiring by applying the current merge in memory.
 pub(crate) fn inspect_wiring(kind: CliKind) -> WiringCheck {
     let Some(path) = vendor_hook_file(kind) else {
@@ -257,30 +281,9 @@ pub(crate) fn inspect_wiring(kind: CliKind) -> WiringCheck {
             };
         }
     };
-    let mut document: serde_json::Value = if text.trim().is_empty() {
-        serde_json::json!({})
-    } else {
-        match serde_json::from_str(&text) {
-            Ok(document) => document,
-            Err(_) => {
-                return WiringCheck {
-                    path: Some(path),
-                    state: WiringState::Invalid,
-                };
-            }
-        }
-    };
-    let before = document.clone();
-    let expected = serde_json::from_str(&render_shared(kind, &cyclops_bin()))
-        .expect("shipped hook template is valid JSON");
-    merge_into(&mut document, &expected);
     WiringCheck {
         path: Some(path),
-        state: if document == before {
-            WiringState::Current
-        } else {
-            WiringState::NeedsUpdate
-        },
+        state: inspect_wiring_bytes(kind, text.as_bytes()),
     }
 }
 
@@ -399,7 +402,7 @@ fn instructions(kind: CliKind, rendered: &Path, label: &str) -> String {
         ),
         CliKind::Codex => format!(
             "Wire it without replacing shared config. Codex loads ZERO hooks in an\n\
-             untrusted directory (finding F1), and\n\
+             untrusted directory, and\n\
              --dangerously-bypass-hook-trust does NOT fix that.\n\
              \n\
              User-level hooks (no directory trust needed): if\n\
@@ -427,7 +430,7 @@ fn instructions(kind: CliKind, rendered: &Path, label: &str) -> String {
              If it already exists, merge only Cyclops' event entries from {p};\n\
              preserve every unrelated key and handler. Never overwrite it.\n\
              \n\
-             agy has no payload-matchable ACK (finding F7): deliveries stay on the\n\
+             agy has no payload-matchable acknowledgement: deliveries stay on the\n\
              screen-verified tier; these hooks feed liveness and turn detection.\n\
              Then check edges arrive: cyclops hooks verify {label}"
         ),
@@ -708,8 +711,8 @@ pub fn run_install(
 /// its path, saying nothing on the way.
 ///
 /// Write one rendered artifact and the receipt that makes it refreshable.
-/// Both writers go through here — `run_install` for the verb, [`prepare`]
-/// for launch wiring — so what lands on disk cannot drift between them.
+/// Both writers go through here: `run_install` for the verb and [`prepare`]
+/// for launch wiring. What lands on disk cannot drift between them.
 ///
 /// A failed receipt comes back as `Ok(Some(reason))`, not `Err`: the
 /// artifact is written and correct, it is only unrefreshable later, and
@@ -1218,6 +1221,7 @@ pub fn run_selftest(c: &mut Client, json: bool, style: &Style, target: &str) -> 
                 state: s,
                 notification_state: None,
                 quota_state: None,
+                notification_settlement: None,
                 position: None,
                 note: None,
                 pane: None,
@@ -1359,6 +1363,23 @@ mod tests {
         assert!(!stale.to_string().contains("/old/path/cyclops"));
     }
 
+    #[test]
+    fn wiring_bytes_can_be_checked_without_reopening_the_vendor_file() {
+        let current = render_shared(CliKind::Claude, &cyclops_bin());
+        assert!(matches!(
+            inspect_wiring_bytes(CliKind::Claude, current.as_bytes()),
+            WiringState::Current
+        ));
+        assert!(matches!(
+            inspect_wiring_bytes(CliKind::Claude, b"{}"),
+            WiringState::NeedsUpdate
+        ));
+        assert!(matches!(
+            inspect_wiring_bytes(CliKind::Claude, b"not json"),
+            WiringState::Invalid
+        ));
+    }
+
     /// Claude's normal direct launch reads its default settings file. An
     /// explicit --settings launch remains supported, but must not be the
     /// only route to lifecycle hooks.
@@ -1414,13 +1435,18 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{} render is not JSON: {e}", kind.name()));
             // No placeholder survives rendering.
             assert!(!out.contains("{label}") && !out.contains("{cyclops_bin}"));
-            // Every registered command is self-tagging and carries the agent.
+            // Every registered command is self-tagging. Claude omits the
+            // mutable display label and relies on authenticated peer identity.
             let text = v.to_string();
-            assert!(
-                text.contains(&format!("--agent {GOLDEN_LABEL}")),
-                "{}: command lost the agent",
-                kind.name()
-            );
+            if kind == CliKind::Claude {
+                assert!(!text.contains("--agent"), "Claude config embeds a label");
+            } else {
+                assert!(
+                    text.contains(&format!("--agent {GOLDEN_LABEL}")),
+                    "{}: command lost the agent",
+                    kind.name()
+                );
+            }
         }
     }
 
@@ -1433,7 +1459,12 @@ mod tests {
                 let cmd = entries[0]["hooks"][0]["command"]
                     .as_str()
                     .unwrap_or_else(|| panic!("{}: {event} entry shape", kind.name()));
-                assert_eq!(cmd, format!("cyclops hook {event} --agent r"));
+                let expected = if kind == CliKind::Claude {
+                    format!("cyclops hook {event}")
+                } else {
+                    format!("cyclops hook {event} --agent r")
+                };
+                assert_eq!(cmd, expected);
             }
         }
         // Claude registers the four attention-relevant events.
@@ -1447,6 +1478,7 @@ mod tests {
                 "Notification",
                 "PermissionRequest",
                 "Stop",
+                "StopFailure",
                 "UserPromptSubmit"
             ]
         );
@@ -1454,7 +1486,7 @@ mod tests {
 
     #[test]
     fn agy_registers_every_event_with_distinct_commands() {
-        // F7: payloads carry no event name, so every event needs its own
+        // Payloads carry no event name, so every event needs its own
         // self-tagging command.
         let v: serde_json::Value = serde_json::from_str(&render(CliKind::Agy, "r", "c")).unwrap();
         let named = v["r"].as_object().expect("named hooks under the label");

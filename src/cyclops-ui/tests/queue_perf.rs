@@ -54,7 +54,11 @@ fn row(i: u64) -> QueueRow {
         attention: attention.then(|| {
             NotificationAttemptId::parse(&format!("att-00000000-0000-4000-8000-{i:012x}")).unwrap()
         }),
+        resolution_intent: None,
+        resolution_action_accepted: None,
+        resolution_consumption_observed: None,
         can_manage_attention: attention,
+        can_withdraw_notification: false,
         message_id,
         recipient: recipient(i),
         recipient_label: format!("agent{}", i % 7),
@@ -70,6 +74,9 @@ fn row(i: u64) -> QueueRow {
             WakeWord::Notified
         },
         cause: attention.then_some(NotificationAttentionCause::VerifyFailed),
+        pre_write_cause: None,
+        current_route: None,
+        fifo_position: Some(i + 1),
         needs_action: attention || !i.is_multiple_of(3),
         seq: i,
         updated_at: i * 1000,

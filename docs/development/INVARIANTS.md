@@ -15,7 +15,7 @@ second place, that is the bug: this page is where they live.
 | [1](#1-a-payload-never-reaches-a-pane-the-gate-did-not-admit) | A payload never reaches a pane the gate did not admit | A shell executes the message |
 | [2](#2-a-modal-is-never-cleared-generically) | A modal is never cleared generically | Escape exits the agent CLI |
 | [3](#3-human-typing-always-wins) | Human typing always wins | The human's half-written sentence is sent as part of the message |
-| [4](#4-blocked_quota-parks-and-never-auto-retries) | `blocked_quota` parks and never auto-retries | A loop that cannot succeed, against a metered API |
+| [4](#4-legacy-blocked_quota-parks-and-never-auto-retries) | Legacy `blocked_quota` parks and never auto-retries | A loop that cannot succeed, against a metered API |
 | [5](#5-every-delivery-ends-in-a-named-state) | Every delivery ends in a named state | Nobody chases what has no state |
 | [6](#6-the-sender-is-whoever-connected-not-whoever-says-so) | The sender is whoever connected, not whoever says so | The audit trail can be forged |
 | [7](#7-secrets-never-enter-the-ledger) | Secrets never enter the ledger | An API key on screen becomes a permanent plain-text record |
@@ -62,11 +62,12 @@ The screen read in step 6 is deliberately the last one before the paste. A
 gate that reads the screen early and pastes later is admitting a pane as it
 was, not as it is, and a human keystroke round-trip fits in that gap.
 
-Verification is the second half of the same rule. Enter is only sent to a
-composer that has been seen holding **this** message id. A staging pattern
-without an id can only prove that something was pasted once
-(`staged_verified` splits id-carrying patterns from generic ones for
-exactly that reason).
+Verification is the second half of the same rule. Enter is sent only when the
+normalized visible composer bytes exactly match the payload selected at the
+durable write boundary. A visible target or terminal sentinel is structural
+evidence, not ownership by itself. A collapsed chip proves only a vendor
+representation because its hidden bytes cannot be compared. It never
+authorizes Enter.
 
 The irreversible boundary changes retry policy. A detach, missing manifest,
 pre-paste occupant rebind, or spool failure is proven before the pane write
@@ -78,7 +79,7 @@ recipient did not receive the message. Inspect the pane before resending.
 
 - Enforced at: `src/cyclopsd/src/delivery.rs`, `gate` (admission),
   `occupant_unchanged` (both re-checks), `attempt_delivery` (the order),
-  `inject` and `staged_verified` (verification).
+  `inject`, `staged_representation`, and `exact_staging_proof` (verification).
 - Proven by: `src/cyclopsd/tests/m1_blockers.rs`,
   `pane_rebound_before_paste_never_pastes_into_the_new_occupant` and
   `pane_rebound_before_submit_withholds_the_submit_key`.
@@ -134,10 +135,10 @@ gate reads a typing human as an idle agent.
 - Proven by: `src/cyclopsd/tests/m1_blockers.rs`,
   `escaped_capture_flips_typed_text_to_idle_with_input_and_gates`.
 
-## 4. `blocked_quota` parks and never auto-retries
+## 4. Legacy `blocked_quota` parks and never auto-retries
 
-**A quota park is terminal in the record. Only an operator sending again
-moves it.**
+**A legacy direct-delivery quota park is terminal in the session record. Only
+an operator sending again moves it.**
 
 What breaks: a retry against an exhausted quota is a request that cannot
 succeed. It costs money on a metered plan, and on some plans it extends the
@@ -149,6 +150,11 @@ Parking is per recipient, not per delivery: the in-flight delivery and
 everything queued behind it park together, because they are all aimed at
 the same exhausted agent. The admin is alerted once, with the reset hint
 parsed off the screen.
+
+Standard mailbox notifications use a separate notification state machine.
+They never retry automatically, but an administrator may start a fresh attempt
+with the guarded `cyclops requeue <message-id>` command after resolving the
+cause.
 
 - Enforced at: `src/cyclopsd/src/delivery.rs`, `park_recipient`;
   `ParkedBlockedQuota` has no outgoing transition in
@@ -193,11 +199,12 @@ made to lie. If a request could name its own sender, any process on the
 machine could append `reviewer: approved` to the audit trail, and a record
 you cannot trust is worse than no record, because people act on it.
 
-The resolution walks the peer pid's ancestry until a pid matches a watched
-pane's `pane_pid`. Labeled pane: that agent. Unlabeled pane: the pane id.
-No watched pane in the ancestry: `admin`, because a same-uid shell outside
-every pane is the human. A uid other than the daemon's is denied before any
-request is parsed.
+The resolution walks the peer pid's current ancestry and identifies supported
+vendor processes. A same-uid shell with no vendor ancestor is `admin`, including
+inside a watched pane. A vendor process gets the pane's durable identity only
+when its ancestry reaches that current pane generation. Unprovable ancestry,
+a vendor outside every watched pane, and a uid other than the daemon's are
+denied before request handling.
 
 `agent.state.report` needs one more thing, because being in the pane is
 weaker than it sounds. An adopted pane keeps its label, its adoption and
@@ -303,6 +310,11 @@ What is allowed, and this is the whole list:
   checkpoints, the decline-key spacing, and the one-shot ping for a hold
   that has lasted too long. None of them repeat, and none of them exists
   when no delivery is in flight.
+- **One candidate lifecycle settle timer per pane.** An authenticated
+  candidate edge arms its generation's deadline. One worker coalesces the
+  pane's candidates, evaluates each generation once per observation, and
+  parks after copy mode, capture failure, or non-terminal evidence. Only a
+  new watcher, request, or candidate event starts another pass.
 - **The eye's animation tick**, one shot per state change
   (`src/cyclops-ui`).
 
@@ -431,6 +443,24 @@ turn running?" is answered by any sensor. "May I write into the composer?"
 is answered only by the sensor that can see the composer, saying it is
 empty, right now, with nothing live contradicting it. Absence of evidence
 is not clean evidence; a contested verdict is not clean evidence.
+
+An authenticated, exactly keyed turn start owns runtime `Working` before the
+first visual output frame. Idle title and composer frames can lag that edge,
+so repeated captures cannot erase it and elapsed time cannot convert it to
+`Idle`. Only the matching keyed end clears it. Process-binding retirement also
+clears the start.
+
+An unkeyed confirmed vendor contract may use authenticated start and end
+events from the same process binding for runtime status. It still cannot bind
+a message to that turn, so composer settlement remains screen-driven.
+
+An unkeyed prompt hook cannot claim an exact lifecycle. Claude's
+`UserPromptSubmit` publishes provisional `Working` immediately, while a later
+lifecycle-capable visual Working frame confirms that the exact staged
+notification entered a turn. Fresh visual evidence owns the return to idle.
+Cyclops never assigns a later `Stop` to that prompt by arrival order or time.
+Permission, modal, and quota screens remain authoritative blocked states. None
+of these runtime rules weaken the clean-composer requirement above.
 
 One clean frame is not clean evidence either, once text has been seen in
 the composer. A screen rule reads one frame, and a pane holding somebody's

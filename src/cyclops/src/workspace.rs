@@ -49,7 +49,7 @@ const PRESETS: &[(&str, &str)] = &[
 const DEFAULT_WORKSPACE: &str = "main";
 
 /// Preset `cyclops start` builds when there is nothing saved. The ladder
-/// starts at one pane (GOALS: valuable at n=1).
+/// starts at one pane so the first-run workspace is useful for one agent.
 const FIRST_RUN_PRESET: &str = "solo";
 
 pub fn preset_names() -> Vec<&'static str> {
@@ -220,7 +220,7 @@ pub fn config_path(home: &Path) -> PathBuf {
 /// The size to build a detached session at: this terminal's, when there
 /// is one.
 ///
-/// MEASURED on tmux 3.6a (F28): tmux hands the cells from a window resize
+/// Measured on tmux 3.6a: tmux hands the cells from a window resize
 /// out EVENLY, not in proportion. A two-pane window split 70/29 at 100
 /// columns becomes 120/79 at 200, not 140/59. So a workspace built at
 /// tmux's 80x24 default and attached from a 200x50 terminal loses the
@@ -417,8 +417,8 @@ fn adopt(client: &mut Client, layout: &Layout, pane_ids: &[String]) -> (Vec<Stri
 /// dock) and a `quad` (two by two) both hold four panes, and mapping
 /// either onto the other renames every agent onto a pane it does not own.
 /// A name is what every later delivery resolves through, so the next
-/// message would go to the wrong agent. GOALS: never type into the wrong
-/// pane.
+/// message would go to the wrong agent. Cyclops must never type into the
+/// wrong pane.
 enum Naming {
     /// The panes are where the workspace says they are.
     Allowed,
@@ -431,7 +431,7 @@ enum Naming {
 ///
 /// Ratios are deliberately not compared. Resizing a pane moves no agent,
 /// and tmux hands out the cells from a window resize evenly rather than
-/// in proportion (F28), so a workspace built at one terminal size never
+/// in proportion, so a workspace built at one terminal size never
 /// has the other's cell counts anyway.
 fn first_difference(live: &Layout, want: &Layout) -> Option<String> {
     if live.windows.len() != want.windows.len() {
@@ -603,11 +603,9 @@ fn wire_hooks(
     // The pane's own hook config, for a CLI that takes one as a launch flag
     // rather than discovering it from a fixed path of its own.
     //
-    // The pane's IDENTITY is not here. It rides in the pane environment as
-    // CYCLOPS_AGENT (see `fill_agents`), which is what lets one shared
-    // vendor config serve every pane: codex reads a single
-    // $CODEX_HOME/hooks.json and agy a single ~/.agents/hooks.json, so a
-    // label baked into either would make every pane report as one agent.
+    // The pane's identity is not here. The daemon derives it from the hook
+    // process and its admitted agent ancestor. CYCLOPS_AGENT only namespaces
+    // the optional hook sequence counter.
     let Some(flag) = known.get(id).and_then(|m| m.settings_flag.as_deref()) else {
         return cmd;
     };
@@ -650,11 +648,9 @@ fn fill_agents(layout: &mut Layout, commands: &[String]) {
                     if let Some(cmd) = next.next() {
                         p.command = Some(cmd.clone());
                         p.launch_now = true;
-                        // Who this pane's hooks report as. Every vendor
-                        // hook command that carries no --agent of its own
-                        // reads this (hook.rs), which is what lets one
-                        // shared $CODEX_HOME/hooks.json or ~/.agents/hooks.json
-                        // serve every pane and still name them apart.
+                        // Namespace for hook sequence counters. Identity comes
+                        // from the authenticated socket peer, so a rename does
+                        // not require rewriting hook configuration.
                         //
                         // Derived from the label at build time and never
                         // saved, so renaming a pane and rebuilding gives it
@@ -1061,8 +1057,8 @@ fn prepare_home(
 
     // 3. Manifests, every run and not only the first. A home that predates
     //    the seed gets them without a reinstall, and a shipped set that
-    //    gains a file reaches an existing home on the next run. Files
-    //    already there are never touched (crate::manifests).
+    //    gains a file reaches an existing home on the next run. Operator
+    //    edits stay unchanged. Known unedited shipped files may advance.
     let seeded = crate::manifests::seed(home);
     if seeded.none_installed() {
         // The one note that contradicts the ready line above it: with no
@@ -1240,8 +1236,8 @@ fn wire_installed_vendors() -> Vec<crate::hookset::WiredVendor> {
 /// Without it the consent lived only in the installer's one invocation:
 /// on a machine where cyclops was installed before the agent CLIs, every
 /// vendor dir was (rightly) absent, both writes were skipped, and nothing
-/// ever came back for them — only the installer and `cyclops update` pass
-/// the flag. While this file exists, every ordinary boot may finish the
+/// ever came back for them. Only the installer and `cyclops update` pass the
+/// flag. While this file exists, every ordinary boot may finish the
 /// wiring for a vendor that appeared since ([`finish_deferred_wiring`]).
 ///
 /// [`record_wiring_consent`] is the single writer. Deleting the file
@@ -1289,13 +1285,13 @@ fn record_wiring_consent(home: &Path) {
 }
 
 /// Finish the install's vendor wiring for agent CLIs that appeared after
-/// it ran. Returns the lines to print — only when something was actually
-/// written, because on every ordinary boot after the first this finds
+/// it ran. Returns lines only when something was actually written, because
+/// on every ordinary boot after the first this finds
 /// everything current and a note repeated forever is noise.
 ///
 /// The boot path for bare `cyclops` and `cyclops start` calls this; the
-/// daemon never does — writing into vendor homes stays a CLI act, done
-/// where a person just ran a command. Without the marker, or with
+/// daemon never does. Writing into vendor homes stays a CLI act, done where
+/// a person just ran a command. Without the marker, or with
 /// `CYCLOPS_NO_VENDOR_HOOKS` set, no vendor home is even looked at.
 pub fn finish_deferred_wiring(home: &Path) -> Vec<String> {
     if !consent_marker(home).is_file() || std::env::var_os("CYCLOPS_NO_VENDOR_HOOKS").is_some() {
@@ -1345,8 +1341,8 @@ fn hook_notes(wired: &[crate::hookset::WiredVendor]) -> Vec<String> {
     out
 }
 
-/// The backup line, one sentence wherever a vendor config was edited —
-/// setup and the deferred boot both print it, because a file this project
+/// The backup line, one sentence wherever a vendor config was edited.
+/// Setup and the deferred boot both print it, because a file this project
 /// copied aside is worth hearing about at the time, whichever run did it.
 fn kept_backup(w: &crate::hookset::WiredVendor) -> Option<String> {
     w.backup
@@ -2093,8 +2089,8 @@ mod tests {
     }
 
     /// The ladder: each preset is the one before it plus a pane, and the
-    /// names carry over. GOALS makes the ladder law, and four unrelated
-    /// arrangements would be four things to learn instead of one.
+    /// names carry over. This keeps the presets one pattern to learn; four
+    /// unrelated arrangements would be four things to learn instead of one.
     #[test]
     fn the_presets_are_a_ladder() {
         let labels = |name: &str| -> Vec<String> {

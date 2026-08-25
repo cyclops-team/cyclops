@@ -391,7 +391,9 @@ dependencies = [
  "cyclops-ui",
  "cyclops-workspace",
  "libc",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "toml",
 ]

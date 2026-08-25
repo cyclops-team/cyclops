@@ -1,16 +1,26 @@
-//! Explicit recovery for a notification left in an agent composer.
+//! Exact recovery for a notification left in an agent composer.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use cyclops_manifest::{strip_csi, Manifest};
 use cyclops_proto::{
-    AgentState, AttentionChecks, AttentionResolveResult, AttentionShowResult, NotificationBinding,
-    NotificationResolution, NotificationTransport, ProcessInstanceId,
+    AgentState, AttentionChecks, AttentionResolveResult, AttentionShowResult, Event,
+    NotificationBinding, NotificationResolution, NotificationResolutionConsumptionObservation,
+    ProcessInstanceId,
 };
 use cyclops_tmux::{PaneRow, SessionWatcher};
 
-use crate::mailbox::{AttentionTarget, MailboxService, MailboxServiceError};
-use crate::{delivery, fusion, Inner};
+use crate::mailbox::{
+    AttentionConsumptionSignal, AttentionResolutionStart, AttentionTarget, MailboxService,
+    MailboxServiceError,
+};
+use crate::{delivery, fusion, messaging, unix_ms, Inner};
+
+// Bound terminal-action settlement while allowing slower terminal clients to
+// render the clean composer that proves the exact action took effect.
+const POST_ACTION_PROOF_DELAYS_MS: [u64; 5] = [0, 120, 240, 480, 1_000];
+const POST_ACTION_EVENT_SCANS_PER_CHECKPOINT: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AttentionActionError {
@@ -20,7 +30,9 @@ pub(crate) enum AttentionActionError {
     Evidence(Box<AttentionShowResult>),
     #[error("this manifest has no measured whole-composer clear sequence")]
     DiscardUnsupported,
-    #[error("the terminal action outcome is uncertain")]
+    #[error(
+        "the terminal action outcome is uncertain; no second key will be sent; reopen this exact attempt after its required durable evidence is recorded"
+    )]
     Uncertain,
 }
 
@@ -62,22 +74,143 @@ pub(crate) async fn resolve(
     target: &AttentionTarget,
     resolution: NotificationResolution,
 ) -> Result<AttentionResolveResult, AttentionActionError> {
-    service.begin_attention_resolution(target)?;
+    let result = resolve_selected(inner, service, target, resolution, false).await;
+    if service
+        .resume_exact_reconciliation(target.record.attempt_id)
+        .unwrap_or(false)
+    {
+        spawn_exact_owned_worker(inner, Arc::clone(service), target.record.attempt_id);
+    }
+    result
+}
+
+/// Reconcile exact Cyclops-owned composer content after relevant evidence moves.
+///
+/// The durable mailbox selects submit for pending work and clear for a claim
+/// ordered after the write. Every terminal action still passes through the
+/// same proof, intent, acceptance, and settlement path as an explicit action.
+pub(crate) fn schedule_exact_owned_reconciliation(
+    inner: &Arc<Inner>,
+    recipient: cyclops_proto::RecipientKey,
+) {
+    let Some(service) = inner.mailbox.as_ref().cloned() else {
+        return;
+    };
+    let Ok(candidates) = service.active_composer_notifications(recipient) else {
+        return;
+    };
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    for attempt_id in candidates
+        .into_iter()
+        .filter(|candidate| candidate.record.needs_exact_owned_reconciliation())
+        .map(|candidate| candidate.record.attempt_id)
+    {
+        if service
+            .request_exact_reconciliation(attempt_id)
+            .unwrap_or(false)
+        {
+            spawn_exact_owned_worker(inner, Arc::clone(&service), attempt_id);
+        }
+    }
+}
+
+fn spawn_exact_owned_worker(
+    inner: &Arc<Inner>,
+    service: Arc<MailboxService>,
+    attempt_id: cyclops_proto::NotificationAttemptId,
+) {
+    let task_inner = Arc::clone(inner);
+    inner.engine.spawn_descendant_task(async move {
+        while service
+            .take_exact_reconciliation_request(attempt_id)
+            .unwrap_or(false)
+        {
+            delivery::inject_pause(&task_inner, "automatic_attention_before_resolve").await;
+            let target = match service.attention_target(&attempt_id.to_string()) {
+                Ok(target) => target,
+                Err(_) => continue,
+            };
+            let resolution = match service.automatic_attention_resolution(&target) {
+                Ok(Some(resolution)) => resolution,
+                Ok(None) | Err(_) => continue,
+            };
+            match resolve_selected(&task_inner, &service, &target, resolution, true).await {
+                Ok(result) => tracing::info!(
+                    %attempt_id,
+                    resolution = ?result.resolution,
+                    "exact-owned composer notification reconciled"
+                ),
+                Err(AttentionActionError::Evidence(_)) => {}
+                Err(AttentionActionError::Uncertain) => tracing::warn!(
+                    %attempt_id,
+                    "exact-owned composer reconciliation remains uncertain"
+                ),
+                Err(AttentionActionError::DiscardUnsupported) => tracing::warn!(
+                    %attempt_id,
+                    "exact-owned composer cannot be cleared by this manifest"
+                ),
+                Err(AttentionActionError::Store(error)) => {
+                    if error.notification_resolution_in_progress() {
+                        match service.park_exact_reconciliation_after_conflict(attempt_id) {
+                            Ok(true) => continue,
+                            Ok(false) | Err(_) => return,
+                        }
+                    }
+                    tracing::debug!(
+                        %attempt_id,
+                        %error,
+                        "exact-owned composer reconciliation did not start"
+                    );
+                }
+            }
+        }
+    });
+}
+
+async fn resolve_selected(
+    inner: &Arc<Inner>,
+    service: &Arc<MailboxService>,
+    target: &AttentionTarget,
+    mut resolution: NotificationResolution,
+    automatic: bool,
+) -> Result<AttentionResolveResult, AttentionActionError> {
+    let start = service.begin_attention_resolution(target, resolution)?;
     let attempt_id = target.record.attempt_id;
+
+    match start {
+        AttentionResolutionStart::Fresh => {}
+        AttentionResolutionStart::ReconcileOnly => {
+            return reconcile_existing_intent(inner, service, target, resolution, false).await;
+        }
+        AttentionResolutionStart::IntentOnlyUncertain => {
+            if resolution == NotificationResolution::Discard {
+                return resolve_clear_composer_discard(inner, service, target).await;
+            }
+            service.cancel_attention_resolution(attempt_id)?;
+            return Err(AttentionActionError::Uncertain);
+        }
+        AttentionResolutionStart::AcceptedUnconsumed => {
+            return reconcile_existing_intent(inner, service, target, resolution, true).await;
+        }
+    }
 
     let first = assess(inner, service, target, false).await;
     let Some(path_kind) = resolution_path(&first, resolution) else {
         service.cancel_attention_resolution(attempt_id)?;
         return Err(AttentionActionError::Evidence(Box::new(first.result)));
     };
+    if path_kind == ResolutionPathKind::ComposerAlreadyClear {
+        return resolve_clear_composer_discard(inner, service, target).await;
+    }
     if matches!(first.path.as_ref(), Some(ResolutionPath::TerminalKey(route)) if resolution == NotificationResolution::Discard && route.manifest.injection.clear_keys.is_empty())
     {
         service.cancel_attention_resolution(attempt_id)?;
         return Err(AttentionActionError::DiscardUnsupported);
     }
 
-    // Rebuild before recording the operator action. A clear-composer
-    // discard writes no key, but it still requires two current observations.
+    // Rebuild before recording the resolution action.
     let second = assess(inner, service, target, false).await;
     if resolution_path(&second, resolution) != Some(path_kind) {
         service.cancel_attention_resolution(attempt_id)?;
@@ -89,17 +222,33 @@ pub(crate) async fn resolve(
         return Err(AttentionActionError::DiscardUnsupported);
     }
 
-    if let Err(error) = service.record_attention_resolution_intent(target, resolution) {
-        service.cancel_attention_resolution(attempt_id)?;
-        return Err(AttentionActionError::Store(error));
+    let intent = if automatic {
+        service.record_automatic_attention_resolution_intent(target)
+    } else {
+        service
+            .record_attention_resolution_intent(target, resolution)
+            .map(|_| resolution)
+    };
+    match intent {
+        Ok(selected) => resolution = selected,
+        Err(error) => {
+            service.cancel_attention_resolution(attempt_id)?;
+            return Err(AttentionActionError::Store(error));
+        }
     }
     delivery::inject_pause(inner, "attention_after_intent").await;
 
     // The journal append takes time. Rebuild the proof before the terminal
-    // key or the no-key resolution rather than trusting an earlier capture.
+    // key rather than trusting an earlier capture.
     let final_assessment = assess(inner, service, target, false).await;
+    if resolution == NotificationResolution::Discard
+        && resolution_path(&final_assessment, resolution)
+            == Some(ResolutionPathKind::ComposerAlreadyClear)
+    {
+        return resolve_clear_composer_discard(inner, service, target).await;
+    }
     if resolution_path(&final_assessment, resolution) != Some(path_kind) {
-        withdraw_pre_key(service, target, resolution)?;
+        withdraw_pre_key(inner, service, target, resolution)?;
         return Err(AttentionActionError::Evidence(Box::new(
             final_assessment.result,
         )));
@@ -107,8 +256,34 @@ pub(crate) async fn resolve(
     let route = match final_assessment.path {
         Some(ResolutionPath::TerminalKey(route)) => {
             let Some(keys) = action_keys(&route.manifest, resolution) else {
-                withdraw_pre_key(service, target, resolution)?;
+                withdraw_pre_key(inner, service, target, resolution)?;
                 return Err(AttentionActionError::DiscardUnsupported);
+            };
+            let mut evidence_events = inner.events.subscribe();
+            let dispatch_started_ms = unix_ms();
+            let consumption_registration = if resolution == NotificationResolution::Complete {
+                let Some(expected_payload) = expected_notification(service, target) else {
+                    withdraw_pre_key(inner, service, target, resolution)?;
+                    return Err(AttentionActionError::Uncertain);
+                };
+                let signal = match service.register_attention_consumption_candidate(
+                    target,
+                    route.session_idx,
+                    route.row.pane_id.clone(),
+                    expected_payload,
+                    dispatch_started_ms,
+                ) {
+                    Ok(signal) => signal,
+                    Err(error) => {
+                        withdraw_pre_key(inner, service, target, resolution)?;
+                        return Err(AttentionActionError::Store(error));
+                    }
+                };
+                signal.map(|signal| {
+                    ConsumptionRegistration::new(Arc::clone(service), attempt_id, signal)
+                })
+            } else {
+                None
             };
             if route
                 .watcher
@@ -122,13 +297,149 @@ pub(crate) async fn resolve(
                 // press a second key sequence.
                 return Err(AttentionActionError::Uncertain);
             }
-            delivery::inject_pause(inner, "attention_after_key").await;
-            route
+            delivery::inject_pause(inner, "attention_after_key_before_accepted").await;
+            if let Err(error) =
+                service.record_attention_resolution_action_accepted(target, resolution)
+            {
+                tracing::error!(
+                    attempt_id = %attempt_id,
+                    %error,
+                    "terminal action was accepted but its durable boundary failed"
+                );
+                let _ = service.cancel_attention_resolution(attempt_id);
+                return Err(AttentionActionError::Uncertain);
+            }
+            delivery::inject_pause(inner, "attention_after_action_accepted").await;
+            let consumption = (resolution == NotificationResolution::Complete).then_some(
+                ConsumptionRequirement {
+                    binding: target
+                        .record
+                        .binding
+                        .clone()
+                        .expect("terminal action requires a durable binding"),
+                    signal: consumption_registration
+                        .as_ref()
+                        .map(ConsumptionRegistration::signal),
+                },
+            );
+            let Some(confirmed) = observe_post_action_clear(
+                inner,
+                service,
+                target,
+                &mut evidence_events,
+                consumption.as_ref(),
+            )
+            .await
+            else {
+                let _ = service.cancel_attention_resolution(attempt_id);
+                // The durable intent remains ambiguous. The exact barrier and
+                // open attention item stay recoverable, and no second key may
+                // be sent for this intent.
+                return Err(AttentionActionError::Uncertain);
+            };
+            confirmed
         }
-        Some(ResolutionPath::ComposerAlreadyClear(route)) => route,
+        Some(ResolutionPath::ComposerAlreadyClear(_)) => {
+            unreachable!("no-key discard returned before terminal intent")
+        }
         None => unreachable!("resolution path was checked above"),
     };
 
+    settle_resolution(inner, service, target, resolution, route).await
+}
+
+/// Settle Discard without a terminal key after two current exact-empty proofs.
+///
+/// No intent is appended on this path. The resolution fact is the first and
+/// only durable action boundary, so replay observes either no action or the
+/// completed Discard. A matching legacy intent-only Discard may use the same
+/// path, but it still cannot send a key.
+async fn resolve_clear_composer_discard(
+    inner: &Arc<Inner>,
+    service: &Arc<MailboxService>,
+    target: &AttentionTarget,
+) -> Result<AttentionResolveResult, AttentionActionError> {
+    let attempt_id = target.record.attempt_id;
+    let first = assess(inner, service, target, false).await;
+    if resolution_path(&first, NotificationResolution::Discard)
+        != Some(ResolutionPathKind::ComposerAlreadyClear)
+    {
+        service.cancel_attention_resolution(attempt_id)?;
+        return Err(AttentionActionError::Evidence(Box::new(first.result)));
+    }
+    delivery::inject_pause(inner, "attention_before_no_key_resolution").await;
+    let second = assess(inner, service, target, false).await;
+    let Some(ResolutionPath::ComposerAlreadyClear(route)) = second.path else {
+        service.cancel_attention_resolution(attempt_id)?;
+        return Err(AttentionActionError::Evidence(Box::new(second.result)));
+    };
+    if !second.result.checks.terminal_action_safe {
+        service.cancel_attention_resolution(attempt_id)?;
+        return Err(AttentionActionError::Evidence(Box::new(second.result)));
+    }
+    if let Err(error) = service.resolve_attention_without_terminal_action(target) {
+        tracing::error!(
+            attempt_id = %attempt_id,
+            %error,
+            "no-key Discard was proven but its atomic resolution fact failed"
+        );
+        let _ = service.cancel_attention_resolution(attempt_id);
+        return Err(AttentionActionError::Uncertain);
+    }
+    delivery::inject_pause(inner, "attention_after_no_key_resolution").await;
+    resolve_staged_hold(inner, target, &route);
+    Ok(AttentionResolveResult {
+        attempt_id,
+        resolution: NotificationResolution::Discard,
+    })
+}
+
+/// Reconcile one matching durable intent without sending another terminal key.
+///
+/// A prior key and its required consumption proof were durably recorded, but
+/// final composer proof was lost. The matching durable chain authorizes no
+/// second key. Fresh exact binding and a positively empty composer settle that
+/// same resolution action; every other observation leaves the intent open.
+async fn reconcile_existing_intent(
+    inner: &Arc<Inner>,
+    service: &Arc<MailboxService>,
+    target: &AttentionTarget,
+    resolution: NotificationResolution,
+    consumption_required: bool,
+) -> Result<AttentionResolveResult, AttentionActionError> {
+    let attempt_id = target.record.attempt_id;
+    let mut evidence_events = inner.events.subscribe();
+    let consumption = consumption_required.then(|| ConsumptionRequirement {
+        binding: target
+            .record
+            .binding
+            .clone()
+            .expect("accepted Complete requires a durable binding"),
+        signal: None,
+    });
+    let Some(route) = observe_post_action_clear(
+        inner,
+        service,
+        target,
+        &mut evidence_events,
+        consumption.as_ref(),
+    )
+    .await
+    else {
+        let _ = service.cancel_attention_resolution(attempt_id);
+        return Err(AttentionActionError::Uncertain);
+    };
+    settle_resolution(inner, service, target, resolution, route).await
+}
+
+async fn settle_resolution(
+    inner: &Arc<Inner>,
+    service: &Arc<MailboxService>,
+    target: &AttentionTarget,
+    resolution: NotificationResolution,
+    route: ActionRoute,
+) -> Result<AttentionResolveResult, AttentionActionError> {
+    let attempt_id = target.record.attempt_id;
     if let Err(error) = service.resolve_attention(target, resolution) {
         tracing::error!(
             attempt_id = %attempt_id,
@@ -139,6 +450,21 @@ pub(crate) async fn resolve(
         return Err(AttentionActionError::Uncertain);
     }
     delivery::inject_pause(inner, "attention_after_resolution").await;
+    resolve_staged_hold(inner, target, &route);
+    if let Err(error) = messaging::schedule_recipient(inner, service, target.record.recipient) {
+        tracing::error!(
+            recipient = %target.record.recipient,
+            %error,
+            "cannot schedule mailbox notification after attention resolution"
+        );
+    }
+    Ok(AttentionResolveResult {
+        attempt_id,
+        resolution,
+    })
+}
+
+fn resolve_staged_hold(inner: &Arc<Inner>, target: &AttentionTarget, route: &ActionRoute) {
     if let Some(binding) = target.record.binding.as_ref() {
         fusion::resolve_staged_hold(
             inner,
@@ -149,10 +475,191 @@ pub(crate) async fn resolve(
             binding.manifest.as_str(),
         );
     }
-    Ok(AttentionResolveResult {
-        attempt_id,
-        resolution,
-    })
+}
+
+/// Require positive post-action composer evidence before durable settlement.
+///
+/// The terminal client accepting a key sequence proves only that it accepted
+/// bytes. A bounded sequence of fresh captures must prove the same binding and
+/// a manifest-owned visible empty composer. Fresh Complete also requires a
+/// exact authenticated prompt receipt or a recipient claim ordered after this
+/// action. Runtime Working events only wake re-evaluation and never prove
+/// consumption. The durable intent, accepted-action fact, Complete consumption
+/// fact, and binding keep crash reconciliation scoped to the same operator
+/// action. Failure leaves the intent unresolved and never authorizes another
+/// terminal key.
+async fn observe_post_action_clear(
+    inner: &Arc<Inner>,
+    service: &MailboxService,
+    target: &AttentionTarget,
+    evidence_events: &mut tokio::sync::broadcast::Receiver<Event>,
+    consumption: Option<&ConsumptionRequirement>,
+) -> Option<ActionRoute> {
+    let started = tokio::time::Instant::now();
+    let mut checkpoint = 1;
+    let mut event_scans = 0;
+    let mut assess_now = true;
+    let mut consumption_observed = consumption.is_none();
+    let pane_id = target.record.recipient.pane_id()?.to_string();
+    loop {
+        if !consumption_observed {
+            let observation = consumption
+                .and_then(|required| required.signal_observation())
+                .or_else(|| service.attention_claim_consumption(target).ok().flatten());
+            if let Some(observation) = observation {
+                if consumption.is_some_and(|required| {
+                    required.current_binding_matches(inner, service, target)
+                }) {
+                    if let Err(error) = service
+                        .record_attention_resolution_consumption_observed(target, observation)
+                    {
+                        tracing::error!(
+                            attempt_id = %target.record.attempt_id,
+                            %error,
+                            "exact notification consumption was observed but its durable boundary failed"
+                        );
+                        return None;
+                    }
+                    consumption_observed = true;
+                    delivery::inject_pause(inner, "attention_after_consumption_observed").await;
+                }
+            }
+        }
+        if assess_now {
+            let assessment = assess(inner, service, target, false).await;
+            if consumption_observed {
+                if let Some(ResolutionPath::ComposerAlreadyClear(route)) = assessment.path {
+                    return Some(route);
+                }
+            }
+        }
+        let delay = POST_ACTION_PROOF_DELAYS_MS.get(checkpoint).copied()?;
+        let deadline = started + Duration::from_millis(delay);
+        if event_scans >= POST_ACTION_EVENT_SCANS_PER_CHECKPOINT {
+            tokio::time::sleep_until(deadline).await;
+            checkpoint += 1;
+            event_scans = 0;
+            assess_now = true;
+            continue;
+        }
+        match wait_for_attention_evidence_event(evidence_events, &pane_id, deadline).await {
+            EvidenceWait::Deadline => {
+                checkpoint += 1;
+                event_scans = 0;
+                assess_now = true;
+            }
+            EvidenceWait::Relevant => {
+                event_scans += 1;
+                assess_now = true;
+            }
+            EvidenceWait::Irrelevant => {
+                event_scans += 1;
+                assess_now = false;
+            }
+            EvidenceWait::Closed => {
+                tokio::time::sleep_until(deadline).await;
+                checkpoint += 1;
+                event_scans = 0;
+                assess_now = true;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvidenceWait {
+    Deadline,
+    Relevant,
+    Irrelevant,
+    Closed,
+}
+
+async fn wait_for_attention_evidence_event(
+    events: &mut tokio::sync::broadcast::Receiver<Event>,
+    pane_id: &str,
+    deadline: tokio::time::Instant,
+) -> EvidenceWait {
+    tokio::select! {
+        _ = tokio::time::sleep_until(deadline) => EvidenceWait::Deadline,
+        event = events.recv() => match event {
+            Ok(event)
+                if matches!(event.event.as_str(), "session" | "messages.changed")
+                    || (matches!(event.event.as_str(), "state" | "readiness")
+                        && event.data["pane_id"] == pane_id) =>
+            {
+                EvidenceWait::Relevant
+            }
+            Ok(_) => EvidenceWait::Irrelevant,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                EvidenceWait::Relevant
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => EvidenceWait::Closed,
+        }
+    }
+}
+
+/// Exact post-dispatch evidence that a Complete action consumed this message.
+struct ConsumptionRequirement {
+    binding: NotificationBinding,
+    signal: Option<Arc<AttentionConsumptionSignal>>,
+}
+
+impl ConsumptionRequirement {
+    fn signal_observation(&self) -> Option<NotificationResolutionConsumptionObservation> {
+        self.signal.as_ref().and_then(|signal| signal.observation())
+    }
+
+    fn current_binding_matches(
+        &self,
+        inner: &Arc<Inner>,
+        service: &MailboxService,
+        target: &AttentionTarget,
+    ) -> bool {
+        let Some(route) =
+            crate::messaging::notification_route(inner, service, target.record.recipient)
+                .ok()
+                .flatten()
+        else {
+            return false;
+        };
+        let row = route.row;
+        if row.dead || row.in_mode {
+            return false;
+        }
+        let current = fusion::admitted_binding(inner, route.session_idx, &row);
+        binding_checks(current.as_ref(), &self.binding) == (true, true)
+    }
+}
+
+struct ConsumptionRegistration {
+    service: Arc<MailboxService>,
+    attempt_id: cyclops_proto::NotificationAttemptId,
+    signal: Arc<AttentionConsumptionSignal>,
+}
+
+impl ConsumptionRegistration {
+    fn new(
+        service: Arc<MailboxService>,
+        attempt_id: cyclops_proto::NotificationAttemptId,
+        signal: Arc<AttentionConsumptionSignal>,
+    ) -> Self {
+        Self {
+            service,
+            attempt_id,
+            signal,
+        }
+    }
+
+    fn signal(&self) -> Arc<AttentionConsumptionSignal> {
+        Arc::clone(&self.signal)
+    }
+}
+
+impl Drop for ConsumptionRegistration {
+    fn drop(&mut self) {
+        self.service
+            .unregister_attention_consumption_candidate(self.attempt_id);
+    }
 }
 
 fn resolution_path(
@@ -162,7 +669,8 @@ fn resolution_path(
     match assessment.path.as_ref()? {
         ResolutionPath::TerminalKey(_) => Some(ResolutionPathKind::TerminalKey),
         ResolutionPath::ComposerAlreadyClear(_)
-            if resolution == NotificationResolution::Discard =>
+            if resolution == NotificationResolution::Discard
+                && assessment.result.checks.terminal_action_safe =>
         {
             Some(ResolutionPathKind::ComposerAlreadyClear)
         }
@@ -171,7 +679,8 @@ fn resolution_path(
 }
 
 fn withdraw_pre_key(
-    service: &MailboxService,
+    inner: &Arc<Inner>,
+    service: &Arc<MailboxService>,
     target: &AttentionTarget,
     resolution: NotificationResolution,
 ) -> Result<(), AttentionActionError> {
@@ -185,6 +694,13 @@ fn withdraw_pre_key(
         return Err(AttentionActionError::Uncertain);
     }
     service.cancel_attention_resolution(target.record.attempt_id)?;
+    if let Err(error) = messaging::schedule_recipient(inner, service, target.record.recipient) {
+        tracing::error!(
+            recipient = %target.record.recipient,
+            %error,
+            "cannot schedule mailbox notification after attention intent withdrawal"
+        );
+    }
     Ok(())
 }
 
@@ -320,8 +836,13 @@ async fn assess(
             observed = Some(content.clone());
         }
     }
-    let screen_state =
-        fusion::screen_winner_esc(&manifest, &plain, Some(&capture)).map(|rule| rule.state);
+    let composer_already_clear = composer_already_clear_is_safe(
+        &checks,
+        &manifest,
+        &capture,
+        !now.dead && !now.in_mode,
+        fresh_state,
+    );
     let route = ActionRoute {
         session_idx,
         watcher,
@@ -330,7 +851,7 @@ async fn assess(
     };
     if checks.all_pass() {
         action_path = Some(ResolutionPath::TerminalKey(route));
-    } else if discard_absent_is_safe(&checks, screen_state, &content_proof) {
+    } else if composer_already_clear {
         action_path = Some(ResolutionPath::ComposerAlreadyClear(route));
     }
     assessment_result(
@@ -364,22 +885,22 @@ fn assessment_result(
     }
 }
 
-fn discard_absent_is_safe(
+fn composer_already_clear_is_safe(
     checks: &AttentionChecks,
-    screen_state: Option<AgentState>,
-    content_proof: &delivery::ComposerContentProof,
+    manifest: &Manifest,
+    capture: &str,
+    pane_action_safe: bool,
+    observed_state: Option<AgentState>,
 ) -> bool {
-    // Do not send clear keys when the exact staged payload is gone. The
-    // screen rule must independently prove an empty composer for this pane.
+    // After a terminal key lands, the lifecycle may release the staged hold
+    // before this read. Settlement therefore proves the current binding and
+    // visible empty composer directly. The pre-key path separately requires
+    // terminal_action_safe before it can treat this as a no-key discard.
     checks.process_matches
         && checks.manifest_matches
-        && checks.terminal_action_safe
-        && screen_state == Some(AgentState::Idle)
-        && matches!(
-            content_proof,
-            delivery::ComposerContentProof::Unprovable
-                | delivery::ComposerContentProof::Unsupported
-        )
+        && pane_action_safe
+        && matches!(observed_state, Some(AgentState::Idle | AgentState::Working))
+        && delivery::visible_clean_composer_proof(manifest, capture)
 }
 
 fn process_matches(current: crate::identity::ProcId, expected: ProcessInstanceId) -> bool {
@@ -396,9 +917,12 @@ fn binding_checks(
 ) -> (bool, bool) {
     (
         current.is_some_and(|binding| {
-            expected.leader.is_some_and(|leader| {
-                process_matches(binding.leader, leader)
-                    && process_matches(binding.agent, expected.agent)
+            expected.pane_root.is_some_and(|pane_root| {
+                process_matches(binding.pane_root, pane_root)
+                    && expected.leader.is_some_and(|leader| {
+                        process_matches(binding.leader, leader)
+                            && process_matches(binding.agent, expected.agent)
+                    })
             })
         }),
         current.is_some_and(|binding| binding.manifest == expected.manifest.as_str()),
@@ -406,26 +930,15 @@ fn binding_checks(
 }
 
 fn expected_notification(service: &MailboxService, target: &AttentionTarget) -> Option<String> {
-    match (target.record.transport, target.record.doorbell_format) {
-        (NotificationTransport::Doorbell, format) => {
-            expected_doorbell(&target.record.message_id, format)
-        }
-        (NotificationTransport::DirectPayload, None) => service
-            .message_line(&target.record.message_id)
-            .ok()
-            .map(|message| delivery::render_canonical_message_payload(&message)),
-        (NotificationTransport::DirectPayload, Some(_)) => None,
-    }
+    let message = service.message_line(&target.record.message_id).ok()?;
+    expected_notification_from_message(target, &message)
 }
 
-fn expected_doorbell(message_id: &cyclops_proto::MessageId, format: Option<u32>) -> Option<String> {
-    match format {
-        None => Some(cyclops_proto::render_legacy_doorbell(message_id)),
-        Some(cyclops_proto::DOORBELL_FORMAT_COMPACT_CLAIM) => {
-            Some(cyclops_proto::render_doorbell_v1(message_id))
-        }
-        Some(_) => None,
-    }
+fn expected_notification_from_message(
+    target: &AttentionTarget,
+    message: &cyclops_proto::LedgerLine,
+) -> Option<String> {
+    delivery::expected_notification_payload(&target.record, message)
 }
 
 fn submit_key(manifest: &Manifest) -> &str {
@@ -460,6 +973,15 @@ id = "test"
 display_name = "test"
 
 [[rule]]
+id = "composer_clean"
+state = "idle"
+composer_semantic = "clean"
+priority = 200
+region = "bottom_non_empty_lines(8)"
+line_regex = ['^>$']
+line_regex_esc = ['^>$']
+
+[[rule]]
 id = "composer"
 state = "idle_with_input"
 priority = 100
@@ -472,12 +994,72 @@ clear_keys = ["C-c"]
 composer_trailer_regex = ['^TRAILER$']
 composer_trailer_regex_esc = ['TRAILER']
 composer_trailer_required_prefix = 1
-composer_prompt_regex = '^> (?P<content>.*)$'
+composer_prompt_regex = '^> ?(?P<content>.*)$'
 composer_continuation_regex = '^  (?P<content>.*)$'
 "#;
 
     fn manifest() -> Manifest {
         Manifest::parse(MANIFEST, std::path::Path::new("test.toml")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn evidence_wait_consumes_one_event_and_keeps_the_later_exact_cue() {
+        let (events, mut receiver) = tokio::sync::broadcast::channel(16);
+        events
+            .send(Event {
+                event: "other".into(),
+                data: serde_json::json!({"pane_id": "%other"}),
+                seq: Some(1),
+            })
+            .unwrap();
+        events
+            .send(Event {
+                event: "readiness".into(),
+                data: serde_json::json!({"pane_id": "%1"}),
+                seq: None,
+            })
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+
+        assert_eq!(
+            wait_for_attention_evidence_event(&mut receiver, "%1", deadline).await,
+            EvidenceWait::Irrelevant
+        );
+        assert_eq!(
+            wait_for_attention_evidence_event(&mut receiver, "%1", deadline).await,
+            EvidenceWait::Relevant
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_wait_keeps_the_checkpoint_deadline_live() {
+        let (_events, mut receiver) = tokio::sync::broadcast::channel(1);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(5);
+        assert_eq!(
+            wait_for_attention_evidence_event(&mut receiver, "%1", deadline).await,
+            EvidenceWait::Deadline
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_working_is_only_a_recheck_cue() {
+        let (events, mut receiver) = tokio::sync::broadcast::channel(4);
+        events
+            .send(Event {
+                event: "state".into(),
+                data: serde_json::json!({
+                    "pane_id": "%1",
+                    "state": "working",
+                    "working_confirmed": true,
+                }),
+                seq: Some(1),
+            })
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            wait_for_attention_evidence_event(&mut receiver, "%1", deadline).await,
+            EvidenceWait::Relevant
+        );
     }
 
     #[test]
@@ -504,16 +1086,27 @@ composer_continuation_regex = '^  (?P<content>.*)$'
                 .parse::<cyclops_proto::WorkspaceId>()
                 .map(cyclops_proto::RecipientKey::admin)
                 .unwrap(),
+            pane_root: Some(ProcessInstanceId::new(39, 88).unwrap()),
             leader: Some(ProcessInstanceId::new(40, 89).unwrap()),
             agent: ProcessInstanceId::new(41, 90).unwrap(),
             manifest: cyclops_proto::NotificationManifestId::new("test").unwrap(),
         };
         let exact = fusion::Binding {
+            pane_root: crate::identity::ProcId { pid: 39, birth: 88 },
             leader: crate::identity::ProcId { pid: 40, birth: 89 },
             agent: crate::identity::ProcId { pid: 41, birth: 90 },
             manifest: "test".into(),
         };
         assert_eq!(binding_checks(Some(&exact), &expected), (true, true));
+
+        let replaced_pane_root = fusion::Binding {
+            pane_root: crate::identity::ProcId { pid: 39, birth: 89 },
+            ..exact.clone()
+        };
+        assert_eq!(
+            binding_checks(Some(&replaced_pane_root), &expected),
+            (false, true)
+        );
 
         let replaced_process = fusion::Binding {
             agent: crate::identity::ProcId { pid: 41, birth: 91 },
@@ -541,6 +1134,7 @@ composer_continuation_regex = '^  (?P<content>.*)$'
         );
 
         let legacy = NotificationBinding {
+            pane_root: None,
             leader: None,
             ..expected
         };
@@ -565,7 +1159,7 @@ composer_continuation_regex = '^  (?P<content>.*)$'
     }
 
     #[test]
-    fn clear_composer_discard_requires_current_binding_and_screen_proof() {
+    fn clear_composer_discard_requires_positive_visible_empty_proof() {
         let checks = AttentionChecks {
             notification_exact: false,
             trailer_anchored: false,
@@ -573,30 +1167,115 @@ composer_continuation_regex = '^  (?P<content>.*)$'
             manifest_matches: true,
             terminal_action_safe: true,
         };
-        assert!(discard_absent_is_safe(
+        let manifest = manifest();
+        let clean = ">\nTRAILER";
+        assert!(composer_already_clear_is_safe(
             &checks,
+            &manifest,
+            clean,
+            true,
             Some(AgentState::Idle),
-            &delivery::ComposerContentProof::Unprovable,
         ));
-        assert!(!discard_absent_is_safe(
+        assert!(composer_already_clear_is_safe(
             &checks,
-            Some(AgentState::IdleWithInput),
-            &delivery::ComposerContentProof::Unprovable,
+            &manifest,
+            clean,
+            true,
+            Some(AgentState::Working),
         ));
-        assert!(!discard_absent_is_safe(
+        assert!(!composer_already_clear_is_safe(
             &checks,
+            &manifest,
+            clean,
+            true,
+            Some(AgentState::BlockedModal),
+        ));
+        assert!(!composer_already_clear_is_safe(
+            &checks,
+            &manifest,
+            clean,
+            false,
             Some(AgentState::Idle),
-            &delivery::ComposerContentProof::Hidden,
+        ));
+        let staged = "> cyclops inbox claim m-one\nTRAILER";
+        assert_eq!(
+            delivery::exact_composer_content_from_joined_capture(&manifest, staged),
+            delivery::ComposerContentProof::Visible("cyclops inbox claim m-one".into())
+        );
+        assert!(!composer_already_clear_is_safe(
+            &checks,
+            &manifest,
+            staged,
+            true,
+            Some(AgentState::Idle),
+        ));
+        assert!(!composer_already_clear_is_safe(
+            &checks,
+            &manifest,
+            ">",
+            true,
+            Some(AgentState::Idle),
+        ));
+        assert!(!composer_already_clear_is_safe(
+            &checks,
+            &manifest,
+            "> human draft\nTRAILER",
+            true,
+            Some(AgentState::Idle),
         ));
 
         let wrong_process = AttentionChecks {
             process_matches: false,
             ..checks
         };
-        assert!(!discard_absent_is_safe(
+        assert!(!composer_already_clear_is_safe(
             &wrong_process,
+            &manifest,
+            clean,
+            true,
             Some(AgentState::Idle),
-            &delivery::ComposerContentProof::Unprovable,
+        ));
+
+        let unsupported = Manifest::parse(
+            MANIFEST
+                .replace(
+                    "composer_prompt_regex = '^> ?(?P<content>.*)$'\ncomposer_continuation_regex = '^  (?P<content>.*)$'\n",
+                    "",
+                )
+                .replace("clear_keys = [\"C-c\"]\n", "")
+                .as_str(),
+            std::path::Path::new("unsupported-clean.toml"),
+        )
+        .unwrap();
+        assert!(!composer_already_clear_is_safe(
+            &checks,
+            &unsupported,
+            clean,
+            true,
+            Some(AgentState::Idle),
+        ));
+
+        let hidden = Manifest::parse(
+            MANIFEST
+                .replace(
+                    "composer_continuation_regex = '^  (?P<content>.*)$'",
+                    "composer_continuation_regex = '^  (?P<content>.*)$'\ncomposer_chip_regex = ['^> \\[Pasted text #\\d+\\]$']\ncomposer_chip_regex_esc = ['^> \\[Pasted text #\\d+\\]$']",
+                )
+                .as_str(),
+            std::path::Path::new("hidden-clean.toml"),
+        )
+        .unwrap();
+        let chip = "> [Pasted text #1]\nTRAILER";
+        assert_eq!(
+            delivery::exact_composer_content_from_joined_capture(&hidden, chip),
+            delivery::ComposerContentProof::Hidden
+        );
+        assert!(!composer_already_clear_is_safe(
+            &checks,
+            &hidden,
+            chip,
+            true,
+            Some(AgentState::Idle),
         ));
     }
 
@@ -646,22 +1325,68 @@ composer_continuation_regex = '^  (?P<content>.*)$'
     }
 
     #[test]
-    fn doorbell_recovery_uses_only_the_recorded_byte_format() {
+    fn attention_assessment_uses_canonical_format_rejection() {
         let message_id = cyclops_proto::MessageId::new("m-format").unwrap();
+        let workspace = "00000000-0000-0000-0000-000000000001"
+            .parse::<cyclops_proto::WorkspaceId>()
+            .unwrap();
+        let recipient = cyclops_proto::RecipientKey::admin(workspace);
+        let message = cyclops_proto::LedgerLine {
+            seq: 1,
+            boot_id: "boot".into(),
+            id: message_id.to_string(),
+            ts: 1,
+            kind: cyclops_proto::Kind::Msg,
+            from: recipient.to_string(),
+            to: vec![recipient.to_string()],
+            subject: Some("Format".into()),
+            body: Some("Body".into()),
+            reply_to: None,
+            deliveries: Vec::new(),
+            data: None,
+        };
+        let mut target = AttentionTarget {
+            record: cyclops_proto::NotificationRecord {
+                attempt_id: cyclops_proto::NotificationAttemptId::parse(
+                    "att-00000000-0000-4000-8000-000000000001",
+                )
+                .unwrap(),
+                message_id: message_id.clone(),
+                recipient,
+                state: cyclops_proto::NotificationState::AttentionRequired,
+                binding: None,
+                transport: cyclops_proto::NotificationTransport::Doorbell,
+                doorbell_format: None,
+                cause: None,
+                pre_write_cause: None,
+                pre_write_observation: None,
+                pre_write_reopen_count: 0,
+                started_seq: 1,
+                updated_seq: 1,
+                updated_at: 1,
+            },
+        };
         assert_eq!(
-            expected_doorbell(&message_id, None),
+            expected_notification_from_message(&target, &message),
             Some(cyclops_proto::render_legacy_doorbell(&message_id))
         );
+        target.record.doorbell_format = Some(cyclops_proto::DOORBELL_FORMAT_COMPACT_CLAIM);
         assert_eq!(
-            expected_doorbell(
-                &message_id,
-                Some(cyclops_proto::DOORBELL_FORMAT_COMPACT_CLAIM)
-            ),
+            expected_notification_from_message(&target, &message),
             Some(cyclops_proto::render_doorbell_v1(&message_id))
         );
-        assert_eq!(expected_doorbell(&message_id, Some(999)), None);
+        target.record.doorbell_format = Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_CLAIM);
+        assert_eq!(
+            expected_notification_from_message(&target, &message),
+            Some(cyclops_proto::render_doorbell_v2(
+                &message_id,
+                target.record.attempt_id
+            ))
+        );
+        target.record.doorbell_format = Some(999);
+        assert_eq!(expected_notification_from_message(&target, &message), None);
         let checks = AttentionChecks {
-            notification_exact: expected_doorbell(&message_id, Some(999)).is_some(),
+            notification_exact: expected_notification_from_message(&target, &message).is_some(),
             trailer_anchored: true,
             process_matches: true,
             manifest_matches: true,

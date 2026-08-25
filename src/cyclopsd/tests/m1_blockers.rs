@@ -32,6 +32,7 @@ regex = ['^WORKING']
 [[rule]]
 id = "composer_typed_input"
 state = "idle_with_input"
+composer_semantic = "human_input"
 priority = 1050
 region = "bottom_non_empty_lines(6)"
 line_regex_esc = ['^\s*(?:\x1b\[[0-9;]*m)*›(?:\x1b\[[0-9;]*m)*\s+[^\x1b\s]']
@@ -39,6 +40,7 @@ line_regex_esc = ['^\s*(?:\x1b\[[0-9;]*m)*›(?:\x1b\[[0-9;]*m)*\s+[^\x1b\s]']
 [[rule]]
 id = "composer_ghost_suggestion"
 state = "idle"
+composer_semantic = "ghost_suggestion"
 priority = 1040
 region = "bottom_non_empty_lines(6)"
 line_regex_esc = ['^\s*(?:\x1b\[[0-9;]*m)*›(?:\x1b\[[0-9;]*m)*\s+\x1b\[2m']
@@ -46,6 +48,7 @@ line_regex_esc = ['^\s*(?:\x1b\[[0-9;]*m)*›(?:\x1b\[[0-9;]*m)*\s+\x1b\[2m']
 [[rule]]
 id = "composer_empty_or_ghost"
 state = "idle"
+composer_semantic = "ambiguous"
 priority = 1000
 region = "bottom_non_empty_lines(6)"
 line_regex = ['^\s*›']
@@ -206,6 +209,7 @@ process_names = ["python3", "python", "Python"]
 [[rule]]
 id = "composer_has_input"
 state = "idle_with_input"
+composer_semantic = "human_input"
 priority = 200
 region = "bottom_non_empty_lines(8)"
 line_regex = ['^\s*❯\s+\S']
@@ -214,6 +218,7 @@ line_regex_esc = ['^❯']
 [[rule]]
 id = "composer_empty"
 state = "idle"
+composer_semantic = "clean"
 priority = 90
 region = "bottom_non_empty_lines(4)"
 line_regex = ['^❯\s*$']
@@ -232,6 +237,8 @@ verify_pattern = ["<message_id>"]
 composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
 composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
 composer_trailer_required_prefix = 2
+composer_prompt_regex = '^❯ ?(?P<content>.*)$'
+composer_continuation_regex = '^(?P<content>.*)$'
 "#;
 
 /// The lifecycle fixture: the fake TUI's own layout.
@@ -249,6 +256,7 @@ process_names = ["python3", "python", "Python"]
 [[rule]]
 id = "composer_has_input"
 state = "idle_with_input"
+composer_semantic = "human_input"
 priority = 200
 region = "bottom_non_empty_lines(8)"
 line_regex = ['^\s*❯\s+\S']
@@ -257,6 +265,7 @@ line_regex_esc = ['^❯']
 [[rule]]
 id = "composer_empty"
 state = "idle"
+composer_semantic = "clean"
 priority = 90
 region = "bottom_non_empty_lines(4)"
 line_regex = ['^❯\s*$']
@@ -275,6 +284,8 @@ verify_pattern = ["<message_id>"]
 composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
 composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
 composer_trailer_required_prefix = 2
+composer_prompt_regex = '^❯ ?(?P<content>.*)$'
+composer_continuation_regex = '^(?P<content>.*)$'
 "#;
 
 /// Install an inject-pause seam that parks the delivery at `phase` and
@@ -417,6 +428,14 @@ async fn pane_rebound_before_submit_withholds_the_submit_key() {
         .await
         .expect("submit path reached the seam within 10s")
         .expect("seam channel open");
+
+    // Health uses this same status request after its local read-only scan.
+    // Terminal IO must not retain the journal lock or block inspection.
+    let status = tokio::time::timeout(Duration::from_secs(2), rig.ctl.request("status", json!({})))
+        .await
+        .expect("status answers while terminal submit is paused");
+    assert_eq!(status["error"], serde_json::Value::Null, "{status}");
+
     rig.tmux.run_ok(&["respawn-pane", "-k", "-t", &pane, "sh"]);
     wait_pane_command_is(&mut rig, &["sh", "bash", "dash"]).await;
     release.add_permits(1);
@@ -429,7 +448,10 @@ async fn pane_rebound_before_submit_withholds_the_submit_key() {
                 && e["data"]["action"] == "rebound"
         })
         .await;
-    assert_eq!(rebound["data"]["cause"], "pane_pid_changed", "{rebound}");
+    assert_eq!(
+        rebound["data"]["cause"], "binding_unprovable",
+        "the replacement shell cannot reproduce the admitted agent binding: {rebound}"
+    );
     rig.ev
         .wait_event(Duration::from_secs(8), |e| {
             e["event"] == "delivery-state"

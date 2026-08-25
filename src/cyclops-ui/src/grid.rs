@@ -271,20 +271,26 @@ fn mailbox_receipt_badge(
     if let Some(ahead) = receipt.position.filter(|ahead| *ahead > 0) {
         words.push_str(&format!(" {sep} {ahead} ahead"));
     }
-    let wake = match receipt.quota_state {
-        Some(MessageQuotaState::Held) => "quota held",
-        Some(MessageQuotaState::ResetObserved) => "quota reset observed",
-        None => match notification {
-            MessageNotificationState::NotStarted => "not started",
-            MessageNotificationState::Queued => "queued",
-            MessageNotificationState::Gating => "checking readiness",
-            MessageNotificationState::Writing => "writing",
-            MessageNotificationState::Staged => "staged",
-            MessageNotificationState::Submitted => "submitted",
-            MessageNotificationState::Notified => "notified",
-            MessageNotificationState::AttentionRequired => "needs attention",
-            MessageNotificationState::Superseded => "superseded",
-        },
+    let wake = if receipt.notification_settlement
+        == Some(cyclops_proto::MessageNotificationSettlement::WithdrawnByClaim)
+    {
+        "withdrawn"
+    } else {
+        match receipt.quota_state {
+            Some(MessageQuotaState::Held) => "quota held",
+            Some(MessageQuotaState::ResetObserved) => "quota reset observed",
+            None => match notification {
+                MessageNotificationState::NotStarted => "not started",
+                MessageNotificationState::Queued => "queued",
+                MessageNotificationState::Gating => "checking readiness",
+                MessageNotificationState::Writing => "writing",
+                MessageNotificationState::Staged => "staged",
+                MessageNotificationState::Submitted => "submitted",
+                MessageNotificationState::Notified => "notified",
+                MessageNotificationState::AttentionRequired => "needs attention",
+                MessageNotificationState::Superseded => "superseded",
+            },
+        }
     };
     words.push_str(&format!(" {sep} wake {wake}"));
     paint.badge(receipt.state, &words)
@@ -323,6 +329,7 @@ pub fn delivery_badge(
             state,
             notification_state: None,
             quota_state: None,
+            notification_settlement: None,
             position: None,
             note,
             held_by: None,
@@ -375,6 +382,7 @@ mod tests {
             state,
             notification_state: None,
             quota_state: None,
+            notification_settlement: None,
             position,
             note: note.map(String::from),
             pane: None,
@@ -469,6 +477,15 @@ mod tests {
                 format!("✓ accepted · 2 ahead · wake {word}")
             );
         }
+
+        let mut withdrawn = receipt(DeliveryState::Queued, Some(2), None);
+        withdrawn.notification_state = Some(NotStarted);
+        withdrawn.notification_settlement =
+            Some(cyclops_proto::MessageNotificationSettlement::WithdrawnByClaim);
+        assert_eq!(
+            receipt_badge(&withdrawn, &Plain),
+            "✓ accepted · 2 ahead · wake withdrawn"
+        );
 
         let mut admin = receipt(DeliveryState::Queued, None, None);
         admin.notification_state = Some(NotStarted);

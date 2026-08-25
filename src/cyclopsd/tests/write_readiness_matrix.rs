@@ -20,7 +20,7 @@ fn shipped_manifests() -> std::collections::HashMap<String, Manifest> {
     load_dir(&dir).expect("load shipped manifests")
 }
 
-/// Construct a Detection from a screen evaluation and optional hook reading, then stamp it.
+/// Construct a Detection from a shipped screen rule and optional hook reading.
 fn fuse_detection(
     vendor: &str,
     state: AgentState,
@@ -29,6 +29,10 @@ fn fuse_detection(
     stale: bool,
     disagreement: bool,
 ) -> Detection {
+    let composer_semantic = shipped_manifests()
+        .get(vendor)
+        .and_then(|manifest| manifest.rules.iter().find(|rule| rule.id == decided_by))
+        .and_then(|rule| rule.composer_semantic);
     let mut readings = Vec::new();
     readings.push(SensorReading {
         sensor: Sensor::Screen,
@@ -53,6 +57,7 @@ fn fuse_detection(
         stale,
         write_ready: false,
         write_block: None,
+        composer_semantic,
     };
     det.stamped(false, ComposerHold::Clear)
 }
@@ -442,7 +447,14 @@ fn cursor_offline_fixture_validation_unavailable_live_gate() {
         false,
         false,
     );
-    assert!(det.write_ready, "clean idle cursor must be write_ready");
+    assert!(
+        !det.write_ready,
+        "the offline Cursor fixture cannot prove a write-safe composer"
+    );
+    assert_eq!(
+        det.write_block.as_deref(),
+        Some("no_write_safe_composer_evidence")
+    );
 
     // 2. IdleWithInput (human typed draft) -> write_ready == false
     let typed_screen =

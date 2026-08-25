@@ -42,7 +42,12 @@ where
             writeln!(
                 w,
                 "{}",
-                json!({"cyclops": "0.1.0", "proto": 1, "boot_id": "b-ui"})
+                json!({
+                    "cyclops": "0.1.0",
+                    "build": env!("CYCLOPS_BUILD_REF"),
+                    "proto": 1,
+                    "boot_id": "b-ui"
+                })
             )
             .expect("write hello");
             'conn: loop {
@@ -79,6 +84,30 @@ fn stdout_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+fn empty_messages_snapshot(req: &Value) -> (Vec<String>, bool) {
+    (
+        vec![json!({"id": req["id"], "result": {
+            "workspace_id": "00000000-0000-0000-0000-000000000001",
+            "workspace_seq": 0,
+            "counts": {
+                "visible_messages": 0,
+                "returned_messages": 0,
+                "inbox_messages": 0,
+                "outbound_messages": 0,
+                "work_messages": 0,
+                "active_messages": 0,
+                "settled_messages": 0,
+                "pending_entries": 0,
+                "claimed_entries": 0,
+                "open_attention_entries": 0
+            },
+            "rows": []
+        }})
+        .to_string()],
+        true,
+    )
+}
+
 /// Two msg facts in the session ledger: one to admin (seq 1), one agent
 /// to agent (seq 2). Timestamps are fixed so the clock gutter is exact.
 ///
@@ -109,7 +138,7 @@ fn write_ledger(home: &Path) {
 /// line too, not just the backfill path. Seq 11 carries an empty body,
 /// which is the same as none: no second line.
 fn serve_canned(home: &Path) {
-    serve_conns(home, 2, move |req| match req["method"].as_str() {
+    serve_conns(home, 3, move |req| match req["method"].as_str() {
         Some("events.subscribe") => (
             vec![
                 json!({"id": req["id"], "result": {"subscribed": true}}).to_string(),
@@ -149,11 +178,29 @@ fn serve_canned(home: &Path) {
                     "agent": "codex", "manifest": "codex", "title": "codex",
                     "current_command": "codex", "dead": false, "in_mode": false,
                     "width": 120, "height": 40, "state": "idle"
-                }]}]
+                }]}],
+                "mailbox_routes": [{
+                    "recipient": {
+                        "kind": "agent",
+                        "workspace_id": "00000000-0000-0000-0000-000000000001",
+                        "session_instance_id": "00000000-0000-0000-0000-000000000002",
+                        "pane_id": "%1"
+                    },
+                    "label": "reviewer"
+                }, {
+                    "recipient": {
+                        "kind": "agent",
+                        "workspace_id": "00000000-0000-0000-0000-000000000001",
+                        "session_instance_id": "00000000-0000-0000-0000-000000000002",
+                        "pane_id": "%2"
+                    },
+                    "label": "codex"
+                }]
             }})
             .to_string()],
             true,
         ),
+        Some("messages.snapshot") => empty_messages_snapshot(&req),
         other => panic!("unexpected method {other:?}"),
     });
 }
@@ -298,20 +345,13 @@ fn answer(open_deliveries: bool) -> Value {
     result
 }
 
-/// Two eye surfaces, one daemon, one instant: they must agree.
-///
-/// The daemon answers the delivery half only when asked, so a surface that
-/// forgets to ask reads a calm rig while the other shouts about the same
-/// backlog. `cyclops status` sent an empty params object and counted panes
-/// alone; `cyclops ui` asked and counted both. Driving both against the
-/// same canned daemon is the only shape of test that can see that, because
-/// each surface was self-consistent.
+/// Normal status is live fleet state. The stream also carries durable alarms.
 #[test]
-fn the_status_grid_and_the_stream_read_one_daemon_the_same_way() {
+fn status_stays_live_while_the_stream_carries_durable_attention() {
     let home = scratch_home("two");
-    // Three connections: the status grid takes one, the plain follow takes
-    // its subscription and its own status.
-    serve_conns(&home, 3, move |req| match req["method"].as_str() {
+    // Four connections: the status grid takes one, while the plain follow
+    // takes its subscription, status seed, and message snapshot.
+    serve_conns(&home, 4, move |req| match req["method"].as_str() {
         Some("status") => {
             let asked = req["params"]["open_deliveries"] == json!(true);
             (
@@ -323,16 +363,17 @@ fn the_status_grid_and_the_stream_read_one_daemon_the_same_way() {
             vec![json!({"id": req["id"], "result": {"subscribed": true}}).to_string()],
             true,
         ),
+        Some("messages.snapshot") => empty_messages_snapshot(&req),
         other => panic!("unexpected method {other:?}"),
     });
 
     let grid = stdout_of(&run_ui(&home, &["status"]));
     let stream = stdout_of(&run_ui(&home, &["ui", "--plain"]));
 
-    // Both halves of the rule, counted once, said the same way on both.
+    // The primary grid reports one blocked pane and omits durable backlog.
     assert_eq!(
         grid.lines().next().unwrap_or_default(),
-        "◉ 2 cyclops · watching main · tmux 3.6a · up 2m · 2 need attention",
+        "◑ 1 cyclops · watching main · tmux 3.6a · up 2m · 1 needs attention",
         "{grid}"
     );
     assert!(
@@ -341,9 +382,8 @@ fn the_status_grid_and_the_stream_read_one_daemon_the_same_way() {
             .any(|l| l.starts_with("eye open · 2 need attention · ")),
         "{stream}"
     );
-    // And each surface still puts a line behind every number it shows.
     assert!(grid.contains("  reviewer  ⚠ blocked_permission"), "{grid}");
-    assert!(grid.contains("  implementer  ⊘ parked · quota"), "{grid}");
+    assert!(!grid.contains("implementer  ⊘ parked · quota"), "{grid}");
     assert!(stream.contains("implementer  ⊘ parked · quota"), "{stream}");
     assert!(
         stream.contains("reviewer  ⚠ blocked_permission"),
@@ -362,7 +402,7 @@ fn the_status_grid_and_the_stream_read_one_daemon_the_same_way() {
 #[test]
 fn a_pane_that_closes_takes_its_attention_item_with_it() {
     let home = scratch_home("gone");
-    serve_conns(&home, 2, move |req| match req["method"].as_str() {
+    serve_conns(&home, 4, move |req| match req["method"].as_str() {
         Some("events.subscribe") => (
             vec![
                 json!({"id": req["id"], "result": {"subscribed": true}}).to_string(),
@@ -376,6 +416,7 @@ fn a_pane_that_closes_takes_its_attention_item_with_it() {
             vec![json!({"id": req["id"], "result": answer(false)}).to_string()],
             true,
         ),
+        Some("messages.snapshot") => empty_messages_snapshot(&req),
         other => panic!("unexpected method {other:?}"),
     });
     let stream = stdout_of(&run_ui(&home, &["ui", "--plain", "--firehose"]));

@@ -474,7 +474,12 @@ fn canned_daemon(
             };
             let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
             let mut w = stream;
-            let hello = json!({"cyclops": "0.1.0", "proto": 1, "boot_id": "b-ws"});
+            let hello = json!({
+                "cyclops": "0.1.0",
+                "build": env!("CYCLOPS_BUILD_REF"),
+                "proto": 1,
+                "boot_id": "b-ws"
+            });
             if writeln!(w, "{hello}").is_err() {
                 return;
             }
@@ -1169,7 +1174,19 @@ fn setup_check_refuses_tier_one_manifests_without_ack_capability() {
             .lines()
             .filter(|line| {
                 let line = line.trim_start();
-                !line.starts_with("ack = ") && !line.starts_with("ack_payload_field = ")
+                let ack_field = [
+                    "ack = ",
+                    "ack_evidence = ",
+                    "ack_payload_field = ",
+                    "ack_latency_ms_p50 = ",
+                    "ack_latency_ms_p95 = ",
+                ]
+                .iter()
+                .any(|field| line.starts_with(field));
+                let claude_candidate_start = id == "claude"
+                    && (line.starts_with("turn_start = ")
+                        || line.starts_with("turn_start_evidence = "));
+                !ack_field && !claude_candidate_start
             })
             .collect::<Vec<_>>()
             .join("\n")

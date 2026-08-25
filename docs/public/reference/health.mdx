@@ -1,0 +1,108 @@
+---
+title: "Health inspection"
+description: "Read-only inspection of Cyclops binaries, daemon identity, setup, and state."
+---
+
+`cyclops health` answers which Cyclops installation the shell is using and
+whether its state can be inspected safely. It works when `cyclopsd` is stopped.
+It never starts a daemon, creates state, repairs permissions, removes files, or
+changes vendor configuration.
+
+```bash
+cyclops health
+cyclops --json health
+```
+
+The command exits `0` when it finds no safety or build-identity problem. It
+exits `1` when the selected client has no executable daemon sibling, PATH
+contains shadow installations, client and daemon builds do not match, a stale
+socket exists, state inspection fails, state permissions are broader than
+owner-only, a linked state entry is present, an installed consumer has
+incomplete setup, an operational inventory cannot be inspected, or an
+inventory limit is reached. An absent state root and a stopped daemon without
+socket residue are valid inspected states.
+
+## What it reports
+
+- The selected client executable, version, build identifier, adjacent daemon
+  canonical path, adjacent daemon build, and every `cyclops` or `cyclopsd`
+  resolution found in bounded PATH entries. The adjacent daemon build is
+  inspected even when no daemon is running.
+- Daemon running state, version, build, canonical executable path, boot
+  identifier, PID plus kernel start value, and whether its build matches the
+  client when the authenticated connection hello reports them. Uptime remains
+  unproven because health does not send a status request.
+- The intended state root and socket path.
+- Setup status for shipped manifests, vendor hooks, agent skills, and mailbox
+  transport capability.
+- Descriptor-relative metadata for state directories, journals, logs,
+  manifests, hooks, sockets, and other entries.
+- The canonical incremental build-cache path and any update scratch
+  entries found under an owner-only temporary directory.
+- Rollback provenance from the selected public installation: selection path,
+  active and known-good pair paths, recorded identities, build identifiers,
+  and whether a distinct validated rollback candidate is available.
+
+Current daemons report their process generation, build, boot identity, and one
+canonical executable path in the authenticated connection hello. Health sends
+no status request, refreshes no detection, and never guesses the running
+executable from PATH. The reported executable is canonicalized and compared
+with the selected adjacent daemon. Older daemons leave unavailable fields
+`unproven`.
+
+Rollback inspection starts from the first PATH-resolved entry that selects the
+running public `cyclops` command. Direct invocation of an immutable pair, and
+legacy installs with no managed descriptor, remain explicitly `unproven`.
+Rollback proof validates recorded pair hashes without executing the retained
+known-good binary. The selected adjacent daemon is probed separately with
+`--version` for the client-pair build check. A stale or changed proof is an
+issue; a valid legacy selection can report its known-good identity without
+claiming rollback safety. A distinct known-good pair is only a rollback
+candidate until the update path proves that it can replay the current journal.
+Health reports journal replay and rollback safety as `unproven` when no durable
+compatibility proof exists.
+
+## State safety
+
+Cyclops state inspection is rooted at one held directory descriptor. Every
+descendant directory and regular file is opened relative to that descriptor
+with no-follow flags. Symbolic links and multiply linked regular files are
+reported unsafe without reading their targets. Entry identity is compared
+between directory enumeration, metadata inspection, and descriptor open.
+Changed identity fails the snapshot instead of returning guessed metadata.
+
+Manifest, hook, and skill files use the same held-descriptor reader. A linked,
+multiply linked, oversized, or unstable setup file is reported as unproven and
+cannot make setup complete. Read-only group or world access remains compatible
+with vendor config conventions. Group or world writable setup files do not.
+
+The state walk has fixed entry, name-byte, depth, and file-byte ceilings. JSON
+includes those limits and reports when a snapshot was truncated. PATH and
+temporary-directory inspection have separate fixed ceilings.
+
+## JSON fields
+
+The JSON report has these top-level objects:
+
+| Field | Meaning |
+| --- | --- |
+| `client` | Selected client build plus bounded PATH resolutions. |
+| `daemon` | Authenticated daemon facts, or `running: false`. |
+| `state` | Intended paths and bounded descriptor-relative inventory. |
+| `setup` | Manifest, hook, skill, and mailbox readiness by consumer. |
+| `build_cache` | Recursive marked build-cache inventory, lease, and descendant safety. |
+| `update_scratch` | Each exact update scratch name, owner marker, lease, and recursive descendant safety. |
+| `rollback` | Known-good candidate availability, journal replay proof, and rollback safety. |
+| `limits` | Every count, byte, and depth ceiling used by the report. |
+| `issues` | Stable issue codes with a message and path where applicable. |
+
+Health reports facts only. Use `cyclops start --setup-only --wire-hooks` for
+setup repair. Update and cleanup have separate mutation contracts.
+
+## Safe cleanup
+
+`cyclops cleanup build-cache update-scratch` is a dry run. Add `--apply` only
+after reviewing its exact candidates. An active lease refuses removal. State,
+journals, messages, rollback pairs, processes, and unmarked historical scratch
+are never removed. See [Cleanup](/reference/cleanup) for the descriptor-bound
+apply contract and JSON schema.

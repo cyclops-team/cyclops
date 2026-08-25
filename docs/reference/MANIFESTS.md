@@ -29,7 +29,7 @@ one rule to fix.
 `write-ready` is the second answer and a different question: may a
 message be pasted right now. Only a screen rule can answer it, because
 only the screen can see the composer. A manifest with no idle screen rule
-reads `not write-ready: no_clean_composer_evidence` however confidently
+reads `not write-ready: no_write_safe_composer_evidence` however confidently
 its title rule says idle.
 
 Add `--raw` and the same answer carries the pane capture the sensors
@@ -74,7 +74,9 @@ launch = "cat"
 
 [hooks]
 turn_start = "UserPromptSubmit"
+turn_start_evidence = "confirmed"
 turn_end = "Stop"
+turn_end_evidence = "confirmed"
 ack = "UserPromptSubmit"
 ack_payload_field = "prompt"
 
@@ -142,6 +144,7 @@ agent is in this state. Highest `priority` that matches wins.
 |---|---|
 | `id` | Rule name. This is what `cyclops read --source detection` prints |
 | `state` | `unknown`, `idle`, `idle_with_input`, `working`, `blocked_modal`, `blocked_permission`, `blocked_quota`, `dead` |
+| `composer_semantic` | Optional measured composer meaning: `clean`, `human_input`, `ghost_suggestion`, or `ambiguous` |
 | `priority` | Higher wins. Rules are sorted once at load |
 | `region` | `pane_title`, or `bottom_non_empty_lines(N)` for the last N non-blank screen lines |
 | `contains` | Every string must appear in the region |
@@ -154,6 +157,12 @@ agent is in this state. Highest `priority` that matches wins.
 | `note`, `evidence` | Free text. Write down what you measured and where |
 
 Clauses inside one matcher are ANDed. A rule with no clauses never fires.
+
+`composer_semantic` describes only the composer shape matched by that rule.
+It does not replace runtime `state`. Leave it absent when the rule does not
+read the composer or when evidence does not support a classification. Use
+`ambiguous` when one rule matches multiple meanings, such as an empty composer
+and a ghost suggestion. Runtime code must not infer this meaning from rule ids.
 
 **Prefer the title.** A title rule costs nothing: tmux already tracks the
 title, so the daemon reads it over the connection it holds and never
@@ -205,7 +214,7 @@ Wiring the hooks on the CLI side is [hooks.md](hooks.md).
 | `verify_pattern` | What must be visible for the paste to count as staged. `<message_id>` is replaced with this delivery's marker |
 | `safe_states` | Deliver only when the agent is in one of these |
 | `unsafe_states` | Never deliver in these |
-| `busy_behavior` | `"queues"` when text pasted mid-turn stages and runs as its own turn. Leave it out unless you measured it |
+| `busy_behavior` | Legacy measurement metadata. It never authorizes a write; omit it from new manifests |
 | `composer_prompt_regex` | Whole joined-capture row that starts the active composer, with a named `content` capture |
 | `composer_continuation_regex` | Whole joined-capture row for each later logical payload line, with a named `content` capture |
 

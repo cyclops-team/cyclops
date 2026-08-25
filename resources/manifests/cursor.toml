@@ -53,7 +53,9 @@ mailbox_capability_file = "~/.agents/skills/cyclops/SKILL.md"
 # the CLI. On this build beforeSubmitPrompt and afterAgentThought both fire.
 config_mechanism = "hooks.json in ~/.cursor/ or <workspace>/.cursor/"
 turn_start = "beforeSubmitPrompt"
+turn_start_evidence = "confirmed"
 turn_end = "stop"
+turn_end_evidence = "confirmed"
 ack = "beforeSubmitPrompt"        # delivery receipt, payload carries `prompt`
 ack_payload_field = "prompt"
 available = [
@@ -180,6 +182,7 @@ evidence = "MEASURED 2026-08-05, fixtures/cursor_working_composer_esc.txt; 'ctrl
 [[rule]]
 id = "composer_typed_input"
 state = "idle_with_input"
+composer_semantic = "human_input"
 priority = 1050
 region = "bottom_non_empty_lines(6)"
 line_regex_esc = ['^(?:\s|\x1b\[[0-9;]*m)*→\s+[^\x1b\s]']
@@ -192,6 +195,7 @@ evidence = "MEASURED: ' \\x1b[48;2;21;21;21m → what does add do'"
 [[rule]]
 id = "composer_ghost_or_empty"
 state = "idle"
+composer_semantic = "ambiguous"
 priority = 1000
 region = "bottom_non_empty_lines(6)"
 line_regex_esc = ['^(?:\s|\x1b\[[0-9;]*m)*\x1b\[(?:0;)?2m→']
@@ -206,6 +210,7 @@ evidence = "MEASURED: ' \\x1b[48;2;21;21;21m \\x1b[2m→ \\x1b[0;7mP\\x1b[0;2m..
 [[rule]]
 id = "composer_plain_fallback"
 state = "idle"
+composer_semantic = "ambiguous"
 priority = 900
 region = "bottom_non_empty_lines(6)"
 line_regex = ['^\s*→\s']
@@ -229,5 +234,4 @@ verify_before_submit = true
 verify_pattern = ["<message_id>"]
 safe_states = ["idle"]
 unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]
-# busy_behavior is deliberately absent: what Cursor does with text pasted
-# mid-turn was not measured, and safe_states = ["idle"] already gates on it.
+# Mid-turn input behavior has not been measured. Working is not write-safe.

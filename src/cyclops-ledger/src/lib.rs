@@ -57,6 +57,10 @@ pub enum LedgerError {
     SequenceExhausted(PathBuf),
     #[error("ledger write state is unknown after an earlier io failure at {0}; reopen required")]
     WriteStateUnknown(PathBuf),
+    #[error("ledger already has an active writer at {0}")]
+    WriterInUse(PathBuf),
+    #[error("ledger writer is sealed at {0}")]
+    WriterSealed(PathBuf),
 }
 
 /// Crash-safe appender for one ledger file.
@@ -71,6 +75,8 @@ struct Inner {
     next_seq: u64,
     strict_replay: bool,
     write_state_unknown: bool,
+    sealed: bool,
+    locked: bool,
 }
 
 impl LedgerWriter {
@@ -115,6 +121,9 @@ impl LedgerWriter {
             source,
         };
         let mut file = root.open_append(descendant)?;
+        if !file.try_lock().map_err(io)? {
+            return Err(LedgerError::WriterInUse(path));
+        }
 
         // Recover only the final unterminated write. Complete records are
         // immutable, including complete records that fail strict replay.
@@ -170,6 +179,8 @@ impl LedgerWriter {
                     next_seq,
                     strict_replay,
                     write_state_unknown: false,
+                    sealed: false,
+                    locked: true,
                 }),
                 path,
                 boot_id: boot_id.into(),
@@ -195,6 +206,9 @@ impl LedgerWriter {
             source,
         };
         let mut inner = self.inner.lock().expect("ledger writer poisoned");
+        if inner.sealed {
+            return Err(LedgerError::WriterSealed(self.path.clone()));
+        }
         if inner.write_state_unknown {
             return Err(LedgerError::WriteStateUnknown(self.path.clone()));
         }
@@ -239,6 +253,24 @@ impl LedgerWriter {
     /// The sequence assigned to the next append.
     pub fn next_seq(&self) -> u64 {
         self.inner.lock().expect("ledger writer poisoned").next_seq
+    }
+
+    /// Stop future appends and release this writer's lifetime file lease.
+    ///
+    /// The writer mutex makes sealing an exact boundary. An append either
+    /// finishes before the lease is released or observes the sealed state.
+    pub fn seal(&self) -> Result<(), LedgerError> {
+        let io = |source| LedgerError::Io {
+            path: self.path.clone(),
+            source,
+        };
+        let mut inner = self.inner.lock().expect("ledger writer poisoned");
+        inner.sealed = true;
+        if inner.locked {
+            inner.file.unlock().map_err(io)?;
+            inner.locked = false;
+        }
+        Ok(())
     }
 }
 
@@ -412,6 +444,32 @@ mod tests {
             writer.read_after(1).unwrap()[0].subject.as_deref(),
             Some("two")
         );
+    }
+
+    #[test]
+    fn one_writer_owns_the_ledger_until_an_exact_seal() {
+        let scratch = Scratch::new("writer-lease");
+        let descendant = Path::new("ledger/main.ndjson");
+        let first = LedgerWriter::open(&scratch.root, descendant, "boot-1").unwrap();
+        first.append(message("one")).unwrap();
+        let before = fs::read(scratch.root.path().join(descendant)).unwrap();
+
+        assert!(matches!(
+            LedgerWriter::open(&scratch.root, descendant, "boot-2"),
+            Err(LedgerError::WriterInUse(_))
+        ));
+        assert_eq!(
+            fs::read(scratch.root.path().join(descendant)).unwrap(),
+            before
+        );
+
+        first.seal().unwrap();
+        assert!(matches!(
+            first.append(message("late")),
+            Err(LedgerError::WriterSealed(_))
+        ));
+        let second = LedgerWriter::open(&scratch.root, descendant, "boot-2").unwrap();
+        assert_eq!(second.append(message("two")).unwrap().seq, 2);
     }
 
     #[test]

@@ -16,7 +16,10 @@
 //!   daemon resolves that exact pair. The client never says "the current
 //!   row" and never resolves anything itself.
 
-use cyclops_proto::{MessageId, NotificationAttemptId, NotificationAttentionCause, RecipientKey};
+use cyclops_proto::{
+    MessageId, MessageRecipientRoute, NotificationAttemptId, NotificationAttentionCause,
+    NotificationPreWriteCause, RecipientKey,
+};
 
 use crate::grid::display_width;
 
@@ -81,9 +84,23 @@ pub enum MailboxWord {
 /// written, nothing more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeWord {
-    /// An attempt exists and has not written yet: queued or gating.
-    Waiting,
+    /// The daemon accepted an attempt into the recipient FIFO.
+    Queued,
+    /// The attempt is waiting for write readiness at the head of the FIFO.
+    Gating,
+    /// The durable write boundary was recorded before terminal mutation.
+    Writing,
+    /// The notification is visible in the terminal composer.
+    Staged,
+    /// The submit key was sent. This is not an agent acknowledgement.
+    Submitted,
+    /// The attempt stopped before any terminal bytes were written.
+    BlockedBeforeWrite,
     Notified,
+    /// The recipient claimed the message before this wake wrote anything.
+    Withdrawn,
+    /// An administrator retired the unwritten wake. The mailbox item remains.
+    WithdrawnByOperator,
     NeedsAttention,
     /// Quota is still positively observed. Wait for a reset observation;
     /// the daemon will never resume this attempt automatically.
@@ -91,17 +108,17 @@ pub enum WakeWord {
     /// Quota is no longer positively observed. An administrator may now
     /// explicitly requeue the whole message.
     QuotaResetObserved,
-    /// A terminal action crossed its durable boundary, but its outcome is unknown.
-    ActionUncertain,
+    /// A terminal action has durable recovery state but no final outcome.
+    /// Separate fields say whether the key and task start were observed.
+    ResolutionIncomplete,
     Cleared,
-    /// The operator proved the staged payload and submitted it.
+    /// Guarded recovery proved the staged notification was submitted.
     /// This says nothing about task completion.
-    OperatorSubmitted,
-    /// The operator proved and removed the staged payload.
-    OperatorDiscarded,
+    ResolvedSubmitted,
+    /// Guarded recovery proved and removed the staged notification.
+    ResolvedDiscarded,
     /// No attempt has been started for this row at all. Distinct from
-    /// `Waiting`: nothing has been queued, so there is nothing in
-    /// flight to wait for.
+    /// `Queued`: nothing has entered the recipient FIFO.
     NotStarted,
     /// A newer attempt replaced this one. Not an outcome, and not
     /// something an operator acts on.
@@ -133,15 +150,22 @@ impl MailboxWord {
 impl WakeWord {
     pub fn cell(self) -> &'static str {
         match self {
-            WakeWord::Waiting => ". waiting",
+            WakeWord::Queued => ". queued",
+            WakeWord::Gating => ". gating",
+            WakeWord::Writing => "> writing",
+            WakeWord::Staged => "> staged",
+            WakeWord::Submitted => "^ submit sent",
+            WakeWord::BlockedBeforeWrite => "! wake blocked",
             WakeWord::Notified => "> notified",
+            WakeWord::Withdrawn => "= withdrawn",
+            WakeWord::WithdrawnByOperator => "= wake withdrawn",
             WakeWord::NeedsAttention => "! needs attention",
             WakeWord::QuotaHeld => "! quota held",
             WakeWord::QuotaResetObserved => "! quota reset observed",
-            WakeWord::ActionUncertain => "! action uncertain",
+            WakeWord::ResolutionIncomplete => "! resolution open",
             WakeWord::Cleared => "x cleared",
-            WakeWord::OperatorSubmitted => "^ submitted",
-            WakeWord::OperatorDiscarded => "x discarded",
+            WakeWord::ResolvedSubmitted => "^ submitted",
+            WakeWord::ResolvedDiscarded => "x discarded",
             WakeWord::NotStarted => "- not started",
             WakeWord::Superseded => "~ superseded",
         }
@@ -149,15 +173,22 @@ impl WakeWord {
 
     pub fn short(self) -> &'static str {
         match self {
-            WakeWord::Waiting => ".wait",
+            WakeWord::Queued => ".queue",
+            WakeWord::Gating => ".gate",
+            WakeWord::Writing => ">write",
+            WakeWord::Staged => ">stage",
+            WakeWord::Submitted => "^submit",
+            WakeWord::BlockedBeforeWrite => "!block",
             WakeWord::Notified => ">notf",
+            WakeWord::Withdrawn => "=wdrn",
+            WakeWord::WithdrawnByOperator => "=wdraw",
             WakeWord::NeedsAttention => "!attn",
             WakeWord::QuotaHeld => "!quota",
             WakeWord::QuotaResetObserved => "!reset",
-            WakeWord::ActionUncertain => "!uncertain",
+            WakeWord::ResolutionIncomplete => "!incomp",
             WakeWord::Cleared => "xclear",
-            WakeWord::OperatorSubmitted => "^submit",
-            WakeWord::OperatorDiscarded => "xdiscd",
+            WakeWord::ResolvedSubmitted => "^settld",
+            WakeWord::ResolvedDiscarded => "xdiscd",
             WakeWord::NotStarted => "-nostart",
             WakeWord::Superseded => "~sprsd",
         }
@@ -192,6 +223,11 @@ pub struct QueueRow {
     pub mailbox: MailboxWord,
     pub wake: WakeWord,
     pub cause: Option<NotificationAttentionCause>,
+    pub pre_write_cause: Option<NotificationPreWriteCause>,
+    /// Current live route. The immutable send-time label remains the fallback.
+    pub current_route: Option<MessageRecipientRoute>,
+    /// The daemon's one-based mailbox position.
+    pub fifo_position: Option<u64>,
     /// Whether this row is work for the reader who asked.
     ///
     /// The daemon decides it, because only the daemon knows who asked.
@@ -203,12 +239,34 @@ pub struct QueueRow {
     /// Separate from the identity on purpose: this is what changes as an
     /// alarm appears, clears, is requeued, or has its attempt replaced.
     pub attention: Option<NotificationAttemptId>,
-    /// Whether this reader may resolve THIS recipient's open alarm.
+    /// Durable pre-key terminal action intent for this attempt.
+    ///
+    /// Intent alone proves no key was accepted. A Discard intent may expose
+    /// only exact-empty no-key reconciliation; Complete remains blocked.
+    pub resolution_intent: Option<cyclops_proto::NotificationResolution>,
+    /// Durable proof that the terminal accepted the intended action key.
+    ///
+    /// A value matching `resolution_intent` authorizes only no-key
+    /// reconciliation of that same action. It never authorizes another key.
+    pub resolution_action_accepted: Option<cyclops_proto::NotificationResolution>,
+    /// Durable exact-payload hook or post-action claim evidence for Complete.
+    ///
+    /// Complete cannot reconcile without it. Discard does not start a turn
+    /// and therefore does not require this field.
+    pub resolution_consumption_observed:
+        Option<cyclops_proto::NotificationResolutionConsumptionObservation>,
+    /// Whether this reader may start a fresh resolution of THIS recipient's
+    /// open alarm.
     ///
     /// The daemon's answer, never inferred. Direction, mailbox state and
     /// wake word are all things a client can see and none of them says
-    /// who is allowed to act; only the daemon knows who asked.
+    /// who is allowed to act; only the daemon knows who asked. Matching
+    /// durable-intent reconciliation is governed separately above.
     pub can_manage_attention: bool,
+    /// Whether this reader may withdraw this exact unwritten wake.
+    ///
+    /// This is the daemon's answer. Visible state is not authorization.
+    pub can_withdraw_notification: bool,
     /// The daemon's own FIFO position. The queue never invents an order.
     pub seq: u64,
     pub updated_at: u64,
@@ -221,9 +279,10 @@ impl QueueRow {
         matches!(
             self.wake,
             WakeWord::NeedsAttention
+                | WakeWord::BlockedBeforeWrite
                 | WakeWord::QuotaHeld
                 | WakeWord::QuotaResetObserved
-                | WakeWord::ActionUncertain
+                | WakeWord::ResolutionIncomplete
         )
     }
 }
@@ -699,7 +758,6 @@ pub(crate) fn render_with_status(
         ),
         width,
     ));
-    out.push(fit(&"-".repeat(width.min(160)), width));
 
     // Too narrow for a table, wide enough for the states. The two state
     // words are what an operator acts on, so the recipient and the
@@ -707,8 +765,17 @@ pub(crate) fn render_with_status(
     // its columns to the width and then cut the wake state off the end.
     let table = TableColumns::for_width(width);
     if table.is_none() {
-        let body_rows = height.saturating_sub(3 + usize::from(status.is_some()));
         let id_w = width - NARROW_FIXED;
+        out.push(fit(
+            &format!(
+                "  {} {} {}",
+                fit("id", id_w),
+                fit("mail", MAILBOX_SHORT_W),
+                fit("wake", WAKE_SHORT_W),
+            ),
+            width,
+        ));
+        let body_rows = height.saturating_sub(3 + usize::from(status.is_some()));
         for row in queue
             .visible()
             .skip(viewport_top(queue, body_rows))
@@ -749,6 +816,18 @@ pub(crate) fn render_with_status(
         wake_w,
         subject_w,
     } = table.expect("checked above");
+
+    out.push(fit(
+        &format!(
+            "  {} {} {} {} {}",
+            fit("id", id_w),
+            fit("recipient", who_w),
+            fit("mailbox", state_w),
+            fit("wake", wake_w),
+            fit("subject", subject_w),
+        ),
+        width,
+    ));
 
     let body_rows = height.saturating_sub(3 + usize::from(status.is_some()));
     let selected = queue.selected().map(|r| r.target.clone());

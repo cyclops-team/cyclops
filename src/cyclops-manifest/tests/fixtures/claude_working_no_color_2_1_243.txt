@@ -1,0 +1,9 @@
+  Sleeping for 8 seconds
+  ⎿  $ sleep 8
+✳ Flambéing… (1s · ↓ 90 tokens)
+  ⎿  Tip: Use /permissions to pre-approve and pre-deny bash, edit, and MCP tools
+────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────
+  Haiku 4.5 · low · Ctx: 76% · 200K window · 47K used
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

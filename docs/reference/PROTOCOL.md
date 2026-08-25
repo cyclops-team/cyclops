@@ -81,6 +81,7 @@ Error codes are stable; messages are for humans. Common codes include:
 | `ambiguous_attention` | more than one attention item could match the requested action |
 | `attention_evidence_failed` | the terminal safety evidence changed before the action |
 | `discard_unsupported` | this notification cannot be cleared with discard |
+| `conflict` | a valid mailbox or notification mutation conflicts with current durable state |
 | `timeout` | `agent.wait` only: the deadline passed. `data.state` carries the state the target was last in |
 | `occupant_changed` | `agent.wait` only: the pinned pane died or changed occupant |
 | `notification_unavailable` | `msg.send` only: an obsolete caller requested the removed send-and-wait composition |
@@ -107,7 +108,9 @@ alphabet.
 | `inbox.list` | List pending mailbox metadata without bodies |
 | `inbox.claim` | Atomically claim one message and return its payload |
 | `messages.snapshot` | Read body-free inbox, outbound, and notification state |
+| `messages.follow` | Page losslessly through body-free message changes after a sequence |
 | `msg.requeue` | Explicitly requeue a notification that permits the transition |
+| `notification.withdraw` | Suppress one exact `queued`, `gating`, or `blocked_pre_write` wake while leaving its mailbox item pending |
 | `alarm.preview` | Preview unresolved notification alarms older than a duration |
 | `attention.show` | Read safety checks for one staged notification attempt |
 | `attention.complete` | Submit one exact staged notification attempt |
@@ -123,6 +126,7 @@ alphabet.
 | `admin.notify` | Raise something for the human |
 | `theme.reload` | Re-read the theme selection and repaint every named pane's border |
 | `daemon.quiesce` | Hold the delivery pipeline at a restart-safe boundary |
+| `daemon.shutdown` | Stop one exact authenticated daemon generation after quiesce |
 | `workspace_ui.get` | Last-active workspace and tab for the terminal workspace UI |
 | `workspace_ui.set` | Persist last-active workspace and tab (not a ledger fact) |
 
@@ -131,14 +135,21 @@ alphabet.
 ```
 -> {"id":2,"method":"status","params":{"open_deliveries":true}}
 <- {"id":2,"result":{"boot_id":"b4ce18e9-...","daemon_version":"0.1.0",
+    "daemon_build":"abc1234","daemon_executable":"/Users/me/.local/bin/cyclopsd",
+    "daemon_process":{"pid":8123,"birth":981221},"pid":8123,
     "manifests":{"dir":"/private/tmp/cyclops-wire.l3llB0/home/manifests","ids":["demo"]},
+    "admin_unread":0,"blocked_notifications_total":0,
     "proto":1,"sessions":[{"attached":true,"name":"main","panes":[
       {"agent":"implementer","current_command":"bash","dead":false,"height":11,
        "hooks_verified":false,"in_mode":false,"manifest":"demo","pane_id":"%0",
-       "state":"idle","title":"","width":80,"window_id":"@0","window_name":"zsh"},
+       "composer":"composer_clean","composer_proof":"manifest_rule","state":"idle",
+       "state_ms":4011,"title":"","width":80,"window_id":"@0",
+       "window_name":"zsh","write_ready":true},
       {"agent":"reviewer","current_command":"bash","dead":false,"height":11,
        "hooks_verified":false,"in_mode":false,"manifest":"demo","pane_id":"%1",
-       "state":"idle","title":"","width":80,"window_id":"@0","window_name":"zsh"}]}],
+       "composer":"composer_clean","composer_proof":"manifest_rule","state":"idle",
+       "state_ms":3988,"title":"","width":80,"window_id":"@0",
+       "window_name":"zsh","write_ready":true}]}],
     "tmux_version":"3.6a","uptime_ms":4032}}
 ```
 
@@ -148,6 +159,22 @@ alphabet.
 bound. `state` is one of `unknown`, `idle`, `idle_with_input`, `working`,
 `blocked_modal`, `blocked_permission`, `blocked_quota`, `dead`.
 
+Runtime, composer ownership, write readiness, notification state, and mailbox
+state are separate fields. `working_confirmed:false` means an authenticated
+start edge made runtime state `working` before current visual confirmation.
+`composer` uses the six closed ownership states. `composer_proof` names the
+evidence strength. An unresolved projection can carry `composer_reason`, a
+unique `notification_attempt`, and `composer_candidates`. The latter preserves
+the number of durable barriers when no single attempt can be selected safely.
+`notification_state`, `message_state`, and `next_action` remain body-free.
+`submitting` is a durable submit intent, not proof that a terminal key was sent.
+
+Status refreshes live panes concurrently under one request-wide budget. A pane
+that does not finish within that budget reports runtime `unknown`, refuses
+writing with `status_refresh_incomplete`, and downgrades composer ownership. It
+keeps any already-known durable attempt and mailbox facts so an incomplete live
+read cannot hide recoverable work.
+
 `manifests` is always there, empty set included, and it is how you tell two
 different problems apart when a pane reads `unknown`: `ids: []` means this
 daemon loaded no detection rules at all and nothing on the machine can be
@@ -156,12 +183,16 @@ binds that pane.
 
 `open_deliveries: true` adds an `open_deliveries` array: every delivery
 whose latest recorded state still needs a human, folded from the whole
-record. Each entry is `{id, to, state, ts, cause}`. Anything that shows the
-attention indicator must ask for it, because that is half the rule; a caller
-that only wants pane state leaves it off and pays nothing.
+record. Each entry is `{id, to, state, ts, cause}`. Stream and durable-alarm
+surfaces ask for this projection. Normal `cyclops status` deliberately leaves
+it off: its eye reports the live pane fleet, while mailbox, alarm, and stream
+surfaces own durable delivery recovery.
 
 `admin_unread` is the number of pending messages in the workspace
 administrator's durable inbox. Older daemons omit it and clients read zero.
+`blocked_notifications` is a bounded body-free sample of pre-write failures.
+`blocked_notifications_total` is the complete count, so omitted sample rows are
+visible without making normal status output grow with the journal.
 
 ### daemon.quiesce
 
@@ -172,6 +203,25 @@ pipeline is safe to stop and remains paused for the bounded restart window;
 pre-write attempts do not block it because restart recovery requeues them. A
 false result names each unresolved `"<message id> -> <recipient>"`, resumes the
 pipeline, and requires the caller to refuse the restart.
+
+### daemon.shutdown
+
+`daemon.shutdown` accepts the exact cached daemon process generation, boot id,
+and an optional bounded quiesce timeout:
+
+```text
+-> {"id":4,"method":"daemon.shutdown","params":{"daemon_process":{"pid":8123,"birth":981221},"boot_id":"b4ce18e9-...","timeout_ms":5000}}
+<- {"id":4,"result":{"stopping":true}}
+```
+
+The daemon rejects a process-generation or boot-id mismatch before quiescing.
+It then applies the same delivery boundary as `daemon.quiesce` and answers
+`{stopping, in_flight?}`. `stopping: false` leaves the daemon live and names
+the unresolved attempts. For `stopping: true`, the connection writes the
+success response completely before requesting internal shutdown. An older
+daemon that returns `unknown_method` cannot be stopped safely by path or pid
+alone; unattended update must refuse and direct the operator to the documented
+old-client migration.
 
 `diagnostics` is omitted when empty. A `deadlock_risk` entry identifies one
 exact notification attempt whose durable route is `gating` while the routed
@@ -196,14 +246,21 @@ cap; the third returns the reasoning behind a state.
 
 The screen reading is not decoration. Had the title rule been the only
 sensor to report, the same `idle` state would have come back with
-`write_ready:false` and `write_block:"no_clean_composer_evidence"`: a
-title says the turn ended, and only the screen can say the composer is
-empty.
+`write_ready:false` and `write_block:"no_write_safe_composer_evidence"`: a
+title says the turn ended, and only a measured screen rule can prove the
+composer is empty or contains a vendor ghost suggestion that is safe to replace.
 
 `decided_by` names the manifest rule that won. `readings` is what each
 sensor saw, one per sensor that read anything (`title`, `screen`, `hook`).
-`disagreement` is true when sensors contradicted each other; the
-higher-priority rule still decided.
+`disagreement` is true when sensors contradicted each other. An authenticated
+keyed turn-start hook reports runtime `working` before visual output appears
+and remains active until the exact keyed end or process-binding retirement. An
+unkeyed Claude prompt hook reports provisional `working` immediately. A later
+lifecycle-capable visual Working frame confirms that exact pending dispatch.
+Fresh visual state then owns the return to idle. Cyclops does not assign a
+later Stop to that prompt by arrival order or elapsed time. Visual blocked
+states remain authoritative. Other disagreements keep the higher-priority
+manifest rule as the runtime verdict.
 
 Two additive fields carry the authorization answer, which is a different
 question from the runtime state. `stale` is true when this verdict is a
@@ -213,7 +270,7 @@ nothing in it was observed just now. `write_ready` is always present and answers
 directly; `write_block` is absent when a terminal write into the composer
 is allowed right now, and otherwise carries the content-free reason it is
 not (`not_idle`,
-`stale_screen_evidence`, `sensor_disagreement`, `no_clean_composer_evidence`,
+`stale_screen_evidence`, `sensor_disagreement`, `no_write_safe_composer_evidence`,
 `conflicting_evidence`). An agent can be `idle` and still carry a
 `write_block`: idleness says no turn is running, while write-readiness
 says the composer was proven empty just now. Delivery gates on the second
@@ -241,9 +298,11 @@ is retained in protocol v1 only so the daemon can reject old callers with
 `notification_unavailable` instead of silently ignoring their request.
 
 The sender is never in the request. The daemon resolves it from the calling
-process, walking it up to a watched pane. A same-user process proven outside
-every watched pane is `admin`; an unprovable ancestry is denied.
-Nothing in a body can forge the header the recipient reads.
+process. A same-user shell with no agent-vendor ancestor is `admin`, including
+inside a watched pane. A vendor process gets an agent identity only when its
+current ancestry reaches a watched pane; an unprovable ancestry or a vendor
+outside every watched pane is denied. Nothing in a body can forge the header
+the recipient reads.
 
 The response proves durable acceptance. `inserted` is false when the
 sender-scoped `client_key` resolves to an existing exact request. Each
@@ -257,8 +316,13 @@ write boundary. An exact installed claim skill selects the content-free
 doorbell:
 
 ```text
-cyclops inbox claim m-7fe0df
+cyclops inbox claim m-7fe0df #c:<lossless-attempt-token>
 ```
+
+The shell comment is a 22-character URL-safe encoding of the complete 128-bit
+notification attempt id. It parses back to the typed id. This keeps the claim
+command runnable while preventing a delayed hook for an older attempt on the
+same message from confirming its replacement.
 
 If that exact capability is absent, outdated, edited, unreadable, or changes
 before the write, the daemon submits the canonical full payload ending in
@@ -266,39 +330,85 @@ before the write, the daemon submits the canonical full payload ending in
 `message_delivered_direct`; it does not append `message_claimed` and has no
 claimant.
 
-The notification states are `not_started`, `queued`, `gating`, `writing`,
-`staged`, `submitted`, `notified`, `attention_required`, and `superseded`.
+The compatibility wire states are `not_started`, `queued`, `gating`, `writing`,
+`staged`, `submitted`, `notified`, `attention_required`, and `superseded`. This
+closed vocabulary remains decodable by older clients. A pre-write claim
+settlement reports `not_started`; a post-write exact clear reports `staged`.
+Both add `settlement: "withdrawn_by_claim"` in `messages.snapshot`. A send
+receipt uses the parallel additive field
+`notification_settlement: "withdrawn_by_claim"`. The internal states remain
+`withdrawn` and `withdrawn_after_staging`; `submitting` also reports `staged`
+until terminal IO succeeds. `superseded` is reserved for actual message
+replacement.
 An ambiguous terminal outcome moves to `attention_required` and never triggers
 an automatic second write. A doorbell message remains pending until claim. A
 successful direct fallback settles the mailbox entry as `delivered_direct`.
+For a current format 2 doorbell with a complete binding, an exact recipient
+claim can start reconciliation of `attention_required` with cause `ack_timeout`.
+The claim leaves that state and its FIFO barrier unchanged until Cyclops clears
+the exact staged doorbell or proves the same bound composer is clean. One
+dedicated fact then moves the attempt to `notified` and retires the barrier
+atomically. It does not settle other attention causes or prove task completion.
+
+A current format 2 `verify_failed` doorbell with a complete binding enters
+automatic exact-owned recovery only when the current normalized composer is an
+exact match and terminal action is safe. A pending mailbox selects `complete`
+and one submit key. An exact recipient claim ordered after `writing` selects
+`discard` and the manifest's measured clear sequence. Selection and durable
+intent are one mailbox transaction, so a concurrent claim lands wholly before
+or after that boundary. Any changed binding, human or trailing text, modal, or
+unprovable content leaves one attention item and sends no key.
 Admin has no pane route, so an accepted admin message reports `not_started` and
 remains in the durable admin inbox without a notification attempt.
 
 The Writing transition carries `transport: "doorbell" | "direct_payload"`
-beside `binding`. A current doorbell also carries `doorbell_format: 1`, which
-fixes the compact claim command bytes for later recovery. A missing format
-identifies the original verbose doorbell. Unknown numeric formats replay but
-cannot authorize an attention recovery action. Binding contains recipient,
-foreground leader generation, agent generation, and manifest only. Transport
-and doorbell format are delivery metadata, not occupant identity. Later
-transitions retain the projected values without repeating them. A Writing fact
-with no transport means the original doorbell format.
+beside `binding`. A current doorbell also carries `doorbell_format: 2`, which
+fixes the attempt-bound claim command bytes for later recovery. Format 1 is the
+older message-only compact claim command. A missing format identifies the
+original verbose doorbell. Unknown numeric formats replay but cannot authorize
+an attention recovery action. Current binding records contain
+the recipient, pane-root generation, foreground leader generation, admitted
+agent generation, and manifest. Older rows without pane-root or leader
+generation replay but cannot authorize a later terminal action. Transport and
+doorbell format are delivery metadata, not occupant identity. Later transitions
+retain the projected values without repeating them. A Writing fact with no
+transport means the original doorbell format.
+
+Current `notification_resolved` facts carry `proof_version: 1`. Version 1
+requires the matching terminal-action intent and the resolution-specific
+action and consumption evidence. A missing proof version is accepted only for
+historical format 1 or older doorbells and legacy direct payloads with the
+incomplete process binding. This compatibility path cannot authorize a new
+terminal action. Replay also accepts the historical direct `staged` to
+`submitted` edge for those same records. Live writes still require the current
+`submitting` boundary.
 
 `writing` is also the durable composer-barrier boundary. Its content-free
-binding records the exact recipient, agent process generation, manifest, and,
-for current rows, foreground leader. Older rows without a leader still arm the
-barrier. A later `writing` compacts an older barrier only for the same exact
-recipient.
+binding records the exact recipient, pane-root generation, foreground leader
+generation, admitted agent generation, and manifest. Older incomplete rows
+still arm the barrier but cannot authorize Enter or exact-clear recovery. A
+later `writing` compacts an older barrier only for the same exact recipient.
 
-After a daemon restart, only `notified`, which carries receipt proof, may retire
-from a fresh clean screen for the same agent generation and manifest. Earlier
-post-write states and `attention_required` restore a hold first. A recovered
-hold can then bind an exact manifest-declared turn observed after restart. Its
-matching end and a later fresh clean screen produce a content-free
-`notification_barrier_retired` fact before the runtime hold is released.
-Foreground leader changes do not change composer ownership; operator terminal
+Outside the compatibility path below, after a daemon restart only `notified`,
+which carries receipt proof, or an
+exact staged-claim clearance may retire from a fresh clean screen for the same
+composer occupant. Earlier post-write states and `attention_required` restore a
+hold first. A recovered hold can then bind an exact manifest-declared turn
+observed after restart. Its matching end and a later fresh clean screen produce
+a content-free `notification_barrier_retired` fact before the runtime hold is
+released.
+One upgrade-only compatibility path handles a stable `attention_required` or
+`notified` format 1 or original doorbell whose `writing` fact lacks a pane-root
+generation. The exact durable recipient claim must follow that attempt's
+`writing` fact, and the same recipient and manifest must prove a semantic
+`clean` composer with exact visible empty extraction. Cyclops then appends only
+`notification_barrier_retired` with cause
+`recipient_claimed_composer_clear`. It sends no terminal key, clears no bytes,
+leaves the mailbox `claimed` and preserves the historical notification state,
+and proves retrieval only. Legacy direct payloads do not qualify.
+Foreground leader changes do not change composer ownership; guarded terminal
 actions still require the exact recorded leader. Agent-generation or manifest
-replacement, explicit operator resolution, and proven physical pane loss are
+replacement, guarded resolution, and proven physical pane loss are
 the other retirement paths. Session-local pane removal alone is not pane loss.
 
 ### mailbox and notification control
@@ -331,7 +441,29 @@ mailbox entry, and returns the immutable payload:
 Reclaiming the same id returns `already_claimed` with the same payload and
 appends no second claim. An entry that is no longer claimable returns
 `message_not_pending`; a subscribed receive client should list again within its
-original deadline. A claim proves retrieval, not task completion.
+original deadline. A pre-write wake becomes `withdrawn`. A claim at `staged`
+does not prove Enter. Cyclops must re-prove the exact doorbell and complete
+binding, clear those bytes once, and positively identify a visible empty
+composer under the same manifest and binding. One
+`notification_claimed_staged_cleared` fact then changes the state to
+`withdrawn_after_staging` and retires the exact composer barrier together. If
+that append fails, both projections remain unchanged and Cyclops repeats only
+the idempotent settlement once. A second failure keeps the exact worker and
+FIFO barrier active under `notification_settlement_storage_failed`; it does
+not repeat clear or Enter. Recovery is `cyclops health`, repair state storage,
+then restart the daemon. Restart recovery may settle a claimed durable
+`staged` attempt whose doorbell is already gone only when the current manifest
+wins a `composer_semantic = "clean"` rule and exact extraction returns visible
+empty bytes under the same complete process binding. Unsupported, unprovable,
+hidden, or nonempty composer content remains ambiguous. A claim at `submitting`
+succeeds once, but the reserved terminal key may still submit the same message
+id. `Submitting` is appended under the workspace journal lock before terminal
+IO and is the linearization point against claim. It is not proof that a key was
+sent. Only an actual `submitted` doorbell can then advance to `notified`.
+`Writing`, direct-payload post-write states, and the `attention_required`
+notification state are unchanged by claim. The upgrade-only path above may
+retire its barrier, but it never hides or resolves the terminal outcome. A
+claim proves retrieval, not task completion.
 
 `messages.snapshot` returns one atomic body-free projection for the
 authenticated caller. Agents see only messages they sent or received. The
@@ -340,7 +472,8 @@ returned along with a bounded recent settled tail controlled by
 `recent_settled` (default 20, maximum 100). Counts cover every visible message,
 including settled rows outside that tail. Rows carry per-recipient mailbox and
 FIFO state, current notification attempt and cause, attention clearance,
-operator resolution, uncertain resolution intent, and a workspace sequence
+guarded resolution, pre-key intent, accepted-action and consumption state, and
+a workspace sequence
 watermark. A notification resolution is reported separately as `complete` or
 `discard`; a resolved attempt is not open attention. Direction is relative to
 the caller: `inbound`, `outbound`, `self_addressed`, or administrator-only
@@ -354,7 +487,25 @@ attempt. `needs_action` applies the same rule to each returned row.
 Per-recipient `can_manage_attention` is the daemon-owned authority for an
 operator action on that exact row. It defaults false for older records and is
 false for non-administrators, resolved or cleared attempts, and uncertain
-resolution intent. A client must not infer it from `needs_action`.
+resolution intent. This field governs fresh attention actions. A
+`resolution_intent` records only the pre-key boundary. It never proves that a
+terminal action was accepted. A matching `resolution_action_accepted` permits
+only the same action to recover. Complete additionally requires
+`resolution_consumption_observed` before it may enter no-key reconciliation.
+A Complete intent without accepted-action evidence, or an accepted Complete
+without consumption evidence, permits neither a retry nor reconciliation. A
+matching intent-only Discard exposes only no-key reconciliation. It does not
+require a Working observation because two fresh exact-empty and binding checks
+prove its requested effect. The opposite action remains unavailable. A client
+must not infer authority from `needs_action`.
+
+`messages.follow` is the lossless event-driven companion to the bounded queue
+snapshot. The authenticated caller supplies `after_seq` and a bounded `limit`.
+The daemon returns only body-free rows visible to that caller, plus the verified
+`through_seq` cursor and `has_more`. A follower advances only to `through_seq`
+and immediately requests the next page while `has_more` is true. Labels are
+display metadata. Active filters bind to durable recipient keys before waiting,
+so a rename cannot strand or retarget a watch.
 
 A recipient with no notification attempt reports `not_started`; the read model
 never invents a queued attempt. Per-recipient `available` comes from the current
@@ -383,6 +534,12 @@ the same methods above. The `admin_unread` status field is its pending count.
 Broadcast `*` addresses adopted agent panes only.
 
 `msg.requeue` takes one `message_id`. `alarm.preview` takes `older_than_ms`.
+Before minting fresh attempts, requeue resolves the complete selected recipient
+set. A current format 2 `verify_failed` composer barrier must be resolved first.
+If any selected attempt owns such an exact barrier, or a post-write barrier
+whose binding is absent or lacks pane-root or foreground-leader generation, the
+whole request returns `conflict` and appends nothing. The existing attempt remains
+visible and claimable.
 `alarm.clear` takes a non-empty list of explicit alarm ids; there is no
 clear-all or age-selected daemon mutation. The human CLI implements
 `alarm clear --older-than <age>` by calling preview once, printing the exact
@@ -406,15 +563,38 @@ are never journaled, logged, or emitted as events.
 requires all five checks again immediately before the submit key. Discard uses
 the same guarded clear sequence when the exact notification remains staged.
 When a fresh screen rule proves the composer empty, discard instead requires
-the recorded process and manifest bindings plus terminal safety, rechecks them
-before recording the resolution, and sends no terminal key. A hidden or typed
-composer never qualifies for that path. Before either resolution path, the
-daemon appends a content-free `notification_resolution_intent` fact. A known
-refusal before a terminal key or no-key resolution appends
-`notification_resolution_intent_withdrawn` and may be retried. An accepted
-key or no-key resolution is followed by one content-free
-`notification_resolved` fact. An unmatched intent reports an uncertain
-outcome and must not be repeated. Repeated or ambiguous resolutions refuse.
+the recorded process and manifest bindings, a manifest-owned
+`composer_semantic = "clean"` rule, exact visible empty composer extraction,
+and terminal safety. It rechecks them before recording the resolution and sends
+no terminal key. Unsupported extraction, hidden content, an unprovable layout,
+or typed content never qualifies. Before a terminal-key action, the daemon
+appends a content-free `notification_resolution_intent` fact. A known refusal
+before the key appends `notification_resolution_intent_withdrawn` and may be
+retried. When the
+terminal accepts the action key, the daemon appends a content-free
+`notification_resolution_action_accepted` fact. Acceptance is not composer
+consumption or settlement. A fresh Complete must then observe either an
+authenticated exact-payload receipt from the same binding or an exact
+recipient claim ordered after this action. A generic Working edge is not
+message correlation. The daemon appends a content-free
+`notification_resolution_consumption_observed` fact. It finally requires fresh
+exact-binding and visible-empty composer proof. A keyed Discard requires the
+accepted action and the same final empty-composer proof. A no-key Discard
+instead requires two current positive empty-composer observations, then
+appends one atomic `notification_resolved_without_terminal_action` fact with
+no prior intent on a fresh path. The same atomic path may settle a matching
+intent-only Discard and still sends no key. Terminal-key settlement appends
+`notification_resolved`.
+Missing evidence leaves the attention
+item and composer barrier open and never sends a second key. A later call may
+reconcile Complete without a key only when the matching intent,
+accepted-action, and consumption facts exist. Keyed Discard needs matching
+intent and accepted-action facts; intent-only Discard uses the exact-empty
+atomic path above. An intent-only or accepted-but-unconsumed Complete
+remains uncertain even if the composer later looks empty. Exact staged bytes,
+typed or trailing content, hidden or unprovable content, a modal, or a changed
+binding keep the action unresolved. A call requesting the other resolution
+refuses.
 
 ### msg.history and msg.thread
 
@@ -780,10 +960,11 @@ jq -c 'select(.id == "m-914b34")' \
 ```
 
 This journal holds immutable message bodies, mailbox mutations, notification
-transitions, composer-barrier retirement facts, and operator recovery facts.
+transitions, composer-barrier retirement facts, and guarded recovery facts.
 Barrier retirement records one of exact lifecycle reconciliation, clean
-receipt-bearing composer observation, occupant replacement, or proven physical
-pane loss. Notification facts and events are content-free. `msg.history`,
+receipt-bearing composer observation, recipient-claimed legacy clean-composer
+reconciliation, occupant replacement, or proven physical pane loss.
+Notification facts and events are content-free. `msg.history`,
 `msg.thread`, and `messages.snapshot` apply the authenticated caller's
 visibility rules rather than exposing raw journal bytes.
 

@@ -5,6 +5,27 @@ versions are unreleased until admin cuts a tag.
 
 ## [Unreleased]
 
+### Added
+
+- Durable workspace mailboxes now separate immutable messages, recipient claims,
+  one-shot wake notifications, and reply threads. `cyclops inbox next` can wait
+  and claim over the socket without touching a terminal composer.
+- `cyclops messages` and the Messages view show one body-free row per message
+  recipient, with mailbox and wake state kept separate. Runtime status now
+  reports composer ownership, write readiness, notification state, mailbox
+  state, and the next action when those facts differ.
+- Workspace administrators can inspect and recover exact notification attempts
+  with alarm preview and clearance, guarded complete or discard, explicit
+  requeue, and provably pre-write notification withdrawal. A fresh same-user
+  shell can perform this work without pretending to be an agent pane.
+- `cyclops health` reports selected binaries, daemon identity, state safety,
+  setup, caches, update scratch, and rollback evidence without changing them.
+  `cyclops cleanup` removes only validated rebuildable asset classes and is a
+  dry run unless `--apply` is present.
+- Installation and update activate a matched CLI and daemon pair. Update proves
+  build identity and journal replay before activation, preserves one validated
+  known-good pair, and supports `cyclops update --rollback`.
+
 ### Changed
 
 - `cyclops send` no longer advertises the nonfunctional `--wait` option.
@@ -21,14 +42,19 @@ versions are unreleased until admin cuts a tag.
 
 ### Fixed
 
-- Mailbox doorbells now fit the validated 60-column terminal lane. The former
-  129-character row could be application-wrapped by Claude at 125 columns,
-  which correctly made exact staging verification refuse the submit key. The
-  new format is the exact 54-character `cyclops inbox claim <id>` command for a
-  generated message id. Its numeric format is recorded at the write boundary,
-  legacy rows remain recoverable, and unknown future formats fail closed.
-  Claude's measured status truncation at 60, 80, 100, and 125 columns is
-  recognized without weakening the required prompt, styling, or trailer checks.
+- Doorbell v2 is an attempt-bound claim command. Its shell-comment suffix
+  losslessly encodes the complete 128-bit notification attempt id, while the
+  command itself remains runnable. The format fits two 60-column rows, is
+  recorded at the write boundary, and can be reconstructed exactly during
+  recovery. Legacy doorbell formats remain recoverable and unknown future
+  formats fail closed.
+- Notification workers expose and durably classify their exact in-flight
+  attempt. Repeated identical pre-write failures settle once with a named cause
+  instead of looping, and a worker crash cannot silently lose the recipient FIFO
+  head.
+- Durable routes and replies use endpoint and process-generation identity rather
+  than mutable display labels. Unknown watch filters fail immediately, and a
+  socket claim can break the former receive-tool and terminal-gate cycle.
 - Codex working-state detection now uses the measured ten-frame active pane
   title when queued terminal input displaces the screen spinner. Static titles
   keep using the existing narrow screen rule.
@@ -50,6 +76,11 @@ versions are unreleased until admin cuts a tag.
   artifacts whose recorded binary is gone, prints what it changed, and
   still never touches an edited file, an unreceipted file, or a copy
   merged into vendor config (those are named instead).
+
+## Historical pre-release development record
+
+The entries below preserve the implementation chronology. They are historical
+context, not the current release summary or a source of product semantics.
 
 ### Added (v7)
 

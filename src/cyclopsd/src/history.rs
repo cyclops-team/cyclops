@@ -480,6 +480,7 @@ pub(crate) fn open_from(
     files: &[Vec<LedgerLine>],
     workspace_file: Option<usize>,
 ) -> Vec<OpenDelivery> {
+    let recipients = delivery_recipients(files);
     let mut out = Vec::new();
     for msg in merge_files(files, workspace_file) {
         for d in &msg.deliveries {
@@ -490,6 +491,9 @@ pub(crate) fn open_from(
                 out.push(OpenDelivery {
                     id: msg.id.clone(),
                     to: d.to.clone(),
+                    recipient: recipients
+                        .get(&(msg.id.clone(), d.to.clone()))
+                        .map(|(_, recipient)| *recipient),
                     state: d.state,
                     ts: d.ts,
                     cause: d.cause.clone(),
@@ -498,6 +502,41 @@ pub(crate) fn open_from(
         }
     }
     out
+}
+
+/// New delivery transition rows carry an immutable recipient beside the
+/// presentation label. Fold the newest valid key without changing the
+/// legacy delivery record shape.
+fn delivery_recipients(
+    files: &[Vec<LedgerLine>],
+) -> HashMap<(String, String), ((u64, u64), RecipientKey)> {
+    let mut recipients = HashMap::new();
+    for line in files.iter().flatten() {
+        if line.kind != Kind::State {
+            continue;
+        }
+        let Some(data) = &line.data else { continue };
+        if data.get("to_state").is_none() {
+            continue;
+        }
+        let (Some(to), Ok(recipient)) = (
+            data.get("to").and_then(Value::as_str),
+            serde_json::from_value::<RecipientKey>(
+                data.get("recipient").cloned().unwrap_or(Value::Null),
+            ),
+        ) else {
+            continue;
+        };
+        let key = (line.id.clone(), to.to_string());
+        let rank = (line.ts, line.seq);
+        if recipients
+            .get(&key)
+            .is_none_or(|(current, _)| rank >= *current)
+        {
+            recipients.insert(key, (rank, recipient));
+        }
+    }
+    recipients
 }
 
 /// Order lines oldest first. ts is the cross-file comparator; seq breaks

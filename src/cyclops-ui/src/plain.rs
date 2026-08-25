@@ -17,13 +17,14 @@ use std::path::Path;
 
 use crate::app::{App, View};
 use crate::data::{self, UiMsg};
+use crate::messages::MessageFollower;
 use crate::stream::{Entry, Intake};
 use crate::theme::Theme;
 use crate::UiOptions;
 
 pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    data::spawn_io(&tx, home, opts.backfill);
+    let io = data::spawn_io(&tx, home, opts.backfill);
     let view = if opts.firehose {
         View::Firehose
     } else {
@@ -31,6 +32,7 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
     };
     let mut app = App::new(Theme::none(), view, opts.filter());
     let mut intake = Intake::new();
+    let mut message_follower = MessageFollower::default();
     // The last eye line printed, so a change prints exactly once.
     let mut eye_printed: Option<Vec<String>> = None;
     // A lost connection ends the follow, but only after the backfill has
@@ -40,15 +42,44 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
 
     while let Some(msg) = rx.recv().await {
         match msg {
-            // Plain output has no messages surface yet. Dropping the
-            // snapshot keeps this stream line-oriented rather than
-            // half-rendering a list it cannot navigate.
-            UiMsg::Messages { .. }
-            | UiMsg::MessagesFailed { .. }
-            | UiMsg::MessagesChanged(_)
-            | UiMsg::MessagesRouteChanged
-            | UiMsg::Subscribed
-            | UiMsg::ActionDone { .. } => {}
+            UiMsg::Subscribed => {
+                app.conn_lost = false;
+                app.refresh.connected();
+                message_follower.connected();
+            }
+            UiMsg::MessagesChanged(changed) => {
+                message_follower.changed(&changed);
+                app.refresh.messages_changed(&changed);
+            }
+            UiMsg::MessagesRouteChanged => app.refresh.mark_dirty(),
+            UiMsg::Messages { request, snapshot } => apply_messages_snapshot(
+                &mut app,
+                &mut message_follower,
+                request,
+                &snapshot,
+                &mut stdout,
+            ),
+            UiMsg::MessagesFailed { request, why } => {
+                if app.refresh.finish_failure(request) {
+                    eprintln!("messages unavailable: {why}");
+                }
+            }
+            UiMsg::MessagesFollow { request, page } => {
+                match message_follower.finish(request, &page) {
+                    Ok(entries) => {
+                        for entry in entries {
+                            live(&mut app, entry, &mut stdout);
+                        }
+                    }
+                    Err(why) => eprintln!("messages follow unavailable: {why}"),
+                }
+            }
+            UiMsg::MessagesFollowFailed { request, why } => {
+                if message_follower.failed(request) {
+                    eprintln!("messages follow unavailable: {why}");
+                }
+            }
+            UiMsg::ActionDone { .. } => {}
             UiMsg::Entry(e) => {
                 for e in intake.entry(*e) {
                     live(&mut app, e, &mut stdout);
@@ -75,14 +106,34 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
                     seed_status(&mut app, *seed, &mut stdout);
                 }
             }
-            UiMsg::ConnLost(text) => lost = Some(text),
+            UiMsg::ConnLost(text) => {
+                app.conn_lost = true;
+                app.refresh.disconnected();
+                message_follower.disconnected();
+                lost = Some(text);
+            }
             // TUI-only traffic. Plain mode holds no theme at all
             // (`Theme::none`, this is the screen-reader mode), so a theme
             // switch has nothing here to move.
+            UiMsg::BuildHealth(health) => {
+                if let Some(notice) = health.notice() {
+                    eprintln!("{notice}");
+                }
+            }
             UiMsg::Key(_) | UiMsg::Notice(_) | UiMsg::EyeTick | UiMsg::ThemeChanged => {}
         }
         eye_line(&app, &mut eye_printed, &mut stdout);
         let _ = stdout.flush();
+        if let Some(request) = app.wants_messages() {
+            if io.refresh.send(request).is_err() {
+                return 1;
+            }
+        }
+        if let Some(request) = message_follower.begin() {
+            if io.follow.send(request).is_err() {
+                return 1;
+            }
+        }
         if let Some(text) = &lost {
             if intake.is_backfilled() {
                 eprintln!("{text}");
@@ -91,6 +142,19 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
         }
     }
     0
+}
+
+fn apply_messages_snapshot(
+    app: &mut App,
+    follower: &mut MessageFollower,
+    request: crate::messages::RefreshRequest,
+    snapshot: &cyclops_proto::MessagesSnapshotResult,
+    _out: &mut impl Write,
+) {
+    if !app.apply_messages_response(request, snapshot) {
+        return;
+    }
+    follower.baseline(snapshot);
 }
 
 /// Apply the startup reconciliation, printing the lines it wrote for items
@@ -171,8 +235,13 @@ fn eye_line(app: &App, printed: &mut Option<Vec<String>>, out: &mut impl Write) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stream::{EntryKind, Filter};
-    use cyclops_proto::AgentState;
+    use crate::stream::{EndpointFilter, EntryKind, Filter};
+    use cyclops_proto::{
+        AgentState, Kind, MailboxEntryState, MessageDirection, MessageId, MessageNotificationState,
+        MessageNotificationSummary, MessageRecipientSummary, MessageSnapshotRow,
+        MessagesChangedArea, MessagesChangedData, MessagesFollowResult, MessagesSnapshotCounts,
+        MessagesSnapshotResult, RecipientKey, SessionInstanceId, TmuxPaneId, WorkspaceId,
+    };
 
     fn state(target: &str, s: AgentState) -> Entry {
         Entry {
@@ -182,6 +251,7 @@ mod tests {
             id: Some("e-1".into()),
             kind: EntryKind::State {
                 target: target.into(),
+                recipient: None,
                 session_idx: 0,
                 pane_id: None,
                 state: s,
@@ -228,11 +298,165 @@ mod tests {
             kind: EntryKind::Msg {
                 from: from.into(),
                 to: to.iter().map(|t| t.to_string()).collect(),
+                endpoints: None,
                 subject: subject.into(),
                 body: body.map(String::from),
                 fyi: false,
             },
         }
+    }
+
+    fn workspace() -> WorkspaceId {
+        "00000000-0000-0000-0000-000000000001".parse().unwrap()
+    }
+
+    fn agent(pane: &str) -> RecipientKey {
+        RecipientKey::agent(
+            workspace(),
+            "00000000-0000-0000-0000-000000000002"
+                .parse::<SessionInstanceId>()
+                .unwrap(),
+            pane.parse::<TmuxPaneId>().unwrap(),
+        )
+    }
+
+    fn snapshot(seq: u64, rows: Vec<MessageSnapshotRow>) -> MessagesSnapshotResult {
+        MessagesSnapshotResult {
+            workspace_id: workspace(),
+            workspace_seq: seq,
+            counts: MessagesSnapshotCounts {
+                visible_messages: rows.len() as u64,
+                returned_messages: rows.len() as u64,
+                inbox_messages: rows.len() as u64,
+                outbound_messages: 0,
+                work_messages: rows.len() as u64,
+                active_messages: rows.len() as u64,
+                settled_messages: 0,
+                pending_entries: rows.len() as u64,
+                claimed_entries: 0,
+                open_attention_entries: 0,
+            },
+            rows,
+        }
+    }
+
+    fn durable_message(seq: u64, sender_label: &str) -> MessageSnapshotRow {
+        let id = MessageId::new(format!("m-{seq}")).unwrap();
+        MessageSnapshotRow {
+            message_id: id.clone(),
+            seq,
+            ts: 43_471_000,
+            kind: Kind::Msg,
+            direction: MessageDirection::Inbound,
+            sender: agent("%1"),
+            sender_label: sender_label.into(),
+            recipients: vec![MessageRecipientSummary {
+                recipient: agent("%2"),
+                label: "codey".into(),
+                direction: MessageDirection::Inbound,
+                needs_action: true,
+                can_manage_attention: false,
+                can_withdraw_notification: false,
+                current_route: None,
+                available: true,
+                mailbox: MailboxEntryState::Pending,
+                fifo_position: Some(1),
+                notification: MessageNotificationSummary {
+                    state: MessageNotificationState::NotStarted,
+                    quota_state: None,
+                    settlement: None,
+                    operator_withdrawn: None,
+                    attempt_id: None,
+                    cause: None,
+                    pre_write_cause: None,
+                    attention_cleared: None,
+                    resolution: None,
+                    resolution_intent: None,
+                    resolution_action_accepted: None,
+                    resolution_consumption_observed: None,
+                    updated_at: None,
+                },
+            }],
+            subject: Some("new durable work".into()),
+            reply_to: None,
+            thread_root: id,
+            thread_message_count: 1,
+            active: true,
+            needs_action: true,
+        }
+    }
+
+    #[test]
+    fn a_settled_burst_larger_than_the_queue_tail_wakes_after_a_rename() {
+        let sender = agent("%1");
+        let mut app = App::new(
+            Theme::none(),
+            View::Admin,
+            Filter {
+                from: Some(EndpointFilter::new(sender, "gemini")),
+                ..Filter::default()
+            },
+        );
+        let mut follower = MessageFollower::default();
+        let mut out = Vec::new();
+
+        app.refresh.connected();
+        let baseline = app.wants_messages().unwrap();
+        apply_messages_snapshot(
+            &mut app,
+            &mut follower,
+            baseline,
+            &snapshot(1, Vec::new()),
+            &mut out,
+        );
+        assert!(out.is_empty(), "the baseline must not replay as live news");
+
+        let changed = MessagesChangedData {
+            workspace_id: workspace(),
+            workspace_seq: 30,
+            changed: [MessagesChangedArea::Messages].into_iter().collect(),
+        };
+        follower.changed(&changed);
+        app.refresh.messages_changed(&changed);
+        let request = app.wants_messages().unwrap();
+        let all: Vec<_> = (2..=26)
+            .map(|seq| durable_message(seq, "gemini-renamed"))
+            .collect();
+        // The queue keeps only its bounded settled tail. Follow uses its
+        // own cursor page and must still emit every earlier arrival.
+        apply_messages_snapshot(
+            &mut app,
+            &mut follower,
+            request,
+            &snapshot(30, all.iter().skip(5).cloned().collect()),
+            &mut out,
+        );
+        assert!(out.is_empty(), "queue replacement is not a live feed");
+
+        let request = follower.begin().expect("the durable cursor is behind");
+        let entries = follower
+            .finish(
+                request,
+                &MessagesFollowResult {
+                    workspace_id: workspace(),
+                    after_seq: 1,
+                    through_seq: 30,
+                    has_more: false,
+                    rows: all,
+                },
+            )
+            .unwrap();
+        for entry in entries {
+            live(&mut app, entry, &mut out);
+        }
+
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("gemini-renamed → codey"), "{rendered}");
+        assert_eq!(
+            rendered.matches("new durable work").count(),
+            25,
+            "{rendered}"
+        );
     }
 
     /// --plain is the screen-reader mode, so it must never carry less
@@ -277,9 +501,11 @@ mod tests {
                 panes: Vec::new(),
                 roster: Vec::new(),
                 admin_unread: 0,
+                mailbox_routes: Vec::new(),
                 open: vec![cyclops_proto::OpenDelivery {
                     id: "m-park".into(),
                     to: "implementer".into(),
+                    recipient: None,
                     state: cyclops_proto::DeliveryState::ParkedBlockedQuota,
                     ts: 43_471_000,
                     cause: Some("blocked_quota".into()),
@@ -343,6 +569,7 @@ mod tests {
             id: Some("m-1".into()),
             kind: EntryKind::Delivery {
                 to: "reviewer".into(),
+                recipient: None,
                 state: cyclops_proto::DeliveryState::AttentionRequired,
                 cause: None,
             },

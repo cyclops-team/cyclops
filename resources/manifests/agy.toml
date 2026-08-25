@@ -25,7 +25,9 @@ config_mechanism = ".agents/hooks.json in the customization root"
 config_shape = "named hooks: { \"<name>\": { \"<Event>\": [...] } }"
 available = ["PreToolUse", "PostToolUse", "PreInvocation", "PostInvocation", "Stop"]
 turn_start = "PreInvocation"
+turn_start_evidence = "confirmed"
 turn_end = "Stop"
+turn_end_evidence = "confirmed"
 payload_encoding = "camelCase protojson"
 payload_common_fields = [
   "conversationId", "workspacePaths", "transcriptPath",
@@ -69,6 +71,7 @@ evidence = "MEASURED: title == 'mac' at idle and during turns"
 [[rule]]
 id = "composer_empty"
 state = "idle"
+composer_semantic = "clean"
 priority = 1000
 region = "bottom_non_empty_lines(4)"
 line_regex = ['^\s*>\s*$']
@@ -78,6 +81,7 @@ evidence = "MEASURED agy idle capture"
 [[rule]]
 id = "composer_has_input"
 state = "idle_with_input"
+composer_semantic = "human_input"
 priority = 1050
 region = "bottom_non_empty_lines(4)"
 line_regex = ['^\s*>\s+\S']

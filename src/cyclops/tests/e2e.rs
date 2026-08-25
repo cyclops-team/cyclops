@@ -28,7 +28,44 @@ fn scratch_home(tag: &str) -> PathBuf {
 }
 
 fn hello(proto: u32) -> Value {
-    json!({"cyclops": "0.1.0", "proto": proto, "boot_id": "b-e2e"})
+    json!({
+        "cyclops": "0.1.0",
+        "build": env!("CYCLOPS_BUILD_REF"),
+        "proto": proto,
+        "boot_id": "b-e2e"
+    })
+}
+
+/// Kernel start time of a pid, or None when the process is gone.
+#[cfg(target_os = "macos")]
+fn birth_of(pid: u32) -> Option<u64> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            size,
+        )
+    };
+    if rc != size {
+        return None;
+    }
+    Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+}
+
+#[cfg(target_os = "linux")]
+fn birth_of(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = stat.rsplit_once(')')?.1;
+    after.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn birth_of(_pid: u32) -> Option<u64> {
+    None
 }
 
 /// Serve one connection: write the hello line, then answer each request
@@ -83,6 +120,25 @@ fn run_cyclops(home: &Path, args: &[&str]) -> Output {
     run_cyclops_io(home, &[], args, None)
 }
 
+/// Copy the built client into an isolated executable pair.
+///
+/// The daemon stand-in is never started by the restart refusal test. It only
+/// provides the executable identity that the client authenticates.
+fn paired_client(directory: &Path) -> (PathBuf, PathBuf) {
+    fs::create_dir(directory).unwrap();
+    let source = Path::new(env!("CARGO_BIN_EXE_cyclops"));
+    let client = directory.join("cyclops");
+    let daemon = directory.join("cyclopsd");
+    for destination in [&client, &daemon] {
+        fs::copy(source, destination).unwrap();
+        fs::set_permissions(destination, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    (
+        fs::canonicalize(client).unwrap(),
+        fs::canonicalize(daemon).unwrap(),
+    )
+}
+
 fn assert_json_failure(out: &Output, exit: i32, expected: Value) {
     assert_eq!(out.status.code(), Some(exit));
     assert!(
@@ -110,7 +166,23 @@ fn run_cyclops_io(
     args: &[&str],
     stdin: Option<&str>,
 ) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cyclops"));
+    run_cyclops_binary_io(
+        Path::new(env!("CARGO_BIN_EXE_cyclops")),
+        home,
+        envs,
+        args,
+        stdin,
+    )
+}
+
+fn run_cyclops_binary_io(
+    binary: &Path,
+    home: &Path,
+    envs: &[(&str, &str)],
+    args: &[&str],
+    stdin: Option<&str>,
+) -> Output {
+    let mut cmd = Command::new(binary);
     cmd.env("CYCLOPS_HOME", home)
         .env_remove("CYCLOPS_AGENT")
         .env_remove("TMUX")
@@ -139,6 +211,7 @@ fn run_cyclops_io(
 fn canned_status() -> Value {
     json!({
         "daemon_version": "0.1.0",
+        "daemon_build": env!("CYCLOPS_BUILD_REF"),
         "proto": 1,
         "boot_id": "b-e2e",
         "uptime_ms": 120_000,
@@ -169,6 +242,42 @@ fn canned_status() -> Value {
                 }
             ]
         }],
+        "mailbox_routes": [
+            {
+                "recipient": {
+                    "kind": "admin",
+                    "workspace_id": "00000000-0000-0000-0000-000000000001"
+                },
+                "label": "admin"
+            },
+            {
+                "recipient": {
+                    "kind": "agent",
+                    "workspace_id": "00000000-0000-0000-0000-000000000001",
+                    "session_instance_id": "00000000-0000-0000-0000-000000000002",
+                    "pane_id": "%1"
+                },
+                "label": "reviewer"
+            },
+            {
+                "recipient": {
+                    "kind": "agent",
+                    "workspace_id": "00000000-0000-0000-0000-000000000001",
+                    "session_instance_id": "00000000-0000-0000-0000-000000000002",
+                    "pane_id": "%2"
+                },
+                "label": "implementer"
+            },
+            {
+                "recipient": {
+                    "kind": "agent",
+                    "workspace_id": "00000000-0000-0000-0000-000000000001",
+                    "session_instance_id": "00000000-0000-0000-0000-000000000002",
+                    "pane_id": "%4"
+                },
+                "label": "%4"
+            }
+        ],
         // What a real daemon answers with. %4 above is the reason it
         // matters: the grid labels that pane unknown, and only this field
         // says whether the machine has no manifests at all or three that
@@ -646,24 +755,50 @@ fn daemon_restart_against_an_older_daemon_names_the_one_time_fix() {
     let _ = fs::remove_dir_all(&home);
 }
 
-/// A restart never interrupts a delivery past the paste: a not-quiet
-/// quiesce answer refuses the whole verb, names what is moving, and no
-/// stop is attempted (the canned server would have seen its request).
+/// A restart never interrupts a delivery past the paste. A refused shutdown
+/// names what is moving and does not signal the authenticated daemon.
 #[test]
 fn daemon_restart_refuses_while_mid_flight() {
     let home = scratch_home("rmf");
-    serve_once(&home, hello(1), |req| {
-        assert_eq!(req["method"], "daemon.quiesce", "{req}");
-        (
-            vec![json!({
-                "id": req["id"],
-                "result": {"quiet": false, "in_flight": ["m-abc123 -> codex"]},
-            })
-            .to_string()],
-            true,
-        )
+    let (client, daemon) = paired_client(&home.join("bin"));
+    let pid = std::process::id();
+    let birth = birth_of(pid).expect("observe test process generation");
+    let process = json!({"pid": pid, "birth": birth});
+    let daemon_executable = daemon.display().to_string();
+    let hello_line = json!({
+        "cyclops": "0.1.0",
+        "build": env!("CYCLOPS_BUILD_REF"),
+        "daemon_process": process.clone(),
+        "daemon_executable": daemon_executable.clone(),
+        "proto": 1,
+        "boot_id": "b-e2e"
     });
-    let out = run_cyclops(&home, &["daemon", "restart"]);
+    let mut status = canned_status();
+    status["daemon_process"] = process.clone();
+    status["daemon_executable"] = json!(daemon_executable);
+    serve_once(&home, hello_line, move |req| match req["method"].as_str() {
+        Some("status") => (
+            vec![json!({"id": req["id"], "result": status.clone()}).to_string()],
+            false,
+        ),
+        Some("daemon.shutdown") => {
+            assert_eq!(req["params"]["daemon_process"], process, "{req}");
+            assert_eq!(req["params"]["boot_id"], "b-e2e", "{req}");
+            (
+                vec![json!({
+                    "id": req["id"],
+                    "result": {
+                        "stopping": false,
+                        "in_flight": ["m-abc123 -> codex"]
+                    },
+                })
+                .to_string()],
+                true,
+            )
+        }
+        other => panic!("unexpected method {other:?}"),
+    });
+    let out = run_cyclops_binary_io(&client, &home, &[], &["daemon", "restart"], None);
     assert_eq!(out.status.code(), Some(1));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("m-abc123 -> codex"), "{err}");
@@ -689,6 +824,51 @@ fn proto_mismatch_warns_and_continues() {
         String::from_utf8_lossy(&out.stderr).trim(),
         "note: cyclopsd speaks protocol 99, this cyclops speaks 1. Continuing; update the older side."
     );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn build_mismatch_is_reported_by_health_and_machine_readable_status() {
+    let home = scratch_home("bm");
+    let mut canned = canned_status();
+    canned["daemon_build"] = json!("shadowed-build");
+    let expected = canned.clone();
+    serve_conns(
+        &home,
+        json!({
+            "cyclops": "0.1.0",
+            "build": "shadowed-build",
+            "proto": 1,
+            "boot_id": "b-shadowed"
+        }),
+        2,
+        move |req| {
+            let result = match req["method"].as_str() {
+                Some("ping") => json!({"pong": true, "ts": 1}),
+                Some("status") => canned.clone(),
+                other => panic!("unexpected method: {other:?}"),
+            };
+            (
+                vec![json!({"id": req["id"], "result": result}).to_string()],
+                false,
+            )
+        },
+    );
+
+    let note = format!(
+        "note: cyclopsd is build shadowed-build, this cyclops is build {}. Continuing; run cyclops daemon restart to load the installed daemon build.",
+        env!("CYCLOPS_BUILD_REF")
+    );
+    let ping = run_cyclops(&home, &["ping", "--json"]);
+    assert!(ping.status.success());
+    assert_eq!(String::from_utf8_lossy(&ping.stderr).trim(), note);
+
+    let out = run_cyclops(&home, &["status", "--json"]);
+    assert!(out.status.success());
+    let status: Value = serde_json::from_slice(&out.stdout).expect("status remains JSON");
+    assert_eq!(status, expected);
+    assert_eq!(status["daemon_build"], "shadowed-build");
+    assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), note);
     let _ = fs::remove_dir_all(&home);
 }
 
@@ -1890,7 +2070,7 @@ fn hook_posts_wellformed_reports_and_stays_silent() {
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 2, "requests: {seen:?}");
     assert_eq!(seen[0]["method"], "agent.state.report");
-    assert_eq!(seen[0]["params"]["agent"], "reviewer");
+    assert_eq!(seen[0]["params"]["agent"], serde_json::Value::Null);
     assert_eq!(seen[0]["params"]["event"], "Stop");
     assert_eq!(seen[0]["params"]["seq"], 1);
     assert_eq!(seen[0]["params"]["payload"]["session_id"], "s-1");

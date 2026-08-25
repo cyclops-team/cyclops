@@ -13,13 +13,21 @@ Cyclops observes and coordinates them.
 - Agent state derived from vendor hooks, pane titles, output, and screen
   evidence.
 - Durable workspace mailboxes with authenticated senders and exact claims.
-- Content-free pane notifications with a separate wake state.
+- Guarded pane notifications with a separate wake state. Current claim-skill
+  proof enables a content-free doorbell; otherwise Cyclops uses visible
+  full-payload compatibility delivery.
 - A live stream and full-screen workspace for watching and controlling panes.
 - An append-only workspace message journal plus separate session state ledgers.
 
 Cyclops supports Claude Code, Codex CLI, Cursor Agent, and Antigravity CLI
 through shipped detection manifests. Another terminal CLI needs a manifest,
 not a Cyclops SDK or wrapper.
+
+Support is version-specific and fails closed when current evidence is missing.
+The current Cursor terminal-notification path has fixture coverage but has not
+completed a live current-version validation run because no current Cursor
+binary was available on the evidence host. Socket inbox claims remain usable.
+See [Recover a notification](/guides/recovery).
 
 ## The two processes
 
@@ -37,15 +45,16 @@ to them the way you'd talk to a teammate: "send this to reviewer and ask
 for a review." An agent that knows the verbs turns that into a handoff
 through the `cyclops` CLI itself, and the workspace shows the receipt.
 
-That "knows the verbs" part comes with the install: the agent skill at
-`skills/cyclops/SKILL.md` teaches an agent the `cyclops` verbs, and the
-installer's setup step places it for Claude Code at
-`~/.claude/skills/cyclops/SKILL.md` when Claude Code is present. A copy
-you edited is never overwritten. Using a different agent? Copy the file
-to wherever that agent reads instructions from.
+That "knows the verbs" part comes with the install. The agent skill at
+`skills/cyclops/SKILL.md` teaches the `cyclops` verbs. Setup places it at
+`~/.claude/skills/cyclops/SKILL.md` for Claude Code, one shared
+`~/.agents/skills/cyclops/SKILL.md` for Codex and Cursor, and
+`~/.gemini/antigravity-cli/skills/cyclops/SKILL.md` for Antigravity CLI when
+those consumers are installed. A copy you edited is never overwritten.
 
 ## Next steps
 
 - [Install Cyclops](/installation)
 - [Run the quickstart](/quickstart)
 - [Choose the tmux sessions to watch](/guides/attach-tmux)
+- [Recover a blocked notification](/guides/recovery)

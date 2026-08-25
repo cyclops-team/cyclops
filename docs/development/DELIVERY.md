@@ -27,9 +27,12 @@ selects again. It never downgrades after any pane write.
 
 Transport is write metadata on the notification record. It is not part of the
 mailbox state and not part of the terminal occupant identity binding. Current
-doorbell writes keep `transport: "doorbell"` and add `doorbell_format: 1`.
-Missing format metadata selects the original verbose row. Unknown numeric
-formats replay but cannot authorize an attention recovery action. Missing
+doorbell writes keep `transport: "doorbell"` and add `doorbell_format: 2`.
+Format 2 carries a lossless 128-bit token for the exact attempt in a shell
+comment. Format 1 remains readable as the older message-only compact row but
+cannot provide hook evidence for a new Complete action. Missing format metadata
+selects the original verbose row. Unknown numeric formats replay but cannot
+authorize an attention recovery action. Missing
 transport metadata on an old journal transition also means the original
 doorbell format.
 
@@ -37,6 +40,14 @@ Both paths are one-shot. An ambiguous paste, verification, submit, or receipt
 opens one attention entry and never writes the payload a second time. Attention
 recovery rebuilds the expected bytes from the durable transport: the fixed row
 for a doorbell, or the canonical message payload for direct fallback.
+
+Current terminal-action settlements append `notification_resolved` with
+`proof_version: 1` and replay only after the exact intent, action, and required
+consumption facts. Missing proof versions are limited to historical format 1
+or older doorbells and legacy direct payloads with incomplete process bindings.
+They settle the old attempt during replay but cannot authorize a new action.
+The same replay-only contract accepts the historical direct `Staged` to
+`Submitted` edge. Current writes must pass through `Submitting`.
 
 ## Direct payload rendering
 
@@ -77,11 +88,39 @@ Reply: cyclops send codex --subject "..."
 
 One worker per durable recipient; notifications to one mailbox are strictly
 FIFO. Broadcast writes one message row with one mailbox entry and one
-notification record per recipient.
+notification record per recipient. A worker retires after its queue drains.
+Enqueue and retirement share one registry lock, so a concurrent send either
+joins the existing FIFO or creates its replacement without losing the handle.
+Each worker job runs under a supervisor. One failure before the pane write
+restarts the exact durable attempt. A repeated worker exit becomes a visible
+`worker_failed` block. Other exhausted pre-write failures retain their closed
+cause, including `write_readiness_changed` for a repeated binding or capability
+race. A failure after the pane may have changed becomes attention instead of
+retrying. If the journal cannot record that classification, the worker faults
+while retaining the exact FIFO head and status exposes the fault for operator
+recovery.
 
 Mailbox notifications use `cyclops_proto::NotificationState`. Each transition
 is a content-free workspace journal fact. Legacy direct deliveries still use
 `cyclops_proto::DeliveryState` in session ledgers.
+
+An authenticated mailbox claim orders against the terminal write boundary.
+`queued`, `gating`, `quota_held`, and `quota_reset_observed` become `withdrawn`
+inside the `message_claimed` fact and cancel that exact pending attempt. A claim
+at `staged` leaves the attempt and composer barrier intact until Cyclops
+re-proves and clears the exact doorbell. One
+`notification_claimed_staged_cleared` fact then changes the attempt to
+`withdrawn_after_staging` and retires its barrier together. A claim at
+`submitting` retrieves the message once but does not cancel the reserved
+terminal key. A claim at `submitted` advances the doorbell to `notified`.
+An `ack_timeout` alarm for a current format 2 doorbell with a complete binding
+can advance to `notified` after an exact recipient claim and composer
+reconciliation. The daemon must first clear the exact staged doorbell, or prove
+the same bound composer is clean. The claim alone leaves the alarm and FIFO
+barrier in place. Other post-write attention, `writing`, direct-payload states,
+and existing `notified` records stay unchanged. `superseded` is reserved for an
+actual message replacement. A claim proves retrieval only. It never proves task
+completion or resolves any other post-write alarm.
 
 ### Gate (amendments b, f, g; GOALS invariants)
 
@@ -93,10 +132,12 @@ timer. In order:
 2. `pane_dead`: attention_required. `pane_in_mode` (human scrolling in
    copy-mode): hold in gating; %pane-mode-changed re-triggers.
 3. Fused state:
-   - `blocked_quota`: park ALL queued deliveries for this recipient as
-     parked_blocked_quota, admin.notify urgent with the reset hint parsed
-     from screen. Never auto-retried (amendment f). After the reset, the
-     operator sends a fresh message; there is no requeue verb.
+   - On the legacy direct-delivery path, `blocked_quota` parks ALL queued
+     deliveries for this recipient as `parked_blocked_quota` and sends one
+     urgent admin notification with the reset hint parsed from screen. It never
+     auto-retries (amendment f). After the reset, the operator sends a fresh
+     message; this legacy state has no requeue verb. Standard mailbox
+     notifications use the explicit guarded requeue command described below.
    - `blocked_modal`: if the matched manifest rule has `auto_dismiss` and
      `decline_keys`, send the decline keys in order with ~250ms spacing,
      ledger a gate line naming the rule, re-evaluate. Multi-key declines
@@ -129,25 +170,21 @@ visible; the hold itself keeps waiting on events, never on a timer.
 
 1. `load-buffer` from a temp file into buffer `cyc-<bootpid>-<seq>` (unique
    per delivery, amendment e), `paste-buffer -p -d`.
-2. Doorbells require the exact fixed row in the active composer. Direct
-   payloads require either the terminal sentinel or a measured collapsed-paste
-   chip in the active composer. Both shapes use the same manifest-owned
-   composer extraction and terminal-layout proof.
+2. Capture the joined, escaped composer region. Doorbells require their exact
+   fixed row. Direct payloads require byte-for-byte reconstruction through the
+   terminal sentinel. In both cases the extracted composer bytes must equal
+   the payload selected at the durable write boundary.
+
+   A measured collapsed-paste chip is representation evidence only. The hidden
+   bytes cannot be compared, so a chip never proves Cyclops ownership and never
+   authorizes Enter. It fails closed into one post-write attention result.
 
    `bracket_paste_flag` is unavailable through tmux 3.6a (amendment b), so
-   bracketed-paste degradation is not gateable. The gate is post-paste
-   composer verification: capture the bottom region and require the
-   manifest's `verify_pattern` with `<message_id>` substituted. The
-   capture flavor follows the manifest: SGR-escaped (`capture-pane -e`)
-   when any rule carries `line_regex_esc` clauses, plain otherwise.
-   Pattern text is matched on de-escaped lines either way; the
-   composer-line pinning also runs the esc clauses against the raw
-   lines.
-
-   Two kinds of evidence are accepted, in this order: the terminal
-   sentinel proven to be the last payload row of the active composer,
-   then the vendor's paste chip pinned to a manifest composer line. A
-   visible leading id is not evidence because it cannot prove completeness.
+   bracketed-paste degradation is not gateable. The capture flavor follows the
+   manifest: SGR-escaped (`capture-pane -e`) when any rule carries
+   `line_regex_esc` clauses, plain otherwise. Composer pinning runs escaped
+   clauses against raw rows and compares normalized visible bytes separately.
+   A visible leading id is not evidence because it cannot prove completeness.
 
    The sentinel is terminal only if it matches a whole row, at least one
    row follows it, and the rows that follow are an ordered subsequence of
@@ -160,16 +197,24 @@ visible; the hold itself keeps waiting on events, never on a timer.
    there. A split or truncated sentinel matches nothing and fails
    closed.
 
-   Which of the two applies is decided per message, by what the capture
-   shows, never per vendor.
+   Representation is decided per capture, never per vendor. A manifest with no
+   measured composer and trailer layout has no exact staging proof and refuses.
+   A manifest declaring `first_paste_caveat` does not stage its first paste
+   after TUI start. Failed exact verification is an ambiguous post-paste
+   outcome: it goes straight to `attention_required` and is never re-pasted.
+3. Verified: state staged. Under the workspace journal lock, reserve the
+   terminal key by appending `submitting`. This is the linearization point
+   against an authenticated claim, not proof that a key was sent. Release the
+   lock, re-prove the exact process binding and composer bytes, then send the
+   manifest's submit key. Only successful terminal IO advances the attempt to
+   `submitted`.
 
-   A manifest declaring neither a trailer layout nor a chip has no
-   staging proof, and every delivery to it refuses. A manifest declaring
-   `first_paste_caveat` does not stage its first paste after TUI start.
-   A failed verification is an ambiguous post-paste outcome: it goes
-   straight to attention_required and is never re-pasted.
-3. Verified: state staged. Send the manifest's submit key (Enter):
-   state submitted.
+   Automatic notification submit runs the full proof immediately before the
+   reservation and again after it. Both checks require the same pane-root,
+   terminal leader, agent generation, and manifest; no pane mode; a current
+   manifest state of `idle` or `idle_with_input`; and the exact attempt-owned
+   staged barrier with no live lifecycle or blocked-state conflict. A refusal
+   withholds Enter and settles once as `verify_failed`. It is never retried.
 
 ### Receipt tiers
 
@@ -186,7 +231,10 @@ visible; the hold itself keeps waiting on events, never on a timer.
   then appends `message_delivered_direct` and retires that mailbox entry. A
   doorbell leaves the entry pending until an authenticated claim.
 - Neither within 5s: `attention_required` with cause `ack_timeout`. Enter may
-  already have been accepted, so the payload is never re-pasted.
+  already have been accepted, so the payload is never re-pasted. A later exact
+  recipient claim starts composer reconciliation for a current format 2
+  attempt. Only exact clear or same-binding clean evidence moves it to
+  `notified`.
 
 ### Retry (bounded, pre-write only)
 
@@ -200,6 +248,29 @@ is after the irreversible boundary and goes directly to
 the attempt boundary and never invites a duplicate paste. `attention_required`
 can mean the terminal outcome is unknown, not that the recipient definitely
 did not receive the message.
+
+### Static pre-write blocks
+
+A mailbox notification stops as `blocked_pre_write` after a known pre-write
+failure exhausts its bounded retry budget, a worker exhausts its restart budget,
+or a write-boundary proof cannot safely continue. Binding and capability races
+receive one immediate re-proof without consuming transport retry budget. A held
+composer barrier blocks immediately. The closed causes name an unavailable
+session, manifest, payload, changed write readiness, paste-buffer spool failure,
+unprovable binding, missing composer semantics, or exhausted worker restart
+budget. None writes pane bytes or retries on a timer. The message stays
+claimable, and a workspace administrator may withdraw that exact unwritten
+notification to release the recipient FIFO.
+An exact positive route and composer-readiness observation may reopen the same
+attempt once. The cached verdict must carry the same pane-root, foreground
+leader, agent process generation, and manifest as the fresh route proof.
+
+A workspace administrator may also withdraw the exact current attempt while it
+is `queued` or `gating`. Those states and `blocked_pre_write` are all durably
+before `writing`, so the operation writes one withdrawal fact, cancels that
+attempt, leaves the message pending and claimable, and admits the next FIFO
+item. `writing` and every later state refuse. Withdrawal availability alone
+does not make ordinary queued or gating work require human attention.
 
 ## `msg.send` semantics
 
@@ -258,15 +329,39 @@ Mailbox notifications recover from the workspace message journal separately
 from the legacy session-ledger chain above. Every `writing` transition with a
 binding arms a durable barrier before the paste, including older bindings that
 do not record a foreground leader. The barrier remains active through
-`staged`, `submitted`, `notified`, and `attention_required`. A later bound write
+`staged`, `submitting`, `submitted`, `notified`, and `attention_required`. A later bound write
 replaces an older barrier only for the same exact durable recipient.
 
-At startup, unresolved `writing`, `staged`, and `submitted` attempts close to
-`attention_required` with `daemon_restart`, but their composer barriers remain
-active. Recovery compares the recorded and current agent process generations
-and manifests. A foreground leader change is normal agent continuity. A
-different agent generation or manifest is authoritative replacement and is
-journaled before the old barrier is released.
+At startup, a claimed `staged` doorbell resumes exact-byte reconciliation,
+and a claimed `submitted` doorbell advances to `notified`. Exact staged bytes
+are cleared once and then settled. A crash may occur after that clear but
+before the settlement append. Recovery may settle without another terminal
+action only when the current manifest wins a `composer_semantic = "clean"`
+rule, exact composer extraction returns visible empty bytes, and the complete process
+binding still matches. Unsupported extraction, an unprovable composer, a hidden
+chip, transcript ambiguity, or nonempty input refuses and enters one post-write
+attention state.
+Other unresolved `writing`, `staged`, `submitting`, and `submitted` attempts
+close to `attention_required` with `daemon_restart`, but their composer
+barriers remain active. The claimed staged settlement fact changes the state
+and retires the barrier together. If its first append fails after a proven
+clear, Cyclops repeats only that idempotent content-free append once. It never
+clears or submits again. A second failure leaves the durable attempt `staged`,
+keeps the exact worker and FIFO barrier active, and reports
+`notification_settlement_storage_failed`. The operator runs `cyclops health`,
+repairs state storage, then restarts the daemon so the same attempt reconciles.
+One upgrade-only exception covers a stable `attention_required` or `notified`
+format 1 or original doorbell whose binding lacks pane-root generation. An
+exact recipient claim ordered after that attempt's `writing` fact, the same
+current manifest, and fresh semantic-clean, exact visible-empty composer proof
+may append a content-free `recipient_claimed_composer_clear` barrier
+retirement. It sends no terminal key, clears no bytes, and leaves the historical
+notification outcome and claimed mailbox state intact. Legacy direct payloads
+do not qualify.
+Recovery compares the recorded and current agent process generations and
+manifests. A foreground leader change is normal agent continuity. A different
+agent generation or manifest is authoritative replacement and is journaled
+before the old barrier is released.
 
 Only a receipt-bearing `notified` attempt may retire from a fresh clean screen
 for the same occupant. Every other post-write state restores the composer hold
@@ -312,7 +407,7 @@ The boot requeue above carries them across.
 - queued delivery starts within 1s of the turn-end state change (the worker
   wakes on the event, nothing polls).
 
-## Operator recovery
+## Guarded composer recovery
 
 `attention show` is read-only. `attention complete` and `attention discard`
 require the exact unresolved attempt, the original process and manifest
@@ -322,8 +417,40 @@ are returned only to the authenticated workspace administrator and never enter
 the journal or daemon log. Requeue and alarm clearance remain explicit
 operator actions and never create an automatic retry loop.
 
+A current format 2 `verify_failed` doorbell uses the same proof and settlement
+path automatically. Pending work selects one submit. An exact recipient claim
+ordered after the write selects one measured clear. The mailbox choice and
+durable intent share one lock. Human, trailing, changed, or unprovable content
+never reaches a terminal key.
+
+Before a terminal-key action, the daemon records one content-free resolution
+intent. If the terminal accepts the key, it records a separate content-free
+action-accepted fact. Neither fact is settlement. A fresh Complete also needs a
+matching authenticated attempt-bound v2 hook receipt or an exact recipient
+claim ordered after this action, recorded as a content-free consumption fact.
+Legacy and v1 doorbell hooks remain replay-compatible but cannot authorize new
+Complete settlement. A
+generic Working edge is only a re-evaluation cue. Complete and keyed Discard then require a fresh
+manifest-owned clean-composer capture before `notification_resolved` may retire
+the barrier. A no-key Discard requires two current positive empty-composer
+observations and appends one atomic no-key resolution fact with no prior
+intent. Missing evidence leaves the original attention item and barrier
+open. Complete enters reconcile-only mode only with matching intent,
+action-accepted, and consumption facts. Keyed Discard needs matching intent and
+action-accepted facts. Intent-only Discard may use the same atomic no-key path
+after two fresh exact-empty observations. Intent-only and accepted-but-unconsumed
+Complete cannot retry or reconcile from later screen state. Reconciliation sends no key and
+still requires exact binding and positive visible-empty composer proof. Exact
+staged content, changed or hidden content, an unprovable composer, and a
+different requested resolution remain unresolved.
+
 The legacy session-delivery path has no operator requeue verb. Standard mailbox
 notifications use the guarded `cyclops requeue <message-id>` recovery command.
+Requeue resolves every selected pending recipient before writing. A current
+format 2 `verify_failed` composer barrier must be resolved before requeue. Any
+post-write barrier with an absent binding or missing pane-root or
+foreground-leader generation also makes the whole requeue conflict before any
+append.
 
 ## v1.1 amendments (M1 gate)
 

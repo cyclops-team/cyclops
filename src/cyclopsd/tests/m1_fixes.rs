@@ -23,7 +23,7 @@ async fn send_and_wait_starts_after_delivery_resolution() {
     let mut rig = Rig::new(
         "waita",
         BUSY_MANIFEST,
-        &hold_script("BUSY-MARKER"),
+        &hold_then_manual_lifecycle_script("BUSY-MARKER"),
         "receipt_block_ms = 200\n",
     )
     .await;
@@ -58,8 +58,9 @@ async fn send_and_wait_starts_after_delivery_resolution() {
 
     // The wait ran only after the delivery resolved: the entry carries the
     // resolved delivery state, and `done` was NOT satisfied by the
-    // pre-delivery busy phase (the released pane is a cat: no turn ever
-    // starts, so a correctly anchored `done` times out).
+    // pre-delivery busy phase. The manual-lifecycle composer consumes this
+    // delivery but emits no post-submit Working edge, so a correctly anchored
+    // `done` times out.
     let wait = &result["wait"][0];
     assert_eq!(wait["to"], "waity", "{result}");
     assert_eq!(wait["delivery"], "delivered_unverified", "{result}");
@@ -139,6 +140,18 @@ async fn restart_requeues_prepaste_deliveries() {
     // The chain went back in the queue with the restart named as cause
     // (written by close_limbo inside boot, so it is on disk already)…
     let lines = rig.ledger_lines();
+    let new_boot_at = lines
+        .iter()
+        .rposition(|line| line["data"]["event"] == "boot")
+        .expect("new boot fact");
+    let new_boot = lines[new_boot_at]["boot_id"].clone();
+    assert!(
+        lines
+            .iter()
+            .skip(new_boot_at)
+            .all(|line| line["boot_id"] == new_boot),
+        "an old daemon appended after the replacement booted: {lines:#?}"
+    );
     let requeue = lines
         .iter()
         .find(|l| {

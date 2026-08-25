@@ -478,7 +478,11 @@ async fn claiming_the_oldest_withdraws_only_its_attempt_and_schedules_the_next()
     assert_eq!(first_row["recipients"][0]["mailbox"]["status"], "claimed");
     assert_eq!(
         first_row["recipients"][0]["notification"]["state"],
-        "superseded"
+        "not_started"
+    );
+    assert_eq!(
+        first_row["recipients"][0]["notification"]["settlement"],
+        "withdrawn_by_claim"
     );
     assert_eq!(second_row["recipients"][0]["mailbox"]["status"], "pending");
     assert!(matches!(

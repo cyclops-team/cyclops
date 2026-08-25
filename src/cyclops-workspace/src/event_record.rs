@@ -114,6 +114,7 @@ mod tests {
             id: None,
             kind: EntryKind::State {
                 target: target.into(),
+                recipient: None,
                 session_idx: 0,
                 pane_id: Some(pane_id.into()),
                 state,
@@ -131,6 +132,7 @@ mod tests {
             }],
             open: Vec::new(),
             admin_unread: 0,
+            mailbox_routes: Vec::new(),
             roster: Vec::new(),
         })
     }

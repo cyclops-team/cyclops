@@ -32,21 +32,29 @@ The receipt reports two separate facts:
 - `accepted` means the durable message and recipient mailbox entries exist.
 - `wake <state>` reports the current terminal notification attempt. It may be
   `not started`, `queued`, `checking readiness`, `writing`, `staged`,
-  `submitted`, `notified`, `needs attention`, or `superseded`.
+  `submitted`, `notified`, `withdrawn`, `needs attention`, or `superseded`.
 
 A position such as `2 ahead` is the recipient mailbox's FIFO position. The
 daemon never bypasses an older pending message.
+
+The body and wake use different paths. Doorbell mode never pastes the message
+body. A terminal wake stages one `inbox claim` command, while a pull client may
+claim the same message through the authenticated socket without changing the
+composer. Both are valid. `cyclops messages` is the authoritative combined
+view of mailbox and wake state.
 
 ## Receive
 
 The preferred path is this content-free notification:
 
 ```text
-cyclops inbox claim m-3f9c2a
+cyclops inbox claim m-3f9c2a #c:<lossless-attempt-token>
 ```
 
 The daemon selects it only when `cyclops setup check` reports `mailbox
-doorbell`. The recipient then claims the message as described below.
+doorbell`. The suffix is a shell comment carrying the exact notification
+attempt, so the command remains runnable. The recipient then claims the message
+as described below.
 
 If setup reports `mailbox direct payload`, Cyclops writes the full message
 envelope instead. This compatibility path exists for an absent, edited,
@@ -105,7 +113,18 @@ Reply: cyclops reply m-3f9c2a --body "..."
 A claim is authenticated to the recipient mailbox. In plain output, repeating
 the claim returns the same payload. In JSON, the repeated result has
 `disposition: "already_claimed"`. It does not create a second task. A claim
-proves payload retrieval, not task completion.
+proves payload retrieval, not task completion or terminal submission. If a
+claim races a doorbell already staged in the composer, Cyclops must either
+submit a previously reserved terminal key or re-prove and clear that exact
+doorbell. The claim alone never settles staged bytes.
+
+A current format 2 doorbell can reach `ack_timeout` after the terminal key was
+sent but before Claude paints output. A later exact recipient claim starts
+reconciliation. Cyclops clears the exact staged doorbell, or proves the same
+bound composer is clean, before moving the attempt to `notified` and clearing
+its alarm. The claim alone changes neither the alarm nor the FIFO barrier.
+Current exact `verify_failed` doorbells use the guarded automatic policy below.
+Other attention causes remain operator work.
 
 Reply using the message id so the daemon derives the recipient, thread, and
 subject from the visible parent:
@@ -136,11 +155,11 @@ accepted m-c82d11
 ```
 
 Admin mail receives no pane notification. `cyclops status` shows the pending
-admin count. An operator caller whose process ancestry is proven outside every
-watched pane reads it with the same `cyclops inbox list` and `cyclops inbox
-claim <id>` commands. A terminal inside a watched pane keeps that pane's agent
-identity. Broadcast `*` targets agent panes only; name `admin` explicitly when
-the operator needs a durable message.
+admin count. A same-user shell with no agent-vendor ancestor reads it with the
+same `cyclops inbox list` and `cyclops inbox claim <id>` commands, including a
+shell inside a watched pane. A vendor process gets an agent identity only
+through its current watched pane. Broadcast `*` targets agent panes only; name
+`admin` explicitly when the operator needs a durable message.
 
 ## Broadcast, reply, and supersession
 
@@ -172,18 +191,38 @@ source.
 An ambiguous notification is never an invitation to resend blindly. Use its
 exact notification attempt id:
 
+Cyclops automatically handles a current format 2 `verify_failed` doorbell only
+when the complete durable binding and exact composer bytes still match. It
+submits once while the mailbox is pending. If the exact recipient claimed after
+the write, it clears that doorbell without submitting it. Durable intent blocks
+a second terminal key after an uncertain outcome. Human, trailing, changed, or
+unprovable content remains one visible attention item.
+
 ```bash
 cyclops attention show <attempt-id> --diff
 cyclops attention complete <attempt-id>
 cyclops attention discard <attempt-id>
 ```
 
-`show` is read-only. `complete` and a staged `discard` recheck the exact
-notification, terminal layout, process generations, manifest, and current
-terminal safety before acting. If a fresh screen rule proves that the composer
-is already empty, `discard` records that resolution without typing a clear
-sequence. An uncertain action outcome must be inspected and must not be
-repeated.
+`show` is read-only. `complete` and `discard` recheck the exact attempt,
+terminal layout, process generations, manifest, and current terminal safety.
+An uncertain result must be inspected and must not be repeated as a fresh
+terminal action. Reconciliation never sends a second key. `cyclops messages`
+shows whether intent, terminal acceptance, and notification consumption were
+proven. Alarm clearance acknowledges the alarm but does not abandon an
+unfinished terminal action. The message remains claimable through `inbox
+claim`. The exact transition and reconciliation rules are owned by the
+[protocol reference](../reference/PROTOCOL.md#mailbox-and-notification-control).
+
+A wake that stops before writing reports one exact cause, including
+`session_unavailable`, `manifest_unavailable`, `payload_unavailable`,
+`write_readiness_changed`, `spool_failed`, `binding_unprovable`,
+`composer_semantic_missing`, or `worker_failed`. The message remains claimable.
+A workspace administrator can release the FIFO without touching the pane:
+
+```bash
+cyclops notification withdraw <attempt-id> --recipient <recipient-key>
+```
 
 `show --diff` returns the exact selected transport bytes to the authenticated
 workspace administrator. A direct fallback diff therefore contains the message

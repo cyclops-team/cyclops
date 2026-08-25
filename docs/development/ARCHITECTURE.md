@@ -11,7 +11,11 @@ Neither document is in this repository. Both live in the separate
 need either to read this page: every frozen decision and every lettered
 amendment is tabled at the end of it against the file that implements it,
 and the measurements they rest on are [findings.md](../../findings.md).
-Everything described here is in the tree and under test.
+Everything described here is in the tree and under test. Two delivery paths
+coexist. The current default is the durable mailbox plus one safe notification,
+specified in [DELIVERY.md](DELIVERY.md). The terminal pipeline diagrams below
+document the still-shipped legacy direct-payload compatibility path. They are
+not the default `msg.send` contract.
 
 ## The shape of it
 
@@ -20,9 +24,10 @@ flowchart LR
     A["agent CLI<br/>in a tmux pane"] -->|"cyclops send, over the socket"| C["cyclops<br/>(thin NDJSON client)"]
     C -->|"one JSON object per line"| D["cyclopsd"]
     D -->|"who connected, walked up<br/>to a watched pane"| I["sender identity"]
-    D -->|"every fact, before it is acted on"| L[("ledger<br/>one NDJSON file<br/>per session")]
+    D -->|"messages, mailboxes,<br/>notifications, replies"| W[("workspace journal")]
+    D -->|"pane state and<br/>legacy delivery"| L[("session journal")]
     D -->|"load-buffer, paste-buffer, send-keys<br/>on the control connection"| T(["tmux server"])
-    T -->|"the payload, as if pasted"| B["recipient's pane"]
+    T -->|"a notification or legacy payload,<br/>as if pasted"| B["recipient's pane"]
     B -->|"the vendor hook runs cyclops hook,<br/>which posts back through the same socket"| D
     D -->|"one receipt per recipient"| C
     D -->|"and an event line to every subscriber"| S(["cyclops watch"])
@@ -32,8 +37,9 @@ Four rules hold the whole design up.
 
 - **tmux owns the terminal.** Cyclops never hosts a pty. It asks tmux and
   tmux answers, over the interface tmux calls control mode.
-- **The ledger is the record.** Append-only NDJSON, one file per watched
-  session, written before anything downstream believes it.
+- **The journals are the record.** Append-only NDJSON, one workspace journal
+  for mailbox facts and one session journal for pane state and legacy delivery,
+  written before anything downstream believes a fact.
 - **Nothing polls.** Every recompute rides an event that already happened.
 - **Every tmux specific lives in `src/cyclops-tmux`.** Control mode is
   unversioned and moves between releases, so one crate absorbs that.
@@ -87,9 +93,11 @@ flowchart TD
     screen -->|"captured"| fuse["fuse: whichever tier's winning rule sits<br/>earlier in priority order decides"]
     fuse -->|"one tier fired, or both agree"| verdict(["verdict, decided_by names what won"])
     fuse -->|"both tiers fired and disagree"| flag["disagreement exposed;<br/>the higher-priority rule still wins"]
-    fuse -->|"the rules tier came back unknown<br/>and a live hook reading exists"| hook["the hook reading decides,<br/>decided_by is hook:&lt;event&gt;"]
-    fuse -->|"a rule decided and the hook reading differs"| flag
+    fuse -->|"an authenticated turn start exists<br/>and the visual verdict is not blocked"| start["verdict: working;<br/>decided_by is hook:&lt;event&gt;"]
+    fuse -->|"the rules tier came back unknown<br/>and a transient hook reading exists"| hook["the hook reading decides,<br/>decided_by is hook:&lt;event&gt;"]
+    fuse -->|"a rule decided and a transient hook reading differs"| flag
     flag --> verdict
+    start --> verdict
     hook --> verdict
 ```
 
@@ -98,16 +106,30 @@ that decides alone skips `capture-pane` entirely. A sensor that fails is
 doubt, not evidence, which is why a failed capture keeps the prior verdict
 instead of flipping the pane.
 
-A hook reading counts as live for 300s, and is dropped after three
-consecutive recomputes where the rules tier decided against it, so a stale
-edge cannot pin fused state. Blocked states always come from rules: no
-tested CLI hooks its modals or its quota.
+A transient hook reading counts as live for 300s and is dropped after three
+consecutive recomputes where the rules tier decided against it. A confirmed,
+keyed turn start reports `working` immediately and stays active until
+process-binding retirement or the authenticated end for that exact key.
+An unkeyed confirmed vendor contract may pair runtime start and end events
+from the same process binding, but it does not create message-level turn
+correlation. Composer holds on that lane still settle from screen evidence.
 
-## Sending: how a message becomes a verified receipt
+Claude exposes no key shared by `UserPromptSubmit` and `Stop`. Its prompt hook
+therefore publishes provisional `working` immediately but remains only a
+dispatch candidate. A later lifecycle-capable visual Working frame confirms
+acceptance of the exact pending notification. Fresh visual state then owns the
+return to idle. Cyclops does not pair Claude's next `Stop` with that prompt by
+arrival order or elapsed time. Blocked states always come from rules because
+no tested CLI hook identifies its modals or quota screens.
 
-Two halves, joined by one queue. `msg.send` writes the fact and fans out;
-one FIFO worker per recipient pane then carries each chain on its own.
-Both are `src/cyclopsd/src/delivery.rs`; the semantics are docs/development/DELIVERY.md.
+## Legacy direct-payload sending: how a message becomes a receipt
+
+This section documents the compatibility pipeline. The public `msg.send`
+endpoint uses the mailbox path: it returns durable acceptance, then schedules a
+separate notification attempt as specified in [DELIVERY.md](DELIVERY.md). The
+internal `delivery::msg_send` compatibility function writes a session fact and
+fans out; one FIFO worker per recipient pane then carries each chain on its own.
+The implementation is `src/cyclopsd/src/delivery.rs`.
 
 ### The call: what the sender gets back
 
@@ -132,7 +154,7 @@ flowchart TD
     parked -->|"resolved at send"| settled
     settled["10. receipt: that state, plus the note<br/>or cause the chain recorded"] -->|"one per recipient"| out
     moving["10. receipt: queued, with the number of<br/>chains ahead of it on that worker"] -->|"one per recipient"| out
-    out(["msg.send result: msg_id, seq, receipts"])
+    out(["legacy receipt result: msg_id, seq, receipts"])
 ```
 
 Steps 5 to 9 run per recipient, so one broadcast returns mixed receipts:
@@ -287,18 +309,24 @@ with cause `daemon_restart`, whatever state it was in (`delivery.rs`,
 
 ## What needs a human, and who owns it
 
-The eye is the signature device, and it appears on three surfaces: the
-stream header, the `--plain` eye line, and `cyclops status`. All three read
-one register and none of them recomputes it. That register is
-`src/cyclops-proto/src/attention.rs`, and it is the only file allowed to answer
-this question.
+The eye is the signature device, and its vocabulary appears on the stream
+header, the `--plain` eye line, and `cyclops status`. All three read
+`src/cyclops-proto/src/attention.rs`; none reimplements the state predicates.
+The stream and plain follow include durable delivery alarms. Normal
+`cyclops status` is intentionally narrower and reports the live pane fleet,
+not every durable mailbox alarm. When a live pane has an exact composer
+barrier, status reports the separate runtime, composer ownership, write
+readiness, notification, message, and next-action facts. Durable recovery and
+historical alarms remain on the mailbox, alarm, and stream surfaces.
 
 ```mermaid
 flowchart TD
-    S["the daemon's status answer:<br/>the pane roster as it is now, plus<br/>open_deliveries folded from the whole record"] -->|"REPLACES both halves wholesale,<br/>once, at startup"| R
+    S["status without open_deliveries:<br/>the live pane roster"] -->|"from_live_status"| L["status register:<br/>agent half only"]
+    F["status with open_deliveries:<br/>pane roster plus durable alarms"] -->|"from_status, once at startup"| R
     E["live events: state, delivery-state, pane-removed"] -->|"one item at a time; each one IS<br/>that item's next transition"| R
     H["a replayed ledger tail"] -->|"nothing. A window over the record cannot<br/>answer 'right now', and letting it try means<br/>--backfill decides the count"| R
-    R(["the register"]) --> A{"AGENT half: the pane's fused state"}
+    L --> A{"AGENT half: the pane's fused state"}
+    R(["stream register"]) --> A
     R --> D{"DELIVERY half: the chain's latest state"}
     A -->|"blocked_modal, blocked_permission or<br/>blocked_quota: nothing downstream clears them"| CT["counted"]
     A -->|"anything else"| NC["not counted"]
@@ -401,7 +429,7 @@ two:
 | Edge | Fired by |
 |---|---|
 | adoption | `adopt_pane` |
-| a fused state change | `fusion::recompute_pane` |
+| a fused state change | `fusion::recompute_pane_with_evidence` |
 | a clear | `unadopt_pane` |
 | a session attach | `reconcile_adoptions` |
 | a window move | `move_chrome` |
@@ -525,7 +553,10 @@ Timers do exist; none of them is an interval. Each is a one-shot tied to
 one thing that already happened: the paste verification re-reads, the
 tier-1 ACK window, the tier-2 checkpoints, the decline spacing, the gate's
 single wedged-hold ping, the per-pane output settle debounce, the watcher's
-reconnect backoff, and the deadlines a caller asked for.
+reconnect backoff, the deadlines a caller asked for, and a candidate
+lifecycle settle deadline armed by an authenticated edge. The lifecycle
+worker coalesces by pane, attempts each generation once per observation,
+and parks until another event.
 
 Sanctioned exceptions, none in the product: the Python probe harness
 (`tests/e2e/lib/`) polls because it is a measuring instrument, the test

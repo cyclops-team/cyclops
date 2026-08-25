@@ -1820,7 +1820,7 @@ mod tests {
 
         let flat = flatten(term.backend().buffer());
         assert!(
-            flat.contains("Pick another name, e.g. lead."),
+            flat.contains("Pick") && flat.contains("another name, e.g. lead."),
             "the useful end of the refusal should remain visible: {flat}"
         );
         assert!(

@@ -28,16 +28,20 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use cyclops_manifest::{mailbox_capability, strip_csi, Manifest};
+use cyclops_manifest::{
+    mailbox_capability, strip_csi, AckEvidence, Manifest, UnstyledComposerProof,
+};
 use cyclops_proto::{
-    AgentState, Delivery, DeliveryReceipt, DeliveryState, Event, Kind, LedgerLine, MessageId,
-    MsgSendParams, MsgSendResult, NotificationAttemptId, NotificationAttentionCause,
-    NotificationTransport, NotifyLevel, ProcessInstanceId, QuiesceResult, RecipientKey, VerifiedBy,
-    WaitUntil, WireError,
+    AgentState, ComposerSemantic, Delivery, DeliveryReceipt, DeliveryState, Detection, Event, Kind,
+    LedgerLine, MessageId, MsgSendParams, MsgSendResult, NotificationAttemptId,
+    NotificationAttentionCause, NotificationBinding, NotificationManifestId,
+    NotificationPreWriteCause, NotificationPreWriteObservation, NotificationRecord,
+    NotificationState, NotificationTransport, NotifyLevel, ProcessInstanceId, QuiesceResult,
+    RecipientKey, Sensor, StatusDiagnostic, VerifiedBy, WaitUntil, WireError,
 };
 use cyclops_tmux::{ControlClient, PaneEvent, PaneRow, SessionWatcher};
 use serde_json::{json, Value};
@@ -46,7 +50,9 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, error, warn};
 
-use crate::notification_adapter::{NotificationAdapterError, NotificationContext};
+use crate::notification_adapter::{
+    ClaimedNotificationBarrier, NotificationAdapterError, NotificationContext, SubmitReservation,
+};
 use crate::{daemon_line, fusion, unix_ms, Inner, PaneKey};
 
 /// Delivery gives up on evidence this long after submit (spec: neither ACK
@@ -63,7 +69,7 @@ const VERIFY_REGION: usize = 15;
 /// Bottom non-empty lines treated as the composer zone for the
 /// marker-left-composer check.
 const COMPOSER_WINDOW: usize = 6;
-/// Spacing between manifest decline keys (amendment g: ~250ms).
+/// Spacing between manifest-defined modal decline keys.
 const DECLINE_SPACING: Duration = Duration::from_millis(250);
 /// Attempts to auto-dismiss one modal rule before treating it as
 /// non-dismissable (hold plus admin notify). Never loop.
@@ -86,8 +92,9 @@ const QUIESCE_HOLD_FALLBACK_MS: u64 = 30_000;
 /// Upgradeable delivered_unverified handles kept per pane for late hook
 /// ACK upgrades.
 const ACK_REGISTRY_CAP: usize = 32;
-const SUPERSEDED_BEFORE_WRITE: &str = "superseded_before_write";
+const NO_LONGER_CURRENT_BEFORE_WRITE: &str = "notification_no_longer_current";
 const NOTIFICATION_RECORD_FAILED: &str = "notification_record_failed";
+const CLAIMED_STAGED_SETTLEMENT_FAILED: &str = "claimed_staged_settlement_failed";
 #[derive(Debug, Clone)]
 struct MailboxCapabilityProof {
     recipient: RecipientKey,
@@ -166,9 +173,12 @@ fn select_attempt_payload(
     });
     if capability.is_some() {
         return Ok(AttemptPayload {
-            bytes: cyclops_proto::render_doorbell_v1(notification.message_id()),
+            bytes: cyclops_proto::render_doorbell_v2(
+                notification.message_id(),
+                notification.attempt_id(),
+            ),
             transport: Some(NotificationTransport::Doorbell),
-            doorbell_format: Some(cyclops_proto::DOORBELL_FORMAT_COMPACT_CLAIM),
+            doorbell_format: Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_CLAIM),
             capability,
         });
     }
@@ -182,19 +192,48 @@ fn select_attempt_payload(
     })
 }
 
+/// Rebuild the exact payload selected at this notification's write boundary.
+///
+/// Delivery recovery and composer projection share this owner so a transport
+/// format cannot be actionable in one path and unprovable in the other.
+pub(crate) fn expected_notification_payload(
+    record: &cyclops_proto::NotificationRecord,
+    message: &LedgerLine,
+) -> Option<String> {
+    if message.id != record.message_id.as_str() {
+        return None;
+    }
+    match (record.transport, record.doorbell_format) {
+        (NotificationTransport::Doorbell, format) => match format {
+            None => Some(cyclops_proto::render_legacy_doorbell(&record.message_id)),
+            Some(cyclops_proto::DOORBELL_FORMAT_COMPACT_CLAIM) => {
+                Some(cyclops_proto::render_doorbell_v1(&record.message_id))
+            }
+            Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_CLAIM) => Some(
+                cyclops_proto::render_doorbell_v2(&record.message_id, record.attempt_id),
+            ),
+            Some(_) => None,
+        },
+        (NotificationTransport::DirectPayload, None) => {
+            Some(render_canonical_message_payload(message))
+        }
+        (NotificationTransport::DirectPayload, Some(_)) => None,
+    }
+}
+
 /// Delivery engine state. Lives in [`Inner`]; all behavior is free
 /// functions taking the daemon state so nothing here holds locks across
 /// awaits by construction.
 pub(crate) struct Engine {
     /// Legacy direct-delivery workers, keyed by exact watched pane route.
     workers: StdMutex<HashMap<PaneKey, Arc<Worker>>>,
-    /// Canonical mailbox notification workers, keyed by durable recipient.
-    notification_workers: StdMutex<HashMap<RecipientKey, Arc<Worker>>>,
-    /// Worker tasks, aborted on daemon shutdown.
+    /// Active mailbox workers and their tasks, keyed by durable recipient.
+    notification_workers: StdMutex<HashMap<RecipientKey, NotificationWorker>>,
+    /// Legacy worker tasks, aborted on daemon shutdown.
     pub(crate) worker_tasks: StdMutex<Vec<JoinHandle<()>>>,
     /// Message ids ever issued or seen in the ledgers (unique per ledger).
     issued: StdMutex<HashSet<String>>,
-    /// Per-delivery unique tmux buffer names (amendment e).
+    /// Per-delivery unique tmux buffer names.
     buffer_seq: AtomicU64,
     /// Deliveries awaiting or upgradeable by a hook ACK, per exact route.
     acks: StdMutex<HashMap<PaneKey, Vec<Arc<DeliveryHandle>>>>,
@@ -212,10 +251,57 @@ pub(crate) struct Engine {
     /// delivery they are on, start no new one, and nothing crosses the
     /// paste boundary (the gate's proceed re-checks it).
     paused: AtomicBool,
+    /// Set before shutdown drains task handles. Once set, no worker registry
+    /// may publish new work.
+    stopping: AtomicBool,
+    /// Every spawned task below a registered daemon root. Shutdown waits
+    /// for this tree to become empty.
+    descendant_tasks: Arc<DescendantTaskDrain>,
+    /// Cancels descendant work at the same boundary that closes worker
+    /// creation. The journal seal remains the final write barrier.
+    descendant_stop: watch::Sender<bool>,
+}
+
+#[derive(Default)]
+struct DescendantTaskDrain {
+    active: AtomicUsize,
+    empty: Notify,
+}
+
+struct DescendantTaskGuard {
+    drain: Arc<DescendantTaskDrain>,
+}
+
+impl Drop for DescendantTaskGuard {
+    fn drop(&mut self) {
+        if self.drain.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.drain.empty.notify_one();
+        }
+    }
+}
+
+impl DescendantTaskDrain {
+    fn enter(self: &Arc<Self>) -> DescendantTaskGuard {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        DescendantTaskGuard {
+            drain: Arc::clone(self),
+        }
+    }
+
+    async fn wait_empty(&self) {
+        loop {
+            let empty = self.empty.notified();
+            if self.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            empty.await;
+        }
+    }
 }
 
 impl Engine {
     pub(crate) fn new() -> Engine {
+        let (descendant_stop, _) = watch::channel(false);
         Engine {
             workers: StdMutex::new(HashMap::new()),
             notification_workers: StdMutex::new(HashMap::new()),
@@ -226,7 +312,71 @@ impl Engine {
             open: StdMutex::new(Vec::new()),
             notification_attempts: StdMutex::new(HashMap::new()),
             paused: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
+            descendant_tasks: Arc::new(DescendantTaskDrain::default()),
+            descendant_stop,
         }
+    }
+
+    /// Wrap work in the daemon's descendant lifetime.
+    ///
+    /// `None` means shutdown cancelled the work. Callers that need a result
+    /// must treat that as an incomplete operation, never as success.
+    pub(crate) fn track_descendant<F>(
+        &self,
+        future: F,
+    ) -> impl std::future::Future<Output = Option<F::Output>> + Send + 'static
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let guard = self.descendant_tasks.enter();
+        let mut stop = self.descendant_stop.subscribe();
+        async move {
+            let _guard = guard;
+            if *stop.borrow() {
+                return None;
+            }
+            tokio::select! {
+                _ = stop.changed() => None,
+                output = future => Some(output),
+            }
+        }
+    }
+
+    pub(crate) fn spawn_descendant_task<F>(&self, future: F) -> JoinHandle<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let tracked = self.track_descendant(future);
+        tokio::spawn(async move {
+            let _ = tracked.await;
+        })
+    }
+
+    pub(crate) async fn wait_for_descendant_tasks(&self) {
+        self.descendant_tasks.wait_empty().await;
+    }
+
+    pub(crate) fn begin_stopping(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        self.paused.store(true, Ordering::SeqCst);
+        self.descendant_stop.send_replace(true);
+        for worker in self.workers.lock().expect("workers lock").values() {
+            worker.notify.notify_waiters();
+        }
+        for entry in self
+            .notification_workers
+            .lock()
+            .expect("notification workers lock")
+            .values()
+        {
+            entry.worker.notify.notify_waiters();
+        }
+    }
+
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
     }
 
     /// Remember a handle for the quiesce sweep, dropping entries whose
@@ -256,20 +406,225 @@ impl Engine {
         }
     }
 
+    fn notification_handle(
+        &self,
+        attempt_id: NotificationAttemptId,
+    ) -> Option<Arc<DeliveryHandle>> {
+        self.notification_attempts
+            .lock()
+            .expect("notification attempts lock")
+            .get(&attempt_id)
+            .and_then(std::sync::Weak::upgrade)
+    }
+
+    /// Retire this run only when the attempts index still names this handle.
+    ///
+    /// Evidence-driven reopening replaces the index with a fresh handle for
+    /// the same durable attempt. The returning stale handle must not erase it.
+    fn retire_notification_run(&self, handle: &Arc<DeliveryHandle>) -> bool {
+        let Some(notification) = &handle.notification else {
+            return false;
+        };
+        let attempt_id = notification.attempt_id();
+        let mut active = self
+            .notification_attempts
+            .lock()
+            .expect("notification attempts lock");
+        let owns_entry = active
+            .get(&attempt_id)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|current| Arc::ptr_eq(&current, handle));
+        if !owns_entry {
+            return false;
+        }
+        active.remove(&attempt_id);
+        true
+    }
+
+    fn replace_notification_run(
+        &self,
+        old: &Arc<DeliveryHandle>,
+        new: &Arc<DeliveryHandle>,
+    ) -> bool {
+        let Some(notification) = &old.notification else {
+            return false;
+        };
+        let attempt_id = notification.attempt_id();
+        let mut active = self
+            .notification_attempts
+            .lock()
+            .expect("notification attempts lock");
+        let owns_entry = active
+            .get(&attempt_id)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|current| Arc::ptr_eq(&current, old));
+        if owns_entry {
+            active.insert(attempt_id, Arc::downgrade(new));
+        }
+        drop(active);
+        if owns_entry {
+            self.track(new);
+        }
+        owns_entry
+    }
+
     /// Un-hold the pipeline and wake every worker.
     fn resume_workers(&self) {
         self.paused.store(false, Ordering::SeqCst);
         for worker in self.workers.lock().expect("workers lock").values() {
             worker.notify.notify_one();
         }
-        for worker in self
+        for entry in self
             .notification_workers
             .lock()
             .expect("notification workers lock")
             .values()
         {
-            worker.notify.notify_one();
+            entry.worker.notify.notify_one();
         }
+    }
+
+    /// Enqueue while holding the worker registry lock. Retirement takes the
+    /// same locks in the same order, so it cannot remove a worker between
+    /// lookup and queue publication.
+    fn enqueue_notification_worker<F>(
+        &self,
+        recipient: RecipientKey,
+        handle: Arc<DeliveryHandle>,
+        spawn: F,
+    ) -> Option<Arc<Worker>>
+    where
+        F: FnOnce(Arc<Worker>) -> JoinHandle<()>,
+    {
+        let mut entries = self
+            .notification_workers
+            .lock()
+            .expect("notification workers lock");
+        if self.stopping.load(Ordering::SeqCst) {
+            return None;
+        }
+        if let Some(entry) = entries.get_mut(&recipient) {
+            let worker = Arc::clone(&entry.worker);
+            worker.enqueue_back(handle);
+            if entry.task.is_finished() && !worker.is_faulted() {
+                worker.set_fault("notification worker supervisor exited");
+            }
+            drop(entries);
+            worker.notify.notify_one();
+            return Some(worker);
+        }
+
+        let worker = Arc::new(Worker::new());
+        worker.enqueue_back(handle);
+        let task = spawn(Arc::clone(&worker));
+        entries.insert(
+            recipient,
+            NotificationWorker {
+                worker: Arc::clone(&worker),
+                task,
+            },
+        );
+        drop(entries);
+        worker.notify.notify_one();
+        Some(worker)
+    }
+
+    /// Remove this exact worker only while its queue is still empty.
+    /// True means the caller no longer owns the registry entry and must exit.
+    fn retire_notification_worker(&self, recipient: RecipientKey, worker: &Arc<Worker>) -> bool {
+        let mut entries = self
+            .notification_workers
+            .lock()
+            .expect("notification workers lock");
+        let Some(entry) = entries.get(&recipient) else {
+            return true;
+        };
+        if !Arc::ptr_eq(&entry.worker, worker) {
+            return true;
+        }
+        if !worker.is_idle() {
+            return false;
+        }
+        entries.remove(&recipient);
+        true
+    }
+
+    pub(crate) fn take_notification_worker_tasks(&self) -> Vec<JoinHandle<()>> {
+        std::mem::take(
+            &mut *self
+                .notification_workers
+                .lock()
+                .expect("notification workers lock"),
+        )
+        .into_values()
+        .map(|entry| entry.task)
+        .collect()
+    }
+
+    pub(crate) fn take_legacy_worker_tasks(&self) -> Vec<JoinHandle<()>> {
+        self.workers.lock().expect("workers lock").clear();
+        std::mem::take(&mut *self.worker_tasks.lock().expect("worker tasks lock"))
+    }
+
+    /// Content-free faults for exact notification work that stopped in memory.
+    pub(crate) fn notification_worker_diagnostics(&self) -> Vec<StatusDiagnostic> {
+        self.notification_workers
+            .lock()
+            .expect("notification workers lock")
+            .iter()
+            .filter_map(|(recipient, entry)| {
+                let state = entry.worker.state.lock().expect("worker state lock");
+                let fault = state.fault.as_ref()?;
+                let handle = state.current.as_ref().or_else(|| state.queue.front())?;
+                let notification = handle.notification.as_ref()?;
+                Some(StatusDiagnostic {
+                    code: if fault == CLAIMED_STAGED_SETTLEMENT_FAILED {
+                        "notification_settlement_storage_failed"
+                    } else if fault.starts_with("notification pre-write block storage failed:") {
+                        "notification_prewrite_storage_failed"
+                    } else if fault.starts_with("notification recovery failed:") {
+                        "notification_recovery_storage_failed"
+                    } else {
+                        "notification_worker_failed"
+                    }
+                    .into(),
+                    message_id: notification.message_id().clone(),
+                    notification_attempt: notification.attempt_id(),
+                    recipient: *recipient,
+                    recipient_label: handle.to.clone(),
+                    pane_id: handle.pane_id.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Whether the exact recipient worker currently owns this attempt.
+    ///
+    /// The weak attempt index, queued handles, and a faulted current handle do
+    /// not prove active work.
+    /// Status uses this only to describe the next step; mutation paths recheck
+    /// their own authority immediately before acting.
+    pub(crate) fn notification_worker_owns(
+        &self,
+        recipient: RecipientKey,
+        attempt_id: NotificationAttemptId,
+    ) -> bool {
+        let workers = self
+            .notification_workers
+            .lock()
+            .expect("notification workers lock");
+        let Some(entry) = workers.get(&recipient) else {
+            return false;
+        };
+        let state = entry.worker.state.lock().expect("worker state lock");
+        if state.fault.is_some() {
+            return false;
+        }
+        state
+            .current
+            .as_ref()
+            .and_then(|handle| handle.notification.as_ref())
+            .is_some_and(|notification| notification.attempt_id() == attempt_id)
     }
 
     /// Seed the issued-id set from a ledger so new ids stay unique per
@@ -295,22 +650,153 @@ impl Engine {
     }
 }
 
+struct NotificationWorker {
+    worker: Arc<Worker>,
+    task: JoinHandle<()>,
+}
+
 /// Per-recipient FIFO worker. The task sleeps on `notify` when idle.
 struct Worker {
-    queue: StdMutex<VecDeque<Arc<DeliveryHandle>>>,
+    state: StdMutex<WorkerState>,
     notify: Notify,
-    busy: AtomicBool,
     /// Set when quota parking hit this recipient; carries the reset hint.
-    /// Cleared only by an operator verb (M2). Never auto-retried.
+    /// Cleared only by an operator recovery verb. Never auto-retried.
     parked: StdMutex<Option<String>>,
 }
 
+struct WorkerState {
+    queue: VecDeque<Arc<DeliveryHandle>>,
+    /// Strong ownership of the exact job removed from the FIFO.
+    current: Option<Arc<DeliveryHandle>>,
+    /// Visible reason the supervisor stopped restarting this worker.
+    fault: Option<String>,
+    /// Bounds failures that happen outside an exact current job.
+    empty_restarts: u8,
+}
+
 impl Worker {
+    fn new() -> Self {
+        Self {
+            state: StdMutex::new(WorkerState {
+                queue: VecDeque::new(),
+                current: None,
+                fault: None,
+                empty_restarts: 0,
+            }),
+            notify: Notify::new(),
+            parked: StdMutex::new(None),
+        }
+    }
+
+    fn enqueue_back(&self, handle: Arc<DeliveryHandle>) {
+        self.state
+            .lock()
+            .expect("worker state lock")
+            .queue
+            .push_back(handle);
+    }
+
+    /// Return the exact in-flight job to the FIFO head without releasing
+    /// ownership of it. Used when quiesce closes the gate after admission
+    /// but before the pane write.
+    fn requeue_current_front(&self, handle: &Arc<DeliveryHandle>) -> bool {
+        let mut state = self.state.lock().expect("worker state lock");
+        let owns = state
+            .current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, handle));
+        if owns {
+            let current = state.current.take().expect("current checked above");
+            state.queue.push_front(current);
+        }
+        owns
+    }
+
+    fn drain_pending(&self) -> Vec<Arc<DeliveryHandle>> {
+        self.state
+            .lock()
+            .expect("worker state lock")
+            .queue
+            .drain(..)
+            .collect()
+    }
+
+    fn prepend(&self, handles: Vec<Arc<DeliveryHandle>>) {
+        let mut state = self.state.lock().expect("worker state lock");
+        for handle in handles.into_iter().rev() {
+            state.queue.push_front(handle);
+        }
+    }
+
+    /// Return the already-owned job after a supervisor restart, or take the FIFO head.
+    fn current_or_next(&self) -> Option<Arc<DeliveryHandle>> {
+        let mut state = self.state.lock().expect("worker state lock");
+        if let Some(current) = &state.current {
+            return Some(Arc::clone(current));
+        }
+        let next = state.queue.pop_front()?;
+        state.current = Some(Arc::clone(&next));
+        Some(next)
+    }
+
+    /// Release this exact in-flight job. False means ownership already moved,
+    /// such as a quiesce handback or a supervisor replacing a failed run.
+    fn finish(&self, handle: &Arc<DeliveryHandle>) -> bool {
+        let mut state = self.state.lock().expect("worker state lock");
+        let owns = state
+            .current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, handle));
+        if owns {
+            state.current = None;
+            state.empty_restarts = 0;
+        }
+        owns
+    }
+
+    fn replace_current(&self, old: &Arc<DeliveryHandle>, new: Arc<DeliveryHandle>) -> bool {
+        let mut state = self.state.lock().expect("worker state lock");
+        let owns = state
+            .current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, old));
+        if owns {
+            state.current = Some(new);
+        }
+        owns
+    }
+
+    #[cfg(test)]
+    fn current(&self) -> Option<Arc<DeliveryHandle>> {
+        self.state
+            .lock()
+            .expect("worker state lock")
+            .current
+            .clone()
+    }
+
+    fn is_idle(&self) -> bool {
+        let state = self.state.lock().expect("worker state lock");
+        state.current.is_none() && state.queue.is_empty()
+    }
+
+    fn set_fault(&self, cause: impl Into<String>) {
+        self.state.lock().expect("worker state lock").fault = Some(cause.into());
+    }
+
+    fn is_faulted(&self) -> bool {
+        self.state
+            .lock()
+            .expect("worker state lock")
+            .fault
+            .is_some()
+    }
+
     /// Deliveries ahead of `handle` from the sender's point of view.
     fn position_of(&self, handle: &Arc<DeliveryHandle>) -> u32 {
-        let q = self.queue.lock().expect("worker queue lock");
-        let busy = self.busy.load(Ordering::SeqCst) as u32;
-        match q.iter().position(|h| Arc::ptr_eq(h, handle)) {
+        let state = self.state.lock().expect("worker state lock");
+        let busy = state.current.is_some() as u32;
+        match state.queue.iter().position(|h| Arc::ptr_eq(h, handle)) {
             Some(i) => i as u32 + busy,
             // Not queued: it is the in-flight one (or already resolved).
             None => 0,
@@ -362,20 +848,35 @@ pub(crate) struct DeliveryHandle {
     /// matches the manifest-declared TurnKey instead.
     submitted_at_ms: std::sync::atomic::AtomicU64,
     /// The manifest bound to the pane when the submit key was sent. Paired
-    /// with `submitted_pid` it is the delivery's BINDING: the process and
-    /// the vendor rules that Enter actually reached. Receipt evidence is
-    /// only evidence about that binding, so a replacement occupant cannot
-    /// resolve, or upgrade, a delivery it never received.
+    /// with `submitted_agent` it identifies the agent instance and vendor
+    /// rules that own receipt evidence. A transient foreground tool may
+    /// change without transferring that ownership.
     submitted_manifest: StdMutex<Option<String>>,
+    /// True once the synchronous write-boundary hook completed.
+    write_boundary_crossed: AtomicBool,
+    /// One automatic supervisor recovery is allowed for this exact run.
+    worker_recoveries: AtomicU64,
+    /// A readiness edge observed while this claimed-barrier run was active.
+    /// Consumed only after the attempt index releases this handle.
+    claimed_notification_rerun_requested: AtomicBool,
 }
 
-/// A vendor acknowledgement that landed before the delivery was ready
-/// for it: the edge it was taken at, and the turn it named if it named
-/// one.
+/// Evidence from a vendor hook that landed before the worker consumed it.
 #[derive(Debug, Clone)]
-struct EarlyAck {
+struct PendingAck {
     edge_ms: u64,
     turn: Option<crate::turnkey::TurnKey>,
+    evidence: PendingAckEvidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingAckEvidence {
+    /// The hook itself proves receipt.
+    Receipt,
+    /// The hook only proves dispatch. A later visual Working observation
+    /// must accept the same correlated turn.
+    DispatchPending,
+    DispatchAccepted,
 }
 
 struct HandleState {
@@ -395,17 +896,20 @@ struct HandleState {
     /// `Staged`, and install afterwards, and the worker can move to
     /// `Submitted` and consume in between: the record is then written
     /// after the only read of it, and a valid acknowledgement is lost.
-    early_ack: Option<EarlyAck>,
+    early_ack: Option<PendingAck>,
     /// Monotonic count of direct-delivery barrier claims, including
     /// refused ones. Mailbox notifications use their durable attempt id.
     /// Separate from `attempts` because a refused claim wrote nothing and
     /// must not cost transport budget.
     claims: u32,
-    /// Attempts that ended at a refused barrier claim. `attempts` is
-    /// append-only history and never runs backward; this is subtracted
-    /// from it to get the transport budget actually spent, because a
-    /// refused claim wrote nothing.
+    /// Count of write-boundary refusals that wrote no pane bytes. Attempts
+    /// remain append-only, so retry accounting subtracts this cumulative
+    /// count rather than charging a refusal as transport work.
     regates: u32,
+    /// Binding and capability each receive one immediate re-proof after an
+    /// exact pane or readiness edge. Repeated refusal under unchanged
+    /// evidence settles as a durable pre-write block.
+    regate_reproof_used: [bool; 2],
     /// The barrier claim this delivery currently holds. Set only when a
     /// claim was granted, and compared before any later settlement so a
     /// receipt cannot release a barrier this delivery no longer owns.
@@ -537,6 +1041,7 @@ impl DeliveryHandle {
                 early_ack: None,
                 claims: 0,
                 regates: 0,
+                regate_reproof_used: [false; 2],
                 barrier: None,
             }),
             state_tx,
@@ -547,6 +1052,9 @@ impl DeliveryHandle {
             submitted_agent: StdMutex::new(None),
             submitted_at_ms: std::sync::atomic::AtomicU64::new(0),
             submitted_manifest: StdMutex::new(None),
+            write_boundary_crossed: AtomicBool::new(false),
+            worker_recoveries: AtomicU64::new(0),
+            claimed_notification_rerun_requested: AtomicBool::new(false),
         })
     }
 
@@ -571,6 +1079,25 @@ impl DeliveryHandle {
             .notification_transport
             .lock()
             .expect("notification transport lock")
+    }
+
+    fn restore_claimed_notification_barrier(&self) {
+        let attempt_id = self
+            .notification
+            .as_ref()
+            .expect("staged recovery belongs to a notification")
+            .attempt_id();
+        {
+            let mut state = self.state.lock().expect("handle state lock");
+            state.state = DeliveryState::Staged;
+            state.barrier = Some(attempt_id.to_string());
+        }
+        self.state_tx.send_replace(DeliveryState::Staged);
+        *self
+            .notification_transport
+            .lock()
+            .expect("notification transport lock") = Some(NotificationTransport::Doorbell);
+        self.write_boundary_crossed.store(true, Ordering::SeqCst);
     }
 
     /// Direct sends own session delivery state. Mailbox notifications use
@@ -704,6 +1231,7 @@ fn emit_delivery_state(
     sessions: &[usize],
     msg_id: &str,
     to: &str,
+    recipient: Option<RecipientKey>,
     from: DeliveryState,
     next: DeliveryState,
     cause: Option<&str>,
@@ -718,6 +1246,7 @@ fn emit_delivery_state(
             msg_id.to_string(),
             json!({
                 "to": to,
+                "recipient": recipient,
                 "from": from,
                 "to_state": next,
                 "cause": cause,
@@ -738,6 +1267,7 @@ fn emit_delivery_state(
         json!({
             "id": msg_id,
             "to": to,
+            "recipient": recipient,
             "from": from,
             "to_state": next,
             "cause": cause,
@@ -810,6 +1340,7 @@ fn advance(
             &handle.ledger_sessions,
             &handle.msg_id,
             &handle.to,
+            inner.recipient_key(handle.session_idx, &handle.pane_id),
             from,
             step.next,
             step.cause,
@@ -862,6 +1393,7 @@ fn gate_line(
     rule: Option<&str>,
     cause: Option<&str>,
 ) {
+    let recipient = inner.recipient_key(handle.session_idx, &handle.pane_id);
     let line = LedgerLine {
         to: vec![handle.to.clone()],
         ..daemon_line(
@@ -869,6 +1401,7 @@ fn gate_line(
             handle.msg_id.clone(),
             json!({
                 "to": handle.to,
+                "recipient": recipient,
                 "action": action,
                 "rule": rule,
                 "cause": cause,
@@ -881,6 +1414,7 @@ fn gate_line(
         json!({
             "id": handle.msg_id,
             "to": handle.to,
+            "recipient": recipient,
             "action": action,
             "rule": rule,
             "cause": cause,
@@ -1039,8 +1573,8 @@ pub(crate) fn admin_notify(
 /// Holds the workers (they finish the delivery they are on and start no
 /// new one; the gate's proceed re-checks the hold so nothing crosses the
 /// paste boundary), then waits out every delivery already past the paste.
-/// Those windows are seconds by construction — the verify re-reads and
-/// the ACK deadline — so on a healthy fleet this answers quickly.
+/// Those windows are seconds by construction: the verify re-reads and the
+/// acknowledgment deadline. On a healthy fleet this answers quickly.
 ///
 /// Deliveries that have not reached a pane do not block quiet: a restart
 /// requeues them ([`close_limbo`]). Quiet keeps the pipeline held for the
@@ -1066,11 +1600,16 @@ pub(crate) async fn quiesce(inner: &Arc<Inner>, timeout_ms: Option<u64>) -> Quie
             .collect();
         if in_flight.is_empty() {
             let held = Arc::clone(inner);
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(QUIESCE_HOLD_FALLBACK_MS)).await;
-                if held.engine.paused.load(Ordering::SeqCst) {
-                    warn!("quiesce hold expired with no stop; resuming deliveries");
-                    held.engine.resume_workers();
+            let mut stop = held.stop.clone();
+            inner.engine.spawn_descendant_task(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(QUIESCE_HOLD_FALLBACK_MS)) => {
+                        if held.engine.paused.load(Ordering::SeqCst) {
+                            warn!("quiesce hold expired with no stop; resuming deliveries");
+                            held.engine.resume_workers();
+                        }
+                    }
+                    _ = stop.changed() => {}
                 }
             });
             return QuiesceResult {
@@ -1104,16 +1643,16 @@ pub(crate) async fn quiesce(inner: &Arc<Inner>, timeout_ms: Option<u64>) -> Quie
 }
 
 // ---------------------------------------------------------------------------
-// Restart-limbo closure
+// Restart recovery
 // ---------------------------------------------------------------------------
 
-/// Resolve deliveries a previous daemon run left unresolved (GOALS: limbo
-/// is a bug). Runs once at boot over the replayed session ledgers, and
-/// the pre-write boundary decides each chain's fate, the same boundary
+/// Resolve deliveries a previous daemon run left unresolved. This runs once
+/// at boot over the replayed session ledgers. The pre-write boundary decides
+/// each chain's fate, using the same boundary
 /// the running pipeline retries by:
 ///
 /// - Before the paste (queued, gating, retry_queued): nothing has touched
-///   the pane, so the chain is REQUEUED — payload rebuilt from the msg
+///   the pane, so the chain is requeued. The payload is rebuilt from the message
 ///   line, handle re-enqueued, and the delivery re-enters the gate as if
 ///   the restart were a long hold. One aggregated FYI names them.
 /// - Past the paste: the outcome is unknowable from here, so the chain
@@ -1232,6 +1771,7 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
                             &[*idx],
                             &id,
                             &to,
+                            inner.recipient_key(sess_idx, &pane_id),
                             state,
                             DeliveryState::RetryQueued,
                             Some("daemon_restart"),
@@ -1256,12 +1796,10 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
                         st.attempts = attempts;
                     }
                     inner.engine.track(&handle);
-                    let worker = worker_for(inner, sess_idx, &pane_id);
-                    worker
-                        .queue
-                        .lock()
-                        .expect("worker queue lock")
-                        .push_back(handle);
+                    let Some(worker) = worker_for(inner, sess_idx, &pane_id) else {
+                        continue;
+                    };
+                    worker.enqueue_back(handle);
                     worker.notify.notify_one();
                     requeued.push(format!("{id} -> {to}"));
                     continue;
@@ -1285,6 +1823,7 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
                 &[*idx],
                 &id,
                 &to,
+                None,
                 state,
                 DeliveryState::AttentionRequired,
                 Some("daemon_restart"),
@@ -1303,7 +1842,7 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
         requeued.dedup();
         // Fyi, not action-required: these deliveries are being handled,
         // and a ping that claims a human is needed while naming nothing a
-        // human can do is the contradiction M3 banned.
+        // human can do contradicts the calm-view contract.
         admin_notify(
             inner,
             NotifyLevel::Fyi,
@@ -1609,11 +2148,20 @@ pub(crate) async fn msg_send(
                 let handle =
                     DeliveryHandle::new(&msg_id, name, pane_id, *session_idx, payload.clone());
                 inner.engine.track(&handle);
-                let worker = worker_for(inner, *session_idx, pane_id);
+                let Some(worker) = worker_for(inner, *session_idx, pane_id) else {
+                    advance(
+                        inner,
+                        &handle,
+                        &[DeliveryState::Queued],
+                        Step::to(DeliveryState::AttentionRequired).cause("daemon_stopping"),
+                    );
+                    handles.push(handle);
+                    continue;
+                };
                 let parked_hint = worker.parked.lock().expect("parked lock").clone();
                 if let Some(hint) = parked_hint {
                     // Parked recipients never auto-retry; new sends park
-                    // immediately with the reset hint (amendment f).
+                    // immediately with the reset hint.
                     advance(
                         inner,
                         &handle,
@@ -1625,8 +2173,7 @@ pub(crate) async fn msg_send(
                 } else {
                     // Block for this receipt only when the worker starts on
                     // it now AND the gate answers without waiting on anyone.
-                    let first_in_line = !worker.busy.load(Ordering::SeqCst)
-                        && worker.queue.lock().expect("worker queue lock").is_empty();
+                    let first_in_line = worker.is_idle();
                     let answers_now = gate_answers_now(inner, *session_idx, pane_id);
                     // The worker is woken asynchronously. Seed the head's
                     // first hold disposition before enqueueing it, so a
@@ -1636,11 +2183,7 @@ pub(crate) async fn msg_send(
                     if first_in_line && !answers_now {
                         handle.set_hold(initial_hold(inner, *session_idx, pane_id));
                     }
-                    worker
-                        .queue
-                        .lock()
-                        .expect("worker queue lock")
-                        .push_back(Arc::clone(&handle));
+                    worker.enqueue_back(Arc::clone(&handle));
                     worker.notify.notify_one();
                     if first_in_line && answers_now {
                         blocking.push(Arc::clone(&handle));
@@ -1870,6 +2413,7 @@ fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryRecei
             state,
             notification_state: None,
             quota_state: None,
+            notification_settlement: None,
             position: None,
             // The gate's machine cause travels as-is when the daemon had
             // no detail to add; wording it belongs to the surface showing
@@ -1885,6 +2429,7 @@ fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryRecei
             state,
             notification_state: None,
             quota_state: None,
+            notification_settlement: None,
             position: None,
             note: None,
             pane,
@@ -1910,6 +2455,7 @@ fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryRecei
         state: DeliveryState::Queued,
         notification_state: None,
         quota_state: None,
+        notification_settlement: None,
         position,
         note: None,
         pane,
@@ -1955,54 +2501,25 @@ fn expand_recipients(inner: &Arc<Inner>, to: &[String]) -> Result<Vec<String>, W
 }
 
 /// Get or spawn the FIFO worker owning one pane.
-fn worker_for(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) -> Arc<Worker> {
+fn worker_for(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) -> Option<Arc<Worker>> {
     let pane = PaneKey::new(session_idx, pane_id);
     let mut workers = inner.engine.workers.lock().expect("workers lock");
+    if inner.engine.is_stopping() {
+        return None;
+    }
     if let Some(w) = workers.get(&pane) {
-        return Arc::clone(w);
+        return Some(Arc::clone(w));
     }
-    let worker = Arc::new(Worker {
-        queue: StdMutex::new(VecDeque::new()),
-        notify: Notify::new(),
-        busy: AtomicBool::new(false),
-        parked: StdMutex::new(None),
-    });
+    let worker = Arc::new(Worker::new());
     workers.insert(pane, Arc::clone(&worker));
-    let task = tokio::spawn(worker_loop(Arc::clone(inner), Arc::clone(&worker)));
+    let task = tokio::spawn(worker_supervisor(Arc::clone(inner), Arc::clone(&worker)));
     inner
         .engine
         .worker_tasks
         .lock()
         .expect("worker tasks lock")
         .push(task);
-    worker
-}
-
-/// Get or spawn the FIFO worker owning one exact mailbox recipient.
-fn notification_worker_for(inner: &Arc<Inner>, recipient: RecipientKey) -> Arc<Worker> {
-    let mut workers = inner
-        .engine
-        .notification_workers
-        .lock()
-        .expect("notification workers lock");
-    if let Some(worker) = workers.get(&recipient) {
-        return Arc::clone(worker);
-    }
-    let worker = Arc::new(Worker {
-        queue: StdMutex::new(VecDeque::new()),
-        notify: Notify::new(),
-        busy: AtomicBool::new(false),
-        parked: StdMutex::new(None),
-    });
-    workers.insert(recipient, Arc::clone(&worker));
-    let task = tokio::spawn(worker_loop(Arc::clone(inner), Arc::clone(&worker)));
-    inner
-        .engine
-        .worker_tasks
-        .lock()
-        .expect("worker tasks lock")
-        .push(task);
-    worker
+    Some(worker)
 }
 
 /// Attach an already-queued mailbox notification to the pane's existing FIFO worker.
@@ -2015,19 +2532,53 @@ pub(crate) fn enqueue_notification_attempt(
     pane_id: &str,
     display_recipient: &str,
     notification: NotificationContext,
-) -> Arc<DeliveryHandle> {
+    replace_existing: bool,
+) -> Option<Arc<DeliveryHandle>> {
     let attempt_id = notification.attempt_id();
     let recipient = notification.recipient();
+    let claimed_barrier = notification.claimed_notification_barrier();
     let mut active = inner
         .engine
         .notification_attempts
         .lock()
         .expect("notification attempts lock");
     active.retain(|_, handle| handle.strong_count() > 0);
-    if let Some(handle) = active.get(&attempt_id).and_then(std::sync::Weak::upgrade) {
-        return handle;
+    if !replace_existing {
+        if let Some(handle) = active.get(&attempt_id).and_then(std::sync::Weak::upgrade) {
+            if claimed_barrier.as_ref().is_ok_and(Option::is_some) {
+                handle
+                    .claimed_notification_rerun_requested
+                    .store(true, Ordering::SeqCst);
+            }
+            return Some(handle);
+        }
     }
-    let doorbell = cyclops_proto::render_doorbell_v1(notification.message_id());
+    let claimed_barrier = match claimed_barrier {
+        Ok(barrier) => barrier,
+        Err(error) => {
+            error!(message_id = %notification.message_id(), %error, "cannot classify notification enqueue");
+            return None;
+        }
+    };
+    let doorbell = if claimed_barrier.is_some() {
+        let record = match notification.current_record() {
+            Ok(record) => record,
+            Err(error) => {
+                error!(message_id = %notification.message_id(), %error, "cannot rebuild claimed staged notification");
+                return None;
+            }
+        };
+        // Recovery owns the durable error result. An empty handle payload is
+        // never written on this path; it lets the worker append one exact
+        // attention cause for a missing message or unsupported format.
+        notification
+            .message_line()
+            .ok()
+            .and_then(|message| expected_notification_payload(&record, &message))
+            .unwrap_or_default()
+    } else {
+        cyclops_proto::render_doorbell_v2(notification.message_id(), notification.attempt_id())
+    };
     let handle = DeliveryHandle::for_notification(
         display_recipient,
         pane_id,
@@ -2035,22 +2586,99 @@ pub(crate) fn enqueue_notification_attempt(
         doorbell,
         notification,
     );
+    if claimed_barrier.is_some() {
+        handle.restore_claimed_notification_barrier();
+    }
     active.insert(attempt_id, Arc::downgrade(&handle));
     drop(active);
     inner.engine.track(&handle);
-    let worker = notification_worker_for(inner, recipient);
-    worker
-        .queue
-        .lock()
-        .expect("worker queue lock")
-        .push_back(Arc::clone(&handle));
-    worker.notify.notify_one();
-    handle
+    let task_inner = Arc::clone(inner);
+    let worker =
+        inner
+            .engine
+            .enqueue_notification_worker(recipient, Arc::clone(&handle), move |worker| {
+                tokio::spawn(notification_worker_supervisor(
+                    task_inner, recipient, worker,
+                ))
+            });
+    if worker.is_none() {
+        inner.engine.retire_notification_run(&handle);
+        return None;
+    }
+    Some(handle)
 }
 
 // ---------------------------------------------------------------------------
 // Worker
 // ---------------------------------------------------------------------------
+
+/// Observe every worker-loop exit without waiting for another enqueue.
+///
+/// The loop child owns normal FIFO work. The supervisor owns its task and
+/// classifies a panic against the exact current handle before starting a new
+/// child. Dropping the supervisor aborts its child through `DeliveryTask`.
+async fn supervise_worker_task<S, R>(mut spawn: S, mut recover: R)
+where
+    S: FnMut() -> JoinHandle<()>,
+    R: FnMut() -> bool,
+{
+    loop {
+        let mut child = DeliveryTask(spawn());
+        match child.wait().await {
+            Ok(()) => return,
+            Err(error) => {
+                error!(%error, "delivery worker loop failed");
+                if !recover() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    }
+}
+
+fn recover_outer_worker(inner: &Arc<Inner>, worker: &Arc<Worker>) -> bool {
+    if let Some(handle) = worker.current_or_next() {
+        return recover_failed_job(inner, worker, &handle);
+    }
+    let mut state = worker.state.lock().expect("worker state lock");
+    if state.empty_restarts == 0 {
+        state.empty_restarts = 1;
+        true
+    } else {
+        state.fault = Some("worker loop failed repeatedly without an owned job".into());
+        false
+    }
+}
+
+async fn worker_supervisor(inner: Arc<Inner>, worker: Arc<Worker>) {
+    supervise_worker_task(
+        || {
+            inner
+                .engine
+                .spawn_descendant_task(worker_loop(Arc::clone(&inner), Arc::clone(&worker)))
+        },
+        || recover_outer_worker(&inner, &worker),
+    )
+    .await;
+}
+
+async fn notification_worker_supervisor(
+    inner: Arc<Inner>,
+    recipient: RecipientKey,
+    worker: Arc<Worker>,
+) {
+    supervise_worker_task(
+        || {
+            inner.engine.spawn_descendant_task(notification_worker_loop(
+                Arc::clone(&inner),
+                recipient,
+                Arc::clone(&worker),
+            ))
+        },
+        || recover_outer_worker(&inner, &worker),
+    )
+    .await;
+}
 
 async fn worker_loop(inner: Arc<Inner>, worker: Arc<Worker>) {
     loop {
@@ -2061,7 +2689,7 @@ async fn worker_loop(inner: Arc<Inner>, worker: Arc<Worker>) {
             worker.notify.notified().await;
             continue;
         }
-        let job = worker.queue.lock().expect("worker queue lock").pop_front();
+        let job = worker.current_or_next();
         match job {
             Some(handle) => {
                 let parked_hint =
@@ -2078,32 +2706,466 @@ async fn worker_loop(inner: Arc<Inner>, worker: Arc<Worker>) {
                             .cause("blocked_quota")
                             .note(hint),
                     );
+                    worker.finish(&handle);
                     continue;
                 }
-                worker.busy.store(true, Ordering::SeqCst);
-                process(&inner, &worker, &handle).await;
-                worker.busy.store(false, Ordering::SeqCst);
+                match supervised_process(&inner, &worker, &handle).await {
+                    Ok(()) => {
+                        worker.finish(&handle);
+                    }
+                    Err(error) => {
+                        error!(id = %handle.msg_id, %error, "legacy delivery worker failed");
+                        if !recover_failed_job(&inner, &worker, &handle) {
+                            return;
+                        }
+                    }
+                }
             }
             None => worker.notify.notified().await,
         }
     }
 }
 
-/// Resolve the live watcher that still owns this handle's route.
+async fn notification_worker_loop(inner: Arc<Inner>, recipient: RecipientKey, worker: Arc<Worker>) {
+    loop {
+        if inner.engine.paused.load(Ordering::SeqCst) {
+            if inner.engine.retire_notification_worker(recipient, &worker) {
+                return;
+            }
+            worker.notify.notified().await;
+            continue;
+        }
+        let job = worker.current_or_next();
+        let Some(handle) = job else {
+            if inner.engine.retire_notification_worker(recipient, &worker) {
+                return;
+            }
+            continue;
+        };
+        match supervised_process(&inner, &worker, &handle).await {
+            Ok(()) => {
+                if worker.is_faulted() {
+                    return;
+                }
+                // Quiesce may have atomically returned this same handle to
+                // the FIFO. In that case its attempt index remains active.
+                if worker.finish(&handle) {
+                    let retired = inner.engine.retire_notification_run(&handle);
+                    if retired
+                        && handle
+                            .claimed_notification_rerun_requested
+                            .swap(false, Ordering::SeqCst)
+                    {
+                        if let (Some(service), Some(notification)) =
+                            (&inner.mailbox, &handle.notification)
+                        {
+                            if let Err(error) = crate::messaging::schedule_recipient(
+                                &inner,
+                                service,
+                                notification.recipient(),
+                            ) {
+                                error!(
+                                    id = %handle.msg_id,
+                                    %error,
+                                    "cannot reschedule claimed notification after readiness edge"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                error!(id = %handle.msg_id, %error, "notification delivery worker failed");
+                if !recover_failed_job(&inner, &worker, &handle) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Abort the child if its owning worker is cancelled during shutdown.
+struct DeliveryTask(JoinHandle<()>);
+
+impl DeliveryTask {
+    async fn wait(&mut self) -> Result<(), tokio::task::JoinError> {
+        (&mut self.0).await
+    }
+}
+
+impl Drop for DeliveryTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn supervised_process(
+    inner: &Arc<Inner>,
+    worker: &Arc<Worker>,
+    handle: &Arc<DeliveryHandle>,
+) -> Result<(), tokio::task::JoinError> {
+    let task_inner = Arc::clone(inner);
+    let worker = Arc::clone(worker);
+    let handle = Arc::clone(handle);
+    let mut task = DeliveryTask(inner.engine.spawn_descendant_task(async move {
+        process(&task_inner, &worker, &handle).await;
+    }));
+    task.wait().await
+}
+
+/// Classify one panicked job from its exact durable boundary.
 ///
-/// Direct delivery keeps its legacy slot lookup. A mailbox notification is
-/// addressable only while the same session instance remains attached in the
-/// original slot and still contains the recipient's exact pane.
-fn watcher_for_handle(inner: &Inner, handle: &DeliveryHandle) -> Option<Arc<SessionWatcher>> {
+/// True restarts the worker loop. False leaves a visible fault and stops it.
+fn recover_failed_job(
+    inner: &Arc<Inner>,
+    worker: &Arc<Worker>,
+    handle: &Arc<DeliveryHandle>,
+) -> bool {
+    let recovery = handle.worker_recoveries.fetch_add(1, Ordering::SeqCst);
+    if let Some(notification) = &handle.notification {
+        let current = match notification.current_record() {
+            Ok(current) => current,
+            Err(error) => {
+                worker.set_fault(format!("notification recovery failed: {error}"));
+                return false;
+            }
+        };
+        if current.attempt_id != notification.attempt_id()
+            || current.pre_write_reopen_count != notification.run_epoch()
+        {
+            // Another run now owns this attempt. The stale task has no fact left to write.
+            worker.finish(handle);
+            inner.engine.retire_notification_run(handle);
+            return true;
+        }
+        match current.state {
+            NotificationState::Queued | NotificationState::Gating if recovery == 0 => {
+                let fresh = DeliveryHandle::for_notification(
+                    &handle.to,
+                    &handle.pane_id,
+                    handle.session_idx,
+                    cyclops_proto::render_doorbell_v2(
+                        notification.message_id(),
+                        notification.attempt_id(),
+                    ),
+                    notification.clone(),
+                );
+                fresh.worker_recoveries.store(1, Ordering::SeqCst);
+                if !worker.replace_current(handle, Arc::clone(&fresh))
+                    || !inner.engine.replace_notification_run(handle, &fresh)
+                {
+                    worker.set_fault("notification recovery lost exact job ownership");
+                    worker.finish(&fresh);
+                    return false;
+                }
+                true
+            }
+            NotificationState::Queued | NotificationState::Gating => {
+                let Some(record) = persist_worker_failed_prewrite(notification, worker) else {
+                    return false;
+                };
+                notify_notification_prewrite_blocked(inner, handle, &record);
+                worker.finish(handle);
+                inner.engine.retire_notification_run(handle);
+                true
+            }
+            NotificationState::Staged
+                if recovery == 0
+                    && notification
+                        .claimed_notification_barrier()
+                        .is_ok_and(|barrier| barrier.is_some()) =>
+            {
+                true
+            }
+            NotificationState::Writing
+            | NotificationState::Staged
+            | NotificationState::Submitting
+            | NotificationState::Submitted => {
+                if let Err(error) = notification
+                    .record_attention(NotificationAttentionCause::TransportOutcomeUnknown)
+                {
+                    worker.set_fault(format!("notification recovery failed: {error}"));
+                    return false;
+                }
+                unregister_ack(inner, handle);
+                let _ = advance(
+                    inner,
+                    handle,
+                    &[
+                        DeliveryState::Pasting,
+                        DeliveryState::Staged,
+                        DeliveryState::Submitted,
+                        DeliveryState::RetryQueued,
+                    ],
+                    Step::to(DeliveryState::AttentionRequired).cause("worker_failed_after_write"),
+                );
+                worker.finish(handle);
+                inner.engine.retire_notification_run(handle);
+                true
+            }
+            NotificationState::Notified => {
+                unregister_ack(inner, handle);
+                if current.transport == NotificationTransport::DirectPayload {
+                    if let Err(error) = notification.record_delivered_direct() {
+                        worker.set_fault(format!("direct settlement recovery failed: {error}"));
+                        return false;
+                    }
+                    if let Some(service) = &inner.mailbox {
+                        if let Err(error) = crate::messaging::schedule_recipient(
+                            inner,
+                            service,
+                            notification.recipient(),
+                        ) {
+                            worker
+                                .set_fault(format!("direct settlement scheduling failed: {error}"));
+                            return false;
+                        }
+                    }
+                }
+                let _ = advance(
+                    inner,
+                    handle,
+                    &[DeliveryState::Submitted],
+                    Step::to(DeliveryState::DeliveredUnverified)
+                        .cause("worker_recovered_notified")
+                        .verified(VerifiedBy::Screen),
+                );
+                worker.finish(handle);
+                inner.engine.retire_notification_run(handle);
+                true
+            }
+            NotificationState::BlockedPreWrite
+            | NotificationState::QuotaHeld
+            | NotificationState::QuotaResetObserved
+            | NotificationState::AttentionRequired
+            | NotificationState::Withdrawn
+            | NotificationState::WithdrawnAfterStaging
+            | NotificationState::WithdrawnByOperator
+            | NotificationState::Superseded => {
+                worker.finish(handle);
+                inner.engine.retire_notification_run(handle);
+                true
+            }
+        }
+    } else if !handle.write_boundary_crossed.load(Ordering::SeqCst) && recovery == 0 {
+        let state = handle.state();
+        if state != DeliveryState::Queued
+            && state != DeliveryState::RetryQueued
+            && !advance(
+                inner,
+                handle,
+                &[DeliveryState::Gating, DeliveryState::Pasting],
+                Step::to(DeliveryState::RetryQueued).cause("worker_recovered_before_write"),
+            )
+        {
+            worker.set_fault("legacy pre-write recovery could not requeue its exact job");
+            return false;
+        }
+        true
+    } else {
+        let cause = if handle.write_boundary_crossed.load(Ordering::SeqCst) {
+            "worker_failed_after_write"
+        } else {
+            "worker_failed_before_write"
+        };
+        let moved = advance(
+            inner,
+            handle,
+            &[
+                DeliveryState::Queued,
+                DeliveryState::Gating,
+                DeliveryState::Pasting,
+                DeliveryState::Staged,
+                DeliveryState::Submitted,
+                DeliveryState::RetryQueued,
+            ],
+            Step::to(DeliveryState::AttentionRequired).cause(cause),
+        );
+        if moved {
+            notify_attention(inner, handle, cause);
+        }
+        worker.finish(handle);
+        if !moved {
+            worker.set_fault(format!("legacy recovery stopped in {:?}", handle.state()));
+            return false;
+        }
+        true
+    }
+}
+
+/// Persist the terminal pre-write block before releasing FIFO ownership.
+///
+/// A failed read or append leaves the exact current handle in place. Advancing
+/// to the next queued message would bypass a durable attempt that still owns
+/// the recipient FIFO.
+fn persist_worker_failed_prewrite(
+    notification: &NotificationContext,
+    worker: &Worker,
+) -> Option<NotificationRecord> {
+    match notification.record_gating().and_then(|_| {
+        notification.record_pre_write_block(NotificationPreWriteCause::WorkerFailed, None)
+    }) {
+        Ok(record) => Some(record),
+        Err(error) => {
+            worker.set_fault(format!("notification recovery failed: {error}"));
+            None
+        }
+    }
+}
+
+/// Persist one known pre-write block without releasing FIFO ownership on an
+/// uncertain journal append.
+///
+/// A successful or stale append lets the worker retire normally. A storage
+/// failure faults the worker, so its current handle remains ahead of every
+/// later notification for this recipient.
+async fn persist_notification_prewrite_block(
+    inner: &Arc<Inner>,
+    worker: &Worker,
+    handle: &DeliveryHandle,
+    cause: NotificationPreWriteCause,
+    observation: Option<NotificationPreWriteObservation>,
+) {
     let Some(notification) = &handle.notification else {
-        return inner.watcher_of(handle.session_idx);
+        return;
+    };
+    if let Some(record) = record_notification_prewrite_block(
+        notification,
+        worker,
+        &inner.mailbox_publication,
+        cause,
+        observation,
+    ) {
+        notify_notification_prewrite_blocked(inner, handle, &record);
+        // A positive route edge can race just ahead of this append and see
+        // only Gating. Reconcile once after the durable block exists so that
+        // edge is not lost. The mailbox projection enforces the one-reopen
+        // limit and exact binding checks.
+        crate::messaging::schedule_route_changed(inner, handle.session_idx, &handle.pane_id);
+        if let Some(watcher) = inner.watcher_of(handle.session_idx) {
+            fusion::recompute_pane(
+                inner,
+                handle.session_idx,
+                &watcher,
+                &handle.pane_id,
+                true,
+                "prewrite_block_reconcile",
+            )
+            .await;
+            crate::messaging::schedule_route_changed(inner, handle.session_idx, &handle.pane_id);
+        }
+    }
+}
+
+fn record_notification_prewrite_block(
+    notification: &NotificationContext,
+    worker: &Worker,
+    publication: &StdMutex<()>,
+    cause: NotificationPreWriteCause,
+    observation: Option<NotificationPreWriteObservation>,
+) -> Option<NotificationRecord> {
+    let recorded = {
+        let _publication = publication.lock().expect("mailbox publication lock");
+        notification.record_pre_write_block(cause, observation)
+    };
+    match recorded {
+        Ok(record) => Some(record),
+        Err(NotificationAdapterError::NoLongerCurrentBeforeWrite) => None,
+        Err(NotificationAdapterError::TerminalConflict(
+            NotificationState::Withdrawn
+            | NotificationState::WithdrawnByOperator
+            | NotificationState::Superseded,
+        )) => None,
+        Err(error) => {
+            error!(id = %notification.message_id(), %error, "notification pre-write block fact failed");
+            worker.set_fault(format!(
+                "notification pre-write block storage failed: {error}"
+            ));
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegateAction {
+    ImmediateReproof,
+    BlockPreWrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegateCause {
+    BarrierHeld,
+    BindingChanged,
+    CapabilityChanged,
+}
+
+impl RegateCause {
+    fn reproof_slot(self) -> Option<usize> {
+        match self {
+            Self::BarrierHeld => None,
+            Self::BindingChanged => Some(0),
+            Self::CapabilityChanged => Some(1),
+        }
+    }
+}
+
+/// A held composer waits for its owner to release it. Binding and capability
+/// races receive one immediate re-proof per exact evidence generation.
+fn regate_action(handle: &DeliveryHandle, cause: RegateCause) -> RegateAction {
+    let mut state = handle.state.lock().expect("handle state lock");
+    state.regates = state.regates.saturating_add(1);
+    let Some(slot) = cause.reproof_slot() else {
+        return RegateAction::BlockPreWrite;
+    };
+    if state.regate_reproof_used[slot] {
+        RegateAction::BlockPreWrite
+    } else {
+        state.regate_reproof_used[slot] = true;
+        RegateAction::ImmediateReproof
+    }
+}
+
+fn reset_immediate_regates(handle: &DeliveryHandle) {
+    handle
+        .state
+        .lock()
+        .expect("handle state lock")
+        .regate_reproof_used = [false; 2];
+}
+
+/// Result of checking the live route against its durable mailbox binding.
+enum HandleRoute {
+    Exact(Arc<SessionWatcher>),
+    BindingChanged,
+    BindingUnprovable { pane_pid: i32 },
+    Unavailable,
+}
+
+/// Classify the live watcher without treating an identity mismatch as absence.
+///
+/// A pane replacement can reach the watcher before the ordered registry event.
+/// That route is present but changed, so the pre-write barrier must record a
+/// reprovable identity change instead of a permanent session-unavailable block.
+fn handle_route(inner: &Inner, handle: &DeliveryHandle) -> HandleRoute {
+    let Some(notification) = &handle.notification else {
+        return inner
+            .watcher_of(handle.session_idx)
+            .map(HandleRoute::Exact)
+            .unwrap_or(HandleRoute::Unavailable);
     };
     let recipient = notification.recipient();
-    let session_instance_id = recipient.session_instance_id()?;
-    if recipient.pane_id()?.to_string() != handle.pane_id {
-        return None;
+    let Some(session_instance_id) = recipient.session_instance_id() else {
+        return HandleRoute::Unavailable;
+    };
+    let Some(pane_id) = recipient.pane_id() else {
+        return HandleRoute::Unavailable;
+    };
+    if pane_id.to_string() != handle.pane_id {
+        return HandleRoute::BindingChanged;
     }
-    let slot = inner.session(handle.session_idx)?;
+    let Some(slot) = inner.session(handle.session_idx) else {
+        return HandleRoute::Unavailable;
+    };
     let watcher = {
         let link = slot.link.lock().expect("session link lock");
         if !link.attached
@@ -2113,23 +3175,86 @@ fn watcher_for_handle(inner: &Inner, handle: &DeliveryHandle) -> Option<Arc<Sess
                 .map(|identity| identity.session_instance_id())
                 != Some(session_instance_id)
         {
-            return None;
+            return HandleRoute::Unavailable;
         }
         link.watcher.as_ref().map(Arc::clone)
-    }?;
-    let row = watcher.pane(&handle.pane_id)?;
-    let root = crate::identity::ProcId::of(row.pane_pid)?;
-    let pane_root = ProcessInstanceId::new(root.pid, root.birth).ok()?;
-    inner
-        .registry
-        .lock()
-        .expect("registry lock")
-        .for_route(recipient, pane_root)?;
-    Some(watcher)
+    };
+    let Some(watcher) = watcher else {
+        return HandleRoute::Unavailable;
+    };
+    let Some(row) = watcher.pane(&handle.pane_id) else {
+        return HandleRoute::Unavailable;
+    };
+    let Some(root) = crate::identity::ProcId::of(row.pane_pid) else {
+        return HandleRoute::BindingUnprovable {
+            pane_pid: row.pane_pid,
+        };
+    };
+    let Ok(pane_root) = ProcessInstanceId::new(root.pid, root.birth) else {
+        return HandleRoute::BindingUnprovable {
+            pane_pid: row.pane_pid,
+        };
+    };
+    let registry = inner.registry.lock().expect("registry lock");
+    if registry.for_route(recipient, pane_root).is_some() {
+        HandleRoute::Exact(watcher)
+    } else if registry.for_recipient(recipient).is_some() {
+        HandleRoute::BindingChanged
+    } else {
+        HandleRoute::BindingUnprovable {
+            pane_pid: row.pane_pid,
+        }
+    }
+}
+
+/// Resolve only a watcher whose durable route binding is exact.
+fn watcher_for_handle(inner: &Inner, handle: &DeliveryHandle) -> Option<Arc<SessionWatcher>> {
+    match handle_route(inner, handle) {
+        HandleRoute::Exact(watcher) => Some(watcher),
+        HandleRoute::BindingChanged
+        | HandleRoute::BindingUnprovable { .. }
+        | HandleRoute::Unavailable => None,
+    }
+}
+
+/// Resolve the route for a write that has not crossed the terminal boundary.
+fn exact_prewrite_watcher(
+    inner: &Inner,
+    handle: &DeliveryHandle,
+    manifest_id: &str,
+) -> Result<Arc<SessionWatcher>, AttemptFailure> {
+    match handle_route(inner, handle) {
+        HandleRoute::Exact(watcher) => Ok(watcher),
+        HandleRoute::BindingChanged => Err(AttemptFailure::pane_rebound_before_paste()),
+        HandleRoute::BindingUnprovable { pane_pid } => Err(AttemptFailure::binding_unprovable(
+            Some(binding_unprovable_observation(pane_pid, manifest_id)),
+        )),
+        HandleRoute::Unavailable => Err(AttemptFailure::session_detached()),
+    }
 }
 
 /// Drive one delivery through gate, inject, submit, ACK, bounded retry.
 async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<DeliveryHandle>) {
+    if let Some(notification) = &handle.notification {
+        match notification.claimed_notification_barrier() {
+            Ok(Some(barrier)) => {
+                if let AttemptOutcome::Failed(failure) =
+                    reconcile_recovered_claimed_notification_barrier(inner, handle, barrier).await
+                {
+                    inject_pause(inner, "post_claimed_notification_refusal").await;
+                    if !fault_notification_worker(worker, &failure) {
+                        let _ = fail_attempt(inner, worker, handle, &failure).await;
+                    }
+                }
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                error!(id = %handle.msg_id, %error, "cannot classify staged claim recovery");
+                return;
+            }
+        }
+    }
     // retry_queued alongside queued: a chain requeued across a daemon
     // restart, or parked by a quiesce, re-enters here in that state.
     if !advance(
@@ -2143,9 +3268,9 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
     if let Some(notification) = &handle.notification {
         match notification.record_gating() {
             Ok(_) => {}
-            Err(NotificationAdapterError::SupersededBeforeWrite) => {
-                // The replacement message owns the terminal supersession
-                // fact. This stale handle has not touched the pane.
+            Err(NotificationAdapterError::NoLongerCurrentBeforeWrite) => {
+                // A claim or replacement retired this attempt before it
+                // touched the pane.
                 return;
             }
             Err(error) => {
@@ -2155,12 +3280,13 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
             }
         }
     }
+    let mut regate_hold = None;
     loop {
-        let gate_outcome = gate(inner, handle).await;
+        let gate_outcome = gate(inner, handle, regate_hold.take()).await;
         if let Some(notification) = &handle.notification {
             match notification.ensure_current_gating() {
                 Ok(()) => {}
-                Err(NotificationAdapterError::SupersededBeforeWrite) => return,
+                Err(NotificationAdapterError::NoLongerCurrentBeforeWrite) => return,
                 Err(error) => {
                     error!(id = %handle.msg_id, error = %error, "notification gate outcome recheck failed");
                     notify_notification_deferred(inner, handle, NOTIFICATION_RECORD_FAILED);
@@ -2170,6 +3296,20 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
         }
         match gate_outcome {
             GateOutcome::Withdrawn => return,
+            GateOutcome::BlockedPreWrite { cause, observation } => {
+                if handle.notification.is_none() {
+                    return;
+                }
+                persist_notification_prewrite_block(
+                    inner,
+                    worker,
+                    handle,
+                    cause,
+                    Some(observation),
+                )
+                .await;
+                return;
+            }
             GateOutcome::Deferred { cause } => {
                 notify_notification_deferred(inner, handle, &cause);
                 return;
@@ -2191,11 +3331,15 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
             GateOutcome::Proceed {
                 manifest_id,
                 pane_pid,
+                regate_evidence_changed,
             } => {
+                if regate_evidence_changed {
+                    reset_immediate_regates(handle);
+                }
                 // A quiesce that landed while this delivery was at the
                 // gate: nothing may cross the paste boundary now. Park
                 // pre-paste and hand the job back; it re-enters when the
-                // pipeline resumes — or requeues across the restart the
+                // pipeline resumes or requeues across the restart the
                 // quiesce was for.
                 if inner.engine.paused.load(Ordering::SeqCst) {
                     if advance(
@@ -2203,12 +3347,9 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
                         handle,
                         &[DeliveryState::Gating],
                         Step::to(DeliveryState::RetryQueued).cause("quiesce"),
-                    ) {
-                        worker
-                            .queue
-                            .lock()
-                            .expect("worker queue lock")
-                            .push_front(Arc::clone(handle));
+                    ) && !worker.requeue_current_front(handle)
+                    {
+                        error!(id = %handle.msg_id, "quiesce lost exact worker ownership");
                     }
                     return;
                 }
@@ -2226,21 +3367,24 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
                 }
                 match attempt_delivery(inner, handle, &manifest_id, pane_pid).await {
                     AttemptOutcome::Done => return,
-                    // The replacement message records the authoritative
-                    // supersession. This worker only proves the old attempt
-                    // never wrote.
-                    AttemptOutcome::SupersededBeforeWrite => return,
+                    // The mailbox fact records why this attempt is no longer
+                    // current. This worker only proves it never wrote.
+                    AttemptOutcome::NoLongerCurrentBeforeWrite => return,
                     AttemptOutcome::Failed(failure) => {
+                        if fault_notification_worker(worker, &failure) {
+                            return;
+                        }
                         // Readiness moved between the gate's proof and
                         // the write. Nothing was written and no transport
                         // was spent, so this is not a retry: it goes back
                         // to the gate, which waits on the barrier's own
                         // release rather than on a budget.
-                        if failure.regate() {
-                            handle.state.lock().expect("handle state lock").regates += 1;
+                        if let Some(regate_cause) = failure.regate_cause() {
+                            let action = regate_action(handle, regate_cause);
                             // The legal path back to the gate runs through
-                            // RetryQueued. The budget is what is skipped
-                            // here, not the state machine.
+                            // RetryQueued. A mailbox race that cannot be
+                            // re-proven settles as a durable pre-write block;
+                            // legacy direct delivery waits on pane evidence.
                             if !advance(
                                 inner,
                                 handle,
@@ -2257,9 +3401,29 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
                             ) {
                                 return;
                             }
+                            match action {
+                                RegateAction::ImmediateReproof => {}
+                                RegateAction::BlockPreWrite => {
+                                    if handle.notification.is_some() {
+                                        persist_notification_prewrite_block(
+                                            inner,
+                                            worker,
+                                            handle,
+                                            NotificationPreWriteCause::WriteReadinessChanged,
+                                            None,
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                    // Legacy direct delivery has no durable
+                                    // mailbox state or withdrawal verb. Keep
+                                    // it held until exact pane evidence moves.
+                                    regate_hold = Some(failure.cause.clone());
+                                }
+                            }
                             continue;
                         }
-                        if !fail_attempt(inner, handle, &failure) {
+                        if !fail_attempt(inner, worker, handle, &failure).await {
                             return;
                         }
                         // Bounded retry: back through the gate.
@@ -2282,7 +3446,7 @@ enum AttemptOutcome {
     /// Delivery resolved (verified, unverified, or matcher-resolved).
     Done,
     /// The mailbox atomically withdrew this attempt before the pane write.
-    SupersededBeforeWrite,
+    NoLongerCurrentBeforeWrite,
     /// This attempt failed; the boundary feeds retry accounting.
     Failed(AttemptFailure),
 }
@@ -2302,44 +3466,76 @@ enum WriteBoundary {
 struct AttemptFailure {
     cause: String,
     boundary: WriteBoundary,
+    pre_write_block: Option<Box<PreWriteBlock>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreWriteBlock {
+    cause: NotificationPreWriteCause,
+    observation: Option<NotificationPreWriteObservation>,
 }
 
 impl AttemptFailure {
-    fn session_detached() -> Self {
+    fn blocked_before_write(cause: impl Into<String>, block: NotificationPreWriteCause) -> Self {
         Self {
-            cause: "session_detached".into(),
+            cause: cause.into(),
             boundary: WriteBoundary::BeforeWrite,
+            pre_write_block: Some(Box::new(PreWriteBlock {
+                cause: block,
+                observation: None,
+            })),
         }
+    }
+
+    fn session_detached() -> Self {
+        Self::blocked_before_write(
+            "session_detached",
+            NotificationPreWriteCause::SessionUnavailable,
+        )
     }
 
     fn no_manifest() -> Self {
-        Self {
-            cause: "no_manifest".into(),
-            boundary: WriteBoundary::BeforeWrite,
-        }
+        Self::blocked_before_write(
+            "no_manifest",
+            NotificationPreWriteCause::ManifestUnavailable,
+        )
     }
 
     fn payload_unavailable() -> Self {
-        Self {
-            cause: "payload_unavailable".into(),
-            boundary: WriteBoundary::BeforeWrite,
-        }
+        Self::blocked_before_write(
+            "payload_unavailable",
+            NotificationPreWriteCause::PayloadUnavailable,
+        )
     }
 
     fn pane_rebound_before_paste() -> Self {
+        Self::blocked_before_write(
+            "pane_rebound",
+            NotificationPreWriteCause::WriteReadinessChanged,
+        )
+    }
+
+    fn binding_unprovable(observation: Option<NotificationPreWriteObservation>) -> Self {
         Self {
-            cause: "pane_rebound".into(),
+            cause: "binding_unprovable".into(),
             boundary: WriteBoundary::BeforeWrite,
+            pre_write_block: Some(Box::new(PreWriteBlock {
+                cause: NotificationPreWriteCause::BindingUnprovable,
+                observation,
+            })),
         }
     }
 
     /// Does this failure belong back at the gate rather than in the
     /// retry budget? True only where the cause is readiness moving under
     /// a delivery that had not yet written anything.
-    fn regate(&self) -> bool {
-        self.cause == "barrier_held"
-            || self.cause == "binding_changed"
-            || self.cause == "capability_changed"
+    fn regate_cause(&self) -> Option<RegateCause> {
+        match self.cause.as_str() {
+            "barrier_held" => Some(RegateCause::BarrierHeld),
+            "binding_changed" => Some(RegateCause::BindingChanged),
+            "capability_changed" => Some(RegateCause::CapabilityChanged),
+            _ => None,
+        }
     }
 
     /// The composer barrier was not this attempt's to take: somebody
@@ -2349,20 +3545,19 @@ impl AttemptFailure {
         Self {
             cause: "barrier_held".into(),
             boundary: WriteBoundary::BeforeWrite,
+            pre_write_block: None,
         }
     }
 
     fn spool_failed() -> Self {
-        Self {
-            cause: "spool_failed".into(),
-            boundary: WriteBoundary::BeforeWrite,
-        }
+        Self::blocked_before_write("spool_failed", NotificationPreWriteCause::SpoolFailed)
     }
 
     fn paste_failed() -> Self {
         Self {
             cause: "paste_failed".into(),
             boundary: WriteBoundary::AfterWrite,
+            pre_write_block: None,
         }
     }
 
@@ -2370,6 +3565,7 @@ impl AttemptFailure {
         Self {
             cause: "verify_failed".into(),
             boundary: WriteBoundary::AfterWrite,
+            pre_write_block: None,
         }
     }
 
@@ -2377,6 +3573,7 @@ impl AttemptFailure {
         Self {
             cause: "pane_rebound_after_paste".into(),
             boundary: WriteBoundary::AfterWrite,
+            pre_write_block: None,
         }
     }
 
@@ -2384,6 +3581,7 @@ impl AttemptFailure {
         Self {
             cause: "submit_failed".into(),
             boundary: WriteBoundary::AfterWrite,
+            pre_write_block: None,
         }
     }
 
@@ -2394,6 +3592,7 @@ impl AttemptFailure {
         Self {
             cause: "receipt_occupant_changed".into(),
             boundary: WriteBoundary::AfterWrite,
+            pre_write_block: None,
         }
     }
 
@@ -2401,6 +3600,7 @@ impl AttemptFailure {
         Self {
             cause: "ack_timeout".into(),
             boundary: WriteBoundary::AfterWrite,
+            pre_write_block: None,
         }
     }
 
@@ -2410,7 +3610,20 @@ impl AttemptFailure {
         Self {
             cause: NOTIFICATION_RECORD_FAILED.into(),
             boundary: WriteBoundary::AfterWrite,
+            pre_write_block: None,
         }
+    }
+
+    fn claimed_staged_settlement_failed() -> Self {
+        Self {
+            cause: CLAIMED_STAGED_SETTLEMENT_FAILED.into(),
+            boundary: WriteBoundary::AfterWrite,
+            pre_write_block: None,
+        }
+    }
+
+    fn faults_notification_worker(&self) -> bool {
+        self.cause == CLAIMED_STAGED_SETTLEMENT_FAILED
     }
 
     /// Map the injector's closed set of pre-submit causes to the semantic
@@ -2424,11 +3637,14 @@ impl AttemptFailure {
             // transport failure. It goes back to the gate rather than to
             // a human.
             "barrier_held" => Self::barrier_held(),
+            "prewrite_session_detached" => Self::session_detached(),
+            "prewrite_binding_unprovable" => Self::binding_unprovable(None),
             // The pane's binding moved between the proof and the write.
             // Nothing was written, and re-proving it is the gate's job.
             "binding_changed" | "capability_changed" => Self {
                 cause,
                 boundary: WriteBoundary::BeforeWrite,
+                pre_write_block: None,
             },
             "paste_failed" => Self::paste_failed(),
             "verify_failed" => Self::verify_failed(),
@@ -2436,26 +3652,35 @@ impl AttemptFailure {
             _ => Self {
                 cause,
                 boundary: WriteBoundary::AfterWrite,
+                pre_write_block: None,
             },
         }
     }
 }
 
+fn fault_notification_worker(worker: &Worker, failure: &AttemptFailure) -> bool {
+    if !failure.faults_notification_worker() {
+        return false;
+    }
+    worker.set_fault(CLAIMED_STAGED_SETTLEMENT_FAILED);
+    true
+}
+
 /// One injection attempt: paste, verify, submit, wait for an ACK tier.
 ///
-/// The gate's admitting snapshot is re-checked against the live pane table
-/// immediately before the paste and again immediately before the submit
-/// key (`admitted_pid`): a pane whose occupant changed after admit (agent
-/// exited to a shell, another CLI took over) must never receive the
-/// payload or the Enter, because a shell occupant would EXECUTE it.
+/// The gate's admitting snapshot is re-checked against the live pane table.
+/// The irreversible write and submit bookends require the same pane-root,
+/// terminal leader, and admitted agent generations plus the same manifest. A
+/// replacement occupant must never receive the payload or Enter.
 async fn attempt_delivery(
     inner: &Arc<Inner>,
     handle: &Arc<DeliveryHandle>,
     manifest_id: &str,
     admitted_pid: i32,
 ) -> AttemptOutcome {
-    let Some(watcher) = watcher_for_handle(inner, handle) else {
-        return AttemptOutcome::Failed(AttemptFailure::session_detached());
+    let watcher = match exact_prewrite_watcher(inner, handle, manifest_id) {
+        Ok(watcher) => watcher,
+        Err(failure) => return AttemptOutcome::Failed(failure),
     };
     let Some(manifest) = inner.manifests.get(manifest_id) else {
         return AttemptOutcome::Failed(AttemptFailure::no_manifest());
@@ -2468,8 +3693,8 @@ async fn attempt_delivery(
             inner.engine.buffer_seq.fetch_add(1, Ordering::Relaxed)
         ),
     };
-    let observed = watcher_for_handle(inner, handle)
-        .and_then(|watcher| watcher.pane(&handle.pane_id))
+    let observed = watcher
+        .pane(&handle.pane_id)
         .and_then(|row| fusion::admitted_binding(inner, handle.session_idx, &row));
     let selected = match select_attempt_payload(handle, manifest, observed.as_ref()) {
         Ok(selected) => selected,
@@ -2491,14 +3716,31 @@ async fn attempt_delivery(
         return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
     }
     inject_pause(inner, "pre_paste").await;
-    let Some(watcher) = watcher_for_handle(inner, handle) else {
-        injector.discard().await;
-        return AttemptOutcome::Failed(AttemptFailure::session_detached());
+    let watcher = match exact_prewrite_watcher(inner, handle, manifest_id) {
+        Ok(watcher) => watcher,
+        Err(failure) => {
+            injector.discard().await;
+            if failure.cause == "pane_rebound" {
+                gate_line(
+                    inner,
+                    handle,
+                    "rebound",
+                    None,
+                    Some("route_binding_changed"),
+                );
+            }
+            return AttemptOutcome::Failed(failure);
+        }
     };
     if let Err(detail) = occupant_unchanged(inner, &watcher, handle, manifest_id, admitted_pid) {
         injector.discard().await;
         gate_line(inner, handle, "rebound", None, Some(&detail));
-        return AttemptOutcome::Failed(AttemptFailure::pane_rebound_before_paste());
+        let failure = if detail == "pane_gone" {
+            AttemptFailure::session_detached()
+        } else {
+            AttemptFailure::pane_rebound_before_paste()
+        };
+        return AttemptOutcome::Failed(failure);
     }
     // The gate's clean-composer evidence was current when it admitted, and
     // admission is a decision about a moment. A person can start typing in
@@ -2541,39 +3783,66 @@ async fn attempt_delivery(
     // That recompute took a capture, so who owns the pane is checked again
     // after it: otherwise the newest fact about the composer would rest on
     // an older fact about whose composer it is.
-    let Some(watcher) = watcher_for_handle(inner, handle) else {
-        injector.discard().await;
-        return AttemptOutcome::Failed(AttemptFailure::session_detached());
+    let watcher = match exact_prewrite_watcher(inner, handle, manifest_id) {
+        Ok(watcher) => watcher,
+        Err(failure) => {
+            injector.discard().await;
+            return AttemptOutcome::Failed(failure);
+        }
     };
     if let Err(detail) = occupant_unchanged(inner, &watcher, handle, manifest_id, admitted_pid) {
         gate_line(inner, handle, "rebound", None, Some(&detail));
         injector.discard().await;
-        return AttemptOutcome::Failed(AttemptFailure::pane_rebound_before_paste());
+        let failure = if detail == "pane_gone" {
+            AttemptFailure::session_detached()
+        } else {
+            AttemptFailure::pane_rebound_before_paste()
+        };
+        return AttemptOutcome::Failed(failure);
     }
     // The binding this write depends on, proven ONCE here, immediately
     // after the last capture that admitted it. Three lookups taken
     // separately can disagree with each other; this is one observation of
     // the leader, the agent and the rules that agent is running under.
-    let proven = match watcher_for_handle(inner, handle)
-        .and_then(|w| w.pane(&handle.pane_id))
-        .and_then(|row| fusion::admitted_binding(inner, handle.session_idx, &row))
-    {
+    let Some(final_row) = watcher.pane(&handle.pane_id) else {
+        injector.discard().await;
+        return AttemptOutcome::Failed(AttemptFailure::session_detached());
+    };
+    let observed_binding = fusion::admitted_binding(inner, handle.session_idx, &final_row);
+    let observation =
+        handle
+            .notification
+            .as_ref()
+            .map(|notification| NotificationPreWriteObservation {
+                pane_root: observed_binding
+                    .as_ref()
+                    .and_then(|binding| process_instance_id(binding.pane_root)),
+                selected_manifest: Some(
+                    NotificationManifestId::new(manifest_id)
+                        .expect("loaded manifest ids are validated before delivery"),
+                ),
+                binding: observed_binding
+                    .as_ref()
+                    .and_then(|binding| notification_binding(notification.recipient(), binding)),
+            });
+    let proven = match observed_binding {
         // The gate admitted under a manifest, and the live read has to
         // still agree with it: a process that exec'd in place keeps its
         // identity while becoming another program.
-        Some(b) if b.manifest == manifest_id => b,
+        Some(binding) if binding.manifest == manifest_id => binding,
         _ => {
             gate_line(inner, handle, "rebound", None, Some("binding_unprovable"));
             injector.discard().await;
-            return AttemptOutcome::Failed(AttemptFailure::pane_rebound_before_paste());
+            return AttemptOutcome::Failed(AttemptFailure::binding_unprovable(observation));
         }
     };
-    // The hold is installed AT the write boundary, by the injector, not
-    // before the attempt and not after it resolves. Before the attempt
-    // would catch `spool_failed`, which is proven pre-write and is meant
-    // to retry: a hold there would block that retry forever, with no
-    // staged payload and no turn coming to clear it. After it resolves
-    // would leave a window where `verify_failed` (the paste may have
+    // The composer hold is installed AT the write boundary, by the injector,
+    // not before the attempt and not after it resolves. Installing it before
+    // the attempt would catch `spool_failed` and block its bounded transport
+    // retry with no staged payload and no turn that could clear the hold.
+    // Exhausted spool failures use the separate durable pre-write block.
+    // Installing the composer hold after the attempt resolves would leave a
+    // window where `verify_failed` (the paste may have
     // landed, nobody could prove what it did) is visible to another
     // delivery for the same pane before anything holds it.
     let target = match selected.transport {
@@ -2582,8 +3851,13 @@ async fn attempt_delivery(
             StagingTarget::Sentinel(&handle.msg_id)
         }
     };
-    let (staged_window, id_staged, payload_at_proof) =
-        match inject(&injector, handle, manifest, target, &|| {
+    let (staged_window, id_staged, payload_at_proof) = match inject(
+        &injector,
+        handle,
+        manifest,
+        target,
+        &selected.bytes,
+        &|| {
             if let Some(notification) = &handle.notification {
                 notification
                     .ensure_current_gating()
@@ -2593,10 +3867,21 @@ async fn attempt_delivery(
             // payload: the same binding, read again, and equal. Nothing
             // has been written yet, so a change here is the world moving
             // rather than a transport failure.
-            let now = watcher_for_handle(inner, handle)
-                .and_then(|w| w.pane(&handle.pane_id))
-                .and_then(|row| fusion::admitted_binding(inner, handle.session_idx, &row));
-            if now.as_ref() != Some(&proven) {
+            let now = match handle_route(inner, handle) {
+                HandleRoute::Exact(watcher) => watcher
+                    .pane(&handle.pane_id)
+                    .ok_or_else(|| "prewrite_session_detached".to_string())
+                    .and_then(|row| {
+                        fusion::admitted_binding(inner, handle.session_idx, &row)
+                            .ok_or_else(|| "prewrite_binding_unprovable".to_string())
+                    })?,
+                HandleRoute::BindingChanged => return Err("binding_changed".to_string()),
+                HandleRoute::BindingUnprovable { .. } => {
+                    return Err("prewrite_binding_unprovable".to_string())
+                }
+                HandleRoute::Unavailable => return Err("prewrite_session_detached".to_string()),
+            };
+            if now != proven {
                 return Err("binding_changed".to_string());
             }
             if matches!(selected.transport, Some(NotificationTransport::Doorbell)) {
@@ -2617,6 +3902,8 @@ async fn attempt_delivery(
             }
             let notification_binding = if handle.notification.is_some() {
                 Some((
+                    ProcessInstanceId::new(proven.pane_root.pid, proven.pane_root.birth)
+                        .map_err(|_| NOTIFICATION_RECORD_FAILED.to_string())?,
                     ProcessInstanceId::new(proven.leader.pid, proven.leader.birth)
                         .map_err(|_| NOTIFICATION_RECORD_FAILED.to_string())?,
                     ProcessInstanceId::new(proven.agent.pid, proven.agent.birth)
@@ -2626,35 +3913,39 @@ async fn attempt_delivery(
                 None
             };
             latch_hold(inner, handle, &proven)?;
-            if let (Some(notification), Some((leader, agent))) =
+            let mut unwritten_hold = UnwrittenHold::new(inner, handle, &proven);
+            if let (Some(notification), Some((pane_root, leader, agent))) =
                 (&handle.notification, notification_binding)
             {
                 let transport = selected
                     .transport
                     .expect("notification attempts select a transport");
                 if let Err(error) = notification.record_writing(
+                    pane_root,
                     leader,
                     agent,
                     &proven.manifest,
                     transport,
                     selected.doorbell_format,
                 ) {
-                    rollback_unwritten_hold(inner, handle, &proven);
                     return Err(notification_write_cause(error));
                 }
             }
+            handle.write_boundary_crossed.store(true, Ordering::SeqCst);
+            unwritten_hold.commit();
             Ok(())
-        })
-        .await
-        {
-            Ok(v) => v,
-            Err(cause) => {
-                if cause == SUPERSEDED_BEFORE_WRITE {
-                    return AttemptOutcome::SupersededBeforeWrite;
-                }
-                return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
+        },
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(cause) => {
+            if cause == NO_LONGER_CURRENT_BEFORE_WRITE {
+                return AttemptOutcome::NoLongerCurrentBeforeWrite;
             }
-        };
+            return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
+        }
+    };
     if let Some(notification) = &handle.notification {
         if let Err(error) = notification.record_staged() {
             error!(id = %handle.msg_id, error = %error, "notification staged fact failed");
@@ -2676,7 +3967,7 @@ async fn attempt_delivery(
         manifest.injection.submit.as_str()
     };
     inject_pause(inner, "pre_submit").await;
-    if let Err(detail) = occupant_unchanged(inner, &watcher, handle, manifest_id, admitted_pid) {
+    if let Err(detail) = proven_binding_unchanged(inner, handle, &proven) {
         // The staged payload belongs to the occupant that verified it; the
         // submit key must never reach whoever replaced it.
         unregister_ack(inner, handle);
@@ -2688,44 +3979,136 @@ async fn attempt_delivery(
     // it, in between; pressing Enter then submits something nobody
     // verified and nobody wrote. So the exact staged representation is
     // proven again here, from a capture taken now.
-    let recheck = if manifest.has_escaped_rules() {
-        injector.capture_escaped(&handle.pane_id).await
-    } else {
-        injector.capture(&handle.pane_id).await
-    };
-    match recheck {
-        Ok(now) => {
-            // Not just "something valid is staged": the SAME thing must be
-            // staged. A human can replace one verified representation with
-            // another between the proof and the key, and a check that only
-            // asks "is this a valid staging?" would wave that through.
-            let still_staged = staged_verified_target(manifest, &now, target);
-            if payload_proof_target(manifest, &now, target).as_deref()
-                != Some(payload_at_proof.as_str())
-                || still_staged != Some(id_staged)
-            {
-                unregister_ack(inner, handle);
-                gate_line(inner, handle, "rebound", None, Some("staging_changed"));
-                return AttemptOutcome::Failed(AttemptFailure::verify_failed());
-            }
-        }
+    let recheck = match injector.capture_joined_escaped(&handle.pane_id).await {
+        Ok(now) => now,
         Err(_) => {
             // Nobody looked, so nobody may press Enter.
             unregister_ack(inner, handle);
             gate_line(inner, handle, "rebound", None, Some("recheck_unobservable"));
             return AttemptOutcome::Failed(AttemptFailure::verify_failed());
         }
+    };
+    // Not just "something valid is staged": the SAME thing must be staged.
+    // A human can replace one verified representation with another between
+    // the proof and the key, and a validity-only check would wave it through.
+    if !exact_staging_snapshot_matches(
+        manifest,
+        &recheck,
+        target,
+        &selected.bytes,
+        id_staged,
+        &payload_at_proof,
+    ) {
+        unregister_ack(inner, handle);
+        gate_line(inner, handle, "rebound", None, Some("staging_changed"));
+        return AttemptOutcome::Failed(AttemptFailure::verify_failed());
     }
     // The capture above took time, so the occupant is checked once more
     // after it. Otherwise the last thing proven about who owns the pane is
     // older than the last thing proven about what is in it.
-    if let Err(detail) = occupant_unchanged(inner, &watcher, handle, manifest_id, admitted_pid) {
+    if let Err(detail) = proven_binding_unchanged(inner, handle, &proven) {
         unregister_ack(inner, handle);
         gate_line(inner, handle, "rebound", None, Some(&detail));
         return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
     }
+    if let Err(detail) = notification_staged_action_safe(inner, handle, manifest, &recheck, &proven)
+    {
+        unregister_ack(inner, handle);
+        gate_line(inner, handle, "rebound", None, Some(&detail));
+        return AttemptOutcome::Failed(AttemptFailure::verify_failed());
+    }
+    let notification_submit_reserved = if let Some(notification) = &handle.notification {
+        match notification.reserve_submit() {
+            Ok(SubmitReservation::Reserved) => true,
+            Ok(SubmitReservation::ClaimedBeforeSubmit) => {
+                return reconcile_claimed_notification_barrier(
+                    inner,
+                    handle,
+                    manifest,
+                    StagingExpectation {
+                        target,
+                        payload: &selected.bytes,
+                    },
+                    &proven,
+                    &injector,
+                    ClaimedStagedReconciliation::CurrentStaged,
+                )
+                .await;
+            }
+            Err(error) => {
+                error!(id = %handle.msg_id, %error, "notification submit reservation failed");
+                return AttemptOutcome::Failed(AttemptFailure::notification_record_failed());
+            }
+        }
+    } else {
+        false
+    };
+    // Reserving submit appends a journal fact and therefore opens another
+    // content and process replacement window. Re-capture the composer and
+    // re-prove the complete binding after that append. `Submitting` reserves
+    // one key attempt; it never authorizes changed or unobservable bytes.
+    if notification_submit_reserved {
+        inject_pause(inner, "post_submit_reservation").await;
+        let reserved_recheck = injector.capture_joined_escaped(&handle.pane_id).await;
+        match reserved_recheck {
+            Ok(now) => {
+                if !exact_staging_snapshot_matches(
+                    manifest,
+                    &now,
+                    target,
+                    &selected.bytes,
+                    id_staged,
+                    &payload_at_proof,
+                ) {
+                    gate_line(
+                        inner,
+                        handle,
+                        "rebound",
+                        None,
+                        Some("staging_changed_after_submit_reservation"),
+                    );
+                    return AttemptOutcome::Failed(AttemptFailure::verify_failed());
+                }
+                if let Err(detail) =
+                    notification_staged_action_safe(inner, handle, manifest, &now, &proven)
+                {
+                    gate_line(
+                        inner,
+                        handle,
+                        "rebound",
+                        None,
+                        Some(&format!("{detail}_after_submit_reservation")),
+                    );
+                    return AttemptOutcome::Failed(AttemptFailure::verify_failed());
+                }
+            }
+            Err(_) => {
+                gate_line(
+                    inner,
+                    handle,
+                    "rebound",
+                    None,
+                    Some("reserved_staging_unobservable"),
+                );
+                return AttemptOutcome::Failed(AttemptFailure::verify_failed());
+            }
+        }
+    }
+    if !notification_submit_reserved {
+        if let Err(detail) = proven_binding_unchanged(inner, handle, &proven) {
+            unregister_ack(inner, handle);
+            gate_line(inner, handle, "rebound", None, Some(&detail));
+            return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
+        }
+    }
     // The occupant re-check just passed: admitted_pid IS the process the
     // submit key goes to. Send-and-wait pins its wait on this pid.
+    // Subscribe before Enter. A fast vendor can paint its entire working
+    // phase before send-keys returns, so subscribing inside the receipt
+    // waiter loses the only turn evidence that actually followed this key.
+    let receipt_events = inner.events.subscribe();
+    let receipt_submit_at = Instant::now();
+    let receipt_submit_at_ms = unix_ms();
     handle.submitted_pid.store(admitted_pid, Ordering::SeqCst);
     // And the AGENT behind it, which is what a hook report is filed
     // under. The foreground leader can be a tool the agent handed the
@@ -2733,7 +4116,9 @@ async fn attempt_delivery(
     // substituted for one another: the leader is terminal admission
     // evidence, the agent identity is who this delivery belongs to.
     *handle.submitted_agent.lock().expect("submitted agent lock") = Some(proven.agent);
-    handle.submitted_at_ms.store(unix_ms(), Ordering::SeqCst);
+    handle
+        .submitted_at_ms
+        .store(receipt_submit_at_ms, Ordering::SeqCst);
     *handle
         .submitted_manifest
         .lock()
@@ -2749,9 +4134,12 @@ async fn attempt_delivery(
         return AttemptOutcome::Failed(AttemptFailure::submit_failed());
     }
     if let Some(notification) = &handle.notification {
-        if let Err(error) = notification.record_submitted() {
-            error!(id = %handle.msg_id, error = %error, "notification submitted fact failed");
-            return AttemptOutcome::Failed(AttemptFailure::notification_record_failed());
+        match notification.record_submitted() {
+            Ok(_) => {}
+            Err(error) => {
+                error!(id = %handle.msg_id, error = %error, "notification submitted fact failed");
+                return AttemptOutcome::Failed(AttemptFailure::notification_record_failed());
+            }
         }
     }
     // The key is sent and the binding is recorded, so an acknowledgement
@@ -2766,22 +4154,44 @@ async fn attempt_delivery(
     ) {
         return AttemptOutcome::Done;
     }
-    // The window this pause exists for: the delivery is Submitted and the
-    // early record has not been taken yet, which is where an
-    // acknowledgement arriving now has to choose between installing and
-    // resolving. Always None in production.
+    // Take any accepted early receipt before claim settlement can return.
+    // A hook can carry the exact TurnKey while a concurrent socket claim has
+    // already made the durable notification Notified. The claim must not
+    // discard that stronger receipt.
+    let early = take_accepted_early_ack(handle);
+    let notified_during_submit_gap = if let Some(notification) = &handle.notification {
+        match notification.settle_submitted_claim() {
+            Ok(notified) => notified,
+            Err(error) => {
+                error!(id = %handle.msg_id, error = %error, "notification claim recheck failed");
+                return AttemptOutcome::Failed(AttemptFailure::notification_record_failed());
+            }
+        }
+    } else {
+        false
+    };
+    if notified_during_submit_gap {
+        if let Some(early) = early {
+            advance_with_early_ack(inner, handle, early);
+        } else {
+            settle_notification_claim(
+                inner,
+                handle
+                    .notification
+                    .as_ref()
+                    .expect("claim settlement belongs to a notification")
+                    .attempt_id(),
+            );
+        }
+        return AttemptOutcome::Done;
+    }
+    // The window this pause exists for: the delivery is Submitted after the
+    // worker took any earlier record. A hook arriving now resolves the exact
+    // submitted handle directly instead of installing another early record.
+    // Always None in production.
     inject_pause(inner, "post_submit").await;
-    // An acknowledgement that arrived between paste-verify and the
-    // Submitted line. Taken under the state lock, which is the lock the
-    // installer read the state through, so one of the two always sees the
-    // other: either this take finds it, or the installer saw `Submitted`
-    // and resolved the delivery itself.
-    let early = handle
-        .state
-        .lock()
-        .expect("handle state lock")
-        .early_ack
-        .take();
+    // An acknowledgement that arrived between paste verification and the
+    // Submitted line was taken under the same state lock the installer used.
     if let Some(early) = early {
         match record_notification_notified(inner, handle) {
             Ok(true) => {}
@@ -2791,20 +4201,24 @@ async fn attempt_delivery(
                 return AttemptOutcome::Failed(AttemptFailure::notification_record_failed());
             }
         }
-        if advance(
-            inner,
-            handle,
-            &[DeliveryState::Submitted],
-            Step::to(DeliveryState::DeliveredVerified)
-                .cause("hook_ack")
-                .verified(VerifiedBy::Hook)
-                .turn_edge(early.edge_ms)
-                .turn(early.turn),
-        ) {
+        if advance_with_early_ack(inner, handle, early) {
             return AttemptOutcome::Done;
         }
     }
-    match await_ack(inner, handle, manifest, &staged_window, id_staged).await {
+    match await_ack(
+        inner,
+        handle,
+        ReceiptWait {
+            manifest,
+            staged_window: &staged_window,
+            id_staged,
+            target,
+            submit_at: receipt_submit_at,
+            events: receipt_events,
+        },
+    )
+    .await
+    {
         AckOutcome::Resolved => AttemptOutcome::Done,
         AckOutcome::Screen => {
             // Stays registered: a late matching hook ACK upgrades it to
@@ -2838,6 +4252,465 @@ async fn attempt_delivery(
     }
 }
 
+/// Re-prove that an automatic notification submit still owns this exact
+/// staged composer. The caller separately compares the normalized bytes.
+/// This check binds that content to the current process generations and
+/// manifest, requires a terminal-safe visual state, and refuses any live
+/// lifecycle or blocked-state conflict retained by fusion.
+fn notification_staged_action_safe(
+    inner: &Arc<Inner>,
+    handle: &DeliveryHandle,
+    manifest: &Manifest,
+    capture: &str,
+    proven: &fusion::Binding,
+) -> Result<(), String> {
+    let Some(notification) = &handle.notification else {
+        return Ok(());
+    };
+    let Some(watcher) = watcher_for_handle(inner, handle) else {
+        return Err("session_detached".to_string());
+    };
+    let Some(row) = watcher.pane(&handle.pane_id) else {
+        return Err("pane_gone".to_string());
+    };
+    if row.dead {
+        return Err("pane_dead".to_string());
+    }
+    if row.in_mode {
+        return Err("pane_in_mode".to_string());
+    }
+    let current = fusion::admitted_binding(inner, handle.session_idx, &row);
+    if !binding_is_exact(current.as_ref(), proven) {
+        return Err("binding_changed".to_string());
+    }
+    let state = manifest
+        .evaluate_esc(&row.title, &strip_csi(capture), Some(capture))
+        .map(|rule| rule.state);
+    if !matches!(state, Some(AgentState::Idle | AgentState::IdleWithInput)) {
+        return Err("staged_manifest_state_unsafe".to_string());
+    }
+    let Some(agent) = process_instance_id(proven.agent) else {
+        return Err("binding_unprovable".to_string());
+    };
+    if !fusion::staged_action_ready(
+        inner,
+        handle.session_idx,
+        &handle.pane_id,
+        &notification.attempt_id().to_string(),
+        agent,
+        &proven.manifest,
+    ) {
+        return Err("staged_action_unsafe".to_string());
+    }
+    Ok(())
+}
+
+/// Take only receipt evidence that can settle the submitted delivery.
+fn take_accepted_early_ack(handle: &DeliveryHandle) -> Option<PendingAck> {
+    let mut state = handle.state.lock().expect("handle state lock");
+    match state.early_ack.as_ref().map(|ack| ack.evidence) {
+        Some(PendingAckEvidence::Receipt | PendingAckEvidence::DispatchAccepted) => {
+            state.early_ack.take()
+        }
+        Some(PendingAckEvidence::DispatchPending) | None => None,
+    }
+}
+
+/// Preserve exact hook receipt and TurnKey evidence across claim settlement.
+fn advance_with_early_ack(
+    inner: &Arc<Inner>,
+    handle: &Arc<DeliveryHandle>,
+    early: PendingAck,
+) -> bool {
+    advance(
+        inner,
+        handle,
+        &[DeliveryState::Submitted],
+        early_ack_step(early),
+    )
+}
+
+fn early_ack_step(early: PendingAck) -> Step<'static> {
+    let cause = match early.evidence {
+        PendingAckEvidence::Receipt => "hook_ack",
+        PendingAckEvidence::DispatchAccepted => "hook_dispatch_accepted_start",
+        PendingAckEvidence::DispatchPending => unreachable!("pending dispatch was not taken"),
+    };
+    Step::to(DeliveryState::DeliveredVerified)
+        .cause(cause)
+        .verified(VerifiedBy::Hook)
+        .turn_edge(early.edge_ms)
+        .turn(early.turn)
+}
+
+async fn reconcile_recovered_claimed_notification_barrier(
+    inner: &Arc<Inner>,
+    handle: &Arc<DeliveryHandle>,
+    barrier: ClaimedNotificationBarrier,
+) -> AttemptOutcome {
+    let notification = handle
+        .notification
+        .as_ref()
+        .expect("staged recovery belongs to a notification");
+    let record = match notification.current_record() {
+        Ok(record) => record,
+        Err(_) => {
+            return AttemptOutcome::Failed(AttemptFailure::notification_record_failed());
+        }
+    };
+    let message = match notification.message_line() {
+        Ok(message) => message,
+        Err(_) => {
+            return AttemptOutcome::Failed(AttemptFailure::from_inject(
+                "claim_recovery_message_missing".to_string(),
+            ));
+        }
+    };
+    let Some(expected) = expected_notification_payload(&record, &message) else {
+        return AttemptOutcome::Failed(AttemptFailure::from_inject(
+            "claim_recovery_format_unknown".to_string(),
+        ));
+    };
+    let Some(binding) = record.binding.as_ref() else {
+        return AttemptOutcome::Failed(AttemptFailure::from_inject(
+            "claim_recovery_binding_missing".to_string(),
+        ));
+    };
+    let Some(pane_root) = binding.pane_root else {
+        return AttemptOutcome::Failed(AttemptFailure::from_inject(
+            "claim_recovery_pane_root_missing".to_string(),
+        ));
+    };
+    let Some(leader) = binding.leader else {
+        return AttemptOutcome::Failed(AttemptFailure::from_inject(
+            "claim_recovery_leader_missing".to_string(),
+        ));
+    };
+    let proven = fusion::Binding {
+        pane_root: crate::identity::ProcId {
+            pid: pane_root.pid(),
+            birth: pane_root.birth(),
+        },
+        leader: crate::identity::ProcId {
+            pid: leader.pid(),
+            birth: leader.birth(),
+        },
+        agent: crate::identity::ProcId {
+            pid: binding.agent.pid(),
+            birth: binding.agent.birth(),
+        },
+        manifest: binding.manifest.as_str().to_string(),
+    };
+    let Some(manifest) = inner.manifests.get(&proven.manifest) else {
+        return AttemptOutcome::Failed(AttemptFailure::from_inject(
+            "claim_recovery_manifest_missing".to_string(),
+        ));
+    };
+    let Some(watcher) = watcher_for_handle(inner, handle) else {
+        return AttemptOutcome::Failed(AttemptFailure::from_inject(
+            "claim_recovery_route_unavailable".to_string(),
+        ));
+    };
+    let injector = TmuxInjector {
+        client: watcher.client(),
+        buffer: format!(
+            "cyc-{}-{}",
+            std::process::id(),
+            inner.engine.buffer_seq.fetch_add(1, Ordering::Relaxed)
+        ),
+    };
+    reconcile_claimed_notification_barrier(
+        inner,
+        handle,
+        manifest,
+        StagingExpectation {
+            target: StagingTarget::ExactRow(&expected),
+            payload: &expected,
+        },
+        &proven,
+        &injector,
+        ClaimedStagedReconciliation::Recovered(barrier),
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimedStagedReconciliation {
+    CurrentStaged,
+    Recovered(ClaimedNotificationBarrier),
+}
+
+impl ClaimedStagedReconciliation {
+    fn barrier(self) -> ClaimedNotificationBarrier {
+        match self {
+            Self::CurrentStaged => ClaimedNotificationBarrier::Staged,
+            Self::Recovered(barrier) => barrier,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StagingExpectation<'a> {
+    target: StagingTarget<'a>,
+    payload: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimedStagedComposer {
+    ExactDoorbell,
+    Clean,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimedStagedAction {
+    ClearThenSettle,
+    SettleOnly,
+    Refuse,
+}
+
+fn claimed_staged_action(
+    composer: ClaimedStagedComposer,
+    reconciliation: ClaimedStagedReconciliation,
+) -> ClaimedStagedAction {
+    match (composer, reconciliation) {
+        (ClaimedStagedComposer::ExactDoorbell, _) => ClaimedStagedAction::ClearThenSettle,
+        (ClaimedStagedComposer::Clean, ClaimedStagedReconciliation::Recovered(_)) => {
+            ClaimedStagedAction::SettleOnly
+        }
+        (ClaimedStagedComposer::Clean, ClaimedStagedReconciliation::CurrentStaged)
+        | (ClaimedStagedComposer::Ambiguous, _) => ClaimedStagedAction::Refuse,
+    }
+}
+
+fn classify_claimed_staged_composer(
+    manifest: &Manifest,
+    capture: &str,
+    target: StagingTarget<'_>,
+    expected_payload: &str,
+) -> ClaimedStagedComposer {
+    if exact_staging_proof(manifest, capture, target, expected_payload).is_some() {
+        return ClaimedStagedComposer::ExactDoorbell;
+    }
+    if clean_composer_proof(manifest, capture) {
+        return ClaimedStagedComposer::Clean;
+    }
+    ClaimedStagedComposer::Ambiguous
+}
+
+/// Reconcile an exact claimed notification barrier.
+///
+/// The claim proves payload retrieval, not Enter. Cyclops clears only an
+/// exact, still-bound doorbell that it can reconstruct byte for byte. Any
+/// missing proof becomes one post-write attention state.
+async fn reconcile_claimed_notification_barrier<I: Injector>(
+    inner: &Arc<Inner>,
+    handle: &Arc<DeliveryHandle>,
+    manifest: &Manifest,
+    staging: StagingExpectation<'_>,
+    proven: &fusion::Binding,
+    injector: &I,
+    reconciliation: ClaimedStagedReconciliation,
+) -> AttemptOutcome {
+    if proven_binding_unchanged(inner, handle, proven).is_err() {
+        return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
+    }
+    let Some(watcher) = watcher_for_handle(inner, handle) else {
+        return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
+    };
+    let staged = match injector.capture_joined_escaped(&handle.pane_id).await {
+        Ok(screen) => screen,
+        Err(_) => return AttemptOutcome::Failed(AttemptFailure::verify_failed()),
+    };
+    if proven_binding_unchanged(inner, handle, proven).is_err() {
+        return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
+    }
+    let Some(row) = watcher.pane(&handle.pane_id) else {
+        return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
+    };
+    if row.in_mode {
+        return AttemptOutcome::Failed(AttemptFailure::verify_failed());
+    }
+
+    let composer =
+        classify_claimed_staged_composer(manifest, &staged, staging.target, staging.payload);
+    match claimed_staged_action(composer, reconciliation) {
+        ClaimedStagedAction::ClearThenSettle => {
+            if manifest.injection.clear_keys.is_empty() {
+                return AttemptOutcome::Failed(AttemptFailure::from_inject(
+                    "claim_clear_unsupported".to_string(),
+                ));
+            }
+            if let Err(cause) =
+                notification_staged_action_safe(inner, handle, manifest, &staged, proven)
+            {
+                return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
+            }
+            if let Err(cause) = injector
+                .clear(&handle.pane_id, &manifest.injection.clear_keys)
+                .await
+            {
+                return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
+            }
+            if !observe_exact_composer_clear(inner, handle, manifest, proven, injector).await {
+                return AttemptOutcome::Failed(AttemptFailure::from_inject(
+                    "claim_clear_unconfirmed".to_string(),
+                ));
+            }
+        }
+        ClaimedStagedAction::SettleOnly => {
+            // A crash can land after exact clear but before the settlement
+            // fact. The fresh clean observation and exact process binding
+            // authorize only the missing durable settlement. No terminal
+            // input is sent again.
+        }
+        ClaimedStagedAction::Refuse => {
+            return AttemptOutcome::Failed(AttemptFailure::verify_failed());
+        }
+    }
+
+    if proven_binding_unchanged(inner, handle, proven).is_err() {
+        return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
+    }
+    inject_pause(inner, "pre_claimed_notification_settlement").await;
+    let notification = handle
+        .notification
+        .as_ref()
+        .expect("claim reconciliation belongs to a notification");
+    let record = match settle_claimed_notification_after_clear(
+        notification,
+        reconciliation.barrier(),
+    ) {
+        Ok(record) => record,
+        Err(error) => {
+            error!(id = %handle.msg_id, %error, "claimed notification settlement failed twice; notification worker remains faulted");
+            return AttemptOutcome::Failed(AttemptFailure::claimed_staged_settlement_failed());
+        }
+    };
+    if let Some(binding) = record.binding.as_ref() {
+        fusion::resolve_staged_hold(
+            inner,
+            handle.session_idx,
+            &handle.pane_id,
+            &record.attempt_id.to_string(),
+            binding.agent,
+            binding.manifest.as_str(),
+        );
+    }
+    inner
+        .composer_recovery
+        .lock()
+        .expect("composer recovery lock")
+        .retired(record.attempt_id);
+    if let Some(service) = &inner.mailbox {
+        if let Err(error) =
+            crate::messaging::schedule_recipient(inner, service, notification.recipient())
+        {
+            error!(id = %handle.msg_id, %error, "cannot advance notification FIFO after staged claim");
+        }
+    }
+    AttemptOutcome::Done
+}
+
+/// Retry only the content-free durable settlement after a proven clear.
+///
+/// The first error may be an interrupted append whose outcome the caller did
+/// not observe. The store operation is idempotent, so one immediate repeat can
+/// discover an already-landed fact or append the missing one. It never clears
+/// the composer or sends a terminal key.
+fn settle_claimed_notification_after_clear(
+    notification: &NotificationContext,
+    barrier: ClaimedNotificationBarrier,
+) -> Result<cyclops_proto::NotificationRecord, NotificationAdapterError> {
+    let settle = || match barrier {
+        ClaimedNotificationBarrier::Staged => notification.settle_claimed_staged_clear(),
+        ClaimedNotificationBarrier::AckTimeout => {
+            notification.settle_claimed_ack_timeout_reconciliation()
+        }
+    };
+    match settle() {
+        Ok(record) => Ok(record),
+        Err(first) => {
+            warn!(
+                message_id = %notification.message_id(),
+                attempt_id = %notification.attempt_id(),
+                error = %first,
+                "retrying claimed notification settlement once"
+            );
+            settle()
+        }
+    }
+}
+
+#[cfg(test)]
+fn settle_claimed_staged_after_clear(
+    notification: &NotificationContext,
+) -> Result<cyclops_proto::NotificationRecord, NotificationAdapterError> {
+    settle_claimed_notification_after_clear(notification, ClaimedNotificationBarrier::Staged)
+}
+
+pub(crate) fn clean_composer_proof(manifest: &Manifest, capture: &str) -> bool {
+    let plain = strip_csi(capture);
+    fusion::screen_winner_esc(manifest, &plain, Some(capture)).is_some_and(|rule| {
+        rule.state == AgentState::Idle && rule.composer_semantic == Some(ComposerSemantic::Clean)
+    }) && visible_clean_composer_proof(manifest, capture)
+}
+
+/// Prove that the manifest-owned composer region is visibly empty.
+///
+/// This is narrower than runtime idleness. Callers combine it with the exact
+/// process binding and the durable action or claim record that owns the
+/// reconciliation.
+pub(crate) fn visible_clean_composer_proof(manifest: &Manifest, capture: &str) -> bool {
+    matches!(
+        exact_composer_content_for_state(
+            manifest,
+            capture,
+            AgentState::Idle,
+            Some(ComposerSemantic::Clean),
+        ),
+        ComposerContentProof::Visible(content) if content.is_empty()
+    )
+}
+
+async fn observe_exact_composer_clear<I: Injector>(
+    inner: &Arc<Inner>,
+    handle: &Arc<DeliveryHandle>,
+    manifest: &Manifest,
+    proven: &fusion::Binding,
+    injector: &I,
+) -> bool {
+    let mut last_delay = 0;
+    for delay in VERIFY_DELAYS_MS {
+        if delay > last_delay {
+            tokio::time::sleep(Duration::from_millis(delay - last_delay)).await;
+        }
+        last_delay = delay;
+        let Some(watcher) = watcher_for_handle(inner, handle) else {
+            return false;
+        };
+        if proven_binding_unchanged(inner, handle, proven).is_err() {
+            return false;
+        }
+        let Ok(capture) = injector.capture_joined_escaped(&handle.pane_id).await else {
+            continue;
+        };
+        let Some(row) = watcher.pane(&handle.pane_id) else {
+            return false;
+        };
+        if proven_binding_unchanged(inner, handle, proven).is_err() {
+            return false;
+        }
+        if !row.in_mode
+            && clean_composer_proof(manifest, &capture)
+            && notification_staged_action_safe(inner, handle, manifest, &capture, proven).is_ok()
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Is the pane still held by the process and rules that Enter reached?
 ///
 /// Receipt evidence answers "did the message land", and it can only
@@ -2851,23 +4724,25 @@ fn submitted_binding_holds(
     watcher: &Arc<SessionWatcher>,
     handle: &Arc<DeliveryHandle>,
 ) -> bool {
-    let want_pid = handle.submitted_pid.load(Ordering::SeqCst);
+    let want_agent = *handle.submitted_agent.lock().expect("submitted agent lock");
     let want_manifest = handle
         .submitted_manifest
         .lock()
         .expect("submitted manifest lock")
         .clone();
-    let (Some(want_manifest), Some(row)) = (want_manifest, watcher.pane(&handle.pane_id)) else {
+    let (Some(want_agent), Some(want_manifest), Some(row)) =
+        (want_agent, want_manifest, watcher.pane(&handle.pane_id))
+    else {
         return false;
     };
-    // The agent instance, not the pane's root process: a shell outlives
-    // the agent that ran inside it, so pinning the root would let the
-    // next agent launched at the same prompt inherit this delivery.
-    if row.dead || fusion::foreground_pid(row.pane_pid) != want_pid {
+    if row.dead {
         return false;
     }
-    fusion::bind_manifest_for(inner, handle.session_idx, &row)
-        .is_some_and(|m| m.agent.id == want_manifest)
+    // The foreground leader is allowed to change after Enter. An agent can
+    // hand the terminal to a tool or take it back without changing who owns
+    // the delivery. Re-prove the admitted agent instance and its rules.
+    fusion::admitted_binding(inner, handle.session_idx, &row)
+        .is_some_and(|binding| binding.agent == want_agent && binding.manifest == want_manifest)
 }
 
 /// Pane-rebind re-check between the gate's admitting recompute and the
@@ -2905,6 +4780,102 @@ fn occupant_unchanged(
     }
 }
 
+/// Re-prove the complete binding captured at the write boundary.
+///
+/// PID numbers alone are reusable. The submit path must retain the same
+/// terminal leader generation, admitted agent generation, and manifest that
+/// authorized the paste.
+fn proven_binding_unchanged(
+    inner: &Arc<Inner>,
+    handle: &Arc<DeliveryHandle>,
+    proven: &fusion::Binding,
+) -> Result<(), String> {
+    let Some(watcher) = watcher_for_handle(inner, handle) else {
+        return Err("session_detached".to_string());
+    };
+    let Some(row) = watcher.pane(&handle.pane_id) else {
+        return Err("pane_gone".to_string());
+    };
+    if row.dead {
+        return Err("pane_dead".to_string());
+    }
+    if row.in_mode {
+        return Err("pane_in_mode".to_string());
+    }
+    let Some(current) = fusion::admitted_binding(inner, handle.session_idx, &row) else {
+        return Err("binding_unprovable".to_string());
+    };
+    if !binding_is_exact(Some(&current), proven) {
+        return Err("binding_changed".to_string());
+    }
+    Ok(())
+}
+
+fn binding_is_exact(current: Option<&fusion::Binding>, proven: &fusion::Binding) -> bool {
+    current == Some(proven)
+}
+
+fn process_instance(pid: i32) -> Option<ProcessInstanceId> {
+    let process = crate::identity::ProcId::of(pid)?;
+    process_instance_id(process)
+}
+
+fn process_instance_id(process: crate::identity::ProcId) -> Option<ProcessInstanceId> {
+    ProcessInstanceId::new(process.pid, process.birth).ok()
+}
+
+fn binding_unprovable_observation(
+    pane_pid: i32,
+    manifest_id: &str,
+) -> NotificationPreWriteObservation {
+    NotificationPreWriteObservation {
+        pane_root: process_instance(pane_pid),
+        selected_manifest: NotificationManifestId::new(manifest_id).ok(),
+        binding: None,
+    }
+}
+
+fn composer_semantic_missing(manifest: &Manifest, detection: &Detection) -> bool {
+    detection
+        .readings
+        .iter()
+        .find(|reading| reading.sensor == Sensor::Screen && reading.state == AgentState::Idle)
+        .and_then(|reading| manifest.rules.iter().find(|rule| rule.id == reading.rule))
+        .is_some_and(|rule| rule.composer_semantic.is_none())
+}
+
+fn composer_semantic_observation(
+    inner: &Inner,
+    handle: &DeliveryHandle,
+    row: &PaneRow,
+    manifest_id: &str,
+) -> Option<NotificationPreWriteObservation> {
+    let notification = handle.notification.as_ref()?;
+    let binding = fusion::admitted_binding(inner, handle.session_idx, row)?;
+    if binding.manifest != manifest_id {
+        return None;
+    }
+
+    Some(NotificationPreWriteObservation {
+        pane_root: Some(process_instance_id(binding.pane_root)?),
+        selected_manifest: Some(NotificationManifestId::new(&binding.manifest).ok()?),
+        binding: Some(notification_binding(notification.recipient(), &binding)?),
+    })
+}
+
+fn notification_binding(
+    recipient: RecipientKey,
+    binding: &fusion::Binding,
+) -> Option<NotificationBinding> {
+    Some(NotificationBinding {
+        recipient,
+        pane_root: Some(process_instance_id(binding.pane_root)?),
+        leader: Some(process_instance_id(binding.leader)?),
+        agent: process_instance_id(binding.agent)?,
+        manifest: NotificationManifestId::new(&binding.manifest).ok()?,
+    })
+}
+
 /// Await the test-only injection pause, when one is installed. Production
 /// never installs one; this is a no-op there.
 pub(crate) async fn inject_pause(inner: &Arc<Inner>, phase: &'static str) {
@@ -2921,15 +4892,16 @@ pub(crate) async fn inject_pause(inner: &Arc<Inner>, phase: &'static str) {
 /// The gate hold cause that no pane event will ever clear: the daemon
 /// could not read who is in the pane.
 const OBSERVATION_HOLD: &str = "occupant_unprovable";
+const WRITE_READINESS_OBSERVATION_HOLD: &str = "not_write_ready:occupant_unprovable";
 
 /// How long that one cause waits before looking again. Short enough that
 /// a transient `ps` failure costs a person nothing, long enough that a
 /// permanently unreadable process table is not a spin.
 const OBSERVATION_RETRY: Duration = Duration::from_millis(250);
 
-/// Mailbox attempts have no legal pre-write terminal state. They remain in
-/// workspace Gating until a pane event permits a fresh evaluation. Direct
-/// deliveries retain the legacy attention and quota outcomes.
+/// Mailbox attempts remain in workspace Gating while an event can change the
+/// answer. Named exhausted failures settle as durable BlockedPreWrite records.
+/// Direct deliveries retain the legacy attention and quota outcomes.
 fn workspace_prewrite_hold(handle: &DeliveryHandle, cause: &str) -> Option<String> {
     (!handle.owns_session_delivery_state()).then(|| cause.to_string())
 }
@@ -2952,9 +4924,10 @@ fn workspace_prewrite_failure_is_deferred(
 /// Retry accounting. Only failures proven to precede the pane write may
 /// consume the configured retry budget. True means the caller should retry
 /// immediately. False means a direct delivery ended in attention_required or
-/// a workspace notification remains durably Gating for later reconciliation.
-fn fail_attempt(
+/// a workspace notification remains durably held or blocked for recovery.
+async fn fail_attempt(
     inner: &Arc<Inner>,
+    worker: &Worker,
     handle: &Arc<DeliveryHandle>,
     failure: &AttemptFailure,
 ) -> bool {
@@ -2978,6 +4951,20 @@ fn fail_attempt(
             Step::to(DeliveryState::RetryQueued).cause(&failure.cause),
         )
     } else {
+        if let (true, Some(block)) = (
+            handle.notification.is_some(),
+            failure.pre_write_block.as_deref(),
+        ) {
+            persist_notification_prewrite_block(
+                inner,
+                worker,
+                handle,
+                block.cause,
+                block.observation.clone(),
+            )
+            .await;
+            return false;
+        }
         if workspace_prewrite_failure_is_deferred(handle, failure) {
             // The workspace attempt remains Gating. No pane write happened,
             // so a terminal notification would be false and a legacy state
@@ -2989,7 +4976,14 @@ fn fail_attempt(
         if matches!(failure.boundary, WriteBoundary::AfterWrite) {
             if let Some(notification) = &handle.notification {
                 match notification.record_attention(notification_attention_cause(&failure.cause)) {
-                    Ok(_) => {}
+                    Ok(record) => {
+                        if record.needs_exact_owned_reconciliation() {
+                            crate::attention_resolution::schedule_exact_owned_reconciliation(
+                                inner,
+                                record.recipient,
+                            );
+                        }
+                    }
                     Err(NotificationAdapterError::TerminalConflict(_)) => return false,
                     Err(error) => {
                         // The workspace journal remains at its last
@@ -3013,6 +5007,30 @@ fn fail_attempt(
     }
 }
 
+fn notify_notification_prewrite_blocked(
+    inner: &Arc<Inner>,
+    handle: &DeliveryHandle,
+    record: &cyclops_proto::NotificationRecord,
+) {
+    let cause = record
+        .pre_write_cause
+        .and_then(|cause| serde_json::to_value(cause).ok())
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string());
+    admin_notify(
+        inner,
+        NotifyLevel::ActionRequired,
+        &format!("notification to {} blocked before write", handle.to),
+        &format!(
+            "message {} attempt {}: {cause}; the mailbox remains claimable",
+            handle.msg_id, record.attempt_id
+        ),
+        Some(&handle.msg_id),
+        Some(handle.session_idx),
+        About::pane(&handle.pane_id),
+    );
+}
+
 fn notification_attention_cause(cause: &str) -> NotificationAttentionCause {
     match cause {
         "paste_failed" => NotificationAttentionCause::PasteFailed,
@@ -3033,7 +5051,7 @@ fn notify_attention(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>, cause: &st
     if !handle.owns_session_delivery_state() {
         // Workspace NotificationState and messages.changed own mailbox
         // attention. A delivery-scoped ping would point at the suppressed
-        // session projection and could never observe operator resolution.
+        // session projection and could never observe guarded resolution.
         return;
     }
     admin_notify(
@@ -3066,7 +5084,7 @@ fn notify_notification_deferred(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>
 
 /// Quota parking: the in-flight delivery and everything queued behind it
 /// park, the worker is flagged, and the admin is alerted once with the
-/// reset hint. Nothing here ever re-queues (amendment f).
+/// reset hint. Nothing here ever requeues automatically.
 async fn park_recipient(
     inner: &Arc<Inner>,
     worker: &Arc<Worker>,
@@ -3076,7 +5094,7 @@ async fn park_recipient(
     if let Some(notification) = &handle.notification {
         match notification.record_quota_held() {
             Ok(_) => {}
-            Err(NotificationAdapterError::SupersededBeforeWrite) => return,
+            Err(NotificationAdapterError::NoLongerCurrentBeforeWrite) => return,
             Err(error) => {
                 error!(id = %handle.msg_id, error = %error, "notification quota-held fact failed");
                 notify_notification_deferred(inner, handle, NOTIFICATION_RECORD_FAILED);
@@ -3121,12 +5139,7 @@ async fn park_recipient(
             .cause("blocked_quota")
             .note(hint.clone()),
     );
-    let drained: Vec<Arc<DeliveryHandle>> = worker
-        .queue
-        .lock()
-        .expect("worker queue lock")
-        .drain(..)
-        .collect();
+    let drained = worker.drain_pending();
     let (direct, notifications) = split_legacy_parked_queue(drained);
     for h in direct {
         advance(
@@ -3139,13 +5152,8 @@ async fn park_recipient(
         );
     }
     if !notifications.is_empty() {
-        let mut queue = worker.queue.lock().expect("worker queue lock");
         // These handles were ahead of anything enqueued after the drain.
-        // Push in reverse so their original FIFO order stays intact.
-        for notification in notifications.into_iter().rev() {
-            queue.push_front(notification);
-        }
-        drop(queue);
+        worker.prepend(notifications);
         worker.notify.notify_one();
     }
     admin_notify(
@@ -3227,12 +5235,22 @@ enum GateOutcome {
         /// submit: a pane whose occupant changed after admit must never be
         /// injected into.
         pane_pid: i32,
+        /// The regate hold observed an exact state, readiness, or pane edge.
+        /// Only this grants a fresh immediate re-proof allowance.
+        regate_evidence_changed: bool,
     },
     Park {
         hint: Option<String>,
     },
     Attention {
         cause: String,
+    },
+    /// Repeated identical evidence proved this exact mailbox attempt cannot
+    /// reach the write boundary. The durable block makes it visible and
+    /// operator-withdrawable without touching the pane.
+    BlockedPreWrite {
+        cause: NotificationPreWriteCause,
+        observation: NotificationPreWriteObservation,
     },
     /// A mailbox notification remains durably queued or gating. The
     /// in-memory worker stops, and the next route or restart reconciliation
@@ -3249,10 +5267,16 @@ enum GateOutcome {
 /// state changes, pane field changes, and session reattach. The recompute
 /// that admits a delivery runs immediately before pasting, so the gate
 /// snapshot is fresher than any human keystroke round-trip.
-async fn gate(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> GateOutcome {
+async fn gate(
+    inner: &Arc<Inner>,
+    handle: &Arc<DeliveryHandle>,
+    initial_hold: Option<String>,
+) -> GateOutcome {
     let mut declines: HashMap<String, u32> = HashMap::new();
     let mut notified_rules: HashSet<String> = HashSet::new();
     let mut last_hold: Option<String> = None;
+    let mut forced_hold = initial_hold;
+    let mut regate_evidence_changed = false;
     // One-shot visibility for wedged holds: a delivery held in gating past
     // the configured threshold pings the admin exactly once.
     let mut hold_since: Option<Instant> = None;
@@ -3267,7 +5291,7 @@ async fn gate(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> GateOutcome {
         if let Some(notification) = &handle.notification {
             match notification.ensure_current_gating() {
                 Ok(()) => {}
-                Err(NotificationAdapterError::SupersededBeforeWrite) => {
+                Err(NotificationAdapterError::NoLongerCurrentBeforeWrite) => {
                     return GateOutcome::Withdrawn;
                 }
                 Err(error) => {
@@ -3279,50 +5303,13 @@ async fn gate(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> GateOutcome {
             }
         }
 
-        let hold = match &watcher {
-            None => Some("session_detached".to_string()),
-            Some(w) => 'pane: {
-                let Some(row) = w.pane(&handle.pane_id) else {
-                    if let Some(hold) = workspace_prewrite_hold(handle, "no_such_pane") {
-                        break 'pane Some(hold);
-                    }
-                    return GateOutcome::Attention {
-                        cause: "no_such_pane".to_string(),
-                    };
-                };
-                if row.dead {
-                    if let Some(hold) = workspace_prewrite_hold(handle, "pane_dead") {
-                        break 'pane Some(hold);
-                    }
-                    return GateOutcome::Attention {
-                        cause: "pane_dead".to_string(),
-                    };
-                }
-                if row.in_mode {
-                    // Human scrolling in copy-mode; %pane-mode-changed
-                    // re-triggers via the pane event stream.
-                    Some("pane_in_mode".to_string())
-                } else {
-                    let Some(manifest) = fusion::bind_manifest_for(inner, handle.session_idx, &row)
-                    else {
-                        if let Some(hold) = workspace_prewrite_hold(handle, "no_manifest") {
-                            break 'pane Some(hold);
-                        }
-                        return GateOutcome::Attention {
-                            cause: "no_manifest".to_string(),
-                        };
-                    };
-                    let manifest_id = manifest.agent.id.clone();
-                    let Some(det) = fusion::recompute_pane(
-                        inner,
-                        handle.session_idx,
-                        w,
-                        &handle.pane_id,
-                        true,
-                        "gate",
-                    )
-                    .await
-                    else {
+        let hold = if let Some(cause) = forced_hold.take() {
+            Some(cause)
+        } else {
+            match &watcher {
+                None => Some("session_detached".to_string()),
+                Some(w) => 'pane: {
+                    let Some(row) = w.pane(&handle.pane_id) else {
                         if let Some(hold) = workspace_prewrite_hold(handle, "no_such_pane") {
                             break 'pane Some(hold);
                         }
@@ -3330,131 +5317,226 @@ async fn gate(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> GateOutcome {
                             cause: "no_such_pane".to_string(),
                         };
                     };
-                    match det.state {
-                        AgentState::Idle => {
-                            // Runtime idle is not permission to write
-                            // (INVARIANTS rule 12). A turn-end hook can put
-                            // the pane in idle while the composer holds a
-                            // staged payload the screen sensor could not
-                            // read; proceeding there pastes over it.
-                            match (det.write_ready, det.write_block.as_deref()) {
-                                (true, _) => {
-                                    // The admitted pid is what every
-                                    // receipt is later held against, so an
-                                    // unreadable process table is a
-                                    // refusal, not a shrug. Falling back
-                                    // to the pane root here would pin the
-                                    // delivery to the SHELL and then
-                                    // resolve receipts against whoever
-                                    // sits at that prompt next.
-                                    //
-                                    // A HOLD rather than an ending: not
-                                    // being able to name the occupant is
-                                    // doubt, and nothing has been written
-                                    // yet. A respawned pane updates its
-                                    // pid in the table without emitting a
-                                    // pane change, so the row can briefly
-                                    // name a process that has already
-                                    // exited, and ending the delivery
-                                    // there would summon a human for a
-                                    // table that was about to catch up.
-                                    match fusion::foreground_pid_checked(row.pane_pid) {
-                                        None => Some("occupant_unprovable".to_string()),
-                                        Some(pane_pid) => {
-                                            gate_line(
-                                                inner,
-                                                handle,
-                                                "proceed",
-                                                Some(&det.decided_by),
-                                                None,
-                                            );
-                                            return GateOutcome::Proceed {
-                                                manifest_id,
-                                                pane_pid,
-                                            };
-                                        }
-                                    }
-                                }
-                                // Hold on an event, never a clock: the next
-                                // pane change re-evaluates, and a screen
-                                // sensor that can see the composer resolves
-                                // it without anyone pasting blind.
-                                (false, reason) => Some(format!(
-                                    "not_write_ready:{}",
-                                    reason.unwrap_or("unstamped")
-                                )),
-                            }
+                    if row.dead {
+                        if let Some(hold) = workspace_prewrite_hold(handle, "pane_dead") {
+                            break 'pane Some(hold);
                         }
-                        AgentState::Dead => {
-                            if let Some(hold) = workspace_prewrite_hold(handle, "pane_dead") {
+                        return GateOutcome::Attention {
+                            cause: "pane_dead".to_string(),
+                        };
+                    }
+                    if row.in_mode {
+                        // Human scrolling in copy-mode; %pane-mode-changed
+                        // re-triggers via the pane event stream.
+                        Some("pane_in_mode".to_string())
+                    } else {
+                        let Some(manifest) =
+                            fusion::bind_manifest_for(inner, handle.session_idx, &row)
+                        else {
+                            if let Some(hold) = workspace_prewrite_hold(handle, "no_manifest") {
                                 break 'pane Some(hold);
                             }
                             return GateOutcome::Attention {
-                                cause: "pane_dead".to_string(),
+                                cause: "no_manifest".to_string(),
                             };
-                        }
-                        AgentState::BlockedQuota => {
-                            let hint = quota_hint(w, &handle.pane_id).await;
-                            gate_line(
-                                inner,
-                                handle,
-                                "park",
-                                Some(&det.decided_by),
-                                Some("blocked_quota"),
-                            );
-                            return GateOutcome::Park { hint };
-                        }
-                        AgentState::BlockedModal | AgentState::BlockedPermission => {
-                            let rule = inner.manifests.get(&manifest_id).and_then(|m| {
-                                m.rules
-                                    .iter()
-                                    .find(|r| r.id == det.decided_by && r.state.is_blocked())
-                            });
-                            match rule {
-                                Some(r)
-                                    if r.auto_dismiss
-                                        && !r.decline_keys.is_empty()
-                                        && *declines.get(&r.id).unwrap_or(&0) < MAX_DECLINES =>
-                                {
-                                    *declines.entry(r.id.clone()).or_insert(0) += 1;
-                                    gate_line(inner, handle, "decline", Some(&r.id), None);
-                                    let keys = r.decline_keys.clone();
-                                    let rule_id = r.id.clone();
-                                    if !send_decline_keys(
-                                        w,
-                                        &handle.pane_id,
-                                        manifest,
-                                        &rule_id,
-                                        &keys,
-                                    )
-                                    .await
+                        };
+                        let manifest_id = manifest.agent.id.clone();
+                        let Some(det) = fusion::recompute_pane(
+                            inner,
+                            handle.session_idx,
+                            w,
+                            &handle.pane_id,
+                            true,
+                            "gate",
+                        )
+                        .await
+                        else {
+                            if let Some(hold) = workspace_prewrite_hold(handle, "no_such_pane") {
+                                break 'pane Some(hold);
+                            }
+                            return GateOutcome::Attention {
+                                cause: "no_such_pane".to_string(),
+                            };
+                        };
+                        match det.state {
+                            AgentState::Idle => {
+                                // Runtime idle is not permission to write. A
+                                // turn-end hook can put the pane in idle while
+                                // the composer holds a staged payload the screen
+                                // sensor could not read. Proceeding pastes over it.
+                                match (det.write_ready, det.write_block.as_deref()) {
+                                    (true, _) => {
+                                        // The admitted pid is what every
+                                        // receipt is later held against, so an
+                                        // unreadable process table is a
+                                        // refusal, not a shrug. Falling back
+                                        // to the pane root here would pin the
+                                        // delivery to the SHELL and then
+                                        // resolve receipts against whoever
+                                        // sits at that prompt next.
+                                        //
+                                        // A HOLD rather than an ending: not
+                                        // being able to name the occupant is
+                                        // doubt, and nothing has been written
+                                        // yet. A respawned pane updates its
+                                        // pid in the table without emitting a
+                                        // pane change, so the row can briefly
+                                        // name a process that has already
+                                        // exited, and ending the delivery
+                                        // there would summon a human for a
+                                        // table that was about to catch up.
+                                        match fusion::foreground_pid_checked(row.pane_pid) {
+                                            None if handle.notification.is_some()
+                                                && last_hold.as_deref()
+                                                    == Some(OBSERVATION_HOLD) =>
+                                            {
+                                                return GateOutcome::BlockedPreWrite {
+                                                    cause:
+                                                        NotificationPreWriteCause::BindingUnprovable,
+                                                    observation: binding_unprovable_observation(
+                                                        row.pane_pid,
+                                                        &manifest_id,
+                                                    ),
+                                                };
+                                            }
+                                            None => Some(OBSERVATION_HOLD.to_string()),
+                                            Some(pane_pid) => {
+                                                gate_line(
+                                                    inner,
+                                                    handle,
+                                                    "proceed",
+                                                    Some(&det.decided_by),
+                                                    None,
+                                                );
+                                                return GateOutcome::Proceed {
+                                                    manifest_id,
+                                                    pane_pid,
+                                                    regate_evidence_changed,
+                                                };
+                                            }
+                                        }
+                                    }
+                                    // Hold on an event, never a clock: the next
+                                    // pane change re-evaluates, and a screen
+                                    // sensor that can see the composer resolves
+                                    // it without anyone pasting blind.
+                                    // Fusion may have recorded the same failed
+                                    // lookup in write readiness. Settle that path
+                                    // after the same bounded second observation.
+                                    (false, Some(OBSERVATION_HOLD))
+                                        if handle.notification.is_some()
+                                            && last_hold.as_deref()
+                                                == Some(WRITE_READINESS_OBSERVATION_HOLD) =>
                                     {
-                                        // The screen changed under the
-                                        // decline (TOCTOU): the confirming
-                                        // key was withheld. Back to the
-                                        // gate loop to re-read reality.
-                                        gate_line(
+                                        return GateOutcome::BlockedPreWrite {
+                                            cause: NotificationPreWriteCause::BindingUnprovable,
+                                            observation: binding_unprovable_observation(
+                                                row.pane_pid,
+                                                &manifest_id,
+                                            ),
+                                        };
+                                    }
+                                    (false, Some("no_write_safe_composer_evidence"))
+                                        if handle.notification.is_some()
+                                            && composer_semantic_missing(manifest, &det) =>
+                                    {
+                                        let Some(observation) = composer_semantic_observation(
                                             inner,
                                             handle,
-                                            "decline_aborted",
-                                            Some(&rule_id),
-                                            Some("modal_changed"),
-                                        );
+                                            &row,
+                                            &manifest_id,
+                                        ) else {
+                                            return GateOutcome::BlockedPreWrite {
+                                                cause: NotificationPreWriteCause::BindingUnprovable,
+                                                observation: binding_unprovable_observation(
+                                                    row.pane_pid,
+                                                    &manifest_id,
+                                                ),
+                                            };
+                                        };
+                                        return GateOutcome::BlockedPreWrite {
+                                            cause:
+                                                NotificationPreWriteCause::ComposerSemanticMissing,
+                                            observation,
+                                        };
                                     }
-                                    // One-shot settle so the dismissal
-                                    // renders before the re-check; the
-                                    // decline count bounds this loop.
-                                    tokio::time::sleep(DECLINE_SPACING).await;
-                                    continue 'gate;
+                                    (false, reason) => Some(format!(
+                                        "not_write_ready:{}",
+                                        reason.unwrap_or("unstamped")
+                                    )),
                                 }
-                                _ => {
-                                    // Trust/permission prompts belong to the
-                                    // human: hold and alert, never dismiss.
-                                    let rule_id = rule
-                                        .map(|r| r.id.clone())
-                                        .unwrap_or_else(|| det.decided_by.clone());
-                                    if notified_rules.insert(rule_id.clone()) {
-                                        admin_notify(
+                            }
+                            AgentState::Dead => {
+                                if let Some(hold) = workspace_prewrite_hold(handle, "pane_dead") {
+                                    break 'pane Some(hold);
+                                }
+                                return GateOutcome::Attention {
+                                    cause: "pane_dead".to_string(),
+                                };
+                            }
+                            AgentState::BlockedQuota => {
+                                let hint = quota_hint(w, &handle.pane_id).await;
+                                gate_line(
+                                    inner,
+                                    handle,
+                                    "park",
+                                    Some(&det.decided_by),
+                                    Some("blocked_quota"),
+                                );
+                                return GateOutcome::Park { hint };
+                            }
+                            AgentState::BlockedModal | AgentState::BlockedPermission => {
+                                let rule = inner.manifests.get(&manifest_id).and_then(|m| {
+                                    m.rules
+                                        .iter()
+                                        .find(|r| r.id == det.decided_by && r.state.is_blocked())
+                                });
+                                match rule {
+                                    Some(r)
+                                        if r.auto_dismiss
+                                            && !r.decline_keys.is_empty()
+                                            && *declines.get(&r.id).unwrap_or(&0)
+                                                < MAX_DECLINES =>
+                                    {
+                                        *declines.entry(r.id.clone()).or_insert(0) += 1;
+                                        gate_line(inner, handle, "decline", Some(&r.id), None);
+                                        let keys = r.decline_keys.clone();
+                                        let rule_id = r.id.clone();
+                                        if !send_decline_keys(
+                                            w,
+                                            &handle.pane_id,
+                                            manifest,
+                                            &rule_id,
+                                            &keys,
+                                        )
+                                        .await
+                                        {
+                                            // The screen changed under the
+                                            // decline (TOCTOU): the confirming
+                                            // key was withheld. Back to the
+                                            // gate loop to re-read reality.
+                                            gate_line(
+                                                inner,
+                                                handle,
+                                                "decline_aborted",
+                                                Some(&rule_id),
+                                                Some("modal_changed"),
+                                            );
+                                        }
+                                        // One-shot settle so the dismissal
+                                        // renders before the re-check; the
+                                        // decline count bounds this loop.
+                                        tokio::time::sleep(DECLINE_SPACING).await;
+                                        continue 'gate;
+                                    }
+                                    _ => {
+                                        // Trust/permission prompts belong to the
+                                        // human: hold and alert, never dismiss.
+                                        let rule_id = rule
+                                            .map(|r| r.id.clone())
+                                            .unwrap_or_else(|| det.decided_by.clone());
+                                        if notified_rules.insert(rule_id.clone()) {
+                                            admin_notify(
                                             inner,
                                             NotifyLevel::ActionRequired,
                                             &format!("{} blocked: {rule_id}", handle.to),
@@ -3470,15 +5552,16 @@ async fn gate(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> GateOutcome {
                                             // is the prompt on the pane.
                                             About::pane(&handle.pane_id),
                                         );
+                                        }
+                                        Some(format!("blocked:{rule_id}"))
                                     }
-                                    Some(format!("blocked:{rule_id}"))
                                 }
                             }
+                            AgentState::Working => Some("working".to_string()),
+                            // Human typing always wins.
+                            AgentState::IdleWithInput => Some("idle_with_input".to_string()),
+                            AgentState::Unknown => Some("unknown".to_string()),
                         }
-                        AgentState::Working => Some("working".to_string()),
-                        // Human typing always wins.
-                        AgentState::IdleWithInput => Some("idle_with_input".to_string()),
-                        AgentState::Unknown => Some("unknown".to_string()),
                     }
                 }
             }
@@ -3513,20 +5596,20 @@ async fn gate(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> GateOutcome {
             let unprovable =
                 cause == OBSERVATION_HOLD || cause == format!("not_write_ready:{OBSERVATION_HOLD}");
             let retry_at = unprovable.then(|| Instant::now() + OBSERVATION_RETRY);
-            tokio::select! {
-                _ = wait_pane_change(
+            let exact_evidence = tokio::select! {
+                changed = wait_pane_change(
                     &mut ev_rx,
                     pane_rx.as_mut(),
                     handle.session_idx,
                     &handle.pane_id,
                     &handle.cancel,
-                ) => {}
+                ) => changed,
                 _ = async {
                     match retry_at {
                         Some(at) => tokio::time::sleep_until(at).await,
                         None => std::future::pending().await,
                     }
-                } => {}
+                } => false,
                 _ = tokio::time::sleep_until(notify_at), if !hold_notified => {
                     // A wedged hold must at least be visible. One ping per
                     // delivery; the hold itself keeps waiting on events.
@@ -3548,8 +5631,10 @@ async fn gate(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> GateOutcome {
                         Some(handle.session_idx),
                         about,
                     );
+                    false
                 }
-            }
+            };
+            regate_evidence_changed |= exact_evidence;
         }
     }
 }
@@ -3566,7 +5651,7 @@ fn normalize_hold_cause(cause: &str) -> &'static str {
         "blocked_quota" => "blocked_quota",
         "unknown" => "unknown",
         c if c.split(':').next() == Some("blocked") => "blocked",
-        // Rule 12: idle by runtime state, but nothing proved the composer
+        // Runtime state is idle, but nothing proved the composer
         // was clean. Receipts say so plainly; the exact reason stays on
         // the gate ledger line.
         c if c.split(':').next() == Some("not_write_ready") => "not_write_ready",
@@ -3574,8 +5659,8 @@ fn normalize_hold_cause(cause: &str) -> &'static str {
     }
 }
 
-/// Manifest decline keys, in order, with spacing (amendment g: the keys
-/// come from the manifest rule, never a generic Enter/Escape).
+/// Manifest decline keys, in order, with spacing. The keys come from the
+/// manifest rule, never a generic Enter/Escape.
 ///
 /// TOCTOU guard: before the FINAL confirming key of a multi-key sequence
 /// the screen is re-captured, and the same modal rule must still be the
@@ -3700,9 +5785,46 @@ fn rollback_unwritten_hold(
     }
 }
 
+/// Releases a claimed composer barrier if the synchronous boundary hook unwinds.
+struct UnwrittenHold<'a> {
+    inner: &'a Arc<Inner>,
+    handle: &'a Arc<DeliveryHandle>,
+    binding: &'a fusion::Binding,
+    armed: bool,
+}
+
+impl<'a> UnwrittenHold<'a> {
+    fn new(
+        inner: &'a Arc<Inner>,
+        handle: &'a Arc<DeliveryHandle>,
+        binding: &'a fusion::Binding,
+    ) -> Self {
+        Self {
+            inner,
+            handle,
+            binding,
+            armed: true,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UnwrittenHold<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            rollback_unwritten_hold(self.inner, self.handle, self.binding);
+        }
+    }
+}
+
 fn notification_write_cause(error: NotificationAdapterError) -> String {
     match error {
-        NotificationAdapterError::SupersededBeforeWrite => SUPERSEDED_BEFORE_WRITE.to_string(),
+        NotificationAdapterError::NoLongerCurrentBeforeWrite => {
+            NO_LONGER_CURRENT_BEFORE_WRITE.to_string()
+        }
         other => {
             error!(error = %other, "notification write fact failed");
             NOTIFICATION_RECORD_FAILED.to_string()
@@ -3783,7 +5905,7 @@ fn settle_hold_on_receipt(
             // hold binds to it and joins the exact lifecycle: only that
             // turn's own end can end it.
             Some(turn) => {
-                fusion::bind_turn(
+                let _ = fusion::bind_turn(
                     inner,
                     handle.session_idx,
                     &handle.pane_id,
@@ -3826,13 +5948,50 @@ fn settle_hold_on_receipt(
     );
 }
 
+/// Reconcile an authenticated claim with a doorbell whose submit succeeded.
+///
+/// A claim while the delivery is still staged proves only mailbox retrieval.
+/// It wakes the worker so that worker can reserve submit or clear the exact
+/// staged bytes. It never creates turn evidence.
+pub(crate) fn settle_notification_claim(
+    inner: &Arc<Inner>,
+    attempt_id: NotificationAttemptId,
+) -> bool {
+    let Some(handle) = inner.engine.notification_handle(attempt_id) else {
+        return false;
+    };
+    if handle.notification_transport() != Some(NotificationTransport::Doorbell) {
+        return false;
+    }
+    let settled = advance(
+        inner,
+        &handle,
+        &[DeliveryState::Submitted],
+        Step::to(DeliveryState::DeliveredUnverified).cause("mailbox_claim"),
+    );
+    if settled
+        || matches!(
+            handle.state(),
+            DeliveryState::DeliveredVerified | DeliveryState::DeliveredUnverified
+        )
+    {
+        handle.ack.notify_one();
+        return true;
+    }
+    if handle.state() == DeliveryState::Staged {
+        handle.cancel.notify_one();
+        return true;
+    }
+    false
+}
+
 fn latch_turn_started(
     inner: &Arc<Inner>,
     session_idx: usize,
     pane_id: &str,
     owner: &str,
     since_ms: u64,
-) {
+) -> bool {
     // An existing mark is never replaced. It records the first observed
     // turn or the submit boundary for the screen lifecycle; it does not
     // correlate a turn end. Only a manifest-declared TurnKey can do that.
@@ -3843,7 +6002,7 @@ fn latch_turn_started(
     fusion::set_hold_owned(inner, session_idx, pane_id, owner, |hold| {
         hold.is_waiting()
             .then_some(cyclops_proto::ComposerHold::TurnStarted { since_ms })
-    });
+    })
 }
 
 /// Block until an event that could change the gate verdict for this pane:
@@ -3855,54 +6014,69 @@ async fn wait_pane_change(
     session_idx: usize,
     pane_id: &str,
     cancel: &Notify,
-) {
-    match pane_rx {
-        Some(prx) => loop {
-            tokio::select! {
-                ev = ev_rx.recv() => if event_wakes(&ev, session_idx, pane_id) { return },
-                pe = prx.recv() => if pane_event_wakes(&pe, pane_id) { return },
-                _ = cancel.notified() => return,
-            }
-        },
-        None => loop {
-            tokio::select! {
-                ev = ev_rx.recv() => if event_wakes(&ev, session_idx, pane_id) { return },
-                _ = cancel.notified() => return,
-            }
-        },
-    }
-}
-
-fn event_wakes(
-    ev: &Result<Event, broadcast::error::RecvError>,
-    session_idx: usize,
-    pane_id: &str,
 ) -> bool {
-    match ev {
-        Ok(e) => match e.event.as_str() {
-            // A readiness change with no state change is exactly the
-            // shape of a hold lifting, and it is the whole reason this
-            // arm exists: without it a delivery sleeps through its own
-            // release.
-            "state" | "readiness" => {
-                e.data["pane_id"] == pane_id && e.data["session_idx"] == session_idx
+    match pane_rx {
+        Some(prx) => {
+            let mut event_open = true;
+            let mut pane_open = true;
+            loop {
+                tokio::select! {
+                    ev = ev_rx.recv(), if event_open => match ev {
+                        Ok(event) => if let Some(exact) = event_wake(&event, session_idx, pane_id) {
+                            return exact;
+                        },
+                        Err(broadcast::error::RecvError::Lagged(_)) => return false,
+                        Err(broadcast::error::RecvError::Closed) => event_open = false,
+                    },
+                    pe = prx.recv(), if pane_open => match pe {
+                        Ok(event) => if let Some(exact) = pane_event_wake(&event, pane_id) {
+                            return exact;
+                        },
+                        Err(broadcast::error::RecvError::Lagged(_)) => return false,
+                        Err(broadcast::error::RecvError::Closed) => pane_open = false,
+                    },
+                    _ = cancel.notified() => return false,
+                }
             }
-            "session" => true,
-            _ => false,
-        },
-        Err(broadcast::error::RecvError::Lagged(_)) => true,
-        Err(broadcast::error::RecvError::Closed) => true,
+        }
+        None => {
+            let mut event_open = true;
+            loop {
+                tokio::select! {
+                    ev = ev_rx.recv(), if event_open => match ev {
+                        Ok(event) => if let Some(exact) = event_wake(&event, session_idx, pane_id) {
+                            return exact;
+                        },
+                        Err(broadcast::error::RecvError::Lagged(_)) => return false,
+                        Err(broadcast::error::RecvError::Closed) => event_open = false,
+                    },
+                    _ = cancel.notified() => return false,
+                }
+            }
+        }
     }
 }
 
-fn pane_event_wakes(pe: &Result<PaneEvent, broadcast::error::RecvError>, pane_id: &str) -> bool {
-    match pe {
-        Ok(PaneEvent::PaneChanged { id, .. }) => id == pane_id,
-        Ok(PaneEvent::PaneRemoved(id)) => id == pane_id,
-        Ok(PaneEvent::Disconnected) => true,
-        Ok(_) => false,
-        Err(broadcast::error::RecvError::Lagged(_)) => true,
-        Err(broadcast::error::RecvError::Closed) => true,
+fn event_wake(event: &Event, session_idx: usize, pane_id: &str) -> Option<bool> {
+    match event.event.as_str() {
+        // A readiness change with no state change is exactly the
+        // shape of a hold lifting, and it is the whole reason this
+        // arm exists: without it a delivery sleeps through its own
+        // release.
+        "state" | "readiness" => (event.data["pane_id"] == pane_id
+            && event.data["session_idx"] == session_idx)
+            .then_some(true),
+        "session" => Some(false),
+        _ => None,
+    }
+}
+
+fn pane_event_wake(event: &PaneEvent, pane_id: &str) -> Option<bool> {
+    match event {
+        PaneEvent::PaneChanged { id, .. } => (id == pane_id).then_some(true),
+        PaneEvent::PaneRemoved(id) => (id == pane_id).then_some(true),
+        PaneEvent::Disconnected => Some(false),
+        _ => None,
     }
 }
 
@@ -3910,11 +6084,11 @@ fn pane_event_wakes(pe: &Result<PaneEvent, broadcast::error::RecvError>, pane_id
 // Inject and verify
 // ---------------------------------------------------------------------------
 
-/// How payload bytes reach an agent and how the backend reads them back
-/// (amendment i; GOALS: delivery behind an adapter). The gate, verify, and
-/// ACK layers above call through this seam only, so a headless protocol
+/// How payload bytes reach an agent and how the backend reads them back.
+/// The gate, verify, and acknowledgment layers call through this seam only,
+/// so a headless protocol
 /// backend slots in per agent without touching them. [`TmuxInjector`] is
-/// the M1 implementation. Errors are the short cause codes retry
+/// the terminal implementation. Errors are the short cause codes retry
 /// accounting records.
 pub(crate) trait Injector {
     /// Put the payload somewhere the pane can take it, WITHOUT the pane
@@ -3951,20 +6125,24 @@ pub(crate) trait Injector {
     async fn discard(&self);
     /// Press the submit key.
     async fn submit(&self, pane_id: &str, key: &str) -> Result<(), String>;
-    /// Read back the visible grid (this backend's verification sensor).
-    async fn capture(&self, pane_id: &str) -> Result<String, String>;
-    /// Read back the grid with SGR escapes (capture-pane -e). Verification
-    /// takes this flavor when the manifest's composer discriminators are
-    /// `line_regex_esc` clauses (codex.toml), which a plain capture can
-    /// never satisfy.
-    async fn capture_escaped(&self, pane_id: &str) -> Result<String, String>;
+    /// Send one measured whole-composer clear sequence.
+    async fn clear(&self, pane_id: &str, keys: &[String]) -> Result<(), String> {
+        for key in keys {
+            self.submit(pane_id, key).await?;
+        }
+        Ok(())
+    }
+    /// Read one escaped snapshot with tmux physical wraps joined. Exact
+    /// composer extraction compares these logical rows with the bytes that
+    /// were spooled.
+    async fn capture_joined_escaped(&self, pane_id: &str) -> Result<String, String>;
 }
 
 /// The tmux paste path: load-buffer through the adapter's private spool
 /// (0600 file under the 0700 cyclops home, never the shared temp dir) into
-/// a per-delivery unique buffer (amendment e), paste-buffer -p (bracketed
-/// when the app opted in, F17) -d so the buffer does not linger
-/// server-global, send-keys for submit.
+/// a per-delivery unique buffer, paste-buffer -p (bracketed when the app
+/// opted in), and -d so the buffer does not linger server-global. Submit uses
+/// send-keys.
 struct TmuxInjector {
     client: Arc<ControlClient>,
     /// Per-delivery unique buffer name.
@@ -4034,16 +6212,17 @@ impl Injector for TmuxInjector {
         })
     }
 
-    async fn capture(&self, pane_id: &str) -> Result<String, String> {
-        self.client
-            .capture_pane(pane_id)
-            .await
-            .map_err(|e| e.to_string())
+    async fn clear(&self, pane_id: &str, keys: &[String]) -> Result<(), String> {
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        self.client.send_keys(pane_id, &keys).await.map_err(|e| {
+            warn!(error = %e, "composer clear failed");
+            "claim_clear_failed".to_string()
+        })
     }
 
-    async fn capture_escaped(&self, pane_id: &str) -> Result<String, String> {
+    async fn capture_joined_escaped(&self, pane_id: &str) -> Result<String, String> {
         self.client
-            .capture_pane_escaped(pane_id)
+            .capture_pane_joined_escaped(pane_id)
             .await
             .map_err(|e| e.to_string())
     }
@@ -4077,43 +6256,41 @@ pub(crate) enum ComposerContentProof {
 /// whether an id-carrying pattern proved the staging (feeds the tier-2
 /// evidence rules).
 ///
-/// Composer verification is the gate (amendment b): bracketed-paste
+/// Composer verification is the gate because bracketed-paste
 /// degradation is not observable up front through tmux 3.6a.
 async fn inject<I: Injector>(
     injector: &I,
     handle: &Arc<DeliveryHandle>,
     manifest: &Manifest,
     target: StagingTarget<'_>,
+    expected_payload: &str,
     on_write: &(dyn Fn() -> Result<(), String> + Sync),
 ) -> Result<(String, bool, String), String> {
     injector.commit(&handle.pane_id, on_write).await?;
     // The capture flavor follows the manifest's composer discriminators:
     // esc rules need the SGR-escaped grid or they fail closed, and a
-    // composer that collapses a long paste into a "[Pasted Content …]"
-    // chip leaves the escaped composer line as the ONLY thing that can
-    // verify the staging (the message id is hidden inside the chip).
-    let escaped = manifest.has_escaped_rules();
+    // composer that collapses a long paste into a chip hides the bytes.
+    // That representation can identify a staged-input condition, but it
+    // cannot prove exact Cyclops ownership or authorize Enter.
     let mut last_delay = 0;
     for delay in VERIFY_DELAYS_MS {
         if delay > last_delay {
             tokio::time::sleep(Duration::from_millis(delay - last_delay)).await;
         }
         last_delay = delay;
-        let capture = if escaped {
-            injector.capture_escaped(&handle.pane_id).await
-        } else {
-            injector.capture(&handle.pane_id).await
-        };
+        let capture = injector.capture_joined_escaped(&handle.pane_id).await;
         match capture {
             Ok(screen) => {
-                if let Some(id_staged) = staged_verified_target(manifest, &screen, target) {
+                if let Some((id_staged, payload_proof)) =
+                    exact_staging_proof(manifest, &screen, target, expected_payload)
+                {
                     // The comparison window is de-escaped text either way,
                     // so SGR churn (a blink, a focus change) can never fake
                     // a "changed composer" for the ACK tier.
                     return Ok((
                         bottom_window(&strip_csi(&screen), COMPOSER_WINDOW),
                         id_staged,
-                        payload_proof_target(manifest, &screen, target).unwrap_or_default(),
+                        payload_proof,
                     ));
                 }
             }
@@ -4123,41 +6300,38 @@ async fn inject<I: Injector>(
     Err("verify_failed".to_string())
 }
 
-/// Did this capture prove the paste staged? `Some(id_matched)` when it
-/// did, `None` when nothing on screen proves it.
+/// What representation is visible in the active composer.
 ///
-/// Two kinds of evidence, tried in order, and the order is the point:
-///
-/// 1. The terminal sentinel, proven to be the last payload row of the
-///    active composer. This is the only evidence that covers the whole
-///    payload, because the sentinel is the last byte written.
-/// 2. A composer-pinned generic pattern, for a vendor that collapsed the
-///    paste into a chip. A chip hides the id and the sentinel alike, so
-///    the chip on the composer line is all that survives it.
-///
-/// Verify that the staged target (sentinel or exact row) or a collapsed chip
-/// is staged in the active composer.
-pub(crate) fn staged_verified_target(
+/// A visible target is still only structural evidence until the extracted
+/// composer bytes match the expected payload. A collapsed chip proves only
+/// that the vendor drew a chip. It cannot prove ownership or authorize Enter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StagedRepresentation {
+    VisibleTarget,
+    CollapsedChip,
+}
+
+fn staged_representation(
     manifest: &Manifest,
     screen: &str,
     target: StagingTarget<'_>,
-) -> Option<bool> {
+) -> Option<StagedRepresentation> {
     match target {
         StagingTarget::Sentinel(msg_id) => {
             if sentinel_verified(manifest, screen, msg_id) {
-                return Some(true);
+                return Some(StagedRepresentation::VisibleTarget);
             }
             if marker_in_composer(manifest, screen) {
-                return Some(false);
+                return Some(StagedRepresentation::CollapsedChip);
             }
             None
         }
         StagingTarget::ExactRow(expected_row) => {
             if exact_row_verified(manifest, screen, expected_row) {
-                return Some(true);
+                return Some(StagedRepresentation::VisibleTarget);
             }
             if marker_in_composer(manifest, screen) {
-                return Some(false);
+                return Some(StagedRepresentation::CollapsedChip);
             }
             None
         }
@@ -4165,14 +6339,14 @@ pub(crate) fn staged_verified_target(
 }
 
 #[cfg(test)]
-fn staged_verified(
+fn sentinel_representation(
     manifest: &Manifest,
     screen: &str,
     _id_patterns: &[String],
     _other_patterns: &[String],
     msg_id: &str,
-) -> Option<bool> {
-    staged_verified_target(manifest, screen, StagingTarget::Sentinel(msg_id))
+) -> Option<StagedRepresentation> {
+    staged_representation(manifest, screen, StagingTarget::Sentinel(msg_id))
 }
 
 /// Is this delivery's sentinel the last payload row of the ACTIVE composer?
@@ -4295,13 +6469,34 @@ fn trailer_follows(manifest: &Manifest, suffix: &[(&str, String)]) -> bool {
     if suffix.len() < required || suffix.len() > layout.len() {
         return false;
     }
+    let structural_unstyled = suffix.iter().all(|(raw, plain)| *raw == plain)
+        && matches!(
+            manifest.injection.unstyled_composer_proof,
+            Some(cyclops_manifest::UnstyledComposerProof::StructuralTrailer)
+        );
+    if structural_unstyled {
+        let Some((_, first)) = suffix.first() else {
+            return false;
+        };
+        let belongs_to_composer = manifest
+            .composer_prompt
+            .as_ref()
+            .is_some_and(|pattern| captured_content(pattern, first).is_some())
+            || manifest
+                .composer_continuation
+                .as_ref()
+                .is_some_and(|pattern| captured_content(pattern, first).is_some());
+        if belongs_to_composer {
+            return false;
+        }
+    }
     // Full span on the plain row, generically: a manifest that forgot an
     // anchor would otherwise accept trailing payload on a chrome row, and
     // no vendor should be able to weaken terminality by omission. The
     // escaped half supplies the style evidence, where a partial match is
     // meaningful because SGR runs surround the text.
     let matches = |i: usize, raw: &str, plain: &str| {
-        whole_row(&layout[i], plain) && layout_esc[i].is_match(raw)
+        whole_row(&layout[i], plain) && (layout_esc[i].is_match(raw) || structural_unstyled)
     };
     for (i, (raw, plain)) in suffix.iter().enumerate().take(required) {
         if !matches(i, raw, plain) {
@@ -4329,10 +6524,6 @@ fn trailer_follows(manifest: &Manifest, suffix: &[(&str, String)]) -> bool {
 }
 
 fn sentinel_proof(manifest: &Manifest, screen: &str, msg_id: &str) -> Option<String> {
-    // A plain capture where the escaped one is required cannot answer.
-    if !screen.contains('\u{1b}') {
-        return None;
-    }
     let want = sentinel_for(msg_id);
     let rows = composer_rows(screen);
     // The bounded tail is where the sentinel is looked for, so a token
@@ -4344,13 +6535,10 @@ fn sentinel_proof(manifest: &Manifest, screen: &str, msg_id: &str) -> Option<Str
     // Exactly one exact sentinel for THIS delivery. Two is ambiguity
     // about which one transport owns, and ambiguity fails closed.
     //
-    // The token row is matched RAW, with only the terminal's own trailing
-    // padding removed. The measured sentinel row carries no styling at
-    // all, and normalizing before comparing is what lets bytes ride along
-    // behind it: a torn `ESC [` swallows the rest of the line and a
-    // complete sequence is removed outright, so either one reduces the
-    // sentinel plus arbitrary content to the exact token. This row proves
-    // nothing follows it, so nothing may.
+    // The token row is matched in the vendor's measured continuation shape,
+    // with only the terminal's own trailing padding removed. Some composers
+    // prefix every logical continuation row, including the sentinel. The raw
+    // row must still equal the plain row so styling cannot hide extra bytes.
     //
     // KNOWN LIMIT, measured on tmux 3.6a: the default capture erases
     // trailing spaces a person typed, exactly as it erases the grid's own
@@ -4358,16 +6546,55 @@ fn sentinel_proof(manifest: &Manifest, screen: &str, msg_id: &str) -> Option<Str
     // padding by any capture this takes. Every other trailing code point
     // is content and refuses. Closing the space case needs the composer
     // endpoint observed independently, bound to this same snapshot.
-    let hits: Vec<usize> = window
+    let raw_hits: Vec<usize> = window
         .iter()
         .enumerate()
-        .filter(|(_, (raw, plain))| *plain == want && *raw == want)
+        .filter(|(_, (raw, plain))| {
+            if raw != plain {
+                return false;
+            }
+            *plain == want
+                || manifest
+                    .composer_continuation
+                    .as_ref()
+                    .is_some_and(|continuation| {
+                        captured_content(continuation, plain) == Some(want.as_str())
+                    })
+        })
         .map(|(i, _)| i)
+        .collect();
+    let hits: Vec<usize> = raw_hits
+        .iter()
+        .copied()
+        .filter(|at| trailer_follows(manifest, &window[at + 1..]))
         .collect();
     let [at] = hits[..] else {
         return None;
     };
-    if !trailer_follows(manifest, &window[at + 1..]) {
+    if let Some(prompt) = manifest.composer_prompt.as_ref() {
+        let want_header = format!("[cyclops {msg_id}] FROM:");
+        let prompt_at = window[..=at]
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, (_, plain))| {
+                captured_content(prompt, plain)
+                    .is_some_and(|content| content.starts_with(&want_header))
+                    .then_some(index)
+            });
+        if let Some(prompt_at) = prompt_at {
+            if raw_hits
+                .iter()
+                .filter(|hit| **hit >= prompt_at && **hit <= at)
+                .count()
+                != 1
+            {
+                return None;
+            }
+        } else if raw_hits.len() != 1 {
+            return None;
+        }
+    } else if raw_hits.len() != 1 {
         return None;
     }
     Some(
@@ -4401,6 +6628,9 @@ pub(crate) fn exact_row_proof(
         .iter()
         .filter(|rule| rule.state == AgentState::IdleWithInput)
         .collect();
+    let structural_unstyled = manifest.injection.unstyled_composer_proof
+        == Some(UnstyledComposerProof::StructuralTrailer)
+        && !screen.contains('\u{1b}');
 
     let hits: Vec<usize> = window
         .iter()
@@ -4410,6 +6640,16 @@ pub(crate) fn exact_row_proof(
             let r = unpad(raw);
             if idle_rules.is_empty() {
                 return p == want || r == want;
+            }
+            if structural_unstyled
+                && raw == plain
+                && manifest
+                    .composer_prompt
+                    .as_ref()
+                    .and_then(|prompt| captured_content(prompt, plain))
+                    == Some(want)
+            {
+                return true;
             }
             if let Some(prefix) = p.strip_suffix(want) {
                 let is_prompt_prefix = prefix
@@ -4430,24 +6670,18 @@ pub(crate) fn exact_row_proof(
             false
         })
         .map(|(i, _)| i)
+        .filter(|at| trailer_follows(manifest, &window[at + 1..]))
         .collect();
 
     let [at] = hits[..] else {
         return None;
     };
 
-    if !trailer_follows(manifest, &window[at + 1..]) {
+    if window[..at]
+        .iter()
+        .any(|(raw, plain)| idle_rules.iter().any(|rule| rule.matches_row(plain, raw)))
+    {
         return None;
-    }
-
-    // Prove the doorbell is the COMPLETE active composer content:
-    // No preceding row in the search window may match an IdleWithInput composer rule.
-    if !idle_rules.is_empty() {
-        for (raw, plain) in &window[..at] {
-            if idle_rules.iter().any(|rule| rule.matches_row(plain, raw)) {
-                return None;
-            }
-        }
     }
 
     Some(window[at].1.trim().to_string())
@@ -4460,6 +6694,7 @@ pub(crate) fn exact_row_verified(manifest: &Manifest, screen: &str, expected_row
 /// Substituted staging patterns, split into id-carrying (contain the
 /// message id after substitution) and generic. The id is always an
 /// id-carrying pattern.
+#[cfg(test)]
 fn verify_patterns(manifest: &Manifest, msg_id: &str) -> (Vec<String>, Vec<String>) {
     let mut id = Vec::new();
     let mut other = Vec::new();
@@ -4523,7 +6758,7 @@ enum Evidence {
 
 /// What one checkpoint pass means for the ACK loop. Expiry may stand only
 /// on a pass that actually looked and saw nothing; doubt freezes the clock
-/// until observability returns (detach-aware ACKs, v1.1 amendment 2).
+/// until observability returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckpointStep {
     Deliver,
@@ -4546,13 +6781,99 @@ fn checkpoint_step(evidence: Evidence, expired: bool) -> CheckpointStep {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiptRefresh {
+    Observe,
+    Resolved,
+    Freeze,
+    Rebound,
+}
+
+/// Classify the stable fusion refresh that precedes every receipt check.
+///
+/// A missing watcher is a detach and freezes time. A live watcher that no
+/// longer has the submitted pane proves a rebound. Once a pane is observed,
+/// only stale screen evidence, pane mode, or an unprovable occupant freezes
+/// the clock. Other refusals remain observable facts and must not stop the
+/// receipt ladder.
+fn receipt_refresh_step(
+    watcher_live: bool,
+    detection: Option<&Detection>,
+    resolved: bool,
+) -> ReceiptRefresh {
+    if resolved {
+        return ReceiptRefresh::Resolved;
+    }
+    if !watcher_live {
+        return ReceiptRefresh::Freeze;
+    }
+    let Some(detection) = detection else {
+        return ReceiptRefresh::Rebound;
+    };
+    if detection.state == AgentState::Dead {
+        return ReceiptRefresh::Rebound;
+    }
+    if detection.stale
+        || matches!(
+            detection.write_block.as_deref(),
+            Some("pane_in_mode" | "occupant_unprovable")
+        )
+    {
+        ReceiptRefresh::Freeze
+    } else {
+        ReceiptRefresh::Observe
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiptStep {
+    Resolved,
+    Deliver,
+    Rebound,
+    Freeze,
+    Expire,
+    Wait,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiptPaneStep {
+    Ignore,
+    Recheck,
+    Rebound,
+    Freeze,
+}
+
+fn receipt_pane_step(
+    event: &Result<PaneEvent, broadcast::error::RecvError>,
+    pane_id: &str,
+    frozen: bool,
+) -> ReceiptPaneStep {
+    match event {
+        Ok(PaneEvent::PaneRemoved(id)) if id == pane_id => ReceiptPaneStep::Rebound,
+        Ok(PaneEvent::PaneChanged { id, row, .. }) if id == pane_id => {
+            if row.dead {
+                ReceiptPaneStep::Rebound
+            } else {
+                ReceiptPaneStep::Recheck
+            }
+        }
+        Ok(PaneEvent::OutputActivity { pane_id: id, .. }) if id == pane_id && frozen => {
+            ReceiptPaneStep::Recheck
+        }
+        Ok(PaneEvent::Disconnected) | Err(broadcast::error::RecvError::Closed) => {
+            ReceiptPaneStep::Freeze
+        }
+        _ => ReceiptPaneStep::Ignore,
+    }
+}
+
 /// The per-delivery ACK timeline: the tier-1 hook window, the tier-2
 /// screen-evidence checkpoints, and the give-up deadline.
 ///
-/// Detach-aware (DELIVERY.md v1.1 amendment 2): while the session's
-/// control connection is down the daemon cannot observe the pane, so the
-/// clock freezes; on reattach every remaining instant shifts by the outage
-/// duration. Time lost to a detach never counts against an ACK window.
+/// While the session's control connection is down, the daemon cannot observe
+/// the pane, so the clock freezes. On reattach every remaining instant shifts
+/// by the outage duration. Time lost to a detach never counts against an
+/// acknowledgment window.
 struct AckClock {
     /// End of the tier-1 hook phase; None once the phase ended (or for
     /// screen-tier agents that never had one).
@@ -4672,18 +6993,128 @@ async fn recv_pane(
 /// that landed during the outage resolves as delivered instead of being
 /// resubmitted (the m1 soak's duplicate). Hook ACKs arriving during the
 /// outage are accepted by the matcher independently of this loop.
-async fn await_ack(
+struct ReceiptWait<'a> {
+    manifest: &'a Manifest,
+    staged_window: &'a str,
+    id_staged: bool,
+    target: StagingTarget<'a>,
+    submit_at: Instant,
+    events: broadcast::Receiver<Event>,
+}
+
+fn receipt_is_resolved(handle: &DeliveryHandle) -> bool {
+    matches!(
+        handle.state(),
+        DeliveryState::DeliveredVerified | DeliveryState::DeliveredUnverified
+    )
+}
+
+/// Preserve the tier-1 diagnostic window when screen evidence resolves first.
+/// A hook arriving before `deadline` records liveness and suppresses the ping.
+fn schedule_missing_hook_diagnostic(
+    inner: &Arc<Inner>,
+    handle: &DeliveryHandle,
+    manifest_id: &str,
+    deadline: Option<Instant>,
+) {
+    let Some(deadline) = deadline else {
+        return;
+    };
+    let Some(agent) = *handle.submitted_agent.lock().expect("submitted agent lock") else {
+        return;
+    };
+    let pane = PaneKey::new(handle.session_idx, &handle.pane_id);
+    let Some(binding) = inner.hook_liveness.binding(&pane, agent, manifest_id) else {
+        return;
+    };
+    let task_inner = Arc::clone(inner);
+    let msg_id = handle.msg_id.clone();
+    let to = handle.to.clone();
+    let mut stop = inner.stop.clone();
+    inner.engine.spawn_descendant_task(async move {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                crate::selftest::notify_f1_once(&task_inner, &msg_id, &to, binding);
+            }
+            _ = stop.changed() => {}
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn receipt_checkpoint_pass(
     inner: &Arc<Inner>,
     handle: &Arc<DeliveryHandle>,
     manifest: &Manifest,
     staged_window: &str,
     id_staged: bool,
+    target: StagingTarget<'_>,
+    working_seen: bool,
+    output_seen: bool,
+    clock: &AckClock,
+) -> ReceiptStep {
+    let Some(watcher) = inner.watcher_of(handle.session_idx) else {
+        return ReceiptStep::Freeze;
+    };
+    let detection = fusion::recompute_pane(
+        inner,
+        handle.session_idx,
+        &watcher,
+        &handle.pane_id,
+        true,
+        "receipt_checkpoint",
+    )
+    .await;
+    let same_watcher = inner
+        .watcher_of(handle.session_idx)
+        .is_some_and(|current| Arc::ptr_eq(&current, &watcher));
+    match receipt_refresh_step(
+        same_watcher,
+        detection.as_ref(),
+        receipt_is_resolved(handle),
+    ) {
+        ReceiptRefresh::Resolved => ReceiptStep::Resolved,
+        ReceiptRefresh::Freeze => ReceiptStep::Freeze,
+        ReceiptRefresh::Rebound => ReceiptStep::Rebound,
+        ReceiptRefresh::Observe => {
+            match checkpoint_step(
+                screen_evidence(
+                    inner,
+                    handle,
+                    manifest,
+                    staged_window,
+                    id_staged,
+                    target,
+                    working_seen,
+                    output_seen,
+                )
+                .await,
+                clock.expired(Instant::now()),
+            ) {
+                CheckpointStep::Deliver => ReceiptStep::Deliver,
+                CheckpointStep::Rebound => ReceiptStep::Rebound,
+                CheckpointStep::Freeze => ReceiptStep::Freeze,
+                CheckpointStep::Expire => ReceiptStep::Expire,
+                CheckpointStep::Wait => ReceiptStep::Wait,
+            }
+        }
+    }
+}
+
+async fn await_ack(
+    inner: &Arc<Inner>,
+    handle: &Arc<DeliveryHandle>,
+    wait: ReceiptWait<'_>,
 ) -> AckOutcome {
-    let submit_at = Instant::now();
+    let ReceiptWait {
+        manifest,
+        staged_window,
+        id_staged,
+        target,
+        submit_at,
+        events: mut ev_rx,
+    } = wait;
     let tier1 = manifest.hooks.ack.is_some() && manifest.hooks.ack_payload_field.is_some();
-    let (id_patterns, other_patterns) = verify_patterns(manifest, &handle.msg_id);
-    let patterns: Vec<String> = id_patterns.into_iter().chain(other_patterns).collect();
-    let mut ev_rx = inner.events.subscribe();
     let mut pane_rx = inner.watcher_of(handle.session_idx).map(|w| w.subscribe());
     let mut working_seen = false;
     let output_seen = false;
@@ -4700,56 +7131,78 @@ async fn await_ack(
         // notification is edge-triggered and can fire before this loop is
         // listening for it, which would leave a delivery that is already
         // resolved waiting out the whole acknowledgement window.
-        if handle.state() == DeliveryState::DeliveredVerified {
+        if matches!(
+            handle.state(),
+            DeliveryState::DeliveredVerified | DeliveryState::DeliveredUnverified
+        ) {
             return AckOutcome::Resolved;
         }
-        let target = clock.next_target();
+        let checkpoint_target = clock.next_target();
         tokio::select! {
             _ = handle.ack.notified() => {
-                if handle.state() == DeliveryState::DeliveredVerified {
+                if matches!(
+                    handle.state(),
+                    DeliveryState::DeliveredVerified | DeliveryState::DeliveredUnverified
+                ) {
                     return AckOutcome::Resolved;
                 }
             }
-            _ = tokio::time::sleep_until(target.map(|(t, _)| t).unwrap_or_else(Instant::now)),
-                if target.is_some() =>
+            _ = tokio::time::sleep_until(checkpoint_target.map(|(t, _)| t).unwrap_or_else(Instant::now)),
+                if checkpoint_target.is_some() =>
             {
                 let now = Instant::now();
-                if target.is_some_and(|(_, hook_end)| hook_end) {
+                if checkpoint_target.is_some_and(|(_, hook_end)| hook_end) {
                     // Tier-1 window over: the delivery downgrades to screen
-                    // evidence. On a pane that has NEVER produced a hook
-                    // edge this is the F1 signature (configuration does not
-                    // equal subscription); the admin hears about it once.
+                    // evidence. On a pane that has never produced a hook
+                    // edge, this is the missing-hook signature: configuration
+                    // does not equal subscription. The admin hears once.
                     if tier1 {
-                        crate::selftest::notify_f1_once(
-                            inner,
-                            &handle.msg_id,
-                            &handle.to,
-                            &handle.pane_id,
-                            handle.session_idx,
-                            &manifest.agent.id,
-                        );
+                        if let Some(agent) = *handle
+                            .submitted_agent
+                            .lock()
+                            .expect("submitted agent lock")
+                        {
+                            let pane = PaneKey::new(handle.session_idx, &handle.pane_id);
+                            if let Some(binding) = inner.hook_liveness.binding(
+                                &pane,
+                                agent,
+                                &manifest.agent.id,
+                            ) {
+                                crate::selftest::notify_f1_once(
+                                    inner,
+                                    &handle.msg_id,
+                                    &handle.to,
+                                    binding,
+                                );
+                            }
+                        }
                     }
                     clock.end_hook_phase(now);
                     continue;
                 }
                 clock.advance_checkpoint();
-                let evidence = screen_evidence(
-                    inner, handle, manifest, &patterns, staged_window,
-                    id_staged, working_seen, output_seen,
-                ).await;
-                match checkpoint_step(evidence, clock.expired(Instant::now())) {
-                    CheckpointStep::Deliver => return AckOutcome::Screen,
-                    CheckpointStep::Expire => return AckOutcome::Timeout,
-                    CheckpointStep::Rebound => return AckOutcome::Rebound,
-                    CheckpointStep::Freeze => {
-                        // The pass could not look (watcher cleared before
-                        // its detach event, or the capture failed): a
-                        // Timeout here would stand on nothing. Freeze; a
-                        // session edge, pane activity, or a lag reconcile
-                        // unfreezes.
+                match receipt_checkpoint_pass(
+                    inner, handle, manifest, staged_window, id_staged, target,
+                    working_seen, output_seen, &clock,
+                ).await {
+                    ReceiptStep::Resolved => return AckOutcome::Resolved,
+                    ReceiptStep::Deliver => {
+                        schedule_missing_hook_diagnostic(
+                            inner,
+                            handle,
+                            &manifest.agent.id,
+                            clock.hook_deadline,
+                        );
+                        return AckOutcome::Screen;
+                    }
+                    ReceiptStep::Expire => return AckOutcome::Timeout,
+                    ReceiptStep::Rebound => return AckOutcome::Rebound,
+                    ReceiptStep::Freeze => {
+                        // The stable refresh could not prove the screen or
+                        // binding. A timeout here would stand on nothing.
                         clock.freeze(Instant::now());
                     }
-                    CheckpointStep::Wait => {}
+                    ReceiptStep::Wait => {}
                 }
             }
             // Reattach/detach truth for THIS session comes from
@@ -4758,8 +7211,8 @@ async fn await_ack(
             // against a name captured at function entry: a followed
             // rename (`PaneEvent::SessionRenamed`, `rename_session_slot`
             // in lib.rs) changes the live name mid-wait, and a stale
-            // snapshot then never matches an attach OR a detach line
-            // again — the clock freezes on the FIRST outage and never
+            // snapshot then never matches an attach or a detach line
+            // again. The clock freezes on the first outage and never
             // unfreezes, which is exactly the "ledger append silently
             // drops" failure mode `emit_state`'s doc comment describes,
             // in delivery-wait clothing. `watcher_of` cannot go stale: it
@@ -4779,19 +7232,24 @@ async fn await_ack(
                             // Reattach evidence pass, before any deadline
                             // can fire: did the payload arrive during the
                             // outage?
-                            match screen_evidence(
-                                inner, handle, manifest, &patterns, staged_window,
-                                id_staged, working_seen, output_seen,
+                            match receipt_checkpoint_pass(
+                                inner, handle, manifest, staged_window, id_staged, target,
+                                working_seen, output_seen, &clock,
                             ).await {
-                                Evidence::Confirmed => return AckOutcome::Screen,
-                                // Still blind right after the edge: stay
-                                // frozen rather than letting the shifted
-                                // deadlines run on an unobserved pane.
-                                Evidence::Unobservable => clock.freeze(Instant::now()),
-                                // Nothing this pane does now speaks for
-                                // the delivery: stop waiting for it to.
-                                Evidence::Rebound => return AckOutcome::Rebound,
-                                Evidence::Absent => {}
+                                ReceiptStep::Resolved => return AckOutcome::Resolved,
+                                ReceiptStep::Deliver => {
+                                    schedule_missing_hook_diagnostic(
+                                        inner,
+                                        handle,
+                                        &manifest.agent.id,
+                                        clock.hook_deadline,
+                                    );
+                                    return AckOutcome::Screen;
+                                }
+                                ReceiptStep::Expire => return AckOutcome::Timeout,
+                                ReceiptStep::Rebound => return AckOutcome::Rebound,
+                                ReceiptStep::Freeze => clock.freeze(Instant::now()),
+                                ReceiptStep::Wait => {}
                             }
                         }
                     } else if live.is_none() {
@@ -4811,37 +7269,38 @@ async fn await_ack(
                 }
             }
             pe = recv_pane(&mut pane_rx) => {
-                match pe {
-                    Ok(PaneEvent::OutputActivity { pane_id: p, .. }) if p == handle.pane_id => {
-                        // Output is a CUE to look, not evidence in itself.
-                        // %output carries a pane id and bytes, never the
-                        // pid that wrote them, and the watcher table can
-                        // still hold the previous occupant when a
-                        // replacement speaks first. Attributing those
-                        // bytes to this delivery would be a guess, so the
-                        // look below is what decides, and it checks the
-                        // binding on both sides of its capture.
-                        // A frozen clock with a live pane stream is doubt
-                        // from a failed capture; the pane speaking again
-                        // is the cue to look and, if observable, resume.
-                        if clock.frozen() {
-                            match screen_evidence(
-                                inner, handle, manifest, &patterns, staged_window,
-                                id_staged, working_seen, output_seen,
-                            ).await {
-                                Evidence::Confirmed => return AckOutcome::Screen,
-                                Evidence::Absent => clock.unfreeze(Instant::now()),
-                                Evidence::Rebound => return AckOutcome::Rebound,
-                                Evidence::Unobservable => {}
+                match receipt_pane_step(&pe, &handle.pane_id, clock.frozen()) {
+                    ReceiptPaneStep::Recheck => {
+                        // Output is only a cue to look. PaneChanged carries a
+                        // new watcher revision. Both resume a frozen clock and
+                        // run the same stable receipt checkpoint immediately.
+                        clock.unfreeze(Instant::now());
+                        match receipt_checkpoint_pass(
+                            inner, handle, manifest, staged_window, id_staged, target,
+                            working_seen, output_seen, &clock,
+                        ).await {
+                            ReceiptStep::Resolved => return AckOutcome::Resolved,
+                            ReceiptStep::Deliver => {
+                                schedule_missing_hook_diagnostic(
+                                    inner,
+                                    handle,
+                                    &manifest.agent.id,
+                                    clock.hook_deadline,
+                                );
+                                return AckOutcome::Screen;
                             }
+                            ReceiptStep::Expire => return AckOutcome::Timeout,
+                            ReceiptStep::Rebound => return AckOutcome::Rebound,
+                            ReceiptStep::Freeze => clock.freeze(Instant::now()),
+                            ReceiptStep::Wait => {}
                         }
                     }
-                    Ok(PaneEvent::Disconnected)
-                    | Err(broadcast::error::RecvError::Closed) => {
+                    ReceiptPaneStep::Rebound => return AckOutcome::Rebound,
+                    ReceiptPaneStep::Freeze => {
                         pane_rx = None;
                         clock.freeze(Instant::now());
                     }
-                    _ => {}
+                    ReceiptPaneStep::Ignore => {}
                 }
             }
         }
@@ -4857,7 +7316,20 @@ fn track_state_event(
     if e.event != "state" || e.data["pane_id"] != handle.pane_id.as_str() {
         return false;
     }
+    if e.data["session_idx"].as_u64() != Some(handle.session_idx as u64) {
+        return false;
+    }
     if e.data["state"] != "working" {
+        return false;
+    }
+    if e.data["working_confirmed"] != true {
+        return false;
+    }
+    let submitted_at_ms = handle.submitted_at_ms.load(Ordering::SeqCst);
+    if e.data["observed_at_ms"]
+        .as_u64()
+        .is_none_or(|observed_at_ms| observed_at_ms < submitted_at_ms)
+    {
         return false;
     }
     // The event carries the binding that produced it, so this asks whether
@@ -4879,7 +7351,7 @@ fn track_state_event(
     handle.submitted_binding_is(agent, manifest)
 }
 
-/// True when the event is a session lifecycle line — attach, detach, or
+/// True when the event is a session lifecycle line: attach, detach, or
 /// this daemon's own rename bookkeeping riding the same "session" name
 /// (`session_lifecycle`, lib.rs). Which one, and whether it is about THIS
 /// caller's session at all, is deliberately not decided here: see the doc
@@ -4890,7 +7362,7 @@ fn is_session_event(ev: &Result<Event, broadcast::error::RecvError>) -> bool {
     matches!(ev, Ok(e) if e.event == "session")
 }
 
-/// Screen evidence for tier 2, spec conjunctive form (v1.1 amendment 1):
+/// Screen evidence for tier 2 uses the protocol's conjunctive form:
 /// the marker left the composer AND turn evidence appeared.
 ///
 /// "Left the composer" is manifest-driven: the marker still sits in the
@@ -4906,29 +7378,46 @@ fn is_session_event(ev: &Result<Event, broadcast::error::RecvError>) -> bool {
 /// (%output events can be swallowed by the watcher's per-pane rate limit
 /// for single short bursts, MEASURED: a cat pane's echoed submit stays
 /// under the 100ms floor, which is why the changed window matters.)
+fn staging_target_still_present(
+    manifest: &Manifest,
+    screen: &str,
+    target: StagingTarget<'_>,
+) -> bool {
+    // This is a post-submit presence check, not ownership proof. A collapsed
+    // chip may show that the staged representation remains, but it never
+    // authorizes a terminal key.
+    match target {
+        StagingTarget::Sentinel(msg_id) => {
+            sentinel_verified(manifest, screen, msg_id) || marker_in_composer(manifest, screen)
+        }
+        StagingTarget::ExactRow(expected_row) => {
+            staged_representation(manifest, screen, StagingTarget::ExactRow(expected_row)).is_some()
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn screen_evidence(
     inner: &Arc<Inner>,
     handle: &Arc<DeliveryHandle>,
     manifest: &Manifest,
-    patterns: &[String],
     staged_window: &str,
     id_staged: bool,
+    target: StagingTarget<'_>,
     working_seen: bool,
     output_seen: bool,
 ) -> Evidence {
     let Some(watcher) = inner.watcher_of(handle.session_idx) else {
         return Evidence::Unobservable;
     };
-    // Same capture flavor the staging verify used, so the marker check can
-    // pin the composer line through esc-only discriminators and the window
+    // Use the staging capture flavor so esc-only composer discriminators
+    // still apply and the de-escaped window comparison stays like-for-like.
     // The binding is checked on both sides of the read: a capture is not
     // instantaneous, and evidence about a pane whose occupant changed
     // while it was being read is evidence about nobody.
     if !submitted_binding_holds(inner, &watcher, handle) {
         return Evidence::Rebound;
     }
-    // comparison is against like text (staged_window is de-escaped).
     let capture = if manifest.has_escaped_rules() {
         watcher.client().capture_pane_escaped(&handle.pane_id).await
     } else {
@@ -4948,10 +7437,16 @@ async fn screen_evidence(
     // So this asks the same two questions staging asked, which are both
     // composer-pinned: is our sentinel still the staged row, or is the
     // vendor's chip still on the composer line.
-    let _ = patterns;
-    let marker_present = sentinel_verified(manifest, &screen, &handle.msg_id)
-        || marker_in_composer(manifest, &screen);
-    if !marker_present && tier2_evidence(changed, id_staged, working_seen, output_seen) {
+    let marker_present = staging_target_still_present(manifest, &screen, target);
+    if !marker_present
+        && tier2_evidence(
+            manifest.hooks.ack_evidence,
+            changed,
+            id_staged,
+            working_seen,
+            output_seen,
+        )
+    {
         Evidence::Confirmed
     } else {
         Evidence::Absent
@@ -4960,46 +7455,69 @@ async fn screen_evidence(
 
 /// The tier-2 turn-evidence rule, factored for the unit test: a changed
 /// window alone is only evidence when the id demonstrably staged.
-fn tier2_evidence(changed: bool, id_staged: bool, working_seen: bool, output_seen: bool) -> bool {
+fn tier2_evidence(
+    ack_evidence: AckEvidence,
+    changed: bool,
+    id_staged: bool,
+    working_seen: bool,
+    output_seen: bool,
+) -> bool {
     let _ = output_seen;
-    working_seen || (changed && id_staged)
+    match ack_evidence {
+        AckEvidence::Receipt => working_seen || (changed && id_staged),
+        // A dispatch hook can precede a sibling hook that rejects the prompt.
+        // Only the exact candidate's later visual acceptance resolves it.
+        AckEvidence::Dispatch => false,
+    }
 }
 
-/// Did the vendor collapse this paste into its chip, on the composer row?
-///
-/// The chip is the alternate representation: it hides the message id and
-/// the sentinel alike, so nothing else on screen can prove the staging.
-/// Proving the chip therefore means matching the row the vendor actually
-/// draws, in both plain and escaped form, on a row a composer rule pins.
-///
-/// It used to be a substring test against the generic `verify_pattern`
-/// entries, which is why this is written the long way now: a message
-/// whose own subject contained the word "Pasted" satisfied it, and a
-/// truncated payload whose sentinel never arrived submitted itself.
-/// What the submit key is bound to: the staged representation exactly as
-/// the proof that validated it saw, and nothing else.
-///
-/// The boundary is taken from that proof rather than from pattern
-/// matching. Dropping rows because they look like chrome would hand the
-/// collision adversary a way in: a payload row reading like a status row
-/// would vanish from the comparison, and a human edit to it with it.
-///
-/// Chrome is excluded because chrome animates. Claude counts context
-/// down, codex counts a turn up, and binding rows that change on their
-/// own would refuse every delivery slower than a tick.
-pub(crate) fn payload_proof_target(
+/// Prove that the active composer contains the exact bytes selected for this
+/// attempt. Visible payloads are reconstructed from joined logical rows and
+/// compared byte for byte. A collapsed chip proves only that the vendor drew a
+/// chip. Its hidden bytes cannot prove ownership and can never authorize a
+/// submit key.
+fn exact_staging_proof(
     manifest: &Manifest,
     screen: &str,
     target: StagingTarget<'_>,
-) -> Option<String> {
-    match target {
-        StagingTarget::Sentinel(msg_id) => {
-            sentinel_proof(manifest, screen, msg_id).or_else(|| chip_proof(manifest, screen))
-        }
-        StagingTarget::ExactRow(expected_row) => {
-            exact_row_proof(manifest, screen, expected_row).or_else(|| chip_proof(manifest, screen))
-        }
+    expected_payload: &str,
+) -> Option<(bool, String)> {
+    if staged_representation(manifest, screen, target) != Some(StagedRepresentation::VisibleTarget)
+    {
+        return None;
     }
+    let content = match target {
+        StagingTarget::Sentinel(msg_id) => {
+            composer_content_from_joined_capture(manifest, screen, msg_id)
+        }
+        StagingTarget::ExactRow(_) => exact_composer_content_from_joined_capture(manifest, screen),
+    };
+    match content {
+        ComposerContentProof::Visible(content) if content == expected_payload => {
+            Some((true, content))
+        }
+        ComposerContentProof::Visible(_)
+        | ComposerContentProof::Hidden
+        | ComposerContentProof::Unsupported
+        | ComposerContentProof::Unprovable => None,
+    }
+}
+
+/// Re-prove the same exact normalized composer bytes selected earlier.
+///
+/// This comparison is used on both sides of the durable `Submitting`
+/// reservation. A second valid-looking payload is still a mismatch.
+fn exact_staging_snapshot_matches(
+    manifest: &Manifest,
+    screen: &str,
+    target: StagingTarget<'_>,
+    expected_payload: &str,
+    id_staged: bool,
+    payload_at_proof: &str,
+) -> bool {
+    let current = exact_staging_proof(manifest, screen, target, expected_payload);
+    current.as_ref().map(|(_, proof)| proof.as_str()) == Some(payload_at_proof)
+        && current.map(|(matched, _)| matched) == Some(id_staged)
 }
 
 /// Extract exact visible composer rows from a joined escaped capture.
@@ -5015,7 +7533,7 @@ pub(crate) fn composer_content_from_joined_capture(
     screen: &str,
     msg_id: &str,
 ) -> ComposerContentProof {
-    if chip_proof(manifest, screen).is_some() {
+    if collapsed_chip_row(manifest, screen).is_some() {
         return ComposerContentProof::Hidden;
     }
     let (Some(prompt), Some(continuation)) = (
@@ -5035,29 +7553,28 @@ pub(crate) fn composer_content_from_joined_capture(
             (captured_content(continuation, plain) == Some(want_sentinel.as_str()))
                 .then_some(start + offset)
         })
+        .filter(|at| trailer_follows(manifest, &rows[*at + 1..]))
         .collect();
     let &[sentinel_at] = sentinel_hits.as_slice() else {
         return ComposerContentProof::Unprovable;
     };
-    if !trailer_follows(manifest, &rows[sentinel_at + 1..]) {
-        return ComposerContentProof::Unprovable;
-    }
 
     let want_header = format!("[cyclops {msg_id}] FROM:");
-    let headers: Vec<(usize, &str)> = rows[..=sentinel_at]
+    let header = rows[..=sentinel_at]
         .iter()
         .enumerate()
+        .rev()
         .filter_map(|(at, (_, plain))| {
             captured_content(prompt, plain)
                 .filter(|content| content.starts_with(&want_header))
                 .map(|content| (at, content))
         })
-        .collect();
-    let [(prompt_at, first)] = headers.as_slice() else {
+        .next();
+    let Some((prompt_at, first)) = header else {
         return ComposerContentProof::Unprovable;
     };
 
-    let mut content = vec![(*first).to_string()];
+    let mut content = vec![first.to_string()];
     let mut sentinel_count = 0;
     for (_, plain) in &rows[prompt_at + 1..=sentinel_at] {
         if captured_content(prompt, plain).is_some() {
@@ -5090,7 +7607,35 @@ pub(crate) fn exact_composer_content_from_joined_capture(
     manifest: &Manifest,
     screen: &str,
 ) -> ComposerContentProof {
-    if chip_proof(manifest, screen).is_some() {
+    exact_composer_content_for_state(manifest, screen, AgentState::IdleWithInput, None)
+}
+
+/// Extract exact occupied input or a visibly empty clean composer.
+///
+/// Projection and recovery need both outcomes. Ghost suggestions and
+/// ambiguous input remain unprovable, and collapsed paste chips remain hidden.
+pub(crate) fn composer_content_for_projection_from_joined_capture(
+    manifest: &Manifest,
+    screen: &str,
+) -> ComposerContentProof {
+    match exact_composer_content_from_joined_capture(manifest, screen) {
+        ComposerContentProof::Unprovable => exact_composer_content_for_state(
+            manifest,
+            screen,
+            AgentState::Idle,
+            Some(ComposerSemantic::Clean),
+        ),
+        proof => proof,
+    }
+}
+
+fn exact_composer_content_for_state(
+    manifest: &Manifest,
+    screen: &str,
+    state: AgentState,
+    required_semantic: Option<ComposerSemantic>,
+) -> ComposerContentProof {
+    if collapsed_chip_row(manifest, screen).is_some() {
         return ComposerContentProof::Hidden;
     }
     let (Some(prompt), Some(continuation)) = (
@@ -5099,37 +7644,49 @@ pub(crate) fn exact_composer_content_from_joined_capture(
     ) else {
         return ComposerContentProof::Unsupported;
     };
-    let idle_rules: Vec<_> = manifest
+    let composer_rules: Vec<_> = manifest
         .rules
         .iter()
-        .filter(|rule| rule.state == AgentState::IdleWithInput)
+        .filter(|rule| {
+            rule.state == state
+                && required_semantic.is_none_or(|semantic| rule.composer_semantic == Some(semantic))
+        })
         .collect();
-    if idle_rules.is_empty() {
+    if composer_rules.is_empty() {
         return ComposerContentProof::Unprovable;
     }
 
     let rows = joined_composer_rows(screen);
+    let structural_unstyled = manifest.injection.unstyled_composer_proof
+        == Some(UnstyledComposerProof::StructuralTrailer)
+        && !screen.contains('\u{1b}');
     let start = rows.len().saturating_sub(VERIFY_REGION);
     let window = &rows[start..];
-    let prompts: Vec<(usize, &str)> = window
+    let trailers: Vec<usize> = (0..window.len())
+        .filter(|at| trailer_follows(manifest, &window[*at..]))
+        .collect();
+    let [trailer_at] = trailers.as_slice() else {
+        return ComposerContentProof::Unprovable;
+    };
+
+    let prompts: Vec<(usize, &str)> = window[..*trailer_at]
         .iter()
         .enumerate()
         .filter_map(|(at, (raw, plain))| {
             let content = captured_content(prompt, plain)?;
-            idle_rules
+            (composer_rules
                 .iter()
                 .any(|rule| rule.matches_row(plain, raw))
+                || (state == AgentState::IdleWithInput && structural_unstyled && raw == plain))
                 .then_some((at, content))
+        })
+        .filter(|(prompt_at, _)| {
+            window[prompt_at + 1..*trailer_at]
+                .iter()
+                .all(|(_, plain)| captured_content(continuation, plain).is_some())
         })
         .collect();
     let [(prompt_at, first)] = prompts.as_slice() else {
-        return ComposerContentProof::Unprovable;
-    };
-
-    let trailers: Vec<usize> = (prompt_at + 1..window.len())
-        .filter(|at| trailer_follows(manifest, &window[*at..]))
-        .collect();
-    let [trailer_at] = trailers.as_slice() else {
         return ComposerContentProof::Unprovable;
     };
 
@@ -5142,6 +7699,16 @@ pub(crate) fn exact_composer_content_from_joined_capture(
             return ComposerContentProof::Unprovable;
         };
         content.push(line.to_string());
+    }
+    // tmux 3.6a retains right-padding cells in a joined capture. Normalize
+    // them only after a manifest rule has classified one prompt row as clean.
+    // Occupied composer rows keep every byte for exact ownership checks.
+    if state == AgentState::Idle
+        && required_semantic == Some(ComposerSemantic::Clean)
+        && content.len() == 1
+        && content[0].bytes().all(|byte| byte == b' ')
+    {
+        content[0].clear();
     }
     ComposerContentProof::Visible(content.join("\n"))
 }
@@ -5169,16 +7736,15 @@ fn whole_row(re: &cyclops_manifest::Regex, row: &str) -> bool {
 }
 
 fn marker_in_composer(manifest: &Manifest, screen: &str) -> bool {
-    chip_proof(manifest, screen).is_some()
+    collapsed_chip_row(manifest, screen).is_some()
 }
 
-/// The proven chip row, when the collapsed representation validates.
+/// The recognized chip row when the collapsed representation matches.
 ///
-/// Equality against this row is equality of the SCREEN representation and
-/// nothing more: the payload behind a chip is not on screen, so it cannot
-/// be compared. That is the same limit the directive accepts by keeping
-/// the chip as an alternate at all.
-fn chip_proof(manifest: &Manifest, screen: &str) -> Option<String> {
+/// Equality against this row is equality of the screen representation only.
+/// The payload behind a chip is not on screen, so it cannot prove exact
+/// notification ownership and cannot authorize Enter.
+fn collapsed_chip_row(manifest: &Manifest, screen: &str) -> Option<String> {
     if manifest.composer_chips.is_empty()
         || manifest.composer_chips.len() != manifest.composer_chips_esc.len()
     {
@@ -5322,9 +7888,10 @@ pub(crate) fn resolve_hook_ack(
     let state = {
         let mut st = handle.state.lock().expect("handle state lock");
         if st.state == DeliveryState::Staged && st.early_ack.is_none() {
-            st.early_ack = Some(EarlyAck {
+            st.early_ack = Some(PendingAck {
                 edge_ms,
                 turn: turn.clone(),
+                evidence: PendingAckEvidence::Receipt,
             });
         }
         st.state
@@ -5372,6 +7939,394 @@ pub(crate) fn resolve_hook_ack(
     };
     handle.ack.notify_waiters();
     moved
+}
+
+/// Record an exact hook dispatch that still needs visual acceptance.
+///
+/// This does not resolve the delivery. Vendors can invoke several prompt
+/// hooks concurrently, and one sibling can reject the prompt after this hook
+/// has already reported it. The matching turn remains pending until fusion
+/// confirms a later Working observation for the same process and manifest.
+pub(crate) fn record_dispatch_candidate(
+    handle: &Arc<DeliveryHandle>,
+    reporter: crate::identity::ProcId,
+    reporter_manifest: &str,
+    edge_ms: u64,
+    turn: Option<crate::turnkey::TurnKey>,
+) -> bool {
+    if !handle.submitted_binding_is(reporter, reporter_manifest) {
+        return false;
+    }
+    let recorded = {
+        let mut st = handle.state.lock().expect("handle state lock");
+        if !matches!(
+            st.state,
+            DeliveryState::Staged | DeliveryState::Submitted | DeliveryState::DeliveredUnverified
+        ) {
+            return false;
+        }
+        match &st.early_ack {
+            Some(existing)
+                if existing.edge_ms != edge_ms
+                    || existing.turn.as_ref() != turn.as_ref()
+                    || existing.evidence != PendingAckEvidence::DispatchPending =>
+            {
+                false
+            }
+            Some(_) => true,
+            None => {
+                st.early_ack = Some(PendingAck {
+                    edge_ms,
+                    turn,
+                    evidence: PendingAckEvidence::DispatchPending,
+                });
+                true
+            }
+        }
+    };
+    if recorded {
+        handle.ack.notify_waiters();
+    }
+    recorded
+}
+
+/// Mark every exact payload match as ambiguous without turning any of them
+/// into receipt evidence. This is the duplicate-bytes case: a pane hook cannot
+/// identify which attempt it belongs to, so all candidates remain recoverable.
+pub(crate) fn mark_dispatch_match_ambiguous(
+    handle: &Arc<DeliveryHandle>,
+    reporter: crate::identity::ProcId,
+    reporter_manifest: &str,
+    cause: &str,
+) -> bool {
+    if !handle.submitted_binding_is(reporter, reporter_manifest) {
+        return false;
+    }
+    let marked = {
+        let mut state = handle.state.lock().expect("handle state lock");
+        if !matches!(
+            state.state,
+            DeliveryState::Staged | DeliveryState::Submitted | DeliveryState::DeliveredUnverified
+        ) {
+            return false;
+        }
+        state.cause = Some(cause.to_string());
+        true
+    };
+    if marked {
+        handle.ack.notify_waiters();
+    }
+    marked
+}
+
+enum UnkeyedDispatchSelection {
+    None,
+    Unique(Arc<DeliveryHandle>, String),
+    Ambiguous(Vec<Arc<DeliveryHandle>>),
+}
+
+fn select_unkeyed_dispatch_candidate(
+    handles: Vec<Arc<DeliveryHandle>>,
+    reporter: crate::identity::ProcId,
+    reporter_manifest: &str,
+    dispatch_edge_ms: u64,
+) -> UnkeyedDispatchSelection {
+    let mut matching = handles
+        .into_iter()
+        .filter_map(|handle| {
+            if !handle.submitted_binding_is(reporter, reporter_manifest) {
+                return None;
+            }
+            let state = handle.state.lock().expect("handle state lock");
+            let owner = state
+                .early_ack
+                .as_ref()
+                .filter(|pending| {
+                    pending.turn.is_none()
+                        && pending.evidence == PendingAckEvidence::DispatchPending
+                        && pending.edge_ms == dispatch_edge_ms
+                })
+                .and_then(|_| state.barrier.clone())?;
+            drop(state);
+            Some((handle, owner))
+        })
+        .collect::<Vec<_>>();
+    match matching.len() {
+        0 => UnkeyedDispatchSelection::None,
+        1 => {
+            let (handle, owner) = matching.pop().expect("one dispatch candidate");
+            UnkeyedDispatchSelection::Unique(handle, owner)
+        }
+        _ => UnkeyedDispatchSelection::Ambiguous(
+            matching.into_iter().map(|(handle, _)| handle).collect(),
+        ),
+    }
+}
+
+/// Accept an unkeyed prompt dispatch after the exact pane shows a later
+/// lifecycle-capable Working frame.
+///
+/// The prompt hook alone is provisional because another vendor hook may still
+/// reject the prompt. The barrier owner makes the later visual observation
+/// recipient- and attempt-specific even though the vendor exposes no turn id.
+pub(crate) fn confirm_unkeyed_dispatch_ack(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    pane_id: &str,
+    reporter: crate::identity::ProcId,
+    reporter_manifest: &str,
+    dispatch_edge_ms: u64,
+    accepted_ms: u64,
+) -> bool {
+    if dispatch_edge_ms >= accepted_ms {
+        return false;
+    }
+    let (handle, owner) = match select_unkeyed_dispatch_candidate(
+        ack_candidates(inner, session_idx, pane_id),
+        reporter,
+        reporter_manifest,
+        dispatch_edge_ms,
+    ) {
+        UnkeyedDispatchSelection::Unique(handle, owner) => (handle, owner),
+        UnkeyedDispatchSelection::Ambiguous(handles) => {
+            for handle in handles {
+                mark_dispatch_match_ambiguous(
+                    &handle,
+                    reporter,
+                    reporter_manifest,
+                    "hook_dispatch_ambiguous",
+                );
+            }
+            return false;
+        }
+        UnkeyedDispatchSelection::None => return false,
+    };
+    if !fusion::set_hold_owned(inner, session_idx, pane_id, &owner, Some) {
+        return false;
+    }
+    let state = {
+        let mut st = handle.state.lock().expect("handle state lock");
+        let Some(current) = st.early_ack.as_mut() else {
+            return false;
+        };
+        if current.turn.is_some()
+            || current.evidence != PendingAckEvidence::DispatchPending
+            || current.edge_ms != dispatch_edge_ms
+        {
+            return false;
+        }
+        current.evidence = PendingAckEvidence::DispatchAccepted;
+        current.edge_ms = accepted_ms;
+        st.state
+    };
+    handle.ack.notify_waiters();
+    match state {
+        DeliveryState::Staged => {}
+        DeliveryState::Submitted => {
+            let recorded = match record_notification_notified(inner, &handle) {
+                Ok(recorded) => recorded,
+                Err(error) => {
+                    error!(id = %handle.msg_id, error = %error, "notification receipt fact failed");
+                    return false;
+                }
+            };
+            if recorded {
+                let _ = advance(
+                    inner,
+                    &handle,
+                    &[DeliveryState::Submitted],
+                    Step::to(DeliveryState::DeliveredVerified)
+                        .cause("hook_dispatch_accepted_start")
+                        .verified(VerifiedBy::Hook)
+                        .turn_edge(accepted_ms),
+                );
+            }
+        }
+        DeliveryState::DeliveredUnverified => {
+            let _ = advance(
+                inner,
+                &handle,
+                &[DeliveryState::DeliveredUnverified],
+                Step::to(DeliveryState::DeliveredVerified)
+                    .cause("hook_dispatch_accepted_start")
+                    .verified(VerifiedBy::Hook)
+                    .turn_edge(accepted_ms),
+            );
+        }
+        _ => {}
+    }
+    true
+}
+
+/// Retire receipt evidence for one exact unkeyed hook edge. The pane runtime
+/// candidate is managed separately in fusion and may still report Working for
+/// a later human prompt.
+pub(crate) fn reject_unkeyed_dispatch_ack(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    pane_id: &str,
+    reporter: crate::identity::ProcId,
+    reporter_manifest: &str,
+    dispatch_edge_ms: u64,
+    cause: &str,
+) -> usize {
+    let mut rejected = 0;
+    for handle in ack_candidates(inner, session_idx, pane_id) {
+        if !handle.submitted_binding_is(reporter, reporter_manifest) {
+            continue;
+        }
+        let removed = {
+            let mut state = handle.state.lock().expect("handle state lock");
+            let matches = state.early_ack.as_ref().is_some_and(|pending| {
+                pending.turn.is_none()
+                    && pending.evidence == PendingAckEvidence::DispatchPending
+                    && pending.edge_ms == dispatch_edge_ms
+            });
+            if matches {
+                state.early_ack = None;
+                state.cause = Some(cause.to_string());
+            }
+            matches
+        };
+        if removed {
+            rejected += 1;
+            handle.ack.notify_waiters();
+        }
+    }
+    rejected
+}
+
+/// Bind an exact dispatch to its composer barrier without publishing receipt.
+///
+/// Lifecycle reconciliation uses this before it updates public state. The
+/// exact end can then settle the barrier in that same observation, while the
+/// delivery remains unresolved until the fused state is cached and emitted.
+pub(crate) fn prepare_dispatch_ack(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    pane_id: &str,
+    reporter: crate::identity::ProcId,
+    reporter_manifest: &str,
+    turn: &crate::turnkey::TurnKey,
+) -> DispatchPreparation {
+    let mut result = DispatchPreparation::default();
+    for handle in ack_candidates(inner, session_idx, pane_id) {
+        if !handle.submitted_binding_is(reporter, reporter_manifest) {
+            continue;
+        }
+        let pending = {
+            let st = handle.state.lock().expect("handle state lock");
+            st.early_ack
+                .as_ref()
+                .filter(|pending| {
+                    pending.turn.as_ref() == Some(turn)
+                        && pending.evidence == PendingAckEvidence::DispatchPending
+                })
+                .and_then(|pending| st.barrier.clone().map(|owner| (owner, pending.edge_ms)))
+        };
+        let Some((owner, start_ms)) = pending else {
+            continue;
+        };
+        if let Some(bound) =
+            fusion::bind_turn(inner, session_idx, pane_id, &owner, turn.clone(), start_ms)
+        {
+            result.prepared = true;
+            result.end_already_present |= bound.end_already_present;
+        }
+    }
+    result
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DispatchPreparation {
+    pub(crate) prepared: bool,
+    pub(crate) end_already_present: bool,
+}
+
+/// Accept pending dispatches after the exact turn has independent evidence.
+///
+/// The usual evidence is a later visual Working observation, cached before
+/// this call. A matching terminal hook also proves that a short turn existed
+/// even when the watcher missed its Working frame. The composer barrier keeps
+/// either path safe while the terminal outcome is reconciled.
+pub(crate) fn confirm_dispatch_ack(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    pane_id: &str,
+    reporter: crate::identity::ProcId,
+    reporter_manifest: &str,
+    turn: &crate::turnkey::TurnKey,
+    accepted_ms: u64,
+) {
+    for handle in ack_candidates(inner, session_idx, pane_id) {
+        if !handle.submitted_binding_is(reporter, reporter_manifest) {
+            continue;
+        }
+        let state = {
+            let mut st = handle.state.lock().expect("handle state lock");
+            let Some(pending) = st.early_ack.as_mut() else {
+                continue;
+            };
+            if pending.turn.as_ref() != Some(turn)
+                || pending.evidence != PendingAckEvidence::DispatchPending
+            {
+                continue;
+            }
+            pending.evidence = PendingAckEvidence::DispatchAccepted;
+            pending.edge_ms = accepted_ms;
+            st.state
+        };
+        handle.ack.notify_waiters();
+        match state {
+            DeliveryState::Staged => {}
+            DeliveryState::Submitted => {
+                let recorded = match record_notification_notified(inner, &handle) {
+                    Ok(recorded) => recorded,
+                    Err(error) => {
+                        error!(id = %handle.msg_id, error = %error, "notification receipt fact failed");
+                        continue;
+                    }
+                };
+                if recorded {
+                    let moved = advance(
+                        inner,
+                        &handle,
+                        &[DeliveryState::Submitted],
+                        Step::to(DeliveryState::DeliveredVerified)
+                            .cause("hook_dispatch_accepted_start")
+                            .verified(VerifiedBy::Hook)
+                            .turn_edge(accepted_ms)
+                            .turn(Some(turn.clone())),
+                    );
+                    if !moved && handle.state() == DeliveryState::DeliveredUnverified {
+                        let _ = advance(
+                            inner,
+                            &handle,
+                            &[DeliveryState::DeliveredUnverified],
+                            Step::to(DeliveryState::DeliveredVerified)
+                                .cause("hook_dispatch_accepted_start")
+                                .verified(VerifiedBy::Hook)
+                                .turn_edge(accepted_ms)
+                                .turn(Some(turn.clone())),
+                        );
+                    }
+                }
+            }
+            DeliveryState::DeliveredUnverified => {
+                let _ = advance(
+                    inner,
+                    &handle,
+                    &[DeliveryState::DeliveredUnverified],
+                    Step::to(DeliveryState::DeliveredVerified)
+                        .cause("hook_dispatch_accepted_start")
+                        .verified(VerifiedBy::Hook)
+                        .turn_edge(accepted_ms)
+                        .turn(Some(turn.clone())),
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5442,11 +8397,9 @@ fn occupant_gone(inner: &Arc<Inner>, session_idx: usize, pane_id: &str, pinned_p
 /// caller as `pinned` when the wait answers for an earlier moment (the
 /// send-and-wait path pins the occupant its delivery was SUBMITTED to).
 /// The pane vanishing, dying, or changing root pid resolves
-/// OccupantChanged, never a false success. pane_pid changes are silent in
-/// the watcher (no PaneField), so the pin is re-read on every wake for
-/// this pane, including output activity: a swapped occupant that neither
-/// prints nor changes any pane field stays undetected until it does, the
-/// same residual window the delivery pipeline accepts.
+/// OccupantChanged, never a false success. The watcher emits a PanePid edge
+/// for a root replacement, and every other pane wake still rechecks the pin
+/// as a fail-closed defense against a delayed or lagged event.
 pub(crate) async fn wait_pinned(
     inner: &Arc<Inner>,
     session_idx: usize,
@@ -5508,7 +8461,7 @@ pub(crate) async fn wait_pinned(
     // wakes that are rare (a pane edge, a reattach, a lagged stream, the
     // moment before success) and not on output, which arrives
     // continuously while an agent streams a turn. Output keeps the cheap
-    // root check it always had, which is there for a silent respawn.
+    // root check it always had, which also covers a delayed respawn edge.
     //
     // The pane row's command text is a WAKE, never the answer. It is not
     // an identity: the row can be a queued snapshot older than the pin,
@@ -5519,7 +8472,9 @@ pub(crate) async fn wait_pinned(
         occupant_gone(inner, session_idx, pane_id, pinned_pid)
             || fusion::foreground_pid_checked(pinned_pid) != Some(pinned_fg)
     };
-    let mut working_seen = working_pre || state == AgentState::Working;
+    let mut working_seen = working_pre
+        || (state == AgentState::Working
+            && fusion::cached_working_confirmed(inner, session_idx, pane_id));
     loop {
         if state == AgentState::Dead {
             return end(WaitOutcome::OccupantChanged, state);
@@ -5550,7 +8505,9 @@ pub(crate) async fn wait_pinned(
                 {
                     if let Ok(s) = serde_json::from_value::<AgentState>(e.data["state"].clone()) {
                         state = s;
-                        if state == AgentState::Working {
+                        if state == AgentState::Working
+                            && e.data["working_confirmed"] == true
+                        {
                             working_seen = true;
                         }
                     }
@@ -5560,7 +8517,7 @@ pub(crate) async fn wait_pinned(
                 // never from matching this event's own `data["name"]`
                 // against a name captured at entry: a followed rename
                 // changes the live name mid-wait, and a stale snapshot
-                // then never matches an attach line again — see the doc
+                // then never matches an attach line again. See the doc
                 // comment on `await_ack`'s (this function's sibling wait)
                 // event arm for the full failure this avoids.
                 Ok(e) if e.event == "session" => match inner.watcher_of(session_idx) {
@@ -5584,7 +8541,9 @@ pub(crate) async fn wait_pinned(
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     // Reconcile on doubt: re-read the cache and the pin.
                     state = inner.cached_state(session_idx, pane_id);
-                    if state == AgentState::Working {
+                    if state == AgentState::Working
+                        && fusion::cached_working_confirmed(inner, session_idx, pane_id)
+                    {
                         working_seen = true;
                     }
                     if gone(inner) {
@@ -5605,8 +8564,8 @@ pub(crate) async fn wait_pinned(
                     }
                 }
                 Ok(PaneEvent::OutputActivity { pane_id: p, .. }) if p == pane_id => {
-                    // Output is the one signal a silent pid swap gives off
-                    // (respawn-pane updates the row without a PaneChanged).
+                    // Output is not identity, but it is another opportunity
+                    // to reject a root replacement before reporting success.
                     if occupant_gone(inner, session_idx, pane_id, pinned_pid) {
                         return end(WaitOutcome::OccupantChanged, state);
                     }
@@ -5699,6 +8658,7 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
     use std::str::FromStr;
+    use std::sync::Barrier;
 
     use cyclops_proto::{
         MessageId, MessagePresentation, NotificationAttemptId, NotificationState, RecipientKey,
@@ -5781,6 +8741,51 @@ mod tests {
         (NotificationScratch(path), store, context, handle, recipient)
     }
 
+    #[test]
+    fn expected_notification_payload_is_the_single_transport_renderer() {
+        let (_scratch, _store, context, _handle, _recipient) =
+            notification_fixture("expected-payload");
+        let message = context.message_line().expect("message");
+        let mut record = context.current_record().expect("notification");
+
+        assert_eq!(
+            expected_notification_payload(&record, &message),
+            Some(cyclops_proto::render_legacy_doorbell(&record.message_id))
+        );
+
+        record.doorbell_format = Some(cyclops_proto::DOORBELL_FORMAT_COMPACT_CLAIM);
+        assert_eq!(
+            expected_notification_payload(&record, &message),
+            Some(cyclops_proto::render_doorbell_v1(&record.message_id))
+        );
+
+        record.doorbell_format = Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_CLAIM);
+        assert_eq!(
+            expected_notification_payload(&record, &message),
+            Some(cyclops_proto::render_doorbell_v2(
+                &record.message_id,
+                record.attempt_id
+            ))
+        );
+
+        record.transport = NotificationTransport::DirectPayload;
+        assert_eq!(expected_notification_payload(&record, &message), None);
+
+        record.doorbell_format = None;
+        assert_eq!(
+            expected_notification_payload(&record, &message),
+            Some(render_canonical_message_payload(&message))
+        );
+
+        record.transport = NotificationTransport::Doorbell;
+        record.doorbell_format = Some(u32::MAX);
+        assert_eq!(expected_notification_payload(&record, &message), None);
+
+        record.doorbell_format = None;
+        record.message_id = MessageId::new("m-different").expect("message id");
+        assert_eq!(expected_notification_payload(&record, &message), None);
+    }
+
     fn notification_state(
         store: &Arc<StdMutex<MessageStore>>,
         recipient: RecipientKey,
@@ -5793,6 +8798,404 @@ mod tests {
             .notification(recipient, message_id)
             .cloned()
             .unwrap()
+    }
+
+    fn prepare_claimed_staged(
+        store: &Arc<StdMutex<MessageStore>>,
+        context: &NotificationContext,
+        recipient: RecipientKey,
+    ) -> cyclops_proto::NotificationRecord {
+        context.record_gating().unwrap();
+        context
+            .record_writing(
+                ProcessInstanceId::new(3999, 817_999).unwrap(),
+                ProcessInstanceId::new(4000, 818_000).unwrap(),
+                ProcessInstanceId::new(4242, 818_221).unwrap(),
+                "codex",
+                NotificationTransport::Doorbell,
+                Some(cyclops_proto::DOORBELL_FORMAT_COMPACT_CLAIM),
+            )
+            .unwrap();
+        context.record_staged().unwrap();
+        let claimed = store
+            .lock()
+            .unwrap()
+            .claim(recipient, context.message_id().clone())
+            .unwrap();
+        assert!(matches!(
+            claimed,
+            crate::mailbox::ClaimOutcome::Claimed {
+                consumed_doorbell_attempt: Some(attempt),
+                ..
+            } if attempt == context.attempt_id()
+        ));
+        notification_state(store, recipient, context.message_id())
+    }
+
+    fn churn_recipient(workspace: WorkspaceId, ordinal: u128) -> RecipientKey {
+        let session = SessionInstanceId::from_uuid(uuid::Uuid::from_u128(ordinal + 1)).unwrap();
+        RecipientKey::agent(workspace, session, TmuxPaneId::from_str("%1").unwrap())
+    }
+
+    fn test_worker_task() -> JoinHandle<()> {
+        tokio::spawn(async {})
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_worker_supervisor_restarts_without_another_enqueue() {
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recoveries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let restarted = Arc::new(Notify::new());
+        let task = tokio::spawn(supervise_worker_task(
+            {
+                let starts = Arc::clone(&starts);
+                let restarted = Arc::clone(&restarted);
+                move || {
+                    let run = starts.fetch_add(1, Ordering::SeqCst);
+                    let restarted = Arc::clone(&restarted);
+                    tokio::spawn(async move {
+                        if run == 0 {
+                            panic!("simulated outer worker failure");
+                        }
+                        restarted.notify_one();
+                        std::future::pending::<()>().await;
+                    })
+                }
+            },
+            {
+                let recoveries = Arc::clone(&recoveries);
+                move || {
+                    recoveries.fetch_add(1, Ordering::SeqCst);
+                    true
+                }
+            },
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), restarted.notified())
+            .await
+            .expect("supervisor starts a replacement child itself");
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        assert_eq!(recoveries.load(Ordering::SeqCst), 1);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_drain_waits_for_an_aborted_worker_child() {
+        struct DropSignal(Arc<AtomicBool>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let engine = Arc::new(Engine::new());
+        let started = Arc::new(Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let spawn_engine = Arc::clone(&engine);
+        let spawn_started = Arc::clone(&started);
+        let spawn_dropped = Arc::clone(&dropped);
+        let supervisor = tokio::spawn(supervise_worker_task(
+            move || {
+                let started = Arc::clone(&spawn_started);
+                let marker = DropSignal(Arc::clone(&spawn_dropped));
+                spawn_engine.spawn_descendant_task(async move {
+                    let _marker = marker;
+                    started.notify_one();
+                    std::future::pending::<()>().await;
+                })
+            },
+            || false,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("tracked worker child starts");
+        supervisor.abort();
+        let _ = supervisor.await;
+        tokio::time::timeout(Duration::from_secs(1), engine.wait_for_descendant_tasks())
+            .await
+            .expect("shutdown drain observes the child cancellation");
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn stopping_cancels_a_tracked_descendant() {
+        let engine = Engine::new();
+        let started = Arc::new(Notify::new());
+        let task_started = Arc::clone(&started);
+        let task = engine.spawn_descendant_task(async move {
+            task_started.notify_one();
+            std::future::pending::<()>().await;
+        });
+
+        started.notified().await;
+        engine.begin_stopping();
+
+        tokio::time::timeout(Duration::from_secs(1), engine.wait_for_descendant_tasks())
+            .await
+            .expect("shutdown cancels tracked descendants");
+        task.await.expect("tracked task exits without panic");
+    }
+
+    #[tokio::test]
+    async fn shutdown_latch_refuses_worker_creation_before_task_drain() {
+        let engine = Engine::new();
+        let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let recipient = churn_recipient(workspace, 900);
+        let handle = DeliveryHandle::new("m-stopping", "worker", "%1", 0, "body".into());
+        let spawned = Arc::new(AtomicBool::new(false));
+
+        engine.begin_stopping();
+        let result = engine.enqueue_notification_worker(recipient, handle, {
+            let spawned = Arc::clone(&spawned);
+            move |_| {
+                spawned.store(true, Ordering::SeqCst);
+                test_worker_task()
+            }
+        });
+
+        assert!(result.is_none());
+        assert!(!spawned.load(Ordering::SeqCst));
+        assert!(engine.take_notification_worker_tasks().is_empty());
+        assert!(engine.take_legacy_worker_tasks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_worker_ownership_excludes_queued_and_different_attempts() {
+        let engine = Engine::new();
+        let (_scratch, _store, context, handle, recipient) =
+            notification_fixture("status-worker-owner");
+        let attempt = context.attempt_id();
+        let worker = engine
+            .enqueue_notification_worker(recipient, Arc::clone(&handle), |_| test_worker_task())
+            .expect("engine is running");
+
+        assert!(
+            !engine.notification_worker_owns(recipient, attempt),
+            "a queued handle was reported as active work"
+        );
+        let current = worker
+            .current_or_next()
+            .expect("queued handle becomes current");
+        assert!(engine.notification_worker_owns(recipient, attempt));
+        assert!(!engine.notification_worker_owns(recipient, NotificationAttemptId::generate()));
+        worker.set_fault(CLAIMED_STAGED_SETTLEMENT_FAILED);
+        assert!(
+            !engine.notification_worker_owns(recipient, attempt),
+            "a faulted worker cannot advertise automatic reconciliation"
+        );
+        assert!(worker.finish(&current));
+        assert!(!engine.notification_worker_owns(recipient, attempt));
+
+        for task in engine.take_notification_worker_tasks() {
+            task.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn notification_workers_retire_across_recipient_session_churn() {
+        let engine = Engine::new();
+        let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+
+        for ordinal in 0..512 {
+            let recipient = churn_recipient(workspace, ordinal);
+            let handle = DeliveryHandle::new(
+                &format!("m-churn-{ordinal}"),
+                "worker",
+                "%1",
+                0,
+                "payload".into(),
+            );
+            let worker = engine
+                .enqueue_notification_worker(recipient, Arc::clone(&handle), |_| test_worker_task())
+                .expect("engine is running");
+            let queued = worker.drain_pending();
+            assert_eq!(queued.len(), 1);
+            assert!(Arc::ptr_eq(&queued[0], &handle));
+            assert!(engine.retire_notification_worker(recipient, &worker));
+            assert!(
+                engine
+                    .notification_workers
+                    .lock()
+                    .expect("notification workers lock")
+                    .is_empty(),
+                "recipient churn retained an idle worker at iteration {ordinal}"
+            );
+        }
+
+        assert!(engine.take_notification_worker_tasks().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_finished_notification_supervisor_stays_faulted_without_losing_its_fifo() {
+        let engine = Engine::new();
+        let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let recipient = churn_recipient(workspace, 700);
+        let first = DeliveryHandle::new("m-worker-first", "worker", "%1", 0, "first".into());
+        let worker = engine
+            .enqueue_notification_worker(recipient, Arc::clone(&first), |_| {
+                tokio::spawn(async move {
+                    panic!("simulated notification worker failure");
+                })
+            })
+            .expect("engine is running");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let finished = engine
+                    .notification_workers
+                    .lock()
+                    .expect("notification workers lock")
+                    .get(&recipient)
+                    .expect("worker entry")
+                    .task
+                    .is_finished();
+                if finished {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed worker task finishes");
+
+        let second = DeliveryHandle::new("m-worker-second", "worker", "%1", 0, "second".into());
+        let reused = engine
+            .enqueue_notification_worker(recipient, Arc::clone(&second), |_| {
+                panic!("a failed supervisor must not restart on later traffic")
+            })
+            .expect("engine is running");
+        assert!(Arc::ptr_eq(&worker, &reused));
+        assert!(worker.current().is_none());
+        assert!(
+            engine
+                .notification_workers
+                .lock()
+                .expect("notification workers lock")
+                .get(&recipient)
+                .expect("faulted worker entry")
+                .task
+                .is_finished(),
+            "the next enqueue must not hide the finished supervisor"
+        );
+        assert_eq!(
+            worker
+                .state
+                .lock()
+                .expect("worker state lock")
+                .fault
+                .as_deref(),
+            Some("notification worker supervisor exited")
+        );
+        assert_eq!(
+            worker
+                .state
+                .lock()
+                .expect("worker state lock")
+                .queue
+                .iter()
+                .map(|handle| handle.msg_id.as_str())
+                .collect::<Vec<_>>(),
+            ["m-worker-first", "m-worker-second"]
+        );
+
+        let tasks = engine.take_notification_worker_tasks();
+        assert_eq!(tasks.len(), 1);
+        tasks[0].abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn enqueue_and_idle_retirement_never_orphan_a_handle() {
+        let engine = Arc::new(Engine::new());
+        let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let runtime = tokio::runtime::Handle::current();
+
+        for ordinal in 0..256 {
+            let recipient = churn_recipient(workspace, ordinal);
+            let seed = DeliveryHandle::new(
+                &format!("m-seed-{ordinal}"),
+                "worker",
+                "%1",
+                0,
+                "seed".into(),
+            );
+            let old_worker = engine
+                .enqueue_notification_worker(recipient, Arc::clone(&seed), |_| test_worker_task())
+                .expect("engine is running");
+            let queued = old_worker.drain_pending();
+            assert_eq!(queued.len(), 1);
+            assert!(Arc::ptr_eq(&queued[0], &seed));
+
+            let next = DeliveryHandle::new(
+                &format!("m-next-{ordinal}"),
+                "worker",
+                "%1",
+                0,
+                "next".into(),
+            );
+            let start = Arc::new(Barrier::new(3));
+            let producer = tokio::task::spawn_blocking({
+                let engine = Arc::clone(&engine);
+                let start = Arc::clone(&start);
+                let next = Arc::clone(&next);
+                let runtime = runtime.clone();
+                move || {
+                    start.wait();
+                    engine
+                        .enqueue_notification_worker(recipient, next, move |_| {
+                            runtime.spawn(async {})
+                        })
+                        .expect("engine is running")
+                }
+            });
+            let retirement = tokio::task::spawn_blocking({
+                let engine = Arc::clone(&engine);
+                let start = Arc::clone(&start);
+                let old_worker = Arc::clone(&old_worker);
+                move || {
+                    start.wait();
+                    engine.retire_notification_worker(recipient, &old_worker)
+                }
+            });
+            tokio::task::block_in_place(|| start.wait());
+
+            let producer_worker = producer.await.unwrap();
+            let retired = retirement.await.unwrap();
+            let current_worker = {
+                let entries = engine
+                    .notification_workers
+                    .lock()
+                    .expect("notification workers lock");
+                Arc::clone(
+                    &entries
+                        .get(&recipient)
+                        .expect("producer leaves an active worker")
+                        .worker,
+                )
+            };
+            assert!(Arc::ptr_eq(&current_worker, &producer_worker));
+            assert_eq!(
+                current_worker
+                    .state
+                    .lock()
+                    .expect("worker state lock")
+                    .queue
+                    .iter()
+                    .filter(|queued| Arc::ptr_eq(queued, &next))
+                    .count(),
+                1,
+                "concurrent retirement orphaned or duplicated the enqueue"
+            );
+            if retired {
+                assert!(!Arc::ptr_eq(&current_worker, &old_worker));
+            } else {
+                assert!(Arc::ptr_eq(&current_worker, &old_worker));
+            }
+
+            current_worker.drain_pending();
+            assert!(engine.retire_notification_worker(recipient, &current_worker));
+        }
     }
 
     #[test]
@@ -5808,6 +9211,7 @@ mod tests {
         context.record_gating().unwrap();
         context
             .record_writing(
+                ProcessInstanceId::new(3999, 817_999).unwrap(),
                 ProcessInstanceId::new(4000, 818_000).unwrap(),
                 ProcessInstanceId::new(4242, 818_221).unwrap(),
                 "codex",
@@ -5816,6 +9220,7 @@ mod tests {
             )
             .unwrap();
         context.record_staged().unwrap();
+        context.reserve_submit().unwrap();
         context.record_submitted().unwrap();
     }
 
@@ -6052,6 +9457,141 @@ mod tests {
         assert!(!should_retry(&unknown, 1, 1));
     }
 
+    #[test]
+    fn exhausted_prewrite_failures_have_exact_recoverable_causes() {
+        let cases = [
+            (
+                AttemptFailure::session_detached(),
+                NotificationPreWriteCause::SessionUnavailable,
+            ),
+            (
+                AttemptFailure::no_manifest(),
+                NotificationPreWriteCause::ManifestUnavailable,
+            ),
+            (
+                AttemptFailure::payload_unavailable(),
+                NotificationPreWriteCause::PayloadUnavailable,
+            ),
+            (
+                AttemptFailure::pane_rebound_before_paste(),
+                NotificationPreWriteCause::WriteReadinessChanged,
+            ),
+            (
+                AttemptFailure::spool_failed(),
+                NotificationPreWriteCause::SpoolFailed,
+            ),
+        ];
+
+        for (failure, expected) in cases {
+            assert!(!should_retry(&failure, 2, 1));
+            let block = failure
+                .pre_write_block
+                .as_deref()
+                .expect("an exhausted known pre-write failure must become recoverable");
+            assert_eq!(block.cause, expected);
+            assert!(block.observation.is_none());
+        }
+
+        for failure in [
+            AttemptFailure::barrier_held(),
+            AttemptFailure::from_inject("binding_changed".into()),
+            AttemptFailure::from_inject("capability_changed".into()),
+        ] {
+            assert!(failure.regate_cause().is_some());
+            assert!(failure.pre_write_block.is_none());
+        }
+    }
+
+    #[test]
+    fn write_boundary_regates_are_bounded_per_evidence_edge() {
+        let handle = DeliveryHandle::new("m-regate", "worker", "%1", 0, String::new());
+        assert_eq!(
+            regate_action(&handle, RegateCause::BarrierHeld),
+            RegateAction::BlockPreWrite,
+            "a barrier race never gets an automatic retry"
+        );
+        assert_eq!(
+            regate_action(&handle, RegateCause::BindingChanged),
+            RegateAction::ImmediateReproof
+        );
+        assert_eq!(
+            regate_action(&handle, RegateCause::BindingChanged),
+            RegateAction::BlockPreWrite,
+            "unchanged binding evidence cannot spin"
+        );
+        assert_eq!(
+            regate_action(&handle, RegateCause::CapabilityChanged),
+            RegateAction::ImmediateReproof,
+            "each distinct proof receives one bounded check"
+        );
+        assert_eq!(
+            regate_action(&handle, RegateCause::CapabilityChanged),
+            RegateAction::BlockPreWrite
+        );
+
+        let cumulative = handle.state.lock().unwrap().regates;
+        assert_eq!(cumulative, 5);
+
+        reset_immediate_regates(&handle);
+        assert_eq!(
+            regate_action(&handle, RegateCause::CapabilityChanged),
+            RegateAction::ImmediateReproof,
+            "a new pane edge opens one fresh proof"
+        );
+        assert_eq!(
+            handle.state.lock().unwrap().regates,
+            cumulative + 1,
+            "an evidence edge never rewrites cumulative unwritten attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_exact_pane_evidence_resets_the_regate_allowance() {
+        let cancel = Notify::new();
+
+        let (events, mut lagged) = broadcast::channel(1);
+        for seq in 1..=2 {
+            events
+                .send(Event {
+                    event: "session".into(),
+                    data: json!({"name": format!("other-{seq}")}),
+                    seq: None,
+                })
+                .unwrap();
+        }
+        assert!(
+            !wait_pane_change(&mut lagged, None, 0, "%1", &cancel).await,
+            "lag is doubt, not exact evidence"
+        );
+
+        let mut exact = events.subscribe();
+        events
+            .send(Event {
+                event: "readiness".into(),
+                data: json!({"session_idx": 3, "pane_id": "%1"}),
+                seq: None,
+            })
+            .unwrap();
+        assert!(wait_pane_change(&mut exact, None, 3, "%1", &cancel).await);
+    }
+
+    #[tokio::test]
+    async fn closed_gate_channels_do_not_become_evidence_or_spin() {
+        let (events, mut receiver) = broadcast::channel::<Event>(1);
+        drop(events);
+        let cancel = Notify::new();
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                wait_pane_change(&mut receiver, None, 0, "%1", &cancel),
+            )
+            .await
+            .is_err(),
+            "a closed event channel must remain held until cancellation"
+        );
+    }
+
     /// Every transition the pipeline can perform must be legal in the
     /// frozen state machine. If the proto table changes, this fails before
     /// any integration test does.
@@ -6162,6 +9702,48 @@ mod tests {
         let crlf = render_payload("m-ccc", "codex", "s", "one\r\ntwo", false);
         assert!(!prompt_matches(&crlf.replace("\r\n", "\n"), &crlf));
         assert!(!prompt_matches(&a.replace('\n', "\r\n"), &a));
+    }
+
+    #[test]
+    fn c3_duplicate_exact_dispatch_candidates_confirm_neither() {
+        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+        let candidate = |id: &str| {
+            let handle = DeliveryHandle::new(id, "claude", "%1", 0, "same bytes".into());
+            *handle.submitted_agent.lock().expect("submitted agent lock") = Some(agent);
+            *handle
+                .submitted_manifest
+                .lock()
+                .expect("submitted manifest lock") = Some("claude".into());
+            {
+                let mut state = handle.state.lock().expect("handle state lock");
+                state.state = DeliveryState::Submitted;
+                state.barrier = Some(format!("{id}-attempt"));
+                state.early_ack = Some(PendingAck {
+                    edge_ms: 10,
+                    turn: None,
+                    evidence: PendingAckEvidence::DispatchPending,
+                });
+            }
+            handle
+        };
+        let first = candidate("m-first");
+        let second = candidate("m-second");
+
+        match select_unkeyed_dispatch_candidate(
+            vec![Arc::clone(&first), Arc::clone(&second)],
+            agent,
+            "claude",
+            10,
+        ) {
+            UnkeyedDispatchSelection::Ambiguous(handles) => {
+                assert_eq!(handles.len(), 2);
+                assert!(handles.iter().any(|handle| Arc::ptr_eq(handle, &first)));
+                assert!(handles.iter().any(|handle| Arc::ptr_eq(handle, &second)));
+            }
+            UnkeyedDispatchSelection::None | UnkeyedDispatchSelection::Unique(_, _) => {
+                panic!("duplicate exact dispatch bytes selected one receipt owner")
+            }
+        }
     }
 
     /// The sentinel is deliberately not the reply hint: transport
@@ -6481,15 +10063,15 @@ composer_continuation_regex = '^(?P<content>.*)$'
             ),
         ] {
             assert_eq!(
-                staged_verified(&m, &screen, &id, &other, "m-3f9c2a"),
+                sentinel_representation(&m, &screen, &id, &other, "m-3f9c2a"),
                 None,
                 "{name} must not verify on the leading id"
             );
         }
         let ok = format!("{head}\nbody\n[cyclops:end m-3f9c2a]\n{CHROME}");
         assert_eq!(
-            staged_verified(&m, &ok, &id, &other, "m-3f9c2a"),
-            Some(true)
+            sentinel_representation(&m, &ok, &id, &other, "m-3f9c2a"),
+            Some(StagedRepresentation::VisibleTarget)
         );
     }
 
@@ -6604,18 +10186,21 @@ composer_trailer_required_prefix = 1
         // the composer is empty. Nothing staged.
         let screen =
             "you: [Pasted text #1 +9 lines]\nassistant: done\n\u{1b}[39m❯\u{a0}\n? for shortcuts";
-        assert_eq!(staged_verified(&m, screen, &id, &other, "m-new01"), None);
-        // The same chip ON the composer line is a real staging.
+        assert_eq!(
+            sentinel_representation(&m, screen, &id, &other, "m-new01"),
+            None
+        );
+        // The same chip on the composer line is a recognized representation.
         let staged = "transcript\n\u{1b}[39m❯\u{a0}[Pasted text #2 +9 lines]\n? for shortcuts";
         assert_eq!(
-            staged_verified(&m, staged, &id, &other, "m-new01"),
-            Some(false)
+            sentinel_representation(&m, staged, &id, &other, "m-new01"),
+            Some(StagedRepresentation::CollapsedChip)
         );
         // A visible id proves the head arrived and nothing more, which is
         // also what a truncated paste looks like, so it does not verify.
         let id_anywhere = "transcript\n❯ [cyclops m-new01] hello\n? for shortcuts";
         assert_eq!(
-            staged_verified(&m, id_anywhere, &id, &other, "m-new01"),
+            sentinel_representation(&m, id_anywhere, &id, &other, "m-new01"),
             None
         );
     }
@@ -6626,6 +10211,7 @@ composer_trailer_required_prefix = 1
         screens: StdMutex<Vec<String>>,
         cursor: std::sync::atomic::AtomicUsize,
         pub(super) pasted: StdMutex<Vec<String>>,
+        submitted: StdMutex<Vec<(String, String)>>,
         spooled: StdMutex<Option<String>>,
     }
 
@@ -6635,8 +10221,19 @@ composer_trailer_required_prefix = 1
                 screens: StdMutex::new(screens.into_iter().map(String::from).collect()),
                 cursor: std::sync::atomic::AtomicUsize::new(0),
                 pasted: StdMutex::new(Vec::new()),
+                submitted: StdMutex::new(Vec::new()),
                 spooled: StdMutex::new(None),
             }
+        }
+
+        fn next_screen(&self) -> String {
+            let screens = self.screens.lock().unwrap();
+            let i = self.cursor.fetch_add(1, Ordering::Relaxed);
+            screens[i.min(screens.len() - 1)].clone()
+        }
+
+        pub(super) fn submitted_is_empty(&self) -> bool {
+            self.submitted.lock().unwrap().is_empty()
         }
     }
 
@@ -6665,20 +10262,15 @@ composer_trailer_required_prefix = 1
             self.pasted.lock().unwrap().push(payload);
             Ok(())
         }
-        async fn submit(&self, _pane_id: &str, _key: &str) -> Result<(), String> {
+        async fn submit(&self, pane_id: &str, key: &str) -> Result<(), String> {
+            self.submitted
+                .lock()
+                .unwrap()
+                .push((pane_id.to_string(), key.to_string()));
             Ok(())
         }
-        // The canned screens are authored in whichever flavor the test's
-        // manifest asks for: the escaped read returns them raw, the plain
-        // read returns them de-escaped (identity for plain fixtures) —
-        // the same relationship the two tmux captures have.
-        async fn capture(&self, _pane_id: &str) -> Result<String, String> {
-            self.capture_escaped(_pane_id).await.map(|s| strip_csi(&s))
-        }
-        async fn capture_escaped(&self, _pane_id: &str) -> Result<String, String> {
-            let screens = self.screens.lock().unwrap();
-            let i = self.cursor.fetch_add(1, Ordering::Relaxed);
-            Ok(screens[i.min(screens.len() - 1)].clone())
+        async fn capture_joined_escaped(&self, _pane_id: &str) -> Result<String, String> {
+            Ok(self.next_screen())
         }
     }
 
@@ -6696,10 +10288,12 @@ composer_trailer_required_prefix = 1
             &handle,
             &manifest,
             StagingTarget::ExactRow(&payload),
+            &payload,
             &|| {
                 assert!(injector.pasted.lock().unwrap().is_empty());
                 context
                     .record_writing(
+                        ProcessInstanceId::new(3999, 817_999).unwrap(),
                         ProcessInstanceId::new(4000, 818_000).unwrap(),
                         ProcessInstanceId::new(4242, 818_221).unwrap(),
                         "codex",
@@ -6724,6 +10318,7 @@ composer_trailer_required_prefix = 1
             cyclops_proto::NotificationState::Staged,
             "send-keys success is not a receipt"
         );
+        context.reserve_submit().unwrap();
         context.record_submitted().unwrap();
         assert_eq!(
             notification_state(&store, recipient, context.message_id()).state,
@@ -6756,6 +10351,7 @@ composer_trailer_required_prefix = 1
             &handle,
             &manifest,
             StagingTarget::ExactRow(&payload),
+            &payload,
             &|| {
                 context
                     .ensure_current_gating()
@@ -6765,7 +10361,7 @@ composer_trailer_required_prefix = 1
         .await
         .unwrap_err();
 
-        assert_eq!(error, SUPERSEDED_BEFORE_WRITE);
+        assert_eq!(error, NO_LONGER_CURRENT_BEFORE_WRITE);
         assert!(injector.pasted.lock().unwrap().is_empty());
         assert_eq!(
             notification_state(&store, recipient, context.message_id()).state,
@@ -6811,6 +10407,7 @@ composer_trailer_required_prefix = 1
             &handle,
             &manifest,
             StagingTarget::ExactRow(&payload),
+            &payload,
             &|| {
                 context
                     .ensure_current_gating()
@@ -6819,32 +10416,795 @@ composer_trailer_required_prefix = 1
         )
         .await
         .unwrap_err();
-        assert_eq!(error, SUPERSEDED_BEFORE_WRITE);
+        assert_eq!(error, NO_LONGER_CURRENT_BEFORE_WRITE);
         assert!(injector.pasted.lock().unwrap().is_empty());
         assert_eq!(
             notification_state(&store, recipient, context.message_id()).state,
-            cyclops_proto::NotificationState::Superseded
+            cyclops_proto::NotificationState::Withdrawn
         );
+    }
+
+    #[tokio::test]
+    async fn operator_withdrawal_wakes_a_queued_attempt_before_gating() {
+        let (_scratch, store, context, handle, recipient) = notification_fixture("operator-queued");
+        let admin = RecipientKey::admin(recipient.workspace_id());
+        store
+            .lock()
+            .unwrap()
+            .withdraw_notification_before_write(admin, recipient, context.attempt_id())
+            .unwrap();
+
+        let engine = Engine::new();
+        engine
+            .notification_attempts
+            .lock()
+            .unwrap()
+            .insert(context.attempt_id(), Arc::downgrade(&handle));
+        engine.cancel_notification(context.attempt_id());
+        tokio::time::timeout(Duration::from_millis(100), handle.cancel.notified())
+            .await
+            .expect("operator withdrawal wakes the exact queued attempt");
+
+        assert!(matches!(
+            context.record_gating(),
+            Err(NotificationAdapterError::NoLongerCurrentBeforeWrite)
+        ));
+        assert!(!handle.write_boundary_crossed.load(Ordering::SeqCst));
+        assert_eq!(
+            notification_state(&store, recipient, context.message_id()).state,
+            NotificationState::WithdrawnByOperator
+        );
+    }
+
+    #[test]
+    fn staged_doorbell_claim_cannot_prove_submit_or_turn_start() {
+        let (_scratch, store, context, _handle, recipient) = notification_fixture("staged-claim");
+        context.record_gating().unwrap();
+        let writing = context
+            .record_writing(
+                ProcessInstanceId::new(3999, 817_999).unwrap(),
+                ProcessInstanceId::new(4000, 818_000).unwrap(),
+                ProcessInstanceId::new(4242, 818_221).unwrap(),
+                "codex",
+                NotificationTransport::Doorbell,
+                None,
+            )
+            .unwrap();
+        context.record_staged().unwrap();
+
+        let outcome = store
+            .lock()
+            .unwrap()
+            .claim(recipient, context.message_id().clone())
+            .unwrap();
+        let crate::mailbox::ClaimOutcome::Claimed {
+            withdrawn_attempt,
+            consumed_doorbell_attempt,
+            ..
+        } = outcome
+        else {
+            panic!("first claim must append a claim fact");
+        };
+        assert_eq!(withdrawn_attempt, None);
+        assert_eq!(consumed_doorbell_attempt, Some(context.attempt_id()));
+
+        let store = store.lock().unwrap();
+        let record = store
+            .projection()
+            .notification(recipient, context.message_id())
+            .unwrap();
+        assert_eq!(record.state, cyclops_proto::NotificationState::Staged);
+        assert_eq!(record.binding, writing.binding);
+        let barriers = store.projection().active_notification_barriers();
+        assert_eq!(barriers.len(), 1);
+        assert_eq!(barriers[0].attempt_id, context.attempt_id());
+        assert_eq!(barriers[0].state, cyclops_proto::NotificationState::Staged);
+        drop(store);
+        assert_eq!(
+            context.reserve_submit().unwrap(),
+            SubmitReservation::ClaimedBeforeSubmit
+        );
+    }
+
+    #[test]
+    fn changed_content_after_submit_reservation_becomes_one_durable_attention() {
+        let (_scratch, store, context, handle, recipient) =
+            notification_fixture("reserved-content-change");
+        context.record_gating().unwrap();
+        context
+            .record_writing(
+                ProcessInstanceId::new(3999, 817_999).unwrap(),
+                ProcessInstanceId::new(4000, 818_000).unwrap(),
+                ProcessInstanceId::new(4242, 818_221).unwrap(),
+                "codex",
+                NotificationTransport::Doorbell,
+                None,
+            )
+            .unwrap();
+        context.record_staged().unwrap();
+        assert_eq!(
+            context.reserve_submit().unwrap(),
+            SubmitReservation::Reserved
+        );
+
+        let manifest = sentinel_manifest();
+        let expected = handle.payload();
+        let exact = format!("\u{1b}[39m❯ {expected}\n{CHROME}");
+        let (id_staged, payload_at_proof) = exact_staging_proof(
+            &manifest,
+            &exact,
+            StagingTarget::ExactRow(&expected),
+            &expected,
+        )
+        .expect("baseline exact payload");
+        let changed = format!("\u{1b}[39m❯ {expected} plus human draft\n{CHROME}");
+        assert!(!exact_staging_snapshot_matches(
+            &manifest,
+            &changed,
+            StagingTarget::ExactRow(&expected),
+            &expected,
+            id_staged,
+            &payload_at_proof,
+        ));
+
+        context
+            .record_attention(NotificationAttentionCause::VerifyFailed)
+            .unwrap();
+        let attention = notification_state(&store, recipient, context.message_id());
+        assert_eq!(attention.state, NotificationState::AttentionRequired);
+        assert_eq!(
+            attention.cause,
+            Some(NotificationAttentionCause::VerifyFailed)
+        );
+        let sequence = store.lock().unwrap().projection().last_sequence();
+        let repeated = context
+            .record_attention(NotificationAttentionCause::VerifyFailed)
+            .unwrap();
+        assert_eq!(repeated.state, NotificationState::AttentionRequired);
+        assert_eq!(store.lock().unwrap().projection().last_sequence(), sequence);
+    }
+
+    #[tokio::test]
+    async fn cleared_claimed_stage_retries_only_the_settlement_fact_once() {
+        let (_scratch, store, context, _handle, recipient) =
+            notification_fixture("claimed-clear-retry");
+        prepare_claimed_staged(&store, &context, recipient);
+        let injector = MockInjector::new(Vec::new());
+        injector.clear("%1", &["C-c".to_string()]).await.unwrap();
+        let before_seq = store.lock().unwrap().projection().last_sequence();
+        store
+            .lock()
+            .unwrap()
+            .inject_next_claimed_staged_clear_append_failure();
+
+        let settled = settle_claimed_staged_after_clear(&context).unwrap();
+        assert_eq!(settled.state, NotificationState::WithdrawnAfterStaging);
+        assert_eq!(
+            store.lock().unwrap().projection().last_sequence(),
+            before_seq.map(|seq| seq + 1),
+            "the failed append writes nothing and the one bounded retry appends one fact"
+        );
+        assert!(store
+            .lock()
+            .unwrap()
+            .projection()
+            .active_notification_barriers()
+            .is_empty());
+
+        let settled_seq = store.lock().unwrap().projection().last_sequence();
+        let replayed = settle_claimed_staged_after_clear(&context).unwrap();
+        assert_eq!(replayed, settled);
+        assert_eq!(
+            store.lock().unwrap().projection().last_sequence(),
+            settled_seq,
+            "an already-landed settlement is discovered without a second fact"
+        );
+        assert_eq!(
+            injector.submitted.lock().unwrap().as_slice(),
+            &[("%1".to_string(), "C-c".to_string())],
+            "settlement retry never repeats clear or sends Enter"
+        );
+        assert!(injector.pasted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn persistent_claimed_stage_settlement_failure_faults_the_exact_fifo_owner() {
+        let (_scratch, store, context, handle, recipient) =
+            notification_fixture("claimed-clear-persistent-failure");
+        prepare_claimed_staged(&store, &context, recipient);
+        let injector = MockInjector::new(Vec::new());
+        injector.clear("%1", &["C-c".to_string()]).await.unwrap();
+        store
+            .lock()
+            .unwrap()
+            .inject_claimed_staged_clear_append_failures(2);
+
+        assert!(settle_claimed_staged_after_clear(&context).is_err());
+        let record = notification_state(&store, recipient, context.message_id());
+        assert_eq!(record.state, NotificationState::Staged);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .projection()
+                .active_notification_barriers(),
+            vec![record],
+            "both failed appends leave the exact barrier as FIFO owner"
+        );
+
+        let worker = Arc::new(Worker::new());
+        let follower = DeliveryHandle::new("m-follower", "reviewer", "%1", 0, String::new());
+        worker.enqueue_back(Arc::clone(&handle));
+        worker.enqueue_back(follower);
+        assert!(Arc::ptr_eq(
+            &worker.current_or_next().expect("current attempt"),
+            &handle
+        ));
+        let failure = AttemptFailure::claimed_staged_settlement_failed();
+        assert!(fault_notification_worker(&worker, &failure));
+        let state = worker.state.lock().unwrap();
+        assert_eq!(
+            state.fault.as_deref(),
+            Some(CLAIMED_STAGED_SETTLEMENT_FAILED)
+        );
+        assert!(state
+            .current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &handle)));
+        assert_eq!(
+            state.queue.len(),
+            1,
+            "the follower remains behind the fault"
+        );
+        drop(state);
+
+        let engine = Engine::new();
+        engine.notification_workers.lock().unwrap().insert(
+            recipient,
+            NotificationWorker {
+                worker,
+                task: test_worker_task(),
+            },
+        );
+        let diagnostics = engine.notification_worker_diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            "notification_settlement_storage_failed"
+        );
+        assert_eq!(diagnostics[0].notification_attempt, context.attempt_id());
+        assert_eq!(
+            injector.submitted.lock().unwrap().as_slice(),
+            &[("%1".to_string(), "C-c".to_string())],
+            "persistent storage failure does not repeat clear or send Enter"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_prewrite_block_append_keeps_the_exact_fifo_owner() {
+        let (_scratch, store, context, handle, recipient) =
+            notification_fixture("worker-prewrite-append-failure");
+        store
+            .lock()
+            .unwrap()
+            .inject_next_pre_write_block_append_failure();
+
+        let worker = Arc::new(Worker::new());
+        let follower = DeliveryHandle::new("m-follower", "reviewer", "%1", 0, String::new());
+        worker.enqueue_back(Arc::clone(&handle));
+        worker.enqueue_back(Arc::clone(&follower));
+        assert!(Arc::ptr_eq(
+            &worker.current_or_next().expect("current attempt"),
+            &handle
+        ));
+
+        assert!(persist_worker_failed_prewrite(&context, &worker).is_none());
+        assert!(worker.is_faulted());
+        assert!(Arc::ptr_eq(
+            &worker.current().expect("failed attempt remains current"),
+            &handle
+        ));
+        assert_eq!(worker.position_of(&follower), 1);
+        assert!(!handle.write_boundary_crossed.load(Ordering::SeqCst));
+        assert_eq!(
+            notification_state(&store, recipient, context.message_id()).state,
+            NotificationState::Gating,
+            "the failed append must not invent a terminal block"
+        );
+
+        let engine = Engine::new();
+        engine.notification_workers.lock().unwrap().insert(
+            recipient,
+            NotificationWorker {
+                worker: Arc::clone(&worker),
+                task: test_worker_task(),
+            },
+        );
+        let diagnostics = engine.notification_worker_diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "notification_recovery_storage_failed");
+        assert_eq!(diagnostics[0].message_id, context.message_id().clone());
+        assert_eq!(diagnostics[0].notification_attempt, context.attempt_id());
+    }
+
+    #[tokio::test]
+    async fn failed_readiness_block_append_keeps_the_exact_fifo_owner() {
+        let (_scratch, store, context, handle, recipient) =
+            notification_fixture("readiness-block-append-failure");
+        context.record_gating().unwrap();
+        store
+            .lock()
+            .unwrap()
+            .inject_next_pre_write_block_append_failure();
+
+        let worker = Arc::new(Worker::new());
+        let follower = DeliveryHandle::new("m-follower", "reviewer", "%1", 0, String::new());
+        worker.enqueue_back(Arc::clone(&handle));
+        worker.enqueue_back(Arc::clone(&follower));
+        assert!(Arc::ptr_eq(
+            &worker.current_or_next().expect("current attempt"),
+            &handle
+        ));
+
+        let record = record_notification_prewrite_block(
+            &context,
+            &worker,
+            &StdMutex::new(()),
+            NotificationPreWriteCause::WriteReadinessChanged,
+            None,
+        );
+        assert!(record.is_none());
+        assert!(worker.is_faulted());
+        assert!(Arc::ptr_eq(
+            &worker.current().expect("failed attempt remains current"),
+            &handle
+        ));
+        assert_eq!(worker.position_of(&follower), 1);
+        assert!(!handle.write_boundary_crossed.load(Ordering::SeqCst));
+        assert_eq!(
+            notification_state(&store, recipient, context.message_id()).state,
+            NotificationState::Gating,
+            "the failed append must not invent a durable block"
+        );
+
+        let engine = Engine::new();
+        engine.notification_workers.lock().unwrap().insert(
+            recipient,
+            NotificationWorker {
+                worker,
+                task: test_worker_task(),
+            },
+        );
+        let diagnostics = engine.notification_worker_diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "notification_prewrite_storage_failed");
+        assert_eq!(diagnostics[0].notification_attempt, context.attempt_id());
+    }
+
+    #[test]
+    fn a_claim_that_wins_the_prewrite_block_releases_fifo_without_faulting() {
+        let (_scratch, store, context, handle, recipient) =
+            notification_fixture("claim-wins-prewrite-block");
+        context.record_gating().unwrap();
+        store
+            .lock()
+            .unwrap()
+            .claim(recipient, context.message_id().clone())
+            .unwrap();
+
+        let worker = Arc::new(Worker::new());
+        let follower = DeliveryHandle::new("m-follower", "reviewer", "%1", 0, String::new());
+        worker.enqueue_back(Arc::clone(&handle));
+        worker.enqueue_back(Arc::clone(&follower));
+        assert!(Arc::ptr_eq(
+            &worker.current_or_next().expect("current attempt"),
+            &handle
+        ));
+
+        let record = record_notification_prewrite_block(
+            &context,
+            &worker,
+            &StdMutex::new(()),
+            NotificationPreWriteCause::WriteReadinessChanged,
+            None,
+        );
+        assert!(record.is_none());
+        assert!(!worker.is_faulted());
+        assert_eq!(
+            notification_state(&store, recipient, context.message_id()).state,
+            NotificationState::Withdrawn
+        );
+        assert!(worker.finish(&handle));
+        assert!(Arc::ptr_eq(
+            &worker.current_or_next().expect("follower advances"),
+            &follower
+        ));
+    }
+
+    #[tokio::test]
+    async fn clean_restart_recovery_settles_without_clear_or_enter() {
+        let (scratch, store, context, handle, recipient) =
+            notification_fixture("claimed-clean-restart");
+        let staged = prepare_claimed_staged(&store, &context, recipient);
+        let message_id = context.message_id().clone();
+        let attempt_id = context.attempt_id();
+        let binding = staged.binding.clone();
+        drop(handle);
+        drop(context);
+        drop(store);
+
+        let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let root = StateRoot::open_or_create(&scratch.0).unwrap();
+        let reopened = MessageStore::open(
+            &root,
+            Path::new("workspaces/current/messages.ndjson"),
+            workspace,
+            "boot-recovered",
+        )
+        .unwrap();
+        let store = Arc::new(StdMutex::new(reopened));
+        let recovered = store
+            .lock()
+            .unwrap()
+            .projection()
+            .claimed_notification_barrier(recipient)
+            .cloned()
+            .expect("restart retains the claimed staged attempt");
+        assert_eq!(recovered.attempt_id, attempt_id);
+        assert_eq!(recovered.binding, binding);
+
+        let manifest = Manifest::parse(
+            r#"
+[agent]
+id = "codex"
+display_name = "codex"
+
+[[rule]]
+id = "composer_clean"
+state = "idle"
+composer_semantic = "clean"
+priority = 1000
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^❯$']
+line_regex_esc = ['^❯$']
+
+[injection]
+composer_trailer_regex = ['^status$']
+composer_trailer_regex_esc = ['^status$']
+composer_trailer_required_prefix = 1
+composer_prompt_regex = '^❯(?P<content>.*)$'
+composer_continuation_regex = '^  (?P<content>.*)$'
+unstyled_composer_proof = 'structural_trailer'
+"#,
+            Path::new("clean.toml"),
+        )
+        .unwrap();
+        let capture = "transcript\n❯\nstatus";
+        let expected = cyclops_proto::render_doorbell_v1(&message_id);
+        assert_eq!(
+            classify_claimed_staged_composer(
+                &manifest,
+                capture,
+                StagingTarget::ExactRow(&expected),
+                &expected,
+            ),
+            ClaimedStagedComposer::Clean
+        );
+        assert_eq!(
+            claimed_staged_action(
+                ClaimedStagedComposer::Clean,
+                ClaimedStagedReconciliation::Recovered(ClaimedNotificationBarrier::Staged),
+            ),
+            ClaimedStagedAction::SettleOnly
+        );
+
+        let injector = MockInjector::new(vec![capture]);
+        let observed = injector.capture_joined_escaped("%1").await.unwrap();
+        assert_eq!(observed, capture);
+        let context = NotificationContext::new(store.clone(), message_id, recipient, attempt_id);
+        let settled = settle_claimed_staged_after_clear(&context).unwrap();
+        assert_eq!(settled.state, NotificationState::WithdrawnAfterStaging);
+        assert!(injector.submitted.lock().unwrap().is_empty());
+        assert!(injector.pasted.lock().unwrap().is_empty());
+        assert!(store
+            .lock()
+            .unwrap()
+            .projection()
+            .active_notification_barriers()
+            .is_empty());
+
+        let unsupported = Manifest::parse(
+            r#"
+[agent]
+id = "unsupported"
+display_name = "unsupported"
+[[rule]]
+id = "composer_clean"
+state = "idle"
+composer_semantic = "clean"
+priority = 1000
+region = "bottom_non_empty_lines(1)"
+line_regex = ['^❯$']
+line_regex_esc = ['^❯$']
+"#,
+            Path::new("unsupported.toml"),
+        )
+        .unwrap();
+        assert!(!clean_composer_proof(&unsupported, "❯"));
+        assert!(!clean_composer_proof(&manifest, "transcript\n❯"));
+        assert!(clean_composer_proof(
+            &manifest,
+            "❯\ntranscript echo\n❯\nstatus"
+        ));
+        assert!(!clean_composer_proof(
+            &manifest,
+            "❯\ntranscript echo\n❯\nstatus\nunexpected"
+        ));
+        assert!(!clean_composer_proof(&manifest, "❯human draft\nstatus"));
+
+        let chip_manifest = composer_manifest();
+        let chip = "transcript\n\u{1b}[39m❯\u{a0}[Pasted text #1]\n? for shortcuts";
+        assert_eq!(
+            exact_composer_content_for_state(
+                &chip_manifest,
+                chip,
+                AgentState::Idle,
+                Some(ComposerSemantic::Clean),
+            ),
+            ComposerContentProof::Hidden
+        );
+        assert!(!clean_composer_proof(&chip_manifest, chip));
+    }
+
+    #[test]
+    fn claimed_stage_policy_clears_only_exact_bytes_and_refuses_human_input() {
+        let manifest = sentinel_manifest();
+        let message_id = MessageId::new("m-claimed-policy").unwrap();
+        let expected = cyclops_proto::render_doorbell_v1(&message_id);
+        let exact = format!("\u{1b}[39m❯ {expected}\n{CHROME}");
+        let human = format!("\u{1b}[39m❯ {expected} plus my draft\n{CHROME}");
+
+        assert_eq!(
+            classify_claimed_staged_composer(
+                &manifest,
+                &exact,
+                StagingTarget::ExactRow(&expected),
+                &expected,
+            ),
+            ClaimedStagedComposer::ExactDoorbell
+        );
+        assert_eq!(
+            claimed_staged_action(
+                ClaimedStagedComposer::ExactDoorbell,
+                ClaimedStagedReconciliation::Recovered(ClaimedNotificationBarrier::Staged),
+            ),
+            ClaimedStagedAction::ClearThenSettle
+        );
+        assert_eq!(
+            classify_claimed_staged_composer(
+                &manifest,
+                &human,
+                StagingTarget::ExactRow(&expected),
+                &expected,
+            ),
+            ClaimedStagedComposer::Ambiguous
+        );
+        assert_eq!(
+            claimed_staged_action(
+                ClaimedStagedComposer::Ambiguous,
+                ClaimedStagedReconciliation::Recovered(ClaimedNotificationBarrier::Staged),
+            ),
+            ClaimedStagedAction::Refuse
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_after_submit_reservation_waits_for_submit_success() {
+        let (_scratch, store, context, handle, recipient) =
+            notification_fixture("claim-after-reservation");
+        context.record_gating().unwrap();
+        context
+            .record_writing(
+                ProcessInstanceId::new(3999, 817_999).unwrap(),
+                ProcessInstanceId::new(4000, 818_000).unwrap(),
+                ProcessInstanceId::new(4242, 818_221).unwrap(),
+                "codex",
+                NotificationTransport::Doorbell,
+                None,
+            )
+            .unwrap();
+        context.record_staged().unwrap();
+        assert_eq!(
+            context.reserve_submit().unwrap(),
+            SubmitReservation::Reserved
+        );
+
+        let first = store
+            .lock()
+            .unwrap()
+            .claim(recipient, context.message_id().clone())
+            .unwrap();
+        let crate::mailbox::ClaimOutcome::Claimed {
+            entry: first_entry,
+            message: first_message,
+            withdrawn_attempt,
+            consumed_doorbell_attempt,
+            ..
+        } = first
+        else {
+            panic!("first claim must append one claim fact");
+        };
+        assert_eq!(first_entry.message_id, *context.message_id());
+        assert_eq!(first_message.message_id, *context.message_id());
+        assert_eq!(withdrawn_attempt, None);
+        assert_eq!(consumed_doorbell_attempt, Some(context.attempt_id()));
+        assert_eq!(
+            notification_state(&store, recipient, context.message_id()).state,
+            NotificationState::Submitting,
+            "a socket claim cannot prove that Enter was sent"
+        );
+
+        let sequence_before_reclaim = store.lock().unwrap().projection().last_sequence();
+        let repeated = store
+            .lock()
+            .unwrap()
+            .claim(recipient, context.message_id().clone())
+            .unwrap();
+        let crate::mailbox::ClaimOutcome::AlreadyClaimed {
+            entry: repeated_entry,
+            message: repeated_message,
+            withdrawn_attempt,
+            consumed_doorbell_attempt,
+            ..
+        } = repeated
+        else {
+            panic!("repeat claim must return the original mailbox task");
+        };
+        assert_eq!(repeated_entry.message_id, first_entry.message_id);
+        assert_eq!(repeated_message.message_id, first_message.message_id);
+        assert_eq!(withdrawn_attempt, None);
+        assert_eq!(consumed_doorbell_attempt, Some(context.attempt_id()));
+        assert_eq!(
+            store.lock().unwrap().projection().last_sequence(),
+            sequence_before_reclaim,
+            "reclaim must not append a second task"
+        );
+        assert_eq!(
+            notification_state(&store, recipient, context.message_id()).state,
+            NotificationState::Submitting
+        );
+
+        let doorbell = cyclops_proto::render_doorbell_v1(context.message_id());
+        assert_eq!(handle.payload(), doorbell);
+        let injector = MockInjector::new(Vec::new());
+        let turn = crate::turnkey::TurnKey::for_test(&["session-1", "turn-1"]);
+        {
+            let mut state = handle.state.lock().unwrap();
+            state.state = DeliveryState::Staged;
+            state.early_ack = Some(PendingAck {
+                edge_ms: 91,
+                turn: Some(turn.clone()),
+                evidence: PendingAckEvidence::Receipt,
+            });
+        }
+        injector.submit(&handle.pane_id, "Enter").await.unwrap();
+        assert_eq!(
+            injector.submitted.lock().unwrap().as_slice(),
+            &[(handle.pane_id.clone(), "Enter".to_string())],
+            "the reserved terminal key submits the same attempt's doorbell"
+        );
+        context.record_submitted().unwrap();
+        handle.state.lock().unwrap().state = DeliveryState::Submitted;
+        let early = take_accepted_early_ack(&handle).expect("hook receipt survives to worker");
+        assert!(context.settle_submitted_claim().unwrap());
+        let step = early_ack_step(early);
+        assert_eq!(step.next, DeliveryState::DeliveredVerified);
+        assert_eq!(step.cause, Some("hook_ack"));
+        assert_eq!(step.verified_by, Some(VerifiedBy::Hook));
+        assert_eq!(step.turn_edge_ms, Some(91));
+        assert_eq!(step.turn, Some(turn));
+        assert_eq!(
+            notification_state(&store, recipient, context.message_id()).state,
+            NotificationState::Notified
+        );
+    }
+
+    #[test]
+    fn notified_state_without_the_exact_claim_does_not_settle_a_claim_race() {
+        let (_scratch, _store, context, _handle, _recipient) =
+            notification_fixture("notified-without-claim");
+        prepare_notification_receipt(&context);
+        context.record_notified().unwrap();
+        assert!(
+            !context.settle_submitted_claim().unwrap(),
+            "Notified proves receipt, not an exact mailbox claim"
+        );
+    }
+
+    #[test]
+    fn submitted_doorbell_claim_names_the_attempt_that_consumed_it() {
+        let (_scratch, store, context, _handle, recipient) =
+            notification_fixture("submitted-claim");
+        prepare_notification_receipt(&context);
+
+        let first = store
+            .lock()
+            .unwrap()
+            .claim(recipient, context.message_id().clone())
+            .unwrap();
+        let crate::mailbox::ClaimOutcome::Claimed {
+            withdrawn_attempt,
+            consumed_doorbell_attempt,
+            ..
+        } = first
+        else {
+            panic!("first claim must append a claim fact");
+        };
+        assert_eq!(withdrawn_attempt, None);
+        assert_eq!(consumed_doorbell_attempt, Some(context.attempt_id()));
+        let record = notification_state(&store, recipient, context.message_id());
+        assert_eq!(record.state, cyclops_proto::NotificationState::Notified);
+        assert_eq!(record.cause, None);
+        assert!(store
+            .lock()
+            .unwrap()
+            .projection()
+            .open_alarms_for_message(context.message_id())
+            .is_empty());
+
+        let late = context
+            .record_attention(NotificationAttentionCause::ReceiptOccupantChanged)
+            .unwrap_err();
+        assert!(matches!(
+            late,
+            NotificationAdapterError::TerminalConflict(cyclops_proto::NotificationState::Notified)
+        ));
+        assert!(store
+            .lock()
+            .unwrap()
+            .projection()
+            .open_alarms_for_message(context.message_id())
+            .is_empty());
+
+        let repeated = store
+            .lock()
+            .unwrap()
+            .claim(recipient, context.message_id().clone())
+            .unwrap();
+        let crate::mailbox::ClaimOutcome::AlreadyClaimed {
+            consumed_doorbell_attempt,
+            ..
+        } = repeated
+        else {
+            panic!("repeat claim must be idempotent");
+        };
+        assert_eq!(consumed_doorbell_attempt, Some(context.attempt_id()));
     }
 
     #[test]
     fn withdrawn_notification_never_enters_the_delivery_gate() {
         let (_scratch, store, context, _handle, recipient) =
             notification_fixture("withdrawn-before-gate");
-        supersede_notification(
-            &store,
-            recipient,
-            context.message_id(),
-            "m-withdrawn-replacement",
-        );
+        let outcome = store
+            .lock()
+            .unwrap()
+            .claim(recipient, context.message_id().clone())
+            .unwrap();
+        let crate::mailbox::ClaimOutcome::Claimed {
+            withdrawn_attempt, ..
+        } = outcome
+        else {
+            panic!("first claim must append a claim fact");
+        };
+        assert_eq!(withdrawn_attempt, Some(context.attempt_id()));
 
         assert!(matches!(
             context.record_gating(),
-            Err(NotificationAdapterError::SupersededBeforeWrite)
+            Err(NotificationAdapterError::NoLongerCurrentBeforeWrite)
         ));
         assert_eq!(
             notification_state(&store, recipient, context.message_id()).state,
-            cyclops_proto::NotificationState::Superseded
+            cyclops_proto::NotificationState::Withdrawn
         );
     }
 
@@ -6899,9 +11259,11 @@ composer_trailer_required_prefix = 1
             &handle,
             &manifest,
             StagingTarget::ExactRow(&payload),
+            &payload,
             &|| {
                 context
                     .record_writing(
+                        ProcessInstanceId::new(3999, 817_999).unwrap(),
                         ProcessInstanceId::new(4000, 818_000).unwrap(),
                         ProcessInstanceId::new(4242, 818_221).unwrap(),
                         "codex",
@@ -6955,6 +11317,7 @@ composer_trailer_required_prefix = 1
                     &handle,
                     &m,
                     StagingTarget::Sentinel(&handle.msg_id),
+                    &payload,
                     &|| Err(cause.to_string())
                 )
                 .await,
@@ -6972,14 +11335,14 @@ composer_trailer_required_prefix = 1
                 "{cause} must not be treated as possibly-written"
             );
             assert!(
-                failure.regate(),
+                failure.regate_cause().is_some(),
                 "{cause} belongs back at the gate, not in the retry budget"
             );
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn inject_rejects_stale_screen_and_accepts_staged() {
+    async fn inject_rejects_stale_and_hidden_staging() {
         let m = composer_manifest();
         let handle = DeliveryHandle::new("m-new01", "worker", "%1", 0, "payload".into());
 
@@ -6993,6 +11356,7 @@ composer_trailer_required_prefix = 1
                 &handle,
                 &m,
                 StagingTarget::Sentinel(&handle.msg_id),
+                &payload,
                 &|| Ok(())
             )
             .await,
@@ -7003,17 +11367,20 @@ composer_trailer_required_prefix = 1
         let staged = "transcript\n\u{1b}[39m❯\u{a0}[Pasted text #2 +9 lines]\n? for shortcuts";
         let mock = MockInjector::new(vec![stale, staged]);
         mock.spool(&payload).await.expect("spool");
-        let (window, id_staged, _proof) = inject(
-            &mock,
-            &handle,
-            &m,
-            StagingTarget::Sentinel(&handle.msg_id),
-            &|| Ok(()),
-        )
-        .await
-        .expect("staged verifies");
-        assert!(!id_staged, "generic pattern staged it, not the id");
-        assert!(window.contains("Pasted text #2"));
+        assert_eq!(
+            inject(
+                &mock,
+                &handle,
+                &m,
+                StagingTarget::Sentinel(&handle.msg_id),
+                &payload,
+                &|| Ok(()),
+            )
+            .await,
+            Err("verify_failed".to_string())
+        );
+        assert_eq!(mock.pasted.lock().unwrap().len(), 1, "payload was pasted");
+        assert!(mock.submitted_is_empty());
     }
 
     /// The shipped codex manifest, parsed as data for the two tests below:
@@ -7067,8 +11434,8 @@ composer_trailer_required_prefix = 1
 
         let staged = format!("transcript above\n{CODEX_COMPOSER_CHIP}{CODEX_TRAILER}");
         assert_eq!(
-            staged_verified(&m, &staged, &id, &other, "m-x"),
-            Some(false)
+            sentinel_representation(&m, &staged, &id, &other, "m-x"),
+            Some(StagedRepresentation::CollapsedChip)
         );
 
         // A chip in the TRANSCRIPT (bold-dim glyph) over an empty
@@ -7076,7 +11443,10 @@ composer_trailer_required_prefix = 1
         let stale = format!(
             "\u{1b}[1;2m›  \u{1b}[0m[Pasted Content 900 chars]\n{CODEX_COMPOSER_GHOST}{CODEX_TRAILER}"
         );
-        assert_eq!(staged_verified(&m, &stale, &id, &other, "m-x"), None);
+        assert_eq!(
+            sentinel_representation(&m, &stale, &id, &other, "m-x"),
+            None
+        );
 
         // A short message renders literally: the id proves it anywhere in
         // the region, chip or no chip.
@@ -7089,40 +11459,36 @@ composer_trailer_required_prefix = 1
             "{CODEX_TRANSCRIPT_LINE}\n\u{1b}[1m›\u{1b}[0m [cyclops m-jean01] hello\n[cyclops:end m-jean01]\n\n  \u{1b}[38;2;246;226;183mgpt-5.6-sol high\u{1b}[39m · /tmp/x"
         );
         assert_eq!(
-            staged_verified(&m, &literal, &id, &other, "m-jean01"),
-            Some(true)
+            sentinel_representation(&m, &literal, &id, &other, "m-jean01"),
+            Some(StagedRepresentation::VisibleTarget)
         );
     }
 
-    /// The whole inject() path against the codex manifest: the escaped
-    /// capture is the one that decides — its de-escaped sibling cannot
-    /// tell the composer glyph from the transcript's — and the delivery
-    /// proceeds to submit instead of erroring verify_failed.
+    /// A collapsed chip confirms representation, not exact composer bytes.
+    /// The inject path must withhold Enter even when the escaped capture
+    /// proves the chip belongs to the active composer.
     #[tokio::test(start_paused = true)]
-    async fn inject_verifies_codex_collapse_via_the_escaped_capture() {
+    async fn inject_refuses_codex_collapse_without_exact_ownership() {
         let m = codex_manifest();
         let handle = DeliveryHandle::new("m-jean01", "codex", "%1", 0, "payload".into());
         let staged = format!("transcript above\n{CODEX_COMPOSER_CHIP}{CODEX_TRAILER}");
         let mock = MockInjector::new(vec![staged.as_str()]);
         let payload = handle.payload();
         mock.spool(&payload).await.expect("spool");
-        let (window, id_staged, _proof) = inject(
-            &mock,
-            &handle,
-            &m,
-            StagingTarget::Sentinel(&handle.msg_id),
-            &|| Ok(()),
-        )
-        .await
-        .expect("collapse stages");
-        assert!(
-            !id_staged,
-            "the chip hides the id; the composer line proved it"
+        assert_eq!(
+            inject(
+                &mock,
+                &handle,
+                &m,
+                StagingTarget::Sentinel(&handle.msg_id),
+                &payload,
+                &|| Ok(()),
+            )
+            .await,
+            Err("verify_failed".to_string())
         );
-        assert!(window.contains("[Pasted Content 2828 chars]"), "{window}");
-        // The ACK comparison window is de-escaped, so later SGR churn
-        // cannot fake a changed composer.
-        assert!(!window.contains('\u{1b}'), "{window}");
+        assert_eq!(mock.pasted.lock().unwrap().len(), 1);
+        assert!(mock.submitted_is_empty());
     }
 
     // -----------------------------------------------------------------
@@ -7133,16 +11499,101 @@ composer_trailer_required_prefix = 1
     fn tier2_changed_window_alone_needs_the_id_staged() {
         // A changed window with no staged id is a redraw, not delivery
         // evidence (this returned true before fix D).
-        assert!(!tier2_evidence(true, false, false, false));
-        assert!(tier2_evidence(true, true, false, false));
-        assert!(tier2_evidence(false, false, true, false));
+        assert!(!tier2_evidence(
+            AckEvidence::Receipt,
+            true,
+            false,
+            false,
+            false
+        ));
+        assert!(tier2_evidence(
+            AckEvidence::Receipt,
+            true,
+            true,
+            false,
+            false
+        ));
+        assert!(tier2_evidence(
+            AckEvidence::Receipt,
+            false,
+            false,
+            true,
+            false
+        ));
         // Output activity is no longer evidence on its own: %output names
         // a pane and its bytes, never the process that wrote them, so a
         // replacement occupant's noise could otherwise resolve a delivery
         // it never received. It survives as a cue to look.
-        assert!(!tier2_evidence(false, false, false, true));
+        assert!(!tier2_evidence(
+            AckEvidence::Receipt,
+            false,
+            false,
+            false,
+            true
+        ));
         // Marker gone but nothing else moved: not evidence.
-        assert!(!tier2_evidence(false, true, false, false));
+        assert!(!tier2_evidence(
+            AckEvidence::Receipt,
+            false,
+            true,
+            false,
+            false
+        ));
+        assert!(
+            !tier2_evidence(AckEvidence::Dispatch, true, true, true, true),
+            "a dispatch candidate needs exact visual acceptance"
+        );
+    }
+
+    #[test]
+    fn working_evidence_must_follow_submit_for_the_exact_session_and_binding() {
+        let handle = DeliveryHandle::new("m-state-evidence", "worker", "%1", 3, "payload".into());
+        let agent = crate::identity::ProcId {
+            pid: 4242,
+            birth: 818_221,
+        };
+        *handle.submitted_agent.lock().unwrap() = Some(agent);
+        *handle.submitted_manifest.lock().unwrap() = Some("fix".into());
+        handle.submitted_at_ms.store(1_000, Ordering::SeqCst);
+
+        let event =
+            |session_idx: usize, observed_at_ms: u64, source_birth: u64, confirmed: bool| {
+                Ok(Event {
+                    event: "state".into(),
+                    data: json!({
+                        "pane_id": "%1",
+                        "session_idx": session_idx,
+                        "state": "working",
+                        "source_pid": 4242,
+                        "source_birth": source_birth,
+                        "source_manifest": "fix",
+                        "observed_at_ms": observed_at_ms,
+                        "working_confirmed": confirmed,
+                    }),
+                    seq: None,
+                })
+            };
+
+        assert!(!track_state_event(
+            &event(3, 999, agent.birth, true),
+            &handle
+        ));
+        assert!(!track_state_event(
+            &event(2, 1_000, agent.birth, true),
+            &handle
+        ));
+        assert!(!track_state_event(
+            &event(3, 1_000, agent.birth + 1, true),
+            &handle
+        ));
+        assert!(!track_state_event(
+            &event(3, 1_000, agent.birth, false),
+            &handle
+        ));
+        assert!(track_state_event(
+            &event(3, 1_000, agent.birth, true),
+            &handle
+        ));
     }
 
     #[test]
@@ -7171,6 +11622,112 @@ composer_trailer_required_prefix = 1
         assert_eq!(
             checkpoint_step(Evidence::Confirmed, true),
             CheckpointStep::Deliver
+        );
+    }
+
+    #[test]
+    fn receipt_refresh_freezes_only_for_unobservable_safety_facts() {
+        let detection = |state, stale, write_block: Option<&str>| Detection {
+            state,
+            readings: Vec::new(),
+            disagreement: false,
+            decided_by: "test".into(),
+            stale,
+            write_ready: write_block.is_none(),
+            write_block: write_block.map(str::to_string),
+            composer_semantic: None,
+        };
+        let clean = detection(AgentState::Idle, false, None);
+        let stale = detection(AgentState::Idle, true, Some("stale_screen_evidence"));
+        let mode = detection(AgentState::Idle, false, Some("pane_in_mode"));
+        let unprovable = detection(AgentState::Idle, false, Some("occupant_unprovable"));
+        let human_draft = detection(AgentState::IdleWithInput, false, Some("not_idle"));
+        let dead = detection(AgentState::Dead, false, Some("not_idle"));
+
+        assert_eq!(
+            receipt_refresh_step(false, Some(&clean), false),
+            ReceiptRefresh::Freeze
+        );
+        assert_eq!(
+            receipt_refresh_step(true, None, false),
+            ReceiptRefresh::Rebound,
+            "a live watcher with no submitted pane is a rebound"
+        );
+        for frozen in [&stale, &mode, &unprovable] {
+            assert_eq!(
+                receipt_refresh_step(true, Some(frozen), false),
+                ReceiptRefresh::Freeze
+            );
+        }
+        assert_eq!(
+            receipt_refresh_step(true, Some(&human_draft), false),
+            ReceiptRefresh::Observe,
+            "observable input must not stop the receipt clock"
+        );
+        assert_eq!(
+            receipt_refresh_step(true, Some(&dead), false),
+            ReceiptRefresh::Rebound
+        );
+        assert_eq!(
+            receipt_refresh_step(false, None, true),
+            ReceiptRefresh::Resolved,
+            "a receipt committed during refresh wins over transport loss"
+        );
+    }
+
+    #[test]
+    fn pane_change_rechecks_and_resumes_a_frozen_receipt_clock() {
+        let row = |dead| cyclops_tmux::PaneRow {
+            pane_id: "%1".into(),
+            window_id: "@1".into(),
+            window_name: "test".into(),
+            title: "test".into(),
+            dead,
+            in_mode: false,
+            current_command: "agent".into(),
+            width: 80,
+            height: 24,
+            active: true,
+            pane_pid: 41,
+        };
+        let changed = Ok(PaneEvent::PaneChanged {
+            id: "%1".into(),
+            changed: Vec::new(),
+            row: row(false),
+        });
+        let dead = Ok(PaneEvent::PaneChanged {
+            id: "%1".into(),
+            changed: Vec::new(),
+            row: row(true),
+        });
+        let output = Ok(PaneEvent::OutputActivity {
+            pane_id: "%1".into(),
+            ts: 1,
+        });
+
+        assert_eq!(
+            receipt_pane_step(&changed, "%1", true),
+            ReceiptPaneStep::Recheck
+        );
+        assert_eq!(
+            receipt_pane_step(&changed, "%1", false),
+            ReceiptPaneStep::Recheck
+        );
+        assert_eq!(
+            receipt_pane_step(&dead, "%1", true),
+            ReceiptPaneStep::Rebound
+        );
+        assert_eq!(
+            receipt_pane_step(&output, "%1", true),
+            ReceiptPaneStep::Recheck
+        );
+        assert_eq!(
+            receipt_pane_step(&output, "%1", false),
+            ReceiptPaneStep::Ignore
+        );
+        assert_eq!(
+            receipt_pane_step(&Ok(PaneEvent::Disconnected), "%1", true),
+            ReceiptPaneStep::Freeze
         );
     }
 
@@ -7754,9 +12311,9 @@ composer_trailer_required_prefix = 1
             "exact doorbell in composer must verify"
         );
         assert_eq!(
-            staged_verified_target(&m, &screen, StagingTarget::ExactRow(&doorbell)),
-            Some(true),
-            "target helper must return true for exact row staging"
+            staged_representation(&m, &screen, StagingTarget::ExactRow(&doorbell)),
+            Some(StagedRepresentation::VisibleTarget),
+            "target helper must identify visible exact-row staging"
         );
     }
 
@@ -7789,6 +12346,29 @@ composer_trailer_required_prefix = 1
     }
 
     #[test]
+    fn tier2_refuses_while_the_exact_doorbell_row_remains() {
+        let manifest = sentinel_manifest();
+        let msg_id = MessageId::new("m-3f9c2a").unwrap();
+        let doorbell = cyclops_proto::render_doorbell_v1(&msg_id);
+        let changed_chrome = format!(
+            "\u{1b}[39m❯ {doorbell}\n\u{1b}[90m────────\n\u{1b}[38;5;152mModel y · Ctx: 77%"
+        );
+
+        let still_present = staging_target_still_present(
+            &manifest,
+            &changed_chrome,
+            StagingTarget::ExactRow(&doorbell),
+        );
+        assert!(still_present);
+        let confirmed =
+            !still_present && tier2_evidence(AckEvidence::Receipt, true, true, false, false);
+        assert!(
+            !confirmed,
+            "changed chrome cannot turn a staged doorbell into a receipt"
+        );
+    }
+
+    #[test]
     fn application_wrapped_exact_row_remains_unverified() {
         let m = sentinel_manifest();
         let msg_id = MessageId::new("m-0123456789abcdef0123456789abcdef")
@@ -7808,13 +12388,13 @@ composer_trailer_required_prefix = 1
             "application line breaks are not exact bytes and must fail closed"
         );
         assert_eq!(
-            staged_verified_target(&m, &screen, StagingTarget::ExactRow(&doorbell)),
+            staged_representation(&m, &screen, StagingTarget::ExactRow(&doorbell)),
             None
         );
     }
 
     #[test]
-    fn staged_verified_target_accepts_collapsed_chip_for_exact_row() {
+    fn collapsed_chip_is_representation_evidence_but_never_exact_ownership() {
         let m = claude();
         let staged = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -7824,9 +12404,49 @@ composer_trailer_required_prefix = 1
         let doorbell = cyclops_proto::render_doorbell_v1(&msg_id);
 
         assert_eq!(
-            staged_verified_target(&m, staged, StagingTarget::ExactRow(&doorbell)),
-            Some(false),
-            "collapsed chip must verify as alternate staging without raw text"
+            staged_representation(&m, staged, StagingTarget::ExactRow(&doorbell)),
+            Some(StagedRepresentation::CollapsedChip),
+            "the manifest still recognizes the vendor's staged representation"
+        );
+        assert_eq!(
+            exact_composer_content_from_joined_capture(&m, staged),
+            ComposerContentProof::Hidden
+        );
+        assert!(
+            exact_staging_proof(&m, staged, StagingTarget::ExactRow(&doorbell), &doorbell)
+                .is_none(),
+            "hidden bytes cannot authorize a submit key"
+        );
+    }
+
+    #[tokio::test]
+    async fn collapsed_chip_stops_the_delivery_before_submit() {
+        let manifest = claude();
+        let staged = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cyclops-manifest/tests/fixtures/claude_pasted_chip_esc.txt"
+        ));
+        let handle = DeliveryHandle::new("m-chip-no-submit", "claude", "%1", 0, String::new());
+        let message_id = MessageId::new(&handle.msg_id).expect("valid message id");
+        let doorbell = cyclops_proto::render_doorbell_v1(&message_id);
+        let injector = MockInjector::new(vec![staged]);
+        injector.spool(&doorbell).await.expect("spool");
+
+        let result = inject(
+            &injector,
+            &handle,
+            &manifest,
+            StagingTarget::ExactRow(&doorbell),
+            &doorbell,
+            &|| Ok(()),
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err(), "verify_failed");
+        assert_eq!(injector.pasted.lock().unwrap().as_slice(), &[doorbell]);
+        assert!(
+            injector.submitted_is_empty(),
+            "representation evidence must not reach the submit key"
         );
     }
 
@@ -7868,7 +12488,7 @@ composer_trailer_required_prefix = 1
             "separate human draft row before doorbell must refuse"
         );
         assert_eq!(
-            staged_verified_target(&m, &screen_draft_above, StagingTarget::ExactRow(&doorbell)),
+            staged_representation(&m, &screen_draft_above, StagingTarget::ExactRow(&doorbell)),
             None,
             "adversarial draft above doorbell must return None"
         );
@@ -7932,7 +12552,7 @@ composer_trailer_required_prefix = 1
             "modal dialog blocking composer must refuse staging verification"
         );
         assert_eq!(
-            staged_verified_target(&m, &screen_modal, StagingTarget::ExactRow(&doorbell)),
+            staged_representation(&m, &screen_modal, StagingTarget::ExactRow(&doorbell)),
             None
         );
     }
@@ -7951,6 +12571,7 @@ composer_trailer_required_prefix = 1
             &handle,
             &m,
             StagingTarget::ExactRow(&doorbell),
+            &doorbell,
             &|| Ok(()),
         )
         .await
@@ -7967,29 +12588,23 @@ composer_trailer_required_prefix = 1
         let doorbell = cyclops_proto::render_doorbell_v1(&msg_id);
 
         let initial_screen = format!("\u{1b}[39m❯ {doorbell}\n{CHROME}");
-        let initial_staged =
-            staged_verified_target(&m, &initial_screen, StagingTarget::ExactRow(&doorbell));
-        let initial_proof =
-            payload_proof_target(&m, &initial_screen, StagingTarget::ExactRow(&doorbell));
-
-        assert_eq!(initial_staged, Some(true));
-        assert!(
-            initial_proof
-                .as_deref()
-                .map(|p| p.contains(&doorbell))
-                .unwrap_or(false),
-            "initial proof must contain doorbell"
-        );
+        let initial = exact_staging_proof(
+            &m,
+            &initial_screen,
+            StagingTarget::ExactRow(&doorbell),
+            &doorbell,
+        )
+        .expect("initial exact proof");
 
         // Case 1: Human typed additional text after the doorbell before Enter is sent
         let changed_after = format!("\u{1b}[39m❯ {doorbell} append edit\n{CHROME}");
-        let recheck_staged =
-            staged_verified_target(&m, &changed_after, StagingTarget::ExactRow(&doorbell));
-        let recheck_proof =
-            payload_proof_target(&m, &changed_after, StagingTarget::ExactRow(&doorbell));
-
-        let would_submit = recheck_proof.as_deref() == initial_proof.as_deref()
-            && recheck_staged == initial_staged;
+        let recheck = exact_staging_proof(
+            &m,
+            &changed_after,
+            StagingTarget::ExactRow(&doorbell),
+            &doorbell,
+        );
+        let would_submit = recheck.as_ref() == Some(&initial);
         assert!(
             !would_submit,
             "recheck must detect changed text after doorbell and withhold enter"
@@ -7997,17 +12612,53 @@ composer_trailer_required_prefix = 1
 
         // Case 2: Human inserted a draft row above the doorbell before Enter is sent
         let changed_above = format!("\u{1b}[39m❯ draft line\n{doorbell}\n{CHROME}");
-        let recheck_above_staged =
-            staged_verified_target(&m, &changed_above, StagingTarget::ExactRow(&doorbell));
-        let recheck_above_proof =
-            payload_proof_target(&m, &changed_above, StagingTarget::ExactRow(&doorbell));
-
-        let would_submit_above = recheck_above_proof.as_deref() == initial_proof.as_deref()
-            && recheck_above_staged == initial_staged;
+        let recheck_above = exact_staging_proof(
+            &m,
+            &changed_above,
+            StagingTarget::ExactRow(&doorbell),
+            &doorbell,
+        );
+        let would_submit_above = recheck_above.as_ref() == Some(&initial);
         assert!(
             !would_submit_above,
             "recheck must detect draft row above doorbell and withhold enter"
         );
+    }
+
+    #[test]
+    fn submit_binding_rejects_reused_pid_generations() {
+        let proven = fusion::Binding {
+            pane_root: crate::identity::ProcId { pid: 39, birth: 79 },
+            leader: crate::identity::ProcId { pid: 40, birth: 80 },
+            agent: crate::identity::ProcId { pid: 41, birth: 81 },
+            manifest: "claude".to_string(),
+        };
+        assert!(binding_is_exact(Some(&proven), &proven));
+
+        let reused_pane_root = fusion::Binding {
+            pane_root: crate::identity::ProcId { pid: 39, birth: 80 },
+            ..proven.clone()
+        };
+        assert!(!binding_is_exact(Some(&reused_pane_root), &proven));
+
+        let reused_leader = fusion::Binding {
+            leader: crate::identity::ProcId { pid: 40, birth: 82 },
+            ..proven.clone()
+        };
+        assert!(!binding_is_exact(Some(&reused_leader), &proven));
+
+        let replaced_agent = fusion::Binding {
+            agent: crate::identity::ProcId { pid: 41, birth: 83 },
+            ..proven.clone()
+        };
+        assert!(!binding_is_exact(Some(&replaced_agent), &proven));
+
+        let replaced_manifest = fusion::Binding {
+            manifest: "codex".to_string(),
+            ..proven.clone()
+        };
+        assert!(!binding_is_exact(Some(&replaced_manifest), &proven));
+        assert!(!binding_is_exact(None, &proven));
     }
 }
 
@@ -8098,6 +12749,158 @@ mod composer_content_proof {
     }
 
     #[test]
+    fn current_raw_claude_capture_is_safe_to_submit() {
+        let capture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cyclops-manifest/tests/fixtures/claude_raw_composer_2_1_239_esc.txt"
+        ));
+        assert!(sentinel_verified(
+            &shipped("claude"),
+            capture,
+            "m-wrapprobe"
+        ));
+    }
+
+    #[test]
+    fn claude_current_fable_empty_composer_is_visible_across_box_palette() {
+        let capture = concat!(
+            "\u{1b}[38;5;244m────────────────────────────────────────────────\n",
+            "\u{1b}[39m❯\u{a0}                                                \n",
+            "\u{1b}[38;5;244m────────────────────────────────────────────────\n",
+            "\u{1b}[39m  \u{1b}[38;5;174mFable 5\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;216mxhigh\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;230m~/projects/agentic_dev/clops\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;72mCtx: 58%\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;181m5h: 94%\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;181m7d: 75%\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;180m1000K window\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;180m423K used\n",
+            "\u{1b}[39m  \u{1b}[38;5;210m⏵⏵ bypass permissions on\u{1b}[38;5;246m (shift+tab to cycle) · ← 1 agent",
+        );
+
+        for capture in [
+            capture.to_string(),
+            capture.replace("\u{1b}[38;5;244m─", "\u{1b}[38;5;116m─"),
+        ] {
+            assert_eq!(
+                composer_content_for_projection_from_joined_capture(&shipped("claude"), &capture),
+                ComposerContentProof::Visible(String::new())
+            );
+
+            let unexpected = format!("{capture}\nunexpected text");
+            assert_eq!(
+                composer_content_for_projection_from_joined_capture(
+                    &shipped("claude"),
+                    &unexpected,
+                ),
+                ComposerContentProof::Unprovable
+            );
+        }
+    }
+
+    #[test]
+    fn claude_2_1_243_no_color_visible_sentinel_uses_structural_proof() {
+        let capture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cyclops-manifest/tests/fixtures/claude_staged_no_color_2_1_243.txt"
+        ));
+        let manifest = shipped("claude");
+        assert!(
+            !capture.contains('\u{1b}'),
+            "fixture unexpectedly contains SGR"
+        );
+        assert_eq!(
+            staged_representation(&manifest, capture, StagingTarget::Sentinel("m-no-color")),
+            Some(StagedRepresentation::VisibleTarget)
+        );
+
+        let doorbell_id = MessageId::new("m-no-color").expect("valid message id");
+        let doorbell = cyclops_proto::render_doorbell_v1(&doorbell_id);
+        let doorbell_capture = format!(
+            "❯\u{a0}{doorbell}\n\
+             ────────────────────────────────────────────────────────────────\n\
+               Haiku 4.5 · low · ~ · Ctx: 76% · 200K window · 47K used\n\
+               ⏵⏵ bypass permissions on (shift+tab to cycle)"
+        );
+        assert_eq!(
+            staged_representation(
+                &manifest,
+                &doorbell_capture,
+                StagingTarget::ExactRow(&doorbell)
+            ),
+            Some(StagedRepresentation::VisibleTarget)
+        );
+        assert_eq!(
+            exact_composer_content_from_joined_capture(&manifest, &doorbell_capture),
+            ComposerContentProof::Visible(doorbell.clone())
+        );
+
+        let doorbell_after_echo = format!(
+            "❯\u{a0}previous submitted prompt\n\
+             prior answer\n\
+             {doorbell_capture}"
+        );
+        assert_eq!(
+            staged_representation(
+                &manifest,
+                &doorbell_after_echo,
+                StagingTarget::ExactRow(&doorbell)
+            ),
+            Some(StagedRepresentation::VisibleTarget)
+        );
+        assert_eq!(
+            exact_composer_content_from_joined_capture(&manifest, &doorbell_after_echo),
+            ComposerContentProof::Visible(doorbell)
+        );
+
+        for invalid in [
+            capture.replace(
+                "  [cyclops:end m-no-color]\n",
+                "  [cyclops:end m-no-color]\n  typed after the sentinel\n",
+            ),
+            capture.replace(
+                "  [cyclops:end m-no-color]",
+                "  [cyclops:end m-no-color] trailing",
+            ),
+            capture.replace(
+                "  [cyclops:end m-no-color]\n",
+                "  [cyclops:end m-no-color]\n  [cyclops:end m-no-color]\n",
+            ),
+            capture.replace(
+                "  [cyclops:end m-no-color]\n",
+                concat!(
+                    "  [cyclops:end m-no-color]\n",
+                    "────────────────────────────────────────────────────────────────\n",
+                    "❯\u{a0}\n",
+                ),
+            ),
+        ] {
+            assert!(!sentinel_verified(&manifest, &invalid, "m-no-color"));
+        }
+    }
+
+    #[test]
+    fn no_color_trailer_does_not_hide_content_after_the_sentinel() {
+        let capture = concat!(
+            "❯\u{a0}[cyclops m-no-color] FROM: cyclopsd  SUBJECT: hook self-test\n",
+            "  [cyclops:end m-no-color]\n",
+            "  typed after the sentinel\n",
+            "────────────────────────────────────────────────────────────────\n",
+            "  Sonnet 5 · xhigh · ~ · 5h: 98% · 7d: 91% · 1000K window\n",
+        );
+        assert!(!sentinel_verified(
+            &shipped("claude"),
+            capture,
+            "m-no-color"
+        ));
+
+        let forged_boundary = concat!(
+            "❯\u{a0}[cyclops m-no-color] FROM: cyclopsd  SUBJECT: hook self-test\n",
+            "  [cyclops:end m-no-color]\n",
+            "  ──────────────────────────────────────────────────────────────\n",
+            "  Sonnet 5 · xhigh · ~ · 5h: 98% · 7d: 91% · 1000K window\n",
+        );
+        assert!(!sentinel_verified(
+            &shipped("claude"),
+            forged_boundary,
+            "m-no-color"
+        ));
+    }
+
+    #[test]
     fn joined_capture_preserves_payload_trailing_spaces() {
         let expected = render_payload("m-space", "test", "spaces", "body", true);
         let edited_capture = claude_capture(&expected).replace(
@@ -8116,6 +12919,43 @@ mod composer_content_proof {
             composer_content_from_joined_capture(&shipped("claude"), &edited_sentinel, "m-space"),
             ComposerContentProof::Unprovable
         );
+    }
+
+    #[test]
+    fn direct_staging_requires_the_reconstructed_payload_bytes() {
+        let manifest = shipped("claude");
+        let expected = render_payload("m-exact", "test", "subject", "body", true);
+        let exact = claude_capture(&expected);
+        assert_eq!(
+            exact_staging_proof(
+                &manifest,
+                &exact,
+                StagingTarget::Sentinel("m-exact"),
+                &expected,
+            ),
+            Some((true, expected.clone()))
+        );
+
+        let prefixed = exact.replace(
+            "  body\n  [cyclops:end m-exact]",
+            "  human draft\n  body\n  [cyclops:end m-exact]",
+        );
+        assert!(exact_staging_proof(
+            &manifest,
+            &prefixed,
+            StagingTarget::Sentinel("m-exact"),
+            &expected,
+        )
+        .is_none());
+
+        let trailing = exact.replace("  [cyclops:end m-exact]\n", "  [cyclops:end m-exact] \n");
+        assert!(exact_staging_proof(
+            &manifest,
+            &trailing,
+            StagingTarget::Sentinel("m-exact"),
+            &expected,
+        )
+        .is_none());
     }
 
     #[test]
@@ -8159,7 +12999,7 @@ mod composer_content_proof {
     }
 
     #[test]
-    fn transcript_echoes_and_multiple_matching_headers_refuse() {
+    fn terminal_composer_wins_over_a_prior_transcript_echo() {
         let expected = render_payload("m-echo", "test", "current", "new body", true);
         let active = claude_capture(&expected);
         let echoed = format!(
@@ -8167,8 +13007,8 @@ mod composer_content_proof {
         );
         assert_eq!(
             composer_content_from_joined_capture(&shipped("claude"), &echoed, "m-echo"),
-            ComposerContentProof::Unprovable,
-            "two same-id headers are ambiguous even when one resembles a transcript"
+            ComposerContentProof::Visible(expected),
+            "the unique terminal trailer must bind the active composer"
         );
 
         let empty_composer = format!(

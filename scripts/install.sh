@@ -16,7 +16,8 @@
 #
 # What it will and will not do: it never uses sudo, never touches your
 # tmux config, and never edits a shell profile without printing the exact
-# lines and where the backup went. Everything it writes is under your home.
+# lines and where the backup went. Binaries go to the selected prefix;
+# state and installed-agent integration stay under your home.
 #
 # POSIX sh on purpose. It runs before cyclops exists on the machine, so it
 # cannot assume anything more than the system shell.
@@ -54,6 +55,15 @@ step() { printf '\n%s==%s %s\n' "$DIM" "$OFF" "$*"; }
 # installer that says "failed" and stops is where a first run dies.
 die() {
     printf '\n%sinstall failed:%s %s\n' "$BOLD" "$OFF" "$1" >&2
+    [ $# -gt 1 ] && printf '  %s\n' "$2" >&2
+    exit 1
+}
+
+# Pair activation is a commit point. Anything that fails after it must say
+# what remains installed and how to finish, rather than implying no install
+# landed.
+incomplete() {
+    printf '\n%sinstall committed; setup incomplete:%s %s\n' "$BOLD" "$OFF" "$1" >&2
     [ $# -gt 1 ] && printf '  %s\n' "$2" >&2
     exit 1
 }
@@ -176,41 +186,74 @@ strip_block() {
 do_uninstall() {
     step "removing cyclops"
 
-    # Stop a running daemon while the binary still exists to ask it to.
-    # Deleting the binaries out from under live processes is how "I
-    # removed it but still see it" happens: the daemon and any open
-    # workspace keep running their deleted copies until they exit.
-    stopper="$(command -v cyclops 2>/dev/null || true)"
-    [ -n "$PREFIX" ] && [ -f "$PREFIX/cyclops" ] && stopper="$PREFIX/cyclops"
-    if [ -n "$stopper" ] && [ -x "$stopper" ]; then
-        if "$stopper" daemon stop >/dev/null 2>&1; then
-            note "stopped the daemon"
-        fi
+    # Establish one prefix from the explicit argument or the selected client.
+    # The client validates both public names and stops only a daemon reporting
+    # that exact selected executable before this shell removes anything.
+    if [ -n "$PREFIX" ]; then
+        pair_prefix="$PREFIX"
+    else
+        stopper="$(command -v cyclops 2>/dev/null || true)"
+        pair_prefix=""
+        [ -n "$stopper" ] && pair_prefix="$(dirname "$stopper")"
+    fi
+    if [ -z "$pair_prefix" ] && [ -n "$(command -v cyclopsd 2>/dev/null || true)" ]; then
+        say "cannot identify one Cyclops install prefix because cyclops is not on PATH"
+        say "nothing was removed; rerun with --prefix DIR naming the install to remove"
+        exit 1
+    fi
+    if [ -z "$pair_prefix" ]; then
+        note "no Cyclops installation found on PATH; nothing was removed"
+        exit 0
+    fi
+    pair_prefix="$(CDPATH= cd "$pair_prefix" 2>/dev/null && pwd -P)" || {
+        say "cannot resolve the selected Cyclops install prefix"
+        say "nothing was removed"
+        exit 1
+    }
+    stopper="$pair_prefix/cyclops"
+    pair_root="$pair_prefix/.cyclops-pairs"
+    if [ -z "$stopper" ] || [ ! -x "$stopper" ]; then
+        say "cannot validate $pair_prefix without its installed cyclops binary"
+        say "nothing was removed"
+        exit 1
+    fi
+    had_pair_root=0
+    { [ -e "$pair_root" ] || [ -L "$pair_root" ]; } && had_pair_root=1
+    if ! "$stopper" update --remove-pair-store --prefix "$pair_prefix"; then
+        say "refused to validate and stop the selected installation; nothing was removed"
+        exit 1
+    fi
+    note "validated $pair_prefix and stopped its daemon if it was running"
+    if [ "$had_pair_root" -eq 1 ]; then
+        note "removed $pair_root"
     fi
 
     removed=0
     for name in cyclops cyclopsd; do
-        # An explicit --prefix wins; otherwise take whatever the shell
-        # actually resolves, which is the copy that has been running.
-        if [ -n "$PREFIX" ]; then
-            bin="$PREFIX/$name"
-        else
-            bin="$(command -v "$name" 2>/dev/null || true)"
-        fi
-        if [ -n "$bin" ] && [ -f "$bin" ]; then
+        # Both public names come from the one prefix established by cyclops.
+        # Resolving cyclopsd independently could delete a shadow installation.
+        bin=""
+        [ -n "$pair_prefix" ] && bin="$pair_prefix/$name"
+        if [ -n "$bin" ] && { [ -f "$bin" ] || [ -L "$bin" ]; }; then
             rm -f "$bin"
             note "removed $bin"
             removed=$((removed + 1))
         fi
     done
-    [ "$removed" -eq 0 ] && note "no cyclops binaries found on PATH"
+    if [ "$removed" -eq 0 ]; then
+        if [ -n "$pair_prefix" ]; then
+            note "no Cyclops binaries found in $pair_prefix"
+        else
+            note "no Cyclops installation found on PATH"
+        fi
+    fi
 
     strip_block "$(profile_for_shell)"
 
     say ""
     say "${BOLD}✔ cyclops is uninstalled${OFF}"
     note "your record and config are untouched at ${CYCLOPS_HOME:-$HOME/.cyclops}"
-    note "remove those too with: rm -rf ${CYCLOPS_HOME:-$HOME/.cyclops}"
+    note "inspect that state root and remove it yourself only when you no longer need the record"
     exit 0
 }
 
@@ -282,12 +325,18 @@ case "$0" in
 esac
 
 CLONED=""
+PAIR_SOURCE=""
+cleanup() {
+    [ -z "$PAIR_SOURCE" ] || rm -rf "$PAIR_SOURCE"
+    [ -z "$CLONED" ] || rm -rf "$CLONED"
+}
+trap cleanup EXIT INT TERM
+
 if [ -z "$SRC" ]; then
     have git || die "git is not installed, and there is no clone to build from" \
         "install git, or clone the repo and run ./scripts/install.sh inside it"
     step "fetching the source"
     CLONED="$(mktemp -d "${TMPDIR:-/tmp}/cyclops-install.XXXXXX")"
-    trap 'rm -rf "$CLONED"' EXIT INT TERM
     git clone --depth 1 --branch "$REF" "$REPO_URL" "$CLONED/cyclops" >/dev/null 2>&1 ||
         die "could not clone $REPO_URL at $REF" "check the network, or set CYCLOPS_REF to a branch that exists"
     SRC="$CLONED/cyclops"
@@ -318,6 +367,19 @@ for name in cyclops cyclopsd; do
     [ -x "$TARGET/$name" ] || die "the build finished but $TARGET/$name is missing"
 done
 
+# Cargo may hard-link a top-level binary to its hashed build artifact. Copy
+# both binaries into one private directory so the validator executes and
+# stages the same unlinked candidate pair.
+PAIR_SOURCE="$(mktemp -d "${TMPDIR:-/tmp}/cyclops-pair.XXXXXX")" ||
+    die "cannot create a private candidate directory"
+chmod 700 "$PAIR_SOURCE" || die "cannot secure the private candidate directory"
+for name in cyclops cyclopsd; do
+    cp "$TARGET/$name" "$PAIR_SOURCE/$name" ||
+        die "cannot copy $name into the private candidate directory"
+    chmod 755 "$PAIR_SOURCE/$name" ||
+        die "cannot make the private $name candidate executable"
+done
+
 # ---------------------------------------------------------------------------
 # 4. install the binaries
 # ---------------------------------------------------------------------------
@@ -331,14 +393,12 @@ mkdir -p "$PREFIX" 2>/dev/null ||
     die "$PREFIX is not writable, and this installer never uses sudo" \
         "pick a directory you own: ./scripts/install.sh --prefix ~/.local/bin"
 
-for name in cyclops cyclopsd; do
-    # Copy beside the target and rename over it. Overwriting a running
-    # binary in place fails with "text file busy"; a rename never does.
-    cp "$TARGET/$name" "$PREFIX/$name.new"
-    chmod +x "$PREFIX/$name.new"
-    mv -f "$PREFIX/$name.new" "$PREFIX/$name"
-    note "$PREFIX/$name"
-done
+# The candidate owns pair validation, journal replay, daemon quiescence, and
+# the one selector change. The shell never publishes two binaries separately.
+"$PAIR_SOURCE/cyclops" update --install-pair "$PAIR_SOURCE" --prefix "$PREFIX" ||
+    die "the matched binary pair could not be activated" "the output above names the proof that failed"
+note "$PREFIX/cyclops"
+note "$PREFIX/cyclopsd"
 
 # ---------------------------------------------------------------------------
 # 5. PATH
@@ -379,19 +439,31 @@ else
         note "$PROFILE already has the cyclops block"
     else
         step "adding $PREFIX to your PATH"
-        mkdir -p "$(dirname "$PROFILE")"
+        if ! mkdir -p "$(dirname "$PROFILE")"; then
+            incomplete "cannot create the shell profile directory" \
+                "the matched pair remains at $PREFIX; add this PATH line manually: $(path_line "$PREFIX")"
+        fi
         if [ -f "$PROFILE" ]; then
             backup="$PROFILE.cyclops-backup.$(date +%Y%m%d%H%M%S)"
-            cp -p "$PROFILE" "$backup"
+            if ! cp -p "$PROFILE" "$backup"; then
+                incomplete "cannot back up $PROFILE" \
+                    "the matched pair remains at $PREFIX; add this PATH line manually: $(path_line "$PREFIX")"
+            fi
         else
             backup=""
-            : > "$PROFILE"
+            if ! : > "$PROFILE"; then
+                incomplete "cannot create $PROFILE" \
+                    "the matched pair remains at $PREFIX; add this PATH line manually: $(path_line "$PREFIX")"
+            fi
         fi
-        {
+        if ! {
             printf '\n%s\n' "$MARK_START"
             path_line "$PREFIX"
             printf '%s\n' "$MARK_END"
-        } >> "$PROFILE"
+        } >> "$PROFILE"; then
+            incomplete "cannot write the PATH block to $PROFILE" \
+                "the matched pair remains at $PREFIX; restore the printed backup if needed, then add: $(path_line "$PREFIX")"
+        fi
         PATH_STATE=reload
 
         say "  three lines added to $PROFILE:"
@@ -430,15 +502,34 @@ fi
 # asked for an install, and it merges around what is already there. Set
 # CYCLOPS_NO_VENDOR_HOOKS=1 to install without it.
 step "setting up ${CYCLOPS_HOME:-$HOME/.cyclops}"
-"$PREFIX/cyclops" start --setup-only --wire-hooks ||
-    die "could not set up ${CYCLOPS_HOME:-$HOME/.cyclops}" "the output above says which file"
+if ! "$PREFIX/cyclops" start --setup-only --wire-hooks; then
+    if [ "${CYCLOPS_UPDATE_DRIVER:-}" = 1 ]; then
+        say ""
+        say "${BOLD}! binary update committed; home setup still needs repair${OFF}"
+        note "the active matched pair remains installed"
+        note "repair: $PREFIX/cyclops start --setup-only --wire-hooks"
+    else
+        incomplete "home setup did not finish" \
+            "repair it with: $PREFIX/cyclops start --setup-only --wire-hooks"
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # 7. prove it works
 # ---------------------------------------------------------------------------
 
 version="$("$PREFIX/cyclops" --version 2>/dev/null || true)"
-[ -n "$version" ] || die "$PREFIX/cyclops does not run" "try running it directly to see the error"
+if [ -z "$version" ]; then
+    if [ "${CYCLOPS_UPDATE_DRIVER:-}" = 1 ]; then
+        say ""
+        say "${BOLD}! binary update committed; installed CLI proof needs repair${OFF}"
+        note "the active matched pair remains installed at $PREFIX"
+        note "inspect: $PREFIX/cyclops --version"
+        exit 0
+    fi
+    incomplete "installed CLI proof failed at $PREFIX/cyclops" \
+        "the matched pair remains active; run $PREFIX/cyclops --version directly to inspect it"
+fi
 
 # What the shell resolves, which is the thing that actually matters. A
 # binary on disk that the shell cannot find is not installed.

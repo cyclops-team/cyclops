@@ -34,6 +34,58 @@ pub enum AgentState {
     Dead,
 }
 
+/// Meaning of the composer shape matched by one screen rule.
+///
+/// Runtime state and composer content are separate facts. Manifests assign
+/// this value only when vendor evidence supports the distinction. An absent
+/// value means the rule makes no composer claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerSemantic {
+    /// The composer is present and contains no staged input.
+    Clean,
+    /// The composer contains user-owned or otherwise unowned input.
+    HumanInput,
+    /// The visible text is a suggestion painted by the vendor.
+    GhostSuggestion,
+    /// The rule cannot distinguish two or more composer meanings.
+    Ambiguous,
+}
+
+/// Current content class of one terminal composer.
+///
+/// Runtime state remains separate. A pane can be runtime-idle while its
+/// composer contains a draft or a staged Cyclops notification.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerState {
+    ComposerClean,
+    HumanDraft,
+    VendorGhostSuggestion,
+    CyclopsNotificationStaged,
+    CyclopsNotificationSubmitted,
+    /// Current evidence cannot assign exact ownership safely.
+    #[default]
+    ComposerAmbiguous,
+}
+
+/// Strength of the evidence behind [`ComposerState`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerProof {
+    /// A vendor-measured manifest rule classified the visible composer.
+    ManifestRule,
+    /// Exact current composer bytes, durable attempt state, and every process
+    /// binding agree. A submitted notification uses positive visible-empty
+    /// composer proof rather than treating an unreadable composer as empty.
+    ExactNotification,
+    /// Positive evidence conflicts or names more than one possible owner.
+    Ambiguous,
+    /// Required content, manifest, or process evidence was unavailable.
+    #[default]
+    Unprovable,
+}
+
 impl AgentState {
     /// True for states that should raise operator attention.
     pub fn is_blocked(self) -> bool {
@@ -150,6 +202,10 @@ pub struct Detection {
     /// Why a write is refused, content-free, absent when it is allowed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_block: Option<String>,
+    /// Vendor-measured meaning of the current screen rule's composer shape.
+    /// None means the rule made no composer claim and never implies clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_semantic: Option<ComposerSemantic>,
 }
 
 /// What a pane's composer has proven since text was last seen staged in
@@ -265,7 +321,7 @@ impl ComposerHold {
         // before the start it belongs to.
         let _ = since_ms;
         let ended = ended.unwrap_or(det.state == AgentState::Idle);
-        if ended && det.screen_says_clean() {
+        if ended && det.screen_proves_write_safe_composer() {
             return ComposerHold::Clear;
         }
         self
@@ -361,14 +417,18 @@ impl Detection {
             .any(|r| r.sensor == Sensor::Hook && r.state == AgentState::Idle && r.ts >= since_ms)
     }
 
-    /// Did the sensor that can see a composer say, just now, that it is
-    /// clean?
+    /// Did the sensor that can see a composer prove, just now, that a write
+    /// cannot overwrite human input?
     ///
     /// The one definition of that evidence, used by the readiness rule
     /// and by the hold that releases on it. A title or a hook reports a
     /// turn boundary, which is a different fact.
-    pub fn screen_says_clean(&self) -> bool {
-        self.readings
+    pub fn screen_proves_write_safe_composer(&self) -> bool {
+        matches!(
+            self.composer_semantic,
+            Some(ComposerSemantic::Clean | ComposerSemantic::GhostSuggestion)
+        ) && self
+            .readings
             .iter()
             .any(|r| r.sensor == Sensor::Screen && r.state == AgentState::Idle)
     }
@@ -420,8 +480,8 @@ impl Detection {
         // now, that the composer is clean. A manifest that cannot produce
         // that reading cannot authorize a write; that is a gap in the
         // manifest, not a licence to guess.
-        if !self.screen_says_clean() {
-            return Err("no_clean_composer_evidence");
+        if !self.screen_proves_write_safe_composer() {
+            return Err("no_write_safe_composer_evidence");
         }
         let conflict = self.readings.iter().any(|r| {
             matches!(
@@ -455,6 +515,19 @@ mod tests {
             serde_json::from_str::<AgentState>("\"idle_with_input\"").unwrap(),
             AgentState::IdleWithInput
         );
+        for (semantic, name) in [
+            (ComposerSemantic::Clean, "clean"),
+            (ComposerSemantic::HumanInput, "human_input"),
+            (ComposerSemantic::GhostSuggestion, "ghost_suggestion"),
+            (ComposerSemantic::Ambiguous, "ambiguous"),
+        ] {
+            let encoded = serde_json::to_string(&semantic).unwrap();
+            assert_eq!(encoded, format!("\"{name}\""));
+            assert_eq!(
+                serde_json::from_str::<ComposerSemantic>(&encoded).unwrap(),
+                semantic
+            );
+        }
     }
 
     #[test]
@@ -499,6 +572,14 @@ mod write_ready_tests {
     }
 
     fn det(state: AgentState, readings: Vec<SensorReading>, disagreement: bool) -> Detection {
+        let composer_semantic = readings
+            .iter()
+            .find(|reading| reading.sensor == Sensor::Screen)
+            .and_then(|reading| match reading.state {
+                AgentState::Idle => Some(ComposerSemantic::Clean),
+                AgentState::IdleWithInput => Some(ComposerSemantic::HumanInput),
+                _ => None,
+            });
         Detection {
             state,
             readings,
@@ -507,6 +588,7 @@ mod write_ready_tests {
             stale: false,
             write_ready: false,
             write_block: None,
+            composer_semantic,
         }
     }
 
@@ -543,6 +625,16 @@ mod write_ready_tests {
         assert_eq!(d.base_write_ready(), Err("hook_derived_idle"));
     }
 
+    #[test]
+    fn title_idle_without_a_clean_screen_is_not_write_ready() {
+        let d = det(
+            AgentState::Idle,
+            vec![reading(Sensor::Title, AgentState::Idle)],
+            false,
+        );
+        assert_eq!(d.base_write_ready(), Err("no_write_safe_composer_evidence"));
+    }
+
     /// The reverse race: screen rules say idle while a live hook says
     /// working. Fusion records disagreement and keeps the rule verdict;
     /// a write must not ride on a contested verdict.
@@ -574,7 +666,7 @@ mod write_ready_tests {
     /// composer says it is empty, and nothing live contradicts it.
     #[test]
     fn positive_clean_screen_evidence_is_write_ready() {
-        let d = det(
+        let mut d = det(
             AgentState::Idle,
             vec![
                 reading(Sensor::Screen, AgentState::Idle),
@@ -582,7 +674,39 @@ mod write_ready_tests {
             ],
             false,
         );
+        d.composer_semantic = Some(ComposerSemantic::Clean);
         assert_eq!(d.base_write_ready(), Ok(()));
+    }
+
+    #[test]
+    fn only_explicit_write_safe_composer_semantics_admit_a_write() {
+        for semantic in [ComposerSemantic::Clean, ComposerSemantic::GhostSuggestion] {
+            let mut d = det(
+                AgentState::Idle,
+                vec![reading(Sensor::Screen, AgentState::Idle)],
+                false,
+            );
+            d.composer_semantic = Some(semantic);
+            assert_eq!(d.base_write_ready(), Ok(()), "{semantic:?}");
+        }
+
+        for semantic in [
+            None,
+            Some(ComposerSemantic::HumanInput),
+            Some(ComposerSemantic::Ambiguous),
+        ] {
+            let mut d = det(
+                AgentState::Idle,
+                vec![reading(Sensor::Screen, AgentState::Idle)],
+                false,
+            );
+            d.composer_semantic = semantic;
+            assert_eq!(
+                d.base_write_ready(),
+                Err("no_write_safe_composer_evidence"),
+                "{semantic:?}"
+            );
+        }
     }
 
     /// Fusion keeps the prior verdict when a forced capture fails, which
@@ -596,6 +720,7 @@ mod write_ready_tests {
             vec![reading(Sensor::Screen, AgentState::Idle)],
             false,
         );
+        d.composer_semantic = Some(ComposerSemantic::Clean);
         assert_eq!(d.base_write_ready(), Ok(()));
         d.stale = true;
         assert_eq!(d.base_write_ready(), Err("stale_screen_evidence"));
@@ -607,11 +732,12 @@ mod write_ready_tests {
     /// question differently from the gate.
     #[test]
     fn pane_mode_refuses_however_clean_the_screen_is() {
-        let clean = det(
+        let mut clean = det(
             AgentState::Idle,
             vec![reading(Sensor::Screen, AgentState::Idle)],
             false,
         );
+        clean.composer_semantic = Some(ComposerSemantic::Clean);
         assert_eq!(clean.base_write_ready(), Ok(()));
         let stamped = clean.clone().stamped(true, ComposerHold::Clear);
         assert!(!stamped.write_ready);

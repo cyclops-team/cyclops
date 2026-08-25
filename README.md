@@ -27,8 +27,12 @@ curl -fsSL https://www.usecyclops.dev/install.sh | sh
 ```
 
 That builds both binaries, puts them on your PATH, and writes the config.
-Budget a few minutes: it is a full release compile. It prints every file
-it touches, backs up any shell profile it edits, and never uses sudo.
+By default it also merges Cyclops hook entries into installed agent CLIs and
+places the Cyclops skill in their supported skill homes. Unrelated vendor
+settings are preserved and each vendor file is backed up before its first
+edit. Set `CYCLOPS_NO_VENDOR_HOOKS=1` to skip hook and skill wiring. Budget a
+few minutes: it is a full release compile. It prints every file it touches,
+backs up any shell profile it edits, and never uses sudo.
 To install from a clone instead:
 
 ```bash
@@ -36,7 +40,9 @@ git clone https://github.com/cyclops-team/cyclops.git && cd cyclops
 ./scripts/install.sh
 ```
 
-Later, `cyclops update` rebuilds from the latest source in place, and
+Later, `cyclops update` proves and activates a matched binary pair, and
+`cyclops update --rollback` can reactivate a replay-proven retained pair
+without reverting state. The
 `sh -s -- --uninstall` on the installer takes everything back off.
 Details, options, and troubleshooting: [installation guide](docs/guides/install.md).
 
@@ -61,15 +67,18 @@ shared way to address one another through durable mailboxes:
 
 The agent runs `cyclops send reviewer ...` from its own pane. The daemon
 resolves the sender from the calling process, accepts the message into the
-durable workspace mailbox, and queues a content-free wake for the reviewer.
-The reviewer claims the exact message before reading its body. You watch the
-handoff from the workspace instead of relaying it by hand.
+durable workspace mailbox, and queues a guarded pane notification. When setup
+reports `mailbox doorbell`, that notification is content-free and the reviewer
+claims the exact message before reading its body. If claim-skill proof is not
+current, Cyclops uses the visible full-payload compatibility path instead. You
+watch the handoff from the workspace instead of relaying it by hand.
 
 Your agents learn the verbs from one file:
 [skills/cyclops/SKILL.md](skills/cyclops/SKILL.md), which the installer
 places at the canonical skill destination for every installed supported
 consumer. Codex and Cursor share one copy under `~/.agents`; setup never
-creates duplicate vendor copies. Scripts use the same CLI with `--json`.
+creates duplicate vendor copies. Scripts use structured command forms with
+`--json`; `watch` emits NDJSON, while `update` and `daemon log` remain text.
 The commands you will actually type:
 
 | Command | What it does |
@@ -86,10 +95,12 @@ The commands you will actually type:
 | `cyclops history` | The message record, newest last |
 | `cyclops wait <agent> --until idle` | Block on an occupant-pinned pane state; does not prove task completion |
 | `cyclops watch` | Live admin, firehose, and Messages views |
-| `cyclops update` | Rebuild from the latest source; config and record untouched |
+| `cyclops update` | Prove and activate a matched pair; restart a running daemon and leave a stopped daemon stopped |
+| `cyclops update --rollback` | Reactivate a replay-proven retained pair without reverting state |
 
 Every command explains itself with `--help`. Daemon reads and direct
-mutations take `--json`. The guarded `alarm clear --older-than` form is
+mutations expose structured `--json` forms except `daemon log`. The guarded
+`alarm clear --older-than` form is
 interactive by design; scripts preview JSON and pass the returned exact ids
 to `alarm clear`. The two-agent review handoff, start to finish, is the
 [quickstart](docs/guides/QUICKSTART.md).

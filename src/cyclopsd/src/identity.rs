@@ -7,12 +7,13 @@
 //! 1. [`peer_of`] reads the kernel's (uid, pid) for the connected peer.
 //!    It only reports. The dispatch layer denies any peer whose uid is not
 //!    the daemon's uid; that check is the ACL, not this module.
-//! 2. [`resolve_sender`] walks the peer pid's process ancestry until a pid
-//!    equals the `pane_pid` of a watched pane. Labeled pane: the sender is
-//!    that agent. Unlabeled pane: the sender is the pane id. No pane in
-//!    the ancestry: the sender is Admin, because a same-uid shell outside
-//!    every watched pane is the human (COORDINATION: Admin may talk from
-//!    any shell).
+//! 2. [`resolve_peer_origin_observed`] walks the peer's current process
+//!    ancestry against exact watched pane-root generations. Mailbox callers
+//!    are agents only when that path crosses a supported vendor process
+//!    inside the current pane. A same-user shell with no vendor ancestor is
+//!    the workspace administrator, including a shell opened inside a watched
+//!    pane. A vendor outside every watched pane, a stale process generation,
+//!    or an ancestry that cannot be proven is denied.
 //!
 //! The walk is bounded (depth cap, visited set) and never blocks: one
 //! proc_pidinfo call (macOS) or one /proc read (Linux) per hop.
@@ -33,9 +34,9 @@ pub enum Sender {
     Agent(String),
     /// A watched pane without a label; carries the tmux pane id.
     Pane(String),
-    /// A same-uid process proven to sit outside every watched pane: the
-    /// human. Proven means the walk reached the top of the process tree
-    /// without meeting one, not that it stopped looking.
+    /// A same-uid process proven to have no vendor ancestor: the human.
+    /// Proven means the walk reached the top of the process tree without
+    /// meeting one, not that it stopped looking.
     Admin,
     /// The ancestry could not be walked to an answer. A missing parent, a
     /// cycle, or a tree deeper than the cap.
@@ -541,6 +542,35 @@ pub fn vendor_ancestor<T, F: Fn(i32) -> Option<T>>(pid: i32, root: i32, classify
     vendor_ancestor_with(start, root, |p: ProcId| classify(p.pid), parent_ident)
 }
 
+/// What one complete vendor-ancestry observation proved.
+///
+/// `NotVendor` means every process through the pane root was read and none
+/// matched. A failed identity, argv, parent, or replay read is
+/// `Unprovable`, because an unread ancestor may still be the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VendorAncestor<T> {
+    Vendor(T),
+    NotVendor,
+    Unprovable,
+}
+
+/// The tri-state form of [`vendor_ancestor`].
+///
+/// Callers that use absence to retire binding-owned state must keep a proven
+/// non-vendor chain separate from a chain that could not be observed.
+pub(crate) fn vendor_ancestor_observed<T, F>(pid: i32, root: i32, classify: F) -> VendorAncestor<T>
+where
+    F: Fn(i32) -> VendorAncestor<T>,
+{
+    let Some(start) = ProcId::of(pid) else {
+        return VendorAncestor::Unprovable;
+    };
+    let Some(root) = ProcId::of(root) else {
+        return VendorAncestor::Unprovable;
+    };
+    vendor_ancestor_observed_with(start, root, |p| classify(p.pid), parent_ident)
+}
+
 /// The parent of a process, as an identity rather than a number.
 ///
 /// Two reads of the child's own identity bracket the parent lookup, so a
@@ -613,6 +643,48 @@ where
         }
     }
     None
+}
+
+fn vendor_ancestor_observed_with<T, F, P>(
+    start: ProcId,
+    root: ProcId,
+    classify: F,
+    parent: P,
+) -> VendorAncestor<T>
+where
+    F: Fn(ProcId) -> VendorAncestor<T>,
+    P: Fn(ProcId) -> Option<ProcId>,
+{
+    let mut current = start;
+    let mut seen: HashSet<ProcId> = HashSet::new();
+    for _ in 0..MAX_ANCESTRY_DEPTH {
+        if current.pid <= 0 || !seen.insert(current) {
+            return VendorAncestor::Unprovable;
+        }
+        match classify(current) {
+            VendorAncestor::Vendor(found) => {
+                return if reaches(start, current, root, &parent) {
+                    VendorAncestor::Vendor(found)
+                } else {
+                    VendorAncestor::Unprovable
+                };
+            }
+            VendorAncestor::NotVendor => {}
+            VendorAncestor::Unprovable => return VendorAncestor::Unprovable,
+        }
+        if current == root {
+            return if reaches(start, root, root, &parent) {
+                VendorAncestor::NotVendor
+            } else {
+                VendorAncestor::Unprovable
+            };
+        }
+        let Some(next) = parent(current) else {
+            return VendorAncestor::Unprovable;
+        };
+        current = next;
+    }
+    VendorAncestor::Unprovable
 }
 
 /// Is `target` on the chain from `from` up to `root`, right now, with
@@ -1021,9 +1093,11 @@ mod tests {
             id(500),
             &pane_rows,
             |process| {
-                (process.pid == 200)
-                    .then_some(Vendorship::Vendor)
-                    .unwrap_or(Vendorship::NotVendor)
+                if process.pid == 200 {
+                    Vendorship::Vendor
+                } else {
+                    Vendorship::NotVendor
+                }
             },
             origin_tree(&[(500, 200), (200, 1)]),
             |_| true,
@@ -1076,6 +1150,48 @@ mod tests {
             ),
             Some(300),
             "the report belongs to the agent that ran the hook"
+        );
+    }
+
+    #[test]
+    fn vendor_ancestry_keeps_proven_absence_separate_from_failed_reads() {
+        let edges = &[(500, 400), (400, 300), (300, 100), (100, 1)];
+        let no_vendor = |_: ProcId| VendorAncestor::<i32>::NotVendor;
+        assert_eq!(
+            vendor_ancestor_observed_with(id(500), id(100), no_vendor, id_tree(edges)),
+            VendorAncestor::NotVendor
+        );
+
+        let unread_process = |process: ProcId| {
+            if process.pid == 300 {
+                VendorAncestor::<i32>::Unprovable
+            } else {
+                VendorAncestor::NotVendor
+            }
+        };
+        assert_eq!(
+            vendor_ancestor_observed_with(id(500), id(100), unread_process, id_tree(edges)),
+            VendorAncestor::Unprovable,
+            "an unread ancestor was treated as proof that no vendor exists"
+        );
+
+        let truncated = &[(500, 400)];
+        assert_eq!(
+            vendor_ancestor_observed_with(id(500), id(100), no_vendor, id_tree(truncated)),
+            VendorAncestor::Unprovable,
+            "a broken ancestry link was treated as a complete non-vendor chain"
+        );
+
+        let vendor = |process: ProcId| {
+            if process.pid == 300 {
+                VendorAncestor::Vendor(process.pid)
+            } else {
+                VendorAncestor::NotVendor
+            }
+        };
+        assert_eq!(
+            vendor_ancestor_observed_with(id(500), id(100), vendor, id_tree(edges)),
+            VendorAncestor::Vendor(300)
         );
     }
 

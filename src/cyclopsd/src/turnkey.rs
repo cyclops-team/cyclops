@@ -123,7 +123,8 @@ mod tests {
     fn manifest(fields: &str) -> Manifest {
         let src = format!(
             "[agent]\nid = \"t\"\ndisplay_name = \"t\"\n\n[hooks]\n\
-             turn_start = \"Start\"\nturn_end = \"Stop\"\n{fields}"
+             turn_start = \"Start\"\nturn_start_evidence = \"confirmed\"\n\
+             turn_end = \"Stop\"\nturn_end_evidence = \"confirmed\"\n{fields}"
         );
         Manifest::parse(&src, Path::new("t.toml")).expect("fixture manifest")
     }

@@ -83,12 +83,16 @@ pub fn dir(home: &Path) -> PathBuf {
 /// edited manifest look untouched.
 const EVER_SHIPPED_FNV64: &[&str] = &[
     "000da241c916d3cb",
+    "0a90724a6ccb9c0a",
     "0e7c902fb67d702a",
     "12765e334728f40b",
     "21a94a206aefa357",
     "2893de300e4fc944",
     "2a8c5b29dff89435",
+    "2d760e8dbff7a191",
+    "316b4c51088fc315",
     "3292eae226f54f79",
+    "39e895dafb8bedb7",
     "3e966f9f7049d206",
     "3ec9936975418c27",
     "3ee05959c01113a7",
@@ -110,10 +114,14 @@ const EVER_SHIPPED_FNV64: &[&str] = &[
     "97778c580f34b125",
     "98ae3fa4eca78cf3",
     "9a67be48357ff9e0",
+    "9be123836a9dac67",
+    "9eee760afa8f5ead",
     "bc4bc371b40e71ca",
     "c60d4aff7fe2a5d2",
     "c86ba6c35e662ee6",
     "cd2508367907b954",
+    "cdc9378b2adb994e",
+    "dc0b06781eb5a812",
     "dcf8e732f46b397c",
     "f6c7c7aaa830babb",
 ];
@@ -602,9 +610,17 @@ mod tests {
         for (blob, id, launch) in PRE_LAUNCH {
             let Some(old) = git_blob(blob) else { continue };
             let file = dir(&home).join(format!("{id}.toml"));
-            let m = cyclops_manifest::Manifest::parse(&old, &file).expect("the old body parses");
-            assert_eq!(&m.agent.id, id);
-            assert_eq!(m.agent.launch, None, "{id}: this blob is not pre-launch");
+            let table: toml::Table = old.parse().expect("the old body is valid TOML");
+            let agent = table
+                .get("agent")
+                .and_then(toml::Value::as_table)
+                .expect("the old body has an agent table");
+            assert_eq!(agent.get("id").and_then(toml::Value::as_str), Some(*id));
+            assert_eq!(
+                agent.get("launch"),
+                None,
+                "{id}: this blob is not pre-launch"
+            );
             assert!(
                 unedited_seed(old.as_bytes()),
                 "the pre-launch {id} body is not in EVER_SHIPPED_FNV64; add {}",

@@ -247,9 +247,9 @@ does not enforce that project policy.
 
 `admin` uses the same mailbox. An agent can run `cyclops send admin ...`.
 No pane wake is attempted; `cyclops status` shows the pending admin count and
-an operator caller proven outside every watched pane uses `cyclops inbox list`
-and `cyclops inbox claim <id>`. A shell inside a watched pane retains that
-pane's agent identity.
+a same-user shell with no agent-vendor ancestor uses `cyclops inbox list` and
+`cyclops inbox claim <id>`, including inside a watched pane. A vendor process
+gets an agent identity only through its current watched pane.
 
 ## 6. Observe pane activity
 

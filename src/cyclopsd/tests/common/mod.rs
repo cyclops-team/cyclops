@@ -71,6 +71,11 @@ pub fn composer_pane() -> String {
     format!("python3 {}", faketui_path())
 }
 
+/// A composer whose lifecycle is controlled by explicit test-only keys.
+pub fn manual_lifecycle_composer_pane() -> String {
+    format!("python3 {} --manual-lifecycle", faketui_path())
+}
+
 /// The composer that ACCEPTS the submit key and does nothing with it:
 /// the staged text stays put and no turn runs.
 ///
@@ -79,6 +84,15 @@ pub fn composer_pane() -> String {
 /// success is wrong here, and the payload is still in the composer.
 pub fn swallowing_composer_pane() -> String {
     format!("python3 {} --swallow-submit", faketui_path())
+}
+
+/// The swallowing composer also repaints its status row after Enter.
+/// The exact staged row remains, so the repaint is not a receipt.
+pub fn swallowing_animated_composer_pane() -> String {
+    format!(
+        "python3 {} --swallow-submit --animate-after-swallow",
+        faketui_path()
+    )
 }
 
 /// The fake TUI's script path, for fixtures that start it themselves
@@ -119,6 +133,7 @@ regex = ['^']
 [[rule]]
 id = "composer_empty"
 state = "idle"
+composer_semantic = "clean"
 priority = 90
 region = "bottom_non_empty_lines(4)"
 line_regex = ['^❯\s*$']
@@ -136,6 +151,7 @@ line_regex = ['^❯\s*$']
 [[rule]]
 id = "composer_holds_paste"
 state = "idle_with_input"
+composer_semantic = "human_input"
 priority = 80
 # The active composer only. The escaped matcher rejects the dim transcript
 # prompt that the fixture paints after consuming a turn.
@@ -167,6 +183,8 @@ verify_pattern = ["<message_id>"]
 composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
 composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
 composer_trailer_required_prefix = 2
+composer_prompt_regex = '^❯ (?P<content>.*)$'
+composer_continuation_regex = '^(?P<content>.*)$'
 safe_states = ["idle"]
 "#;
 
@@ -175,11 +193,15 @@ pub const HOOK_MANIFEST: &str = r#"
 [agent]
 id = "fix"
 display_name = "Hook fixture"
-process_names = ["python3", "python", "Python", "cat", "sh", "bash", "dash"]
+# Keep the GitHub Actions driver out of the fixture's vendor set. Otherwise
+# socket requests from the test process look like an agent outside the rig.
+process_names = ["python3", "python", "Python", "cat", "sh", "dash"]
 
 [hooks]
 turn_start = "UserPromptSubmit"
+turn_start_evidence = "confirmed"
 turn_end = "Stop"
+turn_end_evidence = "confirmed"
 ack = "UserPromptSubmit"
 ack_payload_field = "prompt"
 
@@ -197,6 +219,7 @@ regex = ['^']
 [[rule]]
 id = "composer_empty"
 state = "idle"
+composer_semantic = "clean"
 priority = 90
 region = "bottom_non_empty_lines(4)"
 line_regex = ['^❯\s*$']
@@ -214,6 +237,7 @@ line_regex = ['^❯\s*$']
 [[rule]]
 id = "composer_holds_paste"
 state = "idle_with_input"
+composer_semantic = "human_input"
 priority = 80
 # The active composer only. The escaped matcher rejects the dim transcript
 # prompt that the fixture paints after consuming a turn.
@@ -244,6 +268,8 @@ verify_pattern = ["<message_id>"]
 composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
 composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
 composer_trailer_required_prefix = 2
+composer_prompt_regex = '^❯ (?P<content>.*)$'
+composer_continuation_regex = '^(?P<content>.*)$'
 "#;
 
 /// Modal fixture: one auto-dismissable rule with explicit decline keys and
@@ -285,6 +311,7 @@ regex = ['^']
 [[rule]]
 id = "composer_empty"
 state = "idle"
+composer_semantic = "clean"
 priority = 90
 region = "bottom_non_empty_lines(4)"
 line_regex = ['^❯\s*$']
@@ -302,6 +329,7 @@ line_regex = ['^❯\s*$']
 [[rule]]
 id = "composer_holds_paste"
 state = "idle_with_input"
+composer_semantic = "human_input"
 priority = 80
 # The active composer only. The escaped matcher rejects the dim transcript
 # prompt that the fixture paints after consuming a turn.
@@ -332,6 +360,8 @@ verify_pattern = ["<message_id>"]
 composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
 composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
 composer_trailer_required_prefix = 2
+composer_prompt_regex = '^❯ (?P<content>.*)$'
+composer_continuation_regex = '^(?P<content>.*)$'
 "#;
 
 /// Quota fixture: the agy quota phrase parks the recipient.
@@ -362,6 +392,7 @@ regex = ['^']
 [[rule]]
 id = "composer_empty"
 state = "idle"
+composer_semantic = "clean"
 priority = 90
 region = "bottom_non_empty_lines(4)"
 line_regex = ['^❯\s*$']
@@ -379,6 +410,7 @@ line_regex = ['^❯\s*$']
 [[rule]]
 id = "composer_holds_paste"
 state = "idle_with_input"
+composer_semantic = "human_input"
 priority = 80
 # The active composer only. The escaped matcher rejects the dim transcript
 # prompt that the fixture paints after consuming a turn.
@@ -409,6 +441,8 @@ verify_pattern = ["<message_id>"]
 composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
 composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
 composer_trailer_required_prefix = 2
+composer_prompt_regex = '^❯ (?P<content>.*)$'
+composer_continuation_regex = '^(?P<content>.*)$'
 "#;
 
 /// Busy fixture: a screen marker keeps the pane working until released.
@@ -439,6 +473,7 @@ regex = ['^']
 [[rule]]
 id = "composer_empty"
 state = "idle"
+composer_semantic = "clean"
 priority = 90
 region = "bottom_non_empty_lines(4)"
 line_regex = ['^❯\s*$']
@@ -456,6 +491,7 @@ line_regex = ['^❯\s*$']
 [[rule]]
 id = "composer_holds_paste"
 state = "idle_with_input"
+composer_semantic = "human_input"
 priority = 80
 # The active composer only. The escaped matcher rejects the dim transcript
 # prompt that the fixture paints after consuming a turn.
@@ -486,6 +522,8 @@ verify_pattern = ["<message_id>"]
 composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
 composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
 composer_trailer_required_prefix = 2
+composer_prompt_regex = '^❯ (?P<content>.*)$'
+composer_continuation_regex = '^(?P<content>.*)$'
 "#;
 
 /// Verification-failure fixture: the pattern can never appear on screen,
@@ -510,6 +548,7 @@ regex = ['^']
 [[rule]]
 id = "composer_empty"
 state = "idle"
+composer_semantic = "clean"
 priority = 90
 region = "bottom_non_empty_lines(4)"
 line_regex = ['^❯\s*$']
@@ -597,6 +636,19 @@ impl TestClient {
                 return v;
             }
         }
+    }
+
+    async fn expect_closed(&mut self) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match self.lines.next_line().await.expect("read shutdown EOF") {
+                    Some(_) => continue,
+                    None => return,
+                }
+            }
+        })
+        .await
+        .expect("connection closes within 5s");
     }
 
     /// Next event matching `pred`, scanning buffered then incoming lines.
@@ -761,10 +813,13 @@ impl Rig {
             home,
             home_guard,
             daemon,
+            mut ctl,
+            mut ev,
             sessions,
-            ..
         } = self;
         daemon.shutdown().await;
+        ctl.expect_closed().await;
+        ev.expect_closed().await;
         let (cfg, _) = cyclopsd::Config::load(&home).expect("config loads");
         let daemon = cyclopsd::boot(cfg).await.expect("daemon reboots");
         let sock = daemon.socket_path();
@@ -1003,5 +1058,13 @@ pub async fn wait_pane_state(rig: &mut Rig, want: &str) {
 /// admit a write, hold the staged sentinel, and clear it on Enter.
 pub fn hold_script(marker: &str) -> String {
     let tail = composer_tail();
+    format!("sh -c 'echo {marker}; read x; printf \"\\033[2J\\033[H\"; {tail}'")
+}
+
+/// Hold on a marker, then consume submits without emitting a lifecycle edge.
+/// Tests use this to prove that a pre-release Working phase cannot satisfy a
+/// wait that starts after delivery resolves.
+pub fn hold_then_manual_lifecycle_script(marker: &str) -> String {
+    let tail = format!("{} --manual-lifecycle", composer_tail());
     format!("sh -c 'echo {marker}; read x; printf \"\\033[2J\\033[H\"; {tail}'")
 }

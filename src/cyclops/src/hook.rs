@@ -6,7 +6,7 @@
 //! report. Failures append a line to $CYCLOPS_HOME/hook-errors.log.
 //!
 //! The event name is an argument, not a payload field, because agy hook
-//! payloads carry no event-name field at all (F7): every vendor hook
+//! payloads carry no event-name field at all, so every vendor hook
 //! entry registers a distinct self-tagging command.
 
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -22,7 +22,7 @@ use crate::copy;
 use cyclops_proto::StateReportParams;
 use cyclops_state::StateRoot;
 
-/// Reporting agent label when --agent is absent.
+/// Optional sequence namespace for label-free generated hook commands.
 const AGENT_ENV: &str = "CYCLOPS_AGENT";
 
 /// Total wall-clock budget. The per-phase caps below keep the worst case
@@ -52,9 +52,12 @@ fn post(event: &str, agent_flag: Option<&str>, deadline: Instant) -> Result<(), 
     // the authenticated socket peer, so a hook that does not know its own
     // name can still report. A label supplied here is an assertion about
     // that origin, checked against it and denied on disagreement.
-    let agent = agent_flag
-        .map(String::from)
-        .or_else(|| std::env::var(AGENT_ENV).ok().filter(|a| !a.is_empty()));
+    let agent = agent_flag.map(String::from);
+    let sequence_namespace = agent.clone().or_else(|| {
+        std::env::var(AGENT_ENV)
+            .ok()
+            .filter(|name| !name.is_empty())
+    });
     let home = cyclops_proto::cyclops_home();
     // Payload trouble is logged but never fatal: the event edge matters
     // more than its audit payload.
@@ -67,7 +70,7 @@ fn post(event: &str, agent_flag: Option<&str>, deadline: Instant) -> Result<(), 
     };
     // The counter is per-label, so a report without one carries none
     // rather than sharing a namespace with every other label-free hook.
-    let seq = match &agent {
+    let seq = match &sequence_namespace {
         Some(a) => Some(next_seq(&home, a)?),
         None => None,
     };
@@ -153,6 +156,9 @@ fn log_error(event: &str, cause: &str) {
     log_error_at(&home, event, cause);
 }
 
+const HOOK_ERROR_LOG_BYTES: u64 = 256 * 1024;
+const HOOK_ERROR_LINE_BYTES: usize = 4096;
+
 fn log_error_at(home: &Path, event: &str, cause: &str) {
     let Ok(state_root) = StateRoot::open_or_create(home) else {
         return;
@@ -160,11 +166,43 @@ fn log_error_at(home: &Path, event: &str, cause: &str) {
     let Ok(mut f) = state_root.open_append(Path::new("hook-errors.log")) else {
         return;
     };
-    let _ = writeln!(
-        f,
-        "{} hook {event}: {cause}",
-        utc_stamp(crate::render::now_ms())
+    if !matches!(f.try_lock(), Ok(true)) {
+        return;
+    }
+
+    let prefix = format!(
+        "{} hook {}: ",
+        utc_stamp(crate::render::now_ms()),
+        log_field(event, 128)
     );
+    let available = HOOK_ERROR_LINE_BYTES.saturating_sub(prefix.len() + 1);
+    let line = format!("{prefix}{}\n", log_field(cause, available));
+    let Ok(length) = f.seek(SeekFrom::End(0)) else {
+        return;
+    };
+    if length.saturating_add(line.len() as u64) > HOOK_ERROR_LOG_BYTES
+        && (f.set_len(0).is_err() || f.seek(SeekFrom::Start(0)).is_err())
+    {
+        return;
+    }
+    let _ = f.write_all(line.as_bytes());
+}
+
+/// Keep one hook failure on one bounded log line.
+fn log_field(value: &str, max_bytes: usize) -> String {
+    let mut out = String::with_capacity(value.len().min(max_bytes));
+    for character in value.chars() {
+        let character = if matches!(character, '\n' | '\r') {
+            ' '
+        } else {
+            character
+        };
+        if out.len() + character.len_utf8() > max_bytes {
+            break;
+        }
+        out.push(character);
+    }
+    out
 }
 
 /// UTC "YYYY-MM-DDTHH:MM:SSZ" from Unix ms. std ships no calendar; this
@@ -215,7 +253,7 @@ mod tests {
 
     #[test]
     fn seq_counter_starts_at_one_and_advances() {
-        // Scratch state goes through the shared root (F24), not the OS
+        // Scratch state goes through the shared root, not the OS
         // temp dir, so CYCLOPS_TEST_TMP relocates this test with the rest.
         // That the root really relocates is proven once, in cyclopsd's
         // scratch_override test.
@@ -270,6 +308,54 @@ mod tests {
         assert!(text.contains("hook Stop: second"));
         assert_eq!(mode(&home), 0o700);
         assert_eq!(mode(&path), 0o600);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn hook_error_log_is_bounded_and_one_line_per_failure() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-hook-errors-bounded");
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("hook-errors.log"),
+            vec![b'x'; HOOK_ERROR_LOG_BYTES as usize],
+        )
+        .unwrap();
+
+        log_error_at(&home, "Stop\nforged", &"failure\n".repeat(2000));
+
+        let path = home.join("hook-errors.log");
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.len() <= HOOK_ERROR_LINE_BYTES);
+        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+        assert!(String::from_utf8(bytes)
+            .unwrap()
+            .contains("hook Stop forged: failure failure"));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn hook_error_log_never_waits_for_another_writer() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-hook-errors-locked");
+        let _ = fs::remove_dir_all(&home);
+        let state_root = StateRoot::open_or_create(&home).unwrap();
+        let mut held = state_root
+            .open_append(Path::new("hook-errors.log"))
+            .unwrap();
+        held.write_all(b"existing\n").unwrap();
+        held.lock().unwrap();
+
+        log_error_at(&home, "Stop", "must not wait");
+        assert_eq!(
+            fs::read(home.join("hook-errors.log")).unwrap(),
+            b"existing\n"
+        );
+
+        drop(held);
+        log_error_at(&home, "Stop", "written after release");
+        assert!(fs::read_to_string(home.join("hook-errors.log"))
+            .unwrap()
+            .contains("hook Stop: written after release"));
         let _ = fs::remove_dir_all(&home);
     }
 }

@@ -10,7 +10,7 @@
 //! and validates ownership before changing permissions or exposing bytes.
 
 use std::ffi::{CStr, CString, OsStr, OsString};
-use std::fs::File;
+use std::fs::{File, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -22,6 +22,7 @@ const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 const REPLACEMENT_TEMP_PREFIX: &str = ".cyclops-state-replace-";
 const REPLACEMENT_TEMP_ATTEMPTS: usize = 128;
+const BOUNDED_APPEND_LIMIT_MAX: usize = 16 * 1024 * 1024;
 
 static REPLACEMENT_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -30,9 +31,14 @@ static REPLACEMENT_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
 type RepairAfterInspect = Box<dyn FnOnce(&Path)>;
 
 #[cfg(test)]
+type InspectAfterRead = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
 thread_local! {
     static FAIL_NEXT_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static REPAIR_AFTER_INSPECT: std::cell::RefCell<Option<RepairAfterInspect>> =
+        const { std::cell::RefCell::new(None) };
+    static INSPECT_AFTER_READ: std::cell::RefCell<Option<InspectAfterRead>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -55,6 +61,11 @@ pub enum StateError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("state removal is visible at {path}, but directory sync failed: {source}")]
+    RemovalDurabilityUnknown {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 /// Result of publishing a file without replacing an existing entry.
@@ -70,6 +81,139 @@ pub struct RepairSummary {
     pub directories: usize,
     pub regular_files: usize,
     pub live_socket_preserved: bool,
+}
+
+/// Hard ceiling for one read-only directory inspection.
+pub const INSPECTION_ENTRY_LIMIT_MAX: usize = 4_096;
+
+/// Hard ceiling for names retained by one read-only directory inspection.
+pub const INSPECTION_NAME_BYTES_LIMIT_MAX: usize = 256 * 1_024;
+
+/// Hard ceiling for bytes returned by one read-only file inspection.
+pub const INSPECTION_FILE_BYTES_LIMIT_MAX: usize = 1_024 * 1_024;
+
+/// Hard ceiling for components resolved by one read-only inspection lookup.
+pub const INSPECTION_PATH_COMPONENT_LIMIT_MAX: usize = 256;
+
+/// Hard ceiling for one read-only inspection path.
+pub const INSPECTION_PATH_BYTES_LIMIT_MAX: usize = 64 * 1_024;
+
+/// Caller-selected bounds for one read-only directory inspection.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct InspectionLimits {
+    pub max_entries: usize,
+    pub max_name_bytes: usize,
+}
+
+impl InspectionLimits {
+    /// Validate explicit limits before allocating or reading directory entries.
+    pub fn new(max_entries: usize, max_name_bytes: usize) -> Result<Self, StateError> {
+        if max_entries > INSPECTION_ENTRY_LIMIT_MAX {
+            return Err(StateError::UnsafePath {
+                path: PathBuf::from("<inspection>"),
+                reason: "inspection entry limit exceeds the hard ceiling",
+            });
+        }
+        if max_name_bytes > INSPECTION_NAME_BYTES_LIMIT_MAX {
+            return Err(StateError::UnsafePath {
+                path: PathBuf::from("<inspection>"),
+                reason: "inspection name-byte limit exceeds the hard ceiling",
+            });
+        }
+        Ok(Self {
+            max_entries,
+            max_name_bytes,
+        })
+    }
+}
+
+impl Default for InspectionLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: 1_024,
+            max_name_bytes: 64 * 1_024,
+        }
+    }
+}
+
+/// File type observed without following the named entry.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum InspectedKind {
+    Directory,
+    RegularFile,
+    Socket,
+    Symlink,
+    Other,
+}
+
+/// Descriptor-relative metadata for one state entry.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct InspectedEntry {
+    pub path: PathBuf,
+    pub kind: InspectedKind,
+    pub mode: u32,
+    pub uid: u32,
+    pub links: u64,
+    pub size: u64,
+    pub device: u64,
+    pub inode: u64,
+    /// None means the entry passed the checks available to this snapshot.
+    pub unsafe_reason: Option<&'static str>,
+}
+
+impl InspectedEntry {
+    pub fn safe(&self) -> bool {
+        self.unsafe_reason.is_none()
+    }
+
+    /// Whether an owner-only parent contains every reported risk.
+    ///
+    /// Broader leaf mode bits are harmless behind a 0700 parent. Links,
+    /// foreign ownership, and unsupported file types remain unsafe.
+    pub fn safe_beneath_owner_only_parent(&self) -> bool {
+        self.safe()
+            || self.unsafe_reason == Some("state entry permissions grant access beyond the owner")
+    }
+}
+
+/// One bounded directory snapshot.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DirectoryInspection {
+    pub directory: InspectedEntry,
+    pub entries: Vec<InspectedEntry>,
+    pub retained_name_bytes: usize,
+    pub truncated: bool,
+}
+
+/// One bounded regular-file snapshot from a held descriptor.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FileInspection {
+    pub entry: InspectedEntry,
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
+}
+
+/// Held read-only authority for an existing Cyclops state root.
+///
+/// Unlike [`StateRoot`], this type never creates or repairs anything. All
+/// descendant lookups remain relative to the held root descriptor.
+#[derive(Debug)]
+pub struct StateInspector {
+    directory: File,
+    path: PathBuf,
+    owner: u32,
+    root: InspectedEntry,
+}
+
+/// One exact inspected file or empty directory bound for explicit removal.
+/// Dropping the handle without calling [`BoundStateRemoval::remove`] changes nothing.
+pub struct BoundStateRemoval {
+    parent: File,
+    target: UnlockOnDropFile,
+    name: CString,
+    path: PathBuf,
+    expected: InspectedEntry,
+    kind: RemovalKind,
 }
 
 /// An open, owner-only Cyclops state directory.
@@ -99,6 +243,523 @@ pub struct TransientStateFile {
     armed: bool,
 }
 
+impl StateInspector {
+    /// Open an existing state root without creating or repairing it.
+    ///
+    /// A missing root is a normal absent result. A linked component, foreign
+    /// owner, or unstable root identity is an error.
+    pub fn open_existing(path: &Path) -> Result<Option<Self>, StateError> {
+        let parts = inspection_root_parts(path)?;
+        let owner = effective_uid();
+        let mut directory = open_start(path)?;
+
+        for (index, part) in parts.iter().enumerate() {
+            if index + 1 == parts.len() {
+                validate_root_parent(&directory, path)?;
+            }
+            let name = c_name(path, part)?;
+            directory = match open_directory_at(&directory, &name) {
+                Ok(next) => next,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(path_error(
+                        path,
+                        error,
+                        "state root contains a linked or non-directory component",
+                    ));
+                }
+            };
+        }
+
+        let metadata = directory
+            .metadata()
+            .map_err(|source| io_error(path, source))?;
+        if metadata.uid() != owner {
+            return Err(unsafe_path(path, "state directory belongs to another user"));
+        }
+        let root = inspected_from_metadata(path.to_path_buf(), &metadata, owner);
+        Ok(Some(Self {
+            directory,
+            path: path.to_path_buf(),
+            owner,
+            root,
+        }))
+    }
+
+    /// Display path only. Inspection authority stays on the held descriptor.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Metadata for the held root descriptor.
+    pub fn root(&self) -> &InspectedEntry {
+        &self.root
+    }
+
+    /// Check that a fresh no-follow lookup still names this held root.
+    pub fn path_matches_held_root(&self) -> Result<bool, StateError> {
+        let parts = inspection_root_parts(&self.path)?;
+        let mut directory = open_start(&self.path)?;
+        for part in parts {
+            let name = c_name(&self.path, part)?;
+            directory = match open_directory_at(&directory, &name) {
+                Ok(next) => next,
+                Err(_) => return Ok(false),
+            };
+        }
+        let current = directory
+            .metadata()
+            .map_err(|source| io_error(&self.path, source))?;
+        Ok(current.dev() == self.root.device
+            && current.ino() == self.root.inode
+            && current.uid() == self.owner
+            && current.file_type().is_dir())
+    }
+
+    /// Inspect the state root's direct children within explicit hard bounds.
+    pub fn inspect_root(
+        &self,
+        limits: InspectionLimits,
+    ) -> Result<DirectoryInspection, StateError> {
+        inspect_directory_descriptor(
+            clone_file(&self.directory, &self.path)?,
+            self.path.clone(),
+            self.owner,
+            self.root.clone(),
+            limits,
+        )
+    }
+
+    /// Inspect direct children of one existing descendant directory.
+    ///
+    /// Missing is distinct from an empty directory. Every path component is
+    /// opened relative to the held root and symbolic links are never followed.
+    pub fn inspect_directory(
+        &self,
+        descendant: &Path,
+        limits: InspectionLimits,
+    ) -> Result<Option<DirectoryInspection>, StateError> {
+        let Some((directory, display_path, metadata)) =
+            self.open_descendant_directory(descendant)?
+        else {
+            return Ok(None);
+        };
+        let inspected = inspected_from_metadata(display_path.clone(), &metadata, self.owner);
+        inspect_directory_descriptor(directory, display_path, self.owner, inspected, limits)
+            .map(Some)
+    }
+
+    /// Inspect a directory entry returned by an earlier snapshot.
+    ///
+    /// The path must still name the same device, inode, type, owner, and link
+    /// count. This is the recursive-walk form because it cannot cross from an
+    /// enumerated directory into a replacement directory.
+    pub fn inspect_bound_directory(
+        &self,
+        expected: &InspectedEntry,
+        limits: InspectionLimits,
+    ) -> Result<DirectoryInspection, StateError> {
+        if expected.kind != InspectedKind::Directory {
+            return Err(unsafe_path(
+                &expected.path,
+                "bound inspection target is not a directory",
+            ));
+        }
+        let descendant = expected.path.strip_prefix(&self.path).map_err(|_| {
+            unsafe_path(
+                &expected.path,
+                "bound inspection target is outside the state root",
+            )
+        })?;
+        let Some((directory, display_path, metadata)) =
+            self.open_descendant_directory(descendant)?
+        else {
+            return Err(unsafe_path(
+                &expected.path,
+                "state entry changed during read-only inspection",
+            ));
+        };
+        let current = inspected_from_metadata(display_path.clone(), &metadata, self.owner);
+        if current.device != expected.device
+            || current.inode != expected.inode
+            || current.kind != expected.kind
+            || current.uid != expected.uid
+            || current.links != expected.links
+            || current.mode != expected.mode
+            || current.size != expected.size
+        {
+            return Err(unsafe_path(
+                &expected.path,
+                "state entry changed during read-only inspection",
+            ));
+        }
+        inspect_directory_descriptor(directory, display_path, self.owner, current, limits)
+    }
+
+    fn open_descendant_directory(
+        &self,
+        descendant: &Path,
+    ) -> Result<Option<(File, PathBuf, std::fs::Metadata)>, StateError> {
+        let parts = inspection_descendant_parts(descendant)?;
+        let display_path = self.path.join(descendant);
+        let mut directory = clone_file(&self.directory, &display_path)?;
+        for part in parts {
+            let name = c_name(&display_path, part)?;
+            directory = match open_directory_at(&directory, &name) {
+                Ok(next) => next,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(path_error(
+                        &display_path,
+                        error,
+                        "state path contains a linked or non-directory component",
+                    ));
+                }
+            };
+            let metadata = directory
+                .metadata()
+                .map_err(|source| io_error(&display_path, source))?;
+            if metadata.uid() != self.owner {
+                return Err(unsafe_path(
+                    &display_path,
+                    "state directory belongs to another user",
+                ));
+            }
+        }
+        let metadata = directory
+            .metadata()
+            .map_err(|source| io_error(&display_path, source))?;
+        Ok(Some((directory, display_path, metadata)))
+    }
+
+    /// Read one existing regular state file through a held descriptor.
+    ///
+    /// The byte limit is checked before allocation. The file identity is
+    /// compared before and after the read, and links are refused.
+    pub fn read_file(
+        &self,
+        descendant: &Path,
+        max_bytes: usize,
+    ) -> Result<Option<FileInspection>, StateError> {
+        if max_bytes > INSPECTION_FILE_BYTES_LIMIT_MAX {
+            return Err(unsafe_path(
+                &self.path.join(descendant),
+                "inspection file-byte limit exceeds the hard ceiling",
+            ));
+        }
+        let parts = inspection_descendant_parts(descendant)?;
+        let display_path = self.path.join(descendant);
+        let mut directory = clone_file(&self.directory, &display_path)?;
+        for part in &parts[..parts.len() - 1] {
+            let name = c_name(&display_path, part)?;
+            directory = match open_directory_at(&directory, &name) {
+                Ok(next) => next,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(path_error(
+                        &display_path,
+                        error,
+                        "state path contains a linked or non-directory component",
+                    ));
+                }
+            };
+            let metadata = directory
+                .metadata()
+                .map_err(|source| io_error(&display_path, source))?;
+            if metadata.uid() != self.owner {
+                return Err(unsafe_path(
+                    &display_path,
+                    "state directory belongs to another user",
+                ));
+            }
+        }
+
+        let leaf = c_name(
+            &display_path,
+            parts.last().expect("descendant has one component"),
+        )?;
+        let before = match stat_at_optional(&directory, &leaf, &display_path)? {
+            Some(metadata) => metadata,
+            None => return Ok(None),
+        };
+        validate_regular_stat(&before, &display_path, self.owner)?;
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        // SAFETY: directory and leaf are held descriptors and a valid C name.
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), leaf.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(path_error(
+                &display_path,
+                std::io::Error::last_os_error(),
+                "state file could not be opened for read-only inspection",
+            ));
+        }
+        // SAFETY: fd is a fresh successful openat result owned here.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let metadata = file
+            .metadata()
+            .map_err(|source| io_error(&display_path, source))?;
+        if !metadata_matches_stat(&metadata, &before) {
+            return Err(unsafe_path(
+                &display_path,
+                "state entry changed during read-only inspection",
+            ));
+        }
+
+        let read_limit = u64::try_from(max_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1_024));
+        let mut limited = (&file).take(read_limit);
+        limited
+            .read_to_end(&mut bytes)
+            .map_err(|source| io_error(&display_path, source))?;
+        let truncated = bytes.len() > max_bytes;
+        if truncated {
+            bytes.truncate(max_bytes);
+        }
+        inspect_after_read(&display_path);
+        let descriptor_after = file
+            .metadata()
+            .map_err(|source| io_error(&display_path, source))?;
+        if !metadata_stable_during_read(&metadata, &descriptor_after) {
+            return Err(unsafe_path(
+                &display_path,
+                "state entry changed during read-only inspection",
+            ));
+        }
+        let after = stat_at(&directory, &leaf, &display_path)?;
+        if !same_stat_identity(&before, &after) {
+            return Err(unsafe_path(
+                &display_path,
+                "state entry changed during read-only inspection",
+            ));
+        }
+        let entry = inspected_from_stat(display_path, &after, self.owner);
+        Ok(Some(FileInspection {
+            entry,
+            bytes,
+            truncated,
+        }))
+    }
+
+    /// Bind one inspected regular file for one explicit removal attempt.
+    pub fn bind_regular_file_for_removal(
+        &self,
+        expected: &InspectedEntry,
+    ) -> Result<BoundStateRemoval, StateError> {
+        if expected.kind != InspectedKind::RegularFile
+            || expected.uid != self.owner
+            || expected.links != 1
+        {
+            return Err(unsafe_path(
+                &expected.path,
+                "removal target is not one owned single-link regular file",
+            ));
+        }
+        self.bind_for_removal(expected, RemovalKind::RegularFile)
+    }
+
+    /// Bind one inspected empty directory for one explicit removal attempt.
+    pub fn bind_empty_directory_for_removal(
+        &self,
+        expected: &InspectedEntry,
+    ) -> Result<BoundStateRemoval, StateError> {
+        if expected.kind != InspectedKind::Directory || expected.uid != self.owner {
+            return Err(unsafe_path(
+                &expected.path,
+                "removal target is not one owned directory",
+            ));
+        }
+        self.bind_for_removal(expected, RemovalKind::EmptyDirectory)
+    }
+
+    /// Atomically move one exact direct child directory to a private name.
+    ///
+    /// The move never replaces an existing entry. Callers can keep an
+    /// in-directory lease held while removing the isolated namespace.
+    pub fn isolate_direct_child_directory(
+        &self,
+        expected: &InspectedEntry,
+        isolated_name: &OsStr,
+    ) -> Result<InspectedEntry, StateError> {
+        if expected.kind != InspectedKind::Directory
+            || expected.uid != self.owner
+            || expected.path.parent() != Some(self.path.as_path())
+        {
+            return Err(unsafe_path(
+                &expected.path,
+                "isolation target is not one owned direct child directory",
+            ));
+        }
+        let isolated_path = self.path.join(isolated_name);
+        let isolated_parts = inspection_descendant_parts(Path::new(isolated_name))?;
+        if isolated_parts.len() != 1 || isolated_name.as_bytes().len() > 240 {
+            return Err(unsafe_path(
+                &isolated_path,
+                "isolation name is not one bounded path component",
+            ));
+        }
+        let old_name = c_name(
+            &expected.path,
+            expected
+                .path
+                .file_name()
+                .expect("direct child has one file name"),
+        )?;
+        let new_name = c_name(&isolated_path, isolated_name)?;
+        let before =
+            stat_at_optional(&self.directory, &old_name, &expected.path)?.ok_or_else(|| {
+                unsafe_path(&expected.path, "isolation target changed before binding")
+            })?;
+        validate_removal_stat(&before, expected, RemovalKind::EmptyDirectory)?;
+        let target = open_directory_at(&self.directory, &old_name).map_err(|error| {
+            path_error(
+                &expected.path,
+                error,
+                "isolation target changed before binding",
+            )
+        })?;
+        validate_removal_descriptor(&target, expected, RemovalKind::EmptyDirectory)?;
+        if stat_at_optional(&self.directory, &new_name, &isolated_path)?.is_some() {
+            return Err(unsafe_path(
+                &isolated_path,
+                "isolation target already exists",
+            ));
+        }
+
+        // SAFETY: both names are bounded direct children of the held parent.
+        #[cfg(target_os = "macos")]
+        let result = unsafe {
+            libc::renameatx_np(
+                self.directory.as_raw_fd(),
+                old_name.as_ptr(),
+                self.directory.as_raw_fd(),
+                new_name.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
+        // SAFETY: both names are bounded direct children of the held parent.
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::renameat2(
+                self.directory.as_raw_fd(),
+                old_name.as_ptr(),
+                self.directory.as_raw_fd(),
+                new_name.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result != 0 {
+            return Err(path_error(
+                &isolated_path,
+                std::io::Error::last_os_error(),
+                "could not isolate state directory without replacement",
+            ));
+        }
+        let after = stat_at(&self.directory, &new_name, &isolated_path)?;
+        validate_removal_stat(&after, expected, RemovalKind::EmptyDirectory).map_err(|_| {
+            unsafe_path(
+                &isolated_path,
+                "isolated state directory changed during rename",
+            )
+        })?;
+        sync_directory(&self.directory).map_err(|source| StateError::RemovalDurabilityUnknown {
+            path: isolated_path.clone(),
+            source,
+        })?;
+        let mut isolated = expected.clone();
+        isolated.path = isolated_path;
+        Ok(isolated)
+    }
+
+    fn bind_for_removal(
+        &self,
+        expected: &InspectedEntry,
+        kind: RemovalKind,
+    ) -> Result<BoundStateRemoval, StateError> {
+        let descendant = expected
+            .path
+            .strip_prefix(&self.path)
+            .map_err(|_| unsafe_path(&expected.path, "removal target is outside the state root"))?;
+        let parts = inspection_descendant_parts(descendant)?;
+        let mut parent = clone_file(&self.directory, &expected.path)?;
+        for part in &parts[..parts.len() - 1] {
+            let name = c_name(&expected.path, part)?;
+            parent = open_directory_at(&parent, &name).map_err(|error| {
+                path_error(
+                    &expected.path,
+                    error,
+                    "removal target parent is linked or changed",
+                )
+            })?;
+            let metadata = parent
+                .metadata()
+                .map_err(|source| io_error(&expected.path, source))?;
+            if metadata.uid() != self.owner {
+                return Err(unsafe_path(
+                    &expected.path,
+                    "removal target parent belongs to another user",
+                ));
+            }
+        }
+        let name = c_name(
+            &expected.path,
+            parts.last().expect("descendant has one component"),
+        )?;
+        let before = stat_at_optional(&parent, &name, &expected.path)?
+            .ok_or_else(|| unsafe_path(&expected.path, "removal target changed before binding"))?;
+        validate_removal_stat(&before, expected, kind)?;
+        let target = match kind {
+            RemovalKind::RegularFile => {
+                open_lockable_regular_at(&parent, &name).map_err(|error| {
+                    path_error(
+                        &expected.path,
+                        error,
+                        "removal target changed before binding",
+                    )
+                })?
+            }
+            RemovalKind::EmptyDirectory => open_directory_at(&parent, &name).map_err(|error| {
+                path_error(
+                    &expected.path,
+                    error,
+                    "removal target changed before binding",
+                )
+            })?,
+        };
+        validate_removal_descriptor(&target, expected, kind)?;
+        let after = stat_at_optional(&parent, &name, &expected.path)?
+            .ok_or_else(|| unsafe_path(&expected.path, "removal target changed before binding"))?;
+        validate_removal_stat(&after, expected, kind)?;
+
+        if matches!(kind, RemovalKind::EmptyDirectory) {
+            let snapshot = inspect_directory_descriptor(
+                clone_file(&target, &expected.path)?,
+                expected.path.clone(),
+                self.owner,
+                expected.clone(),
+                InspectionLimits::new(1, INSPECTION_NAME_BYTES_LIMIT_MAX)
+                    .expect("removal inspection limits fit hard ceilings"),
+            )?;
+            if snapshot.truncated || !snapshot.entries.is_empty() {
+                return Err(unsafe_path(
+                    &expected.path,
+                    "removal target directory is not empty",
+                ));
+            }
+        }
+
+        Ok(BoundStateRemoval {
+            parent,
+            target: UnlockOnDropFile::new(target),
+            name,
+            path: expected.path.clone(),
+            expected: expected.clone(),
+            kind,
+        })
+    }
+}
+
 struct SocketIdentity {
     device: libc::dev_t,
     inode: libc::ino_t,
@@ -112,6 +773,12 @@ struct RegularIdentity {
     inode: u64,
     owner: u32,
     links: u64,
+}
+
+#[derive(Clone, Copy)]
+enum RemovalKind {
+    RegularFile,
+    EmptyDirectory,
 }
 
 impl StateRoot {
@@ -579,7 +1246,7 @@ impl StateRoot {
         sync_create_capable_entry(&directory, &file, &display_path, create)?;
 
         Ok(Some(StateFile {
-            file,
+            file: UnlockOnDropFile::new(file),
             path: display_path,
         }))
     }
@@ -628,6 +1295,65 @@ impl BoundSocketCleanup {
         }
         self.armed = false;
         Ok(())
+    }
+}
+
+impl BoundStateRemoval {
+    /// Display path only. Removal and locking use the held descriptors.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Try to hold this exact regular file against another lease holder.
+    pub fn try_lock(&self) -> std::io::Result<bool> {
+        if !matches!(self.kind, RemovalKind::RegularFile) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "only a regular-file removal target can be locked",
+            ));
+        }
+        // SAFETY: target is a held regular-file descriptor. Update uses the
+        // same flock contract, so both sides serialize on the same inode.
+        if unsafe { libc::flock(self.target.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            Ok(false)
+        } else {
+            Err(error)
+        }
+    }
+
+    /// Remove the exact bound entry and durably record the parent change.
+    pub fn remove(self) -> Result<(), StateError> {
+        validate_removal_descriptor(&self.target, &self.expected, self.kind)
+            .map_err(|_| unsafe_path(&self.path, "bound removal target changed before removal"))?;
+        let named = stat_at_optional(&self.parent, &self.name, &self.path)?.ok_or_else(|| {
+            unsafe_path(&self.path, "bound removal target changed before removal")
+        })?;
+        validate_removal_stat(&named, &self.expected, self.kind)
+            .map_err(|_| unsafe_path(&self.path, "bound removal target changed before removal"))?;
+
+        let flags = if matches!(self.kind, RemovalKind::EmptyDirectory) {
+            libc::AT_REMOVEDIR
+        } else {
+            0
+        };
+        // SAFETY: the held parent and immediately revalidated name identify
+        // the descriptor-bound entry. Directory removal is never recursive.
+        let result = unsafe { libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), flags) };
+        if result != 0 {
+            return Err(path_error(
+                &self.path,
+                std::io::Error::last_os_error(),
+                "could not remove bound state entry",
+            ));
+        }
+        sync_directory(&self.parent).map_err(|source| StateError::RemovalDurabilityUnknown {
+            path: self.path,
+            source,
+        })
     }
 }
 
@@ -696,8 +1422,43 @@ impl Drop for TransientStateFile {
 
 /// A validated regular state file.
 pub struct StateFile {
-    file: File,
+    file: UnlockOnDropFile,
     path: PathBuf,
+}
+
+/// A descriptor that explicitly releases any held lock before closing.
+struct UnlockOnDropFile(Option<File>);
+
+impl UnlockOnDropFile {
+    fn new(file: File) -> Self {
+        Self(Some(file))
+    }
+
+    fn into_inner(mut self) -> File {
+        self.0.take().expect("state descriptor is present")
+    }
+}
+
+impl std::ops::Deref for UnlockOnDropFile {
+    type Target = File;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("state descriptor is present")
+    }
+}
+
+impl std::ops::DerefMut for UnlockOnDropFile {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect("state descriptor is present")
+    }
+}
+
+impl Drop for UnlockOnDropFile {
+    fn drop(&mut self) {
+        if let Some(file) = self.0.as_ref() {
+            let _ = file.unlock();
+        }
+    }
 }
 
 struct DirectoryStream(*mut libc::DIR);
@@ -960,6 +1721,114 @@ impl StateFile {
         self.file.lock()
     }
 
+    /// Try to lock this held file without waiting for another process.
+    pub fn try_lock(&self) -> std::io::Result<bool> {
+        match self.file.try_lock() {
+            Ok(()) => Ok(true),
+            Err(TryLockError::WouldBlock) => Ok(false),
+            Err(TryLockError::Error(error)) => Err(error),
+        }
+    }
+
+    /// Release an exclusive lock held by this descriptor.
+    pub fn unlock(&self) -> std::io::Result<()> {
+        self.file.unlock()
+    }
+
+    /// Append one record while keeping the file within a fixed byte limit.
+    ///
+    /// Rotation keeps recent complete lines from the old tail. A record larger
+    /// than the whole limit keeps its final bytes. The held descriptor remains
+    /// the only authority and the file is never replaced by path.
+    pub fn append_bounded(
+        &mut self,
+        record: &[u8],
+        max_bytes: usize,
+        retain_bytes: usize,
+    ) -> std::io::Result<()> {
+        if max_bytes == 0 || max_bytes > BOUNDED_APPEND_LIMIT_MAX || retain_bytes >= max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bounded append limits are invalid",
+            ));
+        }
+
+        self.file.lock()?;
+        let result = self.append_bounded_locked(record, max_bytes, retain_bytes);
+        let unlock = self.file.unlock();
+        match result {
+            Err(error) => Err(error),
+            Ok(()) => unlock,
+        }
+    }
+
+    /// Try one bounded append without waiting for another file writer.
+    pub fn try_append_bounded(
+        &mut self,
+        record: &[u8],
+        max_bytes: usize,
+        retain_bytes: usize,
+    ) -> std::io::Result<bool> {
+        if max_bytes == 0 || max_bytes > BOUNDED_APPEND_LIMIT_MAX || retain_bytes >= max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bounded append limits are invalid",
+            ));
+        }
+        if !self.try_lock()? {
+            return Ok(false);
+        }
+        let result = self.append_bounded_locked(record, max_bytes, retain_bytes);
+        let unlock = self.file.unlock();
+        match result {
+            Err(error) => Err(error),
+            Ok(()) => unlock.map(|()| true),
+        }
+    }
+
+    fn append_bounded_locked(
+        &mut self,
+        record: &[u8],
+        max_bytes: usize,
+        retain_bytes: usize,
+    ) -> std::io::Result<()> {
+        if record.len() >= max_bytes {
+            self.file.set_len(0)?;
+            self.file
+                .write_all(&record[record.len().saturating_sub(max_bytes)..])?;
+            return self.file.flush();
+        }
+
+        let length = self.file.seek(SeekFrom::End(0))?;
+        if length.saturating_add(record.len() as u64) <= max_bytes as u64 {
+            self.file.write_all(record)?;
+            return self.file.flush();
+        }
+
+        let available = max_bytes - record.len();
+        let keep = retain_bytes
+            .min(available)
+            .min(usize::try_from(length).unwrap_or(usize::MAX));
+        let start = length.saturating_sub(keep as u64);
+        self.file.seek(SeekFrom::Start(start))?;
+        let mut tail = Vec::with_capacity(keep);
+        Read::by_ref(&mut *self.file)
+            .take(keep as u64)
+            .read_to_end(&mut tail)?;
+        if start > 0 {
+            let cut = tail
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(tail.len(), |position| position + 1);
+            tail.drain(..cut);
+        }
+
+        self.file.set_len(0)?;
+        self.file.write_all(&tail)?;
+        self.file.write_all(record)?;
+        self.file.flush()
+    }
+
     /// Change the length of this held file.
     pub fn set_len(&self, size: u64) -> std::io::Result<()> {
         self.file.set_len(size)
@@ -971,7 +1840,7 @@ impl StateFile {
 
     /// Return the validated descriptor as a standard file handle.
     pub fn into_file(self) -> File {
-        self.file
+        self.file.into_inner()
     }
 }
 
@@ -1192,6 +2061,369 @@ fn open_directory_at(parent: &File, name: &CString) -> std::io::Result<File> {
     }
 }
 
+fn validate_inspection_limits(limits: InspectionLimits, path: &Path) -> Result<(), StateError> {
+    if limits.max_entries > INSPECTION_ENTRY_LIMIT_MAX {
+        return Err(unsafe_path(
+            path,
+            "inspection entry limit exceeds the hard ceiling",
+        ));
+    }
+    if limits.max_name_bytes > INSPECTION_NAME_BYTES_LIMIT_MAX {
+        return Err(unsafe_path(
+            path,
+            "inspection name-byte limit exceeds the hard ceiling",
+        ));
+    }
+    Ok(())
+}
+
+fn inspected_kind(mode: u32) -> InspectedKind {
+    match mode & libc::S_IFMT as u32 {
+        value if value == libc::S_IFDIR as u32 => InspectedKind::Directory,
+        value if value == libc::S_IFREG as u32 => InspectedKind::RegularFile,
+        value if value == libc::S_IFSOCK as u32 => InspectedKind::Socket,
+        value if value == libc::S_IFLNK as u32 => InspectedKind::Symlink,
+        _ => InspectedKind::Other,
+    }
+}
+
+fn inspection_safety(
+    kind: InspectedKind,
+    mode: u32,
+    uid: u32,
+    links: u64,
+    owner: u32,
+) -> Option<&'static str> {
+    if uid != owner {
+        return Some("state entry belongs to another user");
+    }
+    match kind {
+        InspectedKind::Symlink => return Some("state entry is a symbolic link"),
+        InspectedKind::Other => return Some("state entry has an unsupported file type"),
+        InspectedKind::RegularFile if links != 1 => {
+            return Some("state file has multiple hard links")
+        }
+        InspectedKind::Socket if links != 1 => return Some("state socket has multiple hard links"),
+        _ => {}
+    }
+    let permissions = mode & 0o7777;
+    let allowed = match kind {
+        InspectedKind::Directory => DIRECTORY_MODE,
+        InspectedKind::RegularFile => FILE_MODE,
+        // A socket is protected by its owner-only parent. Socket mode is
+        // platform-managed and therefore reported without imposing 0600.
+        InspectedKind::Socket => return None,
+        InspectedKind::Symlink | InspectedKind::Other => unreachable!("handled above"),
+    };
+    if permissions & !allowed != 0 {
+        Some("state entry permissions grant access beyond the owner")
+    } else {
+        None
+    }
+}
+
+fn inspected_from_metadata(
+    path: PathBuf,
+    metadata: &std::fs::Metadata,
+    owner: u32,
+) -> InspectedEntry {
+    let mode = metadata.mode();
+    let kind = inspected_kind(mode);
+    let uid = metadata.uid();
+    let links = metadata.nlink();
+    InspectedEntry {
+        path,
+        kind,
+        mode: mode & 0o7777,
+        uid,
+        links,
+        size: metadata.size(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        unsafe_reason: inspection_safety(kind, mode, uid, links, owner),
+    }
+}
+
+/// Widen `ino_t` on 32-bit Linux while staying a no-op on 64-bit targets.
+#[allow(clippy::unnecessary_cast)]
+fn stat_inode(metadata: &libc::stat) -> u64 {
+    metadata.st_ino as u64
+}
+
+fn inspected_from_stat(path: PathBuf, metadata: &libc::stat, owner: u32) -> InspectedEntry {
+    let mode = metadata.st_mode as u32;
+    let kind = inspected_kind(mode);
+    let uid = metadata.st_uid;
+    let links = metadata.st_nlink as u64;
+    InspectedEntry {
+        path,
+        kind,
+        mode: mode & 0o7777,
+        uid,
+        links,
+        size: u64::try_from(metadata.st_size).unwrap_or_default(),
+        device: metadata.st_dev as u64,
+        inode: stat_inode(metadata),
+        unsafe_reason: inspection_safety(kind, mode, uid, links, owner),
+    }
+}
+
+fn same_stat_identity(left: &libc::stat, right: &libc::stat) -> bool {
+    left.st_dev == right.st_dev
+        && left.st_ino == right.st_ino
+        && left.st_mode & libc::S_IFMT == right.st_mode & libc::S_IFMT
+        && left.st_uid == right.st_uid
+        && left.st_nlink == right.st_nlink
+}
+
+fn metadata_matches_stat(metadata: &std::fs::Metadata, inspected: &libc::stat) -> bool {
+    metadata.dev() == inspected.st_dev as u64
+        && metadata.ino() == stat_inode(inspected)
+        && metadata.mode() & libc::S_IFMT as u32 == inspected.st_mode as u32 & libc::S_IFMT as u32
+        && metadata.uid() == inspected.st_uid
+        && metadata.nlink() == inspected.st_nlink as u64
+}
+
+fn metadata_stable_during_read(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.mode() & libc::S_IFMT as u32 == after.mode() & libc::S_IFMT as u32
+        && before.uid() == after.uid()
+        && before.nlink() == after.nlink()
+        && before.size() == after.size()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+}
+
+fn removal_kind(kind: RemovalKind) -> InspectedKind {
+    match kind {
+        RemovalKind::RegularFile => InspectedKind::RegularFile,
+        RemovalKind::EmptyDirectory => InspectedKind::Directory,
+    }
+}
+
+fn validate_removal_stat(
+    metadata: &libc::stat,
+    expected: &InspectedEntry,
+    kind: RemovalKind,
+) -> Result<(), StateError> {
+    let same = inspected_kind(metadata.st_mode as u32) == removal_kind(kind)
+        && metadata.st_dev as u64 == expected.device
+        && stat_inode(metadata) == expected.inode
+        && metadata.st_uid == expected.uid
+        && metadata.st_nlink as u64 == expected.links
+        && metadata.st_mode as u32 & 0o7777 == expected.mode
+        && u64::try_from(metadata.st_size).unwrap_or_default() == expected.size;
+    if same {
+        Ok(())
+    } else {
+        Err(unsafe_path(
+            &expected.path,
+            "removal target changed during binding",
+        ))
+    }
+}
+
+fn validate_removal_descriptor(
+    target: &File,
+    expected: &InspectedEntry,
+    kind: RemovalKind,
+) -> Result<(), StateError> {
+    let metadata = target
+        .metadata()
+        .map_err(|source| io_error(&expected.path, source))?;
+    let type_matches = match kind {
+        RemovalKind::RegularFile => metadata.file_type().is_file(),
+        RemovalKind::EmptyDirectory => metadata.file_type().is_dir(),
+    };
+    let same = type_matches
+        && metadata.dev() == expected.device
+        && metadata.ino() == expected.inode
+        && metadata.uid() == expected.uid
+        && metadata.nlink() == expected.links
+        && metadata.mode() & 0o7777 == expected.mode
+        && metadata.size() == expected.size;
+    if same {
+        Ok(())
+    } else {
+        Err(unsafe_path(
+            &expected.path,
+            "removal target changed during binding",
+        ))
+    }
+}
+
+fn open_inspection_at(
+    parent: &File,
+    name: &CString,
+    kind: InspectedKind,
+) -> std::io::Result<Option<File>> {
+    if !matches!(kind, InspectedKind::Directory | InspectedKind::RegularFile) {
+        return Ok(None);
+    }
+    #[cfg(target_os = "linux")]
+    let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let flags = match kind {
+        InspectedKind::Directory => libc::O_SEARCH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        InspectedKind::RegularFile => {
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
+        }
+        _ => unreachable!("filtered above"),
+    };
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: fd is a fresh successful openat result owned here.
+        Ok(Some(unsafe { File::from_raw_fd(fd) }))
+    }
+}
+
+fn open_lockable_regular_at(parent: &File, name: &CString) -> std::io::Result<File> {
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    // SAFETY: parent and name are held values. The returned descriptor is
+    // retained through removal and supports flock on Linux, unlike O_PATH.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: fd is a fresh successful openat result owned here.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+fn inspect_directory_descriptor(
+    directory: File,
+    path: PathBuf,
+    owner: u32,
+    inspected_directory: InspectedEntry,
+    limits: InspectionLimits,
+) -> Result<DirectoryInspection, StateError> {
+    validate_inspection_limits(limits, &path)?;
+    let stream_file = open_directory_for_enumeration(&directory, &path)?;
+    // SAFETY: stream_file is an open directory descriptor. fdopendir takes
+    // ownership only when it returns a non-null stream.
+    let stream = unsafe { libc::fdopendir(stream_file.as_raw_fd()) };
+    if stream.is_null() {
+        return Err(io_error(&path, std::io::Error::last_os_error()));
+    }
+    std::mem::forget(stream_file);
+    let stream = DirectoryStream(stream);
+    let mut entries = Vec::with_capacity(limits.max_entries.min(256));
+    let mut retained_name_bytes = 0usize;
+    let mut truncated = false;
+
+    loop {
+        clear_errno();
+        // SAFETY: stream remains live until the guard is dropped.
+        let raw = unsafe { libc::readdir(stream.0) };
+        if raw.is_null() {
+            let error = current_errno();
+            if error == 0 {
+                break;
+            }
+            return Err(io_error(&path, std::io::Error::from_raw_os_error(error)));
+        }
+        // SAFETY: readdir returned a live dirent with a NUL-terminated name.
+        let name = unsafe { CStr::from_ptr((*raw).d_name.as_ptr()) };
+        let name_bytes = name.to_bytes();
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+        let Some(next_name_bytes) = retained_name_bytes.checked_add(name_bytes.len()) else {
+            truncated = true;
+            break;
+        };
+        if entries.len() >= limits.max_entries || next_name_bytes > limits.max_name_bytes {
+            truncated = true;
+            break;
+        }
+
+        let name = OsStr::from_bytes(name_bytes).to_os_string();
+        let entry_path = path.join(&name);
+        inspect_after_read(&entry_path);
+        let c_name = c_name(&entry_path, &name)?;
+        let before = stat_at_optional(&directory, &c_name, &entry_path)?.ok_or_else(|| {
+            unsafe_path(
+                &entry_path,
+                "state entry changed during read-only inspection",
+            )
+        })?;
+        // d_ino binds the enumeration to the metadata lookup. Missing or
+        // different identity cannot support a safe snapshot.
+        let read_inode = unsafe { (*raw).d_ino as u64 };
+        if read_inode == 0 || read_inode != before.st_ino as u64 {
+            return Err(unsafe_path(
+                &entry_path,
+                "state entry changed during read-only inspection",
+            ));
+        }
+        let kind = inspected_kind(before.st_mode as u32);
+        let pinned = open_inspection_at(&directory, &c_name, kind);
+        let after = stat_at_optional(&directory, &c_name, &entry_path)?.ok_or_else(|| {
+            unsafe_path(
+                &entry_path,
+                "state entry changed during read-only inspection",
+            )
+        })?;
+        if !same_stat_identity(&before, &after) {
+            return Err(unsafe_path(
+                &entry_path,
+                "state entry changed during read-only inspection",
+            ));
+        }
+
+        let mut entry = inspected_from_stat(entry_path.clone(), &after, owner);
+        match pinned {
+            Ok(Some(file)) => {
+                let metadata = file
+                    .metadata()
+                    .map_err(|source| io_error(&entry_path, source))?;
+                if !metadata_matches_stat(&metadata, &after) {
+                    return Err(unsafe_path(
+                        &entry_path,
+                        "state entry changed during read-only inspection",
+                    ));
+                }
+            }
+            Ok(None) => {}
+            Err(_) if entry.unsafe_reason.is_some() => {}
+            Err(_) => {
+                entry.unsafe_reason = Some("state entry could not be pinned for inspection");
+            }
+        }
+        retained_name_bytes = next_name_bytes;
+        entries.push(entry);
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(DirectoryInspection {
+        directory: inspected_directory,
+        entries,
+        retained_name_bytes,
+        truncated,
+    })
+}
+
+#[cfg(test)]
+fn inspect_after_read(path: &Path) {
+    INSPECT_AFTER_READ.with(|slot| {
+        if let Some(action) = slot.borrow_mut().take() {
+            action(path);
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn inspect_after_read(_: &Path) {}
+
+#[cfg(test)]
+fn inject_inspect_after_read(action: impl FnOnce(&Path) + 'static) {
+    INSPECT_AFTER_READ.with(|slot| *slot.borrow_mut() = Some(Box::new(action)));
+}
+
 fn read_regular_file_names(directory: &File, path: &Path) -> Result<Vec<OsString>, StateError> {
     let mut names = Vec::new();
     for name in read_entry_names(directory, path)? {
@@ -1206,7 +2438,7 @@ fn read_regular_file_names(directory: &File, path: &Path) -> Result<Vec<OsString
 }
 
 fn read_entry_names(directory: &File, path: &Path) -> Result<Vec<OsString>, StateError> {
-    let stream_file = clone_file(directory, path)?;
+    let stream_file = open_directory_for_enumeration(directory, path)?;
     // SAFETY: stream_file is an open directory descriptor. fdopendir takes
     // ownership only when it returns a non-null stream.
     let stream = unsafe { libc::fdopendir(stream_file.as_raw_fd()) };
@@ -1238,6 +2470,33 @@ fn read_entry_names(directory: &File, path: &Path) -> Result<Vec<OsString>, Stat
     }
 
     Ok(names)
+}
+
+fn open_directory_for_enumeration(directory: &File, path: &Path) -> Result<File, StateError> {
+    let held = directory
+        .metadata()
+        .map_err(|source| io_error(path, source))?;
+    // Duplicated directory descriptors share a cursor. Opening dot relative to
+    // the held directory creates an independent cursor without reopening a path.
+    let dot = CString::new(".").expect("dot is one valid directory component");
+    let opened = open_directory_at(directory, &dot)
+        .map_err(|error| path_error(path, error, "state directory changed before enumeration"))?;
+    let current = opened.metadata().map_err(|source| io_error(path, source))?;
+    let same = held.file_type().is_dir()
+        && current.file_type().is_dir()
+        && held.dev() == current.dev()
+        && held.ino() == current.ino()
+        && held.uid() == current.uid()
+        && held.nlink() == current.nlink()
+        && held.mode() == current.mode()
+        && held.size() == current.size();
+    if !same {
+        return Err(unsafe_path(
+            path,
+            "state directory changed before enumeration",
+        ));
+    }
+    Ok(opened)
 }
 
 fn repair_directory_tree(
@@ -1757,6 +3016,80 @@ fn current_errno() -> libc::c_int {
     unsafe { *errno_location() }
 }
 
+fn validate_inspection_path(path: &Path) -> Result<(), StateError> {
+    if path.as_os_str().as_bytes().len() > INSPECTION_PATH_BYTES_LIMIT_MAX {
+        return Err(unsafe_path(
+            path,
+            "inspection path exceeds the hard byte ceiling",
+        ));
+    }
+    Ok(())
+}
+
+fn inspection_root_parts(path: &Path) -> Result<Vec<&OsStr>, StateError> {
+    validate_inspection_path(path)?;
+    let mut parts = Vec::with_capacity(16);
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(part) => {
+                if parts.len() >= INSPECTION_PATH_COMPONENT_LIMIT_MAX {
+                    return Err(unsafe_path(
+                        path,
+                        "inspection path exceeds the hard component ceiling",
+                    ));
+                }
+                parts.push(part);
+            }
+            Component::ParentDir => {
+                return Err(unsafe_path(path, "state root contains parent traversal"));
+            }
+            Component::Prefix(_) => {
+                return Err(unsafe_path(path, "state root has an unsupported prefix"));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(unsafe_path(path, "state root must name a directory"));
+    }
+    Ok(parts)
+}
+
+fn inspection_descendant_parts(path: &Path) -> Result<Vec<&OsStr>, StateError> {
+    validate_inspection_path(path)?;
+    if path.is_absolute() {
+        return Err(unsafe_path(path, "state descendant must be relative"));
+    }
+    let mut parts = Vec::with_capacity(8);
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => {
+                if parts.len() >= INSPECTION_PATH_COMPONENT_LIMIT_MAX {
+                    return Err(unsafe_path(
+                        path,
+                        "inspection path exceeds the hard component ceiling",
+                    ));
+                }
+                parts.push(part);
+            }
+            Component::ParentDir => {
+                return Err(unsafe_path(
+                    path,
+                    "state descendant contains parent traversal",
+                ));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(unsafe_path(path, "state descendant must be relative"));
+            }
+            Component::CurDir => {}
+        }
+    }
+    if parts.is_empty() {
+        return Err(unsafe_path(path, "state descendant must name an entry"));
+    }
+    Ok(parts)
+}
+
 fn root_parts(path: &Path) -> Result<Vec<&OsStr>, StateError> {
     let mut parts = Vec::new();
     for component in path.components() {
@@ -1898,6 +3231,605 @@ mod tests {
 
     fn root_in(temp: &tempfile::TempDir) -> StateRoot {
         StateRoot::open_or_create(&base(temp).join("state")).unwrap()
+    }
+
+    #[test]
+    fn read_only_inspection_reports_without_repairing_permissions() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+        let ledger = root_path.join("ledger");
+        let journal = ledger.join("main.ndjson");
+        fs::create_dir(&root_path).unwrap();
+        fs::create_dir(&ledger).unwrap();
+        fs::write(&journal, b"private\n").unwrap();
+        set_mode(&root_path, 0o755);
+        set_mode(&ledger, 0o750);
+        set_mode(&journal, 0o640);
+
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        assert_eq!(inspector.root().mode, 0o755);
+        assert_eq!(
+            inspector.root().unsafe_reason,
+            Some("state entry permissions grant access beyond the owner")
+        );
+        assert!(inspector.root().safe_beneath_owner_only_parent());
+        let root = inspector.inspect_root(InspectionLimits::default()).unwrap();
+        assert_eq!(root.entries.len(), 1);
+        assert_eq!(root.entries[0].kind, InspectedKind::Directory);
+        assert_eq!(root.entries[0].mode, 0o750);
+        let ledger_snapshot = inspector
+            .inspect_directory(Path::new("ledger"), InspectionLimits::default())
+            .unwrap()
+            .expect("ledger directory");
+        assert_eq!(ledger_snapshot.entries.len(), 1);
+        assert_eq!(ledger_snapshot.entries[0].kind, InspectedKind::RegularFile);
+        assert_eq!(ledger_snapshot.entries[0].mode, 0o640);
+        assert_eq!(fs::read(&journal).unwrap(), b"private\n");
+        assert_eq!(mode(&root_path), 0o755);
+        assert_eq!(mode(&ledger), 0o750);
+        assert_eq!(mode(&journal), 0o640);
+    }
+
+    #[test]
+    fn read_only_inspection_treats_a_missing_root_as_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = base(&temp).join("missing");
+        assert!(StateInspector::open_existing(&path).unwrap().is_none());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn read_only_inspection_reports_links_without_following_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let root_path = base.join("state");
+        let external = base.join("external");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(&external, b"outside\n").unwrap();
+        set_mode(&external, 0o644);
+        symlink(&external, root_path.join("linked")).unwrap();
+        fs::hard_link(&external, root_path.join("shared")).unwrap();
+
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let snapshot = inspector.inspect_root(InspectionLimits::default()).unwrap();
+        let linked = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.path.ends_with("linked"))
+            .unwrap();
+        assert_eq!(linked.kind, InspectedKind::Symlink);
+        assert_eq!(linked.unsafe_reason, Some("state entry is a symbolic link"));
+        let shared = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.path.ends_with("shared"))
+            .unwrap();
+        assert_eq!(shared.kind, InspectedKind::RegularFile);
+        assert_eq!(
+            shared.unsafe_reason,
+            Some("state file has multiple hard links")
+        );
+        assert!(!shared.safe_beneath_owner_only_parent());
+        assert_eq!(fs::read(&external).unwrap(), b"outside\n");
+        assert_eq!(mode(&external), 0o644);
+    }
+
+    #[test]
+    fn read_only_inspection_stops_at_explicit_limits() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+        fs::create_dir(&root_path).unwrap();
+        for name in ["one", "two", "three"] {
+            fs::write(root_path.join(name), name).unwrap();
+        }
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let snapshot = inspector
+            .inspect_root(InspectionLimits::new(1, 64).unwrap())
+            .unwrap();
+        assert_eq!(snapshot.entries.len(), 1);
+        assert!(snapshot.truncated);
+        assert!(snapshot.retained_name_bytes <= 64);
+
+        let no_names = inspector
+            .inspect_root(InspectionLimits::new(3, 0).unwrap())
+            .unwrap();
+        assert!(no_names.entries.is_empty());
+        assert!(no_names.truncated);
+        assert!(InspectionLimits::new(INSPECTION_ENTRY_LIMIT_MAX + 1, 1).is_err());
+        assert!(InspectionLimits::new(1, INSPECTION_NAME_BYTES_LIMIT_MAX + 1).is_err());
+    }
+
+    #[test]
+    fn read_only_inspection_restarts_each_directory_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+        fs::create_dir(&root_path).unwrap();
+        for name in ["one", "two", "three"] {
+            fs::write(root_path.join(name), name).unwrap();
+        }
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+
+        let first = inspector.inspect_root(InspectionLimits::default()).unwrap();
+        let bounded = inspector
+            .inspect_root(InspectionLimits::new(1, 64).unwrap())
+            .unwrap();
+        let second = inspector.inspect_root(InspectionLimits::default()).unwrap();
+
+        assert!(bounded.truncated);
+        assert_eq!(bounded.entries.len(), 1);
+        assert_eq!(first, second);
+        assert_eq!(second.entries.len(), 3);
+    }
+
+    #[test]
+    fn read_only_inspection_bounds_lookup_paths_before_opening_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+        fs::create_dir(&root_path).unwrap();
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+
+        let mut components = PathBuf::new();
+        for _ in 0..=INSPECTION_PATH_COMPONENT_LIMIT_MAX {
+            components.push("x");
+        }
+        assert!(inspector
+            .inspect_directory(&components, InspectionLimits::default())
+            .unwrap_err()
+            .to_string()
+            .contains("component ceiling"));
+
+        let long = PathBuf::from("x".repeat(INSPECTION_PATH_BYTES_LIMIT_MAX + 1));
+        assert!(inspector
+            .read_file(&long, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("byte ceiling"));
+    }
+
+    #[test]
+    fn read_only_file_inspection_is_bounded_and_keeps_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+        let file = root_path.join("manifest.toml");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(&file, b"0123456789").unwrap();
+        set_mode(&file, 0o640);
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let snapshot = inspector
+            .read_file(Path::new("manifest.toml"), 4)
+            .unwrap()
+            .expect("manifest");
+        assert_eq!(snapshot.bytes, b"0123");
+        assert!(snapshot.truncated);
+        assert_eq!(snapshot.entry.mode, 0o640);
+        assert_eq!(mode(&file), 0o640);
+        assert!(inspector
+            .read_file(
+                Path::new("manifest.toml"),
+                INSPECTION_FILE_BYTES_LIMIT_MAX + 1
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn read_only_file_inspection_refuses_a_same_inode_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+        let file = root_path.join("manifest.toml");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(&file, b"old bytes").unwrap();
+        let original = fs::symlink_metadata(&file).unwrap();
+        let rewrite = file.clone();
+        inject_inspect_after_read(move |_| fs::write(&rewrite, b"new bytes").unwrap());
+
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let error = inspector
+            .read_file(Path::new("manifest.toml"), 64)
+            .unwrap_err();
+        let changed = fs::symlink_metadata(&file).unwrap();
+        assert_eq!(original.dev(), changed.dev());
+        assert_eq!(original.ino(), changed.ino());
+        assert!(error
+            .to_string()
+            .contains("changed during read-only inspection"));
+    }
+
+    #[test]
+    fn read_only_inspection_refuses_an_entry_replaced_after_readdir() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+        let entry = root_path.join("entry");
+        let displaced = root_path.join("displaced");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(&entry, b"old").unwrap();
+        let replace_entry = entry.clone();
+        inject_inspect_after_read(move |_| {
+            fs::rename(&replace_entry, &displaced).unwrap();
+            fs::write(&replace_entry, b"new").unwrap();
+        });
+
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let error = inspector
+            .inspect_root(InspectionLimits::default())
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("changed during read-only inspection"));
+    }
+
+    #[test]
+    fn bound_directory_inspection_refuses_a_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+        let child = root_path.join("child");
+        fs::create_dir(&root_path).unwrap();
+        fs::create_dir(&child).unwrap();
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let root = inspector.inspect_root(InspectionLimits::default()).unwrap();
+        let expected = root
+            .entries
+            .iter()
+            .find(|entry| entry.path == child)
+            .unwrap();
+        fs::rename(&child, root_path.join("old-child")).unwrap();
+        fs::create_dir(&child).unwrap();
+        let error = inspector
+            .inspect_bound_directory(expected, InspectionLimits::default())
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("changed during read-only inspection"));
+    }
+
+    #[test]
+    fn read_only_inspection_detects_a_replaced_root_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let root_path = base.join("state");
+        fs::create_dir(&root_path).unwrap();
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        fs::rename(&root_path, base.join("old-state")).unwrap();
+        fs::create_dir(&root_path).unwrap();
+        assert!(!inspector.path_matches_held_root().unwrap());
+    }
+
+    #[test]
+    fn bound_removal_rejects_symbolic_and_multiply_linked_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let root_path = base.join("state");
+        let external = base.join("external");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(&external, b"outside\n").unwrap();
+        symlink(&external, root_path.join("linked")).unwrap();
+        fs::hard_link(&external, root_path.join("shared")).unwrap();
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let snapshot = inspector.inspect_root(InspectionLimits::default()).unwrap();
+
+        let linked = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.path.ends_with("linked"))
+            .unwrap();
+        assert!(inspector.bind_regular_file_for_removal(linked).is_err());
+        let shared = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.path.ends_with("shared"))
+            .unwrap();
+        assert!(inspector.bind_regular_file_for_removal(shared).is_err());
+        assert_eq!(fs::read(&external).unwrap(), b"outside\n");
+        assert!(root_path.join("linked").is_symlink());
+        assert!(root_path.join("shared").exists());
+    }
+
+    #[test]
+    fn bound_regular_removal_refuses_an_inode_swap() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+        let path = root_path.join("entry");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(&path, b"original").unwrap();
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let snapshot = inspector.inspect_root(InspectionLimits::default()).unwrap();
+        let removal = inspector
+            .bind_regular_file_for_removal(&snapshot.entries[0])
+            .unwrap();
+
+        let displaced = root_path.join("displaced");
+        fs::rename(&path, &displaced).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        assert!(removal.remove().is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        assert_eq!(fs::read(&displaced).unwrap(), b"original");
+    }
+
+    #[test]
+    fn bound_regular_removal_refuses_a_mode_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+        let path = root_path.join("entry");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(&path, b"original").unwrap();
+        set_mode(&path, 0o600);
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let snapshot = inspector.inspect_root(InspectionLimits::default()).unwrap();
+        let removal = inspector
+            .bind_regular_file_for_removal(&snapshot.entries[0])
+            .unwrap();
+
+        set_mode(&path, 0o666);
+        fs::write(&path, b"modified").unwrap();
+        assert!(removal.remove().is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"modified");
+        assert_eq!(mode(&path), 0o666);
+    }
+
+    #[test]
+    fn bound_regular_removal_refuses_a_size_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+        let path = root_path.join("entry");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(&path, b"original").unwrap();
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let snapshot = inspector.inspect_root(InspectionLimits::default()).unwrap();
+        let removal = inspector
+            .bind_regular_file_for_removal(&snapshot.entries[0])
+            .unwrap();
+
+        fs::write(&path, b"changed size").unwrap();
+        assert!(removal.remove().is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"changed size");
+    }
+
+    #[test]
+    fn bound_regular_removal_removes_only_the_inspected_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+        let path = root_path.join("entry");
+        let keep = root_path.join("keep");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(&path, b"remove").unwrap();
+        fs::write(&keep, b"keep").unwrap();
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let snapshot = inspector.inspect_root(InspectionLimits::default()).unwrap();
+        let entry = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .unwrap();
+
+        inspector
+            .bind_regular_file_for_removal(entry)
+            .unwrap()
+            .remove()
+            .unwrap();
+
+        assert!(!path.exists());
+        assert_eq!(fs::read(&keep).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn bound_regular_removal_retains_a_lockable_descriptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+        let path = root_path.join("entry");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(&path, b"lease").unwrap();
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let snapshot = inspector.inspect_root(InspectionLimits::default()).unwrap();
+        let removal = inspector
+            .bind_regular_file_for_removal(&snapshot.entries[0])
+            .unwrap();
+
+        assert!(removal.try_lock().unwrap());
+        let competing = fs::File::open(&path).unwrap();
+        assert_ne!(
+            unsafe { libc::flock(competing.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "the bound removal must retain the lock"
+        );
+    }
+
+    #[test]
+    fn directory_isolation_preserves_identity_and_never_replaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+        let asset = root_path.join("asset");
+        let isolated = root_path.join(".isolated");
+        fs::create_dir(&root_path).unwrap();
+        fs::create_dir(&asset).unwrap();
+        fs::write(asset.join("payload"), b"keep").unwrap();
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let snapshot = inspector.inspect_root(InspectionLimits::default()).unwrap();
+        let expected = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.path == asset)
+            .unwrap();
+
+        let moved = inspector
+            .isolate_direct_child_directory(expected, OsStr::new(".isolated"))
+            .unwrap();
+        assert_eq!(moved.path, isolated);
+        assert_eq!(moved.device, expected.device);
+        assert_eq!(moved.inode, expected.inode);
+        assert!(!asset.exists());
+        assert_eq!(fs::read(isolated.join("payload")).unwrap(), b"keep");
+
+        fs::create_dir(&asset).unwrap();
+        fs::create_dir(root_path.join(".occupied")).unwrap();
+        let snapshot = inspector.inspect_root(InspectionLimits::default()).unwrap();
+        let replacement = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.path == asset)
+            .unwrap();
+        let error = inspector
+            .isolate_direct_child_directory(replacement, OsStr::new(".occupied"))
+            .unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        assert!(asset.is_dir());
+        assert!(root_path.join(".occupied").is_dir());
+    }
+
+    #[test]
+    fn bound_empty_directory_removal_is_explicit_and_non_recursive() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+        let empty = root_path.join("empty");
+        let mode_changed = root_path.join("mode-changed");
+        let links_changed = root_path.join("links-changed");
+        let nonempty = root_path.join("nonempty");
+        fs::create_dir(&root_path).unwrap();
+        fs::create_dir(&empty).unwrap();
+        fs::create_dir(&mode_changed).unwrap();
+        fs::create_dir(&links_changed).unwrap();
+        fs::create_dir(&nonempty).unwrap();
+        set_mode(&mode_changed, 0o700);
+        fs::write(nonempty.join("keep"), b"keep").unwrap();
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let snapshot = inspector.inspect_root(InspectionLimits::default()).unwrap();
+        let entry = |name: &str| {
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.path.ends_with(name))
+                .unwrap()
+        };
+
+        inspector
+            .bind_empty_directory_for_removal(entry("empty"))
+            .unwrap()
+            .remove()
+            .unwrap();
+        assert!(!empty.exists());
+
+        let removal = inspector
+            .bind_empty_directory_for_removal(entry("mode-changed"))
+            .unwrap();
+        set_mode(&mode_changed, 0o755);
+        let error = removal.remove().unwrap_err();
+        assert!(error.to_string().contains("changed before removal"));
+        assert!(mode_changed.is_dir());
+        assert_eq!(mode(&mode_changed), 0o755);
+
+        let removal = inspector
+            .bind_empty_directory_for_removal(entry("links-changed"))
+            .unwrap();
+        fs::create_dir(links_changed.join("late")).unwrap();
+        let error = removal.remove().unwrap_err();
+        assert!(error.to_string().contains("changed before removal"));
+        assert!(links_changed.join("late").is_dir());
+
+        assert!(inspector
+            .bind_empty_directory_for_removal(entry("nonempty"))
+            .is_err());
+        assert_eq!(fs::read(nonempty.join("keep")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn bounded_append_keeps_the_latest_complete_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = root_in(&temp);
+        let path = root.path().join("cyclopsd.log");
+        let mut file = root.open_append(Path::new("cyclopsd.log")).unwrap();
+
+        file.append_bounded(b"first failure context\n", 64, 32)
+            .unwrap();
+        file.append_bounded(b"second failure context\n", 64, 32)
+            .unwrap();
+        file.append_bounded(b"latest failure context\n", 64, 32)
+            .unwrap();
+
+        let bytes = fs::read(path).unwrap();
+        assert!(bytes.len() <= 64);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("first failure context"));
+        assert!(text.contains("second failure context"));
+        assert!(text.contains("latest failure context"));
+    }
+
+    #[test]
+    fn bounded_append_caps_one_oversized_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = root_in(&temp);
+        let path = root.path().join("cyclopsd.log");
+        let mut file = root.open_append(Path::new("cyclopsd.log")).unwrap();
+        let mut record = vec![b'x'; 96];
+        record[64..].copy_from_slice(b"latest-32-bytes-stay-in-the-log!");
+
+        file.append_bounded(&record, 32, 16).unwrap();
+
+        assert_eq!(fs::read(path).unwrap(), &record[64..]);
+    }
+
+    #[test]
+    fn state_file_try_lock_never_waits_for_an_existing_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = root_in(&temp);
+        let first = root.open_append(Path::new("hook-errors.log")).unwrap();
+        let second = root.open_append(Path::new("hook-errors.log")).unwrap();
+
+        first.lock().unwrap();
+        let inherited = first.file.try_clone().unwrap();
+        assert!(!second.try_lock().unwrap());
+        drop(first);
+        assert!(second.try_lock().unwrap());
+        drop(inherited);
+    }
+
+    #[test]
+    fn bounded_try_append_never_waits_for_an_existing_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = root_in(&temp);
+        let path = root.path().join("cyclopsd.log");
+        let first = root.open_append(Path::new("cyclopsd.log")).unwrap();
+        let mut second = root.open_append(Path::new("cyclopsd.log")).unwrap();
+
+        first.lock().unwrap();
+        assert!(!second.try_append_bounded(b"blocked\n", 64, 32).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"");
+        drop(first);
+        assert!(second.try_append_bounded(b"written\n", 64, 32).unwrap());
+        assert_eq!(fs::read(path).unwrap(), b"written\n");
     }
 
     #[test]

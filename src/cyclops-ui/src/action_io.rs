@@ -111,6 +111,10 @@ pub enum ActionRequest {
         body: String,
         client_key: String,
     },
+    WithdrawNotification {
+        attempt_id: NotificationAttemptId,
+        recipient: cyclops_proto::RecipientKey,
+    },
     ClearAlarm {
         attempt_id: NotificationAttemptId,
     },
@@ -138,7 +142,8 @@ pub enum ActionOutcome {
     NotSent(String),
     /// The request was written and the outcome is unknown. It may have
     /// landed, so a reply must be retried under the same key and the
-    /// terminal verbs must not be repeated.
+    /// terminal verbs must not be repeated as fresh actions. A later
+    /// matching terminal-accepted fact may permit no-key reconciliation.
     Uncertain(String),
 }
 
@@ -170,6 +175,39 @@ pub async fn perform(sock: &Path, request: ActionRequest) -> ActionOutcome {
                 Err(e) => e.into_outcome(),
             }
         }
+        ActionRequest::WithdrawNotification {
+            attempt_id,
+            recipient,
+        } => {
+            let params = serde_json::to_value(cyclops_proto::NotificationWithdrawParams {
+                attempt_id,
+                recipient,
+            })
+            .expect("notification.withdraw params serialize");
+            match call(sock, "notification.withdraw", params).await {
+                Ok(value) => {
+                    match serde_json::from_value::<cyclops_proto::NotificationWithdrawResult>(value)
+                    {
+                        Ok(result) => ActionOutcome::Done(format!(
+                        "wake {} for {}; message remains claimable",
+                        match result.disposition {
+                            cyclops_proto::NotificationWithdrawDisposition::Withdrawn => {
+                                "withdrawn"
+                            }
+                            cyclops_proto::NotificationWithdrawDisposition::AlreadyWithdrawn => {
+                                "already withdrawn"
+                            }
+                        },
+                        result.recipient
+                    )),
+                        Err(error) => ActionOutcome::Uncertain(format!(
+                            "unreadable notification.withdraw result: {error}"
+                        )),
+                    }
+                }
+                Err(error) => error.into_outcome(),
+            }
+        }
         ActionRequest::ClearAlarm { attempt_id } => {
             let params = json!({ "ids": [attempt_id.to_string()] });
             match call(sock, "alarm.clear", params).await {
@@ -178,19 +216,32 @@ pub async fn perform(sock: &Path, request: ActionRequest) -> ActionOutcome {
             }
         }
         ActionRequest::AttentionComplete { attempt_id } => {
-            resolve(sock, "attention.complete", attempt_id, "operator submitted").await
+            resolve(
+                sock,
+                "attention.complete",
+                attempt_id,
+                "notification submitted",
+            )
+            .await
         }
         ActionRequest::AttentionDiscard { attempt_id } => {
-            resolve(sock, "attention.discard", attempt_id, "operator discarded").await
+            resolve(
+                sock,
+                "attention.discard",
+                attempt_id,
+                "notification discarded",
+            )
+            .await
         }
     }
 }
 
 /// The two verbs that end an alarm's life.
 ///
-/// Neither is idempotent, deliberately: a repeat after success is refused
-/// with conflict rather than replayed. That refusal is reported as what
-/// it is so a reader is not invited to try again.
+/// A repeat after success is refused with conflict rather than replayed.
+/// An uncertain action is different: the same RPC enters the daemon's
+/// no-key reconciliation path only after a current snapshot exposes a
+/// matching terminal-accepted fact.
 async fn resolve(
     sock: &Path,
     method: &str,
@@ -211,8 +262,9 @@ async fn resolve(
         },
         // The daemon persisted the intent and then could not finish, so
         // the outcome is genuinely unknown on its side too. This is a
-        // refusal in wire shape and an ambiguity in meaning, and it must
-        // not reoffer the verb: treat it as ambiguity.
+        // refusal in wire shape and an ambiguity in meaning. A later
+        // snapshot may expose matching durable terminal acceptance for
+        // no-key recovery. Intent alone never authorizes it.
         Err(Failure::Refused { code, message }) if code == "attention_action_uncertain" => {
             ActionOutcome::Uncertain(format!(
                 "the daemon recorded the intent and could not finish: {message}"
@@ -478,6 +530,7 @@ async fn ask(stream: UnixStream, method: &str, params: Value) -> Result<Value, F
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
     use tokio::net::UnixListener;
 
     /// A real greeting. The client rejects anything else, so a fixture
@@ -485,6 +538,9 @@ mod tests {
     fn hello_line() -> String {
         let hello = cyclops_proto::Hello {
             cyclops: "0.0.0-test".into(),
+            build: None,
+            daemon_process: None,
+            daemon_executable: None,
             proto: cyclops_proto::PROTOCOL_VERSION,
             boot_id: "boot-test".into(),
         };
@@ -622,6 +678,55 @@ mod tests {
                 assert!(!loaded.checks[0].passed);
             }
             other => panic!("the open did not land: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn withdrawal_names_the_exact_attempt_and_recipient() {
+        let attempt_id =
+            NotificationAttemptId::parse("att-00000000-0000-4000-8000-000000000010").unwrap();
+        let recipient = cyclops_proto::RecipientKey::agent(
+            cyclops_proto::WorkspaceId::from_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            cyclops_proto::SessionInstanceId::from_str("00000000-0000-0000-0000-000000000002")
+                .unwrap(),
+            cyclops_proto::TmuxPaneId::from_str("%1").unwrap(),
+        );
+        for (name, disposition, expected) in [
+            ("withdrawn", "withdrawn", "wake withdrawn"),
+            (
+                "already-withdrawn",
+                "already_withdrawn",
+                "wake already withdrawn",
+            ),
+        ] {
+            let (asked, outcome) = one_call(
+                &format!("ui-action-io-{name}"),
+                json!({
+                    "attempt_id": attempt_id,
+                    "message_id": "m-blocked",
+                    "recipient": recipient,
+                    "disposition": disposition,
+                }),
+                ActionRequest::WithdrawNotification {
+                    attempt_id,
+                    recipient,
+                },
+            )
+            .await;
+
+            assert_eq!(asked["method"], "notification.withdraw");
+            assert_eq!(asked["params"]["attempt_id"], attempt_id.to_string());
+            assert_eq!(
+                asked["params"]["recipient"],
+                serde_json::to_value(recipient).unwrap()
+            );
+            match outcome {
+                ActionOutcome::Done(message) => {
+                    assert!(message.contains(expected), "{message}");
+                    assert!(message.contains("message remains claimable"), "{message}");
+                }
+                other => panic!("withdrawal did not complete: {other:?}"),
+            }
         }
     }
 

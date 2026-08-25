@@ -1,30 +1,37 @@
 # Cyclops hook config template: Claude Code settings fragment.
 # Rendered by `cyclops hooks install claude --agent <label>`; '#' lines are
-# stripped, {label} and {cyclops_bin} are substituted.
+# stripped and {cyclops_bin} is substituted. The label selects the artifact
+# path only. Hook identity comes from the authenticated socket peer so a pane
+# rename cannot stale the config.
 #
 # Wiring: launch claude with `--settings <rendered file>`. Claude only reads
 # hooks from settings it was launched with; dropping this file somewhere is
 # not enough, and cyclops never edits ~/.claude for you. If you already pass
 # your own --settings file, merge the "hooks" object into it instead.
 #
-# Events: UserPromptSubmit is the delivery ACK (payload carries the injected
-# prompt, so the message id is matchable, MEASURED 130/130), Stop is turn
-# end, Notification and PermissionRequest are attention edges. Every entry
-# names its own event on the command line: the receiver must not trust
-# payloads to self-identify (finding F7 on agy set the fleet-wide rule).
+# Events: UserPromptSubmit is an exact dispatch candidate (payload carries the
+# injected prompt, so the message id is matchable, MEASURED 130/130). Claude
+# exposes no key shared with Stop, so visual evidence confirms and ends the
+# candidate. Stop and StopFailure remain liveness telemetry only. Notification
+# and PermissionRequest are attention edges. Every entry names its own event
+# on the command line: the receiver must not trust payloads to self-identify
+# (finding F7 on agy set the fleet-wide rule).
 {
   "hooks": {
     "UserPromptSubmit": [
-      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook UserPromptSubmit --agent {label}" } ] }
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook UserPromptSubmit" } ] }
     ],
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook Stop --agent {label}" } ] }
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook Stop" } ] }
+    ],
+    "StopFailure": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook StopFailure" } ] }
     ],
     "Notification": [
-      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook Notification --agent {label}" } ] }
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook Notification" } ] }
     ],
     "PermissionRequest": [
-      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook PermissionRequest --agent {label}" } ] }
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook PermissionRequest" } ] }
     ]
   }
 }

@@ -48,6 +48,8 @@ pub enum UiMsg {
     Subscribed,
     ConnLost(String),
     Notice(String),
+    /// Exact client and daemon build identity from the socket greeting.
+    BuildHealth(crate::health::BuildHealth),
     /// One-shot eye animation step, armed only while the eye is mid-tick.
     EyeTick,
     /// `cyclops theme <name>` moved the selection. Carries nothing: the
@@ -72,6 +74,15 @@ pub enum UiMsg {
     /// A snapshot read failed. The last good one stays on screen.
     MessagesFailed {
         request: RefreshRequest,
+        why: String,
+    },
+    /// One bounded cursor page of durable message arrivals.
+    MessagesFollow {
+        request: crate::messages::FollowRequest,
+        page: Box<cyclops_proto::MessagesFollowResult>,
+    },
+    MessagesFollowFailed {
+        request: crate::messages::FollowRequest,
         why: String,
     },
     /// A detail read or action came back, under the token it was sent
@@ -104,10 +115,13 @@ pub fn spawn_io(tx: &UnboundedSender<UiMsg>, home: &Path, backfill: usize) -> Io
     ));
     let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(messages_task(tx.clone(), sock.clone(), refresh_rx));
+    let (follow_tx, follow_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(follow_task(tx.clone(), sock.clone(), follow_rx));
     let (action_tx, action_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(action_task(tx.clone(), sock, action_rx));
     Io {
         refresh: refresh_tx,
+        follow: follow_tx,
         action: action_tx,
     }
 }
@@ -115,10 +129,44 @@ pub fn spawn_io(tx: &UnboundedSender<UiMsg>, home: &Path, backfill: usize) -> Io
 /// The two channels the event loop drives its own IO with.
 pub struct Io {
     pub refresh: MessagesRefresh,
+    pub follow: UnboundedSender<crate::messages::FollowRequest>,
     pub action: UnboundedSender<(
         crate::action_io::RequestToken,
         crate::action_io::ActionRequest,
     )>,
+}
+
+async fn follow_task(
+    tx: UnboundedSender<UiMsg>,
+    sock: std::path::PathBuf,
+    mut follow: tokio::sync::mpsc::UnboundedReceiver<crate::messages::FollowRequest>,
+) {
+    while let Some(request) = follow.recv().await {
+        match messages_follow(&sock, request).await {
+            Ok(page) => {
+                if tx
+                    .send(UiMsg::MessagesFollow {
+                        request,
+                        page: Box::new(page),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(error) => {
+                if tx
+                    .send(UiMsg::MessagesFollowFailed {
+                        request,
+                        why: error.to_string(),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// One detail read or action at a time, off the frame path.
@@ -227,6 +275,35 @@ async fn messages_snapshot(
     }
 }
 
+async fn messages_follow(
+    sock: &Path,
+    request: crate::messages::FollowRequest,
+) -> Result<cyclops_proto::MessagesFollowResult, Box<dyn std::error::Error>> {
+    let open = tokio::time::timeout(crate::action_io::OPEN_TIMEOUT, snapshot_open(sock));
+    let (mut lines, mut w) = match open.await {
+        Ok(opened) => opened?,
+        Err(_) => {
+            return Err(format!(
+                "no connection within {}s",
+                crate::action_io::OPEN_TIMEOUT.as_secs()
+            )
+            .into())
+        }
+    };
+    let answer = tokio::time::timeout(
+        crate::action_io::ANSWER_TIMEOUT,
+        follow_ask(&mut lines, &mut w, request),
+    );
+    match answer.await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "no answer within {}s",
+            crate::action_io::ANSWER_TIMEOUT.as_secs()
+        )
+        .into()),
+    }
+}
+
 type SnapshotLines = tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>;
 
 /// Connect and read the greeting. Nothing has been asked for yet.
@@ -270,6 +347,37 @@ async fn snapshot_ask(
         return Ok(serde_json::from_value(v["result"].clone())?);
     }
     Err("messages connection closed early".into())
+}
+
+async fn follow_ask(
+    lines: &mut SnapshotLines,
+    w: &mut tokio::net::unix::OwnedWriteHalf,
+    request: crate::messages::FollowRequest,
+) -> Result<cyclops_proto::MessagesFollowResult, Box<dyn std::error::Error>> {
+    let request_line = serde_json::json!({
+        "id": 1,
+        "method": "messages.follow",
+        "params": {
+            "after_seq": request.after_seq(),
+            "limit": request.limit(),
+        }
+    });
+    w.write_all(request_line.to_string().as_bytes()).await?;
+    w.write_all(b"\n").await?;
+    let line = lines
+        .next_line()
+        .await?
+        .ok_or("messages.follow returned no answer")?;
+    let response: cyclops_proto::Response = serde_json::from_str(&line)?;
+    if let Some(error) = response.error {
+        return Err(format!("messages.follow {}: {}", error.code, error.message).into());
+    }
+    serde_json::from_value(
+        response
+            .result
+            .ok_or("messages.follow returned no result")?,
+    )
+    .map_err(Into::into)
 }
 
 /// Start (or restart) the event subscription.
@@ -339,15 +447,20 @@ async fn subscribe_loop(tx: &UnboundedSender<UiMsg>, sock: &Path) -> Result<(), 
     let stream = UnixStream::connect(sock).await.map_err(connect_words)?;
     let (r, mut w) = stream.into_split();
     let mut lines = BufReader::new(r).lines();
-    // Hello first (S2). Version mismatch warns nowhere useful in a full
-    // screen UI; the protocol is tolerant by design.
-    if lines
-        .next_line()
-        .await
-        .map_err(|e| e.to_string())?
-        .is_none()
-    {
+    // Hello first (S2). The protocol remains tolerant, but build drift is
+    // persistent UI health rather than a warning lost before raw mode starts.
+    let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? else {
         return Err("the connection closed before hello".into());
+    };
+    let hello: cyclops_proto::Hello =
+        serde_json::from_str(line.trim()).map_err(|_| "not a cyclops daemon")?;
+    if tx
+        .send(UiMsg::BuildHealth(crate::health::BuildHealth::from_hello(
+            &hello,
+        )))
+        .is_err()
+    {
+        return Ok(());
     }
     w.write_all(b"{\"id\":1,\"method\":\"events.subscribe\",\"params\":{}}\n")
         .await
@@ -529,6 +642,9 @@ mod tests {
     fn test_hello() -> String {
         let hello = cyclops_proto::Hello {
             cyclops: "0.0.0-test".into(),
+            build: None,
+            daemon_process: None,
+            daemon_executable: None,
             proto: cyclops_proto::PROTOCOL_VERSION,
             boot_id: "boot-test".into(),
         };
@@ -820,6 +936,10 @@ mod tests {
             .unwrap();
 
         let mut gate = RefreshGate::new();
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            UiMsg::BuildHealth(crate::health::BuildHealth::LegacyDaemon { .. })
+        ));
         assert!(matches!(rx.recv().await.unwrap(), UiMsg::Subscribed));
         gate.connected();
         match rx.recv().await.unwrap() {

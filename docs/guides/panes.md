@@ -39,10 +39,11 @@ tmux there is no pane to name, and it says so.
 ## Three names a pane cannot have
 
 `admin` is the durable operator mailbox identity, so no pane may wear it.
-Only a same-user caller proven outside every watched pane resolves as admin; a
-shell inside a watched pane retains that pane's agent identity. `*` addresses
-every agent at once. Anything starting with `%` is a tmux pane id, which Cyclops accepts
-anywhere it accepts a name, so a pane called `%9` could mean two panes.
+A same-user shell with no agent-vendor ancestor resolves as admin, including
+inside a watched pane. A vendor process gets an agent identity only through its
+current watched pane. `*` addresses every agent at once. Anything starting
+with `%` is a tmux pane id, which Cyclops accepts anywhere it accepts a name,
+so a pane called `%9` could mean two panes.
 Each refusal says which of the three it is and what to use instead; none
 of them is a rule you have to remember in advance.
 
@@ -160,7 +161,7 @@ fired by one named function in the daemon.
 | Edge | What happened | Fired by |
 |---|---|---|
 | adoption | you named the pane | `adopt_pane` |
-| a fused state change | the agent went idle, working, or blocked | `fusion::recompute_pane` |
+| a fused state change | the agent went idle, working, or blocked | `fusion::recompute_pane_with_evidence` |
 | a clear | you took the name back | `unadopt_pane` |
 | a session attach | the daemon connected to the session | `reconcile_adoptions` |
 | a window move | the pane was joined or broken into another window | `move_chrome` |

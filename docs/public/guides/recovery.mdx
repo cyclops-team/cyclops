@@ -1,0 +1,73 @@
+---
+title: "Recover a notification"
+description: "Inspect and resolve a blocked or ambiguous one-shot notification safely."
+---
+
+`cyclops send` returns after the message is durable. Its terminal wake is a
+separate one-shot notification. A wake is not a claim, and a claim is not task
+completion. The message remains available through the socket even when the
+terminal wake is blocked.
+
+## Inspect the exact attempt
+
+```bash
+cyclops messages
+cyclops alarm preview --older-than 0s
+cyclops attention show <attempt-id> --diff
+```
+
+`messages` keeps mailbox and wake state separate. `attention show` is an
+administrator-only, read-only recheck of one attempt. `--diff` may expose a
+direct-fallback payload.
+
+Cyclops automatically handles a current format 2 `verify_failed` doorbell only
+when the complete durable binding and exact composer bytes still match. It
+submits once while the mailbox is pending. If the exact recipient claimed after
+the write, it clears that doorbell without submitting it. Durable intent blocks
+a second terminal key after an uncertain outcome. Human, trailing, changed, or
+unprovable content remains one visible attention item.
+
+If the exact staged notification and its current terminal evidence still match,
+use one guarded action:
+
+```bash
+cyclops attention complete <attempt-id>
+cyclops attention discard <attempt-id>
+```
+
+Do not repeat an uncertain terminal action. Reopen the attempt and inspect its
+current state. Reconciliation never sends a second terminal key.
+
+## Recover a pre-write block
+
+A notification blocked before writing has not touched the pane. The recipient
+can still claim the message directly:
+
+```bash
+cyclops inbox claim <message-id>
+```
+
+The workspace administrator can withdraw one exact attempt only while Cyclops
+still proves that no terminal write occurred:
+
+```bash
+cyclops notification withdraw <attempt-id> --recipient <recipient-key>
+```
+
+Withdrawal leaves the mailbox message pending and releases that recipient's
+FIFO. After repairing the reported cause, use `cyclops requeue <message-id>`
+only when the current state says requeue is eligible.
+
+`cyclops alarm clear` acknowledges an alarm. It does not delete the message or
+abandon an unfinished terminal action. Use `cyclops health` before retrying a
+worker or state-storage failure.
+
+## Read status as separate facts
+
+Runtime, composer ownership, write readiness, notification state, and mailbox
+state answer different questions. An idle pane can still contain a staged
+Cyclops notification. Read the status subrow and follow its exact next action
+instead of treating `idle` as permission to write.
+
+The wire states and exact recovery transitions are owned by the
+[protocol reference](https://github.com/cyclops-team/cyclops/blob/main/docs/reference/PROTOCOL.md#mailbox-and-notification-control).

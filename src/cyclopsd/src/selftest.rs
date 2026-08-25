@@ -44,106 +44,177 @@ const SELFTEST_MAX_MS: u64 = 60_000;
 /// display, last-seen unix ms).
 type PaneEdges = HashMap<String, (String, u64)>;
 
-/// One pane's liveness: the edges plus the pane_pid of the occupant they
-/// came from. Edges are evidence about ONE occupant's hook config; an
-/// occupant restart without hooks must not keep showing hooks_verified
-/// behind the previous occupant's edges (the F1 stale-liveness hole).
-struct OccupantEdges {
-    pane_pid: crate::identity::ProcId,
-    edges: PaneEdges,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PaneLifetime(u64);
+
+/// Exact hook setup whose evidence may settle one delayed diagnostic.
+///
+/// The pane lifetime prevents a sleeper from reviving state after physical
+/// pane loss. Process and manifest keep replacement and repin evidence apart.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct HookBinding {
+    pane: PaneKey,
+    lifetime: PaneLifetime,
+    agent: crate::identity::ProcId,
+    manifest: String,
+}
+
+#[derive(Default)]
+struct HookLivenessState {
+    next_lifetime: u64,
+    live: HashMap<PaneKey, PaneLifetime>,
+    edges: HashMap<HookBinding, PaneEdges>,
+    f1_notified: HashSet<HookBinding>,
 }
 
 /// Per-pane hook edge record. Keys are exact watched routes. In-memory and
 /// boot-scoped: "ever" means "this daemon run", which is exactly the
 /// question at adoption/boot (did THIS setup ever produce an edge).
 pub(crate) struct HookLiveness {
-    edges: StdMutex<HashMap<PaneKey, OccupantEdges>>,
-    /// Occupant whose F1 notification already went out: one ping per
-    /// occupant, never a loop.
-    f1_notified: StdMutex<HashMap<PaneKey, crate::identity::ProcId>>,
+    state: StdMutex<HookLivenessState>,
 }
 
 impl HookLiveness {
     pub(crate) fn new() -> HookLiveness {
         HookLiveness {
-            edges: StdMutex::new(HashMap::new()),
-            f1_notified: StdMutex::new(HashMap::new()),
+            state: StdMutex::new(HookLivenessState::default()),
         }
     }
 
-    /// Record one agent.state.report edge for the occupant `pane_pid`.
+    /// Mark one authoritative pane route live. Reattach is idempotent. A route
+    /// reopened after physical loss receives a new lifetime.
+    pub(crate) fn open(&self, pane: &PaneKey) {
+        let mut state = self.state.lock().expect("hook liveness lock");
+        if state.live.contains_key(pane) {
+            return;
+        }
+        state.next_lifetime = state
+            .next_lifetime
+            .checked_add(1)
+            .expect("pane lifetime exhausted");
+        let lifetime = PaneLifetime(state.next_lifetime);
+        state.live.insert(pane.clone(), lifetime);
+    }
+
+    /// Bind a diagnostic to the pane lifetime that is live now.
+    ///
+    /// This never opens a route. Lifecycle code owns open and close, so a
+    /// delayed task cannot recreate a pane that has already disappeared.
+    pub(crate) fn binding(
+        &self,
+        pane: &PaneKey,
+        agent: crate::identity::ProcId,
+        manifest: &str,
+    ) -> Option<HookBinding> {
+        let state = self.state.lock().expect("hook liveness lock");
+        Some(HookBinding {
+            pane: pane.clone(),
+            lifetime: *state.live.get(pane)?,
+            agent,
+            manifest: manifest.to_string(),
+        })
+    }
+
+    /// Record one agent.state.report edge for an exact process and manifest.
     /// Duplicates count: a duplicate still proves the hook config is loaded
-    /// and firing. An edge from a NEW occupant retires the old occupant's
-    /// edges: they were never evidence about this process.
+    /// and firing. Process generations remain distinct so a delayed check
+    /// for one submitted occupant cannot read another occupant's history.
     pub(crate) fn record(
         &self,
         pane: &PaneKey,
         raw_event: &str,
         ts: u64,
-        pane_pid: crate::identity::ProcId,
+        agent: crate::identity::ProcId,
+        manifest: &str,
     ) {
-        let mut edges = self.edges.lock().expect("hook liveness lock");
-        let entry = edges.entry(pane.clone()).or_insert_with(|| OccupantEdges {
-            pane_pid,
-            edges: PaneEdges::new(),
-        });
-        if entry.pane_pid != pane_pid {
-            entry.edges.clear();
-            entry.pane_pid = pane_pid;
-        }
-        entry
+        let mut state = self.state.lock().expect("hook liveness lock");
+        let Some(lifetime) = state.live.get(pane).copied() else {
+            return;
+        };
+        let binding = HookBinding {
+            pane: pane.clone(),
+            lifetime,
+            agent,
+            manifest: manifest.to_string(),
+        };
+        state
             .edges
+            .entry(binding)
+            .or_default()
             .insert(ack::normalize_event(raw_event), (raw_event.to_string(), ts));
     }
 
     /// True once any hook edge has been seen from the CURRENT occupant of
-    /// this pane. Edges recorded under a different pane_pid are a previous
-    /// occupant's and count for nothing.
-    pub(crate) fn seen_any(&self, pane: &PaneKey, current_pid: crate::identity::ProcId) -> bool {
-        self.edges
+    /// this pane and manifest. Other process generations or manifests count
+    /// for nothing.
+    pub(crate) fn seen_any(
+        &self,
+        pane: &PaneKey,
+        current_agent: crate::identity::ProcId,
+        manifest: &str,
+    ) -> bool {
+        let Some(binding) = self.binding(pane, current_agent, manifest) else {
+            return false;
+        };
+        self.state
             .lock()
             .expect("hook liveness lock")
-            .get(pane)
-            .is_some_and(|o| o.pane_pid == current_pid && !o.edges.is_empty())
+            .edges
+            .get(&binding)
+            .is_some_and(|edges| !edges.is_empty())
     }
 
     /// Last-seen unix ms per normalized event, with the raw spelling.
-    /// Empty when the recorded edges belong to a previous occupant.
-    fn snapshot(&self, pane: &PaneKey, current_pid: crate::identity::ProcId) -> PaneEdges {
-        self.edges
+    /// Empty when the recorded edges belong to another process or manifest.
+    fn snapshot(
+        &self,
+        pane: &PaneKey,
+        current_agent: crate::identity::ProcId,
+        manifest: &str,
+    ) -> PaneEdges {
+        let Some(binding) = self.binding(pane, current_agent, manifest) else {
+            return PaneEdges::new();
+        };
+        self.state
             .lock()
             .expect("hook liveness lock")
-            .get(pane)
-            .filter(|o| o.pane_pid == current_pid)
-            .map(|o| o.edges.clone())
+            .edges
+            .get(&binding)
+            .cloned()
             .unwrap_or_default()
     }
 
     /// Pane closed: its edges and its F1 one-shot die with it.
-    pub(crate) fn forget(&self, pane: &PaneKey) {
-        self.edges.lock().expect("hook liveness lock").remove(pane);
-        self.f1_notified
-            .lock()
-            .expect("f1 notified lock")
-            .remove(pane);
+    pub(crate) fn close(&self, pane: &PaneKey) {
+        let mut state = self.state.lock().expect("hook liveness lock");
+        state.live.remove(pane);
+        state.edges.retain(|binding, _| &binding.pane != pane);
+        state.f1_notified.retain(|binding| &binding.pane != pane);
     }
 
-    /// True exactly once per pane occupant: the caller sends the F1
-    /// notification. A new occupant gets its own one-shot.
-    fn first_f1(&self, pane: &PaneKey, current_pid: crate::identity::ProcId) -> bool {
-        let mut notified = self.f1_notified.lock().expect("f1 notified lock");
-        if notified.get(pane) == Some(&current_pid) {
+    /// Reserve one F1 notification only when this exact live binding has no
+    /// edge. The lifetime check, absence check, and reservation share one lock
+    /// so close and concurrent hook arrival cannot split the decision.
+    pub(crate) fn reserve_f1_if_no_edges(&self, binding: &HookBinding) -> bool {
+        let mut state = self.state.lock().expect("hook liveness lock");
+        if state.live.get(&binding.pane) != Some(&binding.lifetime) {
             return false;
         }
-        notified.insert(pane.clone(), current_pid);
-        true
+        if state
+            .edges
+            .get(binding)
+            .is_some_and(|edges| !edges.is_empty())
+        {
+            return false;
+        }
+        state.f1_notified.insert(binding.clone())
     }
 }
 
 /// True when the manifest wires any hook event, i.e. hook liveness is a
 /// meaningful question for panes it binds.
 pub(crate) fn declares_hooks(m: &Manifest) -> bool {
-    m.hooks.turn_start.is_some() || m.hooks.turn_end.is_some() || m.hooks.ack.is_some()
+    !m.hooks.lifecycle_names().is_empty() || m.hooks.ack.is_some()
 }
 
 /// ACK capability tier (DELIVERY.md): 1 = payload-matchable hook ACK,
@@ -176,7 +247,7 @@ pub(crate) fn hooks_verified_for(
     // under the agent's own identity, and a pane root is a shell that
     // never emitted a hook in its life. An agent nobody can identify
     // right now has no proven liveness either.
-    Some(agent.is_some_and(|a| inner.hook_liveness.seen_any(pane, a)))
+    Some(agent.is_some_and(|a| inner.hook_liveness.seen_any(pane, a, &m.agent.id)))
 }
 
 /// The likely reason a configured hook set never fires, per CLI. F1 is the
@@ -207,36 +278,16 @@ pub(crate) fn f1_cause(manifest_id: &str) -> String {
     }
 }
 
-/// First tier-1 ACK timeout on a pane whose CURRENT occupant has zero hook
+/// First tier-1 ACK timeout for the exact submitted occupant with zero hook
 /// edges: one admin ping naming the likely F1 cause. The delivery itself
 /// has already downgraded to the screen tier; this only makes the why
 /// visible. Liveness is per occupant, so a restarted occupant without
 /// hooks pings again instead of hiding behind its predecessor's edges.
-pub(crate) fn notify_f1_once(
-    inner: &Arc<Inner>,
-    msg_id: &str,
-    to: &str,
-    pane_id: &str,
-    session_idx: usize,
-    manifest_id: &str,
-) {
-    // The admitted AGENT, not the pane root. F1 is about an agent whose
-    // hooks are not firing, and the pane's shell has no hooks to fire. A
-    // pane whose agent cannot be identified right now has nobody to warn
-    // about.
-    let Some(agent) = inner
-        .watcher_of(session_idx)
-        .and_then(|w| w.pane(pane_id))
-        .and_then(|row| crate::fusion::admitted_vendor(inner, session_idx, &row))
-        .map(|(_, proc)| proc)
-    else {
-        return;
-    };
-    let pane = PaneKey::new(session_idx, pane_id);
-    if inner.hook_liveness.seen_any(&pane, agent) {
-        return;
-    }
-    if !inner.hook_liveness.first_f1(&pane, agent) {
+pub(crate) fn notify_f1_once(inner: &Arc<Inner>, msg_id: &str, to: &str, binding: HookBinding) {
+    // Use the exact live binding proven immediately before Enter. A process
+    // re-read can observe a replacement, and a delayed task can outlive its
+    // pane. Neither may settle this attempt's setup diagnostic.
+    if !inner.hook_liveness.reserve_f1_if_no_edges(&binding) {
         return;
     }
     delivery::admin_notify(
@@ -247,10 +298,10 @@ pub(crate) fn notify_f1_once(
             "message {msg_id} got no tier-1 hook ACK and no hook edge has ever \
              reached this daemon from that pane; the delivery downgraded to \
              screen evidence. Likely cause: {}",
-            f1_cause(manifest_id)
+            f1_cause(&binding.manifest)
         ),
         Some(msg_id),
-        Some(session_idx),
+        Some(binding.pane.session_idx),
         // The delivery this is about. It downgraded to the screen tier
         // rather than stalling, so the rule counts it as nobody's to
         // clear, and a reader's calm stream holds the ping to that.
@@ -293,22 +344,26 @@ pub(crate) async fn verify(
     // turn_end, deduped on the normalized name), then anything else that
     // actually fired. Edges from a previous occupant are not listed.
     let seen = agent
-        .map(|a| inner.hook_liveness.snapshot(&pane, a))
+        .zip(manifest_id.as_deref())
+        .map(|(a, id)| inner.hook_liveness.snapshot(&pane, a, id))
         .unwrap_or_default();
     let now = unix_ms();
     let mut events: Vec<HookEdgeAge> = Vec::new();
     let mut listed: HashSet<String> = HashSet::new();
     if let Some(m) = manifest {
-        for declared in [&m.hooks.ack, &m.hooks.turn_start, &m.hooks.turn_end]
+        for declared in m
+            .hooks
+            .ack
+            .as_deref()
             .into_iter()
-            .flatten()
+            .chain(m.hooks.lifecycle_names())
         {
             let key = ack::normalize_event(declared);
             if !listed.insert(key.clone()) {
                 continue;
             }
             events.push(HookEdgeAge {
-                event: declared.clone(),
+                event: declared.to_string(),
                 last_seen_ms_ago: seen.get(&key).map(|(_, ts)| now.saturating_sub(*ts)),
             });
         }
@@ -488,23 +543,40 @@ mod tests {
         PaneKey::new(0, id)
     }
 
+    fn open(liveness: &HookLiveness, pane: &PaneKey) {
+        liveness.open(pane);
+    }
+
+    fn binding(
+        liveness: &HookLiveness,
+        pane: &PaneKey,
+        agent: crate::identity::ProcId,
+        manifest: &str,
+    ) -> HookBinding {
+        liveness
+            .binding(pane, agent, manifest)
+            .expect("live pane binding")
+    }
+
     #[test]
     fn liveness_records_and_forgets() {
         let l = HookLiveness::new();
-        assert!(!l.seen_any(&pane("%1"), proc(100)));
-        l.record(&pane("%1"), "UserPromptSubmit", 1_000, proc(100));
-        l.record(&pane("%1"), "user_prompt_submit", 2_000, proc(100));
-        assert!(l.seen_any(&pane("%1"), proc(100)));
+        let route = pane("%1");
+        open(&l, &route);
+        assert!(!l.seen_any(&route, proc(100), "test"));
+        l.record(&route, "UserPromptSubmit", 1_000, proc(100), "test");
+        l.record(&route, "user_prompt_submit", 2_000, proc(100), "test");
+        assert!(l.seen_any(&route, proc(100), "test"));
         // Normalized spellings share a slot; the raw name and ts are the
         // latest ones.
-        let snap = l.snapshot(&pane("%1"), proc(100));
+        let snap = l.snapshot(&route, proc(100), "test");
         assert_eq!(snap.len(), 1);
         assert_eq!(
             snap.get("userpromptsubmit"),
             Some(&("user_prompt_submit".to_string(), 2_000))
         );
-        l.forget(&pane("%1"));
-        assert!(!l.seen_any(&pane("%1"), proc(100)));
+        l.close(&route);
+        assert!(!l.seen_any(&route, proc(100), "test"));
     }
 
     #[test]
@@ -512,59 +584,110 @@ mod tests {
         let liveness = HookLiveness::new();
         let first = PaneKey::new(0, "%1");
         let second = PaneKey::new(1, "%1");
-        liveness.record(&first, "Stop", 1_000, proc(100));
+        open(&liveness, &first);
+        open(&liveness, &second);
+        liveness.record(&first, "Stop", 1_000, proc(100), "test");
 
-        assert!(liveness.seen_any(&first, proc(100)));
+        assert!(liveness.seen_any(&first, proc(100), "test"));
         assert!(
-            !liveness.seen_any(&second, proc(100)),
+            !liveness.seen_any(&second, proc(100), "test"),
             "a hook edge cannot cross watched session routes"
         );
 
-        liveness.record(&second, "UserPromptSubmit", 2_000, proc(200));
-        liveness.forget(&first);
-        assert!(!liveness.seen_any(&first, proc(100)));
+        liveness.record(&second, "UserPromptSubmit", 2_000, proc(200), "test");
+        liveness.close(&first);
+        assert!(!liveness.seen_any(&first, proc(100), "test"));
         assert!(
-            liveness.seen_any(&second, proc(200)),
+            liveness.seen_any(&second, proc(200), "test"),
             "forgetting one route cannot erase the duplicate pane in another session"
         );
     }
 
     /// The F1 stale-liveness hole: edges belong to the occupant that
-    /// produced them. An occupant swap (new pane_pid) invalidates the old
-    /// edges on read AND on the next record.
+    /// produced them. An occupant swap never transfers either occupant's
+    /// evidence to the other.
     #[test]
     fn occupant_swap_invalidates_liveness() {
         let l = HookLiveness::new();
-        l.record(&pane("%1"), "UserPromptSubmit", 1_000, proc(100));
-        assert!(l.seen_any(&pane("%1"), proc(100)));
+        let route = pane("%1");
+        open(&l, &route);
+        l.record(&route, "UserPromptSubmit", 1_000, proc(100), "test");
+        assert!(l.seen_any(&route, proc(100), "test"));
         // The occupant restarted: same pane, new pid, no edges from it yet.
         assert!(
-            !l.seen_any(&pane("%1"), proc(200)),
+            !l.seen_any(&route, proc(200), "test"),
             "old occupant's edges must not count"
         );
-        assert!(l.snapshot(&pane("%1"), proc(200)).is_empty());
-        // The old pid's view is still intact until the new occupant speaks.
-        assert!(l.seen_any(&pane("%1"), proc(100)));
-        // First edge from the new occupant retires the old record entirely.
-        l.record(&pane("%1"), "Stop", 3_000, proc(200));
-        assert!(l.seen_any(&pane("%1"), proc(200)));
-        assert!(!l.seen_any(&pane("%1"), proc(100)));
-        let snap = l.snapshot(&pane("%1"), proc(200));
-        assert_eq!(snap.len(), 1, "old occupant's edges were retired");
+        assert!(l.snapshot(&route, proc(200), "test").is_empty());
+        // The old process's exact history remains available to a delayed
+        // diagnostic for a delivery that was submitted to it.
+        assert!(l.seen_any(&route, proc(100), "test"));
+        l.record(&route, "Stop", 3_000, proc(200), "test");
+        assert!(l.seen_any(&route, proc(200), "test"));
+        assert!(l.seen_any(&route, proc(100), "test"));
+        let snap = l.snapshot(&route, proc(200), "test");
+        assert_eq!(snap.len(), 1);
         assert!(snap.contains_key("stop"));
     }
 
     #[test]
-    fn f1_notify_is_once_per_occupant_and_resets_with_the_pane() {
+    fn f1_reservation_is_atomic_once_per_occupant_and_resets_with_the_pane() {
         let l = HookLiveness::new();
-        assert!(l.first_f1(&pane("%1"), proc(100)));
-        assert!(!l.first_f1(&pane("%1"), proc(100)));
-        assert!(l.first_f1(&pane("%2"), proc(300)));
+        let first = pane("%1");
+        let second = pane("%2");
+        open(&l, &first);
+        open(&l, &second);
+        let first_agent = binding(&l, &first, proc(100), "test");
+        let second_route = binding(&l, &second, proc(300), "test");
+        assert!(l.reserve_f1_if_no_edges(&first_agent));
+        assert!(!l.reserve_f1_if_no_edges(&first_agent));
+        assert!(l.reserve_f1_if_no_edges(&second_route));
         // A new occupant of the same pane gets its own one-shot.
-        assert!(l.first_f1(&pane("%1"), proc(200)));
-        assert!(!l.first_f1(&pane("%1"), proc(200)));
-        l.forget(&pane("%1"));
-        assert!(l.first_f1(&pane("%1"), proc(200)));
+        let replacement = binding(&l, &first, proc(200), "test");
+        assert!(l.reserve_f1_if_no_edges(&replacement));
+        assert!(!l.reserve_f1_if_no_edges(&replacement));
+        // Returning to the first exact generation cannot reserve it twice.
+        assert!(!l.reserve_f1_if_no_edges(&first_agent));
+
+        l.close(&first);
+        assert!(
+            !l.reserve_f1_if_no_edges(&replacement),
+            "a captured binding cannot revive a closed pane"
+        );
+        open(&l, &first);
+        let reopened = binding(&l, &first, proc(200), "test");
+        assert_ne!(replacement, reopened);
+        assert!(l.reserve_f1_if_no_edges(&reopened));
+    }
+
+    #[test]
+    fn an_exact_hook_edge_suppresses_only_its_occupants_f1_reservation() {
+        let l = HookLiveness::new();
+        let route = pane("%1");
+        open(&l, &route);
+        let first = binding(&l, &route, proc(100), "test");
+        let second = binding(&l, &route, proc(200), "test");
+        l.record(&route, "Stop", 1_000, proc(100), "test");
+        assert!(!l.reserve_f1_if_no_edges(&first));
+        assert!(l.reserve_f1_if_no_edges(&second));
+
+        l.record(&route, "Stop", 2_000, proc(200), "test");
+        assert!(!l.reserve_f1_if_no_edges(&second));
+        assert!(!l.reserve_f1_if_no_edges(&first));
+    }
+
+    #[test]
+    fn manifests_do_not_share_hook_edges_or_f1_reservations() {
+        let l = HookLiveness::new();
+        let route = pane("%1");
+        let agent = proc(100);
+        open(&l, &route);
+        l.record(&route, "Stop", 1_000, agent, "claude");
+
+        assert!(l.seen_any(&route, agent, "claude"));
+        assert!(!l.seen_any(&route, agent, "codex"));
+        assert!(!l.reserve_f1_if_no_edges(&binding(&l, &route, agent, "claude")));
+        assert!(l.reserve_f1_if_no_edges(&binding(&l, &route, agent, "codex")));
     }
 
     #[test]
@@ -579,7 +702,7 @@ mod tests {
 
         // agy shape: turn events but no payload-matchable ACK.
         let tier2 = Manifest::parse(
-            "[agent]\nid = \"a\"\ndisplay_name = \"a\"\n\n[hooks]\nturn_end = \"Stop\"\n",
+            "[agent]\nid = \"a\"\ndisplay_name = \"a\"\n\n[hooks]\nturn_end = \"Stop\"\nturn_end_evidence = \"confirmed\"\n",
             Path::new("a.toml"),
         )
         .unwrap();

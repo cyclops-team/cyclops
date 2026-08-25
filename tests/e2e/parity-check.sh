@@ -48,7 +48,7 @@ export CYCLOPS_HOME="$ROOT/home"
 mkdir -p "$CYCLOPS_HOME"
 CYC="$REPO/target/debug/cyclops"
 CYCD="$REPO/target/debug/cyclopsd"
-COMPOSER_COMMAND="python3 '$REPO/src/cyclopsd/tests/common/faketui.py'"
+COMPOSER_PATH="$REPO/src/cyclopsd/tests/common/faketui.py"
 OUT="$ROOT/out"
 DAEMON_PID=""
 CHECKS=0
@@ -123,13 +123,16 @@ cleanup() {
       echo "== the last command's output, which set -e would otherwise discard:"
       sed 's/^/   /' "$OUT"
     fi
-    # The MAIN rig's daemon, which is the one nearly every rung runs in and
-    # the one whose log was missing when a delivery quietly failed to ack.
-    if [ -s "${CYCLOPS_HOME:-}/cyclopsd.log" ]; then
+    # The main rig starts through `cyclops start`, then later restarts under
+    # this script. Print both destinations because the failure can belong to
+    # either daemon generation.
+    for log in "${CYCLOPS_HOME:-}/cyclopsd.log" "${ROOT:-}/daemon.log"; do
+      if [ -s "$log" ]; then
         echo
-        echo "== main daemon.log (last 30):"
-        tail -30 "$CYCLOPS_HOME/cyclopsd.log" | sed 's/^/   /'
-    fi
+        echo "== $log (last 30):"
+        tail -30 "$log" | sed 's/^/   /'
+      fi
+    done
     # The nested rigs log their daemon to a file nobody prints. When the
     # failure is "the daemon never came up", this is the only place that
     # says what it said on the way down.
@@ -140,6 +143,14 @@ cleanup() {
         tail -20 "$ROOT/$nested/daemon.log" | sed 's/^/   /'
       fi
     done
+    if [ -s "$ROOT/notification-state.json" ]; then
+      echo
+      echo "== notification facts while waiting for submit:"
+      jq -c 'select(.data.type == "notification_transition")
+        | {id, attempt: .data.attempt_id, state: .data.state, cause: .data.cause}' \
+        "$ROOT/notification-state.json" \
+        | sed 's/^/   /'
+    fi
   fi
   cyc_stop_daemon
   # The nested rigs run their own daemon and their own tmux server in their
@@ -174,12 +185,9 @@ wait_for() {
 }
 
 daemon_attached() { "$CYC" --json status | jq -e '.sessions[0].attached == true' >/dev/null; }
-# The stand-in announces its read loop. tmux returns from respawn-pane after
-# forking, which is earlier than the fixture process becoming ready to receive
-# a doorbell or a fixture command.
+# The stand-in announces its command loop. tmux returns from respawn-pane after
+# forking, before the fixture process is ready to receive a command.
 standin_reading() { [ -f "$ROOT/ready.$1" ]; }
-# The stand-in is back at its read rather than handling a fixture command.
-standin_free() { [ ! -f "$ROOT/busy.$1" ]; }
 pane_bound_to() {
   "$CYC" --json status | jq -e --arg p "$1" --arg m "$2" \
     '[.sessions[].panes[] | select(.pane_id == $p and .manifest == $m)] | length > 0' >/dev/null
@@ -191,53 +199,59 @@ roster_empty() { "$CYC" --json list | jq -e '.agents | length == 0' >/dev/null; 
 pane_command_done() { [ -f "$ROOT/done.$1" ]; }
 pane_has_text() { tmx capture-pane -p -t "$1" | grep -Fq -- "$2"; }
 
-# Issue a Cyclops command from an ordinary shell that is itself the watched
-# pane root. This mirrors the real sender-identity integration test and avoids
-# borrowing the process ancestry of the agent running this gate.
-shell_command() {
-  local label="$1" pane="$2" command="$3" line
+start_agent() {
+  local label="$1" pane="$2" control="$ROOT/control.main.$1"
+  rm -f "$control" "$ROOT/ready.$label"
+  mkfifo "$control"
+  tmx respawn-pane -k -t "$pane" "'$ROOT/cycagent' '$control' '$ROOT/ready.$label'"
+  wait_for "the $label fixture agent" 100 standin_reading "$label"
+}
+
+# Issue a Cyclops command below the watched fixture agent. The command is
+# sent through a FIFO, so a composer can own the terminal at the same time.
+agent_command() {
+  local label="$1" command="$3" line
   rm -f "$ROOT/result.$label" "$ROOT/exit.$label" "$ROOT/done.$label"
-  printf '\n$ (typed in the %s pane) cyclops %s\n' "$label" "$command"
+  printf '\n$ (run by the %s agent) cyclops %s\n' "$label" "$command"
   line="\"$CYC\" $command > \"$ROOT/result.$label\" 2>&1; code=\$?; printf '%s' \"\$code\" > \"$ROOT/exit.$label\"; : > \"$ROOT/done.$label\""
-  tmx send-keys -t "$pane" -l "$line"
-  tmx send-keys -t "$pane" Enter
-  wait_for "the $label shell command" 100 pane_command_done "$label"
+  printf 'run\t%s\n' "$line" > "$ROOT/control.main.$label"
+  wait_for "the $label agent command" 100 pane_command_done "$label"
   cp "$ROOT/result.$label" "$OUT"
   cp "$ROOT/exit.$label" "$ROOT/exit"
   cat "$OUT"
 }
 
-shell_ready() { [ -f "$ROOT/shell-ready.$1" ]; }
-prepare_shell() {
-  local label="$1" pane="$2"
-  rm -f "$ROOT/shell-ready.$label"
-  tmx send-keys -t "$pane" -l ": > '$ROOT/shell-ready.$label'"
-  tmx send-keys -t "$pane" Enter
-  wait_for "the $label shell" 100 shell_ready "$label"
-}
-
 pane_write_ready() {
   "$CYC" read "$1" --source detection --plain | grep -q 'write-ready$'
 }
-pane_is_shell() {
-  case "$(tmx display-message -p -t "$1" '#{pane_current_command}')" in
-    sh|bash|dash|zsh) return 0 ;;
-    *) return 1 ;;
-  esac
+notification_crossed_submit() {
+  local journal
+  journal="$(find "$CYCLOPS_HOME/workspaces" -name messages.ndjson -print -quit)"
+  [ -n "$journal" ] && cp "$journal" "$ROOT/notification-state.json" &&
+  jq -e --arg id "$1" '
+    select(.id == $id and .data.type == "notification_transition")
+    | .data.state
+    | select(. == "submitted" or . == "notified")' \
+    "$ROOT/notification-state.json" >/dev/null
+}
+pane_is_agent() {
+  [ "$(tmx display-message -p -t "$1" '#{pane_current_command}')" = "cycagent" ]
 }
 start_composer() {
   local label="$1" pane="$2"
   tmx resize-window -t "$pane" -x 500 -y 40
-  tmx send-keys -t "$pane" -l "$COMPOSER_COMMAND"
-  tmx send-keys -t "$pane" Enter
+  printf 'composer\t%s\n' "$COMPOSER_PATH" > "$ROOT/control.main.$label"
   wait_for "the $label composer" 100 pane_has_text "$pane" 'Model x · Ctx: 78%'
-  wait_for "the $label composer to be write-ready" 100 pane_write_ready "$label"
+  if ! wait_for "the $label composer to be write-ready" 100 pane_write_ready "$label"; then
+    "$CYC" read "$label" --source detection --raw --plain >&2 || true
+    tmx capture-pane -p -t "$pane" >&2 || true
+    return 1
+  fi
 }
 stop_composer() {
   local label="$1" pane="$2"
   tmx send-keys -t "$pane" C-c
-  wait_for "the $label composer to exit" 100 pane_is_shell "$pane"
-  prepare_shell "$label" "$pane"
+  wait_for "the $label composer to exit" 100 pane_is_agent "$pane"
 }
 
 # Run a command, show it the way the README shows it, keep the output for
@@ -345,40 +359,10 @@ echo "== tmux:       private TMUX_TMPDIR=$TMUX_TMPDIR (removed on exit)"
 echo "== building cyclops and cyclopsd"
 cargo build -q -p cyclops -p cyclopsd
 
-# The stand-in agent. It is a shell loop, not a vendor CLI, and that is the
-# point of rung 3: cyclops can address it because of one manifest file.
-#
-# It ignores mailbox doorbells and runs lines prefixed with `@cyclops` from
-# inside the pane. That lets the daemon prove sender and recipient identity
-# from process ancestry.
-cat > "$ROOT/agent.sh" <<'EOF'
-label="$1"
-cyc="$2"
-# Announce the read loop BEFORE entering it. tmux returns from respawn-pane
-# when it has forked, not when the new process is reading, and the rig uses
-# this flag to distinguish those moments.
-: > "$3/ready.$label"
-# Announce every stretch spent outside the read so the rig does not type a
-# second fixture command into a command that is still running.
-busy="$3/busy.$label"
-while IFS= read -r line; do
-  : > "$busy"
-  case "$line" in
-    "@cyclops "*)
-      rest=${line#"@cyclops "}
-      eval "\"$cyc\" $rest" > "$3/result.$label" 2>&1
-      code=$?
-      printf '%s' "$code" > "$3/exit.$label"
-      : > "$3/done.$label"
-      ;;
-  esac
-  rm -f "$busy"
-done
-EOF
-
-# Give the fixture process a name that cannot also match the shell running the
-# gate. Sender authentication can then stop at the exact watched pane root.
-ln -s "$(command -v sh)" "$ROOT/cycagent"
+# The fixture has its own executable identity. Cyclops commands and the
+# composer run as its children, so the gate exercises peer ancestry instead
+# of granting authority from a mutable pane label.
+rustc --edition=2021 -Dwarnings "$REPO/tests/e2e/parity_agent.rs" -o "$ROOT/cycagent"
 
 # The stand-in's manifest. Written AFTER the first `cyclops start`, not
 # before: seeding the home with the shipped manifests is that command's job
@@ -388,14 +372,15 @@ DEMO_MANIFEST=$(cat <<'EOF'
 [agent]
 id = "demo"
 display_name = "Parity rig stand-in"
-process_names = ["cycagent", "cat", "python3", "python", "Python", "zsh", "bash"]
+process_names = ["cycagent"]
 argv_basenames = ["cycagent"]
 launch = "cat"
 
 [hooks]
+# This stand-in exposes one event-local start and dispatch fact, not a turn key.
 turn_start = "UserPromptSubmit"
-turn_end = "Stop"
 ack = "UserPromptSubmit"
+ack_evidence = "dispatch"
 ack_payload_field = "prompt"
 
 [messaging]
@@ -418,6 +403,7 @@ regex = ['^']
 [[rule]]
 id = "composer_empty"
 state = "idle"
+composer_semantic = "clean"
 priority = 90
 region = "bottom_non_empty_lines(4)"
 line_regex = ['^❯\s*$']
@@ -425,6 +411,7 @@ line_regex = ['^❯\s*$']
 [[rule]]
 id = "composer_holds_paste"
 state = "idle_with_input"
+composer_semantic = "human_input"
 priority = 80
 region = "bottom_non_empty_lines(3)"
 line_regex = ['^\s*❯\s+\S']
@@ -442,6 +429,8 @@ method = "load-buffer + paste-buffer -p"
 submit = "Enter"
 verify_before_submit = true
 verify_pattern = ["<message_id>"]
+composer_prompt_regex = '^❯ (?P<content>.*)$'
+composer_continuation_regex = '^(?P<content>.*)$'
 composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
 composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
 composer_trailer_required_prefix = 2
@@ -500,8 +489,7 @@ P1="$(tmx list-panes -t main -F '#{pane_id}')"
 # and clears the pane title tmux seeded with the hostname so the roster
 # below shows what an agent publishes rather than what tmux did.
 rm -f "$ROOT/ready.implementer"
-tmx respawn-pane -k -t "$P1" "'$ROOT/cycagent' '$ROOT/agent.sh' implementer '$CYC' '$ROOT'"
-wait_for "the implementer stand-in to be reading" 100 standin_reading implementer
+start_agent implementer "$P1"
 tmx select-pane -t "$P1" -T ''
 # Wait until the daemon binds the new occupant before testing its notification.
 wait_for "the daemon to bind the stand-in" 100 pane_bound_to "$P1" demo
@@ -536,9 +524,9 @@ echo
 echo "#### Rung 2: name panes"
 
 rm -f "$ROOT/ready.reviewer"
-tmx split-window -d -t main "'$ROOT/cycagent' '$ROOT/agent.sh' reviewer '$CYC' '$ROOT'"
-wait_for "the reviewer stand-in to be reading" 100 standin_reading reviewer
+tmx split-window -d -t main "sh"
 P2="$(tmx list-panes -t main -F '#{pane_id}' | tail -1)"
+start_agent reviewer "$P2"
 tmx select-pane -t "$P2" -T ''
 wait_for "cyclopsd to see the new pane" 50 pane_known "$P2"
 
@@ -615,8 +603,8 @@ tmx select-pane -t "$N2" -T ''
 sleep 2.5
 
 run "$CYC" list --plain
-check "with both names on the new panes"  '^ +implementer +○ idle$'
-check "and the second one too"            '^ +reviewer +○ idle$'
+check "with both names on the new panes"  '^ +implementer +\? unknown$'
+check "and the second one too"            '^ +reviewer +\? unknown$'
 
 run "$CYC" start --workspace ops --session ops --preset ops --no-daemon --plain
 check "a preset builds three agents"      '^✓ workspace ready · 3 agents$'
@@ -659,38 +647,55 @@ check_exit "and exits 2" 2
 echo
 echo "#### Rung 5: durable mailbox acceptance and claim"
 
-# Both watched pane roots remain the shells adopted with the session. The
-# reviewer runs the deterministic composer as a child, then returns to the
-# same shell root for claim commands.
-prepare_shell implementer "$N1"
-prepare_shell reviewer "$N2"
+# The rebuilt workspace starts with ordinary shells. Replace them with the
+# dedicated fixture agents before asserting agent-to-agent identity.
+start_agent implementer "$N1"
+start_agent reviewer "$N2"
 tmx select-pane -t "$N1" -T ''
 tmx select-pane -t "$N2" -T ''
+wait_for "the daemon to bind the implementer fixture" 100 pane_bound_to "$N1" demo
+wait_for "the daemon to bind the reviewer fixture" 100 pane_bound_to "$N2" demo
+run "$CYC" name "$N1" implementer --plain
+run "$CYC" name "$N2" reviewer --plain
 start_composer reviewer "$N2"
 run "$CYC" read reviewer --source detection --plain
 check "the reviewer composer is write-ready" 'decided by .* · write-ready$'
 
-shell_command implementer "$N1" 'send reviewer --subject "Release notes review" --body "Check the mailbox contract." --client-key parity-review --plain'
+agent_command implementer "$N1" 'send reviewer --subject "Release notes review" --body "Check the mailbox contract." --client-key parity-review --plain'
 check "acceptance is separate from notification" '^accepted m-[[:xdigit:]]{32}$'
-check "the wake is a second fact" '^✓ accepted( · [0-9]+ ahead)? · wake (not started|queued|checking readiness|writing|staged|submitted|notified|needs attention)$'
+check "the wake is a second fact" '^✓ accepted( · [0-9]+ ahead)? · wake (not started|queued|checking readiness|writing|staged|submitted|notified|withdrawn|needs attention|superseded)$'
 check_exit "mailbox acceptance exits 0" 0
 REVIEW_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
 wait_for "the reviewer mailbox doorbell" 100 pane_has_text "$N2" "cyclops inbox claim $REVIEW_ID"
 printf '\n$ tmux capture-pane -p -t %s\n' "$N2"
 tmx capture-pane -p -t "$N2" | grep -v '^$' > "$OUT"
 cat "$OUT"
-check "the recipient sees only the doorbell" "^❯ cyclops inbox claim $REVIEW_ID\$"
+check "the recipient sees only the exact attempt doorbell" "^❯ cyclops inbox claim $REVIEW_ID #c:[A-Za-z0-9_-]{22}\$"
 check_absent "the pane does not receive the body" '^Check the mailbox contract\.$'
+wait_for "the reviewer doorbell to be submitted" 100 notification_crossed_submit "$REVIEW_ID"
 
-# Return to the same durable recipient shell for authenticated claim.
+# The same durable recipient agent claims the payload over the socket.
 stop_composer reviewer "$N2"
-shell_command reviewer "$N2" "inbox list --plain"
+agent_command reviewer "$N2" "inbox list --plain"
 check "inbox list exposes metadata" "^$REVIEW_ID implementer · Release notes review\$"
-shell_command reviewer "$N2" "inbox claim $REVIEW_ID --plain"
+agent_command reviewer "$N2" "inbox claim $REVIEW_ID --plain"
 check "claim fetches the envelope" "^\[cyclops $REVIEW_ID\] FROM: implementer  SUBJECT: Release notes review\$"
 check "claim fetches the body" '^Check the mailbox contract\.$'
-shell_command reviewer "$N2" "inbox claim $REVIEW_ID --plain"
+agent_command reviewer "$N2" "inbox claim $REVIEW_ID --plain"
 check "plain repeat claim returns the same payload" '^Check the mailbox contract\.$'
+
+# Stopping the composer changes the foreground process after Enter. The exact
+# authenticated claim settles the wake before that late receipt observation can
+# turn the claimed message into an operator alarm.
+agent_command implementer "$N1" '--json messages'
+jq -r --arg id "$REVIEW_ID" '
+  .rows[] | select(.message_id == $id) | .recipients[]
+  | select(.label == "reviewer")
+  | "\(.mailbox.status) \(.notification.state) \(.notification.cause // "-")"' \
+  "$OUT" > "$ROOT/claimed-notification-state"
+cp "$ROOT/claimed-notification-state" "$OUT"
+cat "$OUT"
+check "an exact claim settles the wake without an alarm" '^claimed notified -$'
 
 run "$CYC" wait reviewer --until idle --plain
 check "wait reports the state and how long" '^○ idle · waited [0-9]+s$'
@@ -708,13 +713,13 @@ check "cyclops pipe is not built yet"     'unrecognized subcommand'
 check_exit "so it exits on usage" 2
 
 printf '\n$ cyclops --json history | jq -r \x27.lines[] | "\\(.from) -> \\(.to[0])  \\(.subject)"\x27\n'
-shell_command implementer "$N1" '--json history'
+agent_command implementer "$N1" '--json history'
 jq -r '.lines[] | "\(.from) -> \(.to[0])  \(.subject)"' "$OUT" > "$ROOT/history-jq"
 cp "$ROOT/history-jq" "$OUT"
 cat "$OUT"
 check "every message is jq-able"          '^implementer -> reviewer  Release notes review$'
 
-shell_command implementer "$N1" '--json messages'
+agent_command implementer "$N1" '--json messages'
 WORKSPACE_ID="$(jq -r '.workspace_id' "$OUT")"
 MESSAGE_JOURNAL="$CYCLOPS_HOME/workspaces/$WORKSPACE_ID/messages.ndjson"
 printf '\n$ cyclops --json messages | jq -r .workspace_id\n'
@@ -747,30 +752,32 @@ echo "#### The handoff (docs/guides/QUICKSTART.md walks this)"
 # who the daemon says sent it. Identity is resolved by walking the caller's
 # process up to a watched pane; nothing in the request can claim a sender.
 start_composer reviewer "$N2"
-shell_command implementer "$N1" 'send reviewer --subject "Burst path fix, ready for review" --body "gateway.rs:120. Tests pass." --client-key parity-handoff --plain'
+agent_command implementer "$N1" 'send reviewer --subject "Burst path fix, ready for review" --body "gateway.rs:120. Tests pass." --client-key parity-handoff --plain'
 check "the handoff is accepted from the pane" '^accepted m-[[:xdigit:]]{32}$'
 check_exit "the handoff exits 0" 0
 HANDOFF="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
 wait_for "the handoff doorbell" 100 pane_has_text "$N2" "cyclops inbox claim $HANDOFF"
+wait_for "the handoff doorbell to be submitted" 100 notification_crossed_submit "$HANDOFF"
 
 stop_composer reviewer "$N2"
-shell_command reviewer "$N2" 'history --with reviewer --limit 1 --plain'
+agent_command reviewer "$N2" 'history --with reviewer --limit 1 --plain'
 check "the sender is the pane, not the caller" '^ +[0-9]+s +implementer → reviewer +Burst path fix, ready for review$'
 
-shell_command reviewer "$N2" "inbox claim $HANDOFF --plain"
+agent_command reviewer "$N2" "inbox claim $HANDOFF --plain"
 check "the reviewer claims the handoff body" '^gateway\.rs:120\. Tests pass\.$'
 
 start_composer implementer "$N1"
-shell_command reviewer "$N2" "reply $HANDOFF --body \"Approved. One nit in the retry path.\" --client-key parity-reply --plain"
+agent_command reviewer "$N2" "reply $HANDOFF --body \"Approved. One nit in the retry path.\" --client-key parity-reply --plain"
 check "reply derives routing from the parent" '^accepted m-[[:xdigit:]]{32}$'
 check_exit "an accepted reply exits 0" 0
 REPLY_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
 wait_for "the reply doorbell" 100 pane_has_text "$N1" "cyclops inbox claim $REPLY_ID"
+wait_for "the reply doorbell to be submitted" 100 notification_crossed_submit "$REPLY_ID"
 stop_composer implementer "$N1"
-shell_command implementer "$N1" "inbox claim $REPLY_ID --plain"
+agent_command implementer "$N1" "inbox claim $REPLY_ID --plain"
 check "the implementer claims the verdict" '^Approved\. One nit in the retry path\.$'
 
-shell_command reviewer "$N2" "thread $HANDOFF --plain"
+agent_command reviewer "$N2" "thread $HANDOFF --plain"
 check "the thread holds the request"      '^ +[0-9]+s +implementer → reviewer +Burst path fix, ready for review'
 check "and the reply under it"            '^ +[0-9]+s +reviewer → implementer +Re: Burst path fix, ready for review'
 check "with the review verdict"           '^ +Approved\. One nit in the retry path\.$'
@@ -784,7 +791,7 @@ echo
 echo "#### The admin mailbox"
 
 # A pane agent can address admin, but admin has no pane and receives no wake.
-shell_command implementer "$N1" 'send admin --subject "Operator review" --body "The release note is ready." --client-key parity-admin --plain'
+agent_command implementer "$N1" 'send admin --subject "Operator review" --body "The release note is ready." --client-key parity-admin --plain'
 check "admin is a durable recipient" '^accepted m-[[:xdigit:]]{32}$'
 check "admin receives no pane wake" '^✓ accepted · wake not started$'
 check_exit "the admin send exits 0" 0
@@ -793,7 +800,7 @@ ADMIN_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
 run "$CYC" status --plain
 check "status reports the unread admin count" '^‿ cyclops · watching main · tmux .* · admin inbox 1$'
 
-shell_command implementer "$N1" '--json messages'
+agent_command implementer "$N1" '--json messages'
 jq -r --arg id "$ADMIN_ID" '
   .rows[] | select(.message_id == $id) | .recipients[]
   | select(.label == "admin") | "\(.mailbox.status) \(.notification.state)"' \
@@ -821,34 +828,46 @@ duo_daemon_up() { duo "$CYC" --json status >/dev/null 2>&1; }
 duo_attached() { duo "$CYC" --json status | jq -e '.sessions[0].attached == true' >/dev/null; }
 duo_roster_has() { duo "$CYC" --json list | jq -e --arg a "$1" '[.agents[].agent] | index($a)' >/dev/null; }
 duo_pane_has_text() { duo_tmx capture-pane -p -t "$1" | grep -Fq -- "$2"; }
-duo_shell_command() {
-  local label="$1" pane="$2" command="$3"
+duo_pane_bound_to() {
+  duo "$CYC" --json status | jq -e --arg p "$1" --arg m "$2" \
+    '[.sessions[].panes[] | select(.pane_id == $p and .manifest == $m)] | length > 0' >/dev/null
+}
+duo_agent_command() {
+  local label="$1" command="$3"
   rm -f "$ROOT/result.$label" "$ROOT/exit.$label" "$ROOT/done.$label"
-  printf '\n$ (typed in the %s pane) cyclops %s\n' "$label" "$command"
+  printf '\n$ (run by the %s agent) cyclops %s\n' "$label" "$command"
   local line="CYCLOPS_HOME=\"$DUO_HOME\" TMUX_TMPDIR=\"$ROOT/duo/tmux\" \"$CYC\" $command > \"$ROOT/result.$label\" 2>&1; code=\$?; printf '%s' \"\$code\" > \"$ROOT/exit.$label\"; : > \"$ROOT/done.$label\""
-  duo_tmx send-keys -t "$pane" -l "$line"
-  duo_tmx send-keys -t "$pane" Enter
-  wait_for "the second rig shell command" 100 pane_command_done "$label"
+  printf 'run\t%s\n' "$line" > "$ROOT/duo/control.$label"
+  wait_for "the second rig agent command" 100 pane_command_done "$label"
   cp "$ROOT/result.$label" "$OUT"
   cp "$ROOT/exit.$label" "$ROOT/exit"
   cat "$OUT"
 }
-duo_shell_ready() { [ -f "$ROOT/duo/shell-ready.$1" ]; }
-duo_prepare_shell() {
+duo_agent_ready() { [ -f "$ROOT/duo/ready.$1" ]; }
+duo_start_agent() {
   local label="$1" pane="$2"
-  rm -f "$ROOT/duo/shell-ready.$label"
-  duo_tmx send-keys -t "$pane" -l ": > '$ROOT/duo/shell-ready.$label'"
-  duo_tmx send-keys -t "$pane" Enter
-  wait_for "the second rig $label shell" 100 duo_shell_ready "$label"
+  rm -f "$ROOT/duo/control.$label" "$ROOT/duo/ready.$label"
+  mkfifo "$ROOT/duo/control.$label"
+  duo_tmx respawn-pane -k -t "$pane" \
+    "'$ROOT/cycagent' '$ROOT/duo/control.$label' '$ROOT/duo/ready.$label'"
+  wait_for "the second rig $label agent" 100 duo_agent_ready "$label"
 }
 duo_pane_write_ready() {
   duo "$CYC" read "$1" --source detection --plain | grep -q 'write-ready$'
 }
+duo_notification_crossed_submit() {
+  local journal
+  journal="$(find "$DUO_HOME/workspaces" -name messages.ndjson -print -quit)"
+  [ -n "$journal" ] && jq -e --arg id "$1" '
+    select(.id == $id and .data.type == "notification_transition")
+    | .data.state
+    | select(. == "submitted" or . == "notified")' \
+    "$journal" >/dev/null
+}
 duo_start_composer() {
   local label="$1" pane="$2"
   duo_tmx resize-window -t "$pane" -x 500 -y 40
-  duo_tmx send-keys -t "$pane" -l "$COMPOSER_COMMAND"
-  duo_tmx send-keys -t "$pane" Enter
+  printf 'composer\t%s\n' "$COMPOSER_PATH" > "$ROOT/duo/control.$label"
   wait_for "the second rig $label composer" 100 duo_pane_has_text "$pane" 'Model x · Ctx: 78%'
   wait_for "the second rig $label composer to be write-ready" 100 duo_pane_write_ready "$label"
 }
@@ -902,16 +921,12 @@ duo "$CYC" --json status | jq -r '.manifests.ids[]' > "$OUT"
 cat "$OUT"
 check "the daemon found the shipped set"  '^claude$'
 
-# Two shells, and no shipped manifest binds a shell, so both panes read
-# unknown. This is the state the admin hit, and the surface has to say why
-# rather than only labelling it.
+# No shipped manifest binds the fixture agent, so both panes read unknown.
+# This is the state the admin hit, and the surface has to say why rather than
+# only labelling it.
 read -r D1 D2 <<<"$(duo_tmx list-panes -t main -F '#{pane_id}' | tr '\n' ' ')"
-rm -f "$ROOT/ready.implementer"
-duo_tmx respawn-pane -k -t "$D1" "'$ROOT/cycagent' '$ROOT/agent.sh' implementer '$CYC' '$ROOT'"
-wait_for "the implementer stand-in to be reading" 100 standin_reading implementer
-rm -f "$ROOT/ready.reviewer"
-duo_tmx respawn-pane -k -t "$D2" "'$ROOT/cycagent' '$ROOT/agent.sh' reviewer '$CYC' '$ROOT'"
-wait_for "the reviewer stand-in to be reading" 100 standin_reading reviewer
+duo_start_agent implementer "$D1"
+duo_start_agent reviewer "$D2"
 duo_tmx select-pane -t "$D1" -T ''
 duo_tmx select-pane -t "$D2" -T ''
 sleep 2.5
@@ -958,26 +973,27 @@ check "one row each"                      '^ +reviewer +○ idle$'
 check "the header names the second home"  '^watching main · home .*/duo/home$'
 
 stop_duo_daemon
-duo_tmx respawn-pane -k -t "$D1" "/bin/sh"
-duo_prepare_shell implementer "$D1"
-duo_tmx respawn-pane -k -t "$D2" "/bin/sh"
-duo_prepare_shell reviewer "$D2"
+duo_start_agent implementer "$D1"
+duo_start_agent reviewer "$D2"
 start_duo_daemon
-wait_for "the second daemon to re-attach to shell roots" 60 duo_attached
+wait_for "the second daemon to re-attach to fixture agents" 60 duo_attached
 duo "$CYC" name "$D1" implementer --plain > /dev/null
 duo "$CYC" name "$D2" reviewer --plain > /dev/null
+wait_for "the second daemon to bind implementer" 100 duo_pane_bound_to "$D1" demo
+wait_for "the second daemon to bind reviewer" 100 duo_pane_bound_to "$D2" demo
 duo_start_composer reviewer "$D2"
 
 printf '\n$ cyclops send reviewer --subject "hello"\n'
-duo_shell_command implementer "$D1" 'send reviewer --subject "hello" --client-key parity-duo --plain'
+duo_agent_command implementer "$D1" 'send reviewer --subject "hello" --client-key parity-duo --plain'
 check "the first message is accepted"     '^accepted m-[[:xdigit:]]{32}$'
-check "and reports notification separately" '^✓ accepted( · [0-9]+ ahead)? · wake (not started|queued|checking readiness|writing|staged|submitted|notified|needs attention)$'
+check "and reports notification separately" '^✓ accepted( · [0-9]+ ahead)? · wake (not started|queued|checking readiness|writing|staged|submitted|notified|withdrawn|needs attention|superseded)$'
 check_exit "and accepted send exits 0" 0
 DUO_MESSAGE_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
 wait_for "the second rig reviewer doorbell" 100 duo_pane_has_text "$D2" "cyclops inbox claim $DUO_MESSAGE_ID"
+wait_for "the second rig doorbell to be submitted" 100 duo_notification_crossed_submit "$DUO_MESSAGE_ID"
 
 printf '\n$ cyclops history\n'
-duo_shell_command implementer "$D1" 'history --plain'
+duo_agent_command implementer "$D1" 'history --plain'
 check "and history holds the message fact" '^ +[0-9]+s +implementer → reviewer +hello$'
 
 stop_duo_daemon
@@ -999,34 +1015,46 @@ stock_roster_has() { stock "$CYC" --json list | jq -e --arg a "$1" '[.agents[].a
 stock_idle() { stock "$CYC" --json list | jq -e --arg a "$1" \
   '[.agents[] | select(.agent == $a and .state == "idle")] | length == 1' >/dev/null; }
 stock_pane_has_text() { stock_tmx capture-pane -p -t "$1" | grep -Fq -- "$2"; }
-stock_shell_command() {
-  local label="$1" pane="$2" command="$3"
+stock_pane_bound_to() {
+  stock "$CYC" --json status | jq -e --arg p "$1" --arg m "$2" \
+    '[.sessions[].panes[] | select(.pane_id == $p and .manifest == $m)] | length > 0' >/dev/null
+}
+stock_agent_command() {
+  local label="$1" command="$3"
   rm -f "$ROOT/result.$label" "$ROOT/exit.$label" "$ROOT/done.$label"
-  printf '\n$ (typed in the %s pane) cyclops %s\n' "$label" "$command"
+  printf '\n$ (run by the %s agent) cyclops %s\n' "$label" "$command"
   local line="CYCLOPS_HOME=\"$STOCK_HOME\" TMUX_TMPDIR=\"$ROOT/stock/tmux\" \"$CYC\" $command > \"$ROOT/result.$label\" 2>&1; code=\$?; printf '%s' \"\$code\" > \"$ROOT/exit.$label\"; : > \"$ROOT/done.$label\""
-  stock_tmx send-keys -t "$pane" -l "$line"
-  stock_tmx send-keys -t "$pane" Enter
-  wait_for "the defaults rig shell command" 100 pane_command_done "$label"
+  printf 'run\t%s\n' "$line" > "$ROOT/stock/control.$label"
+  wait_for "the defaults rig agent command" 100 pane_command_done "$label"
   cp "$ROOT/result.$label" "$OUT"
   cp "$ROOT/exit.$label" "$ROOT/exit"
   cat "$OUT"
 }
-stock_shell_ready() { [ -f "$ROOT/stock/shell-ready.$1" ]; }
-stock_prepare_shell() {
+stock_agent_ready() { [ -f "$ROOT/stock/ready.$1" ]; }
+stock_start_agent() {
   local label="$1" pane="$2"
-  rm -f "$ROOT/stock/shell-ready.$label"
-  stock_tmx send-keys -t "$pane" -l ": > '$ROOT/stock/shell-ready.$label'"
-  stock_tmx send-keys -t "$pane" Enter
-  wait_for "the defaults rig $label shell" 100 stock_shell_ready "$label"
+  rm -f "$ROOT/stock/control.$label" "$ROOT/stock/ready.$label"
+  mkfifo "$ROOT/stock/control.$label"
+  stock_tmx respawn-pane -k -t "$pane" \
+    "'$ROOT/cycagent' '$ROOT/stock/control.$label' '$ROOT/stock/ready.$label'"
+  wait_for "the defaults rig $label agent" 100 stock_agent_ready "$label"
 }
 stock_pane_write_ready() {
   stock "$CYC" read "$1" --source detection --plain | grep -q 'write-ready$'
 }
+stock_notification_crossed_submit() {
+  local journal
+  journal="$(find "$STOCK_HOME/workspaces" -name messages.ndjson -print -quit)"
+  [ -n "$journal" ] && jq -e --arg id "$1" '
+    select(.id == $id and .data.type == "notification_transition")
+    | .data.state
+    | select(. == "submitted" or . == "notified")' \
+    "$journal" >/dev/null
+}
 stock_start_composer() {
   local label="$1" pane="$2"
   stock_tmx resize-window -t "$pane" -x 500 -y 40
-  stock_tmx send-keys -t "$pane" -l "$COMPOSER_COMMAND"
-  stock_tmx send-keys -t "$pane" Enter
+  printf 'composer\t%s\n' "$COMPOSER_PATH" > "$ROOT/stock/control.$label"
   wait_for "the defaults rig $label composer" 100 stock_pane_has_text "$pane" 'Model x · Ctx: 78%'
   wait_for "the defaults rig $label composer to be write-ready" 100 stock_pane_write_ready "$label"
 }
@@ -1085,9 +1113,7 @@ wait_for "the defaults daemon to attach" 60 stock_attached
 read -r S1 S2 <<<"$(stock_tmx list-panes -t main -F '#{pane_id}' | tr '\n' ' ')"
 # Pane 1 is bound by the fixture manifest and reports no hook. The fixture
 # loop keeps its one-line doorbell visible and can issue authenticated sends.
-rm -f "$ROOT/ready.implementer"
-stock_tmx respawn-pane -k -t "$S1" "'$ROOT/cycagent' '$ROOT/agent.sh' implementer '$CYC' '$ROOT'"
-wait_for "the defaults implementer fixture" 100 standin_reading implementer
+stock_start_agent implementer "$S1"
 # Pane 2 is the pane nothing detects. `sleep` is in no manifest's
 # process_names, which is the state every pane is in before its agent CLI
 # starts.
@@ -1111,30 +1137,31 @@ wait_for "implementer to read idle" 60 stock_idle implementer
 sleep 2.5
 
 # Standard defaults accept the mailbox write and send only a doorbell to a
-# bound recipient. The sender is an ordinary watched shell.
+# bound recipient. The sender remains the dedicated fixture agent.
 stop_stock_daemon
-stock_tmx respawn-pane -k -t "$S1" "/bin/sh"
-stock_prepare_shell implementer "$S1"
-stock_tmx respawn-pane -k -t "$S2" "/bin/sh"
-stock_prepare_shell reviewer "$S2"
+stock_start_agent implementer "$S1"
+stock_start_agent reviewer "$S2"
 start_stock_daemon
-wait_for "the defaults daemon to re-attach to shell roots" 60 stock_attached
+wait_for "the defaults daemon to re-attach to fixture agents" 60 stock_attached
 stock_run "$CYC" name "$S1" implementer --plain
 stock_run "$CYC" name "$S2" reviewer --plain
+wait_for "the defaults daemon to bind implementer" 100 stock_pane_bound_to "$S1" demo
+wait_for "the defaults daemon to bind reviewer" 100 stock_pane_bound_to "$S2" demo
 stock_start_composer reviewer "$S2"
 
-stock_shell_command implementer "$S1" 'send reviewer --subject "bound hello" --body "private default body" --client-key parity-stock-bound --plain'
+stock_agent_command implementer "$S1" 'send reviewer --subject "bound hello" --body "private default body" --client-key parity-stock-bound --plain'
 check "the default bound send is accepted" '^accepted m-[[:xdigit:]]{32}$'
-check "its wake state is separate" '^✓ accepted( · [0-9]+ ahead)? · wake (not started|queued|checking readiness|writing|staged|submitted|notified|needs attention)$'
+check "its wake state is separate" '^✓ accepted( · [0-9]+ ahead)? · wake (not started|queued|checking readiness|writing|staged|submitted|notified|withdrawn|needs attention|superseded)$'
 check_exit "the default bound send exits 0" 0
 STOCK_BOUND_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
 wait_for "the defaults reviewer doorbell" 100 stock_pane_has_text "$S2" "cyclops inbox claim $STOCK_BOUND_ID"
+wait_for "the defaults doorbell to be submitted" 100 stock_notification_crossed_submit "$STOCK_BOUND_ID"
 stock_tmx capture-pane -p -t "$S2" > "$OUT"
-check "the default pane gets the doorbell" "^❯ cyclops inbox claim $STOCK_BOUND_ID\$"
+check "the default pane gets the exact attempt doorbell" "^❯ cyclops inbox claim $STOCK_BOUND_ID #c:[A-Za-z0-9_-]{22}\$"
 check_absent "the default pane does not get the body" '^private default body$'
 
 # History owns message facts, not standard notification badges.
-stock_shell_command implementer "$S1" 'history --plain'
+stock_agent_command implementer "$S1" 'history --plain'
 check "the bound message is on the record" '^ +[0-9]+s +implementer → reviewer +bound hello$'
 check_absent "history has no standard delivery badge" 'delivered ·|needs attention ·'
 
@@ -1285,7 +1312,7 @@ check "update names the running build"    '^cyclops [0-9]+\.[0-9]+\.[0-9]+ \(([0
 check "and its source"                    "^  source $ROOT/remote at parity-update$"
 check "it reran the installer"            '^✔ cyclops [0-9]+\.[0-9]+\.[0-9]+ \([0-9a-f]+\) is installed$'
 check "and reports old build to new"      '^✔ updated · [0-9]+\.[0-9]+\.[0-9]+ \(([0-9a-f]+(\.dirty)?|unknown)\) → [0-9]+\.[0-9]+\.[0-9]+ \([0-9a-f]+\)$'
-check "then names the no-daemon next step" '^Next: cyclops start +come up on the new build \(no daemon was running\)$'
+check "and keeps a stopped daemon stopped" '^  no daemon was running; the selected pair remains stopped$'
 check_absent "it never stops the daemon itself" 'stopped cyclopsd'
 check_exit "an update exits 0" 0
 

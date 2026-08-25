@@ -5,9 +5,9 @@
 //! else in that namespace, so a pane wearing one could not be addressed:
 //!
 //! 1. `admin` is the operator's durable mailbox identity. It is a valid
-//!    message address, but no pane may wear it. Only a same-user caller proven
-//!    outside every watched pane resolves as `admin`; a pane with that label
-//!    would make identity ambiguous.
+//!    message address, but no pane may wear it. A same-user shell with no
+//!    vendor ancestor resolves as `admin`, including inside a watched pane;
+//!    a pane with that label would make identity ambiguous.
 //! 2. `*` addresses every agent at once.
 //! 3. `%0`, `%1` and so on are tmux's own pane ids, which cyclops accepts
 //!    anywhere a label is accepted.
@@ -35,9 +35,10 @@ pub fn refusal(label: &str) -> Option<String> {
     }
     if label == ADMIN {
         return Some(format!(
-            "\"{ADMIN}\" is you. A same-user terminal caller outside every watched \
-             pane sends as \"{ADMIN}\", so a pane called that would collide with \
-             the operator on the record. Pick another name, e.g. lead."
+            "\"{ADMIN}\" is you. A same-user terminal with no agent-vendor \
+             ancestor sends as \"{ADMIN}\", including inside a watched pane, so \
+             a pane called that would collide with the operator on the record. \
+             Pick another name, e.g. lead."
         ));
     }
     if label == EVERYONE {

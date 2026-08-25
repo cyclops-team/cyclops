@@ -64,12 +64,15 @@ fn same_physical_pane(left: RecipientKey, right: RecipientKey) -> bool {
 }
 
 fn same_composer_occupant(left: &NotificationBinding, right: &NotificationBinding) -> bool {
-    left.agent == right.agent && left.manifest == right.manifest
+    left.pane_root.is_some()
+        && left.pane_root == right.pane_root
+        && left.agent == right.agent
+        && left.manifest == right.manifest
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct RecoveryCoordinator {
-    boot_attempts: HashSet<NotificationAttemptId>,
+    tracked_attempts: HashSet<NotificationAttemptId>,
     retiring: HashSet<NotificationAttemptId>,
     writer_unknown: bool,
 }
@@ -77,10 +80,19 @@ pub(crate) struct RecoveryCoordinator {
 impl RecoveryCoordinator {
     pub(crate) fn new(attempts: impl IntoIterator<Item = NotificationAttemptId>) -> Self {
         Self {
-            boot_attempts: attempts.into_iter().collect(),
+            tracked_attempts: attempts.into_iter().collect(),
             retiring: HashSet::new(),
             writer_unknown: false,
         }
+    }
+
+    /// Track a same-run barrier whose delivery worker already retired.
+    ///
+    /// A late exact claim can reconcile an ACK timeout after the in-memory
+    /// delivery handle is gone. The durable barrier then follows the same
+    /// clean-screen retirement path as a barrier restored at daemon boot.
+    pub(crate) fn track(&mut self, attempt_id: NotificationAttemptId) {
+        self.tracked_attempts.insert(attempt_id);
     }
 
     fn writer_unknown(&self) -> bool {
@@ -93,14 +105,14 @@ impl RecoveryCoordinator {
         recipient: RecipientKey,
     ) -> Vec<NotificationRecord> {
         let active: HashSet<_> = canonical.iter().map(|record| record.attempt_id).collect();
-        self.boot_attempts
+        self.tracked_attempts
             .retain(|attempt_id| active.contains(attempt_id));
         self.retiring
             .retain(|attempt_id| active.contains(attempt_id));
         canonical
             .iter()
             .filter(|record| {
-                self.boot_attempts.contains(&record.attempt_id)
+                self.tracked_attempts.contains(&record.attempt_id)
                     && same_physical_pane(record.recipient, recipient)
             })
             .cloned()
@@ -108,7 +120,7 @@ impl RecoveryCoordinator {
     }
 
     fn contains(&self, attempt_id: NotificationAttemptId) -> bool {
-        self.boot_attempts.contains(&attempt_id)
+        self.tracked_attempts.contains(&attempt_id)
     }
 
     fn reserve_record(
@@ -117,10 +129,10 @@ impl RecoveryCoordinator {
         attempt_id: NotificationAttemptId,
     ) -> Result<Option<NotificationRecord>, &'static str> {
         let active: HashSet<_> = canonical.iter().map(|record| record.attempt_id).collect();
-        self.boot_attempts
+        self.tracked_attempts
             .retain(|candidate| active.contains(candidate));
         self.retiring.retain(|candidate| active.contains(candidate));
-        if !self.boot_attempts.contains(&attempt_id) {
+        if !self.tracked_attempts.contains(&attempt_id) {
             return Ok(None);
         }
         if self.writer_unknown {
@@ -140,6 +152,7 @@ impl RecoveryCoordinator {
         records: &[NotificationRecord],
         live: Option<&NotificationBinding>,
         clean_composer: bool,
+        legacy_claimed_clean: bool,
     ) -> Option<RecoveryAction> {
         let [record] = records else {
             return if records.is_empty() {
@@ -159,13 +172,39 @@ impl RecoveryCoordinator {
             return Some(RecoveryAction::Hold("composer_recovery_unproven"));
         };
         let Some(live) = live.filter(|binding| {
-            same_physical_pane(binding.recipient, record.recipient) && binding.leader.is_some()
+            same_physical_pane(binding.recipient, record.recipient)
+                && binding.pane_root.is_some()
+                && binding.leader.is_some()
         }) else {
             return Some(RecoveryAction::Hold("composer_recovery_unproven"));
         };
 
+        if crate::mailbox::uses_incomplete_legacy_doorbell_contract(record) {
+            if legacy_claimed_clean
+                && live.recipient == record.recipient
+                && expected.manifest == live.manifest
+            {
+                self.retiring.insert(record.attempt_id);
+                return Some(RecoveryAction::Retire {
+                    record: Box::new(record.clone()),
+                    cause: NotificationBarrierRetirementCause::RecipientClaimedComposerClear,
+                    replacement: None,
+                });
+            }
+            return Some(RecoveryAction::Hold("legacy_durable_binding_incomplete"));
+        }
+
+        if expected.pane_root.is_none() {
+            return Some(RecoveryAction::Hold("composer_recovery_unproven"));
+        }
+
         if same_composer_occupant(expected, live) {
-            if record.state == cyclops_proto::NotificationState::Notified && clean_composer {
+            if matches!(
+                record.state,
+                cyclops_proto::NotificationState::Notified
+                    | cyclops_proto::NotificationState::WithdrawnAfterStaging
+            ) && clean_composer
+            {
                 self.retiring.insert(record.attempt_id);
                 return Some(RecoveryAction::Retire {
                     record: Box::new(record.clone()),
@@ -190,7 +229,7 @@ impl RecoveryCoordinator {
     }
 
     pub(crate) fn retired(&mut self, attempt_id: NotificationAttemptId) {
-        self.boot_attempts.remove(&attempt_id);
+        self.tracked_attempts.remove(&attempt_id);
         self.retiring.remove(&attempt_id);
     }
 
@@ -212,7 +251,7 @@ impl RecoveryCoordinator {
             Some("composer_recovery_reopen_required")
         } else if self.retiring.contains(&attempt_id) {
             Some("composer_recovery_retirement_pending")
-        } else if self.boot_attempts.contains(&attempt_id) {
+        } else if self.tracked_attempts.contains(&attempt_id) {
             Some("composer_recovery_retirement_failed")
         } else {
             None
@@ -275,6 +314,9 @@ pub(crate) fn observed_binding(
 ) -> Option<NotificationBinding> {
     Some(NotificationBinding {
         recipient,
+        pane_root: Some(
+            ProcessInstanceId::new(binding.pane_root.pid, binding.pane_root.birth).ok()?,
+        ),
         leader: Some(ProcessInstanceId::new(binding.leader.pid, binding.leader.birth).ok()?),
         agent: ProcessInstanceId::new(binding.agent.pid, binding.agent.birth).ok()?,
         manifest: NotificationManifestId::new(binding.manifest.clone()).ok()?,
@@ -287,7 +329,7 @@ pub(crate) fn clean_composer(det: &Detection, in_mode: bool) -> bool {
         && !det.stale
         && !det.disagreement
         && det.state == AgentState::Idle
-        && det.screen_says_clean()
+        && det.screen_proves_write_safe_composer()
         && det
             .readings
             .iter()
@@ -351,6 +393,7 @@ pub(crate) fn bind_post_recovery_turn(
         turn,
         since_ms,
     )
+    .is_some()
 }
 
 /// Persist exact post-restart lifecycle evidence before fusion consumes it.
@@ -413,6 +456,13 @@ pub(crate) fn retire_exact_lifecycle(
             return LifecycleRetirement::Blocked("composer_recovery_store_unavailable");
         }
     };
+    if canonical.iter().any(|record| {
+        record.attempt_id == candidate && record.needs_claimed_ack_timeout_reconciliation()
+    }) {
+        // Exact v2 ACK-timeout recovery owns its own clear-or-clean settlement
+        // fact. A turn end cannot remove that barrier or hide its alarm.
+        return LifecycleRetirement::Blocked("claimed_notification_reconciliation_pending");
+    }
     let record = match inner
         .composer_recovery
         .lock()
@@ -555,6 +605,66 @@ pub(crate) fn retire_gone_recipient(
     Ok(())
 }
 
+/// Retire every barrier owned by a process generation that was replaced.
+///
+/// The caller first validates the registry's exact old root while holding the
+/// route-publication transaction. A stale replacement edge therefore cannot
+/// reach this operation or retire barriers owned by a newer occupant. The
+/// retirement is persisted before the registry rebind because the physical
+/// replacement remains true even if that later registry write fails. The
+/// replacement binding is the positive process and manifest observation that
+/// makes the durable cause truthful.
+pub(crate) fn retire_replaced_recipient(
+    inner: &Inner,
+    recipient: RecipientKey,
+    replacement: Option<NotificationBinding>,
+) -> Result<(), &'static str> {
+    let service = inner
+        .mailbox
+        .as_ref()
+        .ok_or("composer_recovery_store_unavailable")?;
+    let records: Vec<_> = service
+        .active_notification_barriers()
+        .map_err(|_| "composer_recovery_store_unavailable")?
+        .into_iter()
+        .filter(|record| record.recipient == recipient)
+        .collect();
+    if records.is_empty() {
+        return Ok(());
+    }
+    let replacement = replacement.ok_or("composer_recovery_replacement_unproven")?;
+    if inner
+        .composer_recovery
+        .lock()
+        .expect("composer recovery lock")
+        .writer_unknown()
+    {
+        return Err("composer_recovery_reopen_required");
+    }
+    for record in records {
+        if let Err(error) = service.retire_notification_barrier(
+            &record,
+            NotificationBarrierRetirementCause::OccupantReplaced,
+            Some(replacement.clone()),
+        ) {
+            if writer_requires_reopen(&error) {
+                inner
+                    .composer_recovery
+                    .lock()
+                    .expect("composer recovery lock")
+                    .require_reopen();
+            }
+            return Err("composer_recovery_retirement_failed");
+        }
+        inner
+            .composer_recovery
+            .lock()
+            .expect("composer recovery lock")
+            .retired(record.attempt_id);
+    }
+    Ok(())
+}
+
 /// Prove physical pane loss against the whole tmux server.
 ///
 /// Absence from one session is only a route change. The pane is gone only
@@ -669,6 +779,7 @@ mod tests {
     fn binding(recipient: RecipientKey, pid: i32) -> NotificationBinding {
         NotificationBinding {
             recipient,
+            pane_root: Some(ProcessInstanceId::new(pid - 1, pid as u64 + 99).unwrap()),
             leader: Some(ProcessInstanceId::new(pid, pid as u64 + 100).unwrap()),
             agent: ProcessInstanceId::new(pid + 1, pid as u64 + 101).unwrap(),
             manifest: NotificationManifestId::new("codex").unwrap(),
@@ -685,6 +796,9 @@ mod tests {
             transport: NotificationTransport::Doorbell,
             doorbell_format: None,
             cause: None,
+            pre_write_cause: None,
+            pre_write_observation: None,
+            pre_write_reopen_count: 0,
             started_seq: 4,
             updated_seq: 5,
             updated_at: 6,
@@ -700,6 +814,7 @@ mod tests {
             stale: false,
             write_ready: false,
             write_block: None,
+            composer_semantic: Some(cyclops_proto::ComposerSemantic::Clean),
         }
     }
 
@@ -713,12 +828,13 @@ mod tests {
     }
 
     #[test]
-    fn only_a_notified_attempt_may_retire_from_current_clean_evidence() {
+    fn only_a_settled_attempt_may_retire_from_current_clean_evidence() {
         let route = recipient("00000000-0000-4000-8000-000000000002");
         let expected = binding(route, 40);
         for state in [
             NotificationState::Writing,
             NotificationState::Staged,
+            NotificationState::Submitting,
             NotificationState::Submitted,
             NotificationState::AttentionRequired,
         ] {
@@ -726,7 +842,7 @@ mod tests {
             record.state = state;
             let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
             assert_eq!(
-                recovery.reconcile(std::slice::from_ref(&record), Some(&expected), true),
+                recovery.reconcile(std::slice::from_ref(&record), Some(&expected), true, false,),
                 Some(RecoveryAction::Restore(record.attempt_id)),
                 "{state:?} has no receipt proof"
             );
@@ -736,16 +852,110 @@ mod tests {
         record.state = NotificationState::Notified;
         let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
         assert_eq!(
-            recovery.reconcile(std::slice::from_ref(&record), Some(&expected), false),
+            recovery.reconcile(std::slice::from_ref(&record), Some(&expected), false, false,),
             Some(RecoveryAction::Restore(record.attempt_id))
         );
         assert_eq!(
-            recovery.reconcile(std::slice::from_ref(&record), Some(&expected), true),
+            recovery.reconcile(std::slice::from_ref(&record), Some(&expected), true, false,),
             Some(RecoveryAction::Retire {
                 record: Box::new(record.clone()),
                 cause: NotificationBarrierRetirementCause::ComposerObservedClear,
                 replacement: None,
             })
+        );
+
+        record.state = NotificationState::WithdrawnAfterStaging;
+        let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
+        assert!(matches!(
+            recovery.reconcile(std::slice::from_ref(&record), Some(&expected), true, false,),
+            Some(RecoveryAction::Retire {
+                cause: NotificationBarrierRetirementCause::ComposerObservedClear,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_same_run_late_claim_uses_the_recovery_barrier_path() {
+        let route = recipient("00000000-0000-4000-8000-000000000002");
+        let expected = binding(route, 40);
+        let mut record = record(route, expected.clone());
+        record.state = NotificationState::Notified;
+        let mut recovery = RecoveryCoordinator::default();
+
+        let records = recovery.active_for_recipient(std::slice::from_ref(&record), route);
+        assert_eq!(
+            recovery.reconcile(&records, Some(&expected), true, false),
+            None,
+            "an untracked same-run barrier is not boot recovery work"
+        );
+        recovery.track(record.attempt_id);
+        let records = recovery.active_for_recipient(std::slice::from_ref(&record), route);
+        assert_eq!(
+            recovery.reconcile(&records, Some(&expected), false, false),
+            Some(RecoveryAction::Restore(record.attempt_id))
+        );
+        assert!(matches!(
+            recovery.reconcile(&records, Some(&expected), true, false),
+            Some(RecoveryAction::Retire {
+                cause: NotificationBarrierRetirementCause::ComposerObservedClear,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn an_incomplete_legacy_barrier_retires_only_after_claim_and_clean_screen() {
+        let route = recipient("00000000-0000-4000-8000-000000000002");
+        let live = binding(route, 40);
+        let mut legacy = live.clone();
+        legacy.pane_root = None;
+        let record = record(route, legacy);
+
+        let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
+        assert_eq!(
+            recovery.reconcile(std::slice::from_ref(&record), Some(&live), true, false,),
+            Some(RecoveryAction::Hold("legacy_durable_binding_incomplete"))
+        );
+
+        let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
+        assert_eq!(
+            recovery.reconcile(std::slice::from_ref(&record), Some(&live), true, true,),
+            Some(RecoveryAction::Retire {
+                record: Box::new(record.clone()),
+                cause: NotificationBarrierRetirementCause::RecipientClaimedComposerClear,
+                replacement: None,
+            })
+        );
+
+        let mut wrong_manifest = live.clone();
+        wrong_manifest.manifest = NotificationManifestId::new("claude").unwrap();
+        let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
+        assert_eq!(
+            recovery.reconcile(
+                std::slice::from_ref(&record),
+                Some(&wrong_manifest),
+                true,
+                true,
+            ),
+            Some(RecoveryAction::Hold("legacy_durable_binding_incomplete"))
+        );
+
+        let moved_route = recipient("00000000-0000-4000-8000-000000000003");
+        let mut moved = live.clone();
+        moved.recipient = moved_route;
+        let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
+        assert_eq!(
+            recovery.reconcile(std::slice::from_ref(&record), Some(&moved), true, true,),
+            Some(RecoveryAction::Hold("legacy_durable_binding_incomplete"))
+        );
+
+        let mut direct = record.clone();
+        direct.transport = NotificationTransport::DirectPayload;
+        let mut recovery = RecoveryCoordinator::new([direct.attempt_id]);
+        assert_eq!(
+            recovery.reconcile(std::slice::from_ref(&direct), Some(&live), true, true,),
+            Some(RecoveryAction::Hold("composer_recovery_unproven"))
         );
     }
 
@@ -775,7 +985,12 @@ mod tests {
         let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
 
         assert_eq!(
-            recovery.reconcile(std::slice::from_ref(&record), Some(&replacement), false,),
+            recovery.reconcile(
+                std::slice::from_ref(&record),
+                Some(&replacement),
+                false,
+                false,
+            ),
             Some(RecoveryAction::Retire {
                 record: Box::new(record),
                 cause: NotificationBarrierRetirementCause::OccupantReplaced,
@@ -794,7 +1009,12 @@ mod tests {
         let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
 
         assert_eq!(
-            recovery.reconcile(std::slice::from_ref(&record), Some(&changed_leader), true,),
+            recovery.reconcile(
+                std::slice::from_ref(&record),
+                Some(&changed_leader),
+                true,
+                false,
+            ),
             Some(RecoveryAction::Restore(record.attempt_id))
         );
     }
@@ -810,7 +1030,12 @@ mod tests {
         let record = record(old, expected);
         let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
 
-        let action = recovery.reconcile(std::slice::from_ref(&record), Some(&replacement), false);
+        let action = recovery.reconcile(
+            std::slice::from_ref(&record),
+            Some(&replacement),
+            false,
+            false,
+        );
         let Some(RecoveryAction::Retire {
             replacement: Some(replacement),
             cause: NotificationBarrierRetirementCause::OccupantReplaced,
@@ -828,13 +1053,14 @@ mod tests {
         let mut expected = binding(route, 40);
         expected.leader = None;
         let live = binding(route, 90);
+        expected.pane_root = live.pane_root;
         expected.agent = live.agent;
         expected.manifest = live.manifest.clone();
         let record = record(route, expected);
         let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
 
         assert_eq!(
-            recovery.reconcile(std::slice::from_ref(&record), Some(&live), true),
+            recovery.reconcile(std::slice::from_ref(&record), Some(&live), true, false,),
             Some(RecoveryAction::Restore(record.attempt_id))
         );
     }
@@ -951,7 +1177,7 @@ mod tests {
         recovery.require_reopen();
         assert!(recovery.writer_unknown());
         assert!(recovery.retiring.is_empty());
-        assert!(recovery.boot_attempts.contains(&attempt_id));
+        assert!(recovery.tracked_attempts.contains(&attempt_id));
     }
 
     #[test]

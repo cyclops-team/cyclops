@@ -48,6 +48,7 @@ pub mod detail;
 mod entry;
 mod frame;
 pub mod grid;
+mod health;
 mod input;
 pub mod messages;
 mod plain;
@@ -62,14 +63,18 @@ pub use cyclops_proto::{Attention, AttentionItem, Eye, PaneSnapshot};
 pub use data::{read_backfill, UiMsg};
 pub use detail::{Action, Back, Check, Detail, Draft, Loaded, Request, Stage, ThreadEntry};
 pub use frame::build;
+pub use health::BuildHealth;
 pub use input::Key;
-pub use messages::{rows_from_snapshot, Link, RefreshGate, RefreshRequest};
+pub use messages::{
+    rows_from_snapshot, FollowRequest, Link, MessageFollower, RefreshGate, RefreshRequest,
+};
 pub use queue::{
     Counts, Direction, FrozenTarget, HumanQueue, MailboxWord, QueueRow, QueueTarget, Scope,
     Snapshot, WakeWord,
 };
 pub use stream::{
-    Backfilled, Entry, EntryKind, Filter, Intake, PingDelivery, Record, RosterSeed, StatusSeed,
+    Backfilled, EndpointFilter, Entry, EntryKind, Filter, Intake, MessageEndpoints, PingDelivery,
+    Record, RosterSeed, StatusSeed,
 };
 pub use theme::Theme;
 
@@ -95,9 +100,9 @@ pub struct UiOptions {
     pub plain: bool,
     /// Start in the firehose instead of the admin stream.
     pub firehose: bool,
-    pub with: Option<String>,
-    pub from: Option<String>,
-    pub to: Option<String>,
+    pub with: Option<EndpointFilter>,
+    pub from: Option<EndpointFilter>,
+    pub to: Option<EndpointFilter>,
     /// Ledger tail length for backfill.
     pub backfill: usize,
 }
@@ -196,6 +201,7 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
     };
 
     let mut intake = Intake::new();
+    let mut message_follower = MessageFollower::default();
     let mut tick_armed = false;
     draw(&mut term, &mut app);
 
@@ -214,7 +220,14 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
             let mut queued = Some(first);
             let mut n = 0;
             while let Some(msg) = queued.take() {
-                if handle(&mut app, &mut intake, &mut tick_armed, &tx, msg) {
+                if handle(
+                    &mut app,
+                    &mut intake,
+                    &mut message_follower,
+                    &mut tick_armed,
+                    &tx,
+                    msg,
+                ) {
                     quit = true;
                     break;
                 }
@@ -236,6 +249,11 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
         // burst of edges costs one follow-up rather than one read each.
         if let Some(request) = app.wants_messages() {
             if io.refresh.send(request).is_err() {
+                break;
+            }
+        }
+        if let Some(request) = message_follower.begin() {
+            if io.follow.send(request).is_err() {
                 break;
             }
         }
@@ -282,6 +300,7 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
 fn handle(
     app: &mut App,
     intake: &mut Intake,
+    message_follower: &mut MessageFollower,
     tick_armed: &mut bool,
     tx: &tokio::sync::mpsc::UnboundedSender<UiMsg>,
     msg: UiMsg,
@@ -335,22 +354,43 @@ fn handle(
         UiMsg::Subscribed => {
             app.conn_lost = false;
             app.refresh.connected();
+            message_follower.connected();
         }
         UiMsg::ConnLost(why) => {
             app.conn_lost = true;
             app.refresh.disconnected();
+            message_follower.disconnected();
             app.notice = Some(why);
         }
-        UiMsg::MessagesChanged(changed) => app.refresh.messages_changed(&changed),
+        UiMsg::BuildHealth(health) => app.build_health = Some(health),
+        UiMsg::MessagesChanged(changed) => {
+            message_follower.changed(&changed);
+            app.refresh.messages_changed(&changed);
+        }
         UiMsg::MessagesRouteChanged => app.refresh.mark_dirty(),
         UiMsg::Messages { request, snapshot } => {
-            app.apply_messages_response(request, &snapshot);
+            if app.apply_messages_response(request, &snapshot) {
+                message_follower.baseline(&snapshot);
+            }
         }
         // The last good snapshot stays on screen. Replacing it with
         // nothing would read as an empty mailbox.
         UiMsg::MessagesFailed { request, why } => {
             if app.refresh.finish_failure(request) {
                 app.notice = Some(format!("messages unavailable: {why}"));
+            }
+        }
+        UiMsg::MessagesFollow { request, page } => match message_follower.finish(request, &page) {
+            Ok(entries) => {
+                for entry in entries {
+                    app.live(entry);
+                }
+            }
+            Err(why) => app.notice = Some(format!("messages follow unavailable: {why}")),
+        },
+        UiMsg::MessagesFollowFailed { request, why } => {
+            if message_follower.failed(request) {
+                app.notice = Some(format!("messages follow unavailable: {why}"));
             }
         }
         UiMsg::ActionDone { token, outcome } => app.apply_action(token, *outcome),
@@ -423,6 +463,7 @@ mod tests {
             id: Some("e-1".into()),
             kind: EntryKind::State {
                 target: "reviewer".into(),
+                recipient: None,
                 session_idx: 0,
                 pane_id: Some("%1".into()),
                 state: cyclops_proto::AgentState::BlockedPermission,
@@ -448,12 +489,14 @@ mod tests {
             rows: Vec::new(),
         });
         let mut intake = Intake::new();
+        let mut message_follower = MessageFollower::default();
         let mut tick_armed = false;
         let (tx, _rx) = unbounded_channel();
 
         assert!(!handle(
             &mut app,
             &mut intake,
+            &mut message_follower,
             &mut tick_armed,
             &tx,
             UiMsg::Subscribed,
@@ -462,6 +505,7 @@ mod tests {
         assert!(!handle(
             &mut app,
             &mut intake,
+            &mut message_follower,
             &mut tick_armed,
             &tx,
             UiMsg::MessagesFailed {
@@ -483,12 +527,14 @@ mod tests {
     fn an_initial_connection_failure_is_visible_and_retryable() {
         let mut app = App::new(Theme::none(), View::Messages, Filter::default());
         let mut intake = Intake::new();
+        let mut message_follower = MessageFollower::default();
         let mut tick_armed = false;
         let (tx, _rx) = unbounded_channel();
 
         assert!(!handle(
             &mut app,
             &mut intake,
+            &mut message_follower,
             &mut tick_armed,
             &tx,
             UiMsg::ConnLost("daemon socket unavailable".into()),

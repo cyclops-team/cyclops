@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use cyclops_proto::{Attention, AttentionItem, Eye};
 
 use crate::input::Key;
-use crate::stream::{Entry, EntryKind, Filter, Record, StatusSeed};
+use crate::stream::{EndpointFilter, Entry, EntryKind, Filter, Record, StatusSeed};
 use crate::theme::Theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,9 +162,9 @@ impl Which {
     /// This filter's current value, or None when it is not set.
     pub fn value(self, filter: &Filter) -> Option<&str> {
         match self {
-            Which::With => filter.with.as_deref(),
-            Which::From => filter.from.as_deref(),
-            Which::To => filter.to.as_deref(),
+            Which::With => filter.with.as_ref().map(EndpointFilter::label),
+            Which::From => filter.from.as_ref().map(EndpointFilter::label),
+            Which::To => filter.to.as_ref().map(EndpointFilter::label),
         }
     }
 }
@@ -196,6 +196,9 @@ pub struct App {
     pub top: Option<u64>,
     /// One-line footer notice (focus errors), replaced on next notice.
     pub notice: Option<String>,
+    /// Build identity from the authenticated socket greeting. Unlike a
+    /// transient notice, a mismatch survives navigation and key handling.
+    pub build_health: Option<crate::health::BuildHealth>,
     /// Set when the daemon connection dies; the header says so.
     pub conn_lost: bool,
     /// The roster panel is on when the terminal is wide enough; `a` hides
@@ -222,6 +225,8 @@ pub struct App {
     /// same contract the attention register keeps.
     roster: BTreeMap<PaneRoute, RosterRow>,
     admin_unread: u64,
+    /// Status-owned label bindings used by interactive filter input.
+    filter_routes: Vec<EndpointFilter>,
     /// The messages work queue. Only the Messages view reads it, and it
     /// is filled by whole snapshot replacement, never patched.
     pub queue: crate::queue::HumanQueue,
@@ -282,6 +287,7 @@ impl App {
             selected: None,
             top: None,
             notice: None,
+            build_health: None,
             conn_lost: false,
             show_roster: true,
             row_targets: Vec::new(),
@@ -291,6 +297,7 @@ impl App {
             panes: HashMap::new(),
             roster: BTreeMap::new(),
             admin_unread: 0,
+            filter_routes: Vec::new(),
             queue: crate::queue::HumanQueue::new(),
             refresh: crate::messages::RefreshGate::new(),
             detail: None,
@@ -302,6 +309,20 @@ impl App {
             // not rendered, and refusing every action before the first
             // frame would be its own defect.
             last_size: (80, 24),
+        }
+    }
+
+    /// Persistent health copy followed by the current transient notice.
+    pub fn notice_text(&self) -> Option<String> {
+        let health = self
+            .build_health
+            .as_ref()
+            .and_then(crate::health::BuildHealth::notice);
+        match (health, self.notice.as_deref()) {
+            (Some(health), Some(notice)) => Some(format!("{health}; {notice}")),
+            (Some(health), None) => Some(health),
+            (None, Some(notice)) => Some(notice.to_string()),
+            (None, None) => None,
         }
     }
 
@@ -410,11 +431,17 @@ impl App {
 
         let detail = self.detail.as_ref()?;
         let frozen = detail.target().clone();
-        // One read per open, and the alarm wins when this reader may act
-        // on it. Recovery is the time-sensitive job and it is the one
-        // that needs evidence on screen before a verb is offered.
+        // One read per open. Fresh recovery follows daemon authorization.
+        // An uncertain intent opens the exact attempt for inspection.
+        // Only a matching durable terminal-accepted fact can expose
+        // no-key reconciliation of that recorded verb.
         let (request, claims) = match frozen.attempt {
-            Some(attempt_id) if detail.can_manage_attention() => {
+            Some(attempt_id)
+                if detail.can_manage_attention()
+                    || detail.resolution_intent().is_some()
+                    || detail.resolution_action_accepted().is_some()
+                    || detail.resolution_consumption_observed().is_some() =>
+            {
                 (ActionRequest::OpenAttention { attempt_id }, false)
             }
             _ => {
@@ -463,6 +490,12 @@ impl App {
                     message_id: frozen.target.message_id.clone(),
                     body: detail.draft().text().to_string(),
                     client_key: key,
+                }
+            }
+            (Some(attempt_id), Action::WithdrawNotification) => {
+                crate::action_io::ActionRequest::WithdrawNotification {
+                    attempt_id,
+                    recipient: frozen.target.recipient,
                 }
             }
             // The FROZEN attempt, never the row's current one. Between
@@ -661,6 +694,7 @@ impl App {
                 session_idx,
                 pane_id: Some(p),
                 state,
+                ..
             } => self.roster_observe(*session_idx, p, target, *state),
             // Remove only the route this watcher lost. A transfer can
             // publish the destination state before this source edge, and
@@ -753,6 +787,7 @@ impl App {
     /// After that the register moves on live events alone ([`App::live`]).
     pub fn seed_status(&mut self, seed: StatusSeed) -> Vec<Entry> {
         self.admin_unread = seed.admin_unread;
+        self.filter_routes = seed.mailbox_routes.clone();
         // 1. The sidebar's roster is the answer's pane list, replaced
         //    whole for the same reason the register is: anything the
         //    answer does not list is gone. The daemon's own elapsed
@@ -793,7 +828,20 @@ impl App {
             .iter()
             .map(|pane| (pane.pane_id.clone(), pane.session_idx))
             .collect();
-        self.record.seed_routed(&seed.panes, &seed.open, &routes)
+        let recipients: HashMap<String, _> = seed
+            .mailbox_routes
+            .iter()
+            .flat_map(|route| {
+                let recipient = route.recipient();
+                let mut keys = vec![(route.label().to_string(), recipient)];
+                if let Some(pane_id) = recipient.pane_id() {
+                    keys.push((pane_id.to_string(), recipient));
+                }
+                keys
+            })
+            .collect();
+        self.record
+            .seed_routed(&seed.panes, &seed.open, &routes, &recipients)
     }
 
     /// Every attention item as one phrase, in the stream's own voice
@@ -845,7 +893,9 @@ impl App {
     /// Does the CURRENT view admit this line? The firehose admits
     /// everything; the admin stream asks [`crate::stream::Record::admits`].
     pub fn admits_in_view(&self, e: &Entry) -> bool {
-        self.view == View::Firehose || self.record.admits(e)
+        self.view == View::Firehose
+            || (!self.filter.is_empty() && matches!(&e.kind, EntryKind::Msg { .. }))
+            || self.record.admits(e)
     }
 
     /// Handle one key. Returns a command for the runtime when the key
@@ -1027,7 +1077,7 @@ impl App {
 
     /// Height available to evidence after the Messages status row.
     fn detail_action_height(&self) -> usize {
-        let status_visible = !self.refresh.may_mutate() || self.notice.is_some();
+        let status_visible = !self.refresh.may_mutate() || self.notice_text().is_some();
         self.last_size.1.saturating_sub(usize::from(status_visible))
     }
 
@@ -1232,12 +1282,23 @@ impl App {
     }
 
     fn handle_input_key(&mut self, key: Key) -> Option<Command> {
-        let input = self.input.as_mut().expect("input line open");
         match key {
             Key::Enter => {
-                let value = input.buf.trim().to_string();
-                let value = if value.is_empty() { None } else { Some(value) };
-                match input.which {
+                let input = self.input.as_ref().expect("input line open");
+                let which = input.which;
+                let asked = input.buf.trim().to_string();
+                let value = if asked.is_empty() {
+                    None
+                } else {
+                    match self.resolve_filter(&asked) {
+                        Ok(value) => Some(value),
+                        Err(why) => {
+                            self.notice = Some(why);
+                            return None;
+                        }
+                    }
+                };
+                match which {
                     // with excludes from/to and vice versa, mirroring the
                     // history flags.
                     Which::With => {
@@ -1261,13 +1322,35 @@ impl App {
             }
             Key::Esc => self.input = None,
             Key::Backspace => {
+                let input = self.input.as_mut().expect("input line open");
                 input.buf.pop();
             }
-            Key::Char(c) if !c.is_control() => input.buf.push(c),
+            Key::Char(c) if !c.is_control() => {
+                self.input.as_mut().expect("input line open").buf.push(c)
+            }
             Key::CtrlC => return Some(Command::Quit),
             _ => {}
         }
         None
+    }
+
+    fn resolve_filter(&self, asked: &str) -> Result<EndpointFilter, String> {
+        let matches: Vec<_> = self
+            .filter_routes
+            .iter()
+            .filter(|route| route.label() == asked || route.recipient().to_string() == asked)
+            .cloned()
+            .collect();
+        match matches.as_slice() {
+            [route] => Ok(route.clone()),
+            [] if self.filter_routes.is_empty() => {
+                Err("filter routes are not loaded yet; try again after status arrives".into())
+            }
+            [] => Err(format!("unknown mailbox endpoint '{asked}'")),
+            _ => Err(format!(
+                "mailbox label '{asked}' is ambiguous; use an exact recipient key"
+            )),
+        }
     }
 
     /// Open a filter's input line, pre-filled with its current value so a
@@ -1349,6 +1432,15 @@ mod tests {
     use crate::stream::{EntryKind, RosterSeed, RING_CAP};
     use cyclops_proto::{AgentState, DeliveryState, OpenDelivery, PaneSnapshot};
 
+    fn endpoint(label: &str) -> EndpointFilter {
+        EndpointFilter::new(
+            "admin:00000000-0000-0000-0000-000000000001"
+                .parse()
+                .unwrap(),
+            label,
+        )
+    }
+
     fn msg(from: &str, to: &[&str]) -> Entry {
         Entry {
             uid: 0,
@@ -1358,6 +1450,7 @@ mod tests {
             kind: EntryKind::Msg {
                 from: from.into(),
                 to: to.iter().map(|t| t.to_string()).collect(),
+                endpoints: None,
                 subject: "s".into(),
                 body: None,
                 fyi: false,
@@ -1390,6 +1483,7 @@ mod tests {
             id: Some("e-1".into()),
             kind: EntryKind::State {
                 target: target.into(),
+                recipient: None,
                 session_idx: 0,
                 pane_id: pane_id.map(String::from),
                 state: s,
@@ -1406,6 +1500,7 @@ mod tests {
             id: Some(id.into()),
             kind: EntryKind::Delivery {
                 to: to.into(),
+                recipient: None,
                 state: s,
                 cause: None,
             },
@@ -1420,6 +1515,7 @@ mod tests {
             id: Some("m-1".into()),
             kind: EntryKind::Gate {
                 to: to.into(),
+                recipient: None,
                 action: action.into(),
                 detail: Some(cause.into()),
             },
@@ -1445,6 +1541,7 @@ mod tests {
                 .collect(),
             open,
             admin_unread: 0,
+            mailbox_routes: Vec::new(),
             roster: panes
                 .iter()
                 .map(|(name, pane_id, state)| RosterSeed {
@@ -1463,6 +1560,7 @@ mod tests {
         OpenDelivery {
             id: id.into(),
             to: to.into(),
+            recipient: None,
             state,
             ts: 1000,
             cause: None,
@@ -1723,14 +1821,14 @@ mod tests {
         );
 
         // A filter that admits neither line leaves both counts stranded.
-        a.filter.with = Some("docs".into());
+        a.filter.with = Some(endpoint("docs"));
         let stranded = a.unreachable(&a.visible());
         assert_eq!(stranded.len(), 2);
         assert_eq!(stranded[0].name(), "implementer");
         assert_eq!(stranded[1].name(), "reviewer");
 
         // A filter that admits one leaves the other.
-        a.filter.with = Some("reviewer".into());
+        a.filter.with = Some(endpoint("reviewer"));
         let stranded = a.unreachable(&a.visible());
         assert_eq!(stranded.len(), 1);
         assert_eq!(stranded[0].name(), "implementer");
@@ -1783,6 +1881,11 @@ mod tests {
     #[test]
     fn keys_drive_view_density_input_and_quit() {
         let mut a = app();
+        let workspace = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        a.filter_routes = vec![
+            EndpointFilter::new(cyclops_proto::RecipientKey::admin(workspace), "reviewer"),
+            EndpointFilter::new(cyclops_proto::RecipientKey::admin(workspace), "x"),
+        ];
         assert_eq!(a.handle_key(Key::Char('q')), Some(Command::Quit));
         assert_eq!(a.handle_key(Key::Tab), None);
         assert_eq!(a.view, View::Firehose);
@@ -1799,18 +1902,33 @@ mod tests {
             a.handle_key(Key::Char(c));
         }
         a.handle_key(Key::Enter);
-        assert_eq!(a.filter.with.as_deref(), Some("reviewer"));
+        assert_eq!(
+            a.filter.with.as_ref().map(EndpointFilter::label),
+            Some("reviewer")
+        );
         // from replaces with (they conflict, like the history flags).
         a.handle_key(Key::Char('f'));
         a.handle_key(Key::Char('x'));
         a.handle_key(Key::Enter);
-        assert_eq!(a.filter.from.as_deref(), Some("x"));
+        assert_eq!(a.filter.from.as_ref().map(EndpointFilter::label), Some("x"));
         assert!(a.filter.with.is_none());
         // Empty input clears the filter.
         a.handle_key(Key::Char('f'));
         a.handle_key(Key::Backspace);
         a.handle_key(Key::Enter);
         assert!(a.filter.from.is_none());
+
+        a.handle_key(Key::Char('t'));
+        for c in "renamed-away".chars() {
+            a.handle_key(Key::Char(c));
+        }
+        a.handle_key(Key::Enter);
+        assert!(a.filter.to.is_none());
+        assert!(a.input.is_some(), "an unknown endpoint must stay editable");
+        assert_eq!(
+            a.notice.as_deref(),
+            Some("unknown mailbox endpoint 'renamed-away'")
+        );
     }
 
     #[test]

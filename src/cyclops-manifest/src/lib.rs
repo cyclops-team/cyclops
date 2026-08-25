@@ -39,8 +39,12 @@ use std::path::{Path, PathBuf};
 
 pub use regex::Regex;
 
-use cyclops_proto::AgentState;
+use cyclops_proto::{AgentState, ComposerSemantic};
 use serde::Deserialize;
+
+fn enabled_by_default() -> bool {
+    true
+}
 
 pub mod mailbox_capability;
 
@@ -133,6 +137,13 @@ fn colliding_turn_roles(hooks: &Hooks) -> Option<String> {
             }
         }
     }
+    for event in &hooks.turn_end_confirmed {
+        if normalize_event(event).is_empty() {
+            return Some(format!(
+                "confirmed lifecycle end {event:?} has no comparable name"
+            ));
+        }
+    }
     let named = |e: &Option<String>| declared(e).map(normalize_event);
     // Each pair is checked on its own. A manifest that declares only an
     // acknowledgment and an end still runs both roles at runtime, so
@@ -149,6 +160,37 @@ fn colliding_turn_roles(hooks: &Hooks) -> Option<String> {
         if ack == end {
             return Some(format!(
                 "hooks.ack and hooks.turn_end are the same event {end:?}"
+            ));
+        }
+    }
+    let mut roles: Vec<(String, LifecycleRole)> = Vec::new();
+    if let Some(start) = named(&hooks.turn_start) {
+        roles.push((start, LifecycleRole::Start));
+    }
+    if let Some(end) = named(&hooks.turn_end) {
+        roles.push((end, LifecycleRole::End));
+    }
+    roles.extend(
+        hooks
+            .turn_end_confirmed
+            .iter()
+            .map(|event| (normalize_event(event), LifecycleRole::End)),
+    );
+    for (index, (event, role)) in roles.iter().enumerate() {
+        if roles[..index]
+            .iter()
+            .any(|(prior_event, prior_role)| prior_event == event && prior_role != role)
+        {
+            return Some(format!("lifecycle event {event:?} has both turn roles"));
+        }
+    }
+    if let Some(ack) = named(&hooks.ack) {
+        if roles
+            .iter()
+            .any(|(event, role)| *role == LifecycleRole::End && *event == ack)
+        {
+            return Some(format!(
+                "hooks.ack and a lifecycle end are the same event {ack:?}"
             ));
         }
     }
@@ -210,18 +252,57 @@ pub struct AgentMeta {
     pub launch: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleRole {
+    Start,
+    End,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleCertainty {
+    #[default]
+    Candidate,
+    Confirmed,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AckEvidence {
+    #[default]
+    Receipt,
+    Dispatch,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Hooks {
     #[serde(default)]
     pub config_mechanism: String,
     #[serde(default)]
     pub turn_start: Option<String>,
+    /// What the start event proves when it arrives.
+    #[serde(default)]
+    pub turn_start_evidence: LifecycleCertainty,
     #[serde(default)]
     pub turn_end: Option<String>,
+    /// What the end event proves when it arrives.
+    #[serde(default)]
+    pub turn_end_evidence: LifecycleCertainty,
+    /// Additional end events that are conclusive on arrival.
+    #[serde(default)]
+    pub turn_end_confirmed: Vec<String>,
+    /// Quiet period required before a candidate end may use terminal screen
+    /// evidence. This covers vendors that run sibling stop hooks concurrently.
+    #[serde(default)]
+    pub turn_end_settle_ms: u64,
     /// Hook whose payload acknowledges a delivery. None means this CLI has
     /// no payload-matchable ACK and runs on the screen-verified tier (agy).
     #[serde(default)]
     pub ack: Option<String>,
+    /// Whether the ACK event proves receipt or only dispatch to vendor hooks.
+    #[serde(default)]
+    pub ack_evidence: AckEvidence,
     #[serde(default)]
     pub available: Vec<String>,
     /// Payload field carrying the injected text when `ack` is set.
@@ -253,6 +334,51 @@ pub struct Hooks {
     pub settings_flag: Option<String>,
 }
 
+impl Hooks {
+    /// Classify a lifecycle event and the evidence it carries.
+    pub fn lifecycle_event(&self, event: &str) -> Option<(LifecycleRole, LifecycleCertainty)> {
+        let event = normalize_event(event);
+        self.turn_end_confirmed
+            .iter()
+            .find(|name| normalize_event(name) == event)
+            .map(|_| (LifecycleRole::End, LifecycleCertainty::Confirmed))
+            .or_else(|| {
+                self.turn_start
+                    .as_deref()
+                    .filter(|name| normalize_event(name) == event)
+                    .map(|_| (LifecycleRole::Start, self.turn_start_evidence))
+            })
+            .or_else(|| {
+                self.turn_end
+                    .as_deref()
+                    .filter(|name| normalize_event(name) == event)
+                    .map(|_| (LifecycleRole::End, self.turn_end_evidence))
+            })
+    }
+
+    pub fn has_lifecycle_role(&self, role: LifecycleRole) -> bool {
+        match role {
+            LifecycleRole::Start => self
+                .turn_start
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty()),
+            LifecycleRole::End => {
+                self.turn_end
+                    .as_deref()
+                    .is_some_and(|name| !name.trim().is_empty())
+                    || !self.turn_end_confirmed.is_empty()
+            }
+        }
+    }
+
+    pub fn lifecycle_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.turn_end_confirmed.iter().map(String::as_str).collect();
+        names.extend(self.turn_start.as_deref());
+        names.extend(self.turn_end.as_deref());
+        names
+    }
+}
+
 /// Where a rule looks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Region {
@@ -278,6 +404,12 @@ impl Region {
 /// if its own clauses match or any `any` alternative matches.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RawMatcher {
+    /// Match only when the escaped capture contains no escape bytes at all.
+    /// This is for vendor layouts measured under NO_COLOR. Without this
+    /// guard a plain fallback would also bypass stronger style evidence in a
+    /// colored capture.
+    #[serde(default)]
+    pub unstyled_only: bool,
     #[serde(default)]
     pub contains: Vec<String>,
     #[serde(default)]
@@ -299,8 +431,15 @@ pub struct RawMatcher {
 pub struct RawRule {
     pub id: String,
     pub state: String,
+    /// Vendor-measured meaning of the composer shape this rule matches.
+    #[serde(default)]
+    pub composer_semantic: Option<ComposerSemantic>,
     pub priority: i64,
     pub region: String,
+    /// Whether this rule may confirm or cancel a candidate hook lifecycle.
+    /// Advisory rules still report runtime state and block unsafe writes.
+    #[serde(default = "enabled_by_default")]
+    pub lifecycle_evidence: bool,
     #[serde(default)]
     pub any: Vec<RawMatcher>,
     #[serde(flatten)]
@@ -322,6 +461,7 @@ pub struct RawRule {
 
 #[derive(Debug, Clone)]
 pub struct CompiledMatcher {
+    pub unstyled_only: bool,
     pub contains: Vec<String>,
     pub regex: Vec<regex::Regex>,
     pub line_regex: Vec<regex::Regex>,
@@ -343,6 +483,11 @@ impl CompiledMatcher {
     /// matcher fails closed rather than guessing.
     fn matches_esc(&self, joined: &str, lines: &[&str], esc_lines: Option<&[&str]>) -> bool {
         if self.is_empty() {
+            return false;
+        }
+        if self.unstyled_only
+            && esc_lines.is_none_or(|rows| rows.iter().any(|row| row.contains('\u{1b}')))
+        {
             return false;
         }
         let esc_ok = if self.line_regex_esc.is_empty() {
@@ -390,8 +535,10 @@ impl CompiledRule {
 pub struct CompiledRule {
     pub id: String,
     pub state: AgentState,
+    pub composer_semantic: Option<ComposerSemantic>,
     pub priority: i64,
     pub region: Region,
+    pub lifecycle_evidence: bool,
     pub matcher: CompiledMatcher,
     pub any: Vec<CompiledMatcher>,
     pub decline_keys: Vec<String>,
@@ -435,8 +582,8 @@ pub struct Injection {
     pub safe_states: Vec<String>,
     #[serde(default)]
     pub unsafe_states: Vec<String>,
-    /// "queues" when text pasted mid-turn stages and runs as its own turn
-    /// (measured on Claude). Absent means unestablished: gate on idle.
+    /// Legacy measurement metadata. Delivery never uses it as write authority.
+    /// Omit it from new manifests and encode safety through measured states.
     #[serde(default)]
     pub busy_behavior: Option<String>,
     /// Lines the vendor may render BELOW the composer, which are never
@@ -454,6 +601,10 @@ pub struct Injection {
     /// escaped capture is available.
     #[serde(default)]
     pub composer_trailer_regex_esc: Vec<String>,
+    /// Explicit proof available when a vendor renders the composer without
+    /// SGR, for example under `NO_COLOR`.
+    #[serde(default)]
+    pub unstyled_composer_proof: Option<UnstyledComposerProof>,
     /// How many of those rows are REQUIRED, counted from the top of the
     /// layout. The rows below a composer are not an unordered set: the
     /// vendor paints its box rule and status row every time, its hint or
@@ -483,6 +634,14 @@ pub struct Injection {
     pub composer_prompt_regex: Option<String>,
     #[serde(default)]
     pub composer_continuation_regex: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UnstyledComposerProof {
+    /// The first required trailer row is a measured boundary outside the
+    /// prompt and continuation row shapes.
+    StructuralTrailer,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -533,6 +692,7 @@ fn compile_matcher(
             .collect()
     };
     Ok(CompiledMatcher {
+        unstyled_only: raw.unstyled_only,
         contains: raw.contains.clone(),
         regex: mk(&raw.regex)?,
         line_regex: mk(&raw.line_regex)?,
@@ -652,8 +812,10 @@ impl Manifest {
             rules.push(CompiledRule {
                 id: r.id.clone(),
                 state,
+                composer_semantic: r.composer_semantic,
                 priority: r.priority,
                 region,
+                lifecycle_evidence: r.lifecycle_evidence,
                 matcher,
                 any,
                 decline_keys: r.decline_keys.clone(),
@@ -748,6 +910,17 @@ impl Manifest {
                     .into(),
             });
         }
+        if raw.injection.unstyled_composer_proof.is_some()
+            && (composer_prompt.is_none()
+                || composer_trailers.is_empty()
+                || raw.injection.composer_trailer_required_prefix == 0)
+        {
+            return Err(ManifestError::BadInjection {
+                id: raw.agent.id.clone(),
+                why: "unstyled_composer_proof requires composer extraction patterns and a measured required trailer"
+                    .into(),
+            });
+        }
         if !raw.injection.clear_keys.is_empty() {
             if composer_prompt.is_none() {
                 return Err(ManifestError::BadInjection {
@@ -813,12 +986,13 @@ impl Manifest {
         }
         let key = &raw.hooks.turn_key_fields;
         if !key.is_empty() {
-            let named = |e: &Option<String>| e.as_deref().is_some_and(|n| !n.trim().is_empty());
-            let why = if !named(&raw.hooks.turn_start) || !named(&raw.hooks.turn_end) {
+            let why = if !raw.hooks.has_lifecycle_role(LifecycleRole::Start)
+                || !raw.hooks.has_lifecycle_role(LifecycleRole::End)
+            {
                 // Blank counts as absent: an event name that never matches
                 // anything loads a manifest claiming exact correlation
                 // whose lane can never complete a turn.
-                Some("declared without both hooks.turn_start and hooks.turn_end".to_string())
+                Some("declared without both lifecycle start and end events".to_string())
             } else if key.iter().any(|f| f.trim().is_empty()) {
                 Some("empty field name".to_string())
             } else {
@@ -833,6 +1007,71 @@ impl Manifest {
                     why,
                 });
             }
+        }
+        let candidate_start = raw
+            .hooks
+            .turn_start
+            .as_ref()
+            .is_some_and(|_| raw.hooks.turn_start_evidence == LifecycleCertainty::Candidate);
+        let candidate_end = raw
+            .hooks
+            .turn_end
+            .as_ref()
+            .is_some_and(|_| raw.hooks.turn_end_evidence == LifecycleCertainty::Candidate);
+        let has_ack = raw
+            .hooks
+            .ack
+            .as_deref()
+            .is_some_and(|name| !name.trim().is_empty());
+        let has_payload = raw
+            .hooks
+            .ack_payload_field
+            .as_deref()
+            .is_some_and(|field| !field.trim().is_empty());
+        let same_start_ack = match (raw.hooks.turn_start.as_deref(), raw.hooks.ack.as_deref()) {
+            (Some(start), Some(ack)) if !start.trim().is_empty() && !ack.trim().is_empty() => {
+                normalize_event(start) == normalize_event(ack)
+            }
+            _ => false,
+        };
+        // Claude exposes one event-local fact: UserPromptSubmit both starts a
+        // candidate and dispatches the exact prompt to the hook pipeline. It
+        // exposes no field that can match that start to Stop. This narrow
+        // shape may therefore omit a turn key and let visual evidence end the
+        // candidate. Any declared end still claims cross-event correlation.
+        let unkeyed_start_dispatch = key.is_empty()
+            && candidate_start
+            && raw.hooks.turn_end.is_none()
+            && raw.hooks.turn_end_confirmed.is_empty()
+            && raw.hooks.turn_end_settle_ms == 0
+            && raw.hooks.ack_evidence == AckEvidence::Dispatch
+            && has_ack
+            && has_payload
+            && same_start_ack;
+        if (candidate_start || candidate_end) && key.is_empty() && !unkeyed_start_dispatch {
+            return Err(ManifestError::BadTurnKey {
+                id: raw.agent.id.clone(),
+                why: "candidate lifecycle evidence requires hooks.turn_key_fields unless it is an unkeyed start-only dispatch on the same event"
+                    .to_string(),
+            });
+        }
+        if candidate_end && raw.hooks.turn_end_settle_ms == 0 {
+            return Err(ManifestError::BadHooks {
+                id: raw.agent.id.clone(),
+                why: "candidate lifecycle end requires hooks.turn_end_settle_ms".to_string(),
+            });
+        }
+        if raw.hooks.ack_evidence == AckEvidence::Dispatch
+            && (!candidate_start
+                || !has_ack
+                || !has_payload
+                || (key.is_empty() && !unkeyed_start_dispatch))
+        {
+            return Err(ManifestError::BadHooks {
+                id: raw.agent.id.clone(),
+                why: "dispatch acknowledgment requires a candidate turn start, hooks.ack, hooks.ack_payload_field, and either hooks.turn_key_fields or the same unkeyed start-only event"
+                    .to_string(),
+            });
         }
         // The two lists are one layout described twice: entry i is row i of
         // the measured sequence below the composer, in plain and escaped
@@ -935,8 +1174,11 @@ impl Manifest {
         !self.composer_chips_esc.is_empty()
             || !self.composer_trailers_esc.is_empty()
             || self.rules.iter().any(|r| {
-                !r.matcher.line_regex_esc.is_empty()
-                    || r.any.iter().any(|m| !m.line_regex_esc.is_empty())
+                r.matcher.unstyled_only
+                    || !r.matcher.line_regex_esc.is_empty()
+                    || r.any
+                        .iter()
+                        .any(|m| m.unstyled_only || !m.line_regex_esc.is_empty())
             })
     }
 }
@@ -1049,6 +1291,31 @@ unsafe_states = ["blocked_modal"]
         let r = m.evaluate("plain", screen).unwrap();
         assert_eq!(r.id, "composer_empty");
         assert_eq!(r.state, AgentState::Idle);
+        assert_eq!(r.composer_semantic, None);
+    }
+
+    #[test]
+    fn composer_semantic_is_optional_and_closed() {
+        let annotated = MINI.replace(
+            "id = \"composer_empty\"\nstate = \"idle\"\npriority = 900",
+            "id = \"composer_empty\"\nstate = \"idle\"\ncomposer_semantic = \"clean\"\npriority = 900",
+        );
+        let manifest = Manifest::parse(&annotated, Path::new("semantic.toml")).unwrap();
+        let rule = manifest
+            .rules
+            .iter()
+            .find(|rule| rule.id == "composer_empty")
+            .unwrap();
+        assert_eq!(rule.composer_semantic, Some(ComposerSemantic::Clean));
+
+        let invalid = annotated.replace(
+            "composer_semantic = \"clean\"",
+            "composer_semantic = \"unsupported\"",
+        );
+        assert!(matches!(
+            Manifest::parse(&invalid, Path::new("bad-semantic.toml")),
+            Err(ManifestError::Parse { .. })
+        ));
     }
 
     #[test]
@@ -1165,6 +1432,44 @@ verify_pattern = ["<message_id>"]
     }
 
     #[test]
+    fn an_unstyled_matcher_never_bypasses_colored_evidence() {
+        let source = r#"
+[agent]
+id = "plain"
+display_name = "Plain"
+
+[[rule]]
+id = "unstyled_working"
+state = "working"
+priority = 100
+region = "bottom_non_empty_lines(3)"
+lifecycle_evidence = false
+unstyled_only = true
+contains = ["Working"]
+
+[[rule]]
+id = "fallback"
+state = "idle"
+priority = 1
+region = "bottom_non_empty_lines(3)"
+contains = ["Working"]
+"#;
+        let manifest = Manifest::parse(source, Path::new("plain.toml")).unwrap();
+        assert!(manifest.has_escaped_rules());
+        assert!(!manifest.rules[0].lifecycle_evidence);
+        assert!(manifest.rules[1].lifecycle_evidence);
+        let plain = manifest
+            .evaluate_esc("title", "Working", Some("Working"))
+            .unwrap();
+        assert_eq!(plain.id, "unstyled_working");
+
+        let colored = manifest
+            .evaluate_esc("title", "Working", Some("\u{1b}[31mWorking\u{1b}[0m"))
+            .unwrap();
+        assert_eq!(colored.id, "fallback");
+    }
+
+    #[test]
     fn has_escaped_rules_reflects_esc_clauses() {
         let with = Manifest::parse(ESC_MINI, Path::new("esc.toml")).unwrap();
         assert!(with.has_escaped_rules());
@@ -1265,7 +1570,11 @@ mod trailer_layout_tests {
     #[test]
     fn a_partial_turn_key_is_a_load_error() {
         let hooks = |body: &str| {
-            let src = format!("[agent]\nid = \"t\"\ndisplay_name = \"t\"\n\n[hooks]\n{body}");
+            let src = format!(
+                "[agent]\nid = \"t\"\ndisplay_name = \"t\"\n\n[hooks]\n\
+                 turn_start_evidence = \"confirmed\"\n\
+                 turn_end_evidence = \"confirmed\"\n{body}"
+            );
             Manifest::parse(&src, Path::new("t.toml"))
         };
         let both = "turn_start = \"Start\"\nturn_end = \"Stop\"\n";
@@ -1279,8 +1588,8 @@ mod trailer_layout_tests {
         );
         assert!(hooks(both).is_ok(), "declaring no key at all is fine");
         // Start and acknowledgment MAY be the same event, and are in
-        // every shipped vendor: taking the prompt is both the receipt and
-        // the beginning of the turn.
+        // every shipped vendor: taking the prompt is both the
+        // acknowledgment and the beginning of the turn.
         assert!(
             hooks(&format!(
                 "{both}ack = \"Start\"\nturn_key_fields = [\"turn_id\"]\n"
@@ -1338,7 +1647,15 @@ mod trailer_layout_tests {
     #[test]
     fn one_event_cannot_hold_two_turn_roles() {
         let head = "[agent]\nid = \"t\"\ndisplay_name = \"t\"\n\n[hooks]\n";
-        let load = |body: &str| Manifest::parse(&format!("{head}{body}"), Path::new("t.toml"));
+        let load = |body: &str| {
+            Manifest::parse(
+                &format!(
+                    "{head}turn_start_evidence = \"confirmed\"\n\
+                     turn_end_evidence = \"confirmed\"\n{body}"
+                ),
+                Path::new("t.toml"),
+            )
+        };
 
         for (case, body) in [
             (
@@ -1394,8 +1711,9 @@ mod trailer_layout_tests {
         }
 
         // A start that is ALSO the acknowledgment is a fact about the
-        // vendor, not a collision: taking the prompt is both the receipt
-        // and the beginning of the turn, which is the shipped shape.
+        // vendor, not a collision: taking the prompt is both the
+        // acknowledgment and the beginning of the turn, which is the
+        // shipped shape.
         assert!(load("turn_start = \"Start\"\nturn_end = \"Stop\"\nack = \"Start\"\n").is_ok());
         // And a lifecycle nobody declared has no roles to collide.
         assert!(load("config_mechanism = \"none\"\n").is_ok());
@@ -1407,10 +1725,127 @@ mod trailer_layout_tests {
     #[test]
     fn turn_key_fields_keep_their_declared_order() {
         let src = "[agent]\nid = \"t\"\ndisplay_name = \"t\"\n\n[hooks]\n\
-                   turn_start = \"Start\"\nturn_end = \"Stop\"\n\
+                   turn_start = \"Start\"\nturn_start_evidence = \"confirmed\"\n\
+                   turn_end = \"Stop\"\nturn_end_evidence = \"confirmed\"\n\
                    turn_key_fields = [\"b\", \"a\"]\n";
         let m = Manifest::parse(src, Path::new("t.toml")).expect("loads");
         assert_eq!(m.hooks.turn_key_fields, vec!["b", "a"]);
+    }
+
+    #[test]
+    fn unkeyed_candidate_start_requires_an_event_local_dispatch_contract() {
+        let head = "[agent]\nid = \"t\"\ndisplay_name = \"t\"\n\n[hooks]\n";
+        let load = |body: &str| Manifest::parse(&format!("{head}{body}"), Path::new("t.toml"));
+        let complete = "turn_start = \"UserPromptSubmit\"\n\
+                        turn_start_evidence = \"candidate\"\n\
+                        ack = \"user_prompt_submit\"\n\
+                        ack_evidence = \"dispatch\"\n\
+                        ack_payload_field = \"prompt\"\n";
+        let manifest = load(complete).expect("unkeyed event-local dispatch start loads");
+        assert_eq!(
+            manifest.hooks.lifecycle_event("UserPromptSubmit"),
+            Some((LifecycleRole::Start, LifecycleCertainty::Candidate))
+        );
+        assert_eq!(manifest.hooks.ack_evidence, AckEvidence::Dispatch);
+        assert!(!manifest.hooks.has_lifecycle_role(LifecycleRole::End));
+        assert!(manifest.hooks.turn_key_fields.is_empty());
+
+        for (case, body) in [
+            (
+                "legacy lifecycle defaults",
+                "turn_start = \"Start\"\nturn_end = \"Stop\"\n",
+            ),
+            (
+                "legacy acknowledgment defaults",
+                "turn_start = \"Start\"\nack = \"Start\"\nack_payload_field = \"prompt\"\n",
+            ),
+            (
+                "missing payload field",
+                "turn_start = \"Start\"\nturn_start_evidence = \"candidate\"\n\
+                 ack = \"Start\"\nack_evidence = \"dispatch\"\n",
+            ),
+            (
+                "different acknowledgment event",
+                "turn_start = \"Start\"\nturn_start_evidence = \"candidate\"\n\
+                 ack = \"Accepted\"\nack_evidence = \"dispatch\"\n\
+                 ack_payload_field = \"prompt\"\n",
+            ),
+            (
+                "declared lifecycle end",
+                "turn_start = \"Start\"\nturn_start_evidence = \"candidate\"\n\
+                 turn_end = \"Stop\"\nturn_end_evidence = \"confirmed\"\n\
+                 ack = \"Start\"\nack_evidence = \"dispatch\"\n\
+                 ack_payload_field = \"prompt\"\n",
+            ),
+            (
+                "declared confirmed lifecycle end",
+                "turn_start = \"Start\"\nturn_start_evidence = \"candidate\"\n\
+                 turn_end_confirmed = [\"StopFailure\"]\n\
+                 ack = \"Start\"\nack_evidence = \"dispatch\"\n\
+                 ack_payload_field = \"prompt\"\n",
+            ),
+            (
+                "end settle policy without an end",
+                "turn_start = \"Start\"\nturn_start_evidence = \"candidate\"\n\
+                 turn_end_settle_ms = 3000\n\
+                 ack = \"Start\"\nack_evidence = \"dispatch\"\n\
+                 ack_payload_field = \"prompt\"\n",
+            ),
+        ] {
+            assert!(load(body).is_err(), "{case} loaded");
+        }
+    }
+
+    #[test]
+    fn candidate_end_still_requires_a_turn_key_and_settle_window() {
+        let head = "[agent]\nid = \"t\"\ndisplay_name = \"t\"\n\n[hooks]\n";
+        let load = |body: &str| Manifest::parse(&format!("{head}{body}"), Path::new("t.toml"));
+        let complete = "turn_start = \"Start\"\nturn_start_evidence = \"candidate\"\n\
+                        turn_end = \"Stop\"\nturn_end_evidence = \"candidate\"\n\
+                        turn_end_settle_ms = 3000\n\
+                        ack = \"Start\"\nack_evidence = \"dispatch\"\n\
+                        ack_payload_field = \"prompt\"\n\
+                        turn_key_fields = [\"session_id\", \"prompt_id\"]\n";
+        let manifest = load(complete).expect("keyed candidate lifecycle loads");
+        assert_eq!(
+            manifest.hooks.lifecycle_event("Stop"),
+            Some((LifecycleRole::End, LifecycleCertainty::Candidate))
+        );
+
+        let candidate_start_only = "turn_start = \"Start\"\nturn_start_evidence = \"candidate\"\n\
+                                    turn_end = \"Stop\"\nturn_end_evidence = \"confirmed\"\n\
+                                    ack = \"Start\"\nack_evidence = \"dispatch\"\n\
+                                    ack_payload_field = \"prompt\"\n\
+                                    turn_key_fields = [\"turn_id\"]\n";
+        load(candidate_start_only).expect("a confirmed end needs no candidate settle window");
+
+        let missing_key = "turn_start = \"Start\"\nturn_start_evidence = \"confirmed\"\n\
+                           turn_end = \"Stop\"\nturn_end_evidence = \"candidate\"\n\
+                           turn_end_settle_ms = 3000\n";
+        assert!(matches!(
+            load(missing_key),
+            Err(ManifestError::BadTurnKey { .. })
+        ));
+
+        let missing_settle = "turn_start = \"Start\"\nturn_start_evidence = \"confirmed\"\n\
+                              turn_end = \"Stop\"\nturn_end_evidence = \"candidate\"\n\
+                              turn_key_fields = [\"turn_id\"]\n";
+        assert!(matches!(
+            load(missing_settle),
+            Err(ManifestError::BadHooks { .. })
+        ));
+
+        let confirmed_dispatch = "turn_start = \"Start\"\n\
+                                  turn_start_evidence = \"confirmed\"\n\
+                                  turn_end = \"Stop\"\n\
+                                  turn_end_evidence = \"confirmed\"\n\
+                                  ack = \"Start\"\nack_evidence = \"dispatch\"\n\
+                                  ack_payload_field = \"prompt\"\n\
+                                  turn_key_fields = [\"turn_id\"]\n";
+        assert!(matches!(
+            load(confirmed_dispatch),
+            Err(ManifestError::BadHooks { .. })
+        ));
     }
 
     /// A layout is two descriptions of the same rows plus how many of them
@@ -1446,6 +1881,22 @@ mod trailer_layout_tests {
         ] {
             assert!(parse(&body).is_err(), "{case} must not load");
         }
+    }
+
+    #[test]
+    fn an_unstyled_trailer_requires_a_structural_composer_boundary() {
+        let layout = "composer_trailer_regex = ['^rule$', '^status$']\n\
+                      composer_trailer_regex_esc = ['^esc-rule$', '^esc-status$']\n\
+                      composer_trailer_required_prefix = 2\n\
+                      unstyled_composer_proof = 'structural_trailer'\n";
+        assert!(
+            parse(layout).is_err(),
+            "unstyled layout had no composer boundary"
+        );
+
+        let extraction = "composer_prompt_regex = '^> (?P<content>.*)$'\n\
+                          composer_continuation_regex = '^  (?P<content>.*)$'\n";
+        assert!(parse(&format!("{layout}{extraction}")).is_ok());
     }
 
     /// A manifest that declares no layout at all still loads: it simply
