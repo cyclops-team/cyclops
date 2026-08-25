@@ -56,6 +56,7 @@ line_regex = ['^FAKETUI-WORKING$']
 [[rule]]
 id = "composer_holds_paste"
 state = "idle_with_input"
+composer_semantic = "human_input"
 priority = 80
 region = "bottom_non_empty_lines(6)"
 line_regex = ['^\s*❯\s+\S']
@@ -64,6 +65,7 @@ line_regex_esc = ['^❯']
 [[rule]]
 id = "composer_empty"
 state = "idle"
+composer_semantic = "clean"
 priority = 90
 region = "bottom_non_empty_lines(4)"
 line_regex = ['^❯\s*$']
@@ -75,6 +77,8 @@ verify_pattern = ["<message_id>"]
 composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
 composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
 composer_trailer_required_prefix = 2
+composer_prompt_regex = '^❯ ?(?P<content>.*)$'
+composer_continuation_regex = '^(?P<content>.*)$'
 "#;
 
 /// Run tmux commands against the rig's server from a helper thread after a
@@ -605,6 +609,58 @@ async fn send_wait_holds_when_the_agent_is_a_child_of_the_pane_shell() {
     );
     assert_eq!(wait["outcome"], "reached", "{result}");
     assert_eq!(wait["state"], "idle", "{result}");
+    rig.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_same_command_respawn_wakes_a_pinned_wait_as_occupant_changed() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new("wait-respawn", WAIT_MANIFEST, &composer_pane(), "").await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    rig.tmux
+        .run_ok(&["select-pane", "-t", &pane, "-T", "WORKING before respawn"]);
+    wait_pane_state(&mut rig, "working").await;
+
+    let socket = rig.tmux.socket().to_string();
+    let pane_for_driver = pane.clone();
+    let replacement = composer_pane();
+    let driver = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        let output = std::process::Command::new("tmux")
+            .args(["-u", "-L", &socket, "-f", "/dev/null"])
+            .args(["respawn-pane", "-k", "-t", &pane_for_driver, &replacement])
+            .output()
+            .expect("respawn replacement agent");
+        assert!(
+            output.status.success(),
+            "respawn failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    });
+
+    let response = rig
+        .ctl
+        .request(
+            "agent.wait",
+            json!({"target": "worker", "until": "done", "timeout_ms": 6000}),
+        )
+        .await;
+    driver.join().expect("driver thread");
+    assert_eq!(
+        response["error"]["data"]["outcome"], "occupant_changed",
+        "same-command respawn must wake the pinned wait: {response}"
+    );
+    assert!(
+        response["error"]["data"]["waited_ms"]
+            .as_u64()
+            .expect("waited_ms")
+            < 6000,
+        "the wait ended by timeout instead of the pid edge: {response}"
+    );
     rig.shutdown().await;
 }
 

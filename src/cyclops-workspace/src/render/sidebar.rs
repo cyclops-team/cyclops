@@ -2619,6 +2619,7 @@ mod tests {
             id: None,
             kind: cyclops_ui::EntryKind::State {
                 target: "rev".into(),
+                recipient: None,
                 session_idx: 0,
                 pane_id: Some("%1".into()),
                 state: cyclops_proto::AgentState::BlockedPermission,

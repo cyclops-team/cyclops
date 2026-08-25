@@ -39,27 +39,26 @@ pub(crate) fn status_diagnostics(inner: &Inner) -> Vec<StatusDiagnostic> {
         }
         candidates.push((record, route));
     }
-    if candidates.is_empty() {
-        return Vec::new();
+    let mut seen_attempts = HashSet::new();
+    let mut diagnostics = Vec::new();
+    if let Some(processes) = ProcessSnapshot::read() {
+        for (record, route) in candidates {
+            if seen_attempts.insert(record.attempt_id)
+                && processes.pane_runs_watch(route.row.pane_pid)
+            {
+                diagnostics.push(StatusDiagnostic {
+                    code: "deadlock_risk".into(),
+                    message_id: record.message_id,
+                    notification_attempt: record.attempt_id,
+                    recipient: record.recipient,
+                    recipient_label: route.label,
+                    pane_id: route.pane_id,
+                });
+            }
+        }
     }
 
-    let Some(processes) = ProcessSnapshot::read() else {
-        return Vec::new();
-    };
-    let mut seen_attempts = HashSet::new();
-    candidates
-        .into_iter()
-        .filter(|(record, _)| seen_attempts.insert(record.attempt_id))
-        .filter(|(_, route)| processes.pane_runs_watch(route.row.pane_pid))
-        .map(|(record, route)| StatusDiagnostic {
-            code: "deadlock_risk".into(),
-            message_id: record.message_id,
-            notification_attempt: record.attempt_id,
-            recipient: record.recipient,
-            recipient_label: route.label,
-            pane_id: route.pane_id,
-        })
-        .collect()
+    diagnostics
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]

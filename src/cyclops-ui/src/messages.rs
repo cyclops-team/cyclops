@@ -10,11 +10,209 @@
 //! patches reconstructed by this client.
 
 use cyclops_proto::{
-    MailboxEntryState, MessageDirection, MessageNotificationState, MessageQuotaState,
-    MessageSnapshotRow, MessagesChangedData, MessagesSnapshotResult, RecipientKey, WorkspaceId,
+    MailboxEntryState, MessageDirection, MessageNotificationSettlement, MessageNotificationState,
+    MessageQuotaState, MessageSnapshotRow, MessagesChangedData, MessagesFollowResult,
+    MessagesSnapshotResult, RecipientKey, WorkspaceId,
 };
 
 use crate::queue::{Direction, MailboxWord, QueueRow, QueueTarget, Snapshot, WakeWord};
+use crate::stream::{Entry, EntryKind, MessageEndpoints};
+
+const FOLLOW_PAGE_LIMIT: u32 = 128;
+
+/// One generation-stamped, bounded follow request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FollowRequest {
+    generation: u64,
+    request: u64,
+    after_seq: u64,
+    limit: u32,
+}
+
+impl FollowRequest {
+    pub fn after_seq(self) -> u64 {
+        self.after_seq
+    }
+
+    pub fn limit(self) -> u32 {
+        self.limit
+    }
+}
+
+/// Turns pushed invalidations plus authenticated cursor pages into new
+/// body-free stream entries. Queue snapshots establish the baseline but
+/// never advance the cursor after that: their settled tail is bounded.
+#[derive(Debug, Default)]
+pub struct MessageFollower {
+    workspace_id: Option<WorkspaceId>,
+    cursor: Option<u64>,
+    first_unseen_edge: Option<u64>,
+    target_seq: Option<u64>,
+    in_flight: Option<FollowRequest>,
+    generation: u64,
+    next_request: u64,
+    faulted: bool,
+}
+
+impl MessageFollower {
+    pub fn connected(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.in_flight = None;
+        self.faulted = false;
+    }
+
+    pub fn disconnected(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.in_flight = None;
+    }
+
+    pub fn changed(&mut self, changed: &MessagesChangedData) {
+        if self
+            .workspace_id
+            .is_some_and(|id| id != changed.workspace_id)
+        {
+            self.cursor = None;
+            self.first_unseen_edge = None;
+            self.target_seq = None;
+            self.in_flight = None;
+        }
+        self.workspace_id = Some(changed.workspace_id);
+        if self.cursor.is_none() {
+            self.first_unseen_edge = Some(
+                self.first_unseen_edge
+                    .map_or(changed.workspace_seq, |seq| seq.min(changed.workspace_seq)),
+            );
+        }
+        self.target_seq = Some(
+            self.target_seq
+                .map_or(changed.workspace_seq, |seq| seq.max(changed.workspace_seq)),
+        );
+    }
+
+    /// Establish or refresh the workspace head from one accepted queue
+    /// snapshot. Only the first snapshot may set the cursor directly.
+    pub fn baseline(&mut self, snapshot: &MessagesSnapshotResult) {
+        if self
+            .workspace_id
+            .is_some_and(|id| id != snapshot.workspace_id)
+        {
+            self.cursor = None;
+            self.first_unseen_edge = None;
+            self.target_seq = None;
+            self.in_flight = None;
+        }
+        self.workspace_id = Some(snapshot.workspace_id);
+        if self.cursor.is_none() {
+            self.cursor = Some(
+                self.first_unseen_edge
+                    .map_or(snapshot.workspace_seq, |seq| seq.saturating_sub(1)),
+            );
+        }
+        self.target_seq = Some(self.target_seq.map_or(snapshot.workspace_seq, |seq| {
+            seq.max(snapshot.workspace_seq)
+        }));
+        self.first_unseen_edge = None;
+    }
+
+    pub fn begin(&mut self) -> Option<FollowRequest> {
+        let cursor = self.cursor?;
+        let target = self.target_seq?;
+        if self.faulted || self.in_flight.is_some() || cursor >= target {
+            return None;
+        }
+        self.next_request = self.next_request.wrapping_add(1);
+        let request = FollowRequest {
+            generation: self.generation,
+            request: self.next_request,
+            after_seq: cursor,
+            limit: FOLLOW_PAGE_LIMIT,
+        };
+        self.in_flight = Some(request);
+        Some(request)
+    }
+
+    /// Apply one exact page. The cursor advances only to the sequence the
+    /// server says this page fully covered, never to a bounded queue head.
+    pub fn finish(
+        &mut self,
+        request: FollowRequest,
+        page: &MessagesFollowResult,
+    ) -> Result<Vec<Entry>, &'static str> {
+        if self.in_flight != Some(request) {
+            return Ok(Vec::new());
+        }
+        self.in_flight = None;
+        let rows_valid = page.rows.len() <= request.limit as usize
+            && page
+                .rows
+                .iter()
+                .try_fold(request.after_seq, |prior, row| {
+                    (row.seq > prior && row.seq <= page.through_seq).then_some(row.seq)
+                })
+                .is_some();
+        let page_end_valid =
+            !page.has_more || page.rows.last().map(|row| row.seq) == Some(page.through_seq);
+        if request.generation != self.generation
+            || self.workspace_id != Some(page.workspace_id)
+            || page.after_seq != request.after_seq
+            || page.through_seq < request.after_seq
+            || (page.has_more && page.through_seq == request.after_seq)
+            || !rows_valid
+            || !page_end_valid
+        {
+            self.faulted = true;
+            return Err("invalid durable message cursor page");
+        }
+        self.cursor = Some(page.through_seq);
+        self.target_seq = Some(
+            self.target_seq
+                .map_or(page.through_seq, |seq| seq.max(page.through_seq)),
+        );
+        Ok(page.rows.iter().map(stream_entry).collect())
+    }
+
+    pub fn failed(&mut self, request: FollowRequest) -> bool {
+        if self.in_flight != Some(request) {
+            return false;
+        }
+        self.in_flight = None;
+        self.faulted = true;
+        true
+    }
+}
+
+fn stream_entry(row: &MessageSnapshotRow) -> Entry {
+    let recipients = row.recipients.iter().map(|to| to.recipient).collect();
+    let to = row
+        .recipients
+        .iter()
+        .map(|recipient| {
+            recipient
+                .current_route
+                .as_ref()
+                .map(|route| route.label.clone())
+                .unwrap_or_else(|| recipient.label.clone())
+        })
+        .collect();
+    Entry {
+        uid: 0,
+        ts: row.ts,
+        // Workspace and session ledgers have independent sequence domains.
+        seq: None,
+        id: Some(row.message_id.to_string()),
+        kind: EntryKind::Msg {
+            from: row.sender_label.clone(),
+            to,
+            endpoints: Some(MessageEndpoints {
+                sender: row.sender,
+                recipients,
+            }),
+            subject: row.subject.clone().unwrap_or_default(),
+            body: None,
+            fyi: row.kind == cyclops_proto::Kind::Fyi,
+        },
+    }
+}
 
 /// Fan one authenticated snapshot into queue rows.
 ///
@@ -50,16 +248,28 @@ fn row_for(
         // The exact attempt an attention action names, kept apart from
         // the identity precisely because it changes.
         attention: to.notification.attempt_id,
+        resolution_intent: to.notification.resolution_intent,
+        resolution_action_accepted: to.notification.resolution_action_accepted,
+        resolution_consumption_observed: to.notification.resolution_consumption_observed,
         // The daemon's answer. Never inferred here: direction, mailbox
         // and wake are all visible to a client and none of them says who
         // is allowed to act.
         can_manage_attention: to.can_manage_attention,
+        can_withdraw_notification: to.can_withdraw_notification,
         // Untrusted: both are written by whoever sent the message.
-        recipient_label: crate::grid::safe_text(&to.label),
+        recipient_label: crate::grid::safe_text(
+            to.current_route
+                .as_ref()
+                .map(|route| route.label.as_str())
+                .unwrap_or(&to.label),
+        ),
         subject: row.subject.as_deref().map(crate::grid::safe_text),
         mailbox: mailbox_word(&to.mailbox),
         wake,
         cause: to.notification.cause,
+        pre_write_cause: to.notification.pre_write_cause,
+        current_route: to.current_route.clone(),
+        fifo_position: to.fifo_position,
         needs_action: to.needs_action,
         seq: row.seq,
         updated_at: to.notification.updated_at.unwrap_or(row.ts),
@@ -88,15 +298,22 @@ fn mailbox_word(state: &MailboxEntryState) -> MailboxWord {
     }
 }
 
-/// The wire's nine wake states in the five words a reader needs.
+/// The wire wake state and additive settlement in the words a reader needs.
 ///
-/// Everything between queued and submitted is one thing to a person:
-/// an attempt is in flight and has not been acknowledged. `NotStarted`
-/// stays on its own, because no attempt at all is a different situation
-/// and it changes whether requeue is the right action. An alarm an
-/// operator has already acknowledged reads as cleared rather than as
-/// still needing them.
+/// Every durable phase stays distinct. A staged notification and a queued
+/// notification demand different operator conclusions even though neither
+/// proves an agent acknowledgement. An alarm an operator has already
+/// acknowledged reads as cleared rather than as still needing them.
 fn wake_word(n: &cyclops_proto::MessageNotificationSummary) -> WakeWord {
+    if n.operator_withdrawn == Some(true) {
+        return WakeWord::WithdrawnByOperator;
+    }
+    if n.settlement == Some(MessageNotificationSettlement::WithdrawnByClaim) {
+        return WakeWord::Withdrawn;
+    }
+    if n.pre_write_cause.is_some() {
+        return WakeWord::BlockedBeforeWrite;
+    }
     match n.quota_state {
         Some(MessageQuotaState::Held) => return WakeWord::QuotaHeld,
         Some(MessageQuotaState::ResetObserved) => return WakeWord::QuotaResetObserved,
@@ -113,14 +330,18 @@ fn wake_word(n: &cyclops_proto::MessageNotificationSummary) -> WakeWord {
     }
     match n.state {
         MessageNotificationState::NotStarted => WakeWord::NotStarted,
-        MessageNotificationState::Queued
-        | MessageNotificationState::Gating
-        | MessageNotificationState::Writing
-        | MessageNotificationState::Staged
-        | MessageNotificationState::Submitted => WakeWord::Waiting,
+        MessageNotificationState::Queued => WakeWord::Queued,
+        MessageNotificationState::Gating => WakeWord::Gating,
+        MessageNotificationState::Writing => WakeWord::Writing,
+        MessageNotificationState::Staged => WakeWord::Staged,
+        MessageNotificationState::Submitted => WakeWord::Submitted,
         MessageNotificationState::Notified => WakeWord::Notified,
         MessageNotificationState::AttentionRequired => {
-            if n.resolution_intent.is_some() && n.resolution.is_none() {
+            if (n.resolution_intent.is_some()
+                || n.resolution_action_accepted.is_some()
+                || n.resolution_consumption_observed.is_some())
+                && n.resolution.is_none()
+            {
                 WakeWord::ActionUncertain
             } else if n.attention_cleared == Some(true) {
                 WakeWord::Cleared

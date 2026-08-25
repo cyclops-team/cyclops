@@ -201,6 +201,7 @@ mod tests {
             id: None,
             kind: EntryKind::State {
                 target: target.into(),
+                recipient: None,
                 session_idx: 0,
                 pane_id: Some(pane_id.into()),
                 state,
@@ -291,6 +292,7 @@ mod tests {
             kind: EntryKind::Msg {
                 from: "reviewer".into(),
                 to: vec!["admin".into()],
+                endpoints: None,
                 subject: "ping".into(),
                 body: None,
                 fyi: false,

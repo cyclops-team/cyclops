@@ -1,0 +1,75 @@
+---
+title: "Cleanup"
+description: "Bounded dry-run and removal of marked rebuildable Cyclops assets."
+---
+
+`cyclops cleanup` inventories only named asset classes. It accepts no path.
+Dry-run is the default, and `--apply` is the explicit mutation boundary.
+
+```bash
+cyclops cleanup build-cache update-scratch
+cyclops --json cleanup build-cache update-scratch
+cyclops cleanup build-cache update-scratch --apply
+```
+
+The eligible classes are:
+
+- `build-cache`: the incremental Cargo output directory created by
+  `cyclops update`, with the update and cleanup processes sharing one
+  `.lease` file.
+- `update-scratch`: directories named `cycu.<32-hex>` or the legacy
+  `cyclops-update.<32-hex>` whose
+  owner marker exactly matches the directory suffix and whose `.lease` is
+  present.
+
+State roots, journals, messages, rollback pairs, and processes are never
+cleanup assets. Historical `cyc-*` test directories and loose logs are also
+excluded because they predate an owner-marker and lease contract. Cleanup
+reports them as unproven and does not inspect or remove them.
+
+## Safety contract
+
+Cleanup opens a current-user temporary root only when it is an owner-only
+`0700` directory. A foreign sticky root such as a system `/tmp` is reported as
+`unsupported_temp_root` and is never walked or changed. On macOS, the private
+per-user temporary root is supported. No shared-root walker is used.
+
+Before isolation, each eligible asset must have an owner-only root and an
+unlocked owner-only single-link lease. Inventory is descriptor-relative, does
+not follow symbolic links, does not cross the temporary root's mount, and has
+fixed entry, name-byte, and depth limits. On Linux, mount identity is checked
+in addition to the device number so a same-device bind mount is still a
+boundary. Symbolic links, multiply linked files, foreign ownership,
+unsupported file types, a mount boundary, and an active lease refuse cleanup.
+
+Apply holds the lease while it atomically moves the exact asset directory to a
+private cleanup name. This releases the original namespace for a new updater
+without releasing the old asset lease. Before each removal, Cyclops
+revalidates the named entry and held descriptor against the inventoried type,
+device, inode, owner, mode, link count, and size. Removal uses one-file and
+one-empty-directory operations. It never calls recursive path deletion and
+never kills a process. Payload files and nested directories are removed before
+the owner marker and lease. The isolated cleanup name encodes the original
+device and inode. A later run validates that identity before resuming. A
+missing lease is accepted only for an already empty isolated directory, which
+allows final tombstone retirement after an interruption without authorizing
+further payload removal.
+
+The lease serializes Cyclops' cooperative asset writers. Size changes refuse
+removal. Cleanup does not hash or read arbitrary cache payload bytes, so a
+same-size write by an uncooperative process is not treated as authority. The
+target is still restricted to the exact inventoried inode inside the marked
+rebuildable asset. A failure can leave a safe subset removed; rerun the dry
+run after correcting the named issue.
+
+## Output
+
+Plain and JSON output are built from the same report. Each candidate includes
+its class, path, state, entry count, byte count, and reason. States are
+`absent`, `ready`, `removed`, `active`, `unmarked`, `unsafe`, `failed`, or
+`unsupported`. The JSON report also lists excluded classes and the active
+inventory limits.
+
+Exit `0` means every requested class was absent, ready in dry-run, or removed.
+Exit `1` means a requested candidate was active, unmarked, unsafe, failed, or
+unsupported.

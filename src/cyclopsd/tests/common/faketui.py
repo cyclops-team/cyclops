@@ -37,16 +37,31 @@ consumed), which is what a modal or a mode does to an Enter, and it is
 the case where treating send-keys success as proof of a turn would paste
 a second message over the first.
 
+`--animate-after-swallow` repaints only the status row after swallowing.
+It proves that changing chrome is not a receipt while the exact staged
+row remains in the composer.
+
 `--swallow-once` keeps the first submit staged, then accepts later submits.
 `--clear-staged` makes Ctrl-C clear the composer without exiting. Together
 they let recovery tests distinguish submit from discard by the pane's
 observable result.
+
+`--submit-log <path>` appends one line for every submit key the fixture
+receives. It lets recovery tests prove that reconciliation sends no second key.
+
+`--manual-lifecycle` consumes a successful submit but stays visually idle.
+Lifecycle tests then use Ctrl-T and Ctrl-Y to choose the observed start and
+end without wall-clock races.
 
 BEL (Ctrl-G) hides the composer contents without consuming them: the
 staged buffer is untouched and the pane draws an empty composer. That is
 the wrapped-payload shape, where a payload is really there and the screen
 rules cannot see it, and it is the only way to watch the composer hold
 work alone. Nothing in the delivery pipeline sends BEL.
+
+Test-only controls make lifecycle observations deterministic. Ctrl-T keeps a
+Working row visible, Ctrl-Y returns to the composer, and Ctrl-L redraws the
+current frame. Cyclops itself sends none of these keys.
 """
 
 import os
@@ -57,6 +72,7 @@ import tty
 
 RULE = "\x1b[38;5;244m────────────────────────────────────────\x1b[39m"
 STATUS = "\x1b[38;5;152mModel x · Ctx: 78%\x1b[39m"
+STATUS_ALT = "\x1b[38;5;152mModel x · Ctx: 77%\x1b[39m"
 WORKING = "FAKETUI-WORKING"
 START = b"\x1b[200~"
 END = b"\x1b[201~"
@@ -118,7 +134,7 @@ class Stream:
         return events
 
 
-def draw(transcript, staged, working=False, hidden=False):
+def draw(transcript, staged, working=False, hidden=False, status=STATUS):
     rows = ["\x1b[2J\x1b[H"]
     rows.extend(transcript)
     if working:
@@ -129,7 +145,7 @@ def draw(transcript, staged, working=False, hidden=False):
     rows.append("\x1b[39m❯ " + staged_rows[0])
     rows.extend(staged_rows[1:])
     rows.append(RULE)
-    rows.append(STATUS)
+    rows.append(status)
     sys.stdout.write("\r\n".join(rows) + "\r\n")
     sys.stdout.flush()
 
@@ -179,9 +195,15 @@ def main():
         selftest()
         return
     swallow = "--swallow-submit" in sys.argv
+    animate_after_swallow = "--animate-after-swallow" in sys.argv
     swallow_once = "--swallow-once" in sys.argv
     clear_staged = "--clear-staged" in sys.argv
+    manual_lifecycle = "--manual-lifecycle" in sys.argv
+    submit_log = None
+    if "--submit-log" in sys.argv:
+        submit_log = sys.argv[sys.argv.index("--submit-log") + 1]
     swallowed = False
+    forced_working = False
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     tty.setraw(fd)
@@ -197,41 +219,76 @@ def main():
             chunk = os.read(fd, 65536)
             if not chunk:
                 break
+            if manual_lifecycle and chunk == b"\x1b":
+                forced_working = False
+                draw(transcript, staged, hidden=hidden)
+                continue
             if b"\x03" in chunk:
                 if not clear_staged:
                     break
                 staged = ""
                 hidden = False
                 chunk = chunk.replace(b"\x03", b"")
-                draw(transcript, staged)
+                draw(transcript, staged, working=forced_working)
                 if not chunk:
                     continue
             if b"\x07" in chunk:
                 # Keep the staged buffer, stop drawing it.
                 hidden = True
                 chunk = chunk.replace(b"\x07", b"")
+                draw(transcript, staged, working=forced_working, hidden=hidden)
+                if not chunk:
+                    continue
+            if b"\x14" in chunk:
+                forced_working = True
+                chunk = chunk.replace(b"\x14", b"")
+                draw(transcript, staged, working=True, hidden=hidden)
+                if not chunk:
+                    continue
+            if b"\x19" in chunk:
+                forced_working = False
+                chunk = chunk.replace(b"\x19", b"")
                 draw(transcript, staged, hidden=hidden)
+                if not chunk:
+                    continue
+            if b"\x0c" in chunk:
+                chunk = chunk.replace(b"\x0c", b"")
+                draw(transcript, staged, working=forced_working, hidden=hidden)
                 if not chunk:
                     continue
             for kind, payload in stream.feed(chunk):
                 if kind == "text":
                     staged += payload.decode("utf-8", "replace")
                     hidden = False
-                    draw(transcript, staged)
-                elif swallow or (swallow_once and not swallowed):
-                    # The key arrived and was accepted. Nothing else
-                    # happens: the composer keeps its text and no turn
-                    # starts.
-                    swallowed = True
-                    draw(transcript, staged, hidden=hidden)
-                elif staged:
-                    transcript.extend(("\x1b[1;2m❯\x1b[0m " + staged).split("\n"))
-                    staged = ""
-                    draw(transcript, staged, working=True)
-                    time.sleep(0.4)
-                    draw(transcript, staged)
+                    draw(transcript, staged, working=forced_working)
                 else:
-                    draw(transcript, staged)
+                    if submit_log is not None:
+                        with open(submit_log, "a", encoding="utf-8") as log:
+                            log.write("submit\n")
+                    if swallow or (swallow_once and not swallowed):
+                        # The key arrived and was accepted. Nothing else
+                        # happens: the composer keeps its text and no turn
+                        # starts.
+                        swallowed = True
+                        status = STATUS_ALT if animate_after_swallow else STATUS
+                        draw(
+                            transcript,
+                            staged,
+                            working=forced_working,
+                            hidden=hidden,
+                            status=status,
+                        )
+                    elif staged:
+                        transcript.extend(("\x1b[1;2m❯\x1b[0m " + staged).split("\n"))
+                        staged = ""
+                        if manual_lifecycle:
+                            draw(transcript, staged, working=forced_working)
+                        else:
+                            draw(transcript, staged, working=True)
+                            time.sleep(0.4)
+                            draw(transcript, staged, working=forced_working)
+                    else:
+                        draw(transcript, staged, working=forced_working)
     finally:
         sys.stdout.write("\x1b[?2004l")
         sys.stdout.flush()

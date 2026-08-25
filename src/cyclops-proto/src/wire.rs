@@ -10,13 +10,29 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::state::AgentState;
+use crate::state::{AgentState, ComposerProof, ComposerState};
 
 /// First line the server writes on every connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
     /// Daemon semver, e.g. "0.1.0".
     pub cyclops: String,
+    /// Exact source build stamped into the daemon binary.
+    ///
+    /// Additive and optional so a current client can still inspect a daemon
+    /// that predates build identity. `None` is itself useful evidence that
+    /// the running daemon is old.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
+    /// Exact daemon process generation observed once at startup.
+    ///
+    /// A PID alone can be reused. Update and rollback require both fields
+    /// before they may signal a running daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_process: Option<crate::ProcessInstanceId>,
+    /// Canonical executable path observed once by the daemon itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_executable: Option<String>,
     /// Wire protocol version. Mismatch warns, never disconnects.
     pub proto: u32,
     /// Random id minted at daemon start. Changes on every restart, so a
@@ -144,6 +160,23 @@ pub struct QuiesceResult {
     pub in_flight: Vec<String>,
 }
 
+/// `daemon.shutdown` parameters. The daemon quiesces and stops itself only
+/// when these values still identify this exact boot and process generation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonShutdownParams {
+    pub daemon_process: crate::ProcessInstanceId,
+    pub boot_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonShutdownResult {
+    pub stopping: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub in_flight: Vec<String>,
+}
+
 /// `status` params. Absent on every caller that predates the field, which
 /// is why every member defaults.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -172,14 +205,56 @@ pub struct StatusDiagnostic {
     pub pane_id: String,
 }
 
+/// Closed operator actions advertised by `status` diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusNextAction {
+    /// Workspace administrator action. Agent callers may display it but may
+    /// not execute it with their mailbox identity.
+    WithdrawNotification,
+}
+
+/// One durable wake stopped before any terminal write.
+///
+/// The nested recipient row is the same daemon-owned projection used by
+/// `messages.snapshot`, so status cannot invent a different FIFO, route, or
+/// authorization answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusBlockedNotification {
+    pub message_id: crate::mailbox::MessageId,
+    pub notification_attempt: crate::notification::NotificationAttemptId,
+    pub recipient: MessageRecipientSummary,
+    pub waiting_age_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<StatusNextAction>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResult {
     pub daemon_version: String,
+    /// Exact source build stamped into the daemon binary.
+    ///
+    /// Old daemons omit it and old clients ignore it. A missing value does
+    /// not mean the daemon matches the client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_build: Option<String>,
+    /// Same daemon process generation carried by the connection hello.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_process: Option<crate::ProcessInstanceId>,
+    /// Same canonical executable path carried by the connection hello.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_executable: Option<String>,
     pub proto: u32,
     pub boot_id: String,
     pub uptime_ms: u64,
     pub tmux_version: String,
     pub sessions: Vec<SessionStatus>,
+    /// Current display routes for durable mailboxes.
+    ///
+    /// The key is the endpoint identity. The label is presentation data
+    /// resolved once by clients that offer human-friendly selectors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mailbox_routes: Vec<StatusMailboxRoute>,
     /// Pending messages in the workspace administrator's durable inbox.
     #[serde(default)]
     pub admin_unread: u64,
@@ -193,6 +268,13 @@ pub struct StatusResult {
     /// Content-free operational diagnostics derived from exact live routes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<StatusDiagnostic>,
+    /// Durable pre-write wake failures. Body-free and independent of route
+    /// availability, so a detached recipient cannot hide operator work.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_notifications: Vec<StatusBlockedNotification>,
+    /// Total durable pre-write wake failures before the bounded row sample.
+    #[serde(default)]
+    pub blocked_notifications_total: u64,
     /// The detection manifests this daemon is running on. Additive optional
     /// field: old daemons omit it, old clients ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -206,6 +288,13 @@ pub struct StatusResult {
     /// field: old daemons omit it, old clients ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+}
+
+/// One current display label bound to an immutable mailbox endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusMailboxRoute {
+    pub recipient: crate::identity::RecipientKey,
+    pub label: String,
 }
 
 /// A duration in the roster's words: seconds under a minute, then
@@ -260,6 +349,10 @@ pub struct OpenDelivery {
     pub id: String,
     /// Recipient as addressed.
     pub to: String,
+    /// Immutable recipient on current delivery rows. Absent only for
+    /// compatibility records written before durable endpoint identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<crate::identity::RecipientKey>,
     pub state: crate::ledger::DeliveryState,
     /// Unix ms of the transition that left it here.
     pub ts: u64,
@@ -301,6 +394,30 @@ pub struct PaneStatus {
     pub write_ready: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_block: Option<String>,
+    /// Content class from the daemon's current composer observation.
+    #[serde(default)]
+    pub composer: ComposerState,
+    /// Evidence strength behind `composer`.
+    #[serde(default)]
+    pub composer_proof: ComposerProof,
+    /// Exact durable attempt when the composer barrier names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_attempt: Option<crate::NotificationAttemptId>,
+    /// Stable, content-free reason why composer ownership is unresolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_reason: Option<String>,
+    /// Active durable composer barriers considered for this pane.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub composer_candidates: u32,
+    /// Current durable notification state for `notification_attempt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_state: Option<crate::NotificationState>,
+    /// Current durable mailbox state for the attempt's message and recipient.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_state: Option<ComposerMessageState>,
+    /// Concrete next step for an owned or unresolved Cyclops notification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<ComposerNextAction>,
     pub width: u32,
     pub height: u32,
     pub state: AgentState,
@@ -310,6 +427,10 @@ pub struct PaneStatus {
     /// state has not been computed yet. Additive optional field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_ms: Option<u64>,
+    /// Whether current Working has visual or exact lifecycle confirmation.
+    /// False is a provisional authenticated start, not runtime idleness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_confirmed: Option<bool>,
     /// Hook liveness for adopted panes whose manifest declares hooks:
     /// Some(true) once any hook edge has been seen from the pane's CURRENT
     /// occupant this daemon run, Some(false) while none has (amendment c:
@@ -331,6 +452,47 @@ pub struct PaneStatus {
     /// ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_display_name: Option<String>,
+}
+
+/// Body-free mailbox state used by the composer status projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerMessageState {
+    Pending,
+    Claimed,
+    DeliveredDirect,
+    Superseded,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+impl From<&crate::MailboxEntryState> for ComposerMessageState {
+    fn from(state: &crate::MailboxEntryState) -> Self {
+        match state {
+            crate::MailboxEntryState::Pending => Self::Pending,
+            crate::MailboxEntryState::Claimed { .. } => Self::Claimed,
+            crate::MailboxEntryState::DeliveredDirect { .. } => Self::DeliveredDirect,
+            crate::MailboxEntryState::Superseded { .. } => Self::Superseded,
+        }
+    }
+}
+
+/// Closed next steps for a Cyclops-owned or unresolved composer barrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerNextAction {
+    /// The active worker will submit the exact staged notification.
+    AutomaticSubmit,
+    /// The active worker will reconcile one uncertain or consumed attempt.
+    AutomaticReconcile,
+    /// Workspace administrator inspection of an exact `AttentionRequired` attempt.
+    InspectAttention,
+    /// Inspect durable mailbox and notification state without assuming one attempt.
+    InspectMessages,
+    /// Diagnose an inactive or faulted post-write worker before restarting it.
+    CheckHealth,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -482,6 +644,9 @@ pub struct DeliveryReceipt {
     /// can decode the receipt and still treat it as operator-visible work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_state: Option<MessageQuotaState>,
+    /// Exact claim settlement hidden behind the compatibility state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_settlement: Option<MessageNotificationSettlement>,
     /// Queue depth ahead of this message when state is queued.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<u32>,
@@ -608,6 +773,22 @@ impl Default for MessagesSnapshotParams {
     }
 }
 
+fn default_follow_limit() -> u32 {
+    128
+}
+
+/// Cursor read for durable, body-free message arrivals.
+///
+/// Unlike `messages.snapshot`, this never drops settled rows to keep a
+/// queue compact. The caller advances only to the `through_seq` returned
+/// by each bounded page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessagesFollowParams {
+    pub after_seq: u64,
+    #[serde(default = "default_follow_limit")]
+    pub limit: u32,
+}
+
 /// A message's direction relative to the authenticated caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -623,7 +804,8 @@ fn default_recipient_direction() -> MessageDirection {
     MessageDirection::Workspace
 }
 
-/// Read-side notification state. `NotStarted` means no attempt exists.
+/// Read-side compatibility state. `NotStarted` means no active wake exists;
+/// an additive settlement field distinguishes a withdrawn pre-write attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageNotificationState {
@@ -644,6 +826,9 @@ impl From<crate::notification::NotificationState> for MessageNotificationState {
         match state {
             NotificationState::Queued => Self::Queued,
             NotificationState::Gating => Self::Gating,
+            // Keep the original closed state vocabulary decodable by old
+            // clients. New clients read `pre_write_cause` for the block.
+            NotificationState::BlockedPreWrite => Self::Gating,
             // Keep the original closed wire vocabulary decodable by old
             // clients. New clients read `quota_state` for the exact phase.
             NotificationState::QuotaHeld | NotificationState::QuotaResetObserved => {
@@ -651,9 +836,20 @@ impl From<crate::notification::NotificationState> for MessageNotificationState {
             }
             NotificationState::Writing => Self::Writing,
             NotificationState::Staged => Self::Staged,
+            // The terminal intent is durable, but a submit key is not proven
+            // until the following Submitted fact. Keep old clients honest.
+            NotificationState::Submitting => Self::Staged,
             NotificationState::Submitted => Self::Submitted,
             NotificationState::Notified => Self::Notified,
             NotificationState::AttentionRequired => Self::AttentionRequired,
+            // A pre-write withdrawal never proved that its wake reached the
+            // recipient. Newer clients read the additive settlement fields.
+            NotificationState::Withdrawn => Self::NotStarted,
+            NotificationState::WithdrawnByOperator => Self::NotStarted,
+            // Bytes crossed the write boundary but were cleared before
+            // submit. Preserve that conservative phase for older clients;
+            // the additive settlement names the exact outcome.
+            NotificationState::WithdrawnAfterStaging => Self::Staged,
             NotificationState::Superseded => Self::Superseded,
         }
     }
@@ -679,6 +875,25 @@ impl MessageQuotaState {
     }
 }
 
+/// Additive detail for a notification settled by an authenticated claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageNotificationSettlement {
+    WithdrawnByClaim,
+}
+
+impl MessageNotificationSettlement {
+    pub fn from_notification(state: crate::notification::NotificationState) -> Option<Self> {
+        use crate::notification::NotificationState;
+        match state {
+            NotificationState::Withdrawn | NotificationState::WithdrawnAfterStaging => {
+                Some(Self::WithdrawnByClaim)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Current body-free notification projection for one recipient.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageNotificationSummary {
@@ -687,20 +902,41 @@ pub struct MessageNotificationSummary {
     /// `attention_required` for old-client compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_state: Option<MessageQuotaState>,
+    /// Exact claim settlement hidden behind the compatibility state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement: Option<MessageNotificationSettlement>,
+    /// True when an administrator withdrew this exact pre-write wake.
+    ///
+    /// The mailbox item remains pending. The optional field keeps older
+    /// clients compatible while distinguishing this from a recipient claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_withdrawn: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_id: Option<crate::notification::NotificationAttemptId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<crate::notification::NotificationAttentionCause>,
+    /// Exact reason an attempt stopped before any terminal write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_write_cause: Option<crate::notification::NotificationPreWriteCause>,
     /// Present only for attention-required attempts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention_cleared: Option<bool>,
     /// Explicit operator resolution of this exact attention attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution: Option<crate::notification::NotificationResolution>,
-    /// Terminal action crossed its write boundary without a final outcome.
-    /// Inspect the pane. Never repeat this action automatically.
+    /// Pre-key terminal action intent without a final outcome.
+    /// Never infer that the terminal accepted a key from this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_intent: Option<crate::notification::NotificationResolution>,
+    /// The terminal accepted the action key, but composer consumption and the
+    /// final resolution are not yet proven.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_action_accepted: Option<crate::notification::NotificationResolution>,
+    /// Content-free evidence that an accepted Complete action consumed the
+    /// staged composer input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_consumption_observed:
+        Option<crate::notification::NotificationResolutionConsumptionObservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<u64>,
 }
@@ -722,6 +958,14 @@ pub struct MessageRecipientSummary {
     /// notification state. The daemon answers it for the exact recipient row.
     #[serde(default)]
     pub can_manage_attention: bool,
+    /// Whether the authenticated caller may withdraw this exact unwritten wake.
+    ///
+    /// Clients must not infer this authority from visible notification state.
+    #[serde(default)]
+    pub can_withdraw_notification: bool,
+    /// Current live route, separate from the immutable send-time label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_route: Option<MessageRecipientRoute>,
     /// Current route availability, outside the workspace journal watermark.
     pub available: bool,
     pub mailbox: crate::mailbox::MailboxEntryState,
@@ -729,6 +973,13 @@ pub struct MessageRecipientSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fifo_position: Option<u64>,
     pub notification: MessageNotificationSummary,
+}
+
+/// Current display route for one durable recipient.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageRecipientRoute {
+    pub label: String,
+    pub pane_id: crate::identity::TmuxPaneId,
 }
 
 /// Stable body-free row returned by `messages.snapshot`.
@@ -776,6 +1027,21 @@ pub struct MessagesSnapshotResult {
     /// Highest workspace journal sequence folded into this snapshot.
     pub workspace_seq: u64,
     pub counts: MessagesSnapshotCounts,
+    pub rows: Vec<MessageSnapshotRow>,
+}
+
+/// One bounded page of durable message arrivals visible to the
+/// authenticated caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessagesFollowResult {
+    pub workspace_id: crate::identity::WorkspaceId,
+    /// Cursor supplied by the caller.
+    pub after_seq: u64,
+    /// Highest sequence fully covered by this page. The next request uses
+    /// this value as `after_seq`.
+    pub through_seq: u64,
+    /// More visible message rows exist before the workspace head.
+    pub has_more: bool,
     pub rows: Vec<MessageSnapshotRow>,
 }
 
@@ -834,6 +1100,27 @@ pub struct RequeueResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationWithdrawParams {
+    pub attempt_id: crate::notification::NotificationAttemptId,
+    pub recipient: crate::identity::RecipientKey,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationWithdrawResult {
+    pub attempt_id: crate::notification::NotificationAttemptId,
+    pub message_id: crate::mailbox::MessageId,
+    pub recipient: crate::identity::RecipientKey,
+    pub disposition: NotificationWithdrawDisposition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationWithdrawDisposition {
+    Withdrawn,
+    AlreadyWithdrawn,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlarmPreviewParams {
     pub older_than_ms: u64,
 }
@@ -854,11 +1141,17 @@ pub struct AlarmSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlarmPreviewResult {
     pub entries: Vec<AlarmSummary>,
+    /// Absolute cutoff used to select `entries`.
+    #[serde(default)]
+    pub cutoff_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlarmClearParams {
     pub ids: Vec<String>,
+    /// Preview cutoff for an age-selected clear. Direct-id clears omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cutoff_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1159,6 +1452,60 @@ mod tests {
         assert!(req.params.is_null());
     }
 
+    #[test]
+    fn daemon_build_identity_is_additive_on_hello_and_status() {
+        let old_hello: Hello =
+            serde_json::from_str(r#"{"cyclops":"0.1.0","proto":1,"boot_id":"old"}"#)
+                .expect("an old hello still decodes");
+        assert_eq!(old_hello.build, None);
+
+        let hello = Hello {
+            cyclops: "0.1.0".into(),
+            build: Some("abc1234".into()),
+            daemon_process: Some(crate::ProcessInstanceId::new(42, 7).unwrap()),
+            daemon_executable: Some("/opt/cyclopsd".into()),
+            proto: 1,
+            boot_id: "new".into(),
+        };
+        let hello_wire = serde_json::to_value(hello).unwrap();
+        assert_eq!(hello_wire["build"], "abc1234");
+        assert_eq!(hello_wire["daemon_process"]["pid"], 42);
+        assert_eq!(hello_wire["daemon_executable"], "/opt/cyclopsd");
+
+        let old_status = r#"{"daemon_version":"0.1.0","proto":1,"boot_id":"old",
+            "uptime_ms":1,"tmux_version":"3.6a","sessions":[]}"#;
+        let mut status: StatusResult =
+            serde_json::from_str(old_status).expect("an old status still decodes");
+        assert_eq!(status.daemon_build, None);
+        assert_eq!(status.daemon_process, None);
+        assert_eq!(status.daemon_executable, None);
+        status.daemon_build = Some("abc1234".into());
+        let status_wire = serde_json::to_value(status).unwrap();
+        assert_eq!(status_wire["daemon_build"], "abc1234");
+    }
+
+    #[test]
+    fn a_legacy_pane_without_composer_fields_fails_closed() {
+        let pane: PaneStatus = serde_json::from_value(serde_json::json!({
+            "pane_id": "%1",
+            "window_id": "@1",
+            "window_name": "main",
+            "title": "",
+            "current_command": "claude",
+            "dead": false,
+            "in_mode": false,
+            "width": 80,
+            "height": 24,
+            "state": "idle"
+        }))
+        .expect("legacy pane status still decodes");
+
+        assert!(!pane.write_ready);
+        assert_eq!(pane.composer, ComposerState::ComposerAmbiguous);
+        assert_eq!(pane.composer_proof, ComposerProof::Unprovable);
+        assert_eq!(pane.next_action, None);
+    }
+
     /// The open-delivery seed is additive in both directions: a daemon that
     /// predates it omits the field, and a client that predates it omits the
     /// param. Neither side may fail on the other's absence.
@@ -1182,6 +1529,7 @@ mod tests {
         let d = OpenDelivery {
             id: "m-aaaaaa".into(),
             to: "implementer".into(),
+            recipient: None,
             state: crate::ledger::DeliveryState::ParkedBlockedQuota,
             ts: 1_754_000_002_600,
             cause: Some("blocked_quota".into()),
@@ -1198,12 +1546,14 @@ mod tests {
         assert_eq!(receipt.held_by, None);
         assert_eq!(receipt.notification_state, None);
         assert_eq!(receipt.quota_state, None);
+        assert_eq!(receipt.notification_settlement, None);
 
         let receipt = DeliveryReceipt {
             to: "reviewer".into(),
             state: crate::ledger::DeliveryState::Queued,
             notification_state: None,
             quota_state: None,
+            notification_settlement: None,
             position: Some(0),
             held_by: Some("blocked".into()),
             note: None,
@@ -1227,6 +1577,7 @@ mod tests {
                 state: crate::ledger::DeliveryState::Queued,
                 notification_state: Some(state),
                 quota_state: None,
+                notification_settlement: None,
                 position: None,
                 held_by: None,
                 note: None,
@@ -1244,6 +1595,7 @@ mod tests {
             state: crate::ledger::DeliveryState::Queued,
             notification_state: None,
             quota_state: None,
+            notification_settlement: None,
             position: None,
             held_by: None,
             note: None,
@@ -1251,6 +1603,26 @@ mod tests {
         })
         .unwrap();
         assert!(legacy.get("notification_state").is_none());
+
+        let withdrawn = DeliveryReceipt {
+            to: "reviewer".into(),
+            state: crate::ledger::DeliveryState::Queued,
+            notification_state: Some(MessageNotificationState::NotStarted),
+            quota_state: None,
+            notification_settlement: Some(MessageNotificationSettlement::WithdrawnByClaim),
+            position: None,
+            held_by: None,
+            note: None,
+            pane: None,
+        };
+        let wire = serde_json::to_value(&withdrawn).unwrap();
+        assert_eq!(wire["notification_state"], "not_started");
+        assert_eq!(wire["notification_settlement"], "withdrawn_by_claim");
+        let round_trip: DeliveryReceipt = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            round_trip.notification_settlement,
+            Some(MessageNotificationSettlement::WithdrawnByClaim)
+        );
     }
 
     #[test]
@@ -1263,6 +1635,7 @@ mod tests {
                 state: crate::ledger::DeliveryState::Queued,
                 notification_state: None,
                 quota_state: None,
+                notification_settlement: None,
                 position: None,
                 held_by: None,
                 note: None,
@@ -1372,17 +1745,24 @@ mod tests {
             direction: MessageDirection::Inbound,
             needs_action: true,
             can_manage_attention: true,
+            can_withdraw_notification: false,
+            current_route: None,
             available: true,
             mailbox: crate::MailboxEntryState::Pending,
             fifo_position: Some(1),
             notification: MessageNotificationSummary {
                 state: MessageNotificationState::NotStarted,
                 quota_state: None,
+                settlement: None,
+                operator_withdrawn: None,
                 attempt_id: None,
                 cause: None,
+                pre_write_cause: None,
                 attention_cleared: None,
                 resolution: None,
                 resolution_intent: None,
+                resolution_action_accepted: None,
+                resolution_consumption_observed: None,
                 updated_at: None,
             },
         };
@@ -1391,11 +1771,15 @@ mod tests {
         object.remove("direction");
         object.remove("needs_action");
         object.remove("can_manage_attention");
+        object.remove("can_withdraw_notification");
+        object.remove("current_route");
 
         let decoded: MessageRecipientSummary = serde_json::from_value(legacy).unwrap();
         assert_eq!(decoded.direction, MessageDirection::Workspace);
         assert!(!decoded.needs_action);
         assert!(!decoded.can_manage_attention);
+        assert!(!decoded.can_withdraw_notification);
+        assert!(decoded.current_route.is_none());
     }
 
     #[test]
@@ -1403,11 +1787,16 @@ mod tests {
         let unresolved = MessageNotificationSummary {
             state: MessageNotificationState::AttentionRequired,
             quota_state: None,
+            settlement: None,
+            operator_withdrawn: None,
             attempt_id: None,
             cause: Some(crate::NotificationAttentionCause::VerifyFailed),
+            pre_write_cause: None,
             attention_cleared: Some(false),
             resolution: None,
             resolution_intent: None,
+            resolution_action_accepted: None,
+            resolution_consumption_observed: None,
             updated_at: Some(7),
         };
         let unresolved_wire = serde_json::to_value(&unresolved).unwrap();
@@ -1459,11 +1848,16 @@ mod tests {
             let summary = MessageNotificationSummary {
                 state: internal.into(),
                 quota_state: MessageQuotaState::from_notification(internal),
+                settlement: None,
+                operator_withdrawn: None,
                 attempt_id: None,
                 cause: None,
+                pre_write_cause: None,
                 attention_cleared: None,
                 resolution: None,
                 resolution_intent: None,
+                resolution_action_accepted: None,
+                resolution_consumption_observed: None,
                 updated_at: Some(7),
             };
             let wire = serde_json::to_value(&summary).unwrap();
@@ -1479,18 +1873,24 @@ mod tests {
         let old_wire = serde_json::json!({"state": "attention_required"});
         let current: MessageNotificationSummary = serde_json::from_value(old_wire).unwrap();
         assert_eq!(current.quota_state, None);
+        assert_eq!(current.settlement, None);
     }
 
     #[test]
-    fn uncertain_resolution_intent_is_optional_and_distinct_from_completion() {
+    fn resolution_boundaries_are_distinct_from_completion() {
         let summary = MessageNotificationSummary {
             state: MessageNotificationState::AttentionRequired,
             quota_state: None,
+            settlement: None,
+            operator_withdrawn: None,
             attempt_id: None,
             cause: Some(crate::NotificationAttentionCause::VerifyFailed),
+            pre_write_cause: None,
             attention_cleared: Some(false),
             resolution: None,
             resolution_intent: Some(crate::NotificationResolution::Complete),
+            resolution_action_accepted: None,
+            resolution_consumption_observed: None,
             updated_at: Some(7),
         };
         let wire = serde_json::to_value(&summary).unwrap();
@@ -1501,7 +1901,106 @@ mod tests {
             decoded.resolution_intent,
             Some(crate::NotificationResolution::Complete)
         );
+        assert_eq!(decoded.resolution_action_accepted, None);
         assert_eq!(decoded.resolution, None);
+
+        let accepted = MessageNotificationSummary {
+            resolution_action_accepted: Some(crate::NotificationResolution::Complete),
+            ..summary
+        };
+        let wire = serde_json::to_value(&accepted).unwrap();
+        assert_eq!(wire["resolution_intent"], "complete");
+        assert_eq!(wire["resolution_action_accepted"], "complete");
+        assert!(wire.get("resolution_consumption_observed").is_none());
+        assert!(wire.get("resolution").is_none());
+        let decoded: MessageNotificationSummary = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded, accepted);
+
+        let consumed = MessageNotificationSummary {
+            resolution_consumption_observed: Some(
+                crate::NotificationResolutionConsumptionObservation {
+                    evidence: crate::NotificationResolutionConsumptionEvidence::WorkingEdge,
+                    observed_at_ms: 9,
+                },
+            ),
+            ..accepted
+        };
+        let wire = serde_json::to_value(&consumed).unwrap();
+        assert_eq!(wire["resolution_intent"], "complete");
+        assert_eq!(wire["resolution_action_accepted"], "complete");
+        assert_eq!(
+            wire["resolution_consumption_observed"]["evidence"],
+            "working_edge"
+        );
+        assert_eq!(wire["resolution_consumption_observed"]["observed_at_ms"], 9);
+        assert!(wire.get("resolution").is_none());
+        let decoded: MessageNotificationSummary = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded, consumed);
+    }
+
+    #[test]
+    fn withdrawn_claim_settlement_keeps_old_clients_honest() {
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        #[serde(rename_all = "snake_case")]
+        enum LegacyNotificationState {
+            NotStarted,
+            Staged,
+        }
+
+        #[derive(Deserialize)]
+        struct LegacySummary {
+            state: LegacyNotificationState,
+        }
+
+        for (internal, expected, legacy) in [
+            (
+                crate::NotificationState::Withdrawn,
+                "not_started",
+                LegacyNotificationState::NotStarted,
+            ),
+            (
+                crate::NotificationState::WithdrawnAfterStaging,
+                "staged",
+                LegacyNotificationState::Staged,
+            ),
+        ] {
+            let summary = MessageNotificationSummary {
+                state: internal.into(),
+                quota_state: None,
+                settlement: MessageNotificationSettlement::from_notification(internal),
+                operator_withdrawn: None,
+                attempt_id: None,
+                cause: None,
+                pre_write_cause: None,
+                attention_cleared: None,
+                resolution: None,
+                resolution_intent: None,
+                resolution_action_accepted: None,
+                resolution_consumption_observed: None,
+                updated_at: Some(7),
+            };
+            let wire = serde_json::to_value(&summary).unwrap();
+
+            assert_eq!(wire["state"], expected);
+            assert_eq!(wire["settlement"], "withdrawn_by_claim");
+            assert_eq!(
+                serde_json::from_value::<LegacySummary>(wire.clone())
+                    .unwrap()
+                    .state,
+                legacy
+            );
+            assert_eq!(
+                serde_json::from_value::<MessageNotificationSummary>(wire)
+                    .unwrap()
+                    .settlement,
+                Some(MessageNotificationSettlement::WithdrawnByClaim)
+            );
+        }
+
+        assert_eq!(
+            MessageNotificationState::from(crate::NotificationState::WithdrawnByOperator),
+            MessageNotificationState::NotStarted
+        );
     }
 
     #[test]

@@ -1,5 +1,9 @@
 {
   "timestamp": "2026-08-22T05:30:00Z",
+  "metric_semantics": {
+    "total_verified": "representation_detected",
+    "scope": "staged representation detection and clean clear only; not exact ownership, terminal submission, or receipt"
+  },
   "submitted_receipt_gate": "NOT_EXECUTED_IN_STAGE_CLEAR_HARNESS: isolated stage-and-clear soak intentionally isolates staging verification and teardown without submitting turns",
   "results": [
     {

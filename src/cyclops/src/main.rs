@@ -5,11 +5,11 @@
 //! Two jobs, and nothing between them. It speaks NDJSON over the daemon's
 //! Unix socket (`client.rs`, types from `cyclops-proto`), and it renders
 //! what comes back for a human (`render.rs` layout, `style.rs` color,
-//! `copy.rs` words). Daemon reads and direct mutations take `--json` and
-//! print exactly the socket answer, which is the promise the rendering
-//! exists to be optional against. Guarded age-selected alarm clearance is
-//! interactive because it must confirm a frozen preview. `cyclops ui` has
-//! no `--json`; the machine stream is `cyclops watch --json`.
+//! `copy.rs` words). Structured daemon reads and direct mutations take
+//! `--json` and print exactly the socket answer, which keeps rendering
+//! optional. Guarded age-selected alarm clearance is interactive because it
+//! must confirm a frozen preview. `update`, `daemon log`, and `cyclops ui`
+//! remain text; the machine stream is `cyclops watch --json`.
 //!
 //! Three things here are not that shape and say why:
 //!
@@ -32,17 +32,17 @@
 //!   lived here once and drifted.
 //! - Any color value. Every paint is a `cyclops-theme` token.
 //!
-//! Verbs, by the milestone that added them: `ping`, `status`, `read`,
-//! `watch` (M0); `send`, `hook` (M1); `history`, `thread`, `wait`,
-//! `hooks install|verify|selftest` (M2); `ui` (M3); `name`,
-//! `list`, `start`, `workspace save|restore` (M4); `theme` (M5);
-//! `update`; `setup check` (setup inspection).
+//! The command surface covers live watching, durable messaging, history,
+//! lifecycle waits, hook setup, workspace management, themes, installation,
+//! and daemon control.
 
+mod cleanup;
 mod client;
 mod consumer;
 mod copy;
 mod daemon;
 mod hash;
+mod health;
 mod hook;
 mod hookset;
 mod manifests;
@@ -87,6 +87,9 @@ const WAIT_TIMEOUT_DEFAULT: &str = "60s";
 /// budget, so the transport never times out before the daemon answers.
 const WAIT_READ_SLACK: Duration = Duration::from_secs(10);
 
+/// Exact source build stamped by this crate's existing build script.
+const BUILD_REF: &str = env!("CYCLOPS_BUILD_REF");
+
 /// Version plus the commit that built it (build.rs), so "which build am
 /// I on" is one command instead of an afternoon.
 const VERSION: &str = concat!(
@@ -104,7 +107,8 @@ const VERSION: &str = concat!(
     after_help = "With no command, opens the full-screen workspace (and starts the daemon if needed)."
 )]
 struct Cli {
-    /// Print raw results as JSON. Anything the UI shows, scripts can read.
+    /// Request structured JSON where the command supports it. `watch` emits
+    /// NDJSON. `update`, `daemon log`, and the interactive UI remain text.
     #[arg(long, global = true)]
     json: bool,
 
@@ -134,6 +138,17 @@ enum Cmd {
     },
     /// What cyclops is watching and the state of every agent.
     Status,
+    /// Inspect the installation, daemon, setup, and state without changing them.
+    Health,
+    /// Inventory or remove bounded rebuildable assets. Dry-run is the default.
+    Cleanup {
+        /// List one or both asset classes.
+        #[arg(value_enum, required = true)]
+        assets: Vec<cleanup::AssetClass>,
+        /// Remove exact reported assets after lease and identity revalidation.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Name a pane so cyclops can address it. `--clear` gives it back.
     Name(NameArgs),
     /// Every named agent: what it is called, how it is doing, what it is on.
@@ -176,6 +191,8 @@ enum Cmd {
     Reply(ReplyArgs),
     /// Requeue a message by identifier.
     Requeue(RequeueArgs),
+    /// Manage exact notification attempts.
+    Notification(NotificationArgs),
     /// Preview or clear delivery alarms.
     Alarm(AlarmArgs),
     /// Inspect or resolve an exact staged notification attempt.
@@ -206,9 +223,10 @@ enum Cmd {
     /// Relay a vendor hook event to cyclops. Silent, always exits 0.
     Hook {
         /// Event name, e.g. Stop. An argument because agy payloads carry
-        /// no event-name field (F7); the payload arrives on stdin.
+        /// no event-name field; the payload arrives on stdin.
         event: String,
-        /// Reporting agent label; defaults to $CYCLOPS_AGENT.
+        /// Optional reporting label assertion. The daemon derives identity
+        /// from the authenticated socket peer when omitted.
         #[arg(long)]
         agent: Option<String>,
     },
@@ -222,12 +240,27 @@ enum Cmd {
         /// Theme to switch to, e.g. light. Omit to list what is there.
         name: Option<String>,
     },
-    /// Update cyclops itself: fetch the source, rebuild, and replace the
-    /// installed binaries. Config, themes, manifests and the record are
-    /// untouched. Prints old and new build, then restarts the daemon when
-    /// nothing is mid-flight; an open workspace is never touched. (Wiring
-    /// agent hooks is `cyclops hooks install`, a different job.)
-    Update,
+    /// Update Cyclops itself: fetch the source, rebuild, and replace the
+    /// installed binaries. Durable records and operator-edited setup files
+    /// are preserved. Untouched shipped themes, manifests, skills, and
+    /// Cyclops hook entries may be upgraded. Set CYCLOPS_NO_VENDOR_HOOKS=1
+    /// to skip vendor hook and skill wiring. A running daemon is safely
+    /// restarted; a stopped daemon stays stopped. An open workspace is untouched.
+    Update {
+        /// Reactivate a replay-proven retained pair. State is not rolled back.
+        #[arg(long)]
+        rollback: bool,
+        /// Internal installer entry point. The directory must contain both
+        /// freshly built binaries.
+        #[arg(long, hide = true, value_name = "DIR", conflicts_with = "rollback")]
+        install_pair: Option<std::path::PathBuf>,
+        /// Remove one fully validated managed pair store during uninstall.
+        #[arg(long, hide = true, conflicts_with_all = ["rollback", "install_pair"])]
+        remove_pair_store: bool,
+        /// Installation prefix used with an internal pair-store operation.
+        #[arg(long, hide = true, value_name = "DIR")]
+        prefix: Option<std::path::PathBuf>,
+    },
     /// The daemon: stop it, ask after it, read its log. `cyclops start`
     /// starts one for you, so there is no `daemon start`.
     Daemon {
@@ -511,6 +544,24 @@ struct RequeueArgs {
 }
 
 #[derive(clap::Args)]
+struct NotificationArgs {
+    #[command(subcommand)]
+    cmd: NotificationCmd,
+}
+
+#[derive(Subcommand)]
+enum NotificationCmd {
+    /// Withdraw one exact wake before any terminal write.
+    Withdraw {
+        /// Exact notification attempt identifier.
+        attempt_id: cyclops_proto::NotificationAttemptId,
+        /// Canonical durable recipient key for this attempt.
+        #[arg(long, value_name = "RECIPIENT_KEY")]
+        recipient: cyclops_proto::RecipientKey,
+    },
+}
+
+#[derive(clap::Args)]
 struct AlarmArgs {
     #[command(subcommand)]
     cmd: AlarmCmd,
@@ -725,9 +776,10 @@ fn run(cli: &Cli) -> i32 {
 /// workspace opens. Without themes, a config or `$CYCLOPS_THEME` naming a
 /// shipped theme was a missing file and a warning about fixing one that was
 /// never there. Without manifests, every pane reads unknown and nothing can
-/// be delivered — indistinguishable from a broken install to a first-time
-/// visitor who ran bare `cyclops` after a binary-only copy. Existing files
-/// are never overwritten, so running on every open costs nothing.
+/// be delivered, which is indistinguishable from a broken install to a
+/// first-time visitor who ran bare `cyclops` after a binary-only copy.
+/// Operator-edited files stay unchanged. Known unedited shipped files may
+/// advance, and a current home costs no writes on open.
 ///
 /// A problem is a note, not an exit: a home without themes still renders in
 /// built-in colors, and a home without manifests still opens (the sidebar
@@ -798,6 +850,10 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
         Cmd::Setup {
             cmd: SetupCmd::Check,
         } => setup::run_check(cli.json, &style_for(cli)),
+        // Health must not load a theme through an unchecked state path.
+        Cmd::Health => health::run(cli.json),
+        // Cleanup has no arbitrary path input and does not need the daemon.
+        Cmd::Cleanup { assets, apply } => cleanup::run(cli.json, assets, *apply),
         Cmd::Start(args) => workspace::run_start(
             cli.json,
             &style_for(cli),
@@ -836,11 +892,21 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
         // switch is live at once, but a down daemon costs it only that,
         // so it must not go through connect() either.
         Cmd::Theme { name } => theme::run(cli.json, &style_for(cli), name.as_deref()),
-        // Update replaces the binaries on disk and never talks to the
-        // daemon: the daemon keeps running the old build until the
-        // restart steps it prints are followed, and saying so is part of
-        // its output.
-        Cmd::Update => update::run(cli.json, &style_for(cli)),
+        // Update validates a matched pair, then asks the exact authenticated
+        // daemon generation to stop before one selector changes.
+        Cmd::Update {
+            rollback,
+            install_pair,
+            remove_pair_store,
+            prefix,
+        } => update::run(
+            cli.json,
+            &style_for(cli),
+            *rollback,
+            install_pair.as_deref(),
+            *remove_pair_store,
+            prefix.as_deref(),
+        ),
         // All three answer about a daemon rather than through one, so a
         // daemon that is down is an answer here, not a failure.
         Cmd::Daemon { cmd } => cmd_daemon(cli, &style_for(cli), cmd),
@@ -884,12 +950,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 Ok(client) => client,
                 Err(error) => return inbox_next_client_failed(cli, &error),
             };
-            if client.hello().proto != PROTOCOL_VERSION {
-                eprintln!(
-                    "{}",
-                    copy::proto_mismatch(client.hello().proto, PROTOCOL_VERSION)
-                );
-            }
+            report_hello_mismatch(client.hello());
             cmd_inbox_next(&mut client, cli, timeout, from.as_deref())
         }
         // Install renders and instructs without a daemon; verify and
@@ -933,6 +994,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
         | Cmd::Inbox(_)
         | Cmd::Messages(_)
         | Cmd::Requeue(_)
+        | Cmd::Notification(_)
         | Cmd::Alarm(_)
         | Cmd::Attention(_)
         | Cmd::Hooks { .. } => {
@@ -956,6 +1018,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 Cmd::Inbox(args) => cmd_inbox(&mut c, cli, &style, args),
                 Cmd::Messages(args) => cmd_messages(&mut c, cli, &style, args),
                 Cmd::Requeue(args) => cmd_requeue(&mut c, cli, &style, args),
+                Cmd::Notification(args) => cmd_notification(&mut c, cli, &style, args),
                 Cmd::Alarm(args) => cmd_alarm(&mut c, cli, &style, args),
                 Cmd::Attention(args) => cmd_attention(&mut c, cli, &style, args),
                 Cmd::Hooks {
@@ -975,8 +1038,10 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 | Cmd::Watch { .. }
                 | Cmd::Start(_)
                 | Cmd::Setup { .. }
+                | Cmd::Health
+                | Cmd::Cleanup { .. }
                 | Cmd::Theme { .. }
-                | Cmd::Update
+                | Cmd::Update { .. }
                 | Cmd::Workspace { .. } => {
                     unreachable!("handled above")
                 }
@@ -1006,26 +1071,24 @@ fn cmd_watch(cli: &Cli, style: &Style, kinds: &[String], ui: &UiArgs) -> i32 {
         };
         return cmd_watch_json(&mut c, cli, style, kinds);
     }
-    let checked = match preflight_watch_filters(ui) {
-        Ok(checked) => checked,
+    let filters = match preflight_watch_filters(ui) {
+        Ok(filters) => filters,
         Err(code) => return code,
     };
-    drop(checked);
-    run_stream_ui(cli, ui)
+    run_stream_ui(cli, ui, filters)
 }
 
-fn preflight_watch_filters(ui: &UiArgs) -> Result<Option<Client>, i32> {
+fn preflight_watch_filters(ui: &UiArgs) -> Result<cyclops_ui::Filter, i32> {
     if ui.with.is_none() && ui.from.is_none() && ui.to.is_none() {
-        return Ok(None);
+        return Ok(cyclops_ui::Filter::default());
     }
     let mut client = connect()?;
-    validate_watch_filters(&mut client, ui)?;
-    Ok(Some(client))
+    resolve_watch_filters(&mut client, ui)
 }
 
-/// Watch filters are display conveniences, not endpoint selectors. Validate
-/// them against the current active roster so a typo cannot block forever.
-fn validate_watch_filters(c: &mut Client, ui: &UiArgs) -> Result<(), i32> {
+/// Resolve display conveniences once to immutable endpoint identities.
+/// A later rename changes only presentation and cannot strand the watch.
+fn resolve_watch_filters(c: &mut Client, ui: &UiArgs) -> Result<cyclops_ui::Filter, i32> {
     let value = c
         .request(
             "status",
@@ -1042,29 +1105,37 @@ fn validate_watch_filters(c: &mut Client, ui: &UiArgs) -> Result<(), i32> {
         eprintln!("{}", copy::UNREADABLE_ANSWER);
         1
     })?;
-    let mut labels = vec!["admin".to_string()];
-    labels.extend(
-        status
-            .sessions
-            .iter()
-            .flat_map(|session| &session.panes)
-            .filter(|pane| !pane.dead)
-            .map(|pane| pane.display_name().to_string()),
-    );
-    labels.sort();
-    labels.dedup();
-
     let unknown: Vec<&str> = [&ui.with, &ui.from, &ui.to]
         .into_iter()
         .flatten()
         .map(String::as_str)
-        .filter(|asked| !labels.iter().any(|known| known == asked))
+        .filter(|asked| {
+            !status.mailbox_routes.iter().any(|route| {
+                route.label.as_str() == *asked || route.recipient.to_string() == *asked
+            })
+        })
         .collect();
     if !unknown.is_empty() {
         eprintln!("{}", copy::unknown_watch_filters(&unknown));
         return Err(EXIT_USAGE);
     }
-    Ok(())
+    let resolve = |asked: &Option<String>| {
+        asked.as_ref().and_then(|asked| {
+            status
+                .mailbox_routes
+                .iter()
+                .find(|route| {
+                    route.label.as_str() == asked.as_str()
+                        || route.recipient.to_string() == asked.as_str()
+                })
+                .map(|route| cyclops_ui::EndpointFilter::new(route.recipient, route.label.clone()))
+        })
+    };
+    Ok(cyclops_ui::Filter {
+        with: resolve(&ui.with),
+        from: resolve(&ui.from),
+        to: resolve(&ui.to),
+    })
 }
 
 /// cyclops ui: deprecated alias for `cyclops watch`.
@@ -1074,34 +1145,43 @@ fn cmd_ui(cli: &Cli, args: &UiArgs) -> i32 {
         return EXIT_USAGE;
     }
     eprintln!("{}", copy::UI_DEPRECATED);
-    let checked = match preflight_watch_filters(args) {
-        Ok(checked) => checked,
+    let filters = match preflight_watch_filters(args) {
+        Ok(filters) => filters,
         Err(code) => return code,
     };
-    drop(checked);
-    run_stream_ui(cli, args)
+    run_stream_ui(cli, args, filters)
 }
 
-fn run_stream_ui(cli: &Cli, args: &UiArgs) -> i32 {
+fn run_stream_ui(cli: &Cli, args: &UiArgs, filters: cyclops_ui::Filter) -> i32 {
     cyclops_ui::run(cyclops_ui::UiOptions {
         plain: cli.plain,
         firehose: args.firehose,
-        with: args.with.clone(),
-        from: args.from.clone(),
-        to: args.to.clone(),
+        with: filters.with,
+        from: filters.from,
+        to: filters.to,
         backfill: args.backfill,
     })
 }
 
-/// Connect and check the hello. A protocol mismatch warns once on stderr
-/// and continues: the protocol is tolerant by design (ADR-001, S2).
+/// Report compatibility facts carried by the daemon's hello.
+///
+/// Both mismatches warn and continue. The protocol is tolerant by design,
+/// while the build identifier detects an old or shadowed daemon without
+/// pretending that it cannot answer requests.
+fn report_hello_mismatch(hello: &cyclops_proto::Hello) {
+    if hello.proto != PROTOCOL_VERSION {
+        eprintln!("{}", copy::proto_mismatch(hello.proto, PROTOCOL_VERSION));
+    }
+    if let Some(note) = copy::build_mismatch(hello.build.as_deref(), BUILD_REF) {
+        eprintln!("{note}");
+    }
+}
+
+/// Connect and check the hello. Mismatches warn once on stderr and continue.
 fn connect() -> Result<Client, i32> {
     match Client::connect() {
         Ok(c) => {
-            let proto = c.hello().proto;
-            if proto != PROTOCOL_VERSION {
-                eprintln!("{}", copy::proto_mismatch(proto, PROTOCOL_VERSION));
-            }
+            report_hello_mismatch(c.hello());
             Ok(c)
         }
         Err(e) => {
@@ -1203,6 +1283,7 @@ fn cmd_daemon(cli: &Cli, style: &Style, cmd: &DaemonCmd) -> i32 {
                     return 0;
                 }
             };
+            report_hello_mismatch(client.hello());
             let status: StatusResult = match ask(
                 &mut client,
                 "status",
@@ -2043,29 +2124,134 @@ fn message_recipient_cell(
         }
         cyclops_proto::MailboxEntryState::Superseded { .. } => "superseded".to_string(),
     };
-    let mut notification = match recipient.notification.resolution {
-        Some(cyclops_proto::NotificationResolution::Complete) => "operator submitted".to_string(),
-        Some(cyclops_proto::NotificationResolution::Discard) => "operator discarded".to_string(),
-        None => match recipient.notification.quota_state {
-            Some(cyclops_proto::MessageQuotaState::Held) => {
-                "quota held · wait for quota reset · no automatic resume".to_string()
+    let mut includes_attempt = false;
+    let mut notification = if recipient.notification.operator_withdrawn == Some(true) {
+        "wake withdrawn by admin · message remains claimable".to_string()
+    } else if recipient.notification.settlement
+        == Some(cyclops_proto::MessageNotificationSettlement::WithdrawnByClaim)
+    {
+        "withdrawn".to_string()
+    } else {
+        match recipient.notification.resolution {
+            Some(cyclops_proto::NotificationResolution::Complete) => {
+                "operator submitted".to_string()
             }
-            Some(cyclops_proto::MessageQuotaState::ResetObserved) => format!(
+            Some(cyclops_proto::NotificationResolution::Discard) => {
+                "operator discarded".to_string()
+            }
+            None => match recipient.notification.quota_state {
+                Some(cyclops_proto::MessageQuotaState::Held) => {
+                    "quota held · wait for quota reset · no automatic resume".to_string()
+                }
+                Some(cyclops_proto::MessageQuotaState::ResetObserved) => format!(
                 "quota reset observed · admin next: cyclops requeue {message_id} · message wide"
             ),
-            None => match recipient.notification.state {
-                cyclops_proto::MessageNotificationState::NotStarted => "not started".to_string(),
-                cyclops_proto::MessageNotificationState::Gating => "checking readiness".to_string(),
-                cyclops_proto::MessageNotificationState::AttentionRequired => {
-                    "needs attention".to_string()
-                }
-                state => wire_word(serde_json::to_value(state).unwrap_or(Value::Null)),
+                None => match recipient.notification.pre_write_cause {
+                    Some(cause) => {
+                        let mut blocked =
+                            format!("wake blocked before write: {}", cause.wire_name());
+                        if let Some(updated_at) = recipient.notification.updated_at {
+                            blocked.push_str(&format!(
+                                " · waited {}",
+                                render::human_duration(render::now_ms().saturating_sub(updated_at))
+                            ));
+                        }
+                        blocked.push_str(" · ");
+                        blocked.push_str(
+                            &recipient
+                                .current_route
+                                .as_ref()
+                                .map(|route| {
+                                    format!("current route {} ({})", route.label, route.pane_id)
+                                })
+                                .unwrap_or_else(|| "route unavailable".into()),
+                        );
+                        if recipient.can_withdraw_notification {
+                            if let Some(attempt_id) = recipient.notification.attempt_id {
+                                blocked.push_str(&format!(
+                                    " · admin next: cyclops notification withdraw {attempt_id} --recipient {}",
+                                    recipient.recipient
+                                ));
+                                includes_attempt = true;
+                            }
+                        } else if recipient.direction == cyclops_proto::MessageDirection::Inbound
+                            && matches!(
+                                recipient.mailbox,
+                                cyclops_proto::MailboxEntryState::Pending
+                            )
+                        {
+                            blocked.push_str(&format!(" · next: cyclops inbox claim {message_id}"));
+                        }
+                        blocked
+                    }
+                    None => match recipient.notification.state {
+                        cyclops_proto::MessageNotificationState::NotStarted => {
+                            "not started".to_string()
+                        }
+                        cyclops_proto::MessageNotificationState::Gating => {
+                            "checking readiness".to_string()
+                        }
+                        cyclops_proto::MessageNotificationState::AttentionRequired => {
+                            "needs attention".to_string()
+                        }
+                        state => wire_word(serde_json::to_value(state).unwrap_or(Value::Null)),
+                    },
+                },
             },
-        },
+        }
     };
     if recipient.notification.resolution.is_none() {
         if let Some(intent) = recipient.notification.resolution_intent {
-            notification = copy::attention_action_uncertain(intent);
+            notification = match recipient.notification.resolution_action_accepted {
+                Some(accepted) if accepted == intent => {
+                    if intent == cyclops_proto::NotificationResolution::Complete
+                        && recipient
+                            .notification
+                            .resolution_consumption_observed
+                            .is_none()
+                    {
+                        "terminal accepted, task start unproven; no retry or reconciliation available"
+                            .to_string()
+                    } else {
+                        match recipient.notification.attempt_id {
+                            Some(attempt_id) => {
+                                includes_attempt = true;
+                                format!(
+                                    "terminal accepted the action key; {}",
+                                    copy::attention_action_uncertain(intent, attempt_id)
+                                )
+                            }
+                            None => {
+                                "terminal accepted the action key; exact attempt unavailable for reconciliation"
+                                    .to_string()
+                            }
+                        }
+                    }
+                }
+                None => {
+                    let action = match intent {
+                        cyclops_proto::NotificationResolution::Complete => "submit",
+                        cyclops_proto::NotificationResolution::Discard => "discard",
+                    };
+                    format!(
+                        "{action} intent recorded; terminal acceptance unproven; no retry or reconciliation available"
+                    )
+                }
+                Some(_) => "terminal action records disagree; no retry or reconciliation available"
+                    .to_string(),
+            };
+        } else if recipient.notification.resolution_action_accepted.is_some() {
+            notification =
+                "terminal acceptance recorded without a matching intent; no retry or reconciliation available"
+                    .to_string();
+        } else if recipient
+            .notification
+            .resolution_consumption_observed
+            .is_some()
+        {
+            notification =
+                "task start evidence recorded without matching terminal action facts; no retry or reconciliation available"
+                    .to_string();
         }
         if let Some(cause) = recipient.notification.cause {
             notification.push(':');
@@ -2078,9 +2264,11 @@ fn message_recipient_cell(
             notification.push_str(if cleared { "cleared" } else { "open" });
         }
     }
-    if let Some(attempt_id) = recipient.notification.attempt_id {
-        notification.push(' ');
-        notification.push_str(&attempt_id.to_string());
+    if !includes_attempt {
+        if let Some(attempt_id) = recipient.notification.attempt_id {
+            notification.push(' ');
+            notification.push_str(&attempt_id.to_string());
+        }
     }
     let availability = if recipient.available {
         ""
@@ -2188,6 +2376,46 @@ fn cmd_requeue(c: &mut Client, cli: &Cli, style: &Style, args: &RequeueArgs) -> 
     }
 }
 
+fn cmd_notification(c: &mut Client, cli: &Cli, style: &Style, args: &NotificationArgs) -> i32 {
+    match &args.cmd {
+        NotificationCmd::Withdraw {
+            attempt_id,
+            recipient,
+        } => {
+            let params = serde_json::to_value(cyclops_proto::NotificationWithdrawParams {
+                attempt_id: *attempt_id,
+                recipient: *recipient,
+            })
+            .expect("notification.withdraw params serialize");
+            let result: cyclops_proto::NotificationWithdrawResult = match ask(
+                c,
+                "notification.withdraw",
+                params,
+                cli.json,
+                None,
+                serde_json::from_value,
+            ) {
+                Ok(Some(result)) => result,
+                Ok(None) => return 0,
+                Err(code) => return code,
+            };
+            let verb = match result.disposition {
+                cyclops_proto::NotificationWithdrawDisposition::Withdrawn => "withdrew",
+                cyclops_proto::NotificationWithdrawDisposition::AlreadyWithdrawn => {
+                    "already withdrew"
+                }
+            };
+            println!(
+                "{verb} {} for {}; message {} remains claimable",
+                style.accent(&result.attempt_id.to_string()),
+                result.recipient,
+                style.accent(result.message_id.as_str())
+            );
+            0
+        }
+    }
+}
+
 /// The wire spelling of one serializable value, for display.
 ///
 /// Printing what the daemon sent keeps the shown word and the JSON field
@@ -2261,8 +2489,14 @@ fn confirm_age_clear<R: BufRead, W: Write>(
     Ok(answer.trim() == "clear")
 }
 
-fn clear_alarm_ids(c: &mut Client, cli: &Cli, style: &Style, ids: Vec<String>) -> i32 {
-    let params = serde_json::to_value(cyclops_proto::AlarmClearParams { ids })
+fn clear_alarm_ids(
+    c: &mut Client,
+    cli: &Cli,
+    style: &Style,
+    ids: Vec<String>,
+    cutoff_ms: Option<u64>,
+) -> i32 {
+    let params = serde_json::to_value(cyclops_proto::AlarmClearParams { ids, cutoff_ms })
         .expect("alarm.clear params serialize");
     let result: cyclops_proto::AlarmClearResult = match ask(
         c,
@@ -2297,7 +2531,7 @@ fn cmd_alarm(c: &mut Client, cli: &Cli, style: &Style, args: &AlarmArgs) -> i32 
         }
         AlarmCmd::Clear { ids, older_than } => {
             let Some(older_than) = older_than else {
-                return clear_alarm_ids(c, cli, style, ids.clone());
+                return clear_alarm_ids(c, cli, style, ids.clone(), None);
             };
             if cli.json {
                 eprintln!("{}", copy::ALARM_CLEAR_JSON_REQUIRES_CONFIRMATION);
@@ -2319,6 +2553,7 @@ fn cmd_alarm(c: &mut Client, cli: &Cli, style: &Style, args: &AlarmArgs) -> i32 
             for alarm in &result.entries {
                 println!("{}", alarm_line(&style.accent(&alarm.id), alarm));
             }
+            let cutoff_ms = result.cutoff_ms;
             let ids: Vec<String> = result.entries.into_iter().map(|alarm| alarm.id).collect();
             let confirmed = confirm_age_clear(
                 &mut std::io::stdin().lock(),
@@ -2327,7 +2562,7 @@ fn cmd_alarm(c: &mut Client, cli: &Cli, style: &Style, args: &AlarmArgs) -> i32 
                 older_than,
             );
             match confirmed {
-                Ok(true) => clear_alarm_ids(c, cli, style, ids),
+                Ok(true) => clear_alarm_ids(c, cli, style, ids, Some(cutoff_ms)),
                 Ok(false) => {
                     println!("{}", copy::ALARM_CLEARANCE_CANCELLED);
                     0
@@ -2693,6 +2928,35 @@ mod tests {
     }
 
     #[test]
+    fn health_is_a_daemon_independent_top_level_command() {
+        let parsed = Cli::try_parse_from(["cyclops", "--json", "health"]).unwrap();
+        assert!(parsed.json);
+        assert!(matches!(parsed.cmd, Some(Cmd::Health)));
+    }
+
+    #[test]
+    fn cleanup_is_dry_run_by_default_and_names_only_closed_asset_classes() {
+        let parsed = Cli::try_parse_from([
+            "cyclops",
+            "--json",
+            "cleanup",
+            "build-cache",
+            "update-scratch",
+        ])
+        .unwrap();
+        assert!(parsed.json);
+        assert!(matches!(
+            parsed.cmd,
+            Some(Cmd::Cleanup {
+                assets,
+                apply: false,
+            }) if assets == [cleanup::AssetClass::BuildCache, cleanup::AssetClass::UpdateScratch]
+        ));
+        assert!(Cli::try_parse_from(["cyclops", "cleanup", "/tmp"]).is_err());
+        assert!(Cli::try_parse_from(["cyclops", "cleanup"]).is_err());
+    }
+
+    #[test]
     fn inbox_next_recomputes_one_budget_before_each_socket_operation() {
         let start = Instant::now();
         let deadline = start.checked_add(Duration::from_millis(200)).unwrap();
@@ -2880,17 +3144,24 @@ mod tests {
                 direction: cyclops_proto::MessageDirection::Outbound,
                 needs_action: true,
                 can_manage_attention: false,
+                can_withdraw_notification: false,
+                current_route: None,
                 available: true,
                 mailbox: cyclops_proto::MailboxEntryState::Pending,
                 fifo_position: Some(2),
                 notification: cyclops_proto::MessageNotificationSummary {
                     state: cyclops_proto::MessageNotificationState::AttentionRequired,
                     quota_state: None,
+                    settlement: None,
+                    operator_withdrawn: None,
                     attempt_id: Some(attempt),
                     cause: Some(cyclops_proto::NotificationAttentionCause::VerifyFailed),
+                    pre_write_cause: None,
                     attention_cleared: Some(false),
                     resolution: None,
                     resolution_intent: None,
+                    resolution_action_accepted: None,
+                    resolution_consumption_observed: None,
                     updated_at: Some(3),
                 },
             }],
@@ -2925,11 +3196,16 @@ mod tests {
         not_started.notification = cyclops_proto::MessageNotificationSummary {
             state: cyclops_proto::MessageNotificationState::NotStarted,
             quota_state: None,
+            settlement: None,
+            operator_withdrawn: None,
             attempt_id: None,
             cause: None,
+            pre_write_cause: None,
             attention_cleared: None,
             resolution: None,
             resolution_intent: None,
+            resolution_action_accepted: None,
+            resolution_consumption_observed: None,
             updated_at: None,
         };
         assert_eq!(
@@ -2942,11 +3218,16 @@ mod tests {
         gating.notification = cyclops_proto::MessageNotificationSummary {
             state: cyclops_proto::MessageNotificationState::Gating,
             quota_state: None,
+            settlement: None,
+            operator_withdrawn: None,
             attempt_id: Some(attempt),
             cause: None,
+            pre_write_cause: None,
             attention_cleared: None,
             resolution: None,
             resolution_intent: None,
+            resolution_action_accepted: None,
+            resolution_consumption_observed: None,
             updated_at: Some(3),
         };
         assert_eq!(
@@ -2968,6 +3249,14 @@ mod tests {
         assert!(reset_cell.contains("cyclops requeue m-1"), "{reset_cell}");
         assert!(reset_cell.contains("message wide"), "{reset_cell}");
 
+        let mut withdrawn = gating.clone();
+        withdrawn.notification.state = cyclops_proto::MessageNotificationState::NotStarted;
+        withdrawn.notification.settlement =
+            Some(cyclops_proto::MessageNotificationSettlement::WithdrawnByClaim);
+        let withdrawn_cell = message_recipient_cell(&row.message_id, &withdrawn);
+        assert!(withdrawn_cell.contains("withdrawn"), "{withdrawn_cell}");
+        assert!(!withdrawn_cell.contains("notified"), "{withdrawn_cell}");
+
         let mut resolved = row.recipients[0].clone();
         resolved.notification.resolution = Some(cyclops_proto::NotificationResolution::Complete);
         assert_eq!(
@@ -2983,8 +3272,57 @@ mod tests {
         uncertain.notification.resolution_intent =
             Some(cyclops_proto::NotificationResolution::Complete);
         let cell = message_recipient_cell(&row.message_id, &uncertain);
+        assert!(cell.contains("terminal acceptance unproven"), "{cell}");
+        assert!(!cell.contains("cyclops attention complete"), "{cell}");
+
+        uncertain.notification.resolution_action_accepted =
+            Some(cyclops_proto::NotificationResolution::Complete);
+        let cell = message_recipient_cell(&row.message_id, &uncertain);
         assert!(
-            cell.contains("submit action outcome uncertain; inspect, do not retry"),
+            cell.contains("terminal accepted, task start unproven"),
+            "{cell}"
+        );
+        assert!(!cell.contains("cyclops attention complete"), "{cell}");
+
+        uncertain.notification.resolution_consumption_observed = Some(
+            cyclops_proto::NotificationResolutionConsumptionObservation {
+                evidence: cyclops_proto::NotificationResolutionConsumptionEvidence::WorkingEdge,
+                observed_at_ms: 4,
+            },
+        );
+        let cell = message_recipient_cell(&row.message_id, &uncertain);
+        assert!(cell.contains("terminal accepted the action key"), "{cell}");
+        assert!(cell.contains("cyclops attention complete"), "{cell}");
+        assert!(
+            cell.contains("rechecks without sending a second key"),
+            "{cell}"
+        );
+
+        uncertain.notification.resolution_intent =
+            Some(cyclops_proto::NotificationResolution::Discard);
+        uncertain.notification.resolution_action_accepted =
+            Some(cyclops_proto::NotificationResolution::Discard);
+        uncertain.notification.resolution_consumption_observed = None;
+        let cell = message_recipient_cell(&row.message_id, &uncertain);
+        assert!(cell.contains("terminal accepted the action key"), "{cell}");
+        assert!(cell.contains("cyclops attention discard"), "{cell}");
+
+        let mut worker_failed = gating.clone();
+        worker_failed.can_withdraw_notification = true;
+        worker_failed.current_route = Some(cyclops_proto::MessageRecipientRoute {
+            label: "reviewer-now".into(),
+            pane_id: "%1".parse().unwrap(),
+        });
+        worker_failed.notification.pre_write_cause =
+            Some(cyclops_proto::NotificationPreWriteCause::WorkerFailed);
+        let cell = message_recipient_cell(&row.message_id, &worker_failed);
+        assert!(cell.contains("worker_failed"), "{cell}");
+        assert!(cell.contains("waited "), "{cell}");
+        assert!(cell.contains("current route reviewer-now (%1)"), "{cell}");
+        assert!(
+            cell.contains(
+                "admin next: cyclops notification withdraw att-00000000-0000-4000-8000-000000000001"
+            ),
             "{cell}"
         );
     }
@@ -3037,6 +3375,7 @@ mod tests {
             state,
             notification_state: None,
             quota_state: None,
+            notification_settlement: None,
             position: None,
             note: None,
             pane: None,

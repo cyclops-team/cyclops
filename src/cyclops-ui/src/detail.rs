@@ -10,6 +10,8 @@
 //! an open confirmation and the confirmation still names what the
 //! operator read.
 
+use cyclops_proto::{MessageRecipientRoute, NotificationPreWriteCause, NotificationResolution};
+
 use crate::queue::{Direction, FrozenTarget, MailboxWord, QueueRow, WakeWord};
 
 /// What a detail can be asked to do.
@@ -19,6 +21,8 @@ use crate::queue::{Direction, FrozenTarget, MailboxWord, QueueRow, WakeWord};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Reply,
+    /// Retire one exact wake that the daemon proved never wrote terminal bytes.
+    WithdrawNotification,
     /// Acknowledge an alarm.
     ClearAlarm,
     AttentionComplete,
@@ -29,6 +33,7 @@ impl Action {
     pub fn word(self) -> &'static str {
         match self {
             Action::Reply => "reply",
+            Action::WithdrawNotification => "withdraw pre-write wake",
             Action::ClearAlarm => "clear alarm",
             Action::AttentionComplete => "submit staged notification",
             Action::AttentionDiscard => "discard staged notification",
@@ -237,14 +242,27 @@ pub struct Detail {
     /// This attempt has been resolved, by this operator or another one.
     /// Terminal actions never come back.
     resolved: bool,
-    /// A terminal verb was sent and its outcome is unknown, so neither
-    /// terminal verb may be offered again.
+    /// A terminal verb was attempted and its outcome is unknown. Fresh
+    /// terminal actions stay blocked. Intent alone exposes no action.
     terminal_unknown: bool,
+    /// Exact durable action intended before any terminal key.
+    resolution_intent: Option<NotificationResolution>,
+    /// Exact durable action key the terminal accepted.
+    resolution_action_accepted: Option<NotificationResolution>,
+    /// Durable proof that an accepted Complete action started its turn.
+    resolution_consumption_observed:
+        Option<cyclops_proto::NotificationResolutionConsumptionObservation>,
     /// The reader is typing a reply. Keys go to the draft while it is on.
     composing: bool,
-    /// The daemon's answer, frozen with the row: may THIS reader resolve
-    /// THIS recipient's alarm. Never inferred from anything on screen.
+    /// The daemon's answer, frozen with the row: may THIS reader start a
+    /// fresh resolution for THIS recipient's alarm. Never inferred from
+    /// anything on screen. Matching durable-intent reconciliation is separate.
     can_manage_attention: bool,
+    /// The daemon's answer for this exact unwritten wake and authenticated caller.
+    can_withdraw_notification: bool,
+    pre_write_cause: Option<NotificationPreWriteCause>,
+    current_route: Option<MessageRecipientRoute>,
+    fifo_position: Option<u64>,
 }
 
 /// Has this attempt already reached a terminal outcome?
@@ -263,9 +281,9 @@ fn resolved_from(wake: WakeWord) -> bool {
 
 /// Did a terminal action cross its write boundary without an outcome?
 ///
-/// Distinct from resolved: nobody knows what happened, so the pane needs
-/// a human eye rather than another verb. Both retire the terminal
-/// actions, for different reasons.
+/// Distinct from resolved: nobody knows what happened, so fresh terminal
+/// actions stay blocked. Matching durable intent and terminal acceptance
+/// may expose only exact same-action no-key reconciliation.
 fn terminal_unknown_from(wake: WakeWord) -> bool {
     matches!(wake, WakeWord::ActionUncertain)
 }
@@ -280,6 +298,10 @@ impl Detail {
                 watermark,
             },
             can_manage_attention: row.can_manage_attention,
+            can_withdraw_notification: row.can_withdraw_notification,
+            pre_write_cause: row.pre_write_cause,
+            current_route: row.current_route.clone(),
+            fifo_position: row.fifo_position,
             message_id: row.message_id.to_string(),
             recipient_label: row.recipient_label.clone(),
             subject: row.subject.clone(),
@@ -295,6 +317,9 @@ impl Detail {
             scroll: 0,
             resolved: resolved_from(row.wake),
             terminal_unknown: terminal_unknown_from(row.wake),
+            resolution_intent: row.resolution_intent,
+            resolution_action_accepted: row.resolution_action_accepted,
+            resolution_consumption_observed: row.resolution_consumption_observed,
             composing: false,
         }
     }
@@ -375,6 +400,11 @@ impl Detail {
         ) {
             self.terminal_unknown = true;
         }
+        if action == Some(Action::WithdrawNotification) {
+            // The exact withdrawal is idempotent, but a timeout still owes a
+            // fresh snapshot before the UI offers any mutation again.
+            self.can_withdraw_notification = false;
+        }
         self.needs_reload = false;
         self.stage = Stage::Uncertain {
             action,
@@ -399,6 +429,9 @@ impl Detail {
         self.needs_reload = false;
         if code == "conflict" {
             self.resolved = true;
+        }
+        if action == Some(Action::WithdrawNotification) {
+            self.can_withdraw_notification = false;
         }
         self.stage = Stage::Failed {
             action,
@@ -446,9 +479,21 @@ impl Detail {
                 if row.mailbox != self.mailbox
                     || row.wake != self.wake
                     || row.attention != self.target.attempt
+                    || row.resolution_intent != self.resolution_intent
+                    || row.resolution_action_accepted != self.resolution_action_accepted
+                    || row.resolution_consumption_observed != self.resolution_consumption_observed
+                    || row.pre_write_cause != self.pre_write_cause
+                    || row.current_route != self.current_route
+                    || row.fifo_position != self.fifo_position
                 {
                     self.mailbox = row.mailbox;
                     self.wake = row.wake;
+                    self.resolution_intent = row.resolution_intent;
+                    self.resolution_action_accepted = row.resolution_action_accepted;
+                    self.resolution_consumption_observed = row.resolution_consumption_observed;
+                    self.pre_write_cause = row.pre_write_cause;
+                    self.current_route = row.current_route.clone();
+                    self.fifo_position = row.fifo_position;
                     self.needs_reload = true;
                     self.evidence_stale = true;
                 }
@@ -458,6 +503,8 @@ impl Detail {
                 // and a snapshot that predates it must not re-offer them.
                 self.resolved |= resolved_from(row.wake);
                 self.terminal_unknown |= terminal_unknown_from(row.wake);
+                self.can_manage_attention &= row.can_manage_attention;
+                self.can_withdraw_notification &= row.can_withdraw_notification;
             }
         }
     }
@@ -500,6 +547,20 @@ impl Detail {
         self.wake
     }
 
+    pub fn resolution_intent(&self) -> Option<NotificationResolution> {
+        self.resolution_intent
+    }
+
+    pub fn resolution_action_accepted(&self) -> Option<NotificationResolution> {
+        self.resolution_action_accepted
+    }
+
+    pub fn resolution_consumption_observed(
+        &self,
+    ) -> Option<cyclops_proto::NotificationResolutionConsumptionObservation> {
+        self.resolution_consumption_observed
+    }
+
     pub fn scroll(&self) -> usize {
         self.scroll
     }
@@ -524,7 +585,25 @@ impl Detail {
         {
             return Vec::new();
         }
+        if let Some(action) = self.reconciliation_action() {
+            return if self.target.attempt.is_some() && !self.evidence_stale {
+                vec![action]
+            } else {
+                Vec::new()
+            };
+        }
         let mut out = Vec::new();
+        if self.can_withdraw_notification
+            && self.target.attempt.is_some()
+            && !self.evidence_stale
+            && self.mailbox == MailboxWord::Pending
+            && matches!(
+                self.wake,
+                WakeWord::Queued | WakeWord::Gating | WakeWord::BlockedBeforeWrite
+            )
+        {
+            out.push(Action::WithdrawNotification);
+        }
         // A row is a message that may ALSO carry an alarm. Both sets come
         // from one detail now, because the identity no longer decides
         // which kind of thing this is.
@@ -564,14 +643,57 @@ impl Detail {
         out
     }
 
-    /// May this reader resolve this row's alarm? The daemon's answer,
-    /// frozen at open.
+    /// May this reader start a fresh resolution? The daemon's answer,
+    /// frozen at open. Accepted-action reconciliation is separate.
     pub fn can_manage_attention(&self) -> bool {
         self.can_manage_attention
     }
 
+    /// May this reader withdraw this exact unwritten wake?
+    pub fn can_withdraw_notification(&self) -> bool {
+        self.can_withdraw_notification
+    }
+
     pub fn allows(&self, action: Action) -> bool {
         self.allowed().contains(&action)
+    }
+
+    /// Human copy for an action in this detail's current mode.
+    pub fn action_word(&self, action: Action) -> &'static str {
+        if self.reconciliation_action() == Some(action) {
+            match action {
+                Action::AttentionComplete => "reconcile prior uncertain submit",
+                Action::AttentionDiscard if self.resolution_action_accepted.is_none() => {
+                    "reconcile exact-empty discard without a key"
+                }
+                Action::AttentionDiscard => "reconcile prior uncertain discard",
+                _ => unreachable!("only terminal actions have durable intents"),
+            }
+        } else {
+            action.word()
+        }
+    }
+
+    fn reconciliation_action(&self) -> Option<Action> {
+        if self.wake != WakeWord::ActionUncertain || self.resolved {
+            return None;
+        }
+        let intent = self.resolution_intent?;
+        match intent {
+            NotificationResolution::Complete
+                if self.resolution_action_accepted == Some(intent)
+                    && self.resolution_consumption_observed.is_some() =>
+            {
+                Some(Action::AttentionComplete)
+            }
+            NotificationResolution::Discard
+                if self.resolution_action_accepted.is_none()
+                    || self.resolution_action_accepted == Some(intent) =>
+            {
+                Some(Action::AttentionDiscard)
+            }
+            _ => None,
+        }
     }
 
     /// Ask for an action. Returns what the caller must do next.
@@ -602,6 +724,11 @@ impl Detail {
         if action == Action::Reply {
             self.draft = Draft::default();
         }
+        if action == Action::WithdrawNotification {
+            self.can_withdraw_notification = false;
+            self.wake = WakeWord::WithdrawnByOperator;
+            self.pre_write_cause = None;
+        }
         self.loaded.claim_note = Some(note.into());
         self.stage = Stage::Open;
     }
@@ -628,7 +755,8 @@ impl Detail {
             // token, so the detail never learned it had succeeded, the
             // queue was never re-read, and the row went on reading "needs
             // attention" until a reconnect. The operator's next move is to
-            // reopen and run the same terminal verb again. Esc waits.
+            // reopen and inspect current durable state. Only a recorded
+            // intent may expose matching no-key reconciliation. Esc waits.
             Stage::Acting(_) => Back::Cancelled,
             _ => Back::Closed,
         }
@@ -636,6 +764,18 @@ impl Detail {
 
     /// The sentence an operator says yes to. Names the exact target.
     pub fn confirmation(&self, action: Action) -> String {
+        if self.reconciliation_action() == Some(action) {
+            let attempt = self
+                .target
+                .attempt
+                .expect("a reconciliation action requires one exact attempt");
+            return format!(
+                "{} for {} at seq {}; no second key will be sent. y to confirm, esc to cancel",
+                self.action_word(action),
+                attempt,
+                self.target.watermark
+            );
+        }
         // The exact thing the action will name, which for the attention
         // verbs is the attempt and NOT the message. Once identity became
         // the row, naming the row here would have asked the operator to
@@ -643,6 +783,15 @@ impl Detail {
         // id they were never shown. A confirmation that names something
         // other than what it does is worse than no confirmation.
         let what = match (self.target.attempt, action) {
+            (Some(attempt), Action::WithdrawNotification) => {
+                return format!(
+                    "{} {} for {} at seq {}? y to confirm, esc to cancel",
+                    action.word(),
+                    attempt,
+                    self.target.target.recipient,
+                    self.target.watermark
+                );
+            }
             (Some(attempt), Action::ClearAlarm)
             | (Some(attempt), Action::AttentionComplete)
             | (Some(attempt), Action::AttentionDiscard) => attempt.to_string(),
@@ -650,7 +799,7 @@ impl Detail {
         };
         format!(
             "{} {} at seq {}? y to confirm, esc to cancel",
-            action.word(),
+            self.action_word(action),
             what,
             self.target.watermark
         )
@@ -837,6 +986,29 @@ pub(crate) fn render_with_status(
     let mut body: Vec<String> = Vec::new();
 
     match detail.wake() {
+        WakeWord::BlockedBeforeWrite => {
+            let reason = match detail.pre_write_cause {
+                Some(cause) => cause.label(),
+                None => "reason unavailable",
+            };
+            body.push(format!("wake blocked before write: {reason}"));
+            body.push(format!(
+                "mailbox position: {}",
+                detail
+                    .fifo_position
+                    .map(|position| position.to_string())
+                    .unwrap_or_else(|| "unavailable".into())
+            ));
+            body.push(match &detail.current_route {
+                Some(route) => format!("current route: {} ({})", route.label, route.pane_id),
+                None => "current route: unavailable".into(),
+            });
+            body.push(String::new());
+        }
+        WakeWord::WithdrawnByOperator => {
+            body.push("wake withdrawn by admin; message remains claimable".into());
+            body.push(String::new());
+        }
         WakeWord::QuotaHeld => {
             body.push(
                 "quota held: wait for a quota reset; delivery will not resume automatically".into(),
@@ -852,6 +1024,57 @@ pub(crate) fn render_with_status(
             body.push(String::new());
         }
         _ => {}
+    }
+
+    if let Some(intent) = detail.resolution_intent() {
+        let action = match intent {
+            NotificationResolution::Complete => "submit",
+            NotificationResolution::Discard => "discard",
+        };
+        match detail.resolution_action_accepted() {
+            Some(accepted) if accepted == intent => {
+                if intent == NotificationResolution::Complete
+                    && detail.resolution_consumption_observed().is_none()
+                {
+                    body.push("terminal accepted, task start unproven".into());
+                    body.push("no submit or reconciliation action is available".into());
+                } else {
+                    body.push(format!(
+                        "terminal accepted the {action} action; final outcome remains uncertain"
+                    ));
+                    if intent == NotificationResolution::Complete {
+                        body.push("matching task start observed".into());
+                    }
+                    body.push(
+                        "only same-action reconciliation is available; no second key is sent"
+                            .into(),
+                    );
+                }
+            }
+            None => {
+                body.push(format!(
+                    "{action} intent recorded; terminal acceptance is unproven"
+                ));
+                if intent == NotificationResolution::Discard {
+                    body.push("exact-empty no-key discard reconciliation is available".into());
+                    body.push(
+                        "the daemon rechecks the exact binding and empty composer twice; no terminal key is sent"
+                            .into(),
+                    );
+                } else {
+                    body.push("no submit, discard, or reconciliation action is available".into());
+                }
+            }
+            Some(_) => {
+                body.push("terminal intent and accepted action records disagree".into());
+                body.push("no submit, discard, or reconciliation action is available".into());
+            }
+        }
+        body.push(String::new());
+    } else if detail.resolution_action_accepted().is_some() {
+        body.push("terminal acceptance recorded without a matching intent".into());
+        body.push("no submit, discard, or reconciliation action is available".into());
+        body.push(String::new());
     }
 
     if let Some(note) = &detail.loaded().claim_note {
@@ -1007,19 +1230,19 @@ pub(crate) fn render_with_status(
         // press could be refused, or could hide that the first landed.
         Stage::NotSent { action, why } => format!(
             "{} was not sent: {why}. nothing changed",
-            action.map(|a| a.word()).unwrap_or("the read")
+            action.map(|a| detail.action_word(a)).unwrap_or("the read")
         ),
         // Whatever is still safe is named and numbered here. A key that
         // works while the screen offers nothing is a key nobody knows
         // they have. The terminal verbs are already gone from allowed by
         // the time this renders, so what is listed is what may repeat.
         Stage::Uncertain { action, why } => {
-            let what = action.map(|a| a.word()).unwrap_or("the read");
+            let what = action.map(|a| detail.action_word(a)).unwrap_or("the read");
             let safe: Vec<String> = detail
                 .allowed()
                 .iter()
                 .enumerate()
-                .map(|(i, a)| format!("{} {}", i + 1, a.word()))
+                .map(|(i, a)| format!("{} {}", i + 1, detail.action_word(*a)))
                 .collect();
             if safe.is_empty() {
                 format!("{what} may have landed: {why}. esc, then reopen to see")
@@ -1037,7 +1260,7 @@ pub(crate) fn render_with_status(
                 .allowed()
                 .iter()
                 .enumerate()
-                .map(|(i, a)| format!("{} {}", i + 1, a.word()))
+                .map(|(i, a)| format!("{} {}", i + 1, detail.action_word(*a)))
                 .collect();
             if actions.is_empty() {
                 "no actions available".to_string()

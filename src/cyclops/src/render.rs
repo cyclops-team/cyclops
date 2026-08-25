@@ -19,8 +19,9 @@ use std::path::Path;
 use serde_json::Value;
 
 use cyclops_proto::{
-    AgentState, Attention, AttentionItem, Delivery, DeliveryReceipt, DeliveryState, Detection,
-    Event, Kind, LedgerLine, PaneStatus, Sensor, StatusResult,
+    AgentState, Attention, AttentionItem, ComposerMessageState, ComposerNextAction, ComposerProof,
+    ComposerState, Delivery, DeliveryReceipt, DeliveryState, Detection, Event, Kind, LedgerLine,
+    NotificationState, PaneStatus, Sensor, StatusResult,
 };
 use cyclops_ui::grid;
 
@@ -94,7 +95,129 @@ struct Row {
     adopted: bool,
     state: AgentState,
     detail: Option<String>,
+    facts: Vec<String>,
     session: usize,
+}
+
+fn composer_words(state: ComposerState) -> &'static str {
+    match state {
+        ComposerState::ComposerClean => "clean",
+        ComposerState::HumanDraft => "human draft",
+        ComposerState::VendorGhostSuggestion => "vendor ghost suggestion",
+        ComposerState::CyclopsNotificationStaged => "Cyclops notification staged",
+        ComposerState::CyclopsNotificationSubmitted => "Cyclops notification submitted",
+        ComposerState::ComposerAmbiguous => "ambiguous",
+    }
+}
+
+fn notification_words(state: NotificationState) -> &'static str {
+    match state {
+        NotificationState::Queued => "queued",
+        NotificationState::Gating => "checking readiness",
+        NotificationState::BlockedPreWrite => "blocked before write",
+        NotificationState::QuotaHeld => "quota held",
+        NotificationState::QuotaResetObserved => "quota reset observed",
+        NotificationState::Writing => "writing",
+        NotificationState::Staged => "waiting for submit",
+        NotificationState::Submitting => "submit intent recorded",
+        NotificationState::Submitted => "submitted",
+        NotificationState::Notified => "notified",
+        NotificationState::AttentionRequired => "needs attention",
+        NotificationState::Withdrawn => "withdrawn",
+        NotificationState::WithdrawnAfterStaging => "withdrawn after staging",
+        NotificationState::WithdrawnByOperator => "withdrawn by operator",
+        NotificationState::Superseded => "superseded",
+    }
+}
+
+fn message_words(state: ComposerMessageState) -> &'static str {
+    match state {
+        ComposerMessageState::Pending => "pending",
+        ComposerMessageState::Claimed => "claimed",
+        ComposerMessageState::DeliveredDirect => "delivered direct",
+        ComposerMessageState::Superseded => "superseded",
+    }
+}
+
+fn next_action_words(pane: &PaneStatus, action: ComposerNextAction) -> String {
+    match action {
+        ComposerNextAction::AutomaticSubmit => "automatic submit".into(),
+        ComposerNextAction::AutomaticReconcile => "automatic reconcile".into(),
+        ComposerNextAction::InspectAttention => pane
+            .notification_attempt
+            .map(|attempt| format!("workspace admin: cyclops attention show {attempt} --diff"))
+            .unwrap_or_else(|| "cyclops messages".into()),
+        ComposerNextAction::InspectMessages => "cyclops messages".into(),
+        ComposerNextAction::CheckHealth => "cyclops health".into(),
+    }
+}
+
+/// Additional status facts when runtime state alone would hide useful truth.
+fn status_fact_rows(pane: &PaneStatus, style: &Style) -> Vec<String> {
+    let composer_is_observed = pane.composer_proof != ComposerProof::Unprovable
+        || pane.notification_attempt.is_some()
+        || pane.composer_reason.is_some();
+    let composer_needs_detail = pane.composer != ComposerState::ComposerClean
+        && pane.composer != ComposerState::VendorGhostSuggestion;
+    let show_composer = composer_is_observed
+        && (composer_needs_detail
+            || pane.composer == ComposerState::VendorGhostSuggestion
+            || pane.notification_state.is_some());
+    let show_readiness = show_composer || pane.write_block.is_some();
+    let show_runtime_certainty =
+        pane.state == AgentState::Working && pane.working_confirmed.is_some();
+    if !show_composer
+        && !show_readiness
+        && pane.notification_state.is_none()
+        && !show_runtime_certainty
+    {
+        return Vec::new();
+    }
+
+    let mut facts = Vec::new();
+    if show_runtime_certainty {
+        facts.push(format!(
+            "runtime working: {}",
+            if pane.working_confirmed == Some(true) {
+                "confirmed"
+            } else {
+                "provisional"
+            }
+        ));
+    }
+    if show_composer {
+        facts.push(format!("composer {}", composer_words(pane.composer)));
+    }
+    if let Some(reason) = pane.composer_reason.as_deref() {
+        facts.push(format!("composer reason {reason}"));
+    }
+    if pane.composer_candidates > 1 {
+        facts.push(format!(
+            "{} active notification barriers",
+            pane.composer_candidates
+        ));
+    }
+    if show_readiness {
+        facts.push(match (&pane.write_block, pane.write_ready) {
+            (_, true) => "write readiness ready".to_string(),
+            (Some(reason), false) => format!("write readiness held: {reason}"),
+            (None, false) => "write readiness held: evidence unavailable".to_string(),
+        });
+    }
+    if let Some(state) = pane.notification_state {
+        facts.push(format!("notification {}", notification_words(state)));
+    }
+    if let Some(state) = pane.message_state {
+        facts.push(format!("message {}", message_words(state)));
+    }
+    if let Some(action) = pane.next_action {
+        facts.push(format!("next action {}", next_action_words(pane, action)));
+    }
+    if let Some(attempt) = pane.notification_attempt {
+        facts.push(format!("attempt {attempt}"));
+    }
+
+    vec![format!("    {}", style.dim(&facts.join(" · ")))]
 }
 
 /// The pane title when it says something the row does not already say.
@@ -171,17 +294,10 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
     } else {
         names.join(", ")
     };
-    // The eye is the one attention device (GOALS: stream header, pane
-    // badges, and status), and this surface reads it rather than deciding
-    // it: the register composes the cell and the words, the stream header
-    // asks the same register, and neither can be edited alone.
-    //
-    // Scope: the register is built from THIS answer. `open_deliveries`
-    // rides `status` only for a caller that asks for it, so an answer
-    // without the backlog counts panes alone and understates, which is the
-    // safe direction for an alarm. Everything it does count gets a row
-    // below, so the number is never bare.
-    let attention = Attention::from_status(res);
+    // Normal status reports the live pane fleet. Durable delivery alarms
+    // remain in the mailbox, alarm, and stream surfaces that can act on
+    // them. The named constructor makes that scope an explicit decision.
+    let attention = Attention::from_live_status(res);
     let eye = attention.header();
     let mut header = format!(
         "{} {} {sep} watching {watching} {sep} tmux {} {sep} up {}",
@@ -209,6 +325,7 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
                 config_path.display()
             ),
         ];
+        out.extend(blocked_notification_rows(res, style));
         out.extend(diagnostic_rows(res, style));
         out.extend(waiting_rows(&attention, res, style));
         return out.join("\n");
@@ -238,6 +355,7 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
                 adopted,
                 state: p.state,
                 detail,
+                facts: status_fact_rows(p, style),
                 session: si,
             });
         }
@@ -268,12 +386,80 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
                 state_w,
                 style,
             ));
+            out.extend(r.facts.iter().cloned());
         }
     }
     out.extend(unknown_rows(res, style));
+    out.extend(blocked_notification_rows(res, style));
     out.extend(diagnostic_rows(res, style));
     out.extend(waiting_rows(&attention, res, style));
     out.join("\n")
+}
+
+fn blocked_notification_rows(res: &StatusResult, style: &Style) -> Vec<String> {
+    if res.blocked_notifications.is_empty() {
+        return Vec::new();
+    }
+    let mut rows = vec![
+        String::new(),
+        format!("  {}", style.dim("wake blocked before write")),
+    ];
+    for item in &res.blocked_notifications {
+        let reason = match item.recipient.notification.pre_write_cause {
+            Some(cause) => cause.label(),
+            None => "reason unavailable",
+        };
+        let position = item
+            .recipient
+            .fifo_position
+            .map(|position| format!("FIFO {position}"))
+            .unwrap_or_else(|| "FIFO position unavailable".into());
+        let route = item
+            .recipient
+            .current_route
+            .as_ref()
+            .map(|route| format!("{} ({})", route.label, route.pane_id))
+            .unwrap_or_else(|| "route unavailable".into());
+        rows.push(format!(
+            "  {} {} · {reason} · waited {} · {position} · {route}",
+            style.role(&item.recipient.label, &item.recipient.label),
+            style.accent(item.message_id.as_str()),
+            human_duration(item.waiting_age_ms)
+        ));
+        let next = match item.next_action {
+            Some(cyclops_proto::StatusNextAction::WithdrawNotification) => format!(
+                "workspace admin: cyclops notification withdraw {} --recipient {}",
+                item.notification_attempt, item.recipient.recipient
+            ),
+            None => "recipient claim or cyclops messages inspection".into(),
+        };
+        rows.push(format!(
+            "  {}",
+            style.dim(&format!(
+                "Attempt {} · next: {next}",
+                item.notification_attempt
+            ))
+        ));
+        rows.push(format!(
+            "  {}",
+            style.dim(&format!(
+                "Message remains claimable from its recipient pane: cyclops inbox claim {}",
+                item.message_id
+            ))
+        ));
+    }
+    let omitted = res
+        .blocked_notifications_total
+        .saturating_sub(res.blocked_notifications.len() as u64);
+    if omitted > 0 {
+        rows.push(format!(
+            "  {}",
+            style.dim(&format!(
+                "{omitted} more blocked wakes · next: cyclops messages"
+            ))
+        ));
+    }
+    rows
 }
 
 fn diagnostic_rows(res: &StatusResult, style: &Style) -> Vec<String> {
@@ -282,11 +468,33 @@ fn diagnostic_rows(res: &StatusResult, style: &Style) -> Vec<String> {
         .iter()
         .filter(|diagnostic| diagnostic.code == "deadlock_risk")
         .collect();
-    if risks.is_empty() {
+    let worker_failures: Vec<_> = res
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "notification_worker_failed")
+        .collect();
+    let settlement_failures: Vec<_> = res
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "notification_settlement_storage_failed")
+        .collect();
+    let recovery_failures: Vec<_> = res
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "notification_recovery_storage_failed")
+        .collect();
+    if risks.is_empty()
+        && worker_failures.is_empty()
+        && settlement_failures.is_empty()
+        && recovery_failures.is_empty()
+    {
         return Vec::new();
     }
 
-    let mut rows = vec![String::new(), format!("  {}", style.dim("deadlock risk"))];
+    let mut rows = Vec::new();
+    if !risks.is_empty() {
+        rows.extend([String::new(), format!("  {}", style.dim("deadlock risk"))]);
+    }
     for risk in risks {
         rows.push(format!(
             "  {} {} {} · cyclops watch holds this pane working while its notification is gated",
@@ -301,6 +509,64 @@ fn diagnostic_rows(res: &StatusResult, style: &Style) -> Vec<String> {
                 risk.recipient_label, risk.pane_id
             ))
         ));
+    }
+    if !worker_failures.is_empty() {
+        rows.extend([
+            String::new(),
+            format!("  {}", style.dim("notification worker failure")),
+        ]);
+        for failure in worker_failures {
+            rows.push(format!(
+                "  {} {} {} · delivery stopped and will not restart automatically",
+                style.role(&failure.recipient_label, &failure.recipient_label),
+                style.dim(&failure.pane_id),
+                style.accent(failure.message_id.as_str())
+            ));
+        }
+    }
+    if !settlement_failures.is_empty() {
+        rows.extend([
+            String::new(),
+            format!("  {}", style.dim("notification settlement blocked")),
+        ]);
+        for failure in settlement_failures {
+            rows.push(format!(
+                "  {} {} {} {} · state storage refused the final settlement",
+                style.role(&failure.recipient_label, &failure.recipient_label),
+                style.dim(&failure.pane_id),
+                style.accent(failure.message_id.as_str()),
+                style.accent(&failure.notification_attempt.to_string())
+            ));
+            rows.push(format!(
+                "  {}",
+                style.dim(&format!(
+                    "Run cyclops health, repair state storage, then run cyclops daemon restart to reconcile {}",
+                    failure.notification_attempt
+                ))
+            ));
+        }
+    }
+    if !recovery_failures.is_empty() {
+        rows.extend([
+            String::new(),
+            format!("  {}", style.dim("notification recovery blocked")),
+        ]);
+        for failure in recovery_failures {
+            rows.push(format!(
+                "  {} {} {} {} · state storage refused recovery; this attempt still owns the FIFO",
+                style.role(&failure.recipient_label, &failure.recipient_label),
+                style.dim(&failure.pane_id),
+                style.accent(failure.message_id.as_str()),
+                style.accent(&failure.notification_attempt.to_string())
+            ));
+            rows.push(format!(
+                "  {}",
+                style.dim(&format!(
+                    "Run cyclops health, repair state storage, then run cyclops daemon restart to reconcile {}",
+                    failure.notification_attempt
+                ))
+            ));
+        }
     }
     rows
 }
@@ -347,7 +613,10 @@ fn unmanaged_shell(pane: &PaneStatus) -> bool {
     pane.agent.is_none()
         && pane.manifest.is_none()
         && pane.state == AgentState::Unknown
-        && matches!(pane.current_command.as_str(), "bash" | "fish" | "sh" | "zsh")
+        && matches!(
+            pane.current_command.as_str(),
+            "bash" | "fish" | "sh" | "zsh"
+        )
 }
 
 /// The roster: one row per named agent, on the same grid as `status`.
@@ -603,6 +872,7 @@ fn waiting_rows(attention: &Attention, res: &StatusResult, style: &Style) -> Vec
                 state: *state,
                 notification_state: None,
                 quota_state: None,
+                notification_settlement: None,
                 position: None,
                 note: None,
                 // The eye counts items from the record, which names the
@@ -1087,10 +1357,19 @@ mod tests {
             in_mode: false,
             write_ready: false,
             write_block: None,
+            composer: cyclops_proto::ComposerState::ComposerAmbiguous,
+            composer_proof: cyclops_proto::ComposerProof::Unprovable,
+            notification_attempt: None,
+            composer_reason: None,
+            composer_candidates: 0,
+            notification_state: None,
+            message_state: None,
+            next_action: None,
             width: 120,
             height: 40,
             state,
             state_ms: None,
+            working_confirmed: None,
             hooks_verified: None,
             manifest_display_name: None,
         }
@@ -1106,6 +1385,7 @@ mod tests {
         cyclops_proto::OpenDelivery {
             id: id.into(),
             to: to.into(),
+            recipient: None,
             state,
             ts: 0,
             cause: Some(
@@ -1121,6 +1401,9 @@ mod tests {
     fn fixture() -> StatusResult {
         StatusResult {
             daemon_version: "0.1.0".into(),
+            daemon_build: None,
+            daemon_process: None,
+            daemon_executable: None,
             proto: 1,
             boot_id: "b-test".into(),
             uptime_ms: 2 * 60 * 1000,
@@ -1151,12 +1434,15 @@ mod tests {
                     pane("%4", None, None, "", "vim", AgentState::Unknown),
                 ],
             }],
+            mailbox_routes: Vec::new(),
             admin_unread: 0,
             // The daemon serves this half only when the caller asks for
             // it. An answer without it counts panes alone, which is what
             // the calm-rig cases below pin.
             open_deliveries: Vec::new(),
             diagnostics: Vec::new(),
+            blocked_notifications: Vec::new(),
+            blocked_notifications_total: 0,
             manifests: Some(cyclops_proto::Manifests {
                 ids: vec!["agy".into(), "claude".into(), "codex".into()],
                 dir: Some("/x/manifests".into()),
@@ -1192,6 +1478,198 @@ mod tests {
     }
 
     #[test]
+    fn status_does_not_hide_an_owned_notification_behind_runtime_idle() {
+        let mut status = fixture();
+        let pane = &mut status.sessions[0].panes[1];
+        pane.write_block = Some("composer_hold".into());
+        pane.composer = ComposerState::CyclopsNotificationStaged;
+        pane.composer_proof = ComposerProof::ExactNotification;
+        pane.notification_attempt =
+            Some("att-00000000-0000-4000-8000-000000000001".parse().unwrap());
+        pane.notification_state = Some(NotificationState::Staged);
+        pane.message_state = Some(ComposerMessageState::Pending);
+        pane.next_action = Some(ComposerNextAction::AutomaticSubmit);
+
+        let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
+        assert!(rendered.contains("implementer  ○ idle"), "{rendered}");
+        assert!(
+            rendered.contains("composer Cyclops notification staged"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("write readiness held: composer_hold"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("notification waiting for submit"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("message pending"), "{rendered}");
+        assert!(
+            rendered.contains("next action automatic submit"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn status_distinguishes_provisional_working_and_names_ambiguity_recovery() {
+        let mut status = fixture();
+        let pane = &mut status.sessions[0].panes[0];
+        pane.working_confirmed = Some(false);
+        pane.composer = ComposerState::ComposerAmbiguous;
+        pane.composer_proof = ComposerProof::Unprovable;
+        pane.notification_attempt =
+            Some("att-00000000-0000-4000-8000-000000000001".parse().unwrap());
+        pane.composer_reason = Some("composer_capture_unprovable".into());
+        pane.composer_candidates = 1;
+        pane.notification_state = Some(NotificationState::Submitting);
+        pane.message_state = Some(ComposerMessageState::Pending);
+        pane.next_action = Some(ComposerNextAction::CheckHealth);
+
+        let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
+        assert!(
+            rendered.contains("runtime working: provisional"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("composer reason composer_capture_unprovable"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("notification submit intent recorded"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("next action cyclops health"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn status_offers_attention_inspection_only_for_an_attention_attempt() {
+        let mut status = fixture();
+        {
+            let pane = &mut status.sessions[0].panes[1];
+            pane.notification_attempt =
+                Some("att-00000000-0000-4000-8000-000000000001".parse().unwrap());
+            pane.notification_state = Some(NotificationState::AttentionRequired);
+            pane.next_action = Some(ComposerNextAction::InspectAttention);
+        }
+
+        let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
+        assert!(
+            rendered.contains(
+                "next action workspace admin: cyclops attention show att-00000000-0000-4000-8000-000000000001 --diff"
+            ),
+            "{rendered}"
+        );
+
+        status.sessions[0].panes[1].notification_attempt = None;
+        let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
+        assert!(
+            rendered.contains("next action cyclops messages"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("cyclops attention show"), "{rendered}");
+    }
+
+    #[test]
+    fn status_names_a_blocked_wake_without_exposing_message_content() {
+        let workspace = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let session = "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let recipient =
+            cyclops_proto::RecipientKey::agent(workspace, session, "%1".parse().unwrap());
+        let attempt = "att-00000000-0000-4000-8000-000000000001".parse().unwrap();
+        let mut status = fixture();
+        status
+            .blocked_notifications
+            .push(cyclops_proto::StatusBlockedNotification {
+                message_id: "m-blocked".parse().unwrap(),
+                notification_attempt: attempt,
+                recipient: cyclops_proto::MessageRecipientSummary {
+                    recipient,
+                    label: "reviewer".into(),
+                    direction: cyclops_proto::MessageDirection::Outbound,
+                    needs_action: true,
+                    can_manage_attention: false,
+                    can_withdraw_notification: true,
+                    current_route: Some(cyclops_proto::MessageRecipientRoute {
+                        label: "reviewer-now".into(),
+                        pane_id: "%1".parse().unwrap(),
+                    }),
+                    available: true,
+                    mailbox: cyclops_proto::MailboxEntryState::Pending,
+                    fifo_position: Some(2),
+                    notification: cyclops_proto::MessageNotificationSummary {
+                        state: cyclops_proto::MessageNotificationState::Gating,
+                        quota_state: None,
+                        settlement: None,
+                        operator_withdrawn: None,
+                        attempt_id: Some(attempt),
+                        cause: None,
+                        pre_write_cause: Some(
+                            cyclops_proto::NotificationPreWriteCause::BindingUnprovable,
+                        ),
+                        attention_cleared: None,
+                        resolution: None,
+                        resolution_intent: None,
+                        resolution_action_accepted: None,
+                        resolution_consumption_observed: None,
+                        updated_at: Some(1),
+                    },
+                },
+                waiting_age_ms: 61_000,
+                next_action: Some(cyclops_proto::StatusNextAction::WithdrawNotification),
+            });
+        status.blocked_notifications_total = 5;
+
+        let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
+        assert!(rendered.contains("wake blocked before write"), "{rendered}");
+        assert!(rendered.contains("binding unprovable"), "{rendered}");
+        assert!(rendered.contains("FIFO 2"), "{rendered}");
+        assert!(rendered.contains("reviewer-now (%1)"), "{rendered}");
+        assert!(
+            rendered.contains(&format!(
+                "workspace admin: cyclops notification withdraw {attempt} --recipient {recipient}"
+            )),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("cyclops inbox claim m-blocked"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("secret body"), "{rendered}");
+        assert!(rendered.contains("4 more blocked wakes"), "{rendered}");
+
+        status.blocked_notifications[0]
+            .recipient
+            .notification
+            .pre_write_cause = Some(cyclops_proto::NotificationPreWriteCause::WorkerFailed);
+        let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
+        assert!(rendered.contains("worker failed"), "{rendered}");
+        assert!(rendered.contains("waited 1m"), "{rendered}");
+        assert!(rendered.contains("reviewer-now (%1)"), "{rendered}");
+        assert!(
+            rendered.contains(&format!(
+                "workspace admin: cyclops notification withdraw {attempt} --recipient {recipient}"
+            )),
+            "{rendered}"
+        );
+
+        status.blocked_notifications[0].next_action = None;
+        let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
+        assert!(!rendered.contains("notification withdraw"), "{rendered}");
+        assert!(
+            rendered.contains("recipient claim or cyclops messages inspection"),
+            "{rendered}"
+        );
+
+        status.sessions.clear();
+        let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
+        assert!(rendered.contains("wake blocked before write"), "{rendered}");
+    }
+
+    #[test]
     fn status_names_a_content_free_watch_deadlock_and_the_pull_exit() {
         let mut status = fixture();
         status.diagnostics.push(cyclops_proto::StatusDiagnostic {
@@ -1218,6 +1696,73 @@ mod tests {
             ),
             "{rendered}"
         );
+        assert!(!rendered.contains("secret body"), "{rendered}");
+    }
+
+    #[test]
+    fn status_names_the_exact_settlement_fault_and_recovery() {
+        let mut status = fixture();
+        let attempt = "att-00000000-0000-4000-8000-000000000009";
+        status.diagnostics.push(cyclops_proto::StatusDiagnostic {
+            code: "notification_settlement_storage_failed".into(),
+            message_id: "m-settlement".parse().unwrap(),
+            notification_attempt: attempt.parse().unwrap(),
+            recipient: serde_json::from_value(serde_json::json!({
+                "kind": "agent",
+                "workspace_id": "00000000-0000-0000-0000-000000000001",
+                "session_instance_id": "00000000-0000-0000-0000-000000000002",
+                "pane_id": "%1"
+            }))
+            .unwrap(),
+            recipient_label: "reviewer".into(),
+            pane_id: "%1".into(),
+        });
+
+        let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
+        assert!(
+            rendered.contains("notification settlement blocked"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("reviewer %1 m-settlement {attempt}")),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Run cyclops health"), "{rendered}");
+        assert!(rendered.contains("cyclops daemon restart"), "{rendered}");
+        assert!(!rendered.contains("secret body"), "{rendered}");
+    }
+
+    #[test]
+    fn status_keeps_a_failed_recovery_bound_to_its_fifo_owner() {
+        let mut status = fixture();
+        let attempt = "att-00000000-0000-4000-8000-000000000010";
+        status.diagnostics.push(cyclops_proto::StatusDiagnostic {
+            code: "notification_recovery_storage_failed".into(),
+            message_id: "m-recovery".parse().unwrap(),
+            notification_attempt: attempt.parse().unwrap(),
+            recipient: serde_json::from_value(serde_json::json!({
+                "kind": "agent",
+                "workspace_id": "00000000-0000-0000-0000-000000000001",
+                "session_instance_id": "00000000-0000-0000-0000-000000000002",
+                "pane_id": "%1"
+            }))
+            .unwrap(),
+            recipient_label: "reviewer".into(),
+            pane_id: "%1".into(),
+        });
+
+        let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
+        assert!(
+            rendered.contains("notification recovery blocked"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("reviewer %1 m-recovery {attempt}")),
+            "{rendered}"
+        );
+        assert!(rendered.contains("still owns the FIFO"), "{rendered}");
+        assert!(rendered.contains("Run cyclops health"), "{rendered}");
+        assert!(rendered.contains("cyclops daemon restart"), "{rendered}");
         assert!(!rendered.contains("secret body"), "{rendered}");
     }
 
@@ -1301,7 +1846,10 @@ mod tests {
     #[test]
     fn an_unmanaged_shell_is_not_an_unknown_agent() {
         let mut res = fixture();
-        let shell = res.sessions[0].panes.last_mut().expect("fixture has a shell");
+        let shell = res.sessions[0]
+            .panes
+            .last_mut()
+            .expect("fixture has a shell");
         shell.current_command = "zsh".into();
         let got = render_status(&res, &Style::none(), Path::new("/x"));
         assert!(!got.contains("%4"), "{got}");
@@ -1561,31 +2109,12 @@ mod tests {
             .starts_with(cyclops_proto::Eye::Open.glyph()));
     }
 
-    /// The eye header is composed once, in cyclops_proto::attention, and
-    /// worn by two crates. This is the assertion that was missing while
-    /// they mirrored it: it drives both surfaces off ONE status answer and
-    /// fails the moment either stops asking the register, or phrases the
-    /// cell or the count words itself.
+    /// Both live-pane surfaces use the shared eye vocabulary.
     #[test]
-    fn the_eye_header_is_composed_once_for_both_surfaces() {
+    fn live_status_uses_the_shared_eye_vocabulary() {
         let cases = [
             (AgentState::Working, Vec::new()),
             (AgentState::BlockedPermission, Vec::new()),
-            (
-                AgentState::Working,
-                vec![open_delivery(
-                    "m-1",
-                    "implementer",
-                    DeliveryState::ParkedBlockedQuota,
-                )],
-            ),
-            (
-                AgentState::BlockedPermission,
-                vec![
-                    open_delivery("m-1", "implementer", DeliveryState::ParkedBlockedQuota),
-                    open_delivery("m-2", "reviewer", DeliveryState::AttentionRequired),
-                ],
-            ),
         ];
         for (state, open) in cases {
             let mut res = fixture();
@@ -1634,12 +2163,8 @@ mod tests {
         }
     }
 
-    /// Both halves, or the header lies. `cyclops status` counted blocked
-    /// panes only while the stream counted deliveries too, so one surface
-    /// showed the calm closed eye over a delivery the other was shouting
-    /// about.
     #[test]
-    fn status_counts_open_deliveries_and_gives_each_a_row() {
+    fn status_reports_live_panes_without_durable_delivery_alarms() {
         let mut res = fixture();
         res.open_deliveries = vec![
             open_delivery("m-1", "implementer", DeliveryState::ParkedBlockedQuota),
@@ -1647,43 +2172,31 @@ mod tests {
         ];
         let got = render_status(&res, &Style::none(), Path::new("/x/config.toml"));
         let expected = format!(
-            "◉ 2 cyclops · watching main · tmux 3.6a · up 2m · 2 need attention\n\
+            "‿ cyclops · watching main · tmux 3.6a · up 2m\n\
              \n\
              \x20 reviewer     ● working  Run the tests\n\
              \x20 implementer  ○ idle\n\
-             \x20 %4           ? unknown  vim{UNKNOWN_NOTE}\n\
-             \n\
-             \x20 waiting on you\n\
-             \x20 implementer  ⊘ parked · quota · blocked quota · m-1 · time unknown\n\
-             \x20 reviewer     ⚠ needs attention · outcome unknown: paste verification failed · m-2 · time unknown"
+             \x20 %4           ? unknown  vim{UNKNOWN_NOTE}"
         );
         assert_eq!(got, expected);
         for line in got.lines() {
             assert_eq!(line, line.trim_end(), "trailing space in: {line:?}");
         }
 
-        // A blocked pane and an open delivery add up.
+        // A blocked pane still opens the live status eye by itself.
         res.sessions[0].panes[1].state = AgentState::BlockedQuota;
         let got = render_status(&res, &Style::none(), Path::new("/x/config.toml"));
         assert!(
             got.lines()
                 .next()
                 .unwrap_or_default()
-                .contains("3 need attention"),
+                .contains("1 needs attention"),
             "{got}"
         );
-
-        // An answer with no backlog says nothing about one, and the eye
-        // closes on a calm rig exactly as before.
-        res.sessions[0].panes[1].state = AgentState::Idle;
-        res.open_deliveries.clear();
-        let got = render_status(&res, &Style::none(), Path::new("/x/config.toml"));
-        assert!(!got.contains("waiting on you"), "{got}");
-        assert!(got.starts_with("‿ cyclops"), "{got}");
     }
 
     #[test]
-    fn status_bounds_historical_delivery_rows() {
+    fn status_never_renders_historical_delivery_rows() {
         let mut res = fixture();
         res.open_deliveries = (0..10)
             .map(|index| {
@@ -1698,16 +2211,8 @@ mod tests {
             .collect();
 
         let got = render_status(&res, &Style::none(), Path::new("/x/config.toml"));
-        assert!(got.contains("m-09"), "{got}");
-        assert!(got.contains("m-02"), "{got}");
-        assert!(!got.contains("m-01"), "{got}");
-        assert!(!got.contains("m-00"), "{got}");
-        assert!(
-            got.contains(
-                "2 older alarms not shown · inspect or clear: cyclops alarm preview --older-than <age>"
-            ),
-            "{got}"
-        );
+        assert!(!got.contains("waiting on you"), "{got}");
+        assert!(!got.contains("m-"), "{got}");
     }
 
     #[test]
@@ -1759,6 +2264,7 @@ mod tests {
             state,
             notification_state: None,
             quota_state: None,
+            notification_settlement: None,
             position,
             note: note.map(String::from),
             pane: None,
@@ -2093,6 +2599,7 @@ mod tests {
             stale: false,
             write_ready: false,
             write_block: None,
+            composer_semantic: None,
             readings: vec![
                 SensorReading {
                     sensor: Sensor::Hook,

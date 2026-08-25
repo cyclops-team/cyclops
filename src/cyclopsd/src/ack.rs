@@ -11,6 +11,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use cyclops_manifest::{AckEvidence, LifecycleCertainty, LifecycleRole};
 use cyclops_proto::{AgentState, Sensor, SensorReading, StateReportParams, WireError};
 use serde_json::{json, Value};
 use tracing::debug;
@@ -244,20 +245,24 @@ pub(crate) async fn handle_report(
     // turn still proves that much, and it is the ONLY thing such a
     // payload is allowed to change.
     let edge_ms = unix_ms();
-    inner
-        .hook_liveness
-        .record(&pane, &params.event, edge_ms, origin.agent);
+    if let Some(manifest_id) = origin.manifest.as_deref() {
+        inner
+            .hook_liveness
+            .record(&pane, &params.event, edge_ms, origin.agent, manifest_id);
+    }
 
     // Only the events that make up a turn have to name one. Turn fields
     // describe the turn lifecycle, not every hook a vendor emits: a
     // SessionStart or a tool-use edge legitimately carries no turn id,
     // and demanding one would refuse valid reports.
-    let lifecycle_event = manifest_of(inner, &origin).is_some_and(|m| {
-        [&m.hooks.turn_start, &m.hooks.turn_end, &m.hooks.ack]
-            .iter()
-            .filter_map(|n| n.as_deref())
-            .any(|n| normalize_event(n) == event)
+    let lifecycle = manifest_of(inner, &origin).and_then(|m| m.hooks.lifecycle_event(&event));
+    let is_ack = manifest_of(inner, &origin).is_some_and(|m| {
+        m.hooks
+            .ack
+            .as_deref()
+            .is_some_and(|name| normalize_event(name) == event)
     });
+    let lifecycle_event = lifecycle.is_some() || is_ack;
     // Correlation before any window is touched. A malformed lifecycle
     // event is refused, and a refusal has to leave nothing behind:
     // consuming its sequence number would make the next VALID event
@@ -283,9 +288,19 @@ pub(crate) async fn handle_report(
     // it cannot tell the number 7 from the string "7", nor `["x|y", "z"]`
     // from `["x", "y|z"]`. That is acceptable only where the alternative
     // is no dedupe at all.
-    let dupe_key = match &correlation {
-        Some(turnkey::TurnCorrelation::Exact(turn)) => Some(turn.dedupe_key(&event)),
-        _ => dedupe_ids(&params.payload).map(|(s, t)| format!("{s}|{t}|{event}")),
+    // Candidate terminal hooks may legitimately fire more than once for one
+    // turn. A vendor can run matching end hooks concurrently, block one, then
+    // retry the same turn. The lifecycle store makes simultaneous candidates
+    // idempotent and retires a blocked candidate on later Working evidence. A
+    // permanent turn/event key would discard the later real attempt. Reporter
+    // sequence numbers still reject exact transport replays above.
+    let dupe_key = if matches!(lifecycle, Some((_, LifecycleCertainty::Candidate))) {
+        None
+    } else {
+        match &correlation {
+            Some(turnkey::TurnCorrelation::Exact(turn)) => Some(turn.dedupe_key(&event)),
+            _ => dedupe_ids(&params.payload).map(|(s, t)| format!("{s}|{t}|{event}")),
+        }
     };
     if let Some(key) = dupe_key {
         if inner.ack_state.seen_key(&dedupe_ns, key.as_str()) {
@@ -305,29 +320,75 @@ pub(crate) async fn handle_report(
     // The reading carries the binding it came from for the same reason
     // the ACK does: a hook is a fact about one occupant under one set of
     // rules, and fusion drops it when the pane no longer matches.
-    let is_turn_start = manifest.is_some_and(|m| {
-        m.hooks
-            .turn_start
-            .as_deref()
-            .is_some_and(|n| normalize_event(n) == event)
-    });
-    let is_turn_end = manifest.is_some_and(|m| {
-        m.hooks
-            .turn_end
-            .as_deref()
-            .is_some_and(|n| normalize_event(n) == event)
-    });
-    let mapped = manifest.and_then(|m| {
-        let is =
-            |name: &Option<String>| name.as_deref().is_some_and(|n| normalize_event(n) == event);
-        if is(&m.hooks.turn_start) || is(&m.hooks.ack) {
-            Some(AgentState::Working)
-        } else if is(&m.hooks.turn_end) {
-            Some(AgentState::Idle)
-        } else {
-            None
+    let is_turn_start = matches!(lifecycle, Some((LifecycleRole::Start, _)));
+    let is_turn_end = matches!(lifecycle, Some((LifecycleRole::End, _)));
+    let lifecycle_confirmed = matches!(lifecycle, Some((_, LifecycleCertainty::Confirmed)));
+    let exact_turn = match &correlation {
+        Some(turnkey::TurnCorrelation::Exact(turn)) => Some(turn.clone()),
+        _ => None,
+    };
+    let unkeyed_dispatch_start = is_turn_start
+        && matches!(
+            lifecycle,
+            Some((LifecycleRole::Start, LifecycleCertainty::Candidate))
+        )
+        && exact_turn.is_none()
+        && is_ack
+        && manifest.is_some_and(|m| m.hooks.ack_evidence == AckEvidence::Dispatch);
+    if let (Some((role, LifecycleCertainty::Candidate)), Some(turn), Some(id)) =
+        (lifecycle, exact_turn.clone(), origin.manifest.as_deref())
+    {
+        let settle_ms = manifest
+            .map(|m| m.hooks.turn_end_settle_ms)
+            .unwrap_or_default();
+        let mut candidates = inner.hook_lifecycle.lock().expect("hook lifecycle lock");
+        let end_candidate = match role {
+            LifecycleRole::Start => {
+                candidates.record_start(&pane, origin.agent, id, turn, &params.event, edge_ms);
+                None
+            }
+            LifecycleRole::End => Some(candidates.record_end(
+                &pane,
+                origin.agent,
+                id,
+                turn,
+                &params.event,
+                edge_ms,
+                settle_ms,
+            )),
+        };
+        drop(candidates);
+        if let Some(candidate) = end_candidate {
+            fusion::schedule_candidate_end_recheck(inner, &pane, candidate);
         }
-    });
+    }
+    // A conclusive end for the same exact prompt proves that the prompt was
+    // accepted and a turn existed. Candidate Stop remains neutral until a
+    // later settled visual observation confirms it.
+    let start_confirmed_by_end = if is_turn_end && lifecycle_confirmed {
+        exact_turn.as_ref().and_then(|turn| {
+            origin.manifest.as_deref().and_then(|id| {
+                inner
+                    .hook_lifecycle
+                    .lock()
+                    .expect("hook lifecycle lock")
+                    .take_start_for_turn(&pane, origin.agent, id, turn)
+            })
+        })
+    } else {
+        None
+    };
+    let mapped = match lifecycle {
+        Some((LifecycleRole::Start, LifecycleCertainty::Confirmed)) => Some(AgentState::Working),
+        Some((LifecycleRole::End, LifecycleCertainty::Confirmed)) => Some(AgentState::Idle),
+        _ if unkeyed_dispatch_start => Some(AgentState::Working),
+        None if is_ack
+            && manifest.is_some_and(|m| m.hooks.ack_evidence == AckEvidence::Receipt) =>
+        {
+            Some(AgentState::Working)
+        }
+        _ => None,
+    };
     // A turn END is lifecycle evidence, stored where the runtime sensor's
     // eviction rules cannot reach it and matched by the turn it names
     // rather than by when it arrived. The composer hold may not consume
@@ -339,7 +400,7 @@ pub(crate) async fn handle_report(
     // reads of a payload invite drift between them. A vendor that names
     // no turns stores nothing, because its lifecycle is the screen, and a
     // malformed one never reaches here at all.
-    if is_turn_end {
+    if is_turn_end && lifecycle_confirmed {
         if let (Some(turnkey::TurnCorrelation::Exact(turn)), Some(id)) =
             (&correlation, origin.manifest.as_deref())
         {
@@ -350,6 +411,9 @@ pub(crate) async fn handle_report(
                 id,
                 turn.clone(),
             );
+            let mut lifecycle = inner.hook_lifecycle.lock().expect("hook lifecycle lock");
+            lifecycle.clear_end(&pane, turn);
+            lifecycle.clear_visual_end(&pane, origin.agent, id, turn);
         }
     }
     // A START for a turn this pane has ALREADY seen the end of is not a
@@ -378,26 +442,124 @@ pub(crate) async fn handle_report(
         }
         (m, _) => m,
     };
+    let mut applied_state = mapped;
+    let mut replaced_provisional_edge = None;
     if let Some(state) = mapped {
-        inner
-            .hook_readings
-            .lock()
-            .expect("hook readings lock")
-            .insert(
-                pane.clone(),
-                fusion::HookEntry::bound(
+        let mut readings = inner.hook_readings.lock().expect("hook readings lock");
+        let active_start = readings.get(&pane).is_some_and(|current| {
+            current.active_start_for(origin.agent, origin.manifest.as_deref())
+        });
+        let matching_end = readings
+            .get(&pane)
+            .is_some_and(|current| match &correlation {
+                Some(turnkey::TurnCorrelation::Exact(turn)) => current.active_start_matches(
+                    origin.agent,
+                    origin.manifest.as_deref(),
+                    Some(turn),
+                ),
+                Some(turnkey::TurnCorrelation::Unconfigured) => {
+                    current.confirmed_unkeyed_start_for(origin.agent, origin.manifest.as_deref())
+                }
+                Some(turnkey::TurnCorrelation::Invalid(_)) | None => false,
+            });
+        let conflicting_active = readings.get(&pane).is_some_and(|current| {
+            current.active_start_for(origin.agent, origin.manifest.as_deref()) && !matching_end
+        });
+        let keyed_confirmed_end = is_turn_end && lifecycle_confirmed && exact_turn.is_some();
+        let should_insert = if keyed_confirmed_end {
+            matching_end || (start_confirmed_by_end.is_some() && !conflicting_active)
+        } else {
+            (is_turn_start && lifecycle_confirmed)
+                || unkeyed_dispatch_start
+                || !active_start
+                || (is_turn_end && lifecycle_confirmed && matching_end)
+        };
+        // A receipt hook can be separate from the lifecycle hook. It may add
+        // receipt evidence, but it cannot downgrade a live start into a
+        // transient Working sample that later expires without an end.
+        if should_insert {
+            let reading = SensorReading {
+                sensor: Sensor::Hook,
+                state,
+                rule: params.event.clone(),
+                ts: edge_ms,
+            };
+            let entry = if unkeyed_dispatch_start {
+                fusion::HookEntry::provisional_start(origin.agent, origin.manifest.clone(), reading)
+            } else if is_turn_start && lifecycle_confirmed && exact_turn.is_some() {
+                // A confirmed start owns runtime state until matching end
+                // evidence or binding retirement replaces it.
+                fusion::HookEntry::turn_started(
                     origin.agent,
                     origin.manifest.clone(),
-                    SensorReading {
-                        sensor: Sensor::Hook,
-                        state,
-                        rule: params.event.clone(),
-                        ts: edge_ms,
-                    },
-                ),
-            );
+                    reading,
+                    exact_turn
+                        .clone()
+                        .expect("confirmed start has an exact turn"),
+                )
+            } else if is_turn_start && lifecycle_confirmed {
+                fusion::HookEntry::unkeyed_turn_started(
+                    origin.agent,
+                    origin.manifest.clone(),
+                    reading,
+                )
+            } else if keyed_confirmed_end {
+                fusion::HookEntry::turn_ended(
+                    origin.agent,
+                    origin.manifest.clone(),
+                    reading,
+                    exact_turn.clone().expect("keyed end has a turn"),
+                )
+            } else {
+                fusion::HookEntry::bound(origin.agent, origin.manifest.clone(), reading)
+            };
+            let replaced = readings.insert(pane.clone(), entry);
+            replaced_provisional_edge = replaced.and_then(|entry| {
+                entry.provisional_edge_for(origin.agent, origin.manifest.as_deref())
+            });
+        } else {
+            applied_state = None;
+        }
+        drop(readings);
     }
-    if is_turn_start {
+    if let (Some(previous_edge), Some(manifest_id)) =
+        (replaced_provisional_edge, origin.manifest.as_deref())
+    {
+        delivery::reject_unkeyed_dispatch_ack(
+            inner,
+            session_idx,
+            &pane_id,
+            origin.agent,
+            manifest_id,
+            previous_edge,
+            "hook_dispatch_superseded",
+        );
+    }
+    if unkeyed_dispatch_start && applied_state.is_some() {
+        fusion::schedule_unkeyed_dispatch_recheck(inner, &pane);
+    }
+    if is_turn_end && lifecycle_confirmed {
+        if let (Some(turn), Some(manifest)) = (exact_turn.as_ref(), origin.manifest.as_deref()) {
+            delivery::prepare_dispatch_ack(
+                inner,
+                origin.session_idx,
+                &pane_id,
+                origin.agent,
+                manifest,
+                turn,
+            );
+        }
+    }
+    if let Some(start) = &start_confirmed_by_end {
+        crate::composer_recovery::bind_post_recovery_turn(
+            inner,
+            origin.session_idx,
+            &pane_id,
+            start.turn.clone(),
+            start.edge_ms,
+        );
+    }
+    if is_turn_start && lifecycle_confirmed {
         if let Some(turnkey::TurnCorrelation::Exact(turn)) = &correlation {
             crate::composer_recovery::bind_post_recovery_turn(
                 inner,
@@ -411,34 +573,95 @@ pub(crate) async fn handle_report(
     // Resolve any waiting delivery whose own payload framing owns this
     // prompt. Not any prompt that mentions its id: see `prompt_names`.
     let mut matched = false;
+    let mut dispatch_already_ended = None;
     if let Some(m) = manifest {
-        let is_ack = m
-            .hooks
-            .ack
-            .as_deref()
-            .is_some_and(|a| normalize_event(a) == event);
         if is_ack {
             if let Some(field) = &m.hooks.ack_payload_field {
                 if let Some(text) = params.payload.get(field).and_then(Value::as_str) {
-                    for handle in delivery::ack_candidates(inner, session_idx, &pane_id) {
-                        if handle.claims_prompt(text) {
-                            // The turn the vendor named in THIS payload,
-                            // correlated once above. A delivery whose
-                            // acknowledgement names its turn binds to it
-                            // and leaves the screen lifecycle behind.
-                            let turn = match &correlation {
-                                Some(turnkey::TurnCorrelation::Exact(turn)) => Some(turn.clone()),
-                                _ => None,
-                            };
-                            matched |= delivery::resolve_hook_ack(
+                    if m.hooks.ack_evidence == AckEvidence::Receipt {
+                        if let Some(service) = inner.mailbox.as_ref() {
+                            matched |= service.confirm_attention_consumption_hook(
+                                session_idx,
+                                &pane_id,
+                                origin.recipient_key,
+                                origin.pane_root,
+                                origin.agent,
+                                &m.agent.id,
+                                text,
+                                edge_ms,
+                            );
+                        }
+                    }
+                    let matching: Vec<_> = delivery::ack_candidates(inner, session_idx, &pane_id)
+                        .into_iter()
+                        .filter(|handle| handle.claims_prompt(text))
+                        .collect();
+                    let unique_unkeyed_dispatch = !unkeyed_dispatch_start
+                        || m.hooks.ack_evidence != AckEvidence::Dispatch
+                        || matching.len() == 1;
+                    for handle in matching {
+                        if !unique_unkeyed_dispatch {
+                            delivery::mark_dispatch_match_ambiguous(
+                                &handle,
+                                origin.agent,
+                                &m.agent.id,
+                                "hook_dispatch_ambiguous",
+                            );
+                            continue;
+                        }
+                        // The turn the vendor named in THIS payload,
+                        // correlated once above. A delivery whose
+                        // acknowledgement names its turn binds to it
+                        // and leaves the screen lifecycle behind.
+                        let turn = match &correlation {
+                            Some(turnkey::TurnCorrelation::Exact(turn)) => Some(turn.clone()),
+                            _ => None,
+                        };
+                        matched |= match m.hooks.ack_evidence {
+                            AckEvidence::Receipt => delivery::resolve_hook_ack(
                                 inner,
                                 &handle,
                                 origin.agent,
                                 &m.agent.id,
                                 edge_ms,
                                 turn,
-                            );
-                        }
+                            ),
+                            AckEvidence::Dispatch => {
+                                let recorded = delivery::record_dispatch_candidate(
+                                    &handle,
+                                    origin.agent,
+                                    &m.agent.id,
+                                    edge_ms,
+                                    turn.clone(),
+                                );
+                                if recorded {
+                                    if let Some(turn) = turn.as_ref() {
+                                        let preparation = delivery::prepare_dispatch_ack(
+                                            inner,
+                                            session_idx,
+                                            &pane_id,
+                                            origin.agent,
+                                            &m.agent.id,
+                                            turn,
+                                        );
+                                        if preparation.end_already_present {
+                                            inner
+                                                .hook_lifecycle
+                                                .lock()
+                                                .expect("hook lifecycle lock")
+                                                .take_start_for_turn(
+                                                    &pane,
+                                                    origin.agent,
+                                                    &m.agent.id,
+                                                    turn,
+                                                );
+                                            dispatch_already_ended = Some(turn.clone());
+                                        }
+                                    }
+                                }
+                                recorded
+                            }
+                        };
                     }
                 }
             }
@@ -450,10 +673,44 @@ pub(crate) async fn handle_report(
     // sensors to reconcile; the stored reading waits for reattach.
     let live = watcher.is_some();
     if let Some(w) = watcher {
-        fusion::recompute_pane(inner, session_idx, &w, &pane_id, false, "hook_report").await;
+        fusion::recompute_pane(
+            inner,
+            session_idx,
+            &w,
+            &pane_id,
+            is_turn_end && lifecycle_confirmed,
+            "hook_report",
+        )
+        .await;
+    }
+    if is_turn_end && lifecycle_confirmed {
+        if let (Some(turn), Some(manifest)) = (exact_turn.as_ref(), origin.manifest.as_deref()) {
+            delivery::confirm_dispatch_ack(
+                inner,
+                origin.session_idx,
+                &pane_id,
+                origin.agent,
+                manifest,
+                turn,
+                edge_ms,
+            );
+        }
+    }
+    if let (Some(turn), Some(manifest)) =
+        (dispatch_already_ended.as_ref(), origin.manifest.as_deref())
+    {
+        delivery::confirm_dispatch_ack(
+            inner,
+            origin.session_idx,
+            &pane_id,
+            origin.agent,
+            manifest,
+            turn,
+            edge_ms,
+        );
     }
 
-    Ok(json!({"applied": true, "matched": matched, "state": mapped, "live": live}))
+    Ok(json!({"applied": true, "matched": matched, "state": applied_state, "live": live}))
 }
 
 #[cfg(test)]

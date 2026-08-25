@@ -212,10 +212,11 @@ answer missed the deadline. Inspect the message id before retrying.
 
 `admin` is a valid durable mailbox address even though no pane may use that
 label. Send to it with `cyclops send admin ...`. Admin gets no pane wake; the
-operator sees the pending count in `cyclops status`. Only an operator caller
-proven outside every watched pane has the `admin` inbox identity; a shell
-inside a watched pane retains that pane's agent identity. `--all` targets
-agent panes only, so address admin explicitly.
+operator sees the pending count in `cyclops status`. A same-user shell with no
+agent-vendor ancestor has the `admin` inbox identity, including a shell inside
+a watched pane. A vendor process gets an agent identity only through its
+current watched pane. `--all` targets agent panes only, so address admin
+explicitly.
 
 `cyclops messages` shows body-free inbox, outbound, and notification state.
 `cyclops history --with <agent>` and `cyclops thread <id>` reconstruct the

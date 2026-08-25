@@ -104,8 +104,8 @@ pub struct PaneRow {
     /// next-3.8 stops reporting `#{pane_pid}` for a dead pane while 3.6a
     /// keeps returning the stale pid, so a dead pane's pid is one of the
     /// two depending on the tmux underneath (MEASURED, both). A change
-    /// (respawn-pane) updates the row but emits no PaneChanged: no consumer
-    /// reacts to pid edges, resolution reads the table at message time.
+    /// (respawn-pane) emits [`PaneField::PanePid`] so consumers can retire
+    /// the former process generation before trusting the replacement.
     pub pane_pid: i32,
 }
 
@@ -136,9 +136,18 @@ impl PaneRow {
             // below. Absent evidence is not permission.
             write_ready: false,
             write_block: None,
+            composer: cyclops_proto::ComposerState::ComposerAmbiguous,
+            composer_proof: cyclops_proto::ComposerProof::Unprovable,
+            notification_attempt: None,
+            composer_reason: None,
+            composer_candidates: 0,
+            notification_state: None,
+            message_state: None,
+            next_action: None,
             // Elapsed-in-state, hook liveness, and the manifest's display
             // name are daemon knowledge; the daemon fills all three in.
             state_ms: None,
+            working_confirmed: None,
             hooks_verified: None,
             manifest_display_name: None,
         }
@@ -160,6 +169,8 @@ pub enum PaneField {
     InMode,
     /// Foreground command changed.
     CurrentCommand,
+    /// The process tmux spawned into the pane changed.
+    PanePid,
     /// Width or height changed.
     Size,
     /// Active flag flipped.
@@ -207,6 +218,11 @@ pub enum PaneEvent {
         /// The session's new name.
         name: String,
     },
+    /// An authoritative pane-table reconciliation completed. Consumers that
+    /// track process generations separately from tmux fields use this edge to
+    /// compare their bindings even when every visible [`PaneRow`] field stayed
+    /// the same.
+    Reconciled,
     /// The control connection died. The table is frozen at its last state;
     /// the owner reconnects by building a new watcher.
     Disconnected,
@@ -673,7 +689,6 @@ fn apply_sub_value(ctx: &mut LoopCtx, pane: &str, value: &str) -> Action {
     let Some(row) = table.get_mut(pane) else {
         return Action::Hint;
     };
-    row.pane_pid = pid;
     let mut changed = Vec::new();
     if row.title != title {
         row.title = title.to_string();
@@ -692,6 +707,10 @@ fn apply_sub_value(ctx: &mut LoopCtx, pane: &str, value: &str) -> Action {
     if row.current_command != cmd {
         row.current_command = cmd.to_string();
         changed.push(PaneField::CurrentCommand);
+    }
+    if row.pane_pid != pid {
+        row.pane_pid = pid;
+        changed.push(PaneField::PanePid);
     }
     if changed.is_empty() {
         return Action::None;
@@ -829,6 +848,7 @@ async fn reconcile_target(ctx: &mut LoopCtx, session: &str) -> Result<(), TmuxEr
     for (id, changed, row) in updated {
         let _ = ctx.events.send(PaneEvent::PaneChanged { id, changed, row });
     }
+    let _ = ctx.events.send(PaneEvent::Reconciled);
     Ok(())
 }
 
@@ -851,6 +871,9 @@ fn diff_fields(old: &PaneRow, new: &PaneRow) -> Vec<PaneField> {
     }
     if old.current_command != new.current_command {
         d.push(PaneField::CurrentCommand);
+    }
+    if old.pane_pid != new.pane_pid {
+        d.push(PaneField::PanePid);
     }
     if old.width != new.width || old.height != new.height {
         d.push(PaneField::Size);
@@ -1068,6 +1091,67 @@ mod tests {
         ctx.client.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn a_subscription_pid_edge_emits_even_when_every_other_field_is_stable() {
+        if !cyclops_testrig::tmux_available() {
+            return;
+        }
+        let server = cyclops_testrig::TmuxServer::new("watcher-sub-pid");
+        server.run_ok(&["new-session", "-d", "-s", "pid-edge"]);
+        let (mut ctx, mut events) = stale_session_context(&server, "pid-edge").await;
+        reconcile_current_session(&mut ctx).await.unwrap();
+        while events.try_recv().is_ok() {}
+        let row = ctx
+            .table
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .cloned()
+            .expect("bootstrap pane");
+        let replacement_pid = row.pane_pid + 10_000;
+        let value = format!(
+            "{}\t{}\t{}\t{}\t{}",
+            row.title,
+            u8::from(row.dead),
+            u8::from(row.in_mode),
+            row.current_command,
+            replacement_pid
+        );
+
+        assert!(matches!(
+            apply_sub_value(&mut ctx, &row.pane_id, &value),
+            Action::None
+        ));
+        let event = events.try_recv().expect("pid edge event");
+        assert!(matches!(
+            event,
+            PaneEvent::PaneChanged { id, changed, row: changed_row }
+                if id == row.pane_id
+                    && changed == vec![PaneField::PanePid]
+                    && changed_row.pane_pid == replacement_pid
+        ));
+        ctx.client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_authoritative_snapshot_still_emits_a_reconcile_edge() {
+        if !cyclops_testrig::tmux_available() {
+            return;
+        }
+        let server = cyclops_testrig::TmuxServer::new("watcher-reconcile-edge");
+        server.run_ok(&["new-session", "-d", "-s", "stable"]);
+        let (mut ctx, mut events) = stale_session_context(&server, "stable").await;
+        reconcile_current_session(&mut ctx).await.unwrap();
+        while events.try_recv().is_ok() {}
+
+        reconcile_current_session(&mut ctx).await.unwrap();
+
+        assert!(matches!(events.try_recv(), Ok(PaneEvent::Reconciled)));
+        assert!(events.try_recv().is_err());
+        ctx.client.shutdown().await;
+    }
+
     #[test]
     fn pane_row_parses_and_survives_tabbed_title() {
         let line = "%3\t@1\tmain\tsome title\t0\t1\tzsh\t120\t30\t1\t4242";
@@ -1125,10 +1209,8 @@ mod tests {
             vec![PaneField::Title, PaneField::InMode, PaneField::Size]
         );
 
-        // pane_pid changes update the table silently: no PaneField, no
-        // event (see the field comment on PaneRow).
         let mut c = a.clone();
         c.pane_pid = 8;
-        assert!(diff_fields(&a, &c).is_empty());
+        assert_eq!(diff_fields(&a, &c), vec![PaneField::PanePid]);
     }
 }

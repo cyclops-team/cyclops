@@ -50,6 +50,58 @@ fn codex_lifecycle_manifest() -> String {
     )
 }
 
+fn claude_candidate_manifest() -> String {
+    // Synthetic keyed candidate lifecycle. Claude does not expose this key;
+    // these fixtures exercise the generic candidate-end machinery.
+    let marker = "ack_payload_field = \"prompt\"";
+    assert!(HOOK_MANIFEST.contains(marker), "fixture shape changed");
+    HOOK_MANIFEST
+        .replace(
+            "turn_start_evidence = \"confirmed\"",
+            "turn_start_evidence = \"candidate\"",
+        )
+        .replace(
+            "turn_end_evidence = \"confirmed\"",
+            "turn_end_evidence = \"candidate\"",
+        )
+        .replace(
+            marker,
+            concat!(
+                "ack_payload_field = \"prompt\"\n",
+                "turn_end_settle_ms = 3000\n",
+                "turn_end_confirmed = [\"StopFailure\"]\n",
+                "ack_evidence = \"dispatch\"\n",
+                "turn_key_fields = [\"session_id\", \"prompt_id\"]"
+            ),
+        )
+}
+
+fn claude_unkeyed_dispatch_manifest() -> String {
+    // Mirror the shipped Claude hook contract while retaining the fake
+    // agent process and screen rules needed by this integration fixture.
+    let lifecycle = concat!(
+        "turn_start = \"UserPromptSubmit\"\n",
+        "turn_start_evidence = \"confirmed\"\n",
+        "turn_end = \"Stop\"\n",
+        "turn_end_evidence = \"confirmed\"\n",
+        "ack = \"UserPromptSubmit\"\n"
+    );
+    assert!(HOOK_MANIFEST.contains(lifecycle), "fixture shape changed");
+    HOOK_MANIFEST.replace(
+        lifecycle,
+        concat!(
+            "turn_start = \"UserPromptSubmit\"\n",
+            "turn_start_evidence = \"candidate\"\n",
+            "ack = \"UserPromptSubmit\"\n",
+            "ack_evidence = \"dispatch\"\n"
+        ),
+    )
+}
+
+fn send_fixture_key(rig: &Rig, pane: &str, key: &str) {
+    rig.tmux.run_ok(&["send-keys", "-t", pane, key]);
+}
+
 async fn report(rig: &Rig, event: &str, payload: serde_json::Value) -> serde_json::Value {
     rig.daemon
         .report_state(
@@ -65,11 +117,15 @@ async fn report(rig: &Rig, event: &str, payload: serde_json::Value) -> serde_jso
 }
 
 async fn wait_submitted(rig: &mut Rig, id: &str) {
+    wait_delivery_state(rig, id, "submitted").await;
+}
+
+async fn wait_delivery_state(rig: &mut Rig, id: &str, state: &str) {
     rig.ev
         .wait_event(Duration::from_secs(10), |e| {
             e["event"] == "delivery-state"
                 && e["data"]["id"] == id
-                && e["data"]["to_state"] == "submitted"
+                && e["data"]["to_state"] == state
         })
         .await;
 }
@@ -99,6 +155,826 @@ async fn acknowledge_codex_turn(rig: &mut Rig, subject: &str, session: &str, tur
         })
         .await;
     id
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_unkeyed_dispatch_publishes_provisional_working_then_visual_receipt() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let manifest = claude_unkeyed_dispatch_manifest();
+    let mut rig = Rig::new(
+        "claude-unkeyed-receipt",
+        &manifest,
+        &manual_lifecycle_composer_pane(),
+        "ack_timeout_ms = 3000\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "keyed").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let (sent, _) = rig
+        .send(json!({"to": ["keyed"], "subject": "unkeyed", "body": "body"}))
+        .await;
+    let id = sent["msg_id"].as_str().unwrap().to_string();
+    wait_submitted(&mut rig, &id).await;
+    let start = report(
+        &rig,
+        "UserPromptSubmit",
+        json!({
+            "session_id": "session-1",
+            "prompt": cyclopsd::render_payload(&id, "admin", "unkeyed", "body", false),
+        }),
+    )
+    .await;
+
+    assert_eq!(start["matched"], true, "{start}");
+    assert_eq!(start["state"], "working", "{start}");
+    let provisional_state = rig
+        .ev
+        .wait_event(Duration::from_secs(10), |event| {
+            event["event"] == "state"
+                && event["data"]["pane_id"] == pane.as_str()
+                && event["data"]["state"] == "working"
+                && event["data"]["working_confirmed"] == false
+        })
+        .await;
+    assert_eq!(
+        provisional_state["data"]["working_confirmed"], false,
+        "{provisional_state}"
+    );
+    assert_ne!(
+        rig.final_state(&id, "keyed").as_deref(),
+        Some("delivered_verified"),
+        "the hook dispatch became a receipt before visual acceptance"
+    );
+
+    // Status forces a clean visual recompute. A clean composer is neutral
+    // while Claude's prompt-submit edge remains provisional and output has
+    // not appeared yet.
+    let status = rig.ctl.request("status", json!({})).await;
+    let pane_status = status["result"]["sessions"][0]["panes"]
+        .as_array()
+        .and_then(|panes| panes.iter().find(|row| row["pane_id"] == pane.as_str()))
+        .unwrap_or_else(|| panic!("pane missing after provisional start: {status}"));
+    assert_eq!(pane_status["state"], "working", "{status}");
+    assert_ne!(
+        rig.final_state(&id, "keyed").as_deref(),
+        Some("delivered_verified"),
+        "status promoted the provisional hook dispatch into a receipt"
+    );
+
+    send_fixture_key(&rig, &pane, "C-t");
+    rig.ev
+        .wait_event(Duration::from_secs(10), |event| {
+            event["event"] == "state"
+                && event["data"]["pane_id"] == pane.as_str()
+                && event["data"]["state"] == "working"
+                && event["data"]["working_confirmed"] == true
+        })
+        .await;
+    rig.ev
+        .wait_event(Duration::from_secs(10), |event| {
+            event["event"] == "delivery-state"
+                && event["data"]["id"] == id.as_str()
+                && event["data"]["to_state"] == "delivered_verified"
+        })
+        .await;
+
+    // Claude has no exact Stop key. Its lifecycle returns to idle from a
+    // fresh clean visual frame, without inventing cross-event correlation.
+    send_fixture_key(&rig, &pane, "C-y");
+    wait_pane_state(&mut rig, "idle").await;
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c6_human_prompt_holds_an_unrelated_cyclops_delivery() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let manifest = claude_unkeyed_dispatch_manifest();
+    let mut rig = Rig::new(
+        "claude-human-prompt-hold",
+        &manifest,
+        &manual_lifecycle_composer_pane(),
+        "ack_timeout_ms = 3000\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "keyed").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let human = report(
+        &rig,
+        "UserPromptSubmit",
+        json!({
+            "session_id": "human-session",
+            "prompt": "a human prompt that is not a Cyclops notification",
+        }),
+    )
+    .await;
+    assert_eq!(human["matched"], false, "{human}");
+    assert_eq!(human["state"], "working", "{human}");
+    rig.ev
+        .wait_event(Duration::from_secs(10), |event| {
+            event["event"] == "state"
+                && event["data"]["pane_id"] == pane.as_str()
+                && event["data"]["state"] == "working"
+                && event["data"]["working_confirmed"] == false
+        })
+        .await;
+
+    // Visual output confirms only the pane runtime. The unmatched human
+    // prompt did not claim any Cyclops notification receipt.
+    send_fixture_key(&rig, &pane, "C-t");
+    rig.ev
+        .wait_event(Duration::from_secs(10), |event| {
+            event["event"] == "state"
+                && event["data"]["pane_id"] == pane.as_str()
+                && event["data"]["state"] == "working"
+                && event["data"]["working_confirmed"] == true
+        })
+        .await;
+
+    let (sent, _) = rig
+        .send(json!({"to": ["keyed"], "subject": "held", "body": "body"}))
+        .await;
+    let id = sent["msg_id"].as_str().unwrap().to_string();
+    wait_delivery_state(&mut rig, &id, "gating").await;
+    assert_eq!(rig.final_state(&id, "keyed").as_deref(), Some("gating"));
+    assert!(
+        !rig.tmux.capture(&pane).contains(&id),
+        "the unrelated delivery wrote while the human turn was working"
+    );
+
+    send_fixture_key(&rig, &pane, "C-y");
+    wait_pane_state(&mut rig, "idle").await;
+    wait_submitted(&mut rig, &id).await;
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unconfirmed_dispatch_cannot_be_revived_by_a_later_human_prompt() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let manifest = claude_unkeyed_dispatch_manifest();
+    let mut rig = Rig::new(
+        "claude-unconfirmed-dispatch",
+        &manifest,
+        &manual_lifecycle_composer_pane(),
+        "ack_timeout_ms = 3000\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "keyed").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let (sent, _) = rig
+        .send(json!({"to": ["keyed"], "subject": "unconfirmed", "body": "body"}))
+        .await;
+    let id = sent["msg_id"].as_str().unwrap().to_string();
+    wait_submitted(&mut rig, &id).await;
+    let dispatch = report(
+        &rig,
+        "UserPromptSubmit",
+        json!({
+            "session_id": "cyclops-session",
+            "prompt": cyclopsd::render_payload(
+                &id,
+                "admin",
+                "unconfirmed",
+                "body",
+                false,
+            ),
+        }),
+    )
+    .await;
+    assert_eq!(dispatch["matched"], true, "{dispatch}");
+    assert_eq!(dispatch["state"], "working", "{dispatch}");
+    rig.ev
+        .wait_event(Duration::from_secs(10), |event| {
+            event["event"] == "state"
+                && event["data"]["pane_id"] == pane.as_str()
+                && event["data"]["state"] == "working"
+                && event["data"]["working_confirmed"] == false
+        })
+        .await;
+
+    // No visual Working frame follows. The bounded one-shot recheck retires
+    // both the pane overlay and this exact receipt candidate.
+    wait_pane_state(&mut rig, "idle").await;
+    assert_ne!(
+        rig.final_state(&id, "keyed").as_deref(),
+        Some("delivered_verified"),
+        "a stable clean frame verified an unaccepted dispatch"
+    );
+
+    let human = report(
+        &rig,
+        "UserPromptSubmit",
+        json!({
+            "session_id": "later-human-session",
+            "prompt": "later unrelated human prompt",
+        }),
+    )
+    .await;
+    assert_eq!(human["matched"], false, "{human}");
+    send_fixture_key(&rig, &pane, "C-t");
+    rig.ev
+        .wait_event(Duration::from_secs(10), |event| {
+            event["event"] == "state"
+                && event["data"]["pane_id"] == pane.as_str()
+                && event["data"]["state"] == "working"
+                && event["data"]["working_confirmed"] == true
+        })
+        .await;
+    assert_ne!(
+        rig.final_state(&id, "keyed").as_deref(),
+        Some("delivered_verified"),
+        "a later human turn revived the retired Cyclops receipt candidate"
+    );
+
+    send_fixture_key(&rig, &pane, "C-y");
+    wait_pane_state(&mut rig, "idle").await;
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_dispatch_waits_for_visual_working_before_it_verifies() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let manifest = claude_candidate_manifest();
+    let mut rig = Rig::new(
+        "claude-candidate",
+        &manifest,
+        &manual_lifecycle_composer_pane(),
+        "ack_timeout_ms = 3000\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "keyed").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let (sent, _) = rig
+        .send(json!({"to": ["keyed"], "subject": "candidate", "body": "body"}))
+        .await;
+    let id = sent["msg_id"].as_str().unwrap().to_string();
+    wait_submitted(&mut rig, &id).await;
+    let start = report(
+        &rig,
+        "UserPromptSubmit",
+        json!({
+            "session_id": "session-1",
+            "prompt_id": "prompt-1",
+            "prompt": cyclopsd::render_payload(&id, "admin", "candidate", "body", false),
+        }),
+    )
+    .await;
+    assert_eq!(start["matched"], true, "{start}");
+    assert!(
+        start["state"].is_null(),
+        "candidate claimed runtime state: {start}"
+    );
+    assert_ne!(
+        rig.final_state(&id, "keyed").as_deref(),
+        Some("delivered_verified"),
+        "dispatch alone became a receipt"
+    );
+    send_fixture_key(&rig, &pane, "C-t");
+
+    rig.ev
+        .wait_event(Duration::from_secs(10), |event| {
+            event["event"] == "state"
+                && event["data"]["pane_id"] == pane.as_str()
+                && event["data"]["state"] == "working"
+        })
+        .await;
+    rig.ev
+        .wait_event(Duration::from_secs(10), |event| {
+            event["event"] == "delivery-state"
+                && event["data"]["id"] == id.as_str()
+                && event["data"]["to_state"] == "delivered_verified"
+        })
+        .await;
+
+    let end = report(
+        &rig,
+        "Stop",
+        json!({"session_id": "session-1", "prompt_id": "prompt-1"}),
+    )
+    .await;
+    assert_eq!(end["applied"], true, "{end}");
+    assert!(end["state"].is_null(), "candidate Stop claimed idle: {end}");
+    send_fixture_key(&rig, &pane, "C-y");
+    wait_pane_state(&mut rig, "idle").await;
+
+    let lines = rig.ledger_lines();
+    let working_at = lines
+        .iter()
+        .position(|line| line["kind"] == "state" && line["data"]["state"] == "working")
+        .expect("Working state line");
+    let delivered_at = lines
+        .iter()
+        .position(|line| {
+            line["kind"] == "state"
+                && line["id"] == id.as_str()
+                && line["data"]["to_state"] == "delivered_verified"
+        })
+        .expect("verified delivery line");
+    assert!(
+        working_at < delivered_at,
+        "receipt published before accepted Working"
+    );
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_blocked_dispatch_never_becomes_a_receipt() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let manifest = claude_candidate_manifest();
+    let mut rig = Rig::new(
+        "claude-blocked",
+        &manifest,
+        &swallowing_animated_composer_pane(),
+        "ack_timeout_ms = 200\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "keyed").await;
+
+    let (sent, _) = rig
+        .send(json!({"to": ["keyed"], "subject": "blocked", "body": "body"}))
+        .await;
+    let id = sent["msg_id"].as_str().unwrap().to_string();
+    wait_submitted(&mut rig, &id).await;
+    let start = report(
+        &rig,
+        "UserPromptSubmit",
+        json!({
+            "session_id": "session-1",
+            "prompt_id": "prompt-1",
+            "prompt": cyclopsd::render_payload(&id, "admin", "blocked", "body", false),
+        }),
+    )
+    .await;
+    assert_eq!(start["matched"], true, "{start}");
+    assert!(
+        start["state"].is_null(),
+        "candidate claimed runtime state: {start}"
+    );
+    send_fixture_key(&rig, &pane, "C-l");
+
+    rig.ev
+        .wait_event(Duration::from_secs(10), |event| {
+            event["event"] == "delivery-state"
+                && event["data"]["id"] == id.as_str()
+                && event["data"]["to_state"] == "attention_required"
+        })
+        .await;
+    let screen = rig.tmux.capture(&pane);
+    assert!(
+        screen.contains(&id),
+        "blocked payload left the composer: {screen}"
+    );
+    assert!(!rig.ledger_lines().iter().any(|line| {
+        line["kind"] == "state"
+            && line["id"] == id.as_str()
+            && line["data"]["to_state"] == "delivered_verified"
+    }));
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_blocked_stop_can_be_retried_for_the_same_prompt() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let manifest = claude_candidate_manifest();
+    let mut rig = Rig::new("claude-stop", &manifest, &composer_pane(), "").await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "keyed").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let start = report(
+        &rig,
+        "UserPromptSubmit",
+        json!({
+            "session_id": "session-1",
+            "prompt_id": "prompt-1",
+            "prompt": "manual prompt",
+        }),
+    )
+    .await;
+    assert!(start["state"].is_null(), "{start}");
+    send_fixture_key(&rig, &pane, "C-t");
+    wait_pane_state(&mut rig, "working").await;
+
+    let first_stop = report(
+        &rig,
+        "Stop",
+        json!({"session_id": "session-1", "prompt_id": "prompt-1"}),
+    )
+    .await;
+    assert_eq!(first_stop["applied"], true, "{first_stop}");
+    assert!(
+        first_stop["state"].is_null(),
+        "candidate Stop claimed idle: {first_stop}"
+    );
+    send_fixture_key(&rig, &pane, "C-l");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let read = rig
+        .ctl
+        .request(
+            "pane.read",
+            json!({"target": "keyed", "source": "detection"}),
+        )
+        .await;
+    assert_eq!(read["result"]["detection"]["state"], "working", "{read}");
+
+    let second_stop = report(
+        &rig,
+        "Stop",
+        json!({"session_id": "session-1", "prompt_id": "prompt-1"}),
+    )
+    .await;
+    assert_eq!(second_stop["applied"], true, "{second_stop}");
+    assert_ne!(
+        second_stop["duplicate"], true,
+        "later Stop was deduplicated: {second_stop}"
+    );
+    send_fixture_key(&rig, &pane, "C-y");
+    wait_pane_state(&mut rig, "idle").await;
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_stopfailure_confirms_a_short_turn_without_late_working() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let manifest = claude_candidate_manifest();
+    let mut rig = Rig::new(
+        "claude-stopfailure-short",
+        &manifest,
+        &manual_lifecycle_composer_pane(),
+        "ack_timeout_ms = 3000\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "keyed").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let (sent, _) = rig
+        .send(json!({"to": ["keyed"], "subject": "short", "body": "body"}))
+        .await;
+    let id = sent["msg_id"].as_str().unwrap().to_string();
+    wait_submitted(&mut rig, &id).await;
+    let start = report(
+        &rig,
+        "UserPromptSubmit",
+        json!({
+            "session_id": "session-short",
+            "prompt_id": "prompt-short",
+            "prompt": cyclopsd::render_payload(&id, "admin", "short", "body", false),
+        }),
+    )
+    .await;
+    assert_eq!(start["matched"], true, "{start}");
+    assert!(start["state"].is_null(), "{start}");
+
+    let end = report(
+        &rig,
+        "StopFailure",
+        json!({"session_id": "session-short", "prompt_id": "prompt-short"}),
+    )
+    .await;
+    assert_eq!(end["state"], "idle", "{end}");
+    wait_delivery_state(&mut rig, &id, "delivered_verified").await;
+    let read = rig
+        .ctl
+        .request(
+            "pane.read",
+            json!({"target": "keyed", "source": "detection"}),
+        )
+        .await;
+    assert_eq!(read["result"]["detection"]["state"], "idle", "{read}");
+    assert_eq!(read["result"]["detection"]["write_ready"], true, "{read}");
+    assert!(!rig
+        .ledger_lines()
+        .iter()
+        .any(|line| line["kind"] == "state" && line["data"]["state"] == "working"));
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_stopfailure_before_dispatch_still_confirms_the_exact_message() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let manifest = claude_candidate_manifest();
+    let mut rig = Rig::new(
+        "claude-stopfailure-before-dispatch",
+        &manifest,
+        &manual_lifecycle_composer_pane(),
+        "ack_timeout_ms = 3000\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "keyed").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let (sent, _) = rig
+        .send(json!({"to": ["keyed"], "subject": "reordered", "body": "body"}))
+        .await;
+    let id = sent["msg_id"].as_str().unwrap().to_string();
+    wait_submitted(&mut rig, &id).await;
+
+    let end = report(
+        &rig,
+        "StopFailure",
+        json!({"session_id": "session-reordered", "prompt_id": "prompt-reordered"}),
+    )
+    .await;
+    assert!(
+        end["state"].is_null(),
+        "an end without its start claimed state: {end}"
+    );
+
+    let start = report(
+        &rig,
+        "UserPromptSubmit",
+        json!({
+            "session_id": "session-reordered",
+            "prompt_id": "prompt-reordered",
+            "prompt": cyclopsd::render_payload(&id, "admin", "reordered", "body", false),
+        }),
+    )
+    .await;
+    assert_eq!(start["matched"], true, "{start}");
+    wait_delivery_state(&mut rig, &id, "delivered_verified").await;
+
+    let read = rig
+        .ctl
+        .request(
+            "pane.read",
+            json!({"target": "keyed", "source": "detection"}),
+        )
+        .await;
+    assert_eq!(read["result"]["detection"]["state"], "idle", "{read}");
+    assert_eq!(read["result"]["detection"]["write_ready"], true, "{read}");
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_stopfailure_confirms_a_superseded_exact_dispatch() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let manifest = claude_candidate_manifest();
+    let mut rig = Rig::new(
+        "claude-stopfailure-superseded",
+        &manifest,
+        &manual_lifecycle_composer_pane(),
+        "ack_timeout_ms = 3000\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "keyed").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let (sent, _) = rig
+        .send(json!({"to": ["keyed"], "subject": "first", "body": "body"}))
+        .await;
+    let id = sent["msg_id"].as_str().unwrap().to_string();
+    wait_submitted(&mut rig, &id).await;
+    let first = report(
+        &rig,
+        "UserPromptSubmit",
+        json!({
+            "session_id": "session-superseded",
+            "prompt_id": "prompt-a",
+            "prompt": cyclopsd::render_payload(&id, "admin", "first", "body", false),
+        }),
+    )
+    .await;
+    assert_eq!(first["matched"], true, "{first}");
+
+    let second = report(
+        &rig,
+        "UserPromptSubmit",
+        json!({
+            "session_id": "session-superseded",
+            "prompt_id": "prompt-b",
+            "prompt": "a later human prompt",
+        }),
+    )
+    .await;
+    assert_eq!(second["matched"], false, "{second}");
+    let end_first = report(
+        &rig,
+        "StopFailure",
+        json!({"session_id": "session-superseded", "prompt_id": "prompt-a"}),
+    )
+    .await;
+    assert_eq!(end_first["applied"], true, "{end_first}");
+    wait_delivery_state(&mut rig, &id, "delivered_verified").await;
+
+    send_fixture_key(&rig, &pane, "C-t");
+    wait_pane_state(&mut rig, "working").await;
+    let active = rig
+        .ctl
+        .request(
+            "pane.read",
+            json!({"target": "keyed", "source": "detection"}),
+        )
+        .await;
+    assert_eq!(
+        active["result"]["detection"]["state"], "working",
+        "{active}"
+    );
+
+    let end_second = report(
+        &rig,
+        "StopFailure",
+        json!({"session_id": "session-superseded", "prompt_id": "prompt-b"}),
+    )
+    .await;
+    assert_eq!(end_second["state"], "idle", "{end_second}");
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_stopfailure_ends_runtime_before_a_dirty_barrier_releases() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let manifest = claude_candidate_manifest();
+    let mut rig = Rig::new(
+        "claude-stopfailure-active",
+        &manifest,
+        &manual_lifecycle_composer_pane(),
+        "ack_timeout_ms = 3000\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "keyed").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let (first, _) = rig
+        .send(json!({"to": ["keyed"], "subject": "first", "body": "body"}))
+        .await;
+    let first_id = first["msg_id"].as_str().unwrap().to_string();
+    wait_submitted(&mut rig, &first_id).await;
+    let start = report(
+        &rig,
+        "UserPromptSubmit",
+        json!({
+            "session_id": "session-active",
+            "prompt_id": "prompt-active",
+            "prompt": cyclopsd::render_payload(&first_id, "admin", "first", "body", false),
+        }),
+    )
+    .await;
+    assert_eq!(start["matched"], true, "{start}");
+    send_fixture_key(&rig, &pane, "C-t");
+    wait_pane_state(&mut rig, "working").await;
+    wait_delivery_state(&mut rig, &first_id, "delivered_verified").await;
+
+    let (second, _) = rig
+        .send(json!({"to": ["keyed"], "subject": "second", "body": "body"}))
+        .await;
+    let second_id = second["msg_id"].as_str().unwrap().to_string();
+    wait_delivery_state(&mut rig, &second_id, "gating").await;
+
+    let mismatch = report(
+        &rig,
+        "StopFailure",
+        json!({"session_id": "session-active", "prompt_id": "other-prompt"}),
+    )
+    .await;
+    assert!(mismatch["state"].is_null(), "{mismatch}");
+    wait_pane_state(&mut rig, "working").await;
+
+    let end = report(
+        &rig,
+        "StopFailure",
+        json!({"session_id": "session-active", "prompt_id": "prompt-active"}),
+    )
+    .await;
+    assert_eq!(end["state"], "idle", "{end}");
+    let dirty = rig
+        .ctl
+        .request(
+            "pane.read",
+            json!({"target": "keyed", "source": "detection"}),
+        )
+        .await;
+    assert_eq!(dirty["result"]["detection"]["state"], "idle", "{dirty}");
+    assert_eq!(
+        dirty["result"]["detection"]["write_ready"], false,
+        "{dirty}"
+    );
+    assert_eq!(
+        rig.final_state(&second_id, "keyed").as_deref(),
+        Some("gating")
+    );
+
+    send_fixture_key(&rig, &pane, "C-y");
+    wait_submitted(&mut rig, &second_id).await;
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_interrupt_updates_status_without_fabricating_an_exact_end() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let manifest = claude_candidate_manifest();
+    let mut rig = Rig::new(
+        "claude-interrupt",
+        &manifest,
+        &manual_lifecycle_composer_pane(),
+        "ack_timeout_ms = 3000\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "keyed").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let (first, _) = rig
+        .send(json!({"to": ["keyed"], "subject": "interrupt", "body": "body"}))
+        .await;
+    let first_id = first["msg_id"].as_str().unwrap().to_string();
+    wait_submitted(&mut rig, &first_id).await;
+    report(
+        &rig,
+        "UserPromptSubmit",
+        json!({
+            "session_id": "session-interrupt",
+            "prompt_id": "prompt-interrupt",
+            "prompt": cyclopsd::render_payload(&first_id, "admin", "interrupt", "body", false),
+        }),
+    )
+    .await;
+    send_fixture_key(&rig, &pane, "C-t");
+    wait_pane_state(&mut rig, "working").await;
+    wait_delivery_state(&mut rig, &first_id, "delivered_verified").await;
+
+    let (second, _) = rig
+        .send(json!({"to": ["keyed"], "subject": "held", "body": "body"}))
+        .await;
+    let second_id = second["msg_id"].as_str().unwrap().to_string();
+    wait_delivery_state(&mut rig, &second_id, "gating").await;
+    send_fixture_key(&rig, &pane, "Escape");
+    wait_pane_state(&mut rig, "working").await;
+    let interrupted = rig
+        .ctl
+        .request(
+            "pane.read",
+            json!({"target": "keyed", "source": "detection"}),
+        )
+        .await;
+    assert_eq!(
+        interrupted["result"]["detection"]["state"], "working",
+        "visual idle cannot erase an exact active start: {interrupted}"
+    );
+    assert_eq!(
+        interrupted["result"]["detection"]["write_ready"], false,
+        "visual idle must not fabricate the exact end: {interrupted}"
+    );
+    assert_eq!(
+        rig.final_state(&second_id, "keyed").as_deref(),
+        Some("gating")
+    );
+
+    let end = report(
+        &rig,
+        "StopFailure",
+        json!({"session_id": "session-interrupt", "prompt_id": "prompt-interrupt"}),
+    )
+    .await;
+    assert_eq!(end["applied"], true, "{end}");
+    assert_eq!(end["state"], "idle", "{end}");
+    wait_pane_state(&mut rig, "idle").await;
+    wait_submitted(&mut rig, &second_id).await;
+    rig.shutdown().await;
 }
 
 struct HeldTmuxSocket {
@@ -149,6 +1025,64 @@ impl Drop for HeldTmuxSocket {
     fn drop(&mut self) {
         let _ = self.restore_inner();
     }
+}
+
+/// An authenticated start is the earliest reliable signal that Claude
+/// accepted a prompt. The title and screen can still show the idle composer
+/// until the first output frame, so those frames must not keep runtime state
+/// at idle or evict the start after repeated recomputes.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_authenticated_start_reports_working_before_visual_output() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new("preoutput", HOOK_MANIFEST, &composer_pane(), "").await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "keyed").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let before = rig.tmux.capture(&pane);
+    assert!(
+        !before.contains("FAKETUI-WORKING"),
+        "fixture already showed visual work: {before}"
+    );
+
+    let start = report(
+        &rig,
+        "UserPromptSubmit",
+        json!({"prompt": "a human prompt with no Cyclops message"}),
+    )
+    .await;
+    assert_eq!(start["state"], "working", "{start}");
+
+    // Every read forces the visual sensors. Their repeated idle verdicts
+    // must remain observable disagreement without erasing the lifecycle.
+    for round in 0..6 {
+        let read = rig
+            .ctl
+            .request(
+                "pane.read",
+                json!({"target": "keyed", "source": "detection"}),
+            )
+            .await;
+        let detection = &read["result"]["detection"];
+        assert_eq!(detection["state"], "working", "round {round}: {read}");
+        assert_eq!(detection["disagreement"], true, "round {round}: {read}");
+        assert_eq!(detection["write_ready"], false, "round {round}: {read}");
+    }
+
+    let after = rig.tmux.capture(&pane);
+    assert!(
+        !after.contains("FAKETUI-WORKING"),
+        "the fixture produced output instead of testing the pre-output gap: {after}"
+    );
+
+    let end = report(&rig, "Stop", json!({})).await;
+    assert_eq!(end["state"], "idle", "{end}");
+    wait_pane_state(&mut rig, "idle").await;
+
+    rig.shutdown().await;
 }
 
 /// A start for a turn that has already ended is not a turn running, and
@@ -285,14 +1219,18 @@ async fn a_partial_codex_turn_match_keeps_the_composer_held() {
     ] {
         let end = report(&rig, "Stop", payload).await;
         assert_eq!(end["applied"], true, "{end}");
+        let read = rig
+            .ctl
+            .request(
+                "pane.read",
+                json!({"target": "keyed", "source": "detection"}),
+            )
+            .await;
+        assert_eq!(
+            read["result"]["detection"]["state"], "working",
+            "another turn's end cleared the active lifecycle: {read}"
+        );
     }
-    rig.ev
-        .wait_event(Duration::from_secs(10), |e| {
-            e["event"] == "gate"
-                && e["data"]["id"] == second.as_str()
-                && e["data"]["cause"] == "not_write_ready:composer_hold"
-        })
-        .await;
     assert_eq!(
         rig.final_state(&second, "keyed").as_deref(),
         Some("gating"),
@@ -347,9 +1285,9 @@ async fn a_detached_codex_end_releases_only_after_a_fresh_clean_capture() {
         })
         .await;
 
-    // Put the runtime reading back at idle with an end from another turn.
-    // The exact hold remains, which makes the following detach exercise
-    // stored lifecycle evidence rather than a transient sensor conflict.
+    // An end from another turn changes neither the active runtime start nor
+    // the exact hold. The following detach therefore exercises stored
+    // matching lifecycle evidence rather than a transient sensor conflict.
     let mismatch = report(
         &rig,
         "Stop",
@@ -357,13 +1295,14 @@ async fn a_detached_codex_end_releases_only_after_a_fresh_clean_capture() {
     )
     .await;
     assert_eq!(mismatch["applied"], true, "{mismatch}");
-    rig.ev
-        .wait_event(Duration::from_secs(10), |e| {
-            e["event"] == "gate"
-                && e["data"]["id"] == second.as_str()
-                && e["data"]["cause"] == "not_write_ready:composer_hold"
-        })
+    let read = rig
+        .ctl
+        .request(
+            "pane.read",
+            json!({"target": "keyed", "source": "detection"}),
+        )
         .await;
+    assert_eq!(read["result"]["detection"]["state"], "working", "{read}");
 
     let held_socket = HeldTmuxSocket::disconnect(&rig, "main");
     rig.ev

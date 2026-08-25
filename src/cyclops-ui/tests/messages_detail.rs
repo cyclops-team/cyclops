@@ -7,8 +7,9 @@
 use std::str::FromStr;
 
 use cyclops_proto::{
-    MessageId, NotificationAttemptId, NotificationAttentionCause, RecipientKey, SessionInstanceId,
-    TmuxPaneId, WorkspaceId,
+    MessageId, MessageRecipientRoute, NotificationAttemptId, NotificationAttentionCause,
+    NotificationPreWriteCause, NotificationResolution, RecipientKey, SessionInstanceId, TmuxPaneId,
+    WorkspaceId,
 };
 use cyclops_ui::detail::render;
 use cyclops_ui::{
@@ -39,7 +40,11 @@ fn row(
     QueueRow {
         target,
         attention: None,
+        resolution_intent: None,
+        resolution_action_accepted: None,
+        resolution_consumption_observed: None,
         can_manage_attention: false,
+        can_withdraw_notification: false,
         message_id: MessageId::new("m-001").unwrap(),
         recipient: agent("%1"),
         recipient_label: "reviewer".into(),
@@ -47,6 +52,9 @@ fn row(
         mailbox,
         wake,
         cause: None,
+        pre_write_cause: None,
+        current_route: None,
+        fifo_position: Some(1),
         needs_action: true,
         seq: 1,
         updated_at: 1000,
@@ -99,6 +107,23 @@ fn alarmed() -> QueueRow {
         WakeWord::NeedsAttention,
     );
     r.cause = Some(NotificationAttentionCause::VerifyFailed);
+    r
+}
+
+fn blocked() -> QueueRow {
+    let mut r = row(
+        QueueTarget::new(MessageId::new("m-001").unwrap(), agent("%1")),
+        Direction::Observed,
+        MailboxWord::Pending,
+        WakeWord::BlockedBeforeWrite,
+    );
+    r.attention = Some(attempt(8));
+    r.can_withdraw_notification = true;
+    r.pre_write_cause = Some(NotificationPreWriteCause::BindingUnprovable);
+    r.current_route = Some(MessageRecipientRoute {
+        label: "reviewer-now".into(),
+        pane_id: "%1".parse().unwrap(),
+    });
     r
 }
 
@@ -215,6 +240,58 @@ fn a_detail_offers_only_the_actions_its_target_allows() {
         Action::ClearAlarm,
     ] {
         assert!(!d.allows(forbidden), "{forbidden:?} offered on a message");
+    }
+}
+
+#[test]
+fn a_blocked_wake_offers_one_exact_recipient_scoped_withdrawal() {
+    let row = blocked();
+    let mut detail = opened(&row, Loaded::default());
+    assert_eq!(detail.allowed(), vec![Action::WithdrawNotification]);
+
+    let Request::Confirm(sentence) = detail.request(Action::WithdrawNotification) else {
+        panic!("withdrawal must require exact confirmation");
+    };
+    assert!(sentence.contains(&attempt(8).to_string()), "{sentence}");
+    assert!(sentence.contains(&agent("%1").to_string()), "{sentence}");
+
+    assert_eq!(detail.confirm(), Some(Action::WithdrawNotification));
+    detail.done(Action::WithdrawNotification, "wake withdrawn");
+    assert!(!detail.can_withdraw_notification());
+    assert_eq!(detail.wake(), WakeWord::WithdrawnByOperator);
+    assert!(!detail.allowed().contains(&Action::WithdrawNotification));
+
+    let frame = render(&detail, 80, 24).join("\n");
+    assert!(frame.contains("message remains claimable"), "{frame}");
+}
+
+#[test]
+fn every_daemon_authorized_unwritten_wake_offers_withdrawal() {
+    for wake in [WakeWord::Queued, WakeWord::Gating] {
+        let mut row = row(
+            QueueTarget::new(MessageId::new("m-001").unwrap(), agent("%1")),
+            Direction::Observed,
+            MailboxWord::Pending,
+            wake,
+        );
+        row.attention = Some(attempt(9));
+        row.can_withdraw_notification = true;
+        row.needs_action = false;
+
+        let detail = opened(&row, Loaded::default());
+        assert_eq!(detail.allowed(), vec![Action::WithdrawNotification]);
+    }
+
+    for wake in [WakeWord::Writing, WakeWord::Staged, WakeWord::Submitted] {
+        let mut row = row(
+            QueueTarget::new(MessageId::new("m-001").unwrap(), agent("%1")),
+            Direction::Observed,
+            MailboxWord::Pending,
+            wake,
+        );
+        row.attention = Some(attempt(10));
+        row.can_withdraw_notification = true;
+        assert!(opened(&row, Loaded::default()).allowed().is_empty());
     }
 }
 
@@ -716,11 +793,16 @@ mod through_the_app {
                 MessageNotificationState::Notified
             },
             quota_state: None,
+            settlement: None,
+            operator_withdrawn: None,
             attempt_id: alarmed.then(|| attempt(n)),
             cause: alarmed.then_some(NotificationAttentionCause::VerifyFailed),
+            pre_write_cause: None,
             attention_cleared: alarmed.then_some(false),
             resolution: None,
             resolution_intent: None,
+            resolution_action_accepted: None,
+            resolution_consumption_observed: None,
             updated_at: Some(5_000),
         };
         // Two different callers, because the daemon addresses two
@@ -758,6 +840,8 @@ mod through_the_app {
                 needs_action: true,
                 // Set from the wire, exactly as the daemon answers it.
                 can_manage_attention: alarmed,
+                can_withdraw_notification: false,
+                current_route: None,
                 available: true,
                 mailbox,
                 fifo_position: Some(1),
@@ -772,13 +856,24 @@ mod through_the_app {
         }
     }
 
-    /// An alarm whose terminal action crossed its write boundary without
-    /// an outcome. `wake_word` reads intent-without-resolution as
-    /// `ActionUncertain`.
+    /// An alarm whose terminal accepted its action but has no final outcome.
+    /// `wake_word` reads it as `ActionUncertain`, while fresh-action authority
+    /// remains false and only matching no-key reconciliation is available.
     pub fn wire_row_uncertain(id: &str) -> MessageSnapshotRow {
         let mut row = wire_row_n(id, true, 7);
         row.recipients[0].notification.resolution_intent =
             Some(cyclops_proto::NotificationResolution::Complete);
+        row.recipients[0].notification.resolution_action_accepted =
+            Some(cyclops_proto::NotificationResolution::Complete);
+        row.recipients[0]
+            .notification
+            .resolution_consumption_observed = Some(
+            cyclops_proto::NotificationResolutionConsumptionObservation {
+                evidence: cyclops_proto::NotificationResolutionConsumptionEvidence::WorkingEdge,
+                observed_at_ms: 5_001,
+            },
+        );
+        row.recipients[0].can_manage_attention = false;
         row
     }
 
@@ -1524,33 +1619,148 @@ mod seeded_disposition {
         );
     }
 
-    /// An outcome nobody knows retires the same two verbs, for a different
-    /// reason: the pane needs a human, not another write.
+    /// A matching durable terminal acceptance exposes only no-key reconciliation.
     #[test]
-    fn an_uncertain_attempt_retires_the_terminal_verbs_too() {
-        let mut d = Detail::open(
-            &alarm_row(
+    fn an_accepted_uncertain_attempt_offers_only_its_matching_reconciliation() {
+        for (intent, matching, opposite, phrase) in [
+            (
+                NotificationResolution::Complete,
+                Action::AttentionComplete,
+                Action::AttentionDiscard,
+                "reconcile prior uncertain submit",
+            ),
+            (
+                NotificationResolution::Discard,
+                Action::AttentionDiscard,
+                Action::AttentionComplete,
+                "reconcile prior uncertain discard",
+            ),
+        ] {
+            let mut row = alarm_row(
                 attempt(7),
                 Direction::Outbound,
                 MailboxWord::Claimed,
                 WakeWord::ActionUncertain,
-            ),
-            9,
+            );
+            row.can_manage_attention = false;
+            row.resolution_intent = Some(intent);
+            row.resolution_action_accepted = Some(intent);
+            if intent == NotificationResolution::Complete {
+                row.resolution_consumption_observed = Some(
+                    cyclops_proto::NotificationResolutionConsumptionObservation {
+                        evidence: cyclops_proto::NotificationResolutionConsumptionEvidence::AuthenticatedClaim,
+                        observed_at_ms: 2_000,
+                    },
+                );
+            }
+            let mut d = Detail::open(&row, 9);
+            d.loaded_ok(Loaded::default());
+            assert_eq!(d.allowed(), vec![matching]);
+            assert!(!d.allows(opposite));
+            let Request::Confirm(copy) = d.request(matching) else {
+                panic!("matching reconciliation did not ask for confirmation")
+            };
+            assert!(copy.contains(phrase), "{copy}");
+            assert!(copy.contains("no second key will be sent"), "{copy}");
+        }
+    }
+
+    /// A Complete pre-key intent is a durable uncertainty marker, not proof
+    /// that a key reached the terminal. It cannot expose another key or
+    /// no-key settlement.
+    #[test]
+    fn intent_without_terminal_acceptance_offers_no_terminal_action() {
+        let mut row = alarm_row(
+            attempt(7),
+            Direction::Outbound,
+            MailboxWord::Claimed,
+            WakeWord::ActionUncertain,
         );
-        d.loaded_ok(Loaded {
-            checks: vec![Check {
-                name: "notification exact".into(),
-                passed: true,
-                detail: None,
-            }],
-            ..Loaded::default()
-        });
-        let allowed = d.allowed();
+        row.can_manage_attention = false;
+        row.resolution_intent = Some(NotificationResolution::Complete);
+        let mut d = Detail::open(&row, 9);
+        d.loaded_ok(Loaded::default());
+
+        assert!(d.allowed().is_empty());
+        assert!(!d.allows(Action::AttentionComplete));
+        assert!(!d.allows(Action::AttentionDiscard));
+
+        let frame = render(&d, 96, 24).join("\n");
+        assert!(frame.contains("terminal acceptance is unproven"), "{frame}");
         assert!(
-            !allowed.contains(&Action::AttentionComplete)
-                && !allowed.contains(&Action::AttentionDiscard),
-            "an unknown outcome re-offered a terminal verb: {allowed:?}"
+            frame.contains("no submit, discard, or reconciliation action is available"),
+            "{frame}"
         );
+
+        let frozen = d.target().clone();
+        row.resolution_action_accepted = Some(NotificationResolution::Complete);
+        d.observe_snapshot(Some(&row));
+        assert_eq!(d.target(), &frozen, "snapshot change retargeted the detail");
+        d.loaded_ok(Loaded::default());
+        assert!(d.allowed().is_empty());
+        let frame = render(&d, 96, 24).join("\n");
+        assert!(
+            frame.contains("terminal accepted, task start unproven"),
+            "{frame}"
+        );
+
+        row.resolution_consumption_observed = Some(
+            cyclops_proto::NotificationResolutionConsumptionObservation {
+                evidence:
+                    cyclops_proto::NotificationResolutionConsumptionEvidence::AuthenticatedClaim,
+                observed_at_ms: 2_000,
+            },
+        );
+        d.observe_snapshot(Some(&row));
+        assert_eq!(
+            d.target(),
+            &frozen,
+            "consumption proof retargeted the detail"
+        );
+        d.loaded_ok(Loaded::default());
+        assert_eq!(d.allowed(), vec![Action::AttentionComplete]);
+
+        row.resolution_action_accepted = Some(NotificationResolution::Discard);
+        d.observe_snapshot(Some(&row));
+        d.loaded_ok(Loaded::default());
+        assert!(d.allowed().is_empty());
+        let frame = render(&d, 96, 24).join("\n");
+        assert!(
+            frame.contains("terminal intent and accepted action records disagree"),
+            "{frame}"
+        );
+    }
+
+    #[test]
+    fn intent_only_discard_offers_exact_empty_no_key_reconciliation() {
+        let mut row = alarm_row(
+            attempt(8),
+            Direction::Outbound,
+            MailboxWord::Claimed,
+            WakeWord::ActionUncertain,
+        );
+        row.can_manage_attention = false;
+        row.resolution_intent = Some(NotificationResolution::Discard);
+        let mut detail = Detail::open(&row, 11);
+        detail.loaded_ok(Loaded::default());
+
+        assert_eq!(detail.allowed(), vec![Action::AttentionDiscard]);
+        assert_eq!(
+            detail.action_word(Action::AttentionDiscard),
+            "reconcile exact-empty discard without a key"
+        );
+        let Request::Confirm(copy) = detail.request(Action::AttentionDiscard) else {
+            panic!("intent-only Discard did not expose its no-key recovery")
+        };
+        assert!(copy.contains("no second key will be sent"), "{copy}");
+
+        assert_eq!(detail.escape(), cyclops_ui::Back::Cancelled);
+        let frame = render(&detail, 96, 24).join("\n");
+        assert!(
+            frame.contains("exact-empty no-key discard reconciliation is available"),
+            "{frame}"
+        );
+        assert!(frame.contains("no terminal key is sent"), "{frame}");
     }
 
     /// Tightening only. A snapshot that predates this operator's own
@@ -1581,12 +1791,10 @@ mod seeded_disposition {
     }
 }
 
-/// The whole path, not the pieces: a wire notification carrying an intent
-/// with no resolution must come out the other end as a detail that has
-/// already retired its terminal verbs. This is the one test that proves
-/// wake_word, target_for and Detail::open agree with each other.
+/// The whole path: matching intent, terminal acceptance, and consumption
+/// evidence open the exact attempt and send only its reconciliation RPC.
 #[test]
-fn an_uncertain_wire_row_opens_with_its_terminal_verbs_already_retired() {
+fn an_uncertain_wire_row_sends_only_its_matching_reconciliation_rpc() {
     use through_the_app::*;
 
     let mut app = app_with(vec![wire_row_uncertain("m-001")], 9);
@@ -1601,27 +1809,47 @@ fn an_uncertain_wire_row_opens_with_its_terminal_verbs_already_retired() {
         "an uncertain alarm is still an attention target: {:?}",
         row.target
     );
+    assert!(!row.can_manage_attention);
+    assert_eq!(
+        row.resolution_intent,
+        Some(NotificationResolution::Complete)
+    );
+    assert_eq!(
+        row.resolution_action_accepted,
+        Some(NotificationResolution::Complete)
+    );
+    assert!(row.resolution_consumption_observed.is_some());
 
     app.open_detail().expect("it opens");
-    let (token, _) = app.take_detail_read().expect("it owes a read");
-    app.apply_action(
-        token,
-        cyclops_ui::ActionOutcome::Opened(Box::new(Loaded {
-            checks: vec![Check {
-                name: "notification exact".into(),
-                passed: true,
-                detail: None,
-            }],
-            ..Loaded::default()
-        })),
-    );
+    let (token, request) = app.take_detail_read().expect("it owes a read");
+    assert!(matches!(
+        request,
+        cyclops_ui::ActionRequest::OpenAttention { attempt_id }
+            if attempt_id == attempt(7)
+    ));
+    app.apply_action(token, cyclops_ui::ActionOutcome::Opened(Box::default()));
 
     let allowed = app.detail.as_ref().expect("still open").allowed();
+    assert_eq!(allowed, vec![Action::AttentionComplete]);
+    app.handle_key(cyclops_ui::Key::Char('1'));
+    let frame = cyclops_ui::build(&mut app, 96, 24).join("\n");
     assert!(
-        !allowed.contains(&Action::AttentionComplete)
-            && !allowed.contains(&Action::AttentionDiscard),
-        "an uncertain outcome reached the screen with a terminal verb: {allowed:?}"
+        frame.contains("terminal accepted the submit action"),
+        "{frame}"
     );
+    assert!(
+        frame.contains("reconcile prior uncertain submit"),
+        "{frame}"
+    );
+    let words = frame.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(words.contains("no second key will be sent"), "{frame}");
+    app.handle_key(cyclops_ui::Key::Char('y'));
+    let (_, request) = app.take_pending().expect("reconciliation request");
+    assert!(matches!(
+        request,
+        cyclops_ui::ActionRequest::AttentionComplete { attempt_id }
+            if attempt_id == attempt(7)
+    ));
 }
 
 /// The diff is what an operator acts on. Five booleans name which rule

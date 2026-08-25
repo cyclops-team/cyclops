@@ -23,6 +23,11 @@ cyclops inbox claim <message-id>
 cyclops reply <message-id> --body "Reviewed. One issue."
 ```
 
+The wake is one-shot. An ambiguous terminal outcome raises one attention item
+and leaves the message claimable. Do not resend or requeue blindly. Follow
+[Recover a notification](/guides/recovery) for inspection, guarded completion
+or discard, and provably pre-write withdrawal.
+
 ## Broadcast
 
 ```bash

@@ -29,8 +29,9 @@ argv_basenames = ["cycauth-agent"]
 
 [hooks]
 turn_start = "UserPromptSubmit"
-turn_end = "Stop"
+turn_start_evidence = "candidate"
 ack = "UserPromptSubmit"
+ack_evidence = "dispatch"
 ack_payload_field = "prompt"
 
 [[rule]]
@@ -46,6 +47,7 @@ state = "idle"
 priority = 90
 region = "bottom_non_empty_lines(4)"
 line_regex = ['^❯\s*$']
+composer_semantic = "clean"
 "#;
 
 struct CommandFifo(File);
@@ -137,6 +139,22 @@ impl HookRig {
                 Instant::now() < deadline,
                 "daemon did not observe replacement agent {}: {status}",
                 agent.pid
+            );
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
+    async fn wait_for_manifest(&mut self, manifest: &str) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let status = self.rig.ctl.request("status", json!({})).await;
+            let pane = &status["result"]["sessions"][0]["panes"][0];
+            if pane["manifest"] == manifest {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "daemon lost manifest {manifest:?} while a child held the terminal: {status}"
             );
             tokio::time::sleep(POLL).await;
         }
@@ -369,10 +387,12 @@ async fn sibling_hook_while_foreground_tool_runs_is_admitted() {
         Some(tool_pid),
         "foreground tool must own the pane terminal"
     );
+    fixture.wait_for_manifest("hookauth").await;
 
     fs::write(&send, "go").expect("release sibling hook");
     let response = response(&result).await;
     assert!(response["error"].is_null(), "hook was refused: {response}");
+    assert_eq!(response["result"]["applied"], true, "{response}");
 
     fixture.shutdown().await;
 }

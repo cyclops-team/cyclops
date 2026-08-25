@@ -1,4 +1,4 @@
-# I have to work on this Monday
+# Cyclops engineering map
 
 A map, not a summary. Where things live, where to start reading for the
 job you have been handed, and which decisions were deliberate so you do not
@@ -17,9 +17,9 @@ delivery use separate append-only session journals.
 
 For current messaging, start with [send.md](../guides/send.md),
 [PROTOCOL.md](../reference/PROTOCOL.md), `src/cyclopsd/src/mailbox.rs`, and
-`src/cyclopsd/src/messaging.rs`. Sections below that explicitly say legacy
-describe the compatibility path used by hook self-tests and old session
-records, not standard `cyclops send`.
+`src/cyclopsd/src/messaging.rs`. Sections explicitly labeled legacy describe
+the compatibility path used by hook self-tests and old session records, not
+standard `cyclops send`.
 
 ## The shape
 
@@ -336,7 +336,9 @@ rather than an offset.
 
 **Chosen:** state changes arrive as control-mode notifications and
 subscription pushes; reconciliation is triggered by an event or a request.
-One 30ms debounce, and one-shot timers inside a live delivery.
+One 30ms debounce, one-shot timers inside a live delivery, and one
+event-armed candidate lifecycle settle timer per pane. The lifecycle worker
+evaluates each candidate generation once per observation and then parks.
 
 **Rejected:** a 1Hz reconcile loop, which is the obvious design and would
 have been simpler.

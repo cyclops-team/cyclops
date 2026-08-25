@@ -23,12 +23,14 @@
 //!
 //! ## Restoring across a restart
 //!
-//! A tmux pane id is unique for the life of a tmux SERVER and starts over
-//! at %0 when that server restarts. Replaying the file blindly would
-//! therefore hand an old label to whatever pane inherited the id. Restore
-//! keeps an entry only when the pane still exists AND its root process is
-//! the same pid it was at adoption; everything else is pruned. The pid is
-//! the same occupant identity the delivery gate re-checks before it pastes.
+//! A tmux pane id is unique for the life of a tmux server and starts over
+//! at %0 when that server restarts. Replaying the file blindly would hand
+//! an old label to whatever pane inherited the id. Restore first proves the
+//! durable session instance. Inside that same live session, an exact old
+//! process generation may move to the pane's current generation through a
+//! checked rebind. A new tmux server or session instance never inherits the
+//! label. Delivery still rechecks the current process generation before it
+//! writes to the terminal.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
@@ -369,6 +371,39 @@ impl Registry {
         self.commit(panes, legacy_panes, windows)
     }
 
+    /// Move one durable pane adoption to a replacement process generation.
+    ///
+    /// The caller has already observed an authoritative `pane_pid` edge for
+    /// this recipient in the same live session instance. Only an exact old
+    /// root may move, so a delayed edge cannot overwrite a newer adoption.
+    /// Labels, manifest pins, and saved chrome belong to the logical pane and
+    /// remain unchanged across `respawn-pane`.
+    pub(crate) fn rebind_process(
+        &mut self,
+        recipient: RecipientKey,
+        expected: ProcessInstanceId,
+        replacement: ProcessInstanceId,
+    ) -> Result<bool, StateError> {
+        let Some(current) = self.panes.get(&recipient) else {
+            return Ok(false);
+        };
+        if current.pane_root == Some(replacement) {
+            return Ok(true);
+        }
+        if current.pane_root != Some(expected) {
+            return Ok(false);
+        }
+
+        let mut panes = self.panes.clone();
+        let adoption = panes
+            .get_mut(&recipient)
+            .expect("the adoption was read from this map");
+        adoption.pane_root = Some(replacement);
+        adoption.pane_pid = replacement.pid();
+        self.commit(panes, self.legacy_panes.clone(), self.windows.clone())?;
+        Ok(true)
+    }
+
     /// What [`clear`](Self::clear) would hand back, without handing it back.
     ///
     /// The chrome restore has to run BEFORE the entry is forgotten, because
@@ -691,6 +726,47 @@ mod tests {
             0o600
         );
         assert!(!dir.join("registry.json.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_process_rebind_preserves_the_logical_adoption_and_persists() {
+        let dir = home("process-rebind");
+        let (mut reg, warnings) = load(&dir);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mut original = adoption("%1", "reviewer", 4242, "@0");
+        original.manifest = Some("claude".into());
+        let (recipient, old_root) = route(&original);
+        reg.adopt(original, window("@0", Some("top")))
+            .expect("adopt writes");
+        let new_root = ProcessInstanceId::new(5252, 62_525).unwrap();
+
+        assert!(reg
+            .rebind_process(recipient, old_root, new_root)
+            .expect("rebind writes"));
+        assert!(reg
+            .rebind_process(recipient, old_root, new_root)
+            .expect("repeating the settled transition is idempotent"));
+        let unrelated = ProcessInstanceId::new(6262, 72_626).unwrap();
+        assert!(!reg
+            .rebind_process(recipient, old_root, unrelated)
+            .expect("a stale transition is refused"));
+        assert!(reg.for_route(recipient, old_root).is_none());
+        let rebound = reg
+            .for_route(recipient, new_root)
+            .expect("new process owns the route");
+        assert_eq!(rebound.label, "reviewer");
+        assert_eq!(rebound.manifest.as_deref(), Some("claude"));
+        assert_eq!(rebound.window_id, "@0");
+
+        let (reopened, warnings) = load(&dir);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let rebound = reopened
+            .for_route(recipient, new_root)
+            .expect("rebind survives restart");
+        assert_eq!(rebound.label, "reviewer");
+        assert_eq!(rebound.pane_pid, new_root.pid());
+        assert!(reopened.window("@0").is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

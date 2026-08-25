@@ -142,24 +142,25 @@ pub fn build(app: &mut App, width: usize, height: usize) -> Vec<String> {
 }
 
 fn messages_status(app: &App) -> Option<String> {
+    let notice = app.notice_text();
     match app.refresh.link() {
-        crate::messages::Link::Connecting => Some(match &app.notice {
+        crate::messages::Link::Connecting => Some(match &notice {
             Some(notice) => format!("connecting to cyclops; actions unavailable; {notice}"),
             None => "connecting to cyclops; actions unavailable".into(),
         }),
-        crate::messages::Link::Lost => Some(match &app.notice {
+        crate::messages::Link::Lost => Some(match &notice {
             Some(notice) => {
                 format!("connection lost; R reconnect; {notice}; shown data may be stale")
             }
             None => "connection lost; R reconnect; shown data may be stale".into(),
         }),
-        crate::messages::Link::Connected if !app.refresh.may_mutate() => Some(match &app.notice {
+        crate::messages::Link::Connected if !app.refresh.may_mutate() => Some(match &notice {
             Some(notice) => format!(
                 "refreshing messages; actions unavailable; {notice}; shown data may be stale"
             ),
             None => "refreshing messages; actions unavailable; shown data may be stale".into(),
         }),
-        crate::messages::Link::Connected => app.notice.clone(),
+        crate::messages::Link::Connected => notice,
     }
 }
 
@@ -380,7 +381,7 @@ fn footer(app: &App) -> String {
             theme.dim("  · enter applies · esc cancels")
         );
     }
-    if let Some(notice) = &app.notice {
+    if let Some(notice) = app.notice_text() {
         return format!("  {notice}");
     }
     theme.dim("? keys · tab view · a agents · c density · w/f/t filter · enter jump · q quit")
@@ -560,9 +561,18 @@ mod tests {
     use super::*;
     use crate::app::{App, View};
     use crate::input::Key;
-    use crate::stream::{Entry, EntryKind, Filter};
+    use crate::stream::{EndpointFilter, Entry, EntryKind, Filter};
     use crate::theme::Theme;
     use cyclops_proto::{AgentState, DeliveryState};
+
+    fn endpoint(label: &str) -> EndpointFilter {
+        EndpointFilter::new(
+            "admin:00000000-0000-0000-0000-000000000001"
+                .parse()
+                .unwrap(),
+            label,
+        )
+    }
 
     fn msg(ts: u64, from: &str, to: &[&str], subject: &str, body: Option<&str>) -> Entry {
         Entry {
@@ -573,6 +583,7 @@ mod tests {
             kind: EntryKind::Msg {
                 from: from.into(),
                 to: to.iter().map(|t| t.to_string()).collect(),
+                endpoints: None,
                 subject: subject.into(),
                 body: body.map(String::from),
                 fyi: false,
@@ -596,6 +607,7 @@ mod tests {
             id: Some("m-1".into()),
             kind: EntryKind::Delivery {
                 to: "reviewer".into(),
+                recipient: None,
                 state: DeliveryState::DeliveredVerified,
                 cause: None,
             },
@@ -607,6 +619,7 @@ mod tests {
             id: Some("e-1".into()),
             kind: EntryKind::State {
                 target: "reviewer".into(),
+                recipient: None,
                 session_idx: 0,
                 pane_id: Some("%1".into()),
                 state: AgentState::BlockedPermission,
@@ -662,6 +675,7 @@ mod tests {
             id: Some("e-2".into()),
             kind: EntryKind::State {
                 target: "reviewer".into(),
+                recipient: None,
                 session_idx: 0,
                 pane_id: Some("%1".into()),
                 state: AgentState::Idle,
@@ -795,32 +809,32 @@ mod tests {
             build(&mut a, 80, 12)[2].clone()
         };
         assert_eq!(
-            one(|f| f.with = Some("nobody".into())),
+            one(|f| f.with = Some(endpoint("nobody"))),
             "  reviewer  ⚠ blocked_permission. Hidden by the with filter · \
              press w, empty the line, then enter."
         );
         assert_eq!(
-            one(|f| f.from = Some("nobody".into())),
+            one(|f| f.from = Some(endpoint("nobody"))),
             "  reviewer  ⚠ blocked_permission. Hidden by the from filter · \
              press f, empty the line, then enter."
         );
         assert_eq!(
-            one(|f| f.to = Some("nobody".into())),
+            one(|f| f.to = Some(endpoint("nobody"))),
             "  reviewer  ⚠ blocked_permission. Hidden by the to filter · \
              press t, empty the line, then enter."
         );
         // from and to hold together, so both keys get named.
         assert_eq!(
             one(|f| {
-                f.from = Some("nobody".into());
-                f.to = Some("nobody".into());
+                f.from = Some(endpoint("nobody"));
+                f.to = Some(endpoint("nobody"));
             }),
             "  reviewer  ⚠ blocked_permission. Hidden by the from and to filters · \
              press f and t, empty each line, then enter."
         );
         // No filter at all is the other reason a line can be missing.
         let mut a = fixture();
-        a.filter.with = Some("nobody".into());
+        a.filter.with = Some(endpoint("nobody"));
         assert!(build(&mut a, 80, 12)[2].contains("Hidden by the"));
     }
 
@@ -844,7 +858,7 @@ mod tests {
     #[test]
     fn header_names_the_filters_and_connection_state() {
         let mut a = fixture();
-        a.filter.with = Some("reviewer".into());
+        a.filter.with = Some(endpoint("reviewer"));
         a.conn_lost = true;
         while a.tick_eye() {}
         a.tick_eye();

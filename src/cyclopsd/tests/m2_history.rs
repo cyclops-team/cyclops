@@ -193,7 +193,6 @@ async fn history_reconstructs_a_two_pane_conversation() {
         .await
         .expect("send 1");
     let m1 = r1["msg_id"].as_str().expect("msg id").to_string();
-    assert_eq!(r1["deliveries"][0]["state"], "delivered_unverified", "{r1}");
 
     let r2 = rig
         .daemon
@@ -230,6 +229,22 @@ async fn history_reconstructs_a_two_pane_conversation() {
         .expect("send 5");
     let m5 = r5["msg_id"].as_str().expect("msg id").to_string();
     assert_eq!(r5["deliveries"][0]["state"], "attention_required", "{r5}");
+
+    // A send can return while a recipient is still finishing the preceding
+    // turn. History is an eventual ledger fold, so settle every background
+    // delivery before asserting both its result and that reads append nothing.
+    for (message, recipient) in [(&m3, "codex"), (&m3, "reviewer"), (&m4, "codex")] {
+        if rig.final_state(message, recipient).as_deref() != Some("delivered_unverified") {
+            rig.ev
+                .wait_event(std::time::Duration::from_secs(10), |event| {
+                    event["event"] == "delivery-state"
+                        && event["data"]["id"] == message.as_str()
+                        && event["data"]["to"] == recipient
+                        && event["data"]["to_state"] == "delivered_unverified"
+                })
+                .await;
+        }
+    }
 
     let ledger_before = rig.ledger_lines().len();
 

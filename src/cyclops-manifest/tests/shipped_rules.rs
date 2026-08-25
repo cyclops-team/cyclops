@@ -5,12 +5,67 @@
 
 use std::path::Path;
 
-use cyclops_manifest::{load_dir, Manifest};
-use cyclops_proto::AgentState;
+use cyclops_manifest::{load_dir, AckEvidence, LifecycleCertainty, LifecycleRole, Manifest};
+use cyclops_proto::{AgentState, ComposerSemantic};
 
 fn shipped() -> std::collections::HashMap<String, Manifest> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources/manifests");
     load_dir(&dir).unwrap()
+}
+
+#[test]
+fn shipped_composer_semantics_match_measured_rules_only() {
+    use ComposerSemantic::{Ambiguous, Clean, GhostSuggestion, HumanInput};
+
+    let all = shipped();
+    let expected = [
+        ("claude", "composer_empty", Clean),
+        ("claude", "composer_has_staged_input", HumanInput),
+        ("claude", "composer_styled_input", HumanInput),
+        ("claude", "composer_unstyled_input", HumanInput),
+        ("codex", "composer_typed_input", HumanInput),
+        ("codex", "composer_ghost_suggestion", GhostSuggestion),
+        ("codex", "composer_empty_or_ghost", Ambiguous),
+        ("cursor", "composer_typed_input", HumanInput),
+        ("cursor", "composer_ghost_or_empty", Ambiguous),
+        ("cursor", "composer_plain_fallback", Ambiguous),
+        ("agy", "composer_empty", Clean),
+        ("agy", "composer_has_input", HumanInput),
+    ];
+
+    for &(manifest_id, rule_id, semantic) in &expected {
+        let rule = all[manifest_id]
+            .rules
+            .iter()
+            .find(|rule| rule.id == rule_id)
+            .unwrap_or_else(|| panic!("missing {manifest_id}/{rule_id}"));
+        assert_eq!(
+            rule.composer_semantic,
+            Some(semantic),
+            "{manifest_id}/{rule_id} has the wrong composer meaning"
+        );
+    }
+
+    let annotated = all
+        .values()
+        .flat_map(|manifest| manifest.rules.iter())
+        .filter(|rule| rule.composer_semantic.is_some())
+        .count();
+    assert_eq!(
+        annotated,
+        expected.len(),
+        "a shipped rule gained an unreviewed composer meaning"
+    );
+    assert_eq!(
+        all["claude"]
+            .rules
+            .iter()
+            .find(|rule| rule.id == "composer_ghost_suggestion")
+            .unwrap()
+            .composer_semantic,
+        None,
+        "Claude's ghost shape is not yet backed by a live Claude capture"
+    );
 }
 
 fn version_between<'a>(capture: &'a str, start: &str, end: &str) -> &'a str {
@@ -105,6 +160,28 @@ fn cursor_turn_correlation_waits_for_paired_hook_payload_fixtures() {
         );
     }
     assert!(cursor_fixtures > 0, "Cursor fixture inventory is empty");
+}
+
+/// Claude's current hook payload can identify the submitted prompt but cannot
+/// match UserPromptSubmit to Stop. Start and dispatch are one event-local
+/// candidate; visual evidence owns acceptance and completion.
+#[test]
+fn claude_ships_an_unkeyed_dispatch_start_with_a_visual_end() {
+    let all = shipped();
+    let claude = &all["claude"];
+    assert_eq!(
+        claude.hooks.lifecycle_event("UserPromptSubmit"),
+        Some((LifecycleRole::Start, LifecycleCertainty::Candidate))
+    );
+    assert_eq!(claude.hooks.ack.as_deref(), Some("UserPromptSubmit"));
+    assert_eq!(claude.hooks.ack_evidence, AckEvidence::Dispatch);
+    assert_eq!(claude.hooks.ack_payload_field.as_deref(), Some("prompt"));
+    assert!(claude.hooks.turn_key_fields.is_empty());
+    assert!(claude.hooks.turn_end.is_none());
+    assert!(claude.hooks.turn_end_confirmed.is_empty());
+    assert_eq!(claude.hooks.turn_end_settle_ms, 0);
+    assert!(!claude.hooks.has_lifecycle_role(LifecycleRole::End));
+    assert_eq!(claude.hooks.lifecycle_event("Stop"), None);
 }
 
 #[test]
@@ -999,6 +1076,122 @@ fn claude_active_status_row_reads_working_not_idle() {
         AgentState::Working,
         "a completed step must not pin the pane as working forever"
     );
+}
+
+/// Claude Code 2.1.243 emits a plain activity row when NO_COLOR is set.
+/// The cycling glyph and ellipsis identify the live row. Completed transcript
+/// rows use a past-tense result followed by "for" and must not hold the pane.
+#[test]
+fn claude_no_color_active_status_reads_working() {
+    let claude = &shipped()["claude"];
+    let grid = include_str!("fixtures/claude_working_no_color_2_1_243.txt");
+    assert!(!grid.contains('\u{1b}'));
+
+    let active = claude
+        .evaluate_esc("\u{2733} Hook self-test", grid, Some(grid))
+        .unwrap();
+    assert_eq!(active.id, "composer_working_spinner_status_no_color");
+    assert_eq!(active.state, AgentState::Working);
+    assert!(
+        !claude
+            .rules
+            .iter()
+            .find(|rule| rule.id == active.id)
+            .expect("matched rule is compiled")
+            .lifecycle_evidence
+    );
+
+    let update = grid.replace(
+        "  ⎿  Tip: Use /permissions to pre-approve and pre-deny bash, edit, and MCP tools",
+        "  ✔ Update installed · Restart to update",
+    );
+    let update_reading = claude
+        .evaluate_esc("\u{2733} Hook self-test", &update, Some(&update))
+        .unwrap();
+    assert_eq!(
+        update_reading.id,
+        "composer_working_spinner_status_no_color"
+    );
+    assert_eq!(update_reading.state, AgentState::Working);
+
+    let mode = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+    let status_only = grid.replace(&format!("\n{mode}"), "");
+    let hint_only = status_only.replace(
+        "  Haiku 4.5 · low · Ctx: 76% · 200K window · 47K used",
+        "  Haiku 4.5 · low · Ctx: 76% · 200K window · 47K used\n  paste again to expand",
+    );
+    let hint_and_mode = grid.replace(
+        mode,
+        "  paste again to expand\n  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+    );
+    for variant in [status_only, hint_only, grid.to_string(), hint_and_mode] {
+        let reading = claude
+            .evaluate_esc("\u{2733} Hook self-test", &variant, Some(&variant))
+            .unwrap();
+        assert_eq!(reading.id, "composer_working_spinner_status_no_color");
+        assert_eq!(reading.state, AgentState::Working);
+    }
+
+    for completed in ["\u{273b} Brewed for 12s", "\u{2733} Cooked for 2s"] {
+        let done = grid.replace("\u{2733} Flambéing… (1s · ↓ 90 tokens)", completed);
+        let reading = claude
+            .evaluate_esc("\u{2733} Hook self-test", &done, Some(&done))
+            .unwrap();
+        assert_ne!(
+            reading.state,
+            AgentState::Working,
+            "a completed transcript row must not hold the pane: {completed:?}"
+        );
+    }
+
+    let staged = include_str!("fixtures/claude_staged_no_color_2_1_243.txt")
+        .replace("  Reply not needed.", "  ✳ Flambéing… (1s)");
+    let reading = claude
+        .evaluate_esc("\u{2733} Hook self-test", &staged, Some(&staged))
+        .unwrap();
+    assert_eq!(
+        reading.state,
+        AgentState::IdleWithInput,
+        "spinner-shaped payload text must not visually accept a blocked prompt"
+    );
+    assert_eq!(reading.id, "composer_unstyled_input");
+
+    let long_body = (0..12)
+        .map(|index| format!("  draft line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let long_staged = include_str!("fixtures/claude_staged_no_color_2_1_243.txt")
+        .replace("  Reply not needed.", &long_body);
+    let long_reading = claude
+        .evaluate_esc("\u{2733} Hook self-test", &long_staged, Some(&long_staged))
+        .unwrap();
+    assert_eq!(long_reading.state, AgentState::IdleWithInput);
+    assert_eq!(long_reading.id, "composer_unstyled_input");
+
+    let idle_with_echo = concat!(
+        "✳ Flambéing… (1s)\n",
+        "❯ previous submitted prompt\n",
+        "  completed answer\n",
+        "────────────────────────────────────────────────────────────────\n",
+        "❯\u{a0}\n",
+        "────────────────────────────────────────────────────────────────\n",
+        "  Haiku 4.5 · low · Ctx: 76% · 200K window · 47K used\n",
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n",
+    );
+    let idle = claude
+        .evaluate_esc(
+            "\u{2733} Hook self-test",
+            idle_with_echo,
+            Some(idle_with_echo),
+        )
+        .unwrap();
+    assert_eq!(
+        idle.state,
+        AgentState::Idle,
+        "a transcript echo must not look like composer input (rule {})",
+        idle.id
+    );
+    assert_eq!(idle.id, "title_idle_sparkle");
 }
 
 /// De-escape a capture the way the daemon does before matching plain

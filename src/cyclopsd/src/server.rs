@@ -5,7 +5,10 @@
 //! own broadcast receiver, a lagged receiver is dropped with a warning,
 //! and writes carry a timeout so a wedged client costs one connection.
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -14,12 +17,13 @@ use cyclops_proto::TmuxPaneId;
 use cyclops_proto::{
     AdminNotifyParams, AgentWaitParams, AlarmClearParams, AlarmClearResult, AlarmPreviewParams,
     AlarmPreviewResult, AlarmSummary, AttentionResolveParams, AttentionShowParams,
-    ClaimDisposition, DeliveryState, Event, Hello, InboxClaimParams, InboxClaimResult,
-    InboxListParams, InboxListResult, InboxSummaryEntry, MessagesSnapshotParams, MsgSendParams,
-    NotificationAttemptId, NotificationAttentionCause, NotificationResolution, PaneReadParams,
+    ClaimDisposition, DaemonShutdownParams, DaemonShutdownResult, DeliveryState, Event, Hello,
+    InboxClaimParams, InboxClaimResult, InboxListParams, InboxListResult, InboxSummaryEntry,
+    MessagesFollowParams, MessagesSnapshotParams, MsgSendParams, NotificationAttemptId,
+    NotificationAttentionCause, NotificationResolution, NotificationWithdrawParams, PaneReadParams,
     PaneReadResult, PaneReadSource, PingResult, ProcessInstanceId, QuiesceParams, RecipientKey,
     ReplyParams, Request, RequeueParams, RequeueResult, Response, SessionStatus, StateReportParams,
-    StatusParams, StatusResult, SubscribeParams, WireError, PROTOCOL_VERSION,
+    StatusMailboxRoute, StatusParams, StatusResult, SubscribeParams, WireError, PROTOCOL_VERSION,
 };
 use cyclops_state::{BoundSocketCleanup, StateRoot};
 use cyclops_tmux::SessionWatcher;
@@ -28,6 +32,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, watch};
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::{ack, delivery, fusion, identity, unix_ms, Inner};
@@ -40,6 +45,35 @@ type Peer = Option<identity::PeerConn>;
 /// A write that does not finish inside this window means the client is
 /// wedged; the connection is dropped rather than buffered without bound.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+const STATUS_REFRESH_BUDGET: Duration = Duration::from_millis(250);
+const STATUS_REFRESH_CONCURRENCY: usize = 8;
+const STATUS_BLOCKED_NOTIFICATION_LIMIT: usize = 32;
+const STATUS_REFRESH_INCOMPLETE: &str = "status_refresh_incomplete";
+
+/// The same source build identifier written on the daemon boot log line.
+const BUILD_REF: &str = env!("CYCLOPS_BUILD_REF");
+
+/// One kernel observation shared by every hello and status answer.
+fn daemon_process() -> Option<ProcessInstanceId> {
+    static PROCESS: OnceLock<Option<ProcessInstanceId>> = OnceLock::new();
+    *PROCESS.get_or_init(|| {
+        let process = identity::ProcId::of(std::process::id() as i32)?;
+        ProcessInstanceId::new(process.pid, process.birth).ok()
+    })
+}
+
+/// One self-observed executable path shared by every hello and status answer.
+fn daemon_executable() -> Option<String> {
+    static EXECUTABLE: OnceLock<Option<String>> = OnceLock::new();
+    EXECUTABLE
+        .get_or_init(|| {
+            let path = std::env::current_exe().ok()?;
+            let path = std::fs::canonicalize(path).ok()?;
+            path.into_os_string().into_string().ok()
+        })
+        .clone()
+}
 
 pub(crate) struct BoundSocket {
     listener: Option<UnixListener>,
@@ -71,6 +105,7 @@ const DEFAULT_RECENT_LINES: u32 = 200;
 
 /// Settled history is context, not an unbounded transcript.
 const MAX_RECENT_SETTLED_MESSAGES: u32 = 100;
+const MAX_FOLLOW_MESSAGES: u32 = 256;
 
 /// Protocol v1 methods that exist but land in a later milestone. One list,
 /// so a new milestone replaces entries here instead of hunting through
@@ -191,6 +226,9 @@ pub(crate) async fn handle_conn(inner: Arc<Inner>, stream: UnixStream) {
     let (read_half, mut w) = stream.into_split();
     let hello = Hello {
         cyclops: env!("CARGO_PKG_VERSION").to_string(),
+        build: Some(BUILD_REF.to_string()),
+        daemon_process: daemon_process(),
+        daemon_executable: daemon_executable(),
         proto: PROTOCOL_VERSION,
         boot_id: inner.boot_id.clone(),
     };
@@ -262,7 +300,16 @@ async fn handle_line(
             };
         }
     };
+    let shutdown_after_write = req.method == "daemon.shutdown";
     let (resp, subscribe) = dispatch(inner, req, peer).await;
+    let shutdown_after_write = shutdown_after_write
+        && resp.error.is_none()
+        && resp
+            .result
+            .as_ref()
+            .and_then(|result| result.get("stopping"))
+            .and_then(Value::as_bool)
+            == Some(true);
     let text = serde_json::to_string(&resp).expect("response serializes");
     if let Some(params) = subscribe {
         // Subscribe before writing the ack so no event can fall between.
@@ -273,6 +320,10 @@ async fn handle_line(
         return LineOutcome::Subscribed(params.kinds, rx);
     }
     if write_line(w, &text).await {
+        if shutdown_after_write {
+            inner.shutdown_request.send_replace(true);
+            return LineOutcome::Drop;
+        }
         LineOutcome::Continue
     } else {
         LineOutcome::Drop
@@ -357,8 +408,8 @@ pub(crate) async fn dispatch(
                     Err(r) => return (r, None),
                 },
             };
-            refresh_status_detections(inner).await;
-            let result = status_result(inner, params.open_deliveries);
+            let incomplete = refresh_status_detections(inner).await;
+            let result = status_result_with_refresh(inner, params.open_deliveries, &incomplete);
             (
                 Response::ok(id, serde_json::to_value(result).expect("status serializes")),
                 None,
@@ -384,12 +435,43 @@ pub(crate) async fn dispatch(
                 None,
             )
         }
+        "daemon.shutdown" => {
+            let params: DaemonShutdownParams =
+                match decode_params(&id, req.params, "daemon.shutdown params") {
+                    Ok(params) => params,
+                    Err(response) => return (response, None),
+                };
+            if daemon_process() != Some(params.daemon_process) || inner.boot_id != params.boot_id {
+                return (
+                    Response::err(
+                        id,
+                        "daemon_changed",
+                        "daemon identity changed; nothing was stopped",
+                    ),
+                    None,
+                );
+            }
+            let quiesced = delivery::quiesce(inner, params.timeout_ms).await;
+            let result = DaemonShutdownResult {
+                stopping: quiesced.quiet,
+                in_flight: quiesced.in_flight,
+            };
+            (
+                Response::ok(
+                    id,
+                    serde_json::to_value(result).expect("shutdown serializes"),
+                ),
+                None,
+            )
+        }
         "msg.send" => (msg_send(inner, id, req.params, peer).await, None),
         "msg.reply" => (msg_reply(inner, id, req.params, peer), None),
         "inbox.list" => (inbox_list(inner, id, req.params, peer), None),
         "inbox.claim" => (inbox_claim(inner, id, req.params, peer), None),
         "messages.snapshot" => (messages_snapshot(inner, id, req.params, peer), None),
+        "messages.follow" => (messages_follow(inner, id, req.params, peer), None),
         "msg.requeue" => (msg_requeue(inner, id, req.params, peer), None),
+        "notification.withdraw" => (notification_withdraw(inner, id, req.params, peer), None),
         "alarm.preview" => (alarm_preview(inner, id, req.params, peer), None),
         "alarm.clear" => (alarm_clear(inner, id, req.params, peer), None),
         "attention.show" => (attention_show(inner, id, req.params, peer).await, None),
@@ -666,7 +748,7 @@ fn from_result(id: Value, result: Result<Value, cyclops_proto::WireError>) -> Re
 /// The identity boundary both authenticated verbs stand on: the peer must
 /// present credentials and be the daemon's own user. Fail-closed, and in
 /// one place, because msg.send (sender attribution) and agent.state.report
-/// (hook-ACK evidence) must never disagree about who is allowed in — a
+/// (hook-ACK evidence) must never disagree about who is allowed in. A
 /// tightening applied to one and not the other would leave the record
 /// trusting a peer the other verb turns away.
 fn daemon_peer(peer: Peer) -> Result<(u32, i32), WireError> {
@@ -834,6 +916,31 @@ fn messages_snapshot(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -
     }
 }
 
+fn messages_follow(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
+    let params: MessagesFollowParams = match decode_params(&id, params, "messages.follow params") {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    if params.limit == 0 || params.limit > MAX_FOLLOW_MESSAGES {
+        return Response::err(
+            id,
+            "bad_request",
+            format!("limit must be between 1 and {MAX_FOLLOW_MESSAGES}"),
+        );
+    }
+    let (service, caller) = match mailbox_caller(inner, peer) {
+        Ok(caller) => caller,
+        Err(error) => return wire_error_response(id, error),
+    };
+    match service.messages_follow(caller.key, params.after_seq, params.limit) {
+        Ok(page) => Response::ok(
+            id,
+            serde_json::to_value(page).expect("messages follow page serializes"),
+        ),
+        Err(error) => wire_error_response(id, mailbox_service_error(error)),
+    }
+}
+
 fn msg_requeue(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
     let params: RequeueParams = match decode_params(&id, params, "msg.requeue params") {
         Ok(params) => params,
@@ -860,19 +967,48 @@ fn msg_requeue(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Resp
     )
 }
 
+fn notification_withdraw(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
+    let params: NotificationWithdrawParams =
+        match decode_params(&id, params, "notification.withdraw params") {
+            Ok(params) => params,
+            Err(response) => return response,
+        };
+    let (service, caller) = match mailbox_caller(inner, peer) {
+        Ok(caller) => caller,
+        Err(error) => return wire_error_response(id, error),
+    };
+    if !caller.key.is_admin() {
+        return wire_error_response(id, mailbox_admin_required());
+    }
+    match crate::messaging::withdraw_notification(
+        inner,
+        &service,
+        caller.key,
+        params.recipient,
+        params.attempt_id,
+    ) {
+        Ok(result) => Response::ok(
+            id,
+            serde_json::to_value(result).expect("notification withdrawal result serializes"),
+        ),
+        Err(error) => wire_error_response(id, mailbox_service_error(error)),
+    }
+}
+
 fn alarm_preview(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
     let params: AlarmPreviewParams = match decode_params(&id, params, "alarm.preview params") {
         Ok(params) => params,
         Err(response) => return response,
     };
-    if let Err(error) = require_mailbox_admin(inner, peer) {
-        return wire_error_response(id, error);
-    }
-    let service = match mailbox_service(inner) {
-        Ok(service) => service,
+    let (service, caller) = match mailbox_caller(inner, peer) {
+        Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    let records = match service.alarms_older_than(params.older_than_ms) {
+    if !caller.key.is_admin() {
+        return wire_error_response(id, mailbox_admin_required());
+    }
+    let cutoff_ms = unix_ms().saturating_sub(params.older_than_ms);
+    let records = match service.alarms_at_or_before(cutoff_ms) {
         Ok(records) => records,
         Err(error) => return wire_error_response(id, mailbox_service_error(error)),
     };
@@ -896,7 +1032,7 @@ fn alarm_preview(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Re
         .collect();
     Response::ok(
         id,
-        serde_json::to_value(AlarmPreviewResult { entries })
+        serde_json::to_value(AlarmPreviewResult { entries, cutoff_ms })
             .expect("alarm preview result serializes"),
     )
 }
@@ -906,9 +1042,6 @@ fn alarm_clear(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Resp
         Ok(params) => params,
         Err(response) => return response,
     };
-    if let Err(error) = require_mailbox_admin(inner, peer) {
-        return wire_error_response(id, error);
-    }
     if params.ids.is_empty() {
         return Response::err(id, "bad_request", "alarm.clear requires explicit alarm ids");
     }
@@ -919,11 +1052,14 @@ fn alarm_clear(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Resp
             Err(_) => return Response::err(id, "bad_request", format!("invalid alarm id '{raw}'")),
         }
     }
-    let service = match mailbox_service(inner) {
-        Ok(service) => service,
+    let (service, caller) = match mailbox_caller(inner, peer) {
+        Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    let cleared = match service.clear_alarms(&attempts) {
+    if !caller.key.is_admin() {
+        return wire_error_response(id, mailbox_admin_required());
+    }
+    let cleared = match service.clear_alarms(caller.key, &attempts, params.cutoff_ms) {
         Ok(cleared) => cleared,
         Err(error) => return wire_error_response(id, mailbox_service_error(error)),
     };
@@ -1155,7 +1291,14 @@ fn mailbox_identity_from_origin(
     match origin {
         identity::PeerOrigin::Admin => Ok(service.admin()),
         identity::PeerOrigin::Pane {
-            pane_id, pane_root, ..
+            vendor_below: false,
+            ..
+        } => Ok(service.admin()),
+        identity::PeerOrigin::Pane {
+            pane_id,
+            pane_root,
+            vendor_below: true,
+            ..
         } => {
             let pane = pane_id.parse::<TmuxPaneId>().map_err(|error| WireError {
                 code: "denied".to_string(),
@@ -1204,7 +1347,9 @@ pub(crate) fn mailbox_service_error(error: crate::mailbox::MailboxServiceError) 
                 | MailboxError::AlreadyClaimed { .. }
                 | MailboxError::NotificationAttemptMismatch { .. }
                 | MailboxError::NotificationClearRequiresAttention
-                | MailboxError::NotificationRequeueRequiresAttention => {
+                | MailboxError::NotificationRequeueRequiresAttention
+                | MailboxError::NotificationWithdrawalRequiresPreWrite
+                | MailboxError::NotificationWithdrawalRecipientMismatch { .. } => {
                     ("conflict", error.to_string())
                 }
                 MailboxError::NoUnresolvedAttention(_)
@@ -1508,26 +1653,172 @@ fn verify_report_origin(
     })
 }
 
-/// Refresh every live pane before returning the operator status surface.
-///
-/// Status is an explicit decision point for people and delivery automation.
-/// Returning a cached idle after a pane has started working makes both the
-/// displayed state and the next delivery unsafe. The normal event loop stays
-/// cache-driven; only this on-demand inspection pays for a current screen
-/// observation.
-async fn refresh_status_detections(inner: &Arc<Inner>) {
+type StatusRefreshFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
+type StatusRefreshJob = (crate::PaneKey, StatusRefreshFuture);
+
+/// Refresh live panes within one request-wide budget. Unfinished routes remain
+/// in the returned set and the status projection refuses their cached facts.
+async fn refresh_status_detections(inner: &Arc<Inner>) -> HashSet<crate::PaneKey> {
+    let deadline = tokio::time::Instant::now() + STATUS_REFRESH_BUDGET;
+    let mut jobs = VecDeque::new();
     for session_idx in 0..inner.session_slots().len() {
         let Some(watcher) = inner.watcher_of(session_idx) else {
             continue;
         };
-        let pane_ids: Vec<String> = watcher
-            .snapshot()
-            .into_iter()
-            .map(|pane| pane.pane_id)
-            .collect();
-        for pane_id in pane_ids {
-            fusion::recompute_pane(inner, session_idx, &watcher, &pane_id, true, "status").await;
+        for pane in watcher.snapshot() {
+            let pane_id = pane.pane_id;
+            let key = crate::PaneKey::new(session_idx, &pane_id);
+            let inner = Arc::clone(inner);
+            let watcher = Arc::clone(&watcher);
+            jobs.push_back((
+                key,
+                Box::pin(async move {
+                    fusion::recompute_pane(&inner, session_idx, &watcher, &pane_id, true, "status")
+                        .await
+                        .is_some()
+                }) as StatusRefreshFuture,
+            ));
         }
+    }
+    run_status_refresh_jobs(jobs, deadline, STATUS_REFRESH_CONCURRENCY).await
+}
+
+async fn run_status_refresh_jobs(
+    mut pending: VecDeque<StatusRefreshJob>,
+    deadline: tokio::time::Instant,
+    concurrency: usize,
+) -> HashSet<crate::PaneKey> {
+    let mut incomplete: HashSet<_> = pending.iter().map(|(pane, _)| pane.clone()).collect();
+    let mut running = JoinSet::new();
+    let concurrency = concurrency.max(1);
+
+    loop {
+        while running.len() < concurrency {
+            let Some((pane, refresh)) = pending.pop_front() else {
+                break;
+            };
+            running.spawn(async move { (pane, refresh.await) });
+        }
+        if running.is_empty() {
+            break;
+        }
+        match tokio::time::timeout_at(deadline, running.join_next()).await {
+            Ok(Some(Ok((pane, true)))) => {
+                incomplete.remove(&pane);
+            }
+            Ok(Some(Ok((_, false))) | Some(Err(_))) => {}
+            Ok(None) => break,
+            Err(_) => {
+                // Pane recomputation can publish state and journal facts. It
+                // is not cancellation-safe, so overdue work finishes in the
+                // background while this answer refuses its cached result.
+                running.detach_all();
+                break;
+            }
+        }
+    }
+    incomplete
+}
+
+type ComposerCandidateIndex = HashMap<
+    RecipientKey,
+    HashMap<NotificationAttemptId, crate::mailbox::ActiveComposerNotification>,
+>;
+
+fn composer_candidate_index(inner: &Inner) -> Option<ComposerCandidateIndex> {
+    let candidates = inner
+        .mailbox
+        .as_ref()?
+        .active_composer_notifications_snapshot()
+        .ok()?;
+    let mut grouped = HashMap::new();
+    for candidate in candidates {
+        grouped
+            .entry(candidate.record.recipient)
+            .or_insert_with(HashMap::new)
+            .insert(candidate.record.attempt_id, candidate);
+    }
+    Some(grouped)
+}
+
+fn refuse_incomplete_status(pane: &mut cyclops_proto::PaneStatus) {
+    pane.manifest = None;
+    pane.manifest_display_name = None;
+    pane.state = cyclops_proto::AgentState::Unknown;
+    pane.state_ms = None;
+    pane.write_ready = false;
+    pane.write_block = Some(STATUS_REFRESH_INCOMPLETE.to_string());
+    pane.composer = cyclops_proto::ComposerState::ComposerAmbiguous;
+    pane.composer_proof = cyclops_proto::ComposerProof::Unprovable;
+    pane.composer_reason = Some(STATUS_REFRESH_INCOMPLETE.to_string());
+    if pane.notification_attempt.is_some() || pane.composer_candidates > 0 {
+        pane.next_action = Some(operator_next_action(
+            pane.notification_state,
+            pane.notification_attempt.is_some(),
+        ));
+    } else {
+        pane.next_action = None;
+    }
+    pane.working_confirmed = None;
+    pane.hooks_verified = None;
+}
+
+fn operator_next_action(
+    notification: Option<cyclops_proto::NotificationState>,
+    has_exact_attempt: bool,
+) -> cyclops_proto::ComposerNextAction {
+    use cyclops_proto::{ComposerNextAction, NotificationState};
+
+    match notification {
+        Some(NotificationState::AttentionRequired) if has_exact_attempt => {
+            ComposerNextAction::InspectAttention
+        }
+        Some(
+            NotificationState::Writing
+            | NotificationState::Staged
+            | NotificationState::Submitting
+            | NotificationState::Submitted
+            | NotificationState::Notified
+            | NotificationState::WithdrawnAfterStaging,
+        ) if has_exact_attempt => ComposerNextAction::CheckHealth,
+        _ => ComposerNextAction::InspectMessages,
+    }
+}
+
+fn composer_next_action(
+    composer: cyclops_proto::ComposerState,
+    notification: cyclops_proto::NotificationState,
+    message: Option<cyclops_proto::ComposerMessageState>,
+    active_worker_owns: bool,
+) -> cyclops_proto::ComposerNextAction {
+    use cyclops_proto::{
+        ComposerMessageState, ComposerNextAction, ComposerState, NotificationState,
+    };
+
+    let exact_composer = matches!(
+        composer,
+        ComposerState::CyclopsNotificationStaged | ComposerState::CyclopsNotificationSubmitted
+    );
+    if !exact_composer || !active_worker_owns {
+        return operator_next_action(Some(notification), true);
+    }
+    match (composer, notification, message) {
+        (
+            ComposerState::CyclopsNotificationStaged,
+            NotificationState::Staged,
+            Some(ComposerMessageState::Pending),
+        ) => ComposerNextAction::AutomaticSubmit,
+        (
+            ComposerState::CyclopsNotificationStaged,
+            NotificationState::Staged,
+            Some(ComposerMessageState::Claimed),
+        ) => ComposerNextAction::AutomaticReconcile,
+        (
+            ComposerState::CyclopsNotificationStaged | ComposerState::CyclopsNotificationSubmitted,
+            NotificationState::Submitting | NotificationState::Submitted,
+            _,
+        ) => ComposerNextAction::AutomaticReconcile,
+        _ => operator_next_action(Some(notification), true),
     }
 }
 
@@ -1537,6 +1828,14 @@ async fn refresh_status_detections(inner: &Arc<Inner>) {
 /// waiting on a human. It is opt-in because it reads the session files,
 /// and only a client reconciling attention at startup needs it.
 pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResult {
+    status_result_with_refresh(inner, open_deliveries, &HashSet::new())
+}
+
+fn status_result_with_refresh(
+    inner: &Inner,
+    open_deliveries: bool,
+    incomplete_refreshes: &HashSet<crate::PaneKey>,
+) -> StatusResult {
     // The ledger fold happens before the state locks are taken: it reads
     // files, and the fusion engine wants those locks back promptly.
     let open_deliveries = if open_deliveries {
@@ -1549,13 +1848,37 @@ pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResul
         .as_ref()
         .and_then(|service| service.pending_count(service.admin().key).ok())
         .unwrap_or(0) as u64;
+    let mailbox_routes = inner
+        .mailbox
+        .as_ref()
+        .and_then(|service| service.routes().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|identity| StatusMailboxRoute {
+            recipient: identity.key,
+            label: identity.label,
+        })
+        .collect();
+    let blocked_notifications = inner
+        .mailbox
+        .as_ref()
+        .and_then(|service| {
+            service
+                .blocked_notification_snapshot(unix_ms(), STATUS_BLOCKED_NOTIFICATION_LIMIT)
+                .ok()
+        })
+        .unwrap_or_default();
     let adoptions = inner
         .registry
         .lock()
         .expect("registry lock")
         .exact_adoptions();
-    let diagnostics = crate::deadlock::status_diagnostics(inner);
-    let detections = inner.detections.lock().expect("detections lock");
+    let mut diagnostics = crate::deadlock::status_diagnostics(inner);
+    diagnostics.extend(inner.engine.notification_worker_diagnostics());
+    let composer_candidates = composer_candidate_index(inner);
+    // Status joins durable notification state below. Clone the content-free
+    // fusion stamps first so no journal read runs under the detection lock.
+    let detections = inner.detections.lock().expect("detections lock").clone();
     let sessions = inner
         .session_slots()
         .iter()
@@ -1578,6 +1901,7 @@ pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResul
                     .iter()
                     .map(|r| {
                         let pane = crate::PaneKey::new(session_idx, &r.pane_id);
+                        let refresh_incomplete = incomplete_refreshes.contains(&pane);
                         let entry = detections.get(&pane);
                         let recipient = instance_id.and_then(|instance_id| {
                             Some(RecipientKey::agent(
@@ -1610,6 +1934,117 @@ pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResul
                         // has nothing behind it, so it stays refused.
                         ps.write_ready = entry.is_some_and(|e| e.detection.write_ready);
                         ps.write_block = entry.and_then(|e| e.detection.write_block.clone());
+                        ps.working_confirmed = (ps.state == cyclops_proto::AgentState::Working)
+                            .then_some(entry.is_some_and(|e| e.working_confirmed));
+                        if let Some(entry) = entry {
+                            ps.composer = entry.composer.state;
+                            ps.composer_proof = entry.composer.proof;
+                            ps.notification_attempt = entry.composer.notification_attempt;
+                            ps.composer_reason = entry.composer.reason.map(str::to_string);
+                            ps.composer_candidates = entry.composer.candidate_count;
+                        }
+                        if let Some(durable_candidates) = recipient.and_then(|recipient| {
+                            composer_candidates.as_ref()?.get(&recipient)
+                        }) {
+                            let durable_count = durable_candidates.len();
+                            ps.composer_candidates =
+                                u32::try_from(durable_count).unwrap_or(u32::MAX);
+                            ps.notification_attempt = if durable_count == 1 {
+                                durable_candidates.keys().next().copied()
+                            } else {
+                                None
+                            };
+                        }
+                        if let Some(attempt) = ps.notification_attempt {
+                            let candidate = recipient.and_then(|recipient| {
+                                composer_candidates.as_ref()?.get(&recipient)?.get(&attempt)
+                            });
+                            match candidate {
+                                Some(candidate) => {
+                                    ps.notification_state = Some(candidate.record.state);
+                                    ps.message_state = candidate
+                                        .entry_state
+                                        .as_ref()
+                                        .map(cyclops_proto::ComposerMessageState::from);
+                                    let cached_binding =
+                                        entry.and_then(|entry| entry.composer.binding.as_ref());
+                                    let durable_binding_complete = candidate
+                                        .record
+                                        .binding
+                                        .as_ref()
+                                        .is_some_and(|binding| {
+                                            binding.pane_root.is_some() && binding.leader.is_some()
+                                        });
+                                    let binding_unprovable = pane_root.is_none()
+                                        || cached_binding.is_none()
+                                        || !durable_binding_complete;
+                                    let binding_matches = recipient.is_some_and(|recipient| {
+                                        cached_binding.is_some_and(|binding| {
+                                            ProcessInstanceId::new(
+                                                binding.pane_root.pid,
+                                                binding.pane_root.birth,
+                                            )
+                                            .ok()
+                                            .is_some_and(|cached_root| {
+                                                pane_root == Some(cached_root)
+                                            }) && fusion::notification_binding_matches(
+                                                &candidate.record,
+                                                recipient,
+                                                binding,
+                                            )
+                                        })
+                                    });
+                                    if matches!(
+                                        ps.composer,
+                                        cyclops_proto::ComposerState::CyclopsNotificationStaged
+                                            | cyclops_proto::ComposerState::CyclopsNotificationSubmitted
+                                    ) && !binding_matches
+                                    {
+                                        ps.composer =
+                                            cyclops_proto::ComposerState::ComposerAmbiguous;
+                                        if binding_unprovable {
+                                            ps.composer_proof =
+                                                cyclops_proto::ComposerProof::Unprovable;
+                                            ps.composer_reason =
+                                                Some("binding_unprovable".to_string());
+                                        } else {
+                                            ps.composer_proof =
+                                                cyclops_proto::ComposerProof::Ambiguous;
+                                            ps.composer_reason =
+                                                Some("binding_mismatch".to_string());
+                                        }
+                                        ps.next_action = Some(operator_next_action(
+                                            ps.notification_state,
+                                            ps.notification_attempt.is_some(),
+                                        ));
+                                    } else {
+                                        let active_worker_owns =
+                                            inner.engine.notification_worker_owns(
+                                                candidate.record.recipient,
+                                                candidate.record.attempt_id,
+                                            );
+                                        ps.next_action = Some(composer_next_action(
+                                            ps.composer,
+                                            candidate.record.state,
+                                            ps.message_state,
+                                            active_worker_owns,
+                                        ));
+                                    }
+                                }
+                                None => {
+                                    // A retired or unreadable durable barrier cannot inherit a
+                                    // prior exact status stamp. Status is evidence, not authority.
+                                    ps.composer = cyclops_proto::ComposerState::ComposerAmbiguous;
+                                    ps.composer_proof = cyclops_proto::ComposerProof::Unprovable;
+                                    ps.next_action = Some(operator_next_action(
+                                        ps.notification_state,
+                                        ps.notification_attempt.is_some(),
+                                    ));
+                                }
+                            }
+                        } else if ps.composer_candidates > 0 {
+                            ps.next_action = Some(cyclops_proto::ComposerNextAction::InspectMessages);
+                        }
                         // Hook liveness (amendment c): adopted panes whose
                         // manifest declares hooks carry the verified bit,
                         // scoped to the current occupant (edges from a
@@ -1648,6 +2083,9 @@ pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResul
                             .as_ref()
                             .and_then(|id| inner.manifests.get(id))
                             .map(|m| m.agent.display_name.clone());
+                        if refresh_incomplete {
+                            refuse_incomplete_status(&mut ps);
+                        }
                         ps
                     })
                     .collect(),
@@ -1656,14 +2094,20 @@ pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResul
         .collect();
     StatusResult {
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+        daemon_build: Some(BUILD_REF.to_string()),
+        daemon_process: daemon_process(),
+        daemon_executable: daemon_executable(),
         proto: PROTOCOL_VERSION,
         boot_id: inner.boot_id.clone(),
         uptime_ms: inner.started.elapsed().as_millis() as u64,
         tmux_version: inner.tmux_version.clone(),
         sessions,
+        mailbox_routes,
         admin_unread,
         open_deliveries,
         diagnostics,
+        blocked_notifications: blocked_notifications.rows,
+        blocked_notifications_total: blocked_notifications.total,
         // Always answered, empty set included: "I loaded none" is the fact
         // a client needs to explain an unknown pane, and it is exactly the
         // fact an omitted field would hide.
@@ -1789,7 +2233,7 @@ fn cap_lines(text: String, cap: Option<u32>) -> String {
 /// Returns the slot's index alongside the watcher and pane id: a caller
 /// resolving a session verdict off this (`pane.read source=detection`)
 /// needs that idx rather than a name re-derived from the watcher, for the
-/// same reason `emit_state` takes one — see its doc comment.
+/// same reason `emit_state` takes one. See its doc comment.
 fn resolve_target(inner: &Inner, target: &str) -> Option<(usize, Arc<SessionWatcher>, String)> {
     let (idx, pane_id) = inner.resolve_recipient(target)?;
     inner.watcher_of(idx).and_then(|watcher| {
@@ -1845,8 +2289,213 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::path::Path;
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
     use std::time::{Duration, Instant};
+
+    #[tokio::test(start_paused = true)]
+    async fn status_refresh_has_one_budget_and_bounded_concurrency() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut jobs = VecDeque::new();
+        for index in 0..(STATUS_REFRESH_CONCURRENCY + 3) {
+            let started = Arc::clone(&started);
+            jobs.push_back((
+                crate::PaneKey::new(0, &format!("%{index}")),
+                Box::pin(async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                    true
+                }) as StatusRefreshFuture,
+            ));
+        }
+        let budget = Duration::from_millis(25);
+        let before = tokio::time::Instant::now();
+
+        let incomplete =
+            run_status_refresh_jobs(jobs, before + budget, STATUS_REFRESH_CONCURRENCY).await;
+
+        assert_eq!(tokio::time::Instant::now() - before, budget);
+        assert_eq!(started.load(Ordering::SeqCst), STATUS_REFRESH_CONCURRENCY);
+        assert_eq!(incomplete.len(), STATUS_REFRESH_CONCURRENCY + 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overdue_status_refresh_finishes_after_the_response_budget() {
+        let completed = Arc::new(AtomicUsize::new(0));
+        let completed_by_job = Arc::clone(&completed);
+        let pane = crate::PaneKey::new(0, "%1");
+        let jobs = VecDeque::from([(
+            pane.clone(),
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                completed_by_job.fetch_add(1, Ordering::SeqCst);
+                true
+            }) as StatusRefreshFuture,
+        )]);
+        let before = tokio::time::Instant::now();
+
+        let incomplete = run_status_refresh_jobs(jobs, before + Duration::from_millis(25), 1).await;
+
+        assert_eq!(incomplete, HashSet::from([pane]));
+        assert_eq!(
+            tokio::time::Instant::now() - before,
+            Duration::from_millis(25)
+        );
+        assert_eq!(completed.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_millis(25)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn incomplete_refresh_refuses_live_claims_but_keeps_durable_identity() {
+        let row = cyclops_tmux::PaneRow {
+            pane_id: "%1".into(),
+            window_id: "@1".into(),
+            window_name: "main".into(),
+            title: String::new(),
+            dead: false,
+            in_mode: false,
+            current_command: "claude".into(),
+            width: 120,
+            height: 40,
+            active: true,
+            pane_pid: 42,
+        };
+        let attempt = NotificationAttemptId::generate();
+        let mut pane = row.to_status(
+            Some("reviewer".into()),
+            Some("claude".into()),
+            cyclops_proto::AgentState::Working,
+        );
+        pane.write_ready = true;
+        pane.composer = cyclops_proto::ComposerState::CyclopsNotificationStaged;
+        pane.composer_proof = cyclops_proto::ComposerProof::ExactNotification;
+        pane.notification_attempt = Some(attempt);
+        pane.composer_candidates = 1;
+        pane.notification_state = Some(cyclops_proto::NotificationState::Staged);
+        pane.message_state = Some(cyclops_proto::ComposerMessageState::Pending);
+        pane.next_action = Some(cyclops_proto::ComposerNextAction::AutomaticSubmit);
+        pane.working_confirmed = Some(true);
+
+        refuse_incomplete_status(&mut pane);
+
+        assert_eq!(pane.state, cyclops_proto::AgentState::Unknown);
+        assert!(!pane.write_ready);
+        assert_eq!(pane.write_block.as_deref(), Some(STATUS_REFRESH_INCOMPLETE));
+        assert_eq!(
+            pane.composer,
+            cyclops_proto::ComposerState::ComposerAmbiguous
+        );
+        assert_eq!(
+            pane.composer_proof,
+            cyclops_proto::ComposerProof::Unprovable
+        );
+        assert_eq!(
+            pane.composer_reason.as_deref(),
+            Some(STATUS_REFRESH_INCOMPLETE)
+        );
+        assert_eq!(pane.notification_attempt, Some(attempt));
+        assert_eq!(pane.composer_candidates, 1);
+        assert_eq!(
+            pane.notification_state,
+            Some(cyclops_proto::NotificationState::Staged)
+        );
+        assert_eq!(
+            pane.message_state,
+            Some(cyclops_proto::ComposerMessageState::Pending)
+        );
+        assert_eq!(
+            pane.next_action,
+            Some(cyclops_proto::ComposerNextAction::CheckHealth)
+        );
+        assert_eq!(pane.working_confirmed, None);
+    }
+
+    #[test]
+    fn incomplete_refresh_keeps_ambiguous_candidate_count_and_action() {
+        let row = cyclops_tmux::PaneRow {
+            pane_id: "%1".into(),
+            window_id: "@1".into(),
+            window_name: "main".into(),
+            title: String::new(),
+            dead: false,
+            in_mode: false,
+            current_command: "claude".into(),
+            width: 120,
+            height: 40,
+            active: true,
+            pane_pid: 42,
+        };
+        let mut pane = row.to_status(
+            Some("reviewer".into()),
+            Some("claude".into()),
+            cyclops_proto::AgentState::Idle,
+        );
+        pane.composer_candidates = 2;
+
+        refuse_incomplete_status(&mut pane);
+
+        assert_eq!(pane.notification_attempt, None);
+        assert_eq!(pane.composer_candidates, 2);
+        assert_eq!(
+            pane.next_action,
+            Some(cyclops_proto::ComposerNextAction::InspectMessages)
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_shutdown_is_requested_only_after_the_response_is_written() {
+        let inner = bare_inner();
+        let process = daemon_process().expect("this process has a kernel generation");
+        let request = serde_json::to_string(&Request {
+            id: json!(7),
+            method: "daemon.shutdown".into(),
+            params: json!({
+                "daemon_process": process,
+                "boot_id": inner.boot_id,
+                "timeout_ms": 0,
+            }),
+        })
+        .unwrap();
+        let (server, client) = UnixStream::pair().unwrap();
+        let (_, mut writer) = server.into_split();
+        let mut shutdown = inner.shutdown_request.subscribe();
+
+        let outcome = handle_line(&inner, &request, None, &mut writer).await;
+        assert!(matches!(outcome, LineOutcome::Drop));
+        shutdown.changed().await.unwrap();
+        assert!(*shutdown.borrow());
+
+        let mut line = String::new();
+        let mut reader = BufReader::new(client);
+        reader.read_line(&mut line).await.unwrap();
+        let response: Response = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(response.result.unwrap()["stopping"], true);
+    }
+
+    #[tokio::test]
+    async fn changed_process_generation_never_requests_shutdown() {
+        let inner = bare_inner();
+        let process = daemon_process().expect("this process has a kernel generation");
+        let replacement = ProcessInstanceId::new(process.pid(), process.birth() + 1).unwrap();
+        let request = serde_json::to_string(&Request {
+            id: json!(8),
+            method: "daemon.shutdown".into(),
+            params: json!({
+                "daemon_process": replacement,
+                "boot_id": inner.boot_id,
+                "timeout_ms": 0,
+            }),
+        })
+        .unwrap();
+        let (server, _client) = UnixStream::pair().unwrap();
+        let (_, mut writer) = server.into_split();
+
+        let outcome = handle_line(&inner, &request, None, &mut writer).await;
+        assert!(matches!(outcome, LineOutcome::Continue));
+        assert!(!*inner.shutdown_request.borrow());
+    }
 
     #[test]
     fn a_nonpending_claim_has_a_recoverable_wire_code() {
@@ -1983,9 +2632,12 @@ mod tests {
             sessions: StdMutex::new(Vec::new()),
             events: broadcast::channel(16).0,
             detections: StdMutex::new(HashMap::<crate::PaneKey, DetEntry>::new()),
+            pane_recomputes: StdMutex::new(HashMap::new()),
+            lifecycle_rechecks: StdMutex::new(HashMap::new()),
             registry: StdMutex::new(registry),
             theme: StdMutex::new(cyclops_theme::ThemeWatch::new(&home)),
             hook_readings: StdMutex::new(HashMap::new()),
+            hook_lifecycle: StdMutex::new(crate::hook_lifecycle::Store::new()),
             turn_ends: StdMutex::new(crate::turnkey::Ends::new()),
             argv_cache: StdMutex::new(HashMap::new()),
             engine: crate::delivery::Engine::new(),
@@ -1994,6 +2646,7 @@ mod tests {
             inject_pause: StdMutex::new(None),
             fail_chrome_restore: std::sync::atomic::AtomicBool::new(false),
             workspace_ui: StdMutex::new(crate::workspace_ui::WorkspaceUiState::default()),
+            shutdown_request: watch::channel(false).0,
             // No production sender behind this in tests: nothing here
             // spawns a session_task or calls Daemon::shutdown.
             stop: watch::channel(false).1,
@@ -2261,6 +2914,7 @@ mod tests {
         let attempt_id = NotificationAttemptId::generate();
         let binding = NotificationBinding {
             recipient: agent,
+            pane_root: Some(ProcessInstanceId::new(3999, 817_999).unwrap()),
             leader: Some(ProcessInstanceId::new(4000, 818_000).unwrap()),
             agent: ProcessInstanceId::new(4242, 818_221).unwrap(),
             manifest: NotificationManifestId::new("codex").unwrap(),
@@ -2298,6 +2952,87 @@ mod tests {
             crate::mailbox::MailboxService::new_with_events(directory, store, inner.events.clone());
         Arc::get_mut(&mut inner).expect("sole owner").mailbox = Some(Arc::new(service));
         (inner, path, attempt_id, message_id.to_string())
+    }
+
+    /// A daemon with one exact notification stopped before any pane write.
+    fn inner_with_blocked_notification(
+        tag: &str,
+    ) -> (
+        Arc<Inner>,
+        std::path::PathBuf,
+        NotificationAttemptId,
+        RecipientKey,
+        cyclops_proto::MessageId,
+    ) {
+        use cyclops_proto::{NotificationManifestId, NotificationPreWriteCause};
+
+        let path = cyclops_proto::scratch::scratch_dir(tag);
+        let _ = std::fs::remove_dir_all(&path);
+        let root = cyclops_state::StateRoot::open_or_create(&path).unwrap();
+        let workspace = WorkspaceId::from_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let session = SessionInstanceId::from_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let recipient =
+            RecipientKey::agent(workspace, session, TmuxPaneId::from_str("%1").unwrap());
+        let directory = crate::mailbox::MailboxDirectory::new(
+            workspace,
+            [crate::mailbox::MailboxIdentity {
+                key: recipient,
+                label: "reviewer".into(),
+            }],
+        )
+        .unwrap();
+        let store = crate::mailbox::MessageStore::open(
+            &root,
+            Path::new("workspaces/current/messages.ndjson"),
+            workspace,
+            "boot",
+        )
+        .unwrap();
+        let mut inner = bare_inner();
+        let service =
+            crate::mailbox::MailboxService::new_with_events(directory, store, inner.events.clone());
+        let accepted = service
+            .send(
+                service.admin(),
+                crate::mailbox::MailboxSend {
+                    addresses: vec!["reviewer".into()],
+                    subject: "Blocked".into(),
+                    body: "claimable".into(),
+                    fyi: false,
+                    client_key: None,
+                    supersedes: None,
+                },
+            )
+            .unwrap();
+        let attempt = service
+            .prepare_oldest_notification(recipient)
+            .unwrap()
+            .unwrap();
+        let context = crate::notification_adapter::NotificationContext::new(
+            service.store_handle(),
+            accepted.message_id.clone(),
+            recipient,
+            attempt.attempt_id,
+        );
+        context.record_gating().unwrap();
+        context
+            .record_pre_write_block(
+                NotificationPreWriteCause::BindingUnprovable,
+                Some(cyclops_proto::NotificationPreWriteObservation {
+                    pane_root: None,
+                    selected_manifest: Some(NotificationManifestId::new("codex").unwrap()),
+                    binding: None,
+                }),
+            )
+            .unwrap();
+        Arc::get_mut(&mut inner).expect("sole owner").mailbox = Some(Arc::new(service));
+        (
+            inner,
+            path,
+            attempt.attempt_id,
+            recipient,
+            accepted.message_id,
+        )
     }
 
     async fn ask_inner(inner: &Arc<Inner>, method: &str, params: Value) -> Response {
@@ -2516,6 +3251,8 @@ mod tests {
             attention_action_error(crate::attention_resolution::AttentionActionError::Uncertain);
         assert_eq!(error.code, "attention_action_uncertain");
         assert!(error.message.contains("outcome is uncertain"));
+        assert!(error.message.contains("no second key"));
+        assert!(error.message.contains("required durable evidence"));
     }
 
     /// Preview names why an attempt needs attention, so an operator can
@@ -2614,6 +3351,159 @@ mod tests {
         assert!(response.error.is_none(), "{:?}", response.error);
         assert_eq!(response.result.unwrap()["requeued"], false);
         std::fs::remove_dir_all(path).ok();
+    }
+
+    #[tokio::test]
+    async fn external_admin_withdraws_one_exact_blocked_notification() {
+        let (inner, path, attempt_id, recipient, message_id) =
+            inner_with_blocked_notification("operator-withdraw-server");
+        let params = json!({
+            "attempt_id": attempt_id,
+            "recipient": recipient,
+        });
+        let response = ask_inner(&inner, "notification.withdraw", params.clone()).await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result: cyclops_proto::NotificationWithdrawResult =
+            serde_json::from_value(response.result.unwrap()).unwrap();
+        assert_eq!(result.attempt_id, attempt_id);
+        assert_eq!(result.message_id, message_id);
+        assert_eq!(result.recipient, recipient);
+        assert_eq!(
+            result.disposition,
+            cyclops_proto::NotificationWithdrawDisposition::Withdrawn
+        );
+
+        let repeated = ask_inner(&inner, "notification.withdraw", params).await;
+        let repeated: cyclops_proto::NotificationWithdrawResult =
+            serde_json::from_value(repeated.result.unwrap()).unwrap();
+        assert_eq!(
+            repeated.disposition,
+            cyclops_proto::NotificationWithdrawDisposition::AlreadyWithdrawn
+        );
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn status_exposes_one_body_free_blocked_wake_and_its_exact_action() {
+        let (inner, path, attempt_id, recipient, message_id) =
+            inner_with_blocked_notification("status-blocked-notification");
+
+        let status = status_result(&inner, false);
+        assert_eq!(status.blocked_notifications.len(), 1);
+        assert_eq!(status.blocked_notifications_total, 1);
+        let blocked = &status.blocked_notifications[0];
+        assert_eq!(blocked.message_id, message_id);
+        assert_eq!(blocked.notification_attempt, attempt_id);
+        assert_eq!(blocked.recipient.recipient, recipient);
+        assert_eq!(
+            blocked.recipient.notification.pre_write_cause,
+            Some(cyclops_proto::NotificationPreWriteCause::BindingUnprovable)
+        );
+        assert_eq!(
+            blocked.next_action,
+            Some(cyclops_proto::StatusNextAction::WithdrawNotification)
+        );
+        assert!(blocked.recipient.can_withdraw_notification);
+        assert_eq!(blocked.recipient.fifo_position, Some(1));
+
+        let encoded = serde_json::to_string(&status).unwrap();
+        assert!(
+            !encoded.contains("claimable"),
+            "message body leaked: {encoded}"
+        );
+
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn status_never_advertises_a_second_submit_after_submit_intent() {
+        use cyclops_proto::{
+            ComposerMessageState, ComposerNextAction, ComposerState, NotificationState,
+        };
+
+        assert_eq!(
+            composer_next_action(
+                ComposerState::CyclopsNotificationStaged,
+                NotificationState::Staged,
+                Some(ComposerMessageState::Pending),
+                true,
+            ),
+            ComposerNextAction::AutomaticSubmit
+        );
+        assert_eq!(
+            composer_next_action(
+                ComposerState::CyclopsNotificationStaged,
+                NotificationState::Staged,
+                Some(ComposerMessageState::Claimed),
+                true,
+            ),
+            ComposerNextAction::AutomaticReconcile
+        );
+        for message in [ComposerMessageState::Pending, ComposerMessageState::Claimed] {
+            assert_eq!(
+                composer_next_action(
+                    ComposerState::CyclopsNotificationStaged,
+                    NotificationState::Staged,
+                    Some(message),
+                    false,
+                ),
+                ComposerNextAction::CheckHealth,
+                "{message:?}"
+            );
+        }
+        for state in [NotificationState::Submitting, NotificationState::Submitted] {
+            assert_eq!(
+                composer_next_action(
+                    ComposerState::CyclopsNotificationStaged,
+                    state,
+                    Some(ComposerMessageState::Pending),
+                    true,
+                ),
+                ComposerNextAction::AutomaticReconcile,
+                "{state:?}"
+            );
+            assert_eq!(
+                composer_next_action(
+                    ComposerState::CyclopsNotificationStaged,
+                    state,
+                    Some(ComposerMessageState::Pending),
+                    false,
+                ),
+                ComposerNextAction::CheckHealth,
+                "{state:?}"
+            );
+        }
+        for (state, expected) in [
+            (NotificationState::Notified, ComposerNextAction::CheckHealth),
+            (
+                NotificationState::AttentionRequired,
+                ComposerNextAction::InspectAttention,
+            ),
+            (
+                NotificationState::WithdrawnAfterStaging,
+                ComposerNextAction::CheckHealth,
+            ),
+        ] {
+            assert_eq!(
+                composer_next_action(
+                    ComposerState::CyclopsNotificationStaged,
+                    state,
+                    Some(ComposerMessageState::Claimed),
+                    true,
+                ),
+                expected,
+                "{state:?}"
+            );
+        }
+        assert_eq!(
+            composer_next_action(
+                ComposerState::ComposerAmbiguous,
+                NotificationState::Staged,
+                Some(ComposerMessageState::Pending),
+                true,
+            ),
+            ComposerNextAction::CheckHealth
+        );
     }
 
     async fn call(tag: &str, method: &str, params: Value) -> Response {
@@ -2843,6 +3733,21 @@ mod tests {
             mailbox_identity_from_origin(&inner, &service, identity::PeerOrigin::Admin)
                 .unwrap()
                 .key,
+            RecipientKey::admin(workspace)
+        );
+        assert_eq!(
+            mailbox_identity_from_origin(
+                &inner,
+                &service,
+                identity::PeerOrigin::Pane {
+                    pane_id: "%1".into(),
+                    label: Some("operator-shell".into()),
+                    pane_root: root_process,
+                    vendor_below: false,
+                },
+            )
+            .unwrap()
+            .key,
             RecipientKey::admin(workspace)
         );
         assert_eq!(

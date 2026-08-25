@@ -36,6 +36,7 @@
           "guides/workspace",
           "guides/attach-tmux",
           "guides/coordinate-agents",
+          "guides/recovery",
           "guides/sessions"
         ]
       },
@@ -44,6 +45,8 @@
         "icon": "code",
         "pages": [
           "reference/cli",
+          "reference/health",
+          "reference/cleanup",
           "reference/configuration"
         ]
       }

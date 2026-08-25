@@ -11,9 +11,9 @@
 # Sensor summary for this CLI:
 #   title  AUTHORITATIVE for busy/idle. Tracks hooks within 30-80 ms, below the
 #          100 ms sample interval used to measure it (claude_busy_titles.json).
-#   hooks  AUTHORITATIVE for turn edges and the delivery ACK. UserPromptSubmit
-#          fires 21-28 ms after Enter for paste-injected input, payload carries
-#          the full prompt text so a message id is matchable.
+#   hooks  CANDIDATE prompt start and dispatch ACK only. UserPromptSubmit can
+#          precede a sibling hook that rejects the prompt, so later visual
+#          evidence decides acceptance and turn completion.
 #   screen LAST RESORT. Needed only for modal and permission states, which
 #          neither the title nor any hook reports.
 
@@ -49,9 +49,15 @@ config_mechanism = "--settings <file>"
 # instead of leaving the operator to wire one by hand. Nothing under
 # ~/.claude is read or written to do it.
 settings_flag = "--settings"
+# The current Claude hook schema exposes no turn id shared by
+# UserPromptSubmit and Stop. UserPromptSubmit carries the exact prompt, but
+# sibling hooks run concurrently and can still reject it. Treat the event as
+# an unkeyed candidate start and dispatch ACK. Visual evidence accepts and
+# ends the candidate. A session id or arrival order is not a turn key.
 turn_start = "UserPromptSubmit"
-turn_end = "Stop"
-ack = "UserPromptSubmit"          # delivery receipt, payload contains `prompt`
+turn_start_evidence = "candidate"
+ack = "UserPromptSubmit"
+ack_evidence = "dispatch"
 attention = "Notification"
 available = [
   "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "StopFailure",
@@ -91,6 +97,7 @@ evidence = "MEASURED: appears 30-80 ms after the Stop hook, 6 of 6 turns"
 [[rule]]
 id = "composer_empty"
 state = "idle"
+composer_semantic = "clean"
 priority = 900
 region = "bottom_non_empty_lines(6)"
 line_regex = ['^\s*❯\s*$']
@@ -116,11 +123,23 @@ state = "working"
 priority = 1150
 region = "bottom_non_empty_lines(10)"
 line_regex_esc = ['\x1b\[38;5;215m[·✶✽✳✢✻]\x1b\[39m\s+\x1b\[38;5;215m[A-Z][a-z]+…\s+\x1b\[38;5;246m\(\d+[smhd]']
-evidence = "MEASURED live capture on Claude Code 2.1.236 (2026-08-20): active frames 'ESC[38;5;215m· ESC[39m ESC[38;5;215mKneading… ESC[38;5;246m(28m 7s · 30.3k tokens)' and the same shape for Jitterbugging; completed steps render uniform gray or white"
+evidence = "MEASURED live capture on Claude Code 2.1.236 (2026-08-20): styled active frames"
+
+[[rule]]
+id = "composer_working_spinner_status_no_color"
+state = "working"
+priority = 1149
+region = "bottom_non_empty_lines(10)"
+lifecycle_evidence = false
+unstyled_only = true
+regex = ['(?m)^[·✶✽✳✢✻]\s+\S+…(?:\s+\(\d+[smhd](?:\s+·.*)?\))?\s*\n[^\n]+\n─{32,}\n❯\s*\n─{32,}\n\s{0,4}(?:\S[^·\n]*(?: · [^·\n]+){2,} · \d+K window(?: · \d+K used)?|(?:Opus|Sonnet|Haiku) \d+(?:\.\d+)?(?: \([^·\n]*\))? · (?:xhigh|high|medium|low)(?: · [^·\n]+)* · [^·\n]*…)\s*(?:\n\s{0,4}paste again to expand\s*)?(?:\n\s{0,4}(?:⏸|⏵⏵) [^·\n]*\b(?:on|off)\b(?: · .+| \(.+\))?\s*)?\z']
+note = """NO_COLOR removes the style distinction that proves this activity row is live. The full terminal suffix makes the runtime classification conservative and useful, but it cannot confirm or cancel a candidate hook lifecycle."""
+evidence = "MEASURED Claude Code 2.1.243 under NO_COLOR (2026-08-24): cycling activity row, auxiliary row, and current composer trailer"
 
 [[rule]]
 id = "composer_has_staged_input"
 state = "idle_with_input"
+composer_semantic = "human_input"
 priority = 1050
 region = "bottom_non_empty_lines(6)"
 line_regex = ['^\s*❯\s+\S']
@@ -166,6 +185,7 @@ evidence = "MEASURED F55: real input is unstyled after the NBSP; ghost styling p
 [[rule]]
 id = "composer_styled_input"
 state = "idle_with_input"
+composer_semantic = "human_input"
 priority = 1035
 region = "bottom_non_empty_lines(6)"
 line_regex = ['^\s*❯\s+\S']
@@ -180,6 +200,20 @@ into the human's draft and submitted it.
 This is the fail-safe floor for the composer: anything styled that is not
 provably a ghost is treated as a human's text and held."""
 evidence = "MEASURED 2026-08-20 (issue 16, Claude Code 2.1.232): typed '/model' renders ESC[39m + glyph + NBSP + ESC[38;5;153m, while real ghost styling is dim ESC[2m"
+
+[[rule]]
+id = "composer_unstyled_input"
+state = "idle_with_input"
+composer_semantic = "human_input"
+priority = 1030
+region = "bottom_non_empty_lines(10)"
+unstyled_only = true
+regex = ['(?m)^(?:❯(?: |\x{a0})\S[^\n]*|  \S[^\n]*)(?:\n  [^\n]*)*\n─{32,}\n\s{0,4}(?:\S[^·\n]*(?: · [^·\n]+){2,} · \d+K window(?: · \d+K used)?|(?:Opus|Sonnet|Haiku) \d+(?:\.\d+)?(?: \([^·\n]*\))? · (?:xhigh|high|medium|low)(?: · [^·\n]+)* · [^·\n]*…)\s*(?:\n\s{0,4}paste again to expand\s*)?(?:\n\s{0,4}(?:⏸|⏵⏵) [^·\n]*\b(?:on|off)\b(?: · .+| \(.+\))?\s*)?\z']
+note = """Fail-closed input proof when Claude honors NO_COLOR and emits no
+SGR. The prompt and physical trailer boundary must both be column zero, so a
+payload continuation cannot forge either row. Colored real input and ghost
+rules remain higher priority and retain their measured style distinction."""
+evidence = "MEASURED Claude Code 2.1.243 under NO_COLOR (2026-08-24): prompt content, column-zero box rule, and model status row"
 
 [[rule]]
 id = "screen_working"
@@ -274,7 +308,7 @@ correctness nicety for ordering, not a loss-prevention necessity, on this CLI.""
 # row keeps the model and effort fields, then ends one later field with ….
 composer_trailer_regex = [
   '^─+$',
-  '^\s{0,4}(?:\S[^·]*(?: · [^·]+){3,} · \d+K window(?: · \d+K used)?|(?:Opus|Sonnet|Haiku) \d+(?:\.\d+)?(?: \([^·]*\))? · (?:xhigh|high|medium|low)(?: · [^·]+)* · [^·]*…)\s*$',
+  '^\s{0,4}(?:\S[^·]*(?: · [^·]+){2,} · \d+K window(?: · \d+K used)?|(?:Opus|Sonnet|Haiku) \d+(?:\.\d+)?(?: \([^·]*\))? · (?:xhigh|high|medium|low)(?: · [^·]+)* · [^·]*…)\s*$',
   '^\s{0,4}paste again to expand\s*$',
   '^\s{0,4}(?:⏸|⏵⏵) [^·]*\b(?:on|off)\b(?: · .+| \(.+\))?\s*$',
 ]
@@ -284,6 +318,10 @@ composer_trailer_regex_esc = [
   '^\s*\x1b\[38;5;\d+mpaste again to expand',
   '^(?:\x1b\[[0-9;:]*m)*\s+\x1b\[38;5;\d+m(?:⏸|⏵⏵)',
 ]
+# Claude honors NO_COLOR and then paints no SGR at all. The box rule is a
+# structural boundary outside Claude's measured prompt and continuation rows,
+# so the same plain layout remains terminal evidence in that mode.
+unstyled_composer_proof = "structural_trailer"
 # The first 2 rows are painted every time; the rest are optional.
 composer_trailer_required_prefix = 2
 # The collapsed-paste chip, as a whole composer row. MEASURED (fixture

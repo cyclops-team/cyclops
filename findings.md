@@ -72,7 +72,7 @@ than a measurement.
 | F63 | Detached hook origin uses the same last-known route record as report handling | binds |
 | F64 | Codex paints a blank separator below the composer and the declared trailer must include it | binds |
 | F65 | Whole-composer clearing is measured for Claude and Codex; Antigravity and Cursor refuse unsupported actions | binds |
-| F66 | The isolated stage-and-clear soak passed 100 trials each for Codex, Claude, and Antigravity; Cursor was unavailable | evidence |
+| F66 | The isolated soak detected staged representations and cleared them in 100 trials each for Codex, Claude, and Antigravity; Cursor was unavailable | evidence |
 | F67 | A one-line doorbell must fit the narrow lane because application wrapping is not exact composer evidence | binds |
 
 ## F13. refresh-client -B subscriptions work in control mode on tmux 3.6a (MEASURED)
@@ -1360,9 +1360,11 @@ Measured rows, 2026-08-20 unless noted:
 
   CORRECTED 2026-08-21. An earlier version of this line said that lane
   "keeps the leading-id evidence it had before". It does not, and cannot:
-  `staged_verified` accepts the terminal sentinel or the composer chip
-  and nothing else, so `verify_pattern = ["<message_id>"]` is now inert
-  and every Cursor staging verify refuses. That is the correct fail-closed
+  `staged_representation` recognizes only a measured visible target or a
+  collapsed chip, and `exact_staging_proof` authorizes Enter only for visible
+  exact bytes. Cursor has neither measured representation, so
+  `verify_pattern = ["<message_id>"]` is inert and every Cursor staging verify
+  refuses. That is the correct fail-closed
   answer for a vendor nobody measured, and restoring leading-id
   acceptance would reintroduce the failure described in F62. It is also a
   live blocker rather than a soak-only
@@ -1613,7 +1615,7 @@ pair, but no raw paired hook payload fixture is checked in. Cursor therefore
 keeps `turn_key_fields` empty instead of treating prose or field names as
 correlation proof.
 
-## F66. The isolated stage-and-clear soak passed every installed vendor lane
+## F66. The isolated soak detected staged representations and cleared them
 
 MEASURED 2026-08-22 on macOS with tmux 3.6a. Commit `8a93ace` produced the
 reported results. The safe opt-in harness is frozen on branch
@@ -1632,9 +1634,15 @@ unbroken content, and long multiline bodies. Results were:
 | Claude Code 2.1.239 | 0 | 0 | 100 | 100 | 0 |
 | Antigravity 1.1.18 | 0 | 80 | 20 | 100 | 0 |
 
+The historical JSON field `total_verified` means
+`representation_detected`. It does not mean exact payload ownership, Enter
+authorization, notification submission, or receipt. Collapsed-chip rows in
+particular prove only the vendor representation that the harness later
+cleared.
+
 Cursor was not installed and remains `UNAVAILABLE_OFFLINE_GATE`; deterministic
 fixtures do not replace the current-version live requirement. The harness
-proved staging verification and clean teardown only. It deliberately did not
+proved representation detection and clean teardown only. It deliberately did not
 submit turns or claim a submitted receipt, so those guarantees come from the
 separate delivery and receipt suites. The harness stays on its evidence branch
 because its live vendor launches and dated artifact rewrite are opt-in

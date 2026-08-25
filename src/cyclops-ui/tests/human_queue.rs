@@ -42,7 +42,11 @@ fn message(id: &str, seq: u64, label: &str) -> QueueRow {
     QueueRow {
         target: msg_target(id, recipient("%1")),
         attention: None,
+        resolution_intent: None,
+        resolution_action_accepted: None,
+        resolution_consumption_observed: None,
         can_manage_attention: false,
+        can_withdraw_notification: false,
         message_id: MessageId::new(id).unwrap(),
         recipient: recipient("%1"),
         recipient_label: label.into(),
@@ -50,6 +54,9 @@ fn message(id: &str, seq: u64, label: &str) -> QueueRow {
         mailbox: MailboxWord::Pending,
         wake: WakeWord::Notified,
         cause: None,
+        pre_write_cause: None,
+        current_route: None,
+        fifo_position: Some(1),
         needs_action: true,
         seq,
         updated_at: seq * 1000,
@@ -63,7 +70,11 @@ fn alarm(id: &str, n: u64, seq: u64, label: &str) -> QueueRow {
         // fact about it, not a different row.
         target: msg_target(id, recipient("%2")),
         attention: Some(attempt(n)),
+        resolution_intent: None,
+        resolution_action_accepted: None,
+        resolution_consumption_observed: None,
         can_manage_attention: true,
+        can_withdraw_notification: false,
         message_id: MessageId::new(id).unwrap(),
         recipient: recipient("%2"),
         recipient_label: label.into(),
@@ -71,6 +82,9 @@ fn alarm(id: &str, n: u64, seq: u64, label: &str) -> QueueRow {
         mailbox: MailboxWord::Pending,
         wake: WakeWord::NeedsAttention,
         cause: Some(NotificationAttentionCause::VerifyFailed),
+        pre_write_cause: None,
+        current_route: None,
+        fifo_position: Some(1),
         needs_action: true,
         seq,
         updated_at: seq * 1000,
@@ -393,7 +407,11 @@ fn a_broadcast_keeps_its_recipients_apart_through_a_reorder() {
     let row_for = |to: RecipientKey, label: &str, seq: u64| QueueRow {
         target: msg_target("m-broadcast", to),
         attention: None,
+        resolution_intent: None,
+        resolution_action_accepted: None,
+        resolution_consumption_observed: None,
         can_manage_attention: false,
+        can_withdraw_notification: false,
         message_id: MessageId::new("m-broadcast").unwrap(),
         recipient: to,
         recipient_label: label.into(),
@@ -401,6 +419,9 @@ fn a_broadcast_keeps_its_recipients_apart_through_a_reorder() {
         mailbox: MailboxWord::Pending,
         wake: WakeWord::Notified,
         cause: None,
+        pre_write_cause: None,
+        current_route: None,
+        fifo_position: Some(1),
         needs_action: true,
         seq,
         updated_at: seq * 1000,
@@ -465,11 +486,20 @@ fn no_attempt_reads_as_not_started_and_is_not_waiting() {
     assert!(WakeWord::NotStarted.cell().contains("not started"));
     assert!(!WakeWord::NotStarted.cell().contains("none"));
     assert!(!WakeWord::NotStarted.short().contains("none"));
+    assert_eq!(WakeWord::Withdrawn.cell(), "= withdrawn");
+    assert_eq!(WakeWord::Withdrawn.short(), "=wdrn");
 
     let words: Vec<&str> = [
         WakeWord::NotStarted,
-        WakeWord::Waiting,
+        WakeWord::Queued,
+        WakeWord::Gating,
+        WakeWord::Writing,
+        WakeWord::Staged,
+        WakeWord::Submitted,
+        WakeWord::BlockedBeforeWrite,
         WakeWord::Notified,
+        WakeWord::Withdrawn,
+        WakeWord::WithdrawnByOperator,
         WakeWord::NeedsAttention,
         WakeWord::ActionUncertain,
         WakeWord::Cleared,
@@ -488,8 +518,15 @@ fn no_attempt_reads_as_not_started_and_is_not_waiting() {
     // And the short forms stay apart too, at the width where they are used.
     let shorts: Vec<&str> = [
         WakeWord::NotStarted,
-        WakeWord::Waiting,
+        WakeWord::Queued,
+        WakeWord::Gating,
+        WakeWord::Writing,
+        WakeWord::Staged,
+        WakeWord::Submitted,
+        WakeWord::BlockedBeforeWrite,
         WakeWord::Notified,
+        WakeWord::Withdrawn,
+        WakeWord::WithdrawnByOperator,
         WakeWord::NeedsAttention,
         WakeWord::ActionUncertain,
         WakeWord::Cleared,
@@ -730,8 +767,15 @@ fn state_is_words_and_symbols_and_the_two_records_stay_apart() {
         }
     }
     for word in [
-        WakeWord::Waiting,
+        WakeWord::Queued,
+        WakeWord::Gating,
+        WakeWord::Writing,
+        WakeWord::Staged,
+        WakeWord::Submitted,
+        WakeWord::BlockedBeforeWrite,
         WakeWord::Notified,
+        WakeWord::Withdrawn,
+        WakeWord::WithdrawnByOperator,
         WakeWord::NeedsAttention,
         WakeWord::ActionUncertain,
         WakeWord::Cleared,
@@ -748,7 +792,14 @@ fn state_is_words_and_symbols_and_the_two_records_stay_apart() {
     // The words never claim delivery or reading.
     for w in [
         WakeWord::Notified,
-        WakeWord::Waiting,
+        WakeWord::Queued,
+        WakeWord::Gating,
+        WakeWord::Writing,
+        WakeWord::Staged,
+        WakeWord::Submitted,
+        WakeWord::BlockedBeforeWrite,
+        WakeWord::Withdrawn,
+        WakeWord::WithdrawnByOperator,
         WakeWord::ActionUncertain,
         WakeWord::Cleared,
         WakeWord::OperatorSubmitted,

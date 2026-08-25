@@ -49,10 +49,8 @@ fn install_dry_run_prints_everything_and_writes_nothing() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Would write"), "{stdout}");
-    assert!(
-        stdout.contains("hook UserPromptSubmit --agent reviewer"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("hook UserPromptSubmit"), "{stdout}");
+    assert!(!stdout.contains("--agent reviewer"), "{stdout}");
     assert!(
         stdout.contains("--settings"),
         "wiring instructions: {stdout}"
@@ -86,7 +84,11 @@ fn install_writes_the_default_dest_and_prints_the_wiring() {
         let text = fs::read_to_string(&path).expect("rendered hook artifact");
         let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         assert!(value.is_object(), "{vendor}: {text}");
-        assert!(text.contains("--agent reviewer"), "{vendor}: {text}");
+        if vendor == "claude" {
+            assert!(!text.contains("--agent"), "{vendor}: {text}");
+        } else {
+            assert!(text.contains("--agent reviewer"), "{vendor}: {text}");
+        }
         artifacts.push((path, text));
 
         let stdout = String::from_utf8_lossy(&out.stdout);

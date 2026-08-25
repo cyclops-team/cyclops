@@ -34,7 +34,9 @@ mailbox_capability_file = "~/.agents/skills/cyclops/SKILL.md"
 # Event names are PascalCase in hooks.json, snake_case internally.
 config_mechanism = "hooks.json in CODEX_HOME or <repo>/.codex/"
 turn_start = "UserPromptSubmit"
+turn_start_evidence = "confirmed"
 turn_end = "Stop"
+turn_end_evidence = "confirmed"
 ack = "UserPromptSubmit"
 # Fields that together identify ONE turn, in order. A start and an end
 # carrying the same values are the same turn, which is what lets a
@@ -92,6 +94,7 @@ The daemon must dedupe on (session_id, turn_id)."""
 [[rule]]
 id = "composer_typed_input"
 state = "idle_with_input"
+composer_semantic = "human_input"
 priority = 1050
 region = "bottom_non_empty_lines(6)"
 line_regex_esc = ['^\s*\x1b\[1m›(?:\x1b\[[0-9;]*m)*\s+(?:[^\x1b\s]|\x1b\[(?:[013-9][0-9;]*|2[0-9;]+)m)']
@@ -120,6 +123,7 @@ Earlier ghost probe (0.146.0): 'ESC[1m›ESC[0m fix the rate limiter in gateway.
 [[rule]]
 id = "composer_ghost_suggestion"
 state = "idle"
+composer_semantic = "ghost_suggestion"
 priority = 1040
 region = "bottom_non_empty_lines(6)"
 line_regex_esc = ['^\s*(?:\x1b\[[0-9;]*m)*›(?:\x1b\[[0-9;]*m)*\s+\x1b\[2m']
@@ -130,6 +134,7 @@ evidence = "MEASURED ghost probe: 'ESC[1m›ESC[0m ESC[2mFind and fix a bug in @
 [[rule]]
 id = "composer_empty_or_ghost"
 state = "idle"
+composer_semantic = "ambiguous"
 priority = 1000
 region = "bottom_non_empty_lines(6)"
 line_regex = ['^\s*›']

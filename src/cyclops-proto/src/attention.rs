@@ -1,10 +1,11 @@
 //! What needs a human right now.
 //!
-//! One rule, one register, one owner. The eye is the signature device
+//! One vocabulary, one owner. The eye is the signature device
 //! (GOALS), and it appears on three surfaces: the stream header, the
 //! `--plain` eye line, and `cyclops status`. All three read this module.
-//! None of them recomputes it, and the daemon answers `status` with the
-//! same predicate it uses here.
+//! None of them reimplements the predicates. Stream surfaces include both
+//! agent state and durable delivery alarms. Normal `cyclops status` uses
+//! the live agent half only.
 //!
 //! ## The rule
 //!
@@ -39,12 +40,13 @@
 //! This is as much of the rule as the two predicates are, because it
 //! decides what a count is allowed to depend on.
 //!
-//! 1. The daemon's `status` answer is a SNAPSHOT of now: the pane roster
-//!    as the watcher currently sees it, and the open deliveries folded
-//!    from the whole record. It REPLACES both halves ([`Attention::
-//!    snapshot_agents`], [`Attention::snapshot_deliveries`]), so a pane
-//!    that is gone stops counting and an item nothing could clear cannot
-//!    outlive the answer.
+//! 1. A stream asks the daemon for a `status` snapshot containing the pane
+//!    roster and open deliveries folded from the whole record. It REPLACES
+//!    both halves ([`Attention::snapshot_agents`],
+//!    [`Attention::snapshot_deliveries`]), so a pane that is gone stops
+//!    counting and an item nothing could clear cannot outlive the answer.
+//!    Normal `cyclops status` asks for the pane roster only and builds the
+//!    live agent half with [`Attention::from_live_status`].
 //! 2. Live events move one item at a time ([`Attention::observe_agent`],
 //!    [`Attention::observe_delivery`], [`Attention::forget_agent`]),
 //!    because each one IS the pane's or the delivery's next transition.
@@ -237,13 +239,28 @@ pub struct Attention {
 }
 
 impl Attention {
+    /// The live pane register for the primary status grid.
+    ///
+    /// Durable delivery alarms belong to the mailbox, alarm, and stream surfaces.
+    /// Keeping this constructor separate makes that scope explicit instead
+    /// of relying on an omitted `open_deliveries` request parameter.
+    pub fn from_live_status(res: &StatusResult) -> Attention {
+        let mut attention = Attention::default();
+        attention.snapshot_agents(res.sessions.iter().flat_map(|session| &session.panes).map(
+            |pane| PaneSnapshot {
+                pane_id: pane.pane_id.clone(),
+                name: pane.display_name().to_string(),
+                state: pane.state,
+            },
+        ));
+        attention
+    }
+
     /// The register the daemon's whole `status` answer describes.
     ///
-    /// `cyclops status` reads this. The stream UI does not: it normalizes
-    /// the same answer into its own seed (it needs the pane roster for the
-    /// focus jump too) and then calls the same two snapshot methods this
-    /// does. Two callers, one pair of snapshot methods, so the two
-    /// surfaces cannot count one answer differently.
+    /// The stream UI normalizes the same answer into its own seed because
+    /// it also needs the pane roster for focus jumps, then calls the same
+    /// two snapshot methods as this constructor.
     ///
     /// Scope note: the delivery half is exactly what the answer carried.
     /// `open_deliveries` rides `status` only when the caller asks for it
@@ -252,19 +269,9 @@ impl Attention {
     /// which is the safe direction for an alarm, and the surface can say
     /// so because it holds the same answer.
     pub fn from_status(res: &StatusResult) -> Attention {
-        let mut a = Attention::default();
-        a.snapshot_agents(
-            res.sessions
-                .iter()
-                .flat_map(|s| &s.panes)
-                .map(|p| PaneSnapshot {
-                    pane_id: p.pane_id.clone(),
-                    name: p.display_name().to_string(),
-                    state: p.state,
-                }),
-        );
-        a.snapshot_deliveries(&res.open_deliveries);
-        a
+        let mut attention = Attention::from_live_status(res);
+        attention.snapshot_deliveries(&res.open_deliveries);
+        attention
     }
 
     /// Replace the pane roster with the daemon's current one.
@@ -588,6 +595,7 @@ impl PaneStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{ComposerProof, ComposerState};
     use crate::wire::{SessionStatus, StatusResult};
 
     fn pane(pane_id: &str, agent: Option<&str>, state: AgentState) -> PaneStatus {
@@ -603,10 +611,19 @@ mod tests {
             in_mode: false,
             write_ready: false,
             write_block: None,
+            composer: ComposerState::ComposerAmbiguous,
+            composer_proof: ComposerProof::Unprovable,
+            notification_attempt: None,
+            composer_reason: None,
+            composer_candidates: 0,
+            notification_state: None,
+            message_state: None,
+            next_action: None,
             width: 120,
             height: 40,
             state,
             state_ms: None,
+            working_confirmed: None,
             hooks_verified: None,
             manifest_display_name: None,
         }
@@ -615,6 +632,9 @@ mod tests {
     fn status(panes: Vec<PaneStatus>, open: Vec<OpenDelivery>) -> StatusResult {
         StatusResult {
             daemon_version: "0.1.0".into(),
+            daemon_build: None,
+            daemon_process: None,
+            daemon_executable: None,
             proto: 1,
             boot_id: "b".into(),
             uptime_ms: 1000,
@@ -624,9 +644,12 @@ mod tests {
                 attached: true,
                 panes,
             }],
+            mailbox_routes: Vec::new(),
             admin_unread: 0,
             open_deliveries: open,
             diagnostics: Vec::new(),
+            blocked_notifications: Vec::new(),
+            blocked_notifications_total: 0,
             manifests: None,
             pid: None,
         }
@@ -636,6 +659,7 @@ mod tests {
         OpenDelivery {
             id: id.into(),
             to: to.into(),
+            recipient: None,
             state,
             ts: 1000,
             cause: None,
@@ -715,6 +739,24 @@ mod tests {
         assert_eq!(res.sessions[0].panes[2].display_name(), "%4");
     }
 
+    #[test]
+    fn live_status_excludes_durable_delivery_alarms() {
+        let res = status(
+            vec![pane("%1", Some("reviewer"), AgentState::BlockedPermission)],
+            vec![open(
+                "m-park",
+                "implementer",
+                DeliveryState::ParkedBlockedQuota,
+            )],
+        );
+        let attention = Attention::from_live_status(&res);
+        assert_eq!(attention.count(), 1);
+        assert!(matches!(
+            attention.items().as_slice(),
+            [AttentionItem::Agent { pane_id, .. }] if pane_id == "%1"
+        ));
+    }
+
     /// The snapshot replaces both halves. A pane that disappears between
     /// two answers stops counting, and so does a delivery the fold no
     /// longer lists: merging left items nothing could ever clear.
@@ -769,9 +811,8 @@ mod tests {
         assert_eq!(a.count(), 0);
     }
 
-    /// The header words are composed here and nowhere else, so the stream,
-    /// `cyclops status` and the plain follow cannot phrase the same count
-    /// three ways.
+    /// Header words are composed here and nowhere else, so surfaces with
+    /// different scopes still use one eye vocabulary.
     #[test]
     fn the_header_cell_carries_the_count_beside_the_glyph() {
         let mut a = Attention::default();

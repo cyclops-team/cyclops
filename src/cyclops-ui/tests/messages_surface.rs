@@ -7,11 +7,12 @@
 use std::str::FromStr;
 
 use cyclops_proto::{
-    Kind, MailboxEntryState, MessageDirection, MessageId, MessageNotificationState,
-    MessageNotificationSummary, MessageQuotaState, MessageRecipientSummary, MessageSnapshotRow,
-    MessagesChangedArea, MessagesChangedData, MessagesSnapshotCounts, MessagesSnapshotResult,
-    NotificationAttemptId, NotificationAttentionCause, RecipientKey, SessionInstanceId, TmuxPaneId,
-    WorkspaceId,
+    Kind, MailboxEntryState, MessageDirection, MessageId, MessageNotificationSettlement,
+    MessageNotificationState, MessageNotificationSummary, MessageQuotaState,
+    MessageRecipientSummary, MessageSnapshotRow, MessagesChangedArea, MessagesChangedData,
+    MessagesSnapshotCounts, MessagesSnapshotResult, NotificationAttemptId,
+    NotificationAttentionCause, NotificationPreWriteCause, RecipientKey, SessionInstanceId,
+    TmuxPaneId, WorkspaceId,
 };
 use cyclops_ui::queue::render;
 use cyclops_ui::{
@@ -40,11 +41,16 @@ fn wake(state: MessageNotificationState) -> MessageNotificationSummary {
     MessageNotificationSummary {
         state,
         quota_state: None,
+        settlement: None,
+        operator_withdrawn: None,
         attempt_id: None,
         cause: None,
+        pre_write_cause: None,
         attention_cleared: None,
         resolution: None,
         resolution_intent: None,
+        resolution_action_accepted: None,
+        resolution_consumption_observed: None,
         updated_at: Some(5_000),
     }
 }
@@ -53,11 +59,16 @@ fn alarm(n: u64, cleared: bool) -> MessageNotificationSummary {
     MessageNotificationSummary {
         state: MessageNotificationState::AttentionRequired,
         quota_state: None,
+        settlement: None,
+        operator_withdrawn: None,
         attempt_id: Some(attempt(n)),
         cause: Some(NotificationAttentionCause::VerifyFailed),
+        pre_write_cause: None,
         attention_cleared: Some(cleared),
         resolution: None,
         resolution_intent: None,
+        resolution_action_accepted: None,
+        resolution_consumption_observed: None,
         updated_at: Some(6_000),
     }
 }
@@ -66,11 +77,16 @@ fn quota(n: u64, state: MessageQuotaState) -> MessageNotificationSummary {
     MessageNotificationSummary {
         state: MessageNotificationState::AttentionRequired,
         quota_state: Some(state),
+        settlement: None,
+        operator_withdrawn: None,
         attempt_id: Some(attempt(n)),
         cause: None,
+        pre_write_cause: None,
         attention_cleared: None,
         resolution: None,
         resolution_intent: None,
+        resolution_action_accepted: None,
+        resolution_consumption_observed: None,
         updated_at: Some(6_000),
     }
 }
@@ -88,6 +104,8 @@ fn to(
         direction,
         needs_action,
         can_manage_attention: false,
+        can_withdraw_notification: false,
+        current_route: None,
         available: true,
         mailbox: MailboxEntryState::Pending,
         fifo_position: Some(1),
@@ -356,17 +374,16 @@ fn recipient_scope_beats_the_message_level_answer() {
     );
 }
 
-/// The wire's nine wake states arrive as words a reader can act on, and
-/// no attempt stays distinct from an attempt that has not landed.
+/// Every durable notification phase reaches the queue without collapsing.
 #[test]
-fn wake_states_map_without_losing_the_distinction_that_matters() {
+fn wake_states_map_without_losing_delivery_progress() {
     let cases = [
         (MessageNotificationState::NotStarted, WakeWord::NotStarted),
-        (MessageNotificationState::Queued, WakeWord::Waiting),
-        (MessageNotificationState::Gating, WakeWord::Waiting),
-        (MessageNotificationState::Writing, WakeWord::Waiting),
-        (MessageNotificationState::Staged, WakeWord::Waiting),
-        (MessageNotificationState::Submitted, WakeWord::Waiting),
+        (MessageNotificationState::Queued, WakeWord::Queued),
+        (MessageNotificationState::Gating, WakeWord::Gating),
+        (MessageNotificationState::Writing, WakeWord::Writing),
+        (MessageNotificationState::Staged, WakeWord::Staged),
+        (MessageNotificationState::Submitted, WakeWord::Submitted),
         (MessageNotificationState::Notified, WakeWord::Notified),
         (MessageNotificationState::Superseded, WakeWord::Superseded),
     ];
@@ -388,7 +405,61 @@ fn wake_states_map_without_losing_the_distinction_that_matters() {
         };
         assert_eq!(q.visible().next().unwrap().wake, word, "{wire:?}");
     }
-    assert_ne!(WakeWord::NotStarted, WakeWord::Waiting);
+    assert_ne!(WakeWord::Queued, WakeWord::Gating);
+    assert_ne!(WakeWord::Gating, WakeWord::Staged);
+    assert_ne!(WakeWord::Staged, WakeWord::Submitted);
+
+    let mut withdrawn = wake(MessageNotificationState::NotStarted);
+    withdrawn.settlement = Some(MessageNotificationSettlement::WithdrawnByClaim);
+    let mut queue = HumanQueue::new();
+    queue.replace(rows_from_snapshot(&snapshot(
+        2,
+        vec![row(
+            "m-withdrawn",
+            2,
+            MessageDirection::Inbound,
+            false,
+            vec![mine("%1", "reviewer", withdrawn)],
+        )],
+    )));
+    queue.set_scope(Scope::All);
+    assert_eq!(queue.visible().next().unwrap().wake, WakeWord::Withdrawn);
+
+    let mut blocked = wake(MessageNotificationState::Gating);
+    blocked.attempt_id = Some(attempt(21));
+    blocked.pre_write_cause = Some(NotificationPreWriteCause::BindingUnprovable);
+    let mut blocked_to = theirs("%1", "reviewer", blocked);
+    blocked_to.needs_action = true;
+    blocked_to.can_withdraw_notification = true;
+    let rows = rows_from_snapshot(&snapshot(
+        3,
+        vec![row(
+            "m-blocked",
+            3,
+            MessageDirection::Workspace,
+            true,
+            vec![blocked_to],
+        )],
+    ));
+    assert_eq!(rows.rows[0].wake, WakeWord::BlockedBeforeWrite);
+    assert!(rows.rows[0].needs_human());
+    assert!(rows.rows[0].can_withdraw_notification);
+
+    let mut operator_withdrawn = wake(MessageNotificationState::NotStarted);
+    operator_withdrawn.attempt_id = Some(attempt(21));
+    operator_withdrawn.operator_withdrawn = Some(true);
+    let rows = rows_from_snapshot(&snapshot(
+        4,
+        vec![row(
+            "m-operator-withdrawn",
+            4,
+            MessageDirection::Workspace,
+            false,
+            vec![theirs("%1", "reviewer", operator_withdrawn)],
+        )],
+    ));
+    assert_eq!(rows.rows[0].wake, WakeWord::WithdrawnByOperator);
+    assert!(!rows.rows[0].needs_human());
 
     for (quota_state, word) in [
         (MessageQuotaState::Held, WakeWord::QuotaHeld),
@@ -436,6 +507,63 @@ fn wake_states_map_without_losing_the_distinction_that_matters() {
     assert_eq!(only.wake, WakeWord::ActionUncertain);
     assert!(only.needs_human());
     assert_eq!(only.attention, Some(attempt(10)));
+    assert_eq!(
+        only.resolution_intent,
+        Some(cyclops_proto::NotificationResolution::Complete)
+    );
+    assert_eq!(only.resolution_action_accepted, None);
+
+    let mut accepted = alarm(10, false);
+    accepted.resolution_intent = Some(cyclops_proto::NotificationResolution::Complete);
+    accepted.resolution_action_accepted = Some(cyclops_proto::NotificationResolution::Complete);
+    let rows = rows_from_snapshot(&snapshot(
+        2,
+        vec![row(
+            "m-accepted-uncertain",
+            2,
+            MessageDirection::Outbound,
+            true,
+            vec![to(
+                "%1",
+                "reviewer",
+                accepted,
+                MessageDirection::Outbound,
+                true,
+            )],
+        )],
+    ));
+    assert_eq!(
+        rows.rows[0].resolution_action_accepted,
+        Some(cyclops_proto::NotificationResolution::Complete)
+    );
+    assert_eq!(rows.rows[0].resolution_consumption_observed, None);
+
+    let mut consumed = alarm(10, false);
+    consumed.resolution_intent = Some(cyclops_proto::NotificationResolution::Complete);
+    consumed.resolution_action_accepted = Some(cyclops_proto::NotificationResolution::Complete);
+    consumed.resolution_consumption_observed = Some(
+        cyclops_proto::NotificationResolutionConsumptionObservation {
+            evidence: cyclops_proto::NotificationResolutionConsumptionEvidence::WorkingEdge,
+            observed_at_ms: 7_000,
+        },
+    );
+    let rows = rows_from_snapshot(&snapshot(
+        3,
+        vec![row(
+            "m-consumed-uncertain",
+            3,
+            MessageDirection::Outbound,
+            true,
+            vec![to(
+                "%1",
+                "reviewer",
+                consumed,
+                MessageDirection::Outbound,
+                true,
+            )],
+        )],
+    ));
+    assert!(rows.rows[0].resolution_consumption_observed.is_some());
 
     // A recipient acts on their pending message, not on the admin-only
     // alarm raised by its failed wake.
@@ -477,6 +605,10 @@ fn wake_states_map_without_losing_the_distinction_that_matters() {
     )));
     let only = q.visible().next().unwrap();
     assert_eq!(only.wake, WakeWord::ActionUncertain);
+    assert_eq!(
+        only.resolution_intent,
+        Some(cyclops_proto::NotificationResolution::Discard)
+    );
     assert!(only.attention.is_none() || !only.can_manage_attention);
 
     // An acknowledged alarm reads as cleared and is no longer work.
@@ -534,6 +666,56 @@ fn wake_states_map_without_losing_the_distinction_that_matters() {
         let only = q.visible().next().unwrap();
         assert_eq!(only.wake, word);
         assert!(!only.can_manage_attention);
+    }
+}
+
+/// The resting queue names the exact phase instead of reducing progress to waiting.
+#[test]
+fn rendered_rows_distinguish_gating_staged_and_submitted() {
+    let mut queue = HumanQueue::new();
+    queue.replace(rows_from_snapshot(&snapshot(
+        3,
+        vec![
+            row(
+                "m-gating",
+                1,
+                MessageDirection::Inbound,
+                true,
+                vec![mine(
+                    "%1",
+                    "gating-agent",
+                    wake(MessageNotificationState::Gating),
+                )],
+            ),
+            row(
+                "m-staged",
+                2,
+                MessageDirection::Inbound,
+                true,
+                vec![mine(
+                    "%2",
+                    "staged-agent",
+                    wake(MessageNotificationState::Staged),
+                )],
+            ),
+            row(
+                "m-submitted",
+                3,
+                MessageDirection::Inbound,
+                true,
+                vec![mine(
+                    "%3",
+                    "submitted-agent",
+                    wake(MessageNotificationState::Submitted),
+                )],
+            ),
+        ],
+    )));
+    queue.set_scope(Scope::All);
+
+    let frame = render(&queue, 160, 24).join("\n");
+    for phase in [WakeWord::Gating, WakeWord::Staged, WakeWord::Submitted] {
+        assert!(frame.contains(phase.cell()), "missing {phase:?}: {frame}");
     }
 }
 

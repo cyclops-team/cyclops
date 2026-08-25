@@ -78,9 +78,28 @@ claimed. Run `cyclops messages` to inspect the current mailbox and notification
 state. If the target pane is unknown, start its agent or pin the correct
 manifest. The body remains in the mailbox and is never pasted into the pane.
 
+If `cyclops status` shows runtime idle but also prints `composer Cyclops
+notification staged`, read the whole subrow. It names write readiness, the
+notification and mailbox states, the next action, and the exact attempt id.
+Cyclops must either submit that exact owned notification once, reconcile an
+uncertain submit, expose a recoverable attention item, or allow a proven
+pre-write withdrawal. It must not treat the staged notification as a generic
+human draft or leave it unreported.
+
 If the notification reaches `needs attention`, run `cyclops alarm preview
 --older-than 0s` and inspect the exact attempt with `cyclops attention show
 <attempt-id> --diff`. Do not resend or requeue blindly.
+
+If status reports `wake blocked before write`, inspect the cause. A
+`binding_unprovable` block needs process or route repair. A
+`composer_semantic_missing` block means the matched manifest rule does not say
+whether the composer is clean. A `worker_failed` block means the supervised
+delivery worker exhausted its pre-write restart budget. The other exact causes
+name an unavailable session, manifest, or payload, changed write readiness, or
+a failed paste-buffer spool. None writes to the pane. Claim the message through
+the socket, or have the workspace administrator withdraw the exact notification
+shown by status so the next FIFO item can proceed. Inspect `cyclops health`
+before requeueing a worker failure.
 
 ## A receipt says `1 ahead`
 
@@ -131,9 +150,16 @@ $ cyclops status
 ```
 
 The id and age in this compatibility example change on every run. This status
-surface owns blocked panes, legacy direct-delivery attention, and the unread
-admin count. It does not own standard mailbox notification alarms. Use
-`cyclops messages` and `cyclops alarm preview --older-than <age>` for those.
+surface owns blocked panes, legacy direct-delivery attention, the unread admin
+count, and a bounded body-free sample of notification wakes blocked before any
+write. It prints the full blocked-wake count when the sample is shorter than the
+total. Use `cyclops messages` and `cyclops alarm preview --older-than <age>` for
+the complete durable view and operator actions.
+
+A Claude prompt-start hook can report `runtime working: provisional` before the
+first visible output. `confirmed` means a current visual or exact keyed
+lifecycle observation agreed. Both states refuse terminal writing while the
+turn is active.
 
 ## A mailbox notification says `needs attention`
 
@@ -145,10 +171,15 @@ cyclops attention show <attempt-id> --diff
 ```
 
 `show` is read-only. If the evidence still matches, `attention complete` or
-`attention discard` performs one guarded action. An uncertain action outcome
-must be inspected and must not be repeated. Only use `cyclops requeue
-<message-id>` after resolving the cause and confirming that the notification is
-eligible.
+`attention discard` performs one guarded action. An uncertain outcome must be
+inspected and must not be repeated. `cyclops messages` names which recovery
+boundary was proven, and reconciliation never sends a second terminal key.
+`cyclops alarm clear` acknowledges the alarm but does not abandon an unfinished
+terminal action. Retrieve the durable message with `cyclops inbox claim
+<message-id>`. Only use `cyclops requeue <message-id>` after resolving the cause
+and confirming that the notification is eligible. The exact transition and
+reconciliation rules are in the
+[protocol reference](../reference/PROTOCOL.md#mailbox-and-notification-control).
 
 ## A legacy hook self-test lands unverified
 

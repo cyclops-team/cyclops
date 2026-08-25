@@ -5,7 +5,8 @@
 //! chosen for its ancestry. Both cases here do that with real processes
 //! against a real daemon:
 //!
-//! - a client running inside a watched pane resolves to that pane;
+//! - a client descending from the admitted agent in a watched pane resolves
+//!   to that agent;
 //! - a client running under a vendor process, outside every watched pane,
 //!   is refused, and nothing reaches the ledger.
 //!
@@ -16,15 +17,17 @@
 //! vendor here is a shell this test spawns under a shipped vendor's argv
 //! name, which is the same shape and is true everywhere.
 //!
-//! The positive operator case stays a unit test with an injected chain
-//! (`identity::tests`): a suite running under an agent cannot honestly
-//! produce a chain with no agent in it.
+//! A separate control starts from the test runner without a vendor parent and
+//! proves that a same-user shell remains the workspace administrator.
 
 mod common;
 
+use std::fs::{File, OpenOptions};
+use std::io::Write as _;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use common::*;
@@ -42,6 +45,7 @@ const NAMED_MANIFEST: &str = r#"
 id = "fix"
 display_name = "Sender fixture"
 process_names = ["cycagent", "cycvendor"]
+argv_basenames = ["cycagent"]
 
 [[rule]]
 id = "always_idle"
@@ -89,6 +93,92 @@ fn named_bin(tag: &str) -> PathBuf {
     dir
 }
 
+fn agent_binary() -> &'static Path {
+    static BINARY: OnceLock<PathBuf> = OnceLock::new();
+    BINARY.get_or_init(|| {
+        let dir = cyclops_proto::scratch::scratch_dir("cyc-sender-agent-bin");
+        std::fs::create_dir_all(&dir).expect("sender agent binary directory");
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/common/live_use_agent.rs");
+        let binary = dir.join("cycagent");
+        let output = Command::new("rustc")
+            .args([
+                "--edition=2021",
+                "-Dwarnings",
+                source.to_str().expect("source path is UTF-8"),
+                "-o",
+                binary.to_str().expect("binary path is UTF-8"),
+            ])
+            .output()
+            .expect("compile sender agent fixture");
+        assert!(
+            output.status.success(),
+            "sender agent compile failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        binary
+    })
+}
+
+fn create_fifo(path: &Path) {
+    let status = Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("create sender agent FIFO");
+    assert!(status.success(), "mkfifo failed for {}", path.display());
+}
+
+async fn open_fifo_writer(path: PathBuf) -> File {
+    tokio::task::spawn_blocking(move || {
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap_or_else(|error| panic!("open FIFO {}: {error}", path.display()))
+    })
+    .await
+    .expect("join FIFO open")
+}
+
+fn agent_request(
+    commands: &mut File,
+    client: &Path,
+    socket: &Path,
+    output: &Path,
+    method: &str,
+    params: &Value,
+) {
+    writeln!(
+        commands,
+        "request\t{}\t{}\t{}\t{}\t{}",
+        client.display(),
+        socket.display(),
+        output.display(),
+        method,
+        params
+    )
+    .expect("write sender agent request");
+    commands.flush().expect("flush sender agent request");
+}
+
+async fn wait_for_manifest(rig: &mut Rig, pane_id: &str) {
+    let mut last = Value::Null;
+    for _ in 0..100 {
+        let status = rig.ctl.request("status", json!({})).await;
+        let bound = status["result"]["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|session| session["panes"].as_array().into_iter().flatten())
+            .any(|pane| pane["pane_id"] == pane_id && pane["manifest"] == "fix");
+        if bound {
+            return;
+        }
+        last = status;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("pane {pane_id} never bound the sender fixture manifest: {last}");
+}
+
 /// Wait for the client to write its response file, then read it.
 async fn response(out: &Path) -> Value {
     for _ in 0..100 {
@@ -122,7 +212,7 @@ fn workspace_lines(home: &Path) -> Vec<Value> {
 /// says who sent it, and nothing in it could: the label comes from the
 /// process tree the connection was opened from.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_client_inside_a_watched_pane_sends_as_that_pane() {
+async fn a_client_below_a_current_agent_sends_as_that_agent() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -135,7 +225,12 @@ async fn a_client_inside_a_watched_pane_sends_as_that_pane() {
 
     // A second pane in the same watched session runs the client, so the
     // recipient's composer is left alone.
-    rig.tmux.run_ok(&["split-window", "-t", &pane, "-d", "sh"]);
+    let sender_fifo = rig.home.join("sender-agent.fifo");
+    create_fifo(&sender_fifo);
+    let sender_agent = format!("{} {}", agent_binary().display(), sender_fifo.display());
+    rig.tmux
+        .run_ok(&["split-window", "-t", &pane, "-d", &sender_agent]);
+    let mut sender_commands = open_fifo_writer(sender_fifo).await;
     // The watcher learns about the new pane on its own subscription tick.
     let mut sender_pane = None;
     for _ in 0..100 {
@@ -147,26 +242,44 @@ async fn a_client_inside_a_watched_pane_sends_as_that_pane() {
     }
     let sender_pane = sender_pane.expect("the split pane appears in status");
     rig.label(&sender_pane, "sender").await;
+    wait_for_manifest(&mut rig, &sender_pane).await;
 
     let out = rig.home.join("inside.json");
     let socket = rig.daemon.socket_path();
-    rig.tmux.run_ok(&[
-        "send-keys",
-        "-t",
-        &sender_pane,
-        &format!(
-            "{}/cycclient {} {} {} msg.send '{}'",
-            bin.display(),
-            client_path(),
-            socket.display(),
-            out.display(),
-            json!({"to": ["hooky"], "subject": "inside", "body": "b"})
-        ),
-        "Enter",
-    ]);
+    agent_request(
+        &mut sender_commands,
+        Path::new(&client_path()),
+        &socket,
+        &out,
+        "msg.send",
+        &json!({"to": ["hooky"], "subject": "inside", "body": "b"}),
+    );
 
     let resp = response(&out).await;
     assert!(resp["error"].is_null(), "the send must be accepted: {resp}");
+
+    let denied_out = rig.home.join("agent-withdraw-denied.json");
+    agent_request(
+        &mut sender_commands,
+        Path::new(&client_path()),
+        &socket,
+        &denied_out,
+        "notification.withdraw",
+        &json!({
+            "attempt_id": "att-00000000-0000-4000-8000-000000000001",
+            "recipient": {
+                "kind": "agent",
+                "workspace_id": "00000000-0000-0000-0000-000000000001",
+                "session_instance_id": "00000000-0000-0000-0000-000000000002",
+                "pane_id": "%1"
+            }
+        }),
+    );
+    let denied = response(&denied_out).await;
+    assert_eq!(
+        denied["error"]["code"], "denied",
+        "an agent pane cannot exercise an administrator recovery verb: {denied}"
+    );
 
     let message_id = resp["result"]["msg_id"]
         .as_str()
@@ -179,7 +292,7 @@ async fn a_client_inside_a_watched_pane_sends_as_that_pane() {
         .clone();
     assert_eq!(
         from, "sender",
-        "the sender is the pane the request came from"
+        "the sender is the admitted agent the request descended from"
     );
 
     assert!(
@@ -302,6 +415,14 @@ async fn a_vendor_outside_every_watched_pane_is_refused() {
         lines.iter().any(|l| l["subject"] == "control"),
         "the accepted control send is on the record"
     );
+    let control = lines
+        .iter()
+        .find(|line| line["subject"] == "control")
+        .expect("control message");
+    assert_eq!(
+        control["from"], "admin",
+        "a same-user caller with no agent ancestor is the operator"
+    );
 
     rig.shutdown().await;
 }
@@ -323,7 +444,12 @@ async fn me_on_the_read_side_is_the_calling_pane() {
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "hooky").await;
 
-    rig.tmux.run_ok(&["split-window", "-t", &pane, "-d", "sh"]);
+    let asker_fifo = rig.home.join("asker-agent.fifo");
+    create_fifo(&asker_fifo);
+    let asker_agent = format!("{} {}", agent_binary().display(), asker_fifo.display());
+    rig.tmux
+        .run_ok(&["split-window", "-t", &pane, "-d", &asker_agent]);
+    let mut asker_commands = open_fifo_writer(asker_fifo).await;
     let mut sender_pane = None;
     for _ in 0..100 {
         if let Some(p) = rig.pane_ids().await.into_iter().find(|p| p != &pane) {
@@ -334,6 +460,7 @@ async fn me_on_the_read_side_is_the_calling_pane() {
     }
     let sender_pane = sender_pane.expect("the split pane appears in status");
     rig.label(&sender_pane, "asker").await;
+    wait_for_manifest(&mut rig, &sender_pane).await;
 
     // Two messages the rig sends as the operator, and one the pane sends
     // as itself. "me", asked from that pane, must find only its own.
@@ -342,38 +469,26 @@ async fn me_on_the_read_side_is_the_calling_pane() {
     let sent = rig.home.join("me-send.json");
     let asked = rig.home.join("me-history.json");
     let socket = rig.daemon.socket_path();
-    rig.tmux.run_ok(&[
-        "send-keys",
-        "-t",
-        &sender_pane,
-        &format!(
-            "{}/cycclient {} {} {} msg.send '{}'",
-            bin.display(),
-            client_path(),
-            socket.display(),
-            sent.display(),
-            json!({"to": ["hooky"], "subject": "mine", "body": "b"})
-        ),
-        "Enter",
-    ]);
+    agent_request(
+        &mut asker_commands,
+        Path::new(&client_path()),
+        &socket,
+        &sent,
+        "msg.send",
+        &json!({"to": ["hooky"], "subject": "mine", "body": "b"}),
+    );
     let resp = response(&sent).await;
     assert!(resp["error"].is_null(), "the pane's own send: {resp}");
     rig.label(&sender_pane, "renamed").await;
 
-    rig.tmux.run_ok(&[
-        "send-keys",
-        "-t",
-        &sender_pane,
-        &format!(
-            "{}/cycclient {} {} {} msg.history '{}'",
-            bin.display(),
-            client_path(),
-            socket.display(),
-            asked.display(),
-            json!({"from": "me"})
-        ),
-        "Enter",
-    ]);
+    agent_request(
+        &mut asker_commands,
+        Path::new(&client_path()),
+        &socket,
+        &asked,
+        "msg.history",
+        &json!({"from": "me"}),
+    );
     let resp = response(&asked).await;
     let subjects: Vec<String> = resp["result"]["lines"]
         .as_array()

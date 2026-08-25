@@ -284,18 +284,30 @@ mod tests {
             height: 24,
             state,
             state_ms: None,
+            working_confirmed: None,
             hooks_verified: None,
             manifest_display_name: None,
             // Runtime state and write-readiness are separate answers
             // (rule 12); decoration reads only the first.
             write_ready: false,
             write_block: None,
+            composer: cyclops_proto::ComposerState::ComposerAmbiguous,
+            composer_proof: cyclops_proto::ComposerProof::Unprovable,
+            notification_attempt: None,
+            composer_reason: None,
+            composer_candidates: 0,
+            notification_state: None,
+            message_state: None,
+            next_action: None,
         }
     }
 
     fn status_with(panes: Vec<PaneStatus>) -> StatusResult {
         StatusResult {
             daemon_version: "0.1.0".into(),
+            daemon_build: None,
+            daemon_process: None,
+            daemon_executable: None,
             proto: 1,
             boot_id: "b".into(),
             uptime_ms: 1,
@@ -305,9 +317,12 @@ mod tests {
                 attached: true,
                 panes,
             }],
+            mailbox_routes: Vec::new(),
             admin_unread: 0,
             open_deliveries: vec![],
             diagnostics: vec![],
+            blocked_notifications: vec![],
+            blocked_notifications_total: 0,
             manifests: None,
             pid: None,
         }

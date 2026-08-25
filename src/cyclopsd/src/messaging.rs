@@ -4,16 +4,18 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use cyclops_proto::{
-    DeliveryReceipt, DeliveryState, MessageId, MsgSendParams, MsgSendResult, RecipientKey,
+    DeliveryReceipt, DeliveryState, MessageId, MsgSendParams, MsgSendResult, NotificationBinding,
+    NotificationManifestId, NotificationPreWriteObservation, NotificationWithdrawDisposition,
+    NotificationWithdrawResult, ProcessInstanceId, RecipientKey,
 };
 use cyclops_tmux::{PaneRow, SessionWatcher};
-use tracing::error;
+use tracing::{debug, error};
 
 use crate::mailbox::{
     AcceptResult, ClaimOutcome, MailboxIdentity, MailboxSend, MailboxService, MailboxServiceError,
 };
 use crate::notification_adapter::NotificationContext;
-use crate::Inner;
+use crate::{Inner, PaneKey};
 
 pub(crate) struct NotificationRoute {
     pub(crate) session_idx: usize,
@@ -74,18 +76,125 @@ pub(crate) fn notification_route(
     Ok(matched)
 }
 
-/// Schedule only the oldest pending entry for one durable recipient.
-pub(crate) fn schedule_recipient(
+fn process_instance(process: crate::identity::ProcId) -> Option<ProcessInstanceId> {
+    ProcessInstanceId::new(process.pid, process.birth).ok()
+}
+
+/// Capture the complete live binding that would authorize a terminal write.
+///
+/// A manifest pin alone is not enough. The selected rules and the process
+/// ancestry must identify the same vendor before a blocked attempt can move.
+fn proven_binding_observation(
+    inner: &Inner,
+    recipient: RecipientKey,
+    route: &NotificationRoute,
+) -> Option<NotificationPreWriteObservation> {
+    let Some(pane_root) =
+        crate::identity::ProcId::of(route.row.pane_pid).and_then(process_instance)
+    else {
+        debug!(%recipient, pane = %route.pane_id, "route binding lacks a proven pane root");
+        return None;
+    };
+    let adopted_root = inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .for_recipient(recipient)
+        .and_then(|adoption| adoption.pane_root);
+    if adopted_root != Some(pane_root) {
+        debug!(
+            %recipient,
+            pane = %route.pane_id,
+            ?pane_root,
+            ?adopted_root,
+            "route binding is not exact for this pane root"
+        );
+        return None;
+    }
+    let Some(binding) = crate::fusion::admitted_binding(inner, route.session_idx, &route.row)
+    else {
+        debug!(%recipient, pane = %route.pane_id, "route binding has no admitted vendor ancestry");
+        return None;
+    };
+    let Some(selected) = crate::fusion::bind_manifest_for(inner, route.session_idx, &route.row)
+    else {
+        debug!(%recipient, pane = %route.pane_id, "route binding has no selected manifest");
+        return None;
+    };
+    if binding.manifest != selected.agent.id {
+        debug!(%recipient, pane = %route.pane_id, selected = %selected.agent.id, admitted = %binding.manifest, "route binding disagrees with the selected manifest");
+        return None;
+    }
+    Some(NotificationPreWriteObservation {
+        pane_root: Some(pane_root),
+        selected_manifest: Some(NotificationManifestId::new(&selected.agent.id).ok()?),
+        binding: Some(NotificationBinding {
+            recipient,
+            pane_root: Some(process_instance(binding.pane_root)?),
+            leader: Some(process_instance(binding.leader)?),
+            agent: process_instance(binding.agent)?,
+            manifest: NotificationManifestId::new(binding.manifest).ok()?,
+        }),
+    })
+}
+
+/// Confirm that the cached composer verdict belongs to the same live agent
+/// and manifest as the route observation used to reopen a blocked attempt.
+fn route_is_write_ready(
+    inner: &Inner,
+    route: &NotificationRoute,
+    observation: &NotificationPreWriteObservation,
+) -> bool {
+    let Some(binding) = observation.binding.as_ref() else {
+        return false;
+    };
+    let (Some(pane_root), Some(leader)) = (binding.pane_root, binding.leader) else {
+        return false;
+    };
+    let expected = crate::fusion::Binding {
+        pane_root: crate::identity::ProcId {
+            pid: pane_root.pid(),
+            birth: pane_root.birth(),
+        },
+        leader: crate::identity::ProcId {
+            pid: leader.pid(),
+            birth: leader.birth(),
+        },
+        agent: crate::identity::ProcId {
+            pid: binding.agent.pid(),
+            birth: binding.agent.birth(),
+        },
+        manifest: binding.manifest.to_string(),
+    };
+    inner
+        .detections
+        .lock()
+        .expect("detections lock")
+        .get(&PaneKey::new(route.session_idx, &route.pane_id))
+        .is_some_and(|entry| cached_entry_is_write_ready(entry, route.row.in_mode, &expected))
+}
+
+fn cached_entry_is_write_ready(
+    entry: &crate::DetEntry,
+    pane_in_mode: bool,
+    expected: &crate::fusion::Binding,
+) -> bool {
+    !pane_in_mode
+        && entry.detection.write_ready
+        && !entry.detection.stale
+        && !entry.detection.disagreement
+        && !entry.in_mode
+        && entry.binding.as_ref() == Some(expected)
+}
+
+fn enqueue_prepared_notification(
     inner: &Arc<Inner>,
     service: &Arc<MailboxService>,
     recipient: RecipientKey,
-) -> Result<(), MailboxServiceError> {
-    let Some(route) = notification_route(inner, service, recipient)? else {
-        return Ok(());
-    };
-    let Some(record) = service.prepare_oldest_notification(recipient)? else {
-        return Ok(());
-    };
+    route: NotificationRoute,
+    record: cyclops_proto::NotificationRecord,
+    rerun_existing: bool,
+) {
     let context = NotificationContext::new_with_changes(
         service.store_handle(),
         record.message_id,
@@ -93,14 +202,109 @@ pub(crate) fn schedule_recipient(
         record.attempt_id,
         service.change_publisher(),
     );
-    crate::delivery::enqueue_notification_attempt(
+    let _ = crate::delivery::enqueue_notification_attempt(
         inner,
         route.session_idx,
         &route.pane_id,
         &route.label,
         context,
+        rerun_existing,
     );
+}
+
+/// Schedule only the oldest pending entry for one durable recipient.
+pub(crate) fn schedule_recipient(
+    inner: &Arc<Inner>,
+    service: &Arc<MailboxService>,
+    recipient: RecipientKey,
+) -> Result<(), MailboxServiceError> {
+    if inner.engine.is_stopping() {
+        return Ok(());
+    }
+    let Some(route) = notification_route(inner, service, recipient)? else {
+        return Ok(());
+    };
+    let Some(record) = service.prepare_oldest_notification(recipient)? else {
+        return Ok(());
+    };
+    enqueue_prepared_notification(inner, service, recipient, route, record, false);
     Ok(())
+}
+
+/// Reopen one blocked attempt under the publication lock.
+///
+/// The returned route and record are handed to the delivery engine only
+/// after every registry and mailbox lock has been released.
+fn prepare_recipient_after_route_evidence(
+    inner: &Arc<Inner>,
+    service: &Arc<MailboxService>,
+    recipient: RecipientKey,
+) -> Result<Option<(NotificationRoute, cyclops_proto::NotificationRecord)>, MailboxServiceError> {
+    let Some(route) = notification_route(inner, service, recipient)? else {
+        return Ok(None);
+    };
+    let Some(observation) = proven_binding_observation(inner, recipient, &route) else {
+        return Ok(None);
+    };
+    let write_ready = route_is_write_ready(inner, &route, &observation);
+    let Some(confirmed_route) = notification_route(inner, service, recipient)? else {
+        return Ok(None);
+    };
+    if confirmed_route.session_idx != route.session_idx || confirmed_route.pane_id != route.pane_id
+    {
+        return Ok(None);
+    }
+    let Some(confirmed) = proven_binding_observation(inner, recipient, &confirmed_route) else {
+        return Ok(None);
+    };
+    if confirmed != observation
+        || route_is_write_ready(inner, &confirmed_route, &confirmed) != write_ready
+    {
+        return Ok(None);
+    }
+    let Some(record) = service.reopen_oldest_notification_after_route_evidence(
+        recipient,
+        confirmed,
+        write_ready,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((route, record)))
+}
+
+fn schedule_recipient_after_route_evidence(
+    inner: &Arc<Inner>,
+    service: &Arc<MailboxService>,
+    recipient: RecipientKey,
+) -> Result<(), MailboxServiceError> {
+    let prepared = {
+        let _publication = inner
+            .mailbox_publication
+            .lock()
+            .expect("mailbox publication lock");
+        prepare_recipient_after_route_evidence(inner, service, recipient)?
+    };
+    if let Some((route, record)) = prepared {
+        enqueue_prepared_notification(inner, service, recipient, route, record, true);
+    }
+    Ok(())
+}
+
+/// Reconcile one pane after its route, process, or readiness evidence changed.
+pub(crate) fn schedule_route_changed(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) {
+    let Some(service) = inner.mailbox.as_ref() else {
+        return;
+    };
+    let Some(recipient) = inner.recipient_key(session_idx, pane_id) else {
+        return;
+    };
+    if let Err(error) = schedule_recipient(inner, service, recipient) {
+        error!(%recipient, %error, "cannot schedule mailbox notification for changed route");
+    }
+    if let Err(error) = schedule_recipient_after_route_evidence(inner, service, recipient) {
+        error!(%recipient, %error, "cannot reopen blocked mailbox notification");
+    }
 }
 
 /// Resume queued work after a route appears or a daemon restarts.
@@ -146,6 +350,7 @@ fn finish_acceptance(
                     state: DeliveryState::Queued,
                     notification_state: Some(disposition.notification_state),
                     quota_state: disposition.quota_state,
+                    notification_settlement: disposition.notification_settlement,
                     position: disposition.position_ahead,
                     held_by: None,
                     note: None,
@@ -207,14 +412,21 @@ pub(crate) fn claim(
     message_id: MessageId,
 ) -> Result<ClaimOutcome, MailboxServiceError> {
     let outcome = service.claim(claimant, message_id)?;
-    let withdrawn = match &outcome {
+    let (withdrawn, consumed_doorbell) = match &outcome {
         ClaimOutcome::Claimed {
-            withdrawn_attempt, ..
+            withdrawn_attempt,
+            consumed_doorbell_attempt,
+            ..
         }
         | ClaimOutcome::AlreadyClaimed {
-            withdrawn_attempt, ..
-        } => *withdrawn_attempt,
+            withdrawn_attempt,
+            consumed_doorbell_attempt,
+            ..
+        } => (*withdrawn_attempt, *consumed_doorbell_attempt),
     };
+    if let Some(attempt_id) = consumed_doorbell {
+        crate::delivery::settle_notification_claim(inner, attempt_id);
+    }
     if let Some(attempt_id) = withdrawn {
         inner.engine.cancel_notification(attempt_id);
     }
@@ -237,4 +449,93 @@ pub(crate) fn requeue(
         }
     }
     Ok(!records.is_empty())
+}
+
+/// Withdraw one exact unwritten wake and advance the recipient's FIFO.
+pub(crate) fn withdraw_notification(
+    inner: &Arc<Inner>,
+    service: &Arc<MailboxService>,
+    operator: RecipientKey,
+    recipient: RecipientKey,
+    attempt_id: cyclops_proto::NotificationAttemptId,
+) -> Result<NotificationWithdrawResult, MailboxServiceError> {
+    let (record, inserted) = {
+        let _publication = inner
+            .mailbox_publication
+            .lock()
+            .expect("mailbox publication lock");
+        service.withdraw_notification_before_write(operator, recipient, attempt_id)?
+    };
+    inner.engine.cancel_notification(attempt_id);
+    if let Err(error) = schedule_recipient(inner, service, recipient) {
+        error!(%recipient, %error, "cannot schedule mailbox notification after withdrawal");
+    }
+    Ok(NotificationWithdrawResult {
+        attempt_id,
+        message_id: record.message_id,
+        recipient,
+        disposition: if inserted {
+            NotificationWithdrawDisposition::Withdrawn
+        } else {
+            NotificationWithdrawDisposition::AlreadyWithdrawn
+        },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn binding(leader_birth: u64) -> crate::fusion::Binding {
+        crate::fusion::Binding {
+            pane_root: crate::identity::ProcId {
+                pid: 10,
+                birth: 100,
+            },
+            leader: crate::identity::ProcId {
+                pid: 20,
+                birth: leader_birth,
+            },
+            agent: crate::identity::ProcId {
+                pid: 30,
+                birth: 300,
+            },
+            manifest: "claude".into(),
+        }
+    }
+
+    #[test]
+    fn cached_readiness_belongs_to_one_complete_process_binding() {
+        let original = binding(200);
+        let entry = crate::DetEntry {
+            detection: cyclops_proto::Detection {
+                state: cyclops_proto::AgentState::Idle,
+                readings: Vec::new(),
+                disagreement: false,
+                decided_by: "fixture".into(),
+                stale: false,
+                write_ready: true,
+                write_block: None,
+                composer_semantic: Some(cyclops_proto::ComposerSemantic::Clean),
+            },
+            binding: Some(original.clone()),
+            manifest: Some("claude".into()),
+            occupant: Some(20),
+            agent: Some(original.agent),
+            in_mode: false,
+            quota_screen_clear: true,
+            hold: cyclops_proto::ComposerHold::Clear,
+            turn: None,
+            hold_owner: None,
+            composer: crate::ComposerProjection::default(),
+            working_confirmed: false,
+            since: std::time::Instant::now(),
+        };
+
+        assert!(cached_entry_is_write_ready(&entry, false, &original));
+        assert!(
+            !cached_entry_is_write_ready(&entry, false, &binding(201)),
+            "a reused leader pid with a new generation cannot inherit readiness"
+        );
+    }
 }

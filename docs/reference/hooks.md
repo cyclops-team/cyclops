@@ -61,8 +61,10 @@ Wiring per CLI:
   Cyclops' event entries, preserving every unrelated key and handler; never
   overwrite it. `CURSOR_CONFIG_DIR` relocates `cli-config.json` but not
   `hooks.json`: a file placed there fires zero events, so never wire it that
-  way. Unlike agy, cursor's `beforeSubmitPrompt` carries the full prompt text,
-  a payload-matchable ack, so its deliveries reach the verified tier.
+  way. On the measured Cursor build, `beforeSubmitPrompt` carried the full
+  prompt text and could match an exact payload. No current Cursor binary was
+  available for the release validation run, so that historical measurement is
+  not a current verified-tier claim. Current unknowns fail closed.
 
 For every vendor, a missing destination can receive the prepared file. An
 existing destination must be merged by hand so existing handlers and unrelated

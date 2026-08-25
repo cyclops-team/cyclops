@@ -42,7 +42,12 @@ where
             writeln!(
                 w,
                 "{}",
-                json!({"cyclops": "0.1.0", "proto": 1, "boot_id": "b-ui"})
+                json!({
+                    "cyclops": "0.1.0",
+                    "build": env!("CYCLOPS_BUILD_REF"),
+                    "proto": 1,
+                    "boot_id": "b-ui"
+                })
             )
             .expect("write hello");
             'conn: loop {
@@ -149,7 +154,24 @@ fn serve_canned(home: &Path) {
                     "agent": "codex", "manifest": "codex", "title": "codex",
                     "current_command": "codex", "dead": false, "in_mode": false,
                     "width": 120, "height": 40, "state": "idle"
-                }]}]
+                }]}],
+                "mailbox_routes": [{
+                    "recipient": {
+                        "kind": "agent",
+                        "workspace_id": "00000000-0000-0000-0000-000000000001",
+                        "session_instance_id": "00000000-0000-0000-0000-000000000002",
+                        "pane_id": "%1"
+                    },
+                    "label": "reviewer"
+                }, {
+                    "recipient": {
+                        "kind": "agent",
+                        "workspace_id": "00000000-0000-0000-0000-000000000001",
+                        "session_instance_id": "00000000-0000-0000-0000-000000000002",
+                        "pane_id": "%2"
+                    },
+                    "label": "codex"
+                }]
             }})
             .to_string()],
             true,
@@ -298,16 +320,9 @@ fn answer(open_deliveries: bool) -> Value {
     result
 }
 
-/// Two eye surfaces, one daemon, one instant: they must agree.
-///
-/// The daemon answers the delivery half only when asked, so a surface that
-/// forgets to ask reads a calm rig while the other shouts about the same
-/// backlog. `cyclops status` sent an empty params object and counted panes
-/// alone; `cyclops ui` asked and counted both. Driving both against the
-/// same canned daemon is the only shape of test that can see that, because
-/// each surface was self-consistent.
+/// Normal status is live fleet state. The stream also carries durable alarms.
 #[test]
-fn the_status_grid_and_the_stream_read_one_daemon_the_same_way() {
+fn status_stays_live_while_the_stream_carries_durable_attention() {
     let home = scratch_home("two");
     // Three connections: the status grid takes one, the plain follow takes
     // its subscription and its own status.
@@ -329,10 +344,10 @@ fn the_status_grid_and_the_stream_read_one_daemon_the_same_way() {
     let grid = stdout_of(&run_ui(&home, &["status"]));
     let stream = stdout_of(&run_ui(&home, &["ui", "--plain"]));
 
-    // Both halves of the rule, counted once, said the same way on both.
+    // The primary grid reports one blocked pane and omits durable backlog.
     assert_eq!(
         grid.lines().next().unwrap_or_default(),
-        "◉ 2 cyclops · watching main · tmux 3.6a · up 2m · 2 need attention",
+        "◑ 1 cyclops · watching main · tmux 3.6a · up 2m · 1 needs attention",
         "{grid}"
     );
     assert!(
@@ -341,9 +356,8 @@ fn the_status_grid_and_the_stream_read_one_daemon_the_same_way() {
             .any(|l| l.starts_with("eye open · 2 need attention · ")),
         "{stream}"
     );
-    // And each surface still puts a line behind every number it shows.
     assert!(grid.contains("  reviewer  ⚠ blocked_permission"), "{grid}");
-    assert!(grid.contains("  implementer  ⊘ parked · quota"), "{grid}");
+    assert!(!grid.contains("implementer  ⊘ parked · quota"), "{grid}");
     assert!(stream.contains("implementer  ⊘ parked · quota"), "{stream}");
     assert!(
         stream.contains("reviewer  ⚠ blocked_permission"),

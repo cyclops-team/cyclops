@@ -31,6 +31,7 @@ fn msg(ts: u64, seq: Option<u64>, from: &str, to: &[&str], subject: &str) -> Ent
         kind: EntryKind::Msg {
             from: from.into(),
             to: to.iter().map(|t| t.to_string()).collect(),
+            endpoints: None,
             subject: subject.into(),
             body: None,
             fyi: false,
@@ -46,6 +47,7 @@ fn state(ts: u64, seq: Option<u64>, target: &str, pane_id: &str, state: AgentSta
         id: None,
         kind: EntryKind::State {
             target: target.into(),
+            recipient: None,
             session_idx: 0,
             pane_id: Some(pane_id.into()),
             state,
@@ -104,6 +106,7 @@ fn transcript() -> Vec<Step> {
             }],
             open: Vec::new(),
             admin_unread: 0,
+            mailbox_routes: Vec::new(),
             roster: Vec::new(),
         })),
         Step::Backfill(

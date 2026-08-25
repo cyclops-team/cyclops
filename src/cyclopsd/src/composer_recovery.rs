@@ -64,7 +64,10 @@ fn same_physical_pane(left: RecipientKey, right: RecipientKey) -> bool {
 }
 
 fn same_composer_occupant(left: &NotificationBinding, right: &NotificationBinding) -> bool {
-    left.agent == right.agent && left.manifest == right.manifest
+    left.pane_root.is_some()
+        && left.pane_root == right.pane_root
+        && left.agent == right.agent
+        && left.manifest == right.manifest
 }
 
 #[derive(Debug, Default)]
@@ -154,18 +157,25 @@ impl RecoveryCoordinator {
         let Some(expected) = record
             .binding
             .as_ref()
-            .filter(|binding| binding.recipient == record.recipient)
+            .filter(|binding| binding.recipient == record.recipient && binding.pane_root.is_some())
         else {
             return Some(RecoveryAction::Hold("composer_recovery_unproven"));
         };
         let Some(live) = live.filter(|binding| {
-            same_physical_pane(binding.recipient, record.recipient) && binding.leader.is_some()
+            same_physical_pane(binding.recipient, record.recipient)
+                && binding.pane_root.is_some()
+                && binding.leader.is_some()
         }) else {
             return Some(RecoveryAction::Hold("composer_recovery_unproven"));
         };
 
         if same_composer_occupant(expected, live) {
-            if record.state == cyclops_proto::NotificationState::Notified && clean_composer {
+            if matches!(
+                record.state,
+                cyclops_proto::NotificationState::Notified
+                    | cyclops_proto::NotificationState::WithdrawnAfterStaging
+            ) && clean_composer
+            {
                 self.retiring.insert(record.attempt_id);
                 return Some(RecoveryAction::Retire {
                     record: Box::new(record.clone()),
@@ -275,6 +285,9 @@ pub(crate) fn observed_binding(
 ) -> Option<NotificationBinding> {
     Some(NotificationBinding {
         recipient,
+        pane_root: Some(
+            ProcessInstanceId::new(binding.pane_root.pid, binding.pane_root.birth).ok()?,
+        ),
         leader: Some(ProcessInstanceId::new(binding.leader.pid, binding.leader.birth).ok()?),
         agent: ProcessInstanceId::new(binding.agent.pid, binding.agent.birth).ok()?,
         manifest: NotificationManifestId::new(binding.manifest.clone()).ok()?,
@@ -287,7 +300,7 @@ pub(crate) fn clean_composer(det: &Detection, in_mode: bool) -> bool {
         && !det.stale
         && !det.disagreement
         && det.state == AgentState::Idle
-        && det.screen_says_clean()
+        && det.screen_proves_write_safe_composer()
         && det
             .readings
             .iter()
@@ -351,6 +364,7 @@ pub(crate) fn bind_post_recovery_turn(
         turn,
         since_ms,
     )
+    .is_some()
 }
 
 /// Persist exact post-restart lifecycle evidence before fusion consumes it.
@@ -555,6 +569,66 @@ pub(crate) fn retire_gone_recipient(
     Ok(())
 }
 
+/// Retire every barrier owned by a process generation that was replaced.
+///
+/// The caller first validates the registry's exact old root while holding the
+/// route-publication transaction. A stale replacement edge therefore cannot
+/// reach this operation or retire barriers owned by a newer occupant. The
+/// retirement is persisted before the registry rebind because the physical
+/// replacement remains true even if that later registry write fails. The
+/// replacement binding is the positive process and manifest observation that
+/// makes the durable cause truthful.
+pub(crate) fn retire_replaced_recipient(
+    inner: &Inner,
+    recipient: RecipientKey,
+    replacement: Option<NotificationBinding>,
+) -> Result<(), &'static str> {
+    let service = inner
+        .mailbox
+        .as_ref()
+        .ok_or("composer_recovery_store_unavailable")?;
+    let records: Vec<_> = service
+        .active_notification_barriers()
+        .map_err(|_| "composer_recovery_store_unavailable")?
+        .into_iter()
+        .filter(|record| record.recipient == recipient)
+        .collect();
+    if records.is_empty() {
+        return Ok(());
+    }
+    let replacement = replacement.ok_or("composer_recovery_replacement_unproven")?;
+    if inner
+        .composer_recovery
+        .lock()
+        .expect("composer recovery lock")
+        .writer_unknown()
+    {
+        return Err("composer_recovery_reopen_required");
+    }
+    for record in records {
+        if let Err(error) = service.retire_notification_barrier(
+            &record,
+            NotificationBarrierRetirementCause::OccupantReplaced,
+            Some(replacement.clone()),
+        ) {
+            if writer_requires_reopen(&error) {
+                inner
+                    .composer_recovery
+                    .lock()
+                    .expect("composer recovery lock")
+                    .require_reopen();
+            }
+            return Err("composer_recovery_retirement_failed");
+        }
+        inner
+            .composer_recovery
+            .lock()
+            .expect("composer recovery lock")
+            .retired(record.attempt_id);
+    }
+    Ok(())
+}
+
 /// Prove physical pane loss against the whole tmux server.
 ///
 /// Absence from one session is only a route change. The pane is gone only
@@ -669,6 +743,7 @@ mod tests {
     fn binding(recipient: RecipientKey, pid: i32) -> NotificationBinding {
         NotificationBinding {
             recipient,
+            pane_root: Some(ProcessInstanceId::new(pid - 1, pid as u64 + 99).unwrap()),
             leader: Some(ProcessInstanceId::new(pid, pid as u64 + 100).unwrap()),
             agent: ProcessInstanceId::new(pid + 1, pid as u64 + 101).unwrap(),
             manifest: NotificationManifestId::new("codex").unwrap(),
@@ -685,6 +760,9 @@ mod tests {
             transport: NotificationTransport::Doorbell,
             doorbell_format: None,
             cause: None,
+            pre_write_cause: None,
+            pre_write_observation: None,
+            pre_write_reopen_count: 0,
             started_seq: 4,
             updated_seq: 5,
             updated_at: 6,
@@ -700,6 +778,7 @@ mod tests {
             stale: false,
             write_ready: false,
             write_block: None,
+            composer_semantic: Some(cyclops_proto::ComposerSemantic::Clean),
         }
     }
 
@@ -713,12 +792,13 @@ mod tests {
     }
 
     #[test]
-    fn only_a_notified_attempt_may_retire_from_current_clean_evidence() {
+    fn only_a_settled_attempt_may_retire_from_current_clean_evidence() {
         let route = recipient("00000000-0000-4000-8000-000000000002");
         let expected = binding(route, 40);
         for state in [
             NotificationState::Writing,
             NotificationState::Staged,
+            NotificationState::Submitting,
             NotificationState::Submitted,
             NotificationState::AttentionRequired,
         ] {
@@ -747,6 +827,16 @@ mod tests {
                 replacement: None,
             })
         );
+
+        record.state = NotificationState::WithdrawnAfterStaging;
+        let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
+        assert!(matches!(
+            recovery.reconcile(std::slice::from_ref(&record), Some(&expected), true),
+            Some(RecoveryAction::Retire {
+                cause: NotificationBarrierRetirementCause::ComposerObservedClear,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -828,6 +918,7 @@ mod tests {
         let mut expected = binding(route, 40);
         expected.leader = None;
         let live = binding(route, 90);
+        expected.pane_root = live.pane_root;
         expected.agent = live.agent;
         expected.manifest = live.manifest.clone();
         let record = record(route, expected);

@@ -73,13 +73,16 @@ pub fn attention_check_value(passed: bool) -> &'static str {
     }
 }
 
-pub fn attention_action_uncertain(resolution: cyclops_proto::NotificationResolution) -> String {
+pub fn attention_action_uncertain(
+    resolution: cyclops_proto::NotificationResolution,
+    attempt_id: cyclops_proto::NotificationAttemptId,
+) -> String {
+    let (action, command) = match resolution {
+        cyclops_proto::NotificationResolution::Complete => ("submit", "complete"),
+        cyclops_proto::NotificationResolution::Discard => ("discard", "discard"),
+    };
     format!(
-        "{} action outcome uncertain; inspect, do not retry",
-        match resolution {
-            cyclops_proto::NotificationResolution::Complete => "submit",
-            cyclops_proto::NotificationResolution::Discard => "discard",
-        }
+        "{action} action outcome uncertain; safe reconcile: cyclops attention {command} {attempt_id}; this rechecks without sending a second key"
     )
 }
 
@@ -305,6 +308,22 @@ pub fn proto_mismatch(server: u32, client: u32) -> String {
     format!("note: cyclopsd speaks protocol {server}, this cyclops speaks {client}. Continuing; update the older side.")
 }
 
+/// A running daemon built from different source than this client.
+///
+/// Absence is a mismatch too: it identifies a daemon old enough to predate
+/// exact build reporting rather than silently treating it as current.
+pub fn build_mismatch(server: Option<&str>, client: &str) -> Option<String> {
+    match server {
+        Some(server) if server == client => None,
+        Some(server) => Some(format!(
+            "note: cyclopsd is build {server}, this cyclops is build {client}. Continuing; run cyclops daemon restart to load the installed daemon build."
+        )),
+        None => Some(format!(
+            "note: cyclopsd did not report a build identifier, this cyclops is build {client}. Continuing; run cyclops daemon restart to load the installed daemon build."
+        )),
+    }
+}
+
 pub fn bad_duration(input: &str) -> String {
     format!("can't read \"{input}\" as a duration. Use forms like 90s, 2m, 1m30s, or 500ms.")
 }
@@ -338,7 +357,7 @@ pub fn unknown_watch_filters(asked: &[&str]) -> String {
         "unknown active display labels"
     };
     format!(
-        "{label} {names}. Watch filters use current display labels, not durable endpoint identities, and renaming a pane can invalidate one. Run cyclops list --all to discover active labels. For automation, use cyclops inbox next --timeout 30s."
+        "{label} {names}. Run cyclops list --all to discover active labels. Watch resolves each label once to its durable endpoint, so renaming it later does not retarget or strand the filter. For automation, use cyclops inbox next --timeout 30s."
     )
 }
 
@@ -621,9 +640,22 @@ mod tests {
         );
         assert_eq!(attention_check_value(true), "yes");
         assert_eq!(attention_check_value(false), "no");
+        let attempt =
+            cyclops_proto::NotificationAttemptId::parse("att-00000000-0000-4000-8000-000000000001")
+                .unwrap();
         assert_eq!(
-            attention_action_uncertain(cyclops_proto::NotificationResolution::Complete),
-            "submit action outcome uncertain; inspect, do not retry"
+            attention_action_uncertain(
+                cyclops_proto::NotificationResolution::Complete,
+                attempt
+            ),
+            "submit action outcome uncertain; safe reconcile: cyclops attention complete att-00000000-0000-4000-8000-000000000001; this rechecks without sending a second key"
+        );
+        assert_eq!(
+            attention_action_uncertain(
+                cyclops_proto::NotificationResolution::Discard,
+                attempt
+            ),
+            "discard action outcome uncertain; safe reconcile: cyclops attention discard att-00000000-0000-4000-8000-000000000001; this rechecks without sending a second key"
         );
     }
 
@@ -706,6 +738,19 @@ mod tests {
         assert_eq!(
             proto_mismatch(2, 1),
             "note: cyclopsd speaks protocol 2, this cyclops speaks 1. Continuing; update the older side."
+        );
+    }
+
+    #[test]
+    fn build_mismatch_names_both_builds_and_treats_absence_as_old() {
+        assert_eq!(build_mismatch(Some("abc1234"), "abc1234"), None);
+        assert_eq!(
+            build_mismatch(Some("old5678"), "abc1234").as_deref(),
+            Some("note: cyclopsd is build old5678, this cyclops is build abc1234. Continuing; run cyclops daemon restart to load the installed daemon build.")
+        );
+        assert_eq!(
+            build_mismatch(None, "abc1234").as_deref(),
+            Some("note: cyclopsd did not report a build identifier, this cyclops is build abc1234. Continuing; run cyclops daemon restart to load the installed daemon build.")
         );
     }
 

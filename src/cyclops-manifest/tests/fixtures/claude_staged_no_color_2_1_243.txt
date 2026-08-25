@@ -1,0 +1,6 @@
+❯ [cyclops m-no-color] FROM: cyclopsd  SUBJECT: [cyclops] hook self-test
+  Reply not needed.
+  [cyclops:end m-no-color]
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Sonnet 5 · xhigh · ~ · 5h: 98% · 7d: 91% · 1000K window
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

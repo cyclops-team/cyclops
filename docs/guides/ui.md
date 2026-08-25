@@ -50,6 +50,16 @@ connection or failed snapshot read, the last authenticated snapshot stays
 visible as stale data and `R` starts one explicit reconnect. Cyclops never
 starts parallel reconnects or retries on a timer.
 
+`cyclops status` remains the compact live-pane view. A pane can be runtime
+idle while a notification is staged, so status prints a factual subrow when
+that distinction matters: composer ownership, write readiness, notification
+state, mailbox state, the next action, and the exact attempt id. This is live
+barrier state, not a replacement for the durable Messages and alarm views.
+Provisional and confirmed working states are labeled separately. Live pane
+refresh has one request-wide budget; an incomplete row fails closed and keeps
+its durable message facts. Blocked pre-write wakes are sampled to a fixed row
+limit with the complete count printed below them.
+
 A ping points at something rather than being it, so a ping saying a
 human is needed shows here only while the thing it points at is still
 counted (see [the eye](#the-eye)). The daemon also pings about
@@ -163,11 +173,13 @@ agent of a state line. While pinned it takes the newest entry.
 The header carries cyclops's mark: `‿` closed when calm, `◑` opening
 with one attention item, `◉` open with the count beside it.
 
-Two things need a human, and that is the whole rule: an agent whose
-state is blocked, and a delivery that parked on a quota or ran out of
-redelivery. `cyclops status` wears the same eye, counts by the same
-rule, and reads it from the same code
-(`src/cyclops-proto/src/attention.rs`).
+The stream counts two things: an agent whose state is blocked, and a
+delivery that parked on a quota or ran out of redelivery. Normal
+`cyclops status` uses the same eye vocabulary for the live pane fleet but
+does not fold durable delivery history into that grid. Mailbox, alarm, and
+stream surfaces show those delivery records and provide the actions that
+resolve them. Both scopes are owned by
+`src/cyclops-proto/src/attention.rs`.
 
 Nothing else counts, pings included. A ping is the daemon telling you
 about one of those two, so it names which one and the admin stream drops
@@ -185,7 +197,7 @@ closes an unresolved one.
 
 ### Where the count comes from
 
-Two sources, and history is not one of them:
+The stream count has two sources, and replayed history is not one of them:
 
 - the daemon's `status` answer at startup, which carries every pane it
   watches and every delivery its fold still counts, taken over the whole
@@ -206,9 +218,9 @@ daemon reports `pane-removed` when a pane leaves the tmux table, and
 that is the pane's last transition. The firehose shows it as
 `%1 closed`.
 
-`cyclops status` counts by the same rule and asks the daemon the same
-question, including the delivery half. The two surfaces read against one
-daemon at one instant always agree.
+`cyclops status` asks for the pane roster only. Its eye answers whether a
+live pane is blocked, and its admin-inbox suffix reports unread human mail.
+Use the mailbox, alarm, or stream surface for durable delivery alarms.
 
 Anything the count knows about gets a line in the stream, timestamped
 when it happened, so a park from this morning reads as this morning. It

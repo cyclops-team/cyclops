@@ -195,9 +195,24 @@ async fn f1_zero_edge_tier1_downgrades_notifies_once_and_loses_nothing() {
     assert_eq!(notify["data"]["to"], "hooky", "{notify}");
     assert_eq!(notify["data"]["id"], m1.as_str(), "{notify}");
 
-    // Still unverified in status; the payload really reached the pane.
-    let status = rig.ctl.request("status", json!({})).await;
-    assert_eq!(status_pane(&status)["hooks_verified"], false, "{status}");
+    // Still unverified in status; the payload really reached the pane. The
+    // screen receipt can resolve while the fixture's short Working frame is
+    // still visible. Wait for its clean write-ready frame before exercising
+    // F1 notification deduplication, which is independent of queue wakeup.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = rig.ctl.request("status", json!({})).await;
+        let pane_status = status_pane(&status);
+        assert_eq!(pane_status["hooks_verified"], false, "{status}");
+        if pane_status["write_ready"] == true {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first delivery never returned to a clean write-ready frame: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     assert!(rig.tmux.capture(&pane).contains(&m1), "marker not in pane");
 
     // A second delivery downgrades the same way but does NOT re-notify:
@@ -206,7 +221,10 @@ async fn f1_zero_edge_tier1_downgrades_notifies_once_and_loses_nothing() {
         .send(json!({"to": ["hooky"], "subject": "after", "body": "b"}))
         .await;
     let m2 = r2["msg_id"].as_str().unwrap().to_string();
-    assert_eq!(r2["deliveries"][0]["state"], "delivered_unverified", "{r2}");
+    assert_eq!(
+        r2["deliveries"][0]["state"], "delivered_unverified",
+        "second delivery left a positively write-ready frame: {r2}"
+    );
     let f1_notifies = rig
         .ledger_lines()
         .iter()
@@ -329,7 +347,7 @@ async fn forged_report_over_the_socket_is_denied_and_ingests_nothing() {
 /// F1 downgrade notification for the NEW occupant instead of hiding behind
 /// the old one's edges.
 #[tokio::test(flavor = "multi_thread")]
-async fn occupant_swap_requires_fresh_adoption_and_renews_the_f1_ping() {
+async fn occupant_swap_preserves_the_name_and_renews_the_f1_ping() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -364,50 +382,11 @@ async fn occupant_swap_requires_fresh_adoption_and_renews_the_f1_ping() {
     let status = rig.ctl.request("status", json!({})).await;
     assert_eq!(status_pane(&status)["hooks_verified"], true, "{status}");
 
-    // Occupant swap: same command, new process. Exact adoption is bound to
-    // the former process instance, so the replacement first becomes
-    // unadopted and carries no hook verdict.
+    // Occupant swap: same logical pane and name, new process. The durable
+    // route moves to the replacement, but hook proof stays with the process
+    // that emitted it and must disappear.
     rig.tmux
         .run_ok(&["respawn-pane", "-k", "-t", &pane, &composer_pane()]);
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let status = rig.ctl.request("status", json!({})).await;
-        let pane_status = status_pane(&status);
-        if pane_status["agent"].is_null() && pane_status["hooks_verified"].is_null() {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the replacement inherited its predecessor's adoption: {status}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    // Re-adopting the replacement restores the label but not the old
-    // process's hook proof. This hookless occupant must get its own F1
-    // notification after the delivery below.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let response = rig
-            .ctl
-            .request("pane.label", json!({"target": pane, "label": "hooky"}))
-            .await;
-        if response["result"]["label"] == "hooky" {
-            break;
-        }
-        assert_eq!(response["error"]["code"], "no_such_target", "{response}");
-        assert!(
-            response["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("changed during adoption")),
-            "{response}"
-        );
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the replacement route never stabilized: {response}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let status = rig.ctl.request("status", json!({})).await;
@@ -417,7 +396,7 @@ async fn occupant_swap_requires_fresh_adoption_and_renews_the_f1_ping() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "the replacement did not acquire a fresh hook verdict: {status}"
+            "the replacement did not keep the name with fresh hook state: {status}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

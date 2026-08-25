@@ -31,7 +31,7 @@
 use std::collections::{HashMap, HashSet};
 
 use cyclops_proto::{AgentState, DeliveryState, Event};
-use cyclops_ui::{build, grid, App, Density, Entry, Filter, Theme, View};
+use cyclops_ui::{build, grid, App, Density, EndpointFilter, Entry, Filter, Theme, View};
 use serde_json::{json, Value};
 
 const BASE: u64 = 43_471_000;
@@ -464,18 +464,26 @@ fn a_clearance_names_what_it_resolved_on_both_halves() {
 /// alarm rows by different paths and a clearance has to pass whichever the
 /// alarm passed.
 fn filters() -> Vec<Filter> {
+    let endpoint = |label: &str| {
+        EndpointFilter::new(
+            "admin:00000000-0000-0000-0000-000000000001"
+                .parse()
+                .unwrap(),
+            label,
+        )
+    };
     vec![
         Filter::default(),
         Filter {
-            with: Some(AGENT.into()),
+            with: Some(endpoint(AGENT)),
             ..Filter::default()
         },
         Filter {
-            from: Some(AGENT.into()),
+            from: Some(endpoint(AGENT)),
             ..Filter::default()
         },
         Filter {
-            to: Some(RECIPIENT.into()),
+            to: Some(endpoint(RECIPIENT)),
             ..Filter::default()
         },
     ]

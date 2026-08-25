@@ -107,21 +107,20 @@ doubt, not evidence, which is why a failed capture keeps the prior verdict
 instead of flipping the pane.
 
 A transient hook reading counts as live for 300s and is dropped after three
-consecutive recomputes where the rules tier decided against it. An
-authenticated turn start is different: it reports `working` immediately and
-stays active until process-binding retirement or an authenticated turn end.
-For keyed manifests, the end must name the same exact turn. An unkeyed
-manifest, including Claude today, selects the next authenticated end from the
-same process binding. Repeated idle visual frames cannot end a turn. Blocked
-states always come from rules because no tested CLI hooks its modals or quota.
+consecutive recomputes where the rules tier decided against it. A confirmed,
+keyed turn start reports `working` immediately and stays active until
+process-binding retirement or the authenticated end for that exact key.
+An unkeyed confirmed vendor contract may pair runtime start and end events
+from the same process binding, but it does not create message-level turn
+correlation. Composer holds on that lane still settle from screen evidence.
 
-The unkeyed Claude rule depends on its synchronous command-hook contract.
-Cyclops generates command hooks without `async`, and Claude Code documents
-that hooks block execution until they complete by default. A prior turn's Stop
-hook therefore completes before Claude can process the next UserPromptSubmit
-hook. If Claude wiring becomes asynchronous, the manifest must gain an exact
-turn key before this rule can remain enabled. See the
-[Claude Code hooks reference](https://code.claude.com/docs/en/hooks#command-hook-fields).
+Claude exposes no key shared by `UserPromptSubmit` and `Stop`. Its prompt hook
+therefore publishes provisional `working` immediately but remains only a
+dispatch candidate. A later lifecycle-capable visual Working frame confirms
+acceptance of the exact pending notification. Fresh visual state then owns the
+return to idle. Cyclops does not pair Claude's next `Stop` with that prompt by
+arrival order or elapsed time. Blocked states always come from rules because
+no tested CLI hook identifies its modals or quota screens.
 
 ## Legacy direct-payload sending: how a message becomes a receipt
 
@@ -314,8 +313,11 @@ The eye is the signature device, and its vocabulary appears on the stream
 header, the `--plain` eye line, and `cyclops status`. All three read
 `src/cyclops-proto/src/attention.rs`; none reimplements the state predicates.
 The stream and plain follow include durable delivery alarms. Normal
-`cyclops status` is intentionally narrower and reports only the live pane
-fleet, with durable recovery left to mailbox, alarm, and stream surfaces.
+`cyclops status` is intentionally narrower and reports the live pane fleet,
+not every durable mailbox alarm. When a live pane has an exact composer
+barrier, status reports the separate runtime, composer ownership, write
+readiness, notification, message, and next-action facts. Durable recovery and
+historical alarms remain on the mailbox, alarm, and stream surfaces.
 
 ```mermaid
 flowchart TD
@@ -551,7 +553,10 @@ Timers do exist; none of them is an interval. Each is a one-shot tied to
 one thing that already happened: the paste verification re-reads, the
 tier-1 ACK window, the tier-2 checkpoints, the decline spacing, the gate's
 single wedged-hold ping, the per-pane output settle debounce, the watcher's
-reconnect backoff, and the deadlines a caller asked for.
+reconnect backoff, the deadlines a caller asked for, and a candidate
+lifecycle settle deadline armed by an authenticated edge. The lifecycle
+worker coalesces by pane, attempts each generation once per observation,
+and parks until another event.
 
 Sanctioned exceptions, none in the product: the Python probe harness
 (`tests/e2e/lib/`) polls because it is a measuring instrument, the test

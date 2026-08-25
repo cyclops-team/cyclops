@@ -80,7 +80,12 @@ fn canned_daemon(home: &Path, conns: usize, painting: &str) -> Arc<Mutex<Vec<Val
             };
             let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
             let mut w = stream;
-            let hello = json!({"cyclops": "0.1.0", "proto": 1, "boot_id": "b-th"});
+            let hello = json!({
+                "cyclops": "0.1.0",
+                "build": env!("CYCLOPS_BUILD_REF"),
+                "proto": 1,
+                "boot_id": "b-th"
+            });
             if writeln!(w, "{hello}").is_err() {
                 return;
             }

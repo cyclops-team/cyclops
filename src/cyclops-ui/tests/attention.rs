@@ -13,10 +13,20 @@
 
 use cyclops_proto::{AgentState, Delivery, DeliveryState, Kind, LedgerLine, OpenDelivery};
 use cyclops_ui::{
-    build, App, Entry, EntryKind, Eye, Filter, Intake, PaneSnapshot, StatusSeed, Theme, View,
+    build, App, EndpointFilter, Entry, EntryKind, Eye, Filter, Intake, PaneSnapshot, StatusSeed,
+    Theme, View,
 };
 
 const BASE: u64 = 43_000_000;
+
+fn endpoint(label: &str) -> EndpointFilter {
+    EndpointFilter::new(
+        "admin:00000000-0000-0000-0000-000000000001"
+            .parse()
+            .unwrap(),
+        label,
+    )
+}
 
 fn ledger_dir(temp: &tempfile::TempDir) -> std::path::PathBuf {
     std::fs::canonicalize(temp.path())
@@ -117,6 +127,7 @@ fn daemon_answer() -> StatusSeed {
     StatusSeed {
         watched: vec!["main".into()],
         admin_unread: 0,
+        mailbox_routes: Vec::new(),
         roster: Vec::new(),
         panes: vec![
             PaneSnapshot {
@@ -133,6 +144,7 @@ fn daemon_answer() -> StatusSeed {
         open: vec![OpenDelivery {
             id: "m-park".into(),
             to: "implementer".into(),
+            recipient: None,
             state: DeliveryState::ParkedBlockedQuota,
             ts: BASE + 100,
             cause: Some("blocked_quota".into()),
@@ -336,7 +348,7 @@ fn every_count_has_a_line_the_reader_can_reach() {
     // A filter that hides one of the two, over a window that still has
     // the other. The header keeps both, so the frame has to name the one
     // it cannot show.
-    app.filter.with = Some("reviewer".into());
+    app.filter.with = Some(endpoint("reviewer"));
     let rows = build(&mut app, 80, 12);
     assert!(rows[0].contains("2 need attention"), "{:?}", rows[0]);
     assert!(!app.visible().is_empty(), "the window is not empty here");
@@ -348,7 +360,7 @@ fn every_count_has_a_line_the_reader_can_reach() {
     assert!(rows[3].contains("⚠ blocked_modal"), "{rows:?}");
 
     // A filter that hides both names them both, one line, plural counted.
-    app.filter.with = Some("nobody".into());
+    app.filter.with = Some(endpoint("nobody"));
     let rows = build(&mut app, 80, 12);
     assert!(app.visible().is_empty());
     assert_eq!(

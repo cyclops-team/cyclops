@@ -1,16 +1,19 @@
 {
   "hooks": {
     "UserPromptSubmit": [
-      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook UserPromptSubmit --agent reviewer" } ] }
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook UserPromptSubmit" } ] }
     ],
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook Stop --agent reviewer" } ] }
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook Stop" } ] }
+    ],
+    "StopFailure": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook StopFailure" } ] }
     ],
     "Notification": [
-      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook Notification --agent reviewer" } ] }
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook Notification" } ] }
     ],
     "PermissionRequest": [
-      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook PermissionRequest --agent reviewer" } ] }
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook PermissionRequest" } ] }
     ]
   }
 }

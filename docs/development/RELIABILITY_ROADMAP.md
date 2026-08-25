@@ -102,19 +102,16 @@ not vendor identities. Generic transport code owns completeness and terminal
 anchoring. Manifests own representation-specific vocabulary. Production code
 must not branch on vendor names.
 
-### Claim settlement
+### Claim and terminal submit ordering
 
-A successful claim settles notification work according to the write boundary:
-
-- A notification that has not written is withdrawn.
-- A staged or submitted doorbell is recorded as notified and keeps its composer
-  barrier until the terminal is reconciled.
-- A direct payload that crossed the write boundary is not withdrawn.
-- An attention record after the write boundary stays open and clearable.
-
-The claim fact is the only durable owner of this settlement. Replay derives the
-notification projection from that fact. Cyclops must not append a second fact
-that can disagree with the claim.
+The normative transition and recovery contracts live in
+[Delivery](DELIVERY.md#per-recipient-pipeline) and
+[Protocol](../reference/PROTOCOL.md#mailbox-and-notification-control). This roadmap
+requires their release properties without maintaining a second transition
+table: a claim never proves Enter, a claimed staged doorbell settles only after
+exact clear proof, that settlement changes the attempt and retires its barrier
+in one append, and `submitting` orders a claim against terminal IO without
+claiming the key was sent.
 
 ### Status and pull receive
 
@@ -223,7 +220,9 @@ An earlier focused pass does not substitute for the frozen run.
 - A lifecycle cache eviction cannot erase a durable turn edge.
 - Capture failure, pane mode, stale observation, identity change, and sensor
   conflict all refuse terminal writing.
-- Raw-wrap and collapsed-chip staging prove complete notification structure.
+- Raw-wrap staging proves complete notification structure only when the visible
+  composer bytes match exactly. A collapsed chip is representation evidence
+  only and never authorizes Enter because its hidden bytes cannot be compared.
 - A changed, truncated, echoed, or followed trailer fails closed.
 - Submit success requires proof that the staged notification was consumed.
 - A pasted but unsent notification remains recoverable through attention.
@@ -247,8 +246,12 @@ An earlier focused pass does not substitute for the frozen run.
   durable state transition.
 - Repeated identical `binding_unprovable` evidence settles into one visible
   pre-write blocked notification and performs no timer retry.
+- A matched idle rule without composer ownership semantics settles into one
+  visible `composer_semantic_missing` pre-write block with zero pane writes.
 - Recipient-scoped withdrawal accepts only an exact, unclaimed, provably
-  unwritten attempt, appends one durable fact, and releases the next FIFO item.
+  unwritten `queued`, `gating`, or `blocked_pre_write` attempt, appends one
+  durable fact, and releases the next FIFO item. Availability alone does not
+  promote ordinary queue or gate waits into human work.
 - A socket claim remains available while terminal wake is blocked and settles
   the blocked pre-write attempt without a second terminal write.
 - Session churn keeps worker, route, and queue counts bounded.

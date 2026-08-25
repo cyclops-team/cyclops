@@ -66,7 +66,20 @@ are preserved when it writes preferences.
 | `$CYCLOPS_HOME/workspaces/*.toml` | Saved workspace layouts. |
 | `$CYCLOPS_HOME/manifests/` | Per-CLI detection rules. |
 | `$CYCLOPS_HOME/themes/` | Semantic color themes. |
-| `$CYCLOPS_HOME/cyclopsd.log` | Log for the detached daemon. |
+| `$CYCLOPS_HOME/cyclopsd.log` | Bounded daemon log, including foreground and detached runs. |
+| `$CYCLOPS_HOME/hook-errors.log` | Bounded diagnostics from short-lived agent hooks. |
+
+`cyclopsd.log` is capped at 1 MiB for the full daemon lifetime. When it
+reaches the cap, Cyclops keeps up to 512 KiB of recent complete lines before
+appending the new event. One tracing event is capped at 64 KiB and keeps its
+most recent bytes. `hook-errors.log` is capped at 256 KiB, with each failure
+limited to one 4096-byte line. A hook drops a diagnostic instead of waiting
+when another process holds the log lock.
+
+Both logs are opened through the protected state root. Cyclops refuses a
+symlink or multiply linked log instead of following or repairing its target.
+Use `cyclops health` to identify an unsafe entry, inspect it, and replace it
+before restarting the daemon. `cyclops daemon log` reads the daemon log.
 
 ## Environment variables
 
@@ -75,7 +88,7 @@ are preserved when it writes preferences.
 | `CYCLOPS_HOME` | Runtime home; defaults to `~/.cyclops`. |
 | `CYCLOPS_THEME` | Theme name or theme-file override. |
 | `CYCLOPS_LOG` | Daemon tracing filter, such as `debug`. |
-| `CYCLOPS_AGENT` | Agent label a vendor-hook command reports as, when the command names no `--agent` of its own. `cyclops start --agents` sets it on each pane it opens, which is what lets one shared vendor hooks file serve a whole fleet and still tell the panes apart. |
+| `CYCLOPS_AGENT` | Optional namespace for per-pane hook sequence counters. The daemon derives hook identity from the authenticated socket peer, so renaming does not require rewriting hook configuration. |
 | `CYCLOPS_NO_VENDOR_HOOKS` | Set to any value to install without editing agent CLI configuration. See below. |
 | `NO_COLOR` | Disable color without removing state words or glyphs. |
 

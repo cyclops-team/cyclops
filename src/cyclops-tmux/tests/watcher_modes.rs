@@ -4,6 +4,7 @@ mod common;
 
 use common::{await_event, TestServer};
 use cyclops_tmux::{PaneEvent, PaneField, SessionWatcher};
+use std::time::Duration;
 
 #[tokio::test]
 async fn copy_mode_flips_in_mode_and_back() {
@@ -75,6 +76,55 @@ async fn short_lived_command_flips_pane_dead_with_remain_on_exit() {
     // The corpse stays in the table. next-3.8 stops reporting #{pane_pid}
     // for a dead pane, and a row dropped for that reads as a removal.
     assert!(w.pane("%1").unwrap().dead);
+
+    w.shutdown().await;
+}
+
+#[tokio::test]
+async fn respawn_emits_the_replacement_process_generation() {
+    let Some(srv) = TestServer::new("respawn-pid") else {
+        return;
+    };
+    srv.new_session("rp");
+    srv.tmux_ok(&["respawn-pane", "-k", "-t", "%0", "sleep 60"]);
+
+    let w = SessionWatcher::connect(srv.config("rp"))
+        .await
+        .expect("connect");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if w.pane("%0")
+                .is_some_and(|row| row.current_command == "sleep")
+            {
+                break;
+            }
+            w.reconcile_now().await.expect("refresh initial command");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("initial sleep process did not become authoritative");
+    let first = w.pane("%0").expect("pane %0").pane_pid;
+    let mut rx = w.subscribe();
+
+    srv.tmux_ok(&["respawn-pane", "-k", "-t", "%0", "sleep 60"]);
+    let event = await_event(&mut rx, "PaneChanged(pane_pid)", |event| {
+        matches!(event, PaneEvent::PaneChanged { id, changed, row }
+            if id == "%0"
+                && changed.contains(&PaneField::PanePid)
+                && row.pane_pid > 0
+                && row.pane_pid != first)
+    })
+    .await;
+    let PaneEvent::PaneChanged { changed, row, .. } = event else {
+        unreachable!()
+    };
+    assert_eq!(
+        changed,
+        vec![PaneField::PanePid],
+        "same-command respawn must be a process-generation edge only"
+    );
+    assert_eq!(w.pane("%0").expect("pane %0").pane_pid, row.pane_pid);
 
     w.shutdown().await;
 }

@@ -19,22 +19,35 @@
 //! about to write, and `pane.read source=detection`, passes
 //! `force_screen` for exactly that reason.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
-use cyclops_manifest::{strip_csi, CompiledRule, Manifest, Region};
-use cyclops_proto::{
-    AgentState, ComposerHold, Detection, ProcessInstanceId, RecipientKey, Sensor, SensorReading,
+use cyclops_manifest::{
+    strip_csi, AckEvidence, CompiledRule, LifecycleCertainty, Manifest, Region,
 };
+use cyclops_proto::{
+    AgentState, ComposerHold, ComposerProof, ComposerSemantic, ComposerState, Detection,
+    NotificationAttemptId, NotificationAttentionCause, NotificationState, ProcessInstanceId,
+    RecipientKey, Sensor, SensorReading,
+};
+#[cfg(test)]
+use cyclops_proto::{NotificationTransport, DOORBELL_FORMAT_COMPACT_CLAIM};
 use cyclops_tmux::{PaneRow, SessionWatcher, TmuxError};
 use tracing::debug;
 
-use crate::{turnkey, unix_ms, DetEntry, Inner, PaneKey};
+use crate::{turnkey, unix_ms, ComposerProjection, DetEntry, Inner, PaneKey};
 
-/// A hook reading older than this is spent: it can no longer decide fused
-/// state on its own (a stale edge must not pin a verdict forever). Checked
-/// only when a recompute runs anyway; no timer ages anything.
+/// A transient hook reading older than this is spent: it can no longer decide
+/// fused state on its own. A confirmed exact lifecycle start is retained until
+/// its matching end replaces it. A provisional unkeyed start is reconciled by
+/// later visual evidence.
 const HOOK_READING_TTL_MS: u64 = 300_000;
+/// Grace period for an unkeyed prompt-submit edge to produce its first visual
+/// Working frame. A clean frame inside this window is neutral. One stable
+/// recheck after the window retires an unconfirmed edge rather than leaving a
+/// provisional runtime overlay alive forever.
+const UNKEYED_DISPATCH_SETTLE_MS: u64 = 500;
 /// Consecutive rules-tier verdicts contradicting the hook reading before
 /// the reading is invalidated.
 const HOOK_DISAGREE_LIMIT: u32 = 3;
@@ -47,6 +60,27 @@ pub(crate) struct HookEntry {
     manifest: Option<String>,
     pub(crate) reading: SensorReading,
     pub(crate) disagreements: u32,
+    /// This reading came from the manifest's turn-start edge. A confirmed exact
+    /// start remains active until its matching end or binding retirement. A
+    /// provisional start remains active only until visual reconciliation.
+    active_start: bool,
+    /// The start itself is independent evidence that a turn exists.
+    ///
+    /// An unkeyed prompt-submit hook is provisional: it updates runtime status
+    /// immediately, but a later visual Working observation must confirm it
+    /// before delivery or `wait done` may rely on it.
+    confirmed_start: bool,
+    /// This reading is a conclusive end for one exact turn. It overrides a
+    /// stale visual Working frame, but never a blocking state or staged input.
+    authoritative_end: bool,
+    /// The exact turn when the manifest can name it. `None` can describe a
+    /// binding-scoped confirmed lifecycle or provisional dispatch evidence,
+    /// but it can never authorize exact-turn settlement.
+    active_turn: Option<turnkey::TurnKey>,
+    /// Deadline for one stable visual reconciliation of an unkeyed start.
+    /// The hook edge itself remains `reading.ts`; the deadline never stands in
+    /// for a second event.
+    provisional_ready_at_ms: Option<u64>,
 }
 
 impl HookEntry {
@@ -66,6 +100,78 @@ impl HookEntry {
             disagreements: 0,
             pane_pid,
             manifest,
+            active_start: false,
+            confirmed_start: false,
+            authoritative_end: false,
+            active_turn: None,
+            provisional_ready_at_ms: None,
+        }
+    }
+
+    /// A confirmed turn-start reading that owns runtime state until its exact
+    /// lifecycle evidence reports the turn ended.
+    pub(crate) fn turn_started(
+        pane_pid: crate::identity::ProcId,
+        manifest: Option<String>,
+        reading: SensorReading,
+        turn: turnkey::TurnKey,
+    ) -> HookEntry {
+        debug_assert_eq!(reading.state, AgentState::Working);
+        HookEntry {
+            active_start: true,
+            confirmed_start: true,
+            active_turn: Some(turn),
+            ..HookEntry::bound(pane_pid, manifest, reading)
+        }
+    }
+
+    /// A confirmed start from a vendor whose hooks cannot name turns.
+    ///
+    /// This owns runtime state under one process and manifest binding. It does
+    /// not create exact-turn evidence and cannot settle message receipt or a
+    /// composer barrier.
+    pub(crate) fn unkeyed_turn_started(
+        pane_pid: crate::identity::ProcId,
+        manifest: Option<String>,
+        reading: SensorReading,
+    ) -> HookEntry {
+        debug_assert_eq!(reading.state, AgentState::Working);
+        HookEntry {
+            active_start: true,
+            confirmed_start: true,
+            ..HookEntry::bound(pane_pid, manifest, reading)
+        }
+    }
+
+    /// A prompt-submit edge that updates runtime status while its acceptance
+    /// remains subject to an independent visual observation.
+    pub(crate) fn provisional_start(
+        pane_pid: crate::identity::ProcId,
+        manifest: Option<String>,
+        reading: SensorReading,
+    ) -> HookEntry {
+        debug_assert_eq!(reading.state, AgentState::Working);
+        HookEntry {
+            active_start: true,
+            confirmed_start: false,
+            provisional_ready_at_ms: Some(reading.ts.saturating_add(UNKEYED_DISPATCH_SETTLE_MS)),
+            ..HookEntry::bound(pane_pid, manifest, reading)
+        }
+    }
+
+    /// A conclusive end that owns runtime state until the visual sensors
+    /// reach a terminal frame or a later start replaces it.
+    pub(crate) fn turn_ended(
+        pane_pid: crate::identity::ProcId,
+        manifest: Option<String>,
+        reading: SensorReading,
+        turn: turnkey::TurnKey,
+    ) -> HookEntry {
+        debug_assert_eq!(reading.state, AgentState::Idle);
+        HookEntry {
+            authoritative_end: true,
+            active_turn: Some(turn),
+            ..HookEntry::bound(pane_pid, manifest, reading)
         }
     }
 
@@ -77,6 +183,949 @@ impl HookEntry {
     fn describes(&self, agent: Option<crate::identity::ProcId>, manifest: Option<&str>) -> bool {
         agent == Some(self.pane_pid) && self.manifest.as_deref() == manifest
     }
+
+    /// Does this exact process binding already own an active turn start?
+    pub(crate) fn active_start_for(
+        &self,
+        agent: crate::identity::ProcId,
+        manifest: Option<&str>,
+    ) -> bool {
+        self.active_start && self.describes(Some(agent), manifest)
+    }
+
+    fn provisional_start_for(
+        &self,
+        agent: crate::identity::ProcId,
+        manifest: Option<&str>,
+    ) -> bool {
+        self.active_start_for(agent, manifest) && !self.confirmed_start
+    }
+
+    fn provisional_recheck_for(
+        &self,
+        agent: crate::identity::ProcId,
+        manifest: Option<&str>,
+    ) -> Option<ProvisionalStartRecheck> {
+        self.provisional_start_for(agent, manifest)
+            .then(|| ProvisionalStartRecheck {
+                agent,
+                manifest: manifest.map(str::to_string),
+                edge_ms: self.reading.ts,
+                ready_at_ms: self
+                    .provisional_ready_at_ms
+                    .expect("provisional start has a reconciliation deadline"),
+            })
+    }
+
+    pub(crate) fn provisional_edge_for(
+        &self,
+        agent: crate::identity::ProcId,
+        manifest: Option<&str>,
+    ) -> Option<u64> {
+        self.provisional_recheck_for(agent, manifest)
+            .map(|candidate| candidate.edge_ms)
+    }
+
+    fn confirmed_start_for(&self, agent: crate::identity::ProcId, manifest: Option<&str>) -> bool {
+        self.active_start_for(agent, manifest) && self.confirmed_start
+    }
+
+    /// Does this binding own a confirmed lifecycle that cannot name turns?
+    pub(crate) fn confirmed_unkeyed_start_for(
+        &self,
+        agent: crate::identity::ProcId,
+        manifest: Option<&str>,
+    ) -> bool {
+        self.confirmed_start_for(agent, manifest) && self.active_turn.is_none()
+    }
+
+    /// Does an end name the active turn under this exact process binding?
+    pub(crate) fn active_start_matches(
+        &self,
+        agent: crate::identity::ProcId,
+        manifest: Option<&str>,
+        turn: Option<&turnkey::TurnKey>,
+    ) -> bool {
+        let Some(turn) = turn else {
+            return false;
+        };
+        self.active_start_for(agent, manifest) && self.active_turn.as_ref() == Some(turn)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProvisionalStartRecheck {
+    agent: crate::identity::ProcId,
+    manifest: Option<String>,
+    edge_ms: u64,
+    ready_at_ms: u64,
+}
+
+/// Candidate start accepted by a later visual Working observation.
+struct ConfirmedCandidateStart {
+    edge: crate::hook_lifecycle::Candidate,
+    accepted_ms: u64,
+    terminal: bool,
+}
+
+enum LifecycleRecheckWork {
+    Terminal(
+        crate::hook_lifecycle::TerminalKind,
+        crate::hook_lifecycle::Candidate,
+    ),
+    Provisional(ProvisionalStartRecheck),
+}
+
+impl LifecycleRecheckWork {
+    fn ready_at_ms(&self) -> u64 {
+        match self {
+            Self::Terminal(_, candidate) => candidate.ready_at_ms,
+            Self::Provisional(candidate) => candidate.ready_at_ms,
+        }
+    }
+
+    fn cause(&self) -> &'static str {
+        match self {
+            Self::Terminal(crate::hook_lifecycle::TerminalKind::End, _) => "candidate_end_settled",
+            Self::Terminal(crate::hook_lifecycle::TerminalKind::VisualEnd, _) => {
+                "candidate_visual_end_settled"
+            }
+            Self::Provisional(_) => "unkeyed_dispatch_settled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleObservation {
+    None,
+    Visual,
+    Stable,
+}
+
+impl LifecycleObservation {
+    fn from_cause(cause: &str) -> Self {
+        match cause {
+            "output_settled"
+            | "bootstrap"
+            | "lag_reconcile"
+            | "pane_reconciled"
+            | "status"
+            | "pane.read"
+            | "gate"
+            | "pre_paste"
+            | "receipt_checkpoint"
+            | "candidate_end_settled"
+            | "candidate_visual_end_settled"
+            | "unkeyed_dispatch_settled" => Self::Stable,
+            "pane_added" | "pane_changed" => Self::Visual,
+            _ => Self::None,
+        }
+    }
+
+    fn is_visual(self) -> bool {
+        self != Self::None
+    }
+}
+
+pub(crate) fn schedule_candidate_end_recheck(
+    inner: &Arc<Inner>,
+    pane: &PaneKey,
+    _candidate: crate::hook_lifecycle::Candidate,
+) {
+    schedule_lifecycle_recheck(inner, pane);
+}
+
+pub(crate) fn schedule_unkeyed_dispatch_recheck(inner: &Arc<Inner>, pane: &PaneKey) {
+    schedule_lifecycle_recheck(inner, pane);
+}
+
+pub(crate) struct LifecycleRecheckTask {
+    notify: Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+fn schedule_lifecycle_recheck(inner: &Arc<Inner>, pane: &PaneKey) {
+    if *inner.stop.borrow() {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    if let Some(notify) = inner
+        .lifecycle_rechecks
+        .lock()
+        .expect("lifecycle rechecks lock")
+        .get(pane)
+        .map(|entry| Arc::clone(&entry.notify))
+    {
+        notify.notify_one();
+        return;
+    }
+    let has_terminal = inner
+        .hook_lifecycle
+        .lock()
+        .expect("hook lifecycle lock")
+        .has_terminal_candidates(pane);
+    let has_provisional = provisional_recheck(inner, pane).is_some();
+    if !has_terminal && !has_provisional {
+        return;
+    }
+    let mut rechecks = inner
+        .lifecycle_rechecks
+        .lock()
+        .expect("lifecycle rechecks lock");
+    // Shutdown sets the stop latch before draining this registry. Check it
+    // while holding the insertion lock so every published entry remains
+    // joinable by shutdown.
+    if *inner.stop.borrow() {
+        return;
+    }
+    if let Some(entry) = rechecks.get(pane) {
+        entry.notify.notify_one();
+        return;
+    }
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let worker_inner = Arc::clone(inner);
+    let worker_pane = pane.clone();
+    let worker_notify = Arc::clone(&notify);
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    let task = runtime.spawn(async move {
+        if start_rx.await.is_err() {
+            return;
+        }
+        lifecycle_recheck_worker(worker_inner, worker_pane, worker_notify).await;
+    });
+    rechecks.insert(
+        pane.clone(),
+        LifecycleRecheckTask {
+            notify: Arc::clone(&notify),
+            task,
+        },
+    );
+    // The task cannot inspect or retire its entry until the registry owns its
+    // handle. Sending under the same lock also closes shutdown's drain race.
+    let _ = start_tx.send(());
+}
+
+async fn lifecycle_recheck_worker(
+    inner: Arc<Inner>,
+    pane: PaneKey,
+    notify: Arc<tokio::sync::Notify>,
+) {
+    let mut stop = inner.stop.clone();
+    let mut attempted_terminal = HashSet::new();
+    let mut attempted_provisional = HashSet::new();
+    loop {
+        if *stop.borrow() || !lifecycle_recheck_is_current(&inner, &pane, &notify) {
+            remove_lifecycle_recheck(&inner, &pane, &notify);
+            return;
+        }
+        let terminal = inner
+            .hook_lifecycle
+            .lock()
+            .expect("hook lifecycle lock")
+            .next_terminal_recheck_excluding(&pane, &attempted_terminal)
+            .map(|(kind, candidate)| LifecycleRecheckWork::Terminal(kind, candidate));
+        let provisional = provisional_recheck(&inner, &pane)
+            .filter(|candidate| {
+                !attempted_provisional.contains(&(candidate.agent, candidate.edge_ms))
+            })
+            .map(LifecycleRecheckWork::Provisional);
+        let next = match (terminal, provisional) {
+            (Some(terminal), Some(provisional)) => {
+                if terminal.ready_at_ms() <= provisional.ready_at_ms() {
+                    Some(terminal)
+                } else {
+                    Some(provisional)
+                }
+            }
+            (terminal, provisional) => terminal.or(provisional),
+        };
+        let Some(work) = next else {
+            if retire_lifecycle_recheck_if_empty(&inner, &pane, &notify) {
+                return;
+            }
+            // Every current candidate already had one stable observation.
+            // Wait for new evidence instead of repeatedly capturing the same
+            // frame. A notification resets the pass so every candidate can be
+            // considered again against that new evidence.
+            tokio::select! {
+                _ = notify.notified() => {
+                    attempted_terminal.clear();
+                    attempted_provisional.clear();
+                }
+                _ = stop.changed() => {}
+            }
+            continue;
+        };
+        let delay = work.ready_at_ms().saturating_sub(unix_ms());
+        if delay > 0 {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+                _ = notify.notified() => {
+                    attempted_terminal.clear();
+                    attempted_provisional.clear();
+                    continue;
+                },
+                _ = stop.changed() => continue,
+            }
+        }
+        if *stop.borrow() || !lifecycle_recheck_is_current(&inner, &pane, &notify) {
+            remove_lifecycle_recheck(&inner, &pane, &notify);
+            return;
+        }
+        let Some(watcher) = inner.watcher_of(pane.session_idx) else {
+            remove_lifecycle_recheck(&inner, &pane, &notify);
+            return;
+        };
+        let cause = work.cause();
+        let Some(_detection) = recompute_pane(
+            &inner,
+            pane.session_idx,
+            &watcher,
+            &pane.pane_id,
+            true,
+            cause,
+        )
+        .await
+        else {
+            remove_lifecycle_recheck(&inner, &pane, &notify);
+            return;
+        };
+        match work {
+            LifecycleRecheckWork::Terminal(kind, candidate) => {
+                let still_current = inner
+                    .hook_lifecycle
+                    .lock()
+                    .expect("hook lifecycle lock")
+                    .terminal_candidate_is_current(&pane, kind, &candidate);
+                if still_current {
+                    let key = crate::hook_lifecycle::Store::terminal_recheck_key(kind, &candidate);
+                    // This candidate did not settle against the current
+                    // evidence. Move on so one unresolved turn cannot starve
+                    // another turn's later deadline.
+                    attempted_terminal.insert(key);
+                }
+            }
+            LifecycleRecheckWork::Provisional(candidate) => {
+                let still_current =
+                    provisional_recheck(&inner, &pane).is_some_and(|current| current == candidate);
+                if still_current {
+                    attempted_provisional.insert((candidate.agent, candidate.edge_ms));
+                }
+            }
+        }
+    }
+}
+
+fn provisional_recheck(inner: &Inner, pane: &PaneKey) -> Option<ProvisionalStartRecheck> {
+    let readings = inner.hook_readings.lock().expect("hook readings lock");
+    let entry = readings.get(pane)?;
+    entry.provisional_recheck_for(entry.pane_pid, entry.manifest.as_deref())
+}
+
+fn lifecycle_recheck_is_current(
+    inner: &Inner,
+    pane: &PaneKey,
+    notify: &Arc<tokio::sync::Notify>,
+) -> bool {
+    inner
+        .lifecycle_rechecks
+        .lock()
+        .expect("lifecycle rechecks lock")
+        .get(pane)
+        .is_some_and(|current| Arc::ptr_eq(&current.notify, notify))
+}
+
+fn retire_lifecycle_recheck_if_empty(
+    inner: &Inner,
+    pane: &PaneKey,
+    notify: &Arc<tokio::sync::Notify>,
+) -> bool {
+    let mut rechecks = inner
+        .lifecycle_rechecks
+        .lock()
+        .expect("lifecycle rechecks lock");
+    if !rechecks
+        .get(pane)
+        .is_some_and(|current| Arc::ptr_eq(&current.notify, notify))
+    {
+        return true;
+    }
+    let pending_terminal = inner
+        .hook_lifecycle
+        .lock()
+        .expect("hook lifecycle lock")
+        .has_terminal_candidates(pane);
+    let pending_provisional = provisional_recheck(inner, pane).is_some();
+    if pending_terminal || pending_provisional {
+        return false;
+    }
+    rechecks.remove(pane);
+    true
+}
+
+fn remove_lifecycle_recheck(inner: &Inner, pane: &PaneKey, notify: &Arc<tokio::sync::Notify>) {
+    let mut rechecks = inner
+        .lifecycle_rechecks
+        .lock()
+        .expect("lifecycle rechecks lock");
+    if rechecks
+        .get(pane)
+        .is_some_and(|current| Arc::ptr_eq(&current.notify, notify))
+    {
+        rechecks.remove(pane);
+    }
+}
+
+pub(crate) fn cancel_lifecycle_recheck(inner: &Inner, pane: &PaneKey) {
+    let mut rechecks = inner
+        .lifecycle_rechecks
+        .lock()
+        .expect("lifecycle rechecks lock");
+    let entry = rechecks.remove(pane);
+    inner
+        .hook_lifecycle
+        .lock()
+        .expect("hook lifecycle lock")
+        .forget(pane);
+    drop(rechecks);
+    stop_lifecycle_recheck_entry(entry);
+}
+
+fn cancel_lifecycle_recheck_task(inner: &Inner, pane: &PaneKey) {
+    let mut rechecks = inner
+        .lifecycle_rechecks
+        .lock()
+        .expect("lifecycle rechecks lock");
+    let entry = rechecks.remove(pane);
+    drop(rechecks);
+    stop_lifecycle_recheck_entry(entry);
+}
+
+fn stop_lifecycle_recheck_entry(entry: Option<LifecycleRecheckTask>) {
+    if let Some(entry) = entry {
+        entry.notify.notify_one();
+        let task = entry.task;
+        // A recheck can discover a manifest or process rebound inside its own
+        // recompute. Let that recompute commit the new binding. Aborting the
+        // current task here would cancel it at its next await and leave the
+        // cache on the old occupant.
+        if tokio::task::try_id().is_none_or(|current| current != task.id()) {
+            task.abort();
+        }
+    }
+}
+
+pub(crate) fn take_lifecycle_recheck_tasks(inner: &Inner) -> Vec<tokio::task::JoinHandle<()>> {
+    let entries = std::mem::take(
+        &mut *inner
+            .lifecycle_rechecks
+            .lock()
+            .expect("lifecycle rechecks lock"),
+    );
+    entries
+        .into_values()
+        .map(|entry| {
+            entry.notify.notify_one();
+            entry.task
+        })
+        .collect()
+}
+
+fn positive_visual_working(inner: &Inner, manifest: &str, detection: &Detection) -> bool {
+    let manifest = inner.manifests.get(manifest);
+    !detection.stale
+        && detection.state == AgentState::Working
+        && detection.readings.iter().any(|reading| {
+            if reading.sensor == Sensor::Hook || reading.state != AgentState::Working {
+                return false;
+            }
+            manifest.is_none_or(|manifest| {
+                let mut rules = manifest.rules.iter().filter(|rule| rule.id == reading.rule);
+                let Some(first) = rules.next() else {
+                    return false;
+                };
+                first.lifecycle_evidence && rules.all(|rule| rule.lifecycle_evidence)
+            })
+        })
+}
+
+fn terminal_visual_state(detection: &Detection, in_mode: bool) -> Option<AgentState> {
+    if in_mode || detection.stale {
+        return None;
+    }
+    let screen = detection
+        .readings
+        .iter()
+        .filter(|reading| reading.sensor == Sensor::Screen)
+        .map(|reading| reading.state)
+        .next()?;
+    if !matches!(screen, AgentState::Idle | AgentState::IdleWithInput) {
+        return None;
+    }
+    let terminal = detection
+        .readings
+        .iter()
+        .filter(|reading| reading.sensor != Sensor::Hook)
+        .all(|reading| matches!(reading.state, AgentState::Idle | AgentState::IdleWithInput));
+    terminal.then_some(screen)
+}
+
+fn visual_rejects_start(detection: &Detection, in_mode: bool) -> bool {
+    if detection.stale {
+        return false;
+    }
+    if in_mode {
+        return true;
+    }
+    let decisive_screen = detection.readings.iter().any(|reading| {
+        reading.sensor == Sensor::Screen
+            && (reading.state == AgentState::IdleWithInput || reading.state.is_blocked())
+    });
+    decisive_screen
+}
+
+/// Reconcile pane runtime and one exact dispatch candidate from the same hook
+/// edge. Runtime is pane-scoped. Receipt remains attempt-scoped and requires a
+/// pending candidate with this exact edge.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_unkeyed_dispatch_start(
+    inner: &Arc<Inner>,
+    pane: &PaneKey,
+    agent: crate::identity::ProcId,
+    manifest: &str,
+    detection: &Detection,
+    in_mode: bool,
+    observed_ms: u64,
+    observation: LifecycleObservation,
+) -> bool {
+    if !observation.is_visual()
+        || !inner.manifests.get(manifest).is_some_and(|m| {
+            m.hooks.ack_evidence == AckEvidence::Dispatch && m.hooks.turn_key_fields.is_empty()
+        })
+    {
+        return false;
+    }
+    let provisional = inner
+        .hook_readings
+        .lock()
+        .expect("hook readings lock")
+        .get(pane)
+        .and_then(|entry| entry.provisional_recheck_for(agent, Some(manifest)));
+    let Some(provisional) = provisional else {
+        return false;
+    };
+
+    let accepted = positive_visual_working(inner, manifest, detection);
+    let rejected = visual_rejects_start(detection, in_mode);
+    let expired_clean = observation == LifecycleObservation::Stable
+        && observed_ms >= provisional.ready_at_ms
+        && terminal_visual_state(detection, in_mode) == Some(AgentState::Idle);
+    if !accepted && !rejected && !expired_clean {
+        return false;
+    }
+
+    let removed = {
+        let mut readings = inner.hook_readings.lock().expect("hook readings lock");
+        if readings
+            .get(pane)
+            .and_then(|entry| entry.provisional_recheck_for(agent, Some(manifest)))
+            .is_some_and(|current| current.edge_ms == provisional.edge_ms)
+        {
+            readings.remove(pane);
+            true
+        } else {
+            false
+        }
+    };
+    if accepted && removed {
+        crate::delivery::confirm_unkeyed_dispatch_ack(
+            inner,
+            pane.session_idx,
+            &pane.pane_id,
+            agent,
+            manifest,
+            provisional.edge_ms,
+            observed_ms,
+        );
+    } else if removed {
+        crate::delivery::reject_unkeyed_dispatch_ack(
+            inner,
+            pane.session_idx,
+            &pane.pane_id,
+            agent,
+            manifest,
+            provisional.edge_ms,
+            if rejected {
+                "hook_dispatch_conflicted"
+            } else {
+                "hook_dispatch_unconfirmed"
+            },
+        );
+    }
+    accepted && removed
+}
+
+/// Whether the current Working cache is backed by a lifecycle-capable visual
+/// observation or a confirmed hook start. Provisional hook status is excluded.
+pub(crate) fn cached_working_confirmed(inner: &Inner, session_idx: usize, pane_id: &str) -> bool {
+    let pane = PaneKey::new(session_idx, pane_id);
+    inner
+        .detections
+        .lock()
+        .expect("detections lock")
+        .get(&pane)
+        .is_some_and(|entry| entry.working_confirmed)
+}
+
+fn working_is_confirmed(
+    inner: &Inner,
+    pane: &PaneKey,
+    detection: &Detection,
+    agent: Option<crate::identity::ProcId>,
+    manifest: Option<&str>,
+) -> bool {
+    if detection.state != AgentState::Working {
+        return false;
+    }
+    if manifest.is_some_and(|manifest| positive_visual_working(inner, manifest, detection)) {
+        return true;
+    }
+    match (agent, manifest) {
+        (Some(agent), manifest) => inner
+            .hook_readings
+            .lock()
+            .expect("hook readings lock")
+            .get(pane)
+            .is_some_and(|entry| entry.confirmed_start_for(agent, manifest)),
+        _ => false,
+    }
+}
+
+fn retire_obsolete_visual_end(
+    inner: &Arc<Inner>,
+    pane: &PaneKey,
+    agent: crate::identity::ProcId,
+    manifest: &str,
+) {
+    let active_turn = inner
+        .hook_readings
+        .lock()
+        .expect("hook readings lock")
+        .get(pane)
+        .filter(|entry| entry.active_start_for(agent, Some(manifest)))
+        .and_then(|entry| entry.active_turn.clone());
+    let Some(active_turn) = active_turn else {
+        return;
+    };
+    // Visual idle cannot end a keyed lifecycle. Retire candidates created by
+    // older code, then keep the exact start until its matching keyed end and a
+    // clean composer settle through the normal terminal-candidate path.
+    inner
+        .hook_lifecycle
+        .lock()
+        .expect("hook lifecycle lock")
+        .clear_visual_end(pane, agent, manifest, &active_turn);
+}
+
+struct TerminalDrain {
+    confirmations: Vec<ConfirmedCandidateStart>,
+}
+
+const MAX_TERMINAL_DRAIN_PER_OBSERVATION: usize = 128;
+
+/// One stable terminal frame can settle every exact Stop that became ready
+/// while the pane was detached. Draining here avoids depending on timer tasks
+/// that correctly exited when no watcher was available.
+fn drain_terminal_candidates(
+    inner: &Arc<Inner>,
+    pane: &PaneKey,
+    agent: crate::identity::ProcId,
+    manifest: &str,
+    observed_ms: u64,
+) -> TerminalDrain {
+    let mut confirmations = Vec::new();
+    for _ in 0..MAX_TERMINAL_DRAIN_PER_OBSERVATION {
+        let active_turn = inner
+            .hook_readings
+            .lock()
+            .expect("hook readings lock")
+            .get(pane)
+            .filter(|entry| entry.active_start_for(agent, Some(manifest)))
+            .and_then(|entry| entry.active_turn.clone());
+        let settlement = inner
+            .hook_lifecycle
+            .lock()
+            .expect("hook lifecycle lock")
+            .settle_next_ready_terminal(pane, agent, manifest, active_turn.as_ref(), observed_ms);
+        let Some(settlement) = settlement else {
+            break;
+        };
+        let end = settlement.end;
+        turnkey::PaneEnds::record(
+            &mut inner.turn_ends.lock().expect("turn ends lock"),
+            pane,
+            agent,
+            manifest,
+            end.turn.clone(),
+        );
+        let mut readings = inner.hook_readings.lock().expect("hook readings lock");
+        if readings
+            .get(pane)
+            .is_some_and(|entry| entry.active_start_matches(agent, Some(manifest), Some(&end.turn)))
+        {
+            readings.remove(pane);
+        }
+        drop(readings);
+        if let Some(start) = settlement.start {
+            // Pin the paired dispatch before another unrelated end is
+            // recorded. PaneEnds bounds unpinned history, so deferring every
+            // pin until the whole drain finishes could evict the active
+            // delivery's exact end inside one large detached backlog.
+            crate::delivery::prepare_dispatch_ack(
+                inner,
+                pane.session_idx,
+                &pane.pane_id,
+                start.agent,
+                &start.manifest,
+                &start.turn,
+            );
+            confirmations.push(ConfirmedCandidateStart {
+                edge: start,
+                accepted_ms: observed_ms,
+                terminal: true,
+            });
+        }
+    }
+    TerminalDrain { confirmations }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_candidate_lifecycles(
+    inner: &Arc<Inner>,
+    pane: &PaneKey,
+    agent: crate::identity::ProcId,
+    manifest: &str,
+    detection: &Detection,
+    in_mode: bool,
+    observed_ms: u64,
+    observation: LifecycleObservation,
+) -> Vec<ConfirmedCandidateStart> {
+    let mut confirmations = Vec::new();
+    if observation == LifecycleObservation::Stable
+        && terminal_visual_state(detection, in_mode).is_some()
+    {
+        let drained = drain_terminal_candidates(inner, pane, agent, manifest, observed_ms);
+        confirmations.extend(drained.confirmations);
+    }
+    confirmations.extend(reconcile_candidate_lifecycle(
+        inner,
+        pane,
+        agent,
+        manifest,
+        detection,
+        in_mode,
+        observed_ms,
+        observation,
+    ));
+    confirmations
+}
+
+/// Promote or retire candidate lifecycle edges using a later watcher revision.
+/// Raw hook-triggered recomputes cannot reach a candidate because they do not
+/// advance the visual revision.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_candidate_lifecycle(
+    inner: &Arc<Inner>,
+    pane: &PaneKey,
+    agent: crate::identity::ProcId,
+    manifest: &str,
+    detection: &Detection,
+    in_mode: bool,
+    observed_ms: u64,
+    observation: LifecycleObservation,
+) -> Option<ConfirmedCandidateStart> {
+    let active_turn = inner
+        .hook_readings
+        .lock()
+        .expect("hook readings lock")
+        .get(pane)
+        .filter(|entry| entry.active_start_for(agent, Some(manifest)))
+        .and_then(|entry| entry.active_turn.clone());
+    let (start, end) = {
+        let store = inner.hook_lifecycle.lock().expect("hook lifecycle lock");
+        let end = store.end_for(pane, agent, manifest, active_turn.as_ref());
+        (store.start_for(pane, agent, manifest), end)
+    };
+    // The watcher timestamp is taken before the observation starts. An edge
+    // arriving during capture cannot be confirmed by pixels that may predate
+    // it, even if the observation commits a newer revision afterwards.
+    let start = start.filter(|edge| edge.edge_ms < observed_ms);
+    let end = end.filter(|edge| edge.edge_ms < observed_ms);
+
+    let terminal_state = terminal_visual_state(detection, in_mode);
+    if let Some(end) = end.as_ref() {
+        let working_belongs_to_end = active_turn.as_ref() == Some(&end.turn)
+            && !inner
+                .hook_lifecycle
+                .lock()
+                .expect("hook lifecycle lock")
+                .has_other_start_for(pane, agent, manifest, &end.turn);
+        if positive_visual_working(inner, manifest, detection) && working_belongs_to_end {
+            // A Stop hook reports before Claude has combined every concurrent
+            // Stop decision. Later Working proves at least one sibling kept
+            // this exact turn alive. A candidate for another turn makes the
+            // frame ambiguous, so it cannot retire this Stop.
+            let consumed = inner
+                .hook_lifecycle
+                .lock()
+                .expect("hook lifecycle lock")
+                .clear_terminal_candidates(pane, end);
+            if !consumed {
+                return None;
+            }
+        } else if observation != LifecycleObservation::Stable || observed_ms < end.ready_at_ms {
+            let deferred = inner
+                .hook_lifecycle
+                .lock()
+                .expect("hook lifecycle lock")
+                .defer_end(pane, end);
+            if !deferred {
+                return None;
+            }
+        } else if terminal_state.is_some() {
+            let settlement = inner
+                .hook_lifecycle
+                .lock()
+                .expect("hook lifecycle lock")
+                .settle_terminal_candidate(pane, end);
+            let settlement = settlement?;
+            turnkey::PaneEnds::record(
+                &mut inner.turn_ends.lock().expect("turn ends lock"),
+                pane,
+                agent,
+                manifest,
+                end.turn.clone(),
+            );
+            {
+                let mut readings = inner.hook_readings.lock().expect("hook readings lock");
+                if readings.get(pane).is_some_and(|entry| {
+                    entry.active_start_matches(agent, Some(manifest), Some(&end.turn))
+                }) {
+                    readings.remove(pane);
+                }
+            }
+            if let Some(start) = settlement.start {
+                return Some(ConfirmedCandidateStart {
+                    edge: start,
+                    accepted_ms: observed_ms,
+                    terminal: true,
+                });
+            }
+        } else {
+            let deferred = inner
+                .hook_lifecycle
+                .lock()
+                .expect("hook lifecycle lock")
+                .defer_end(pane, end);
+            if !deferred {
+                return None;
+            }
+        }
+    }
+
+    retire_obsolete_visual_end(inner, pane, agent, manifest);
+
+    let start = start?;
+    if active_turn.is_some() {
+        inner
+            .hook_lifecycle
+            .lock()
+            .expect("hook lifecycle lock")
+            .defer_start(pane, &start);
+        return None;
+    }
+    if visual_rejects_start(detection, in_mode) {
+        // Staged input or a blocking screen proves this prompt did not enter a
+        // turn. A clean composer is neutral: Claude clears accepted input
+        // before it paints the first Working frame.
+        let _ = inner
+            .hook_lifecycle
+            .lock()
+            .expect("hook lifecycle lock")
+            .clear_start(pane, &start);
+        return None;
+    }
+    if !positive_visual_working(inner, manifest, detection) {
+        let _ = inner
+            .hook_lifecycle
+            .lock()
+            .expect("hook lifecycle lock")
+            .defer_start(pane, &start);
+        return None;
+    }
+    let already_ended = turnkey::PaneEnds::holds(
+        &inner.turn_ends.lock().expect("turn ends lock"),
+        pane,
+        agent,
+        manifest,
+        &start.turn,
+    );
+    let consumed = inner
+        .hook_lifecycle
+        .lock()
+        .expect("hook lifecycle lock")
+        .clear_start(pane, &start);
+    if !consumed {
+        return None;
+    }
+    if already_ended {
+        return None;
+    }
+    let reading = SensorReading {
+        sensor: Sensor::Hook,
+        state: AgentState::Working,
+        rule: format!("{}:visual_confirmed", start.event),
+        ts: observed_ms,
+    };
+    inner
+        .hook_readings
+        .lock()
+        .expect("hook readings lock")
+        .insert(
+            pane.clone(),
+            HookEntry::turn_started(
+                agent,
+                Some(manifest.to_string()),
+                reading,
+                start.turn.clone(),
+            ),
+        );
+    // A confirmed end can race the promotion between the first check and
+    // insertion. Recheck after the active reading exists. If the end landed
+    // first, remove only the exact reading this promotion installed.
+    let ended_after_insert = turnkey::PaneEnds::holds(
+        &inner.turn_ends.lock().expect("turn ends lock"),
+        pane,
+        agent,
+        manifest,
+        &start.turn,
+    );
+    if ended_after_insert {
+        let mut readings = inner.hook_readings.lock().expect("hook readings lock");
+        if readings.get(pane).is_some_and(|entry| {
+            entry.active_start_matches(agent, Some(manifest), Some(&start.turn))
+        }) {
+            readings.remove(pane);
+        }
+        return None;
+    }
+    Some(ConfirmedCandidateStart {
+        edge: start,
+        accepted_ms: observed_ms,
+        terminal: false,
+    })
 }
 
 /// Bind a manifest to a pane by its foreground command. Deterministic:
@@ -91,7 +1140,7 @@ pub(crate) fn bind_manifest<'a>(
 }
 
 /// Bind a manifest to a pane row: the explicit pin first, then the comm
-/// name, then the argv-basename fallback.
+/// name, then the live process ancestry.
 ///
 /// The pin is `cyclops name --manifest <id>` and it wins outright. It
 /// exists because both automatic routes read what the pane is RUNNING, and
@@ -102,13 +1151,15 @@ pub(crate) fn bind_manifest<'a>(
 /// pane_current_command is the kernel comm of the RESOLVED executable, so
 /// native installs can report a bare version string ("2.1.220", F21) and
 /// never bind by comm; the invoked argv[0] basename still says "claude".
-/// The fallback resolves argv once per (pane, pid), cached, and matches it
-/// against process_names plus argv_basenames.
+/// The foreground argv cache keeps that common case cheap. When a tool owns
+/// the terminal, the live ancestry walk finds the admitted agent above it.
 ///
-/// The pid it reads is the pane's FOREGROUND process, not `pane_pid`. See
+/// Both routes start at the pane's FOREGROUND process, not `pane_pid`. See
 /// [`foreground_pid`]: an agent started by typing its name at a shell
 /// prompt is a child of the pane's first process, and reading `pane_pid`
-/// binds every such pane to the shell instead of the agent.
+/// binds every such pane to the shell instead of the agent. The ancestry
+/// route is also what keeps the manifest stable while the agent gives the
+/// terminal to a child tool.
 pub(crate) fn bind_manifest_for<'a>(
     inner: &'a Inner,
     session_idx: usize,
@@ -144,13 +1195,10 @@ pub(crate) fn bind_manifest_for<'a>(
     if row.pane_pid <= 0 {
         return None;
     }
-    argv_bound_manifest(
-        inner,
-        session_idx,
-        &row.pane_id,
-        foreground_pid(row.pane_pid),
-    )
-    .map(|(m, _)| m)
+    let leader = foreground_pid(row.pane_pid);
+    argv_bound_manifest(inner, session_idx, &row.pane_id, leader)
+        .or_else(|| vendor_between(inner, session_idx, &row.pane_id, leader, row.pane_pid))
+        .map(|(m, _)| m)
 }
 
 /// The agent instance a process is working for, proven from the process
@@ -177,6 +1225,16 @@ pub(crate) fn vendor_between<'a>(
     // second read produces a valid-looking binding for a process this
     // walk never saw.
     crate::identity::vendor_ancestor(from, root, |p| argv_live(inner, pane_id, p))
+}
+
+fn vendor_between_observed<'a>(
+    inner: &'a Inner,
+    _session_idx: usize,
+    pane_id: &str,
+    from: i32,
+    root: i32,
+) -> crate::identity::VendorAncestor<(&'a Manifest, crate::identity::ProcId)> {
+    crate::identity::vendor_ancestor_observed(from, root, |p| argv_live_observed(inner, pane_id, p))
 }
 
 /// The same binding, read LIVE, with no cache consulted.
@@ -221,6 +1279,21 @@ fn argv_live<'a>(
     match vendor_read(inner, pid, argv_basename, crate::identity::proc_facts) {
         VendorRead::Vendor(m, proc) => Some((m, proc)),
         VendorRead::NotVendor | VendorRead::Unprovable => None,
+    }
+}
+
+fn argv_live_observed<'a>(
+    inner: &'a Inner,
+    pane_id: &str,
+    pid: i32,
+) -> crate::identity::VendorAncestor<(&'a Manifest, crate::identity::ProcId)> {
+    let _ = pane_id;
+    match vendor_read(inner, pid, argv_basename, crate::identity::proc_facts) {
+        VendorRead::Vendor(manifest, process) => {
+            crate::identity::VendorAncestor::Vendor((manifest, process))
+        }
+        VendorRead::NotVendor => crate::identity::VendorAncestor::NotVendor,
+        VendorRead::Unprovable => crate::identity::VendorAncestor::Unprovable,
     }
 }
 
@@ -299,9 +1372,10 @@ pub(crate) fn admitted_vendor<'a>(
 
 /// Everything a write depends on about a pane, read as ONE observation.
 ///
-/// Three facts that have to agree, and are worthless apart: the
-/// foreground leader holding the terminal, the agent process the payload
-/// belongs to, and the rules that agent is running under RIGHT NOW.
+/// Four facts that have to agree, and are worthless apart: the pane-root
+/// process generation, the foreground leader holding the terminal, the agent
+/// process the payload belongs to, and the rules that agent is running under
+/// right now.
 ///
 /// The manifest is part of it rather than something remembered from the
 /// gate because a process can exec in place: same pid, same start time,
@@ -310,9 +1384,115 @@ pub(crate) fn admitted_vendor<'a>(
 /// land in another's composer under the first one's rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Binding {
+    pub(crate) pane_root: crate::identity::ProcId,
     pub(crate) leader: crate::identity::ProcId,
     pub(crate) agent: crate::identity::ProcId,
     pub(crate) manifest: String,
+}
+
+/// Match a durable notification binding to one current process observation.
+///
+/// Older incomplete records remain replayable but cannot authorize composer
+/// ownership or a terminal action.
+pub(crate) fn notification_binding_matches(
+    record: &cyclops_proto::NotificationRecord,
+    recipient: RecipientKey,
+    current: &Binding,
+) -> bool {
+    let Some(expected) = record.binding.as_ref() else {
+        return false;
+    };
+    let Ok(pane_root) = ProcessInstanceId::new(current.pane_root.pid, current.pane_root.birth)
+    else {
+        return false;
+    };
+    let Ok(leader) = ProcessInstanceId::new(current.leader.pid, current.leader.birth) else {
+        return false;
+    };
+    let Ok(agent) = ProcessInstanceId::new(current.agent.pid, current.agent.birth) else {
+        return false;
+    };
+
+    expected.recipient == record.recipient
+        && recipient == record.recipient
+        && expected.pane_root == Some(pane_root)
+        && expected.leader == Some(leader)
+        && expected.agent == agent
+        && expected.manifest.as_str() == current.manifest
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BindingObservation {
+    Bound(Binding),
+    NotVendor,
+    Gone,
+    Unprovable,
+}
+
+fn admitted_binding_observation(
+    inner: &Inner,
+    session_idx: usize,
+    row: &PaneRow,
+) -> BindingObservation {
+    let Some(pane_root) = crate::identity::ProcId::of(row.pane_pid) else {
+        return BindingObservation::Unprovable;
+    };
+    let Some(leader_pid) = foreground_pid_checked(row.pane_pid) else {
+        return BindingObservation::Unprovable;
+    };
+    let Some(leader) = crate::identity::ProcId::of(leader_pid) else {
+        return BindingObservation::Unprovable;
+    };
+    let observed =
+        vendor_between_observed(inner, session_idx, &row.pane_id, leader.pid, row.pane_pid);
+    if crate::identity::ProcId::of(row.pane_pid) != Some(pane_root)
+        || foreground_pid_checked(row.pane_pid).and_then(crate::identity::ProcId::of)
+            != Some(leader)
+    {
+        return BindingObservation::Unprovable;
+    }
+    match observed {
+        crate::identity::VendorAncestor::Vendor((manifest, agent)) => {
+            BindingObservation::Bound(Binding {
+                pane_root,
+                leader,
+                agent,
+                manifest: manifest.agent.id.clone(),
+            })
+        }
+        crate::identity::VendorAncestor::NotVendor => BindingObservation::NotVendor,
+        crate::identity::VendorAncestor::Unprovable => BindingObservation::Unprovable,
+    }
+}
+
+fn pane_binding_observation(
+    inner: &Inner,
+    session_idx: usize,
+    row: &PaneRow,
+    occupant: Occupant,
+) -> BindingObservation {
+    if row.dead || occupant == Occupant::Gone {
+        BindingObservation::Gone
+    } else if occupant == Occupant::Unprovable {
+        BindingObservation::Unprovable
+    } else {
+        admitted_binding_observation(inner, session_idx, row)
+    }
+}
+
+fn binding_replacement_proven(
+    prior_agent: Option<crate::identity::ProcId>,
+    prior_manifest: Option<&str>,
+    observation: &BindingObservation,
+    observed_manifest: Option<&str>,
+) -> bool {
+    match observation {
+        BindingObservation::Bound(binding) => prior_agent.is_some_and(|prior_agent| {
+            binding.agent != prior_agent || prior_manifest != observed_manifest
+        }),
+        BindingObservation::NotVendor | BindingObservation::Gone => true,
+        BindingObservation::Unprovable => false,
+    }
 }
 
 /// The current binding of a pane, or None if any part of it could not be
@@ -322,15 +1502,12 @@ pub(crate) fn admitted_binding(
     session_idx: usize,
     row: &PaneRow,
 ) -> Option<Binding> {
-    let leader_pid = foreground_pid_checked(row.pane_pid)?;
-    let leader = crate::identity::ProcId::of(leader_pid)?;
-    let (manifest, agent) =
-        vendor_between(inner, session_idx, &row.pane_id, leader.pid, row.pane_pid)?;
-    Some(Binding {
-        leader,
-        agent,
-        manifest: manifest.agent.id.clone(),
-    })
+    match admitted_binding_observation(inner, session_idx, row) {
+        BindingObservation::Bound(binding) => Some(binding),
+        BindingObservation::NotVendor
+        | BindingObservation::Gone
+        | BindingObservation::Unprovable => None,
+    }
 }
 
 /// The manifest that claims this argv[0] basename, by either declared name.
@@ -352,7 +1529,7 @@ pub(crate) fn manifest_for_basename<'a>(
 /// it, so `pane_pid` names the shell no matter what is on screen.
 /// MEASURED (tmux 3.7b, Claude Code 2.1.222): a pane running Claude Code
 /// reports `pane_current_command` "2.1.222", `pane_pid` the zsh, and
-/// `ps -o args=` on that pid "-zsh" — nothing in either sensor says
+/// `ps -o args=` on that pid "-zsh". Nothing in either sensor says
 /// "claude", so the pane bound no manifest and carried no state at all.
 ///
 /// The agent instance's identity, and the reason a pane id and a pane pid
@@ -497,6 +1674,14 @@ pub(crate) fn set_hold_owned(
 /// delivery, when the pane's binding cannot be named, or when the hold is
 /// already waiting on a DIFFERENT turn. Binding the same key again is
 /// idempotent: an acknowledgement can arrive more than once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BoundTurn {
+    /// The exact end was already durable when this turn took the pin.
+    /// Callers retain this fact even if reconciliation consumes the store
+    /// before they publish the corresponding receipt.
+    pub(crate) end_already_present: bool,
+}
+
 pub(crate) fn bind_turn(
     inner: &Arc<Inner>,
     session_idx: usize,
@@ -504,33 +1689,28 @@ pub(crate) fn bind_turn(
     owner: &str,
     turn: turnkey::TurnKey,
     since_ms: u64,
-) -> bool {
-    let (prior_ready, det) = {
+) -> Option<BoundTurn> {
+    let (prior_ready, det, end_already_present) = {
         let mut map = inner.detections.lock().expect("detections lock");
         let pane = PaneKey::new(session_idx, pane_id);
-        let Some(entry) = map.get_mut(&pane) else {
-            return false;
-        };
+        let entry = map.get_mut(&pane)?;
         if entry.hold_owner.as_deref() != Some(owner) {
-            return false;
+            return None;
         }
         // The end store is keyed on the pane's binding, so an unnamed
         // binding has nothing to key on.
         let (Some(agent), Some(manifest)) = (entry.agent, entry.manifest.clone()) else {
-            return false;
+            return None;
         };
         if entry.turn.as_ref().is_some_and(|t| *t != turn) {
-            return false;
+            return None;
         }
-        if !turnkey::PaneEnds::pin(
-            &mut inner.turn_ends.lock().expect("turn ends lock"),
-            &pane,
-            agent,
-            &manifest,
-            &turn,
-        ) {
-            return false;
+        let mut turn_ends = inner.turn_ends.lock().expect("turn ends lock");
+        if !turnkey::PaneEnds::pin(&mut turn_ends, &pane, agent, &manifest, &turn) {
+            return None;
         }
+        let end_already_present =
+            turnkey::PaneEnds::holds(&turn_ends, &pane, agent, &manifest, &turn);
         entry.turn = Some(turn);
         // Only a hold that is still WAITING takes the mark. One that
         // already carries a witnessed edge has stronger evidence than an
@@ -543,10 +1723,12 @@ pub(crate) fn bind_turn(
             entry.detection.write_block.clone(),
         );
         entry.detection = entry.detection.clone().stamped(entry.in_mode, entry.hold);
-        (prior_ready, entry.detection.clone())
+        (prior_ready, entry.detection.clone(), end_already_present)
     };
     wake_readiness(inner, session_idx, pane_id, Some(prior_ready), &det);
-    true
+    Some(BoundTurn {
+        end_already_present,
+    })
 }
 
 /// Claim the composer barrier for one delivery attempt, at the write
@@ -765,6 +1947,7 @@ fn wake_readiness(
             }),
             None,
         );
+        crate::messaging::schedule_route_changed(inner, session_idx, pane_id);
     }
 }
 
@@ -801,6 +1984,20 @@ fn retain_stale(
     p.stale = true;
     let p = p.stamped(in_mode, entry.hold);
     entry.detection = p.clone();
+    let attempt = entry.composer.notification_attempt.or_else(|| {
+        entry
+            .hold_owner
+            .as_deref()
+            .and_then(|owner| NotificationAttemptId::parse(owner).ok())
+    });
+    let candidate_count = entry.composer.candidate_count as usize;
+    entry.composer = ambiguous_composer_projection(
+        attempt,
+        ComposerProof::Unprovable,
+        "detection_stale",
+        candidate_count,
+    );
+    entry.working_confirmed = false;
     Some(p)
 }
 
@@ -815,7 +2012,7 @@ pub(crate) fn parse_tpgid(line: &str) -> Option<i32> {
 /// memoising the reading only once it has actually bound something. The ps
 /// spawn runs when comm binding already missed; never on a clock.
 ///
-/// The asymmetry — remember a hit, re-probe a miss — is load-bearing, not
+/// The asymmetry, remember a hit and re-probe a miss, is load-bearing, not
 /// an optimisation. Vendor CLIs ship a shell wrapper that re-execs itself
 /// in place, so the pid is stable across the exec while argv[0] flips from
 /// the wrapper's interpreter to the agent's own name. cursor-agent's
@@ -829,8 +2026,8 @@ pub(crate) fn parse_tpgid(line: &str) -> Option<i32> {
 ///
 /// Recomputes are output-driven and typing `agent` at a prompt echoes that
 /// line immediately, so the probe lands in the first window often. Keyed on
-/// (pane, pid), a cache that remembered "bash" could never correct itself —
-/// the pid never changes — and the pane would read unknown, carry no state
+/// (pane, pid), a cache that remembered "bash" could never correct itself.
+/// The pid never changes, and the pane would read unknown, carry no state
 /// and refuse delivery for the rest of that process's life. So a basename
 /// that binds nothing means "not settled yet", never "no agent here".
 ///
@@ -941,8 +2138,8 @@ pub(crate) fn parse_argv_basename(args_line: &str) -> Option<String> {
 enum HookAction {
     /// Reading is live: feed it to fusion.
     Use,
-    /// Reading is spent (TTL) or invalidated (repeated rules-tier
-    /// contradiction): drop it from the store and fuse without it.
+    /// A transient reading is spent by TTL or repeated rules-tier
+    /// contradiction. Drop it from the store and fuse without it.
     Drop,
 }
 
@@ -950,6 +2147,20 @@ enum HookAction {
 /// Disagreement only counts when the rules actually decided something;
 /// agreement resets the streak.
 fn hook_action(entry: &mut HookEntry, rules_state: AgentState, now_ms: u64) -> HookAction {
+    // An authenticated start is a lifecycle fact, not a sample. The idle
+    // composer often remains on screen until Claude paints its first output,
+    // and repeated captures of that frame do not end the turn. A missing end
+    // must remain visible as Working instead of silently ageing to Idle.
+    if entry.active_start {
+        return HookAction::Use;
+    }
+    if entry.authoritative_end {
+        return if matches!(rules_state, AgentState::Idle | AgentState::IdleWithInput) {
+            HookAction::Drop
+        } else {
+            HookAction::Use
+        };
+    }
     if now_ms.saturating_sub(entry.reading.ts) > HOOK_READING_TTL_MS {
         return HookAction::Drop;
     }
@@ -965,6 +2176,47 @@ fn hook_action(entry: &mut HookEntry, rules_state: AgentState, now_ms: u64) -> H
         HookAction::Drop
     } else {
         HookAction::Use
+    }
+}
+
+/// Apply one bound hook reading to the visual verdict.
+///
+/// An active start owns the runtime answer before the first output frame. The
+/// screen still owns blocked states because lifecycle hooks do not observe
+/// permission prompts, modals, or quota exhaustion. Disagreement remains
+/// explicit, and write-readiness is stamped separately after fusion.
+fn apply_hook_reading(
+    detection: &mut Detection,
+    reading: SensorReading,
+    active_start: bool,
+    authoritative_end: bool,
+) {
+    let hook_state = reading.state;
+    let hook_rule = reading.rule.clone();
+    let visual_state = detection.state;
+    detection.readings.push(reading);
+
+    if authoritative_end
+        && hook_state == AgentState::Idle
+        && !visual_state.is_blocked()
+        && visual_state != AgentState::IdleWithInput
+    {
+        if visual_state != AgentState::Unknown && visual_state != AgentState::Idle {
+            detection.disagreement = true;
+        }
+        detection.state = AgentState::Idle;
+        detection.decided_by = format!("hook:{hook_rule}");
+    } else if active_start && hook_state == AgentState::Working && !visual_state.is_blocked() {
+        if visual_state != AgentState::Unknown && visual_state != AgentState::Working {
+            detection.disagreement = true;
+        }
+        detection.state = AgentState::Working;
+        detection.decided_by = format!("hook:{hook_rule}");
+    } else if visual_state == AgentState::Unknown {
+        detection.state = hook_state;
+        detection.decided_by = format!("hook:{hook_rule}");
+    } else if hook_state != visual_state {
+        detection.disagreement = true;
     }
 }
 
@@ -1031,11 +2283,12 @@ async fn capture_screens(
     m: &Manifest,
     pane_id: &str,
 ) -> Result<(String, Option<String>), TmuxError> {
-    let plain = watcher.client().capture_pane(pane_id).await?;
     if !m.has_escaped_rules() {
+        let plain = watcher.client().capture_pane(pane_id).await?;
         return Ok((plain, None));
     }
     let esc = watcher.client().capture_pane_escaped(pane_id).await?;
+    let plain = strip_csi(&esc);
     Ok((plain, Some(esc)))
 }
 
@@ -1078,6 +2331,7 @@ pub(crate) fn fuse(
             stale: false,
             write_ready: false,
             write_block: None,
+            composer_semantic: screen.and_then(|rule| rule.composer_semantic),
             readings,
         },
         None => Detection {
@@ -1088,6 +2342,7 @@ pub(crate) fn fuse(
             stale: false,
             write_ready: false,
             write_block: None,
+            composer_semantic: None,
         },
     }
 }
@@ -1170,6 +2425,392 @@ fn settle_turn(
     (next, stranded)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ComposerCapture {
+    NotRead,
+    Visible(String),
+    Hidden,
+    Unprovable,
+    BindingChanged,
+}
+
+impl From<crate::delivery::ComposerContentProof> for ComposerCapture {
+    fn from(proof: crate::delivery::ComposerContentProof) -> Self {
+        match proof {
+            crate::delivery::ComposerContentProof::Visible(content) => Self::Visible(content),
+            crate::delivery::ComposerContentProof::Hidden => Self::Hidden,
+            crate::delivery::ComposerContentProof::Unsupported
+            | crate::delivery::ComposerContentProof::Unprovable => Self::Unprovable,
+        }
+    }
+}
+
+fn composer_capture_binding_is_stable(
+    row_before: &PaneRow,
+    row_after: Option<&PaneRow>,
+    recipient_before: Option<RecipientKey>,
+    recipient_after: Option<RecipientKey>,
+    binding_before: &BindingObservation,
+    binding_after: Option<&BindingObservation>,
+) -> bool {
+    let Some(row_after) = row_after else {
+        return false;
+    };
+    !row_after.dead
+        && !row_after.in_mode
+        && row_after.pane_pid == row_before.pane_pid
+        && recipient_after == recipient_before
+        && binding_after == Some(binding_before)
+}
+
+fn semantic_composer_projection(semantic: Option<ComposerSemantic>) -> ComposerProjection {
+    match semantic {
+        Some(ComposerSemantic::Clean) => ComposerProjection {
+            state: ComposerState::ComposerClean,
+            proof: ComposerProof::ManifestRule,
+            notification_attempt: None,
+            reason: None,
+            candidate_count: 0,
+            binding: None,
+        },
+        Some(ComposerSemantic::HumanInput) => ComposerProjection {
+            state: ComposerState::HumanDraft,
+            proof: ComposerProof::ManifestRule,
+            notification_attempt: None,
+            reason: None,
+            candidate_count: 0,
+            binding: None,
+        },
+        Some(ComposerSemantic::GhostSuggestion) => ComposerProjection {
+            state: ComposerState::VendorGhostSuggestion,
+            proof: ComposerProof::ManifestRule,
+            notification_attempt: None,
+            reason: None,
+            candidate_count: 0,
+            binding: None,
+        },
+        Some(ComposerSemantic::Ambiguous) => ComposerProjection {
+            state: ComposerState::ComposerAmbiguous,
+            proof: ComposerProof::Ambiguous,
+            notification_attempt: None,
+            reason: Some("manifest_rule_ambiguous"),
+            candidate_count: 0,
+            binding: None,
+        },
+        None => ComposerProjection::default(),
+    }
+}
+
+fn ambiguous_composer_projection(
+    attempt: Option<NotificationAttemptId>,
+    proof: ComposerProof,
+    reason: &'static str,
+    candidate_count: usize,
+) -> ComposerProjection {
+    ComposerProjection {
+        state: ComposerState::ComposerAmbiguous,
+        proof,
+        notification_attempt: attempt,
+        reason: Some(reason),
+        candidate_count: u32::try_from(candidate_count).unwrap_or(u32::MAX),
+        binding: None,
+    }
+}
+
+fn notification_submission_recorded(record: &cyclops_proto::NotificationRecord) -> bool {
+    match record.state {
+        NotificationState::Submitted | NotificationState::Notified => true,
+        NotificationState::AttentionRequired => matches!(
+            record.cause,
+            Some(
+                NotificationAttentionCause::ReceiptOccupantChanged
+                    | NotificationAttentionCause::AckTimeout
+            )
+        ),
+        NotificationState::Queued
+        | NotificationState::Gating
+        | NotificationState::BlockedPreWrite
+        | NotificationState::QuotaHeld
+        | NotificationState::QuotaResetObserved
+        | NotificationState::Writing
+        | NotificationState::Staged
+        | NotificationState::Submitting
+        | NotificationState::Withdrawn
+        | NotificationState::WithdrawnAfterStaging
+        | NotificationState::WithdrawnByOperator
+        | NotificationState::Superseded => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_composer(
+    semantic: Option<ComposerSemantic>,
+    owner: Option<&str>,
+    detection: &Detection,
+    in_mode: bool,
+    binding: &BindingObservation,
+    recipient: Option<RecipientKey>,
+    capture: &ComposerCapture,
+    candidates: &[crate::mailbox::ActiveComposerNotification],
+    candidate_store_available: bool,
+) -> ComposerProjection {
+    let parsed_owner = owner.and_then(|value| NotificationAttemptId::parse(value).ok());
+    if !candidate_store_available {
+        return ambiguous_composer_projection(
+            parsed_owner,
+            ComposerProof::Unprovable,
+            "notification_store_unavailable",
+            candidates.len(),
+        );
+    }
+    if in_mode {
+        return ambiguous_composer_projection(
+            parsed_owner,
+            ComposerProof::Ambiguous,
+            "pane_in_mode",
+            candidates.len(),
+        );
+    }
+    if detection.stale {
+        return ambiguous_composer_projection(
+            parsed_owner,
+            ComposerProof::Unprovable,
+            "detection_stale",
+            candidates.len(),
+        );
+    }
+    if matches!(capture, ComposerCapture::BindingChanged) {
+        return ambiguous_composer_projection(
+            parsed_owner,
+            ComposerProof::Ambiguous,
+            "binding_changed_during_capture",
+            candidates.len(),
+        );
+    }
+    if owner.is_none() && candidates.is_empty() {
+        return semantic_composer_projection(semantic);
+    }
+    if owner.is_some() && parsed_owner.is_none() && candidates.is_empty() {
+        return ambiguous_composer_projection(
+            None,
+            ComposerProof::Unprovable,
+            "direct_delivery_hold_unprovable",
+            0,
+        );
+    }
+
+    let attempt = match (parsed_owner, candidates) {
+        (Some(attempt), [candidate]) if candidate.record.attempt_id == attempt => attempt,
+        (None, [candidate]) => {
+            return ambiguous_composer_projection(
+                Some(candidate.record.attempt_id),
+                ComposerProof::Unprovable,
+                "notification_owner_missing",
+                1,
+            );
+        }
+        (Some(attempt), []) => {
+            return ambiguous_composer_projection(
+                Some(attempt),
+                ComposerProof::Ambiguous,
+                "notification_attempt_mismatch",
+                0,
+            );
+        }
+        (Some(attempt), [_]) => {
+            return ambiguous_composer_projection(
+                Some(attempt),
+                ComposerProof::Ambiguous,
+                "notification_attempt_mismatch",
+                1,
+            );
+        }
+        (owner, _) => {
+            return ambiguous_composer_projection(
+                owner,
+                ComposerProof::Ambiguous,
+                "multiple_active_notifications",
+                candidates.len(),
+            );
+        }
+    };
+    let candidate = &candidates[0];
+
+    if matches!(binding, BindingObservation::Unprovable) {
+        return ambiguous_composer_projection(
+            Some(attempt),
+            ComposerProof::Unprovable,
+            "binding_unprovable",
+            candidates.len(),
+        );
+    }
+    if detection.disagreement
+        || detection.state.is_blocked()
+        || matches!(
+            binding,
+            BindingObservation::NotVendor | BindingObservation::Gone
+        )
+    {
+        return ambiguous_composer_projection(
+            Some(attempt),
+            ComposerProof::Ambiguous,
+            "terminal_state_unsafe",
+            candidates.len(),
+        );
+    }
+    if semantic.is_none() {
+        return ambiguous_composer_projection(
+            Some(attempt),
+            ComposerProof::Unprovable,
+            "composer_semantic_unprovable",
+            candidates.len(),
+        );
+    }
+
+    let Some(current_recipient) = recipient else {
+        return ambiguous_composer_projection(
+            Some(attempt),
+            ComposerProof::Unprovable,
+            "recipient_unprovable",
+            candidates.len(),
+        );
+    };
+    let Some(expected_binding) = candidate.record.binding.as_ref() else {
+        return ambiguous_composer_projection(
+            Some(attempt),
+            ComposerProof::Unprovable,
+            "durable_binding_incomplete",
+            candidates.len(),
+        );
+    };
+    let BindingObservation::Bound(current_binding) = binding else {
+        return ambiguous_composer_projection(
+            Some(attempt),
+            ComposerProof::Unprovable,
+            "binding_unprovable",
+            candidates.len(),
+        );
+    };
+    let Some(expected_pane_root) = expected_binding.pane_root else {
+        return ambiguous_composer_projection(
+            Some(attempt),
+            ComposerProof::Unprovable,
+            "durable_binding_incomplete",
+            candidates.len(),
+        );
+    };
+    let Some(expected_leader) = expected_binding.leader else {
+        return ambiguous_composer_projection(
+            Some(attempt),
+            ComposerProof::Unprovable,
+            "durable_binding_incomplete",
+            candidates.len(),
+        );
+    };
+    let current_pane_root = ProcessInstanceId::new(
+        current_binding.pane_root.pid,
+        current_binding.pane_root.birth,
+    )
+    .ok();
+    let current_leader =
+        ProcessInstanceId::new(current_binding.leader.pid, current_binding.leader.birth).ok();
+    let current_agent =
+        ProcessInstanceId::new(current_binding.agent.pid, current_binding.agent.birth).ok();
+    if expected_binding.recipient != candidate.record.recipient
+        || current_recipient != candidate.record.recipient
+        || Some(expected_pane_root) != current_pane_root
+        || Some(expected_leader) != current_leader
+        || Some(expected_binding.agent) != current_agent
+        || expected_binding.manifest.as_str() != current_binding.manifest
+    {
+        return ambiguous_composer_projection(
+            Some(attempt),
+            ComposerProof::Ambiguous,
+            "binding_mismatch",
+            candidates.len(),
+        );
+    }
+
+    let Some(expected) = candidate.message.as_ref().and_then(|message| {
+        crate::delivery::expected_notification_payload(&candidate.record, message)
+    }) else {
+        return ambiguous_composer_projection(
+            Some(attempt),
+            ComposerProof::Unprovable,
+            "notification_payload_unprovable",
+            candidates.len(),
+        );
+    };
+    match capture {
+        ComposerCapture::Visible(actual)
+            if actual == &expected && semantic == Some(ComposerSemantic::HumanInput) =>
+        {
+            ComposerProjection {
+                // Visible exact bytes are staged regardless of what the durable
+                // submit path previously recorded. This is the swallowed-submit
+                // case status must expose rather than declaring consumed.
+                state: ComposerState::CyclopsNotificationStaged,
+                proof: ComposerProof::ExactNotification,
+                notification_attempt: Some(attempt),
+                reason: None,
+                candidate_count: 1,
+                binding: Some(current_binding.clone()),
+            }
+        }
+        ComposerCapture::Visible(actual)
+            if semantic == Some(ComposerSemantic::Clean)
+                && actual.is_empty()
+                && notification_submission_recorded(&candidate.record) =>
+        {
+            ComposerProjection {
+                state: ComposerState::CyclopsNotificationSubmitted,
+                proof: ComposerProof::ExactNotification,
+                notification_attempt: Some(attempt),
+                reason: None,
+                candidate_count: 1,
+                binding: Some(current_binding.clone()),
+            }
+        }
+        ComposerCapture::Visible(_) => ambiguous_composer_projection(
+            Some(attempt),
+            ComposerProof::Ambiguous,
+            "composer_content_mismatch",
+            candidates.len(),
+        ),
+        ComposerCapture::Hidden => ambiguous_composer_projection(
+            Some(attempt),
+            ComposerProof::Unprovable,
+            "composer_hidden",
+            candidates.len(),
+        ),
+        ComposerCapture::NotRead => ambiguous_composer_projection(
+            Some(attempt),
+            ComposerProof::Unprovable,
+            "composer_not_read",
+            candidates.len(),
+        ),
+        ComposerCapture::Unprovable => ambiguous_composer_projection(
+            Some(attempt),
+            ComposerProof::Unprovable,
+            "composer_capture_unprovable",
+            candidates.len(),
+        ),
+        ComposerCapture::BindingChanged => unreachable!("handled before candidate projection"),
+    }
+}
+
+fn pane_recompute_gate(inner: &Arc<Inner>, pane: &PaneKey) -> Arc<tokio::sync::Mutex<()>> {
+    let mut gates = inner
+        .pane_recomputes
+        .lock()
+        .expect("pane recompute gates lock");
+    Arc::clone(
+        gates
+            .entry(pane.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+    )
+}
+
 /// Recompute one pane's Detection, update the cache, and emit a "state"
 /// event when the fused state changed. `force_screen` runs the full sensor
 /// set even when a title rule alone would decide (pane.read detection).
@@ -1189,12 +2830,22 @@ pub(crate) async fn recompute_pane(
     cause: &str,
 ) -> Option<Detection> {
     let route = PaneKey::new(session_idx, pane_id);
+    let prior_working_confirmed = cached_working_confirmed(inner, session_idx, pane_id);
+    // One pane has one observation timeline. The capture is part of the
+    // transaction: serializing only the cache write would still let a stale
+    // clean frame captured first commit after a newer draft or Working frame.
+    // The map keeps one stable gate per route for the daemon's lifetime so a
+    // waiter can never race a newly-created replacement gate.
+    let recompute_gate = pane_recompute_gate(inner, &route);
+    let _recompute_guard = recompute_gate.lock().await;
+    let lifecycle_observation = LifecycleObservation::from_cause(cause);
     let Some(row) = watcher.pane(pane_id) else {
         inner
             .detections
             .lock()
             .expect("detections lock")
             .remove(&route);
+        cancel_lifecycle_recheck(inner, &route);
         return None;
     };
     let recovery_recipient =
@@ -1205,6 +2856,17 @@ pub(crate) async fn recompute_pane(
             Err(reason) => (Vec::new(), Some(reason)),
         },
         None => (Vec::new(), None),
+    };
+    let (composer_candidates, composer_store_available) = match recovery_recipient {
+        Some(recipient) => match inner
+            .mailbox
+            .as_ref()
+            .and_then(|service| service.active_composer_notifications(recipient).ok())
+        {
+            Some(candidates) => (candidates, true),
+            None => (Vec::new(), false),
+        },
+        None => (Vec::new(), true),
     };
     let recovering = !recovery_records.is_empty() || recovery_store_error.is_some();
     let manifest = bind_manifest_for(inner, session_idx, &row);
@@ -1221,15 +2883,74 @@ pub(crate) async fn recompute_pane(
         Occupant::Leader(leader) => Some(leader),
         Occupant::Gone | Occupant::Unprovable => None,
     };
-    let admitted_observation = occupant.and_then(|_| admitted_binding(inner, session_idx, &row));
-    let admitted = admitted_observation.as_ref().map(|binding| binding.agent);
+    let binding_observation = pane_binding_observation(inner, session_idx, &row, seen);
+    let unobservable = binding_observation == BindingObservation::Unprovable;
+    let observed_binding = match &binding_observation {
+        BindingObservation::Bound(binding) => Some(binding.clone()),
+        BindingObservation::NotVendor
+        | BindingObservation::Gone
+        | BindingObservation::Unprovable => None,
+    };
+    let admitted = match &binding_observation {
+        BindingObservation::Bound(binding) => Some(binding.agent),
+        BindingObservation::NotVendor
+        | BindingObservation::Gone
+        | BindingObservation::Unprovable => None,
+    };
+    // A live admitted binding fills a transient gap in the independent rule
+    // lookup. A configured pin or command match still wins when present.
+    let manifest_id = manifest_id.or_else(|| match &binding_observation {
+        BindingObservation::Bound(binding) => Some(binding.manifest.clone()),
+        BindingObservation::NotVendor
+        | BindingObservation::Gone
+        | BindingObservation::Unprovable => None,
+    });
+    let observed_manifest = manifest_id.as_deref();
+    let cached_binding_rebound = inner
+        .detections
+        .lock()
+        .expect("detections lock")
+        .get(&route)
+        .is_some_and(|entry| {
+            binding_replacement_proven(
+                entry.agent,
+                entry.manifest.as_deref(),
+                &binding_observation,
+                observed_manifest,
+            )
+        });
+    // Candidate ingress can establish the replacement binding before this
+    // recompute sees it. Compare against the store's own exact binding, not
+    // only the detection cache, which may correctly be empty after an earlier
+    // unprovable observation.
+    let lifecycle_binding_rebound = {
+        let mut lifecycle = inner.hook_lifecycle.lock().expect("hook lifecycle lock");
+        match (&binding_observation, observed_manifest) {
+            (BindingObservation::Bound(binding), Some(manifest)) => {
+                lifecycle.forget_if_binding_differs(&route, binding.agent, manifest)
+            }
+            (BindingObservation::NotVendor | BindingObservation::Gone, _) => {
+                lifecycle.forget(&route);
+                true
+            }
+            (BindingObservation::Bound(_), None) | (BindingObservation::Unprovable, _) => false,
+        }
+    };
+    if cached_binding_rebound || lifecycle_binding_rebound {
+        // Keep a bucket already rebound by record_start/record_end. In every
+        // proven replacement case the old worker must stop.
+        cancel_lifecycle_recheck_task(inner, &route);
+        // A current-binding edge can land between retirement and task
+        // cancellation. Re-arm after cancellation so either ordering leaves
+        // one worker attached to the surviving bucket.
+        schedule_lifecycle_recheck(inner, &route);
+    }
     // A process that EXITED is proof: whatever it was holding is gone
     // with it, and prior state retires normally. A process table that
     // could not be READ is not proof of anything. Nothing this pane holds
     // was disproved by a lookup that failed to answer, so the binding,
     // the hold, its owner and the turn it waits on are frozen below
     // rather than recomputed, and the verdict refuses.
-    let unobservable = !row.dead && seen == Occupant::Unprovable;
     let quota_screen_clear = inner
         .detections
         .lock()
@@ -1237,19 +2958,30 @@ pub(crate) async fn recompute_pane(
         .get(&route)
         .filter(|entry| entry.agent == admitted && entry.manifest == manifest_id)
         .is_some_and(|entry| entry.quota_screen_clear);
+    let prior_hold_owner = inner
+        .detections
+        .lock()
+        .expect("detections lock")
+        .get(&route)
+        .and_then(|entry| entry.hold_owner.clone());
+    let inspect_composer = prior_hold_owner.is_some() || !composer_candidates.is_empty();
+    let mut composer_capture = ComposerCapture::NotRead;
 
     // Kept for the emitted event: the verdict below consumes manifest_id.
     let source_manifest = manifest_id.clone().unwrap_or_default();
     let ts = unix_ms();
+    let candidate_lane = manifest.is_some_and(|m| {
+        m.hooks.turn_start_evidence == LifecycleCertainty::Candidate
+            || m.hooks.turn_end_evidence == LifecycleCertainty::Candidate
+    });
 
     if !row.dead && row.in_mode && !recovering {
-        // Copy-mode and friends gate delivery in M1; they are not agent
+        // Copy mode and other pane modes gate delivery; they are not agent
         // states. Keep the prior verdict; status exposes in_mode per row.
         //
         // Resolved before the lock: it spawns a process, and nothing else
         // in the daemon should wait on the detection cache while a `ps`
         // runs.
-        let occupant = foreground_pid_checked(row.pane_pid);
         let mut map = inner.detections.lock().expect("detections lock");
         let prior_ready = map
             .get(&route)
@@ -1260,12 +2992,14 @@ pub(crate) async fn recompute_pane(
         // this pane had before the human started scrolling.
         let det = match map.get_mut(&route) {
             Some(e) => {
-                let same_binding = e.agent == admitted && e.manifest == manifest_id;
-                e.manifest = manifest_id;
+                let same_binding = unobservable
+                    || (e.agent == admitted && e.manifest.as_deref() == manifest_id.as_deref());
                 // Only an observation that answered may rewrite the
                 // binding: overwriting it with the nothing a failed
                 // lookup returned would strand the hold it protects.
-                if occupant.is_some() {
+                if !unobservable {
+                    e.binding = observed_binding.clone();
+                    e.manifest = manifest_id;
                     e.occupant = occupant;
                     e.agent = admitted;
                 }
@@ -1274,10 +3008,24 @@ pub(crate) async fn recompute_pane(
                 }
                 e.in_mode = true;
                 e.detection = e.detection.clone().stamped(true, e.hold);
+                if unobservable {
+                    e.detection = e.detection.clone().occupant_unprovable();
+                }
+                e.composer = project_composer(
+                    e.detection.composer_semantic,
+                    e.hold_owner.as_deref(),
+                    &e.detection,
+                    true,
+                    &binding_observation,
+                    recovery_recipient,
+                    &ComposerCapture::NotRead,
+                    &composer_candidates,
+                    composer_store_available,
+                );
                 e.detection.clone()
             }
             None => {
-                let det = Detection {
+                let mut det = Detection {
                     state: AgentState::Unknown,
                     readings: Vec::new(),
                     disagreement: false,
@@ -1285,12 +3033,28 @@ pub(crate) async fn recompute_pane(
                     stale: false,
                     write_ready: false,
                     write_block: None,
+                    composer_semantic: None,
                 }
                 .stamped(true, ComposerHold::default());
+                if unobservable {
+                    det = det.occupant_unprovable();
+                }
+                let composer = project_composer(
+                    det.composer_semantic,
+                    None,
+                    &det,
+                    true,
+                    &binding_observation,
+                    recovery_recipient,
+                    &ComposerCapture::NotRead,
+                    &composer_candidates,
+                    composer_store_available,
+                );
                 map.insert(
                     route.clone(),
                     DetEntry {
                         detection: det.clone(),
+                        binding: observed_binding.clone(),
                         manifest: manifest_id,
                         occupant,
                         agent: admitted,
@@ -1299,6 +3063,8 @@ pub(crate) async fn recompute_pane(
                         hold: ComposerHold::default(),
                         turn: None,
                         hold_owner: None,
+                        composer,
+                        working_confirmed: false,
                         since: std::time::Instant::now(),
                     },
                 );
@@ -1309,6 +3075,9 @@ pub(crate) async fn recompute_pane(
         // Entering a mode refuses a write without touching the runtime
         // state, so this is the wake that has no state edge behind it.
         wake_readiness(inner, session_idx, pane_id, prior_ready, &det);
+        if !is_candidate_recheck_cause(cause) {
+            schedule_lifecycle_recheck(inner, &route);
+        }
         return Some(det);
     }
 
@@ -1321,14 +3090,46 @@ pub(crate) async fn recompute_pane(
             stale: false,
             write_ready: false,
             write_block: None,
+            composer_semantic: None,
         }
     } else if let Some(m) = manifest {
         let t_rule = title_winner(m, &row.title);
+        let candidate_end_active = m.hooks.turn_end_evidence == LifecycleCertainty::Candidate
+            && admitted.is_some_and(|agent| {
+                inner
+                    .hook_readings
+                    .lock()
+                    .expect("hook readings lock")
+                    .get(&route)
+                    .is_some_and(|entry| entry.active_start_for(agent, Some(m.agent.id.as_str())))
+            });
+        let candidate_pending = admitted.is_some_and(|agent| {
+            inner
+                .hook_lifecycle
+                .lock()
+                .expect("hook lifecycle lock")
+                .has_pending_for(&route, agent, &m.agent.id)
+        });
+        let composer_held = inner
+            .detections
+            .lock()
+            .expect("detections lock")
+            .get(&route)
+            .filter(|entry| {
+                entry.agent == admitted && entry.manifest.as_deref() == Some(m.agent.id.as_str())
+            })
+            .is_some_and(|entry| entry.hold.refuses());
         // One agreeing screen baseline is required per exact occupant so
         // durable quota holds can recover after restart even when a title
         // rule would otherwise skip capture forever. A held quota keeps
         // this false and therefore keeps consulting screen until reset.
-        let need_screen = force_screen || recovering || !quota_screen_clear || t_rule.is_none();
+        let need_screen = force_screen
+            || recovering
+            || !quota_screen_clear
+            || t_rule.is_none()
+            || candidate_end_active
+            || candidate_pending
+            || composer_held;
         let mut capture_failed = false;
         let (screen, screen_esc) = if need_screen {
             match capture_screens(watcher, m, pane_id).await {
@@ -1357,6 +3158,9 @@ pub(crate) async fn recompute_pane(
                         // evidence has to wake whoever was gating on the
                         // old answer.
                         wake_readiness(inner, session_idx, pane_id, prior_ready, &p);
+                        if !is_candidate_recheck_cause(cause) {
+                            schedule_lifecycle_recheck(inner, &route);
+                        }
                         return Some(p);
                     }
                     // Nothing cached describes whoever is in the pane now,
@@ -1373,6 +3177,40 @@ pub(crate) async fn recompute_pane(
         } else {
             (None, None)
         };
+        if inspect_composer {
+            composer_capture = match watcher.client().capture_pane_joined_escaped(pane_id).await {
+                Ok(joined) => {
+                    crate::delivery::exact_composer_content_from_joined_capture(m, &joined).into()
+                }
+                Err(_) => ComposerCapture::NotRead,
+            };
+        }
+        let capture_binding_changed = if need_screen || inspect_composer {
+            let row_after_capture = watcher.pane(pane_id);
+            let recipient_after_capture = row_after_capture.as_ref().and_then(|current| {
+                crate::composer_recovery::exact_recipient(inner, session_idx, watcher, current)
+            });
+            let binding_after_capture = row_after_capture.as_ref().map(|current| {
+                let seen_after_capture = occupant_of(current.pane_pid);
+                pane_binding_observation(inner, session_idx, current, seen_after_capture)
+            });
+            !composer_capture_binding_is_stable(
+                &row,
+                row_after_capture.as_ref(),
+                recovery_recipient,
+                recipient_after_capture,
+                &binding_observation,
+                binding_after_capture.as_ref(),
+            )
+        } else {
+            false
+        };
+        if capture_binding_changed {
+            // Screen bytes authorize only the exact process generations that
+            // surrounded the capture. A replacement during either capture
+            // makes both readiness and composer ownership unprovable.
+            composer_capture = ComposerCapture::BindingChanged;
+        }
         let s_rule = screen
             .as_deref()
             .and_then(|s| screen_winner_esc(m, s, screen_esc.as_deref()));
@@ -1380,8 +3218,14 @@ pub(crate) async fn recompute_pane(
         // No prior to fall back on and the screen sensor errored: the rule
         // set was never fully consulted, and the record must not claim it
         // was (GOALS: the record never lies).
-        if capture_failed && det.decided_by == "no_rule" {
-            det.decided_by = "sensor_error".into();
+        if capture_failed {
+            det.stale = true;
+            if det.decided_by == "no_rule" {
+                det.decided_by = "sensor_error".into();
+            }
+        }
+        if capture_binding_changed {
+            det = det.refused("binding_changed_during_capture");
         }
         det
     } else {
@@ -1393,16 +3237,73 @@ pub(crate) async fn recompute_pane(
             stale: false,
             write_ready: false,
             write_block: None,
+            composer_semantic: None,
         }
     };
 
+    if candidate_lane && !row.dead && !detection.stale && lifecycle_observation.is_visual() {
+        inner
+            .hook_lifecycle
+            .lock()
+            .expect("hook lifecycle lock")
+            .note_visual_change(&route);
+    }
+    if candidate_lane && !row.dead && !detection.stale {
+        if let (Some(agent), Some(manifest)) = (admitted, manifest_id.as_deref()) {
+            reconcile_unkeyed_dispatch_start(
+                inner,
+                &route,
+                agent,
+                manifest,
+                &detection,
+                row.in_mode,
+                ts,
+                lifecycle_observation,
+            );
+        }
+    }
+    let confirmed_candidates = if candidate_lane && !row.dead {
+        match (admitted, manifest_id.as_deref()) {
+            (Some(agent), Some(manifest)) => reconcile_candidate_lifecycles(
+                inner,
+                &route,
+                agent,
+                manifest,
+                &detection,
+                row.in_mode,
+                ts,
+                lifecycle_observation,
+            ),
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    for confirmed in &confirmed_candidates {
+        if confirmed.terminal {
+            crate::delivery::prepare_dispatch_ack(
+                inner,
+                session_idx,
+                pane_id,
+                confirmed.edge.agent,
+                &confirmed.edge.manifest,
+                &confirmed.edge.turn,
+            );
+        }
+        crate::composer_recovery::bind_post_recovery_turn(
+            inner,
+            session_idx,
+            pane_id,
+            confirmed.edge.turn.clone(),
+            confirmed.accepted_ms,
+        );
+    }
+
     // Hook sensor (agent.state.report): high-precision edges, incomplete
-    // coverage. Rules keep the verdict when they produced one; the hook
-    // decides only where rules see nothing, and a live disagreement stays
-    // observable either way. Blocked states always come from rules, since
-    // no tested CLI hooks its modals or quota (amendment h). Readings age
-    // out on TTL or repeated rules-tier contradiction so a stale edge
-    // cannot pin fused state.
+    // coverage. An authenticated start owns runtime Working before visual
+    // output appears. Rules still own blocked states because no tested CLI
+    // hooks its modals or quota. Other hook readings decide only where rules
+    // see nothing and remain subject to transient-reading eviction.
     if !row.dead {
         let hook = {
             let mut map = inner.hook_readings.lock().expect("hook readings lock");
@@ -1425,7 +3326,11 @@ pub(crate) async fn recompute_pane(
                     None
                 }
                 Some(entry) => match hook_action(entry, detection.state, ts) {
-                    HookAction::Use => Some(entry.reading.clone()),
+                    HookAction::Use => Some((
+                        entry.reading.clone(),
+                        entry.active_start,
+                        entry.authoritative_end,
+                    )),
                     HookAction::Drop => {
                         map.remove(&route);
                         None
@@ -1433,23 +3338,18 @@ pub(crate) async fn recompute_pane(
                 },
             }
         };
-        if let Some(reading) = hook {
-            let hook_state = reading.state;
-            let hook_rule = reading.rule.clone();
-            detection.readings.push(reading);
-            if detection.state == AgentState::Unknown {
-                detection.state = hook_state;
-                detection.decided_by = format!("hook:{hook_rule}");
-            } else if hook_state != detection.state {
-                detection.disagreement = true;
-            }
+        if let Some((reading, active_start, authoritative_end)) = hook {
+            apply_hook_reading(&mut detection, reading, active_start, authoritative_end);
         }
     }
 
-    let recovery_live = recovery_recipient.and_then(|recipient| {
-        admitted_observation
-            .as_ref()
-            .and_then(|binding| crate::composer_recovery::observed_binding(recipient, binding))
+    let recovery_live = recovery_recipient.and_then(|recipient| match &binding_observation {
+        BindingObservation::Bound(binding) => {
+            crate::composer_recovery::observed_binding(recipient, binding)
+        }
+        BindingObservation::NotVendor
+        | BindingObservation::Gone
+        | BindingObservation::Unprovable => None,
     });
     let recovery_clean = recovery_live.as_ref().is_some_and(|binding| {
         crate::composer_recovery::clean_composer_for_binding(
@@ -1505,6 +3405,9 @@ pub(crate) async fn recompute_pane(
             }
         }
     }
+
+    let working_confirmed =
+        working_is_confirmed(inner, &route, &detection, admitted, manifest_id.as_deref());
 
     let (prior, prior_ready, detection, probe_quota_reset) = {
         let mut map = inner.detections.lock().expect("detections lock");
@@ -1629,6 +3532,17 @@ pub(crate) async fn recompute_pane(
         if let Some(reason) = recovery_refusal {
             detection = detection.refused(reason);
         }
+        let composer = project_composer(
+            detection.composer_semantic,
+            final_owner.as_deref(),
+            &detection,
+            row.in_mode,
+            &binding_observation,
+            recovery_recipient,
+            &composer_capture,
+            &composer_candidates,
+            composer_store_available,
+        );
         // A positive screen baseline is enough to discover durable quota
         // holds after restart. Carry that baseline across title-only and
         // hook-only redraws for the same occupant. A positive quota screen
@@ -1664,6 +3578,10 @@ pub(crate) async fn recompute_pane(
             route,
             DetEntry {
                 detection: detection.clone(),
+                binding: match &frozen {
+                    Some(e) => e.binding.clone(),
+                    None => observed_binding,
+                },
                 // A binding is rewritten only by an observation that
                 // answered. Overwriting it with the nothing a failed
                 // lookup returned would leave the next SUCCESSFUL
@@ -1689,6 +3607,8 @@ pub(crate) async fn recompute_pane(
                 // cleared hold owns nothing, so the next attempt is free
                 // to take it.
                 hold_owner: final_owner,
+                composer,
+                working_confirmed,
                 since,
             },
         );
@@ -1705,8 +3625,12 @@ pub(crate) async fn recompute_pane(
         crate::delivery::observe_quota_reset(inner, session_idx, pane_id);
     }
     // First sight of a pane that reads Unknown is baseline, not a change.
-    let changed = prior != Some(detection.state)
+    let state_changed = prior != Some(detection.state)
         && !(prior.is_none() && detection.state == AgentState::Unknown);
+    let certainty_changed = detection.state == AgentState::Working
+        && prior == Some(AgentState::Working)
+        && prior_working_confirmed != working_confirmed;
+    let changed = state_changed || certainty_changed;
     if changed {
         debug!(
             pane = pane_id,
@@ -1722,28 +3646,52 @@ pub(crate) async fn recompute_pane(
             prior,
             cause,
             (admitted, source_manifest.as_str()),
+            working_confirmed,
         );
         // The border says what this row says, from the same edge. No
         // timer, no second rule: an adopted pane's chrome moves exactly
         // when the fused state it names moves.
         crate::repaint_chrome(inner, session_idx, watcher, pane_id).await;
     }
+    for confirmed in confirmed_candidates {
+        crate::delivery::confirm_dispatch_ack(
+            inner,
+            session_idx,
+            pane_id,
+            confirmed.edge.agent,
+            &confirmed.edge.manifest,
+            &confirmed.edge.turn,
+            confirmed.accepted_ms,
+        );
+    }
+    if !is_candidate_recheck_cause(cause) {
+        schedule_lifecycle_recheck(inner, &PaneKey::new(session_idx, pane_id));
+    }
     Some(detection)
+}
+
+fn is_candidate_recheck_cause(cause: &str) -> bool {
+    matches!(
+        cause,
+        "candidate_end_settled"
+            | "candidate_visual_end_settled"
+            | "unkeyed_dispatch_settled"
+            | "receipt_checkpoint"
+    )
 }
 
 /// Quota is a screen-only fact. Leaving it requires a fresh, agreeing
 /// screen classification, not hook-derived idle or an unknown frame.
 fn positive_quota_reset_observation(detection: &Detection) -> bool {
+    let state_disproves_quota = detection.state != AgentState::BlockedQuota
+        && (detection.state.is_blocked()
+            || matches!(
+                detection.state,
+                AgentState::Idle | AgentState::IdleWithInput | AgentState::Working
+            ));
     !detection.stale
         && !detection.disagreement
-        && matches!(
-            detection.state,
-            AgentState::Idle
-                | AgentState::IdleWithInput
-                | AgentState::Working
-                | AgentState::BlockedModal
-                | AgentState::BlockedPermission
-        )
+        && state_disproves_quota
         && detection.readings.iter().any(|reading| {
             reading.sensor == Sensor::Screen
                 && reading.state == detection.state
@@ -1840,6 +3788,7 @@ line_regex = ['^FIXPROMPT']
             stale: false,
             write_ready: false,
             write_block: None,
+            composer_semantic: None,
         }
     }
 
@@ -1866,6 +3815,984 @@ line_regex = ['^FIXPROMPT']
         assert!(!quota_reset_probe_needed(false, &disagreeing));
     }
 
+    fn lifecycle_detection(sensor: Sensor, state: AgentState) -> Detection {
+        Detection {
+            state,
+            readings: vec![SensorReading {
+                sensor,
+                state,
+                rule: "fixture".into(),
+                ts: 10,
+            }],
+            disagreement: false,
+            decided_by: "fixture".into(),
+            stale: false,
+            write_ready: false,
+            write_block: None,
+            composer_semantic: None,
+        }
+    }
+
+    fn lifecycle_manifest() -> Manifest {
+        Manifest::parse(
+            r#"
+[agent]
+id = "claude"
+display_name = "Claude fixture"
+
+[hooks]
+turn_start = "UserPromptSubmit"
+turn_start_evidence = "candidate"
+ack = "UserPromptSubmit"
+ack_evidence = "dispatch"
+ack_payload_field = "prompt"
+
+[[rule]]
+id = "trusted_working"
+state = "working"
+priority = 100
+region = "pane_title"
+contains = ["working"]
+
+[[rule]]
+id = "advisory_working"
+state = "working"
+priority = 90
+region = "bottom_non_empty_lines(3)"
+lifecycle_evidence = false
+contains = ["working"]
+"#,
+            Path::new("claude.toml"),
+        )
+        .unwrap()
+    }
+
+    fn named_lifecycle_detection(rule: &str, sensor: Sensor, state: AgentState) -> Detection {
+        let mut detection = lifecycle_detection(sensor, state);
+        detection.readings[0].rule = rule.into();
+        detection.decided_by = rule.into();
+        detection
+    }
+
+    #[test]
+    fn advisory_working_never_mutates_an_exact_lifecycle() {
+        let mut manifests = BTreeMap::new();
+        manifests.insert("claude".into(), lifecycle_manifest());
+        let inner = inner_with(manifests);
+        let pane = pane();
+        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+        let turn = turnkey::TurnKey::for_test(&["session", "prompt"]);
+        let advisory =
+            named_lifecycle_detection("advisory_working", Sensor::Screen, AgentState::Working);
+        let trusted =
+            named_lifecycle_detection("trusted_working", Sensor::Title, AgentState::Working);
+        inner.hook_lifecycle.lock().unwrap().record_start(
+            &pane,
+            agent,
+            "claude",
+            turn.clone(),
+            "UserPromptSubmit",
+            5,
+        );
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+
+        assert!(reconcile_candidate_lifecycle(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &advisory,
+            false,
+            6,
+            LifecycleObservation::Stable,
+        )
+        .is_none());
+        assert!(inner.hook_readings.lock().unwrap().get(&pane).is_none());
+
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+        reconcile_candidate_lifecycle(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &trusted,
+            false,
+            7,
+            LifecycleObservation::Stable,
+        )
+        .expect("trusted visual evidence confirms the candidate");
+
+        let visual_end = inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .record_visual_end(&pane, agent, "claude", turn.clone(), 8, 3_000)
+            .expect("visual end recorded");
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+        reconcile_candidate_lifecycle(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &advisory,
+            false,
+            9,
+            LifecycleObservation::Stable,
+        );
+        assert!(
+            !inner
+                .hook_lifecycle
+                .lock()
+                .unwrap()
+                .visual_end_is_current(&pane, &visual_end),
+            "obsolete visual-only terminal candidate survived"
+        );
+        assert!(
+            inner
+                .hook_readings
+                .lock()
+                .unwrap()
+                .get(&pane)
+                .is_some_and(|entry| entry.active_start_for(agent, Some("claude"))),
+            "retiring visual-only evidence cleared the exact start"
+        );
+
+        let stop = inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .record_end(&pane, agent, "claude", turn, "Stop", 10, 3_000);
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+        reconcile_candidate_lifecycle(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &advisory,
+            false,
+            11,
+            LifecycleObservation::Stable,
+        );
+        let candidates = inner.hook_lifecycle.lock().unwrap();
+        assert!(candidates.end_is_current(&pane, &stop));
+    }
+
+    #[test]
+    fn candidate_start_needs_a_later_visual_working_observation() {
+        let inner = inner_with(BTreeMap::new());
+        let pane = pane();
+        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+        let turn = turnkey::TurnKey::for_test(&["session", "prompt"]);
+        inner.hook_lifecycle.lock().unwrap().record_start(
+            &pane,
+            agent,
+            "claude",
+            turn.clone(),
+            "UserPromptSubmit",
+            5,
+        );
+        let working = lifecycle_detection(Sensor::Title, AgentState::Working);
+        assert!(
+            reconcile_candidate_lifecycle(
+                &inner,
+                &pane,
+                agent,
+                "claude",
+                &working,
+                false,
+                6,
+                LifecycleObservation::None,
+            )
+            .is_none(),
+            "the hook-triggered view confirmed its own candidate"
+        );
+        assert!(inner.hook_readings.lock().unwrap().get(&pane).is_none());
+
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+        let confirmed = reconcile_candidate_lifecycle(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &working,
+            false,
+            7,
+            LifecycleObservation::Stable,
+        )
+        .expect("later Working confirms the candidate");
+        assert_eq!(confirmed.edge.turn, turn);
+        assert!(inner
+            .hook_readings
+            .lock()
+            .unwrap()
+            .get(&pane)
+            .is_some_and(|entry| entry.active_start_for(agent, Some("claude"))));
+    }
+
+    #[test]
+    fn unkeyed_clean_frame_is_neutral_until_the_bounded_recheck() {
+        let mut manifests = BTreeMap::new();
+        manifests.insert("claude".into(), lifecycle_manifest());
+        let inner = inner_with(manifests);
+        let pane = pane();
+        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+        inner.hook_readings.lock().unwrap().insert(
+            pane.clone(),
+            HookEntry::provisional_start(
+                agent,
+                Some("claude".into()),
+                SensorReading {
+                    sensor: Sensor::Hook,
+                    state: AgentState::Working,
+                    rule: "UserPromptSubmit".into(),
+                    ts: 1_000,
+                },
+            ),
+        );
+        let clean = lifecycle_detection(Sensor::Screen, AgentState::Idle);
+
+        assert!(!reconcile_unkeyed_dispatch_start(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &clean,
+            false,
+            1_100,
+            LifecycleObservation::Stable,
+        ));
+        assert!(
+            inner
+                .hook_readings
+                .lock()
+                .unwrap()
+                .get(&pane)
+                .is_some_and(|entry| entry.provisional_start_for(agent, Some("claude"))),
+            "the immediate clean frame rejected a prompt before output could appear"
+        );
+
+        assert!(!reconcile_unkeyed_dispatch_start(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &clean,
+            false,
+            1_000 + UNKEYED_DISPATCH_SETTLE_MS,
+            LifecycleObservation::Stable,
+        ));
+        assert!(
+            inner.hook_readings.lock().unwrap().get(&pane).is_none(),
+            "the bounded clean recheck left provisional Working alive forever"
+        );
+    }
+
+    #[test]
+    fn a_later_unkeyed_edge_cannot_confirm_the_edge_it_replaced() {
+        let mut manifests = BTreeMap::new();
+        manifests.insert("claude".into(), lifecycle_manifest());
+        let inner = inner_with(manifests);
+        let pane = pane();
+        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+        let start = |ts| {
+            HookEntry::provisional_start(
+                agent,
+                Some("claude".into()),
+                SensorReading {
+                    sensor: Sensor::Hook,
+                    state: AgentState::Working,
+                    rule: "UserPromptSubmit".into(),
+                    ts,
+                },
+            )
+        };
+        let first = start(1_000);
+        let second = start(1_100);
+        assert_eq!(
+            first.provisional_edge_for(agent, Some("claude")),
+            Some(1_000)
+        );
+        inner
+            .hook_readings
+            .lock()
+            .unwrap()
+            .insert(pane.clone(), second);
+
+        assert!(reconcile_unkeyed_dispatch_start(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &named_lifecycle_detection("trusted_working", Sensor::Title, AgentState::Working),
+            false,
+            1_101,
+            LifecycleObservation::Stable,
+        ));
+        assert!(inner.hook_readings.lock().unwrap().get(&pane).is_none());
+    }
+
+    #[test]
+    fn an_edge_arriving_during_capture_waits_for_the_next_observation() {
+        let inner = inner_with(BTreeMap::new());
+        let pane = pane();
+        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+        let turn = turnkey::TurnKey::for_test(&["session", "prompt"]);
+        inner.hook_lifecycle.lock().unwrap().record_start(
+            &pane,
+            agent,
+            "claude",
+            turn,
+            "UserPromptSubmit",
+            10,
+        );
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+        let working = lifecycle_detection(Sensor::Screen, AgentState::Working);
+        assert!(
+            reconcile_candidate_lifecycle(
+                &inner,
+                &pane,
+                agent,
+                "claude",
+                &working,
+                false,
+                10,
+                LifecycleObservation::Stable,
+            )
+            .is_none(),
+            "an observation that began with the hook must not confirm it"
+        );
+        assert!(
+            reconcile_candidate_lifecycle(
+                &inner,
+                &pane,
+                agent,
+                "claude",
+                &working,
+                false,
+                11,
+                LifecycleObservation::Stable,
+            )
+            .is_some(),
+            "the next later observation should confirm the same edge"
+        );
+    }
+
+    #[test]
+    fn clean_composer_preserves_a_dispatch_until_later_working() {
+        let inner = inner_with(BTreeMap::new());
+        let pane = pane();
+        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+        let turn = turnkey::TurnKey::for_test(&["session", "prompt"]);
+        inner.hook_lifecycle.lock().unwrap().record_start(
+            &pane,
+            agent,
+            "claude",
+            turn.clone(),
+            "UserPromptSubmit",
+            5,
+        );
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+        let idle = lifecycle_detection(Sensor::Screen, AgentState::Idle);
+        assert!(reconcile_candidate_lifecycle(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &idle,
+            false,
+            6,
+            LifecycleObservation::Stable,
+        )
+        .is_none());
+        assert!(
+            inner
+                .hook_lifecycle
+                .lock()
+                .unwrap()
+                .start_for(&pane, agent, "claude")
+                .is_none(),
+            "the neutral observation was consumed once"
+        );
+
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+        assert!(
+            reconcile_candidate_lifecycle(
+                &inner,
+                &pane,
+                agent,
+                "claude",
+                &idle,
+                false,
+                6_006,
+                LifecycleObservation::Stable,
+            )
+            .is_none(),
+            "elapsed time and repeated clean frames are not rejection evidence"
+        );
+
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+        let working = lifecycle_detection(Sensor::Title, AgentState::Working);
+        assert!(
+            reconcile_candidate_lifecycle(
+                &inner,
+                &pane,
+                agent,
+                "claude",
+                &working,
+                false,
+                6_007,
+                LifecycleObservation::Stable,
+            )
+            .is_some(),
+            "the exact candidate must survive Claude's delayed first Working frame"
+        );
+    }
+
+    #[test]
+    fn clean_composer_never_retires_an_active_exact_turn() {
+        let inner = inner_with(BTreeMap::new());
+        let pane = pane();
+        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+        let turn = turnkey::TurnKey::for_test(&["session", "prompt"]);
+        inner.hook_lifecycle.lock().unwrap().record_start(
+            &pane,
+            agent,
+            "claude",
+            turn,
+            "UserPromptSubmit",
+            5,
+        );
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+        reconcile_candidate_lifecycle(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &lifecycle_detection(Sensor::Title, AgentState::Working),
+            false,
+            6,
+            LifecycleObservation::Stable,
+        )
+        .expect("start confirmed");
+
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+        reconcile_candidate_lifecycle(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &lifecycle_detection(Sensor::Screen, AgentState::Idle),
+            false,
+            400,
+            LifecycleObservation::Stable,
+        );
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+        reconcile_candidate_lifecycle(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &lifecycle_detection(Sensor::Screen, AgentState::Idle),
+            false,
+            10_000,
+            LifecycleObservation::Stable,
+        );
+        assert!(
+            inner
+                .hook_readings
+                .lock()
+                .unwrap()
+                .get(&pane)
+                .is_some_and(|entry| entry.active_start_for(agent, Some("claude"))),
+            "repeated settled visual idle fabricated an exact end"
+        );
+    }
+
+    #[test]
+    fn unrelated_candidate_cannot_orphan_an_active_exact_turn() {
+        let inner = inner_with(BTreeMap::new());
+        let pane = pane();
+        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+        let first = turnkey::TurnKey::for_test(&["session", "first"]);
+        let second = turnkey::TurnKey::for_test(&["session", "second"]);
+        let working = lifecycle_detection(Sensor::Screen, AgentState::Working);
+        inner.hook_readings.lock().unwrap().insert(
+            pane.clone(),
+            HookEntry::turn_started(
+                agent,
+                Some("claude".into()),
+                working.readings[0].clone(),
+                first.clone(),
+            ),
+        );
+        let visual_end = inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .record_visual_end(&pane, agent, "claude", first, 10, 0)
+            .expect("visual end recorded");
+        inner.hook_lifecycle.lock().unwrap().record_start(
+            &pane,
+            agent,
+            "claude",
+            second.clone(),
+            "UserPromptSubmit",
+            20,
+        );
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+
+        reconcile_candidate_lifecycle(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &lifecycle_detection(Sensor::Screen, AgentState::Idle),
+            false,
+            30,
+            LifecycleObservation::Stable,
+        );
+
+        let mut candidates = inner.hook_lifecycle.lock().unwrap();
+        assert!(!candidates.visual_end_is_current(&pane, &visual_end));
+        assert!(candidates.has_pending_for(&pane, agent, "claude"));
+        candidates.note_visual_change(&pane);
+        assert_eq!(
+            candidates
+                .start_for(&pane, agent, "claude")
+                .expect("unrelated start remains pending")
+                .turn,
+            second
+        );
+        drop(candidates);
+        assert!(inner
+            .hook_readings
+            .lock()
+            .unwrap()
+            .get(&pane)
+            .is_some_and(|entry| entry.active_start_for(agent, Some("claude"))));
+    }
+
+    #[test]
+    fn a_later_turn_cannot_overwrite_an_active_turns_pending_stop() {
+        let inner = inner_with(BTreeMap::new());
+        let pane = pane();
+        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+        let first = turnkey::TurnKey::for_test(&["session", "first"]);
+        let second = turnkey::TurnKey::for_test(&["session", "second"]);
+        let working = lifecycle_detection(Sensor::Title, AgentState::Working);
+        inner.hook_readings.lock().unwrap().insert(
+            pane.clone(),
+            HookEntry::turn_started(
+                agent,
+                Some("claude".into()),
+                working.readings[0].clone(),
+                first.clone(),
+            ),
+        );
+        let first_end = inner.hook_lifecycle.lock().unwrap().record_end(
+            &pane,
+            agent,
+            "claude",
+            first.clone(),
+            "Stop",
+            10,
+            3_000,
+        );
+        inner.hook_lifecycle.lock().unwrap().record_start(
+            &pane,
+            agent,
+            "claude",
+            second.clone(),
+            "UserPromptSubmit",
+            20,
+        );
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+
+        reconcile_candidate_lifecycle(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &working,
+            false,
+            4_000,
+            LifecycleObservation::Stable,
+        );
+
+        assert!(inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .end_is_current(&pane, &first_end));
+        assert!(inner
+            .hook_readings
+            .lock()
+            .unwrap()
+            .get(&pane)
+            .is_some_and(|entry| entry.active_start_matches(agent, Some("claude"), Some(&first))));
+
+        let second_end = inner.hook_lifecycle.lock().unwrap().record_end(
+            &pane,
+            agent,
+            "claude",
+            second.clone(),
+            "Stop",
+            5_000,
+            0,
+        );
+        let idle = lifecycle_detection(Sensor::Screen, AgentState::Idle);
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+        reconcile_candidate_lifecycle(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &idle,
+            false,
+            5_001,
+            LifecycleObservation::Stable,
+        );
+        assert!(turnkey::PaneEnds::holds(
+            &inner.turn_ends.lock().unwrap(),
+            &pane,
+            agent,
+            "claude",
+            &first,
+        ));
+        assert!(inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .end_is_current(&pane, &second_end));
+
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+        let confirmed = reconcile_candidate_lifecycle(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &idle,
+            false,
+            5_002,
+            LifecycleObservation::Stable,
+        )
+        .expect("the second turn settles independently");
+        assert_eq!(confirmed.edge.turn, second);
+        assert!(confirmed.terminal);
+        assert!(inner.hook_readings.lock().unwrap().get(&pane).is_none());
+        assert!(!inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .has_pending_for(&pane, agent, "claude"));
+    }
+
+    #[test]
+    fn one_terminal_reattach_observation_drains_every_completed_turn() {
+        let pane = pane();
+        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+        let idle = lifecycle_detection(Sensor::Screen, AgentState::Idle);
+        for order in [[0_usize, 1, 2], [2_usize, 1, 0]] {
+            let inner = inner_with(BTreeMap::new());
+            let turns = [
+                turnkey::TurnKey::for_test(&["session", "first"]),
+                turnkey::TurnKey::for_test(&["session", "second"]),
+                turnkey::TurnKey::for_test(&["session", "third"]),
+            ];
+            for index in order {
+                inner.hook_lifecycle.lock().unwrap().record_start(
+                    &pane,
+                    agent,
+                    "claude",
+                    turns[index].clone(),
+                    "UserPromptSubmit",
+                    5,
+                );
+                inner.hook_lifecycle.lock().unwrap().record_end(
+                    &pane,
+                    agent,
+                    "claude",
+                    turns[index].clone(),
+                    "Stop",
+                    10,
+                    0,
+                );
+            }
+            inner
+                .hook_lifecycle
+                .lock()
+                .unwrap()
+                .note_visual_change(&pane);
+
+            let confirmed = reconcile_candidate_lifecycles(
+                &inner,
+                &pane,
+                agent,
+                "claude",
+                &idle,
+                false,
+                20,
+                LifecycleObservation::Stable,
+            );
+
+            let mut actual = confirmed
+                .iter()
+                .map(|item| item.edge.turn.dedupe_key(""))
+                .collect::<Vec<_>>();
+            actual.sort();
+            let mut expected = turns
+                .iter()
+                .map(|turn| turn.dedupe_key(""))
+                .collect::<Vec<_>>();
+            expected.sort();
+            assert_eq!(actual, expected);
+            for turn in &turns {
+                assert!(turnkey::PaneEnds::holds(
+                    &inner.turn_ends.lock().unwrap(),
+                    &pane,
+                    agent,
+                    "claude",
+                    turn,
+                ));
+            }
+            assert!(!inner
+                .hook_lifecycle
+                .lock()
+                .unwrap()
+                .has_pending_for(&pane, agent, "claude"));
+        }
+    }
+
+    #[test]
+    fn staged_payload_and_blocking_screen_reject_a_dispatch_candidate() {
+        for state in [AgentState::IdleWithInput, AgentState::BlockedPermission] {
+            let detection = lifecycle_detection(Sensor::Screen, state);
+            assert!(
+                visual_rejects_start(&detection, false),
+                "{state} must not leave a dispatch eligible for a later turn"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_stop_needs_a_quiet_horizon_and_resumed_working_rejects_it() {
+        let inner = inner_with(BTreeMap::new());
+        let pane = pane();
+        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+        let turn = turnkey::TurnKey::for_test(&["session", "prompt"]);
+        inner.hook_lifecycle.lock().unwrap().record_start(
+            &pane,
+            agent,
+            "claude",
+            turn.clone(),
+            "UserPromptSubmit",
+            5,
+        );
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+        let working = lifecycle_detection(Sensor::Title, AgentState::Working);
+        reconcile_candidate_lifecycle(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &working,
+            false,
+            6,
+            LifecycleObservation::Stable,
+        )
+        .expect("start confirmed");
+
+        inner.hook_lifecycle.lock().unwrap().record_end(
+            &pane,
+            agent,
+            "claude",
+            turn.clone(),
+            "Stop",
+            100,
+            3_000,
+        );
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+        let idle = lifecycle_detection(Sensor::Screen, AgentState::Idle);
+        assert!(
+            reconcile_candidate_lifecycle(
+                &inner,
+                &pane,
+                agent,
+                "claude",
+                &idle,
+                false,
+                400,
+                LifecycleObservation::Stable,
+            )
+            .is_none(),
+            "ordinary output settling cannot confirm a candidate Stop"
+        );
+        assert!(inner
+            .hook_readings
+            .lock()
+            .unwrap()
+            .get(&pane)
+            .is_some_and(|entry| entry.active_start_for(agent, Some("claude"))));
+        assert!(!turnkey::PaneEnds::holds(
+            &inner.turn_ends.lock().unwrap(),
+            &pane,
+            agent,
+            "claude",
+            &turn
+        ));
+
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+        reconcile_candidate_lifecycle(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &working,
+            false,
+            1_650,
+            LifecycleObservation::Visual,
+        );
+        assert!(
+            inner
+                .hook_lifecycle
+                .lock()
+                .unwrap()
+                .end_for(&pane, agent, "claude", Some(&turn))
+                .is_none(),
+            "resumed Working must reject Stop before the timer fires"
+        );
+        inner.hook_lifecycle.lock().unwrap().record_end(
+            &pane,
+            agent,
+            "claude",
+            turn.clone(),
+            "Stop",
+            2_000,
+            3_000,
+        );
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+        reconcile_candidate_lifecycle(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &idle,
+            false,
+            2_300,
+            LifecycleObservation::Stable,
+        );
+        assert!(!turnkey::PaneEnds::holds(
+            &inner.turn_ends.lock().unwrap(),
+            &pane,
+            agent,
+            "claude",
+            &turn
+        ));
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+        reconcile_candidate_lifecycle(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &idle,
+            false,
+            5_001,
+            LifecycleObservation::Stable,
+        );
+        assert!(turnkey::PaneEnds::holds(
+            &inner.turn_ends.lock().unwrap(),
+            &pane,
+            agent,
+            "claude",
+            &turn
+        ));
+        assert!(inner.hook_readings.lock().unwrap().get(&pane).is_none());
+    }
+
     #[test]
     fn unresolved_recovery_never_enters_the_ordinary_screen_lifecycle() {
         let attempt_id = cyclops_proto::NotificationAttemptId::generate();
@@ -1885,6 +4812,7 @@ line_regex = ['^FIXPROMPT']
             stale: false,
             write_ready: false,
             write_block: None,
+            composer_semantic: None,
         };
         let clean = Detection {
             state: AgentState::Idle,
@@ -1899,6 +4827,7 @@ line_regex = ['^FIXPROMPT']
             stale: false,
             write_ready: false,
             write_block: None,
+            composer_semantic: None,
         };
 
         assert_eq!(
@@ -1958,6 +4887,11 @@ line_regex = ['^FIXPROMPT']
             stale: false,
             write_ready: false,
             write_block: None,
+            composer_semantic: match state {
+                AgentState::Idle => Some(ComposerSemantic::Clean),
+                AgentState::IdleWithInput => Some(ComposerSemantic::HumanInput),
+                _ => None,
+            },
         };
         let working = screen(AgentState::Working, "spinner", 7);
         let clean = screen(AgentState::Idle, "composer_empty", 9);
@@ -2079,6 +5013,7 @@ line_regex = ['^FIXPROMPT']
             stale: false,
             write_ready: false,
             write_block: None,
+            composer_semantic: Some(ComposerSemantic::Clean),
         };
         let clean = screen(AgentState::Idle, "composer_empty", 9);
 
@@ -2181,6 +5116,11 @@ line_regex = ['^FIXPROMPT']
             stale: false,
             write_ready: false,
             write_block: None,
+            composer_semantic: match state {
+                AgentState::Idle => Some(ComposerSemantic::Clean),
+                AgentState::IdleWithInput => Some(ComposerSemantic::HumanInput),
+                _ => None,
+            },
         };
         let clean = screen(AgentState::Idle, "composer_empty", 9);
         let typed = screen(AgentState::IdleWithInput, "composer_text", 9);
@@ -2274,6 +5214,7 @@ line_regex = ['^FIXPROMPT']
             stale: false,
             write_ready: false,
             write_block: None,
+            composer_semantic: None,
         }
         .stamped(false, ComposerHold::Clear);
         let agent = crate::identity::ProcId { pid: 71, birth: 3 };
@@ -2283,6 +5224,7 @@ line_regex = ['^FIXPROMPT']
 
         let entry = |owner: Option<&str>, hold, turn: Option<&turnkey::TurnKey>| DetEntry {
             detection: clean.clone(),
+            binding: None,
             manifest: Some("codex".into()),
             occupant: Some(71),
             agent: Some(agent),
@@ -2291,6 +5233,8 @@ line_regex = ['^FIXPROMPT']
             quota_screen_clear: false,
             hold,
             hold_owner: owner.map(str::to_string),
+            composer: ComposerProjection::default(),
+            working_confirmed: false,
             since: std::time::Instant::now(),
         };
         // Every case starts from a known pane state AND an empty end
@@ -2318,7 +5262,7 @@ line_regex = ['^FIXPROMPT']
         // The delivery holding the barrier binds its own turn, and the
         // hold leaves the screen lifecycle for it.
         start(entry(Some("m-1#1"), ComposerHold::Staged, None));
-        assert!(bind_turn(&inner, 0, "%1", "m-1#1", t1.clone(), 500));
+        assert!(bind_turn(&inner, 0, "%1", "m-1#1", t1.clone(), 500).is_some());
         assert_eq!(
             bound(),
             (
@@ -2330,13 +5274,40 @@ line_regex = ['^FIXPROMPT']
 
         // Binding the same turn again is idempotent: an acknowledgement
         // can arrive more than once, and the first witnessed edge stands.
-        assert!(bind_turn(&inner, 0, "%1", "m-1#1", t1.clone(), 900));
+        assert!(bind_turn(&inner, 0, "%1", "m-1#1", t1.clone(), 900).is_some());
         assert_eq!(
             bound(),
             (
                 ComposerHold::TurnStarted { since_ms: 500 },
                 Some(t1.clone())
             )
+        );
+
+        // The end check belongs to the same turn-store transaction as the
+        // pin. Reconciliation may consume the end immediately after this
+        // call, but the dispatch receipt still retains what the transaction
+        // observed.
+        start(entry(Some("m-1#1"), ComposerHold::Staged, None));
+        turnkey::PaneEnds::record(
+            &mut inner.turn_ends.lock().expect("turn ends lock"),
+            &pane(),
+            agent,
+            "codex",
+            t1.clone(),
+        );
+        let ended =
+            bind_turn(&inner, 0, "%1", "m-1#1", t1.clone(), 500).expect("matching turn binds");
+        assert!(ended.end_already_present);
+        assert!(turnkey::PaneEnds::take(
+            &mut inner.turn_ends.lock().expect("turn ends lock"),
+            &pane(),
+            agent,
+            "codex",
+            &t1,
+        ));
+        assert!(
+            ended.end_already_present,
+            "the captured fact must survive consumption"
         );
 
         // A hold already waiting on one turn is not a second turn's to
@@ -2346,7 +5317,7 @@ line_regex = ['^FIXPROMPT']
             ComposerHold::TurnStarted { since_ms: 500 },
             Some(&t1),
         ));
-        assert!(!bind_turn(&inner, 0, "%1", "m-1#1", t2.clone(), 900));
+        assert!(bind_turn(&inner, 0, "%1", "m-1#1", t2.clone(), 900).is_none());
         assert_eq!(
             bound(),
             (ComposerHold::TurnStarted { since_ms: 500 }, Some(t1))
@@ -2357,12 +5328,12 @@ line_regex = ['^FIXPROMPT']
         // released, the next claimed the composer, and evidence for the
         // first arrives afterwards.
         start(entry(Some("m-2#1"), ComposerHold::Staged, None));
-        assert!(!bind_turn(&inner, 0, "%1", "m-1#1", t2.clone(), 900));
+        assert!(bind_turn(&inner, 0, "%1", "m-1#1", t2.clone(), 900).is_none());
         assert_eq!(bound(), (ComposerHold::Staged, None));
 
         // An unowned barrier is nobody's to bind.
         start(entry(None, ComposerHold::Staged, None));
-        assert!(!bind_turn(&inner, 0, "%1", "m-2#1", t2.clone(), 900));
+        assert!(bind_turn(&inner, 0, "%1", "m-2#1", t2.clone(), 900).is_none());
         assert_eq!(bound(), (ComposerHold::Staged, None));
 
         // And a pane whose binding cannot be named has nothing to key the
@@ -2370,7 +5341,7 @@ line_regex = ['^FIXPROMPT']
         let mut unbound = entry(Some("m-2#1"), ComposerHold::Staged, None);
         unbound.agent = None;
         start(unbound);
-        assert!(!bind_turn(&inner, 0, "%1", "m-2#1", t2, 900));
+        assert!(bind_turn(&inner, 0, "%1", "m-2#1", t2, 900).is_none());
         assert_eq!(bound(), (ComposerHold::Staged, None));
     }
 
@@ -2397,6 +5368,7 @@ line_regex = ['^FIXPROMPT']
             stale: false,
             write_ready: false,
             write_block: None,
+            composer_semantic: None,
         }
         .stamped(false, ComposerHold::Clear);
         let admitted = crate::identity::ProcId {
@@ -2406,6 +5378,7 @@ line_regex = ['^FIXPROMPT']
         let agent = Some(admitted);
         let entry = |hold, owner: Option<&str>| DetEntry {
             detection: clean.clone(),
+            binding: None,
             manifest: Some("bash".into()),
             occupant: Some(4242),
             agent,
@@ -2414,6 +5387,8 @@ line_regex = ['^FIXPROMPT']
             quota_screen_clear: false,
             hold,
             hold_owner: owner.map(str::to_string),
+            composer: ComposerProjection::default(),
+            working_confirmed: false,
             since: std::time::Instant::now(),
         };
 
@@ -2471,7 +5446,6 @@ line_regex = ['^FIXPROMPT']
             process,
             "bash"
         ));
-
         let mut working = entry(ComposerHold::Staged, Some(attempt));
         working.detection.readings.push(SensorReading {
             sensor: Sensor::Hook,
@@ -2566,6 +5540,7 @@ line_regex = ['^FIXPROMPT']
             stale: false,
             write_ready: false,
             write_block: None,
+            composer_semantic: Some(ComposerSemantic::Clean),
         }
         .stamped(false, ComposerHold::Clear);
         assert!(clean.write_ready, "fixture must start write-ready");
@@ -2576,6 +5551,7 @@ line_regex = ['^FIXPROMPT']
             pane(),
             DetEntry {
                 detection: clean,
+                binding: None,
                 manifest: Some("bash".into()),
                 occupant: Some(4242),
                 agent: None,
@@ -2584,6 +5560,8 @@ line_regex = ['^FIXPROMPT']
                 quota_screen_clear: false,
                 hold: ComposerHold::Clear,
                 hold_owner: None,
+                composer: ComposerProjection::default(),
+                working_confirmed: false,
                 since,
             },
         );
@@ -2631,10 +5609,12 @@ line_regex = ['^FIXPROMPT']
             stale: false,
             write_ready: false,
             write_block: None,
+            composer_semantic: None,
         }
         .stamped(false, ComposerHold::Clear);
         let entry_a = || DetEntry {
             detection: working.clone(),
+            binding: None,
             manifest: Some("agent-a".into()),
             occupant: Some(111),
             agent: None,
@@ -2643,6 +5623,8 @@ line_regex = ['^FIXPROMPT']
             hold: ComposerHold::Clear,
             hold_owner: None,
             turn: None,
+            composer: ComposerProjection::default(),
+            working_confirmed: false,
             since: std::time::Instant::now(),
         };
 
@@ -2730,6 +5712,502 @@ line_regex = ['^FIXPROMPT']
         assert!(d.readings.is_empty());
     }
 
+    fn composer_candidate(
+        state: NotificationState,
+    ) -> (
+        crate::mailbox::ActiveComposerNotification,
+        RecipientKey,
+        BindingObservation,
+    ) {
+        let workspace = "00000000-0000-4000-8000-000000000001".parse().unwrap();
+        let session = "00000000-0000-4000-8000-000000000002".parse().unwrap();
+        let recipient = RecipientKey::agent(workspace, session, "%1".parse().unwrap());
+        let pane_root = crate::identity::ProcId { pid: 69, birth: 1 };
+        let leader = crate::identity::ProcId { pid: 70, birth: 2 };
+        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+        let message_id = cyclops_proto::MessageId::new("m-composer").unwrap();
+        let attempt_id =
+            NotificationAttemptId::parse("att-00000000-0000-4000-8000-000000000003").unwrap();
+        let record = cyclops_proto::NotificationRecord {
+            attempt_id,
+            message_id: message_id.clone(),
+            recipient,
+            state,
+            binding: Some(cyclops_proto::NotificationBinding {
+                recipient,
+                pane_root: Some(ProcessInstanceId::new(pane_root.pid, pane_root.birth).unwrap()),
+                leader: Some(ProcessInstanceId::new(leader.pid, leader.birth).unwrap()),
+                agent: ProcessInstanceId::new(agent.pid, agent.birth).unwrap(),
+                manifest: cyclops_proto::NotificationManifestId::new("claude").unwrap(),
+            }),
+            transport: NotificationTransport::Doorbell,
+            doorbell_format: Some(DOORBELL_FORMAT_COMPACT_CLAIM),
+            cause: None,
+            pre_write_cause: None,
+            pre_write_observation: None,
+            pre_write_reopen_count: 0,
+            started_seq: 2,
+            updated_seq: 3,
+            updated_at: 4,
+        };
+        let message = cyclops_proto::LedgerLine {
+            seq: 1,
+            boot_id: "boot".into(),
+            id: message_id.to_string(),
+            ts: 1,
+            kind: cyclops_proto::Kind::Msg,
+            from: "admin".into(),
+            to: vec!["claude".into()],
+            subject: Some("subject".into()),
+            body: Some("body".into()),
+            reply_to: None,
+            deliveries: Vec::new(),
+            data: None,
+        };
+        (
+            crate::mailbox::ActiveComposerNotification {
+                record,
+                message: Some(message),
+                entry_state: Some(cyclops_proto::MailboxEntryState::Pending),
+            },
+            recipient,
+            BindingObservation::Bound(Binding {
+                pane_root,
+                leader,
+                agent,
+                manifest: "claude".into(),
+            }),
+        )
+    }
+
+    fn composer_detection(semantic: Option<ComposerSemantic>) -> Detection {
+        let state = match semantic {
+            Some(ComposerSemantic::Clean | ComposerSemantic::GhostSuggestion) => AgentState::Idle,
+            _ => AgentState::IdleWithInput,
+        };
+        Detection {
+            state,
+            readings: vec![SensorReading {
+                sensor: Sensor::Screen,
+                state,
+                rule: "composer".into(),
+                ts: 5,
+            }],
+            disagreement: false,
+            decided_by: "composer".into(),
+            stale: false,
+            write_ready: false,
+            write_block: None,
+            composer_semantic: semantic,
+        }
+    }
+
+    #[test]
+    fn composer_projection_exposes_the_six_closed_states() {
+        assert_eq!(
+            semantic_composer_projection(Some(ComposerSemantic::Clean)).state,
+            ComposerState::ComposerClean
+        );
+        assert_eq!(
+            semantic_composer_projection(Some(ComposerSemantic::HumanInput)).state,
+            ComposerState::HumanDraft
+        );
+        assert_eq!(
+            semantic_composer_projection(Some(ComposerSemantic::GhostSuggestion)).state,
+            ComposerState::VendorGhostSuggestion
+        );
+        assert_eq!(
+            semantic_composer_projection(Some(ComposerSemantic::Ambiguous)).state,
+            ComposerState::ComposerAmbiguous
+        );
+
+        let (candidate, recipient, binding) = composer_candidate(NotificationState::Submitted);
+        let expected = cyclops_proto::render_doorbell_v1(&candidate.record.message_id);
+        let staged = project_composer(
+            Some(ComposerSemantic::HumanInput),
+            Some(&candidate.record.attempt_id.to_string()),
+            &composer_detection(Some(ComposerSemantic::HumanInput)),
+            false,
+            &binding,
+            Some(recipient),
+            &ComposerCapture::Visible(expected),
+            std::slice::from_ref(&candidate),
+            true,
+        );
+        assert_eq!(staged.state, ComposerState::CyclopsNotificationStaged);
+        assert_eq!(staged.proof, ComposerProof::ExactNotification);
+
+        let submitted = project_composer(
+            Some(ComposerSemantic::Clean),
+            Some(&candidate.record.attempt_id.to_string()),
+            &composer_detection(Some(ComposerSemantic::Clean)),
+            false,
+            &binding,
+            Some(recipient),
+            &ComposerCapture::Visible(String::new()),
+            std::slice::from_ref(&candidate),
+            true,
+        );
+        assert_eq!(submitted.state, ComposerState::CyclopsNotificationSubmitted);
+        assert_eq!(submitted.proof, ComposerProof::ExactNotification);
+    }
+
+    #[test]
+    fn submitted_record_with_visible_exact_bytes_is_still_staged() {
+        let (candidate, recipient, binding) = composer_candidate(NotificationState::Submitted);
+        let expected = cyclops_proto::render_doorbell_v1(&candidate.record.message_id);
+        let projection = project_composer(
+            Some(ComposerSemantic::HumanInput),
+            Some(&candidate.record.attempt_id.to_string()),
+            &composer_detection(Some(ComposerSemantic::HumanInput)),
+            false,
+            &binding,
+            Some(recipient),
+            &ComposerCapture::Visible(expected),
+            std::slice::from_ref(&candidate),
+            true,
+        );
+
+        assert_eq!(projection.state, ComposerState::CyclopsNotificationStaged);
+        assert_eq!(projection.proof, ComposerProof::ExactNotification);
+    }
+
+    #[test]
+    fn submit_intent_and_post_staging_withdrawal_do_not_claim_submission() {
+        for state in [
+            NotificationState::Submitting,
+            NotificationState::WithdrawnAfterStaging,
+        ] {
+            let (candidate, recipient, binding) = composer_candidate(state);
+            let projection = project_composer(
+                Some(ComposerSemantic::Clean),
+                Some(&candidate.record.attempt_id.to_string()),
+                &composer_detection(Some(ComposerSemantic::Clean)),
+                false,
+                &binding,
+                Some(recipient),
+                &ComposerCapture::Visible(String::new()),
+                std::slice::from_ref(&candidate),
+                true,
+            );
+
+            assert_eq!(
+                projection.state,
+                ComposerState::ComposerAmbiguous,
+                "{state:?}"
+            );
+            assert_eq!(projection.proof, ComposerProof::Ambiguous, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn copy_mode_and_stale_frames_never_reuse_a_semantic_as_current() {
+        let mut detection = composer_detection(Some(ComposerSemantic::Clean));
+        let copy_mode = project_composer(
+            detection.composer_semantic,
+            None,
+            &detection,
+            true,
+            &BindingObservation::Unprovable,
+            None,
+            &ComposerCapture::NotRead,
+            &[],
+            true,
+        );
+        assert_eq!(copy_mode.state, ComposerState::ComposerAmbiguous);
+        assert_eq!(copy_mode.proof, ComposerProof::Ambiguous);
+        assert_eq!(copy_mode.reason, Some("pane_in_mode"));
+
+        detection.stale = true;
+        let stale = project_composer(
+            detection.composer_semantic,
+            None,
+            &detection,
+            false,
+            &BindingObservation::Unprovable,
+            None,
+            &ComposerCapture::NotRead,
+            &[],
+            true,
+        );
+        assert_eq!(stale.state, ComposerState::ComposerAmbiguous);
+        assert_eq!(stale.proof, ComposerProof::Unprovable);
+        assert_eq!(stale.reason, Some("detection_stale"));
+    }
+
+    #[test]
+    fn process_change_during_capture_never_projects_exact_ownership() {
+        for (state, semantic, capture) in [
+            (
+                NotificationState::Staged,
+                ComposerSemantic::HumanInput,
+                ComposerCapture::BindingChanged,
+            ),
+            (
+                NotificationState::Submitted,
+                ComposerSemantic::Clean,
+                ComposerCapture::BindingChanged,
+            ),
+        ] {
+            let (candidate, recipient, binding) = composer_candidate(state);
+            let projection = project_composer(
+                Some(semantic),
+                Some(&candidate.record.attempt_id.to_string()),
+                &composer_detection(Some(semantic)),
+                false,
+                &binding,
+                Some(recipient),
+                &capture,
+                std::slice::from_ref(&candidate),
+                true,
+            );
+
+            assert_eq!(projection.state, ComposerState::ComposerAmbiguous);
+            assert_eq!(projection.proof, ComposerProof::Ambiguous);
+            assert_eq!(projection.reason, Some("binding_changed_during_capture"));
+            assert_eq!(projection.binding, None);
+        }
+    }
+
+    #[test]
+    fn capture_bookend_requires_the_same_route_mode_and_process_generations() {
+        let (_, recipient, binding) = composer_candidate(NotificationState::Staged);
+        let before = PaneRow {
+            pane_id: "%1".into(),
+            window_id: "@1".into(),
+            window_name: "main".into(),
+            title: String::new(),
+            dead: false,
+            in_mode: false,
+            current_command: "claude".into(),
+            width: 120,
+            height: 40,
+            active: true,
+            pane_pid: 4000,
+        };
+        let after = before.clone();
+        assert!(composer_capture_binding_is_stable(
+            &before,
+            Some(&after),
+            Some(recipient),
+            Some(recipient),
+            &binding,
+            Some(&binding),
+        ));
+
+        for changed in [
+            {
+                let mut row = after.clone();
+                row.in_mode = true;
+                row
+            },
+            {
+                let mut row = after.clone();
+                row.dead = true;
+                row
+            },
+            {
+                let mut row = after.clone();
+                row.pane_pid += 1;
+                row
+            },
+        ] {
+            assert!(!composer_capture_binding_is_stable(
+                &before,
+                Some(&changed),
+                Some(recipient),
+                Some(recipient),
+                &binding,
+                Some(&binding),
+            ));
+        }
+        assert!(!composer_capture_binding_is_stable(
+            &before,
+            Some(&after),
+            Some(recipient),
+            None,
+            &binding,
+            Some(&binding),
+        ));
+
+        let BindingObservation::Bound(mut replaced_agent) = binding.clone() else {
+            unreachable!("fixture has a complete binding")
+        };
+        replaced_agent.agent.birth += 1;
+        let replaced_agent = BindingObservation::Bound(replaced_agent);
+        assert!(!composer_capture_binding_is_stable(
+            &before,
+            Some(&after),
+            Some(recipient),
+            Some(recipient),
+            &binding,
+            Some(&replaced_agent),
+        ));
+    }
+
+    #[test]
+    fn conflicting_runtime_readings_never_project_exact_ownership() {
+        let (candidate, recipient, binding) = composer_candidate(NotificationState::Staged);
+        let expected = cyclops_proto::render_doorbell_v1(&candidate.record.message_id);
+        let mut detection = composer_detection(Some(ComposerSemantic::HumanInput));
+        detection.disagreement = true;
+        detection.readings.push(SensorReading {
+            sensor: Sensor::Hook,
+            state: AgentState::Working,
+            rule: "turn_start".into(),
+            ts: 6,
+        });
+        let projection = project_composer(
+            detection.composer_semantic,
+            Some(&candidate.record.attempt_id.to_string()),
+            &detection,
+            false,
+            &binding,
+            Some(recipient),
+            &ComposerCapture::Visible(expected),
+            std::slice::from_ref(&candidate),
+            true,
+        );
+
+        assert_eq!(projection.state, ComposerState::ComposerAmbiguous);
+        assert_eq!(projection.proof, ComposerProof::Ambiguous);
+        assert_eq!(projection.reason, Some("terminal_state_unsafe"));
+        assert_eq!(projection.binding, None);
+    }
+
+    #[test]
+    fn submitted_record_with_unprovable_capture_never_claims_exact_ownership() {
+        let (candidate, recipient, binding) = composer_candidate(NotificationState::Submitted);
+        let projection = project_composer(
+            Some(ComposerSemantic::Clean),
+            Some(&candidate.record.attempt_id.to_string()),
+            &composer_detection(Some(ComposerSemantic::Clean)),
+            false,
+            &binding,
+            Some(recipient),
+            &ComposerCapture::Unprovable,
+            std::slice::from_ref(&candidate),
+            true,
+        );
+
+        assert_eq!(projection.state, ComposerState::ComposerAmbiguous);
+        assert_eq!(projection.proof, ComposerProof::Unprovable);
+        assert_eq!(projection.reason, Some("composer_capture_unprovable"));
+        assert!(projection.binding.is_none());
+    }
+
+    #[test]
+    fn exact_notification_projection_fails_closed_on_hidden_or_extra_content() {
+        let (candidate, recipient, binding) = composer_candidate(NotificationState::Submitted);
+        let owner = candidate.record.attempt_id.to_string();
+        let expected = cyclops_proto::render_doorbell_v1(&candidate.record.message_id);
+        for (capture, proof) in [
+            (
+                ComposerCapture::Visible(format!("{expected} unexpected")),
+                ComposerProof::Ambiguous,
+            ),
+            (ComposerCapture::Hidden, ComposerProof::Unprovable),
+        ] {
+            let projection = project_composer(
+                Some(ComposerSemantic::HumanInput),
+                Some(&owner),
+                &composer_detection(Some(ComposerSemantic::HumanInput)),
+                false,
+                &binding,
+                Some(recipient),
+                &capture,
+                std::slice::from_ref(&candidate),
+                true,
+            );
+            assert_eq!(projection.state, ComposerState::ComposerAmbiguous);
+            assert_eq!(projection.proof, proof);
+        }
+
+        let projection = project_composer(
+            Some(ComposerSemantic::HumanInput),
+            Some(&owner),
+            &composer_detection(Some(ComposerSemantic::HumanInput)),
+            false,
+            &binding,
+            Some(recipient),
+            &ComposerCapture::Visible(expected),
+            &[candidate.clone(), candidate],
+            true,
+        );
+        assert_eq!(projection.state, ComposerState::ComposerAmbiguous);
+        assert_eq!(projection.proof, ComposerProof::Ambiguous);
+        assert_eq!(projection.reason, Some("multiple_active_notifications"));
+        assert_eq!(projection.candidate_count, 2);
+        assert!(projection.binding.is_none());
+    }
+
+    #[test]
+    fn a_direct_hold_is_not_reported_as_multiple_notifications() {
+        let direct = project_composer(
+            Some(ComposerSemantic::Clean),
+            Some("m-direct#1"),
+            &composer_detection(Some(ComposerSemantic::Clean)),
+            false,
+            &BindingObservation::Unprovable,
+            None,
+            &ComposerCapture::Visible(String::new()),
+            &[],
+            true,
+        );
+        assert_eq!(direct.state, ComposerState::ComposerAmbiguous);
+        assert_eq!(direct.proof, ComposerProof::Unprovable);
+        assert_eq!(direct.reason, Some("direct_delivery_hold_unprovable"));
+        assert_eq!(direct.candidate_count, 0);
+    }
+
+    #[test]
+    fn pane_root_generation_is_required_for_exact_composer_ownership() {
+        let (candidate, recipient, binding) = composer_candidate(NotificationState::Submitted);
+        let owner = candidate.record.attempt_id.to_string();
+        let expected = cyclops_proto::render_doorbell_v1(&candidate.record.message_id);
+        let BindingObservation::Bound(mut replaced_root) = binding.clone() else {
+            unreachable!("composer fixture has a complete binding")
+        };
+        replaced_root.pane_root = crate::identity::ProcId {
+            pid: replaced_root.pane_root.pid,
+            birth: replaced_root.pane_root.birth + 1,
+        };
+        let projection = project_composer(
+            Some(ComposerSemantic::HumanInput),
+            Some(&owner),
+            &composer_detection(Some(ComposerSemantic::HumanInput)),
+            false,
+            &BindingObservation::Bound(replaced_root),
+            Some(recipient),
+            &ComposerCapture::Visible(expected.clone()),
+            std::slice::from_ref(&candidate),
+            true,
+        );
+        assert_eq!(projection.state, ComposerState::ComposerAmbiguous);
+        assert_eq!(projection.proof, ComposerProof::Ambiguous);
+
+        let mut legacy = candidate;
+        legacy
+            .record
+            .binding
+            .as_mut()
+            .expect("composer fixture has a durable binding")
+            .pane_root = None;
+        let projection = project_composer(
+            Some(ComposerSemantic::HumanInput),
+            Some(&owner),
+            &composer_detection(Some(ComposerSemantic::HumanInput)),
+            false,
+            &binding,
+            Some(recipient),
+            &ComposerCapture::Visible(expected),
+            std::slice::from_ref(&legacy),
+            true,
+        );
+        assert_eq!(projection.state, ComposerState::ComposerAmbiguous);
+        assert_eq!(projection.proof, ComposerProof::Unprovable);
+    }
+
     fn entry(state: AgentState, ts: u64) -> HookEntry {
         HookEntry::bound(
             crate::identity::ProcId { pid: 1, birth: 1 },
@@ -2740,6 +6218,33 @@ line_regex = ['^FIXPROMPT']
                 rule: "Stop".into(),
                 ts,
             },
+        )
+    }
+
+    fn start_entry(ts: u64) -> HookEntry {
+        HookEntry::provisional_start(
+            crate::identity::ProcId { pid: 1, birth: 1 },
+            None,
+            SensorReading {
+                sensor: Sensor::Hook,
+                state: AgentState::Working,
+                rule: "UserPromptSubmit".into(),
+                ts,
+            },
+        )
+    }
+
+    fn end_entry(ts: u64) -> HookEntry {
+        HookEntry::turn_ended(
+            crate::identity::ProcId { pid: 1, birth: 1 },
+            None,
+            SensorReading {
+                sensor: Sensor::Hook,
+                state: AgentState::Idle,
+                rule: "StopFailure".into(),
+                ts,
+            },
+            turnkey::TurnKey::for_test(&["session", "prompt"]),
         )
     }
 
@@ -2801,6 +6306,195 @@ line_regex = ['^FIXPROMPT']
             hook_action(&mut e, AgentState::Idle, 2_000),
             HookAction::Use
         );
+    }
+
+    #[test]
+    fn an_active_start_never_silently_ages_to_idle() {
+        let mut entry = start_entry(1_000);
+        for round in 0..10 {
+            assert_eq!(
+                hook_action(
+                    &mut entry,
+                    AgentState::Idle,
+                    1_001 + HOOK_READING_TTL_MS + round,
+                ),
+                HookAction::Use,
+                "idle frame {round} discarded the active start"
+            );
+        }
+        assert_eq!(entry.disagreements, 0);
+    }
+
+    #[test]
+    fn an_exact_active_start_accepts_only_its_lifecycle_end() {
+        let agent = crate::identity::ProcId { pid: 1, birth: 1 };
+        let t1 = turnkey::TurnKey::for_test(&["session", "turn-1"]);
+        let t2 = turnkey::TurnKey::for_test(&["session", "turn-2"]);
+        let reading = SensorReading {
+            sensor: Sensor::Hook,
+            state: AgentState::Working,
+            rule: "UserPromptSubmit".into(),
+            ts: 1,
+        };
+        let exact = HookEntry::turn_started(agent, Some("codex".into()), reading, t1.clone());
+        assert!(exact.active_start_matches(agent, Some("codex"), Some(&t1)));
+        assert!(!exact.active_start_matches(agent, Some("codex"), Some(&t2)));
+        assert!(
+            !exact.active_start_matches(agent, Some("codex"), None),
+            "an unkeyed end cannot authorize exact lifecycle settlement"
+        );
+    }
+
+    #[test]
+    fn an_unkeyed_confirmed_start_accepts_only_an_unkeyed_end() {
+        let agent = crate::identity::ProcId { pid: 1, birth: 1 };
+        let reading = SensorReading {
+            sensor: Sensor::Hook,
+            state: AgentState::Working,
+            rule: "PreInvocation".into(),
+            ts: 1,
+        };
+        let unkeyed = HookEntry::unkeyed_turn_started(agent, Some("agy".into()), reading.clone());
+        let provisional = HookEntry::provisional_start(agent, Some("agy".into()), reading);
+        let turn = turnkey::TurnKey::for_test(&["turn"]);
+
+        assert!(unkeyed.confirmed_unkeyed_start_for(agent, Some("agy")));
+        assert!(!unkeyed.active_start_matches(agent, Some("agy"), Some(&turn)));
+        assert!(!provisional.confirmed_unkeyed_start_for(agent, Some("agy")));
+        assert!(!unkeyed.confirmed_unkeyed_start_for(agent, Some("other")));
+    }
+
+    #[test]
+    fn an_active_start_reports_working_without_authorizing_a_write() {
+        for visual_state in [AgentState::Idle, AgentState::IdleWithInput] {
+            let mut detection = Detection {
+                state: visual_state,
+                readings: vec![SensorReading {
+                    sensor: Sensor::Screen,
+                    state: visual_state,
+                    rule: "composer".into(),
+                    ts: 2,
+                }],
+                disagreement: false,
+                decided_by: "composer".into(),
+                stale: false,
+                write_ready: false,
+                write_block: None,
+                composer_semantic: None,
+            };
+            let start = start_entry(3);
+            apply_hook_reading(
+                &mut detection,
+                start.reading,
+                start.active_start,
+                start.authoritative_end,
+            );
+            let detection = detection.stamped(false, ComposerHold::Clear);
+
+            assert_eq!(detection.state, AgentState::Working, "{visual_state}");
+            assert!(detection.disagreement, "{visual_state}");
+            assert_eq!(detection.decided_by, "hook:UserPromptSubmit");
+            assert!(!detection.write_ready, "{visual_state}");
+        }
+    }
+
+    #[test]
+    fn blocked_visuals_remain_authoritative_during_an_active_start() {
+        let states = [
+            AgentState::Unknown,
+            AgentState::Idle,
+            AgentState::IdleWithInput,
+            AgentState::Working,
+            AgentState::BlockedModal,
+            AgentState::BlockedPermission,
+            AgentState::BlockedQuota,
+            AgentState::Dead,
+        ];
+        for blocked in states.into_iter().filter(|state| state.is_blocked()) {
+            let mut detection = Detection {
+                state: blocked,
+                readings: vec![SensorReading {
+                    sensor: Sensor::Screen,
+                    state: blocked,
+                    rule: "blocked_screen".into(),
+                    ts: 2,
+                }],
+                disagreement: false,
+                decided_by: "blocked_screen".into(),
+                stale: false,
+                write_ready: false,
+                write_block: None,
+                composer_semantic: None,
+            };
+            let start = start_entry(3);
+            apply_hook_reading(
+                &mut detection,
+                start.reading,
+                start.active_start,
+                start.authoritative_end,
+            );
+            let detection = detection.stamped(false, ComposerHold::Clear);
+
+            assert_eq!(detection.state, blocked);
+            assert_eq!(detection.decided_by, "blocked_screen");
+            assert!(detection.disagreement);
+            assert!(!detection.write_ready);
+        }
+    }
+
+    #[test]
+    fn a_conclusive_end_overrides_stale_working_but_not_terminal_safety_state() {
+        for (visual, expected) in [
+            (AgentState::Working, AgentState::Idle),
+            (AgentState::Unknown, AgentState::Idle),
+            (AgentState::IdleWithInput, AgentState::IdleWithInput),
+            (AgentState::BlockedModal, AgentState::BlockedModal),
+            (AgentState::BlockedPermission, AgentState::BlockedPermission),
+            (AgentState::BlockedQuota, AgentState::BlockedQuota),
+        ] {
+            let mut detection = Detection {
+                state: visual,
+                readings: vec![SensorReading {
+                    sensor: Sensor::Screen,
+                    state: visual,
+                    rule: "visual".into(),
+                    ts: 2,
+                }],
+                disagreement: false,
+                decided_by: "visual".into(),
+                stale: false,
+                write_ready: false,
+                write_block: None,
+                composer_semantic: None,
+            };
+            let end = end_entry(3);
+            apply_hook_reading(
+                &mut detection,
+                end.reading,
+                end.active_start,
+                end.authoritative_end,
+            );
+            assert_eq!(detection.state, expected, "visual state {visual}");
+            assert!(
+                visual == AgentState::IdleWithInput
+                    || visual == AgentState::Unknown
+                    || visual.is_blocked()
+                    || detection.disagreement,
+                "stale Working must remain visible as disagreement"
+            );
+        }
+    }
+
+    #[test]
+    fn a_conclusive_end_retires_only_after_visual_terminal_state() {
+        for state in [AgentState::Working, AgentState::BlockedModal] {
+            let mut end = end_entry(3);
+            assert_eq!(hook_action(&mut end, state, 4), HookAction::Use);
+        }
+        for state in [AgentState::Idle, AgentState::IdleWithInput] {
+            let mut end = end_entry(3);
+            assert_eq!(hook_action(&mut end, state, 4), HookAction::Drop);
+        }
     }
 
     // The shipped codex esc rules: dim after the glyph is a ghost
@@ -2944,6 +6638,7 @@ regex = ['^IDLE']
         let agent = crate::identity::ProcId { pid: 71, birth: 3 };
         context
             .record_writing(
+                ProcessInstanceId::new(69, 1).unwrap(),
                 ProcessInstanceId::new(70, 2).unwrap(),
                 ProcessInstanceId::new(agent.pid, agent.birth).unwrap(),
                 "codex",
@@ -2972,11 +6667,13 @@ regex = ['^IDLE']
             stale: false,
             write_ready: false,
             write_block: None,
+            composer_semantic: Some(ComposerSemantic::Clean),
         };
         inner.detections.lock().unwrap().insert(
             pane(),
             DetEntry {
                 detection: clean.clone(),
+                binding: None,
                 manifest: Some("codex".into()),
                 occupant: Some(70),
                 agent: Some(agent),
@@ -2985,6 +6682,8 @@ regex = ['^IDLE']
                 hold: ComposerHold::TurnStarted { since_ms: 8 },
                 turn: Some(turn.clone()),
                 hold_owner: Some(queued.attempt_id.to_string()),
+                composer: ComposerProjection::default(),
+                working_confirmed: false,
                 since: std::time::Instant::now(),
             },
         );
@@ -3001,6 +6700,7 @@ regex = ['^IDLE']
         }
         let live = NotificationBinding {
             recipient,
+            pane_root: Some(ProcessInstanceId::new(69, 1).unwrap()),
             leader: Some(ProcessInstanceId::new(70, 2).unwrap()),
             agent: ProcessInstanceId::new(agent.pid, agent.birth).unwrap(),
             manifest: NotificationManifestId::new("codex").unwrap(),
@@ -3058,7 +6758,9 @@ regex = ['^IDLE']
                     stale: false,
                     write_ready: false,
                     write_block: None,
+                    composer_semantic: Some(ComposerSemantic::Clean),
                 },
+                binding: None,
                 manifest: Some("codex".into()),
                 occupant: Some(70),
                 agent: Some(agent),
@@ -3067,6 +6769,8 @@ regex = ['^IDLE']
                 hold: ComposerHold::TurnStarted { since_ms: 8 },
                 turn: Some(turn.clone()),
                 hold_owner: Some(attempt_id.to_string()),
+                composer: ComposerProjection::default(),
+                working_confirmed: false,
                 since: std::time::Instant::now(),
             },
         );
@@ -3088,6 +6792,7 @@ regex = ['^IDLE']
         );
         let live = cyclops_proto::NotificationBinding {
             recipient,
+            pane_root: Some(cyclops_proto::ProcessInstanceId::new(69, 1).unwrap()),
             leader: Some(cyclops_proto::ProcessInstanceId::new(70, 2).unwrap()),
             agent: cyclops_proto::ProcessInstanceId::new(agent.pid, agent.birth).unwrap(),
             manifest: cyclops_proto::NotificationManifestId::new("codex").unwrap(),
@@ -3118,6 +6823,13 @@ regex = ['^IDLE']
     }
 
     fn inner_with(manifests: BTreeMap<String, Manifest>) -> Arc<Inner> {
+        inner_with_stop(manifests, tokio::sync::watch::channel(false).1)
+    }
+
+    fn inner_with_stop(
+        manifests: BTreeMap<String, Manifest>,
+        stop: tokio::sync::watch::Receiver<bool>,
+    ) -> Arc<Inner> {
         let home = cyclops_proto::scratch::scratch_dir(&format!(
             "cyc-argv-cache-{}",
             uuid::Uuid::new_v4()
@@ -3146,9 +6858,12 @@ regex = ['^IDLE']
             sessions: StdMutex::new(Vec::new()),
             events: tokio::sync::broadcast::channel(16).0,
             detections: StdMutex::new(HashMap::new()),
+            pane_recomputes: StdMutex::new(HashMap::new()),
+            lifecycle_rechecks: StdMutex::new(HashMap::new()),
             registry: StdMutex::new(registry),
             theme: StdMutex::new(cyclops_theme::ThemeWatch::new(&home)),
             hook_readings: StdMutex::new(HashMap::new()),
+            hook_lifecycle: StdMutex::new(crate::hook_lifecycle::Store::new()),
             turn_ends: StdMutex::new(crate::turnkey::Ends::new()),
             argv_cache: StdMutex::new(HashMap::new()),
             engine: crate::delivery::Engine::new(),
@@ -3157,9 +6872,240 @@ regex = ['^IDLE']
             inject_pause: StdMutex::new(None),
             fail_chrome_restore: std::sync::atomic::AtomicBool::new(false),
             workspace_ui: StdMutex::new(crate::workspace_ui::WorkspaceUiState::default()),
-            stop: tokio::sync::watch::channel(false).1,
+            shutdown_request: tokio::sync::watch::channel(false).0,
+            stop,
             extra_tasks: StdMutex::new(Vec::new()),
         })
+    }
+
+    #[test]
+    fn explicit_full_screen_decisions_are_stable_lifecycle_observations() {
+        for cause in ["status", "pane.read", "gate", "pre_paste"] {
+            assert_eq!(
+                LifecycleObservation::from_cause(cause),
+                LifecycleObservation::Stable
+            );
+        }
+        assert_eq!(
+            LifecycleObservation::from_cause("agent.state.report"),
+            LifecycleObservation::None
+        );
+    }
+
+    #[test]
+    fn candidate_binding_retirement_requires_positive_replacement_evidence() {
+        let old_agent = crate::identity::ProcId { pid: 70, birth: 2 };
+        let new_agent = crate::identity::ProcId { pid: 71, birth: 3 };
+        let bound = |agent, manifest: &str| {
+            BindingObservation::Bound(Binding {
+                pane_root: crate::identity::ProcId { pid: 69, birth: 1 },
+                leader: agent,
+                agent,
+                manifest: manifest.to_string(),
+            })
+        };
+
+        assert!(!binding_replacement_proven(
+            Some(old_agent),
+            Some("claude"),
+            &BindingObservation::Unprovable,
+            None,
+        ));
+        assert!(!binding_replacement_proven(
+            Some(old_agent),
+            Some("claude"),
+            &bound(old_agent, "claude"),
+            Some("claude"),
+        ));
+        assert!(!binding_replacement_proven(
+            None,
+            None,
+            &bound(new_agent, "claude"),
+            Some("claude"),
+        ));
+        assert!(binding_replacement_proven(
+            Some(old_agent),
+            Some("claude"),
+            &bound(new_agent, "claude"),
+            Some("claude"),
+        ));
+        assert!(binding_replacement_proven(
+            Some(old_agent),
+            Some("claude"),
+            &bound(old_agent, "codex"),
+            Some("codex"),
+        ));
+        for absent in [BindingObservation::NotVendor, BindingObservation::Gone] {
+            assert!(binding_replacement_proven(None, None, &absent, None,));
+        }
+    }
+
+    #[tokio::test]
+    async fn pane_observations_share_one_route_gate() {
+        let inner = inner_with(BTreeMap::new());
+        let route = PaneKey::new(0, "%1");
+        let first = pane_recompute_gate(&inner, &route);
+        let same = pane_recompute_gate(&inner, &route);
+        let other = pane_recompute_gate(&inner, &PaneKey::new(0, "%2"));
+
+        let _guard = first.lock().await;
+        assert!(
+            same.try_lock().is_err(),
+            "same-pane capture was not serialized"
+        );
+        assert!(other.try_lock().is_ok(), "unrelated panes shared one gate");
+    }
+
+    #[tokio::test]
+    async fn same_pane_candidates_share_one_recheck_worker() {
+        let inner = inner_with(BTreeMap::new());
+        let pane = PaneKey::new(0, "%1");
+        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+        let first = inner.hook_lifecycle.lock().unwrap().record_end(
+            &pane,
+            agent,
+            "claude",
+            turnkey::TurnKey::for_test(&["session", "first"]),
+            "Stop",
+            10,
+            3_000,
+        );
+        schedule_candidate_end_recheck(&inner, &pane, first);
+        let original = inner
+            .lifecycle_rechecks
+            .lock()
+            .unwrap()
+            .get(&pane)
+            .map(|entry| Arc::clone(&entry.notify))
+            .expect("first candidate owns a worker");
+
+        let replacement = inner.hook_lifecycle.lock().unwrap().record_end(
+            &pane,
+            agent,
+            "claude",
+            turnkey::TurnKey::for_test(&["session", "second"]),
+            "Stop",
+            20,
+            3_000,
+        );
+        schedule_candidate_end_recheck(&inner, &pane, replacement);
+        {
+            let rechecks = inner.lifecycle_rechecks.lock().unwrap();
+            assert_eq!(rechecks.len(), 1);
+            assert!(rechecks
+                .get(&pane)
+                .is_some_and(|current| Arc::ptr_eq(&current.notify, &original)));
+        }
+
+        cancel_lifecycle_recheck(&inner, &pane);
+        tokio::task::yield_now().await;
+        assert!(inner.lifecycle_rechecks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn external_observation_wakes_a_parked_recheck_after_settlement() {
+        let inner = inner_with(BTreeMap::new());
+        let pane = PaneKey::new(0, "%1");
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(std::future::pending());
+        inner.lifecycle_rechecks.lock().unwrap().insert(
+            pane.clone(),
+            LifecycleRecheckTask {
+                notify: Arc::clone(&notify),
+                task,
+            },
+        );
+
+        schedule_lifecycle_recheck(&inner, &pane);
+        tokio::time::timeout(Duration::from_millis(50), notify.notified())
+            .await
+            .expect("an external observation must wake the parked worker");
+        cancel_lifecycle_recheck(&inner, &pane);
+    }
+
+    #[tokio::test]
+    async fn a_recheck_can_retire_itself_without_cancelling_its_recompute() {
+        let inner = inner_with(BTreeMap::new());
+        let pane = PaneKey::new(0, "%1");
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let task_inner = Arc::clone(&inner);
+        let task_pane = pane.clone();
+        let task = tokio::spawn(async move {
+            let _ = start_rx.await;
+            cancel_lifecycle_recheck(&task_inner, &task_pane);
+            tokio::task::yield_now().await;
+            let _ = done_tx.send(());
+        });
+        inner
+            .lifecycle_rechecks
+            .lock()
+            .unwrap()
+            .insert(pane, LifecycleRecheckTask { notify, task });
+
+        start_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(100), done_rx)
+            .await
+            .expect("self-retirement aborted the active recompute")
+            .expect("recheck task ended before reporting completion");
+        assert!(inner.lifecycle_rechecks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_owns_every_published_recheck_task() {
+        let inner = inner_with(BTreeMap::new());
+        let pane = PaneKey::new(0, "%1");
+        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+        let candidate = inner.hook_lifecycle.lock().unwrap().record_end(
+            &pane,
+            agent,
+            "claude",
+            turnkey::TurnKey::for_test(&["session", "turn"]),
+            "Stop",
+            unix_ms(),
+            60_000,
+        );
+
+        schedule_candidate_end_recheck(&inner, &pane, candidate);
+        let mut tasks = take_lifecycle_recheck_tasks(&inner);
+
+        assert_eq!(tasks.len(), 1, "the registry published no joinable task");
+        assert!(inner.lifecycle_rechecks.lock().unwrap().is_empty());
+        let mut task = tasks.pop().expect("one registered task");
+        task.abort();
+        let _ = (&mut task).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_latch_refuses_new_lifecycle_workers() {
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let inner = inner_with_stop(BTreeMap::new(), stop_rx);
+        let pane = PaneKey::new(0, "%1");
+        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+        let candidate = inner.hook_lifecycle.lock().unwrap().record_end(
+            &pane,
+            agent,
+            "claude",
+            turnkey::TurnKey::for_test(&["session", "turn"]),
+            "Stop",
+            10,
+            0,
+        );
+        stop_tx.send(true).unwrap();
+
+        schedule_candidate_end_recheck(&inner, &pane, candidate);
+
+        assert!(inner.lifecycle_rechecks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn receipt_checkpoint_is_stable_without_rearming_its_recheck_worker() {
+        assert_eq!(
+            LifecycleObservation::from_cause("receipt_checkpoint"),
+            LifecycleObservation::Stable
+        );
+        assert!(is_candidate_recheck_cause("receipt_checkpoint"));
     }
 
     #[test]
@@ -3174,7 +7120,9 @@ regex = ['^IDLE']
                 stale: false,
                 write_ready: false,
                 write_block: None,
+                composer_semantic: None,
             },
+            binding: None,
             manifest: None,
             occupant: None,
             agent: None,
@@ -3183,6 +7131,8 @@ regex = ['^IDLE']
             hold: ComposerHold::Clear,
             turn: None,
             hold_owner: None,
+            composer: ComposerProjection::default(),
+            working_confirmed: false,
             since: std::time::Instant::now(),
         };
         inner

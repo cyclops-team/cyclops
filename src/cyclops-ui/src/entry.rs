@@ -66,14 +66,18 @@ impl Entry {
                 };
                 format!("{who}{tag}  {subject}")
             }
-            EntryKind::Delivery { to, state, cause } => {
+            EntryKind::Delivery {
+                to, state, cause, ..
+            } => {
                 format!(
                     "{}  {}",
                     theme.role(to, to),
                     grid::delivery_badge(to, *state, cause.as_deref(), theme)
                 )
             }
-            EntryKind::Gate { to, action, detail } => {
+            EntryKind::Gate {
+                to, action, detail, ..
+            } => {
                 // A hold on a blocked pane is one of the three things that
                 // reach the calm view, so it wears the same encoding as the
                 // other two: glyph plus word, undimmed. The rule id that
@@ -107,7 +111,7 @@ impl Entry {
                     grid::state_cell(*state, theme)
                 )
             }
-            EntryKind::Cleared { was, how } => {
+            EntryKind::Cleared { was, how, .. } => {
                 format!(
                     "{}  {}",
                     theme.role(was.name(), was.name()),
@@ -149,6 +153,7 @@ mod tests {
             kind: EntryKind::Msg {
                 from: from.into(),
                 to: to.iter().map(|t| t.to_string()).collect(),
+                endpoints: None,
                 subject: subject.into(),
                 body: None,
                 fyi: false,
@@ -195,6 +200,7 @@ mod tests {
             id: Some("m-1".into()),
             kind: EntryKind::Delivery {
                 to: "reviewer".into(),
+                recipient: None,
                 state: DeliveryState::DeliveredVerified,
                 cause: None,
             },
@@ -211,6 +217,7 @@ mod tests {
             id: Some("e-1".into()),
             kind: EntryKind::State {
                 target: "reviewer".into(),
+                recipient: None,
                 session_idx: 0,
                 pane_id: Some("%1".into()),
                 state: AgentState::BlockedPermission,
@@ -246,6 +253,7 @@ mod tests {
             id: Some("m-1".into()),
             kind: EntryKind::Gate {
                 to: "reviewer".into(),
+                recipient: None,
                 action: "hold".into(),
                 detail: Some("pane_in_mode".into()),
             },
@@ -266,6 +274,7 @@ mod tests {
             id: Some("m-1".into()),
             kind: EntryKind::Gate {
                 to: "reviewer".into(),
+                recipient: None,
                 action: "hold".into(),
                 detail: Some("blocked:trust_dialog".into()),
             },
@@ -308,6 +317,7 @@ mod tests {
                     name: "reviewer".into(),
                     state: AgentState::BlockedPermission,
                 },
+                recipient: None,
                 how,
             },
         };
@@ -330,6 +340,7 @@ mod tests {
                     id: "m-1".into(),
                     state: DeliveryState::ParkedBlockedQuota,
                 },
+                recipient: None,
                 how: Clearance::Moved,
             },
         };
@@ -371,6 +382,7 @@ mod tests {
             id: Some("e-1".into()),
             kind: EntryKind::State {
                 target: "reviewer".into(),
+                recipient: None,
                 session_idx: 0,
                 pane_id: Some("%1".into()),
                 state: AgentState::BlockedPermission,
@@ -389,6 +401,7 @@ mod tests {
             id: Some("m-1".into()),
             kind: EntryKind::Delivery {
                 to: "implementer".into(),
+                recipient: None,
                 state: DeliveryState::ParkedBlockedQuota,
                 cause: None,
             },
