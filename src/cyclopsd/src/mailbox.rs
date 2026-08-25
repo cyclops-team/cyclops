@@ -3002,7 +3002,7 @@ impl MailboxProjection {
                     && self
                         .active_notification_barriers
                         .get(&record.attempt_id)
-                        .is_some_and(|active| active == record)
+                        .is_some_and(|active| active == *record)
             })
             .min_by_key(|record| record.started_seq)
     }

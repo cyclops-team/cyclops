@@ -3251,6 +3251,7 @@ async fn recompute_pane_with_evidence(
         return Some(det);
     }
 
+    let mut capture_binding_changed = false;
     let mut detection = if row.dead {
         Detection {
             state: AgentState::Dead,
@@ -3356,7 +3357,7 @@ async fn recompute_pane_with_evidence(
                 Err(_) => ComposerCapture::NotRead,
             };
         }
-        let capture_binding_changed = if need_screen || inspect_composer {
+        capture_binding_changed = if need_screen || inspect_composer {
             let row_after_capture = watcher.pane(pane_id);
             let recipient_after_capture = row_after_capture.as_ref().and_then(|current| {
                 crate::composer_recovery::exact_recipient(inner, session_idx, watcher, current)

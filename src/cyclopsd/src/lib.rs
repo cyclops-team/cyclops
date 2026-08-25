@@ -96,7 +96,7 @@ use cyclops_tmux::{
     ControlConfig, PaneEvent, PaneField, PaneRow, SessionWatcher, TmuxError, TmuxVersion,
 };
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
