@@ -582,8 +582,8 @@ pub struct Injection {
     pub safe_states: Vec<String>,
     #[serde(default)]
     pub unsafe_states: Vec<String>,
-    /// "queues" when text pasted mid-turn stages and runs as its own turn
-    /// (measured on Claude). Absent means unestablished: gate on idle.
+    /// Legacy measurement metadata. Delivery never uses it as write authority.
+    /// Omit it from new manifests and encode safety through measured states.
     #[serde(default)]
     pub busy_behavior: Option<String>,
     /// Lines the vendor may render BELOW the composer, which are never

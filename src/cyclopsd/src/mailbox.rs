@@ -47,6 +47,16 @@ pub(crate) struct ActiveComposerNotification {
     pub(crate) record: NotificationRecord,
     pub(crate) message: Option<LedgerLine>,
     pub(crate) entry_state: Option<MailboxEntryState>,
+    pub(crate) recovery_action: ExactOwnedRecoveryAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExactOwnedRecoveryAction {
+    Ineligible,
+    Submit,
+    Clear,
+    Reconcile,
+    Inspect,
 }
 
 /// Bounded body-free status projection of durable pre-write failures.
@@ -298,6 +308,10 @@ pub enum MailboxError {
         "notification attempt '{0}' has an unresolved post-write composer barrier with an incomplete durable binding"
     )]
     NotificationRequeueBarrierBindingIncomplete(NotificationAttemptId),
+    #[error(
+        "notification attempt '{0}' still owns an exact staged composer notification; resolve it before requeueing"
+    )]
+    NotificationRequeueExactComposerBarrier(NotificationAttemptId),
     #[error("notification clearance requires an attention-required attempt")]
     NotificationClearRequiresAttention,
     #[error(
@@ -342,6 +356,8 @@ pub enum MailboxError {
     },
     #[error("notification attempt '{0}' is already being resolved")]
     NotificationResolutionInProgress(NotificationAttemptId),
+    #[error("notification attempt '{0}' is not eligible for exact-owned recovery")]
+    NotificationAutomaticResolutionNotEligible(NotificationAttemptId),
     #[error("message '{0}' has no unresolved attention attempt")]
     NoUnresolvedAttention(MessageId),
     #[error("message '{message_id}' has multiple unresolved attention attempts")]
@@ -568,7 +584,7 @@ pub(crate) struct AttentionTarget {
     pub(crate) record: NotificationRecord,
 }
 
-/// How an exact operator action may proceed after reserving its attempt.
+/// How an exact resolution action may proceed after reserving its attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AttentionResolutionStart {
     /// No durable terminal action exists for this attempt.
@@ -2985,6 +3001,73 @@ impl MailboxProjection {
             .is_some_and(|entry| entry.state.is_pending())
     }
 
+    /// Choose the terminal recovery for one exact active composer barrier.
+    ///
+    /// An existing durable intent always wins. For a fresh action, pending
+    /// means submit the staged doorbell and a claim ordered after the write
+    /// means clear it. Selection and intent persistence share the store lock
+    /// so a concurrent claim lands wholly before or after that boundary.
+    fn exact_owned_resolution(&self, target: &AttentionTarget) -> Option<NotificationResolution> {
+        let current = self.alarm_by_attempt(target.record.attempt_id)?;
+        if current != &target.record
+            || self.attention_resolved(current.attempt_id)
+            || !current.needs_exact_owned_reconciliation()
+            || self.notification(current.recipient, &current.message_id) != Some(current)
+            || self.active_notification_barriers.get(&current.attempt_id) != Some(current)
+        {
+            return None;
+        }
+        if let Some(recorded) = self.attention_resolution_intent(current.attempt_id) {
+            return Some(recorded);
+        }
+        if self.entry_is_pending(current.recipient, &current.message_id) {
+            Some(NotificationResolution::Complete)
+        } else if self.exact_recipient_claimed_after_write(current) {
+            Some(NotificationResolution::Discard)
+        } else {
+            None
+        }
+    }
+
+    fn exact_owned_recovery_action(
+        &self,
+        current: &NotificationRecord,
+    ) -> ExactOwnedRecoveryAction {
+        if self.attention_resolved(current.attempt_id)
+            || !current.needs_exact_owned_reconciliation()
+            || self.notification(current.recipient, &current.message_id) != Some(current)
+            || self.active_notification_barriers.get(&current.attempt_id) != Some(current)
+        {
+            return ExactOwnedRecoveryAction::Ineligible;
+        }
+        match self.attention_resolution_intent(current.attempt_id) {
+            None if self.entry_is_pending(current.recipient, &current.message_id) => {
+                ExactOwnedRecoveryAction::Submit
+            }
+            None if self.exact_recipient_claimed_after_write(current) => {
+                ExactOwnedRecoveryAction::Clear
+            }
+            Some(NotificationResolution::Complete)
+                if self.attention_resolution_action_accepted(current.attempt_id)
+                    == Some(NotificationResolution::Complete)
+                    && (self
+                        .attention_resolution_consumption_observed(current.attempt_id)
+                        .is_some()
+                        || self.exact_claim_after_attention_action(current).is_some()) =>
+            {
+                ExactOwnedRecoveryAction::Reconcile
+            }
+            Some(NotificationResolution::Discard)
+                if self.attention_resolution_action_accepted(current.attempt_id)
+                    == Some(NotificationResolution::Discard) =>
+            {
+                ExactOwnedRecoveryAction::Reconcile
+            }
+            Some(_) => ExactOwnedRecoveryAction::Inspect,
+            None => ExactOwnedRecoveryAction::Ineligible,
+        }
+    }
+
     /// Oldest exact notification barrier owned by a durable recipient claim.
     ///
     /// A staged doorbell and a v2 ACK-timeout doorbell both keep their original
@@ -3993,8 +4076,15 @@ pub struct MailboxService {
     store: Arc<StdMutex<MessageStore>>,
     changes: Option<MessageChangePublisher>,
     resolving_attention: StdMutex<HashSet<NotificationAttemptId>>,
+    exact_reconciliation: StdMutex<ExactReconciliationRequests>,
     attention_consumption_candidates:
         StdMutex<HashMap<NotificationAttemptId, AttentionConsumptionCandidate>>,
+}
+
+#[derive(Default)]
+struct ExactReconciliationRequests {
+    running: HashSet<NotificationAttemptId>,
+    dirty: HashSet<NotificationAttemptId>,
 }
 
 /// One exact causal observation waiting to become a durable consumption fact.
@@ -4087,6 +4177,16 @@ impl From<MailboxError> for MailboxServiceError {
     }
 }
 
+impl MailboxServiceError {
+    pub(crate) fn notification_resolution_in_progress(&self) -> bool {
+        matches!(
+            self,
+            Self::Store(MessageStoreError::Mailbox(error))
+                if matches!(error.as_ref(), MailboxError::NotificationResolutionInProgress(_))
+        )
+    }
+}
+
 impl MailboxService {
     pub fn new(directory: MailboxDirectory, store: MessageStore) -> Self {
         Self::new_inner(directory, store, None)
@@ -4117,6 +4217,7 @@ impl MailboxService {
             store: Arc::new(StdMutex::new(store)),
             changes,
             resolving_attention: StdMutex::new(HashSet::new()),
+            exact_reconciliation: StdMutex::new(ExactReconciliationRequests::default()),
             attention_consumption_candidates: StdMutex::new(HashMap::new()),
         }
     }
@@ -4297,7 +4398,7 @@ impl MailboxService {
             .claimed_notification_barrier(recipient)
             .cloned()
         {
-            // A durable operator action owns this exact barrier until it is
+            // A durable resolution chain owns this exact barrier until it is
             // reconciled or explicitly withdrawn. Starting the automatic
             // claimed-barrier path here could settle the notification first
             // and leave the operator chain permanently incomplete.
@@ -4599,6 +4700,7 @@ impl MailboxService {
                     .projection()
                     .get_entry(record.recipient, &record.message_id)
                     .map(|entry| entry.state.clone()),
+                recovery_action: store.projection().exact_owned_recovery_action(&record),
                 record,
             })
             .collect())
@@ -4826,6 +4928,17 @@ impl MailboxService {
             projection
                 .active_notification_barriers
                 .get(&record.attempt_id)
+                .is_some_and(NotificationRecord::needs_exact_owned_reconciliation)
+        }) {
+            return Err(MessageStoreError::from(
+                MailboxError::NotificationRequeueExactComposerBarrier(record.attempt_id),
+            )
+            .into());
+        }
+        if let Some(record) = selected.iter().copied().find(|record| {
+            projection
+                .active_notification_barriers
+                .get(&record.attempt_id)
                 .is_some_and(|active| {
                     active.binding.as_ref().is_none_or(|binding| {
                         binding.pane_root.is_none() || binding.leader.is_none()
@@ -5032,7 +5145,125 @@ impl MailboxService {
         Ok(())
     }
 
-    /// Persist the terminal write boundary before an operator action.
+    /// Read the current durable policy for exact-owned recovery.
+    pub(crate) fn automatic_attention_resolution(
+        &self,
+        target: &AttentionTarget,
+    ) -> Result<Option<NotificationResolution>, MailboxServiceError> {
+        Ok(self.store()?.projection().exact_owned_resolution(target))
+    }
+
+    /// Record a relevant evidence edge and elect at most one worker.
+    pub(crate) fn request_exact_reconciliation(
+        &self,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<bool, MailboxServiceError> {
+        let mut requests = self
+            .exact_reconciliation
+            .lock()
+            .map_err(|_| MailboxServiceError::Poisoned)?;
+        requests.dirty.insert(attempt_id);
+        Ok(requests.running.insert(attempt_id))
+    }
+
+    /// Consume one evidence edge or retire the attempt worker atomically.
+    pub(crate) fn take_exact_reconciliation_request(
+        &self,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<bool, MailboxServiceError> {
+        let mut requests = self
+            .exact_reconciliation
+            .lock()
+            .map_err(|_| MailboxServiceError::Poisoned)?;
+        if requests.dirty.remove(&attempt_id) {
+            return Ok(true);
+        }
+        requests.running.remove(&attempt_id);
+        Ok(false)
+    }
+
+    /// Preserve an edge that collided with an explicit resolution.
+    ///
+    /// The reservation check and worker handoff share the same critical
+    /// section. Either the explicit resolver sees the parked edge when it
+    /// releases its reservation, or this worker sees that the reservation
+    /// already ended and continues immediately.
+    pub(crate) fn park_exact_reconciliation_after_conflict(
+        &self,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<bool, MailboxServiceError> {
+        let resolving = self
+            .resolving_attention
+            .lock()
+            .map_err(|_| MailboxServiceError::Poisoned)?;
+        let mut requests = self
+            .exact_reconciliation
+            .lock()
+            .map_err(|_| MailboxServiceError::Poisoned)?;
+        requests.dirty.insert(attempt_id);
+        requests.running.remove(&attempt_id);
+        if resolving.contains(&attempt_id) {
+            return Ok(false);
+        }
+        Ok(requests.running.insert(attempt_id))
+    }
+
+    /// Re-elect a parked worker after the explicit reservation ends.
+    pub(crate) fn resume_exact_reconciliation(
+        &self,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<bool, MailboxServiceError> {
+        let resolving = self
+            .resolving_attention
+            .lock()
+            .map_err(|_| MailboxServiceError::Poisoned)?;
+        if resolving.contains(&attempt_id) {
+            return Ok(false);
+        }
+        let mut requests = self
+            .exact_reconciliation
+            .lock()
+            .map_err(|_| MailboxServiceError::Poisoned)?;
+        Ok(requests.dirty.contains(&attempt_id) && requests.running.insert(attempt_id))
+    }
+
+    /// Persist the exact-owned recovery choice at its mailbox linearization point.
+    pub(crate) fn record_automatic_attention_resolution_intent(
+        &self,
+        target: &AttentionTarget,
+    ) -> Result<NotificationResolution, MailboxServiceError> {
+        let mut store = self.store()?;
+        let resolution = store.projection().exact_owned_resolution(target).ok_or(
+            MailboxError::NotificationAutomaticResolutionNotEligible(target.record.attempt_id),
+        )?;
+        if store
+            .projection()
+            .attention_resolution_intent(target.record.attempt_id)
+            .is_some()
+        {
+            return Ok(resolution);
+        }
+        store.record_notification_resolution_intent(
+            target.record.message_id.clone(),
+            target.record.recipient,
+            target.record.attempt_id,
+            resolution,
+        )?;
+        let seq = store
+            .projection()
+            .last_sequence()
+            .expect("attention resolution intent advances the workspace sequence");
+        self.publish_change(
+            seq,
+            &[
+                MessagesChangedArea::Notifications,
+                MessagesChangedArea::Attention,
+            ],
+        );
+        Ok(resolution)
+    }
+
+    /// Persist the terminal write boundary before a resolution action.
     pub(crate) fn record_attention_resolution_intent(
         &self,
         target: &AttentionTarget,
@@ -11222,6 +11453,55 @@ mod tests {
             .unwrap();
     }
 
+    fn exact_doorbell_alarm(
+        store: &mut MessageStore,
+        message_id: &MessageId,
+        recipient: RecipientKey,
+        attempt_id: NotificationAttemptId,
+        base_ts: u64,
+    ) {
+        for (offset, state) in [NotificationState::Queued, NotificationState::Gating]
+            .into_iter()
+            .enumerate()
+        {
+            store
+                .append_notification_transition_at(
+                    message_id.clone(),
+                    recipient,
+                    attempt_id,
+                    state,
+                    None,
+                    None,
+                    base_ts + offset as u64,
+                )
+                .unwrap();
+        }
+        store
+            .append_notification_transition_with_transport_at(
+                message_id.clone(),
+                recipient,
+                attempt_id,
+                NotificationState::Writing,
+                Some(notification_binding(recipient)),
+                Some(NotificationTransport::Doorbell),
+                Some(DOORBELL_FORMAT_ATTEMPT_CLAIM),
+                None,
+                base_ts + 2,
+            )
+            .unwrap();
+        store
+            .append_notification_transition_at(
+                message_id.clone(),
+                recipient,
+                attempt_id,
+                NotificationState::AttentionRequired,
+                None,
+                Some(NotificationAttentionCause::VerifyFailed),
+                base_ts + 3,
+            )
+            .unwrap();
+    }
+
     fn append_resolution_at(
         store: &mut MessageStore,
         message_id: &MessageId,
@@ -11363,6 +11643,76 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn exact_reconciliation_edges_coalesce_without_getting_lost() {
+        let (_scratch, store, _, bob) = operator_store("exact-reconciliation-edges");
+        let carol = test_context().3;
+        let service = MailboxService::new(operator_directory(bob, carol), store);
+        let attempt_id = attempt(1);
+
+        assert!(service.request_exact_reconciliation(attempt_id).unwrap());
+        assert!(service
+            .take_exact_reconciliation_request(attempt_id)
+            .unwrap());
+        assert!(!service.request_exact_reconciliation(attempt_id).unwrap());
+        assert!(service
+            .take_exact_reconciliation_request(attempt_id)
+            .unwrap());
+        assert!(!service
+            .take_exact_reconciliation_request(attempt_id)
+            .unwrap());
+
+        assert!(service.request_exact_reconciliation(attempt_id).unwrap());
+        assert!(service
+            .take_exact_reconciliation_request(attempt_id)
+            .unwrap());
+
+        service
+            .resolving_attention
+            .lock()
+            .unwrap()
+            .insert(attempt_id);
+        assert!(!service
+            .park_exact_reconciliation_after_conflict(attempt_id)
+            .unwrap());
+        service
+            .resolving_attention
+            .lock()
+            .unwrap()
+            .remove(&attempt_id);
+        assert!(service.resume_exact_reconciliation(attempt_id).unwrap());
+        assert!(service
+            .take_exact_reconciliation_request(attempt_id)
+            .unwrap());
+        assert!(!service
+            .take_exact_reconciliation_request(attempt_id)
+            .unwrap());
+
+        assert!(service.request_exact_reconciliation(attempt_id).unwrap());
+        assert!(service
+            .take_exact_reconciliation_request(attempt_id)
+            .unwrap());
+        service
+            .resolving_attention
+            .lock()
+            .unwrap()
+            .insert(attempt_id);
+        service
+            .resolving_attention
+            .lock()
+            .unwrap()
+            .remove(&attempt_id);
+        assert!(service
+            .park_exact_reconciliation_after_conflict(attempt_id)
+            .unwrap());
+        assert!(service
+            .take_exact_reconciliation_request(attempt_id)
+            .unwrap());
+        assert!(!service
+            .take_exact_reconciliation_request(attempt_id)
+            .unwrap());
     }
 
     fn current_attempts(
@@ -11788,6 +12138,60 @@ mod tests {
 
         MessageStore::open(&root, journal, workspace, "boot-2")
             .expect("the service guard does not alter replay semantics");
+    }
+
+    #[test]
+    fn broadcast_requeue_preserves_an_exact_composer_barrier_and_its_handle() {
+        let scratch = StoreScratch::new("requeue-exact-composer-barrier");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, admin, bob, carol) = test_context();
+        let message_id = MessageId::new("m-requeue-exact-composer-barrier").unwrap();
+        let mut store = MessageStore::open(&root, journal, workspace, "boot-1").unwrap();
+        store
+            .accept_at(
+                message_id.clone(),
+                draft(admin, vec![bob, carol], "Barrier", None),
+                1,
+            )
+            .unwrap();
+        alarm(&mut store, &message_id, bob, attempt(1), 2);
+        exact_doorbell_alarm(&mut store, &message_id, carol, attempt(2), 10);
+        let before_bytes = std::fs::read(store.journal_path()).unwrap();
+        let before_seq = store.projection().last_sequence();
+        let before_attempts = current_attempts(&store, &message_id, [bob, carol]);
+        let service = MailboxService::new(operator_directory(bob, carol), store);
+
+        assert!(matches!(
+            service.requeue_message(message_id.clone()),
+            Err(MailboxServiceError::Store(MessageStoreError::Mailbox(error)))
+                if matches!(
+                    *error,
+                    MailboxError::NotificationRequeueExactComposerBarrier(id)
+                        if id == attempt(2)
+                )
+        ));
+        assert_eq!(
+            service
+                .attention_target(&attempt(2).to_string())
+                .unwrap()
+                .record
+                .attempt_id,
+            attempt(2)
+        );
+
+        let store = service.store().unwrap();
+        assert_eq!(std::fs::read(store.journal_path()).unwrap(), before_bytes);
+        assert_eq!(store.projection().last_sequence(), before_seq);
+        assert_eq!(
+            current_attempts(&store, &message_id, [bob, carol]),
+            before_attempts
+        );
+        assert!(store
+            .projection()
+            .active_notification_barriers()
+            .iter()
+            .any(|record| record.attempt_id == attempt(2)));
     }
 
     #[test]

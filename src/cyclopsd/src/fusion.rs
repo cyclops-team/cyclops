@@ -1914,7 +1914,7 @@ pub(crate) fn release_unwritten_hold(
     true
 }
 
-/// Confirm that an operator action still owns the staged composer.
+/// Confirm that a guarded resolution still owns the staged composer.
 ///
 /// Exact payload capture proves the bytes. This check proves that no live
 /// lifecycle or blocked-state evidence makes a terminal key unsafe.
@@ -1958,7 +1958,7 @@ fn staged_entry_ready(
             .all(|reading| matches!(reading.state, AgentState::Idle | AgentState::IdleWithInput))
 }
 
-/// Release the staged composer barrier after an explicit operator action.
+/// Release the staged composer barrier after a guarded resolution.
 ///
 /// The caller has already proved the exact composer bytes. This final
 /// check keeps the release bound to the process generation and manifest
@@ -3639,7 +3639,7 @@ async fn recompute_pane_with_evidence(
     let working_confirmed =
         working_is_confirmed(inner, &route, &detection, admitted, manifest_id.as_deref());
 
-    let (prior, prior_ready, detection, probe_quota_reset) = {
+    let (prior, prior_ready, detection, probe_quota_reset, composer_changed) = {
         let mut map = inner.detections.lock().expect("detections lock");
         if matches!(
             recovery_action.as_ref(),
@@ -3773,6 +3773,7 @@ async fn recompute_pane_with_evidence(
             &composer_candidates,
             composer_store_available,
         );
+        let composer_changed = prior_entry.is_none_or(|entry| entry.composer != composer);
         // A positive screen baseline is enough to discover durable quota
         // holds after restart. Carry that baseline across title-only and
         // hook-only redraws for the same occupant. A positive quota screen
@@ -3842,7 +3843,13 @@ async fn recompute_pane_with_evidence(
                 since,
             },
         );
-        (prior, prior_ready, detection, probe_quota_reset)
+        (
+            prior,
+            prior_ready,
+            detection,
+            probe_quota_reset,
+            composer_changed,
+        )
     };
     // A readiness change under an UNCHANGED runtime state is still news
     // for anyone gating on it. The hold lifting is the case that matters:
@@ -3861,6 +3868,11 @@ async fn recompute_pane_with_evidence(
         && prior == Some(AgentState::Working)
         && prior_working_confirmed != working_confirmed;
     let changed = state_changed || certainty_changed;
+    if state_changed || composer_changed {
+        if let Some(recipient) = recovery_recipient {
+            crate::attention_resolution::schedule_exact_owned_reconciliation(inner, recipient);
+        }
+    }
     if changed {
         debug!(
             pane = pane_id,
@@ -6409,6 +6421,7 @@ contains = ["working"]
                 record,
                 message: Some(message),
                 entry_state: Some(cyclops_proto::MailboxEntryState::Pending),
+                recovery_action: crate::mailbox::ExactOwnedRecoveryAction::Ineligible,
             },
             recipient,
             BindingObservation::Bound(Binding {

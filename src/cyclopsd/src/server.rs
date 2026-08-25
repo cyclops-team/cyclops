@@ -1360,6 +1360,7 @@ pub(crate) fn mailbox_service_error(error: crate::mailbox::MailboxServiceError) 
                 | MailboxError::NotificationClearRequiresAttention
                 | MailboxError::NotificationRequeueRequiresAttention
                 | MailboxError::NotificationRequeueBarrierBindingIncomplete(_)
+                | MailboxError::NotificationRequeueExactComposerBarrier(_)
                 | MailboxError::NotificationWithdrawalRequiresPreWrite
                 | MailboxError::NotificationWithdrawalRecipientMismatch { .. } => {
                     ("conflict", error.to_string())
@@ -1804,6 +1805,8 @@ fn composer_next_action(
     composer: cyclops_proto::ComposerState,
     notification: cyclops_proto::NotificationState,
     message: Option<cyclops_proto::ComposerMessageState>,
+    recovery_action: crate::mailbox::ExactOwnedRecoveryAction,
+    clear_supported: bool,
     active_worker_owns: bool,
 ) -> cyclops_proto::ComposerNextAction {
     use cyclops_proto::{
@@ -1814,6 +1817,22 @@ fn composer_next_action(
         composer,
         ComposerState::CyclopsNotificationStaged | ComposerState::CyclopsNotificationSubmitted
     );
+    if exact_composer && notification == NotificationState::AttentionRequired {
+        return match recovery_action {
+            crate::mailbox::ExactOwnedRecoveryAction::Submit => ComposerNextAction::AutomaticSubmit,
+            crate::mailbox::ExactOwnedRecoveryAction::Clear if clear_supported => {
+                ComposerNextAction::AutomaticReconcile
+            }
+            crate::mailbox::ExactOwnedRecoveryAction::Reconcile => {
+                ComposerNextAction::AutomaticReconcile
+            }
+            crate::mailbox::ExactOwnedRecoveryAction::Ineligible
+            | crate::mailbox::ExactOwnedRecoveryAction::Clear
+            | crate::mailbox::ExactOwnedRecoveryAction::Inspect => {
+                ComposerNextAction::InspectAttention
+            }
+        };
+    }
     if !exact_composer || !active_worker_owns {
         return operator_next_action(Some(notification), true);
     }
@@ -2038,10 +2057,22 @@ fn status_result_with_refresh(
                                                 candidate.record.recipient,
                                                 candidate.record.attempt_id,
                                             );
+                                        let clear_supported = candidate
+                                            .record
+                                            .binding
+                                            .as_ref()
+                                            .and_then(|binding| {
+                                                inner.manifests.get(binding.manifest.as_str())
+                                            })
+                                            .is_some_and(|manifest| {
+                                                !manifest.injection.clear_keys.is_empty()
+                                            });
                                         ps.next_action = Some(composer_next_action(
                                             ps.composer,
                                             candidate.record.state,
                                             ps.message_state,
+                                            candidate.recovery_action,
+                                            clear_supported,
                                             active_worker_owns,
                                         ));
                                     }
@@ -3456,6 +3487,7 @@ mod tests {
 
     #[test]
     fn status_never_advertises_a_second_submit_after_submit_intent() {
+        use crate::mailbox::ExactOwnedRecoveryAction;
         use cyclops_proto::{
             ComposerMessageState, ComposerNextAction, ComposerState, NotificationState,
         };
@@ -3465,6 +3497,8 @@ mod tests {
                 ComposerState::CyclopsNotificationStaged,
                 NotificationState::Staged,
                 Some(ComposerMessageState::Pending),
+                ExactOwnedRecoveryAction::Ineligible,
+                false,
                 true,
             ),
             ComposerNextAction::AutomaticSubmit
@@ -3474,9 +3508,55 @@ mod tests {
                 ComposerState::CyclopsNotificationStaged,
                 NotificationState::Staged,
                 Some(ComposerMessageState::Claimed),
+                ExactOwnedRecoveryAction::Ineligible,
+                false,
                 true,
             ),
             ComposerNextAction::AutomaticReconcile
+        );
+        assert_eq!(
+            composer_next_action(
+                ComposerState::CyclopsNotificationStaged,
+                NotificationState::AttentionRequired,
+                Some(ComposerMessageState::Pending),
+                ExactOwnedRecoveryAction::Submit,
+                false,
+                false,
+            ),
+            ComposerNextAction::AutomaticSubmit
+        );
+        assert_eq!(
+            composer_next_action(
+                ComposerState::CyclopsNotificationStaged,
+                NotificationState::AttentionRequired,
+                Some(ComposerMessageState::Pending),
+                ExactOwnedRecoveryAction::Inspect,
+                false,
+                false,
+            ),
+            ComposerNextAction::InspectAttention
+        );
+        assert_eq!(
+            composer_next_action(
+                ComposerState::CyclopsNotificationStaged,
+                NotificationState::AttentionRequired,
+                Some(ComposerMessageState::Claimed),
+                ExactOwnedRecoveryAction::Clear,
+                true,
+                false,
+            ),
+            ComposerNextAction::AutomaticReconcile
+        );
+        assert_eq!(
+            composer_next_action(
+                ComposerState::CyclopsNotificationStaged,
+                NotificationState::AttentionRequired,
+                Some(ComposerMessageState::Claimed),
+                ExactOwnedRecoveryAction::Clear,
+                false,
+                false,
+            ),
+            ComposerNextAction::InspectAttention
         );
         for message in [ComposerMessageState::Pending, ComposerMessageState::Claimed] {
             assert_eq!(
@@ -3484,6 +3564,8 @@ mod tests {
                     ComposerState::CyclopsNotificationStaged,
                     NotificationState::Staged,
                     Some(message),
+                    ExactOwnedRecoveryAction::Ineligible,
+                    false,
                     false,
                 ),
                 ComposerNextAction::CheckHealth,
@@ -3496,6 +3578,8 @@ mod tests {
                     ComposerState::CyclopsNotificationStaged,
                     state,
                     Some(ComposerMessageState::Pending),
+                    ExactOwnedRecoveryAction::Ineligible,
+                    false,
                     true,
                 ),
                 ComposerNextAction::AutomaticReconcile,
@@ -3506,6 +3590,8 @@ mod tests {
                     ComposerState::CyclopsNotificationStaged,
                     state,
                     Some(ComposerMessageState::Pending),
+                    ExactOwnedRecoveryAction::Ineligible,
+                    false,
                     false,
                 ),
                 ComposerNextAction::CheckHealth,
@@ -3528,6 +3614,8 @@ mod tests {
                     ComposerState::CyclopsNotificationStaged,
                     state,
                     Some(ComposerMessageState::Claimed),
+                    ExactOwnedRecoveryAction::Ineligible,
+                    false,
                     true,
                 ),
                 expected,
@@ -3539,6 +3627,8 @@ mod tests {
                 ComposerState::ComposerAmbiguous,
                 NotificationState::Staged,
                 Some(ComposerMessageState::Pending),
+                ExactOwnedRecoveryAction::Ineligible,
+                false,
                 true,
             ),
             ComposerNextAction::CheckHealth

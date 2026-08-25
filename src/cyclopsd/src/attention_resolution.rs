@@ -1,4 +1,4 @@
-//! Explicit recovery for a notification left in an agent composer.
+//! Exact recovery for a notification left in an agent composer.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,6 +74,108 @@ pub(crate) async fn resolve(
     target: &AttentionTarget,
     resolution: NotificationResolution,
 ) -> Result<AttentionResolveResult, AttentionActionError> {
+    let result = resolve_selected(inner, service, target, resolution, false).await;
+    if service
+        .resume_exact_reconciliation(target.record.attempt_id)
+        .unwrap_or(false)
+    {
+        spawn_exact_owned_worker(inner, Arc::clone(service), target.record.attempt_id);
+    }
+    result
+}
+
+/// Reconcile exact Cyclops-owned composer content after relevant evidence moves.
+///
+/// The durable mailbox selects submit for pending work and clear for a claim
+/// ordered after the write. Every terminal action still passes through the
+/// same proof, intent, acceptance, and settlement path as an explicit action.
+pub(crate) fn schedule_exact_owned_reconciliation(
+    inner: &Arc<Inner>,
+    recipient: cyclops_proto::RecipientKey,
+) {
+    let Some(service) = inner.mailbox.as_ref().cloned() else {
+        return;
+    };
+    let Ok(candidates) = service.active_composer_notifications(recipient) else {
+        return;
+    };
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    for attempt_id in candidates
+        .into_iter()
+        .filter(|candidate| candidate.record.needs_exact_owned_reconciliation())
+        .map(|candidate| candidate.record.attempt_id)
+    {
+        if service
+            .request_exact_reconciliation(attempt_id)
+            .unwrap_or(false)
+        {
+            spawn_exact_owned_worker(inner, Arc::clone(&service), attempt_id);
+        }
+    }
+}
+
+fn spawn_exact_owned_worker(
+    inner: &Arc<Inner>,
+    service: Arc<MailboxService>,
+    attempt_id: cyclops_proto::NotificationAttemptId,
+) {
+    let task_inner = Arc::clone(inner);
+    inner.engine.spawn_descendant_task(async move {
+        while service
+            .take_exact_reconciliation_request(attempt_id)
+            .unwrap_or(false)
+        {
+            delivery::inject_pause(&task_inner, "automatic_attention_before_resolve").await;
+            let target = match service.attention_target(&attempt_id.to_string()) {
+                Ok(target) => target,
+                Err(_) => continue,
+            };
+            let resolution = match service.automatic_attention_resolution(&target) {
+                Ok(Some(resolution)) => resolution,
+                Ok(None) | Err(_) => continue,
+            };
+            match resolve_selected(&task_inner, &service, &target, resolution, true).await {
+                Ok(result) => tracing::info!(
+                    %attempt_id,
+                    resolution = ?result.resolution,
+                    "exact-owned composer notification reconciled"
+                ),
+                Err(AttentionActionError::Evidence(_)) => {}
+                Err(AttentionActionError::Uncertain) => tracing::warn!(
+                    %attempt_id,
+                    "exact-owned composer reconciliation remains uncertain"
+                ),
+                Err(AttentionActionError::DiscardUnsupported) => tracing::warn!(
+                    %attempt_id,
+                    "exact-owned composer cannot be cleared by this manifest"
+                ),
+                Err(AttentionActionError::Store(error)) => {
+                    if error.notification_resolution_in_progress() {
+                        match service.park_exact_reconciliation_after_conflict(attempt_id) {
+                            Ok(true) => continue,
+                            Ok(false) | Err(_) => return,
+                        }
+                    }
+                    tracing::debug!(
+                        %attempt_id,
+                        %error,
+                        "exact-owned composer reconciliation did not start"
+                    );
+                }
+            }
+        }
+    });
+}
+
+async fn resolve_selected(
+    inner: &Arc<Inner>,
+    service: &Arc<MailboxService>,
+    target: &AttentionTarget,
+    mut resolution: NotificationResolution,
+    automatic: bool,
+) -> Result<AttentionResolveResult, AttentionActionError> {
     let start = service.begin_attention_resolution(target, resolution)?;
     let attempt_id = target.record.attempt_id;
 
@@ -108,7 +210,7 @@ pub(crate) async fn resolve(
         return Err(AttentionActionError::DiscardUnsupported);
     }
 
-    // Rebuild before recording the operator action.
+    // Rebuild before recording the resolution action.
     let second = assess(inner, service, target, false).await;
     if resolution_path(&second, resolution) != Some(path_kind) {
         service.cancel_attention_resolution(attempt_id)?;
@@ -120,15 +222,31 @@ pub(crate) async fn resolve(
         return Err(AttentionActionError::DiscardUnsupported);
     }
 
-    if let Err(error) = service.record_attention_resolution_intent(target, resolution) {
-        service.cancel_attention_resolution(attempt_id)?;
-        return Err(AttentionActionError::Store(error));
+    let intent = if automatic {
+        service.record_automatic_attention_resolution_intent(target)
+    } else {
+        service
+            .record_attention_resolution_intent(target, resolution)
+            .map(|_| resolution)
+    };
+    match intent {
+        Ok(selected) => resolution = selected,
+        Err(error) => {
+            service.cancel_attention_resolution(attempt_id)?;
+            return Err(AttentionActionError::Store(error));
+        }
     }
     delivery::inject_pause(inner, "attention_after_intent").await;
 
     // The journal append takes time. Rebuild the proof before the terminal
     // key rather than trusting an earlier capture.
     let final_assessment = assess(inner, service, target, false).await;
+    if resolution == NotificationResolution::Discard
+        && resolution_path(&final_assessment, resolution)
+            == Some(ResolutionPathKind::ComposerAlreadyClear)
+    {
+        return resolve_clear_composer_discard(inner, service, target).await;
+    }
     if resolution_path(&final_assessment, resolution) != Some(path_kind) {
         withdraw_pre_key(inner, service, target, resolution)?;
         return Err(AttentionActionError::Evidence(Box::new(
@@ -281,7 +399,7 @@ async fn resolve_clear_composer_discard(
 /// A prior key and its required consumption proof were durably recorded, but
 /// final composer proof was lost. The matching durable chain authorizes no
 /// second key. Fresh exact binding and a positively empty composer settle that
-/// same operator action; every other observation leaves the intent open.
+/// same resolution action; every other observation leaves the intent open.
 async fn reconcile_existing_intent(
     inner: &Arc<Inner>,
     service: &Arc<MailboxService>,

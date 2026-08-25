@@ -14,6 +14,9 @@ content-free wake for the recipient pane. The receipt keeps those facts
 separate: `accepted` covers the mailbox record, while `wake <state>` reports
 the current notification attempt.
 
+A socket claim may complete without any body appearing in the composer. The
+Messages view records the mailbox and wake outcomes separately.
+
 The recipient retrieves the body only by claiming the exact id named by the
 wake:
 

@@ -2133,12 +2133,8 @@ fn message_recipient_cell(
         "withdrawn".to_string()
     } else {
         match recipient.notification.resolution {
-            Some(cyclops_proto::NotificationResolution::Complete) => {
-                "operator submitted".to_string()
-            }
-            Some(cyclops_proto::NotificationResolution::Discard) => {
-                "operator discarded".to_string()
-            }
+            Some(cyclops_proto::NotificationResolution::Complete) => "wake submitted".to_string(),
+            Some(cyclops_proto::NotificationResolution::Discard) => "wake discarded".to_string(),
             None => match recipient.notification.quota_state {
                 Some(cyclops_proto::MessageQuotaState::Held) => {
                     "quota held · wait for quota reset · no automatic resume".to_string()
@@ -3261,7 +3257,7 @@ mod tests {
         resolved.notification.resolution = Some(cyclops_proto::NotificationResolution::Complete);
         assert_eq!(
             message_recipient_cell(&row.message_id, &resolved),
-            "reviewer [pending · 1 ahead; operator submitted att-00000000-0000-4000-8000-000000000001]"
+            "reviewer [pending · 1 ahead; wake submitted att-00000000-0000-4000-8000-000000000001]"
         );
         assert_eq!(
             serde_json::to_value(gating.notification.state).unwrap(),

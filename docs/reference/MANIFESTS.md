@@ -214,7 +214,7 @@ Wiring the hooks on the CLI side is [hooks.md](hooks.md).
 | `verify_pattern` | What must be visible for the paste to count as staged. `<message_id>` is replaced with this delivery's marker |
 | `safe_states` | Deliver only when the agent is in one of these |
 | `unsafe_states` | Never deliver in these |
-| `busy_behavior` | `"queues"` when text pasted mid-turn stages and runs as its own turn. Leave it out unless you measured it |
+| `busy_behavior` | Legacy measurement metadata. It never authorizes a write; omit it from new manifests |
 | `composer_prompt_regex` | Whole joined-capture row that starts the active composer, with a named `content` capture |
 | `composer_continuation_regex` | Whole joined-capture row for each later logical payload line, with a named `content` capture |
 

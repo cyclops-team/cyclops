@@ -501,10 +501,10 @@ fn no_attempt_reads_as_not_started_and_is_not_waiting() {
         WakeWord::Withdrawn,
         WakeWord::WithdrawnByOperator,
         WakeWord::NeedsAttention,
-        WakeWord::ActionUncertain,
+        WakeWord::ResolutionIncomplete,
         WakeWord::Cleared,
-        WakeWord::OperatorSubmitted,
-        WakeWord::OperatorDiscarded,
+        WakeWord::ResolvedSubmitted,
+        WakeWord::ResolvedDiscarded,
         WakeWord::Superseded,
     ]
     .iter()
@@ -528,10 +528,10 @@ fn no_attempt_reads_as_not_started_and_is_not_waiting() {
         WakeWord::Withdrawn,
         WakeWord::WithdrawnByOperator,
         WakeWord::NeedsAttention,
-        WakeWord::ActionUncertain,
+        WakeWord::ResolutionIncomplete,
         WakeWord::Cleared,
-        WakeWord::OperatorSubmitted,
-        WakeWord::OperatorDiscarded,
+        WakeWord::ResolvedSubmitted,
+        WakeWord::ResolvedDiscarded,
         WakeWord::Superseded,
     ]
     .iter()
@@ -777,10 +777,10 @@ fn state_is_words_and_symbols_and_the_two_records_stay_apart() {
         WakeWord::Withdrawn,
         WakeWord::WithdrawnByOperator,
         WakeWord::NeedsAttention,
-        WakeWord::ActionUncertain,
+        WakeWord::ResolutionIncomplete,
         WakeWord::Cleared,
-        WakeWord::OperatorSubmitted,
-        WakeWord::OperatorDiscarded,
+        WakeWord::ResolvedSubmitted,
+        WakeWord::ResolvedDiscarded,
         WakeWord::NotStarted,
         WakeWord::Superseded,
     ] {
@@ -800,10 +800,10 @@ fn state_is_words_and_symbols_and_the_two_records_stay_apart() {
         WakeWord::BlockedBeforeWrite,
         WakeWord::Withdrawn,
         WakeWord::WithdrawnByOperator,
-        WakeWord::ActionUncertain,
+        WakeWord::ResolutionIncomplete,
         WakeWord::Cleared,
-        WakeWord::OperatorSubmitted,
-        WakeWord::OperatorDiscarded,
+        WakeWord::ResolvedSubmitted,
+        WakeWord::ResolvedDiscarded,
     ] {
         let cell = w.cell().to_lowercase();
         for forbidden in ["delivered", "read", "complete", "done"] {

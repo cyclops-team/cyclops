@@ -407,7 +407,7 @@ The boot requeue above carries them across.
 - queued delivery starts within 1s of the turn-end state change (the worker
   wakes on the event, nothing polls).
 
-## Operator recovery
+## Guarded composer recovery
 
 `attention show` is read-only. `attention complete` and `attention discard`
 require the exact unresolved attempt, the original process and manifest
@@ -416,6 +416,12 @@ safe terminal state. Diff inputs can contain a direct fallback payload. They
 are returned only to the authenticated workspace administrator and never enter
 the journal or daemon log. Requeue and alarm clearance remain explicit
 operator actions and never create an automatic retry loop.
+
+A current format 2 `verify_failed` doorbell uses the same proof and settlement
+path automatically. Pending work selects one submit. An exact recipient claim
+ordered after the write selects one measured clear. The mailbox choice and
+durable intent share one lock. Human, trailing, changed, or unprovable content
+never reaches a terminal key.
 
 Before a terminal-key action, the daemon records one content-free resolution
 intent. If the terminal accepts the key, it records a separate content-free
@@ -440,9 +446,10 @@ different requested resolution remain unresolved.
 
 The legacy session-delivery path has no operator requeue verb. Standard mailbox
 notifications use the guarded `cyclops requeue <message-id>` recovery command.
-Requeue resolves every selected pending recipient before writing. An unresolved
+Requeue resolves every selected pending recipient before writing. A current
+format 2 `verify_failed` composer barrier must be resolved before requeue. Any
 post-write barrier with an absent binding or missing pane-root or
-foreground-leader generation makes the whole requeue conflict before any
+foreground-leader generation also makes the whole requeue conflict before any
 append.
 
 ## v1.1 amendments (M1 gate)

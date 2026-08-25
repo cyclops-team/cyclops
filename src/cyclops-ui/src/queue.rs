@@ -110,13 +110,13 @@ pub enum WakeWord {
     QuotaResetObserved,
     /// A terminal action has durable recovery state but no final outcome.
     /// Separate fields say whether the key and task start were observed.
-    ActionUncertain,
+    ResolutionIncomplete,
     Cleared,
-    /// The operator proved the staged payload and submitted it.
+    /// Guarded recovery proved the staged notification was submitted.
     /// This says nothing about task completion.
-    OperatorSubmitted,
-    /// The operator proved and removed the staged payload.
-    OperatorDiscarded,
+    ResolvedSubmitted,
+    /// Guarded recovery proved and removed the staged notification.
+    ResolvedDiscarded,
     /// No attempt has been started for this row at all. Distinct from
     /// `Queued`: nothing has entered the recipient FIFO.
     NotStarted,
@@ -162,10 +162,10 @@ impl WakeWord {
             WakeWord::NeedsAttention => "! needs attention",
             WakeWord::QuotaHeld => "! quota held",
             WakeWord::QuotaResetObserved => "! quota reset observed",
-            WakeWord::ActionUncertain => "! action uncertain",
+            WakeWord::ResolutionIncomplete => "! resolution open",
             WakeWord::Cleared => "x cleared",
-            WakeWord::OperatorSubmitted => "^ submitted",
-            WakeWord::OperatorDiscarded => "x discarded",
+            WakeWord::ResolvedSubmitted => "^ submitted",
+            WakeWord::ResolvedDiscarded => "x discarded",
             WakeWord::NotStarted => "- not started",
             WakeWord::Superseded => "~ superseded",
         }
@@ -185,10 +185,10 @@ impl WakeWord {
             WakeWord::NeedsAttention => "!attn",
             WakeWord::QuotaHeld => "!quota",
             WakeWord::QuotaResetObserved => "!reset",
-            WakeWord::ActionUncertain => "!uncertain",
+            WakeWord::ResolutionIncomplete => "!incomp",
             WakeWord::Cleared => "xclear",
-            WakeWord::OperatorSubmitted => "^opsub",
-            WakeWord::OperatorDiscarded => "xdiscd",
+            WakeWord::ResolvedSubmitted => "^settld",
+            WakeWord::ResolvedDiscarded => "xdiscd",
             WakeWord::NotStarted => "-nostart",
             WakeWord::Superseded => "~sprsd",
         }
@@ -282,7 +282,7 @@ impl QueueRow {
                 | WakeWord::BlockedBeforeWrite
                 | WakeWord::QuotaHeld
                 | WakeWord::QuotaResetObserved
-                | WakeWord::ActionUncertain
+                | WakeWord::ResolutionIncomplete
         )
     }
 }
@@ -758,7 +758,6 @@ pub(crate) fn render_with_status(
         ),
         width,
     ));
-    out.push(fit(&"-".repeat(width.min(160)), width));
 
     // Too narrow for a table, wide enough for the states. The two state
     // words are what an operator acts on, so the recipient and the
@@ -766,8 +765,17 @@ pub(crate) fn render_with_status(
     // its columns to the width and then cut the wake state off the end.
     let table = TableColumns::for_width(width);
     if table.is_none() {
-        let body_rows = height.saturating_sub(3 + usize::from(status.is_some()));
         let id_w = width - NARROW_FIXED;
+        out.push(fit(
+            &format!(
+                "  {} {} {}",
+                fit("id", id_w),
+                fit("mail", MAILBOX_SHORT_W),
+                fit("wake", WAKE_SHORT_W),
+            ),
+            width,
+        ));
+        let body_rows = height.saturating_sub(3 + usize::from(status.is_some()));
         for row in queue
             .visible()
             .skip(viewport_top(queue, body_rows))
@@ -808,6 +816,18 @@ pub(crate) fn render_with_status(
         wake_w,
         subject_w,
     } = table.expect("checked above");
+
+    out.push(fit(
+        &format!(
+            "  {} {} {} {} {}",
+            fit("id", id_w),
+            fit("recipient", who_w),
+            fit("mailbox", state_w),
+            fit("wake", wake_w),
+            fit("subject", subject_w),
+        ),
+        width,
+    ));
 
     let body_rows = height.saturating_sub(3 + usize::from(status.is_some()));
     let selected = queue.selected().map(|r| r.target.clone());

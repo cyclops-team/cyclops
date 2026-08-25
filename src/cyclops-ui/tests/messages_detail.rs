@@ -579,7 +579,7 @@ fn ambiguity_withholds_only_the_verbs_that_cannot_repeat() {
 
     // A success does the same: what landed cannot land again.
     let mut d = opened(&alarmed(), loaded());
-    d.done(Action::AttentionComplete, "operator submitted");
+    d.done(Action::AttentionComplete, "notification submitted");
     assert!(d.is_resolved());
     assert_eq!(d.allowed(), vec![Action::ClearAlarm]);
 
@@ -857,7 +857,7 @@ mod through_the_app {
     }
 
     /// An alarm whose terminal accepted its action but has no final outcome.
-    /// `wake_word` reads it as `ActionUncertain`, while fresh-action authority
+    /// `wake_word` reads it as `ResolutionIncomplete`, while fresh-action authority
     /// remains false and only matching no-key reconciliation is available.
     pub fn wire_row_uncertain(id: &str) -> MessageSnapshotRow {
         let mut row = wire_row_n(id, true, 7);
@@ -1141,7 +1141,7 @@ mod loop_journey {
 
         let sent = pump(&mut app, |request| {
             assert!(matches!(request, ActionRequest::AttentionComplete { .. }));
-            ActionOutcome::Done("operator submitted".into())
+            ActionOutcome::Done("notification submitted".into())
         });
         assert!(matches!(sent, ActionRequest::AttentionComplete { .. }));
 
@@ -1564,7 +1564,7 @@ mod seeded_disposition {
                 attempt(7),
                 Direction::Outbound,
                 MailboxWord::Claimed,
-                WakeWord::OperatorSubmitted,
+                WakeWord::ResolvedSubmitted,
             ),
             9,
         );
@@ -1578,7 +1578,7 @@ mod seeded_disposition {
                 attempt(7),
                 Direction::Outbound,
                 MailboxWord::Claimed,
-                WakeWord::OperatorDiscarded,
+                WakeWord::ResolvedDiscarded,
             ),
             9,
         );
@@ -1595,7 +1595,7 @@ mod seeded_disposition {
                 attempt(7),
                 Direction::Outbound,
                 MailboxWord::Claimed,
-                WakeWord::OperatorSubmitted,
+                WakeWord::ResolvedSubmitted,
             ),
             9,
         );
@@ -1640,7 +1640,7 @@ mod seeded_disposition {
                 attempt(7),
                 Direction::Outbound,
                 MailboxWord::Claimed,
-                WakeWord::ActionUncertain,
+                WakeWord::ResolutionIncomplete,
             );
             row.can_manage_attention = false;
             row.resolution_intent = Some(intent);
@@ -1674,7 +1674,7 @@ mod seeded_disposition {
             attempt(7),
             Direction::Outbound,
             MailboxWord::Claimed,
-            WakeWord::ActionUncertain,
+            WakeWord::ResolutionIncomplete,
         );
         row.can_manage_attention = false;
         row.resolution_intent = Some(NotificationResolution::Complete);
@@ -1737,7 +1737,7 @@ mod seeded_disposition {
             attempt(8),
             Direction::Outbound,
             MailboxWord::Claimed,
-            WakeWord::ActionUncertain,
+            WakeWord::ResolutionIncomplete,
         );
         row.can_manage_attention = false;
         row.resolution_intent = Some(NotificationResolution::Discard);
@@ -1776,7 +1776,7 @@ mod seeded_disposition {
             ),
             9,
         );
-        d.done(Action::AttentionComplete, "operator submitted");
+        d.done(Action::AttentionComplete, "notification submitted");
         assert!(d.is_resolved(), "this operator just resolved it");
         d.observe_snapshot(Some(&alarm_row(
             attempt(7),
@@ -1801,7 +1801,7 @@ fn an_uncertain_wire_row_sends_only_its_matching_reconciliation_rpc() {
     let row = app.queue.selected().expect("a row");
     assert_eq!(
         row.wake,
-        WakeWord::ActionUncertain,
+        WakeWord::ResolutionIncomplete,
         "the wire fixture did not produce an uncertain wake"
     );
     assert!(
@@ -2181,7 +2181,7 @@ mod audit {
         );
 
         // The answer still lands, so the detail records that it happened.
-        app.apply_action(token, ActionOutcome::Done("operator submitted".into()));
+        app.apply_action(token, ActionOutcome::Done("notification submitted".into()));
         assert!(
             app.detail.as_ref().unwrap().is_resolved(),
             "the answer was discarded and the attempt looks unresolved"

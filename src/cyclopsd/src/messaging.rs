@@ -305,6 +305,7 @@ pub(crate) fn schedule_route_changed(inner: &Arc<Inner>, session_idx: usize, pan
     if let Err(error) = schedule_recipient_after_route_evidence(inner, service, recipient) {
         error!(%recipient, %error, "cannot reopen blocked mailbox notification");
     }
+    crate::attention_resolution::schedule_exact_owned_reconciliation(inner, recipient);
 }
 
 /// Resume queued work after a route appears or a daemon restarts.
@@ -443,6 +444,7 @@ pub(crate) fn claim(
     if let Some(attempt_id) = withdrawn {
         inner.engine.cancel_notification(attempt_id);
     }
+    crate::attention_resolution::schedule_exact_owned_reconciliation(inner, claimant);
     if claimed_ack_timeout.is_none() {
         if let Err(error) = schedule_recipient(inner, service, claimant) {
             error!(%claimant, %error, "cannot schedule mailbox notification after claim");

@@ -292,11 +292,8 @@ verify_before_submit = true
 verify_pattern = ["<message_id>", "Pasted text"]
 safe_states = ["idle"]
 unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]
-busy_behavior = "queues"
-busy_note = """MEASURED: text pasted while a turn is running stages in the composer
-and is submitted as its own separate turn once the current turn ends. It is not
-merged into the running turn and is not lost. Gating on idle is therefore a
-correctness nicety for ordering, not a loss-prevention necessity, on this CLI."""
+# Claude 2.1.243 can queue input during ordinary generation but can interrupt
+# active tool flow. Working is therefore not a supported write-safe state.
 # MEASURED (fixtures claude_idle_2_1_221.txt, claude_pasted_chip_plain.txt):
 # below the composer Claude renders a box rule, a model status row, and
 # optional hint/mode rows. None of it is payload, so the terminal sentinel

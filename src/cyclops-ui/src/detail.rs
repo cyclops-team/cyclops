@@ -275,7 +275,7 @@ pub struct Detail {
 fn resolved_from(wake: WakeWord) -> bool {
     matches!(
         wake,
-        WakeWord::OperatorSubmitted | WakeWord::OperatorDiscarded
+        WakeWord::ResolvedSubmitted | WakeWord::ResolvedDiscarded
     )
 }
 
@@ -285,7 +285,7 @@ fn resolved_from(wake: WakeWord) -> bool {
 /// actions stay blocked. Matching durable intent and terminal acceptance
 /// may expose only exact same-action no-key reconciliation.
 fn terminal_unknown_from(wake: WakeWord) -> bool {
-    matches!(wake, WakeWord::ActionUncertain)
+    matches!(wake, WakeWord::ResolutionIncomplete)
 }
 
 impl Detail {
@@ -675,7 +675,7 @@ impl Detail {
     }
 
     fn reconciliation_action(&self) -> Option<Action> {
-        if self.wake != WakeWord::ActionUncertain || self.resolved {
+        if self.wake != WakeWord::ResolutionIncomplete || self.resolved {
             return None;
         }
         let intent = self.resolution_intent?;
@@ -958,7 +958,7 @@ pub(crate) fn render_with_status(
     out.push(fit(&format!("{id}  {}", detail.recipient_label()), width));
     out.push(fit(
         &format!(
-            "message {}  {}  {}  {}{}{}",
+            "message {}  mailbox {}  wake {}  {}{}{}",
             detail.message_id(),
             detail.mailbox().cell(),
             detail.wake().cell(),

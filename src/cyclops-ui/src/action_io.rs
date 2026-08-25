@@ -216,10 +216,22 @@ pub async fn perform(sock: &Path, request: ActionRequest) -> ActionOutcome {
             }
         }
         ActionRequest::AttentionComplete { attempt_id } => {
-            resolve(sock, "attention.complete", attempt_id, "operator submitted").await
+            resolve(
+                sock,
+                "attention.complete",
+                attempt_id,
+                "notification submitted",
+            )
+            .await
         }
         ActionRequest::AttentionDiscard { attempt_id } => {
-            resolve(sock, "attention.discard", attempt_id, "operator discarded").await
+            resolve(
+                sock,
+                "attention.discard",
+                attempt_id,
+                "notification discarded",
+            )
+            .await
         }
     }
 }

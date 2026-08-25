@@ -504,7 +504,7 @@ fn wake_states_map_without_losing_delivery_progress() {
     )));
     q.set_scope(Scope::All);
     let only = q.visible().next().unwrap();
-    assert_eq!(only.wake, WakeWord::ActionUncertain);
+    assert_eq!(only.wake, WakeWord::ResolutionIncomplete);
     assert!(only.needs_human());
     assert_eq!(only.attention, Some(attempt(10)));
     assert_eq!(
@@ -604,7 +604,7 @@ fn wake_states_map_without_losing_delivery_progress() {
         )],
     )));
     let only = q.visible().next().unwrap();
-    assert_eq!(only.wake, WakeWord::ActionUncertain);
+    assert_eq!(only.wake, WakeWord::ResolutionIncomplete);
     assert_eq!(
         only.resolution_intent,
         Some(cyclops_proto::NotificationResolution::Discard)
@@ -642,11 +642,11 @@ fn wake_states_map_without_losing_delivery_progress() {
     for (resolution, word) in [
         (
             cyclops_proto::NotificationResolution::Complete,
-            WakeWord::OperatorSubmitted,
+            WakeWord::ResolvedSubmitted,
         ),
         (
             cyclops_proto::NotificationResolution::Discard,
-            WakeWord::OperatorDiscarded,
+            WakeWord::ResolvedDiscarded,
         ),
     ] {
         let mut resolved = alarm(10, false);

@@ -234,5 +234,4 @@ verify_before_submit = true
 verify_pattern = ["<message_id>"]
 safe_states = ["idle"]
 unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]
-# busy_behavior is deliberately absent: what Cursor does with text pasted
-# mid-turn was not measured, and safe_states = ["idle"] already gates on it.
+# Mid-turn input behavior has not been measured. Working is not write-safe.

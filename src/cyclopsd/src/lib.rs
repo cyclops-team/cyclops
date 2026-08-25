@@ -385,7 +385,7 @@ pub(crate) struct SessionLink {
     mailbox_panes: HashMap<String, ObservedPane>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ComposerProjection {
     pub(crate) state: cyclops_proto::ComposerState,
     pub(crate) proof: cyclops_proto::ComposerProof,

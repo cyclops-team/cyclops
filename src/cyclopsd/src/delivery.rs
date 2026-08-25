@@ -4875,7 +4875,14 @@ async fn fail_attempt(
         if matches!(failure.boundary, WriteBoundary::AfterWrite) {
             if let Some(notification) = &handle.notification {
                 match notification.record_attention(notification_attention_cause(&failure.cause)) {
-                    Ok(_) => {}
+                    Ok(record) => {
+                        if record.needs_exact_owned_reconciliation() {
+                            crate::attention_resolution::schedule_exact_owned_reconciliation(
+                                inner,
+                                record.recipient,
+                            );
+                        }
+                    }
                     Err(NotificationAdapterError::TerminalConflict(_)) => return false,
                     Err(error) => {
                         // The workspace journal remains at its last
@@ -4943,7 +4950,7 @@ fn notify_attention(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>, cause: &st
     if !handle.owns_session_delivery_state() {
         // Workspace NotificationState and messages.changed own mailbox
         // attention. A delivery-scoped ping would point at the suppressed
-        // session projection and could never observe operator resolution.
+        // session projection and could never observe guarded resolution.
         return;
     }
     admin_notify(

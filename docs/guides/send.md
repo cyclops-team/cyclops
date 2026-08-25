@@ -37,6 +37,12 @@ The receipt reports two separate facts:
 A position such as `2 ahead` is the recipient mailbox's FIFO position. The
 daemon never bypasses an older pending message.
 
+The body and wake use different paths. Doorbell mode never pastes the message
+body. A terminal wake stages one `inbox claim` command, while a pull client may
+claim the same message through the authenticated socket without changing the
+composer. Both are valid. `cyclops messages` is the authoritative combined
+view of mailbox and wake state.
+
 ## Receive
 
 The preferred path is this content-free notification:
@@ -117,6 +123,7 @@ sent but before Claude paints output. A later exact recipient claim starts
 reconciliation. Cyclops clears the exact staged doorbell, or proves the same
 bound composer is clean, before moving the attempt to `notified` and clearing
 its alarm. The claim alone changes neither the alarm nor the FIFO barrier.
+Current exact `verify_failed` doorbells use the guarded automatic policy below.
 Other attention causes remain operator work.
 
 Reply using the message id so the daemon derives the recipient, thread, and
@@ -183,6 +190,13 @@ source.
 
 An ambiguous notification is never an invitation to resend blindly. Use its
 exact notification attempt id:
+
+Cyclops automatically handles a current format 2 `verify_failed` doorbell only
+when the complete durable binding and exact composer bytes still match. It
+submits once while the mailbox is pending. If the exact recipient claimed after
+the write, it clears that doorbell without submitting it. Durable intent blocks
+a second terminal key after an uncertain outcome. Human, trailing, changed, or
+unprovable content remains one visible attention item.
 
 ```bash
 cyclops attention show <attempt-id> --diff

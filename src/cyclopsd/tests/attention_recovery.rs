@@ -36,6 +36,32 @@ fn recovery_composer_pane() -> String {
     format!("python3 {} --swallow-once --clear-staged", faketui_path())
 }
 
+/// Keep automatic recovery from racing tests that exercise the explicit RPC.
+fn pause_automatic_reconciliation(rig: &mut Rig) -> tokio::sync::mpsc::UnboundedReceiver<()> {
+    let (entered_tx, entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let hold = Arc::new(tokio::sync::Semaphore::new(0));
+    rig.daemon.set_inject_pause(move |phase| {
+        let entered_tx = entered_tx.clone();
+        let hold = Arc::clone(&hold);
+        Box::pin(async move {
+            if phase == "automatic_attention_before_resolve" {
+                let _ = entered_tx.send(());
+                hold.acquire_owned().await.unwrap().forget();
+            }
+        })
+    });
+    entered_rx
+}
+
+async fn wait_for_automatic_reconciliation_pause(
+    entered: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+) {
+    tokio::time::timeout(Duration::from_secs(5), entered.recv())
+        .await
+        .expect("automatic reconciliation reached its pause")
+        .expect("automatic pause sender stayed open");
+}
+
 fn workspace_journal(rig: &Rig) -> PathBuf {
     fs::read_dir(rig.home.join("workspaces"))
         .expect("workspace directory")
@@ -91,6 +117,25 @@ async fn wait_for_empty_composer(rig: &Rig, pane: &str) -> String {
         assert!(
             Instant::now() < deadline,
             "composer did not become empty: {screen}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_resolution(rig: &Rig, attempt_id: &str, resolution: NotificationResolution) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let lines = workspace_lines(rig);
+        if resolution_lines(&lines, attempt_id).iter().any(|line| {
+            line.data
+                .as_ref()
+                .is_some_and(|data| data["resolution"] == serde_json::to_value(resolution).unwrap())
+        }) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "automatic {resolution:?} did not settle for {attempt_id}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -326,6 +371,11 @@ async fn exercise_resolution(resolution: NotificationResolution, direct_fallback
         )
         .await
     };
+    let mut automatic_pause = if direct_fallback {
+        None
+    } else {
+        Some(pause_automatic_reconciliation(&mut rig))
+    };
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
 
@@ -345,6 +395,9 @@ async fn exercise_resolution(resolution: NotificationResolution, direct_fallback
         .unwrap();
     let message_id = sent["msg_id"].as_str().expect("message id").to_string();
     let attempt_id = wait_for_alarm(&mut rig, &message_id).await;
+    if let Some(entered) = automatic_pause.as_mut() {
+        wait_for_automatic_reconciliation_pause(entered).await;
+    }
     let doorbell = cyclops_proto::render_doorbell_v2(
         &MessageId::new(&message_id).unwrap(),
         cyclops_proto::NotificationAttemptId::parse(&attempt_id).unwrap(),
@@ -594,6 +647,166 @@ async fn discard_clears_one_exact_staged_notification_and_replays_resolution() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn pending_exact_owned_doorbell_submits_once_without_operator_input() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+
+    let log_dir = cyclops_proto::scratch::scratch_dir(&format!(
+        "attention-automatic-complete-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&log_dir).unwrap();
+    let submit_log = log_dir.join("submits.txt");
+    let pane_command = format!(
+        "python3 {} --swallow-once --clear-staged --submit-log {}",
+        faketui_path(),
+        submit_log.display()
+    );
+    let mut rig = Rig::new(
+        "attention-automatic-complete",
+        &recovery_manifest(),
+        &pane_command,
+        "receipt_block_ms = 100\nack_timeout_ms = 300\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let hold = Arc::new(tokio::sync::Semaphore::new(0));
+    let paused = Arc::clone(&hold);
+    rig.daemon.set_inject_pause(move |phase| {
+        let entered_tx = entered_tx.clone();
+        let paused = Arc::clone(&paused);
+        Box::pin(async move {
+            if phase == "attention_after_action_accepted" {
+                let _ = entered_tx.send(());
+                paused.acquire_owned().await.unwrap().forget();
+            }
+        })
+    });
+
+    let sent = rig
+        .daemon
+        .msg_send(
+            "admin",
+            serde_json::from_value::<MsgSendParams>(json!({
+                "to": ["worker"],
+                "subject": "Automatic exact submit",
+                "body": "private body",
+                "client_key": "automatic-exact-submit"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    tokio::time::timeout(Duration::from_secs(10), entered_rx.recv())
+        .await
+        .expect("automatic Complete reached action acceptance")
+        .expect("pause sender stayed open");
+    let attempt_id = wait_for_alarm(&mut rig, &message_id).await;
+    rig.daemon
+        .claim_message_for_test("worker", &message_id)
+        .expect("exact post-action claim");
+    hold.add_permits(1);
+
+    wait_for_resolution(&rig, &attempt_id, NotificationResolution::Complete).await;
+    wait_for_empty_composer(&rig, &pane).await;
+    let lines = workspace_lines(&rig);
+    assert_eq!(intent_lines(&lines, &attempt_id).len(), 1);
+    assert_eq!(accepted_action_lines(&lines, &attempt_id).len(), 1);
+    assert_eq!(consumption_lines(&lines, &attempt_id).len(), 1);
+    assert_eq!(resolution_lines(&lines, &attempt_id).len(), 1);
+    assert_eq!(fs::read_to_string(&submit_log).unwrap().lines().count(), 2);
+
+    rig.shutdown().await;
+    fs::remove_dir_all(log_dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claimed_exact_owned_doorbell_clears_without_another_submit() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+
+    let log_dir = cyclops_proto::scratch::scratch_dir(&format!(
+        "attention-automatic-discard-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&log_dir).unwrap();
+    let submit_log = log_dir.join("submits.txt");
+    let pane_command = format!(
+        "python3 {} --swallow-once --clear-staged --submit-log {}",
+        faketui_path(),
+        submit_log.display()
+    );
+    let mut rig = Rig::new(
+        "attention-automatic-discard",
+        &recovery_manifest(),
+        &pane_command,
+        "receipt_block_ms = 100\nack_timeout_ms = 300\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let hold = Arc::new(tokio::sync::Semaphore::new(0));
+    let paused = Arc::clone(&hold);
+    rig.daemon.set_inject_pause(move |phase| {
+        let entered_tx = entered_tx.clone();
+        let paused = Arc::clone(&paused);
+        Box::pin(async move {
+            if phase == "automatic_attention_before_resolve" {
+                let _ = entered_tx.send(());
+                paused.acquire_owned().await.unwrap().forget();
+            }
+        })
+    });
+
+    let sent = rig
+        .daemon
+        .msg_send(
+            "admin",
+            serde_json::from_value::<MsgSendParams>(json!({
+                "to": ["worker"],
+                "subject": "Automatic exact clear",
+                "body": "private body",
+                "client_key": "automatic-exact-clear"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    tokio::time::timeout(Duration::from_secs(10), entered_rx.recv())
+        .await
+        .expect("automatic reconciliation was scheduled")
+        .expect("pause sender stayed open");
+    let attempt_id = wait_for_alarm(&mut rig, &message_id).await;
+    rig.daemon
+        .claim_message_for_test("worker", &message_id)
+        .expect("claim after the write boundary");
+    hold.add_permits(32);
+
+    wait_for_resolution(&rig, &attempt_id, NotificationResolution::Discard).await;
+    wait_for_empty_composer(&rig, &pane).await;
+    let lines = workspace_lines(&rig);
+    assert_eq!(intent_lines(&lines, &attempt_id).len(), 1);
+    assert_eq!(accepted_action_lines(&lines, &attempt_id).len(), 1);
+    assert!(consumption_lines(&lines, &attempt_id).is_empty());
+    assert_eq!(resolution_lines(&lines, &attempt_id).len(), 1);
+    assert_eq!(fs::read_to_string(&submit_log).unwrap().lines().count(), 1);
+
+    rig.shutdown().await;
+    fs::remove_dir_all(log_dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn direct_fallback_complete_submits_the_exact_canonical_payload() {
     exercise_resolution(NotificationResolution::Complete, true).await;
 }
@@ -623,6 +836,7 @@ async fn admin_diff_exposes_only_the_content_free_doorbell() {
     let recipient = rig.pane_ids_session(1).await[0].clone();
     rig.label(&sender, "sender").await;
     rig.label(&recipient, "recipient").await;
+    let mut automatic_pause = pause_automatic_reconciliation(&mut rig);
 
     let sent = rig
         .daemon
@@ -640,6 +854,7 @@ async fn admin_diff_exposes_only_the_content_free_doorbell() {
         .unwrap();
     let message_id = sent["msg_id"].as_str().expect("message id").to_string();
     let attempt_id = wait_for_alarm(&mut rig, &message_id).await;
+    wait_for_automatic_reconciliation_pause(&mut automatic_pause).await;
 
     let shown = rig
         .ctl
@@ -833,6 +1048,7 @@ async fn diff_returns_only_the_trailer_bound_composer_candidate() {
         "receipt_block_ms = 100\nack_timeout_ms = 300\n",
     )
     .await;
+    let mut automatic_pause = pause_automatic_reconciliation(&mut rig);
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
     let sent = rig
@@ -851,6 +1067,7 @@ async fn diff_returns_only_the_trailer_bound_composer_candidate() {
         .unwrap();
     let message_id = sent["msg_id"].as_str().unwrap().to_string();
     let attempt_id = wait_for_alarm(&mut rig, &message_id).await;
+    wait_for_automatic_reconciliation_pause(&mut automatic_pause).await;
     rig.tmux
         .run_ok(&["send-keys", "-t", &pane, "-l", "trailing human input"]);
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -912,6 +1129,7 @@ async fn exercise_resolution_crash_window(
         "receipt_block_ms = 100\nack_timeout_ms = 300\n",
     )
     .await;
+    let mut automatic_pause = pause_automatic_reconciliation(&mut rig);
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
     let sent = rig
@@ -930,6 +1148,7 @@ async fn exercise_resolution_crash_window(
         .unwrap();
     let message_id = sent["msg_id"].as_str().unwrap().to_string();
     let attempt_id = wait_for_alarm(&mut rig, &message_id).await;
+    wait_for_automatic_reconciliation_pause(&mut automatic_pause).await;
 
     let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
     let hold = Arc::new(tokio::sync::Semaphore::new(0));
@@ -1188,6 +1407,7 @@ async fn exercise_no_key_discard_crash(phase: &'static str, resolved_before_cras
         "receipt_block_ms = 100\nack_timeout_ms = 300\n",
     )
     .await;
+    let mut automatic_pause = pause_automatic_reconciliation(&mut rig);
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
     let sent = rig
@@ -1206,6 +1426,7 @@ async fn exercise_no_key_discard_crash(phase: &'static str, resolved_before_cras
         .unwrap();
     let message_id = sent["msg_id"].as_str().unwrap().to_string();
     let attempt_id = wait_for_alarm(&mut rig, &message_id).await;
+    wait_for_automatic_reconciliation_pause(&mut automatic_pause).await;
     assert_eq!(fs::read_to_string(&submit_log).unwrap().lines().count(), 1);
 
     // The operator independently cleared the exact staged notification. This
@@ -1311,6 +1532,7 @@ async fn swallowed_complete_stays_uncertain_and_reconciliation_sends_no_second_k
         "receipt_block_ms = 100\nack_timeout_ms = 300\n",
     )
     .await;
+    let mut automatic_pause = pause_automatic_reconciliation(&mut rig);
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
     let sent = rig
@@ -1329,6 +1551,7 @@ async fn swallowed_complete_stays_uncertain_and_reconciliation_sends_no_second_k
         .unwrap();
     let message_id = sent["msg_id"].as_str().unwrap().to_string();
     let attempt_id = wait_for_alarm(&mut rig, &message_id).await;
+    wait_for_automatic_reconciliation_pause(&mut automatic_pause).await;
     let expected = cyclops_proto::render_doorbell_v2(
         &MessageId::new(&message_id).unwrap(),
         cyclops_proto::NotificationAttemptId::parse(&attempt_id).unwrap(),
@@ -1462,6 +1685,7 @@ async fn process_replacement_after_intent_refuses_the_terminal_key() {
         "receipt_block_ms = 100\nack_timeout_ms = 300\n",
     )
     .await;
+    let mut automatic_pause = pause_automatic_reconciliation(&mut rig);
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
     let sent = rig
@@ -1480,6 +1704,7 @@ async fn process_replacement_after_intent_refuses_the_terminal_key() {
         .unwrap();
     let message_id = sent["msg_id"].as_str().unwrap().to_string();
     let attempt_id = wait_for_alarm(&mut rig, &message_id).await;
+    wait_for_automatic_reconciliation_pause(&mut automatic_pause).await;
 
     let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
     let hold = Arc::new(tokio::sync::Semaphore::new(0));
@@ -1584,6 +1809,7 @@ async fn fresh_blocked_capture_refuses_the_terminal_key() {
         "receipt_block_ms = 100\nack_timeout_ms = 300\n",
     )
     .await;
+    let mut automatic_pause = pause_automatic_reconciliation(&mut rig);
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
     let sent = rig
@@ -1602,6 +1828,7 @@ async fn fresh_blocked_capture_refuses_the_terminal_key() {
         .unwrap();
     let message_id = sent["msg_id"].as_str().unwrap().to_string();
     let attempt_id = wait_for_alarm(&mut rig, &message_id).await;
+    wait_for_automatic_reconciliation_pause(&mut automatic_pause).await;
 
     let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
     let hold = Arc::new(tokio::sync::Semaphore::new(0));

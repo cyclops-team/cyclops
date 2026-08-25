@@ -37,6 +37,11 @@ daemon FIFO order stays intact inside each group. A row keeps the exact
 message, recipient, and notification attempt it represents, so a live
 update cannot move an action to a neighboring row.
 
+The `mailbox` column describes the durable body state. The `wake` column
+describes only the one-line terminal notification. `claimed` and `staged` can
+coexist when the recipient fetched the body while the exact doorbell still
+awaits reconciliation. Resting rows never contain message bodies.
+
 Messages has four scopes: Work, All, Inbox, and Outbound. Press `s` to
 cycle them. Work is the daemon's answer about what needs this operator,
 not a client-side guess. Enter opens the selected row in a full-width

@@ -349,6 +349,15 @@ The claim leaves that state and its FIFO barrier unchanged until Cyclops clears
 the exact staged doorbell or proves the same bound composer is clean. One
 dedicated fact then moves the attempt to `notified` and retires the barrier
 atomically. It does not settle other attention causes or prove task completion.
+
+A current format 2 `verify_failed` doorbell with a complete binding enters
+automatic exact-owned recovery only when the current normalized composer is an
+exact match and terminal action is safe. A pending mailbox selects `complete`
+and one submit key. An exact recipient claim ordered after `writing` selects
+`discard` and the manifest's measured clear sequence. Selection and durable
+intent are one mailbox transaction, so a concurrent claim lands wholly before
+or after that boundary. Any changed binding, human or trailing text, modal, or
+unprovable content leaves one attention item and sends no key.
 Admin has no pane route, so an accepted admin message reports `not_started` and
 remains in the durable admin inbox without a notification attempt.
 
@@ -397,9 +406,9 @@ generation. The exact durable recipient claim must follow that attempt's
 `recipient_claimed_composer_clear`. It sends no terminal key, clears no bytes,
 leaves the mailbox `claimed` and preserves the historical notification state,
 and proves retrieval only. Legacy direct payloads do not qualify.
-Foreground leader changes do not change composer ownership; operator terminal
+Foreground leader changes do not change composer ownership; guarded terminal
 actions still require the exact recorded leader. Agent-generation or manifest
-replacement, explicit operator resolution, and proven physical pane loss are
+replacement, guarded resolution, and proven physical pane loss are
 the other retirement paths. Session-local pane removal alone is not pane loss.
 
 ### mailbox and notification control
@@ -463,8 +472,8 @@ returned along with a bounded recent settled tail controlled by
 `recent_settled` (default 20, maximum 100). Counts cover every visible message,
 including settled rows outside that tail. Rows carry per-recipient mailbox and
 FIFO state, current notification attempt and cause, attention clearance,
-operator resolution, pre-key intent, accepted-action and consumption state,
-and a workspace sequence
+guarded resolution, pre-key intent, accepted-action and consumption state, and
+a workspace sequence
 watermark. A notification resolution is reported separately as `complete` or
 `discard`; a resolved attempt is not open attention. Direction is relative to
 the caller: `inbound`, `outbound`, `self_addressed`, or administrator-only
@@ -526,9 +535,10 @@ Broadcast `*` addresses adopted agent panes only.
 
 `msg.requeue` takes one `message_id`. `alarm.preview` takes `older_than_ms`.
 Before minting fresh attempts, requeue resolves the complete selected recipient
-set. If any selected attempt still owns a post-write composer barrier whose
-binding is absent or lacks pane-root or foreground-leader generation, the whole
-request returns `conflict` and appends nothing. The existing attempt remains
+set. A current format 2 `verify_failed` composer barrier must be resolved first.
+If any selected attempt owns such an exact barrier, or a post-write barrier
+whose binding is absent or lacks pane-root or foreground-leader generation, the
+whole request returns `conflict` and appends nothing. The existing attempt remains
 visible and claimable.
 `alarm.clear` takes a non-empty list of explicit alarm ids; there is no
 clear-all or age-selected daemon mutation. The human CLI implements
@@ -950,7 +960,7 @@ jq -c 'select(.id == "m-914b34")' \
 ```
 
 This journal holds immutable message bodies, mailbox mutations, notification
-transitions, composer-barrier retirement facts, and operator recovery facts.
+transitions, composer-barrier retirement facts, and guarded recovery facts.
 Barrier retirement records one of exact lifecycle reconciliation, clean
 receipt-bearing composer observation, recipient-claimed legacy clean-composer
 reconciliation, occupant replacement, or proven physical pane loss.

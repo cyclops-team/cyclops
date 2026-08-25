@@ -511,6 +511,24 @@ pub struct NotificationRecord {
 }
 
 impl NotificationRecord {
+    /// Whether this exact failed wake may enter automatic composer recovery.
+    ///
+    /// The terminal still has to prove the complete binding, exact rendered
+    /// doorbell, and action-safe composer before it may send a key. This
+    /// predicate only selects the durable attempt class that supports that
+    /// proof.
+    pub fn needs_exact_owned_reconciliation(&self) -> bool {
+        self.state == NotificationState::AttentionRequired
+            && self.cause == Some(NotificationAttentionCause::VerifyFailed)
+            && self.transport == NotificationTransport::Doorbell
+            && self.doorbell_format == Some(DOORBELL_FORMAT_ATTEMPT_CLAIM)
+            && self.binding.as_ref().is_some_and(|binding| {
+                binding.recipient == self.recipient
+                    && binding.pane_root.is_some()
+                    && binding.leader.is_some()
+            })
+    }
+
     /// Whether a late claim may enter exact ACK-timeout reconciliation.
     ///
     /// This predicate does not settle the notification. The daemon must still
@@ -614,7 +632,7 @@ pub enum NotificationFact {
         recipient: RecipientKey,
         operator: RecipientKey,
     },
-    /// Durable intent recorded before an operator terminal action.
+    /// Durable intent recorded before a terminal resolution action.
     ///
     /// Intent alone does not prove that a terminal key was accepted. A later
     /// request must not send a second key or reconcile from composer state
@@ -1107,6 +1125,15 @@ mod tests {
         let mut invalid = record.clone();
         invalid.cause = Some(NotificationAttentionCause::VerifyFailed);
         assert!(!invalid.needs_claimed_ack_timeout_reconciliation());
+        assert!(invalid.needs_exact_owned_reconciliation());
+
+        let mut invalid_exact = invalid.clone();
+        invalid_exact.doorbell_format = Some(DOORBELL_FORMAT_COMPACT_CLAIM);
+        assert!(!invalid_exact.needs_exact_owned_reconciliation());
+
+        let mut invalid_exact = invalid.clone();
+        invalid_exact.binding.as_mut().unwrap().pane_root = None;
+        assert!(!invalid_exact.needs_exact_owned_reconciliation());
 
         let mut invalid = record.clone();
         invalid.doorbell_format = Some(DOORBELL_FORMAT_COMPACT_CLAIM);

@@ -921,7 +921,7 @@ pub struct MessageNotificationSummary {
     /// Present only for attention-required attempts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention_cleared: Option<bool>,
-    /// Explicit operator resolution of this exact attention attempt.
+    /// Durable resolution of this exact attention attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution: Option<crate::notification::NotificationResolution>,
     /// Pre-key terminal action intent without a final outcome.

@@ -321,10 +321,10 @@ fn wake_word(n: &cyclops_proto::MessageNotificationSummary) -> WakeWord {
     }
     match n.resolution {
         Some(cyclops_proto::NotificationResolution::Complete) => {
-            return WakeWord::OperatorSubmitted;
+            return WakeWord::ResolvedSubmitted;
         }
         Some(cyclops_proto::NotificationResolution::Discard) => {
-            return WakeWord::OperatorDiscarded;
+            return WakeWord::ResolvedDiscarded;
         }
         None => {}
     }
@@ -342,7 +342,7 @@ fn wake_word(n: &cyclops_proto::MessageNotificationSummary) -> WakeWord {
                 || n.resolution_consumption_observed.is_some())
                 && n.resolution.is_none()
             {
-                WakeWord::ActionUncertain
+                WakeWord::ResolutionIncomplete
             } else if n.attention_cleared == Some(true) {
                 WakeWord::Cleared
             } else {
