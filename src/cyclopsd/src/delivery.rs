@@ -7399,6 +7399,16 @@ fn exact_composer_content_for_state(
         };
         content.push(line.to_string());
     }
+    // tmux 3.6a can retain right-padding cells in a joined capture. Normalize
+    // them only after a manifest rule has classified one prompt row as clean.
+    // Occupied composer rows keep every byte for exact ownership checks.
+    if state == AgentState::Idle
+        && required_semantic == Some(ComposerSemantic::Clean)
+        && content.len() == 1
+        && content[0].bytes().all(|byte| byte == b' ')
+    {
+        content[0].clear();
+    }
     ComposerContentProof::Visible(content.join("\n"))
 }
 
@@ -12393,7 +12403,7 @@ mod composer_content_proof {
     fn claude_2_1_243_fable_empty_composer_is_visible_to_recovery() {
         let capture = concat!(
             "\u{1b}[38;5;244m────────────────────────────────────────────────\n",
-            "\u{1b}[39m❯\u{a0}\n",
+            "\u{1b}[39m❯\u{a0}                                                \n",
             "\u{1b}[38;5;244m────────────────────────────────────────────────\n",
             "\u{1b}[39m  \u{1b}[38;5;174mFable 5\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;216mxhigh\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;230m~/projects/agentic_dev/clops\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;72mCtx: 58%\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;181m5h: 94%\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;181m7d: 75%\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;180m1000K window\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;180m423K used\n",
             "\u{1b}[39m  \u{1b}[38;5;210m⏵⏵ bypass permissions on\u{1b}[38;5;246m (shift+tab to cycle) · ← 1 agent",
