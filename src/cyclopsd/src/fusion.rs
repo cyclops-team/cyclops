@@ -1052,7 +1052,10 @@ fn reconcile_candidate_lifecycle_with_evidence(
                 .lock()
                 .expect("hook lifecycle lock")
                 .has_other_start_for(pane, agent, manifest, &end.turn);
-        if positive_visual_working(inner, manifest, detection) && working_belongs_to_end {
+        if positive_visual_working(inner, manifest, detection)
+            && working_belongs_to_end
+            && observed_ms >= end.ready_at_ms
+        {
             // A Stop hook reports before Claude has combined every concurrent
             // Stop decision. Later Working proves at least one sibling kept
             // this exact turn alive. A candidate for another turn makes the
@@ -2006,8 +2009,10 @@ pub(crate) fn resolve_staged_hold(
 /// would be a transition that never happened, so this is its own event
 /// and it names no ledger line.
 ///
-/// `prior` is None on first sight, which is not a change: nothing was
-/// waiting on an answer that did not exist yet.
+/// First sight is not a public readiness change. It still reconciles the
+/// route because process replacement can retire the prior detection before a
+/// delivery records its durable pre-write block. The first clean detection is
+/// then the only positive edge available to reopen that exact attempt.
 fn wake_readiness(
     inner: &Arc<Inner>,
     session_idx: usize,
@@ -2016,7 +2021,8 @@ fn wake_readiness(
     det: &Detection,
 ) {
     let now = (det.write_ready, det.write_block.clone());
-    if prior.is_some_and(|p| p != now) {
+    let decision = readiness_wake_decision(prior.as_ref(), &now);
+    if decision.emit_public {
         inner.emit(
             "readiness",
             serde_json::json!({
@@ -2027,7 +2033,26 @@ fn wake_readiness(
             }),
             None,
         );
+    }
+    if decision.reconcile_route {
         crate::messaging::schedule_route_changed(inner, session_idx, pane_id);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReadinessWakeDecision {
+    emit_public: bool,
+    reconcile_route: bool,
+}
+
+fn readiness_wake_decision(
+    prior: Option<&(bool, Option<String>)>,
+    now: &(bool, Option<String>),
+) -> ReadinessWakeDecision {
+    let changed = prior.is_some_and(|prior| prior != now);
+    ReadinessWakeDecision {
+        emit_public: changed,
+        reconcile_route: prior.is_none() || changed,
     }
 }
 
@@ -3997,6 +4022,35 @@ line_regex = ['^FIXPROMPT']
     }
 
     #[test]
+    fn first_readiness_sight_reconciles_without_publishing_a_transition() {
+        let ready = (true, None);
+        assert_eq!(
+            readiness_wake_decision(None, &ready),
+            ReadinessWakeDecision {
+                emit_public: false,
+                reconcile_route: true,
+            }
+        );
+
+        assert_eq!(
+            readiness_wake_decision(Some(&ready), &ready),
+            ReadinessWakeDecision {
+                emit_public: false,
+                reconcile_route: false,
+            }
+        );
+
+        let held = (false, Some("composer_hold".to_string()));
+        assert_eq!(
+            readiness_wake_decision(Some(&held), &ready),
+            ReadinessWakeDecision {
+                emit_public: true,
+                reconcile_route: true,
+            }
+        );
+    }
+
+    #[test]
     fn quota_reset_store_probe_runs_once_per_positive_screen_edge() {
         let clean = quota_detection(Sensor::Screen, AgentState::Idle);
         let quota = quota_detection(Sensor::Screen, AgentState::BlockedQuota);
@@ -5067,6 +5121,73 @@ contains = ["working"]
             &turn,
         ));
         assert!(inner.hook_readings.lock().unwrap().get(&pane).is_none());
+    }
+
+    #[test]
+    fn working_retires_a_candidate_stop_only_after_its_settle_boundary() {
+        let inner = inner_with(BTreeMap::new());
+        let pane = pane();
+        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+        let turn = turnkey::TurnKey::for_test(&["session", "prompt"]);
+        let working = lifecycle_detection(Sensor::Title, AgentState::Working);
+        inner.hook_readings.lock().unwrap().insert(
+            pane.clone(),
+            HookEntry::turn_started(
+                agent,
+                Some("claude".into()),
+                working.readings[0].clone(),
+                turn.clone(),
+            ),
+        );
+        let end = inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .record_end(&pane, agent, "claude", turn, "Stop", 10, 100);
+
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+        reconcile_candidate_lifecycle_with_evidence(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &working,
+            false,
+            20,
+            20,
+            LifecycleObservation::Stable,
+        );
+        assert!(inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .end_is_current(&pane, &end));
+
+        inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .note_visual_change(&pane);
+        reconcile_candidate_lifecycle_with_evidence(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &working,
+            false,
+            110,
+            110,
+            LifecycleObservation::Stable,
+        );
+        assert!(!inner
+            .hook_lifecycle
+            .lock()
+            .unwrap()
+            .end_is_current(&pane, &end));
     }
 
     #[test]

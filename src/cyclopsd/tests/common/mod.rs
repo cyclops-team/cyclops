@@ -193,7 +193,9 @@ pub const HOOK_MANIFEST: &str = r#"
 [agent]
 id = "fix"
 display_name = "Hook fixture"
-process_names = ["python3", "python", "Python", "cat", "sh", "bash", "dash"]
+# Keep the GitHub Actions driver out of the fixture's vendor set. Otherwise
+# socket requests from the test process look like an agent outside the rig.
+process_names = ["python3", "python", "Python", "cat", "sh", "dash"]
 
 [hooks]
 turn_start = "UserPromptSubmit"

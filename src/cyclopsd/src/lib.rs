@@ -2086,8 +2086,9 @@ pub(crate) async fn paint_chrome(inner: &Arc<Inner>, session_idx: usize, pane_id
 }
 
 /// Repaint the state half of an adopted pane's border. Called from the one
-/// place a fused state change is recorded (fusion::recompute_pane), so a
-/// border can never disagree with the row `cyclops list` prints.
+/// place a fused state change is recorded
+/// (fusion::recompute_pane_with_evidence), so a border can never disagree
+/// with the row `cyclops list` prints.
 pub(crate) async fn repaint_chrome(
     inner: &Arc<Inner>,
     session_idx: usize,

@@ -5681,17 +5681,26 @@ impl MessageStore {
             .map(inbox_message)
             .transpose()?
             .ok_or_else(|| MailboxError::MessageNotFound(message_id.clone()))?;
+        let prior_claim_seq = self
+            .projection
+            .claim_sequences
+            .get(&(entry.recipient, message_id.clone()))
+            .copied();
+        // A repeat claim preserves the consumed attempt only when the claim
+        // fact itself moved that attempt to Notified. A later screen or hook
+        // receipt has another sequence and must not be attributed to claim.
         let consumed_doorbell_attempt = self
             .projection
             .notification(entry.recipient, &message_id)
             .filter(|record| {
                 record.transport == NotificationTransport::Doorbell
-                    && matches!(
+                    && (matches!(
                         record.state,
                         NotificationState::Staged
                             | NotificationState::Submitting
                             | NotificationState::Submitted
-                    )
+                    ) || (record.state == NotificationState::Notified
+                        && prior_claim_seq == Some(record.updated_seq)))
             })
             .map(|record| record.attempt_id);
         let claimed_ack_timeout_attempt = self
@@ -6853,13 +6862,19 @@ mod tests {
         let scratch = StoreScratch::new("change-events");
         let root = scratch.root();
         let journal = Path::new("workspaces/current/messages.ndjson");
-        let (workspace, admin, bob, _) = test_context();
+        let (workspace, admin, bob, carol) = test_context();
         let directory = MailboxDirectory::new(
             workspace,
-            [MailboxIdentity {
-                key: bob,
-                label: "reviewer".into(),
-            }],
+            [
+                MailboxIdentity {
+                    key: bob,
+                    label: "reviewer".into(),
+                },
+                MailboxIdentity {
+                    key: carol,
+                    label: "observer".into(),
+                },
+            ],
         )
         .unwrap();
         let store = MessageStore::open(&root, journal, workspace, "boot").unwrap();
@@ -7042,7 +7057,7 @@ mod tests {
         let fourth = service
             .send(
                 service.admin(),
-                mailbox_send("reviewer", "Late claim", "Body"),
+                mailbox_send("observer", "Late claim", "Body"),
             )
             .unwrap();
         next_change(
@@ -7053,12 +7068,12 @@ mod tests {
                 MessagesChangedArea::Mailboxes,
             ],
         );
-        let queued = service.prepare_oldest_notification(bob).unwrap().unwrap();
+        let queued = service.prepare_oldest_notification(carol).unwrap().unwrap();
         next_change(&mut events, 24, &[MessagesChangedArea::Notifications]);
         let context = crate::notification_adapter::NotificationContext::new_with_changes(
             service.store_handle(),
             fourth.message_id.clone(),
-            bob,
+            carol,
             queued.attempt_id,
             service.change_publisher(),
         );
@@ -7066,9 +7081,9 @@ mod tests {
         next_change(&mut events, 25, &[MessagesChangedArea::Notifications]);
         context
             .record_writing(
-                notification_binding(bob).pane_root.unwrap(),
-                notification_binding(bob).leader.unwrap(),
-                notification_binding(bob).agent,
+                notification_binding(carol).pane_root.unwrap(),
+                notification_binding(carol).leader.unwrap(),
+                notification_binding(carol).agent,
                 "codex",
                 NotificationTransport::Doorbell,
                 Some(DOORBELL_FORMAT_ATTEMPT_CLAIM),
@@ -7092,7 +7107,7 @@ mod tests {
                 MessagesChangedArea::Attention,
             ],
         );
-        let outcome = service.claim(bob, fourth.message_id.clone()).unwrap();
+        let outcome = service.claim(carol, fourth.message_id.clone()).unwrap();
         assert!(matches!(
             outcome,
             ClaimOutcome::Claimed {
@@ -7105,7 +7120,7 @@ mod tests {
             let store = service.store().unwrap();
             let record = store
                 .projection()
-                .notification(bob, &fourth.message_id)
+                .notification(carol, &fourth.message_id)
                 .unwrap();
             assert_eq!(record.state, NotificationState::AttentionRequired);
             assert_eq!(record.cause, Some(NotificationAttentionCause::AckTimeout));
@@ -7122,7 +7137,7 @@ mod tests {
         let store = service.store().unwrap();
         let record = store
             .projection()
-            .notification(bob, &fourth.message_id)
+            .notification(carol, &fourth.message_id)
             .unwrap();
         assert_eq!(record.state, NotificationState::Notified);
         assert_eq!(record.cause, None);

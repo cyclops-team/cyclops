@@ -161,7 +161,7 @@ fired by one named function in the daemon.
 | Edge | What happened | Fired by |
 |---|---|---|
 | adoption | you named the pane | `adopt_pane` |
-| a fused state change | the agent went idle, working, or blocked | `fusion::recompute_pane` |
+| a fused state change | the agent went idle, working, or blocked | `fusion::recompute_pane_with_evidence` |
 | a clear | you took the name back | `unadopt_pane` |
 | a session attach | the daemon connected to the session | `reconcile_adoptions` |
 | a window move | the pane was joined or broken into another window | `move_chrome` |

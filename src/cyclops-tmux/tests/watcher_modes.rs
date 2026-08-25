@@ -86,6 +86,9 @@ async fn respawn_emits_the_replacement_process_generation() {
         return;
     };
     srv.new_session("rp");
+    // Isolate the process-generation edge. A pending automatic rename can
+    // otherwise join the respawn event on newer tmux builds.
+    srv.tmux_ok(&["set-option", "-g", "automatic-rename", "off"]);
     srv.tmux_ok(&["respawn-pane", "-k", "-t", "%0", "sleep 60"]);
 
     let w = SessionWatcher::connect(srv.config("rp"))
