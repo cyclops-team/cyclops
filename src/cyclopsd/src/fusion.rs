@@ -312,6 +312,7 @@ impl LifecycleObservation {
             | "pane.read"
             | "gate"
             | "pre_paste"
+            | "prewrite_block_reconcile"
             | "receipt_checkpoint"
             | "candidate_end_settled"
             | "candidate_visual_end_settled"
@@ -7598,7 +7599,13 @@ regex = ['^IDLE']
 
     #[test]
     fn explicit_full_screen_decisions_are_stable_lifecycle_observations() {
-        for cause in ["status", "pane.read", "gate", "pre_paste"] {
+        for cause in [
+            "status",
+            "pane.read",
+            "gate",
+            "pre_paste",
+            "prewrite_block_reconcile",
+        ] {
             assert_eq!(
                 LifecycleObservation::from_cause(cause),
                 LifecycleObservation::Stable

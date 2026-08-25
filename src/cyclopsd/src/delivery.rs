@@ -2923,7 +2923,7 @@ fn persist_worker_failed_prewrite(
 /// A successful or stale append lets the worker retire normally. A storage
 /// failure faults the worker, so its current handle remains ahead of every
 /// later notification for this recipient.
-fn persist_notification_prewrite_block(
+async fn persist_notification_prewrite_block(
     inner: &Arc<Inner>,
     worker: &Worker,
     handle: &DeliveryHandle,
@@ -2946,6 +2946,18 @@ fn persist_notification_prewrite_block(
         // edge is not lost. The mailbox projection enforces the one-reopen
         // limit and exact binding checks.
         crate::messaging::schedule_route_changed(inner, handle.session_idx, &handle.pane_id);
+        if let Some(watcher) = inner.watcher_of(handle.session_idx) {
+            fusion::recompute_pane(
+                inner,
+                handle.session_idx,
+                &watcher,
+                &handle.pane_id,
+                true,
+                "prewrite_block_reconcile",
+            )
+            .await;
+            crate::messaging::schedule_route_changed(inner, handle.session_idx, &handle.pane_id);
+        }
     }
 }
 
@@ -3074,7 +3086,7 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
                 {
                     inject_pause(inner, "post_claimed_notification_refusal").await;
                     if !fault_notification_worker(worker, &failure) {
-                        let _ = fail_attempt(inner, worker, handle, &failure);
+                        let _ = fail_attempt(inner, worker, handle, &failure).await;
                     }
                 }
                 return;
@@ -3137,7 +3149,8 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
                     handle,
                     cause,
                     Some(observation),
-                );
+                )
+                .await;
                 return;
             }
             GateOutcome::Deferred { cause } => {
@@ -3241,7 +3254,8 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
                                             handle,
                                             NotificationPreWriteCause::WriteReadinessChanged,
                                             None,
-                                        );
+                                        )
+                                        .await;
                                         return;
                                     }
                                     // Legacy direct delivery has no durable
@@ -3252,7 +3266,7 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
                             }
                             continue;
                         }
-                        if !fail_attempt(inner, worker, handle, &failure) {
+                        if !fail_attempt(inner, worker, handle, &failure).await {
                             return;
                         }
                         // Bounded retry: back through the gate.
@@ -4714,7 +4728,7 @@ fn workspace_prewrite_failure_is_deferred(
 /// consume the configured retry budget. True means the caller should retry
 /// immediately. False means a direct delivery ended in attention_required or
 /// a workspace notification remains durably held or blocked for recovery.
-fn fail_attempt(
+async fn fail_attempt(
     inner: &Arc<Inner>,
     worker: &Worker,
     handle: &Arc<DeliveryHandle>,
@@ -4750,7 +4764,8 @@ fn fail_attempt(
                 handle,
                 block.cause,
                 block.observation.clone(),
-            );
+            )
+            .await;
             return false;
         }
         if workspace_prewrite_failure_is_deferred(handle, failure) {
