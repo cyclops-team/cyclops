@@ -141,6 +141,29 @@ async fn wait_for_resolution(rig: &Rig, attempt_id: &str, resolution: Notificati
     }
 }
 
+async fn request_after_automatic_resolution_settles(
+    rig: &mut Rig,
+    method: &str,
+    attempt_id: &str,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let response = rig.ctl.request(method, json!({"id": attempt_id})).await;
+        let automatic_still_owns = response["error"]["code"] == "conflict"
+            && response["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("already being resolved"));
+        if !automatic_still_owns {
+            return response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "automatic resolution did not release {attempt_id}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn active_composer_line(screen: &str) -> Option<&str> {
     let lines: Vec<_> = screen.lines().collect();
     let trailer = lines.iter().position(|line| line.starts_with('─'))?;
@@ -1269,15 +1292,24 @@ async fn exercise_resolution_crash_window(
     request.abort();
     let mut rig = rig.reboot().await;
     rig.wait_attached(1).await;
-    let repeated = rig
-        .ctl
-        .request("attention.complete", json!({"id": attempt_id}))
-        .await;
+    let repeated =
+        request_after_automatic_resolution_settles(&mut rig, "attention.complete", &attempt_id)
+            .await;
     if resolved_before_crash {
         assert_eq!(repeated["error"]["code"], "conflict", "{repeated}");
     } else if resolves_on_retry {
-        assert!(repeated["error"].is_null(), "{repeated}");
-        assert_eq!(repeated["result"]["resolution"], "complete");
+        if repeated["error"].is_null() {
+            assert_eq!(repeated["result"]["resolution"], "complete");
+        } else {
+            assert_eq!(repeated["error"]["code"], "conflict", "{repeated}");
+            assert!(
+                repeated["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("already resolved")),
+                "{repeated}"
+            );
+        }
+        wait_for_resolution(&rig, &attempt_id, NotificationResolution::Complete).await;
     } else {
         assert_eq!(
             repeated["error"]["code"], "attention_action_uncertain",
@@ -1476,10 +1508,9 @@ async fn exercise_no_key_discard_crash(phase: &'static str, resolved_before_cras
     request.abort();
     let mut rig = rig.reboot().await;
     rig.wait_attached(1).await;
-    let repeated = rig
-        .ctl
-        .request("attention.discard", json!({"id": attempt_id}))
-        .await;
+    let repeated =
+        request_after_automatic_resolution_settles(&mut rig, "attention.discard", &attempt_id)
+            .await;
     if resolved_before_crash {
         assert_eq!(repeated["error"]["code"], "conflict", "{repeated}");
     } else {
