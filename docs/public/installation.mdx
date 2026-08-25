@@ -66,6 +66,25 @@ A bare `cyclops` opens the full-screen workspace, starting a tmux session
 and the daemon when neither is already running. If the installer added a
 PATH block, first open a new shell or run the reload command it printed.
 
+### If Codex reports `TERM=dumb`
+
+Do not continue into the interactive TUI from that shell. Run:
+
+```bash
+printf '%s\n' "$TERM"
+```
+
+An agent pane inside tmux normally reports `tmux-256color`; a regular terminal
+outside tmux commonly reports `xterm-256color`. Cyclops does not set
+`TERM=dumb`. Remove that value from the shell profile, launcher, or automation
+that created the shell, then start a fresh terminal. Do not claim richer
+terminal capabilities in a non-interactive pipe merely to suppress the warning.
+
+Headless tmux control clients may report `dumb` without changing an agent
+pane. Check the value in the exact pane where the agent starts. The full
+diagnostic is in the repository's
+[troubleshooting guide](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/troubleshooting.md#codex-warns-that-term-is-dumb).
+
 ## Update
 
 ```bash

@@ -21,6 +21,43 @@ The workspace commands (`start --no-daemon`, `workspace save|restore`)
 work without a daemon, they just cannot name panes or count agents. That
 is what a light `✓` on their output line means.
 
+## Codex warns that `TERM` is `dumb`
+
+Interactive agent CLIs need a terminal description that supports cursor
+movement and full-screen drawing. If Codex prints this warning, do not continue
+in that shell until the launch environment is understood:
+
+```text
+WARNING: TERM is set to "dumb". Codex's interactive TUI may not work in this terminal.
+Continue anyway? [y/N]:
+```
+
+Check the exact shell that will launch the agent:
+
+```bash
+printf '%s\n' "$TERM"
+```
+
+Inside tmux, Cyclops panes normally report `tmux-256color`. A regular terminal
+outside tmux commonly reports `xterm-256color`. Cyclops does not set
+`TERM=dumb`; it leaves pane terminal selection to tmux. Check that selection
+with:
+
+```bash
+tmux show-options -gv default-terminal
+tmux show-environment -g TERM
+```
+
+Remove an explicit `export TERM=dumb` from the shell profile, launcher, or
+automation that created the shell. If the shell is attached to a real terminal
+emulator but inherited the wrong value, start a fresh terminal after correcting
+that configuration. Do not set `xterm-256color` merely to silence the warning in
+a non-interactive pipe or log runner; the claimed capabilities must be real.
+
+Headless tmux control clients can themselves report `dumb`. That is expected and
+does not change the terminal type inside an agent pane. Diagnose the value in
+the pane where the agent process starts.
+
 ## "lost the connection to cyclops: path must be shorter than SUN_LEN"
 
 ```
