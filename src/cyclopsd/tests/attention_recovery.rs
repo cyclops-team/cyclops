@@ -1022,12 +1022,25 @@ async fn exercise_resolution_crash_window(
     let journal = fs::read_to_string(workspace_journal(&rig)).unwrap();
     assert_eq!(journal.matches("Crash boundary secret").count(), 1);
     assert_eq!(journal.matches("Crash boundary body").count(), 1);
-    let keys_before_reboot = fs::read_to_string(&submit_log).unwrap().lines().count();
-    assert_eq!(
-        keys_before_reboot,
-        1 + usize::from(phase != "attention_after_intent"),
-        "unexpected terminal-key count at {phase}"
-    );
+    // tmux acknowledges send-keys before the pane process consumes the input.
+    // Observe that first key before reboot so the later count proves no retry.
+    let expected_keys_before_reboot = 1 + usize::from(phase != "attention_after_intent");
+    let key_deadline = Instant::now() + Duration::from_secs(5);
+    let keys_before_reboot = loop {
+        let observed = fs::read_to_string(&submit_log).unwrap().lines().count();
+        assert!(
+            observed <= expected_keys_before_reboot,
+            "unexpected terminal-key count at {phase}: {observed}"
+        );
+        if observed == expected_keys_before_reboot {
+            break observed;
+        }
+        assert!(
+            Instant::now() < key_deadline,
+            "terminal fixture did not consume the issued key at {phase}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
 
     request.abort();
     let mut rig = rig.reboot().await;
