@@ -72,7 +72,7 @@ fn same_composer_occupant(left: &NotificationBinding, right: &NotificationBindin
 
 #[derive(Debug, Default)]
 pub(crate) struct RecoveryCoordinator {
-    boot_attempts: HashSet<NotificationAttemptId>,
+    tracked_attempts: HashSet<NotificationAttemptId>,
     retiring: HashSet<NotificationAttemptId>,
     writer_unknown: bool,
 }
@@ -80,10 +80,19 @@ pub(crate) struct RecoveryCoordinator {
 impl RecoveryCoordinator {
     pub(crate) fn new(attempts: impl IntoIterator<Item = NotificationAttemptId>) -> Self {
         Self {
-            boot_attempts: attempts.into_iter().collect(),
+            tracked_attempts: attempts.into_iter().collect(),
             retiring: HashSet::new(),
             writer_unknown: false,
         }
+    }
+
+    /// Track a same-run barrier whose delivery worker already retired.
+    ///
+    /// A late exact claim can reconcile an ACK timeout after the in-memory
+    /// delivery handle is gone. The durable barrier then follows the same
+    /// clean-screen retirement path as a barrier restored at daemon boot.
+    pub(crate) fn track(&mut self, attempt_id: NotificationAttemptId) {
+        self.tracked_attempts.insert(attempt_id);
     }
 
     fn writer_unknown(&self) -> bool {
@@ -96,14 +105,14 @@ impl RecoveryCoordinator {
         recipient: RecipientKey,
     ) -> Vec<NotificationRecord> {
         let active: HashSet<_> = canonical.iter().map(|record| record.attempt_id).collect();
-        self.boot_attempts
+        self.tracked_attempts
             .retain(|attempt_id| active.contains(attempt_id));
         self.retiring
             .retain(|attempt_id| active.contains(attempt_id));
         canonical
             .iter()
             .filter(|record| {
-                self.boot_attempts.contains(&record.attempt_id)
+                self.tracked_attempts.contains(&record.attempt_id)
                     && same_physical_pane(record.recipient, recipient)
             })
             .cloned()
@@ -111,7 +120,7 @@ impl RecoveryCoordinator {
     }
 
     fn contains(&self, attempt_id: NotificationAttemptId) -> bool {
-        self.boot_attempts.contains(&attempt_id)
+        self.tracked_attempts.contains(&attempt_id)
     }
 
     fn reserve_record(
@@ -120,10 +129,10 @@ impl RecoveryCoordinator {
         attempt_id: NotificationAttemptId,
     ) -> Result<Option<NotificationRecord>, &'static str> {
         let active: HashSet<_> = canonical.iter().map(|record| record.attempt_id).collect();
-        self.boot_attempts
+        self.tracked_attempts
             .retain(|candidate| active.contains(candidate));
         self.retiring.retain(|candidate| active.contains(candidate));
-        if !self.boot_attempts.contains(&attempt_id) {
+        if !self.tracked_attempts.contains(&attempt_id) {
             return Ok(None);
         }
         if self.writer_unknown {
@@ -220,7 +229,7 @@ impl RecoveryCoordinator {
     }
 
     pub(crate) fn retired(&mut self, attempt_id: NotificationAttemptId) {
-        self.boot_attempts.remove(&attempt_id);
+        self.tracked_attempts.remove(&attempt_id);
         self.retiring.remove(&attempt_id);
     }
 
@@ -242,7 +251,7 @@ impl RecoveryCoordinator {
             Some("composer_recovery_reopen_required")
         } else if self.retiring.contains(&attempt_id) {
             Some("composer_recovery_retirement_pending")
-        } else if self.boot_attempts.contains(&attempt_id) {
+        } else if self.tracked_attempts.contains(&attempt_id) {
             Some("composer_recovery_retirement_failed")
         } else {
             None
@@ -447,6 +456,13 @@ pub(crate) fn retire_exact_lifecycle(
             return LifecycleRetirement::Blocked("composer_recovery_store_unavailable");
         }
     };
+    if canonical.iter().any(|record| {
+        record.attempt_id == candidate && record.needs_claimed_ack_timeout_reconciliation()
+    }) {
+        // Exact v2 ACK-timeout recovery owns its own clear-or-clean settlement
+        // fact. A turn end cannot remove that barrier or hide its alarm.
+        return LifecycleRetirement::Blocked("claimed_notification_reconciliation_pending");
+    }
     let record = match inner
         .composer_recovery
         .lock()
@@ -860,6 +876,35 @@ mod tests {
     }
 
     #[test]
+    fn a_same_run_late_claim_uses_the_recovery_barrier_path() {
+        let route = recipient("00000000-0000-4000-8000-000000000002");
+        let expected = binding(route, 40);
+        let mut record = record(route, expected.clone());
+        record.state = NotificationState::Notified;
+        let mut recovery = RecoveryCoordinator::default();
+
+        let records = recovery.active_for_recipient(std::slice::from_ref(&record), route);
+        assert_eq!(
+            recovery.reconcile(&records, Some(&expected), true, false),
+            None,
+            "an untracked same-run barrier is not boot recovery work"
+        );
+        recovery.track(record.attempt_id);
+        let records = recovery.active_for_recipient(std::slice::from_ref(&record), route);
+        assert_eq!(
+            recovery.reconcile(&records, Some(&expected), false, false),
+            Some(RecoveryAction::Restore(record.attempt_id))
+        );
+        assert!(matches!(
+            recovery.reconcile(&records, Some(&expected), true, false),
+            Some(RecoveryAction::Retire {
+                cause: NotificationBarrierRetirementCause::ComposerObservedClear,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn an_incomplete_legacy_barrier_retires_only_after_claim_and_clean_screen() {
         let route = recipient("00000000-0000-4000-8000-000000000002");
         let live = binding(route, 40);
@@ -1132,7 +1177,7 @@ mod tests {
         recovery.require_reopen();
         assert!(recovery.writer_unknown());
         assert!(recovery.retiring.is_empty());
-        assert!(recovery.boot_attempts.contains(&attempt_id));
+        assert!(recovery.tracked_attempts.contains(&attempt_id));
     }
 
     #[test]

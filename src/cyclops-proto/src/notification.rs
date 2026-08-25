@@ -510,6 +510,25 @@ pub struct NotificationRecord {
     pub updated_at: u64,
 }
 
+impl NotificationRecord {
+    /// Whether a late claim may enter exact ACK-timeout reconciliation.
+    ///
+    /// This predicate does not settle the notification. The daemon must still
+    /// prove that the exact staged doorbell was cleared, or that the same bound
+    /// composer is visibly clean, before appending the settlement fact.
+    pub fn needs_claimed_ack_timeout_reconciliation(&self) -> bool {
+        self.state == NotificationState::AttentionRequired
+            && self.cause == Some(NotificationAttentionCause::AckTimeout)
+            && self.transport == NotificationTransport::Doorbell
+            && self.doorbell_format == Some(DOORBELL_FORMAT_ATTEMPT_CLAIM)
+            && self.binding.as_ref().is_some_and(|binding| {
+                binding.recipient == self.recipient
+                    && binding.pane_root.is_some()
+                    && binding.leader.is_some()
+            })
+    }
+}
+
 /// One recipient moved from an attention attempt to a fresh queued attempt.
 ///
 /// The enclosing fact owns the message identity and record version so one
@@ -667,6 +686,17 @@ pub enum NotificationFact {
     /// composer proof. Replay changes the notification state and retires its
     /// composer barrier together.
     NotificationClaimedStagedCleared {
+        record_version: u32,
+        attempt_id: NotificationAttemptId,
+        message_id: MessageId,
+        recipient: RecipientKey,
+    },
+    /// A late exact recipient claim reconciled one v2 doorbell ACK timeout.
+    ///
+    /// The daemon appends this only after the exact bound composer was cleared,
+    /// or after crash recovery proved that same composer visibly clean. The
+    /// fact carries identity only and retires the composer barrier atomically.
+    NotificationClaimedAckTimeoutReconciled {
         record_version: u32,
         attempt_id: NotificationAttemptId,
         message_id: MessageId,
@@ -1044,6 +1074,54 @@ mod tests {
     }
 
     #[test]
+    fn exact_v2_ack_timeout_requires_composer_reconciliation_after_claim() {
+        let workspace = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let session = "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let recipient = RecipientKey::agent(workspace, session, "%3".parse().unwrap());
+        let binding = NotificationBinding {
+            recipient,
+            pane_root: Some(ProcessInstanceId::new(39, 88).unwrap()),
+            leader: Some(ProcessInstanceId::new(40, 89).unwrap()),
+            agent: ProcessInstanceId::new(41, 90).unwrap(),
+            manifest: NotificationManifestId::new("claude").unwrap(),
+        };
+        let record = NotificationRecord {
+            attempt_id: NotificationAttemptId::generate(),
+            message_id: MessageId::new("m-late-claim").unwrap(),
+            recipient,
+            state: NotificationState::AttentionRequired,
+            binding: Some(binding),
+            transport: NotificationTransport::Doorbell,
+            doorbell_format: Some(DOORBELL_FORMAT_ATTEMPT_CLAIM),
+            cause: Some(NotificationAttentionCause::AckTimeout),
+            pre_write_cause: None,
+            pre_write_observation: None,
+            pre_write_reopen_count: 0,
+            started_seq: 1,
+            updated_seq: 7,
+            updated_at: 8,
+        };
+
+        assert!(record.needs_claimed_ack_timeout_reconciliation());
+
+        let mut invalid = record.clone();
+        invalid.cause = Some(NotificationAttentionCause::VerifyFailed);
+        assert!(!invalid.needs_claimed_ack_timeout_reconciliation());
+
+        let mut invalid = record.clone();
+        invalid.doorbell_format = Some(DOORBELL_FORMAT_COMPACT_CLAIM);
+        assert!(!invalid.needs_claimed_ack_timeout_reconciliation());
+
+        let mut invalid = record.clone();
+        invalid.binding.as_mut().unwrap().leader = None;
+        assert!(!invalid.needs_claimed_ack_timeout_reconciliation());
+
+        let mut invalid = record;
+        invalid.binding.as_mut().unwrap().recipient = RecipientKey::admin(workspace);
+        assert!(!invalid.needs_claimed_ack_timeout_reconciliation());
+    }
+
+    #[test]
     fn doorbell_renderer_format() {
         let msg_id = MessageId::new("m-3f9c2a").unwrap();
         assert_eq!(render_doorbell_v1(&msg_id), "cyclops inbox claim m-3f9c2a");
@@ -1308,6 +1386,41 @@ mod tests {
             ]
         );
         assert_eq!(value["type"], "notification_claimed_staged_cleared");
+        assert!(value.get("body").is_none());
+        assert!(value.get("composer").is_none());
+        assert!(value.get("diff").is_none());
+        assert_eq!(
+            serde_json::from_value::<NotificationFact>(value).unwrap(),
+            fact
+        );
+    }
+
+    #[test]
+    fn claimed_ack_timeout_reconciliation_fact_contains_identity_only() {
+        let workspace = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let session = "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let fact = NotificationFact::NotificationClaimedAckTimeoutReconciled {
+            record_version: 1,
+            attempt_id: NotificationAttemptId::parse("att-00000000-0000-4000-8000-000000000001")
+                .unwrap(),
+            message_id: MessageId::new("m-claimed-ack-timeout").unwrap(),
+            recipient: RecipientKey::agent(workspace, session, "%3".parse().unwrap()),
+        };
+
+        let value = serde_json::to_value(&fact).unwrap();
+        let mut keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "attempt_id",
+                "message_id",
+                "recipient",
+                "record_version",
+                "type",
+            ]
+        );
+        assert_eq!(value["type"], "notification_claimed_ack_timeout_reconciled");
         assert!(value.get("body").is_none());
         assert!(value.get("composer").is_none());
         assert!(value.get("diff").is_none());

@@ -412,28 +412,97 @@ pub(crate) fn claim(
     message_id: MessageId,
 ) -> Result<ClaimOutcome, MailboxServiceError> {
     let outcome = service.claim(claimant, message_id)?;
-    let (withdrawn, consumed_doorbell) = match &outcome {
+    let (withdrawn, consumed_doorbell, claimed_ack_timeout) = match &outcome {
         ClaimOutcome::Claimed {
             withdrawn_attempt,
             consumed_doorbell_attempt,
+            claimed_ack_timeout_attempt,
             ..
         }
         | ClaimOutcome::AlreadyClaimed {
             withdrawn_attempt,
             consumed_doorbell_attempt,
+            claimed_ack_timeout_attempt,
             ..
-        } => (*withdrawn_attempt, *consumed_doorbell_attempt),
+        } => (
+            *withdrawn_attempt,
+            *consumed_doorbell_attempt,
+            *claimed_ack_timeout_attempt,
+        ),
     };
     if let Some(attempt_id) = consumed_doorbell {
         crate::delivery::settle_notification_claim(inner, attempt_id);
     }
+    if let Some(attempt_id) = claimed_ack_timeout {
+        if let Err(error) =
+            schedule_claimed_notification_recovery(inner, service, claimant, attempt_id)
+        {
+            error!(%claimant, %error, "cannot schedule claimed notification recovery");
+        }
+    }
     if let Some(attempt_id) = withdrawn {
         inner.engine.cancel_notification(attempt_id);
     }
-    if let Err(error) = schedule_recipient(inner, service, claimant) {
-        error!(%claimant, %error, "cannot schedule mailbox notification after claim");
+    if claimed_ack_timeout.is_none() {
+        if let Err(error) = schedule_recipient(inner, service, claimant) {
+            error!(%claimant, %error, "cannot schedule mailbox notification after claim");
+        }
     }
     Ok(outcome)
+}
+
+/// Reconcile the composer barrier after a late claim identifies an ACK timeout.
+///
+/// The delivery handle may still be retiring or already gone. Track the
+/// durable attempt, enqueue a fresh recovery handle for the same FIFO owner,
+/// then request one current screen reading. A stale handle cannot erase the
+/// replacement because the attempt index is pointer-checked on retirement.
+fn schedule_claimed_notification_recovery(
+    inner: &Arc<Inner>,
+    service: &Arc<MailboxService>,
+    recipient: RecipientKey,
+    attempt_id: cyclops_proto::NotificationAttemptId,
+) -> Result<(), MailboxServiceError> {
+    inner
+        .composer_recovery
+        .lock()
+        .expect("composer recovery lock")
+        .track(attempt_id);
+    let Some(route) = notification_route(inner, service, recipient)? else {
+        return Ok(());
+    };
+    let Some(record) = service.prepare_oldest_notification(recipient)? else {
+        return Ok(());
+    };
+    if record.attempt_id != attempt_id {
+        error!(
+            %recipient,
+            expected_attempt = %attempt_id,
+            found_attempt = %record.attempt_id,
+            "claimed notification recovery lost FIFO ownership"
+        );
+        return Ok(());
+    }
+    let session_idx = route.session_idx;
+    let pane_id = route.pane_id.clone();
+    let watcher = Arc::clone(&route.watcher);
+    enqueue_prepared_notification(inner, service, recipient, route, record, true);
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return Ok(());
+    };
+    let inner = Arc::clone(inner);
+    runtime.spawn(async move {
+        crate::fusion::recompute_pane(
+            &inner,
+            session_idx,
+            &watcher,
+            &pane_id,
+            true,
+            "claimed_ack_timeout",
+        )
+        .await;
+    });
+    Ok(())
 }
 
 pub(crate) fn requeue(

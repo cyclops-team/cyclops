@@ -51,7 +51,7 @@ use tokio::time::Instant;
 use tracing::{debug, error, warn};
 
 use crate::notification_adapter::{
-    NotificationAdapterError, NotificationContext, SubmitReservation,
+    ClaimedNotificationBarrier, NotificationAdapterError, NotificationContext, SubmitReservation,
 };
 use crate::{daemon_line, fusion, unix_ms, Inner, PaneKey};
 
@@ -334,9 +334,9 @@ impl Engine {
     ///
     /// Evidence-driven reopening replaces the index with a fresh handle for
     /// the same durable attempt. The returning stale handle must not erase it.
-    fn retire_notification_run(&self, handle: &Arc<DeliveryHandle>) {
+    fn retire_notification_run(&self, handle: &Arc<DeliveryHandle>) -> bool {
         let Some(notification) = &handle.notification else {
-            return;
+            return false;
         };
         let attempt_id = notification.attempt_id();
         let mut active = self
@@ -348,9 +348,10 @@ impl Engine {
             .and_then(std::sync::Weak::upgrade)
             .is_some_and(|current| Arc::ptr_eq(&current, handle));
         if !owns_entry {
-            return;
+            return false;
         }
         active.remove(&attempt_id);
+        true
     }
 
     fn replace_notification_run(
@@ -768,6 +769,9 @@ pub(crate) struct DeliveryHandle {
     write_boundary_crossed: AtomicBool,
     /// One automatic supervisor recovery is allowed for this exact run.
     worker_recoveries: AtomicU64,
+    /// A readiness edge observed while this claimed-barrier run was active.
+    /// Consumed only after the attempt index releases this handle.
+    claimed_notification_rerun_requested: AtomicBool,
 }
 
 /// Evidence from a vendor hook that landed before the worker consumed it.
@@ -963,6 +967,7 @@ impl DeliveryHandle {
             submitted_manifest: StdMutex::new(None),
             write_boundary_crossed: AtomicBool::new(false),
             worker_recoveries: AtomicU64::new(0),
+            claimed_notification_rerun_requested: AtomicBool::new(false),
         })
     }
 
@@ -989,7 +994,7 @@ impl DeliveryHandle {
             .expect("notification transport lock")
     }
 
-    fn restore_claimed_staged(&self) {
+    fn restore_claimed_notification_barrier(&self) {
         let attempt_id = self
             .notification
             .as_ref()
@@ -2439,6 +2444,7 @@ pub(crate) fn enqueue_notification_attempt(
 ) -> Option<Arc<DeliveryHandle>> {
     let attempt_id = notification.attempt_id();
     let recipient = notification.recipient();
+    let claimed_barrier = notification.claimed_notification_barrier();
     let mut active = inner
         .engine
         .notification_attempts
@@ -2447,17 +2453,22 @@ pub(crate) fn enqueue_notification_attempt(
     active.retain(|_, handle| handle.strong_count() > 0);
     if !replace_existing {
         if let Some(handle) = active.get(&attempt_id).and_then(std::sync::Weak::upgrade) {
+            if claimed_barrier.as_ref().is_ok_and(Option::is_some) {
+                handle
+                    .claimed_notification_rerun_requested
+                    .store(true, Ordering::SeqCst);
+            }
             return Some(handle);
         }
     }
-    let resume_claimed_staged = match notification.is_claimed_staged() {
-        Ok(resume) => resume,
+    let claimed_barrier = match claimed_barrier {
+        Ok(barrier) => barrier,
         Err(error) => {
             error!(message_id = %notification.message_id(), %error, "cannot classify notification enqueue");
             return None;
         }
     };
-    let doorbell = if resume_claimed_staged {
+    let doorbell = if claimed_barrier.is_some() {
         let record = match notification.current_record() {
             Ok(record) => record,
             Err(error) => {
@@ -2483,8 +2494,8 @@ pub(crate) fn enqueue_notification_attempt(
         doorbell,
         notification,
     );
-    if resume_claimed_staged {
-        handle.restore_claimed_staged();
+    if claimed_barrier.is_some() {
+        handle.restore_claimed_notification_barrier();
     }
     active.insert(attempt_id, Arc::downgrade(&handle));
     drop(active);
@@ -2643,7 +2654,28 @@ async fn notification_worker_loop(inner: Arc<Inner>, recipient: RecipientKey, wo
                 // Quiesce may have atomically returned this same handle to
                 // the FIFO. In that case its attempt index remains active.
                 if worker.finish(&handle) {
-                    inner.engine.retire_notification_run(&handle);
+                    let retired = inner.engine.retire_notification_run(&handle);
+                    if retired
+                        && handle
+                            .claimed_notification_rerun_requested
+                            .swap(false, Ordering::SeqCst)
+                    {
+                        if let (Some(service), Some(notification)) =
+                            (&inner.mailbox, &handle.notification)
+                        {
+                            if let Err(error) = crate::messaging::schedule_recipient(
+                                &inner,
+                                service,
+                                notification.recipient(),
+                            ) {
+                                error!(
+                                    id = %handle.msg_id,
+                                    %error,
+                                    "cannot reschedule claimed notification after readiness edge"
+                                );
+                            }
+                        }
+                    }
                 }
             }
             Err(error) => {
@@ -2742,7 +2774,10 @@ fn recover_failed_job(
                 true
             }
             NotificationState::Staged
-                if recovery == 0 && notification.is_claimed_staged().unwrap_or(false) =>
+                if recovery == 0
+                    && notification
+                        .claimed_notification_barrier()
+                        .is_ok_and(|barrier| barrier.is_some()) =>
             {
                 true
             }
@@ -3032,18 +3067,19 @@ fn watcher_for_handle(inner: &Inner, handle: &DeliveryHandle) -> Option<Arc<Sess
 /// Drive one delivery through gate, inject, submit, ACK, bounded retry.
 async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<DeliveryHandle>) {
     if let Some(notification) = &handle.notification {
-        match notification.is_claimed_staged() {
-            Ok(true) => {
+        match notification.claimed_notification_barrier() {
+            Ok(Some(barrier)) => {
                 if let AttemptOutcome::Failed(failure) =
-                    reconcile_recovered_claimed_staged(inner, handle).await
+                    reconcile_recovered_claimed_notification_barrier(inner, handle, barrier).await
                 {
+                    inject_pause(inner, "post_claimed_notification_refusal").await;
                     if !fault_notification_worker(worker, &failure) {
                         let _ = fail_attempt(inner, worker, handle, &failure);
                     }
                 }
                 return;
             }
-            Ok(false) => {}
+            Ok(None) => {}
             Err(error) => {
                 error!(id = %handle.msg_id, %error, "cannot classify staged claim recovery");
                 return;
@@ -3774,7 +3810,7 @@ async fn attempt_delivery(
         match notification.reserve_submit() {
             Ok(SubmitReservation::Reserved) => true,
             Ok(SubmitReservation::ClaimedBeforeSubmit) => {
-                return reconcile_claimed_staged(
+                return reconcile_claimed_notification_barrier(
                     inner,
                     handle,
                     manifest,
@@ -3785,6 +3821,7 @@ async fn attempt_delivery(
                     &proven,
                     &injector,
                     ClaimedStagedReconciliation::CurrentRun,
+                    ClaimedNotificationBarrier::Staged,
                 )
                 .await;
             }
@@ -4096,9 +4133,10 @@ fn early_ack_step(early: PendingAck) -> Step<'static> {
         .turn(early.turn)
 }
 
-async fn reconcile_recovered_claimed_staged(
+async fn reconcile_recovered_claimed_notification_barrier(
     inner: &Arc<Inner>,
     handle: &Arc<DeliveryHandle>,
+    barrier: ClaimedNotificationBarrier,
 ) -> AttemptOutcome {
     let notification = handle
         .notification
@@ -4171,7 +4209,7 @@ async fn reconcile_recovered_claimed_staged(
             inner.engine.buffer_seq.fetch_add(1, Ordering::Relaxed)
         ),
     };
-    reconcile_claimed_staged(
+    reconcile_claimed_notification_barrier(
         inner,
         handle,
         manifest,
@@ -4182,6 +4220,7 @@ async fn reconcile_recovered_claimed_staged(
         &proven,
         &injector,
         ClaimedStagedReconciliation::Recovered,
+        barrier,
     )
     .await
 }
@@ -4241,12 +4280,12 @@ fn classify_claimed_staged_composer(
     ClaimedStagedComposer::Ambiguous
 }
 
-/// Reconcile a mailbox claim that won before terminal submit intent.
+/// Reconcile an exact claimed notification barrier.
 ///
 /// The claim proves payload retrieval, not Enter. Cyclops clears only an
 /// exact, still-bound doorbell that it can reconstruct byte for byte. Any
 /// missing proof becomes one post-write attention state.
-async fn reconcile_claimed_staged<I: Injector>(
+async fn reconcile_claimed_notification_barrier<I: Injector>(
     inner: &Arc<Inner>,
     handle: &Arc<DeliveryHandle>,
     manifest: &Manifest,
@@ -4254,6 +4293,7 @@ async fn reconcile_claimed_staged<I: Injector>(
     proven: &fusion::Binding,
     injector: &I,
     reconciliation: ClaimedStagedReconciliation,
+    barrier: ClaimedNotificationBarrier,
 ) -> AttemptOutcome {
     if proven_binding_unchanged(inner, handle, proven).is_err() {
         return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
@@ -4284,6 +4324,11 @@ async fn reconcile_claimed_staged<I: Injector>(
                     "claim_clear_unsupported".to_string(),
                 ));
             }
+            if let Err(cause) =
+                notification_staged_action_safe(inner, handle, manifest, &staged, proven)
+            {
+                return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
+            }
             if let Err(cause) = injector
                 .clear(&handle.pane_id, &manifest.injection.clear_keys)
                 .await
@@ -4310,14 +4355,15 @@ async fn reconcile_claimed_staged<I: Injector>(
     if proven_binding_unchanged(inner, handle, proven).is_err() {
         return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
     }
+    inject_pause(inner, "pre_claimed_notification_settlement").await;
     let notification = handle
         .notification
         .as_ref()
         .expect("claim reconciliation belongs to a notification");
-    let record = match settle_claimed_staged_after_clear(notification) {
+    let record = match settle_claimed_notification_after_clear(notification, barrier) {
         Ok(record) => record,
         Err(error) => {
-            error!(id = %handle.msg_id, %error, "staged claim settlement failed twice; notification worker remains faulted");
+            error!(id = %handle.msg_id, %error, "claimed notification settlement failed twice; notification worker remains faulted");
             return AttemptOutcome::Failed(AttemptFailure::claimed_staged_settlement_failed());
         }
     };
@@ -4331,6 +4377,11 @@ async fn reconcile_claimed_staged<I: Injector>(
             binding.manifest.as_str(),
         );
     }
+    inner
+        .composer_recovery
+        .lock()
+        .expect("composer recovery lock")
+        .retired(record.attempt_id);
     if let Some(service) = &inner.mailbox {
         if let Err(error) =
             crate::messaging::schedule_recipient(inner, service, notification.recipient())
@@ -4347,21 +4398,34 @@ async fn reconcile_claimed_staged<I: Injector>(
 /// not observe. The store operation is idempotent, so one immediate repeat can
 /// discover an already-landed fact or append the missing one. It never clears
 /// the composer or sends a terminal key.
-fn settle_claimed_staged_after_clear(
+fn settle_claimed_notification_after_clear(
     notification: &NotificationContext,
+    barrier: ClaimedNotificationBarrier,
 ) -> Result<cyclops_proto::NotificationRecord, NotificationAdapterError> {
-    match notification.settle_claimed_staged_clear() {
+    let settle = || match barrier {
+        ClaimedNotificationBarrier::Staged => notification.settle_claimed_staged_clear(),
+        ClaimedNotificationBarrier::AckTimeout => {
+            notification.settle_claimed_ack_timeout_reconciliation()
+        }
+    };
+    match settle() {
         Ok(record) => Ok(record),
         Err(first) => {
             warn!(
                 message_id = %notification.message_id(),
                 attempt_id = %notification.attempt_id(),
                 error = %first,
-                "retrying claimed staged settlement once"
+                "retrying claimed notification settlement once"
             );
-            notification.settle_claimed_staged_clear()
+            settle()
         }
     }
+}
+
+fn settle_claimed_staged_after_clear(
+    notification: &NotificationContext,
+) -> Result<cyclops_proto::NotificationRecord, NotificationAdapterError> {
+    settle_claimed_notification_after_clear(notification, ClaimedNotificationBarrier::Staged)
 }
 
 pub(crate) fn clean_composer_proof(manifest: &Manifest, capture: &str) -> bool {
@@ -4416,7 +4480,10 @@ async fn observe_exact_composer_clear<I: Injector>(
         if proven_binding_unchanged(inner, handle, proven).is_err() {
             return false;
         }
-        if !row.in_mode && clean_composer_proof(manifest, &capture) {
+        if !row.in_mode
+            && clean_composer_proof(manifest, &capture)
+            && notification_staged_action_safe(inner, handle, manifest, &capture, proven).is_ok()
+        {
             return true;
         }
     }
@@ -10487,7 +10554,7 @@ composer_trailer_required_prefix = 1
             .lock()
             .unwrap()
             .projection()
-            .claimed_staged_notification(recipient)
+            .claimed_notification_barrier(recipient)
             .cloned()
             .expect("restart retains the claimed staged attempt");
         assert_eq!(recovered.attempt_id, attempt_id);
@@ -10669,6 +10736,7 @@ line_regex_esc = ['^❯$']
             message: first_message,
             withdrawn_attempt,
             consumed_doorbell_attempt,
+            ..
         } = first
         else {
             panic!("first claim must append one claim fact");
@@ -10694,6 +10762,7 @@ line_regex_esc = ['^❯$']
             message: repeated_message,
             withdrawn_attempt,
             consumed_doorbell_attempt,
+            ..
         } = repeated
         else {
             panic!("repeat claim must return the original mailbox task");

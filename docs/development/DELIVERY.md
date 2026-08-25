@@ -113,10 +113,14 @@ re-proves and clears the exact doorbell. One
 `withdrawn_after_staging` and retires its barrier together. A claim at
 `submitting` retrieves the message once but does not cancel the reserved
 terminal key. A claim at `submitted` advances the doorbell to `notified`.
-`writing`, direct-payload post-write states, `attention_required`, and existing
-`notified` records stay unchanged. `superseded` is reserved for an actual
-message replacement. A claim proves retrieval only. It never proves Enter,
-task completion, or resolution of a post-write alarm.
+An `ack_timeout` alarm for a current format 2 doorbell with a complete binding
+can advance to `notified` after an exact recipient claim and composer
+reconciliation. The daemon must first clear the exact staged doorbell, or prove
+the same bound composer is clean. The claim alone leaves the alarm and FIFO
+barrier in place. Other post-write attention, `writing`, direct-payload states,
+and existing `notified` records stay unchanged. `superseded` is reserved for an
+actual message replacement. A claim proves retrieval only. It never proves task
+completion or resolves any other post-write alarm.
 
 ### Gate (amendments b, f, g; GOALS invariants)
 
@@ -227,7 +231,10 @@ visible; the hold itself keeps waiting on events, never on a timer.
   then appends `message_delivered_direct` and retires that mailbox entry. A
   doorbell leaves the entry pending until an authenticated claim.
 - Neither within 5s: `attention_required` with cause `ack_timeout`. Enter may
-  already have been accepted, so the payload is never re-pasted.
+  already have been accepted, so the payload is never re-pasted. A later exact
+  recipient claim starts composer reconciliation for a current format 2
+  attempt. Only exact clear or same-binding clean evidence moves it to
+  `notified`.
 
 ### Retry (bounded, pre-write only)
 

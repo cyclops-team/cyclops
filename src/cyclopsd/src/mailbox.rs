@@ -107,6 +107,7 @@ pub enum ClaimOutcome {
         message: InboxMessage,
         withdrawn_attempt: Option<NotificationAttemptId>,
         consumed_doorbell_attempt: Option<NotificationAttemptId>,
+        claimed_ack_timeout_attempt: Option<NotificationAttemptId>,
     },
     /// Entry was already claimed by this claimant; returns existing entry and canonical message line.
     AlreadyClaimed {
@@ -114,6 +115,7 @@ pub enum ClaimOutcome {
         message: InboxMessage,
         withdrawn_attempt: Option<NotificationAttemptId>,
         consumed_doorbell_attempt: Option<NotificationAttemptId>,
+        claimed_ack_timeout_attempt: Option<NotificationAttemptId>,
     },
 }
 
@@ -381,6 +383,8 @@ pub struct MailboxProjection {
     /// Requeue can replace the current attempt while an older attempt still
     /// owns staged composer state, so the key is the exact attempt id.
     active_notification_barriers: HashMap<NotificationAttemptId, NotificationRecord>,
+    /// ACK-timeout claim reconciliations applied from their dedicated fact.
+    claimed_ack_timeout_reconciliations: HashSet<NotificationAttemptId>,
     /// Every attempt identifier seen in this workspace, including superseded attempts.
     notification_attempts: HashSet<NotificationAttemptId>,
     /// Attempts an operator has acknowledged. Kept beside the records
@@ -466,6 +470,11 @@ enum PreparedMutation {
         resolution: NotificationResolution,
     },
     NotificationClaimedStagedCleared {
+        key: (RecipientKey, MessageId),
+        record: NotificationRecord,
+        attempt_id: NotificationAttemptId,
+    },
+    NotificationClaimedAckTimeoutReconciled {
         key: (RecipientKey, MessageId),
         record: NotificationRecord,
         attempt_id: NotificationAttemptId,
@@ -743,6 +752,7 @@ impl MailboxProjection {
             mailbox_index: HashMap::new(),
             notifications: HashMap::new(),
             active_notification_barriers: HashMap::new(),
+            claimed_ack_timeout_reconciliations: HashSet::new(),
             cleared_attempts: HashSet::new(),
             clearance_batches: HashSet::new(),
             resolved_attempts: HashMap::new(),
@@ -925,6 +935,9 @@ impl MailboxProjection {
             Some("notification_resolved") => self.prepare_notification_resolution(line),
             Some("notification_claimed_staged_cleared") => {
                 self.prepare_notification_claimed_staged_clear(line)
+            }
+            Some("notification_claimed_ack_timeout_reconciled") => {
+                self.prepare_notification_claimed_ack_timeout_reconciliation(line)
             }
             Some("notification_barrier_retired") => {
                 self.prepare_notification_barrier_retirement(line)
@@ -2374,6 +2387,78 @@ impl MailboxProjection {
         })
     }
 
+    fn prepare_notification_claimed_ack_timeout_reconciliation(
+        &self,
+        line: &LedgerLine,
+    ) -> Result<PreparedMutation, MailboxError> {
+        let fact: NotificationFact = serde_json::from_value(
+            line.data
+                .clone()
+                .ok_or_else(|| MailboxError::InvalidNotificationFact("missing data".into()))?,
+        )
+        .map_err(|error| MailboxError::InvalidNotificationFact(error.to_string()))?;
+        let NotificationFact::NotificationClaimedAckTimeoutReconciled {
+            record_version,
+            attempt_id,
+            message_id,
+            recipient,
+        } = fact
+        else {
+            return Err(MailboxError::InvalidNotificationFact(
+                "expected notification_claimed_ack_timeout_reconciled".into(),
+            ));
+        };
+
+        self.validate_notification_envelope(line, record_version, &message_id, recipient)?;
+        let key = (recipient, message_id.clone());
+        let current =
+            self.notifications
+                .get(&key)
+                .ok_or_else(|| MailboxError::NotificationNotFound {
+                    message_id: message_id.clone(),
+                    recipient,
+                })?;
+        if current.attempt_id != attempt_id {
+            return Err(MailboxError::NotificationAttemptMismatch {
+                expected: current.attempt_id,
+                found: attempt_id,
+            });
+        }
+        if !current.needs_claimed_ack_timeout_reconciliation() {
+            return Err(MailboxError::InvalidNotificationTransition {
+                from: current.state,
+                to: NotificationState::Notified,
+            });
+        }
+        if !self.exact_recipient_claimed_after_write(current) {
+            return Err(MailboxError::InvalidNotificationFact(
+                "ACK-timeout reconciliation requires an exact recipient claim after write".into(),
+            ));
+        }
+        let active = self
+            .active_notification_barriers
+            .get(&attempt_id)
+            .ok_or(MailboxError::NotificationBarrierNotActive(attempt_id))?;
+        if active != current {
+            return Err(MailboxError::InvalidNotificationFact(
+                "ACK-timeout reconciliation does not match the exact active barrier".into(),
+            ));
+        }
+
+        let mut record = current.clone();
+        record.state = NotificationState::Notified;
+        record.cause = None;
+        record.pre_write_cause = None;
+        record.pre_write_observation = None;
+        record.updated_seq = line.seq;
+        record.updated_at = line.ts;
+        Ok(PreparedMutation::NotificationClaimedAckTimeoutReconciled {
+            key,
+            record,
+            attempt_id,
+        })
+    }
+
     fn prepare_notification_barrier_retirement(
         &self,
         line: &LedgerLine,
@@ -2453,8 +2538,20 @@ impl MailboxProjection {
                     });
                 }
             }
-            NotificationBarrierRetirementCause::LifecycleReconciled
-            | NotificationBarrierRetirementCause::PaneGone => {
+            NotificationBarrierRetirementCause::LifecycleReconciled => {
+                if replacement.is_some() {
+                    return Err(MailboxError::NotificationBarrierReplacementForbidden);
+                }
+                if active.needs_claimed_ack_timeout_reconciliation()
+                    && self.exact_recipient_claimed_after_write(active)
+                {
+                    return Err(MailboxError::NotificationBarrierRetirementState {
+                        cause,
+                        state: active.state,
+                    });
+                }
+            }
+            NotificationBarrierRetirementCause::PaneGone => {
                 if replacement.is_some() {
                     return Err(MailboxError::NotificationBarrierReplacementForbidden);
                 }
@@ -2857,6 +2954,15 @@ impl MailboxProjection {
                 self.notifications.insert(key, record);
                 self.active_notification_barriers.remove(&attempt_id);
             }
+            PreparedMutation::NotificationClaimedAckTimeoutReconciled {
+                key,
+                record,
+                attempt_id,
+            } => {
+                self.notifications.insert(key, record);
+                self.active_notification_barriers.remove(&attempt_id);
+                self.claimed_ack_timeout_reconciliations.insert(attempt_id);
+            }
             PreparedMutation::NotificationBarrierRetired { attempt_id } => {
                 self.active_notification_barriers.remove(&attempt_id);
             }
@@ -2877,10 +2983,11 @@ impl MailboxProjection {
             .is_some_and(|entry| entry.state.is_pending())
     }
 
-    /// Oldest exact attempt whose mailbox claim won after staging but before
-    /// terminal submit intent. It remains bound to its original attempt for
-    /// byte-exact composer reconciliation.
-    pub(crate) fn claimed_staged_notification(
+    /// Oldest exact notification barrier owned by a durable recipient claim.
+    ///
+    /// A staged doorbell and a v2 ACK-timeout doorbell both keep their original
+    /// FIFO position until byte-exact composer reconciliation settles them.
+    pub(crate) fn claimed_notification_barrier(
         &self,
         recipient: RecipientKey,
     ) -> Option<&NotificationRecord> {
@@ -2888,11 +2995,14 @@ impl MailboxProjection {
             .values()
             .filter(|record| {
                 record.recipient == recipient
-                    && record.state == NotificationState::Staged
                     && record.transport == NotificationTransport::Doorbell
+                    && (record.state == NotificationState::Staged
+                        || record.needs_claimed_ack_timeout_reconciliation())
+                    && self.exact_recipient_claimed_after_write(record)
                     && self
-                        .get_entry(recipient, &record.message_id)
-                        .is_some_and(|entry| entry.state.is_claimed())
+                        .active_notification_barriers
+                        .get(&record.attempt_id)
+                        .is_some_and(|active| active == record)
             })
             .min_by_key(|record| record.started_seq)
     }
@@ -3151,7 +3261,7 @@ impl MailboxProjection {
         })
     }
 
-    fn exact_recipient_claimed_after_write(&self, record: &NotificationRecord) -> bool {
+    pub(crate) fn exact_recipient_claimed_after_write(&self, record: &NotificationRecord) -> bool {
         let Some(write_seq) = self
             .notification_write_sequences
             .get(&record.attempt_id)
@@ -3854,6 +3964,8 @@ pub struct MessageStore {
     #[cfg(test)]
     fail_claimed_staged_clear_appends: usize,
     #[cfg(test)]
+    fail_claimed_ack_timeout_reconciliation_appends: usize,
+    #[cfg(test)]
     fail_pre_write_block_appends: usize,
 }
 
@@ -4149,7 +4261,7 @@ impl MailboxService {
                 (entries.values().any(|entry| entry.state.is_pending())
                     || store
                         .projection()
-                        .claimed_staged_notification(*recipient)
+                        .claimed_notification_barrier(*recipient)
                         .is_some())
                 .then_some(*recipient)
             })
@@ -4172,7 +4284,7 @@ impl MailboxService {
         let mut store = self.store()?;
         if let Some(record) = store
             .projection()
-            .claimed_staged_notification(recipient)
+            .claimed_notification_barrier(recipient)
             .cloned()
         {
             return Ok(Some(record));
@@ -4527,10 +4639,11 @@ impl MailboxService {
         message_id: MessageId,
     ) -> Result<ClaimOutcome, MailboxServiceError> {
         let mut store = self.store()?;
-        let projection = store.projection();
-        let notification_changed = projection
+        let notification_changed = store
+            .projection()
             .notification(claimant, &message_id)
-            .is_some_and(|record| record.state.settled_by_claim(record.transport) != record.state);
+            .map(|record| record.state.settled_by_claim(record.transport) != record.state)
+            .unwrap_or_default();
         let outcome = store.claim(claimant, message_id)?;
         if let ClaimOutcome::Claimed {
             withdrawn_attempt, ..
@@ -5354,6 +5467,8 @@ impl MessageStore {
             #[cfg(test)]
             fail_claimed_staged_clear_appends: 0,
             #[cfg(test)]
+            fail_claimed_ack_timeout_reconciliation_appends: 0,
+            #[cfg(test)]
             fail_pre_write_block_appends: 0,
         })
     }
@@ -5379,6 +5494,11 @@ impl MessageStore {
     #[cfg(test)]
     pub(crate) fn inject_claimed_staged_clear_append_failures(&mut self, count: usize) {
         self.fail_claimed_staged_clear_appends = count;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_next_claimed_ack_timeout_reconciliation_append_failure(&mut self) {
+        self.fail_claimed_ack_timeout_reconciliation_appends = 1;
     }
 
     #[cfg(test)]
@@ -5571,9 +5691,13 @@ impl MessageStore {
                         NotificationState::Staged
                             | NotificationState::Submitting
                             | NotificationState::Submitted
-                            | NotificationState::Notified
                     )
             })
+            .map(|record| record.attempt_id);
+        let claimed_ack_timeout_attempt = self
+            .projection
+            .notification(entry.recipient, &message_id)
+            .filter(|record| record.needs_claimed_ack_timeout_reconciliation())
             .map(|record| record.attempt_id);
 
         match &entry.state {
@@ -5587,6 +5711,7 @@ impl MessageStore {
                         message,
                         withdrawn_attempt: None,
                         consumed_doorbell_attempt,
+                        claimed_ack_timeout_attempt: None,
                     });
                 }
                 return Err(MailboxError::AlreadyClaimed {
@@ -5651,6 +5776,7 @@ impl MessageStore {
             message,
             withdrawn_attempt,
             consumed_doorbell_attempt,
+            claimed_ack_timeout_attempt,
         })
     }
 
@@ -6424,6 +6550,85 @@ impl MessageStore {
             .expect("claimed staged clear retains its notification record"))
     }
 
+    /// Settle a claimed v2 ACK timeout after exact composer reconciliation.
+    ///
+    /// The dedicated identity-only fact moves the notification to Notified and
+    /// retires its barrier together. Until that append succeeds, the alarm
+    /// remains visible and the attempt remains the recipient FIFO owner.
+    pub(crate) fn settle_claimed_ack_timeout_reconciliation(
+        &mut self,
+        message_id: MessageId,
+        recipient: RecipientKey,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<NotificationRecord, MessageStoreError> {
+        if self
+            .projection
+            .claimed_ack_timeout_reconciliations
+            .contains(&attempt_id)
+        {
+            let current = self
+                .projection
+                .notification(recipient, &message_id)
+                .filter(|record| {
+                    record.attempt_id == attempt_id
+                        && record.state == NotificationState::Notified
+                        && record.transport == NotificationTransport::Doorbell
+                        && record.doorbell_format == Some(DOORBELL_FORMAT_ATTEMPT_CLAIM)
+                        && !self
+                            .projection
+                            .active_notification_barriers
+                            .contains_key(&attempt_id)
+                })
+                .ok_or_else(|| {
+                    MailboxError::InvalidNotificationFact(
+                        "settled ACK-timeout reconciliation has inconsistent projection state"
+                            .into(),
+                    )
+                })?;
+            return Ok(current.clone());
+        }
+
+        let fact = NotificationFact::NotificationClaimedAckTimeoutReconciled {
+            record_version: CANONICAL_RECORD_VERSION,
+            attempt_id,
+            message_id: message_id.clone(),
+            recipient,
+        };
+        let line = LedgerLine {
+            seq: self.writer.next_seq(),
+            boot_id: self.writer.boot_id().to_string(),
+            id: message_id.to_string(),
+            ts: now_ms().max(1),
+            kind: Kind::State,
+            from: "cyclopsd".into(),
+            to: vec![recipient.to_string()],
+            subject: None,
+            body: None,
+            reply_to: None,
+            deliveries: Vec::new(),
+            data: Some(serde_json::to_value(fact)?),
+        };
+        let prepared = self.projection.prepare_line(&line)?;
+        #[cfg(test)]
+        if self.fail_claimed_ack_timeout_reconciliation_appends > 0 {
+            self.fail_claimed_ack_timeout_reconciliation_appends -= 1;
+            return Err(LedgerError::Io {
+                path: self.writer.path().to_path_buf(),
+                source: std::io::Error::other(
+                    "injected claimed ACK-timeout reconciliation journal append failure",
+                ),
+            }
+            .into());
+        }
+        let persisted = self.writer.append(line)?;
+        self.projection.commit_line(persisted, prepared);
+        Ok(self
+            .projection
+            .notification(recipient, &message_id)
+            .cloned()
+            .expect("ACK-timeout reconciliation retains its notification record"))
+    }
+
     /// Retire one active composer barrier after external safety proof.
     pub(crate) fn retire_notification_barrier(
         &mut self,
@@ -6833,6 +7038,94 @@ mod tests {
                 MessagesChangedArea::Attention,
             ],
         );
+
+        let fourth = service
+            .send(
+                service.admin(),
+                mailbox_send("reviewer", "Late claim", "Body"),
+            )
+            .unwrap();
+        next_change(
+            &mut events,
+            23,
+            &[
+                MessagesChangedArea::Messages,
+                MessagesChangedArea::Mailboxes,
+            ],
+        );
+        let queued = service.prepare_oldest_notification(bob).unwrap().unwrap();
+        next_change(&mut events, 24, &[MessagesChangedArea::Notifications]);
+        let context = crate::notification_adapter::NotificationContext::new_with_changes(
+            service.store_handle(),
+            fourth.message_id.clone(),
+            bob,
+            queued.attempt_id,
+            service.change_publisher(),
+        );
+        context.record_gating().unwrap();
+        next_change(&mut events, 25, &[MessagesChangedArea::Notifications]);
+        context
+            .record_writing(
+                notification_binding(bob).pane_root.unwrap(),
+                notification_binding(bob).leader.unwrap(),
+                notification_binding(bob).agent,
+                "codex",
+                NotificationTransport::Doorbell,
+                Some(DOORBELL_FORMAT_ATTEMPT_CLAIM),
+            )
+            .unwrap();
+        next_change(&mut events, 26, &[MessagesChangedArea::Notifications]);
+        context.record_staged().unwrap();
+        next_change(&mut events, 27, &[MessagesChangedArea::Notifications]);
+        context.reserve_submit().unwrap();
+        next_change(&mut events, 28, &[MessagesChangedArea::Notifications]);
+        context.record_submitted().unwrap();
+        next_change(&mut events, 29, &[MessagesChangedArea::Notifications]);
+        context
+            .record_attention(NotificationAttentionCause::AckTimeout)
+            .unwrap();
+        next_change(
+            &mut events,
+            30,
+            &[
+                MessagesChangedArea::Notifications,
+                MessagesChangedArea::Attention,
+            ],
+        );
+        let outcome = service.claim(bob, fourth.message_id.clone()).unwrap();
+        assert!(matches!(
+            outcome,
+            ClaimOutcome::Claimed {
+                claimed_ack_timeout_attempt: Some(found),
+                ..
+            } if found == queued.attempt_id
+        ));
+        next_change(&mut events, 31, &[MessagesChangedArea::Mailboxes]);
+        {
+            let store = service.store().unwrap();
+            let record = store
+                .projection()
+                .notification(bob, &fourth.message_id)
+                .unwrap();
+            assert_eq!(record.state, NotificationState::AttentionRequired);
+            assert_eq!(record.cause, Some(NotificationAttentionCause::AckTimeout));
+        }
+        context.settle_claimed_ack_timeout_reconciliation().unwrap();
+        next_change(
+            &mut events,
+            32,
+            &[
+                MessagesChangedArea::Notifications,
+                MessagesChangedArea::Attention,
+            ],
+        );
+        let store = service.store().unwrap();
+        let record = store
+            .projection()
+            .notification(bob, &fourth.message_id)
+            .unwrap();
+        assert_eq!(record.state, NotificationState::Notified);
+        assert_eq!(record.cause, None);
     }
 
     #[test]
@@ -13454,7 +13747,7 @@ mod tests {
             .is_empty());
         let record = reopened
             .projection()
-            .claimed_staged_notification(bob)
+            .claimed_notification_barrier(bob)
             .expect("claimed staged attempt remains resumable");
         assert_eq!(record.attempt_id, attempt_id);
         assert_eq!(record.state, NotificationState::Staged);
@@ -13464,7 +13757,7 @@ mod tests {
         let replayed = MessageStore::open(&root, journal, workspace, "boot-3").unwrap();
         let record = replayed
             .projection()
-            .claimed_staged_notification(bob)
+            .claimed_notification_barrier(bob)
             .expect("second replay retains the exact attempt");
         assert_eq!(record.attempt_id, attempt_id);
         assert_eq!(record.binding.as_ref(), Some(&binding));
@@ -14152,6 +14445,186 @@ mod tests {
         assert_eq!(active[0].attempt_id, attempt(1));
         assert_eq!(active[0].state, NotificationState::AttentionRequired);
         assert_eq!(active[0].binding.as_ref().unwrap().leader, None);
+    }
+
+    #[test]
+    fn exact_recipient_claim_keeps_a_v2_ack_timeout_until_reconciled() {
+        let scratch = StoreScratch::new("v2-ack-timeout-claim");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, admin, bob, _) = test_context();
+        let message_id = MessageId::new("m-v2-ack-timeout").unwrap();
+        let attempt_id = attempt(1);
+        let mut store = MessageStore::open(&root, journal, workspace, "boot").unwrap();
+        store
+            .accept_at(
+                message_id.clone(),
+                draft(admin, vec![bob], "Late claim", None),
+                1,
+            )
+            .unwrap();
+        store
+            .queue_notification(message_id.clone(), bob, attempt_id)
+            .unwrap();
+        store
+            .advance_notification(
+                message_id.clone(),
+                bob,
+                attempt_id,
+                NotificationState::Gating,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .advance_notification_with_transport(
+                message_id.clone(),
+                bob,
+                attempt_id,
+                NotificationState::Writing,
+                notification_binding(bob),
+                NotificationTransport::Doorbell,
+                Some(DOORBELL_FORMAT_ATTEMPT_CLAIM),
+            )
+            .unwrap();
+        for state in [
+            NotificationState::Staged,
+            NotificationState::Submitting,
+            NotificationState::Submitted,
+        ] {
+            store
+                .advance_notification(message_id.clone(), bob, attempt_id, state, None, None)
+                .unwrap();
+        }
+        store
+            .advance_notification(
+                message_id.clone(),
+                bob,
+                attempt_id,
+                NotificationState::AttentionRequired,
+                None,
+                Some(NotificationAttentionCause::AckTimeout),
+            )
+            .unwrap();
+
+        let outcome = store.claim(bob, message_id.clone()).unwrap();
+        assert!(matches!(
+            outcome,
+            ClaimOutcome::Claimed {
+                claimed_ack_timeout_attempt: Some(found),
+                ..
+            } if found == attempt_id
+        ));
+        let record = store.projection().notification(bob, &message_id).unwrap();
+        assert_eq!(record.state, NotificationState::AttentionRequired);
+        assert_eq!(record.cause, Some(NotificationAttentionCause::AckTimeout));
+        assert_eq!(
+            store
+                .projection()
+                .open_alarms_for_message(&message_id)
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .projection()
+                .claimed_notification_barrier(bob)
+                .map(|record| record.attempt_id),
+            Some(attempt_id)
+        );
+        let before_failed_append = store.projection().last_sequence();
+        store.inject_next_claimed_ack_timeout_reconciliation_append_failure();
+        assert!(store
+            .settle_claimed_ack_timeout_reconciliation(message_id.clone(), bob, attempt_id)
+            .is_err());
+        assert_eq!(store.projection().last_sequence(), before_failed_append);
+        assert_eq!(
+            store
+                .projection()
+                .notification(bob, &message_id)
+                .map(|record| (record.state, record.cause)),
+            Some((
+                NotificationState::AttentionRequired,
+                Some(NotificationAttentionCause::AckTimeout),
+            ))
+        );
+        assert_eq!(store.projection().active_notification_barriers().len(), 1);
+        assert_eq!(
+            store
+                .projection()
+                .open_alarms_for_message(&message_id)
+                .len(),
+            1
+        );
+        let error = store
+            .retire_notification_barrier(
+                message_id.clone(),
+                bob,
+                attempt_id,
+                NotificationBarrierRetirementCause::LifecycleReconciled,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MessageStoreError::Mailbox(error)
+                if matches!(
+                    *error,
+                    MailboxError::NotificationBarrierRetirementState {
+                        cause: NotificationBarrierRetirementCause::LifecycleReconciled,
+                        state: NotificationState::AttentionRequired,
+                    }
+                )
+        ));
+        assert_eq!(store.projection().active_notification_barriers().len(), 1);
+        assert_eq!(
+            store
+                .projection()
+                .open_alarms_for_message(&message_id)
+                .len(),
+            1
+        );
+
+        store
+            .settle_claimed_ack_timeout_reconciliation(message_id.clone(), bob, attempt_id)
+            .unwrap();
+        let record = store.projection().notification(bob, &message_id).unwrap();
+        assert_eq!(record.state, NotificationState::Notified);
+        assert_eq!(record.cause, None);
+        assert!(store.projection().active_notification_barriers().is_empty());
+        assert!(store
+            .projection()
+            .open_alarms_for_message(&message_id)
+            .is_empty());
+        let settled_seq = store.projection().last_sequence();
+        let settled_lines = std::fs::read_to_string(store.journal_path())
+            .unwrap()
+            .lines()
+            .count();
+        store
+            .settle_claimed_ack_timeout_reconciliation(message_id.clone(), bob, attempt_id)
+            .unwrap();
+        assert_eq!(store.projection().last_sequence(), settled_seq);
+        assert_eq!(
+            std::fs::read_to_string(store.journal_path())
+                .unwrap()
+                .lines()
+                .count(),
+            settled_lines
+        );
+        drop(store);
+
+        let reopened = MessageStore::open(&root, journal, workspace, "boot-2").unwrap();
+        let record = reopened
+            .projection()
+            .notification(bob, &message_id)
+            .unwrap();
+        assert_eq!(record.state, NotificationState::Notified);
+        assert_eq!(record.cause, None);
+        assert!(reopened
+            .projection()
+            .open_alarms_for_message(&message_id)
+            .is_empty());
     }
 
     #[test]

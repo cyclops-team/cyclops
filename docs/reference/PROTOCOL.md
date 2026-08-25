@@ -343,6 +343,12 @@ replacement.
 An ambiguous terminal outcome moves to `attention_required` and never triggers
 an automatic second write. A doorbell message remains pending until claim. A
 successful direct fallback settles the mailbox entry as `delivered_direct`.
+For a current format 2 doorbell with a complete binding, an exact recipient
+claim can start reconciliation of `attention_required` with cause `ack_timeout`.
+The claim leaves that state and its FIFO barrier unchanged until Cyclops clears
+the exact staged doorbell or proves the same bound composer is clean. One
+dedicated fact then moves the attempt to `notified` and retires the barrier
+atomically. It does not settle other attention causes or prove task completion.
 Admin has no pane route, so an accepted admin message reports `not_started` and
 remains in the durable admin inbox without a notification attempt.
 

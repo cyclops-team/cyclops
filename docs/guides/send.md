@@ -112,6 +112,13 @@ claim races a doorbell already staged in the composer, Cyclops must either
 submit a previously reserved terminal key or re-prove and clear that exact
 doorbell. The claim alone never settles staged bytes.
 
+A current format 2 doorbell can reach `ack_timeout` after the terminal key was
+sent but before Claude paints output. A later exact recipient claim starts
+reconciliation. Cyclops clears the exact staged doorbell, or proves the same
+bound composer is clean, before moving the attempt to `notified` and clearing
+its alarm. The claim alone changes neither the alarm nor the FIFO barrier.
+Other attention causes remain operator work.
+
 Reply using the message id so the daemon derives the recipient, thread, and
 subject from the visible parent:
 

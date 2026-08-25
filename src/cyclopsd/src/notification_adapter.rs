@@ -45,6 +45,12 @@ pub(crate) enum SubmitReservation {
     ClaimedBeforeSubmit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimedNotificationBarrier {
+    Staged,
+    AckTimeout,
+}
+
 impl NotificationContext {
     #[allow(dead_code)]
     pub(crate) fn new(
@@ -118,20 +124,28 @@ impl NotificationContext {
             .ok_or(NotificationAdapterError::NoLongerCurrentBeforeWrite)
     }
 
-    pub(crate) fn is_claimed_staged(&self) -> Result<bool, NotificationAdapterError> {
+    pub(crate) fn claimed_notification_barrier(
+        &self,
+    ) -> Result<Option<ClaimedNotificationBarrier>, NotificationAdapterError> {
         let store = self
             .store
             .lock()
             .map_err(|_| NotificationAdapterError::StoreLockPoisoned)?;
         let current = store
             .projection()
-            .notification(self.recipient, &self.message_id);
-        let claimed = store
-            .projection()
-            .get_entry(self.recipient, &self.message_id)
-            .is_some_and(|entry| entry.state.is_claimed());
-        Ok(current.is_some_and(|record| {
-            self.owns(record) && record.state == NotificationState::Staged && claimed
+            .claimed_notification_barrier(self.recipient);
+        Ok(current.and_then(|record| {
+            if !self.owns(record) {
+                None
+            } else if record.state == NotificationState::Staged
+                && record.transport == NotificationTransport::Doorbell
+            {
+                Some(ClaimedNotificationBarrier::Staged)
+            } else if record.needs_claimed_ack_timeout_reconciliation() {
+                Some(ClaimedNotificationBarrier::AckTimeout)
+            } else {
+                None
+            }
         }))
     }
 
@@ -341,6 +355,38 @@ impl NotificationContext {
                     .projection()
                     .last_sequence()
                     .expect("claimed staged clear advances the workspace sequence");
+                publisher.publish(
+                    seq,
+                    &[
+                        MessagesChangedArea::Notifications,
+                        MessagesChangedArea::Attention,
+                    ],
+                );
+            }
+        }
+        Ok(record)
+    }
+
+    /// Settle an exact claimed v2 ACK timeout after composer reconciliation.
+    pub(crate) fn settle_claimed_ack_timeout_reconciliation(
+        &self,
+    ) -> Result<NotificationRecord, NotificationAdapterError> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| NotificationAdapterError::StoreLockPoisoned)?;
+        let before_seq = store.projection().last_sequence();
+        let record = store.settle_claimed_ack_timeout_reconciliation(
+            self.message_id.clone(),
+            self.recipient,
+            self.attempt_id,
+        )?;
+        if store.projection().last_sequence() != before_seq {
+            if let Some(publisher) = &self.changes {
+                let seq = store
+                    .projection()
+                    .last_sequence()
+                    .expect("ACK-timeout reconciliation advances the workspace sequence");
                 publisher.publish(
                     seq,
                     &[

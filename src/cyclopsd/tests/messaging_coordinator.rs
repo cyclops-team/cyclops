@@ -10,7 +10,9 @@ use common::{
     composer_pane, faketui_path, hold_script, swallowing_animated_composer_pane, tmux_available,
     wait_pane_state, Rig, CAT_MANIFEST, HOOK_MANIFEST, MODAL_MANIFEST,
 };
-use cyclops_proto::{Kind, LedgerLine, MessageId, MsgSendParams, NotificationState};
+use cyclops_proto::{
+    Kind, LedgerLine, MessageId, MsgSendParams, NotificationAttemptId, NotificationState,
+};
 use serde_json::{json, Value};
 
 fn workspace_lines(rig: &Rig) -> Vec<LedgerLine> {
@@ -753,6 +755,268 @@ async fn changed_chrome_does_not_receipt_a_swallowed_compact_doorbell() {
     assert!(screen.contains(&compact_doorbell(&message_id)), "{screen}");
     assert!(screen.contains("Ctx: 77%"), "{screen}");
 
+    rig.daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exact_v2_ack_timeout_claim_clears_then_advances_the_fifo() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let log_dir = cyclops_proto::scratch::scratch_dir(&format!(
+        "claimed-ack-timeout-submit-log-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&log_dir).unwrap();
+    let submit_log = log_dir.join("submits.txt");
+    let pane_command = format!(
+        "python3 {} --swallow-once --clear-staged --submit-log {}",
+        faketui_path(),
+        submit_log.display()
+    );
+    let manifest = HOOK_MANIFEST.replace(
+        "submit = \"Enter\"\n",
+        "submit = \"Enter\"\nclear_keys = [\"C-c\"]\n",
+    );
+    let mut rig = Rig::new(
+        "workspace-claimed-v2-ack-timeout",
+        &manifest,
+        &pane_command,
+        "delivery_retry_max = 0\nreceipt_block_ms = 300\nack_timeout_ms = 50\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let pair = send_waiting_pair(&rig, "claimed-v2-ack-timeout").await;
+    assert_only_oldest_attempt_exists(&rig, &pair);
+    wait_for_notification_state(&mut rig, &pair.first, NotificationState::Staged).await;
+    wait_for_notification_state(&mut rig, &pair.first, NotificationState::Submitted).await;
+    wait_for_notification_state(&mut rig, &pair.first, NotificationState::AttentionRequired).await;
+    let attention =
+        notification_transition(&rig, &pair.first, NotificationState::AttentionRequired)
+            .expect("durable ACK-timeout transition");
+    assert_eq!(attention.data.as_ref().unwrap()["cause"], "ack_timeout");
+    let attempt_id = attention.data.as_ref().unwrap()["attempt_id"]
+        .as_str()
+        .unwrap();
+    let expected = cyclops_proto::render_doorbell_v2(
+        &MessageId::new(&pair.first).unwrap(),
+        NotificationAttemptId::parse(attempt_id).unwrap(),
+    );
+    assert!(rig.tmux.capture(&pane).contains(&expected));
+    assert_eq!(fs::read_to_string(&submit_log).unwrap().lines().count(), 1);
+
+    let (settlement_tx, mut settlement_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release_settlement = Arc::new(tokio::sync::Semaphore::new(0));
+    let (refusal_tx, mut refusal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release_refusal = Arc::new(tokio::sync::Semaphore::new(0));
+    let (second_staged_tx, mut second_staged_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release_second = Arc::new(tokio::sync::Semaphore::new(0));
+    let settlement_pause = Arc::clone(&release_settlement);
+    let refusal_pause = Arc::clone(&release_refusal);
+    let second_pause = Arc::clone(&release_second);
+    rig.daemon.set_inject_pause(move |phase| {
+        let settlement_tx = settlement_tx.clone();
+        let refusal_tx = refusal_tx.clone();
+        let second_staged_tx = second_staged_tx.clone();
+        let settlement_pause = Arc::clone(&settlement_pause);
+        let refusal_pause = Arc::clone(&refusal_pause);
+        let second_pause = Arc::clone(&second_pause);
+        Box::pin(async move {
+            match phase {
+                "post_claimed_notification_refusal" => {
+                    let _ = refusal_tx.send(());
+                    refusal_pause.acquire_owned().await.unwrap().forget();
+                }
+                "pre_claimed_notification_settlement" => {
+                    let _ = settlement_tx.send(());
+                    settlement_pause.acquire_owned().await.unwrap().forget();
+                }
+                "pre_submit" => {
+                    let _ = second_staged_tx.send(());
+                    second_pause.acquire_owned().await.unwrap().forget();
+                }
+                _ => {}
+            }
+        })
+    });
+
+    let started = rig
+        .daemon
+        .report_state(
+            serde_json::from_value(json!({
+                "agent": "worker",
+                "event": "UserPromptSubmit",
+                "seq": 1,
+                "payload": {
+                    "prompt": "a different prompt is already running",
+                    "session_id": "claimed-ack-timeout-session",
+                    "turn_id": "claimed-ack-timeout-turn"
+                }
+            }))
+            .unwrap(),
+        )
+        .await
+        .expect("turn start accepted");
+    assert_eq!(started["applied"], true, "{started}");
+    assert_eq!(started["state"], "working", "{started}");
+    wait_pane_state(&mut rig, "working").await;
+
+    rig.daemon
+        .claim_message_for_test("worker", &pair.first)
+        .expect("exact recipient claim");
+    tokio::time::timeout(Duration::from_secs(5), refusal_rx.recv())
+        .await
+        .expect("claimed recovery reached its unsafe-action decision")
+        .expect("refusal sender stayed open");
+    assert!(settlement_rx.try_recv().is_err());
+    assert!(
+        rig.tmux.capture(&pane).contains(&expected),
+        "the exact doorbell must remain staged while terminal action is unsafe"
+    );
+    assert!(workspace_lines(&rig).iter().all(|line| {
+        line.id != pair.first
+            || line
+                .data
+                .as_ref()
+                .is_none_or(|data| data["type"] != "notification_claimed_ack_timeout_reconciled")
+    }));
+
+    let stopped = rig
+        .daemon
+        .report_state(
+            serde_json::from_value(json!({
+                "agent": "worker",
+                "event": "Stop",
+                "seq": 2,
+                "payload": {
+                    "session_id": "claimed-ack-timeout-session",
+                    "turn_id": "claimed-ack-timeout-turn"
+                }
+            }))
+            .unwrap(),
+        )
+        .await
+        .expect("turn end accepted");
+    assert_eq!(stopped["applied"], true, "{stopped}");
+    assert_eq!(stopped["state"], "idle", "{stopped}");
+    wait_pane_state(&mut rig, "idle").await;
+    release_refusal.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), settlement_rx.recv())
+        .await
+        .expect("claimed notification reached the settlement boundary")
+        .expect("settlement sender stayed open");
+    let claim = wait_for_workspace_fact(&rig, &pair.first, "message_claimed").await;
+    assert!(workspace_lines(&rig).iter().all(|line| {
+        line.id != pair.first
+            || line
+                .data
+                .as_ref()
+                .is_none_or(|data| data["type"] != "notification_claimed_ack_timeout_reconciled")
+    }));
+    assert!(notification_attempts(&rig, &pair.second).is_empty());
+    let claimed = rig.ctl.request("messages.snapshot", json!({})).await;
+    let first_before_settlement = claimed["result"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["message_id"].as_str() == Some(pair.first.as_str()))
+        .expect("claimed message remains visible before settlement");
+    assert_eq!(
+        first_before_settlement["recipients"][0]["mailbox"]["status"],
+        "claimed"
+    );
+    assert_eq!(
+        first_before_settlement["recipients"][0]["notification"]["state"],
+        "attention_required"
+    );
+    assert_eq!(
+        first_before_settlement["recipients"][0]["notification"]["cause"],
+        "ack_timeout"
+    );
+    assert_eq!(claimed["result"]["counts"]["open_attention_entries"], 1);
+    assert!(
+        !rig.tmux.capture(&pane).contains(&expected),
+        "exact clear must finish before durable settlement"
+    );
+
+    release_settlement.add_permits(1);
+    let settled = wait_for_workspace_fact(
+        &rig,
+        &pair.first,
+        "notification_claimed_ack_timeout_reconciled",
+    )
+    .await;
+    assert!(claim.seq < settled.seq, "claim must precede reconciliation");
+    assert!(settled.subject.is_none());
+    assert!(settled.body.is_none());
+    assert!(settled.reply_to.is_none());
+    assert!(settled.deliveries.is_empty());
+    let data = settled.data.as_ref().unwrap().as_object().unwrap();
+    assert_eq!(
+        data.keys().cloned().collect::<BTreeSet<_>>(),
+        [
+            "attempt_id".to_string(),
+            "message_id".to_string(),
+            "recipient".to_string(),
+            "record_version".to_string(),
+            "type".to_string(),
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert!(data.get("composer").is_none());
+    assert!(data.get("diff").is_none());
+    assert_eq!(
+        notification_state_count(&rig, &pair.first, NotificationState::Notified),
+        0,
+        "only the dedicated reconciliation fact may project Notified"
+    );
+    rig.ev
+        .wait_event(Duration::from_secs(5), |event| {
+            event["event"] == "messages.changed"
+                && event["seq"] == settled.seq
+                && event["data"]["changed"].as_array().is_some_and(|areas| {
+                    areas.iter().any(|area| area == "notifications")
+                        && areas.iter().any(|area| area == "attention")
+                })
+        })
+        .await;
+
+    tokio::time::timeout(Duration::from_secs(5), second_staged_rx.recv())
+        .await
+        .expect("next FIFO notification reached pre-submit")
+        .expect("pre-submit sender stayed open");
+    let second_writing = notification_transition(&rig, &pair.second, NotificationState::Writing)
+        .expect("next FIFO notification crossed the write boundary");
+    assert!(
+        settled.seq < second_writing.seq,
+        "next FIFO notification advanced before reconciliation"
+    );
+    assert_eq!(notification_attempts(&rig, &pair.first).len(), 1);
+    assert_eq!(
+        notification_state_count(&rig, &pair.first, NotificationState::Writing),
+        1,
+        "reconciliation must not paste the first doorbell again"
+    );
+    assert_eq!(fs::read_to_string(&submit_log).unwrap().lines().count(), 1);
+    assert!(!rig.tmux.capture(&pane).contains(&expected));
+
+    let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
+    let first = snapshot["result"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["message_id"].as_str() == Some(pair.first.as_str()))
+        .expect("claimed message remains visible");
+    assert_eq!(first["recipients"][0]["mailbox"]["status"], "claimed");
+    assert_eq!(first["recipients"][0]["notification"]["state"], "notified");
+    assert_eq!(snapshot["result"]["counts"]["open_attention_entries"], 0);
+
+    release_second.add_permits(1);
     rig.daemon.shutdown().await;
 }
 
