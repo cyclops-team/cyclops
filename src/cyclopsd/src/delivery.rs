@@ -3820,8 +3820,7 @@ async fn attempt_delivery(
                     },
                     &proven,
                     &injector,
-                    ClaimedStagedReconciliation::CurrentRun,
-                    ClaimedNotificationBarrier::Staged,
+                    ClaimedStagedReconciliation::CurrentStaged,
                 )
                 .await;
             }
@@ -4219,16 +4218,24 @@ async fn reconcile_recovered_claimed_notification_barrier(
         },
         &proven,
         &injector,
-        ClaimedStagedReconciliation::Recovered,
-        barrier,
+        ClaimedStagedReconciliation::Recovered(barrier),
     )
     .await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaimedStagedReconciliation {
-    CurrentRun,
-    Recovered,
+    CurrentStaged,
+    Recovered(ClaimedNotificationBarrier),
+}
+
+impl ClaimedStagedReconciliation {
+    fn barrier(self) -> ClaimedNotificationBarrier {
+        match self {
+            Self::CurrentStaged => ClaimedNotificationBarrier::Staged,
+            Self::Recovered(barrier) => barrier,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4257,10 +4264,10 @@ fn claimed_staged_action(
 ) -> ClaimedStagedAction {
     match (composer, reconciliation) {
         (ClaimedStagedComposer::ExactDoorbell, _) => ClaimedStagedAction::ClearThenSettle,
-        (ClaimedStagedComposer::Clean, ClaimedStagedReconciliation::Recovered) => {
+        (ClaimedStagedComposer::Clean, ClaimedStagedReconciliation::Recovered(_)) => {
             ClaimedStagedAction::SettleOnly
         }
-        (ClaimedStagedComposer::Clean, ClaimedStagedReconciliation::CurrentRun)
+        (ClaimedStagedComposer::Clean, ClaimedStagedReconciliation::CurrentStaged)
         | (ClaimedStagedComposer::Ambiguous, _) => ClaimedStagedAction::Refuse,
     }
 }
@@ -4293,7 +4300,6 @@ async fn reconcile_claimed_notification_barrier<I: Injector>(
     proven: &fusion::Binding,
     injector: &I,
     reconciliation: ClaimedStagedReconciliation,
-    barrier: ClaimedNotificationBarrier,
 ) -> AttemptOutcome {
     if proven_binding_unchanged(inner, handle, proven).is_err() {
         return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
@@ -4360,7 +4366,10 @@ async fn reconcile_claimed_notification_barrier<I: Injector>(
         .notification
         .as_ref()
         .expect("claim reconciliation belongs to a notification");
-    let record = match settle_claimed_notification_after_clear(notification, barrier) {
+    let record = match settle_claimed_notification_after_clear(
+        notification,
+        reconciliation.barrier(),
+    ) {
         Ok(record) => record,
         Err(error) => {
             error!(id = %handle.msg_id, %error, "claimed notification settlement failed twice; notification worker remains faulted");
@@ -4422,6 +4431,7 @@ fn settle_claimed_notification_after_clear(
     }
 }
 
+#[cfg(test)]
 fn settle_claimed_staged_after_clear(
     notification: &NotificationContext,
 ) -> Result<cyclops_proto::NotificationRecord, NotificationAdapterError> {
@@ -10600,7 +10610,7 @@ unstyled_composer_proof = 'structural_trailer'
         assert_eq!(
             claimed_staged_action(
                 ClaimedStagedComposer::Clean,
-                ClaimedStagedReconciliation::Recovered,
+                ClaimedStagedReconciliation::Recovered(ClaimedNotificationBarrier::Staged),
             ),
             ClaimedStagedAction::SettleOnly
         );
@@ -10683,7 +10693,7 @@ line_regex_esc = ['^❯$']
         assert_eq!(
             claimed_staged_action(
                 ClaimedStagedComposer::ExactDoorbell,
-                ClaimedStagedReconciliation::Recovered,
+                ClaimedStagedReconciliation::Recovered(ClaimedNotificationBarrier::Staged),
             ),
             ClaimedStagedAction::ClearThenSettle
         );
@@ -10699,7 +10709,7 @@ line_regex_esc = ['^❯$']
         assert_eq!(
             claimed_staged_action(
                 ClaimedStagedComposer::Ambiguous,
-                ClaimedStagedReconciliation::Recovered,
+                ClaimedStagedReconciliation::Recovered(ClaimedNotificationBarrier::Staged),
             ),
             ClaimedStagedAction::Refuse
         );

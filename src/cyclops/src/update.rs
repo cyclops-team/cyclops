@@ -2807,7 +2807,10 @@ sys.exit(43)"#,
         let root = cyclops_state::StateRoot::open_or_create(&cache).unwrap();
         let held = lock_build_cache(&root).unwrap();
         let inherited = held.0.try_clone().unwrap();
-        assert!(lock_build_cache(&root).unwrap_err().contains("in use"));
+        let error = lock_build_cache(&root)
+            .err()
+            .expect("a second build cache lease must be refused");
+        assert!(error.contains("in use"));
         drop(held);
         assert!(lock_build_cache(&root).is_ok());
         drop(inherited);

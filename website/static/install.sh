@@ -325,12 +325,18 @@ case "$0" in
 esac
 
 CLONED=""
+PAIR_SOURCE=""
+cleanup() {
+    [ -z "$PAIR_SOURCE" ] || rm -rf "$PAIR_SOURCE"
+    [ -z "$CLONED" ] || rm -rf "$CLONED"
+}
+trap cleanup EXIT INT TERM
+
 if [ -z "$SRC" ]; then
     have git || die "git is not installed, and there is no clone to build from" \
         "install git, or clone the repo and run ./scripts/install.sh inside it"
     step "fetching the source"
     CLONED="$(mktemp -d "${TMPDIR:-/tmp}/cyclops-install.XXXXXX")"
-    trap 'rm -rf "$CLONED"' EXIT INT TERM
     git clone --depth 1 --branch "$REF" "$REPO_URL" "$CLONED/cyclops" >/dev/null 2>&1 ||
         die "could not clone $REPO_URL at $REF" "check the network, or set CYCLOPS_REF to a branch that exists"
     SRC="$CLONED/cyclops"
@@ -361,6 +367,19 @@ for name in cyclops cyclopsd; do
     [ -x "$TARGET/$name" ] || die "the build finished but $TARGET/$name is missing"
 done
 
+# Cargo may hard-link a top-level binary to its hashed build artifact. Copy
+# both binaries into one private directory so the validator executes and
+# stages the same unlinked candidate pair.
+PAIR_SOURCE="$(mktemp -d "${TMPDIR:-/tmp}/cyclops-pair.XXXXXX")" ||
+    die "cannot create a private candidate directory"
+chmod 700 "$PAIR_SOURCE" || die "cannot secure the private candidate directory"
+for name in cyclops cyclopsd; do
+    cp "$TARGET/$name" "$PAIR_SOURCE/$name" ||
+        die "cannot copy $name into the private candidate directory"
+    chmod 755 "$PAIR_SOURCE/$name" ||
+        die "cannot make the private $name candidate executable"
+done
+
 # ---------------------------------------------------------------------------
 # 4. install the binaries
 # ---------------------------------------------------------------------------
@@ -376,7 +395,7 @@ mkdir -p "$PREFIX" 2>/dev/null ||
 
 # The candidate owns pair validation, journal replay, daemon quiescence, and
 # the one selector change. The shell never publishes two binaries separately.
-"$TARGET/cyclops" update --install-pair "$TARGET" --prefix "$PREFIX" ||
+"$PAIR_SOURCE/cyclops" update --install-pair "$PAIR_SOURCE" --prefix "$PREFIX" ||
     die "the matched binary pair could not be activated" "the output above names the proof that failed"
 note "$PREFIX/cyclops"
 note "$PREFIX/cyclopsd"
