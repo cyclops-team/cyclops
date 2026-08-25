@@ -11,6 +11,7 @@ use ratatui::style::Modifier;
 use ratatui::text::Span;
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap};
 
+use super::PANE_GRIP;
 use crate::bindings::BindingAction;
 use crate::copy;
 use crate::dialog::Dialog;
@@ -47,10 +48,11 @@ const DIALOG_BUTTON_GAP: u16 = 2;
 /// and not so many that the card takes the terminal it floats over.
 const FIELD_MAX_ROWS: u16 = 6;
 
-/// The rows a floating box is dragged by: its top border, and the title row
-/// under it. One border row is a hard target for a pointer, and the title
-/// row carries no control of its own, so claiming it costs nothing and
-/// doubles the reach.
+/// The rows a floating box is dragged by: its top border, and the row
+/// under it. One border row is a hard target for a pointer, and the row
+/// under it carries no control of its own (the hint on the list cards, the
+/// question on a plain one), so claiming it costs nothing and doubles the
+/// reach.
 const DIALOG_GRAB_ROWS: u16 = 2;
 
 /// Move a centered box by however far the operator has dragged it, and keep
@@ -74,14 +76,23 @@ fn shift_on_screen(rect: Rect, area: Rect, offset: (i16, i16)) -> Rect {
     )
 }
 
-/// Record the rows that pick a floating box up, and light them while the
-/// pointer is on them so the box says it can be moved.
+/// Name a floating box in its top border, set the drag grip at the
+/// border's far end, and record the rows that pick the box up.
+///
+/// The border reads `╭─ Themes ──────[⠿]─╮`, or `╭──────[⠿]─╮` for a
+/// card whose title is its question and stays inside. The grip is
+/// [`PANE_GRIP`], the handle every pane frame wears, so a card is dragged
+/// by the glyph a pane is; and it is always painted, because a handle that
+/// only appears under the mouse has to be found by accident. Nothing here
+/// answers the pointer: the whole strip drags and the grip says so at
+/// rest. An earlier version lit the border under the mouse, and a bar
+/// that lit read as a selection rather than a handle.
 fn paint_title_bar(
     buf: &mut Buffer,
     dialog_area: Rect,
+    title: Option<&str>,
     paint: &Paint,
     hits: &mut HitMap,
-    hover: Option<(u16, u16)>,
 ) {
     let grab = Rect::new(
         dialog_area.x,
@@ -89,18 +100,23 @@ fn paint_title_bar(
         dialog_area.width,
         DIALOG_GRAB_ROWS.min(dialog_area.height),
     );
-    let hovered = hover.is_some_and(|(col, row)| {
-        col >= grab.x && col < grab.x + grab.width && row >= grab.y && row < grab.y + grab.height
-    });
-    // The border alone, not the title row: lighting the row under it would
-    // restyle the title text and read as a selection rather than a handle.
-    if hovered {
-        let style = theme::dialog_primary(paint);
-        for col in dialog_area.x..dialog_area.x + dialog_area.width {
-            if let Some(cell) = buf.cell_mut((col, dialog_area.y)) {
-                cell.set_style(style);
-            }
-        }
+    // Between the corners, which stay the frame's, one border cell in
+    // from each so the name and the grip sit in the line rather than
+    // against a corner.
+    let bar = Rect::new(
+        dialog_area.x.saturating_add(1),
+        dialog_area.y,
+        dialog_area.width.saturating_sub(2),
+        1,
+    );
+    let style = theme::dialog_title(paint);
+    if let Some(title) = title {
+        let name = format!(" {title} ");
+        super::overlay_text(buf, bar, bar.x.saturating_add(1), bar.y, &name, style);
+    }
+    let grip_x = (bar.x + bar.width).saturating_sub(text_width(PANE_GRIP) + 1);
+    if grip_x > bar.x {
+        super::overlay_text(buf, bar, grip_x, bar.y, PANE_GRIP, style);
     }
     hits.push(grab, HitTarget::DialogTitleBar);
 }
@@ -425,7 +441,7 @@ pub fn paint_dialog(
             .render(error_area, buf);
     }
     paint_dialog_buttons(buf, inner, paint, hits, hover, confirm_label);
-    paint_title_bar(buf, dialog_area, paint, hits, hover);
+    paint_title_bar(buf, dialog_area, None, paint, hits);
 }
 
 /// Where a plain dialog lands and how many rows its field gets, or `None`
@@ -636,14 +652,6 @@ fn paint_keybinds_dialog(
         inner,
         left,
         inner.y,
-        copy::KEYBINDS_TITLE,
-        theme::menu_row(paint).add_modifier(Modifier::BOLD),
-    );
-    super::overlay_text(
-        buf,
-        inner,
-        left,
-        inner.y + 1,
         copy::KEYBINDS_HINT,
         theme::menu_hint(paint),
     );
@@ -655,12 +663,12 @@ fn paint_keybinds_dialog(
         buf,
         inner,
         left,
-        inner.y + 2,
+        inner.y + 1,
         copy::STATE_GLYPH_LEGEND,
         theme::menu_hint(paint),
     );
 
-    let list_y = inner.y + 4;
+    let list_y = inner.y + 3;
     let start = if list_h == 0 {
         0
     } else {
@@ -722,7 +730,7 @@ fn paint_keybinds_dialog(
             .saturating_add(inner.width.saturating_sub(progress_w + 2));
         super::overlay_text(buf, inner, x, footer_y, &progress, theme::menu_hint(paint));
     }
-    paint_title_bar(buf, dialog_area, paint, hits, hover);
+    paint_title_bar(buf, dialog_area, Some(copy::KEYBINDS_TITLE), paint, hits);
 }
 
 /// Tallest the keybinds dialog may grow. The list scrolls, so the dialog
@@ -734,9 +742,10 @@ fn keybind_dialog_geometry(row_count: usize, area: Rect) -> Option<(Rect, u16)> 
         return None;
     }
     let width = area.width.saturating_sub(4).min(72);
-    // Title, hint, glyph legend, one blank line before the list, one blank
-    // line after it, and the footer: 6 fixed rows around the scrollable list.
-    let wanted_height = u16::try_from(row_count.saturating_add(8)).unwrap_or(u16::MAX);
+    // Hint, glyph legend, one blank line before the list, one blank line
+    // after it, and the footer: 5 fixed rows around the scrollable list.
+    // The title is in the border (`paint_title_bar`).
+    let wanted_height = u16::try_from(row_count.saturating_add(7)).unwrap_or(u16::MAX);
     let height = wanted_height
         .min(area.height.saturating_sub(2))
         .clamp(6, KEYBINDS_MAX_HEIGHT);
@@ -746,7 +755,7 @@ fn keybind_dialog_geometry(row_count: usize, area: Rect) -> Option<(Rect, u16)> 
         width,
         height,
     );
-    let list_height = height.saturating_sub(2).saturating_sub(6);
+    let list_height = height.saturating_sub(2).saturating_sub(5);
     Some((dialog, list_height))
 }
 
@@ -799,20 +808,12 @@ fn paint_themes_dialog(
 
     let left = inner.x + DIALOG_INSET;
     let usable_w = inner.width.saturating_sub(2 * DIALOG_INSET);
-    super::overlay_text(
-        buf,
-        inner,
-        left,
-        inner.y,
-        copy::THEMES_TITLE,
-        theme::menu_row(paint).add_modifier(Modifier::BOLD),
-    );
     if !names.is_empty() {
         super::overlay_text(
             buf,
             inner,
             left,
-            inner.y + 1,
+            inner.y,
             copy::THEMES_HINT,
             theme::menu_hint(paint),
         );
@@ -820,7 +821,7 @@ fn paint_themes_dialog(
 
     // The selected row stays visible: the window slides down only once
     // the arrows walk past its last visible row.
-    let list_y = inner.y + 3;
+    let list_y = inner.y + 2;
     let list_h = usize::from(list_h);
     let start = if list_h == 0 || selected < list_h {
         0
@@ -868,7 +869,7 @@ fn paint_themes_dialog(
     }
 
     paint_dialog_buttons(buf, inner, paint, hits, hover, copy::BUTTON_APPLY);
-    paint_title_bar(buf, dialog_area, paint, hits, hover);
+    paint_title_bar(buf, dialog_area, Some(copy::THEMES_TITLE), paint, hits);
 }
 
 /// What the theme picker's notice slot holds. An empty listing has no rows
@@ -894,8 +895,11 @@ fn themes_dialog_geometry(
         return None;
     }
     let width = area.width.saturating_sub(4).min(48);
+    // Hint, one blank line before the list, one after it, and the action
+    // row: 4 fixed rows around the list, plus the notice. The title is in
+    // the border (`paint_title_bar`).
     let wanted_height =
-        u16::try_from(row_count.saturating_add(notice_lines).saturating_add(7)).unwrap_or(u16::MAX);
+        u16::try_from(row_count.saturating_add(notice_lines).saturating_add(6)).unwrap_or(u16::MAX);
     let height = wanted_height.min(area.height.saturating_sub(2)).max(6);
     let dialog = Rect::new(
         area.x + (area.width - width) / 2,
@@ -905,7 +909,7 @@ fn themes_dialog_geometry(
     );
     let list_height = height
         .saturating_sub(2)
-        .saturating_sub(5)
+        .saturating_sub(4)
         .saturating_sub(u16::try_from(notice_lines).unwrap_or(u16::MAX));
     Some((dialog, list_height))
 }
@@ -1601,6 +1605,89 @@ mod tests {
         }
     }
 
+    /// The name sits at the left of the top border and the grip at its
+    /// right, and neither answers the pointer: the strip reads as a header
+    /// rather than a control, and the grip alone says the card drags.
+    #[test]
+    fn the_title_bar_names_the_card_left_and_wears_the_grip_right() {
+        let theme = Paint::for_test();
+        let dialog = Dialog::Themes {
+            names: vec!["dark".into()],
+            selected: 0,
+            active: Some(0),
+            notice: None,
+        };
+        let draw = |hover: Option<(u16, u16)>| -> (Buffer, HitMap) {
+            let mut term = Terminal::new(TestBackend::new(72, 24)).unwrap();
+            let mut hits = HitMap::default();
+            term.draw(|f| {
+                paint_dialog(
+                    &dialog,
+                    f.area(),
+                    f.buffer_mut(),
+                    &theme,
+                    &mut hits,
+                    hover,
+                    (0, 0),
+                );
+            })
+            .unwrap();
+            (term.backend().buffer().clone(), hits)
+        };
+
+        let (rest, hits) = draw(None);
+        let (cx, cy) = box_corner(&rest);
+        let width = hits
+            .regions()
+            .iter()
+            .find(|region| region.target == HitTarget::DialogTitleBar)
+            .map(|region| region.rect.width)
+            .expect("the header drags");
+        let top: String = (cx..cx + width).map(|x| rest[(x, cy)].symbol()).collect();
+        assert!(top.starts_with("╭─ Themes ─"), "the name leads: {top}");
+        assert!(
+            top.ends_with(&format!("{PANE_GRIP}─╮")),
+            "the grip trails: {top}"
+        );
+        assert!(
+            rest[(cx + 3, cy)].modifier.contains(Modifier::BOLD),
+            "the name is bold at rest"
+        );
+
+        for hover in [(cx + 3, cy), (cx + width / 2, cy), (cx + width / 2, cy + 1)] {
+            assert!(
+                matches!(hits.hit(hover.0, hover.1), Some(HitTarget::DialogTitleBar)),
+                "the whole header drags"
+            );
+            let (pointed, _) = draw(Some(hover));
+            for x in cx..cx + width {
+                assert_eq!(
+                    pointed[(x, cy)],
+                    rest[(x, cy)],
+                    "the border does not answer the pointer at {hover:?}"
+                );
+            }
+        }
+    }
+
+    /// A plain dialog's title is its question and stays inside the card;
+    /// its border carries the grip alone.
+    #[test]
+    fn a_plain_dialog_keeps_its_question_inside_and_the_grip_in_the_border() {
+        let (buf, hits) = draw_dialog(&Dialog::confirm_close("%0"), (0, 0));
+        let (cx, cy) = box_corner(&buf);
+        let width = hits
+            .regions()
+            .iter()
+            .find(|region| region.target == HitTarget::DialogTitleBar)
+            .map(|region| region.rect.width)
+            .expect("the header drags");
+        let top: String = (cx..cx + width).map(|x| buf[(x, cy)].symbol()).collect();
+        assert!(top.starts_with("╭───"), "{top}");
+        assert!(top.ends_with(&format!("{PANE_GRIP}─╮")), "{top}");
+        assert_eq!(row_of(&buf, copy::CONFIRM_CLOSE_PANE), cy + 1);
+    }
+
     #[test]
     fn themes_dialog_marks_active_raises_selected_and_offers_apply() {
         let backend = TestBackend::new(60, 16);
@@ -1899,7 +1986,7 @@ mod tests {
             "dialog should be capped at 20 rows even with many bindings"
         );
         assert_eq!(
-            list_h, 12,
+            list_h, 13,
             "list height = dialog height - borders - padding"
         );
     }
@@ -2091,9 +2178,14 @@ mod tests {
         let (corner_x, corner_y) = box_corner(buf);
         let content_x = corner_x + 1 + DIALOG_INSET;
         assert_eq!(
-            buf[(content_x, corner_y + 1)].symbol(),
+            buf[(corner_x + 3, corner_y)].symbol(),
             "T",
-            "the themes title starts at the inset"
+            "the themes title rides the border"
+        );
+        assert_eq!(
+            buf[(content_x, corner_y + 1)].symbol(),
+            "P",
+            "the themes hint starts at the inset"
         );
         assert_eq!(
             buf[(content_x, row_of(buf, "✓ dark"))].symbol(),

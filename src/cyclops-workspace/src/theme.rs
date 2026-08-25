@@ -303,6 +303,13 @@ pub fn dialog_secondary(paint: &Paint) -> Style {
     chrome_panel(paint).add_modifier(Modifier::BOLD)
 }
 
+/// A floating box's name and its drag grip, in its top border: the
+/// frame's own ink, bold, so they stand out of the line the way a title
+/// did when it sat inside the card. Neither answers the pointer.
+pub fn dialog_title(paint: &Paint) -> Style {
+    pane_border_focused(paint).add_modifier(Modifier::BOLD)
+}
+
 /// A menu or dialog surface at rest. Overlays sit one level above the
 /// workspace panel so they read as theme furniture rather than black holes.
 pub fn menu_row(paint: &Paint) -> Style {

@@ -289,10 +289,13 @@ keyboard-first, mouse-clickable action model. Destructive confirmations use
 the same rule: Enter or click `↵ Confirm` to proceed, Escape or click
 `Esc Cancel` to back out.
 
-Every dialog can be moved. Press its top border or title row and drag: the
-card follows the pointer and stops at the screen edge, so its action row
-stays reachable. The position lasts as long as that dialog does; the next
-one opens centered.
+Every dialog can be moved. Its top border names the card at the left
+(`╭─ Themes ─`, on the list dialogs) and carries a `[⠿]` grip at the
+right, the same handle a pane frame wears. Press the border or the row
+under it and drag: the card follows the pointer and stops at the screen
+edge, so its action row stays reachable. The header does not light under
+the pointer; the grip says it drags. The position lasts as long as that
+dialog does; the next one opens centered.
 
 `Ctrl+B` `s`, or the `@` button in the sidebar's footer, opens the
 composer. The whole grammar is `@name` and then the message, taken
