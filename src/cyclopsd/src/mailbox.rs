@@ -2528,8 +2528,10 @@ impl MailboxProjection {
                 if replacement.is_some() {
                     return Err(MailboxError::NotificationBarrierReplacementForbidden);
                 }
-                if active.state != NotificationState::AttentionRequired
-                    || !uses_incomplete_legacy_doorbell_contract(active)
+                if !matches!(
+                    active.state,
+                    NotificationState::AttentionRequired | NotificationState::Notified
+                ) || !uses_incomplete_legacy_doorbell_contract(active)
                     || !self.exact_recipient_claimed_after_write(active)
                 {
                     return Err(MailboxError::NotificationBarrierRetirementState {
@@ -11853,6 +11855,95 @@ mod tests {
             .projection()
             .active_notification_barriers()
             .is_empty());
+    }
+
+    #[test]
+    fn a_claimed_legacy_notified_barrier_retires_after_clean_recovery() {
+        let scratch = StoreScratch::new("claimed-legacy-notified-retirement");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, admin, bob, _) = test_context();
+        let message_id = MessageId::new("m-claimed-legacy-notified").unwrap();
+        let attempt_id = attempt(1);
+        let mut store = MessageStore::open(&root, journal, workspace, "boot-1").unwrap();
+        store
+            .accept_at(
+                message_id.clone(),
+                draft(admin, vec![bob], "Legacy notified", None),
+                1,
+            )
+            .unwrap();
+        for (offset, state) in [NotificationState::Queued, NotificationState::Gating]
+            .into_iter()
+            .enumerate()
+        {
+            store
+                .append_notification_transition_at(
+                    message_id.clone(),
+                    bob,
+                    attempt_id,
+                    state,
+                    None,
+                    None,
+                    2 + offset as u64,
+                )
+                .unwrap();
+        }
+        store
+            .append_notification_transition_with_transport_at(
+                message_id.clone(),
+                bob,
+                attempt_id,
+                NotificationState::Writing,
+                Some(legacy_notification_binding(bob)),
+                Some(NotificationTransport::Doorbell),
+                Some(DOORBELL_FORMAT_COMPACT_CLAIM),
+                None,
+                4,
+            )
+            .unwrap();
+        for (offset, state) in [
+            NotificationState::Staged,
+            NotificationState::Submitting,
+            NotificationState::Submitted,
+            NotificationState::Notified,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store
+                .append_notification_transition_at(
+                    message_id.clone(),
+                    bob,
+                    attempt_id,
+                    state,
+                    None,
+                    None,
+                    5 + offset as u64,
+                )
+                .unwrap();
+        }
+        store.claim_at(bob, message_id.clone(), 9).unwrap();
+
+        store
+            .retire_notification_barrier(
+                message_id.clone(),
+                bob,
+                attempt_id,
+                NotificationBarrierRetirementCause::RecipientClaimedComposerClear,
+                None,
+            )
+            .unwrap();
+
+        assert!(store.projection().active_notification_barriers().is_empty());
+        assert_eq!(
+            store
+                .projection()
+                .notification(bob, &message_id)
+                .unwrap()
+                .state,
+            NotificationState::Notified
+        );
     }
 
     #[test]
