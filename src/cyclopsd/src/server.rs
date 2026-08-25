@@ -1348,6 +1348,7 @@ pub(crate) fn mailbox_service_error(error: crate::mailbox::MailboxServiceError) 
                 | MailboxError::NotificationAttemptMismatch { .. }
                 | MailboxError::NotificationClearRequiresAttention
                 | MailboxError::NotificationRequeueRequiresAttention
+                | MailboxError::NotificationRequeueBarrierBindingIncomplete(_)
                 | MailboxError::NotificationWithdrawalRequiresPreWrite
                 | MailboxError::NotificationWithdrawalRecipientMismatch { .. } => {
                     ("conflict", error.to_string())

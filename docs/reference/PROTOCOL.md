@@ -81,6 +81,7 @@ Error codes are stable; messages are for humans. Common codes include:
 | `ambiguous_attention` | more than one attention item could match the requested action |
 | `attention_evidence_failed` | the terminal safety evidence changed before the action |
 | `discard_unsupported` | this notification cannot be cleared with discard |
+| `conflict` | a valid mailbox or notification mutation conflicts with current durable state |
 | `timeout` | `agent.wait` only: the deadline passed. `data.state` carries the state the target was last in |
 | `occupant_changed` | `agent.wait` only: the pinned pane died or changed occupant |
 | `notification_unavailable` | `msg.send` only: an obsolete caller requested the removed send-and-wait composition |
@@ -373,13 +374,23 @@ generation, admitted agent generation, and manifest. Older incomplete rows
 still arm the barrier but cannot authorize Enter or exact-clear recovery. A
 later `writing` compacts an older barrier only for the same exact recipient.
 
-After a daemon restart, only `notified`, which carries receipt proof, or an
+Outside the compatibility path below, after a daemon restart only `notified`,
+which carries receipt proof, or an
 exact staged-claim clearance may retire from a fresh clean screen for the same
 composer occupant. Earlier post-write states and `attention_required` restore a
 hold first. A recovered hold can then bind an exact manifest-declared turn
 observed after restart. Its matching end and a later fresh clean screen produce
 a content-free `notification_barrier_retired` fact before the runtime hold is
 released.
+One upgrade-only compatibility path handles an `attention_required` format 1
+or original doorbell whose `writing` fact lacks a pane-root generation. The
+exact durable recipient claim must follow that attempt's `writing` fact, and
+the same recipient and manifest must prove a semantic `clean` composer with
+exact visible empty extraction. Cyclops then appends only
+`notification_barrier_retired` with cause
+`recipient_claimed_composer_clear`. It sends no terminal key, clears no bytes,
+leaves the mailbox `claimed` and notification `attention_required`, and proves
+retrieval only. Legacy direct payloads do not qualify.
 Foreground leader changes do not change composer ownership; operator terminal
 actions still require the exact recorded leader. Agent-generation or manifest
 replacement, explicit operator resolution, and proven physical pane loss are
@@ -434,9 +445,10 @@ succeeds once, but the reserved terminal key may still submit the same message
 id. `Submitting` is appended under the workspace journal lock before terminal
 IO and is the linearization point against claim. It is not proof that a key was
 sent. Only an actual `submitted` doorbell can then advance to `notified`.
-Writing, direct payload post-write states, and `attention_required` are
-unchanged. A claim therefore never hides an unresolved terminal outcome. It
-proves retrieval, not task completion.
+`Writing`, direct-payload post-write states, and the `attention_required`
+notification state are unchanged by claim. The upgrade-only path above may
+retire its barrier, but it never hides or resolves the terminal outcome. A
+claim proves retrieval, not task completion.
 
 `messages.snapshot` returns one atomic body-free projection for the
 authenticated caller. Agents see only messages they sent or received. The
@@ -507,6 +519,11 @@ the same methods above. The `admin_unread` status field is its pending count.
 Broadcast `*` addresses adopted agent panes only.
 
 `msg.requeue` takes one `message_id`. `alarm.preview` takes `older_than_ms`.
+Before minting fresh attempts, requeue resolves the complete selected recipient
+set. If any selected attempt still owns a post-write composer barrier whose
+binding is absent or lacks pane-root or foreground-leader generation, the whole
+request returns `conflict` and appends nothing. The existing attempt remains
+visible and claimable.
 `alarm.clear` takes a non-empty list of explicit alarm ids; there is no
 clear-all or age-selected daemon mutation. The human CLI implements
 `alarm clear --older-than <age>` by calling preview once, printing the exact
@@ -929,8 +946,9 @@ jq -c 'select(.id == "m-914b34")' \
 This journal holds immutable message bodies, mailbox mutations, notification
 transitions, composer-barrier retirement facts, and operator recovery facts.
 Barrier retirement records one of exact lifecycle reconciliation, clean
-receipt-bearing composer observation, occupant replacement, or proven physical
-pane loss. Notification facts and events are content-free. `msg.history`,
+receipt-bearing composer observation, recipient-claimed legacy clean-composer
+reconciliation, occupant replacement, or proven physical pane loss.
+Notification facts and events are content-free. `msg.history`,
 `msg.thread`, and `messages.snapshot` apply the authenticated caller's
 visibility rules rather than exposing raw journal bytes.
 

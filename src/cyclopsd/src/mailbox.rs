@@ -292,6 +292,10 @@ pub enum MailboxError {
     NotificationRecipientNotAgent,
     #[error("notification requeue requires attention or an observed quota reset")]
     NotificationRequeueRequiresAttention,
+    #[error(
+        "notification attempt '{0}' has an unresolved post-write composer barrier with an incomplete durable binding"
+    )]
+    NotificationRequeueBarrierBindingIncomplete(NotificationAttemptId),
     #[error("notification clearance requires an attention-required attempt")]
     NotificationClearRequiresAttention,
     #[error(
@@ -395,6 +399,8 @@ pub struct MailboxProjection {
     resolution_action_sequences: HashMap<NotificationAttemptId, u64>,
     /// Workspace sequence of each exact recipient claim.
     claim_sequences: HashMap<(RecipientKey, MessageId), u64>,
+    /// Workspace sequence where each attempt crossed its terminal write boundary.
+    notification_write_sequences: HashMap<NotificationAttemptId, u64>,
     /// Complete actions with exact, causally correlated consumption evidence.
     resolution_consumptions:
         HashMap<NotificationAttemptId, NotificationResolutionConsumptionObservation>,
@@ -483,6 +489,18 @@ fn uses_legacy_notification_write_contract(record: &NotificationRecord) -> bool 
         NotificationTransport::DirectPayload => record.doorbell_format.is_none(),
     };
     legacy_transport
+        && record
+            .binding
+            .as_ref()
+            .is_some_and(|binding| binding.pane_root.is_none())
+}
+
+pub(crate) fn uses_incomplete_legacy_doorbell_contract(record: &NotificationRecord) -> bool {
+    record.transport == NotificationTransport::Doorbell
+        && matches!(
+            record.doorbell_format,
+            None | Some(DOORBELL_FORMAT_COMPACT_CLAIM)
+        )
         && record
             .binding
             .as_ref()
@@ -732,6 +750,7 @@ impl MailboxProjection {
             resolution_actions_accepted: HashMap::new(),
             resolution_action_sequences: HashMap::new(),
             claim_sequences: HashMap::new(),
+            notification_write_sequences: HashMap::new(),
             resolution_consumptions: HashMap::new(),
             notification_attempts: HashSet::new(),
         }
@@ -2420,6 +2439,20 @@ impl MailboxProjection {
                     });
                 }
             }
+            NotificationBarrierRetirementCause::RecipientClaimedComposerClear => {
+                if replacement.is_some() {
+                    return Err(MailboxError::NotificationBarrierReplacementForbidden);
+                }
+                if active.state != NotificationState::AttentionRequired
+                    || !uses_incomplete_legacy_doorbell_contract(active)
+                    || !self.exact_recipient_claimed_after_write(active)
+                {
+                    return Err(MailboxError::NotificationBarrierRetirementState {
+                        cause,
+                        state: active.state,
+                    });
+                }
+            }
             NotificationBarrierRetirementCause::LifecycleReconciled
             | NotificationBarrierRetirementCause::PaneGone => {
                 if replacement.is_some() {
@@ -2740,6 +2773,8 @@ impl MailboxProjection {
                 let bound_write =
                     record.state == NotificationState::Writing && record.binding.is_some();
                 if bound_write {
+                    self.notification_write_sequences
+                        .insert(record.attempt_id, line.seq);
                     // A later admitted write proves the prior barrier released.
                     // RecipientKey keeps compaction on the exact durable route.
                     self.active_notification_barriers
@@ -3114,6 +3149,33 @@ impl MailboxProjection {
             evidence: NotificationResolutionConsumptionEvidence::AuthenticatedClaim,
             observed_at_ms: *claimed_at,
         })
+    }
+
+    fn exact_recipient_claimed_after_write(&self, record: &NotificationRecord) -> bool {
+        let Some(write_seq) = self
+            .notification_write_sequences
+            .get(&record.attempt_id)
+            .copied()
+        else {
+            return false;
+        };
+        let Some(claim_seq) = self
+            .claim_sequences
+            .get(&(record.recipient, record.message_id.clone()))
+            .copied()
+        else {
+            return false;
+        };
+        claim_seq > write_seq
+            && self
+                .get_entry(record.recipient, &record.message_id)
+                .is_some_and(|entry| {
+                    matches!(
+                        &entry.state,
+                        MailboxEntryState::Claimed { claimant, .. }
+                            if *claimant == record.recipient
+                    )
+                })
     }
 
     fn unresolved_attention_for_message(&self, message_id: &MessageId) -> Vec<&NotificationRecord> {
@@ -4379,6 +4441,16 @@ impl MailboxService {
         Ok(self.store()?.projection().active_notification_barriers())
     }
 
+    pub(crate) fn exact_recipient_claimed_after_write(
+        &self,
+        record: &NotificationRecord,
+    ) -> Result<bool, MailboxServiceError> {
+        Ok(self
+            .store()?
+            .projection()
+            .exact_recipient_claimed_after_write(record))
+    }
+
     /// All active composer barriers with message and mailbox facts from one
     /// projection read. Status groups this snapshot without rescanning it.
     pub(crate) fn active_composer_notifications_snapshot(
@@ -4608,7 +4680,7 @@ impl MailboxService {
                 .into(),
             );
         }
-        let requeues: Vec<_> = requeueable
+        let selected: Vec<_> = requeueable
             .into_iter()
             // An alarm whose entry has been claimed or superseded cannot
             // be redelivered. It stays visible and stays clearable; it is
@@ -4616,6 +4688,24 @@ impl MailboxService {
             // prevents a predictable partial application.
             .filter(|record| projection.entry_is_pending(record.recipient, &message_id))
             .filter(|record| !resolving.contains(&record.attempt_id))
+            .collect();
+        if let Some(record) = selected.iter().copied().find(|record| {
+            projection
+                .active_notification_barriers
+                .get(&record.attempt_id)
+                .is_some_and(|active| {
+                    active.binding.as_ref().is_none_or(|binding| {
+                        binding.pane_root.is_none() || binding.leader.is_none()
+                    })
+                })
+        }) {
+            return Err(MessageStoreError::from(
+                MailboxError::NotificationRequeueBarrierBindingIncomplete(record.attempt_id),
+            )
+            .into());
+        }
+        let requeues: Vec<_> = selected
+            .into_iter()
             .map(|record| NotificationRequeue {
                 prior_attempt_id: record.attempt_id,
                 attempt_id: NotificationAttemptId::generate(),
@@ -11210,6 +11300,203 @@ mod tests {
     }
 
     #[test]
+    fn broadcast_requeue_refuses_an_incomplete_barrier_before_any_append() {
+        let scratch = StoreScratch::new("requeue-incomplete-barrier");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, admin, bob, carol) = test_context();
+        let message_id = MessageId::new("m-requeue-incomplete-barrier").unwrap();
+        let mut store = MessageStore::open(&root, journal, workspace, "boot-1").unwrap();
+        store
+            .accept_at(
+                message_id.clone(),
+                draft(admin, vec![bob, carol], "Barrier", None),
+                1,
+            )
+            .unwrap();
+        alarm(&mut store, &message_id, bob, attempt(1), 2);
+        legacy_alarm(
+            &mut store,
+            &message_id,
+            carol,
+            attempt(2),
+            NotificationTransport::Doorbell,
+            Some(DOORBELL_FORMAT_COMPACT_CLAIM),
+            10,
+        );
+        let before_bytes = std::fs::read(store.journal_path()).unwrap();
+        let before_seq = store.projection().last_sequence();
+        let before_attempts = current_attempts(&store, &message_id, [bob, carol]);
+        let before_barriers = store.projection().active_notification_barriers();
+        let service = MailboxService::new(operator_directory(bob, carol), store);
+
+        assert!(matches!(
+            service.requeue_message(message_id.clone()),
+            Err(MailboxServiceError::Store(MessageStoreError::Mailbox(error)))
+                if matches!(
+                    *error,
+                    MailboxError::NotificationRequeueBarrierBindingIncomplete(id)
+                        if id == attempt(2)
+                )
+        ));
+
+        let store = service.store().unwrap();
+        assert_eq!(std::fs::read(store.journal_path()).unwrap(), before_bytes);
+        assert_eq!(store.projection().last_sequence(), before_seq);
+        assert_eq!(
+            current_attempts(&store, &message_id, [bob, carol]),
+            before_attempts
+        );
+        assert_eq!(
+            store.projection().active_notification_barriers(),
+            before_barriers
+        );
+        drop(store);
+        drop(service);
+
+        MessageStore::open(&root, journal, workspace, "boot-2")
+            .expect("the service guard does not alter replay semantics");
+    }
+
+    #[test]
+    fn a_claimed_legacy_attention_barrier_retires_without_a_terminal_action() {
+        let scratch = StoreScratch::new("claimed-legacy-barrier-retirement");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, admin, bob, _) = test_context();
+        let message_id = MessageId::new("m-claimed-legacy-barrier").unwrap();
+        let attempt_id = attempt(1);
+        let mut store = MessageStore::open(&root, journal, workspace, "boot-1").unwrap();
+        store
+            .accept_at(
+                message_id.clone(),
+                draft(admin, vec![bob], "Legacy", None),
+                1,
+            )
+            .unwrap();
+        legacy_alarm(
+            &mut store,
+            &message_id,
+            bob,
+            attempt_id,
+            NotificationTransport::Doorbell,
+            Some(DOORBELL_FORMAT_COMPACT_CLAIM),
+            2,
+        );
+        let record = store
+            .projection()
+            .notification(bob, &message_id)
+            .unwrap()
+            .clone();
+        assert!(store
+            .retire_notification_barrier(
+                message_id.clone(),
+                bob,
+                attempt_id,
+                NotificationBarrierRetirementCause::RecipientClaimedComposerClear,
+                None,
+            )
+            .is_err());
+
+        store.claim_at(bob, message_id.clone(), 20).unwrap();
+        store
+            .retire_notification_barrier(
+                message_id.clone(),
+                bob,
+                attempt_id,
+                NotificationBarrierRetirementCause::RecipientClaimedComposerClear,
+                None,
+            )
+            .unwrap();
+        assert!(store.projection().active_notification_barriers().is_empty());
+        assert_eq!(
+            store.projection().notification(bob, &message_id),
+            Some(&record)
+        );
+        assert!(matches!(
+            &store.projection().get_entry(bob, &message_id).unwrap().state,
+            MailboxEntryState::Claimed { claimant, .. } if *claimant == bob
+        ));
+        drop(store);
+
+        let reopened = MessageStore::open(&root, journal, workspace, "boot-2").unwrap();
+        assert!(reopened
+            .projection()
+            .active_notification_barriers()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_claim_after_writing_remains_valid_when_attention_lands_later() {
+        let scratch = StoreScratch::new("claim-between-write-and-attention");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, admin, bob, _) = test_context();
+        let message_id = MessageId::new("m-claim-between-write-and-attention").unwrap();
+        let attempt_id = attempt(1);
+        let mut store = MessageStore::open(&root, journal, workspace, "boot-1").unwrap();
+        store
+            .accept_at(
+                message_id.clone(),
+                draft(admin, vec![bob], "Legacy", None),
+                1,
+            )
+            .unwrap();
+        for (state, ts) in [
+            (NotificationState::Queued, 2),
+            (NotificationState::Gating, 3),
+        ] {
+            store
+                .append_notification_transition_at(
+                    message_id.clone(),
+                    bob,
+                    attempt_id,
+                    state,
+                    None,
+                    None,
+                    ts,
+                )
+                .unwrap();
+        }
+        store
+            .append_notification_transition_with_transport_at(
+                message_id.clone(),
+                bob,
+                attempt_id,
+                NotificationState::Writing,
+                Some(legacy_notification_binding(bob)),
+                Some(NotificationTransport::Doorbell),
+                Some(DOORBELL_FORMAT_COMPACT_CLAIM),
+                None,
+                4,
+            )
+            .unwrap();
+        store.claim_at(bob, message_id.clone(), 5).unwrap();
+        store
+            .append_notification_transition_at(
+                message_id.clone(),
+                bob,
+                attempt_id,
+                NotificationState::AttentionRequired,
+                None,
+                Some(NotificationAttentionCause::VerifyFailed),
+                6,
+            )
+            .unwrap();
+
+        store
+            .retire_notification_barrier(
+                message_id,
+                bob,
+                attempt_id,
+                NotificationBarrierRetirementCause::RecipientClaimedComposerClear,
+                None,
+            )
+            .unwrap();
+        assert!(store.projection().active_notification_barriers().is_empty());
+    }
+
+    #[test]
     fn a_failed_batch_append_changes_neither_projection_nor_replay() {
         let (scratch, mut store, message_id, bob, carol) =
             broadcast_operator_store("requeue-batch-append-failure");
@@ -13482,13 +13769,13 @@ mod tests {
         let mut recovery = crate::composer_recovery::RecoveryCoordinator::new([attempt_id]);
         let exact = recovery.active_for_recipient(&active, bob);
         assert_eq!(
-            recovery.reconcile(&exact, Some(&binding), false),
+            recovery.reconcile(&exact, Some(&binding), false, false),
             Some(crate::composer_recovery::RecoveryAction::Restore(
                 attempt_id
             ))
         );
         assert!(matches!(
-            recovery.reconcile(&exact, Some(&binding), true),
+            recovery.reconcile(&exact, Some(&binding), true, false),
             Some(crate::composer_recovery::RecoveryAction::Retire {
                 cause: NotificationBarrierRetirementCause::ComposerObservedClear,
                 ..

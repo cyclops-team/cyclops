@@ -375,6 +375,10 @@ pub enum NotificationBarrierRetirementCause {
     LifecycleReconciled,
     /// A settled attempt and the same bound composer read clean.
     ComposerObservedClear,
+    /// The exact recipient claimed an incomplete legacy attempt after its
+    /// write boundary, and its current manifest then proved a clean composer.
+    /// No terminal key or delivery-completion claim is implied.
+    RecipientClaimedComposerClear,
     /// A different agent generation or manifest owns the physical pane.
     OccupantReplaced,
     /// A server-wide pane observation proved the physical pane was gone.

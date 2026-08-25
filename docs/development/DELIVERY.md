@@ -343,6 +343,13 @@ clears or submits again. A second failure leaves the durable attempt `staged`,
 keeps the exact worker and FIFO barrier active, and reports
 `notification_settlement_storage_failed`. The operator runs `cyclops health`,
 repairs state storage, then restarts the daemon so the same attempt reconciles.
+One upgrade-only exception covers an `attention_required` format 1 or original
+doorbell whose binding lacks pane-root generation. An exact recipient claim
+ordered after that attempt's `writing` fact, the same current manifest, and
+fresh semantic-clean, exact visible-empty composer proof may append a
+content-free `recipient_claimed_composer_clear` barrier retirement. It sends no
+terminal key, clears no bytes, and leaves both the attention outcome and claimed
+mailbox state intact. Legacy direct payloads do not qualify.
 Recovery compares the recorded and current agent process generations and
 manifests. A foreground leader change is normal agent continuity. A different
 agent generation or manifest is authoritative replacement and is journaled
@@ -425,6 +432,10 @@ different requested resolution remain unresolved.
 
 The legacy session-delivery path has no operator requeue verb. Standard mailbox
 notifications use the guarded `cyclops requeue <message-id>` recovery command.
+Requeue resolves every selected pending recipient before writing. An unresolved
+post-write barrier with an absent binding or missing pane-root or
+foreground-leader generation makes the whole requeue conflict before any
+append.
 
 ## v1.1 amendments (M1 gate)
 

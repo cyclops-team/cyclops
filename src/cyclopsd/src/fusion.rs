@@ -2517,6 +2517,22 @@ fn ambiguous_composer_projection(
     }
 }
 
+fn claimed_legacy_recovery_ready(
+    detection: &Detection,
+    in_mode: bool,
+    detection_manifest: Option<&str>,
+    binding: &cyclops_proto::NotificationBinding,
+    capture: &ComposerCapture,
+) -> bool {
+    crate::composer_recovery::clean_composer_for_binding(
+        detection,
+        in_mode,
+        detection_manifest,
+        binding,
+    ) && detection.composer_semantic == Some(ComposerSemantic::Clean)
+        && matches!(capture, ComposerCapture::Visible(content) if content.is_empty())
+}
+
 fn notification_submission_recorded(record: &cyclops_proto::NotificationRecord) -> bool {
     match record.state {
         NotificationState::Submitted | NotificationState::Notified => true,
@@ -2599,41 +2615,50 @@ fn project_composer(
         );
     }
 
-    let attempt = match (parsed_owner, candidates) {
-        (Some(attempt), [candidate]) if candidate.record.attempt_id == attempt => attempt,
-        (None, [candidate]) => {
-            return ambiguous_composer_projection(
-                Some(candidate.record.attempt_id),
-                ComposerProof::Unprovable,
-                "notification_owner_missing",
-                1,
-            );
-        }
-        (Some(attempt), []) => {
-            return ambiguous_composer_projection(
-                Some(attempt),
-                ComposerProof::Ambiguous,
-                "notification_attempt_mismatch",
-                0,
-            );
-        }
-        (Some(attempt), [_]) => {
-            return ambiguous_composer_projection(
-                Some(attempt),
-                ComposerProof::Ambiguous,
-                "notification_attempt_mismatch",
-                1,
-            );
-        }
-        (owner, _) => {
-            return ambiguous_composer_projection(
-                owner,
-                ComposerProof::Ambiguous,
-                "multiple_active_notifications",
-                candidates.len(),
-            );
-        }
-    };
+    let attempt =
+        match (parsed_owner, candidates) {
+            (Some(attempt), [candidate]) if candidate.record.attempt_id == attempt => attempt,
+            (None, [candidate]) => {
+                let reason =
+                    if candidate.record.binding.as_ref().is_none_or(|binding| {
+                        binding.pane_root.is_none() || binding.leader.is_none()
+                    }) {
+                        "durable_binding_incomplete"
+                    } else {
+                        "notification_owner_missing"
+                    };
+                return ambiguous_composer_projection(
+                    Some(candidate.record.attempt_id),
+                    ComposerProof::Unprovable,
+                    reason,
+                    1,
+                );
+            }
+            (Some(attempt), []) => {
+                return ambiguous_composer_projection(
+                    Some(attempt),
+                    ComposerProof::Ambiguous,
+                    "notification_attempt_mismatch",
+                    0,
+                );
+            }
+            (Some(attempt), [_]) => {
+                return ambiguous_composer_projection(
+                    Some(attempt),
+                    ComposerProof::Ambiguous,
+                    "notification_attempt_mismatch",
+                    1,
+                );
+            }
+            (owner, _) => {
+                return ambiguous_composer_projection(
+                    owner,
+                    ComposerProof::Ambiguous,
+                    "multiple_active_notifications",
+                    candidates.len(),
+                );
+            }
+        };
     let candidate = &candidates[0];
 
     if matches!(binding, BindingObservation::Unprovable) {
@@ -3359,6 +3384,24 @@ pub(crate) async fn recompute_pane(
             binding,
         )
     });
+    let exact_claim_after_write = match recovery_records.as_slice() {
+        [record] => inner
+            .mailbox
+            .as_ref()
+            .and_then(|service| service.exact_recipient_claimed_after_write(record).ok())
+            .unwrap_or(false),
+        _ => false,
+    };
+    let legacy_claimed_clean = exact_claim_after_write
+        && recovery_live.as_ref().is_some_and(|binding| {
+            claimed_legacy_recovery_ready(
+                &detection,
+                row.in_mode,
+                manifest_id.as_deref(),
+                binding,
+                &composer_capture,
+            )
+        });
     let mut recovery_action = if let Some(reason) = recovery_store_error {
         Some(crate::composer_recovery::RecoveryAction::Hold(reason))
     } else {
@@ -3366,7 +3409,12 @@ pub(crate) async fn recompute_pane(
             .composer_recovery
             .lock()
             .expect("composer recovery lock")
-            .reconcile(&recovery_records, recovery_live.as_ref(), recovery_clean)
+            .reconcile(
+                &recovery_records,
+                recovery_live.as_ref(),
+                recovery_clean,
+                legacy_claimed_clean,
+            )
     };
     let retired_attempt = match recovery_action.as_ref() {
         Some(action @ crate::composer_recovery::RecoveryAction::Retire { .. }) => {
@@ -6206,6 +6254,85 @@ contains = ["working"]
         );
         assert_eq!(projection.state, ComposerState::ComposerAmbiguous);
         assert_eq!(projection.proof, ComposerProof::Unprovable);
+    }
+
+    #[test]
+    fn an_ownerless_legacy_candidate_names_its_missing_durable_binding() {
+        let (mut candidate, recipient, binding) =
+            composer_candidate(NotificationState::AttentionRequired);
+        candidate
+            .record
+            .binding
+            .as_mut()
+            .expect("composer fixture has a durable binding")
+            .pane_root = None;
+        let expected = cyclops_proto::render_doorbell_v1(&candidate.record.message_id);
+
+        let projection = project_composer(
+            Some(ComposerSemantic::HumanInput),
+            None,
+            &composer_detection(Some(ComposerSemantic::HumanInput)),
+            false,
+            &binding,
+            Some(recipient),
+            &ComposerCapture::Visible(expected),
+            std::slice::from_ref(&candidate),
+            true,
+        );
+
+        assert_eq!(projection.state, ComposerState::ComposerAmbiguous);
+        assert_eq!(projection.proof, ComposerProof::Unprovable);
+        assert_eq!(projection.reason, Some("durable_binding_incomplete"));
+        assert_eq!(
+            projection.notification_attempt,
+            Some(candidate.record.attempt_id)
+        );
+    }
+
+    #[test]
+    fn claimed_legacy_recovery_requires_semantic_clean_and_exact_visible_empty() {
+        let (candidate, _, _) = composer_candidate(NotificationState::AttentionRequired);
+        let binding = candidate
+            .record
+            .binding
+            .as_ref()
+            .expect("composer fixture has a durable binding");
+        let clean = composer_detection(Some(ComposerSemantic::Clean));
+        assert!(claimed_legacy_recovery_ready(
+            &clean,
+            false,
+            Some("claude"),
+            binding,
+            &ComposerCapture::Visible(String::new()),
+        ));
+
+        for semantic in [
+            ComposerSemantic::GhostSuggestion,
+            ComposerSemantic::HumanInput,
+            ComposerSemantic::Ambiguous,
+        ] {
+            assert!(!claimed_legacy_recovery_ready(
+                &composer_detection(Some(semantic)),
+                false,
+                Some("claude"),
+                binding,
+                &ComposerCapture::Visible(String::new()),
+            ));
+        }
+        for capture in [
+            ComposerCapture::Visible("text".into()),
+            ComposerCapture::Hidden,
+            ComposerCapture::NotRead,
+            ComposerCapture::BindingChanged,
+        ] {
+            assert!(!claimed_legacy_recovery_ready(
+                &clean,
+                false,
+                Some("claude"),
+                binding,
+                &capture,
+            ));
+        }
     }
 
     fn entry(state: AgentState, ts: u64) -> HookEntry {

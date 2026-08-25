@@ -143,6 +143,7 @@ impl RecoveryCoordinator {
         records: &[NotificationRecord],
         live: Option<&NotificationBinding>,
         clean_composer: bool,
+        legacy_claimed_clean: bool,
     ) -> Option<RecoveryAction> {
         let [record] = records else {
             return if records.is_empty() {
@@ -157,7 +158,7 @@ impl RecoveryCoordinator {
         let Some(expected) = record
             .binding
             .as_ref()
-            .filter(|binding| binding.recipient == record.recipient && binding.pane_root.is_some())
+            .filter(|binding| binding.recipient == record.recipient)
         else {
             return Some(RecoveryAction::Hold("composer_recovery_unproven"));
         };
@@ -168,6 +169,25 @@ impl RecoveryCoordinator {
         }) else {
             return Some(RecoveryAction::Hold("composer_recovery_unproven"));
         };
+
+        if crate::mailbox::uses_incomplete_legacy_doorbell_contract(record) {
+            if legacy_claimed_clean
+                && live.recipient == record.recipient
+                && expected.manifest == live.manifest
+            {
+                self.retiring.insert(record.attempt_id);
+                return Some(RecoveryAction::Retire {
+                    record: Box::new(record.clone()),
+                    cause: NotificationBarrierRetirementCause::RecipientClaimedComposerClear,
+                    replacement: None,
+                });
+            }
+            return Some(RecoveryAction::Hold("legacy_durable_binding_incomplete"));
+        }
+
+        if expected.pane_root.is_none() {
+            return Some(RecoveryAction::Hold("composer_recovery_unproven"));
+        }
 
         if same_composer_occupant(expected, live) {
             if matches!(
@@ -806,7 +826,7 @@ mod tests {
             record.state = state;
             let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
             assert_eq!(
-                recovery.reconcile(std::slice::from_ref(&record), Some(&expected), true),
+                recovery.reconcile(std::slice::from_ref(&record), Some(&expected), true, false,),
                 Some(RecoveryAction::Restore(record.attempt_id)),
                 "{state:?} has no receipt proof"
             );
@@ -816,11 +836,11 @@ mod tests {
         record.state = NotificationState::Notified;
         let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
         assert_eq!(
-            recovery.reconcile(std::slice::from_ref(&record), Some(&expected), false),
+            recovery.reconcile(std::slice::from_ref(&record), Some(&expected), false, false,),
             Some(RecoveryAction::Restore(record.attempt_id))
         );
         assert_eq!(
-            recovery.reconcile(std::slice::from_ref(&record), Some(&expected), true),
+            recovery.reconcile(std::slice::from_ref(&record), Some(&expected), true, false,),
             Some(RecoveryAction::Retire {
                 record: Box::new(record.clone()),
                 cause: NotificationBarrierRetirementCause::ComposerObservedClear,
@@ -831,12 +851,67 @@ mod tests {
         record.state = NotificationState::WithdrawnAfterStaging;
         let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
         assert!(matches!(
-            recovery.reconcile(std::slice::from_ref(&record), Some(&expected), true),
+            recovery.reconcile(std::slice::from_ref(&record), Some(&expected), true, false,),
             Some(RecoveryAction::Retire {
                 cause: NotificationBarrierRetirementCause::ComposerObservedClear,
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn an_incomplete_legacy_barrier_retires_only_after_claim_and_clean_screen() {
+        let route = recipient("00000000-0000-4000-8000-000000000002");
+        let live = binding(route, 40);
+        let mut legacy = live.clone();
+        legacy.pane_root = None;
+        let record = record(route, legacy);
+
+        let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
+        assert_eq!(
+            recovery.reconcile(std::slice::from_ref(&record), Some(&live), true, false,),
+            Some(RecoveryAction::Hold("legacy_durable_binding_incomplete"))
+        );
+
+        let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
+        assert_eq!(
+            recovery.reconcile(std::slice::from_ref(&record), Some(&live), true, true,),
+            Some(RecoveryAction::Retire {
+                record: Box::new(record.clone()),
+                cause: NotificationBarrierRetirementCause::RecipientClaimedComposerClear,
+                replacement: None,
+            })
+        );
+
+        let mut wrong_manifest = live.clone();
+        wrong_manifest.manifest = NotificationManifestId::new("claude").unwrap();
+        let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
+        assert_eq!(
+            recovery.reconcile(
+                std::slice::from_ref(&record),
+                Some(&wrong_manifest),
+                true,
+                true,
+            ),
+            Some(RecoveryAction::Hold("legacy_durable_binding_incomplete"))
+        );
+
+        let moved_route = recipient("00000000-0000-4000-8000-000000000003");
+        let mut moved = live.clone();
+        moved.recipient = moved_route;
+        let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
+        assert_eq!(
+            recovery.reconcile(std::slice::from_ref(&record), Some(&moved), true, true,),
+            Some(RecoveryAction::Hold("legacy_durable_binding_incomplete"))
+        );
+
+        let mut direct = record.clone();
+        direct.transport = NotificationTransport::DirectPayload;
+        let mut recovery = RecoveryCoordinator::new([direct.attempt_id]);
+        assert_eq!(
+            recovery.reconcile(std::slice::from_ref(&direct), Some(&live), true, true,),
+            Some(RecoveryAction::Hold("composer_recovery_unproven"))
+        );
     }
 
     #[test]
@@ -865,7 +940,12 @@ mod tests {
         let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
 
         assert_eq!(
-            recovery.reconcile(std::slice::from_ref(&record), Some(&replacement), false,),
+            recovery.reconcile(
+                std::slice::from_ref(&record),
+                Some(&replacement),
+                false,
+                false,
+            ),
             Some(RecoveryAction::Retire {
                 record: Box::new(record),
                 cause: NotificationBarrierRetirementCause::OccupantReplaced,
@@ -884,7 +964,12 @@ mod tests {
         let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
 
         assert_eq!(
-            recovery.reconcile(std::slice::from_ref(&record), Some(&changed_leader), true,),
+            recovery.reconcile(
+                std::slice::from_ref(&record),
+                Some(&changed_leader),
+                true,
+                false,
+            ),
             Some(RecoveryAction::Restore(record.attempt_id))
         );
     }
@@ -900,7 +985,12 @@ mod tests {
         let record = record(old, expected);
         let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
 
-        let action = recovery.reconcile(std::slice::from_ref(&record), Some(&replacement), false);
+        let action = recovery.reconcile(
+            std::slice::from_ref(&record),
+            Some(&replacement),
+            false,
+            false,
+        );
         let Some(RecoveryAction::Retire {
             replacement: Some(replacement),
             cause: NotificationBarrierRetirementCause::OccupantReplaced,
@@ -925,7 +1015,7 @@ mod tests {
         let mut recovery = RecoveryCoordinator::new([record.attempt_id]);
 
         assert_eq!(
-            recovery.reconcile(std::slice::from_ref(&record), Some(&live), true),
+            recovery.reconcile(std::slice::from_ref(&record), Some(&live), true, false,),
             Some(RecoveryAction::Restore(record.attempt_id))
         );
     }
