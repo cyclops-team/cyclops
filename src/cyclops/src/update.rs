@@ -27,7 +27,7 @@ use std::os::unix::fs::{
     PermissionsExt as _,
 };
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -1559,11 +1559,33 @@ fn prove_pair_identity(directory: &Path) -> Result<String, String> {
     Ok(cli)
 }
 
+// A concurrent fork can briefly inherit a newly staged executable's writable
+// descriptor. Linux rejects execution until that child reaches exec and
+// closes the descriptor, so retry only that transient kernel result.
+const TEXT_BUSY_RETRY_DELAYS_MS: [u64; 3] = [100, 200, 400];
+
+fn retry_text_busy<T>(mut operation: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut delays = TEXT_BUSY_RETRY_DELAYS_MS.into_iter();
+    loop {
+        match operation() {
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                let Some(delay_ms) = delays.next() else {
+                    return Err(error);
+                };
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            result => return result,
+        }
+    }
+}
+
+fn version_output(binary: &Path) -> std::io::Result<Output> {
+    retry_text_busy(|| Command::new(binary).arg("--version").output())
+}
+
 fn binary_identity(binary: &Path, expected_name: &str) -> Result<String, String> {
     require_executable(binary)?;
-    let output = Command::new(binary)
-        .arg("--version")
-        .output()
+    let output = version_output(binary)
         .map_err(|error| format!("run {} --version: {error}", binary.display()))?;
     if !output.status.success() {
         return Err(format!("{} --version failed", binary.display()));
@@ -1816,9 +1838,7 @@ fn copy_replay_state(source: &Path, destination: &Path) -> Result<(), String> {
 }
 
 pub(crate) fn candidate_build(binary: &Path) -> Result<String, String> {
-    let output = Command::new(binary)
-        .arg("--version")
-        .output()
+    let output = version_output(binary)
         .map_err(|error| format!("run {} --version: {error}", binary.display()))?;
     if !output.status.success() {
         return Err(format!("{} --version failed", binary.display()));
@@ -1973,7 +1993,7 @@ fn isolate_probe_config(home: &Path) -> Result<(), String> {
 /// `<bin> --version` with the leading command name stripped, so the
 /// report reads `0.1.0 (e610afc)` on both sides of the arrow.
 fn version_of(bin: &Path) -> Option<String> {
-    let out = Command::new(bin).arg("--version").output().ok()?;
+    let out = version_output(bin).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -2575,6 +2595,69 @@ mod tests {
             0o755,
         )
         .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn version_probe_recovers_after_a_transient_text_busy_result() {
+        let scratch = Scratch::create().unwrap();
+        let binary = scratch.path().join("cyclops");
+        write_new(
+            &binary,
+            b"#!/bin/sh\necho 'cyclops 0.1.0 (busy-test)'\n",
+            0o755,
+        )
+        .unwrap();
+        let writer = OpenOptions::new().write(true).open(&binary).unwrap();
+        let initial = Command::new(&binary).arg("--version").output().unwrap_err();
+        assert_eq!(initial.raw_os_error(), Some(libc::ETXTBSY));
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drop(writer);
+        });
+        let output = version_output(&binary).unwrap();
+        release.join().unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "cyclops 0.1.0 (busy-test)"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn text_busy_retry_is_bounded_and_specific() {
+        let mut transient_attempts = 0;
+        let recovered = retry_text_busy(|| {
+            transient_attempts += 1;
+            if transient_attempts == 1 {
+                Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+            } else {
+                Ok(7)
+            }
+        })
+        .unwrap();
+        assert_eq!(recovered, 7);
+        assert_eq!(transient_attempts, 2);
+
+        let mut busy_attempts = 0;
+        let busy = retry_text_busy(|| {
+            busy_attempts += 1;
+            Err::<(), _>(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+        })
+        .unwrap_err();
+        assert_eq!(busy.raw_os_error(), Some(libc::ETXTBSY));
+        assert_eq!(busy_attempts, TEXT_BUSY_RETRY_DELAYS_MS.len() + 1);
+
+        let mut denied_attempts = 0;
+        let denied = retry_text_busy(|| {
+            denied_attempts += 1;
+            Err::<(), _>(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(denied_attempts, 1);
     }
 
     fn replay_rejecting_pair(path: &Path, build: &str, rejected_state: &str) {
