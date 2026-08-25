@@ -3205,7 +3205,8 @@ pub(crate) async fn recompute_pane(
         if inspect_composer {
             composer_capture = match watcher.client().capture_pane_joined_escaped(pane_id).await {
                 Ok(joined) => {
-                    crate::delivery::exact_composer_content_from_joined_capture(m, &joined).into()
+                    crate::delivery::composer_content_for_projection_from_joined_capture(m, &joined)
+                        .into()
                 }
                 Err(_) => ComposerCapture::NotRead,
             };

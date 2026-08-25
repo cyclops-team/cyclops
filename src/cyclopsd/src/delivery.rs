@@ -7309,6 +7309,25 @@ pub(crate) fn exact_composer_content_from_joined_capture(
     exact_composer_content_for_state(manifest, screen, AgentState::IdleWithInput, None)
 }
 
+/// Extract exact occupied input or a visibly empty clean composer.
+///
+/// Projection and recovery need both outcomes. Ghost suggestions and
+/// ambiguous input remain unprovable, and collapsed paste chips remain hidden.
+pub(crate) fn composer_content_for_projection_from_joined_capture(
+    manifest: &Manifest,
+    screen: &str,
+) -> ComposerContentProof {
+    match exact_composer_content_from_joined_capture(manifest, screen) {
+        ComposerContentProof::Unprovable => exact_composer_content_for_state(
+            manifest,
+            screen,
+            AgentState::Idle,
+            Some(ComposerSemantic::Clean),
+        ),
+        proof => proof,
+    }
+}
+
 fn exact_composer_content_for_state(
     manifest: &Manifest,
     screen: &str,
@@ -12368,6 +12387,22 @@ mod composer_content_proof {
             capture,
             "m-wrapprobe"
         ));
+    }
+
+    #[test]
+    fn claude_2_1_243_fable_empty_composer_is_visible_to_recovery() {
+        let capture = concat!(
+            "\u{1b}[38;5;244m────────────────────────────────────────────────\n",
+            "\u{1b}[39m❯\u{a0}\n",
+            "\u{1b}[38;5;244m────────────────────────────────────────────────\n",
+            "\u{1b}[39m  \u{1b}[38;5;174mFable 5\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;216mxhigh\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;230m~/projects/agentic_dev/clops\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;72mCtx: 58%\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;181m5h: 94%\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;181m7d: 75%\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;180m1000K window\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;180m423K used\n",
+            "\u{1b}[39m  \u{1b}[38;5;210m⏵⏵ bypass permissions on\u{1b}[38;5;246m (shift+tab to cycle) · ← 1 agent",
+        );
+
+        assert_eq!(
+            composer_content_for_projection_from_joined_capture(&shipped("claude"), capture),
+            ComposerContentProof::Visible(String::new())
+        );
     }
 
     #[test]

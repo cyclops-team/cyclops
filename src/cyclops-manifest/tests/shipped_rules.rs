@@ -913,6 +913,7 @@ fn shipped_composer_trailers_match_captured_chrome_only() {
             &[
                 "────────────────────────",
                 "  Opus 5 · xhigh · ~/projects/clops · Ctx: 97% · 5h: 93% · 1000K window · 28K used",
+                "  Fable 5 · xhigh · ~/projects/agentic_dev/clops · Ctx: 58% · 5h: 94% · 7d: 75% · 1000K window · 423K used",
                 "  Opus 5 (1M context) · xhigh · ~/projects/agentic_dev/cy…",
                 "  Opus 5 (1M context) · xhigh · ~/projects/agentic_dev/cyclops-worktrees/mess…",
                 "  Opus 5 (1M context) · xhigh · ~/projects/agentic_dev/cyclops-worktrees/messaging-integration · …",

@@ -3,7 +3,8 @@
 # Verified against Claude Code 2.1.220 running inside tmux 3.6a, 120x40 pane;
 # re-verified on 2.1.221 (live rig, 2026-08-06); composer byte shapes
 # re-measured on 2.1.222 (F55 ghost probe, 2026-08-13, 140x40 pane);
-# composer extraction and clear action re-measured on 2.1.239 (2026-08-21).
+# composer extraction and clear action re-measured on 2.1.239 (2026-08-21);
+# the Fable 5 idle trailer was re-measured on 2.1.243 (2026-08-25).
 # On 2.1.221 the idle title is
 # "✳ <conversation summary>" and the pre-OSC title is the tmux hostname
 # seed; the ^ anchors cover both, do not tighten them to fixed strings.
@@ -20,7 +21,7 @@
 [agent]
 id = "claude"
 display_name = "Claude Code"
-version_tested = "2.1.221"
+version_tested = "2.1.243"
 process_names = ["claude"]
 # MEASURED (m1 soak): on native installs ~/.local/bin/claude is a symlink to
 # ~/.local/share/claude/versions/2.1.220 and macOS derives the process comm
