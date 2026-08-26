@@ -1,6 +1,6 @@
 /* Cyclops design tokens.
    The page is painted in two of the product's own themes. Light is
-   `sorbet` and dark is `ember`, both lifted from resources/themes/*.toml,
+   `sorbet` and dark is `forest`, both lifted from resources/themes/*.toml,
    so the page chrome and the workspace mock inside it are the same
    palette: one product, two of its themes, never a screenshot that
    inverted. */
@@ -95,66 +95,67 @@
 :root[data-theme='dark'] {
 	color-scheme: dark;
 
-	/* Ember: a fire an hour after it stopped being a fire. The page ground
-	   is the pane ground, the same relation sorbet has, and the chrome
-	   steps UP through charcoal into scorched brown. */
-	--paper: #14100d; /* surface.bg */
-	--surface: #1a1410;
-	--surface-mid: #201a14; /* chrome.panel */
-	--surface-deep: #1c1611;
-	--navbar-bg: rgba(20, 16, 13, 0.88);
+	/* Forest: a stand of conifers at dusk. The page ground is the pane
+	   ground, the same relation sorbet has, and the chrome steps UP
+	   through needle into moss. */
+	--paper: #0c1310; /* surface.bg */
+	--surface: #101a15;
+	--surface-mid: #14201a; /* chrome.panel */
+	--surface-deep: #111b16;
+	--navbar-bg: rgba(12, 19, 16, 0.88);
 
-	/* Ink & grays: ash is brown, not neutral. */
-	--ink: #f7ede2; /* palette.15 */
-	--text: #f2e7db; /* surface.fg */
-	--muted: #a08b78; /* surface.dim */
-	--gray: #b39c88;
-	--faint: #8a7462;
+	/* Ink & grays: a green-cast gray, so quiet things recede into the
+	   ground instead of standing on it. */
+	--ink: #eff5f0; /* palette.15 */
+	--text: #e2ece4; /* surface.fg */
+	--muted: #86a58a; /* surface.dim */
+	--gray: #9db8a0;
+	--faint: #6f8a74;
 
 	/* Lines */
-	--line: #2b211a; /* palette.0 */
-	--line-soft: #241b15;
-	--hairline: #3c2f23; /* chrome.raised */
-	--hairline-btn: #4f3f31;
+	--line: #17231b; /* palette.0 */
+	--line-soft: #131d17;
+	--hairline: #24342a; /* chrome.raised */
+	--hairline-btn: #34483b;
 
-	/* The accent is the coal somebody just breathed on; its companion is
-	   the amber one step down the heat. */
-	--accent: #ff9d4d; /* surface.accent */
-	--accent-hover: #ffb06a;
-	--accent-ink: #14100d;
-	--accent-soft: #3c2f23; /* chrome.raised */
-	--accent-2: #e8c46a; /* role.2, amber */
-	--accent-2-hover: #f0d086;
-	--link: #ffb06a;
+	/* The accent is sage, the green with the most gray left in it; its
+	   companion is the fallen leaf at the warm end of the role wheel. */
+	--accent: #9ec9a2; /* surface.accent */
+	--accent-hover: #b3d8b6;
+	--accent-ink: #0c1310;
+	--accent-soft: #24342a; /* chrome.raised */
+	--accent-2: #dd9a72; /* role.8, fallen leaf */
+	--accent-2-hover: #e6ad8a;
+	--link: #b3d8b6;
 
-	--field-line: #3f3025;
-	--field-node: #75604e;
+	--field-line: #22332a;
+	--field-node: #4d6653;
 
-	--term-bg: #14100d;
-	--term-line: #2b211a;
-	--term-frame: #3c2f23;
-	--term-pane-line: #5f5044;
+	--term-bg: #0c1310;
+	--term-line: #17231b;
+	--term-frame: #24342a;
+	--term-pane-line: #4f6656;
 	--term-shadow: rgba(0, 0, 0, 0.55);
-	--term-text: #f2e7db;
-	--term-dim: #a08b78;
-	--term-faint: #8a7462; /* above state.dead, which lands under 3:1 here */
-	--term-control: #201a14;
-	--term-control-hover: #3c2f23;
+	--term-text: #e2ece4;
+	--term-dim: #86a58a;
+	--term-faint: #6f8a74; /* above state.dead, which lands under 3:1 here */
+	--term-control: #14201a;
+	--term-control-hover: #24342a;
 
-	--sb-accent: #ff9d4d;
-	--sb-panel: #201a14;
-	--sb-raised: #3c2f23;
-	--sb-healthy: #9fc47f;
-	--sb-needs: #f0b95e;
-	--sb-terminal: #f2635e;
-	--sb-role-1: #ff9d4d; /* ember */
-	--sb-role-2: #e8c46a; /* amber */
-	--sb-role-3: #dc7a5c; /* rust */
-	--sb-role-4: #b9c47a; /* scorched olive */
-	--sb-role-5: #eb9aa6; /* ash rose */
-	--sb-role-6: #cfa98c; /* driftwood */
-	--sb-role-7: #93c4b4; /* verdigris */
-	--sb-role-8: #bf94cc; /* smolder violet */
+	--sb-accent: #9ec9a2;
+	--sb-panel: #14201a;
+	--sb-raised: #24342a;
+	--sb-healthy: #8ecf95;
+	--sb-needs: #dcc073;
+	--sb-terminal: #e0797f;
+	--sb-role-1: #9ec9a2; /* sage */
+	--sb-role-2: #79c98c; /* fern */
+	--sb-role-3: #c6d489; /* lichen */
+	--sb-role-4: #85c8bd; /* stream teal */
+	--sb-role-5: #d6b88c; /* birch */
+	--sb-role-6: #a1b6de; /* bluebell */
+	--sb-role-7: #cba1bb; /* foxglove */
+	--sb-role-8: #dd9a72; /* fallen leaf */
 }
 
 * {

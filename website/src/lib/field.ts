@@ -7,7 +7,7 @@
 // Vanilla three.js, loaded on demand from the component so the page paints
 // before the chunk arrives and the server never sees it. Every color comes
 // from the page's CSS tokens, so the field follows the theme toggle
-// between sorbet and ember the way the rest of the page does.
+// between sorbet and forest the way the rest of the page does.
 
 import * as THREE from 'three';
 
