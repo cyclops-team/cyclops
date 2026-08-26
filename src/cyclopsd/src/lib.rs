@@ -1743,12 +1743,7 @@ pub(crate) async fn label_pane(
                 data: None,
             });
         };
-        let holder = {
-            let reg = inner.registry.lock().expect("registry lock");
-            reg.for_label(l)
-                .filter(|holder| holder.recipient != Some(*recipient))
-                .cloned()
-        };
+        let holder = conflicting_label_holder(inner, l, *recipient);
         if let Some(holder) = holder {
             return Err(bad_request(label_taken_words(inner, l, &holder)));
         }
@@ -1868,6 +1863,63 @@ fn label_taken_words(inner: &Inner, label: &str, holder: &registry::Adoption) ->
             session = holder.session,
         )
     }
+}
+
+fn conflicting_label_holder(
+    inner: &Inner,
+    label: &str,
+    recipient: RecipientKey,
+) -> Option<registry::Adoption> {
+    inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .for_label(label)
+        .filter(|holder| holder.recipient != Some(recipient))
+        .cloned()
+}
+
+/// Persist one adoption while the caller owns `mailbox_publication`.
+///
+/// The earlier label check gives a fast refusal. This check is authoritative:
+/// two concurrent calls may both pass the earlier check, but only one may
+/// mutate the registry and publish the mailbox directory.
+fn commit_adoption_under_publication(
+    inner: &Inner,
+    adoption: registry::Adoption,
+    window: registry::WindowChrome,
+) -> Result<(), WireError> {
+    let recipient = adoption
+        .recipient
+        .expect("new adoptions carry an exact recipient");
+    if let Some(holder) = conflicting_label_holder(inner, &adoption.label, recipient) {
+        return Err(bad_request(label_taken_words(
+            inner,
+            &adoption.label,
+            &holder,
+        )));
+    }
+    if let Err(error) = inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .adopt(adoption, window)
+    {
+        return Err(WireError {
+            code: "internal".to_string(),
+            message: format!("cannot record the adoption: {error}"),
+            data: None,
+        });
+    }
+    if !refresh_mailbox_directory_unlocked(inner) {
+        return Err(WireError {
+            code: "internal".to_string(),
+            message: "the name was recorded but its mailbox route could not be published"
+                .to_string(),
+            data: None,
+        });
+    }
+    Ok(())
 }
 
 /// Put one pane on the roster under `label` and paint the border that says
@@ -2010,26 +2062,7 @@ async fn adopt_pane(
         window_id: row.window_id.clone(),
         border_status: known_status.unwrap_or(read.border_status),
     };
-    if let Err(e) = inner
-        .registry
-        .lock()
-        .expect("registry lock")
-        .adopt(adoption, window)
-    {
-        return Err(WireError {
-            code: "internal".to_string(),
-            message: format!("cannot record the adoption: {e}"),
-            data: None,
-        });
-    }
-    if !refresh_mailbox_directory_unlocked(inner) {
-        return Err(WireError {
-            code: "internal".to_string(),
-            message: "the name was recorded but its mailbox route could not be published"
-                .to_string(),
-            data: None,
-        });
-    }
+    commit_adoption_under_publication(inner, adoption, window)?;
     drop(publication);
     // 3. Paint.
     paint_chrome(inner, session_idx, pane_id).await;
@@ -5113,6 +5146,71 @@ mod tests {
         refresh_mailbox_directory(&inner);
         assert!(send_test_message(service, "driver".into()).is_err());
         assert!(send_test_message(service, pane.to_string()).is_err());
+    }
+
+    #[test]
+    fn two_prevalidated_adoptions_cannot_publish_one_label_or_clear_the_directory() {
+        let mut inner = bare_inner("cyc-atomic-pane-label");
+        enable_mailbox(&mut inner);
+        let root = identity::ProcId::of(std::process::id() as i32).unwrap();
+        let pane_a: TmuxPaneId = "%1".parse().unwrap();
+        let pane_b: TmuxPaneId = "%2".parse().unwrap();
+        let binding_a =
+            persist_test_binding(&inner, test_live_key(inner.workspace_id, 900, 1000, "$1"));
+        let binding_b =
+            persist_test_binding(&inner, test_live_key(inner.workspace_id, 901, 2000, "$1"));
+        let recipient_a =
+            RecipientKey::agent(inner.workspace_id, binding_a.session_instance_id(), pane_a);
+        let recipient_b =
+            RecipientKey::agent(inner.workspace_id, binding_b.session_instance_id(), pane_b);
+        add_detached_route(&inner, "a", test_pane("%1", root.pid), binding_a);
+        add_detached_route(&inner, "b", test_pane("%2", root.pid), binding_b);
+        let pane_root = ProcessInstanceId::new(root.pid, root.birth).unwrap();
+        let adoption =
+            |session: &str, pane: TmuxPaneId, recipient: RecipientKey| registry::Adoption {
+                session: session.into(),
+                pane_id: pane.to_string(),
+                label: "worker".into(),
+                recipient: Some(recipient),
+                pane_root: Some(pane_root),
+                manifest: None,
+                pane_pid: root.pid,
+                window_id: format!("@{}", pane.number()),
+                border_format: None,
+            };
+        let window = |session: &str, pane: TmuxPaneId| registry::WindowChrome {
+            session: session.into(),
+            window_id: format!("@{}", pane.number()),
+            border_status: None,
+        };
+
+        let _publication = inner.mailbox_publication.lock().unwrap();
+        commit_adoption_under_publication(
+            &inner,
+            adoption("a", pane_a, recipient_a),
+            window("a", pane_a),
+        )
+        .unwrap();
+        let refused = commit_adoption_under_publication(
+            &inner,
+            adoption("b", pane_b, recipient_b),
+            window("b", pane_b),
+        )
+        .unwrap_err();
+        assert_eq!(refused.code, "bad_request");
+        assert!(refused.message.contains("already taken"));
+        drop(_publication);
+
+        let adoptions = inner.registry.lock().unwrap().exact_adoptions();
+        assert_eq!(adoptions.len(), 1);
+        assert_eq!(adoptions[0].recipient, Some(recipient_a));
+        let service = inner.mailbox.as_ref().unwrap();
+        assert_eq!(
+            service.agent_for_pane(pane_a).unwrap().unwrap().key,
+            recipient_a
+        );
+        assert!(service.agent_for_pane(pane_b).unwrap().is_none());
+        send_test_message(service, "worker".into()).unwrap();
     }
 
     #[test]
