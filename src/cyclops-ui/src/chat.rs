@@ -224,7 +224,7 @@ pub fn proven_status_label(mailbox: MailboxWord, wake: WakeWord) -> &'static str
         (_, WakeWord::NeedsAttention) => "Attention",
         (_, WakeWord::QuotaHeld) => "Quota held",
         (_, WakeWord::QuotaResetObserved) => "Quota reset",
-        (_, WakeWord::BlockedBeforeWrite) => "Wake blocked",
+        (_, WakeWord::BlockedBeforeWrite) => "Blocked before write",
         (_, WakeWord::ResolutionIncomplete) => "Resolution open",
         (_, WakeWord::Withdrawn) => "Withdrawn",
         (_, WakeWord::WithdrawnByOperator) => "Wake withdrawn",
@@ -1526,6 +1526,10 @@ mod tests {
         assert!(
             joined.contains("head · held: session unavailable"),
             "pre-write blocked head must render pre-write cause: {joined}"
+        );
+        assert!(
+            joined.contains("Blocked before write"),
+            "the resting surface must name the terminal-write boundary: {joined}"
         );
     }
 

@@ -155,7 +155,7 @@ impl WakeWord {
             WakeWord::Writing => "> writing",
             WakeWord::Staged => "> staged",
             WakeWord::Submitted => "^ submit sent",
-            WakeWord::BlockedBeforeWrite => "! wake blocked",
+            WakeWord::BlockedBeforeWrite => "! blocked before write",
             WakeWord::Notified => "> notified",
             WakeWord::Withdrawn => "= withdrawn",
             WakeWord::WithdrawnByOperator => "= wake withdrawn",
