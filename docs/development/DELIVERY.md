@@ -169,12 +169,6 @@ timer. In order:
    `blocked_pre_write` with its content-free observed width and no paste. A
    later qualifying width observation from route or size evidence may reopen
    that attempt once.
-6. A terminal grid cannot prove that the application composer has no hidden
-   prefix or suffix. Current format 3 attempts therefore stop before the pane
-   write with `composer_ownership_unproven`. Re-enabling the write requires an
-   application-level source that proves the complete unsubmitted composer for
-   the same binding and attempt. Screen equality alone never authorizes a key.
-
 A delivery held in gating longer than `gate_hold_notify_ms` (config,
 default 120000) pings the admin once (action_required) so a wedged hold is
 visible; the hold itself keeps waiting on events, never on a timer.

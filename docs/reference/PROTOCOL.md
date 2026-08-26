@@ -370,13 +370,14 @@ the exact staged doorbell or proves the same bound composer is clean. One
 dedicated fact then moves the attempt to `notified` and retires the barrier
 atomically. It does not settle other attention causes or prove task completion.
 
-Terminal-grid equality does not prove that an application composer has no
-hidden prefix or suffix. A current format 3 attempt therefore stops before the
-pane write with `composer_ownership_unproven`. Existing post-write attempts may
-still expose visible bytes for inspection, but terminal capture alone cannot
-make `trailer_anchored` true and cannot authorize `complete` or a submit key.
-Application-level composer proof must bind the complete unsubmitted bytes to
-the same attempt and process generation before this path can be enabled.
+An exact-attempt `verify_failed` doorbell with a complete binding enters
+automatic exact-owned recovery only when the current normalized composer is an
+exact match and terminal action is safe. A pending mailbox selects `complete`
+and one submit key. An exact recipient claim ordered after `writing` selects
+`discard` and the manifest's measured clear sequence. Selection and durable
+intent are one mailbox transaction, so a concurrent claim lands wholly before
+or after that boundary. Any changed binding, human or trailing text, modal, or
+unprovable content leaves one attention item and sends no key.
 
 A `blocked_pre_write` transition may carry `wake_block`, the exact closed
 scheduler outcome that left the attempt without a live owner. The projection
@@ -599,9 +600,7 @@ CLI can compute a local diff. A direct fallback diff contains the message body
 and is available only to the authenticated workspace administrator. Diff bytes
 are never journaled, logged, or emitted as events.
 `attention.complete` and `attention.discard` take the same id shape. Complete
-requires all five checks again immediately before the submit key. A terminal
-capture alone cannot satisfy `trailer_anchored`, even when its visible bytes
-equal the expected doorbell. Discard uses
+requires all five checks again immediately before the submit key. Discard uses
 the same guarded clear sequence when the exact notification remains staged.
 When a fresh screen rule proves the composer empty, discard instead requires
 the recorded process and manifest bindings, a manifest-owned

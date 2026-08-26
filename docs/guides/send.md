@@ -198,13 +198,12 @@ source.
 An ambiguous notification is never an invitation to resend blindly. Use its
 exact notification attempt id:
 
-Terminal captures can show the exact format 3 row but cannot prove that the
-application composer has no hidden prefix or suffix. Current format 3 attempts
-therefore stop before any pane write with `composer_ownership_unproven`. The
-message remains claimable through the socket. A future terminal action requires
-an application-level source that proves the complete unsubmitted composer for
-the same attempt and process binding. Human, trailing, changed, hidden, or
-unprovable content never receives a submit key.
+Cyclops automatically handles a current exact-attempt `verify_failed` doorbell only
+when the complete durable binding and exact composer bytes still match. It
+submits once while the mailbox is pending. If the exact recipient claimed after
+the write, it clears that doorbell without submitting it. Durable intent blocks
+a second terminal key after an uncertain outcome. Human, trailing, changed, or
+unprovable content remains one visible attention item.
 
 ```bash
 cyclops attention show <attempt-id> --diff
@@ -225,8 +224,7 @@ claim`. The exact transition and reconciliation rules are owned by the
 A wake that stops before writing reports one exact cause, including
 `session_unavailable`, `manifest_unavailable`, `payload_unavailable`,
 `write_readiness_changed`, `spool_failed`, `binding_unprovable`,
-`composer_semantic_missing`, `composer_ownership_unproven`, or `worker_failed`.
-The message remains claimable.
+`composer_semantic_missing`, or `worker_failed`. The message remains claimable.
 For format 3, `write_readiness_changed` with an observed width below its
 recorded required width is shown as `pane too narrow`. The width pair is
 content-free, no pane write occurred, and a later size edge may reopen that

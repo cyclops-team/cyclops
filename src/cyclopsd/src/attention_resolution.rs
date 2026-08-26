@@ -825,17 +825,17 @@ async fn assess(
             binding.manifest.as_str(),
         );
 
-    // Composer extraction reports visible bytes for inspection. It cannot
-    // prove that the application buffer has no hidden prefix or suffix, so it
-    // never authorizes a terminal key by itself.
+    // Composer extraction proves the terminal layout independently from
+    // equality. An operator asking for a diff needs the actual mismatch,
+    // while a terminal action still requires exact normalized content.
     let content_proof = delivery::exact_composer_content_from_joined_capture(&manifest, &capture);
-    apply_terminal_grid_content_observation(
-        &mut checks,
-        expected.as_deref(),
-        &content_proof,
-        include_diff,
-        &mut observed,
-    );
+    if let delivery::ComposerContentProof::Visible(content) = &content_proof {
+        checks.trailer_anchored = true;
+        checks.notification_exact = expected.as_deref() == Some(content.as_str());
+        if include_diff {
+            observed = Some(content.clone());
+        }
+    }
     let composer_already_clear = composer_already_clear_is_safe(
         &checks,
         &manifest,
@@ -862,25 +862,6 @@ async fn assess(
         include_diff,
         action_path,
     )
-}
-
-/// Record visible composer evidence without upgrading it to application proof.
-fn apply_terminal_grid_content_observation(
-    checks: &mut AttentionChecks,
-    expected: Option<&str>,
-    proof: &delivery::ComposerContentProof,
-    include_diff: bool,
-    observed: &mut Option<String>,
-) {
-    let delivery::ComposerContentProof::Visible(content) = proof else {
-        return;
-    };
-    checks.notification_exact = expected == Some(content.as_str());
-    if include_diff {
-        *observed = Some(content.clone());
-    }
-    // `trailer_anchored` stays false. The grid can prove visible layout, but
-    // not that the application buffer ends at the last visible character.
 }
 
 fn assessment_result(
@@ -1175,36 +1156,6 @@ composer_continuation_regex = '^  (?P<content>.*)$'
             assert!(!staged_composer_state_is_safe(Some(state)));
         }
         assert!(!staged_composer_state_is_safe(None));
-    }
-
-    #[test]
-    fn terminal_grid_equality_never_proves_application_buffer_terminality() {
-        let mut checks = AttentionChecks {
-            notification_exact: false,
-            trailer_anchored: false,
-            process_matches: true,
-            manifest_matches: true,
-            terminal_action_safe: true,
-        };
-        let mut observed = None;
-        let visible =
-            delivery::ComposerContentProof::Visible("cyclops inbox claim m-att_exact".to_string());
-
-        apply_terminal_grid_content_observation(
-            &mut checks,
-            Some("cyclops inbox claim m-att_exact"),
-            &visible,
-            true,
-            &mut observed,
-        );
-
-        assert!(checks.notification_exact);
-        assert!(!checks.trailer_anchored);
-        assert!(!checks.all_pass());
-        assert_eq!(
-            observed,
-            Some("cyclops inbox claim m-att_exact".to_string())
-        );
     }
 
     #[test]

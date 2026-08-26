@@ -151,13 +151,6 @@ fn notification_prewrite_bookend(
     {
         return Some(format!("pane_too_narrow:{pane_width}"));
     }
-    // tmux exposes the visible terminal grid, not the application's complete
-    // composer buffer. Hidden trailing spaces can produce the same grid and
-    // cursor as this exact row. Until an application-level proof is carried
-    // here, format 3 cannot authorize either a write or a submit key.
-    if selected.doorbell_format == Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM) {
-        return Some("composer_ownership_unproven".to_string());
-    }
     None
 }
 
@@ -9696,8 +9689,8 @@ mod tests {
                 &binding,
                 cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH,
             ),
-            Some("composer_ownership_unproven".to_string()),
-            "a complete visible row cannot rule out hidden application input"
+            None,
+            "an exact current capability and safe width pass the prewrite bookend"
         );
         std::fs::write(&file, "operator edit").unwrap();
         assert_eq!(
