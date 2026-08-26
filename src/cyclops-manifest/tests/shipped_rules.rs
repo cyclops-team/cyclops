@@ -190,15 +190,18 @@ fn composer_actions_ship_only_for_measured_vendors() {
     for id in ["claude", "codex"] {
         let manifest = &all[id];
         assert_eq!(manifest.injection.clear_keys, ["C-c"], "{id}");
+    }
+    for id in ["agy", "claude", "codex"] {
+        let manifest = &all[id];
         assert!(manifest.composer_prompt.is_some(), "{id}");
         assert!(manifest.composer_continuation.is_some(), "{id}");
     }
     for id in ["agy", "cursor"] {
         let manifest = &all[id];
         assert!(manifest.injection.clear_keys.is_empty(), "{id}");
-        assert!(manifest.composer_prompt.is_none(), "{id}");
-        assert!(manifest.composer_continuation.is_none(), "{id}");
     }
+    assert!(all["cursor"].composer_prompt.is_none());
+    assert!(all["cursor"].composer_continuation.is_none());
     for manifest in all.values() {
         assert!(
             manifest

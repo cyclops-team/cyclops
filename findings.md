@@ -1738,3 +1738,46 @@ its socket identity, unlinks the executable while the helper remains live, and
 requires the identity to remain current. Separate checks require process exit,
 pid reuse, descriptor inheritance, and an in-place exec to revoke authority.
 Executable path lookup is not an identity or liveness proof.
+
+## F70. AGY 1.1.21 needs escaped prompt identity before exact doorbell submission
+
+MEASURED 2026-08-26 on macOS with tmux 3.6a and Antigravity CLI 1.1.21.
+The release-proof pane was 120 columns wide and ran the shipped AGY manifest.
+The probe used `tmux capture-pane -e -p -J` against the fresh pane after
+Cyclops staged one compact doorbell. A second capture from an existing AGY
+conversation supplied submitted prompt echoes. The captures were read-only;
+no human draft was typed or submitted for the measurement.
+
+The active occupied composer rendered as:
+
+```text
+ESC[94m>ESC[39m cyclops inbox claim <opaque-message-key>
+ESC[90m<box rule>
+ESC[38;5;152mGemini 3.7 Flash<styled status fields>
+```
+
+Submitted prompts in the transcript rendered as:
+
+```text
+ESC[1mESC[34m> <submitted prompt>ESC[0m
+```
+
+Both rows reduce to `> text` after escape stripping. The old plain-only
+`composer_has_input` rule could therefore treat a transcript echo as another
+composer prompt. The shipped manifest now requires the active prompt's exact
+escaped glyph transition and declares byte-preserving composer extraction.
+Exact staging still requires the same expected doorbell bytes and the measured
+styled trailer immediately below them. Unexpected text becomes extracted
+content and fails equality rather than being ignored.
+
+The initial live delivery exposed a separate missing-capability failure: the
+manifest declared trailer anchors but no composer extraction patterns, so the
+production submit gate returned `Unsupported` after the doorbell was visibly
+staged and withheld Enter. The regression includes an earlier transcript echo,
+the active 1.1.21 doorbell row, and both trailer rows, then calls the production
+exact-staging proof.
+
+This evidence is narrow. It measures the occupied and empty composer prompt,
+transcript echo styling, and the two-row trailer on 1.1.21. It does not reprove
+the working, modal, quota, hook, lifecycle, restart, or multiline direct-payload
+rules, so `version_tested` remains bound to the authoritative 1.1.11 fixture.

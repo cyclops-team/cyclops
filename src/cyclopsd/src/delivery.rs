@@ -13095,6 +13095,10 @@ mod composer_content_proof {
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../resources/manifests/agy.toml"
             )),
+            "cursor" => include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../resources/manifests/cursor.toml"
+            )),
             _ => panic!("unknown shipped manifest {id}"),
         };
         Manifest::parse(source, std::path::Path::new(id)).expect("shipped manifest parses")
@@ -13139,6 +13143,36 @@ mod composer_content_proof {
                 "{vendor} did not reconstruct the rendered payload"
             );
         }
+    }
+
+    /// AGY 1.1.21 keeps a compact doorbell visible as one prompt row. The
+    /// styled rule and status rows bind that row to the active composer.
+    #[test]
+    fn agy_1_1_21_exact_doorbell_reaches_the_submit_gate() {
+        let manifest = shipped("agy");
+        let message_id = MessageId::new("m-0123456789abcdef0123456789abcdef")
+            .expect("valid generated message id");
+        let doorbell = cyclops_proto::render_doorbell_v1(&message_id);
+        let capture = format!(
+            "\u{1b}[1m\u{1b}[34m> an earlier submitted prompt\u{1b}[0m\n\
+             \u{1b}[94m>\u{1b}[39m {doorbell}\n\
+             \u{1b}[90m────────────────────────────────────────────────────────────────────────────────\n\
+             \u{1b}[38;5;152mGemini 3.7 Flash\u{1b}[38;5;251m · \u{1b}[38;5;217mHigh\u{1b}[38;5;251m · \u{1b}[38;5;151m~\u{1b}[38;5;251m · \u{1b}[38;5;182mFull\u{1b}[38;5;251m · \u{1b}[38;5;151mCtx: 100%\u{1b}[38;5;251m · 44% 5h, 74% wk · \u{1b}[38;5;215m(0K / 1048K)"
+        );
+
+        assert_eq!(
+            exact_composer_content_from_joined_capture(&manifest, &capture),
+            ComposerContentProof::Visible(doorbell.clone())
+        );
+        assert_eq!(
+            exact_staging_proof(
+                &manifest,
+                &capture,
+                StagingTarget::ExactRow(&doorbell),
+                &doorbell,
+            ),
+            Some((true, doorbell))
+        );
     }
 
     #[test]
@@ -13637,7 +13671,7 @@ mod composer_content_proof {
             );
         }
         assert_eq!(
-            composer_content_from_joined_capture(&shipped("agy"), "anything", "m-unsupported"),
+            composer_content_from_joined_capture(&shipped("cursor"), "anything", "m-unsupported"),
             ComposerContentProof::Unsupported
         );
     }
