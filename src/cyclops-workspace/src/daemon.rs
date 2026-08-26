@@ -328,10 +328,7 @@ pub fn fetch_messages_snapshot(
     limit: usize,
 ) -> Result<cyclops_proto::MessagesSnapshotResult, String> {
     let params = serde_json::to_value(cyclops_proto::MessagesSnapshotParams {
-        limit: Some(limit as u64),
-        before: None,
-        after: None,
-        scope: None,
+        recent_settled: u32::try_from(limit).unwrap_or(u32::MAX).min(100),
     })
     .map_err(|e| format!("cannot encode messages.snapshot params: {e}"))?;
     let value = request(home, "messages.snapshot", params)?;
@@ -343,11 +340,9 @@ pub fn fetch_messages_snapshot(
 pub fn fetch_message_claim(
     home: &Path,
     message_id: &cyclops_proto::MessageId,
-    recipient: &cyclops_proto::RecipientKey,
-) -> Result<cyclops_proto::ClaimResult, String> {
+) -> Result<cyclops_proto::InboxClaimResult, String> {
     let params = serde_json::to_value(cyclops_proto::InboxClaimParams {
         message_id: message_id.clone(),
-        recipient: Some(recipient.clone()),
     })
     .map_err(|e| format!("cannot encode inbox.claim params: {e}"))?;
     let value = request(home, "inbox.claim", params)?;

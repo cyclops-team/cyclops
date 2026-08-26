@@ -992,7 +992,7 @@ fn paint_drag_preview(drag: &DragState, buf: &mut Buffer, paint: &Paint) {
         DragTarget::Divider { .. } => "↔",
         DragTarget::Pane { .. } | DragTarget::Tab { .. } => "⇄",
         DragTarget::Workspace { .. } | DragTarget::Agent { .. } => "⇅",
-        DragTarget::Sidebar => "↔",
+        DragTarget::Sidebar | DragTarget::Messages => "↔",
         // Vertical only: the sidebar's two panels trade rows, not columns.
         DragTarget::SidebarSplit => "↕",
         // Free in both axes, unlike every other drag here.

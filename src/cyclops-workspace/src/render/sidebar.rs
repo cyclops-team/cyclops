@@ -11,6 +11,8 @@
 //! Both states paint that chevron through [`paint_toggle`], so the two can
 //! never disagree about how the control looks or answers a mouse.
 
+use std::collections::HashMap;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -560,7 +562,7 @@ pub fn paint_messages_resize_feedback(
         for row in divider.y..divider.y + divider.height {
             if let Some(cell) = buf.cell_mut((divider.x, row)) {
                 cell.set_symbol("│");
-                cell.set_style(theme::border_focused(paint));
+                cell.set_style(theme::pane_border_focused(paint));
             }
         }
     } else if hovered {
@@ -568,7 +570,7 @@ pub fn paint_messages_resize_feedback(
             if row < band.y || row >= band.y + band.height {
                 if let Some(cell) = buf.cell_mut((divider.x, row)) {
                     cell.set_symbol("│");
-                    cell.set_style(theme::border_hover(paint));
+                    cell.set_style(theme::pane_border_focused(paint));
                 }
             }
         }
@@ -3416,7 +3418,20 @@ mod tests {
         let mut hits = HitMap::default();
         let paint = Paint::for_test();
         let queue = cyclops_ui::HumanQueue::default();
-        paint_messages(&queue, None, None, area, &mut buf, &paint, &mut hits, None);
+        paint_messages(
+            &queue,
+            None,
+            None,
+            &cyclops_ui::AvatarRegistry::default(),
+            None,
+            None,
+            None,
+            area,
+            &mut buf,
+            &paint,
+            &mut hits,
+            None,
+        );
 
         let band = toggle_reach(Rect::new(170, 0, 1, 50));
         for y in 0..area.height {

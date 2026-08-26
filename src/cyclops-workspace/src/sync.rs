@@ -47,6 +47,7 @@ pub async fn fetch_workspace_model(
         active_workspace,
         session,
         sidebar_visible: true,
+        messages_visible: false,
     })
 }
 

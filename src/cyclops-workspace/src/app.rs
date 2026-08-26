@@ -56,8 +56,8 @@ use crate::naming;
 use crate::notice::NoticeState;
 use crate::persist::{self, load_prefs, set_last_active, SidebarTab, WorkspacePrefs};
 use crate::render::{
-    paint_dialog, paint_menu, paint_sidebar, paint_sidebar_rail, paint_sidebar_resize_feedback,
-    paint_tab_bar, paint_window,
+    paint_dialog, paint_menu, paint_messages, paint_messages_rail, paint_messages_resize_feedback,
+    paint_sidebar, paint_sidebar_rail, paint_sidebar_resize_feedback, paint_tab_bar, paint_window,
 };
 use crate::resilience::{self, LinkState};
 use crate::selection::{self, SelectionState};
@@ -853,7 +853,7 @@ pub async fn run_async() -> i32 {
     });
     let (stream_reconcile_tx, stream_reconcile_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let stream_home = home.clone();
-    let stream_results = action_tx;
+    let stream_results = action_tx.clone();
     std::thread::spawn(move || {
         while stream_reconcile_rx.recv().is_ok() {
             let bootstrap = crate::event_record::load(&stream_home);
@@ -3548,6 +3548,7 @@ async fn handle_mouse(
                 | HitTarget::NewWorkspaceButton
                 | HitTarget::SidebarTab { .. }
                 | HitTarget::SidebarToggle
+                | HitTarget::MessagesToggle
                 | HitTarget::AttentionIndicator { .. } => {
                     app.close_menu();
                 }
@@ -4082,13 +4083,13 @@ async fn handle_messages_key(
             return Ok(Some(InputOutcome::Redraw));
         }
         KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if let Some(row) = app.messages_queue.selected() {
+            if let Some(row) = app.messages_queue.selected().cloned() {
                 messages_composer_changed(app);
                 app.messages_composer = cyclops_ui::ComposerState::new_reply(
-                    row.message_id.clone(),
+                    row.message_id,
                     row.sender,
-                    row.sender_label.clone(),
-                    row.subject.clone(),
+                    row.sender_label,
+                    row.subject,
                 );
                 app.messages_composer.bind_sender(app.messages_caller);
                 return Ok(Some(InputOutcome::Redraw));
@@ -4209,6 +4210,7 @@ async fn commit_drag_drop(
         // left to resolve against whatever is under the release.
         DragTarget::Divider { .. }
         | DragTarget::Sidebar
+        | DragTarget::Messages
         | DragTarget::SidebarSplit
         | DragTarget::Dialog => None,
     };

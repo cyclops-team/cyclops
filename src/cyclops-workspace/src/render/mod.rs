@@ -63,8 +63,8 @@ pub use canvas::{PANE_GAPS, PANE_MARGIN};
 pub use overlay::{clamp_dialog_offset, keybind_max_scroll, paint_dialog, paint_menu, MenuChecks};
 pub use sidebar::{
     paint_messages, paint_messages_rail, paint_messages_resize_feedback, paint_sidebar,
-    paint_sidebar_rail, paint_sidebar_resize_feedback, sidebar_body_bottom, MESSAGES_COLLAPSE,
-    MESSAGES_EXPAND, SIDEBAR_COLLAPSE, SIDEBAR_EXPAND,
+    paint_sidebar_rail, paint_sidebar_resize_feedback, sidebar_body_bottom, SIDEBAR_COLLAPSE,
+    SIDEBAR_EXPAND,
 };
 pub use stream::{event_stream_rows, EventRow};
 pub use tab_bar::paint_tab_bar;
