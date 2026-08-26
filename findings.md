@@ -74,6 +74,7 @@ than a measurement.
 | F65 | Whole-composer clearing is measured for Claude and Codex; Antigravity and Cursor refuse unsupported actions | binds |
 | F66 | The isolated soak detected staged representations and cleared them in 100 trials each for Codex, Claude, and Antigravity; Cursor was unavailable | evidence |
 | F67 | A one-line doorbell must fit the narrow lane because application wrapping is not exact composer evidence | binds |
+| F68 | Codex 0.149.1 colors the prompt glyph separately and may leave its status trailer unstyled under `NO_COLOR` | binds, partial evidence |
 
 ## F13. refresh-client -B subscriptions work in control mode on tmux 3.6a (MEASURED)
 
@@ -1686,3 +1687,38 @@ captured the complete ten-frame Braille cycle while active; the same-version
 idle title had no prefix. A separate title rule now recognizes only that exact
 cycle. The screen window remains narrow, and old static titles retain the
 existing screen path.
+
+## F68. Codex 0.149.1 changed prompt styling and honors `NO_COLOR` in its trailer
+
+MEASURED 2026-08-25 on macOS with tmux 3.6a and Codex CLI 0.149.1. Two
+fresh isolated tmux servers used 187x62 panes, private `CYCLOPS_HOME` roots,
+and Cyclops build `642b7d3`. One launch inherited `NO_COLOR=1`; the other
+explicitly removed it. Neither probe touched the live Cyclops daemon or a
+user pane.
+
+In the colored launch, Codex painted the occupied prompt as:
+
+```text
+ESC[1m ESC[38;2;255;178;66m › ESC[0m <input>
+```
+
+The shipped rule expected the prompt glyph immediately after the bold SGR.
+Cyclops therefore classified its exact staged doorbell through the plain
+fallback, could not extract exact composer ownership, withheld Enter, and
+raised one `verify_failed` attention attempt. Process binding, manifest
+binding, and terminal-action safety all remained true. In the `NO_COLOR`
+launch the prompt retained its bold SGR while the model status row carried no
+SGR. The same exact doorbell again stayed staged because the trailer had no
+declared unstyled proof.
+
+The minimized captures contain compact doorbells but no message body:
+
+| Fixture | SHA-256 |
+| --- | --- |
+| `src/cyclops-manifest/tests/fixtures/codex_staged_0_149_1_esc.txt` | `3892872fff4f39bafc0a79fa74d6da8d8a832e6234e9ddfce612bd5740265b50` |
+| `src/cyclops-manifest/tests/fixtures/codex_staged_no_color_0_149_1.txt` | `2b3ebc0ee755ae627c4cdf41b6f2a3ab57c9101042d5ce54a58de314e23a262e` |
+
+This evidence is narrow. It measures an occupied prompt and the two trailer
+representations. The 0.149.1 ghost, slash command, working, tool, modal,
+collapsed-chip, hook, restart, resumed-session, claim, and reply cases remain
+unproven. It does not promote the manifest's full-ruleset version claim.

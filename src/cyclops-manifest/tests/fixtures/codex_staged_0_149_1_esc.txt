@@ -1,0 +1,11 @@
+╭─────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.149.1)                      │
+│                                                 │
+│ model:       gpt-5.6-sol max   /model to change │
+│ directory:   ~                                  │
+│ permissions: YOLO mode                          │
+╰─────────────────────────────────────────────────╯
+
+[1m[38;2;255;178;66m›[0m cyclops inbox claim m-4c0cdcbf9cb04cf983ef2c6aa206eac9 #c:xvXB2rLoTC2SpbRj5fnDFA
+
+  [38;2;246;226;183mgpt-5.6-sol max[2m[39m · [0m[38;2;171;223;167m~[2m[39m · [0m[38;2;200;169;238mFull Access[2m[39m · [0m[38;2;242;181;144mContext 100% left[2m[39m · [0m[38;2;233;144;169mweekly 57% left

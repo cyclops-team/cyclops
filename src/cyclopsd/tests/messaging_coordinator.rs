@@ -1703,20 +1703,26 @@ async fn same_route_with_a_new_pane_root_reproves_before_writing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unprovable_pinned_binding_blocks_once_and_withdrawal_advances_fifo() {
+async fn codex_ghost_with_unprovable_binding_blocks_once_and_withdrawal_advances_fifo() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
-    let manifest = CAT_MANIFEST.replace(
-        "process_names = [\"python3\", \"python\", \"Python\", \"cat\", \"sh\", \"dash\"]",
+    let manifest = include_str!("../../../resources/manifests/codex.toml").replace(
+        "process_names = [\"codex\"]",
         "process_names = [\"not-a-real-fixture-process\"]",
+    );
+    let ghost_pane = concat!(
+        r#"python3 -c 'import sys,time; "#,
+        r#"sys.stdout.write("\033[1m\033[38;2;255;178;66m›\033[0m "#,
+        r#"\033[2mSummarize recent commits\033[0m"); "#,
+        r#"sys.stdout.flush(); time.sleep(3600)'"#,
     );
     let mut rig = Rig::new(
         "workspace-unprovable-pinned-binding",
         &manifest,
-        &composer_pane(),
-        "delivery_retry_max = 0",
+        ghost_pane,
+        "",
     )
     .await;
     let pane = rig.pane_ids().await[0].clone();
@@ -1724,14 +1730,60 @@ async fn an_unprovable_pinned_binding_blocks_once_and_withdrawal_advances_fifo()
         .ctl
         .request(
             "pane.label",
-            json!({"target": pane, "label": "worker", "manifest": "fix"}),
+            json!({"target": pane, "label": "worker", "manifest": "codex"}),
         )
         .await;
     assert_eq!(named["result"]["label"], "worker", "{named}");
-    assert_eq!(named["result"]["manifest"], "fix", "{named}");
+    assert_eq!(named["result"]["manifest"], "codex", "{named}");
+    wait_pane_state(&mut rig, "idle").await;
 
     let pair = send_waiting_pair(&rig, "unprovable-binding").await;
+    let proceed = rig
+        .ev
+        .wait_event(Duration::from_secs(8), |event| {
+            event["event"] == "gate"
+                && event["data"]["id"] == pair.first.as_str()
+                && event["data"]["action"] == "proceed"
+        })
+        .await;
+    assert_eq!(proceed["data"]["rule"], "composer_ghost_suggestion");
+    let rebound = rig
+        .ev
+        .wait_event(Duration::from_secs(8), |event| {
+            event["event"] == "gate"
+                && event["data"]["id"] == pair.first.as_str()
+                && event["data"]["action"] == "rebound"
+        })
+        .await;
+    assert_eq!(rebound["data"]["cause"], "binding_unprovable");
+    assert!(
+        proceed["seq"].as_u64().unwrap() < rebound["seq"].as_u64().unwrap(),
+        "binding failure must follow the admitted ghost-composer gate"
+    );
     wait_for_notification_state(&mut rig, &pair.first, NotificationState::BlockedPreWrite).await;
+    let gate_trace: Vec<String> = rig
+        .ledger_lines()
+        .iter()
+        .filter(|line| line["kind"] == "gate" && line["id"] == pair.first.as_str())
+        .map(|line| {
+            format!(
+                "{}:{}:{}",
+                line["data"]["action"].as_str().unwrap_or(""),
+                line["data"]["rule"].as_str().unwrap_or(""),
+                line["data"]["cause"].as_str().unwrap_or("")
+            )
+        })
+        .collect();
+    assert_eq!(
+        gate_trace,
+        vec![
+            "proceed:composer_ghost_suggestion:".to_string(),
+            "rebound::binding_unprovable".to_string(),
+            "proceed:composer_ghost_suggestion:".to_string(),
+            "rebound::binding_unprovable".to_string(),
+        ],
+        "the production retry budget must settle after two exact attempts"
+    );
     assert_only_oldest_attempt_exists(&rig, &pair);
     assert_eq!(
         notification_state_count(&rig, &pair.first, NotificationState::BlockedPreWrite),
@@ -1746,7 +1798,7 @@ async fn an_unprovable_pinned_binding_blocks_once_and_withdrawal_advances_fifo()
     );
     assert_eq!(
         blocked_fact["pre_write_observation"]["selected_manifest"],
-        "fix"
+        "codex"
     );
     // A failed OS process observation may not have a pane generation to
     // record. It must never manufacture the complete binding that failed.
@@ -1791,13 +1843,21 @@ async fn an_unprovable_pinned_binding_blocks_once_and_withdrawal_advances_fifo()
             .ctl
             .request(
                 "pane.label",
-                json!({"target": pane, "label": "worker", "manifest": "fix"}),
+                json!({"target": pane, "label": "worker", "manifest": "codex"}),
             )
             .await;
         assert_eq!(repeated["result"]["label"], "worker", "{repeated}");
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(notification_attempts(&rig, &pair.first).len(), 1);
+    assert_eq!(
+        rig.ledger_lines()
+            .iter()
+            .filter(|line| line["kind"] == "gate" && line["id"] == pair.first.as_str())
+            .count(),
+        gate_trace.len(),
+        "unchanged evidence must not restart the bounded retry chain"
+    );
     assert_eq!(
         notification_state_count(&rig, &pair.first, NotificationState::BlockedPreWrite),
         1,

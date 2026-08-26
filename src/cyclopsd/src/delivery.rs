@@ -12873,6 +12873,107 @@ mod composer_content_proof {
     }
 
     #[test]
+    fn codex_0_149_1_doorbell_has_exact_visible_ownership() {
+        let capture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cyclops-manifest/tests/fixtures/codex_staged_0_149_1_esc.txt"
+        ));
+        let manifest = shipped("codex");
+        let doorbell =
+            "cyclops inbox claim m-4c0cdcbf9cb04cf983ef2c6aa206eac9 #c:xvXB2rLoTC2SpbRj5fnDFA";
+
+        assert_eq!(
+            staged_representation(&manifest, capture, StagingTarget::ExactRow(doorbell)),
+            Some(StagedRepresentation::VisibleTarget)
+        );
+        assert_eq!(
+            exact_composer_content_from_joined_capture(&manifest, capture),
+            ComposerContentProof::Visible(doorbell.to_string())
+        );
+
+        for ambiguous in [
+            capture.replace(doorbell, &format!("human draft {doorbell}")),
+            capture.replace(doorbell, &format!("{doorbell} unexpected")),
+        ] {
+            let ComposerContentProof::Visible(content) =
+                exact_composer_content_from_joined_capture(&manifest, &ambiguous)
+            else {
+                panic!("the occupied composer must remain visible as human input")
+            };
+            assert_ne!(content, doorbell);
+            assert!(exact_staging_proof(
+                &manifest,
+                &ambiguous,
+                StagingTarget::ExactRow(doorbell),
+                doorbell
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn codex_0_149_1_no_color_doorbell_uses_structural_trailer() {
+        let capture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cyclops-manifest/tests/fixtures/codex_staged_no_color_0_149_1.txt"
+        ));
+        let manifest = shipped("codex");
+        let doorbell =
+            "cyclops inbox claim m-cfb2ad82c11a484cb617733220308231 #c:RN31a7Y4SsKK6gxgZ0xUKg";
+
+        assert_eq!(
+            exact_composer_content_from_joined_capture(&manifest, capture),
+            ComposerContentProof::Visible(doorbell.to_string())
+        );
+        assert_eq!(
+            exact_staging_proof(
+                &manifest,
+                capture,
+                StagingTarget::ExactRow(doorbell),
+                doorbell
+            ),
+            Some((true, doorbell.to_string()))
+        );
+
+        let followed = format!("{capture}\nunexpected text");
+        assert_eq!(
+            exact_composer_content_from_joined_capture(&manifest, &followed),
+            ComposerContentProof::Unprovable
+        );
+        assert!(exact_staging_proof(
+            &manifest,
+            &followed,
+            StagingTarget::ExactRow(doorbell),
+            doorbell
+        )
+        .is_none());
+
+        let prompt_row = capture.lines().next().unwrap();
+        let status_row = capture.lines().last().unwrap();
+        let empty_prompt = "\u{1b}[1m›\u{1b}[0m ";
+        let invalid = [
+            capture.replace(doorbell, &format!("human draft {doorbell}")),
+            capture.replace(doorbell, &format!("{doorbell} unexpected")),
+            capture.replacen("\n\n", "\n  unexpected continuation\n\n", 1),
+            format!("{prompt_row}\n{capture}"),
+            format!("{prompt_row}\nprior answer\n{empty_prompt}\n\n{status_row}"),
+            capture.replace(status_row, "Allow command? [y/N]"),
+        ];
+        for screen in invalid {
+            assert!(
+                exact_staging_proof(
+                    &manifest,
+                    &screen,
+                    StagingTarget::ExactRow(doorbell),
+                    doorbell
+                )
+                .is_none(),
+                "ambiguous no-color composer content must fail closed"
+            );
+        }
+    }
+
+    #[test]
     fn no_color_trailer_does_not_hide_content_after_the_sentinel() {
         let capture = concat!(
             "❯\u{a0}[cyclops m-no-color] FROM: cyclopsd  SUBJECT: hook self-test\n",

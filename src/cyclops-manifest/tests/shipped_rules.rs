@@ -389,6 +389,39 @@ fn codex_ghost_vs_typed_probed_fixtures() {
     assert_eq!(r.state, AgentState::Idle);
 }
 
+/// Codex 0.149.1 adds a truecolor SGR between the bold composer style and
+/// the prompt glyph. The occupied composer must still outrank the plain
+/// idle fallback or a staged Cyclops doorbell cannot be verified.
+#[test]
+fn codex_0_149_1_colored_prompt_is_staged_input() {
+    let all = shipped();
+    let codex = &all["codex"];
+    let escaped = include_str!("fixtures/codex_staged_0_149_1_esc.txt");
+    let plain = cyclops_manifest::strip_csi(escaped);
+
+    let rule = codex.evaluate_esc("proj", &plain, Some(escaped)).unwrap();
+    assert_eq!(rule.id, "composer_typed_input");
+    assert_eq!(rule.state, AgentState::IdleWithInput);
+
+    let doorbell =
+        "cyclops inbox claim m-4c0cdcbf9cb04cf983ef2c6aa206eac9 #c:xvXB2rLoTC2SpbRj5fnDFA";
+    let human = escaped.replace(doorbell, "review my local changes");
+    let human_plain = cyclops_manifest::strip_csi(&human);
+    let rule = codex
+        .evaluate_esc("proj", &human_plain, Some(&human))
+        .unwrap();
+    assert_eq!(rule.id, "composer_typed_input");
+    assert_eq!(rule.state, AgentState::IdleWithInput);
+
+    let ghost = escaped.replace(doorbell, "\u{1b}[2mSummarize recent commits\u{1b}[0m");
+    let ghost_plain = cyclops_manifest::strip_csi(&ghost);
+    let rule = codex
+        .evaluate_esc("proj", &ghost_plain, Some(&ghost))
+        .unwrap();
+    assert_eq!(rule.id, "composer_ghost_suggestion");
+    assert_eq!(rule.state, AgentState::Idle);
+}
+
 /// MEASURED 2026-08-17 (codex-cli 0.147.0, live pane at 120x40): a paste long
 /// enough to collapse renders as a COLORED chip, so the first significant
 /// character after the glyph is an SGR introducer rather than a byte. The

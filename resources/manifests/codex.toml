@@ -6,7 +6,8 @@
 # interrupt)" and the ghost composer stays on screen for the whole turn.
 # Composer extraction and clear action were re-measured on 0.149.0
 # (2026-08-21). Active and idle pane titles were re-measured on 0.149.0
-# (2026-08-22).
+# (2026-08-22). Occupied prompt styling and no-color trailer structure were
+# re-measured on 0.149.1 (2026-08-25).
 #
 # Sensor summary for this CLI:
 #   title  WORKING-ONLY on 0.149.0. Active turns prefix the project title with
@@ -97,14 +98,16 @@ state = "idle_with_input"
 composer_semantic = "human_input"
 priority = 1050
 region = "bottom_non_empty_lines(6)"
-line_regex_esc = ['^\s*\x1b\[1m›(?:\x1b\[[0-9;]*m)*\s+(?:[^\x1b\s]|\x1b\[(?:[013-9][0-9;]*|2[0-9;]+)m)']
+line_regex_esc = ['^\s*\x1b\[1m(?:\x1b\[(?:3[0-7]|38(?:(?:;|:)[0-9]+)+)m)*›(?:\x1b\[[0-9;:]*m)*\s+(?:[^\x1b\s]|\x1b\[(?:[013-9][0-9;:]*|2[0-9;:]+)m)']
 note = """Content after the composer glyph, in either form it takes. Typed text
 is a plain byte ('› fix the rate limiter'). A paste long enough to collapse is
 a COLORED chip ('› [Pasted Content 2828 chars]' in 38;5;6), so its first
 significant character is an SGR introducer, not a byte — the earlier
 `[^\\x1b\\s]` clause could not see it, and a staged chip read idle: the gate
 would paste a second message on top of the first, and delivery could not
-verify its own staging (both fixed 2026-08-17).
+verify its own staging (both fixed 2026-08-17). Codex 0.149.1 adds a
+truecolor foreground SGR between the bold-only run and the glyph. The optional
+run before the glyph accepts only measured foreground-color forms, not dim.
 
 Two exclusions carry the rule. Ghost suggestions are dim, so an SGR whose
 whole parameter list is `2` is not content — that is what the alternation's
@@ -118,6 +121,8 @@ fixtures/codex_pasted_chip_{esc,plain}.txt:
   composer + chip   ESC[1m›ESC[0m ESC[38;5;6m[Pasted Content 2828 chars]ESC[39m
   composer + ghost  ESC[1m›ESC[0m ESC[2mSummarize recent commitsESC[0m
   transcript        ESC[1;2m›  ESC[0m[cyclops m-diag01] FROM: tester ...
+MEASURED 2026-08-25, codex-cli 0.149.1, live 187x62 pane:
+  composer          ESC[1m ESC[38;2;255;178;66m › ESC[0m <typed text>
 Earlier ghost probe (0.146.0): 'ESC[1m›ESC[0m fix the rate limiter in gateway.rs'"""
 
 [[rule]]
@@ -126,9 +131,10 @@ state = "idle"
 composer_semantic = "ghost_suggestion"
 priority = 1040
 region = "bottom_non_empty_lines(6)"
-line_regex_esc = ['^\s*(?:\x1b\[[0-9;]*m)*›(?:\x1b\[[0-9;]*m)*\s+\x1b\[2m']
+line_regex_esc = ['^\s*\x1b\[1m(?:\x1b\[(?:3[0-7]|38(?:(?:;|:)[0-9]+)+)m)*›(?:\x1b\[[0-9;:]*m)*\s+\x1b\[2m']
 note = """Ghost suggestion text is wrapped in SGR dim (ESC[2m) directly after
-the glyph. Ghost text is NOT staged user input; the pane is idle and safe."""
+the glyph. The prompt itself may carry the measured 0.149.1 foreground color.
+Ghost text is NOT staged user input; the pane is idle and safe."""
 evidence = "MEASURED ghost probe: 'ESC[1m›ESC[0m ESC[2mFind and fix a bug in @filenameESC[0m'"
 
 [[rule]]
@@ -269,6 +275,10 @@ composer_trailer_regex_esc = [
 ]
 # Required prefix length: 2. Both rows are painted every time.
 composer_trailer_required_prefix = 2
+# Codex 0.149.1 honors NO_COLOR for the status row while retaining the
+# bold composer glyph. The required blank plus status-row structure is the
+# measured fallback when the trailer itself carries no SGR.
+unstyled_composer_proof = "structural_trailer"
 # The collapsed-paste chip, as a whole composer row. MEASURED (fixture
 # codex_pasted_chip_esc.txt): the bold composer glyph, then the chip
 # painted in 38;5;6.
