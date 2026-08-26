@@ -2040,17 +2040,15 @@ async fn handle_mouse(
                 }
                 // A picker notch moves the selection one row, not a
                 // viewport three: the list is what the wheel is over.
-                Some(Dialog::Themes {
-                    selected, names, ..
-                }) => {
+                Some(open @ Dialog::Settings { .. }) => {
                     let delta = if up { -1 } else { 1 };
-                    *selected = dialog::move_theme_selection(*selected, delta, names.len());
+                    dialog::move_settings_selection(open, delta);
                 }
                 _ => {}
             }
-            // Same preview the arrow keys make: the row the wheel lands
-            // on goes live for the next render.
-            exec::preview_selected_theme(app);
+            // Same landing the arrow keys make: a theme goes live for the
+            // next render, a sound row takes the check.
+            exec::settings_cursor_moved(app, false);
             return Ok(());
         }
         match mouse.kind {
@@ -2067,6 +2065,24 @@ async fn handle_mouse(
                     // does; the drags below carry it.
                     Some(HitTarget::DialogTitleBar) => {
                         app.drag = Some(DragState::on_down(DragTarget::Dialog, col, row));
+                    }
+                    Some(HitTarget::SettingsSection { section }) => {
+                        let section = *section;
+                        if let Some(open) = app.dialog.as_mut() {
+                            dialog::show_settings_section(open, section);
+                        }
+                    }
+                    // The mouse's half of the arrows: the row goes under
+                    // the cursor and, for a theme, live for the next
+                    // render; a sound row takes the check and plays on
+                    // every click. Applying stays with Enter and the
+                    // button.
+                    Some(HitTarget::SettingsRow { index }) => {
+                        let index = *index;
+                        if let Some(open) = app.dialog.as_mut() {
+                            dialog::select_settings_row(open, index);
+                        }
+                        exec::settings_cursor_moved(app, true);
                     }
                     _ => {}
                 }
@@ -2493,9 +2509,11 @@ async fn handle_mouse(
                 }
                 // Dialog rows only ever reach the mouse handler's own
                 // dialog-is-open branch, which returns before this match.
-                HitTarget::DialogConfirm | HitTarget::DialogCancel | HitTarget::DialogTitleBar => {
-                    return Ok(())
-                }
+                HitTarget::DialogConfirm
+                | HitTarget::DialogCancel
+                | HitTarget::DialogTitleBar
+                | HitTarget::SettingsSection { .. }
+                | HitTarget::SettingsRow { .. } => return Ok(()),
             }
             if let Some(action) = action::route_mouse_click(&target, MouseButton::Left) {
                 let outcome = exec::execute(app, client, action).await?;
@@ -3255,6 +3273,18 @@ fn apply_decoration_snapshot(app: &mut App, snapshot: DecorationSnapshot) {
     {
         app.save_prefs_or_log();
     }
+    // Before the swap, while both snapshots are in hand: the cue is about
+    // the difference between them (`crate::sound` says which differences).
+    if app.prefs.sound_notifs
+        && crate::sound::background_state_changed(
+            &app.decoration,
+            &snapshot,
+            &app.model.active_tab().active_pane,
+            app.window_focused,
+        )
+    {
+        crate::sound::play(&app.home, &app.prefs.sound);
+    }
     app.decoration = snapshot;
 }
 
@@ -3547,16 +3577,19 @@ async fn handle_dialog_key(
                 Some(Dialog::Keybinds { scroll, .. }) => {
                     *scroll = dialog::move_keybind_scroll(*scroll, delta, max_scroll);
                 }
-                Some(Dialog::Themes {
-                    selected, names, ..
-                }) => {
-                    *selected = dialog::move_theme_selection(*selected, delta, names.len());
+                Some(open @ Dialog::Settings { .. }) => {
+                    dialog::move_settings_selection(open, delta);
                 }
                 _ => {}
             }
-            // The row the arrows land on goes live for the next render
-            // (a no-op for every other dialog).
-            exec::preview_selected_theme(app);
+            // The row the arrows land on goes live, or takes the check,
+            // for the next render (a no-op for every other dialog).
+            exec::settings_cursor_moved(app, false);
+        }
+        DialogKeyAction::SwitchSection(delta) => {
+            if let Some(open) = app.dialog.as_mut() {
+                dialog::switch_settings_section(open, delta);
+            }
         }
         DialogKeyAction::ScrollStart => {
             if let Some(Dialog::Keybinds { scroll, .. }) = app.dialog.as_mut() {
@@ -4734,13 +4767,17 @@ mod tests {
         let mut app = test_app(one_pane_model(), home.clone());
         let dim = cyclops_theme::tokens::SURFACE_DIM;
         let original = app.paint.theme.resolve(dim).rgb;
-        // What ShowThemes does: keep the live paint beside the picker.
+        // What ShowSettings does: keep the live paint beside the picker.
         app.theme_restore = Some(app.paint.theme.clone());
-        app.dialog = Some(Dialog::Themes {
-            names: vec!["solar".into()],
-            selected: 0,
-            active: None,
-            notice: None,
+        app.dialog = Some(Dialog::Settings {
+            section: dialog::SettingsSection::Theme,
+            themes: dialog::ThemePicker {
+                names: vec!["solar".into()],
+                selected: 0,
+                active: None,
+                notice: None,
+            },
+            sound: dialog::SoundPicker::new(false, vec!["system".into()], "system"),
         });
         exec::preview_selected_theme(&mut app);
         assert_ne!(app.paint.theme.resolve(dim).rgb, original, "previewed");
@@ -4788,11 +4825,15 @@ mod tests {
         let dim = cyclops_theme::tokens::SURFACE_DIM;
 
         app.theme_restore = Some(app.paint.theme.clone());
-        app.dialog = Some(Dialog::Themes {
-            names: vec!["dark".into(), "solar".into()],
-            selected: 1,
-            active: Some(0),
-            notice: None,
+        app.dialog = Some(Dialog::Settings {
+            section: dialog::SettingsSection::Theme,
+            themes: dialog::ThemePicker {
+                names: vec!["dark".into(), "solar".into()],
+                selected: 1,
+                active: Some(0),
+                notice: None,
+            },
+            sound: dialog::SoundPicker::new(false, vec!["system".into()], "system"),
         });
         exec::preview_selected_theme(&mut app);
         assert_eq!(app.paint.theme.resolve(dim).rgb, (0x22, 0x22, 0x22));

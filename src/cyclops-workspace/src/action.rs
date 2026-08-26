@@ -87,7 +87,7 @@ use crossterm::event::MouseButton;
 use cyclops_tmux::{PaneDirection, SplitDirection};
 
 use crate::bindings::BindingAction;
-use crate::dialog::Dialog;
+use crate::dialog::{Dialog, SettingsSection};
 use crate::drag::DragTarget;
 use crate::input::mouse::{HitTarget, MenuState};
 use crate::layout::SplitDir;
@@ -315,15 +315,25 @@ pub enum Action {
         tab: crate::persist::SidebarTab,
     },
     ShowKeybinds,
-    /// Open the theme picker. Carries no target: the listing is read from
-    /// the themes directory at execution time, so a file added or removed
-    /// between the click and the open cannot show a stale row.
-    ShowThemes,
+    /// Open the settings card on its theme section. Carries no target:
+    /// the theme listing is read from the themes directory at execution
+    /// time, so a file added or removed between the click and the open
+    /// cannot show a stale row, and the sound switch is read from prefs.
+    ShowSettings,
     /// Switch to a theme by name, exactly what `cyclops theme <name>`
     /// does: write the config key and nudge the daemon, whose theme event
     /// repaints this workspace through the existing hot-reload watch.
     ApplyTheme {
         name: String,
+    },
+    /// Save what the sound section has checked, the switch
+    /// (`[workspace] sound_notifs`) and the cue (`[workspace] sound`, an
+    /// installed stem or `crate::sound::SYSTEM`; `None` keeps the saved
+    /// one when nothing on offer is checked), and close the card, the
+    /// way a confirmed Apply on the theme section does.
+    ApplySoundSettings {
+        on: bool,
+        cue: Option<String>,
     },
     Detach,
 }
@@ -455,7 +465,7 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
         BindingAction::ToggleMotion => Some(Action::ToggleMotion),
         BindingAction::ToggleEventPanel => Some(Action::ToggleEventPanel),
         BindingAction::ShowKeybinds => Some(Action::ShowKeybinds),
-        BindingAction::ShowThemes => Some(Action::ShowThemes),
+        BindingAction::ShowSettings => Some(Action::ShowSettings),
     }
 }
 
@@ -633,13 +643,27 @@ pub fn route_dialog_confirm(dialog: &Dialog) -> Option<Action> {
         }),
         // Read-only: nothing to confirm. Enter just dismisses it.
         Dialog::Keybinds { .. } => None,
-        // Enter applies the row the arrows are on. An empty listing has
-        // nothing to apply, so Enter dismisses like the keybinds sheet.
-        Dialog::Themes {
-            names, selected, ..
-        } => names
-            .get(*selected)
+        // Enter applies the row the arrows are on, in the section that is
+        // showing. An empty theme listing has nothing to apply, so Enter
+        // dismisses like the keybinds sheet.
+        Dialog::Settings {
+            section: SettingsSection::Theme,
+            themes,
+            ..
+        } => themes
+            .names
+            .get(themes.selected)
             .map(|name| Action::ApplyTheme { name: name.clone() }),
+        // The sound section's Enter reads the checks, not the cursor:
+        // landing on rows moved them, and both groups are saved at once.
+        Dialog::Settings {
+            section: SettingsSection::Sound,
+            sound,
+            ..
+        } => Some(Action::ApplySoundSettings {
+            on: sound.on,
+            cue: sound.checked_sound().map(String::from),
+        }),
     }
 }
 
@@ -1537,45 +1561,86 @@ mod tests {
     }
 
     #[test]
-    fn show_themes_agrees_across_keyboard_and_app_menu() {
+    fn show_settings_agrees_across_keyboard_and_app_menu() {
         let tabs = [tab("@1")];
         let workspaces = [workspace("$1", "main")];
         let c = ctx(&tabs, 0, "%0", "main", &workspaces, 0);
 
         assert_eq!(
-            route_binding(BindingAction::ShowThemes, &c),
-            Some(Action::ShowThemes)
+            route_binding(BindingAction::ShowSettings, &c),
+            Some(Action::ShowSettings)
         );
         assert_eq!(
-            route_menu_item(&MenuState::AppMenu, BindingAction::ShowThemes, &c),
-            Some(Action::ShowThemes)
+            route_menu_item(&MenuState::AppMenu, BindingAction::ShowSettings, &c),
+            Some(Action::ShowSettings)
         );
     }
 
-    #[test]
-    fn themes_dialog_confirms_the_selected_row_by_name() {
-        assert_eq!(
-            route_dialog_confirm(&Dialog::Themes {
-                names: vec!["dark".into(), "light".into(), "solar".into()],
+    fn settings(section: SettingsSection, names: Vec<String>, sound_selected: usize) -> Dialog {
+        Dialog::Settings {
+            section,
+            themes: crate::dialog::ThemePicker {
+                names,
                 selected: 1,
                 active: Some(0),
                 notice: None,
-            }),
+            },
+            sound: crate::dialog::SoundPicker {
+                selected: sound_selected,
+                on: false,
+                sounds: vec!["bow-ripple".into(), "system".into()],
+                active_sound: Some(0),
+                previewed: None,
+            },
+        }
+    }
+
+    /// Enter answers the section that is showing: the theme under the
+    /// cursor on one, the sound section's checks on the other, each
+    /// blind to the other's state.
+    #[test]
+    fn settings_confirms_the_selected_row_of_the_showing_section() {
+        let names = vec!["dark".to_string(), "light".into(), "solar".into()];
+        assert_eq!(
+            route_dialog_confirm(&settings(SettingsSection::Theme, names.clone(), 0)),
             Some(Action::ApplyTheme {
                 name: "light".into()
             })
         );
+        // The sound section answers with its checks, wherever the cursor
+        // is: the helper's picker has the switch off and the shipped cue
+        // checked.
+        for cursor in [0, 3, 4] {
+            assert_eq!(
+                route_dialog_confirm(&settings(SettingsSection::Sound, names.clone(), cursor)),
+                Some(Action::ApplySoundSettings {
+                    on: false,
+                    cue: Some("bow-ripple".into())
+                }),
+                "cursor on row {cursor}"
+            );
+        }
+        let mut checked = settings(SettingsSection::Sound, Vec::new(), 3);
+        if let Dialog::Settings { sound, .. } = &mut checked {
+            sound.selected = 0;
+            sound.check_selected();
+            sound.selected = 3;
+            sound.check_selected();
+        }
+        assert_eq!(
+            route_dialog_confirm(&checked),
+            Some(Action::ApplySoundSettings {
+                on: true,
+                cue: Some("system".into())
+            }),
+            "what landing checked is what Enter saves"
+        );
     }
 
     #[test]
-    fn an_empty_themes_dialog_confirms_to_no_action() {
+    fn an_empty_theme_listing_confirms_to_no_action() {
         assert_eq!(
-            route_dialog_confirm(&Dialog::Themes {
-                names: Vec::new(),
-                selected: 0,
-                active: None,
-                notice: None,
-            }),
+            route_dialog_confirm(&settings(SettingsSection::Theme, Vec::new(), 0)),
             None
         );
     }

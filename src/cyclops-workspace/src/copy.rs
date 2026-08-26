@@ -136,7 +136,8 @@ pub const MENU_TAB_BAR: &str = "Tab bar";
 /// The only visible switch for chrome fades (`crate::animate`).
 pub const MENU_MOTION: &str = "Motion";
 
-pub const MENU_THEMES: &str = "Themes";
+/// Opens the settings dialog: the theme picker and the sound switch.
+pub const MENU_SETTINGS: &str = "Settings";
 
 pub const MENU_KEYBINDS: &str = "Keybinds";
 
@@ -150,9 +151,30 @@ pub const MENU_RENAME_WORKSPACE: &str = "Rename session";
 
 pub const MENU_CLOSE_WORKSPACE: &str = "Close session";
 
-pub const THEMES_TITLE: &str = "Themes";
+pub const SETTINGS_TITLE: &str = "Settings";
 
-pub const THEMES_HINT: &str = "Pick with ↑/↓, Enter applies everywhere.";
+/// The settings dialog's section chips, in the order Tab walks them.
+pub const SETTINGS_SECTION_THEME: &str = "Theme";
+
+pub const SETTINGS_SECTION_SOUND: &str = "Sound";
+
+pub const THEMES_HINT: &str = "Pick with ↑/↓, Tab switches section, Enter applies everywhere.";
+
+/// The sound section's two rows. "Sound notifs" rather than "Sounds":
+/// the switch is about being told, not about the workspace making noise.
+pub const SOUND_NOTIFS_ON: &str = "Sound notifs: on";
+
+pub const SOUND_NOTIFS_OFF: &str = "Sound notifs: off";
+
+/// The sound list's built-in row: the system's alert sound rather than
+/// a file. Its pref value is `crate::sound::SYSTEM`.
+pub const SOUND_SYSTEM: &str = "System alert";
+
+/// The sound section's first line, muted: what the switch is for.
+pub const SOUND_INTRO: &str = "Play sounds when agents change state in background.";
+
+/// The muted heading over the sounds to choose from.
+pub const SOUND_LIST_HEADING: &str = "Sounds";
 
 pub const THEMES_EMPTY: &str = "No themes found. Run cyclops start to seed the shipped ones.";
 

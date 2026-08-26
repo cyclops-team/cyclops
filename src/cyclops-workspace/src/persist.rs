@@ -94,6 +94,15 @@ pub struct WorkspacePrefs {
     /// while this answers "should we", and an operator who finds motion
     /// distracting must not have to re-answer it every launch.
     pub motion: bool,
+    /// Whether a background agent changing state plays a sound
+    /// (`crate::sound`). Off by default: a workspace that starts ringing
+    /// after an upgrade is a surprise, and the settings dialog is one
+    /// click away. Stored rather than inferred for the reason `motion`
+    /// is: this is "should we", not "can we".
+    pub sound_notifs: bool,
+    /// Which sound `sound_notifs` plays: an installed stem under
+    /// `<home>/sounds/`, or `crate::sound::SYSTEM` for the system alert.
+    pub sound: String,
     pub workspace_order: Vec<String>,
     /// Stable labels, with pane-id fallbacks for unnamed detected agents.
     pub agent_order: Vec<String>,
@@ -125,6 +134,8 @@ impl Default for WorkspacePrefs {
             files_rows: 8,
             tab_bar_visible: true,
             motion: true,
+            sound_notifs: false,
+            sound: crate::sound::DEFAULT.to_string(),
             workspace_order: Vec::new(),
             agent_order: Vec::new(),
             folder_tracked: Vec::new(),
@@ -196,6 +207,12 @@ pub fn load_prefs(home: &Path) -> WorkspacePrefs {
     }
     if let Some(v) = workspace.get("motion").and_then(|v| v.as_bool()) {
         prefs.motion = v;
+    }
+    if let Some(v) = workspace.get("sound_notifs").and_then(|v| v.as_bool()) {
+        prefs.sound_notifs = v;
+    }
+    if let Some(v) = workspace.get("sound").and_then(|v| v.as_str()) {
+        prefs.sound = v.to_string();
     }
     if let Some(v) = workspace.get("tab_bar_visible").and_then(|v| v.as_bool()) {
         prefs.tab_bar_visible = v;
@@ -282,6 +299,11 @@ pub fn save_prefs(home: &Path, prefs: &WorkspacePrefs) -> std::io::Result<()> {
         toml::Value::String(prefs.sidebar_tab.as_str().into()),
     );
     workspace.insert("motion".into(), toml::Value::Boolean(prefs.motion));
+    workspace.insert(
+        "sound_notifs".into(),
+        toml::Value::Boolean(prefs.sound_notifs),
+    );
+    workspace.insert("sound".into(), toml::Value::String(prefs.sound.clone()));
     workspace.insert(
         "tab_bar_visible".into(),
         toml::Value::Boolean(prefs.tab_bar_visible),
@@ -428,6 +450,8 @@ mod tests {
             sidebar_tab: *SidebarTab::offered().last().expect("a tab is offered"),
             tab_bar_visible: false,
             motion: false,
+            sound_notifs: true,
+            sound: "system".into(),
             workspace_order: vec!["beta".into(), "alpha".into()],
             agent_order: vec!["name:reviewer".into(), "pane:%7".into()],
             folder_tracked: vec!["$3".into(), "$7".into()],
@@ -562,6 +586,8 @@ mod tests {
             "sidebar_tab",
             "tab_bar_visible",
             "motion",
+            "sound_notifs",
+            "sound",
             "workspace_order",
             "agent_order",
             "folder_tracked",
@@ -598,6 +624,8 @@ mod tests {
                 sidebar_tab: SidebarTab::Sessions,
                 tab_bar_visible: true,
                 motion: true,
+                sound_notifs: false,
+                sound: "bow-ripple".into(),
                 workspace_order: vec!["cyclops".into()],
                 agent_order: vec!["name:implementer".into()],
                 folder_tracked: vec![],

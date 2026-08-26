@@ -80,7 +80,8 @@ spawns `tmux -V` once at boot to read the version. The parsing is
 
 Data directories, none of them code paths: `resources/manifests/` (per-CLI
 detection), `resources/hooks/` (vendor hook templates), `resources/layouts/` (workspace
-presets), `resources/themes/` (palettes), `demos/` (runnable scenarios), `website/`
+presets), `resources/themes/` (palettes), `resources/sounds/` (the workspace's
+notification cues), `demos/` (runnable scenarios), `website/`
 (the landing page, outside the Cargo workspace and checked by its own CI
 job).
 

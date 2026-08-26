@@ -14,7 +14,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap};
 use super::PANE_GRIP;
 use crate::bindings::BindingAction;
 use crate::copy;
-use crate::dialog::Dialog;
+use crate::dialog::{Dialog, SettingsSection, SoundPicker, SoundRow, ThemePicker};
 use crate::input::mouse::{HitMap, HitTarget, MenuState};
 use crate::theme::{self, Paint};
 
@@ -40,6 +40,12 @@ const DIALOG_INNER_ROWS: u16 = 5;
 /// of stretching the box across the terminal.
 const DIALOG_ERROR_MAX_WIDTH: u16 = 68;
 
+/// Widest the settings card gets. Wider than the plain dialogs so the
+/// sound section's one-line explanation and the theme hint each fit on
+/// one row at an ordinary terminal width; a narrower terminal wraps them
+/// rather than losing them.
+const SETTINGS_MAX_WIDTH: u16 = 58;
+
 /// Columns between two buttons on the action row.
 const DIALOG_BUTTON_GAP: u16 = 2;
 
@@ -50,9 +56,11 @@ const FIELD_MAX_ROWS: u16 = 6;
 
 /// The rows a floating box is dragged by: its top border, and the row
 /// under it. One border row is a hard target for a pointer, and the row
-/// under it carries no control of its own (the hint on the list cards, the
-/// question on a plain one), so claiming it costs nothing and doubles the
-/// reach.
+/// under it carries no control of its own (the hint on the keybinds
+/// sheet, the question on a plain one), so claiming it costs nothing and
+/// doubles the reach. The settings card's section chips are the one
+/// control on that row; they are pushed after the strip so each wins its
+/// own cells and the rest of the row still drags.
 const DIALOG_GRAB_ROWS: u16 = 2;
 
 /// Move a centered box by however far the operator has dragged it, and keep
@@ -281,7 +289,7 @@ fn dialog_parts(dialog: &Dialog) -> (&str, Option<&str>, Option<&str>, &'static 
             copy::BUTTON_SEND,
         ),
         Dialog::Keybinds { .. } => unreachable!("keybinds uses its own dialog renderer"),
-        Dialog::Themes { .. } => unreachable!("themes uses its own dialog renderer"),
+        Dialog::Settings { .. } => unreachable!("settings uses its own dialog renderer"),
     }
 }
 
@@ -296,12 +304,10 @@ fn dialog_parts(dialog: &Dialog) -> (&str, Option<&str>, Option<&str>, &'static 
 pub fn dialog_rect(dialog: &Dialog, area: Rect) -> Option<Rect> {
     match dialog {
         Dialog::Keybinds { rows, .. } => keybind_dialog_geometry(rows.len(), area).map(|(r, _)| r),
-        Dialog::Themes { names, notice, .. } => {
-            let width = area.width.saturating_sub(4).min(48);
-            let notice_lines = themes_notice(names, notice.as_deref())
-                .map(|text| wrapped_line_count(text, width.saturating_sub(DIALOG_CHROME_WIDTH)))
-                .unwrap_or(0);
-            themes_dialog_geometry(names.len(), notice_lines, area).map(|(r, _)| r)
+        // Sized for every section at once, so Tab never moves the box.
+        Dialog::Settings { themes, sound, .. } => {
+            let (rows, footer_lines) = settings_frame(themes, sound, area);
+            settings_dialog_geometry(rows, footer_lines, area).map(|(r, _)| r)
         }
         _ => {
             let (title, input, hint, confirm_label) = dialog_parts(dialog);
@@ -356,24 +362,14 @@ pub fn paint_dialog(
         paint_keybinds_dialog(*scroll, rows, area, buf, paint, hits, hover, offset);
         return;
     }
-    if let Dialog::Themes {
-        names,
-        selected,
-        active,
-        notice,
+    if let Dialog::Settings {
+        section,
+        themes,
+        sound,
     } = dialog
     {
-        paint_themes_dialog(
-            names,
-            *selected,
-            *active,
-            notice.as_deref(),
-            area,
-            buf,
-            paint,
-            hits,
-            hover,
-            offset,
+        paint_settings_dialog(
+            *section, themes, sound, area, buf, paint, hits, hover, offset,
         );
         return;
     }
@@ -770,20 +766,22 @@ pub fn keybind_max_scroll(row_count: usize, area: Rect) -> u16 {
     u16::try_from(row_count.saturating_sub(list_height as usize)).unwrap_or(u16::MAX)
 }
 
-/// The theme picker: a titled list with the active row checked and the
-/// selected row raised. Applying repaints the whole workspace, so the
-/// rows need no swatch; the CLI's listing is the visual preview.
+/// The settings card: section chips across the top, the showing
+/// section's list under them with the saved row checked and the selected
+/// row raised, and a muted line under the list saying what the list is
+/// for. Applying a theme repaints the whole workspace, so its rows need
+/// no swatch; the CLI's listing is the visual preview.
 ///
-/// The active marker is [`copy::MENU_CHECK`], the same glyph the app
+/// The saved marker is [`copy::MENU_CHECK`], the same glyph the app
 /// menu's toggles use, because a theme being on is the same kind of fact
 /// as motion being on and should not need a second vocabulary. It rides
-/// beside the selection highlight, so "which one is applied" and "which
+/// beside the selection highlight, so "which one is saved" and "which
 /// one is the cursor on" stay separable without color.
-fn paint_themes_dialog(
-    names: &[String],
-    selected: usize,
-    active: Option<usize>,
-    notice: Option<&str>,
+#[allow(clippy::too_many_arguments)]
+fn paint_settings_dialog(
+    section: SettingsSection,
+    themes: &ThemePicker,
+    sound: &SoundPicker,
     area: Rect,
     buf: &mut Buffer,
     paint: &Paint,
@@ -791,12 +789,14 @@ fn paint_themes_dialog(
     hover: Option<(u16, u16)>,
     offset: (i16, i16),
 ) {
-    let notice = themes_notice(names, notice);
-    let width = area.width.saturating_sub(4).min(48);
-    let notice_lines = notice
-        .map(|text| wrapped_line_count(text, width.saturating_sub(DIALOG_CHROME_WIDTH)))
-        .unwrap_or(0);
-    let Some((dialog_area, list_h)) = themes_dialog_geometry(names.len(), notice_lines, area)
+    let lines = settings_lines(section, themes, sound);
+    let selected = match section {
+        SettingsSection::Theme => themes.selected,
+        SettingsSection::Sound => sound.selected,
+    };
+    let footer = settings_footer(section, themes);
+    let (frame_rows, footer_lines) = settings_frame(themes, sound, area);
+    let Some((dialog_area, list_h)) = settings_dialog_geometry(frame_rows, footer_lines, area)
     else {
         return;
     };
@@ -808,98 +808,237 @@ fn paint_themes_dialog(
 
     let left = inner.x + DIALOG_INSET;
     let usable_w = inner.width.saturating_sub(2 * DIALOG_INSET);
-    if !names.is_empty() {
-        super::overlay_text(
-            buf,
-            inner,
-            left,
-            inner.y,
-            copy::THEMES_HINT,
-            theme::menu_hint(paint),
-        );
-    }
 
     // The selected row stays visible: the window slides down only once
-    // the arrows walk past its last visible row.
+    // the arrows walk past its last visible line. Lines, not rows: a gap
+    // between the sound section's groups takes a line no row is on.
     let list_y = inner.y + 2;
     let list_h = usize::from(list_h);
-    let start = if list_h == 0 || selected < list_h {
+    let cursor_line = lines
+        .iter()
+        .position(|line| matches!(line, SettingsLine::Row { index, .. } if *index == selected))
+        .unwrap_or(0);
+    let start = if list_h == 0 || cursor_line < list_h {
         0
     } else {
-        selected + 1 - list_h
+        cursor_line + 1 - list_h
     };
-    for (line, index) in (start..names.len().min(start + list_h)).enumerate() {
-        let y = list_y + line as u16;
+    for (offset, line) in lines[start..lines.len().min(start + list_h)]
+        .iter()
+        .enumerate()
+    {
+        let y = list_y + offset as u16;
+        let SettingsLine::Row {
+            index,
+            label,
+            checked,
+        } = *line
+        else {
+            if let SettingsLine::Text(text) = *line {
+                super::overlay_text(buf, inner, left, y, text, theme::menu_hint(paint));
+            }
+            continue;
+        };
         let style = if index == selected {
             theme::menu_row_hover(paint)
         } else {
             theme::menu_row(paint)
         };
-        buf.set_style(Rect::new(left, y, usable_w, 1), style);
-        let mark = if Some(index) == active {
-            copy::MENU_CHECK
-        } else {
-            " "
-        };
-        super::overlay_text(
-            buf,
-            inner,
-            left,
-            y,
-            &format!("{mark} {}", names[index]),
-            style,
-        );
+        let rect = Rect::new(left, y, usable_w, 1);
+        buf.set_style(rect, style);
+        let mark = if checked { copy::MENU_CHECK } else { " " };
+        super::overlay_text(buf, inner, left, y, &format!("{mark} {label}"), style);
+        hits.push(rect, HitTarget::SettingsRow { index });
     }
 
-    if let Some(text) = notice {
-        let notice_y = list_y + list_h as u16 + 1;
-        let bottom = inner.y + inner.height;
-        if notice_y < bottom {
-            let notice_area = Rect::new(
-                left,
-                notice_y,
-                usable_w,
-                (notice_lines as u16).min(bottom - notice_y),
-            );
-            Paragraph::new(text)
-                .style(theme::menu_hint(paint))
-                .wrap(Wrap { trim: true })
-                .render(notice_area, buf);
-        }
+    let footer_y = list_y + list_h as u16 + 1;
+    let bottom = inner.y + inner.height;
+    if footer_y < bottom {
+        let footer_area = Rect::new(
+            left,
+            footer_y,
+            usable_w,
+            (footer_lines as u16).min(bottom - footer_y),
+        );
+        Paragraph::new(footer)
+            .style(theme::menu_hint(paint))
+            .wrap(Wrap { trim: true })
+            .render(footer_area, buf);
     }
 
     paint_dialog_buttons(buf, inner, paint, hits, hover, copy::BUTTON_APPLY);
-    paint_title_bar(buf, dialog_area, Some(copy::THEMES_TITLE), paint, hits);
+    paint_title_bar(buf, dialog_area, Some(copy::SETTINGS_TITLE), paint, hits);
+    // After the title bar on purpose: the chips share its second row, and
+    // `HitMap::hit` answers with the last region pushed over a cell, so a
+    // chip wins its own cells and the rest of the row still drags.
+    paint_section_chips(buf, inner, left, usable_w, section, paint, hits, hover);
 }
 
-/// What the theme picker's notice slot holds. An empty listing has no rows
-/// to explain the hint against, and the notice slot wraps, so the
-/// where-themes-come-from line goes there instead.
-fn themes_notice<'a>(names: &[String], notice: Option<&'a str>) -> Option<&'a str> {
-    if names.is_empty() {
-        Some(copy::THEMES_EMPTY)
-    } else {
-        notice
+/// The section chips, Tab's targets made visible: every section named,
+/// the showing one filled the way the primary button is, the others
+/// muted until the pointer is over them.
+#[allow(clippy::too_many_arguments)]
+fn paint_section_chips(
+    buf: &mut Buffer,
+    inner: Rect,
+    left: u16,
+    usable_w: u16,
+    showing: SettingsSection,
+    paint: &Paint,
+    hits: &mut HitMap,
+    hover: Option<(u16, u16)>,
+) {
+    let right = left.saturating_add(usable_w);
+    let mut x = left;
+    for section in SettingsSection::ALL {
+        let text = format!(" {} ", section.label());
+        let w = text_width(&text);
+        if w > right.saturating_sub(x) {
+            break;
+        }
+        let rect = Rect::new(x, inner.y, w, 1);
+        let hovered =
+            hover.is_some_and(|(hc, hr)| hr == rect.y && hc >= rect.x && hc < rect.x + rect.width);
+        let style = if section == showing {
+            theme::dialog_primary(paint)
+        } else if hovered {
+            theme::menu_row_hover(paint)
+        } else {
+            theme::menu_hint(paint)
+        };
+        super::overlay_text(buf, inner, x, inner.y, &text, style);
+        hits.push(rect, HitTarget::SettingsSection { section });
+        x = x.saturating_add(w + DIALOG_BUTTON_GAP);
     }
 }
 
-/// Same shape as [`keybind_dialog_geometry`]: fixed rows (title, hint,
-/// one blank before the list, one after, the footer) around a list that
-/// shrinks before the chrome does.
-fn themes_dialog_geometry(
+fn settings_width(area: Rect) -> u16 {
+    area.width.saturating_sub(4).min(SETTINGS_MAX_WIDTH)
+}
+
+/// One line of a settings list: a row the cursor can be on, or the
+/// blank line that keeps the sound section's two groups apart.
+#[derive(Debug, Clone, Copy)]
+enum SettingsLine<'a> {
+    Row {
+        /// The picker's row index: what the cursor and a click name.
+        index: usize,
+        label: &'a str,
+        /// Whether the check is on this row: the choice Enter would
+        /// save, which follows the cursor within its group.
+        checked: bool,
+    },
+    /// A muted line the cursor skips: an explanation, or a heading.
+    Text(&'a str),
+    Gap,
+}
+
+/// The lines the showing section lists.
+fn settings_lines<'a>(
+    section: SettingsSection,
+    themes: &'a ThemePicker,
+    sound: &'a SoundPicker,
+) -> Vec<SettingsLine<'a>> {
+    match section {
+        SettingsSection::Theme => theme_lines(themes),
+        SettingsSection::Sound => sound_lines(sound),
+    }
+}
+
+/// One list, one check, and it is on the cursor: the theme under it is
+/// the one Enter would apply, and is already live as a preview.
+fn theme_lines(themes: &ThemePicker) -> Vec<SettingsLine<'_>> {
+    themes
+        .names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| SettingsLine::Row {
+            index,
+            label: name.as_str(),
+            checked: index == themes.selected,
+        })
+        .collect()
+}
+
+/// What the switch is for, the switch's rows, then the sounds under
+/// their own heading: two groups that each check their own row, kept
+/// apart so two checks read as two answers and not a contradiction.
+fn sound_lines(sound: &SoundPicker) -> Vec<SettingsLine<'_>> {
+    let mut lines = Vec::with_capacity(sound.len() + 5);
+    lines.push(SettingsLine::Text(copy::SOUND_INTRO));
+    lines.push(SettingsLine::Gap);
+    for index in 0..sound.len() {
+        let Some(row) = sound.row(index) else {
+            break;
+        };
+        if index == SoundPicker::SWITCH_ROWS {
+            lines.push(SettingsLine::Gap);
+            lines.push(SettingsLine::Text(copy::SOUND_LIST_HEADING));
+        }
+        let label = match row {
+            SoundRow::Switch(true) => copy::SOUND_NOTIFS_ON,
+            SoundRow::Switch(false) => copy::SOUND_NOTIFS_OFF,
+            SoundRow::Sound(name) if name == crate::sound::SYSTEM => copy::SOUND_SYSTEM,
+            SoundRow::Sound(name) => name,
+        };
+        lines.push(SettingsLine::Row {
+            index,
+            label,
+            checked: sound.is_checked(index),
+        });
+    }
+    lines
+}
+
+/// The muted line under the list. The theme section's says how to drive
+/// the card, or what an apply that could not go live had to say, or
+/// where themes come from when there are none to list. The sound section
+/// says its piece at the top ([`sound_lines`]) and has none.
+fn settings_footer(section: SettingsSection, themes: &ThemePicker) -> &str {
+    match section {
+        SettingsSection::Theme if themes.names.is_empty() => copy::THEMES_EMPTY,
+        SettingsSection::Theme => themes.notice.as_deref().unwrap_or(copy::THEMES_HINT),
+        SettingsSection::Sound => "",
+    }
+}
+
+/// The list rows and footer lines the card is sized for: the most any
+/// section needs, so one card fits every section and Tab never resizes
+/// it. Every footer the theme section can show is counted, so an apply
+/// notice arriving does not move the box either.
+fn settings_frame(themes: &ThemePicker, sound: &SoundPicker, area: Rect) -> (usize, usize) {
+    let text_width = settings_width(area).saturating_sub(DIALOG_CHROME_WIDTH);
+    let rows = theme_lines(themes).len().max(sound_lines(sound).len());
+    let footers = [
+        copy::THEMES_HINT,
+        copy::THEMES_EMPTY,
+        themes.notice.as_deref().unwrap_or(""),
+    ];
+    let footer_lines = footers
+        .iter()
+        .map(|footer| wrapped_line_count(footer, text_width))
+        .max()
+        .unwrap_or(0);
+    (rows, footer_lines)
+}
+
+/// Same shape as [`keybind_dialog_geometry`]: fixed rows (chips, one
+/// blank before the list, one after, the footer, the action row) around
+/// a list that shrinks before the chrome does.
+fn settings_dialog_geometry(
     row_count: usize,
-    notice_lines: usize,
+    footer_lines: usize,
     area: Rect,
 ) -> Option<(Rect, u16)> {
     if area.width < 8 || area.height < 6 {
         return None;
     }
-    let width = area.width.saturating_sub(4).min(48);
-    // Hint, one blank line before the list, one after it, and the action
-    // row: 4 fixed rows around the list, plus the notice. The title is in
+    let width = settings_width(area);
+    // Chips, one blank line before the list, one after it, and the action
+    // row: 4 fixed rows around the list, plus the footer. The title is in
     // the border (`paint_title_bar`).
     let wanted_height =
-        u16::try_from(row_count.saturating_add(notice_lines).saturating_add(6)).unwrap_or(u16::MAX);
+        u16::try_from(row_count.saturating_add(footer_lines).saturating_add(6)).unwrap_or(u16::MAX);
     let height = wanted_height.min(area.height.saturating_sub(2)).max(6);
     let dialog = Rect::new(
         area.x + (area.width - width) / 2,
@@ -910,7 +1049,7 @@ fn themes_dialog_geometry(
     let list_height = height
         .saturating_sub(2)
         .saturating_sub(4)
-        .saturating_sub(u16::try_from(notice_lines).unwrap_or(u16::MAX));
+        .saturating_sub(u16::try_from(footer_lines).unwrap_or(u16::MAX));
     Some((dialog, list_height))
 }
 
@@ -990,10 +1129,10 @@ pub fn menu_items(menu: &MenuState, checks: MenuChecks) -> Vec<MenuRow> {
                 BindingAction::ToggleMotion,
                 Some(checks.motion),
             ),
-            // Themes opens a picker rather than flipping anything, so it
-            // carries no check of its own; the picker marks the theme
-            // that is on with the same glyph.
-            (copy::MENU_THEMES, BindingAction::ShowThemes, None),
+            // Settings opens a card rather than flipping anything, so it
+            // carries no check of its own; the card marks the theme and
+            // the sound row that are on with the same glyph.
+            (copy::MENU_SETTINGS, BindingAction::ShowSettings, None),
             (copy::MENU_KEYBINDS, BindingAction::ShowKeybinds, None),
             (copy::MENU_DETACH, BindingAction::Detach, None),
         ],
@@ -1234,9 +1373,9 @@ mod tests {
         assert_eq!(checked(&rows, copy::MENU_TAB_BAR), Some(true));
         assert_eq!(checked(&rows, copy::MENU_MOTION), Some(true));
         assert_eq!(checked(&rows, copy::MENU_TOGGLE_EVENTS), Some(false));
-        // Not a toggle: opening a picker is not a setting, and reserving a
-        // check for it would imply it could be on.
-        assert_eq!(checked(&rows, copy::MENU_THEMES), None);
+        // Not a toggle: opening the settings card is not a setting, and
+        // reserving a check for it would imply it could be on.
+        assert_eq!(checked(&rows, copy::MENU_SETTINGS), None);
         assert_eq!(checked(&rows, copy::MENU_DETACH), None);
 
         let off = MenuChecks::default();
@@ -1375,11 +1514,34 @@ mod tests {
                 // Motion ships with no chord either, so the menu is its
                 // only switch, for the same reason the tab strip's is.
                 BindingAction::ToggleMotion,
-                BindingAction::ShowThemes,
+                BindingAction::ShowSettings,
                 BindingAction::ShowKeybinds,
                 BindingAction::Detach,
             ]
         );
+    }
+
+    /// The settings card open on its theme section.
+    fn theme_card(
+        names: Vec<String>,
+        selected: usize,
+        active: Option<usize>,
+        notice: Option<String>,
+    ) -> Dialog {
+        Dialog::Settings {
+            section: SettingsSection::Theme,
+            themes: ThemePicker {
+                names,
+                selected,
+                active,
+                notice,
+            },
+            sound: SoundPicker::new(
+                false,
+                vec!["bow-ripple".into(), crate::sound::SYSTEM.into()],
+                "bow-ripple",
+            ),
+        }
     }
 
     /// Paint one dialog into a fixed terminal at a given drag offset.
@@ -1496,12 +1658,7 @@ mod tests {
         for dialog in [
             composer("@reviewer ship it"),
             Dialog::confirm_close("%0"),
-            Dialog::Themes {
-                names: vec!["dark".into(), "light".into()],
-                selected: 0,
-                active: Some(0),
-                notice: None,
-            },
+            theme_card(vec!["dark".into(), "light".into()], 0, Some(0), None),
             Dialog::Keybinds {
                 scroll: 0,
                 rows: Vec::new(),
@@ -1576,18 +1733,13 @@ mod tests {
                 scroll: 0,
                 rows: Vec::new(),
             },
-            Dialog::Themes {
-                names: Vec::new(),
-                selected: 0,
-                active: None,
-                notice: None,
-            },
-            Dialog::Themes {
-                names: vec!["dark".into()],
-                selected: 0,
-                active: Some(0),
-                notice: Some("the daemon is not running".into()),
-            },
+            theme_card(Vec::new(), 0, None, None),
+            theme_card(
+                vec!["dark".into()],
+                0,
+                Some(0),
+                Some("the daemon is not running".into()),
+            ),
         ] {
             let rect = dialog_rect(&dialog, area).expect("a full terminal hosts it");
             let (_, hits) = draw_dialog(&dialog, (0, 0));
@@ -1611,12 +1763,7 @@ mod tests {
     #[test]
     fn the_title_bar_names_the_card_left_and_wears_the_grip_right() {
         let theme = Paint::for_test();
-        let dialog = Dialog::Themes {
-            names: vec!["dark".into()],
-            selected: 0,
-            active: Some(0),
-            notice: None,
-        };
+        let dialog = theme_card(vec!["dark".into()], 0, Some(0), None);
         let draw = |hover: Option<(u16, u16)>| -> (Buffer, HitMap) {
             let mut term = Terminal::new(TestBackend::new(72, 24)).unwrap();
             let mut hits = HitMap::default();
@@ -1644,7 +1791,7 @@ mod tests {
             .map(|region| region.rect.width)
             .expect("the header drags");
         let top: String = (cx..cx + width).map(|x| rest[(x, cy)].symbol()).collect();
-        assert!(top.starts_with("╭─ Themes ─"), "the name leads: {top}");
+        assert!(top.starts_with("╭─ Settings ─"), "the name leads: {top}");
         assert!(
             top.ends_with(&format!("{PANE_GRIP}─╮")),
             "the grip trails: {top}"
@@ -1689,17 +1836,17 @@ mod tests {
     }
 
     #[test]
-    fn themes_dialog_marks_active_raises_selected_and_offers_apply() {
+    fn settings_card_checks_and_raises_the_selected_row_and_offers_apply() {
         let backend = TestBackend::new(60, 16);
         let mut term = Terminal::new(backend).unwrap();
         let theme = Paint::for_test();
         let mut hits = HitMap::default();
-        let dialog = Dialog::Themes {
-            names: vec!["dark".into(), "light".into(), "solar".into()],
-            selected: 1,
-            active: Some(0),
-            notice: None,
-        };
+        let dialog = theme_card(
+            vec!["dark".into(), "light".into(), "solar".into()],
+            1,
+            Some(0),
+            None,
+        );
         term.draw(|f| {
             paint_dialog(
                 &dialog,
@@ -1715,9 +1862,12 @@ mod tests {
 
         let buf = term.backend().buffer();
         let flat = flatten(buf);
-        assert!(flat.contains("Themes"), "title renders: {flat}");
-        assert!(flat.contains("✓ dark"), "active row is checked: {flat}");
-        assert!(flat.contains("light") && flat.contains("solar"), "{flat}");
+        assert!(flat.contains("Settings"), "title renders: {flat}");
+        assert!(
+            flat.contains("✓ light") && !flat.contains("✓ dark"),
+            "the check is on the cursor, not the saved theme: {flat}"
+        );
+        assert!(flat.contains("dark") && flat.contains("solar"), "{flat}");
         assert!(flat.contains("↵ Apply"), "confirm affordance: {flat}");
         assert!(flat.contains("Esc Cancel"), "cancel affordance: {flat}");
         assert!(hits
@@ -1753,12 +1903,12 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         let theme = Paint::for_test();
         let mut hits = HitMap::default();
-        let dialog = Dialog::Themes {
-            names: vec!["dark".into()],
-            selected: 0,
-            active: Some(0),
-            notice: Some(copy::THEME_SAVED_NO_DAEMON.into()),
-        };
+        let dialog = theme_card(
+            vec!["dark".into()],
+            0,
+            Some(0),
+            Some(copy::THEME_SAVED_NO_DAEMON.into()),
+        );
         term.draw(|f| {
             paint_dialog(
                 &dialog,
@@ -1778,18 +1928,226 @@ mod tests {
         );
     }
 
+    /// Tab's targets made visible: both sections named on the row under
+    /// the border, the showing one lit, each a click target that wins its
+    /// cells from the grab strip while the rest of that row still drags.
+    #[test]
+    fn settings_card_offers_its_sections_as_chips_over_the_grab_strip() {
+        let (buf, hits) = draw_dialog(&theme_card(vec!["dark".into()], 0, Some(0), None), (0, 0));
+        let flat = flatten(&buf);
+        assert!(
+            flat.contains(copy::SETTINGS_SECTION_THEME)
+                && flat.contains(copy::SETTINGS_SECTION_SOUND),
+            "both sections are named: {flat}"
+        );
+        let chip = |section: SettingsSection| {
+            hits.regions()
+                .iter()
+                .find(|region| region.target == HitTarget::SettingsSection { section })
+                .map(|region| region.rect)
+                .unwrap_or_else(|| panic!("{section:?} has no chip"))
+        };
+        let theme_chip = chip(SettingsSection::Theme);
+        let sound_chip = chip(SettingsSection::Sound);
+        assert_eq!(theme_chip.y, sound_chip.y, "one row of chips");
+        assert!(
+            sound_chip.x > theme_chip.x + theme_chip.width,
+            "in Tab order"
+        );
+        assert_eq!(
+            hits.hit(sound_chip.x, sound_chip.y),
+            Some(&HitTarget::SettingsSection {
+                section: SettingsSection::Sound
+            }),
+            "a chip wins its own cells"
+        );
+        assert!(
+            matches!(
+                hits.hit(sound_chip.x + sound_chip.width + 4, sound_chip.y),
+                Some(HitTarget::DialogTitleBar)
+            ),
+            "past the chips the row still drags"
+        );
+        assert_ne!(
+            buf[(theme_chip.x + 1, theme_chip.y)].bg,
+            buf[(sound_chip.x + 1, sound_chip.y)].bg,
+            "the showing section's chip is lit"
+        );
+    }
+
+    /// Every listed row is a click target naming its index, the mouse's
+    /// half of the arrows, in both sections.
+    #[test]
+    fn settings_rows_are_click_targets() {
+        let (_, hits) = draw_dialog(
+            &theme_card(vec!["dark".into(), "light".into()], 0, Some(0), None),
+            (0, 0),
+        );
+        let row = |index: usize| {
+            hits.regions()
+                .iter()
+                .find(|region| region.target == HitTarget::SettingsRow { index })
+                .map(|region| region.rect)
+                .unwrap_or_else(|| panic!("row {index} is not a target"))
+        };
+        let (dark, light) = (row(0), row(1));
+        assert_eq!(light.y, dark.y + 1, "one row each, in list order");
+        assert_eq!(
+            hits.hit(light.x + light.width - 1, light.y),
+            Some(&HitTarget::SettingsRow { index: 1 }),
+            "the whole row answers, not just its text"
+        );
+        assert!(
+            !hits
+                .regions()
+                .iter()
+                .any(|region| region.target == HitTarget::SettingsRow { index: 2 }),
+            "no target for a row the list does not have"
+        );
+
+        let mut sound = theme_card(vec!["dark".into()], 0, Some(0), None);
+        if let Dialog::Settings { section, .. } = &mut sound {
+            *section = SettingsSection::Sound;
+        }
+        let (buf, hits) = draw_dialog(&sound, (0, 0));
+        let off = row_of(&buf, copy::SOUND_NOTIFS_OFF);
+        assert!(
+            matches!(
+                hits.hit(buf.area.width / 2, off),
+                Some(HitTarget::SettingsRow { index: 1 })
+            ),
+            "the switch's rows are targets too"
+        );
+    }
+
+    /// One card for every section: switching to the shorter list does
+    /// not shrink the box, and an apply notice arriving does not move
+    /// it. The empty space under a short list is the price of a box
+    /// that holds still under Tab.
+    #[test]
+    fn the_settings_card_keeps_one_size_across_sections() {
+        let area = Rect::new(0, 0, 80, 24);
+        let names: Vec<String> = [
+            "dark", "light", "solar", "mono", "paper", "sage", "ink", "dusk", "dawn", "fog",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let theme = theme_card(names.clone(), 0, Some(0), None);
+        let mut sound = theme_card(names, 0, Some(0), None);
+        if let Dialog::Settings { section, .. } = &mut sound {
+            *section = SettingsSection::Sound;
+        }
+        let noticed = theme_card(
+            vec!["dark".into()],
+            0,
+            Some(0),
+            Some(copy::THEME_SAVED_NO_DAEMON.into()),
+        );
+        let plain = theme_card(vec!["dark".into()], 0, Some(0), None);
+
+        let rect = |dialog: &Dialog| dialog_rect(dialog, area).expect("fits");
+        assert_eq!(rect(&theme), rect(&sound), "Tab does not resize the card");
+        assert_eq!(
+            rect(&plain).height,
+            rect(&noticed).height,
+            "the apply notice was sized for before it arrived"
+        );
+        assert!(
+            rect(&theme).height > rect(&plain).height,
+            "the list still sizes the card: ten themes need more than the sound list"
+        );
+        let (buf, _) = draw_dialog(&sound, (0, 0));
+        let flat = flatten(&buf);
+        assert!(flat.contains(copy::SOUND_NOTIFS_ON) && flat.contains(copy::SOUND_LIST_HEADING));
+    }
+
+    /// The sound section: the two rows of the switch, the saved one
+    /// checked and the cursor's raised, the theme list gone, and the
+    /// muted line under them saying what the switch is for.
+    #[test]
+    fn sound_section_lists_the_switch_with_its_explanation() {
+        let dialog = Dialog::Settings {
+            section: SettingsSection::Sound,
+            themes: ThemePicker {
+                names: vec!["dark".into()],
+                selected: 0,
+                active: Some(0),
+                notice: None,
+            },
+            sound: SoundPicker::new(
+                false,
+                vec!["bow-ripple".into(), crate::sound::SYSTEM.into()],
+                crate::sound::SYSTEM,
+            ),
+        };
+        let (buf, hits) = draw_dialog(&dialog, (0, 0));
+        let flat = flatten(&buf);
+        assert!(
+            flat.contains(&format!("{} {}", copy::MENU_CHECK, copy::SOUND_NOTIFS_OFF)),
+            "the checked row wears the mark: {flat}"
+        );
+        assert!(flat.contains(copy::SOUND_NOTIFS_ON), "{flat}");
+        // The explanation opens the section, a blank line above the
+        // switch, and neither it nor the heading is a row: no target, and
+        // the cursor's raised ground never lands on them.
+        let intro = row_of(&buf, copy::SOUND_INTRO);
+        let on_row = row_of(&buf, copy::SOUND_NOTIFS_ON);
+        assert_eq!(on_row, intro + 2, "the explanation is first: {flat}");
+        assert!(hits.hit(buf.area.width / 2, intro).is_none());
+        // The sounds: under their heading, the shipped cue by name, the
+        // bell by its label, the saved one checked, a blank line between
+        // the groups, and each a click target by its picker index.
+        assert!(flat.contains("  bow-ripple"), "the installed sound: {flat}");
+        assert!(
+            flat.contains(&format!("{} {}", copy::MENU_CHECK, copy::SOUND_SYSTEM)),
+            "the checked cue wears the mark: {flat}"
+        );
+        let off_row = row_of(&buf, copy::SOUND_NOTIFS_OFF);
+        let heading = row_of(&buf, copy::SOUND_LIST_HEADING);
+        let ripple = row_of(&buf, "bow-ripple");
+        assert_eq!(heading, off_row + 2, "a blank line, then the heading");
+        assert_eq!(ripple, heading + 1, "the sounds sit under it");
+        assert!(hits.hit(buf.area.width / 2, heading).is_none());
+        let gap: String = (0..buf.area.width)
+            .map(|x| buf[(x, off_row + 1)].symbol())
+            .collect();
+        assert!(
+            gap.trim_matches(|c| c == ' ' || c == '│' || c == '║')
+                .is_empty(),
+            "{gap:?}"
+        );
+        assert_eq!(
+            hits.hit(buf.area.width / 2, ripple),
+            Some(&HitTarget::SettingsRow { index: 2 })
+        );
+        assert_eq!(
+            hits.hit(buf.area.width / 2, ripple + 1),
+            Some(&HitTarget::SettingsRow { index: 3 })
+        );
+        assert!(
+            !flat.contains("dark"),
+            "the theme list is not showing: {flat}"
+        );
+        let on = row_of(&buf, copy::SOUND_NOTIFS_ON);
+        let off = row_of(&buf, copy::SOUND_NOTIFS_OFF);
+        let x = (0..buf.area.width)
+            .find(|col| buf[(*col, on)].symbol() == "S")
+            .expect("row text");
+        assert_ne!(
+            buf[(x, on)].bg,
+            buf[(x, off)].bg,
+            "the row the arrows are on is raised"
+        );
+    }
+
     #[test]
     fn empty_themes_dialog_says_where_themes_come_from() {
         let backend = TestBackend::new(60, 16);
         let mut term = Terminal::new(backend).unwrap();
         let theme = Paint::for_test();
         let mut hits = HitMap::default();
-        let dialog = Dialog::Themes {
-            names: Vec::new(),
-            selected: 0,
-            active: None,
-            notice: None,
-        };
+        let dialog = theme_card(Vec::new(), 0, None, None);
         term.draw(|f| {
             paint_dialog(
                 &dialog,
@@ -2099,12 +2457,7 @@ mod tests {
             ),
             (
                 "themes",
-                Some(Dialog::Themes {
-                    names: vec!["dark".into()],
-                    selected: 0,
-                    active: Some(0),
-                    notice: None,
-                }),
+                Some(theme_card(vec!["dark".into()], 0, Some(0), None)),
                 MenuState::None,
             ),
             ("app menu", None, MenuState::AppMenu),
@@ -2159,12 +2512,7 @@ mod tests {
         let mut hits = HitMap::default();
         term.draw(|f| {
             paint_dialog(
-                &Dialog::Themes {
-                    names: vec!["dark".into(), "light".into()],
-                    selected: 0,
-                    active: Some(0),
-                    notice: None,
-                },
+                &theme_card(vec!["dark".into(), "light".into()], 0, Some(0), None),
                 f.area(),
                 f.buffer_mut(),
                 &theme,
@@ -2179,13 +2527,27 @@ mod tests {
         let content_x = corner_x + 1 + DIALOG_INSET;
         assert_eq!(
             buf[(corner_x + 3, corner_y)].symbol(),
-            "T",
-            "the themes title rides the border"
+            "S",
+            "the settings title rides the border"
+        );
+        let chip = hits
+            .regions()
+            .iter()
+            .find(|region| {
+                region.target
+                    == HitTarget::SettingsSection {
+                        section: SettingsSection::Theme,
+                    }
+            })
+            .expect("the theme chip is clickable");
+        assert_eq!(
+            chip.rect.x, content_x,
+            "the section chips start at the inset, like the action row"
         );
         assert_eq!(
-            buf[(content_x, corner_y + 1)].symbol(),
+            buf[(content_x, row_of(buf, "Pick with"))].symbol(),
             "P",
-            "the themes hint starts at the inset"
+            "the theme hint starts at the inset"
         );
         assert_eq!(
             buf[(content_x, row_of(buf, "✓ dark"))].symbol(),

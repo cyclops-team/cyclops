@@ -11,6 +11,8 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::copy;
+
 /// Active modal dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dialog {
@@ -57,19 +59,186 @@ pub enum Dialog {
         /// The request identity and the only valid transitions around it.
         send: ComposeSendState,
     },
-    /// Pick a theme; Enter applies it exactly like `cyclops theme <name>`.
-    Themes {
-        /// Loadable theme names, the same rows `cyclops theme` lists.
-        names: Vec<String>,
-        /// The row the arrow keys are on.
-        selected: usize,
-        /// The row of the active theme, when it is one of the rows at all
-        /// (a path or CYCLOPS_THEME selection is not).
-        active: Option<usize>,
-        /// What an apply that could not go live has to say (daemon down,
-        /// or painting something else). Same slot NamePane's error uses.
-        notice: Option<String>,
+    /// The settings card: one section showing at a time, Tab walks them.
+    /// Every section keeps its own list state while another is showing,
+    /// so a Tab away and back lands where the arrows were.
+    Settings {
+        section: SettingsSection,
+        themes: ThemePicker,
+        sound: SoundPicker,
     },
+}
+
+/// The settings card's sections, in the order Tab walks them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsSection {
+    Theme,
+    Sound,
+}
+
+impl SettingsSection {
+    pub const ALL: [SettingsSection; 2] = [SettingsSection::Theme, SettingsSection::Sound];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsSection::Theme => copy::SETTINGS_SECTION_THEME,
+            SettingsSection::Sound => copy::SETTINGS_SECTION_SOUND,
+        }
+    }
+
+    /// The section `delta` steps along, wrapping at both ends: Tab from
+    /// the last section is the first one, so the key never dead-ends.
+    pub fn step(self, delta: i16) -> Self {
+        let len = Self::ALL.len() as i32;
+        let at = Self::ALL.iter().position(|s| *s == self).unwrap_or(0) as i32;
+        Self::ALL[(at + i32::from(delta)).rem_euclid(len) as usize]
+    }
+}
+
+/// Pick a theme; Enter applies it exactly like `cyclops theme <name>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThemePicker {
+    /// Loadable theme names, the same rows `cyclops theme` lists.
+    pub names: Vec<String>,
+    /// The row the arrow keys are on.
+    pub selected: usize,
+    /// The row of the active theme, when it is one of the rows at all
+    /// (a path or CYCLOPS_THEME selection is not).
+    pub active: Option<usize>,
+    /// What an apply that could not go live has to say (daemon down,
+    /// or painting something else). Same slot NamePane's error uses.
+    pub notice: Option<String>,
+}
+
+/// The sound section as one list the arrows walk: the switch's two rows
+/// first, then every sound there is to choose from. One cursor and one
+/// Enter for both, so it reads and moves like the theme picker beside
+/// it; each group keeps its own saved row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoundPicker {
+    /// The row the arrow keys are on.
+    pub selected: usize,
+    /// The switch's checked side: the saved one when the card opens,
+    /// the last switch row landed on since. Enter saves it.
+    pub on: bool,
+    /// The sounds on offer, `crate::sound::choices` order: installed
+    /// stems, then the system alert.
+    pub sounds: Vec<String>,
+    /// Index into `sounds` of the checked cue, the same way: saved on
+    /// open, then following the cursor. `None` when the saved name is
+    /// not on offer (its file went away), so no row wears its check.
+    pub active_sound: Option<usize>,
+    /// Where the cursor was when a sound last played for it, so a redraw
+    /// does not replay and a return to the same row does.
+    pub previewed: Option<usize>,
+}
+
+/// One row of the sound list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoundRow<'a> {
+    /// The switch: `true` is the "on" row.
+    Switch(bool),
+    /// A sound to choose, by the name `[workspace] sound` saves.
+    Sound(&'a str),
+}
+
+impl SoundPicker {
+    /// The switch's rows, ahead of the sounds. On first: it is what the
+    /// switch is for.
+    pub const SWITCH_ROWS: usize = 2;
+
+    /// Opens on the saved switch, the cursor on its row.
+    pub fn new(on: bool, sounds: Vec<String>, chosen: &str) -> Self {
+        let active_sound = sounds.iter().position(|name| name == chosen);
+        SoundPicker {
+            selected: Self::row_for(on),
+            on,
+            sounds,
+            active_sound,
+            previewed: None,
+        }
+    }
+
+    pub fn row_for(on: bool) -> usize {
+        if on {
+            0
+        } else {
+            1
+        }
+    }
+
+    /// How many rows the arrows can land on.
+    pub fn len(&self) -> usize {
+        Self::SWITCH_ROWS + self.sounds.len()
+    }
+
+    pub fn row(&self, index: usize) -> Option<SoundRow<'_>> {
+        match index {
+            0 => Some(SoundRow::Switch(true)),
+            1 => Some(SoundRow::Switch(false)),
+            _ => self
+                .sounds
+                .get(index - Self::SWITCH_ROWS)
+                .map(|name| SoundRow::Sound(name)),
+        }
+    }
+
+    /// What Enter would save: the row the cursor is on.
+    pub fn selected_row(&self) -> Option<SoundRow<'_>> {
+        self.row(self.selected)
+    }
+
+    /// Whether row `index` wears its group's check: the switch's checked
+    /// side, or the checked cue.
+    pub fn is_checked(&self, index: usize) -> bool {
+        match self.row(index) {
+            Some(SoundRow::Switch(on)) => on == self.on,
+            Some(SoundRow::Sound(_)) => Some(index - Self::SWITCH_ROWS) == self.active_sound,
+            None => false,
+        }
+    }
+
+    /// Move the cursor's group's check to the cursor: the switch reads
+    /// as flipped, or the row becomes the cue to be. Nothing is saved
+    /// until Enter reads the checks. Whether a check moved.
+    pub fn check_selected(&mut self) -> bool {
+        let index = self.selected.checked_sub(Self::SWITCH_ROWS);
+        match self.selected_row() {
+            Some(SoundRow::Switch(on)) => {
+                let changed = self.on != on;
+                self.on = on;
+                changed
+            }
+            Some(SoundRow::Sound(_)) => {
+                let changed = self.active_sound != index;
+                self.active_sound = index;
+                changed
+            }
+            None => false,
+        }
+    }
+
+    /// The checked cue's name, when one is on offer.
+    pub fn checked_sound(&self) -> Option<&str> {
+        self.active_sound
+            .and_then(|index| self.sounds.get(index))
+            .map(String::as_str)
+    }
+
+    /// The sound to play because the cursor just arrived on it: a sound
+    /// row the cursor was not on at the last call. Leaving for another
+    /// row and coming back plays again; a redraw with the cursor still
+    /// does not.
+    pub fn arrived_on(&mut self) -> Option<&str> {
+        if self.previewed == Some(self.selected) {
+            return None;
+        }
+        self.previewed = Some(self.selected);
+        match self.selected_row() {
+            Some(SoundRow::Sound(name)) => Some(name),
+            _ => None,
+        }
+    }
 }
 
 impl Dialog {
@@ -135,6 +304,8 @@ pub enum DialogKeyAction {
     Scroll(i16),
     ScrollStart,
     ScrollEnd,
+    /// Tab (forward) or Shift+Tab (back) across the settings sections.
+    SwitchSection(i16),
     Ignore,
 }
 
@@ -155,14 +326,18 @@ pub fn dialog_key_action(dialog: &Dialog, key: &KeyEvent) -> DialogKeyAction {
             _ => DialogKeyAction::Ignore,
         };
     }
-    // The picker scrolls a selection, not a viewport, and unlike the
-    // keybinds sheet its Enter has something to confirm.
-    if matches!(dialog, Dialog::Themes { .. }) {
+    // The settings card scrolls a selection, not a viewport, and unlike
+    // the keybinds sheet its Enter has something to confirm. Tab is the
+    // one key it has that no other dialog does: none of them takes a
+    // literal tab, so nothing is lost by claiming it here.
+    if matches!(dialog, Dialog::Settings { .. }) {
         return match key.code {
             KeyCode::Esc => DialogKeyAction::Cancel,
             KeyCode::Enter => DialogKeyAction::Confirm,
             KeyCode::Up => DialogKeyAction::Scroll(-1),
             KeyCode::Down => DialogKeyAction::Scroll(1),
+            KeyCode::Tab => DialogKeyAction::SwitchSection(1),
+            KeyCode::BackTab => DialogKeyAction::SwitchSection(-1),
             _ => DialogKeyAction::Ignore,
         };
     }
@@ -387,9 +562,9 @@ pub fn move_keybind_scroll(current: u16, delta: i16, max: u16) -> u16 {
     }
 }
 
-/// Resolve a [`DialogKeyAction::Scroll`] delta against the theme picker's
-/// rows: clamped to the ends, same rule as [`move_keybind_scroll`].
-pub fn move_theme_selection(current: usize, delta: i16, len: usize) -> usize {
+/// Resolve a [`DialogKeyAction::Scroll`] delta against a list's rows:
+/// clamped to the ends, same rule as [`move_keybind_scroll`].
+pub fn move_selection(current: usize, delta: i16, len: usize) -> usize {
     let Some(last) = len.checked_sub(1) else {
         return 0;
     };
@@ -399,6 +574,60 @@ pub fn move_theme_selection(current: usize, delta: i16, len: usize) -> usize {
             .min(last)
     } else {
         current.saturating_add(delta as usize).min(last)
+    }
+}
+
+/// Move the settings card's selection `delta` rows, in whichever section
+/// is showing. The one place that knows which list the arrows are on, so
+/// the key path and the wheel path cannot disagree about it.
+pub fn move_settings_selection(dialog: &mut Dialog, delta: i16) {
+    let Dialog::Settings {
+        section,
+        themes,
+        sound,
+    } = dialog
+    else {
+        return;
+    };
+    match section {
+        SettingsSection::Theme => {
+            themes.selected = move_selection(themes.selected, delta, themes.names.len());
+        }
+        SettingsSection::Sound => {
+            sound.selected = move_selection(sound.selected, delta, sound.len());
+        }
+    }
+}
+
+/// Put the showing section's cursor on row `index` (a click). A row the
+/// list does not have leaves the cursor where it was.
+pub fn select_settings_row(dialog: &mut Dialog, index: usize) {
+    let Dialog::Settings {
+        section,
+        themes,
+        sound,
+    } = dialog
+    else {
+        return;
+    };
+    match section {
+        SettingsSection::Theme if index < themes.names.len() => themes.selected = index,
+        SettingsSection::Sound if index < sound.len() => sound.selected = index,
+        _ => {}
+    }
+}
+
+/// Show the section `delta` steps along (Tab, Shift+Tab, a chip click).
+pub fn switch_settings_section(dialog: &mut Dialog, delta: i16) {
+    if let Dialog::Settings { section, .. } = dialog {
+        *section = section.step(delta);
+    }
+}
+
+/// Show one section outright (a chip click names it).
+pub fn show_settings_section(dialog: &mut Dialog, wanted: SettingsSection) {
+    if let Dialog::Settings { section, .. } = dialog {
+        *section = wanted;
     }
 }
 
@@ -499,14 +728,26 @@ mod tests {
         );
     }
 
+    fn settings(section: SettingsSection) -> Dialog {
+        Dialog::Settings {
+            section,
+            themes: ThemePicker {
+                names: vec!["dark".into(), "light".into()],
+                selected: 0,
+                active: Some(0),
+                notice: None,
+            },
+            sound: SoundPicker::new(
+                false,
+                vec!["bow-ripple".into(), "system".into()],
+                "bow-ripple",
+            ),
+        }
+    }
+
     #[test]
-    fn theme_picker_keys_move_confirm_and_cancel() {
-        let dialog = Dialog::Themes {
-            names: vec!["dark".into(), "light".into()],
-            selected: 0,
-            active: Some(0),
-            notice: None,
-        };
+    fn settings_keys_move_switch_confirm_and_cancel() {
+        let dialog = settings(SettingsSection::Theme);
         let key = |code| KeyEvent::new(code, KeyModifiers::empty());
         assert_eq!(
             dialog_key_action(&dialog, &key(KeyCode::Down)),
@@ -524,6 +765,17 @@ mod tests {
             dialog_key_action(&dialog, &key(KeyCode::Esc)),
             DialogKeyAction::Cancel
         );
+        assert_eq!(
+            dialog_key_action(&dialog, &key(KeyCode::Tab)),
+            DialogKeyAction::SwitchSection(1)
+        );
+        assert_eq!(
+            dialog_key_action(
+                &dialog,
+                &KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)
+            ),
+            DialogKeyAction::SwitchSection(-1)
+        );
         // No text input: a typed character must not become an append.
         assert_eq!(
             dialog_key_action(&dialog, &key(KeyCode::Char('d'))),
@@ -532,11 +784,143 @@ mod tests {
     }
 
     #[test]
-    fn theme_selection_clamps_at_both_ends() {
-        assert_eq!(move_theme_selection(0, -1, 3), 0);
-        assert_eq!(move_theme_selection(0, 1, 3), 1);
-        assert_eq!(move_theme_selection(2, 1, 3), 2);
-        assert_eq!(move_theme_selection(0, 1, 0), 0);
+    fn list_selection_clamps_at_both_ends() {
+        assert_eq!(move_selection(0, -1, 3), 0);
+        assert_eq!(move_selection(0, 1, 3), 1);
+        assert_eq!(move_selection(2, 1, 3), 2);
+        assert_eq!(move_selection(0, 1, 0), 0);
+    }
+
+    /// A click lands the cursor on the row it names, in the showing
+    /// section only, and a row past the end is not a jump to nowhere.
+    #[test]
+    fn a_row_click_moves_the_showing_sections_cursor() {
+        let mut dialog = settings(SettingsSection::Theme);
+        select_settings_row(&mut dialog, 1);
+        select_settings_row(&mut dialog, 7);
+        switch_settings_section(&mut dialog, 1);
+        select_settings_row(&mut dialog, 1);
+        let Dialog::Settings { themes, sound, .. } = &dialog else {
+            unreachable!()
+        };
+        assert_eq!(
+            themes.selected, 1,
+            "the theme click landed; the far one did not"
+        );
+        assert_eq!(
+            sound.selected, 1,
+            "the sound click landed in its own section"
+        );
+        assert_eq!(sound.selected_row(), Some(SoundRow::Switch(false)));
+    }
+
+    /// One list, two groups: the arrows walk from the switch onto the
+    /// sounds, each group checks its own saved row, and a sound plays
+    /// once per arrival of the cursor.
+    #[test]
+    fn the_sound_list_follows_the_switch_and_plays_on_arrival() {
+        let mut picker =
+            SoundPicker::new(true, vec!["bow-ripple".into(), "system".into()], "system");
+        assert_eq!(picker.len(), 4);
+        assert_eq!(picker.selected_row(), Some(SoundRow::Switch(true)));
+        assert!(
+            picker.is_checked(0) && !picker.is_checked(1),
+            "the switch's saved side"
+        );
+        assert!(
+            !picker.is_checked(2) && picker.is_checked(3),
+            "the saved cue"
+        );
+        assert_eq!(picker.row(3), Some(SoundRow::Sound("system")));
+        assert_eq!(picker.row(4), None);
+
+        assert_eq!(picker.arrived_on(), None, "opening plays nothing");
+        picker.selected = 2;
+        assert_eq!(picker.arrived_on(), Some("bow-ripple"));
+        assert_eq!(picker.arrived_on(), None, "a redraw does not replay");
+        picker.selected = 1;
+        assert_eq!(picker.arrived_on(), None, "the switch is silent");
+        picker.selected = 2;
+        assert_eq!(picker.arrived_on(), Some("bow-ripple"), "coming back plays");
+
+        let gone = SoundPicker::new(false, vec!["system".into()], "bow-ripple");
+        assert_eq!(gone.active_sound, None, "a saved cue that is not on offer");
+        assert!(!gone.is_checked(2));
+        assert_eq!(gone.checked_sound(), None);
+    }
+
+    /// Landing on a row is checking it: the check moves to the row in
+    /// its own group, the other group's check stays, and landing where
+    /// the check already is moves nothing.
+    #[test]
+    fn landing_on_a_row_moves_its_groups_check() {
+        let mut picker = SoundPicker::new(
+            true,
+            vec!["bow-ripple".into(), "system".into()],
+            "bow-ripple",
+        );
+        assert!(!picker.check_selected(), "opening on the checked row");
+
+        picker.selected = 1;
+        assert!(picker.check_selected());
+        assert!(!picker.on && picker.is_checked(1) && !picker.is_checked(0));
+        assert!(picker.is_checked(2), "the cue's check stayed put");
+
+        picker.selected = 3;
+        assert!(picker.check_selected());
+        assert_eq!(picker.checked_sound(), Some("system"));
+        assert!(picker.is_checked(3) && !picker.is_checked(2));
+        assert!(picker.is_checked(1), "the switch's check stayed put");
+        assert!(!picker.check_selected(), "landing again moves nothing");
+    }
+
+    /// Tab wraps, and each section keeps its own cursor across a switch.
+    #[test]
+    fn sections_wrap_and_keep_their_own_selection() {
+        let mut dialog = settings(SettingsSection::Theme);
+        move_settings_selection(&mut dialog, 1);
+        switch_settings_section(&mut dialog, 1);
+        move_settings_selection(&mut dialog, -1);
+        switch_settings_section(&mut dialog, 1);
+        let Dialog::Settings {
+            section,
+            themes,
+            sound,
+        } = &dialog
+        else {
+            unreachable!()
+        };
+        assert_eq!(*section, SettingsSection::Theme, "Tab past the last wraps");
+        assert_eq!(themes.selected, 1, "the theme cursor survived the trip");
+        assert_eq!(sound.selected, 0, "the sound cursor moved on its own");
+        assert_eq!(sound.selected_row(), Some(SoundRow::Switch(true)));
+
+        let mut back = settings(SettingsSection::Theme);
+        switch_settings_section(&mut back, -1);
+        assert!(matches!(
+            back,
+            Dialog::Settings {
+                section: SettingsSection::Sound,
+                ..
+            }
+        ));
+        show_settings_section(&mut back, SettingsSection::Theme);
+        assert!(matches!(
+            back,
+            Dialog::Settings {
+                section: SettingsSection::Theme,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_sound_picker_opens_on_the_saved_row() {
+        let on = SoundPicker::new(true, vec!["system".into()], "system");
+        let off = SoundPicker::new(false, vec!["system".into()], "system");
+        assert_eq!(on.selected, 0);
+        assert_eq!(off.selected, 1);
+        assert_eq!(off.selected_row(), Some(SoundRow::Switch(false)));
     }
 
     fn composer(buffer: &str) -> Dialog {

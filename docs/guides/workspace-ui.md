@@ -258,6 +258,52 @@ clickable, so the mouse always has a way back to the panel and to the
 remaining columns to the pane canvas and re-declares the tmux client
 size, so all panes reflow.
 
+## Settings
+
+The app menu's `Settings` item opens the settings card: one section
+showing at a time, `Tab` (and `Shift+Tab`) walking between them, or a
+click on a section's chip in the card's top row. `↑`/`↓` move down the
+showing section's list (a click on a row puts the cursor there). Landing
+on a row checks it: the `✓` (the same one the app menu's toggles wear)
+moves to the row, showing what `Enter` would save, and nothing is saved
+yet. `Enter` (or the `Apply` button) saves what is checked and closes;
+`Esc` closes and forgets it. The card is one size for every section: it
+is sized for the longer list, so switching sections never resizes it.
+
+- **Theme** lists every loadable theme, the same rows `cyclops theme`
+  prints. Landing on a theme checks it and previews it over the live
+  workspace; `Enter` applies it exactly like `cyclops theme <name>` (the
+  config key is written and cyclopsd repaints pane borders), and `Esc`
+  puts the previous theme back. See [themes.md](themes.md).
+- **Sound** opens with what it is for, then the switch, `Sound notifs:
+  on` or `off`, saved under `[workspace] sound_notifs` (off by default),
+  and under a `Sounds` heading the sounds to choose from. On, the workspace plays the chosen sound when an agent
+  you are not looking at gives you a reason to look: it finished a turn
+  (working to idle), it needs a human (attention raised, or blocked on a
+  prompt), or it died. Starting to work is silent, and so is the focused
+  pane while the terminal has focus. The list is every file in
+  `~/.cyclops/sounds/` by name without its extension, then
+  `System alert`. `bow-ripple` (the default) and `glass-ping` ship with
+  Cyclops, which `cyclops start` and bare `cyclops` seed there like the
+  themes; drop your own `.wav` or `.aiff` beside them and it is listed
+  next time the card opens. The
+  switch and the list each have their own `✓`, and each follows the
+  cursor within its group; landing on a sound plays it, and a click on
+  a sound plays it again. `Enter` saves both checks at once, the switch
+  as `sound_notifs` and the sound as `[workspace] sound` (`"bow-ripple"`
+  by default, `"system"` for the system alert); `Esc` saves neither.
+  Files play through `afplay` on macOS and the first of `paplay`,
+  `aplay`, `ffplay` on Linux. `System alert` is the alert sound your
+  system plays, at its alert volume: on macOS the one chosen in System
+  Settings → Sound (via `osascript -e beep`), on Linux the freedesktop
+  sound theme's bell. It is also what plays when the chosen file is
+  missing or there is no player for it; only a system with no alert
+  sound at all falls back to the terminal bell, which many terminals
+  ship with the sound turned off.
+
+`show_settings` is the binding name; `show_themes`, from when the card
+was only a theme picker, still works in an existing config.
+
 ## Motion
 
 Four things fade rather than snap: a pane border taking or losing focus,
@@ -290,7 +336,7 @@ the same rule: Enter or click `↵ Confirm` to proceed, Escape or click
 `Esc Cancel` to back out.
 
 Every dialog can be moved. Its top border names the card at the left
-(`╭─ Themes ─`, on the list dialogs) and carries a `[⠿]` grip at the
+(`╭─ Settings ─`, on the list dialogs) and carries a `[⠿]` grip at the
 right, the same handle a pane frame wears. Press the border or the row
 under it and drag: the card follows the pointer and stops at the screen
 edge, so its action row stays reachable. The header does not light under
@@ -386,6 +432,8 @@ files_rows = 8
 sidebar_tab = "sessions"
 tab_bar_visible = true
 motion = true
+sound_notifs = false
+sound = "bow-ripple"
 workspace_order = ["main", "website"]
 agent_order = ["name:implementer", "name:reviewer"]
 folder_tracked = []

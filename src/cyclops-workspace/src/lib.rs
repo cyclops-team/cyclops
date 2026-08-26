@@ -22,6 +22,7 @@ mod render;
 pub mod resilience;
 pub mod runtime;
 mod selection;
+mod sound;
 mod sync;
 mod term_guard;
 mod theme;

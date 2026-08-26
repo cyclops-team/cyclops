@@ -151,6 +151,7 @@ $ cyclops start --setup-only
 ✔ cyclops is set up
   wrote /Users/you/.cyclops/config.toml
   wrote 17 themes to /Users/you/.cyclops/themes
+  wrote 2 sounds to /Users/you/.cyclops/sounds
   wrote 4 detection manifests to /Users/you/.cyclops/manifests
 ```
 
@@ -247,7 +248,8 @@ A file you edited is never rewritten, so your measurements survive every
 run. A copy still byte-identical to a version Cyclops shipped is a seed
 nobody touched, and a newer shipped version replaces it on the next run,
 so an upgrade reaches an untouched home without a reinstall. Themes
-follow the same rule.
+follow the same rule; the shipped sounds are written once and then left
+alone.
 
 Four optional keys. The first two change how the daemon talks to tmux, so
 add them only when you mean to. `theme` changes what every surface prints,

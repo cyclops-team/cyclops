@@ -59,8 +59,9 @@ pub enum BindingAction {
     ShowKeybinds,
     /// Open the composer: address a message without leaving the workspace.
     Compose,
-    /// No default chord: reached from the app menu, bindable via config.
-    ShowThemes,
+    /// Open the settings dialog (themes, sound). No default chord:
+    /// reached from the app menu, bindable via config.
+    ShowSettings,
 }
 
 /// One human-readable row in the in-app keybinding reference.
@@ -290,7 +291,9 @@ fn action_from_key(key: &str) -> Option<BindingAction> {
         "toggle_event_panel" => Some(BindingAction::ToggleEventPanel),
         "show_keybinds" => Some(BindingAction::ShowKeybinds),
         "compose" => Some(BindingAction::Compose),
-        "show_themes" => Some(BindingAction::ShowThemes),
+        // `show_themes` is the key this action had when the dialog was
+        // only a theme picker; a config that binds it keeps working.
+        "show_settings" | "show_themes" => Some(BindingAction::ShowSettings),
         s if s.starts_with("tab_") => s
             .strip_prefix("tab_")
             .and_then(|n| n.parse::<usize>().ok())
@@ -427,7 +430,7 @@ fn action_words(action: BindingAction) -> String {
         BindingAction::ToggleEventPanel => "Toggle event stream".into(),
         BindingAction::ShowKeybinds => "Keybinds".into(),
         BindingAction::Compose => "Send a message".into(),
-        BindingAction::ShowThemes => "Themes".into(),
+        BindingAction::ShowSettings => "Settings".into(),
     }
 }
 
@@ -465,7 +468,7 @@ fn help_rank(action: BindingAction) -> (u8, usize) {
         BindingAction::ToggleEventPanel => (50, 0),
         BindingAction::Compose => (50, 1),
         BindingAction::ShowKeybinds => (51, 0),
-        BindingAction::ShowThemes => (52, 0),
+        BindingAction::ShowSettings => (52, 0),
         BindingAction::Detach => (53, 0),
     }
 }
