@@ -387,6 +387,13 @@ impl SessionSlot {
         self.alias_of().is_none()
     }
 
+    fn journal_file_name(&self) -> Option<String> {
+        self.ledger
+            .path()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    }
+
     /// Retire this slot behind `canonical_idx` without invalidating its
     /// historical index. Only the session-registration transaction calls
     /// this. A live loser is woken so its task tears down its duplicate
@@ -405,6 +412,17 @@ impl SessionSlot {
             self.alias_changed.send_replace(Some(canonical_idx));
         }
         retired
+    }
+
+    fn retarget_alias(&self, prior_idx: usize, canonical_idx: usize) -> bool {
+        self.alias_of
+            .compare_exchange(
+                prior_idx,
+                canonical_idx,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     /// Current observed rows while attached, otherwise the retained rows.
@@ -3225,6 +3243,37 @@ fn rename_session_slot_locked(
             );
             return true;
         }
+        let Some(canonical_journal) = slot.journal_file_name() else {
+            error!(
+                source_idx = idx,
+                target_idx = other_idx,
+                "rename collision source has no journal file name"
+            );
+            return true;
+        };
+        if inner
+            .append_line(
+                other_idx,
+                daemon_line(
+                    Kind::System,
+                    inner.mint_event_id(),
+                    json!({
+                        "event": "session_slot_aliased",
+                        "session": &new_name,
+                        "canonical_session_idx": idx,
+                        "canonical_journal": canonical_journal,
+                    }),
+                ),
+            )
+            .is_none()
+        {
+            error!(
+                source_idx = idx,
+                target_idx = other_idx,
+                "rename collision history link could not be recorded"
+            );
+            return true;
+        }
         if !other.retire_as_alias(idx) {
             error!(
                 source_idx = idx,
@@ -3234,6 +3283,17 @@ fn rename_session_slot_locked(
             );
             return true;
         }
+        for alias in inner.session_slots() {
+            alias.retarget_alias(other_idx, idx);
+        }
+        debug_assert!(inner.session(idx).is_some_and(|slot| slot.is_canonical()));
+        debug_assert!(inner.session_slots().iter().all(|slot| {
+            slot.alias_of().is_none_or(|canonical_idx| {
+                inner
+                    .session(canonical_idx)
+                    .is_some_and(|canonical| canonical.is_canonical())
+            })
+        }));
         Some((other_idx, other, target_is_live))
     } else {
         None
@@ -3264,18 +3324,6 @@ fn rename_session_slot_locked(
             session = %new_name,
             was_live,
             "retired a duplicate session slot after a rename collision"
-        );
-        inner.append_line(
-            alias_idx,
-            daemon_line(
-                Kind::System,
-                inner.mint_event_id(),
-                json!({
-                    "event": "session_slot_aliased",
-                    "session": &new_name,
-                    "canonical_session_idx": idx,
-                }),
-            ),
         );
         debug_assert_eq!(alias.alias_of(), Some(idx));
     }
@@ -6578,6 +6626,116 @@ process_names = ["never"]
                 .expect("runtime session task does not panic");
         }
         drop(runtime);
+        drop(configured);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_configured_alias_keeps_the_runtime_journal_in_history_after_restart() {
+        let tag = "cyc-session-alias-history";
+        let inner = bare_inner(tag);
+        let home = inner.cfg.home.clone();
+        let configured_ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/research.ndjson"),
+            &inner.boot_id,
+        )
+        .unwrap();
+        let runtime_ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/yahirh.ndjson"),
+            &inner.boot_id,
+        )
+        .unwrap();
+        let configured = Arc::new(SessionSlot::new(
+            "research".into(),
+            Arc::new(configured_ledger),
+        ));
+        let runtime = Arc::new(SessionSlot::new("yahirh".into(), Arc::new(runtime_ledger)));
+        inner
+            .sessions
+            .lock()
+            .unwrap()
+            .extend([Arc::clone(&configured), Arc::clone(&runtime)]);
+
+        let mut before = daemon_line(Kind::Msg, "m-1-before-rename".into(), Value::Null);
+        before.from = "admin".into();
+        before.to = vec!["reviewer".into()];
+        runtime.ledger.append(before).unwrap();
+        rename_session_slot_locked(&inner, 1, "research".into(), None);
+        std::thread::sleep(Duration::from_millis(2));
+        let mut after = daemon_line(Kind::Msg, "m-2-after-rename".into(), Value::Null);
+        after.from = "admin".into();
+        after.to = vec!["reviewer".into()];
+        runtime.ledger.append(after).unwrap();
+
+        // A restart recreates only the configured slot. Its durable alias fact
+        // must keep the runtime-created journal in the history source set.
+        *inner.sessions.lock().unwrap() = vec![Arc::clone(&configured)];
+        let history = history::msg_history(
+            &inner,
+            cyclops_proto::HistoryParams {
+                with: None,
+                from: None,
+                to: None,
+                limit: 10,
+                cursor: None,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        let ids = history["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|line| line["id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            ["m-1-before-rename", "m-2-after-rename"],
+            "both sides of the rename must survive exactly once and in order: {history}"
+        );
+
+        drop(runtime);
+        drop(configured);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn repeated_session_collisions_keep_every_alias_one_hop_from_the_owner() {
+        let tag = "cyc-session-alias-flat";
+        let inner = bare_inner(tag);
+        let home = inner.cfg.home.clone();
+        let add_slot = |name: &str| {
+            let ledger = LedgerWriter::open(
+                &inner.state_root,
+                &PathBuf::from("ledger").join(format!("{name}.ndjson")),
+                &inner.boot_id,
+            )
+            .unwrap();
+            let slot = Arc::new(SessionSlot::new(name.into(), Arc::new(ledger)));
+            inner.sessions.lock().unwrap().push(Arc::clone(&slot));
+            slot
+        };
+
+        let configured = add_slot("research");
+        let first = add_slot("first");
+        rename_session_slot_locked(&inner, 1, "research".into(), None);
+        assert_eq!(configured.alias_of(), Some(1));
+
+        let second = add_slot("second");
+        rename_session_slot_locked(&inner, 2, "research".into(), None);
+
+        assert_eq!(first.alias_of(), Some(2));
+        assert_eq!(configured.alias_of(), Some(2));
+        assert!(second.is_canonical());
+        assert_eq!(inner.active_session_slots().len(), 1);
+
+        drop(second);
+        drop(first);
         drop(configured);
         drop(inner);
         let _ = std::fs::remove_dir_all(home);

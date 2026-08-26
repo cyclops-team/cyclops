@@ -1,6 +1,7 @@
 //! Read-side queries over the authoritative workspace message journal.
 //!
-//! Pre-upgrade session ledgers remain readable as compatibility sources.
+//! Pre-upgrade session ledgers remain readable as compatibility sources,
+//! including runtime-named journals linked by a later session rename.
 //! Workspace records are read first and duplicate message identifiers are
 //! returned once. New messages are never copied into a session ledger.
 //!
@@ -15,8 +16,9 @@
 //! machine, so no indexed reader was added to that crate; the additive
 //! index stays a measured-need option, not a speculative one.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use cyclops_proto::{
@@ -328,24 +330,62 @@ fn history_sources(inner: &Inner) -> (Vec<Vec<LedgerLine>>, Vec<String>, Option<
             }
         }
     }
+    let mut pending = VecDeque::new();
     for slot in inner.session_slots() {
         let source = legacy_journal_source(&slot);
         if seen.insert(source.clone()) {
-            names.push(source);
-            files.push(read_session(&slot));
+            pending.push_back((source, read_session(&slot)));
         }
+    }
+    while let Some((source, lines)) = pending.pop_front() {
+        for journal in linked_session_journals(&lines) {
+            let linked_source = legacy_journal_source_for_file(&journal);
+            if !seen.insert(linked_source.clone()) {
+                continue;
+            }
+            let descendant = PathBuf::from("ledger").join(&journal);
+            let linked_lines = match cyclops_ledger::read_after(&inner.state_root, &descendant, 0) {
+                Ok(lines) => lines,
+                Err(error) => {
+                    warn!(journal, %error, "linked session history is unreadable");
+                    Vec::new()
+                }
+            };
+            pending.push_back((linked_source, linked_lines));
+        }
+        names.push(source);
+        files.push(lines);
     }
     (files, names, workspace_file)
 }
 
 fn legacy_journal_source(slot: &crate::SessionSlot) -> String {
-    let file = slot
-        .ledger
-        .path()
-        .file_name()
-        .map(|name| name.to_string_lossy())
-        .unwrap_or_default();
+    legacy_journal_source_for_file(&slot.journal_file_name().unwrap_or_default())
+}
+
+fn legacy_journal_source_for_file(file: &str) -> String {
     format!("session-journal:{file}")
+}
+
+fn linked_session_journals(lines: &[LedgerLine]) -> Vec<String> {
+    lines
+        .iter()
+        .filter_map(|line| line.data.as_ref())
+        .filter(|data| data["event"] == "session_slot_aliased")
+        .filter_map(|data| data["canonical_journal"].as_str())
+        .filter(|file| valid_session_journal_file(file))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn valid_session_journal_file(file: &str) -> bool {
+    let path = Path::new(file);
+    matches!(
+        path.components().collect::<Vec<_>>().as_slice(),
+        [Component::Normal(_)]
+    ) && path
+        .extension()
+        .is_some_and(|extension| extension == "ndjson")
 }
 
 fn read_session(slot: &crate::SessionSlot) -> Vec<LedgerLine> {
