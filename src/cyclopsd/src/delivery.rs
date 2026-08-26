@@ -11023,6 +11023,7 @@ composer_trailer_required_prefix = 1
                 crate::composer_recovery::RecoveryCoordinator::default(),
             ),
             mailbox_publication: StdMutex::new(()),
+            unread_projection_gate: tokio::sync::Mutex::new(()),
             mailbox_publish_pause: StdMutex::new(None),
             boot_id: "b-unwritten-test".into(),
             started: std::time::Instant::now(),

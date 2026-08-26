@@ -2831,6 +2831,7 @@ mod tests {
                 crate::composer_recovery::RecoveryCoordinator::default(),
             ),
             mailbox_publication: StdMutex::new(()),
+            unread_projection_gate: tokio::sync::Mutex::new(()),
             mailbox_publish_pause: StdMutex::new(None),
             boot_id: "b-test".into(),
             started: Instant::now(),
