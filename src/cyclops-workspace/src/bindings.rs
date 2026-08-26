@@ -56,11 +56,15 @@ pub enum BindingAction {
     /// merge of the old right-hand panel into the sidebar; the config key
     /// (`toggle_event_panel`) keeps working unchanged.
     ToggleEventPanel,
+    /// Open the settings card on its keybinds section: the reference
+    /// generated from the active map.
     ShowKeybinds,
     /// Open the composer: address a message without leaving the workspace.
     Compose,
-    /// No default chord: reached from the app menu, bindable via config.
-    ShowThemes,
+    /// Open the settings card (theme, sound, keybinds) on its first
+    /// section. No default chord: reached from the app menu, bindable
+    /// via config.
+    ShowSettings,
 }
 
 /// One human-readable row in the in-app keybinding reference.
@@ -227,6 +231,13 @@ pub fn default_bindings() -> HashMap<BindingAction, BindingChord> {
 }
 
 /// Load bindings from `<home>/config.toml`, falling back to defaults.
+///
+/// A chord belongs to one action. The map is keyed by action, so a
+/// rebinding that reuses a default's chord would otherwise leave both
+/// actions on it, and the router (`input/router.rs`) walking the map
+/// would answer with whichever hashed first: a binding that works in
+/// one process and does nothing in the next. The user's line wins, and
+/// the default that had the chord loses it.
 pub fn load_bindings(home: &Path) -> HashMap<BindingAction, BindingChord> {
     let path = home.join("config.toml");
     let Ok(text) = std::fs::read_to_string(&path) else {
@@ -250,6 +261,7 @@ pub fn load_bindings(home: &Path) -> HashMap<BindingAction, BindingChord> {
             continue;
         };
         if let Some(chord) = parse_binding_spec(spec) {
+            out.retain(|_, taken| *taken != chord);
             out.insert(action, chord);
         }
     }
@@ -290,7 +302,9 @@ fn action_from_key(key: &str) -> Option<BindingAction> {
         "toggle_event_panel" => Some(BindingAction::ToggleEventPanel),
         "show_keybinds" => Some(BindingAction::ShowKeybinds),
         "compose" => Some(BindingAction::Compose),
-        "show_themes" => Some(BindingAction::ShowThemes),
+        // `show_themes` is the key this action had when the dialog was
+        // only a theme picker; a config that binds it keeps working.
+        "show_settings" | "show_themes" => Some(BindingAction::ShowSettings),
         s if s.starts_with("tab_") => s
             .strip_prefix("tab_")
             .and_then(|n| n.parse::<usize>().ok())
@@ -427,7 +441,7 @@ fn action_words(action: BindingAction) -> String {
         BindingAction::ToggleEventPanel => "Toggle event stream".into(),
         BindingAction::ShowKeybinds => "Keybinds".into(),
         BindingAction::Compose => "Send a message".into(),
-        BindingAction::ShowThemes => "Themes".into(),
+        BindingAction::ShowSettings => "Settings".into(),
     }
 }
 
@@ -465,7 +479,7 @@ fn help_rank(action: BindingAction) -> (u8, usize) {
         BindingAction::ToggleEventPanel => (50, 0),
         BindingAction::Compose => (50, 1),
         BindingAction::ShowKeybinds => (51, 0),
-        BindingAction::ShowThemes => (52, 0),
+        BindingAction::ShowSettings => (52, 0),
         BindingAction::Detach => (53, 0),
     }
 }
@@ -559,6 +573,48 @@ mod tests {
     fn direct_chord_rebinds_next_tab() {
         let chord = parse_binding_spec("ctrl+alt+]").expect("parse");
         assert!(matches!(chord, BindingChord::Direct(_)));
+    }
+
+    /// Rebinding onto a chord a default owns takes it from the default:
+    /// one action per chord, so the router's answer does not depend on
+    /// hash order. Rebinding onto a free chord touches nothing else.
+    #[test]
+    fn a_rebinding_takes_its_chord_from_the_default_that_had_it() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-bindings-collision");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("scratch");
+        std::fs::write(
+            home.join("config.toml"),
+            "[workspace.bindings]\nshow_settings = \"prefix g\"\nname_pane = \"prefix o\"\n",
+        )
+        .expect("write");
+        let g = BindingChord::Prefix(KeyCode::Char('g'));
+        assert_eq!(
+            default_bindings().get(&BindingAction::FocusFiles),
+            Some(&g),
+            "the default this test collides with"
+        );
+
+        let bindings = load_bindings(&home);
+
+        assert_eq!(bindings.get(&BindingAction::ShowSettings), Some(&g));
+        assert!(
+            !bindings.contains_key(&BindingAction::FocusFiles),
+            "the default lost the chord the config claimed"
+        );
+        assert_eq!(
+            bindings.get(&BindingAction::NamePane),
+            Some(&BindingChord::Prefix(KeyCode::Char('o')))
+        );
+        // Settings has no default chord, so it joins the map as the file
+        // panel leaves it: one in, one out, nothing else touched.
+        assert!(!default_bindings().contains_key(&BindingAction::ShowSettings));
+        assert_eq!(bindings.len(), default_bindings().len());
+        let mut chords: Vec<&BindingChord> = bindings.values().collect();
+        chords.sort_by_key(|chord| format!("{chord:?}"));
+        chords.dedup();
+        assert_eq!(chords.len(), bindings.len(), "no chord is shared");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

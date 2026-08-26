@@ -21,15 +21,6 @@ pub const NAME_PANE_TITLE: &str = "Name pane";
 
 pub const NAME_PANE_HINT: &str = "Used to identify and message this agent, e.g. reviewer.";
 
-pub const KEYBINDS_TITLE: &str = "Keybinds";
-
-pub const KEYBINDS_HINT: &str = "Scroll with ↑/↓, PgUp/PgDn, or the mouse wheel.";
-
-/// The compact state vocabulary (rule 11), spelled out once for the
-/// keybinds dialog since sidebar rows and inactive pane borders show only
-/// the glyph half of it.
-pub const STATE_GLYPH_LEGEND: &str = "Status:  ○ idle   ● working   ⚠ needs attention   ✕ dead";
-
 pub const RENAME_WORKSPACE_PROMPT: &str = "Rename session";
 
 pub const CONFIRM_CLOSE_WORKSPACE: &str = "Close this session?";
@@ -136,9 +127,9 @@ pub const MENU_TAB_BAR: &str = "Tab bar";
 /// The only visible switch for chrome fades (`crate::animate`).
 pub const MENU_MOTION: &str = "Motion";
 
-pub const MENU_THEMES: &str = "Themes";
-
-pub const MENU_KEYBINDS: &str = "Keybinds";
+/// Opens the settings dialog: the theme picker, the sound switch, and
+/// the keybinding reference.
+pub const MENU_SETTINGS: &str = "Settings";
 
 pub const MENU_DETACH: &str = "Detach";
 
@@ -150,9 +141,32 @@ pub const MENU_RENAME_WORKSPACE: &str = "Rename session";
 
 pub const MENU_CLOSE_WORKSPACE: &str = "Close session";
 
-pub const THEMES_TITLE: &str = "Themes";
+pub const SETTINGS_TITLE: &str = "Settings";
 
-pub const THEMES_HINT: &str = "Pick with ↑/↓, Enter applies everywhere.";
+/// The settings dialog's section chips, in the order Tab walks them.
+pub const SETTINGS_SECTION_THEME: &str = "Theme";
+
+pub const SETTINGS_SECTION_SOUND: &str = "Sound";
+
+pub const SETTINGS_SECTION_KEYBINDS: &str = "Keybinds";
+
+pub const THEMES_HINT: &str = "Pick with ↑/↓, Tab switches section, Enter applies everywhere.";
+
+/// The sound section's two rows. "Sound notifs" rather than "Sounds":
+/// the switch is about being told, not about the workspace making noise.
+pub const SOUND_NOTIFS_ON: &str = "Sound notifs: on";
+
+pub const SOUND_NOTIFS_OFF: &str = "Sound notifs: off";
+
+/// The sound list's built-in row: the system's alert sound rather than
+/// a file. Its pref value is `crate::sound::SYSTEM`.
+pub const SOUND_SYSTEM: &str = "System alert";
+
+/// The sound section's first line, muted: what the switch is for.
+pub const SOUND_INTRO: &str = "Play sounds when agents change state in background.";
+
+/// The muted heading over the sounds to choose from.
+pub const SOUND_LIST_HEADING: &str = "Sounds";
 
 pub const THEMES_EMPTY: &str = "No themes found. Run cyclops start to seed the shipped ones.";
 

@@ -49,6 +49,7 @@ mod manifests;
 mod render;
 mod setup;
 mod skillseed;
+mod soundseed;
 mod style;
 mod theme;
 mod themeseed;
@@ -787,6 +788,9 @@ fn run(cli: &Cli) -> i32 {
 fn seed_home_for_workspace() {
     let home = cyclops_proto::cyclops_home();
     for why in themeseed::seed(&home).problems {
+        eprintln!("{why}");
+    }
+    for why in soundseed::seed(&home).problems {
         eprintln!("{why}");
     }
     let seeded = manifests::seed(&home);

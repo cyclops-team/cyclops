@@ -1054,6 +1054,13 @@ fn prepare_home(
         notes.push(crate::themeseed::installed(&themes));
     }
     notes.extend(themes.problems);
+    //    The shipped sound cue goes the same way, and a home without it
+    //    still has the terminal bell.
+    let sounds = crate::soundseed::seed(home);
+    if !sounds.written.is_empty() {
+        notes.push(crate::soundseed::installed(&sounds));
+    }
+    notes.extend(sounds.problems);
 
     // 3. Manifests, every run and not only the first. A home that predates
     //    the seed gets them without a reinstall, and a shipped set that

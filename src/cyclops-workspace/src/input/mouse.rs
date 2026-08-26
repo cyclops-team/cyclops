@@ -112,6 +112,16 @@ pub enum HitTarget {
     /// The top border and title row of an open dialog: the rows that move
     /// the box rather than answer it.
     DialogTitleBar,
+    /// One section chip of the settings dialog: the mouse's half of Tab.
+    SettingsSection {
+        section: crate::dialog::SettingsSection,
+    },
+    /// One row of the settings dialog's showing list: the mouse's half of
+    /// the arrows. A click puts the cursor on it (and previews a theme);
+    /// applying is still `Enter` or the button.
+    SettingsRow {
+        index: usize,
+    },
 }
 
 /// Geometry recorded during render for cell hit-testing.

@@ -33,7 +33,9 @@ use crate::action::{Action, Insertion, TabDestination};
 use crate::copy;
 use crate::daemon;
 use crate::decoration::{self, DecorationSnapshot};
-use crate::dialog::{Composed, Dialog};
+use crate::dialog::{
+    Composed, Dialog, KeybindSheet, SettingsSection, SoundPicker, SoundRow, ThemePicker,
+};
 use crate::naming;
 use crate::persist::SidebarTab;
 
@@ -397,28 +399,48 @@ pub(super) async fn execute(
                 ..Outcome::default()
             })
         }
-        Action::ShowKeybinds => {
-            app.open_dialog(Dialog::Keybinds {
-                scroll: 0,
-                rows: app.router.help(),
-            });
-            Ok(Outcome::default())
-        }
-        Action::ShowThemes => {
+        Action::ShowSettings { section } => {
             let (names, active) = theme_rows(&app.home);
             // What close-without-apply puts back: browsing previews into
             // `paint.theme` directly (see [`preview_selected_theme`]), so
             // the theme that is live right now rides beside the picker.
             app.theme_restore = Some(app.paint.theme.clone());
-            app.open_dialog(Dialog::Themes {
-                selected: active.unwrap_or(0),
-                names,
-                active,
-                notice: None,
+            app.open_dialog(Dialog::Settings {
+                section,
+                themes: ThemePicker {
+                    selected: active.unwrap_or(0),
+                    names,
+                    active,
+                    notice: None,
+                },
+                sound: SoundPicker::new(
+                    app.prefs.sound_notifs,
+                    crate::sound::choices(&app.home),
+                    &app.prefs.sound,
+                ),
+                // From the router's live map, not from documentation, so
+                // a rebinding in config.toml is what the sheet teaches.
+                keybinds: KeybindSheet {
+                    scroll: 0,
+                    rows: app.router.help(),
+                },
             });
             Ok(Outcome::default())
         }
         Action::ApplyTheme { name } => Ok(apply_theme(app, &name)),
+        Action::ApplySoundSettings { on, cue } => {
+            app.prefs.sound_notifs = on;
+            if let Some(cue) = cue {
+                app.prefs.sound = cue;
+            }
+            // Closing the card closes its theme section too: a theme
+            // browsed but never applied goes back, exactly as Esc does.
+            super::dialog_cancel(app);
+            Ok(Outcome {
+                persist: true,
+                ..Outcome::default()
+            })
+        }
         Action::Detach => Ok(Outcome {
             detach: true,
             ..Outcome::default()
@@ -1039,6 +1061,35 @@ fn theme_rows(home: &Path) -> (Vec<String>, Option<usize>) {
     (rows.into_iter().map(|(name, _)| name).collect(), active)
 }
 
+/// The cursor landed on a settings row, by arrows, wheel, or a click
+/// (`clicked`). Landing is a preview in both sections and saves nothing:
+/// Enter does that, Esc forgets it. A theme row goes live over the
+/// workspace ([`preview_selected_theme`]) and its check follows the
+/// cursor (the painter's rule). A sound row takes its group's check
+/// ([`SoundPicker::check_selected`]) and plays once for the arrival
+/// ([`SoundPicker::arrived_on`]) and on every click, so hearing it
+/// again is one click. A no-op for every other dialog.
+pub(super) fn settings_cursor_moved(app: &mut App, clicked: bool) {
+    preview_selected_theme(app);
+    let Some(Dialog::Settings {
+        section: SettingsSection::Sound,
+        sound,
+        ..
+    }) = app.dialog.as_mut()
+    else {
+        return;
+    };
+    sound.check_selected();
+    let arrived = sound.arrived_on().is_some();
+    let play = match sound.selected_row() {
+        Some(SoundRow::Sound(name)) if arrived || clicked => Some(name.to_string()),
+        _ => None,
+    };
+    if let Some(name) = play {
+        crate::sound::play(&app.home, &name);
+    }
+}
+
 /// Preview the theme under the picker's cursor: load its file and swap it
 /// into the live paint for the next render. Nothing is written and no
 /// daemon is nudged; this is transient UI state (module rule 2), and a
@@ -1052,13 +1103,10 @@ fn theme_rows(home: &Path) -> (Vec<String>, Option<usize>) {
 /// and load warnings are dropped for the reason [`save_theme_choice`]
 /// gives: the ThemeWatch logs them once if this file is ever applied.
 pub(super) fn preview_selected_theme(app: &mut App) {
-    let Some(Dialog::Themes {
-        names, selected, ..
-    }) = app.dialog.as_ref()
-    else {
+    let Some(Dialog::Settings { themes, .. }) = app.dialog.as_ref() else {
         return;
     };
-    let Some(name) = names.get(*selected) else {
+    let Some(name) = themes.names.get(themes.selected) else {
         return;
     };
     let Some(path) = cyclops_theme::path_for(name, &app.home) else {
@@ -1106,16 +1154,10 @@ fn apply_theme(app: &mut App, name: &str) -> Outcome {
     // The story stays in the open picker (the NamePane error shape);
     // Escape closes it. A written config moves the active marker even
     // when the daemon did not confirm, because the selection did switch.
-    if let Some(Dialog::Themes {
-        names,
-        active,
-        notice,
-        ..
-    }) = app.dialog.as_mut()
-    {
-        *notice = Some(text);
+    if let Some(Dialog::Settings { themes, .. }) = app.dialog.as_mut() {
+        themes.notice = Some(text);
         if saved {
-            *active = names.iter().position(|n| n == name);
+            themes.active = themes.names.iter().position(|n| n == name);
         }
     }
     Outcome::default()
@@ -2306,10 +2348,27 @@ mod tests {
         client.shutdown().await;
     }
 
-    // -- Theme picker: the listing filter, and the two ends of an apply. --
+    // -- Settings: the theme listing filter, the two ends of an apply, and
+    //    the sound switch. --
+
+    /// The settings card open on its theme section, the shape every
+    /// theme test below starts from.
+    fn theme_settings(names: Vec<String>, selected: usize, active: Option<usize>) -> Dialog {
+        Dialog::Settings {
+            section: SettingsSection::Theme,
+            themes: ThemePicker {
+                names,
+                selected,
+                active,
+                notice: None,
+            },
+            sound: SoundPicker::new(false, vec!["system".into()], "system"),
+            keybinds: KeybindSheet::default(),
+        }
+    }
 
     #[tokio::test]
-    async fn show_themes_offers_only_loadable_themes_and_marks_the_active_one() {
+    async fn show_settings_offers_only_loadable_themes_and_marks_the_active_one() {
         if !tmux_available() {
             return;
         }
@@ -2328,27 +2387,49 @@ mod tests {
         write_theme(&home, "broken", "[surface\n");
         write_theme(&home, "empty", "name = \"empty\"\n");
         std::fs::write(home.join("config.toml"), "theme = \"dark\"\n").expect("config");
+        std::fs::create_dir_all(home.join("sounds")).expect("sounds dir");
+        std::fs::write(home.join("sounds/chime.wav"), b"").expect("a sound");
         let mut app = test_app(one_tab_model("s", "@0", &pane, "$0"), home.clone());
 
-        let outcome = execute(&mut app, &client, Action::ShowThemes)
-            .await
-            .expect("open the picker");
+        app.prefs.sound_notifs = true;
+        app.prefs.sound = "chime".into();
+        let outcome = execute(
+            &mut app,
+            &client,
+            Action::ShowSettings {
+                section: SettingsSection::Theme,
+            },
+        )
+        .await
+        .expect("open the card");
 
         assert!(!outcome.reconcile);
         assert!(!outcome.persist);
         match &app.dialog {
-            Some(Dialog::Themes {
-                names,
-                selected,
-                active,
-                notice,
+            Some(Dialog::Settings {
+                section,
+                themes,
+                sound,
+                keybinds,
             }) => {
-                assert_eq!(names, &vec!["dark".to_string()]);
-                assert_eq!(*selected, 0, "the arrows start on the active row");
-                assert_eq!(*active, Some(0));
-                assert_eq!(*notice, None);
+                assert_eq!(*section, SettingsSection::Theme, "opens on themes");
+                assert_eq!(keybinds.scroll, 0);
+                assert_eq!(
+                    keybinds.rows,
+                    app.router.help(),
+                    "the keybinds section is the active map, as rows"
+                );
+                assert_eq!(themes.names, vec!["dark".to_string()]);
+                assert_eq!(themes.selected, 0, "the arrows start on the active row");
+                assert_eq!(themes.active, Some(0));
+                assert_eq!(themes.notice, None);
+                assert_eq!(
+                    *sound,
+                    SoundPicker::new(true, vec!["chime".into(), "system".into()], "chime"),
+                    "the saved switch, the installed sounds then the bell, the saved cue"
+                );
             }
-            other => panic!("expected the theme picker, got {other:?}"),
+            other => panic!("expected the settings card, got {other:?}"),
         }
         assert!(
             app.theme_restore.is_some(),
@@ -2381,12 +2462,11 @@ mod tests {
         spawn_theme_reload_daemon(&home, "solar");
         let mut app = test_app(one_tab_model("s", "@0", &pane, "$0"), home.clone());
         app.theme_restore = Some(app.paint.theme.clone());
-        app.open_dialog(Dialog::Themes {
-            names: vec!["dark".into(), "solar".into()],
-            selected: 1,
-            active: Some(0),
-            notice: None,
-        });
+        app.open_dialog(theme_settings(
+            vec!["dark".into(), "solar".into()],
+            1,
+            Some(0),
+        ));
 
         let outcome = execute(
             &mut app,
@@ -2430,12 +2510,11 @@ mod tests {
         );
         let mut app = test_app(one_tab_model("s", "@0", &pane, "$0"), home.clone());
         app.theme_restore = Some(app.paint.theme.clone());
-        app.open_dialog(Dialog::Themes {
-            names: vec!["dark".into(), "solar".into()],
-            selected: 1,
-            active: Some(0),
-            notice: None,
-        });
+        app.open_dialog(theme_settings(
+            vec!["dark".into(), "solar".into()],
+            1,
+            Some(0),
+        ));
 
         execute(
             &mut app,
@@ -2454,9 +2533,12 @@ mod tests {
             "theme = \"solar\"\n"
         );
         match &app.dialog {
-            Some(Dialog::Themes { notice, active, .. }) => {
-                assert_eq!(notice.as_deref(), Some(crate::copy::THEME_SAVED_NO_DAEMON));
-                assert_eq!(*active, Some(1), "the selection did switch");
+            Some(Dialog::Settings { themes, .. }) => {
+                assert_eq!(
+                    themes.notice.as_deref(),
+                    Some(crate::copy::THEME_SAVED_NO_DAEMON)
+                );
+                assert_eq!(themes.active, Some(1), "the selection did switch");
             }
             other => panic!("expected the picker to stay open, got {other:?}"),
         }
@@ -2482,12 +2564,11 @@ mod tests {
         std::fs::write(home.join("config.toml"), "theme = \"dark\"\n").expect("config");
         let mut app = test_app(one_tab_model("s", "@0", "%0", "$0"), home.clone());
         app.theme_restore = Some(app.paint.theme.clone());
-        app.open_dialog(Dialog::Themes {
-            names: vec!["dark".into(), "solar".into()],
-            selected: 1,
-            active: Some(0),
-            notice: None,
-        });
+        app.open_dialog(theme_settings(
+            vec!["dark".into(), "solar".into()],
+            1,
+            Some(0),
+        ));
 
         preview_selected_theme(&mut app);
 
@@ -2527,15 +2608,14 @@ mod tests {
         app.theme_restore = Some(app.paint.theme.clone());
         // The listing only offers loadable rows, so "broken" being a row
         // means the file broke while the picker was open.
-        app.open_dialog(Dialog::Themes {
-            names: vec!["broken".into(), "lunar".into(), "solar".into()],
-            selected: 2,
-            active: None,
-            notice: None,
-        });
+        app.open_dialog(theme_settings(
+            vec!["broken".into(), "lunar".into(), "solar".into()],
+            2,
+            None,
+        ));
         let select = |app: &mut App, row: usize| {
-            if let Some(Dialog::Themes { selected, .. }) = app.dialog.as_mut() {
-                *selected = row;
+            if let Some(Dialog::Settings { themes, .. }) = app.dialog.as_mut() {
+                themes.selected = row;
             }
             preview_selected_theme(app);
         };
@@ -2557,6 +2637,164 @@ mod tests {
         select(&mut app, 1);
         assert_eq!(dim(&app), (0x33, 0x33, 0x33), "the picker is not wedged");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The sound switch: Enter on its row saves the preference, and the
+    /// card closes the way Esc would, putting back a theme that was only
+    /// browsed.
+    #[tokio::test]
+    async fn apply_sound_settings_saves_closes_and_restores_a_browsed_theme() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-set-sound");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        let pane = pane_ids(&server, "s")[0].clone();
+        let client = rig_client(&server, "s").await;
+        let home = scratch_home("exec-set-sound-home");
+        write_theme(
+            &home,
+            "solar",
+            "name = \"solar\"\n[surface]\ndim = \"#222222\"\n",
+        );
+        let mut app = test_app(one_tab_model("s", "@0", &pane, "$0"), home.clone());
+        let dim = cyclops_theme::tokens::SURFACE_DIM;
+        let original = app.paint.theme.resolve(dim).rgb;
+        app.theme_restore = Some(app.paint.theme.clone());
+        app.open_dialog(Dialog::Settings {
+            section: SettingsSection::Sound,
+            themes: ThemePicker {
+                names: vec!["solar".into()],
+                selected: 0,
+                active: None,
+                notice: None,
+            },
+            sound: SoundPicker::new(false, vec!["system".into()], "system"),
+            keybinds: KeybindSheet::default(),
+        });
+        preview_selected_theme(&mut app);
+        assert_ne!(app.paint.theme.resolve(dim).rgb, original, "browsed");
+
+        let outcome = execute(
+            &mut app,
+            &client,
+            Action::ApplySoundSettings {
+                on: true,
+                cue: None,
+            },
+        )
+        .await
+        .expect("save the switch");
+
+        assert!(outcome.persist, "the switch belongs on disk");
+        assert!(app.prefs.sound_notifs);
+        assert!(app.dialog.is_none(), "a saved switch closes the card");
+        assert_eq!(
+            app.paint.theme.resolve(dim).rgb,
+            original,
+            "a browsed theme was not applied, so it goes back"
+        );
+        assert!(app.theme_restore.is_none());
+
+        let _ = std::fs::remove_dir_all(&home);
+        client.shutdown().await;
+    }
+
+    /// Landing on the switch's other row moves the check and nothing
+    /// else: no pref changes, no file is written, the card stays open,
+    /// and Esc forgets it. Enter is what saves the checks.
+    #[tokio::test]
+    async fn landing_on_a_sound_row_checks_it_without_saving() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-sound-landing");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        let pane = pane_ids(&server, "s")[0].clone();
+        let client = rig_client(&server, "s").await;
+        let home = scratch_home("exec-sound-landing-home");
+        let mut app = test_app(one_tab_model("s", "@0", &pane, "$0"), home.clone());
+        app.open_dialog(Dialog::Settings {
+            section: SettingsSection::Sound,
+            themes: ThemePicker {
+                names: Vec::new(),
+                selected: 0,
+                active: None,
+                notice: None,
+            },
+            sound: SoundPicker::new(false, vec!["system".into()], "system"),
+            keybinds: KeybindSheet::default(),
+        });
+
+        if let Some(open) = app.dialog.as_mut() {
+            crate::dialog::select_settings_row(open, 0);
+        }
+        settings_cursor_moved(&mut app, true);
+
+        match &app.dialog {
+            Some(Dialog::Settings { sound, .. }) => {
+                assert!(sound.on && sound.is_checked(0), "the check moved");
+            }
+            other => panic!("the card stays open, got {other:?}"),
+        }
+        assert!(!app.prefs.sound_notifs, "landing saves nothing");
+        assert!(!home.join("config.toml").exists(), "and writes nothing");
+
+        super::super::dialog_cancel(&mut app);
+        assert!(!app.prefs.sound_notifs, "Esc forgets the check");
+        assert!(!home.join("config.toml").exists());
+
+        let _ = std::fs::remove_dir_all(&home);
+        client.shutdown().await;
+    }
+
+    /// Both checks are saved by one Enter: the switch and the cue.
+    #[tokio::test]
+    async fn apply_sound_settings_saves_the_cue_and_closes_the_card() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-set-sound-name");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        let pane = pane_ids(&server, "s")[0].clone();
+        let client = rig_client(&server, "s").await;
+        let home = scratch_home("exec-set-sound-name-home");
+        let mut app = test_app(one_tab_model("s", "@0", &pane, "$0"), home.clone());
+        app.prefs.sound_notifs = true;
+        app.open_dialog(Dialog::Settings {
+            section: SettingsSection::Sound,
+            themes: ThemePicker {
+                names: Vec::new(),
+                selected: 0,
+                active: None,
+                notice: None,
+            },
+            sound: SoundPicker::new(
+                true,
+                vec!["bow-ripple".into(), "system".into()],
+                "bow-ripple",
+            ),
+            keybinds: KeybindSheet::default(),
+        });
+
+        let outcome = execute(
+            &mut app,
+            &client,
+            Action::ApplySoundSettings {
+                on: true,
+                cue: Some("system".into()),
+            },
+        )
+        .await
+        .expect("save the cue");
+
+        assert!(outcome.persist);
+        assert_eq!(app.prefs.sound, "system");
+        assert!(app.prefs.sound_notifs, "the switch is saved with it");
+        assert!(app.dialog.is_none());
+
+        let _ = std::fs::remove_dir_all(&home);
+        client.shutdown().await;
     }
 
     // -- Insertion ordering: matches `action::resolve_insertion`'s

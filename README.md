@@ -156,14 +156,6 @@ behind it. Otherwise, one page per question.
 | [STYLE.md](docs/development/STYLE.md) | How this codebase is written |
 | [CUTOVER.md](docs/development/CUTOVER.md) | Migrating from the v1 shell toolkit |
 
-## Versions
-
-This tree is the Rust implementation. The previous shell-and-Python
-toolkit lives on branch
-[`v1`](https://github.com/cyclops-team/cyclops/tree/v1) as a read-only
-reference; nothing migrates automatically, and
-[the cutover runbook](docs/development/CUTOVER.md) covers moving off it.
-
 ## License
 
 MIT, see [LICENSE](LICENSE). Upstream attribution for the v1 lineage is

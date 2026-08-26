@@ -5,6 +5,13 @@ versions are unreleased until admin cuts a tag.
 
 ## [Unreleased]
 
+### Fixed
+
+- A `[workspace.bindings]` rebinding onto a chord a default already used
+  left both actions on the chord, and which one fired depended on hash
+  order: it worked in one process and did nothing in the next. The
+  rebinding now takes the chord and the default is unbound.
+
 ### Added
 
 - Durable workspace mailboxes now separate immutable messages, recipient claims,
@@ -25,6 +32,32 @@ versions are unreleased until admin cuts a tag.
 - Installation and update activate a matched CLI and daemon pair. Update proves
   build identity and journal replay before activation, preserves one validated
   known-good pair, and supports `cyclops update --rollback`.
+- The workspace's app menu has a `Settings` item in place of `Themes`
+  and `Keybinds`. It opens one card with three sections: the theme
+  picker, unchanged, a `Sound notifs` switch, and the keybinding
+  reference, which was a card of its own. `Tab` walks the sections (or
+  click a section's chip), `↑`/`↓` move in the showing list (or click a
+  row; `PgUp`/`PgDn`, `Home`/`End` and the wheel move too); landing on
+  a row moves the `✓` to it without saving, `Enter` saves what is
+  checked, `Esc` forgets it. The card keeps one size across sections.
+  The Keybinds section scrolls its rows behind a viewport, counts the
+  rows showing, and closes on `Enter` or `Esc`: nothing on it to apply.
+  `Ctrl+B` `?` (`show_keybinds`) opens the card on that section.
+  The switch is saved as `[workspace] sound_notifs` (off by default).
+  Under the switch, the sounds to choose from: every file in
+  `~/.cyclops/sounds/` by name (`bow-ripple` and `glass-ping` ship and
+  are seeded there), then `System alert`; landing on one
+  plays it (a click plays it again), `Enter` saves it as `[workspace]
+  sound` (`"bow-ripple"` by default). The binding name is
+  `show_settings`; a config that binds `show_themes` keeps working.
+- With sound notifications on, the workspace plays a cue when an agent
+  you are not looking at gives you a reason to look: it finished a turn
+  (working to idle), needs a human (attention raised or blocked), or
+  died. Starting to work is silent, and so is the focused pane while the
+  terminal has focus. The cue is `bow-ripple.wav`, shipped in the binary
+  and seeded to `~/.cyclops/sounds/` by `cyclops start` and bare `cyclops`
+  like the themes, played through the platform's stock player; the
+  terminal bell stands in when the file is missing.
 
 ### Changed
 

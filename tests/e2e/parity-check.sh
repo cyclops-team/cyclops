@@ -453,6 +453,7 @@ echo "#### Rung 1: one pane, persistence, history"
 run "$CYC" start --setup-only --plain
 check "setup writes the config"           'wrote .*/config\.toml$'
 check "setup installs the themes"         '^  wrote 17 themes to .*/themes$'
+check "setup installs the sounds"         '^  wrote 2 sounds to .*/sounds$'
 check "setup installs the manifests"      '^  wrote 4 detection manifests to .*/manifests$'
 
 # The stand-in's own manifest, written the way docs/reference/MANIFESTS.md says to

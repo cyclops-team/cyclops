@@ -53,7 +53,7 @@ Default bindings are prefix-first (`Ctrl+B`, same shape as tmux):
 | `Ctrl+B` `b` | Collapse or reopen the sidebar |
 | `Ctrl+B` `g` | Put the keyboard in the file panel; Esc gives it back |
 | `Ctrl+B` `s` | Send a message to an agent |
-| `Ctrl+B` `?` | Open the scrollable keybinding reference |
+| `Ctrl+B` `?` | Open Settings on its Keybinds section, the reference to every active binding |
 
 Hiding the tab bar ships with no chord: the app menu's `Tab bar` item is
 the way, so a hidden strip is always something you chose. Bind
@@ -258,6 +258,65 @@ clickable, so the mouse always has a way back to the panel and to the
 remaining columns to the pane canvas and re-declares the tmux client
 size, so all panes reflow.
 
+## Settings
+
+The app menu's `Settings` item opens the settings card: one section
+showing at a time, `Tab` (and `Shift+Tab`) walking between them, or a
+click on a section's chip in the card's top row. `↑`/`↓` move down the
+showing section's list (a click on a row puts the cursor there;
+`PgUp`/`PgDn` move eight rows, `Home`/`End` to the ends, and the wheel
+moves too). Landing on a row checks it: the `✓` (the same one the app
+menu's toggles wear) moves to the row, showing what `Enter` would save,
+and nothing is saved yet. `Enter` (or the `Apply` button) saves what is
+checked and closes; `Esc` closes and forgets it. The card is one size
+for every section: it is sized for the longest list, so switching
+sections never resizes it.
+
+- **Theme** lists every loadable theme, the same rows `cyclops theme`
+  prints. Landing on a theme checks it and previews it over the live
+  workspace; `Enter` applies it exactly like `cyclops theme <name>` (the
+  config key is written and cyclopsd repaints pane borders), and `Esc`
+  puts the previous theme back. See [themes.md](themes.md).
+- **Sound** opens with what it is for, then the switch, `Sound notifs:
+  on` or `off`, saved under `[workspace] sound_notifs` (off by default),
+  and under a `Sounds` heading the sounds to choose from. On, the workspace plays the chosen sound when an agent
+  you are not looking at gives you a reason to look: it finished a turn
+  (working to idle), it needs a human (attention raised, or blocked on a
+  prompt), or it died. Starting to work is silent, and so is the focused
+  pane while the terminal has focus. The list is every file in
+  `~/.cyclops/sounds/` by name without its extension, then
+  `System alert`. `bow-ripple` (the default) and `glass-ping` ship with
+  Cyclops, which `cyclops start` and bare `cyclops` seed there like the
+  themes; drop your own `.wav` or `.aiff` beside them and it is listed
+  next time the card opens. The
+  switch and the list each have their own `✓`, and each follows the
+  cursor within its group; landing on a sound plays it, and a click on
+  a sound plays it again. `Enter` saves both checks at once, the switch
+  as `sound_notifs` and the sound as `[workspace] sound` (`"bow-ripple"`
+  by default, `"system"` for the system alert); `Esc` saves neither.
+  Files play through `afplay` on macOS and the first of `paplay`,
+  `aplay`, `ffplay` on Linux. `System alert` is the alert sound your
+  system plays, at its alert volume: on macOS the one chosen in System
+  Settings → Sound (via `osascript -e beep`), on Linux the freedesktop
+  sound theme's bell. It is also what plays when the chosen file is
+  missing or there is no player for it; only a system with no alert
+  sound at all falls back to the terminal bell, which many terminals
+  ship with the sound turned off.
+
+- **Keybinds** is the keybinding reference: every active binding, chord
+  and action, generated from the bindings actually in force rather than
+  from documentation, so a rebinding in `config.toml` is what it shows.
+  It reads only; the list scrolls (`↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End`,
+  or the wheel, three rows a notch), and the count at the bottom right
+  says which rows are showing. `Enter` and `Esc` both close it; there is
+  nothing on it to apply. `Ctrl+B` `?` opens the card on this section
+  directly.
+
+`show_settings` is the binding name; `show_themes`, from when the card
+was only a theme picker, still works in an existing config.
+`show_keybinds` (`Ctrl+B` `?` by default) opens the same card on its
+Keybinds section.
+
 ## Motion
 
 Four things fade rather than snap: a pane border taking or losing focus,
@@ -289,10 +348,13 @@ keyboard-first, mouse-clickable action model. Destructive confirmations use
 the same rule: Enter or click `↵ Confirm` to proceed, Escape or click
 `Esc Cancel` to back out.
 
-Every dialog can be moved. Press its top border or title row and drag: the
-card follows the pointer and stops at the screen edge, so its action row
-stays reachable. The position lasts as long as that dialog does; the next
-one opens centered.
+Every dialog can be moved. Its top border names the card at the left
+(`╭─ Settings ─`, on the list dialogs) and carries a `[⠿]` grip at the
+right, the same handle a pane frame wears. Press the border or the row
+under it and drag: the card follows the pointer and stops at the screen
+edge, so its action row stays reachable. The header does not light under
+the pointer; the grip says it drags. The position lasts as long as that
+dialog does; the next one opens centered.
 
 `Ctrl+B` `s`, or the `@` button in the sidebar's footer, opens the
 composer. The whole grammar is `@name` and then the message, taken
@@ -319,9 +381,8 @@ right-click, not a list position and not whichever item later becomes
 active. Menus highlight the row under the pointer. The `☰ menu` button at
 the sidebar's bottom opens the application menu. The matching `+` at the
 bottom-right creates a workspace from the focused pane's folder. The
-application menu's Keybinds item opens a padded, scrollable list generated
-from the bindings that are actually active; use arrow keys, Page Up/Down,
-Home/End, or the mouse wheel.
+keybinding reference is the settings card's Keybinds section (see
+[Settings](#settings)).
 
 Wheel over a pane scrolls its history; new output never pulls a scrolled
 viewport back to the tail. Drag a gutter to resize, drag a tab onto another
@@ -383,6 +444,8 @@ files_rows = 8
 sidebar_tab = "sessions"
 tab_bar_visible = true
 motion = true
+sound_notifs = false
+sound = "bow-ripple"
 workspace_order = ["main", "website"]
 agent_order = ["name:implementer", "name:reviewer"]
 folder_tracked = []
@@ -393,6 +456,10 @@ toggle_sidebar = "prefix b"
 toggle_tab_bar = "prefix t"
 show_keybinds = "prefix ?"
 ```
+
+A chord belongs to one action: a rebinding that reuses a default's chord
+takes it, and the default is left unbound (`show_settings = "prefix g"`
+would open Settings and leave the file panel's `g` unbound).
 
 More: [workspaces.md](workspaces.md) for presets and save/restore;
 [ui.md](ui.md) for the stream TUI.
