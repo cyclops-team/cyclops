@@ -5,20 +5,20 @@
 	// rows are the argument, so the before and after of one row must be
 	// about the same thing.
 	const rows = [
+		{ before: 'Copy-paste to hand context between agents', after: 'An agent hands off with one command' },
 		{ before: 'A separate terminal window per agent', after: "Every agent's pane in one workspace" },
-		{ before: 'Copy-paste to hand context between them', after: 'An agent hands off with one command' },
 		{ before: 'No way for agents to reach each other', after: 'Agent-to-agent messages, with receipts' },
 		{ before: 'Panes with no name and no state', after: 'Named panes that show their state' }
 	];
 </script>
 
 <section class="section">
-	<SectionHead title="THE PROBLEM" index="Why Cyclops" />
+	<SectionHead title="THE PROBLEM" index="Motivation" />
 	<h3 class="statement">Your agents are powerful.<br />Their teamwork is manual.</h3>
 	<p class="lede">
-		Developers use different coding agents for different jobs, but coordinating them still means
-		manually passing context, assigning work, and tracking progress. Cyclops gives them a shared
-		coordination layer.
+		Most people already run more than one coding agent, each in its own window. Getting them to
+		work together means copying context between windows, handing out the work yourself, and
+		watching every pane. Cyclops puts them in one workspace where they can talk to each other.
 	</p>
 	<div class="panel compare" role="table" aria-label="Before and with Cyclops, row by row">
 		<div class="row head" role="row">
