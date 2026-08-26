@@ -61,6 +61,7 @@ fn row(
         seq: 1,
         updated_at: 1000,
         direction,
+        ..Default::default()
     }
 }
 

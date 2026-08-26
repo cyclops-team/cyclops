@@ -445,6 +445,7 @@ pub fn paint_messages(
     detail: Option<&cyclops_ui::Detail>,
     composer: Option<&cyclops_ui::ComposerState>,
     avatar_registry: &cyclops_ui::AvatarRegistry,
+    pane_manifests: Option<&HashMap<String, String>>,
     status: Option<&str>,
     area: Rect,
     buf: &mut Buffer,
@@ -478,17 +479,22 @@ pub fn paint_messages(
     if content_w == 0 || content_h == 0 {
         return;
     }
-    let rows = match detail {
-        Some(d) => cyclops_ui::detail::render_with_status(d, content_w, content_h, status),
-        None => cyclops_ui::render_chat(
-            queue,
-            composer,
-            avatar_registry,
-            content_w,
-            content_h,
-            status,
-        ),
-    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64);
+
+    let rows = cyclops_ui::render_chat(
+        queue,
+        detail,
+        composer,
+        avatar_registry,
+        pane_manifests,
+        content_w,
+        content_h,
+        status,
+        now_ms,
+    );
     let content_rect = Rect::new(
         area.x + 1,
         area.y,

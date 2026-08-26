@@ -3276,6 +3276,17 @@ async fn handle_messages_key(
                 return Ok(Some(InputOutcome::Redraw));
             }
             KeyCode::Enter => {
+                // If the composer is in an Uncertain stage, send write may have already
+                // completed at the daemon. Require explicit reconciliation before retry.
+                if matches!(
+                    app.messages_composer.stage,
+                    Some(cyclops_ui::Stage::Uncertain { .. })
+                ) {
+                    app.notice
+                        .show("Reconciliation required: send outcome unconfirmed by daemon");
+                    return Ok(Some(InputOutcome::Redraw));
+                }
+
                 let text = app.messages_composer.text().to_string();
                 if text.trim().is_empty() {
                     return Ok(Some(InputOutcome::NoRedraw));
@@ -3287,26 +3298,27 @@ async fn handle_messages_key(
                 let (to, fyi, reply_to, subject) = match mode {
                     Some(cyclops_ui::ComposerMode::Reply {
                         ref message_id,
-                        ref reply_to_label,
+                        ref origin_label,
                         ..
                     }) => (
-                        vec![reply_to_label.clone()],
+                        vec![origin_label.clone()],
                         false,
-                        Some(message_id.clone()),
+                        Some(message_id.to_string()),
                         format!("Re: {message_id}"),
                     ),
-                    Some(cyclops_ui::ComposerMode::Announce {
-                        ref recipients_preview,
-                    }) => {
-                        let to = if recipients_preview.is_empty() {
+                    Some(cyclops_ui::ComposerMode::Announce { ref recipients }) => {
+                        let to: Vec<String> = if recipients.is_empty() {
                             vec!["*".to_string()]
                         } else {
-                            recipients_preview.clone()
+                            recipients.iter().map(|(_, l)| l.clone()).collect()
                         };
                         (to, true, None, "Announcement".to_string())
                     }
-                    Some(cyclops_ui::ComposerMode::Direct { ref recipient }) => (
-                        vec![recipient.clone()],
+                    Some(cyclops_ui::ComposerMode::Direct {
+                        ref recipient_label,
+                        ..
+                    }) => (
+                        vec![recipient_label.clone()],
                         false,
                         None,
                         "Direct Message".to_string(),
@@ -3332,11 +3344,11 @@ async fn handle_messages_key(
                         app.notice.show(msg);
                     }
                     crate::daemon::SendOutcome::Rejected(why) => {
-                        // Draft preserved on failure so operator can retry
+                        // Draft preserved on refusal so operator can retry
                         app.messages_composer.record_not_sent(why);
                     }
                     crate::daemon::SendOutcome::Unknown(why) => {
-                        // Draft preserved on uncertain outcome
+                        // Draft preserved on uncertain outcome; requires reconciliation
                         app.messages_composer.record_uncertain(why);
                     }
                 }
@@ -3352,24 +3364,39 @@ async fn handle_messages_key(
             KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(row) = app.messages_queue.selected() {
                     app.messages_composer = cyclops_ui::ComposerState::new_reply(
-                        row.message_id.to_string(),
-                        row.recipient_label.clone(),
-                        Some(row.recipient),
+                        row.message_id.clone(),
+                        row.sender,
+                        row.sender_label.clone(),
                         row.subject.clone(),
                     );
                     return Ok(Some(InputOutcome::Redraw));
                 }
             }
             KeyCode::Char('a') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let mut recipients: Vec<String> = app
+                let dummy_endpoint = cyclops_proto::RecipientKey::parse(
+                    "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+                )
+                .unwrap();
+                let recipients: Vec<(cyclops_proto::RecipientKey, String)> = app
                     .decoration
                     .panes
-                    .values()
-                    .filter_map(|p| p.label.clone())
+                    .iter()
+                    .map(|(pane_id, p)| {
+                        (
+                            dummy_endpoint,
+                            p.label.clone().unwrap_or_else(|| pane_id.clone()),
+                        )
+                    })
                     .collect();
-                if recipients.is_empty() {
-                    recipients = vec!["claude".into(), "codex".into(), "agy".into()];
-                }
+                let recipients = if recipients.is_empty() {
+                    vec![
+                        (dummy_endpoint, "claude".into()),
+                        (dummy_endpoint, "codex".into()),
+                        (dummy_endpoint, "agy".into()),
+                    ]
+                } else {
+                    recipients
+                };
                 app.messages_composer = cyclops_ui::ComposerState::new_announce(recipients);
                 return Ok(Some(InputOutcome::Redraw));
             }
@@ -4348,11 +4375,18 @@ fn draw(
                 );
             }
             if let Some(messages) = areas.messages {
+                let pane_manifests: std::collections::HashMap<String, String> = app
+                    .decoration
+                    .panes
+                    .iter()
+                    .filter_map(|(id, p)| p.manifest.as_ref().map(|m| (id.clone(), m.clone())))
+                    .collect();
                 paint_messages(
                     &app.messages_queue,
                     app.messages_detail.as_ref(),
                     Some(&app.messages_composer),
                     &app.avatar_registry,
+                    Some(&pane_manifests),
                     app.notice.text(),
                     messages,
                     f.buffer_mut(),
