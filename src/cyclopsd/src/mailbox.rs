@@ -15640,7 +15640,7 @@ mod tests {
                 current_attempt,
                 NotificationState::AttentionRequired,
                 None,
-                Some(NotificationAttentionCause::VerifyFailed),
+                Some(NotificationAttentionCause::SubmitFailed),
             )
             .unwrap();
         store

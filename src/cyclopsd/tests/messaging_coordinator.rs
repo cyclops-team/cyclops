@@ -170,12 +170,13 @@ fn assert_only_oldest_attempt_exists(rig: &Rig, pair: &WaitingPair) {
 }
 
 async fn wait_for_doorbell(rig: &Rig, pane: &str, message_id: &str) -> String {
-    let expected = compact_doorbell(message_id);
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let screen = rig.tmux.capture(pane);
-        if screen.contains(&expected) {
-            return screen;
+        if let Some(expected) = current_compact_doorbell(rig, message_id) {
+            if screen.contains(&expected) {
+                return screen;
+            }
         }
         assert!(
             Instant::now() < deadline,
@@ -185,8 +186,20 @@ async fn wait_for_doorbell(rig: &Rig, pane: &str, message_id: &str) -> String {
     }
 }
 
-fn compact_doorbell(message_id: &str) -> String {
-    cyclops_proto::render_doorbell_v1(&MessageId::new(message_id).unwrap())
+fn current_compact_doorbell(rig: &Rig, message_id: &str) -> Option<String> {
+    workspace_lines(rig).into_iter().rev().find_map(|line| {
+        let data = line.data?;
+        if line.id != message_id || data["type"] != "notification_transition" {
+            return None;
+        }
+        let attempt_id = NotificationAttemptId::parse(data["attempt_id"].as_str()?).ok()?;
+        Some(cyclops_proto::render_doorbell_v3(attempt_id))
+    })
+}
+
+fn compact_doorbell(rig: &Rig, message_id: &str) -> String {
+    current_compact_doorbell(rig, message_id)
+        .unwrap_or_else(|| panic!("message {message_id} has no notification attempt"))
 }
 
 fn legacy_doorbell(message_id: &str) -> String {
@@ -331,9 +344,7 @@ async fn private_body_shapes_never_reach_the_notification_pane() {
         );
     }
     assert!(
-        screen.contains(&cyclops_proto::render_doorbell_v1(
-            &cyclops_proto::MessageId::new(&message_id).unwrap()
-        )),
+        screen.contains(&compact_doorbell(&rig, &message_id)),
         "the fixed notification row was not staged: {screen}"
     );
 
@@ -526,7 +537,7 @@ async fn a_hook_start_after_submit_reservation_withholds_enter() {
     assert!(
         rig.tmux
             .capture(&pane)
-            .contains(&compact_doorbell(&message_id)),
+            .contains(&compact_doorbell(&rig, &message_id)),
         "the withheld doorbell should remain available for reconciliation"
     );
 
@@ -758,7 +769,10 @@ async fn changed_chrome_does_not_receipt_a_swallowed_compact_doorbell() {
         0
     );
     let screen = rig.tmux.capture(&pane);
-    assert!(screen.contains(&compact_doorbell(&message_id)), "{screen}");
+    assert!(
+        screen.contains(&compact_doorbell(&rig, &message_id)),
+        "{screen}"
+    );
     assert!(screen.contains("Ctx: 77%"), "{screen}");
 
     rig.daemon.shutdown().await;
@@ -1198,7 +1212,7 @@ async fn recipient_without_exact_mailbox_evidence_gets_direct_delivery_without_a
     assert!(screen.contains("first body"));
     assert!(screen.contains("second body"));
     for message_id in [&pair.first, &pair.second] {
-        assert!(!screen.contains(&compact_doorbell(message_id)));
+        assert!(!screen.contains(&compact_doorbell(&rig, message_id)));
         assert!(!screen.contains(&legacy_doorbell(message_id)));
     }
 
@@ -1294,7 +1308,7 @@ async fn mailbox_evidence_drift_before_the_write_falls_back_without_a_doorbell()
     }));
     let screen = pane_history(&rig, &pane);
     assert!(screen.contains("direct body after capability drift"));
-    assert!(!screen.contains(&compact_doorbell(&message_id)));
+    assert!(!screen.contains(&compact_doorbell(&rig, &message_id)));
     assert!(!screen.contains(&legacy_doorbell(&message_id)));
 
     rig.daemon.shutdown().await;
@@ -1326,9 +1340,7 @@ async fn a_human_draft_holds_one_notification_attempt_until_its_turn_finishes() 
         .await;
     let held_screen = rig.tmux.capture(&pane);
     assert!(held_screen.contains("human draft stays private"));
-    assert!(!held_screen.contains(&cyclops_proto::render_doorbell_v1(
-        &cyclops_proto::MessageId::new(&pair.first).unwrap()
-    )));
+    assert!(!held_screen.contains(&compact_doorbell(&rig, &pair.first)));
     assert_only_oldest_attempt_exists(&rig, &pair);
     assert_eq!(
         notification_state_count(&rig, &pair.first, NotificationState::Staged),
@@ -1373,7 +1385,7 @@ async fn copy_mode_holds_one_notification_attempt_until_the_pane_is_write_ready(
         })
         .await;
     let held_screen = rig.tmux.capture(&pane);
-    assert!(!held_screen.contains(&compact_doorbell(&pair.first)));
+    assert!(!held_screen.contains(&compact_doorbell(&rig, &pair.first)));
     assert!(!held_screen.contains("first body"));
     assert_only_oldest_attempt_exists(&rig, &pair);
     assert_eq!(
@@ -1424,7 +1436,7 @@ async fn a_human_modal_holds_one_notification_attempt_until_the_prompt_is_cleare
         .await;
     let held_screen = rig.tmux.capture(&pane);
     assert!(held_screen.contains("FAKE-TRUST-PROMPT"));
-    assert!(!held_screen.contains(&compact_doorbell(&pair.first)));
+    assert!(!held_screen.contains(&compact_doorbell(&rig, &pair.first)));
     assert!(!held_screen.contains("first body"));
     assert_only_oldest_attempt_exists(&rig, &pair);
     assert_eq!(
@@ -1587,7 +1599,7 @@ async fn queued_notification_resumes_after_restart_without_a_second_attempt() {
     assert!(!rig
         .tmux
         .capture(&pane)
-        .contains(&compact_doorbell(&message_id)));
+        .contains(&compact_doorbell(&rig, &message_id)));
 
     let mut rig = rig.reboot().await;
     rig.wait_attached(1).await;
@@ -1949,7 +1961,7 @@ async fn codex_ghost_with_unprovable_binding_blocks_once_and_withdrawal_advances
     ] {
         assert_eq!(notification_state_count(&rig, &pair.first, state), 0);
     }
-    assert!(!pane_history(&rig, &pane).contains(&compact_doorbell(&pair.first)));
+    assert!(!pane_history(&rig, &pane).contains(&compact_doorbell(&rig, &pair.first)));
 
     let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
     let first_row = snapshot["result"]["rows"]
@@ -2018,7 +2030,7 @@ async fn codex_ghost_with_unprovable_binding_blocks_once_and_withdrawal_advances
         notification_state_count(&rig, &pair.first, NotificationState::Writing),
         0
     );
-    assert!(!pane_history(&rig, &pane).contains(&compact_doorbell(&pair.second)));
+    assert!(!pane_history(&rig, &pane).contains(&compact_doorbell(&rig, &pair.second)));
 
     let after = rig.ctl.request("messages.snapshot", json!({})).await;
     let first_after = after["result"]["rows"]
@@ -2075,7 +2087,7 @@ async fn a_manifest_without_composer_ownership_blocks_once_and_withdrawal_advanc
     ] {
         assert_eq!(notification_state_count(&rig, &pair.first, state), 0);
     }
-    assert!(!pane_history(&rig, &pane).contains(&compact_doorbell(&pair.first)));
+    assert!(!pane_history(&rig, &pane).contains(&compact_doorbell(&rig, &pair.first)));
 
     let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
     let first = snapshot["result"]["rows"]
@@ -2114,7 +2126,7 @@ async fn a_manifest_without_composer_ownership_blocks_once_and_withdrawal_advanc
     assert!(withdrawn["error"].is_null(), "{withdrawn}");
     wait_for_notification_state(&mut rig, &pair.second, NotificationState::BlockedPreWrite).await;
     assert_eq!(notification_attempts(&rig, &pair.second).len(), 1);
-    assert!(!pane_history(&rig, &pane).contains(&compact_doorbell(&pair.second)));
+    assert!(!pane_history(&rig, &pane).contains(&compact_doorbell(&rig, &pair.second)));
 
     rig.daemon.shutdown().await;
 }
@@ -2164,7 +2176,7 @@ async fn newly_proven_binding_reopens_the_same_blocked_attempt_once() {
         .into_iter()
         .next()
         .expect("blocked attempt");
-    assert!(!pane_history(&rig, &pane).contains(&compact_doorbell(&message_id)));
+    assert!(!pane_history(&rig, &pane).contains(&compact_doorbell(&rig, &message_id)));
 
     rig.tmux
         .run_ok(&["respawn-pane", "-k", "-t", &pane, &composer_pane()]);
@@ -2185,7 +2197,7 @@ async fn newly_proven_binding_reopens_the_same_blocked_attempt_once() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let screen = wait_for_doorbell(&rig, &pane, &message_id).await;
-    assert!(screen.contains(&compact_doorbell(&message_id)));
+    assert!(screen.contains(&compact_doorbell(&rig, &message_id)));
     wait_for_notification_state(&mut rig, &message_id, NotificationState::Writing).await;
     assert_eq!(
         notification_attempts(&rig, &message_id),

@@ -9560,7 +9560,7 @@ mod tests {
         )));
         std::fs::create_dir_all(&scratch.0).unwrap();
         let file = scratch.0.join("SKILL.md");
-        std::fs::write(&file, "current capability").unwrap();
+        std::fs::write(&file, mailbox_capability::SHIPPED_SKILL).unwrap();
         let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
         let session = SessionInstanceId::from_str("00000000-0000-4000-8000-000000000002").unwrap();
         let recipient =
@@ -9590,7 +9590,7 @@ mod tests {
             notification_prewrite_bookend(&selected, Some(recipient), &binding, narrow),
             Some(format!("pane_too_narrow:{narrow}"))
         );
-        std::fs::write(&file, "changed capability").unwrap();
+        std::fs::write(&file, "operator edit").unwrap();
         assert_eq!(
             notification_prewrite_bookend(&selected, Some(recipient), &binding, narrow),
             Some("capability_changed".to_string())
