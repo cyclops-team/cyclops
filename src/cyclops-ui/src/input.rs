@@ -501,9 +501,11 @@ mod stream_tests {
             out.extend(drain(&mut pending, &mut in_paste));
         }
         // Input stops here. A half-read sequence that is just an ESC
-        // becomes the escape key; an unterminated paste is thrown away.
+        // becomes the escape key. An unterminated paste is thrown away
+        // and reported through the same rejection event as the live reader.
         if in_paste {
             pending.clear();
+            out.push(Key::PasteRejected);
         } else if pending == [0x1b] {
             out.extend(decode(&pending));
             pending.clear();

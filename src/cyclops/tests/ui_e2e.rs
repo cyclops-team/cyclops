@@ -231,7 +231,7 @@ fn ui_plain_admin_stream_is_calm_and_ends_honestly() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
     assert_eq!(
         String::from_utf8_lossy(&out.stderr).trim(),
-        "cyclops ui is deprecated; use cyclops watch\nlost the connection to cyclops: the connection closed. Check that cyclopsd is still running, then retry."
+        "cyclops ui is deprecated; use cyclops watch\nlost the connection to cyclops: the connection closed; the live stream may have a gap. Check that cyclopsd is still running, then retry."
     );
     let _ = fs::remove_dir_all(&home);
 }
@@ -313,7 +313,7 @@ fn ui_daemon_down_reports_and_exits_one() {
     assert_eq!(
         String::from_utf8_lossy(&out.stderr).trim(),
         format!(
-            "cyclops ui is deprecated; use cyclops watch\n{}",
+            "cyclops ui is deprecated; use cyclops watch\nstartup status unavailable; state may be incomplete: No such file or directory (os error 2)\n{}",
             cyclops_proto::NOT_RUNNING
         )
     );
