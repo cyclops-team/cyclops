@@ -251,14 +251,6 @@ impl ChatAction {
 
 const ACTION_SEPARATOR: &str = " | ";
 
-/// Does this status line mean the drawer is showing stale or no state?
-///
-/// The retry verb appears only then, so an operator is never offered a
-/// recovery for a connection that is fine.
-pub fn refresh_failed(status: &str) -> bool {
-    status.contains("refresh failed") || status.contains("reconnecting")
-}
-
 /// The verbs the strip offers right now. `refresh_failed` adds the retry.
 pub fn chat_actions(refresh_failed: bool) -> Vec<ChatAction> {
     let mut actions = vec![
@@ -544,6 +536,10 @@ pub struct ChatRenderContext<'a> {
     pub live_routes: Option<&'a [cyclops_proto::StatusMailboxRoute]>,
     pub pane_manifests: Option<&'a HashMap<String, String>>,
     pub status: Option<&'a str>,
+    /// A failed one-shot snapshot can be retried through Ctrl+R. Passive
+    /// subscription reconnects stay status-only because they have no
+    /// operator-triggered action.
+    pub retry_available: bool,
     pub now_ms: Option<u64>,
 }
 
@@ -556,6 +552,7 @@ impl<'a> ChatRenderContext<'a> {
             live_routes: None,
             pane_manifests: None,
             status: None,
+            retry_available: false,
             now_ms: None,
         }
     }
@@ -572,6 +569,11 @@ impl<'a> ChatRenderContext<'a> {
 
     pub fn with_status(mut self, status: &'a str) -> Self {
         self.status = Some(status);
+        self
+    }
+
+    pub fn with_retry_available(mut self) -> Self {
+        self.retry_available = true;
         self
     }
 
@@ -595,6 +597,7 @@ pub fn render_chat(
         live_routes,
         pane_manifests,
         status,
+        retry_available,
         now_ms,
     } = context;
     if width == 0 || height == 0 {
@@ -926,11 +929,11 @@ pub fn render_chat(
             out.push(fit(help, width));
         } else {
             out.push(fit("── Messages Group Chat ──", width));
-            out.push(chat_action_strip(width, refresh_failed(status_hint)).0);
+            out.push(chat_action_strip(width, retry_available).0);
         }
     } else {
         out.push(fit("── Messages Group Chat ──", width));
-        out.push(chat_action_strip(width, refresh_failed(status_hint)).0);
+        out.push(chat_action_strip(width, retry_available).0);
     }
 
     out.truncate(height);
@@ -970,8 +973,8 @@ mod strip_tests {
         assert!(!row.contains("announce"), "{row:?}");
     }
 
-    /// Retry is offered only while the drawer says it is stale, so the
-    /// operator is never given a recovery for a healthy connection.
+    /// Retry is offered only when the caller owns a failed snapshot request,
+    /// not merely because a passive daemon reconnect is underway.
     #[test]
     fn retry_appears_only_while_a_refresh_has_failed() {
         let (healthy, _) = chat_action_strip(80, false);
@@ -979,9 +982,30 @@ mod strip_tests {
         let (failed, spans) = chat_action_strip(80, true);
         assert!(failed.starts_with(ChatAction::Retry.label()), "{failed:?}");
         assert_eq!(spans[0].0, ChatAction::Retry);
-        assert!(refresh_failed("refresh failed: cyclopsd is unavailable"));
-        assert!(refresh_failed("daemon reconnecting"));
-        assert!(!refresh_failed("3 pending"));
+
+        let registry = AvatarRegistry::default();
+        let queue = HumanQueue::new();
+        let reconnecting = render_chat(
+            &queue,
+            ChatRenderContext::new(&registry).with_status("daemon reconnecting"),
+            80,
+            10,
+        )
+        .join("\n");
+        assert!(
+            !reconnecting.contains(ChatAction::Retry.label()),
+            "a passive reconnect must not advertise an operator retry"
+        );
+        let failed = render_chat(
+            &queue,
+            ChatRenderContext::new(&registry)
+                .with_status("refresh failed: cyclopsd is unavailable")
+                .with_retry_available(),
+            80,
+            10,
+        )
+        .join("\n");
+        assert!(failed.contains(ChatAction::Retry.label()), "{failed}");
     }
 }
 

@@ -450,6 +450,7 @@ pub fn paint_messages(
     live_routes: Option<&[cyclops_proto::StatusMailboxRoute]>,
     pane_manifests: Option<&HashMap<String, String>>,
     status: Option<&str>,
+    retry_available: bool,
     area: Rect,
     buf: &mut Buffer,
     paint: &Paint,
@@ -496,6 +497,7 @@ pub fn paint_messages(
             live_routes,
             pane_manifests,
             status,
+            retry_available,
             now_ms,
         },
         content_w,
@@ -513,8 +515,7 @@ pub fn paint_messages(
     // one in `rows`. Matching on that text locates the strip without the
     // renderer having to report a row index that a later edit could leave
     // stale; a strip that did not fit produces no spans and no hits.
-    let (strip, spans) =
-        cyclops_ui::chat_action_strip(content_w, cyclops_ui::refresh_failed(status.unwrap_or("")));
+    let (strip, spans) = cyclops_ui::chat_action_strip(content_w, retry_available);
     let strip_row = rows
         .iter()
         .rposition(|row| row == &strip)
@@ -3425,8 +3426,8 @@ mod tests {
         let queue = cyclops_ui::HumanQueue::new();
         let registry = cyclops_ui::AvatarRegistry::default();
         paint_messages(
-            &queue, None, None, &registry, None, None, None, area, &mut buf, &paint, &mut hits,
-            None,
+            &queue, None, None, &registry, None, None, None, false, area, &mut buf, &paint,
+            &mut hits, None,
         );
 
         let content_w = (area.width - 1) as usize;
@@ -3495,6 +3496,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             area,
             &mut buf,
             &paint,

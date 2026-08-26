@@ -219,10 +219,7 @@ pub fn clamp_sidebar_width(requested: u16, terminal_width: u16) -> u16 {
 /// usable. The operator decides how wide the conversation is; this only
 /// keeps the canvas from disappearing behind it.
 pub fn clamp_messages_width(requested: u16, terminal_width: u16) -> u16 {
-    let max = terminal_width
-        .saturating_sub(MAIN_MIN_WIDTH)
-        .max(MESSAGES_MIN_WIDTH.min(terminal_width))
-        .max(1);
+    let max = terminal_width.saturating_sub(MAIN_MIN_WIDTH).max(1);
     let min = MESSAGES_MIN_WIDTH.min(max);
     requested.clamp(min, max)
 }
@@ -1031,6 +1028,19 @@ mod tests {
         // A drag from a column near the left edge of a wide terminal is
         // the same request expressed as a position.
         assert_eq!(messages_width_for_column(60, 200), 140);
+    }
+
+    #[test]
+    fn a_narrow_terminal_keeps_the_main_canvas_minimum() {
+        for terminal_width in 21..=33 {
+            let drawer = clamp_messages_width(u16::MAX, terminal_width);
+            assert_eq!(
+                terminal_width - drawer,
+                MAIN_MIN_WIDTH,
+                "terminal width {terminal_width} left only {} canvas columns",
+                terminal_width - drawer
+            );
+        }
     }
 
     #[test]

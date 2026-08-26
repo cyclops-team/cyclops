@@ -33,7 +33,7 @@ use crossterm::event::{
 use cyclops_tmux::{
     ControlClient, ControlConfig, InputCapacity, Notification, NotificationReceiver, TmuxError,
 };
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 use tokio::sync::{mpsc, oneshot};
@@ -2138,7 +2138,10 @@ fn subscribe_decoration_once(
     // connection: everything that changed while nothing was subscribed
     // produced no event, so without this a state flip during the outage
     // stays on screen as stale.
-    if control_tx.blocking_send(AppMsg::DaemonReconnected).is_err() {
+    // The prior connection reports its gap on this same FIFO before it
+    // releases the reconnect loop. Keeping the new acknowledgement here
+    // prevents a delayed old gap from invalidating this connection.
+    if stream_tx.blocking_send(AppMsg::DaemonReconnected).is_err() {
         return SubscribeEnd::SinkGone;
     }
 
@@ -5487,12 +5490,12 @@ async fn handle_dialog_key(
 /// reading. `observe` runs first and is the only place an animation starts;
 /// see `crate::animate` for why arming is a diff rather than a call at each
 /// site.
-fn draw(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+fn draw<B: Backend>(
+    terminal: &mut Terminal<B>,
     app: &mut App,
     motion: &mut Motion,
     now: Instant,
-) -> io::Result<()> {
+) -> Result<(), B::Error> {
     // The preference is read here rather than pushed from the exec arm
     // because the clock is a local of the loop, not a field of `App`. One
     // read per frame is cheap, it cannot desynchronise from what the menu
@@ -5583,6 +5586,7 @@ fn draw(
                     Some(&app.decoration.mailbox_routes),
                     Some(&pane_manifests),
                     link_status,
+                    app.messages_refresh_error.is_some(),
                     messages,
                     f.buffer_mut(),
                     &app.paint,
@@ -5660,7 +5664,6 @@ fn draw(
             if let Some(messages) = areas.messages {
                 if areas.canvas.width > 0 && areas.canvas.height > 0 {
                     let divider = Rect::new(messages.x, messages.y, 1, messages.height);
-                    app.hit_map.push(divider, HitTarget::MessagesDivider);
                     paint_messages_resize_feedback(
                         f.buffer_mut(),
                         divider,
@@ -6284,7 +6287,7 @@ mod tests {
     async fn clicking_the_messages_chevron_collapses_the_drawer() {
         use cyclops_testrig::{tmux_available, TmuxServer};
         use cyclops_tmux::{ControlClient, ControlConfig};
-        use ratatui::{buffer::Buffer, layout::Rect};
+        use ratatui::backend::TestBackend;
 
         if !tmux_available() {
             return;
@@ -6310,22 +6313,11 @@ mod tests {
         model.messages_visible = true;
         let mut app = test_app(model, home.clone());
         app.prefs.messages_visible = true;
-        let area = Rect::new(50, 0, 30, 24);
-        let mut buffer = Buffer::empty(area);
-        paint_messages(
-            &app.messages_queue,
-            None,
-            None,
-            &app.avatar_registry,
-            None,
-            None,
-            None,
-            area,
-            &mut buffer,
-            &app.paint,
-            &mut app.hit_map,
-            None,
-        );
+        app.term_size = (80, 24);
+        app.window_focused = false;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        let mut motion = Motion::new(false);
+        draw(&mut terminal, &mut app, &mut motion, Instant::now()).expect("full frame");
         let (column, row) = (0..80u16)
             .flat_map(|column| (0..24u16).map(move |row| (column, row)))
             .find(|&(column, row)| {
@@ -7307,7 +7299,7 @@ mod tests {
         std::fs::create_dir_all(&home).expect("scratch home");
 
         let (control_tx, mut control_rx) = mpsc::channel(INGRESS_CAPACITY);
-        let (stream_tx, _stream_rx) = mpsc::channel(INGRESS_CAPACITY);
+        let (stream_tx, mut stream_rx) = mpsc::channel(INGRESS_CAPACITY);
         let home_bg = home.clone();
         // Millisecond backoff so the whole lifecycle runs in test time;
         // production wires resilience::reconnect_delay.
@@ -7322,7 +7314,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(40));
         let daemon = FakeDaemon::spawn(&home);
         wait_for_msg(
-            &mut control_rx,
+            &mut stream_rx,
             "the resync ask after the boot race",
             |msg| matches!(msg, AppMsg::DaemonReconnected),
         );
@@ -7331,7 +7323,10 @@ mod tests {
         // ended here, permanently.
         drop(daemon);
         let daemon = FakeDaemon::spawn(&home);
-        wait_for_msg(&mut control_rx, "the resync ask after the restart", |msg| {
+        wait_for_msg(&mut stream_rx, "the gap before the restart", |msg| {
+            matches!(msg, AppMsg::StreamGap { .. })
+        });
+        wait_for_msg(&mut stream_rx, "the resync ask after the restart", |msg| {
             matches!(msg, AppMsg::DaemonReconnected)
         });
 
@@ -7377,7 +7372,7 @@ mod tests {
         std::fs::create_dir_all(&home).expect("scratch home");
 
         let (control_tx, mut control_rx) = mpsc::channel(INGRESS_CAPACITY);
-        let (stream_tx, _stream_rx) = mpsc::channel(INGRESS_CAPACITY);
+        let (stream_tx, mut stream_rx) = mpsc::channel(INGRESS_CAPACITY);
         let home_bg = home.clone();
         std::thread::spawn(move || {
             run_decoration_forwarder(&home_bg, &control_tx, &stream_tx, |_| {
@@ -7419,7 +7414,7 @@ mod tests {
 
         // The chain never gave up: a daemon that appears now is found.
         let daemon = FakeDaemon::spawn(&home);
-        wait_for_msg(&mut control_rx, "the resync ask after recovery", |msg| {
+        wait_for_msg(&mut stream_rx, "the resync ask after recovery", |msg| {
             matches!(msg, AppMsg::DaemonReconnected)
         });
 
