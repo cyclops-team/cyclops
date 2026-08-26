@@ -26,7 +26,7 @@
 //! ping, and the two deadlines a caller asked for (`receipt_block_ms`,
 //! and `timeout_ms` on a wait). Nothing runs on an interval.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -1760,6 +1760,50 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
         body: String,
         fyi: bool,
     }
+    struct Chain {
+        state: DeliveryState,
+        attempts: u32,
+        owner: usize,
+        owners: BTreeSet<usize>,
+        rank: (u64, u64, u64, u64),
+    }
+    fn consider(
+        chains: &mut HashMap<(String, String), Chain>,
+        key: (String, String),
+        state: DeliveryState,
+        attempts: u32,
+        owner: usize,
+        rank: (u64, u64, u64, u64),
+    ) {
+        match chains.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Chain {
+                    state,
+                    attempts,
+                    owner,
+                    owners: BTreeSet::from([owner]),
+                    rank,
+                });
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let current = entry.get_mut();
+                current.owners.insert(owner);
+                // A terminal fact in the configured root closes unresolved
+                // history in a linked journal. Otherwise transition time is
+                // authoritative; the remaining fields make ties stable.
+                let terminal_wins = receipt_resolved(state) && !receipt_resolved(current.state);
+                let same_class_is_newer = receipt_resolved(state)
+                    == receipt_resolved(current.state)
+                    && rank > current.rank;
+                if terminal_wins || same_class_is_newer {
+                    current.state = state;
+                    current.attempts = attempts;
+                    current.owner = owner;
+                    current.rank = rank;
+                }
+            }
+        }
+    }
     let workspace_ids = match &inner.mailbox {
         Some(service) => match service.workspace_message_ids() {
             Ok(ids) => ids,
@@ -1778,22 +1822,28 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
     // The same closures as identities, so the one ping can name them and
     // a reader can hold it to the register (cyclops-ui `App::admits`).
     let mut named: Vec<DeliveryRef> = Vec::new();
+    // Families are descendants-first and configured-root-last. Fold all of
+    // them before acting so one (message, recipient) can mint at most one
+    // recovery handle during this boot.
+    let mut chains: HashMap<(String, String), Chain> = HashMap::new();
+    let mut envelopes: HashMap<(String, usize), Envelope> = HashMap::new();
+    let mut scan_order = 0_u64;
     for (idx, lines) in replayed {
-        // (msg id, recipient) -> (latest state, attempts).
-        let mut chains: HashMap<(String, String), (DeliveryState, u32)> = HashMap::new();
-        let mut envelopes: HashMap<String, Envelope> = HashMap::new();
         for line in lines {
+            scan_order = scan_order.saturating_add(1);
             if !legacy_recovery_owns(&line.id, &workspace_ids) {
                 continue;
             }
             match line.kind {
                 Kind::Msg | Kind::Fyi => {
-                    envelopes.entry(line.id.clone()).or_insert(Envelope {
-                        from: line.from.clone(),
-                        subject: line.subject.clone().unwrap_or_default(),
-                        body: line.body.clone().unwrap_or_default(),
-                        fyi: matches!(line.kind, Kind::Fyi),
-                    });
+                    envelopes
+                        .entry((line.id.clone(), *idx))
+                        .or_insert(Envelope {
+                            from: line.from.clone(),
+                            subject: line.subject.clone().unwrap_or_default(),
+                            body: line.body.clone().unwrap_or_default(),
+                            fyi: matches!(line.kind, Kind::Fyi),
+                        });
                     // `hosted` names the recipients whose chains live in
                     // this file. Ledgers from before the field existed were
                     // single-file: a msg line with no hosted list hosts
@@ -1808,9 +1858,14 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
                     for d in &line.deliveries {
                         let is_hosted = hosted.as_ref().is_none_or(|h| h.contains(d.to.as_str()));
                         if is_hosted {
-                            chains
-                                .entry((line.id.clone(), d.to.clone()))
-                                .or_insert((d.state, d.attempts));
+                            consider(
+                                &mut chains,
+                                (line.id.clone(), d.to.clone()),
+                                d.state,
+                                d.attempts,
+                                *idx,
+                                (d.ts, line.ts, line.seq, scan_order),
+                            );
                         }
                     }
                 }
@@ -1822,105 +1877,134 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
                     ) else {
                         continue; // fused-state line, not a delivery line
                     };
-                    let attempts = line.deliveries.first().map(|d| d.attempts).unwrap_or(0);
-                    chains.insert((line.id.clone(), to.to_string()), (state, attempts));
+                    let record = line.deliveries.first();
+                    consider(
+                        &mut chains,
+                        (line.id.clone(), to.to_string()),
+                        state,
+                        record.map(|delivery| delivery.attempts).unwrap_or(0),
+                        *idx,
+                        (
+                            record.map(|delivery| delivery.ts).unwrap_or(line.ts),
+                            line.ts,
+                            line.seq,
+                            scan_order,
+                        ),
+                    );
                 }
                 _ => {}
             }
         }
-        let mut dangling: Vec<((String, String), (DeliveryState, u32))> = chains
-            .into_iter()
-            .filter(|(_, (state, _))| !receipt_resolved(*state))
-            .collect();
-        dangling.sort_by(|a, b| a.0.cmp(&b.0));
-        for ((id, to), (state, attempts)) in dangling {
-            if receipt_is_queued(state) {
-                let target = envelopes.get(&id).zip(requeue_target(inner, &to, *idx));
-                if let Some((env, (sess_idx, pane_id))) = target {
-                    let payload = render_payload(&id, &env.from, &env.subject, &env.body, env.fyi);
-                    // Gating cannot survive the run that was doing the
-                    // gating; the recorded step back is retry_queued, the
-                    // pre-paste retry state. Queued and retry_queued are
-                    // already accurate and re-enter silently.
-                    let requeue_state = if state == DeliveryState::Gating {
-                        let record = Delivery {
-                            to: to.clone(),
-                            state: DeliveryState::RetryQueued,
-                            verified_by: None,
-                            attempts,
-                            ts: unix_ms(),
-                            cause: Some("daemon_restart".to_string()),
-                        };
-                        emit_delivery_state(
-                            inner,
-                            &[*idx],
-                            &id,
-                            &to,
-                            inner.recipient_key(sess_idx, &pane_id),
-                            state,
-                            DeliveryState::RetryQueued,
-                            Some("daemon_restart"),
-                            None,
-                            &record,
-                        );
-                        DeliveryState::RetryQueued
-                    } else {
-                        state
+    }
+    let mut dangling: Vec<_> = chains
+        .into_iter()
+        .filter(|(_, chain)| !receipt_resolved(chain.state))
+        .collect();
+    dangling.sort_by(|a, b| a.0.cmp(&b.0));
+    for ((id, to), chain) in dangling {
+        if chain.owners.len() != 1 {
+            error!(
+                message_id = id,
+                recipient = to,
+                owners = ?chain.owners,
+                "legacy restart chain has more than one configured owner; leaving it untouched"
+            );
+            continue;
+        }
+        let Chain {
+            state,
+            attempts,
+            owner: idx,
+            ..
+        } = chain;
+        if receipt_is_queued(state) {
+            let target = envelopes
+                .get(&(id.clone(), idx))
+                .zip(requeue_target(inner, &to, idx));
+            if let Some((env, (sess_idx, pane_id))) = target {
+                let payload = render_payload(&id, &env.from, &env.subject, &env.body, env.fyi);
+                // Gating cannot survive the run that was doing the
+                // gating; the recorded step back is retry_queued, the
+                // pre-paste retry state. Queued and retry_queued are
+                // already accurate and re-enter silently.
+                let requeue_state = if state == DeliveryState::Gating {
+                    let record = Delivery {
+                        to: to.clone(),
+                        state: DeliveryState::RetryQueued,
+                        verified_by: None,
+                        attempts,
+                        ts: unix_ms(),
+                        cause: Some("daemon_restart".to_string()),
                     };
-                    let handle = DeliveryHandle::with_ledger_sessions(
+                    emit_delivery_state(
+                        inner,
+                        &[idx],
                         &id,
                         &to,
-                        &pane_id,
-                        sess_idx,
-                        vec![*idx],
-                        payload,
+                        inner.recipient_key(sess_idx, &pane_id),
+                        state,
+                        DeliveryState::RetryQueued,
+                        Some("daemon_restart"),
+                        None,
+                        &record,
                     );
-                    {
-                        let mut st = handle.state.lock().expect("handle state lock");
-                        st.state = requeue_state;
-                        st.attempts = attempts;
-                    }
-                    inner.engine.track(&handle);
-                    let Some(worker) = worker_for(inner, sess_idx, &pane_id) else {
-                        continue;
-                    };
-                    worker.enqueue_back(handle);
-                    worker.notify.notify_one();
-                    requeued.push(format!("{id} -> {to}"));
-                    continue;
+                    DeliveryState::RetryQueued
+                } else {
+                    state
+                };
+                let handle = DeliveryHandle::with_ledger_sessions(
+                    &id,
+                    &to,
+                    &pane_id,
+                    sess_idx,
+                    vec![idx],
+                    payload,
+                );
+                {
+                    let mut st = handle.state.lock().expect("handle state lock");
+                    st.state = requeue_state;
+                    st.attempts = attempts;
                 }
-                // No pane to requeue into: close below, like any other
-                // chain the restart cannot carry forward.
+                inner.engine.track(&handle);
+                let Some(worker) = worker_for(inner, sess_idx, &pane_id) else {
+                    continue;
+                };
+                worker.enqueue_back(handle);
+                worker.notify.notify_one();
+                requeued.push(format!("{id} -> {to}"));
+                continue;
             }
-            // A post-write delivery cannot be requeued after restart. Its
-            // mutable recipient label does not prove which pane may still
-            // hold the payload, so the ambiguous outcome closes below.
-            let record = Delivery {
-                to: to.clone(),
-                state: DeliveryState::AttentionRequired,
-                verified_by: None,
-                attempts,
-                ts: unix_ms(),
-                cause: Some("daemon_restart".to_string()),
-            };
-            emit_delivery_state(
-                inner,
-                &[*idx],
-                &id,
-                &to,
-                None,
-                state,
-                DeliveryState::AttentionRequired,
-                Some("daemon_restart"),
-                None,
-                &record,
-            );
-            closed.push(format!("{id} -> {to}"));
-            named.push(DeliveryRef {
-                to: to.clone(),
-                msg_id: id.clone(),
-            });
+            // No pane to requeue into: close below, like any other
+            // chain the restart cannot carry forward.
         }
+        // A post-write delivery cannot be requeued after restart. Its
+        // mutable recipient label does not prove which pane may still
+        // hold the payload, so the ambiguous outcome closes below.
+        let record = Delivery {
+            to: to.clone(),
+            state: DeliveryState::AttentionRequired,
+            verified_by: None,
+            attempts,
+            ts: unix_ms(),
+            cause: Some("daemon_restart".to_string()),
+        };
+        emit_delivery_state(
+            inner,
+            &[idx],
+            &id,
+            &to,
+            None,
+            state,
+            DeliveryState::AttentionRequired,
+            Some("daemon_restart"),
+            None,
+            &record,
+        );
+        closed.push(format!("{id} -> {to}"));
+        named.push(DeliveryRef {
+            to: to.clone(),
+            msg_id: id.clone(),
+        });
     }
     if !requeued.is_empty() {
         requeued.sort();

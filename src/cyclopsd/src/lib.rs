@@ -2503,16 +2503,14 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         }
         sessions.push(Arc::new(SessionSlot::new(name.clone(), Arc::new(ledger))));
     }
-    let replayed: Vec<(usize, Vec<LedgerLine>)> =
-        history::session_journal_family(&state_root, replay_roots)
-            .into_iter()
-            .map(|(idx, _, lines)| {
-                // This is the first Engine use after construction, so every
-                // historical id is reserved before any request can mint one.
-                engine.preload_ids(&lines);
-                (idx, lines)
-            })
-            .collect();
+    let replay = history::session_journal_replay(&state_root, replay_roots);
+    // This is the first Engine use after construction, so every historical
+    // id is reserved before any request can mint one. Files stay separate for
+    // history; restart recovery receives one descendant-first stream per root.
+    for (_, lines) in &replay.files {
+        engine.preload_ids(lines);
+    }
+    let replayed = replay.recovery;
     // Adoptions from the previous run. Nothing is trusted onto a pane
     // yet; each session prunes its own entries against the live pane
     // table when it attaches (registry::restore_session).
@@ -4872,7 +4870,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn boot_preloads_and_settles_a_rename_linked_legacy_journal() {
+    async fn two_boots_settle_a_rename_linked_legacy_journal_once() {
         let home = cyclops_proto::scratch::scratch_dir(&format!(
             "cyc-linked-boot-replay-{}",
             uuid::Uuid::new_v4()
@@ -4886,6 +4884,24 @@ mod tests {
                 .unwrap();
 
         let legacy_id = "m-abcdef";
+        let assert_terminal_history =
+            |configured_lines: Vec<LedgerLine>, linked_lines: Vec<LedgerLine>| {
+                let history = history::merge_files(&[configured_lines, linked_lines], None);
+                let records = history
+                    .iter()
+                    .filter(|line| line.id == legacy_id)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    records.len(),
+                    1,
+                    "linked history must expose one message after recovery"
+                );
+                assert_eq!(
+                    records[0].deliveries[0].state,
+                    cyclops_proto::DeliveryState::AttentionRequired,
+                    "the terminal root fact must dominate the linked submitted copy"
+                );
+            };
         let mut message = daemon_line(Kind::Msg, legacy_id.into(), json!({"hosted": ["%0"]}));
         message.from = "admin".into();
         message.to = vec!["%0".into()];
@@ -4918,7 +4934,7 @@ mod tests {
 
         let mut cfg = Config::defaults(&home);
         cfg.sessions = vec!["research".into()];
-        let daemon = boot(cfg).await.unwrap();
+        let daemon = boot(cfg.clone()).await.unwrap();
         assert_eq!(
             daemon
                 .inner
@@ -4947,6 +4963,47 @@ mod tests {
             })
             .count();
         assert_eq!(settlements, 1, "linked in-flight chain must settle once");
+        let linked_lines = cyclops_ledger::read_after(
+            &daemon.inner.state_root,
+            Path::new("ledger/runtime.ndjson"),
+            0,
+        )
+        .unwrap();
+        assert_terminal_history(lines, linked_lines);
+
+        daemon.shutdown().await;
+        drop(daemon);
+
+        let daemon = boot(cfg).await.unwrap();
+        let configured_lines = daemon
+            .inner
+            .session(0)
+            .unwrap()
+            .ledger
+            .read_after(0)
+            .unwrap();
+        let settlements = configured_lines
+            .iter()
+            .filter(|line| {
+                line.id == legacy_id
+                    && line.kind == Kind::State
+                    && line.data.as_ref().is_some_and(|data| {
+                        data["to_state"] == "attention_required"
+                            && data["cause"] == "daemon_restart"
+                    })
+            })
+            .count();
+        assert_eq!(
+            settlements, 1,
+            "a linked chain already settled into its root must not settle again"
+        );
+        let linked_lines = cyclops_ledger::read_after(
+            &daemon.inner.state_root,
+            Path::new("ledger/runtime.ndjson"),
+            0,
+        )
+        .unwrap();
+        assert_terminal_history(configured_lines, linked_lines);
 
         daemon.shutdown().await;
         drop(daemon);

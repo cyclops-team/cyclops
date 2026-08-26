@@ -16,18 +16,18 @@
 //! machine, so no indexed reader was added to that crate; the additive
 //! index stays a measured-need option, not a speculative one.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use cyclops_proto::{
-    HistoryParams, HistoryResult, Kind, LedgerLine, MessageMetadata, OpenDelivery, RecipientKey,
-    ThreadResult, WireError,
+    Delivery, HistoryParams, HistoryResult, Kind, LedgerLine, MessageMetadata, OpenDelivery,
+    RecipientKey, ThreadResult, WireError,
 };
 use cyclops_state::StateRoot;
 use serde_json::Value;
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::identity;
 use crate::mailbox::MailboxIdentity;
@@ -342,7 +342,7 @@ fn history_sources(inner: &Inner) -> (Vec<Vec<LedgerLine>>, Vec<String>, Option<
             )
         })
         .collect();
-    for (_, journal, lines) in session_journal_family(&inner.state_root, roots) {
+    for (journal, lines) in session_journal_replay(&inner.state_root, roots).files {
         names.push(legacy_journal_source_for_file(&journal));
         files.push(lines);
     }
@@ -353,44 +353,142 @@ fn legacy_journal_source_for_file(file: &str) -> String {
     format!("session-journal:{file}")
 }
 
+pub(crate) struct SessionJournalReplay {
+    /// Globally unique files for id preload and the history read model.
+    pub(crate) files: Vec<(String, Vec<LedgerLine>)>,
+    /// One causally ordered stream per unambiguous configured root.
+    pub(crate) recovery: Vec<(usize, Vec<LedgerLine>)>,
+}
+
+struct SessionJournalNode {
+    journal: String,
+    lines: Vec<LedgerLine>,
+    links: Vec<String>,
+    owners: BTreeSet<usize>,
+}
+
 /// Root session journals plus every rename-linked journal they reach.
 ///
 /// History and boot recovery share this traversal so a linked compatibility
 /// chain cannot be visible to readers while remaining invisible to id preload
-/// or restart settlement. The root index follows every descendant: after a
-/// restart that configured slot is the only live place where recovery can
-/// append a terminal fact or requeue a raw pane recipient.
-pub(crate) fn session_journal_family(
+/// or restart settlement. History sees each file once. Recovery sees each
+/// unambiguous family descendants-first and its configured root last, so a
+/// terminal fact appended to the root on an earlier boot follows the linked
+/// message that fact closes.
+pub(crate) fn session_journal_replay(
     state_root: &StateRoot,
     roots: Vec<(usize, String, Vec<LedgerLine>)>,
-) -> Vec<(usize, String, Vec<LedgerLine>)> {
-    let mut seen = HashSet::new();
-    let mut pending = VecDeque::new();
+) -> SessionJournalReplay {
+    let mut nodes = Vec::<SessionJournalNode>::new();
+    let mut by_journal = HashMap::<String, usize>::new();
+    let mut root_nodes = Vec::new();
+    let mut pending = VecDeque::<(usize, usize)>::new();
     for (idx, journal, lines) in roots {
-        if seen.insert(journal.clone()) {
-            pending.push_back((idx, journal, lines));
+        let node_idx = match by_journal.get(&journal).copied() {
+            Some(node_idx) => node_idx,
+            None => {
+                let node_idx = nodes.len();
+                by_journal.insert(journal.clone(), node_idx);
+                nodes.push(SessionJournalNode {
+                    links: linked_session_journals(&lines),
+                    journal,
+                    lines,
+                    owners: BTreeSet::new(),
+                });
+                node_idx
+            }
+        };
+        root_nodes.push((idx, node_idx));
+        if nodes[node_idx].owners.insert(idx) {
+            pending.push_back((node_idx, idx));
         }
     }
 
-    let mut family = Vec::new();
-    while let Some((idx, journal, lines)) = pending.pop_front() {
-        for linked in linked_session_journals(&lines) {
-            if !seen.insert(linked.clone()) {
-                continue;
-            }
-            let descendant = PathBuf::from("ledger").join(&linked);
-            let linked_lines = match cyclops_ledger::read_after(state_root, &descendant, 0) {
-                Ok(lines) => lines,
-                Err(error) => {
-                    warn!(journal = linked, %error, "linked session journal is unreadable");
-                    Vec::new()
+    // The queue is one (journal, configured owner) pair. A cycle can revisit
+    // a file, but it cannot add the same owner twice, so traversal is bounded
+    // by files times configured roots.
+    while let Some((node_idx, owner)) = pending.pop_front() {
+        let links = nodes[node_idx].links.clone();
+        for linked in links {
+            let linked_idx = match by_journal.get(&linked).copied() {
+                Some(linked_idx) => linked_idx,
+                None => {
+                    let descendant = PathBuf::from("ledger").join(&linked);
+                    let lines = match cyclops_ledger::read_after(state_root, &descendant, 0) {
+                        Ok(lines) => lines,
+                        Err(read_error) => {
+                            warn!(journal = linked, error = %read_error, "linked session journal is unreadable");
+                            Vec::new()
+                        }
+                    };
+                    let linked_idx = nodes.len();
+                    by_journal.insert(linked.clone(), linked_idx);
+                    nodes.push(SessionJournalNode {
+                        links: linked_session_journals(&lines),
+                        journal: linked,
+                        lines,
+                        owners: BTreeSet::new(),
+                    });
+                    linked_idx
                 }
             };
-            pending.push_back((idx, linked, linked_lines));
+            if nodes[linked_idx].owners.insert(owner) {
+                pending.push_back((linked_idx, owner));
+            }
         }
-        family.push((idx, journal, lines));
     }
-    family
+
+    for node in &nodes {
+        if node.owners.len() > 1 {
+            error!(
+                journal = node.journal,
+                owners = ?node.owners,
+                "linked session journal has more than one configured owner; restart recovery will leave it untouched"
+            );
+        }
+    }
+
+    fn append_descendants_first(
+        node_idx: usize,
+        owner: usize,
+        nodes: &[SessionJournalNode],
+        by_journal: &HashMap<String, usize>,
+        visited: &mut HashSet<usize>,
+        lines: &mut Vec<LedgerLine>,
+    ) {
+        if !visited.insert(node_idx)
+            || nodes[node_idx].owners.len() != 1
+            || !nodes[node_idx].owners.contains(&owner)
+        {
+            return;
+        }
+        for linked in &nodes[node_idx].links {
+            if let Some(linked_idx) = by_journal.get(linked).copied() {
+                append_descendants_first(linked_idx, owner, nodes, by_journal, visited, lines);
+            }
+        }
+        lines.extend(nodes[node_idx].lines.iter().cloned());
+    }
+
+    let mut recovery = Vec::new();
+    for (owner, root_idx) in root_nodes {
+        let mut visited = HashSet::new();
+        let mut lines = Vec::new();
+        append_descendants_first(
+            root_idx,
+            owner,
+            &nodes,
+            &by_journal,
+            &mut visited,
+            &mut lines,
+        );
+        recovery.push((owner, lines));
+    }
+    let files = nodes
+        .into_iter()
+        .map(|node| (node.journal, node.lines))
+        .collect();
+    SessionJournalReplay { files, recovery }
 }
 
 fn linked_session_journals(lines: &[LedgerLine]) -> Vec<String> {
@@ -474,6 +572,9 @@ pub(crate) fn fold_messages(lines: &[LedgerLine]) -> Vec<LedgerLine> {
     msgs
 }
 
+type DeliveryKey = (String, String);
+type DeliveryRank = (u64, u64, u64, usize);
+
 /// Merge per-file folded messages into one stream. Compatibility copies
 /// merge only when no workspace record owns their id. Other copies dedupe
 /// by id, and each recipient keeps its newest delivery record. Output is
@@ -516,6 +617,49 @@ pub(crate) fn merge_files(
                     }
                 }
             }
+        }
+    }
+    // A rename-linked compatibility family can carry the Msg fact in the
+    // old runtime-named journal and its later recovery State fact in the
+    // configured root. `fold_messages` deliberately folds one file, so apply
+    // the newest explicit transition across files after the message copies
+    // have merged. Workspace-owned ids still accept facts only from the
+    // workspace journal.
+    let mut states: HashMap<DeliveryKey, (DeliveryRank, Delivery)> = HashMap::new();
+    for (file_index, file) in files.iter().enumerate() {
+        for line in file {
+            if line.kind != Kind::State
+                || (workspace_ids.contains(line.id.as_str()) && Some(file_index) != workspace_file)
+                || !line
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| data.get("to_state").is_some())
+            {
+                continue;
+            }
+            let Some(record) = line.deliveries.first() else {
+                continue;
+            };
+            let key = (line.id.clone(), record.to.clone());
+            let rank = (record.ts, line.ts, line.seq, file_index);
+            if states.get(&key).is_none_or(|(current, _)| rank > *current) {
+                states.insert(key, (rank, record.clone()));
+            }
+        }
+    }
+    for ((id, to), (_, record)) in states {
+        let Some(&message_index) = index.get(&id) else {
+            continue;
+        };
+        let message = &mut merged[message_index];
+        match message
+            .deliveries
+            .iter_mut()
+            .find(|delivery| delivery.to == to)
+        {
+            Some(current) if record.ts >= current.ts => *current = record,
+            Some(_) => {}
+            None => message.deliveries.push(record),
         }
     }
     sort_lines(&mut merged);
