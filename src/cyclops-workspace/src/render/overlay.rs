@@ -1117,6 +1117,13 @@ pub fn menu_items(menu: &MenuState, checks: MenuChecks) -> Vec<MenuRow> {
         MenuState::AppMenu => vec![
             (copy::MENU_NEW_TAB, BindingAction::NewTab, None),
             (copy::MENU_NEW_WORKSPACE, BindingAction::NewWorkspace, None),
+            // Rule 2 in `render/mod.rs`: a surface that is put away has no
+            // chrome left to host its own control, so the menu carries it.
+            // The composer's `@` button is painted in the sidebar footer,
+            // which a collapsed sidebar does not have, and the one-column
+            // rail only has room for the chevron. Without this row the
+            // composer is keyboard-only the moment the sidebar is closed.
+            (copy::MENU_COMPOSE, BindingAction::Compose, None),
             (
                 copy::MENU_TOGGLE_EVENTS,
                 BindingAction::ToggleEventPanel,
@@ -1529,6 +1536,14 @@ mod tests {
             vec![
                 BindingAction::NewTab,
                 BindingAction::NewWorkspace,
+                // The composer's `@` button is painted in the sidebar
+                // footer, and a collapsed sidebar keeps only the
+                // one-column rail, so without this row the composer is
+                // keyboard-only the moment the sidebar is closed. Rule 2
+                // in `render/mod.rs` puts exactly that case here. It sits
+                // with the other two things the menu DOES rather than
+                // toggles.
+                BindingAction::Compose,
                 BindingAction::ToggleEventPanel,
                 BindingAction::ToggleMessages,
                 BindingAction::ToggleTabBar,
