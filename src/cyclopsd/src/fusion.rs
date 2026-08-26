@@ -1993,7 +1993,7 @@ fn staged_entry_ready(
 /// The exact settlement may race a lifecycle recompute that promotes the
 /// owned hold after the composer was cleared. That promotion must not leave
 /// an already-settled notification blocking the pane.
-pub(crate) fn resolve_staged_hold(
+pub(crate) async fn resolve_staged_hold(
     inner: &Arc<Inner>,
     session_idx: usize,
     pane_id: &str,
@@ -2001,13 +2001,15 @@ pub(crate) fn resolve_staged_hold(
     agent: cyclops_proto::ProcessInstanceId,
     manifest: &str,
 ) -> bool {
+    let pane = PaneKey::new(session_idx, pane_id);
+    let recompute_gate = pane_recompute_gate(inner, &pane);
+    let _recompute_guard = recompute_gate.lock().await;
     let expected = crate::identity::ProcId {
         pid: agent.pid(),
         birth: agent.birth(),
     };
     let (prior_ready, det) = {
         let mut map = inner.detections.lock().expect("detections lock");
-        let pane = PaneKey::new(session_idx, pane_id);
         let Some(entry) = map.get_mut(&pane) else {
             return false;
         };
@@ -6083,8 +6085,8 @@ contains = ["working"]
     /// delivery take it and paste over their text. A fresh claim needs a
     /// composer this daemon believes is empty AND unclaimed; only the
     /// same owner may re-claim what it already holds.
-    #[test]
-    fn a_fresh_claim_refuses_a_barrier_it_does_not_own() {
+    #[tokio::test]
+    async fn a_fresh_claim_refuses_a_barrier_it_does_not_own() {
         let clean = Detection {
             state: AgentState::Idle,
             readings: vec![SensorReading {
@@ -6203,26 +6205,37 @@ contains = ["working"]
         ));
 
         put(entry(ComposerHold::Staged, Some(attempt)));
-        assert!(!resolve_staged_hold(
-            &inner,
-            0,
-            "%1",
-            "att-00000000-0000-4000-8000-000000000002",
-            process,
-            "bash"
-        ));
+        assert!(
+            !resolve_staged_hold(
+                &inner,
+                0,
+                "%1",
+                "att-00000000-0000-4000-8000-000000000002",
+                process,
+                "bash"
+            )
+            .await
+        );
         assert_eq!(hold_now(), (ComposerHold::Staged, Some(attempt.into())));
-        assert!(resolve_staged_hold(
-            &inner, 0, "%1", attempt, process, "bash"
-        ));
+        assert!(resolve_staged_hold(&inner, 0, "%1", attempt, process, "bash").await);
         assert_eq!(hold_now(), (ComposerHold::Clear, None));
 
-        // Exact composer clearance can race a lifecycle recompute. The
-        // settled attempt still owns that promoted hold and must retire its
-        // turn pin instead of leaving the pane blocked after settlement.
+        // A recompute that started before settlement may still promote the
+        // old hold. Resolution waits for that commit, then clears it last.
         let turn = turnkey::TurnKey::for_test(&["settled"]);
         let mut promoted = entry(ComposerHold::TurnStarted { since_ms: 9 }, Some(attempt));
         promoted.turn = Some(turn.clone());
+        put(entry(ComposerHold::Staged, Some(attempt)));
+        let recompute_gate = pane_recompute_gate(&inner, &pane());
+        let recompute_guard = recompute_gate.lock().await;
+        let mut resolution = Box::pin(resolve_staged_hold(
+            &inner, 0, "%1", attempt, process, "bash",
+        ));
+        tokio::select! {
+            biased;
+            result = &mut resolution => panic!("resolution crossed an active recompute: {result}"),
+            () = tokio::task::yield_now() => {}
+        }
         put(promoted);
         assert!(turnkey::PaneEnds::pin(
             &mut inner.turn_ends.lock().expect("turn ends lock"),
@@ -6231,9 +6244,8 @@ contains = ["working"]
             "bash",
             &turn,
         ));
-        assert!(resolve_staged_hold(
-            &inner, 0, "%1", attempt, process, "bash"
-        ));
+        drop(recompute_guard);
+        assert!(resolution.await);
         assert_eq!(hold_now(), (ComposerHold::Clear, None));
         assert!(turnkey::PaneEnds::pin(
             &mut inner.turn_ends.lock().expect("turn ends lock"),

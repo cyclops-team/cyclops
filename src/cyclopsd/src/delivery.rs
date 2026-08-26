@@ -4778,7 +4778,8 @@ async fn reconcile_claimed_notification_barrier<I: Injector>(
             &record.attempt_id.to_string(),
             binding.agent,
             binding.manifest.as_str(),
-        );
+        )
+        .await;
     }
     inner
         .composer_recovery

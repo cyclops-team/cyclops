@@ -1270,7 +1270,6 @@ async fn an_exact_attempt_ack_timeout_claim_clears_then_advances_the_fifo() {
         0,
         "only the dedicated reconciliation fact may project Notified"
     );
-    wait_for_pane_write_ready(&mut rig, &pane).await;
     rig.ev
         .wait_event(Duration::from_secs(5), |event| {
             event["event"] == "messages.changed"

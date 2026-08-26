@@ -387,7 +387,7 @@ async fn resolve_clear_composer_discard(
         return Err(AttentionActionError::Uncertain);
     }
     delivery::inject_pause(inner, "attention_after_no_key_resolution").await;
-    resolve_staged_hold(inner, target, &route);
+    resolve_staged_hold(inner, target, &route).await;
     Ok(AttentionResolveResult {
         attempt_id,
         resolution: NotificationResolution::Discard,
@@ -450,7 +450,7 @@ async fn settle_resolution(
         return Err(AttentionActionError::Uncertain);
     }
     delivery::inject_pause(inner, "attention_after_resolution").await;
-    resolve_staged_hold(inner, target, &route);
+    resolve_staged_hold(inner, target, &route).await;
     if let Err(error) = messaging::schedule_recipient(inner, service, target.record.recipient) {
         tracing::error!(
             recipient = %target.record.recipient,
@@ -464,7 +464,7 @@ async fn settle_resolution(
     })
 }
 
-fn resolve_staged_hold(inner: &Arc<Inner>, target: &AttentionTarget, route: &ActionRoute) {
+async fn resolve_staged_hold(inner: &Arc<Inner>, target: &AttentionTarget, route: &ActionRoute) {
     if let Some(binding) = target.record.binding.as_ref() {
         fusion::resolve_staged_hold(
             inner,
@@ -473,7 +473,8 @@ fn resolve_staged_hold(inner: &Arc<Inner>, target: &AttentionTarget, route: &Act
             &target.record.attempt_id.to_string(),
             binding.agent,
             binding.manifest.as_str(),
-        );
+        )
+        .await;
     }
 }
 
