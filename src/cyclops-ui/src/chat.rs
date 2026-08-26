@@ -5,12 +5,10 @@
 
 use std::collections::HashMap;
 
-use cyclops_proto::{
-    Kind, MessageId, NotificationAttentionCause, NotificationPreWriteCause, RecipientKey,
-};
+use cyclops_proto::{Kind, MessageId, NotificationAttentionCause, RecipientKey};
 
 use crate::avatar::{Avatar, AvatarRegistry};
-use crate::detail::{Detail, Draft, Stage, ThreadEntry, DRAFT_MAX_BYTES};
+use crate::detail::{Detail, Draft, Stage, ThreadEntry};
 use crate::grid::display_width;
 use crate::queue::{fit, HumanQueue, MailboxWord, QueueRow, QueueTarget, WakeWord};
 
@@ -284,6 +282,7 @@ pub struct RecipientEntry {
     pub cause: Option<String>,
     pub fifo_position: Option<u64>,
     pub is_attention: bool,
+    pub is_selected: bool,
     pub target: QueueTarget,
 }
 
@@ -343,6 +342,7 @@ impl TimelineItem {
                 cause: cause_str,
                 fifo_position: row.fifo_position,
                 is_attention: row.needs_human(),
+                is_selected: is_sel,
                 target: row.target.clone(),
             };
 
@@ -423,6 +423,21 @@ pub fn format_time(ts_ms: u64, now_ms: Option<u64>) -> String {
     format!("{ts_ms}ms")
 }
 
+/// First timeline line, centered on the selected recipient when possible.
+fn timeline_viewport_top(
+    total_lines: usize,
+    visible_lines: usize,
+    selected_line: Option<usize>,
+) -> usize {
+    if visible_lines == 0 || total_lines <= visible_lines {
+        return 0;
+    }
+    let last_top = total_lines - visible_lines;
+    selected_line
+        .map(|line| line.saturating_sub(visible_lines / 2).min(last_top))
+        .unwrap_or(last_top)
+}
+
 /// Render the group-chat timeline and bottom bounded composer into exact-width lines.
 pub fn render_chat(
     queue: &HumanQueue,
@@ -492,6 +507,7 @@ pub fn render_chat(
     );
 
     let mut timeline_lines: Vec<String> = Vec::new();
+    let mut selected_anchor_line: Option<usize> = None;
 
     if width < 24 {
         // Ultra-narrow mode: 1-2 lines per entry using initials (never icon only)
@@ -508,23 +524,40 @@ pub fn render_chat(
             } else {
                 item.message_id.as_str()
             };
-            let first_recip = item.recipients.first();
-            let status_short = first_recip
+            let shown_recipient = item
+                .recipients
+                .iter()
+                .find(|recipient| recipient.is_selected)
+                .or_else(|| item.recipients.first());
+            let status_short = shown_recipient
                 .map(|r| proven_status_short(r.mailbox, r.wake))
                 .unwrap_or("*pend");
 
             let line1 = format!("{sel_mark}{attn_mark}[{s_initials}]{short_id} {status_short}");
             timeline_lines.push(fit(&line1, width));
-            let recip_labels = item
+            let recip_labels = match item
                 .recipients
                 .iter()
-                .map(|r| r.label.as_str())
-                .collect::<Vec<_>>()
-                .join(",");
+                .find(|recipient| recipient.is_selected)
+            {
+                Some(recipient) if item.recipients.len() > 1 => {
+                    format!(">{} +{}", recipient.label, item.recipients.len() - 1)
+                }
+                Some(recipient) => format!(">{}", recipient.label),
+                None => item
+                    .recipients
+                    .iter()
+                    .map(|recipient| recipient.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            };
             let line2 = format!(" -> {recip_labels}");
             timeline_lines.push(fit(&line2, width));
+            if item.is_selected {
+                selected_anchor_line = Some(timeline_lines.len().saturating_sub(1));
+            }
 
-            if let Some(r) = first_recip {
+            if let Some(r) = shown_recipient {
                 if r.is_attention || r.cause.is_some() {
                     let is_head = r.mailbox == MailboxWord::Pending && r.fifo_position == Some(1);
                     let cause_desc = r.cause.as_deref().unwrap_or(status_short);
@@ -563,12 +596,6 @@ pub fn render_chat(
             let time_str = format_time(item.ts, now_ms);
 
             let header = if item.is_broadcast {
-                let recip_previews = item
-                    .recipients
-                    .iter()
-                    .map(|r| format!("[{}] {}", r.avatar.badge(), r.label))
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 format!(
                     "{sel_mark}{attn_mark}[BC] [{s_badge}] {} -> @all ({time_str}) [{}]",
                     item.sender_label, item.message_id
@@ -593,7 +620,7 @@ pub fn render_chat(
 
             // Expose authorized thread history if present in detail
             for entry in &item.thread_history {
-                let entry_avatar = avatar_registry.resolve(&entry.sender_label);
+                let entry_avatar = Avatar::from_label(&entry.sender_label);
                 let entry_time = format_time(entry.ts, now_ms);
                 timeline_lines.push(fit(
                     &format!(
@@ -622,13 +649,17 @@ pub fn render_chat(
             // Recipient delivery truth states
             for r in &item.recipients {
                 let status_label = proven_status_label(r.mailbox, r.wake);
+                let recipient_mark = if r.is_selected { ">" } else { " " };
                 let states = format!(
-                    "   [{}] [{status_label}] [mail: {}] [wake: {}]",
+                    "  {recipient_mark}[{}] [{status_label}] [mail: {}] [wake: {}]",
                     r.label,
                     r.mailbox.short(),
                     r.wake.short()
                 );
                 timeline_lines.push(fit(&states, width));
+                if r.is_selected {
+                    selected_anchor_line = Some(timeline_lines.len().saturating_sub(1));
+                }
                 if r.is_attention || r.cause.is_some() {
                     let is_head = r.mailbox == MailboxWord::Pending && r.fifo_position == Some(1);
                     let cause_desc = r.cause.as_deref().unwrap_or(status_label);
@@ -663,7 +694,7 @@ pub fn render_chat(
 
     // Viewport slicing for timeline
     let total_lines = timeline_lines.len();
-    let start_line = total_lines.saturating_sub(timeline_height);
+    let start_line = timeline_viewport_top(total_lines, timeline_height, selected_anchor_line);
     for line in timeline_lines
         .into_iter()
         .skip(start_line)
@@ -753,7 +784,7 @@ pub fn render_chat(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::queue::{Direction, QueueTarget, Snapshot};
+    use crate::queue::{Direction, QueueTarget, Scope, Snapshot};
     use cyclops_proto::{
         MessageId, NotificationAttentionCause, NotificationPreWriteCause, RecipientKey,
     };
@@ -851,6 +882,7 @@ mod tests {
             watermark: 3,
             rows: vec![row1, row2_a, row2_b],
         });
+        queue.set_scope(Scope::All);
         queue
     }
 
@@ -880,7 +912,202 @@ mod tests {
             joined.contains("[BC]"),
             "multi-recipient broadcast must be marked [BC]"
         );
-        assert!(joined.contains("[CC]"), "claude must have CC avatar badge");
+        assert!(
+            joined.contains("[CL]"),
+            "an unproven claude label must use initials"
+        );
+        assert!(
+            !joined.contains('✳'),
+            "an unproven claude label received an official icon"
+        );
+    }
+
+    #[test]
+    fn broadcast_selection_marks_the_exact_recipient() {
+        let mut queue = make_test_queue();
+        let message = MessageId::parse("m-0000000000000002").unwrap();
+        let claude = RecipientKey::parse(
+            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+        )
+        .unwrap();
+        let codex = RecipientKey::parse(
+            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%2",
+        )
+        .unwrap();
+        let registry = AvatarRegistry::default();
+
+        assert!(queue.select(&QueueTarget::new(message.clone(), claude)));
+        let claude_frame = render_chat(
+            &queue,
+            None,
+            None,
+            &registry,
+            None,
+            None,
+            80,
+            20,
+            None,
+            Some(1_010_000),
+        )
+        .join("\n");
+        assert!(claude_frame.contains("  >[claude]"), "{claude_frame}");
+        assert!(!claude_frame.contains("  >[codex]"), "{claude_frame}");
+        let claude_narrow = render_chat(
+            &queue,
+            None,
+            None,
+            &registry,
+            None,
+            None,
+            18,
+            10,
+            None,
+            Some(1_010_000),
+        )
+        .join("\n");
+        assert!(claude_narrow.contains("-> >claude +1"), "{claude_narrow}");
+        assert_eq!(queue.freeze().unwrap().target.recipient(), Some(claude));
+
+        assert!(queue.select(&QueueTarget::new(message, codex)));
+        let codex_frame = render_chat(
+            &queue,
+            None,
+            None,
+            &registry,
+            None,
+            None,
+            80,
+            20,
+            None,
+            Some(1_010_000),
+        )
+        .join("\n");
+        assert!(codex_frame.contains("  >[codex]"), "{codex_frame}");
+        assert!(!codex_frame.contains("  >[claude]"), "{codex_frame}");
+        let codex_narrow = render_chat(
+            &queue,
+            None,
+            None,
+            &registry,
+            None,
+            None,
+            18,
+            10,
+            None,
+            Some(1_010_000),
+        )
+        .join("\n");
+        assert!(codex_narrow.contains("-> >codex +1"), "{codex_narrow}");
+        assert_eq!(queue.freeze().unwrap().target.recipient(), Some(codex));
+    }
+
+    #[test]
+    fn thread_labels_never_claim_a_vendor_icon() {
+        let mut queue = make_test_queue();
+        let recipient = RecipientKey::parse(
+            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+        )
+        .unwrap();
+        let message = MessageId::parse("m-0000000000000001").unwrap();
+        assert!(queue.select(&QueueTarget::new(message, recipient)));
+        let mut detail = Detail::open(queue.selected().unwrap(), 3);
+        detail.loaded_ok(crate::detail::Loaded {
+            thread: vec![ThreadEntry {
+                message_id: "m-history".into(),
+                sender_label: "claude".into(),
+                subject: Some("historical label only".into()),
+                body: None,
+                ts: 900_000,
+            }],
+            ..crate::detail::Loaded::default()
+        });
+
+        let frame = render_chat(
+            &queue,
+            Some(&detail),
+            None,
+            &AvatarRegistry::default(),
+            None,
+            None,
+            80,
+            20,
+            None,
+            Some(1_010_000),
+        )
+        .join("\n");
+        assert!(frame.contains("[CL] claude"), "{frame}");
+        assert!(!frame.contains("✳ claude"), "{frame}");
+    }
+
+    #[test]
+    fn older_selection_stays_visible_at_narrow_and_wide_sizes() {
+        let recipient = RecipientKey::parse(
+            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+        )
+        .unwrap();
+        let sender = RecipientKey::parse(
+            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%0",
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for index in 0..20u64 {
+            let message = MessageId::parse(&format!("m-{index:016x}")).unwrap();
+            rows.push(QueueRow {
+                target: QueueTarget::new(message.clone(), recipient),
+                message_id: message.clone(),
+                recipient,
+                recipient_label: "claude".into(),
+                sender,
+                sender_label: "operator".into(),
+                thread_root: message,
+                thread_message_count: 1,
+                ts: 1_000_000 + index,
+                kind: Kind::Msg,
+                recipient_count: 1,
+                subject: Some(format!("message {index}")),
+                mailbox: MailboxWord::Pending,
+                wake: WakeWord::NotStarted,
+                needs_action: true,
+                seq: index + 1,
+                updated_at: 1_000_000 + index,
+                direction: Direction::Inbound,
+                ..QueueRow::default()
+            });
+        }
+        let oldest = rows[0].target.clone();
+        let mut queue = HumanQueue::default();
+        queue.replace(Snapshot {
+            watermark: 20,
+            rows,
+        });
+        assert!(queue.select(&oldest));
+
+        for (width, height) in [(18, 10), (80, 12)] {
+            let frame = render_chat(
+                &queue,
+                None,
+                None,
+                &AvatarRegistry::default(),
+                None,
+                None,
+                width,
+                height,
+                None,
+                Some(1_010_000),
+            );
+            let selected_id = if width < 24 {
+                "000000"
+            } else {
+                "m-0000000000000000"
+            };
+            assert!(
+                frame
+                    .iter()
+                    .any(|line| line.starts_with('>') && line.contains(selected_id)),
+                "selected older message is outside the {width}x{height} viewport:\n{}",
+                frame.join("\n")
+            );
+        }
     }
 
     #[test]

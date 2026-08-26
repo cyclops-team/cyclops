@@ -62,7 +62,7 @@ impl Avatar {
     }
 }
 
-/// Registry mapping manifest IDs, process names, or agent identifiers to avatars.
+/// Registry mapping proven manifest IDs to avatars.
 #[derive(Debug, Clone)]
 pub struct AvatarRegistry {
     entries: HashMap<String, Avatar>,
@@ -100,14 +100,11 @@ impl AvatarRegistry {
         self.entries.insert(id.into().to_ascii_lowercase(), avatar);
     }
 
-    /// Resolve an avatar by identity key or label. If not registered, falls back
-    /// deterministically to uppercase initials derived from the label.
-    pub fn resolve(&self, id_or_label: &str) -> Avatar {
-        let normalized = id_or_label.trim().to_ascii_lowercase();
-        if let Some(avatar) = self.entries.get(&normalized) {
-            return avatar.clone();
-        }
-        Avatar::from_label(id_or_label)
+    /// Resolve a manifest ID after its endpoint and route were proven.
+    fn resolve_manifest(&self, manifest_id: &str) -> Option<Avatar> {
+        self.entries
+            .get(&manifest_id.trim().to_ascii_lowercase())
+            .cloned()
     }
 
     /// Resolve an avatar for a durable endpoint by joining it to live mailbox routes
@@ -120,30 +117,30 @@ impl AvatarRegistry {
         live_routes: Option<&[cyclops_proto::StatusMailboxRoute]>,
         pane_manifests: Option<&HashMap<String, String>>,
     ) -> Avatar {
-        let is_live_route = match live_routes {
-            Some(routes) => routes.iter().any(|r| &r.recipient == endpoint),
-            None => true,
+        let is_live_route = live_routes
+            .is_some_and(|routes| routes.iter().any(|route| &route.recipient == endpoint));
+        let manifest = if is_live_route {
+            pane_manifests.and_then(|manifests| manifests.get(endpoint.pane_id()))
+        } else {
+            None
         };
-        if is_live_route {
-            let pane_id = endpoint.pane_id();
-            if let Some(manifests) = pane_manifests {
-                if let Some(manifest) = manifests.get(pane_id) {
-                    return self.resolve(manifest);
-                }
-            }
+        if let Some(avatar) = manifest.and_then(|id| self.resolve_manifest(id)) {
+            return avatar;
         }
-        self.resolve(display_label)
+        Avatar::from_label(display_label)
     }
 
-    /// Resolve an avatar for a durable endpoint by joining it to pane manifests,
-    /// or falling back deterministically to initials from the label without vendor guessing.
+    /// Resolve without live-route proof.
+    ///
+    /// A manifest keyed only by pane is insufficient because the pane may now
+    /// belong to another process generation. This path always uses initials.
     pub fn resolve_endpoint(
         &self,
-        endpoint: &cyclops_proto::RecipientKey,
+        _endpoint: &cyclops_proto::RecipientKey,
         display_label: &str,
-        pane_manifests: Option<&HashMap<String, String>>,
+        _pane_manifests: Option<&HashMap<String, String>>,
     ) -> Avatar {
-        self.resolve_route_endpoint(endpoint, display_label, None, pane_manifests)
+        Avatar::from_label(display_label)
     }
 }
 
@@ -155,40 +152,38 @@ mod tests {
     fn default_registry_resolves_known_agents() {
         let reg = AvatarRegistry::default();
 
-        let claude = reg.resolve("claude");
+        let claude = reg.resolve_manifest("claude").unwrap();
         assert_eq!(claude.initials, "CC");
         assert_eq!(claude.icon.as_deref(), Some("✳"));
         assert_eq!(claude.display_name, "Claude Code");
 
-        let codex = reg.resolve("codex");
+        let codex = reg.resolve_manifest("codex").unwrap();
         assert_eq!(codex.initials, "CX");
         assert_eq!(codex.icon.as_deref(), Some("•"));
 
-        let gemini = reg.resolve("gemini");
+        let gemini = reg.resolve_manifest("gemini").unwrap();
         assert_eq!(gemini.initials, "AG");
         assert_eq!(gemini.icon.as_deref(), Some("✦"));
 
-        let agy = reg.resolve("agy");
+        let agy = reg.resolve_manifest("agy").unwrap();
         assert_eq!(agy.initials, "AG");
         assert_eq!(agy.icon.as_deref(), Some("✦"));
     }
 
     #[test]
     fn fallback_derives_initials_without_guessing() {
-        let reg = AvatarRegistry::default();
-
-        let reviewer = reg.resolve("reviewer");
+        let reviewer = Avatar::from_label("reviewer");
         assert_eq!(reviewer.initials, "RE");
         assert_eq!(reviewer.icon, None);
 
-        let custom = reg.resolve("custom_worker");
+        let custom = Avatar::from_label("custom_worker");
         assert_eq!(custom.initials, "CW");
         assert_eq!(custom.icon, None);
 
-        let single = reg.resolve("x");
+        let single = Avatar::from_label("x");
         assert_eq!(single.initials, "X");
 
-        let empty = reg.resolve("   ");
+        let empty = Avatar::from_label("   ");
         assert_eq!(empty.initials, "?");
     }
 
@@ -200,9 +195,45 @@ mod tests {
             Avatar::new("CU", Some("★".into()), "Custom Agent"),
         );
 
-        let custom = reg.resolve("custom");
+        let custom = reg.resolve_manifest("custom").unwrap();
         assert_eq!(custom.initials, "CU");
         assert_eq!(custom.icon.as_deref(), Some("★"));
         assert_eq!(custom.display_name, "Custom Agent");
+    }
+
+    #[test]
+    fn vendor_icon_requires_exact_live_route_and_manifest() {
+        let reg = AvatarRegistry::default();
+        let endpoint = cyclops_proto::RecipientKey::parse(
+            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+        )
+        .unwrap();
+        let replacement = cyclops_proto::RecipientKey::parse(
+            "00000000-0000-0000-0000-000000000001:99999999-9999-9999-9999-999999999999:%1",
+        )
+        .unwrap();
+        let manifests = HashMap::from([("%1".to_string(), "claude".to_string())]);
+        let stale_routes = [cyclops_proto::StatusMailboxRoute {
+            recipient: replacement,
+            label: "claude".into(),
+        }];
+
+        let stale =
+            reg.resolve_route_endpoint(&endpoint, "claude", Some(&stale_routes), Some(&manifests));
+        assert_eq!(stale.initials, "CL");
+        assert_eq!(stale.icon, None);
+
+        let live_routes = [cyclops_proto::StatusMailboxRoute {
+            recipient: endpoint,
+            label: "renamed-agent".into(),
+        }];
+        let proven = reg.resolve_route_endpoint(
+            &endpoint,
+            "renamed-agent",
+            Some(&live_routes),
+            Some(&manifests),
+        );
+        assert_eq!(proven.initials, "CC");
+        assert_eq!(proven.icon.as_deref(), Some("✳"));
     }
 }

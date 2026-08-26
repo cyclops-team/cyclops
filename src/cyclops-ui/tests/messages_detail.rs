@@ -363,6 +363,10 @@ fn destructive_actions_confirm_by_name_and_cancel_clean() {
         sentence.contains(&attempt(7).to_string()),
         "the confirmation does not name the attempt: {sentence}"
     );
+    assert!(
+        sentence.contains("reviewer") && sentence.contains(&agent("%1").to_string()),
+        "the confirmation does not name the frozen broadcast recipient: {sentence}"
+    );
     assert!(sentence.contains("discard"), "{sentence}");
     assert_eq!(*d.stage(), Stage::Confirming(Action::AttentionDiscard));
 
@@ -390,6 +394,28 @@ fn destructive_actions_confirm_by_name_and_cancel_clean() {
     let mut d = opened(&outbound(), Loaded::default());
     assert!(matches!(d.request(Action::Reply), Request::Refused(_)));
     assert_eq!(*d.stage(), Stage::Open);
+}
+
+#[test]
+fn a_broadcast_action_names_the_frozen_recipient() {
+    let mut selected = alarmed();
+    selected.target = QueueTarget::new(MessageId::new("m-001").unwrap(), agent("%2"));
+    selected.recipient = agent("%2");
+    selected.recipient_label = "codex-reviewer".into();
+    let mut detail = opened(
+        &selected,
+        Loaded {
+            checks: checks(true),
+            ..Loaded::default()
+        },
+    );
+
+    let Request::Confirm(sentence) = detail.request(Action::AttentionDiscard) else {
+        panic!("broadcast recipient action did not ask for confirmation");
+    };
+    assert!(sentence.contains("codex-reviewer"), "{sentence}");
+    assert!(sentence.contains(&agent("%2").to_string()), "{sentence}");
+    assert!(!sentence.contains(&agent("%1").to_string()), "{sentence}");
 }
 
 /// A row that vanished under an open detail freezes it rather than
