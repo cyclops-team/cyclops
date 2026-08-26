@@ -9,7 +9,7 @@
 [agent]
 id = "agy"
 display_name = "Antigravity CLI"
-version_tested = "1.1.21"
+version_tested = "1.1.11"
 process_names = ["agy"]
 default_model_observed = "Gemini 3.6 Flash (High)"
 # What `cyclops start --agents agy` runs in a pane. The bare CLI; the ACK

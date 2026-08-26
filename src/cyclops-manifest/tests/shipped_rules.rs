@@ -84,11 +84,12 @@ fn version_between<'a>(capture: &'a str, start: &str, end: &str) -> &'a str {
         .0
 }
 
-/// `version_tested` names the current vendor version with authoritative live
-/// fixture evidence. It does not claim that every vendor state was remeasured;
-/// each rule and finding still names its own evidence boundary.
+/// `version_tested` names the capture that anchors each shipped ruleset.
+/// Newer partial captures do not silently strengthen that whole-manifest
+/// claim. Promoting it requires a new authoritative fixture and this table
+/// changing together.
 #[test]
-fn version_tested_matches_each_authoritative_version_fixture() {
+fn version_tested_matches_each_authoritative_fixture() {
     let all = shipped();
     let cases = [
         (
@@ -110,7 +111,7 @@ fn version_tested_matches_each_authoritative_version_fixture() {
         (
             "agy",
             version_between(
-                include_str!("fixtures/agy_file_access_permission_plain.txt"),
+                include_str!("fixtures/agy_working_composer_plain.txt"),
                 "Antigravity CLI ",
                 "\n",
             ),
@@ -128,7 +129,7 @@ fn version_tested_matches_each_authoritative_version_fixture() {
     for (id, fixture_version) in cases {
         assert_eq!(
             all[id].agent.version_tested, fixture_version,
-            "{id}: version_tested diverged from its authoritative version fixture"
+            "{id}: version_tested diverged from its authoritative fixture"
         );
     }
 }

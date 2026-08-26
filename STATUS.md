@@ -100,7 +100,7 @@ whenever coverage grows.
   | --- | --- | --- | --- |
   | Claude Code | 2.1.221 | 2.1.239 composer extraction, clearing, and stage-and-clear soak | Current idle, working, staged, modal, and quota matrix |
   | Codex CLI | 0.147.0 | 0.149.1 occupied-prompt and no-color trailer structure; 0.149.0 clearing, title spinner, and stage-and-clear soak | Current full matrix, fresh and resumed delivery, and live hook payload capture |
-  | Antigravity CLI | 1.1.21 | 1.1.21 exact composer and file-access permission; 1.1.18 stage-and-clear soak | Current full matrix beyond the measured composer and permission states, plus lifecycle evidence |
+  | Antigravity CLI | 1.1.11 | 1.1.21 exact composer and file-access permission; 1.1.18 stage-and-clear soak | Current full matrix beyond the measured composer and permission states, plus lifecycle evidence |
   | Cursor Agent CLI | 2026.07.23-e383d2b | No installed binary on the evidence host | Installed current binary, full matrix, and paired start and end hook payloads |
 
   The soak proves staging verification and cleanup only. It does not promote a

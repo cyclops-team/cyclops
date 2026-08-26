@@ -1780,8 +1780,8 @@ exact-staging proof.
 This evidence is narrow. It measures the occupied and empty composer prompt,
 transcript echo styling, and the two-row trailer on 1.1.21. It does not reprove
 the working, modal, quota, hook, lifecycle, restart, or multiline direct-payload
-rules. F71 adds the current permission-modal evidence that later moved
-`version_tested` to 1.1.21.
+rules. F71 adds current permission-modal evidence, but the full-ruleset
+`version_tested` claim remains bound to 1.1.11.
 
 ## F71. AGY 1.1.21 replaces every prior state signal with a file-access modal
 
@@ -1818,7 +1818,8 @@ The fixtures `agy_file_access_permission_plain.txt` and
 the account, path, message locator, and unrelated transcript removed. The rule
 requires the `File access` header, the exact question, and the selected first
 choice together. It outranks a stale working spinner and never dismisses the
-decision automatically.
+decision automatically. This capture proves only the 1.1.21 file-access modal;
+`version_tested` remains 1.1.11 until the complete ruleset is remeasured.
 
 ## F72. A title never asserts idle; lifecycle needs screen evidence; liveness admits the first wake
 
