@@ -125,6 +125,35 @@ impl MailboxCapabilityProof {
     }
 }
 
+/// Recheck format-specific authority before considering terminal geometry.
+///
+/// Capability loss is an identity failure and must not be hidden by a narrow
+/// pane. Both pre-write bookends use this exact ordering.
+fn notification_prewrite_bookend(
+    selected: &AttemptPayload,
+    recipient: Option<RecipientKey>,
+    binding: &fusion::Binding,
+    pane_width: u32,
+) -> Option<String> {
+    if matches!(selected.transport, Some(NotificationTransport::Doorbell)) {
+        let current =
+            recipient
+                .zip(selected.capability.as_ref())
+                .is_some_and(|(recipient, proof)| {
+                    proof.recheck(recipient, binding.agent, &binding.manifest)
+                });
+        if !current {
+            return Some("capability_changed".to_string());
+        }
+    }
+    if selected.doorbell_format == Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM)
+        && pane_width < cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH
+    {
+        return Some(format!("pane_too_narrow:{pane_width}"));
+    }
+    None
+}
+
 fn select_mailbox_capability(
     manifest: &Manifest,
     recipient: RecipientKey,
@@ -173,12 +202,9 @@ fn select_attempt_payload(
     });
     if capability.is_some() {
         return Ok(AttemptPayload {
-            bytes: cyclops_proto::render_doorbell_v2(
-                notification.message_id(),
-                notification.attempt_id(),
-            ),
+            bytes: cyclops_proto::render_doorbell_v3(notification.attempt_id()),
             transport: Some(NotificationTransport::Doorbell),
-            doorbell_format: Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_CLAIM),
+            doorbell_format: Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
             capability,
         });
     }
@@ -212,6 +238,9 @@ pub(crate) fn expected_notification_payload(
             Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_CLAIM) => Some(
                 cyclops_proto::render_doorbell_v2(&record.message_id, record.attempt_id),
             ),
+            Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM) => {
+                Some(cyclops_proto::render_doorbell_v3(record.attempt_id))
+            }
             Some(_) => None,
         },
         (NotificationTransport::DirectPayload, None) => {
@@ -2577,7 +2606,7 @@ pub(crate) fn enqueue_notification_attempt(
             .and_then(|message| expected_notification_payload(&record, &message))
             .unwrap_or_default()
     } else {
-        cyclops_proto::render_doorbell_v2(notification.message_id(), notification.attempt_id())
+        cyclops_proto::render_doorbell_v3(notification.attempt_id())
     };
     let handle = DeliveryHandle::for_notification(
         display_recipient,
@@ -2844,10 +2873,7 @@ fn recover_failed_job(
                     &handle.to,
                     &handle.pane_id,
                     handle.session_idx,
-                    cyclops_proto::render_doorbell_v2(
-                        notification.message_id(),
-                        notification.attempt_id(),
-                    ),
+                    cyclops_proto::render_doorbell_v3(notification.attempt_id()),
                     notification.clone(),
                 );
                 fresh.worker_recoveries.store(1, Ordering::SeqCst);
@@ -3526,6 +3552,18 @@ impl AttemptFailure {
         }
     }
 
+    fn pane_too_narrow(mut observation: NotificationPreWriteObservation) -> Self {
+        observation.required_pane_width = Some(cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH);
+        Self {
+            cause: "pane_too_narrow".into(),
+            boundary: WriteBoundary::BeforeWrite,
+            pre_write_block: Some(Box::new(PreWriteBlock {
+                cause: NotificationPreWriteCause::WriteReadinessChanged,
+                observation: Some(observation),
+            })),
+        }
+    }
+
     /// Does this failure belong back at the gate rather than in the
     /// retry budget? True only where the cause is readiness moving under
     /// a delivery that had not yet written anything.
@@ -3824,6 +3862,8 @@ async fn attempt_delivery(
                 binding: observed_binding
                     .as_ref()
                     .and_then(|binding| notification_binding(notification.recipient(), binding)),
+                pane_width: Some(final_row.width),
+                required_pane_width: None,
             });
     let proven = match observed_binding {
         // The gate admitted under a manifest, and the live read has to
@@ -3836,6 +3876,24 @@ async fn attempt_delivery(
             return AttemptOutcome::Failed(AttemptFailure::binding_unprovable(observation));
         }
     };
+    if let Some(cause) = notification_prewrite_bookend(
+        &selected,
+        handle
+            .notification
+            .as_ref()
+            .map(NotificationContext::recipient),
+        &proven,
+        final_row.width,
+    ) {
+        injector.discard().await;
+        if cause.starts_with("pane_too_narrow:") {
+            return AttemptOutcome::Failed(AttemptFailure::pane_too_narrow(
+                observation.expect("format 3 belongs to a notification"),
+            ));
+        }
+        return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
+    }
+    inject_pause(inner, "post_final_prewrite").await;
     // The composer hold is installed AT the write boundary, by the injector,
     // not before the attempt and not after it resolves. Installing it before
     // the attempt would catch `spool_failed` and block its bounded transport
@@ -3867,14 +3925,15 @@ async fn attempt_delivery(
             // payload: the same binding, read again, and equal. Nothing
             // has been written yet, so a change here is the world moving
             // rather than a transport failure.
-            let now = match handle_route(inner, handle) {
-                HandleRoute::Exact(watcher) => watcher
-                    .pane(&handle.pane_id)
-                    .ok_or_else(|| "prewrite_session_detached".to_string())
-                    .and_then(|row| {
-                        fusion::admitted_binding(inner, handle.session_idx, &row)
-                            .ok_or_else(|| "prewrite_binding_unprovable".to_string())
-                    })?,
+            let (now, pane_width) = match handle_route(inner, handle) {
+                HandleRoute::Exact(watcher) => {
+                    let row = watcher
+                        .pane(&handle.pane_id)
+                        .ok_or_else(|| "prewrite_session_detached".to_string())?;
+                    let binding = fusion::admitted_binding(inner, handle.session_idx, &row)
+                        .ok_or_else(|| "prewrite_binding_unprovable".to_string())?;
+                    (binding, row.width)
+                }
                 HandleRoute::BindingChanged => return Err("binding_changed".to_string()),
                 HandleRoute::BindingUnprovable { .. } => {
                     return Err("prewrite_binding_unprovable".to_string())
@@ -3884,21 +3943,16 @@ async fn attempt_delivery(
             if now != proven {
                 return Err("binding_changed".to_string());
             }
-            if matches!(selected.transport, Some(NotificationTransport::Doorbell)) {
-                let current = selected.capability.as_ref().is_some_and(|proof| {
-                    proof.recheck(
-                        handle
-                            .notification
-                            .as_ref()
-                            .expect("doorbell transport belongs to a notification")
-                            .recipient(),
-                        proven.agent,
-                        &proven.manifest,
-                    )
-                });
-                if !current {
-                    return Err("capability_changed".to_string());
-                }
+            if let Some(cause) = notification_prewrite_bookend(
+                &selected,
+                handle
+                    .notification
+                    .as_ref()
+                    .map(NotificationContext::recipient),
+                &now,
+                pane_width,
+            ) {
+                return Err(cause);
             }
             let notification_binding = if handle.notification.is_some() {
                 Some((
@@ -3942,6 +3996,14 @@ async fn attempt_delivery(
         Err(cause) => {
             if cause == NO_LONGER_CURRENT_BEFORE_WRITE {
                 return AttemptOutcome::NoLongerCurrentBeforeWrite;
+            }
+            if let Some(width) = cause
+                .strip_prefix("pane_too_narrow:")
+                .and_then(|width| width.parse::<u32>().ok())
+            {
+                let mut observation = observation.expect("format 3 belongs to a notification");
+                observation.pane_width = Some(width);
+                return AttemptOutcome::Failed(AttemptFailure::pane_too_narrow(observation));
             }
             return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
         }
@@ -4832,6 +4894,8 @@ fn binding_unprovable_observation(
         pane_root: process_instance(pane_pid),
         selected_manifest: NotificationManifestId::new(manifest_id).ok(),
         binding: None,
+        pane_width: None,
+        required_pane_width: None,
     }
 }
 
@@ -4860,6 +4924,8 @@ fn composer_semantic_observation(
         pane_root: Some(process_instance_id(binding.pane_root)?),
         selected_manifest: Some(NotificationManifestId::new(&binding.manifest).ok()?),
         binding: Some(notification_binding(notification.recipient(), &binding)?),
+        pane_width: Some(row.width),
+        required_pane_width: None,
     })
 }
 
@@ -5044,7 +5110,9 @@ fn notification_attention_cause(cause: &str) -> NotificationAttentionCause {
 }
 
 fn should_retry(failure: &AttemptFailure, spent: u32, retry_max: u32) -> bool {
-    matches!(failure.boundary, WriteBoundary::BeforeWrite) && spent <= retry_max
+    matches!(failure.boundary, WriteBoundary::BeforeWrite)
+        && failure.cause != "pane_too_narrow"
+        && spent <= retry_max
 }
 
 fn notify_attention(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>, cause: &str) {
@@ -8768,6 +8836,12 @@ mod tests {
             ))
         );
 
+        record.doorbell_format = Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM);
+        assert_eq!(
+            expected_notification_payload(&record, &message),
+            Some(cyclops_proto::render_doorbell_v3(record.attempt_id))
+        );
+
         record.transport = NotificationTransport::DirectPayload;
         assert_eq!(expected_notification_payload(&record, &message), None);
 
@@ -9451,10 +9525,76 @@ mod tests {
         let exhausted = AttemptFailure::spool_failed();
         assert!(!should_retry(&exhausted, 2, 1));
 
+        let pane_too_narrow = AttemptFailure::pane_too_narrow(NotificationPreWriteObservation {
+            pane_root: Some(ProcessInstanceId::new(1, 1).unwrap()),
+            selected_manifest: Some(NotificationManifestId::new("codex").unwrap()),
+            binding: None,
+            pane_width: Some(cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH - 1),
+            required_pane_width: None,
+        });
+        assert!(!should_retry(&pane_too_narrow, 0, 3));
+        assert_eq!(
+            pane_too_narrow.pre_write_block.as_deref().unwrap().cause,
+            NotificationPreWriteCause::WriteReadinessChanged
+        );
+        assert_eq!(
+            pane_too_narrow
+                .pre_write_block
+                .as_deref()
+                .and_then(|block| block.observation.as_ref())
+                .and_then(|observation| observation.required_pane_width),
+            Some(cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH)
+        );
+
         // The production mapping keeps unknown injector errors conservative
         // too: they can never opt into the pre-write retry budget.
         let unknown = AttemptFailure::from_inject("future_failure".into());
         assert!(!should_retry(&unknown, 1, 1));
+    }
+
+    #[test]
+    fn capability_loss_outranks_a_narrow_format_3_pane() {
+        let scratch = NotificationScratch(cyclops_proto::scratch::scratch_dir(&format!(
+            "capability-bookend-{}",
+            uuid::Uuid::new_v4()
+        )));
+        std::fs::create_dir_all(&scratch.0).unwrap();
+        let file = scratch.0.join("SKILL.md");
+        std::fs::write(&file, "current capability").unwrap();
+        let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let session = SessionInstanceId::from_str("00000000-0000-4000-8000-000000000002").unwrap();
+        let recipient =
+            RecipientKey::agent(workspace, session, TmuxPaneId::from_str("%1").unwrap());
+        let agent = crate::identity::ProcId { pid: 42, birth: 7 };
+        let selected = AttemptPayload {
+            bytes: "doorbell".to_string(),
+            transport: Some(NotificationTransport::Doorbell),
+            doorbell_format: Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
+            capability: Some(MailboxCapabilityProof {
+                recipient,
+                agent,
+                manifest: "codex".to_string(),
+                file: file.clone(),
+                expected_digest: mailbox_capability::file_digest(&file).unwrap(),
+            }),
+        };
+        let binding = fusion::Binding {
+            pane_root: crate::identity::ProcId { pid: 40, birth: 5 },
+            leader: crate::identity::ProcId { pid: 41, birth: 6 },
+            agent,
+            manifest: "codex".to_string(),
+        };
+        let narrow = cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH - 1;
+
+        assert_eq!(
+            notification_prewrite_bookend(&selected, Some(recipient), &binding, narrow),
+            Some(format!("pane_too_narrow:{narrow}"))
+        );
+        std::fs::write(&file, "changed capability").unwrap();
+        assert_eq!(
+            notification_prewrite_bookend(&selected, Some(recipient), &binding, narrow),
+            Some("capability_changed".to_string())
+        );
     }
 
     #[test]
@@ -12909,6 +13049,34 @@ mod composer_content_proof {
             )
             .is_none());
         }
+    }
+
+    /// Derived from the measured 0.149.1 prompt and trailer rows. The live
+    /// 187-column capture remains release evidence; this minimized fixture
+    /// proves format 3 stays exact at the supported 80-column layout.
+    #[test]
+    fn codex_0_149_1_format_3_is_exact_in_a_derived_80_column_capture() {
+        let capture = decoded_fixture(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cyclops-manifest/tests/fixtures/codex_doorbell_v3_derived_80_esc.hex"
+        )));
+        let manifest = shipped("codex");
+        let attempt_id =
+            NotificationAttemptId::parse("att-c6f5c1da-b2e8-4c2d-92a5-b463e5f9c314").unwrap();
+        let doorbell = cyclops_proto::render_doorbell_v3(attempt_id);
+
+        for row in cyclops_manifest::strip_csi(&capture).lines() {
+            assert!(row.chars().count() <= 80, "derived row exceeds 80 columns");
+        }
+        assert_eq!(
+            exact_staging_proof(
+                &manifest,
+                &capture,
+                StagingTarget::ExactRow(&doorbell),
+                &doorbell,
+            ),
+            Some((true, doorbell))
+        );
     }
 
     #[test]

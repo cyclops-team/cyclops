@@ -53,6 +53,8 @@ fn row(
         wake,
         cause: None,
         pre_write_cause: None,
+        pre_write_pane_width: None,
+        pre_write_required_pane_width: None,
         current_route: None,
         fifo_position: Some(1),
         needs_action: true,
@@ -263,6 +265,21 @@ fn a_blocked_wake_offers_one_exact_recipient_scoped_withdrawal() {
 
     let frame = render(&detail, 80, 24).join("\n");
     assert!(frame.contains("message remains claimable"), "{frame}");
+}
+
+#[test]
+fn a_width_block_says_what_was_observed_and_required() {
+    let mut row = blocked();
+    row.pre_write_cause = Some(NotificationPreWriteCause::WriteReadinessChanged);
+    row.pre_write_pane_width = Some(59);
+    row.pre_write_required_pane_width = Some(60);
+
+    let frame = render(&opened(&row, Loaded::default()), 80, 24).join("\n");
+    assert!(
+        frame.contains("pane too narrow (59, requires 60)"),
+        "{frame}"
+    );
+    assert!(!frame.contains("write readiness changed"), "{frame}");
 }
 
 #[test]
@@ -798,6 +815,8 @@ mod through_the_app {
             attempt_id: alarmed.then(|| attempt(n)),
             cause: alarmed.then_some(NotificationAttentionCause::VerifyFailed),
             pre_write_cause: None,
+            pre_write_pane_width: None,
+            pre_write_required_pane_width: None,
             attention_cleared: alarmed.then_some(false),
             resolution: None,
             resolution_intent: None,

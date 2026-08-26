@@ -224,6 +224,8 @@ pub struct QueueRow {
     pub wake: WakeWord,
     pub cause: Option<NotificationAttentionCause>,
     pub pre_write_cause: Option<NotificationPreWriteCause>,
+    pub pre_write_pane_width: Option<u32>,
+    pub pre_write_required_pane_width: Option<u32>,
     /// Current live route. The immutable send-time label remains the fallback.
     pub current_route: Option<MessageRecipientRoute>,
     /// The daemon's one-based mailbox position.

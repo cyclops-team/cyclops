@@ -143,10 +143,12 @@ With the exact shipped claim skill, Cyclops writes one content-free doorbell
 after proving a clean composer:
 
 ```text
-cyclops inbox claim m-18bfdb
+cyclops inbox claim m-att_<22-character-attempt-token>
 ```
 
-Claim that message to read its payload. If the exact skill proof is absent,
+The reserved `m-att_` locator works with positional-claim clients while the
+daemon atomically resolves the exact current attempt. The returned envelope
+names the message id used for reply. If the exact skill proof is absent,
 outdated, edited, unreadable, or changes before the write, Cyclops instead
 writes the full canonical payload ending in `[cyclops:end <id>]`. That direct
 fallback is recorded as `delivered_direct`, not as a claim, so do not run
@@ -163,8 +165,9 @@ of those states means an authenticated claim occurred.
 
 ## 3. List, claim, and reply
 
-The wake line names the exact message. List pending metadata if you need the
-queue:
+The current wake line names the exact notification attempt. Running it claims
+the bound message without exposing a mutable alias or truncated message id.
+List pending metadata if you need the queue:
 
 ```console
 $ cyclops inbox list

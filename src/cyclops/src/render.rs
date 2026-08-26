@@ -405,10 +405,20 @@ fn blocked_notification_rows(res: &StatusResult, style: &Style) -> Vec<String> {
         format!("  {}", style.dim("wake blocked before write")),
     ];
     for item in &res.blocked_notifications {
-        let reason = match item.recipient.notification.pre_write_cause {
-            Some(cause) => cause.label(),
-            None => "reason unavailable",
-        };
+        let reason = item
+            .recipient
+            .notification
+            .pane_width_block()
+            .map(|(observed, required)| {
+                format!("pane too narrow ({observed}, requires {required})")
+            })
+            .or_else(|| {
+                item.recipient
+                    .notification
+                    .pre_write_cause
+                    .map(|cause| cause.label().to_string())
+            })
+            .unwrap_or_else(|| "reason unavailable".to_string());
         let position = item
             .recipient
             .fifo_position
@@ -1610,6 +1620,8 @@ mod tests {
                         pre_write_cause: Some(
                             cyclops_proto::NotificationPreWriteCause::BindingUnprovable,
                         ),
+                        pre_write_pane_width: None,
+                        pre_write_required_pane_width: None,
                         attention_cleared: None,
                         resolution: None,
                         resolution_intent: None,
@@ -1644,7 +1656,34 @@ mod tests {
         status.blocked_notifications[0]
             .recipient
             .notification
+            .pre_write_cause =
+            Some(cyclops_proto::NotificationPreWriteCause::WriteReadinessChanged);
+        status.blocked_notifications[0]
+            .recipient
+            .notification
+            .pre_write_pane_width = Some(59);
+        status.blocked_notifications[0]
+            .recipient
+            .notification
+            .pre_write_required_pane_width = Some(60);
+        let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
+        assert!(
+            rendered.contains("pane too narrow (59, requires 60)"),
+            "{rendered}"
+        );
+
+        status.blocked_notifications[0]
+            .recipient
+            .notification
             .pre_write_cause = Some(cyclops_proto::NotificationPreWriteCause::WorkerFailed);
+        status.blocked_notifications[0]
+            .recipient
+            .notification
+            .pre_write_pane_width = None;
+        status.blocked_notifications[0]
+            .recipient
+            .notification
+            .pre_write_required_pane_width = None;
         let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
         assert!(rendered.contains("worker failed"), "{rendered}");
         assert!(rendered.contains("waited 1m"), "{rendered}");

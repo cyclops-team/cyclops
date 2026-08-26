@@ -9,20 +9,20 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock};
 
 use cyclops_ledger::{now_ms, LedgerError, LedgerWriter};
 use cyclops_proto::{
-    Event, InboxMessage, Kind, LedgerLine, MailboxEntry, MailboxEntryState, MailboxFact,
-    MailboxListItem, MailboxTypeError, MessageDirection, MessageId, MessageMetadata,
-    MessageNotificationSettlement, MessageNotificationState, MessageNotificationSummary,
-    MessagePresentation, MessageQuotaState, MessageRecipientRoute, MessageRecipientSummary,
-    MessageSnapshotRow, MessagesChangedArea, MessagesChangedData, MessagesFollowResult,
-    MessagesSnapshotCounts, MessagesSnapshotResult, NotificationAttemptId,
+    doorbell_format_names_exact_attempt, Event, InboxMessage, Kind, LedgerLine, MailboxEntry,
+    MailboxEntryState, MailboxFact, MailboxListItem, MailboxTypeError, MessageDirection, MessageId,
+    MessageMetadata, MessageNotificationSettlement, MessageNotificationState,
+    MessageNotificationSummary, MessagePresentation, MessageQuotaState, MessageRecipientRoute,
+    MessageRecipientSummary, MessageSnapshotRow, MessagesChangedArea, MessagesChangedData,
+    MessagesFollowResult, MessagesSnapshotCounts, MessagesSnapshotResult, NotificationAttemptId,
     NotificationAttentionCause, NotificationBarrierRetirementCause, NotificationBinding,
     NotificationFact, NotificationPreWriteCause, NotificationPreWriteObservation,
     NotificationRecord, NotificationRequeue, NotificationResolution,
     NotificationResolutionConsumptionEvidence, NotificationResolutionConsumptionObservation,
     NotificationState, NotificationTransport, ProcessInstanceId, RecipientKey, RequestDigest,
     StatusBlockedNotification, StatusNextAction, TmuxPaneId, WorkspaceId, CANONICAL_RECORD_VERSION,
-    DOORBELL_FORMAT_ATTEMPT_CLAIM, DOORBELL_FORMAT_COMPACT_CLAIM,
-    NOTIFICATION_RESOLUTION_PROOF_VERSION,
+    DOORBELL_FORMAT_ATTEMPT_CLAIM, DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM,
+    DOORBELL_FORMAT_COMPACT_CLAIM, NOTIFICATION_RESOLUTION_PROOF_VERSION,
 };
 use cyclops_state::StateRoot;
 use tokio::sync::broadcast;
@@ -291,6 +291,10 @@ pub enum MailboxError {
     NotificationPreWriteCauseRequired,
     #[error("a blocked pre-write notification requires the selected gate manifest")]
     NotificationPreWriteObservationRequired,
+    #[error(
+        "pane-too-narrow notification width '{observed}' is not below required width '{required}'"
+    )]
+    NotificationPaneWidthNotNarrow { observed: u32, required: u32 },
     #[error("notification attempt already used its automatic pre-write reopen")]
     NotificationPreWriteReopenExhausted,
     #[error("pre-write evidence is only allowed on a blocked pre-write transition")]
@@ -337,6 +341,8 @@ pub enum MailboxError {
     },
     #[error("notification attempt '{0}' names no current attempt in this workspace")]
     NotificationAttemptUnknown(NotificationAttemptId),
+    #[error("notification claim locator '{0}' conflicts with a stored message id")]
+    NotificationAttemptClaimLocatorConflict(MessageId),
     #[error("notification attempt '{0}' was already resolved")]
     NotificationAlreadyResolved(NotificationAttemptId),
     #[error("notification attempt '{0}' has an unresolved terminal action")]
@@ -544,6 +550,20 @@ fn notification_transition_allowed(
             && record.state == NotificationState::Staged
             && next == NotificationState::Submitted
             && uses_legacy_notification_write_contract(record))
+}
+
+fn notification_pre_write_width_block(record: &NotificationRecord) -> Option<(u32, u32)> {
+    if record.state != NotificationState::BlockedPreWrite
+        || record.pre_write_cause != Some(NotificationPreWriteCause::WriteReadinessChanged)
+    {
+        return None;
+    }
+    record
+        .pre_write_observation
+        .as_ref()?
+        .pane_width
+        .zip(record.pre_write_observation.as_ref()?.required_pane_width)
+        .filter(|(observed, required)| observed < required)
 }
 
 struct ReplyDerivation {
@@ -1472,18 +1492,43 @@ impl MailboxProjection {
             if pre_write_cause.is_none() {
                 return Err(MailboxError::NotificationPreWriteCauseRequired);
             }
+            let width_observation = pre_write_observation.as_ref().and_then(|observation| {
+                observation.pane_width.zip(observation.required_pane_width)
+            });
+            let has_partial_width_observation =
+                pre_write_observation.as_ref().is_some_and(|observation| {
+                    observation.pane_width.is_some() != observation.required_pane_width.is_some()
+                });
             if matches!(
                 pre_write_cause,
                 Some(
                     NotificationPreWriteCause::BindingUnprovable
                         | NotificationPreWriteCause::ComposerSemanticMissing
                 )
-            ) && pre_write_observation
-                .as_ref()
-                .and_then(|observation| observation.selected_manifest.as_ref())
-                .is_none()
+            ) || width_observation.is_some()
+                && pre_write_cause == Some(NotificationPreWriteCause::WriteReadinessChanged)
             {
+                if pre_write_observation
+                    .as_ref()
+                    .and_then(|observation| observation.selected_manifest.as_ref())
+                    .is_none()
+                {
+                    return Err(MailboxError::NotificationPreWriteObservationRequired);
+                }
+            }
+            if has_partial_width_observation {
                 return Err(MailboxError::NotificationPreWriteObservationRequired);
+            }
+            if let Some((observed, required)) = width_observation {
+                if pre_write_cause != Some(NotificationPreWriteCause::WriteReadinessChanged) {
+                    return Err(MailboxError::NotificationPreWriteObservationRequired);
+                }
+                if observed >= required || required == 0 {
+                    return Err(MailboxError::NotificationPaneWidthNotNarrow {
+                        observed,
+                        required,
+                    });
+                }
             }
         } else if pre_write_cause.is_some() || pre_write_observation.is_some() {
             return Err(MailboxError::NotificationPreWriteCauseForbidden);
@@ -3070,7 +3115,7 @@ impl MailboxProjection {
 
     /// Oldest exact notification barrier owned by a durable recipient claim.
     ///
-    /// A staged doorbell and a v2 ACK-timeout doorbell both keep their original
+    /// A staged doorbell and an exact-attempt ACK-timeout doorbell keep their original
     /// FIFO position until byte-exact composer reconciliation settles them.
     pub(crate) fn claimed_notification_barrier(
         &self,
@@ -3227,6 +3272,8 @@ impl MailboxProjection {
                 attempt_id: None,
                 cause: None,
                 pre_write_cause: None,
+                pre_write_pane_width: None,
+                pre_write_required_pane_width: None,
                 attention_cleared: None,
                 resolution: None,
                 resolution_intent: None,
@@ -3254,6 +3301,7 @@ impl MailboxProjection {
             .copied()
             .filter(|observation| observation.evidence.proves_exact_consumption())
             .filter(|_| resolution.is_none());
+        let width_block = notification_pre_write_width_block(record);
         MessageNotificationSummary {
             state: record.state.into(),
             quota_state: MessageQuotaState::from_notification(record.state),
@@ -3263,6 +3311,8 @@ impl MailboxProjection {
             attempt_id: Some(record.attempt_id),
             cause: record.cause,
             pre_write_cause: record.pre_write_cause,
+            pre_write_pane_width: width_block.map(|(observed, _)| observed),
+            pre_write_required_pane_width: width_block.map(|(_, required)| required),
             attention_cleared,
             resolution,
             resolution_intent,
@@ -4469,6 +4519,30 @@ impl MailboxService {
         }
     }
 
+    /// Whether the oldest pending wake is blocked only by its recorded width.
+    pub(crate) fn oldest_notification_has_width_block(
+        &self,
+        recipient: RecipientKey,
+    ) -> Result<bool, MailboxServiceError> {
+        if recipient.is_admin() {
+            return Ok(false);
+        }
+        let store = self.store()?;
+        let Some(message_id) = store
+            .projection()
+            .get_pending(recipient)
+            .first()
+            .map(|entry| &entry.message_id)
+        else {
+            return Ok(false);
+        };
+        Ok(store
+            .projection()
+            .notification(recipient, message_id)
+            .and_then(notification_pre_write_width_block)
+            .is_some())
+    }
+
     /// Reopen the oldest blocked attempt after exact route evidence changes.
     ///
     /// Ordinary mailbox changes never call this operation. The caller must
@@ -4514,7 +4588,19 @@ impl MailboxService {
             Some(NotificationPreWriteCause::BindingUnprovable) => {
                 current.pre_write_observation.as_ref() != Some(&observation)
             }
-            Some(NotificationPreWriteCause::WriteReadinessChanged) => write_ready,
+            Some(NotificationPreWriteCause::WriteReadinessChanged) => {
+                let required_width =
+                    notification_pre_write_width_block(&current).map(|(_, required)| required);
+                match required_width {
+                    Some(required) => {
+                        observation
+                            .pane_width
+                            .is_some_and(|width| width >= required)
+                            && current.pre_write_observation.as_ref() != Some(&observation)
+                    }
+                    None => write_ready,
+                }
+            }
             _ => false,
         };
         if current.state != NotificationState::BlockedPreWrite
@@ -4775,6 +4861,37 @@ impl MailboxService {
                 .projection()
                 .last_sequence()
                 .expect("a fresh claim advances the workspace sequence");
+            let changed = if notification_changed || withdrawn_attempt.is_some() {
+                &[
+                    MessagesChangedArea::Mailboxes,
+                    MessagesChangedArea::Notifications,
+                ][..]
+            } else {
+                &[MessagesChangedArea::Mailboxes][..]
+            };
+            self.publish_change(seq, changed);
+        }
+        Ok(outcome)
+    }
+
+    /// Claim a format 3 attempt locator or an imported legacy message id.
+    pub(crate) fn claim_notification_locator(
+        &self,
+        claimant: RecipientKey,
+        locator: MessageId,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<ClaimOutcome, MailboxServiceError> {
+        let mut store = self.store()?;
+        let (outcome, notification_changed) =
+            store.claim_notification_locator(claimant, locator, attempt_id)?;
+        if let ClaimOutcome::Claimed {
+            withdrawn_attempt, ..
+        } = &outcome
+        {
+            let seq = store
+                .projection()
+                .last_sequence()
+                .expect("a fresh locator claim advances the workspace sequence");
             let changed = if notification_changed || withdrawn_attempt.is_some() {
                 &[
                     MessagesChangedArea::Mailboxes,
@@ -5350,7 +5467,7 @@ impl MailboxService {
         Ok(())
     }
 
-    /// Register one boot-local attempt-bound v2 matcher before the terminal key.
+    /// Register one boot-local exact-attempt matcher before the terminal key.
     ///
     /// The payload remains in memory. Only a closed evidence kind and timestamp
     /// can cross the durable boundary after terminal acceptance is recorded.
@@ -5362,7 +5479,7 @@ impl MailboxService {
         expected_payload: String,
         not_before_ms: u64,
     ) -> Result<Option<Arc<AttentionConsumptionSignal>>, MailboxServiceError> {
-        if target.record.doorbell_format != Some(DOORBELL_FORMAT_ATTEMPT_CLAIM) {
+        if !doorbell_format_names_exact_attempt(target.record.doorbell_format) {
             return Ok(None);
         }
         let binding = target
@@ -5408,8 +5525,8 @@ impl MailboxService {
         }
     }
 
-    /// Match an authenticated hook only when its lossless v2 token parses to
-    /// this exact attempt and its payload and durable binding also match.
+    /// Match an authenticated hook only when its token names this exact
+    /// attempt and its payload and durable binding also match.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn confirm_attention_consumption_hook(
         &self,
@@ -5422,7 +5539,13 @@ impl MailboxService {
         prompt: &str,
         observed_at_ms: u64,
     ) -> bool {
-        let Some((message_id, attempt_id)) = cyclops_proto::parse_doorbell_v2(prompt) else {
+        let Some((message_id, attempt_id)) = cyclops_proto::parse_doorbell_v3(prompt)
+            .map(|attempt_id| (None, attempt_id))
+            .or_else(|| {
+                cyclops_proto::parse_doorbell_v2(prompt)
+                    .map(|(message_id, attempt_id)| (Some(message_id), attempt_id))
+            })
+        else {
             return false;
         };
         let Ok(candidates) = self.attention_consumption_candidates.lock() else {
@@ -5432,7 +5555,9 @@ impl MailboxService {
             .iter()
             .filter(|(candidate_attempt, candidate)| {
                 **candidate_attempt == attempt_id
-                    && candidate.message_id == message_id
+                    && message_id
+                        .as_ref()
+                        .is_none_or(|message_id| &candidate.message_id == message_id)
                     && candidate.session_idx == session_idx
                     && candidate.pane_id == pane_id
                     && candidate.recipient == recipient
@@ -5912,6 +6037,43 @@ impl MessageStore {
         self.claim_at(claimant, message_id, now_ms())
     }
 
+    /// Resolve a reserved format 3 locator without shadowing legacy messages.
+    /// The boolean reports whether the claim also changes notification state.
+    fn claim_notification_locator(
+        &mut self,
+        claimant: RecipientKey,
+        locator: MessageId,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<(ClaimOutcome, bool), MessageStoreError> {
+        let real_message_exists = self.projection.get_message(&locator).is_some();
+        let attempt_was_issued = self.projection.notification_attempts.contains(&attempt_id);
+        if !attempt_was_issued {
+            let notification_changed = self
+                .projection
+                .notification(claimant, &locator)
+                .map(|record| record.state.settled_by_claim(record.transport) != record.state)
+                .unwrap_or_default();
+            let outcome = self.claim_at(claimant, locator, now_ms())?;
+            return Ok((outcome, notification_changed));
+        }
+
+        let record = self
+            .projection
+            .notification_by_attempt(attempt_id)
+            .cloned()
+            .filter(|record| {
+                record.doorbell_format == Some(DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM)
+                    && record.recipient == claimant
+            })
+            .ok_or(MailboxError::NotificationAttemptUnknown(attempt_id))?;
+        if real_message_exists {
+            return Err(MailboxError::NotificationAttemptClaimLocatorConflict(locator).into());
+        }
+        let notification_changed = record.state.settled_by_claim(record.transport) != record.state;
+        let outcome = self.claim_at(claimant, record.message_id, now_ms())?;
+        Ok((outcome, notification_changed))
+    }
+
     fn claim_at(
         &mut self,
         claimant: RecipientKey,
@@ -6184,7 +6346,9 @@ impl MessageStore {
         if let Some(format) = doorbell_format {
             if !matches!(
                 format,
-                DOORBELL_FORMAT_COMPACT_CLAIM | DOORBELL_FORMAT_ATTEMPT_CLAIM
+                DOORBELL_FORMAT_COMPACT_CLAIM
+                    | DOORBELL_FORMAT_ATTEMPT_CLAIM
+                    | DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM
             ) {
                 return Err(MailboxError::UnsupportedNotificationDoorbellFormat(format).into());
             }
@@ -6810,7 +6974,7 @@ impl MessageStore {
             .expect("claimed staged clear retains its notification record"))
     }
 
-    /// Settle a claimed v2 ACK timeout after exact composer reconciliation.
+    /// Settle a claimed exact-attempt ACK timeout after composer reconciliation.
     ///
     /// The dedicated identity-only fact moves the notification to Notified and
     /// retires its barrier together. Until that append succeeds, the alarm
@@ -6833,7 +6997,7 @@ impl MessageStore {
                     record.attempt_id == attempt_id
                         && record.state == NotificationState::Notified
                         && record.transport == NotificationTransport::Doorbell
-                        && record.doorbell_format == Some(DOORBELL_FORMAT_ATTEMPT_CLAIM)
+                        && doorbell_format_names_exact_attempt(record.doorbell_format)
                         && !self
                             .projection
                             .active_notification_barriers
@@ -6991,7 +7155,7 @@ mod tests {
     use super::*;
     use cyclops_proto::{
         scratch::scratch_dir, NotificationManifestId, ProcessInstanceId, RecipientPresentation,
-        SessionInstanceId, TmuxPaneId,
+        SessionInstanceId, TmuxPaneId, DOORBELL_V3_MIN_PANE_WIDTH,
     };
     use std::fs;
     use std::io::Write;
@@ -7337,7 +7501,7 @@ mod tests {
                 notification_binding(carol).agent,
                 "codex",
                 NotificationTransport::Doorbell,
-                Some(DOORBELL_FORMAT_ATTEMPT_CLAIM),
+                Some(DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
             )
             .unwrap();
         next_change(&mut events, 26, &[MessagesChangedArea::Notifications]);
@@ -8069,7 +8233,7 @@ mod tests {
                     notification_binding(bob).agent,
                     "codex",
                     NotificationTransport::Doorbell,
-                    Some(DOORBELL_FORMAT_ATTEMPT_CLAIM),
+                    Some(DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
                 )
                 .unwrap();
             context.record_staged().unwrap();
@@ -8161,6 +8325,8 @@ mod tests {
             pane_root: Some(ProcessInstanceId::new(3999, 817_999).unwrap()),
             selected_manifest: Some(NotificationManifestId::new("wrong-pin").unwrap()),
             binding: Some(notification_binding(bob)),
+            pane_width: None,
+            required_pane_width: None,
         };
         context
             .record_pre_write_block(
@@ -8187,6 +8353,8 @@ mod tests {
             pane_root: Some(ProcessInstanceId::new(4000, 818_000).unwrap()),
             selected_manifest: Some(NotificationManifestId::new("codex").unwrap()),
             binding: Some(notification_binding(bob)),
+            pane_width: None,
+            required_pane_width: None,
         };
         assert!(service
             .reopen_oldest_notification_after_route_evidence(bob, cross_pane_observation, false,)
@@ -8199,6 +8367,8 @@ mod tests {
                 leader: None,
                 ..notification_binding(bob)
             }),
+            pane_width: None,
+            required_pane_width: None,
         };
         assert!(
             service
@@ -8242,6 +8412,8 @@ mod tests {
             pane_root: failed_observation.pane_root,
             selected_manifest: Some(NotificationManifestId::new("codex").unwrap()),
             binding: None,
+            pane_width: None,
+            required_pane_width: None,
         };
         let reopened_context = crate::notification_adapter::NotificationContext::new(
             service.store_handle(),
@@ -8262,6 +8434,8 @@ mod tests {
                 agent: ProcessInstanceId::new(4243, 818_222).unwrap(),
                 ..notification_binding(bob)
             }),
+            pane_width: None,
+            required_pane_width: None,
         };
         let lines_before_second_proof = service.journal_lines().unwrap().len();
         assert!(service
@@ -8340,6 +8514,8 @@ mod tests {
             pane_root: Some(ProcessInstanceId::new(3999, 817_999).unwrap()),
             selected_manifest: Some(NotificationManifestId::new("codex").unwrap()),
             binding: Some(notification_binding(bob)),
+            pane_width: None,
+            required_pane_width: None,
         };
 
         let lines_before = service.journal_lines().unwrap().len();
@@ -8379,7 +8555,7 @@ mod tests {
         let scratch = StoreScratch::new("operator-prewrite-withdrawal");
         let root = scratch.root();
         let journal = Path::new("workspaces/current/messages.ndjson");
-        let (workspace, admin, bob, _) = test_context();
+        let (workspace, admin, bob, carol) = test_context();
         let make_directory = || {
             MailboxDirectory::new(
                 workspace,
@@ -8416,6 +8592,8 @@ mod tests {
                     pane_root: Some(ProcessInstanceId::new(4000, 818_000).unwrap()),
                     selected_manifest: Some(NotificationManifestId::new("codex").unwrap()),
                     binding: None,
+                    pane_width: None,
+                    required_pane_width: None,
                 }),
             )
             .unwrap();
@@ -8517,6 +8695,8 @@ mod tests {
                     pane_root: Some(ProcessInstanceId::new(4000, 818_000).unwrap()),
                     selected_manifest: Some(NotificationManifestId::new("codex").unwrap()),
                     binding: Some(notification_binding(bob)),
+                    pane_width: None,
+                    required_pane_width: None,
                 },
                 true,
             )
@@ -8683,6 +8863,8 @@ mod tests {
                     pane_root: None,
                     selected_manifest: Some(NotificationManifestId::new("codex").unwrap()),
                     binding: None,
+                    pane_width: None,
+                    required_pane_width: None,
                 }),
             )
             .unwrap();
@@ -8779,6 +8961,8 @@ mod tests {
                         pane_root: None,
                         selected_manifest: Some(NotificationManifestId::new("codex").unwrap()),
                         binding: None,
+                        pane_width: None,
+                        required_pane_width: None,
                     }),
                 )
                 .unwrap();
@@ -11484,7 +11668,7 @@ mod tests {
                 NotificationState::Writing,
                 Some(notification_binding(recipient)),
                 Some(NotificationTransport::Doorbell),
-                Some(DOORBELL_FORMAT_ATTEMPT_CLAIM),
+                Some(DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
                 None,
                 base_ts + 2,
             )
@@ -13055,7 +13239,7 @@ mod tests {
                     NotificationState::Writing,
                     Some(notification_binding(bob)),
                     Some(NotificationTransport::Doorbell),
-                    Some(DOORBELL_FORMAT_ATTEMPT_CLAIM),
+                    Some(DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
                     None,
                     4,
                 )
@@ -13435,8 +13619,7 @@ mod tests {
         let service = MailboxService::new(directory, store);
         let old_attempt = attempt(1);
         let replacement_attempt = attempt(2);
-        let replacement_payload =
-            cyclops_proto::render_doorbell_v2(&message_id, replacement_attempt);
+        let replacement_payload = cyclops_proto::render_doorbell_v3(replacement_attempt);
         let signal = Arc::new(AttentionConsumptionSignal::new());
         service
             .attention_consumption_candidates
@@ -13473,7 +13656,7 @@ mod tests {
             pane_root,
             agent,
             "claude",
-            &cyclops_proto::render_doorbell_v2(&message_id, old_attempt),
+            &cyclops_proto::render_doorbell_v3(old_attempt),
             101,
         ));
         assert!(!service.confirm_attention_consumption_hook(
@@ -14504,7 +14687,9 @@ mod tests {
         let (workspace, admin, bob, _) = test_context();
         let cases = [
             (MessageId::new("m-compact").unwrap(), attempt(1), 1),
-            (MessageId::new("m-future").unwrap(), attempt(2), 999),
+            (MessageId::new("m-attempt-message").unwrap(), attempt(2), 2),
+            (MessageId::new("m-attempt-only").unwrap(), attempt(3), 3),
+            (MessageId::new("m-future").unwrap(), attempt(4), 999),
         ];
 
         {
@@ -15262,6 +15447,283 @@ mod tests {
     }
 
     #[test]
+    fn attempt_locator_claim_accepts_only_the_current_authenticated_recipient() {
+        let scratch = StoreScratch::new("attempt-claim");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, admin, bob, carol) = test_context();
+        let message_id = MessageId::new("m-attempt-claim").unwrap();
+        let old_attempt = attempt(1);
+        let current_attempt = attempt(2);
+        let mut store = MessageStore::open(&root, journal, workspace, "boot").unwrap();
+        store
+            .accept_at(
+                message_id.clone(),
+                draft(admin, vec![bob], "Claim", None),
+                1,
+            )
+            .unwrap();
+        alarm_because(
+            &mut store,
+            &message_id,
+            bob,
+            old_attempt,
+            2,
+            NotificationAttentionCause::VerifyFailed,
+        );
+        store
+            .requeue_notification(message_id.clone(), bob, old_attempt, current_attempt)
+            .unwrap();
+        store
+            .advance_notification(
+                message_id.clone(),
+                bob,
+                current_attempt,
+                NotificationState::Gating,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .advance_notification_with_transport(
+                message_id.clone(),
+                bob,
+                current_attempt,
+                NotificationState::Writing,
+                notification_binding(bob),
+                NotificationTransport::Doorbell,
+                Some(DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.claim_notification_locator(
+                bob,
+                cyclops_proto::notification_attempt_claim_locator(old_attempt),
+                old_attempt,
+            ),
+            Err(MessageStoreError::Mailbox(error))
+                if matches!(error.as_ref(), MailboxError::NotificationAttemptUnknown(found)
+                    if *found == old_attempt)
+        ));
+        assert!(matches!(
+            store.claim_notification_locator(
+                carol,
+                cyclops_proto::notification_attempt_claim_locator(current_attempt),
+                current_attempt,
+            ),
+            Err(MessageStoreError::Mailbox(error))
+                if matches!(error.as_ref(), MailboxError::NotificationAttemptUnknown(found)
+                    if *found == current_attempt)
+        ));
+        assert!(matches!(
+            store
+                .claim_notification_locator(
+                    bob,
+                    cyclops_proto::notification_attempt_claim_locator(current_attempt),
+                    current_attempt,
+                )
+                .unwrap()
+                .0,
+            ClaimOutcome::Claimed { message, .. } if message.message_id == message_id
+        ));
+    }
+
+    #[test]
+    fn attempt_locator_distinguishes_legacy_messages_without_fallback_ambiguity() {
+        let scratch = StoreScratch::new("attempt-locator-collision");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, admin, bob, carol) = test_context();
+        let never_issued = attempt(10);
+        let legacy_locator = cyclops_proto::notification_attempt_claim_locator(never_issued);
+        let current_attempt = attempt(11);
+        let current_message = MessageId::new("m-current-attempt").unwrap();
+        let colliding_locator = cyclops_proto::notification_attempt_claim_locator(current_attempt);
+        let mut store = MessageStore::open(&root, journal, workspace, "boot").unwrap();
+
+        store
+            .accept_at(
+                legacy_locator.clone(),
+                draft(admin, vec![bob], "Imported legacy locator", None),
+                1,
+            )
+            .unwrap();
+        assert!(matches!(
+            store
+                .claim_notification_locator(bob, legacy_locator.clone(), never_issued)
+                .unwrap()
+                .0,
+            ClaimOutcome::Claimed { message, .. } if message.message_id == legacy_locator
+        ));
+
+        store
+            .accept_at(
+                current_message.clone(),
+                draft(admin, vec![bob], "Current attempt", None),
+                2,
+            )
+            .unwrap();
+        store
+            .queue_notification(current_message.clone(), bob, current_attempt)
+            .unwrap();
+        store
+            .advance_notification(
+                current_message.clone(),
+                bob,
+                current_attempt,
+                NotificationState::Gating,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .advance_notification_with_transport(
+                current_message.clone(),
+                bob,
+                current_attempt,
+                NotificationState::Writing,
+                notification_binding(bob),
+                NotificationTransport::Doorbell,
+                Some(DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
+            )
+            .unwrap();
+        store
+            .accept_at(
+                colliding_locator.clone(),
+                draft(admin, vec![bob], "Imported collision", None),
+                3,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.claim_notification_locator(bob, colliding_locator.clone(), current_attempt),
+            Err(MessageStoreError::Mailbox(error))
+                if matches!(
+                    error.as_ref(),
+                    MailboxError::NotificationAttemptClaimLocatorConflict(found)
+                        if found == &colliding_locator
+                )
+        ));
+        assert!(matches!(
+            store.claim_notification_locator(carol, colliding_locator.clone(), current_attempt),
+            Err(MessageStoreError::Mailbox(error))
+                if matches!(
+                    error.as_ref(),
+                    MailboxError::NotificationAttemptUnknown(found)
+                        if *found == current_attempt
+                )
+        ));
+        assert!(store.projection().entry_is_pending(bob, &current_message));
+        assert!(store.projection().entry_is_pending(bob, &colliding_locator));
+
+        for state in [
+            NotificationState::Staged,
+            NotificationState::Submitting,
+            NotificationState::Submitted,
+        ] {
+            store
+                .advance_notification(
+                    current_message.clone(),
+                    bob,
+                    current_attempt,
+                    state,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        store
+            .advance_notification(
+                current_message.clone(),
+                bob,
+                current_attempt,
+                NotificationState::AttentionRequired,
+                None,
+                Some(NotificationAttentionCause::VerifyFailed),
+            )
+            .unwrap();
+        store
+            .requeue_notification(current_message, bob, current_attempt, attempt(12))
+            .unwrap();
+        assert!(matches!(
+            store.claim_notification_locator(bob, colliding_locator.clone(), current_attempt),
+            Err(MessageStoreError::Mailbox(error))
+                if matches!(
+                    error.as_ref(),
+                    MailboxError::NotificationAttemptUnknown(found)
+                        if *found == current_attempt
+                )
+        ));
+        assert!(store.projection().entry_is_pending(bob, &colliding_locator));
+    }
+
+    #[test]
+    fn pane_width_edge_reopens_one_exact_prewrite_attempt() {
+        let scratch = StoreScratch::new("pane-width-reopen");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, _, bob, _) = test_context();
+        let directory = MailboxDirectory::new(
+            workspace,
+            [MailboxIdentity {
+                key: bob,
+                label: "reviewer".into(),
+            }],
+        )
+        .unwrap();
+        let store = MessageStore::open(&root, journal, workspace, "boot").unwrap();
+        let service = MailboxService::new(directory, store);
+        let accepted = service
+            .send(service.admin(), mailbox_send("reviewer", "Width", ""))
+            .unwrap();
+        let queued = service.prepare_oldest_notification(bob).unwrap().unwrap();
+        let context = crate::notification_adapter::NotificationContext::new(
+            service.store_handle(),
+            accepted.message_id,
+            bob,
+            queued.attempt_id,
+        );
+        context.record_gating().unwrap();
+        let narrow = NotificationPreWriteObservation {
+            pane_root: Some(ProcessInstanceId::new(3999, 817_999).unwrap()),
+            selected_manifest: Some(NotificationManifestId::new("codex").unwrap()),
+            binding: Some(notification_binding(bob)),
+            pane_width: Some(DOORBELL_V3_MIN_PANE_WIDTH - 1),
+            required_pane_width: Some(DOORBELL_V3_MIN_PANE_WIDTH),
+        };
+        context
+            .record_pre_write_block(
+                NotificationPreWriteCause::WriteReadinessChanged,
+                Some(narrow.clone()),
+            )
+            .unwrap();
+
+        assert!(service.oldest_notification_has_width_block(bob).unwrap());
+        assert!(service
+            .reopen_oldest_notification_after_route_evidence(bob, narrow.clone(), true)
+            .unwrap()
+            .is_none());
+        let wide = NotificationPreWriteObservation {
+            pane_width: Some(DOORBELL_V3_MIN_PANE_WIDTH),
+            required_pane_width: None,
+            ..narrow
+        };
+        let reopened = service
+            .reopen_oldest_notification_after_route_evidence(bob, wide.clone(), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened.attempt_id, queued.attempt_id);
+        assert_eq!(reopened.state, NotificationState::Gating);
+        assert_eq!(reopened.pre_write_reopen_count, 1);
+        assert!(!service.oldest_notification_has_width_block(bob).unwrap());
+        assert!(service
+            .reopen_oldest_notification_after_route_evidence(bob, wide, true)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn clean_screen_retirement_is_rejected_for_an_ambiguous_attempt() {
         let scratch = StoreScratch::new("ambiguous-clean-retirement");
         let root = scratch.root();
@@ -15438,7 +15900,7 @@ mod tests {
                 NotificationState::Writing,
                 notification_binding(bob),
                 NotificationTransport::Doorbell,
-                Some(DOORBELL_FORMAT_ATTEMPT_CLAIM),
+                Some(DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
             )
             .unwrap();
         let non_writing = store
@@ -15449,7 +15911,7 @@ mod tests {
                 NotificationState::Staged,
                 None,
                 None,
-                Some(DOORBELL_FORMAT_ATTEMPT_CLAIM),
+                Some(DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
                 None,
                 5,
             )

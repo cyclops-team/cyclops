@@ -48,13 +48,14 @@ view of mailbox and wake state.
 The preferred path is this content-free notification:
 
 ```text
-cyclops inbox claim m-3f9c2a #c:<lossless-attempt-token>
+cyclops inbox claim m-att_<lossless-attempt-token>
 ```
 
 The daemon selects it only when `cyclops setup check` reports `mailbox
-doorbell`. The suffix is a shell comment carrying the exact notification
-attempt, so the command remains runnable. The recipient then claims the message
-as described below.
+doorbell`. The reserved locator remains valid positional-claim input for older
+clients. Its 22-character token losslessly identifies the exact current
+notification attempt. The daemon atomically resolves that attempt to its
+message and claims it for the authenticated recipient.
 
 If setup reports `mailbox direct payload`, Cyclops writes the full message
 envelope instead. This compatibility path exists for an absent, edited,
@@ -118,7 +119,7 @@ claim races a doorbell already staged in the composer, Cyclops must either
 submit a previously reserved terminal key or re-prove and clear that exact
 doorbell. The claim alone never settles staged bytes.
 
-A current format 2 doorbell can reach `ack_timeout` after the terminal key was
+A current format 3 doorbell can reach `ack_timeout` after the terminal key was
 sent but before Claude paints output. A later exact recipient claim starts
 reconciliation. Cyclops clears the exact staged doorbell, or proves the same
 bound composer is clean, before moving the attempt to `notified` and clearing
@@ -191,7 +192,7 @@ source.
 An ambiguous notification is never an invitation to resend blindly. Use its
 exact notification attempt id:
 
-Cyclops automatically handles a current format 2 `verify_failed` doorbell only
+Cyclops automatically handles a current exact-attempt `verify_failed` doorbell only
 when the complete durable binding and exact composer bytes still match. It
 submits once while the mailbox is pending. If the exact recipient claimed after
 the write, it clears that doorbell without submitting it. Durable intent blocks
@@ -218,6 +219,10 @@ A wake that stops before writing reports one exact cause, including
 `session_unavailable`, `manifest_unavailable`, `payload_unavailable`,
 `write_readiness_changed`, `spool_failed`, `binding_unprovable`,
 `composer_semantic_missing`, or `worker_failed`. The message remains claimable.
+For format 3, `write_readiness_changed` with an observed width below its
+recorded required width is shown as `pane_too_narrow`. The width pair is
+content-free, no pane write occurred, and a later size edge may reopen that
+same attempt once.
 A workspace administrator can release the FIFO without touching the pane:
 
 ```bash

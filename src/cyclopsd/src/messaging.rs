@@ -135,6 +135,8 @@ fn proven_binding_observation(
             agent: process_instance(binding.agent)?,
             manifest: NotificationManifestId::new(binding.manifest).ok()?,
         }),
+        pane_width: Some(route.row.width),
+        required_pane_width: None,
     })
 }
 
@@ -308,6 +310,30 @@ pub(crate) fn schedule_route_changed(inner: &Arc<Inner>, session_idx: usize, pan
     crate::attention_resolution::schedule_exact_owned_reconciliation(inner, recipient);
 }
 
+/// Reconsider a durable width block after one actual pane-size edge.
+///
+/// Size-only events remain irrelevant to normal delivery and state fusion.
+/// Once the exact blocked attempt reopens, later size events are no-ops.
+pub(crate) fn schedule_pane_size_changed(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) {
+    let Some(service) = inner.mailbox.as_ref() else {
+        return;
+    };
+    let Some(recipient) = inner.recipient_key(session_idx, pane_id) else {
+        return;
+    };
+    match service.oldest_notification_has_width_block(recipient) {
+        Ok(true) => {
+            if let Err(error) = schedule_recipient_after_route_evidence(inner, service, recipient) {
+                error!(%recipient, %error, "cannot reopen width-blocked mailbox notification");
+            }
+        }
+        Ok(false) => {}
+        Err(error) => {
+            error!(%recipient, %error, "cannot inspect width-blocked mailbox notification");
+        }
+    }
+}
+
 /// Resume queued work after a route appears or a daemon restarts.
 pub(crate) fn schedule_available(inner: &Arc<Inner>) {
     let Some(service) = inner.mailbox.as_ref() else {
@@ -413,6 +439,26 @@ pub(crate) fn claim(
     message_id: MessageId,
 ) -> Result<ClaimOutcome, MailboxServiceError> {
     let outcome = service.claim(claimant, message_id)?;
+    finish_claim(inner, service, claimant, outcome)
+}
+
+pub(crate) fn claim_notification_locator(
+    inner: &Arc<Inner>,
+    service: &Arc<MailboxService>,
+    claimant: RecipientKey,
+    locator: MessageId,
+    attempt_id: cyclops_proto::NotificationAttemptId,
+) -> Result<ClaimOutcome, MailboxServiceError> {
+    let outcome = service.claim_notification_locator(claimant, locator, attempt_id)?;
+    finish_claim(inner, service, claimant, outcome)
+}
+
+fn finish_claim(
+    inner: &Arc<Inner>,
+    service: &Arc<MailboxService>,
+    claimant: RecipientKey,
+    outcome: ClaimOutcome,
+) -> Result<ClaimOutcome, MailboxServiceError> {
     let (withdrawn, consumed_doorbell, claimed_ack_timeout) = match &outcome {
         ClaimOutcome::Claimed {
             withdrawn_attempt,

@@ -268,6 +268,8 @@ fn row_for(
         wake,
         cause: to.notification.cause,
         pre_write_cause: to.notification.pre_write_cause,
+        pre_write_pane_width: to.notification.pre_write_pane_width,
+        pre_write_required_pane_width: to.notification.pre_write_required_pane_width,
         current_route: to.current_route.clone(),
         fifo_position: to.fifo_position,
         needs_action: to.needs_action,

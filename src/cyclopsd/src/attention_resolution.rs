@@ -1383,6 +1383,11 @@ composer_continuation_regex = '^  (?P<content>.*)$'
                 target.record.attempt_id
             ))
         );
+        target.record.doorbell_format = Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM);
+        assert_eq!(
+            expected_notification_from_message(&target, &message),
+            Some(cyclops_proto::render_doorbell_v3(target.record.attempt_id))
+        );
         target.record.doorbell_format = Some(999);
         assert_eq!(expected_notification_from_message(&target, &message), None);
         let checks = AttentionChecks {

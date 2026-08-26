@@ -884,7 +884,20 @@ fn inbox_claim(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Resp
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    let result = match crate::messaging::claim(inner, &service, caller.key, params.message_id) {
+    // Only inbox.claim interprets the reserved locator. Every other message-id
+    // consumer keeps treating the same bytes as a literal historical id.
+    let outcome = match cyclops_proto::parse_notification_attempt_claim_locator(&params.message_id)
+    {
+        Some(attempt_id) => crate::messaging::claim_notification_locator(
+            inner,
+            &service,
+            caller.key,
+            params.message_id,
+            attempt_id,
+        ),
+        None => crate::messaging::claim(inner, &service, caller.key, params.message_id),
+    };
+    let result = match outcome {
         Ok(crate::mailbox::ClaimOutcome::Claimed { message, .. }) => InboxClaimResult {
             disposition: ClaimDisposition::Claimed,
             message,
@@ -1357,6 +1370,7 @@ pub(crate) fn mailbox_service_error(error: crate::mailbox::MailboxServiceError) 
                 MailboxError::DuplicateIdempotencyKey { .. }
                 | MailboxError::AlreadyClaimed { .. }
                 | MailboxError::NotificationAttemptMismatch { .. }
+                | MailboxError::NotificationAttemptClaimLocatorConflict(_)
                 | MailboxError::NotificationClearRequiresAttention
                 | MailboxError::NotificationRequeueRequiresAttention
                 | MailboxError::NotificationRequeueBarrierBindingIncomplete(_)
@@ -2556,6 +2570,16 @@ mod tests {
         assert_eq!(error.code, "message_not_pending");
     }
 
+    #[test]
+    fn a_locator_collision_has_a_stable_wire_conflict_code() {
+        let locator = cyclops_proto::MessageId::new("m-att_AAAAAAAAQACAAAAAAAAAAQ").unwrap();
+        let error = mailbox_service_error(crate::mailbox::MailboxServiceError::from(
+            crate::mailbox::MailboxError::NotificationAttemptClaimLocatorConflict(locator),
+        ));
+
+        assert_eq!(error.code, "conflict");
+    }
+
     #[tokio::test]
     async fn stale_socket_is_replaced_before_recursive_state_repair() {
         let home = cyclops_proto::scratch::scratch_dir("cyc-stale-socket-repair");
@@ -3092,6 +3116,8 @@ mod tests {
                     pane_root: None,
                     selected_manifest: Some(NotificationManifestId::new("codex").unwrap()),
                     binding: None,
+                    pane_width: None,
+                    required_pane_width: None,
                 }),
             )
             .unwrap();

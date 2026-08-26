@@ -316,13 +316,25 @@ write boundary. An exact installed claim skill selects the content-free
 doorbell:
 
 ```text
-cyclops inbox claim m-7fe0df #c:<lossless-attempt-token>
+cyclops inbox claim m-att_<lossless-attempt-token>
 ```
 
-The shell comment is a 22-character URL-safe encoding of the complete 128-bit
-notification attempt id. It parses back to the typed id. This keeps the claim
-command runnable while preventing a delayed hook for an older attempt on the
-same message from confirming its replacement.
+The 22-character URL-safe token encodes the complete 128-bit notification
+attempt id. The `m-att_` namespace is reserved for this locator and is disjoint
+from production message ids, which are always `m-` plus 32 lowercase hex
+characters. Older clients already accept it as a positional claim argument.
+Only the daemon's `inbox.claim` handler interprets the canonical locator; other
+message-id consumers do not. It resolves only the current attempt for that
+exact authenticated recipient and appends the claim under the same store lock.
+A delayed command for a replaced attempt cannot claim its replacement.
+
+Format 3 must fit one exact composer row. A pane narrower than 60 columns is
+recorded as `blocked_pre_write` with the compatible cause
+`write_readiness_changed`, plus its observed and required widths. Current
+clients render that evidence as `pane_too_narrow`. No paste occurs. A later
+width observation meeting the recorded requirement may reopen that same
+attempt once. The operator may withdraw it while it remains provably
+pre-write.
 
 If that exact capability is absent, outdated, edited, unreadable, or changes
 before the write, the daemon submits the canonical full payload ending in
@@ -343,14 +355,14 @@ replacement.
 An ambiguous terminal outcome moves to `attention_required` and never triggers
 an automatic second write. A doorbell message remains pending until claim. A
 successful direct fallback settles the mailbox entry as `delivered_direct`.
-For a current format 2 doorbell with a complete binding, an exact recipient
+For an exact-attempt doorbell with a complete binding, an exact recipient
 claim can start reconciliation of `attention_required` with cause `ack_timeout`.
 The claim leaves that state and its FIFO barrier unchanged until Cyclops clears
 the exact staged doorbell or proves the same bound composer is clean. One
 dedicated fact then moves the attempt to `notified` and retires the barrier
 atomically. It does not settle other attention causes or prove task completion.
 
-A current format 2 `verify_failed` doorbell with a complete binding enters
+An exact-attempt `verify_failed` doorbell with a complete binding enters
 automatic exact-owned recovery only when the current normalized composer is an
 exact match and terminal action is safe. A pending mailbox selects `complete`
 and one submit key. An exact recipient claim ordered after `writing` selects
@@ -362,11 +374,13 @@ Admin has no pane route, so an accepted admin message reports `not_started` and
 remains in the durable admin inbox without a notification attempt.
 
 The Writing transition carries `transport: "doorbell" | "direct_payload"`
-beside `binding`. A current doorbell also carries `doorbell_format: 2`, which
-fixes the attempt-bound claim command bytes for later recovery. Format 1 is the
-older message-only compact claim command. A missing format identifies the
-original verbose doorbell. Unknown numeric formats replay but cannot authorize
-an attention recovery action. Current binding records contain
+beside `binding`. A current doorbell carries `doorbell_format: 3`, which fixes
+the reserved attempt-locator command bytes for later recovery. Format 2 is the
+older message id plus a lossless attempt-token comment. Format 1 is the older
+message-only compact claim command. Formats 1 and 2 replay with their original
+bytes. A missing format identifies the original verbose doorbell. Unknown
+numeric formats replay but cannot authorize an attention recovery action.
+Current binding records contain
 the recipient, pane-root generation, foreground leader generation, admitted
 agent generation, and manifest. Older rows without pane-root or leader
 generation replay but cannot authorize a later terminal action. Transport and
@@ -437,6 +451,13 @@ mailbox entry, and returns the immutable payload:
     "sender_label":"admin",
     "subject":"Review the rate limiter","thread_root":"m-7fe0df"}}}
 ```
+
+When the `message_id` is the canonical reserved `m-att_` locator from a format
+3 doorbell, `inbox.claim` resolves the current attempt and claims its bound
+message under one mailbox-store lock. A stale or foreign issued attempt never
+falls back to a literal message claim. If an imported legacy message uses the
+same locator bytes, Cyclops reports a conflict instead of choosing either
+target. No other method interprets the reserved locator.
 
 Reclaiming the same id returns `already_claimed` with the same payload and
 appends no second claim. An entry that is no longer claimable returns
@@ -535,10 +556,11 @@ Broadcast `*` addresses adopted agent panes only.
 
 `msg.requeue` takes one `message_id`. `alarm.preview` takes `older_than_ms`.
 Before minting fresh attempts, requeue resolves the complete selected recipient
-set. A current format 2 `verify_failed` composer barrier must be resolved first.
-If any selected attempt owns such an exact barrier, or a post-write barrier
-whose binding is absent or lacks pane-root or foreground-leader generation, the
-whole request returns `conflict` and appends nothing. The existing attempt remains
+set. A current exact-attempt `verify_failed` composer barrier must be resolved
+first. If any selected attempt owns such an exact barrier, or a post-write
+barrier whose binding is absent or lacks pane-root or foreground-leader
+generation, the whole request returns `conflict` and appends nothing. The
+existing attempt remains
 visible and claimable.
 `alarm.clear` takes a non-empty list of explicit alarm ids; there is no
 clear-all or age-selected daemon mutation. The human CLI implements

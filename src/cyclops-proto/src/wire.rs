@@ -918,6 +918,12 @@ pub struct MessageNotificationSummary {
     /// Exact reason an attempt stopped before any terminal write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_write_cause: Option<crate::notification::NotificationPreWriteCause>,
+    /// Pane width observed for a compatibility-encoded width block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_write_pane_width: Option<u32>,
+    /// Minimum width recorded with `pre_write_pane_width`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_write_required_pane_width: Option<u32>,
     /// Present only for attention-required attempts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention_cleared: Option<bool>,
@@ -939,6 +945,20 @@ pub struct MessageNotificationSummary {
         Option<crate::notification::NotificationResolutionConsumptionObservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<u64>,
+}
+
+impl MessageNotificationSummary {
+    /// Exact observed and required widths for a format-specific pre-write block.
+    pub fn pane_width_block(&self) -> Option<(u32, u32)> {
+        if self.pre_write_cause
+            != Some(crate::notification::NotificationPreWriteCause::WriteReadinessChanged)
+        {
+            return None;
+        }
+        self.pre_write_pane_width
+            .zip(self.pre_write_required_pane_width)
+            .filter(|(observed, required)| observed < required)
+    }
 }
 
 /// One recipient's mailbox and notification state for a message.
@@ -1447,6 +1467,16 @@ mod tests {
     }
 
     #[test]
+    fn message_claim_keeps_its_original_wire_shape() {
+        let message = serde_json::to_value(InboxClaimParams {
+            message_id: "m-one".parse().unwrap(),
+        })
+        .unwrap();
+
+        assert_eq!(message, serde_json::json!({"message_id": "m-one"}));
+    }
+
+    #[test]
     fn missing_params_defaults_to_null() {
         let req: Request = serde_json::from_str(r#"{"id":"a","method":"status"}"#).unwrap();
         assert!(req.params.is_null());
@@ -1758,6 +1788,8 @@ mod tests {
                 attempt_id: None,
                 cause: None,
                 pre_write_cause: None,
+                pre_write_pane_width: None,
+                pre_write_required_pane_width: None,
                 attention_cleared: None,
                 resolution: None,
                 resolution_intent: None,
@@ -1792,6 +1824,8 @@ mod tests {
             attempt_id: None,
             cause: Some(crate::NotificationAttentionCause::VerifyFailed),
             pre_write_cause: None,
+            pre_write_pane_width: None,
+            pre_write_required_pane_width: None,
             attention_cleared: Some(false),
             resolution: None,
             resolution_intent: None,
@@ -1814,6 +1848,30 @@ mod tests {
         assert_eq!(
             decoded.resolution,
             Some(crate::NotificationResolution::Discard)
+        );
+    }
+
+    #[test]
+    fn notification_summary_exposes_width_detail_without_changing_the_closed_cause() {
+        #[derive(Debug, Deserialize)]
+        struct LegacySummary {
+            state: MessageNotificationState,
+            pre_write_cause: crate::NotificationPreWriteCause,
+        }
+
+        let wire = serde_json::json!({
+            "state": "gating",
+            "pre_write_cause": "write_readiness_changed",
+            "pre_write_pane_width": 59,
+            "pre_write_required_pane_width": 60
+        });
+        let current: MessageNotificationSummary = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(current.pane_width_block(), Some((59, 60)));
+        let legacy: LegacySummary = serde_json::from_value(wire).unwrap();
+        assert_eq!(legacy.state, MessageNotificationState::Gating);
+        assert_eq!(
+            legacy.pre_write_cause,
+            crate::NotificationPreWriteCause::WriteReadinessChanged
         );
     }
 
@@ -1853,6 +1911,8 @@ mod tests {
                 attempt_id: None,
                 cause: None,
                 pre_write_cause: None,
+                pre_write_pane_width: None,
+                pre_write_required_pane_width: None,
                 attention_cleared: None,
                 resolution: None,
                 resolution_intent: None,
@@ -1886,6 +1946,8 @@ mod tests {
             attempt_id: None,
             cause: Some(crate::NotificationAttentionCause::VerifyFailed),
             pre_write_cause: None,
+            pre_write_pane_width: None,
+            pre_write_required_pane_width: None,
             attention_cleared: Some(false),
             resolution: None,
             resolution_intent: Some(crate::NotificationResolution::Complete),
@@ -1972,6 +2034,8 @@ mod tests {
                 attempt_id: None,
                 cause: None,
                 pre_write_cause: None,
+                pre_write_pane_width: None,
+                pre_write_required_pane_width: None,
                 attention_cleared: None,
                 resolution: None,
                 resolution_intent: None,

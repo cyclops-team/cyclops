@@ -3865,12 +3865,15 @@ async fn handle_pane_event(
                         | PaneField::PanePid
                 )
             });
+            let size_changed = changed.iter().any(|field| matches!(field, PaneField::Size));
             if relevant {
                 fusion::recompute_pane(inner, session_idx, watcher, &id, false, "pane_changed")
                     .await;
             }
             if occupant_changed {
                 messaging::schedule_route_changed(inner, session_idx, &id);
+            } else if size_changed {
+                messaging::schedule_pane_size_changed(inner, session_idx, &id);
             }
             // A move does not touch agent state, but it does move half the
             // chrome: the pane carries its own options and the window's

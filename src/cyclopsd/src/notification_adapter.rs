@@ -367,7 +367,7 @@ impl NotificationContext {
         Ok(record)
     }
 
-    /// Settle an exact claimed v2 ACK timeout after composer reconciliation.
+    /// Settle an exact claimed attempt ACK timeout after composer reconciliation.
     pub(crate) fn settle_claimed_ack_timeout_reconciliation(
         &self,
     ) -> Result<NotificationRecord, NotificationAdapterError> {

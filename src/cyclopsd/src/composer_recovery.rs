@@ -459,7 +459,7 @@ pub(crate) fn retire_exact_lifecycle(
     if canonical.iter().any(|record| {
         record.attempt_id == candidate && record.needs_claimed_ack_timeout_reconciliation()
     }) {
-        // Exact v2 ACK-timeout recovery owns its own clear-or-clean settlement
+        // Exact attempt ACK-timeout recovery owns its own clear-or-clean settlement
         // fact. A turn end cannot remove that barrier or hide its alarm.
         return LifecycleRetirement::Blocked("claimed_notification_reconciliation_pending");
     }

@@ -223,6 +223,12 @@ async fn wait_for_pane_mode(rig: &mut Rig, pane: &str, expected: bool) {
     }
 }
 
+async fn resize_pane_and_allow_event(rig: &Rig, pane: &str, width: u32) {
+    let width = width.to_string();
+    rig.tmux.run_ok(&["resize-pane", "-t", pane, "-x", &width]);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+}
+
 fn pane_pid(rig: &Rig, pane: &str) -> i64 {
     let output = rig
         .tmux
@@ -759,7 +765,139 @@ async fn changed_chrome_does_not_receipt_a_swallowed_compact_doorbell() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_exact_v2_ack_timeout_claim_clears_then_advances_the_fifo() {
+async fn format_3_width_block_writes_nothing_then_reopens_once_on_a_size_edge() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "workspace-format3-width-edge",
+        CAT_MANIFEST,
+        &composer_pane(),
+        "delivery_retry_max = 0",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+    resize_pane_and_allow_event(&rig, &pane, 59).await;
+
+    let sent = send_workspace_message(&rig, "format3-width", "Width", "private body").await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::BlockedPreWrite).await;
+    let blocked = notification_transition(&rig, &message_id, NotificationState::BlockedPreWrite)
+        .expect("the narrow pane block is durable");
+    let fact = blocked.data.as_ref().expect("blocked transition data");
+    assert_eq!(fact["pre_write_cause"], "write_readiness_changed");
+    assert_eq!(fact["pre_write_observation"]["pane_width"], 59);
+    assert_eq!(
+        fact["pre_write_observation"]["required_pane_width"],
+        cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH
+    );
+    let attempt = NotificationAttemptId::parse(fact["attempt_id"].as_str().unwrap()).unwrap();
+    let doorbell = cyclops_proto::render_doorbell_v3(attempt);
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::Writing),
+        0
+    );
+    assert!(!pane_history(&rig, &pane).contains(&doorbell));
+
+    let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
+    let notification = &snapshot["result"]["rows"][0]["recipients"][0]["notification"];
+    assert_eq!(notification["pre_write_cause"], "write_readiness_changed");
+    assert_eq!(notification["pre_write_pane_width"], 59);
+    assert_eq!(
+        notification["pre_write_required_pane_width"],
+        cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH
+    );
+
+    resize_pane_and_allow_event(&rig, &pane, cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH).await;
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::Writing).await;
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::Gating),
+        2,
+        "one width edge must reopen the same attempt exactly once"
+    );
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::BlockedPreWrite),
+        1
+    );
+    assert_eq!(notification_attempts(&rig, &message_id).len(), 1);
+
+    resize_pane_and_allow_event(&rig, &pane, cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH).await;
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::Gating),
+        2,
+        "an unchanged size cannot start another reopen chain"
+    );
+
+    rig.daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn format_3_resize_between_final_read_and_write_is_caught() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "workspace-format3-width-bookend",
+        CAT_MANIFEST,
+        &composer_pane(),
+        "delivery_retry_max = 0",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let pause = Arc::clone(&release);
+    rig.daemon.set_inject_pause(move |phase| {
+        let entered_tx = entered_tx.clone();
+        let pause = Arc::clone(&pause);
+        Box::pin(async move {
+            if phase != "post_final_prewrite" {
+                return;
+            }
+            let _ = entered_tx.send(());
+            pause.acquire_owned().await.unwrap().forget();
+        })
+    });
+
+    let sent =
+        send_workspace_message(&rig, "format3-width-bookend", "Width race", "private body").await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+        .await
+        .expect("delivery reached the final pre-write bookend")
+        .expect("pause sender stayed open");
+    resize_pane_and_allow_event(&rig, &pane, 59).await;
+    release.add_permits(1);
+
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::BlockedPreWrite).await;
+    let blocked = notification_transition(&rig, &message_id, NotificationState::BlockedPreWrite)
+        .expect("the on-write width bookend refused the pane");
+    let fact = blocked.data.as_ref().expect("blocked transition data");
+    assert_eq!(fact["pre_write_cause"], "write_readiness_changed");
+    assert_eq!(fact["pre_write_observation"]["pane_width"], 59);
+    assert_eq!(
+        fact["pre_write_observation"]["required_pane_width"],
+        cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH
+    );
+    let attempt = NotificationAttemptId::parse(fact["attempt_id"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::Writing),
+        0
+    );
+    assert!(!pane_history(&rig, &pane).contains(&cyclops_proto::render_doorbell_v3(attempt)));
+
+    rig.daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exact_attempt_ack_timeout_claim_clears_then_advances_the_fifo() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -780,7 +918,7 @@ async fn an_exact_v2_ack_timeout_claim_clears_then_advances_the_fifo() {
         "submit = \"Enter\"\nclear_keys = [\"C-c\"]\n",
     );
     let mut rig = Rig::new(
-        "workspace-claimed-v2-ack-timeout",
+        "workspace-claimed-v3-ack-timeout",
         &manifest,
         &pane_command,
         "delivery_retry_max = 0\nreceipt_block_ms = 300\nack_timeout_ms = 50\n",
@@ -790,7 +928,7 @@ async fn an_exact_v2_ack_timeout_claim_clears_then_advances_the_fifo() {
     rig.label(&pane, "worker").await;
     wait_pane_state(&mut rig, "idle").await;
 
-    let pair = send_waiting_pair(&rig, "claimed-v2-ack-timeout").await;
+    let pair = send_waiting_pair(&rig, "claimed-v3-ack-timeout").await;
     assert_only_oldest_attempt_exists(&rig, &pair);
     wait_for_notification_state(&mut rig, &pair.first, NotificationState::Staged).await;
     wait_for_notification_state(&mut rig, &pair.first, NotificationState::Submitted).await;
@@ -802,10 +940,8 @@ async fn an_exact_v2_ack_timeout_claim_clears_then_advances_the_fifo() {
     let attempt_id = attention.data.as_ref().unwrap()["attempt_id"]
         .as_str()
         .unwrap();
-    let expected = cyclops_proto::render_doorbell_v2(
-        &MessageId::new(&pair.first).unwrap(),
-        NotificationAttemptId::parse(attempt_id).unwrap(),
-    );
+    let expected =
+        cyclops_proto::render_doorbell_v3(NotificationAttemptId::parse(attempt_id).unwrap());
     assert!(rig.tmux.capture(&pane).contains(&expected));
     assert_eq!(fs::read_to_string(&submit_log).unwrap().lines().count(), 1);
 

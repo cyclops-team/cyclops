@@ -261,6 +261,8 @@ pub struct Detail {
     /// The daemon's answer for this exact unwritten wake and authenticated caller.
     can_withdraw_notification: bool,
     pre_write_cause: Option<NotificationPreWriteCause>,
+    pre_write_pane_width: Option<u32>,
+    pre_write_required_pane_width: Option<u32>,
     current_route: Option<MessageRecipientRoute>,
     fifo_position: Option<u64>,
 }
@@ -300,6 +302,8 @@ impl Detail {
             can_manage_attention: row.can_manage_attention,
             can_withdraw_notification: row.can_withdraw_notification,
             pre_write_cause: row.pre_write_cause,
+            pre_write_pane_width: row.pre_write_pane_width,
+            pre_write_required_pane_width: row.pre_write_required_pane_width,
             current_route: row.current_route.clone(),
             fifo_position: row.fifo_position,
             message_id: row.message_id.to_string(),
@@ -483,6 +487,8 @@ impl Detail {
                     || row.resolution_action_accepted != self.resolution_action_accepted
                     || row.resolution_consumption_observed != self.resolution_consumption_observed
                     || row.pre_write_cause != self.pre_write_cause
+                    || row.pre_write_pane_width != self.pre_write_pane_width
+                    || row.pre_write_required_pane_width != self.pre_write_required_pane_width
                     || row.current_route != self.current_route
                     || row.fifo_position != self.fifo_position
                 {
@@ -492,6 +498,8 @@ impl Detail {
                     self.resolution_action_accepted = row.resolution_action_accepted;
                     self.resolution_consumption_observed = row.resolution_consumption_observed;
                     self.pre_write_cause = row.pre_write_cause;
+                    self.pre_write_pane_width = row.pre_write_pane_width;
+                    self.pre_write_required_pane_width = row.pre_write_required_pane_width;
                     self.current_route = row.current_route.clone();
                     self.fifo_position = row.fifo_position;
                     self.needs_reload = true;
@@ -728,6 +736,8 @@ impl Detail {
             self.can_withdraw_notification = false;
             self.wake = WakeWord::WithdrawnByOperator;
             self.pre_write_cause = None;
+            self.pre_write_pane_width = None;
+            self.pre_write_required_pane_width = None;
         }
         self.loaded.claim_note = Some(note.into());
         self.stage = Stage::Open;
@@ -987,11 +997,21 @@ pub(crate) fn render_with_status(
 
     match detail.wake() {
         WakeWord::BlockedBeforeWrite => {
-            let reason = match detail.pre_write_cause {
-                Some(cause) => cause.label(),
-                None => "reason unavailable",
-            };
-            body.push(format!("wake blocked before write: {reason}"));
+            if let Some((observed, required)) = detail
+                .pre_write_pane_width
+                .zip(detail.pre_write_required_pane_width)
+                .filter(|(observed, required)| observed < required)
+            {
+                body.push(format!(
+                    "wake blocked before write: pane too narrow ({observed}, requires {required})"
+                ));
+            } else {
+                let reason = match detail.pre_write_cause {
+                    Some(cause) => cause.label(),
+                    None => "reason unavailable",
+                };
+                body.push(format!("wake blocked before write: {reason}"));
+            }
             body.push(format!(
                 "mailbox position: {}",
                 detail

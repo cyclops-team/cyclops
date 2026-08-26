@@ -198,6 +198,7 @@ roster_empty() { "$CYC" --json list | jq -e '.agents | length == 0' >/dev/null; 
 
 pane_command_done() { [ -f "$ROOT/done.$1" ]; }
 pane_has_text() { tmx capture-pane -p -t "$1" | grep -Fq -- "$2"; }
+pane_matches() { tmx capture-pane -p -t "$1" | grep -Eq -- "$2"; }
 
 start_agent() {
   local label="$1" pane="$2" control="$ROOT/control.main.$1"
@@ -666,21 +667,25 @@ check "acceptance is separate from notification" '^accepted m-[[:xdigit:]]{32}$'
 check "the wake is a second fact" '^✓ accepted( · [0-9]+ ahead)? · wake (not started|queued|checking readiness|writing|staged|submitted|notified|withdrawn|needs attention|superseded)$'
 check_exit "mailbox acceptance exits 0" 0
 REVIEW_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
-wait_for "the reviewer mailbox doorbell" 100 pane_has_text "$N2" "cyclops inbox claim $REVIEW_ID"
+wait_for "the reviewer mailbox doorbell" 100 pane_matches "$N2" '^❯ cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 printf '\n$ tmux capture-pane -p -t %s\n' "$N2"
 tmx capture-pane -p -t "$N2" | grep -v '^$' > "$OUT"
 cat "$OUT"
-check "the recipient sees only the exact attempt doorbell" "^❯ cyclops inbox claim $REVIEW_ID #c:[A-Za-z0-9_-]{22}\$"
+check "the recipient sees only the exact attempt doorbell" '^❯ cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 check_absent "the pane does not receive the body" '^Check the mailbox contract\.$'
+REVIEW_LOCATOR="$(awk '/^❯ cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$/ { print $5; exit }' "$OUT")"
+[ -n "$REVIEW_LOCATOR" ] || { echo "!! exact attempt locator was not captured" >&2; exit 1; }
 wait_for "the reviewer doorbell to be submitted" 100 notification_crossed_submit "$REVIEW_ID"
 
 # The same durable recipient agent claims the payload over the socket.
 stop_composer reviewer "$N2"
 agent_command reviewer "$N2" "inbox list --plain"
 check "inbox list exposes metadata" "^$REVIEW_ID implementer · Release notes review\$"
-agent_command reviewer "$N2" "inbox claim $REVIEW_ID --plain"
-check "claim fetches the envelope" "^\[cyclops $REVIEW_ID\] FROM: implementer  SUBJECT: Release notes review\$"
-check "claim fetches the body" '^Check the mailbox contract\.$'
+agent_command reviewer "$N2" "inbox claim $REVIEW_LOCATOR --plain"
+check "the displayed locator fetches the original envelope" "^\[cyclops $REVIEW_ID\] FROM: implementer  SUBJECT: Release notes review\$"
+check "the displayed locator fetches the body" '^Check the mailbox contract\.$'
+agent_command reviewer "$N2" "inbox claim $REVIEW_LOCATOR --plain"
+check "the same locator repeat returns the same payload" '^Check the mailbox contract\.$'
 agent_command reviewer "$N2" "inbox claim $REVIEW_ID --plain"
 check "plain repeat claim returns the same payload" '^Check the mailbox contract\.$'
 
@@ -756,7 +761,7 @@ agent_command implementer "$N1" 'send reviewer --subject "Burst path fix, ready 
 check "the handoff is accepted from the pane" '^accepted m-[[:xdigit:]]{32}$'
 check_exit "the handoff exits 0" 0
 HANDOFF="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
-wait_for "the handoff doorbell" 100 pane_has_text "$N2" "cyclops inbox claim $HANDOFF"
+wait_for "the handoff doorbell" 100 pane_matches "$N2" '^❯ cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 wait_for "the handoff doorbell to be submitted" 100 notification_crossed_submit "$HANDOFF"
 
 stop_composer reviewer "$N2"
@@ -771,7 +776,7 @@ agent_command reviewer "$N2" "reply $HANDOFF --body \"Approved. One nit in the r
 check "reply derives routing from the parent" '^accepted m-[[:xdigit:]]{32}$'
 check_exit "an accepted reply exits 0" 0
 REPLY_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
-wait_for "the reply doorbell" 100 pane_has_text "$N1" "cyclops inbox claim $REPLY_ID"
+wait_for "the reply doorbell" 100 pane_matches "$N1" '^❯ cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 wait_for "the reply doorbell to be submitted" 100 notification_crossed_submit "$REPLY_ID"
 stop_composer implementer "$N1"
 agent_command implementer "$N1" "inbox claim $REPLY_ID --plain"
@@ -828,6 +833,7 @@ duo_daemon_up() { duo "$CYC" --json status >/dev/null 2>&1; }
 duo_attached() { duo "$CYC" --json status | jq -e '.sessions[0].attached == true' >/dev/null; }
 duo_roster_has() { duo "$CYC" --json list | jq -e --arg a "$1" '[.agents[].agent] | index($a)' >/dev/null; }
 duo_pane_has_text() { duo_tmx capture-pane -p -t "$1" | grep -Fq -- "$2"; }
+duo_pane_matches() { duo_tmx capture-pane -p -t "$1" | grep -Eq -- "$2"; }
 duo_pane_bound_to() {
   duo "$CYC" --json status | jq -e --arg p "$1" --arg m "$2" \
     '[.sessions[].panes[] | select(.pane_id == $p and .manifest == $m)] | length > 0' >/dev/null
@@ -989,7 +995,7 @@ check "the first message is accepted"     '^accepted m-[[:xdigit:]]{32}$'
 check "and reports notification separately" '^✓ accepted( · [0-9]+ ahead)? · wake (not started|queued|checking readiness|writing|staged|submitted|notified|withdrawn|needs attention|superseded)$'
 check_exit "and accepted send exits 0" 0
 DUO_MESSAGE_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
-wait_for "the second rig reviewer doorbell" 100 duo_pane_has_text "$D2" "cyclops inbox claim $DUO_MESSAGE_ID"
+wait_for "the second rig reviewer doorbell" 100 duo_pane_matches "$D2" '^❯ cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 wait_for "the second rig doorbell to be submitted" 100 duo_notification_crossed_submit "$DUO_MESSAGE_ID"
 
 printf '\n$ cyclops history\n'
@@ -1015,6 +1021,7 @@ stock_roster_has() { stock "$CYC" --json list | jq -e --arg a "$1" '[.agents[].a
 stock_idle() { stock "$CYC" --json list | jq -e --arg a "$1" \
   '[.agents[] | select(.agent == $a and .state == "idle")] | length == 1' >/dev/null; }
 stock_pane_has_text() { stock_tmx capture-pane -p -t "$1" | grep -Fq -- "$2"; }
+stock_pane_matches() { stock_tmx capture-pane -p -t "$1" | grep -Eq -- "$2"; }
 stock_pane_bound_to() {
   stock "$CYC" --json status | jq -e --arg p "$1" --arg m "$2" \
     '[.sessions[].panes[] | select(.pane_id == $p and .manifest == $m)] | length > 0' >/dev/null
@@ -1154,10 +1161,10 @@ check "the default bound send is accepted" '^accepted m-[[:xdigit:]]{32}$'
 check "its wake state is separate" '^✓ accepted( · [0-9]+ ahead)? · wake (not started|queued|checking readiness|writing|staged|submitted|notified|withdrawn|needs attention|superseded)$'
 check_exit "the default bound send exits 0" 0
 STOCK_BOUND_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
-wait_for "the defaults reviewer doorbell" 100 stock_pane_has_text "$S2" "cyclops inbox claim $STOCK_BOUND_ID"
+wait_for "the defaults reviewer doorbell" 100 stock_pane_matches "$S2" '^❯ cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 wait_for "the defaults doorbell to be submitted" 100 stock_notification_crossed_submit "$STOCK_BOUND_ID"
 stock_tmx capture-pane -p -t "$S2" > "$OUT"
-check "the default pane gets the exact attempt doorbell" "^❯ cyclops inbox claim $STOCK_BOUND_ID #c:[A-Za-z0-9_-]{22}\$"
+check "the default pane gets the exact attempt doorbell" '^❯ cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 check_absent "the default pane does not get the body" '^private default body$'
 
 # History owns message facts, not standard notification badges.

@@ -308,6 +308,15 @@ pub struct NotificationPreWriteObservation {
     /// represent a partially proven leader, agent, or manifest as authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<NotificationBinding>,
+    /// Pane width observed without storing any terminal content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_width: Option<u32>,
+    /// Minimum pane width required by the selected notification format.
+    ///
+    /// Stored beside the observed width so replay does not reinterpret an
+    /// older block after a future format changes its threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_pane_width: Option<u32>,
 }
 
 /// Closed causes for an ambiguous outcome after the write boundary.
@@ -339,7 +348,7 @@ pub enum NotificationResolution {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationResolutionConsumptionEvidence {
-    /// An authenticated hook carried an attempt-bound v2 payload whose
+    /// An authenticated hook carried an exact-attempt payload whose
     /// lossless token parsed to this exact attempt under the same binding.
     ExactHookPrompt,
     /// The exact durable recipient claimed this message after the terminal
@@ -446,6 +455,12 @@ pub enum NotificationTransport {
 pub const DOORBELL_FORMAT_COMPACT_CLAIM: u32 = 1;
 /// Claim-command doorbell carrying an injective token for the exact attempt.
 pub const DOORBELL_FORMAT_ATTEMPT_CLAIM: u32 = 2;
+/// Single-row claim command carrying only the exact attempt token.
+pub const DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM: u32 = 3;
+/// Minimum pane width that can carry doorbell format 3 as one exact row.
+pub const DOORBELL_V3_MIN_PANE_WIDTH: u32 = 60;
+/// Message-shaped namespace reserved for exact notification-attempt claims.
+pub const NOTIFICATION_ATTEMPT_CLAIM_LOCATOR_PREFIX: &str = "m-att_";
 /// Current proof contract for a terminal-action resolution fact.
 ///
 /// Missing values identify legacy facts written before action acceptance and
@@ -521,7 +536,7 @@ impl NotificationRecord {
         self.state == NotificationState::AttentionRequired
             && self.cause == Some(NotificationAttentionCause::VerifyFailed)
             && self.transport == NotificationTransport::Doorbell
-            && self.doorbell_format == Some(DOORBELL_FORMAT_ATTEMPT_CLAIM)
+            && doorbell_format_names_exact_attempt(self.doorbell_format)
             && self.binding.as_ref().is_some_and(|binding| {
                 binding.recipient == self.recipient
                     && binding.pane_root.is_some()
@@ -538,7 +553,7 @@ impl NotificationRecord {
         self.state == NotificationState::AttentionRequired
             && self.cause == Some(NotificationAttentionCause::AckTimeout)
             && self.transport == NotificationTransport::Doorbell
-            && self.doorbell_format == Some(DOORBELL_FORMAT_ATTEMPT_CLAIM)
+            && doorbell_format_names_exact_attempt(self.doorbell_format)
             && self.binding.as_ref().is_some_and(|binding| {
                 binding.recipient == self.recipient
                     && binding.pane_root.is_some()
@@ -709,7 +724,7 @@ pub enum NotificationFact {
         message_id: MessageId,
         recipient: RecipientKey,
     },
-    /// A late exact recipient claim reconciled one v2 doorbell ACK timeout.
+    /// A late exact recipient claim reconciled one doorbell ACK timeout.
     ///
     /// The daemon appends this only after the exact bound composer was cleared,
     /// or after crash recovery proved that same composer visibly clean. The
@@ -754,7 +769,15 @@ pub fn render_doorbell_v1(oldest_msg_id: &MessageId) -> String {
 pub fn render_doorbell_v2(oldest_msg_id: &MessageId, attempt_id: NotificationAttemptId) -> String {
     format!(
         "cyclops inbox claim {oldest_msg_id} #c:{}",
-        compact_attempt_token(attempt_id)
+        notification_attempt_token(attempt_id)
+    )
+}
+
+/// Rebuild single-row attempt-locator doorbell format 3.
+pub fn render_doorbell_v3(attempt_id: NotificationAttemptId) -> String {
+    format!(
+        "cyclops inbox claim {}",
+        notification_attempt_claim_locator(attempt_id)
     )
 }
 
@@ -772,11 +795,12 @@ pub fn parse_doorbell_v2(payload: &str) -> Option<(MessageId, NotificationAttemp
     }
     Some((
         MessageId::new(message_id).ok()?,
-        decode_attempt_token(token)?,
+        parse_notification_attempt_token(token)?,
     ))
 }
 
-fn compact_attempt_token(attempt_id: NotificationAttemptId) -> String {
+/// Encode every bit of one attempt identity as 22 URL-safe characters.
+fn notification_attempt_token(attempt_id: NotificationAttemptId) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let bytes = attempt_id.0.as_bytes();
     let mut encoded = String::with_capacity(22);
@@ -792,7 +816,8 @@ fn compact_attempt_token(attempt_id: NotificationAttemptId) -> String {
     encoded
 }
 
-fn decode_attempt_token(encoded: &str) -> Option<NotificationAttemptId> {
+/// Decode only the canonical, lossless 22-character attempt token.
+fn parse_notification_attempt_token(encoded: &str) -> Option<NotificationAttemptId> {
     if encoded.len() != 22 || !encoded.is_ascii() {
         return None;
     }
@@ -816,7 +841,49 @@ fn decode_attempt_token(encoded: &str) -> Option<NotificationAttemptId> {
     }
     bytes[15] = (values[20] << 2) | (values[21] >> 4);
     let uuid = Uuid::from_bytes(bytes);
-    (!uuid.is_nil()).then_some(NotificationAttemptId(uuid))
+    let attempt_id = (!uuid.is_nil()).then_some(NotificationAttemptId(uuid))?;
+    (notification_attempt_token(attempt_id) == encoded).then_some(attempt_id)
+}
+
+/// Build the canonical message-shaped locator understood by `inbox.claim`.
+///
+/// Production message ids are `m-` plus 32 lowercase hex characters. The
+/// reserved `m-att_` prefix is therefore disjoint from every minted id while
+/// remaining valid input for older positional claim clients.
+pub fn notification_attempt_claim_locator(attempt_id: NotificationAttemptId) -> MessageId {
+    MessageId::new(format!(
+        "{NOTIFICATION_ATTEMPT_CLAIM_LOCATOR_PREFIX}{}",
+        notification_attempt_token(attempt_id)
+    ))
+    .expect("the reserved attempt locator is a valid message-shaped id")
+}
+
+/// Decode only the canonical reserved locator for one exact attempt.
+pub fn parse_notification_attempt_claim_locator(
+    message_id: &MessageId,
+) -> Option<NotificationAttemptId> {
+    let token = message_id
+        .as_str()
+        .strip_prefix(NOTIFICATION_ATTEMPT_CLAIM_LOCATOR_PREFIX)?;
+    let attempt_id = parse_notification_attempt_token(token)?;
+    (notification_attempt_claim_locator(attempt_id).as_str() == message_id.as_str())
+        .then_some(attempt_id)
+}
+
+/// Parse the exact attempt identity carried by doorbell format 3.
+pub fn parse_doorbell_v3(payload: &str) -> Option<NotificationAttemptId> {
+    let payload = payload.strip_suffix('\n').unwrap_or(payload);
+    let locator = payload.strip_prefix("cyclops inbox claim ")?;
+    let message_id = MessageId::new(locator).ok()?;
+    parse_notification_attempt_claim_locator(&message_id)
+}
+
+/// Whether a doorbell format names one exact notification attempt.
+pub const fn doorbell_format_names_exact_attempt(format: Option<u32>) -> bool {
+    matches!(
+        format,
+        Some(DOORBELL_FORMAT_ATTEMPT_CLAIM | DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM)
+    )
 }
 
 fn decode_attempt_character(character: u8) -> Option<u8> {
@@ -929,6 +996,50 @@ mod tests {
             assert_eq!(serde_json::to_value(cause).unwrap(), wire_name);
             assert!(!cause.label().is_empty());
         }
+    }
+
+    #[test]
+    fn width_block_keeps_the_closed_prewrite_cause_rollback_decodable() {
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        #[serde(rename_all = "snake_case")]
+        enum LegacyPreWriteCause {
+            WriteReadinessChanged,
+        }
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        struct LegacyObservation {
+            selected_manifest: Option<String>,
+        }
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        struct LegacyBlock {
+            pre_write_cause: LegacyPreWriteCause,
+            pre_write_observation: LegacyObservation,
+        }
+
+        let current = serde_json::json!({
+            "pre_write_cause": NotificationPreWriteCause::WriteReadinessChanged,
+            "pre_write_observation": {
+                "selected_manifest": "codex",
+                "pane_width": 59,
+                "required_pane_width": 60
+            }
+        });
+        let legacy: LegacyBlock = serde_json::from_value(current).unwrap();
+        assert_eq!(
+            legacy.pre_write_cause,
+            LegacyPreWriteCause::WriteReadinessChanged
+        );
+        assert_eq!(
+            legacy.pre_write_observation.selected_manifest.as_deref(),
+            Some("codex")
+        );
+
+        let prior: NotificationPreWriteObservation = serde_json::from_value(serde_json::json!({
+            "selected_manifest": "codex",
+            "pane_width": 59
+        }))
+        .unwrap();
+        assert_eq!(prior.pane_width, Some(59));
+        assert_eq!(prior.required_pane_width, None);
     }
 
     #[test]
@@ -1092,7 +1203,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_v2_ack_timeout_requires_composer_reconciliation_after_claim() {
+    fn exact_attempt_ack_timeout_requires_composer_reconciliation_after_claim() {
         let workspace = "00000000-0000-0000-0000-000000000001".parse().unwrap();
         let session = "00000000-0000-0000-0000-000000000002".parse().unwrap();
         let recipient = RecipientKey::agent(workspace, session, "%3".parse().unwrap());
@@ -1121,6 +1232,12 @@ mod tests {
         };
 
         assert!(record.needs_claimed_ack_timeout_reconciliation());
+
+        let mut current = record.clone();
+        current.doorbell_format = Some(DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM);
+        assert!(current.needs_claimed_ack_timeout_reconciliation());
+        current.cause = Some(NotificationAttentionCause::VerifyFailed);
+        assert!(current.needs_exact_owned_reconciliation());
 
         let mut invalid = record.clone();
         invalid.cause = Some(NotificationAttentionCause::VerifyFailed);
@@ -1181,6 +1298,69 @@ mod tests {
             parse_doorbell_v2(&render_doorbell_v1(&MessageId::new("m-3f9c2a").unwrap())),
             None
         );
+    }
+
+    #[test]
+    fn doorbell_v3_is_exact_single_line_and_rejects_noncanonical_locators() {
+        let first =
+            NotificationAttemptId::parse("att-00000000-0000-4000-8000-000000000001").unwrap();
+        let second =
+            NotificationAttemptId::parse("att-00000000-0000-4000-8000-000000000002").unwrap();
+        let hyphen =
+            NotificationAttemptId::parse("att-f8000000-0000-4000-8000-000000000001").unwrap();
+        let double_hyphen =
+            NotificationAttemptId::parse("att-fbe00000-0000-4000-8000-000000000001").unwrap();
+        let first_token = notification_attempt_token(first);
+        let first_locator = notification_attempt_claim_locator(first);
+        let first_payload = render_doorbell_v3(first);
+
+        assert_eq!(first_token.len(), 22);
+        assert_eq!(first_locator.as_str(), format!("m-att_{first_token}"));
+        assert_eq!(
+            parse_notification_attempt_claim_locator(&first_locator),
+            Some(first)
+        );
+        assert_ne!(first_payload, render_doorbell_v3(second));
+        assert_eq!(parse_doorbell_v3(&first_payload), Some(first));
+        assert_eq!(
+            parse_doorbell_v3(&format!("{first_payload}\n")),
+            Some(first)
+        );
+        assert_eq!(parse_notification_attempt_token(&first_token), Some(first));
+        assert_eq!(parse_doorbell_v3(&format!("{first_payload} extra")), None);
+        assert_eq!(parse_doorbell_v3(&format!(" {first_payload}")), None);
+        assert_eq!(
+            parse_notification_attempt_token("AAAAAAAAQACAAAAAAAAAAR"),
+            None
+        );
+        assert_eq!(
+            parse_notification_attempt_claim_locator(
+                &MessageId::new("m-att_AAAAAAAAQACAAAAAAAAAAR").unwrap()
+            ),
+            None
+        );
+        assert_eq!(
+            parse_notification_attempt_claim_locator(
+                &MessageId::new("m-00000000000040008000000000000001").unwrap()
+            ),
+            None
+        );
+        assert_eq!(parse_doorbell_v2(&first_payload), None);
+        assert_eq!(notification_attempt_token(hyphen), "-AAAAAAAQACAAAAAAAAAAQ");
+        assert_eq!(
+            notification_attempt_token(double_hyphen),
+            "--AAAAAAQACAAAAAAAAAAQ"
+        );
+        assert_eq!(
+            parse_notification_attempt_token("--AAAAAAQACAAAAAAAAAAQ"),
+            Some(double_hyphen)
+        );
+        assert_eq!(
+            parse_doorbell_v3("cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ"),
+            Some(double_hyphen)
+        );
+        assert_eq!(2 + first_payload.chars().count(), 50);
+        assert!(2 + first_payload.chars().count() <= DOORBELL_V3_MIN_PANE_WIDTH as usize);
     }
 
     #[test]

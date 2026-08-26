@@ -27,10 +27,13 @@ selects again. It never downgrades after any pane write.
 
 Transport is write metadata on the notification record. It is not part of the
 mailbox state and not part of the terminal occupant identity binding. Current
-doorbell writes keep `transport: "doorbell"` and add `doorbell_format: 2`.
-Format 2 carries a lossless 128-bit token for the exact attempt in a shell
-comment. Format 1 remains readable as the older message-only compact row but
-cannot provide hook evidence for a new Complete action. Missing format metadata
+doorbell writes keep `transport: "doorbell"` and add `doorbell_format: 3`.
+Format 3 carries a lossless 128-bit attempt token under the reserved `m-att_`
+message-shaped namespace. This keeps the row runnable by older positional
+claim clients while only the new daemon interprets the locator.
+Format 2 replays its older message id plus trailing attempt-token comment byte for byte.
+Format 1 remains readable as the older message-only compact row but cannot
+provide hook evidence for a new Complete action. Missing format metadata
 selects the original verbose row. Unknown numeric formats replay but cannot
 authorize an attention recovery action. Missing
 transport metadata on an old journal transition also means the original
@@ -113,7 +116,7 @@ re-proves and clears the exact doorbell. One
 `withdrawn_after_staging` and retires its barrier together. A claim at
 `submitting` retrieves the message once but does not cancel the reserved
 terminal key. A claim at `submitted` advances the doorbell to `notified`.
-An `ack_timeout` alarm for a current format 2 doorbell with a complete binding
+An `ack_timeout` alarm for an exact-attempt doorbell with a complete binding
 can advance to `notified` after an exact recipient claim and composer
 reconciliation. The daemon must first clear the exact staged doorbell, or prove
 the same bound composer is clean. The claim alone leaves the alarm and FIFO
@@ -161,6 +164,11 @@ timer. In order:
    admitted pid is the agent's, resolved fresh; a process table that
    cannot be read is `occupant_unprovable`, not a fallback to the pane's
    shell.
+5. Format 3 requires a pane width of at least 60 columns on that final row and
+   at the immediate pre-write bookend. A narrower pane becomes
+   `blocked_pre_write` with its content-free observed width and no paste. A
+   later qualifying width observation from route or size evidence may reopen
+   that attempt once.
 
 A delivery held in gating longer than `gate_hold_notify_ms` (config,
 default 120000) pings the admin once (action_required) so a wedged hold is
@@ -220,8 +228,9 @@ visible; the hold itself keeps waiting on events, never on a timer.
 
 - Tier 1 (claude, codex, cursor): the manifest `hooks.ack` event arrives via
   `agent.state.report` within the ACK window (default 1500ms; measured p95
-  is under 40ms) and its `ack_payload_field` contains the message id:
-  a hook receipt. Codex duplicate hook events are
+  is under 40ms) and its `ack_payload_field` contains the exact format 3
+  attempt locator. Legacy formats correlate through their recorded message
+  and attempt markers. Codex duplicate hook events are
   deduped on (session_id, turn_id, event) before matching (amendment d).
 - Tier 2 (agy, or tier 1 timeout): screen evidence shows the marker left the
   composer and turn-start evidence appeared (working state or output
@@ -232,8 +241,8 @@ visible; the hold itself keeps waiting on events, never on a timer.
   doorbell leaves the entry pending until an authenticated claim.
 - Neither within 5s: `attention_required` with cause `ack_timeout`. Enter may
   already have been accepted, so the payload is never re-pasted. A later exact
-  recipient claim starts composer reconciliation for a current format 2
-  attempt. Only exact clear or same-binding clean evidence moves it to
+  recipient claim starts composer reconciliation for a current exact-attempt
+  doorbell. Only exact clear or same-binding clean evidence moves it to
   `notified`.
 
 ### Retry (bounded, pre-write only)
@@ -248,6 +257,11 @@ is after the irreversible boundary and goes directly to
 the attempt boundary and never invites a duplicate paste. `attention_required`
 can mean the terminal outcome is unknown, not that the recipient definitely
 did not receive the message.
+
+The `pane_too_narrow` width detail is also pre-write, but it does not consume
+the retry budget. Its durable cause remains `write_readiness_changed` for old
+reader compatibility, with observed and required widths recorded separately.
+It stays withdrawable until a qualifying width edge or operator action.
 
 ### Static pre-write blocks
 
@@ -417,7 +431,7 @@ are returned only to the authenticated workspace administrator and never enter
 the journal or daemon log. Requeue and alarm clearance remain explicit
 operator actions and never create an automatic retry loop.
 
-A current format 2 `verify_failed` doorbell uses the same proof and settlement
+An exact-attempt `verify_failed` doorbell uses the same proof and settlement
 path automatically. Pending work selects one submit. An exact recipient claim
 ordered after the write selects one measured clear. The mailbox choice and
 durable intent share one lock. Human, trailing, changed, or unprovable content
@@ -426,7 +440,7 @@ never reaches a terminal key.
 Before a terminal-key action, the daemon records one content-free resolution
 intent. If the terminal accepts the key, it records a separate content-free
 action-accepted fact. Neither fact is settlement. A fresh Complete also needs a
-matching authenticated attempt-bound v2 hook receipt or an exact recipient
+matching authenticated exact-attempt hook receipt or an exact recipient
 claim ordered after this action, recorded as a content-free consumption fact.
 Legacy and v1 doorbell hooks remain replay-compatible but cannot authorize new
 Complete settlement. A
@@ -447,7 +461,7 @@ different requested resolution remain unresolved.
 The legacy session-delivery path has no operator requeue verb. Standard mailbox
 notifications use the guarded `cyclops requeue <message-id>` recovery command.
 Requeue resolves every selected pending recipient before writing. A current
-format 2 `verify_failed` composer barrier must be resolved before requeue. Any
+exact-attempt `verify_failed` composer barrier must be resolved before requeue. Any
 post-write barrier with an absent binding or missing pane-root or
 foreground-leader generation also makes the whole requeue conflict before any
 append.

@@ -369,6 +369,8 @@ mod tests {
                     attempt_id: None,
                     cause: None,
                     pre_write_cause: None,
+                    pre_write_pane_width: None,
+                    pre_write_required_pane_width: None,
                     attention_cleared: None,
                     resolution: None,
                     resolution_intent: None,

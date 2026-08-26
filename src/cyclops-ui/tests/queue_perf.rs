@@ -75,6 +75,8 @@ fn row(i: u64) -> QueueRow {
         },
         cause: attention.then_some(NotificationAttentionCause::VerifyFailed),
         pre_write_cause: None,
+        pre_write_pane_width: None,
+        pre_write_required_pane_width: None,
         current_route: None,
         fifo_position: Some(i + 1),
         needs_action: attention || !i.is_multiple_of(3),

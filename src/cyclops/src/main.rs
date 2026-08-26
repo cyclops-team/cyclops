@@ -2144,8 +2144,14 @@ fn message_recipient_cell(
             ),
                 None => match recipient.notification.pre_write_cause {
                     Some(cause) => {
-                        let mut blocked =
-                            format!("wake blocked before write: {}", cause.wire_name());
+                        let reason = recipient
+                            .notification
+                            .pane_width_block()
+                            .map(|(observed, required)| {
+                                format!("pane_too_narrow ({observed}, requires {required})")
+                            })
+                            .unwrap_or_else(|| cause.wire_name().to_string());
+                        let mut blocked = format!("wake blocked before write: {reason}");
                         if let Some(updated_at) = recipient.notification.updated_at {
                             blocked.push_str(&format!(
                                 " · waited {}",
@@ -2968,6 +2974,16 @@ mod tests {
     }
 
     #[test]
+    fn inbox_claim_requires_one_message_shaped_target() {
+        assert!(Cli::try_parse_from(["cyclops", "inbox", "claim"]).is_err());
+        assert!(Cli::try_parse_from(["cyclops", "inbox", "claim", "m-1"]).is_ok());
+        assert!(Cli::try_parse_from(
+            ["cyclops", "inbox", "claim", "m-att_--AAAAAAQACAAAAAAAAAAQ",]
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn send_keeps_reply_and_supersession_flags() {
         let reply = Cli::try_parse_from([
             "cyclops",
@@ -3153,6 +3169,8 @@ mod tests {
                     attempt_id: Some(attempt),
                     cause: Some(cyclops_proto::NotificationAttentionCause::VerifyFailed),
                     pre_write_cause: None,
+                    pre_write_pane_width: None,
+                    pre_write_required_pane_width: None,
                     attention_cleared: Some(false),
                     resolution: None,
                     resolution_intent: None,
@@ -3197,6 +3215,8 @@ mod tests {
             attempt_id: None,
             cause: None,
             pre_write_cause: None,
+            pre_write_pane_width: None,
+            pre_write_required_pane_width: None,
             attention_cleared: None,
             resolution: None,
             resolution_intent: None,
@@ -3219,6 +3239,8 @@ mod tests {
             attempt_id: Some(attempt),
             cause: None,
             pre_write_cause: None,
+            pre_write_pane_width: None,
+            pre_write_required_pane_width: None,
             attention_cleared: None,
             resolution: None,
             resolution_intent: None,
