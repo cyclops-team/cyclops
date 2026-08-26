@@ -250,12 +250,7 @@ pub(super) async fn execute(
             app.prefs.messages_visible = app.model.messages_visible;
             if app.model.messages_visible {
                 app.messages_focused = true;
-                if app.messages_gate.link() == cyclops_ui::Link::Lost {
-                    app.messages_gate.connected();
-                } else {
-                    app.messages_gate.mark_dirty();
-                }
-                super::pump_messages_refresh(app);
+                super::request_messages_snapshot(app);
             } else {
                 app.messages_focused = false;
             }
@@ -1271,14 +1266,14 @@ fn send_message(app: &mut App, to: String, subject: String, body: String) {
             super::finish_compose_send(
                 app.dialog.as_mut(),
                 attempt,
-                daemon::SendOutcome::Rejected("another send is still in progress".into()),
+                daemon::SendOutcome::NotSent("another send is still in progress".into()),
             );
         }
         Err(std::sync::mpsc::TrySendError::Disconnected(attempt)) => {
             super::finish_compose_send(
                 app.dialog.as_mut(),
                 attempt,
-                daemon::SendOutcome::Rejected("the send worker stopped".into()),
+                daemon::SendOutcome::NotSent("the send worker stopped".into()),
             );
         }
     }
@@ -1398,8 +1393,12 @@ mod tests {
             messages_focused: false,
             messages_gate: cyclops_ui::RefreshGate::new(),
             messages_send_tx: None,
+            messages_composer_revision: 0,
+            messages_send_in_flight: None,
             messages_snapshot_tx: None,
             message_detail_tx: None,
+            message_detail_in_flight: None,
+            messages_reconcile_owed: None,
         }
     }
 

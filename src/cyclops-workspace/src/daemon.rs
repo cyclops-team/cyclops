@@ -140,11 +140,43 @@ fn read_bounded_line(reader: &mut impl BufRead, context: &str) -> Result<Vec<u8>
     }
 }
 
+/// A daemon refusal with its stable machine-readable code intact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DaemonRefusal {
+    pub code: String,
+    pub message: String,
+    pub data: Option<Value>,
+}
+
+impl From<cyclops_proto::WireError> for DaemonRefusal {
+    fn from(error: cyclops_proto::WireError) -> Self {
+        Self {
+            code: error.code,
+            message: error.message,
+            data: error.data,
+        }
+    }
+}
+
+impl DaemonRefusal {
+    #[cfg(test)]
+    pub(crate) fn new(code: &str, message: &str) -> Self {
+        Self {
+            code: code.to_string(),
+            message: message.to_string(),
+            data: None,
+        }
+    }
+}
+
 /// Result of a composer send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SendOutcome {
     Accepted(String),
-    Rejected(String),
+    /// The request did not reach the daemon.
+    NotSent(String),
+    /// The daemon answered no. The code is kept for state-specific recovery.
+    Rejected(DaemonRefusal),
     /// The request write began, but no trustworthy response arrived.
     Unknown(String),
 }
@@ -201,12 +233,12 @@ pub fn send_message_full(
     }) {
         Ok(params) => params,
         Err(error) => {
-            return SendOutcome::Rejected(format!("cannot encode the message: {error}"));
+            return SendOutcome::NotSent(format!("cannot encode the message: {error}"));
         }
     };
     let mut reader = match connect_with(home, SEND_TIMEOUT) {
         Ok(reader) => reader,
-        Err(error) => return SendOutcome::Rejected(error),
+        Err(error) => return SendOutcome::NotSent(error),
     };
     if let Err(error) = write_request(reader.get_mut(), "msg.send", params) {
         return SendOutcome::Unknown(error);
@@ -229,7 +261,7 @@ pub fn send_message_full(
         );
     }
     if let Some(error) = response.error {
-        return SendOutcome::Rejected(error.message);
+        return SendOutcome::Rejected(error.into());
     }
     let Some(value) = response.result else {
         return SendOutcome::Unknown("cyclopsd omitted the msg.send result".to_string());
@@ -515,7 +547,7 @@ mod tests {
         let outcome = send_message(&home, "missing", "hello", "hello", "workspace-rejected-key");
         assert_eq!(
             outcome,
-            SendOutcome::Rejected("no such recipient".to_string())
+            SendOutcome::Rejected(DaemonRefusal::new("unknown_recipient", "no such recipient"))
         );
         server.join().expect("server");
         let _ = std::fs::remove_dir_all(home);
