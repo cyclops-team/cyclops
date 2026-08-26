@@ -9,15 +9,14 @@
 //! still goes to the higher-priority rule but the disagreement is exposed
 //! on the Detection (GOALS: observable, not an error).
 //!
-//! Screen capture is consulted last (amendment h): when a pane_title rule
-//! alone decides the STATE, capture-pane is skipped entirely.
+//! Every recompute evaluates the screen tier when the selected manifest has
+//! screen rules. A title is current state evidence, but it cannot prove that a
+//! permission dialog, quota screen, human draft, or active status row is
+//! absent. Output events remain coalesced by the watcher, so this policy adds
+//! one bounded capture per recompute rather than a polling loop.
 //!
-//! That skip is a cost decision about state, and it is never allowed to
-//! decide a write. Only the screen sensor can see a composer, so
-//! write-readiness needs a positive clean-composer reading from it (rule
-//! 12), and a verdict reached without one refuses. Every caller who is
-//! about to write, and `pane.read source=detection`, passes
-//! `force_screen` for exactly that reason.
+//! Only the screen sensor can prove composer readiness. A verdict without a
+//! positive clean-composer reading still refuses writes under rule 12.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -47,6 +46,9 @@ const HOOK_READING_TTL_MS: u64 = 300_000;
 /// A clean frame is neutral at every age. Positive Working accepts the edge;
 /// staged input, a blocking screen, or pane mode rejects it.
 const UNKEYED_DISPATCH_SETTLE_MS: u64 = 500;
+/// One bounded follow-up for contradictory, stale, or held current evidence.
+/// New pane events may schedule another pass; the worker itself never polls.
+const CONTINUOUS_EVIDENCE_RECHECK_MS: u64 = 100;
 /// Consecutive rules-tier verdicts contradicting the hook reading before
 /// the reading is invalidated.
 const HOOK_DISAGREE_LIMIT: u32 = 3;
@@ -69,8 +71,9 @@ pub(crate) struct HookEntry {
     /// immediately, but a later visual Working observation must confirm it
     /// before delivery or `wait done` may rely on it.
     confirmed_start: bool,
-    /// This reading is a conclusive end for one exact turn. It overrides a
-    /// stale visual Working frame, but never a blocking state or staged input.
+    /// This reading is a conclusive end for one exact turn. It remains an
+    /// edge, not a persistent Idle level: a later current visual Working
+    /// observation supersedes it.
     authoritative_end: bool,
     /// The exact turn when the manifest can name it. `None` can describe a
     /// binding-scoped confirmed lifecycle or provisional dispatch evidence,
@@ -273,6 +276,7 @@ enum LifecycleRecheckWork {
         crate::hook_lifecycle::Candidate,
     ),
     Provisional(ProvisionalStartRecheck),
+    Observation(u64),
 }
 
 impl LifecycleRecheckWork {
@@ -280,6 +284,7 @@ impl LifecycleRecheckWork {
         match self {
             Self::Terminal(_, candidate) => candidate.ready_at_ms,
             Self::Provisional(candidate) => candidate.ready_at_ms,
+            Self::Observation(ready_at_ms) => *ready_at_ms,
         }
     }
 
@@ -290,6 +295,7 @@ impl LifecycleRecheckWork {
                 "candidate_visual_end_settled"
             }
             Self::Provisional(_) => "unkeyed_dispatch_settled",
+            Self::Observation(_) => "continuous_evidence_recheck",
         }
     }
 }
@@ -316,7 +322,8 @@ impl LifecycleObservation {
             | "receipt_checkpoint"
             | "candidate_end_settled"
             | "candidate_visual_end_settled"
-            | "unkeyed_dispatch_settled" => Self::Stable,
+            | "unkeyed_dispatch_settled"
+            | "continuous_evidence_recheck" => Self::Stable,
             "pane_added" | "pane_changed" => Self::Visual,
             _ => Self::None,
         }
@@ -367,7 +374,8 @@ fn schedule_lifecycle_recheck(inner: &Arc<Inner>, pane: &PaneKey) {
         .expect("hook lifecycle lock")
         .has_terminal_candidates(pane);
     let has_provisional = provisional_recheck(inner, pane).is_some();
-    if !has_terminal && !has_provisional {
+    let needs_observation = targeted_reobservation_needed(inner, pane);
+    if !has_terminal && !has_provisional && !needs_observation {
         return;
     }
     let mut rechecks = inner
@@ -415,6 +423,7 @@ async fn lifecycle_recheck_worker(
     let mut stop = inner.stop.clone();
     let mut attempted_terminal = HashSet::new();
     let mut attempted_provisional = HashSet::new();
+    let mut attempted_observation = false;
     loop {
         if *stop.borrow() || !lifecycle_recheck_is_current(&inner, &pane, &notify) {
             remove_lifecycle_recheck(&inner, &pane, &notify);
@@ -431,16 +440,16 @@ async fn lifecycle_recheck_worker(
                 !attempted_provisional.contains(&(candidate.agent, candidate.edge_ms))
             })
             .map(LifecycleRecheckWork::Provisional);
-        let next = match (terminal, provisional) {
-            (Some(terminal), Some(provisional)) => {
-                if terminal.ready_at_ms() <= provisional.ready_at_ms() {
-                    Some(terminal)
-                } else {
-                    Some(provisional)
-                }
-            }
-            (terminal, provisional) => terminal.or(provisional),
-        };
+        let observation = (!attempted_observation && targeted_reobservation_needed(&inner, &pane))
+            .then(|| {
+                LifecycleRecheckWork::Observation(
+                    unix_ms().saturating_add(CONTINUOUS_EVIDENCE_RECHECK_MS),
+                )
+            });
+        let next = [terminal, provisional, observation]
+            .into_iter()
+            .flatten()
+            .min_by_key(LifecycleRecheckWork::ready_at_ms);
         let Some(work) = next else {
             if retire_lifecycle_recheck_if_empty(&inner, &pane, &notify) {
                 return;
@@ -453,6 +462,7 @@ async fn lifecycle_recheck_worker(
                 _ = notify.notified() => {
                     attempted_terminal.clear();
                     attempted_provisional.clear();
+                    attempted_observation = false;
                 }
                 _ = stop.changed() => {}
             }
@@ -465,6 +475,7 @@ async fn lifecycle_recheck_worker(
                 _ = notify.notified() => {
                     attempted_terminal.clear();
                     attempted_provisional.clear();
+                    attempted_observation = false;
                     continue;
                 },
                 _ = stop.changed() => continue,
@@ -514,8 +525,24 @@ async fn lifecycle_recheck_worker(
                     attempted_provisional.insert((candidate.agent, candidate.edge_ms));
                 }
             }
+            LifecycleRecheckWork::Observation(_) => {
+                attempted_observation = true;
+            }
         }
     }
+}
+
+fn targeted_reobservation_needed(inner: &Inner, pane: &PaneKey) -> bool {
+    inner
+        .detections
+        .lock()
+        .expect("detections lock")
+        .get(pane)
+        .is_some_and(|entry| needs_targeted_reobservation(&entry.detection, entry.hold))
+}
+
+fn needs_targeted_reobservation(detection: &Detection, hold: ComposerHold) -> bool {
+    detection.stale || detection.disagreement || hold.refuses()
 }
 
 fn provisional_recheck(inner: &Inner, pane: &PaneKey) -> Option<ProvisionalStartRecheck> {
@@ -2252,7 +2279,7 @@ enum HookAction {
 /// Age one hook entry against the rules-tier verdict of this recompute.
 /// Disagreement only counts when the rules actually decided something;
 /// agreement resets the streak.
-fn hook_action(entry: &mut HookEntry, rules_state: AgentState, now_ms: u64) -> HookAction {
+fn hook_action(entry: &mut HookEntry, detection: &Detection, now_ms: u64) -> HookAction {
     // An authenticated start is a lifecycle fact, not a sample. The idle
     // composer often remains on screen until Claude paints its first output,
     // and repeated captures of that frame do not end the turn. A missing end
@@ -2261,7 +2288,16 @@ fn hook_action(entry: &mut HookEntry, rules_state: AgentState, now_ms: u64) -> H
         return HookAction::Use;
     }
     if entry.authoritative_end {
-        return if matches!(rules_state, AgentState::Idle | AgentState::IdleWithInput) {
+        let newer_visual_working = detection.readings.iter().any(|reading| {
+            reading.sensor != Sensor::Hook
+                && reading.state == AgentState::Working
+                && reading.ts >= entry.reading.ts
+        });
+        return if matches!(
+            detection.state,
+            AgentState::Idle | AgentState::IdleWithInput
+        ) || newer_visual_working
+        {
             HookAction::Drop
         } else {
             HookAction::Use
@@ -2270,10 +2306,10 @@ fn hook_action(entry: &mut HookEntry, rules_state: AgentState, now_ms: u64) -> H
     if now_ms.saturating_sub(entry.reading.ts) > HOOK_READING_TTL_MS {
         return HookAction::Drop;
     }
-    if rules_state == AgentState::Unknown {
+    if detection.state == AgentState::Unknown {
         return HookAction::Use;
     }
-    if rules_state == entry.reading.state {
+    if detection.state == entry.reading.state {
         entry.disagreements = 0;
         return HookAction::Use;
     }
@@ -2299,17 +2335,21 @@ fn apply_hook_reading(
 ) {
     let hook_state = reading.state;
     let hook_rule = reading.rule.clone();
+    let hook_ts = reading.ts;
     let visual_state = detection.state;
+    let newer_visual_working = detection.readings.iter().any(|visual| {
+        visual.sensor != Sensor::Hook && visual.state == AgentState::Working && visual.ts >= hook_ts
+    });
     detection.readings.push(reading);
 
-    if authoritative_end
+    if authoritative_end && newer_visual_working {
+        // Stop ended its bound turn. A later current-level Working reading
+        // describes what is on the pane now and cannot be overwritten by
+        // retaining that historical edge as an Idle level.
+    } else if authoritative_end
         && hook_state == AgentState::Idle
-        && !visual_state.is_blocked()
-        && visual_state != AgentState::IdleWithInput
+        && matches!(visual_state, AgentState::Unknown | AgentState::Idle)
     {
-        if visual_state != AgentState::Unknown && visual_state != AgentState::Idle {
-            detection.disagreement = true;
-        }
         detection.state = AgentState::Idle;
         detection.decided_by = format!("hook:{hook_rule}");
     } else if active_start && hook_state == AgentState::Working && !visual_state.is_blocked() {
@@ -2331,6 +2371,10 @@ pub(crate) fn title_winner<'m>(m: &'m Manifest, title: &str) -> Option<&'m Compi
     m.rules
         .iter()
         .find(|r| r.region == Region::PaneTitle && r.matches(title, &[title]))
+}
+
+fn manifest_uses_screen_tier(m: &Manifest) -> bool {
+    m.rules.iter().any(|rule| rule.region != Region::PaneTitle)
 }
 
 /// Highest-priority screen-region rule matching the capture. Region
@@ -2943,8 +2987,9 @@ fn pane_recompute_gate(inner: &Arc<Inner>, pane: &PaneKey) -> Arc<tokio::sync::M
 }
 
 /// Recompute one pane's Detection, update the cache, and emit a "state"
-/// event when the fused state changed. `force_screen` runs the full sensor
-/// set even when a title rule alone would decide (pane.read detection).
+/// event when the fused state changed. Manifests with screen rules always run
+/// the full sensor set. `force_screen` additionally captures for title-only
+/// manifests used by explicit inspection paths.
 /// Returns None when the pane is gone from the table.
 ///
 /// `session_idx` is the caller's stable session-slot index, not re-derived
@@ -3291,42 +3336,11 @@ async fn recompute_pane_with_evidence(
         }
     } else if let Some(m) = manifest {
         let t_rule = title_winner(m, &row.title);
-        let candidate_end_active = m.hooks.turn_end_evidence == LifecycleCertainty::Candidate
-            && admitted.is_some_and(|agent| {
-                inner
-                    .hook_readings
-                    .lock()
-                    .expect("hook readings lock")
-                    .get(&route)
-                    .is_some_and(|entry| entry.active_start_for(agent, Some(m.agent.id.as_str())))
-            });
-        let candidate_pending = admitted.is_some_and(|agent| {
-            inner
-                .hook_lifecycle
-                .lock()
-                .expect("hook lifecycle lock")
-                .has_pending_for(&route, agent, &m.agent.id)
-        });
-        let composer_held = inner
-            .detections
-            .lock()
-            .expect("detections lock")
-            .get(&route)
-            .filter(|entry| {
-                entry.agent == admitted && entry.manifest.as_deref() == Some(m.agent.id.as_str())
-            })
-            .is_some_and(|entry| entry.hold.refuses());
-        // One agreeing screen baseline is required per exact occupant so
-        // durable quota holds can recover after restart even when a title
-        // rule would otherwise skip capture forever. A held quota keeps
-        // this false and therefore keeps consulting screen until reset.
-        let need_screen = force_screen
-            || recovering
-            || !quota_screen_clear
-            || t_rule.is_none()
-            || candidate_end_active
-            || candidate_pending
-            || composer_held;
+        // A title cannot establish that the screen contains no stronger or
+        // safer current evidence. When a manifest declares a screen tier, the
+        // same recompute always evaluates it. `force_screen` retains its
+        // meaning for title-only manifests used by explicit inspection paths.
+        let need_screen = force_screen || manifest_uses_screen_tier(m);
         let mut capture_failed = false;
         let (screen, screen_esc) = if need_screen {
             match capture_screens(watcher, m, pane_id).await {
@@ -3532,7 +3546,7 @@ async fn recompute_pane_with_evidence(
                     map.remove(&route);
                     None
                 }
-                Some(entry) => match hook_action(entry, detection.state, ts) {
+                Some(entry) => match hook_action(entry, &detection, ts) {
                     HookAction::Use => Some((
                         entry.reading.clone(),
                         entry.active_start,
@@ -3918,6 +3932,7 @@ fn is_candidate_recheck_cause(cause: &str) -> bool {
         "candidate_end_settled"
             | "candidate_visual_end_settled"
             | "unkeyed_dispatch_settled"
+            | "continuous_evidence_recheck"
             | "receipt_checkpoint"
     )
 }
@@ -4012,8 +4027,47 @@ region = "bottom_non_empty_lines(3)"
 line_regex = ['^FIXPROMPT']
 "#;
 
+    const CURRENT_TIERS_FIXTURE: &str = r#"
+[agent]
+id = "current-tiers"
+display_name = "Current tiers fixture"
+process_names = ["fixture"]
+
+[[rule]]
+id = "title_working"
+state = "working"
+priority = 1100
+region = "pane_title"
+regex = ['^WORKING']
+
+[[rule]]
+id = "title_idle"
+state = "idle"
+priority = 1000
+region = "pane_title"
+regex = ['^IDLE']
+
+[[rule]]
+id = "screen_modal"
+state = "blocked_modal"
+priority = 1200
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^PERMISSION']
+
+[[rule]]
+id = "screen_working"
+state = "working"
+priority = 1150
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^ACTIVE']
+"#;
+
     fn manifest() -> Manifest {
         Manifest::parse(FIXTURE, Path::new("bash.toml")).unwrap()
+    }
+
+    fn current_tiers_manifest() -> Manifest {
+        Manifest::parse(CURRENT_TIERS_FIXTURE, Path::new("current-tiers.toml")).unwrap()
     }
 
     fn quota_detection(sensor: Sensor, state: AgentState) -> Detection {
@@ -4084,6 +4138,24 @@ line_regex = ['^FIXPROMPT']
         let mut disagreeing = clean.clone();
         disagreeing.disagreement = true;
         assert!(!quota_reset_probe_needed(false, &disagreeing));
+    }
+
+    #[test]
+    fn only_unstable_or_held_evidence_gets_a_bounded_follow_up() {
+        let stable = lifecycle_detection(Sensor::Screen, AgentState::Idle);
+        assert!(!needs_targeted_reobservation(&stable, ComposerHold::Clear));
+
+        let mut stale = stable.clone();
+        stale.stale = true;
+        assert!(needs_targeted_reobservation(&stale, ComposerHold::Clear));
+
+        let mut disagreeing = stable.clone();
+        disagreeing.disagreement = true;
+        assert!(needs_targeted_reobservation(
+            &disagreeing,
+            ComposerHold::Clear
+        ));
+        assert!(needs_targeted_reobservation(&stable, ComposerHold::Staged));
     }
 
     fn lifecycle_detection(sensor: Sensor, state: AgentState) -> Detection {
@@ -6345,6 +6417,30 @@ contains = ["working"]
     }
 
     #[test]
+    fn current_screen_evidence_survives_repeated_title_observations() {
+        let m = current_tiers_manifest();
+        assert!(manifest_uses_screen_tier(&m));
+
+        let idle_title = title_winner(&m, "IDLE ready");
+        let working_screen = screen_winner(&m, "ACTIVE");
+        for observed_at in [10, 11, 12] {
+            let detection = fuse(&m, idle_title, working_screen, observed_at);
+            assert_eq!(detection.state, AgentState::Working);
+            assert_eq!(detection.decided_by, "screen_working");
+            assert!(detection.disagreement);
+            assert!(!detection.write_ready);
+        }
+
+        let working_title = title_winner(&m, "WORKING now");
+        let modal_screen = screen_winner(&m, "PERMISSION required");
+        let blocked = fuse(&m, working_title, modal_screen, 13);
+        assert_eq!(blocked.state, AgentState::BlockedModal);
+        assert_eq!(blocked.decided_by, "screen_modal");
+        assert!(blocked.disagreement);
+        assert!(!blocked.write_ready);
+    }
+
+    #[test]
     fn single_tier_is_no_disagreement() {
         let m = manifest();
         let s = screen_winner(&m, "FIXPROMPT ");
@@ -6984,11 +7080,19 @@ contains = ["working"]
     fn hook_reading_ages_out_on_ttl() {
         let mut e = entry(AgentState::Working, 1_000);
         assert_eq!(
-            hook_action(&mut e, AgentState::Unknown, 1_000 + HOOK_READING_TTL_MS),
+            hook_action(
+                &mut e,
+                &lifecycle_detection(Sensor::Screen, AgentState::Unknown),
+                1_000 + HOOK_READING_TTL_MS,
+            ),
             HookAction::Use
         );
         assert_eq!(
-            hook_action(&mut e, AgentState::Unknown, 1_001 + HOOK_READING_TTL_MS),
+            hook_action(
+                &mut e,
+                &lifecycle_detection(Sensor::Screen, AgentState::Unknown),
+                1_001 + HOOK_READING_TTL_MS,
+            ),
             HookAction::Drop
         );
     }
@@ -6999,21 +7103,37 @@ contains = ["working"]
         // Rules see nothing: no evidence against the hook.
         for _ in 0..10 {
             assert_eq!(
-                hook_action(&mut e, AgentState::Unknown, 2_000),
+                hook_action(
+                    &mut e,
+                    &lifecycle_detection(Sensor::Screen, AgentState::Unknown),
+                    2_000,
+                ),
                 HookAction::Use
             );
         }
         // Two contradictions survive, the third invalidates.
         assert_eq!(
-            hook_action(&mut e, AgentState::Idle, 2_000),
+            hook_action(
+                &mut e,
+                &lifecycle_detection(Sensor::Screen, AgentState::Idle),
+                2_000,
+            ),
             HookAction::Use
         );
         assert_eq!(
-            hook_action(&mut e, AgentState::Idle, 2_000),
+            hook_action(
+                &mut e,
+                &lifecycle_detection(Sensor::Screen, AgentState::Idle),
+                2_000,
+            ),
             HookAction::Use
         );
         assert_eq!(
-            hook_action(&mut e, AgentState::Idle, 2_000),
+            hook_action(
+                &mut e,
+                &lifecycle_detection(Sensor::Screen, AgentState::Idle),
+                2_000,
+            ),
             HookAction::Drop
         );
     }
@@ -7022,20 +7142,36 @@ contains = ["working"]
     fn hook_agreement_resets_the_disagreement_streak() {
         let mut e = entry(AgentState::Working, 1_000);
         assert_eq!(
-            hook_action(&mut e, AgentState::Idle, 2_000),
+            hook_action(
+                &mut e,
+                &lifecycle_detection(Sensor::Screen, AgentState::Idle),
+                2_000,
+            ),
             HookAction::Use
         );
         assert_eq!(
-            hook_action(&mut e, AgentState::Idle, 2_000),
+            hook_action(
+                &mut e,
+                &lifecycle_detection(Sensor::Screen, AgentState::Idle),
+                2_000,
+            ),
             HookAction::Use
         );
         assert_eq!(
-            hook_action(&mut e, AgentState::Working, 2_000),
+            hook_action(
+                &mut e,
+                &lifecycle_detection(Sensor::Screen, AgentState::Working),
+                2_000,
+            ),
             HookAction::Use
         );
         assert_eq!(e.disagreements, 0);
         assert_eq!(
-            hook_action(&mut e, AgentState::Idle, 2_000),
+            hook_action(
+                &mut e,
+                &lifecycle_detection(Sensor::Screen, AgentState::Idle),
+                2_000,
+            ),
             HookAction::Use
         );
     }
@@ -7047,7 +7183,7 @@ contains = ["working"]
             assert_eq!(
                 hook_action(
                     &mut entry,
-                    AgentState::Idle,
+                    &lifecycle_detection(Sensor::Screen, AgentState::Idle),
                     1_001 + HOOK_READING_TTL_MS + round,
                 ),
                 HookAction::Use,
@@ -7131,6 +7267,36 @@ contains = ["working"]
     }
 
     #[test]
+    fn a_current_bound_start_and_agreeing_screen_stay_working() {
+        let agent = crate::identity::ProcId { pid: 1, birth: 1 };
+        for observed_at in [10, 11, 12] {
+            let mut detection = lifecycle_detection(Sensor::Screen, AgentState::Working);
+            detection.readings[0].ts = observed_at;
+            let start = HookEntry::unkeyed_turn_started(
+                agent,
+                Some("fixture".into()),
+                SensorReading {
+                    sensor: Sensor::Hook,
+                    state: AgentState::Working,
+                    rule: "PreInvocation".into(),
+                    ts: 3,
+                },
+            );
+            apply_hook_reading(
+                &mut detection,
+                start.reading,
+                start.active_start,
+                start.authoritative_end,
+            );
+            let detection = detection.stamped(false, ComposerHold::Clear);
+
+            assert_eq!(detection.state, AgentState::Working);
+            assert!(!detection.disagreement);
+            assert!(!detection.write_ready);
+        }
+    }
+
+    #[test]
     fn blocked_visuals_remain_authoritative_during_an_active_start() {
         let states = [
             AgentState::Unknown,
@@ -7175,9 +7341,9 @@ contains = ["working"]
     }
 
     #[test]
-    fn a_conclusive_end_overrides_stale_working_but_not_terminal_safety_state() {
+    fn a_conclusive_end_never_overwrites_current_working_or_safety_state() {
         for (visual, expected) in [
-            (AgentState::Working, AgentState::Idle),
+            (AgentState::Working, AgentState::Working),
             (AgentState::Unknown, AgentState::Idle),
             (AgentState::IdleWithInput, AgentState::IdleWithInput),
             (AgentState::BlockedModal, AgentState::BlockedModal),
@@ -7208,25 +7374,49 @@ contains = ["working"]
             );
             assert_eq!(detection.state, expected, "visual state {visual}");
             assert!(
-                visual == AgentState::IdleWithInput
+                visual == AgentState::Working
+                    || visual == AgentState::IdleWithInput
                     || visual == AgentState::Unknown
-                    || visual.is_blocked()
-                    || detection.disagreement,
-                "stale Working must remain visible as disagreement"
+                    || visual.is_blocked(),
+                "current visual safety state changed"
             );
         }
     }
 
     #[test]
-    fn a_conclusive_end_retires_only_after_visual_terminal_state() {
-        for state in [AgentState::Working, AgentState::BlockedModal] {
-            let mut end = end_entry(3);
-            assert_eq!(hook_action(&mut end, state, 4), HookAction::Use);
+    fn an_old_stop_cannot_override_repeated_current_visual_working() {
+        for observed_at in [3, 10, 11, 12] {
+            let mut detection = lifecycle_detection(Sensor::Screen, AgentState::Working);
+            detection.readings[0].ts = observed_at;
+            let end = end_entry(3);
+            apply_hook_reading(
+                &mut detection,
+                end.reading,
+                end.active_start,
+                end.authoritative_end,
+            );
+            let detection = detection.stamped(false, ComposerHold::Clear);
+
+            assert_eq!(detection.state, AgentState::Working);
+            assert_eq!(detection.decided_by, "fixture");
+            assert!(!detection.write_ready);
         }
-        for state in [AgentState::Idle, AgentState::IdleWithInput] {
+    }
+
+    #[test]
+    fn a_conclusive_end_is_an_edge_not_a_persistent_idle_level() {
+        for state in [
+            AgentState::Working,
+            AgentState::Idle,
+            AgentState::IdleWithInput,
+        ] {
             let mut end = end_entry(3);
-            assert_eq!(hook_action(&mut end, state, 4), HookAction::Drop);
+            let current = lifecycle_detection(Sensor::Screen, state);
+            assert_eq!(hook_action(&mut end, &current, 4), HookAction::Drop);
         }
+        let mut end = end_entry(3);
+        let blocked = lifecycle_detection(Sensor::Screen, AgentState::BlockedModal);
+        assert_eq!(hook_action(&mut end, &blocked, 4), HookAction::Use);
     }
 
     // The shipped codex esc rules: dim after the glyph is a ghost
