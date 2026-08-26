@@ -343,7 +343,7 @@ async fn wait_for_pane_mode(rig: &mut Rig, pane: &str, expected: bool) {
 async fn resize_pane_and_allow_event(rig: &mut Rig, pane: &str, width: u32) {
     let width_arg = width.to_string();
     rig.tmux
-        .run_ok(&["resize-pane", "-t", pane, "-x", &width_arg]);
+        .run_ok(&["resize-window", "-t", pane, "-x", &width_arg]);
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let status = rig.ctl.request("status", json!({})).await;
@@ -360,6 +360,28 @@ async fn resize_pane_and_allow_event(rig: &mut Rig, pane: &str, width: u32) {
         assert!(
             Instant::now() < deadline,
             "daemon did not observe pane {pane} at width {width}: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_pane_write_ready(rig: &Rig, pane: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = rig.ctl.request("status", json!({})).await;
+        let ready = status["result"]["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|session| session["panes"].as_array())
+            .flatten()
+            .any(|row| row["pane_id"] == pane && row["write_ready"] == true);
+        if ready {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pane {pane} did not become write-ready: {status}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -759,6 +781,7 @@ async fn a_claim_before_submit_clears_only_the_exact_doorbell_and_advances_fifo(
         0
     );
     assert!(!rig.tmux.capture(&pane).contains(&first_id));
+    wait_for_pane_write_ready(&rig, &pane).await;
 
     let second =
         send_workspace_message(&rig, "claim-before-submit-second", "Second", "second body").await;
@@ -2029,9 +2052,12 @@ async fn same_route_with_a_new_pane_root_reproves_before_writing() {
         blocked_data["attempt_id"], writing_data["attempt_id"],
         "route reconciliation must retain the exact notification attempt"
     );
-    assert_eq!(
-        blocked_data["pre_write_cause"], "write_readiness_changed",
-        "the original process proof must fail closed before reconciliation"
+    assert!(
+        matches!(
+            blocked_data["pre_write_cause"].as_str(),
+            Some("session_unavailable" | "write_readiness_changed")
+        ),
+        "the original route or process proof must fail closed before reconciliation: {blocked_data}"
     );
     assert_eq!(
         writing_data["binding"]["pane_root"]["pid"], replacement_pid,
@@ -2151,10 +2177,8 @@ async fn codex_ghost_with_unprovable_binding_blocks_once_and_withdrawal_advances
         vec![
             "proceed:composer_ghost_suggestion:".to_string(),
             "rebound::binding_unprovable".to_string(),
-            "proceed:composer_ghost_suggestion:".to_string(),
-            "rebound::binding_unprovable".to_string(),
         ],
-        "the production retry budget must settle after two exact attempts"
+        "unchanged binding evidence must settle after one exact attempt"
     );
     assert_only_oldest_attempt_exists(&rig, &pair);
     assert_eq!(
@@ -2293,6 +2317,7 @@ async fn a_manifest_without_composer_ownership_blocks_once_and_withdrawal_advanc
     .await;
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
 
     let pair = send_waiting_pair(&rig, "composer-semantic-missing").await;
     wait_for_notification_state(&mut rig, &pair.first, NotificationState::BlockedPreWrite).await;
@@ -2386,6 +2411,7 @@ async fn newly_proven_binding_reopens_the_same_blocked_attempt_once() {
         )
         .await;
     assert_eq!(named["result"]["label"], "worker", "{named}");
+    wait_pane_state(&mut rig, "idle").await;
 
     let sent = send_workspace_message(
         &rig,

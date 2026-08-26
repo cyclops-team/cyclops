@@ -5180,7 +5180,7 @@ fn should_retry(failure: &AttemptFailure, spent: u32, retry_max: u32) -> bool {
     matches!(failure.boundary, WriteBoundary::BeforeWrite)
         && !matches!(
             failure.cause.as_str(),
-            "pane_too_narrow" | "composer_ownership_unproven"
+            "pane_too_narrow" | "composer_ownership_unproven" | "binding_unprovable"
         )
         && spent <= retry_max
 }
@@ -5496,6 +5496,33 @@ async fn gate(
                                 cause: "no_such_pane".to_string(),
                             };
                         };
+                        let screen_reports_idle = det.readings.iter().any(|reading| {
+                            reading.sensor == Sensor::Screen && reading.state == AgentState::Idle
+                        });
+                        if handle.notification.is_some() && screen_reports_idle {
+                            if composer_semantic_missing(manifest, &det) {
+                                if let Some(observation) =
+                                    composer_semantic_observation(inner, handle, &row, &manifest_id)
+                                {
+                                    return GateOutcome::BlockedPreWrite {
+                                        cause: NotificationPreWriteCause::ComposerSemanticMissing,
+                                        observation,
+                                    };
+                                }
+                            }
+                            if fusion::admitted_binding(inner, handle.session_idx, &row).is_none() {
+                                if last_hold.as_deref() == Some(OBSERVATION_HOLD) {
+                                    return GateOutcome::BlockedPreWrite {
+                                        cause: NotificationPreWriteCause::BindingUnprovable,
+                                        observation: binding_unprovable_observation(
+                                            row.pane_pid,
+                                            &manifest_id,
+                                        ),
+                                    };
+                                }
+                                break 'pane Some(OBSERVATION_HOLD.to_string());
+                            }
+                        }
                         match det.state {
                             AgentState::Idle => {
                                 // Runtime idle is not permission to write. A
@@ -9589,6 +9616,11 @@ mod tests {
             (
                 AttemptFailure::composer_ownership_unproven(),
                 "composer_ownership_unproven",
+                false,
+            ),
+            (
+                AttemptFailure::binding_unprovable(None),
+                "binding_unprovable",
                 false,
             ),
             (AttemptFailure::paste_failed(), "paste_failed", false),
