@@ -5,6 +5,9 @@
 
 mod common;
 
+use std::fs;
+use std::path::PathBuf;
+
 use common::*;
 use cyclops_proto::MsgSendParams;
 use serde_json::{json, Value};
@@ -20,6 +23,20 @@ fn line_ids(resp: &Value) -> Vec<String> {
         .iter()
         .map(|l| l["id"].as_str().expect("line id").to_string())
         .collect()
+}
+
+fn workspace_journal(rig: &Rig) -> PathBuf {
+    fs::read_dir(rig.home.join("workspaces"))
+        .expect("workspace directory")
+        .find_map(|entry| {
+            let path = entry.ok()?.path().join("messages.ndjson");
+            path.is_file().then_some(path)
+        })
+        .expect("workspace journal")
+}
+
+fn workspace_journal_bytes(rig: &Rig) -> Vec<u8> {
+    fs::read(workspace_journal(rig)).expect("workspace journal readable")
 }
 
 /// LOW: recipients are ledgered under their canonical name (the pane's
@@ -267,7 +284,7 @@ async fn history_reconstructs_a_two_pane_conversation() {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 
-    let ledger_before = rig.ledger_lines().len();
+    let journal_before = workspace_journal_bytes(&rig);
 
     // --with reviewer reconstructs the conversation: both directions plus
     // the broadcast, ordered oldest first, nothing else.
@@ -377,8 +394,9 @@ async fn history_reconstructs_a_two_pane_conversation() {
         .await;
     assert_eq!(resp["error"]["code"], "no_such_message", "{resp}");
 
-    // Reading is free and reading never writes.
-    assert_eq!(rig.ledger_lines().len(), ledger_before);
+    // The history API reads the durable message journal without mutating it.
+    // Session-state observations may still arrive on the separate pane ledger.
+    assert_eq!(workspace_journal_bytes(&rig), journal_before);
     rig.assert_ledger_legal(&[]);
 
     // The record survives the daemon: a fresh boot on the same home
