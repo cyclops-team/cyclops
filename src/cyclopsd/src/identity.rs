@@ -588,9 +588,23 @@ fn origin_parent_ident(child: ProcId) -> Option<OriginParent> {
         return None;
     }
     if ppid <= 1 {
-        Some(OriginParent::Top)
-    } else {
-        ProcId::of(ppid).map(OriginParent::Process)
+        return Some(OriginParent::Top);
+    }
+    if let Some(parent) = ProcId::of(ppid) {
+        return Some(OriginParent::Process(parent));
+    }
+    // A parent this daemon cannot identify is the end of what it can
+    // prove, and how the walk must treat that depends on WHY. A process
+    // owned by another user is structurally not one of this daemon's
+    // vendors (they all run as the daemon's own user), and nothing above
+    // it can be reached through it either, so it is the top of the
+    // provable chain: the walk stops here and the caller decides on the
+    // vendor evidence it already gathered BELOW this point, which is
+    // where a vendor would have to be to matter. A parent whose owner is
+    // equally unreadable proves nothing at all and still refuses.
+    match foreign_owner(ppid) {
+        Some(uid) if uid != unsafe { libc::getuid() } => Some(OriginParent::Top),
+        _ => None,
     }
 }
 
@@ -822,6 +836,56 @@ fn birth_of(pid: i32) -> Option<u64> {
     bsd_info(pid).map(|(_, birth, _)| birth)
 }
 
+/// The owner and parent of a process the full record refuses to describe.
+///
+/// MEASURED on macOS 26.5: `proc_pidinfo(PROC_PIDTBSDINFO)` is refused to a
+/// normal user for a process owned by anybody else, so every ancestry walk
+/// that crosses one, and a Terminal.app login shell crosses a root-owned
+/// `login` on the way to launchd, loses the chain there. The short record
+/// is readable for those same processes and carries the two facts the walk
+/// needs to decide what to do about them: who owns it and what is above it.
+/// It carries no start time, which is why a process read this way is a
+/// boundary rather than a link (see `origin_parent_ident`): an identity
+/// that cannot be re-proven must never be compared as if it could.
+///
+/// Not the sysctl `KERN_PROC_PID` route: libc still defines no `kinfo_proc`
+/// for apple targets, and hand-spelling `extern_proc` plus `eproc` is the
+/// fragile unsafe this crate avoids. This struct libc does define.
+#[cfg(target_os = "macos")]
+fn bsd_short_info(pid: i32) -> Option<(i32, u32)> {
+    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            size,
+        )
+    };
+    if rc != size {
+        return None;
+    }
+    Some((info.pbsi_ppid as i32, info.pbsi_uid))
+}
+
+/// The owner of a process this daemon cannot fully read, when the kernel
+/// will still say who it belongs to. None when even that is refused.
+#[cfg(target_os = "macos")]
+pub fn foreign_owner(pid: i32) -> Option<u32> {
+    (pid > 0).then_some(())?;
+    if bsd_info(pid).is_some() {
+        return None;
+    }
+    bsd_short_info(pid).map(|(_, uid)| uid)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn foreign_owner(_pid: i32) -> Option<u32> {
+    None
+}
+
 /// One kernel read, both facts. The parent and the start time come out of
 /// the same `proc_bsdinfo` record, so asking for identity costs nothing
 /// beyond what the ancestry walk was already paying.
@@ -1043,6 +1107,72 @@ mod tests {
             None if process.pid == 1 => Some(OriginParent::Top),
             None => None,
         }
+    }
+
+    /// A Terminal.app login shell puts a root-owned `login` between the
+    /// operator's command and launchd, and this daemon cannot read that
+    /// process at all. Before the boundary rule, the walk lost the chain
+    /// there and every workspace UI started from a plain terminal was
+    /// refused a mailbox identity on macOS. An ancestor that is provably
+    /// somebody else's is the top of what can be proven, and with no
+    /// vendor below it the peer is the local operator.
+    #[test]
+    fn an_unreadable_foreign_ancestor_is_the_top_of_the_provable_chain() {
+        let pane_rows = vec![("%1".to_string(), Some("codex".to_string()), id(200))];
+        // 900 is the caller, 800 its shell; 700 stands for the root-owned
+        // login whose identity cannot be read, so the tree offers no
+        // parent for it at all.
+        let unreadable_parent = |process: ProcId| match process.pid {
+            900 => Some(OriginParent::Process(id(800))),
+            800 => None,
+            _ => None,
+        };
+        assert_eq!(
+            resolve_peer_origin_with(
+                id(900),
+                &pane_rows,
+                |_| Vendorship::NotVendor,
+                unreadable_parent,
+                |_| true,
+            ),
+            PeerOrigin::Unprovable,
+            "without the boundary the chain simply ends and nothing is proven"
+        );
+        let foreign_boundary = |process: ProcId| match process.pid {
+            900 => Some(OriginParent::Process(id(800))),
+            800 => Some(OriginParent::Top),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_peer_origin_with(
+                id(900),
+                &pane_rows,
+                |_| Vendorship::NotVendor,
+                foreign_boundary,
+                |_| true,
+            ),
+            PeerOrigin::Admin,
+            "a foreign-owned ancestor tops out the walk for the local operator"
+        );
+        // The boundary is not a laundering route: a vendor between the
+        // caller and that boundary still refuses, because vendor evidence
+        // is gathered below it, which is where a vendor has to be to
+        // matter.
+        assert_eq!(
+            resolve_peer_origin_with(
+                id(900),
+                &pane_rows,
+                |process| if process.pid == 800 {
+                    Vendorship::Vendor
+                } else {
+                    Vendorship::NotVendor
+                },
+                foreign_boundary,
+                |_| true,
+            ),
+            PeerOrigin::Unprovable,
+            "a vendor below the boundary still denies admin authority"
+        );
     }
 
     #[test]
