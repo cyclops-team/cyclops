@@ -896,6 +896,14 @@ fn inbox_claim(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Resp
     };
     // Only inbox.claim interprets the reserved locator. Every other message-id
     // consumer keeps treating the same bytes as a literal historical id.
+    // Read the oldest pending id before the claim so a claim-by-id that
+    // jumps the queue can say what it left at the head. A failed read is
+    // silence here, never a refused claim.
+    let oldest_pending = service
+        .list(caller.key, None, Some(1))
+        .ok()
+        .and_then(|entries| entries.into_iter().next())
+        .map(|item| item.entry.message_id);
     let outcome = match cyclops_proto::parse_notification_attempt_claim_locator(&params.message_id)
     {
         Some(attempt_id) => crate::messaging::claim_notification_locator(
@@ -908,13 +916,18 @@ fn inbox_claim(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Resp
         None => crate::messaging::claim(inner, &service, caller.key, params.message_id),
     };
     let result = match outcome {
-        Ok(crate::mailbox::ClaimOutcome::Claimed { message, .. }) => InboxClaimResult {
-            disposition: ClaimDisposition::Claimed,
-            message,
-        },
+        Ok(crate::mailbox::ClaimOutcome::Claimed { message, .. }) => {
+            let skipped_oldest = oldest_pending.filter(|oldest| *oldest != message.message_id);
+            InboxClaimResult {
+                disposition: ClaimDisposition::Claimed,
+                message,
+                skipped_oldest,
+            }
+        }
         Ok(crate::mailbox::ClaimOutcome::AlreadyClaimed { message, .. }) => InboxClaimResult {
             disposition: ClaimDisposition::AlreadyClaimed,
             message,
+            skipped_oldest: None,
         },
         Err(error) => return wire_error_response(id, mailbox_service_error(error)),
     };
@@ -3090,6 +3103,101 @@ mod tests {
     }
 
     /// A daemon with one exact notification stopped before any pane write.
+    /// Two pending messages to the workspace administrator, which is the
+    /// identity the test process resolves to, so it can claim them.
+    fn inner_with_two_pending_to_admin(
+        tag: &str,
+    ) -> (
+        Arc<Inner>,
+        std::path::PathBuf,
+        cyclops_proto::MessageId,
+        cyclops_proto::MessageId,
+    ) {
+        use cyclops_proto::{Kind, MessagePresentation, RecipientPresentation};
+
+        let path = cyclops_proto::scratch::scratch_dir(tag);
+        let _ = std::fs::remove_dir_all(&path);
+        let root = cyclops_state::StateRoot::open_or_create(&path).unwrap();
+        let workspace = WorkspaceId::from_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let session = SessionInstanceId::from_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let pane = TmuxPaneId::from_str("%1").unwrap();
+        let agent = RecipientKey::agent(workspace, session, pane);
+        let admin = RecipientKey::admin(workspace);
+        let directory = crate::mailbox::MailboxDirectory::new(
+            workspace,
+            [crate::mailbox::MailboxIdentity {
+                key: agent,
+                label: "reviewer".into(),
+            }],
+        )
+        .unwrap();
+        let mut store = crate::mailbox::MessageStore::open(
+            &root,
+            Path::new("workspaces/current/messages.ndjson"),
+            workspace,
+            "boot",
+        )
+        .unwrap();
+        let first = cyclops_proto::MessageId::new("m-first").unwrap();
+        let second = cyclops_proto::MessageId::new("m-second").unwrap();
+        for (message_id, subject) in [(&first, "First"), (&second, "Second")] {
+            store
+                .accept(
+                    message_id.clone(),
+                    crate::mailbox::MessageDraft {
+                        kind: Kind::Msg,
+                        sender: agent,
+                        recipients: vec![admin],
+                        subject: Some(subject.into()),
+                        body: Some("Body".into()),
+                        client_key: None,
+                        supersedes: None,
+                        presentation: MessagePresentation {
+                            sender_label: "reviewer".into(),
+                            recipient_labels: vec![RecipientPresentation {
+                                recipient: admin,
+                                label: "admin".into(),
+                            }],
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        let mut inner = bare_inner();
+        let service =
+            crate::mailbox::MailboxService::new_with_events(directory, store, inner.events.clone());
+        Arc::get_mut(&mut inner).expect("sole owner").mailbox = Some(Arc::new(service));
+        (inner, path, first, second)
+    }
+
+    /// F5: claiming by id around the oldest pending message is allowed and
+    /// must say so, because the skipped message still holds the FIFO head.
+    #[tokio::test]
+    async fn claim_by_id_names_the_oldest_pending_it_skipped() {
+        let (inner, path, first, second) =
+            inner_with_two_pending_to_admin("cyc-claim-names-skipped-oldest");
+
+        let response = ask_inner(&inner, "inbox.claim", json!({"message_id": second})).await;
+        let claimed: cyclops_proto::InboxClaimResult =
+            serde_json::from_value(response.result.expect("second claim succeeds")).unwrap();
+        assert_eq!(claimed.message.message_id, second);
+        assert_eq!(claimed.skipped_oldest, Some(first.clone()));
+
+        // A repeat claim is not a fresh skip.
+        let response = ask_inner(&inner, "inbox.claim", json!({"message_id": second})).await;
+        let repeated: cyclops_proto::InboxClaimResult =
+            serde_json::from_value(response.result.unwrap()).unwrap();
+        assert_eq!(repeated.skipped_oldest, None);
+
+        // Claiming the oldest skips nothing, and the field is absent on the wire.
+        let response = ask_inner(&inner, "inbox.claim", json!({"message_id": first})).await;
+        let raw = response.result.unwrap();
+        assert!(raw.get("skipped_oldest").is_none(), "{raw}");
+        let oldest: cyclops_proto::InboxClaimResult = serde_json::from_value(raw).unwrap();
+        assert_eq!(oldest.message.message_id, first);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     fn inner_with_blocked_notification(
         tag: &str,
     ) -> (

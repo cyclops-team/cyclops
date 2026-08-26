@@ -64,6 +64,12 @@ pub fn alarm_cleared_unknown(id: &str) -> String {
     format!("  acknowledged only · no unresolved attempt was listed for {id} just before clearing")
 }
 
+/// A claim by id took a later message; the oldest pending one still holds
+/// this recipient's queue head and its wake.
+pub fn claim_skipped_oldest(oldest: &str) -> String {
+    format!("skipped oldest pending {oldest} · it still holds your queue head · claim it, or use inbox next for oldest-first")
+}
+
 pub fn no_unresolved_alarms(older_than: &str) -> String {
     format!("no unresolved alarms selected by --older-than {older_than}")
 }

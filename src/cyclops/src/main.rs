@@ -1784,6 +1784,8 @@ fn cmd_inbox(c: &mut Client, cli: &Cli, style: &Style, args: &InboxArgs) -> i32 
                 Err(code) => return code,
             };
             print_claim_payload(&result.message);
+            print_skipped_oldest(result.skipped_oldest.as_ref());
+            print_skipped_oldest(result.skipped_oldest.as_ref());
             0
         }
         InboxCmd::Next { .. } => unreachable!("inbox next owns its bounded connection"),
@@ -2405,6 +2407,14 @@ fn message_wake_block_reason(
                 .pre_write_cause
                 .map(|cause| cause.wire_name().to_string())
         })
+}
+
+/// F5: a claim by id that jumped the queue says what it left at the head,
+/// so a recipient cannot keep skipping a stuck oldest message unknowingly.
+fn print_skipped_oldest(skipped: Option<&cyclops_proto::MessageId>) {
+    if let Some(oldest) = skipped {
+        println!("{}", copy::claim_skipped_oldest(oldest.as_str()));
+    }
 }
 
 fn print_claim_payload(message: &cyclops_proto::InboxMessage) {

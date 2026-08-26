@@ -1153,6 +1153,12 @@ pub struct InboxClaimParams {
 pub struct InboxClaimResult {
     pub disposition: ClaimDisposition,
     pub message: InboxMessage,
+    /// Present when a fresh claim by id took a message that was not the
+    /// recipient's oldest pending one: the oldest at claim time, which
+    /// still holds that recipient's FIFO head. Absent for oldest-first
+    /// claims, repeat claims, and clients that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_oldest: Option<crate::mailbox::MessageId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
