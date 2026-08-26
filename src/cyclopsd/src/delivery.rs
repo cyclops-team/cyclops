@@ -704,6 +704,11 @@ impl Engine {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn id_is_preloaded(&self, id: &str) -> bool {
+        self.issued.lock().expect("issued lock").contains(id)
+    }
+
     /// Mint a short unique message id, e.g. "m-3f9c2a".
     fn mint_msg_id(&self) -> String {
         let mut issued = self.issued.lock().expect("issued lock");

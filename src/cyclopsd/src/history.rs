@@ -25,6 +25,7 @@ use cyclops_proto::{
     HistoryParams, HistoryResult, Kind, LedgerLine, MessageMetadata, OpenDelivery, RecipientKey,
     ThreadResult, WireError,
 };
+use cyclops_state::StateRoot;
 use serde_json::Value;
 use tracing::warn;
 
@@ -316,7 +317,6 @@ fn history_sources(inner: &Inner) -> (Vec<Vec<LedgerLine>>, Vec<String>, Option<
     let mut files = Vec::new();
     let mut names = Vec::new();
     let mut workspace_file = None;
-    let mut seen = HashSet::new();
     if let Some(service) = &inner.mailbox {
         match service.journal_lines() {
             Ok(lines) if !lines.is_empty() => {
@@ -330,41 +330,67 @@ fn history_sources(inner: &Inner) -> (Vec<Vec<LedgerLine>>, Vec<String>, Option<
             }
         }
     }
-    let mut pending = VecDeque::new();
-    for slot in inner.session_slots() {
-        let source = legacy_journal_source(&slot);
-        if seen.insert(source.clone()) {
-            pending.push_back((source, read_session(&slot)));
-        }
-    }
-    while let Some((source, lines)) = pending.pop_front() {
-        for journal in linked_session_journals(&lines) {
-            let linked_source = legacy_journal_source_for_file(&journal);
-            if !seen.insert(linked_source.clone()) {
-                continue;
-            }
-            let descendant = PathBuf::from("ledger").join(&journal);
-            let linked_lines = match cyclops_ledger::read_after(&inner.state_root, &descendant, 0) {
-                Ok(lines) => lines,
-                Err(error) => {
-                    warn!(journal, %error, "linked session history is unreadable");
-                    Vec::new()
-                }
-            };
-            pending.push_back((linked_source, linked_lines));
-        }
-        names.push(source);
+    let roots = inner
+        .session_slots()
+        .into_iter()
+        .enumerate()
+        .map(|(idx, slot)| {
+            (
+                idx,
+                slot.journal_file_name().unwrap_or_default(),
+                read_session(&slot),
+            )
+        })
+        .collect();
+    for (_, journal, lines) in session_journal_family(&inner.state_root, roots) {
+        names.push(legacy_journal_source_for_file(&journal));
         files.push(lines);
     }
     (files, names, workspace_file)
 }
 
-fn legacy_journal_source(slot: &crate::SessionSlot) -> String {
-    legacy_journal_source_for_file(&slot.journal_file_name().unwrap_or_default())
-}
-
 fn legacy_journal_source_for_file(file: &str) -> String {
     format!("session-journal:{file}")
+}
+
+/// Root session journals plus every rename-linked journal they reach.
+///
+/// History and boot recovery share this traversal so a linked compatibility
+/// chain cannot be visible to readers while remaining invisible to id preload
+/// or restart settlement. The root index follows every descendant: after a
+/// restart that configured slot is the only live place where recovery can
+/// append a terminal fact or requeue a raw pane recipient.
+pub(crate) fn session_journal_family(
+    state_root: &StateRoot,
+    roots: Vec<(usize, String, Vec<LedgerLine>)>,
+) -> Vec<(usize, String, Vec<LedgerLine>)> {
+    let mut seen = HashSet::new();
+    let mut pending = VecDeque::new();
+    for (idx, journal, lines) in roots {
+        if seen.insert(journal.clone()) {
+            pending.push_back((idx, journal, lines));
+        }
+    }
+
+    let mut family = Vec::new();
+    while let Some((idx, journal, lines)) = pending.pop_front() {
+        for linked in linked_session_journals(&lines) {
+            if !seen.insert(linked.clone()) {
+                continue;
+            }
+            let descendant = PathBuf::from("ledger").join(&linked);
+            let linked_lines = match cyclops_ledger::read_after(state_root, &descendant, 0) {
+                Ok(lines) => lines,
+                Err(error) => {
+                    warn!(journal = linked, %error, "linked session journal is unreadable");
+                    Vec::new()
+                }
+            };
+            pending.push_back((idx, linked, linked_lines));
+        }
+        family.push((idx, journal, lines));
+    }
+    family
 }
 
 fn linked_session_journals(lines: &[LedgerLine]) -> Vec<String> {
@@ -373,8 +399,14 @@ fn linked_session_journals(lines: &[LedgerLine]) -> Vec<String> {
         .filter_map(|line| line.data.as_ref())
         .filter(|data| data["event"] == "session_slot_aliased")
         .filter_map(|data| data["canonical_journal"].as_str())
-        .filter(|file| valid_session_journal_file(file))
-        .map(str::to_owned)
+        .filter_map(|file| {
+            if valid_session_journal_file(file) {
+                Some(file.to_owned())
+            } else {
+                warn!(journal = file, "invalid linked session journal was ignored");
+                None
+            }
+        })
         .collect()
 }
 

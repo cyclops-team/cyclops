@@ -2483,7 +2483,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     .map_err(|error| anyhow::anyhow!("open mailbox directory: {error}"))?;
     let (manifests, manifest_dir) = load_manifests(&cfg);
     let mut sessions = Vec::with_capacity(cfg.sessions.len());
-    let mut replayed: Vec<(usize, Vec<LedgerLine>)> = Vec::new();
+    let mut replay_roots: Vec<(usize, String, Vec<LedgerLine>)> = Vec::new();
     let engine = delivery::Engine::new();
     for (idx, name) in cfg.sessions.iter().enumerate() {
         let descendant = PathBuf::from("ledger").join(format!("{name}.ndjson"));
@@ -2493,17 +2493,26 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
                 state_root.path().join(&descendant).display()
             )
         })?;
-        // Message ids stay unique per ledger across restarts; the replayed
-        // lines also feed the restart-limbo scan below.
+        // The roots and every rename-linked journal discovered from them
+        // feed both id preload and restart-limbo settlement below.
         match ledger.read_after(0) {
             Ok(lines) => {
-                engine.preload_ids(&lines);
-                replayed.push((idx, lines));
+                replay_roots.push((idx, format!("{name}.ndjson"), lines));
             }
             Err(e) => warn!(session = %name, error = %e, "ledger replay for id preload failed"),
         }
         sessions.push(Arc::new(SessionSlot::new(name.clone(), Arc::new(ledger))));
     }
+    let replayed: Vec<(usize, Vec<LedgerLine>)> =
+        history::session_journal_family(&state_root, replay_roots)
+            .into_iter()
+            .map(|(idx, _, lines)| {
+                // This is the first Engine use after construction, so every
+                // historical id is reserved before any request can mint one.
+                engine.preload_ids(&lines);
+                (idx, lines)
+            })
+            .collect();
     // Adoptions from the previous run. Nothing is trusted onto a pane
     // yet; each session prunes its own entries against the live pane
     // table when it attaches (registry::restore_session).
@@ -4859,6 +4868,84 @@ mod tests {
         assert_eq!(inbox[0].entry.message_id, message_id);
         second.shutdown().await;
         drop(second);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn boot_preloads_and_settles_a_rename_linked_legacy_journal() {
+        let home = cyclops_proto::scratch::scratch_dir(&format!(
+            "cyc-linked-boot-replay-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state_root = StateRoot::open_or_create(&home).unwrap();
+        let configured =
+            LedgerWriter::open(&state_root, Path::new("ledger/research.ndjson"), "old-boot")
+                .unwrap();
+        let linked =
+            LedgerWriter::open(&state_root, Path::new("ledger/runtime.ndjson"), "old-boot")
+                .unwrap();
+
+        let legacy_id = "m-abcdef";
+        let mut message = daemon_line(Kind::Msg, legacy_id.into(), json!({"hosted": ["%0"]}));
+        message.from = "admin".into();
+        message.to = vec!["%0".into()];
+        message.subject = Some("linked before restart".into());
+        message.body = Some("body".into());
+        message.deliveries = vec![cyclops_proto::Delivery {
+            to: "%0".into(),
+            state: cyclops_proto::DeliveryState::Submitted,
+            verified_by: None,
+            attempts: 1,
+            ts: unix_ms(),
+            cause: None,
+        }];
+        linked.append(message).unwrap();
+        configured
+            .append(daemon_line(
+                Kind::System,
+                "e-alias".into(),
+                json!({
+                    "event": "session_slot_aliased",
+                    "session": "research",
+                    "canonical_session_idx": 1,
+                    "canonical_journal": "runtime.ndjson",
+                }),
+            ))
+            .unwrap();
+        drop(linked);
+        drop(configured);
+        drop(state_root);
+
+        let mut cfg = Config::defaults(&home);
+        cfg.sessions = vec!["research".into()];
+        let daemon = boot(cfg).await.unwrap();
+        assert!(
+            daemon.inner.engine.id_is_preloaded(legacy_id),
+            "an id visible through linked history must be reserved before requests can mint ids"
+        );
+
+        let lines = daemon
+            .inner
+            .session(0)
+            .unwrap()
+            .ledger
+            .read_after(0)
+            .unwrap();
+        let settlements = lines
+            .iter()
+            .filter(|line| {
+                line.id == legacy_id
+                    && line.kind == Kind::State
+                    && line.data.as_ref().is_some_and(|data| {
+                        data["to_state"] == "attention_required"
+                            && data["cause"] == "daemon_restart"
+                    })
+            })
+            .count();
+        assert_eq!(settlements, 1, "linked in-flight chain must settle once");
+
+        daemon.shutdown().await;
+        drop(daemon);
         std::fs::remove_dir_all(home).unwrap();
     }
 
