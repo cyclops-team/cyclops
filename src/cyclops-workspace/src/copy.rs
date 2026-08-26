@@ -21,13 +21,9 @@ pub const NAME_PANE_TITLE: &str = "Name pane";
 
 pub const NAME_PANE_HINT: &str = "Used to identify and message this agent, e.g. reviewer.";
 
-pub const KEYBINDS_TITLE: &str = "Keybinds";
-
-pub const KEYBINDS_HINT: &str = "Scroll with ↑/↓, PgUp/PgDn, or the mouse wheel.";
-
-/// The compact state vocabulary (rule 11), spelled out once for the
-/// keybinds dialog since sidebar rows and inactive pane borders show only
-/// the glyph half of it.
+/// The compact state vocabulary (rule 11), spelled out once under the
+/// settings card's keybinds section since sidebar rows and inactive pane
+/// borders show only the glyph half of it.
 pub const STATE_GLYPH_LEGEND: &str = "Status:  ○ idle   ● working   ⚠ needs attention   ✕ dead";
 
 pub const RENAME_WORKSPACE_PROMPT: &str = "Rename session";
@@ -136,10 +132,9 @@ pub const MENU_TAB_BAR: &str = "Tab bar";
 /// The only visible switch for chrome fades (`crate::animate`).
 pub const MENU_MOTION: &str = "Motion";
 
-/// Opens the settings dialog: the theme picker and the sound switch.
+/// Opens the settings dialog: the theme picker, the sound switch, and
+/// the keybinding reference.
 pub const MENU_SETTINGS: &str = "Settings";
-
-pub const MENU_KEYBINDS: &str = "Keybinds";
 
 pub const MENU_DETACH: &str = "Detach";
 
@@ -157,6 +152,8 @@ pub const SETTINGS_TITLE: &str = "Settings";
 pub const SETTINGS_SECTION_THEME: &str = "Theme";
 
 pub const SETTINGS_SECTION_SOUND: &str = "Sound";
+
+pub const SETTINGS_SECTION_KEYBINDS: &str = "Keybinds";
 
 pub const THEMES_HINT: &str = "Pick with ↑/↓, Tab switches section, Enter applies everywhere.";
 

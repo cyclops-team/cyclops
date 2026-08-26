@@ -53,7 +53,7 @@ Default bindings are prefix-first (`Ctrl+B`, same shape as tmux):
 | `Ctrl+B` `b` | Collapse or reopen the sidebar |
 | `Ctrl+B` `g` | Put the keyboard in the file panel; Esc gives it back |
 | `Ctrl+B` `s` | Send a message to an agent |
-| `Ctrl+B` `?` | Open the scrollable keybinding reference |
+| `Ctrl+B` `?` | Open Settings on its Keybinds section, the reference to every active binding |
 
 Hiding the tab bar ships with no chord: the app menu's `Tab bar` item is
 the way, so a hidden strip is always something you chose. Bind
@@ -263,12 +263,14 @@ size, so all panes reflow.
 The app menu's `Settings` item opens the settings card: one section
 showing at a time, `Tab` (and `Shift+Tab`) walking between them, or a
 click on a section's chip in the card's top row. `↑`/`↓` move down the
-showing section's list (a click on a row puts the cursor there). Landing
-on a row checks it: the `✓` (the same one the app menu's toggles wear)
-moves to the row, showing what `Enter` would save, and nothing is saved
-yet. `Enter` (or the `Apply` button) saves what is checked and closes;
-`Esc` closes and forgets it. The card is one size for every section: it
-is sized for the longer list, so switching sections never resizes it.
+showing section's list (a click on a row puts the cursor there;
+`PgUp`/`PgDn` move eight rows, `Home`/`End` to the ends, and the wheel
+moves too). Landing on a row checks it: the `✓` (the same one the app
+menu's toggles wear) moves to the row, showing what `Enter` would save,
+and nothing is saved yet. `Enter` (or the `Apply` button) saves what is
+checked and closes; `Esc` closes and forgets it. The card is one size
+for every section: it is sized for the longest list, so switching
+sections never resizes it.
 
 - **Theme** lists every loadable theme, the same rows `cyclops theme`
   prints. Landing on a theme checks it and previews it over the live
@@ -301,8 +303,21 @@ is sized for the longer list, so switching sections never resizes it.
   sound at all falls back to the terminal bell, which many terminals
   ship with the sound turned off.
 
+- **Keybinds** is the keybinding reference: every active binding, chord
+  and action, generated from the bindings actually in force rather than
+  from documentation, so a rebinding in `config.toml` is what it shows.
+  It reads only; the list scrolls (`↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End`,
+  or the wheel, three rows a notch), the count at the bottom right says
+  which rows are showing, and the line under the list spells out the
+  status glyphs (`○ idle`, `● working`, `⚠ needs attention`, `✕ dead`)
+  the sidebar and pane borders show only the glyph of. `Enter` and `Esc`
+  both close it; there is nothing on it to apply. `Ctrl+B` `?` opens the
+  card on this section directly.
+
 `show_settings` is the binding name; `show_themes`, from when the card
 was only a theme picker, still works in an existing config.
+`show_keybinds` (`Ctrl+B` `?` by default) opens the same card on its
+Keybinds section.
 
 ## Motion
 
@@ -368,9 +383,8 @@ right-click, not a list position and not whichever item later becomes
 active. Menus highlight the row under the pointer. The `☰ menu` button at
 the sidebar's bottom opens the application menu. The matching `+` at the
 bottom-right creates a workspace from the focused pane's folder. The
-application menu's Keybinds item opens a padded, scrollable list generated
-from the bindings that are actually active; use arrow keys, Page Up/Down,
-Home/End, or the mouse wheel.
+keybinding reference is the settings card's Keybinds section (see
+[Settings](#settings)).
 
 Wheel over a pane scrolls its history; new output never pulls a scrolled
 viewport back to the tail. Drag a gutter to resize, drag a tab onto another

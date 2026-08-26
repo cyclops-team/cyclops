@@ -56,11 +56,14 @@ pub enum BindingAction {
     /// merge of the old right-hand panel into the sidebar; the config key
     /// (`toggle_event_panel`) keeps working unchanged.
     ToggleEventPanel,
+    /// Open the settings card on its keybinds section: the reference
+    /// generated from the active map.
     ShowKeybinds,
     /// Open the composer: address a message without leaving the workspace.
     Compose,
-    /// Open the settings dialog (themes, sound). No default chord:
-    /// reached from the app menu, bindable via config.
+    /// Open the settings card (theme, sound, keybinds) on its first
+    /// section. No default chord: reached from the app menu, bindable
+    /// via config.
     ShowSettings,
 }
 

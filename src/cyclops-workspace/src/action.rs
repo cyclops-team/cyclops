@@ -314,12 +314,14 @@ pub enum Action {
     SelectSidebarTab {
         tab: crate::persist::SidebarTab,
     },
-    ShowKeybinds,
-    /// Open the settings card on its theme section. Carries no target:
-    /// the theme listing is read from the themes directory at execution
-    /// time, so a file added or removed between the click and the open
-    /// cannot show a stale row, and the sound switch is read from prefs.
-    ShowSettings,
+    /// Open the settings card on one of its sections. Carries no other
+    /// target: the theme listing is read from the themes directory at
+    /// execution time, so a file added or removed between the click and
+    /// the open cannot show a stale row, the sound switch is read from
+    /// prefs, and the keybinds section is generated from the active map.
+    ShowSettings {
+        section: SettingsSection,
+    },
     /// Switch to a theme by name, exactly what `cyclops theme <name>`
     /// does: write the config key and nudge the daemon, whose theme event
     /// repaints this workspace through the existing hot-reload watch.
@@ -464,8 +466,12 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
         BindingAction::ToggleTabBar => Some(Action::ToggleTabBar),
         BindingAction::ToggleMotion => Some(Action::ToggleMotion),
         BindingAction::ToggleEventPanel => Some(Action::ToggleEventPanel),
-        BindingAction::ShowKeybinds => Some(Action::ShowKeybinds),
-        BindingAction::ShowSettings => Some(Action::ShowSettings),
+        BindingAction::ShowKeybinds => Some(Action::ShowSettings {
+            section: SettingsSection::Keybinds,
+        }),
+        BindingAction::ShowSettings => Some(Action::ShowSettings {
+            section: SettingsSection::Theme,
+        }),
     }
 }
 
@@ -641,11 +647,9 @@ pub fn route_dialog_confirm(dialog: &Dialog) -> Option<Action> {
         Dialog::ConfirmCloseWorkspace { session } => Some(Action::CloseWorkspace {
             session: session.clone(),
         }),
-        // Read-only: nothing to confirm. Enter just dismisses it.
-        Dialog::Keybinds { .. } => None,
         // Enter applies the row the arrows are on, in the section that is
         // showing. An empty theme listing has nothing to apply, so Enter
-        // dismisses like the keybinds sheet.
+        // dismisses like the keybinds section.
         Dialog::Settings {
             section: SettingsSection::Theme,
             themes,
@@ -664,6 +668,11 @@ pub fn route_dialog_confirm(dialog: &Dialog) -> Option<Action> {
             on: sound.on,
             cue: sound.checked_sound().map(String::from),
         }),
+        // Read-only: nothing to confirm. Enter just dismisses the card.
+        Dialog::Settings {
+            section: SettingsSection::Keybinds,
+            ..
+        } => None,
     }
 }
 
@@ -1549,15 +1558,22 @@ mod tests {
         );
     }
 
+    /// Nothing on the keybinds section is chosen, so its Enter has no
+    /// action and the card closes the way an empty theme list's does.
     #[test]
-    fn keybinds_dialog_confirms_to_no_action() {
-        assert_eq!(
-            route_dialog_confirm(&Dialog::Keybinds {
-                scroll: 0,
-                rows: Vec::new(),
-            }),
-            None
-        );
+    fn the_keybinds_section_confirms_to_no_action() {
+        let dialog = Dialog::Settings {
+            section: SettingsSection::Keybinds,
+            themes: crate::dialog::ThemePicker {
+                names: vec!["dark".into()],
+                selected: 0,
+                active: Some(0),
+                notice: None,
+            },
+            sound: crate::dialog::SoundPicker::new(true, vec!["system".into()], "system"),
+            keybinds: crate::dialog::KeybindSheet::default(),
+        };
+        assert_eq!(route_dialog_confirm(&dialog), None);
     }
 
     #[test]
@@ -1568,11 +1584,23 @@ mod tests {
 
         assert_eq!(
             route_binding(BindingAction::ShowSettings, &c),
-            Some(Action::ShowSettings)
+            Some(Action::ShowSettings {
+                section: SettingsSection::Theme
+            })
+        );
+        // The keybinding reference is the same card, open on its own
+        // section, so `Ctrl+B ?` still lands on the bindings.
+        assert_eq!(
+            route_binding(BindingAction::ShowKeybinds, &c),
+            Some(Action::ShowSettings {
+                section: SettingsSection::Keybinds
+            })
         );
         assert_eq!(
             route_menu_item(&MenuState::AppMenu, BindingAction::ShowSettings, &c),
-            Some(Action::ShowSettings)
+            Some(Action::ShowSettings {
+                section: SettingsSection::Theme
+            })
         );
     }
 
@@ -1592,6 +1620,7 @@ mod tests {
                 active_sound: Some(0),
                 previewed: None,
             },
+            keybinds: crate::dialog::KeybindSheet::default(),
         }
     }
 

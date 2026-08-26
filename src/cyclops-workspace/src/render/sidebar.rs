@@ -840,8 +840,7 @@ fn paint_footer_rule(content: Rect, y: u16, buf: &mut Buffer, paint: &Paint) {
 /// stealing the rest of the row.
 ///
 /// Painted for the Stream tab too. The menu button is the only mouse route
-/// to themes, keybinds, and detach, so hiding it behind a tab would strand
-/// them.
+/// to settings and detach, so hiding it behind a tab would strand them.
 ///
 /// `clipped` is how many rows the body above could not fit. Zero paints
 /// nothing.
@@ -972,7 +971,7 @@ fn paint_footer(
     } else if clipped > 0 {
         // The body stops at the footer and does not scroll, so without
         // this a workspace below the fold looks like one that does not
-        // exist. Same job as the keybinds dialog's "1–12 / 20".
+        // exist. Same job as the keybinds section's "1–12 / 20".
         Some(format!("+{clipped} more"))
     } else {
         None

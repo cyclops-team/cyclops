@@ -2033,18 +2033,13 @@ async fn handle_mouse(
         ) {
             let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
             let max_scroll = keybind_scroll_limit(app);
-            match app.dialog.as_mut() {
-                Some(Dialog::Keybinds { scroll, .. }) => {
-                    let delta = if up { -3 } else { 3 };
-                    *scroll = dialog::move_keybind_scroll(*scroll, delta, max_scroll);
-                }
-                // A picker notch moves the selection one row, not a
-                // viewport three: the list is what the wheel is over.
-                Some(open @ Dialog::Settings { .. }) => {
-                    let delta = if up { -1 } else { 1 };
-                    dialog::move_settings_selection(open, delta);
-                }
-                _ => {}
+            // A picker notch moves the selection one row; the keybinds
+            // section's moves its viewport three. The dialog says which
+            // list the wheel is over.
+            if let Some(open @ Dialog::Settings { .. }) = app.dialog.as_mut() {
+                let rows = dialog::settings_wheel_rows(open);
+                let delta = if up { -rows } else { rows };
+                dialog::move_settings_selection(open, delta, max_scroll);
             }
             // Same landing the arrow keys make: a theme goes live for the
             // next render, a sound row takes the check.
@@ -3171,9 +3166,9 @@ async fn follow_workspace_folder(
 /// Apply the open dialog's action (Enter or its confirm button).
 /// Route the open dialog's confirmation to a terminal [`Action`] and run it
 /// through the executor. A dialog whose buffer resolves to nothing (a blank
-/// rename, or the read-only Keybinds sheet) still dismisses on Enter — it
-/// just does so here instead of inside an executor arm, since there is no
-/// action to hand it.
+/// rename, or the settings card on its read-only keybinds section) still
+/// dismisses on Enter — it just does so here instead of inside an executor
+/// arm, since there is no action to hand it.
 async fn dialog_confirm(
     app: &mut App,
     client: &ControlClient,
@@ -3251,12 +3246,17 @@ async fn paste_into_focused_pane(
     Ok(())
 }
 
+/// How far the settings card's keybinds section can scroll on this
+/// terminal: its rows past the list the card has room for. Zero for
+/// every other dialog, and for no dialog.
 fn keybind_scroll_limit(app: &App) -> u16 {
-    let row_count = match app.dialog.as_ref() {
-        Some(Dialog::Keybinds { rows, .. }) => rows.len(),
-        _ => return 0,
+    let Some(dialog) = app.dialog.as_ref() else {
+        return 0;
     };
-    crate::render::keybind_max_scroll(row_count, Rect::new(0, 0, app.term_size.0, app.term_size.1))
+    crate::render::settings_keybind_max_scroll(
+        dialog,
+        Rect::new(0, 0, app.term_size.0, app.term_size.1),
+    )
 }
 
 /// Install one decoration snapshot: the offline bookkeeping and the
@@ -3573,14 +3573,8 @@ async fn handle_dialog_key(
             }
         }
         DialogKeyAction::Scroll(delta) => {
-            match app.dialog.as_mut() {
-                Some(Dialog::Keybinds { scroll, .. }) => {
-                    *scroll = dialog::move_keybind_scroll(*scroll, delta, max_scroll);
-                }
-                Some(open @ Dialog::Settings { .. }) => {
-                    dialog::move_settings_selection(open, delta);
-                }
-                _ => {}
+            if let Some(open) = app.dialog.as_mut() {
+                dialog::move_settings_selection(open, delta, max_scroll);
             }
             // The row the arrows land on goes live, or takes the check,
             // for the next render (a no-op for every other dialog).
@@ -3591,15 +3585,12 @@ async fn handle_dialog_key(
                 dialog::switch_settings_section(open, delta);
             }
         }
-        DialogKeyAction::ScrollStart => {
-            if let Some(Dialog::Keybinds { scroll, .. }) = app.dialog.as_mut() {
-                *scroll = 0;
+        DialogKeyAction::ScrollStart | DialogKeyAction::ScrollEnd => {
+            let to_end = action == DialogKeyAction::ScrollEnd;
+            if let Some(open) = app.dialog.as_mut() {
+                dialog::jump_settings_selection(open, to_end, max_scroll);
             }
-        }
-        DialogKeyAction::ScrollEnd => {
-            if let Some(Dialog::Keybinds { scroll, .. }) = app.dialog.as_mut() {
-                *scroll = max_scroll;
-            }
+            exec::settings_cursor_moved(app, false);
         }
         DialogKeyAction::Ignore => {}
     }
@@ -4778,6 +4769,7 @@ mod tests {
                 notice: None,
             },
             sound: dialog::SoundPicker::new(false, vec!["system".into()], "system"),
+            keybinds: dialog::KeybindSheet::default(),
         });
         exec::preview_selected_theme(&mut app);
         assert_ne!(app.paint.theme.resolve(dim).rgb, original, "previewed");
@@ -4834,6 +4826,7 @@ mod tests {
                 notice: None,
             },
             sound: dialog::SoundPicker::new(false, vec!["system".into()], "system"),
+            keybinds: dialog::KeybindSheet::default(),
         });
         exec::preview_selected_theme(&mut app);
         assert_eq!(app.paint.theme.resolve(dim).rgb, (0x22, 0x22, 0x22));

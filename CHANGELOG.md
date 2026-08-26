@@ -32,12 +32,17 @@ versions are unreleased until admin cuts a tag.
 - Installation and update activate a matched CLI and daemon pair. Update proves
   build identity and journal replay before activation, preserves one validated
   known-good pair, and supports `cyclops update --rollback`.
-- The workspace's app menu has a `Settings` item in place of `Themes`. It
-  opens one card with two sections: the theme picker, unchanged, and a
-  `Sound notifs` switch. `Tab` walks the sections (or click a section's
-  chip), `↑`/`↓` move in the showing list (or click a row); landing on
+- The workspace's app menu has a `Settings` item in place of `Themes`
+  and `Keybinds`. It opens one card with three sections: the theme
+  picker, unchanged, a `Sound notifs` switch, and the keybinding
+  reference, which was a card of its own. `Tab` walks the sections (or
+  click a section's chip), `↑`/`↓` move in the showing list (or click a
+  row; `PgUp`/`PgDn`, `Home`/`End` and the wheel move too); landing on
   a row moves the `✓` to it without saving, `Enter` saves what is
   checked, `Esc` forgets it. The card keeps one size across sections.
+  The Keybinds section scrolls its rows behind a viewport, counts the
+  rows showing, and closes on `Enter` or `Esc`: nothing on it to apply.
+  `Ctrl+B` `?` (`show_keybinds`) opens the card on that section.
   The switch is saved as `[workspace] sound_notifs` (off by default).
   Under the switch, the sounds to choose from: every file in
   `~/.cyclops/sounds/` by name (`bow-ripple` and `glass-ping` ship and

@@ -14,7 +14,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap};
 use super::PANE_GRIP;
 use crate::bindings::BindingAction;
 use crate::copy;
-use crate::dialog::{Dialog, SettingsSection, SoundPicker, SoundRow, ThemePicker};
+use crate::dialog::{Dialog, KeybindSheet, SettingsSection, SoundPicker, SoundRow, ThemePicker};
 use crate::input::mouse::{HitMap, HitTarget, MenuState};
 use crate::theme::{self, Paint};
 
@@ -44,7 +44,7 @@ const DIALOG_ERROR_MAX_WIDTH: u16 = 68;
 /// sound section's one-line explanation and the theme hint each fit on
 /// one row at an ordinary terminal width; a narrower terminal wraps them
 /// rather than losing them.
-const SETTINGS_MAX_WIDTH: u16 = 58;
+const SETTINGS_MAX_WIDTH: u16 = 64;
 
 /// Columns between two buttons on the action row.
 const DIALOG_BUTTON_GAP: u16 = 2;
@@ -288,7 +288,6 @@ fn dialog_parts(dialog: &Dialog) -> (&str, Option<&str>, Option<&str>, &'static 
             status.as_deref().or(Some(copy::COMPOSE_HINT)),
             copy::BUTTON_SEND,
         ),
-        Dialog::Keybinds { .. } => unreachable!("keybinds uses its own dialog renderer"),
         Dialog::Settings { .. } => unreachable!("settings uses its own dialog renderer"),
     }
 }
@@ -297,16 +296,20 @@ fn dialog_parts(dialog: &Dialog) -> (&str, Option<&str>, Option<&str>, &'static 
 ///
 /// The one dispatch from a dialog to its geometry, so the bound a drag is
 /// held to and the rect the paint uses cannot disagree about which shape a
-/// dialog has. `paint_dialog` reaches the same three functions for the
+/// dialog has. `paint_dialog` reaches the same two functions for the
 /// extra row counts it also needs;
 /// `every_dialog_is_dragged_to_where_it_is_painted` is what keeps the two
 /// matches saying the same thing.
 pub fn dialog_rect(dialog: &Dialog, area: Rect) -> Option<Rect> {
     match dialog {
-        Dialog::Keybinds { rows, .. } => keybind_dialog_geometry(rows.len(), area).map(|(r, _)| r),
         // Sized for every section at once, so Tab never moves the box.
-        Dialog::Settings { themes, sound, .. } => {
-            let (rows, footer_lines) = settings_frame(themes, sound, area);
+        Dialog::Settings {
+            themes,
+            sound,
+            keybinds,
+            ..
+        } => {
+            let (rows, footer_lines) = settings_frame(themes, sound, keybinds, area);
             settings_dialog_geometry(rows, footer_lines, area).map(|(r, _)| r)
         }
         _ => {
@@ -358,18 +361,15 @@ pub fn paint_dialog(
     hover: Option<(u16, u16)>,
     offset: (i16, i16),
 ) {
-    if let Dialog::Keybinds { scroll, rows } = dialog {
-        paint_keybinds_dialog(*scroll, rows, area, buf, paint, hits, hover, offset);
-        return;
-    }
     if let Dialog::Settings {
         section,
         themes,
         sound,
+        keybinds,
     } = dialog
     {
         paint_settings_dialog(
-            *section, themes, sound, area, buf, paint, hits, hover, offset,
+            *section, themes, sound, keybinds, area, buf, paint, hits, hover, offset,
         );
         return;
     }
@@ -619,158 +619,14 @@ fn wrapped_line_count(text: &str, width: u16) -> usize {
     lines
 }
 
-/// Large, padded keybinding reference. The dialog owns only a scroll
-/// offset; its rows come from the active router map rather than hardcoded
-/// documentation.
-fn paint_keybinds_dialog(
-    scroll: u16,
-    rows: &[crate::bindings::BindingHelp],
-    area: Rect,
-    buf: &mut Buffer,
-    paint: &Paint,
-    hits: &mut HitMap,
-    hover: Option<(u16, u16)>,
-    offset: (i16, i16),
-) {
-    let Some((dialog_area, list_h)) = keybind_dialog_geometry(rows.len(), area) else {
-        return;
-    };
-    let dialog_area = shift_on_screen(dialog_area, area, offset);
-    clear_area(buf, dialog_area);
-    let block = overlay_block(paint);
-    let inner = block.inner(dialog_area);
-    block.render(dialog_area, buf);
-
-    let left = inner.x + DIALOG_INSET;
-    let usable_w = inner.width.saturating_sub(2 * DIALOG_INSET);
-    super::overlay_text(
-        buf,
-        inner,
-        left,
-        inner.y,
-        copy::KEYBINDS_HINT,
-        theme::menu_hint(paint),
-    );
-    // Rule 11's compact surfaces (sidebar rows, inactive pane borders) show
-    // the glyph alone; this dialog is the one place that spells the whole
-    // vocabulary out, once, so a reader never has to guess what a bare ●
-    // or ✕ meant.
-    super::overlay_text(
-        buf,
-        inner,
-        left,
-        inner.y + 1,
-        copy::STATE_GLYPH_LEGEND,
-        theme::menu_hint(paint),
-    );
-
-    let list_y = inner.y + 3;
-    let start = if list_h == 0 {
-        0
-    } else {
-        usize::from(scroll.min(keybind_max_scroll(rows.len(), area)))
-    };
-    let key_w = rows
-        .iter()
-        .map(|row| Span::raw(row.keys.as_str()).width())
-        .max()
-        .unwrap_or(0)
-        .min(usable_w.saturating_sub(4) as usize) as u16;
-    for (line, row) in rows.iter().skip(start).take(list_h as usize).enumerate() {
-        let y = list_y + line as u16;
-        super::overlay_text(
-            buf,
-            inner,
-            left,
-            y,
-            &row.keys,
-            theme::pane_border_focused(paint),
-        );
-        super::overlay_text(
-            buf,
-            inner,
-            left + key_w + 3,
-            y,
-            &row.action,
-            theme::menu_row(paint),
-        );
-    }
-
-    let footer_y = inner.y + inner.height.saturating_sub(1);
-    let close = format!("↵ / Esc {}", copy::BUTTON_CLOSE);
-    let close_w = Span::raw(close.as_str()).width() as u16;
-    let close_rect = Rect::new(left, footer_y, close_w.min(usable_w), 1);
-    let hovered = hover.is_some_and(|(x, y)| {
-        y == close_rect.y && x >= close_rect.x && x < close_rect.x + close_rect.width
-    });
-    super::overlay_text(
-        buf,
-        inner,
-        close_rect.x,
-        close_rect.y,
-        &close,
-        if hovered {
-            theme::dialog_primary(paint).add_modifier(Modifier::UNDERLINED)
-        } else {
-            theme::dialog_primary(paint)
-        },
-    );
-    hits.push(close_rect, HitTarget::DialogCancel);
-
-    if !rows.is_empty() && list_h > 0 {
-        let end = (start + list_h as usize).min(rows.len());
-        let progress = format!("{}–{} / {}", start + 1, end, rows.len());
-        let progress_w = Span::raw(progress.as_str()).width() as u16;
-        let x = inner
-            .x
-            .saturating_add(inner.width.saturating_sub(progress_w + 2));
-        super::overlay_text(buf, inner, x, footer_y, &progress, theme::menu_hint(paint));
-    }
-    paint_title_bar(buf, dialog_area, Some(copy::KEYBINDS_TITLE), paint, hits);
-}
-
-/// Tallest the keybinds dialog may grow. The list scrolls, so the dialog
-/// stays a card rather than a wall.
-const KEYBINDS_MAX_HEIGHT: u16 = 20;
-
-fn keybind_dialog_geometry(row_count: usize, area: Rect) -> Option<(Rect, u16)> {
-    if area.width < 8 || area.height < 6 {
-        return None;
-    }
-    let width = area.width.saturating_sub(4).min(72);
-    // Hint, glyph legend, one blank line before the list, one blank line
-    // after it, and the footer: 5 fixed rows around the scrollable list.
-    // The title is in the border (`paint_title_bar`).
-    let wanted_height = u16::try_from(row_count.saturating_add(7)).unwrap_or(u16::MAX);
-    let height = wanted_height
-        .min(area.height.saturating_sub(2))
-        .clamp(6, KEYBINDS_MAX_HEIGHT);
-    let dialog = Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    );
-    let list_height = height.saturating_sub(2).saturating_sub(5);
-    Some((dialog, list_height))
-}
-
-/// Largest meaningful keybinding-list offset for this terminal area.
-pub fn keybind_max_scroll(row_count: usize, area: Rect) -> u16 {
-    let Some((_, list_height)) = keybind_dialog_geometry(row_count, area) else {
-        return 0;
-    };
-    if list_height == 0 {
-        return 0;
-    }
-    u16::try_from(row_count.saturating_sub(list_height as usize)).unwrap_or(u16::MAX)
-}
-
 /// The settings card: section chips across the top, the showing
 /// section's list under them with the saved row checked and the selected
 /// row raised, and a muted line under the list saying what the list is
 /// for. Applying a theme repaints the whole workspace, so its rows need
-/// no swatch; the CLI's listing is the visual preview.
+/// no swatch; the CLI's listing is the visual preview. The keybinds
+/// section lists the active bindings instead, read-only, behind a
+/// viewport ([`paint_keybind_rows`]), with a close control where the
+/// other sections have Apply.
 ///
 /// The saved marker is [`copy::MENU_CHECK`], the same glyph the app
 /// menu's toggles use, because a theme being on is the same kind of fact
@@ -782,6 +638,7 @@ fn paint_settings_dialog(
     section: SettingsSection,
     themes: &ThemePicker,
     sound: &SoundPicker,
+    keybinds: &KeybindSheet,
     area: Rect,
     buf: &mut Buffer,
     paint: &Paint,
@@ -789,13 +646,8 @@ fn paint_settings_dialog(
     hover: Option<(u16, u16)>,
     offset: (i16, i16),
 ) {
-    let lines = settings_lines(section, themes, sound);
-    let selected = match section {
-        SettingsSection::Theme => themes.selected,
-        SettingsSection::Sound => sound.selected,
-    };
     let footer = settings_footer(section, themes);
-    let (frame_rows, footer_lines) = settings_frame(themes, sound, area);
+    let (frame_rows, footer_lines) = settings_frame(themes, sound, keybinds, area);
     let Some((dialog_area, list_h)) = settings_dialog_geometry(frame_rows, footer_lines, area)
     else {
         return;
@@ -808,50 +660,22 @@ fn paint_settings_dialog(
 
     let left = inner.x + DIALOG_INSET;
     let usable_w = inner.width.saturating_sub(2 * DIALOG_INSET);
+    let list = Rect::new(left, inner.y + 2, usable_w, list_h);
 
-    // The selected row stays visible: the window slides down only once
-    // the arrows walk past its last visible line. Lines, not rows: a gap
-    // between the sound section's groups takes a line no row is on.
-    let list_y = inner.y + 2;
-    let list_h = usize::from(list_h);
-    let cursor_line = lines
-        .iter()
-        .position(|line| matches!(line, SettingsLine::Row { index, .. } if *index == selected))
-        .unwrap_or(0);
-    let start = if list_h == 0 || cursor_line < list_h {
-        0
-    } else {
-        cursor_line + 1 - list_h
+    let showing = match section {
+        SettingsSection::Keybinds => paint_keybind_rows(buf, inner, list, keybinds, paint),
+        SettingsSection::Theme | SettingsSection::Sound => {
+            let lines = settings_lines(section, themes, sound);
+            let selected = match section {
+                SettingsSection::Sound => sound.selected,
+                _ => themes.selected,
+            };
+            paint_settings_rows(buf, inner, list, &lines, selected, paint, hits);
+            None
+        }
     };
-    for (offset, line) in lines[start..lines.len().min(start + list_h)]
-        .iter()
-        .enumerate()
-    {
-        let y = list_y + offset as u16;
-        let SettingsLine::Row {
-            index,
-            label,
-            checked,
-        } = *line
-        else {
-            if let SettingsLine::Text(text) = *line {
-                super::overlay_text(buf, inner, left, y, text, theme::menu_hint(paint));
-            }
-            continue;
-        };
-        let style = if index == selected {
-            theme::menu_row_hover(paint)
-        } else {
-            theme::menu_row(paint)
-        };
-        let rect = Rect::new(left, y, usable_w, 1);
-        buf.set_style(rect, style);
-        let mark = if checked { copy::MENU_CHECK } else { " " };
-        super::overlay_text(buf, inner, left, y, &format!("{mark} {label}"), style);
-        hits.push(rect, HitTarget::SettingsRow { index });
-    }
 
-    let footer_y = list_y + list_h as u16 + 1;
+    let footer_y = list.y + list.height + 1;
     let bottom = inner.y + inner.height;
     if footer_y < bottom {
         let footer_area = Rect::new(
@@ -866,12 +690,163 @@ fn paint_settings_dialog(
             .render(footer_area, buf);
     }
 
-    paint_dialog_buttons(buf, inner, paint, hits, hover, copy::BUTTON_APPLY);
+    match section {
+        SettingsSection::Keybinds => {
+            paint_close_row(buf, inner, paint, hits, hover, showing, keybinds.rows.len())
+        }
+        SettingsSection::Theme | SettingsSection::Sound => {
+            paint_dialog_buttons(buf, inner, paint, hits, hover, copy::BUTTON_APPLY)
+        }
+    }
     paint_title_bar(buf, dialog_area, Some(copy::SETTINGS_TITLE), paint, hits);
     // After the title bar on purpose: the chips share its second row, and
     // `HitMap::hit` answers with the last region pushed over a cell, so a
     // chip wins its own cells and the rest of the row still drags.
     paint_section_chips(buf, inner, left, usable_w, section, paint, hits, hover);
+}
+
+/// A picking section's lines: the cursor's row raised, the checked row
+/// marked, muted text where the section explains itself, and every row
+/// a click target by its picker index.
+///
+/// The selected row stays visible: the window slides down only once the
+/// arrows walk past its last visible line. Lines, not rows: a gap
+/// between the sound section's groups takes a line no row is on.
+fn paint_settings_rows(
+    buf: &mut Buffer,
+    inner: Rect,
+    list: Rect,
+    lines: &[SettingsLine<'_>],
+    selected: usize,
+    paint: &Paint,
+    hits: &mut HitMap,
+) {
+    let list_h = usize::from(list.height);
+    let cursor_line = lines
+        .iter()
+        .position(|line| matches!(line, SettingsLine::Row { index, .. } if *index == selected))
+        .unwrap_or(0);
+    let start = if list_h == 0 || cursor_line < list_h {
+        0
+    } else {
+        cursor_line + 1 - list_h
+    };
+    for (offset, line) in lines[start..lines.len().min(start + list_h)]
+        .iter()
+        .enumerate()
+    {
+        let y = list.y + offset as u16;
+        let SettingsLine::Row {
+            index,
+            label,
+            checked,
+        } = *line
+        else {
+            if let SettingsLine::Text(text) = *line {
+                super::overlay_text(buf, inner, list.x, y, text, theme::menu_hint(paint));
+            }
+            continue;
+        };
+        let style = if index == selected {
+            theme::menu_row_hover(paint)
+        } else {
+            theme::menu_row(paint)
+        };
+        let rect = Rect::new(list.x, y, list.width, 1);
+        buf.set_style(rect, style);
+        let mark = if checked { copy::MENU_CHECK } else { " " };
+        super::overlay_text(buf, inner, list.x, y, &format!("{mark} {label}"), style);
+        hits.push(rect, HitTarget::SettingsRow { index });
+    }
+}
+
+/// The keybinds section's rows: the chord in the focus color and the
+/// action beside it, from the row the sheet is scrolled to. Read-only,
+/// so no row is raised and none is a target. Returns the rows showing
+/// (for the `first–last / all` count), or `None` when none fit.
+fn paint_keybind_rows(
+    buf: &mut Buffer,
+    inner: Rect,
+    list: Rect,
+    keybinds: &KeybindSheet,
+    paint: &Paint,
+) -> Option<(usize, usize)> {
+    let list_h = usize::from(list.height);
+    if list_h == 0 || keybinds.rows.is_empty() {
+        return None;
+    }
+    let start = usize::from(keybinds.scroll).min(keybinds.rows.len().saturating_sub(list_h));
+    let end = (start + list_h).min(keybinds.rows.len());
+    let key_w = keybinds
+        .rows
+        .iter()
+        .map(|row| Span::raw(row.keys.as_str()).width())
+        .max()
+        .unwrap_or(0)
+        .min(usize::from(list.width.saturating_sub(4))) as u16;
+    for (line, row) in keybinds.rows[start..end].iter().enumerate() {
+        let y = list.y + line as u16;
+        super::overlay_text(
+            buf,
+            inner,
+            list.x,
+            y,
+            &row.keys,
+            theme::pane_border_focused(paint),
+        );
+        super::overlay_text(
+            buf,
+            inner,
+            list.x + key_w + 3,
+            y,
+            &row.action,
+            theme::menu_row(paint),
+        );
+    }
+    Some((start, end))
+}
+
+/// The keybinds section's action row: nothing to apply, so one control
+/// closes the card by either key, and the rows showing are counted at
+/// the right, the way the sidebar says `+3 more` for what is below its
+/// fold. Same row and inset as the Apply row of the other sections.
+fn paint_close_row(
+    buf: &mut Buffer,
+    inner: Rect,
+    paint: &Paint,
+    hits: &mut HitMap,
+    hover: Option<(u16, u16)>,
+    showing: Option<(usize, usize)>,
+    total: usize,
+) {
+    let row_y = inner.y + inner.height.saturating_sub(1);
+    let left = inner.x + DIALOG_INSET;
+    let usable_w = inner.width.saturating_sub(2 * DIALOG_INSET);
+    let close = format!(" ↵ / Esc {} ", copy::BUTTON_CLOSE);
+    let close_w = text_width(&close);
+    if close_w > usable_w {
+        return;
+    }
+    let rect = Rect::new(left, row_y, close_w, 1);
+    let hovered =
+        hover.is_some_and(|(hc, hr)| hr == rect.y && hc >= rect.x && hc < rect.x + rect.width);
+    let style = if hovered {
+        theme::dialog_primary(paint).add_modifier(Modifier::UNDERLINED)
+    } else {
+        theme::dialog_primary(paint)
+    };
+    super::overlay_text(buf, inner, rect.x, rect.y, &close, style);
+    hits.push(rect, HitTarget::DialogCancel);
+
+    let Some((start, end)) = showing else {
+        return;
+    };
+    let progress = format!("{}–{} / {}", start + 1, end, total);
+    let progress_w = text_width(&progress);
+    let x = left.saturating_add(usable_w.saturating_sub(progress_w));
+    if x >= rect.x + rect.width + DIALOG_BUTTON_GAP {
+        super::overlay_text(buf, inner, x, row_y, &progress, theme::menu_hint(paint));
+    }
 }
 
 /// The section chips, Tab's targets made visible: every section named,
@@ -942,6 +917,8 @@ fn settings_lines<'a>(
     match section {
         SettingsSection::Theme => theme_lines(themes),
         SettingsSection::Sound => sound_lines(sound),
+        // Its rows are a different shape (`paint_keybind_rows`).
+        SettingsSection::Keybinds => Vec::new(),
     }
 }
 
@@ -993,25 +970,43 @@ fn sound_lines(sound: &SoundPicker) -> Vec<SettingsLine<'_>> {
 /// The muted line under the list. The theme section's says how to drive
 /// the card, or what an apply that could not go live had to say, or
 /// where themes come from when there are none to list. The sound section
-/// says its piece at the top ([`sound_lines`]) and has none.
+/// says its piece at the top ([`sound_lines`]) and has none. The keybinds
+/// section's spells out the status glyphs its rows' actions act on
+/// (rule 11): the sidebar and pane borders show only the glyph half.
 fn settings_footer(section: SettingsSection, themes: &ThemePicker) -> &str {
     match section {
         SettingsSection::Theme if themes.names.is_empty() => copy::THEMES_EMPTY,
         SettingsSection::Theme => themes.notice.as_deref().unwrap_or(copy::THEMES_HINT),
         SettingsSection::Sound => "",
+        SettingsSection::Keybinds => copy::STATE_GLYPH_LEGEND,
     }
 }
 
+/// The most rows the keybinds section shows at once. Its list scrolls,
+/// so the card stays a card rather than growing into a wall for forty
+/// bindings; thirteen is what the sheet showed when it was a dialog of
+/// its own, capped at twenty rows.
+const KEYBINDS_LIST_ROWS: usize = 13;
+
 /// The list rows and footer lines the card is sized for: the most any
 /// section needs, so one card fits every section and Tab never resizes
-/// it. Every footer the theme section can show is counted, so an apply
-/// notice arriving does not move the box either.
-fn settings_frame(themes: &ThemePicker, sound: &SoundPicker, area: Rect) -> (usize, usize) {
+/// it. Every footer any section can show is counted, so an apply notice
+/// arriving does not move the box either.
+fn settings_frame(
+    themes: &ThemePicker,
+    sound: &SoundPicker,
+    keybinds: &KeybindSheet,
+    area: Rect,
+) -> (usize, usize) {
     let text_width = settings_width(area).saturating_sub(DIALOG_CHROME_WIDTH);
-    let rows = theme_lines(themes).len().max(sound_lines(sound).len());
+    let rows = theme_lines(themes)
+        .len()
+        .max(sound_lines(sound).len())
+        .max(keybinds.rows.len().min(KEYBINDS_LIST_ROWS));
     let footers = [
         copy::THEMES_HINT,
         copy::THEMES_EMPTY,
+        copy::STATE_GLYPH_LEGEND,
         themes.notice.as_deref().unwrap_or(""),
     ];
     let footer_lines = footers
@@ -1022,9 +1017,8 @@ fn settings_frame(themes: &ThemePicker, sound: &SoundPicker, area: Rect) -> (usi
     (rows, footer_lines)
 }
 
-/// Same shape as [`keybind_dialog_geometry`]: fixed rows (chips, one
-/// blank before the list, one after, the footer, the action row) around
-/// a list that shrinks before the chrome does.
+/// Fixed rows (chips, one blank before the list, one after, the footer,
+/// the action row) around a list that shrinks before the chrome does.
 fn settings_dialog_geometry(
     row_count: usize,
     footer_lines: usize,
@@ -1051,6 +1045,29 @@ fn settings_dialog_geometry(
         .saturating_sub(4)
         .saturating_sub(u16::try_from(footer_lines).unwrap_or(u16::MAX));
     Some((dialog, list_height))
+}
+
+/// Largest meaningful keybinds-section offset for this terminal area:
+/// the rows past the list the card has room for. Zero for every other
+/// dialog, which has no viewport to scroll.
+pub fn settings_keybind_max_scroll(dialog: &Dialog, area: Rect) -> u16 {
+    let Dialog::Settings {
+        themes,
+        sound,
+        keybinds,
+        ..
+    } = dialog
+    else {
+        return 0;
+    };
+    let (rows, footer_lines) = settings_frame(themes, sound, keybinds, area);
+    let Some((_, list_height)) = settings_dialog_geometry(rows, footer_lines, area) else {
+        return 0;
+    };
+    if list_height == 0 {
+        return 0;
+    }
+    u16::try_from(keybinds.rows.len().saturating_sub(usize::from(list_height))).unwrap_or(u16::MAX)
 }
 
 /// Keep the editing cursor visible when a name is wider than its field.
@@ -1131,9 +1148,9 @@ pub fn menu_items(menu: &MenuState, checks: MenuChecks) -> Vec<MenuRow> {
             ),
             // Settings opens a card rather than flipping anything, so it
             // carries no check of its own; the card marks the theme and
-            // the sound row that are on with the same glyph.
+            // the sound row that are on with the same glyph. The
+            // keybinding reference is a section of that card.
             (copy::MENU_SETTINGS, BindingAction::ShowSettings, None),
-            (copy::MENU_KEYBINDS, BindingAction::ShowKeybinds, None),
             (copy::MENU_DETACH, BindingAction::Detach, None),
         ],
         MenuState::ContextMenu { .. } => vec![
@@ -1496,7 +1513,7 @@ mod tests {
     /// of its own, and the tab strip is now one of those: hidden, its item
     /// here is the only way back, so it has to be in this list.
     #[test]
-    fn app_menu_offers_the_surface_toggles_between_new_and_keybinds() {
+    fn app_menu_offers_the_surface_toggles_between_new_and_settings() {
         let actions: Vec<_> = menu_items(&MenuState::AppMenu, MenuChecks::default())
             .iter()
             .map(|(_, action, _)| *action)
@@ -1514,8 +1531,9 @@ mod tests {
                 // Motion ships with no chord either, so the menu is its
                 // only switch, for the same reason the tab strip's is.
                 BindingAction::ToggleMotion,
+                // The keybinding reference is a section of the settings
+                // card, so it needs no item of its own.
                 BindingAction::ShowSettings,
-                BindingAction::ShowKeybinds,
                 BindingAction::Detach,
             ]
         );
@@ -1541,7 +1559,30 @@ mod tests {
                 vec!["bow-ripple".into(), crate::sound::SYSTEM.into()],
                 "bow-ripple",
             ),
+            keybinds: KeybindSheet::default(),
         }
+    }
+
+    /// The settings card open on its keybinds section, with `count`
+    /// generated rows scrolled to `scroll`.
+    fn keybinds_card(count: usize, scroll: u16) -> Dialog {
+        let mut dialog = theme_card(vec!["dark".into()], 0, Some(0), None);
+        if let Dialog::Settings {
+            section, keybinds, ..
+        } = &mut dialog
+        {
+            *section = SettingsSection::Keybinds;
+            *keybinds = KeybindSheet {
+                scroll,
+                rows: (0..count)
+                    .map(|index| crate::bindings::BindingHelp {
+                        keys: format!("Ctrl+{}", index % 26),
+                        action: format!("Action {index}"),
+                    })
+                    .collect(),
+            };
+        }
+        dialog
     }
 
     /// Paint one dialog into a fixed terminal at a given drag offset.
@@ -1659,10 +1700,7 @@ mod tests {
             composer("@reviewer ship it"),
             Dialog::confirm_close("%0"),
             theme_card(vec!["dark".into(), "light".into()], 0, Some(0), None),
-            Dialog::Keybinds {
-                scroll: 0,
-                rows: Vec::new(),
-            },
+            keybinds_card(40, 0),
         ] {
             let rest = dialog_rect(&dialog, area).expect("a full terminal hosts it");
             let (_, hits) = draw_dialog(&dialog, (0, 0));
@@ -1675,8 +1713,7 @@ mod tests {
             );
 
             // A modest drag lands exactly where it was dragged to. One cell,
-            // because the widest of these cards (the keybinds sheet) leaves
-            // only two columns of slack in an 80-column terminal.
+            // a drag every card has room for in an 80-column terminal.
             assert_eq!(clamp_dialog_offset(&dialog, area, (1, 1)), (1, 1));
 
             // A drag off the edge stops at it, so the offset the app keeps
@@ -1729,10 +1766,7 @@ mod tests {
                 session: "main".into(),
             },
             composer("@reviewer one\ntwo\nthree"),
-            Dialog::Keybinds {
-                scroll: 0,
-                rows: Vec::new(),
-            },
+            keybinds_card(40, 5),
             theme_card(Vec::new(), 0, None, None),
             theme_card(
                 vec!["dark".into()],
@@ -1937,8 +1971,9 @@ mod tests {
         let flat = flatten(&buf);
         assert!(
             flat.contains(copy::SETTINGS_SECTION_THEME)
-                && flat.contains(copy::SETTINGS_SECTION_SOUND),
-            "both sections are named: {flat}"
+                && flat.contains(copy::SETTINGS_SECTION_SOUND)
+                && flat.contains(copy::SETTINGS_SECTION_KEYBINDS),
+            "every section is named: {flat}"
         );
         let chip = |section: SettingsSection| {
             hits.regions()
@@ -1949,9 +1984,12 @@ mod tests {
         };
         let theme_chip = chip(SettingsSection::Theme);
         let sound_chip = chip(SettingsSection::Sound);
+        let keybinds_chip = chip(SettingsSection::Keybinds);
         assert_eq!(theme_chip.y, sound_chip.y, "one row of chips");
+        assert_eq!(theme_chip.y, keybinds_chip.y, "one row of chips");
         assert!(
-            sound_chip.x > theme_chip.x + theme_chip.width,
+            sound_chip.x > theme_chip.x + theme_chip.width
+                && keybinds_chip.x > sound_chip.x + sound_chip.width,
             "in Tab order"
         );
         assert_eq!(
@@ -1963,7 +2001,7 @@ mod tests {
         );
         assert!(
             matches!(
-                hits.hit(sound_chip.x + sound_chip.width + 4, sound_chip.y),
+                hits.hit(keybinds_chip.x + keybinds_chip.width + 4, keybinds_chip.y),
                 Some(HitTarget::DialogTitleBar)
             ),
             "past the chips the row still drags"
@@ -2034,7 +2072,7 @@ mod tests {
         .map(String::from)
         .collect();
         let theme = theme_card(names.clone(), 0, Some(0), None);
-        let mut sound = theme_card(names, 0, Some(0), None);
+        let mut sound = theme_card(names.clone(), 0, Some(0), None);
         if let Dialog::Settings { section, .. } = &mut sound {
             *section = SettingsSection::Sound;
         }
@@ -2046,8 +2084,14 @@ mod tests {
         );
         let plain = theme_card(vec!["dark".into()], 0, Some(0), None);
 
+        let mut keybinds = theme_card(names, 0, Some(0), None);
+        if let Dialog::Settings { section, .. } = &mut keybinds {
+            *section = SettingsSection::Keybinds;
+        }
+
         let rect = |dialog: &Dialog| dialog_rect(dialog, area).expect("fits");
         assert_eq!(rect(&theme), rect(&sound), "Tab does not resize the card");
+        assert_eq!(rect(&theme), rect(&keybinds), "nor onto the keybinds");
         assert_eq!(
             rect(&plain).height,
             rect(&noticed).height,
@@ -2080,6 +2124,7 @@ mod tests {
                 vec!["bow-ripple".into(), crate::sound::SYSTEM.into()],
                 crate::sound::SYSTEM,
             ),
+            keybinds: KeybindSheet::default(),
         };
         let (buf, hits) = draw_dialog(&dialog, (0, 0));
         let flat = flatten(&buf);
@@ -2276,76 +2321,116 @@ mod tests {
         );
     }
 
+    /// The keybinds section: the chord and the action of every active
+    /// binding behind a viewport, scrolled to the row asked for and no
+    /// further, the count of what is showing at the right, the status
+    /// legend under the list, and one close control that answers the
+    /// mouse. No row is a target: there is nothing on one to choose.
     #[test]
-    fn keybind_dialog_is_padded_themed_and_scrolls_to_the_last_row() {
-        let rows: Vec<_> = (0..20)
-            .map(|index| crate::bindings::BindingHelp {
-                keys: format!("Ctrl+{index}"),
-                action: format!("Action {index}"),
-            })
-            .collect();
-        let backend = TestBackend::new(50, 12);
-        let mut term = Terminal::new(backend).unwrap();
-        let theme = Paint::for_test();
+    fn the_keybinds_section_scrolls_to_the_last_row_and_closes() {
+        let area = Rect::new(0, 0, 60, 24);
+        let dialog = keybinds_card(20, u16::MAX);
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
         let mut hits = HitMap::default();
         term.draw(|frame| {
             paint_dialog(
-                &Dialog::Keybinds {
-                    scroll: u16::MAX,
-                    rows: rows.clone(),
-                },
+                &dialog,
                 frame.area(),
                 frame.buffer_mut(),
-                &theme,
+                &Paint::for_test(),
                 &mut hits,
                 None,
                 (0, 0),
             );
         })
         .unwrap();
-
         let buf = term.backend().buffer();
         let flat = flatten(buf);
+        assert!(flat.contains("Settings"), "the card's title: {flat}");
         assert!(
             flat.contains("Action 19"),
-            "last row should be reachable: {flat}"
+            "the last row is reachable: {flat}"
         );
         assert!(
-            !flat.contains("Action 0"),
-            "scroll should move the first row away"
+            !flat.contains("Action 0 "),
+            "scrolling moved the first row away: {flat}"
         );
-        assert_ne!(buf[(4, 3)].bg, RtColor::Reset, "modal owns a themed ground");
-        // The close control answers the mouse, and nothing the painter
-        // pushes after it takes its cells. Stated as a hit test rather than
-        // "it was pushed last", so adding a control elsewhere on the card
-        // (the title bar did) does not read as a regression here.
+        assert!(flat.contains("Ctrl+19"), "the chord beside it: {flat}");
+        let max = settings_keybind_max_scroll(&dialog, area);
+        assert!(max > 0 && max < 20, "some rows are below the fold: {max}");
+        assert!(
+            flat.contains(&format!("{}–20 / 20", usize::from(max) + 1)),
+            "the rows showing are counted: {flat}"
+        );
+        assert!(
+            flat.contains("○ idle"),
+            "the status legend explains the glyphs: {flat}"
+        );
+        assert!(
+            !flat.contains("Apply") && flat.contains("Esc Close"),
+            "nothing to apply, one control closes: {flat}"
+        );
         let close = hits
             .regions()
             .iter()
             .find(|region| region.target == HitTarget::DialogCancel)
             .map(|region| region.rect)
-            .expect("the sheet registers its close control");
+            .expect("the section registers its close control");
         assert_eq!(hits.hit(close.x, close.y), Some(&HitTarget::DialogCancel));
-    }
-
-    #[test]
-    fn keybind_dialog_stays_a_card_in_tall_terminals() {
-        let rows: Vec<_> = (0..100)
-            .map(|i| crate::bindings::BindingHelp {
-                keys: format!("Ctrl+{}", i % 26),
-                action: format!("Action {i}"),
-            })
-            .collect();
-        let area = Rect::new(0, 0, 80, 50);
-        let (dialog, list_h) = keybind_dialog_geometry(rows.len(), area)
-            .expect("should produce geometry for large area");
-        assert_eq!(
-            dialog.height, 20,
-            "dialog should be capped at 20 rows even with many bindings"
+        assert!(
+            !hits
+                .regions()
+                .iter()
+                .any(|region| matches!(region.target, HitTarget::SettingsRow { .. })),
+            "no row is a target"
+        );
+        let action = row_of(buf, "Action 19");
+        assert_ne!(
+            buf[(4, action)].bg,
+            RtColor::Reset,
+            "modal owns a themed ground"
         );
         assert_eq!(
-            list_h, 13,
-            "list height = dialog height - borders - padding"
+            buf[(4, action)].bg,
+            buf[(4, action - 1)].bg,
+            "no row is raised"
+        );
+    }
+
+    /// The keybinds section caps the card rather than growing it: forty
+    /// bindings size the list like thirteen, and the rest scroll. A few
+    /// bindings do not shrink it below what the other sections need.
+    #[test]
+    fn the_keybinds_section_caps_the_card_and_scrolls_the_rest() {
+        let area = Rect::new(0, 0, 80, 50);
+        let rect = |dialog: &Dialog| dialog_rect(dialog, area).expect("fits");
+        let hundred = keybinds_card(100, 0);
+        let thirteen = keybinds_card(13, 0);
+        assert_eq!(
+            rect(&hundred).height,
+            rect(&thirteen).height,
+            "the list is capped; the card is not a wall"
+        );
+        assert!(
+            rect(&hundred).height < area.height / 2,
+            "a card, in a tall terminal: {:?}",
+            rect(&hundred)
+        );
+        assert_eq!(
+            settings_keybind_max_scroll(&hundred, area),
+            100 - KEYBINDS_LIST_ROWS as u16,
+            "everything past the cap is reachable by scrolling"
+        );
+        assert_eq!(settings_keybind_max_scroll(&thirteen, area), 0);
+        assert_eq!(
+            rect(&keybinds_card(2, 0)),
+            rect(&theme_card(vec!["dark".into()], 0, Some(0), None)),
+            "a short sheet is sized by the other sections"
+        );
+        assert_eq!(
+            settings_keybind_max_scroll(&theme_card(Vec::new(), 0, None, None), area),
+            0,
+            "a picking section has no viewport to scroll"
         );
     }
 
@@ -2444,17 +2529,7 @@ mod tests {
                 }),
                 MenuState::None,
             ),
-            (
-                "keybinds",
-                Some(Dialog::Keybinds {
-                    scroll: 0,
-                    rows: vec![crate::bindings::BindingHelp {
-                        keys: "Ctrl+A".into(),
-                        action: "Attach".into(),
-                    }],
-                }),
-                MenuState::None,
-            ),
+            ("keybinds", Some(keybinds_card(1, 0)), MenuState::None),
             (
                 "themes",
                 Some(theme_card(vec!["dark".into()], 0, Some(0), None)),

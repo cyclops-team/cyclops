@@ -33,7 +33,9 @@ use crate::action::{Action, Insertion, TabDestination};
 use crate::copy;
 use crate::daemon;
 use crate::decoration::{self, DecorationSnapshot};
-use crate::dialog::{Composed, Dialog, SettingsSection, SoundPicker, SoundRow, ThemePicker};
+use crate::dialog::{
+    Composed, Dialog, KeybindSheet, SettingsSection, SoundPicker, SoundRow, ThemePicker,
+};
 use crate::naming;
 use crate::persist::SidebarTab;
 
@@ -397,21 +399,14 @@ pub(super) async fn execute(
                 ..Outcome::default()
             })
         }
-        Action::ShowKeybinds => {
-            app.open_dialog(Dialog::Keybinds {
-                scroll: 0,
-                rows: app.router.help(),
-            });
-            Ok(Outcome::default())
-        }
-        Action::ShowSettings => {
+        Action::ShowSettings { section } => {
             let (names, active) = theme_rows(&app.home);
             // What close-without-apply puts back: browsing previews into
             // `paint.theme` directly (see [`preview_selected_theme`]), so
             // the theme that is live right now rides beside the picker.
             app.theme_restore = Some(app.paint.theme.clone());
             app.open_dialog(Dialog::Settings {
-                section: SettingsSection::Theme,
+                section,
                 themes: ThemePicker {
                     selected: active.unwrap_or(0),
                     names,
@@ -423,6 +418,12 @@ pub(super) async fn execute(
                     crate::sound::choices(&app.home),
                     &app.prefs.sound,
                 ),
+                // From the router's live map, not from documentation, so
+                // a rebinding in config.toml is what the sheet teaches.
+                keybinds: KeybindSheet {
+                    scroll: 0,
+                    rows: app.router.help(),
+                },
             });
             Ok(Outcome::default())
         }
@@ -2362,6 +2363,7 @@ mod tests {
                 notice: None,
             },
             sound: SoundPicker::new(false, vec!["system".into()], "system"),
+            keybinds: KeybindSheet::default(),
         }
     }
 
@@ -2391,9 +2393,15 @@ mod tests {
 
         app.prefs.sound_notifs = true;
         app.prefs.sound = "chime".into();
-        let outcome = execute(&mut app, &client, Action::ShowSettings)
-            .await
-            .expect("open the card");
+        let outcome = execute(
+            &mut app,
+            &client,
+            Action::ShowSettings {
+                section: SettingsSection::Theme,
+            },
+        )
+        .await
+        .expect("open the card");
 
         assert!(!outcome.reconcile);
         assert!(!outcome.persist);
@@ -2402,8 +2410,15 @@ mod tests {
                 section,
                 themes,
                 sound,
+                keybinds,
             }) => {
                 assert_eq!(*section, SettingsSection::Theme, "opens on themes");
+                assert_eq!(keybinds.scroll, 0);
+                assert_eq!(
+                    keybinds.rows,
+                    app.router.help(),
+                    "the keybinds section is the active map, as rows"
+                );
                 assert_eq!(themes.names, vec!["dark".to_string()]);
                 assert_eq!(themes.selected, 0, "the arrows start on the active row");
                 assert_eq!(themes.active, Some(0));
@@ -2655,6 +2670,7 @@ mod tests {
                 notice: None,
             },
             sound: SoundPicker::new(false, vec!["system".into()], "system"),
+            keybinds: KeybindSheet::default(),
         });
         preview_selected_theme(&mut app);
         assert_ne!(app.paint.theme.resolve(dim).rgb, original, "browsed");
@@ -2707,6 +2723,7 @@ mod tests {
                 notice: None,
             },
             sound: SoundPicker::new(false, vec!["system".into()], "system"),
+            keybinds: KeybindSheet::default(),
         });
 
         if let Some(open) = app.dialog.as_mut() {
@@ -2757,6 +2774,7 @@ mod tests {
                 vec!["bow-ripple".into(), "system".into()],
                 "bow-ripple",
             ),
+            keybinds: KeybindSheet::default(),
         });
 
         let outcome = execute(
