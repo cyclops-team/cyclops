@@ -24,7 +24,7 @@
 
 use cyclops_proto::{
     AgentState, AttentionItem, Clearance, DeliveryReceipt, DeliveryState, MessageNotificationState,
-    MessageQuotaState, MessageWakeBlock,
+    MessageQuotaState,
 };
 
 /// The caller's color, for the cells this module composes.
@@ -378,6 +378,7 @@ pub fn cleared_cell(was: &AttentionItem, how: Clearance, paint: &dyn Paint) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cyclops_proto::MessageWakeBlock;
 
     fn receipt(state: DeliveryState, position: Option<u32>, note: Option<&str>) -> DeliveryReceipt {
         DeliveryReceipt {
