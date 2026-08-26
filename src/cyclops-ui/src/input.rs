@@ -40,6 +40,8 @@ pub enum Key {
     /// `term::Term::enter` turns on.
     PasteStart,
     PasteEnd,
+    /// A paste was discarded because it exceeded its byte or time bound.
+    PasteRejected,
 }
 
 /// Decode one raw read into keys. Escape sequences arrive whole in one
@@ -198,6 +200,9 @@ pub fn spawn_reader(tx: tokio::sync::mpsc::UnboundedSender<Key>) {
                         // thing this buffer exists to prevent.
                         pending.clear();
                         in_paste = false;
+                        if tx.blocking_send(Key::PasteRejected).is_err() {
+                            return;
+                        }
                     } else if pending == [0x1b] {
                         for key in decode(&pending) {
                             if tx.send(key).is_err() {
@@ -251,6 +256,7 @@ fn drain(pending: &mut Vec<u8>, in_paste: &mut bool) -> Vec<Key> {
                     // whose terminator arrives in the same read was
                     // delivered whole however large it was.
                     if payload.len() > PASTE_MAX {
+                        out.push(Key::PasteRejected);
                         continue;
                     }
                     out.push(Key::PasteStart);
@@ -261,6 +267,7 @@ fn drain(pending: &mut Vec<u8>, in_paste: &mut bool) -> Vec<Key> {
                     if pending.len() > PASTE_MAX {
                         pending.clear();
                         *in_paste = false;
+                        out.push(Key::PasteRejected);
                     }
                     return out;
                 }
@@ -555,12 +562,9 @@ mod stream_tests {
     /// A paste the terminal never closes is discarded, never decoded.
     /// Promoting held bytes to keys is the failure being prevented.
     #[test]
-    fn an_unterminated_paste_is_discarded_not_decoded() {
+    fn an_unterminated_paste_is_visible_and_not_decoded() {
         let keys = through_reader(b"\x1b[200~q1y", 2);
-        assert!(
-            keys.is_empty(),
-            "an abandoned paste leaked its payload: {keys:?}"
-        );
+        assert_eq!(keys, vec![Key::PasteRejected]);
     }
 
     /// CRLF is one line break, not two, and a tab is text.
@@ -614,6 +618,7 @@ mod stream_tests {
             !keys.contains(&Key::Char('x')),
             "an oversized paste was buffered and delivered"
         );
+        assert!(keys.contains(&Key::PasteRejected));
         assert!(
             keys.contains(&Key::Char('j')),
             "the reader did not recover after dropping a huge paste: {keys:?}"

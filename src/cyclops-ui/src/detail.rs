@@ -115,6 +115,9 @@ pub struct Draft {
     keyed_for: Option<String>,
 }
 
+/// Leaves room for JSON escaping and request metadata inside one daemon frame.
+pub const DRAFT_MAX_BYTES: usize = crate::wire::MAX_FRAME_BYTES / 4;
+
 impl Draft {
     pub fn text(&self) -> &str {
         &self.text
@@ -128,8 +131,12 @@ impl Draft {
         self.text = text.into();
     }
 
-    pub fn push(&mut self, ch: char) {
+    pub fn push(&mut self, ch: char) -> bool {
+        if self.text.len().saturating_add(ch.len_utf8()) > DRAFT_MAX_BYTES {
+            return false;
+        }
         self.text.push(ch);
+        true
     }
 
     pub fn backspace(&mut self) {

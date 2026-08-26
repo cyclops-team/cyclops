@@ -23,8 +23,15 @@ use crate::theme::Theme;
 use crate::UiOptions;
 
 pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let io = data::spawn_io(&tx, home, opts.backfill);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(crate::EVENT_CAPACITY);
+    let (snapshot_tx, mut snapshot_rx) = tokio::sync::mpsc::channel(crate::SNAPSHOT_CAPACITY);
+    let (action_tx, mut action_rx) = tokio::sync::mpsc::channel(crate::ACTION_CAPACITY);
+    let sinks = data::UiSinks {
+        events: event_tx,
+        snapshots: snapshot_tx,
+        actions: action_tx,
+    };
+    let io = data::spawn_io(&sinks, home, opts.backfill);
     let view = if opts.firehose {
         View::Firehose
     } else {
@@ -40,7 +47,15 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
     let mut lost: Option<String> = None;
     let mut stdout = std::io::stdout();
 
-    while let Some(msg) = rx.recv().await {
+    loop {
+        let msg = tokio::select! {
+            action = action_rx.recv() => action,
+            snapshot = snapshot_rx.recv() => snapshot,
+            event = event_rx.recv() => event,
+        };
+        let Some(msg) = msg else {
+            return 1;
+        };
         match msg {
             UiMsg::Subscribed => {
                 app.conn_lost = false;
@@ -49,7 +64,9 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
             }
             UiMsg::MessagesChanged(changed) => {
                 message_follower.changed(&changed);
-                app.refresh.messages_changed(&changed);
+                if app.refresh.messages_changed(&changed) {
+                    eprintln!("message sequence gap detected; rebuilding from a whole snapshot");
+                }
             }
             UiMsg::MessagesRouteChanged => app.refresh.mark_dirty(),
             UiMsg::Messages { request, snapshot } => apply_messages_snapshot(
@@ -120,17 +137,18 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
                     eprintln!("{notice}");
                 }
             }
-            UiMsg::Key(_) | UiMsg::Notice(_) | UiMsg::EyeTick | UiMsg::ThemeChanged => {}
+            UiMsg::Notice(notice) => eprintln!("{notice}"),
+            UiMsg::Key(_) | UiMsg::EyeTick | UiMsg::ThemeChanged => {}
         }
         eye_line(&app, &mut eye_printed, &mut stdout);
         let _ = stdout.flush();
         if let Some(request) = app.wants_messages() {
-            if io.refresh.send(request).is_err() {
+            if io.refresh.send(request).await.is_err() {
                 return 1;
             }
         }
         if let Some(request) = message_follower.begin() {
-            if io.follow.send(request).is_err() {
+            if io.follow.send(request).await.is_err() {
                 return 1;
             }
         }
@@ -141,7 +159,6 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
             }
         }
     }
-    0
 }
 
 fn apply_messages_snapshot(

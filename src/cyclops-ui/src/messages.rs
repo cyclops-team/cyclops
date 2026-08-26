@@ -454,28 +454,33 @@ impl RefreshGate {
     /// Duplicate or older edges are ignored. A gap invalidates the
     /// current request even if its answer later looks plausible: only a
     /// request started after the gap may replace the queue.
-    pub fn messages_changed(&mut self, changed: &MessagesChangedData) {
+    /// Returns true when the caller must expose that gap while rebuilding.
+    pub fn messages_changed(&mut self, changed: &MessagesChangedData) -> bool {
+        let mut gap = false;
         let newer = match (self.workspace_id, self.workspace_seq) {
             (Some(workspace_id), _) if workspace_id != changed.workspace_id => {
                 self.invalidate_generation();
+                gap = true;
                 true
             }
             (_, Some(workspace_seq)) if changed.workspace_seq <= workspace_seq => false,
             (_, Some(workspace_seq)) => {
                 if changed.workspace_seq > workspace_seq.saturating_add(1) {
                     self.invalidate_generation();
+                    gap = true;
                 }
                 true
             }
             _ => true,
         };
         if !newer {
-            return;
+            return false;
         }
         self.workspace_id = Some(changed.workspace_id);
         self.workspace_seq = Some(changed.workspace_seq);
         self.dirty = true;
         self.snapshot_current = false;
+        gap
     }
 
     /// The connection came back. Everything on screen predates the gap,

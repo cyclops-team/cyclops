@@ -942,6 +942,7 @@ impl App {
                 return None;
             }
             let mut send_reply = false;
+            let mut draft_full = false;
             let detail = self.detail.as_mut()?;
             match key {
                 Key::CtrlC => return Some(Command::Quit),
@@ -951,7 +952,7 @@ impl App {
                 // typed one are the same byte by the time they arrive, so
                 // a composer that sent on Enter would send whatever came
                 // before the first line break of a paste.
-                Key::Enter => detail.draft_mut().push('\n'),
+                Key::Enter => draft_full = !detail.draft_mut().push('\n'),
                 Key::CtrlD => {
                     // request() again, at the moment of sending. It is the
                     // staleness gate, and the row can go stale while the
@@ -970,8 +971,14 @@ impl App {
                         }
                     }
                 }
-                Key::Char(c) => detail.draft_mut().push(c),
+                Key::Char(c) => draft_full = !detail.draft_mut().push(c),
                 _ => {}
+            }
+            if draft_full {
+                self.notice = Some(format!(
+                    "reply is limited to {} KiB",
+                    crate::detail::DRAFT_MAX_BYTES / 1024
+                ));
             }
             if send_reply {
                 self.confirm_action(crate::detail::Action::Reply);
@@ -1087,11 +1094,21 @@ impl App {
             return;
         }
         if let (Some(detail), Some(ch)) = (self.detail.as_mut(), ch) {
-            detail.draft_mut().push(ch);
+            if !detail.draft_mut().push(ch) {
+                self.notice = Some(format!(
+                    "reply is limited to {} KiB",
+                    crate::detail::DRAFT_MAX_BYTES / 1024
+                ));
+            }
         }
     }
 
     pub fn handle_key(&mut self, key: Key) -> Option<Command> {
+        if key == Key::PasteRejected {
+            self.pasting = false;
+            self.notice = Some("paste refused: exceeds the UI ingress bound".into());
+            return None;
+        }
         // Bracketed paste is settled HERE, above every route, because
         // every route below reads keys as commands. A guard further down
         // only protected the detail: a paste landing on the queue, on a
@@ -1431,6 +1448,18 @@ mod tests {
     use super::*;
     use crate::stream::{EntryKind, RosterSeed, RING_CAP};
     use cyclops_proto::{AgentState, DeliveryState, OpenDelivery, PaneSnapshot};
+
+    #[test]
+    fn a_rejected_paste_is_visible_and_leaves_command_mode() {
+        let mut app = App::new(Theme::none(), View::Admin, Filter::default());
+        app.pasting = true;
+        assert_eq!(app.handle_key(Key::PasteRejected), None);
+        assert!(!app.pasting);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("paste refused: exceeds the UI ingress bound")
+        );
+    }
 
     fn endpoint(label: &str) -> EndpointFilter {
         EndpointFilter::new(
