@@ -23,7 +23,9 @@
 			</div>
 		</div>
 		<div class="visual">
-			<HeroVisual />
+			<div class="mock">
+				<HeroVisual />
+			</div>
 			<p class="hint">
 				<span class="live" aria-hidden="true"></span>
 				Live mock · click an agent, a pane, or a tab
@@ -34,8 +36,9 @@
 <style>
 	.hero {
 		display: grid;
-		grid-template-columns: minmax(0, 0.82fr) minmax(0, 1.18fr);
-		gap: 48px;
+		/* The copy never drops under the width the install line needs. */
+		grid-template-columns: minmax(412px, 0.83fr) minmax(0, 1.17fr);
+		gap: 40px;
 		align-items: center;
 		padding-top: 56px;
 		padding-bottom: 40px;
@@ -45,6 +48,7 @@
 	.visual {
 		min-width: 0;
 	}
+
 
 	.eyebrow {
 		margin-bottom: 18px;
@@ -116,11 +120,37 @@
 		flex-shrink: 0;
 	}
 
-	@media (max-width: 960px) {
+	/* As the row narrows the workspace scales down whole, like a picture,
+	   rather than reflowing its panes: their titles stay intact. */
+	@media (max-width: 1240px) {
+		.mock {
+			zoom: 0.95;
+		}
+	}
+
+	@media (max-width: 1180px) {
+		.mock {
+			zoom: 0.9;
+		}
+	}
+
+	@media (max-width: 1130px) {
+		.mock {
+			zoom: 0.85;
+		}
+	}
+
+	/* Under this the row cannot hold a whole install line beside a
+	   readable mock, so the mock goes under the copy. */
+	@media (max-width: 1100px) {
 		.hero {
 			grid-template-columns: minmax(0, 1fr);
 			padding-top: 48px;
 			gap: 40px;
+		}
+
+		.mock {
+			zoom: 1;
 		}
 	}
 

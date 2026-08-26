@@ -14,7 +14,7 @@
 	   before pasting it. A footnote, not a second prompt. */
 	.prereq {
 		padding: 0 14px 12px;
-		font-size: 12px;
+		font-size: 11.5px;
 		line-height: 1.5;
 		color: var(--term-dim);
 	}

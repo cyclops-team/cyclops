@@ -219,7 +219,7 @@
 <div
 	class="term visual"
 	role="group"
-	aria-label="A live mock of the Cyclops workspace: a sidebar listing the clops session with four named agents, a tab strip, and pane frames whose borders carry each agent's name and state"
+	aria-label="A live mock of the Cyclops workspace: a sidebar listing the cyclops session with four named agents, a tab strip, and pane frames whose borders carry each agent's name and state"
 >
 	<div class="shell">
 		<aside class="sidebar">
@@ -229,7 +229,7 @@
 			</div>
 
 			<div class="tree">
-				<div class="row ws sel"><span class="arrow">▾</span>clops</div>
+				<div class="row ws sel"><span class="arrow">▾</span>cyclops</div>
 				{#each AGENTS as agent (agent.id)}
 					<button
 						type="button"
@@ -327,7 +327,7 @@
 
 	.shell {
 		display: grid;
-		grid-template-columns: 140px 1fr;
+		grid-template-columns: 126px 1fr;
 	}
 
 	/* ---- sidebar ---- */
@@ -555,11 +555,11 @@
 	.canvas {
 		flex: 1;
 		display: grid;
-		grid-template-columns: 1.2fr 1fr;
+		grid-template-columns: 1.25fr 1fr;
 		grid-template-rows: 1fr 1fr;
-		gap: 18px 12px;
-		padding: 13px 10px 12px;
-		min-height: 300px;
+		gap: 18px 8px;
+		padding: 13px 6px 12px;
+		min-height: 340px;
 	}
 
 	.canvas.single {

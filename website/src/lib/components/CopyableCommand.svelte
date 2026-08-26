@@ -1,13 +1,27 @@
 <script lang="ts">
-	import { onDestroy } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
 
 	let { lines }: { lines: string[] } = $props();
 
+	// The fade at the row's end is only for a line that does not fit; a
+	// line that fits shows whole, to the last character.
+	let linesEl: HTMLDivElement;
+	let overflowing = $state(false);
+
+	onMount(() => {
+		const measure = () => (overflowing = linesEl.scrollWidth > linesEl.clientWidth + 1);
+		measure();
+		const ro = new ResizeObserver(measure);
+		ro.observe(linesEl);
+		document.fonts?.ready.then(measure);
+		return () => ro.disconnect();
+	});
+
 	type CopyState = 'idle' | 'copied' | 'failed';
 	const COPY_LABEL: Record<CopyState, string> = {
-		idle: 'Copy',
-		copied: 'Copied',
-		failed: 'Failed'
+		idle: 'copy',
+		copied: 'copied',
+		failed: 'failed'
 	};
 
 	let copyState = $state<CopyState>('idle');
@@ -29,11 +43,13 @@
 </script>
 
 <div class="row">
-	<div class="lines">
+	<div class="lines" class:overflowing bind:this={linesEl}>
 		{#each lines as line (line)}
 			<div class="line"><span class="dollar">$</span>&nbsp;{line}</div>
 		{/each}
 	</div>
+	<!-- The control sits on the frame's top rule, at the end where the
+	     workspace keeps a pane's own controls, so the line has the row. -->
 	<button
 		class:copied={copyState === 'copied'}
 		class:failed={copyState === 'failed'}
@@ -41,19 +57,15 @@
 		aria-label="Copy install command"
 		aria-live="polite"
 	>
-		{COPY_LABEL[copyState]}
+		[{COPY_LABEL[copyState]}]
 	</button>
 </div>
 
 <style>
 	.row {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
 		width: 100%;
 		min-width: 0;
-		gap: 14px;
-		padding: 11px 12px 11px 14px;
+		padding: 13px 10px 11px 14px;
 	}
 
 	.lines {
@@ -61,6 +73,9 @@
 		flex: 1;
 		overflow-x: auto;
 		scrollbar-width: none;
+	}
+
+	.lines.overflowing {
 		mask-image: linear-gradient(to right, black calc(100% - 18px), transparent);
 		-webkit-mask-image: linear-gradient(to right, black calc(100% - 18px), transparent);
 	}
@@ -70,7 +85,7 @@
 	}
 
 	.line {
-		font-size: 13px;
+		font-size: 11.5px;
 		line-height: 1.5;
 		color: var(--term-text);
 		white-space: pre;
@@ -87,20 +102,28 @@
 	}
 
 	button {
+		position: absolute;
+		z-index: 2;
+		top: -8px;
+		right: 6px;
 		font-family: var(--font-mono);
-		font-size: 11.5px;
-		background: var(--term-control);
-		border: 1px solid var(--term-line);
+		font-size: 11px;
+		line-height: 15px;
+		letter-spacing: -0.4px;
+		background: var(--term-bg);
+		border: none;
 		color: var(--term-dim);
-		padding: 5px 10px;
+		padding: 0 3px;
 		cursor: pointer;
-		flex-shrink: 0;
-		line-height: 1.4;
 	}
 
 	button:hover {
-		border-color: var(--term-control-hover);
 		color: var(--term-text);
+	}
+
+	button:focus-visible {
+		outline: 2px solid var(--sb-accent);
+		outline-offset: 1px;
 	}
 
 	/* A completed copy is state.healthy, the same green a receipt uses. */
