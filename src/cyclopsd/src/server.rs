@@ -3484,6 +3484,7 @@ mod tests {
             transport: cyclops_proto::NotificationTransport::Doorbell,
             doorbell_format: Some(2),
             cause: Some(cyclops_proto::NotificationAttentionCause::VerifyFailed),
+            verify_outcome: None,
             pre_write_cause: None,
             wake_block: None,
             pre_write_observation: None,
