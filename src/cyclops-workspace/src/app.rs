@@ -2177,6 +2177,23 @@ fn finish_compose_send(
     }
 }
 
+/// Pump the Messages drawer refresh gate, issuing a snapshot fetch if one is owed and none in flight.
+pub(crate) fn pump_messages_refresh(app: &mut App) {
+    if !app.model.messages_visible {
+        return;
+    }
+    if let Some(req) = app.messages_gate.begin() {
+        let sent = if let Some(tx) = &app.messages_snapshot_tx {
+            tx.try_send((req, 128)).is_ok()
+        } else {
+            false
+        };
+        if !sent {
+            app.messages_gate.finish_failure(req);
+        }
+    }
+}
+
 /// Handle one app message. Returns false when the channel closed.
 async fn handle_app_msg(
     msg: Option<AppMsg>,
@@ -3485,7 +3502,11 @@ async fn handle_messages_key(
         match key.code {
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.messages_composer.reconcile_stage();
-                app.messages_gate.mark_dirty();
+                if app.messages_gate.link() == cyclops_ui::Link::Lost {
+                    app.messages_gate.connected();
+                } else {
+                    app.messages_gate.mark_dirty();
+                }
                 pump_messages_refresh(app);
                 app.notice.show(
                     "Reconciled uncertain state: refreshed snapshot and routes",

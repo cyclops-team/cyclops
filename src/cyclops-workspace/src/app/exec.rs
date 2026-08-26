@@ -250,7 +250,11 @@ pub(super) async fn execute(
             app.prefs.messages_visible = app.model.messages_visible;
             if app.model.messages_visible {
                 app.messages_focused = true;
-                app.messages_gate.mark_dirty();
+                if app.messages_gate.link() == cyclops_ui::Link::Lost {
+                    app.messages_gate.connected();
+                } else {
+                    app.messages_gate.mark_dirty();
+                }
                 super::pump_messages_refresh(app);
             } else {
                 app.messages_focused = false;
