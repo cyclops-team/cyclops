@@ -29,6 +29,12 @@ const SESSION_ATTACH_TIMEOUT: Duration = Duration::from_secs(20);
 // Integration requests can wait behind a reconnect or screen recompute on a
 // loaded runner. Keep the bound finite while allowing that work to finish.
 const CLIENT_LINE_TIMEOUT: Duration = Duration::from_secs(30);
+// The first post-handshake request can include the daemon's initial session
+// adoption and screen recompute. On a macOS runner executing the whole suite
+// twice, that bounded work has twice exceeded the ordinary request budget
+// while the same test passed in the adjacent run. Keep later requests tight;
+// give only request 1 one additional ordinary window.
+const FIRST_REQUEST_LINE_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn rig_slots() -> &'static Arc<Semaphore> {
     static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -715,13 +721,18 @@ impl TestClient {
     }
 
     async fn next_line_for(&mut self, request: Option<(u64, &str)>) -> Value {
-        let line = match tokio::time::timeout(CLIENT_LINE_TIMEOUT, self.lines.next_line()).await {
+        let timeout = if request.is_some_and(|(id, _)| id == 1) {
+            FIRST_REQUEST_LINE_TIMEOUT
+        } else {
+            CLIENT_LINE_TIMEOUT
+        };
+        let line = match tokio::time::timeout(timeout, self.lines.next_line()).await {
             Ok(line) => line.expect("read line").expect("connection open"),
             Err(_) => match request {
                 Some((id, method)) => {
-                    panic!("no line within 30s while waiting for request {id} ({method})")
+                    panic!("no line within {timeout:?} while waiting for request {id} ({method})")
                 }
-                None => panic!("no line within 30s while waiting for an event"),
+                None => panic!("no line within {timeout:?} while waiting for an event"),
             },
         };
         serde_json::from_str(&line).expect("line parses")
