@@ -497,9 +497,13 @@ cyclops --json health
 Cleanup accepts only named rebuildable asset classes. The default is a dry run;
 `--apply` removes only candidates that still pass the descriptor-relative,
 no-follow ownership checks. It never accepts an arbitrary path and never
-touches message journals. Every executed cleanup appends one content-free
-record to `operations/cleanup.ndjson` under the Cyclops state root. The command
-reports a failed record append instead of claiming an unrecorded cleanup.
+touches message journals. Before the first deletion, Cyclops durably writes an
+owner-only checkpoint and locks the cleanup journal. Each execution then
+appends one content-free `completed` or `interrupted` fact to
+`operations/cleanup.ndjson`. The next applied cleanup recovers a pending
+checkpoint exactly once, and a torn final journal record is discarded before
+replay. Invalid complete records stop cleanup before deletion instead of hiding
+journal damage.
 
 ```bash
 cyclops cleanup build-cache

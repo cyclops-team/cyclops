@@ -4,8 +4,8 @@
 //! beneath held directory descriptors, and removal is always an explicit
 //! second step after a dry-run report.
 
-use std::collections::{BTreeMap, VecDeque};
-use std::io::Write as _;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -28,6 +28,10 @@ const CLEANUP_UPDATE_PREFIX: &str = ".cyclops-cleanup.update-scratch.";
 const NONCE_BYTES: usize = 32;
 const CACHE_KEY_BYTES: usize = 16;
 const CLEANUP_RECORD: &str = "operations/cleanup.ndjson";
+const CLEANUP_CHECKPOINT: &str = "operations/cleanup.pending.json";
+const CLEANUP_JOURNAL_BYTES_LIMIT: u64 = 16 * 1_024 * 1_024;
+const CLEANUP_RECORD_BYTES_LIMIT: usize = 64 * 1_024;
+const CLEANUP_CHECKPOINT_BYTES_LIMIT: usize = 4 * 1_024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum AssetClass {
@@ -133,6 +137,97 @@ struct CleanupRecordReport {
     error: Option<String>,
 }
 
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields, tag = "state", rename_all = "snake_case")]
+enum CleanupCheckpoint {
+    Clear {
+        schema: u32,
+    },
+    Pending {
+        schema: u32,
+        operation_id: String,
+        ts: u64,
+        classes: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CleanupOutcome {
+    Completed,
+    Interrupted,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CleanupClassFact {
+    class: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidates: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    removed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    problems: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CleanupFact {
+    schema: u32,
+    kind: String,
+    operation_id: String,
+    ts: u64,
+    mode: String,
+    outcome: CleanupOutcome,
+    ok: bool,
+    classes: Vec<CleanupClassFact>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyCleanupClassFact {
+    class: String,
+    candidates: usize,
+    removed: usize,
+    problems: usize,
+    #[serde(rename = "bytes")]
+    _bytes: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyCleanupFact {
+    schema: u32,
+    kind: String,
+    #[serde(rename = "ts")]
+    _ts: u64,
+    mode: String,
+    #[serde(rename = "ok")]
+    _ok: bool,
+    classes: Vec<LegacyCleanupClassFact>,
+}
+
+struct CleanupJournal {
+    file: cyclops_state::StateFile,
+    operation_ids: BTreeSet<String>,
+    length: u64,
+}
+
+struct CleanupRecorder {
+    root: StateRoot,
+    journal: CleanupJournal,
+    operation_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CleanupBoundary {
+    PendingWritten,
+    RemovalFinished,
+    FactWritten,
+}
+
 struct Inventory {
     entries: Vec<InspectedEntry>,
     directories: BTreeMap<PathBuf, InspectedEntry>,
@@ -198,17 +293,15 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static AFTER_OPERATIONAL_INVENTORY: std::cell::RefCell<Option<AfterOperationalInventory>> =
         const { std::cell::RefCell::new(None) };
+    static CLEANUP_CRASH_BOUNDARY: std::cell::Cell<Option<CleanupBoundary>> =
+        const { std::cell::Cell::new(None) };
 }
 
 pub(crate) fn run(json_output: bool, classes: &[AssetClass], apply: bool) -> i32 {
     let home = cyclops_proto::cyclops_home();
     let temp_root = platform_temp_root();
     let cache = crate::update::build_cache(&home);
-    let mut report = collect_at(&temp_root, &cache, classes, apply);
-    report.record.path = home.join(CLEANUP_RECORD);
-    if apply {
-        persist_cleanup_record(&home, &mut report);
-    }
+    let report = execute_cleanup_at(&home, &temp_root, &cache, classes, apply);
     if json_output {
         println!("{}", render_json(&report));
     } else {
@@ -216,6 +309,56 @@ pub(crate) fn run(json_output: bool, classes: &[AssetClass], apply: bool) -> i32
     }
     i32::from(!report.issues.is_empty())
 }
+
+fn execute_cleanup_at(
+    home: &Path,
+    temp_root: &Path,
+    cache: &Path,
+    classes: &[AssetClass],
+    apply: bool,
+) -> CleanupReport {
+    if !apply {
+        let mut report = collect_at(temp_root, cache, classes, false);
+        report.record.path = home.join(CLEANUP_RECORD);
+        return report;
+    }
+
+    let mut recorder = match CleanupRecorder::begin(home, classes) {
+        Ok(recorder) => recorder,
+        Err(error) => {
+            // No cleanup runs without a durable pre-deletion checkpoint.
+            let mut report = collect_at(temp_root, cache, classes, false);
+            report.apply = true;
+            report.record.path = home.join(CLEANUP_RECORD);
+            report.record.state = "failed";
+            report.record.error = Some(error.clone());
+            report
+                .issues
+                .push(format!("prepare durable cleanup operation: {error}"));
+            return report;
+        }
+    };
+    cleanup_boundary(CleanupBoundary::PendingWritten);
+
+    let mut report = collect_at(temp_root, cache, classes, true);
+    report.record.path = home.join(CLEANUP_RECORD);
+    cleanup_boundary(CleanupBoundary::RemovalFinished);
+    recorder.finish(&mut report);
+    report
+}
+
+#[cfg(test)]
+fn cleanup_boundary(boundary: CleanupBoundary) {
+    CLEANUP_CRASH_BOUNDARY.with(|slot| {
+        if slot.get() == Some(boundary) {
+            slot.set(None);
+            panic!("injected cleanup crash at {boundary:?}");
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn cleanup_boundary(_: CleanupBoundary) {}
 
 /// Inspect cleanup-managed operational assets without locking or changing them.
 pub(crate) fn inspect_operational_assets(home: &Path) -> OperationalAssetInventory {
@@ -507,56 +650,362 @@ fn collect_at(
     report
 }
 
-fn persist_cleanup_record(home: &Path, report: &mut CleanupReport) {
-    report.record.path = home.join(CLEANUP_RECORD);
-    let result = (|| -> Result<(), String> {
+impl CleanupRecorder {
+    fn begin(home: &Path, requested_classes: &[AssetClass]) -> Result<Self, String> {
         let root = StateRoot::open_or_create(home).map_err(|error| error.to_string())?;
+        let mut journal = CleanupJournal::open(&root)?;
+
+        if let Some(checkpoint) = read_cleanup_checkpoint(&root)? {
+            match checkpoint {
+                CleanupCheckpoint::Clear { schema } if schema == 1 => {}
+                CleanupCheckpoint::Pending {
+                    schema,
+                    operation_id,
+                    ts,
+                    classes,
+                } if schema == 1 => {
+                    validate_operation_id(&operation_id)?;
+                    validate_class_names(&classes)?;
+                    let fact = CleanupFact {
+                        schema: 2,
+                        kind: "cleanup".to_string(),
+                        operation_id,
+                        ts,
+                        mode: "apply".to_string(),
+                        outcome: CleanupOutcome::Interrupted,
+                        ok: false,
+                        classes: classes
+                            .into_iter()
+                            .map(|class| CleanupClassFact {
+                                class,
+                                candidates: None,
+                                removed: None,
+                                problems: None,
+                                bytes: None,
+                            })
+                            .collect(),
+                    };
+                    journal.append(&fact)?;
+                }
+                _ => return Err("cleanup checkpoint has an unsupported schema".to_string()),
+            }
+        }
+        journal.ensure_final_capacity()?;
+
+        let classes = deduplicate_classes(requested_classes)
+            .into_iter()
+            .map(|class| class.name().to_string())
+            .collect::<Vec<_>>();
+        let operation_id = new_cleanup_operation_id(&journal)?;
+        write_cleanup_checkpoint(
+            &root,
+            &CleanupCheckpoint::Pending {
+                schema: 1,
+                operation_id: operation_id.clone(),
+                ts: crate::render::now_ms(),
+                classes,
+            },
+        )?;
+
+        Ok(Self {
+            root,
+            journal,
+            operation_id,
+        })
+    }
+
+    fn finish(&mut self, report: &mut CleanupReport) {
+        let fact = completed_cleanup_fact(&self.operation_id, report);
+        let result = self.journal.append(&fact).and_then(|_| {
+            cleanup_boundary(CleanupBoundary::FactWritten);
+            write_cleanup_checkpoint(&self.root, &CleanupCheckpoint::Clear { schema: 1 })
+        });
+        match result {
+            Ok(()) => report.record.state = "written",
+            Err(error) => {
+                report.record.state = "failed";
+                report.record.error = Some(error.clone());
+                report
+                    .issues
+                    .push(format!("finalize content-free cleanup record: {error}"));
+            }
+        }
+    }
+}
+
+impl CleanupJournal {
+    fn open(root: &StateRoot) -> Result<Self, String> {
         let mut file = root
             .open_append(Path::new(CLEANUP_RECORD))
             .map_err(|error| error.to_string())?;
-        let mut classes = BTreeMap::<&str, (usize, usize, usize, u64)>::new();
-        for candidate in &report.candidates {
-            let counts = classes.entry(candidate.class.name()).or_default();
-            counts.0 += 1;
-            counts.1 += usize::from(candidate.state == CandidateState::Removed);
-            counts.2 += usize::from(candidate.state.is_problem());
-            counts.3 = counts.3.saturating_add(candidate.bytes);
-        }
-        let record = json!({
-            "schema": 1,
-            "kind": "cleanup",
-            "ts": crate::render::now_ms(),
-            "mode": "apply",
-            "ok": report.issues.is_empty(),
-            "classes": classes.into_iter().map(|(class, counts)| json!({
-                "class": class,
-                "candidates": counts.0,
-                "removed": counts.1,
-                "problems": counts.2,
-                "bytes": counts.3,
-            })).collect::<Vec<_>>(),
-        });
-        let mut line = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
-        line.push(b'\n');
         file.lock().map_err(|error| error.to_string())?;
-        let write = file
-            .write_all(&line)
-            .and_then(|()| file.flush())
-            .and_then(|()| file.sync_data())
-            .map_err(|error| error.to_string());
-        let unlock = file.unlock().map_err(|error| error.to_string());
-        write.and(unlock)
-    })();
-    match result {
-        Ok(()) => report.record.state = "written",
-        Err(error) => {
-            report.record.state = "failed";
-            report.record.error = Some(error.clone());
-            report
-                .issues
-                .push(format!("append content-free cleanup record: {error}"));
+        let opened = (|| -> Result<(BTreeSet<String>, u64), String> {
+            let length = file
+                .seek(SeekFrom::End(0))
+                .map_err(|error| error.to_string())?;
+            if length > CLEANUP_JOURNAL_BYTES_LIMIT {
+                return Err(format!(
+                    "cleanup journal exceeds {} bytes",
+                    CLEANUP_JOURNAL_BYTES_LIMIT
+                ));
+            }
+            file.seek(SeekFrom::Start(0))
+                .map_err(|error| error.to_string())?;
+            let mut bytes = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
+            file.read_to_end(&mut bytes)
+                .map_err(|error| error.to_string())?;
+
+            if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+                let complete = bytes
+                    .iter()
+                    .rposition(|byte| *byte == b'\n')
+                    .map_or(0, |position| position + 1);
+                file.set_len(complete as u64)
+                    .and_then(|()| file.sync_data())
+                    .map_err(|error| error.to_string())?;
+                bytes.truncate(complete);
+            }
+
+            let mut operation_ids = BTreeSet::new();
+            for line in bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+            {
+                if line.len() > CLEANUP_RECORD_BYTES_LIMIT {
+                    return Err("cleanup journal contains an oversized record".to_string());
+                }
+                if let Some(operation_id) = parse_cleanup_record(line)? {
+                    if !operation_ids.insert(operation_id) {
+                        return Err("cleanup journal repeats an operation id".to_string());
+                    }
+                }
+            }
+            file.seek(SeekFrom::End(0))
+                .map_err(|error| error.to_string())?;
+            Ok((operation_ids, bytes.len() as u64))
+        })();
+        match opened {
+            Ok((operation_ids, length)) => Ok(Self {
+                file,
+                operation_ids,
+                length,
+            }),
+            Err(error) => {
+                let _ = file.unlock();
+                Err(error)
+            }
         }
     }
+
+    fn append(&mut self, fact: &CleanupFact) -> Result<(), String> {
+        validate_cleanup_fact(fact)?;
+        if self.operation_ids.contains(&fact.operation_id) {
+            return Ok(());
+        }
+        let mut line = serde_json::to_vec(fact).map_err(|error| error.to_string())?;
+        if line.len() > CLEANUP_RECORD_BYTES_LIMIT {
+            return Err("cleanup record exceeds its byte limit".to_string());
+        }
+        line.push(b'\n');
+        let next_length = self.length.saturating_add(line.len() as u64);
+        if next_length > CLEANUP_JOURNAL_BYTES_LIMIT {
+            return Err(format!(
+                "cleanup journal would exceed {} bytes",
+                CLEANUP_JOURNAL_BYTES_LIMIT
+            ));
+        }
+        self.file
+            .write_all(&line)
+            .and_then(|()| self.file.flush())
+            .and_then(|()| self.file.sync_data())
+            .map_err(|error| error.to_string())?;
+        self.operation_ids.insert(fact.operation_id.clone());
+        self.length = next_length;
+        Ok(())
+    }
+
+    fn ensure_final_capacity(&self) -> Result<(), String> {
+        if self
+            .length
+            .saturating_add((CLEANUP_RECORD_BYTES_LIMIT + 1) as u64)
+            > CLEANUP_JOURNAL_BYTES_LIMIT
+        {
+            return Err(format!(
+                "cleanup journal has no room below its {} byte limit",
+                CLEANUP_JOURNAL_BYTES_LIMIT
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn read_cleanup_checkpoint(root: &StateRoot) -> Result<Option<CleanupCheckpoint>, String> {
+    let Some(mut file) = root
+        .open_read(Path::new(CLEANUP_CHECKPOINT))
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take((CLEANUP_CHECKPOINT_BYTES_LIMIT + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > CLEANUP_CHECKPOINT_BYTES_LIMIT {
+        return Err("cleanup checkpoint exceeds its byte limit".to_string());
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+fn write_cleanup_checkpoint(
+    root: &StateRoot,
+    checkpoint: &CleanupCheckpoint,
+) -> Result<(), String> {
+    let mut bytes = serde_json::to_vec(checkpoint).map_err(|error| error.to_string())?;
+    if bytes.len() > CLEANUP_CHECKPOINT_BYTES_LIMIT {
+        return Err("cleanup checkpoint exceeds its byte limit".to_string());
+    }
+    bytes.push(b'\n');
+    root.replace_file(Path::new(CLEANUP_CHECKPOINT), &bytes)
+        .map_err(|error| error.to_string())
+}
+
+fn completed_cleanup_fact(operation_id: &str, report: &CleanupReport) -> CleanupFact {
+    let mut classes = BTreeMap::<&str, (usize, usize, usize, u64)>::new();
+    for candidate in &report.candidates {
+        let counts = classes.entry(candidate.class.name()).or_default();
+        counts.0 += 1;
+        counts.1 += usize::from(candidate.state == CandidateState::Removed);
+        counts.2 += usize::from(candidate.state.is_problem());
+        counts.3 = counts.3.saturating_add(candidate.bytes);
+    }
+    CleanupFact {
+        schema: 2,
+        kind: "cleanup".to_string(),
+        operation_id: operation_id.to_string(),
+        ts: crate::render::now_ms(),
+        mode: "apply".to_string(),
+        outcome: CleanupOutcome::Completed,
+        ok: report.issues.is_empty(),
+        classes: classes
+            .into_iter()
+            .map(|(class, counts)| CleanupClassFact {
+                class: class.to_string(),
+                candidates: Some(counts.0),
+                removed: Some(counts.1),
+                problems: Some(counts.2),
+                bytes: Some(counts.3),
+            })
+            .collect(),
+    }
+}
+
+fn parse_cleanup_record(line: &[u8]) -> Result<Option<String>, String> {
+    let value: Value = serde_json::from_slice(line).map_err(|error| error.to_string())?;
+    match value.get("schema").and_then(Value::as_u64) {
+        Some(1) => {
+            let fact: LegacyCleanupFact =
+                serde_json::from_value(value).map_err(|error| error.to_string())?;
+            validate_legacy_cleanup_fact(&fact)?;
+            Ok(None)
+        }
+        Some(2) => {
+            let fact: CleanupFact =
+                serde_json::from_value(value).map_err(|error| error.to_string())?;
+            validate_cleanup_fact(&fact)?;
+            Ok(Some(fact.operation_id))
+        }
+        _ => Err("cleanup journal contains an unsupported schema".to_string()),
+    }
+}
+
+fn validate_legacy_cleanup_fact(fact: &LegacyCleanupFact) -> Result<(), String> {
+    if fact.schema != 1 || fact.kind != "cleanup" || fact.mode != "apply" {
+        return Err("cleanup journal contains an invalid legacy record".to_string());
+    }
+    let mut names = Vec::with_capacity(fact.classes.len());
+    for class in &fact.classes {
+        if class.removed > class.candidates || class.problems > class.candidates {
+            return Err("cleanup journal contains invalid legacy counts".to_string());
+        }
+        names.push(class.class.clone());
+    }
+    validate_class_names(&names)
+}
+
+fn validate_cleanup_fact(fact: &CleanupFact) -> Result<(), String> {
+    if fact.schema != 2 || fact.kind != "cleanup" || fact.mode != "apply" {
+        return Err("cleanup journal contains an invalid record".to_string());
+    }
+    validate_operation_id(&fact.operation_id)?;
+    let names = fact
+        .classes
+        .iter()
+        .map(|class| class.class.clone())
+        .collect::<Vec<_>>();
+    validate_class_names(&names)?;
+    if fact.outcome == CleanupOutcome::Interrupted && fact.ok {
+        return Err("interrupted cleanup record claims success".to_string());
+    }
+    for class in &fact.classes {
+        match fact.outcome {
+            CleanupOutcome::Completed => {
+                let (Some(candidates), Some(removed), Some(problems), Some(_)) =
+                    (class.candidates, class.removed, class.problems, class.bytes)
+                else {
+                    return Err("completed cleanup record has missing counts".to_string());
+                };
+                if removed > candidates || problems > candidates {
+                    return Err("completed cleanup record has invalid counts".to_string());
+                }
+            }
+            CleanupOutcome::Interrupted => {
+                if class.candidates.is_some()
+                    || class.removed.is_some()
+                    || class.problems.is_some()
+                    || class.bytes.is_some()
+                {
+                    return Err("interrupted cleanup record claims an outcome".to_string());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_class_names(classes: &[String]) -> Result<(), String> {
+    let unique = classes.iter().collect::<BTreeSet<_>>();
+    if unique.len() != classes.len()
+        || classes
+            .iter()
+            .any(|class| class != "build_cache" && class != "update_scratch")
+    {
+        return Err("cleanup record has invalid asset classes".to_string());
+    }
+    Ok(())
+}
+
+fn validate_operation_id(operation_id: &str) -> Result<(), String> {
+    if operation_id.len() != NONCE_BYTES
+        || !operation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("cleanup operation id is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn new_cleanup_operation_id(journal: &CleanupJournal) -> Result<String, String> {
+    for _ in 0..16 {
+        let operation_id = crate::update::random_hex()?;
+        if !journal.operation_ids.contains(&operation_id) {
+            return Ok(operation_id);
+        }
+    }
+    Err("could not allocate a unique cleanup operation id".to_string())
 }
 
 fn deduplicate_classes(classes: &[AssetClass]) -> Vec<AssetClass> {
@@ -2246,13 +2695,17 @@ mod tests {
         let temp = private_temp();
         let home = temp.path().join("state");
         let cache = temp.path().join("absent-cache");
-        let mut first = collect_at(temp.path(), &cache, &[AssetClass::BuildCache], true);
-        persist_cleanup_record(&home, &mut first);
+        let first = execute_cleanup_at(&home, temp.path(), &cache, &[AssetClass::BuildCache], true);
         assert_eq!(first.record.state, "written");
         assert!(first.record.error.is_none());
 
-        let mut second = collect_at(temp.path(), &cache, &[AssetClass::UpdateScratch], true);
-        persist_cleanup_record(&home, &mut second);
+        let second = execute_cleanup_at(
+            &home,
+            temp.path(),
+            &cache,
+            &[AssetClass::UpdateScratch],
+            true,
+        );
         assert_eq!(second.record.state, "written");
 
         let text = fs::read_to_string(home.join(CLEANUP_RECORD)).unwrap();
@@ -2268,13 +2721,24 @@ mod tests {
                 .collect::<BTreeSet<_>>();
             assert_eq!(
                 keys,
-                ["classes", "kind", "mode", "ok", "schema", "ts"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect()
+                [
+                    "classes",
+                    "kind",
+                    "mode",
+                    "ok",
+                    "operation_id",
+                    "outcome",
+                    "schema",
+                    "ts",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
             );
+            assert_eq!(value["schema"], 2);
             assert_eq!(value["kind"], "cleanup");
             assert_eq!(value["mode"], "apply");
+            assert_eq!(value["outcome"], "completed");
             assert!(!line.contains(temp.path().to_string_lossy().as_ref()));
             assert!(!line.contains("reason"));
             assert!(!line.contains("path"));
@@ -2286,9 +2750,147 @@ mod tests {
         let temp = private_temp();
         let home = temp.path().join("state");
         let cache = temp.path().join("absent-cache");
-        let report = collect_at(temp.path(), &cache, &[AssetClass::BuildCache], false);
+        let report =
+            execute_cleanup_at(&home, temp.path(), &cache, &[AssetClass::BuildCache], false);
 
         assert_eq!(report.record.state, "not_requested");
         assert!(!home.exists());
+    }
+
+    #[test]
+    fn an_invalid_journal_refuses_cleanup_before_the_first_deletion() {
+        let temp = private_temp();
+        let home = temp.path().join("state");
+        let cache = build_cache(temp.path());
+        let root = StateRoot::open_or_create(&home).unwrap();
+        let mut journal = root.open_append(Path::new(CLEANUP_RECORD)).unwrap();
+        std::io::Write::write_all(&mut journal, b"{}\n").unwrap();
+        journal.sync_data().unwrap();
+        drop(journal);
+
+        let report =
+            execute_cleanup_at(&home, temp.path(), &cache, &[AssetClass::BuildCache], true);
+
+        assert_eq!(report.record.state, "failed");
+        assert!(cache.exists());
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.contains("prepare durable cleanup operation")));
+    }
+
+    #[test]
+    fn a_torn_tail_is_recovered_before_the_next_cleanup_record() {
+        let temp = private_temp();
+        let home = temp.path().join("state");
+        let cache = temp.path().join("absent-cache");
+        let first = execute_cleanup_at(&home, temp.path(), &cache, &[AssetClass::BuildCache], true);
+        assert_eq!(first.record.state, "written");
+
+        let root = StateRoot::open_or_create(&home).unwrap();
+        let mut journal = root.open_append(Path::new(CLEANUP_RECORD)).unwrap();
+        std::io::Write::write_all(&mut journal, b"{\"schema\":2").unwrap();
+        journal.sync_data().unwrap();
+        drop(journal);
+
+        let second = execute_cleanup_at(
+            &home,
+            temp.path(),
+            &cache,
+            &[AssetClass::UpdateScratch],
+            true,
+        );
+        assert_eq!(second.record.state, "written");
+        assert_eq!(cleanup_facts(&home).len(), 2);
+    }
+
+    #[test]
+    fn every_cleanup_crash_boundary_recovers_one_fact_for_the_exact_operation() {
+        for boundary in [
+            CleanupBoundary::PendingWritten,
+            CleanupBoundary::RemovalFinished,
+            CleanupBoundary::FactWritten,
+        ] {
+            let temp = private_temp();
+            let home = temp.path().join("state");
+            let cache = build_cache(temp.path());
+            CLEANUP_CRASH_BOUNDARY.with(|slot| slot.set(Some(boundary)));
+
+            let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                execute_cleanup_at(&home, temp.path(), &cache, &[AssetClass::BuildCache], true)
+            }));
+            assert!(crashed.is_err(), "{boundary:?} did not interrupt cleanup");
+            let operation_id = pending_operation_id(&home);
+            assert_eq!(
+                cache.exists(),
+                boundary == CleanupBoundary::PendingWritten,
+                "{boundary:?} crossed the wrong deletion boundary"
+            );
+
+            let recovered =
+                execute_cleanup_at(&home, temp.path(), &cache, &[AssetClass::BuildCache], true);
+            assert_eq!(recovered.record.state, "written");
+            let facts = cleanup_facts(&home);
+            let original = facts
+                .iter()
+                .filter(|fact| fact.operation_id == operation_id)
+                .collect::<Vec<_>>();
+            assert_eq!(original.len(), 1, "{boundary:?} duplicated its fact");
+            assert_eq!(
+                original[0].outcome,
+                if boundary == CleanupBoundary::FactWritten {
+                    CleanupOutcome::Completed
+                } else {
+                    CleanupOutcome::Interrupted
+                }
+            );
+            assert!(matches!(
+                read_cleanup_checkpoint(&StateRoot::open_or_create(&home).unwrap()).unwrap(),
+                Some(CleanupCheckpoint::Clear { schema: 1 })
+            ));
+        }
+    }
+
+    #[test]
+    fn schema_one_cleanup_records_remain_compatible() {
+        let temp = private_temp();
+        let home = temp.path().join("state");
+        let cache = temp.path().join("absent-cache");
+        let root = StateRoot::open_or_create(&home).unwrap();
+        let mut journal = root.open_append(Path::new(CLEANUP_RECORD)).unwrap();
+        std::io::Write::write_all(
+            &mut journal,
+            br#"{"schema":1,"kind":"cleanup","ts":1,"mode":"apply","ok":true,"classes":[]}
+"#,
+        )
+        .unwrap();
+        journal.sync_data().unwrap();
+        drop(journal);
+
+        let report =
+            execute_cleanup_at(&home, temp.path(), &cache, &[AssetClass::BuildCache], true);
+        assert_eq!(report.record.state, "written");
+        let text = fs::read_to_string(home.join(CLEANUP_RECORD)).unwrap();
+        assert_eq!(text.lines().count(), 2);
+    }
+
+    fn cleanup_facts(home: &Path) -> Vec<CleanupFact> {
+        fs::read(home.join(CLEANUP_RECORD))
+            .unwrap()
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| {
+                let value: Value = serde_json::from_slice(line).unwrap();
+                (value["schema"] == 2).then(|| serde_json::from_value(value).unwrap())
+            })
+            .collect()
+    }
+
+    fn pending_operation_id(home: &Path) -> String {
+        let root = StateRoot::open_or_create(home).unwrap();
+        match read_cleanup_checkpoint(&root).unwrap().unwrap() {
+            CleanupCheckpoint::Pending { operation_id, .. } => operation_id,
+            CleanupCheckpoint::Clear { .. } => panic!("cleanup checkpoint was already clear"),
+        }
     }
 }
