@@ -20,10 +20,11 @@ use cyclops_proto::{
     ClaimDisposition, DaemonShutdownParams, DaemonShutdownResult, DeliveryState, Event, Hello,
     InboxClaimParams, InboxClaimResult, InboxListParams, InboxListResult, InboxSummaryEntry,
     MessagesFollowParams, MessagesSnapshotParams, MsgSendParams, NotificationAttemptId,
-    NotificationAttentionCause, NotificationResolution, NotificationWithdrawParams, PaneReadParams,
-    PaneReadResult, PaneReadSource, PingResult, ProcessInstanceId, QuiesceParams, RecipientKey,
-    ReplyParams, Request, RequeueParams, RequeueResult, Response, SessionStatus, StateReportParams,
-    StatusMailboxRoute, StatusParams, StatusResult, SubscribeParams, WireError, PROTOCOL_VERSION,
+    NotificationAttentionCause, NotificationRecord, NotificationResolution,
+    NotificationWithdrawParams, PaneReadParams, PaneReadResult, PaneReadSource, PingResult,
+    ProcessInstanceId, QuiesceParams, RecipientKey, ReplyParams, Request, RequeueParams,
+    RequeueResult, Response, SessionStatus, StateReportParams, StatusMailboxRoute, StatusParams,
+    StatusResult, SubscribeParams, WireError, PROTOCOL_VERSION,
 };
 use cyclops_state::{BoundSocketCleanup, StateRoot};
 use cyclops_tmux::SessionWatcher;
@@ -896,14 +897,6 @@ fn inbox_claim(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Resp
     };
     // Only inbox.claim interprets the reserved locator. Every other message-id
     // consumer keeps treating the same bytes as a literal historical id.
-    // Read the oldest pending id before the claim so a claim-by-id that
-    // jumps the queue can say what it left at the head. A failed read is
-    // silence here, never a refused claim.
-    let oldest_pending = service
-        .list(caller.key, None, Some(1))
-        .ok()
-        .and_then(|entries| entries.into_iter().next())
-        .map(|item| item.entry.message_id);
     let outcome = match cyclops_proto::parse_notification_attempt_claim_locator(&params.message_id)
     {
         Some(attempt_id) => crate::messaging::claim_notification_locator(
@@ -916,14 +909,15 @@ fn inbox_claim(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Resp
         None => crate::messaging::claim(inner, &service, caller.key, params.message_id),
     };
     let result = match outcome {
-        Ok(crate::mailbox::ClaimOutcome::Claimed { message, .. }) => {
-            let skipped_oldest = oldest_pending.filter(|oldest| *oldest != message.message_id);
-            InboxClaimResult {
-                disposition: ClaimDisposition::Claimed,
-                message,
-                skipped_oldest,
-            }
-        }
+        Ok(crate::mailbox::ClaimOutcome::Claimed {
+            message,
+            skipped_oldest,
+            ..
+        }) => InboxClaimResult {
+            disposition: ClaimDisposition::Claimed,
+            message,
+            skipped_oldest,
+        },
         Ok(crate::mailbox::ClaimOutcome::AlreadyClaimed { message, .. }) => InboxClaimResult {
             disposition: ClaimDisposition::AlreadyClaimed,
             message,
@@ -1061,27 +1055,27 @@ fn alarm_preview(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Re
     };
     // Identity, state and age only. No subject and no body: an operator
     // deciding what to clear does not need the message contents.
-    let entries = records
-        .into_iter()
-        .map(|record| AlarmSummary {
-            id: record.attempt_id.to_string(),
-            message_id: record.message_id.to_string(),
-            recipient: record.recipient.to_string(),
-            state: DeliveryState::AttentionRequired,
-            // An attention record always carries a cause. If one ever
-            // reached here without it, the honest answer is that the
-            // outcome is unknown, not a specific failure it did not have.
-            cause: record
-                .cause
-                .unwrap_or(NotificationAttentionCause::TransportOutcomeUnknown),
-            ts: record.updated_at,
-        })
-        .collect();
+    let entries = records.iter().map(alarm_summary).collect();
     Response::ok(
         id,
         serde_json::to_value(AlarmPreviewResult { entries, cutoff_ms })
             .expect("alarm preview result serializes"),
     )
+}
+
+fn alarm_summary(record: &NotificationRecord) -> AlarmSummary {
+    AlarmSummary {
+        id: record.attempt_id.to_string(),
+        message_id: record.message_id.to_string(),
+        recipient: record.recipient.to_string(),
+        state: DeliveryState::AttentionRequired,
+        // An attention record always carries a cause. If one ever reaches
+        // here without it, report an unknown outcome instead of inventing one.
+        cause: record
+            .cause
+            .unwrap_or(NotificationAttentionCause::TransportOutcomeUnknown),
+        ts: record.updated_at,
+    }
 }
 
 fn alarm_clear(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
@@ -1106,12 +1100,16 @@ fn alarm_clear(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Resp
     if !caller.key.is_admin() {
         return wire_error_response(id, mailbox_admin_required());
     }
-    let cleared = match service.clear_alarms(caller.key, &attempts, params.cutoff_ms) {
-        Ok(cleared) => cleared,
+    let summaries = match service.clear_alarms(caller.key, &attempts, params.cutoff_ms) {
+        Ok(summaries) => summaries,
         Err(error) => return wire_error_response(id, mailbox_service_error(error)),
     };
     let result = AlarmClearResult {
-        cleared_ids: cleared.iter().map(ToString::to_string).collect(),
+        cleared_ids: summaries
+            .iter()
+            .map(|record| record.attempt_id.to_string())
+            .collect(),
+        summaries: summaries.iter().map(alarm_summary).collect(),
     };
     Response::ok(
         id,
@@ -3722,6 +3720,31 @@ mod tests {
             assert!(entry.get("subject").is_none() && entry.get("body").is_none());
             std::fs::remove_dir_all(path).ok();
         }
+    }
+
+    #[tokio::test]
+    async fn clear_returns_only_the_exact_body_free_attempt_facts() {
+        let (inner, path, attempt_id, message_id) = inner_with_alarm(
+            "operator-clear-summary",
+            cyclops_proto::NotificationAttentionCause::VerifyFailed,
+        );
+        let response = ask_inner(
+            &inner,
+            "alarm.clear",
+            json!({"ids": [attempt_id.to_string()]}),
+        )
+        .await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let value = response.result.unwrap();
+        assert_eq!(value["cleared_ids"], json!([attempt_id.to_string()]));
+        let summaries = value["summaries"].as_array().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0]["id"], attempt_id.to_string());
+        assert_eq!(summaries[0]["message_id"], message_id);
+        assert_eq!(summaries[0]["cause"], "verify_failed");
+        assert!(summaries[0].get("subject").is_none());
+        assert!(summaries[0].get("body").is_none());
+        std::fs::remove_dir_all(path).ok();
     }
 
     #[tokio::test]

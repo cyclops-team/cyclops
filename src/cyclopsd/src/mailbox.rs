@@ -116,6 +116,9 @@ pub enum ClaimOutcome {
     Claimed {
         entry: MailboxEntry,
         message: InboxMessage,
+        /// Oldest pending message immediately before this claim fact was
+        /// appended, when this claim took a later FIFO entry.
+        skipped_oldest: Option<MessageId>,
         withdrawn_attempt: Option<NotificationAttemptId>,
         consumed_doorbell_attempt: Option<NotificationAttemptId>,
         claimed_ack_timeout_attempt: Option<NotificationAttemptId>,
@@ -5248,22 +5251,29 @@ impl MailboxService {
     /// Every identifier is resolved before any fact is appended, so a
     /// request naming one unknown or superseded attempt changes nothing.
     /// Identifiers already acknowledged resolve and append nothing.
+    /// Returned records are captured under the same lock as validation and
+    /// clearance, in request order, including repeated identifiers.
     pub fn clear_alarms(
         &self,
         operator: RecipientKey,
         ids: &[NotificationAttemptId],
         cutoff_ms: Option<u64>,
-    ) -> Result<Vec<NotificationAttemptId>, MailboxServiceError> {
+    ) -> Result<Vec<NotificationRecord>, MailboxServiceError> {
         let mut store = self.store()?;
         if operator != RecipientKey::admin(store.projection().workspace_id()) {
             return Err(MailboxError::NotificationClearOperatorInvalid.into());
         }
 
         let mut fresh = BTreeSet::new();
+        let mut summaries = Vec::with_capacity(ids.len());
         for id in ids {
-            let record = store.projection().alarm_by_attempt(*id).ok_or_else(|| {
-                MessageStoreError::from(MailboxError::NotificationAttemptUnknown(*id))
-            })?;
+            let record = store
+                .projection()
+                .alarm_by_attempt(*id)
+                .cloned()
+                .ok_or_else(|| {
+                    MessageStoreError::from(MailboxError::NotificationAttemptUnknown(*id))
+                })?;
             if record.state != NotificationState::AttentionRequired {
                 return Err(MessageStoreError::from(
                     MailboxError::NotificationClearRequiresAttention,
@@ -5283,6 +5293,7 @@ impl MailboxService {
             if !store.projection().alarm_cleared(*id) {
                 fresh.insert(*id);
             }
+            summaries.push(record);
         }
 
         if !fresh.is_empty() {
@@ -5301,7 +5312,7 @@ impl MailboxService {
                 );
             }
         }
-        Ok(ids.to_vec())
+        Ok(summaries)
     }
 
     /// Withdraw one exact unwritten wake without changing its mailbox entry.
@@ -6217,6 +6228,13 @@ impl MessageStore {
         message_id: MessageId,
         ts: u64,
     ) -> Result<ClaimOutcome, MessageStoreError> {
+        let skipped_oldest = self
+            .projection
+            .get_pending(claimant)
+            .into_iter()
+            .next()
+            .map(|entry| entry.message_id.clone())
+            .filter(|oldest| oldest != &message_id);
         let entry = self
             .projection
             .get_entry(claimant, &message_id)
@@ -6333,6 +6351,7 @@ impl MessageStore {
         Ok(ClaimOutcome::Claimed {
             entry: updated,
             message,
+            skipped_oldest,
             withdrawn_attempt,
             consumed_doorbell_attempt,
             claimed_ack_timeout_attempt,
@@ -8051,6 +8070,85 @@ mod tests {
             .unwrap();
         assert_eq!(current.recipient_keys, [replacement]);
         assert_eq!(current.recipients, ["implementer"]);
+    }
+
+    #[test]
+    fn concurrent_claims_report_the_head_from_the_claim_lock() {
+        let scratch = StoreScratch::new("claim-head-lock");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, _, bob, _) = test_context();
+        let directory = MailboxDirectory::new(
+            workspace,
+            [MailboxIdentity {
+                key: bob,
+                label: "reviewer".into(),
+            }],
+        )
+        .unwrap();
+        let store = MessageStore::open(&root, journal, workspace, "boot").unwrap();
+        let service = std::sync::Arc::new(MailboxService::new(directory, store));
+        let first = service
+            .send(
+                service.admin(),
+                mailbox_send("reviewer", "First", "First body"),
+            )
+            .unwrap()
+            .message_id;
+        let second = service
+            .send(
+                service.admin(),
+                mailbox_send("reviewer", "Second", "Second body"),
+            )
+            .unwrap()
+            .message_id;
+
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let first_worker = {
+            let service = std::sync::Arc::clone(&service);
+            let gate = std::sync::Arc::clone(&gate);
+            let first = first.clone();
+            std::thread::spawn(move || {
+                gate.wait();
+                service.claim(bob, first).unwrap()
+            })
+        };
+        let second_worker = {
+            let service = std::sync::Arc::clone(&service);
+            let gate = std::sync::Arc::clone(&gate);
+            let second = second.clone();
+            std::thread::spawn(move || {
+                gate.wait();
+                service.claim(bob, second).unwrap()
+            })
+        };
+        gate.wait();
+
+        let first_outcome = first_worker.join().unwrap();
+        let second_outcome = second_worker.join().unwrap();
+        assert!(matches!(first_outcome, ClaimOutcome::Claimed { .. }));
+        let ClaimOutcome::Claimed { skipped_oldest, .. } = second_outcome else {
+            panic!("second message was not freshly claimed");
+        };
+
+        let store = service.store().unwrap();
+        let first_seq = store
+            .projection()
+            .claim_sequences
+            .get(&(bob, first.clone()))
+            .copied()
+            .unwrap();
+        let second_seq = store
+            .projection()
+            .claim_sequences
+            .get(&(bob, second))
+            .copied()
+            .unwrap();
+        if first_seq < second_seq {
+            assert_eq!(skipped_oldest, None);
+        } else {
+            assert_eq!(skipped_oldest, Some(first));
+        }
     }
 
     #[test]
@@ -13265,7 +13363,8 @@ mod tests {
 
     #[test]
     fn clearing_several_alarms_appends_one_replayable_fact() {
-        let (scratch, store, _, bob, carol) = broadcast_operator_store("clear-batch-atomic");
+        let (scratch, store, message_id, bob, carol) =
+            broadcast_operator_store("clear-batch-atomic");
         let journal = Path::new("workspaces/current/messages.ndjson");
         let (workspace, admin, _, _) = test_context();
         let before = store.projection().last_sequence().unwrap();
@@ -13275,9 +13374,21 @@ mod tests {
             MailboxService::new_with_events(operator_directory(bob, carol), store, sender);
 
         let requested = [attempt(2), attempt(1), attempt(1)];
+        let summaries = service.clear_alarms(admin, &requested, None).unwrap();
         assert_eq!(
-            service.clear_alarms(admin, &requested, None).unwrap(),
+            summaries
+                .iter()
+                .map(|record| record.attempt_id)
+                .collect::<Vec<_>>(),
             requested
+        );
+        assert_eq!(summaries.len(), requested.len());
+        assert_eq!(summaries[0].message_id, message_id);
+        assert_eq!(summaries[0].recipient, carol);
+        assert_eq!(summaries[1].recipient, bob);
+        assert_eq!(
+            summaries[0].cause,
+            Some(NotificationAttentionCause::VerifyFailed)
         );
         let store = service.store().unwrap();
         assert_eq!(store.projection().last_sequence(), Some(before + 1));

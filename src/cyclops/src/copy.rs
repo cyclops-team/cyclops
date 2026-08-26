@@ -54,14 +54,8 @@ pub fn alarm_cleared_consequence(
     cause: &str,
 ) -> String {
     format!(
-        "  acknowledged only · attempt {id} stays {state} ({cause}) · message {message_id} to {recipient} is unchanged and, while pending, holds that recipient's queue · release: recipient claims {message_id} · or admin: cyclops attention show {id} --diff, then complete or discard · or cyclops requeue {message_id} after fixing the cause"
+        "  acknowledged only · at clearance, attempt {id} was {state} ({cause}) · clearance did not change message {message_id} to {recipient}; while pending, it can hold that recipient's queue · next: recipient retrieves the durable payload with cyclops inbox claim {message_id} · admin may inspect current state with cyclops attention show {id} --diff, then complete or discard when its checks authorize the action · neither clearance nor payload retrieval alone proves a post-write composer barrier retired"
     )
-}
-
-/// The cleared id was not in the unresolved set the daemon reported just
-/// before clearing, so nothing can be said about what it held.
-pub fn alarm_cleared_unknown(id: &str) -> String {
-    format!("  acknowledged only · no unresolved attempt was listed for {id} just before clearing")
 }
 
 /// A claim by id took a later message; the oldest pending one still holds

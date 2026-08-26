@@ -1255,6 +1255,10 @@ pub struct AlarmClearParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlarmClearResult {
     pub cleared_ids: Vec<String>,
+    /// Body-free attempt facts captured under the same store lock as the
+    /// clearance. Older daemons omit this additive field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub summaries: Vec<AlarmSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1884,6 +1888,31 @@ mod tests {
         let decoded: AlarmSummary =
             serde_json::from_value(serde_json::to_value(&summary).unwrap()).expect("round trip");
         assert_eq!(decoded.cause, NotificationAttentionCause::VerifyFailed);
+    }
+
+    #[test]
+    fn alarm_clear_summaries_are_additive_and_body_free() {
+        let legacy: AlarmClearResult =
+            serde_json::from_str(r#"{"cleared_ids":["att-1"]}"#).unwrap();
+        assert_eq!(legacy.cleared_ids, vec!["att-1".to_string()]);
+        assert!(legacy.summaries.is_empty());
+
+        let current = AlarmClearResult {
+            cleared_ids: vec!["att-1".into()],
+            summaries: vec![AlarmSummary {
+                id: "att-1".into(),
+                message_id: "m-1".into(),
+                recipient: "reviewer".into(),
+                state: crate::ledger::DeliveryState::AttentionRequired,
+                cause: crate::notification::NotificationAttentionCause::VerifyFailed,
+                ts: 7,
+            }],
+        };
+        let value = serde_json::to_value(current).unwrap();
+        assert_eq!(value["summaries"].as_array().unwrap().len(), 1);
+        assert!(value.to_string().contains("verify_failed"));
+        assert!(!value.to_string().contains("body"));
+        assert!(!value.to_string().contains("subject"));
     }
 
     #[test]

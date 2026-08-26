@@ -45,7 +45,9 @@ daemon never bypasses an older pending message. When the oldest pending
 message is not moving (`attention_required`, quota held, or blocked before
 write), `cyclops messages` prints one `held queue` line naming that recipient,
 the head message id, its cause, and how many wait behind it, and every
-follower cell reads `N ahead · behind <id> (<cause>)`.
+follower cell reads `N ahead · behind <id> (<cause>)`. The held-queue line
+names next actions for the exact cause. It does not treat alarm clearance or
+payload retrieval alone as proof that a post-write composer barrier retired.
 
 The body and wake use different paths. Doorbell mode never pastes the message
 body. A terminal wake stages one `inbox claim` command, while a pull client may
@@ -253,13 +255,17 @@ those diff inputs to its journal or log.
 that is still eligible. `cyclops alarm clear <attempt-id>...` appends explicit
 clearances to the content-free notification alarm register. A clearance
 acknowledges; it retires nothing. Under each cleared id the command prints the
-attempt's state and cause, the message and recipient it still holds, and the
-two actions that release it: a recipient claim, or `attention show --diff`
-followed by `complete` or `discard` (or `requeue` after the cause is fixed).
-At daemon start, every open attempt that no automatic reconciliation can
-retire is listed once to the operator with the same two actions. For an age-selected
-set, `cyclops alarm clear --older-than <age>` previews and prints the exact ids,
-then requires typing `clear` at a confirmation that names the count and cutoff.
+attempt's state and cause at clearance time, the message and recipient the
+clearance did not change, and the available next actions. The recipient
+retrieves the durable payload with `inbox claim`, or the administrator inspects
+the exact attempt with `attention show --diff` and uses `complete` or `discard`
+only when its checks authorize the action. Neither clearance nor payload
+retrieval alone proves that a post-write composer barrier retired.
+
+For an age-selected set, `cyclops alarm clear --older-than <age>` previews and
+prints the exact ids, then requires typing `clear` at a confirmation that names
+the count and cutoff.
+
 The clear request contains only those frozen ids, so a newer alarm cannot enter
 the operation. There is no clear-all form. Scripts use `alarm preview --json`
 and pass its ids explicitly rather than using the interactive age form. None of

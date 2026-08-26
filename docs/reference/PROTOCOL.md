@@ -607,7 +607,10 @@ clear-all or age-selected daemon mutation. The human CLI implements
 selected ids, naming the count and cutoff in its confirmation, and sending
 only that frozen id set to `alarm.clear`. Alarms created after the preview
 cannot be swept into the request. Requeues and clearances are append-only
-workspace facts.
+workspace facts. The clear response includes additive body-free summaries for
+only the requested ids. Those summaries are captured under the same mailbox
+store lock as the clearance, so the CLI does not issue an unbounded preview or
+describe state that changed between a read and the clear.
 
 `attention.show` takes `id` and optional `diff`. The id is an exact
 notification attempt id, or a message id only when that message has one
