@@ -185,6 +185,9 @@ pub enum EntryKind {
         subject: String,
         pane_id: Option<String>,
         to: Option<String>,
+        /// Exact recipient for a single-delivery ping. Older events carry
+        /// only `to` and remain label-scoped.
+        recipient: Option<RecipientKey>,
         deliveries: Vec<PingDelivery>,
     },
     State {
@@ -323,6 +326,7 @@ fn notify_kind(d: &Value, subject: String) -> EntryKind {
         subject,
         pane_id: opt_str(d, "pane_id"),
         to: opt_str(d, "to"),
+        recipient: recipient_of(d),
         deliveries: ping_deliveries(d),
     }
 }
@@ -1898,10 +1902,12 @@ mod tests {
             }
         ));
 
+        let ping_recipient = endpoint("implementer").recipient();
         let line: LedgerLine = serde_json::from_value(json!({
             "seq": 10, "boot_id": "b", "id": "e-2", "ts": 1000, "kind": "system",
             "from": "cyclopsd", "to": ["admin"], "subject": "quota parked",
-            "data": {"event": "admin_notify", "level": "urgent", "to": "implementer"}
+            "data": {"event": "admin_notify", "level": "urgent", "to": "implementer",
+                     "recipient": ping_recipient}
         }))
         .unwrap();
         let e = Entry::from_ledger(&line).unwrap();
@@ -1916,8 +1922,9 @@ mod tests {
                 level: NotifyLevel::Urgent,
                 pane_id: None,
                 to: Some(to),
+                recipient: Some(got),
                 ..
-            } if to == "implementer"
+            } if to == "implementer" && *got == ping_recipient
         ));
     }
 
@@ -2353,6 +2360,7 @@ mod tests {
                 subject: "a prompt is waiting".into(),
                 pane_id: Some(pane_id.into()),
                 to: None,
+                recipient: None,
                 deliveries: Vec::new(),
             },
         }

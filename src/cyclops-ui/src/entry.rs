@@ -238,6 +238,7 @@ mod tests {
                 subject: "delivery to reviewer needs attention".into(),
                 pane_id: None,
                 to: Some("reviewer".into()),
+                recipient: None,
                 deliveries: Vec::new(),
             },
         };

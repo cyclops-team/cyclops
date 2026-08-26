@@ -584,6 +584,7 @@ mod tests {
                 subject: "delivery to reviewer needs attention".into(),
                 pane_id: None,
                 to: to.map(String::from),
+                recipient: None,
                 deliveries: Vec::new(),
             },
         }

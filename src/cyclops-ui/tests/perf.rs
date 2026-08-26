@@ -32,6 +32,7 @@ fn synthetic(i: u64) -> Entry {
             subject: format!("delivery to agent{} needs attention", i % 7),
             pane_id: None,
             to: Some(format!("agent{}", i % 7)),
+            recipient: None,
             deliveries: Vec::new(),
         },
         0 => EntryKind::Msg {
