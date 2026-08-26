@@ -377,6 +377,8 @@ struct App {
     messages_focused: bool,
     /// Whether a messages.snapshot request is currently in-flight.
     messages_snapshot_in_flight: bool,
+    /// Highest workspace_seq observed from messages.changed events for follow-up refresh.
+    messages_pending_seq: u64,
     /// Async worker for Messages composer sends.
     messages_send_tx: Option<std::sync::mpsc::SyncSender<MessagesSendTask>>,
     /// Async worker for bounded messages snapshot requests.
@@ -995,6 +997,7 @@ pub async fn run_async() -> i32 {
         stream_reconcile_requests: Some(stream_reconcile_tx),
         messages_focused: false,
         messages_snapshot_in_flight: false,
+        messages_pending_seq: 0,
         messages_send_tx: Some(messages_send_tx),
         messages_snapshot_tx: Some(messages_snapshot_tx),
         message_detail_tx: Some(message_detail_tx),
@@ -1684,7 +1687,7 @@ fn subscribe_decoration_once(
                 .get("workspace_seq")
                 .and_then(serde_json::Value::as_u64)
                 .or_else(|| ev.data.get("seq").and_then(serde_json::Value::as_u64))
-                .unwrap_or(0);
+                .unwrap_or(u64::MAX);
             if stream_tx
                 .blocking_send(AppMsg::MessagesChanged { workspace_seq })
                 .is_err()
@@ -2369,9 +2372,10 @@ async fn handle_app_msg(
             arm(debounce);
         }
         AppMsg::MessagesChanged { workspace_seq } => {
+            app.messages_pending_seq = app.messages_pending_seq.max(workspace_seq);
             if app.model.messages_visible
                 && !app.messages_snapshot_in_flight
-                && workspace_seq > app.messages_queue.watermark()
+                && app.messages_pending_seq > app.messages_queue.watermark()
             {
                 if let Some(tx) = &app.messages_snapshot_tx {
                     let _ = tx.try_send(128);
@@ -2430,6 +2434,15 @@ async fn handle_app_msg(
                 watermark: result.watermark,
                 rows,
             });
+            // If an edge arrived while this fetch was in flight, issue exactly one follow-up:
+            if app.model.messages_visible
+                && app.messages_pending_seq > app.messages_queue.watermark()
+            {
+                if let Some(tx) = &app.messages_snapshot_tx {
+                    let _ = tx.try_send(128);
+                    app.messages_snapshot_in_flight = true;
+                }
+            }
             arm(debounce);
         }
         AppMsg::MessageDetailLoaded(detail) => {
@@ -4910,6 +4923,7 @@ mod tests {
             stream_reconcile_requests: None,
             messages_focused: false,
             messages_snapshot_in_flight: false,
+            messages_pending_seq: 0,
             messages_send_tx: None,
             messages_snapshot_tx: None,
             message_detail_tx: None,

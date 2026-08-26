@@ -1397,6 +1397,7 @@ mod tests {
             stream_reconcile_requests: None,
             messages_focused: false,
             messages_snapshot_in_flight: false,
+            messages_pending_seq: 0,
             messages_send_tx: None,
             messages_snapshot_tx: None,
             message_detail_tx: None,
