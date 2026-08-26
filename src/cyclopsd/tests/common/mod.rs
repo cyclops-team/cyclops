@@ -23,6 +23,9 @@ use tokio::net::UnixStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const MAX_CONCURRENT_RIGS: usize = 8;
+// RECONNECT_MIN reaches RECONNECT_MAX after 6.2 seconds. Allow two complete
+// five-second retries after that ladder, then round up for runner scheduling.
+const SESSION_ATTACH_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn rig_slots() -> &'static Arc<Semaphore> {
     static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -940,7 +943,7 @@ impl Rig {
     }
 
     pub async fn wait_attached_session(&mut self, idx: usize, panes: usize) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + SESSION_ATTACH_TIMEOUT;
         loop {
             let resp = self.ctl.request("status", json!({})).await;
             let session = &resp["result"]["sessions"][idx];
