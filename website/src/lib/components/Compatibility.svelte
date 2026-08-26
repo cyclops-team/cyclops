@@ -1,19 +1,18 @@
 <script lang="ts">
 	import SectionHead from './SectionHead.svelte';
-	import AgentMark, { type MarkKind } from './AgentMark.svelte';
+	import AgentMark from './AgentMark.svelte';
 	import { REPO_URL } from '$lib/config';
 
 	const MANIFESTS_URL = `${REPO_URL}/blob/main/docs/reference/MANIFESTS.md`;
 
-	// The four manifests that ship (resources/manifests/*.toml), then the
-	// one you write. Each row is the CLI's command, the way a pane names it,
-	// with the manifest's display name under it.
-	const agents: { kind: MarkKind; cmd: string; name: string }[] = [
-		{ kind: 'claude', cmd: 'claude', name: 'Claude Code' },
-		{ kind: 'codex', cmd: 'codex', name: 'Codex CLI' },
-		{ kind: 'cursor', cmd: 'cursor-agent', name: 'Cursor Agent' },
-		{ kind: 'agy', cmd: 'agy', name: 'Antigravity CLI' },
-		{ kind: 'any', cmd: 'your-agent', name: 'One manifest file' }
+	// The four manifests that ship (resources/manifests/*.toml): each row is
+	// the CLI's command, the way a pane names it, and the manifest's display
+	// name. The fifth agent is the reader's, and it gets the mark.
+	const detected = [
+		{ cmd: 'claude', name: 'Claude Code' },
+		{ cmd: 'codex', name: 'Codex CLI' },
+		{ cmd: 'cursor-agent', name: 'Cursor Agent' },
+		{ cmd: 'agy', name: 'Antigravity CLI' }
 	];
 </script>
 
@@ -28,30 +27,28 @@
 				agents detected out of the box. Teaching Cyclops a new agent CLI is one file.
 			</p>
 		</div>
-		<ul class="marks" aria-label="Agents Cyclops recognises">
-			{#each agents as agent (agent.kind)}
-				{#if agent.kind === 'any'}
-					<!-- The fifth card takes the rest of the row: it is the one that
-					     is about the reader's agent, so it gets the room and the link. -->
-					<li class="mark yours">
-						<AgentMark kind={agent.kind} size={64} />
-						<div class="yours-text">
-							<span class="cmd">{agent.cmd}</span>
-							<span class="name">{agent.name}</span>
-							<a class="more" href={MANIFESTS_URL} target="_blank" rel="noopener noreferrer"
-								>Write a manifest →</a
-							>
-						</div>
-					</li>
-				{:else}
-					<li class="mark">
-						<AgentMark kind={agent.kind} size={64} />
+		<div class="panel card">
+			<ul class="list" aria-label="Agents detected out of the box">
+				<li class="head label">Detected out of the box</li>
+				{#each detected as agent (agent.cmd)}
+					<li class="agent">
+						<span class="marker" aria-hidden="true">✓</span>
 						<span class="cmd">{agent.cmd}</span>
 						<span class="name">{agent.name}</span>
 					</li>
-				{/if}
-			{/each}
-		</ul>
+				{/each}
+			</ul>
+			<div class="yours">
+				<AgentMark size={72} />
+				<div class="yours-text">
+					<span class="cmd">your-agent</span>
+					<span class="name">Any agent you want</span>
+					<a class="more" href={MANIFESTS_URL} target="_blank" rel="noopener noreferrer"
+						>Write a manifest →</a
+					>
+				</div>
+			</div>
+		</div>
 	</div>
 </section>
 
@@ -64,7 +61,7 @@
 	}
 
 	/* One notch under the other sections' statements: it shares the row
-	   with the marks and must not shout over them. */
+	   with the card and must not shout over it. */
 	.statement {
 		font-size: clamp(22px, 2.5vw, 30px);
 		margin-bottom: calc(16px + 0.4em);
@@ -74,55 +71,56 @@
 		margin: 0;
 	}
 
-	.marks {
+	.card {
+		padding: 0;
+	}
+
+	.list {
 		list-style: none;
 		margin: 0;
-		padding: 0;
+		padding: 16px 0 12px;
+	}
+
+	.head {
+		padding: 8px 28px 10px;
+	}
+
+	.agent {
 		display: grid;
-		grid-template-columns: repeat(3, 1fr);
-		gap: 8px;
+		grid-template-columns: 14px 110px minmax(0, 1fr);
+		align-items: baseline;
+		gap: 16px;
+		padding: 7px 28px;
 	}
 
-	.mark {
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		gap: 4px;
-		padding: 22px 12px 18px;
-		border: 1px solid var(--line);
-		background: var(--surface);
-		transition: border-color 0.15s;
+	.marker {
+		font-size: 12px;
+		color: var(--accent);
 	}
 
-	.mark:hover {
-		border-color: var(--accent);
-	}
-
-	.mark :global(canvas) {
-		margin-bottom: 8px;
-	}
-
+	/* The reader's agent: the mark, then the same command-and-name pair as
+	   the rows above it, with the way in. */
 	.yours {
-		grid-column: span 2;
-		flex-direction: row;
-		justify-content: center;
-		gap: 20px;
-		padding: 22px 24px 18px;
+		display: flex;
+		align-items: center;
+		gap: 22px;
+		padding: 22px 28px 24px;
+		border-top: 1px solid var(--line);
 	}
 
 	.yours :global(canvas) {
-		margin-bottom: 0;
+		flex-shrink: 0;
 	}
 
 	.yours-text {
 		display: flex;
 		flex-direction: column;
-		gap: 4px;
+		gap: 3px;
 		min-width: 0;
 	}
 
 	.more {
-		margin-top: 6px;
+		margin-top: 8px;
 		font-size: 12px;
 		color: var(--accent);
 	}
@@ -149,23 +147,13 @@
 		}
 	}
 
-	@media (max-width: 480px) {
-		.marks {
-			grid-template-columns: repeat(2, 1fr);
+	@media (max-width: 400px) {
+		.agent {
+			grid-template-columns: 14px minmax(0, 1fr);
 		}
 
-		.yours {
-			flex-direction: column;
-			gap: 4px;
-			text-align: center;
-		}
-
-		.yours :global(canvas) {
-			margin-bottom: 8px;
-		}
-
-		.yours-text {
-			align-items: center;
+		.agent .name {
+			grid-column: 2;
 		}
 	}
 </style>
