@@ -2365,6 +2365,9 @@ async fn handle_app_msg(
         }
         AppMsg::DecorationChanged(snapshot) => {
             apply_decoration_snapshot(app, snapshot);
+            if app.messages_gate.link() == cyclops_ui::Link::Lost {
+                app.messages_gate.connected();
+            }
             app.messages_gate.mark_dirty();
             pump_messages_refresh(app);
             arm(debounce);
@@ -2390,6 +2393,9 @@ async fn handle_app_msg(
             arm(debounce);
         }
         AppMsg::MessagesChanged(changed) => {
+            if app.messages_gate.link() == cyclops_ui::Link::Lost {
+                app.messages_gate.connected();
+            }
             match changed {
                 Some(data) => {
                     app.messages_gate.messages_changed(&data);
@@ -2445,6 +2451,9 @@ async fn handle_app_msg(
         // arms (the theme_watch refresh in `run_async`).
         AppMsg::ThemeChanged => arm(debounce),
         AppMsg::MessagesSnapshotLoaded { request, result } => {
+            if app.messages_gate.link() != cyclops_ui::Link::Connected {
+                app.messages_gate.connected();
+            }
             let accepted = app.messages_gate.finish_snapshot(request, &result);
             if accepted {
                 let rows = cyclops_ui::messages::rows_from_snapshot(&result);

@@ -257,6 +257,20 @@ pub fn proven_status_short(mailbox: MailboxWord, wake: WakeWord) -> &'static str
     }
 }
 
+/// Human-readable words for attention causes.
+pub fn attention_cause_label(cause: NotificationAttentionCause) -> &'static str {
+    match cause {
+        NotificationAttentionCause::PasteFailed => "paste failed",
+        NotificationAttentionCause::VerifyFailed => "verify failed",
+        NotificationAttentionCause::PaneReboundAfterPaste => "pane rebound after paste",
+        NotificationAttentionCause::SubmitFailed => "submit failed",
+        NotificationAttentionCause::ReceiptOccupantChanged => "receipt occupant changed",
+        NotificationAttentionCause::AckTimeout => "ack timeout",
+        NotificationAttentionCause::DaemonRestart => "daemon restart",
+        NotificationAttentionCause::TransportOutcomeUnknown => "transport outcome unknown",
+    }
+}
+
 /// A recipient delivery fact entry on an aggregated message bubble.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecipientEntry {
@@ -315,7 +329,7 @@ impl TimelineItem {
             let cause_str = row
                 .cause
                 .as_ref()
-                .map(|c| format!("{c:?}"))
+                .map(|c| attention_cause_label(*c).to_string())
                 .or_else(|| row.pre_write_cause.as_ref().map(|c| c.label().to_string()));
 
             let recip_entry = RecipientEntry {
@@ -516,11 +530,11 @@ pub fn render_chat(
                             .count();
                         let behind_count = total_pending.saturating_sub(1);
                         let behind_desc = if behind_count > 0 {
-                            format!(" {behind_count}b")
+                            format!(" · {behind_count} behind")
                         } else {
                             String::new()
                         };
-                        let line3 = format!(" ! [head:held {cause_desc}{behind_desc}]");
+                        let line3 = format!(" ! [head · held: {cause_desc}{behind_desc}]");
                         timeline_lines.push(fit(&line3, width));
                     } else {
                         let line3 = format!(" ! [held: {cause_desc}]");
@@ -1220,8 +1234,8 @@ mod tests {
 
         let joined = lines.join("\n");
         assert!(
-            joined.contains("head · held: VerifyFailed · 2 behind"),
-            "held queue head must render exact VerifyFailed cause and behind count: {joined}"
+            joined.contains("head · held: verify failed · 2 behind"),
+            "held queue head must render exact verify failed cause and behind count: {joined}"
         );
     }
 
@@ -1326,7 +1340,7 @@ mod tests {
 
         let joined = lines.join("\n");
         assert!(
-            joined.contains("held: VerifyFailed"),
+            joined.contains("held: verify failed"),
             "claimed row must show cause: {joined}"
         );
         assert!(
