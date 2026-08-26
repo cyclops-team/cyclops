@@ -70,11 +70,10 @@ pub enum PeerOrigin {
 /// so a peer identified by pid alone can be a different program by the
 /// time a later request on the same connection is answered.
 ///
-/// What this carries beyond the number is a generation: something that
-/// changes when the process behind the pid does. On macOS the kernel
-/// attests it directly, and it is an EXECUTION rather than a process, so a
-/// peer that execs across a live connection stops matching. That is
-/// stronger than a start time, which an exec does not move.
+/// What this carries beyond the number is both a process birth and, where
+/// the kernel provides it, an execution generation. Birth changes on exit
+/// and pid reuse. On macOS the audit token also changes across an exec,
+/// which birth alone cannot detect.
 ///
 /// Deliberately NOT a claim about who wrote any particular byte. A
 /// descriptor can be inherited or passed, so socket credentials identify
@@ -84,24 +83,11 @@ pub enum PeerOrigin {
 pub struct PeerIdentity {
     pub uid: u32,
     pub pid: i32,
-    exec: PeerExec,
-}
-
-/// What tells one execution from another behind the same pid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PeerExec {
-    /// The kernel's own audit token. MEASURED on macOS 26.5: reading
-    /// `LOCAL_PEERTOKEN` returns 32 bytes whose pid, pidversion and euid
-    /// match the connector, the pidversion INCREMENTS across an exec, a
-    /// re-read on the same descriptor reflects the new execution, and
-    /// `proc_pidpath_audittoken` answers ESRCH for a token whose execution
-    /// is gone.
+    birth: u64,
+    /// The audit token's pidversion identifies one execution. Re-reading
+    /// the socket token detects exec without consulting an executable path.
     #[cfg(target_os = "macos")]
-    Token([u32; 8]),
-    /// No attested generation available. The start time is the closest
-    /// stand-in, and it is weaker: an exec keeps it.
-    #[cfg(not(target_os = "macos"))]
-    Birth(u64),
+    exec: [u32; 8],
 }
 
 /// A connection and the peer that opened it.
@@ -137,41 +123,18 @@ impl PeerIdentity {
     /// behind it need not be.
     pub fn still_current(&self, fd: std::os::fd::RawFd) -> bool {
         match peer_identity_fd(fd) {
-            Ok(now) => now == *self && self.alive(),
+            Ok(now) => now == *self && self.matches_process(ProcId::of(self.pid)),
             Err(_) => false,
         }
     }
 
-    #[cfg(target_os = "macos")]
-    fn alive(&self) -> bool {
-        let PeerExec::Token(token) = self.exec;
-        // Proves the EXECUTION is still there, which a re-read of the
-        // socket option cannot: the option answers for whatever holds the
-        // pid now, and this answers for the one that connected.
-        let mut path = [0i8; 4096];
-        let rc = unsafe {
-            proc_pidpath_audittoken(
-                std::ptr::addr_of!(token).cast(),
-                path.as_mut_ptr().cast(),
-                path.len() as u32,
-            )
-        };
-        rc > 0
+    fn matches_process(&self, current: Option<ProcId>) -> bool {
+        current
+            == Some(ProcId {
+                pid: self.pid,
+                birth: self.birth,
+            })
     }
-
-    #[cfg(not(target_os = "macos"))]
-    fn alive(&self) -> bool {
-        matches!(self.exec, PeerExec::Birth(b) if birth_of(self.pid) == Some(b))
-    }
-}
-
-#[cfg(target_os = "macos")]
-extern "C" {
-    fn proc_pidpath_audittoken(
-        token: *const libc::c_void,
-        buffer: *mut libc::c_void,
-        buffersize: u32,
-    ) -> libc::c_int;
 }
 
 /// The peer of a connected Unix socket, identified rather than numbered.
@@ -184,6 +147,29 @@ pub fn peer_identity(stream: &UnixStream) -> std::io::Result<PeerIdentity> {
 /// split into halves can still be asked who is on the other end.
 #[cfg(target_os = "macos")]
 pub fn peer_identity_fd(fd: std::os::fd::RawFd) -> std::io::Result<PeerIdentity> {
+    let token = macos_peer_token(fd)?;
+    let uid = token[1];
+    let pid = token[5] as i32;
+    let (process, process_uid) =
+        proc_facts(pid).ok_or_else(|| std::io::Error::other("peer process unreadable"))?;
+    if process_uid != uid {
+        return Err(std::io::Error::other("peer uid changed during observation"));
+    }
+    if macos_peer_token(fd)? != token || !process.still_live() {
+        return Err(std::io::Error::other(
+            "peer execution changed during observation",
+        ));
+    }
+    Ok(PeerIdentity {
+        uid,
+        pid,
+        birth: process.birth,
+        exec: token,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_peer_token(fd: std::os::fd::RawFd) -> std::io::Result<[u32; 8]> {
     // Spelled locally: libc's coverage of these has historically drifted.
     const SOL_LOCAL: libc::c_int = 0;
     const LOCAL_PEERTOKEN: libc::c_int = 0x006;
@@ -208,11 +194,7 @@ pub fn peer_identity_fd(fd: std::os::fd::RawFd) -> std::io::Result<PeerIdentity>
     // Field positions are libbsm's accessors, MEASURED against
     // audit_token_to_euid, audit_token_to_pid and
     // audit_token_to_pidversion on macOS 26.5.
-    Ok(PeerIdentity {
-        uid: token[1],
-        pid: token[5] as i32,
-        exec: PeerExec::Token(token),
-    })
+    Ok(token)
 }
 
 /// Same, where no attested peer identity is available.
@@ -223,11 +205,7 @@ pub fn peer_identity_fd(fd: std::os::fd::RawFd) -> std::io::Result<PeerIdentity>
 pub fn peer_identity_fd(fd: std::os::fd::RawFd) -> std::io::Result<PeerIdentity> {
     let (uid, pid) = linux_peer_of_fd(fd)?;
     let birth = birth_of(pid).ok_or_else(|| std::io::Error::other("peer process unreadable"))?;
-    Ok(PeerIdentity {
-        uid,
-        pid,
-        exec: PeerExec::Birth(birth),
-    })
+    Ok(PeerIdentity { uid, pid, birth })
 }
 
 /// Unsupported platform: no peer credentials, so a connection cannot become
@@ -988,6 +966,30 @@ mod tests {
             pid,
             birth: pid as u64 * 1000,
         }
+    }
+
+    #[test]
+    fn peer_process_birth_rejects_exit_and_pid_reuse() {
+        let peer = PeerIdentity {
+            uid: 501,
+            pid: 42,
+            birth: 700,
+            #[cfg(target_os = "macos")]
+            exec: [0; 8],
+        };
+
+        assert!(peer.matches_process(Some(ProcId {
+            pid: 42,
+            birth: 700,
+        })));
+        assert!(!peer.matches_process(None), "an exited opener is not live");
+        assert!(
+            !peer.matches_process(Some(ProcId {
+                pid: 42,
+                birth: 701,
+            })),
+            "a reused pid belongs to a different process"
+        );
     }
 
     /// The same synthetic tree, walked as identities. Every process keeps

@@ -1722,3 +1722,19 @@ This evidence is narrow. It measures an occupied prompt and the two trailer
 representations. The 0.149.1 ghost, slash command, working, tool, modal,
 collapsed-chip, hook, restart, resumed-session, claim, and reply cases remain
 unproven. It does not promote the manifest's full-ruleset version claim.
+
+## F69. An unlinked macOS executable is still a live process
+
+OBSERVED 2026-08-26 on macOS during a managed Cyclops update. A workspace
+process kept its daemon socket open after the updater pruned the immutable pair
+directory that had launched it. `LOCAL_PEERTOKEN` and
+`proc_pidinfo(PROC_PIDTBSDINFO)` still identified the same execution and process
+birth, but `proc_pidpath_audittoken` could no longer return an executable path.
+The daemon therefore rejected the live workspace peer as if its process had
+changed.
+
+The regression launches a compiled helper from a scratch executable, captures
+its socket identity, unlinks the executable while the helper remains live, and
+requires the identity to remain current. Separate checks require process exit,
+pid reuse, descriptor inheritance, and an in-place exec to revoke authority.
+Executable path lookup is not an identity or liveness proof.
