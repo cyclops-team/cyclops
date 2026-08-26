@@ -2661,6 +2661,10 @@ mod tests {
                 .await
             {
                 Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => break,
+                // Linux may report one reset while the dropped listener is
+                // still retiring. Keep waiting for the refused state that
+                // `bind_socket` classifies as safe to reclaim.
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
                 Ok(Ok(stream)) => drop(stream),
                 Ok(Err(error)) => panic!("stale socket fixture failed: {error}"),
                 Err(_) => {}
