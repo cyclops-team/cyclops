@@ -1373,6 +1373,7 @@ mod tests {
                 BindingAction::NewTab,
                 BindingAction::NewWorkspace,
                 BindingAction::ToggleEventPanel,
+                BindingAction::ToggleMessages,
                 BindingAction::ToggleTabBar,
                 // The file panel's only switch: its seam can close it, and
                 // a closed panel leaves no seam to reopen with.

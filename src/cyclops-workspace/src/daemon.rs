@@ -202,61 +202,68 @@ pub fn send_message(
 ) -> SendOutcome {
     send_message_request(
         home,
-        vec![to.to_string()],
-        None,
-        None,
-        subject,
-        body,
-        false,
-        None,
-        client_key,
+        MessageRequest {
+            to: vec![to.to_string()],
+            recipient_keys: None,
+            expected_caller: None,
+            subject,
+            body,
+            fyi: false,
+            reply_to: None,
+            client_key,
+        },
     )
+}
+
+/// Exact sender and recipients used by the Messages composer.
+pub struct ExactMessageRequest<'a> {
+    pub recipient_keys: Option<Vec<cyclops_proto::RecipientKey>>,
+    pub expected_caller: cyclops_proto::RecipientKey,
+    pub subject: &'a str,
+    pub body: &'a str,
+    pub fyi: bool,
+    pub reply_to: Option<String>,
+    pub client_key: &'a str,
 }
 
 /// Send from the Messages surface using exact recipients or a reply reference.
-pub fn send_message_full(
-    home: &Path,
-    recipient_keys: Option<Vec<cyclops_proto::RecipientKey>>,
-    expected_caller: cyclops_proto::RecipientKey,
-    subject: &str,
-    body: &str,
-    fyi: bool,
-    reply_to: Option<String>,
-    client_key: &str,
-) -> SendOutcome {
+pub fn send_message_full(home: &Path, request: ExactMessageRequest<'_>) -> SendOutcome {
     send_message_request(
         home,
-        Vec::new(),
-        recipient_keys,
-        Some(expected_caller),
-        subject,
-        body,
-        fyi,
-        reply_to,
-        client_key,
+        MessageRequest {
+            to: Vec::new(),
+            recipient_keys: request.recipient_keys,
+            expected_caller: Some(request.expected_caller),
+            subject: request.subject,
+            body: request.body,
+            fyi: request.fyi,
+            reply_to: request.reply_to,
+            client_key: request.client_key,
+        },
     )
 }
 
-fn send_message_request(
-    home: &Path,
+struct MessageRequest<'a> {
     to: Vec<String>,
     recipient_keys: Option<Vec<cyclops_proto::RecipientKey>>,
     expected_caller: Option<cyclops_proto::RecipientKey>,
-    subject: &str,
-    body: &str,
+    subject: &'a str,
+    body: &'a str,
     fyi: bool,
     reply_to: Option<String>,
-    client_key: &str,
-) -> SendOutcome {
+    client_key: &'a str,
+}
+
+fn send_message_request(home: &Path, request: MessageRequest<'_>) -> SendOutcome {
     let params = match serde_json::to_value(cyclops_proto::MsgSendParams {
-        to,
-        recipient_keys,
-        expected_caller,
-        subject: subject.to_string(),
-        body: body.to_string(),
-        fyi,
-        client_key: Some(client_key.to_string()),
-        reply_to,
+        to: request.to,
+        recipient_keys: request.recipient_keys,
+        expected_caller: request.expected_caller,
+        subject: request.subject.to_string(),
+        body: request.body.to_string(),
+        fyi: request.fyi,
+        client_key: Some(request.client_key.to_string()),
+        reply_to: request.reply_to,
         supersedes: None,
         wait: None,
     }) {

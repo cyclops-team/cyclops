@@ -295,7 +295,7 @@ struct MessageDetailTask {
 impl MessageDetailTask {
     fn request(&self) -> cyclops_ui::ActionRequest {
         debug_assert_eq!(&self.row.target, &self.target.target);
-        match self.target.attempt.clone() {
+        match self.target.attempt {
             Some(attempt_id) => cyclops_ui::ActionRequest::OpenAttention { attempt_id },
             None => cyclops_ui::ActionRequest::OpenMessage {
                 message_id: self.row.message_id.clone(),
@@ -514,9 +514,15 @@ fn arm(debounce: &mut Option<Instant>) {
 }
 
 enum Wake {
-    Message(Option<AppMsg>),
+    Message(Option<Box<AppMsg>>),
     InputCapacity(Result<InputCapacity, TmuxError>),
     Deadline,
+}
+
+impl Wake {
+    fn message(message: Option<AppMsg>) -> Self {
+        Self::Message(message.map(Box::new))
+    }
 }
 
 type InputCapacityFuture =
@@ -688,7 +694,7 @@ async fn next_wake(
         return Wake::Deadline;
     }
     let Some(deadline) = deadline else {
-        return Wake::Message(
+        return Wake::message(
             next_message(
                 input_rx,
                 paste_rx,
@@ -713,7 +719,7 @@ async fn next_wake(
             stream_rx,
             allow_stream,
             fairness,
-        ) => Wake::Message(msg),
+        ) => Wake::message(msg),
         _ = sleep_until(deadline) => Wake::Deadline,
     }
 }
@@ -746,13 +752,13 @@ async fn next_pending_input_wake(
         return tokio::select! {
             biased;
             result = capacity.as_mut() => Wake::InputCapacity(result),
-            message = background => Wake::Message(message),
+            message = background => Wake::message(message),
         };
     };
     tokio::select! {
         biased;
         result = capacity.as_mut() => Wake::InputCapacity(result),
-        message = background => Wake::Message(message),
+        message = background => Wake::message(message),
         _ = sleep_until(deadline) => Wake::Deadline,
     }
 }
@@ -874,13 +880,15 @@ pub async fn run_async() -> i32 {
             let attempt = task.attempt;
             let outcome = crate::daemon::send_message_full(
                 &msg_send_home,
-                attempt.recipient_keys.clone(),
-                attempt.caller,
-                &attempt.subject,
-                &attempt.body,
-                attempt.fyi,
-                attempt.reply_to.clone(),
-                &attempt.client_key,
+                crate::daemon::ExactMessageRequest {
+                    recipient_keys: attempt.recipient_keys.clone(),
+                    expected_caller: attempt.caller,
+                    subject: &attempt.subject,
+                    body: &attempt.body,
+                    fyi: attempt.fyi,
+                    reply_to: attempt.reply_to.clone(),
+                    client_key: &attempt.client_key,
+                },
             );
             if msg_send_results
                 .blocking_send(AppMsg::MessagesSendFinished { attempt, outcome })
@@ -1251,7 +1259,7 @@ pub async fn run_async() -> i32 {
         match wake {
             Wake::Message(msg) => {
                 if !handle_app_msg(
-                    msg,
+                    msg.map(|message| *message),
                     &mut app,
                     &mut client,
                     &mut debounce,
@@ -5555,7 +5563,7 @@ mod tests {
             mode: composer.mode.clone().expect("composer mode"),
             caller: messages_test_caller(),
             recipient_keys: Some(vec![
-                "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1"
+                "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1"
                     .parse()
                     .expect("recipient"),
             ]),
@@ -5569,7 +5577,7 @@ mod tests {
 
     fn direct_composer() -> cyclops_ui::ComposerState {
         let recipient = cyclops_proto::RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1",
         )
         .expect("recipient");
         let mut composer = cyclops_ui::ComposerState::new_direct(recipient, "claudex".into());
@@ -5940,10 +5948,13 @@ mod tests {
                 None,
             )
             .await;
-            match (expected, wake) {
-                ("focus", Wake::Message(Some(AppMsg::Focus(true))))
-                | ("tmux", Wake::Message(Some(AppMsg::Redraw)))
-                | ("stream", Wake::Message(Some(AppMsg::ThemeChanged))) => {}
+            let Wake::Message(Some(message)) = wake else {
+                panic!("pending input returned a non-message wake");
+            };
+            match (expected, *message) {
+                ("focus", AppMsg::Focus(true))
+                | ("tmux", AppMsg::Redraw)
+                | ("stream", AppMsg::ThemeChanged) => {}
                 _ => panic!("pending input drained background lanes out of order"),
             }
         }
@@ -6711,11 +6722,13 @@ mod tests {
             let width = crate::render::clamp_sidebar_width(want, full.width);
             app.prefs.sidebar_width = width;
             let (grid, _) = declared_for(&app);
+            let messages_rail = app.chrome(full).messages_rail.width;
             assert_eq!(
                 i32::from(width)
                     + i32::from(grid)
                     + 2 * i32::from(crate::render::PANE_MARGIN)
-                    + i32::from(gap_w),
+                    + i32::from(gap_w)
+                    + i32::from(messages_rail),
                 i32::from(full.width),
                 "width {width} loses a column somewhere"
             );

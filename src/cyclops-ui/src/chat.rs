@@ -881,11 +881,11 @@ mod tests {
     fn make_test_queue() -> HumanQueue {
         let mut queue = HumanQueue::default();
         let s0 = RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%0",
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%0",
         )
         .unwrap();
         let r1 = RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1",
         )
         .unwrap();
         let m1 = MessageId::parse("m-0000000000000001").unwrap();
@@ -918,7 +918,7 @@ mod tests {
 
         // Broadcast message with 2 recipient rows (claude and codex)
         let r2 = RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%2",
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%2",
         )
         .unwrap();
         let m2 = MessageId::parse("m-0000000000000002").unwrap();
@@ -1005,11 +1005,11 @@ mod tests {
         let mut queue = make_test_queue();
         let message = MessageId::parse("m-0000000000000002").unwrap();
         let claude = RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1",
         )
         .unwrap();
         let codex = RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%2",
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%2",
         )
         .unwrap();
         let registry = AvatarRegistry::default();
@@ -1059,7 +1059,7 @@ mod tests {
     fn thread_labels_never_claim_a_vendor_icon() {
         let mut queue = make_test_queue();
         let recipient = RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1",
         )
         .unwrap();
         let message = MessageId::parse("m-0000000000000001").unwrap();
@@ -1092,11 +1092,11 @@ mod tests {
     #[test]
     fn older_selection_stays_visible_at_narrow_and_wide_sizes() {
         let recipient = RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1",
         )
         .unwrap();
         let sender = RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%0",
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%0",
         )
         .unwrap();
         let mut rows = Vec::new();
@@ -1198,7 +1198,7 @@ mod tests {
     #[test]
     fn reply_composer_binds_durable_id_and_endpoint() {
         let endpoint = RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1",
         )
         .unwrap();
         let message_id = MessageId::parse("m-0000000000000001").unwrap();
@@ -1223,7 +1223,7 @@ mod tests {
     #[test]
     fn uncertain_stage_warns_reconciliation_required_without_enter_retry() {
         let r1 = RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1",
         )
         .unwrap();
         let mut composer = ComposerState::new_announce(vec![(r1, "claude".into())]);
@@ -1273,7 +1273,7 @@ mod tests {
     fn stable_target_selection_under_insertions() {
         let mut queue = make_test_queue();
         let r1 = RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1",
         )
         .unwrap();
         let m1 = MessageId::parse("m-0000000000000001").unwrap();
@@ -1288,7 +1288,7 @@ mod tests {
 
         // Prepend a new row
         let r0 = RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%0",
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%0",
         )
         .unwrap();
         let m0 = MessageId::parse("m-0000000000000000").unwrap();
@@ -1327,7 +1327,7 @@ mod tests {
     #[test]
     fn reply_uses_the_referenced_message_without_a_mutable_selector() {
         let r1 = RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1",
         )
         .unwrap();
         let m1 = MessageId::parse("m-0000000000000001").unwrap();
@@ -1348,11 +1348,11 @@ mod tests {
     #[test]
     fn revalidate_routes_rejects_missing_endpoint_and_never_retargets_by_label() {
         let r1 = RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1",
         )
         .unwrap();
         let r_different_session = RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:99999999-9999-9999-9999-999999999999:%1",
+            "agent:00000000-0000-0000-0000-000000000001/99999999-9999-9999-9999-999999999999/%1",
         )
         .unwrap();
         let mode = ComposerMode::Direct {
@@ -1378,7 +1378,7 @@ mod tests {
     #[test]
     fn stale_connection_recovery_preserves_draft_and_idempotency_key() {
         let r1 = RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1",
         )
         .unwrap();
         let m1 = MessageId::parse("m-0000000000000001").unwrap();
@@ -1407,7 +1407,7 @@ mod tests {
     fn held_queue_head_renders_verify_failed_and_accurate_behind_count() {
         let mut queue = make_test_queue();
         let r1 = RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1",
         )
         .unwrap();
         let m1 = MessageId::parse("m-0000000000000001").unwrap();
@@ -1486,7 +1486,7 @@ mod tests {
     fn pre_write_held_head_renders_cause() {
         let mut queue = make_test_queue();
         let r1 = RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1",
         )
         .unwrap();
         let m1 = MessageId::parse("m-0000000000000001").unwrap();
@@ -1529,7 +1529,7 @@ mod tests {
     fn claimed_or_non_head_attention_row_does_not_label_head() {
         let mut queue = make_test_queue();
         let r1 = RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1",
         )
         .unwrap();
         let m1 = MessageId::parse("m-0000000000000001").unwrap();

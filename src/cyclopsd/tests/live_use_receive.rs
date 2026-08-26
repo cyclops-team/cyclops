@@ -34,6 +34,17 @@ state = "idle"
 priority = 100
 region = "pane_title"
 regex = ['^']
+
+# The foreground watch is the fact under test. The fixture must still provide
+# the positive composer evidence every terminal write requires, or a missing
+# composer contract blocks the attempt for an unrelated reason.
+[[rule]]
+id = "composer_empty"
+state = "idle"
+composer_semantic = "clean"
+priority = 90
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^❯\s*$']
 "#;
 
 struct CommandFifo(File);

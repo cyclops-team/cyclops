@@ -296,12 +296,13 @@ pub struct QueueRow {
 impl Default for QueueRow {
     fn default() -> Self {
         let recipient =
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1"
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1"
                 .parse()
                 .unwrap();
-        let sender = "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%0"
-            .parse()
-            .unwrap();
+        let sender =
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%0"
+                .parse()
+                .unwrap();
         let message_id = MessageId::new("m-0000000000000001").unwrap();
         Self {
             target: QueueTarget::new(message_id.clone(), recipient),

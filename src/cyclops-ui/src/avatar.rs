@@ -43,16 +43,21 @@ impl Avatar {
     /// Derive a fallback avatar from an arbitrary label without vendor guessing.
     pub fn from_label(label: &str) -> Self {
         let trimmed = label.trim();
-        let initials = if trimmed.is_empty() {
-            "?".to_string()
-        } else {
-            let mut chars = trimmed.chars().filter(|c| c.is_alphanumeric());
-            let first = chars.next().unwrap_or('?').to_ascii_uppercase();
-            let second = chars.next().map(|c| c.to_ascii_uppercase());
-            match second {
-                Some(s) => format!("{first}{s}"),
-                None => format!("{first}"),
+        let mut words = trimmed
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|word| !word.is_empty());
+        let initials = match (words.next(), words.next()) {
+            (None, _) => "?".to_string(),
+            (Some(first), Some(second)) => {
+                let first = first.chars().next().unwrap_or('?').to_ascii_uppercase();
+                let second = second.chars().next().unwrap_or('?').to_ascii_uppercase();
+                format!("{first}{second}")
             }
+            (Some(word), None) => word
+                .chars()
+                .take(2)
+                .map(|character| character.to_ascii_uppercase())
+                .collect(),
         };
         Self {
             initials,
@@ -223,11 +228,11 @@ mod tests {
     fn vendor_icon_requires_exact_live_route_and_manifest() {
         let reg = AvatarRegistry::default();
         let endpoint = cyclops_proto::RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1",
         )
         .unwrap();
         let replacement = cyclops_proto::RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:99999999-9999-9999-9999-999999999999:%1",
+            "agent:00000000-0000-0000-0000-000000000001/99999999-9999-9999-9999-999999999999/%1",
         )
         .unwrap();
         let manifests = HashMap::from([("%1".to_string(), "claude".to_string())]);
