@@ -9,6 +9,7 @@ use cyclops_proto::{Kind, MessageId, NotificationAttentionCause, RecipientKey};
 
 use crate::avatar::{Avatar, AvatarRegistry};
 use crate::detail::{Detail, Draft, Stage, ThreadEntry};
+#[cfg(test)]
 use crate::grid::display_width;
 use crate::queue::{fit, HumanQueue, MailboxWord, QueueRow, QueueTarget, WakeWord};
 
@@ -227,6 +228,7 @@ pub fn proven_status_label(mailbox: MailboxWord, wake: WakeWord) -> &'static str
         (_, WakeWord::ResolutionIncomplete) => "Resolution open",
         (_, WakeWord::Withdrawn) => "Withdrawn",
         (_, WakeWord::WithdrawnByOperator) => "Wake withdrawn",
+        (_, WakeWord::Superseded) => "Superseded",
         (MailboxWord::Claimed, _) => "Claimed",
         (_, WakeWord::Queued) => "Wake queued",
         (_, WakeWord::Gating) => "Wake gating",
@@ -240,7 +242,7 @@ pub fn proven_status_label(mailbox: MailboxWord, wake: WakeWord) -> &'static str
         (MailboxWord::Pending, WakeWord::NotStarted) => "Accepted (wake not started)",
         (MailboxWord::Pending, _) => "Accepted (pending)",
         (MailboxWord::DeliveredDirect, _) => "Delivered direct",
-        (MailboxWord::Superseded, _) | (_, WakeWord::Superseded) => "Superseded",
+        (MailboxWord::Superseded, _) => "Superseded",
     }
 }
 
@@ -253,6 +255,8 @@ pub fn proven_status_short(mailbox: MailboxWord, wake: WakeWord) -> &'static str
         (_, WakeWord::BlockedBeforeWrite) => "!block",
         (_, WakeWord::ResolutionIncomplete) => "!incomp",
         (_, WakeWord::Withdrawn | WakeWord::WithdrawnByOperator) => "=wdrn",
+        (_, WakeWord::Superseded) => "-sprsd",
+        (_, WakeWord::Cleared | WakeWord::ResolvedDiscarded) => "xclear",
         (MailboxWord::Claimed, _) => "=claim",
         (_, WakeWord::Queued | WakeWord::Gating | WakeWord::Writing | WakeWord::Staged) => {
             ".wake-pend"
@@ -261,8 +265,7 @@ pub fn proven_status_short(mailbox: MailboxWord, wake: WakeWord) -> &'static str
         (_, WakeWord::NotStarted) => "*acc-nostart",
         (MailboxWord::Pending, _) => "*acc-pend",
         (MailboxWord::DeliveredDirect, _) => "=dir",
-        (MailboxWord::Superseded, _) | (_, WakeWord::Superseded) => "-sprsd",
-        (_, WakeWord::Cleared | WakeWord::ResolvedDiscarded) => "xclear",
+        (MailboxWord::Superseded, _) => "-sprsd",
     }
 }
 

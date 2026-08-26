@@ -120,7 +120,11 @@ impl AvatarRegistry {
         let is_live_route = live_routes
             .is_some_and(|routes| routes.iter().any(|route| &route.recipient == endpoint));
         let manifest = if is_live_route {
-            pane_manifests.and_then(|manifests| manifests.get(endpoint.pane_id()))
+            pane_manifests.and_then(|manifests| {
+                endpoint
+                    .pane_id()
+                    .and_then(|pane| manifests.get(&pane.to_string()))
+            })
         } else {
             None
         };

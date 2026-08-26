@@ -295,15 +295,14 @@ pub struct QueueRow {
 
 impl Default for QueueRow {
     fn default() -> Self {
-        let recipient = RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
-        )
-        .unwrap();
-        let sender = RecipientKey::parse(
-            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%0",
-        )
-        .unwrap();
-        let message_id = MessageId::parse("m-0000000000000001").unwrap();
+        let recipient =
+            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1"
+                .parse()
+                .unwrap();
+        let sender = "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%0"
+            .parse()
+            .unwrap();
+        let message_id = MessageId::new("m-0000000000000001").unwrap();
         Self {
             target: QueueTarget::new(message_id.clone(), recipient),
             message_id: message_id.clone(),
@@ -324,6 +323,7 @@ impl Default for QueueRow {
             pre_write_cause: None,
             pre_write_pane_width: None,
             pre_write_required_pane_width: None,
+            wake_block: None,
             current_route: None,
             fifo_position: None,
             needs_action: false,
