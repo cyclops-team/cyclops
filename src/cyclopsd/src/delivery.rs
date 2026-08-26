@@ -4991,7 +4991,7 @@ fn composer_semantic_observation(
         pane_root: Some(process_instance_id(binding.pane_root)?),
         selected_manifest: Some(NotificationManifestId::new(&binding.manifest).ok()?),
         binding: Some(notification_binding(notification.recipient(), &binding)?),
-        pane_width: Some(row.width),
+        pane_width: None,
         required_pane_width: None,
     })
 }

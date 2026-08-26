@@ -580,6 +580,11 @@ pub struct MsgSendParams {
     /// labels so a rename cannot retarget a message between selection and send.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipient_keys: Option<Vec<crate::identity::RecipientKey>>,
+    /// Authenticated sender observed by an interactive client before send.
+    /// The daemon refuses when the current socket caller differs, so a stale
+    /// UI cannot silently send under another mailbox identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_caller: Option<crate::identity::RecipientKey>,
     pub subject: String,
     #[serde(default)]
     pub body: String,
@@ -1930,6 +1935,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(exact.recipient_keys, Some(vec![recipient]));
+        assert!(exact.expected_caller.is_none());
 
         let legacy: MsgSendParams = serde_json::from_value(serde_json::json!({
             "to": ["reviewer"],

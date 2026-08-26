@@ -88,6 +88,7 @@ fn row(i: u64) -> QueueRow {
         } else {
             Direction::Inbound
         },
+        ..Default::default()
     }
 }
 

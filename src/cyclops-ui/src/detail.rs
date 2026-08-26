@@ -786,13 +786,17 @@ impl Detail {
 
     /// The sentence an operator says yes to. Names the exact target.
     pub fn confirmation(&self, action: Action) -> String {
+        let recipient = format!(
+            "{} ({})",
+            self.target.target.recipient, self.recipient_label
+        );
         if self.reconciliation_action() == Some(action) {
             let attempt = self
                 .target
                 .attempt
                 .expect("a reconciliation action requires one exact attempt");
             return format!(
-                "{} for {} at seq {}; no second key will be sent. y to confirm, esc to cancel",
+                "{} for {recipient} using {} at seq {}; no second key will be sent. y to confirm, esc to cancel",
                 self.action_word(action),
                 attempt,
                 self.target.watermark
@@ -807,10 +811,9 @@ impl Detail {
         let what = match (self.target.attempt, action) {
             (Some(attempt), Action::WithdrawNotification) => {
                 return format!(
-                    "{} {} for {} at seq {}? y to confirm, esc to cancel",
+                    "{} {} for {recipient} at seq {}? y to confirm, esc to cancel",
                     action.word(),
                     attempt,
-                    self.target.target.recipient,
                     self.target.watermark
                 );
             }
@@ -820,7 +823,7 @@ impl Detail {
             _ => self.target.target.id(),
         };
         format!(
-            "{} {} at seq {}? y to confirm, esc to cancel",
+            "{} {} for {recipient} at seq {}? y to confirm, esc to cancel",
             self.action_word(action),
             what,
             self.target.watermark
@@ -945,7 +948,7 @@ pub fn render(detail: &Detail, width: usize, height: usize) -> Vec<String> {
     render_with_status(detail, width, height, None)
 }
 
-pub(crate) fn render_with_status(
+pub fn render_with_status(
     detail: &Detail,
     width: usize,
     height: usize,

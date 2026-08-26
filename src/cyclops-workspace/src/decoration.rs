@@ -38,6 +38,8 @@ pub struct PrimaryStatus {
 #[derive(Debug, Clone, Default)]
 pub struct DecorationSnapshot {
     pub panes: HashMap<String, PaneDecoration>,
+    /// Live display routes for durable mailboxes from the daemon.
+    pub mailbox_routes: Vec<cyclops_proto::StatusMailboxRoute>,
     /// The daemon's attention register.
     ///
     /// Nothing in the workspace reads it any more. Its per-pane half is
@@ -243,6 +245,7 @@ fn snapshot_from_status(status: &StatusResult) -> DecorationSnapshot {
         online: true,
         panes,
         attention,
+        mailbox_routes: status.mailbox_routes.clone(),
     }
 }
 

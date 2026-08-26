@@ -140,11 +140,43 @@ fn read_bounded_line(reader: &mut impl BufRead, context: &str) -> Result<Vec<u8>
     }
 }
 
+/// A daemon refusal with its stable machine-readable code intact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DaemonRefusal {
+    pub code: String,
+    pub message: String,
+    pub data: Option<Value>,
+}
+
+impl From<cyclops_proto::WireError> for DaemonRefusal {
+    fn from(error: cyclops_proto::WireError) -> Self {
+        Self {
+            code: error.code,
+            message: error.message,
+            data: error.data,
+        }
+    }
+}
+
+impl DaemonRefusal {
+    #[cfg(test)]
+    pub(crate) fn new(code: &str, message: &str) -> Self {
+        Self {
+            code: code.to_string(),
+            message: message.to_string(),
+            data: None,
+        }
+    }
+}
+
 /// Result of a composer send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SendOutcome {
     Accepted(String),
-    Rejected(String),
+    /// The request did not reach the daemon.
+    NotSent(String),
+    /// The daemon answered no. The code is kept for state-specific recovery.
+    Rejected(DaemonRefusal),
     /// The request write began, but no trustworthy response arrived.
     Unknown(String),
 }
@@ -168,25 +200,74 @@ pub fn send_message(
     body: &str,
     client_key: &str,
 ) -> SendOutcome {
+    send_message_request(
+        home,
+        vec![to.to_string()],
+        None,
+        None,
+        subject,
+        body,
+        false,
+        None,
+        client_key,
+    )
+}
+
+/// Send from the Messages surface using exact recipients or a reply reference.
+pub fn send_message_full(
+    home: &Path,
+    recipient_keys: Option<Vec<cyclops_proto::RecipientKey>>,
+    expected_caller: cyclops_proto::RecipientKey,
+    subject: &str,
+    body: &str,
+    fyi: bool,
+    reply_to: Option<String>,
+    client_key: &str,
+) -> SendOutcome {
+    send_message_request(
+        home,
+        Vec::new(),
+        recipient_keys,
+        Some(expected_caller),
+        subject,
+        body,
+        fyi,
+        reply_to,
+        client_key,
+    )
+}
+
+fn send_message_request(
+    home: &Path,
+    to: Vec<String>,
+    recipient_keys: Option<Vec<cyclops_proto::RecipientKey>>,
+    expected_caller: Option<cyclops_proto::RecipientKey>,
+    subject: &str,
+    body: &str,
+    fyi: bool,
+    reply_to: Option<String>,
+    client_key: &str,
+) -> SendOutcome {
     let params = match serde_json::to_value(cyclops_proto::MsgSendParams {
-        to: vec![to.to_string()],
-        recipient_keys: None,
+        to,
+        recipient_keys,
+        expected_caller,
         subject: subject.to_string(),
         body: body.to_string(),
-        fyi: false,
+        fyi,
         client_key: Some(client_key.to_string()),
-        reply_to: None,
+        reply_to,
         supersedes: None,
         wait: None,
     }) {
         Ok(params) => params,
         Err(error) => {
-            return SendOutcome::Rejected(format!("cannot encode the message: {error}"));
+            return SendOutcome::NotSent(format!("cannot encode the message: {error}"));
         }
     };
     let mut reader = match connect_with(home, SEND_TIMEOUT) {
         Ok(reader) => reader,
-        Err(error) => return SendOutcome::Rejected(error),
+        Err(error) => return SendOutcome::NotSent(error),
     };
     if let Err(error) = write_request(reader.get_mut(), "msg.send", params) {
         return SendOutcome::Unknown(error);
@@ -209,7 +290,7 @@ pub fn send_message(
         );
     }
     if let Some(error) = response.error {
-        return SendOutcome::Rejected(error.message);
+        return SendOutcome::Rejected(error.into());
     }
     let Some(value) = response.result else {
         return SendOutcome::Unknown("cyclopsd omitted the msg.send result".to_string());
@@ -239,6 +320,38 @@ fn receipt_line(result: &cyclops_proto::MsgSendResult) -> String {
         ),
         None => format!("{} · on the record", result.msg_id),
     }
+}
+
+/// Fetch a bounded snapshot of recent messages for the Messages TUI.
+pub fn fetch_messages_snapshot(
+    home: &Path,
+    limit: usize,
+) -> Result<cyclops_proto::MessagesSnapshotResult, String> {
+    let params = serde_json::to_value(cyclops_proto::MessagesSnapshotParams {
+        limit: Some(limit as u64),
+        before: None,
+        after: None,
+        scope: None,
+    })
+    .map_err(|e| format!("cannot encode messages.snapshot params: {e}"))?;
+    let value = request(home, "messages.snapshot", params)?;
+    serde_json::from_value(value)
+        .map_err(|e| format!("cannot decode messages.snapshot result: {e}"))
+}
+
+/// Claim a message in the durable inbox to authorize body and thread inspection.
+pub fn fetch_message_claim(
+    home: &Path,
+    message_id: &cyclops_proto::MessageId,
+    recipient: &cyclops_proto::RecipientKey,
+) -> Result<cyclops_proto::ClaimResult, String> {
+    let params = serde_json::to_value(cyclops_proto::InboxClaimParams {
+        message_id: message_id.clone(),
+        recipient: Some(recipient.clone()),
+    })
+    .map_err(|e| format!("cannot encode inbox.claim params: {e}"))?;
+    let value = request(home, "inbox.claim", params)?;
+    serde_json::from_value(value).map_err(|e| format!("cannot decode inbox.claim result: {e}"))
 }
 
 /// Current daemon status. Callers pass the shared protocol params so the
@@ -463,7 +576,7 @@ mod tests {
         let outcome = send_message(&home, "missing", "hello", "hello", "workspace-rejected-key");
         assert_eq!(
             outcome,
-            SendOutcome::Rejected("no such recipient".to_string())
+            SendOutcome::Rejected(DaemonRefusal::new("unknown_recipient", "no such recipient"))
         );
         server.join().expect("server");
         let _ = std::fs::remove_dir_all(home);

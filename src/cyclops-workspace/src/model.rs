@@ -102,6 +102,8 @@ pub struct WorkspaceModel {
     pub session: SessionModel,
     /// Sidebar expanded (render state; persisted in step 13).
     pub sidebar_visible: bool,
+    /// Messages drawer expanded on the right edge.
+    pub messages_visible: bool,
 }
 
 impl WorkspaceModel {

@@ -70,6 +70,9 @@ impl SidebarTab {
 pub struct WorkspacePrefs {
     pub sidebar_visible: bool,
     pub sidebar_width: u16,
+    /// Messages drawer visibility on the right edge.
+    pub messages_visible: bool,
+    pub messages_width: u16,
     /// The sidebar tab last selected, restored on reopen like visibility
     /// and width.
     pub sidebar_tab: SidebarTab,
@@ -118,6 +121,8 @@ impl Default for WorkspacePrefs {
             // can drag well below this — so a fresh config should not
             // start pinned to the minimum just because it once matched it.
             sidebar_width: crate::render::SIDEBAR_DEFAULT_WIDTH,
+            messages_visible: false,
+            messages_width: crate::render::MESSAGES_DEFAULT_WIDTH,
             sidebar_tab: SidebarTab::default(),
             // Eight rows: a folder name, a way out, and six entries. Enough
             // to be a file tree on the 24-row terminal that is the floor,
@@ -177,6 +182,16 @@ pub fn load_prefs(home: &Path) -> WorkspacePrefs {
         .and_then(|v| u16::try_from(v).ok())
     {
         prefs.sidebar_width = v;
+    }
+    if let Some(v) = workspace.get("messages_visible").and_then(|v| v.as_bool()) {
+        prefs.messages_visible = v;
+    }
+    if let Some(v) = workspace
+        .get("messages_width")
+        .and_then(|v| v.as_integer())
+        .and_then(|v| u16::try_from(v).ok())
+    {
+        prefs.messages_width = v;
     }
     if let Some(v) = workspace
         .get("files_rows")
@@ -272,6 +287,14 @@ pub fn save_prefs(home: &Path, prefs: &WorkspacePrefs) -> std::io::Result<()> {
     workspace.insert(
         "sidebar_width".into(),
         toml::Value::Integer(prefs.sidebar_width as i64),
+    );
+    workspace.insert(
+        "messages_visible".into(),
+        toml::Value::Boolean(prefs.messages_visible),
+    );
+    workspace.insert(
+        "messages_width".into(),
+        toml::Value::Integer(prefs.messages_width as i64),
     );
     workspace.insert(
         "files_rows".into(),

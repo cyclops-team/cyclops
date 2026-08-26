@@ -245,6 +245,21 @@ pub(super) async fn execute(
             app.model.sidebar_visible = !app.model.sidebar_visible;
             Ok(commit_sidebar_visibility(app, client).await)
         }
+        Action::ToggleMessages => {
+            app.model.messages_visible = !app.model.messages_visible;
+            app.prefs.messages_visible = app.model.messages_visible;
+            if app.model.messages_visible {
+                app.messages_focused = true;
+                super::request_messages_snapshot(app);
+            } else {
+                app.messages_focused = false;
+            }
+            super::resize_client(app, client).await;
+            Ok(Outcome {
+                persist: true,
+                ..Outcome::default()
+            })
+        }
         Action::ToggleTabBar => {
             // The strip's row moves between chrome and the declared grid
             // whole, so every flip re-declares the client size exactly the
@@ -1251,14 +1266,14 @@ fn send_message(app: &mut App, to: String, subject: String, body: String) {
             super::finish_compose_send(
                 app.dialog.as_mut(),
                 attempt,
-                daemon::SendOutcome::Rejected("another send is still in progress".into()),
+                daemon::SendOutcome::NotSent("another send is still in progress".into()),
             );
         }
         Err(std::sync::mpsc::TrySendError::Disconnected(attempt)) => {
             super::finish_compose_send(
                 app.dialog.as_mut(),
                 attempt,
-                daemon::SendOutcome::Rejected("the send worker stopped".into()),
+                daemon::SendOutcome::NotSent("the send worker stopped".into()),
             );
         }
     }
@@ -1316,6 +1331,7 @@ mod tests {
                 active_tab: 0,
             },
             sidebar_visible: true,
+            messages_visible: false,
         }
     }
 
@@ -1357,6 +1373,10 @@ mod tests {
             watched_sessions: HashSet::new(),
             sidebar_tab: SidebarTab::default(),
             record: cyclops_ui::Record::new(),
+            messages_queue: cyclops_ui::HumanQueue::default(),
+            messages_detail: None,
+            messages_composer: cyclops_ui::ComposerState::default(),
+            avatar_registry: cyclops_ui::AvatarRegistry::default(),
             intake: cyclops_ui::Intake::new(),
             stream_reconciling: false,
             cursor_style: None,
@@ -1370,6 +1390,15 @@ mod tests {
             folder_probe_at: None,
             send_requests: None,
             stream_reconcile_requests: None,
+            messages_focused: false,
+            messages_gate: cyclops_ui::RefreshGate::new(),
+            messages_send_tx: None,
+            messages_composer_revision: 0,
+            messages_send_in_flight: None,
+            messages_snapshot_tx: None,
+            message_detail_tx: None,
+            message_detail_in_flight: None,
+            messages_reconcile_owed: None,
         }
     }
 
@@ -2223,6 +2252,55 @@ mod tests {
         assert_ne!(
             reopened, collapsed,
             "the canvas has to give the sidebar's columns back"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn toggle_messages_persists_visibility_and_redecares_client_size() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-toggle-messages");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        let pane = pane_ids(&server, "s")[0].clone();
+        let client = rig_client(&server, "s").await;
+        let home = scratch_home("exec-toggle-messages-home");
+        let mut app = test_app(one_tab_model("s", "@0", &pane, "$0"), home.clone());
+        assert!(!app.model.messages_visible, "the default is collapsed");
+
+        let outcome = execute(&mut app, &client, Action::ToggleMessages)
+            .await
+            .expect("open messages drawer");
+        assert!(outcome.persist, "the new visibility belongs on disk");
+        assert!(app.model.messages_visible);
+        assert!(app.prefs.messages_visible, "prefs mirror the model");
+        let opened = app
+            .declared_client_size
+            .expect("opening messages drawer re-declares the client size");
+
+        crate::persist::save_prefs(&home, &app.prefs).expect("save prefs");
+        assert!(
+            crate::persist::load_prefs(&home).messages_visible,
+            "a workspace quit with messages open must reopen with messages open"
+        );
+
+        let outcome = execute(&mut app, &client, Action::ToggleMessages)
+            .await
+            .expect("collapse messages drawer");
+        assert!(outcome.persist);
+        assert!(!app.model.messages_visible);
+        assert!(!app.prefs.messages_visible);
+        let collapsed = app
+            .declared_client_size
+            .expect("collapsing messages drawer re-declares the client size");
+        assert_ne!(
+            opened, collapsed,
+            "the canvas must resize when messages drawer collapses"
         );
 
         let _ = std::fs::remove_dir_all(&home);

@@ -219,6 +219,22 @@ pub struct QueueRow {
     pub recipient: RecipientKey,
     /// Current display chrome. A rename changes this and nothing else.
     pub recipient_label: String,
+    /// Durable sender identity from wire snapshot.
+    pub sender: RecipientKey,
+    /// Durable sender display label from wire snapshot.
+    pub sender_label: String,
+    /// Explicit reply-to message ID if present.
+    pub reply_to: Option<MessageId>,
+    /// Thread root message ID.
+    pub thread_root: MessageId,
+    /// Thread total message count.
+    pub thread_message_count: u64,
+    /// Message timestamp in Unix ms.
+    pub ts: u64,
+    /// Wire message kind (Msg, Fyi).
+    pub kind: cyclops_proto::Kind,
+    /// Total number of recipients for this message.
+    pub recipient_count: usize,
     pub subject: Option<String>,
     pub mailbox: MailboxWord,
     pub wake: WakeWord,
@@ -275,6 +291,53 @@ pub struct QueueRow {
     pub seq: u64,
     pub updated_at: u64,
     pub direction: Direction,
+}
+
+impl Default for QueueRow {
+    fn default() -> Self {
+        let recipient = RecipientKey::parse(
+            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+        )
+        .unwrap();
+        let sender = RecipientKey::parse(
+            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%0",
+        )
+        .unwrap();
+        let message_id = MessageId::parse("m-0000000000000001").unwrap();
+        Self {
+            target: QueueTarget::new(message_id.clone(), recipient),
+            message_id: message_id.clone(),
+            recipient,
+            recipient_label: "operator".into(),
+            sender,
+            sender_label: "sender".into(),
+            reply_to: None,
+            thread_root: message_id,
+            thread_message_count: 1,
+            ts: 0,
+            kind: cyclops_proto::Kind::Msg,
+            recipient_count: 1,
+            subject: None,
+            mailbox: MailboxWord::Pending,
+            wake: WakeWord::NotStarted,
+            cause: None,
+            pre_write_cause: None,
+            pre_write_pane_width: None,
+            pre_write_required_pane_width: None,
+            current_route: None,
+            fifo_position: None,
+            needs_action: false,
+            attention: None,
+            resolution_intent: None,
+            resolution_action_accepted: None,
+            resolution_consumption_observed: None,
+            can_manage_attention: false,
+            can_withdraw_notification: false,
+            seq: 0,
+            updated_at: 0,
+            direction: Direction::Inbound,
+        }
+    }
 }
 
 impl QueueRow {
@@ -700,7 +763,7 @@ pub fn render(queue: &HumanQueue, width: usize, height: usize) -> Vec<String> {
     render_with_status(queue, width, height, None)
 }
 
-pub(crate) fn render_with_status(
+pub fn render_with_status(
     queue: &HumanQueue,
     width: usize,
     height: usize,

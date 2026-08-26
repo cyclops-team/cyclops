@@ -44,6 +44,8 @@
 
 pub mod action_io;
 mod app;
+pub mod avatar;
+pub mod chat;
 mod data;
 pub mod detail;
 mod entry;
@@ -61,10 +63,12 @@ mod wire;
 
 pub use action_io::{perform, ActionOutcome, ActionRequest, RequestKind, RequestToken};
 pub use app::{App, Command, Density, RosterRow, RowTarget, View};
+pub use avatar::{Avatar, AvatarRegistry};
+pub use chat::{render_chat, ComposerMode, ComposerState, TimelineItem};
 pub use cyclops_proto::{Attention, AttentionItem, Eye, PaneSnapshot};
 pub use data::{read_backfill, read_backfill_report, BackfillReport, UiMsg};
 pub use detail::{Action, Back, Check, Detail, Draft, Loaded, Request, Stage, ThreadEntry};
-pub use frame::build;
+pub use frame::{build, messages_help};
 pub use health::BuildHealth;
 pub use input::Key;
 pub use messages::{

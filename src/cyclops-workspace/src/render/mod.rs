@@ -62,8 +62,9 @@ pub use canvas::{
 pub use canvas::{PANE_GAPS, PANE_MARGIN};
 pub use overlay::{clamp_dialog_offset, keybind_max_scroll, paint_dialog, paint_menu, MenuChecks};
 pub use sidebar::{
-    paint_sidebar, paint_sidebar_rail, paint_sidebar_resize_feedback, sidebar_body_bottom,
-    SIDEBAR_COLLAPSE, SIDEBAR_EXPAND,
+    paint_messages, paint_messages_rail, paint_messages_resize_feedback, paint_sidebar,
+    paint_sidebar_rail, paint_sidebar_resize_feedback, sidebar_body_bottom, MESSAGES_COLLAPSE,
+    MESSAGES_EXPAND, SIDEBAR_COLLAPSE, SIDEBAR_EXPAND,
 };
 pub use stream::{event_stream_rows, EventRow};
 pub use tab_bar::paint_tab_bar;
@@ -97,32 +98,36 @@ const SIDEBAR_MAX_WIDTH: u16 = 42;
 /// every column the panel gave up except this one.
 pub(crate) const SIDEBAR_RAIL_WIDTH: u16 = 1;
 
+/// Geometry constants for the mirrored right-edge messages drawer.
+pub(crate) const MESSAGES_MIN_WIDTH: u16 = 14;
+pub(crate) const MESSAGES_DEFAULT_WIDTH: u16 = 24;
+pub(crate) const MESSAGES_MAX_WIDTH: u16 = 42;
+pub(crate) const MESSAGES_RAIL_WIDTH: u16 = 1;
+
 /// Chrome rectangles for one frame. `sidebar` and `rail` are mutually
-/// exclusive: the panel is open, or its one-column rail stands in its
-/// place.
+/// exclusive on the left edge; `messages` and `messages_rail` are mutually
+/// exclusive on the right edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChromeAreas {
     pub sidebar: Option<Rect>,
     pub rail: Option<Rect>,
     pub tab_bar: Rect,
     pub canvas: Rect,
+    pub messages: Option<Rect>,
+    pub messages_rail: Option<Rect>,
 }
 
-/// Split one frame into the sidebar (or its rail), tab bar, and pane
-/// canvas: the top-level chrome composition every painted surface below
-/// sits inside. `app` decides visibility and width; this only turns those
-/// decisions into rectangles. The sidebar is the one side panel: its
-/// Stream tab hosts what used to be a separate right-hand event panel.
-///
-/// Both visibility flags are the operator's own persisted choices, and
-/// every caller must read them from the same snapshot it sizes the canvas
-/// with, or the painted grid disagrees with the tmux-declared size (the
-/// bug class of 626ec09: panels painted for the wrong terminal).
+/// Split one frame into the sidebar (or its rail), right messages drawer (or
+/// its rail), tab bar, and pane canvas: the top-level chrome composition
+/// every painted surface below sits inside. `app` decides visibility and width;
+/// this only turns those decisions into rectangles.
 pub fn chrome_areas_for(
     area: Rect,
     sidebar_visible: bool,
     sidebar_width: u16,
     tab_bar_visible: bool,
+    messages_visible: bool,
+    messages_width: u16,
 ) -> ChromeAreas {
     let mut main = area;
     let sidebar = if sidebar_visible && main.width > 4 {
@@ -149,6 +154,31 @@ pub fn chrome_areas_for(
     } else {
         None
     };
+    let messages = if messages_visible && main.width > 4 {
+        let w = clamp_messages_width(messages_width, main.width);
+        let m = Rect::new(main.x + main.width - w, main.y, w, main.height);
+        main = Rect::new(main.x, main.y, main.width - w, main.height);
+        Some(m)
+    } else {
+        None
+    };
+    let messages_rail = if !messages_visible && main.width > MESSAGES_RAIL_WIDTH {
+        let r = Rect::new(
+            main.x + main.width - MESSAGES_RAIL_WIDTH,
+            main.y,
+            MESSAGES_RAIL_WIDTH,
+            main.height,
+        );
+        main = Rect::new(
+            main.x,
+            main.y,
+            main.width - MESSAGES_RAIL_WIDTH,
+            main.height,
+        );
+        Some(r)
+    } else {
+        None
+    };
     let bar_h = if tab_bar_visible {
         TAB_BAR_HEIGHT.min(main.height)
     } else {
@@ -166,6 +196,8 @@ pub fn chrome_areas_for(
         rail,
         tab_bar,
         canvas,
+        messages,
+        messages_rail,
     }
 }
 
@@ -177,20 +209,25 @@ pub fn clamp_sidebar_width(requested: u16, terminal_width: u16) -> u16 {
     requested.clamp(min, max)
 }
 
+/// Bound a requested messages drawer width to what stays readable without
+/// eating more than half the terminal.
+pub fn clamp_messages_width(requested: u16, terminal_width: u16) -> u16 {
+    let max = MESSAGES_MAX_WIDTH.min(terminal_width / 2).max(1);
+    let min = MESSAGES_MIN_WIDTH.min(max);
+    requested.clamp(min, max)
+}
+
 /// The sidebar width a live drag to `column` would commit, bounded the same
 /// way a resting preference is.
-///
-/// The handle is the pane canvas's own left border now (`app::draw`,
-/// `sidebar::SIDEBAR_GRAB_WIDTH`), and that border sits exactly on the
-/// column the sidebar's width already treats as one past its last — the
-/// same column `chrome_areas_for` hands back as `canvas.x`. So the column
-/// under the pointer already IS the width, with no plus-one: a drag begun
-/// on the border lands snap-free. A drag begun one cell short, on the
-/// sidebar's own edge (`SIDEBAR_GRAB_WIDTH`'s fat-finger tolerance),
-/// still snaps the panel one cell narrower on its first step, same as
-/// before this column stopped being the primary handle.
 pub fn sidebar_width_for_column(column: u16, terminal_width: u16) -> u16 {
     clamp_sidebar_width(column, terminal_width)
+}
+
+/// The messages drawer width a live drag from the right edge to `column`
+/// would commit.
+pub fn messages_width_for_column(column: u16, terminal_width: u16) -> u16 {
+    let width_from_right = terminal_width.saturating_sub(column);
+    clamp_messages_width(width_from_right, terminal_width)
 }
 
 /// The width to restore when a sidebar-resize drag is cancelled: `None` for
@@ -198,6 +235,12 @@ pub fn sidebar_width_for_column(column: u16, terminal_width: u16) -> u16 {
 pub fn sidebar_width_on_cancel(drag: &DragState, terminal_width: u16) -> Option<u16> {
     matches!(&drag.target, DragTarget::Sidebar)
         .then(|| sidebar_width_for_column(drag.start.0, terminal_width))
+}
+
+/// The width to restore when a messages-drawer drag is cancelled.
+pub fn messages_width_on_cancel(drag: &DragState, terminal_width: u16) -> Option<u16> {
+    matches!(&drag.target, DragTarget::Messages)
+        .then(|| messages_width_for_column(drag.start.0, terminal_width))
 }
 
 /// Write `text` onto one row, clipped to `bounds`.
@@ -976,31 +1019,74 @@ mod tests {
 
     #[test]
     fn chrome_canvas_excludes_sidebar_and_tab_bar() {
-        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, SIDEBAR_MIN_WIDTH, true);
+        let areas = chrome_areas_for(
+            Rect::new(0, 0, 200, 50),
+            true,
+            SIDEBAR_MIN_WIDTH,
+            true,
+            false,
+            24,
+        );
         assert_eq!(areas.sidebar, Some(Rect::new(0, 0, SIDEBAR_MIN_WIDTH, 50)));
         assert_eq!(areas.rail, None, "an open panel needs no rail");
         assert_eq!(
+            areas.messages_rail,
+            Some(Rect::new(199, 0, 1, 50)),
+            "collapsed messages drawer leaves one rail column on the right"
+        );
+        assert_eq!(
             areas.tab_bar,
-            Rect::new(SIDEBAR_MIN_WIDTH, 0, 200 - SIDEBAR_MIN_WIDTH, 1)
+            Rect::new(SIDEBAR_MIN_WIDTH, 0, 200 - SIDEBAR_MIN_WIDTH - 1, 1)
         );
         assert_eq!(
             areas.canvas,
-            Rect::new(SIDEBAR_MIN_WIDTH, 1, 200 - SIDEBAR_MIN_WIDTH, 49)
+            Rect::new(SIDEBAR_MIN_WIDTH, 1, 200 - SIDEBAR_MIN_WIDTH - 1, 49)
         );
     }
 
     /// The collapsed shape: no panel rectangle, a one-column rail in its
-    /// place, and every other column back to the canvas. This is the
-    /// geometry boot must declare when prefs say collapsed, and the rail
-    /// column is the only thing standing between the canvas and the full
-    /// terminal.
+    /// place, and every other column back to the canvas.
     #[test]
     fn a_collapsed_sidebar_leaves_one_rail_column_and_gives_back_the_rest() {
-        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), false, 22, true);
+        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), false, 22, true, false, 24);
         assert_eq!(areas.sidebar, None);
         assert_eq!(areas.rail, Some(Rect::new(0, 0, 1, 50)));
-        assert_eq!(areas.tab_bar, Rect::new(1, 0, 199, 1));
-        assert_eq!(areas.canvas, Rect::new(1, 1, 199, 49));
+        assert_eq!(areas.messages_rail, Some(Rect::new(199, 0, 1, 50)));
+        assert_eq!(areas.tab_bar, Rect::new(1, 0, 198, 1));
+        assert_eq!(areas.canvas, Rect::new(1, 1, 198, 49));
+    }
+
+    /// An open right messages drawer carves width from the right edge.
+    #[test]
+    fn an_open_messages_drawer_carves_width_from_the_right() {
+        let areas = chrome_areas_for(
+            Rect::new(0, 0, 200, 50),
+            false,
+            22,
+            true,
+            true,
+            MESSAGES_MIN_WIDTH,
+        );
+        assert_eq!(areas.sidebar, None);
+        assert_eq!(areas.rail, Some(Rect::new(0, 0, 1, 50)));
+        assert_eq!(
+            areas.messages,
+            Some(Rect::new(
+                200 - MESSAGES_MIN_WIDTH,
+                0,
+                MESSAGES_MIN_WIDTH,
+                50
+            ))
+        );
+        assert_eq!(areas.messages_rail, None);
+        assert_eq!(
+            areas.tab_bar,
+            Rect::new(1, 0, 200 - 1 - MESSAGES_MIN_WIDTH, 1)
+        );
+        assert_eq!(
+            areas.canvas,
+            Rect::new(1, 1, 200 - 1 - MESSAGES_MIN_WIDTH, 49)
+        );
     }
 
     /// Hiding the strip is the operator's own choice now, not a tab count:
@@ -1008,11 +1094,18 @@ mod tests {
     /// taken, whatever the workspace holds.
     #[test]
     fn a_hidden_tab_bar_gives_the_canvas_its_row() {
-        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), true, SIDEBAR_MIN_WIDTH, false);
+        let areas = chrome_areas_for(
+            Rect::new(0, 0, 200, 50),
+            true,
+            SIDEBAR_MIN_WIDTH,
+            false,
+            false,
+            24,
+        );
         assert_eq!(areas.tab_bar.height, 0);
         assert_eq!(
             areas.canvas,
-            Rect::new(SIDEBAR_MIN_WIDTH, 0, 200 - SIDEBAR_MIN_WIDTH, 50)
+            Rect::new(SIDEBAR_MIN_WIDTH, 0, 200 - SIDEBAR_MIN_WIDTH - 1, 50)
         );
     }
 
@@ -1020,10 +1113,11 @@ mod tests {
     /// keeps none, and the canvas is exactly what is left.
     #[test]
     fn a_collapsed_rail_and_a_hidden_bar_compose() {
-        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), false, 22, false);
+        let areas = chrome_areas_for(Rect::new(0, 0, 200, 50), false, 22, false, false, 24);
         assert_eq!(areas.rail, Some(Rect::new(0, 0, 1, 50)));
+        assert_eq!(areas.messages_rail, Some(Rect::new(199, 0, 1, 50)));
         assert_eq!(areas.tab_bar.height, 0);
-        assert_eq!(areas.canvas, Rect::new(1, 0, 199, 50));
+        assert_eq!(areas.canvas, Rect::new(1, 0, 198, 50));
     }
 
     /// `Paint::for_test` builds the 256-color path; the fade only runs on

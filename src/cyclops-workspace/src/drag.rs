@@ -40,6 +40,8 @@ pub enum DragTarget {
     },
     /// Resize the application sidebar, not a tmux pane.
     Sidebar,
+    /// Resize the right-edge messages drawer.
+    Messages,
     /// Move the seam between the sidebar's session tree and its file
     /// panel. Vertical only, and it resizes no tmux pane: both halves
     /// belong to the application.

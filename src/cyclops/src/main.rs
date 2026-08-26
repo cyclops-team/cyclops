@@ -1665,6 +1665,7 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
     let params = serde_json::to_value(MsgSendParams {
         to: to.clone(),
         recipient_keys: None,
+        expected_caller: None,
         subject: args.subject.clone(),
         body,
         fyi: args.fyi,

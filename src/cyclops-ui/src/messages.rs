@@ -245,6 +245,14 @@ fn row_for(
         target,
         message_id: row.message_id.clone(),
         recipient,
+        sender: row.sender,
+        sender_label: crate::grid::safe_text(&row.sender_label),
+        reply_to: row.reply_to.clone(),
+        thread_root: row.thread_root.clone(),
+        thread_message_count: row.thread_message_count,
+        ts: row.ts,
+        kind: row.kind,
+        recipient_count: row.recipients.len(),
         // The exact attempt an attention action names, kept apart from
         // the identity precisely because it changes.
         attention: to.notification.attempt_id,

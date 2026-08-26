@@ -424,6 +424,7 @@ pub(crate) async fn selftest(
     let send_params = MsgSendParams {
         to: vec![params.target.clone()],
         recipient_keys: None,
+        expected_caller: None,
         subject: "[cyclops] hook self-test".to_string(),
         body: "Reply not needed.".to_string(),
         fyi: true,

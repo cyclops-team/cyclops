@@ -64,6 +64,7 @@ fn message(id: &str, seq: u64, label: &str) -> QueueRow {
         seq,
         updated_at: seq * 1000,
         direction: Direction::Inbound,
+        ..Default::default()
     }
 }
 
@@ -95,6 +96,7 @@ fn alarm(id: &str, n: u64, seq: u64, label: &str) -> QueueRow {
         seq,
         updated_at: seq * 1000,
         direction: Direction::Inbound,
+        ..Default::default()
     }
 }
 
@@ -435,6 +437,7 @@ fn a_broadcast_keeps_its_recipients_apart_through_a_reorder() {
         seq,
         updated_at: seq * 1000,
         direction: Direction::Inbound,
+        ..Default::default()
     };
 
     let mut q = HumanQueue::new();

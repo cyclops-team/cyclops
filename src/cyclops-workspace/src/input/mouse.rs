@@ -99,6 +99,12 @@ pub enum HitTarget {
     /// panel's outer edge, and on the one-column rail a collapse leaves
     /// behind. One target for both, because it is one control.
     SidebarToggle,
+    /// The chevron that collapses or reopens the right-edge messages drawer:
+    /// on the open panel's inner divider edge, and on the one-column rail
+    /// a collapse leaves behind.
+    MessagesToggle,
+    /// Resize handle for the right-edge messages drawer.
+    MessagesDivider,
     AttentionIndicator {
         pane_id: String,
     },
@@ -293,6 +299,8 @@ pub fn motion_touches_hover_button(
                     | HitTarget::NewWorkspaceButton
                     | HitTarget::SidebarToggle
                     | HitTarget::SidebarDivider
+                    | HitTarget::MessagesToggle
+                    | HitTarget::MessagesDivider
                     | HitTarget::FileRow { .. }
                     | HitTarget::FileDisclosure { .. }
                     | HitTarget::FileUp

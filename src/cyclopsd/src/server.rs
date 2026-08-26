@@ -803,6 +803,16 @@ async fn msg_send(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> R
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
+    if params
+        .expected_caller
+        .is_some_and(|expected| expected != sender.key)
+    {
+        return Response::err(
+            id,
+            "denied",
+            "the authenticated mailbox caller changed after the client snapshot",
+        );
+    }
     if params.reply_to.is_some() && (params.fyi || params.supersedes.is_some()) {
         return Response::err(
             id,
@@ -3206,6 +3216,7 @@ mod tests {
             json!({
                 "to": [],
                 "recipient_keys": [recipient],
+                "expected_caller": RecipientKey::admin(recipient.workspace_id()),
                 "subject": "Exact route",
                 "body": "Body",
                 "client_key": "exact-server-send"
@@ -3232,6 +3243,19 @@ mod tests {
         assert_eq!(row.recipients[0].label, "reviewer");
 
         let message_count = snapshot.counts.visible_messages;
+        let changed_caller = ask_inner(
+            &inner,
+            "msg.send",
+            json!({
+                "to": [],
+                "recipient_keys": [recipient],
+                "expected_caller": recipient,
+                "subject": "Wrong sender"
+            }),
+        )
+        .await;
+        assert_eq!(changed_caller.error.unwrap().code, "denied");
+
         let mixed = ask_inner(
             &inner,
             "msg.send",

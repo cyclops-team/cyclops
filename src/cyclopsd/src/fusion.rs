@@ -1985,11 +1985,14 @@ fn staged_entry_ready(
             .all(|reading| matches!(reading.state, AgentState::Idle | AgentState::IdleWithInput))
 }
 
-/// Release the staged composer barrier after a guarded resolution.
+/// Release this attempt's composer barrier after a guarded resolution.
 ///
 /// The caller has already proved the exact composer bytes. This final
 /// check keeps the release bound to the process generation and manifest
 /// recorded before the paste, so it cannot clear another occupant's hold.
+/// The exact settlement may race a lifecycle recompute that promotes the
+/// owned hold after the composer was cleared. That promotion must not leave
+/// an already-settled notification blocking the pane.
 pub(crate) fn resolve_staged_hold(
     inner: &Arc<Inner>,
     session_idx: usize,
@@ -2004,15 +2007,25 @@ pub(crate) fn resolve_staged_hold(
     };
     let (prior_ready, det) = {
         let mut map = inner.detections.lock().expect("detections lock");
-        let Some(entry) = map.get_mut(&PaneKey::new(session_idx, pane_id)) else {
+        let pane = PaneKey::new(session_idx, pane_id);
+        let Some(entry) = map.get_mut(&pane) else {
             return false;
         };
-        if entry.hold != ComposerHold::Staged
+        if entry.hold == ComposerHold::Clear
             || entry.hold_owner.as_deref() != Some(owner)
             || entry.agent != Some(expected)
             || entry.manifest.as_deref() != Some(manifest)
         {
             return false;
+        }
+        if let Some(turn) = entry.turn.as_ref() {
+            turnkey::PaneEnds::retire(
+                &mut inner.turn_ends.lock().expect("turn ends lock"),
+                &pane,
+                expected,
+                manifest,
+                turn,
+            );
         }
         let prior_ready = (
             entry.detection.write_ready,
@@ -6203,6 +6216,32 @@ contains = ["working"]
             &inner, 0, "%1", attempt, process, "bash"
         ));
         assert_eq!(hold_now(), (ComposerHold::Clear, None));
+
+        // Exact composer clearance can race a lifecycle recompute. The
+        // settled attempt still owns that promoted hold and must retire its
+        // turn pin instead of leaving the pane blocked after settlement.
+        let turn = turnkey::TurnKey::for_test(&["settled"]);
+        let mut promoted = entry(ComposerHold::TurnStarted { since_ms: 9 }, Some(attempt));
+        promoted.turn = Some(turn.clone());
+        put(promoted);
+        assert!(turnkey::PaneEnds::pin(
+            &mut inner.turn_ends.lock().expect("turn ends lock"),
+            &pane(),
+            admitted,
+            "bash",
+            &turn,
+        ));
+        assert!(resolve_staged_hold(
+            &inner, 0, "%1", attempt, process, "bash"
+        ));
+        assert_eq!(hold_now(), (ComposerHold::Clear, None));
+        assert!(turnkey::PaneEnds::pin(
+            &mut inner.turn_ends.lock().expect("turn ends lock"),
+            &pane(),
+            admitted,
+            "bash",
+            &turnkey::TurnKey::for_test(&["next"]),
+        ));
 
         // The race this exists for: a person types between the proof and
         // the write, a recompute records the text, and nobody owns it.
