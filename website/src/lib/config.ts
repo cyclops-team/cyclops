@@ -5,10 +5,6 @@ export const DOCS_URL = 'https://www.usecyclops.dev/docs';
 export const LICENSE_URL = `${REPO_URL}/blob/main/LICENSE`;
 export const GITHUB_API_URL = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}`;
 
-// Below this count a bare number doesn't read as social proof, so the badge
-// shows a plain "Star" prompt instead.
-export const GITHUB_STAR_THRESHOLD = 10;
-
 // `website/static/install.sh` is the same file as the repository's tested
 // `scripts/install.sh`. The parity gate refuses drift between the command
 // copied here and the installer contributors run from a clone.

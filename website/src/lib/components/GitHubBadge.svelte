@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import GithubMark from './GithubMark.svelte';
-	import { GITHUB_API_URL, GITHUB_STAR_THRESHOLD, REPO_URL } from '$lib/config';
+	import { GITHUB_API_URL, REPO_URL } from '$lib/config';
 
 	function formatStars(n: number): string {
 		if (n < 1000) return String(n);
@@ -28,9 +28,9 @@
 			.then((res) => (res.ok ? res.json() : null))
 			.then((data) => {
 				if (cancelled || !data || typeof data.stargazers_count !== 'number') return;
-				if (data.stargazers_count >= GITHUB_STAR_THRESHOLD) {
-					starText = formatStars(data.stargazers_count);
-				}
+				// The real count, whatever it is. "Star" is only the fallback
+				// while the request is in flight or when GitHub does not answer.
+				starText = formatStars(data.stargazers_count);
 			})
 			.catch(() => {
 				// Network failure, rate limit, or timeout — keep the "Star" fallback.
