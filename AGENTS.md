@@ -32,20 +32,22 @@ fact to an NDJSON ledger. A generated knowledge base with diagrams lives at
 
 ## The gates a change must pass
 
-Same five core checks, in order (full detail: [CONTRIBUTING.md](CONTRIBUTING.md)).
+Same five core gates, in order (full detail: [CONTRIBUTING.md](CONTRIBUTING.md)).
 `./scripts/check.sh` runs them all, cheapest first; `--fast` stops after
-the test suite.
+the test suite. The Rust test gate uses nextest for executable tests and Cargo
+for doctests, which nextest does not run.
 
 ```bash
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --no-fail-fast
+cargo nextest run --workspace --no-fail-fast
+cargo test --workspace --doc
 python3 scripts/check-doc-paths.py
 ./tests/e2e/parity-check.sh
 ```
 
-- `--no-fail-fast` is not optional: cargo stops at the first failing test
-  *binary* and hides everything after it (F24).
+- `--no-fail-fast` is not optional: nextest must keep scheduling so one run
+  reports every failing test instead of hiding the remaining failures.
 - Touching either installer requires keeping `scripts/install.sh` and
   `website/static/install.sh` byte-for-byte identical, then running
   `./tests/e2e/parity-check.sh --with-installer`.
@@ -127,7 +129,7 @@ Standard lint/test/build/run commands are in this file and
 [CONTRIBUTING.md](CONTRIBUTING.md). Follow those. Non-obvious
 caveats for this environment:
 
-- **Run `cargo test` from a plain shell, not inside tmux.** The e2e tests
+- **Run the Rust tests (nextest and `cargo test --doc`) from a plain shell, not inside tmux.** The e2e tests
   inherit the caller's environment; with `$TMUX` / `$TMUX_PANE` set,
   `src/cyclops/tests/e2e.rs`'s
   `self_names_the_calling_pane_and_says_so_when_there_is_none` fails

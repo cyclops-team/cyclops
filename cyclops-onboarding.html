@@ -1210,7 +1210,8 @@
           <div class="cmd">
             <div class="cmd-line"><span class="c">cargo fmt --all</span></div>
             <div class="cmd-line"><span class="c">cargo clippy --workspace --all-targets -- -D warnings</span></div>
-            <div class="cmd-line"><span class="c">cargo test --workspace --no-fail-fast</span><span class="n"># the flag is not optional (F24)</span></div>
+            <div class="cmd-line"><span class="c">cargo nextest run --workspace --no-fail-fast</span><span class="n"># the flag is not optional (F24)</span></div>
+            <div class="cmd-line"><span class="c">cargo test --workspace --doc</span><span class="n"># nextest does not run doctests</span></div>
             <div class="cmd-line"><span class="c">python3 scripts/check-doc-paths.py</span><span class="n"># every quoted path must exist</span></div>
             <div class="cmd-line"><span class="c">./tests/e2e/parity-check.sh</span><span class="n"># docs must match binary output</span></div>
           </div>
@@ -1265,8 +1266,8 @@
           <div class="sect-body">Not <code>/private/tmp</code> (macOS-only), not <code>std::env::temp_dir()</code> (its long /var/folders path blows the ~104-byte Unix socket cap). This is finding F24 and it cost two milestones. CI runs the whole suite twice, once with CYCLOPS_TEST_TMP relocated, to catch a hardcoded path.</div>
         </details>
         <details class="sect">
-          <summary><span class="sect-chev"></span><span class="sect-title">cargo test needs --no-fail-fast, always</span></summary>
-          <div class="sect-body">cargo stops at the first failing test *binary* and silently never runs the rest — one portability bug passed green across two milestones this way (F24). The flag makes the failure count real. CI passes it; you should too.</div>
+          <summary><span class="sect-chev"></span><span class="sect-title">nextest needs --no-fail-fast, always</span></summary>
+          <div class="sect-body">nextest must keep scheduling after a failure so one run reports every failing test. One portability bug passed green across two milestones because the visible failure count did not cover the full suite (F24). CI passes the flag; you should too.</div>
         </details>
         <details class="sect">
           <summary><span class="sect-chev"></span><span class="sect-title">Docs are CI-verified against the binaries</span></summary>

@@ -155,7 +155,8 @@ From `CONTRIBUTING.md` — five core checks:
 ```bash
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --no-fail-fast     # the flag is not optional (F24)
+cargo nextest run --workspace --no-fail-fast   # the flag is not optional (F24)
+cargo test --workspace --doc                   # nextest does not run doctests
 python3 scripts/check-doc-paths.py
 ./tests/e2e/parity-check.sh
 ```
@@ -166,8 +167,9 @@ Touching either installer requires `scripts/install.sh` and
 Testing rules that bite: every
 tmux-touching test goes through `cyclops-testrig` (never the default tmux
 server), and every scratch path comes from `cyclops_proto::scratch` (never
-`/tmp` literals or `std::env::temp_dir()`). Run `cargo test` from a plain
-shell, not inside tmux (see `AGENTS.md` Custom Instructions).
+`/tmp` literals or `std::env::temp_dir()`). Run the Rust test gate (nextest
+and the doctests) from a plain shell, not inside tmux (see `AGENTS.md`
+Custom Instructions).
 
 ## CI (`.github/workflows/ci.yml`)
 
@@ -175,7 +177,7 @@ shell, not inside tmux (see `AGENTS.md` Custom Instructions).
 flowchart TB
     subgraph test["test (ubuntu + macos, fail-fast: false)"]
         a["cargo fmt --check"] --> b["cargo clippy -D warnings"]
-        b --> c["cargo test --workspace --no-fail-fast"]
+        b --> c["cargo nextest run --workspace --no-fail-fast, then cargo test --workspace --doc"]
         c --> d["commPact shim tests (python)"]
         d --> e["check-doc-paths.py --selftest, then run"]
         e --> f["tests/e2e/parity-check.sh (docs and binaries agree)"]
@@ -185,7 +187,7 @@ flowchart TB
         h["cargo build --workspace"] --> i["parity-check.sh --with-installer"]
     end
     subgraph canary["tmux-head (advisory, continue-on-error)"]
-        j["build tmux from master"] --> k["cargo test --workspace"]
+        j["build tmux from master"] --> k["cargo nextest run --workspace --no-fail-fast, then cargo test --workspace --doc"]
     end
     subgraph website["website"]
         l["cmp hosted and tested installers"] --> m["npm run check"]

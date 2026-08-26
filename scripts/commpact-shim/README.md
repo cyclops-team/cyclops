@@ -22,4 +22,5 @@ python3 scripts/commpact-shim/test_shim.py
 ```
 
 CI runs this suite on ubuntu and macos after the Rust tests (`test` job in
-`.github/workflows/ci.yml`); cargo test alone does not cover the shim.
+`.github/workflows/ci.yml`); the Rust test gate (nextest and the doctests)
+does not cover the shim.

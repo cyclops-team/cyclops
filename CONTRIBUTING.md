@@ -18,16 +18,23 @@ Two binaries land in `target/debug/`: `cyclopsd` (the daemon) and `cyclops`
 
 You need tmux on PATH to run most of the tests. `tmux -V` should print 3.2
 or newer; the tree is developed against 3.6a and CI also builds tmux master.
+Install the same nextest release CI uses before running the full gate:
+
+```bash
+cargo install cargo-nextest --locked --version 0.9.100
+```
 
 ## The loop
 
-Five commands, in this order. They are the same five core CI checks, so a green
-run here is a green run there.
+Five gates, in this order. They are the same five core CI gates, so a green
+run here is a green run there. The Rust test gate uses nextest for executable
+tests and Cargo for doctests, which nextest does not run.
 
 ```bash
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --no-fail-fast
+cargo nextest run --workspace --no-fail-fast
+cargo test --workspace --doc
 python3 scripts/check-doc-paths.py
 ./tests/e2e/parity-check.sh
 ```
@@ -56,11 +63,10 @@ cmp scripts/install.sh website/static/install.sh
 
 ### `--no-fail-fast` is not optional
 
-`cargo test` stops at the first failing test **binary** and never runs the
-rest. One portability bug once passed for a green build across two
-milestones this way: 25 of 26 tests in one binary passed, that binary
-failed, and the other 31 binaries never ran, so the visible failure count
-had no relation to the real one (F24). Always pass the flag. CI does.
+Nextest otherwise stops scheduling after the first failure and can hide the
+remaining failures. One portability bug once passed for a green build across
+two milestones because the visible failure count did not cover the full suite
+(F24). Always pass the flag. CI does.
 
 ### What the parity gate is
 
@@ -160,7 +166,7 @@ On macOS a relocated run takes the same code path Linux does:
 
 ```bash
 mkdir -p /private/var/tmp/cyc-relocated
-CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated cargo test --workspace --no-fail-fast
+CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated cargo nextest run --workspace --no-fail-fast
 ```
 
 CI runs the whole suite twice for this reason, once relocated.
@@ -201,7 +207,8 @@ throw away the signal that tells a portability bug from a real regression.
 |---|---|
 | `cargo fmt --all --check` | Formatting drifted |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Any lint fires, including in tests |
-| `cargo test --workspace --no-fail-fast` | Any test fails, on either OS |
+| `cargo nextest run --workspace --no-fail-fast` | Any test fails, on either OS |
+| `cargo test --workspace --doc` | A Rust doctest fails |
 | `python3 scripts/commpact-shim/test_shim.py` | The commPact v1 shim broke (bash and python, invisible to cargo) |
 | `python3 scripts/check-doc-paths.py` | A doc points at a file this repo does not have, or a page exists that no front door links to. `--selftest` proves the checker still catches, so a green run cannot mean it stopped looking |
 | `./tests/e2e/parity-check.sh` | A doc quotes output the binaries no longer print |
