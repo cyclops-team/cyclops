@@ -856,6 +856,7 @@ mod tests {
                 transport: NotificationTransport::Doorbell,
                 doorbell_format: format,
                 cause: Some(NotificationAttentionCause::VerifyFailed),
+                verify_outcome: None,
                 pre_write_cause: None,
                 wake_block: None,
                 pre_write_observation: None,
