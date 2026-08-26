@@ -2129,8 +2129,9 @@ fn staged_frame_is_quiet(entry: &DetEntry) -> bool {
 /// turn, or a pane whose completed suffix scrolled away), never "did the
 /// turn end?". It admits `Idle` only when the fused state is `unknown`
 /// because the clean composer is not lifecycle evidence, the exact current
-/// agent generation has produced an authenticated hook edge in this pane
-/// lifetime (SessionStart on a fresh pane), no start is active for that
+/// agent generation has produced an authenticated `SessionStart` or
+/// `UserPromptSubmit` edge in this pane lifetime (telemetry and attention
+/// edges never qualify), no start is active for that
 /// generation, and the current capture is a nonstale, out-of-mode,
 /// binding-stable frame whose screen winner is a clean idle-class composer
 /// row. It never touches a hook entry and cannot end a latch.
@@ -2178,7 +2179,9 @@ fn liveness_idle_admission(
         .manifests
         .get(manifest_id)
         .is_some_and(crate::selftest::declares_hooks)
-        && inner.hook_liveness.seen_any(route, agent, manifest_id);
+        && inner
+            .hook_liveness
+            .seen_admitting_edge(route, agent, manifest_id);
     let active_start = inner
         .hook_readings
         .lock()
@@ -7609,9 +7612,67 @@ regex = ['^']
                 stable,
             )
         };
+        // Liveness is exact-binding and event-specific: telemetry and attention
+        // edges leave the pane unknown, SessionStart admits it, and a later
+        // generation on the same pane starts unknown again.
+        let liveness = crate::selftest::HookLiveness::new();
+        let pane = PaneKey::new(0, "%9");
+        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
+        liveness.open(&pane);
+        assert!(
+            !liveness.seen_admitting_edge(&pane, agent, "claude"),
+            "no edge yet"
+        );
+        for (ts, event) in [
+            (10, "Notification"),
+            (11, "Stop"),
+            (12, "StopFailure"),
+            (13, "PermissionRequest"),
+        ] {
+            liveness.record(&pane, event, ts, agent, "claude");
+            assert!(
+                liveness.seen_any(&pane, agent, "claude"),
+                "{event} proves wiring"
+            );
+            assert!(
+                !liveness.seen_admitting_edge(&pane, agent, "claude"),
+                "{event} must leave the pane unknown"
+            );
+            assert!(!admits(
+                liveness.seen_admitting_edge(&pane, agent, "claude"),
+                false,
+                false,
+                false,
+                true
+            ));
+        }
+        liveness.record(&pane, "SessionStart", 14, agent, "claude");
+        assert!(
+            liveness.seen_admitting_edge(&pane, agent, "claude"),
+            "SessionStart admits"
+        );
+        assert!(admits(
+            liveness.seen_admitting_edge(&pane, agent, "claude"),
+            false,
+            false,
+            false,
+            true
+        ));
+        let other = crate::identity::ProcId { pid: 8, birth: 80 };
+        assert!(
+            !liveness.seen_admitting_edge(&pane, other, "claude"),
+            "another generation begins unknown"
+        );
+        let prompt_first = PaneKey::new(0, "%10");
+        liveness.open(&prompt_first);
+        liveness.record(&prompt_first, "UserPromptSubmit", 20, agent, "claude");
+        assert!(
+            liveness.seen_admitting_edge(&prompt_first, agent, "claude"),
+            "UserPromptSubmit qualifies"
+        );
         assert!(
             !admits(false, false, false, false, true),
-            "before SessionStart"
+            "before any admitting edge"
         );
         assert!(
             admits(true, false, false, false, true),

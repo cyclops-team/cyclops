@@ -1469,7 +1469,7 @@ mod tests {
                 assert_eq!(cmd, expected);
             }
         }
-        // Claude registers the four attention-relevant events.
+        // Claude registers the four attention-relevant events plus SessionStart liveness.
         let v: serde_json::Value =
             serde_json::from_str(&render(CliKind::Claude, "r", "c")).unwrap();
         let mut events: Vec<&String> = v["hooks"].as_object().unwrap().keys().collect();
@@ -1479,6 +1479,7 @@ mod tests {
             [
                 "Notification",
                 "PermissionRequest",
+                "SessionStart",
                 "Stop",
                 "StopFailure",
                 "UserPromptSubmit"

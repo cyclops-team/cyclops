@@ -1526,6 +1526,38 @@ fn claude_2_1_246_terminal_suffix_is_lifecycle_evidence_only_when_no_active_row_
         "unstyled prose row"
     );
 
+    // MUTATION (row-connected pairing): an older genuine styled completion
+    // above a later unstyled completion-shaped row must not count: the plain
+    // suffix would anchor on the forged later row and the escaped suffix on
+    // the genuine older row, and the pair must share one line span.
+    let (plain, esc) = claude_frame(
+        &[
+            "✻ Sautéed for 6s · done 7:33 AM",
+            "  prior output row",
+            "✻ Baked for 3s · done 7:00 AM",
+            RULE_120,
+            "❯",
+            RULE_120,
+            trailer_plain,
+        ],
+        &[
+            "\u{1b}[38;5;246m✻\u{1b}[39m \u{1b}[38;5;246mSautéed for 6s · done 7:33 AM\u{1b}[39m",
+            "  prior output row",
+            "✻ Baked for 3s · done 7:00 AM",
+            &rule_esc,
+            "\u{1b}[39m❯",
+            &rule_esc,
+            trailer_esc,
+        ],
+    );
+    let rule = claude
+        .evaluate_esc("", &plain, Some(&esc))
+        .expect("a rule matches");
+    assert_ne!(
+        rule.id, "composer_completed_terminal_suffix_2_1_246",
+        "older genuine styled row above a later forged row"
+    );
+
     // MUTATION: a genuine styled completed row followed by an active 215 row
     // never proves the terminal under the escaped clause.
     let (plain, esc) = claude_frame(

@@ -12,12 +12,18 @@
 # Events: UserPromptSubmit is an exact dispatch candidate (payload carries the
 # injected prompt, so the message id is matchable, MEASURED 130/130). Claude
 # exposes no key shared with Stop, so visual evidence confirms and ends the
-# candidate. Stop and StopFailure remain liveness telemetry only. Notification
-# and PermissionRequest are attention edges. Every entry names its own event
+# candidate. SessionStart is process-bound liveness: an authenticated edge from
+# the exact agent generation that admits a fresh clean pane as idle before its
+# first turn (findings F72). Stop and StopFailure remain liveness telemetry
+# only. Notification and PermissionRequest are attention edges. Every entry
+# names its own event
 # on the command line: the receiver must not trust payloads to self-identify
 # (finding F7 on agy set the fleet-wide rule).
 {
   "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook SessionStart" } ] }
+    ],
     "UserPromptSubmit": [
       { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook UserPromptSubmit" } ] }
     ],

@@ -147,6 +147,30 @@ impl HookLiveness {
     /// True once any hook edge has been seen from the CURRENT occupant of
     /// this pane and manifest. Other process generations or manifests count
     /// for nothing.
+    /// Exact-binding, event-specific liveness for runtime-idle admission:
+    /// only a normalized `SessionStart` or `UserPromptSubmit` edge from the
+    /// current agent generation in this pane lifetime qualifies. `Stop` and
+    /// `StopFailure` are telemetry, `Notification` and `PermissionRequest`
+    /// are attention edges; none of them says the agent is at rest with a
+    /// composer it owns, so none of them admits a pane. `seen_any` stays the
+    /// broader "hooks are wired at all" answer behind `hooks_verified`.
+    pub(crate) fn seen_admitting_edge(
+        &self,
+        pane: &PaneKey,
+        current_agent: crate::identity::ProcId,
+        manifest: &str,
+    ) -> bool {
+        const ADMITTING_EVENTS: [&str; 2] = ["SessionStart", "UserPromptSubmit"];
+        let Some(binding) = self.binding(pane, current_agent, manifest) else {
+            return false;
+        };
+        let state = self.state.lock().expect("hook liveness lock");
+        state.edges.get(&binding).is_some_and(|edges| {
+            ADMITTING_EVENTS
+                .iter()
+                .any(|event| edges.contains_key(&ack::normalize_event(event)))
+        })
+    }
     pub(crate) fn seen_any(
         &self,
         pane: &PaneKey,

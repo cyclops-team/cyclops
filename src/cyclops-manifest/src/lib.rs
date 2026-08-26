@@ -425,13 +425,16 @@ pub struct RawMatcher {
     /// clauses fails closed when no escaped capture was provided.
     #[serde(default)]
     pub line_regex_esc: Vec<String>,
-    /// Like `regex`, but run against the region's SGR-escaped rows joined
-    /// with newlines, so one ordered pattern can prove that styled rows sit
-    /// in a given order on the same rows the plain `regex` matched.
-    /// MEASURED (Claude Code 2.1.246, probe a91f): the completed-turn suffix
-    /// is a uniform 38;5;246 row followed by the composer box; per-line
-    /// escaped clauses cannot tie the styled row to the ordered plain
-    /// suffix, this can. Fails closed when no escaped capture was provided.
+    /// Paired by index with `regex`: clause `i` runs against the region's
+    /// SGR-escaped rows joined with newlines and must match starting on the
+    /// same line and ending on the same line as `regex[i]` does on the plain
+    /// rows. That ties the styled rows to the exact rows the plain pattern
+    /// proved, not merely to the same region. MEASURED (Claude Code 2.1.246,
+    /// probe a91f): the completed-turn suffix is a uniform 38;5;246 row
+    /// followed by the composer box; an older genuine styled completion
+    /// above a later unstyled completion-shaped row must not count. The
+    /// counts must be equal when `regex_esc` is present; the clause fails
+    /// closed when no escaped capture was provided.
     #[serde(default)]
     pub regex_esc: Vec<String>,
 }
@@ -506,11 +509,10 @@ impl CompiledMatcher {
         } else {
             match esc_lines {
                 Some(el) => {
-                    let joined_esc = el.join("\n");
                     self.line_regex_esc
                         .iter()
                         .all(|r| el.iter().any(|l| r.is_match(l)))
-                        && self.regex_esc.iter().all(|r| r.is_match(&joined_esc))
+                        && paired_spans_match(&self.regex, &self.regex_esc, lines, el)
                 }
                 None => false,
             }
@@ -523,6 +525,55 @@ impl CompiledMatcher {
                 .iter()
                 .all(|r| lines.iter().any(|l| r.is_match(l)))
     }
+}
+
+/// Do the paired `regex`/`regex_esc` clauses each match the SAME line span?
+///
+/// The plain and escaped rows are aligned one to one (both come from the
+/// same bottom-up non-empty filter), so a match is located by the line it
+/// starts on and the line it ends on. For every pair there must be one line
+/// at which both patterns match starting there and both end on the same
+/// line. A pattern that only matches from an older row while its twin
+/// matches from a later row proves nothing about the same rows.
+fn paired_spans_match(
+    plain: &[regex::Regex],
+    esc: &[regex::Regex],
+    lines: &[&str],
+    esc_lines: &[&str],
+) -> bool {
+    if esc.is_empty() {
+        return true;
+    }
+    if plain.len() != esc.len() || lines.len() != esc_lines.len() {
+        return false;
+    }
+    let joined_plain = lines.join("\n");
+    let joined_esc = esc_lines.join("\n");
+    let starts = |rows: &[&str]| -> Vec<usize> {
+        let mut offsets = Vec::with_capacity(rows.len());
+        let mut at = 0usize;
+        for row in rows {
+            offsets.push(at);
+            at += row.len() + 1;
+        }
+        offsets
+    };
+    let plain_starts = starts(lines);
+    let esc_starts = starts(esc_lines);
+    let end_line = |text: &str, end: usize| text[..end].matches('\n').count();
+    plain.iter().zip(esc.iter()).all(|(p, e)| {
+        (0..lines.len()).any(|line| {
+            let plain_end = p
+                .find_at(&joined_plain, plain_starts[line])
+                .filter(|m| m.start() == plain_starts[line])
+                .map(|m| end_line(&joined_plain, m.end()));
+            let esc_end = e
+                .find_at(&joined_esc, esc_starts[line])
+                .filter(|m| m.start() == esc_starts[line])
+                .map(|m| end_line(&joined_esc, m.end()));
+            matches!((plain_end, esc_end), (Some(a), Some(b)) if a == b)
+        })
+    })
 }
 
 impl CompiledRule {
@@ -705,6 +756,16 @@ fn compile_matcher(
             })
             .collect()
     };
+    if !raw.regex_esc.is_empty() && raw.regex_esc.len() != raw.regex.len() {
+        return Err(ManifestError::BadInjection {
+            id: id.into(),
+            why: format!(
+                "{rule}: regex_esc must pair one-to-one with regex ({} vs {})",
+                raw.regex_esc.len(),
+                raw.regex.len()
+            ),
+        });
+    }
     Ok(CompiledMatcher {
         unstyled_only: raw.unstyled_only,
         contains: raw.contains.clone(),
@@ -2057,6 +2118,37 @@ regex_esc = ['(?m)^\x1b\[38;5;246mDONE\x1b\[39m\n\x1b\[39m>\s*\z']
         assert!(
             manifest.evaluate_esc("", plain, Some(unstyled)).is_none(),
             "plain-looking esc rows"
+        );
+        // The pair must match the same line span: a styled DONE two rows up
+        // with an unstyled DONE directly above the prompt is not the same row.
+        let split_plain = "DONE\nx\nDONE\n>";
+        let split_esc = "\u{1b}[38;5;246mDONE\u{1b}[39m\nx\nDONE\n\u{1b}[39m>";
+        assert!(
+            manifest
+                .evaluate_esc("", split_plain, Some(split_esc))
+                .is_none(),
+            "split spans"
+        );
+        // Pair counts are validated at parse.
+        let unpaired = Manifest::parse(
+            r#"
+[agent]
+id = "esc"
+display_name = "Esc fixture"
+process_names = ["esc"]
+
+[[rule]]
+id = "unpaired"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(4)"
+regex_esc = ['DONE']
+"#,
+            Path::new("unpaired.toml"),
+        );
+        assert!(
+            unpaired.is_err(),
+            "regex_esc without a paired regex must not parse"
         );
     }
 }
