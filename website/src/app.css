@@ -4,7 +4,14 @@
    so the page chrome and the workspace mock inside it are the same
    palette: one product, two of its themes, never a screenshot that
    inverted. */
-:root {
+
+/* `.invert` paints one element in the OTHER theme: on the forest page a
+   sorbet panel, on the sorbet page a forest one. The selectors below
+   make each token block apply to its own theme and to an inverted
+   element inside the opposite one, so the swap is the whole palette,
+   pane frames included, never a second set of colors. */
+:root,
+:root[data-theme='dark'] .invert {
 	color-scheme: light;
 
 	/* Surfaces, stepping down from the paper into apricot the way sorbet's
@@ -37,6 +44,15 @@
 	--accent-soft: #f3d3bd; /* chrome.raised */
 	--accent-2: #b3406e; /* role.8, raspberry */
 	--accent-2-hover: #9c3560;
+
+	/* The counterpoint: one color of the OPPOSITE temperature to the
+	   accent, so a page painted in one theme is not painted in one hue.
+	   On sorbet that is mint, the cool flavor on the counter, for the
+	   small structural marks (eyebrows, step numbers, the field's pulses).
+	   The pixel headlines keep their soft apricot drop: mint under cocoa
+	   ink reads as mud, not as a shadow. */
+	--counter: #2a7a76; /* role.5, mint */
+	--counter-shadow: #f3d3bd; /* chrome.raised */
 	--link: #a6461e; /* palette.1, a read link on peach */
 
 	/* The field behind the hero: wires and nodes one step quieter than
@@ -92,7 +108,8 @@
 	--font-pixel: 'Silkscreen', ui-monospace, monospace;
 }
 
-:root[data-theme='dark'] {
+:root[data-theme='dark'],
+:root:not([data-theme='dark']) .invert {
 	color-scheme: dark;
 
 	/* Forest: a stand of conifers at dusk. The page ground is the pane
@@ -126,6 +143,11 @@
 	--accent-soft: #24342a; /* chrome.raised */
 	--accent-2: #dd9a72; /* role.8, fallen leaf */
 	--accent-2-hover: #e6ad8a;
+
+	/* Forest's counterpoint is its one warm leaf, and it is strong enough
+	   to be the headline's drop shadow as well. */
+	--counter: #dd9a72; /* role.8, fallen leaf */
+	--counter-shadow: #dd9a72;
 	--link: #b3d8b6;
 
 	--field-line: #22332a;
@@ -267,7 +289,7 @@ a:hover {
 	font-size: 11.5px;
 	letter-spacing: 2px;
 	text-transform: uppercase;
-	color: var(--accent);
+	color: var(--counter);
 }
 
 /* The one display size every section statement shares.
@@ -308,6 +330,11 @@ a:hover {
 
 .panel.deep {
 	background: var(--surface-deep);
+}
+
+.panel.invert {
+	background: var(--paper);
+	color: var(--text);
 }
 
 .btn {

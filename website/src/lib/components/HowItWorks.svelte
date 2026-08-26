@@ -75,7 +75,7 @@
 
 	.num {
 		font-size: 13px;
-		color: var(--accent);
+		color: var(--counter);
 		margin-bottom: 16px;
 	}
 

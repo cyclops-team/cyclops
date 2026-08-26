@@ -5,7 +5,7 @@
 </script>
 
 <section class="section">
-	<div class="panel deep cta">
+	<div class="panel deep cta invert">
 		<div class="eyebrow">// Get started</div>
 		<h2 class="pixel">BUILD WITH YOUR<br />WHOLE AGENT TEAM</h2>
 		<p>Install Cyclops and coordinate any agents you can run from the terminal.</p>
@@ -37,7 +37,7 @@
 		color: var(--ink);
 		line-height: 1.05;
 		margin: 0;
-		text-shadow: 5px 5px 0 var(--accent-soft);
+		text-shadow: 5px 5px 0 var(--counter-shadow);
 	}
 
 	p {

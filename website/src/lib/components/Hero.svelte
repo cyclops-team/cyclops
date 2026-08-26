@@ -56,7 +56,7 @@
 		line-height: 0.98;
 		color: var(--ink);
 		margin: 0;
-		text-shadow: 5px 5px 0 var(--accent-soft);
+		text-shadow: 5px 5px 0 var(--counter-shadow);
 	}
 
 	p {

@@ -22,7 +22,7 @@
 				line: token('--field-line'),
 				node: token('--field-node'),
 				agents: [token('--sb-role-1'), token('--sb-role-4'), token('--sb-role-3')],
-				pulse: token('--sb-accent')
+				pulse: token('--counter')
 			};
 		}
 
