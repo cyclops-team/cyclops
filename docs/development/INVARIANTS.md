@@ -452,10 +452,12 @@ empty, right now, with nothing live contradicting it. Absence of evidence
 is not clean evidence; a contested verdict is not clean evidence.
 
 An authenticated, exactly keyed turn start owns runtime `Working` before the
-first visual output frame. Idle title and composer frames can lag that edge,
-so repeated captures cannot erase it and elapsed time cannot convert it to
-`Idle`. Only the matching keyed end clears it. Process-binding retirement also
-clears the start.
+first visual output frame. Idle title and ordinary composer frames can lag that
+edge, so repeated captures cannot erase it and elapsed time cannot convert it
+to `Idle`. The matching keyed end clears it. A manifest-declared terminal
+screen rule may also clear it on one stable, current capture when that exact
+rule wins an idle-class frame; generic empty, ghost, and typed composer rules
+are never terminal evidence. Process-binding retirement also clears the start.
 
 An unkeyed confirmed vendor contract may use authenticated start and end
 events from the same process binding for runtime status. It still cannot bind

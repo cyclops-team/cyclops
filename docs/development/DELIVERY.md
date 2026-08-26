@@ -223,6 +223,14 @@ visible; the hold itself keeps waiting on events, never on a timer.
    staged barrier with no live lifecycle or blocked-state conflict. A refusal
    withholds Enter and settles once as `verify_failed`. It is never retried.
 
+An exact start normally ends on its matching hook end. When a measured vendor
+path emits no end hook, a manifest may mark one exact screen rule as lifecycle
+evidence. That rule must win an idle-class frame on a fresh, stable capture;
+ordinary empty, ghost, and typed composer rules do not qualify. Codex 0.149.1
+uses this only for the exact interruption suffix left after a human cancels a
+command approval, paired with its dim ghost composer and ordered below the
+live Working rule.
+
 ### Receipt tiers
 
 - Tier 1 (claude, codex, cursor): the manifest `hooks.ack` event arrives via

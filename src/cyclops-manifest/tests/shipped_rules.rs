@@ -30,6 +30,7 @@ fn shipped_composer_semantics_match_measured_rules_only() {
         ("claude", "composer_unstyled_input", HumanInput),
         ("codex", "composer_typed_input", HumanInput),
         ("codex", "composer_ghost_suggestion", GhostSuggestion),
+        ("codex", "approval_cancelled_terminal", GhostSuggestion),
         ("codex", "composer_empty_or_ghost", Ambiguous),
         ("cursor", "composer_typed_input", HumanInput),
         ("cursor", "composer_ghost_or_empty", Ambiguous),
@@ -472,6 +473,45 @@ fn codex_collapsed_paste_chip_is_staged_input() {
         AgentState::Idle,
         "a submitted turn in the transcript is not a staged composer"
     );
+}
+
+/// MEASURED 2026-08-26, Codex 0.149.1: canceling a command approval returns
+/// to the dim ghost composer but emits no Stop hook. The exact interruption
+/// suffix is therefore lifecycle evidence, while typed input and a later live
+/// Working frame must still refuse an idle verdict.
+#[test]
+fn codex_cancelled_approval_is_terminal_only_with_a_clean_ghost_composer() {
+    let all = shipped();
+    let codex = &all["codex"];
+    let interrupted = "\x1b[38;5;1m■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.\x1b[39m\n\
+        \x1b[1m›\x1b[0m\x1b[48;2;30;30;30m \x1b[2mAsk Codex to do anything\x1b[0m";
+    let plain = cyclops_manifest::strip_csi(interrupted);
+
+    let rule = codex
+        .evaluate_esc("proj", &plain, Some(interrupted))
+        .expect("measured cancellation suffix matches");
+    assert_eq!(rule.id, "approval_cancelled_terminal");
+    assert_eq!(rule.state, AgentState::Idle);
+    assert!(rule.lifecycle_evidence);
+
+    let typed = interrupted.replace(
+        "\x1b[2mAsk Codex to do anything\x1b[0m",
+        "review the uncommitted changes",
+    );
+    let typed_plain = cyclops_manifest::strip_csi(&typed);
+    let rule = codex
+        .evaluate_esc("proj", &typed_plain, Some(&typed))
+        .expect("typed composer remains classifiable");
+    assert_eq!(rule.id, "composer_typed_input");
+    assert_eq!(rule.state, AgentState::IdleWithInput);
+
+    let working = format!("• Working (1s • esc to interrupt)\n{interrupted}");
+    let working_plain = cyclops_manifest::strip_csi(&working);
+    let rule = codex
+        .evaluate_esc("proj", &working_plain, Some(&working))
+        .expect("working frame remains classifiable");
+    assert_eq!(rule.id, "screen_working");
+    assert_eq!(rule.state, AgentState::Working);
 }
 
 /// MEASURED 2026-08-08 (codex-cli 0.147.0, tmux 120x40), SAFETY: Codex keeps

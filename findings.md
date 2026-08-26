@@ -1889,5 +1889,24 @@ These observations cover typed slash-command, working-turn, and tool-execution
 classification without weakening composer safety.
 
 This does not advance the manifest's full-ruleset `version_tested` claim.
-Current-version modal/approval, collapsed staging, exact notification ACK,
-and daemon-restart cells still need their own measured evidence.
+Three further live cells ran on the same installed build. A 2,828-character
+no-submit paste rendered as Codex's colored `[Pasted Content 2828 chars]`
+chip and detection selected `composer_typed_input`, `idle_with_input`, and
+write readiness false. An exact notification then moved from submitted to
+notified in 56ms, before the configured 1500ms tier-1 window can enter screen
+fallback and 10.9 seconds before the recipient claim; this proves the exact
+`UserPromptSubmit` ACK path. Finally, an explicit command approval rendered
+the current 0.149.1 approval dialog and detection selected
+`approval_prompt`, `blocked_permission`, and write readiness false.
+
+Canceling that approval exposed one additional lifecycle edge: Codex returned
+to its dim ghost composer and printed `Conversation interrupted - tell the
+model what to do differently`, but emitted no matching Stop hook. The exact
+UserPromptSubmit latch therefore remained Working. The shipped manifest now
+marks only that measured interruption suffix paired with the dim ghost
+composer as lifecycle evidence, below the live Working rule; typed input cannot
+match it. A stable capture may end the stranded start through the same
+manifest-owned terminal seam used by other no-end-hook vendor paths.
+
+The current-version daemon-restart cell remains before the full-ruleset
+`version_tested` claim may advance.

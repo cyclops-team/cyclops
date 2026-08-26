@@ -83,10 +83,6 @@ pub(crate) struct HookEntry {
     /// The hook edge itself remains `reading.ts`; the deadline never stands in
     /// for a second event.
     provisional_ready_at_ms: Option<u64>,
-    /// This start was a provisional candidate that a visual Working frame
-    /// promoted. Only such a latch may be ended by the screen's lifecycle
-    /// evidence; an authenticated confirmed start keeps its hook-tier end.
-    promoted: bool,
 }
 
 impl HookEntry {
@@ -111,7 +107,6 @@ impl HookEntry {
             authoritative_end: false,
             active_turn: None,
             provisional_ready_at_ms: None,
-            promoted: false,
         }
     }
     /// Promote a visually accepted provisional dispatch start into a
@@ -126,7 +121,6 @@ impl HookEntry {
         HookEntry {
             confirmed_start: true,
             provisional_ready_at_ms: None,
-            promoted: true,
             ..self
         }
     }
@@ -2529,25 +2523,21 @@ fn hook_action_observed(
     // and repeated captures of that frame do not end the turn. A missing end
     // must remain visible as Working instead of silently ageing to Idle.
     if entry.active_start {
-        // A promoted candidate start has no key an end hook could match, so
-        // its only screen-side terminal is one observation of a conclusive
-        // lifecycle-evidence idle winner on an idle-class fused frame, taken
-        // out of mode, nonstale, with the binding proven stable around the
-        // capture. A rule that needs more than one observation to be
-        // conclusive is not lifecycle evidence at all; a bare, ghosted, or
-        // typed composer row is not that evidence (lifecycle_evidence is
-        // false on it). An authenticated confirmed start is stronger
-        // evidence than any screen frame and ends only on the hook tier or a
-        // binding change: the idle composer stays on screen until the first
-        // output and must never erase it.
-        if entry.promoted && entry.active_turn.is_none() {
-            let fused_idle = matches!(
-                detection.state,
-                AgentState::Idle | AgentState::IdleWithInput
-            );
-            if idle_confirmed && fused_idle && !in_mode && !detection.stale && binding_stable {
-                return HookAction::Drop;
-            }
+        // One observation of a manifest-declared lifecycle terminal may end
+        // a start when that rule wins an idle-class fused frame on a stable,
+        // current capture. This is deliberately narrower than generic clean
+        // composer evidence: Codex 0.149.1 emits no Stop when a human cancels
+        // an approval, while the measured interruption suffix plus dim ghost
+        // composer proves that exact turn ended. Ordinary empty, ghost, and
+        // typed composer rules are not lifecycle evidence and cannot erase a
+        // start before its first output. A promoted candidate uses the same
+        // terminal seam because it has no key an end hook could match.
+        let fused_idle = matches!(
+            detection.state,
+            AgentState::Idle | AgentState::IdleWithInput
+        );
+        if idle_confirmed && fused_idle && !in_mode && !detection.stale && binding_stable {
+            return HookAction::Drop;
         }
         return HookAction::Use;
     }
@@ -7579,11 +7569,10 @@ regex = ['^']
         );
         assert!(staged_entry_ready(&idle_with_input, "att-1", agent, "fix"));
     }
-    /// An authenticated confirmed start (not a promoted candidate) is never
-    /// ended by the screen: repeated idle composer frames before the first
-    /// output keep it Working, as the lifecycle contract requires.
+    /// Ordinary idle composer frames never end an authenticated confirmed
+    /// start. One manifest-declared terminal winner may do so.
     #[test]
-    fn a_confirmed_start_is_never_ended_by_a_screen_terminal() {
+    fn a_confirmed_start_ignores_generic_idle_and_accepts_one_screen_terminal() {
         let agent = crate::identity::ProcId { pid: 7, birth: 70 };
         let mut entry =
             HookEntry::unkeyed_turn_started(agent, Some("fix".into()), working_reading(1000));
@@ -7591,14 +7580,17 @@ regex = ['^']
         let idle = visual(AgentState::Idle, false);
         for ts in 0..6 {
             assert_eq!(
-                hook_action_observed(&mut entry, &idle, true, false, true, 2000 + ts),
+                hook_action_observed(&mut entry, &idle, false, false, true, 2000 + ts),
                 HookAction::Use,
-                "confirmed start frame {ts}"
+                "generic idle frame {ts}"
             );
         }
         assert!(
-            entry.unkeyed_latch_ended_by(agent, Some("fix"), 3000),
-            "the hook tier still ends it"
+            matches!(
+                hook_action_observed(&mut entry, &idle, true, false, true, 3000),
+                HookAction::Drop
+            ),
+            "the measured screen terminal ends it"
         );
     }
     const SHIPPED_CLAUDE: &str = include_str!(concat!(
@@ -7895,9 +7887,10 @@ regex = ['^']
         assert!(!staged_entry_ready(&hook_only, "att-1", agent, "fix"));
         assert!(!staged_hold_ready(&hook_only));
     }
-    /// A keyed start is retired by its key, never by a screen terminal.
+    /// Stable screen bookends are not terminal by themselves. A keyed start
+    /// still accepts an explicitly lifecycle-capable terminal winner.
     #[test]
-    fn a_keyed_start_is_not_ended_by_screen_bookends() {
+    fn a_keyed_start_needs_more_than_bookends_before_a_screen_terminal() {
         let agent = crate::identity::ProcId { pid: 7, birth: 70 };
         let turn = turnkey::TurnKey::for_test(&["s", "t"]);
         let mut entry =
@@ -7905,10 +7898,14 @@ regex = ['^']
         let idle = visual(AgentState::Idle, false);
         for _ in 0..3 {
             assert_eq!(
-                hook_action_observed(&mut entry, &idle, true, false, true, 2000),
+                hook_action_observed(&mut entry, &idle, false, false, true, 2000),
                 HookAction::Use
             );
         }
+        assert_eq!(
+            hook_action_observed(&mut entry, &idle, true, false, true, 2001),
+            HookAction::Drop
+        );
     }
     /// A manifest that never captures the screen still decides by title.
     #[test]
@@ -8687,6 +8684,41 @@ regex = ['^']
             );
         }
         assert_eq!(entry.disagreements, 0);
+    }
+
+    #[test]
+    fn a_manifest_terminal_idle_may_end_an_exact_active_start() {
+        let mut entry = start_entry(1_000);
+        assert_eq!(
+            hook_action_observed(
+                &mut entry,
+                &lifecycle_detection(Sensor::Screen, AgentState::Idle),
+                true,
+                false,
+                true,
+                1_001,
+            ),
+            HookAction::Drop
+        );
+
+        for (idle_confirmed, in_mode, binding_stable) in [
+            (false, false, true),
+            (true, true, true),
+            (true, false, false),
+        ] {
+            let mut entry = start_entry(1_000);
+            assert_eq!(
+                hook_action_observed(
+                    &mut entry,
+                    &lifecycle_detection(Sensor::Screen, AgentState::Idle),
+                    idle_confirmed,
+                    in_mode,
+                    binding_stable,
+                    1_001,
+                ),
+                HookAction::Use
+            );
+        }
     }
 
     #[test]

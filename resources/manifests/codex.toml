@@ -196,6 +196,23 @@ to everything above it; at 1100 it would wedge a finished pane as working."""
 evidence = "MEASURED 2026-08-08, codex-cli 0.147.0, fixtures/codex_working_composer_plain.txt; captured live at 120x40 while the turn rendered"
 
 [[rule]]
+id = "approval_cancelled_terminal"
+state = "idle"
+composer_semantic = "ghost_suggestion"
+lifecycle_evidence = true
+priority = 1090
+region = "bottom_non_empty_lines(12)"
+contains = ["Conversation interrupted - tell the model what to do differently"]
+line_regex_esc = ['^\s*\x1b\[1m(?:\x1b\[(?:3[0-7]|38(?:(?:;|:)[0-9]+)+)m)*›(?:\x1b\[[0-9;:]*m)*\s+\x1b\[2m']
+note = """Codex 0.149.1 does not emit Stop when the human cancels a command
+approval. The exact interruption suffix plus the current dim ghost composer is
+the measured terminal observation for that turn. The rule stays below
+screen_working, so a later live turn wins, and its escaped composer clause
+fails on typed text. A stable capture may therefore end the otherwise stranded
+UserPromptSubmit latch without making the pane write-ready over human input."""
+evidence = "MEASURED 2026-08-26, codex-cli 0.149.1, live resumed pane after canceling an explicit command approval"
+
+[[rule]]
 id = "trust_dialog"
 state = "blocked_modal"
 priority = 1300
