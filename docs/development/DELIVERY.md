@@ -257,6 +257,19 @@ the attempt boundary and never invites a duplicate paste. `attention_required`
 can mean the terminal outcome is unknown, not that the recipient definitely
 did not receive the message.
 
+A paste command pipe that accepted zero command bytes is also proven pre-write.
+A legacy direct delivery may use its bounded retry because it has no durable
+workspace notification boundary to correct.
+
+A workspace notification writes its durable `writing` barrier immediately
+before the paste command is attempted. If the transport then proves that the
+first command write accepted zero bytes, Cyclops appends the narrowly scoped
+`writing` to `blocked_pre_write` correction with cause
+`paste_command_unwritten`. Only after that append succeeds does it release the
+runtime composer hold. This exact attempt is claimable and withdrawable, but is
+not replayed automatically. A partial command write or flush failure remains
+`paste_failed` after the write boundary because tmux may have received it.
+
 The `pane_too_narrow` width detail is also pre-write, but it does not consume
 the retry budget. Its durable cause remains `write_readiness_changed` for old
 reader compatibility, with observed and required widths recorded separately.
@@ -267,12 +280,13 @@ It stays withdrawable until a qualifying width edge or operator action.
 A mailbox notification stops as `blocked_pre_write` after a known pre-write
 failure exhausts its bounded retry budget, a worker exhausts its restart budget,
 or a write-boundary proof cannot safely continue. Binding and capability races
-receive one immediate re-proof without consuming transport retry budget. A held
-composer barrier blocks immediately. The closed causes name an unavailable
-session, manifest, payload, changed write readiness, paste-buffer spool failure,
-unprovable binding, missing composer semantics, or exhausted worker restart
-budget. None writes pane bytes or retries on a timer. The message stays
-claimable, and a workspace administrator may withdraw that exact unwritten
+may receive one re-proof after new causal evidence without consuming transport
+retry budget. A held composer barrier blocks immediately. The closed causes name
+an unavailable session, manifest, payload, changed write readiness, paste-buffer
+spool failure, an exact paste command that accepted zero bytes, unprovable
+binding, missing composer semantics, or exhausted worker restart budget. None
+writes pane bytes or retries on a timer. The message stays claimable, and a
+workspace administrator may withdraw that exact unwritten
 notification to release the recipient FIFO.
 The transition also records the exact closed scheduler outcome when no live
 worker owns the wake. Replay, send receipts, status, and message detail read

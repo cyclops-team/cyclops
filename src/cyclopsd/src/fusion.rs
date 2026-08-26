@@ -1904,9 +1904,10 @@ pub(crate) fn claim_hold(
     true
 }
 
-/// Release this attempt's barrier when its durable write fact could not be recorded.
+/// Release this attempt's barrier after proving that no terminal command byte was written.
 ///
-/// The caller has not asked tmux to paste yet. Exact owner and binding checks
+/// This covers a refused durable write fact and a paste command whose first
+/// pipe write failed before accepting bytes. Exact owner and binding checks
 /// prevent a failed attempt from clearing a person's draft or another delivery.
 pub(crate) fn release_unwritten_hold(
     inner: &Arc<Inner>,

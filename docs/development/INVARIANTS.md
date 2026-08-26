@@ -77,6 +77,13 @@ each goes directly to `attention_required` with its exact cause. That state
 means the terminal outcome can be unknown, not that Cyclops proved the
 recipient did not receive the message. Inspect the pane before resending.
 
+One transport result is narrower than a generic paste failure. If the command
+pipe fails its first write before accepting any command byte, Cyclops records
+`paste_command_unwritten` and returns that exact workspace notification to
+`blocked_pre_write`. The durable correction precedes runtime hold release. A
+partial write or flush failure never takes this path and remains an ambiguous
+post-write `paste_failed`.
+
 - Enforced at: `src/cyclopsd/src/delivery.rs`, `gate` (admission),
   `occupant_unchanged` (both re-checks), `attempt_delivery` (the order),
   `inject`, `staged_representation`, and `exact_staging_proof` (verification).

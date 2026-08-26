@@ -44,7 +44,7 @@ use cyclops_proto::{
     NotificationVerifyOutcome, NotifyLevel, ProcessInstanceId, QuiesceResult, RecipientKey, Sensor,
     StatusDiagnostic, VerifiedBy, WaitUntil, WireError,
 };
-use cyclops_tmux::{ControlClient, PaneEvent, PaneRow, SessionWatcher};
+use cyclops_tmux::{ControlClient, PaneEvent, PaneRow, SessionWatcher, TmuxError};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, watch, Notify};
 use tokio::task::JoinHandle;
@@ -3663,6 +3663,13 @@ impl AttemptFailure {
         Self::blocked_before_write("spool_failed", NotificationPreWriteCause::SpoolFailed)
     }
 
+    fn paste_command_unwritten() -> Self {
+        Self::blocked_before_write(
+            "paste_command_unwritten",
+            NotificationPreWriteCause::PasteCommandUnwritten,
+        )
+    }
+
     fn paste_failed() -> Self {
         Self {
             cause: "paste_failed".into(),
@@ -4101,7 +4108,15 @@ async fn attempt_delivery(
     .await
     {
         Ok(v) => v,
-        Err(cause) => {
+        Err(InjectFailure::PasteCommandUnwritten) => {
+            if let Err(error) = correct_proven_unwritten_paste(handle) {
+                error!(id = %handle.msg_id, error = %error, "notification unwritten correction failed");
+                return AttemptOutcome::Failed(AttemptFailure::notification_record_failed());
+            }
+            rollback_unwritten_hold(inner, handle, &proven);
+            return AttemptOutcome::Failed(AttemptFailure::paste_command_unwritten());
+        }
+        Err(InjectFailure::Other(cause)) => {
             if cause == NO_LONGER_CURRENT_BEFORE_WRITE {
                 return AttemptOutcome::NoLongerCurrentBeforeWrite;
             }
@@ -5131,7 +5146,7 @@ async fn fail_attempt(
         DeliveryState::Submitted,
         DeliveryState::RetryQueued,
     ];
-    if should_retry(failure, spent, inner.cfg.delivery_retry_max) {
+    if should_retry_attempt(handle, failure, spent, inner.cfg.delivery_retry_max) {
         advance(
             inner,
             handle,
@@ -5244,6 +5259,20 @@ fn should_retry(failure: &AttemptFailure, spent: u32, retry_max: u32) -> bool {
             "pane_too_narrow" | "composer_ownership_unproven" | "binding_unprovable"
         )
         && spent <= retry_max
+}
+
+fn should_retry_attempt(
+    handle: &DeliveryHandle,
+    failure: &AttemptFailure,
+    spent: u32,
+    retry_max: u32,
+) -> bool {
+    // A workspace notification already has a durable Writing fact. Its exact
+    // zero-byte correction must remain withdrawable instead of being replayed
+    // automatically. Legacy direct delivery has no such durable attempt and
+    // may use the existing bounded pre-write retry.
+    !(handle.notification.is_some() && failure.cause == "paste_command_unwritten")
+        && should_retry(failure, spent, retry_max)
 }
 
 fn notify_attention(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>, cause: &str) {
@@ -6039,6 +6068,19 @@ fn rollback_unwritten_hold(
     }
 }
 
+/// Correct the provisional boundary after tmux proves that its command pipe
+/// accepted no byte of the paste command.
+///
+/// The durable correction must succeed before the runtime boundary is cleared.
+/// Otherwise restart recovery must continue treating the attempt as post-write.
+fn correct_proven_unwritten_paste(handle: &DeliveryHandle) -> Result<(), NotificationAdapterError> {
+    if let Some(notification) = &handle.notification {
+        notification.record_paste_command_unwritten()?;
+    }
+    handle.write_boundary_crossed.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
 /// Releases a claimed composer barrier if the synchronous boundary hook unwinds.
 struct UnwrittenHold<'a> {
     inner: &'a Arc<Inner>,
@@ -6360,9 +6402,10 @@ pub(crate) trait Injector {
     /// submitting.
     ///
     /// `on_write` runs immediately before the pane is asked to take it,
-    /// which is the write boundary: everything before it is provably
-    /// retryable, and everything from it onward may have left text in
-    /// somebody's composer.
+    /// which arms the conservative write boundary: everything before it is
+    /// provably retryable, and everything from it onward may have left text
+    /// in somebody's composer. Only a transport result proving that the
+    /// command pipe accepted zero bytes can correct that boundary.
     ///
     /// It can FAIL, and then nothing is written. The barrier it installs
     /// is what stops the next delivery pasting over this one, so a paste
@@ -6373,7 +6416,7 @@ pub(crate) trait Injector {
         &self,
         pane_id: &str,
         on_write: &(dyn Fn() -> Result<(), String> + Sync),
-    ) -> Result<(), String>;
+    ) -> Result<(), InjectFailure>;
 
     /// Drop a spooled payload the attempt is not going to write.
     async fn discard(&self);
@@ -6390,6 +6433,27 @@ pub(crate) trait Injector {
     /// composer extraction compares these logical rows with the bytes that
     /// were spooled.
     async fn capture_joined_escaped(&self, pane_id: &str) -> Result<String, String>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InjectFailure {
+    /// The tmux command pipe accepted no byte of the paste command.
+    PasteCommandUnwritten,
+    /// Every other refusal or ambiguous outcome keeps its existing cause.
+    Other(String),
+}
+
+impl From<String> for InjectFailure {
+    fn from(cause: String) -> Self {
+        Self::Other(cause)
+    }
+}
+
+fn classify_paste_buffer_failure(error: TmuxError) -> InjectFailure {
+    match error {
+        TmuxError::Io(_) => InjectFailure::PasteCommandUnwritten,
+        _ => InjectFailure::Other("paste_failed".to_string()),
+    }
 }
 
 /// The tmux paste path: load-buffer through the adapter's private spool
@@ -6414,7 +6478,8 @@ impl Injector for TmuxInjector {
             // Loading the private spool buffer happens before tmux is asked
             // to write to the pane, regardless of how the load command
             // failed. It is therefore safe to retry under the bounded
-            // pre-write budget; only paste-buffer failures are ambiguous.
+            // pre-write budget. A paste-buffer failure stays ambiguous unless
+            // the command pipe proves that it accepted zero command bytes.
             return Err("spool_failed".to_string());
         }
         Ok(())
@@ -6428,11 +6493,12 @@ impl Injector for TmuxInjector {
         &self,
         pane_id: &str,
         on_write: &(dyn Fn() -> Result<(), String> + Sync),
-    ) -> Result<(), String> {
+    ) -> Result<(), InjectFailure> {
         // The write boundary. Spooling is behind us and provably touched
-        // no pane; the next call may put text in somebody's composer, and
-        // its failure is ambiguous about whether it did. Whatever this
-        // hook installs has to be installed BEFORE the await, not after
+        // no pane; the next call may put text in somebody's composer. Every
+        // outcome except an exact zero-byte command failure is ambiguous
+        // about whether it did. Whatever this hook installs has to be
+        // installed BEFORE the await, not after
         // it returns, or an outcome that leaves a payload behind can be
         // acted on by another delivery first.
         //
@@ -6442,7 +6508,7 @@ impl Injector for TmuxInjector {
         // budget.
         if let Err(cause) = on_write() {
             let _ = self.client.delete_buffer(&self.buffer).await;
-            return Err(cause);
+            return Err(InjectFailure::Other(cause));
         }
         if let Err(e) = self
             .client
@@ -6454,7 +6520,7 @@ impl Injector for TmuxInjector {
             // server-global with the payload in it. Best effort: the buffer
             // dies with the server either way.
             let _ = self.client.delete_buffer(&self.buffer).await;
-            return Err("paste_failed".to_string());
+            return Err(classify_paste_buffer_failure(e));
         }
         Ok(())
     }
@@ -6519,7 +6585,7 @@ async fn inject<I: Injector>(
     target: StagingTarget<'_>,
     expected_payload: &str,
     on_write: &(dyn Fn() -> Result<(), String> + Sync),
-) -> Result<(String, bool, String), String> {
+) -> Result<(String, bool, String), InjectFailure> {
     injector.commit(&handle.pane_id, on_write).await?;
     // The capture flavor follows the manifest's composer discriminators:
     // esc rules need the SGR-escaped grid or they fail closed, and a
@@ -6551,7 +6617,7 @@ async fn inject<I: Injector>(
             Err(e) => debug!(error = %e, "verify capture failed"),
         }
     }
-    Err("verify_failed".to_string())
+    Err(InjectFailure::Other("verify_failed".to_string()))
 }
 
 /// What representation is visible in the active composer.
@@ -9703,6 +9769,11 @@ mod tests {
             ),
             (AttemptFailure::spool_failed(), "spool_failed", true),
             (
+                AttemptFailure::paste_command_unwritten(),
+                "paste_command_unwritten",
+                true,
+            ),
+            (
                 AttemptFailure::composer_ownership_unproven(),
                 "composer_ownership_unproven",
                 false,
@@ -9868,6 +9939,10 @@ mod tests {
             (
                 AttemptFailure::spool_failed(),
                 NotificationPreWriteCause::SpoolFailed,
+            ),
+            (
+                AttemptFailure::paste_command_unwritten(),
+                NotificationPreWriteCause::PasteCommandUnwritten,
             ),
             (
                 AttemptFailure::composer_ownership_unproven(),
@@ -10608,6 +10683,33 @@ composer_trailer_required_prefix = 1
         spooled: StdMutex<Option<String>>,
     }
 
+    struct UnwrittenCommitInjector;
+
+    impl Injector for UnwrittenCommitInjector {
+        async fn spool(&self, _payload: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn commit(
+            &self,
+            _pane_id: &str,
+            on_write: &(dyn Fn() -> Result<(), String> + Sync),
+        ) -> Result<(), InjectFailure> {
+            on_write().map_err(InjectFailure::Other)?;
+            Err(InjectFailure::PasteCommandUnwritten)
+        }
+
+        async fn discard(&self) {}
+
+        async fn submit(&self, _pane_id: &str, _key: &str) -> Result<(), String> {
+            panic!("an unwritten paste must not submit")
+        }
+
+        async fn capture_joined_escaped(&self, _pane_id: &str) -> Result<String, String> {
+            panic!("an unwritten paste must not verify")
+        }
+    }
+
     impl MockInjector {
         pub(super) fn new(screens: Vec<&str>) -> MockInjector {
             MockInjector {
@@ -10644,8 +10746,8 @@ composer_trailer_required_prefix = 1
             &self,
             _pane_id: &str,
             on_write: &(dyn Fn() -> Result<(), String> + Sync),
-        ) -> Result<(), String> {
-            on_write()?;
+        ) -> Result<(), InjectFailure> {
+            on_write().map_err(InjectFailure::Other)?;
             let payload = self
                 .spooled
                 .lock()
@@ -10723,6 +10825,235 @@ composer_trailer_required_prefix = 1
         assert_eq!(notified.binding.unwrap().manifest.as_str(), "codex");
     }
 
+    #[test]
+    fn a_proven_unwritten_paste_restores_a_withdrawable_notification_state() {
+        let (scratch, store, context, handle, recipient) =
+            notification_fixture("paste-command-unwritten");
+        context.record_gating().unwrap();
+        context
+            .record_writing(
+                ProcessInstanceId::new(3999, 817_999).unwrap(),
+                ProcessInstanceId::new(4000, 818_000).unwrap(),
+                ProcessInstanceId::new(4242, 818_221).unwrap(),
+                "codex",
+                NotificationTransport::Doorbell,
+                Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .projection()
+                .active_notification_barriers()
+                .len(),
+            1
+        );
+
+        let blocked = context.record_paste_command_unwritten().unwrap();
+
+        assert_eq!(blocked.state, NotificationState::BlockedPreWrite);
+        assert_eq!(
+            blocked.pre_write_cause,
+            Some(NotificationPreWriteCause::PasteCommandUnwritten)
+        );
+        assert!(blocked.state.can_withdraw_before_write());
+        assert_eq!(blocked.binding, None);
+        assert_eq!(blocked.doorbell_format, None);
+        assert!(store
+            .lock()
+            .unwrap()
+            .projection()
+            .active_notification_barriers()
+            .is_empty());
+        assert_eq!(
+            notification_state(&store, recipient, context.message_id()),
+            blocked
+        );
+        let failure = AttemptFailure::paste_command_unwritten();
+        assert_eq!(failure.boundary, WriteBoundary::BeforeWrite);
+        assert!(!should_retry_attempt(&handle, &failure, 0, 3));
+        let direct = DeliveryHandle::new(
+            "m-direct-unwritten",
+            "reviewer",
+            "%1",
+            0,
+            "payload".to_string(),
+        );
+        assert!(should_retry_attempt(&direct, &failure, 0, 3));
+
+        let message_id = context.message_id().clone();
+        drop(handle);
+        drop(context);
+        drop(store);
+        let root = StateRoot::open_or_create(&scratch.0).unwrap();
+        let mut replayed = MessageStore::open(
+            &root,
+            Path::new("workspaces/current/messages.ndjson"),
+            recipient.workspace_id(),
+            "replay",
+        )
+        .unwrap();
+        let replayed_record = replayed
+            .projection()
+            .notification(recipient, &message_id)
+            .unwrap();
+        assert_eq!(replayed_record.state, NotificationState::BlockedPreWrite);
+        assert_eq!(
+            replayed_record.pre_write_cause,
+            Some(NotificationPreWriteCause::PasteCommandUnwritten)
+        );
+        assert!(replayed
+            .projection()
+            .active_notification_barriers()
+            .is_empty());
+        let withdrawn = replayed
+            .withdraw_notification_before_write(
+                RecipientKey::admin(recipient.workspace_id()),
+                recipient,
+                blocked.attempt_id,
+            )
+            .unwrap();
+        assert_eq!(withdrawn.state, NotificationState::WithdrawnByOperator);
+    }
+
+    #[tokio::test]
+    async fn an_unwritten_commit_is_corrected_at_the_delivery_seam() {
+        let (_scratch, store, context, handle, recipient) =
+            notification_fixture("unwritten-delivery-seam");
+        context.record_gating().unwrap();
+        let payload = handle.payload();
+        let manifest = sentinel_manifest();
+
+        let error = inject(
+            &UnwrittenCommitInjector,
+            &handle,
+            &manifest,
+            StagingTarget::ExactRow(&payload),
+            &payload,
+            &|| {
+                context
+                    .record_writing(
+                        ProcessInstanceId::new(3999, 817_999).unwrap(),
+                        ProcessInstanceId::new(4000, 818_000).unwrap(),
+                        ProcessInstanceId::new(4242, 818_221).unwrap(),
+                        "codex",
+                        NotificationTransport::Doorbell,
+                        None,
+                    )
+                    .map(|_| handle.write_boundary_crossed.store(true, Ordering::SeqCst))
+                    .map_err(notification_write_cause)
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, InjectFailure::PasteCommandUnwritten);
+        assert_eq!(
+            notification_state(&store, recipient, context.message_id()).state,
+            NotificationState::Writing
+        );
+        correct_proven_unwritten_paste(&handle).unwrap();
+        assert!(!handle.write_boundary_crossed.load(Ordering::SeqCst));
+        let corrected = notification_state(&store, recipient, context.message_id());
+        assert_eq!(corrected.state, NotificationState::BlockedPreWrite);
+        assert_eq!(
+            corrected.pre_write_cause,
+            Some(NotificationPreWriteCause::PasteCommandUnwritten)
+        );
+    }
+
+    #[test]
+    fn only_a_zero_byte_command_write_is_a_proven_unwritten_paste() {
+        assert_eq!(
+            classify_paste_buffer_failure(TmuxError::Io(std::io::Error::other("first write"))),
+            InjectFailure::PasteCommandUnwritten
+        );
+        assert_eq!(
+            classify_paste_buffer_failure(TmuxError::WriteUncertain(std::io::Error::other(
+                "partial write or flush"
+            ))),
+            InjectFailure::Other("paste_failed".to_string())
+        );
+        assert_eq!(
+            classify_paste_buffer_failure(TmuxError::Command("tmux refused".to_string())),
+            InjectFailure::Other("paste_failed".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unwritten_correction_append_failure_keeps_the_postwrite_barrier() {
+        let (_scratch, store, context, handle, recipient) =
+            notification_fixture("unwritten-correction-append-failure");
+        context.record_gating().unwrap();
+        context
+            .record_writing(
+                ProcessInstanceId::new(3999, 817_999).unwrap(),
+                ProcessInstanceId::new(4000, 818_000).unwrap(),
+                ProcessInstanceId::new(4242, 818_221).unwrap(),
+                "codex",
+                NotificationTransport::Doorbell,
+                None,
+            )
+            .unwrap();
+        handle.write_boundary_crossed.store(true, Ordering::SeqCst);
+        store
+            .lock()
+            .unwrap()
+            .inject_next_pre_write_block_append_failure();
+
+        assert!(correct_proven_unwritten_paste(&handle).is_err());
+        assert!(handle.write_boundary_crossed.load(Ordering::SeqCst));
+        let current = notification_state(&store, recipient, context.message_id());
+        assert_eq!(current.state, NotificationState::Writing);
+        assert!(current.binding.is_some());
+    }
+
+    #[test]
+    fn a_claim_after_proven_unwritten_is_not_postwrite_evidence() {
+        let (_scratch, store, context, _handle, recipient) =
+            notification_fixture("unwritten-claim-order");
+        context.record_gating().unwrap();
+        context
+            .record_writing(
+                ProcessInstanceId::new(3999, 817_999).unwrap(),
+                ProcessInstanceId::new(4000, 818_000).unwrap(),
+                ProcessInstanceId::new(4242, 818_221).unwrap(),
+                "codex",
+                NotificationTransport::Doorbell,
+                None,
+            )
+            .unwrap();
+        let blocked = context.record_paste_command_unwritten().unwrap();
+        store
+            .lock()
+            .unwrap()
+            .claim(recipient, context.message_id().clone())
+            .unwrap();
+
+        assert!(!store
+            .lock()
+            .unwrap()
+            .projection()
+            .exact_recipient_claimed_after_write(&blocked));
+    }
+
+    #[test]
+    fn the_unwritten_cause_requires_a_prior_writing_fact() {
+        let (_scratch, store, context, _handle, recipient) =
+            notification_fixture("unwritten-requires-writing");
+        context.record_gating().unwrap();
+
+        assert!(context
+            .record_pre_write_block(NotificationPreWriteCause::PasteCommandUnwritten, None)
+            .is_err());
+        assert_eq!(
+            notification_state(&store, recipient, context.message_id()).state,
+            NotificationState::Gating
+        );
+    }
+
     #[tokio::test]
     async fn superseded_notification_aborts_inside_on_write_without_pasting() {
         let (_scratch, store, context, handle, recipient) = notification_fixture("superseded");
@@ -10754,7 +11085,10 @@ composer_trailer_required_prefix = 1
         .await
         .unwrap_err();
 
-        assert_eq!(error, NO_LONGER_CURRENT_BEFORE_WRITE);
+        assert_eq!(
+            error,
+            InjectFailure::Other(NO_LONGER_CURRENT_BEFORE_WRITE.to_string())
+        );
         assert!(injector.pasted.lock().unwrap().is_empty());
         assert_eq!(
             notification_state(&store, recipient, context.message_id()).state,
@@ -10809,7 +11143,10 @@ composer_trailer_required_prefix = 1
         )
         .await
         .unwrap_err();
-        assert_eq!(error, NO_LONGER_CURRENT_BEFORE_WRITE);
+        assert_eq!(
+            error,
+            InjectFailure::Other(NO_LONGER_CURRENT_BEFORE_WRITE.to_string())
+        );
         assert!(injector.pasted.lock().unwrap().is_empty());
         assert_eq!(
             notification_state(&store, recipient, context.message_id()).state,
@@ -11668,7 +12005,10 @@ line_regex_esc = ['^❯$']
             },
         )
         .await;
-        assert_eq!(result, Err("verify_failed".into()));
+        assert_eq!(
+            result,
+            Err(InjectFailure::Other("verify_failed".to_string()))
+        );
         assert_eq!(injector.pasted.lock().unwrap().len(), 1);
 
         context
@@ -11714,7 +12054,7 @@ line_regex_esc = ['^❯$']
                     &|| Err(cause.to_string())
                 )
                 .await,
-                Err(cause.to_string())
+                Err(InjectFailure::Other(cause.to_string()))
             );
             assert!(
                 mock.pasted.lock().unwrap().is_empty(),
@@ -11753,7 +12093,7 @@ line_regex_esc = ['^❯$']
                 &|| Ok(())
             )
             .await,
-            Err("verify_failed".to_string())
+            Err(InjectFailure::Other("verify_failed".to_string()))
         );
         assert_eq!(mock.pasted.lock().unwrap().len(), 1, "payload was pasted");
 
@@ -11770,7 +12110,7 @@ line_regex_esc = ['^❯$']
                 &|| Ok(()),
             )
             .await,
-            Err("verify_failed".to_string())
+            Err(InjectFailure::Other("verify_failed".to_string()))
         );
         assert_eq!(mock.pasted.lock().unwrap().len(), 1, "payload was pasted");
         assert!(mock.submitted_is_empty());
@@ -11878,7 +12218,7 @@ line_regex_esc = ['^❯$']
                 &|| Ok(()),
             )
             .await,
-            Err("verify_failed".to_string())
+            Err(InjectFailure::Other("verify_failed".to_string()))
         );
         assert_eq!(mock.pasted.lock().unwrap().len(), 1);
         assert!(mock.submitted_is_empty());
@@ -12386,7 +12726,7 @@ contains = ["OTHER-DIALOG"]
         // %9999 does not exist: load-buffer succeeds, paste-buffer fails.
         injector.spool("secret payload").await.expect("spool");
         let err = injector.commit("%9999", &|| Ok(())).await.unwrap_err();
-        assert_eq!(err, "paste_failed");
+        assert_eq!(err, InjectFailure::Other("paste_failed".to_string()));
         let buffers = client.command("list-buffers").await.unwrap_or_default();
         assert!(
             buffers.iter().all(|l| !l.contains(&injector.buffer)),
@@ -12835,7 +13175,10 @@ composer_trailer_required_prefix = 1
         )
         .await;
 
-        assert_eq!(result.unwrap_err(), "verify_failed");
+        assert_eq!(
+            result.unwrap_err(),
+            InjectFailure::Other("verify_failed".to_string())
+        );
         assert_eq!(injector.pasted.lock().unwrap().as_slice(), &[doorbell]);
         assert!(
             injector.submitted_is_empty(),

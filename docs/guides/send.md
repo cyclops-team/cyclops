@@ -235,8 +235,9 @@ claim`. The exact transition and reconciliation rules are owned by the
 
 A wake that stops before writing reports one exact cause, including
 `session_unavailable`, `manifest_unavailable`, `payload_unavailable`,
-`write_readiness_changed`, `spool_failed`, `binding_unprovable`,
-`composer_semantic_missing`, or `worker_failed`. The message remains claimable.
+`write_readiness_changed`, `spool_failed`, `paste_command_unwritten`,
+`binding_unprovable`, `composer_semantic_missing`, or `worker_failed`. The
+message remains claimable.
 For format 3, `write_readiness_changed` with an observed width below its
 recorded required width is shown as `pane too narrow`. The width pair is
 content-free, no pane write occurred, and a later size edge may reopen that

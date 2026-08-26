@@ -514,6 +514,42 @@ impl NotificationContext {
         Ok(record)
     }
 
+    /// Correct the durable write boundary after the transport proves that
+    /// the paste command pipe accepted zero command bytes.
+    pub(crate) fn record_paste_command_unwritten(
+        &self,
+    ) -> Result<NotificationRecord, NotificationAdapterError> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| NotificationAdapterError::StoreLockPoisoned)?;
+        let current = store
+            .projection()
+            .notification(self.recipient, &self.message_id)
+            .cloned()
+            .ok_or(NotificationAdapterError::NoLongerCurrentBeforeWrite)?;
+        if !self.owns(&current) {
+            return Err(NotificationAdapterError::NoLongerCurrentBeforeWrite);
+        }
+        if current.state == NotificationState::BlockedPreWrite
+            && current.pre_write_cause == Some(NotificationPreWriteCause::PasteCommandUnwritten)
+        {
+            return Ok(current);
+        }
+        if current.state != NotificationState::Writing {
+            return Err(NotificationAdapterError::TerminalConflict(current.state));
+        }
+        let record = store.block_notification_before_write(
+            self.message_id.clone(),
+            self.recipient,
+            self.attempt_id,
+            NotificationPreWriteCause::PasteCommandUnwritten,
+            None,
+        )?;
+        self.publish_transition(&record);
+        Ok(record)
+    }
+
     pub(crate) fn record_quota_held(&self) -> Result<NotificationRecord, NotificationAdapterError> {
         let mut store = self
             .store

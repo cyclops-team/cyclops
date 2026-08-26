@@ -127,7 +127,9 @@ impl<'de> Deserialize<'de> for NotificationManifestId {
 
 /// State of one recipient's one-shot wake notification.
 ///
-/// `Writing` is the durable boundary before the external composer write.
+/// `Writing` is the durable boundary before the external composer write. A
+/// later `paste_command_unwritten` fact may correct it to `BlockedPreWrite`
+/// only when the command pipe proves that it accepted zero command bytes.
 /// Recovery may resume `Queued` or `Gating`. A claimed `Staged` doorbell may
 /// resume only to re-prove and clear that exact attempt. A claimed `Submitted`
 /// doorbell may settle as `Notified`. Other unresolved states from `Writing`
@@ -183,6 +185,8 @@ impl NotificationState {
             BlockedPreWrite => matches!(next, Gating | Withdrawn | WithdrawnByOperator),
             QuotaHeld => next == QuotaResetObserved,
             QuotaResetObserved => false,
+            // The zero-byte Writing correction is cause-gated by the
+            // notification projection and cannot be expressed by states alone.
             Writing => matches!(next, Staged | AttentionRequired),
             Staged => matches!(next, Submitting | AttentionRequired),
             Submitting => matches!(next, Submitted | AttentionRequired),
@@ -247,6 +251,9 @@ pub enum NotificationPreWriteCause {
     WriteReadinessChanged,
     /// The terminal paste buffer could not be prepared before the write.
     SpoolFailed,
+    /// The terminal command pipe refused the paste command before accepting
+    /// any command byte.
+    PasteCommandUnwritten,
     /// The manifest selected at the gate could not be proven against the
     /// live process ancestry immediately before the write.
     BindingUnprovable,
@@ -270,6 +277,7 @@ impl NotificationPreWriteCause {
             Self::PayloadUnavailable => "payload_unavailable",
             Self::WriteReadinessChanged => "write_readiness_changed",
             Self::SpoolFailed => "spool_failed",
+            Self::PasteCommandUnwritten => "paste_command_unwritten",
             Self::BindingUnprovable => "binding_unprovable",
             Self::ComposerSemanticMissing => "composer_semantic_missing",
             Self::ComposerOwnershipUnproven => "composer_ownership_unproven",
@@ -285,6 +293,7 @@ impl NotificationPreWriteCause {
             Self::PayloadUnavailable => "payload unavailable",
             Self::WriteReadinessChanged => "write readiness changed",
             Self::SpoolFailed => "paste buffer preparation failed",
+            Self::PasteCommandUnwritten => "paste command was not written",
             Self::BindingUnprovable => "binding unprovable",
             Self::ComposerSemanticMissing => "composer ownership rule missing",
             Self::ComposerOwnershipUnproven => "complete composer ownership unproven",
@@ -1038,6 +1047,10 @@ mod tests {
                 "write_readiness_changed",
             ),
             (NotificationPreWriteCause::SpoolFailed, "spool_failed"),
+            (
+                NotificationPreWriteCause::PasteCommandUnwritten,
+                "paste_command_unwritten",
+            ),
             (
                 NotificationPreWriteCause::BindingUnprovable,
                 "binding_unprovable",

@@ -428,6 +428,15 @@ supervisor exit, enqueue refusal, and unproven complete composer ownership.
 `scheduler_state_unavailable` is reserved for legacy blocked facts that did
 not journal the exact outcome.
 
+The sole live correction out of `writing` is
+`blocked_pre_write` with `pre_write_cause: "paste_command_unwritten"`. It is
+valid only when the tmux command pipe reports that its first paste-command
+write accepted zero bytes. The transition clears the projected terminal
+binding and doorbell format, restores pre-write withdrawal, and is appended
+before the runtime composer hold is released. Partial command writes, flush
+failures, tmux command errors, reply timeouts, and disconnects do not qualify;
+they remain `attention_required` with the post-write `paste_failed` cause.
+
 Admin has no pane route, so an accepted admin message reports `not_started` and
 remains in the durable admin inbox without a notification attempt.
 

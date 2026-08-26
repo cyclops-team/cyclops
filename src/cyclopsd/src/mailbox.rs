@@ -546,14 +546,18 @@ pub(crate) fn uses_incomplete_legacy_doorbell_contract(record: &NotificationReco
             .is_some_and(|binding| binding.pane_root.is_none())
 }
 
-/// Accept the direct Staged to Submitted edge written before submit intent
-/// became its own durable state. Current process bindings use the strict graph.
+/// Admit the one cause-gated correction whose transport proves zero command
+/// bytes, plus the historical direct Staged to Submitted replay edge.
 fn notification_transition_allowed(
     record: &NotificationRecord,
     next: NotificationState,
+    pre_write_cause: Option<NotificationPreWriteCause>,
     replaying: bool,
 ) -> bool {
     record.state.can_transition_to(next)
+        || (record.state == NotificationState::Writing
+            && next == NotificationState::BlockedPreWrite
+            && pre_write_cause == Some(NotificationPreWriteCause::PasteCommandUnwritten))
         || (replaying
             && record.state == NotificationState::Staged
             && next == NotificationState::Submitted
@@ -1476,7 +1480,19 @@ impl MailboxProjection {
             {
                 return Err(MailboxError::NotificationPreWriteReopenExhausted);
             }
-            Some(current) if !notification_transition_allowed(current, state, replaying) => {
+            Some(current)
+                if pre_write_cause == Some(NotificationPreWriteCause::PasteCommandUnwritten)
+                    && !(current.state == NotificationState::Writing
+                        && state == NotificationState::BlockedPreWrite) =>
+            {
+                return Err(MailboxError::InvalidNotificationTransition {
+                    from: current.state,
+                    to: state,
+                });
+            }
+            Some(current)
+                if !notification_transition_allowed(current, state, pre_write_cause, replaying) =>
+            {
                 return Err(MailboxError::InvalidNotificationTransition {
                     from: current.state,
                     to: state,
@@ -1627,6 +1643,10 @@ impl MailboxProjection {
                     state,
                     binding: if state == NotificationState::Writing {
                         binding
+                    } else if state == NotificationState::BlockedPreWrite
+                        && pre_write_cause == Some(NotificationPreWriteCause::PasteCommandUnwritten)
+                    {
+                        None
                     } else {
                         current.binding.clone()
                     },
@@ -1637,6 +1657,10 @@ impl MailboxProjection {
                     },
                     doorbell_format: if state == NotificationState::Writing {
                         doorbell_format
+                    } else if state == NotificationState::BlockedPreWrite
+                        && pre_write_cause == Some(NotificationPreWriteCause::PasteCommandUnwritten)
+                    {
+                        None
                     } else {
                         current.doorbell_format
                     },
@@ -3001,7 +3025,13 @@ impl MailboxProjection {
                             *attempt_id == record.attempt_id || active.recipient != record.recipient
                         });
                 }
-                if bound_write
+                let proven_unwritten = record.state == NotificationState::BlockedPreWrite
+                    && record.pre_write_cause
+                        == Some(NotificationPreWriteCause::PasteCommandUnwritten);
+                if proven_unwritten {
+                    self.active_notification_barriers.remove(&record.attempt_id);
+                    self.notification_write_sequences.remove(&record.attempt_id);
+                } else if bound_write
                     || self
                         .active_notification_barriers
                         .contains_key(&record.attempt_id)
