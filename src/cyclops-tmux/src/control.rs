@@ -274,25 +274,32 @@ impl CommandPipe {
         line.push('\n');
         let write = write_command_line(stdin, line.as_bytes()).await;
         if let Err(error) = write {
-            // A failed control write poisons FIFO correlation even when no
-            // byte landed. Close the stream, then report whether this command
-            // was provably unwritten or may have reached tmux.
-            *guard = None;
-            drop(guard);
-            self.reply_slots.close();
-            let mut pending = self.pending.lock().expect("pending lock");
-            while let Some(slot) = pending.pop_front() {
-                if let ReplyTarget::Caller(tx) = slot.target {
-                    let _ = tx.send(Err(TmuxError::Disconnected));
-                }
-            }
-            return Err(match error {
-                CommandWriteError::Unwritten(error) => TmuxError::Io(error),
-                CommandWriteError::Uncertain(error) => TmuxError::WriteUncertain(error),
-            });
+            return Err(self.poison_after_write_failure(&mut *guard, error));
         }
         self.issued.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// A failed write breaks FIFO correlation for every command on this pipe.
+    /// Close it once, fail pending callers, and preserve whether this command
+    /// was provably unwritten or may have reached tmux.
+    fn poison_after_write_failure(
+        &self,
+        stdin: &mut Option<ChildStdin>,
+        error: CommandWriteError,
+    ) -> TmuxError {
+        *stdin = None;
+        self.reply_slots.close();
+        let mut pending = self.pending.lock().expect("pending lock");
+        while let Some(slot) = pending.pop_front() {
+            if let ReplyTarget::Caller(tx) = slot.target {
+                let _ = tx.send(Err(TmuxError::Disconnected));
+            }
+        }
+        match error {
+            CommandWriteError::Unwritten(error) => TmuxError::Io(error),
+            CommandWriteError::Uncertain(error) => TmuxError::WriteUncertain(error),
+        }
     }
 
     /// Drop stdin (tmux sees EOF) and fail everything still waiting.
@@ -1539,46 +1546,46 @@ mod tests {
         ));
     }
 
-    /// The pipe-level contract a closed child stdin proves without a timing
-    /// premise: the first submit fails (unwritten or uncertain, whichever the
-    /// OS observes first), and the pipe is poisoned so nothing replays.
+    /// A classified write failure poisons the pipe, fails pending callers,
+    /// and prevents a later command from entering the broken FIFO.
     #[tokio::test]
-    async fn a_closed_command_sink_fails_the_first_submit_and_poisons_the_pipe() {
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg("exec 0<&-; printf 'stdin-closed\\n'; exec sleep 30")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("spawn closed command sink");
-        let stdin = child.stdin.take().expect("closed sink stdin");
-        let mut ready = String::new();
-        BufReader::new(child.stdout.take().expect("closed sink stdout"))
-            .read_line(&mut ready)
-            .await
-            .expect("read closed-sink readiness");
-        assert_eq!(ready, "stdin-closed\n");
-        let pipe = CommandPipe {
-            stdin: Arc::new(Mutex::new(Some(stdin))),
-            pending: Arc::new(StdMutex::new(VecDeque::new())),
-            reply_slots: Arc::new(Semaphore::new(2)),
-            issued: Arc::new(AtomicU64::new(0)),
-        };
+    async fn a_write_failure_poisons_the_pipe_and_fails_pending_callers() {
+        let (pipe, mut child) = command_pipe_without_replies(2);
+        let (tx, rx) = oneshot::channel();
+        let permit = Arc::clone(&pipe.reply_slots)
+            .try_acquire_owned()
+            .expect("reply capacity");
+        pipe.pending
+            .lock()
+            .expect("pending lock")
+            .push_back(ReplySlot {
+                target: ReplyTarget::Caller(tx),
+                _permit: permit,
+            });
 
-        let first = pipe.submit("display-message -p not-sent").await;
-        child.kill().await.expect("stop closed command sink");
-        assert!(
-            matches!(
-                first,
-                Err(TmuxError::Io(_)) | Err(TmuxError::WriteUncertain(_))
-            ),
-            "a closed sink fails the first submit one way or the other: {first:?}"
-        );
+        let mapped = {
+            let mut stdin = pipe.stdin.lock().await;
+            pipe.poison_after_write_failure(
+                &mut *stdin,
+                CommandWriteError::Unwritten(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed before the first byte",
+                )),
+            )
+        };
+        assert!(matches!(mapped, TmuxError::Io(_)));
+        assert!(matches!(rx.await, Ok(Err(TmuxError::Disconnected))));
+        assert!(pipe.stdin.lock().await.is_none());
+        assert!(pipe.pending.lock().expect("pending lock").is_empty());
         assert!(matches!(
             pipe.submit("display-message -p never-replay").await,
             Err(TmuxError::Disconnected)
         ));
-        assert!(pipe.pending.lock().expect("pending lock").is_empty());
+        let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .expect("command sink exits after stdin closes")
+            .expect("wait for command sink");
+        assert!(status.success(), "command sink exit: {status}");
     }
 
     #[tokio::test]
