@@ -22,6 +22,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 
+const CLIENT_LINE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Fixture manifest: binds one test-owned shell alias and gives fusion one title
 /// tier and one screen tier with deliberately different states, so both
 /// the title-decides path and the disagreement path are exercised without
@@ -103,9 +105,9 @@ impl TestClient {
     }
 
     async fn next_line(&mut self) -> Value {
-        let line = tokio::time::timeout(Duration::from_secs(5), self.lines.next_line())
+        let line = tokio::time::timeout(CLIENT_LINE_TIMEOUT, self.lines.next_line())
             .await
-            .expect("line within 5s")
+            .expect("line within 30s")
             .expect("read line")
             .expect("connection open");
         serde_json::from_str(&line).expect("line parses")
@@ -143,7 +145,10 @@ impl TestClient {
         let deadline = Instant::now() + within;
         loop {
             assert!(Instant::now() < deadline, "no event within {within:?}");
-            let v = self.next_line().await;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let v = tokio::time::timeout(remaining, self.next_line())
+                .await
+                .unwrap_or_else(|_| panic!("no event within {within:?}"));
             if v.get("event").is_some() {
                 return v;
             }

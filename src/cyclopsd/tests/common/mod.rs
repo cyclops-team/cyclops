@@ -26,6 +26,9 @@ const MAX_CONCURRENT_RIGS: usize = 8;
 // RECONNECT_MIN reaches RECONNECT_MAX after 6.2 seconds. Allow two complete
 // five-second retries after that ladder, then round up for runner scheduling.
 const SESSION_ATTACH_TIMEOUT: Duration = Duration::from_secs(20);
+// Integration requests can wait behind a reconnect or screen recompute on a
+// loaded runner. Keep the bound finite while allowing that work to finish.
+const CLIENT_LINE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn rig_slots() -> &'static Arc<Semaphore> {
     static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -708,11 +711,19 @@ impl TestClient {
     }
 
     pub async fn next_line(&mut self) -> Value {
-        let line = tokio::time::timeout(Duration::from_secs(10), self.lines.next_line())
-            .await
-            .expect("line within 10s")
-            .expect("read line")
-            .expect("connection open");
+        self.next_line_for(None).await
+    }
+
+    async fn next_line_for(&mut self, request: Option<(u64, &str)>) -> Value {
+        let line = match tokio::time::timeout(CLIENT_LINE_TIMEOUT, self.lines.next_line()).await {
+            Ok(line) => line.expect("read line").expect("connection open"),
+            Err(_) => match request {
+                Some((id, method)) => {
+                    panic!("no line within 30s while waiting for request {id} ({method})")
+                }
+                None => panic!("no line within 30s while waiting for an event"),
+            },
+        };
         serde_json::from_str(&line).expect("line parses")
     }
 
@@ -725,7 +736,7 @@ impl TestClient {
             .await
             .expect("write to daemon");
         loop {
-            let v = self.next_line().await;
+            let v = self.next_line_for(Some((id, method))).await;
             if v.get("event").is_some() {
                 self.pending_events.push_back(v);
                 continue;
@@ -760,7 +771,10 @@ impl TestClient {
                 Instant::now() < deadline,
                 "no matching event within {within:?}"
             );
-            let v = self.next_line().await;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let v = tokio::time::timeout(remaining, self.next_line())
+                .await
+                .unwrap_or_else(|_| panic!("no matching event within {within:?}"));
             if v.get("event").is_some() {
                 if pred(&v) {
                     return v;
