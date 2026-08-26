@@ -3249,7 +3249,7 @@ fn rename_session_slot_locked(
                 target_idx = other_idx,
                 "rename collision source has no journal file name"
             );
-            return true;
+            return false;
         };
         if inner
             .append_line(
@@ -3272,7 +3272,7 @@ fn rename_session_slot_locked(
                 target_idx = other_idx,
                 "rename collision history link could not be recorded"
             );
-            return true;
+            return false;
         }
         if !other.retire_as_alias(idx) {
             error!(
@@ -6616,6 +6616,112 @@ process_names = ["never"]
             .unwrap()
             .iter()
             .any(|line| { line.subject.as_deref() == Some("canonical-only notification") }));
+
+        let _ = stop_tx.send(true);
+        let tasks = std::mem::take(&mut *inner.extra_tasks.lock().unwrap());
+        for task in tasks {
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("runtime session task stops")
+                .expect("runtime session task does not panic");
+        }
+        drop(runtime);
+        drop(configured);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// The opposite registration order is equally important: the runtime
+    /// rename can retire the configured slot before its task ever publishes.
+    /// Starting that task afterwards must observe the alias and exit without
+    /// attaching a second watcher or route.
+    #[tokio::test]
+    async fn a_rename_that_wins_registration_prevents_the_configured_slot_from_publishing() {
+        if !cyclops_testrig::tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let server = cyclops_testrig::TmuxServer::new("rename-wins-registration");
+        server.run_ok(&["new-session", "-d", "-s", "yahirh", "/bin/sh"]);
+
+        let mut inner = bare_inner("cyc-rename-wins-registration");
+        let home = inner.cfg.home.clone();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        {
+            let mutable = Arc::get_mut(&mut inner).expect("bare inner is unique");
+            mutable.cfg.tmux_socket = Some(server.socket().to_string());
+            mutable.cfg.tmux_config = Some(PathBuf::from("/dev/null"));
+            mutable.shutdown_request = stop_tx.clone();
+            mutable.stop = stop_rx;
+        }
+
+        let configured_ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/research.ndjson"),
+            &inner.boot_id,
+        )
+        .unwrap();
+        let configured = Arc::new(SessionSlot::new(
+            "research".into(),
+            Arc::new(configured_ledger),
+        ));
+        let configured_idx = {
+            let mut sessions = inner.sessions.lock().unwrap();
+            sessions.push(Arc::clone(&configured));
+            sessions.len() - 1
+        };
+
+        let (runtime_idx, added) = watch_session(&inner, "yahirh")
+            .await
+            .expect("runtime session is watched");
+        assert!(added);
+        let runtime = inner.session(runtime_idx).unwrap();
+        wait_for_session_binding(&runtime, None).await;
+
+        server.run_ok(&["rename-session", "-t", "=yahirh", "research"]);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if configured.alias_of() == Some(runtime_idx) && runtime.name() == "research" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("rename retires the unpublished configured slot");
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::spawn(session_task(
+                Arc::clone(&inner),
+                configured_idx,
+                inner.stop.clone(),
+            )),
+        )
+        .await
+        .expect("retired configured task exits")
+        .expect("retired configured task does not panic");
+        {
+            let link = configured.link.lock().unwrap();
+            assert!(!link.attached);
+            assert!(link.watcher.is_none());
+            assert!(link.identity.is_none());
+        }
+        assert_eq!(inner.session_index("research"), Some(runtime_idx));
+        assert_eq!(inner.active_session_slots().len(), 1);
+        let pane_id = runtime
+            .link
+            .lock()
+            .unwrap()
+            .mailbox_panes
+            .keys()
+            .next()
+            .expect("runtime watcher published one pane")
+            .clone();
+        assert_eq!(
+            inner.resolve_recipient(&pane_id),
+            Some((runtime_idx, pane_id))
+        );
 
         let _ = stop_tx.send(true);
         let tasks = std::mem::take(&mut *inner.extra_tasks.lock().unwrap());
