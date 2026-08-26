@@ -173,9 +173,73 @@ fn vendor_hook_file(kind: CliKind) -> Option<PathBuf> {
 /// some do. Any command that invokes a cyclops binary's `hook` receiver is
 /// ours to replace; everything else in the file is the operator's and is
 /// carried through untouched.
-fn is_cyclops_entry(v: &serde_json::Value) -> bool {
-    let text = v.to_string();
-    text.contains(" hook ") && text.contains("cyclops")
+/// Is this one command hook exactly a Cyclops hook command?
+///
+/// Exactly the two rendered forms are ours: `<bin> hook <Event>` and
+/// `<bin> hook <Event> --agent <label>`, where the event and the label are
+/// plain words and `<bin>` is either one of the bin paths our own rendering
+/// uses right now (`own_bins`, which covers a test binary or any install
+/// prefix) or a path whose basename is exactly `cyclops` (an older install
+/// at another prefix). Any other trailing token, shell operator, wrapper, or
+/// suffix makes the command the operator's, and it must survive a merge:
+/// `cyclops hook Stop && echo mine` is not ours.
+fn is_cyclops_hook_command(command: &str, own_bins: &[&str]) -> bool {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let (bin, event, label) = match tokens.as_slice() {
+        [bin, "hook", event] => (*bin, *event, None),
+        [bin, "hook", event, "--agent", label] => (*bin, *event, Some(*label)),
+        _ => return false,
+    };
+    let plain_word = |word: &str| {
+        !word.is_empty()
+            && word
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    };
+    if !plain_word(event) || label.is_some_and(|label| !plain_word(label)) {
+        return false;
+    }
+    let basename = bin.rsplit('/').next().unwrap_or(bin);
+    own_bins.contains(&bin) || basename == "cyclops"
+}
+
+/// The bin paths our own rendering (`src`) uses for its hook commands.
+fn own_hook_bins(src: &[serde_json::Value]) -> Vec<&str> {
+    src.iter()
+        .filter_map(|group| group.get("hooks").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter_map(|hook| hook.get("command").and_then(serde_json::Value::as_str))
+        .filter_map(|command| command.split_whitespace().next())
+        .collect()
+}
+
+/// Strip only this project's own command hooks out of one event group,
+/// keeping the group's matcher and every sibling hook the operator wrote.
+/// Returns `None` when nothing remains, so the group is dropped whole.
+fn without_cyclops_hooks(
+    group: &serde_json::Value,
+    own_bins: &[&str],
+) -> Option<serde_json::Value> {
+    use serde_json::Value;
+    let Some(hooks) = group.get("hooks").and_then(Value::as_array) else {
+        return Some(group.clone());
+    };
+    let kept: Vec<Value> = hooks
+        .iter()
+        .filter(|hook| {
+            !hook
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|command| is_cyclops_hook_command(command, own_bins))
+        })
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let mut stripped = group.clone();
+    stripped["hooks"] = Value::Array(kept);
+    Some(stripped)
 }
 
 /// Merge `src` into `dst`, replacing only this project's own entries.
@@ -194,9 +258,20 @@ fn merge_into(dst: &mut serde_json::Value, src: &serde_json::Value) {
             }
         }
         (d @ Value::Array(_), Value::Array(s)) => {
+            // Groups are `{ "matcher"?: .., "hooks": [ .. ] }`. Only the
+            // exact Cyclops command hooks inside each group are ours to
+            // replace; a mixed group keeps its operator hooks and its
+            // matcher, an emptied group goes, and exactly one current
+            // Cyclops group is appended. Running this twice is a no-op.
+            let own_bins = own_hook_bins(s);
             let kept: Vec<Value> = d
                 .as_array()
-                .map(|a| a.iter().filter(|e| !is_cyclops_entry(e)).cloned().collect())
+                .map(|groups| {
+                    groups
+                        .iter()
+                        .filter_map(|group| without_cyclops_hooks(group, &own_bins))
+                        .collect()
+                })
                 .unwrap_or_default();
             *d = Value::Array(kept.into_iter().chain(s.iter().cloned()).collect());
         }
@@ -1808,5 +1883,125 @@ mod tests {
                 .unwrap_or_else(|| panic!("cursor: {event} entry shape"));
             assert_eq!(cmd, format!("cyclops hook {event} --agent r"));
         }
+    }
+
+    /// The merge replaces only the exact Cyclops command hooks inside each
+    /// group: a mixed group keeps the operator's hook and its matcher, an
+    /// operator command that merely mentions the words survives, and two
+    /// merges are byte-identical.
+    #[test]
+    fn the_merge_strips_only_exact_cyclops_hooks_inside_a_group() {
+        let theirs = serde_json::json!({
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "matcher": "startup",
+                        "hooks": [
+                            { "type": "command", "command": "echo mine" },
+                            { "type": "command", "command": "/old/prefix/bin/cyclops hook SessionStart" }
+                        ]
+                    },
+                    { "hooks": [ { "type": "command", "command": "/old/prefix/bin/cyclops hook SessionStart --agent r" } ] }
+                ],
+                "Stop": [
+                    { "hooks": [ { "type": "command", "command": "echo cyclops hook fired" } ] },
+                    { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook Stop && echo mine" } ] }
+                ]
+            }
+        });
+        let ours: serde_json::Value =
+            serde_json::from_str(&render_shared(CliKind::Claude, GOLDEN_BIN)).unwrap();
+        let mut doc = theirs.clone();
+        merge_into(&mut doc, &ours);
+        let session_start = doc["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(
+            session_start.len(),
+            2,
+            "mixed group kept, empty group dropped, ours once: {session_start:?}"
+        );
+        assert_eq!(
+            session_start[0]["matcher"], "startup",
+            "the group matcher survived"
+        );
+        assert_eq!(
+            session_start[0]["hooks"],
+            serde_json::json!([{ "type": "command", "command": "echo mine" }]),
+            "the operator hook survived and the old Cyclops hook went"
+        );
+        assert_eq!(
+            session_start[1]["hooks"][0]["command"],
+            format!("{GOLDEN_BIN} hook SessionStart"),
+            "exactly one current Cyclops group appended"
+        );
+        let stop = doc["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(
+            stop[0]["hooks"][0]["command"], "echo cyclops hook fired",
+            "an unrelated command containing the words is not ours"
+        );
+        assert_eq!(
+            stop[1]["hooks"][0]["command"], "/opt/cyclops/bin/cyclops hook Stop && echo mine",
+            "an operator suffix makes the command theirs"
+        );
+        assert_eq!(
+            stop.len(),
+            3,
+            "two operator groups kept, ours appended once"
+        );
+        let once = serde_json::to_string(&doc).unwrap();
+        merge_into(&mut doc, &ours);
+        assert_eq!(
+            serde_json::to_string(&doc).unwrap(),
+            once,
+            "two merges are byte-identical"
+        );
+    }
+
+    #[test]
+    fn only_the_exact_hook_command_shape_is_ours() {
+        let own = ["/tmp/target/debug/deps/cyclops-0123abcd"];
+        assert!(is_cyclops_hook_command(
+            "/opt/cyclops/bin/cyclops hook Stop",
+            &own
+        ));
+        assert!(is_cyclops_hook_command(
+            "cyclops hook beforeSubmitPrompt --agent r",
+            &own
+        ));
+        assert!(is_cyclops_hook_command(
+            "/tmp/target/debug/deps/cyclops-0123abcd hook Stop",
+            &own
+        ));
+        // not ours: wrong shape, wrong binary, or anything trailing
+        assert!(!is_cyclops_hook_command("echo cyclops hook fired", &own));
+        assert!(!is_cyclops_hook_command(
+            "/usr/bin/notify cyclops hook",
+            &own
+        ));
+        assert!(!is_cyclops_hook_command("cyclops hook", &own));
+        assert!(!is_cyclops_hook_command("cyclops-shim hook Stop", &own));
+        assert!(
+            !is_cyclops_hook_command("cyclops hook Stop && echo mine", &own),
+            "shell suffix"
+        );
+        assert!(
+            !is_cyclops_hook_command("cyclops hook Stop --verbose", &own),
+            "unknown extra argument"
+        );
+        assert!(
+            !is_cyclops_hook_command("cyclops hook Stop --agent r extra", &own),
+            "token after the label"
+        );
+        assert!(
+            !is_cyclops_hook_command("sh -c 'cyclops hook Stop'", &own),
+            "wrapper"
+        );
+        assert!(
+            !is_cyclops_hook_command("cyclops hook Stop;", &own),
+            "operator glued to the event"
+        );
+        assert!(
+            !is_cyclops_hook_command("cyclops hook Stop --agent 'r; rm'", &own),
+            "operator in the label"
+        );
     }
 }
