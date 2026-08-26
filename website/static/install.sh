@@ -393,6 +393,16 @@ mkdir -p "$PREFIX" 2>/dev/null ||
     die "$PREFIX is not writable, and this installer never uses sudo" \
         "pick a directory you own: ./scripts/install.sh --prefix ~/.local/bin"
 
+# Pair activation restarts an already-running daemon before setup below can
+# replace its seeded manifests. Remember that pre-install fact so setup can
+# reload only a daemon the operator was already running; a fresh install must
+# not start one as a side effect.
+DAEMON_WAS_RUNNING=0
+if "$PAIR_SOURCE/cyclops" daemon status --json 2>/dev/null |
+    grep -q '"daemon_process":'; then
+    DAEMON_WAS_RUNNING=1
+fi
+
 # The candidate owns pair validation, journal replay, daemon quiescence, and
 # the one selector change. The shell never publishes two binaries separately.
 "$PAIR_SOURCE/cyclops" update --install-pair "$PAIR_SOURCE" --prefix "$PREFIX" ||
@@ -511,6 +521,17 @@ if ! "$PREFIX/cyclops" start --setup-only --wire-hooks; then
     else
         incomplete "home setup did not finish" \
             "repair it with: $PREFIX/cyclops start --setup-only --wire-hooks"
+    fi
+fi
+
+# Activation above restarted the old daemon before setup installed this
+# pair's manifests. Reload that same live service now so the selected binary
+# and its detection rules become one effective version. No daemon was running
+# on a fresh install, so that path remains setup-only.
+if [ "$DAEMON_WAS_RUNNING" -eq 1 ]; then
+    if ! "$PREFIX/cyclops" daemon restart --plain; then
+        incomplete "the installed setup could not be loaded by the daemon" \
+            "the matched pair remains active; retry: $PREFIX/cyclops daemon restart --plain"
     fi
 fi
 
