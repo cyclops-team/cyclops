@@ -1393,6 +1393,7 @@ mod tests {
             stream_reconcile_requests: None,
             messages_focused: false,
             messages_gate: cyclops_ui::RefreshGate::new(),
+            messages_refresh_error: None,
             messages_send_tx: None,
             messages_composer_revision: 0,
             messages_send_in_flight: None,

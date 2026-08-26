@@ -584,9 +584,23 @@ impl RefreshGate {
             return false;
         }
         // The last snapshot remains useful but is no longer current.
-        // Move to Lost so the operator gets one explicit R recovery path
-        // instead of an automatic retry loop or a permanently disabled UI.
+        // Move to Lost so clients whose snapshot shares the subscription
+        // reconnect explicitly instead of retrying forever.
         self.link = Link::Lost;
+        self.snapshot_current = false;
+        true
+    }
+
+    /// Finish a failed one-shot snapshot while the caller's independent
+    /// event subscription remains acknowledged.
+    pub fn finish_snapshot_failure(&mut self, request: RefreshRequest) -> bool {
+        if self.in_flight != Some(request) {
+            return false;
+        }
+        self.in_flight = None;
+        if request.generation != self.generation {
+            return false;
+        }
         self.snapshot_current = false;
         true
     }

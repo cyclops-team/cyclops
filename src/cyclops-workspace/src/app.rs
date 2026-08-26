@@ -207,6 +207,7 @@ enum AppMsg {
     /// A messages snapshot request failed or timed out.
     MessagesSnapshotFailed {
         request: cyclops_ui::RefreshRequest,
+        error: String,
     },
     /// Message detail or claim response for one frozen target.
     MessageDetailFinished {
@@ -548,6 +549,10 @@ struct App {
     messages_focused: bool,
     /// Refresh gate and connection lifecycle for the Messages drawer.
     messages_gate: cyclops_ui::RefreshGate,
+    /// Exact failure from the last whole-snapshot RPC. Kept until another
+    /// request starts or a current snapshot lands so the drawer never hides
+    /// an authentication, routing, or transport failure behind `refresh failed`.
+    messages_refresh_error: Option<String>,
     /// Async worker for Messages composer sends.
     messages_send_tx: Option<std::sync::mpsc::SyncSender<MessagesSendTask>>,
     /// Local edit generation used to reject completions for abandoned drafts.
@@ -1030,9 +1035,9 @@ pub async fn run_async() -> i32 {
                         return;
                     }
                 }
-                Err(_) => {
+                Err(error) => {
                     if msg_snapshot_results
-                        .blocking_send(AppMsg::MessagesSnapshotFailed { request })
+                        .blocking_send(AppMsg::MessagesSnapshotFailed { request, error })
                         .is_err()
                     {
                         return;
@@ -1294,6 +1299,7 @@ pub async fn run_async() -> i32 {
         stream_reconcile_requests: Some(stream_reconcile_tx),
         messages_focused: false,
         messages_gate: cyclops_ui::RefreshGate::new(),
+        messages_refresh_error: None,
         messages_send_tx: Some(messages_send_tx),
         messages_composer_revision: 0,
         messages_send_in_flight: None,
@@ -3043,6 +3049,7 @@ fn finish_message_detail(
 fn request_messages_snapshot(app: &mut App) {
     match app.messages_gate.link() {
         cyclops_ui::Link::Connected => {
+            app.messages_refresh_error = None;
             app.messages_gate.mark_dirty();
             pump_messages_refresh(app);
         }
@@ -3334,6 +3341,7 @@ async fn handle_app_msg(
         AppMsg::MessagesSnapshotLoaded { request, result } => {
             let accepted = app.messages_gate.finish_snapshot(request, &result);
             if accepted {
+                app.messages_refresh_error = None;
                 app.messages_caller = result.caller;
                 app.messages_queue
                     .replace(cyclops_ui::messages::rows_from_snapshot(&result));
@@ -3342,9 +3350,11 @@ async fn handle_app_msg(
             pump_messages_refresh(app);
             arm(debounce);
         }
-        AppMsg::MessagesSnapshotFailed { request } => {
-            app.messages_gate.finish_failure(request);
-            app.messages_caller = None;
+        AppMsg::MessagesSnapshotFailed { request, error } => {
+            if app.messages_gate.finish_snapshot_failure(request) {
+                app.messages_refresh_error = Some(error);
+                app.messages_caller = None;
+            }
             pump_messages_refresh(app);
             arm(debounce);
         }
@@ -4369,31 +4379,36 @@ async fn handle_messages_key(
 ) -> Result<Option<InputOutcome>, cyclops_tmux::TmuxError> {
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    if !app.model.messages_visible || !app.messages_focused {
+    if !app.model.messages_visible {
+        return Ok(None);
+    }
+
+    if matches!(key.code, KeyCode::Char('r'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && (app.messages_focused || app.messages_refresh_error.is_some())
+    {
+        if matches!(
+            app.messages_composer.stage,
+            Some(cyclops_ui::Stage::Uncertain { .. })
+        ) {
+            app.messages_reconcile_owed = MessagesDraftIdentity::current(
+                &app.messages_composer,
+                app.messages_composer_revision,
+                app.messages_caller,
+            );
+        }
+        request_messages_snapshot(app);
+        app.notice.show("Refreshing messages", Instant::now());
+        return Ok(Some(InputOutcome::Redraw));
+    }
+
+    if !app.messages_focused {
         return Ok(None);
     }
 
     // If the composer is focused and active, it handles typing and sending:
     if app.messages_composer.focused && app.messages_composer.mode.is_some() {
         match key.code {
-            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if matches!(
-                    app.messages_composer.stage,
-                    Some(cyclops_ui::Stage::Uncertain { .. })
-                ) {
-                    app.messages_reconcile_owed = MessagesDraftIdentity::current(
-                        &app.messages_composer,
-                        app.messages_composer_revision,
-                        app.messages_caller,
-                    );
-                }
-                request_messages_snapshot(app);
-                app.notice.show(
-                    "Refresh requested; the uncertain send stays blocked until current state lands",
-                    Instant::now(),
-                );
-                return Ok(Some(InputOutcome::Redraw));
-            }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if app.messages_composer.push_char(c) {
                     messages_composer_changed(app);
@@ -5550,11 +5565,15 @@ fn draw(
                     .iter()
                     .filter_map(|(id, p)| p.manifest.as_ref().map(|m| (id.clone(), m.clone())))
                     .collect();
-                let link_status = if app.messages_gate.link() == cyclops_ui::Link::Lost {
-                    Some("refresh failed · Ctrl+R to retry")
-                } else {
-                    app.notice.text()
-                };
+                let refresh_status = app
+                    .messages_refresh_error
+                    .as_ref()
+                    .map(|error| format!("refresh failed: {error} · Ctrl+R to retry"));
+                let link_status = refresh_status.as_deref().or_else(|| {
+                    (app.messages_gate.link() == cyclops_ui::Link::Lost)
+                        .then_some("daemon reconnecting")
+                        .or_else(|| app.notice.text())
+                });
                 paint_messages(
                     &app.messages_queue,
                     app.messages_detail.as_ref(),
@@ -5888,6 +5907,7 @@ mod tests {
             stream_reconcile_requests: None,
             messages_focused: false,
             messages_gate: cyclops_ui::RefreshGate::new(),
+            messages_refresh_error: None,
             messages_send_tx: None,
             messages_composer_revision: 0,
             messages_send_in_flight: None,
@@ -6225,6 +6245,110 @@ mod tests {
         assert!(!app.messages_gate.may_mutate());
         request_messages_snapshot(&mut app);
         assert_eq!(app.messages_gate.link(), cyclops_ui::Link::Connecting);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn ctrl_r_retries_a_failed_snapshot_without_drawer_focus() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let home = cyclops_proto::scratch::scratch_dir("workspace-messages-retry");
+        let mut model = one_pane_model();
+        model.messages_visible = true;
+        let mut app = test_app(model, home.clone());
+        app.messages_gate.connected();
+        let failed = app.messages_gate.begin().expect("initial snapshot");
+        assert!(app.messages_gate.finish_snapshot_failure(failed));
+        app.messages_refresh_error = Some("old daemon closed the socket".into());
+        app.messages_focused = false;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        app.messages_snapshot_tx = Some(tx);
+
+        let outcome = handle_messages_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        )
+        .await
+        .expect("key handling");
+
+        assert!(matches!(outcome, Some(InputOutcome::Redraw)));
+        assert!(app.messages_refresh_error.is_none());
+        assert!(app.messages_gate.is_fetching());
+        let (_, limit) = rx.try_recv().expect("retry request");
+        assert_eq!(limit, 128);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn clicking_the_messages_chevron_collapses_the_drawer() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+        use ratatui::{buffer::Buffer, layout::Rect};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-messages-toggle");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "/bin/sh",
+        ]);
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-messages-toggle-home");
+        let mut model = one_pane_model();
+        model.messages_visible = true;
+        let mut app = test_app(model, home.clone());
+        app.prefs.messages_visible = true;
+        let area = Rect::new(50, 0, 30, 24);
+        let mut buffer = Buffer::empty(area);
+        paint_messages(
+            &app.messages_queue,
+            None,
+            None,
+            &app.avatar_registry,
+            None,
+            None,
+            None,
+            area,
+            &mut buffer,
+            &app.paint,
+            &mut app.hit_map,
+            None,
+        );
+        let (column, row) = (0..80u16)
+            .flat_map(|column| (0..24u16).map(move |row| (column, row)))
+            .find(|&(column, row)| {
+                matches!(
+                    app.hit_map.hit(column, row),
+                    Some(HitTarget::MessagesToggle)
+                )
+            })
+            .expect("messages chevron hit target");
+        let mut detached = false;
+
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), column, row),
+            &mut detached,
+        )
+        .await
+        .expect("click");
+
+        assert!(!app.model.messages_visible);
+        assert!(!app.prefs.messages_visible);
+        assert!(!app.messages_focused);
+        client.shutdown().await;
         let _ = std::fs::remove_dir_all(home);
     }
 
