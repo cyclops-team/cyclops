@@ -970,15 +970,13 @@ fn sound_lines(sound: &SoundPicker) -> Vec<SettingsLine<'_>> {
 /// The muted line under the list. The theme section's says how to drive
 /// the card, or what an apply that could not go live had to say, or
 /// where themes come from when there are none to list. The sound section
-/// says its piece at the top ([`sound_lines`]) and has none. The keybinds
-/// section's spells out the status glyphs its rows' actions act on
-/// (rule 11): the sidebar and pane borders show only the glyph half.
+/// says its piece at the top ([`sound_lines`]) and has none; the keybinds
+/// section's rows explain themselves and it has none either.
 fn settings_footer(section: SettingsSection, themes: &ThemePicker) -> &str {
     match section {
         SettingsSection::Theme if themes.names.is_empty() => copy::THEMES_EMPTY,
         SettingsSection::Theme => themes.notice.as_deref().unwrap_or(copy::THEMES_HINT),
-        SettingsSection::Sound => "",
-        SettingsSection::Keybinds => copy::STATE_GLYPH_LEGEND,
+        SettingsSection::Sound | SettingsSection::Keybinds => "",
     }
 }
 
@@ -1006,7 +1004,6 @@ fn settings_frame(
     let footers = [
         copy::THEMES_HINT,
         copy::THEMES_EMPTY,
-        copy::STATE_GLYPH_LEGEND,
         themes.notice.as_deref().unwrap_or(""),
     ];
     let footer_lines = footers
@@ -2323,9 +2320,9 @@ mod tests {
 
     /// The keybinds section: the chord and the action of every active
     /// binding behind a viewport, scrolled to the row asked for and no
-    /// further, the count of what is showing at the right, the status
-    /// legend under the list, and one close control that answers the
-    /// mouse. No row is a target: there is nothing on one to choose.
+    /// further, the count of what is showing at the right, and one close
+    /// control that answers the mouse. No row is a target: there is
+    /// nothing on one to choose.
     #[test]
     fn the_keybinds_section_scrolls_to_the_last_row_and_closes() {
         let area = Rect::new(0, 0, 60, 24);
@@ -2361,10 +2358,6 @@ mod tests {
         assert!(
             flat.contains(&format!("{}–20 / 20", usize::from(max) + 1)),
             "the rows showing are counted: {flat}"
-        );
-        assert!(
-            flat.contains("○ idle"),
-            "the status legend explains the glyphs: {flat}"
         );
         assert!(
             !flat.contains("Apply") && flat.contains("Esc Close"),

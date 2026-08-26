@@ -21,11 +21,6 @@ pub const NAME_PANE_TITLE: &str = "Name pane";
 
 pub const NAME_PANE_HINT: &str = "Used to identify and message this agent, e.g. reviewer.";
 
-/// The compact state vocabulary (rule 11), spelled out once under the
-/// settings card's keybinds section since sidebar rows and inactive pane
-/// borders show only the glyph half of it.
-pub const STATE_GLYPH_LEGEND: &str = "Status:  ○ idle   ● working   ⚠ needs attention   ✕ dead";
-
 pub const RENAME_WORKSPACE_PROMPT: &str = "Rename session";
 
 pub const CONFIRM_CLOSE_WORKSPACE: &str = "Close this session?";

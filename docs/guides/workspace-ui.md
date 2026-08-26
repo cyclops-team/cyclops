@@ -307,12 +307,10 @@ sections never resizes it.
   and action, generated from the bindings actually in force rather than
   from documentation, so a rebinding in `config.toml` is what it shows.
   It reads only; the list scrolls (`↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End`,
-  or the wheel, three rows a notch), the count at the bottom right says
-  which rows are showing, and the line under the list spells out the
-  status glyphs (`○ idle`, `● working`, `⚠ needs attention`, `✕ dead`)
-  the sidebar and pane borders show only the glyph of. `Enter` and `Esc`
-  both close it; there is nothing on it to apply. `Ctrl+B` `?` opens the
-  card on this section directly.
+  or the wheel, three rows a notch), and the count at the bottom right
+  says which rows are showing. `Enter` and `Esc` both close it; there is
+  nothing on it to apply. `Ctrl+B` `?` opens the card on this section
+  directly.
 
 `show_settings` is the binding name; `show_themes`, from when the card
 was only a theme picker, still works in an existing config.
