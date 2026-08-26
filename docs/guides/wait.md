@@ -8,7 +8,7 @@ occupant so a dead or replaced pane can never read as success.
 
 ```
 cyclops wait reviewer --until idle
-cyclops wait codex --until done --timeout 5m
+cyclops wait codex --until turn-ended --timeout 5m
 ```
 
 `--until` takes one of three targets:
@@ -16,7 +16,7 @@ cyclops wait codex --until done --timeout 5m
 | Until | Resolves when |
 |---|---|
 | `idle` | No turn is running. Not the same as being writable: whether a message may be pasted is the daemon-stamped write-readiness answer. |
-| `done` | A turn runs on this pane and reaches idle. The occupant is rechecked, but the turn is not correlated to a message or task. |
+| `turn-ended` | Working is observed, then the same pane occupant reaches `idle` or `idle_with_input`. This does not identify which turn, message, or task caused the observations, and it does not prove write readiness. |
 | `blocked` | The agent hits any blocked state: vendor modal, permission prompt, or quota. |
 
 `--timeout` reads human durations: `90s`, `2m`, `1m30s`, `500ms`. Default
@@ -49,5 +49,5 @@ separate commands and does not advertise a message-completion wait.
 
 State edges come from sensor fusion. On agents detected only by title or
 screen rules, tmux reports changes once per second, so a turn that starts
-and ends inside the same second can be missed by `done`. Hook-wired agents
+and ends inside the same second can be missed by `turn-ended`. Hook-wired agents
 report their edges directly and are not subject to that tick.

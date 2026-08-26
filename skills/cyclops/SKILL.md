@@ -231,14 +231,14 @@ durable conversation.
 polling `cyclops status` in a loop.
 
 ```
-cyclops wait <agent> --until idle|done|blocked [--timeout 90s]
+cyclops wait <agent> --until idle|turn-ended|blocked [--timeout 90s]
 ```
 
 - `idle` means no turn is running. That is a statement about the turn, not
   permission to write: whether a notification may be written is the separate
   write-readiness answer the daemon stamps, which `cyclops read <agent>
   --source detection` shows beside the state.
-- `done`: a turn runs on the pane and reaches idle. If the agent is already
+- `turn-ended`: Cyclops observes Working and then idle on the same pane. If the agent is already
   idle, it must start and finish a turn first. This is not correlated to a
   message or task.
 - `blocked`: the agent hit a vendor modal, a permission prompt, or quota.

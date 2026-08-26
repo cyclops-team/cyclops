@@ -145,17 +145,16 @@ async fn agent_wait_idle_answers_immediately_and_unknown_targets_fail() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn agent_wait_done_resolves_on_the_working_to_idle_edge() {
+async fn agent_wait_turn_ended_resolves_on_the_working_to_idle_edge() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
-    let mut rig = Rig::new("waitdone", WAIT_MANIFEST, &composer_pane(), "").await;
+    let mut rig = Rig::new("waitturnend", WAIT_MANIFEST, &composer_pane(), "").await;
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
 
-    // CURRENT turn: put the pane mid-turn, then wait; the turn ending
-    // satisfies done.
+    // A current confirmed Working phase followed by Idle satisfies turn-ended.
     rig.tmux
         .run(&["select-pane", "-t", &pane, "-T", "WORKING now"]);
     rig.ev
@@ -173,15 +172,15 @@ async fn agent_wait_done_resolves_on_the_working_to_idle_edge() {
         .ctl
         .request(
             "agent.wait",
-            json!({"target": "worker", "until": "done", "timeout_ms": 8000}),
+            json!({"target": "worker", "until": "turn_ended", "timeout_ms": 8000}),
         )
         .await;
     driver.join().expect("driver thread");
     assert!(resp["error"].is_null(), "{resp}");
     assert_eq!(resp["result"]["state"], "idle", "{resp}");
 
-    // NEXT turn: the pane is idle now, so done must NOT resolve until a
-    // working phase has been observed AND ended. The working phase must
+    // The pane is idle now, so turn-ended must NOT resolve until a Working phase
+    // has been observed and the pane returns to Idle. The Working phase must
     // outlive tmux's 1Hz subscription tick or it is invisible (F23).
     let driver = drive_later(
         rig.tmux.socket().to_string(),
@@ -194,7 +193,7 @@ async fn agent_wait_done_resolves_on_the_working_to_idle_edge() {
         .ctl
         .request(
             "agent.wait",
-            json!({"target": "worker", "until": "done", "timeout_ms": 8000}),
+            json!({"target": "worker", "until": "turn_ended", "timeout_ms": 8000}),
         )
         .await;
     driver.join().expect("driver thread");
@@ -203,7 +202,7 @@ async fn agent_wait_done_resolves_on_the_working_to_idle_edge() {
     let waited = resp["result"]["waited_ms"].as_u64().expect("waited_ms");
     assert!(
         waited >= 400,
-        "done resolved before the driven turn even started ({waited}ms): {resp}"
+        "turn-ended resolved before the driven turn even started ({waited}ms): {resp}"
     );
     rig.shutdown().await;
 }
@@ -245,12 +244,12 @@ async fn agent_wait_timeout_is_a_wire_error_naming_the_state() {
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
 
-    // Nothing ever works: done cannot be reached, so the budget expires.
+    // Nothing ever works: turn-ended cannot be reached, so the budget expires.
     let resp = rig
         .ctl
         .request(
             "agent.wait",
-            json!({"target": "worker", "until": "done", "timeout_ms": 600}),
+            json!({"target": "worker", "until": "turn_ended", "timeout_ms": 600}),
         )
         .await;
     let err = &resp["error"];
@@ -259,7 +258,7 @@ async fn agent_wait_timeout_is_a_wire_error_naming_the_state() {
         err["message"]
             .as_str()
             .unwrap()
-            .contains("did not reach done"),
+            .contains("did not reach turn ended"),
         "{resp}"
     );
     // The error data carries the state it was in, so the caller can act.
@@ -300,7 +299,7 @@ async fn agent_wait_pins_the_occupant_and_reports_a_killed_pane() {
         .ctl
         .request(
             "agent.wait",
-            json!({"target": "mortal", "until": "done", "timeout_ms": 8000}),
+            json!({"target": "mortal", "until": "turn_ended", "timeout_ms": 8000}),
         )
         .await;
     driver.join().expect("driver thread");
@@ -414,7 +413,7 @@ async fn send_wait_pins_the_submitted_occupant_not_the_impostor() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn send_wait_done_round_trip() {
+async fn send_wait_turn_ended_round_trip() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -457,7 +456,13 @@ async fn send_wait_done_round_trip() {
         // Outlive the 1Hz subscription tick (F23) so the working phase is
         // observable before the turn "ends".
         std::thread::sleep(Duration::from_millis(2000));
-        tmux(&["select-pane", "-t", &pane_for_driver, "-T", "READY done"]);
+        tmux(&[
+            "select-pane",
+            "-t",
+            &pane_for_driver,
+            "-T",
+            "READY turn ended",
+        ]);
     });
 
     let (result, _) = rig
@@ -465,7 +470,7 @@ async fn send_wait_done_round_trip() {
             "to": ["worker"],
             "subject": "run this",
             "body": "a\nb",
-            "wait": {"until": "done", "timeout_ms": 10000},
+            "wait": {"until": "turn_ended", "timeout_ms": 10000},
         }))
         .await;
     driver.join().expect("driver thread");
@@ -589,7 +594,13 @@ async fn send_wait_holds_when_the_agent_is_a_child_of_the_pane_shell() {
             "WORKING the turn",
         ]);
         std::thread::sleep(Duration::from_millis(2000));
-        tmux(&["select-pane", "-t", &pane_for_driver, "-T", "READY done"]);
+        tmux(&[
+            "select-pane",
+            "-t",
+            &pane_for_driver,
+            "-T",
+            "READY turn ended",
+        ]);
     });
 
     let (result, _) = rig
@@ -597,7 +608,7 @@ async fn send_wait_holds_when_the_agent_is_a_child_of_the_pane_shell() {
             "to": ["worker"],
             "subject": "run this",
             "body": "a\nb",
-            "wait": {"until": "done", "timeout_ms": 10000},
+            "wait": {"until": "turn_ended", "timeout_ms": 10000},
         }))
         .await;
     driver.join().expect("driver thread");
@@ -646,7 +657,7 @@ async fn a_same_command_respawn_wakes_a_pinned_wait_as_occupant_changed() {
         .ctl
         .request(
             "agent.wait",
-            json!({"target": "worker", "until": "done", "timeout_ms": 6000}),
+            json!({"target": "worker", "until": "turn_ended", "timeout_ms": 6000}),
         )
         .await;
     driver.join().expect("driver thread");
@@ -718,7 +729,7 @@ async fn a_foreground_agent_exiting_ends_the_wait_even_though_the_shell_survives
         .ctl
         .request(
             "agent.wait",
-            json!({"target": "worker", "until": "done", "timeout_ms": 6000}),
+            json!({"target": "worker", "until": "turn_ended", "timeout_ms": 6000}),
         )
         .await;
     driver.join().expect("driver thread");

@@ -159,14 +159,22 @@ composer_semantic = "clean"
 lifecycle_evidence = true
 priority = 1148
 region = "bottom_non_empty_lines(24)"
-regex = ['(?m)^[·✶✽✳✢✻]\s+\S+\s+for\s+\d+[smhd]\s+·\s+done\s+\d{1,2}:\d{2}\s+(?:AM|PM)\s*\n(?:[^·✶✽✳✢✻\n][^\n]*\n)*─{32,}\s*\n❯\s*\n─{32,}\s*\n(?:\s{0,4}(?:\S[^·\n]*(?: · [^·\n]+){2,} · \d+K window(?: · \d+K used)?|(?:Opus|Sonnet|Haiku) \d+(?:\.\d+)?(?: \([^·\n]*\))? · (?:xhigh|high|medium|low)(?: · [^·\n]+)* · [^·\n]*…)\s*(?:\n\s{0,4}paste again to expand\s*)?(?:\n\s{0,4}(?:⏸|⏵⏵) [^·\n]*\b(?:on|off)\b(?: \([^)]*\))?(?: · .+)?\s*)?|\s{0,4}(?:⏸|⏵⏵) [^·\n]*\b(?:on|off)\b(?: \([^)]*\))?(?: · .+)?\s*)\z']
+regex = ['(?m)^[·✶✽✳✢✻]\s+\S+\s+for\s+\d+[smhd](?:\s+\d+[smhd])*\s+·\s+done\s+\d{1,2}:\d{2}\s+(?:AM|PM)\s*\n(?:[^·✶✽✳✢✻\n][^\n]*\n)*─{32,}\s*\n❯\s*\n─{32,}\s*\n(?:\s{0,4}(?:\S[^·\n]*(?: · [^·\n]+){2,} · \d+K window(?: · \d+K used)?|(?:Opus|Sonnet|Haiku) \d+(?:\.\d+)?(?: \([^·\n]*\))? · (?:xhigh|high|medium|low)(?: · [^·\n]+)* · [^·\n]*…)\s*(?:\n\s{0,4}paste again to expand\s*)?(?:\n\s{0,4}(?:⏸|⏵⏵) [^·\n]*\b(?:on|off)\b(?: \([^)]*\))?(?: · .+)?\s*)?|\s{0,4}(?:⏸|⏵⏵) [^·\n]*\b(?:on|off)\b(?: \([^)]*\))?(?: · .+)?\s*)\z']
 # One ordered escaped pattern, anchored at the end of the region: the
 # uniform-246 completed row, then only rows that do not open with the active
 # 38;5;215 color, then the 244 rule, the styled composer, the 244 rule, and
 # the trailer. Styling is proven on the same rows, in the same order, as the
 # plain suffix above; per-line escaped clauses could not tie them together.
-regex_esc = ['(?m)^\x1b\[38;5;246m[·✶✽✳✢✻]\x1b\[39m\s+\x1b\[38;5;246m\S+\s+for\s+\d+[smhd]\s+·\s+done\s+\d{1,2}:\d{2}\s+(?:AM|PM)\x1b\[39m\s*\n(?:(?:[^\x1b\n][^\n]*|\x1b\[(?:38;5;24[46]|39|0)m[^\n]*)\n)*\x1b\[38;5;244m─{32,}\s*\n(?:\x1b\[(?:38;5;246|39)m)*❯(?:\x{a0}| )*(?:\x1b\[(?:38;5;246|39)m)*\s*\n\x1b\[38;5;244m─{32,}\s*\n[^\n]*\z']
+regex_esc = ['(?m)^\x1b\[38;5;246m[·✶✽✳✢✻]\x1b\[39m\s+\x1b\[38;5;246m\S+\s+for\s+\d+[smhd](?:\s+\d+[smhd])*\s+·\s+done\s+\d{1,2}:\d{2}\s+(?:AM|PM)\x1b\[39m\s*\n(?:(?:[^\x1b\n][^\n]*|\x1b\[(?:38;5;24[46]|39|0)m[^\n]*)\n)*\x1b\[38;5;244m─{32,}\s*\n(?:\x1b\[(?:38;5;246|39)m)*❯(?:\x{a0}| )*(?:\x1b\[(?:38;5;246|39)m)*\s*\n\x1b\[38;5;244m─{32,}\s*\n[^\n]*(?:\n[^\n]*)?\z']
 evidence = "MEASURED live capture on Claude Code 2.1.236 (2026-08-20): styled active frames"
+# MEASURED 2026-08-26 (Claude Code 2.1.246, pane %1, captured idle frame in
+# shipped_rules.rs claude_2_1_246_terminal_suffix_matches_a_real_long_turn):
+# a turn over a minute prints two duration units ("Churned for 5m 11s") and
+# the real frame carries two trailer rows below the composer box (the model
+# status row, then the permissions row). The single-unit duration and the
+# one-row trailer both refused every real completion, so no Claude turn
+# ever ended on visual evidence and the pane stayed working until the next
+# prompt.
 
 [[rule]]
 id = "composer_working_spinner_status_no_color"

@@ -210,8 +210,9 @@ enum Cmd {
     Wait {
         /// Agent label or pane id, e.g. reviewer or %4.
         target: String,
-        /// idle: no turn is running (NOT permission to write). done: the
-        /// current or next turn ends.
+        /// idle: no turn is running (NOT permission to write). turn-ended:
+        /// working was observed, then the same occupant reached idle or
+        /// idle_with_input. This has no turn or message identity.
         /// blocked: any blocked state (modal, permission, quota).
         #[arg(long, value_enum)]
         until: UntilArg,
@@ -646,7 +647,7 @@ struct HistoryArgs {
 #[derive(Clone, Copy, ValueEnum)]
 enum UntilArg {
     Idle,
-    Done,
+    TurnEnded,
     Blocked,
 }
 
@@ -654,7 +655,7 @@ impl UntilArg {
     fn word(self) -> &'static str {
         match self {
             UntilArg::Idle => "idle",
-            UntilArg::Done => "done",
+            UntilArg::TurnEnded => "turn_ended",
             UntilArg::Blocked => "blocked",
         }
     }
@@ -664,7 +665,7 @@ impl From<UntilArg> for WaitUntil {
     fn from(u: UntilArg) -> Self {
         match u {
             UntilArg::Idle => WaitUntil::Idle,
-            UntilArg::Done => WaitUntil::Done,
+            UntilArg::TurnEnded => WaitUntil::TurnEnded,
             UntilArg::Blocked => WaitUntil::Blocked,
         }
     }
@@ -2950,7 +2951,7 @@ fn local_line_diff(expected: &str, observed: &str) -> String {
     out
 }
 
-/// cyclops wait <target> --until idle|done|blocked [--timeout 60s].
+/// cyclops wait <target> --until idle|turn-ended|blocked [--timeout 60s].
 /// Blocks on the daemon's agent.wait: the daemon watches the fused state
 /// stream and pins the pane occupant; nothing here polls.
 fn cmd_wait(cli: &Cli, style: &Style, target: &str, until: UntilArg, timeout: &str) -> i32 {
@@ -3311,7 +3312,7 @@ mod tests {
             "--subject",
             "run tests",
             "--wait",
-            "done",
+            "turn-ended",
         ])
         .is_err());
     }
@@ -3326,6 +3327,27 @@ mod tests {
         let help = error.to_string();
         assert!(!help.contains("--wait"), "{help}");
         assert!(!help.contains("--timeout"), "{help}");
+    }
+
+    #[test]
+    fn wait_help_names_the_observed_transition_without_done() {
+        let error = match Cli::try_parse_from(["cyclops", "wait", "--help"]) {
+            Ok(_) => panic!("wait --help returned a command instead of help"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = error.to_string();
+        assert!(help.contains("working was observed"), "{help}");
+        assert!(help.contains("idle_with_input"), "{help}");
+        assert!(help.contains("no turn or message identity"), "{help}");
+        assert!(help.contains("turn-ended"), "{help}");
+        assert!(!help.contains("done"), "{help}");
+        assert!(!help.contains("turn ends"), "{help}");
+
+        assert!(
+            Cli::try_parse_from(["cyclops", "wait", "reviewer", "--until", "turn-ended",]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["cyclops", "wait", "reviewer", "--until", "done"]).is_err());
     }
 
     #[test]

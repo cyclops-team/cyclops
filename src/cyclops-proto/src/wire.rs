@@ -640,9 +640,15 @@ pub enum WaitUntil {
     /// Write-readiness is `Detection::write_ready`, and delivery asks it
     /// again at paste time regardless of what a wait returned.
     Idle,
-    /// A working-to-idle edge was observed for the same pane occupant.
-    /// This does not identify which message or task the turn handled.
-    Done,
+    /// Working was observed, then the same occupant reached Idle or
+    /// IdleWithInput. This does not identify a turn, message, or task and
+    /// does not prove write readiness.
+    ///
+    /// `done` is accepted only for compatibility with older clients. The
+    /// canonical wire value names the exact observation and makes no task
+    /// completion claim.
+    #[serde(rename = "turn_ended", alias = "done")]
+    TurnEnded,
     /// The agent entered any blocked_* state.
     Blocked,
 }
@@ -1467,6 +1473,18 @@ pub enum NotifyLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_ended_is_canonical_while_done_remains_read_compatible() {
+        assert_eq!(
+            serde_json::to_value(WaitUntil::TurnEnded).unwrap(),
+            serde_json::json!("turn_ended")
+        );
+        assert_eq!(
+            serde_json::from_value::<WaitUntil>(serde_json::json!("done")).unwrap(),
+            WaitUntil::TurnEnded
+        );
+    }
 
     #[test]
     fn request_roundtrip_tolerates_unknown_fields() {

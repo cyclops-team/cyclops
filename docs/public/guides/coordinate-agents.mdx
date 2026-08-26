@@ -1,6 +1,6 @@
 ---
 title: "Coordinate agents"
-description: "Send work, broadcast announcements, wait for turns, and review the record."
+description: "Send work, broadcast announcements, wait for pane state, and review the record."
 ---
 
 ## Send one agent a request
@@ -50,13 +50,14 @@ state per recipient. `--all` targets adopted agents, not the admin inbox.
 ## Wait for pane activity
 
 ```bash
-cyclops wait reviewer --until done --timeout 2m
+cyclops wait reviewer --until turn-ended --timeout 2m
 ```
 
-`done` means the working-to-idle edge for the same pane occupant. If the
-process in the pane changes while waiting, Cyclops exits separately rather
-than claiming the new process finished the old turn. This observes pane
-activity and does not prove a specific message or task was completed.
+`turn-ended` means Cyclops observed working followed by `idle` or `idle_with_input`
+for the same pane occupant. If the process in the pane changes while waiting,
+Cyclops exits separately instead of answering for the replacement. This
+observes pane activity. It does not identify a turn, prove write readiness, or
+prove that a specific message or task was completed.
 
 ## Watch live
 

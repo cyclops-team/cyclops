@@ -11,8 +11,8 @@ use common::*;
 use serde_json::{json, Value};
 
 /// Fix A: send-and-wait must start the wait only after the delivery
-/// resolves, and `done` must not count a working phase that predates the
-/// delivery. A busy pane released mid-wait used to satisfy `done` off the
+/// resolves, and `turn_ended` must not count a working phase that predates the
+/// delivery. A busy pane released mid-wait used to satisfy `turn_ended` off the
 /// PRE-delivery busy phase, with the delivery still unresolved.
 #[tokio::test(flavor = "multi_thread")]
 async fn send_and_wait_starts_after_delivery_resolution() {
@@ -47,7 +47,7 @@ async fn send_and_wait_starts_after_delivery_resolution() {
             "to": ["waity"],
             "subject": "wait for me",
             "body": "a\nb\nc",
-            "wait": {"until": "done", "timeout_ms": 2500},
+            "wait": {"until": "turn_ended", "timeout_ms": 2500},
         }))
         .await;
     releaser.join().expect("releaser thread");
@@ -57,16 +57,16 @@ async fn send_and_wait_starts_after_delivery_resolution() {
     assert_eq!(result["deliveries"][0]["state"], "queued", "{result}");
 
     // The wait ran only after the delivery resolved: the entry carries the
-    // resolved delivery state, and `done` was NOT satisfied by the
+    // resolved delivery state, and `turn_ended` was NOT satisfied by the
     // pre-delivery busy phase. The manual-lifecycle composer consumes this
     // delivery but emits no post-submit Working edge, so a correctly anchored
-    // `done` times out.
+    // `turn_ended` times out.
     let wait = &result["wait"][0];
     assert_eq!(wait["to"], "waity", "{result}");
     assert_eq!(wait["delivery"], "delivered_unverified", "{result}");
     assert_eq!(
         wait["outcome"], "timeout",
-        "done was satisfied by a working phase that predates the delivery: {result}"
+        "turn_ended was satisfied by a working phase that predates the delivery: {result}"
     );
 
     // By response time the ledger agrees the delivery resolved.

@@ -3479,7 +3479,7 @@ mod tests {
             json!({
                 "to": ["admin"],
                 "subject": "Do work",
-                "wait": {"until": "done", "timeout_ms": 60_000}
+                "wait": {"until": "turn_ended", "timeout_ms": 60_000}
             }),
         )
         .await;

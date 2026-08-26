@@ -2378,7 +2378,7 @@ pub(crate) async fn msg_send(
 
     // Send-and-wait composes agent.wait onto the same call: the wait
     // starts only AFTER the delivery reaches a resolved state
-    // (DELIVERY.md), so `done` can never be satisfied by a turn that
+    // (DELIVERY.md), so `turn_ended` can never be satisfied by a turn that
     // predates the delivery. A delivery that ends anywhere but delivered
     // has no turn to watch; its entry reports the delivery state instead
     // of a fabricated wait result. Every entry carries the same
@@ -8930,8 +8930,9 @@ pub(crate) enum WaitOutcome {
     /// The pinned pane died or its occupant changed mid-wait; resolving
     /// anything else would be a false answer about a different process.
     OccupantChanged,
-    /// Send-and-wait only: the delivery resolved somewhere other than
-    /// delivered, so there is no turn to watch.
+    /// Legacy direct send-and-wait only: the delivery resolved somewhere
+    /// other than delivered, so there is no post-delivery pane transition
+    /// to observe.
     NotDelivered,
 }
 
@@ -8973,10 +8974,11 @@ fn occupant_gone(inner: &Arc<Inner>, session_idx: usize, pane_id: &str, pinned_p
 /// and the session watcher stream; the deadline is the only timer.
 ///
 /// Semantics (protocol spec): idle is fused Idle; blocked is any blocked_*
-/// state; done is the working -> idle edge, so the CURRENT turn (already
-/// working, or `working_pre` from a delivery handle) or the NEXT turn
-/// counts, and a blocked state mid-turn keeps waiting rather than passing
-/// as done.
+/// state; turn-ended is an observed Working followed by Idle or IdleWithInput. The
+/// current confirmed Working phase or the next confirmed Working phase can
+/// provide the first observation. A blocked state mid-sequence keeps waiting
+/// rather than passing as turn-ended. This state sequence carries no turn or
+/// message identity and says nothing about write readiness.
 ///
 /// Pinning: (pane_id, pane_pid) recorded at start, or supplied by the
 /// caller as `pinned` when the wait answers for an earlier moment (the
@@ -9067,14 +9069,14 @@ pub(crate) async fn wait_pinned(
         let satisfied = match until {
             WaitUntil::Idle => state == AgentState::Idle,
             WaitUntil::Blocked => state.is_blocked(),
-            WaitUntil::Done => {
+            WaitUntil::TurnEnded => {
                 working_seen && matches!(state, AgentState::Idle | AgentState::IdleWithInput)
             }
         };
         if satisfied {
-            // The state edge says the turn ended. It does not say WHOSE
-            // turn, so the identity is re-proven before the wait calls it
-            // reached.
+            // The state sequence does not identify a turn. Re-prove the
+            // occupant before reporting that this pane reached the requested
+            // state.
             if gone(inner) {
                 return end(WaitOutcome::OccupantChanged, state);
             }
@@ -9233,7 +9235,7 @@ pub(crate) async fn agent_wait(
 fn until_word(until: WaitUntil) -> &'static str {
     match until {
         WaitUntil::Idle => "idle",
-        WaitUntil::Done => "done",
+        WaitUntil::TurnEnded => "turn ended",
         WaitUntil::Blocked => "blocked",
     }
 }
