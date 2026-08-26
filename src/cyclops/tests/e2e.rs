@@ -1771,7 +1771,7 @@ fn send_broadcast_renders_the_aligned_grid() {
         // Positional target merges with --to, positional first.
         assert_eq!(req["params"]["to"], json!(["reviewer", "implementer"]));
         assert_eq!(req["params"]["fyi"], true);
-        assert_eq!(req["params"]["reply_to"], "m-11aa22");
+        assert!(req["params"]["reply_to"].is_null());
         (
             vec![json!({"id": req["id"], "result": {
                 "msg_id": "m-9c0ffe", "seq": 8,
@@ -1797,8 +1797,6 @@ fn send_broadcast_renders_the_aligned_grid() {
             "--body",
             "b",
             "--fyi",
-            "--reply-to",
-            "m-11aa22",
         ],
         None,
     );
