@@ -389,14 +389,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// The built-in cue has a command on this platform, so the switch
-    /// makes a noise on a machine with no sounds folder at all.
+    /// The built-in cue is `osascript -e beep` on macOS, where it is
+    /// always there, so the switch makes a noise on a machine with no
+    /// sounds folder at all. On Linux it needs a freedesktop sound theme
+    /// and a player, and a box without both (a CI runner) gets None so
+    /// the caller falls to the bell: the answer must agree with what the
+    /// box has, not assume it.
     #[test]
     fn the_system_alert_has_a_command_here() {
-        let command = system_alert_command().expect("a way to play the system alert");
-        let program = command.get_program().to_string_lossy().into_owned();
+        let command = system_alert_command();
         if cfg!(target_os = "macos") {
+            let command = command.expect("a way to play the system alert");
+            let program = command.get_program().to_string_lossy().into_owned();
             assert!(program.ends_with("osascript"), "{program}");
+            return;
         }
+        let theme = [
+            "/usr/share/sounds/freedesktop/stereo/bell.oga",
+            "/usr/share/sounds/freedesktop/stereo/complete.oga",
+        ]
+        .iter()
+        .any(|path| Path::new(path).is_file());
+        let player = ["paplay", "aplay", "ffplay"]
+            .iter()
+            .any(|name| find_on_path(name).is_some());
+        assert_eq!(
+            command.is_some(),
+            theme && player,
+            "theme file here: {theme}, player on PATH: {player}"
+        );
     }
 }
