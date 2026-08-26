@@ -921,11 +921,41 @@ impl Rig {
     }
 
     pub fn ledger_lines_for(&self, session: &str) -> Vec<Value> {
-        let text = std::fs::read_to_string(self.ledger_path_for(session)).expect("ledger readable");
-        text.lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).expect("ledger line is valid JSON"))
-            .collect()
+        const READ_ATTEMPTS: usize = 50;
+        const READ_RETRY: Duration = Duration::from_millis(20);
+
+        // A concurrent append can expose its final JSON before the newline.
+        // Retry only that unfinished tail. Completed malformed lines fail now.
+        for attempt in 0..READ_ATTEMPTS {
+            let text =
+                std::fs::read_to_string(self.ledger_path_for(session)).expect("ledger readable");
+            let lines: Vec<_> = text
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .collect();
+            let mut parsed = Vec::with_capacity(lines.len());
+
+            for (index, line) in lines.iter().enumerate() {
+                match serde_json::from_str(line) {
+                    Ok(value) => parsed.push(value),
+                    Err(error) => {
+                        let final_line_is_in_flight =
+                            index + 1 == lines.len() && !text.ends_with('\n');
+                        if final_line_is_in_flight && attempt + 1 < READ_ATTEMPTS {
+                            std::thread::sleep(READ_RETRY);
+                            break;
+                        }
+                        panic!("ledger line is valid JSON: {error}");
+                    }
+                }
+            }
+
+            if parsed.len() == lines.len() {
+                return parsed;
+            }
+        }
+
+        unreachable!("the final bounded ledger read either returns or reports its parse error")
     }
 
     /// The whole-run ledger contract: every line is jq-parseable and
