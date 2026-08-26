@@ -6389,7 +6389,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_event_after_capture_keeps_the_app_barrier_closed() {
-        let (repair, repair_rx) = oneshot::channel();
+        let (repair, repair_rx) = oneshot::channel::<bool>();
         let (cutover_tx, cutover) = oneshot::channel();
         let source = tokio::spawn(async move {
             assert!(repair_rx.await.expect("app reports snapshot result"));
@@ -6413,7 +6413,7 @@ mod tests {
         gate.close();
         let source_gate = gate.clone();
         let (input_tx, mut input_rx) = mpsc::channel(1);
-        let (repair, repair_rx) = oneshot::channel();
+        let (repair, repair_rx) = oneshot::channel::<bool>();
         let (cutover_tx, cutover) = oneshot::channel();
         let source = tokio::spawn(async move {
             assert!(repair_rx.await.expect("app reports snapshot result"));
