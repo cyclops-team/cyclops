@@ -343,12 +343,14 @@ a:hover {
 	font-family: var(--font-pixel);
 }
 
+/* The measure is capped; the margin beside it grows with the window, so
+   a laptop gets a real margin and not just the inner padding. */
 .section {
-	width: 100%;
+	box-sizing: content-box;
 	min-width: 0;
-	max-width: 1200px;
+	max-width: 1044px;
 	margin: 0 auto;
-	padding: 72px 48px;
+	padding: 72px max(48px, 7vw);
 }
 
 /* The small uppercase label: section indexes, column heads, meta keys. */
