@@ -11,3 +11,11 @@ test-threads = 8
 slow-timeout = { period = "60s", terminate-after = 3 }
 retries = 0
 fail-fast = false
+
+# Nextest launches every test in its own process. That bypasses the
+# workspace performance suite's in-process serial lock and lets its tmux
+# floods compete with the UI suites' wall-clock budgets. Give each of these
+# tests the whole configured pool so they run alone, one at a time.
+[[profile.default.overrides]]
+filter = 'binary_id(=cyclops-ui::perf) | binary_id(=cyclops-ui::queue_perf) | binary_id(=cyclops-workspace::perf_contract)'
+threads-required = "num-test-threads"
