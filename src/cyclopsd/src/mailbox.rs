@@ -4606,19 +4606,6 @@ impl MailboxService {
         Ok(entries)
     }
 
-    /// The live notification record for one (recipient, message), if any.
-    pub(crate) fn notification_record(
-        &self,
-        recipient: RecipientKey,
-        message_id: &MessageId,
-    ) -> Option<NotificationRecord> {
-        self.store()
-            .ok()?
-            .projection()
-            .notification(recipient, message_id)
-            .cloned()
-    }
-
     pub fn pending_count(&self, recipient: RecipientKey) -> Result<usize, MailboxServiceError> {
         Ok(self.store()?.projection().pending_count(recipient))
     }

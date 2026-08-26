@@ -1094,9 +1094,7 @@ mod tests {
             a.items(),
             vec![
                 AttentionItem::Delivery {
-                    recipient: DeliveryRecipientIdentity::LegacyLabel(
-                        "implementer".into().to_string()
-                    ),
+                    recipient: DeliveryRecipientIdentity::LegacyLabel("implementer".to_string()),
                     to: "implementer".into(),
                     id: "m-park".into(),
                     state: DeliveryState::ParkedBlockedQuota,
@@ -1439,9 +1437,7 @@ mod tests {
             a.observe_delivery("reviewer", None, Some("m-1"), DeliveryState::Queued),
             Some(Resolved {
                 was: AttentionItem::Delivery {
-                    recipient: DeliveryRecipientIdentity::LegacyLabel(
-                        "reviewer".into().to_string()
-                    ),
+                    recipient: DeliveryRecipientIdentity::LegacyLabel("reviewer".to_string()),
                     to: "reviewer".into(),
                     id: "m-1".into(),
                     state: DeliveryState::ParkedBlockedQuota,

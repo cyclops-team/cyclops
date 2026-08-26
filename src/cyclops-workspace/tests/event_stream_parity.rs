@@ -66,6 +66,7 @@ fn ping(ts: u64, pane_id: &str, subject: &str) -> Entry {
             subject: subject.into(),
             pane_id: Some(pane_id.into()),
             to: None,
+            recipient: None,
             deliveries: Vec::new(),
         },
     }
