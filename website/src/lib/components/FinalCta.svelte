@@ -1,16 +1,16 @@
 <script lang="ts">
-	import InstallSelector from './InstallSelector.svelte';
+	import InstallCommand from './InstallCommand.svelte';
 	import GithubMark from './GithubMark.svelte';
 	import { REPO_URL } from '$lib/config';
 </script>
 
 <section class="section">
-	<div class="panel">
+	<div class="panel deep cta invert">
 		<div class="eyebrow">// Get started</div>
 		<h2 class="pixel">BUILD WITH YOUR<br />WHOLE AGENT TEAM</h2>
 		<p>Install Cyclops and coordinate any agents you can run from the terminal.</p>
 		<div class="install">
-			<InstallSelector idPrefix="final-install" />
+			<InstallCommand />
 		</div>
 		<a class="github-link" href={REPO_URL} target="_blank" rel="noopener noreferrer">
 			<GithubMark size={14} />
@@ -20,9 +20,7 @@
 </section>
 
 <style>
-	.panel {
-		border: 1px solid var(--line);
-		background: var(--surface-deep);
+	.cta {
 		padding: 72px 56px;
 		text-align: center;
 	}
@@ -34,10 +32,12 @@
 	h2 {
 		font-weight: 700;
 		font-size: clamp(28px, 4.6vw, 48px);
+		letter-spacing: -0.04em;
+		word-spacing: -0.2em;
 		color: var(--ink);
 		line-height: 1.05;
 		margin: 0;
-		text-shadow: 5px 5px 0 var(--mist);
+		text-shadow: 5px 5px 0 var(--counter-shadow);
 	}
 
 	p {
@@ -50,7 +50,7 @@
 
 	.install {
 		max-width: 560px;
-		margin: 0 auto 24px;
+		margin: 0 auto 28px;
 		text-align: left;
 	}
 
@@ -69,11 +69,11 @@
 	}
 
 	.github-link:hover {
-		color: var(--sage-ink);
+		color: var(--accent);
 	}
 
 	@media (max-width: 720px) {
-		.panel {
+		.cta {
 			padding: 48px 24px;
 		}
 	}

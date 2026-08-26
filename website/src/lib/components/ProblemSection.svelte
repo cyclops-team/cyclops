@@ -1,109 +1,89 @@
 <script lang="ts">
 	import SectionHead from './SectionHead.svelte';
 
-	const before = [
-		'Isolated agent terminals',
-		'Manual context handoffs',
-		'No direct agent messaging',
-		'Unclear agent responsibilities'
-	];
-
-	const after = [
-		'Named agent roles',
-		'Structured agent-to-agent messages',
-		'Permission-aware routing',
-		'Verified terminal delivery'
+	// One problem per row and, beside it, what Cyclops does about it. The
+	// rows are the argument, so the before and after of one row must be
+	// about the same thing.
+	const rows = [
+		{ before: 'Copy-paste to hand context between agents', after: 'An agent hands off with one command' },
+		{ before: 'A separate terminal window per agent', after: "Every agent's pane in one workspace" },
+		{ before: 'No way for agents to reach each other', after: 'Agent-to-agent messages, with receipts' },
+		{ before: 'Panes with no name and no state', after: 'Named panes that show their state' }
 	];
 </script>
 
 <section class="section">
-	<SectionHead title="THE PROBLEM" index="01 / Why Cyclops" />
-	<h3 class="pixel heading">Your agents are powerful.<br />Their teamwork is manual.</h3>
-	<p class="body">
-		Developers use different coding agents for different jobs, but coordinating them still means
-		manually passing context, assigning work, and tracking progress. Cyclops gives them a shared
-		coordination layer.
+	<SectionHead title="THE PROBLEM" index="Motivation" />
+	<h3 class="statement">Your agents are powerful.<br />Their teamwork is manual.</h3>
+	<p class="lede">
+		Most people already run more than one coding agent, each in its own window. Getting them to
+		work together means copying context between windows, handing out the work yourself, and
+		watching every pane. Cyclops puts them in one workspace where they can talk to each other.
 	</p>
-	<div class="compare">
-		<div class="col">
-			<div class="col-label">Before Cyclops</div>
-			<ul>
-				{#each before as item (item)}
-					<li><span class="marker before-marker">✕</span>{item}</li>
-				{/each}
-			</ul>
+	<div class="panel compare" role="table" aria-label="Before and with Cyclops, row by row">
+		<div class="row head" role="row">
+			<div class="cell label" role="columnheader">Before Cyclops</div>
+			<div class="cell label accent" role="columnheader">With Cyclops</div>
 		</div>
-		<div class="col">
-			<div class="col-label accent">With Cyclops</div>
-			<ul>
-				{#each after as item (item)}
-					<li><span class="marker after-marker">✓</span>{item}</li>
-				{/each}
-			</ul>
-		</div>
+		{#each rows as row (row.before)}
+			<div class="row" role="row">
+				<div class="cell before" role="cell">
+					<span class="marker" aria-hidden="true">✕</span>{row.before}
+				</div>
+				<div class="cell after" role="cell">
+					<span class="marker" aria-hidden="true">✓</span>{row.after}
+				</div>
+			</div>
+		{/each}
 	</div>
 </section>
 
 <style>
-	.heading {
-		font-weight: 700;
-		font-size: clamp(26px, 3.6vw, 38px);
-		color: var(--ink);
-		line-height: 1.15;
-		margin: 0 0 24px;
-	}
-
-	.body {
-		max-width: 640px;
-		font-size: 16px;
-		line-height: 1.7;
-		color: var(--muted);
-		margin: 0 0 44px;
+	.lede {
+		margin-bottom: 40px;
 	}
 
 	.compare {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		border: 1px solid var(--line);
-	}
-
-	.col {
-		padding: 32px;
-	}
-
-	.col:first-child {
-		border-right: 1px solid var(--line);
-	}
-
-	.col-label {
-		font-size: 11px;
-		letter-spacing: 2px;
-		text-transform: uppercase;
-		color: var(--faint);
-		margin-bottom: 20px;
-	}
-
-	.col-label.accent {
-		color: var(--sage-ink);
-	}
-
-	ul {
-		list-style: none;
-		margin: 0;
 		padding: 0;
 	}
 
-	li {
+	.row {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+	}
+
+	.row + .row {
+		border-top: 1px solid var(--line-soft);
+	}
+
+	.row.head + .row {
+		border-top: 1px solid var(--line);
+	}
+
+	.cell {
 		display: flex;
 		align-items: baseline;
 		gap: 12px;
+		min-width: 0;
+		padding: 14px 32px;
 		font-size: 14px;
 		color: var(--text);
-		padding: 10px 0;
 	}
 
-	li + li {
-		border-top: 1px solid var(--line-soft);
+	.cell:first-child {
+		border-right: 1px solid var(--line);
+	}
+
+	.head .cell {
+		padding: 28px 32px 16px;
+	}
+
+	.label.accent {
+		color: var(--accent);
+	}
+
+	.row:last-child .cell {
+		padding-bottom: 28px;
 	}
 
 	.marker {
@@ -112,22 +92,64 @@
 		width: 14px;
 	}
 
-	.before-marker {
-		color: var(--mauve-ink);
+	.before .marker {
+		color: var(--faint);
 	}
 
-	.after-marker {
-		color: var(--sage-ink);
+	.after .marker {
+		color: var(--accent);
 	}
 
 	@media (max-width: 720px) {
-		.compare {
+		/* Narrow: each row stacks its own before over its after, so the
+		   pairing survives; the column heads become a legend. */
+		.row {
 			grid-template-columns: 1fr;
 		}
 
-		.col:first-child {
+		.cell {
+			padding: 12px 24px;
+		}
+
+		.cell:first-child {
 			border-right: none;
-			border-bottom: 1px solid var(--line);
+		}
+
+		/* The heads sit together as a legend for the markers below; no
+		   divider, since there are no columns to divide. */
+		.head {
+			grid-template-columns: auto auto;
+			justify-content: start;
+			column-gap: 20px;
+		}
+
+		.head .cell {
+			padding: 20px 0 12px 24px;
+		}
+
+		.head .cell:first-child {
+			border-right: none;
+		}
+
+		.head .cell + .cell {
+			padding-left: 0;
+		}
+
+		.row:not(.head) .before {
+			padding-bottom: 4px;
+			color: var(--muted);
+		}
+
+		.row:not(.head) .after {
+			padding-top: 4px;
+		}
+
+		.row:last-child .before {
+			padding-bottom: 4px;
+		}
+
+		.row:last-child .after {
+			padding-bottom: 20px;
 		}
 	}
 </style>

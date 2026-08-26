@@ -52,7 +52,7 @@
 	}
 
 	nav a:hover {
-		color: var(--sage-ink);
+		color: var(--accent);
 	}
 
 	.tag {

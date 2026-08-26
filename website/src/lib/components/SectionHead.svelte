@@ -4,7 +4,7 @@
 
 <div class="head">
 	<h2 class="pixel">{title}</h2>
-	<span>{index}</span>
+	<span class="label">{index}</span>
 </div>
 
 <style>
@@ -13,29 +13,23 @@
 		align-items: baseline;
 		justify-content: space-between;
 		border-bottom: 1px solid var(--line);
-		padding-bottom: 18px;
-		margin-bottom: 44px;
+		padding-bottom: 16px;
+		margin-bottom: 40px;
 	}
 
 	h2 {
-		font-size: 22px;
+		font-size: 20px;
+		letter-spacing: 1px;
 		color: var(--ink);
 		margin: 0;
 		font-weight: 700;
-	}
-
-	span {
-		font-size: 12px;
-		letter-spacing: 2px;
-		color: var(--faint);
-		text-transform: uppercase;
 	}
 
 	@media (max-width: 420px) {
 		.head {
 			align-items: flex-start;
 			flex-direction: column;
-			gap: 10px;
+			gap: 8px;
 			margin-bottom: 32px;
 		}
 	}
