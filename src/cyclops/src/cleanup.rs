@@ -5,12 +5,13 @@
 //! second step after a dry-run report.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
 use cyclops_state::{
-    BoundStateRemoval, InspectedEntry, InspectedKind, InspectionLimits, StateInspector,
+    BoundStateRemoval, InspectedEntry, InspectedKind, InspectionLimits, StateInspector, StateRoot,
 };
 use serde_json::{json, Value};
 
@@ -26,6 +27,7 @@ const CLEANUP_BUILD_PREFIX: &str = ".cyclops-cleanup.build-cache.";
 const CLEANUP_UPDATE_PREFIX: &str = ".cyclops-cleanup.update-scratch.";
 const NONCE_BYTES: usize = 32;
 const CACHE_KEY_BYTES: usize = 16;
+const CLEANUP_RECORD: &str = "operations/cleanup.ndjson";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum AssetClass {
@@ -120,7 +122,15 @@ struct CleanupReport {
     temp_root_state: &'static str,
     candidates: Vec<CandidateReport>,
     excluded: Vec<ExcludedClass>,
+    record: CleanupRecordReport,
     issues: Vec<String>,
+}
+
+#[derive(Debug)]
+struct CleanupRecordReport {
+    state: &'static str,
+    path: PathBuf,
+    error: Option<String>,
 }
 
 struct Inventory {
@@ -191,9 +201,14 @@ thread_local! {
 }
 
 pub(crate) fn run(json_output: bool, classes: &[AssetClass], apply: bool) -> i32 {
+    let home = cyclops_proto::cyclops_home();
     let temp_root = platform_temp_root();
-    let cache = crate::update::build_cache(&cyclops_proto::cyclops_home());
-    let report = collect_at(&temp_root, &cache, classes, apply);
+    let cache = crate::update::build_cache(&home);
+    let mut report = collect_at(&temp_root, &cache, classes, apply);
+    report.record.path = home.join(CLEANUP_RECORD);
+    if apply {
+        persist_cleanup_record(&home, &mut report);
+    }
     if json_output {
         println!("{}", render_json(&report));
     } else {
@@ -413,6 +428,11 @@ fn collect_at(
         temp_root_state: "unsupported",
         candidates: Vec::new(),
         excluded: excluded_classes(),
+        record: CleanupRecordReport {
+            state: "not_requested",
+            path: PathBuf::from(CLEANUP_RECORD),
+            error: None,
+        },
         issues: Vec::new(),
     };
 
@@ -485,6 +505,58 @@ fn collect_at(
         }
     }
     report
+}
+
+fn persist_cleanup_record(home: &Path, report: &mut CleanupReport) {
+    report.record.path = home.join(CLEANUP_RECORD);
+    let result = (|| -> Result<(), String> {
+        let root = StateRoot::open_or_create(home).map_err(|error| error.to_string())?;
+        let mut file = root
+            .open_append(Path::new(CLEANUP_RECORD))
+            .map_err(|error| error.to_string())?;
+        let mut classes = BTreeMap::<&str, (usize, usize, usize, u64)>::new();
+        for candidate in &report.candidates {
+            let counts = classes.entry(candidate.class.name()).or_default();
+            counts.0 += 1;
+            counts.1 += usize::from(candidate.state == CandidateState::Removed);
+            counts.2 += usize::from(candidate.state.is_problem());
+            counts.3 = counts.3.saturating_add(candidate.bytes);
+        }
+        let record = json!({
+            "schema": 1,
+            "kind": "cleanup",
+            "ts": crate::render::now_ms(),
+            "mode": "apply",
+            "ok": report.issues.is_empty(),
+            "classes": classes.into_iter().map(|(class, counts)| json!({
+                "class": class,
+                "candidates": counts.0,
+                "removed": counts.1,
+                "problems": counts.2,
+                "bytes": counts.3,
+            })).collect::<Vec<_>>(),
+        });
+        let mut line = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
+        line.push(b'\n');
+        file.lock().map_err(|error| error.to_string())?;
+        let write = file
+            .write_all(&line)
+            .and_then(|()| file.flush())
+            .and_then(|()| file.sync_data())
+            .map_err(|error| error.to_string());
+        let unlock = file.unlock().map_err(|error| error.to_string());
+        write.and(unlock)
+    })();
+    match result {
+        Ok(()) => report.record.state = "written",
+        Err(error) => {
+            report.record.state = "failed";
+            report.record.error = Some(error.clone());
+            report
+                .issues
+                .push(format!("append content-free cleanup record: {error}"));
+        }
+    }
 }
 
 fn deduplicate_classes(classes: &[AssetClass]) -> Vec<AssetClass> {
@@ -1468,6 +1540,11 @@ fn render_json(report: &CleanupReport) -> Value {
             "state": excluded.state,
             "reason": excluded.reason,
         })).collect::<Vec<_>>(),
+        "record": {
+            "state": report.record.state,
+            "path": report.record.path.display().to_string(),
+            "error": report.record.error.as_deref(),
+        },
         "limits": {
             "entries": ENTRY_LIMIT,
             "name_bytes": NAME_BYTES_LIMIT,
@@ -1504,6 +1581,14 @@ fn render_plain(report: &CleanupReport) -> String {
             excluded.class, excluded.state, excluded.reason
         ));
     }
+    lines.push(format!(
+        "  record    {} · {}",
+        report.record.state,
+        report.record.path.display()
+    ));
+    if let Some(error) = &report.record.error {
+        lines.push(format!("    {error}"));
+    }
     if !report.issues.is_empty() {
         lines.push("  issues".to_string());
         for issue in &report.issues {
@@ -1517,6 +1602,7 @@ fn render_plain(report: &CleanupReport) -> String {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::BTreeSet;
     use std::fs;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
@@ -2153,5 +2239,56 @@ mod tests {
         assert_eq!(report.temp_root_state, "unsupported");
         assert_eq!(report.candidates[0].state, CandidateState::Unsupported);
         assert!(!cache.exists());
+    }
+
+    #[test]
+    fn executed_cleanup_appends_one_content_free_record_per_run() {
+        let temp = private_temp();
+        let home = temp.path().join("state");
+        let cache = temp.path().join("absent-cache");
+        let mut first = collect_at(temp.path(), &cache, &[AssetClass::BuildCache], true);
+        persist_cleanup_record(&home, &mut first);
+        assert_eq!(first.record.state, "written");
+        assert!(first.record.error.is_none());
+
+        let mut second = collect_at(temp.path(), &cache, &[AssetClass::UpdateScratch], true);
+        persist_cleanup_record(&home, &mut second);
+        assert_eq!(second.record.state, "written");
+
+        let text = fs::read_to_string(home.join(CLEANUP_RECORD)).unwrap();
+        let lines = text.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        for line in lines {
+            let value: Value = serde_json::from_str(line).unwrap();
+            let keys = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                keys,
+                ["classes", "kind", "mode", "ok", "schema", "ts"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            );
+            assert_eq!(value["kind"], "cleanup");
+            assert_eq!(value["mode"], "apply");
+            assert!(!line.contains(temp.path().to_string_lossy().as_ref()));
+            assert!(!line.contains("reason"));
+            assert!(!line.contains("path"));
+        }
+    }
+
+    #[test]
+    fn dry_run_does_not_create_a_cleanup_record() {
+        let temp = private_temp();
+        let home = temp.path().join("state");
+        let cache = temp.path().join("absent-cache");
+        let report = collect_at(temp.path(), &cache, &[AssetClass::BuildCache], false);
+
+        assert_eq!(report.record.state, "not_requested");
+        assert!(!home.exists());
     }
 }
