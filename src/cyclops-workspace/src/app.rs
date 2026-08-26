@@ -3443,6 +3443,20 @@ async fn handle_messages_key(
     // If the composer is focused and active, it handles typing and sending:
     if app.messages_composer.focused && app.messages_composer.mode.is_some() {
         match key.code {
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.messages_composer.reconcile_stage();
+                if !app.messages_snapshot_in_flight {
+                    if let Some(tx) = &app.messages_snapshot_tx {
+                        let _ = tx.try_send(128);
+                        app.messages_snapshot_in_flight = true;
+                    }
+                }
+                app.notice.show(
+                    "Reconciled uncertain state: refreshed snapshot and routes",
+                    Instant::now(),
+                );
+                return Ok(Some(InputOutcome::Redraw));
+            }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.messages_composer.push_char(c);
                 return Ok(Some(InputOutcome::Redraw));
@@ -3465,7 +3479,7 @@ async fn handle_messages_key(
                     Some(cyclops_ui::Stage::Uncertain { .. })
                 ) {
                     app.notice.show(
-                        "Reconciliation required: send outcome unconfirmed by daemon",
+                        "Send outcome unconfirmed by daemon: press Ctrl+R to reconcile or verify snapshot before retry",
                         Instant::now(),
                     );
                     return Ok(Some(InputOutcome::Redraw));
@@ -3477,82 +3491,18 @@ async fn handle_messages_key(
                 }
                 let key_mint = format!("ws-msg-{}", uuid::Uuid::new_v4());
                 let client_key = app.messages_composer.key_for_send(|| key_mint);
-                let mode = app.messages_composer.mode.clone();
+                let mode = app.messages_composer.mode.as_ref().unwrap();
 
-                let (to, fyi, reply_to, subject) = match mode {
-                    Some(cyclops_ui::ComposerMode::Reply {
-                        ref message_id,
-                        ref origin_endpoint,
-                        ..
-                    }) => {
-                        let route_opt = app
-                            .decoration
-                            .mailbox_routes
-                            .iter()
-                            .find(|r| r.recipient == *origin_endpoint);
-                        let target_label = if let Some(route) = route_opt {
-                            route.label.clone()
-                        } else {
-                            app.messages_composer.record_not_sent(format!(
-                                "origin endpoint {origin_endpoint} is no longer reachable in mailbox routes"
-                            ));
-                            return Ok(Some(InputOutcome::Redraw));
-                        };
-                        (
-                            vec![target_label],
-                            false,
-                            Some(message_id.to_string()),
-                            format!("Re: {message_id}"),
-                        )
-                    }
-                    Some(cyclops_ui::ComposerMode::Announce { ref recipients }) => {
-                        let mut to_labels = Vec::new();
-                        for (endpoint, label) in recipients {
-                            if let Some(r) = app
-                                .decoration
-                                .mailbox_routes
-                                .iter()
-                                .find(|r| r.recipient == *endpoint)
-                            {
-                                to_labels.push(r.label.clone());
-                            } else {
-                                to_labels.push(label.clone());
-                            }
-                        }
-                        if to_labels.is_empty() {
-                            app.messages_composer.record_not_sent(
-                                "no reachable mailbox routes available for announcement".into(),
-                            );
+                // Revalidate exact RecipientKeys against current live mailbox routes; never retarget by label
+                let (to, fyi, reply_to, subject) =
+                    match mode.revalidate_routes(&app.decoration.mailbox_routes) {
+                        Ok(res) => res,
+                        Err(why) => {
+                            app.messages_composer.record_not_sent(why.clone());
+                            app.notice.show(format!("Refused: {why}"), Instant::now());
                             return Ok(Some(InputOutcome::Redraw));
                         }
-                        (to_labels, true, None, "Announcement".to_string())
-                    }
-                    Some(cyclops_ui::ComposerMode::Direct {
-                        ref recipient_endpoint,
-                        ..
-                    }) => {
-                        let route_opt = app
-                            .decoration
-                            .mailbox_routes
-                            .iter()
-                            .find(|r| r.recipient == *recipient_endpoint);
-                        let target_label = if let Some(route) = route_opt {
-                            route.label.clone()
-                        } else {
-                            app.messages_composer.record_not_sent(format!(
-                                "recipient endpoint {recipient_endpoint} is no longer reachable in mailbox routes"
-                            ));
-                            return Ok(Some(InputOutcome::Redraw));
-                        };
-                        (
-                            vec![target_label],
-                            false,
-                            None,
-                            "Direct Message".to_string(),
-                        )
-                    }
-                    None => return Ok(Some(InputOutcome::NoRedraw)),
-                };
+                    };
 
                 // Asynchronously route send through background worker lane and render Sending
                 app.messages_composer.stage =

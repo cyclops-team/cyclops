@@ -41,6 +41,73 @@ impl ComposerMode {
             ComposerMode::Direct { .. } => "Direct",
         }
     }
+
+    /// Revalidate that the exact RecipientKey(s) are still active in the live mailbox routes.
+    /// Returns (to_labels, fyi, reply_to, subject) on success.
+    /// Never retargets by label if the endpoint RecipientKey is missing or moved.
+    pub fn revalidate_routes(
+        &self,
+        live_routes: &[cyclops_proto::StatusMailboxRoute],
+    ) -> Result<(Vec<String>, bool, Option<String>, String), String> {
+        match self {
+            ComposerMode::Reply {
+                message_id,
+                origin_endpoint,
+                ..
+            } => {
+                let route = live_routes
+                    .iter()
+                    .find(|r| &r.recipient == origin_endpoint)
+                    .ok_or_else(|| {
+                        format!(
+                            "origin endpoint {origin_endpoint} is no longer live in mailbox routes"
+                        )
+                    })?;
+                Ok((
+                    vec![route.label.clone()],
+                    false,
+                    Some(message_id.to_string()),
+                    format!("Re: {message_id}"),
+                ))
+            }
+            ComposerMode::Direct {
+                recipient_endpoint, ..
+            } => {
+                let route = live_routes
+                    .iter()
+                    .find(|r| &r.recipient == recipient_endpoint)
+                    .ok_or_else(|| {
+                        format!(
+                            "recipient endpoint {recipient_endpoint} is no longer live in mailbox routes"
+                        )
+                    })?;
+                Ok((
+                    vec![route.label.clone()],
+                    false,
+                    None,
+                    "Direct Message".to_string(),
+                ))
+            }
+            ComposerMode::Announce { recipients } => {
+                if recipients.is_empty() {
+                    return Err("no recipients specified for announcement".to_string());
+                }
+                let mut matched_labels = Vec::new();
+                for (endpoint, _) in recipients {
+                    let route = live_routes
+                        .iter()
+                        .find(|r| &r.recipient == endpoint)
+                        .ok_or_else(|| {
+                            format!(
+                                "announcement recipient {endpoint} is no longer live in mailbox routes"
+                            )
+                        })?;
+                    matched_labels.push(route.label.clone());
+                }
+                Ok((matched_labels, true, None, "Announcement".to_string()))
+            }
+        }
+    }
 }
 
 /// State of the bottom bounded composer.
@@ -131,6 +198,13 @@ impl ComposerState {
 
     pub fn clear_stage(&mut self) {
         self.stage = None;
+    }
+
+    /// Reconcile an uncertain send by clearing the stage after operator reconciliation.
+    pub fn reconcile_stage(&mut self) {
+        if matches!(self.stage, Some(Stage::Uncertain { .. })) {
+            self.stage = None;
+        }
     }
 }
 
@@ -906,5 +980,93 @@ mod tests {
             Some(&target1),
             "target1 must remain selected by stable ID"
         );
+    }
+
+    #[test]
+    fn revalidate_routes_matches_exact_recipient_key() {
+        let r1 = RecipientKey::parse(
+            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+        )
+        .unwrap();
+        let m1 = MessageId::parse("m-0000000000000001").unwrap();
+        let mode = ComposerMode::Reply {
+            message_id: m1.clone(),
+            origin_endpoint: r1,
+            origin_label: "claude".into(),
+            reply_subject: Some("Test".into()),
+        };
+
+        let live_routes = vec![cyclops_proto::StatusMailboxRoute {
+            recipient: r1,
+            label: "claude-dev".into(),
+        }];
+
+        let (to, fyi, reply_to, subject) =
+            mode.revalidate_routes(&live_routes).expect("valid match");
+        assert_eq!(to, vec!["claude-dev"]);
+        assert!(!fyi);
+        assert_eq!(reply_to, Some("m-0000000000000001".to_string()));
+        assert_eq!(subject, "Re: m-0000000000000001");
+    }
+
+    #[test]
+    fn revalidate_routes_rejects_missing_endpoint_and_never_retargets_by_label() {
+        let r1 = RecipientKey::parse(
+            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+        )
+        .unwrap();
+        let r_different_session = RecipientKey::parse(
+            "00000000-0000-0000-0000-000000000001:99999999-9999-9999-9999-999999999999:%1",
+        )
+        .unwrap();
+        let m1 = MessageId::parse("m-0000000000000001").unwrap();
+        let mode = ComposerMode::Reply {
+            message_id: m1,
+            origin_endpoint: r1,
+            origin_label: "claude".into(),
+            reply_subject: Some("Test".into()),
+        };
+
+        // Another pane has the same label name "claude", but a different session instance
+        let live_routes = vec![cyclops_proto::StatusMailboxRoute {
+            recipient: r_different_session,
+            label: "claude".into(),
+        }];
+
+        let result = mode.revalidate_routes(&live_routes);
+        assert!(
+            result.is_err(),
+            "must refuse to retarget even if label matches"
+        );
+        let err_msg = result.unwrap_err();
+        assert!(err_msg.contains("no longer live in mailbox routes"));
+    }
+
+    #[test]
+    fn stale_connection_recovery_preserves_draft_and_idempotency_key() {
+        let r1 = RecipientKey::parse(
+            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+        )
+        .unwrap();
+        let m1 = MessageId::parse("m-0000000000000001").unwrap();
+        let mut composer =
+            ComposerState::new_reply(m1, r1, "claude".into(), Some("Refactor plan".into()));
+        composer.push_char('S');
+        composer.push_char('a');
+        composer.push_char('f');
+        composer.push_char('e');
+
+        let key1 = composer.key_for_send(|| "idemp-key-100".to_string());
+        assert_eq!(key1, "idemp-key-100");
+
+        // Stale connection failure
+        composer.record_not_sent("daemon connection reset".into());
+        assert_eq!(composer.text(), "Safe");
+        assert!(matches!(composer.stage, Some(Stage::NotSent { .. })));
+
+        // Draft and client idempotency key are strictly preserved across reconnect/retry
+        let key2 = composer.key_for_send(|| "idemp-key-999".to_string());
+        assert_eq!(key2, "idemp-key-100");
+        assert_eq!(composer.text(), "Safe");
     }
 }
