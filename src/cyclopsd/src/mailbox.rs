@@ -4976,8 +4976,9 @@ impl MailboxService {
             .map_err(Into::into)
     }
 
-    /// Bounded body-free mailbox attention for status and message views.
-    /// Both surfaces read these rows from the same projection.
+    /// The full durable mailbox attention set `status` and
+    /// `messages.snapshot` serve, from the same projection: open alarms and
+    /// held queue heads in every held state, pre-write blocks included.
     pub(crate) fn mailbox_attention_rows(
         &self,
     ) -> Result<Vec<cyclops_proto::OpenDelivery>, MailboxServiceError> {
@@ -4990,6 +4991,7 @@ impl MailboxService {
         Ok(self.store()?.projection().mailbox_attention_rows(&labels))
     }
 
+    /// Bounded body-free pre-write failures for the operator status view.
     pub(crate) fn blocked_notification_snapshot(
         &self,
         now: u64,
