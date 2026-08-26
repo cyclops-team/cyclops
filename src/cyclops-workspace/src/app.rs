@@ -183,6 +183,22 @@ enum AppMsg {
     /// cyclops-ui's `UiMsg::ThemeChanged`: the handler arms the render
     /// debounce and the reload itself runs on that deadline, before draw.
     ThemeChanged,
+    /// A messages snapshot response has landed from cyclopsd.
+    MessagesSnapshotLoaded(cyclops_proto::MessagesSnapshotResult),
+    /// Message detail / claim response has landed from cyclopsd.
+    MessageDetailLoaded(Box<cyclops_ui::Detail>),
+    /// Messages group-chat composer send outcome from background worker.
+    MessagesSendFinished(crate::daemon::SendOutcome),
+}
+
+/// Work item for sending a message asynchronously from the group-chat composer.
+pub(crate) struct MessagesSendTask {
+    pub to: Vec<String>,
+    pub subject: String,
+    pub body: String,
+    pub fyi: bool,
+    pub reply_to: Option<String>,
+    pub client_key: String,
 }
 
 /// Independent bounded lanes for work that enters the application from
@@ -353,6 +369,18 @@ struct App {
     /// One fixed stream replacement worker. Gap edges coalesce in its
     /// single slot while the current replacement is loading.
     stream_reconcile_requests: Option<std::sync::mpsc::SyncSender<()>>,
+    /// Whether the Messages drawer has active keyboard focus.
+    messages_focused: bool,
+    /// Whether a messages.snapshot request is currently in-flight.
+    messages_snapshot_in_flight: bool,
+    /// Async worker for Messages composer sends.
+    messages_send_tx: Option<std::sync::mpsc::SyncSender<MessagesSendTask>>,
+    /// Async worker for bounded messages snapshot requests.
+    messages_snapshot_tx: Option<std::sync::mpsc::SyncSender<usize>>,
+    /// Async worker for claiming/loading message detail.
+    message_detail_tx: Option<
+        std::sync::mpsc::SyncSender<(cyclops_proto::MessageId, cyclops_proto::RecipientKey)>,
+    >,
 }
 
 fn toggle_workspace_expanded(expanded: &mut HashSet<String>, session_id: String) -> bool {
@@ -656,6 +684,91 @@ pub async fn run_async() -> i32 {
         }
     });
 
+    let (messages_send_tx, messages_send_rx) = std::sync::mpsc::sync_channel::<MessagesSendTask>(1);
+    let msg_send_home = home.clone();
+    let msg_send_results = action_tx.clone();
+    std::thread::spawn(move || {
+        while let Ok(task) = messages_send_rx.recv() {
+            let outcome = crate::daemon::send_message_full(
+                &msg_send_home,
+                task.to,
+                &task.subject,
+                &task.body,
+                task.fyi,
+                task.reply_to,
+                &task.client_key,
+            );
+            if msg_send_results
+                .blocking_send(AppMsg::MessagesSendFinished(outcome))
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+
+    let (messages_snapshot_tx, messages_snapshot_rx) = std::sync::mpsc::sync_channel::<usize>(1);
+    let msg_snapshot_home = home.clone();
+    let msg_snapshot_results = action_tx.clone();
+    std::thread::spawn(move || {
+        while let Ok(limit) = messages_snapshot_rx.recv() {
+            if let Ok(result) = crate::daemon::fetch_messages_snapshot(&msg_snapshot_home, limit) {
+                if msg_snapshot_results
+                    .blocking_send(AppMsg::MessagesSnapshotLoaded(result))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    });
+
+    let (message_detail_tx, message_detail_rx) =
+        std::sync::mpsc::sync_channel::<(cyclops_proto::MessageId, cyclops_proto::RecipientKey)>(1);
+    let msg_detail_home = home.clone();
+    let msg_detail_results = action_tx.clone();
+    std::thread::spawn(move || {
+        while let Ok((message_id, recipient)) = message_detail_rx.recv() {
+            if let Ok(claim) =
+                crate::daemon::fetch_message_claim(&msg_detail_home, &message_id, &recipient)
+            {
+                let row = cyclops_ui::QueueRow {
+                    message_id: message_id.clone(),
+                    recipient,
+                    ..Default::default()
+                };
+                let mut detail = cyclops_ui::Detail::open(&row, 0);
+                let thread: Vec<cyclops_ui::ThreadEntry> = claim
+                    .thread
+                    .into_iter()
+                    .map(|t| cyclops_ui::ThreadEntry {
+                        message_id: t.message_id,
+                        sender_label: t.sender_label,
+                        subject: t.subject,
+                        body: t.body,
+                        ts: t.ts,
+                    })
+                    .collect();
+                let loaded = cyclops_ui::Loaded {
+                    body: claim.body,
+                    body_authorized: claim.body_authorized,
+                    thread,
+                    checks: Vec::new(),
+                    claim_note: claim.note,
+                    thread_note: claim.thread_note,
+                    expected: None,
+                };
+                detail.loaded_ok(loaded);
+                if msg_detail_results
+                    .blocking_send(AppMsg::MessageDetailLoaded(Box::new(detail)))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    });
+
     std::thread::spawn(move || loop {
         match event::read() {
             Ok(Event::Key(k)) => {
@@ -876,6 +989,11 @@ pub async fn run_async() -> i32 {
         folder_probe_at: None,
         send_requests: Some(send_request_tx),
         stream_reconcile_requests: Some(stream_reconcile_tx),
+        messages_focused: false,
+        messages_snapshot_in_flight: false,
+        messages_send_tx: Some(messages_send_tx),
+        messages_snapshot_tx: Some(messages_snapshot_tx),
+        message_detail_tx: Some(message_detail_tx),
     };
     // Bare `cyclops` can boot a session config.toml never mentions, so the
     // very first frame is already a frame the daemon may not be watching
@@ -885,6 +1003,12 @@ pub async fn run_async() -> i32 {
         log_err(&app.home, &format!("decoration refresh failed: {error}"));
         DecorationSnapshot::default()
     });
+    if app.model.messages_visible {
+        if let Some(tx) = &app.messages_snapshot_tx {
+            let _ = tx.try_send(128);
+            app.messages_snapshot_in_flight = true;
+        }
+    }
     // The subscription at the top of this function is already queuing live
     // entries on the app channel; boot's backfill-then-seed lands before
     // the loop below drains them, which is exactly the order the intake
@@ -2196,10 +2320,22 @@ async fn handle_app_msg(
         }
         AppMsg::DecorationChanged(snapshot) => {
             apply_decoration_snapshot(app, snapshot);
+            if app.model.messages_visible && !app.messages_snapshot_in_flight {
+                if let Some(tx) = &app.messages_snapshot_tx {
+                    let _ = tx.try_send(128);
+                    app.messages_snapshot_in_flight = true;
+                }
+            }
             arm(debounce);
         }
         AppMsg::DaemonReconnected => {
             resync_daemon_state(app);
+            if app.model.messages_visible && !app.messages_snapshot_in_flight {
+                if let Some(tx) = &app.messages_snapshot_tx {
+                    let _ = tx.try_send(128);
+                    app.messages_snapshot_in_flight = true;
+                }
+            }
             arm(debounce);
         }
         // E2: per-event, not coalesced with the decoration burst above —
@@ -2259,6 +2395,43 @@ async fn handle_app_msg(
         // Wake-only: the reload itself runs on the render deadline this
         // arms (the theme_watch refresh in `run_async`).
         AppMsg::ThemeChanged => arm(debounce),
+        AppMsg::MessagesSnapshotLoaded(result) => {
+            app.messages_snapshot_in_flight = false;
+            let rows = cyclops_ui::messages::rows_from_snapshot(&result);
+            app.messages_queue.replace(cyclops_ui::Snapshot {
+                watermark: result.watermark,
+                rows,
+            });
+            arm(debounce);
+        }
+        AppMsg::MessageDetailLoaded(detail) => {
+            app.messages_detail = Some(*detail);
+            arm(debounce);
+        }
+        AppMsg::MessagesSendFinished(outcome) => {
+            match outcome {
+                crate::daemon::SendOutcome::Accepted(msg) => {
+                    app.messages_composer.draft.set("");
+                    app.messages_composer.mode = None;
+                    app.messages_composer.focused = false;
+                    app.messages_composer.clear_stage();
+                    app.notice.show(msg, Instant::now());
+                }
+                crate::daemon::SendOutcome::Rejected(why) => {
+                    app.messages_composer.record_not_sent(why);
+                }
+                crate::daemon::SendOutcome::Unknown(why) => {
+                    app.messages_composer.record_uncertain(why);
+                }
+            }
+            if !app.messages_snapshot_in_flight {
+                if let Some(tx) = &app.messages_snapshot_tx {
+                    let _ = tx.try_send(128);
+                    app.messages_snapshot_in_flight = true;
+                }
+            }
+            arm(debounce);
+        }
         AppMsg::Mouse(mouse) => {
             // Bare motion only matters while a menu or dialog shows hover
             // highlights — or over the sidebar's create button, the one
@@ -2304,6 +2477,13 @@ async fn handle_app_msg(
                 if dialog::append_dialog_text(app.dialog.as_mut(), &text) {
                     arm(debounce);
                 }
+                return true;
+            }
+            if app.model.messages_visible && app.messages_focused && app.messages_composer.focused {
+                for ch in text.chars() {
+                    app.messages_composer.push_char(ch);
+                }
+                arm(debounce);
                 return true;
             }
             if let Err(e) = paste_into_focused_pane(app, client, text.as_bytes()).await {
@@ -2716,6 +2896,7 @@ async fn handle_mouse(
                 }
                 HitTarget::PaneBody { pane_id } => {
                     app.close_menu();
+                    app.messages_focused = false;
                     let pane_id = pane_id.clone();
                     let hit = HitTarget::PaneBody {
                         pane_id: pane_id.clone(),
@@ -2905,6 +3086,7 @@ async fn handle_mouse(
                 HitTarget::MessagesDivider => {
                     app.close_menu();
                     clear_selection(app);
+                    app.messages_focused = true;
                     app.drag = Some(DragState::on_down(DragTarget::Messages, col, row));
                     return Ok(());
                 }
@@ -3254,7 +3436,7 @@ async fn handle_messages_key(
 ) -> Result<Option<InputOutcome>, cyclops_tmux::TmuxError> {
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    if !app.model.messages_visible {
+    if !app.model.messages_visible || !app.messages_focused {
         return Ok(None);
     }
 
@@ -3282,8 +3464,10 @@ async fn handle_messages_key(
                     app.messages_composer.stage,
                     Some(cyclops_ui::Stage::Uncertain { .. })
                 ) {
-                    app.notice
-                        .show("Reconciliation required: send outcome unconfirmed by daemon");
+                    app.notice.show(
+                        "Reconciliation required: send outcome unconfirmed by daemon",
+                        Instant::now(),
+                    );
                     return Ok(Some(InputOutcome::Redraw));
                 }
 
@@ -3298,59 +3482,91 @@ async fn handle_messages_key(
                 let (to, fyi, reply_to, subject) = match mode {
                     Some(cyclops_ui::ComposerMode::Reply {
                         ref message_id,
-                        ref origin_label,
+                        ref origin_endpoint,
                         ..
-                    }) => (
-                        vec![origin_label.clone()],
-                        false,
-                        Some(message_id.to_string()),
-                        format!("Re: {message_id}"),
-                    ),
-                    Some(cyclops_ui::ComposerMode::Announce { ref recipients }) => {
-                        let to: Vec<String> = if recipients.is_empty() {
-                            vec!["*".to_string()]
+                    }) => {
+                        let route_opt = app
+                            .decoration
+                            .mailbox_routes
+                            .iter()
+                            .find(|r| r.recipient == *origin_endpoint);
+                        let target_label = if let Some(route) = route_opt {
+                            route.label.clone()
                         } else {
-                            recipients.iter().map(|(_, l)| l.clone()).collect()
+                            app.messages_composer.record_not_sent(format!(
+                                "origin endpoint {origin_endpoint} is no longer reachable in mailbox routes"
+                            ));
+                            return Ok(Some(InputOutcome::Redraw));
                         };
-                        (to, true, None, "Announcement".to_string())
+                        (
+                            vec![target_label],
+                            false,
+                            Some(message_id.to_string()),
+                            format!("Re: {message_id}"),
+                        )
+                    }
+                    Some(cyclops_ui::ComposerMode::Announce { ref recipients }) => {
+                        let mut to_labels = Vec::new();
+                        for (endpoint, label) in recipients {
+                            if let Some(r) = app
+                                .decoration
+                                .mailbox_routes
+                                .iter()
+                                .find(|r| r.recipient == *endpoint)
+                            {
+                                to_labels.push(r.label.clone());
+                            } else {
+                                to_labels.push(label.clone());
+                            }
+                        }
+                        if to_labels.is_empty() {
+                            app.messages_composer.record_not_sent(
+                                "no reachable mailbox routes available for announcement".into(),
+                            );
+                            return Ok(Some(InputOutcome::Redraw));
+                        }
+                        (to_labels, true, None, "Announcement".to_string())
                     }
                     Some(cyclops_ui::ComposerMode::Direct {
-                        ref recipient_label,
+                        ref recipient_endpoint,
                         ..
-                    }) => (
-                        vec![recipient_label.clone()],
-                        false,
-                        None,
-                        "Direct Message".to_string(),
-                    ),
+                    }) => {
+                        let route_opt = app
+                            .decoration
+                            .mailbox_routes
+                            .iter()
+                            .find(|r| r.recipient == *recipient_endpoint);
+                        let target_label = if let Some(route) = route_opt {
+                            route.label.clone()
+                        } else {
+                            app.messages_composer.record_not_sent(format!(
+                                "recipient endpoint {recipient_endpoint} is no longer reachable in mailbox routes"
+                            ));
+                            return Ok(Some(InputOutcome::Redraw));
+                        };
+                        (
+                            vec![target_label],
+                            false,
+                            None,
+                            "Direct Message".to_string(),
+                        )
+                    }
                     None => return Ok(Some(InputOutcome::NoRedraw)),
                 };
 
-                let outcome = crate::daemon::send_message_full(
-                    &app.home,
-                    to,
-                    &subject,
-                    &text,
-                    fyi,
-                    reply_to,
-                    &client_key,
-                );
-                match outcome {
-                    crate::daemon::SendOutcome::Accepted(msg) => {
-                        app.messages_composer.draft.set("");
-                        app.messages_composer.mode = None;
-                        app.messages_composer.focused = false;
-                        app.messages_composer.clear_stage();
-                        app.notice.show(msg);
-                    }
-                    crate::daemon::SendOutcome::Rejected(why) => {
-                        // Draft preserved on refusal so operator can retry
-                        app.messages_composer.record_not_sent(why);
-                    }
-                    crate::daemon::SendOutcome::Unknown(why) => {
-                        // Draft preserved on uncertain outcome; requires reconciliation
-                        app.messages_composer.record_uncertain(why);
-                    }
+                // Asynchronously route send through background worker lane and render Sending
+                app.messages_composer.stage =
+                    Some(cyclops_ui::Stage::Acting(cyclops_ui::Action::Reply));
+                if let Some(tx) = &app.messages_send_tx {
+                    let task = MessagesSendTask {
+                        to,
+                        subject,
+                        body: text,
+                        fyi,
+                        reply_to,
+                        client_key,
+                    };
+                    let _ = tx.send(task);
                 }
                 return Ok(Some(InputOutcome::Redraw));
             }
@@ -3358,70 +3574,79 @@ async fn handle_messages_key(
         }
     }
 
-    // When the composer is not focused, handle navigation and shortcut actions
-    if !app.messages_composer.focused || app.messages_composer.mode.is_none() {
-        match key.code {
-            KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(row) = app.messages_queue.selected() {
-                    app.messages_composer = cyclops_ui::ComposerState::new_reply(
-                        row.message_id.clone(),
-                        row.sender,
-                        row.sender_label.clone(),
-                        row.subject.clone(),
+    // When the composer is not focused, handle navigation and shortcut actions:
+    match key.code {
+        KeyCode::Enter => {
+            if app.messages_detail.is_some() {
+                return Ok(Some(InputOutcome::NoRedraw));
+            }
+            if let Some(row) = app.messages_queue.selected() {
+                if let Some(tx) = &app.message_detail_tx {
+                    let _ = tx.send((row.message_id.clone(), row.recipient));
+                    app.notice.show(
+                        format!("Loading message {}...", row.message_id),
+                        Instant::now(),
                     );
                     return Ok(Some(InputOutcome::Redraw));
                 }
             }
-            KeyCode::Char('a') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let dummy_endpoint = cyclops_proto::RecipientKey::parse(
-                    "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
-                )
-                .unwrap();
-                let recipients: Vec<(cyclops_proto::RecipientKey, String)> = app
-                    .decoration
-                    .panes
-                    .iter()
-                    .map(|(pane_id, p)| {
-                        (
-                            dummy_endpoint,
-                            p.label.clone().unwrap_or_else(|| pane_id.clone()),
-                        )
-                    })
-                    .collect();
-                let recipients = if recipients.is_empty() {
-                    vec![
-                        (dummy_endpoint, "claude".into()),
-                        (dummy_endpoint, "codex".into()),
-                        (dummy_endpoint, "agy".into()),
-                    ]
-                } else {
-                    recipients
-                };
-                app.messages_composer = cyclops_ui::ComposerState::new_announce(recipients);
-                return Ok(Some(InputOutcome::Redraw));
-            }
-            KeyCode::Char('j') | KeyCode::Down
-                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                app.messages_queue.select_next();
-                return Ok(Some(InputOutcome::Redraw));
-            }
-            KeyCode::Char('k') | KeyCode::Up if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.messages_queue.select_previous();
-                return Ok(Some(InputOutcome::Redraw));
-            }
-            KeyCode::Char('s') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let next = match app.messages_queue.scope() {
-                    cyclops_ui::Scope::Work => cyclops_ui::Scope::Inbox,
-                    cyclops_ui::Scope::Inbox => cyclops_ui::Scope::Outbound,
-                    cyclops_ui::Scope::Outbound => cyclops_ui::Scope::All,
-                    cyclops_ui::Scope::All => cyclops_ui::Scope::Work,
-                };
-                app.messages_queue.set_scope(next);
-                return Ok(Some(InputOutcome::Redraw));
-            }
-            _ => {}
         }
+        KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q') => {
+            if app.messages_detail.is_some() {
+                app.messages_detail = None;
+                return Ok(Some(InputOutcome::Redraw));
+            }
+            // Return keyboard focus to active terminal pane
+            app.messages_focused = false;
+            return Ok(Some(InputOutcome::Redraw));
+        }
+        KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(row) = app.messages_queue.selected() {
+                app.messages_composer = cyclops_ui::ComposerState::new_reply(
+                    row.message_id.clone(),
+                    row.sender,
+                    row.sender_label.clone(),
+                    row.subject.clone(),
+                );
+                return Ok(Some(InputOutcome::Redraw));
+            }
+        }
+        KeyCode::Char('a') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let routes = &app.decoration.mailbox_routes;
+            if routes.is_empty() {
+                app.messages_composer.record_not_sent(
+                    "no reachable mailbox routes available for announcement".into(),
+                );
+                app.notice
+                    .show("Refused: no reachable mailbox routes", Instant::now());
+                return Ok(Some(InputOutcome::Redraw));
+            }
+            let recipients: Vec<(cyclops_proto::RecipientKey, String)> = routes
+                .iter()
+                .map(|r| (r.recipient, r.label.clone()))
+                .collect();
+            app.messages_composer = cyclops_ui::ComposerState::new_announce(recipients);
+            return Ok(Some(InputOutcome::Redraw));
+        }
+        KeyCode::Char('j') | KeyCode::Down if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.messages_queue.select_next();
+            return Ok(Some(InputOutcome::Redraw));
+        }
+        KeyCode::Char('k') | KeyCode::Up if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.messages_queue.select_previous();
+            return Ok(Some(InputOutcome::Redraw));
+        }
+        KeyCode::Char('s') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let next = match app.messages_queue.scope() {
+                cyclops_ui::Scope::Work => cyclops_ui::Scope::Inbox,
+                cyclops_ui::Scope::Inbox => cyclops_ui::Scope::Outbound,
+                cyclops_ui::Scope::Outbound => cyclops_ui::Scope::All,
+                cyclops_ui::Scope::All => cyclops_ui::Scope::Work,
+            };
+            app.messages_queue.set_scope(next);
+            return Ok(Some(InputOutcome::Redraw));
+        }
+        _ => {}
     }
 
     Ok(None)
@@ -4386,6 +4611,7 @@ fn draw(
                     app.messages_detail.as_ref(),
                     Some(&app.messages_composer),
                     &app.avatar_registry,
+                    Some(&app.decoration.mailbox_routes),
                     Some(&pane_manifests),
                     app.notice.text(),
                     messages,
@@ -4688,6 +4914,11 @@ mod tests {
             folder_probe_at: None,
             send_requests: None,
             stream_reconcile_requests: None,
+            messages_focused: false,
+            messages_snapshot_in_flight: false,
+            messages_send_tx: None,
+            messages_snapshot_tx: None,
+            message_detail_tx: None,
         }
     }
 

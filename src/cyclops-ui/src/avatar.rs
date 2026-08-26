@@ -110,6 +110,31 @@ impl AvatarRegistry {
         Avatar::from_label(id_or_label)
     }
 
+    /// Resolve an avatar for a durable endpoint by joining it to live mailbox routes
+    /// and pane manifests, ensuring session-instance exactness, or falling back
+    /// deterministically to initials from the label without vendor guessing.
+    pub fn resolve_route_endpoint(
+        &self,
+        endpoint: &cyclops_proto::RecipientKey,
+        display_label: &str,
+        live_routes: Option<&[cyclops_proto::StatusMailboxRoute]>,
+        pane_manifests: Option<&HashMap<String, String>>,
+    ) -> Avatar {
+        let is_live_route = match live_routes {
+            Some(routes) => routes.iter().any(|r| &r.recipient == endpoint),
+            None => true,
+        };
+        if is_live_route {
+            let pane_id = endpoint.pane_id();
+            if let Some(manifests) = pane_manifests {
+                if let Some(manifest) = manifests.get(pane_id) {
+                    return self.resolve(manifest);
+                }
+            }
+        }
+        self.resolve(display_label)
+    }
+
     /// Resolve an avatar for a durable endpoint by joining it to pane manifests,
     /// or falling back deterministically to initials from the label without vendor guessing.
     pub fn resolve_endpoint(
@@ -118,13 +143,7 @@ impl AvatarRegistry {
         display_label: &str,
         pane_manifests: Option<&HashMap<String, String>>,
     ) -> Avatar {
-        let pane_id = endpoint.pane_id();
-        if let Some(manifests) = pane_manifests {
-            if let Some(manifest) = manifests.get(pane_id) {
-                return self.resolve(manifest);
-            }
-        }
-        self.resolve(display_label)
+        self.resolve_route_endpoint(endpoint, display_label, None, pane_manifests)
     }
 }
 

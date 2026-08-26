@@ -219,6 +219,7 @@ impl TimelineItem {
     pub fn aggregate_from_rows(
         rows: &[QueueRow],
         avatar_registry: &AvatarRegistry,
+        live_routes: Option<&[cyclops_proto::StatusMailboxRoute]>,
         pane_manifests: Option<&HashMap<String, String>>,
         selected_target: Option<&QueueTarget>,
         detail: Option<&Detail>,
@@ -228,9 +229,10 @@ impl TimelineItem {
 
         for row in rows {
             let is_sel = selected_target == Some(&row.target);
-            let recip_avatar = avatar_registry.resolve_endpoint(
+            let recip_avatar = avatar_registry.resolve_route_endpoint(
                 &row.recipient,
                 &row.recipient_label,
+                live_routes,
                 pane_manifests,
             );
 
@@ -252,9 +254,10 @@ impl TimelineItem {
                 }
                 item.is_broadcast = item.recipients.len() > 1 || row.kind == Kind::Fyi;
             } else {
-                let sender_avatar = avatar_registry.resolve_endpoint(
+                let sender_avatar = avatar_registry.resolve_route_endpoint(
                     &row.sender,
                     &row.sender_label,
+                    live_routes,
                     pane_manifests,
                 );
 
@@ -329,6 +332,7 @@ pub fn render_chat(
     detail: Option<&Detail>,
     composer: Option<&ComposerState>,
     avatar_registry: &AvatarRegistry,
+    live_routes: Option<&[cyclops_proto::StatusMailboxRoute]>,
     pane_manifests: Option<&HashMap<String, String>>,
     width: usize,
     height: usize,
@@ -376,6 +380,7 @@ pub fn render_chat(
     let items = TimelineItem::aggregate_from_rows(
         &visible_rows,
         avatar_registry,
+        live_routes,
         pane_manifests,
         selected_target,
         detail,
@@ -384,7 +389,7 @@ pub fn render_chat(
     let mut timeline_lines: Vec<String> = Vec::new();
 
     if width < 24 {
-        // Ultra-narrow mode: 1-2 lines per entry
+        // Ultra-narrow mode: 1-2 lines per entry using initials (never icon only)
         for item in &items {
             let sel_mark = if item.is_selected { ">" } else { " " };
             let attn_mark = if item.recipients.iter().any(|r| r.is_attention) {
@@ -392,7 +397,7 @@ pub fn render_chat(
             } else {
                 " "
             };
-            let s_badge = item.sender_avatar.badge();
+            let s_initials = &item.sender_avatar.initials;
             let short_id = if item.message_id.as_str().len() > 6 {
                 &item.message_id.as_str()[item.message_id.as_str().len() - 6..]
             } else {
@@ -403,7 +408,7 @@ pub fn render_chat(
                 .map(|r| proven_status_short(r.mailbox, r.wake))
                 .unwrap_or("*pend");
 
-            let line1 = format!("{sel_mark}{attn_mark}[{s_badge}]{short_id} {status_short}");
+            let line1 = format!("{sel_mark}{attn_mark}[{s_initials}]{short_id} {status_short}");
             timeline_lines.push(fit(&line1, width));
             let recip_labels = item
                 .recipients
@@ -699,6 +704,7 @@ mod tests {
             None,
             &reg,
             None,
+            None,
             80,
             20,
             None,
@@ -750,6 +756,7 @@ mod tests {
             None,
             None,
             &reg,
+            None,
             None,
             18,
             10,
@@ -815,6 +822,7 @@ mod tests {
             None,
             Some(&composer),
             &reg,
+            None,
             None,
             80,
             10,
