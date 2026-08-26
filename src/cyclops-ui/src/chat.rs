@@ -812,7 +812,9 @@ pub fn render_chat(
                         format!("! [Not sent: {why} (draft preserved, Enter to retry)]")
                     }
                     Stage::Uncertain { why, .. } => {
-                        format!("! [Uncertain: {why} (draft preserved; outcome unconfirmed, reconciliation required)]")
+                        format!(
+                            "! [Uncertain: reconciliation required; draft preserved; outcome unconfirmed: {why}]"
+                        )
                     }
                     Stage::Failed { why, .. } => {
                         format!("! [Refused: {why} (draft preserved)]")
