@@ -435,7 +435,8 @@ cargo install cargo-nextest --locked --version 0.9.100
 ```
 
 ```bash
-cargo nextest run --workspace --no-fail-fast
+cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
+cargo test -p cyclopsd --all-targets --no-fail-fast
 cargo test --workspace --doc
 python3 scripts/commpact-shim/test_shim.py
 ./tests/e2e/parity-check.sh
@@ -466,7 +467,8 @@ elsewhere. Move it with `CYCLOPS_TEST_TMP`:
 
 ```bash
 mkdir -p /private/var/tmp/cyc-relocated
-CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated cargo nextest run --workspace --no-fail-fast
+CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
+CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated cargo test -p cyclopsd --all-targets --no-fail-fast
 ```
 
 Use it when `/private/tmp` is not writable, and when you want to check

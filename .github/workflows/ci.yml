@@ -57,7 +57,8 @@ jobs:
       - name: Rust tests
         run: |
           status=0
-          cargo nextest run --workspace --no-fail-fast || status=$?
+          cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast || status=$?
+          cargo test -p cyclopsd --all-targets --no-fail-fast || status=$?
           cargo test --workspace --doc || status=$?
           exit "$status"
       # The commPact shim is bash + python, invisible to nextest; its
@@ -94,7 +95,8 @@ jobs:
         run: |
           mkdir -p "$CYCLOPS_TEST_TMP"
           status=0
-          cargo nextest run --workspace --no-fail-fast || status=$?
+          cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast || status=$?
+          cargo test -p cyclopsd --all-targets --no-fail-fast || status=$?
           cargo test --workspace --doc || status=$?
           python3 scripts/commpact-shim/test_shim.py || status=$?
           exit "$status"
@@ -150,6 +152,7 @@ jobs:
       - name: Rust tests against tmux HEAD
         run: |
           status=0
-          cargo nextest run --workspace --no-fail-fast || status=$?
+          cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast || status=$?
+          cargo test -p cyclopsd --all-targets --no-fail-fast || status=$?
           cargo test --workspace --doc || status=$?
           exit "$status"

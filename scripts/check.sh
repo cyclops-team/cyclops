@@ -33,7 +33,8 @@ stage() {
 # reports every failure; the stage fails if either did. Same as CI.
 rust_tests() {
     status=0
-    cargo nextest run --workspace --no-fail-fast || status=$?
+    cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast || status=$?
+    cargo test -p cyclopsd --all-targets --no-fail-fast || status=$?
     cargo test --workspace --doc || status=$?
     return "$status"
 }

@@ -155,7 +155,8 @@ From `CONTRIBUTING.md` — five core checks:
 ```bash
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
-cargo nextest run --workspace --no-fail-fast   # the flag is not optional (F24)
+cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
+cargo test -p cyclopsd --all-targets --no-fail-fast
 cargo test --workspace --doc                   # nextest does not run doctests
 python3 scripts/check-doc-paths.py
 ./tests/e2e/parity-check.sh
@@ -177,7 +178,7 @@ Custom Instructions).
 flowchart TB
     subgraph test["test (ubuntu + macos, fail-fast: false)"]
         a["cargo fmt --check"] --> b["cargo clippy -D warnings"]
-        b --> c["cargo nextest run --workspace --no-fail-fast, then cargo test --workspace --doc"]
+        b --> c["nextest parallel-safe suites, cargo test cyclopsd, then workspace doctests"]
         c --> d["commPact shim tests (python)"]
         d --> e["check-doc-paths.py --selftest, then run"]
         e --> f["tests/e2e/parity-check.sh (docs and binaries agree)"]
@@ -187,7 +188,7 @@ flowchart TB
         h["cargo build --workspace"] --> i["parity-check.sh --with-installer"]
     end
     subgraph canary["tmux-head (advisory, continue-on-error)"]
-        j["build tmux from master"] --> k["cargo nextest run --workspace --no-fail-fast, then cargo test --workspace --doc"]
+        j["build tmux from master"] --> k["nextest parallel-safe suites, cargo test cyclopsd, then workspace doctests"]
     end
     subgraph website["website"]
         l["cmp hosted and tested installers"] --> m["npm run check"]

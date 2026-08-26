@@ -33,7 +33,8 @@ tests and Cargo for doctests, which nextest does not run.
 ```bash
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
-cargo nextest run --workspace --no-fail-fast
+cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
+cargo test -p cyclopsd --all-targets --no-fail-fast
 cargo test --workspace --doc
 python3 scripts/check-doc-paths.py
 ./tests/e2e/parity-check.sh
@@ -166,7 +167,8 @@ On macOS a relocated run takes the same code path Linux does:
 
 ```bash
 mkdir -p /private/var/tmp/cyc-relocated
-CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated cargo nextest run --workspace --no-fail-fast
+CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
+CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated cargo test -p cyclopsd --all-targets --no-fail-fast
 ```
 
 CI runs the whole suite twice for this reason, once relocated.
@@ -207,7 +209,8 @@ throw away the signal that tells a portability bug from a real regression.
 |---|---|
 | `cargo fmt --all --check` | Formatting drifted |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Any lint fires, including in tests |
-| `cargo nextest run --workspace --no-fail-fast` | Any test fails, on either OS |
+| `cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast` | Any parallel-safe test fails, on either OS |
+| `cargo test -p cyclopsd --all-targets --no-fail-fast` | Any daemon test fails under its process-isolated rig contract |
 | `cargo test --workspace --doc` | A Rust doctest fails |
 | `python3 scripts/commpact-shim/test_shim.py` | The commPact v1 shim broke (bash and python, invisible to cargo) |
 | `python3 scripts/check-doc-paths.py` | A doc points at a file this repo does not have, or a page exists that no front door links to. `--selftest` proves the checker still catches, so a green run cannot mean it stopped looking |

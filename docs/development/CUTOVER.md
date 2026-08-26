@@ -41,7 +41,8 @@ refused. A one-line deprecation note prints to stderr once per day per user
 ## Preconditions (all must hold before install)
 
 - [ ] Current core gates pass, including clippy and
-      `cargo nextest run --workspace --no-fail-fast`, plus
+      `cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast`,
+      `cargo test -p cyclopsd --all-targets --no-fail-fast`, plus
       `cargo test --workspace --doc`.
 - [ ] Shim tests green: `python3 scripts/commpact-shim/test_shim.py`.
 - [ ] `cyclopsd` running against the real session; `cyclops status` shows
