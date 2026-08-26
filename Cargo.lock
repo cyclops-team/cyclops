@@ -484,6 +484,7 @@ dependencies = [
  "cyclops-theme",
  "cyclops-tmux",
  "libc",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
