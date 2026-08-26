@@ -25,7 +25,7 @@
 			<p class="lede">
 				Cyclops detects supported agents automatically. Each one is described by a small manifest
 				file: what its process is called, how it reports back, and how to tell when it's busy. 4
-				agents detected out of the box. Teaching it a new CLI is one file.
+				agents detected out of the box. Teaching Cyclops a new agent CLI is one file.
 			</p>
 		</div>
 		<ul class="marks" aria-label="Agents Cyclops recognises">
