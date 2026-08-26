@@ -5,10 +5,10 @@
    palette: one product, two of its themes, never a screenshot that
    inverted. */
 
-/* `.invert` paints one element on the opposite ground: on the sorbet
-   page a forest panel (the forest block below also applies inside it),
-   and on the forest page a plain near-white panel in forest's own ink
-   and green (its block sits after the forest tokens). */
+/* `.invert` paints one element on the opposite ground in the page's own
+   ink and accent: a plain near-black panel on the sorbet page, a plain
+   near-white one on the forest page. Neither is the other theme; the
+   two blocks sit after the forest tokens. */
 :root {
 	color-scheme: light;
 
@@ -43,13 +43,10 @@
 	--accent-2: #b3406e; /* role.8, raspberry */
 	--accent-2-hover: #9c3560;
 
-	/* The counterpoint: one color of the OPPOSITE temperature to the
-	   accent, so a page painted in one theme is not painted in one hue.
-	   On sorbet that is mint, the cool flavor on the counter, for the
-	   small structural marks (eyebrows, step numbers, the field's pulses).
-	   The pixel headlines keep their soft apricot drop: mint under cocoa
-	   ink reads as mud, not as a shadow. */
-	--counter: #2a7a76; /* role.5, mint */
+	/* The counterpoint is plain ink, no second hue: the small structural
+	   marks (eyebrows, step numbers, the field's pulses) read as pencil on
+	   the paper. The pixel headlines keep their soft raised-apricot drop. */
+	--counter: #3a2b26;
 	--counter-shadow: #f3d3bd; /* chrome.raised */
 	--link: #a6461e; /* palette.1, a read link on peach */
 
@@ -106,8 +103,7 @@
 	--font-pixel: 'Silkscreen', ui-monospace, monospace;
 }
 
-:root[data-theme='dark'],
-:root:not([data-theme='dark']) .invert {
+:root[data-theme='dark'] {
 	color-scheme: dark;
 
 	/* Forest: a stand of conifers at dusk. The page ground is the pane
@@ -179,9 +175,49 @@
 	--sb-role-8: #dd9a72; /* fallen leaf */
 }
 
+/* The dark panel on the sorbet page: near-black ground, sorbet's paper
+   as the ink, and the coral lifted far enough to read on it. Only the
+   tokens a panel and the pane frame inside it use. */
+:root:not([data-theme='dark']) .invert {
+	color-scheme: dark;
+	--paper: #171412;
+	--surface: #1d1a17;
+	--surface-mid: #221e1b;
+	--surface-deep: #171412;
+	--ink: #fff6ed;
+	--text: #f3e6da;
+	--muted: #bfa99b;
+	--gray: #a8938a;
+	--faint: #83736b;
+	--line: #2b2622;
+	--line-soft: #241f1c;
+	--hairline: #3a332e;
+	--hairline-btn: #4a413b;
+	--accent: #e8836b;
+	--accent-hover: #f0987f;
+	--accent-ink: #171412;
+	--accent-soft: #33261f;
+	--link: #f0987f;
+	--counter: #f3e6da;
+	--counter-shadow: #33261f;
+	--term-bg: #171412;
+	--term-line: #2b2622;
+	--term-frame: #3a332e;
+	--term-pane-line: #4a413b;
+	--term-shadow: rgba(0, 0, 0, 0.5);
+	--term-text: #f3e6da;
+	--term-dim: #bfa99b;
+	--term-faint: #83736b;
+	--term-control: #221e1b;
+	--term-control-hover: #33261f;
+	--sb-accent: #e8836b;
+	--sb-panel: #221e1b;
+	--sb-raised: #33261f;
+	--sb-healthy: #8ecf95;
+}
+
 /* The light panel on the forest page: near-white paper, forest ink, and
-   the green pulled down far enough to read on white. Only the tokens a
-   panel and the pane frame inside it use. */
+   the green pulled down far enough to read on white. */
 :root[data-theme='dark'] .invert {
 	color-scheme: light;
 	--paper: #f6f8f6;
