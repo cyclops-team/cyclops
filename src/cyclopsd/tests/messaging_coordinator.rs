@@ -1238,6 +1238,7 @@ async fn an_exact_attempt_ack_timeout_claim_clears_then_advances_the_fifo() {
         !rig.tmux.capture(&pane).contains(&expected),
         "exact clear must finish before durable settlement"
     );
+    wait_for_pane_write_ready(&mut rig, &pane).await;
 
     release_settlement.add_permits(1);
     let settled = wait_for_workspace_fact(
@@ -2136,28 +2137,6 @@ async fn codex_ghost_with_unprovable_binding_blocks_once_and_withdrawal_advances
     wait_pane_state(&mut rig, "idle").await;
 
     let pair = send_waiting_pair(&rig, "unprovable-binding").await;
-    let proceed = rig
-        .ev
-        .wait_event(Duration::from_secs(8), |event| {
-            event["event"] == "gate"
-                && event["data"]["id"] == pair.first.as_str()
-                && event["data"]["action"] == "proceed"
-        })
-        .await;
-    assert_eq!(proceed["data"]["rule"], "composer_ghost_suggestion");
-    let rebound = rig
-        .ev
-        .wait_event(Duration::from_secs(8), |event| {
-            event["event"] == "gate"
-                && event["data"]["id"] == pair.first.as_str()
-                && event["data"]["action"] == "rebound"
-        })
-        .await;
-    assert_eq!(rebound["data"]["cause"], "binding_unprovable");
-    assert!(
-        proceed["seq"].as_u64().unwrap() < rebound["seq"].as_u64().unwrap(),
-        "binding failure must follow the admitted ghost-composer gate"
-    );
     wait_for_notification_state(&mut rig, &pair.first, NotificationState::BlockedPreWrite).await;
     let gate_trace: Vec<String> = rig
         .ledger_lines()
@@ -2174,11 +2153,8 @@ async fn codex_ghost_with_unprovable_binding_blocks_once_and_withdrawal_advances
         .collect();
     assert_eq!(
         gate_trace,
-        vec![
-            "proceed:composer_ghost_suggestion:".to_string(),
-            "rebound::binding_unprovable".to_string(),
-        ],
-        "unchanged binding evidence must settle after one exact attempt"
+        vec!["hold::occupant_unprovable".to_string()],
+        "unprovable binding must block before the delivery gate admits a write"
     );
     assert_only_oldest_attempt_exists(&rig, &pair);
     assert_eq!(

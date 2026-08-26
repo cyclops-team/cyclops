@@ -5479,6 +5479,34 @@ async fn gate(
                             };
                         };
                         let manifest_id = manifest.agent.id.clone();
+                        // Screen evidence cannot repair a manifest that has no
+                        // composer ownership vocabulary. Settle that static
+                        // configuration failure before waiting on pane events.
+                        if handle.notification.is_some()
+                            && !manifest
+                                .rules
+                                .iter()
+                                .any(|rule| rule.composer_semantic.is_some())
+                        {
+                            let Some(observation) =
+                                composer_semantic_observation(inner, handle, &row, &manifest_id)
+                            else {
+                                if last_hold.as_deref() == Some(OBSERVATION_HOLD) {
+                                    return GateOutcome::BlockedPreWrite {
+                                        cause: NotificationPreWriteCause::BindingUnprovable,
+                                        observation: binding_unprovable_observation(
+                                            row.pane_pid,
+                                            &manifest_id,
+                                        ),
+                                    };
+                                }
+                                break 'pane Some(OBSERVATION_HOLD.to_string());
+                            };
+                            return GateOutcome::BlockedPreWrite {
+                                cause: NotificationPreWriteCause::ComposerSemanticMissing,
+                                observation,
+                            };
+                        }
                         let Some(det) = fusion::recompute_pane(
                             inner,
                             handle.session_idx,
