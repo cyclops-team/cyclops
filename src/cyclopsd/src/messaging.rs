@@ -552,9 +552,14 @@ async fn observe_first_durable_dispositions(
     events: tokio::sync::broadcast::Receiver<cyclops_proto::Event>,
     deadline: Instant,
 ) -> Result<Vec<crate::mailbox::MessageDisposition>, MailboxServiceError> {
-    observe_first_durable_dispositions_with(message_id, outcomes, events, deadline, || {
-        service.message_dispositions(message_id)
-    })
+    observe_first_durable_dispositions_with(
+        message_id,
+        outcomes,
+        events,
+        deadline,
+        || service.message_dispositions(message_id),
+        Instant::now,
+    )
     .await
 }
 
@@ -567,6 +572,7 @@ async fn observe_first_durable_dispositions_with(
         Vec<crate::mailbox::MessageDisposition>,
         MailboxServiceError,
     >,
+    mut now: impl FnMut() -> Instant,
 ) -> Result<Vec<crate::mailbox::MessageDisposition>, MailboxServiceError> {
     let mut pending: HashMap<RecipientKey, ScheduledHead> = outcomes
         .iter()
@@ -587,8 +593,11 @@ async fn observe_first_durable_dispositions_with(
                 .find(|disposition| disposition.recipient == *recipient)
                 .is_none_or(|disposition| !has_first_durable_disposition(disposition, head))
         });
-        if pending.is_empty() || Instant::now() >= deadline {
+        if pending.is_empty() {
             return Ok(dispositions);
+        }
+        if now() >= deadline {
+            return read_projection();
         }
 
         if !wait_for_messages_change(&mut events, deadline).await {
@@ -932,7 +941,11 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::str::FromStr;
 
-    use cyclops_proto::{scratch::scratch_dir, Event, SessionInstanceId, TmuxPaneId, WorkspaceId};
+    use cyclops_proto::{
+        scratch::scratch_dir, Event, NotificationAttentionCause, NotificationResolution,
+        NotificationTransport, NotificationVerifyOutcome, SessionInstanceId, TmuxPaneId,
+        WorkspaceId, DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM,
+    };
     use cyclops_state::StateRoot;
     use tokio::sync::broadcast;
 
@@ -1093,6 +1106,21 @@ mod tests {
         }
     }
 
+    fn record_doorbell_write(context: &NotificationContext) {
+        let observation = durable_observation(context.recipient());
+        let binding = observation.binding.unwrap();
+        context
+            .record_writing(
+                binding.pane_root.unwrap(),
+                binding.leader.unwrap(),
+                binding.agent,
+                binding.manifest.as_str(),
+                NotificationTransport::Doorbell,
+                Some(DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
+            )
+            .unwrap();
+    }
+
     #[test]
     fn cached_readiness_belongs_to_one_complete_process_binding() {
         let original = binding(200);
@@ -1243,6 +1271,138 @@ mod tests {
         assert_eq!(
             serde_json::to_value(replayed_receipt).unwrap(),
             serde_json::to_value(live_receipt).unwrap()
+        );
+    }
+
+    #[test]
+    fn verify_failed_without_a_scheduler_fact_has_no_wake_block() {
+        let (_scratch, service, _events, _recipient, _) =
+            mailbox_service("verify-failed-no-wake-block", 8);
+        let (accepted, context, _head) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        record_doorbell_write(&context);
+        context
+            .record_verify_attention(NotificationVerifyOutcome::ambiguous())
+            .unwrap();
+
+        let disposition = service
+            .message_dispositions(&accepted.message_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            disposition.notification_state_raw,
+            Some(NotificationState::AttentionRequired)
+        );
+        assert_eq!(disposition.wake_block, None);
+        assert_eq!(receipt_from_disposition(disposition, None).wake_block, None);
+    }
+
+    #[test]
+    fn ack_timeout_without_a_scheduler_fact_has_no_wake_block() {
+        let (_scratch, service, _events, _recipient, _) =
+            mailbox_service("ack-timeout-no-wake-block", 8);
+        let (accepted, context, _head) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        record_doorbell_write(&context);
+        context.record_staged().unwrap();
+        context.reserve_submit().unwrap();
+        context.record_submitted().unwrap();
+        context
+            .record_attention(NotificationAttentionCause::AckTimeout)
+            .unwrap();
+
+        let disposition = service
+            .message_dispositions(&accepted.message_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            disposition.notification_state_raw,
+            Some(NotificationState::AttentionRequired)
+        );
+        assert_eq!(disposition.wake_block, None);
+        assert_eq!(receipt_from_disposition(disposition, None).wake_block, None);
+    }
+
+    #[test]
+    fn quota_records_without_a_scheduler_fact_have_no_wake_block() {
+        let (_scratch, service, _events, recipient, _) = mailbox_service("quota-no-wake-block", 8);
+        let (accepted, context, _head) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        context.record_quota_held().unwrap();
+
+        let held = service
+            .message_dispositions(&accepted.message_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            held.notification_state_raw,
+            Some(NotificationState::QuotaHeld)
+        );
+        assert_eq!(held.wake_block, None);
+        assert_eq!(receipt_from_disposition(held, None).wake_block, None);
+
+        service.observe_quota_reset(recipient).unwrap();
+        let reset = service
+            .message_dispositions(&accepted.message_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            reset.notification_state_raw,
+            Some(NotificationState::QuotaResetObserved)
+        );
+        assert_eq!(reset.wake_block, None);
+        assert_eq!(receipt_from_disposition(reset, None).wake_block, None);
+    }
+
+    #[test]
+    fn a_pending_exact_resolution_is_the_receipts_wake_block() {
+        let (scratch, service, _events, recipient, _) =
+            mailbox_service("pending-resolution-receipt", 8);
+        let (accepted, context, _head) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        record_doorbell_write(&context);
+        let attention = context
+            .record_verify_attention(NotificationVerifyOutcome::ambiguous())
+            .unwrap();
+        let target = service
+            .attention_target(&attention.attempt_id.to_string())
+            .unwrap();
+        service
+            .record_attention_resolution_intent(&target, NotificationResolution::Complete)
+            .unwrap();
+
+        let disposition = service
+            .message_dispositions(&accepted.message_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            disposition.wake_block,
+            Some(MessageWakeBlock::AttentionResolutionPending)
+        );
+        assert_eq!(
+            receipt_from_disposition(disposition, None).wake_block,
+            Some(MessageWakeBlock::AttentionResolutionPending)
+        );
+
+        let live = service.message_dispositions(&accepted.message_id).unwrap();
+        drop(context);
+        drop(service);
+        let (workspace, directory, replayed_recipient, _) = test_directory();
+        assert_eq!(replayed_recipient, recipient);
+        let store = MessageStore::open(
+            &scratch.root(),
+            Path::new("workspaces/current/messages.ndjson"),
+            workspace,
+            "boot-replay",
+        )
+        .unwrap();
+        let replayed = MailboxService::new(directory, store)
+            .message_dispositions(&accepted.message_id)
+            .unwrap();
+        assert_eq!(replayed, live);
+        assert_eq!(
+            receipt_from_disposition(replayed[0].clone(), None).wake_block,
+            Some(MessageWakeBlock::AttentionResolutionPending)
         );
     }
 
@@ -1417,7 +1577,7 @@ mod tests {
         assert_eq!(
             dispositions[0].wake_block,
             Some(MessageWakeBlock::SchedulerStateUnavailable),
-            "a terminal row without an exact scheduler outcome keeps the compatibility fallback"
+            "a blocked pre-write row without an exact scheduler outcome keeps the compatibility fallback"
         );
     }
 
@@ -1504,11 +1664,63 @@ mod tests {
                 }
                 service.message_dispositions(&accepted.message_id)
             },
+            Instant::now,
         )
         .await
         .unwrap();
 
         assert_eq!(reads, 2, "timeout must take one final projection read");
+        assert_eq!(
+            dispositions[0].notification_state_raw,
+            Some(NotificationState::BlockedPreWrite)
+        );
+        assert_eq!(
+            dispositions[0].wake_block,
+            Some(MessageWakeBlock::WorkerSupervisorExited)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_projection_read_that_crosses_the_deadline_takes_one_final_read() {
+        let (_scratch, service, events, recipient, _) =
+            mailbox_service("deadline-crossing-final-read", 8);
+        let (accepted, context, head) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        let outcomes = HashMap::from([(
+            recipient,
+            RecipientScheduleOutcome::WorkerOwned {
+                head,
+                observe_first_disposition: true,
+            },
+        )]);
+        let receiver = events.subscribe();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut reads = 0;
+
+        let dispositions = observe_first_durable_dispositions_with(
+            &accepted.message_id,
+            &outcomes,
+            receiver,
+            deadline,
+            || {
+                reads += 1;
+                if reads == 2 {
+                    context
+                        .record_pre_write_block_with_wake_block(
+                            NotificationPreWriteCause::WorkerFailed,
+                            None,
+                            Some(MessageWakeBlock::WorkerSupervisorExited),
+                        )
+                        .unwrap();
+                }
+                service.message_dispositions(&accepted.message_id)
+            },
+            || deadline,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reads, 2, "a deadline crossing must force a final read");
         assert_eq!(
             dispositions[0].notification_state_raw,
             Some(NotificationState::BlockedPreWrite)

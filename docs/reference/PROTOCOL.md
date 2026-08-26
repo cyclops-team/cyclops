@@ -434,10 +434,13 @@ retains it across replay and exposes it on
 `MessageNotificationSummary.wake_block`. Current values distinguish daemon
 shutdown, missing route, pending attention resolution, worker fault, worker
 supervisor exit, enqueue refusal, and unproven complete composer ownership.
-`scheduler_state_unavailable` is the compatibility fallback for a terminal
-row that has no journaled exact scheduler outcome, including legacy facts.
-New scheduler failures record a specific outcome or fail the request if that
-fact cannot be persisted.
+`scheduler_state_unavailable` is the compatibility fallback for a legacy
+`blocked_pre_write` row that has no journaled exact scheduler outcome. New
+scheduler failures record a specific outcome or fail the request if that fact
+cannot be persisted. A durable resolution intent projects
+`attention_resolution_pending` into message snapshots and send receipts for
+that exact attempt until it settles. Attention and quota states alone never
+invent a scheduler outcome.
 
 The sole live correction out of `writing` is
 `blocked_pre_write` with `pre_write_cause: "paste_command_unwritten"`. It is

@@ -578,19 +578,21 @@ fn notification_pre_write_width_block(record: &NotificationRecord) -> Option<(u3
         .filter(|(observed, required)| observed < required)
 }
 
-/// Exact recorded scheduler outcome, with one compatibility fallback for a
-/// terminal row that has no additive `wake_block` value.
-fn notification_wake_block(record: &NotificationRecord) -> Option<MessageWakeBlock> {
-    record.wake_block.or_else(|| {
-        matches!(
-            record.state,
-            NotificationState::BlockedPreWrite
-                | NotificationState::QuotaHeld
-                | NotificationState::QuotaResetObserved
-                | NotificationState::AttentionRequired
-        )
-        .then_some(MessageWakeBlock::SchedulerStateUnavailable)
-    })
+/// Exact projected scheduler outcome, plus the compatibility answer for a
+/// blocked pre-write row written before `wake_block` existed.
+fn notification_wake_block(
+    record: &NotificationRecord,
+    attention_resolution_pending: bool,
+) -> Option<MessageWakeBlock> {
+    record
+        .wake_block
+        .or_else(|| {
+            attention_resolution_pending.then_some(MessageWakeBlock::AttentionResolutionPending)
+        })
+        .or_else(|| {
+            (record.state == NotificationState::BlockedPreWrite)
+                .then_some(MessageWakeBlock::SchedulerStateUnavailable)
+        })
 }
 
 struct ReplyDerivation {
@@ -4810,7 +4812,12 @@ impl MailboxService {
         let Some(record) = store.projection().notification(recipient, &message_id) else {
             return Ok(None);
         };
-        let block = notification_wake_block(record);
+        let block = notification_wake_block(
+            record,
+            store
+                .projection()
+                .attention_resolution_pending(record.attempt_id),
+        );
         Ok(block.map(|block| NotificationScheduleBlock {
             message_id,
             attempt_id: record.attempt_id,
@@ -4965,7 +4972,14 @@ impl MailboxService {
                     quota_state,
                     notification_settlement,
                     pre_write_cause: record.and_then(|record| record.pre_write_cause),
-                    wake_block: record.and_then(notification_wake_block),
+                    wake_block: record.and_then(|record| {
+                        notification_wake_block(
+                            record,
+                            store
+                                .projection()
+                                .attention_resolution_pending(record.attempt_id),
+                        )
+                    }),
                     position_ahead,
                 }
             })
