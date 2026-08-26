@@ -23,9 +23,9 @@
 		<div class="copy">
 			<h3 class="statement">If it runs in your terminal,<br />it can run in Cyclops.</h3>
 			<p class="lede">
-				Cyclops recognises an agent by a manifest: the process it runs as, the hooks it can
-				report through, and what its title says while it is busy. 4 agents detected out of the
-				box. Teaching it a new CLI is one file.
+				Cyclops detects supported agents automatically. Each one is described by a small manifest
+				file: what its process is called, how it reports back, and how to tell when it's busy. 4
+				agents detected out of the box. Teaching it a new CLI is one file.
 			</p>
 		</div>
 		<ul class="marks" aria-label="Agents Cyclops recognises">
