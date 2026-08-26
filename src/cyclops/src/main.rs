@@ -210,9 +210,10 @@ enum Cmd {
     Wait {
         /// Agent label or pane id, e.g. reviewer or %4.
         target: String,
-        /// idle: no turn is running (NOT permission to write). done: the
-        /// current or next turn ends.
-        /// blocked: any blocked state (modal, permission, quota).
+        /// idle: no turn is running (NOT permission to write). done: working
+        /// was observed, then the same occupant reached idle or
+        /// idle_with_input. This has no turn or message identity. blocked: any
+        /// blocked state (modal, permission, quota).
         #[arg(long, value_enum)]
         until: UntilArg,
         /// Give up after this long, e.g. 90s, 2m, 1m30s. Max 10m.
@@ -3326,6 +3327,20 @@ mod tests {
         let help = error.to_string();
         assert!(!help.contains("--wait"), "{help}");
         assert!(!help.contains("--timeout"), "{help}");
+    }
+
+    #[test]
+    fn wait_help_describes_done_as_a_pane_transition() {
+        let error = match Cli::try_parse_from(["cyclops", "wait", "--help"]) {
+            Ok(_) => panic!("wait --help returned a command instead of help"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = error.to_string();
+        assert!(help.contains("working was observed"), "{help}");
+        assert!(help.contains("idle_with_input"), "{help}");
+        assert!(help.contains("no turn or message identity"), "{help}");
+        assert!(!help.contains("turn ends"), "{help}");
     }
 
     #[test]

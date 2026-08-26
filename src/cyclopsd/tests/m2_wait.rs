@@ -154,8 +154,7 @@ async fn agent_wait_done_resolves_on_the_working_to_idle_edge() {
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
 
-    // CURRENT turn: put the pane mid-turn, then wait; the turn ending
-    // satisfies done.
+    // A current confirmed Working phase followed by Idle satisfies done.
     rig.tmux
         .run(&["select-pane", "-t", &pane, "-T", "WORKING now"]);
     rig.ev
@@ -180,8 +179,8 @@ async fn agent_wait_done_resolves_on_the_working_to_idle_edge() {
     assert!(resp["error"].is_null(), "{resp}");
     assert_eq!(resp["result"]["state"], "idle", "{resp}");
 
-    // NEXT turn: the pane is idle now, so done must NOT resolve until a
-    // working phase has been observed AND ended. The working phase must
+    // The pane is idle now, so done must NOT resolve until a Working phase
+    // has been observed and the pane returns to Idle. The Working phase must
     // outlive tmux's 1Hz subscription tick or it is invisible (F23).
     let driver = drive_later(
         rig.tmux.socket().to_string(),

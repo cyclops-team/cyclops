@@ -16,7 +16,7 @@ cyclops wait codex --until done --timeout 5m
 | Until | Resolves when |
 |---|---|
 | `idle` | No turn is running. Not the same as being writable: whether a message may be pasted is the daemon-stamped write-readiness answer. |
-| `done` | A turn runs on this pane and reaches idle. The occupant is rechecked, but the turn is not correlated to a message or task. |
+| `done` | Working is observed, then the same pane occupant reaches `idle` or `idle_with_input`. This does not identify a turn, message, or task, and it does not prove write readiness. |
 | `blocked` | The agent hits any blocked state: vendor modal, permission prompt, or quota. |
 
 `--timeout` reads human durations: `90s`, `2m`, `1m30s`, `500ms`. Default

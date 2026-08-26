@@ -118,7 +118,7 @@ alphabet.
 | `alarm.clear` | Append clearance facts for explicit alarm identifiers |
 | `msg.history` | Messages from the record, filtered and paged |
 | `msg.thread` | One message, its replies, and its full delivery chain |
-| `agent.wait` | Block until an agent is idle, done, or blocked |
+| `agent.wait` | Block until a pane is idle, blocked, or completes an observed working-to-idle state sequence |
 | `agent.state.report` | A hook reporting a turn edge. Only from inside the pane |
 | `hooks.verify` | Hook liveness for a pane: tier and last-seen edges |
 | `hooks.selftest` | One no-op delivery that proves the ack hook fires |
@@ -788,12 +788,14 @@ mailbox notification transitions are content-free system facts instead.
     "target":"reviewer","until":"idle","waited_ms":0}}
 ```
 
-`until` is `idle`, `done`, or `blocked`. The daemon watches its own state
-stream and holds the response; nothing polls, on either side. Set your read
-deadline above `timeout_ms`.
+`until` is `idle`, `done`, or `blocked`. `done` requires an observed Working
+state followed by Idle or IdleWithInput for the same pane occupant. The daemon
+watches its own state stream and holds the response; nothing polls, on either
+side. Set your read deadline above `timeout_ms`.
 
-This wait observes pane state. It does not correlate the observed turn to a
-message or prove that a specific task completed.
+This wait observes pane state. It does not identify a turn, correlate the
+transition to a message, prove write readiness, or prove that a specific task
+completed.
 
 Two failures have their own codes rather than an outcome: `timeout` (its
 `data` carries the state the target was last in) and `occupant_changed`, the

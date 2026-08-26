@@ -261,11 +261,12 @@ gets an agent identity only through its current watched pane.
 cyclops wait reviewer --until done --timeout 5m
 ```
 
-`done` means a turn ran on that pane and reached idle while the same
-process occupied it. It does not identify which message or task the turn
-handled. Use the reviewer's reply from section 5 as the durable verdict.
-Do not treat a pane state transition as proof that a specific review
-finished. Exit codes and the occupant pinning rule are in [wait.md](wait.md).
+`done` means Cyclops observed working followed by `idle` or `idle_with_input`
+while the same process occupied the pane. It does not identify a turn, message,
+or task, and it does not prove the pane is write-ready. Use the reviewer's reply
+from section 5 as the durable verdict. Do not treat a pane state transition as
+proof that a specific review finished. Exit codes and the occupant pinning rule
+are in [wait.md](wait.md).
 
 ## 7. Audit it later
 

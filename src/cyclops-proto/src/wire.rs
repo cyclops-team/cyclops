@@ -640,8 +640,9 @@ pub enum WaitUntil {
     /// Write-readiness is `Detection::write_ready`, and delivery asks it
     /// again at paste time regardless of what a wait returned.
     Idle,
-    /// A working-to-idle edge was observed for the same pane occupant.
-    /// This does not identify which message or task the turn handled.
+    /// Working was observed, then the same occupant reached Idle or
+    /// IdleWithInput. This does not identify a turn, message, or task and
+    /// does not prove write readiness.
     Done,
     /// The agent entered any blocked_* state.
     Blocked,
