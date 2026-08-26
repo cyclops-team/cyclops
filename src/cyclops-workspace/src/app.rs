@@ -3531,12 +3531,20 @@ async fn handle_messages_key(
                 return Ok(Some(InputOutcome::NoRedraw));
             }
             if let Some(row) = app.messages_queue.selected() {
-                if let Some(tx) = &app.message_detail_tx {
-                    let _ = tx.send((row.message_id.clone(), row.recipient));
-                    app.notice.show(
-                        format!("Loading message {}...", row.message_id),
-                        Instant::now(),
-                    );
+                if row.direction == cyclops_ui::Direction::Inbound
+                    && row.mailbox == cyclops_ui::MailboxWord::Pending
+                {
+                    if let Some(tx) = &app.message_detail_tx {
+                        let _ = tx.send((row.message_id.clone(), row.recipient));
+                        app.notice.show(
+                            format!("Claiming message {}...", row.message_id),
+                            Instant::now(),
+                        );
+                        return Ok(Some(InputOutcome::Redraw));
+                    }
+                } else {
+                    let detail = cyclops_ui::Detail::open(row, app.messages_queue.watermark());
+                    app.messages_detail = Some(detail);
                     return Ok(Some(InputOutcome::Redraw));
                 }
             }
