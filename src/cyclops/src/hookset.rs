@@ -226,14 +226,43 @@ fn own_hook_bins(src: &[serde_json::Value]) -> Vec<&str> {
     bins
 }
 
+/// The outer object of a hook group with its `hooks` removed: the matcher
+/// and whatever metadata the author put around the commands.
+fn group_shell(entry: &serde_json::Value) -> serde_json::Value {
+    let mut shell = entry.clone();
+    if let Some(object) = shell.as_object_mut() {
+        object.remove("hooks");
+    }
+    shell
+}
+
+/// The group shells our own rendering (`src`) uses right now.
+fn own_group_shells(src: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    src.iter()
+        .filter(|entry| {
+            entry
+                .get("hooks")
+                .and_then(serde_json::Value::as_array)
+                .is_some()
+        })
+        .map(group_shell)
+        .collect()
+}
+
 /// Strip only this project's own command hooks out of one event entry.
 ///
 /// Lifecycle and Cursor entries are direct command objects. Tool hooks use a
 /// group with a nested `hooks` array. An unrelated direct object is cloned
 /// whole; a mixed group keeps its matcher and every operator-owned sibling.
+/// Only exact Cyclops command objects are ever removed: an object none of
+/// whose hooks are ours (an empty array included) is untouched, and a group
+/// whose hooks were all ours goes whole only when its outer object is
+/// exactly a shell we render; an operator's outer object (its matcher, its
+/// metadata) survives with the Cyclops commands removed, even emptied.
 fn without_cyclops_hooks(
     entry: &serde_json::Value,
     own_bins: &[&str],
+    own_shells: &[serde_json::Value],
 ) -> Option<serde_json::Value> {
     use serde_json::Value;
     if let Some(hooks) = entry.get("hooks").and_then(Value::as_array) {
@@ -247,7 +276,10 @@ fn without_cyclops_hooks(
             })
             .cloned()
             .collect();
-        if kept.is_empty() {
+        if kept.len() == hooks.len() {
+            return Some(entry.clone());
+        }
+        if kept.is_empty() && own_shells.contains(&group_shell(entry)) {
             return None;
         }
         let mut stripped = entry.clone();
@@ -283,12 +315,13 @@ fn merge_into(dst: &mut serde_json::Value, src: &serde_json::Value) {
             // matcher and operator hooks, and the current source is appended
             // once. Running this twice is a no-op.
             let own_bins = own_hook_bins(s);
+            let own_shells = own_group_shells(s);
             let kept: Vec<Value> = d
                 .as_array()
                 .map(|groups| {
                     groups
                         .iter()
-                        .filter_map(|entry| without_cyclops_hooks(entry, &own_bins))
+                        .filter_map(|entry| without_cyclops_hooks(entry, &own_bins, &own_shells))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -1902,6 +1935,90 @@ mod tests {
                 .unwrap_or_else(|| panic!("cursor: {event} entry shape"));
             assert_eq!(cmd, format!("cyclops hook {event} --agent r"));
         }
+    }
+
+    /// An object none of whose hooks are ours is not ours to touch, an empty
+    /// `hooks` array included: it survives byte for byte.
+    #[test]
+    fn an_unrelated_object_with_an_empty_hooks_array_survives() {
+        let current_bin = "/tmp/target/debug/deps/cyclops-0123abcd";
+        let placeholder = serde_json::json!({ "hooks": [], "note": "operator placeholder" });
+        let mut doc = serde_json::json!({
+            "hooks": {
+                "beforeSubmitPrompt": [
+                    placeholder.clone(),
+                    { "command": "/old/prefix/bin/cyclops hook beforeSubmitPrompt" }
+                ]
+            },
+            "version": 1
+        });
+        let ours: serde_json::Value =
+            serde_json::from_str(&render_shared(CliKind::Cursor, current_bin)).unwrap();
+
+        merge_into(&mut doc, &ours);
+
+        let entries = doc["hooks"]["beforeSubmitPrompt"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(
+            entries[0], placeholder,
+            "the empty operator object survived whole"
+        );
+        assert_eq!(
+            entries[1]["command"],
+            format!("{current_bin} hook beforeSubmitPrompt")
+        );
+        let once = serde_json::to_vec(&doc).unwrap();
+        merge_into(&mut doc, &ours);
+        assert_eq!(serde_json::to_vec(&doc).unwrap(), once);
+    }
+
+    /// A group whose only hook was ours keeps its operator-owned outer
+    /// object (matcher and metadata) with the Cyclops command removed, even
+    /// though that leaves its array empty; only a group whose outer object
+    /// is exactly the shell we render goes whole, which is what keeps two
+    /// merges byte-identical.
+    #[test]
+    fn an_operator_group_keeps_its_matcher_and_metadata_when_its_only_hook_was_ours() {
+        let current_bin = "/tmp/target/debug/deps/cyclops-0123abcd";
+        let mut doc = serde_json::json!({
+            "hooks": {
+                "Stop": [
+                    {
+                        "matcher": "Bash",
+                        "timeout": 9,
+                        "hooks": [
+                            { "type": "command", "command": "/old/prefix/bin/cyclops hook Stop" }
+                        ]
+                    },
+                    {
+                        "hooks": [
+                            { "type": "command", "command": "/old/prefix/bin/cyclops hook Stop" }
+                        ]
+                    }
+                ]
+            }
+        });
+        let ours: serde_json::Value =
+            serde_json::from_str(&render_shared(CliKind::Claude, current_bin)).unwrap();
+
+        merge_into(&mut doc, &ours);
+
+        let stop = doc["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 2, "{stop:?}");
+        assert_eq!(
+            stop[0],
+            serde_json::json!({ "matcher": "Bash", "timeout": 9, "hooks": [] }),
+            "the operator's outer object survived, emptied"
+        );
+        assert_eq!(
+            stop[1]["hooks"][0]["command"],
+            format!("{current_bin} hook Stop"),
+            "our bare shell went and the current rendering was appended once"
+        );
+        assert!(!doc.to_string().contains("/old/prefix/bin/cyclops"));
+        let once = serde_json::to_vec(&doc).unwrap();
+        merge_into(&mut doc, &ours);
+        assert_eq!(serde_json::to_vec(&doc).unwrap(), once);
     }
 
     #[test]
