@@ -93,8 +93,11 @@
 		margin: 0 0 24px;
 	}
 
+	/* Each card's frame grows to fill it, so the three read as three panes
+	   of one height; the shorter snippets keep their lines at the top. */
+	.step :global(.mock),
 	.step :global(.frame) {
-		margin-top: auto;
+		flex: 1 0 auto;
 	}
 
 	.step :global(.frame-body) {
